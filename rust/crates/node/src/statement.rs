@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use rtdb_columnar::MemoryReservation;
+use rtdb_columnar::{MemoryReservation, OwnedBatch};
 use rtdb_plan::{CatalogLookups, ColumnId, Field, RecordingCatalog, Schema, SqlNotice};
 use rtdb_query::{PreparedQuery, QueryContext, QueryCursor, RuntimeSchema};
 use rtdb_sql::{DeferredStatementSyntax, ParsedStatement, PrepareOptions, StatementKind, StatementSyntaxBatch};
@@ -21,7 +21,7 @@ struct PreparedData {
     _reservation: Arc<MemoryReservation>,
     plan: std::sync::Mutex<Option<CachedPlan>>,
 }
-enum PreparedResult { Query { schema: Schema, pg_types: Vec<PgType> }, Dml }
+enum PreparedResult { Query { schema: Schema, pg_types: Vec<PgType>, parameter_projection: bool }, Dml }
 
 /// An immutable SQL preparation; each query execution binds against its supplied snapshot.
 /// Session access checks and read-basis capture precede this API and remain the caller's obligation.
@@ -126,7 +126,7 @@ impl PreparedSql {
                     query.schema().clone()
                 };
                 let pg_types = schema.fields().iter().map(|field| if dynamic_pg || policy != ResultSignaturePolicy::PostgreSql { Ok(PgType::Default) } else { PgType::from_logical(&field.data_type) }).collect::<Result<_>>()?;
-                PreparedResult::Query { schema, pg_types }
+                PreparedResult::Query { schema, pg_types, parameter_projection: query.is_parameter_projection() }
             }
             StatementKind::Session => return Err(session_statement(source, &options, &context.memory)),
         };
@@ -176,6 +176,23 @@ impl PreparedSql {
         self.open_query_batches(context, arguments, types, true).await
     }
 
+    /// Uses a single Arrow parameter row directly when the query only projects parameters.
+    pub async fn try_open_parameter_projection(&self, context: Arc<QueryContext>, arguments: &OwnedBatch, types: &[LogicalType]) -> Result<Option<QueryCursor>> {
+        if !matches!(&self.0.result, PreparedResult::Query { parameter_projection: true, .. })
+            || self.0.policy != ResultSignaturePolicy::Dynamic || !self.0.options.parameter_types.is_empty()
+            || arguments.batch().num_rows() != 1 || types.len() != self.parameter_count() {
+            return Ok(None);
+        }
+        let projection = async {
+            let query = deep(self.source(), || self.bind(&context, types, true))?;
+            query.execute_parameter_projection(context, arguments, types, Some(self.source())).await
+        }.await;
+        match projection {
+            Err(error) if error.code == "rtdb/memory-budget-exceeded" => Ok(None),
+            result => result,
+        }
+    }
+
     async fn open_query_batches(&self, context: Arc<QueryContext>, mut arguments: Vec<Value>, types: &[LogicalType], columnar: bool) -> Result<QueryCursor> {
         if arguments.len() != self.parameter_count() { return Err(parameter_error("Argument count differs from the prepared statement")); }
         arguments.iter_mut().for_each(rtdb_columnar::admit_execution_value);
@@ -222,7 +239,7 @@ impl PreparedSql {
     }
 
     fn check_signature(&self, actual: &Schema) -> Result<()> {
-        let PreparedResult::Query { schema, pg_types } = &self.0.result else { return Err(kind_error()); };
+        let PreparedResult::Query { schema, pg_types, .. } = &self.0.result else { return Err(kind_error()); };
         let compatible = match self.0.policy {
             ResultSignaturePolicy::Dynamic => true,
             ResultSignaturePolicy::Exact => schema.fields().iter().map(|field| (&field.name, &field.data_type)).eq(actual.fields().iter().map(|field| (&field.name, &field.data_type))),
@@ -290,7 +307,7 @@ fn retained_bytes(source: &String, options: &PrepareOptions, parameters: &Vec<Lo
     bytes = bytes.checked_add(options.search_path.capacity().checked_mul(std::mem::size_of::<String>()).ok_or_else(size_error)?).and_then(|n| n.checked_add(parameters.capacity().checked_mul(std::mem::size_of::<LogicalType>())?)).ok_or_else(size_error)?;
     bytes = bytes.checked_add(notices.capacity().checked_mul(std::mem::size_of::<SqlNotice>()).ok_or_else(size_error)?).ok_or_else(size_error)?;
     for notice in notices { bytes = bytes.checked_add(notice.message.capacity()).ok_or_else(size_error)?; }
-    if let PreparedResult::Query { schema, pg_types } = result {
+    if let PreparedResult::Query { schema, pg_types, .. } = result {
         bytes = bytes.checked_add(pg_types.capacity().checked_mul(std::mem::size_of::<PgType>()).ok_or_else(size_error)?).ok_or_else(size_error)?;
         for field in schema.fields() { bytes = bytes.checked_add(field.data_type.retained_bytes()?).and_then(|n| n.checked_add(field.name.capacity())).and_then(|n| n.checked_add(256)).ok_or_else(size_error)?; }
     }

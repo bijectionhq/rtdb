@@ -261,9 +261,15 @@ async fn prepared_parameters_are_positional_all_batches_update_and_old_ticket_ke
     let query = client.prepare("SELECT ? AS n", None).await;
     client.upload(CommandPreparedStatementQuery { prepared_statement_handle: query.prepared_statement_handle.clone() }, vec![arguments(vec![41, 99])]).await;
     let descriptor = FlightDescriptor::new_cmd(CommandPreparedStatementQuery { prepared_statement_handle: query.prepared_statement_handle.clone() }.as_any().encode_to_vec());
-    let request = client.request(descriptor); let old = client.client.get_flight_info(request).await.unwrap().into_inner();
+    let request = client.request(descriptor.clone()); let old = client.client.get_flight_info(request).await.unwrap().into_inner();
     client.upload(CommandPreparedStatementQuery { prepared_statement_handle: query.prepared_statement_handle }, vec![arguments(vec![42])]).await;
-    assert_eq!(integer(&client.redeem(&old).await[0], 0, 0), 41); running.stop().await;
+    let request = client.request(descriptor); let current = client.client.get_flight_info(request).await.unwrap().into_inner();
+    assert_eq!(integer(&client.redeem(&old).await[0], 0, 0), 41);
+    let current_schema = current.clone().try_decode_schema().unwrap();
+    let current = client.redeem(&current).await;
+    assert_eq!(current[0].schema().as_ref(), &current_schema);
+    assert_eq!(integer(&current[0], 0, 0), 42);
+    running.stop().await;
 }
 
 #[tokio::test]
@@ -378,6 +384,7 @@ async fn mixed_nested_ingest_returns_arrow_unions_from_cold_persisted_pages() {
     let record = Value::Struct(StructFields::from([("a".into(), Value::I64(7))]));
     let list = Value::List(vec![Value::Utf8("list".into())]);
     let fixed = Value::FixedSizeList(vec![Value::I64(13), Value::I64(21)]);
+    let uuid = Value::Uuid([3; 16]);
     let upload = |ids: Vec<i64>, logical: LogicalType, values: &[Value]| {
         let schema = Arc::new(Schema::new(vec![
             Field::new("_id", DataType::Int64, false),
@@ -398,7 +405,8 @@ async fn mixed_nested_ingest_returns_arrow_unions_from_cold_persisted_pages() {
     let schema = Arc::new(Schema::new(vec![Field::new("_id", DataType::Int64, false), Field::new("v", aliases.data_type().clone(), false)]));
     let aliases = RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(vec![4, 5])), Arc::new(aliases)]).unwrap();
     client.upload(command.clone(), vec![aliases]).await;
-    client.upload(command, vec![upload(vec![6], fixed.logical_type(), std::slice::from_ref(&fixed))]).await;
+    client.upload(command.clone(), vec![upload(vec![6], fixed.logical_type(), std::slice::from_ref(&fixed))]).await;
+    client.upload(command, vec![upload(vec![7], uuid.logical_type(), std::slice::from_ref(&uuid))]).await;
     client.end(tx, true).await.unwrap();
 
     let database = running.node.catalog().database("xtdb").unwrap();
@@ -421,7 +429,7 @@ async fn mixed_nested_ingest_returns_arrow_unions_from_cold_persisted_pages() {
         (0..batch.num_rows()).map(|row| (integer(batch, 0, row), rtdb_columnar::read_value(field, array, row).unwrap())).collect::<Vec<_>>()
     }).collect();
     rows.sort_by_key(|(id, _)| *id);
-    assert_eq!(rows, [(1, record), (2, Value::Null), (3, list), (4, Value::I64(-1)), (5, Value::I64(9)), (6, fixed)]);
+    assert_eq!(rows, [(1, record), (2, Value::Null), (3, list), (4, Value::I64(-1)), (5, Value::I64(9)), (6, fixed), (7, uuid)]);
     running.stop().await;
 }
 

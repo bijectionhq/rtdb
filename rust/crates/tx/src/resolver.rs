@@ -647,7 +647,7 @@ impl<'a> OpenTransaction<'a> {
             .filter(|(field, _)| !matches!(field.name().as_str(), "_valid_from" | "_valid_to"))
             .map(|(field, column)| (Arc::clone(field), Arc::clone(column))).unzip();
         let content = rtdb_columnar::build_struct_array(fields.into(), &columns, array.len(), None)?;
-        let batch = rtdb_format::data::owned_put_batch(content, &headers, memory)?;
+        let batch = rtdb_format::data::owned_put_batch(content, &headers, documents.source_bytes(), memory)?;
         self.buffer.append_batch(table, batch)
     }
     async fn check_replay_marker(&self, replay: &ReplaySubmission) -> Result<()> {
@@ -827,7 +827,7 @@ fn mutation_put_batch(batch: &RecordBatch, system_time: Timestamp, memory: &Arc<
     let schema = Arc::new(Schema::new(content.fields().clone()));
     let content = RecordBatch::try_new(schema, columns).map_err(|error| Anomaly::fault("rtdb.tx/mutation-schema", error.to_string()))?;
     let Some(documents) = ArrowDocuments::from_record_batch(&content, memory)? else { return Ok(None); };
-    rtdb_format::data::owned_put_batch(Arc::new(documents.array().clone()), &headers, memory).map(Some)
+    rtdb_format::data::owned_put_batch(Arc::new(documents.array().clone()), &headers, None, memory).map(Some)
 }
 
 fn mutation_column<'a>(batch: &'a RecordBatch, name: &str) -> Result<OutputColumn<'a>> {

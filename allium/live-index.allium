@@ -210,6 +210,7 @@ entity StagedTxTable {
     -- Staging copies compatible Arrow document columns from their input arrays when combining writes in transaction order.
     -- Native SQL puts can stage scalar document columns directly from the mutation query batch.
     -- Staging views retain shared Arrow source allocations while exposing only the buffer spans they use.
+    -- When memory admits the copy, a put with a large shared source allocation copies its selected cells into compact Arrow buffers.
     -- A staged put preserves its declared column types, including columns with only null cells.
     -- A table's columns, a struct's fields and a union's legs keep the order they were first written in; types compare without regard to that order.
     -- Temporary memory used during construction is released before staging.

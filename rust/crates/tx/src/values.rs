@@ -154,6 +154,7 @@ impl Documents {
 pub struct ArrowDocuments {
     array: StructArray,
     layout: Arc<DecodedDocumentLayout>,
+    source_bytes: Option<usize>,
 }
 
 impl ArrowDocuments {
@@ -165,6 +166,12 @@ impl ArrowDocuments {
         let schema = batch.schema();
         if batch.num_rows() == 0 || schema.fields().iter().any(|field| !Self::compatible(field, true)) {
             return Ok(None);
+        }
+        for (field, array) in schema.fields().iter().zip(batch.columns()) {
+            if contains_uuid(field) && (!uuid_field(field)
+                || (array.is_null(0) && array.logical_null_count() != array.len())) {
+                return Ok(None);
+            }
         }
         let _schema = memory.reserve(rtdb_format::ipc::schema_translation_bound(&schema)?)?;
         let names = schema.fields().iter().map(|field| field.name()).collect::<BTreeSet<_>>();
@@ -189,6 +196,8 @@ impl ArrowDocuments {
             let nulls = array.logical_null_count();
             let array = if nulls == array.len() {
                 Arc::new(arrow_array::NullArray::new(array.len())) as ArrayRef
+            } else if uuid_field(field) && nulls != 0 {
+                canonical_nullable_uuid(array, memory)?
             } else {
                 let Some(array) = normalized_document_array(array, memory, normalize_unions)? else { return Ok(None); };
                 array
@@ -200,11 +209,11 @@ impl ArrowDocuments {
         let layout = DecodedDocumentLayout::new(&fields, memory)?;
         let array = StructArray::try_new_with_length(fields, columns, None, batch.num_rows())
             .map_err(|error| Anomaly::incorrect("rtdb.tx/document-schema", error.to_string()))?;
-        Ok(Some(Self { array, layout }))
+        Ok(Some(Self { array, layout, source_bytes: None }))
     }
 
     fn compatible(field: &arrow_schema::Field, normalize: bool) -> bool {
-        field.metadata().is_empty() && match field.data_type() {
+        compatible_document_metadata(field) && match field.data_type() {
             DataType::Struct(fields) => fields.iter().all(|field| Self::compatible(field, normalize)),
             DataType::List(field) | DataType::FixedSizeList(field, _) => Self::compatible(field, normalize),
             DataType::Union(fields, arrow_schema::UnionMode::Dense) => fields.iter().all(|(_, field)| {
@@ -218,8 +227,10 @@ impl ArrowDocuments {
         }
     }
 
-    pub(crate) fn from_source(array: &StructArray, layout: Arc<DecodedDocumentLayout>, memory: &Arc<MemoryBudget>) -> Result<Option<Self>> {
-        if array.is_empty() || array.null_count() != 0 || !array.fields().iter().all(|field| Self::compatible(field, false)) {
+    pub(crate) fn from_source(array: &StructArray, layout: Arc<DecodedDocumentLayout>, source_bytes: usize, memory: &Arc<MemoryBudget>) -> Result<Option<Self>> {
+        if array.is_empty() || array.null_count() != 0 || !array.fields().iter().all(|field| {
+            Self::compatible(field, false) && canonical_uuid_unions(field)
+        }) {
             return Ok(None);
         }
         let fixed = || array.fields().iter().zip(array.columns()).filter(|(field, _)| contains_fixed_size_list(field.data_type()));
@@ -233,11 +244,12 @@ impl ArrowDocuments {
                 rtdb_columnar::validate_readable_column(field, column.as_ref(), logical, memory)?;
             }
         }
-        Ok(Some(Self { array: array.clone(), layout }))
+        Ok(Some(Self { array: array.clone(), layout, source_bytes: Some(source_bytes) }))
     }
 
     pub(crate) fn array(&self) -> &StructArray { &self.array }
     pub(crate) fn columns(&self) -> &[String] { &self.layout.columns }
+    pub(crate) fn source_bytes(&self) -> Option<usize> { self.source_bytes }
 
     pub(crate) fn to_rows(&self, omit_nulls: bool, memory: &Arc<MemoryBudget>) -> Result<Documents> {
         Documents::read_arrow(&self.array, Arc::clone(&self.layout), omit_nulls, memory)
@@ -246,9 +258,10 @@ impl ArrowDocuments {
     pub(crate) fn iid(&self, row: usize, reader: Option<&(usize, ColumnReader)>, memory: &Arc<MemoryBudget>) -> Result<rtdb_types::Iid> {
         if let Some((index, reader)) = reader {
             let column = self.array.column(*index);
-            if column.is_valid(row) {
+            if column.data_type() != &DataType::Null && column.is_valid(row) {
                 let _scratch = memory.reserve(rtdb_columnar::estimate_read_cell_bytes(&self.array.fields()[*index], column.as_ref(), row)?)?;
-                return Ok(reader.read(column.as_ref(), row)?.entity_id()?.iid());
+                let value = reader.read(column.as_ref(), row)?;
+                if !matches!(value, Value::Null | Value::Undefined) { return Ok(value.entity_id()?.iid()); }
             }
         }
         let slice = self.array.slice(row, 1);
@@ -270,6 +283,49 @@ pub(crate) fn contains_fixed_size_list(layout: &DataType) -> bool {
         DataType::Union(fields, arrow_schema::UnionMode::Dense) => fields.iter().any(|(_, field)| contains_fixed_size_list(field.data_type())),
         _ => false,
     }
+}
+
+pub(crate) fn compatible_document_metadata(field: &arrow_schema::Field) -> bool {
+    field.metadata().is_empty() || uuid_field(field)
+}
+
+fn uuid_field(field: &arrow_schema::Field) -> bool {
+    let metadata = field.metadata();
+    field.data_type() == &DataType::FixedSizeBinary(16)
+        && metadata.len() == 2
+        && metadata.get(rtdb_columnar::EXTENSION_NAME_KEY).is_some_and(|name| name == "uuid")
+        && metadata.get(rtdb_columnar::EXTENSION_METADATA_KEY).is_some_and(String::is_empty)
+}
+
+fn contains_uuid(field: &arrow_schema::Field) -> bool {
+    match field.data_type() {
+        DataType::Struct(fields) => fields.iter().any(|field| contains_uuid(field)),
+        DataType::List(field) | DataType::FixedSizeList(field, _) => contains_uuid(field),
+        DataType::Union(fields, _) => fields.iter().any(|(_, field)| contains_uuid(field)),
+        _ => uuid_field(field),
+    }
+}
+
+fn canonical_uuid_unions(field: &arrow_schema::Field) -> bool {
+    match field.data_type() {
+        DataType::Struct(fields) => fields.iter().all(|field| canonical_uuid_unions(field)),
+        DataType::List(field) | DataType::FixedSizeList(field, _) => canonical_uuid_unions(field),
+        DataType::Union(fields, _) => !contains_uuid(field) || fields.iter().all(|(_, field)| {
+            from_field(field).and_then(|logical| rtdb_columnar::leg_name(&logical)).is_ok_and(|name| name == *field.name())
+                && canonical_uuid_unions(field)
+        }),
+        _ => true,
+    }
+}
+
+fn canonical_nullable_uuid(array: &ArrayRef, memory: &Arc<MemoryBudget>) -> Result<ArrayRef> {
+    let bound = array.len().checked_mul(128).and_then(|bytes| bytes.checked_add(4096)).ok_or_else(overflow)?;
+    let mut reservation = memory.reserve(bound)?;
+    let cells = (0..array.len()).map(|index| Some((0, index))).collect::<Vec<_>>();
+    let column = rtdb_columnar::copy_nullable_cells(&[array.as_ref()], &cells)?;
+    drop(cells);
+    Arc::get_mut(&mut reservation).expect("UUID selection owns its reservation").shrink_to(column.get_array_memory_size())?;
+    rtdb_columnar::retain_array(column, &reservation)
 }
 
 pub(crate) fn plain_scalar_field(field: &arrow_schema::Field) -> bool {
@@ -328,6 +384,9 @@ fn normalized_document_array(array: &ArrayRef, memory: &Arc<MemoryBudget>, norma
 
 fn normalized_field(field: &arrow_schema::Field, array: &ArrayRef) -> arrow_schema::Field {
     let changed = array.data_type() != field.data_type();
+    if changed && array.data_type() == &DataType::Null {
+        return arrow_schema::Field::new(field.name(), DataType::Null, true);
+    }
     let nullable = field.is_nullable() || (changed && !matches!(array.data_type(), DataType::Union(..)) && (
         array.is_nullable() || (matches!(field.data_type(), DataType::Union(..)) && from_field(field).is_ok_and(|ty| ty.nullable()))
     ));

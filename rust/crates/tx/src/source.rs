@@ -143,7 +143,8 @@ impl SourceTransaction {
                 list.value(0)
             } else { Arc::clone(column) };
             let union = array.as_any().downcast_ref::<UnionArray>().ok_or_else(|| invalid("Transaction operations are not a union"))?;
-            for row in 0..union.len() { operations.push(reader.operation(union, row)?); }
+            let source_bytes = page.reservation().bytes();
+            for row in 0..union.len() { operations.push(reader.operation(union, row, source_bytes)?); }
         }
         if abort_on_legacy_resolver {
             if !matches!(operations.first(), Some(Operation::Public(TxOp::Sql { sql, args: None })) if sql == LEGACY_REPLAY_ABORT) {
@@ -695,7 +696,7 @@ fn merge_document_fields(left: &Field, right: &Field) -> Result<Option<Field>> {
 
 fn document_relayout_type(field: &Field) -> Result<Option<LogicalType>> {
     fn supported_field(field: &Field) -> bool {
-        field.metadata().is_empty() && match field.data_type() {
+        crate::values::compatible_document_metadata(field) && match field.data_type() {
             DataType::Struct(fields) => fields.iter().all(|field| supported_field(field)),
             DataType::List(field) | DataType::FixedSizeList(field, _) => supported_field(field),
             DataType::Union(fields, UnionMode::Dense) => fields.iter().all(|(_, field)| {
@@ -852,7 +853,7 @@ struct SourceOperationReader<'a> {
 }
 
 impl SourceOperationReader<'_> {
-    fn operation(&mut self, union: &UnionArray, row: usize) -> Result<Operation> {
+    fn operation(&mut self, union: &UnionArray, row: usize, source_bytes: usize) -> Result<Operation> {
         let memory = self.memory;
         let parsed_fields = &mut *self.parsed_fields;
         let (name, array, offset) = union_leg(union, row)?;
@@ -898,7 +899,7 @@ impl SourceOperationReader<'_> {
                     std::collections::btree_map::Entry::Vacant(layout) => Arc::clone(layout.insert(DecodedDocumentLayout::new(structs.fields(), memory)?)),
                 };
                 if name == "put-docs" && iids.is_some()
-                    && let Some(documents) = ArrowDocuments::from_source(structs, Arc::clone(&layout), memory)? {
+                    && let Some(documents) = ArrowDocuments::from_source(structs, Arc::clone(&layout), source_bytes, memory)? {
                     return Ok(Operation::PutArrowIids { table, documents, iids: iids.expect("put contains IIDs"), valid_from, valid_to });
                 }
                 let documents = Documents::read_arrow(structs, layout, name == "put-docs", memory)?;
@@ -1249,6 +1250,98 @@ mod tests {
         let [Operation::PutArrowIids { documents, iids, .. }] = replayed.operations.as_slice() else { panic!("expected columnar replay"); };
         assert_eq!(documents.array().len(), 2);
         assert_eq!(iids, &[EntityId::Integer(1).iid(), EntityId::Integer(2).iid()]);
+    }
+
+    #[test]
+    fn uuid_uploads_keep_their_arrow_types_and_nulls_on_source_replay() {
+        let memory = budget();
+        let table = TableRef::new("public", "docs");
+        let uuid = LogicalType::Scalar(rtdb_types::ScalarType::Uuid);
+        let insert = |id, logical: &LogicalType, value| {
+            let schema = Arc::new(Schema::new(vec![
+                Field::new("_id", DataType::Int64, false), to_field("v", logical).unwrap(),
+            ]));
+            let batch = RecordBatch::try_new(schema, vec![
+                Arc::new(arrow_array::Int64Array::from(vec![id])), rtdb_columnar::copy_array(logical, &[value]).unwrap(),
+            ]).unwrap();
+            let batch = OwnedBatch::new(batch, &memory).unwrap();
+            let documents = ArrowDocuments::from_batch(&batch, &memory).unwrap().unwrap();
+            TxOp::PutArrowDocs { table: table.clone(), documents }
+        };
+        let opaque = Value::FixedSizeBinary(vec![3; 16]);
+        let submissions = vec![insert(1, &uuid, Value::Uuid([3; 16])), insert(2, &opaque.logical_type(), opaque.clone()),
+            insert(3, &uuid.maybe(), Value::Null)];
+        let transaction = SourceTransaction::new(submissions, SubmitOptions::default(), &memory).unwrap();
+
+        let replay = roundtrip(&transaction);
+
+        for (operation, expected) in replay.operations.iter().zip([Value::Uuid([3; 16]), opaque, Value::Null]) {
+            let Operation::PutArrowIids { documents, .. } = operation else { panic!("Expected an Arrow operation") };
+            assert_eq!(documents.to_rows(false, &memory).unwrap().rows()[0]["v"], expected);
+        }
+        assert_eq!(replay.operations.len(), 3);
+    }
+
+    #[test]
+    fn an_all_null_uuid_id_reaches_the_missing_id_error() {
+        let memory = budget();
+        let uuid = LogicalType::Scalar(rtdb_types::ScalarType::Uuid).maybe();
+        let schema = Arc::new(Schema::new(vec![to_field("_id", &uuid).unwrap()]));
+        let batch = RecordBatch::try_new(schema, vec![rtdb_columnar::copy_array(&uuid, &[Value::Null]).unwrap()]).unwrap();
+        let batch = OwnedBatch::new(batch, &memory).unwrap();
+        let documents = ArrowDocuments::from_batch(&batch, &memory).unwrap().unwrap();
+        let table = TableRef::new("public", "docs");
+        let transaction = SourceTransaction::new(vec![TxOp::PutArrowDocs { table, documents }], SubmitOptions::default(), &memory).unwrap();
+
+        let error = transaction.encode().unwrap_err();
+
+        assert_eq!(error.code, "missing-id");
+        assert!(error.context.contains_key("doc"));
+    }
+
+    #[test]
+    fn a_tagged_null_in_a_uuid_id_column_reports_a_missing_id() {
+        let memory = budget();
+        let values = [Value::Uuid([3; 16]), Value::Null, Value::I64(1)];
+        let logical = LogicalType::join_all(&values.iter().map(Value::logical_type).collect::<Vec<_>>());
+        let fields = vec![to_field("_id", &logical).unwrap()].into();
+        let array = rtdb_columnar::copy_array(&logical, &values).unwrap();
+        let layout = DecodedDocumentLayout::new(&fields, &memory).unwrap();
+        let array = rtdb_columnar::build_struct_array(fields, &[array], values.len(), None).unwrap();
+        let documents = ArrowDocuments::from_source(array.as_struct(), layout, array.get_array_memory_size(), &memory).unwrap().unwrap();
+        let reader = documents.id_reader().unwrap();
+
+        let error = documents.iid(1, reader.as_ref(), &memory).unwrap_err();
+
+        assert_eq!(error.code, "missing-id");
+        assert!(error.context.contains_key("doc"));
+    }
+
+    #[test]
+    fn uuid_uploads_keep_row_codec_bytes_for_nulls_with_hidden_payloads() {
+        use arrow_array::{FixedSizeBinaryArray, Int64Array};
+        use arrow_buffer::{Buffer, NullBuffer};
+
+        let memory = budget();
+        let logical = LogicalType::Scalar(rtdb_types::ScalarType::Uuid).maybe();
+        let schema = Arc::new(Schema::new(vec![Field::new("_id", DataType::Int64, false), to_field("v", &logical).unwrap()]));
+        let upload = |validity| {
+            let bytes = Buffer::from_vec(vec![3_u8; 32]);
+            let column = FixedSizeBinaryArray::new(16, bytes, Some(NullBuffer::from(validity)));
+            let batch = RecordBatch::try_new(Arc::clone(&schema), vec![Arc::new(Int64Array::from(vec![1, 2])), Arc::new(column)]).unwrap();
+            let batch = OwnedBatch::new(batch, &memory).unwrap();
+            ArrowDocuments::from_batch(&batch, &memory).unwrap()
+        };
+        let table = TableRef::new("public", "docs");
+        let documents = upload(vec![true, false]).unwrap();
+        let puts = SourceTransaction::new(vec![TxOp::PutArrowDocs { table: table.clone(), documents }], SubmitOptions::default(), &memory).unwrap();
+        let rows = vec![StructFields::from([("_id".into(), Value::I64(1)), ("v".into(), Value::Uuid([3; 16]))]),
+            StructFields::from([("_id".into(), Value::I64(2)), ("v".into(), Value::Null)])];
+        let row_puts = SourceTransaction::new(vec![TxOp::PutDocs { table, documents: Documents::new(rows, &memory).unwrap(),
+            valid_from: None, valid_to: None }], SubmitOptions::default(), &memory).unwrap();
+
+        assert_eq!(puts.encode().unwrap().as_slice(), row_puts.encode().unwrap().as_slice());
+        assert!(upload(vec![false, true]).is_none());
     }
 
     #[test]
