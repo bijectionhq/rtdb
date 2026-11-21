@@ -7,7 +7,7 @@ use bytes::Bytes;
 use futures::{StreamExt, TryStreamExt, stream::BoxStream};
 use object_store::{CopyOptions, GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStore as ProviderStore, ObjectStoreExt, PutMultipartOptions, PutOptions, PutPayload, PutResult, UploadPart, memory::InMemory, path::Path};
 use rtdb_columnar::MemoryBudget;
-use rtdb_storage::{Error, IoRegion, ObjectKey, ObjectStore, ReadReservation, remote::RemoteStore};
+use rtdb_storage::{Error, IoRegion, ObjectKey, ObjectStore, ReadReservation, remote::{PublicationJournal, RemoteStore}};
 use tokio::sync::Semaphore;
 
 #[derive(Debug)]
@@ -169,12 +169,38 @@ async fn bounded<F: Future>(future: F) -> F::Output {
     tokio::time::timeout(Duration::from_secs(10), future).await.expect("controlled I/O did not finish")
 }
 
+#[derive(Default)]
+struct PublicationInventory {
+    pending: std::sync::Mutex<std::collections::BTreeMap<uuid::Uuid, ObjectKey>>,
+}
+
+#[async_trait]
+impl PublicationJournal for PublicationInventory {
+    async fn admit(&self, key: &ObjectKey, attempt: uuid::Uuid) -> rtdb_storage::Result<()> {
+        assert!(self.pending.lock().unwrap().insert(attempt, key.clone()).is_none());
+        Ok(())
+    }
+
+    async fn settle(&self, key: &ObjectKey, attempt: uuid::Uuid, submitted: bool) -> rtdb_storage::Result<()> {
+        assert!(submitted);
+        assert_eq!(self.pending.lock().unwrap().remove(&attempt).as_ref(), Some(key));
+        Ok(())
+    }
+}
+
+fn journaled_region() -> (Arc<IoRegion>, Arc<PublicationInventory>) {
+    let mut io = IoRegion::new();
+    let journal = Arc::new(PublicationInventory::default());
+    Arc::get_mut(&mut io).unwrap().track_publications(journal.clone());
+    (io, journal)
+}
+
 #[tokio::test]
 async fn a_drained_single_put_region_recovers_only_its_exact_committed_write() {
     let key = ObjectKey::new("data.arrow").unwrap();
     let contents = Bytes::from_static(b"sealed");
     let prefix = ObjectKey::new("cell").unwrap();
-    let io = IoRegion::new();
+    let (io, journal) = journaled_region();
     let store = RemoteStore::new_single_put(ControlledStore::new(Hooks::default()), prefix.clone(), io.clone());
     store.put(&key, contents.clone()).await.unwrap();
     assert!(matches!(
@@ -182,26 +208,26 @@ async fn a_drained_single_put_region_recovers_only_its_exact_committed_write() {
         Err(Error::ConflictingObject(_))
     ));
     io.close_and_wait().await;
-    assert!(!io.has_unknown_publication());
+    assert!(journal.pending.lock().unwrap().is_empty());
 
-    let io = IoRegion::new();
+    let (io, journal) = journaled_region();
     let provider = ControlledStore::new(Hooks { lose_put_reply: true, ..Default::default() });
     let store = RemoteStore::new_single_put(provider.clone(), prefix.clone(), io.clone());
     store.put(&key, contents.clone()).await.unwrap();
     io.close_and_wait().await;
-    assert!(!io.has_unknown_publication());
+    assert!(journal.pending.lock().unwrap().is_empty());
     assert_eq!(paths(&provider.inner).await, ["cell/data.arrow"]);
 
     for (hooks, objects) in [
         (Hooks { fail_before_put: true, ..Default::default() }, Vec::<&str>::new()),
         (Hooks { lose_put_reply: true, forget_put_witness: true, ..Default::default() }, vec!["cell/data.arrow"]),
     ] {
-        let io = IoRegion::new();
+        let (io, journal) = journaled_region();
         let provider = ControlledStore::new(hooks);
         let store = RemoteStore::new_single_put(provider.clone(), prefix.clone(), io.clone());
         assert!(matches!(store.put(&key, contents.clone()).await, Err(Error::Remote { .. })));
         io.close_and_wait().await;
-        assert!(io.has_unknown_publication());
+        assert_eq!(journal.pending.lock().unwrap().len(), 1);
         assert_eq!(paths(&provider.inner).await, objects);
     }
 }
@@ -210,7 +236,7 @@ async fn a_drained_single_put_region_recovers_only_its_exact_committed_write() {
 async fn a_replacement_can_observe_a_closed_writers_exact_publication() {
     let key = ObjectKey::new("data.arrow").unwrap();
     let prefix = ObjectKey::new("cell").unwrap();
-    let io = IoRegion::new();
+    let (io, journal) = journaled_region();
     let provider = ControlledStore::new(Hooks {
         lose_put_reply: true,
         defer_publication_head: true,
@@ -219,7 +245,7 @@ async fn a_replacement_can_observe_a_closed_writers_exact_publication() {
     let old = RemoteStore::new_single_put(provider.clone(), prefix.clone(), io.clone());
     assert!(matches!(old.put(&key, Bytes::from_static(b"sealed")).await, Err(Error::Remote { .. })));
     io.close_and_wait().await;
-    let pending = io.pending_publications();
+    let pending = journal.pending.lock().unwrap().clone();
     assert_eq!(pending.len(), 1);
     let (&attempt, retained_key) = pending.first_key_value().unwrap();
     assert_eq!(retained_key, &key);
@@ -229,6 +255,51 @@ async fn a_replacement_can_observe_a_closed_writers_exact_publication() {
     let reaper = RemoteStore::new_single_put(provider, prefix, IoRegion::new());
     assert!(reaper.publication_confirmed(retained_key, attempt).await.unwrap());
     assert!(!reaper.publication_confirmed(retained_key, uuid::Uuid::new_v4()).await.unwrap());
+}
+
+struct PublicationGate {
+    admission: Arc<Gate>,
+    refused: bool,
+    settlements: AtomicUsize,
+}
+
+#[async_trait]
+impl PublicationJournal for PublicationGate {
+    async fn admit(&self, _key: &ObjectKey, _attempt: uuid::Uuid) -> rtdb_storage::Result<()> {
+        self.admission.enter().await;
+        if self.refused {
+            return Err(Error::Task("directory refused the publication".into()));
+        }
+        Ok(())
+    }
+
+    async fn settle(&self, _key: &ObjectKey, _attempt: uuid::Uuid, submitted: bool) -> rtdb_storage::Result<()> {
+        assert_eq!(submitted, !self.refused);
+        self.settlements.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn a_tracked_remote_put_waits_for_durable_admission_before_contacting_the_provider() {
+    for refused in [false, true] {
+        let gate = Gate::new();
+        let journal = Arc::new(PublicationGate { admission: gate.clone(), refused, settlements: AtomicUsize::new(0) });
+        let mut io = IoRegion::new();
+        Arc::get_mut(&mut io).unwrap().track_publications(journal.clone());
+        let provider = ControlledStore::new(Hooks::default());
+        let store = RemoteStore::new_single_put(provider.clone(), ObjectKey::new("cell").unwrap(), io.clone());
+        let key = ObjectKey::new("data.arrow").unwrap();
+        let mut write = Box::pin(store.put(&key, Bytes::from_static(b"sealed")));
+        assert_pending(write.as_mut()).await;
+        gate.arrived().await;
+        assert_eq!(provider.observed.calls.load(Ordering::SeqCst), 0);
+        gate.release();
+        assert_eq!(bounded(write).await.is_err(), refused);
+        io.close_and_wait().await;
+        assert_eq!(journal.settlements.load(Ordering::SeqCst), 1);
+        assert_eq!(provider.observed.calls.load(Ordering::SeqCst), if refused { 0 } else { 1 });
+    }
 }
 
 async fn assert_pending<F: Future + ?Sized>(mut future: Pin<&mut F>) {

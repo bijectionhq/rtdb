@@ -444,7 +444,7 @@ async fn a_checkpoint_capture_keeps_its_cut_and_archives_only_sealed_objects() {
     let destination = tempfile::tempdir().unwrap();
     let archive = CellStorage::Local { root: destination.path().to_owned() };
     let operation = uuid::Uuid::new_v4();
-    let capture = rtdb_multi::archive::capture(cell.directory.as_ref(), &cell.storage(), &archive, &cell.keys(), id, operation).await.unwrap();
+    let capture = rtdb_multi::archive::capture(cell.directory.clone(), &cell.storage(), &archive, &cell.keys(), id, operation).await.unwrap();
     assert_eq!(capture.point.checkpoint, first);
     assert!(capture.objects.iter().any(|object| object.name.ends_with(".arrow")));
     assert!(capture.objects.iter().any(|object| object.name.starts_with("blocks/")));
@@ -457,11 +457,11 @@ async fn a_checkpoint_capture_keeps_its_cut_and_archives_only_sealed_objects() {
     }
     client.simple_query("INSERT INTO orders (_id, detail) VALUES (2, 'later')").await.unwrap();
     assert!(advance(Some(first.block)).await.block > first.block);
-    let replay = rtdb_multi::archive::capture(cell.directory.as_ref(), &cell.storage(), &archive, &cell.keys(), id, operation).await.unwrap();
+    let replay = rtdb_multi::archive::capture(cell.directory.clone(), &cell.storage(), &archive, &cell.keys(), id, operation).await.unwrap();
     assert_eq!(replay, capture);
     let other_destination = tempfile::tempdir().unwrap();
     let other_archive = CellStorage::Local { root: other_destination.path().to_owned() };
-    assert!(rtdb_multi::archive::capture(cell.directory.as_ref(), &cell.storage(), &other_archive, &cell.keys(), id, operation).await.is_err());
+    assert!(rtdb_multi::archive::capture(cell.directory.clone(), &cell.storage(), &other_archive, &cell.keys(), id, operation).await.is_err());
     assert!(rtdb_multi::archive::begin_retirement(cell.directory.as_ref(), id).await.is_err());
     assert!(rtdb_multi::archive::restore(cell.directory.as_ref(), &cell.storage(), &archive, &cell.keys(), id, operation, 4 << 20).await.is_err());
     drop(client);
@@ -498,14 +498,14 @@ async fn restoring_the_current_archive_preserves_the_ordered_tail_and_authority(
     let archive = CellStorage::Local { root: archive_dir.path().to_owned() };
     let operation = uuid::Uuid::new_v4();
     let storage = cell.storage();
-    let capture = rtdb_multi::archive::capture(cell.directory.as_ref(), &storage, &archive, &cell.keys(), id, operation).await.unwrap();
+    let capture = rtdb_multi::archive::capture(cell.directory.clone(), &storage, &archive, &cell.keys(), id, operation).await.unwrap();
     let object = capture.objects.iter().find(|object| object.name.ends_with(".arrow")).unwrap();
     let path = archive_dir.path().join(format!("checkpoint-captures/{id}/{operation}/objects/{}", object.name));
     let ciphertext = std::fs::read(&path).unwrap();
     let mut corrupt = ciphertext.clone();
     corrupt[0] ^= 1;
     std::fs::write(&path, corrupt).unwrap();
-    assert!(rtdb_multi::archive::capture(cell.directory.as_ref(), &storage, &archive, &cell.keys(), id, operation).await.is_err());
+    assert!(rtdb_multi::archive::capture(cell.directory.clone(), &storage, &archive, &cell.keys(), id, operation).await.is_err());
     assert!(rtdb_multi::archive::restore(cell.directory.as_ref(), &storage, &archive, &cell.keys(), id, operation, 4 << 20).await.is_err());
     let still_live = cell.directory.deployment(&id.to_string()).await.unwrap().unwrap();
     assert_eq!(still_live.lifecycle, Lifecycle::Live);

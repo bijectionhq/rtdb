@@ -128,16 +128,16 @@ persisted lock. A missing lock witness keeps the region pending. For remote
 storage, a producer that exits without acknowledging drain keeps cleanup
 pending until the provider's outstanding work can be accounted for.
 Each remote serving object is published with one conditional PUT of its
-sealed bytes directly to its final key. The PUT carries a unique publication
-identity in its metadata. An ambiguous response settles only if a fresh
-HEAD returns that identity. Missing or unrelated metadata keeps the region's
-admission pending. When I/O joins, its owner records the closed admission
-and exact unresolved publication identities in the directory. A later
-reaper can release it after confirming those objects in the original
-serving or checkpoint namespace. The reaper holds ordinary serving
-collection while the directory retains those publication identities.
-An owner that exits before recording its close still leaves an open
-admission.
+sealed bytes directly to its final key. Serving and checkpoint writers
+record the exact object key and a unique publication identity in the
+directory before sending the PUT. The PUT carries that identity in its
+metadata. An acknowledged success or definite refusal clears the attempt.
+For an ambiguous response, only a fresh HEAD returning that exact identity
+can confirm the publication. When the owner closes its I/O, a reaper can
+release the closed admission after checking every retained attempt.
+Ordinary serving collection preserves those object keys. An owner that
+exits before recording its close still leaves an open admission and its
+write-ahead inventory.
 
 `rtdb-multi capture --id UUID --operation UUID` retains the selected
 published checkpoint and copies its catalog, table metadata and referenced

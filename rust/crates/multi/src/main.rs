@@ -367,7 +367,7 @@ async fn run(arguments: Vec<String>) -> Result<()> {
             let archive = CellStorage::parse(arguments.required("archive-root")?)?;
             let keys = key_service(arguments.required("keys")?).await?;
             let capture = rtdb_multi::archive::capture(
-                directory.as_ref(), &storage, &archive, keys.as_ref(),
+                directory, &storage, &archive, keys.as_ref(),
                 installation_id(&arguments)?, required_uuid(&arguments, "operation")?,
             ).await?;
             println!("{}", serde_json::to_string_pretty(&capture).expect("a capture serializes"));

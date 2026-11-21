@@ -516,7 +516,7 @@ async fn checkpoint_objects(
 /// fixes the checkpoint before any payload copy. An interrupted copy can
 /// resume while its original inputs remain available.
 pub async fn capture(
-    directory: &dyn Directory,
+    directory: Arc<dyn Directory>,
     storage: &CellStorage,
     destination: &CellStorage,
     keys: &dyn KeyService,
@@ -534,8 +534,11 @@ pub async fn capture(
     let local = matches!((storage, destination), (CellStorage::Local { .. }, CellStorage::Local { .. }));
     let witness = if local { keys.hold_local_storage_region(region)? } else { None };
     let witnessed = witness.is_some();
-    let io = IoRegion::new().child_holding(witness.map(|file| Arc::new(file) as Arc<dyn Send + Sync>));
-    let admitted = update_installation(directory, &id, |record| {
+    let mut io = IoRegion::new().child_holding(witness.map(|file| Arc::new(file) as Arc<dyn Send + Sync>));
+    if matches!(destination, CellStorage::S3 { .. }) {
+        crate::store::track_publications(&mut io, directory.clone(), id.clone(), region, None);
+    }
+    let admitted = update_installation(directory.as_ref(), &id, |record| {
         if !matches!(record.lifecycle, Lifecycle::Live | Lifecycle::Quarantined)
             || record.move_from.is_some() || record.archive_retirement.is_some()
         {
@@ -559,34 +562,35 @@ pub async fn capture(
                 remote_disposal: None,
             });
         }
-        record.storage_regions.insert(region, rtdb_directory::StorageRegion::Open);
+        record.storage_regions.insert(region, if local {
+            rtdb_directory::StorageRegion::Local
+        } else {
+            crate::store::remote_storage_region(Some(operation))
+        });
         Ok(())
     }).await;
     let record = match admitted {
         Ok(record) => record,
         Err(error) => {
-            // A directory transport failure can hide a committed admission.
-            // Leave its durable local witness available to the reaper.
+            // No provider request was sent. Cancel any admission whose
+            // directory response was lost, including a late CAS.
             drop(io);
-            if witnessed && error.code == "rtdb.multi/capture" {
+            if error.code != "rtdb.multi/capture" {
+                crate::store::release_region(directory.as_ref(), &id, region, true).await?;
+            }
+            if witnessed {
                 keys.forget_local_storage_region(region)?;
             }
             return Err(error);
         },
     };
-    let point = capture_point(&record, deployment, operation, &binding)?;
-    let result = capture_registered(directory, storage, destination, keys, &record, point, io.clone()).await;
+    let result = async {
+        let point = capture_point(&record, deployment, operation, &binding)?;
+        capture_registered(directory.as_ref(), storage, destination, keys, &record, point, io.clone()).await
+    }.await;
     io.close_and_wait().await;
-    let pending = io.pending_publications();
-    if !pending.is_empty() {
-        crate::store::close_remote_region(directory, &id, region, Some(operation), &pending).await?;
-        return Err(unavailable("The archive provider's publication is unconfirmed"));
-    }
     drop(io);
-    update_installation(directory, &id, |record| {
-        record.storage_regions.remove(&region);
-        Ok(())
-    }).await?;
+    crate::store::release_region(directory.as_ref(), &id, region, false).await?;
     if witnessed {
         keys.forget_local_storage_region(region)?;
     }

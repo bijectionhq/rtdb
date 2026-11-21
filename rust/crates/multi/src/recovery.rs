@@ -88,7 +88,7 @@ impl RecoveryService {
         })
     }
 
-    async fn dispatch(&self, directory: &dyn Directory, request: Request) -> Result<Reply> {
+    async fn dispatch(&self, directory: Arc<dyn Directory>, request: Request) -> Result<Reply> {
         if !self.token.accepts(&request.token)
             || request.capture.is_nil()
             || request.authority.is_nil()
@@ -132,7 +132,7 @@ impl RecoveryService {
                     return Ok(Reply::Refused);
                 }
                 let recovery = archive::restore_checkpoint(
-                    directory,
+                    directory.as_ref(),
                     &self.storage,
                     &self.archive,
                     self.keys.as_ref(),
@@ -160,7 +160,7 @@ impl RecoveryService {
         }
     }
 
-    async fn handle(&self, directory: &dyn Directory, line: &str) -> Reply {
+    async fn handle(&self, directory: Arc<dyn Directory>, line: &str) -> Reply {
         let Ok(request) = serde_json::from_str::<Request>(line) else {
             return Reply::Refused;
         };
@@ -226,7 +226,7 @@ pub async fn serve(
             let reply = if let Ok(_operation) = operations.try_acquire() {
                 // Finishing the operation releases its durable storage registration
                 // even when the client disconnects before receiving the receipt.
-                service.handle(directory.as_ref(), &line).await
+                service.handle(directory, &line).await
             } else {
                 Reply::Deferred
             };
@@ -309,19 +309,19 @@ mod tests {
         };
         assert!(matches!(
             service
-                .handle(directory.as_ref(), &request("invalid", authority))
+                .handle(directory.clone(), &request("invalid", authority))
                 .await,
             Reply::Refused
         ));
         assert!(matches!(
             service
-                .handle(directory.as_ref(), &request(&token, Uuid::new_v4()))
+                .handle(directory.clone(), &request(&token, Uuid::new_v4()))
                 .await,
             Reply::Refused
         ));
         assert!(matches!(
             service
-                .handle(directory.as_ref(), &request(&token, authority))
+                .handle(directory.clone(), &request(&token, authority))
                 .await,
             Reply::Deferred
         ));

@@ -6,6 +6,15 @@ use object_store::{Attribute, GetOptions, ObjectStore as ProviderStore, ObjectSt
 use std::{ops::Range, sync::Arc};
 use tokio::io::{AsyncReadExt, AsyncSeekExt};
 
+/// The storage-region owner records a provider write before it can take effect.
+#[async_trait]
+pub trait PublicationJournal: Send + Sync {
+    async fn admit(&self, key: &ObjectKey, attempt: uuid::Uuid) -> Result<()>;
+    /// Records terminal provider evidence, or cancels an admission that did
+    /// not reach the provider. A lost admit reply still needs a cancellation.
+    async fn settle(&self, key: &ObjectKey, attempt: uuid::Uuid, submitted: bool) -> Result<()>;
+}
+
 #[derive(Clone)]
 pub struct RemoteStore {
     objects: Arc<RemoteObjects>,
@@ -210,21 +219,29 @@ impl RemoteObjects {
 
     async fn put(&self, key: &ObjectKey, bytes: Bytes, authority: Option<&IoRegion>) -> Result<()> {
         let mut options = PutOptions { mode: PutMode::Create, ..Default::default() };
-        let publication = authority.map(|io| {
+        let journal = authority.and_then(IoRegion::publication_journal);
+        let attempt = if authority.is_some() {
             let attempt = uuid::Uuid::new_v4();
-            options.attributes.insert(publication_attribute(), attempt.to_string().into());
-            (attempt, io.publication(attempt, key.clone()))
-        });
-        let response = self.client.put_opts(&self.path(key), bytes.clone().into(), options).await;
-        if let Some((attempt, publication)) = publication {
-            if matches!(&response, Ok(_) | Err(object_store::Error::AlreadyExists { .. }
-                | object_store::Error::Precondition { .. } | object_store::Error::PermissionDenied { .. }))
+            if let Some(journal) = journal
+                && let Err(error) = journal.admit(key, attempt).await
             {
-                publication.confirm();
-            } else if matches!(self.publication_confirmed(key, attempt).await, Ok(true)) {
-                publication.confirm();
-                return Ok(());
+                journal.settle(key, attempt, false).await?;
+                return Err(error);
             }
+            options.attributes.insert(publication_attribute(), attempt.to_string().into());
+            Some(attempt)
+        } else {
+            None
+        };
+        let response = self.client.put_opts(&self.path(key), bytes.clone().into(), options).await;
+        if let Some(attempt) = attempt {
+            let terminal = matches!(&response, Ok(_) | Err(object_store::Error::AlreadyExists { .. }
+                | object_store::Error::Precondition { .. } | object_store::Error::PermissionDenied { .. }));
+            let recovered = !terminal && matches!(self.publication_confirmed(key, attempt).await, Ok(true));
+            if (terminal || recovered) && let Some(journal) = journal {
+                journal.settle(key, attempt, true).await?;
+            }
+            if recovered { return Ok(()); }
         }
         match response {
             Ok(_) => Ok(()),

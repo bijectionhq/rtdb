@@ -186,11 +186,13 @@ pub struct DeploymentRecord {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "state", rename_all = "snake_case")]
 pub enum StorageRegion {
-    Open,
-    /// The owner joined all I/O and retained each ambiguous write by the
-    /// exact provider publication identity and key. No new I/O can start.
-    ClosedRemote {
+    Local,
+    Remote {
         archive: Option<uuid::Uuid>,
+        /// When closed, the region owner has joined its I/O and may issue
+        /// no further requests. Uncertain publications still need evidence.
+        closed: bool,
+        /// Written before a conditional provider mutation is submitted.
         publications: BTreeMap<uuid::Uuid, String>,
     },
 }

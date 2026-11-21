@@ -1,15 +1,15 @@
-use std::{collections::BTreeMap, sync::Arc};
+use std::sync::Arc;
 use parking_lot::Mutex;
 use tokio_util::task::{TaskTracker, task_tracker::TaskTrackerToken};
-use crate::{Error, ObjectKey, Result};
-use uuid::Uuid;
+use crate::{Error, Result};
 
 pub struct IoRegion {
     closed: Mutex<bool>,
     tasks: TaskTracker,
     parent: Option<Arc<IoRegion>>,
     lifetime: Option<Arc<dyn Send + Sync>>,
-    pending_publications: Mutex<BTreeMap<Uuid, ObjectKey>>,
+    #[cfg(feature = "remote")]
+    publication_journal: Option<Arc<dyn crate::remote::PublicationJournal>>,
 }
 pub(crate) struct IoAdmission {
     tokens: Vec<TaskTrackerToken>,
@@ -24,7 +24,7 @@ impl IoAdmission {
 }
 impl IoRegion {
     pub fn new() -> Arc<Self> {
-        Arc::new(Self { closed: Mutex::new(false), tasks: TaskTracker::new(), parent: None, lifetime: None, pending_publications: Mutex::new(BTreeMap::new()) })
+        Self::region(None, None)
     }
     /// Operations admitted through this child also belong to every ancestor's drain.
     /// Closing a child leaves siblings open; closing an ancestor rejects subsequent admissions through the child.
@@ -35,18 +35,24 @@ impl IoRegion {
     /// Retain a provider lifetime in every admitted task. An unfinished task
     /// keeps its authority witness even if the async region owner is dropped.
     pub fn child_holding(self: &Arc<Self>, lifetime: Option<Arc<dyn Send + Sync>>) -> Arc<Self> {
-        Arc::new(Self { closed: Mutex::new(false), tasks: TaskTracker::new(), parent: Some(Arc::clone(self)), lifetime, pending_publications: Mutex::new(BTreeMap::new()) })
+        Self::region(Some(Arc::clone(self)), lifetime)
     }
-    pub fn has_unknown_publication(&self) -> bool {
-        !self.pending_publications.lock().is_empty()
+    fn region(parent: Option<Arc<IoRegion>>, lifetime: Option<Arc<dyn Send + Sync>>) -> Arc<Self> {
+        Arc::new(Self {
+            closed: Mutex::new(false), tasks: TaskTracker::new(), parent, lifetime,
+            #[cfg(feature = "remote")]
+            publication_journal: None,
+        })
     }
-    /// The exact writes the owner must retain after closing and joining the region.
-    pub fn pending_publications(&self) -> BTreeMap<Uuid, ObjectKey> {
-        self.pending_publications.lock().clone()
+    /// Gives an unused region a durable owner for its provider writes.
+    #[cfg(feature = "remote")]
+    pub fn track_publications(&mut self, journal: Arc<dyn crate::remote::PublicationJournal>) {
+        assert!(self.publication_journal.is_none(), "a region has one publication journal");
+        self.publication_journal = Some(journal);
     }
     #[cfg(feature = "remote")]
-    pub(crate) fn publication(&self, attempt: Uuid, key: ObjectKey) -> Publication<'_> {
-        Publication { region: self, pending: Some((attempt, key)) }
+    pub(crate) fn publication_journal(&self) -> Option<&dyn crate::remote::PublicationJournal> {
+        self.publication_journal.as_deref()
     }
     pub(crate) fn admit(&self) -> Result<IoAdmission> {
         let closed = self.closed.lock();
@@ -95,26 +101,6 @@ impl IoRegion {
             drop(operation);
         }).await.map_err(|error| Error::Task(error.to_string()))?;
         receiver.await.map_err(|error| Error::Task(error.to_string()))?
-    }
-}
-
-#[cfg(feature = "remote")]
-pub(crate) struct Publication<'a> {
-    region: &'a IoRegion,
-    pending: Option<(Uuid, ObjectKey)>,
-}
-
-#[cfg(feature = "remote")]
-impl Publication<'_> {
-    pub(crate) fn confirm(mut self) { self.pending.take(); }
-}
-
-#[cfg(feature = "remote")]
-impl Drop for Publication<'_> {
-    fn drop(&mut self) {
-        if let Some((attempt, key)) = self.pending.take() {
-            self.region.pending_publications.lock().insert(attempt, key);
-        }
     }
 }
 
