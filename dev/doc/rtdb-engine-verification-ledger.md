@@ -127,7 +127,7 @@ A proof of a candidate is conditional on the explicitly stated contract and work
 | LOG10 · Failure reporting | Open | — |
 | LOG11 · Stream separation | Partial | [Main Logkeeper reply rank](rtdb-engine-proof-evidence.md#main-evidence) · [Lean model of retained journal slot identity](rtdb-engine-proof-evidence.md#multi-evidence) |
 | LOG12 · Retained-history audit | Partial | [Lean page-chain and quorum certification laws, and online and offline native tests](rtdb-engine-proof-evidence.md#main-evidence) |
-| LOG13 · Terminal stream retirement | Open | — |
+| LOG13 · Terminal stream retirement | Partial | [Lean terminal control and all-replica settlement, Kani admission, and journal restart](rtdb-engine-proof-evidence.md#main-evidence) |
 
 ## Memory trie and live indexing
 

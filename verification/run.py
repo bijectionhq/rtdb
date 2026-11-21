@@ -580,6 +580,20 @@ def verify_logkeeper(args, scratch):
     }
     verify_lean_model(args, scratch, models / "RetainedAudit.lean", "logkeeper-audit", audit_controls, 5)
 
+    retirement_controls = {
+        "erase-tombstone-on-snapshot": (
+            "⟨state.promised, state.retired⟩",
+            "⟨state.promised, false⟩",
+            ["compacting_and_replaying_preserves_the_control_state"],
+        ),
+        "retire-on-any-reply": (
+            "addressed.all settled",
+            "addressed.any settled",
+            ["retirement_completion_covers_every_addressed_replica", "a_majority_does_not_establish_retirement_of_all_replicas"],
+        ),
+    }
+    verify_lean_model(args, scratch, models / "TerminalJournal.lean", "logkeeper-retirement", retirement_controls, 5)
+
 
 def verify_generation_retention(args, scratch):
     path = Path("verification/lean/GenerationRetention.lean")
