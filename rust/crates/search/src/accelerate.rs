@@ -336,11 +336,12 @@ impl Candidates<'_> {
     fn best_file(&self) -> Option<(usize, f64)> {
         self.files.iter().enumerate().filter_map(|(index, (_, file))| file.bound().map(|bound| (index, bound))).max_by(|left, right| left.1.total_cmp(&right.1))
     }
-    /// No IID not yet handed out has a matching event scoring above this.
-    fn frontier(&mut self) -> f64 {
+    /// Stop only when the kth verified score beats both remaining sources.
+    fn can_stop(&mut self, kth: f64) -> bool {
         self.drop_seen();
-        let pending = self.pending.peek().map_or(f64::NEG_INFINITY, |top| top.0);
-        self.best_file().map_or(pending, |(_, bound)| bound.max(pending))
+        let pending = self.pending.peek().map(|top| top.0.to_bits());
+        let unread = self.best_file().map(|(_, bound)| bound.to_bits());
+        crate::rank_cutoff::can_stop(kth.to_bits(), pending, unread)
     }
     /// The next IID, best first, with its best event's score and whether that event is exactly visible.
     fn next(&mut self) -> Result<Option<(f64, Iid, bool)>> {
@@ -402,7 +403,7 @@ impl SearchAccelerator {
         loop {
             if verified.len() >= limit {
                 verified.sort_by(descending);
-                if verified[limit - 1].0 > candidates.frontier() { break; }
+                if candidates.can_stop(verified[limit - 1].0) { break; }
             }
             let mut iids = BTreeSet::new();
             let mut handed = 0;

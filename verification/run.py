@@ -155,6 +155,20 @@ def verify_rank_bound(args, scratch):
     print("rank-ieee-witness: checked exact reversal and padded bound")
 
 
+def verify_rank_cutoff_order(args, scratch):
+    path = Path("verification/smt/rank-cutoff-order.smt2")
+    for name, expected in (("baseline", "unsat"), ("distinct-zeroes", "sat")):
+        case = f"rank-cutoff-order-{name}"
+        directory = scratch / case
+        source = clone_file(path, directory)
+        if name == "distinct-zeroes":
+            replace_once(source, "(ite (= bits #x8000000000000000) #x0000000000000000 bits)", "bits")
+        checked = run_case([args.z3, "-T:20", str(source)], directory, args.evidence, case)
+        if checked.returncode or checked.stderr or checked.stdout.splitlines() != [expected]:
+            raise ValueError(f"{case}: expected {expected}, observed {checked.stdout.strip()}")
+        print(f"{case}: {expected}")
+
+
 def lean_error_theorems(source, relative, output):
     source_lines = source.read_text().splitlines()
     errors = re.findall(rf"^{re.escape(str(relative))}:(\d+):\d+: error", output, re.M)
@@ -779,6 +793,7 @@ def main():
         verify_tla(args, directory)
         verify_verus(args, directory)
         verify_rank_bound(args, directory)
+        verify_rank_cutoff_order(args, directory)
         verify_alloy(args, directory)
         verify_apalache(args, directory)
         verify_maude(args, directory)

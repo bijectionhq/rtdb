@@ -225,7 +225,9 @@ rule RepairUnreadableSearchFile {
 --   2. IIDs in the scan's selected IID scope are taken best bound first, in batches.
 --      A document left exactly visible by CutByLaterEvents counts as verified when the scan's only predicate is the MATCH used to narrow candidates.
 --      The rest, live rows, documents a tie left inexact, and every IID where the scan has other predicates, are verified by running the scan itself over the partition restricted to them, with its own predicates.
---   3. Verification stops once n verified rows score strictly above every bound not yet taken, every unscored window's included.
+--   3. Verification can stop early only when n verified rows score strictly above both sources: already-scored candidates and unread windows.
+--      Either source can be empty. Equal bounds, including the two signed zeroes, keep verification going.
+--      An invalid score or bound supplied to this decision also keeps verification going.
 --   4. The scan is restricted to the IIDs of verified rows scoring at least the n-th, ties included, and the sort above keeps the first n as it would have.
 --
 -- The visible row of an IID is one of its matching events, so its bound is never below its score, and no IID left out can hold one of the first n rows.

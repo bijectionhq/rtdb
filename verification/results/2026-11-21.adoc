@@ -424,3 +424,22 @@ The complete formal suite passed on `7f38bfa7e`.
 It includes the ordered bucket proof, the two-reader authorization model, 16 bounded TLC baselines with 33 failure or reachability controls, and the prior 54 Verus obligations with 26 controls.
 Its input manifest SHA-256 is `528e740c7815a74ff1cab78fe9007c5557a4996e211c1aa9c45b52e14fdfee2e`.
 The Rust source is identical to the source in the combined run at `63e162d6f`, which included compiler and native replay controls.
+
+== Strict production ranking cutoff
+
+Verus checked eight obligations in link:../verus/rank_cutoff/proof.rs[the cutoff area].
+When the pending heap and unread windows supply their respective maximum bounds, the decision allows an early stop exactly when a valid kth score strictly exceeds every supplied bound.
+An empty source imposes no comparison.
+The two signed zeroes compare equal and an invalid input to the decision prevents an early stop.
+The SQL ranker's decision calls the verified Rust function.
+
+Both production-only mutations failed their local postconditions.
+Allowing equality and weakening the matching contract failed both independent tie laws.
+Omitting unread windows and weakening the matching contract failed the unread-window tie law.
+
+Z3 found no counterexample to equality of binary64 strict order and the unsigned key comparison across the admitted domain.
+Removing signed-zero normalization gave a counterexample.
+All 29 search-crate unit tests and all 18 native SQL search tests passed, along with seven node unit tests.
+
+The proof depends on the frontier inputs.
+Showing that candidate visibility checks, heap selection, window enumeration and index metadata collectively supply an upper bound for every qualifying row is a separate obligation.
