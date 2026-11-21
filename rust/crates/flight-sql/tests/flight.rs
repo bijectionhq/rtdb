@@ -261,9 +261,15 @@ async fn prepared_parameters_are_positional_all_batches_update_and_old_ticket_ke
     let query = client.prepare("SELECT ? AS n", None).await;
     client.upload(CommandPreparedStatementQuery { prepared_statement_handle: query.prepared_statement_handle.clone() }, vec![arguments(vec![41, 99])]).await;
     let descriptor = FlightDescriptor::new_cmd(CommandPreparedStatementQuery { prepared_statement_handle: query.prepared_statement_handle.clone() }.as_any().encode_to_vec());
-    let request = client.request(descriptor); let old = client.client.get_flight_info(request).await.unwrap().into_inner();
+    let request = client.request(descriptor.clone()); let old = client.client.get_flight_info(request).await.unwrap().into_inner();
     client.upload(CommandPreparedStatementQuery { prepared_statement_handle: query.prepared_statement_handle }, vec![arguments(vec![42])]).await;
-    assert_eq!(integer(&client.redeem(&old).await[0], 0, 0), 41); running.stop().await;
+    let request = client.request(descriptor); let current = client.client.get_flight_info(request).await.unwrap().into_inner();
+    assert_eq!(integer(&client.redeem(&old).await[0], 0, 0), 41);
+    let current_schema = current.clone().try_decode_schema().unwrap();
+    let current = client.redeem(&current).await;
+    assert_eq!(current[0].schema().as_ref(), &current_schema);
+    assert_eq!(integer(&current[0], 0, 0), 42);
+    running.stop().await;
 }
 
 #[tokio::test]

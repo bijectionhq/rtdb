@@ -19,6 +19,38 @@ fn context(state: Option<&PartitionState>, memory: &Arc<MemoryBudget>) -> Arc<Qu
 }
 
 #[tokio::test]
+async fn prepared_parameter_projection_keeps_the_bound_arrow_buffers() {
+    use arrow_array::{Int64Array, RecordBatch, StringArray, cast::AsArray, types::Int64Type};
+    use arrow_schema::{DataType, Field, Schema};
+    use rtdb_columnar::OwnedBatch;
+
+    let memory = MemoryBudget::new(1 << 24);
+    let context = context(None, &memory);
+    let schema = Arc::new(Schema::new(vec![Field::new("client-int", DataType::Int64, false), Field::new("client-text", DataType::Utf8, false)]));
+    let batch = RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(vec![42])), Arc::new(StringArray::from(vec!["bound"]))]).unwrap();
+    let bound = OwnedBatch::new(batch, &memory).unwrap();
+    let types = [LogicalType::Scalar(ScalarType::I64), LogicalType::Scalar(ScalarType::Utf8)];
+    let pointer = bound.batch().column(0).as_primitive::<Int64Type>().values().as_ptr();
+    let query = PreparedSql::prepare("SELECT $2 AS label, $1 AS n", &context, PrepareOptions::default(), ResultSignaturePolicy::Dynamic).unwrap();
+    let advertised = query.result_schema(&context, &types).unwrap();
+
+    let empty = PreparedSql::prepare("SELECT FROM (VALUES ($1, $2)) AS t(a, b)", &context, PrepareOptions::default(), ResultSignaturePolicy::Dynamic).unwrap();
+    let mut empty = empty.try_open_parameter_projection(Arc::clone(&context), &bound, &types).await.unwrap().unwrap();
+    let empty_row = empty.next_batch().await.unwrap().unwrap();
+    assert_eq!((empty_row.batch().num_columns(), empty_row.batch().num_rows()), (0, 1));
+
+    let mut cursor = query.try_open_parameter_projection(context, &bound, &types).await.unwrap().unwrap();
+    drop(bound);
+    let output = cursor.next_batch().await.unwrap().unwrap();
+
+    assert_eq!(cursor.schema(), advertised.schema());
+    assert_eq!(output.batch().column(0).as_string::<i32>().value(0), "bound");
+    assert_eq!(output.batch().column(1).as_primitive::<Int64Type>().value(0), 42);
+    assert_eq!(output.batch().column(1).as_primitive::<Int64Type>().values().as_ptr(), pointer);
+    assert!(cursor.next_batch().await.unwrap().is_none());
+}
+
+#[tokio::test]
 async fn postgres_preparation_keeps_inline_xtql_source_and_result_fields() {
     let memory = MemoryBudget::new(1 << 26);
     let context = context(None, &memory);

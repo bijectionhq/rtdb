@@ -4,8 +4,8 @@ use arrow_array::{ArrayRef, RecordBatch, RecordBatchOptions};
 use arrow_schema::Schema as ArrowSchema;
 use async_trait::async_trait;
 use rtdb_columnar::{MemoryBudget, MemoryReservation, OwnedBatch, copy_array, estimate_builder_bytes_refs, to_field};
-use rtdb_plan::{Catalog, ExecutionError, ExecutionSample, ExecutionTimer, Relation, Schema};
-use rtdb_types::{LogicalType, Result, Value};
+use rtdb_plan::{Catalog, ExecutionError, ExecutionSample, ExecutionTimer, Expr, Relation, RelationNode, Schema};
+use rtdb_types::{LogicalType, Result, ScalarType, Value};
 
 use crate::{QueryContext, context::{Execution, cancelled}, invalid};
 use crate::runtime_schema::{EmissionMode, EmittedRelation, RuntimeSchema, parameter_types};
@@ -189,17 +189,69 @@ impl PreparedQuery {
         self.open(context, parameters, text, Batching::Columns).await
     }
 
-    async fn open(&self, context: Arc<QueryContext>, parameters: Vec<Value>, text: Option<&str>, batching: Batching) -> Result<QueryCursor> {
-        let counter = context.query_cpu.clone();
-        let open = self.open_retained(context.clone(), parameters, text, batching);
-        let lease = context.catalog.read_lease();
-        rtdb_storage::IoRegion::retaining(context, rtdb_storage::IoRegion::leased(lease, async {
-            let mut open = std::pin::pin!(open);
-            match counter {
-                Some(counter) => crate::query_cpu::measure(counter, open.as_mut()).await,
-                None => open.await,
+    pub fn is_parameter_projection(&self) -> bool {
+        if !matches!(self.output, QueryOutput::Rows) || self.settings.as_ref() != &rtdb_plan::QuerySettings::default()
+            || self.required_parameter_count == 0 { return false; }
+        let mut relation = self.relation.as_ref();
+        loop {
+            match relation.node() {
+                RelationNode::Values { rows } => return matches!(rows.as_slice(), [row] if row.iter().all(|expr| matches!(expr, Expr::Parameter { .. }))),
+                RelationNode::Project { input, expressions } | RelationNode::Rename { input, expressions, .. }
+                    if expressions.iter().all(|expression| matches!(expression.expr, Expr::Parameter { .. } | Expr::Column { .. })) => relation = input,
+                _ => return false,
             }
-        })).await
+        }
+    }
+
+    /// Opens a pure parameter projection using the bound arrays when their fields have the emitted layout.
+    pub async fn execute_parameter_projection(
+        &self, context: Arc<QueryContext>, arguments: &OwnedBatch, types: &[LogicalType], text: Option<&str>,
+    ) -> Result<Option<QueryCursor>> {
+        measured_open(Arc::clone(&context), async { self.open_parameter_projection(context, arguments, types, text) }).await
+    }
+
+    fn open_parameter_projection(
+        &self, context: Arc<QueryContext>, arguments: &OwnedBatch, types: &[LogicalType], text: Option<&str>,
+    ) -> Result<Option<QueryCursor>> {
+        let batch = arguments.batch();
+        if batch.num_rows() != 1 || batch.num_columns() != types.len() || self.required_parameter_count != types.len()
+            || !self.is_parameter_projection() || !types.iter().all(direct_parameter_type) {
+            return Ok(None);
+        }
+        let schema = self.emit_result_schema(&context, types)?;
+        let runtime_schema = EmittedRelation::derive(Arc::clone(&self.relation), &context.catalog, types, &context.memory)?.output();
+        let metadata = context.memory.reserve(crate::runtime_schema::allocation_bound(&self.relation)?)?;
+        let mut fields = Vec::with_capacity(runtime_schema.schema().len());
+        let mut arrays = Vec::with_capacity(runtime_schema.schema().len());
+        for (position, result) in runtime_schema.schema().fields().iter().enumerate() {
+            let Some(index) = projected_parameter(&self.relation, position) else { return Ok(None); };
+            let field = to_field(&result.name, &result.data_type)?;
+            let Some(array) = batch.columns().get(index) else { return Ok(None); };
+            if field.data_type() != array.data_type() || field.metadata() != batch.schema_ref().field(index).metadata()
+                || array.nulls().is_some() {
+                return Ok(None);
+            }
+            fields.push(field);
+            arrays.push(rtdb_columnar::retain_array(Arc::clone(array), &metadata)?);
+        }
+        let options = RecordBatchOptions::new().with_row_count(Some(1));
+        let projected = RecordBatch::try_new_with_options(Arc::new(ArrowSchema::new(fields)), arrays, &options).map_err(|error| invalid("output-arrow", error))?;
+        let projected = match OwnedBatch::with_reservation(projected, Arc::clone(arguments.reservation())) {
+            Ok(batch) => batch,
+            Err(error) if error.code == "rtdb/undersized-reservation" => return Ok(None),
+            Err(error) => return Err(error),
+        };
+        let context = context.apply_settings(&self.settings, &[])?;
+        let query_span = crate::trace::QueryTrace::start(&context, text);
+        let context = Arc::clone(&context).with_tracer(context.tracer.clone(), query_span.as_ref().map(|span| span.context()));
+        let trace = crate::trace::CursorTrace::new(&context, "output", "query.cursor.output", true);
+        let sample = Some(ExecutionSample::new(context.execution_observer.clone(), ExecutionTimer::Query));
+        Ok(Some(QueryCursor { schema, runtime_schema, input: Some(QueryInput::Projection(Some(projected))), context,
+            sample, trace, query_span, plan_reservation: self._plan_reservation.clone() }))
+    }
+
+    async fn open(&self, context: Arc<QueryContext>, parameters: Vec<Value>, text: Option<&str>, batching: Batching) -> Result<QueryCursor> {
+        measured_open(Arc::clone(&context), self.open_retained(context, parameters, text, batching)).await
     }
 
     async fn open_retained(&self, context: Arc<QueryContext>, mut parameters: Vec<Value>, text: Option<&str>, batching: Batching) -> Result<QueryCursor> {
@@ -268,7 +320,7 @@ impl PreparedQuery {
                         context.check_cancelled()?;
                     }
                 }
-                QueryInput::Pages(_) => return Err(invalid("analysis-input", "Query analysis requires an execution cursor")),
+                QueryInput::Pages(_) | QueryInput::Projection(_) => return Err(invalid("analysis-input", "Query analysis requires an execution cursor")),
             }
             let peak = context.memory.peak_bytes();
             let reservation = context.memory.reserve(analysis.output_bound()?)?;
@@ -280,6 +332,47 @@ impl PreparedQuery {
         }
         let trace = crate::trace::CursorTrace::new(&context, "output", "query.cursor.output", true);
         Ok(QueryCursor { schema, runtime_schema: runtime_schema.output(), input: Some(input), context, sample, trace, query_span, plan_reservation: self._plan_reservation.clone() })
+    }
+}
+
+async fn measured_open<T>(context: Arc<QueryContext>, open: impl std::future::Future<Output = Result<T>>) -> Result<T> {
+    let counter = context.query_cpu.clone();
+    let lease = context.catalog.read_lease();
+    rtdb_storage::IoRegion::retaining(context, rtdb_storage::IoRegion::leased(lease, async {
+        let mut open = std::pin::pin!(open);
+        match counter {
+            Some(counter) => crate::query_cpu::measure(counter, open.as_mut()).await,
+            None => open.await,
+        }
+    })).await
+}
+
+fn projected_parameter(mut relation: &Relation, mut position: usize) -> Option<usize> {
+    loop {
+        match relation.node() {
+            RelationNode::Values { rows } => return match rows.first()?.get(position)? {
+                Expr::Parameter { index, .. } => Some(*index),
+                _ => None,
+            },
+            RelationNode::Project { input, expressions } | RelationNode::Rename { input, expressions, .. } => {
+                match &expressions.get(position)?.expr {
+                    Expr::Parameter { index, .. } => return Some(*index),
+                    Expr::Column { id, .. } => position = input.schema().position(*id)?,
+                    _ => return None,
+                }
+                relation = input;
+            }
+            _ => return None,
+        }
+    }
+}
+
+fn direct_parameter_type(ty: &LogicalType) -> bool {
+    match ty {
+        LogicalType::Maybe(ty) => direct_parameter_type(ty),
+        LogicalType::Scalar(ScalarType::I8 | ScalarType::I16 | ScalarType::I32 | ScalarType::I64 |
+            ScalarType::F32 | ScalarType::F64 | ScalarType::Utf8 | ScalarType::Binary | ScalarType::FixedSizeBinary(_) | ScalarType::Uuid) => true,
+        _ => false,
     }
 }
 
@@ -295,6 +388,7 @@ enum QueryInput {
     Pages(crate::pages::BoxPageCursor),
     Columns(crate::columnar::BoxBatchCursor),
     Ordered(crate::columnar::BoxBatchCursor),
+    Projection(Option<OwnedBatch>),
 }
 
 tokio::task_local! { static ENCODING_ORDERED_BATCH: (); }
@@ -371,6 +465,7 @@ impl QueryCursor {
     async fn pull_batch(&mut self) -> Result<Option<OwnedBatch>> {
         let Some(input) = &mut self.input else { return Ok(None); };
         let page = match input {
+            QueryInput::Projection(batch) => return Ok(batch.take()),
             QueryInput::Columns(input) | QueryInput::Ordered(input) => loop {
                 let Some(batch) = input.next_batch().await? else { return Ok(None); };
                 if batch.len != 0 { return column_batch(self.runtime_schema.schema(), &self.context.memory, batch).map(Some); }

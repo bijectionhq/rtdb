@@ -114,7 +114,8 @@ impl Service {
             let token_guard = token.clone().drop_guard();
             let options = options(&native);
             let params = params.as_ref().map(|value| STANDARD.decode(value).map(Bytes::from).map_err(|_| invalid("invalid ticket parameters"))).transpose()?;
-            let arguments = params.as_ref().map(|bytes| wire::parameter_batch(bytes, self.memory()).and_then(|batch| wire::arguments(&batch, self.memory()))).transpose()?;
+            let parameter_batch = params.as_ref().map(|bytes| wire::parameter_batch(bytes, self.memory())).transpose()?;
+            let arguments = parameter_batch.as_ref().map(|batch| wire::arguments(batch, self.memory())).transpose()?;
             let cursor = if let Some(control) = rtdb_sql::parse_admitted_control_in(&sql, &options, self.memory()).map_err(status)? {
                 if control_schema(control.statement()).map_err(status)?.is_none() { return Err(invalid("ticket query cannot execute an update")); }
                 match native.execute_control_with(control.statement(), &[], &token, ControlExecutionOptions { frontend: ControlFrontend::FlightSql, implicit_transaction: false }).await.map_err(status)? {
@@ -124,14 +125,22 @@ impl Service {
                 let context = native.query_context_at(&basis.read()?, &token).await.map_err(status)?;
                 let prepared = PreparedSql::prepare(&sql, &context, options, ResultSignaturePolicy::Dynamic).map_err(status)?;
                 if prepared.is_dml() { return Err(invalid("ticket query cannot execute an update")); }
-                let row = arguments.as_ref().map(|arguments| {
-                    arguments.rows().next().ok_or_else(|| invalid("Query parameter batch has no rows"))?.map_err(status)
-                }).transpose()?;
-                let row = row.as_deref().unwrap_or_default();
-                let bound = row.iter().try_fold(wire::add(1024, wire::mul(row.len(), std::mem::size_of::<rtdb_types::Value>())?)?, |bytes, value| wire::add(bytes, value.retained_bytes().map_err(status)?))?;
-                let _values = self.memory().reserve(bound).map_err(status)?;
-                let values = row.to_vec();
-                prepared.open_query_columns_typed(context, values, arguments.as_ref().map(SqlArguments::types).unwrap_or_default()).await.map_err(status)?
+                let types = arguments.as_ref().map(SqlArguments::types).unwrap_or_default();
+                let projection = if let Some(batch) = parameter_batch.as_ref() {
+                    prepared.try_open_parameter_projection(Arc::clone(&context), batch, types).await.map_err(status)?
+                } else { None };
+                match projection {
+                    Some(cursor) => cursor,
+                    None => {
+                        let row = arguments.as_ref().map(|arguments| {
+                            arguments.rows().next().ok_or_else(|| invalid("Query parameter batch has no rows"))?.map_err(status)
+                        }).transpose()?;
+                        let row = row.as_deref().unwrap_or_default();
+                        let bound = row.iter().try_fold(wire::add(1024, wire::mul(row.len(), std::mem::size_of::<rtdb_types::Value>())?)?, |bytes, value| wire::add(bytes, value.retained_bytes().map_err(status)?))?;
+                        let _values = self.memory().reserve(bound).map_err(status)?;
+                        prepared.open_query_columns_typed(context, row.to_vec(), types).await.map_err(status)?
+                    }
+                }
             };
             drop(native); Ok::<_, Status>((cursor, connection, token_guard))
         };
