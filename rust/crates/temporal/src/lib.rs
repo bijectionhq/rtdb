@@ -43,8 +43,9 @@ impl From<Polygon> for PolygonParts {
 fn range_recency(ranges: impl DoubleEndedIterator<Item = (Timestamp, Timestamp, Timestamp)>) -> Timestamp {
     let mut recency = Timestamp::MIN;
     for (valid_from, valid_to, system_to) in ranges.rev() {
-        recency = recency.max(system_to.min(valid_to));
-        if recency >= valid_from { return recency; }
+        let (bound, finished) = event_step::recency_step(recency.0, valid_from.0, valid_to.0, system_to.0);
+        recency = Timestamp(bound);
+        if finished { return recency; }
     }
     recency
 }
