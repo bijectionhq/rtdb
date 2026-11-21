@@ -272,6 +272,16 @@ pub(crate) fn contains_fixed_size_list(layout: &DataType) -> bool {
     }
 }
 
+pub(crate) fn plain_scalar_field(field: &arrow_schema::Field) -> bool {
+    field.metadata().is_empty() && match field.data_type() {
+        DataType::Boolean | DataType::Int8 | DataType::Int16 | DataType::Int32 | DataType::Int64 |
+        DataType::UInt8 | DataType::UInt16 | DataType::UInt32 | DataType::UInt64 |
+        DataType::Float32 | DataType::Float64 | DataType::Utf8 | DataType::Binary | DataType::FixedSizeBinary(_) => true,
+        DataType::Null => field.is_nullable(),
+        _ => false,
+    }
+}
+
 fn normalized_document_array(array: &ArrayRef, memory: &Arc<MemoryBudget>, normalize_unions: bool) -> Result<Option<ArrayRef>> {
     Ok(Some(match array.data_type() {
         DataType::UInt8 => signed_column::<UInt8Type, Int8Type>(array.as_ref()),

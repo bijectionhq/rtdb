@@ -11,6 +11,7 @@ use rtdb_types::{Anomaly, Result, Timestamp, Value};
 use rtdb_sql::StaticMutationKind;
 
 use crate::{ArrowDocuments, Documents, SourceTransaction, SqlArguments, SubmitOptions, TxOp};
+use crate::values::plain_scalar_field;
 
 struct SubmissionCatalog<'a>(&'a str);
 impl Catalog for SubmissionCatalog<'_> {
@@ -138,14 +139,7 @@ fn projected_arrow_documents(input: &Relation, pages: &[&RecordBatch], memory: &
     }
 
     let schema = first.schema_ref();
-    let scalar_arguments = schema.fields().iter().all(|field| field.metadata().is_empty() && match field.data_type() {
-        DataType::Boolean | DataType::Int8 | DataType::Int16 | DataType::Int32 | DataType::Int64 |
-        DataType::UInt8 | DataType::UInt16 | DataType::UInt32 | DataType::UInt64 |
-        DataType::Float32 | DataType::Float64 | DataType::Utf8 | DataType::Binary | DataType::FixedSizeBinary(_) => true,
-        DataType::Null => field.is_nullable(),
-        _ => false,
-    });
-    if !scalar_arguments {
+    if !schema.fields().iter().all(|field| plain_scalar_field(field)) {
         return Ok(None);
     }
 
