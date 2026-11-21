@@ -9,7 +9,8 @@ Prepared updates retain uploaded Arrow parameter batches through transaction buf
 Bulk ingestion retains compatible Arrow document columns during source-log encoding, replay and transaction staging.
 This includes lists and structs with compatible child fields.
 Arrow batches targeting the same table can share a source-log document layout when their common columns agree and other columns are absent.
-Non-null scalar columns with compatible union legs share a dense union when their types differ between batches.
+Scalar columns with compatible union legs share a dense union when their types differ between batches.
+Null and missing values use the union's null leg.
 The typed document writer handles layouts that require cell conversion.
 
 == Composition and ownership

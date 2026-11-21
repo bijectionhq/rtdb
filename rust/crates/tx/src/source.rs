@@ -350,7 +350,7 @@ fn arrow_document_leg(pages: &[&StructArray], arrays: &mut BatchBuilder) -> Resu
                 field.as_ref().clone().with_nullable(true)
             } else if field.data_type() == &DataType::Null && field.is_nullable() {
                 previous.clone().with_nullable(true)
-            } else if let (Some(previous), Some(next)) = (nonnull_scalar_legs(previous)?, nonnull_scalar_legs(field)?) {
+            } else if let (Some(previous), Some(next)) = (scalar_legs(previous)?, scalar_legs(field)?) {
                 to_field(field.name(), &previous.join(&next))?
             } else {
                 return Ok(None);
@@ -358,22 +358,25 @@ fn arrow_document_leg(pages: &[&StructArray], arrays: &mut BatchBuilder) -> Resu
             layout.insert(field.name().clone(), merged);
         }
     }
-    let mut fields = Vec::with_capacity(layout.len());
-    let mut columns = Vec::with_capacity(layout.len());
-    if layout.iter().any(|(name, field)| matches!(field.data_type(), DataType::Union(..))
-        && pages.iter().any(|page| {
-            page.fields().iter().find(|field| field.name() == name)
-                .is_none_or(|source| source.is_nullable() || source.data_type() == &DataType::Null)
-        })) {
-        return Ok(None);
-    }
+    let mut output_layout = Vec::with_capacity(layout.len());
     for (name, field) in layout {
+        let nullable = field.is_nullable() || pages.iter().any(|page| page.column_by_name(&name).is_none());
+        let field = if nullable && matches!(field.data_type(), DataType::Union(..)) {
+            let Some(logical) = scalar_legs(&field)? else { return Ok(None) };
+            to_field(name, &logical.maybe())?
+        } else {
+            field.with_nullable(nullable)
+        };
+        output_layout.push(field);
+    }
+    let mut fields = Vec::with_capacity(output_layout.len());
+    let mut columns = Vec::with_capacity(output_layout.len());
+    for field in output_layout {
+        let union = matches!(field.data_type(), DataType::Union(..));
         let inputs: Vec<_> = pages.iter().map(|page| {
-            page.fields().iter().zip(page.columns()).find(|(source, _)| source.name() == &name)
-                .filter(|(source, _)| source.data_type() != &DataType::Null || field.data_type() == &DataType::Null)
+            page.fields().iter().zip(page.columns()).find(|(source, _)| source.name() == field.name())
+                .filter(|(source, _)| union || source.data_type() != &DataType::Null || field.data_type() == &DataType::Null)
         }).collect();
-        let nullable = field.is_nullable() || inputs.iter().any(Option::is_none);
-        let field = field.with_nullable(nullable);
         let logical = from_field(&field)?;
         let bound = pages.iter().zip(&inputs).try_fold(4096usize, |bytes, (page, column)| {
             let size = match column {
@@ -390,6 +393,11 @@ fn arrow_document_leg(pages: &[&StructArray], arrays: &mut BatchBuilder) -> Resu
                 match column {
                     Some((source, column)) if source.data_type() == field.data_type() => Ok(Arc::clone(column)),
                     Some((source, column)) => rtdb_columnar::relayout_arrow_column(Arc::clone(column), source, &field).map(|(_, column)| column),
+                    None if union => {
+                        let null = Field::new(field.name(), DataType::Null, true);
+                        let array = Arc::new(arrow_array::NullArray::new(page.len()));
+                        rtdb_columnar::relayout_arrow_column(array, &null, &field).map(|(_, column)| column)
+                    }
                     None => Ok(arrow_array::new_null_array(field.data_type(), page.len())),
                 }
             }).collect::<Result<Vec<_>>>()?;
@@ -402,14 +410,14 @@ fn arrow_document_leg(pages: &[&StructArray], arrays: &mut BatchBuilder) -> Resu
     document_list(structs, offsets).map(Some)
 }
 
-fn nonnull_scalar_legs(field: &Field) -> Result<Option<LogicalType>> {
-    if field.is_nullable() || !field.metadata().is_empty() { return Ok(None); }
+fn scalar_legs(field: &Field) -> Result<Option<LogicalType>> {
+    if !field.metadata().is_empty() { return Ok(None); }
+    if let DataType::Union(fields, _) = field.data_type()
+        && fields.iter().any(|(_, field)| field.is_nullable() && field.data_type() != &DataType::Null) {
+        return Ok(None);
+    }
     let logical = from_field(field)?;
-    let scalar = match &logical {
-        LogicalType::Scalar(_) => true,
-        LogicalType::Union(legs) => legs.iter().all(|leg| matches!(leg, LogicalType::Scalar(_))),
-        _ => false,
-    };
+    let scalar = logical.legs().iter().all(|leg| matches!(leg, LogicalType::Scalar(_) | LogicalType::Null));
     Ok(scalar.then_some(logical))
 }
 
@@ -849,6 +857,45 @@ mod tests {
             let field = documents.array().fields().iter().find(|field| field.name() == "v").unwrap();
             assert!(array.as_any().is::<UnionArray>());
             assert_eq!(read_value(field, array.as_ref(), 0).unwrap(), expected);
+        }
+    }
+
+    #[test]
+    fn mixed_arrow_scalar_layouts_keep_null_and_missing_values_in_the_union() {
+        let memory = budget();
+        let table = TableRef::new("public", "docs");
+        let put = |ids: Vec<i64>, column: Option<ArrayRef>| {
+            let mut fields = vec![Field::new("_id", DataType::Int64, false)];
+            let mut columns = vec![Arc::new(arrow_array::Int64Array::from(ids)) as ArrayRef];
+            if let Some(column) = column {
+                fields.push(Field::new("v", column.data_type().clone(), true));
+                columns.push(column);
+            }
+            let batch = RecordBatch::try_new(Arc::new(Schema::new(fields)), columns).unwrap();
+            let batch = OwnedBatch::new(batch, &memory).unwrap();
+            let documents = ArrowDocuments::from_batch(&batch, &memory).unwrap().unwrap();
+            TxOp::PutArrowDocs { table: table.clone(), documents }
+        };
+        let source = SourceTransaction::new(vec![
+            put(vec![1, 2, 3], Some(Arc::new(arrow_array::Int64Array::from(vec![Some(7), None, Some(9)])))),
+            put(vec![4], Some(Arc::new(arrow_array::StringArray::from(vec!["text"])))),
+            put(vec![5], None),
+            put(vec![6], Some(Arc::new(arrow_array::NullArray::new(1)))),
+        ], SubmitOptions::default(), &memory).unwrap();
+
+        let replay = roundtrip(&source);
+
+        let expected = [vec![Value::I64(7), Value::Null, Value::I64(9)], vec![Value::Utf8("text".into())], vec![Value::Null], vec![Value::Null]];
+        assert_eq!(replay.operations.len(), expected.len());
+        for (operation, expected) in replay.operations.iter().zip(expected) {
+            let Operation::PutArrowIids { documents, .. } = operation else {
+                panic!("Expected Arrow documents on replay");
+            };
+            let array = documents.array().column_by_name("v").unwrap();
+            let field = documents.array().fields().iter().find(|field| field.name() == "v").unwrap();
+            assert!(array.as_any().is::<UnionArray>());
+            let values = (0..array.len()).map(|row| read_value(field, array.as_ref(), row).unwrap()).collect::<Vec<_>>();
+            assert_eq!(values, expected);
         }
     }
 

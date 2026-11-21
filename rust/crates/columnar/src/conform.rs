@@ -8,8 +8,8 @@ use crate::{MemoryBudget, MemoryReservation, OwnedBatch, copy_array, estimate_bu
 
 mod physical;
 
-/// Adapts compatible physical layouts while retaining their value buffers.
-/// The caller reserves temporary metadata and any new union tags and offsets.
+/// Adapts compatible physical layouts, sharing value buffers when the target can use them.
+/// The caller reserves new union tags, offsets, and any filtered scalar child.
 /// The returned field carries the actual nullability, including nested fields.
 pub fn relayout_arrow_column(array: ArrayRef, source: &arrow_schema::Field, target: &arrow_schema::Field) -> Result<(arrow_schema::Field, ArrayRef)> {
     let target_type = from_field(target)?;

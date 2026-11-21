@@ -1,5 +1,5 @@
 use std::sync::Arc;
-use arrow_array::{Array, ArrayRef, NullArray, UnionArray, make_array};
+use arrow_array::{Array, ArrayRef, BooleanArray, NullArray, UnionArray, make_array};
 use arrow_buffer::ScalarBuffer;
 use arrow_schema::{DataType, Field, UnionFields, UnionMode};
 use rtdb_types::{LogicalType as L, Result};
@@ -55,9 +55,10 @@ pub(super) fn relayout(array: ArrayRef, source: &Field, target: &Field) -> Resul
 fn union(array: ArrayRef, source: &Field, target: &Field, targets: &UnionFields) -> Result<(Field, ArrayRef)> {
     let canonical = array.as_any().downcast_ref::<UnionArray>();
     let source_fields = match source.data_type() { DataType::Union(fields, UnionMode::Dense) => Some(fields), _ => None };
-    let source_leg = if source_fields.is_none() {
-        from_field(source)?.legs().into_iter().find(|leg| !matches!(leg, L::Null | L::Nothing)).map(|leg| leg_name(&leg)).transpose()?
-    } else { None };
+    let source_type = if source_fields.is_none() { from_field(source)?.legs().into_iter().find(|leg| !matches!(leg, L::Null | L::Nothing)) } else { None };
+    let source_leg = source_type.as_ref().map(leg_name).transpose()?;
+    let scalar = matches!(source_type, Some(L::Scalar(_)));
+    let valid = array.nulls().filter(|nulls| scalar && nulls.null_count() > 0);
     let mut fields = Vec::with_capacity(targets.len());
     let mut children = Vec::with_capacity(targets.len());
     let mut mappings = Vec::with_capacity(targets.len());
@@ -76,7 +77,11 @@ fn union(array: ArrayRef, source: &Field, target: &Field, targets: &UnionFields)
             (to_field(target_field.name(), &L::Null)?, Arc::new(NullArray::new(array.len())) as ArrayRef)
         } else if source_leg.as_deref() == Some(name.as_str()) {
             nonnull_id = Some(target_id);
-            (source.clone(), Arc::clone(&array))
+            let child = match valid {
+                Some(valid) => arrow_select::filter::filter(array.as_ref(), &BooleanArray::new(valid.inner().clone(), None)).map_err(crate::arrow_error)?,
+                None => Arc::clone(&array),
+            };
+            (source.clone().with_nullable(source.is_nullable() && !scalar), child)
         } else { (to_field(target_field.name(), &logical)?, copy_array(&logical, &[])?) };
         let (field, child) = relayout(child, &source_field, target_field)?;
         fields.push((target_id, field));
@@ -84,12 +89,17 @@ fn union(array: ArrayRef, source: &Field, target: &Field, targets: &UnionFields)
     }
     let mut ids = Vec::with_capacity(array.len());
     let mut offsets = Vec::with_capacity(array.len());
+    let mut value_offset = 0;
     for row in 0..array.len() {
         let (id, offset) = if let Some(source) = canonical {
             let id = mappings.iter().find(|(id, _)| *id == source.type_id(row)).map(|(_, target)| *target).ok_or_else(incompatible)?;
             (id, source.value_offset(row))
+        } else if array.data_type() == &DataType::Null || array.is_null(row) {
+            (null_id.ok_or_else(incompatible)?, row)
         } else {
-            (if array.is_null(row) { null_id } else { nonnull_id }.ok_or_else(incompatible)?, row)
+            let offset = if valid.is_some() { value_offset } else { row };
+            value_offset += 1;
+            (nonnull_id.ok_or_else(incompatible)?, offset)
         };
         ids.push(id);
         offsets.push(i32::try_from(offset).map_err(|_| super::fault("page-allocation-size", "Union child exceeds i32 offsets"))?);
