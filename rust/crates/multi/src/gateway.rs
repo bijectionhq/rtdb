@@ -12,6 +12,7 @@ use bytes::Bytes;
 use parking_lot::Mutex;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::Semaphore;
 use tokio_rustls::{TlsAcceptor, rustls};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
@@ -44,6 +45,8 @@ pub struct GatewayOptions {
     /// When set, every frontend must negotiate TLS before startup.
     pub tls: Option<Arc<rustls::ServerConfig>>,
     pub startup_timeout: Duration,
+    pub maximum_connections: usize,
+    pub maximum_connections_per_deployment: usize,
     /// How often an open connection tells its holder it is in use.
     pub touch_interval: Duration,
     /// The cell's secret, with which the gateway mints a capability for each reconnection of an authenticated session.
@@ -51,10 +54,50 @@ pub struct GatewayOptions {
 }
 
 impl Default for GatewayOptions {
-    fn default() -> Self { Self { cells: None, tls: None, startup_timeout: crate::session::STARTUP_WITHIN, control_timeout: Duration::from_secs(35), touch_interval: Duration::from_secs(10), capabilities: None } }
+    fn default() -> Self {
+        Self {
+            cells: None, tls: None, startup_timeout: crate::session::STARTUP_WITHIN,
+            control_timeout: Duration::from_secs(35), touch_interval: Duration::from_secs(10),
+            maximum_connections: 4096, maximum_connections_per_deployment: 256, capabilities: None,
+        }
+    }
+}
+
+struct DeploymentConnections {
+    limit: usize,
+    counts: Mutex<BTreeMap<String, usize>>,
+}
+
+struct DeploymentConnection {
+    registry: Arc<DeploymentConnections>,
+    name: String,
+}
+
+impl DeploymentConnections {
+    fn admit(self: &Arc<Self>, name: &str) -> Option<DeploymentConnection> {
+        let mut active = self.counts.lock();
+        let count = active.entry(name.to_owned()).or_default();
+        if *count >= self.limit { return None; }
+        *count += 1;
+        Some(DeploymentConnection { registry: Arc::clone(self), name: name.to_owned() })
+    }
+}
+
+impl Drop for DeploymentConnection {
+    fn drop(&mut self) {
+        let mut active = self.registry.counts.lock();
+        let count = active.get_mut(&self.name).expect("an admission owns a connection slot");
+        *count -= 1;
+        if *count == 0 { active.remove(&self.name); }
+    }
 }
 
 pub async fn serve(listener: TcpListener, directory: Arc<dyn Directory>, options: GatewayOptions, cancellation: CancellationToken) -> Result<()> {
+    if !(1..=Semaphore::MAX_PERMITS).contains(&options.maximum_connections) || options.maximum_connections_per_deployment == 0 {
+        return Err(Anomaly::incorrect("rtdb.multi/gateway-connections", "Gateway connection limits must be positive and supported by the runtime"));
+    }
+    let connections = Arc::new(Semaphore::new(options.maximum_connections));
+    let deployments = Arc::new(DeploymentConnections { limit: options.maximum_connections_per_deployment, counts: Mutex::default() });
     let heartbeats = Arc::new(Heartbeats::default());
     let mut connection_index = 0usize;
     loop {
@@ -62,6 +105,8 @@ pub async fn serve(listener: TcpListener, directory: Arc<dyn Directory>, options
             _ = cancellation.cancelled() => return Ok(()),
             accepted = listener.accept() => accepted.map_err(io)?,
         };
+        let Ok(permit) = Arc::clone(&connections).try_acquire_owned() else { continue; };
+        let deployments = Arc::clone(&deployments);
         let directory = Arc::clone(&directory);
         let options = options.clone();
         let heartbeats = Arc::clone(&heartbeats);
@@ -69,9 +114,10 @@ pub async fn serve(listener: TcpListener, directory: Arc<dyn Directory>, options
         let index = connection_index;
         connection_index = connection_index.wrapping_add(1);
         tokio::spawn(async move {
+            let _permit = permit;
             tokio::select! {
                 _ = cancellation.cancelled() => {}
-                _ = connection(client, directory, options, cancellation.clone(), heartbeats, index) => {}
+                _ = connection(client, directory, options, cancellation.clone(), heartbeats, deployments, index) => {}
             }
         });
     }
@@ -102,7 +148,8 @@ trait Transport: AsyncRead + AsyncWrite + Unpin + Send {}
 impl<T: AsyncRead + AsyncWrite + Unpin + Send> Transport for T {}
 type Client = Box<dyn Transport>;
 
-async fn connection(client: TcpStream, directory: Arc<dyn Directory>, options: GatewayOptions, cancellation: CancellationToken, heartbeats: Arc<Heartbeats>, connection_index: usize) -> Result<()> {
+async fn connection(client: TcpStream, directory: Arc<dyn Directory>, options: GatewayOptions, cancellation: CancellationToken,
+                    heartbeats: Arc<Heartbeats>, deployments: Arc<DeploymentConnections>, connection_index: usize) -> Result<()> {
     let startup_deadline = tokio::time::Instant::now() + options.startup_timeout;
     let startup = tokio::time::timeout_at(startup_deadline, read_startup(Box::new(client), options.tls.as_ref()));
     let Some(result) = cancellation.run_until_cancelled(startup).await else { return Ok(()); };
@@ -116,6 +163,9 @@ async fn connection(client: TcpStream, directory: Arc<dyn Directory>, options: G
         Ok((name, expected)) if !name.is_empty() => (name.to_owned(), expected),
         Ok(_) => return refuse(&mut client, "3D000", "The startup message names no database").await,
         Err(error) => return refuse(&mut client, "3D000", error.message.as_deref().unwrap_or_default()).await,
+    };
+    let Some(_deployment_connection) = deployments.admit(&name) else {
+        return refuse(&mut client, "53300", "This deployment has reached its gateway connection limit").await;
     };
     let Ok(remote_gateway) = tokio::time::timeout_at(startup_deadline, elsewhere(&directory, &name, &options)).await else {
         return refuse(&mut client, "57P03", "Timed out looking up the deployment's cell").await;

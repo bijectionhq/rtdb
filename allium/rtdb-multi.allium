@@ -2395,6 +2395,11 @@ surface ClientAccess {
         -- A placement notification can start the next reconnect attempt before its fallback timer elapses.
         -- A replacement connection must resolve the original deployment identity.
 
+    @guarantee GatewayConnectionLimits
+        -- Each gateway bounds its accepted sockets and the sessions routed to any deployment.
+        -- A saturated deployment can refuse a new session while another deployment still has a slot.
+        -- Closing a session frees its reserved capacity.
+
     @guarantee ReadYourWrites
         -- Within a session, every read sees every transaction the session was acknowledged.
 

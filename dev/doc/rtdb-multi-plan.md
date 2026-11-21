@@ -640,6 +640,12 @@ Moves are invisible to clients only if the gateway owns connections and session 
 2. **Crate `gateway`.**
    Terminates pgwire (reusing `pgwire/src/protocol.rs` and `wire.rs`) and Flight SQL, authenticates, mints capabilities and idempotency keys, and sends statements to nodes over an RPC carrying the capability, the session state and the basis.
 3. **Crate `affinity`**, ported from Bijection's `crates/affinity` with its score vectors, and routing by it (`RouteRead`), with per-key in-flight bounds and pressure.
+   Each pgwire gateway admits at most 4,096 connections overall and 256 for one deployment name by default.
+   Set these limits with `--max-connections` and `--max-connections-per-deployment`.
+   The overall limit includes connections that have not completed startup.
+   When the overall limit is exhausted, the gateway closes new sockets before startup.
+   A deployment at its limit rejects new sessions with SQLSTATE `53300`.
+   Closing a session releases both its connection slots.
 4. **Redirects**: `NotHolder`, `Moved`, `Behind`, followed by the gateway without the client noticing.
    The gateway renews a deployment's idle protection at the backend connected to the session, including after a move.
    Sessions on one gateway share a heartbeat for each deployment and backend address until the last connection to that backend closes.

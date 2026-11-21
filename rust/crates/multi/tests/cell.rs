@@ -197,6 +197,66 @@ async fn a_saturated_holder_declines_gateway_startup_without_stalling_existing_s
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn gateway_connection_limits_leave_room_for_another_deployment_and_release_disconnected_sessions() {
+    use rtdb_multi::gateway::{GatewayOptions, serve};
+    use tokio_util::sync::CancellationToken;
+
+    let cell = Cell::start(1, None).await;
+    for name in ["shop", "market"] {
+        admin::create_deployment(cell.directory.as_ref(), name, "acme", 3).await.unwrap();
+    }
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let stop = CancellationToken::new();
+    let options = GatewayOptions {
+        maximum_connections: 2, maximum_connections_per_deployment: 1, capabilities: Some(secret()),
+        ..Default::default()
+    };
+    let gateway = tokio::spawn(serve(listener, cell.directory.clone(), options, stop.clone()));
+    let connect = |name| {
+        let uri = format!("host=127.0.0.1 port={port} user=xtdb password=cell-test dbname={name}");
+        async move { tokio_postgres::connect(&uri, NoTls).await }
+    };
+    tokio::time::timeout(Duration::from_secs(10), async {
+        use tokio_postgres::error::SqlState;
+
+        let (shop, shop_driver) = connect("shop").await.unwrap();
+        let shop_driver = tokio::spawn(shop_driver);
+        let Err(full) = connect("shop").await else { panic!("a second connection to shop was admitted"); };
+        assert_eq!(full.code(), Some(&SqlState::TOO_MANY_CONNECTIONS));
+        let (market, market_driver) = loop {
+            match connect("market").await {
+                Ok(connected) => break connected,
+                Err(error) if error.code().is_none() => tokio::time::sleep(Duration::from_millis(5)).await,
+                Err(error) => panic!("market cannot use the gateway's other connection: {error}"),
+            }
+        };
+        let market_driver = tokio::spawn(market_driver);
+        let Err(full) = connect("shop").await else { panic!("a third connection to the gateway was admitted"); };
+        assert_eq!(full.code(), None);
+        assert_eq!(values(&market, "SELECT 23").await, ["23"]);
+
+        drop(shop);
+        shop_driver.await.unwrap().unwrap();
+        let (shop, driver) = loop {
+            match connect("shop").await {
+                Ok(connected) => break connected,
+                Err(error) if error.code().is_none() || error.code() == Some(&SqlState::TOO_MANY_CONNECTIONS) => tokio::time::sleep(Duration::from_millis(5)).await,
+                Err(error) => panic!("shop cannot reconnect: {error}"),
+            }
+        };
+        let driver = tokio::spawn(driver);
+        assert_eq!(values(&shop, "SELECT 24").await, ["24"]);
+        drop((shop, market));
+        driver.await.unwrap().unwrap();
+        market_driver.await.unwrap().unwrap();
+    }).await.expect("another deployment and a subsequent connection can use available capacity");
+    stop.cancel();
+    gateway.await.unwrap().unwrap();
+    cell.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_engine_pin_constrains_claims_and_moves_until_explicitly_cleared() {
     let mut cell = Cell::start(1, None).await;
     let newer = cell.add_node_with_engine(Some("next-image".into())).await;
