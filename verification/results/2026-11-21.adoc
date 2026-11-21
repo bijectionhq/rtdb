@@ -1269,3 +1269,19 @@ The selected Rust suites passed 330 tests at `4ffa2cf02` with the default stack 
 The run included 78 local cell tests, including the idempotent retry, checkpoint retention, load-aware rebalancing and cross-organisation fork after source erasure.
 The DynamoDB feature and live S3 qualification were outside the selected tests.
 From `rust/`, run `BIJECTION_LOCAL_EXECUTION=owner-authorized RUST_TEST_THREADS=4 cargo test --offline --locked -p rtdb-multi -p rtdb-replication -p rtdb-node --lib --test cell --test resources --test native`.
+
+=== Combined formal and Multi runs on the consolidated sources
+
+The combined formal runner completed with Lean, TLC, Verus, Z3, Apalache, Alloy, Maude, mCRL2 and AutoHyper.
+The run started from `5a04755e1`.
+All 258 tracked proof and adapter inputs in its manifest match the bytes on `706be8093`.
+The run covered 126 baseline Verus obligations in 17 areas, 70 Verus controls, and 30 TLC baseline cases with their registered controls and witnesses.
+Apalache additionally checked both fork policies through eight transitions and rejected the stale-inventory control.
+The input manifest SHA-256 is `594fb9a0ba992a4d71f33802cf8ca36248210d1993287778a5fb164a3b7ed87c`.
+This formal invocation omitted the Rust boundary and native replay options.
+The merged Rust suite and the targeted checkpoint metadata control are recorded above.
+
+The separate `verification/multi/check.sh` run checked 15 Lean modules and 14 TLC configurations, including all expected refusals and counterexamples.
+Each TLC case now keeps its copied source, generated trace and state database in its own ignored run directory.
+The clean-checkout pass replayed every Multi configuration with that layout.
+Use `BIJECTION_LOCAL_EXECUTION=owner-authorized TLA2TOOLS_JAR=/path/to/tla2tools.jar LEAN=/path/to/lean bash verification/multi/check.sh` with the pinned Java on the path. link:../multi/check.sh[Multi runner] · link:../README.adoc#_run_the_studies[Combined runner]
