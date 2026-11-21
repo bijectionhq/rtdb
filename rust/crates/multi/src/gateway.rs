@@ -192,6 +192,7 @@ async fn connection(client: TcpStream, directory: Arc<dyn Directory>, options: G
     }
     if expected.is_some() { startup.parameters.insert("database".into(), name.clone()); }
     startup.parameters.insert(rtdb_pgwire::GATEWAY_AWAIT_TOKEN_PARAMETER.into(), "on".into());
+    startup.parameters.insert(rtdb_pgwire::GATEWAY_SETTINGS_PARAMETER.into(), "on".into());
     startup.bytes = encode_startup(&startup.parameters);
     let read_only = startup.read_only();
     let mut router = GatewayRouter {

@@ -45,9 +45,16 @@ impl<W: AsyncWrite + Unpin> Writer<W> {
     pub async fn auth(&mut self, method: i32) -> Result<()> { self.send(b'R', &method.to_be_bytes()).await?; self.flush().await }
     pub async fn parameter(&mut self, key: &str, value: &str) -> Result<()> { self.record(b'S', key.len() + value.len() + 2, |bytes| { cstring(bytes, key)?; cstring(bytes, value) }).await?; self.flush().await }
     pub async fn gateway_await_token(&mut self, token: Option<&str>) -> Result<()> {
-        self.record(crate::GATEWAY_AWAIT_TOKEN_TAG, 1 + token.map_or(0, str::len), |body| {
+        self.record(crate::GATEWAY_SESSION_STATE_TAG, 1 + token.map_or(0, str::len), |body| {
             body.push(u8::from(token.is_some()));
             if let Some(token) = token { body.extend_from_slice(token.as_bytes()); }
+            Ok(())
+        }).await
+    }
+    pub async fn gateway_settings(&mut self, encoded: &[u8]) -> Result<()> {
+        self.record(crate::GATEWAY_SESSION_STATE_TAG, 1 + encoded.len(), |body| {
+            body.push(crate::GATEWAY_SETTINGS_KIND);
+            body.extend_from_slice(encoded);
             Ok(())
         }).await
     }

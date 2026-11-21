@@ -1962,6 +1962,33 @@ async fn a_gateway_session_keeps_its_await_token_across_moves_and_replays_a_clea
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_gateway_session_restores_settings_and_discard_all_resets_them_across_moves() {
+    let cell = Cell::start(2, None).await;
+    admin::create_deployment(cell.directory.as_ref(), "shop", "acme", 3).await.unwrap();
+    let client = cell.connect("shop").await;
+    let default_zone = values(&client, "SHOW timezone").await;
+    let default_search_path = values(&client, "SHOW search_path").await;
+    client.simple_query("SET TIME ZONE 'Europe/Paris'; SET search_path TO 'reports,public'; SET SESSION CHARACTERISTICS AS TRANSACTION READ ONLY").await.unwrap();
+
+    let source = cell.holder("shop").await.unwrap();
+    admin::move_deployment(cell.directory.as_ref(), "shop", &cell.node(1 - source).agent.member(), &control()).await.unwrap();
+    assert_eq!(values(&client, "SHOW timezone").await, ["Europe/Paris"]);
+    assert_eq!(values(&client, "SHOW search_path").await, ["reports,public"]);
+    client.simple_query("BEGIN").await.unwrap();
+    assert!(client.simple_query("INSERT INTO items (_id) VALUES (1)").await.is_err());
+    client.simple_query("ROLLBACK").await.unwrap();
+    client.simple_query("DISCARD ALL").await.unwrap();
+
+    admin::move_deployment(cell.directory.as_ref(), "shop", &cell.node(source).agent.member(), &control()).await.unwrap();
+    assert_eq!(values(&client, "SHOW timezone").await, default_zone);
+    assert_eq!(values(&client, "SHOW search_path").await, default_search_path);
+    client.simple_query("BEGIN; INSERT INTO items (_id) VALUES (2); COMMIT").await.unwrap();
+    assert_eq!(values(&client, "SELECT _id FROM items").await, ["2"]);
+    drop(client);
+    cell.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_snapshot_and_a_later_holder_reuse_the_same_deployment_disk_cache() {
     let cell = Cell::start(1, None).await;
     admin::create_deployment(cell.directory.as_ref(), "shop", "acme", 3).await.unwrap();

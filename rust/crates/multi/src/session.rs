@@ -12,7 +12,7 @@ use std::time::Duration;
 
 use bytes::{BufMut, Bytes, BytesMut};
 use rtdb_directory::{DeploymentRecord, Directory, Lifecycle};
-use rtdb_pgwire::GATEWAY_AWAIT_TOKEN_TAG;
+use rtdb_pgwire::{GATEWAY_SESSION_STATE_TAG, GATEWAY_SETTINGS_KIND, GATEWAY_SETTINGS_PARAMETER};
 use rtdb_types::{Anomaly, AnomalyCategory, MemoryBudget, MemoryReservation, Result};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -140,6 +140,7 @@ pub struct Session {
     record: watch::Receiver<Option<DeploymentRecord>>,
     prepared: BTreeMap<String, Frame>,
     await_token: Option<Frame>,
+    settings: Option<Frame>,
     status: Status,
     /// The frames of the command sent since the session was last idle, kept until it is answered, so a refusal before it ran can resend it.
     pending: Vec<Frame>,
@@ -161,7 +162,7 @@ pub struct Session {
 impl Session {
     pub fn new(startup: Bytes, router: Arc<dyn Router>, directory: Arc<dyn Directory>, deployment: String, grants: Option<Grants>, keyed: bool) -> Self {
         let record = rtdb_directory::watch_deployment(directory, deployment, RECONNECT_RETRY_DELAY);
-        Self { startup, frame_memory: MemoryBudget::new(DEFAULT_GATEWAY_FRAME_BYTES), installation_status: None, grants, authenticated: None, greeting: Greeting::default(), router, record, prepared: BTreeMap::new(), await_token: None, status: Status::Busy, pending: Vec::new(), prepared_responses: 0, answered: false, lost_unanswered: false, discarding: false, keyed, key: None, swallowing: 0 }
+        Self { startup, frame_memory: MemoryBudget::new(DEFAULT_GATEWAY_FRAME_BYTES), installation_status: None, grants, authenticated: None, greeting: Greeting::default(), router, record, prepared: BTreeMap::new(), await_token: None, settings: None, status: Status::Busy, pending: Vec::new(), prepared_responses: 0, answered: false, lost_unanswered: false, discarding: false, keyed, key: None, swallowing: 0 }
     }
 
     pub(crate) fn with_frame_memory(mut self, memory: Arc<MemoryBudget>) -> Self {
@@ -204,13 +205,16 @@ impl Session {
         let (mut stream, control, epoch) = self.router.route().await?;
         stream.write_all(&self.reconnection_startup()).await.map_err(io)?;
         let mut backend = Backend::new(stream, epoch, Arc::clone(&self.frame_memory));
-        let supports_await_token = replay_ready(&mut backend.frames).await?;
-        if self.await_token.is_some() && !supports_await_token {
+        let features = replay_ready(&mut backend.frames).await?;
+        if self.await_token.is_some() && !features.await_token {
             return Err(Anomaly::new(AnomalyCategory::Unsupported, "rtdb.multi/reconnect-basis", "The new holder cannot restore the session's await token"));
         }
-        if self.await_token.is_some() || !self.prepared.is_empty() {
+        if self.settings.is_some() && !features.settings {
+            return Err(Anomaly::new(AnomalyCategory::Unsupported, "rtdb.multi/reconnect-settings", "The new holder cannot restore the session's settings"));
+        }
+        if self.settings.is_some() || self.await_token.is_some() || !self.prepared.is_empty() {
             let send = async {
-                for frame in self.await_token.iter().chain(self.prepared.values()) {
+                for frame in self.settings.iter().chain(self.await_token.iter()).chain(self.prepared.values()) {
                     backend.writer.write_all(&frame.encode()).await.map_err(io)?;
                 }
                 backend.writer.write_all(&[b'S', 0, 0, 0, 4]).await.map_err(io)
@@ -291,8 +295,8 @@ impl Session {
                     Event::Request(None) => break Ok(()),
                     Event::Request(Some(request)) => {
                         let request = request.map_err(io)?;
-                        if request.tag == GATEWAY_AWAIT_TOKEN_TAG {
-                            break Err(Anomaly::incorrect("rtdb.multi/private-pgwire-frame", "A client cannot send a gateway await token frame"));
+                        if request.tag == GATEWAY_SESSION_STATE_TAG {
+                            break Err(Anomaly::incorrect("rtdb.multi/private-pgwire-frame", "A client cannot send a gateway session state frame"));
                         }
                         if request.tag == b'X' {
                             if let Some(current) = backend.as_mut() { let _ = current.writer.write_all(&request.encode()).await; }
@@ -328,13 +332,21 @@ impl Session {
                         self.status = Status::Busy;
                     }
                     Event::Reply(Some(Ok(frame))) => {
-                        if frame.tag == GATEWAY_AWAIT_TOKEN_TAG {
+                        if frame.tag == GATEWAY_SESSION_STATE_TAG {
                             if self.greeting.done && !self.discarding {
-                                self.await_token = (frame.body.first() == Some(&1)).then_some(frame);
+                                match frame.body.first().copied() {
+                                    Some(0) => self.await_token = None,
+                                    Some(1) => self.await_token = Some(frame),
+                                    Some(GATEWAY_SETTINGS_KIND) if frame.body.len() > 1 => self.settings = Some(frame),
+                                    _ => {}
+                                }
                             }
                             continue;
                         }
                         if !self.greeting.done {
+                            if frame.tag == b'S' && frame.body.split(|byte| *byte == 0).next() == Some(GATEWAY_SETTINGS_PARAMETER.as_bytes()) {
+                                continue;
+                            }
                             self.greeting.observe(&frame, &mut self.authenticated);
                             tokio::time::timeout_at(startup_deadline, async {
                                 if self.greeting.done {
@@ -478,15 +490,22 @@ impl Session {
     }
 }
 
-async fn replay_ready(frames: &mut mpsc::Receiver<std::io::Result<Frame>>) -> Result<bool> {
-    let mut supports_await_token = false;
+#[derive(Default)]
+struct ReplayFeatures { await_token: bool, settings: bool }
+
+async fn replay_ready(frames: &mut mpsc::Receiver<std::io::Result<Frame>>) -> Result<ReplayFeatures> {
+    let mut features = ReplayFeatures::default();
     loop {
         let frame = frames.recv().await.ok_or_else(|| lost("the new backend closed while restoring the session"))?.map_err(io)?;
         match frame.tag {
             b'E' => return Err(Anomaly::new(AnomalyCategory::Unavailable, "rtdb.multi/reconnect-refused", "The new holder refused the session's replay")),
             b'R' if frame.body.len() >= 4 && frame.body[..4] != [0, 0, 0, 0] => return Err(Anomaly::new(AnomalyCategory::Unsupported, "rtdb.multi/reconnect-auth", "The new holder asks for a password the gateway does not hold")),
-            GATEWAY_AWAIT_TOKEN_TAG => supports_await_token = true,
-            b'Z' => return Ok(supports_await_token),
+            GATEWAY_SESSION_STATE_TAG => match frame.body.first().copied() {
+                Some(0 | 1) => features.await_token = true,
+                Some(GATEWAY_SETTINGS_KIND) => features.settings = true,
+                _ => {}
+            },
+            b'Z' => return Ok(features),
             _ => {}
         }
     }

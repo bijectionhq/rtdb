@@ -9,7 +9,7 @@ use rtdb_sql::{AdmittedControl, BatchExecution, ContextualStatementDiagnostic, E
 use rtdb_types::{Anomaly, PgType, Result, Value};
 use tokio::io::AsyncWrite;
 use tokio_util::sync::CancellationToken;
-use crate::{GATEWAY_AWAIT_TOKEN_TAG, ServerConfig, connection::{Startup, apply_startup, display_parameter}, error::{cancelled, protocol}, server::CancellationSlot, wire::{Column, Frame, Input, Writer}};
+use crate::{GATEWAY_SESSION_STATE_TAG, GATEWAY_SETTINGS_KIND, ServerConfig, connection::{Startup, apply_startup, display_parameter}, error::{cancelled, protocol}, server::CancellationSlot, wire::{Column, Frame, Input, Writer}};
 
 enum PreparedKind { Empty, Query(PreparedSql), Dml(PreparedSql), Control(PreparedControl), Keywords }
 enum PreparedControl { Batch(ControlStatement), Extended(AdmittedControl) }
@@ -69,12 +69,17 @@ pub(crate) struct ProtocolSession {
     implicit: bool,
     transaction_generation: u64,
     reported_await_token: u64,
+    reported_settings: u64,
     statements: BTreeMap<String, RegisteredStatement>,
     portals: BTreeMap<String, Portal>,
     copy: Option<crate::copy::CopyInput>,
 }
 impl ProtocolSession {
-    pub fn new(session: NativeSession, node: Node, config: Arc<ServerConfig>, startup: Startup, cancellations: Arc<CancellationSlot>) -> Self { Self { session, node, config, startup, cancellations, extended: false, skip_until_sync: false, implicit: false, transaction_generation: 0, reported_await_token: 0, statements: BTreeMap::new(), portals: BTreeMap::new(), copy: None } }
+    pub fn new(session: NativeSession, node: Node, config: Arc<ServerConfig>, startup: Startup, cancellations: Arc<CancellationSlot>) -> Self {
+        let reported_settings = session.state().settings_revision();
+        Self { session, node, config, startup, cancellations, extended: false, skip_until_sync: false, implicit: false, transaction_generation: 0,
+            reported_await_token: 0, reported_settings, statements: BTreeMap::new(), portals: BTreeMap::new(), copy: None }
+    }
     pub fn extended(&self) -> bool { self.extended }
     pub fn close(&mut self) { self.copy = None; self.portals.clear(); self.statements.clear(); self.session.state_mut().close(); }
     fn environment(&self) -> Result<SessionEnvironment> { SessionEnvironment::new(self.session.state().parameter_entries(), self.session.state().effective_timezone(), self.node.memory()) }
@@ -88,11 +93,17 @@ impl ProtocolSession {
     fn ready(&self) -> u8 { match self.session.state().status() { TransactionStatus::Idle | TransactionStatus::Closed => b'I', TransactionStatus::Failed => b'E', _ => b'T' } }
     async fn report_ready<W: AsyncWrite + Unpin>(&mut self, writer: &mut Writer<W>) -> Result<()> {
         let status = self.ready();
-        if status == b'I' && self.startup.gateway_await_tokens {
+        if status == b'I' && self.startup.gateway_session_state {
             let (revision, token) = self.session.state().connection_await_token();
             if revision != self.reported_await_token {
                 writer.gateway_await_token(token).await?;
                 self.reported_await_token = revision;
+            }
+            let revision = self.session.state().settings_revision();
+            if self.startup.gateway_settings && revision != self.reported_settings {
+                let (encoded, _reservation) = self.session.state().encode_gateway_settings()?;
+                writer.gateway_settings(&encoded).await?;
+                self.reported_settings = revision;
             }
         }
         writer.ready(status).await
@@ -203,18 +214,27 @@ impl ProtocolSession {
                 if self.extended { return Err(protocol("COPY input was cancelled")); }
                 self.report_ready(writer).await?;
             }
-            GATEWAY_AWAIT_TOKEN_TAG if self.startup.gateway_await_tokens => {
+            GATEWAY_SESSION_STATE_TAG if self.startup.gateway_session_state => {
                 if self.extended || self.copy.is_some() || self.ready() != b'I' {
-                    return Err(protocol("A gateway can restore a token only on an idle session"));
+                    return Err(protocol("A gateway can restore state only on an idle session"));
                 }
-                self.extended = true;
-                let token = match input.byte()? {
-                    0 => { input.end()?; None },
-                    1 => Some(std::str::from_utf8(input.remaining()).map_err(|_| protocol("The gateway await token is not UTF-8"))?.to_owned()),
-                    _ => return Err(protocol("Invalid gateway await token")),
-                };
-                self.session.state_mut().set_await_token(token)?;
-                self.reported_await_token = self.session.state().connection_await_token().0;
+                match input.byte()? {
+                    0 => {
+                        input.end()?;
+                        self.session.state_mut().set_await_token(None)?;
+                        self.reported_await_token = self.session.state().connection_await_token().0;
+                    }
+                    1 => {
+                        let token = std::str::from_utf8(input.remaining()).map_err(|_| protocol("The gateway await token is not UTF-8"))?.to_owned();
+                        self.session.state_mut().set_await_token(Some(token))?;
+                        self.reported_await_token = self.session.state().connection_await_token().0;
+                    }
+                    GATEWAY_SETTINGS_KIND if self.startup.gateway_settings => {
+                        self.session.state_mut().restore_gateway_settings(input.remaining())?;
+                        self.reported_settings = self.session.state().settings_revision();
+                    }
+                    _ => return Err(protocol("Invalid gateway session state")),
+                }
             }
             b'p' => (),
             _ => return Err(Anomaly::unsupported("xtdb.pgwire/unknown-client-msg", format!("unknown client message: {}", frame.tag))),
@@ -883,7 +903,7 @@ mod tests {
         let options = rtdb_node::NodeOptions { automatic_compaction: false, automatic_gc: false, ..Default::default() };
         let (node, driver) = Node::open(options, services).await.unwrap();
         let session = node.session("xtdb", identity).unwrap();
-        let startup = Startup { parameters: BTreeMap::new(), gateway_await_tokens: false, _reservation: node.memory().reserve(0).unwrap() };
+        let startup = Startup { parameters: BTreeMap::new(), gateway_session_state: false, gateway_settings: false, _reservation: node.memory().reserve(0).unwrap() };
         let frontend = ProtocolSession::new(session, node, Arc::new(ServerConfig::default()), startup, Arc::new(CancellationSlot::default()));
         (frontend, driver)
     }

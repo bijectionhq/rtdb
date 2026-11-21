@@ -735,6 +735,9 @@ Moves are invisible to clients only if the gateway owns connections and session 
    At each idle command boundary, a placed node reports changes to the session’s await token over its private gateway connection.
    The gateway restores the token, including its removal, before replaying named prepared statements on the new backend.
    A replacement backend must support await-token restoration to resume a session with a saved token.
+   Gateway reconnects restore the session timezone, parameters and default transaction access before preparing statements.
+   Replaying the connection state keeps the startup database and authenticated principal.
+   The gateway tracks settings and await-token support separately during a rolling update.
    A single pgwire autocommit write sends `CommandComplete` after the commit succeeds.
    PGwire carries stable placement interruption codes independently of the configured error detail format. [PostgreSQL ErrorResponse format](https://www.postgresql.org/docs/current/protocol-message-formats.html#PROTOCOL-MESSAGE-FORMATS-ERRORRESPONSE)
 5. **Suspicion reports** to the controller on connection failure.

@@ -818,6 +818,8 @@ entity Session {
     deployment: DeploymentId
     capability: Capability
     -- Parameters, prepared statements, the transaction buffer up to commit.
+    -- The pgwire gateway keeps mutable connection settings at idle command boundaries.
+    -- A new backend restores the settings before preparing statements or running another command.
     state: Bytes
     -- The highest basis this session has been acknowledged or has read at.
     -- The pgwire gateway retains the backend's connection await token at idle command boundaries.
