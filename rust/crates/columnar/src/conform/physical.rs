@@ -4,12 +4,18 @@ use arrow_buffer::ScalarBuffer;
 use arrow_data::ArrayData;
 use arrow_schema::{DataType, Field, UnionFields, UnionMode};
 use rtdb_types::{LogicalType as L, Result};
-use crate::{copy_selected_cells, estimate_copy_cell_bytes, from_field, leg_name, to_field};
+use crate::interleave::{Padding, undefined_cells};
+use crate::read_allocation::null_copy_bytes;
+use crate::{copy_nullable_cells, copy_selected_cells, estimate_copy_cell_bytes, estimate_null_copy_cell_bytes, from_field, leg_name, to_field};
 
-pub(super) fn additional_bytes(data: &ArrayData, source: &Field, target: &Field) -> Result<usize> {
-    let null_bytes = |target: &Field| {
-        crate::estimate_builder_bytes_refs(&from_field(target)?.maybe(), std::iter::repeat_n(&rtdb_types::Value::Null, data.len()))
+pub(super) fn additional_bytes(data: &ArrayData, source: &Field, target: &Field, event: bool) -> Result<usize> {
+    let null_bytes = |target: &Field, cell_bytes: usize| {
+        let cells = super::multiply(super::multiply(cell_bytes, 4)?, data.len())?;
+        super::add(super::multiply(target.size(), 8)?, cells)
     };
+    if undefined_union(source, target, event) {
+        return null_bytes(target, null_copy_bytes(target, Padding::Undefined)?);
+    }
     match (source.data_type(), target.data_type()) {
         (source_type, DataType::Union(targets, UnionMode::Dense)) => {
             let tags = super::multiply(data.len(), 64)?;
@@ -18,7 +24,7 @@ pub(super) fn additional_bytes(data: &ArrayData, source: &Field, target: &Field)
                     targets.iter().try_fold(0, |bytes, (_, target)| {
                         let name = leg_name(&from_field(target)?)?;
                         let Some((index, _, source)) = union_leg(sources, &name) else { return Ok(bytes) };
-                        super::add(bytes, additional_bytes(&data.child_data()[index], source, target)?)
+                        super::add(bytes, additional_bytes(&data.child_data()[index], source, target, event)?)
                     })?
                 }
                 _ => {
@@ -30,34 +36,44 @@ pub(super) fn additional_bytes(data: &ArrayData, source: &Field, target: &Field)
                                 super::add(bytes, super::multiply(estimate_copy_cell_bytes(source, array.as_ref(), row)?, 4)?)
                             })?
                         } else { 0 };
-                        super::add(copy, additional_bytes(data, source, target)?)?
+                        super::add(copy, additional_bytes(data, source, target, event)?)?
                     } else { 0 }
                 }
             };
             super::add(tags, children)
         }
-        (DataType::Null, _) => null_bytes(target),
+        (DataType::Null, _) => null_bytes(target, estimate_null_copy_cell_bytes(target)?),
         (DataType::Struct(source), DataType::Struct(target)) => target.iter().try_fold(0, |bytes, field| {
             let extra = match source.iter().position(|original| original.name() == field.name()) {
-                Some(index) => additional_bytes(&data.child_data()[index], &source[index], field)?,
-                None => null_bytes(field)?,
+                Some(index) => additional_bytes(&data.child_data()[index], &source[index], field, event)?,
+                None => null_bytes(field, estimate_null_copy_cell_bytes(field)?)?,
             };
             super::add(bytes, extra)
         }),
         (DataType::List(source), DataType::List(target))
         | (DataType::FixedSizeList(source, _), DataType::FixedSizeList(target, _))
-        | (DataType::Map(source, _), DataType::Map(target, _)) => additional_bytes(&data.child_data()[0], source, target),
+        | (DataType::Map(source, _), DataType::Map(target, _)) => additional_bytes(&data.child_data()[0], source, target, event),
         _ => Ok(0),
     }
 }
 
-pub(super) fn relayout(array: ArrayRef, source: &Field, target: &Field) -> Result<(Field, ArrayRef)> {
+fn undefined_union(source: &Field, target: &Field, event: bool) -> bool {
+    event && source.data_type() == &DataType::Null && !source.is_nullable()
+        && matches!(target.data_type(), DataType::Union(_, UnionMode::Dense))
+}
+
+pub(super) fn relayout(array: ArrayRef, source: &Field, target: &Field, event: bool) -> Result<(Field, ArrayRef)> {
+    if undefined_union(source, target, event) {
+        return Ok((target.clone(), undefined_cells(target.data_type(), array.len())?));
+    }
     if let DataType::Union(fields, UnionMode::Dense) = target.data_type() {
-        return union(array, source, target, fields);
+        return union(array, source, target, fields, event);
     }
     if source.data_type() == &DataType::Null && target.data_type() != &DataType::Null {
         let field = target.clone().with_nullable(true);
-        return Ok((field, arrow_array::new_null_array(target.data_type(), array.len())));
+        let empty = arrow_array::new_empty_array(target.data_type());
+        let nulls = copy_nullable_cells(&[empty.as_ref()], &vec![None; array.len()])?;
+        return Ok((field, nulls));
     }
     let data = array.to_data();
     let mut children = Vec::with_capacity(data.child_data().len());
@@ -65,10 +81,10 @@ pub(super) fn relayout(array: ArrayRef, source: &Field, target: &Field) -> Resul
         (DataType::Struct(source_fields), DataType::Struct(target_fields)) => {
             let fields = target_fields.iter().map(|target| {
                 let (field, child) = match source_fields.iter().position(|source| source.name() == target.name()) {
-                    Some(index) => relayout(make_array(data.child_data()[index].clone()), &source_fields[index], target)?,
+                    Some(index) => relayout(make_array(data.child_data()[index].clone()), &source_fields[index], target, event)?,
                     None => {
                         let null = Field::new(target.name(), DataType::Null, true);
-                        relayout(Arc::new(NullArray::new(data.len())), &null, target)?
+                        relayout(Arc::new(NullArray::new(data.len())), &null, target, event)?
                     }
                 };
                 children.push(child.to_data());
@@ -77,23 +93,23 @@ pub(super) fn relayout(array: ArrayRef, source: &Field, target: &Field) -> Resul
             DataType::Struct(fields.into())
         }
         (DataType::List(source), DataType::List(target)) => {
-            let (field, child) = relayout(make_array(data.child_data()[0].clone()), source, target)?;
+            let (field, child) = relayout(make_array(data.child_data()[0].clone()), source, target, event)?;
             children.push(child.to_data());
             DataType::List(Arc::new(field))
         }
         (DataType::FixedSizeList(source, count), DataType::FixedSizeList(target, target_count)) if count == target_count => {
-            let (field, child) = relayout(make_array(data.child_data()[0].clone()), source, target)?;
+            let (field, child) = relayout(make_array(data.child_data()[0].clone()), source, target, event)?;
             children.push(child.to_data());
             DataType::FixedSizeList(Arc::new(field), *count)
         }
         (DataType::Map(source, sorted), DataType::Map(target, target_sorted)) if sorted == target_sorted => {
-            let (field, child) = relayout(make_array(data.child_data()[0].clone()), source, target)?;
+            let (field, child) = relayout(make_array(data.child_data()[0].clone()), source, target, event)?;
             children.push(child.to_data());
             DataType::Map(Arc::new(field), *sorted)
         }
         (DataType::RunEndEncoded(source_ends, source_values), DataType::RunEndEncoded(target_ends, target_values)) => {
-            let (ends, ends_array) = relayout(make_array(data.child_data()[0].clone()), source_ends, target_ends)?;
-            let (values, values_array) = relayout(make_array(data.child_data()[1].clone()), source_values, target_values)?;
+            let (ends, ends_array) = relayout(make_array(data.child_data()[0].clone()), source_ends, target_ends, event)?;
+            let (values, values_array) = relayout(make_array(data.child_data()[1].clone()), source_values, target_values, event)?;
             children.extend([ends_array.to_data(), values_array.to_data()]);
             DataType::RunEndEncoded(Arc::new(ends), Arc::new(values))
         }
@@ -107,7 +123,7 @@ pub(super) fn relayout(array: ArrayRef, source: &Field, target: &Field) -> Resul
     Ok((field, make_array(data)))
 }
 
-fn union(array: ArrayRef, source: &Field, target: &Field, targets: &UnionFields) -> Result<(Field, ArrayRef)> {
+fn union(array: ArrayRef, source: &Field, target: &Field, targets: &UnionFields, event: bool) -> Result<(Field, ArrayRef)> {
     let canonical = array.as_any().downcast_ref::<UnionArray>();
     let source_fields = match source.data_type() { DataType::Union(fields, UnionMode::Dense) => Some(fields), _ => None };
     let source_leg = if source_fields.is_none() { monomorphic_leg(source)? } else { None };
@@ -139,7 +155,7 @@ fn union(array: ArrayRef, source: &Field, target: &Field, targets: &UnionFields)
             };
             (source.clone().with_nullable(false), child)
         } else { (target_field.as_ref().clone(), arrow_array::new_empty_array(target_field.data_type())) };
-        let (field, child) = relayout(child, &source_field, target_field)?;
+        let (field, child) = relayout(child, &source_field, target_field, event)?;
         fields.push((target_id, field));
         children.push(child);
     }

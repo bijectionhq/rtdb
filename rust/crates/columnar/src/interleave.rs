@@ -15,7 +15,7 @@ pub fn interleave(arrays: &[&dyn Array], cells: &[(usize, usize)]) -> Result<Arr
         return Ok(array.slice(start, cells.len()));
     }
     match arrays.first().map(|array| array.data_type()) {
-        Some(DataType::Union(fields, arrow_schema::UnionMode::Dense)) => interleave_union(fields, arrays, cells, interleave),
+        Some(DataType::Union(fields, arrow_schema::UnionMode::Dense)) => interleave_union(fields, arrays, cells, Padding::Null, interleave),
         _ => arrow_select::interleave::interleave(arrays, cells).map_err(|error| invalid(error)),
     }
 }
@@ -23,34 +23,77 @@ pub fn interleave(arrays: &[&dyn Array], cells: &[(usize, usize)]) -> Result<Arr
 /// Copies selected Arrow cells, allocating dense-union and run-end children according to their selected positions.
 /// Sources have the same layout, and every selection names a row within its source.
 pub fn copy_selected_cells(arrays: &[&dyn Array], cells: &[(usize, usize)]) -> Result<ArrayRef> {
+    let cells = cells.iter().copied().map(Some).collect::<Vec<_>>();
+    copy_nullable_cells(arrays, &cells)
+}
+
+/// Copies selected Arrow cells with typed null slots for missing cells.
+pub fn copy_nullable_cells(arrays: &[&dyn Array], cells: &[Option<(usize, usize)>]) -> Result<ArrayRef> {
+    copy_cells(arrays, cells, Padding::Null)
+}
+
+/// Copies cells into persisted event columns, keeping the legacy undefined slots beneath null parents.
+pub fn copy_event_cells(arrays: &[&dyn Array], cells: &[Option<(usize, usize)>]) -> Result<ArrayRef> {
+    copy_cells(arrays, cells, Padding::Event)
+}
+
+pub(crate) fn undefined_cells(data_type: &DataType, rows: usize) -> Result<ArrayRef> {
+    let empty = arrow_array::new_empty_array(data_type);
+    copy_nested_cells(&[empty.as_ref()], &vec![None; rows], Padding::Undefined)
+}
+
+fn copy_cells(arrays: &[&dyn Array], cells: &[Cell], padding: Padding) -> Result<ArrayRef> {
     let layout = arrays.first().map(|array| array.data_type()).ok_or_else(|| invalid("Nothing to interleave"))?;
     if arrays.iter().any(|array| array.data_type() != layout) {
         return Err(invalid("Selected Arrow layouts differ"));
     }
-    let cells = cells.iter().copied().map(Some).collect::<Vec<_>>();
-    copy_nested_cells(arrays, &cells)
+    copy_nested_cells(arrays, cells, padding)
 }
 
 type Cell = Option<(usize, usize)>;
 
-fn copy_nested_cells(arrays: &[&dyn Array], cells: &[Cell]) -> Result<ArrayRef> {
+#[derive(Clone, Copy)]
+pub(crate) enum Padding {
+    Null,
+    Event,
+    Undefined,
+}
+
+impl Padding {
+    pub(crate) fn under_null_parent(self) -> Self {
+        match self {
+            Self::Null => Self::Null,
+            Self::Event | Self::Undefined => Self::Undefined,
+        }
+    }
+
+    pub(crate) fn union_leg(self, fields: &UnionFields) -> Option<(i8, &Arc<Field>)> {
+        match self {
+            Self::Undefined => fields.iter().next(),
+            Self::Null | Self::Event => fields.iter().find(|(_, field)| field.data_type() == &DataType::Null).or_else(|| fields.iter().next()),
+        }
+    }
+}
+
+fn copy_nested_cells(arrays: &[&dyn Array], cells: &[Cell], padding: Padding) -> Result<ArrayRef> {
     use arrow_array::cast::AsArray;
     let layout = arrays[0].data_type();
     match layout {
-        DataType::Union(fields, arrow_schema::UnionMode::Dense) => interleave_union(fields, arrays, cells, copy_nested_cells),
+        DataType::Union(fields, arrow_schema::UnionMode::Dense) =>
+            interleave_union(fields, arrays, cells, padding, |children, picks| copy_nested_cells(children, picks, padding)),
         DataType::Struct(fields) => {
             let structs: Vec<_> = arrays.iter().map(|array| array.as_struct()).collect();
             let visible = visible_cells(arrays, cells);
             let columns = (0..fields.len()).map(|position| {
                 let inputs = structs.iter().map(|array| array.column(position).as_ref()).collect::<Vec<_>>();
-                copy_nested_cells(&inputs, &visible)
+                copy_nested_cells(&inputs, &visible, padding.under_null_parent())
             }).collect::<Result<Vec<_>>>()?;
             crate::build_struct_array(fields.clone(), &columns, cells.len(), interleave_validity(&visible))
         }
         DataType::List(_) => {
             let lists = arrays.iter().map(|array| array.as_list::<i32>()).map(|array| (array.value_offsets(), array.values().as_ref()));
             let visible = visible_cells(arrays, cells);
-            let (offsets, values) = interleave_list_values(lists, &visible)?;
+            let (offsets, values) = interleave_list_values(lists, &visible, padding)?;
             // A union's explicit null leg does not require a physical null bitmap on the list child.
             let data = ArrayData::builder(layout.clone()).len(cells.len()).nulls(interleave_validity(&visible))
                 .add_buffer(offsets.into_inner().into_inner()).add_child_data(values.to_data()).build().map_err(invalid)?;
@@ -71,7 +114,7 @@ fn copy_nested_cells(arrays: &[&dyn Array], cells: &[Cell]) -> Result<ArrayRef> 
                     picks.extend(std::iter::repeat_n(None, width));
                 }
             }
-            let values = copy_nested_cells(&lists, &picks)?;
+            let values = copy_nested_cells(&lists, &picks, padding.under_null_parent())?;
             let data = ArrayData::builder(layout.clone()).len(cells.len()).nulls(interleave_validity(&visible))
                 .add_child_data(values.to_data()).build().map_err(invalid)?;
             Ok(make_array(data))
@@ -79,15 +122,15 @@ fn copy_nested_cells(arrays: &[&dyn Array], cells: &[Cell]) -> Result<ArrayRef> 
         DataType::Map(field, sorted) => {
             let maps = arrays.iter().map(|array| array.as_map()).map(|array| (array.value_offsets(), array.entries() as &dyn Array));
             let visible = visible_cells(arrays, cells);
-            let (offsets, values) = interleave_list_values(maps, &visible)?;
+            let (offsets, values) = interleave_list_values(maps, &visible, padding)?;
             let entries = values.as_struct();
             if entries.column(0).logical_null_count() != 0 { return Err(invalid("Arrow map keys cannot be null")); }
             Ok(Arc::new(MapArray::try_new(Arc::clone(field), offsets, entries.clone(), interleave_validity(&visible), *sorted).map_err(invalid)?))
         }
         DataType::RunEndEncoded(ends, _) => match ends.data_type() {
-            DataType::Int16 => copy_runs::<Int16Type>(arrays, cells),
-            DataType::Int32 => copy_runs::<Int32Type>(arrays, cells),
-            DataType::Int64 => copy_runs::<Int64Type>(arrays, cells),
+            DataType::Int16 => copy_runs::<Int16Type>(arrays, cells, padding),
+            DataType::Int32 => copy_runs::<Int32Type>(arrays, cells, padding),
+            DataType::Int64 => copy_runs::<Int64Type>(arrays, cells, padding),
             _ => Err(invalid("A run-end array requires signed 16-, 32- or 64-bit run ends")),
         },
         _ => {
@@ -108,7 +151,7 @@ fn copy_nested_cells(arrays: &[&dyn Array], cells: &[Cell]) -> Result<ArrayRef> 
     }
 }
 
-fn copy_runs<R: RunEndIndexType>(arrays: &[&dyn Array], cells: &[Cell]) -> Result<ArrayRef> {
+fn copy_runs<R: RunEndIndexType>(arrays: &[&dyn Array], cells: &[Cell], padding: Padding) -> Result<ArrayRef> {
     let end = |value| R::Native::from_usize(value).ok_or_else(|| {
         Anomaly::incorrect("rtdb/run-end-selection-width", "Selected rows exceed the run-end width")
     });
@@ -127,21 +170,21 @@ fn copy_runs<R: RunEndIndexType>(arrays: &[&dyn Array], cells: &[Cell]) -> Resul
         }
     }
     if !picks.is_empty() { ends.push(end(cells.len())?); }
-    let values = copy_nested_cells(&inputs, &picks)?;
+    let values = copy_nested_cells(&inputs, &picks, padding)?;
     let ends = PrimitiveArray::<R>::new(ScalarBuffer::from(ends), None);
     let data = ArrayData::builder(arrays[0].data_type().clone()).len(cells.len())
         .add_child_data(ends.to_data()).add_child_data(values.to_data()).build().map_err(invalid)?;
     Ok(make_array(data))
 }
 
-fn interleave_union<C>(fields: &UnionFields, arrays: &[&dyn Array], cells: &[C],
-    select: fn(&[&dyn Array], &[C]) -> Result<ArrayRef>) -> Result<ArrayRef>
+fn interleave_union<C>(fields: &UnionFields, arrays: &[&dyn Array], cells: &[C], padding: Padding,
+    select: impl Fn(&[&dyn Array], &[C]) -> Result<ArrayRef>) -> Result<ArrayRef>
 where C: Copy + From<(usize, usize)> + Into<Cell> {
     let unions = arrays.iter().map(|array| array.as_any().downcast_ref::<UnionArray>().ok_or_else(|| invalid("A union source is not a union"))).collect::<Result<Vec<_>>>()?;
     let mut picks: Vec<Vec<C>> = vec![Vec::new(); fields.iter().map(|(id, _)| id as usize + 1).max().unwrap_or(0)];
     let mut ids = Vec::with_capacity(cells.len());
     let mut offsets = Vec::with_capacity(cells.len());
-    let masked_leg = masked_union_leg(fields).map(|(id, _)| id);
+    let masked_leg = padding.union_leg(fields).map(|(id, _)| id);
     for &cell in cells {
         let (id, pick) = if let Some((source, row)) = cell.into() {
             let union = unions[source];
@@ -162,10 +205,6 @@ where C: Copy + From<(usize, usize)> + Into<Cell> {
         .map_err(|error| invalid(error))?))
 }
 
-pub(crate) fn masked_union_leg(fields: &UnionFields) -> Option<(i8, &Arc<Field>)> {
-    fields.iter().find(|(_, field)| field.data_type() == &DataType::Null).or_else(|| fields.iter().next())
-}
-
 fn visible_cells(arrays: &[&dyn Array], cells: &[Cell]) -> Vec<Cell> {
     cells.iter().map(|cell| cell.filter(|&(source, row)| arrays[source].is_valid(row))).collect()
 }
@@ -176,7 +215,7 @@ fn interleave_validity(cells: &[Cell]) -> Option<NullBuffer> {
     validity.finish()
 }
 
-fn interleave_list_values<'a>(lists: impl Iterator<Item = (&'a [i32], &'a dyn Array)>, cells: &[Cell])
+fn interleave_list_values<'a>(lists: impl Iterator<Item = (&'a [i32], &'a dyn Array)>, cells: &[Cell], padding: Padding)
     -> Result<(OffsetBuffer<i32>, ArrayRef)> {
     let (offsets, values): (Vec<_>, Vec<_>) = lists.unzip();
     let mut picks = Vec::new();
@@ -195,7 +234,7 @@ fn interleave_list_values<'a>(lists: impl Iterator<Item = (&'a [i32], &'a dyn Ar
         };
         selected.push(count);
     }
-    let values = copy_nested_cells(&values, &picks)?;
+    let values = copy_nested_cells(&values, &picks, padding)?;
     Ok((OffsetBuffer::new(ScalarBuffer::from(selected)), values))
 }
 

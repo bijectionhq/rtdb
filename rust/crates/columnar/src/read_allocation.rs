@@ -2,6 +2,8 @@ use arrow_array::{Array, BinaryArray, FixedSizeBinaryArray, FixedSizeListArray, 
 use arrow_schema::{DataType, Field, UnionMode};
 use rtdb_types::{Anomaly, Result, Value};
 
+use crate::interleave::Padding;
+
 /// Bounds `read_value`'s temporary schema construction and owned result without allocating.
 /// Only the selected cell, active union leg, and selected list offsets contribute value bytes.
 /// Existing Arrow buffers retain their own reservations; sum this bound before reading multiple cells.
@@ -13,19 +15,24 @@ pub fn estimate_read_value_bytes(field: &Field, array: &dyn Array, row: usize) -
 
 /// Bounds the owned result of reading one cell through a `ColumnReader`, whose schema is derived once per column.
 pub fn estimate_read_cell_bytes(field: &Field, array: &dyn Array, row: usize) -> Result<usize> {
-    estimate_cell_bytes(field, array, row, false)
+    estimate_cell_bytes(field, array, row, None)
 }
 
 /// Bounds a cell copied by an Arrow selection and the placeholders used beneath null parents.
 pub fn estimate_copy_cell_bytes(field: &Field, array: &dyn Array, row: usize) -> Result<usize> {
-    estimate_cell_bytes(field, array, row, true)
+    estimate_cell_bytes(field, array, row, Some(Padding::Null))
 }
 
-fn estimate_cell_bytes(field: &Field, array: &dyn Array, row: usize, copy: bool) -> Result<usize> {
+/// Bounds a cell copied into a persisted event column.
+pub fn estimate_event_copy_cell_bytes(field: &Field, array: &dyn Array, row: usize) -> Result<usize> {
+    estimate_cell_bytes(field, array, row, Some(Padding::Event))
+}
+
+fn estimate_cell_bytes(field: &Field, array: &dyn Array, row: usize, copy: Option<Padding>) -> Result<usize> {
     if row >= array.len() { return Err(Anomaly::incorrect("rtdb/row-index", "Cell index exceeds array length")); }
     if field.data_type() != array.data_type() { return Err(layout()); }
     let base = add(mul(std::mem::size_of::<Value>(), 2)?, 256)?;
-    if field.data_type() == &DataType::Null && !field.is_nullable() && !copy { return Err(Anomaly::fault("xtdb/zero-leg-read", "The bottom type has no values to read")); }
+    if field.data_type() == &DataType::Null && !field.is_nullable() && copy.is_none() { return Err(Anomaly::fault("xtdb/zero-leg-read", "The bottom type has no values to read")); }
     if let DataType::RunEndEncoded(ends, values) = field.data_type() {
         let child = match ends.data_type() {
             DataType::Int16 => { let runs = cast::<RunArray<Int16Type>>(array)?; estimate_cell_bytes(values, runs.values().as_ref(), runs.get_physical_index(row), copy)? },
@@ -42,7 +49,7 @@ fn estimate_cell_bytes(field: &Field, array: &dyn Array, row: usize, copy: bool)
         return add(base, estimate_cell_bytes(field, union.child(id).as_ref(), union.value_offset(row), copy)?);
     }
     if array.is_null(row) {
-        return if copy { masked_copy_bytes(field) } else { Ok(base) };
+        return copy.map_or(Ok(base), |padding| null_copy_bytes(field, padding));
     }
     let value = match field.data_type() {
         DataType::Utf8 => mul(cast::<StringArray>(array)?.value(row).len(), 2)?,
@@ -56,7 +63,7 @@ fn estimate_cell_bytes(field: &Field, array: &dyn Array, row: usize, copy: bool)
             for (index, child) in fields.iter().enumerate() {
                 bytes = add(bytes, map_node()?)?;
                 bytes = add(bytes, mul(child.name().len(), 2)?)?;
-                bytes = add(bytes, if child.data_type() == &DataType::Null && !child.is_nullable() && !copy { std::mem::size_of::<Value>() }
+                bytes = add(bytes, if child.data_type() == &DataType::Null && !child.is_nullable() && copy.is_none() { std::mem::size_of::<Value>() }
                     else { estimate_cell_bytes(child, values.column(index).as_ref(), row, copy)? })?;
             }
             bytes
@@ -84,23 +91,33 @@ fn estimate_cell_bytes(field: &Field, array: &dyn Array, row: usize, copy: bool)
     add(base, value)
 }
 
-fn masked_copy_bytes(field: &Field) -> Result<usize> {
+/// Bounds a typed null slot, including the placeholders in its fixed-width children.
+pub fn estimate_null_copy_cell_bytes(field: &Field) -> Result<usize> {
+    null_copy_bytes(field, Padding::Null)
+}
+
+/// Bounds an absent cell in a persisted event column.
+pub fn estimate_event_null_cell_bytes(field: &Field) -> Result<usize> {
+    null_copy_bytes(field, Padding::Event)
+}
+
+pub(crate) fn null_copy_bytes(field: &Field, padding: Padding) -> Result<usize> {
     let base = 256 + 2 * std::mem::size_of::<Value>();
     let children = match field.data_type() {
-        DataType::Struct(fields) => fields.iter().try_fold(0, |bytes, field| add(bytes, masked_copy_bytes(field)?))?,
-        DataType::FixedSizeList(child, count) => mul(usize::try_from(*count).map_err(|_| layout())?, masked_copy_bytes(child)?)?,
+        DataType::Struct(fields) => fields.iter().try_fold(0, |bytes, field| add(bytes, null_copy_bytes(field, padding.under_null_parent())?))?,
+        DataType::FixedSizeList(child, count) => mul(usize::try_from(*count).map_err(|_| layout())?, null_copy_bytes(child, padding.under_null_parent())?)?,
         DataType::FixedSizeBinary(width) => mul(usize::try_from(*width).map_err(|_| layout())?, 2)?,
-        DataType::RunEndEncoded(_, values) => masked_copy_bytes(values)?,
+        DataType::RunEndEncoded(_, values) => null_copy_bytes(values, padding)?,
         DataType::Union(fields, UnionMode::Dense) => {
-            let (_, field) = crate::interleave::masked_union_leg(fields).ok_or_else(layout)?;
-            masked_copy_bytes(field)?
+            let (_, field) = padding.union_leg(fields).ok_or_else(layout)?;
+            null_copy_bytes(field, padding)?
         }
         _ => 0,
     };
     add(base, children)
 }
 
-fn range(field: &Field, values: &dyn Array, start: usize, end: usize, copy: bool) -> Result<usize> {
+fn range(field: &Field, values: &dyn Array, start: usize, end: usize, copy: Option<Padding>) -> Result<usize> {
     if start > end || end > values.len() { return Err(layout()); }
     let mut bytes = add(256, mul(end - start, mul(std::mem::size_of::<Value>(), 2)?)?)?;
     for row in start..end { bytes = add(bytes, estimate_cell_bytes(field, values, row, copy)?)?; }

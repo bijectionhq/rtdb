@@ -15,12 +15,25 @@ pub fn relayout_arrow_column(array: ArrayRef, source: &arrow_schema::Field, targ
     let target_type = from_field(target)?;
     let source_type = from_field(source)?;
     layout(&target_type, &source_type)?;
-    physical::relayout(array, source, target)
+    physical::relayout(array, source, target, false)
 }
 
 /// Bounds the temporary and new allocations needed to relayout an already owned array.
 pub fn arrow_relayout_bound(array: &dyn arrow_array::Array, source: &arrow_schema::Field, target: &arrow_schema::Field) -> Result<usize> {
-    add(multiply(target.size(), 8)?, physical::additional_bytes(&array.to_data(), source, target)?)
+    add(multiply(target.size(), 8)?, physical::additional_bytes(&array.to_data(), source, target, false)?)
+}
+
+/// Adapts persisted event layouts while preserving undefined cells in fields of bottom type.
+pub fn relayout_event_column(array: ArrayRef, source: &arrow_schema::Field, target: &arrow_schema::Field) -> Result<(arrow_schema::Field, ArrayRef)> {
+    let target_type = from_field(target)?;
+    if from_field(source)?.unencoded().join(&target_type) != target_type {
+        return Err(fault("page-outside-declared-type", "Page type differs from its declared event type"));
+    }
+    physical::relayout(array, source, target, true)
+}
+
+pub fn event_relayout_bound(array: &dyn arrow_array::Array, source: &arrow_schema::Field, target: &arrow_schema::Field) -> Result<usize> {
+    add(multiply(target.size(), 8)?, physical::additional_bytes(&array.to_data(), source, target, true)?)
 }
 
 /// A page in a declared wire layout, retaining its schema and allocation charges.
@@ -72,7 +85,7 @@ pub fn conform_batch(batch: OwnedBatch, declared: &Schema, memory: &Arc<MemoryBu
         if let Some((source_field, array)) = input {
             let bound = arrow_relayout_bound(array.as_ref(), source_field, field)?;
             if let Ok(_scratch) = memory.reserve(bound)
-                && let Ok((physical, retained)) = physical::relayout(Arc::clone(array), source_field, field) {
+                && let Ok((physical, retained)) = physical::relayout(Arc::clone(array), source_field, field, false) {
                 output.grow_to(add(output.bytes(), retained.get_array_memory_size())?)?;
                 fields.push(physical);
                 arrays.push(retained);
@@ -95,7 +108,7 @@ pub fn conform_batch(batch: OwnedBatch, declared: &Schema, memory: &Arc<MemoryBu
         let physical = to_field(field.name(), &ty)?.with_metadata(field.metadata().clone());
         let bound = multiply(estimate_builder_bytes(&ty, &column)?, 2)?;
         output.grow_to(add(output.bytes(), bound)?)?;
-        let (physical, array) = physical::relayout(copy_array(&ty, &column)?, &physical, field)?;
+        let (physical, array) = physical::relayout(copy_array(&ty, &column)?, &physical, field, false)?;
         fields.push(physical);
         arrays.push(array);
     }

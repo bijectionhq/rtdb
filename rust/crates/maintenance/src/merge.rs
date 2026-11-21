@@ -12,7 +12,7 @@ use async_trait::async_trait;
 use arrow_schema::{DataType, SchemaRef};
 use rtdb_types::CivilDate;
 use rtdb_columnar::{MemoryBudget, MemoryReservation, OwnedBatch, from_field};
-use rtdb_format::{data::{EncodedEvent, EventBatch, PageEvent, copy_encoded_batch_with_recency}, ipc::{ArrowFile, ArrowFileWriter, inspect_file_reserved}, keys::TrieKey,
+use rtdb_format::{data::{EncodedEvent, EventBatch, PageEvent, copy_encoded_batch_with_recency, owned_encoded_batch_with_recency}, ipc::{ArrowFile, ArrowFileWriter, inspect_file_reserved}, keys::TrieKey,
     log::proto::{TriesAdded, TrieDetails, TrieFileVersions}, metadata::MetadataFile};
 use rtdb_storage::{ObjectKey, ObjectStore, ReadReservation};
 use rtdb_temporal::AdmittedPolygonCalculator;
@@ -91,10 +91,12 @@ struct MergeFile {
 struct OutputSchema { put: Option<StructFields<LogicalType>>, iid_encoding: Option<RunEndWidth>, recency: bool }
 
 impl OutputSchema {
-    fn batch(&self, events: &[PageEvent]) -> Result<arrow_array::RecordBatch> {
-        copy_encoded_batch_with_recency(events, self.put.clone(), self.iid_encoding, self.recency)
+    fn batch(&self, events: &[PageEvent], memory: &Arc<MemoryBudget>) -> Result<OwnedBatch> {
+        owned_encoded_batch_with_recency(events, self.put.clone(), self.iid_encoding, self.recency, memory)
     }
-    fn schema(&self) -> Result<SchemaRef> { Ok(self.batch(&[])?.schema()) }
+    fn schema(&self) -> Result<SchemaRef> {
+        Ok(copy_encoded_batch_with_recency::<PageEvent>(&[], self.put.clone(), self.iid_encoding, self.recency)?.schema())
+    }
 }
 
 fn create_file(path: &Path) -> Result<File> {
@@ -307,8 +309,7 @@ impl CompactionExecutor for SegmentCompactor {
             }
             drop(calculator);
             for (index, events) in buckets {
-                let _charge = event_reservation(&self.memory, &events, 8)?;
-                outputs[index].write(&events, task.path.clone(), &put, &self.config)?;
+                outputs[index].write(&events, task.path.clone(), &put, &self.config, &self.memory)?;
             }
             tokio::task::yield_now().await;
         }
@@ -348,12 +349,14 @@ impl MergeFile {
         let writer = ArrowFileWriter::new_bounded_reserved(create_file(&path)?, schema.schema()?.as_ref(), disk_remaining(directory, config.temporary_byte_limit)?, memory)?;
         Ok(Self { path, part: part.to_vec(), recency, carries_recency, writer: Some(writer), leaves: Vec::new() })
     }
-    fn write(&mut self, events: &[PageEvent], path: Vec<u8>, put: &Option<StructFields<LogicalType>>, config: &MergeConfig) -> Result<()> {
+    fn write(&mut self, events: &[PageEvent], path: Vec<u8>, put: &Option<StructFields<LogicalType>>, config: &MergeConfig,
+        memory: &Arc<MemoryBudget>) -> Result<()> {
         if events.is_empty() { return Ok(()); }
         let schema = OutputSchema { put: put.clone(), iid_encoding: (config.run_end_encoded_iids && self.recency.is_some()).then_some(RunEndWidth::I32), recency: self.carries_recency };
         let writer = self.writer.as_mut().ok_or_else(|| crate::invalid("Merge file already ended"))?;
         limit_writer(writer, self.path.parent().ok_or_else(|| crate::invalid("Merge path has no parent"))?, config.temporary_byte_limit)?;
-        writer.write(&schema.batch(events)?)?;
+        let batch = schema.batch(events, memory)?;
+        writer.write_event_page(batch.batch(), memory)?;
         self.leaves.push(layout::Leaf { page: self.leaves.len(), path, rows: events.len(), min_recency: events.iter().filter_map(|event| event.recency).min(), max_recency: events.iter().filter_map(|event| event.recency).max() });
         Ok(())
     }
@@ -373,6 +376,26 @@ mod tests {
     use rtdb_types::Iid;
 
     fn page(events: &[StoredEvent]) -> Vec<PageEvent> { EventBatch::new(build_event_batch(events, None, None).unwrap()).unwrap().page_events().unwrap() }
+
+    #[test]
+    fn compaction_reserves_encoding_scratch_before_writing_a_page() {
+        let fields = StructFields::from([("payload".into(), LogicalType::Scalar(rtdb_types::ScalarType::Binary))]);
+        let input = build_event_batch(&[StoredEvent {
+            iid: Iid([1; 16]), system_from: Timestamp(100), valid_time: Interval::ALL, recency: None,
+            operation: StoredOperation::Put(StructFields::from([("payload".into(), rtdb_types::Value::Binary(vec![7; 1 << 20]))])),
+        }], Some(fields), None).unwrap();
+        let file = tempfile::tempfile().unwrap();
+        let memory = MemoryBudget::new(1 << 20);
+        let mut writer = ArrowFileWriter::new_reserved(file, input.schema_ref(), &memory).unwrap();
+        let position = writer.bytes_written();
+        let before = memory.used_bytes();
+
+        let error = writer.write_event_page(&input, &memory).unwrap_err();
+
+        assert_eq!(error.code, "rtdb/memory-budget-exceeded");
+        assert_eq!(writer.bytes_written(), position);
+        assert_eq!(memory.used_bytes(), before);
+    }
 
     #[test]
     fn row_heap_matches_flatten_and_sort_without_losing_occurrences() {

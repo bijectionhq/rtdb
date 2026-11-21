@@ -8,7 +8,7 @@ use rtdb_columnar::{MemoryBudget, MemoryReservation};
 use rtdb_format::{data::{EventBatch, PageEvent}, ipc::{ArrowFile, ArrowFileWriter}, metadata::MetadataBuilder};
 use rtdb_types::{Iid, LogicalType, Result, RunEndWidth, Timestamp};
 use tokio_util::sync::CancellationToken;
-use super::{MergeConfig, MergeFile, OutputSchema, check_disk, create_file, disk_remaining, event_reservation, limit_writer, open_input, read_page, row_bytes};
+use super::{MergeConfig, MergeFile, OutputSchema, check_disk, create_file, disk_remaining, limit_writer, open_input, read_page, row_bytes};
 use super::planner::bucket;
 
 #[derive(Clone, Debug)]
@@ -49,20 +49,15 @@ struct FinalWriter<'a> {
 impl FinalWriter<'_> {
     fn leaf(&mut self, events: &[PageEvent]) -> Result<usize> {
         if self.cancellation.is_cancelled() { return Err(crate::closed()); }
-        let _batch = event_reservation(self.memory, events, 8)?;
-        let batch = self.schema.batch(events)?;
-        let (leaf, metadata_charge) = self.metadata.write_leaf_reserved(&batch, self.memory)?;
-        limit_writer(&mut self.data, self.directory, self.disk_limit)?;
-        self.data.write(&batch)?;
-        self.metadata_charges.push(metadata_charge);
-        Ok(leaf)
+        let batch = self.schema.batch(events, self.memory)?;
+        self.page(batch.batch())
     }
 
     fn page(&mut self, batch: &arrow_array::RecordBatch) -> Result<usize> {
         if self.cancellation.is_cancelled() { return Err(crate::closed()); }
         let (leaf, metadata_charge) = self.metadata.write_leaf_reserved(batch, self.memory)?;
         limit_writer(&mut self.data, self.directory, self.disk_limit)?;
-        self.data.write(batch)?;
+        self.data.write_event_page(batch, self.memory)?;
         self.metadata_charges.push(metadata_charge);
         Ok(leaf)
     }
