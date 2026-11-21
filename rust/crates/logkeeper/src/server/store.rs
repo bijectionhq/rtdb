@@ -8,7 +8,7 @@ use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore, mpsc, oneshot};
+use tokio::sync::{Notify, Semaphore, mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 
 const COMPACTION_SLACK_BYTES: u64 = 1 << 20;
