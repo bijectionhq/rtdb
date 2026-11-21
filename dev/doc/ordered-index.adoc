@@ -41,6 +41,7 @@ A missing checkpoint, missing source coverage or memory admission failure uses t
 
 The index worker packs its own immutable pages and publishes a checkpoint after its pages and revision directory are durable.
 It checks coverage against the table catalog's durable event count before publication.
+Each flushed input comes from the captured catalog's adopted L0 inventory and must match its recorded byte length.
 Queries can use a complete checkpoint plus replay from the captured table events, and a reopened node can use the same files.
 Table compaction changes neither the logical roots nor the index's publication schedule.
 A damaged checkpoint can be rebuilt from retained level-zero events.

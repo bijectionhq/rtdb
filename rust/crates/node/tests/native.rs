@@ -2207,10 +2207,13 @@ async fn rebuilding_a_missing_ordered_root_preserves_the_incremental_manifest() 
 }
 
 #[tokio::test]
-async fn ordered_coverage_ignores_a_nested_copy_of_a_canonical_l0_file() {
+async fn ordered_coverage_uses_only_adopted_l0_files() {
     let mut config = options();
     config.automatic_artefacts = false;
-    let (node, driver) = running(config, services()).await;
+    let observer = Arc::new(OrderedIndexReads::default());
+    let mut services = services();
+    services.scan_accelerators.push(observer.clone());
+    let (node, driver) = running(config, services).await;
     let mut session = node.session("xtdb", Arc::new(Authority)).unwrap();
     let database = node.catalog().database("xtdb").unwrap();
     index_sql(&mut session, "CREATE INDEX orders_key ON orders (priority, _id)").await;
@@ -2222,14 +2225,22 @@ async fn ordered_coverage_ignores_a_nested_copy_of_a_canonical_l0_file() {
     let entry = snapshot.table_entry(&table).unwrap();
     let trie = rtdb_format::keys::TrieKey::l0(snapshot.trie_catalog().l0_max_block_index(&table)).unwrap();
     let canonical = entry.slug.data_key(&trie);
-    let (directory, file) = canonical.rsplit_once('/').unwrap();
-    let copy = rtdb_storage::ObjectKey::new(format!("{directory}/staging/{file}")).unwrap();
     let canonical = rtdb_storage::ObjectKey::new(canonical).unwrap();
+    index_sql(&mut session, "INSERT INTO unrelated RECORDS {_id: 1}").await;
+    index_flush(&node, &database).await;
+    let gap = database.snapshot().trie_catalog().l0_max_block_index(&TableRef::new("public", "unrelated"));
+    assert!(gap > trie.block_index());
+    let unadopted = rtdb_format::keys::TrieKey::l0(gap).unwrap();
+    let copy = rtdb_storage::ObjectKey::new(entry.slug.data_key(&unadopted)).unwrap();
     let store = database.object_store();
     store.put(&copy, store.get(&canonical).await.unwrap()).await.unwrap();
+    index_sql(&mut session, "INSERT INTO orders RECORDS {_id: 2, priority: 2}").await;
+    index_flush(&node, &database).await;
 
     database.build_artefacts().await.unwrap();
     let query = "SELECT _id FROM orders ORDER BY priority, _id LIMIT 1";
-    assert_eq!(rows(session.query_sql(query, vec![]).await.unwrap()).await, [vec![Value::I64(1)]]);
+    observer.take();
+    assert_eq!(rows(session.query_sql(query, vec![]).await.unwrap()).await, [vec![Value::I64(2)]]);
+    assert!(observer.take().is_empty());
     stop(&node, driver).await;
 }

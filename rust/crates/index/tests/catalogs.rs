@@ -14,12 +14,18 @@ fn current(catalog: &TrieCatalog) -> BTreeSet<String> { catalog.current_tries(&t
 fn names(keys: &[&str]) -> BTreeSet<String> { keys.iter().map(|key| (*key).to_owned()).collect() }
 
 #[test]
-fn historical_l1_waits_for_current_file_and_covered_l0_leaves_catalog() {
+fn historical_l1_waits_for_current_file_and_covered_l0_stays_in_source_inventory() {
     let initial = apply(&[("l00-rc-b00", 10), ("l00-rc-b01", 10), ("l00-rc-b02", 10), ("l01-r20200101-b01", 5), ("l01-r20200102-b01", 5)]);
     assert_eq!(current(&initial), names(&["l00-rc-b00", "l00-rc-b01", "l00-rc-b02"]));
     let next = initial.with_tries(table(), [notification("l01-rc-b01", 15)], Timestamp(100)).unwrap();
     assert_eq!(current(&next), names(&["l00-rc-b02", "l01-r20200101-b01", "l01-r20200102-b01", "l01-rc-b01"]));
-    assert!(next.all_tries(&table()).iter().all(|trie| trie.key.to_string() != "l00-rc-b00"));
+    let blocks: Vec<_> = next.l0_source(&table(), BlockIndex(-1), BlockIndex(2))
+        .map(|trie| (trie.key.block_index(), trie.state)).collect();
+    assert_eq!(blocks, [
+        (BlockIndex(0), TrieState::Garbage { as_of: Timestamp(100) }),
+        (BlockIndex(1), TrieState::Garbage { as_of: Timestamp(100) }),
+        (BlockIndex(2), TrieState::Live),
+    ]);
     assert!(next.garbage_tries(&table(), Timestamp::MAX).is_empty());
     assert_eq!(next.l0_max_block_index(&table()), BlockIndex(2));
 }
@@ -85,7 +91,7 @@ fn a_checkpoint_preserves_pending_historical_promotion_for_each_block() {
 }
 
 #[test]
-fn persisted_partitions_repair_covered_l0_and_drop_old_l0_garbage_5395() {
+fn persisted_partitions_keep_covered_l0_for_exact_replay_5395() {
     let mut live_l0 = notification("l00-rc-b00", 10); live_l0.state = TrieState::Live;
     let mut garbage_l0 = notification("l00-rc-b01", 10); garbage_l0.state = TrieState::Garbage { as_of: Timestamp(100) };
     let mut l1 = notification("l01-rc-b00", 10); l1.state = TrieState::Live;
@@ -96,7 +102,12 @@ fn persisted_partitions_repair_covered_l0_and_drop_old_l0_garbage_5395() {
     let block = TableBlock::from_parts(BTreeMap::new(), &Default::default(), 0, partitions).unwrap();
     let catalog = TrieCatalog::load(&BTreeMap::from([(table(), block)]), 20, Timestamp(101)).unwrap();
     assert_eq!(current(&catalog), names(&["l01-rc-b00"]));
-    assert_eq!(catalog.all_tries(&table()).len(), 1);
+    let source: Vec<_> = catalog.l0_source(&table(), BlockIndex(-1), BlockIndex(1))
+        .map(|trie| (trie.key.block_index(), trie.state)).collect();
+    assert_eq!(source, [
+        (BlockIndex(0), TrieState::Garbage { as_of: Timestamp(101) }),
+        (BlockIndex(1), TrieState::Garbage { as_of: Timestamp(100) }),
+    ]);
     assert_eq!(catalog.l0_max_block_index(&table()), BlockIndex(1));
 }
 

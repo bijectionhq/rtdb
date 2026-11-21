@@ -6,6 +6,7 @@
 -- Tries are added by block flushes (see db.allium) and compaction (see compaction.allium).
 -- Tries are read by the scan operator for query execution.
 -- Tries are garbage-collected by gc.allium once superseded by compaction output.
+-- The native catalog retains adopted L0 identities and lengths for recovery after primary compaction supersedes them.
 --
 -- See: trie/TrieCatalog.kt, log/proto/log.proto (TrieDetails, TrieState)
 
