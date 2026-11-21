@@ -1999,6 +1999,45 @@ async fn ordered_index_publishes_its_own_roots_and_seeks_both_directions_at_a_ba
 }
 
 #[tokio::test]
+async fn ordered_index_limits_distinct_visible_keys_in_both_directions() {
+    let observer = Arc::new(OrderedIndexReads::default());
+    let mut services = services();
+    services.scan_accelerators.push(observer.clone());
+    let mut config = options();
+    config.automatic_artefacts = false;
+    let (node, driver) = running(config, services).await;
+    let mut session = node.session("xtdb", Arc::new(Authority)).unwrap();
+    let database = node.catalog().database("xtdb").unwrap();
+
+    let index = "CREATE INDEX IF NOT EXISTS orders_candidates ON orders (world, key, label)";
+    index_sql(&mut session, index).await;
+    index_sql(&mut session, index).await;
+    index_sql(&mut session, "INSERT INTO orders RECORDS
+        {_id: 1, world: 4, key: 'a', label: 'hidden'},
+        {_id: 2, world: 4, key: 'b', label: 'public'},
+        {_id: 3, world: 4, key: 'b', label: 'low'},
+        {_id: 4, world: 4, key: 'c', label: 'low'},
+        {_id: 5, world: 4, key: 'c', label: 'public'},
+        {_id: 6, world: 8, key: 'd', label: 'public'}").await;
+    index_flush(&node, &database).await;
+    database.build_artefacts().await.unwrap();
+
+    for (direction, expected) in [("ASC", ["b", "c"]), ("DESC", ["c", "b"])] {
+        let query = format!("SELECT DISTINCT key FROM orders WHERE world = 4
+            AND (label = 'low' OR label = 'public') ORDER BY key {direction} LIMIT 2");
+        assert_eq!(rows(session.query_sql(&query, vec![]).await.unwrap()).await,
+            expected.map(|key| vec![Value::Utf8(key.into())]));
+        assert!(observer.take().is_empty(), "the ordered index answered without opening a candidate scan");
+    }
+
+    let query = "SELECT DISTINCT key FROM orders WHERE world = 4 AND key > 'b'
+        AND (label = 'low' OR label = 'public') ORDER BY key LIMIT 1";
+    assert_eq!(rows(session.query_sql(query, vec![]).await.unwrap()).await, [vec![Value::Utf8("c".into())]]);
+    assert!(observer.take().is_empty(), "the ordered index answered the continuation");
+    stop(&node, driver).await;
+}
+
+#[tokio::test]
 async fn ordered_index_retires_erased_keys_and_drop_recreate_gets_a_fresh_generation() {
     let mut config = options();
     config.automatic_artefacts = false;

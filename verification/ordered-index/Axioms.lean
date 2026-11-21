@@ -1,4 +1,5 @@
 import Buckets
+import DistinctPage
 import OrderedRead
 import Reachability
 import Recovery
@@ -17,3 +18,7 @@ import SeekRange
 #print axioms RTDB.OrderedIndex.count_completes_ordered_inclusion
 #print axioms RTDB.OrderedIndex.stale_mark_preserves_current
 #print axioms RTDB.OrderedIndex.rebuilt_layout_matches
+#print axioms RTDB.OrderedIndex.distinctRuns_mem
+#print axioms RTDB.OrderedIndex.distinctRuns_strict
+#print axioms RTDB.OrderedIndex.hidden_postings_preserve_distinct_page
+#print axioms RTDB.OrderedIndex.global_prefix_survives_local_limit

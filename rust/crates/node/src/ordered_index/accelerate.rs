@@ -6,12 +6,12 @@ use std::{
 use async_trait::async_trait;
 use rtdb_plan::{BinaryOp, ColumnId, Expr, Field};
 use rtdb_query::{ScanAccelerator, ScanRequest};
-use rtdb_types::{AnomalyCategory, Iid, LogicalType, Result, ScalarType, Value};
+use rtdb_types::{AnomalyCategory, Iid, LogicalType, Result, ScalarType};
 use std::sync::Arc;
 
 use super::{
     Definition, definitions,
-    key::{Atom, Bucket, family},
+    key::{Atom, Bucket, Family, family},
     maintenance::{cancelled, read_root},
     tree::{Cursor, Key, Tree},
 };
@@ -85,10 +85,10 @@ async fn seek(request: &ScanRequest<'_>, limit: Option<usize>) -> Result<Option<
             .collect();
         let range = Range::bind(request, &fields).await?;
         let top = if let Some(limit) = limit {
-            let Some(reverse) = order(request, &fields, &range) else {
+            let Some((reverse, distinct_slot)) = order(request, &fields, &range) else {
                 continue;
             };
-            Some(Top { limit, reverse })
+            Some(Top { limit, reverse, distinct_slot })
         } else {
             if range.is_open() {
                 continue;
@@ -395,10 +395,16 @@ fn operands<'a>(
 struct Top {
     limit: usize,
     reverse: bool,
+    distinct_slot: Option<usize>,
 }
 
-fn order(request: &ScanRequest<'_>, fields: &[Option<&Field>], range: &Range) -> Option<bool> {
-    let order = &request.scan.ordered_top_k.as_ref()?.order;
+fn order(
+    request: &ScanRequest<'_>,
+    fields: &[Option<&Field>],
+    range: &Range,
+) -> Option<(bool, Option<usize>)> {
+    let plan = request.scan.ordered_top_k.as_ref()?;
+    let order = &plan.order;
     let equal = &fields[..range.prefix.len()];
     let mut suffix = order.iter().filter(|sort| {
         !matches!(&sort.expr, Expr::Column { id, .. } if equal.iter().flatten().any(|field| field.id == *id))
@@ -422,7 +428,20 @@ fn order(request: &ScanRequest<'_>, fields: &[Option<&Field>], range: &Range) ->
             return None;
         }
     }
-    Some(reverse)
+    let distinct_slot = if plan.distinct {
+        let [sort] = order.as_slice() else { return None };
+        let slot = range.prefix.len();
+        let field = fields.get(slot)?.as_ref()?;
+        if family(&field.data_type) != Some(Family::Text)
+            || !matches!(&sort.expr, Expr::Column { id, .. } if *id == field.id)
+        {
+            return None;
+        }
+        Some(slot)
+    } else {
+        None
+    };
+    Some((reverse, distinct_slot))
 }
 
 #[derive(Debug)]
@@ -558,6 +577,10 @@ async fn use_index(
             }
         }
     }
+    let distinct_slot = top.and_then(|top| top.distinct_slot);
+    if distinct_slot.is_some() && !covered {
+        return Ok(None);
+    }
     let reverse = top.is_some_and(|top| top.reverse);
     let buckets: Vec<_> = Bucket::at(request.bounds.valid_time.lower()).collect();
     let mut cursors: Vec<_> = buckets
@@ -578,6 +601,7 @@ async fn use_index(
     }
     let mut selected = Vec::new();
     let mut pending = Vec::new();
+    let mut last_distinct = None::<Arc<[Atom]>>;
     while let Some(head) = heap.pop() {
         if request.cancellation.is_cancelled() {
             return Err(cancelled());
@@ -587,7 +611,15 @@ async fn use_index(
             .all(|predicate| predicate.matches(&head.tuple))
         {
             if covered {
-                selected.push(head.iid);
+                let emit = distinct_slot.is_none_or(|slot| {
+                    last_distinct.as_ref().is_none_or(|prior| prior[slot] != head.tuple[slot])
+                });
+                if emit {
+                    selected.push(head.iid);
+                    if distinct_slot.is_some() {
+                        last_distinct = Some(Arc::clone(&head.tuple));
+                    }
+                }
             } else {
                 pending.push(head.iid);
                 if pending.len()

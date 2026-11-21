@@ -337,6 +337,10 @@ impl PageCursor for OrderedRows {
         }
         Ok(Some(output.finish()))
     }
+
+    fn trace_attributes(&self, span: &mut dyn rtdb_plan::TraceSpan) {
+        span.attribute("scan_ordered_seek", rtdb_plan::TraceValue::Unsigned(1));
+    }
 }
 
 /// Runs the scan itself over one partition, restricted to a batch of IIDs, its predicates applied as the scan's filter applies them; narrowing is skipped because the IIDs are fixed.

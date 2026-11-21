@@ -25,5 +25,6 @@ entity Checkpoint {
 -- A revision edits both sides of a changed projection. Unchanged spans retain their postings.
 -- The read opens a root at its system-time point and applies captured uncovered events, including erasures.
 -- A point read merges bucket prefixes in key order and fetches payload at the same basis.
+-- An ordered distinct page filters eligible rows before counting each distinct key once.
 -- An erasure removes the IID's old membership from every affected root and makes unreachable pages collectible.
 -- Data compaction preserves input events and changes no ordered-index checkpoint.

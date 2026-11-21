@@ -12,7 +12,7 @@ The checker results and the remaining production obligations appear below.
 | Replay and fallback | `Recovery.lean` states equivalence for complete checkpoints and ordered tails. It also states exactly when the event count completes coverage. `Reachability.lean` states layout identity across a checkpoint split. | Establish that the canonical flushed inputs and live offset are an ordered substream of the exact capture. |
 | Publication and reclamation | `Checkpoint.tla` models a captured reader, two workers, immutable objects, publication, collection, fallback, and crash. The two control configurations remove checked source identity and complete upload. `Reachability.lean` states how a stale mark preserves later reachable pages under the per-block sharing rule. | Prove the sharing rule for `Tree::persist` and `store_roots`, and connect reader retention, leadership and immutable writes to the protocol. |
 | Erasure | `Temporal.lean` states how erase cuts the captured IID's prior history, including historical system-time reads. | Connect revision-directory scrubbing and physical collection across object and node caches to the model. `ErasureCleanup.tla` models the durable cleanup obligation under a single fail-stop owner. `ErasureRelease.tla` checks the requirement for fenced writes and replica eviction. |
-| Bijection page witnesses | `OrderedRead.lean` states how agreement over the consumed ordered prefix preserves the page, including a lookahead when it is observable. | Implement and prove the Bijection-to-RTDB refinement for world ancestry, labels, custody and range witnesses. The current RTDB accelerator serves SQL. |
+| Bijection page witnesses | `OrderedRead.lean` states how agreement over the consumed ordered prefix preserves the page. `DistinctPage.lean` proves that deduplication preserves sorted membership, that denied labels preserve a distinct page, and that per-source limits preserve its global prefix. | Bind the per-world SQL results and protected custody streams to acquisition and revalidation. |
 
 `CheckpointCountOnly.cfg` should produce a wrong answer when a replay substitutes an event with a duplicate while preserving the count.
 `CheckpointEarlyPublish.cfg` should expose a reachable manifest that references a missing object.
@@ -33,7 +33,7 @@ A physical erasure theorem across overlapping maintenance owners still needs a f
 Bijection's [cutover proof evidence](https://github.com/bijectionhq/bijection/blob/2fa0572878a0b812a38e33332818bbb687e8d8c0/verification/cutover-kernel-laws.md) records separate Lean, TLC and Verus checks on its existing kernel cutover.
 The applicable page law is `hidden_write_preserves_page_and_cursor`, over Bijection's projected, ordered observation.
 The native adapter obtains its candidates through the WorldStore scan and does world overlay, label filtering, custody checks and validation there.
-Connecting those observed prefixes to the RTDB ordered tree remains a production refinement obligation.
+The adapter asks RTDB for each clear source's ordered distinct key prefix. It combines those prefixes with the protected candidates before resolving the overlay.
 
 The cleanup model assumes one fail-stop maintenance owner.
 In production, a worker's term cancellation and an object-store `put` are separate operations.
@@ -73,8 +73,20 @@ The release model's fence makes an already-admitted write from the old term
 incapable of storing bytes after the term advances. Its acknowledgement also
 requires eviction on the modeled replica. Production must establish these
 conditions across its object store and replicas to claim physical completion.
-The proof run checked the models and included Rust decision functions. The
-native RTDB and Bijection runtime regressions remain unexecuted.
+The proof run checked the models and included Rust decision functions.
+
+## Runtime integration
+
+The native `ordered_index` filter passed six cases on the merged engine with ordered distinct scans enabled.
+The cases cover idempotent declaration, ordered distinct limits, both scan directions, exact temporal reads, reopen, and primary compaction.
+Lean 4.35.0 checked seven law modules and audited 17 theorems.
+Verus 0.2026.11.05.31e44e6 on the MacBook Pro M1 checked ten domain functions and six seek functions using the included production sources.
+TLC reran the erasure models and reproduced the three expected failures in their weakened controls.
+
+The local Bijection PgWire fixture `registered_pages_agree_with_and_without_ordered_index` exercised hosted WorldStore authority and fixture custody against a local RTDB build using the traced query implementation recorded at `49bd0c804845235ab0721c95dda596b5ee4c68b6`.
+The `scan_ordered_seek` attribute was present on both labelled ascending and descending reads before the index was dropped, and absent from the corresponding scans after the drop.
+At one basis and observation, both paths returned the expected rows, continuation and authenticated consumed predicate, and both registrations revalidated.
+Hosted provider upload settlement and reader eviction remain production proof obligations.
 
 ## Execution
 

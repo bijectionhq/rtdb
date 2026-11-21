@@ -109,7 +109,7 @@ fn annotate_top_k(relation: Arc<Relation>) -> Result<Arc<Relation>> {
         RelationNode::Rename { input, prefix, expressions } => RelationNode::Rename { input: annotate_top_k(Arc::clone(input))?, prefix: prefix.clone(), expressions: expressions.clone() },
         RelationNode::SortLimit { input, order_by, offset, fetch: Some(fetch) } => {
             let limit = match offset { Some(offset) => Expr::binary(BinaryOp::Add, offset.clone(), fetch.clone()), None => fetch.clone() };
-            let Some(input) = push_top_k(input, order_by, &limit, &[])? else { return Ok(relation) };
+            let Some(input) = push_top_k(input, order_by, &limit, &[], false)? else { return Ok(relation) };
             RelationNode::SortLimit { input, order_by: order_by.clone(), offset: offset.clone(), fetch: Some(fetch.clone()) }
         }
         _ => return Ok(relation),
@@ -117,7 +117,7 @@ fn annotate_top_k(relation: Arc<Relation>) -> Result<Arc<Relation>> {
     Ok(Arc::new(Relation::new(relation.schema().clone(), rebuilt)?))
 }
 
-fn push_top_k(relation: &Arc<Relation>, order: &[rtdb_plan::SortExpr], limit: &Expr, residuals: &[Expr]) -> Result<Option<Arc<Relation>>> {
+fn push_top_k(relation: &Arc<Relation>, order: &[rtdb_plan::SortExpr], limit: &Expr, residuals: &[Expr], distinct: bool) -> Result<Option<Arc<Relation>>> {
     let through = |expressions: &[NamedExpr]| {
         let defined: BTreeMap<ColumnId, Expr> = expressions.iter().map(|named| (named.field.id, named.expr.clone())).collect();
         let rewrite = |expression: &mut Expr| if let Expr::Column { id, .. } = expression {
@@ -132,33 +132,41 @@ fn push_top_k(relation: &Arc<Relation>, order: &[rtdb_plan::SortExpr], limit: &E
     let node = match relation.node() {
         RelationNode::Project { input, expressions } => {
             let (order, residuals) = through(expressions);
-            let Some(input) = push_top_k(input, &order, limit, &residuals)? else { return Ok(None) };
+            let Some(input) = push_top_k(input, &order, limit, &residuals, distinct)? else { return Ok(None) };
             RelationNode::Project { input, expressions: expressions.clone() }
         }
         RelationNode::Rename { input, prefix, expressions } => {
             let (order, residuals) = through(expressions);
-            let Some(input) = push_top_k(input, &order, limit, &residuals)? else { return Ok(None) };
+            let Some(input) = push_top_k(input, &order, limit, &residuals, distinct)? else { return Ok(None) };
             RelationNode::Rename { input, prefix: prefix.clone(), expressions: expressions.clone() }
         }
         RelationNode::Extend { input, expressions } => {
             let (order, residuals) = through(expressions);
-            let Some(input) = push_top_k(input, &order, limit, &residuals)? else { return Ok(None) };
+            let Some(input) = push_top_k(input, &order, limit, &residuals, distinct)? else { return Ok(None) };
             return Ok(Some(Arc::new(input.extend(expressions.clone())?)));
         }
         RelationNode::Filter { input, predicate } if ordered_index_filter(predicate) => {
             let mut residuals = residuals.to_vec();
             residuals.push(predicate.clone());
-            let Some(input) = push_top_k(input, order, limit, &residuals)? else { return Ok(None) };
+            let Some(input) = push_top_k(input, order, limit, &residuals, distinct)? else { return Ok(None) };
             RelationNode::Filter { input, predicate: predicate.clone() }
+        }
+        RelationNode::Distinct { input } if !distinct => {
+            let ([field], [sort]) = (relation.schema().fields(), order) else { return Ok(None) };
+            if !matches!(&sort.expr, Expr::Column { id, .. } if *id == field.id) {
+                return Ok(None);
+            }
+            let Some(input) = push_top_k(input, order, limit, residuals, true)? else { return Ok(None) };
+            RelationNode::Distinct { input }
         }
         RelationNode::Scan(scan) => {
             let mut scan = scan.clone();
             let Some(first) = order.first() else { return Ok(None) };
             if residuals.iter().all(ordered_index_filter)
                 && order.iter().all(|key| matches!(&key.expr, Expr::Column { id, .. } if scan.columns.iter().any(|field| field.id == *id))) {
-                scan.ordered_top_k = Some(rtdb_plan::OrderedTopK { order: order.to_vec(), residuals: residuals.to_vec() });
+                scan.ordered_top_k = Some(rtdb_plan::OrderedTopK { order: order.to_vec(), residuals: residuals.to_vec(), distinct });
             } else {
-                if !residuals.is_empty() { return Ok(None); }
+                if distinct || !residuals.is_empty() { return Ok(None); }
                 let Expr::Call { name, args, .. } = &first.expr else { return Ok(None) };
                 let [Expr::Column { id, .. }, query] = args.as_slice() else { return Ok(None) };
                 if !first.descending || !name.eq_ignore_ascii_case("search_score")

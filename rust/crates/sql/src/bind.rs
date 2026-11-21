@@ -788,6 +788,7 @@ impl Context<'_> {
             )?;
             (input, projected, names)
         };
+        let mut distinct = select.distinct;
         if let Some(order_by) = order_by {
             let ast::OrderByKind::Expressions(expressions) = &order_by.kind else { return Err(grammar_rejected("ORDER BY ALL")); };
             let fields = projected.iter().map(|projection| projection.field.clone()).collect::<Vec<_>>();
@@ -813,10 +814,22 @@ impl Context<'_> {
                 let descending = sort_descending(&expression.options)?;
                 order.push(SortExpr { expr, descending, nulls_first: expression.options.nulls_first.unwrap_or(descending) });
             }
-            input = Arc::new(input.sort(order)?);
-            input = Arc::new(input.project(fields.into_iter().map(|field| NamedExpr { expr: field.expression(), field }).collect())?);
+            let order_uses_projection = order.iter().all(|sort| {
+                matches!(&sort.expr, Expr::Column { id, .. } if fields.iter().any(|field| field.id == *id))
+            });
+            let output = fields.into_iter().map(|field| NamedExpr { expr: field.expression(), field }).collect();
+            if distinct && order_uses_projection {
+                // Sorting observes only the retained output, so equal rows share a sort key.
+                input = Arc::new(input.project(output)?);
+                input = Arc::new(Relation::new(input.schema().clone(), RelationNode::Distinct { input })?);
+                input = Arc::new(input.sort(order)?);
+                distinct = false;
+            } else {
+                input = Arc::new(input.sort(order)?);
+                input = Arc::new(input.project(output)?);
+            }
         } else { input = Arc::new(input.project(projected)?); }
-        if select.distinct {
+        if distinct {
             input = Arc::new(Relation::new(input.schema().clone(), RelationNode::Distinct { input })?);
         }
         // The reference parses `GROUP BY ()` but its plan never conforms, so the rest of the query is bound first for its errors to take precedence.

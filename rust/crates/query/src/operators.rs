@@ -450,7 +450,7 @@ fn ordered_input(runtime: Arc<EmittedRelation>, execution: Execution, limit: usi
                 let Some(input) = ordered_input(Arc::clone(&child), execution.child(0), limit).await? else { return Ok(None); };
                 Box::new(PageExtend { input, schema: child.schema().clone(), expressions: expressions.clone(), execution: execution.clone() })
             }
-            RelationNode::Filter { .. } => {
+            RelationNode::Filter { .. } | RelationNode::Distinct { .. } => {
                 let Some(input) = ordered_input(runtime.child(0)?, execution.child(0), limit).await? else { return Ok(None); };
                 input
             }

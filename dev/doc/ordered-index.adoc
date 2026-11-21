@@ -13,6 +13,9 @@ Reuse both temporal points to continue the same read across SQL statements.
 The scan can reverse the index order and applies predicates before counting rows towards the limit.
 It fetches projected fields from a row's table at the same basis.
 
+`SELECT DISTINCT key ... ORDER BY key LIMIT n` can use an ordered index when the key is a stored text column and the preceding index columns are fixed by equality predicates.
+The ordered seek applies index-covered predicates before counting distinct keys.
+
 The index orders signed integers, Booleans, text, binary values, UUIDs and calendar dates.
 Ascending order places nulls last and reversing the order places them first.
 The normal SQL executor covers unsupported sort directions, types, temporal intervals and query shapes.
