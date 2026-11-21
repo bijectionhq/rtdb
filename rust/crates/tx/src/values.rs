@@ -185,6 +185,9 @@ impl ArrowDocuments {
         field.metadata().is_empty() && match field.data_type() {
             DataType::Struct(fields) => fields.iter().all(|field| Self::compatible(field)),
             DataType::List(field) => Self::compatible(field),
+            DataType::Union(fields, arrow_schema::UnionMode::Dense) => fields.iter().all(|(_, field)| {
+                Self::compatible(field) && from_field(field).is_ok_and(|ty| rtdb_columnar::execution_type(&ty) == ty)
+            }),
             DataType::Null | DataType::Boolean | DataType::Int8 | DataType::Int16 | DataType::Int32 | DataType::Int64 |
             DataType::UInt8 | DataType::UInt16 | DataType::UInt32 | DataType::UInt64 |
             DataType::Float32 | DataType::Float64 | DataType::Utf8 | DataType::Binary | DataType::FixedSizeBinary(_) |
