@@ -1,3 +1,5 @@
+#![recursion_limit = "256"]
+
 //! The RTDB multi cell processes.
 
 use std::collections::BTreeMap;
@@ -875,16 +877,14 @@ fn cell_secret(arguments: &Arguments) -> Result<Option<Arc<rtdb_multi::capabilit
     arguments.optional("cell-secret").map(|path| rtdb_multi::capability::CellSecret::from_file(std::path::Path::new(path)).map(Arc::new)).transpose()
 }
 
-fn key_service(specification: &str) -> futures::future::BoxFuture<'_, Result<Arc<dyn rtdb_multi::keys::KeyService>>> {
-    Box::pin(async move {
-        if let Some(table) = specification.strip_prefix("dynamodb:") {
-            return dynamo_keys(table).await;
-        }
-        if specification.starts_with("s3://") {
-            return s3_keys(specification).await;
-        }
-        Ok(Arc::new(rtdb_multi::keys::LocalKeyService::new(specification)?) as Arc<dyn rtdb_multi::keys::KeyService>)
-    })
+async fn key_service(specification: &str) -> Result<Arc<dyn rtdb_multi::keys::KeyService>> {
+    if let Some(table) = specification.strip_prefix("dynamodb:") {
+        return dynamo_keys(table).await;
+    }
+    if specification.starts_with("s3://") {
+        return s3_keys(specification).await;
+    }
+    Ok(Arc::new(rtdb_multi::keys::LocalKeyService::new(specification)?))
 }
 
 #[cfg(feature = "s3-key-vault")]
