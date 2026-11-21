@@ -1,0 +1,130 @@
+= Native RTDB verification
+
+The references are an ordered history of complete batches and a captured read admission.
+Each successful native read must agree with the history admitted by its basis.
+Each durable acknowledgement must refer to an applied batch recoverable under the declared log and object-store contracts.
+Maintenance steps must preserve that history's observable answers and the availability promised to live readers.
+
+See link:../dev/doc/rtdb-formal-verification-design.adoc[the full design] and link:../dev/doc/rtdb-verification.adoc[the individual studies].
+The first combined run is recorded in link:results/2026-11-21.adoc[the evidence ledger].
+
+== Independent derivations
+
+Three isolated GPT-6.2 Astra designers received the same requirements brief, with the production source and the other reports withheld.
+Each derived an ordered log of atomic batches, a private resolution prefix, a captured read horizon, and a representation boundary.
+All three chose a separate system coordinate for time travel and an admission horizon for the ERASE cutoff.
+
+[cols="1,2,2",options="header"]
+|===
+|Design |Choice that distinguishes it |Constraint or alternative it exposed
+
+|A
+|Publish a whole resolved batch with a version precondition.
+Reject new admissions to horizons before the latest erase, while an already admitted handle may finish.
+|A serial writer turn can replace validation of an optimistic resolver.
+Without either rule, two conditional withdrawals can both read the same balance and commit incompatible decisions.
+
+|B
+|Serialize resolution and durable extension.
+Expose fresh historical system reads under the current admission horizon.
+|A private batch list suffices for read-your-writes.
+A copied immutable answer can replace generation pins if copying and admission are atomic.
+
+|C
+|Append resolved facts, with a separate erase horizon and historical system basis for a fresh admission.
+|Persistent interval maps can replace a history fold as the physical representation.
+An old root alone cannot implement fresh retrospective erasure.
+|===
+
+The erase policy under study allows an existing pin to retain its admitted view.
+A fresh read within the current captured view uses that view's ERASE cutoff even if its requested system coordinate predates the erase.
+Reopening an old admission and requesting an old system coordinate must be distinguished in API contracts.
+The study does not decide which old handles may be reopened, how long their storage must survive, or what physical destruction of backups promises.
+
+== Mechanisms under comparison
+
+[cols="1,2,2",options="header"]
+|===
+|Mechanism |Minimal observation it explains |Weakened variant and witness
+|Ordered atomic publication
+|Commit order resolves conflicts and the full batch is the public step.
+|Publish only a debit or acknowledge a staged request, then crash.
+|Validated or serialized resolution
+|A resolved batch reads its own ordered prefix and an eligible committed basis.
+|Two staged increments read zero before either is published.
+|Bitemporal point resolution at an admitted horizon
+|Corrections can change valid-time history, and ERASE masks older versions in fresh admissions.
+|Treat ERASE as a delete whose scope starts at the query's system time, or merge across a write's origin.
+|Stable admission and representation lifetime
+|A reader holds either the bytes or the right to use a reachable generation.
+|Retire one member of a shared file and delete the object while a sibling or reader still holds it.
+|Durable root replacement
+|Publication switches the recoverable representation atomically and retains its log suffix.
+|Publish a root that has not reached durable storage.
+|Search refinement
+|Candidates can narrow work if the resolved result and top K remain the same.
+|Admit a rank witness that fails a second predicate, or prune an unseen score tied at the cutoff.
+|===
+
+The choices here concern semantic transitions.
+Replication providers, SQL, partition layouts, deletion protocols, index caches and query plans can spell or implement those transitions in different ways.
+Retry identity is conditional on the product contract.
+Protocol-level exactly-once effects require durable request identity and defined receipt retention.
+Reclamation liveness requires readers to release or expire and storage calls to complete.
+
+== Run the studies
+
+Use an owner-authorized local execution from the checkout root.
+The runner uses the supplied executables and JARs, writes each mutation into a disposable directory, and records per-case diagnostics and input hashes.
+It requires a fresh output directory.
+
+[source,sh]
+----
+BIJECTION_LOCAL_EXECUTION=owner-authorized VERUS_Z3_PATH=/path/to/z3 \
+  python3 verification/run.py \
+  --lean /path/to/lean --verus /path/to/verus \
+  --java /path/to/java --tlc /path/to/tla2tools.jar --alloy /path/to/alloy.jar \
+  --apalache /path/to/apalache-mc --maude /path/to/maude \
+  --rust-boundary --native-replay \
+  --evidence /path/to/new-evidence-directory
+----
+
+The local toolchain for this study is Lean 4.36.0, Verus 0.2026.11.20.9da409b with Rust 1.100.0 and Z3 4.16.0, and TLC 2026.11.19.180144 and Alloy 6.2.0 with Java 21.0.13.
+The independent comparison also uses Maude 3.5.1 and Apalache 0.63.0.
+The pinned Verus release replaces the earlier proposed source build of 31e44e6.
+The optional Rust boundary check compiles an unchanged copy and two mutated copies of the replica driver imported from the current Git commit.
+The optional native replay reads the same seeded 4,096-observation trace that the Lean evaluator checks, exercising both temporal resolvers and the unbounded visibility rectangles.
+It also compiles the unmodified and unpadded text scorer to replay the binary64 boundary witness.
+The same option runs the local checkpoint interruption and manifest-recovery tests and replays a root-first mutation of the checkpoint writer.
+It also exercises the Azure adapter against a loopback provider and separately mutates premature copy acknowledgement and cleanup on an unknown outcome.
+
+== Evidence boundaries
+
+* `lean/History.lean` proves laws over a mathematical history and audits the axioms used.
+  `lean/Trace.lean` and the Rust temporal tests read the same fixture in `traces/temporal.tsv`.
+  `lean/Minimality.lean` exhibits requirements that need a distinct admission horizon, a private resolution prefix, a whole batch boundary, or intra-batch order.
+  `lean/Ceiling.lean` proves that the system-time ceiling at a valid coordinate emits the reference answer exactly once, including after ordinary out-of-range events are dropped.
+* `tla/Kernel.tla` explores a bounded protocol with one durable log and two terms and requests, plus the pinned and copied read variants.
+  It assumes durable append is atomic and does not implement a consensus provider.
+* `tla/Resolution.tla` compares serialized, validated and blind optimistic resolution under the same increment program.
+  Apalache checks the same TLA+ transitions symbolically and `maude/Resolution.maude` gives an independent rewrite model.
+* `tla/CacheGeneration.tla` models the cache pathname ownership race independently from the shared artefact reference counts.
+* `tla/ReadBack.tla` separates append, record delivery, apply, and acknowledgement across a crash and restart.
+* `tla/Checkpoint.tla` separates durable object publication, lost replies, listing, and log replay across a restart.
+  It checks one root and three dependencies with finite failures, including early publication, loss of an acknowledged dependency, and log trimming followed by a listing omission.
+  It compares an acknowledged pending copy with a copy whose completion is checked.
+* `tla/LeaseAdmission.tla` compares validated expiring leases and coordinated pins against age-only collection and stale-follower admission.
+* `alloy/Reclamation.als` independently checks the structural last-reference rule over a finite scope, including one deliberately faulty collector.
+* `smt/rank-bound.smt2` checks the exact-real inequalities behind the binary64 score bound under the normal-rounding model and its two negative controls.
+  `smt/rank-witness.smt2` checks the concrete counterexample with exact binary64 operations.
+  The Lean frontier proof assumes coverage by pending scores or unread windows.
+* `verus/` checks the exact Rust functions called by the search builder, temporal resolvers, half-open interval operations and replica fence.
+  The ceiling area checks the in-place vector transitions and window clipping while the interval area checks per-fragment admission.
+  The temporal event and allocation shell, storage adapters and full search equivalence need separate refinement and replay evidence.
+
+The run ledger identifies tool identities, positive cases, bounded negative traces and unresolved obligations.
+
+The Azure diagnostic in `traces/azure_copy_completion_diagnostic.rs` reproduces the early acknowledgement on unmodified production sources through `6f0094f47`.
+Copy it into `rust/crates/azure/tests/` in an isolated checkout of that revision, then run `BIJECTION_LOCAL_EXECUTION=owner-authorized cargo test --locked -p rtdb-azure --test azure_copy_completion_diagnostic` in its `rust/` directory.
+The fixture speaks Azure's HTTP protocol on loopback and exercises the real Azure and remote-storage adapters.
+A passing diagnostic observes the defect described in the ledger.

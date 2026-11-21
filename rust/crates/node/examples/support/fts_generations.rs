@@ -211,8 +211,9 @@ impl<'a> Search<'a> {
             system_time: Interval::at(self.basis).unwrap(),
         };
         let mut work = Work::default();
+        let scorer = Arc::new(rtdb_text::Scorer::new(scoring.clone(), Some(self.corpus))).for_ranking().unwrap();
         let mut files: Vec<_> = self.files.iter()
-            .map(|file| file.ranked("body", matching, scoring, Some(self.corpus), bounds).unwrap()).collect();
+            .map(|file| file.ranked("body", matching, &scorer, bounds).unwrap()).collect();
         let mut top: Vec<(f64, i64, &Row)> = Vec::new();
         while let Some((index, bound)) = files.iter().enumerate().filter_map(|(index, file)| {
             file.bound().map(|bound| (index, bound))

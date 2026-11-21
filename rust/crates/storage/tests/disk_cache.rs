@@ -375,6 +375,26 @@ async fn an_invalidated_file_outlives_its_leases_and_nothing_else() {
 }
 
 #[tokio::test]
+async fn an_invalidated_loader_cannot_unlink_the_replacement_file() {
+    let directory = tempfile::tempdir().unwrap();
+    let cache = DiskCache::open(directory.path(), 100, MemoryBudget::new(4 * 1024 * 1024)).unwrap();
+    let store = ObservedStore::new(true);
+    let key = ObjectKey::new("db/0/table/file").unwrap();
+    store.put(&key, Bytes::from_static(b"data")).await.unwrap();
+    let mut old = Box::pin(cache.get(&key, &store, &key));
+    assert_pending(old.as_mut()).await;
+    cache.invalidate(&key).unwrap();
+    let fresh = cache.get(&key, &store, &key).await.unwrap();
+    store.release.add_permits(1);
+    let retired = old.await.unwrap();
+    let retired_path = retired.path();
+    assert_ne!(retired_path, fresh.path());
+    drop(retired);
+    assert!(!retired_path.exists());
+    assert_eq!(std::fs::read(fresh.path()).unwrap(), b"data");
+}
+
+#[tokio::test]
 async fn invalidating_a_buffer_pool_entry_keeps_open_leases_and_misses_afterwards() {
     let remote = Arc::new(MemoryStore::default());
     let pool = BufferPool::new(remote.clone(), 1 << 20);

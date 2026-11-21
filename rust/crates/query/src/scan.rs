@@ -184,10 +184,10 @@ impl ScanCursor {
     pub async fn new(scan: Scan, execution: Execution, pushdowns: Option<Arc<crate::pushdown::Pushdowns>>) -> Result<Self> {
         let context = Arc::clone(&execution.context);
         let database = context.catalog.database(&scan.table.name.database)?;
-        Self::over(scan, execution, pushdowns, &database.partitions, &database.storage).await
+        Self::over(scan, execution, pushdowns, &database.partitions, &database.storage, true).await
     }
     /// A scan of the given partitions of its database, which share `storage`.
-    async fn over(mut scan: Scan, execution: Execution, pushdowns: Option<Arc<crate::pushdown::Pushdowns>>, database_partitions: &[Snapshot], storage: &Arc<BufferPool>) -> Result<Self> {
+    async fn over(mut scan: Scan, execution: Execution, pushdowns: Option<Arc<crate::pushdown::Pushdowns>>, database_partitions: &[Snapshot], storage: &Arc<BufferPool>, accelerate: bool) -> Result<Self> {
         let fixed_iids = scan.iids.is_some();
         if !fixed_iids { scan.iids = id_selection(&scan, execution.parameters.values()); }
         let bytes = scan.table.name.database.len().checked_add(scan.table.name.table.schema.len()).and_then(|bytes| bytes.checked_add(scan.table.name.table.table.len())).and_then(|bytes| bytes.checked_add(4096)).ok_or_else(|| invalid("scan-size", "Scan labels exceed allocation range"))?;
@@ -210,8 +210,8 @@ impl ScanCursor {
         for snapshot in database_partitions {
             let bounds = bounds(&scan, snapshot, &execution).await?;
             let mut narrowed = scan.clone();
-            let verifier = ScanVerifier { scan: &scan, execution: &execution, pushdowns: pushdowns.clone(), partition: snapshot, storage };
-            for accelerator in execution.context.accelerators.iter().filter(|_| !fixed_iids) {
+            let verifier = ScanVerifier { scan: &scan, execution: &execution, pushdowns: pushdowns.clone(), partition: snapshot, storage, canonical_entity_iids };
+            for accelerator in execution.context.accelerators.iter().filter(|_| accelerate && !fixed_iids) {
                 let request = crate::ScanRequest { database: &name, scan: &narrowed, snapshot, storage, bounds, memory: &execution.context.memory,
                     current_time: execution.context.current_time, cancellation: &execution.context.cancellation, constants: &crate::accelerate::ExecutionConstants(&execution),
                     corpora: execution.context.corpora.as_ref(), verifier: &verifier, partitions: database_partitions };
@@ -229,7 +229,7 @@ impl ScanCursor {
                     let request = crate::ScanRequest { database: &name, scan: &narrowed, snapshot, storage, bounds, memory: &execution.context.memory,
                         current_time: execution.context.current_time, cancellation: &execution.context.cancellation, constants: &crate::accelerate::ExecutionConstants(&execution),
                         corpora: execution.context.corpora.as_ref(), verifier: &verifier, partitions: database_partitions };
-                    for accelerator in execution.context.accelerators.iter() {
+                    for accelerator in execution.context.accelerators.iter().filter(|_| accelerate) {
                         if let Some(found) = accelerator.match_answers(&request, &evaluated.column, query).await? { answers = Some(found); break; }
                     }
                 }
@@ -255,11 +255,14 @@ impl ScanCursor {
 }
 
 /// Runs the scan itself over one partition, restricted to a batch of IIDs, its predicates applied as the scan's filter applies them; narrowing is skipped because the IIDs are fixed.
-struct ScanVerifier<'a> { scan: &'a Scan, execution: &'a Execution, pushdowns: Option<Arc<crate::pushdown::Pushdowns>>, partition: &'a Snapshot, storage: &'a Arc<BufferPool> }
+struct ScanVerifier<'a> { scan: &'a Scan, execution: &'a Execution, pushdowns: Option<Arc<crate::pushdown::Pushdowns>>, partition: &'a Snapshot, storage: &'a Arc<BufferPool>, canonical_entity_iids: bool }
 
 #[async_trait]
 impl crate::CandidateVerifier for ScanVerifier<'_> {
-    async fn visible(&self, iids: std::collections::BTreeSet<Iid>, column: rtdb_plan::ColumnId) -> Result<Vec<(Iid, Value)>> {
+    async fn visible(&self, mut iids: std::collections::BTreeSet<Iid>, column: rtdb_plan::ColumnId) -> Result<Vec<(Iid, Value)>> {
+        if let Some(pushdowns) = &self.pushdowns {
+            iids.retain(|iid| pushdowns.iid_matches(&self.scan.columns, *iid, self.canonical_entity_iids));
+        }
         if iids.is_empty() { return Ok(Vec::new()); }
         let mut scan = self.scan.clone();
         scan.top_k = None;
@@ -272,7 +275,7 @@ impl crate::CandidateVerifier for ScanVerifier<'_> {
         let (iid_at, column_at) = (position(&|field| field.name == "_iid")?, position(&|field| field.id == column)?);
         let schema = Schema::new(scan.columns.clone())?;
         let predicate = scan.predicates.iter().cloned().reduce(|left, right| Expr::binary(rtdb_plan::BinaryOp::And, left, right));
-        let mut cursor = ScanCursor::over(scan, self.execution.clone(), self.pushdowns.clone(), std::slice::from_ref(self.partition), self.storage).await?;
+        let mut cursor = ScanCursor::over(scan, self.execution.clone(), self.pushdowns.clone(), std::slice::from_ref(self.partition), self.storage, false).await?;
         let metadata = self.execution.scope()?;
         let invocation = predicate.as_ref().map(|predicate| self.execution.prepare_expression(predicate, &schema, &metadata)).transpose()?;
         let mut visible = Vec::new();
@@ -287,6 +290,68 @@ impl crate::CandidateVerifier for ScanVerifier<'_> {
             }
         }
         Ok(visible)
+    }
+
+    async fn snapshot_corpus(
+        &self, column: &str, at: Timestamp, partitions: &[Snapshot],
+    ) -> Result<Arc<dyn crate::CorpusSource>> {
+        let point = TemporalFilter::At(Expr::Literal(Value::Timestamp {
+            value: at.0, unit: rtdb_types::TimeUnit::Microsecond, timezone: Some("UTC".into()),
+        }));
+        let scan = Scan {
+            table: self.scan.table.clone(),
+            columns: vec![rtdb_plan::Field {
+                id: rtdb_plan::ColumnId(0), name: column.into(), qualifier: None,
+                qualified_only: false, unnamed: false,
+                data_type: self.scan.table.columns.get(column).cloned().unwrap_or(rtdb_types::LogicalType::Null),
+            }],
+            valid_time: point.clone(), system_time: point, clamp_valid_time: false,
+            iids: None, predicates: Vec::new(), top_k: None, matches: Vec::new(),
+        };
+        let memory = &self.execution.context.memory;
+        let mut cursor = ScanCursor::over(scan, self.execution.clone(), None, partitions, self.storage, false).await?;
+        let mut corpus = rtdb_text::Corpus::default();
+        let mut retained = Vec::new();
+        while let Some(mut page) = cursor.next_page().await? {
+            while let Some(row) = page.next() {
+                let value = &row.values[0];
+                if matches!(value, Value::Null | Value::Undefined) { continue; }
+                corpus.documents += 1;
+                if let Value::Utf8(text) = value {
+                    let bytes = text.len().checked_mul(128).and_then(|bytes| bytes.checked_add(256))
+                        .ok_or_else(|| invalid("corpus-size", "Corpus tokenization exceeds addressable memory"))?;
+                    let _tokens = memory.reserve(bytes)?;
+                    let mut tokens = rtdb_text::tokens(text);
+                    corpus.tokens += u64::from(rtdb_text::stored_length(tokens.len()));
+                    tokens.sort_unstable();
+                    tokens.dedup();
+                    for term in tokens {
+                        if let Some(frequency) = corpus.frequencies.get_mut(&term) {
+                            *frequency += 1;
+                        } else {
+                            retained.push(memory.reserve(term.capacity().checked_add(128)
+                                .ok_or_else(|| invalid("corpus-size", "Corpus term exceeds addressable memory"))?)?);
+                            corpus.frequencies.insert(term, 1);
+                        }
+                    }
+                }
+            }
+        }
+        Ok(Arc::new(ScannedCorpus { corpus, _retained: retained }))
+    }
+}
+
+struct ScannedCorpus { corpus: rtdb_text::Corpus, _retained: Vec<Arc<MemoryReservation>> }
+
+impl crate::CorpusSource for ScannedCorpus {
+    fn corpus(&self, query: &rtdb_text::Query) -> Result<rtdb_text::Corpus> {
+        Ok(rtdb_text::Corpus {
+            documents: self.corpus.documents,
+            tokens: self.corpus.tokens,
+            frequencies: query.terms().iter().map(|term| {
+                (term.clone(), self.corpus.frequencies.get(term).copied().unwrap_or_default())
+            }).collect(),
+        })
     }
 }
 

@@ -208,8 +208,9 @@ rule RepairUnreadableSearchFile {
 -- Past max_candidates candidates, the scan runs unnarrowed instead.
 -- Past max_unindexed_bytes of tries the lane should have indexed but has not, the node builds none of them: the scan is neither narrowed nor ranked, and only rows of tries with a recorded file take MATCH from it.
 --
--- A score's corpus is CorpusAsOfTheSnapshot's, registered with the query once per table and column a MATCH narrows, from every partition the query reads.
--- A query text's corpus is fixed at its first use, so every score in one query is relative to the same corpus.
+-- A query that evaluates SEARCH_SCORE registers CorpusAsOfTheSnapshot once per table and column a MATCH narrows, from every partition the query reads.
+-- When optional search construction cannot fit the query budget or the source page order is unsupported by the search format, the scan evaluates those rows from their data files.
+-- A query text's score parameters are fixed at its first use, so pruning and every score in one query use the same binary64 weights and average length.
 --
 -- A score from the index equals SEARCH_SCORE on the resolved row: both take each term's frequency and the document's length rounded to the index's stored lengths.
 --
@@ -220,7 +221,8 @@ rule RepairUnreadableSearchFile {
 --   1. Every matching event that may be visible bounds its IID above by its score, an IID's best event bounding it.
 --      Events in live segments are scored from their rows.
 --      A search file's documents are scored a batch of windows at a time, best window bound first, and a window is scored only once its bound may exceed every event already scored.
---   2. IIDs are taken best bound first, in batches.
+--      A window adds the upper bounds for each term in scoring order. Each term uses the window's maximum frequency and minimum stored length with binary64 roundoff covered before addition.
+--   2. IIDs in the scan's selected IID scope are taken best bound first, in batches.
 --      A document left exactly visible by CutByLaterEvents counts as verified when the scan's only predicate is the MATCH used to narrow candidates.
 --      The rest, live rows, documents a tie left inexact, and every IID where the scan has other predicates, are verified by running the scan itself over the partition restricted to them, with its own predicates.
 --   3. Verification stops once n verified rows score strictly above every bound not yet taken, every unscored window's included.
@@ -228,14 +230,15 @@ rule RepairUnreadableSearchFile {
 --
 -- The visible row of an IID is one of its matching events, so its bound is never below its score, and no IID left out can hold one of the first n rows.
 -- An IID's history lies in one partition, so the first n rows overall are among the first n of some partition, and the sort above picks them from the union.
--- The scan is left to the unranked narrowing when the matching IIDs exceed max_candidates, or when verification runs past sixteen batches.
+-- The scan is left to the unranked narrowing when the weights fall outside the window bound's domain, the matching IIDs exceed max_candidates, or verification runs past sixteen batches.
 -- SEARCH_SCORE sums documents, tokens and each of its terms' document frequencies over every corpus the query registered; with none, each term's inverse document frequency is 1.
 
 rule CorpusAsOfTheSnapshot {
     -- A column's corpus at a snapshot is its values in the rows a scan of the table sees at the snapshot's own instant, its latest transaction's system time, taken as valid time and system time both, across every partition and the live index.
     -- A row whose column is null or absent is not in it; a value that is not text is, with no tokens.
     -- Documents counts those rows, tokens sums their stored lengths, and a term's frequency counts the rows holding it.
-    -- It is a function of the snapshot's data, not of which search files exist: a node builds the search file of every trie visible at the instant, whatever max_unindexed_bytes allows narrowing.
+    -- The corpus is a function of the snapshot's data.
+    -- A node can build search files for any trie visible at the snapshot instant, or count the same corpus by scanning the resolved values when a build is refused.
     -- Each file's runs that its own events leave visible at every instant from its latest event on are counted once per file and kept; those visible over a bounded valid interval are checked at the instant.
     -- An entity with events in more than one file, or in the live index, is resolved across all of them as the scan resolves, live rows first at one instant, and its one visible row replaces what its runs counted file by file.
     -- Within one live segment, a later appended event takes precedence over earlier rows at the same system time.

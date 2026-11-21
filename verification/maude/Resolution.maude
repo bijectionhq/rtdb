@@ -1,0 +1,45 @@
+mod RESOLUTION is
+  protecting NAT .
+
+  sorts Mode Pending State .
+  ops serialized validated blind : -> Mode [ctor] .
+  op idle : -> Pending [ctor] .
+  op staged : Nat Nat -> Pending [ctor] .
+  op state : Mode Nat Nat Pending Pending -> State [ctor] .
+
+  vars MODE : Mode .
+  vars REV VALUE BASE RESULT : Nat .
+  vars LEFT RIGHT : Pending .
+
+  crl [resolve-left] :
+    state(MODE, REV, VALUE, idle, RIGHT) =>
+    state(MODE, REV, VALUE, staged(REV, VALUE + 1), RIGHT)
+    if MODE =/= serialized or RIGHT == idle .
+  crl [resolve-right] :
+    state(MODE, REV, VALUE, LEFT, idle) =>
+    state(MODE, REV, VALUE, LEFT, staged(REV, VALUE + 1))
+    if MODE =/= serialized or LEFT == idle .
+  crl [commit-left] :
+    state(MODE, REV, VALUE, staged(BASE, RESULT), RIGHT) =>
+    state(MODE, REV + 1, RESULT, idle, RIGHT)
+    if REV < 2 and (MODE == blind or BASE == REV) .
+  crl [commit-right] :
+    state(MODE, REV, VALUE, LEFT, staged(BASE, RESULT)) =>
+    state(MODE, REV + 1, RESULT, LEFT, idle)
+    if REV < 2 and (MODE == blind or BASE == REV) .
+  crl [retry-left] :
+    state(MODE, REV, VALUE, staged(BASE, RESULT), RIGHT) =>
+    state(MODE, REV, VALUE, idle, RIGHT)
+    if BASE < REV .
+  crl [retry-right] :
+    state(MODE, REV, VALUE, LEFT, staged(BASE, RESULT)) =>
+    state(MODE, REV, VALUE, LEFT, idle)
+    if BASE < REV .
+endm
+
+search [1] state(serialized, 0, 0, idle, idle) =>*
+  state(serialized, REV, VALUE, LEFT, RIGHT) such that REV =/= VALUE .
+search [1] state(validated, 0, 0, idle, idle) =>*
+  state(validated, REV, VALUE, LEFT, RIGHT) such that REV =/= VALUE .
+search [1] state(blind, 0, 0, idle, idle) =>*
+  state(blind, REV, VALUE, LEFT, RIGHT) such that REV =/= VALUE .

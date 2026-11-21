@@ -8,7 +8,7 @@ use rtdb_plan::{BinaryOp, Expr};
 use rtdb_query::{MatchAnswers, ScanAccelerator, ScanRequest};
 use rtdb_storage::ObjectKey;
 use rtdb_text::Query;
-use rtdb_types::{Iid, Interval, Result, TemporalBounds, Timestamp, Value};
+use rtdb_types::{Anomaly, Iid, Interval, Result, TemporalBounds, Timestamp, Value};
 
 use crate::{KIND, SearchDefinition, SearchFile, runtime::{Suspect, TrieFile}};
 
@@ -49,6 +49,11 @@ fn may_be_visible(valid_from: i64, valid_to: i64, system_from: i64, recency: i64
     valid_from < valid.upper().0 && valid_to > valid.lower().0 && system_from < system.upper().0 && valid.lower().0.min(system.lower().0) < recency
 }
 
+fn optional_build_refused(error: &Anomaly) -> bool {
+    matches!(error.code.as_str(),
+        "rtdb/memory-budget-exceeded" | "rtdb.storage/memory-limit" | "rtdb.search/input-order")
+}
+
 #[async_trait]
 impl ScanAccelerator for SearchAccelerator {
     async fn candidate_iids(&self, request: &ScanRequest<'_>) -> Result<Option<BTreeSet<Iid>>> {
@@ -62,7 +67,9 @@ impl ScanAccelerator for SearchAccelerator {
         }
         let Some((column, query, definition)) = chosen else { return Ok(None) };
         if query.terms().is_empty() { return Ok(Some(BTreeSet::new())); }
-        self.register_corpora(request, column, &definition).await?;
+        if request.corpora.scores_requested() {
+            self.register_corpora(request, column, &definition).await?;
+        }
         if let Some(top_k) = &scan.top_k {
             let ranked = scan.columns.iter().find(|field| field.id == top_k.column).is_some_and(|field| field.name == column);
             if ranked { if let Some(candidates) = self.top_k(request, top_k, column, &query, &definition).await? { return Ok(Some(candidates)); } }
@@ -76,7 +83,7 @@ impl ScanAccelerator for SearchAccelerator {
 
     async fn match_answers(&self, request: &ScanRequest<'_>, column: &str, query: &str) -> Result<Option<MatchAnswers>> {
         let Some(definition) = self.definition(request, column).await? else { return Ok(None) };
-        let files = match self.trie_files(request, &definition).await? { TrieFiles::Complete(found) | TrieFiles::Recorded(found) => found.files };
+        let files = match self.trie_files(request, &definition).await? { TrieFiles::Complete(found) | TrieFiles::Partial(found) => found.files };
         let query = Query::parse(query);
         let mut answers = MatchAnswers::default();
         let mut sets = BTreeMap::new();
@@ -93,8 +100,8 @@ impl ScanAccelerator for SearchAccelerator {
     }
 }
 
-/// A partition's search files: one for every live trie, or only the recorded ones where building the rest would exceed max_unindexed_bytes.
-enum TrieFiles { Complete(Found), Recorded(Found) }
+/// A partition's search files with complete or partial coverage of the live tries which can hold visible rows.
+enum TrieFiles { Complete(Found), Partial(Found) }
 
 /// A partition's search files, and the recorded tries left unopened because no lifespan section of theirs meets the bounds.
 struct Found { files: Vec<TrieFile>, skipped: Vec<rtdb_format::keys::TrieKey> }
@@ -138,16 +145,11 @@ fn cut(rectangles: &mut Vec<[i64; 4]>, events: Vec<crate::file::KeyedEvent>) -> 
     for event in events {
         let mut kept = Vec::with_capacity(rectangles.len());
         for rectangle in rectangles.drain(..) {
-            let [valid_from, valid_to, system_from, system_to] = rectangle;
-            tied |= event.system_from == system_from;
-            if event.system_from <= system_from { kept.push(rectangle); continue; }
-            if event.op == rtdb_types::EventOp::Erase { continue; }
-            if event.system_from >= system_to { kept.push(rectangle); continue; }
-            let (cut_from, cut_to) = (event.valid_from.max(valid_from), event.valid_to.min(valid_to));
-            if cut_from >= cut_to { kept.push(rectangle); continue; }
-            if valid_from < cut_from { kept.push([valid_from, cut_from, system_from, system_to]); }
-            if cut_to < valid_to { kept.push([cut_to, valid_to, system_from, system_to]); }
-            kept.push([cut_from, cut_to, system_from, event.system_from]);
+            tied |= event.system_from == rectangle[2];
+            kept.extend(crate::rectangle::cut_rectangle(
+                rectangle, event.valid_from, event.valid_to, event.system_from,
+                event.op == rtdb_types::EventOp::Erase,
+            ).into_iter().flatten());
         }
         *rectangles = kept;
     }
@@ -225,8 +227,16 @@ impl SearchAccelerator {
             if !by_policy { unindexed = unindexed.saturating_add(trie.data_file_size); }
             unbuilt.push((trie.key.clone(), data));
         }
-        if limit.is_some_and(|limit| unindexed > limit) { return Ok(TrieFiles::Recorded(Found { files, skipped })); }
-        for (trie, data) in unbuilt { files.push(self.runtime.built(request.database, request.storage, &trie, &data, &definition.columns, request.memory, request.cancellation).await?); }
+        if limit.is_some_and(|limit| unindexed > limit) { return Ok(TrieFiles::Partial(Found { files, skipped })); }
+        for (trie, data) in unbuilt {
+            match self.runtime.built(request.database, request.storage, &trie, &data, &definition.columns, request.memory, request.cancellation).await {
+                Ok(file) => files.push(file),
+                Err(error) if limit.is_some() && optional_build_refused(&error) => {
+                    return Ok(TrieFiles::Partial(Found { files, skipped }));
+                }
+                Err(error) => return Err(error),
+            }
+        }
         Ok(TrieFiles::Complete(Found { files, skipped }))
     }
 
@@ -243,7 +253,16 @@ impl SearchAccelerator {
         let mut segments = Vec::new();
         for snapshot in request.partitions {
             // A corpus resolves entities across every source, so no trie is left out by its sections.
-            match self.trie_files_in(request, snapshot, definition, point, None, false).await? { TrieFiles::Complete(found) | TrieFiles::Recorded(found) => files.extend(found.files) }
+            match self.trie_files_in(request, snapshot, definition, point, None, false).await {
+                Ok(TrieFiles::Complete(found) | TrieFiles::Partial(found)) => files.extend(found.files),
+                Err(error) if optional_build_refused(&error) => {
+                    drop(files);
+                    let source = request.verifier.snapshot_corpus(column, Timestamp(at), request.partitions).await?;
+                    request.corpora.register(name, source);
+                    return Ok(());
+                }
+                Err(error) => return Err(error),
+            }
             segments.extend(snapshot.iter_segments(table).cloned());
         }
         request.corpora.register(name, Arc::new(TableCorpus { runtime: Arc::clone(&self.runtime), database: request.database.to_string(), files: parking_lot::Mutex::new(files), computed: std::sync::OnceLock::new(), segments, column: column.to_string(), at }));
@@ -356,10 +375,10 @@ impl SearchAccelerator {
         let Ok(limit) = usize::try_from(limit) else { return Ok(None) };
         if limit == 0 { return Ok(Some(BTreeSet::new())); }
         let TrieFiles::Complete(Found { files, skipped }) = self.trie_files(request, definition).await? else { return Ok(None) };
-        let scoring = Query::parse(&text);
-        let corpus = rtdb_expr::CorpusLookup::corpus(request.corpora, &text);
+        let scoring = rtdb_expr::CorpusLookup::scorer(request.corpora, &text);
+        let Some(rank_scorer) = scoring.for_ranking() else { return Ok(None); };
         let ranked = by_file(&files).map(|selected| {
-            Ok((selected.members, selected.file.ranked(column, matching, &scoring, corpus.as_ref(), request.bounds)?))
+            Ok((selected.members, selected.file.ranked(column, matching, &rank_scorer, request.bounds)?))
         }).collect::<Result<Vec<_>>>()?;
         let mut candidates = Candidates { files: ranked, cutter: Cutter::new(&files, &skipped, request, &self.runtime), pending: std::collections::BinaryHeap::new(), seen: BTreeSet::new(), scored: 0 };
         let trusted = match request.scan.predicates.as_slice() {
@@ -374,7 +393,7 @@ impl SearchAccelerator {
                 let StoredOperation::Put(document) = &event.operation else { continue };
                 let Some(Value::Utf8(value)) = document.get(column) else { continue };
                 let tokens = rtdb_text::tokens(value);
-                if matching.matches(&tokens) { candidates.push(event.iid, rtdb_text::bm25(&scoring, &tokens, corpus.as_ref()), false); }
+                if matching.matches(&tokens) { candidates.push(event.iid, scoring.bm25(&tokens), false); }
             }
         }
         let mut verified: Vec<(f64, Iid)> = Vec::new();
@@ -390,6 +409,7 @@ impl SearchAccelerator {
             while handed < batch {
                 let Some((score, iid, exact)) = candidates.next()? else { break };
                 handed += 1;
+                if request.scan.iids.as_ref().is_some_and(|scope| !scope.contains(&iid)) { continue; }
                 // An exactly visible event's row is in the scan's output with its score, so it needs no verifying.
                 if exact && trusted { verified.push((score, iid)); } else { iids.insert(iid); }
             }
@@ -400,7 +420,7 @@ impl SearchAccelerator {
             if rounds > 16 { return Ok(None); }
             for (iid, value) in request.verifier.visible(iids, top_k.column).await? {
                 let Value::Utf8(value) = value else { continue };
-                verified.push((rtdb_text::bm25(&scoring, &rtdb_text::tokens(&value), corpus.as_ref()), iid));
+                verified.push((scoring.bm25(&rtdb_text::tokens(&value)), iid));
             }
         }
         verified.sort_by(descending);
@@ -457,7 +477,8 @@ mod tests {
         assert_eq!(iids, BTreeSet::from([Iid([64; 16])]));
         assert_eq!(by_file(&[trie(0), trie(1)]).count(), 1);
 
-        let ranked = file.ranked("body", &query, &query, None, bounds).unwrap();
+        let rank_scorer = Arc::new(rtdb_text::Scorer::new(query.clone(), None)).for_ranking().unwrap();
+        let ranked = file.ranked("body", &query, &rank_scorer, bounds).unwrap();
         let mut candidates = Candidates {
             files: vec![(BTreeMap::from([(1, 0)]), ranked)], cutter,
             pending: Default::default(), seen: BTreeSet::new(), scored: 0,

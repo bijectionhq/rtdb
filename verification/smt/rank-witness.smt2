@@ -1,0 +1,21 @@
+; The exact binary64 witness also exercised by the Rust mutation test.
+(set-logic QF_FP)
+(define-fun f1 () (_ FloatingPoint 11 53) ((_ to_fp 11 53) #x41b7fffe53000000))
+(define-fun f2 () (_ FloatingPoint 11 53) ((_ to_fp 11 53) #x41b7fffe54000000))
+(define-fun penalty () (_ FloatingPoint 11 53) ((_ to_fp 11 53) #x3fe23fb1bcad84d5))
+(define-fun scale () (_ FloatingPoint 11 53) ((_ to_fp 11 53) #x400199999999999a))
+(define-fun padding () (_ FloatingPoint 11 53) ((_ to_fp 11 53) #x3ff0000000000010))
+(define-fun score ((f (_ FloatingPoint 11 53))) (_ FloatingPoint 11 53)
+  (fp.div RNE (fp.mul RNE f scale) (fp.add RNE f penalty)))
+
+(echo "exact-unpadded-reversal")
+(push)
+(assert (not (fp.gt (score f1) (score f2))))
+(check-sat)
+(pop)
+
+(echo "exact-padded-bound")
+(push)
+(assert (not (fp.leq (score f1) (fp.mul RNE (score f2) padding))))
+(check-sat)
+(pop)

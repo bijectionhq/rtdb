@@ -1,5 +1,6 @@
-use rtdb_temporal::{Rectangle, resolve_ordered, visibility};
-use rtdb_types::{EventHeader, EventOp, Iid, Interval, TemporalBounds, Timestamp};
+use rtdb_temporal::{HistoryResolver, Rectangle, resolve_ordered, visibility};
+use rtdb_types::{EventHeader, EventOp, Iid, Interval, MemoryBudget, TemporalBounds, Timestamp};
+use std::sync::Arc;
 
 struct Seeded(u64);
 impl Seeded {
@@ -29,6 +30,68 @@ fn bounds(random: &mut Seeded) -> TemporalBounds {
         Interval::from_micros(lower, upper).unwrap()
     };
     TemporalBounds { valid_time: dimension(60), system_time: dimension(110) }
+}
+
+#[test]
+fn the_production_resolver_agrees_with_the_reference_trace() {
+    let number = |text: &str| text.parse::<i64>().unwrap();
+    let iid = |text: &str| Iid([u8::try_from(number(text)).unwrap(); 16]);
+    let span = |from, to| Interval::from_micros(number(from), number(to)).unwrap();
+    let mut events: Vec<(EventHeader, Option<i64>)> = Vec::new();
+    let mut name = "";
+    let mut observations = 0;
+    let memory = MemoryBudget::new(1 << 20);
+    let input = std::env::var_os("RTDB_TEMPORAL_TRACE")
+        .map(|path| std::fs::read_to_string(path).unwrap())
+        .unwrap_or_else(|| include_str!("../../../../verification/traces/temporal.tsv").to_string());
+    for line in input.lines() {
+        let fields: Vec<_> = line.split('\t').collect();
+        let event = |system, key, valid_time, op| EventHeader {
+            system_from: Timestamp(number(system)), iid: iid(key), valid_time, op,
+        };
+        match fields.as_slice() {
+            ["case", label] => { events.clear(); name = label; }
+            ["put", system, key, lower, upper, value] => {
+                events.push((event(system, key, span(lower, upper), EventOp::Put), Some(number(value))));
+            }
+            ["delete", system, key, lower, upper] => {
+                events.push((event(system, key, span(lower, upper), EventOp::Delete), None));
+            }
+            ["erase", system, key] => {
+                events.push((event(system, key, Interval::ALL, EventOp::Erase), None));
+            }
+            ["expect", horizon, system, key, valid, expected] => {
+                let (horizon, system, valid) = (number(horizon), number(system), number(valid));
+                let bounds = TemporalBounds {
+                    valid_time: Interval::from_micros(valid, valid + 1).unwrap(),
+                    system_time: Interval::from_micros(system, system + 1).unwrap(),
+                };
+                let mut input: Vec<_> = events.iter().rev()
+                    .filter(|(event, _)| event.system_from.0 <= horizon && event.iid == iid(key))
+                    .collect();
+                input.sort_by_key(|(event, _)| std::cmp::Reverse(event.system_from));
+                let sources = || input.iter().map(|(event, value)| (event, *value));
+                let expected: Vec<_> = (*expected != "none").then(|| number(expected)).into_iter().collect();
+                let actual: Vec<_> = resolve_ordered(sources(), bounds, false).unwrap().into_iter()
+                    .map(|row| row.source.expect("the resolver emitted a put")).collect();
+                assert_eq!(actual, expected, "ordinary ceiling, {name}: {line}");
+                let mut admitted = HistoryResolver::new_in(bounds, false, Arc::clone(&memory));
+                let mut actual = Vec::new();
+                for (event, value) in sources() {
+                    let rows = admitted.resolve_in(event, value, &memory).unwrap();
+                    actual.extend(rows.as_slice().iter().map(|row| row.source.expect("the resolver emitted a put")));
+                }
+                assert_eq!(actual, expected, "admitted ceiling, {name}: {line}");
+                let actual: Vec<_> = visibility(sources()).unwrap().into_iter()
+                    .filter(|(_, rectangle)| rectangle.meets(bounds))
+                    .map(|(value, _)| value.expect("the resolver emitted a put")).collect();
+                assert_eq!(actual, expected, "unbounded rectangles, {name}: {line}");
+                observations += 1;
+            }
+            _ => panic!("{name}: malformed trace row {line}"),
+        }
+    }
+    assert!(observations > 0);
 }
 
 #[test]

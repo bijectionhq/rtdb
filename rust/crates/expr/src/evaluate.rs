@@ -46,7 +46,7 @@ pub struct EvalContext<'a> {
 }
 
 pub trait CorpusLookup: Send + Sync {
-    fn corpus(&self, query: &str) -> Option<rtdb_text::Corpus>;
+    fn scorer(&self, query: &str) -> Arc<rtdb_text::Scorer>;
 }
 
 impl Default for EvalContext<'_> {

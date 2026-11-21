@@ -7,16 +7,15 @@ pub(crate) fn call(name: &str, args: &[Value], context: &EvalContext<'_>) -> Opt
     if !matches!(name, "match" | "search_score") { return None; }
     Some((|| {
         if args.iter().any(nullish) { return Ok(Value::Null); }
-        let query = match &args[1] { Value::Utf8(query) => rtdb_text::Query::parse(query), _ => return Ok(Value::Null) };
+        let Value::Utf8(query) = &args[1] else { return Ok(Value::Null) };
         let tokens = match &args[0] { Value::Utf8(text) => rtdb_text::tokens(text), _ => Vec::new() };
         context.reserve(tokens.iter().map(|token| token.len() + 32).sum::<usize>().saturating_add(256))?;
         Ok(match name {
-            "match" => Value::Bool(query.matches(&tokens)),
-            _ => {
-                let Value::Utf8(text) = &args[1] else { return Ok(Value::Null) };
-                let corpus = context.corpora.and_then(|corpora| corpora.corpus(text));
-                Value::F64(rtdb_text::bm25(&query, &tokens, corpus.as_ref()))
-            }
+            "match" => Value::Bool(rtdb_text::Query::parse(query).matches(&tokens)),
+            _ => Value::F64(match context.corpora {
+                Some(corpora) => corpora.scorer(query).bm25(&tokens),
+                None => rtdb_text::Scorer::new(rtdb_text::Query::parse(query), None).bm25(&tokens),
+            }),
         })
     })())
 }

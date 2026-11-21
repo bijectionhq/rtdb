@@ -1,0 +1,71 @@
+; Each check asks for a counterexample. RN means round to nearest, ties to even.
+(set-logic QF_NRA)
+(define-fun epsilon () Real (/ 1 9007199254740992)) ; 2^-53
+(define-fun rn-error ((factor Real)) Bool
+  (and (<= (- 1 epsilon) factor) (<= factor (+ 1 epsilon))))
+(define-fun relative-envelope () Real (* 8 epsilon))
+(define-fun padding () Real (+ 1 (* 32 epsilon)))
+(declare-const numerator-1 Real)
+(declare-const numerator-2 Real)
+(declare-const denominator Real)
+(declare-const quotient Real)
+(declare-const padded Real)
+(assert (and (rn-error numerator-1) (rn-error numerator-2) (rn-error denominator)
+             (rn-error quotient) (rn-error padded)))
+
+(echo "term-roundoff")
+(push)
+; The score has two rounded products above the line, one rounded addition below,
+; and a rounded division. K1 + 1 and K1 * norm are already binary64 inputs.
+(define-fun numerator () Real (* numerator-1 numerator-2 quotient))
+(assert (or (< numerator (* denominator (- 1 relative-envelope)))
+            (> numerator (* denominator (+ 1 relative-envelope)))))
+(check-sat)
+(pop)
+
+(echo "padding")
+(push)
+(assert (< (* padded padding (- 1 relative-envelope)) (+ 1 relative-envelope)))
+(check-sat)
+(pop)
+
+(echo "frequency-and-length")
+(push)
+(declare-const frequency Real)
+(declare-const maximum-frequency Real)
+(declare-const penalty Real)
+(declare-const minimum-penalty Real)
+(assert (and (< 0 frequency) (<= frequency maximum-frequency)
+             (< 0 minimum-penalty) (<= minimum-penalty penalty)))
+; Cross-multiply the ideal quotients, cancelling the common positive weight.
+(assert (> (* frequency (+ maximum-frequency minimum-penalty))
+           (* maximum-frequency (+ frequency penalty))))
+(check-sat)
+(pop)
+
+(echo "rounding-monotone")
+(push)
+(declare-const left Real)
+(declare-const right Real)
+(declare-const left-rn Real)
+(declare-const right-rn Real)
+(assert (and (< left right) (> left-rn right-rn)))
+; Each selected representable number is at least as close as the other one.
+(assert (<= (* (- left-rn left) (- left-rn left))
+            (* (- right-rn left) (- right-rn left))))
+(assert (<= (* (- right-rn right) (- right-rn right))
+            (* (- left-rn right) (- left-rn right))))
+(check-sat)
+(pop)
+
+(echo "sum-step")
+(push)
+(declare-const score Real)
+(declare-const bound Real)
+(declare-const next-score Real)
+(declare-const next-bound Real)
+(assert (and (<= score bound) (<= next-score next-bound)))
+; After exact addition, monotone rounding preserves this inequality.
+(assert (> (+ score next-score) (+ bound next-bound)))
+(check-sat)
+(pop)

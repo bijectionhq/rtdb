@@ -13,6 +13,8 @@ mod position;
 mod pg;
 mod type_edn;
 mod time;
+mod timestamp;
+mod interval_step;
 mod instant_text;
 mod value;
 mod uri;
@@ -39,7 +41,8 @@ pub use logical::{IntervalUnit, ListKind, LogicalType, RunEndWidth, ScalarType, 
 pub use type_edn::{TypeForm, function_type_mismatch};
 pub use position::*;
 pub use pg::{PgType, PgTypeDescriptor, pg_name_oid, pg_table_oid};
-pub use time::{EventHeader, EventOp, Instant, Interval, TemporalBounds, Timestamp};
+pub use time::{EventHeader, EventOp, Instant, Interval, TemporalBounds};
+pub use timestamp::Timestamp;
 pub use value::{DecimalValue, Value};
 pub use uri::UriParts;
 pub use utf8::decode_java_utf8;

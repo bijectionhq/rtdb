@@ -1,0 +1,265 @@
+= Native kernel study results, 2026-11-21
+
+The combined local run used the production sources through commit `9f2311110` and the model and runner sources in this study commit.
+The command in link:../README.adoc[the runner instructions] used all six named tools and enabled the Rust boundary controls.
+Logs include input hashes, solver diagnostics, and bounded counterexample traces.
+
+== Checked results
+
+[cols="1,2,2",options="header"]
+|===
+|Tool |Positive evidence |Controls and limits
+
+|Lean 4.36.0
+|The one-pass history evaluator refines the independent point definition.
+Admitted answers survive later publication.
+Arbitrary older histories agree after an erase of the observed key.
+The model proves key projection, point constancy between valid and system boundaries, and an abstract strict cutoff bound.
+|Half-open interval, future ERASE and tied-cutoff mutations fail.
+The audited theorems use standard Lean axioms.
+These are theorems about the model.
+
+|Verus 0.2026.11.20.9da409b, Z3 4.16.0
+|Fourteen verified functions across the production search rectangle decisions, temporal admission and replica admission areas.
+|All seven declared mutations failed at the expected functions.
+The proofs cover the included decisions, including two joint controls.
+The actual partition publication transitions, scan coverage and token-to-effect composition need further proof.
+
+|TLC 2026.11.19.180144
+|The pin and copy variants reached 8,140 and 7,012 states.
+The serialized and validated resolver variants reached 9 and 24 states.
+The fair stable-service case reached 8,140 states.
+The cache generation check reached 9 states.
+|All ten negative configurations produce a violation.
+The protocol assumes atomic append to one durable log, two terms, two requests, two roots and one reader.
+Progress assumes stable availability and weak fairness for apply and acknowledgement.
+
+|Apalache 0.63.0
+|Serialized and validated resolution hold through eight transitions.
+|Blind publication loses an update at transition four.
+
+|Maude 3.5.1
+|Independent rewrite models of serialized and validated resolution explore 9 and 24 states with no lost update.
+|The blind variant reaches revision two with value one.
+
+|Alloy 6.2.0
+|The last-reference rule preserves reachability in scope four.
+A satisfying shared-file retention case witnesses a nonempty model.
+|Deleting on the first member's removal admits a counterexample.
+
+|Rust compiler
+|The admitted-record apply boundary compiles on the unchanged production copy.
+|Minting the token from the driver fails with E0423.
+Passing a raw decoded record to apply fails with E0308 at the actual call site.
+
+|Rust runtime
+|238 tests passed across search, temporal, replication, storage and maintenance, with one ignored benchmark.
+All 15 node search tests passed.
+Lean and the Rust resolver both matched all 13 shared trace observations.
+|The tests exercise the local database, logs, compaction, cache races and search.
+No hosted provider fault test is included in this result.
+|===
+
+== Counterexamples and amendments
+
+[cols="1,2,2",options="header"]
+|===
+|Property |Small trace |Amendment or surviving rule
+
+|Atomic batch
+|Resolve, then publish the debit alone.
+|Make the full batch the unit of the admitted log transition.
+
+|Durable acknowledgement
+|Resolve, then acknowledge without append.
+|In the model, only an applied batch can be acknowledged.
+
+|Term fencing
+|Resolve in an old term, hand over, then publish the pending batch.
+|Reject stale terms and preserve admission through deferred apply.
+
+|Retry identity
+|Resolve one identity, append, retry that identity, append again.
+|Preserve a durable receipt or refuse an ambiguous retry under the provider contract.
+The model checks uniqueness for its receipt policy.
+
+|Read basis
+|Pin, resolve a new request, append, apply and change the pinned read history.
+|Keep the captured observation stable.
+
+|Durable root
+|Publish a manifest before storing its replacement object.
+|Publish the durable replacement before retiring its predecessor.
+
+|Shared reclamation
+|Pin an old generation, store and publish its replacement, then collect the pinned generation.
+|Allow collection only after references reach zero.
+
+|Cache generation
+|Start loading, invalidate, publish a replacement and complete the old load.
+|An obsolete loader can publish only a private path.
+In production, cache invalidation and pathname publication share the state lock.
+
+|Search visibility and rank
+|Merge two historical writes across their system origins, or count a row whose second MATCH predicate fails.
+|Retain system origins, apply strictly later erases to older rectangles, and score only resolved rows that pass the scan restriction.
+
+|Compaction schema
+|Decode a spill page whose Arrow union has a null leg, then copy it into a writer whose declared field differs in nullability.
+|Re-encode the original rows to the declared schema when passthrough would violate that schema.
+|===
+
+== Remaining proof obligations
+
+The complete native temporal ceiling and rectangle emitter still need a refinement proof against the point evaluator.
+The search ranking proof still needs coverage of the production floating-point score frontier, alternate physical recency page layouts, and optional build failure under memory pressure.
+The durable protocol models assume provider behavior.
+Provider faults, object-store recovery, the full trie coverage transition and cross-node lease accounting need production refinement evidence.
+The observations here support specific component claims and bounded protocol claims.
+
+== Expanded refinement run
+
+Production sources through `b2609268a` now use the Verus-checked single-event rectangle subtraction and temporal recency fold step.
+The combined proof run verified 19 functions across three areas and rejected all nine Verus mutations at their declared functions.
+Lean checked the full mathematical recency fold against the early-exit fold for ordered valid intervals.
+It also proved that retaining the required ordered prefix preserves top K and gave independence witnesses for whole batches, the admission horizon, the private prefix and operation order.
+Public `Polygon::recency` preserves its existing behavior for arbitrary constructed shapes.
+The early-exit refinement relies on ordered native intervals.
+
+Seventeen node search tests passed.
+The new tests compare plain MATCH and exact scores with a scan corpus when an index build exceeds the memory budget or historical physical pages are out of global IID order.
+The count-star plan also keeps the projection empty when only cardinality is needed.
+
+[cols="2,1,3",options="header"]
+|===
+|Additional TLC model |Distinct states |Rejected alternatives
+|Read-back and acknowledgement |195
+|Apply before delivery and acknowledgement on append each violate their own invariant.
+|Validated generation lease |350
+|Age-only collection and stale-follower admission can strand a reader.
+|Coordinated generation pin |415
+|The reader remains entitled until release, so the model forbids deletion while it holds the generation.
+|===
+
+The native trie collector currently selects garbage from the latest catalog and a retention timestamp.
+It has no distributed evidence of which generations readers still need.
+The lease model requires generation validation at admission and an enforced expiry on reads.
+The coordinated pin model requires an authority that serializes pin acquisition and reclamation, plus a contract for abandoned readers.
+Both alternatives are conditional on the modeled provider and clock assumptions.
+
+== Shared trace and ranking algebra
+
+Lean and the production Rust temporal resolver agreed on 4,096 generated point observations over 128 histories, in addition to the 13 hand-written observations.
+The retained seed includes alternate admission horizons, valid interval endpoints, multiple entities and same-batch put, delete and erase.
+The mathematical BM25 term fraction increases with a greater frequency and lower normalization term under the ordered arithmetic premises.
+The concrete floating-point window implementation still needs a rounding and frontier proof.
+
+The combined local runner passed from `5076d2cd1` with both Rust options enabled.
+The native package run passed 532 tests across query, search, temporal, replication, storage and maintenance, with one ignored benchmark.
+The native node search suite passed all 17 tests.
+The retention protocol and provider refinement remain open.
+
+== Binary64 score bounds and frontier
+
+The combined runner passed from `5daed1770` with both Rust options enabled, using the toolchain listed in link:../README.adoc[the runner instructions].
+The underlying scorer preserves the BM25 expression and its addition order.
+Window, candidate and SQL scoring now share one computed set of term weights.
+The old unpadded extremum can be one representable value below a row's score. The previous aggregate margin was present and this witness does not refute it.
+
+|===
+|Evidence |Result and scope
+
+|Lean 4.36.0
+|The frontier of pending scores and unexpanded windows covers every row with evidence in either source.
+A possible tie prevents a strict cutoff.
+Dropping unexpanded windows fails at `frontier_covers_supported_row`, and admitting equality fails the tied-cutoff controls.
+
+|Z3 4.16.0
+|Five counterexample queries are unsatisfiable over the exact-real model of rounded BM25.
+Removing the per-term padding and reversing the length premise each makes just its own query satisfiable.
+Separate binary64 queries check the one-value reversal and its repaired bound.
+
+|Native Rust replay
+|The binary64 witness passes on the exact production scorer.
+The source mutation that removes padding compiles and fails at the bound assertion.
+The text and search unit suites passed all 32 tests, and the node search suite passed all 17 tests, including ranked-versus-full sorting and candidate reduction across partitions.
+The combined runner also replayed all 4,096 native temporal observations.
+|===
+
+The numeric proof depends on the IEEE round-to-nearest operations and the source-to-model correspondence stated in link:../../dev/doc/rtdb-verification.adoc[Study 2].
+The frontier proof assumes completeness of the qualifying row's matching event in a pending entry or unexpanded window.
+The production evidence exercises those paths, including shared-file members, without a general proof of index decoding, temporal candidate coverage or planner eligibility.
+The durable storage and cross-node reader-retention obligations remain open.
+
+== Checkpoint interruption on local durable storage
+
+The combined runner passed from `11131976a` with both Rust options enabled.
+TLC explored all 97 reachable states of the single-root model.
+The shortest early-root trace is three transitions.
+A second variant loses a child after its durable write in eight transitions.
+The log-retention variant removes the prefix, crashes, and then cannot find the root in eleven transitions.
+
+Four native conformance tests passed, including interruptions immediately before and after the root write, loss of a source acknowledgement, and recovery against a closed history manifest.
+The pre-write replay rebuilt from the retained log.
+The post-write replay opened the stored checkpoint and observed the same single system-time row.
+Moving the root write ahead of the table blocks in a disposable copy made the post-write replay fail at startup on the missing object `tables/public$docs/blocks/b00.binpb`.
+
+The first combined run exposed a race in the fault fixture.
+Injected closure can reach the shutting-down driver's log poll before cancellation is selected.
+The final test accepts that exact injected error as an interruption and still checks the durable checkpoint and recovered history on both sides of the write.
+
+These are local provider observations and a bounded model of checkpoint publication under the stated retention and durability assumptions.
+The referenced-trie closure across concurrent compaction and GC, and behavior on remote storage, remain separate obligations.
+
+== Azure pending copy counterexample
+
+The checkpoint model that waits for copy completion holds in all 155 reachable states.
+Treating copy acceptance as completion publishes a root without its data object in six transitions.
+The offline Azure diagnostic passed through the production adapter at `6f0094f47`, with a provider returning `202 Accepted` and `x-ms-copy-status: pending`.
+The adapter returned success from file publication and deleted the copy source.
+The fixture observed the premature success on loopback.
+
+The combined local runner passed from `be1a66831` with both Rust options enabled.
+The corrected adapter waits for the same copy identifier to report success before acknowledging and removing staging.
+An unavailable status check preserves staging, and a retry sees an in-progress destination as unavailable.
+Both native controls compiled and failed at their declared assertions after removing the completion check or deleting staging on an unknown outcome.
+The Azure and storage package run with remote support passed 204 tests.
+The provider wait uses the client's default retry duration.
+Live Azure behavior under load, remediation of a terminal failed destination, and eventual cleanup of abandoned staging remain open.
+
+== Projected ceiling and shared interval decision
+
+The combined local runner passed from `90d44b4c5` with both Rust options enabled.
+The input manifest SHA-256 was `4477d684b03144bd290aa15cd2dd8d3c7b1c20ac9b6a3b4324dfdfbfb694c995`.
+Lean proved the unrestricted and request-bounded ceiling folds against the reference point query and exhibited a duplicate emission on unordered input.
+The inclusive upper edge and unchanged ceiling each failed their declared proof obligations.
+
+The production interval intersection now backs both intersection and overlap queries.
+Verus verified that exact decision and two independent law wrappers, plus 19 functions in the previous areas.
+The combined run rejected all 12 Verus controls, including the joint mutations that weakened the intersection contract.
+The complete Rust ceiling vector and range emitter still need a refinement proof against the projected model.
+
+Both native resolvers and the unbounded rectangles agreed with the mathematical answer on all 4,096 generated observations.
+There were 240 passing Rust type and temporal tests and 17 passing node search tests at the same revision.
+The combined suite also reran the checkpoint and Azure production controls and the 11 positive and 18 negative TLC configurations.
+
+== Production ceiling layout and fragment admission
+
+The combined local runner passed from `7a1937642` with both Rust options enabled.
+The input manifest SHA-256 was `d904a0fce7bc45577176e8564cb7404b92dd2bcb75b48a1eda57fe65923f57be`.
+Verus reported 43 verified obligations across five areas.
+All 18 Verus negative controls failed at their declared sites.
+The new controls exercise splitting, stale cells after compaction of the vectors, a skipped overwrite, an upper endpoint, a widened fragment, and admission that ignores system time.
+
+The verified production ceiling step preserves alignment of the two vectors and their strictly increasing boundaries.
+Splitting preserves point answers, and an overwrite changes exactly the points in its half-open range.
+The same area verifies which cells a scan visits and their clipping.
+The interval area checks that per-fragment admission tests both query axes, optionally clamps valid time, and preserves system time.
+
+The native run passed 302 tests across types, temporal, maintenance and search, with one ignored benchmark.
+The node search suite passed 17 tests.
+The combined run replayed all 4,096 generated observations against both Rust resolvers and unbounded visibility, four checkpoint tests and their root-first mutation, two Azure tests and their copy-status and staging mutations, and the binary64 score witness and its unpadded mutation.
+TLC reran 11 passing bounded configurations and found counterexamples in all 18 weakened configurations.
+
+The proof covers the actual vector operations under the standard Verus vector specifications.
+The allocation and event shell, production input order and the full resolver's assembly of fragments still rely on source inspection and replay.

@@ -7,11 +7,12 @@ use rtdb_index::BlockPreparation;
 use rtdb_types::{Anomaly, BlockIndex, Result, StorageEpoch, StorageVersion, Timestamp, TxId};
 
 use crate::ReplicaRecord;
+use crate::admission::AdmittedReplica;
 
 pub struct PendingBlock {
     pub boundary: ReplicaRecord,
     pub prepared: BlockPreparation,
-    buffered: VecDeque<ReplicaRecord>,
+    buffered: VecDeque<AdmittedReplica>,
     buffered_bytes: usize,
     max_records: usize,
     max_bytes: usize,
@@ -29,7 +30,7 @@ impl PendingBlock {
             && StorageEpoch(message.storage_epoch.unwrap_or_default()) == epoch
     }
     /// Records have already passed term admission and oversized-payload resolution.
-    pub fn hold(&mut self, record: ReplicaRecord) -> Result<()> {
+    pub(crate) fn hold(&mut self, record: AdmittedReplica) -> Result<()> {
         let bytes = self.buffered_bytes.checked_add(record.retained_bytes()).ok_or_else(|| invalid("Held replica byte size overflow"))?;
         if self.buffered.len() >= self.max_records || bytes > self.max_bytes {
             return Err(Anomaly::fault("xtdb.indexer/follower-buffer-overflow", "Pending block exceeded the retained replica record limit"));
@@ -39,7 +40,7 @@ impl PendingBlock {
         Ok(())
     }
     pub fn buffered_len(&self) -> usize { self.buffered.len() }
-    pub fn into_records(self) -> VecDeque<ReplicaRecord> { self.buffered }
+    pub(crate) fn into_records(self) -> VecDeque<AdmittedReplica> { self.buffered }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
