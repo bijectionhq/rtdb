@@ -388,6 +388,17 @@ pub enum StorageRegion {
         /// Written before a conditional provider mutation is submitted.
         publications: BTreeMap<uuid::Uuid, StoragePublication>,
     },
+    ReplicaReplay {
+        first_required: i64,
+        custody: ReplayCustody,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "custody", rename_all = "snake_case")]
+pub enum ReplayCustody {
+    Local,
+    Hosted { owner: Option<HostedTask> },
 }
 
 impl StorageRegion {
@@ -395,6 +406,7 @@ impl StorageRegion {
         match self {
             Self::Local { tracks_ordered_index_pages, .. } |
             Self::Remote { tracks_ordered_index_pages, .. } => *tracks_ordered_index_pages,
+            Self::ReplicaReplay { .. } => false,
         }
     }
 }

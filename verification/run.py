@@ -1414,10 +1414,10 @@ def verify_multi_trim_admission(args, source):
     if baseline.returncode or f"{test} ... ok" not in baseline.stdout or "1 passed; 0 failed" not in baseline.stdout:
         raise ValueError("native Multi recovery admission did not enforce the authorized trim")
 
-    logs = source / "rust/crates/multi/src/logs.rs"
-    original = logs.read_bytes()
+    holds = source / "rust/crates/multi/src/recovery_holds.rs"
+    original = holds.read_bytes()
     try:
-        replace_once(logs, "if let Some(recovery) = &self.recovery { recovery.check_start(after).await?; }", "")
+        replace_once(holds, "if let Some(anchor) = &record.replica_anchor", "if false && let Some(anchor) = &record.replica_anchor")
         control = run_case(command, source / "rust", args.evidence, f"{label}-ignore-authorization", env)
         if (
             control.returncode != 101 or f"{test} ... FAILED" not in control.stdout
@@ -1426,8 +1426,39 @@ def verify_multi_trim_admission(args, source):
         ):
             raise ValueError("ignoring Multi trim authorization did not fail at the native admission assertion")
     finally:
-        logs.write_bytes(original)
+        holds.write_bytes(original)
     print(f"{label}: directory floor enforced before physical trim, missing check rejected")
+
+
+def verify_recovery_hold_replay(args, source):
+    env = os.environ | {
+        "CARGO_TARGET_DIR": str(ROOT / "target"),
+        "CARGO_PROFILE_DEV_DEBUG": "0",
+        "CARGO_PROFILE_TEST_DEBUG": "0",
+        "CARGO_INCREMENTAL": "0",
+    }
+    test = "a_recovering_subscriber_keeps_its_suffix_through_a_concurrent_trim"
+    command = ["cargo", "test", "--locked", "-p", "rtdb-multi", "--test", "cell", test, "--", "--exact"]
+    label = "rust-multi-recovery-hold"
+    baseline = run_case(command, source / "rust", args.evidence, f"{label}-baseline", env)
+    if baseline.returncode or f"{test} ... ok" not in baseline.stdout or "1 passed; 0 failed" not in baseline.stdout:
+        raise ValueError("Multi subscriber did not complete recovery and allow trim progress")
+
+    agent = source / "rust/crates/multi/src/agent.rs"
+    original = agent.read_bytes()
+    try:
+        replace_once(agent, "StorageRegion::ReplicaReplay { first_required, .. } => Some(*first_required),",
+                     "StorageRegion::ReplicaReplay { .. } => None,")
+        control = run_case(command, source / "rust", args.evidence, f"{label}-ignore-holds", env)
+        if (
+            control.returncode != 101 or f"{test} ... FAILED" not in control.stdout
+            or "trim must retain the first required replica record" not in control.stdout
+            or "0 passed; 1 failed" not in control.stdout
+        ):
+            raise ValueError("ignoring replay holds did not fail at the physical retention assertion")
+    finally:
+        agent.write_bytes(original)
+    print(f"{label}: recovery and later trim progress passed, ignoring the hold failed")
 
 
 def verify_catalog_replay(args, source):
@@ -1827,6 +1858,9 @@ def main():
         "rust/crates/kafka/src/lib.rs",
         "rust/crates/logkeeper/src/client/mod.rs",
         "rust/crates/multi/src/logs.rs",
+        "rust/crates/multi/src/recovery_holds.rs",
+        "rust/crates/multi/src/agent.rs",
+        "rust/crates/multi/tests/cell.rs",
     ))
     for path in list(source_paths):
         if path.name == "proof.rs":
@@ -1863,6 +1897,7 @@ def main():
             verify_checkpoint_trie_retention(args, source)
             verify_replay_prefix(args, source)
             verify_multi_trim_admission(args, source)
+            verify_recovery_hold_replay(args, source)
             verify_catalog_replay(args, source)
             verify_system_time_replay(args, source)
             verify_merge_replay(args, source)

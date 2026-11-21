@@ -10,7 +10,7 @@ use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use parking_lot::Mutex;
-use rtdb_directory::{Cas, Checkpoint, DeploymentRecord, Directory, JournalAnchor, Lifecycle, MemberId, MemberRecord, MemberState, Version, claim, effective_holder, now_ms, park, suspend_holding};
+use rtdb_directory::{Cas, Checkpoint, DeploymentRecord, Directory, JournalAnchor, Lifecycle, MemberId, MemberRecord, MemberState, StorageRegion, Version, claim, effective_holder, now_ms, park, suspend_holding};
 use rtdb_format::catalog::BlockCatalog;
 use rtdb_node::{Database, Node};
 use rtdb_replication::Role as DriverRole;
@@ -20,6 +20,7 @@ use tokio_util::sync::CancellationToken;
 use crate::control::{ACTIVATION_RATE_LIMITED, CLAIM_CONTENDED, Handler, MoveTicket, NODE_UNDER_PRESSURE, NOT_CLAIMABLE, Request, Response};
 use crate::deployment::{CellStorage, Role, database_config, ensemble_servers, select_logkeepers};
 use crate::lease::MemberLease;
+use crate::replica_retention::replica_trim_through;
 
 #[derive(Clone, Debug)]
 pub struct AgentOptions {
@@ -832,14 +833,22 @@ impl NodeAgent {
         let Ok(database) = self.node.catalog().database(name) else { return };
         let Some(block) = database.status().adopted_block else { return };
         let Some(checkpoint) = checkpoint_for_block(&block, StorageEpoch(current.log_epoch)) else { return };
-        let through = checkpoint.boundary - 1;
-        let needs_trim = self.holdings.lock().get(name).is_some_and(|holding| {
-            holding.id == current.id && holding.epoch == epoch && holding.trimmed_through.is_none_or(|trimmed| trimmed < through)
-        });
+        let trimmed_through = self.holdings.lock().get(name)
+            .filter(|holding| holding.id == current.id && holding.epoch == epoch)
+            .map(|holding| holding.trimmed_through.unwrap_or(-1));
+        let Some(trimmed_through) = trimmed_through else { return; };
+        let needs_trim = trimmed_through < checkpoint.boundary - 1;
         let needs_publication = current.checkpoint.is_none_or(|published| published.block < checkpoint.block);
-        if !needs_publication && (through < 0 || !needs_trim) { return; }
+        if !needs_publication && !needs_trim { return; }
         let Ok(Some((mut record, _))) = self.publish_checkpoint(&current.id, epoch, &block).await else { return; };
-        if through < 0 || !needs_trim { return; }
+        if !needs_trim { return; }
+        let Some(published) = record.checkpoint else { return; };
+        let boundary = published.boundary.min(checkpoint.boundary);
+        let oldest_replay = record.storage_regions.values().filter_map(|region| match region {
+            StorageRegion::ReplicaReplay { first_required, .. } => Some(*first_required),
+            _ => None,
+        }).min().unwrap_or(boundary);
+        let Some(through) = replica_trim_through(boundary, oldest_replay).filter(|through| *through > trimmed_through) else { return; };
         let Ok(members) = self.members().await else { return };
         let Ok(servers) = ensemble_servers(&record, &members) else { return };
         let stream = rtdb_logkeeper::StreamConfig { write_quorum: crate::deployment::write_quorum(servers.len()), servers, stream: record.stream("replica"), maximum_message_bytes: 4 << 20 };
@@ -850,6 +859,7 @@ impl NodeAgent {
             let root_incarnation = record.replica_anchor.as_ref().map_or(record.incarnation, |anchor| anchor.root_incarnation);
             let version = record.version;
             record.replica_anchor = Some(Box::new(JournalAnchor { root_incarnation, interval: proof.interval, digest }));
+            // The CAS also validates the observed recovery holds.
             if !matches!(self.directory.replace_deployment(record, version).await, Ok(Cas::Applied(_))) {
                 return;
             }

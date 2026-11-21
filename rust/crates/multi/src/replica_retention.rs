@@ -14,3 +14,15 @@ pub(crate) fn excluded_replay_start(after: i64, authorized_through: i64) -> Opti
     let first_retained = authorized_through.checked_add(1)?;
     Some((after + 1, first_retained))
 }
+
+#[cfg_attr(verus_keep_ghost, verus_spec(out =>
+    ensures
+        out.is_some() <==> 0 < checkpoint && 0 < first_required,
+        out.is_some() ==> 0 <= out.unwrap() < checkpoint && out.unwrap() < first_required,
+        out.is_some() ==> (out.unwrap() as int) + 1 == checkpoint || (out.unwrap() as int) + 1 == first_required,
+))]
+pub(crate) fn replica_trim_through(checkpoint: i64, first_required: i64) -> Option<i64> {
+    let first_retained = checkpoint.min(first_required);
+    if first_retained <= 0 { return None; }
+    Some(first_retained - 1)
+}

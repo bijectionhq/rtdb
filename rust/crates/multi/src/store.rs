@@ -511,9 +511,14 @@ pub(crate) async fn reconcile_storage_regions(
     }
     for (&region, state) in &record.storage_regions {
         match state {
-            StorageRegion::Local { .. } if matches!(storage, CellStorage::Local { .. }) && keys.local_storage_region_drained(region)? => {
+            StorageRegion::Local { .. } | StorageRegion::ReplicaReplay { custody: rtdb_directory::ReplayCustody::Local, .. }
+                if matches!(storage, CellStorage::Local { .. }) && keys.local_storage_region_drained(region)? => {
                 release_region(directory, &record.id, region, false).await?;
                 keys.forget_local_storage_region(region)?;
+            }
+            StorageRegion::ReplicaReplay { custody: rtdb_directory::ReplayCustody::Hosted { owner: Some(owner) }, .. }
+                if directory.hosted_task_stopped(owner).await? => {
+                release_region(directory, &record.id, region, false).await?;
             }
             StorageRegion::Remote { archive, owner, publications, closed, .. } => {
                 if !*closed {
@@ -954,7 +959,7 @@ pub async fn run_reaper(
                     if let Some(keys) = keys.as_deref() {
                         for record in &deployments {
                             if record.ordered_indexes.is_empty() && record.ordered_index_catalogs.is_empty()
-                                && !record.storage_regions.values().any(|region| matches!(region, StorageRegion::Remote { .. }))
+                                && !record.storage_regions.values().any(|region| matches!(region, StorageRegion::Remote { .. } | StorageRegion::ReplicaReplay { .. }))
                             {
                                 continue;
                             }
@@ -1461,6 +1466,32 @@ mod tests {
             .await.unwrap();
         assert_eq!(receipt.deployment, record.id);
         assert!(!keys.local_storage_region_drained(region).unwrap(), "the consumed witness is removed");
+    }
+
+    #[tokio::test]
+    async fn the_local_reaper_leaves_other_recovery_holds_in_place() {
+        let files = tempfile::tempdir().unwrap();
+        let keys = crate::keys::LocalKeyService::new(files.path().join("keys")).unwrap();
+        let storage = CellStorage::Local { root: files.path().join("objects") };
+        let directory = rtdb_directory::MemoryDirectory::new();
+        let mut record = DeploymentRecord::new("shop", "acme", vec![], 0);
+        let stopped = Uuid::new_v4();
+        let running = Uuid::new_v4();
+        let stopped_witness = keys.hold_local_storage_region(stopped).unwrap().unwrap();
+        let running_witness = keys.hold_local_storage_region(running).unwrap().unwrap();
+        for id in [stopped, running] {
+            record.storage_regions.insert(id, StorageRegion::ReplicaReplay { first_required: 5, custody: rtdb_directory::ReplayCustody::Local });
+        }
+        let record = directory.create_deployment(record).await.unwrap();
+        drop(stopped_witness);
+        reconcile_storage_regions(directory.as_ref(), &storage, &keys, &record).await.unwrap();
+        let current = directory.deployment(&record.id).await.unwrap().unwrap();
+        assert_eq!(current.storage_regions.len(), 1);
+        assert!(current.storage_regions.contains_key(&running));
+        assert!(!keys.local_storage_region_drained(stopped).unwrap());
+        drop(running_witness);
+        reconcile_storage_regions(directory.as_ref(), &storage, &keys, &current).await.unwrap();
+        assert!(directory.deployment(&record.id).await.unwrap().unwrap().storage_regions.is_empty());
     }
 
     #[tokio::test]
