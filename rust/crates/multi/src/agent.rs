@@ -431,13 +431,27 @@ impl NodeAgent {
                 return Ok(Response::Subscribed { address: self.address.clone() });
             }
         }
-        let checkpoint = record.checkpoint.ok_or_else(|| Anomaly::new(AnomalyCategory::Unavailable, "rtdb.multi/no-checkpoint", format!("{name} has published no block to read")))?;
-        let configuration = database_config(&record, Vec::new(), &self.options.storage, Role::Snapshot(checkpoint));
         self.stop_running(name).await;
-        self.node.database_or_attach(name.to_owned(), configuration).await?
-            .ok_or_else(|| Anomaly::fault("rtdb.multi/not-opened", "The node declined to open the snapshot"))?;
-        self.subscriptions.lock().insert(name.to_owned(), LocalSubscription { id: record.id, last_touch: Instant::now(), opened: Instant::now(), role: Role::Snapshot(checkpoint), fragments: false });
-        Ok(Response::Subscribed { address: self.address.clone() })
+        let mut record = record;
+        for _ in 0..8 {
+            let checkpoint = record.checkpoint.ok_or_else(|| Anomaly::new(AnomalyCategory::Unavailable, "rtdb.multi/no-checkpoint", format!("{name} has published no block to read")))?;
+            let configuration = database_config(&record, Vec::new(), &self.options.storage, Role::Snapshot(checkpoint));
+            match self.node.database_or_attach(name.to_owned(), configuration).await {
+                Ok(Some(_)) => {
+                    self.subscriptions.lock().insert(name.to_owned(), LocalSubscription { id: record.id, last_touch: Instant::now(), opened: Instant::now(), role: Role::Snapshot(checkpoint), fragments: false });
+                    return Ok(Response::Subscribed { address: self.address.clone() });
+                }
+                Err(error) if error.code == crate::store::CHECKPOINT_ADVANCED => {
+                    record = self.directory.deployment(&record.id).await?
+                        .filter(|fresh| fresh.lifecycle == Lifecycle::Live && fresh.incarnation == record.incarnation
+                            && fresh.checkpoint.is_some_and(|published| published.block > checkpoint.block))
+                        .ok_or(error)?;
+                }
+                Err(error) => return Err(error),
+                Ok(None) => return Err(Anomaly::fault("rtdb.multi/not-opened", "The node declined to open the snapshot")),
+            }
+        }
+        Err(Anomaly::new(AnomalyCategory::Conflict, crate::store::CHECKPOINT_ADVANCED, "The published checkpoint kept changing while opening the snapshot"))
     }
 
     /// Publishes a worker's compaction as the deployment's holder.

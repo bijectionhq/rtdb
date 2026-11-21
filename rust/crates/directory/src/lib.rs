@@ -235,10 +235,14 @@ pub enum StorageRegion {
         archive: Option<uuid::Uuid>,
         #[serde(default)]
         tracks_ordered_index_pages: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        checkpoint_metadata_from: Option<i64>,
     },
     Remote {
         #[serde(default)]
         tracks_ordered_index_pages: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        checkpoint_metadata_from: Option<i64>,
         archive: Option<uuid::Uuid>,
         /// Serving I/O can read its repair archive while writing its own prefix.
         repair_archive: Option<uuid::Uuid>,
@@ -252,6 +256,20 @@ pub enum StorageRegion {
 }
 
 impl StorageRegion {
+    pub fn checkpoint_metadata_from(&self) -> Option<i64> {
+        match self {
+            Self::Local { checkpoint_metadata_from, .. } |
+            Self::Remote { checkpoint_metadata_from, closed: false, .. } => *checkpoint_metadata_from,
+            Self::Remote { closed: true, .. } => None,
+        }
+    }
+
+    pub fn release_checkpoint_metadata(&mut self) {
+        if let Self::Local { checkpoint_metadata_from, .. } | Self::Remote { checkpoint_metadata_from, .. } = self {
+            *checkpoint_metadata_from = None;
+        }
+    }
+
     pub fn tracks_ordered_index_pages(&self) -> bool {
         match self {
             Self::Local { tracks_ordered_index_pages, .. } |

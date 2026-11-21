@@ -134,6 +134,8 @@ pub enum BlockDiscovery {
     /// Probes forward from a known block, one head per block.
     /// A missing hint or checkpoint metadata triggers ordinary discovery by listing.
     From(BlockIndex),
+    /// A published and admitted lower bound. A refreshed listing must also respect it.
+    FromPublished(BlockIndex),
     /// Recovers exactly this block, for a reader of the state as of it.
     At(BlockIndex),
 }
@@ -228,14 +230,24 @@ impl BlockStore {
         let mut latest = match discovery {
             BlockDiscovery::At(block) if exists(block).await? => return Ok(Some(block)),
             BlockDiscovery::At(block) => return Err(rtdb_types::Anomaly::new(rtdb_types::AnomalyCategory::Unavailable, "rtdb.replication/block-gone", format!("Block {} is no longer stored", block.0))),
-            BlockDiscovery::From(hint) if exists(hint).await? => hint,
-            _ => {
-                let directory = ObjectKey::new("blocks")?;
-                return Ok(self.store.list(Some(&directory)).await?.into_iter().filter_map(|entry| block_index_from_key(entry.key.as_str()).ok()).max());
-            }
+            BlockDiscovery::From(hint) | BlockDiscovery::FromPublished(hint) if exists(hint).await? => hint,
+            BlockDiscovery::FromPublished(hint) => return self.latest_listed_block().await?
+                .filter(|index| *index >= hint).map(Some).ok_or_else(|| rtdb_types::Anomaly::new(
+                    rtdb_types::AnomalyCategory::Unavailable, "rtdb.replication/block-gone",
+                    format!("Published checkpoint {} and its successors could not be found", hint.0),
+                )),
+            _ => return self.latest_listed_block().await,
         };
-        while exists(BlockIndex(latest.0 + 1)).await? { latest = BlockIndex(latest.0 + 1); }
+        while let Some(next) = latest.0.checked_add(1).map(BlockIndex) {
+            if !exists(next).await? { break; }
+            latest = next;
+        }
         Ok(Some(latest))
+    }
+
+    async fn latest_listed_block(&self) -> Result<Option<BlockIndex>> {
+        let directory = ObjectKey::new("blocks")?;
+        Ok(self.store.list(Some(&directory)).await?.into_iter().filter_map(|entry| block_index_from_key(entry.key.as_str()).ok()).max())
     }
 
     async fn load_catalog(&self, index: BlockIndex) -> Result<BlockCatalog> {

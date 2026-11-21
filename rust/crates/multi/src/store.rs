@@ -15,7 +15,7 @@ use bytes::Bytes;
 use parking_lot::Mutex;
 use prost_types::Any;
 use rtdb_directory::{Cas, DeploymentRecord, Directory, HostedTask, Lifecycle, StoragePublication, StorageRegion, now_ms};
-use rtdb_node::RemoteStorageFactory;
+use rtdb_node::{OpenedRecoveryStore, RemoteStorageFactory};
 use rtdb_storage::{Error, IoRegion, ObjectKey, ObjectStore, object_store::{IndexPageLifecycle, StoredObject}, remote::PublicationJournal};
 use rtdb_types::{Anomaly, Result};
 use serde::{Deserialize, Serialize};
@@ -26,6 +26,7 @@ use uuid::Uuid;
 use crate::cipher::{Cipher, SEALED_OVERHEAD as OVERHEAD};
 use crate::deployment::CellStorage;
 use crate::keys::KeyService;
+use crate::checkpoint_retention::checkpoint_metadata_collectable;
 use crate::ordered_index_storage::{self, HostedIndexPages};
 
 /// The protobuf type name the cell's storage factory is registered under.
@@ -68,39 +69,40 @@ pub struct CellStoreFactory {
 #[async_trait]
 impl RemoteStorageFactory for CellStoreFactory {
     async fn open(&self, configuration: &Any, storage_root: &ObjectKey, io: Arc<IoRegion>) -> Result<Arc<dyn ObjectStore>> {
-        let config: CellStoreConfig = serde_json::from_slice(&configuration.value)
-            .map_err(|error| Anomaly::incorrect("rtdb.multi/storage-config", format!("Cell storage configuration is malformed: {error}")))?;
-        let (record, region, owner, release) = self.admit_region(&config, io).await?;
-        let recovery = if storage_root.as_str() == crate::archive::checkpoint_storage_root()? {
-            crate::archive::ArchivedCheckpoint::load(&record, self.keys.as_ref(), region.clone()).await?
-        } else {
-            None
-        };
-        let bucket = config.storage.bucket(region).await?;
-        let store = format!("{}/{}", config.prefix, storage_root.as_str());
-        let root = FencedStore {
-            inner: Arc::new(crate::reference::PrefixedStore::new(Arc::clone(&bucket), store.clone())),
-            directory: self.directory.clone(),
-            deployment: config.deployment.clone(),
-            fence: Fence::from(&config),
-            _release: Some(release),
-        };
-        confirm_root(&root, &config.deployment, config.writer_epoch.is_some()).await?;
-        let discovery = match record.checkpoint { Some(checkpoint) => crate::packing::PackDiscovery::From(checkpoint.block), None => crate::packing::PackDiscovery::List };
-        let pages = HostedIndexPages::new(
-            self.directory.clone(), config.deployment, store.clone(), owner, config.writer_epoch, self.storage_regions.clone(),
-        );
-        let mut opened = open_with_scoped_store(bucket, &store, Arc::new(root), discovery, wall_clock(), recovery).await?;
-        Arc::get_mut(&mut opened).expect("the new store has one owner").index_pages = Some(pages);
-        Ok(opened)
+        Ok(self.open_for_recovery(configuration, storage_root, io).await?.store)
     }
 
-    /// A deployment with a published checkpoint recovers from it without listing its store.
-    async fn block_discovery(&self, configuration: &Any) -> Result<rtdb_replication::BlockDiscovery> {
+    async fn open_for_recovery(&self, configuration: &Any, storage_root: &ObjectKey, io: Arc<IoRegion>) -> Result<OpenedRecoveryStore> {
         let config: CellStoreConfig = serde_json::from_slice(&configuration.value)
             .map_err(|error| Anomaly::incorrect("rtdb.multi/storage-config", format!("Cell storage configuration is malformed: {error}")))?;
-        if let Some(block) = config.snapshot_block { return Ok(rtdb_replication::BlockDiscovery::At(rtdb_types::BlockIndex(block))); }
-        Ok(match self.checkpoint(&config).await? { Some(block) => rtdb_replication::BlockDiscovery::From(rtdb_types::BlockIndex(block)), None => rtdb_replication::BlockDiscovery::List })
+        let (record, region, owner, release, checkpoint_metadata) = self.admit_region(&config, io).await?;
+        let blocks = discovery_from_admitted_record(&config, &record);
+        let checkpoint_metadata: Arc<dyn Send + Sync> = Arc::new(checkpoint_metadata);
+        let opened = IoRegion::retaining(Arc::clone(&checkpoint_metadata), async {
+            let recovery = if storage_root.as_str() == crate::archive::checkpoint_storage_root()? {
+                crate::archive::ArchivedCheckpoint::load(&record, self.keys.as_ref(), region.clone()).await?
+            } else {
+                None
+            };
+            let bucket = config.storage.bucket(region).await?;
+            let store = format!("{}/{}", config.prefix, storage_root.as_str());
+            let root = FencedStore {
+                inner: Arc::new(crate::reference::PrefixedStore::new(Arc::clone(&bucket), store.clone())),
+                directory: self.directory.clone(),
+                deployment: config.deployment.clone(),
+                fence: Fence::from(&config),
+                _release: Some(release),
+            };
+            confirm_root(&root, &config.deployment, config.writer_epoch.is_some()).await?;
+            let discovery = match record.checkpoint { Some(checkpoint) => crate::packing::PackDiscovery::From(checkpoint.block), None => crate::packing::PackDiscovery::List };
+            let pages = HostedIndexPages::new(
+                self.directory.clone(), config.deployment, store.clone(), owner, config.writer_epoch, self.storage_regions.clone(),
+            );
+            let mut opened = open_with_scoped_store(bucket, &store, Arc::new(root), discovery, wall_clock(), recovery).await?;
+            Arc::get_mut(&mut opened).expect("the new store has one owner").index_pages = Some(pages);
+            Ok::<_, Anomaly>(opened)
+        }).await?;
+        Ok(OpenedRecoveryStore { store: opened, blocks, checkpoint_metadata: Some(checkpoint_metadata) })
     }
 
     /// Encryption sits above the node's disk cache, which therefore holds ciphertext.
@@ -114,18 +116,29 @@ impl RemoteStorageFactory for CellStoreFactory {
     }
 }
 
+pub(crate) const CHECKPOINT_ADVANCED: &str = "rtdb.multi/checkpoint-advanced";
+
+fn discovery_from_admitted_record(config: &CellStoreConfig, record: &DeploymentRecord) -> rtdb_replication::BlockDiscovery {
+    use rtdb_replication::BlockDiscovery;
+    use rtdb_types::BlockIndex;
+    if let Some(block) = config.snapshot_block { return BlockDiscovery::At(BlockIndex(block)); }
+    let Some(checkpoint) = record.checkpoint else { return BlockDiscovery::List; };
+    BlockDiscovery::FromPublished(BlockIndex(checkpoint.block))
+}
+
 impl CellStoreFactory {
     async fn admit_region(
         &self,
         config: &CellStoreConfig,
         parent: Arc<IoRegion>,
-    ) -> Result<(DeploymentRecord, Arc<IoRegion>, Uuid, oneshot::Sender<()>)> {
+    ) -> Result<(DeploymentRecord, Arc<IoRegion>, Uuid, oneshot::Sender<()>, oneshot::Sender<()>)> {
         let directory = self.directory.clone();
         let keys = self.keys.clone();
         let config = config.clone();
         let hosted_task = self.hosted_task.clone();
         let id = Uuid::new_v4();
-        let (release, dropped) = oneshot::channel();
+        let (release, mut dropped) = oneshot::channel();
+        let (metadata, read) = oneshot::channel();
         let (ready, admitted) = oneshot::channel();
         // The worker owns both the admission and its release. Dropping the
         // opening future cannot strand a request that has reached the directory.
@@ -154,13 +167,19 @@ impl CellStoreFactory {
                 {
                     return Err(Anomaly::incorrect("rtdb.multi/storage-authority", format!("Installation {} no longer authorizes this store", config.deployment)));
                 }
+                if let Some(requested) = config.snapshot_block
+                    && !record.checkpoint.is_some_and(|published| published.block == requested)
+                {
+                    return Err(Anomaly::new(rtdb_types::AnomalyCategory::Conflict, CHECKPOINT_ADVANCED, "The snapshot's checkpoint changed before storage admission"));
+                }
+                let checkpoint_metadata_from = Some(record.checkpoint.map_or(0, |checkpoint| checkpoint.block));
                 let repair = record.checkpoint_recovery.as_ref()
                     .filter(|repair| repair.completed_at_ms.is_some())
                     .map(|repair| repair.operation);
                 record.storage_regions.insert(id, if local {
-                    StorageRegion::Local { archive: repair, tracks_ordered_index_pages: true }
+                    StorageRegion::Local { archive: repair, tracks_ordered_index_pages: true, checkpoint_metadata_from }
                 } else {
-                    StorageRegion::Remote { tracks_ordered_index_pages: true, archive: None, repair_archive: repair, owner: hosted_task.clone(),
+                    StorageRegion::Remote { tracks_ordered_index_pages: true, checkpoint_metadata_from, archive: None, repair_archive: repair, owner: hosted_task.clone(),
                         closed: false, publications: BTreeMap::new() }
                 });
                 Ok(())
@@ -169,10 +188,25 @@ impl CellStoreFactory {
             // The admission predicate and missing installation are local
             // refusals. Other directory errors may hide an applied CAS.
             let uncertain = accepted.as_ref().err().is_some_and(|error| !matches!(
-                error.code.as_str(), "rtdb.multi/storage-authority" | "rtdb.multi/unknown-installation"
+                error.code.as_str(), "rtdb.multi/storage-authority" | "rtdb.multi/unknown-installation" | CHECKPOINT_ADVANCED
             ));
             if ready.send(accepted.map(|record| (record, io.clone()))).is_ok() && opened {
-                let _ = dropped.await;
+                tokio::select! {
+                    _ = &mut dropped => {}
+                    _ = read => loop {
+                        let result = crate::admin::update_installation(directory.as_ref(), &config.deployment, |record| {
+                            if let Some(region) = record.storage_regions.get_mut(&id) {
+                                region.release_checkpoint_metadata();
+                            }
+                            Ok(())
+                        }).await;
+                        if result.is_ok() { let _ = dropped.await; break; }
+                        tokio::select! {
+                            _ = &mut dropped => break,
+                            _ = tokio::time::sleep(Duration::from_secs(1)) => {}
+                        }
+                    }
+                }
             }
             io.close_and_wait().await;
             drop(io);
@@ -196,16 +230,12 @@ impl CellStoreFactory {
             "rtdb.multi/storage-admission",
             "The serving storage region could not be admitted",
         ))??;
-        Ok((record, region, id, release))
-    }
-
-    async fn checkpoint(&self, config: &CellStoreConfig) -> Result<Option<i64>> {
-        Ok(self.directory.deployment(&config.deployment).await?.and_then(|record| record.checkpoint).map(|checkpoint| checkpoint.block))
+        Ok((record, region, id, release, metadata))
     }
 }
 
 pub(crate) fn remote_storage_region(archive: Option<Uuid>, owner: Option<HostedTask>) -> StorageRegion {
-    StorageRegion::Remote { tracks_ordered_index_pages: true, archive, repair_archive: None, owner, closed: false, publications: BTreeMap::new() }
+    StorageRegion::Remote { tracks_ordered_index_pages: true, checkpoint_metadata_from: None, archive, repair_archive: None, owner, closed: false, publications: BTreeMap::new() }
 }
 
 pub(crate) fn track_publications(
@@ -697,6 +727,9 @@ pub async fn reap(bucket: &dyn ObjectStore, record: &DeploymentRecord, grace: Du
 pub async fn reap_as_of(bucket: &dyn ObjectStore, record: &DeploymentRecord, now_ms: i64, grace: Duration, references: &crate::reference::References) -> Result<Reaped> {
     use crate::reference::{Base, physical_objects};
     let mut reaped = Reaped::default();
+    if !matches!(record.lifecycle, Lifecycle::Live | Lifecycle::Quarantined) { return Ok(reaped); }
+    let published = record.checkpoint.map(|checkpoint| checkpoint.block);
+    let oldest = record.storage_regions.values().filter_map(StorageRegion::checkpoint_metadata_from).min();
     let threshold = now_ms - grace.as_millis() as i64;
     for store in crate::reference::stores(bucket, &record.storage_prefix()).await? {
         let mut base = Base::load(bucket, &store).await?;
@@ -715,15 +748,20 @@ pub async fn reap_as_of(bucket: &dyn ObjectStore, record: &DeploymentRecord, now
             let Some(location) = physical(&own, &name) else { continue };
             let Ok(bytes) = bucket.get(&crate::reference::key(&location)?).await else { continue };
             let Ok(released) = serde_json::from_slice::<GarbageRecord>(&bytes) else { continue };
-            if released.released_at_ms > threshold { reaped.waiting += 1; continue; }
+            if released.released_at_ms > threshold || checkpoint_metadata_block(&released.key)
+                .is_some_and(|block| !checkpoint_metadata_collectable(block, published, oldest))
+            {
+                reaped.waiting += 1;
+                continue;
+            }
             due.insert(released.key, name);
         }
         let mut forgotten = BTreeSet::new();
         let packs: BTreeSet<String> = own.iter().chain(before.objects.keys()).filter(|name| name.starts_with(&format!("{}/", crate::packing::PACK_DIRECTORY))).cloned().collect();
         // The latest block's pack names every other pack, so a cold start finds them all through it: it stays.
         let latest = packs.iter().filter(|pack| pack.starts_with(&format!("{}/b", crate::packing::PACK_DIRECTORY))).max().cloned();
-        // A cold start walks block by block from the published checkpoint's pack to the latest, stopping at the first one missing: from the checkpoint on, every block's pack stays.
-        let walked = |pack: &str| record.checkpoint.is_some_and(|checkpoint| crate::packing::pack_block(pack).is_some_and(|block| block >= checkpoint.block));
+        let walked = |pack: &str| crate::packing::pack_block(pack)
+            .is_some_and(|block| !checkpoint_metadata_collectable(block, published, oldest));
         let mut packed = BTreeSet::new();
         let mut obsolete_packs = Vec::new();
         for pack in packs {
@@ -765,6 +803,17 @@ pub async fn reap_as_of(bucket: &dyn ObjectStore, record: &DeploymentRecord, now
         for garbage_record in local_records { references.erase(bucket, &store, garbage_record).await?; }
     }
     Ok(reaped)
+}
+
+fn checkpoint_metadata_block(key: &str) -> Option<i64> {
+    let file = if let Some(file) = key.strip_prefix("blocks/") {
+        file
+    } else {
+        let (_, relative) = key.strip_prefix("tables/")?.split_once('/')?;
+        relative.strip_prefix("blocks/")?
+    };
+    if file.contains('/') { return None; }
+    rtdb_format::keys::block_index_from_key(file).ok().map(|index| index.0)
 }
 
 /// When a garbage record's name says it was released, in milliseconds since the epoch.
@@ -1080,7 +1129,7 @@ mod tests {
             compactor: false,
             snapshot_block: None,
         };
-        let (admitted, region, _, attachment) = factory.admit_region(&config, IoRegion::new()).await.unwrap();
+        let (admitted, region, _, attachment, _metadata) = factory.admit_region(&config, IoRegion::new()).await.unwrap();
         assert_eq!(admitted.storage_regions.len(), 1);
 
         let (entered, active) = oneshot::channel();
@@ -1129,6 +1178,7 @@ mod tests {
         let before = directory.deployment(&record.id).await.unwrap().unwrap();
         assert_eq!(before.storage_regions[&region], StorageRegion::Remote {
             tracks_ordered_index_pages: true,
+            checkpoint_metadata_from: None,
             archive: None, repair_archive: None, owner: None, closed: false, publications: BTreeMap::from([(attempt, StoragePublication { key: object.to_string(), upload_id: "upload".to_owned() })]),
         });
         release_region(directory.as_ref(), &record.id, region, false).await.unwrap();
@@ -1137,6 +1187,7 @@ mod tests {
         let retained = directory.deployment(&record.id).await.unwrap().unwrap();
         assert_eq!(retained.storage_regions[&region], StorageRegion::Remote {
             tracks_ordered_index_pages: true,
+            checkpoint_metadata_from: None,
             archive: None, repair_archive: None, owner: None, closed: true, publications: BTreeMap::from([(attempt, StoragePublication { key: object.to_string(), upload_id: "upload".to_owned() })]),
         });
     }
@@ -1150,7 +1201,7 @@ mod tests {
         let region = Uuid::new_v4();
         let witness = keys.hold_local_storage_region(region).unwrap().unwrap();
         let mut record = DeploymentRecord::new("shop", "acme", vec![], 0);
-        record.storage_regions.insert(region, StorageRegion::Local { archive: None, tracks_ordered_index_pages: true });
+        record.storage_regions.insert(region, StorageRegion::Local { archive: None, tracks_ordered_index_pages: true, checkpoint_metadata_from: None });
         let record = directory.create_deployment(record).await.unwrap();
         crate::admin::begin_disposal(directory.as_ref(), &record.id).await.unwrap();
 
@@ -1167,7 +1218,8 @@ mod tests {
     #[tokio::test]
     async fn the_reaper_erases_a_pack_once_every_object_in_it_is_released() {
         let directory = tempfile::tempdir().unwrap();
-        let record = DeploymentRecord::new("shop", "acme", vec![], 0);
+        let mut record = DeploymentRecord::new("shop", "acme", vec![], 0);
+        record.checkpoint = Some(rtdb_directory::Checkpoint { block: 1, boundary: 2, source: 1, system_time: 0 });
         let root = directory.path().join(record.storage_prefix()).join("v06");
         let local: Arc<dyn ObjectStore> = Arc::new(LocalStore::open(&root).unwrap());
         let store = GarbageStore::open(crate::packing::PackingStore::open(local, crate::packing::PackDiscovery::List).await.unwrap()).await.unwrap();
@@ -1184,6 +1236,93 @@ mod tests {
         store.delete(&key("blocks/b00.binpb")).await.unwrap();
         assert_eq!(reap(&bucket, &record, Duration::ZERO, &Default::default()).await.unwrap().erased, 3);
         assert_eq!(packs(), 1, "a fully released pack is erased, and the latest block's, which names every pack, stays");
+    }
+
+    #[tokio::test]
+    async fn an_admitted_checkpoint_keeps_packed_and_loose_metadata_until_provider_reads_drain() {
+        use rtdb_directory::{Checkpoint, MemoryDirectory};
+        use rtdb_replication::BlockDiscovery;
+        use rtdb_types::BlockIndex;
+
+        let files = tempfile::tempdir().unwrap();
+        let keys = Arc::new(crate::keys::LocalKeyService::new(files.path().join("keys")).unwrap());
+        let storage = CellStorage::Local { root: files.path().join("objects") };
+        let directory = MemoryDirectory::new();
+        let io = IoRegion::new();
+        let bucket = storage.bucket(IoRegion::new()).await.unwrap();
+        let checkpoint = |block| Checkpoint { block, boundary: block + 1, source: block, system_time: 0 };
+        let mut record = DeploymentRecord::new("shop", "acme", vec![], 0);
+        record.checkpoint = Some(checkpoint(0));
+        let record = directory.create_deployment(record).await.unwrap();
+        let scope = format!("{}/v06", record.storage_prefix());
+        let physical = |relative| key(&format!("{scope}/{relative}"));
+        bucket.put(&physical(ROOT_MARKER), Bytes::copy_from_slice(record.id.as_bytes())).await.unwrap();
+        let core = "blocks/b00.binpb";
+        let packed = "tables/packed/blocks/b00.binpb";
+        let loose = "tables/loose/blocks/b00.binpb";
+        let spill = "~packs/p000.pack";
+        let writer = open_deployment_store(bucket.clone(), &scope, crate::packing::PackDiscovery::List, wall_clock()).await.unwrap();
+        writer.put(&key(core), Bytes::from_static(b"root")).await.unwrap();
+        let (bytes, _) = crate::packing::encode_pack(&BTreeMap::from([(packed.to_owned(), Bytes::from_static(b"table"))]), vec![], 0);
+        bucket.put(&physical(spill), bytes).await.unwrap();
+        bucket.put(&physical(loose), Bytes::from_static(b"loose")).await.unwrap();
+        let writer = open_deployment_store(bucket.clone(), &scope, crate::packing::PackDiscovery::List, wall_clock()).await.unwrap();
+        writer.put(&key("blocks/b01.binpb"), Bytes::from_static(b"new root")).await.unwrap();
+        for name in [core, packed, loose] { writer.delete(&key(name)).await.unwrap(); }
+
+        let tasks = TaskTracker::new();
+        let storage_factory = CellStoreFactory {
+            directory: directory.clone(), keys, hosted_task: None, storage_regions: tasks.clone(),
+        };
+        let configuration = |snapshot_block| Any { type_url: String::new(), value: serde_json::to_vec(&CellStoreConfig {
+            storage: storage.clone(), prefix: record.storage_prefix(), deployment: record.id.clone(),
+            writer_epoch: None, compactor: false, snapshot_block,
+        }).unwrap() };
+        let mut opened = storage_factory.open_for_recovery(&configuration(None), &key("v06"), io.clone()).await.unwrap();
+        assert_eq!(opened.blocks, BlockDiscovery::FromPublished(BlockIndex(0)));
+        let mut current = directory.deployment(&record.id).await.unwrap().unwrap();
+        assert_eq!(current.storage_regions.values().filter_map(StorageRegion::checkpoint_metadata_from).collect::<Vec<_>>(), [0]);
+        let version = current.version;
+        current.checkpoint = Some(checkpoint(1));
+        let held = directory.replace_deployment(current, version).await.unwrap().applied().unwrap();
+        let stale = storage_factory.open_for_recovery(&configuration(Some(0)), &key("v06"), IoRegion::new()).await.err().unwrap();
+        assert_eq!(stale.code, CHECKPOINT_ADVANCED);
+        let refs = crate::reference::References::default();
+        reap_as_of(bucket.as_ref(), &held, i64::MAX, Duration::ZERO, &refs).await.unwrap();
+        assert!(bucket.head(&physical("~packs/b00.pack")).await.is_ok(), "an admitted checkpoint root must survive collection");
+        for (name, expected) in [(core, b"root".as_slice()), (packed, b"table"), (loose, b"loose")] {
+            assert_eq!(opened.store.get(&key(name)).await.unwrap().as_ref(), expected);
+        }
+
+        let hold = opened.checkpoint_metadata.take().unwrap();
+        let (started, reading) = oneshot::channel();
+        let (resume, complete) = std::sync::mpsc::channel();
+        let provider = io.clone();
+        let reader = tokio::spawn(IoRegion::retaining(hold, async move {
+            provider.run_blocking(move || { started.send(()).unwrap(); complete.recv().unwrap(); Ok(()) }).await
+        }));
+        reading.await.unwrap();
+        reader.abort();
+        assert!(reader.await.unwrap_err().is_cancelled());
+        let current = directory.deployment(&record.id).await.unwrap().unwrap();
+        assert!(current.storage_regions.values().any(|region| region.checkpoint_metadata_from() == Some(0)));
+        resume.send(()).unwrap();
+        let released = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let current = directory.deployment(&record.id).await.unwrap().unwrap();
+                if current.storage_regions.values().all(|region| region.checkpoint_metadata_from().is_none()) { break current; }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        }).await.unwrap();
+        assert_eq!(released.storage_regions.len(), 1);
+        reap_as_of(bucket.as_ref(), &released, i64::MAX, Duration::ZERO, &refs).await.unwrap();
+        for name in ["~packs/b00.pack", spill, loose] {
+            assert!(matches!(bucket.head(&physical(name)).await, Err(Error::MissingObject(_))));
+        }
+        assert!(bucket.head(&physical("~packs/b01.pack")).await.is_ok());
+        drop(opened);
+        tasks.close();
+        tasks.wait().await;
     }
 
     #[tokio::test]

@@ -681,7 +681,7 @@ pub async fn capture(
             });
         }
         record.storage_regions.insert(region, if local {
-            rtdb_directory::StorageRegion::Local { archive: Some(operation), tracks_ordered_index_pages: true }
+            rtdb_directory::StorageRegion::Local { archive: Some(operation), tracks_ordered_index_pages: true, checkpoint_metadata_from: None }
         } else {
             crate::store::remote_storage_region(Some(operation), hosted_task.clone())
         });

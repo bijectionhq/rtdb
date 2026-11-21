@@ -286,7 +286,7 @@ where
     let region = Uuid::new_v4();
     let (state, witness) = match media {
         CellStorage::Local { .. } => (
-            rtdb_directory::StorageRegion::Local { archive: capture, tracks_ordered_index_pages: true },
+            rtdb_directory::StorageRegion::Local { archive: capture, tracks_ordered_index_pages: true, checkpoint_metadata_from: None },
             keys.hold_local_storage_region(region)?,
         ),
         CellStorage::S3 { .. } => {
