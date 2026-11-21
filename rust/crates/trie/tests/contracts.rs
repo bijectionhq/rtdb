@@ -1,6 +1,6 @@
-use std::{cell::RefCell, convert::Infallible, sync::Arc};
+use std::{cell::RefCell, cmp::Reverse, convert::Infallible, sync::Arc};
 
-use rtdb_trie::{Bucketer, ColumnSummary, Comparison, EventMerge, EventRow, IidReader, MemoryHashTrie, PageSummary, Path, PersistedNode, PersistedTrie, PruningOptions, ScalarBounds, TemporalSummary, TrieConfig, select_pages};
+use rtdb_trie::{Bucketer, ColumnSummary, Comparison, EventMerge, EventRow, IidReader, MemoryHashTrie, PageSummary, Path, PersistedNode, PersistedTrie, PruningOptions, ScalarBounds, TemporalSummary, TrieConfig, TrieNode, select_pages};
 use rtdb_types::{EventHeader, EventOp, Iid, Interval, Result, TemporalBounds, Timestamp, Value};
 
 fn iid(value: u32) -> Iid {
@@ -146,6 +146,57 @@ fn batch_chunks_and_one_batch_contain_identical_rows() {
     let empty = MemoryHashTrie::new(TrieConfig::new(8, 32).unwrap());
     let chunks = empty.add_range(&iids, 0, 7).unwrap().add_range(&iids, 7, 50).unwrap().add_range(&iids, 57, 93).unwrap();
     assert_eq!(chunks.sorted_rows(&iids).unwrap(), empty.add_range(&iids, 0, 150).unwrap().sorted_rows(&iids).unwrap());
+}
+
+#[test]
+fn mixed_insertions_and_compaction_match_flat_history_for_every_iid() {
+    let iids = [
+        iid(0xc000_0000),
+        iid(0),
+        iid(0x8000_0000),
+        iid(0),
+        iid(0x4000_0000),
+        Iid([0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]),
+        iid(0x8000_0000),
+        iid(0x4000_0000),
+    ];
+    let assert_history = |trie: &MemoryHashTrie, rows: &[u32]| {
+        let mut expected = rows.to_vec();
+        expected.sort_by_key(|&row| (iids[row as usize].0, Reverse(row)));
+        assert_eq!(trie.sorted_rows(&iids[..]).unwrap(), expected);
+
+        for target in iids.into_iter().chain([iid(u32::MAX)]) {
+            let mut node = Some(trie.root().as_ref());
+            while let Some(TrieNode::Branch { path, children }) = node {
+                let depth = path.len();
+                let bucket = (target.0[depth / 4] >> (6 - 2 * (depth % 4))) & 3;
+                node = children[usize::from(bucket)].as_deref();
+            }
+            let matching = |&row: &u32| iids[row as usize] == target;
+            let actual: Vec<_> = match node {
+                Some(TrieNode::Leaf(leaf)) => leaf.sorted_rows(&iids[..]).unwrap()
+                    .iter().copied().filter(matching).collect(),
+                None => Vec::new(),
+                Some(TrieNode::Branch { .. }) => unreachable!(),
+            };
+            assert_eq!(actual, expected.iter().copied().filter(matching).collect::<Vec<_>>());
+        }
+    };
+
+    for (log_limit, page_limit) in [(1, 1), (2, 1), (3, 2), (5, 8), (64, 1024)] {
+        let empty = MemoryHashTrie::new(TrieConfig::new(log_limit, page_limit).unwrap());
+        let prefix = empty.add(&iids[..], 0).unwrap().add_range(&iids[..], 1, 4).unwrap();
+        let mixed = prefix.add_all(&iids[..], &[7, 2, 5, 2, 6]).unwrap();
+        let history = [0, 1, 2, 3, 4, 7, 2, 5, 2, 6];
+        let single = history.iter().fold(empty, |trie, &row| trie.add(&iids[..], row).unwrap());
+
+        assert_history(&prefix, &history[..5]);
+        assert_history(&mixed, &history);
+        assert_history(&single, &history);
+        assert_history(&mixed.compact_logs(&iids[..]).unwrap(), &history);
+        let restored = MemoryHashTrie::from_persisted(mixed.persisted(&iids[..]).unwrap(), &iids[..]).unwrap();
+        assert_history(&restored, &history);
+    }
 }
 
 #[test]

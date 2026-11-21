@@ -124,6 +124,20 @@ cargo build --locked --manifest-path rust/Cargo.toml -p rtdb-server --features k
 RTDB_CLASSIC_BIN="$PWD/rust/target/debug/rtdb" bash verification/classic-kafka-s3.sh
 ```
 
+### Memory trie lookup and coverage
+
+Lean checks that every split and finite sequence of modeled insertions preserves all row occurrences and that a routed lookup agrees with filtering the original insertion history by IID.
+Regrouping the same history into different batches preserves both observations for any split policies, including policies that produce different tree shapes.
+The model assumes a stable IID reader and the same deterministic bucket function for routing and lookup.
+Lean 4.35.0 checked five exported theorems using only `propext` and `Quot.sound`.
+The runner rejected controls that drop the maximum-depth leaf and look in the wrong child. [Lean model](../../verification/lean/MemoryTrie.lean)
+
+The Rust test compares public trie insertion, leaf traversal, compaction, and persisted restore with a flat sort-and-filter oracle.
+It covers five configurations, all four top-level buckets, a maximum-depth collision, repeated admitted row indices, an absent IID, and an earlier retained trie.
+The native trie suite passed 20 tests with `cargo test --manifest-path rust/Cargo.toml --locked -p rtdb-trie`. [Rust contract test](../../rust/crates/trie/tests/contracts.rs)
+
+Remaining work includes a machine-checked refinement of the Rust and JVM implementations, including leaf sorting, pending logs, traversal order, and the production lookup and row-reader call paths.
+
 ## Multi evidence
 
 The multi models describe the separate `e86af7f12` branch baseline and its directory, Logkeeper, and object-store assumptions.
