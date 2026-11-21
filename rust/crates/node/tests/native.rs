@@ -3341,6 +3341,55 @@ async fn ordered_index_limits_distinct_visible_keys_in_both_directions() {
 }
 
 #[tokio::test]
+async fn ordered_distinct_compound_prefix_pages_without_table_payloads() {
+    let observer = Arc::new(OrderedIndexReads::default());
+    let mut services = services();
+    services.scan_accelerators.push(observer.clone());
+    let mut config = options();
+    config.automatic_artefacts = false;
+    let (node, driver) = running(config, services).await;
+    let mut session = node.session("xtdb", Arc::new(Authority)).unwrap();
+    let database = node.catalog().database("xtdb").unwrap();
+    index_sql(
+        &mut session,
+        "CREATE INDEX history_order ON orders (world, tick, document, audience)",
+    ).await;
+    index_sql(&mut session, "INSERT INTO orders RECORDS
+        {_id: 1, world: 1, tick: 10, document: 'a', audience: 'hidden'},
+        {_id: 2, world: 1, tick: 10, document: 'b', audience: 'public'},
+        {_id: 3, world: 1, tick: 10, document: 'b', audience: 'public'},
+        {_id: 4, world: 1, tick: 10, document: 'c', audience: 'public'},
+        {_id: 5, world: 1, tick: 11, document: 'b', audience: 'public'},
+        {_id: 6, world: 1, tick: 11, document: NULL, audience: 'public'},
+        {_id: 7, world: 2, tick: 10, document: 'a', audience: 'public'}").await;
+    index_flush(&node, &database).await;
+    database.build_artefacts().await.unwrap();
+
+    let table = TableRef::new("public", "orders");
+    let snapshot = database.snapshot();
+    let entry = snapshot.table_entry(&table).unwrap();
+    let trie = rtdb_format::keys::TrieKey::l0(snapshot.trie_catalog().l0_max_block_index(&table)).unwrap();
+    let primary = rtdb_storage::ObjectKey::new(entry.slug.data_key(&trie)).unwrap();
+    database.object_store().delete(&primary).await.unwrap();
+    database.storage().invalidate(&primary).await.unwrap();
+
+    let query = "SELECT DISTINCT tick, document FROM orders WHERE world = 1
+        AND document IS NOT NULL AND audience = 'public'
+        AND (tick > 10 OR (tick = 10 AND document >= 'b'))
+        ORDER BY tick, document LIMIT 2";
+    let pair = |tick, id: &str| vec![Value::I64(tick), Value::Utf8(id.into())];
+    assert_eq!(rows(session.query_sql(query, vec![]).await.unwrap()).await,
+        [pair(10, "b"), pair(10, "c")]);
+    let reverse = "SELECT DISTINCT tick, document FROM orders WHERE world = 1
+        AND document IS NOT NULL AND audience = 'public'
+        ORDER BY tick DESC, document DESC LIMIT 1 OFFSET 1";
+    assert_eq!(rows(session.query_sql(reverse, vec![]).await.unwrap()).await,
+        [pair(10, "c")]);
+    assert!(observer.take().is_empty(), "compound pages were served from index postings");
+    stop(&node, driver).await;
+}
+
+#[tokio::test]
 async fn a_covered_ordered_scan_yields_a_batch_before_opening_later_leaves() {
     let observer = Arc::new(OrderedIndexReads::default());
     let mut services = services();

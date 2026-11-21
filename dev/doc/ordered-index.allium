@@ -37,7 +37,8 @@ entity Checkpoint {
 -- A contiguous forward run of plain text or binary cells may share its selected value bytes.
 -- Hosted shared buffers retain the page permit through synchronous wire encoding and drop before transport waits.
 -- Hosted APIs returning Arrow arrays to callers use independent result buffers.
--- An ordered distinct page filters eligible rows before counting each distinct key once.
+-- An ordered distinct page filters eligible rows before counting each distinct sort prefix once.
+-- All participating equality classes must be adjacent in the index order.
 -- On the ordinary fallback plan, an input-opening error takes precedence over an OFFSET or FETCH error.
 -- After the input opens, OFFSET is checked before FETCH.
 -- An erasure removes the IID's old membership from every affected root and makes unreachable pages collectible.

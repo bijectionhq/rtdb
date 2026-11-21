@@ -17,7 +17,7 @@ use async_trait::async_trait;
 use rtdb_columnar::{
     BatchBuilder, MemoryReservation, OwnedBatch, retain_buffer_with_owner, to_field,
 };
-use rtdb_plan::{BinaryOp, ColumnId, Expr, Field};
+use rtdb_plan::{BinaryOp, ColumnId, Expr, Field, UnaryOp};
 use rtdb_query::{OrderedBatches, OrderedCandidates, OrderedScan, ScanAccelerator, ScanRequest};
 use rtdb_types::{AnomalyCategory, Iid, LogicalType, Result, ScalarType, TimeUnit};
 use std::sync::Arc;
@@ -124,14 +124,14 @@ async fn seek(
             .collect();
         let range = Range::bind(request, &fields).await?;
         let top = if let Some(window) = &window {
-            let Some((reverse, distinct_slot)) = order(request, &fields, &range) else {
+            let Some((reverse, distinct)) = order(request, &fields, &range) else {
                 continue;
             };
             Some(Top {
                 limit: window.end,
                 offset: window.start,
                 reverse,
-                distinct_slot,
+                distinct,
             })
         } else {
             if range.is_open() {
@@ -437,14 +437,20 @@ struct Top {
     limit: usize,
     offset: usize,
     reverse: bool,
-    distinct_slot: Option<usize>,
+    distinct: Option<DistinctPrefix>,
+}
+
+#[derive(Clone, Copy)]
+struct DistinctPrefix {
+    start: usize,
+    end: usize,
 }
 
 fn order(
     request: &ScanRequest<'_>,
     fields: &[Option<&Field>],
     range: &Range,
-) -> Option<(bool, Option<usize>)> {
+) -> Option<(bool, Option<DistinctPrefix>)> {
     let plan = request.scan.ordered_top_k.as_ref()?;
     let order = &plan.order;
     let equal = &fields[..range.prefix.len()];
@@ -452,10 +458,12 @@ fn order(
         !matches!(&sort.expr, Expr::Column { id, .. } if equal.iter().flatten().any(|field| field.id == *id))
     }).peekable();
     let reverse = suffix.peek()?.descending;
-    for (position, sort) in suffix.enumerate() {
-        let field = fields.get(range.prefix.len() + position)?.as_ref()?;
+    let start = range.prefix.len();
+    let mut end = start;
+    for sort in suffix {
+        let field = fields.get(end)?.as_ref()?;
+        let family = family(&field.data_type)?;
         if !matches!(&sort.expr, Expr::Column { id, .. } if *id == field.id)
-            || family(&field.data_type).is_none()
             || field.data_type.legs().into_iter().any(|leg| {
                 matches!(
                     leg,
@@ -466,32 +474,29 @@ fn order(
             })
             || sort.descending != reverse
             || (sort.nulls_first != reverse && field.data_type.nullable() && field.name != "_id")
+            // SQL DISTINCT coalesces signed zeros, which can fall into
+            // different compound sort bands. Only adjacent equivalence
+            // classes may be collapsed by a prefix seek.
+            || (plan.distinct && family == Family::Float)
         {
             return None;
         }
+        end += 1;
     }
-    let distinct_slot = if plan.distinct {
-        let [sort] = order.as_slice() else {
-            return None;
-        };
-        let slot = range.prefix.len();
-        let field = fields.get(slot)?.as_ref()?;
-        if family(&field.data_type) != Some(Family::Text)
-            || !matches!(&sort.expr, Expr::Column { id, .. } if *id == field.id)
-        {
-            return None;
-        }
-        Some(slot)
-    } else {
-        None
-    };
-    Some((reverse, distinct_slot))
+    Some((
+        reverse,
+        plan.distinct.then_some(DistinctPrefix { start, end }),
+    ))
 }
 
 #[derive(Debug)]
 enum Predicate {
     All(Box<Self>, Box<Self>),
     Either(Box<Self>, Box<Self>),
+    Null {
+        slot: usize,
+        expected: bool,
+    },
     Compare {
         slot: usize,
         op: BinaryOp,
@@ -506,6 +511,20 @@ impl Predicate {
         expression: &'a Expr,
     ) -> futures::future::BoxFuture<'a, Result<Option<Self>>> {
         Box::pin(async move {
+            if let Expr::Unary {
+                op: op @ (UnaryOp::IsNull | UnaryOp::IsNotNull),
+                expr,
+            } = expression
+                && let Expr::Column { id, .. } = expr.as_ref()
+            {
+                return Ok(fields
+                    .iter()
+                    .position(|field| field.is_some_and(|field| field.id == *id))
+                    .map(|slot| Self::Null {
+                        slot,
+                        expected: *op == UnaryOp::IsNull,
+                    }));
+            }
             let Expr::Binary { op, left, right } = expression else {
                 return Ok(None);
             };
@@ -559,6 +578,7 @@ impl Predicate {
         match self {
             Self::All(left, right) => left.matches(tuple) && right.matches(tuple),
             Self::Either(left, right) => left.matches(tuple) || right.matches(tuple),
+            Self::Null { slot, expected } => (tuple.cell(*slot) == AtomRef::Null) == *expected,
             Self::Compare { slot, op, value } => {
                 let cell = tuple.cell(*slot);
                 let value = value.borrowed();
@@ -608,8 +628,8 @@ async fn use_index(
             }
         }
     }
-    let distinct_slot = top.and_then(|top| top.distinct_slot);
-    if distinct_slot.is_some() && !covered {
+    let distinct = top.and_then(|top| top.distinct);
+    if distinct.is_some() && !covered {
         return Ok(None);
     }
     let projection = if top.is_some() && covered {
@@ -617,6 +637,9 @@ async fn use_index(
     } else {
         None
     };
+    if distinct.is_some() && projection.is_none() {
+        return Ok(None);
+    }
     if top.is_some_and(|top| top.offset >= top.limit) {
         return Ok(Some(if projection.is_some() {
             OrderedScan::Covered(Box::new(CoveredSeek::empty()))
@@ -681,7 +704,7 @@ async fn use_index(
     let postings = MatchingPostings {
         scan,
         predicates,
-        distinct_slot,
+        distinct,
         last: None,
     };
     if let (Some(projection), Some(top)) = (projection, top) {
@@ -707,7 +730,7 @@ async fn use_index(
 struct MatchingPostings {
     scan: PostingScan,
     predicates: Vec<Predicate>,
-    distinct_slot: Option<usize>,
+    distinct: Option<DistinctPrefix>,
     last: Option<Head>,
 }
 
@@ -721,12 +744,12 @@ impl MatchingPostings {
             {
                 continue;
             }
-            if let Some(slot) = self.distinct_slot {
-                if self
-                    .last
-                    .as_ref()
-                    .is_some_and(|last| last.tuple().cell(slot) == head.tuple().cell(slot))
-                {
+            if let Some(prefix) = self.distinct {
+                let tuple = head.tuple();
+                if self.last.as_ref().is_some_and(|last| {
+                    let previous = last.tuple();
+                    (prefix.start..prefix.end).all(|slot| previous.cell(slot) == tuple.cell(slot))
+                }) {
                     continue;
                 }
                 self.last = Some(head.clone());

@@ -152,8 +152,10 @@ fn push_top_k(relation: &Arc<Relation>, order: &[rtdb_plan::SortExpr], limit: &E
             RelationNode::Filter { input, predicate: predicate.clone() }
         }
         RelationNode::Distinct { input } if !distinct => {
-            let ([field], [sort]) = (relation.schema().fields(), order) else { return Ok(None) };
-            if !matches!(&sort.expr, Expr::Column { id, .. } if *id == field.id) {
+            let fields = relation.schema().fields();
+            if fields.len() != order.len() || fields.iter().any(|field| {
+                !order.iter().any(|sort| matches!(&sort.expr, Expr::Column { id, .. } if *id == field.id))
+            }) {
                 return Ok(None);
             }
             let Some(input) = push_top_k(input, order, limit, residuals, true)? else { return Ok(None) };
@@ -185,6 +187,9 @@ fn push_top_k(relation: &Arc<Relation>, order: &[rtdb_plan::SortExpr], limit: &E
 }
 
 fn ordered_index_filter(expression: &Expr) -> bool {
+    if let Expr::Unary { op: rtdb_plan::UnaryOp::IsNull | rtdb_plan::UnaryOp::IsNotNull, expr } = expression {
+        return matches!(expr.as_ref(), Expr::Column { .. });
+    }
     let Expr::Binary { op, left, right } = expression else { return false; };
     if matches!(op, BinaryOp::And | BinaryOp::Or) {
         return ordered_index_filter(left) && ordered_index_filter(right);
