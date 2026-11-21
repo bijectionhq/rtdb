@@ -24,6 +24,26 @@ async fn remote_namespaces_share_a_provider_without_aliasing() {
 }
 
 #[tokio::test]
+async fn an_encoded_namespace_lists_its_own_keys() {
+    let provider = Arc::new(object_store::memory::InMemory::new());
+    let inside = RemoteStore::new(provider.clone(), Some(ObjectKey::new("cell 1/~org/%data").unwrap()));
+    let neighbor = RemoteStore::new(provider, Some(ObjectKey::new("cell 1/~org/%data-2").unwrap()));
+    let key = ObjectKey::new("tries/~packs/block #1").unwrap();
+    inside.put(&key, Bytes::from_static(b"inside")).await.unwrap();
+    neighbor.put(&key, Bytes::from_static(b"neighbor")).await.unwrap();
+
+    let root = inside.list(None).await.unwrap();
+    let subtree = inside.list(Some(&ObjectKey::new("tries").unwrap())).await.unwrap();
+    assert_eq!(root.len(), 1);
+    assert_eq!(root[0].key, key);
+    assert_eq!(subtree, root);
+    assert_eq!(inside.get(&root[0].key).await.unwrap(), Bytes::from_static(b"inside"));
+    inside.delete(&root[0].key).await.unwrap();
+    assert!(inside.list(None).await.unwrap().is_empty());
+    assert_eq!(neighbor.get(&key).await.unwrap(), Bytes::from_static(b"neighbor"));
+}
+
+#[tokio::test]
 async fn a_provider_object_at_the_namespace_root_is_not_a_relative_object() {
     let provider = Arc::new(object_store::memory::InMemory::new());
     let root = RemoteStore::new(provider.clone(), None);
