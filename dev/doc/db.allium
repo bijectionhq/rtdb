@@ -883,6 +883,7 @@ rule LeaderProcessesTx {
         -- The marker expires at the later of the permit cutoff and one hour after the admission sample.
         -- Private replay markers can be created by the resolver only and are protected from application writes and erases.
         -- A duplicate records the original transaction key in its durable outcome and skips the user operations.
+        -- A caller error while looking up a private marker records a durable abort for that attempt and skips its user operations.
         let resolved = ResolveTx(tx_resolver, msg)
         AppendTx(resolved, src_msg_id: msg.msg_id)
 }
