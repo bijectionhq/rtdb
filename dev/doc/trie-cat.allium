@@ -323,15 +323,18 @@ rule supersede_by_block_index {
 
 rule completed_part_group {
     -- True when all branch_factor siblings at (level, recency, parent_part ++ [0..3])
-    -- have max_block_index >= the new trie's block_index.
-    -- See: trie_catalog.clj (completed-part-group?, sibling-tries)
+    -- hold a nascent or live result of the new trie's exact block_index.
+    -- High-water marks belong to stale-notice admission. A later partial group
+    -- leaves the parent in service until a complete group can replace it.
     when: completed_part_group(trie) -> Boolean
 
     let parent_part = trie.part.pop
     ensures:
         for p in 0..(config.branch_factor - 1):
             let sibling_shard = trie_catalog.tries[trie.table][(trie.level, trie.recency, parent_part ++ [p])]
-            sibling_shard.max_block_index >= trie.block_index
+            some sibling in sibling_shard.tries where
+                sibling.block_index = trie.block_index
+                and (sibling.state = :nascent or sibling.state = :live)
 }
 
 rule mark_part_group_live {
