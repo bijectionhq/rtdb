@@ -47,15 +47,22 @@ pub fn watch_deployment(directory: Arc<dyn Directory>, id: String, interval: Dur
 }
 
 async fn poll_shared(directory: Arc<dyn Directory>, id: String, period: Duration, watcher: Arc<DeploymentWatch>) {
+    let feed = directory.change_feed();
     let mut ticker = ticker(period.saturating_mul(SAFETY_NET_FACTOR));
     loop {
         let record = tokio::select! {
             _ = watcher.sender.closed() => {
-                if directory.change_feed().is_none_or(|feed| feed.remove_watch_if_idle(&id, period, &watcher)) { return; }
+                if feed.is_none_or(|feed| {
+                    feed.discard_unused_history();
+                    feed.remove_watch_if_idle(&id, period, &watcher)
+                }) { return; }
                 None
             }
             record = watcher.next() => Some(record),
-            _ = ticker.tick() => directory.deployment(&id).await.ok().flatten(),
+            _ = ticker.tick() => {
+                if let Some(feed) = feed { feed.discard_unused_history(); }
+                directory.deployment(&id).await.ok().flatten()
+            },
         };
         if let Some(record) = record { publish_newer(&watcher.sender, record); }
     }

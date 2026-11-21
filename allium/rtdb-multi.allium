@@ -359,6 +359,7 @@ contract Directory {
     @invariant WatchesMayLagButNeverRewind
         -- A watcher receives each record's changes in epoch order, possibly late, and discards any change older than the one it holds.
         -- Sessions in one process that follow the same deployment share the feed and safety-net polls.
+        -- A process consuming only keyed watches retains watch state for the deployments it follows.
         -- A watch observation earlier than a confirmed route or holder epoch keeps that route or holding valid.
         --   A late change costs a redirect, never a wrong answer, because no watcher authorises anything by what it has seen.
 
@@ -1826,6 +1827,7 @@ rule BoundTailMemory {
 invariant CostFollowsActivity {
     -- A parked deployment holds no memory on any member, no log-server state, no timer, no task and no connection.
     -- Its cost is its directory record and its objects.
+    -- A node releases the holding's trim watermark with the holding and the operation lock with its last user.
     for record in DeploymentRecords:
         record.is_parked implies
             (not exists h in Holdings: h.deployment = record and h.state != deposed)

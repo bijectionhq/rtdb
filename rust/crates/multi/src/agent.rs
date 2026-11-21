@@ -57,7 +57,47 @@ pub const SNAPSHOT_LIFETIME: Duration = Duration::from_secs(30 * 60);
 
 const CONFIRM_WITHIN: Duration = Duration::from_secs(2);
 
-struct LocalHolding { id: String, epoch: u64, last_touch: Instant, linearizable: bool }
+struct LocalHolding {
+    id: String,
+    epoch: u64,
+    last_touch: Instant,
+    linearizable: bool,
+    trimmed_through: Option<i64>,
+}
+
+type Turns = Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>;
+
+struct DeploymentTurn<'a> {
+    turns: &'a Turns,
+    name: &'a str,
+    gate: Option<Arc<tokio::sync::Mutex<()>>>,
+}
+
+impl<'a> DeploymentTurn<'a> {
+    fn new(turns: &'a Turns, name: &'a str) -> Self {
+        let mut entries = turns.lock();
+        let gate = match entries.get(name) {
+            Some(gate) => gate.clone(),
+            None => entries.entry(name.to_owned()).or_default().clone(),
+        };
+        Self { turns, name, gate: Some(gate) }
+    }
+
+    async fn lock(&self) -> tokio::sync::MutexGuard<'_, ()> {
+        self.gate.as_ref().expect("the turn still holds its gate").lock().await
+    }
+}
+
+impl Drop for DeploymentTurn<'_> {
+    fn drop(&mut self) {
+        let mut turns = self.turns.lock();
+        // Drop this reference under the registry lock so simultaneous departures can see the last one.
+        drop(self.gate.take());
+        if turns.get(self.name).is_some_and(|gate| Arc::strong_count(gate) == 1) {
+            turns.remove(self.name);
+        }
+    }
+}
 /// `fragments` keeps a replica open for the fragments other nodes send it, whatever the deployment's read width.
 struct LocalSubscription { id: String, last_touch: Instant, opened: Instant, role: Role, fragments: bool }
 
@@ -74,17 +114,15 @@ pub struct NodeAgent {
     secret: Option<Arc<crate::capability::CellSecret>>,
     writers: crate::logs::Writers,
     subscriptions: Mutex<BTreeMap<String, LocalSubscription>>,
-    /// The lsn each deployment's stream was last trimmed through by this node.
-    trimmed: Mutex<HashMap<String, i64>>,
     /// One activation, subscription or park at a time per deployment name.
-    turns: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+    turns: Turns,
     /// How many fragments this node has read for other nodes' scans, by deployment, table and prefix.
     fragments_read: Mutex<BTreeMap<(String, String, String), u64>>,
 }
 
 impl NodeAgent {
     pub fn new(directory: Arc<dyn Directory>, node: Node, lease: Arc<MemberLease>, address: String, options: AgentOptions, writers: crate::logs::Writers, secret: Option<Arc<crate::capability::CellSecret>>) -> Arc<Self> {
-        Arc::new(Self { directory, node, lease, address, options, secret, warming: Mutex::new(BTreeSet::new()), holdings: Mutex::new(BTreeMap::new()), writers, trimmed: Mutex::new(HashMap::new()), subscriptions: Mutex::new(BTreeMap::new()), turns: Mutex::new(HashMap::new()), fragments_read: Mutex::new(BTreeMap::new()) })
+        Arc::new(Self { directory, node, lease, address, options, secret, warming: Mutex::new(BTreeSet::new()), holdings: Mutex::new(BTreeMap::new()), writers, subscriptions: Mutex::new(BTreeMap::new()), turns: Mutex::new(HashMap::new()), fragments_read: Mutex::new(BTreeMap::new()) })
     }
 
     pub fn member(&self) -> MemberId { self.lease.id() }
@@ -95,8 +133,8 @@ impl NodeAgent {
     /// The fragments this node has read for other nodes, as (deployment, `schema.table`, prefix) with how often.
     pub fn fragments_read(&self) -> BTreeMap<(String, String, String), u64> { self.fragments_read.lock().clone() }
 
-    fn turn(&self, name: &str) -> Arc<tokio::sync::Mutex<()>> {
-        Arc::clone(self.turns.lock().entry(name.to_owned()).or_default())
+    fn turn<'a>(&'a self, name: &'a str) -> DeploymentTurn<'a> {
+        DeploymentTurn::new(&self.turns, name)
     }
 
     async fn members(&self) -> Result<BTreeMap<MemberId, MemberRecord>> {
@@ -156,7 +194,7 @@ impl NodeAgent {
         }.await;
         match opened {
             Ok(()) => {
-                self.holdings.lock().insert(record.name.clone(), LocalHolding { id: record.id.clone(), epoch: record.epoch, last_touch: Instant::now(), linearizable: record.linearizable_reads });
+                self.holdings.lock().insert(record.name.clone(), LocalHolding { id: record.id.clone(), epoch: record.epoch, last_touch: Instant::now(), linearizable: record.linearizable_reads, trimmed_through: None });
                 Ok(Response::Held { epoch: record.epoch, address: self.address.clone() })
             }
             Err(error) => {
@@ -428,11 +466,19 @@ impl NodeAgent {
             if !matches!(self.directory.replace_deployment(next, record.version).await, Ok(Cas::Applied(_))) { return; }
         }
 
-        if boundary == 0 || self.trimmed.lock().get(id).is_some_and(|trimmed| *trimmed >= boundary - 1) { return; }
+        if boundary == 0 || !self.holdings.lock().get(name).is_some_and(|holding| {
+            holding.id == id && holding.epoch == epoch && holding.trimmed_through.is_none_or(|trimmed| trimmed < boundary - 1)
+        }) {
+            return;
+        }
         let Ok(members) = self.members().await else { return };
         let Ok(servers) = ensemble_servers(&record, &members) else { return };
         let stream = rtdb_logkeeper::StreamConfig { write_quorum: crate::deployment::write_quorum(servers.len()), servers, stream: record.stream("replica"), maximum_message_bytes: 4 << 20 };
-        if rtdb_logkeeper::trim(&stream, rtdb_storage::log::LogOffset(boundary - 1)).await.is_ok() { self.trimmed.lock().insert(id.to_owned(), boundary - 1); }
+        if rtdb_logkeeper::trim(&stream, rtdb_storage::log::LogOffset(boundary - 1)).await.is_ok()
+            && let Some(holding) = self.holdings.lock().get_mut(name).filter(|holding| holding.id == id && holding.epoch == epoch)
+        {
+            holding.trimmed_through = Some(boundary - 1);
+        }
     }
 
     #[doc(hidden)]
@@ -476,7 +522,7 @@ impl NodeAgent {
             let Ok(servers) = ensemble_servers(&record, &members) else { continue };
             let configuration = database_config(&record, servers, &self.options.storage, Role::Compactor);
             if let Ok(Some(_)) = self.node.database_or_attach(name.clone(), configuration).await {
-                self.subscriptions.lock().insert(name, LocalSubscription { id: record.id, last_touch: Instant::now(), opened: Instant::now(), role: Role::Compactor, fragments: false });
+                self.subscriptions.lock().insert(name.clone(), LocalSubscription { id: record.id, last_touch: Instant::now(), opened: Instant::now(), role: Role::Compactor, fragments: false });
             }
         }
     }
@@ -570,5 +616,41 @@ impl Handler for NodeAgent {
             Request::ScanFragment { name, fragment, grant } => match self.check_node_grant(&grant, &name) { Ok(()) => self.scan_fragment(&name, &fragment).await, Err(error) => Err(error) }
         };
         result.unwrap_or_else(|error| Response::refused(&error))
+    }
+}
+
+
+#[cfg(test)]
+mod tests {
+    use super::{DeploymentTurn, Turns};
+
+    #[tokio::test]
+    async fn a_deployment_turn_survives_while_another_operation_uses_it() {
+        let turns = Turns::default();
+        let first = DeploymentTurn::new(&turns, "shop");
+        let held = first.lock().await;
+        let second = DeploymentTurn::new(&turns, "shop");
+        assert!(second.gate.as_ref().unwrap().try_lock().is_err());
+        drop(held);
+        drop(first);
+        assert_eq!(turns.lock().len(), 1);
+        drop(second.lock().await);
+        drop(second);
+        assert!(turns.lock().is_empty());
+    }
+
+    #[test]
+    fn departing_operations_reclaim_their_turn_under_contention() {
+        let turns = Turns::default();
+        for index in 0..100 {
+            let name = format!("deployment-{index}");
+            let first = DeploymentTurn::new(&turns, &name);
+            let second = DeploymentTurn::new(&turns, &name);
+            std::thread::scope(|scope| {
+                scope.spawn(move || drop(first));
+                scope.spawn(move || drop(second));
+            });
+            assert!(turns.lock().is_empty());
+        }
     }
 }

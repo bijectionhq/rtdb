@@ -1,4 +1,5 @@
-//! Measures what an open, idle deployment costs a node: run with `cargo test -p rtdb-multi --release --test footprint -- --ignored --nocapture`.
+//! Measures the footprint of an open or parked deployment.
+//! Run each measurement in a fresh process by naming its test before `-- --ignored --nocapture`.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -45,4 +46,40 @@ async fn the_resident_cost_of_an_idle_deployment() {
     println!("tasks per deployment: {:.1}", (tasks_after.saturating_sub(tasks_before)) as f64 / count as f64);
     node.kill().await.unwrap();
     for logkeeper in logkeepers { logkeeper.stop().await.unwrap(); }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore]
+async fn parked_directory_density_with_an_active_watch() {
+    use rtdb_directory::{DeploymentRecord, MemberId, watch_deployment};
+
+    let count: usize = std::env::var("RTDB_PARKED_BENCH_DEPLOYMENTS").ok().and_then(|value| value.parse().ok()).unwrap_or(100_000);
+    assert!(count > 0);
+    let directory: Arc<dyn Directory> = MemoryDirectory::new();
+    let ensemble = (0..3).map(|_| MemberId::fresh()).collect::<Vec<_>>();
+    let hot = directory.create_deployment(DeploymentRecord::new("active", "bench", ensemble.clone(), 0)).await.unwrap();
+    let mut watch = watch_deployment(directory.clone(), hot.id, Duration::from_millis(100));
+    drop(watch.wait_for(|current| current.is_some()).await.unwrap());
+    let runtime = tokio::runtime::Handle::current();
+    let rss_before = resident_bytes();
+    let tasks_before = runtime.metrics().num_alive_tasks();
+
+    let started = Instant::now();
+    for index in 0..count {
+        let record = DeploymentRecord::new(format!("parked-{index}"), "bench", ensemble.clone(), 0);
+        directory.create_deployment(record).await.unwrap();
+    }
+    let created_in = started.elapsed();
+    let rss_after = resident_bytes();
+    let tasks_after = runtime.metrics().num_alive_tasks();
+    let final_record = directory.deployment_by_name(&format!("parked-{}", count - 1)).await.unwrap().unwrap();
+    let serialized = serde_json::to_vec(&final_record).unwrap().len();
+
+    assert!(final_record.holder.is_none());
+    assert_eq!(tasks_after, tasks_before);
+    println!("parked deployments: {count}");
+    println!("directory creates per second: {:.0}", count as f64 / created_in.as_secs_f64());
+    println!("resident bytes per parked deployment: {}", rss_after.saturating_sub(rss_before) / count as u64);
+    println!("JSON bytes in the final deployment record: {serialized}");
+    println!("additional Tokio tasks: {}", tasks_after - tasks_before);
 }

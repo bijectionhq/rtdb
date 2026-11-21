@@ -39,7 +39,7 @@ Update this section as work lands.
 | 5 | the store is fenced by the holder's epoch, cannot delete (a delete is a garbage record), and the reaper erases released objects and packs after a grace period | object names do not carry the writer's epoch: put-if-absent, the fence, and sealing an object under a nonce derived from its name and contents stand in for it, so a deposed holder's late upload of a block is the same bytes as its successor's, which takes it as its own; a cell keeps its objects in a local directory or an S3 bucket (`s3://bucket/prefix`), tested against MinIO; nodes write with the cell's credentials rather than per-epoch ones scoped to their prefix |
 | 6 | a block flush writes one object, its block's pack, which holds the catalog and is the boot object; placed nodes flush within 15 minutes and on park; the directory's checkpoint names the last published block, and a cold start finds its latest block by probing forward from it, and reads that block's pack, which names every other, listing nothing | the boot object inlines the catalog and per-table block files but not the top trie levels, which are read from their own level-0 pack entries |
 | 7 | compaction workers compact the deployments that rank them first and relay the result to the holder, which publishes it; holders on such a cell run no compactor | |
-| 8 | parking after idleness, under `--max-active`, on drain, and waking on the next connection | resident-idle is not separate from active: a held idle deployment keeps its database open, which the measurement shows to be cheap |
+| 8 | parking after idleness, under `--max-active`, on drain, and waking on the next connection; operation locks are released with their last users and trim watermarks with their holdings | resident-idle is not separate from active: a held idle deployment keeps its database open, which the measurement shows to be cheap |
 | 9 | the gateway reads pgwire frames, survives a planned move or a holder's death while the session is idle, replays the startup and prepared statements, and resends a command a former holder refused as not held; once the first holder has authenticated the client, each reconnection carries a capability the gateway signs with the cell's secret, which a node accepts in place of the password for that deployment alone | the first connection's authentication is still the node's, relayed by the gateway |
 | 10 | read replicas fed by the log for read-only sessions within a deployment's read width; opt-in linearizable reads confirmed with the logkeepers before each query ; a snapshot session (`rtdb.read=snapshot`) reads the deployment as of its checkpoint on any node, the holder last, opened from object storage with frozen logs and no logkeeper, and closed before the reaper's grace runs out, serving any basis at or below the checkpoint ; a deployment whose persisted tries outgrow a node's disk cache (by default; `AgentOptions::fragments` sets the threshold and depth, and no command-line flag does yet) splits each whole-table scan into 16 trie-prefix fragments, each read at the coordinator's basis by the node that ranks first for `{storage identity}/{table}/{prefix}` among the nodes that may take placements, which opens a log-fed replica for it if it has none, and answered over the control protocol as Arrow IPC; a fragment whose reader fails or is not at the basis is read by the coordinator itself | scan fragments are split by the scan on the coordinating node, not by a cell-wide planner, and the size test is the deployment's persisted trie bytes against the node's disk-cache size rather than `PerMemberCacheShare`; a fragment carries the projection, the evaluated temporal bounds and the predicates any node evaluates alike, but not those on parameters, outer rows, the clock or chance, which the coordinator alone applies, and comes back whole in one response rather than streamed, a slice too large for one response being read by the coordinator instead; a reader at or past the coordinator's basis serves a fragment as of the basis, except that what was erased since is gone; `_id` lookups and multi-partition databases are never split |
 | 11 | the controller reaps expired members, confirms silent nodes dead by probing, and rebalances; planned moves; quarantine to the isolation pool; `status` as the autoscaling signal | autoscaling acts on the signal outside RTDB |
@@ -546,6 +546,25 @@ Running alongside every stage from stage 2 onwards, and concluding the branch:
 2. A zombie harness freezes a holder mid-upload, mid-append and mid-flush and resumes it after its successor has taken over.
 3. A hash-chain auditor verifies, offline, that every deployment's history is one chain across epochs.
 4. A staging cell holds ten million deployments (300 bytes each when parked) under Zipf activity.
+
+**Local parked-density measurement**
+
+An Apple M4 Max debug build created parked records directly in `MemoryDirectory` with three logkeeper IDs per record and one active keyed watch.
+The run includes the directory's deployment and name indexes and uses process resident-set change divided by the number of parked records.
+
+| Parked deployments | Directory inserts/s | Resident bytes per record | JSON bytes for the last record | Additional Tokio tasks |
+| ---: | ---: | ---: | ---: | ---: |
+| 100,000 | 175,214 | 1,548 | 515 | 0 |
+| 1,000,000 | 152,846 | 1,544 | 516 | 0 |
+
+```sh
+RTDB_PARKED_BENCH_DEPLOYMENTS=1000000 \
+  cargo test --manifest-path rust/Cargo.toml -p rtdb-multi --test footprint \
+  parked_directory_density -- --ignored --nocapture
+```
+
+The 516-byte JSON measurement exceeds the 300-byte record budget by itself.
+The staging run still needs the production directory, ten million records and an active Zipf workload.
 
 ## 6. Existing specs affected
 

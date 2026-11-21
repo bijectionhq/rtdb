@@ -56,7 +56,18 @@ impl ChangeFeed {
     pub fn new() -> Self { Self { sender: broadcast::channel(Self::CAPACITY).0, state: Mutex::new(FeedState::default()) } }
 
     /// Receives every record published from now on.
-    pub fn subscribe(&self) -> broadcast::Receiver<DeploymentRecord> { self.sender.subscribe() }
+    pub fn subscribe(&self) -> broadcast::Receiver<DeploymentRecord> {
+        let mut state = self.state.lock();
+        if self.sender.receiver_count() == 0 { state.published = HashMap::new(); }
+        self.sender.subscribe()
+    }
+
+    pub(crate) fn discard_unused_history(&self) {
+        let mut state = self.state.lock();
+        if self.sender.receiver_count() == 0 && !state.published.is_empty() {
+            state.published = HashMap::new();
+        }
+    }
 
     pub(crate) fn acquire_watch(&self, id: &str, interval: Duration) -> (WatchReceiver, Option<Arc<DeploymentWatch>>) {
         let mut state = self.state.lock();
@@ -83,19 +94,27 @@ impl ChangeFeed {
         true
     }
 
-    /// Publishes a record only when its version exceeds the last version offered for that deployment.
+    /// Offers a record to its keyed watches and to any consumers of the whole feed.
     pub fn publish(&self, record: DeploymentRecord) -> bool {
         let watches = {
             let mut state = self.state.lock();
-            if state.published.get(&record.id).is_some_and(|version| *version >= record.version) { return false; }
-            state.published.insert(record.id.clone(), record.version);
+            let broadcasting = self.sender.receiver_count() != 0;
+            if broadcasting {
+                if state.published.get(&record.id).is_some_and(|version| *version >= record.version) { return false; }
+                state.published.insert(record.id.clone(), record.version);
+            } else if !state.published.is_empty() {
+                state.published = HashMap::new();
+            }
+
             let watches: Vec<_> = state.watches.get(&record.id).into_iter()
                 .flat_map(|by_interval| by_interval.values().filter_map(Weak::upgrade)).collect();
-            if watches.is_empty() {
-                let _ = self.sender.send(record);
-                return true;
+            if broadcasting {
+                if watches.is_empty() {
+                    let _ = self.sender.send(record);
+                    return true;
+                }
+                let _ = self.sender.send(record.clone());
             }
-            let _ = self.sender.send(record.clone());
             watches
         };
         for watcher in watches { watcher.offer(record.clone()); }
@@ -173,6 +192,48 @@ pub(crate) mod tests {
         assert_eq!(receiver.try_recv().unwrap().version, 3);
         assert_eq!(receiver.try_recv().unwrap().version, 4);
         assert!(receiver.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn keyed_watches_leave_unwatched_deployments_out_of_the_feed_state() {
+        let feed = ChangeFeed::new();
+        let mut active = DeploymentRecord::new("shop", "acme", vec![], 0);
+        active.version = 1;
+        let (_receiver, watch) = feed.acquire_watch(&active.id, Duration::from_millis(100));
+        feed.publish(active.clone());
+
+        let broadcast = feed.subscribe();
+        let mut parked = DeploymentRecord::new("parked", "acme", vec![], 0);
+        parked.version = 1;
+        feed.publish(parked);
+        assert_eq!(feed.state.lock().published.len(), 1);
+        drop(broadcast);
+        for _ in 0..10_000 {
+            feed.publish(DeploymentRecord::new("parked", "acme", vec![], 0));
+        }
+
+        let watched = watch.unwrap().next().await;
+        assert_eq!(watched, active);
+        let state = feed.state.lock();
+        assert_eq!(state.watches.len(), 1);
+        assert!(state.published.is_empty());
+    }
+
+    #[tokio::test]
+    async fn an_active_keyed_watch_releases_broadcast_history_after_the_feed_goes_quiet() {
+        let directory = MemoryDirectory::new();
+        let active = directory.create_deployment(DeploymentRecord::new("active", "acme", vec![], 0)).await.unwrap();
+        let mut watcher = crate::watch_deployment(directory.clone(), active.id, Duration::from_millis(5));
+        drop(watcher.wait_for(|record| record.is_some()).await.unwrap());
+        let feed = directory.change_feed().unwrap();
+        let broadcast = feed.subscribe();
+        directory.create_deployment(DeploymentRecord::new("parked", "acme", vec![], 0)).await.unwrap();
+        assert_eq!(feed.state.lock().published.len(), 1);
+        drop(broadcast);
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !feed.state.lock().published.is_empty() { tokio::time::sleep(Duration::from_millis(5)).await; }
+        }).await.unwrap();
     }
 
     #[tokio::test]
