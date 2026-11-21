@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use parking_lot::Mutex;
-use rtdb_directory::{Cas, DeploymentRecord, Directory, LegacyIndexPages, Lifecycle, OrderedIndexStorage, StoragePublication, StorageRegion};
+use rtdb_directory::{Cas, DeploymentRecord, Directory, LegacyIndexPages, Lifecycle, OrderedIndexCatalog, OrderedIndexStorage, StoragePublication, StorageRegion};
 use rtdb_format::keys::ORDERED_INDEX_ROOT;
 use rtdb_storage::{
     Error, ObjectKey, ObjectStore,
@@ -72,10 +72,12 @@ impl HostedIndexPages {
         let directory = self.directory.clone();
         let deployment = self.deployment.clone();
         let owner = self.owner;
+        let store = self.store.clone();
         let scope = scope.clone();
         self.tasks.spawn(async move {
             let answer = update_installation(directory.as_ref(), &deployment, |record| {
                 require_owner(record, owner, &scope.index, None)?;
+                require_current_definition(record, &store, &scope.index)?;
                 let index = record.ordered_indexes.entry(scope.index.clone()).or_default();
                 if !index.admits(scope.generation) {
                     return Err(closed_scope());
@@ -141,6 +143,7 @@ impl IndexPageLifecycle for HostedIndexPages {
         let epoch = self.writer_epoch.ok_or_else(|| storage_error(closed_scope()))?;
         update_installation(self.directory.as_ref(), &self.deployment, |record| {
             require_owner(record, self.owner, &scope.index, Some(epoch))?;
+            require_current_definition(record, &self.store, &scope.index)?;
             let index = record.ordered_indexes.entry(scope.index.clone()).or_default();
             index.oldest_generation = index.oldest_generation.max(scope.generation);
             retire_legacy(index);
@@ -151,13 +154,25 @@ impl IndexPageLifecycle for HostedIndexPages {
 
     async fn retire_dropped(&self, active: &BTreeSet<ObjectKey>, through: i64) -> rtdb_storage::Result<()> {
         let epoch = self.writer_epoch.ok_or_else(|| storage_error(closed_scope()))?;
+        let active: BTreeSet<_> = active.iter().map(ToString::to_string).collect();
         update_installation(self.directory.as_ref(), &self.deployment, |record| {
             require_owner(record, self.owner, &self.store, Some(epoch))?;
+            let catalog = record.ordered_index_catalogs.entry(self.store.clone()).or_insert_with(|| {
+                OrderedIndexCatalog { through, active: active.clone(), prior_prefixes_discovered: false }
+            });
+            if catalog.through > through {
+                return Ok(());
+            }
+            if (catalog.through == through && catalog.active != active)
+                || active.iter().any(|index| definition_dropped(catalog, index))
+            {
+                return Err(closed_scope());
+            }
+            catalog.through = through;
+            catalog.active.clone_from(&active);
             for (index, state) in &mut record.ordered_indexes {
                 let Some(relative) = below(index, &self.store) else { continue };
-                if definition(relative).is_some_and(|version| version <= through)
-                    && !active.iter().any(|index| index.as_str() == relative)
-                {
+                if !state.dropped && definition_dropped(catalog, relative) {
                     state.dropped = true;
                     retire_legacy(state);
                 }
@@ -199,6 +214,20 @@ fn definition(relative: &str) -> Option<i64> {
         return None;
     }
     i64::from_str_radix(version, 16).ok()
+}
+
+fn definition_dropped(catalog: &OrderedIndexCatalog, relative: &str) -> bool {
+    definition(relative).is_some_and(|version| version <= catalog.through)
+        && !catalog.active.contains(relative)
+}
+
+fn require_current_definition(record: &DeploymentRecord, store: &str, index: &str) -> Result<()> {
+    if let Some(catalog) = record.ordered_index_catalogs.get(store)
+        && below(index, store).is_some_and(|relative| definition_dropped(catalog, relative))
+    {
+        return Err(closed_scope());
+    }
+    Ok(())
 }
 
 fn page_key(name: &str) -> Option<(&str, Option<u64>)> {
@@ -287,6 +316,49 @@ fn ready_generations(record: &DeploymentRecord) -> Vec<(String, Option<u64>)> {
     result
 }
 
+async fn child_directories(
+    bucket: &dyn ObjectStore, inventory: Option<&rtdb_s3::VersionedInventory>, prefix: &ObjectKey,
+) -> Result<BTreeSet<String>> {
+    if let Some(inventory) = inventory {
+        inventory.child_directories(prefix).await
+    } else {
+        Ok(bucket.list(Some(prefix)).await?.iter().filter_map(|object| {
+            below(object.key.as_str(), prefix.as_str())?.split_once('/').map(|(part, _)| part.to_owned())
+        }).collect())
+    }
+}
+
+async fn discover_dropped_definitions(
+    directory: &dyn Directory, bucket: &dyn ObjectStore, inventory: Option<&rtdb_s3::VersionedInventory>,
+    record: &DeploymentRecord, store: &str,
+) -> Result<DeploymentRecord> {
+    let root = ObjectKey::new(format!("{store}/{ORDERED_INDEX_ROOT}"))?;
+    let mut definitions = child_directories(bucket, inventory, &root).await?;
+    for (_, _, publication) in publications_under(record, &root)? {
+        if let Some((name, _)) = below(&publication.key, root.as_str()).and_then(|relative| relative.split_once('/')) {
+            definitions.insert(name.to_owned());
+        }
+    }
+    update_installation(directory, &record.id, |current| {
+        if current.storage_prefix() != record.storage_prefix() || untracked_regions_open(current) {
+            return Ok(());
+        }
+        let Some(catalog) = current.ordered_index_catalogs.get_mut(store) else { return Ok(()) };
+        if catalog.prior_prefixes_discovered {
+            return Ok(());
+        }
+        for name in &definitions {
+            if definition_dropped(catalog, &format!("{ORDERED_INDEX_ROOT}/{name}")) {
+                let state = current.ordered_indexes.entry(format!("{root}/{name}")).or_default();
+                state.dropped = true;
+                retire_legacy(state);
+            }
+        }
+        catalog.prior_prefixes_discovered = true;
+        Ok(())
+    }).await
+}
+
 pub(crate) async fn reap(
     directory: &dyn Directory, storage: &CellStorage, bucket: &dyn ObjectStore,
     record: &DeploymentRecord,
@@ -295,11 +367,16 @@ pub(crate) async fn reap(
         return Ok(());
     }
     let residence = record.storage_prefix();
-    let discovery: Vec<_> = record.ordered_indexes.iter().filter_map(|(name, index)| {
-        let before = if index.dropped { u64::MAX } else { index.oldest_generation };
-        (before > index.audited_before && below(name, &residence).is_some()).then_some((name, before))
+    let catalogs: Vec<_> = record.ordered_index_catalogs.iter().filter_map(|(name, catalog)| {
+        (!catalog.prior_prefixes_discovered && below(name, &residence).is_some()).then_some(name)
     }).collect();
-    if discovery.is_empty() && ready_generations(record).is_empty() {
+    let pending = |name: &str, index: &OrderedIndexStorage| {
+        let before = if index.dropped { u64::MAX } else { index.oldest_generation };
+        (before > index.audited_before && below(name, &residence).is_some()).then_some(before)
+    };
+    if catalogs.is_empty() && ready_generations(record).is_empty()
+        && !record.ordered_indexes.iter().any(|(name, index)| pending(name, index).is_some())
+    {
         return Ok(());
     }
     let inventory = match storage {
@@ -307,16 +384,18 @@ pub(crate) async fn reap(
         CellStorage::Local { .. } => None,
     };
     let mut refreshed = record.clone();
+    for store in catalogs {
+        refreshed = discover_dropped_definitions(
+            directory, bucket, inventory.as_ref(), &refreshed, store,
+        ).await?;
+    }
+    let discovery = refreshed.ordered_indexes.iter().filter_map(|(name, index)| {
+        pending(name, index).map(|before| (name.clone(), before))
+    }).collect::<Vec<_>>();
     for (index, before) in discovery {
         let prefix = ObjectKey::new(format!("{index}/generations"))?;
-        let mut generations = if let Some(inventory) = &inventory {
-            inventory.child_directories(&prefix).await?
-        } else {
-            bucket.list(Some(&prefix)).await?.iter().filter_map(|object| {
-                below(object.key.as_str(), prefix.as_str())?.split_once('/').map(|(part, _)| part.to_owned())
-            }).collect()
-        };
-        for (_, _, publication) in publications_under(record, &prefix)? {
+        let mut generations = child_directories(bucket, inventory.as_ref(), &prefix).await?;
+        for (_, _, publication) in publications_under(&refreshed, &prefix)? {
             if let Some((generation, _)) = below(&publication.key, prefix.as_str()).and_then(|relative| relative.split_once('/')) {
                 generations.insert(generation.to_owned());
             }
@@ -325,7 +404,7 @@ pub(crate) async fn reap(
             if current.storage_prefix() != residence || untracked_regions_open(current) {
                 return Ok(());
             }
-            let Some(state) = current.ordered_indexes.get_mut(index) else { return Ok(()) };
+            let Some(state) = current.ordered_indexes.get_mut(&index) else { return Ok(()) };
             for generation in &generations {
                 if generation.len() == 16 && let Ok(generation) = u64::from_str_radix(generation, 16)
                     && generation < before && !state.admits(generation)
@@ -373,6 +452,14 @@ pub(crate) async fn reap(
                 Some(generation) if !state.admits(generation) => { state.generations.remove(&generation); }
                 None if state.legacy_pages == LegacyIndexPages::Retiring => { state.legacy_pages = LegacyIndexPages::Removed; }
                 _ => {}
+            }
+            if state.dropped && state.audited_before == u64::MAX
+                && state.generations.is_empty() && state.legacy_pages == LegacyIndexPages::Removed
+                && current.ordered_index_catalogs.iter().any(|(store, catalog)| {
+                    below(&index, store).is_some_and(|relative| definition_dropped(catalog, relative))
+                })
+            {
+                current.ordered_indexes.remove(&index);
             }
             Ok(())
         }).await?;
@@ -486,4 +573,58 @@ mod tests {
         tasks.close();
         tokio::time::timeout(Duration::from_secs(5), tasks.wait()).await.unwrap();
     }
+    #[tokio::test]
+    async fn a_catalog_cut_reclaims_an_unregistered_dropped_definition_and_keeps_it_closed() {
+        let directory = MemoryDirectory::new();
+        let owner = Uuid::new_v4();
+        let mut record = DeploymentRecord::new("shop", "acme", Vec::new(), 0);
+        record.epoch = 1;
+        record.holder = Some(MemberId("writer".into()));
+        record.storage_regions.insert(owner, crate::store::remote_storage_region(None, None));
+        let record = directory.create_deployment(record).await.unwrap();
+        let store = format!("{}/v06", record.storage_prefix());
+        let tasks = TaskTracker::new();
+        let indexes = HostedIndexPages::new(
+            directory.clone(), record.id.clone(), store.clone(), owner, Some(1), tasks.clone(),
+        );
+        let dropped = ObjectKey::new(format!("{ORDERED_INDEX_ROOT}/0000000000000001-{}", "a".repeat(64))).unwrap();
+        let active = ObjectKey::new(format!("{ORDERED_INDEX_ROOT}/0000000000000003-{}", "b".repeat(64))).unwrap();
+        let legacy = ObjectKey::new(format!("{store}/{dropped}/pages/erased")).unwrap();
+        let scoped = ObjectKey::new(format!("{store}/{dropped}/generations/0000000000000000/pages/erased")).unwrap();
+        let retained = ObjectKey::new(format!("{store}/{active}/generations/0000000000000000/pages/retained")).unwrap();
+        let bucket = MemoryStore::default();
+        let storage = CellStorage::Local { root: std::path::PathBuf::new() };
+        for key in [&legacy, &scoped, &retained] {
+            bucket.put(key, "indexed data".as_bytes().into()).await.unwrap();
+        }
+
+        indexes.retire_dropped(&BTreeSet::from([active.clone()]), 3).await.unwrap();
+        let captured = directory.deployment(&record.id).await.unwrap().unwrap();
+        assert!(captured.ordered_indexes.is_empty());
+        let stale = IndexPageScope { index: &dropped, generation: 0 };
+        assert!(indexes.retain(stale).await.is_err());
+
+        reap(directory.as_ref(), &storage, &bucket, &captured).await.unwrap();
+        for key in [&legacy, &scoped] {
+            assert!(matches!(bucket.head(key).await, Err(Error::MissingObject(_))));
+        }
+        assert!(bucket.head(&retained).await.is_ok());
+        let reaped = directory.deployment(&record.id).await.unwrap().unwrap();
+        assert!(reaped.ordered_index_catalogs[&store].prior_prefixes_discovered);
+        assert!(reaped.ordered_indexes.is_empty(), "the catalog keeps the fence after the inventory is retired");
+        assert!(indexes.retain(stale).await.is_err());
+        assert!(indexes.retire_before(stale).await.is_err());
+        assert!(indexes.retire_dropped(&BTreeSet::from([dropped.clone()]), 3).await.is_err());
+
+        // Skipping a transient definition can leave the active set unchanged.
+        // The newer cut still closes every omitted definition born by that cut.
+        indexes.retire_dropped(&BTreeSet::from([active]), 4).await.unwrap();
+        let omitted = ObjectKey::new(format!("{ORDERED_INDEX_ROOT}/0000000000000004-{}", "c".repeat(64))).unwrap();
+        assert!(indexes.retain(IndexPageScope { index: &omitted, generation: 0 }).await.is_err());
+
+        drop(indexes);
+        tasks.close();
+        tokio::time::timeout(Duration::from_secs(5), tasks.wait()).await.unwrap();
+    }
+
 }

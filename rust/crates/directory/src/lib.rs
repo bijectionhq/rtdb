@@ -153,6 +153,9 @@ pub struct DeploymentRecord {
     /// Page custody for ordered indexes, keyed by their physical index prefix.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub ordered_indexes: BTreeMap<String, OrderedIndexStorage>,
+    /// Published definition sets, keyed by their serving store prefix.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub ordered_index_catalogs: BTreeMap<String, OrderedIndexCatalog>,
     /// How many ranks of the affinity order may serve reads.
     pub read_width: u32,
     pub activation_crashes: u32,
@@ -255,6 +258,13 @@ impl StorageRegion {
             Self::Remote { tracks_ordered_index_pages, .. } => *tracks_ordered_index_pages,
         }
     }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OrderedIndexCatalog {
+    pub through: i64,
+    pub active: BTreeSet<String>,
+    pub prior_prefixes_discovered: bool,
 }
 
 /// Persistent fence and inventory of a derived index's physical generations.
@@ -452,7 +462,7 @@ impl DeploymentRecord {
     pub fn new(name: impl Into<String>, org: impl Into<String>, ensemble: Vec<MemberId>, now_ms: i64) -> Self {
         let id = uuid::Uuid::new_v4().to_string();
         Self { lineage: id.clone(), id, name: name.into(), org: org.into(), incarnation: 1, lifecycle: Lifecycle::Live, epoch: 0, holder: None,
-            ensemble, replica_journals: BTreeSet::new(), storage_regions: BTreeMap::new(), ordered_indexes: BTreeMap::new(), read_width: 1, activation_crashes: 0, created_at_ms: now_ms, move_intent: None, log_epoch: 0, parent: None, move_from: None, linearizable_reads: false, checkpoint: None, moved_at_ms: None, cell_transfer: None, disposal: None, retired_residences: BTreeMap::new(), checkpoint_recovery: None, checkpoint_stage: None, checkpoint_repair_receipts: BTreeMap::new(), checkpoint_captures: BTreeMap::new(), checkpoint_capture_retirements: BTreeMap::new(), archive_retirement: None, version: 0 }
+            ensemble, replica_journals: BTreeSet::new(), storage_regions: BTreeMap::new(), ordered_indexes: BTreeMap::new(), ordered_index_catalogs: BTreeMap::new(), read_width: 1, activation_crashes: 0, created_at_ms: now_ms, move_intent: None, log_epoch: 0, parent: None, move_from: None, linearizable_reads: false, checkpoint: None, moved_at_ms: None, cell_transfer: None, disposal: None, retired_residences: BTreeMap::new(), checkpoint_recovery: None, checkpoint_stage: None, checkpoint_repair_receipts: BTreeMap::new(), checkpoint_captures: BTreeMap::new(), checkpoint_capture_retirements: BTreeMap::new(), archive_retirement: None, version: 0 }
     }
 
     pub fn can_fork(&self) -> bool {

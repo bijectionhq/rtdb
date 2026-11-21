@@ -135,14 +135,29 @@ async fn ordered_index_erasure_retires_the_old_hosted_provider_generation() {
             }
             tokio::time::sleep(Duration::from_millis(20)).await;
         };
-        stop.cancel();
-        reaper.await.unwrap();
-
         assert!(inventory.is_empty(&original).await.unwrap());
         assert!(bucket.list(Some(&original)).await.unwrap().is_empty());
         assert!(observed.ordered_indexes[&index].generations.contains_key(&scope));
         assert_eq!(values(&client, "SELECT DISTINCT key FROM orders WHERE key >= 'a' ORDER BY key LIMIT 2").await,
                    ["kept"]);
+
+        client.simple_query("DROP INDEX order_keys").await.unwrap();
+        node.agent.flush("ordered").await.unwrap();
+        database.build_artefacts().await.unwrap();
+        loop {
+            let current = cell.directory.deployment(&deployment.id).await.unwrap().unwrap();
+            if !current.ordered_indexes.contains_key(&index) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let replacement = ObjectKey::new(format!("{index}/generations/{scope:016x}")).unwrap();
+        assert!(inventory.is_empty(&replacement).await.unwrap());
+        assert_eq!(values(&client, "SELECT DISTINCT key FROM orders WHERE key >= 'a' ORDER BY key LIMIT 2").await,
+                   ["kept"]);
+
+        stop.cancel();
+        reaper.await.unwrap();
         drop(database);
         drop(client);
         cell.stop().await;

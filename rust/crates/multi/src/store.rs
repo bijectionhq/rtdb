@@ -788,7 +788,7 @@ pub async fn run_reaper(
                 if let Ok(deployments) = directory.deployments().await {
                     if let Some(keys) = keys.as_deref() {
                         for record in &deployments {
-                            if record.ordered_indexes.is_empty()
+                            if record.ordered_indexes.is_empty() && record.ordered_index_catalogs.is_empty()
                                 && !record.storage_regions.values().any(|region| matches!(region, StorageRegion::Remote { .. }))
                             {
                                 continue;
@@ -801,7 +801,7 @@ pub async fn run_reaper(
                     }
                     for record in &deployments {
                         if !matches!(record.lifecycle, Lifecycle::Live | Lifecycle::Quarantined)
-                            || record.ordered_indexes.is_empty()
+                            || (record.ordered_indexes.is_empty() && record.ordered_index_catalogs.is_empty())
                         {
                             continue;
                         }
