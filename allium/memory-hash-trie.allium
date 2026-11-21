@@ -435,7 +435,11 @@ rule Compare {
 -- Serialization
 --
 -- When serializing to protobuf, logs are compacted first.
--- Only the sorted `data` arrays are persisted.
+-- The wire preserves each leaf's sorted row indices.
+-- The wire root carries the trie root path when it is nonempty.
+-- An absent root path decodes as the empty path.
+-- A decoded child's path is its parent's path extended by the child's bucket position.
+-- Decoding preserves each leaf's row indices in their stored order.
 -- Log entries would be lost if not compacted before serialization.
 ------------------------------------------------------------
 
@@ -445,7 +449,7 @@ rule ToProto {
     -- MUST compact logs before serialization
     -- Logs are ephemeral and not persisted
 
-    ensures: trie.compact_logs().root_node.as_proto()
+    ensures: encode_trie(trie.root_node.path, trie.compact_logs().root_node)
 }
 
 ------------------------------------------------------------

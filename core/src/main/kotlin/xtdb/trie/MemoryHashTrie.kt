@@ -1,6 +1,7 @@
 package xtdb.trie
 
 import com.carrotsearch.hppc.IntArrayList
+import com.google.protobuf.ByteString
 import org.apache.arrow.memory.util.ArrowBufPointer
 import xtdb.arrow.VectorReader
 import xtdb.trie.proto.*
@@ -243,11 +244,16 @@ class MemoryHashTrie(
         }
 
     val asProto: ByteArray
-        get() = hashTrie {
-            logLimit = this@MemoryHashTrie.logLimit
-            pageLimit = this@MemoryHashTrie.pageLimit
-            rootNode = compactLogs().rootNode.asProto()
-        }.toByteArray()
+        get() {
+            val root = compactLogs().rootNode
+            val encoded = root.asProto()
+            return hashTrie {
+                logLimit = this@MemoryHashTrie.logLimit
+                pageLimit = this@MemoryHashTrie.pageLimit
+                rootNode = if (root.path.isEmpty()) encoded
+                else encoded.toBuilder().setPath(ByteString.copyFrom(root.path)).build()
+            }.toByteArray()
+        }
 
     companion object {
         @JvmStatic
@@ -302,13 +308,17 @@ class MemoryHashTrie(
             return res.toArray()
         }
 
-        private fun HashTrieNode.decode(logLimit: Int): Node? =
+        private fun HashTrieNode.decode(logLimit: Int, path: ByteArray): Node? =
             when (nodeCase) {
-                HashTrieNode.NodeCase.BRANCH ->
-                    Branch(path.toByteArray(), branch.childrenList.map { it.decode(logLimit) })
+                HashTrieNode.NodeCase.BRANCH -> Branch(
+                    path,
+                    branch.childrenList.mapIndexed { bucket, child ->
+                        child.decode(logLimit, conjPath(path, bucket.toByte()))
+                    }
+                )
 
                 HashTrieNode.NodeCase.LEAF ->
-                    Leaf(logLimit, path.toByteArray(), leaf.dataList.toIntArray())
+                    Leaf(logLimit, path, leaf.dataList.toIntArray())
 
                 HashTrieNode.NodeCase.NODE_NOT_SET -> null
             }
@@ -316,11 +326,9 @@ class MemoryHashTrie(
         @JvmStatic
         fun fromProto(bytes: ByteArray, iidReader: VectorReader): MemoryHashTrie {
             val msg = HashTrieProto.parseFrom(bytes)
-
-            return MemoryHashTrie(
-                msg.rootNode.decode(msg.logLimit)!!,
-                iidReader, msg.logLimit, msg.pageLimit
-            )
+            val encoded = msg.rootNode
+            val root = encoded.decode(msg.logLimit, encoded.path.toByteArray())!!
+            return MemoryHashTrie(root, iidReader, msg.logLimit, msg.pageLimit)
         }
     }
 }

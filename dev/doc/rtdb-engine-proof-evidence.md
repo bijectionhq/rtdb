@@ -203,6 +203,20 @@ JVM regressions cover sibling single inserts, sibling batches below the threshol
 Run these cases with `./gradlew :xtdb-core:test --tests 'xtdb.trie.MemoryHashTrieTest'`.
 Whole-trie JVM refinement across splits and the native ownership and publication proof remain open. [Immutable trie contract](../../allium/memory-hash-trie.allium) · [Lean proof](../../verification/lean/JvmTriePendingLogs.lean) · [JVM regressions](../../core/src/test/kotlin/xtdb/trie/MemoryHashTrieTest.kt)
 
+### Protobuf trie paths and ordered IID candidates
+
+The JVM protobuf encoder previously dropped a nonempty root path and the JVM decoder assigned empty paths to that root and its descendants.
+A reproduction serialized root `[2]` with leaf `[2, 1]` containing row 7 and then read row 7 at path `[]`.
+The format carries a nonempty root path and reconstructs each child path from its bucket position, as the Rust codec does.
+The actual JVM encoder and the Rust encoder emitted identical 24-byte messages for that trie, and the Rust decoder recovered the same root, empty buckets, and row.
+A legacy message without a root path decodes as an empty-root trie.
+Recovering a nonempty root from a historical export that omitted it requires the root path from an external source.
+Lean proves that the wire round trip reconstructs every anchored path and preserves the order and multiplicity of rows selected by any IID-prefix candidate filter.
+The model starts with a well-placed four-bucket tree whose leaf rows have already been compacted and fit the wire's signed row-index field.
+Lean 4.35.0 audited six theorems and rejected mutations that omit the root or assign one child its neighbour's path.
+The JVM regressions check a rootless legacy message, a nonempty root with sparse children and equal-IID rows, actual IID-path selection, and insertion after reopening.
+Full refinement of the persistence and Arrow-backed lookup paths remains open. [Wire proof](../../verification/lean/TrieWirePaths.lean) · [JVM codec regressions](../../core/src/test/kotlin/xtdb/trie/MemoryHashTrieTest.kt)
+
 ## Multi evidence
 
 The multi models describe the separate `e86af7f12` branch baseline and its directory, Logkeeper, and object-store assumptions.
