@@ -8,9 +8,10 @@
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
+use std::time::Duration;
 
 use bytes::{BufMut, Bytes, BytesMut};
-use rtdb_directory::{DeploymentRecord, Directory};
+use rtdb_directory::{DeploymentRecord, Directory, Lifecycle};
 use rtdb_types::{Anomaly, AnomalyCategory, Result};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -19,7 +20,8 @@ use tokio::sync::{mpsc, watch};
 use tokio_util::task::AbortOnDropHandle;
 
 const MAXIMUM_FRAME_BYTES: usize = 1 << 30;
-const RECONNECT_WITHIN: std::time::Duration = std::time::Duration::from_secs(30);
+const RECONNECT_WITHIN: Duration = Duration::from_secs(30);
+const RECONNECT_RETRY_DELAY: Duration = Duration::from_millis(100);
 /// A capability serves one reconnection, so it only has to outlive the startup it is sent in.
 const CAPABILITY_TTL: std::time::Duration = std::time::Duration::from_secs(30);
 
@@ -137,7 +139,7 @@ pub struct Session {
 
 impl Session {
     pub fn new(startup: Bytes, router: Arc<dyn Router>, directory: Arc<dyn Directory>, deployment: String, grants: Option<Grants>, keyed: bool) -> Self {
-        let record = rtdb_directory::watch_deployment(directory, deployment, std::time::Duration::from_millis(100));
+        let record = rtdb_directory::watch_deployment(directory, deployment, RECONNECT_RETRY_DELAY);
         Self { startup, grants, authenticated: None, greeting: Greeting::default(), router, record, prepared: BTreeMap::new(), status: Status::Busy, pending: Vec::new(), prepared_responses: 0, answered: false, lost_unanswered: false, discarding: false, keyed, key: None, swallowing: 0 }
     }
 
@@ -145,10 +147,11 @@ impl Session {
     async fn connect(&mut self) -> Result<Backend> {
         let result = tokio::time::timeout(RECONNECT_WITHIN, async {
             loop {
+                let previous = placement(&self.record.borrow());
                 match self.connect_once().await {
                     Ok(backend) => return Ok(backend),
                     Err(error) if !matches!(error.category, AnomalyCategory::Unavailable | AnomalyCategory::Conflict) => return Err(error),
-                    Err(_) => tokio::time::sleep(std::time::Duration::from_millis(100)).await,
+                    Err(_) => wait_for_placement(&mut self.record, previous, RECONNECT_RETRY_DELAY).await,
                 }
             }
         }).await.unwrap_or_else(|_| Err(lost("timed out reconnecting to the holder")));
@@ -364,6 +367,17 @@ impl Session {
     }
 }
 
+fn placement(record: &Option<DeploymentRecord>) -> Option<(u64, Lifecycle)> {
+    record.as_ref().map(|record| (record.epoch, record.lifecycle))
+}
+
+async fn wait_for_placement(record: &mut watch::Receiver<Option<DeploymentRecord>>, before: Option<(u64, Lifecycle)>, delay: Duration) {
+    let retry_at = tokio::time::Instant::now() + delay;
+    let watch_closed = tokio::time::timeout_at(retry_at, record.wait_for(|current| placement(current) != before)).await
+        .is_ok_and(|update| update.is_err());
+    if watch_closed { tokio::time::sleep_until(retry_at).await; }
+}
+
 /// Whether an ErrorResponse is a placed node's refusal of a database it no longer holds, raised before the command ran.
 fn not_held(frame: &Frame) -> bool {
     backend_anomaly_code(frame).map_or_else(
@@ -468,6 +482,22 @@ mod tests {
     async fn pair(listener: &TcpListener) -> (TcpStream, TcpStream) {
         let near = TcpStream::connect(listener.local_addr().unwrap()).await.unwrap();
         (near, listener.accept().await.unwrap().0)
+    }
+
+    #[tokio::test]
+    async fn a_placement_change_wakes_a_reconnect_before_its_fallback_timer() {
+        let mut record = DeploymentRecord::new("shop", "acme", vec![], 0);
+        let (changes, mut watched) = watch::channel(Some(record.clone()));
+        let original = placement(&watched.borrow());
+        let retry = tokio::spawn(async move { wait_for_placement(&mut watched, original, Duration::from_secs(30)).await });
+        record.version += 1;
+        changes.send_replace(Some(record.clone()));
+        tokio::task::yield_now().await;
+        assert!(!retry.is_finished());
+
+        record.epoch += 1;
+        changes.send_replace(Some(record));
+        tokio::time::timeout(Duration::from_secs(5), retry).await.unwrap().unwrap();
     }
 
     #[tokio::test]

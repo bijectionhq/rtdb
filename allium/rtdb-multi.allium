@@ -2131,6 +2131,7 @@ surface ClientAccess {
         -- An open pgwire session renews idle protection for its current backend and stops renewing it when that connection closes.
         -- A failed startup ends the client's authentication exchange.
         -- A finite reconnect window bounds the time an established session waits for a replacement holder.
+        -- A placement notification can start the next reconnect attempt before its fallback timer elapses.
 
     @guarantee ReadYourWrites
         -- Within a session, every read sees every transaction the session was acknowledged.
