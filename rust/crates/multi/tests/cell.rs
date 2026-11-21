@@ -923,6 +923,74 @@ async fn read_only_sessions_spread_across_the_deployments_read_width() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_controller_widens_for_read_sessions_and_retires_replicas_when_they_leave() {
+    let cell = Cell::start(3, None).await;
+    let directory = cell.directory.clone();
+    let deployment = admin::create_deployment(directory.as_ref(), "shop", "acme", 3).await.unwrap();
+    let writer = cell.connect("shop").await;
+    writer.simple_query("INSERT INTO orders (_id, total) VALUES (1, 10)").await.unwrap();
+    let holder = cell.holder("shop").await.unwrap();
+    cell.node(holder).agent.flush("shop").await.unwrap();
+
+    let mut readers = Vec::new();
+    for _ in 0..2 {
+        let (reader, connection) = tokio_postgres::Config::new().host("127.0.0.1").port(cell.gateway.port())
+            .user("xtdb").password("cell-test").dbname("shop").options("-c default_transaction_read_only=on")
+            .connect(NoTls).await.unwrap();
+        tokio::spawn(connection);
+        readers.push(reader);
+    }
+    assert_eq!(directory.deployment(&deployment.id).await.unwrap().unwrap().read_width, 1);
+
+    let stop = tokio_util::sync::CancellationToken::new();
+    let options = admin::ControllerOptions {
+        interval: Duration::from_millis(50),
+        suspicion_probes: 0,
+        control: control(),
+        read_width: Some(rtdb_multi::read_width::ReadWidthOptions {
+            sessions_per_node: std::num::NonZeroU64::new(1).unwrap(),
+            max_width: std::num::NonZeroU32::new(3).unwrap(),
+        }),
+        ..Default::default()
+    };
+    let controller = admin::run_controller(directory.clone(), options, stop.clone());
+    let wait_for_width = async |width| {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                if directory.deployment(&deployment.id).await.unwrap().unwrap().read_width == width { break; }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        }).await.unwrap_or_else(|_| panic!("read width did not reach {width}"));
+    };
+    let verify = async {
+        wait_for_width(3).await;
+        for _ in 0..2 {
+            let (reader, connection) = tokio_postgres::Config::new().host("127.0.0.1").port(cell.gateway.port())
+                .user("xtdb").password("cell-test").dbname("shop").options("-c default_transaction_read_only=on")
+                .connect(NoTls).await.unwrap();
+            tokio::spawn(connection);
+            readers.push(reader);
+        }
+        for reader in &readers {
+            assert_eq!(values(reader, "SELECT total FROM orders").await, ["10"]);
+        }
+        assert!((0..3).filter(|&node| node != holder).all(|node| cell.node(node).agent.subscribed() == ["shop"]));
+
+        drop(readers);
+        wait_for_width(1).await;
+        for replica in (0..3).filter(|&node| node != holder) {
+            cell.node(replica).agent.reconcile().await;
+            assert!(cell.node(replica).agent.subscribed().is_empty());
+        }
+        assert_eq!(values(&writer, "SELECT total FROM orders").await, ["10"]);
+        stop.cancel();
+    };
+    tokio::join!(controller, verify);
+    drop(writer);
+    cell.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_read_only_session_is_served_by_a_log_fed_replica() {
     let cell = Cell::start(2, None).await;
     admin::create_deployment(cell.directory.as_ref(), "shop", "acme", 3).await.unwrap();

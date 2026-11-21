@@ -46,6 +46,7 @@ pub enum Request {
     Ping,
     FlightEndpoint,
     HoldingLoads { #[serde(default)] measure_query_cpu: bool },
+    ReadLoads,
     /// A client is using the deployment through a gateway.
     Touch { name: String },
     /// Serve the deployment's reads from a log-fed replica on this node.
@@ -77,6 +78,7 @@ pub enum Response {
     Subscribed { address: String },
     FlightEndpoint { address: String },
     HoldingLoads { holdings: Vec<crate::load::HoldingLoad> },
+    ReadLoads { loads: Vec<crate::read_width::ReadLoad> },
     Done,
     Flushed { block: i64 },
     Published { position: i64 },

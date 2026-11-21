@@ -364,7 +364,7 @@ impl Session {
                                     self.greeting.installation = uuid::Uuid::parse_str(value).ok();
                                     continue;
                                 }
-                                if matches!(name, GATEWAY_SETTINGS_PARAMETER | rtdb_pgwire::REQUIRED_INSTALLATION_PARAMETER) { continue; }
+                                if matches!(name, GATEWAY_SETTINGS_PARAMETER | rtdb_pgwire::GATEWAY_REPLICA_READ_PARAMETER | rtdb_pgwire::REQUIRED_INSTALLATION_PARAMETER) { continue; }
                             }
                             if frame.tag == b'Z' && self.expected_installation.is_some_and(|expected| self.greeting.installation != Some(expected)) {
                                 client_write.write_all(&error_frame("3D000", "The holder did not verify the requested installation").encode()).await.map_err(io)?;

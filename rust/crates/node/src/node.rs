@@ -630,6 +630,9 @@ impl NodeDriver {
 
 pub struct NativeSession { pub(crate) state: Session, pub(crate) service: Arc<NativeSessionService> }
 impl NativeSession {
+    pub fn track_replica_read_session(&self) -> Result<impl Send + use<>> {
+        Ok(self.service.database()?.track_replica_read_session())
+    }
     pub fn state(&self) -> &Session { &self.state }
     pub fn state_mut(&mut self) -> &mut Session { &mut self.state }
     pub async fn query_context(&mut self) -> Result<Arc<QueryContext>> {

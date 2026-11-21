@@ -197,12 +197,17 @@ async fn connection(client: TcpStream, directory: Arc<dyn Directory>, options: G
     }
     startup.parameters.insert(rtdb_pgwire::GATEWAY_AWAIT_TOKEN_PARAMETER.into(), "on".into());
     startup.parameters.insert(rtdb_pgwire::GATEWAY_SETTINGS_PARAMETER.into(), "on".into());
-    startup.bytes = encode_startup(&startup.parameters);
+    let snapshot = startup.snapshot();
     let read_only = startup.read_only();
+    startup.parameters.remove(rtdb_pgwire::GATEWAY_REPLICA_READ_PARAMETER);
+    if read_only && !snapshot {
+        startup.parameters.insert(rtdb_pgwire::GATEWAY_REPLICA_READ_PARAMETER.into(), "on".into());
+    }
+    startup.bytes = encode_startup(&startup.parameters);
     let mut router = GatewayRouter {
         directory: Arc::clone(&directory), name,
         deployment: expected.map(|id| id.hyphenated().to_string()),
-        read_only, snapshot: startup.snapshot(), options: options.clone(), heartbeats, connection_index,
+        read_only, snapshot, options: options.clone(), heartbeats, connection_index,
     };
     let route_initial = tokio::time::timeout_at(startup_deadline, router.route_with_record()).await;
     let (server, control, epoch, deployment) = match route_initial {

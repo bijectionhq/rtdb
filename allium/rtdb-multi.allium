@@ -323,6 +323,8 @@ config {
     -- Reads.
     subscriber_basis_wait: Duration = 20.milliseconds
     max_read_width: Integer = 8
+    read_sessions_per_node: Integer = 0
+    read_width_quiet_samples: Integer = 3
 
     -- Control.
     activations_per_node_per_second: Integer = 200
@@ -1902,20 +1904,27 @@ rule ServeSnapshot {
 }
 
 rule WidenOnPressure {
+    -- The controller counts authenticated, replica-eligible Pgwire sessions at their serving nodes.
+    -- Observed pressure can widen the route when the next affinity rank has reported.
+    -- A widening reserves one more eligible read rank and replicas open on demand.
+    -- The gateway applies the wider route to subsequent connections and reconnects.
     when: ReadOverflow(deployment)
 
-    requires: deployment.read_width < config.max_read_width
+    requires: config.read_sessions_per_node > 0
+              and deployment.read_width < config.max_read_width
 
     ensures:
         Directory.cas(deployment.id, deployment.epoch, change: { read_width: deployment.read_width + 1 })
-        Subscription.created(deployment: deployment, member: Affinity.rank(deployment, deployment.read_width + 1), applied_lsn: deployment.checkpoint.lsn)
 }
 
 rule NarrowOnQuiet {
     -- A replica outside the remaining affinity ranks retires when the node observes the narrower width.
+    -- Quiet uses half the widening capacity for each serving node.
+    -- Consecutive quiet observations of the writer pool must agree on the writer epoch and width for config.read_width_quiet_samples samples.
     when: ReadQuiet(deployment)
 
-    requires: deployment.read_width > 1
+    requires: config.read_sessions_per_node > 0
+              and deployment.read_width > 1
 
     ensures:
         Directory.cas(deployment.id, deployment.epoch, change: { read_width: deployment.read_width - 1 })
