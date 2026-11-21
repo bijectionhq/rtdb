@@ -1957,3 +1957,45 @@ Z3 excludes expiry overlapping an admitted provider operation when the margin is
 The formula allows separate monotonic clocks with different rates, requires the first observation to follow renewal start, and bounds each rate relative to physical time.
 Dropping either term yields a satisfiable overlap.
 The deployed clock-drift and provider-duration bounds, complete recovery-root manifests, the production certificate path and the collector's typestate enforcement are still open. link:../smt/residence-clock-margin.smt2[Margin constraints and controls]
+
+=== Binding hosted compaction retirement to an exact publication
+
+The Rust compactor requests a publication version for each output data and metadata file.
+The remote adapter takes a new version from the conditional write response.
+It takes the version of identical existing bytes from the same GET response that it read and compared.
+For uncertain multipart completion it accepts a version only when the read-back metadata identifies that upload attempt.
+The S3 adapter extracts the version from the multipart completion response. link:https://docs.aws.amazon.com/AmazonS3/latest/API/API_CompleteMultipartUpload.html#API_CompleteMultipartUpload_ResponseElements[S3 completion response] · link:https://docs.aws.amazon.com/AmazonS3/latest/API/API_GetObject.html#API_GetObject_ResponseElements[S3 object read response]
+
+The trie notification and checkpoint catalog carry the exact provider namespace, physical key and version for each witnessed file.
+The fields survive transition to garbage.
+A retirement intent marks an observation as a publication match only if all of that identity equals the selected catalog record.
+Files inherited or restored from another residence, packed entries, and older trie records can lack publication evidence.
+Shared artefacts still need their own publication binding and reference proof.
+The new evidence applies to GC-1 and GC-2 at the publication boundary.
+Certificate issuance, recovery and fork reachability, and version-selective physical erasure remain open.
+
+TLC exhausted 50 distinct states with three possible provider versions, one write attempt, one later replacement, and one retirement observation.
+The model reaches both a lost-reply confirmation and a retry of identical bytes with a different version.
+Four controls fail at their named invariants.
+They substitute a later HEAD result for the write acknowledgement or for the verified read, omit the attempt check, or match retirement by key.
+Apalache independently checked the baseline through six transitions and found the later-HEAD counterexample.
+The model assumes authenticated provider responses and distinct non-null version IDs at one physical key. link:../tla/PublicationVersion.tla[Model and controls]
+
+The model evidence is in `/private/tmp/rtdb-formal.QMjPSJsX/publication-version-model-ayvhb1fb/`.
+
+The scoped Rust suite on pre-rebase commit `af106a821` passed all 233 cases across storage, S3, maintenance, replication, and Multi.
+It included the publication acknowledgement, verified existing-object read, lost multipart acknowledgement, and catalog retirement fixtures.
+The JVM `:xtdb-core:testClasses` task on the same commit regenerated Protobuf sources and compiled Java and Kotlin production and test code.
+These runs are recorded in `catalog-publication-versions-af106a821-native.log` and `publication-version-jvm-schema.log` under the evidence directory's parent.
+The MinIO image could not be pulled, so the optional versioned-provider fixture did not run against a server.
+The final rebased commit `4e53c43e2` passed 237 scoped Rust cases.
+The exact-source native runner replayed both new fixtures and rejected the two controls at their expected assertions.
+Those controls substitute a later HEAD version for the version from the verified GET, or treat any observed version as equivalent to the catalog receipt.
+The final logs are `catalog-publication-versions-4e53c43e2-native.log` and `native-publication-version-4e53c43e2-q760kna8/` in the evidence directory's parent.
+The rebased JVM schema run at `92aa7a7d7` also compiled all Core Java and Kotlin sources and test classes with the new Protobuf definitions.
+The final rebase left those JVM and Protobuf inputs byte-for-byte unchanged.
+The full JVM behavior result from the preceding section remains separate.
+
+The archived naming-epoch, admission-floor and durable-intent fixtures also completed at the prior integration boundary.
+Both naming controls, both floor controls and all four durable-intent controls failed at the declared assertions.
+The archived command records are in `/private/tmp/rtdb-formal.QMjPSJsX/catalog-replay-final-9o0olj0u/`.
