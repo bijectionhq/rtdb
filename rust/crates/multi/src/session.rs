@@ -201,18 +201,36 @@ impl Session {
         let (client_read, mut client_write) = tokio::io::split(client);
         let (mut requests, client_reader) = pump(client_read);
         let mut backend = Some(Backend::new(first, first_epoch));
-        enum Event { Request(Option<std::io::Result<Frame>>), Reply(Option<std::io::Result<Frame>>) }
+        enum Event {
+            Request(Option<std::io::Result<Frame>>),
+            Reply(Option<std::io::Result<Frame>>),
+            Retired,
+        }
         let outcome = async {
             backend.as_mut().expect("just set").writer.write_all(&self.startup).await.map_err(io)?;
             loop {
                 let event = {
                     let Some(current) = backend.as_mut() else { break Ok(()) };
                     tokio::select! {
-                        request = requests.recv() => Event::Request(request),
-                        reply = current.frames.recv() => Event::Reply(reply),
+                        biased;
+                        _ = self.record.wait_for(|record| record.as_ref().is_some_and(|record| {
+                            record.lifecycle == rtdb_directory::Lifecycle::Deleting
+                                || record.lifecycle == rtdb_directory::Lifecycle::Deleted && record.moved_at_ms.is_none()
+                        })) => Event::Retired,
+                        event = async {
+                            tokio::select! {
+                                request = requests.recv() => Event::Request(request),
+                                reply = current.frames.recv() => Event::Reply(reply),
+                            }
+                        } => event,
                     }
                 };
                 match event {
+                    Event::Retired => {
+                        client_write.write_all(&error_frame("08006", "The installation has retired").encode()).await.map_err(io)?;
+                        client_write.flush().await.map_err(io)?;
+                        break Ok(());
+                    }
                     Event::Request(None) => break Ok(()),
                     Event::Request(Some(request)) => {
                         let request = request.map_err(io)?;
