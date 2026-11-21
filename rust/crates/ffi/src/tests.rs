@@ -320,7 +320,7 @@ fn adbc_unnamed_parameters_are_bound_by_ordinal_and_copied() {
     let mut array = FFI_ArrowArray::new(&StructArray::from(batch).to_data());
     let values = unsafe { arrow::import_rows(&mut array, &mut schema, &memory) }.unwrap();
     assert!(array.release.is_none()); assert!(schema.release.is_none());
-    assert_eq!(values.arguments.rows().next().unwrap(), &[rtdb_types::Value::I64(3), rtdb_types::Value::I64(7)]);
+    assert_eq!(&*values.arguments.rows().next().unwrap().unwrap(), &[rtdb_types::Value::I64(3), rtdb_types::Value::I64(7)]);
     assert_eq!(values.names, vec!["", ""]);
     drop(values); assert_eq!(memory.used_bytes(), 0);
 }
@@ -394,7 +394,7 @@ fn decimal_c_data_uses_signed_parameters_and_retains_detached_schema_children() 
             assert!(!schema.child(0).metadata().unwrap().contains_key(rtdb_columnar::INTERNAL_DECIMAL_PRECISION_KEY));
             let imported = unsafe { arrow::import_rows(&mut array, &mut schema, &memory) }.unwrap();
             assert_eq!(imported.arguments.types(), &[ty.clone()]);
-            assert_eq!(imported.arguments.rows().next().unwrap(), &[value]);
+            assert_eq!(&*imported.arguments.rows().next().unwrap().unwrap(), &[value]);
             drop(imported); assert_eq!(memory.used_bytes(), 0);
             let schema = arrow::export_schema(&Schema::new(vec![rtdb_columnar::to_field("value", &ty).unwrap()]), &memory).unwrap();
             let mut child = unsafe { std::mem::replace(&mut **schema.children, FFI_ArrowSchema::empty()) };
@@ -430,8 +430,8 @@ fn nested_decimal_c_data_restores_each_union_child_scale() {
     let imported = unsafe { arrow::import_rows(&mut array, &mut schema, &memory) }.unwrap();
     assert_eq!(imported.arguments.types(), &[ty]);
     let mut rows = imported.arguments.rows();
-    assert_eq!(rows.next().unwrap(), &[Value::Null]);
-    assert_eq!(rows.next().unwrap(), &[value]);
+    assert_eq!(&*rows.next().unwrap().unwrap(), &[Value::Null]);
+    assert_eq!(&*rows.next().unwrap().unwrap(), &[value]);
     assert!(rows.next().is_none());
     drop(rows);
     drop(imported); assert_eq!(memory.used_bytes(), 0);

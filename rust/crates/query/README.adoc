@@ -81,6 +81,12 @@ Spill files are scoped temporary resources with a retained-byte quota.
 
 * Visibility resolution merges each common trie task in IID order and descending system time, with newer segments first at equal system times.
   Emitted rows are grouped by contributing source page, with persisted pages before live pages.
+* Persisted scans open the Arrow footer and request the pages that survive pruning.
+  Compatible uncompressed columns can keep their source buffers through IPC decoding and through contiguous scan selections.
+  Compatible lists and structs stay columnar through scan projection.
+  Projected columns use Arrow nulls for pages where the field is absent when the other pages share a layout or form a scalar union.
+  A scalar dense union that matches the result layout keeps its Arrow array at the query cursor.
+  The buffer pool can retain decoded pages and parsed footers independently of the file's encoded payload.
 * The temporal resolver sees puts, deletes, and erases before a projected document reaches a value predicate.
 * Temporal file selection includes live candidates before dropping persisted files.
 * Page selection uses temporal summaries, recency ceilings, and IID ranges, with a bypass option for comparison tests.

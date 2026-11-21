@@ -15,6 +15,10 @@ impl BatchBuilder {
         Ok(Self { reservation: memory.reserve(metadata)? })
     }
 
+    pub fn reserve_scratch(&self, bytes: usize) -> Result<Arc<MemoryReservation>> {
+        self.reservation.budget().reserve(bytes)
+    }
+
     pub fn column(&mut self, temporary: usize, build: impl FnOnce() -> Result<ArrayRef>) -> Result<ArrayRef> {
         let reservation = Arc::get_mut(&mut self.reservation).expect("batch construction owns its reservation");
         let retained = reservation.bytes();
@@ -130,7 +134,7 @@ impl OwnedBatch {
     }
 }
 
-/// The bytes a batch's distinct allocations hold, counting a buffer that several arrays share once.
+/// Counts each buffer base address once, using the largest capacity reported for it.
 pub fn shared_allocation_size(batch: &RecordBatch) -> Result<usize> {
     let mut buffers = BTreeMap::new();
     let mut descriptors = std::mem::size_of::<RecordBatch>();
@@ -196,22 +200,20 @@ struct RetainedAllocation {
     _reservation: Arc<MemoryReservation>,
 }
 
-fn attach_buffer(buffer: &Buffer, reservation: &Arc<MemoryReservation>) -> Result<Buffer> {
-    let offset = buffer.ptr_offset();
-    let span = offset.checked_add(buffer.len()).ok_or_else(|| Anomaly::fault("rtdb/buffer-span-overflow", "Arrow buffer span exceeds usize"))?;
+fn attach_buffer(buffer: &Buffer, reservation: &Arc<MemoryReservation>) -> Buffer {
+    let start = std::ptr::NonNull::from(buffer.as_slice()).cast();
     let owner = Arc::new(RetainedAllocation { _buffer: buffer.clone(), _reservation: Arc::clone(reservation) });
-    // SAFETY: the owner retains the original immutable allocation; its base pointer covers this existing slice's offset and length.
-    let retained = unsafe { Buffer::from_custom_allocation(buffer.data_ptr(), span, owner) };
-    Ok(retained.slice_with_length(offset, buffer.len()))
+    // SAFETY: the owner keeps the original immutable buffer alive for this slice's address and length.
+    unsafe { Buffer::from_custom_allocation(start, buffer.len(), owner) }
 }
 
 fn attach_data(data: ArrayData, reservation: &Arc<MemoryReservation>) -> Result<ArrayData> {
-    let buffers = data.buffers().iter().map(|buffer| attach_buffer(buffer, reservation)).collect::<Result<Vec<_>>>()?;
+    let buffers = data.buffers().iter().map(|buffer| attach_buffer(buffer, reservation)).collect::<Vec<_>>();
     let children = data.child_data().iter().map(|child| attach_data(child.clone(), reservation)).collect::<Result<Vec<_>>>()?;
     let nulls = data.nulls().map(|nulls| {
-        let buffer = attach_buffer(nulls.buffer(), reservation)?;
-        Ok::<NullBuffer, Anomaly>(NullBuffer::new(BooleanBuffer::new(buffer, nulls.offset(), nulls.len())))
-    }).transpose()?;
+        let buffer = attach_buffer(nulls.buffer(), reservation);
+        NullBuffer::new(BooleanBuffer::new(buffer, nulls.offset(), nulls.len()))
+    });
     data.into_builder().buffers(buffers).child_data(children).nulls(nulls).build().map_err(super::arrow_error)
 }
 

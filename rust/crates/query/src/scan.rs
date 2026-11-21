@@ -4,22 +4,104 @@ use std::io::Cursor;
 use std::sync::Arc;
 
 use arrow_array::{Array, StructArray};
+use arrow_buffer::Buffer;
+use bytes::Bytes;
 use arrow_schema::DataType;
 use async_trait::async_trait;
 use rtdb_columnar::{MemoryBudget, MemoryReservation, OwnedBatch, estimate_builder_bytes, from_field};
-use rtdb_format::{ipc::{ArrowFile, FileLayout, inspect_file_reserved}, metadata::{MetadataFile, MetadataNode}};
+use rtdb_format::{ipc::{PageDecoder, inspect_file_reserved}, metadata::{MetadataFile, MetadataNode}};
 use rtdb_index::{CatalogTrie, IndexBatch, LiveTable, LocatedRows, RowSource, Snapshot, TrieState};
 use rtdb_plan::{Expr, Scan, Schema, TemporalFilter, UnaryOp};
-use rtdb_storage::{ObjectKey, cache::{BufferPool, Cached, View}};
+use rtdb_storage::{ObjectKey, cache::{BufferPool, CacheLease, Cached, View}};
 use rtdb_temporal::{HistoryResolver, ResolvedRow};
 use rtdb_trie::{PageSummary, PruningOptions, TemporalSummary, select_pages, select_pages_with_scratch};
 use rtdb_types::{Anomaly, EventHeader, Iid, Interval, Result, TemporalBounds, Timestamp, Value};
 
 use crate::{context::Execution, fragment::{ScanFragment, ScanFragmenter}, pages::{OwnedPage,PageBuilder,PageCursor}, scan_tasks::{PageRange,ScanTask,ScanTaskPlan}, invalid};
 
-/// A data file read whole from the buffer pool, or, where the pool no longer holds it but its layout is known, a page at a time.
-enum DataState { Unopened, Open { reader: ArrowFile, _reservation: Arc<MemoryReservation> }, Ranged { reader: ArrowFile, file: rtdb_format::ipc::SparseFile, _reservation: Arc<MemoryReservation> } }
-struct DataFile { storage: Arc<BufferPool>, key: ObjectKey, state: DataState }
+struct DataFile {
+    storage: Arc<BufferPool>,
+    key: ObjectKey,
+    opened: Option<OpenedLayout>,
+}
+
+struct OpenedLayout {
+    layout: Arc<CachedLayout>,
+    _opening: Arc<MemoryReservation>,
+    whole: Option<CacheLease>,
+}
+
+impl DataFile {
+    async fn decode_page(&mut self, page: usize, memory: &Arc<MemoryBudget>) -> Result<(arrow_array::RecordBatch, Arc<MemoryReservation>)> {
+        if self.opened.is_none() {
+            let whole = if self.storage.object_store().supports_scan_ranges(&self.key) {
+                None
+            } else {
+                Some(self.storage.get_or(&self.key, memory).await?)
+            };
+            let (layout, opening) = self.open_layout(whole.as_ref(), memory).await?;
+            self.opened = Some(OpenedLayout { layout, _opening: opening, whole });
+        }
+        let opened = self.opened.as_ref().expect("the data file is open");
+        let reader = &opened.layout.decoder;
+        let bytes = self.read_range(opened.whole.as_ref(), reader.page_range(page)?, memory).await?;
+        let mut bound = reader.page_bound(page, bytes.as_slice())?;
+        for field in reader.schema().fields() {
+            bound = bound.checked_add(estimate_builder_bytes(&from_field(field)?, &[])?)
+                .ok_or_else(|| invalid("page-size", "Arrow schema allocation bound overflow"))?;
+        }
+        let charged = memory.reserve(bound)?;
+        let batch = reader.decode_page(page, page_buffer(bytes))?;
+        Ok((batch, charged))
+    }
+
+    async fn read_range(&self, whole: Option<&CacheLease>, range: std::ops::Range<u64>, memory: &Arc<MemoryBudget>) -> Result<CacheLease> {
+        if let Some(whole) = whole {
+            let start = usize::try_from(range.start).map_err(|error| invalid("page-range", error))?;
+            let end = usize::try_from(range.end).map_err(|error| invalid("page-range", error))?;
+            return Ok(whole.slice(start..end)?);
+        }
+        Ok(self.storage.scan_range(&self.key, range, memory).await?)
+    }
+
+    async fn open_layout(&self, whole: Option<&CacheLease>, memory: &Arc<MemoryBudget>) -> Result<(Arc<CachedLayout>, Arc<MemoryReservation>)> {
+        if let Some(cached) = self.storage.view::<CachedLayout>(&self.key, View::Layout) {
+            let opening = memory.reserve(cached._reservation.bytes())?;
+            return Ok((cached, opening));
+        }
+        let size = match whole { Some(bytes) => bytes.as_slice().len() as u64, None => self.storage.scan_length(&self.key).await? };
+        let tail = size.checked_sub(10).ok_or_else(|| invalid("file-size", "Arrow file is shorter than its footer"))?;
+        let trailer = self.read_range(whole, tail..size, memory).await?;
+        let trailer = trailer.as_slice().try_into().map_err(|_| invalid("file-size", "Arrow footer trailer is truncated"))?;
+        let length = arrow_ipc::reader::read_footer_length(trailer).map_err(|error| invalid("file-size", error))?;
+        let footer = tail.checked_sub(length as u64).ok_or_else(|| invalid("file-size", "Arrow footer exceeds its file"))?;
+        let bytes = self.read_range(whole, footer..tail, memory).await?;
+        let bound = length.checked_mul(16).and_then(|bytes| bytes.checked_add(65_536))
+            .ok_or_else(|| invalid("file-layout-size", "Arrow footer allocation exceeds addressable memory"))?;
+        let opening = memory.reserve(bound)?;
+        let mut decoder = PageDecoder::from_footer(bytes.as_slice(), footer, None)?;
+        let mut dictionaries = Vec::new();
+        for index in 0..decoder.dictionary_count() {
+            let bytes = self.read_range(whole, decoder.dictionary_range(index)?, memory).await?;
+            dictionaries.push(memory.reserve(decoder.dictionary_bound(index, bytes.as_slice())?)?);
+            decoder.load_dictionary(index, page_buffer(bytes))?;
+        }
+        // Dictionary buffers are charged to this query. Cache only directories that do not retain those buffers.
+        if dictionaries.is_empty() && let Some(reservation) = self.storage.admit(bound) {
+            let layout = Arc::new(CachedLayout { decoder, _reservation: reservation, _dictionaries: dictionaries });
+            self.storage.insert_view(&self.key, View::Layout, Arc::clone(&layout));
+            return Ok((layout, opening));
+        }
+        let layout = Arc::new(CachedLayout { decoder, _reservation: Arc::clone(&opening), _dictionaries: dictionaries });
+        Ok((layout, opening))
+    }
+}
+
+fn page_buffer(bytes: CacheLease) -> Buffer {
+    // A cached page must release the rest of a whole object when the query is done reading it.
+    if bytes.is_partial_allocation() { Buffer::from(bytes.as_slice().to_vec()) }
+    else { Buffer::from(Bytes::from_owner(bytes)) }
+}
 
 #[derive(Default)]
 struct FileDescriptors {
@@ -745,7 +827,7 @@ impl PartitionScan {
             };
             files.admit(file_count, &self.execution.context.memory)?;
             let file = files.entries.len();
-            files.entries.push(DataFile { storage: Arc::clone(&self.storage), key: ObjectKey::new(slug.data_key(&trie.key))?, state: DataState::Unopened });
+            files.entries.push(DataFile { storage: Arc::clone(&self.storage), key: ObjectKey::new(slug.data_key(&trie.key))?, opened: None });
             let trie_recency = recency(trie.key.recency())?;
             let memory = &self.execution.context.memory;
             let mut pending = MetadataStack::default();
@@ -808,43 +890,8 @@ impl PartitionScan {
             }
             (PageSource::File { file, page: page_index }, None) => {
                 let data = &mut self.files.entries[*file];
-                if matches!(&data.state, DataState::Unopened) && let Some(cached) = data.storage.view::<CachedLayout>(&data.key, View::Layout) {
-                    let footer = cached.length.checked_sub(u64::try_from(cached.layout.footer_encoded_bytes).map_err(|_| invalid("file-size", "Arrow footer exceeds its file"))?)
-                        .ok_or_else(|| invalid("file-size", "Arrow footer exceeds its file"))?;
-                    let file = rtdb_format::ipc::SparseFile::new(cached.length);
-                    file.add(footer, Arc::new(data.storage.get_range_or(&data.key, footer..cached.length, &self.execution.context.memory).await?));
-                    let reservation = self.execution.context.memory.reserve(cached.layout.opening_allocation_bound()?)?;
-                    data.state = DataState::Ranged { reader: ArrowFile::from_inspected_reader(file.clone(), None, cached.layout.clone())?, file, _reservation: reservation };
-                }
-                if matches!(&data.state, DataState::Unopened) {
-                    let lease = data.storage.get_or(&data.key, &self.execution.context.memory).await?;
-                    let length = lease.as_slice().len() as u64;
-                    let mut cursor = Cursor::new(lease);
-                    let layout = inspect_file_reserved(&mut cursor, |bytes| self.execution.context.memory.reserve(bytes))?;
-                    if let Some(retained) = data.storage.admit(layout_bytes(&layout)?)
-                        && data.storage.insert_view(&data.key, View::Layout, Arc::new(CachedLayout { length, layout: layout.clone(), _reservation: retained })) {
-                        data.storage.evict(&data.key);
-                    }
-                    let reservation = self.execution.context.memory.reserve(layout.opening_allocation_bound()?)?;
-                    data.state = DataState::Open { reader: ArrowFile::from_inspected_reader(cursor, None, layout)?, _reservation: reservation };
-                }
-                let reader = match &mut data.state {
-                    DataState::Open { reader, .. } => reader,
-                    DataState::Ranged { reader, file, .. } => {
-                        let range = reader.page_range(*page_index)?;
-                        let bytes = data.storage.get_range_or(&data.key, range.clone(), &self.execution.context.memory).await?;
-                        file.retain_from(0);
-                        file.add(range.start, Arc::new(bytes));
-                        reader
-                    }
-                    DataState::Unopened => return Err(invalid("file-state", "Data file failed to open")),
-                };
-                let mut bound = reader.page_allocation_bound(*page_index)?;
-                for field in reader.schema().fields() {
-                    bound = bound.checked_add(estimate_builder_bytes(&from_field(field)?, &[])?).ok_or_else(|| invalid("page-size", "Arrow schema allocation bound overflow"))?;
-                }
-                let charged = self.execution.context.memory.reserve(bound)?;
-                let page = reader.read_page(*page_index)?;
+                let (page, charged) = data.decode_page(*page_index, &self.execution.context.memory).await?;
+                let bound = charged.bytes();
                 let headers = IndexBatch::header_bytes(page.num_rows())?;
                 let batch = match data.storage.admit(bound).zip(data.storage.admit(headers)) {
                     Some((reservation, headers)) => {
@@ -1053,13 +1100,12 @@ async fn dimension(filter: &TemporalFilter, default: rtdb_types::Instant, execut
 struct CachedMetadata { metadata: Arc<MetadataFile>, bound: usize, _reservation: Arc<MemoryReservation> }
 impl Cached for CachedMetadata { fn in_use(&self) -> bool { Arc::strong_count(&self.metadata) > 1 } }
 
-/// A data file's length and inspected IPC layout, which a scan otherwise re-derives by reading the whole file.
-struct CachedLayout { length: u64, layout: FileLayout, _reservation: Arc<MemoryReservation> }
-impl Cached for CachedLayout {}
-fn layout_bytes(layout: &FileLayout) -> Result<usize> {
-    layout.page_encoded_bytes.len().checked_add(layout.page_decoding_bounds.len()).and_then(|count| count.checked_mul(std::mem::size_of::<usize>()))
-        .and_then(|bytes| bytes.checked_add(std::mem::size_of::<CachedLayout>() + 256)).ok_or_else(|| invalid("file-layout-size", "File layout exceeds addressable memory"))
+struct CachedLayout {
+    decoder: PageDecoder,
+    _reservation: Arc<MemoryReservation>,
+    _dictionaries: Vec<Arc<MemoryReservation>>,
 }
+impl Cached for CachedLayout {}
 
 /// A decoded data page, whose batch retains the pool's reservation, and the bound a query admits for it.
 struct CachedPage { batch: Arc<IndexBatch>, bound: usize }
@@ -1408,6 +1454,63 @@ mod tests {
         store.put(&ObjectKey::new(table_entry.slug.data_key(&trie)).unwrap(), data.into()).await.unwrap();
         state.add_tries(&BTreeMap::from([(table.clone(), vec![addition, nascent])]), Timestamp(200)).unwrap();
         (state, table, events, store, metadata_charge)
+    }
+
+    #[tokio::test]
+    async fn a_cold_point_scan_returns_arrow_after_reading_the_selected_page() {
+        use std::ops::Range;
+        use rtdb_storage::{Result as StorageResult, StoredObject};
+
+        struct ScanStore {
+            inner: Arc<MemoryStore>,
+            data: ObjectKey,
+            ranged: bool,
+            reads: std::sync::Mutex<Vec<Range<u64>>>,
+        }
+        #[async_trait]
+        impl ObjectStore for ScanStore {
+            fn supports_scan_ranges(&self, key: &ObjectKey) -> bool { key != &self.data || self.ranged }
+            async fn head(&self, key: &ObjectKey) -> StorageResult<StoredObject> { self.inner.head(key).await }
+            async fn get(&self, key: &ObjectKey) -> StorageResult<Bytes> { self.get_range(key, 0..self.head(key).await?.size).await }
+            async fn get_range(&self, key: &ObjectKey, range: Range<u64>) -> StorageResult<Bytes> {
+                if key == &self.data { self.reads.lock().unwrap().push(range.clone()); }
+                self.inner.get_range(key, range).await
+            }
+            async fn put(&self, key: &ObjectKey, bytes: Bytes) -> StorageResult<()> { self.inner.put(key, bytes).await }
+            async fn put_file(&self, key: &ObjectKey, path: &std::path::Path) -> StorageResult<()> { self.inner.put_file(key, path).await }
+            async fn list(&self, directory: Option<&ObjectKey>) -> StorageResult<Vec<StoredObject>> { self.inner.list(directory).await }
+            async fn delete(&self, key: &ObjectKey) -> StorageResult<()> { self.inner.delete(key).await }
+        }
+
+        let (state, table, events, store, _) = persisted_page_fixture().await;
+        let data = store.list(None).await.unwrap().into_iter()
+            .find(|object| object.key.as_str().contains("/data/")).unwrap().key;
+        let bytes = store.get(&data).await.unwrap();
+        let tail = bytes.len() - 10;
+        let footer = tail - arrow_ipc::reader::read_footer_length(bytes[tail..].try_into().unwrap()).unwrap();
+        let decoder = PageDecoder::from_footer(&bytes[footer..tail], footer as u64, None).unwrap();
+        for ranged in [true, false] {
+            let store = Arc::new(ScanStore { inner: Arc::clone(&store), data: data.clone(), ranged, reads: Default::default() });
+            let storage = Arc::new(BufferPool::new(store.clone(), 1 << 20));
+            let (mut scan, execution, _) = descriptor_scan(state.value().snapshot(), table.clone(), storage);
+            scan.iids = Some([events[1].iid].into());
+            let mut cursor = ScanCursor::new(scan, execution, None).await.unwrap();
+            let page = cursor.next_batch().await.unwrap().unwrap();
+            let [crate::columnar::Column::Arrow { array, .. }] = page.columns.as_slice() else {
+                panic!("Expected a projected Arrow column");
+            };
+            let values = array.as_any().downcast_ref::<arrow_array::Int64Array>().unwrap();
+            assert_eq!(values.values().as_ref(), &[2]);
+            assert_eq!(page.len, 1);
+            assert!(cursor.next_batch().await.unwrap().is_none());
+
+            let expected = if ranged {
+                vec![tail as u64..bytes.len() as u64, footer as u64..tail as u64, decoder.page_range(1).unwrap()]
+            } else {
+                vec![0..bytes.len() as u64]
+            };
+            assert_eq!(*store.reads.lock().unwrap(), expected);
+        }
     }
 
     #[tokio::test]

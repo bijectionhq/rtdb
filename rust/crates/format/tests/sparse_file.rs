@@ -1,8 +1,9 @@
 use std::sync::Arc;
 
 use arrow_array::{ArrayRef, Int64Array, RecordBatch};
+use arrow_buffer::Buffer;
 use arrow_schema::{DataType, Field, Schema};
-use rtdb_format::ipc::{ArrowFile, SparseFile, inspect_file_reserved, write_file};
+use rtdb_format::ipc::{ArrowFile, PageDecoder, SparseFile, inspect_file_reserved, write_file};
 
 #[test]
 fn a_file_opened_from_its_footer_reads_a_page_from_that_page_s_bytes_alone() {
@@ -20,4 +21,24 @@ fn a_file_opened_from_its_footer_reads_a_page_from_that_page_s_bytes_alone() {
     file.add(range.start, Arc::new(bytes[range.start as usize..range.end as usize].to_vec()));
     assert_eq!(reader.read_page(1).unwrap(), pages[1]);
     assert!(reader.read_page(0).is_err(), "a page whose bytes were not fetched cannot be read");
+}
+
+#[test]
+fn a_page_decoder_retains_the_encoded_body_for_compatible_columns() {
+    let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int64, false)]));
+    let page = RecordBatch::try_new(Arc::clone(&schema), vec![Arc::new(Int64Array::from(vec![11, 22, 33]))]).unwrap();
+    let bytes = write_file(&schema, std::slice::from_ref(&page)).unwrap();
+    let tail = bytes.len() - 10;
+    let footer = tail - arrow_ipc::reader::read_footer_length(bytes[tail..].try_into().unwrap()).unwrap();
+    let decoder = PageDecoder::from_footer(&bytes[footer..tail], footer as u64, None).unwrap();
+    let range = decoder.page_range(0).unwrap();
+    let encoded = Buffer::from(bytes[range.start as usize..range.end as usize].to_vec());
+    let address = encoded.as_ptr() as usize;
+    let end = address + encoded.len();
+    assert!(decoder.page_bound(0, &encoded).is_ok());
+    let actual = decoder.decode_page(0, encoded).unwrap();
+
+    assert_eq!(actual, page);
+    let data = actual.column(0).as_any().downcast_ref::<Int64Array>().unwrap();
+    assert!((address..end).contains(&(data.values().as_ptr() as usize)));
 }
