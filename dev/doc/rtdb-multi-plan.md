@@ -826,7 +826,8 @@ Read-your-writes across tiers; a zombie holder cannot serve a linearizable read;
 **Done when** a hot deployment's reads spread across its read width with bounded staleness.
 
 Nodes use the same eligible affinity ranks as the gateway when opening a log-fed read replica.
-A narrower width retires existing out-of-rank replicas, and their gateway sessions reconnect within the remaining width.
+A narrower width retires out-of-rank replicas that serve only Pgwire reads, and their gateway sessions reconnect within the remaining width.
+A replica serving scan fragments can remain attached.
 Enable automatic width with `rtdb-multi controller --read-sessions-per-node N`.
 With this policy enabled, the controller manages the width of live writer placements and manual width changes are subject to later adjustment.
 The default maximum width is eight, including the writer, and `--max-read-width N` can set a different ceiling.
@@ -1282,7 +1283,8 @@ The next table compares how many handoffs a draining member could execute concur
 | 8 | 2,958–4,953 | 14.0–23.7 | 12.7–119.7 | 18.4–208.3 |
 | 2 | 4,570–4,827 | 13.8–14.8 | 12.8–24.2 | 11.1–19.5 |
 
-The draining node now runs two handoffs at a time and still takes up to eight per pass.
+That comparison configured the drain to run two handoffs at a time.
+The current drain runs one at a time and takes up to eight per pass.
 The optional latency limit fails a run when either scale transition reaches the specified p99.
 On the integrated build with journal backpressure, shared gateway heartbeats and idle flushing, two of three trials passed the 30 ms limit in both transitions.
 The third scale-in measured 36.4 ms p99, and every counter still matched.
@@ -1292,6 +1294,16 @@ RTDB_TEST_PGWIRE_CONNECTIONS=256 RTDB_CELL_BENCH_CONNECTIONS=4 RTDB_CELL_BENCH_S
   cargo test --manifest-path rust/Cargo.toml -p rtdb-multi --release --test load \
   durable_pgwire_updates_under_zipf_activity -- --ignored --nocapture
 ```
+
+**Guarded gateway keys**
+
+A release run moved all 1,000 deployments and then killed a holder responsible for 350 of them.
+The surviving cell preserved the exact counter in every deployment.
+Three release trials with 32 warm deployments, 16 workers and four connections per deployment each verified all 32,768 Zipf updates.
+Those trials ran alongside JVM verification jobs and measured 100.9–276.2 ms p99 during scale-out and 101.5–163.5 ms during scale-in.
+Three repeats after those verification jobs finished verified the same counter totals and measured 38.1–164.7 ms p99 during scale-out and 70.5–100.8 ms during scale-in.
+Other workloads remained active on the shared host.
+The 30 ms acceptance target remains open.
 
 ## 6. Existing specs affected
 
