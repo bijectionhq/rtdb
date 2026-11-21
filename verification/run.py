@@ -974,7 +974,29 @@ def verify_reader_retention(args, scratch):
         print(f"{case}: {'negative control rejected' if mutation else 'proved'}")
 
 
+def verify_gateway_replay_lean(args, scratch):
+    path = Path("verification/multi/lean/GatewayReplay.lean")
+    controls = {
+        "reset-ordinal": (
+            "{ backend with sqlSettings := [] }",
+            "{ backend with sqlSettings := [], ordinal := backend.ordinal + 1 }",
+            ["reset_preserves_effective_key", "reset_preserves_effective_key"],
+        ),
+        "malformed-skips-key": (
+            '| _ => backend.commandKey ++ "/" ++ toString backend.ordinal',
+            '| .absent => backend.commandKey ++ "/" ++ toString backend.ordinal\n  | .malformed => ""',
+            ["malformed_metadata_uses_command_key", "malformed_metadata_uses_command_key"],
+        ),
+        "renew-deadline": (
+            "deadline.getD (cutoff window now)", "cutoff window now",
+            ["replacements_preserve_cutoff"],
+        ),
+    }
+    verify_lean_model(args, scratch, path, "gateway-replay", controls, 4)
+
+
 def verify_lean(args, scratch):
+    verify_gateway_replay_lean(args, scratch)
     path = Path("verification/lean/History.lean")
     controls = {
         "baseline": None,
