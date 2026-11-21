@@ -27,6 +27,7 @@ The driver also waits for the admitted-call monitor to reach zero before reporti
 Service methods and response streams are passive caller-owned work.
 The stream advertises the prepared result schema and conforms runtime pages through the passive `rtdb-columnar::DeclaredBatch` adapter.
 Columns that already match their declared field retain their Arrow buffers when the adapter conforms the rest of the page.
+Compatible nested field ordering and dense union identifiers can change while retaining the source value buffers.
 This follows the pinned Flight producer's ADBC `ArrowReader`, including NULL endpoint vectors under advertised timestamp fields.
 The encoder checks the complete declared schema before encoding physical buffers, including signed decimal precision and scale metadata.
 Schema and record-node regression sources remain unexecuted.

@@ -38,43 +38,48 @@ pub fn conform_batch(batch: OwnedBatch, declared: &Schema, memory: &Arc<MemoryBu
         if source.fields().get(index).is_some_and(|candidate| candidate.name() == field.name()) { Some(index) }
         else { source.fields().iter().rposition(|candidate| candidate.name() == field.name()) }
     }).collect::<Vec<_>>();
-    let reusable = declared.fields().iter().zip(&positions).map(|(field, position)| {
-        position.filter(|&position| source.field(position) == field.as_ref())
-    }).collect::<Vec<_>>();
-    let rebuilt_count = reusable.iter().filter(|position| position.is_none()).count();
-    let mut decoded_bound = multiply(batch.batch().num_rows(), multiply(rebuilt_count, std::mem::size_of::<Value>())?)?;
-    for (position, reused) in positions.iter().zip(&reusable) {
-        if let (Some(position), None) = (position, reused) {
-            for row in 0..batch.batch().num_rows() {
-                decoded_bound = add(decoded_bound, estimate_read_value_bytes(source.field(*position), batch.batch().column(*position).as_ref(), row)?)?;
-            }
-        }
-    }
-    let _decoded = memory.reserve(decoded_bound)?;
-    let reused_bytes = reusable.iter().flatten().try_fold(schema_bound, |bytes, &position| {
-        add(bytes, batch.batch().column(position).get_array_memory_size())
-    })?;
-    let mut output = memory.reserve(reused_bytes)?;
+    let mut output = memory.reserve(schema_bound)?;
     let mut fields = Vec::with_capacity(declared.fields().len());
     let mut arrays: Vec<ArrayRef> = Vec::with_capacity(declared.fields().len());
-    for ((field, position), reused) in declared.fields().iter().zip(&positions).zip(reusable) {
-        if let Some(position) = reused {
+    for (field, position) in declared.fields().iter().zip(positions) {
+        let input = position.map(|position| (source.field(position), batch.batch().column(position)));
+        let output = Arc::get_mut(&mut output).expect("Conformance owns the output reservation");
+        if let Some((source_field, array)) = input && source_field == field.as_ref() {
+            output.grow_to(add(output.bytes(), array.get_array_memory_size())?)?;
             fields.push(field.as_ref().clone());
-            arrays.push(Arc::clone(batch.batch().column(position)));
+            arrays.push(Arc::clone(array));
             continue;
         }
         let target = from_field(field)?;
-        let source_type = position.map(|position| from_field(source.field(position))).transpose()?.unwrap_or(L::Null);
-        if position.is_none() && !target.nullable() { return Err(fault("page-missing-non-nullable", "Page lacks a required declared field")); }
+        let source_type = input.map(|(field, _)| from_field(field)).transpose()?.unwrap_or(L::Null);
+        if input.is_none() && !target.nullable() { return Err(fault("page-missing-non-nullable", "Page lacks a required declared field")); }
         let ty = layout(&target, &source_type)?;
-        let column = (0..batch.batch().num_rows()).map(|row| match position {
-            Some(position) => read_value(source.field(*position), batch.batch().column(*position).as_ref(), row),
+        if let Some((source_field, array)) = input {
+            let bound = add(multiply(array.len(), 64)?, multiply(field.size(), 4)?)?;
+            if let Ok(_scratch) = memory.reserve(bound)
+                && let Ok((physical, retained)) = physical::relayout(Arc::clone(array), source_field, field) {
+                output.grow_to(add(output.bytes(), retained.get_array_memory_size())?)?;
+                fields.push(physical);
+                arrays.push(retained);
+                continue;
+            }
+        }
+        let rows = batch.batch().num_rows();
+        let base = multiply(rows, std::mem::size_of::<Value>())?;
+        let bound = match input {
+            Some((source_field, array)) => (0..rows).try_fold(base, |bytes, row| {
+                add(bytes, estimate_read_value_bytes(source_field, array.as_ref(), row)?)
+            })?,
+            None => base,
+        };
+        let _decoded = memory.reserve(bound)?;
+        let column = (0..rows).map(|row| match input {
+            Some((source_field, array)) => read_value(source_field, array.as_ref(), row),
             None => Ok(Value::Null),
         }).collect::<Result<Vec<_>>>()?;
         let physical = to_field(field.name(), &ty)?.with_metadata(field.metadata().clone());
         let bound = multiply(estimate_builder_bytes(&ty, &column)?, 2)?;
-        let reservation = Arc::get_mut(&mut output).expect("Conformance owns the output reservation");
-        reservation.grow_to(add(reservation.bytes(), bound)?)?;
+        output.grow_to(add(output.bytes(), bound)?)?;
         let (physical, array) = physical::relayout(copy_array(&ty, &column)?, &physical, field)?;
         fields.push(physical);
         arrays.push(array);
