@@ -88,6 +88,21 @@ fn rejected_event_releases_its_reservation_and_does_not_create_a_table() {
 }
 
 #[test]
+fn events_appended_by_reference_and_by_value_stage_as_one_tables_rows() {
+    use rtdb_index::StoredEvent;
+    let state = PartitionState::empty(TrieConfig::default()).unwrap();
+    let budget = MemoryBudget::new(1 << 24);
+    let mut tx = TransactionBuffer::new(state.resolving_snapshot(&[]).unwrap(), key(0), Arc::clone(&budget)).unwrap();
+    let event = |id| StoredEvent { iid: EntityId::Integer(id).iid(), system_from: key(0).system_time, valid_time: Interval::ALL, operation: StoredOperation::Put(document(id, id)), recency: None };
+    tx.append_to(&table(), event(1)).unwrap();
+    tx.append(table(), event(2)).unwrap();
+    tx.append_to(&table(), event(3)).unwrap();
+    let staged = tx.stage().unwrap();
+    assert_eq!(staged.tables().keys().collect::<Vec<_>>(), [&table()]);
+    assert_eq!(staged.row_count().unwrap(), 3);
+}
+
+#[test]
 fn staged_predecessors_and_own_writes_are_each_scanned_once() {
     let state = PartitionState::empty(TrieConfig::default()).unwrap();
     let budget = MemoryBudget::new(1 << 24);

@@ -1,8 +1,9 @@
+use std::collections::BTreeSet;
 use std::sync::Arc;
 use std::time::Duration;
 use async_trait::async_trait;
 use futures::{StreamExt, stream};
-use rtdb_format::{catalog::{BlockCatalog, TableEntry}, keys::{TrieKey, block_index_from_key, oversized_block_index}};
+use rtdb_format::{catalog::{BlockCatalog, TableEntry}, keys::{PartGroup, TrieKey, block_index_from_key, oversized_block_index}};
 use rtdb_storage::{ObjectKey, ObjectStore};
 use rtdb_types::{Anomaly, BlockIndex, Result, TableRef, Timestamp};
 use tokio::sync::Semaphore;
@@ -73,7 +74,8 @@ impl TrieCollector {
             let snapshot = Arc::clone(&snapshot);
             async move {
                 let keys = snapshot.trie_catalog().garbage_tries(&entry.table, as_of).into_iter().map(|trie| trie.key.clone()).collect::<Vec<_>>();
-                let result = self.collect_table(&entry, &keys, &deletes, cancellation).await;
+                let groups = finished_groups(snapshot.trie_catalog(), &entry.table, &keys);
+                let result = self.collect_table(&entry, &keys, &groups, &deletes, cancellation).await;
                 if let Err(error) = &result { if !cancellation.is_cancelled() { self.observer.table_failed(Some(&entry.table), error); } }
             }
         });
@@ -81,7 +83,15 @@ impl TrieCollector {
         if cancellation.is_cancelled() { Err(crate::closed()) } else { Ok(()) }
     }
 
-    async fn collect_table(&self, entry: &TableEntry, keys: &[TrieKey], deletes: &Semaphore, cancellation: &CancellationToken) -> Result<()> {
+    async fn collect_table(&self, entry: &TableEntry, keys: &[TrieKey], groups: &BTreeSet<PartGroup>, deletes: &Semaphore, cancellation: &CancellationToken) -> Result<()> {
+        // A group's artefacts are derived from every member's data file, so they go before any member's.
+        for group in groups {
+            if cancellation.is_cancelled() { return Err(crate::closed()); }
+            let artefacts = ObjectKey::new(entry.slug.group_artefact_prefix(group)).map_err(crate::invalid)?;
+            for artefact in self.store.list(Some(&artefacts)).await.map_err(crate::invalid)? {
+                self.store.delete(&artefact.key).await.map_err(crate::invalid)?;
+            }
+        }
         for chunk in keys.chunks(self.config.chunk_size) {
             if cancellation.is_cancelled() { return Err(crate::closed()); }
             if chunk.iter().any(|key| key.level() == 0) { return Err(crate::invalid("L0 recovery files cannot be garbage collected")); }
@@ -89,6 +99,11 @@ impl TrieCollector {
                 let key = &chunk[index];
                 let _permit = deletes.acquire().await.map_err(crate::invalid)?;
                 if cancellation.is_cancelled() { return Err(crate::closed()); }
+                // Artefacts carry the data file's content, so they go first; listing catches any whose record has not reached this catalog.
+                let artefacts = ObjectKey::new(entry.slug.artefact_prefix(key)).map_err(crate::invalid)?;
+                for artefact in self.store.list(Some(&artefacts)).await.map_err(crate::invalid)? {
+                    self.store.delete(&artefact.key).await.map_err(crate::invalid)?;
+                }
                 self.store.delete(&ObjectKey::new(entry.slug.data_key(key)).map_err(crate::invalid)?).await.map_err(crate::invalid)?;
                 self.store.delete(&ObjectKey::new(entry.slug.metadata_key(key)).map_err(crate::invalid)?).await.map_err(crate::invalid)
             }).buffer_unordered(self.config.delete_parallelism).collect::<Vec<Result<()>>>().await;
@@ -98,6 +113,14 @@ impl TrieCollector {
         }
         Ok(())
     }
+}
+
+/// The partition groups of tries being collected none of whose members the catalog holds besides them: their artefacts serve no trie once these go.
+fn finished_groups(catalog: &rtdb_index::TrieCatalog, table: &TableRef, keys: &[TrieKey]) -> BTreeSet<PartGroup> {
+    let collected: BTreeSet<&TrieKey> = keys.iter().collect();
+    keys.iter().filter_map(TrieKey::part_group)
+        .filter(|group| catalog.group_members(table, group).iter().all(|member| collected.contains(&member.key)))
+        .collect()
 }
 
 #[async_trait]

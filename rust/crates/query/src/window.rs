@@ -2,7 +2,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use rtdb_plan::{Binder, ColumnId, Schema, SortExpr, WindowExpr, WindowFunction};
 use rtdb_types::{LogicalType, Result, ScalarType, Value};
-use crate::{context::Execution, cursor::OwnedRow, invalid, operators::rows_equal, pages::{BoxPageCursor,OwnedPage,PageBuilder,PageCursor}, sort::SortCursor, spill::SpillWriter};
+use crate::{context::Execution, cursor::OwnedRow, invalid, operators::rows_equal, pages::{BoxPageCursor,OwnedPage,PageBuilder,PageCursor}, sort::SortCursor};
 
 pub(crate) struct WindowCursor {
     input: Option<BoxPageCursor>, runtime: Arc<crate::runtime_schema::EmittedRelation>, schema: Schema, partition_by: Vec<ColumnId>, order_by: Vec<SortExpr>, expressions: Vec<WindowExpr>, execution: Execution,
@@ -18,7 +18,7 @@ impl WindowCursor {
         let partition = binder.field("", None, LogicalType::Scalar(ScalarType::U64))?;
         let schema = self.schema.concat(&Schema::new(vec![partition.clone()])?)?;
         let positions = self.partition_by.iter().map(|column| self.schema.position(*column).ok_or_else(|| invalid("window-column", "Window partition column is absent"))).collect::<Result<Vec<_>>>()?;
-        let partitioned = PartitionPages { input, positions, runtime: Arc::clone(&self.runtime), keys: self.execution.context.spill.create()?, count: 0, execution: self.execution.clone() };
+        let partitioned = PartitionPages { input, positions, runtime: Arc::clone(&self.runtime), keys: Vec::new(), index: Default::default(), count: 0, execution: self.execution.clone() };
         let mut order = vec![SortExpr { expr: partition.expression(), descending: false, nulls_first: false }];
         order.extend(self.order_by.clone());
         let mut sorted = SortCursor::from_pages(Box::new(partitioned), schema, order, self.execution.clone());
@@ -75,7 +75,8 @@ impl PageCursor for WindowCursor {
     }
 }
 
-struct PartitionPages { input: BoxPageCursor, positions: Vec<usize>, runtime: Arc<crate::runtime_schema::EmittedRelation>, keys: SpillWriter, count: u64, execution: Execution }
+/// Numbers each row's partition in first-seen order, finding a key among those with its hash.
+struct PartitionPages { input: BoxPageCursor, positions: Vec<usize>, runtime: Arc<crate::runtime_schema::EmittedRelation>, keys: Vec<OwnedRow>, index: std::collections::HashMap<u32, Vec<usize>>, count: u64, execution: Execution }
 #[async_trait]
 impl PageCursor for PartitionPages {
     async fn next_page(&mut self) -> Result<Option<OwnedPage>> {
@@ -92,20 +93,18 @@ impl PageCursor for PartitionPages {
             let values = self.positions.iter().map(|position| row.values[*position].clone()).collect::<Vec<_>>();
             let key = OwnedRow::with_reservation(values, charge)?;
             let hash = crate::join_storage::hash_values(&key.values)?;
-            let mut reader = self.keys.reader(Arc::clone(&self.execution.context.memory))?;
             let mut found = None;
-            while let Some(previous) = reader.next()? {
-                self.execution.context.check_cancelled()?;
-                if hash == crate::join_storage::hash_values(&previous.values[..previous.values.len() - 1])?
-                    && rows_equal(&key.values, &previous.values[..previous.values.len() - 1], &self.execution.context.timezone, &self.execution.context.memory)? { found = Some(partition_id(&previous.values)?); break; }
+            for &candidate in self.index.get(&hash).map(Vec::as_slice).unwrap_or_default() {
+                let previous = &self.keys[candidate].values;
+                if rows_equal(&key.values, &previous[..previous.len() - 1], &self.execution.context.timezone, &self.execution.context.memory)? { found = Some(partition_id(previous)?); break; }
             }
             let group = match found {
                 Some(group) => group,
                 None => {
                     let group = self.count;
                     self.count = self.count.checked_add(1).ok_or_else(|| invalid("window-count", "Window partition count overflow"))?;
-                    let key = copy_row(&key.values, &[Value::U64(group)], &self.execution)?;
-                    self.keys.write(&key.values, &self.execution.context.memory)?;
+                    self.index.entry(hash).or_default().push(self.keys.len());
+                    self.keys.push(copy_row(&key.values, &[Value::U64(group)], &self.execution)?);
                     group
                 }
             };

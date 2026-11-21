@@ -1,0 +1,43 @@
+{
+  "summary": "RTDB's production valid-time rectangle merge retains the system-time origin and preserves pointwise membership under the declared one-event cut.",
+  "flags": ["--no-external-by-default", "--verify-module", "production", "--verify-module", "laws"],
+  "min_verified_functions": 3,
+  "controls": {
+    "merge_across_system_origins": {
+      "defect": "The merge accepts a right rectangle with a different system-time origin.",
+      "mutate": [{
+        "file": "rust/crates/search/src/rectangle.rs",
+        "find": " && left[2] == right[2]",
+        "replace": ""
+      }],
+      "expect": [{
+        "file": "rust/crates/search/src/rectangle.rs",
+        "function": "merge_adjacent_valid_time",
+        "category": "postcondition not satisfied"
+      }],
+      "min_verified_functions": 2
+    },
+    "merge_across_system_origins_with_weakened_contract": {
+      "defect": "Both the implementation and the local contract allow merging different system-time origins.",
+      "mutate": [{
+        "file": "rust/crates/search/src/rectangle.rs",
+        "find": " && left[2] == right[2]",
+        "replace": ""
+      }, {
+        "file": "rust/crates/search/src/rectangle.rs",
+        "find": " && left@[2] == right@[2]",
+        "replace": ""
+      }],
+      "expect": [{
+        "file": "verification/verus/search_visibility/laws.rs",
+        "function": "merge_preserves_event_origin",
+        "category": "postcondition not satisfied"
+      }, {
+        "file": "verification/verus/search_visibility/laws.rs",
+        "function": "merge_preserves_visibility_after_a_cut",
+        "category": "postcondition not satisfied"
+      }],
+      "min_verified_functions": 1
+    }
+  }
+}

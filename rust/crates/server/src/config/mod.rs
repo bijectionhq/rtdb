@@ -39,6 +39,9 @@ pub struct DiskCacheSettings { pub path: PathBuf, pub maximum_bytes: Option<u64>
 pub struct IndexerSettings { pub log_limit: usize, pub page_limit: usize, pub rows_per_block: u64, pub flush_duration: Duration, pub skip_transactions: BTreeSet<SourcePosition>, pub enabled: bool }
 #[derive(Clone, Debug)]
 pub struct CompactorSettings { pub threads: usize, pub run_end_encoded_iids: bool, pub within_file_recency_branching: bool }
+/// Full-text search's index lane; with it off, `MATCH` is still answered, by scanning.
+#[derive(Clone, Debug)]
+pub struct SearchSettings { pub enabled: bool, pub threads: usize }
 #[derive(Clone, Debug)]
 pub struct GarbageSettings { pub enabled: bool, pub blocks_to_keep: usize, pub garbage_lifetime: Duration }
 #[derive(Clone, Debug)]
@@ -62,6 +65,7 @@ pub struct NodeConfiguration {
     pub indexer: IndexerSettings,
     pub compactor: CompactorSettings,
     pub garbage: GarbageSettings,
+    pub search: SearchSettings,
     pub auth: AuthConfig,
     pub tracing: TracingSettings,
     pub modules: Vec<ModuleSettings>,
@@ -121,7 +125,7 @@ impl NodeConfiguration {
                 None => BTreeMap::new(),
             };
             Self { playground: false, server: None, flight_sql: None, health, remotes, primary, fixed_databases: Some(fixed_databases), memory_cache, disk_cache,
-                default_timezone: None, indexer, compactor: compactor(None, environment)?, garbage: garbage(None)?, auth: authentication::default_auth(environment),
+                default_timezone: None, indexer, compactor: compactor(None, environment)?, garbage: garbage(None)?, search: search(None)?, auth: authentication::default_auth(environment),
                 tracing: tracing(None)?, modules: Vec::new(), read_only_databases: false, skipped_databases: BTreeSet::new(), node_id, local_log_uses_clock, kafka_auto_create_topic, join_build_rows, generate_series_end_exclusive, object_sort: Default::default() }
         } else {
             let server = match fields.take("server") { None => Some(PgwireSettings::default()), Some(Yaml::Null) => None, Some(value) => Some(pgwire(value)?) };
@@ -129,6 +133,7 @@ impl NodeConfiguration {
             let default_timezone = fields.string("defaultTz")?.as_deref().map(rtdb_expr::normalize_timezone).transpose()?;
             let compactor = compactor(fields.take("compactor"), environment)?;
             let garbage = garbage(fields.take("garbageCollector"))?;
+            let search = search(fields.take("search"))?;
             let auth = fields.take("authn").map(|value| authentication::decode(value, environment)).transpose()?.unwrap_or_else(|| authentication::default_auth(environment));
             let tracing = tracing(fields.take("tracer"))?;
             let modules = fields.sequence("modules")?.unwrap_or_default().into_iter().map(module).collect::<Result<_>>()?;
@@ -137,7 +142,7 @@ impl NodeConfiguration {
                 Some(values) => values.iter().map(|value| scalar_string(value, "skipDbs")).collect::<Result<_>>()?,
                 None => environment("XTDB_SKIP_DBS").into_iter().flat_map(|value| value.split(',').map(str::trim).filter(|value| !value.is_empty()).map(str::to_owned).collect::<Vec<_>>()).collect(),
             };
-            Self { playground: false, server, flight_sql, health, remotes, primary, fixed_databases: None, memory_cache, disk_cache, default_timezone, indexer, compactor, garbage, auth, tracing, modules, read_only_databases, skipped_databases, node_id, local_log_uses_clock, kafka_auto_create_topic, join_build_rows, generate_series_end_exclusive, object_sort: Default::default() }
+            Self { playground: false, server, flight_sql, health, remotes, primary, fixed_databases: None, memory_cache, disk_cache, default_timezone, indexer, compactor, garbage, search, auth, tracing, modules, read_only_databases, skipped_databases, node_id, local_log_uses_clock, kafka_auto_create_topic, join_build_rows, generate_series_end_exclusive, object_sort: Default::default() }
         };
         fields.finish()?;
         Ok(configuration)
@@ -221,6 +226,12 @@ fn compactor(value: Option<Yaml>, environment: &impl Fn(&str) -> Option<String>)
 fn garbage(value: Option<Yaml>) -> Result<GarbageSettings> {
     let mut fields = YamlFields::new(value.unwrap_or_else(empty), "garbageCollector")?;
     let result = GarbageSettings { enabled: fields.boolean("enabled")?.unwrap_or(true), blocks_to_keep: positive(fields.integer("blocksToKeep")?.unwrap_or(10) as i64, "blocksToKeep")?, garbage_lifetime: duration(&mut fields, "garbageLifetime", 24 * 3600)? };
+    fields.finish()?;
+    Ok(result)
+}
+fn search(value: Option<Yaml>) -> Result<SearchSettings> {
+    let mut fields = YamlFields::new(value.unwrap_or_else(empty), "search")?;
+    let result = SearchSettings { enabled: fields.boolean("enabled")?.unwrap_or(true), threads: positive(fields.integer("threads")?.unwrap_or(1) as i64, "threads")? };
     fields.finish()?;
     Ok(result)
 }

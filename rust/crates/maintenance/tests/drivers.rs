@@ -25,7 +25,7 @@ impl CompactionPublisher for Publisher {
 #[tokio::test]
 async fn later_compact_all_reports_the_same_failure_without_retrying_the_job() {
     let table = TableRef::new("public", "foo");
-    let catalog = TrieCatalog::default().with_tries(table, [CatalogTrie { key: "l00-rc-b00".parse().unwrap(), data_file_size: 1, metadata: None, state: TrieState::Live }], Timestamp(0)).unwrap();
+    let catalog = TrieCatalog::default().with_tries(table, [CatalogTrie { key: "l00-rc-b00".parse().unwrap(), data_file_size: 1, metadata: None, state: TrieState::Live, artefacts: Vec::new() }], Timestamp(0)).unwrap();
     let state = Arc::new(PartitionState::new(PartitionValue::loaded(catalog, TableCatalog::default(), TrieConfig::default()).unwrap()));
     let executor = Arc::new(FailingExecutor(AtomicUsize::new(0)));
     let (driver, handle) = CompactionDriver::new(state, executor.clone(), Arc::new(Publisher), 2, 8, false).unwrap();
@@ -84,8 +84,15 @@ async fn manual_compaction_schedules_only_during_a_request() {
 
     let mut request = Box::pin(handle.compact_all());
     assert!(futures::poll!(request.as_mut()).is_pending());
-    assert!(futures::poll!(run.as_mut()).is_pending());
-    assert_eq!(futures::poll!(request.as_mut()), Poll::Ready(Ok(())));
+    // The requested job runs on a thread of its own, so the driver is driven until the request completes.
+    let completed = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        loop {
+            if let Poll::Ready(result) = futures::poll!(request.as_mut()) { break result; }
+            assert!(futures::poll!(run.as_mut()).is_pending());
+            tokio::task::yield_now().await;
+        }
+    }).await.expect("the requested compaction completes");
+    assert_eq!(completed, Ok(()));
     assert!(available_jobs(state.value().trie_catalog()).unwrap().is_empty());
     let calls = snapshots.calls.load(Ordering::SeqCst);
     assert!(calls > 0);

@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use rtdb_columnar::MemoryReservation;
-use rtdb_plan::{ColumnId, Field, Schema, SqlNotice};
+use rtdb_plan::{CatalogLookups, ColumnId, Field, RecordingCatalog, Schema, SqlNotice};
 use rtdb_query::{PreparedQuery, QueryContext, QueryCursor, RuntimeSchema};
 use rtdb_sql::{DeferredStatementSyntax, ParsedStatement, PrepareOptions, StatementKind, StatementSyntaxBatch};
 use rtdb_tx::{SqlArguments, TxOp};
@@ -15,9 +15,11 @@ struct PreparedData {
     options: PrepareOptions,
     parameters: Vec<LogicalType>,
     notices: Vec<SqlNotice>,
+    ordered_index_command_tag: Option<&'static str>,
     result: PreparedResult,
     policy: ResultSignaturePolicy,
     _reservation: Arc<MemoryReservation>,
+    plan: std::sync::Mutex<Option<CachedPlan>>,
 }
 enum PreparedResult { Query { schema: Schema, pg_types: Vec<PgType> }, Dml }
 
@@ -100,6 +102,7 @@ impl PreparedSql {
     ) -> Result<Self> {
         let source = parsed.source();
         let count = parsed.parameter_count();
+        let ordered_index_command_tag = parsed.ordered_index_command_tag();
         if options.parameter_types.keys().any(|index| *index >= count) { return Err(parameter_error("Declared parameter lies outside the statement")); }
         let parameter_bytes = options.parameter_types.values().try_fold(count.checked_mul(1024).and_then(|n| n.checked_add(1024)).ok_or_else(size_error)?, |bytes, ty| bytes.checked_add(ty.retained_bytes()?).ok_or_else(size_error))?;
         let _parameters = context.memory.reserve(parameter_bytes)?;
@@ -131,7 +134,7 @@ impl PreparedSql {
         let bytes = retained_bytes(&source, &options, &parameters, &notices, &result)?;
         let reservation = context.memory.reserve(bytes)?;
         drop(source_reservation);
-        Ok(Self(Arc::new(PreparedData { source, options, parameters, notices, result, policy, _reservation: reservation })))
+        Ok(Self(Arc::new(PreparedData { source, options, parameters, notices, ordered_index_command_tag, result, policy, _reservation: reservation, plan: Default::default() })))
     }
 
     pub fn source(&self) -> &str { &self.0.source }
@@ -140,6 +143,7 @@ impl PreparedSql {
     /// Planning warnings in source traversal order; repeated occurrences are retained.
     /// Execution-time rebinding does not append warnings to this immutable preparation.
     pub fn notices(&self) -> &[SqlNotice] { &self.0.notices }
+    pub fn ordered_index_command_tag(&self) -> Option<&'static str> { self.0.ordered_index_command_tag }
     pub fn is_dml(&self) -> bool { matches!(&self.0.result, PreparedResult::Dml) }
     pub fn prepared_schema(&self) -> Option<&Schema> { match &self.0.result { PreparedResult::Query { schema, .. } => Some(schema), PreparedResult::Dml => None } }
     pub fn postgres_types(&self) -> Option<&[PgType]> { match &self.0.result { PreparedResult::Query { pg_types, .. } => Some(pg_types), PreparedResult::Dml => None } }
@@ -190,7 +194,18 @@ impl PreparedSql {
         options.default_timezone = context.timezone.clone();
         if execution { for ty in options.parameter_types.values_mut() { *ty = rtdb_columnar::execution_type(ty); } }
         for (index, ty) in argument_types.iter().enumerate() { options.parameter_types.entry(index).or_insert_with(|| if execution { rtdb_columnar::execution_type(ty) } else { ty.clone() }); }
-        prepare_query(&self.0.source, context, &options)
+        let cached = self.0.plan.lock().ok().and_then(|plan| plan.as_ref().filter(|plan| plan.options == options).map(|plan| (plan.lookups.clone(), plan.query.clone())));
+        if let Some((lookups, query)) = cached && lookups.replay(&context.catalog)? { return query.recharged(&context.memory); }
+        let recording = RecordingCatalog::new(&context.catalog);
+        let _syntax = admit_sql_syntax(&self.0.source, &context.memory)?;
+        let query = PreparedQuery::from_prepared(rtdb_sql::prepare_in(&self.0.source, &recording, &options, &context.memory)?, &context.memory)?;
+        // A plan's allocations stay charged to the budget it was planned in, so the kept copy is planned in the statement's own.
+        if let Some(lookups) = recording.finish() {
+            let budget = self.0._reservation.budget();
+            let kept = rtdb_sql::prepare_in(&self.0.source, &context.catalog, &options, budget).and_then(|prepared| PreparedQuery::from_prepared(prepared, budget));
+            if let (Ok(kept), Ok(mut plan)) = (kept, self.0.plan.lock()) { *plan = Some(CachedPlan { options, lookups: Arc::new(lookups), query: kept }); }
+        }
+        Ok(query)
     }
 
     fn check_signature(&self, actual: &Schema) -> Result<()> {
@@ -205,6 +220,10 @@ impl PreparedSql {
         if compatible { Ok(()) } else { Err(Anomaly::new(AnomalyCategory::Conflict, "xtdb/prepared-query-out-of-date", "cached plan must not change result type")) }
     }
 }
+
+/// The last plan a statement bound, and what its planning read from the catalog: a snapshot that answers those
+/// lookups the same plans the statement the same way, so it reuses the plan.
+struct CachedPlan { options: PrepareOptions, lookups: Arc<CatalogLookups>, query: PreparedQuery }
 
 fn admit_source(source: &str, context: &QueryContext, options: &mut PrepareOptions) -> Result<Arc<MemoryReservation>> {
     context.check_cancelled()?;

@@ -48,6 +48,69 @@ fn trie_keys_and_recorded_slugs_retain_existing_object_paths() {
 }
 
 #[test]
+fn a_tries_artefacts_live_under_one_prefix_of_its_own() {
+    let slug = TableSlug::recorded("public$docs").unwrap();
+    let key: TrieKey = "l01-rc-b03".parse().unwrap();
+    let artefact = slug.artefact_key(&key, "search", "docs_body", 2).unwrap();
+    assert_eq!(artefact, "tables/public$docs/artefacts/l01-rc-b03/search/docs_body-v2.bin");
+    assert!(artefact.starts_with(&format!("{}/", slug.artefact_prefix(&key))));
+    let other: TrieKey = "l02-rc-p0-b03".parse().unwrap();
+    assert!(!slug.artefact_key(&other, "search", "docs_body", 2).unwrap().starts_with(&format!("{}/", slug.artefact_prefix(&key))));
+    for bad in ["", ".", "..", "a/b", "a\\b"] {
+        assert!(slug.artefact_key(&key, bad, "docs_body", 2).is_err(), "{bad:?}");
+        assert!(slug.artefact_key(&key, "search", bad, 2).is_err(), "{bad:?}");
+    }
+}
+
+#[test]
+fn an_artefact_key_names_the_trie_kind_definition_and_version_it_was_made_from() {
+    let slug = TableSlug::recorded("public$docs").unwrap();
+    let key: TrieKey = "l01-rc-b03".parse().unwrap();
+    for (id, version) in [("docs_body~a1f3", 2), ("with-v-inside", 7), ("docs", -1)] {
+        let artefact = slug.artefact_key(&key, "search", id, version).unwrap();
+        assert!(artefact.starts_with(&format!("{}/", slug.artefacts_prefix())));
+        assert_eq!(slug.parse_artefact_key(&artefact), Some((ArtefactOwner::Trie(key.clone()), "search".into(), id.into(), version)), "{artefact}");
+    }
+    let group = "l03-rc-p21-b07".parse::<TrieKey>().unwrap().part_group().unwrap();
+    let artefact = slug.owner_artefact_key(&ArtefactOwner::Group(group.clone()), "search", "docs", 3).unwrap();
+    assert_eq!(artefact, "tables/public$docs/artefacts/g03-rc-p2-b07/search/docs-v3.bin");
+    assert_eq!(slug.parse_artefact_key(&artefact), Some((ArtefactOwner::Group(group), "search".into(), "docs".into(), 3)));
+    for stray in ["tables/public$docs/artefacts/l01-rc-b03/search/docs-v2.tmp", "tables/public$docs/artefacts/l01-rc-b03/docs-v2.bin",
+        "tables/public$docs/artefacts/l01-rc-b03/search/x/docs-v2.bin", "tables/public$other/artefacts/l01-rc-b03/search/docs-v2.bin",
+        "tables/public$docs/artefacts/not-a-trie/search/docs-v2.bin", "tables/public$docs/artefacts/l01-rc-b03/search/docs-v02.bin",
+        "tables/public$docs/artefacts/g01-rc-b03/search/docs-v2.bin", "tables/public$docs/artefacts/g02-r20200106-b03/search/docs-v2.bin"] {
+        assert_eq!(slug.parse_artefact_key(stray), None, "{stray}");
+    }
+}
+
+#[test]
+fn a_tiered_trie_belongs_to_the_partition_group_of_its_siblings() {
+    let group = |key: &str| key.parse::<TrieKey>().unwrap().part_group();
+    let l2c = group("l02-rc-p2-b05").unwrap();
+    assert_eq!(l2c.to_string(), "g02-rc-b05");
+    assert_eq!(l2c.members().iter().map(ToString::to_string).collect::<Vec<_>>(), ["l02-rc-p0-b05", "l02-rc-p1-b05", "l02-rc-p2-b05", "l02-rc-p3-b05"]);
+    assert_eq!(l2c.to_string().parse::<PartGroup>().unwrap(), l2c);
+    for member in l2c.members() { assert_eq!(member.part_group().as_ref(), Some(&l2c)); }
+    let l3h = group("l03-r20200106-p1-b12a").unwrap();
+    assert_eq!(l3h.to_string(), "g03-r20200106-b12a");
+    assert_eq!(l3h.to_string().parse::<PartGroup>().unwrap(), l3h);
+    assert_eq!(group("l04-rc-p013-b01").unwrap().members()[3].to_string(), "l04-rc-p013-b01");
+    for untiered in ["l00-rc-b00", "l01-rc-b03", "l01-r20200106-b03", "l02-r20200106-b03"] { assert_eq!(group(untiered), None, "{untiered}"); }
+    for bad in ["g00-rc-b00", "g01-rc-b03", "g02-r20200106-b03", "l02-rc-b05", "g02-rc-p-b05"] { assert!(bad.parse::<PartGroup>().is_err(), "{bad}"); }
+}
+
+#[test]
+fn a_record_names_its_tries_object_or_its_groups() {
+    let slug = TableSlug::recorded("public$docs").unwrap();
+    let record = |scope: pb::ArtefactScope| pb::ArtefactRecord { kind: Some("search".into()), definition_id: Some("docs".into()), definition_version: Some(1), stats: None, scope: Some(scope as i32) };
+    let member: TrieKey = "l02-rc-p1-b05".parse().unwrap();
+    assert_eq!(slug.recorded_artefact_key(&member, &record(pb::ArtefactScope::Trie)).unwrap(), "tables/public$docs/artefacts/l02-rc-p1-b05/search/docs-v1.bin");
+    assert_eq!(slug.recorded_artefact_key(&member, &record(pb::ArtefactScope::PartGroup)).unwrap(), "tables/public$docs/artefacts/g02-rc-b05/search/docs-v1.bin");
+    assert_eq!(slug.recorded_artefact_key(&member, &pb::ArtefactRecord { scope: None, ..record(pb::ArtefactScope::Trie) }).unwrap(), "tables/public$docs/artefacts/l02-rc-p1-b05/search/docs-v1.bin", "a record without a scope is its trie's");
+    assert!(slug.recorded_artefact_key(&"l01-rc-b05".parse().unwrap(), &record(pb::ArtefactScope::PartGroup)).is_err(), "a trie outside every group has no group object");
+}
+
+#[test]
 fn trie_recency_keys_preserve_the_nonnegative_java_calendar_range() {
     use rtdb_types::CivilDate;
     for (date, text) in [

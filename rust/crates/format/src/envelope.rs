@@ -27,7 +27,7 @@ impl SourceMessage {
         let mut transaction = false;
         while !payload.is_empty() {
             let (field, wire) = wire_key(&mut payload)?;
-            if matches!(field, 1..=4 | 6) {
+            if matches!(field, 1..=4 | 6 | 7) {
                 if wire != 2 { return Err(invalid("Source message body must be length-delimited")); }
                 transaction = field == 6;
             }

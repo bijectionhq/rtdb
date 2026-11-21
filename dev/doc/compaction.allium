@@ -196,6 +196,9 @@ contract OutputSegmentLayout {
         -- Every finite signed 64-bit microsecond recency has a partition ceiling in the ISO proleptic Gregorian calendar.
         -- Weekly ceilings fall on Monday at 0000Z; a recency exactly on a ceiling belongs to that partition.
 
+    @invariant OutputPagesShareTheMergedSchema
+        -- Every page in an output data file uses the merged schema, including its field types and nullability.
+
     @invariant DecimalFieldsCarryTheirLogicalParameters
         -- Each decimal field in an output Arrow schema carries the merged field's signed 32-bit precision and scale, including decimal fields nested in containers.
         -- Its coefficient buffers represent values at that scale.
@@ -249,8 +252,11 @@ contract OutputSegmentLayout {
         -- A file whose data carries no `_recency` records none.
 
     @invariant OutputDeterministic
-        -- Every output file, including its recency column and its trie, is a deterministic function of the job and the `within_file_recency_branching` setting.
+        -- Every output data and meta file, including its recency column and its trie, is a deterministic function of the job and the `within_file_recency_branching` setting.
         -- Every node compacting a database has the same setting, so every node that runs the job writes identical files.
+        -- An output's artefact records are those its node's artefact kinds built for the definitions in force in its snapshot, so two nodes may record different sets.
+        -- Each artefact is deterministic in its own key.
+        -- Tiered compaction writes one bucket per job and leaves potential group artefacts to the lane, which sees the completed group in the catalog.
 }
 
 ------------------------------------------------------------

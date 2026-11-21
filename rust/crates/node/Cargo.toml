@@ -7,7 +7,8 @@ license.workspace = true
 publish.workspace = true
 
 [features]
-default = []
+default = ["search"]
+search = ["dep:rtdb-search"]
 kafka = ["dep:rtdb-kafka"]
 kafka-connect = ["kafka"]
 s3 = ["dep:rtdb-s3"]
@@ -25,6 +26,7 @@ rtdb-format.workspace = true
 rtdb-storage.workspace = true
 rtdb-index.workspace = true
 rtdb-trie.workspace = true
+rtdb-temporal.workspace = true
 rtdb-plan.workspace = true
 rtdb-sql.workspace = true
 rtdb-xtql.workspace = true
@@ -38,6 +40,7 @@ rtdb-s3 = { workspace = true, optional = true }
 rtdb-azure = { workspace = true, optional = true }
 rtdb-gcs = { workspace = true, optional = true }
 rtdb-pg-source = { workspace = true, optional = true }
+rtdb-search = { workspace = true, optional = true }
 async-trait.workspace = true
 futures.workspace = true
 prost-types.workspace = true
@@ -51,6 +54,7 @@ tokio.workspace = true
 tokio-util.workspace = true
 
 [dev-dependencies]
+rtdb-text.workspace = true
 tempfile.workspace = true
 
 [lints]

@@ -200,7 +200,7 @@ impl Compiler<'_, '_> {
         let valid_time = self.temporal(from.valid_time.as_ref(), &mut temporal_scope, parameters)?;
         let system_time = self.temporal(from.system_time.as_ref(), &mut temporal_scope, parameters)?;
         if !matches!(temporal_scope.relation.node(), RelationNode::Values { .. }) { return Err(error("xtql/invalid-expression", "Temporal scan filters cannot contain relational subqueries")); }
-        let scan = Relation::scan(Scan { table, columns, valid_time, system_time, clamp_valid_time: false, iids: None, predicates: Vec::new() })?;
+        let scan = Relation::scan(Scan { table, columns, valid_time, system_time, clamp_valid_time: false, iids: None, predicates: Vec::new(), top_k: None, ordered_top_k: None, matches: Vec::new() })?;
         let mut bound = Bound::from_relation(scan);
         let mut period_projections = Vec::new();
         for (period, lower_name, upper_name) in [("_valid_time", "_valid_from", "_valid_to"), ("_system_time", "_system_from", "_system_to")] {

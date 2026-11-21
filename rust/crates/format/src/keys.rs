@@ -6,6 +6,15 @@ use serde::Serialize;
 
 pub const CURRENT_STORAGE_VERSION: StorageVersion = StorageVersion(6);
 
+/// Independently derived ordered indexes belong to one source history.
+pub const ORDERED_INDEX_ROOT: &str = "ordered-index/v2";
+
+pub fn is_ordered_index_object(name: &str) -> bool {
+    name == ORDERED_INDEX_ROOT || name.strip_prefix(ORDERED_INDEX_ROOT)
+        .is_some_and(|suffix| suffix.starts_with('/'))
+}
+
+
 pub fn lex_hex(value: u64) -> String {
     let body = format!("{value:x}");
     format!("{:x}{body}", body.len() - 1)
@@ -103,6 +112,43 @@ impl TableSlug {
 
     pub fn metadata_key(&self, trie: &TrieKey) -> String { format!("{}/meta/{trie}.arrow", self.table_prefix()) }
 
+    /// Every artefact derived from one trie lives under this prefix, so collecting the trie can list and delete them all.
+    pub fn artefact_prefix(&self, trie: &TrieKey) -> String { self.owner_prefix(&ArtefactOwner::Trie(trie.clone())) }
+
+    /// Every artefact derived from a partition group's data files lives under this prefix, so collecting its last member can list and delete them all.
+    pub fn group_artefact_prefix(&self, group: &PartGroup) -> String { self.owner_prefix(&ArtefactOwner::Group(group.clone())) }
+
+    fn owner_prefix(&self, owner: &ArtefactOwner) -> String { format!("{}/artefacts/{owner}", self.table_prefix()) }
+
+    /// Every artefact of the table, under each of its tries' and partition groups' prefixes.
+    pub fn artefacts_prefix(&self) -> String { format!("{}/artefacts", self.table_prefix()) }
+
+    /// The owner, kind, definition id and version an artefact key was made from, or `None` for a key `owner_artefact_key` does not make.
+    pub fn parse_artefact_key(&self, key: &str) -> Option<(ArtefactOwner, String, String, i64)> {
+        let rest = key.strip_prefix(&self.artefacts_prefix())?.strip_prefix('/')?;
+        let mut parts = rest.split('/');
+        let (owner, kind, file, None) = (parts.next()?, parts.next()?, parts.next()?, parts.next()) else { return None };
+        let (id, version) = file.strip_suffix(".bin")?.rsplit_once("-v")?;
+        let (owner, version) = (owner.parse::<ArtefactOwner>().ok()?, version.parse::<i64>().ok()?);
+        (self.owner_artefact_key(&owner, kind, id, version).ok()? == key).then(|| (owner, kind.to_string(), id.to_string(), version))
+    }
+
+    pub fn artefact_key(&self, trie: &TrieKey, kind: &str, definition_id: &str, definition_version: i64) -> Result<String> {
+        self.owner_artefact_key(&ArtefactOwner::Trie(trie.clone()), kind, definition_id, definition_version)
+    }
+
+    pub fn owner_artefact_key(&self, owner: &ArtefactOwner, kind: &str, definition_id: &str, definition_version: i64) -> Result<String> {
+        for component in [kind, definition_id] {
+            if component.is_empty() || matches!(component, "." | "..") || component.contains(['/', '\\', '\0']) { return Err(invalid_key(component)); }
+        }
+        Ok(format!("{}/{kind}/{definition_id}-v{definition_version}.bin", self.owner_prefix(owner)))
+    }
+
+    /// The object a record on `trie`'s entry names: under the trie's own prefix, or under its partition group's for a group-scoped record.
+    pub fn recorded_artefact_key(&self, trie: &TrieKey, record: &crate::log::proto::ArtefactRecord) -> Result<String> {
+        self.owner_artefact_key(&ArtefactOwner::of(trie, record)?, record.kind(), record.definition_id(), record.definition_version())
+    }
+
     pub fn block_key(&self, block: BlockIndex) -> Result<String> {
         Ok(format!("{}/{}", self.table_prefix(), block_key(block)?))
     }
@@ -131,6 +177,88 @@ impl TrieKey {
     pub fn recency(&self) -> Option<CivilDate> { self.recency }
     pub fn part(&self) -> &[u8] { &self.part }
     pub fn block_index(&self) -> BlockIndex { self.block_index }
+
+    /// The partition group of a tiered trie: a current trie at level 2 and up, or a historical one at level 3 and up (trie-cat.allium: InsertTrie_General).
+    /// Level 0, level 1 and the levelled level-2 historical tries belong to none.
+    pub fn part_group(&self) -> Option<PartGroup> {
+        let tiered = self.level >= 3 || (self.level == 2 && self.recency.is_none());
+        let (_, parent) = self.part.split_last().filter(|_| tiered)?;
+        Some(PartGroup { parent: Self { level: self.level, recency: self.recency, part: parent.to_vec(), block_index: self.block_index } })
+    }
+}
+
+/// How many sibling tries complete a tiered partition group, one per IID bucket under their parent part.
+pub const BRANCH_FACTOR: u8 = 4;
+
+/// The sibling outputs of tiered compaction at one block: the same level, recency and parent part, one per bucket.
+/// They become live together; each is superseded on its own.
+/// Its key is its members' with `g` for `l` and the members' own bucket dropped, e.g. `g02-rc-b05` for `l02-rc-p0-b05` to `l02-rc-p3-b05`.
+#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Serialize)]
+pub struct PartGroup { parent: TrieKey }
+
+impl PartGroup {
+    pub fn level(&self) -> i64 { self.parent.level }
+    pub fn recency(&self) -> Option<CivilDate> { self.parent.recency }
+    pub fn block_index(&self) -> BlockIndex { self.parent.block_index }
+    /// In bucket order.
+    pub fn members(&self) -> Vec<TrieKey> {
+        (0..BRANCH_FACTOR).map(|bucket| {
+            let mut part = self.parent.part.clone();
+            part.push(bucket);
+            TrieKey { part, ..self.parent.clone() }
+        }).collect()
+    }
+}
+
+impl fmt::Display for PartGroup {
+    fn fmt(&self, output: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let parent = self.parent.to_string();
+        write!(output, "g{}", &parent[1..])
+    }
+}
+
+impl FromStr for PartGroup {
+    type Err = Anomaly;
+
+    fn from_str(key: &str) -> Result<Self> {
+        let parent: TrieKey = format!("l{}", key.strip_prefix('g').ok_or_else(|| invalid_key(key))?).parse()?;
+        let mut member = parent.clone();
+        member.part.push(0);
+        member.part_group().filter(|group| group.parent == parent).ok_or_else(|| invalid_key(key))
+    }
+}
+
+/// What an artefact is derived from, and so the prefix its objects live under.
+#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Serialize)]
+pub enum ArtefactOwner { Trie(TrieKey), Group(PartGroup) }
+
+impl ArtefactOwner {
+    /// The owner of a record on `trie`'s entry: the trie, or its partition group for a group-scoped record.
+    pub fn of(trie: &TrieKey, record: &crate::log::proto::ArtefactRecord) -> Result<Self> {
+        match record.scope() {
+            crate::log::proto::ArtefactScope::Trie => Ok(Self::Trie(trie.clone())),
+            crate::log::proto::ArtefactScope::PartGroup => trie.part_group().map(Self::Group)
+                .ok_or_else(|| Anomaly::incorrect("rtdb.format/invalid-artefact-scope", format!("Trie {trie} belongs to no partition group"))),
+        }
+    }
+    /// The tries whose data files the artefact is derived from.
+    pub fn tries(&self) -> Vec<TrieKey> {
+        match self { Self::Trie(trie) => vec![trie.clone()], Self::Group(group) => group.members() }
+    }
+}
+
+impl fmt::Display for ArtefactOwner {
+    fn fmt(&self, output: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self { Self::Trie(trie) => trie.fmt(output), Self::Group(group) => group.fmt(output) }
+    }
+}
+
+impl FromStr for ArtefactOwner {
+    type Err = Anomaly;
+
+    fn from_str(key: &str) -> Result<Self> {
+        if key.starts_with('g') { key.parse().map(Self::Group) } else { key.parse().map(Self::Trie) }
+    }
 }
 
 impl fmt::Display for TrieKey {

@@ -157,11 +157,22 @@ pub struct LiveTable {
     trie: MemoryHashTrie,
     last_system_time: Option<Timestamp>,
     canonical_entity_iids: bool,
+    located: LocatedLeaves,
 }
+
+/// A trie leaf's rows in iid order, each located in its table's chunks with its header copied out.
+#[derive(Debug)]
+pub struct LocatedRows { pub located: Vec<(u32, u32)>, pub headers: Vec<EventHeader>, _reservation: Option<Arc<MemoryReservation>> }
+
+/// The leaves a snapshot's scans have located, keyed by the leaf's address in the snapshot's own trie.
+/// A row's location depends on the chunk layout, which every append can change, so a cloned table starts empty.
+#[derive(Debug, Default)]
+struct LocatedLeaves(std::sync::Mutex<std::collections::HashMap<usize, Arc<LocatedRows>>>);
+impl Clone for LocatedLeaves { fn clone(&self) -> Self { Self::default() } }
 
 impl LiveTable {
     pub fn new(table: TableRef, block_index: BlockIndex, config: TrieConfig) -> Self {
-        Self { table, block_index, chunks: Vec::new(), row_count: 0, column_types: StructFields::new(), trie: MemoryHashTrie::new(config), last_system_time: None, canonical_entity_iids: true }
+        Self { table, block_index, chunks: Vec::new(), row_count: 0, column_types: StructFields::new(), trie: MemoryHashTrie::new(config), last_system_time: None, canonical_entity_iids: true, located: LocatedLeaves::default() }
     }
     pub fn table(&self) -> &TableRef { &self.table }
     pub fn block_index(&self) -> BlockIndex { self.block_index }
@@ -171,10 +182,34 @@ impl LiveTable {
     pub(crate) fn has_canonical_entity_iids(&self) -> bool { self.canonical_entity_iids }
     pub fn batches(&self) -> impl Iterator<Item = &Arc<IndexBatch>> { self.chunks.iter().map(|(_, batch)| batch) }
     /// The chunk holding `row`, and the row's position within it.
+    /// The unconsumed batches and the prefix to skip in the first one.
+    /// A live table preserves row addresses when it merges its Arrow chunks.
+    pub fn batches_from(&self, row: u32) -> impl Iterator<Item = (&Arc<IndexBatch>, usize)> {
+        let first = self.chunks.partition_point(|(start, batch)| u64::from(*start) + batch.len() as u64 <= u64::from(row));
+        self.chunks[first..].iter().map(move |(start, batch)| (batch, row.saturating_sub(*start) as usize))
+    }
     pub fn locate(&self, row: u32) -> Result<(u32, u32)> {
         if row >= self.row_count { return Err(invalid("Live table row exceeds its retained batches")); }
         let index = self.chunks.partition_point(|(start, _)| *start <= row).checked_sub(1).ok_or_else(|| invalid("Live table row has no owning batch"))?;
         Ok((index as u32, row - self.chunks[index].0))
+    }
+    /// `leaf`'s rows located and their headers copied, once per snapshot; `leaf` is one of this table's trie leaves.
+    pub fn located_rows(&self, leaf: &rtdb_trie::Leaf) -> Result<Arc<LocatedRows>> {
+        let key = leaf as *const rtdb_trie::Leaf as usize;
+        if let Some(rows) = self.located.0.lock().map_err(|_| invalid("Located leaf cache is poisoned"))?.get(&key) { return Ok(Arc::clone(rows)); }
+        let rows = leaf.sorted_rows(self)?;
+        let bytes = rows.len().checked_mul(std::mem::size_of::<(u32, u32)>() + std::mem::size_of::<EventHeader>()).and_then(|bytes| bytes.checked_add(256))
+            .ok_or_else(|| invalid("Located leaf rows exceed addressable memory"))?;
+        let _reservation = self.chunks.first().map(|(_, batch)| batch.owned.reservation().budget().reserve(bytes)).transpose()?;
+        let mut located = Vec::with_capacity(rows.len());
+        let mut headers = Vec::with_capacity(rows.len());
+        for row in rows.iter() {
+            let at = self.locate(*row)?;
+            headers.push(self.header_at(at)?);
+            located.push(at);
+        }
+        let rows = Arc::new(LocatedRows { located, headers, _reservation });
+        Ok(Arc::clone(self.located.0.lock().map_err(|_| invalid("Located leaf cache is poisoned"))?.entry(key).or_insert(rows)))
     }
     /// The header of a row `locate` found.
     pub fn header_at(&self, (chunk, offset): (u32, u32)) -> Result<EventHeader> {
@@ -225,7 +260,7 @@ impl LiveTable {
     /// stay small, so a table written a row per transaction is read from chunks of up to `MERGED_CHUNK_ROWS` rows.
     /// Chunks keep their row addresses, since a merged chunk starts where the earlier one did.
     fn merge_small_chunks(&mut self) -> Result<()> {
-        const MERGED_CHUNK_ROWS: usize = 1024;
+        const MERGED_CHUNK_ROWS: usize = 8192;
         while let [.., (start, previous), (_, last)] = self.chunks.as_slice() {
             if last.len() < previous.len() || previous.len() + last.len() > MERGED_CHUNK_ROWS || previous.arrow().schema() != last.arrow().schema() { break; }
             let schema = previous.arrow().schema();
@@ -235,7 +270,10 @@ impl LiveTable {
                 .ok_or_else(|| invalid("Merged live chunk exceeds addressable memory"))?;
             let mut reservation = budget.reserve(bound)?;
             let merged = arrow_select::concat::concat_batches(&schema, [previous.arrow(), last.arrow()]).map_err(invalid)?;
-            Arc::get_mut(&mut reservation).expect("a fresh reservation is unshared").shrink_to(merged.get_array_memory_size())?;
+            // Concatenating a dense union sizes every leg for all of its rows, so the merge can outgrow its inputs.
+            let lease = Arc::get_mut(&mut reservation).ok_or_else(|| invalid("A merged chunk's charge is shared"))?;
+            lease.grow_to(lease.bytes().max(merged.get_array_memory_size()))?;
+            lease.shrink_to(merged.get_array_memory_size())?;
             let merged = IndexBatch::from_owned(OwnedBatch::with_reservation(merged, reservation)?)?;
             let start = *start;
             self.chunks.truncate(self.chunks.len() - 2);
@@ -448,18 +486,23 @@ impl TransactionBuffer {
     pub fn erase(&mut self, table: TableRef, id: &EntityId) -> Result<()> {
         self.append(table, StoredEvent { iid: id.iid(), system_from: self.tx_key.system_time, valid_time: Interval::ALL, operation: StoredOperation::Erase, recency: None })
     }
-    pub fn append(&mut self, table: TableRef, mut event: StoredEvent) -> Result<()> {
+    pub fn append(&mut self, table: TableRef, event: StoredEvent) -> Result<()> { self.append_to(&table, event) }
+    /// As `append`, copying the table reference only for the table's first write.
+    pub fn append_to(&mut self, table: &TableRef, mut event: StoredEvent) -> Result<()> {
         if event.system_from != self.tx_key.system_time { return Err(invalid("Transaction event has another system time")); }
         if let StoredOperation::Put(document) = &mut event.operation { document.values_mut().for_each(Value::admit_object_dates); }
         let document_bytes = match &event.operation { StoredOperation::Put(document) => Value::document_retained_bytes(document)?, _ => 0 };
-        let bytes = document_bytes.checked_add(4096).and_then(|bytes| bytes.checked_add(table.schema.capacity())).and_then(|bytes| bytes.checked_add(table.table.capacity()))
+        let bytes = document_bytes.checked_add(4096).and_then(|bytes| bytes.checked_add(table.schema.len())).and_then(|bytes| bytes.checked_add(table.table.len()))
             .ok_or_else(|| invalid("Transaction event size overflow"))?;
         let reservation = self.budget.reserve(bytes)?;
-        let pending = self.tables.entry(table).or_default();
+        if !self.tables.contains_key(table) { self.tables.insert(table.clone(), PendingTable::default()); }
+        let pending = self.tables.get_mut(table).ok_or_else(|| invalid("Transaction table write disappeared"))?;
         pending.events.push(event);
         pending.reservations.push(reservation);
         Ok(())
     }
+    /// The snapshot the transaction started from, without its own writes, for a statement that reads no table.
+    pub fn base_snapshot(&self) -> Snapshot { self.base.clone() }
     pub fn snapshot(&self) -> Result<Snapshot> {
         let mut segments = self.segments.lock().map_err(|_| invalid("Transaction segment cache was poisoned"))?;
         for (table, pending) in &self.tables {
@@ -652,15 +695,55 @@ mod chunk_tests {
         let memory = MemoryBudget::new(1 << 26);
         let table = TableRef::new("public", "docs");
         let mut live = LiveTable::new(table, BlockIndex(0), TrieConfig::default());
-        for id in 0..2000i64 {
+        for id in 0..10_000i64 {
             let event = StoredEvent { iid: EntityId::Integer(id).iid(), system_from: Timestamp(id), valid_time: Interval::ALL,
                 operation: StoredOperation::Put(StructFields::from([("_id".into(), Value::I64(id)), ("v".into(), Value::F64(id as f64))])), recency: None };
             live = live.append(&TableWrite::new(StructFields::new(), Some(IndexBatch::copy_events(&[event], &StructFields::new(), &memory).unwrap())), Timestamp(id)).unwrap();
         }
-        assert!(live.chunks.len() <= 16, "{} chunks", live.chunks.len());
-        for id in [0u32, 1, 1023, 1024, 1999] {
+        assert!(live.chunks.len() <= 8, "{} chunks", live.chunks.len());
+        for id in [0u32, 1, 1023, 1024, 8191, 8192, 9999] {
             assert_eq!(live.row(id).unwrap().header().unwrap().system_from, Timestamp(i64::from(id)));
         }
+    }
+
+    fn put(id: i64, memory: &Arc<MemoryBudget>) -> TableWrite {
+        let event = StoredEvent { iid: EntityId::Integer(id).iid(), system_from: Timestamp(id), valid_time: Interval::ALL,
+            operation: StoredOperation::Put(StructFields::from([("_id".into(), Value::I64(id))])), recency: None };
+        TableWrite::new(StructFields::new(), Some(IndexBatch::copy_events(&[event], &StructFields::new(), memory).unwrap()))
+    }
+
+    #[test]
+    fn chunks_of_a_column_written_at_several_widths_merge_within_their_charge() {
+        let memory = MemoryBudget::new(1 << 28);
+        let mut live = LiveTable::new(TableRef::new("public", "docs"), BlockIndex(0), TrieConfig::default());
+        for tx in 0..128i64 {
+            let events = (tx * 64..tx * 64 + 64).map(|n| {
+                let id = match (n - tx * 64) % 3 { 0 => Value::I16(n as i16), 1 => Value::I32(n as i32), _ => Value::I64(n) };
+                StoredEvent { iid: EntityId::Integer(n).iid(), system_from: Timestamp(tx), valid_time: Interval::ALL,
+                    operation: StoredOperation::Put(StructFields::from([("_id".into(), id), ("sku".into(), Value::Utf8(format!("sku-{n}")))])), recency: None }
+            }).collect::<Vec<_>>();
+            live = live.append(&TableWrite::new(StructFields::new(), Some(IndexBatch::copy_events(&events, &StructFields::new(), &memory).unwrap())), Timestamp(tx)).unwrap();
+        }
+        assert!(live.chunks.len() <= 4, "{} chunks", live.chunks.len());
+        assert_eq!(live.row_count, 8192);
+    }
+
+    #[test]
+    fn a_snapshot_locates_a_leaf_once_and_a_later_append_relocates_it() {
+        let memory = MemoryBudget::new(1 << 26);
+        let mut live = LiveTable::new(TableRef::new("public", "docs"), BlockIndex(0), TrieConfig::default());
+        for id in 0..3 { live = live.append(&put(id, &memory), Timestamp(id)).unwrap(); }
+        let leaf = live.trie().leaves()[0];
+        let located = live.located_rows(leaf).unwrap();
+        assert!(Arc::ptr_eq(&located, &live.located_rows(leaf).unwrap()));
+        assert_eq!(located.headers.iter().map(|header| header.system_from).collect::<OrderedSet<_>>(), (0..3).map(Timestamp).collect());
+        let appended = live.append(&put(3, &memory), Timestamp(3)).unwrap();
+        let relocated = appended.located_rows(appended.trie().leaves()[0]).unwrap();
+        assert!(!Arc::ptr_eq(&located, &relocated));
+        assert_eq!(relocated.headers.len(), 4);
+        for (at, header) in relocated.located.iter().zip(&relocated.headers) { assert_eq!(appended.header_at(*at).unwrap(), *header); }
+        drop((located, relocated, live, appended));
+        assert_eq!(memory.used_bytes(), 0, "located rows are released with the table that holds them");
     }
 
     #[test]

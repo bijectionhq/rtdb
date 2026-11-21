@@ -1,3 +1,4 @@
+mod accelerate;
 mod aggregate;
 mod context;
 mod parameters;
@@ -18,6 +19,7 @@ mod window;
 mod scan;
 mod fragment;
 mod columnar;
+mod vector;
 mod page_metadata;
 mod scan_tasks;
 mod spill;
@@ -37,6 +39,7 @@ mod cross;
 mod join_storage;
 mod mark;
 
+pub use accelerate::{CandidateVerifier, ConstantEvaluator, CorpusRegistry, CorpusSource, FileMatches, MatchAnswers, ScanAccelerator, ScanRequest};
 pub use context::{CatalogSnapshot, DatabaseSnapshot, QueryContext, QueryOptions};
 pub use fragment::{FragmentDepth, ScanFragment, ScanFragmenter, TriePrefix, evaluate_fragment};
 pub use cursor::{PreparedQuery, QueryCursor};

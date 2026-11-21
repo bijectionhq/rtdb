@@ -30,6 +30,14 @@ use crate::keys::KeyService;
 /// The protobuf type name the cell's storage factory is registered under.
 pub const CELL_STORAGE_TYPE: &str = "rtdb.multi.CellStorage";
 pub const GARBAGE_DIRECTORY: &str = "~garbage";
+const ORDERED_INDEX_RELEASE: &str = "-ordered-index";
+
+pub(crate) fn belongs_to_ordered_index(name: &str) -> bool {
+    rtdb_format::keys::is_ordered_index_object(name)
+        || name.strip_prefix(GARBAGE_DIRECTORY)
+            .is_some_and(|record| record.starts_with('/') && record.ends_with(ORDERED_INDEX_RELEASE))
+}
+
 const SEALED_OVERHEAD: u64 = OVERHEAD as u64;
 
 /// The deployment store a node opens, carried in its `DatabaseConfig`.
@@ -558,6 +566,9 @@ impl ObjectStore for EncryptingStore {
     async fn head(&self, key: &ObjectKey) -> rtdb_storage::Result<StoredObject> { self.inner.head(key).await.map(plain) }
     async fn head_fresh(&self, key: &ObjectKey) -> rtdb_storage::Result<StoredObject> { self.inner.head_fresh(key).await.map(plain) }
     async fn get(&self, key: &ObjectKey) -> rtdb_storage::Result<Bytes> { self.open(key, self.inner.get(key).await?) }
+    async fn get_fresh(&self, key: &ObjectKey) -> rtdb_storage::Result<Bytes> {
+        self.open(key, self.inner.get_fresh(key).await?)
+    }
     async fn get_range(&self, key: &ObjectKey, range: Range<u64>) -> rtdb_storage::Result<Bytes> {
         let plaintext = self.get(key).await?;
         let length = plaintext.len() as u64;
@@ -566,7 +577,7 @@ impl ObjectStore for EncryptingStore {
     }
     async fn put(&self, key: &ObjectKey, bytes: Bytes) -> rtdb_storage::Result<()> {
         // An immutable put retried with identical content is a completed retry; sealing twice gives different bytes, so the retry is recognised before sealing.
-        if let Ok(existing) = self.get(key).await { return if existing == bytes { Ok(()) } else { Err(Error::Task(format!("{key} already exists with different content"))) }; }
+        if let Ok(existing) = self.get_fresh(key).await { return if existing == bytes { Ok(()) } else { Err(Error::Task(format!("{key} already exists with different content"))) }; }
         self.inner.put(key, self.seal(key, &bytes)?).await
     }
     async fn put_file(&self, key: &ObjectKey, source: &Path) -> rtdb_storage::Result<()> {
@@ -577,6 +588,7 @@ impl ObjectStore for EncryptingStore {
         Ok(self.inner.list(directory).await?.into_iter().map(plain).collect())
     }
     async fn delete(&self, key: &ObjectKey) -> rtdb_storage::Result<()> { self.inner.delete(key).await }
+    async fn forget(&self, key: &ObjectKey) -> rtdb_storage::Result<()> { self.inner.forget(key).await }
 }
 
 /// A garbage record: an object released by its deployment, which the reaper may erase once `released_at_ms` is older than its grace period.
@@ -628,7 +640,8 @@ impl ObjectStore for GarbageStore {
     async fn delete(&self, key: &ObjectKey) -> rtdb_storage::Result<()> {
         if self.released.lock().contains(key) { return Ok(()); }
         let record = GarbageRecord { key: key.as_str().to_owned(), released_at_ms: (self.clock)() };
-        let name = ObjectKey::new(format!("{GARBAGE_DIRECTORY}/{:020}-{}", record.released_at_ms, uuid::Uuid::new_v4().simple()))
+        let suffix = if rtdb_format::keys::is_ordered_index_object(key.as_str()) { ORDERED_INDEX_RELEASE } else { "" };
+        let name = ObjectKey::new(format!("{GARBAGE_DIRECTORY}/{:020}-{}{suffix}", record.released_at_ms, uuid::Uuid::new_v4().simple()))
             .map_err(|error| Error::Task(error.to_string()))?;
         self.inner.put(&name, Bytes::from(serde_json::to_vec(&record).expect("a record serializes"))).await?;
         self.released.lock().insert(key.clone());

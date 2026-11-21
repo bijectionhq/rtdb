@@ -14,12 +14,18 @@ fn current(catalog: &TrieCatalog) -> BTreeSet<String> { catalog.current_tries(&t
 fn names(keys: &[&str]) -> BTreeSet<String> { keys.iter().map(|key| (*key).to_owned()).collect() }
 
 #[test]
-fn historical_l1_waits_for_current_file_and_covered_l0_leaves_catalog() {
+fn historical_l1_waits_for_current_file_and_covered_l0_stays_in_source_inventory() {
     let initial = apply(&[("l00-rc-b00", 10), ("l00-rc-b01", 10), ("l00-rc-b02", 10), ("l01-r20200101-b01", 5), ("l01-r20200102-b01", 5)]);
     assert_eq!(current(&initial), names(&["l00-rc-b00", "l00-rc-b01", "l00-rc-b02"]));
     let next = initial.with_tries(table(), [notification("l01-rc-b01", 15)], Timestamp(100)).unwrap();
     assert_eq!(current(&next), names(&["l00-rc-b02", "l01-r20200101-b01", "l01-r20200102-b01", "l01-rc-b01"]));
-    assert!(next.all_tries(&table()).iter().all(|trie| trie.key.to_string() != "l00-rc-b00"));
+    let blocks: Vec<_> = next.l0_source(&table(), BlockIndex(-1), BlockIndex(2))
+        .map(|trie| (trie.key.block_index(), trie.state)).collect();
+    assert_eq!(blocks, [
+        (BlockIndex(0), TrieState::Garbage { as_of: Timestamp(100) }),
+        (BlockIndex(1), TrieState::Garbage { as_of: Timestamp(100) }),
+        (BlockIndex(2), TrieState::Live),
+    ]);
     assert!(next.garbage_tries(&table(), Timestamp::MAX).is_empty());
     assert_eq!(next.l0_max_block_index(&table()), BlockIndex(2));
 }
@@ -58,7 +64,7 @@ fn l1_current_before_historical_and_replayed_l0_are_idempotent_4301_4545() {
 }
 
 #[test]
-fn persisted_partitions_repair_covered_l0_and_drop_old_l0_garbage_5395() {
+fn persisted_partitions_keep_covered_l0_for_exact_replay_5395() {
     let mut live_l0 = notification("l00-rc-b00", 10); live_l0.state = TrieState::Live;
     let mut garbage_l0 = notification("l00-rc-b01", 10); garbage_l0.state = TrieState::Garbage { as_of: Timestamp(100) };
     let mut l1 = notification("l01-rc-b00", 10); l1.state = TrieState::Live;
@@ -69,7 +75,12 @@ fn persisted_partitions_repair_covered_l0_and_drop_old_l0_garbage_5395() {
     let block = TableBlock::from_parts(BTreeMap::new(), &Default::default(), 0, partitions).unwrap();
     let catalog = TrieCatalog::load(&BTreeMap::from([(table(), block)]), 20, Timestamp(101)).unwrap();
     assert_eq!(current(&catalog), names(&["l01-rc-b00"]));
-    assert_eq!(catalog.all_tries(&table()).len(), 1);
+    let source: Vec<_> = catalog.l0_source(&table(), BlockIndex(-1), BlockIndex(1))
+        .map(|trie| (trie.key.block_index(), trie.state)).collect();
+    assert_eq!(source, [
+        (BlockIndex(0), TrieState::Garbage { as_of: Timestamp(101) }),
+        (BlockIndex(1), TrieState::Garbage { as_of: Timestamp(100) }),
+    ]);
     assert_eq!(catalog.l0_max_block_index(&table()), BlockIndex(1));
 }
 
@@ -131,4 +142,59 @@ fn table_oid_allocation_is_sorted_and_recorded_slugs_stay_frozen() {
     assert_eq!(next.entry(&alpha).unwrap().slug.as_str(), "historical-location");
     assert_eq!(next.entry(&table()).unwrap().oid, 20_001);
     assert_eq!(next.entry(&zeta).unwrap().oid, 20_002);
+}
+
+fn artefact(definition_id: &str, version: i64, stats: u8) -> rtdb_format::log::proto::ArtefactRecord {
+    rtdb_format::log::proto::ArtefactRecord { kind: Some("search".into()), definition_id: Some(definition_id.into()), definition_version: Some(version), stats: Some(vec![stats]), scope: None }
+}
+
+#[test]
+fn a_trie_keeps_the_first_artefact_per_definition_version_and_unknown_tries_take_none() {
+    let catalog = apply(&[("l01-rc-b00", 30)]);
+    let key = "l01-rc-b00".parse().unwrap();
+    let recorded = catalog.with_artefacts(&table(), [
+        (key, artefact("body", 1, 1)),
+        ("l01-rc-b00".parse().unwrap(), artefact("body", 1, 2)),
+        ("l01-rc-b00".parse().unwrap(), artefact("body", 2, 3)),
+        ("l01-rc-b07".parse().unwrap(), artefact("body", 1, 4)),
+    ]);
+    let tries = recorded.all_tries(&table());
+    let [trie] = tries.as_slice() else { panic!("one trie expected, got {tries:?}") };
+    assert_eq!(trie.artefacts, vec![artefact("body", 1, 1), artefact("body", 2, 3)]);
+    assert_eq!(trie.artefact("search", "body", 2), Some(&artefact("body", 2, 3)));
+    assert!(trie.artefact("search", "title", 1).is_none());
+    assert!(recorded.with_artefacts(&TableRef::new("public", "other"), [("l01-rc-b00".parse().unwrap(), artefact("body", 1, 1))]).all_tries(&TableRef::new("public", "other")).is_empty());
+}
+
+#[test]
+fn removing_an_artefact_drops_its_record_whatever_its_stats_and_leaves_the_rest() {
+    let key: rtdb_format::keys::TrieKey = "l01-rc-b00".parse().unwrap();
+    let recorded = apply(&[("l01-rc-b00", 30)]).with_artefacts(&table(), [(key.clone(), artefact("body", 1, 1)), (key.clone(), artefact("body", 2, 2))]);
+    let removed = recorded.without_artefacts(&table(), [(key.clone(), artefact("body", 1, 7)), (key.clone(), artefact("title", 1, 1)), ("l01-rc-b07".parse().unwrap(), artefact("body", 2, 2))]);
+    assert_eq!(removed.all_tries(&table())[0].artefacts, vec![artefact("body", 2, 2)]);
+    assert_eq!(removed.without_artefacts(&table(), [(key, artefact("body", 1, 1))]).all_tries(&table()), removed.all_tries(&table()), "removing an absent record changes nothing");
+}
+
+#[test]
+fn artefact_records_survive_the_block_file_roundtrip() {
+    let catalog = apply(&[("l01-rc-b00", 30), ("l01-rc-b01", 30)]).with_artefacts(&table(), [("l01-rc-b01".parse().unwrap(), artefact("body", 1, 9))]);
+    let block = TableBlock::from_parts(BTreeMap::new(), &Default::default(), 0, catalog.partitions(&table()).unwrap()).unwrap();
+    let loaded = TrieCatalog::load(&BTreeMap::from([(table(), block)]), 20, Timestamp(200)).unwrap();
+    assert_eq!(catalog.all_tries(&table()), loaded.all_tries(&table()));
+    assert!(loaded.all_tries(&table()).iter().any(|trie| trie.artefact("search", "body", 1).is_some()));
+}
+
+#[test]
+fn a_partition_groups_members_are_looked_up_by_key_whatever_their_state() {
+    let complete = apply(&[("l01-rc-b00", 2), ("l02-rc-p0-b00", 10), ("l02-rc-p1-b00", 10), ("l02-rc-p2-b00", 10), ("l02-rc-p3-b00", 10)]);
+    let member: rtdb_format::keys::TrieKey = "l02-rc-p2-b00".parse().unwrap();
+    let group = member.part_group().unwrap();
+    let members = complete.group_members(&table(), &group);
+    assert_eq!(members.iter().map(|trie| trie.key.to_string()).collect::<Vec<_>>(), ["l02-rc-p0-b00", "l02-rc-p1-b00", "l02-rc-p2-b00", "l02-rc-p3-b00"]);
+    assert!(members.iter().all(|trie| trie.state == TrieState::Live));
+    assert_eq!(complete.trie(&table(), &member).map(|trie| trie.data_file_size), Some(10));
+    assert!(complete.trie(&table(), &"l02-rc-p2-b01".parse().unwrap()).is_none());
+    let partial = apply(&[("l02-rc-p0-b00", 10), ("l02-rc-p3-b00", 10)]);
+    assert_eq!(partial.group_members(&table(), &group).iter().map(|trie| (trie.key.to_string(), trie.state)).collect::<Vec<_>>(),
+        [("l02-rc-p0-b00".to_string(), TrieState::Nascent), ("l02-rc-p3-b00".to_string(), TrieState::Nascent)]);
 }

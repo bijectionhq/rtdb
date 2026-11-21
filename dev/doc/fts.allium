@@ -1,0 +1,396 @@
+-- allium: 3
+-- fts.allium
+--
+-- Full-text search over a table's documents, answered at any valid time and system time.
+--
+-- The unit indexed is the text run: every version of one entity in a trie data file whose indexed values are the same, with the rectangles of valid time × system time where one of them is visible, as the scan's own resolver decides them over the file.
+-- A trie may carry one search file per index definition over its own data file's runs.
+-- The members of a partition group (trie-cat.allium: PartGroup) may share one search file over their runs, deleted with the last member.
+-- A search file only nominates candidates.
+-- Which version of an entity is visible at the query's valid and system time is decided by the scan's bitemporal resolution, as it is for every other predicate, and MATCH is re-checked on the resolved row.
+-- So a search file that is missing costs a query time and never changes its result.
+--
+-- The core knows a search file only as an artefact of kind `search`: trie-cat.allium records artefacts on trie entries, db.allium carries ArtefactsAdded through the leader, and gc.allium deletes artefacts with their owner.
+-- This spec owns what an artefact of kind `search` holds, which definitions and jobs produce them, and how a query reads them.
+--
+-- See: rust/crates/search, rust/crates/text, rust/crates/maintenance/src/artefact.rs, rust/crates/query/src/accelerate.rs; plan: fts-implementation.adoc
+
+use "./trie-cat.allium" as trie_cat
+use "./db.allium" as db
+
+------------------------------------------------------------
+-- Given
+------------------------------------------------------------
+
+given {
+    database: db/Database
+    trie_catalog: trie_cat/TrieCatalog
+    search_definitions: SearchDefinitions
+}
+
+------------------------------------------------------------
+-- Values
+------------------------------------------------------------
+
+value SearchIndexDefinition {
+    -- A document of `xt.search_indexes`, keyed by the index's name.
+    name: String
+    table: trie_cat/TableRef
+    -- Only the UTF-8 leg of each named column is indexed; other legs of the same column contribute no terms.
+    columns: List<String>
+    analyzer: String
+    -- The defining transaction's id, so redefining an index under its name is a new version.
+    version: Integer
+    -- False when the index covers the current side alone: `WITH (history = false)`; a document without it covers history.
+    history: Boolean
+
+    -- Derived
+    -- The artefact definition id names the analyzer and search file format versions, so a change to either builds new search files rather than reading old ones.
+    artefact_id: "{name}~a{analyzer_version}f{format_version}"
+}
+
+value SearchDoc {
+    -- One document per text run of a column: an entity's versions in the data file whose value in that column has the same tokens, a value that is not text having none.
+    -- A version visible nowhere within the file, a delete, an erase, and a version whose column is null or absent belong to no run of the column.
+    doc_id: Integer
+    iid: Bytes
+    member: Integer
+    -- Where one of the run's versions is visible, as rtdb_temporal::visibility resolves the file's events of the entity with no bounds.
+    rectangles: List<Rectangle>
+}
+
+value Rectangle {
+    valid_from: Instant
+    valid_to: Instant
+    system_from: Instant
+    system_to: Instant
+}
+
+------------------------------------------------------------
+-- Entities
+------------------------------------------------------------
+
+entity SearchDefinitions {
+    -- The definitions in force: `xt.search_indexes` read at a committed basis, as of the basis's own system time in valid time too.
+    -- They are documents the indexer writes, so every node reading at the same basis holds the same set, and a node reads them once per basis.
+    -- A snapshot carrying a transaction's own writes reads them afresh, as of the reader's current time.
+    definitions: List<SearchIndexDefinition>
+}
+
+entity SearchJob {
+    -- An artefact job of kind `search`; ephemeral, like compaction.allium's CompactionJob.
+    table: trie_cat/TableRef
+    owner: trie_cat/TrieKey | trie_cat/PartGroup
+    definition: SearchIndexDefinition
+}
+
+------------------------------------------------------------
+-- Config
+------------------------------------------------------------
+
+config {
+    -- See: server config `search: {enabled, threads}`, NodeOptions.artefact_threads / scan_acceleration.
+    -- Off stops the lane and the accelerator together; MATCH is then answered by scanning.
+    enabled: Boolean = true
+    threads: Integer = 1
+    -- Above this many candidates, the scan runs unnarrowed.
+    max_candidates: Integer = 100000
+    -- Above this many bytes of selected tries the lane should have indexed but has not, the node builds none of their search files itself.
+    -- Level 0 and the partial level-1 current trie, which the lane never indexes, do not count.
+    max_unindexed_bytes: Integer = 67108864
+    -- Group members' data files must fit within this limit and a quarter of the node's memory budget.
+    group_bytes: Integer = 536870912
+}
+
+------------------------------------------------------------
+-- Rules: Definitions
+------------------------------------------------------------
+
+rule DefineSearchIndex {
+    -- CREATE SEARCH INDEX name ON table (column, ...) [WITH (history = true | false)] is a transaction; the indexer writes its document at the transaction's system time, valid from then on.
+    -- An index covers history by default; without it, the lane builds no historical trie's search file, and a past query reads those tries through files its node builds.
+    when: SearchIndexDefined(definition)
+
+    ensures:
+        search_definitions.definitions.add(definition)
+}
+
+rule DropSearchIndex {
+    -- DROP SEARCH INDEX deletes the document; the lane then retires the dropped definition's search files (RetireSearchFiles).
+    when: SearchIndexDropped(name)
+
+    ensures:
+        search_definitions.definitions.remove(name)
+}
+
+------------------------------------------------------------
+-- Rules: Index lane
+------------------------------------------------------------
+
+-- Search jobs are the artefact lane's jobs (maintenance/src/artefact.rs: available_artefact_jobs) for the definitions in force:
+-- a live trie above level 0, other than a level-1 current trie below the file size target, and other than a historical trie for a definition without history, lacking an artefact for the definition's artefact id and version.
+-- Level 0 and the partial level-1 current trie are rewritten within a block or two, so a node builds their search files itself when a query needs them.
+-- A partition group whose members are all live, lack the file, and fit the size limit is one job.
+-- Otherwise each eligible member that lacks the file gets its own job.
+-- Jobs run current side first, then higher levels first.
+
+rule SearchJobRuns {
+    -- Each tiered compaction job writes one bucket, so compaction leaves a potential shared search file to the lane.
+    -- For other eligible outputs, compaction still builds a search file from the local data file and records it on TrieDetails before publishing.
+    -- The lane builds files compaction leaves out, files for new definitions or versions, and repairs.
+    -- The lane downloads the owner's data files, in bucket order for a group.
+    -- Both paths read one page at a time under that page's memory reservation.
+    -- Both reserve the segment's indexing heap up front in proportion to the input size, build the segment on disk, and stream the bundle to the object store.
+    -- A job the memory budget cannot admit fails, and is eligible again at the next block.
+    when: job: SearchJob.created
+
+    ensures:
+        BuildAndUploadSearchFile(job)
+        db/ArtefactsAdded(table: job.table, entries: search_entries(job)) appended to database.source_log
+}
+
+rule RetireSearchFiles {
+    -- A search file is retired once its definition leaves force: dropped, redefined, or superseded by a new analyzer or format version.
+    -- A retired definition is one neither in force nor made after the snapshot's basis, so a definition newer than the snapshot is never retired.
+    -- The lane appends ArtefactsRemoved for the retired records on the table's live tries, and once it is applied deletes their objects.
+    -- It deletes as well every unrecorded object of kind `search` under a live trie for a retired definition: one a builder uploaded and failed to record.
+    -- While a definition is in force, such an object needs no sweep: its job stays available, and the next builder writes the same bytes under the same key and records them.
+    -- The lane looks at every table when it starts, at a table whenever its definitions in force change, and again at a table whose last look, or one of whose jobs, failed; it looks only while no job of its own is running.
+    -- GC collects an artefact under a retired trie or under a group with no remaining members.
+    -- Every node's lane retires on its own, so a removal may be appended more than once, and a second changes nothing.
+    -- A builder on another node may still record an object a retiring lane deleted; its own lane retires that record at its next look.
+    -- While nodes run different analyzer or format versions, a newer node retires an older version's files and an older node builds them again; the churn ends with the upgrade.
+    when: DefinitionsInForceChanged(table)
+
+    ensures:
+        db/ArtefactsRemoved(table: table, entries: retired_records(table)) appended to database.source_log
+        RetiredSearchFilesDeleted(table)
+}
+
+rule RepairUnreadableSearchFile {
+    -- A scan that finds a recorded search file missing, or its bytes unreadable as a search file, evaluates that trie from its data file and reports the file to its database's lane, which wakes for it.
+    -- A file that could not be fetched at all is not reported: the store may be briefly unavailable, and the file sound.
+    -- The lane drops its cached copies and reads the object afresh. If the object is missing it builds it; if its bytes are still unreadable it deletes it and builds it again; if it cannot be fetched the job fails and is retried.
+    -- Rebuilding the original file reproduces its bytes and leaves its records in place.
+    -- If the group build finds an original member's data file missing and the catalog has superseded or collected that member, the lane builds a file for each remaining live member that still needs one.
+    -- A single ArtefactsAdded message replaces the shared records after the new files have been uploaded.
+    -- A report is dropped when no live member still records that search file or the definition has left force.
+    when: SearchFileUnreadable(table, owner, definition)
+
+    ensures:
+        SearchJob.created(table: table, owner: owner, definition: definition)
+}
+
+------------------------------------------------------------
+-- Rules: Query
+------------------------------------------------------------
+
+-- MATCH(column, query) holds when the column's UTF-8 value holds every term of the query, tokenised by the analyzer, and every phrase of it (terms between double quotes) as consecutive tokens.
+-- The analyzer splits a word longer than the index's longest token (rtdb_text::MAX_TOKEN_BYTES) into tokens of at most that length, so the index holds every token the analyzer makes.
+-- SEARCH_SCORE(column, query) is the BM25 of that value for the query's terms.
+--
+-- A scan with a MATCH conjunct on a column that a definition in force covers is narrowed before it opens:
+--
+--   1. The scan selects tries exactly as it does without MATCH.
+--      A trie whose recency is at or before the earlier of the query's valid and system lower bounds holds no event the query can see, so no search file of it is read or built.
+--      A recorded trie none of whose lifespan sections, read from its record's stats, meets the bounds is left unopened, and within a file a document whose section misses them is passed over.
+--   2. A selected trie whose entry records a search file for that definition contributes the IIDs of its docs whose terms satisfy the query and one of whose rectangles meets the query's bounds.
+--      The scan reads a shared file once and uses the runs of selected members alone for candidates and ranking.
+--   3. A selected trie with no such record, or whose file cannot be read, is read through a search file the node builds from its data file and keeps, under the same rule.
+--      A data file never changes, so a kept one serves every later query of the trie.
+--      Queries that need the same file at once share one build; one that fails or is cancelled leaves the next to build it.
+--   4. Every live segment contributes the IIDs of its matching rows under the same rule, with recency ∞.
+--      A node keeps postings per live segment and column, extending them by the batches appended since, so a growing live index is tokenised once.
+--      A document is cut by the events of its entity in the partition's other selected tries and live segments, as CutByLaterEvents says, and contributes only if a rectangle it keeps meets the bounds.
+--   5. The scan runs restricted to the union, resolving each candidate's full history in every selected trie and live segment.
+--   6. MATCH is evaluated on each resolved row, as MatchEvaluatedByTheScan says.
+--
+-- Past max_candidates candidates, the scan runs unnarrowed instead.
+-- Past max_unindexed_bytes of tries the lane should have indexed but has not, the node builds none of them: the scan is neither narrowed nor ranked, and only rows of tries with a recorded file take MATCH from it.
+--
+-- A score's corpus is CorpusAsOfTheSnapshot's, registered with the query once per table and column a MATCH narrows, from every partition the query reads.
+-- A query text's corpus is fixed at its first use, so every score in one query is relative to the same corpus.
+--
+-- A score from the index equals SEARCH_SCORE on the resolved row: both take each term's frequency and the document's length rounded to the index's stored lengths.
+--
+-- A scan whose rows feed only projections and then `ORDER BY SEARCH_SCORE(column, query) DESC ... LIMIT n`, with a MATCH on the same column, is ranked before it opens, in each partition it reads:
+--
+--   0. The column's corpus is registered before any partition is ranked, so a score is the same whichever partition fixes it first.
+--
+--   1. Every matching event that may be visible bounds its IID above by its score, an IID's best event bounding it.
+--      Events in live segments are scored from their rows.
+--      A search file's documents are scored a batch of windows at a time, best window bound first, and a window is scored only once its bound may exceed every event already scored.
+--   2. IIDs are taken best bound first, in batches.
+--      A document left exactly visible by CutByLaterEvents counts as verified when the scan's only predicate is the MATCH used to narrow candidates.
+--      The rest, live rows, documents a tie left inexact, and every IID where the scan has other predicates, are verified by running the scan itself over the partition restricted to them, with its own predicates.
+--   3. Verification stops once n verified rows score strictly above every bound not yet taken, every unscored window's included.
+--   4. The scan is restricted to the IIDs of verified rows scoring at least the n-th, ties included, and the sort above keeps the first n as it would have.
+--
+-- The visible row of an IID is one of its matching events, so its bound is never below its score, and no IID left out can hold one of the first n rows.
+-- An IID's history lies in one partition, so the first n rows overall are among the first n of some partition, and the sort above picks them from the union.
+-- The scan is left to the unranked narrowing when the matching IIDs exceed max_candidates, or when verification runs past sixteen batches.
+-- SEARCH_SCORE sums documents, tokens and each of its terms' document frequencies over every corpus the query registered; with none, each term's inverse document frequency is 1.
+
+rule CorpusAsOfTheSnapshot {
+    -- A column's corpus at a snapshot is its values in the rows a scan of the table sees at the snapshot's own instant, its latest transaction's system time, taken as valid time and system time both, across every partition and the live index.
+    -- A row whose column is null or absent is not in it; a value that is not text is, with no tokens.
+    -- Documents counts those rows, tokens sums their stored lengths, and a term's frequency counts the rows holding it.
+    -- It is a function of the snapshot's data, not of which search files exist: a node builds the search file of every trie visible at the instant, whatever max_unindexed_bytes allows narrowing.
+    -- Each file's runs that its own events leave visible at every instant from its latest event on are counted once per file and kept; those visible over a bounded valid interval are checked at the instant.
+    -- An entity with events in more than one file, or in the live index, is resolved across all of them as the scan resolves, live rows first at one instant, and its one visible row replaces what its runs counted file by file.
+    -- A shared file contributes only the runs and row keys of the members the snapshot selects.
+    -- A node keeps the corpus for those files, member selections and live segments.
+    when: ScoreAsked(column, snapshot)
+
+    ensures:
+        CorpusOfVisibleRows(column, snapshot)
+}
+
+rule CutByLaterEvents {
+    -- A document's rectangles come from its own file's events; an event of the same entity elsewhere in the partition, in a selected trie or live segment, cuts them.
+    -- A put or delete whose system-from is later than a rectangle's takes the event's valid interval from that system time on.
+    -- A later erase removes the whole rectangle, including a rectangle whose system interval ended before the erase.
+    -- An earlier event takes nothing.
+    -- An event at the same instant takes nothing: the scan orders such events itself, so the document stays a candidate and is no longer exact.
+    -- The tries cut by are those step 1 keeps, each found for the entity by its IID path and its file's key table, and the live segments by their kept keys; a trie step 1 leaves out holds no cut the query can see.
+    -- A document is exactly visible where a rectangle it keeps meets the bounds, no tie touched it, and no trie left unopened by its sections covers its entity: such a trie may hold a cut, a delete say.
+    when: ScanWithMatch(scan, predicate)
+
+    ensures:
+        EachCandidateCutByItsEntitysLaterEvents(scan)
+}
+
+rule MatchIsAResidualPredicate {
+    when: ScanWithMatch(scan, predicate)
+
+    let candidates = search_candidates(scan, predicate)
+
+    ensures:
+        ScanRestrictedToIids(scan, candidates)
+        FilterResolvedRows(scan, predicate)
+}
+
+rule MatchEvaluatedByTheScan {
+    -- A MATCH with a constant query in a predicate the scan filters by, under NOT and IS NULL as much as bare, is a boolean column the scan evaluates on each resolved row.
+    -- The text column is then read only for the rows the scan cannot answer otherwise, and projected only if something else needs it.
+    -- A row of a trie takes MATCH from its search file for a definition covering the column: true where the document matches, null where the column is null or absent, and false otherwise.
+    -- A row in a trie with no readable recorded file takes it from the file the node builds, and a row in a live segment, or in a trie the node does not build, from its own value.
+    -- NOT MATCH, which no candidate set narrows, and count(*) over MATCH thus tokenise no text but the live index's.
+    when: ScanWithMatch(scan, predicate)
+
+    ensures:
+        EachResolvedRowMatchedFromItsSearchFileOrValue(scan, predicate)
+}
+
+------------------------------------------------------------
+-- Contracts
+------------------------------------------------------------
+
+contract SearchFileLayout {
+    -- What a search file holds.
+    -- See: search/src/file.rs
+
+    @invariant PureFunctionOfFileAndDefinition
+        -- A search file's bytes are a deterministic function of the owner's data files, its definition and the job's identity.
+        -- Every node that runs the same job writes the same object.
+
+    @invariant OneDocPerRun
+        -- A search file has one document per text run of each column in each member's data file, so a version changing one column adds no posting to another.
+        -- It records each row's run in each column, or that the row is visible with the column null or absent, or that it is visible nowhere within the file.
+        -- A document's rectangles may merge when they have the same system-time interval and adjacent valid-time intervals.
+        -- Each rectangle retains the originating event's system-from for cuts by events outside its file.
+
+    @invariant RectanglesFromTheResolver
+        -- A document's rectangles are where the scan's resolver, run over the file's events of the entity with no bounds, makes one of the run's versions visible.
+        -- A scan at any bounds sees exactly the events whose rectangles meet them (temporal/tests/visibility.rs), so within the file a document is visible exactly where a rectangle is.
+
+    @invariant KeysAreRecorded
+        -- The file records every row's IID, system from, valid interval and operation, in data-file order within each member.
+        -- A partition group's members have disjoint IID ranges and appear in bucket order, so a shared file's keys are in IID order.
+
+    @invariant LifespanSections
+        -- A document's lifespan runs from its birth, the earliest of its rectangles' later lower bound, to its death, the latest of their earlier upper bound, clipped to its trie's recency: no row of a historical trie is visible from its recency on, whatever its own file's events say.
+        -- Documents fall into classes by lifespan: under one, four, sixteen, sixty-four and two hundred and fifty-six weeks, and longer.
+        -- Each class's section bounds its documents' rectangles, births and deaths, and the file records it in its sidecar and in its artefact record's stats.
+        -- A shared file's lifespan sections bound its full partition group, whose members share one recency.
+        -- A document is visible at a point only where its birth is before the point's later coordinate and its death after the earlier, so a section whose bounds miss a query's holds nothing visible to it.
+        -- A query at a past valid time but the present system time prunes little this way: only the bounds on each axis apply.
+
+    @invariant WindowBoundsAreUpperBounds
+        -- Documents fall in windows of 128 consecutive ids.
+        -- For each term of a column and each window holding it, the file records the term's highest frequency there and the shortest stored length among the documents holding it, stored for a term in at least 1024 documents and read from its postings otherwise.
+        -- A term's part of BM25 rises with its frequency and, its inverse document frequency being positive, falls with the length, so no document in the window scores above the sum of the parts at those, whatever the corpus.
+
+    @invariant RowsAndNullsAreRecorded
+        -- The file records the first page and document of each member and the first row of each data page.
+        -- A visible row's member, page and position within it determine MATCH in each column, null included.
+
+    @invariant TokensAreTheResidualsTokens
+        -- A search file's terms are the analyzer's tokens of each row's UTF-8 value, the same tokens MATCH evaluates on a resolved row, with their positions, so a phrase matches in the file exactly when it matches the row.
+}
+
+contract SearchCorrectness {
+    -- What narrowing may and may not change about a query.
+
+    @invariant RankedLimitKeepsTheFirstRows
+        -- Under a ranked LIMIT, the rows the scan hands on include every row among the first n by SEARCH_SCORE, ties at the n-th included.
+
+    @invariant ResultIndependentOfSearchFiles
+        -- A query's rows are the same whichever search files exist, are readable, or are missing, including none.
+        -- SEARCH_SCORE's values are the same too, a function of the snapshot (ScoresFromTheSnapshot).
+
+    @invariant CandidatesAreASuperset
+        -- Every IID with a visible row satisfying MATCH at the query's valid and system time is in the candidate set.
+
+    @invariant VisibilityIsResolved
+        -- Whether a row is visible is decided by the scan's resolution over the candidate's full history.
+        -- A document's rectangles only ever rule a candidate out: an event in another trie or the live index can cut a run's rectangles and never widen them.
+
+    @invariant SearchFilesFromTheSnapshot
+        -- A scan reads the search files its snapshot's catalog records, and those its node builds from the snapshot's data files, and no others.
+        -- A node keeps recorded files by object key, and the files it builds by data-file key and columns, each naming immutable bytes, and uses one only while the database's storage is the one it was read through, so a kept file is never stale.
+        -- A recorded file the object store holds on this node's disk, its local store or disk cache, is mapped from there rather than read into memory, so the files kept open are bounded by disk and only the pages a query reads are resident.
+        -- A file read into memory holds its buffer-pool lease, so when the pool refuses a read for want of room, the node drops the files it keeps that way and reads again.
+}
+
+------------------------------------------------------------
+-- Surfaces
+------------------------------------------------------------
+
+surface FullTextSearch {
+    facing client: db/Client
+
+    context db: db/Database
+
+    provides:
+        SearchIndexDefined(definition)
+        SearchIndexDropped(name)
+        ScanWithMatch(scan, predicate)
+
+    contracts:
+        demands SearchCorrectness
+
+    @guarantee MatchAtAnyTime
+        -- MATCH answers at any valid time and system time the scan accepts, the default as-of-now included.
+
+    @guarantee ScoresFromTheSnapshot
+        -- A score is BM25 against CorpusAsOfTheSnapshot: the same snapshot scores the same whatever compaction and the lane have done.
+        -- A query at a past time is scored against its snapshot's corpus, not the past one.
+        -- A query narrowing several columns or tables sums their corpora.
+}
+
+-- Black box helpers used in rule expressions:
+--   search_entries(job)                — the file's record on its trie or on every member of its group
+--   search_candidates(scan, predicate)  — steps 1–4 of the query plan
+--   BuildAndUploadSearchFile(job)       — tokenise the data file's rows and upload the bundled index under the owner's artefact key
+--   CorpusOfVisibleRows(column, snapshot) — CorpusAsOfTheSnapshot's counts (search/src/corpus.rs)
+--   EachCandidateCutByItsEntitysLaterEvents(scan) — CutByLaterEvents' subtraction, before narrowing and ranking
+--   EachResolvedRowMatchedFromItsSearchFileOrValue(scan, predicate) — MatchEvaluatedByTheScan's evaluation, in the scan, before its filter
+--   retired_records(table)               — the records RetireSearchFiles retires (maintenance/src/artefact.rs: retired_artefacts)
+--   RetiredSearchFilesDeleted(table)     — delete the retired records' objects, and list the table's artefact objects to delete the unrecorded ones RetireSearchFiles names (stray_artefacts)
+
+------------------------------------------------------------
+-- Open Questions
+------------------------------------------------------------
+
+open question "How far does fan-out scale? A completed partition group can share one search file across four sibling tries. At what table size would files spanning several partition groups be useful?"

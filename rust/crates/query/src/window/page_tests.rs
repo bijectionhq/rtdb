@@ -40,7 +40,7 @@ fn expressions(functions: &[WindowFunction]) -> Vec<WindowExpr> {
 async fn partition_mapping_preserves_semantic_pages_including_empty_pages() {
     for batch_rows in [1,1024] {
         let execution = execution(batch_rows);let baseline = execution.context.memory.used_bytes();
-        let mut cursor = PartitionPages { input: input(vec![vec![row(1,3),row(2,4)],vec![],vec![row(1,5)]],&execution),positions: vec![0],runtime: runtime(&execution),keys: execution.context.spill.create().unwrap(),count: 0,execution: execution.clone() };
+        let mut cursor = PartitionPages { input: input(vec![vec![row(1,3),row(2,4)],vec![],vec![row(1,5)]],&execution),positions: vec![0],runtime: runtime(&execution),keys: Vec::new(),index: Default::default(),count: 0,execution: execution.clone() };
         let mut first = cursor.next_page().await.unwrap().unwrap();assert_eq!(first.len(),2);
         assert_eq!(first.next().unwrap().values,[Value::I64(1),Value::I64(3),Value::U64(0)]);
         assert_eq!(first.next().unwrap().values,[Value::I64(2),Value::I64(4),Value::U64(1)]);
@@ -103,7 +103,7 @@ async fn partition_hash_precedes_cross_unit_timestamp_equality() {
     let schema = Schema::new(vec![Field { id: ColumnId(0),name: "x".into(),qualifier: None,qualified_only: false,unnamed: false,data_type: ty }]).unwrap();
     let relation = Relation::new(schema,RelationNode::Values { rows: vec![] }).unwrap();
     let runtime = EmittedRelation::derive(Arc::new(relation),&execution.context.catalog,execution.parameters.types(),&execution.context.memory).unwrap();
-    let mut cursor = PartitionPages { input: input(vec![vec![vec![first],vec![second]]],&execution),positions: vec![0],runtime,keys: execution.context.spill.create().unwrap(),count: 0,execution: execution.clone() };
+    let mut cursor = PartitionPages { input: input(vec![vec![vec![first],vec![second]]],&execution),positions: vec![0],runtime,keys: Vec::new(),index: Default::default(),count: 0,execution: execution.clone() };
     let mut page = cursor.next_page().await.unwrap().unwrap();
     assert_eq!(partition_id(&page.next().unwrap().values).unwrap(),0);
     assert_eq!(partition_id(&page.next().unwrap().values).unwrap(),1);

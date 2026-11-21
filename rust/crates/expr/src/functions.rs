@@ -43,6 +43,7 @@ pub fn scalar_call(name: &str, args: &[Value], context: &EvalContext<'_>) -> Res
     let name = name.to_lowercase().replace('-', "_");
     function_type(&name, &args.iter().map(Value::logical_type).collect::<Vec<_>>())?;
     if let Some(result) = crate::period::predicate(&name, args, context) { return result; }
+    if let Some(result) = crate::search::call(&name, args, context) { return result; }
     if let Some(result) = crate::string::call(&name, args, context) { return result; }
     if let Some(result) = crate::session_info::call(&name, args, context) { return result; }
     if let Some(result) = crate::collection::call(&name, args, context) { return result; }
