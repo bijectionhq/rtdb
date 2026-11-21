@@ -116,6 +116,8 @@ pub enum Lifecycle {
     Quarantined,
     /// Being moved to another cell; fenced while the cutover completes.
     Moving,
+    /// The current checkpoint is being repaired from its immutable archive.
+    Restoring,
     /// Fenced; its objects, log and keys are being destroyed.
     Deleting,
     /// A tombstone.
@@ -170,6 +172,7 @@ pub struct DeploymentRecord {
     pub moved_at_ms: Option<i64>,
     pub cell_transfer: Option<CellTransfer>,
     pub disposal: Option<DisposalReceipt>,
+    pub checkpoint_recovery: Option<CheckpointRecovery>,
     pub version: Version,
 }
 
@@ -204,11 +207,22 @@ pub struct Checkpoint {
     pub system_time: i64,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CheckpointRecovery {
+    pub operation: uuid::Uuid,
+    pub checkpoint: Checkpoint,
+    pub epoch: u64,
+    pub previous_lifecycle: Lifecycle,
+    pub archive: String,
+    pub manifest_sha256: String,
+    pub completed_at_ms: Option<i64>,
+}
+
 impl DeploymentRecord {
     pub fn new(name: impl Into<String>, org: impl Into<String>, ensemble: Vec<MemberId>, now_ms: i64) -> Self {
         let id = uuid::Uuid::new_v4().to_string();
         Self { lineage: id.clone(), id, name: name.into(), org: org.into(), incarnation: 1, lifecycle: Lifecycle::Live, epoch: 0, holder: None,
-            ensemble, replica_journals: BTreeSet::new(), read_width: 1, activation_crashes: 0, created_at_ms: now_ms, move_intent: None, log_epoch: 0, parent: None, move_from: None, linearizable_reads: false, checkpoint: None, moved_at_ms: None, cell_transfer: None, disposal: None, version: 0 }
+            ensemble, replica_journals: BTreeSet::new(), read_width: 1, activation_crashes: 0, created_at_ms: now_ms, move_intent: None, log_epoch: 0, parent: None, move_from: None, linearizable_reads: false, checkpoint: None, moved_at_ms: None, cell_transfer: None, disposal: None, checkpoint_recovery: None, version: 0 }
     }
 
     /// The affinity key: stable across epochs and residency, distinct across incarnations.

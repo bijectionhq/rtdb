@@ -188,6 +188,7 @@ async fn route(directory: &Arc<dyn Directory>, name: &str, expected: Option<&str
     match record.lifecycle {
         Lifecycle::Live | Lifecycle::Quarantined => {}
         Lifecycle::Moving => return Err(Anomaly::new(AnomalyCategory::Unavailable, "rtdb.multi/moving", format!("{name} is moving to another cell; retry shortly"))),
+        Lifecycle::Restoring => return Err(Anomaly::new(AnomalyCategory::Unavailable, "rtdb.multi/restoring", format!("{name}'s checkpoint is being restored; retry shortly"))),
         Lifecycle::Deleting | Lifecycle::Deleted => return Err(Anomaly::incorrect("rtdb.multi/deleted", format!("{name} has been deleted"))),
     }
     let members: BTreeMap<MemberId, MemberRecord> = directory.members().await?.into_iter().map(|member| (member.id.clone(), member)).collect();

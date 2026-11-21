@@ -96,6 +96,14 @@ tries as ciphertext to the independent archive. The receipt fixes the
 location, length and digest of each object. Retrying the operation recovers
 the same checkpoint. The key vault stays outside the capture.
 
+`rtdb-multi restore` accepts the live directory's current checkpoint with
+the original archive manifest and current key. It records a restore intent,
+fences the old writer at the logkeepers, and verifies the objects. The
+directory then admits the checkpoint archive as a read-only source for
+missing objects. A successor recovers the same ordered tail before serving.
+The directory keeps the accepted manifest and completion for retries.
+Retain the archive while an installation uses it.
+
 **Fixed on the way.**
 
 - A newly activated fork could publish its parent's boundary and trim its own log before its first flush completed.

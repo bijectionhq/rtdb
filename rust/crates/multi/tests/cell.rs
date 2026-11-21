@@ -437,7 +437,47 @@ async fn a_checkpoint_capture_keeps_its_cut_and_archives_only_sealed_objects() {
     assert!(advance(Some(first.block)).await.block > first.block);
     let replay = rtdb_multi::archive::capture(cell.directory.as_ref(), &cell.storage(), &archive, &cell.keys(), id, operation).await.unwrap();
     assert_eq!(replay, capture);
+    assert!(rtdb_multi::archive::restore(cell.directory.as_ref(), &cell.storage(), &archive, &cell.keys(), id, operation, 4 << 20).await.is_err());
     drop(client);
+    cell.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn restoring_the_current_archive_preserves_the_ordered_tail_and_authority() {
+    let mut cell = Cell::start(2, None).await;
+    let id = uuid::Uuid::new_v4();
+    admin::install_deployment(cell.directory.as_ref(), id, "shop", "acme", 3).await.unwrap();
+    let client = cell.connect("shop").await;
+    client.simple_query("INSERT INTO orders (_id, total) VALUES (1, 10)").await.unwrap();
+    let holder = cell.holder("shop").await.unwrap();
+    cell.node(holder).agent.flush("shop").await.unwrap();
+    let record = tokio::time::timeout(Duration::from_secs(8), async {
+        loop {
+            let record = cell.directory.deployment(&id.to_string()).await.unwrap().unwrap();
+            if record.checkpoint.is_some() { return record; }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    }).await.unwrap();
+    let archive_dir = tempfile::tempdir().unwrap();
+    let archive = CellStorage::Local { root: archive_dir.path().to_owned() };
+    let operation = uuid::Uuid::new_v4();
+    let storage = cell.storage();
+    rtdb_multi::archive::capture(cell.directory.as_ref(), &storage, &archive, &cell.keys(), id, operation).await.unwrap();
+    client.simple_query("INSERT INTO orders (_id, total) VALUES (2, 20)").await.unwrap();
+    drop(client);
+    cell.nodes[holder].take().unwrap().kill().await.unwrap();
+    let CellStorage::Local { root } = &storage else { panic!("a disposable local fixture") };
+    std::fs::remove_dir_all(root.join(record.storage_prefix())).unwrap();
+
+    let restored = rtdb_multi::archive::restore(cell.directory.as_ref(), &storage, &archive, &cell.keys(), id, operation, 4 << 20).await.unwrap();
+    assert!(restored.completed_at_ms.is_some());
+    assert_eq!(restored.epoch, record.epoch + 1);
+    let reopened = connect_eventually(&cell, "shop").await;
+    assert_eq!(values(&reopened, "SHOW rtdb_hosted_source_barrier").await, [id.to_string()]);
+    assert_eq!(values(&reopened, "SELECT total FROM orders ORDER BY _id").await, ["10", "20"]);
+    let retried = rtdb_multi::archive::restore(cell.directory.as_ref(), &storage, &archive, &cell.keys(), id, operation, 4 << 20).await.unwrap();
+    assert_eq!(retried, restored);
+    drop(reopened);
     cell.stop().await;
 }
 
