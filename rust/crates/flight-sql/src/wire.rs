@@ -5,9 +5,9 @@ use arrow_flight::FlightData;
 use arrow_ipc::writer::{CompressionContext, DictionaryTracker, IpcDataGenerator, IpcWriteOptions};
 use arrow_schema::{Schema, SchemaRef};
 use bytes::Bytes;
-use rtdb_columnar::{MemoryBudget, MemoryReservation, OwnedBatch, estimate_read_value_bytes, read_value_as, from_field};
+use rtdb_columnar::{MemoryBudget, MemoryReservation, OwnedBatch, from_field};
 use rtdb_tx::SqlArguments;
-use rtdb_types::{LogicalType, Value};
+use rtdb_types::LogicalType;
 use tonic::Status;
 use crate::error::{arrow, invalid, status};
 
@@ -123,9 +123,13 @@ pub(crate) fn parameter_ipc(batch: &RecordBatch, memory: &Arc<MemoryBudget>) -> 
     Ok(Some(retain(output, charge)))
 }
 pub(crate) fn parameter_batch(bytes: &Bytes, memory: &Arc<MemoryBudget>) -> Result<OwnedBatch, Status> {
-    let charge = memory.reserve(ipc_bound(bytes)?).map_err(status)?;
+    let mut charge = memory.reserve(ipc_bound(bytes)?).map_err(status)?;
     let mut reader = rtdb_format::ipc::ArrowStream::from_reader(Cursor::new(bytes.as_ref()), None).map_err(status)?;
     let batch = reader.next().transpose().map_err(status)?.unwrap_or_else(|| RecordBatch::new_empty(reader.schema()));
+    drop(reader);
+    let retained = add(rtdb_columnar::shared_allocation_size(&batch).map_err(status)?, schema_bound(batch.schema_ref())?)?;
+    let reservation = Arc::get_mut(&mut charge).expect("ticket decoding owns its reservation");
+    reservation.shrink_to(retained.min(reservation.bytes())).map_err(status)?;
     OwnedBatch::with_reservation(batch, charge).map_err(status)
 }
 
@@ -156,13 +160,8 @@ impl BoundParameters {
 
     pub fn batch(&self) -> &RecordBatch { self.batch.batch() }
 
-    pub fn update_arguments(&self, memory: &Arc<MemoryBudget>) -> Result<SqlArguments, Status> {
-        let arguments = SqlArguments::from_arrow(self.batch.clone(), memory).map_err(status)?;
-        let _check = memory.reserve(schema_bound(self.batch().schema_ref())?).map_err(status)?;
-        for ((field, array), logical) in self.batch().schema_ref().fields().iter().zip(self.batch().columns()).zip(arguments.types()) {
-            rtdb_columnar::validate_readable_column(field, array.as_ref(), logical, memory).map_err(status)?;
-        }
-        Ok(arguments)
+    pub fn arguments(&self, memory: &Arc<MemoryBudget>) -> Result<SqlArguments, Status> {
+        arguments(&self.batch, memory)
     }
 }
 fn ipc_bound(bytes: &[u8]) -> Result<usize, Status> {
@@ -200,14 +199,14 @@ impl ParameterTypes {
     pub fn as_slice(&self) -> &[LogicalType] { &self.types }
 }
 
-pub(crate) fn arguments(batch: &RecordBatch, memory: &Arc<MemoryBudget>) -> Result<SqlArguments, Status> {
-    let schema = batch.schema_ref();
-    let mut bound = schema_bound(schema)?;
-    for row in 0..batch.num_rows() { for (column, field) in schema.fields().iter().enumerate() { bound = add(bound, estimate_read_value_bytes(field, batch.column(column).as_ref(), row).map_err(status)?)?; } }
-    let _scratch = memory.reserve(bound).map_err(status)?;
-    let types = logical_parameter_types(schema)?;
-    let rows = (0..batch.num_rows()).map(|row| schema.fields().iter().zip(&types).enumerate().map(|(column, (field, ty))| read_value_as(ty, field, batch.column(column).as_ref(), row).map_err(status)).collect::<Result<Vec<Value>, _>>()).collect::<Result<Vec<_>, _>>()?;
-    SqlArguments::new(types, rows, memory).map_err(status)
+pub(crate) fn arguments(batch: &OwnedBatch, memory: &Arc<MemoryBudget>) -> Result<SqlArguments, Status> {
+    let record = batch.batch();
+    let _check = memory.reserve(schema_bound(record.schema_ref())?).map_err(status)?;
+    let arguments = SqlArguments::from_arrow(batch.clone(), memory).map_err(status)?;
+    for ((field, array), logical) in record.schema_ref().fields().iter().zip(record.columns()).zip(arguments.types()) {
+        rtdb_columnar::validate_readable_column(field, array.as_ref(), logical, memory).map_err(status)?;
+    }
+    Ok(arguments)
 }
 
 #[cfg(test)]
@@ -215,6 +214,7 @@ mod tests {
     use super::*;
     use arrow_array::Int64Array;
     use rtdb_columnar::read_value;
+    use rtdb_types::Value;
     use arrow_schema::{DataType, Field};
     #[test]
     fn argument_rows_are_each_cell_read_under_its_columns_field() {
@@ -223,9 +223,9 @@ mod tests {
             Field::new("t", DataType::Timestamp(arrow_schema::TimeUnit::Microsecond, Some("UTC".into())), true)]));
         let columns: Vec<ArrayRef> = vec![Arc::new(Int64Array::from(vec![Some(1), None])), Arc::new(arrow_array::StringArray::from(vec!["a", "b"])),
             Arc::new(arrow_array::TimestampMicrosecondArray::from(vec![None, Some(5)]).with_timezone("UTC"))];
-        let batch = RecordBatch::try_new(Arc::clone(&schema), columns).unwrap();
+        let batch = OwnedBatch::new(RecordBatch::try_new(Arc::clone(&schema), columns).unwrap(), &memory).unwrap();
         let arguments = arguments(&batch, &memory).unwrap();
-        let expected: Vec<Vec<Value>> = (0..2).map(|row| (0..3).map(|column| read_value(schema.field(column), batch.column(column).as_ref(), row).unwrap()).collect()).collect();
+        let expected: Vec<Vec<Value>> = (0..2).map(|row| (0..3).map(|column| read_value(schema.field(column), batch.batch().column(column).as_ref(), row).unwrap()).collect()).collect();
         assert_eq!(arguments.rows().map(|row| row.unwrap().to_vec()).collect::<Vec<_>>(), expected);
     }
     #[test]
@@ -261,7 +261,7 @@ mod tests {
     fn empty_parameter_columns_and_empty_parameter_rows_remain_distinct() {
         let memory = MemoryBudget::new(1 << 20); assert!(parameter_ipc(&RecordBatch::new_empty(Arc::new(Schema::empty())), &memory).unwrap().is_none());
         let schema = Arc::new(Schema::new(vec![Field::new("arbitrary-name", DataType::Int64, true)]));
-        let bytes = parameter_ipc(&RecordBatch::new_empty(schema), &memory).unwrap().unwrap(); let batch = parameter_batch(&bytes, &memory).unwrap(); let args = arguments(batch.batch(), &memory).unwrap();
+        let bytes = parameter_ipc(&RecordBatch::new_empty(schema), &memory).unwrap().unwrap(); let batch = parameter_batch(&bytes, &memory).unwrap(); let args = arguments(&batch, &memory).unwrap();
         assert_eq!(args.row_count(), 0); assert_eq!(args.types().len(), 1);
     }
 
@@ -271,7 +271,7 @@ mod tests {
         let schema = Arc::new(Schema::new(vec![Field::new("arg", DataType::Int64, false)]));
 
         let bound = BoundParameters::empty(&schema, &memory).unwrap();
-        let args = bound.update_arguments(&memory).unwrap();
+        let args = bound.arguments(&memory).unwrap();
         drop(bound);
 
         assert!(memory.used_bytes() > 0);
@@ -290,10 +290,12 @@ mod tests {
         let batch = RecordBatch::new_empty(Arc::clone(&schema));
         let bound = schema_bound(&schema).unwrap();
 
+        let batch_memory = MemoryBudget::new(1 << 24);
+        let owned = OwnedBatch::new(batch.clone(), &batch_memory).unwrap();
         let short = MemoryBudget::new(bound - 1);
         for error in [
             ParameterTypes::from_batch(&batch, &short).err().unwrap(),
-            arguments(&batch, &short).err().unwrap(),
+            arguments(&owned, &short).err().unwrap(),
         ] {
             assert_eq!(error.code(), tonic::Code::InvalidArgument);
             let bytes = error.metadata().get_bin("xtdb-anomaly-bin").unwrap().to_bytes().unwrap();
@@ -324,26 +326,25 @@ mod tests {
         assert_eq!(decoded.used_bytes(), 0);
 
         let memory = MemoryBudget::new(1 << 24);
-        let args = arguments(&batch, &memory).unwrap();
+        let args = arguments(&owned, &memory).unwrap();
+        drop(owned);
         drop(batch);
         assert_eq!(args.types(), std::slice::from_ref(&expected));
         assert_eq!(args.row_count(), 0);
-        let direct_memory = MemoryBudget::new(1 << 24);
-        let direct = SqlArguments::new(vec![expected], Vec::new(), &direct_memory).unwrap();
-        assert_eq!(memory.used_bytes(), direct_memory.used_bytes());
+        assert!(batch_memory.used_bytes() > 0);
         assert_eq!(memory.peak_bytes(), bound + memory.used_bytes());
-        drop(direct);
         drop(args);
+        assert_eq!(batch_memory.used_bytes(), 0);
         assert_eq!(memory.used_bytes(), 0);
     }
 
     #[test]
-    fn bound_update_arguments_retain_arrow_and_admit_rows_only_when_read() {
+    fn bound_arguments_retain_arrow_and_admit_rows_only_when_read() {
         let memory = MemoryBudget::new(1 << 20);
         let schema = Arc::new(Schema::new(vec![Field::new("client-name", DataType::Int64, true)]));
         let batch = RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(vec![None, Some(17)]))]).unwrap();
         let bound = BoundParameters::new(OwnedBatch::new(batch, &memory).unwrap(), &memory).unwrap();
-        let restore = bound.update_arguments(&memory).unwrap();
+        let restore = bound.arguments(&memory).unwrap();
         drop(bound);
         let obstruction = memory.reserve(memory.limit_bytes() - memory.used_bytes()).unwrap();
 
@@ -353,6 +354,42 @@ mod tests {
         drop(obstruction);
         assert_eq!(restore.rows().map(|row| row.unwrap().to_vec()).collect::<Vec<_>>(), [vec![Value::Null], vec![Value::I64(17)]]);
         drop(restore);
+        assert_eq!(memory.used_bytes(), 0);
+    }
+
+    #[test]
+    fn ticket_arguments_reject_an_unreadable_value_after_the_first_row() {
+        let memory = MemoryBudget::new(1 << 20);
+        let field = rtdb_columnar::to_field("arg", &LogicalType::Scalar(rtdb_types::ScalarType::Uri)).unwrap();
+        let batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![field])),
+            vec![Arc::new(arrow_array::StringArray::from(vec!["https://xtdb.com", "bad uri"]))],
+        ).unwrap();
+        let bytes = parameter_ipc(&batch, &memory).unwrap().unwrap();
+        let decoded = parameter_batch(&bytes, &memory).unwrap();
+
+        let error = arguments(&decoded, &memory).err().unwrap();
+
+        let bytes = error.metadata().get_bin("xtdb-anomaly-bin").unwrap().to_bytes().unwrap();
+        let anomaly: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(anomaly["code"], "xtdb/invalid-uri");
+    }
+
+    #[test]
+    fn ticket_arguments_keep_only_the_retained_arrow_allocation_after_decoding() {
+        let encoded = MemoryBudget::new(1 << 22);
+        let schema = Arc::new(Schema::new(vec![Field::new("arg", DataType::Int64, false)]));
+        let batch = RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(vec![42; 2048]))]).unwrap();
+        let bytes = parameter_ipc(&batch, &encoded).unwrap().unwrap();
+        let memory = MemoryBudget::new(ipc_bound(&bytes).unwrap());
+        let decoded = parameter_batch(&bytes, &memory).unwrap();
+
+        let args = arguments(&decoded, &memory).unwrap();
+        drop(decoded);
+        assert_eq!(args.row_count(), 2048);
+        assert_eq!(&*args.rows().next().unwrap().unwrap(), &[Value::I64(42)]);
+        assert!(memory.used_bytes() < memory.limit_bytes() / 16);
+        drop(args);
         assert_eq!(memory.used_bytes(), 0);
     }
 
@@ -447,7 +484,7 @@ mod tests {
             let decoded = decoder.decode(encoded.into_iter().next().unwrap()).unwrap().unwrap();
             assert_eq!(read_value(decoded.batch().schema().field(0), decoded.batch().column(0).as_ref(), 0).unwrap(), value);
             let bytes = parameter_ipc(&batch, &memory).unwrap().unwrap(); let parameters = parameter_batch(&bytes, &memory).unwrap();
-            let args = arguments(parameters.batch(), &memory).unwrap();
+            let args = arguments(&parameters, &memory).unwrap();
             assert_eq!(args.types(), &[ty]); assert_eq!(&*args.rows().next().unwrap().unwrap(), &[value]);
             drop(args); drop(parameters); drop(bytes); drop(decoded); drop(decoder); assert_eq!(memory.used_bytes(), 0);
         }

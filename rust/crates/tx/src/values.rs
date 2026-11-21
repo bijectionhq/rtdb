@@ -179,6 +179,10 @@ impl ArrowDocuments {
         let mut fields = Vec::with_capacity(schema.fields().len());
         let mut columns = Vec::with_capacity(schema.fields().len());
         for (field, array) in schema.fields().iter().zip(batch.columns()) {
+            if contains_fixed_size_list(field.data_type()) {
+                let logical = from_field(field)?;
+                rtdb_columnar::validate_readable_column(field, array.as_ref(), &logical, memory)?;
+            }
             let nulls = array.logical_null_count();
             let array = if nulls == array.len() {
                 Arc::new(arrow_array::NullArray::new(array.len())) as ArrayRef
@@ -199,7 +203,7 @@ impl ArrowDocuments {
     fn compatible(field: &arrow_schema::Field, normalize: bool) -> bool {
         field.metadata().is_empty() && match field.data_type() {
             DataType::Struct(fields) => fields.iter().all(|field| Self::compatible(field, normalize)),
-            DataType::List(field) => Self::compatible(field, normalize),
+            DataType::List(field) | DataType::FixedSizeList(field, _) => Self::compatible(field, normalize),
             DataType::Union(fields, arrow_schema::UnionMode::Dense) => fields.iter().all(|(_, field)| {
                 Self::compatible(field, normalize) && (normalize || from_field(field).is_ok_and(|ty| rtdb_columnar::execution_type(&ty) == ty))
             }),
@@ -211,9 +215,22 @@ impl ArrowDocuments {
         }
     }
 
-    pub(crate) fn from_source(array: &StructArray, layout: Arc<DecodedDocumentLayout>) -> Option<Self> {
-        (!array.is_empty() && array.null_count() == 0 && array.fields().iter().all(|field| Self::compatible(field, false)))
-            .then(|| Self { array: array.clone(), layout })
+    pub(crate) fn from_source(array: &StructArray, layout: Arc<DecodedDocumentLayout>, memory: &Arc<MemoryBudget>) -> Result<Option<Self>> {
+        if array.is_empty() || array.null_count() != 0 || !array.fields().iter().all(|field| Self::compatible(field, false)) {
+            return Ok(None);
+        }
+        let fixed = || array.fields().iter().zip(array.columns()).filter(|(field, _)| contains_fixed_size_list(field.data_type()));
+        if fixed().next().is_some() {
+            let bound = fixed().try_fold(4096usize, |bytes, (field, _)| {
+                field.size().checked_mul(8).and_then(|size| bytes.checked_add(size)).ok_or_else(overflow)
+            })?;
+            let _scratch = memory.reserve(bound)?;
+            for (field, column) in fixed() {
+                let logical = layout.types.get(field.name()).ok_or_else(|| Anomaly::fault("rtdb.tx/document-schema", "Replayed column has no type"))?;
+                rtdb_columnar::validate_readable_column(field, column.as_ref(), logical, memory)?;
+            }
+        }
+        Ok(Some(Self { array: array.clone(), layout }))
     }
 
     pub(crate) fn array(&self) -> &StructArray { &self.array }
@@ -242,6 +259,16 @@ impl ArrowDocuments {
     }
 }
 
+pub(crate) fn contains_fixed_size_list(layout: &DataType) -> bool {
+    match layout {
+        DataType::FixedSizeList(..) => true,
+        DataType::Struct(fields) => fields.iter().any(|field| contains_fixed_size_list(field.data_type())),
+        DataType::List(field) => contains_fixed_size_list(field.data_type()),
+        DataType::Union(fields, arrow_schema::UnionMode::Dense) => fields.iter().any(|(_, field)| contains_fixed_size_list(field.data_type())),
+        _ => false,
+    }
+}
+
 fn normalized_document_array(array: &ArrayRef, memory: &Arc<MemoryBudget>, normalize_unions: bool) -> Result<Option<ArrayRef>> {
     Ok(Some(match array.data_type() {
         DataType::UInt8 => signed_column::<UInt8Type, Int8Type>(array.as_ref()),
@@ -266,6 +293,18 @@ fn normalized_document_array(array: &ArrayRef, memory: &Arc<MemoryBudget>, norma
             let field = normalized_field(field, &values);
             match ListArray::try_new(Arc::new(field), source.offsets().clone(), values, source.nulls().cloned()) {
                 Ok(array) => Arc::new(array),
+                Err(_) => return Ok(None),
+            }
+        }
+        DataType::FixedSizeList(field, width) => {
+            let source = array.as_fixed_size_list();
+            let Some(values) = normalized_document_array(source.values(), memory, normalize_unions)? else { return Ok(None); };
+            if Arc::ptr_eq(source.values(), &values) { return Ok(Some(Arc::clone(array))); }
+            let field = Arc::new(normalized_field(field, &values));
+            let result = source.to_data().into_builder().data_type(DataType::FixedSizeList(field, *width))
+                .child_data(vec![values.to_data()]).build();
+            match result {
+                Ok(data) => arrow_array::make_array(data),
                 Err(_) => return Ok(None),
             }
         }

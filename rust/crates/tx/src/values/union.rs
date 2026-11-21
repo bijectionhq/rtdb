@@ -131,9 +131,9 @@ fn copy_children(target: &Field, picks: &mut [(usize, usize)], sources: &[Child]
                 }
                 None => {
                     let null = Field::new(target.name(), DataType::Null, true);
-                    let array = arrow_array::NullArray::new(1);
-                    reservations.push(memory.reserve(arrow_relayout_bound(&array, &null, target)?)?);
-                    arrow_array::new_null_array(target.data_type(), 1)
+                    let array = Arc::new(arrow_array::NullArray::new(1));
+                    reservations.push(memory.reserve(arrow_relayout_bound(array.as_ref(), &null, target)?)?);
+                    relayout_arrow_column(array, &null, target)?.1
                 }
             };
             positions[*source] = arrays.len();
