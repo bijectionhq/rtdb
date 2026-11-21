@@ -72,6 +72,10 @@ use crate::{
 const MAXIMUM_BYTES: u64 = 1 << 30;
 const MAXIMUM_MANIFEST_BYTES: u64 = 16 << 20;
 
+pub(crate) fn checkpoint_storage_root() -> Result<String> {
+    Ok(StorageRoot::new(CURRENT_STORAGE_VERSION, StorageEpoch(0))?.key())
+}
+
 fn digest(ciphertext: &[u8]) -> String {
     URL_SAFE_NO_PAD.encode(ring::digest::digest(&ring::digest::SHA256, ciphertext))
 }
@@ -85,14 +89,14 @@ async fn read_object(
         return Err(Error::ConflictingObject(name.to_string()));
     }
     let ciphertext = files.get_range(name, 0..object.bytes).await?;
-    if digest(&ciphertext) != object.sha256 {
+    if ciphertext.len() as u64 != object.bytes || digest(&ciphertext) != object.sha256 {
         return Err(Error::ConflictingObject(name.to_string()));
     }
     Ok(ciphertext)
 }
 
-/// Restored checkpoints are kept in their immutable archive. Only the
-/// directory's accepted manifest can supply a missing serving object.
+/// The accepted manifest supplies the immutable objects covered by a repair.
+/// Other reads continue through the current serving store.
 pub(crate) struct ArchivedCheckpoint {
     files: PrefixedStore,
     objects: BTreeMap<ObjectKey, ArchivedObject>,
@@ -157,7 +161,7 @@ impl ArchivedCheckpoint {
         let checkpoint = record
             .checkpoint
             .ok_or_else(|| inconsistent("Recovered installation lost its checkpoint"))?;
-        let version = StorageRoot::new(CURRENT_STORAGE_VERSION, StorageEpoch(0))?.key();
+        let version = checkpoint_storage_root()?;
         let root = format!("{}/{version}", record.storage_prefix());
         let physical = PrefixedStore::new(destination.clone(), root.clone());
         let serving = open_deployment_store(
@@ -168,8 +172,9 @@ impl ArchivedCheckpoint {
         )
         .await?;
         for (name, object) in &self.objects {
-            match serving.head(name).await {
-                Ok(_) => continue,
+            match serving.get(name).await {
+                Ok(bytes) if bytes.len() as u64 == object.bytes && digest(&bytes) == object.sha256 => continue,
+                Ok(_) => return Err(Error::ConflictingObject(name.to_string()).into()),
                 Err(Error::MissingObject(_)) => {},
                 Err(error) => return Err(error.into()),
             }
@@ -185,67 +190,47 @@ struct CheckpointStore {
     archive: ArchivedCheckpoint,
 }
 
-impl CheckpointStore {
-    fn entry(&self, key: &ObjectKey) -> rtdb_storage::Result<&ArchivedObject> {
-        self.archive
-            .objects
-            .get(key)
-            .ok_or_else(|| Error::MissingObject(key.to_string()))
-    }
-
-    async fn archived(&self, key: &ObjectKey) -> rtdb_storage::Result<Bytes> {
-        read_object(&self.archive.files, key, self.entry(key)?).await
-    }
-}
-
 #[async_trait::async_trait]
 impl ObjectStore for CheckpointStore {
     async fn head(&self, key: &ObjectKey) -> rtdb_storage::Result<StoredObject> {
-        match self.serving.head(key).await {
-            Err(Error::MissingObject(_)) => Ok(StoredObject {
-                key: key.clone(),
-                size: self.entry(key)?.bytes,
-            }),
-            result => result,
+        match self.archive.objects.get(key) {
+            Some(object) => Ok(StoredObject { key: key.clone(), size: object.bytes }),
+            None => self.serving.head(key).await,
         }
     }
 
     async fn head_fresh(&self, key: &ObjectKey) -> rtdb_storage::Result<StoredObject> {
-        match self.serving.head_fresh(key).await {
-            Err(Error::MissingObject(_)) => {
-                let metadata = self.archive.files.head_fresh(key).await?;
-                if metadata.size != self.entry(key)?.bytes {
-                    return Err(Error::ConflictingObject(key.to_string()));
-                }
-                Ok(metadata)
-            },
-            result => result,
+        let Some(object) = self.archive.objects.get(key) else {
+            return self.serving.head_fresh(key).await;
+        };
+        let metadata = self.archive.files.head_fresh(key).await?;
+        if metadata.size != object.bytes {
+            return Err(Error::ConflictingObject(key.to_string()));
         }
+        Ok(metadata)
     }
 
     async fn get(&self, key: &ObjectKey) -> rtdb_storage::Result<Bytes> {
-        match self.serving.get(key).await {
-            Err(Error::MissingObject(_)) => self.archived(key).await,
-            result => result,
+        match self.archive.objects.get(key) {
+            Some(object) => read_object(&self.archive.files, key, object).await,
+            None => self.serving.get(key).await,
         }
     }
 
     async fn get_range(&self, key: &ObjectKey, range: Range<u64>) -> rtdb_storage::Result<Bytes> {
-        match self.serving.get_range(key, range.clone()).await {
-            Err(Error::MissingObject(_)) => {
-                let bytes = self.archived(key).await?;
-                if range.start > range.end || range.end > bytes.len() as u64 {
-                    return Err(Error::InvalidRange {
-                        key: key.to_string(),
-                        start: range.start,
-                        end: range.end,
-                        length: bytes.len() as u64,
-                    });
-                }
-                Ok(bytes.slice(range.start as usize..range.end as usize))
-            },
-            result => result,
+        let Some(object) = self.archive.objects.get(key) else {
+            return self.serving.get_range(key, range).await;
+        };
+        if range.start > range.end || range.end > object.bytes {
+            return Err(Error::InvalidRange {
+                key: key.to_string(),
+                start: range.start,
+                end: range.end,
+                length: object.bytes,
+            });
         }
+        let bytes = read_object(&self.archive.files, key, object).await?;
+        Ok(bytes.slice(range.start as usize..range.end as usize))
     }
 
     async fn list(&self, directory: Option<&ObjectKey>) -> rtdb_storage::Result<Vec<StoredObject>> {
@@ -258,7 +243,7 @@ impl ObjectStore for CheckpointStore {
             .collect::<BTreeMap<_, _>>();
         for (key, object) in &self.archive.objects {
             if directory.is_none_or(|directory| key.is_under(directory)) {
-                objects.entry(key.clone()).or_insert_with(|| StoredObject {
+                objects.insert(key.clone(), StoredObject {
                     key: key.clone(),
                     size: object.bytes,
                 });
@@ -648,7 +633,7 @@ async fn capture_registered(
 
     let recovery = ArchivedCheckpoint::load(record, io.clone()).await?;
     let source = storage.bucket(io).await?;
-    let version = StorageRoot::new(CURRENT_STORAGE_VERSION, StorageEpoch(0))?.key();
+    let version = checkpoint_storage_root()?;
     let root = format!("{}/{version}", record.storage_prefix());
     let owner = source.get(&key(&format!("{root}/{ROOT_MARKER}"))?).await?;
     if owner.as_ref() != record.id.as_bytes() {
@@ -1106,6 +1091,32 @@ pub async fn finish_retirement(
 mod tests {
     use super::*;
     use rtdb_directory::{DisposalReceipt, MemoryDirectory};
+
+    #[tokio::test]
+    async fn repaired_reads_use_the_accepted_archive_for_covered_keys() -> Result<()> {
+        let archive_bucket = Arc::new(rtdb_storage::MemoryStore::default());
+        let files = PrefixedStore::new(archive_bucket, "archive");
+        let serving = Arc::new(rtdb_storage::MemoryStore::default());
+        let covered = key("covered")?;
+        let newer = key("newer")?;
+        files.put(&covered, Bytes::from_static(b"accepted")).await?;
+        serving.put(&covered, Bytes::from_static(b"rewritten")).await?;
+        serving.put(&newer, Bytes::from_static(b"current tail")).await?;
+        let archived = ArchivedCheckpoint {
+            files,
+            objects: [(covered.clone(), ArchivedObject {
+                name: covered.to_string(), bytes: 8, sha256: digest(b"accepted"),
+            })].into(),
+        };
+        let store = archived.with_serving(serving);
+        assert_eq!(store.head(&covered).await?.size, 8);
+        assert_eq!(store.head_fresh(&covered).await?.size, 8);
+        assert_eq!(store.get(&covered).await?.as_ref(), b"accepted");
+        assert_eq!(store.get_range(&covered, 2..6).await?.as_ref(), b"cept");
+        assert_eq!(store.list(None).await?[0].size, 8);
+        assert_eq!(store.get(&newer).await?.as_ref(), b"current tail");
+        Ok(())
+    }
 
     #[tokio::test]
     async fn s3_archive_retirement_requires_the_observation_for_its_registered_inventory()

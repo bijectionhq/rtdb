@@ -62,7 +62,11 @@ impl RemoteStorageFactory for CellStoreFactory {
         let config: CellStoreConfig = serde_json::from_slice(&configuration.value)
             .map_err(|error| Anomaly::incorrect("rtdb.multi/storage-config", format!("Cell storage configuration is malformed: {error}")))?;
         let (record, region, release) = self.admit_region(&config, io).await?;
-        let recovery = crate::archive::ArchivedCheckpoint::load(&record, region.clone()).await?;
+        let recovery = if storage_root.as_str() == crate::archive::checkpoint_storage_root()? {
+            crate::archive::ArchivedCheckpoint::load(&record, region.clone()).await?
+        } else {
+            None
+        };
         let bucket = config.storage.bucket(region).await?;
         let store = format!("{}/{}", config.prefix, storage_root.as_str());
         let root = FencedStore {

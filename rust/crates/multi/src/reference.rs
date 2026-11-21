@@ -286,6 +286,17 @@ async fn copy_in(from_bucket: &dyn ObjectStore, from: &str, to_bucket: &dyn Obje
     to_bucket.put(&target, from_bucket.get(&key(from)?).await.map_err(storage)?).await.map_err(storage)
 }
 
+/// An earlier attempt can leave objects in the target. Only identical bytes
+/// satisfy a retry, and a concurrent create remains conditional in the store.
+async fn stage_object(bucket: &dyn ObjectStore, key: &ObjectKey, bytes: Bytes) -> Result<()> {
+    match bucket.get(key).await {
+        Ok(existing) if existing == bytes => Ok(()),
+        Ok(_) => Err(Error::ConflictingObject(key.to_string()).into()),
+        Err(Error::MissingObject(_)) => bucket.put(key, bytes).await.map_err(storage),
+        Err(error) => Err(error.into()),
+    }
+}
+
 /// Copies a deployment's stores from `from` in one cell's bucket to `to` in another's, resolving every reference into an object of its own.
 pub async fn materialize(from_bucket: &dyn ObjectStore, from: &str, to_bucket: &dyn ObjectStore, to: &str) -> Result<()> {
     for store in stores(from_bucket, from).await? {
@@ -293,15 +304,12 @@ pub async fn materialize(from_bucket: &dyn ObjectStore, from: &str, to_bucket: &
         let target = format!("{to}/{version}");
         let base = Base::load(from_bucket, &store).await?;
         for name in physical_objects(from_bucket, &store).await? {
-            copy_in(from_bucket, &format!("{store}/{name}"), to_bucket, &format!("{target}/{name}")).await?;
+            let source = key(&format!("{store}/{name}"))?;
+            let destination = key(&format!("{target}/{name}"))?;
+            stage_object(to_bucket, &destination, from_bucket.get(&source).await?).await?;
         }
         for (name, owner) in base.objects {
             let destination = key(&format!("{target}/{name}"))?;
-            match to_bucket.head(&destination).await {
-                Ok(_) => continue,
-                Err(Error::MissingObject(_)) => {},
-                Err(error) => return Err(error.into()),
-            }
             let own = key(&format!("{store}/{name}"))?;
             let bytes = match from_bucket.get(&own).await {
                 Err(Error::MissingObject(_)) => match from_bucket.get(&key(&format!("{owner}/{name}"))?).await {
@@ -312,7 +320,7 @@ pub async fn materialize(from_bucket: &dyn ObjectStore, from: &str, to_bucket: &
                 },
                 value => value?,
             };
-            to_bucket.put(&destination, bytes).await?;
+            stage_object(to_bucket, &destination, bytes).await?;
         }
     }
     Ok(())
@@ -336,6 +344,17 @@ mod tests {
         let error = erase_deployment(bucket.as_ref(), outer, &[other]).await.unwrap_err();
         assert_eq!(error.code, "rtdb.multi/overlapping-deployment-prefix");
         assert_eq!(bucket.get(&key(&retained).unwrap()).await.unwrap().as_ref(), b"other deployment");
+    }
+
+    #[tokio::test]
+    async fn a_transfer_retries_only_identical_staged_objects() {
+        let (here, there) = (bucket(), bucket());
+        put(&here, "source/v06/blocks/b00", b"accepted").await;
+        put(&there, "target/v06/blocks/b00", b"substitute").await;
+        assert!(materialize(here.as_ref(), "source", there.as_ref(), "target").await.is_err());
+        there.delete(&key("target/v06/blocks/b00").unwrap()).await.unwrap();
+        materialize(here.as_ref(), "source", there.as_ref(), "target").await.unwrap();
+        materialize(here.as_ref(), "source", there.as_ref(), "target").await.unwrap();
     }
 
     #[tokio::test]

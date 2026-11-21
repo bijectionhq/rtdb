@@ -163,8 +163,10 @@ provider proves that versions and unfinished uploads are absent.
 `rtdb-multi restore` accepts the live directory's current checkpoint with
 the original archive manifest and current key. It records a restore intent,
 fences the old writer at the logkeepers, and verifies the objects. The
-directory then admits the checkpoint archive as a read-only source for
-missing objects. A successor recovers the same ordered tail before serving.
+directory then admits the checkpoint archive as the source of its exact
+manifest members. Reads check those objects against the manifest digest.
+Objects outside that manifest come from serving storage. A successor
+recovers the same ordered tail before serving.
 The directory keeps each accepted manifest and completion under its capture ID.
 A retry observes that exact receipt after a later repair or cell move. It
 does not open a new writer fence or access the archived objects.
