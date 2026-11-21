@@ -225,7 +225,8 @@ impl Session {
     pub(crate) async fn run_before(mut self, client: impl AsyncRead + AsyncWrite + Unpin + Send + 'static, first: TcpStream, first_control: Option<String>, first_epoch: u64,
                                    startup_deadline: tokio::time::Instant) -> Result<()> {
         let (client_read, mut client_write) = tokio::io::split(client);
-        let (mut requests, _client_reader) = pump(client_read);
+        let (mut requests, mut client_reader) = pump(client_read);
+        let mut copying_in = false;
         let mut first = Backend::new(first, first_epoch);
         first.heartbeat = first_control.and_then(|address| self.router.start_touching(address));
         let mut backend = Some(first);
@@ -240,6 +241,7 @@ impl Session {
             loop {
                 let event = {
                     let Some(current) = backend.as_mut() else { break Ok(()) };
+                    let waiting_for_ready = self.keyed && !copying_in && self.pending.last().is_some_and(|frame| command_boundary(frame.tag));
                     tokio::select! {
                         biased;
                         _ = self.record.wait_for(|record| record.as_ref().is_some_and(|record| {
@@ -254,7 +256,8 @@ impl Session {
                                 return Ok::<_, Anomaly>(Event::Reply(reply));
                             }
                             tokio::select! {
-                                request = requests.recv() => Ok(Event::Request(request)),
+                                request = requests.recv(), if !waiting_for_ready => Ok(Event::Request(request)),
+                                _ = &mut client_reader, if waiting_for_ready => Ok(Event::Request(None)),
                                 reply = current.frames.recv() => Ok(Event::Reply(reply)),
                             }
                         } => event?,
@@ -276,6 +279,17 @@ impl Session {
                         if !self.greeting.done {
                             tokio::time::timeout_at(startup_deadline, backend.as_mut().expect("greeting backend").writer.write_all(&request.encode()))
                                 .await.map_err(|_| startup_timeout())?.map_err(io)?;
+                            continue;
+                        }
+                        if copying_in && matches!(request.tag, b'd' | b'c' | b'f') {
+                            backend.as_mut().expect("copy backend").dispatch(&request).await;
+                            if request.tag != b'd' {
+                                copying_in = false;
+                                if self.pending.last().is_none_or(|frame| !command_boundary(frame.tag)) {
+                                    self.pending.push(request);
+                                    self.status = Status::Busy;
+                                }
+                            }
                             continue;
                         }
                         if request.tag == b'H' {
@@ -340,8 +354,10 @@ impl Session {
                         self.answered = true;
                         match frame.tag {
                             b'1' | b'3' => self.confirm_prepared_change(frame.tag),
+                            b'G' => copying_in = true,
+                            b'E' => copying_in = false,
                             b'Z' => {
-                                if let Some(end) = self.pending.iter().position(|request| matches!(request.tag, b'Q' | b'S')) {
+                                if let Some(end) = self.pending.iter().position(|request| command_boundary(request.tag)) {
                                     self.pending.drain(..=end);
                                 }
                                 self.prepared_responses = 0;
@@ -421,6 +437,8 @@ impl Session {
         }
     }
 }
+
+fn command_boundary(tag: u8) -> bool { matches!(tag, b'Q' | b'S' | b'c' | b'f') }
 
 fn placement(record: &Option<DeploymentRecord>) -> Option<(u64, Lifecycle)> {
     record.as_ref().map(|record| (record.epoch, record.lifecycle))
@@ -538,6 +556,102 @@ mod tests {
     async fn pair(listener: &TcpListener) -> (TcpStream, TcpStream) {
         let near = TcpStream::connect(listener.local_addr().unwrap()).await.unwrap();
         (near, listener.accept().await.unwrap().0)
+    }
+
+    #[tokio::test]
+    async fn a_pipelined_command_retries_under_its_own_key_after_the_previous_command_replies() {
+        let directory = rtdb_directory::MemoryDirectory::new();
+        let record = directory.create_deployment(DeploymentRecord::new("shop", "acme", vec![], 0)).await.unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let (mut client, gateway) = pair(&listener).await;
+        let (first, mut dying) = pair(&listener).await;
+        let (second, mut successor) = pair(&listener).await;
+        let router = Arc::new(Next(tokio::sync::Mutex::new(Some(second))));
+        let session = Session::new(Bytes::from_static(b"\0\0\0\x08\0\x03\0\0"), router, directory, record.id, None, true);
+        let running = tokio::spawn(session.run(gateway, first, None, 0));
+
+        tokio::time::timeout(Duration::from_secs(5), async {
+            greet(&mut dying).await;
+            assert_eq!(receive(&mut client).await.0, b'R');
+            assert_eq!(receive(&mut client).await.0, b'Z');
+            send(&mut client, b'Q', b"UPDATE counters SET n = n + 1\0").await;
+            send(&mut client, b'Q', b"UPDATE counters SET n = n + 2\0").await;
+
+            let first_key = query(&mut dying).await;
+            assert!(first_key.starts_with("SET rtdb_idempotency_key = "));
+            assert_eq!(query(&mut dying).await, "UPDATE counters SET n = n + 1");
+            send(&mut dying, b'C', b"SET\0").await;
+            send(&mut dying, b'Z', b"I").await;
+            send(&mut dying, b'C', b"UPDATE 1\0").await;
+            send(&mut dying, b'Z', b"I").await;
+
+            let second_key = query(&mut dying).await;
+            assert!(second_key.starts_with("SET rtdb_idempotency_key = "), "{second_key}");
+            assert_ne!(second_key, first_key);
+            assert_eq!(query(&mut dying).await, "UPDATE counters SET n = n + 2");
+            assert_eq!(receive(&mut client).await, (b'C', b"UPDATE 1\0".to_vec()));
+            assert_eq!(receive(&mut client).await.0, b'Z');
+            drop(dying);
+
+            greet(&mut successor).await;
+            assert_eq!(query(&mut successor).await, second_key);
+            assert_eq!(query(&mut successor).await, "UPDATE counters SET n = n + 2");
+            send(&mut successor, b'C', b"SET\0").await;
+            send(&mut successor, b'Z', b"I").await;
+            send(&mut successor, b'C', b"UPDATE 2\0").await;
+            send(&mut successor, b'Z', b"I").await;
+            assert_eq!(receive(&mut client).await, (b'C', b"UPDATE 2\0".to_vec()));
+            assert_eq!(receive(&mut client).await.0, b'Z');
+            send(&mut client, b'X', b"").await;
+            running.await.unwrap().unwrap();
+        }).await.expect("the two pipelined commands finish through reconnect");
+    }
+
+    #[tokio::test]
+    async fn copy_input_can_stream_before_ready_and_the_next_update_gets_a_fresh_key() {
+        let directory = rtdb_directory::MemoryDirectory::new();
+        let record = directory.create_deployment(DeploymentRecord::new("shop", "acme", vec![], 0)).await.unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let (mut client, gateway) = pair(&listener).await;
+        let (first, mut backend) = pair(&listener).await;
+        let router = Arc::new(Next(tokio::sync::Mutex::new(None)));
+        let session = Session::new(Bytes::from_static(b"\0\0\0\x08\0\x03\0\0"), router, directory, record.id, None, true);
+        let running = tokio::spawn(session.run(gateway, first, None, 0));
+
+        tokio::time::timeout(Duration::from_secs(5), async {
+            greet(&mut backend).await;
+            assert_eq!(receive(&mut client).await.0, b'R');
+            assert_eq!(receive(&mut client).await.0, b'Z');
+            send(&mut client, b'Q', b"COPY counters FROM STDIN\0").await;
+            let copy_key = query(&mut backend).await;
+            assert!(copy_key.starts_with("SET rtdb_idempotency_key = "));
+            assert_eq!(query(&mut backend).await, "COPY counters FROM STDIN");
+            send(&mut backend, b'C', b"SET\0").await;
+            send(&mut backend, b'Z', b"I").await;
+            send(&mut backend, b'G', &[0, 0, 1, 0, 0]).await;
+            assert_eq!(receive(&mut client).await.0, b'G');
+
+            send(&mut client, b'd', b"1\n").await;
+            send(&mut client, b'c', b"").await;
+            send(&mut client, b'Q', b"UPDATE counters SET n = n + 1\0").await;
+            assert_eq!(receive(&mut backend).await, (b'd', b"1\n".to_vec()));
+            assert_eq!(receive(&mut backend).await, (b'c', Vec::new()));
+            send(&mut backend, b'C', b"COPY 1\0").await;
+            send(&mut backend, b'Z', b"I").await;
+            assert_eq!(receive(&mut client).await, (b'C', b"COPY 1\0".to_vec()));
+            assert_eq!(receive(&mut client).await.0, b'Z');
+
+            let update_key = query(&mut backend).await;
+            assert!(update_key.starts_with("SET rtdb_idempotency_key = "), "{update_key}");
+            assert_ne!(update_key, copy_key);
+            assert_eq!(query(&mut backend).await, "UPDATE counters SET n = n + 1");
+            send(&mut client, b'X', b"").await;
+            send(&mut backend, b'C', b"SET\0").await;
+            send(&mut backend, b'Z', b"I").await;
+            send(&mut backend, b'C', b"UPDATE 1\0").await;
+            send(&mut backend, b'Z', b"I").await;
+            running.await.unwrap().unwrap();
+        }).await.expect("COPY runs to completion before the next update");
     }
 
     #[tokio::test]

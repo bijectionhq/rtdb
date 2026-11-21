@@ -1797,6 +1797,24 @@ async fn updates_sent_back_to_back_across_a_holders_death_are_neither_lost_nor_d
     cell.stop().await;
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn pipelined_prepared_writes_commit_individually_before_and_after_a_move() {
+    let cell = Cell::start(2, None).await;
+    admin::create_deployment(cell.directory.as_ref(), "shop", "acme", 3).await.unwrap();
+    let client = cell.connect("shop").await;
+    client.simple_query("INSERT INTO counters (_id, n) VALUES (1, 0)").await.unwrap();
+    let update = client.prepare_typed("UPDATE counters SET n = n + $1 WHERE _id = 1", &[tokio_postgres::types::Type::INT8]).await.unwrap();
+    tokio::try_join!(client.execute(&update, &[&1_i64]), client.execute(&update, &[&2_i64])).unwrap();
+    assert_eq!(values(&client, "SELECT n FROM counters").await, ["3"]);
+
+    let holder = cell.holder("shop").await.unwrap();
+    admin::move_deployment(cell.directory.as_ref(), "shop", &cell.node(1 - holder).lease.id(), &common::control()).await.unwrap();
+    tokio::try_join!(client.execute(&update, &[&4_i64]), client.execute(&update, &[&8_i64])).unwrap();
+    assert_eq!(values(&client, "SELECT n FROM counters").await, ["15"]);
+    drop(client);
+    cell.stop().await;
+}
+
 /// Every column of every row `sql` returns, sorted.
 async fn rows(client: &tokio_postgres::Client, sql: &str) -> Vec<String> {
     let mut rows: Vec<String> = client.simple_query(sql).await.unwrap().into_iter().filter_map(|message| match message {

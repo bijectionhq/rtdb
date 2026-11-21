@@ -640,6 +640,10 @@ Moves are invisible to clients only if the gateway owns connections and session 
    A retry waits for a placement change or the 100 ms fallback timer, whichever arrives first.
    A driver that stops during execution can leave the outcome unknown.
    The gateway replays the command under its original key when the client has received no answer.
+   Writable pgwire sessions accept pipelined frames and dispatch one command cycle at a time.
+   Each autocommit cycle gets its own key after the previous cycle's ReadyForQuery.
+   In an explicit transaction, the cycles retain the transaction's key through commit or rollback.
+   COPY input continues to stream before ReadyForQuery. [PostgreSQL protocol flow](https://www.postgresql.org/docs/current/protocol-flow.html)
    A single pgwire autocommit write sends `CommandComplete` after the commit succeeds.
    PGwire carries stable placement interruption codes independently of the configured error detail format. [PostgreSQL ErrorResponse format](https://www.postgresql.org/docs/current/protocol-message-formats.html#PROTOCOL-MESSAGE-FORMATS-ERRORRESPONSE)
 5. **Suspicion reports** to the controller on connection failure.
