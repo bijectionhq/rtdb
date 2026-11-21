@@ -96,6 +96,7 @@ The optional Rust boundary check compiles an unchanged copy and two mutated copi
 The optional native replay reads the same seeded 4,096-observation trace that the Lean evaluator checks.
 It also compiles the unmodified and unpadded text scorer to replay the binary64 boundary witness.
 The same option runs the local checkpoint interruption and manifest-recovery tests and replays a root-first mutation of the checkpoint writer.
+It also exercises the Azure adapter against a loopback provider and separately mutates premature copy acknowledgement and cleanup on an unknown outcome.
 
 == Evidence boundaries
 

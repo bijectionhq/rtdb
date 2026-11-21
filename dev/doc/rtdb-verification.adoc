@@ -209,3 +209,12 @@ The protocol allows a successful acceptance response with status `pending`.
 An offline HTTP fixture sent that response to the real adapter and observed a successful file publication and staging deletion before a completed destination existed.
 Accepting the response as proof of a durable child also violates the checkpoint model.
 See link:https://learn.microsoft.com/en-us/rest/api/storageservices/copy-blob[Azure Copy Blob response semantics].
+
+Amendment 003.
+The Azure transport now completes the copy request only after the provider reports success for that copy.
+A pending reply requires a copy identifier, and each authenticated status check must report the same identifier.
+The wait uses the Azure client's default retry duration.
+A transport or status ambiguity returns an unavailable error and keeps the private staging blob.
+A normal metadata read reports a pending destination as unavailable, so a retry can check the immutable bytes after the provider finishes.
+The provider still owns the terminal outcome.
+When it fails or cannot establish that outcome, retrying or cleaning a failed destination and finding abandoned staging blobs require separate recovery evidence.

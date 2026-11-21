@@ -449,6 +449,7 @@ def verify_checkpoint_replay(args, source):
     ):
         raise ValueError("checkpoint replay baseline failed")
     blocks = source / "rust/crates/replication/src/blocks.rs"
+    original = blocks.read_bytes()
     table_writes = """        for entry in table_catalog.entries() {
             check_cancelled(cancellation)?;
             let block = table_blocks.get(&entry.table).ok_or_else(|| invalid("Recorded table has no block metadata"))?;
@@ -469,7 +470,45 @@ def verify_checkpoint_replay(args, source):
         or "0 passed; 1 failed" not in checked.stdout
     ):
         raise ValueError("root-first mutation did not fail at checkpoint startup")
+    blocks.write_bytes(original)
     print("rust-checkpoint-replay: four tests passed, root-first production mutation rejected")
+
+
+def verify_azure_replay(args, source):
+    env = os.environ | {
+        "CARGO_TARGET_DIR": str(ROOT / "target"),
+        "CARGO_PROFILE_DEV_DEBUG": "0",
+        "CARGO_PROFILE_TEST_DEBUG": "0",
+        "CARGO_INCREMENTAL": "0",
+    }
+    command = ["cargo", "test", "--locked", "-p", "rtdb-azure", "--test", "copy_completion"]
+    checked = run_case(command, source / "rust", args.evidence, "rust-azure-copy-baseline", env)
+    if checked.returncode or "2 passed; 0 failed" not in checked.stdout:
+        raise ValueError("Azure copy replay baseline failed")
+    controls = (
+        ("ack-on-accept", "rust/crates/azure/src/copy.rs",
+         'Some(b"success") => Ok(response),', 'Some(b"success" | b"pending") => Ok(response),',
+         "a_pending_copy_finishes_before_publication_and_staging_cleanup", "publication or cleanup preceded copy completion"),
+        ("delete-on-unknown", "rust/crates/storage/src/remote.rs",
+         "            Err(error) if copy_outcome_unknown(&error) => return Err(provider_error(key, error)),\n", "",
+         "an_unconfirmed_copy_preserves_its_staging_source", "an uncertain copy did not keep its staging source"),
+    )
+    for name, file, find, replacement, test, expected in controls:
+        path = source / file
+        original = path.read_bytes()
+        replace_once(path, find, replacement)
+        checked = run_case(
+            [*command, test, "--", "--exact"], source / "rust", args.evidence, f"rust-azure-{name}", env,
+        )
+        if (
+            checked.returncode != 101
+            or f"{test} ... FAILED" not in checked.stdout
+            or expected not in checked.stdout
+            or "0 passed; 1 failed" not in checked.stdout
+        ):
+            raise ValueError(f"{name}: expected a failure at {test}")
+        path.write_bytes(original)
+    print("rust-azure-copy: completion and unknown-outcome tests passed, both production mutations rejected")
 
 
 def replay_rust_trace(args):
@@ -556,6 +595,10 @@ def main():
         "rust/crates/conformance/src/faults.rs",
         "rust/crates/conformance/tests/node_faults.rs",
         "rust/crates/conformance/tests/recovery.rs",
+        "rust/crates/azure/src/copy.rs",
+        "rust/crates/azure/src/lib.rs",
+        "rust/crates/azure/tests/copy_completion.rs",
+        "rust/crates/storage/src/remote.rs",
     ))
     for path in list(source_paths):
         if path.name == "proof.rs":
@@ -584,6 +627,7 @@ def main():
             replay_rank_witness(args, directory)
             replay_rust_trace(args)
             verify_checkpoint_replay(args, source)
+            verify_azure_replay(args, source)
 
 
 if __name__ == "__main__":

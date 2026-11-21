@@ -1,4 +1,5 @@
 mod connection;
+mod copy;
 mod credential;
 mod process;
 mod powershell;
@@ -8,7 +9,7 @@ mod desktop;
 
 use std::sync::Arc;
 use std::time::Duration;
-use object_store::{ClientOptions, StaticCredentialProvider, azure::{AzureAuthorizer, MicrosoftAzure, MicrosoftAzureBuilder}, client::{HttpConnector, HttpRequest, HttpRequestBody, ReqwestConnector}};
+use object_store::{ClientOptions, StaticCredentialProvider, azure::{AzureAuthorizer, AzureCredentialProvider, MicrosoftAzure, MicrosoftAzureBuilder}, client::{HttpConnector, HttpRequest, HttpRequestBody, ReqwestConnector}};
 use rtdb_format::generated::xtdb::azure::proto::AzureBlobStorageConfig;
 use rtdb_storage::{IoRegion, ObjectKey, ObjectStore, remote::RemoteStore};
 use rtdb_types::{Anomaly, Result};
@@ -80,14 +81,15 @@ impl AzureConfig {
         let prefix = self.object_prefix(storage_root)?;
         let credentials = self.resolve_credentials(remotes)?;
         let connection = connection::resolve(self, credentials)?;
-        let mut builder = MicrosoftAzureBuilder::from_env().with_account(&connection.account).with_container_name(&self.container)
+        let credentials: AzureCredentialProvider = match connection.credential {
+            Some(credential) => Arc::new(StaticCredentialProvider::new(credential)),
+            None => Arc::new(credential::CredentialBridge::new(self.user_managed_identity_client_id.as_deref(), Arc::clone(&io))?),
+        };
+        let builder = MicrosoftAzureBuilder::from_env().with_account(&connection.account).with_container_name(&self.container)
             .with_use_emulator(false).with_skip_signature(false).with_endpoint(connection.endpoint.to_string()).with_allow_http(connection.endpoint.scheme() == "http");
-        if let Some(credential) = connection.credential {
-            builder = builder.with_credentials(Arc::new(StaticCredentialProvider::new(credential)));
-        } else {
-            builder = builder.with_credentials(Arc::new(credential::CredentialBridge::new(self.user_managed_identity_client_id.as_deref(), Arc::clone(&io))?));
-        }
-        let client = builder.build().map_err(invalid)?;
+        let client = builder.with_credentials(Arc::clone(&credentials))
+            .with_http_connector(copy::CopyConnector::new(connection.account.clone(), credentials))
+            .build().map_err(invalid)?;
         ensure_container(&client, &connection.account, &connection.endpoint, &self.container).await?;
         Ok(Arc::new(RemoteStore::new_in(Arc::new(client), Some(prefix), io)))
     }

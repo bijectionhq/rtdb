@@ -6,6 +6,19 @@ use object_store::{ObjectStore as ProviderStore, ObjectStoreExt, PutMode, PutOpt
 use std::{ops::Range, sync::Arc};
 use tokio::io::{AsyncReadExt, AsyncSeekExt};
 
+/// A provider may still be copying when its completion can no longer be established.
+#[derive(Debug, thiserror::Error)]
+#[error("copy outcome is unknown: {0}")]
+pub struct CopyOutcomeUnknown(pub &'static str);
+
+fn copy_outcome_unknown(mut error: &(dyn std::error::Error + 'static)) -> bool {
+    loop {
+        if error.is::<CopyOutcomeUnknown>() { return true; }
+        let Some(source) = error.source() else { return false };
+        error = source;
+    }
+}
+
 #[derive(Clone)]
 pub struct RemoteStore { objects: Arc<RemoteObjects>, io: Arc<IoRegion> }
 
@@ -218,6 +231,8 @@ impl RemoteObjects {
         let published = match self.client.copy_if_not_exists(&temporary, &self.path(key)).await {
             Ok(()) => Ok(()),
             Err(object_store::Error::AlreadyExists { .. } | object_store::Error::Precondition { .. }) => self.compare_file(key, &mut input, source, length).await,
+            // A pending copy still depends on its private source.
+            Err(error) if copy_outcome_unknown(&error) => return Err(provider_error(key, error)),
             Err(error) => Err(provider_error(key, error)),
         };
         let cleanup = self.client.delete(&temporary).await.map_err(|error| provider_error(key, error));
