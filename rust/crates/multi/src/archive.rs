@@ -322,6 +322,39 @@ pub struct Capture {
     pub objects: Vec<ArchivedObject>,
 }
 
+impl Capture {
+    async fn verify(
+        &self,
+        bucket: Arc<dyn ObjectStore>,
+        prefix: &str,
+        material: &[u8; crate::keys::KEY_BYTES],
+    ) -> Result<()> {
+        let files = Arc::new(PrefixedStore::new(bucket, format!("{prefix}/objects")));
+        let plaintext = EncryptingStore::new(files.clone(), material)?;
+        let closure = checkpoint_objects(&plaintext, &self.point).await?;
+        let mut bytes = 0u64;
+        let objects = self.objects.iter()
+            .map(|object| {
+                bytes = bytes.checked_add(object.bytes)
+                    .filter(|total| *total <= MAXIMUM_BYTES)
+                    .ok_or_else(|| unavailable("Checkpoint exceeds the archive byte budget"))?;
+                Ok((key(&object.name)?, object))
+            })
+            .collect::<Result<std::collections::BTreeMap<_, _>>>()?;
+        if objects.len() != self.objects.len() || objects.keys().ne(closure.iter()) {
+            return Err(inconsistent(
+                "The archive object list differs from the checkpoint closure",
+            ));
+        }
+        let cipher = Cipher::new(material)?;
+        for (name, object) in objects {
+            let ciphertext = read_object(files.as_ref(), &name, object).await?;
+            cipher.open(name.as_str(), &ciphertext)?;
+        }
+        Ok(())
+    }
+}
+
 fn unavailable(message: &'static str) -> Anomaly {
     Anomaly::new(AnomalyCategory::Unavailable, "rtdb.multi/capture", message)
 }
@@ -576,14 +609,20 @@ async fn capture_registered(
         registration.media_bound = true;
         Ok(())
     }).await?;
-    let archive = PrefixedStore::new(archive_bucket, format!("checkpoint-captures/{deployment}/{operation}"));
+    let prefix = format!("checkpoint-captures/{deployment}/{operation}");
+    let archive = PrefixedStore::new(archive_bucket.clone(), &prefix);
     let spec = key("intent.json")?;
     let receipt = key("capture.json")?;
     archive.put(&spec, encode(&point)?).await?;
+    let material = keys
+        .existing_key(&record.id)
+        .await?
+        .ok_or_else(|| unavailable("The source key is unavailable"))?;
     if let Some(completed) = read::<Capture>(&archive, &receipt).await? {
         if completed.point != point {
             return Err(inconsistent("The completed archive has another checkpoint"));
         }
+        completed.verify(archive_bucket, &prefix, &material).await?;
         return Ok(completed);
     }
     if !same_lifetime(record, &point) {
@@ -600,10 +639,6 @@ async fn capture_registered(
     if owner.as_ref() != record.id.as_bytes() {
         return Err(inconsistent("The checkpoint belongs to another source"));
     }
-    let material = keys
-        .existing_key(&record.id)
-        .await?
-        .ok_or_else(|| unavailable("The source key is unavailable"))?;
     let sealed = open_deployment_store_with_archive(
         source,
         &root,
@@ -647,6 +682,7 @@ async fn capture_registered(
             "Checkpoint exceeds the archive metadata budget",
         ));
     }
+    capture.verify(archive_bucket, &prefix, &material).await?;
     if !directory
         .deployment(&deployment.to_string())
         .await?
@@ -697,7 +733,7 @@ pub async fn restore(
         .await?
         .ok_or_else(|| unavailable("The checkpoint capture is incomplete"))?;
     let manifest_sha256 = digest(&encode(&capture)?);
-    let point = capture.point;
+    let point = capture.point.clone();
     let intent = read::<CapturePoint>(&metadata, &key("intent.json")?).await?;
     if intent.as_ref() != Some(&point)
         || point != capture_point(&current, deployment, operation, &archive_binding)?
@@ -713,34 +749,7 @@ pub async fn restore(
         .existing_key(&id)
         .await?
         .ok_or_else(|| unavailable("The current installation key is unavailable"))?;
-    let files = Arc::new(PrefixedStore::new(
-        archive_bucket,
-        format!("{prefix}/objects"),
-    ));
-    let plaintext = EncryptingStore::new(files.clone(), &material)?;
-    let closure = checkpoint_objects(&plaintext, &point).await?;
-    let mut bytes = 0u64;
-    let objects = capture
-        .objects
-        .iter()
-        .map(|object| {
-            bytes = bytes
-                .checked_add(object.bytes)
-                .filter(|total| *total <= MAXIMUM_BYTES)
-                .ok_or_else(|| unavailable("Checkpoint exceeds the archive byte budget"))?;
-            Ok((key(&object.name)?, object))
-        })
-        .collect::<Result<std::collections::BTreeMap<_, _>>>()?;
-    if objects.len() != capture.objects.len() || objects.keys().ne(closure.iter()) {
-        return Err(inconsistent(
-            "The archive object list differs from the checkpoint closure",
-        ));
-    }
-    let cipher = Cipher::new(&material)?;
-    for (name, object) in objects {
-        let ciphertext = read_object(files.as_ref(), &name, object).await?;
-        cipher.open(name.as_str(), &ciphertext)?;
-    }
+    capture.verify(archive_bucket, &prefix, &material).await?;
 
     let fenced = update_installation(directory, &id, |record| {
         if !same_incarnation(record, &point)
