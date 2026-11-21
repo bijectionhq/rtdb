@@ -260,6 +260,21 @@ then the corresponding plain scans. Rows, continuation, and the authenticated
 read witness matched and both registrations revalidated. The alias fix keeps
 the positional mask decoder intact and gives each joined column a unique name.
 
+The focused paged-overlay regression passed on Bijection source
+`d00682f567c`, published as `c259639529869f6fb98ced7184fe7c896d4388d0`.
+It uses a parent with 146 candidate keys and a child with a long run of
+deletions and one inherited merge. The test checks the two remaining rows,
+continuation, and exhaustion in both directions. The disk-backed PgWire
+trace recorded native seeks while traversing the deleted candidates.
+
+The broader WorldStore conformance reruns on the newer Bijection source
+hit fixture lease deadlines. The last run used in-memory RTDB storage
+with tracing disabled. It reached the second label-order pass and stopped
+when the 300 ms lease in
+`a_dropped_or_lapsed_world_refuses_the_whole_commit` expired before its
+fixture fork committed. The focused registered-page and paged-overlay
+regressions passed against the disk-backed PgWire engine.
+
 ## Execution
 
 Use Lean 4.35.0, Bijection's pinned Verus toolchain, and TLC from the authorized proof environment.
