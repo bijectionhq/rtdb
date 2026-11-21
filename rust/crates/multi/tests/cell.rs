@@ -5,8 +5,10 @@ mod common;
 use std::time::Duration;
 
 use common::*;
-use rtdb_directory::MemberPool;
+use rtdb_directory::{DeploymentRecord, Directory, Lifecycle, MemberId, MemberPool, MemoryDirectory};
 use rtdb_multi::admin;
+use rtdb_multi::deployment::CellStorage;
+use rtdb_multi::keys::LocalKeyService;
 use tokio_postgres::NoTls;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -30,6 +32,27 @@ async fn hosted_install_retries_recover_the_same_authority() {
     drop(client);
     assert_eq!(admin::install_deployment(directory, id, "shop", "acme", 3).await.unwrap().id, installed.id);
     cell.stop().await;
+}
+
+#[tokio::test]
+async fn failed_disposal_reuses_the_fence_on_retry() {
+    let directory = MemoryDirectory::new();
+    let data = tempfile::tempdir().unwrap();
+    let storage = CellStorage::Local { root: data.path().join("objects") };
+    let keys = LocalKeyService::new(data.path().join("keys")).unwrap();
+    let installation = directory.create_deployment(
+        DeploymentRecord::new("shop", "acme", vec![MemberId::fresh()], 0),
+    ).await.unwrap();
+
+    for _ in 0..2 {
+        let error = admin::delete_deployment(directory.as_ref(), &storage, &keys, &installation.id, 4 << 20).await.unwrap_err();
+        assert_eq!(error.code, "rtdb.multi/disposal-ensemble");
+        let pending = directory.deployment(&installation.id).await.unwrap().unwrap();
+        assert_eq!(pending.lifecycle, Lifecycle::Deleting);
+        assert_eq!(pending.epoch, installation.epoch + 1);
+        assert_eq!(pending.version, installation.version + 1);
+        assert!(pending.disposal.is_none());
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -242,12 +265,17 @@ async fn a_fork_starts_from_its_parents_data_and_diverges_and_a_deletion_leaves_
     cell.node(holder).agent.park("shop-preview").await.unwrap();
     let written = own(&child.storage_prefix());
 
-    let deletion = admin::delete_deployment(cell.directory.as_ref(), &cell.storage(), &cell.keys(), "shop", 4 << 20).await.unwrap();
-    assert!(deletion.verified_empty);
+    let deletion = admin::delete_deployment(cell.directory.as_ref(), &cell.storage(), &cell.keys(), &parent.id, 4 << 20).await.unwrap();
+    assert_eq!(deletion.deployment, parent.id);
     assert!(files_under(&root.join(parent.storage_prefix())).is_empty(), "the parent's objects are erased");
     assert!(own(&child.storage_prefix()) > written, "after the fork's shared objects were copied into it");
-    assert!(!cell.data.path().join("keys").join(format!("{}.key", parent.id)).exists(), "its key is destroyed");
-    assert_eq!(cell.directory.deployment_by_name("shop").await.unwrap().unwrap().lifecycle, rtdb_directory::Lifecycle::Deleted);
+    assert!(rtdb_multi::keys::KeyService::key(&cell.keys(), &parent.id).is_err(), "its key is withdrawn");
+    let tombstone = cell.directory.deployment_by_name("shop").await.unwrap().unwrap();
+    assert_eq!(tombstone.lifecycle, rtdb_directory::Lifecycle::Deleted);
+    assert_eq!(tombstone.disposal, Some(deletion.clone()));
+    let recovered = admin::delete_deployment(cell.directory.as_ref(), &cell.storage(), &cell.keys(), &parent.id, 4 << 20).await.unwrap();
+    assert_eq!(recovered, deletion);
+    assert_eq!(cell.directory.deployment(&parent.id).await.unwrap().unwrap().version, tombstone.version);
     assert!(tokio_postgres::connect(&format!("host=127.0.0.1 port={} user=xtdb password=cell-test dbname=shop", cell.gateway.port()), NoTls).await.is_err(), "a deleted deployment is refused");
     let preview = connect_eventually(&cell, "shop-preview").await;
     assert_eq!(values(&preview, "SELECT total FROM orders").await, ["10", "20", "30"], "a fork outlives its parent's deletion");
