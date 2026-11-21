@@ -43,6 +43,7 @@ struct FinalWriter<'a> {
     cancellation: &'a CancellationToken,
     directory: &'a Path,
     disk_limit: u64,
+    copy_spill_pages: bool,
 }
 
 impl FinalWriter<'_> {
@@ -82,8 +83,7 @@ impl FinalWriter<'_> {
     fn tree(&mut self, reader: &mut ArrowFile, leaves: &[Leaf], depth: usize, page_size: usize) -> Result<usize> {
         if leaves.is_empty() { return self.metadata.write_nil(); }
         let total = leaves.iter().try_fold(0usize, |total, leaf| total.checked_add(leaf.rows).ok_or_else(|| crate::invalid("Page tree row count overflow")))?;
-        if let [leaf] = leaves && leaf.rows > 0 && leaf.rows <= page_size {
-            // A spill page was built from its events with this output schema, so a leaf that is one whole page is written as it is.
+        if self.copy_spill_pages && let [leaf] = leaves && leaf.rows > 0 && leaf.rows <= page_size {
             let page = read_page(reader, leaf.page, self.memory)?;
             if page.batch().num_rows() != leaf.rows { return Err(crate::invalid("Spill page row count differs from its page tree")); }
             return self.page(page.batch());
@@ -233,7 +233,9 @@ pub(super) fn normalize(input: &MergeFile, put: &Option<StructFields<LogicalType
     let (mut reader, _reader_charge) = open_input(File::open(&input.path).map_err(crate::invalid)?, memory)?;
     let schema = OutputSchema { put: put.clone(), iid_encoding: (config.run_end_encoded_iids && input.recency.is_some()).then_some(RunEndWidth::I32), recency: input.carries_recency };
     let directory = data_path.parent().ok_or_else(|| crate::invalid("Output path has no parent"))?;
-    let mut output = FinalWriter { data: ArrowFileWriter::new_bounded_reserved(create_file(data_path)?, schema.schema()?.as_ref(), disk_remaining(directory, config.temporary_byte_limit)?, memory)?, metadata: MetadataBuilder::new(input.carries_recency, true), schema, memory, metadata_charges: Vec::new(), cancellation, directory, disk_limit: config.temporary_byte_limit };
+    let declared = schema.schema()?;
+    let copy_spill_pages = reader.schema().as_ref() == declared.as_ref();
+    let mut output = FinalWriter { data: ArrowFileWriter::new_bounded_reserved(create_file(data_path)?, declared.as_ref(), disk_remaining(directory, config.temporary_byte_limit)?, memory)?, metadata: MetadataBuilder::new(input.carries_recency, true), schema, memory, metadata_charges: Vec::new(), cancellation, directory, disk_limit: config.temporary_byte_limit, copy_spill_pages };
     if !input.carries_recency {
         output.tree(&mut reader, &input.leaves, 0, config.page_size)?;
     } else if input.leaves.is_empty() { output.metadata.write_nil()?; }
