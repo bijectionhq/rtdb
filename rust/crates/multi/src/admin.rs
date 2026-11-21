@@ -15,6 +15,9 @@ use crate::control::{self, ControlKey, MoveTicket, Request, Response};
 use crate::deployment::{CellStorage, ensemble_servers, live_holdings, require_storage_namespaces, s3_write_lease_horizon, select_logkeepers, storage_namespaces, write_quorum};
 use crate::keys::KeyService;
 
+mod holder;
+pub use holder::{HolderObservation, observe_holder};
+
 const CONTROL_TIMEOUT: Duration = Duration::from_secs(35);
 const CONCURRENT_SUSPICION_PROBES: usize = 16;
 

@@ -40,6 +40,7 @@ Usage: rtdb-multi --build-info\n\
        rtdb-multi drain --directory DIR --member ID\n\
        rtdb-multi roll-engine --directory DIR --version VERSION\n\
        rtdb-multi status --directory DIR [--target-per-node N] [--placements-only]\n\
+       rtdb-multi observe-holder --directory DIR --id UUID --incarnation N\n\
        rtdb-multi audit --directory DIR --keys PATH --name NAME [--require-quorum]\n\
        rtdb-multi audit-log --data PATH --stream STREAM [--from LSN --through LSN] [--prefix-report FILE] [--expect DIGEST]\n\
        rtdb-multi move --directory DIR --name NAME --to MEMBER [--cell-secret FILE]\n\
@@ -797,6 +798,17 @@ async fn run(arguments: Vec<String>) -> Result<()> {
                 serde_json::to_string_pretty(&admin::cell_status(directory.as_ref(), target).await?)
             };
             println!("{}", json.expect("a status serializes"));
+            Ok(())
+        }
+        "observe-holder" => {
+            let directory = directory(arguments.required("directory")?).await?;
+            let authority = installation_id(&arguments)?;
+            let incarnation = arguments.number("incarnation", 0u64)?;
+            if incarnation == 0 {
+                return Err(usage("--incarnation must select the original nonzero incarnation".into()));
+            }
+            let observation = admin::observe_holder(directory.as_ref(), authority, incarnation).await?;
+            println!("{}", serde_json::to_string(&observation).expect("a holder observation serializes"));
             Ok(())
         }
         "audit" => {
