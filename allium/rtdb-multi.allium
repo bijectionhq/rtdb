@@ -853,6 +853,7 @@ entity GatewayRoute {
     -- A gateway's cached view of one active deployment: its holder and epoch, pushed for the active set.
     -- A wrong view costs one redirect; a gateway never authorises a write by its view.
     -- A route to a running writer can check that member by ID before considering the eligible fleet.
+    -- A gateway follows a redirect after the target confirms its serving endpoint and epoch.
     deployment: DeploymentId
     holder: MemberId?
     epoch: Epoch
@@ -1779,9 +1780,15 @@ rule DrainMember {
 
 rule Rebalance {
     -- The balancer moves deployments off a node over a watermark on any LoadVector dimension, each to its next eligible rank.
+    -- A write rate compares accepted source bytes across observations of the same holding epoch.
+    -- Query CPU uses native query opening and result-batch execution time on the holder.
+    -- A move using rates uses members with observations for each active holding.
     -- Each eligible target belongs to the deployment's placement pool.
     -- A reservation uses the source holding's identity and epoch from the plan.
     -- A conflicting reservation or a changed source ends the current pass.
+    -- Configured byte watermarks use sampled live batch and in-memory object cache charges on active writers.
+    -- A target must fit every configured watermark after the proposed move.
+    -- A busy source samples only its local active holders.
     when: NodeOverWatermark(member, dimension)
 
     ensures:
@@ -1939,6 +1946,7 @@ rule WidenOnPressure {
 }
 
 rule NarrowOnQuiet {
+    -- A replica outside the remaining affinity ranks retires when the node observes the narrower width.
     when: ReadQuiet(deployment)
 
     requires: deployment.read_width > 1
@@ -2037,10 +2045,13 @@ rule Fork {
 }
 
 rule ForkAcrossOrganisations {
-    -- A fork into another organisation is a server-side copy, re-encrypted under the child's key, into a new lineage.
+    -- A fork into another organisation creates its own lineage and key.
+    -- Its checkpoint closure and its selected tail are copied under the child's key before the directory publishes the child.
+    -- Publication checks the parent in the writer epoch and storage generation used to prepare the copy.
     when: ForkRequested(parent, basis, org)
 
     requires: org != parent.org
+              and parent.lifecycle in {live, quarantined}
 
     ensures:
         let child = CreateDeployment(org)

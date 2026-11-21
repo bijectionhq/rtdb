@@ -413,6 +413,11 @@ impl LiveIndex {
     pub fn block_index(&self) -> BlockIndex { self.block_index }
     pub fn latest_completed_tx(&self) -> Option<TransactionKey> { self.latest_completed_tx }
     pub fn block_row_count(&self) -> u64 { self.block_row_count }
+    pub fn live_batch_bytes(&self) -> u64 {
+        self.tables.values().flat_map(|table| table.batches()).fold(0u64, |bytes, batch| {
+            bytes.saturating_add(batch.owned.reservation().bytes() as u64).saturating_add(batch.headers.1.bytes() as u64)
+        })
+    }
     pub fn tables(&self) -> &BTreeMap<TableRef, Arc<LiveTable>> { &self.tables }
     pub fn apply(&self, staged: &StagedWrite) -> Result<Self> {
         if staged.block_index != self.block_index || staged.predecessor != self.latest_completed_tx { return Err(invalid("Staged transaction no longer follows this live index")); }
@@ -750,14 +755,20 @@ mod chunk_tests {
     fn a_table_written_a_row_per_transaction_with_long_string_ids_merges_its_chunks() {
         let memory = MemoryBudget::new(1 << 26);
         let table = TableRef::new("public", "keys");
-        let mut live = LiveTable::new(table, BlockIndex(0), TrieConfig::default());
+        let mut live = LiveIndex::new(BlockIndex(0), None, TrieConfig::default());
         for id in 0..1000i64 {
             let key = format!("{id:032x}/0");
             let event = StoredEvent { iid: EntityId::String(key.clone()).iid(), system_from: Timestamp(id), valid_time: Interval::ALL,
                 operation: StoredOperation::Put(StructFields::from([("_id".into(), Value::Utf8(key))])), recency: None };
-            live = live.append(&TableWrite::new(StructFields::new(), Some(IndexBatch::copy_events(&[event], &StructFields::new(), &memory).unwrap())), Timestamp(id))
-                .unwrap_or_else(|error| panic!("row {id}: {error:?}"));
+            let batch = IndexBatch::copy_events(&[event], &StructFields::new(), &memory).unwrap();
+            let write = TableWrite::new(StructFields::new(), Some(batch));
+            let transaction = TransactionKey { tx_id: rtdb_types::TxId(id), system_time: Timestamp(id) };
+            let staged = StagedWrite::new(transaction, live.latest_completed_tx(), live.block_index(), BTreeMap::from([(table.clone(), write)])).unwrap();
+            live = live.apply(&staged).unwrap_or_else(|error| panic!("row {id}: {error:?}"));
         }
-        assert!(live.chunks.len() <= 16, "{} chunks", live.chunks.len());
+        let chunks = &live.tables()[&table].chunks;
+        assert!(chunks.len() <= 16, "{} chunks", chunks.len());
+        assert_eq!(live.live_batch_bytes(), memory.used_bytes() as u64);
+        assert_eq!(live.next_block().unwrap().live_batch_bytes(), 0);
     }
 }

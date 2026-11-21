@@ -42,8 +42,8 @@ Update this section as work lands.
 | 8 | parking after idleness, under `--max-active`, on drain, and waking on the next connection; operation locks are released with their last users and trim watermarks with their holdings. Ordinary parking drains admitted writes and publishes the adopted checkpoint when releasing the holder. | Opt-in resident-idle retains the placement and checkpoint, closes local execution resources, and wakes through a new epoch. A local in-memory directory run measured 100,000 resident placements with zero additional node execution bytes or tasks. |
 | 9 | the gateway reads pgwire frames, survives a planned move or a holder's death while the session is idle, replays the startup and prepared statements, and resends a command a former holder refused as not held; once the first holder has authenticated the client, each reconnection carries a capability the gateway signs with the cell's secret, which a node accepts in place of the password for that deployment alone. The pgwire gateway can terminate TLS and bind a connection to a specific installation. | The first connection's authentication runs on its node. The Flight SQL gateway supports one cell and binds server-local sessions to the current writer. Transparent Flight SQL recovery and cross-cell routing remain open. |
 | 10 | read replicas fed by the log for read-only sessions within a deployment's read width; opt-in linearizable reads confirmed with the logkeepers before each query ; a snapshot session (`rtdb.read=snapshot`) reads the deployment as of its checkpoint on any node, the holder last, opened from object storage with frozen logs and no logkeeper, and closed before the reaper's grace runs out, serving any basis at or below the checkpoint ; a deployment whose persisted tries outgrow a node's disk cache (by default; `AgentOptions::fragments` sets the threshold and depth, and no command-line flag does yet) splits each whole-table scan into 16 trie-prefix fragments, each read at the coordinator's basis by the node that ranks first for `{storage identity}/{table}/{prefix}` among the nodes that may take placements, which opens a log-fed replica for it if it has none, and answered over the control protocol as Arrow IPC; a fragment whose reader fails or is not at the basis is read by the coordinator itself. Pgwire read-only sessions spread across the available replicas within the configured width. | scan fragments are split by the scan on the coordinating node, not by a cell-wide planner, and the size test is the deployment's persisted trie bytes against the node's disk-cache size rather than `PerMemberCacheShare`; a fragment carries the projection, the evaluated temporal bounds and the predicates any node evaluates alike, but not those on parameters, outer rows, the clock or chance, which the coordinator alone applies, and comes back whole in one response rather than streamed, a slice too large for one response being read by the coordinator instead; a reader at or past the coordinator's basis serves a fragment as of the basis, except that what was erased since is gone; `_id` lookups and multi-partition databases are never split |
-| 11 | the controller reaps expired members, confirms silent nodes dead by probing, and rebalances; planned moves; quarantine to the isolation pool; `status` as the autoscaling signal. Member probes have bounded concurrency, drains move one holding at a time, and `status --placements-only` reads indexed demand by pool. | Autoscaling acts on the reported signal outside RTDB. Load-vector rebalancing and automatic read-width adjustment remain open. |
-| 12 | per-deployment AES-256-GCM keys for objects (above the disk cache) and log payloads; forks by reference into the parent's lineage on fresh logs: a fork's `~base` manifest names where each object it shares physically lives, and whatever erases a shared object (the reaper, the parent's deletion) copies it into the forks still referencing it first; a cell move materializes every reference; deletion durably drops the stream from addressed replicas, empties the inventory including S3 versions, destroys the local key and stores a signed receipt bound to the deployment’s namespaces; a fork can also be taken at a past block younger than the reaper's grace, referencing only what existed when that block was written. Local fork, reaper, move and disposal operations serialize their inventory mutations. Hosted disposal waits for storage admissions and retires every recorded replica journal. | a fork is of the current state, of a past block, or of a time at or after the checkpoint, whose tail up to it is copied into the fork's stream, rather than of any basis with its tail in a pack; a time before the checkpoint must be forked as a past block, and a tail holding an oversized transaction is refused; a forked tail's transactions take new ids in the fork's log epoch; a referenced object is copied out before its owner erases it rather than kept in place, and the reaper and forks use a grace interval, and enforcing concurrent reference publication requires the spec's lineage fence |
+| 11 | the controller reaps expired members, confirms silent nodes dead by probing, and rebalances; planned moves; quarantine to the isolation pool; `status` as the autoscaling signal. Member probes have bounded concurrency, drains move one holding at a time, and `status --placements-only` reads indexed demand by pool. | Autoscaling acts on the reported signal outside RTDB. The controller can rebalance using write rate, query CPU, live batch and cache byte watermarks. Automatic read-width adjustment remains open. |
+| 12 | per-deployment AES-256-GCM keys for objects (above the disk cache) and log payloads; forks by reference into the parent's lineage on fresh logs: a fork's `~base` manifest names where each object it shares physically lives, and whatever erases a shared object (the reaper, the parent's deletion) copies it into the forks still referencing it first; a cell move materializes every reference; deletion durably drops the stream from addressed replicas, empties the inventory including S3 versions, destroys the local key and stores a signed receipt bound to the deployment’s namespaces; a fork can also be taken at a past block younger than the reaper's grace, referencing only what existed when that block was written. Local fork, reaper, move and disposal operations serialize their inventory mutations. Hosted disposal waits for storage admissions and retires every recorded replica journal. Cross-organisation forks copy the checkpoint and selected log tail with their own key. | a fork is of the current state, of a past block, or of a time at or after the checkpoint, whose tail up to it is copied into the fork's stream, rather than of any basis with its tail in a pack; a time before the checkpoint must be forked as a past block, and a tail holding an oversized transaction is refused; a forked tail's transactions take new ids in the fork's log epoch; a referenced object is copied out before its owner erases it rather than kept in place, and the reaper and forks use a grace interval, and enforcing concurrent reference publication requires the spec's lineage fence |
 | 13 | persistent cell placement with DynamoDB and a local in-memory cell map, gateway forwarding, creation in the least occupied cell, restartable cell moves that carry the unflushed tail across; the old cell's reaper erases what a move left there once the grace has passed since the move. The destination has a durable object copy and sealed replica tail before cutover. Each residence retains independent storage and key custody. | The source is fenced during the copy. Provider-backed movement and cleanup still require staging qualification. The source reaper needs its key authority. |
 | 14 | the chaos test and the history audit; `crates/simulation` runs one deployment's single-writer protocol from a seed (members claiming through the directory, three logkeeper state machines, a modelled writer, crashes, partitions, broken connections) and checks the epoch and log invariants after every step; it also runs a cell's storage lifecycle from a seed (deployments writing through their real store stacks, releasing, forking now and at a past block, reaper passes, deletions and cell moves, over in-memory buckets on a simulated clock, with injected pack read failures and move cleanup), checking that each deployment reads exactly what it wrote or inherited and has not released and nothing its parent wrote after the fork point, and gateway sessions (the real session over loopback TCP to stub backends that die during startup, before or after executing, between replies, or after preparing a named statement), checking that every command runs at most once, exactly once if the client was told it succeeded, and that the client sees only its own command's replies | three simulations of parts of a cell rather than one of a whole cell: the storage run has no nodes, directory or logkeepers and its admin sequences are modelled around the real calls, the session backends are stubs, with simple commands and extended-protocol prepared reads; combined directory, provider and runtime failures remain to be simulated |
 
@@ -757,6 +757,7 @@ Moves are invisible to clients only if the gateway owns connections and session 
    If a holder accepts a socket but stalls before `ReadyForQuery`, the gateway closes startup with SQLSTATE `57P03` so the client can retry.
    A retry waits for a placement change or the 100 ms fallback timer, whichever arrives first.
    A gateway routing directly to a known writer reads that member by ID before considering other candidates.
+   A redirect is followed through the replacement node’s control endpoint so pgwire connects after the replacement confirms its endpoint and epoch.
    The writer checks its own membership by ID when it reuses a running placement.
    If a placed database detaches or changes while a query checks authority, the node refuses before planning so the gateway can retry.
    A direct Flight SQL session on a placed node supplies `x-xtdb-database` on its first authenticated request.
@@ -819,6 +820,9 @@ Read-your-writes across tiers; a zombie holder cannot serve a linearizable read;
 
 **Done when** a hot deployment's reads spread across its read width with bounded staleness.
 
+Nodes use the same eligible affinity ranks as the gateway when opening a log-fed read replica.
+A narrower width retires existing out-of-rank replicas, and their gateway sessions reconnect within the remaining width.
+
 ### Stage 11: the controller
 
 **Why.**
@@ -834,6 +838,17 @@ Placement must follow load and the fleet must scale both ways (spec surface `Con
    It runs the handoffs one at a time.
    The source's identity and epoch must still match at reservation.
    A rebalancer ends its current pass when another operation has reserved the deployment or changed the source holding.
+   The optional `--rebalance-write-bytes-per-second`, `--rebalance-query-cpu-ms-per-second`, `--rebalance-tail-bytes` and `--rebalance-cache-bytes` are per-node watermarks.
+   The controller samples up to 16 eligible endpoints concurrently and chooses moves from the strongest configured pressure.
+   The live tail sample counts the current block's retained event batches and their headers.
+   The cache sample counts bytes charged to the deployment's in-memory pool, including decoded views and outstanding read leases.
+   The write rate uses encoded source bytes accepted by the holder between two observations of the same epoch.
+   The query CPU rate records thread CPU spent opening native queries and producing result batches on the holder.
+   Linux and macOS nodes start measuring that counter on the first controller probe that requests it for a holding.
+   With a rate watermark configured, a node with an unsampled holding waits for another observation before participating in moves.
+   The next eligible member in the deployment's affinity order must fit the sampled load under every configured limit.
+   Moves through the configured watermarks are limited to eight per pass by default.
+   Use `--rebalance MOVES` to override that limit.
    A recently used deployment keeps serving on a draining node while its pool has no eligible successor.
 2. Planned handoff (`IntendMove`, `HandOff`): subscription warm-up, hot-range prefetch from the source, admission pause, `Handoff` record, claim by move intent.
    The gateway, claim rule, and rebalancer use the same eligibility check for the general and isolation pools.
@@ -962,6 +977,14 @@ The completed prefetch trials measured 169.7–686.4 ms during scale-out and 97.
 The 48-move gap p99 ranged from 100.3 to 2,358.4 ms on the baseline and from 129.2 to 3,032.8 ms with the prefetch.
 The branch keeps the existing handoff path while the prefetch strategy is evaluated.
 
+A second comparison ran three paired release trials with the same 32,768-update Zipf workload and 48 continuous handoffs per build.
+In this experiment, opening the checkpoint and quorum log overlapped after authorizing the storage region.
+All six Zipf counters and all six handoff counters verified on a shared development host.
+Baseline scale-out p99 ranged from 105.8 to 255.9 ms and scale-in p99 ranged from 74.0 to 292.9 ms.
+With overlapping opens, those ranges were 148.4–2,304.7 ms and 111.8–3,734.8 ms.
+The 48-move gap p99 ranged from 122.3 to 182.2 ms on the baseline and from 133.8 to 212.5 ms with overlapping opens.
+Checkpoint and quorum-log opens remain sequential.
+
 ### Stage 12: encryption, lineages, forks and deletion
 
 **Why.**
@@ -974,6 +997,9 @@ Deletion must be provable and forks must be cheap (spec rules `Fork`, `ForkAcros
 3. Fork: a new record in the lineage with a fork checkpoint referencing the parent's objects plus one pack of the parent's tail to the fork basis; inherited reads capped at the fork basis; cross-organisation forks copied and re-encrypted.
    Fork reads retry their local copy if the reaper transfers an inherited object between the first local read and the read from its original owner.
    A reference-manifest read repeats the listing if a concurrent revision replaced the listed manifest.
+   Use `rtdb-multi fork --org ORG` to copy a checkpoint or historical fork into another organisation in the same cell.
+   The destination owns its key, lineage, checkpoint objects and replica tail.
+   The directory publishes the child after copying its selected checkpoint and tail and checking the source's epoch and storage generation.
 4. Deletion: fence by epoch bump, seal and drop the stream, wait `credential_ttl`, re-wrap shared objects to a surviving referrer, delete all versions, prove the prefix empty twice, destroy the key, sign the deletion record.
    The delete command durably drops the stream from every member of its current ensemble and any pending source ensemble before proceeding to object erasure.
    A missing replica leaves the deployment fenced in `deleting`.
@@ -1024,7 +1050,9 @@ Deletion must be provable and forks must be cheap (spec rules `Fork`, `ForkAcros
    A deployment moving between cells keeps ownership of its source tail until cutover.
 
 **Tests.**
-A fork costs constant time regardless of size; a deleted parent's children still read their inherited data; a deleted deployment's objects are unreadable from the moment its key is destroyed.
+A same-organisation fork copies no payload.
+A cross-organisation fork copies the selected checkpoint and tail with an independent key and remains readable after the source is erased.
+A deleted deployment's objects are unreadable from the moment its key is destroyed.
 
 **Done when** deletion produces a signed record and the scrubber finds nothing left under the prefix.
 
@@ -1163,6 +1191,7 @@ Writes convert eligible rows as they are created or updated.
 Switching writers back to `dynamodb:PREFIX` stops new packed writes.
 Existing packed rows require a rewrite to JSON before downgrading any reader.
 Held deployments, operation journals and records with non-UUID logkeeper IDs continue to use JSON.
+Parked records with ordered-index fences also use JSON.
 DynamoDB Local verifies mixed layouts, the holder index, conditional updates and Streams delivery.
 Rebalancing and compaction placement query live members' holdings with bounded concurrency.
 The DynamoDB holder index omits unheld rows and verifies each hit by a strongly consistent read.

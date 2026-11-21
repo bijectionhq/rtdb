@@ -153,6 +153,9 @@ entity LiveIndex {
     -- Rows APPLIED into the currently-open block, and the gauge the leader cuts on.
     -- Counted where a transaction's rows land, so a transaction resolved but never applied contributes nothing to it, whichever term resolved it.
     block_row_count: Integer
+    -- The placement load sample counts the event batches and decoded headers retained by the current block.
+    -- The gauge resets when the next block opens.
+    live_batch_bytes: Integer
 
     -- Durable live tables: they hold only applied rows.
     tables: LiveTable with index = this

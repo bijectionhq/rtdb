@@ -5020,6 +5020,7 @@ dependencies = [
  "datafusion-functions",
  "datafusion-physical-expr",
  "futures",
+ "libc",
  "parking_lot",
  "rtdb-columnar",
  "rtdb-expr",

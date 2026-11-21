@@ -18,6 +18,7 @@ pub mod gateway;
 pub mod install;
 pub mod keys;
 pub mod lease;
+pub mod load;
 pub mod logs;
 mod ordered_index_storage;
 pub mod packing;

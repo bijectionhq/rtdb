@@ -1,5 +1,5 @@
 use std::collections::BTreeMap;
-use std::sync::Arc;
+use std::sync::{Arc, atomic::{AtomicU64, Ordering}};
 
 use async_trait::async_trait;
 use rtdb_columnar::MemoryBudget;
@@ -28,6 +28,8 @@ pub struct Database {
     pub(crate) logs: Arc<PartitionLogs>,
     pub(crate) replication: ReplicationHandle,
     transaction_admission: RwLock<parking_lot::Mutex<Option<SourcePosition>>>,
+    submitted_bytes: AtomicU64,
+    query_cpu: Option<Arc<rtdb_query::QueryCpu>>,
     compaction: Option<CompactionHandle>,
     artefacts: Vec<ArtefactHandle>,
     ordered_cycle: Option<OrderedIndexCycle>,
@@ -66,6 +68,14 @@ impl Database {
     pub fn compaction(&self) -> Option<&CompactionHandle> { self.compaction.as_ref() }
     /// Rows applied since the last block, held in the live index until the next flush.
     pub fn live_rows(&self) -> u64 { self.partition.value().live().block_row_count() }
+    pub fn live_batch_bytes(&self) -> u64 { self.partition.value().live().live_batch_bytes() }
+    pub fn cache_bytes(&self) -> u64 { self.storage.pool_retained_bytes() as u64 }
+    pub fn observe_query_cpu(&self) -> Option<u64> { self.query_cpu.as_ref()?.observe() }
+    pub(crate) fn query_cpu_tracker(&self) -> Option<Arc<rtdb_query::QueryCpu>> {
+        self.query_cpu.as_ref().filter(|counter| counter.is_observed()).cloned()
+    }
+    pub fn submitted_bytes(&self) -> u64 { self.submitted_bytes.load(Ordering::Relaxed) }
+    pub(crate) fn record_submission(&self, bytes: u64) { self.submitted_bytes.fetch_add(bytes, Ordering::Relaxed); }
     /// Pauses new user submissions and waits for the admitted ones to apply.
     pub async fn pause_transactions(&self) -> Result<PausedTransactions<'_>> {
         let paused = self.transaction_admission.write().await;
@@ -196,6 +206,7 @@ impl DatabaseFactory {
                 scan_accelerators: Arc::clone(&self.accelerators),
                 cancellation: cancellation.clone(), default_tz: self.options.default_timezone.clone(), authorization: Arc::clone(&self.authorization),
                 execution_observer: self.execution_observer.clone(), tracer: self.tracer.clone() });
+            let query_cpu = catalog.is_placed().then(|| Arc::new(rtdb_query::QueryCpu::default()));
             let effects = Arc::new(CatalogEffects { catalog, commands, primary: name == "xtdb" });
             let mut replication_options = self.options.replication.clone();
             replication_options.may_lead &= !read_only;
@@ -242,7 +253,7 @@ impl DatabaseFactory {
             let ordered_cycle = ordered_worker.as_ref().map(|_| watch::channel(None).0);
             let supervisor = MaintenanceSupervisor { store: resources.store, partition: Arc::clone(&partition), replication: replication.clone(), compaction: compaction.clone(), artefacts: artefacts.clone(),
                 observer: Arc::clone(&self.observer), options: self.options.clone(), source, ordered_worker, ordered_cycle: ordered_cycle.clone() };
-            let database = Arc::new(Database { name, configuration, read_only, partition, storage, logs, replication, transaction_admission: RwLock::default(), compaction, artefacts, ordered_cycle, cancellation: cancellation.clone(), io: Arc::clone(&io) });
+            let database = Arc::new(Database { name, configuration, read_only, partition, storage, logs, replication, transaction_admission: RwLock::default(), submitted_bytes: AtomicU64::new(0), query_cpu, compaction, artefacts, ordered_cycle, cancellation: cancellation.clone(), io: Arc::clone(&io) });
             let driver = DatabaseDriver { database: Arc::clone(&database), replication: replica_driver, compactor, artefacts: artefact_drivers, supervisor, logs: opened_logs.drivers, log_cancellation };
             Ok(OpenedDatabase { database, driver, secondaries })
         };

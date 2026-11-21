@@ -126,6 +126,14 @@ async fn exercise_cell(storage: CellStorage) {
     for store in &copied {
         assert!(rtdb_multi::reference::physical_objects(bucket.as_ref(), store).await.unwrap().is_empty(), "a fork on S3 references its parent's objects rather than copying them");
     }
+    let external = admin::fork_into(
+        cell.directory.as_ref(), &cell.storage(), &cell.keys(), "shop",
+        admin::ForkDestination { name: "outside-preview", org: Some("recipient") }, &control(),
+    ).await.unwrap();
+    let versioned = rtdb_multi::reference::stores(bucket.as_ref(), &external.storage_prefix()).await.unwrap();
+    assert_eq!(versioned.len(), 1);
+    assert!(rtdb_multi::reference::Base::load(bucket.as_ref(), &versioned[0]).await.unwrap().objects.is_empty());
+
     eprintln!("S3 phase: read and write fork");
     let preview = connect_eventually(&cell, "shop-preview").await;
     assert_eq!(values(&preview, "SELECT _id FROM orders").await, ["0", "1", "2", "3", "4", "5"]);
@@ -144,6 +152,10 @@ async fn exercise_cell(storage: CellStorage) {
     let preview = connect_eventually(&cell, "shop-preview").await;
     assert_eq!(values(&preview, "SELECT _id FROM orders").await, ["0", "1", "2", "3", "4", "5", "50"], "the fork outlives its parent, its shared objects copied into it first");
     drop(preview);
+
+    let outside = connect_eventually(&cell, "outside-preview").await;
+    assert_eq!(values(&outside, "SELECT _id FROM orders").await, ["0", "1", "2", "3", "4", "5"]);
+    drop(outside);
 
     eprintln!("S3 phase: reap");
     let deployments = cell.directory.deployments().await.unwrap();

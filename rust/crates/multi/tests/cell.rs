@@ -14,7 +14,7 @@ use std::{
 use common::*;
 use rtdb_directory::{DeploymentRecord, Directory, Lifecycle, MemberId, MemberPool, MemoryDirectory};
 use rtdb_multi::admin;
-use rtdb_multi::control::Response;
+use rtdb_multi::control::{Request, Response};
 use rtdb_multi::keys::KeyService;
 use rtdb_multi::cells::{CellMap, MemoryCellMap};
 use rtdb_multi::deployment::CellStorage;
@@ -221,6 +221,47 @@ async fn routing_to_a_current_writer_does_not_scan_the_member_inventory() {
         drop(client);
     }
     assert_eq!(directory.membership_scans.load(Ordering::Relaxed), scans);
+    cell.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn resource_rebalancing_moves_the_largest_tail_toward_an_eligible_node() {
+    let cell = Cell::start(2, None).await;
+    let directory = cell.directory.as_ref();
+    for (name, bytes) in [("heavy", 8192), ("light", 16)] {
+        admin::create_deployment(directory, name, "acme", 3).await.unwrap();
+        assert!(matches!(cell.node(0).agent.activate(name).await.unwrap(), Response::Held { .. }));
+        let client = connect_eventually(&cell, name).await;
+        client.simple_query(&format!("INSERT INTO docs (_id, payload) VALUES (1, '{}')", "x".repeat(bytes))).await.unwrap();
+    }
+    let snapshot = rtdb_multi::control::call(&cell.node(0).control_address.to_string(), &Request::HoldingLoads { measure_query_cpu: true }, Duration::from_secs(2), &control()).await.unwrap();
+    let Response::HoldingLoads { holdings } = snapshot else { panic!("expected the writer's active loads") };
+    assert_eq!(holdings.len(), 2);
+    let reader = connect_eventually(&cell, "heavy").await;
+    assert_eq!(values(&reader, "SELECT CHAR_LENGTH(payload) FROM docs").await, ["8192"]);
+    drop(reader);
+    let profile = rtdb_multi::control::call(&cell.node(0).control_address.to_string(), &Request::HoldingLoads { measure_query_cpu: true }, Duration::from_secs(2), &control()).await.unwrap();
+    let Response::HoldingLoads { holdings: after_probe } = profile else { panic!("expected the writer's CPU sample") };
+    if cfg!(any(target_os = "linux", target_os = "macos")) {
+        let selected = |name: &str| after_probe.iter().find(|holding| holding.name == name).unwrap().query_cpu_nanos;
+        assert!(selected("heavy").unwrap() > 0);
+        assert_eq!(selected("light"), Some(0));
+    }
+    let submitted: BTreeMap<_, _> = holdings.iter().map(|holding| (holding.name.as_str(), holding.submitted_bytes.unwrap())).collect();
+    assert!(submitted["heavy"] > 8192 && submitted["heavy"] > submitted["light"] && submitted["light"] > 0);
+    let by_name: BTreeMap<_, _> = holdings.into_iter().map(|holding| (holding.name, holding.load.tail_bytes)).collect();
+    assert!(by_name["heavy"] > by_name["light"] && by_name["light"] > 0);
+    let limit = std::num::NonZeroU64::new(by_name["heavy"] + by_name["light"] / 2).unwrap();
+    let limits = rtdb_multi::load::LoadLimits { tail_bytes: Some(limit), ..Default::default() };
+    let mut samples = rtdb_multi::load::LoadSamples::default();
+
+    assert_eq!(rtdb_multi::load::rebalance(directory, 4, limits, &control(), &mut samples).await.unwrap(), 1);
+    assert_eq!(cell.holder("heavy").await, Some(1));
+    assert_eq!(cell.holder("light").await, Some(0));
+    let client = connect_eventually(&cell, "heavy").await;
+    assert_eq!(values(&client, "SELECT CHAR_LENGTH(payload) FROM docs").await, ["8192"]);
+    drop(client);
+    assert_eq!(rtdb_multi::load::rebalance(directory, 4, limits, &control(), &mut samples).await.unwrap(), 0);
     cell.stop().await;
 }
 
@@ -869,6 +910,14 @@ async fn read_only_sessions_spread_across_the_deployments_read_width() {
     for reader in &readers {
         assert_eq!(values(reader, "SELECT total FROM orders").await, ["10"]);
     }
+    admin::set_read_width(cell.directory.as_ref(), "shop", 2).await.unwrap();
+    let replicas = (0..3).filter(|replica| *replica != holder).collect::<Vec<_>>();
+    for &replica in &replicas { cell.node(replica).agent.reconcile().await; }
+    let (active, closed): (Vec<_>, Vec<_>) = replicas.into_iter()
+        .partition(|&replica| cell.node(replica).agent.subscribed() == ["shop"]);
+    assert_eq!((active.len(), closed.len()), (1, 1));
+    assert_eq!(cell.node(closed[0]).agent.subscribe("shop").await.unwrap_err().code, "rtdb.multi/read-width");
+    for reader in &readers { assert_eq!(values(reader, "SELECT total FROM orders").await, ["10"]); }
     drop((readers, writer));
     cell.stop().await;
 }
@@ -2081,6 +2130,7 @@ async fn a_recovering_subscriber_keeps_its_suffix_through_a_concurrent_trim() {
     let initial = directory.deployment(&deployment.id).await.unwrap().unwrap().checkpoint.unwrap();
     client.simple_query("INSERT INTO orders (_id, total) VALUES (2, 20), (3, 30)").await.unwrap();
     let subscriber = cell.add_node().await;
+    admin::set_read_width(directory.as_ref(), "shop", 2).await.unwrap();
     let gate = Arc::new(RecoveryGate::default());
     *directory.recovery_gate.lock().unwrap() = Some(gate.clone());
     let agent = Arc::clone(&cell.node(subscriber).agent);
@@ -2119,7 +2169,6 @@ async fn a_recovering_subscriber_keeps_its_suffix_through_a_concurrent_trim() {
         status.replica_position.offset() >= updated.boundary || matches!(status.role, rtdb_replication::Role::Stopped)
     })).await.unwrap().unwrap();
     assert!(database.status().replica_position.offset() >= updated.boundary, "subscriber applied the newer block boundary");
-    admin::set_read_width(directory.as_ref(), "shop", 2).await.unwrap();
     let (follower, connection) = tokio_postgres::Config::new().host("127.0.0.1").port(cell.gateway.port())
         .user("xtdb").password("cell-test").dbname("shop").options("-c default_transaction_read_only=on")
         .connect(NoTls).await.unwrap();
@@ -2388,6 +2437,9 @@ async fn a_snapshot_session_reads_the_checkpoint_from_object_storage_on_another_
     assert!(cell.node(1 - holder).agent.subscribed().contains(&"shop".to_owned()), "on a node that does not hold it");
     assert!(snapshot.simple_query("INSERT INTO orders (_id, total) VALUES (7, 1)").await.is_err(), "and it never writes");
     let reader = cell.node(1 - holder);
+    assert_eq!(reader.agent.subscribe("shop").await.unwrap_err().code, "rtdb.multi/read-width");
+    assert!(reader.agent.subscribed_snapshots().contains(&"shop".to_owned()));
+    admin::set_read_width(cell.directory.as_ref(), "shop", 2).await.unwrap();
     assert!(matches!(reader.agent.subscribe("shop").await, Err(_) | Ok(rtdb_multi::control::Response::Subscribed { .. })));
     assert!(!reader.agent.subscribed_snapshots().contains(&"shop".to_owned()), "asked for a replica, a node replaces its snapshot rather than serve it as one");
     drop((snapshot, client));
@@ -2659,6 +2711,14 @@ async fn a_fork_at_a_time_after_the_checkpoint_holds_the_tail_up_to_it() {
     assert!(admin::fork_at_time(cell.directory.as_ref(), &cell.storage(), &cell.keys(), "shop", "too-early", rtdb_types::Timestamp(0), Duration::from_secs(3600), 4 << 20).await.is_err(),
         "a time before the checkpoint is a past block's");
     admin::fork_at_time(cell.directory.as_ref(), &cell.storage(), &cell.keys(), "shop", "shop-then", then, Duration::from_secs(3600), 4 << 20).await.unwrap();
+    admin::fork_time_into(
+        cell.directory.as_ref(), &cell.storage(), &cell.keys(), "shop",
+        admin::ForkDestination { name: "shop-external-then", org: Some("recipient-org") },
+        then, Duration::from_secs(3600), 4 << 20,
+    ).await.unwrap();
+    let external = connect_eventually(&cell, "shop-external-then").await;
+    assert_eq!(values(&external, "SELECT _id FROM orders").await, ["0", "1", "2", "3", "4"]);
+    drop(external);
     let fork = connect_eventually(&cell, "shop-then").await;
     assert_eq!(values(&fork, "SELECT _id FROM orders").await, ["0", "1", "2", "3", "4"], "the fork holds the block and the tail up to the time, and nothing after");
     fork.simple_query("INSERT INTO orders (_id, total) VALUES (50, 1)").await.unwrap();
@@ -2672,6 +2732,67 @@ async fn a_fork_at_a_time_after_the_checkpoint_holds_the_tail_up_to_it() {
     let fork = connect_eventually(&cell, "shop-then").await;
     assert_eq!(values(&fork, "SELECT _id FROM orders").await, ["0", "1", "2", "3", "4", "50"], "the copied tail is the fork's history, recovered by its next holder");
     drop(fork);
+    cell.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_cross_organisation_fork_owns_its_checkpoint_and_survives_erasure_of_its_source() {
+    use rtdb_format::keys::{CURRENT_STORAGE_VERSION, StorageRoot, block_key};
+    use rtdb_multi::{cipher::Cipher, packing::PackDiscovery, reference::Base, store};
+    use rtdb_storage::ObjectStore;
+    use rtdb_types::BlockIndex;
+
+    let cell = Cell::start(2, None).await;
+    let directory = cell.directory.as_ref();
+    let storage = cell.storage();
+    let keys = cell.keys();
+    let parent = admin::create_deployment(directory, "shop", "source-org", 3).await.unwrap();
+    let client = cell.connect("shop").await;
+    client.simple_query("INSERT INTO orders (_id, total) VALUES (1, 10)").await.unwrap();
+    let first = admin::flush_checkpoint(directory, &parent, &control()).await.unwrap().checkpoint.unwrap();
+    client.simple_query("INSERT INTO orders (_id, total) VALUES (2, 20)").await.unwrap();
+    drop(client);
+
+    let current = admin::fork_into(
+        directory, &storage, &keys, "shop",
+        admin::ForkDestination { name: "shop-current", org: Some("recipient-org") }, &control(),
+    ).await.unwrap();
+    let historical = admin::fork_block_into(
+        directory, &storage, &keys, "shop",
+        admin::ForkDestination { name: "shop-historical", org: Some("recipient-org") },
+        first.block, Duration::from_secs(3600),
+    ).await.unwrap();
+
+    let bucket = storage.bucket(rtdb_storage::IoRegion::new()).await.unwrap();
+    let version = StorageRoot::new(CURRENT_STORAGE_VERSION, rtdb_types::StorageEpoch(0)).unwrap().key();
+    let root = |record: &DeploymentRecord| format!("{}/{version}", record.storage_prefix());
+    let parent_key = keys.existing_key(&parent.key_id()).await.unwrap().unwrap();
+    let child_key = keys.existing_key(&historical.key_id()).await.unwrap().unwrap();
+    assert_ne!(parent_key, child_key);
+    let parent_cipher = Cipher::new(&parent_key).unwrap();
+    let child_cipher = Cipher::new(&child_key).unwrap();
+    for child in [&current, &historical] {
+        assert_eq!(child.parent.as_deref(), Some(parent.id.as_str()));
+        assert_eq!((child.org.as_str(), child.lineage.as_str()), ("recipient-org", child.id.as_str()));
+        assert!(Base::load(bucket.as_ref(), &root(child)).await.unwrap().objects.is_empty());
+    }
+    let catalog = rtdb_storage::ObjectKey::new(block_key(BlockIndex(first.block)).unwrap()).unwrap();
+    let parent_store = store::open_deployment_store(bucket.clone(), &root(&parent), PackDiscovery::List, store::wall_clock()).await.unwrap();
+    let child_store = store::open_deployment_store(bucket.clone(), &root(&historical), PackDiscovery::List, store::wall_clock()).await.unwrap();
+    let source = parent_store.get(&catalog).await.unwrap();
+    let copied = child_store.get(&catalog).await.unwrap();
+    assert_eq!(parent_cipher.open(catalog.as_str(), &source).unwrap(), child_cipher.open(catalog.as_str(), &copied).unwrap());
+    assert!(parent_cipher.open(catalog.as_str(), &copied).is_err());
+
+    admin::delete_deployment(directory, &storage, &keys, "shop", 4 << 20).await.unwrap();
+    assert_eq!(keys.existing_key(&parent.key_id()).await.unwrap_err().code, "rtdb.multi/key-destroyed");
+    let preview = connect_eventually(&cell, "shop-current").await;
+    assert_eq!(values(&preview, "SELECT total FROM orders").await, ["10", "20"]);
+    let past = connect_eventually(&cell, "shop-historical").await;
+    assert_eq!(values(&past, "SELECT total FROM orders").await, ["10"]);
+    past.simple_query("INSERT INTO orders (_id, total) VALUES (3, 30)").await.unwrap();
+    assert_eq!(values(&past, "SELECT total FROM orders").await, ["10", "30"]);
+    drop((preview, past));
     cell.stop().await;
 }
 

@@ -787,8 +787,10 @@ fn fork_conflict() -> Anomaly {
 }
 
 fn check_fork_parent(child: &DeploymentRecord, parent: Option<&DeploymentRecord>, expected: Version) -> Result<()> {
-    if parent.is_some_and(|parent| parent.version == expected && parent.can_fork()
-        && parent.org == child.org && parent.lineage == child.lineage)
+    if parent.is_some_and(|parent| {
+        let lineage = if parent.org == child.org { &parent.lineage } else { &child.id };
+        parent.version == expected && parent.can_fork() && child.lineage == *lineage
+    })
     {
         Ok(())
     } else {

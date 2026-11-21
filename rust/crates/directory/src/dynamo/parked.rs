@@ -77,7 +77,8 @@ pub(super) fn encode(record: &DeploymentRecord) -> Option<Vec<u8>> {
         id, name: _, org, lineage, incarnation, lifecycle, epoch: _, holder, resident_idle: _, ensemble, created_at_ms, read_width,
         activation_crashes, log_epoch, parent, linearizable_reads, checkpoint, replica_anchor, storage_generation,
         storage_namespaces, s3_write_lease_until_ms, engine_pin, deletion_observation, move_intent, placement_move, move_from, log_copy_servers, cell_move, moved_at_ms,
-        source_cleanup, deletion_record, replica_journals, storage_regions, cell_transfer, disposal, checkpoint_recovery,
+        source_cleanup, deletion_record, replica_journals, storage_regions, ordered_indexes, ordered_index_catalogs,
+        cell_transfer, disposal, checkpoint_recovery,
         checkpoint_stage, checkpoint_repair_receipts, checkpoint_captures, checkpoint_capture_retirements,
         archive_retirement, compaction_replay_cutoff, retired_residences, version: _,
     } = record;
@@ -85,6 +86,7 @@ pub(super) fn encode(record: &DeploymentRecord) -> Option<Vec<u8>> {
         || move_intent.is_some() || placement_move.is_some() || move_from.is_some() || cell_move.is_some()
         || moved_at_ms.is_some() || source_cleanup.is_some() || deletion_observation.is_some() || deletion_record.is_some() || !log_copy_servers.is_empty()
         || !storage_regions.is_empty() || cell_transfer.is_some() || disposal.is_some() || checkpoint_recovery.is_some()
+        || !ordered_indexes.is_empty() || !ordered_index_catalogs.is_empty()
         || checkpoint_stage.is_some() || !checkpoint_repair_receipts.is_empty() || !checkpoint_capture_retirements.is_empty()
         || !retired_residences.is_empty() || !checkpoint_captures.is_empty() || archive_retirement.is_some()
     {
@@ -196,6 +198,8 @@ pub(super) fn decode(bytes: &[u8], id: &str, name: &str, epoch: u64, version: Ve
         deletion_record: None,
         replica_journals: packed.replica_journals.into_iter().collect(),
         storage_regions: Default::default(),
+        ordered_indexes: Default::default(),
+        ordered_index_catalogs: Default::default(),
         cell_transfer: None,
         disposal: None,
         retired_residences: Default::default(),

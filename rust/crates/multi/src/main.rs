@@ -30,7 +30,7 @@ Usage: rtdb-multi --build-info\n\
        rtdb-multi move-cell --cell-map ADDR --name NAME --from CELL --from-directory DIR --from-storage-root PATH --from-keys PATH --to CELL --to-directory DIR --to-storage-root PATH --to-keys PATH [--ecs-cluster ARN]\n\
        rtdb-multi prepare-cell-transfer [--transfer FILE | --transfer-bucket BUCKET --transfer-digest SHA256] --from CELL --from-directory DIR --from-storage-root PATH --from-keys PATH --to CELL --to-directory DIR --to-storage-root PATH --to-keys PATH [--ecs-cluster ARN]\n\
        rtdb-multi activate-cell-transfer [--transfer FILE | --transfer-bucket BUCKET --transfer-digest SHA256] --from CELL --from-directory DIR --from-storage-root PATH --from-keys PATH --to CELL --to-directory DIR --to-storage-root PATH --to-keys PATH\n\
-       rtdb-multi controller --directory DIR [--rebalance MOVES] [--cell-secret FILE]\n\
+       rtdb-multi controller --directory DIR [--rebalance MOVES] [--rebalance-write-bytes-per-second BYTES] [--rebalance-tail-bytes BYTES] [--rebalance-cache-bytes BYTES] [--rebalance-query-cpu-ms-per-second MS] [--cell-secret FILE]\n\
        rtdb-multi reaper --directory DIR --storage-root PATH [--keys PATH] [--ecs-cluster ARN] [--grace SECONDS] [--recovery-listen ADDR --recovery-config FILE --recovery-token-file FILE --recovery-org ORG --archive-root PATH --cell-secret FILE]\n\
        rtdb-multi create --directory DIR --name NAME [--org ORG] [--replicas N]\n\
        rtdb-multi install --directory DIR --id UUID --name NAME --org ORG [--replicas N]\n\
@@ -44,7 +44,7 @@ Usage: rtdb-multi --build-info\n\
        rtdb-multi pin-engine --directory DIR --name NAME (--version VERSION | --clear)\n\
        rtdb-multi read-width --directory DIR --name NAME --width N\n\
        rtdb-multi unquarantine --directory DIR --name NAME\n\
-       rtdb-multi fork --directory DIR --storage-root PATH --keys PATH --from NAME --name NAME [--at-block N | --at-time RFC3339] [--grace SECONDS] [--cell-secret FILE]\n\
+       rtdb-multi fork --directory DIR --storage-root PATH --keys PATH --from NAME --name NAME [--org ORG] [--at-block N | --at-time RFC3339] [--grace SECONDS] [--cell-secret FILE]\n\
        rtdb-multi delete --directory DIR --storage-root PATH --keys PATH (--name NAME | --id UUID)\n\
        rtdb-multi schedule-disposal --directory DIR --id UUID\n\
        rtdb-multi disposal --directory DIR --id UUID\n\
@@ -61,10 +61,13 @@ Use dynamodb+packed:PREFIX to write packed parked rows after all readers have up
 MAP is HOST:PORT of a cell-map server, or dynamodb:PREFIX for tables named PREFIX-cells and PREFIX-placements.\n\
 DynamoDB requires the `dynamodb` feature. RTDB_DYNAMODB_ENDPOINT points at DynamoDB Local.\n";
 
-#[tokio::main]
-async fn main() {
+fn main() {
+    let runtime = match tokio::runtime::Builder::new_multi_thread().thread_stack_size(rtdb_node::WORKER_STACK_BYTES).enable_all().build() {
+        Ok(runtime) => runtime,
+        Err(error) => { eprintln!("{error}"); std::process::exit(1); }
+    };
     let arguments: Vec<String> = std::env::args().skip(1).collect();
-    if let Err(error) = run(arguments).await {
+    if let Err(error) = runtime.block_on(run(arguments)) {
         eprintln!("{}: {}", error.code, error.message.as_deref().unwrap_or(""));
         std::process::exit(1);
     }
@@ -467,7 +470,20 @@ async fn run(arguments: Vec<String>) -> Result<()> {
         }
         "controller" => {
             let directory = directory(arguments.required("directory")?).await?;
-            let options = admin::ControllerOptions { rebalance_moves: arguments.number("rebalance", 0usize)?, control: rtdb_multi::control::ControlKey(cell_secret(&arguments)?), ..Default::default() };
+            let limit = |flag| -> Result<Option<std::num::NonZeroU64>> {
+                if !arguments.present(flag) { return Ok(None); }
+                arguments.required(flag)?.parse().map(Some)
+                    .map_err(|_| usage(format!("--{flag} must be a positive integer")))
+            };
+            let load_limits = rtdb_multi::load::LoadLimits {
+                write_bytes_per_second: limit("rebalance-write-bytes-per-second")?,
+                query_cpu_millis_per_second: limit("rebalance-query-cpu-ms-per-second")?,
+                tail_bytes: limit("rebalance-tail-bytes")?,
+                cache_bytes: limit("rebalance-cache-bytes")?,
+            };
+            let default_moves = if load_limits.enabled() { 8 } else { 0 };
+            let options = admin::ControllerOptions { rebalance_moves: arguments.number("rebalance", default_moves)?,
+                load_limits, control: rtdb_multi::control::ControlKey(cell_secret(&arguments)?), ..Default::default() };
             admin::run_controller(directory, options, cancellation).await;
             Ok(())
         }
@@ -584,19 +600,21 @@ async fn run(arguments: Vec<String>) -> Result<()> {
         "fork" => {
             let directory = directory(arguments.required("directory")?).await?;
             let storage = CellStorage::parse(arguments.required("storage-root")?)?;
-            let (from, name) = (arguments.required("from")?, arguments.required("name")?);
+            let from = arguments.required("from")?;
+            let org = if arguments.present("org") { Some(arguments.required("org")?) } else { None };
+            let destination = admin::ForkDestination { name: arguments.required("name")?, org };
             let record = match (arguments.optional("at-block"), arguments.optional("at-time")) {
                 (None, Some(time)) => {
                     let time = time.parse::<chrono::DateTime<chrono::Utc>>().map_err(|_| usage("--at-time must be an RFC 3339 timestamp".into()))?;
-                    admin::fork_at_time(directory.as_ref(), &storage, key_service(arguments.required("keys")?).await?.as_ref(), from, name, rtdb_types::Timestamp(time.timestamp_micros()),
+                    admin::fork_time_into(directory.as_ref(), &storage, key_service(arguments.required("keys")?).await?.as_ref(), from, destination, rtdb_types::Timestamp(time.timestamp_micros()),
                         Duration::from_secs(arguments.number("grace", 3600u64)?), 4 << 20).await?
                 }
                 (at_block, _) => match at_block {
                 Some(block) => {
                     let block = block.parse().map_err(|_| usage("--at-block must be a block index".into()))?;
-                    admin::fork_at_block(directory.as_ref(), &storage, key_service(arguments.required("keys")?).await?.as_ref(), from, name, block, Duration::from_secs(arguments.number("grace", 3600u64)?)).await?
+                    admin::fork_block_into(directory.as_ref(), &storage, key_service(arguments.required("keys")?).await?.as_ref(), from, destination, block, Duration::from_secs(arguments.number("grace", 3600u64)?)).await?
                 }
-                None => admin::fork(directory.as_ref(), &storage, key_service(arguments.required("keys")?).await?.as_ref(), from, name, &rtdb_multi::control::ControlKey(cell_secret(&arguments)?)).await?,
+                None => admin::fork_into(directory.as_ref(), &storage, key_service(arguments.required("keys")?).await?.as_ref(), from, destination, &rtdb_multi::control::ControlKey(cell_secret(&arguments)?)).await?,
                 },
             };
             println!("{}", serde_json::to_string_pretty(&record).expect("a record serializes"));
