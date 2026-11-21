@@ -127,7 +127,9 @@ impl TrieCollector {
                     Err(error) => { self.observer.table_failed(Some(&entry.table), &error); return; }
                 };
                 let groups = finished_groups(collection.current().trie_catalog(), &entry.table, &keys);
-                let result = IoRegion::retaining(collection, self.collect_table(&entry, &keys, &groups, cut, &deletes, cancellation)).await;
+                let result = IoRegion::retaining(collection.clone(), self.collect_table(
+                    &entry, &keys, &groups, cut, collection.current().trie_catalog(), &deletes, cancellation,
+                )).await;
                 if let Err(error) = &result { if !cancellation.is_cancelled() { self.observer.table_failed(Some(&entry.table), error); } }
             }
         });
@@ -135,7 +137,7 @@ impl TrieCollector {
         if cancellation.is_cancelled() { Err(crate::closed()) } else { Ok(()) }
     }
 
-    async fn collect_table(&self, entry: &TableEntry, keys: &[TrieKey], groups: &BTreeSet<PartGroup>, cut: Option<CatalogCut>, deletes: &Semaphore, cancellation: &CancellationToken) -> Result<()> {
+    async fn collect_table(&self, entry: &TableEntry, keys: &[TrieKey], groups: &BTreeSet<PartGroup>, cut: Option<CatalogCut>, catalog: &rtdb_index::TrieCatalog, deletes: &Semaphore, cancellation: &CancellationToken) -> Result<()> {
         if keys.iter().any(|key| key.level() == 0) { return Err(crate::invalid("L0 recovery files cannot be garbage collected")); }
         let chunk_size = self.config.chunk_size;
         // A shared file belongs in the receipt of the last batch removing members
@@ -166,11 +168,20 @@ impl TrieCollector {
             let trie_files = trie_files.into_iter().collect::<Result<Vec<_>>>()?;
             let intent = if let Some(cut) = cut {
                 let keys: Vec<_> = group_files.get(&index).into_iter().flatten().chain(trie_files.iter().flatten()).cloned().collect();
-                let files = stream::iter(keys).map(|key| async move {
+                let mut published = BTreeMap::new();
+                for key in chunk {
+                    let Some(files) = catalog.trie(&entry.table, key).and_then(|trie| trie.published_files.as_ref()) else { continue };
+                    if let Some(data) = &files.data { published.insert(ObjectKey::new(entry.slug.data_key(key))?, data); }
+                    if let Some(metadata) = &files.metadata { published.insert(ObjectKey::new(entry.slug.metadata_key(key))?, metadata); }
+                }
+                let files = stream::iter(keys).map(|key| {
+                    let version = published.get(&key).map(|version| (*version).clone());
+                    async move {
                         let _permit = deletes.acquire().await.map_err(crate::invalid)?;
                         if cancellation.is_cancelled() { return Err(crate::closed()); }
-                        RetirementFile::observe(self.store.as_ref(), &key).await
-                    }).buffered(self.config.delete_parallelism).collect::<Vec<_>>().await;
+                        RetirementFile::observe(self.store.as_ref(), &key, version).await
+                    }
+                }).buffered(self.config.delete_parallelism).collect::<Vec<_>>().await;
                 let files = files.into_iter().collect::<Result<Vec<_>>>()?;
                 Some(PendingRetirement::stage(self.store.as_ref(), cut, &entry.table, chunk, files).await?)
             } else { None };

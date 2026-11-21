@@ -25,7 +25,7 @@ impl CompactionPublisher for Publisher {
 #[tokio::test]
 async fn later_compact_all_reports_the_same_failure_without_retrying_the_job() {
     let table = TableRef::new("public", "foo");
-    let catalog = TrieCatalog::default().with_tries(table, [CatalogTrie { key: "l00-rc-b00".parse().unwrap(), data_file_size: 1, metadata: None, state: TrieState::Live, artefacts: Vec::new() }], Timestamp(0)).unwrap();
+    let catalog = TrieCatalog::default().with_tries(table, [CatalogTrie { key: "l00-rc-b00".parse().unwrap(), data_file_size: 1, metadata: None, state: TrieState::Live, artefacts: Vec::new(), published_files: None }], Timestamp(0)).unwrap();
     let state = Arc::new(PartitionState::new(PartitionValue::loaded(catalog, TableCatalog::default(), TrieConfig::default()).unwrap()));
     let executor = Arc::new(FailingExecutor(AtomicUsize::new(0)));
     let (driver, handle) = CompactionDriver::new(state, executor.clone(), Arc::new(Publisher), 2, 8, false).unwrap();

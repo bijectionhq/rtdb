@@ -108,6 +108,8 @@ value TrieKey {
 -- Replica publications of compaction output are admitted only in the current naming epoch.
 -- A checkpoint in a different naming epoch installs its persisted trie catalog before replay continues.
 -- A removal matches the entire trie key, including the naming epoch, in addition to the garbage state.
+-- Native compaction records an exact provider version for each file whose publication supplied one.
+-- The catalog preserves those versions after the trie becomes garbage and across checkpoint and replica serialization.
     -- Compaction outputs carry the catalog's naming epoch, persisted in each block; a compactor reset starts a new epoch, so no name is published twice.
 }
 

@@ -1608,6 +1608,21 @@ TLA_CASES = (
     ("RetirementPublication", "retirement-collection-and-reuse",
      ("INVARIANTS CertificateFollowsInstall CurrentCatalogReadable AdmittedReaderReadable",
       "INVARIANT NeverCollectsAndReuses"), "NeverCollectsAndReuses"),
+    ("PublicationVersion", "publication-version", None, None),
+    ("PublicationVersion", "publication-version-head-after-write", (
+        'Mutation = "none"', 'Mutation = "head_after_write"'), "BindsCheckedVersion"),
+    ("PublicationVersion", "publication-version-head-after-read", (
+        'Mutation = "none"', 'Mutation = "head_after_read"'), "BindsCheckedVersion"),
+    ("PublicationVersion", "publication-version-ignore-attempt", (
+        'Mutation = "none"', 'Mutation = "ignore_attempt"'), "BindsCheckedVersion"),
+    ("PublicationVersion", "publication-version-ignore-publication", (
+        'Mutation = "none"', 'Mutation = "ignore_publication"'), "RetirementMatchesBinding"),
+    ("PublicationVersion", "publication-version-lost-reply", (
+        "INVARIANTS BindsCheckedVersion RetirementMatchesBinding",
+        "INVARIANT LostReplyWitness"), "LostReplyWitness"),
+    ("PublicationVersion", "publication-version-verified-retry", (
+        "INVARIANTS BindsCheckedVersion RetirementMatchesBinding",
+        "INVARIANT VerifiedRetryWitness"), "VerifiedRetryWitness"),
     ("CatalogAdmissionFloor", "catalog-admission-floor", None, None),
     ("CatalogAdmissionFloor", "catalog-floor-admit-older", (
         'Mutation = "none"', 'Mutation = "ignore_floor"'), "HeldViewAdmissible"),
@@ -1878,6 +1893,11 @@ def verify_apalache(args, scratch):
         ('Mutation = "none"', 'Mutation = "remote_status"'), "replica receipt ahead of catalog",
     )
     check_apalache(args, scratch, "RecoveryCollection", "recovery-collection", "RecoverySafe", 10)
+    check_apalache(args, scratch, "PublicationVersion", "publication-version", "Safety", 6)
+    check_apalache(
+        args, scratch, "PublicationVersion", "publication-version-head-after-read", "BindsCheckedVersion", 6,
+        ('Mutation = "none"', 'Mutation = "head_after_read"'), "a later version substituted for the verified read",
+    )
     check_apalache(args, scratch, "CatalogAdmissionFloor", "catalog-admission-floor", "Safety", 8)
     check_apalache(
         args, scratch, "CatalogAdmissionFloor", "catalog-floor-without-cas", "HeldViewAdmissible", 8,
@@ -2297,6 +2317,41 @@ def verify_trie_naming_epoch(args, source):
         finally:
             path.write_bytes(original)
     print("rust-naming-epoch: delayed notices passed, both controls failed")
+
+
+def verify_compaction_publication_versions(args, source):
+    env = os.environ | {
+        "CARGO_TARGET_DIR": os.environ.get("CARGO_TARGET_DIR", str(ROOT / "target")),
+        "CARGO_PROFILE_TEST_DEBUG": "0",
+    }
+    cases = (
+        ("publication_versions_come_from_the_acknowledgement_or_verified_existing_bytes",
+         ["-p", "rtdb-storage", "--features", "remote", "--test", "remote_lifetime"], "publication-read",
+         "rust/crates/storage/src/remote.rs", "        Ok(version)\n    }\n\n    async fn publication_confirmed",
+         "        Ok(self.client.head(&self.path(key)).await.map_err(|error| provider_error(key, error))?.version)\n    }\n\n    async fn publication_confirmed",
+         "the same read must supply the body and version"),
+        ("retirement_binds_only_the_same_version_the_catalog_published",
+         ["-p", "rtdb-maintenance", "--test", "gc"], "retirement-version-match",
+         "rust/crates/maintenance/src/retirement_intent.rs",
+         "published.as_ref().is_some_and(|expected| *expected == PublishedObjectVersion::from(observed.clone()))",
+         "published.is_some()", "an observed replacement cannot stand in for the catalog's publication"),
+    )
+    for test, selection, name, file, before, after, failure in cases:
+        command = ["cargo", "test", "--locked", *selection, test, "--", "--exact"]
+        baseline = run_case(command, source / "rust", args.evidence, f"rust-{name}-baseline", env)
+        if baseline.returncode or f"{test} ... ok" not in baseline.stdout or "1 passed; 0 failed" not in baseline.stdout:
+            raise ValueError(f"{name}: native baseline did not pass")
+        path = source / file
+        original = path.read_bytes()
+        try:
+            replace_once(path, before, after)
+            checked = run_case(command, source / "rust", args.evidence, f"rust-{name}-control", env)
+            if (checked.returncode != 101 or f"{test} ... FAILED" not in checked.stdout
+                or failure not in checked.stdout or "0 passed; 1 failed" not in checked.stdout):
+                raise ValueError(f"{name}: mutation did not fail at its declared assertion")
+        finally:
+            path.write_bytes(original)
+        print(f"rust-{name}: exact version passed, substituting a different version failed")
 
 
 def verify_s3_object_version(args, source):
@@ -2945,6 +3000,9 @@ def main():
         "rust/crates/azure/src/lib.rs",
         "rust/crates/azure/tests/copy_completion.rs",
         "rust/crates/storage/src/remote.rs",
+        "rust/crates/storage/tests/remote_lifetime.rs",
+        "rust/crates/format/src/lib.rs",
+        "core/src/main/proto/xtdb/log/proto/log.proto",
         "rust/crates/storage/src/object_store.rs",
         "rust/crates/storage/src/disk_cache.rs",
         "rust/crates/s3/src/lib.rs",
@@ -3018,6 +3076,7 @@ def main():
             verify_catalog_admission_floor(args, source)
             verify_trie_naming_epoch(args, source)
             verify_s3_object_version(args, source)
+            verify_compaction_publication_versions(args, source)
             verify_replay_prefix(args, source)
             verify_multi_trim_admission(args, source)
             verify_recovery_hold_replay(args, source)

@@ -835,7 +835,13 @@ Each observation carries the namespace, encoded physical key and exact version i
 A missing object or header, an empty or `null` version, and an inherited, packed or archive-backed entry yield no version evidence.
 Historical intents remain readable with an empty file plan.
 A provider observation identifies one object version at observation time.
-Certification still needs evidence that the selected catalog named that publication and that every reference, including group membership, is excluded.
+For new hosted compaction outputs, the catalog now preserves the version returned by the immutable put that published each data or metadata file.
+An idempotent retry takes the version from the same provider response that returned the matching bytes.
+An uncertain multipart completion takes the version only from a provider response bearing that exact attempt's witness.
+The retirement journal records a publication match only for an observed version equal to the selected catalog's recorded version.
+An inherited or packed file, a historical catalog without recorded versions, or a replacement at the same key carries no publication match.
+The publication model compares these bindings with separate HEAD requests and key-only retirement observations. link:../../verification/tla/PublicationVersion.tla[Publication version model]
+Certification still needs to exclude every relevant recovery and fork reference, including group membership, and authorize the exact provider effect.
 The Lean identity model checks that an accepted observation names the selected physical identity and that an exact erase preserves every other publication.
 A replacement can have the same logical key and content digest, and two provider namespaces can have the same local key and version.
 The model also checks the alternative of names qualified by epoch and input digest.
@@ -1381,7 +1387,7 @@ Verus checks the exact cutoff decision.
 Verus checks the shipped S3 version classifier, with production-only and joint contract mutations.
 A loopback S3 HEAD fixture checks provider key encoding and refusal of missing, empty and replaceable version IDs.
 Lean checks identity matching, exact erase and qualified names, with four controls against weaker operations.
-|Bind the observed version to catalog publication, test other storage representations, and require a directory-installed certificate before a provider erase.
+|Extend version binding to shared artefacts and other storage representations, and require a directory-installed certificate before a provider erase.
 
 |Concurrent design models
 |TLC covers bounded writer admission, query capture, resolution, recovery, cache, reader I/O, and compaction publication variants.

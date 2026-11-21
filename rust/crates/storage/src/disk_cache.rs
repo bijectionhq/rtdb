@@ -376,11 +376,20 @@ impl ObjectStore for DiskCachedStore {
             Ok(Some(crate::LocalFile::new(file, Some(lease))))
         }).await
     }
+    async fn put_with_version(&self, key: &ObjectKey, bytes: Bytes) -> Result<Option<rtdb_types::PhysicalObjectVersion>> {
+        let _scope = self.io.admit()?;
+        let _operation = self.cache.begin_operation()?;
+        self.remote.put_with_version(key, bytes).await
+    }
     async fn put_file(&self, key: &ObjectKey, source: &Path) -> Result<()> {
+        self.put_file_with_version(key, source).await.map(drop)
+    }
+    async fn put_file_with_version(&self, key: &ObjectKey, source: &Path) -> Result<Option<rtdb_types::PhysicalObjectVersion>> {
         let scope = self.io.admit()?;
         let _operation = self.cache.begin_operation()?;
-        self.remote.put_file(key, source).await?;
-        self.cache.put_file_admitted(&self.key(key)?, source, Some(scope)).await
+        let written = self.remote.put_file_with_version(key, source).await?;
+        self.cache.put_file_admitted(&self.key(key)?, source, Some(scope)).await?;
+        Ok(written)
     }
     async fn list(&self, directory: Option<&ObjectKey>) -> Result<Vec<StoredObject>> { let _scope = self.io.admit()?; let _operation = self.cache.begin_operation()?; self.cache.cancellation.run_until_cancelled(self.remote.list(directory)).await.ok_or_else(cache_closed)? }
     async fn delete(&self, key: &ObjectKey) -> Result<()> {

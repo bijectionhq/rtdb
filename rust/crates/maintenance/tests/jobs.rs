@@ -8,7 +8,7 @@ fn catalog(keys: &[(&str, i64)]) -> TrieCatalog {
     let table = TableRef::new("public", "foo");
     let mut catalog = TrieCatalog::new(16).unwrap();
     for (key, size) in keys {
-        catalog = catalog.with_tries(table.clone(), [CatalogTrie { key: key.parse().unwrap(), data_file_size: *size, metadata: None, state: TrieState::Live, artefacts: Vec::new() }], Timestamp(100)).unwrap();
+        catalog = catalog.with_tries(table.clone(), [CatalogTrie { key: key.parse().unwrap(), data_file_size: *size, metadata: None, state: TrieState::Live, artefacts: Vec::new(), published_files: None }], Timestamp(100)).unwrap();
     }
     catalog
 }

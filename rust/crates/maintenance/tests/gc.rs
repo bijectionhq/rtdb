@@ -86,7 +86,7 @@ async fn trie_gc_deletes_artefacts_and_both_files_before_publishing_and_preserve
     let entry = tables.entry(&table).unwrap().clone();
     let mut catalog = TrieCatalog::new(16).unwrap();
     for key in ["l00-rc-b00", "l01-rc-b00", "l01-rc-b01"] {
-        catalog = catalog.with_tries(table.clone(), [CatalogTrie { key: key.parse().unwrap(), data_file_size: 1, metadata: None, state: TrieState::Live, artefacts: Vec::new() }], Timestamp(100)).unwrap();
+        catalog = catalog.with_tries(table.clone(), [CatalogTrie { key: key.parse().unwrap(), data_file_size: 1, metadata: None, state: TrieState::Live, artefacts: Vec::new(), published_files: None }], Timestamp(100)).unwrap();
     }
     let store = Arc::new(MemoryStore::default());
     for key in ["l00-rc-b00", "l01-rc-b00"] {
@@ -310,7 +310,7 @@ async fn collection_preserves_open_readers_and_their_inflight_io() {
     let tables = TableCatalog::default().with_seeded_table(table.clone(), Vec::new()).unwrap();
     let entry = tables.entry(&table).unwrap().clone();
     let trie = |key: &str| CatalogTrie {
-        key: key.parse().unwrap(), data_file_size: 1, metadata: None, state: TrieState::Live, artefacts: Vec::new(),
+        key: key.parse().unwrap(), data_file_size: 1, metadata: None, state: TrieState::Live, artefacts: Vec::new(), published_files: None,
     };
     let preserved = trie("l01-rc-b00");
     let unreferenced = trie("l01-rc-b01");
@@ -374,13 +374,21 @@ async fn collection_preserves_open_readers_and_their_inflight_io() {
     drop(collection);
 }
 
-struct ObservedGroupStore {
+struct ObservedStore {
     inner: Arc<MemoryStore>,
-    group_file: ObjectKey,
+    versions: BTreeMap<ObjectKey, PhysicalObjectVersion>,
+}
+
+fn provider_version(key: &ObjectKey, version: &str) -> PhysicalObjectVersion {
+    PhysicalObjectVersion {
+        namespace: S3ObjectNamespace { bucket: "test-cell".into(), endpoint: None, region: Some("us-east-1".into()) },
+        key: format!("test-residence/{key}"),
+        version: version.into(),
+    }
 }
 
 #[async_trait]
-impl ObjectStore for ObservedGroupStore {
+impl ObjectStore for ObservedStore {
     async fn head(&self, key: &ObjectKey) -> rtdb_storage::Result<rtdb_storage::object_store::StoredObject> { self.inner.head(key).await }
     async fn get(&self, key: &ObjectKey) -> rtdb_storage::Result<Bytes> { self.inner.get(key).await }
     async fn get_range(&self, key: &ObjectKey, range: std::ops::Range<u64>) -> rtdb_storage::Result<Bytes> { self.inner.get_range(key, range).await }
@@ -389,14 +397,53 @@ impl ObjectStore for ObservedGroupStore {
     async fn list(&self, prefix: Option<&ObjectKey>) -> rtdb_storage::Result<Vec<rtdb_storage::object_store::StoredObject>> { self.inner.list(prefix).await }
     async fn delete(&self, key: &ObjectKey) -> rtdb_storage::Result<()> { self.inner.delete(key).await }
     async fn retirement_version(&self, key: &ObjectKey) -> rtdb_storage::Result<Option<PhysicalObjectVersion>> {
-        if key != &self.group_file { return Ok(None); }
+        let Some(version) = self.versions.get(key) else { return Ok(None); };
         self.inner.head(key).await?;
-        Ok(Some(PhysicalObjectVersion {
-            namespace: S3ObjectNamespace { bucket: "test-cell".into(), endpoint: None, region: Some("us-east-1".into()) },
-            key: format!("test-residence/{key}"),
-            version: "group-file-version".into(),
-        }))
+        Ok(Some(version.clone()))
     }
+}
+
+#[tokio::test]
+async fn retirement_binds_only_the_same_version_the_catalog_published() {
+    use rtdb_format::log::proto::TrieFileVersions;
+
+    let table = TableRef::new("public", "docs");
+    let tables = TableCatalog::default().with_seeded_table(table.clone(), Vec::new()).unwrap();
+    let entry = tables.entry(&table).unwrap().clone();
+    let mut old = CatalogTrie::notification("l01-rc-b00".parse().unwrap(), 1, None).unwrap();
+    let data = ObjectKey::new(entry.slug.data_key(&old.key)).unwrap();
+    let metadata = ObjectKey::new(entry.slug.metadata_key(&old.key)).unwrap();
+    let published_data = provider_version(&data, "data-version");
+    let published_meta = provider_version(&metadata, "metadata-version");
+    old.published_files = Some(TrieFileVersions {
+        data: Some(published_data.clone().into()),
+        metadata: Some(published_meta.into()),
+    });
+    let restored = CatalogTrie::from_proto(&old.to_proto(&table)).unwrap();
+    assert_eq!(restored.published_files, old.published_files);
+    let next = CatalogTrie::notification("l01-rc-b01".parse().unwrap(), 1, None).unwrap();
+    let catalog = TrieCatalog::new(16).unwrap().with_tries(table, [restored, next], Timestamp(100)).unwrap();
+    let state = Arc::new(PartitionState::new(PartitionValue::loaded(catalog, tables, TrieConfig::default()).unwrap()));
+    state.publish_catalog_cut(CatalogCut { storage_version: StorageVersion(6), storage_epoch: StorageEpoch(0),
+        replica_epoch: StorageEpoch(0), through: ReplicaPosition(0) }).unwrap();
+    let store = Arc::new(MemoryStore::default());
+    for key in [&data, &metadata] { store.put(key, Bytes::from_static(b"published")).await.unwrap(); }
+    let observing = Arc::new(ObservedStore { inner: store.clone(), versions: BTreeMap::from([
+        (data.clone(), published_data), (metadata.clone(), provider_version(&metadata, "replacement-version")),
+    ]) });
+    let publisher = Arc::new(DeletedPublisher { store: store.clone(), table: entry, commits: Mutex::new(Vec::new()) });
+    let collector = TrieCollector::new(observing, state, publisher, Arc::new(Observer::default()), unleased(), fixed_clock()).unwrap();
+    collector.collect_as_of(Timestamp(100), &CancellationToken::new()).await.unwrap();
+    let installed = ObjectKey::new(format!("{TRIE_RETIREMENT_DIRECTORY}/6-0-0/installed")).unwrap();
+    let receipts = store.list(Some(&installed)).await.unwrap();
+    assert_eq!(receipts.len(), 1);
+    let bytes = store.get(&receipts[0].key).await.unwrap();
+    let intent: serde_json::Value = serde_json::from_slice(&bytes[8..]).unwrap();
+    assert_eq!(intent["files"][0]["key"], data.as_str());
+    assert_eq!(intent["files"][0]["matches_publication"], true);
+    assert_eq!(intent["files"][1]["key"], metadata.as_str());
+    assert_eq!(intent["files"][1]["version"]["version"], "replacement-version");
+    assert!(intent["files"][1].get("matches_publication").is_none(), "an observed replacement cannot stand in for the catalog's publication");
 }
 
 #[tokio::test]
@@ -404,7 +451,7 @@ async fn a_groups_artefacts_go_only_with_the_last_member_the_catalog_holds() {
     let table = TableRef::new("public", "docs");
     let tables = TableCatalog::default().with_seeded_table(table.clone(), Vec::new()).unwrap();
     let entry = tables.entry(&table).unwrap().clone();
-    let add = |catalog: TrieCatalog, key: &str, at: i64| catalog.with_tries(table.clone(), [CatalogTrie { key: key.parse().unwrap(), data_file_size: 1, metadata: None, state: TrieState::Live, artefacts: Vec::new() }], Timestamp(at)).unwrap();
+    let add = |catalog: TrieCatalog, key: &str, at: i64| catalog.with_tries(table.clone(), [CatalogTrie { key: key.parse().unwrap(), data_file_size: 1, metadata: None, state: TrieState::Live, artefacts: Vec::new(), published_files: None }], Timestamp(at)).unwrap();
     let mut catalog = TrieCatalog::new(16).unwrap();
     for bucket in 0..4 { catalog = add(catalog, &format!("l02-rc-p{bucket}-b00"), 100); }
     let supersede = |mut catalog: TrieCatalog, part: u8| { for bucket in 0..4 { catalog = add(catalog, &format!("l03-rc-p{part}{bucket}-b01"), 100 + i64::from(part)); } catalog };
@@ -412,7 +459,10 @@ async fn a_groups_artefacts_go_only_with_the_last_member_the_catalog_holds() {
     let object = ObjectKey::new(entry.slug.group_artefact_prefix(&group) + "/search/body-v1.bin").unwrap();
     let store = Arc::new(MemoryStore::default());
     store.put(&object, Bytes::from_static(b"artefact")).await.unwrap();
-    let observing = Arc::new(ObservedGroupStore { inner: store.clone(), group_file: object.clone() });
+    let observing = Arc::new(ObservedStore {
+        inner: store.clone(),
+        versions: BTreeMap::from([(object.clone(), provider_version(&object, "group-file-version"))]),
+    });
     let collect = |catalog: TrieCatalog| {
         let (store, observing, tables, entry) = (store.clone(), observing.clone(), tables.clone(), entry.clone());
         async move {
@@ -463,7 +513,7 @@ async fn collection_waits_a_whole_reader_lease_after_first_observing_garbage() {
     let entry = tables.entry(&table).unwrap().clone();
     let mut catalog = TrieCatalog::new(16).unwrap();
     for key in ["l00-rc-b00", "l01-rc-b00", "l01-rc-b01"] {
-        catalog = catalog.with_tries(table.clone(), [CatalogTrie { key: key.parse().unwrap(), data_file_size: 1, metadata: None, state: TrieState::Live, artefacts: Vec::new() }], Timestamp(100)).unwrap();
+        catalog = catalog.with_tries(table.clone(), [CatalogTrie { key: key.parse().unwrap(), data_file_size: 1, metadata: None, state: TrieState::Live, artefacts: Vec::new(), published_files: None }], Timestamp(100)).unwrap();
     }
     let store = Arc::new(MemoryStore::default());
     let garbage: TrieKey = "l01-rc-b00".parse().unwrap();

@@ -802,6 +802,14 @@ impl ObjectStore for FencedStore {
     async fn get_range(&self, key: &ObjectKey, range: Range<u64>) -> rtdb_storage::Result<Bytes> { self.inner.get_range(key, range).await }
     async fn put(&self, key: &ObjectKey, bytes: Bytes) -> rtdb_storage::Result<()> { self.check(key).await?; self.inner.put(key, bytes).await }
     async fn put_file(&self, key: &ObjectKey, source: &Path) -> rtdb_storage::Result<()> { self.check(key).await?; self.inner.put_file(key, source).await }
+    async fn put_with_version(&self, key: &ObjectKey, bytes: Bytes) -> rtdb_storage::Result<Option<rtdb_types::PhysicalObjectVersion>> {
+        self.check(key).await?;
+        self.inner.put_with_version(key, bytes).await
+    }
+    async fn put_file_with_version(&self, key: &ObjectKey, source: &Path) -> rtdb_storage::Result<Option<rtdb_types::PhysicalObjectVersion>> {
+        self.check(key).await?;
+        self.inner.put_file_with_version(key, source).await
+    }
     async fn list(&self, directory: Option<&ObjectKey>) -> rtdb_storage::Result<Vec<StoredObject>> { self.inner.list(directory).await }
     async fn delete(&self, key: &ObjectKey) -> rtdb_storage::Result<()> {
         Err(Error::ReadOnlyLog(PathBuf::from(key.as_str())))
@@ -856,6 +864,16 @@ impl ObjectStore for EncryptingStore {
     async fn put_file(&self, key: &ObjectKey, source: &Path) -> rtdb_storage::Result<()> {
         let bytes = tokio::fs::read(source).await.map_err(|error| Error::Task(format!("cannot read {}: {error}", source.display())))?;
         self.put(key, Bytes::from(bytes)).await
+    }
+    async fn put_with_version(&self, key: &ObjectKey, bytes: Bytes) -> rtdb_storage::Result<Option<rtdb_types::PhysicalObjectVersion>> {
+        match self.inner.put_with_version(key, self.seal(key, &bytes)?).await {
+            Err(Error::ConflictingObject(_)) if self.get_fresh(key).await? == bytes => Ok(None),
+            written => written,
+        }
+    }
+    async fn put_file_with_version(&self, key: &ObjectKey, source: &Path) -> rtdb_storage::Result<Option<rtdb_types::PhysicalObjectVersion>> {
+        let bytes = tokio::fs::read(source).await.map_err(|error| Error::Task(format!("cannot read {}: {error}", source.display())))?;
+        self.put_with_version(key, Bytes::from(bytes)).await
     }
     async fn list(&self, directory: Option<&ObjectKey>) -> rtdb_storage::Result<Vec<StoredObject>> {
         Ok(self.inner.list(directory).await?.into_iter().map(plain).collect())
@@ -922,6 +940,12 @@ impl ObjectStore for GarbageStore {
     fn supports_scan_ranges(&self, key: &ObjectKey) -> bool { self.inner.supports_scan_ranges(key) }
     async fn put(&self, key: &ObjectKey, bytes: Bytes) -> rtdb_storage::Result<()> { self.inner.put(key, bytes).await }
     async fn put_file(&self, key: &ObjectKey, source: &Path) -> rtdb_storage::Result<()> { self.inner.put_file(key, source).await }
+    async fn put_with_version(&self, key: &ObjectKey, bytes: Bytes) -> rtdb_storage::Result<Option<rtdb_types::PhysicalObjectVersion>> {
+        self.inner.put_with_version(key, bytes).await
+    }
+    async fn put_file_with_version(&self, key: &ObjectKey, source: &Path) -> rtdb_storage::Result<Option<rtdb_types::PhysicalObjectVersion>> {
+        self.inner.put_file_with_version(key, source).await
+    }
     async fn list(&self, directory: Option<&ObjectKey>) -> rtdb_storage::Result<Vec<StoredObject>> {
         self.load_releases().await?;
         let objects = self.inner.list(directory).await?;

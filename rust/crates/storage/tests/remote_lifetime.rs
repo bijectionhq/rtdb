@@ -7,7 +7,7 @@ use bytes::Bytes;
 use futures::{StreamExt, TryStreamExt, stream::BoxStream};
 use object_store::{CopyOptions, GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStore as ProviderStore, ObjectStoreExt, PutMultipartOptions, PutOptions, PutPayload, PutResult, UploadPart, memory::InMemory, path::Path};
 use rtdb_columnar::MemoryBudget;
-use rtdb_storage::{Error, IoRegion, ObjectKey, ObjectStore, ReadReservation, remote::{PublicationJournal, PublicationUploads, RemoteStore}};
+use rtdb_storage::{Error, IoRegion, ObjectKey, ObjectStore, ReadReservation, remote::{PublicationJournal, PublicationResult, PublicationUploads, RemoteStore}};
 use tokio::sync::Semaphore;
 
 #[derive(Debug)]
@@ -39,6 +39,9 @@ struct Hooks {
     forget_put_witness: bool,
     fail_first_publication_abort: bool,
     deny_list: bool,
+    put_version: Option<&'static str>,
+    read_version: Option<&'static str>,
+    head_version: Option<&'static str>,
 }
 
 #[derive(Debug, Default)]
@@ -85,7 +88,8 @@ impl ProviderStore for ControlledStore {
         if self.hooks.forget_put_witness {
             options.attributes = Default::default();
         }
-        let result = self.inner.put_opts(location, payload, options).await?;
+        let mut result = self.inner.put_opts(location, payload, options).await?;
+        if let Some(version) = self.hooks.put_version { result.version = Some(version.into()); }
         if self.hooks.lose_put_reply {
             return Err(injected("lost publication reply"));
         }
@@ -100,7 +104,10 @@ impl ProviderStore for ControlledStore {
     async fn get_opts(&self, location: &Path, options: GetOptions) -> object_store::Result<GetResult> {
         self.called();
         if !options.head { if let Some(gate) = &self.hooks.read { gate.enter().await; } }
-        self.inner.get_opts(location, options).await
+        let version = if options.head { self.hooks.head_version } else { self.hooks.read_version };
+        let mut result = self.inner.get_opts(location, options).await?;
+        if let Some(version) = version { result.meta.version = Some(version.into()); }
+        Ok(result)
     }
     fn delete_stream(&self, locations: BoxStream<'static, object_store::Result<Path>>) -> BoxStream<'static, object_store::Result<Path>> {
         let (inner, hooks, observed) = (Arc::clone(&self.inner), Arc::clone(&self.hooks), Arc::clone(&self.observed));
@@ -148,17 +155,17 @@ impl PublicationUploads for ControlledStore {
         Ok(upload)
     }
 
-    async fn complete(&self, path: &Path, upload: &str, bytes: Bytes) -> rtdb_storage::Result<bool> {
+    async fn complete(&self, path: &Path, upload: &str, bytes: Bytes) -> rtdb_storage::Result<PublicationResult> {
         let (owner, attempt) = self.uploads.lock().unwrap().get(upload).unwrap().clone();
         assert_eq!(owner, *path);
         let mut options = PutOptions { mode: object_store::PutMode::Create, ..Default::default() };
         options.attributes.insert(object_store::Attribute::Metadata("rtdb-publication".into()), attempt.to_string().into());
         match self.put_opts(path, bytes.into(), options).await {
-            Ok(_) => {
+            Ok(written) => {
                 self.uploads.lock().unwrap().remove(upload);
-                Ok(true)
+                Ok(PublicationResult::Published { version: written.version })
             }
-            Err(object_store::Error::AlreadyExists { .. } | object_store::Error::Precondition { .. }) => Ok(false),
+            Err(object_store::Error::AlreadyExists { .. } | object_store::Error::Precondition { .. }) => Ok(PublicationResult::Conflict),
             Err(error) => Err(Error::Remote { key: path.to_string(), message: error.to_string() }),
         }
     }
@@ -236,6 +243,40 @@ fn journaled_region() -> (Arc<IoRegion>, Arc<PublicationInventory>) {
 }
 
 #[tokio::test]
+async fn publication_versions_come_from_the_acknowledgement_or_verified_existing_bytes() {
+    use rtdb_types::S3ObjectNamespace;
+
+    let path = ObjectKey::new("data.arrow").unwrap();
+    let contents = Bytes::from_static(b"sealed");
+    for managed in [false, true] {
+        let provider = ControlledStore::new(Hooks {
+            put_version: Some("write-version"),
+            read_version: Some("retried-version"),
+            head_version: Some("unbound-current-version"),
+            ..Default::default()
+        });
+        let prefix = ObjectKey::new("cell").unwrap();
+        let (io, journal) = journaled_region();
+        let store = if managed {
+            RemoteStore::new_managed(provider.clone(), prefix, io.clone(), provider)
+        } else {
+            RemoteStore::new_in(provider, Some(prefix), io.clone())
+        }.with_s3_versioning(S3ObjectNamespace { bucket: "objects".into(), endpoint: None, region: None });
+
+        let written = store.put_with_version(&path, contents.clone()).await.unwrap().unwrap();
+        assert_eq!(written.key, "cell/data.arrow");
+        assert_eq!(written.version, "write-version", "the provider write acknowledgement supplies the version");
+        let retried = store.put_with_version(&path, contents.clone()).await.unwrap().unwrap();
+        assert_eq!(retried.version, "retried-version", "the same read must supply the body and version");
+        assert_eq!(retried.namespace, written.namespace);
+        assert_eq!(store.retirement_version(&path).await.unwrap().unwrap().version, "unbound-current-version");
+        assert!(matches!(store.put_with_version(&path, Bytes::from_static(b"other")).await, Err(Error::ConflictingObject(_))));
+        io.close_and_wait().await;
+        assert!(journal.pending.lock().unwrap().is_empty());
+    }
+}
+
+#[tokio::test]
 async fn managed_completion_recovers_exact_bytes_or_retires_the_upload() {
     let key = ObjectKey::new("data.arrow").unwrap();
     let contents = Bytes::from_static(b"sealed");
@@ -252,9 +293,11 @@ async fn managed_completion_recovers_exact_bytes_or_retires_the_upload() {
     assert!(journal.pending.lock().unwrap().is_empty());
 
     let (io, journal) = journaled_region();
-    let provider = ControlledStore::new(Hooks { lose_put_reply: true, ..Default::default() });
-    let store = RemoteStore::new_managed(provider.clone(), prefix.clone(), io.clone(), provider.clone());
-    store.put(&key, contents.clone()).await.unwrap();
+    let provider = ControlledStore::new(Hooks { lose_put_reply: true, head_version: Some("confirmed-attempt-version"), ..Default::default() });
+    let store = RemoteStore::new_managed(provider.clone(), prefix.clone(), io.clone(), provider.clone())
+        .with_s3_versioning(rtdb_types::S3ObjectNamespace { bucket: "objects".into(), endpoint: None, region: None });
+    let recovered = store.put_with_version(&key, contents.clone()).await.unwrap().unwrap();
+    assert_eq!(recovered.version, "confirmed-attempt-version");
     io.close_and_wait().await;
     assert!(journal.pending.lock().unwrap().is_empty());
     assert_eq!(paths(&provider.inner).await, ["cell/data.arrow"]);

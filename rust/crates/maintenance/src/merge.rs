@@ -13,7 +13,7 @@ use arrow_schema::{DataType, SchemaRef};
 use rtdb_types::CivilDate;
 use rtdb_columnar::{MemoryBudget, MemoryReservation, OwnedBatch, from_field};
 use rtdb_format::{data::{EncodedEvent, EventBatch, PageEvent, copy_encoded_batch_with_recency}, ipc::{ArrowFile, ArrowFileWriter, inspect_file_reserved}, keys::TrieKey,
-    log::proto::{TriesAdded, TrieDetails}, metadata::MetadataFile};
+    log::proto::{TriesAdded, TrieDetails, TrieFileVersions}, metadata::MetadataFile};
 use rtdb_storage::{ObjectKey, ObjectStore, ReadReservation};
 use rtdb_temporal::AdmittedPolygonCalculator;
 use rtdb_types::{EventOp, Interval, LogicalType, Result, RunEndWidth, StorageEpoch, StorageVersion, Timestamp};
@@ -325,14 +325,17 @@ impl CompactionExecutor for SegmentCompactor {
             let (size, metadata) = layout::normalize(output, &put, &self.config, &self.memory, &data_path, &meta_path, cancellation)?;
             check_disk(directory.path(), self.config.temporary_byte_limit, 0)?;
             let data_key = ObjectKey::new(entry.slug.data_key(&key)).map_err(crate::invalid)?;
-            self.store.put_file(&data_key, &data_path).await.map_err(|error| rtdb_types::Anomaly::from(error)
+            let data = self.store.put_file_with_version(&data_key, &data_path).await.map_err(|error| rtdb_types::Anomaly::from(error)
                 .with_context("key", data_key.to_string().into()).with_context("operation", "put_file".into()))?;
             if cancellation.is_cancelled() { return Err(crate::closed()); }
             let metadata_key = ObjectKey::new(entry.slug.metadata_key(&key)).map_err(crate::invalid)?;
-            self.store.put_file(&metadata_key, &meta_path).await.map_err(|error| rtdb_types::Anomaly::from(error)
+            let meta = self.store.put_file_with_version(&metadata_key, &meta_path).await.map_err(|error| rtdb_types::Anomaly::from(error)
                 .with_context("key", metadata_key.to_string().into()).with_context("operation", "put_file".into()))?;
             let artefacts = self.artefacts_of(&snapshot, &job.table, &key, &data_path, size, cancellation).await;
-            tries.push(TrieDetails { table_name: Some(entry.table.schema_and_table()), trie_key: Some(key.to_string()), data_file_size: Some(i64::try_from(size).map_err(crate::invalid)?), trie_metadata: Some(metadata), artefacts, ..Default::default() });
+            let published_files = if data.is_some() || meta.is_some() {
+                Some(TrieFileVersions { data: data.map(Into::into), metadata: meta.map(Into::into) })
+            } else { None };
+            tries.push(TrieDetails { table_name: Some(entry.table.schema_and_table()), trie_key: Some(key.to_string()), data_file_size: Some(i64::try_from(size).map_err(crate::invalid)?), trie_metadata: Some(metadata), artefacts, published_files, ..Default::default() });
         }
         Ok(TriesAdded { storage_version: Some(self.version.0), storage_epoch: Some(self.epoch.0), tries, ..Default::default() })
     }

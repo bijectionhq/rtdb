@@ -11,7 +11,7 @@ use rtdb_types::{Result, SourcePosition, StorageEpoch, StorageVersion, TableRef,
 use tokio_util::sync::CancellationToken;
 
 fn table() -> TableRef { TableRef::new("public", "docs") }
-fn trie(key: &str, size: i64) -> CatalogTrie { CatalogTrie { key: key.parse().unwrap(), data_file_size: size, metadata: None, state: TrieState::Live, artefacts: Vec::new() } }
+fn trie(key: &str, size: i64) -> CatalogTrie { CatalogTrie { key: key.parse().unwrap(), data_file_size: size, metadata: None, state: TrieState::Live, artefacts: Vec::new(), published_files: None } }
 fn definition(id: &str) -> ArtefactDefinition { ArtefactDefinition { table: table(), kind: "search".into(), id: id.into(), version: 1, historical: true, group_bytes: None } }
 fn record(id: &str) -> ArtefactRecord { ArtefactRecord { kind: Some("search".into()), definition_id: Some(id.into()), definition_version: Some(1), stats: None, scope: None, file_size: None } }
 fn catalog() -> TrieCatalog {

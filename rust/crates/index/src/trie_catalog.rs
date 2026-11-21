@@ -15,13 +15,15 @@ pub struct CatalogTrie {
     pub state: TrieState,
     /// Files derived from this trie's data file, at most one per (kind, definition id, definition version).
     pub artefacts: Vec<log_pb::ArtefactRecord>,
+    /// The provider's version for each file at publication, retained when the trie becomes garbage.
+    pub published_files: Option<log_pb::TrieFileVersions>,
 }
 
 impl CatalogTrie {
     pub fn notification(key: TrieKey, data_file_size: i64, mut metadata: Option<log_pb::TrieMetadata>) -> Result<Self> {
         if data_file_size < 0 { return Err(invalid("Trie file size is negative")); }
         if let Some(metadata) = &mut metadata { metadata.iid_bloom = None; }
-        Ok(Self { key, data_file_size, metadata, state: TrieState::Nascent, artefacts: Vec::new() })
+        Ok(Self { key, data_file_size, metadata, state: TrieState::Nascent, artefacts: Vec::new(), published_files: None })
     }
 
     pub fn from_proto(value: &log_pb::TrieDetails) -> Result<Self> {
@@ -34,7 +36,7 @@ impl CatalogTrie {
         };
         let data_file_size = value.data_file_size.unwrap_or_default();
         if data_file_size < 0 { return Err(invalid("Trie file size is negative")); }
-        Ok(Self { key, data_file_size, metadata: value.trie_metadata.clone(), state, artefacts: value.artefacts.clone() })
+        Ok(Self { key, data_file_size, metadata: value.trie_metadata.clone(), state, artefacts: value.artefacts.clone(), published_files: value.published_files.clone() })
     }
 
     pub fn to_proto(&self, table: &TableRef) -> log_pb::TrieDetails {
@@ -45,7 +47,7 @@ impl CatalogTrie {
         log_pb::TrieDetails {
             table_name: Some(table.schema_and_table()), trie_key: Some(self.key.to_string()),
             data_file_size: Some(self.data_file_size), trie_metadata: self.metadata.clone(),
-            trie_state: Some(state), garbage_as_of, artefacts: self.artefacts.clone(),
+            trie_state: Some(state), garbage_as_of, artefacts: self.artefacts.clone(), published_files: self.published_files.clone(),
         }
     }
 

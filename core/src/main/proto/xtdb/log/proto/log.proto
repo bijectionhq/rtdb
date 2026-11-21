@@ -96,6 +96,21 @@ message TrieDetails {
     TrieState trie_state = 5;
     int64 garbage_as_of = 6;
     repeated ArtefactRecord artefacts = 7;
+    TrieFileVersions published_files = 8;
+}
+
+// Physical identities returned when the immutable files were published.
+message TrieFileVersions {
+    PublishedObjectVersion data = 1;
+    PublishedObjectVersion metadata = 2;
+}
+
+message PublishedObjectVersion {
+    string bucket = 1;
+    string endpoint = 2;
+    string region = 3;
+    string key = 4;
+    string version = 5;
 }
 
 // A file derived from a trie's data file (e.g. a search index), recorded on the trie's catalog entry and deleted with it.

@@ -1,5 +1,5 @@
 use bytes::{BufMut, Bytes, BytesMut};
-use rtdb_format::keys::{TRIE_RETIREMENT_DIRECTORY, TrieKey};
+use rtdb_format::{keys::{TRIE_RETIREMENT_DIRECTORY, TrieKey}, log::proto::PublishedObjectVersion};
 use rtdb_index::PartitionValue;
 use rtdb_storage::{Error, ObjectKey, ObjectStore};
 use rtdb_types::{CatalogCut, PhysicalObjectVersion, ReplicaPosition, Result, TableRef};
@@ -16,11 +16,17 @@ pub(crate) struct RetirementFile {
     key: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     version: Option<PhysicalObjectVersion>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    matches_publication: bool,
 }
 
 impl RetirementFile {
-    pub(crate) async fn observe(store: &dyn ObjectStore, key: &ObjectKey) -> Result<Self> {
-        Ok(Self { key: key.to_string(), version: store.retirement_version(key).await? })
+    pub(crate) async fn observe(store: &dyn ObjectStore, key: &ObjectKey, published: Option<PublishedObjectVersion>) -> Result<Self> {
+        let version = store.retirement_version(key).await?;
+        let matches_publication = version.as_ref().is_some_and(|observed| {
+            published.as_ref().is_some_and(|expected| *expected == PublishedObjectVersion::from(observed.clone()))
+        });
+        Ok(Self { key: key.to_string(), version, matches_publication })
     }
 }
 

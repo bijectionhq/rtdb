@@ -153,6 +153,15 @@ pub trait ObjectStore: Send + Sync {
     /// Publishes an immutable object, accepting an identical existing object as a completed retry.
     async fn put(&self, key: &ObjectKey, bytes: Bytes) -> Result<()>;
     async fn put_file(&self, key: &ObjectKey, source: &Path) -> Result<()>;
+    /// Returns a provider version from the successful write or from the read that verified an identical existing object.
+    async fn put_with_version(&self, key: &ObjectKey, bytes: Bytes) -> Result<Option<rtdb_types::PhysicalObjectVersion>> {
+        self.put(key, bytes).await?;
+        Ok(None)
+    }
+    async fn put_file_with_version(&self, key: &ObjectKey, source: &Path) -> Result<Option<rtdb_types::PhysicalObjectVersion>> {
+        self.put_file(key, source).await?;
+        Ok(None)
+    }
     /// Returns the object names reported under a directory, ordered lexicographically.
     /// A listing may observe concurrent writes or deletions while enumerating the names.
     async fn list(&self, directory: Option<&ObjectKey>) -> Result<Vec<StoredObject>>;

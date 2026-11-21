@@ -33,13 +33,20 @@ pub trait PublicationJournal: Send + Sync {
     async fn settle(&self, key: &ObjectKey, attempt: uuid::Uuid, upload: &str, submitted: bool) -> Result<()>;
 }
 
+/// The result of this specific conditional publication.
+#[derive(Debug, PartialEq, Eq)]
+pub enum PublicationResult {
+    Published { version: Option<String> },
+    Conflict,
+}
+
 /// A provider with a durable, independently abortable upload capability.
 #[async_trait]
 pub trait PublicationUploads: Send + Sync {
     /// Reserves an empty upload for a provider-encoded key.
     async fn reserve(&self, path: &Path, attempt: uuid::Uuid) -> Result<String>;
     /// Makes the upload visible only if no object already holds that key.
-    async fn complete(&self, path: &Path, upload: &str, bytes: Bytes) -> Result<bool>;
+    async fn complete(&self, path: &Path, upload: &str, bytes: Bytes) -> Result<PublicationResult>;
     /// Cancels this upload and confirms that it retains no parts.
     async fn abort(&self, path: &Path, upload: &str) -> Result<()>;
 }
@@ -109,7 +116,7 @@ impl RemoteStore {
             let io = destination.io.clone();
             return IoRegion::run_async_admitted(admission, async move {
                 let bytes = objects.get(&source).await?;
-                destination_objects.put(&key, bytes, Some(&io)).await
+                destination_objects.put(&key, bytes, Some(&io)).await.map(drop)
             }).await;
         }
         IoRegion::run_async_admitted(admission, async move { objects.copy_to(&source, &destination_objects, &key).await }).await
@@ -133,11 +140,7 @@ impl ObjectStore for RemoteStore {
                 Err(object_store::Error::NotFound { .. }) => return Ok(None),
                 Err(error) => return Err(provider_error(&key, error)),
             };
-            Ok(metadata.version.filter(|version| valid_object_version(version.as_bytes())).map(|version| PhysicalObjectVersion {
-                namespace: namespace.as_ref().clone(),
-                key: path.to_string(),
-                version,
-            }))
+            Ok(physical_version(Some(namespace.as_ref()), &path, metadata.version))
         }).await
     }
     async fn get(&self, key: &ObjectKey) -> Result<Bytes> {
@@ -158,10 +161,17 @@ impl ObjectStore for RemoteStore {
         self.io.run_async(async move { reservation.finish(objects.get_range(&key, range).await?) }).await
     }
     async fn put(&self, key: &ObjectKey, bytes: Bytes) -> Result<()> {
+        self.put_with_version(key, bytes).await.map(drop)
+    }
+    async fn put_with_version(&self, key: &ObjectKey, bytes: Bytes) -> Result<Option<PhysicalObjectVersion>> {
         let (objects, key) = (Arc::clone(&self.objects), key.clone());
         let io = self.io.clone();
         let single_put = self.single_put;
-        self.io.run_async(async move { objects.put(&key, bytes, single_put.then_some(io.as_ref())).await }).await
+        let namespace = self.version_namespace.clone();
+        self.io.run_async(async move {
+            let version = objects.put(&key, bytes, single_put.then_some(io.as_ref())).await?;
+            Ok(physical_version(namespace.as_deref(), &objects.path(&key), version))
+        }).await
     }
     async fn put_file(&self, key: &ObjectKey, source: &std::path::Path) -> Result<()> {
         if self.single_put {
@@ -239,6 +249,12 @@ impl RemoteObjects {
     }
 }
 
+fn physical_version(namespace: Option<&S3ObjectNamespace>, path: &Path, version: Option<String>) -> Option<PhysicalObjectVersion> {
+    let namespace = namespace?;
+    let version = version.filter(|version| valid_object_version(version.as_bytes()))?;
+    Some(PhysicalObjectVersion { namespace: namespace.clone(), key: path.to_string(), version })
+}
+
 fn publication_attribute() -> Attribute { Attribute::Metadata("rtdb-publication".into()) }
 
 fn provider_error(key: &ObjectKey, error: object_store::Error) -> Error {
@@ -299,13 +315,13 @@ impl RemoteObjects {
         Ok(bytes)
     }
 
-    async fn put(&self, key: &ObjectKey, bytes: Bytes, authority: Option<&IoRegion>) -> Result<()> {
+    async fn put(&self, key: &ObjectKey, bytes: Bytes, authority: Option<&IoRegion>) -> Result<Option<String>> {
         if let Some(journal) = authority.and_then(IoRegion::publication_journal) {
             return self.put_journaled(key, bytes, journal).await;
         }
         let options = PutOptions { mode: PutMode::Create, ..Default::default() };
         match self.client.put_opts(&self.path(key), bytes.clone().into(), options).await {
-            Ok(_) => Ok(()),
+            Ok(written) => Ok(written.version),
             Err(object_store::Error::AlreadyExists { .. } | object_store::Error::Precondition { .. }) => {
                 self.compare_existing(key, bytes).await
             }
@@ -313,7 +329,7 @@ impl RemoteObjects {
         }
     }
 
-    async fn put_journaled(&self, key: &ObjectKey, bytes: Bytes, journal: &dyn PublicationJournal) -> Result<()> {
+    async fn put_journaled(&self, key: &ObjectKey, bytes: Bytes, journal: &dyn PublicationJournal) -> Result<Option<String>> {
         let uploads = self.uploads.as_ref().ok_or_else(|| Error::Remote {
             key: key.to_string(), message: "The cell store has no abortable publication capability".into(),
         })?;
@@ -327,37 +343,46 @@ impl RemoteObjects {
         }
 
         let result = uploads.complete(&path, &upload, bytes.clone()).await;
-        if !matches!(&result, Ok(true)) {
+        if !matches!(&result, Ok(PublicationResult::Published { .. })) {
             // A conflict leaves uploaded parts behind. An uncertain
             // completion must also be fenced before clearing the admission.
             uploads.abort(&path, &upload).await?;
         }
         journal.settle(key, attempt, &upload, true).await?;
         match result {
-            Ok(true) => Ok(()),
-            Ok(false) => self.compare_existing(key, bytes).await,
+            Ok(PublicationResult::Published { version }) => Ok(version),
+            Ok(PublicationResult::Conflict) => self.compare_existing(key, bytes).await,
             Err(error) => {
-                if matches!(self.publication_confirmed(key, attempt).await, Ok(true)) {
-                    Ok(())
-                } else {
-                    Err(error)
+                match self.publication_confirmed(key, attempt).await {
+                    Ok(PublicationResult::Published { version }) => Ok(version),
+                    _ => Err(error),
                 }
             }
         }
     }
 
-    async fn compare_existing(&self, key: &ObjectKey, bytes: Bytes) -> Result<()> {
-        if self.get(key).await? == bytes { Ok(()) } else { Err(Error::ConflictingObject(key.to_string())) }
+    async fn compare_existing(&self, key: &ObjectKey, bytes: Bytes) -> Result<Option<String>> {
+        let object = self.client.get(&self.path(key)).await.map_err(|error| provider_error(key, error))?;
+        let version = object.meta.version.clone();
+        if object.bytes().await.map_err(|error| provider_error(key, error))? != bytes {
+            return Err(Error::ConflictingObject(key.to_string()));
+        }
+        Ok(version)
     }
 
-    async fn publication_confirmed(&self, key: &ObjectKey, attempt: uuid::Uuid) -> Result<bool> {
+    async fn publication_confirmed(&self, key: &ObjectKey, attempt: uuid::Uuid) -> Result<PublicationResult> {
         match self.client.get_opts(&self.path(key), GetOptions::new().with_head(true)).await {
             Ok(object) => {
                 let expected = attempt.to_string();
-                Ok(object.attributes.get(&publication_attribute())
-                    .is_some_and(|receipt| receipt.as_ref() == expected.as_str()))
+                if object.attributes.get(&publication_attribute())
+                    .is_some_and(|receipt| receipt.as_ref() == expected.as_str())
+                {
+                    Ok(PublicationResult::Published { version: object.meta.version })
+                } else {
+                    Ok(PublicationResult::Conflict)
+                }
             }
-            Err(object_store::Error::NotFound { .. }) => Ok(false),
+            Err(object_store::Error::NotFound { .. }) => Ok(PublicationResult::Conflict),
             Err(error) => Err(provider_error(key, error)),
         }
     }
@@ -369,7 +394,7 @@ impl RemoteObjects {
             Err(Error::MissingObject(_)) => (),
             Err(error) => return Err(error),
         }
-        if length == 0 { return self.put(key, Bytes::new(), None).await; }
+        if length == 0 { return self.put(key, Bytes::new(), None).await.map(drop); }
         let temporary = format!(".tmp/upload-{}", uuid::Uuid::new_v4());
         let temporary = Path::from(match &self.prefix { Some(prefix) => format!("{prefix}/{temporary}"), None => temporary });
         let mut upload = self.client.put_multipart(&temporary).await.map_err(|error| provider_error(key, error))?;

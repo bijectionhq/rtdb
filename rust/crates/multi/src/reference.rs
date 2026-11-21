@@ -106,6 +106,14 @@ impl ObjectStore for PrefixedStore {
         let (writer, key) = self.mutation(key)?;
         writer.put_file(&key, source).await
     }
+    async fn put_with_version(&self, key: &ObjectKey, bytes: Bytes) -> rtdb_storage::Result<Option<rtdb_types::PhysicalObjectVersion>> {
+        let (writer, key) = self.mutation(key)?;
+        writer.put_with_version(&key, bytes).await
+    }
+    async fn put_file_with_version(&self, key: &ObjectKey, source: &Path) -> rtdb_storage::Result<Option<rtdb_types::PhysicalObjectVersion>> {
+        let (writer, key) = self.mutation(key)?;
+        writer.put_file_with_version(&key, source).await
+    }
     async fn list(&self, directory: Option<&ObjectKey>) -> rtdb_storage::Result<Vec<StoredObject>> {
         let under = match directory { Some(directory) => self.full(directory)?, None => self::key(&self.prefix)? };
         let strip = format!("{}/", self.prefix);
@@ -173,6 +181,20 @@ impl ObjectStore for ReferencingStore {
     async fn put_file(&self, key: &ObjectKey, source: &Path) -> rtdb_storage::Result<()> {
         if self.base.objects.contains_key(key.as_str()) { return self.put(key, Bytes::from(std::fs::read(source).map_err(|error| Error::Task(format!("{}: {error}", source.display())))?)).await; }
         self.own.put_file(key, source).await
+    }
+    async fn put_with_version(&self, key: &ObjectKey, bytes: Bytes) -> rtdb_storage::Result<Option<rtdb_types::PhysicalObjectVersion>> {
+        if self.base.objects.contains_key(key.as_str()) {
+            self.put(key, bytes).await?;
+            return Ok(None);
+        }
+        self.own.put_with_version(key, bytes).await
+    }
+    async fn put_file_with_version(&self, key: &ObjectKey, source: &Path) -> rtdb_storage::Result<Option<rtdb_types::PhysicalObjectVersion>> {
+        if self.base.objects.contains_key(key.as_str()) {
+            self.put_file(key, source).await?;
+            return Ok(None);
+        }
+        self.own.put_file_with_version(key, source).await
     }
     async fn list(&self, directory: Option<&ObjectKey>) -> rtdb_storage::Result<Vec<StoredObject>> {
         let mut listed: BTreeMap<String, StoredObject> = self.own.list(directory).await?.into_iter()

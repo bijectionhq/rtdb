@@ -282,6 +282,20 @@ impl ObjectStore for PackingStore {
         }
         self.inner.put_file(object, source).await
     }
+    async fn put_with_version(&self, key: &ObjectKey, bytes: Bytes) -> rtdb_storage::Result<Option<rtdb_types::PhysicalObjectVersion>> {
+        if packed(key.as_str()) {
+            self.put(key, bytes).await?;
+            return Ok(None);
+        }
+        self.inner.put_with_version(key, bytes).await
+    }
+    async fn put_file_with_version(&self, key: &ObjectKey, source: &Path) -> rtdb_storage::Result<Option<rtdb_types::PhysicalObjectVersion>> {
+        if packed(key.as_str()) {
+            self.put_file(key, source).await?;
+            return Ok(None);
+        }
+        self.inner.put_file_with_version(key, source).await
+    }
     async fn list(&self, directory: Option<&ObjectKey>) -> rtdb_storage::Result<Vec<StoredObject>> {
         let prefix = directory.map(|directory| format!("{}/", directory.as_str()));
         let under = |name: &str| prefix.as_deref().is_none_or(|prefix| name.starts_with(prefix));

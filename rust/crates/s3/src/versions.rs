@@ -6,7 +6,7 @@ use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::types::{ChecksumAlgorithm, CompletedMultipartUpload, CompletedPart, Delete, ObjectIdentifier, RequestPayer};
 use bytes::Bytes;
 use object_store::path::Path;
-use rtdb_storage::{Error, ObjectKey, remote::PublicationUploads};
+use rtdb_storage::{Error, ObjectKey, remote::{PublicationResult, PublicationUploads}};
 use rtdb_types::{Anomaly, AnomalyCategory, Result};
 
 fn collect_child(parent: &str, key: Option<&str>, children: &mut BTreeSet<String>) {
@@ -210,7 +210,7 @@ impl PublicationUploads for VersionedInventory {
             .ok_or_else(|| publication_failure(path, "S3 did not identify the reserved upload"))
     }
 
-    async fn complete(&self, path: &Path, upload: &str, bytes: Bytes) -> rtdb_storage::Result<bool> {
+    async fn complete(&self, path: &Path, upload: &str, bytes: Bytes) -> rtdb_storage::Result<PublicationResult> {
         let key = path.as_ref();
         let part = self.client.upload_part().bucket(&self.bucket).key(key).upload_id(upload)
             .part_number(1).checksum_algorithm(ChecksumAlgorithm::Sha256).body(ByteStream::from(bytes))
@@ -224,8 +224,8 @@ impl PublicationUploads for VersionedInventory {
         match self.client.complete_multipart_upload().bucket(&self.bucket).key(key).upload_id(upload)
             .if_none_match("*").multipart_upload(parts).set_request_payer(self.request_payer.clone()).send().await
         {
-            Ok(_) => Ok(true),
-            Err(error) if error.as_service_error().and_then(|error| error.code()) == Some("PreconditionFailed") => Ok(false),
+            Ok(output) => Ok(PublicationResult::Published { version: output.version_id().map(str::to_owned) }),
+            Err(error) if error.as_service_error().and_then(|error| error.code()) == Some("PreconditionFailed") => Ok(PublicationResult::Conflict),
             Err(error) => Err(publication_failure(path, error.to_string())),
         }
     }
@@ -300,13 +300,15 @@ mod tests {
         let upload_path = Path::from(format!("{}/{upload_key}", inventory.root));
         let attempt = uuid::Uuid::new_v4();
         let winner = inventory.reserve(&upload_path, attempt).await.unwrap();
-        assert!(inventory.complete(&upload_path, &winner, Bytes::from_static(b"sealed")).await.unwrap());
+        let published = inventory.complete(&upload_path, &winner, Bytes::from_static(b"sealed")).await.unwrap();
+        let PublicationResult::Published { version: Some(published_version) } = published else { panic!("versioned completion lacked its version") };
         let loser = inventory.reserve(&upload_path, uuid::Uuid::new_v4()).await.unwrap();
-        assert!(!inventory.complete(&upload_path, &loser, Bytes::from_static(b"other")).await.unwrap());
+        assert_eq!(inventory.complete(&upload_path, &loser, Bytes::from_static(b"other")).await.unwrap(), PublicationResult::Conflict);
         inventory.abort_publication(&upload_key, &loser).await.unwrap();
         inventory.abort_publication(&upload_key, &winner).await.unwrap();
         let retained = client.get_object().bucket(&bucket).key(upload_path.as_ref()).send().await.unwrap();
         assert_eq!(retained.metadata().unwrap()["rtdb-publication"], attempt.to_string());
+        assert_eq!(retained.version_id(), Some(published_version.as_str()));
         assert_eq!(retained.body.collect().await.unwrap().into_bytes().as_ref(), b"sealed");
         inventory.purge(&ObjectKey::new("managed").unwrap()).await.unwrap();
 
