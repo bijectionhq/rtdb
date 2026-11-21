@@ -78,7 +78,7 @@ impl StateFile {
         file.get_ref().sync_all().map_err(io)?;
         drop(file);
         fs::rename(next, self.state_path()).map_err(io)?;
-        File::open(&self.root).and_then(|root| root.sync_all()).map_err(io)
+        rtdb_types::directory_io::open_for_sync(&self.root).and_then(|root| root.sync_all()).map_err(io)
     }
 
     fn state_path(&self) -> PathBuf { self.root.join("directory.json") }

@@ -172,7 +172,12 @@ A successful initialization records the deployment UUID, journal ID and key dige
 `standalone` requires those original records and starts a loopback TLS gateway using a supplied certificate, private key and password file.
 The journal accepts connections only inside the standalone process.
 The gateway reports its bound port and installation UUID in the caller's private readiness file.
+`rtdb-multi --build-info` reports the compiled source revision, time-zone data digest and standalone protocol.
+Set `RTDB_REVISION` to the selected full source commit when building a distributable executable.
 A supervisor can start the process with `--parent-stdin` so closing its private pipe requests shutdown.
+The local directory, journal, keys and objects propagate namespace-flush failures to callers.
+On Windows this uses a write-capable directory handle and `FlushFileBuffers`.
+A missing file on a delete retry still requires a directory flush before confirming removal.
 
 ## 1. Ground rules
 

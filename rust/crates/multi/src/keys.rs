@@ -77,7 +77,7 @@ impl LocalKeyService {
     }
 
     fn sync_directory(&self) -> Result<()> {
-        File::open(&self.directory).and_then(|directory| directory.sync_all()).map_err(io)
+        rtdb_types::directory_io::open_for_sync(&self.directory).and_then(|directory| directory.sync_all()).map_err(io)
     }
     fn local_key(&self, deployment: &str) -> Result<[u8; KEY_BYTES]> {
         let path = self.path(deployment);

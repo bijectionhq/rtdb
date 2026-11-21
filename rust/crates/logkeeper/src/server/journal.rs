@@ -17,7 +17,6 @@ use rtdb_types::{Anomaly, AnomalyCategory, Result};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufReader, Write as _};
-use std::os::unix::fs::FileExt as _;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -160,11 +159,39 @@ struct Placed<'a> {
     length: usize,
 }
 
+#[cfg(unix)]
+fn read_exact_at(file: &File, bytes: &mut [u8], offset: u64) -> std::io::Result<()> {
+    use std::os::unix::fs::FileExt as _;
+    file.read_exact_at(bytes, offset)
+}
+
+#[cfg(windows)]
+fn read_exact_at(file: &File, mut bytes: &mut [u8], mut offset: u64) -> std::io::Result<()> {
+    use std::io::{Error, ErrorKind};
+    use std::os::windows::fs::FileExt as _;
+
+    // Reads always supply their offset; segment writes use append-only
+    // handles, so moving the Windows file cursor cannot redirect a write.
+    while !bytes.is_empty() {
+        match file.seek_read(bytes, offset) {
+            Ok(0) => return Err(Error::new(ErrorKind::UnexpectedEof, "incomplete journal frame")),
+            Ok(read) => {
+                offset = offset.checked_add(read as u64)
+                    .ok_or_else(|| Error::new(ErrorKind::InvalidData, "journal offset overflow"))?;
+                bytes = &mut bytes[read..];
+            }
+            Err(error) if error.kind() == ErrorKind::Interrupted => continue,
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(())
+}
+
 fn segment_path(segments: &Path, sequence: u64) -> PathBuf { segments.join(format!("{sequence:020}.seg")) }
 
 fn sync_directory(directory: &Path, fsync: bool) -> Result<()> {
     if !fsync { return Ok(()); }
-    File::open(directory).and_then(|directory| rtdb_storage::sync_file(&directory)).map_err(|error| io_error(directory, error))
+    rtdb_storage::sync_directory(directory).map_err(|error| io_error(directory, error))
 }
 
 /// Every segment file by sequence, removing temporary files a crashed compaction left.
@@ -517,7 +544,7 @@ impl Journal {
         let path = segment_path(&self.segments, location.segment);
         let file = file.ok_or_else(|| Anomaly::fault("rtdb.logkeeper/segment-retired", format!("lsn {lsn} points at retired segment {}", path.display())))?;
         let mut frame = vec![0; location.length as usize];
-        file.read_exact_at(&mut frame, location.offset).map_err(|error| io_error(&path, error))?;
+        read_exact_at(file, &mut frame, location.offset).map_err(|error| io_error(&path, error))?;
         match next_record(&Bytes::from(frame), &mut 0) {
             Some(Record { kind: Some(Kind::Append(entry)), .. }) if entry.lsn == lsn => Ok(entry.payload),
             _ => Err(corrupt(&path, format!("no entry {lsn} at {}", location.offset))),

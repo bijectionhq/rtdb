@@ -30,7 +30,7 @@ use crate::gateway::{self, GatewayOptions};
 use crate::keys::{KeyService, LocalKeyService};
 use crate::lease::{LeaseOptions, MemberLease, Registration};
 
-const FORMAT: u32 = 1;
+pub const STANDALONE_PROTOCOL: u32 = 1;
 const AUTHORITY: &str = "authority.json";
 const DIRECTORY: &str = "directory";
 const JOURNAL: &str = "journal";
@@ -76,7 +76,7 @@ pub async fn initialize_standalone(root: &Path, name: &str, id: Uuid) -> Result<
     let keys = LocalKeyService::new(root.join(KEYS))?;
     let key = keys.key(&record.id).await?;
     let authority = Authority {
-        format: FORMAT,
+        format: STANDALONE_PROTOCOL,
         database: record.name.clone(),
         installation: id,
         journal: journal_id,
@@ -84,9 +84,7 @@ pub async fn initialize_standalone(root: &Path, name: &str, id: Uuid) -> Result<
     };
     directory.create_deployment(record).await?;
     write_private(&root.join(AUTHORITY), &authority, true)?;
-    File::open(root)
-        .and_then(|root| rtdb_storage::sync_file(&root))
-        .map_err(io)?;
+    rtdb_storage::sync_directory(root).map_err(io)?;
     drop(journal);
     Ok(())
 }
@@ -218,7 +216,7 @@ pub async fn serve_standalone(
         let serving = async {
             if cancellation.is_cancelled() { return Ok(()); }
             write_private(&settings.ready_file, &Ready {
-                format: FORMAT, database: &settings.name, installation: settings.id,
+                format: STANDALONE_PROTOCOL, database: &settings.name, installation: settings.id,
                 host: address.ip(), port: address.port(),
             }, false)?;
             let options = GatewayOptions { tls: Some(tls), capabilities: Some(capabilities), ..Default::default() };
@@ -262,7 +260,7 @@ fn read_authority(root: &Path, name: &str, id: Uuid) -> Result<Authority> {
     let raw = read_bounded(&root.join(AUTHORITY), 4096)?;
     let authority: Authority =
         serde_json::from_str(&raw).map_err(|error| invalid(error.to_string()))?;
-    if authority.format != FORMAT || authority.database != name || authority.installation != id {
+    if authority.format != STANDALONE_PROTOCOL || authority.database != name || authority.installation != id {
         return Err(invalid(
             "The retained standalone RTDB authority identifies another deployment",
         ));

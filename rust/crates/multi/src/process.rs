@@ -2,7 +2,7 @@
 
 mod standalone;
 
-pub use standalone::{StandaloneSettings, initialize_standalone, serve_standalone};
+pub use standalone::{STANDALONE_PROTOCOL, StandaloneSettings, initialize_standalone, serve_standalone};
 
 use std::net::SocketAddr;
 use std::path::PathBuf;

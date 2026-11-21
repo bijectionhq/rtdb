@@ -13,7 +13,8 @@ use rtdb_types::{Anomaly, Result};
 use tokio_util::sync::CancellationToken;
 
 const HELP: &str = "RTDB multi\n\n\
-Usage: rtdb-multi initialize-directory --state PATH\n\
+Usage: rtdb-multi --build-info\n\
+       rtdb-multi initialize-directory --state PATH\n\
        rtdb-multi initialize-standalone --state PATH --name NAME --id UUID\n\
        rtdb-multi standalone --state PATH --name NAME --id UUID --certificate FILE --private-key FILE --password-file FILE --ready-file FILE [--parent-stdin]\n\
        rtdb-multi directory --state PATH --listen ADDR\n\
@@ -96,6 +97,22 @@ async fn run(arguments: Vec<String>) -> Result<()> {
     let cancellation = CancellationToken::new();
     { let cancellation = cancellation.clone(); tokio::spawn(async move { shutdown_signal().await; cancellation.cancel(); }); }
     match command.as_str() {
+        "--build-info" => {
+            #[derive(serde::Serialize)]
+            struct MultiBuildInfo {
+                #[serde(flatten)]
+                provenance: rtdb_types::BuildInfo,
+                standalone_protocol: u32,
+            }
+            let report = MultiBuildInfo {
+                provenance: rtdb_types::compiled_build_info(),
+                standalone_protocol: process::STANDALONE_PROTOCOL,
+            };
+            let mut output = std::io::stdout().lock();
+            serde_json::to_writer(&mut output, &report).map_err(|error| io(std::io::Error::other(error)))?;
+            use std::io::Write as _;
+            writeln!(output).map_err(io)
+        }
         "help" | "--help" | "-h" => { print!("{HELP}"); Ok(()) }
         "initialize-standalone" => {
             process::initialize_standalone(std::path::Path::new(arguments.required("state")?), arguments.required("name")?, installation_id(&arguments)?).await
