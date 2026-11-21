@@ -1,0 +1,93 @@
+{
+  "summary": "The production search finds the unique owner, and append and tail replacement preserve a contiguous row layout.",
+  "flags": ["--no-external-by-default", "--verify-module", "production", "--verify-module", "laws"],
+  "min_verified_functions": 9,
+  "controls": {
+    "exclude_chunk_start": {
+      "defect": "A row at a chunk's first ordinal is assigned to the wrong chunk.",
+      "mutate": [{
+        "file": "rust/crates/index/src/row_address.rs",
+        "find": "if chunks[middle].0 <= row {",
+        "replace": "if chunks[middle].0 < row {"
+      }],
+      "expect": [{
+        "file": "rust/crates/index/src/row_address.rs",
+        "function": "last_started_chunk",
+        "category": "invariant not satisfied at end of loop body"
+      }],
+      "min_verified_functions": 8
+    },
+    "drop_relative_offset": {
+      "defect": "Every row is read from the first offset in its chunk.",
+      "mutate": [{
+        "file": "rust/crates/index/src/row_address.rs",
+        "find": "Some((index, row - chunks[index].0))",
+        "replace": "Some((index, 0))"
+      }],
+      "expect": [{
+        "file": "rust/crates/index/src/row_address.rs",
+        "function": "last_started_chunk",
+        "category": "postcondition not satisfied"
+      }],
+      "min_verified_functions": 8
+    },
+    "append_at_new_total": {
+      "defect": "An appended chunk begins after its own rows.",
+      "mutate": [{
+        "file": "rust/crates/index/src/row_address.rs",
+        "find": "chunks.push((rows, batch));",
+        "replace": "chunks.push((total, batch));"
+      }],
+      "expect": [{
+        "file": "rust/crates/index/src/row_address.rs",
+        "function": "append_chunk",
+        "category": "assertion failed"
+      }, {
+        "file": "rust/crates/index/src/row_address.rs",
+        "function": "append_chunk",
+        "category": "postcondition not satisfied"
+      }],
+      "min_verified_functions": 8
+    },
+    "wrap_row_count_on_append": {
+      "defect": "An append accepts a count that exceeds the row address space.",
+      "mutate": [{
+        "file": "rust/crates/index/src/row_address.rs",
+        "find": "let Some(total) = rows.checked_add(count) else {\n        return None;\n    };",
+        "replace": "let total = rows.wrapping_add(count);"
+      }],
+      "expect": [{
+        "file": "rust/crates/index/src/row_address.rs",
+        "function": "append_chunk",
+        "category": "postcondition not satisfied"
+      }, {
+        "file": "rust/crates/index/src/row_address.rs",
+        "function": "append_chunk",
+        "category": "postcondition not satisfied"
+      }],
+      "min_verified_functions": 8
+    },
+    "join_at_later_chunk_start": {
+      "defect": "Two joined chunks start at the second chunk's ordinal.",
+      "mutate": [{
+        "file": "rust/crates/index/src/row_address.rs",
+        "find": "let start = chunks[index].0;",
+        "replace": "let start = chunks[index + 1].0;"
+      }],
+      "expect": [{
+        "file": "rust/crates/index/src/row_address.rs",
+        "function": "replace_last_two",
+        "category": "assertion failed"
+      }, {
+        "file": "rust/crates/index/src/row_address.rs",
+        "function": "replace_last_two",
+        "category": "postcondition not satisfied"
+      }, {
+        "file": "rust/crates/index/src/row_address.rs",
+        "function": "replace_last_two",
+        "category": "postcondition not satisfied"
+      }],
+      "min_verified_functions": 8
+    }
+  }
+}

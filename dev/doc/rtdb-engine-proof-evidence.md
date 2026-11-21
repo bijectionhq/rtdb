@@ -33,7 +33,9 @@ These results apply to the classic and full-text Rust paths at the particular re
 | LOG12 · Retained history audit | Lean proves chain equality for arbitrary page partitions, continuation from an adjacent digest, and the coverage and equality requirements for strict certification. Native contract tests compare online and stopped-journal digests across epochs and exercise quorum certification across multiple pages and trim. | Relate the accepted online and offline intervals and ordered records to the model under all journal and transport outcomes, including responder selection and physical validation. |
 | LOG13 · Journal retirement | Lean proves that replay and compaction preserve the retirement marker, and that completion requires every addressed replica. Kani checks replay of the production `Drop` event and subsequent commit refusal on an empty stream. Native replicas exercise retirement retry, restart, and direct checks for removed payloads. | Prove the runtime journal and fsync transitions, the inventory of all required replicas after copy or move, and the storage and deletion receipt contracts. |
 | CELL09, STORE10 and Multi recovery S2, S5 · Worker loss | A local MinIO and PgWire regression retains the checkpoint and acknowledged suffix, compares current rows and the full bitemporal projection, and verifies new writes after losing one, two, and all three compute workers. | Prove the complete activation and recovery path under the published durable-service and liveness assumptions. |
-| IDX04 | Verus checks the Rust base-four IID bucket function. The Kani harness also checks all legal depths and the independent bit-extraction rule for width 2, 4, or 8 in the actual bucketer. | Prove every admitted row is placed and found under the corresponding serialized and live subtree through insertion, splitting, and replay. |
+| IDX02, IDX04, IDX06, IDX07 | Verus checks the production Rust base-four IID digit, path comparison, and stable partition of an insertion or split batch at every valid depth. The Kani harness also checks all legal depths and the independent bit-extraction rule for width 2, 4, or 8 in the actual bucketer. | Compose grouping, leaf ordering, and recursive replacement at actual Rust and JVM call sites, then connect the resulting trees to traversal and replay. |
+| IDX02, IDX03, IDX07 | Verus checks that the production Rust leaf merge returns every input occurrence in order. An injective logical rank uniquely determines the successful output sequence from those occurrences. | Prove that each leaf supplies correctly ordered runs, that its reader and comparator realize the logical rank, and that the JVM merge satisfies the same contract. |
+| IDX01, IDX08 | Verus checks the production Rust search, append, and adjacent chunk replacement against one contiguous-layout invariant. Lean proves that appending rows and joining adjacent chunks preserve existing ordinal reads. | Prove the Arrow row-content obligation and snapshot ownership across block transitions, and refine the JVM equivalents. |
 | SCAN07, GC01, GC02 | Lean proves the abstract generation retention invariant for arbitrarily many readers, objects, in-flight operations and steps. Verus checks the collector's production selection loop against the visibility observations it receives. | Refine the captured references, provider operations, and authority changes, including the full durable deletion protocol. |
 | GC09, STORE03 · Hosted ordered-index retirement | Lean checks point equivalence after scrubbing known erase cuts. A bounded TLC model checks storage retirement, reader release, scrubbed replay, and conditional completion. Integration tests exercise a held reader and versioned local S3 provider. | Compose the directory and provider contracts with every hosted deployment, reader and primary-file custody path covered by physical disposal. |
 | STORE03 · Read entitlements | Lean proves a lease timing inequality and preservation of read entitlement across arbitrary abstract pin transitions, including close while a read remains active. | Prove clock, I/O completion, decoded page ownership, cache eviction, and provider lifetime assumptions at production call sites. |
@@ -123,6 +125,67 @@ It starts disposable local services and records its logs under `build/proof-runs
 cargo build --locked --manifest-path rust/Cargo.toml -p rtdb-server --features kafka,s3 --bin rtdb
 RTDB_CLASSIC_BIN="$PWD/rust/target/debug/rtdb" bash verification/classic-kafka-s3.sh
 ```
+
+### Memory trie lookup and coverage
+
+Lean checks that every split and finite sequence of modeled insertions preserves all row occurrences and that a routed lookup agrees with filtering the original insertion history by IID.
+Regrouping the same history into different batches preserves both observations for any split policies, including policies that produce different tree shapes.
+The model assumes a stable IID reader and the same deterministic bucket function for routing and lookup.
+Lean 4.35.0 checked five exported theorems using only `propext` and `Quot.sound`.
+The runner rejected controls that drop the maximum-depth leaf and look in the wrong child. [Lean model](../../verification/lean/MemoryTrie.lean)
+
+The Rust test compares public trie insertion, leaf traversal, compaction, and persisted restore with a flat sort-and-filter oracle.
+It covers five configurations, all four top-level buckets, a maximum-depth collision, repeated admitted row indices, an absent IID, and an earlier retained trie.
+The native trie suite passed 20 tests with `cargo test --manifest-path rust/Cargo.toml --locked -p rtdb-trie`. [Rust contract test](../../rust/crates/trie/tests/contracts.rs)
+
+Remaining work includes a machine-checked refinement of the Rust and JVM implementations, including leaf sorting, pending logs, traversal order, and the production lookup and row-reader call paths.
+
+### Production IID path comparison
+
+The Rust memory trie uses the Verus-checked base-four comparison for default-width root-path admission and for validating restored leaves.
+The public bucketer validates the path first.
+For any IID and any path of length at most 64, the proof establishes that equality means every path digit matches and that the first differing digit determines any non-equal result.
+The native contract test compares the public bucketer with an independent unsigned lexicographic oracle at every path depth, including the empty path and a first difference at the last digit.
+Verus 0.2026.11.05.31e44e6 checked nine functions and rejected all five mutations, including one that accepts an IID with a smaller first differing digit. [Verus study](../../verification/verus/iid_partition/area.json)
+The native run passed 495 tests with `cargo test --manifest-path rust/Cargo.toml --locked -p rtdb-trie -p rtdb-format -p rtdb-index -p rtdb-query`. [Rust contract test](../../rust/crates/trie/tests/contracts.rs)
+
+### Production live-trie bucket grouping
+
+Rust branch insertion and leaf splitting call the same checked grouping function.
+For an arbitrary finite input at any branching depth, Verus proves that each successful child sequence is the input filtered by that child's base-four IID digit, including repeated rows and their original order.
+On an IID read failure at a branching depth, the function returns that first modeled read error.
+The proof assumes a finite exact-size iterator obeying the Rust iterator specification and a terminating reader whose results agree with the supplied per-row model.
+The child-path law composes the production comparator and digit selector to show that child membership is parent membership plus agreement on the next digit.
+The native tests exercise the last IID digit, repeated rows, and a read failure whose suffix remains unread.
+Verus 0.2026.11.05.31e44e6 checked thirteen functions and rejected all eight mutations, including wrong-child placement, reversed order, and admitting an unreadable row.
+The native run passed 497 tests with `cargo test --manifest-path rust/Cargo.toml --locked -p rtdb-trie -p rtdb-format -p rtdb-index -p rtdb-query`. [Production grouping and tests](../../rust/crates/trie/src/partition_step.rs) · [Verus study](../../verification/verus/iid_partition/area.json)
+
+### Production leaf merge
+
+Rust leaf sorting and compaction use the verified two-run merge.
+With sorted input runs, representable output capacity, and a fallible comparator consistent with a stable rank, Verus proves that a successful merge is sorted and its row multiset is the sum of the two input multisets.
+An injective rank gives one ordered output sequence for that multiset.
+The rank law proves that a fixed-width IID interpreted as an unsigned big-endian number, with a descending row-index suffix, agrees with the specified bytewise IID and row-index order.
+The merge proof takes sorted input runs and the production comparator's agreement with that rank as premises.
+The native tests exercise repeated rows, the unconsumed tail, and propagation of a comparison failure.
+Verus 0.2026.11.05.31e44e6 checked fourteen functions and rejected four mutations that select the larger head, omit the tail, consume a row without emitting it, or reverse the order within an IID.
+The native run passed 499 tests with `cargo test --manifest-path rust/Cargo.toml --locked -p rtdb-trie -p rtdb-format -p rtdb-index -p rtdb-query`. [Production merge and tests](../../rust/crates/trie/src/leaf_merge_step.rs) · [Verus study](../../verification/verus/trie_leaf_merge/area.json)
+
+### Live row addresses across chunk layouts
+
+The Rust live table uses the checked search for row and header reads, cached leaf addresses, and the block-copy path.
+Verus proves that the search returns the last chunk start at or before the requested ordinal and the exact relative offset.
+The owner law assumes contiguous chunks and proves that every in-range row has one nonempty owner, even when empty chunks cause repeated starts.
+The production append preserves the layout and existing addresses on success and leaves the chunk vector intact on count overflow.
+Replacing the last two chunks preserves the layout when the replacement has their combined length.
+The ownership law composes with the replacement function to prove the new address of every existing row, including displacement by the first chunk's length for a row from the second.
+The compact address API reports an error if the chunk index exceeds its 32-bit representation.
+Lean proves that the returned address reads the same value as the flat layout and that arbitrary appends and contiguous chunk joins preserve every captured row ordinal.
+The join model assumes the Arrow concatenation produces the original rows in the original order.
+The native tests check chunk boundaries, repeated starts, retained reads after actual chunk coalescing, and trie reads from snapshots retained through discard and block rollover.
+Lean 4.35.0 audited five theorems and rejected both mutations.
+Verus 0.2026.11.05.31e44e6 checked nine functions and rejected five mutations.
+The native run passed 503 tests with `cargo test --manifest-path rust/Cargo.toml --locked -p rtdb-trie -p rtdb-format -p rtdb-index -p rtdb-query`. [Lean model](../../verification/lean/LiveRowAddress.lean) · [Verus study](../../verification/verus/live_row_address/area.json) · [Snapshot regression](../../rust/crates/index/tests/live_index.rs)
 
 ## Multi evidence
 

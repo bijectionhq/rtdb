@@ -499,6 +499,41 @@ def verify_memory_admission(args, scratch):
     verify_lean_model(args, scratch, path, "memory-admission", controls, 6)
 
 
+def verify_memory_trie(args, scratch):
+    path = Path("verification/lean/MemoryTrie.lean")
+    controls = {
+        "drop-at-max-depth": (
+            "| 0 => .leaf rows",
+            "| 0 => .leaf []",
+            ["lookup_rebuild", "rebuild_preserves_rows"],
+        ),
+        "look-in-wrong-bucket": (
+            "| .three => lookup iidOf route target (depth + 1) three",
+            "| .three => lookup iidOf route target (depth + 1) two",
+            ["lookup_addAll", "lookup_rebuild"],
+        ),
+    }
+    verify_lean_model(args, scratch, path, "memory-trie", controls, 5)
+
+
+def verify_live_row_address(args, scratch):
+    path = Path("verification/lean/LiveRowAddress.lean")
+    controls = {
+        "include-own-chunk-in-start": (
+            "(chunks.take index).flatten.length",
+            "(chunks.take (index + 1)).flatten.length",
+            ["chunk_read_matches_flat_history", "last_start_locates_a_row",
+             "next_chunk_starts_at_exclusive_end"],
+        ),
+        "reverse-joined-chunks": (
+            "prior ++ (left ++ right) :: suffix",
+            "prior ++ (right ++ left) :: suffix",
+            ["edit_preserves_existing_rows"],
+        ),
+    }
+    verify_lean_model(args, scratch, path, "live-row-address", controls, 5)
+
+
 def verify_outer_join(args, scratch):
     path = Path("verification/lean/OuterJoin.lean")
     controls = {
@@ -853,6 +888,8 @@ def verify_lean(args, scratch):
             verify_basis_tokens(args, scratch)
             verify_run_encoding(args, scratch)
             verify_memory_admission(args, scratch)
+            verify_memory_trie(args, scratch)
+            verify_live_row_address(args, scratch)
             verify_outer_join(args, scratch)
             verify_table_slugs(args, scratch)
             verify_explicit_session(args, scratch)
