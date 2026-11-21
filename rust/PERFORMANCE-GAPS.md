@@ -116,6 +116,11 @@ The follow-up runner records the first wrong result, subsequent counts and proto
   It retains the existing type join for heterogeneous rows.
 - `075647865` reserves schema memory once per flat Flight parameter column and accounts for each decoded value.
   The combined trie, index, Flight SQL and transaction suites passed all 166 tests for these three write-path changes.
+- `c0d1f479c` uses radix sort for large batches of page Bloom positions and accounts for its temporary buffer.
+  A synthetic 5,120-position sort took 7–10 µs instead of 27 µs on Apple silicon.
+  The format and maintenance suites passed 173 tests, including byte-for-byte Bloom output with nulls and selected rows.
+- `55277dbf3` borrows plain argument values during static expansion and preallocates decoded document maps from the selected column count.
+  The index, transaction and Flight SQL suites passed all 147 tests.
 
 ## Current branch measurements
 
@@ -213,6 +218,8 @@ The same configuration improved the observed million-row memory and pgwire resul
 The glibc run with a 61.1 ms pgwire single-INSERT p95 was followed by 3.09 ms and 2.12 ms with jemalloc.
 The 100,000-row Flight ingest median still trails the reference, and the million-row Flight median difference is inside the measured XTDB spread.
 Verify the packaged allocator setting and repeat the remaining Flight comparisons with phase-specific profiles.
+The native release image built from `5d0b86b41` on Mac mini 2 loaded the packaged allocator and passed both build-information checks.
+Run the packaged image and the candidate with all write-path changes under the same limits.
 
 ### Flight and UPDATE CPU samples
 
