@@ -667,3 +667,13 @@ The separately checked reachability formula produces a pair in which one run is 
 AutoHyper produced distinct lasso witnesses when fail-fast recovery stops and when a refresh keeps the failed candidate.
 This establishes the two-run property for the modeled stable listing and completed read steps.
 It leaves completion time, continuing provider failures, and the replica-log suffix outside the observation.
+
+== Combined verification through two-run checkpoint agreement
+
+The complete runner passed on `48a98ea71` with mCRL2, AutoHyper and both Rust replay options enabled.
+It checked 78 Verus obligations and matched all 46 diagnostic controls.
+TLC completed 18 bounded baselines and found the expected counterexamples or reachability witnesses for 45 controls.
+All other recorded formal checks and native replays passed, including the seven checkpoint and recovery cases and their root-first and fail-fast mutations.
+AutoHyper returned `SAT` for the pair property and the witness that distinguishes completion order.
+It returned `UNSAT` for both weakened models and supplied two traces per counterexample.
+The input manifest SHA-256 is `6401c5caecdb02079ea455bdfa013741d97c13e1f5c089bea898412feb1dcc8b`.
