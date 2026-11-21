@@ -417,3 +417,10 @@ The audited proofs use standard Lean axioms.
 
 The result composes with a partitioner that supplies the proved ordered filters, including the precise placement of erasures.
 It does not claim that the native compaction merger already supplies that complete refinement.
+
+== Combined check of the expanded models
+
+The complete formal suite passed on `7f38bfa7e`.
+It includes the ordered bucket proof, the two-reader authorization model, 16 bounded TLC baselines with 33 failure or reachability controls, and the prior 54 Verus obligations with 26 controls.
+Its input manifest SHA-256 is `528e740c7815a74ff1cab78fe9007c5557a4996e211c1aa9c45b52e14fdfee2e`.
+The Rust source is identical to the source in the combined run at `63e162d6f`, which included compiler and native replay controls.
