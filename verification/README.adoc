@@ -165,9 +165,9 @@ It also exercises the Azure adapter against a loopback provider and separately m
   The fallback requires a newer checkpoint in a refreshed listing and has no effect on replica-log retention.
 * `tla/ReplicaTrimAdmission.tla` models shared recovery admission and trim authorization separately from physical deletion.
   `lean/ReplicaTrimAdmission.lean` proves safety for an arbitrary number of readers and finite histories.
-  Multi startup checks the directory's certified trim boundary before admitting an ordinary recovery cursor.
-  Verus checks the offset decision against the source Multi calls.
-  Durable recovery holds remain a model obligation.
+  Multi startup checks the directory's certified trim boundary and registers a hold for a nonempty catch-up window before admitting the provider cursor.
+  Verus checks both the recovery start and the cap on an authorized trim in exact production source.
+  The native concurrent-trim test checks the retained record, subscriber SQL results, and progress after releasing the hold, with a source control that discards the hold at trim selection.
 * `tla/ReplicaHoldLifecycle.tla` separates an ambiguous admission, cancellation, provider drain, and confirmed owner death.
   Its controls release during drain, substitute a timeout for death evidence, and skip the closing CAS when a delayed admission has not appeared yet.
   The reachability case permits reclamation after confirmed owner death.
