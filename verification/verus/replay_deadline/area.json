@@ -1,0 +1,20 @@
+{
+  "summary": "Replacement writers inherit the deadline of the pending command.",
+  "flags": ["--no-external-by-default", "--verify-module", "production", "--verify-module", "laws"],
+  "min_verified_functions": 2,
+  "controls": {
+    "reissue_the_deadline": {
+      "mutate": [{
+        "file": "rust/crates/multi/src/replay_deadline.rs",
+        "find": "Some(original) => original",
+        "replace": "Some(_) => proposed"
+      }],
+      "expect": [{
+        "file": "rust/crates/multi/src/replay_deadline.rs",
+        "function": "replay_cutoff",
+        "category": "postcondition not satisfied"
+      }],
+      "min_verified_functions": 1
+    }
+  }
+}

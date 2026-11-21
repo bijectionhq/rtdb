@@ -264,6 +264,8 @@ Sources include the [authentication crate](../../rust/crates/auth/README.adoc), 
 - **API11 · Cancellation isolation.** Cancel, disconnect, expiration, and close release the affected work without invalidating unrelated sessions, requests, or retained results.
 - **API12 · Authentication refresh.** Revalidation and expiration enforce the applicable rules for continuing or rejecting requests without mixing identities or sessions.
 - **API13 · Cross-deployment noninterference (Candidate).** At fixed identities, grants, bases, and statement context, authorized data observations in one deployment are invariant under unrelated work in another deployment.
+- **API14 · Bounded gateway replay.** The first replayable failure sets the pending command's cutoff, and every replacement attempt shares it until the gateway takes a reply for forwarding to the client.
+  Expiration preserves the command's unknown outcome and ends gateway recovery.
 
 ## 16. Resource accounting and operational progress
 

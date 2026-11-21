@@ -5178,6 +5178,7 @@ dependencies = [
  "rtdb-logkeeper",
  "rtdb-multi",
  "rtdb-node",
+ "rtdb-pgwire",
  "rtdb-storage",
  "rtdb-types",
  "tokio",

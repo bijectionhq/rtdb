@@ -176,7 +176,7 @@ Each open refinement obligation must connect those transitions to the Rust code 
 | S4 · Repair preserves the committed prefix | Fixed-ensemble TLC checks recovery selection and incomplete copying. | Prove the repair boundary and old-ensemble to new-ensemble handoff, including stale overwrite and failure during the copy. |
 | S5 · Readiness implies correct recovery | TLC checks writable readiness and reaches a post-restart read and write, and Lean proves the exact basis and upper bound of successful abstract checkpoint-only reads. | Show the actual readiness and query paths establish checkpoint completeness, enforce the basis, and refine those checks. |
 | S6 · A quorum represents real journals | TLC counterexamples for address reuse and early registration, plus a loopback reproduction of early registration with the Rust binary. | Reproduce address reuse against Rust and establish a durable identity and readiness contract for existing ensembles. |
-| S7 · A keyed retry has one effect | Lean proves that an atomically recorded commit retains its original outcome and has one mutation in a single unexpired key window. | Verify the gateway and the durable idempotency transaction, including key derivation, replay eligibility, and expiration. |
+| S7 · A keyed retry has one effect | Lean covers a single unexpired atomic key and preservation of the effective key under session reset and replacement. Bounded TLC checks the gateway schedule and exhibits duplicate effects with SQL-owned keys and malformed metadata. Native tests cover both cases and the mixed-version replay boundary. | Refine the durable duplicate guard, ordinal derivation for multi-transaction commands, behavior when expression-derived application keys change, and expiration. |
 | Conditional recovery liveness | Weak-fairness TLC checks for one deployment and an intact fixed-ensemble quorum. | Prove progress across the fault boundary with admissible demand, replacement compute, and the actual readiness and retry protocol. |
 
 [CheckpointTrim.lean](../lean/CheckpointTrim.lean) distinguishes a deployment's own published checkpoint from an inherited read checkpoint.
@@ -186,6 +186,11 @@ Durable pack completeness is a premise at upload, and publication checks the wri
 Applying that theorem to Logkeepers requires distinct inventory entries tied to the correct journals and a durable promise that survives restart.
 [IdempotencyWindow.lean](../lean/IdempotencyWindow.lean) checks arbitrary commit, reply, and disconnect traces for a single eligible key before expiration.
 Its commit transition installs the outcome atomically with the only mutation, which is the contract the Rust resolver and idempotency table must establish.
+[GatewayReplay.lean](../../verification/multi/lean/GatewayReplay.lean) proves effective-key preservation for a fixed application key or a private command key and ordinal.
+It also proves that any number of replacements preserve the first recovery cutoff.
+The [gateway model](../../verification/multi/tla/RTDBGatewayReplay.tla) checks a bounded single-command schedule with three weakened configurations.
+[Verus checks the production cutoff-selection step](../../verification/verus/replay_deadline/proof.rs).
+The full composition with the asynchronous gateway, SQL execution, and the durable journal remains open.
 [CheckpointReplay.lean](../lean/CheckpointReplay.lean) proves that replaying exactly the suffix above a checkpoint gives the same result as folding the whole committed prefix through the requested basis.
 It also proves that the abstract snapshot response uses the requested basis within the checkpoint's coverage.
 The production refinement must connect the packed catalog and bitemporal query state to this complete logical prefix.

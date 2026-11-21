@@ -9,7 +9,7 @@ use rtdb_sql::{AdmittedControl, BatchExecution, ContextualStatementDiagnostic, E
 use rtdb_types::{Anomaly, PgType, Result, Value};
 use tokio::io::AsyncWrite;
 use tokio_util::sync::CancellationToken;
-use crate::{GATEWAY_KEY_KIND, GATEWAY_NAMED_PARSE_KIND, GATEWAY_SESSION_STATE_TAG, GATEWAY_SETTINGS_KIND, GATEWAY_SQL_PREPARE_KIND, ServerConfig, connection::{Startup, apply_startup, display_parameter}, error::{cancelled, protocol}, server::CancellationSlot, wire::{Column, Frame, Input, Writer}};
+use crate::{GATEWAY_KEY_CONFIRM_KIND, GATEWAY_KEY_KIND, GATEWAY_NAMED_PARSE_KIND, GATEWAY_SESSION_STATE_TAG, GATEWAY_SETTINGS_KIND, GATEWAY_SQL_PREPARE_KIND, ServerConfig, connection::{Startup, apply_startup, display_parameter}, error::{cancelled, protocol}, server::CancellationSlot, wire::{Column, Frame, Input, Writer}};
 
 enum PreparedKind { Empty, Query(PreparedSql), Dml(PreparedSql), Control(PreparedControl), Keywords }
 enum PreparedControl { Batch(ControlStatement), Extended(AdmittedControl) }
@@ -132,14 +132,16 @@ impl ProtocolSession {
     fn rollback(&mut self) -> Result<()> { self.session.state_mut().rollback_tx()?; self.end_transaction(); Ok(()) }
 
     pub async fn handle<W: AsyncWrite + Unpin>(&mut self, frame: Frame, writer: &mut Writer<W>) -> Result<()> {
-        if frame.tag == GATEWAY_SESSION_STATE_TAG && let Some((&GATEWAY_KEY_KIND, key)) = frame.body.split_first() {
+        if frame.tag == GATEWAY_SESSION_STATE_TAG && let Some((&kind @ (GATEWAY_KEY_KIND | GATEWAY_KEY_CONFIRM_KIND), key)) = frame.body.split_first() {
             // Failure here ends the connection before it can execute the following command.
             if !self.startup.gateway_session_state || self.extended || self.copy.is_some() || self.ready() != b'I' {
                 return Err(protocol("A gateway key requires an idle gateway session"));
             }
             let key = std::str::from_utf8(key).ok().filter(|key| key.len() == 32 && key.bytes().all(|byte| byte.is_ascii_hexdigit()))
                 .ok_or_else(|| protocol("Invalid gateway key"))?;
-            return self.session.state_mut().set_parameter(rtdb_node::IDEMPOTENCY_KEY_PARAMETER, Some(key.to_owned()));
+            self.session.state_mut().set_gateway_key(key.to_owned())?;
+            if kind == GATEWAY_KEY_CONFIRM_KIND { writer.ready(b'I').await?; }
+            return Ok(());
         }
         if self.skip_until_sync && frame.tag != b'S' { return Ok(()); }
         if self.copy.is_some() && matches!(frame.tag, b'S' | b'H') { return Ok(()); }
@@ -1048,11 +1050,46 @@ mod tests {
 
         frontend.startup.gateway_session_state = true;
         frontend.handle(frame(key), &mut writer).await.unwrap();
-        assert_eq!(frontend.session.state().parameter(rtdb_node::IDEMPOTENCY_KEY_PARAMETER), Some(key));
         assert!(frontend.handle(frame("invalid"), &mut writer).await.is_err());
         assert!(writer.into_inner().is_empty());
         drop(frontend);
         driver.close_without_run().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn retried_writes_stay_keyed_through_session_reset_and_malformed_metadata() {
+        let (mut frontend, driver) = test_frontend().await;
+        frontend.startup.gateway_session_state = true;
+        let node = frontend.node.clone();
+        let driver = tokio::spawn(driver.run());
+        let memory = Arc::clone(node.memory());
+        let mut writer = Writer::new(Vec::new(), Arc::clone(&memory));
+        frontend.simple("INSERT INTO counters (_id, n) VALUES (1, 0), (2, 0), (3, 0)", &mut writer).await.unwrap();
+
+        for (keys, command) in [
+            ([1, 1], "DISCARD ALL; UPDATE counters SET n = n + 1 WHERE _id = 1"),
+            ([2, 2], "BEGIN READ WRITE WITH (METADATA = {idempotency_key: 123}); UPDATE counters SET n = n + 1 WHERE _id = 2; COMMIT"),
+            ([3, 4], "BEGIN READ WRITE WITH (METADATA = {idempotency_key: 'application-key'}); UPDATE counters SET n = n + 1 WHERE _id = 3; COMMIT"),
+        ] {
+            for id in keys {
+                let key = format!("{id:032x}");
+                let prelude = Frame { tag: GATEWAY_SESSION_STATE_TAG, body: [&[GATEWAY_KEY_CONFIRM_KIND], key.as_bytes()].concat(), charge: memory.reserve(0).unwrap() };
+                frontend.handle(prelude, &mut writer).await.unwrap();
+                frontend.simple(command, &mut writer).await.unwrap();
+            }
+        }
+        frontend.simple("SELECT n FROM counters ORDER BY _id", &mut writer).await.unwrap();
+        let bytes = writer.into_inner();
+        let mut reader = crate::wire::Reader::new(bytes.as_slice(), memory);
+        let mut counters = Vec::new();
+        while let Some(frame) = reader.read(1 << 20).await.unwrap() {
+            assert_ne!(frame.tag, b'E', "{}", String::from_utf8_lossy(&frame.body));
+            if frame.tag == b'D' { counters.push(frame.body[6..].to_vec()); }
+        }
+        assert_eq!(counters, [b"1".to_vec(), b"1".to_vec(), b"1".to_vec()]);
+        drop(frontend);
+        node.shutdown();
+        driver.await.unwrap().unwrap();
     }
 
     #[tokio::test]

@@ -169,6 +169,7 @@ async fn startup(process: i32, transport: &mut Option<Stream>, address: SocketAd
                 if gateway_session_state {
                     writer.gateway_await_token(None).await?;
                     writer.send(crate::GATEWAY_SESSION_STATE_TAG, &[crate::GATEWAY_KEY_KIND]).await?;
+                    writer.send(crate::GATEWAY_SESSION_STATE_TAG, &[crate::GATEWAY_KEY_CONFIRM_KIND]).await?;
                 }
                 if gateway_settings {
                     writer.gateway_settings(&[]).await?;
