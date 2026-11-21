@@ -411,6 +411,32 @@ def verify_system_time(args, scratch):
     verify_lean_model(args, scratch, path, "system-time", controls, 5)
 
 
+def verify_generation_retention(args, scratch):
+    path = Path("verification/lean/GenerationRetention.lean")
+    controls = {
+        "publish-pending-object": (
+            "dependencies generation object → state.present object ∧ ¬ state.pendingDeletion object) →",
+            "dependencies generation object → state.present object) →",
+            ["step_preserves_entitlement"],
+        ),
+        "close-drops-inflight": (
+            "state with readers := state.readers.erase generation }",
+            "state with readers := state.readers.erase generation, inflight := [] }",
+            ["closing_a_reader_preserves_its_inflight_operations"],
+        ),
+        "authorize-current-generation-only": (
+            "(∀ generation, entitled state generation → ¬ dependencies generation object) →",
+            "(¬ dependencies state.current object) →",
+            ["step_preserves_entitlement", "an_unreferenced_object_can_be_collected"],
+        ),
+        "finish-all-of-generation": (
+            "inflight := state.inflight.erase generation", "inflight := state.inflight.filter (· != generation)",
+            ["completing_one_read_preserves_all_other_references"] * 2,
+        ),
+    }
+    verify_lean_model(args, scratch, path, "generation-retention", controls, 5)
+
+
 def verify_reader_retention(args, scratch):
     path = Path("verification/lean/ReaderRetention.lean")
     controls = {
@@ -493,6 +519,7 @@ def verify_lean(args, scratch):
             verify_ceiling(args, scratch, directory)
             verify_system_time(args, scratch)
             verify_reader_retention(args, scratch)
+            verify_generation_retention(args, scratch)
             verify_compaction_projection(args, scratch, directory)
             verify_compaction_planner(args, scratch)
             verify_compaction_merge(args, scratch)

@@ -166,6 +166,9 @@ It also exercises the Azure adapter against a loopback provider and separately m
 * `tla/LeaseAdmission.tla` compares validated expiring leases and coordinated pins against age-only collection and stale-follower admission.
 * `tla/ReaderIO.tla` separates admission and in-flight I/O, with controls for clock error, expiry, overrun, release, and authority change.
   `lean/ReaderRetention.lean` proves strict lease timing and preservation of an abstract counted pin, with matching expiry and close controls.
+  `lean/GenerationRetention.lean` proves that a coordinated registry keeps every object required by the current generation, open readers, and in-flight operations available across arbitrary finite histories.
+  Each read completion releases exactly one reference, and an unreferenced object admits authorization followed by collection.
+  The model treats reference accounting and collection authorization as atomic and requires a conclusive provider completion for the deletion step.
 * `tla/CompactionGroup.tla` checks durable, complete sibling publication for one replacement.
   `tla/CompactionOverlap.tla` compares exact sibling membership with a high-water mark across two interleaved generations.
   The Rust catalog regression checks the corresponding admission behavior.

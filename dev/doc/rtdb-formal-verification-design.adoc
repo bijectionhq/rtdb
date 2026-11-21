@@ -1078,6 +1078,8 @@ Establish supported remote configurations and any eventual retry and staging cle
 |Retention
 |The bounded lease and pin designs pass their recorded finite instances.
 The weakened alternatives yield model counterexamples.
+Lean proves the coordinated generation protocol's availability invariant for arbitrary finite histories and overlapping reader and I/O references.
+It checks the independence of preserving in-flight references from the availability invariant alone.
 The native diagnostic reproduced the failure under explicit eligible collection.
 Verus proved the latest-block and shared-sibling catalog decisions.
 |Choose the user-facing policy, establish its production storage boundary, and replay the resulting protection and collection paths.

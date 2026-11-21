@@ -882,3 +882,22 @@ That run included the six interval theorems and the native cohort controls.
 Its input manifest SHA-256 is `3c3acf9ff1d60f596032f31d1ac80f4e36b3ed2d3d1508efb89928826a92643a`.
 On `d31830530`, the focused runner audited all seven interval and history theorems, rejected their five controls, and passed both native replays with all three controls.
 The selected Rust maintenance suites also passed 40 tests at that revision.
+The combined runner passed on the equivalent proof and program sources at `f58954ea5` with mCRL2, AutoHyper, and both Rust options enabled.
+It included the surrounding-history theorem and the archived native erase control.
+Its input manifest SHA-256 is `6ae698322fe3f1d27e4b0758d498df2142bc8c1f4e3535d820f55d119bdcd2ca`.
+
+== Coordinated generation retention
+
+The link:../lean/GenerationRetention.lean[Lean model] proves an availability invariant for the current generation, every open reader, and every in-flight operation.
+The invariant holds for all finite histories from a safe initial state, with arbitrary generation and object identities and overlapping dependencies.
+An object required by any protected generation is present and has no outstanding collection authorization.
+Closing a reader preserves its in-flight references, and completing one read removes exactly one reference while preserving all other counts.
+The model also admits a two-step authorization and collection program for any present object with no reference.
+
+The five audited theorems pass in the pinned Lean runner.
+The four controls admit a pending object into a published generation, drop I/O on close, authorize against only the current generation, or complete every operation for the same generation.
+The close control leaves availability over tracked references valid and fails the independent reference-preservation law.
+
+The model takes the generation's dependency relation and atomic registration and collection authorization as premises.
+Physical completion represents a provider-confirmed end to deletion, with all effects of that authorized operation settled.
+The Rust capture path, I/O lifetime, collector, and failover authority need a refinement to this protocol before the theorem applies to deployment behavior.
