@@ -93,7 +93,7 @@ The local toolchain for this study is Lean 4.36.0, Verus 0.2026.11.20.9da409b wi
 The independent comparison also uses Maude 3.5.1 and Apalache 0.63.0.
 The pinned Verus release replaces the earlier proposed source build of 31e44e6.
 The optional Rust boundary check compiles an unchanged copy and two mutated copies of the replica driver imported from the current Git commit.
-The optional native replay reads the same seeded 4,096-observation trace that the Lean evaluator checks.
+The optional native replay reads the same seeded 4,096-observation trace that the Lean evaluator checks, exercising both temporal resolvers and the unbounded visibility rectangles.
 It also compiles the unmodified and unpadded text scorer to replay the binary64 boundary witness.
 The same option runs the local checkpoint interruption and manifest-recovery tests and replays a root-first mutation of the checkpoint writer.
 It also exercises the Azure adapter against a loopback provider and separately mutates premature copy acknowledgement and cleanup on an unknown outcome.
@@ -103,6 +103,7 @@ It also exercises the Azure adapter against a loopback provider and separately m
 * `lean/History.lean` proves laws over a mathematical history and audits the axioms used.
   `lean/Trace.lean` and the Rust temporal tests read the same fixture in `traces/temporal.tsv`.
   `lean/Minimality.lean` exhibits requirements that need a distinct admission horizon, a private resolution prefix, a whole batch boundary, or intra-batch order.
+  `lean/Ceiling.lean` proves that the system-time ceiling at a valid coordinate emits the reference answer exactly once, including after ordinary out-of-range events are dropped.
 * `tla/Kernel.tla` explores a bounded protocol with one durable log and two terms and requests, plus the pinned and copied read variants.
   It assumes durable append is atomic and does not implement a consensus provider.
 * `tla/Resolution.tla` compares serialized, validated and blind optimistic resolution under the same increment program.

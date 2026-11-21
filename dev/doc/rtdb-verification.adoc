@@ -218,3 +218,23 @@ A transport or status ambiguity returns an unavailable error and keeps the priva
 A normal metadata read reports a pending destination as unavailable, so a retry can check the immutable bytes after the provider finishes.
 The provider still owns the terminal outcome.
 When it fails or cannot establish that outcome, retrying or cleaning a failed destination and finding abandoned staging blobs require separate recovery evidence.
+
+== Study 4 · A ceiling at one valid coordinate
+
+Question.
+Does the temporal ceiling produce exactly the same values as the history query at every point?
+
+Project the admitted history onto one valid coordinate and IID, retaining writes and deletes that affect it and truncating older events at an erase.
+The remaining events retain nonincreasing system time and their input order at a tie.
+Each event replaces the system upper edge for the next event at that coordinate.
+Only puts emit a value, and their system intervals have an exclusive upper edge.
+
+The Lean model proves that this fold returns precisely the point evaluator's answer for every such history.
+It also proves that dropping ordinary events at or beyond the requested system upper bound preserves answers inside the range.
+The proof treats erase separately from that optimization.
+Reordering three concrete inputs reopens the ceiling after an emission and can emit twice.
+Controls remove the ceiling update and make its upper edge inclusive.
+
+The native replay compares the same fixture with the ordinary resolver, its memory-admitted version and the unbounded visibility rectangles.
+The formal argument works with the projected ceiling for one coordinate.
+The correspondence between that projected ceiling and the complete Rust vector split, replacement, and rectangle emission remains open.

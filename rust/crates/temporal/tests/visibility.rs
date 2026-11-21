@@ -1,5 +1,6 @@
-use rtdb_temporal::{Rectangle, resolve_ordered, visibility};
-use rtdb_types::{EventHeader, EventOp, Iid, Interval, TemporalBounds, Timestamp};
+use rtdb_temporal::{HistoryResolver, Rectangle, resolve_ordered, visibility};
+use rtdb_types::{EventHeader, EventOp, Iid, Interval, MemoryBudget, TemporalBounds, Timestamp};
+use std::sync::Arc;
 
 struct Seeded(u64);
 impl Seeded {
@@ -39,6 +40,7 @@ fn the_production_resolver_agrees_with_the_reference_trace() {
     let mut events: Vec<(EventHeader, Option<i64>)> = Vec::new();
     let mut name = "";
     let mut observations = 0;
+    let memory = MemoryBudget::new(1 << 20);
     let input = std::env::var_os("RTDB_TEMPORAL_TRACE")
         .map(|path| std::fs::read_to_string(path).unwrap())
         .unwrap_or_else(|| include_str!("../../../../verification/traces/temporal.tsv").to_string());
@@ -68,11 +70,22 @@ fn the_production_resolver_agrees_with_the_reference_trace() {
                     .filter(|(event, _)| event.system_from.0 <= horizon && event.iid == iid(key))
                     .collect();
                 input.sort_by_key(|(event, _)| std::cmp::Reverse(event.system_from));
-                let sources = input.into_iter().map(|(event, value)| (event, *value));
-                let actual: Vec<_> = resolve_ordered(sources, bounds, false).unwrap().into_iter()
+                let sources = || input.iter().map(|(event, value)| (event, *value));
+                let expected: Vec<_> = (*expected != "none").then(|| number(expected)).into_iter().collect();
+                let actual: Vec<_> = resolve_ordered(sources(), bounds, false).unwrap().into_iter()
                     .map(|row| row.source.expect("the resolver emitted a put")).collect();
-                let expected = (*expected != "none").then(|| number(expected));
-                assert_eq!(actual, expected.into_iter().collect::<Vec<_>>(), "{name}: {line}");
+                assert_eq!(actual, expected, "ordinary ceiling, {name}: {line}");
+                let mut admitted = HistoryResolver::new_in(bounds, false, Arc::clone(&memory));
+                let mut actual = Vec::new();
+                for (event, value) in sources() {
+                    let rows = admitted.resolve_in(event, value, &memory).unwrap();
+                    actual.extend(rows.as_slice().iter().map(|row| row.source.expect("the resolver emitted a put")));
+                }
+                assert_eq!(actual, expected, "admitted ceiling, {name}: {line}");
+                let actual: Vec<_> = visibility(sources()).unwrap().into_iter()
+                    .filter(|(_, rectangle)| rectangle.meets(bounds))
+                    .map(|(value, _)| value.expect("the resolver emitted a put")).collect();
+                assert_eq!(actual, expected, "unbounded rectangles, {name}: {line}");
                 observations += 1;
             }
             _ => panic!("{name}: malformed trace row {line}"),

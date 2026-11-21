@@ -139,6 +139,48 @@ def verify_rank_bound(args, scratch):
     print("rank-ieee-witness: checked exact reversal and padded bound")
 
 
+def lean_error_theorems(source, relative, output):
+    source_lines = source.read_text().splitlines()
+    errors = re.findall(rf"^{re.escape(str(relative))}:(\d+):\d+: error", output, re.M)
+    return sorted(
+        re.findall(r"^theorem (\w+)", "\n".join(source_lines[:int(line)]), re.M)[-1]
+        for line in errors
+    )
+
+
+def verify_ceiling(args, scratch, history):
+    path = Path("verification/lean/Ceiling.lean")
+    controls = {
+        "baseline": None,
+        "closed-upper": (
+            "  | some upper => decide (system < upper)", "  | some upper => decide (system ≤ upper)",
+            ["emitted_below_closed_ceiling"],
+        ),
+        "unchanged-ceiling": (
+            "let later := emit system (some head.1) tail", "let later := emit system ceiling tail",
+            ["emission_refines_latest", "emission_refines_latest", "emitted_below_closed_ceiling"],
+        ),
+    }
+    env = os.environ | {"LEAN_PATH": str(history)}
+    allowed = {"propext", "Classical.choice", "Quot.sound"}
+    for name, mutation in controls.items():
+        case = f"lean-ceiling-{name}"
+        directory = scratch / case
+        source = clone_file(path, directory)
+        if mutation:
+            replace_once(source, mutation[0], mutation[1])
+        result = run_case([args.lean, str(path)], directory, args.evidence, case, env)
+        if mutation:
+            observed = lean_error_theorems(source, path, result.stdout)
+            if not result.returncode or observed != mutation[2]:
+                raise ValueError(f"{case}: expected {mutation[2]}, observed {observed}")
+        else:
+            audited = re.findall(r"depends on axioms: \[([^\]]*)\]", result.stdout)
+            if result.returncode or len(audited) != 2 or any(set(axioms.split(", ")) - allowed for axioms in audited):
+                raise ValueError("Lean ceiling proof or axiom audit failed")
+        print(f"{case}: {'negative control rejected' if mutation else 'proved'}")
+
+
 def verify_lean(args, scratch):
     path = Path("verification/lean/History.lean")
     controls = {
@@ -174,12 +216,7 @@ def verify_lean(args, scratch):
         unsupported = re.findall(r"depends on axioms: \[([^\]]*)\]", result.stdout)
         allowed = {"propext", "Classical.choice", "Quot.sound"}
         if mutation:
-            source_lines = source.read_text().splitlines()
-            errors = re.findall(r"^verification/lean/History\.lean:(\d+):\d+: error", result.stdout, re.M)
-            observed = sorted(
-                re.findall(r"^theorem (\w+)", "\n".join(source_lines[:int(line)]), re.M)[-1]
-                for line in errors
-            )
+            observed = lean_error_theorems(source, path, result.stdout)
             if not result.returncode or observed != mutation[2]:
                 raise ValueError(f"{case}: expected {mutation[2]}, observed {observed}")
         elif result.returncode or not unsupported or any(
@@ -189,6 +226,7 @@ def verify_lean(args, scratch):
         print(f"{case}: {'negative control rejected' if mutation else 'proved'}")
         if not mutation:
             env = os.environ | {"LEAN_PATH": str(directory)}
+            verify_ceiling(args, scratch, directory)
             independence = Path("verification/lean/Minimality.lean")
             clone_file(independence, directory)
             checked = run_case(
@@ -526,7 +564,7 @@ def replay_rust_trace(args):
     )
     if log.returncode or "1 passed; 0 failed" not in log.stdout:
         raise ValueError("Production resolver rejected the generated temporal trace")
-    print("rust-generated-trace: production resolver agrees on all 4096 observations")
+    print("rust-generated-trace: both production resolvers and visibility agree on all 4096 observations")
 
 
 def replay_rank_witness(args, scratch):
