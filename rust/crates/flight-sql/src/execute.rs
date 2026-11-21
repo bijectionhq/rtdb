@@ -22,7 +22,7 @@ impl Service {
             return Ok(Shape { schema: control_schema(control.statement()).map_err(status)?.as_ref().map(|schema| wire::plan_schema(schema, self.memory())).transpose()?, parameters: 0 });
         }
         let context = native.prepare_context(&token).await.map_err(status)?;
-        let prepared = PreparedSql::prepare(source, &context, options, ResultSignaturePolicy::Dynamic)
+        let prepared = native.prepare_sql(source, &context, options, ResultSignaturePolicy::Dynamic)
             .map_err(status)?;
         let schema = if prepared.is_dml() { None } else {
             Some(self.parameterized_schema(&prepared, &context, params)?)
@@ -57,7 +57,7 @@ impl Service {
             return execute_control_update(native, control.statement(), arguments.as_ref(), &token).await;
         }
         let context = native.prepare_context(&token).await.map_err(status)?;
-        let prepared = PreparedSql::prepare(source, &context, options, ResultSignaturePolicy::Dynamic)
+        let prepared = native.prepare_sql(source, &context, options, ResultSignaturePolicy::Dynamic)
             .map_err(status)?;
         execute_prepared_update(native, &prepared, arguments).await
     }
@@ -86,7 +86,7 @@ impl Service {
         } else {
             let prepared = {
                 let context = native.prepare_context(&token).await.map_err(status)?;
-                PreparedSql::prepare(source, &context, options.clone(), ResultSignaturePolicy::Dynamic)
+                native.prepare_sql(source, &context, options.clone(), ResultSignaturePolicy::Dynamic)
                     .map_err(status)?
             };
             if prepared.is_dml() {
@@ -98,7 +98,7 @@ impl Service {
             drop(prepared);
             let basis = native.state_mut().read_basis().await.map_err(status)?;
             let context = native.query_context_at(&basis, &token).await.map_err(status)?;
-            let prepared = PreparedSql::prepare(source, &context, options, ResultSignaturePolicy::Dynamic).map_err(status)?;
+            let prepared = native.prepare_sql(source, &context, options, ResultSignaturePolicy::Dynamic).map_err(status)?;
             let schema = self.parameterized_schema(&prepared, &context, params.as_ref())?;
             (basis, schema)
         };
@@ -125,7 +125,7 @@ impl Service {
                 }
             } else {
                 let context = native.query_context_at(&basis.read()?, &token).await.map_err(status)?;
-                let prepared = PreparedSql::prepare(&sql, &context, options, ResultSignaturePolicy::Dynamic).map_err(status)?;
+                let prepared = native.prepare_sql(&sql, &context, options, ResultSignaturePolicy::Dynamic).map_err(status)?;
                 if prepared.is_dml() { return Err(invalid("ticket query cannot execute an update")); }
                 let row = match &arguments { None => &[][..], Some(arguments) => arguments.rows().next().ok_or_else(|| invalid("Query parameter batch has no rows"))? };
                 let bound = row.iter().try_fold(wire::add(1024, wire::mul(row.len(), std::mem::size_of::<rtdb_types::Value>())?)?, |bytes, value| wire::add(bytes, value.retained_bytes().map_err(status)?))?;

@@ -202,7 +202,7 @@ impl ProtocolSession {
             let _rewrite_syntax = admit_rewrite_syntax(original.len(), source.len(), &context.memory)?;
             let syntax = rtdb_sql::parse_syntax_in(source, &context.memory)
                 .map_err(|error| extended_syntax_error(source, original, error, &context.memory))?;
-            sql_shape(PreparedSql::prepare_postgres_syntax(syntax, &context, options.search_path, &oids)?, oids.len())
+            sql_shape(self.node.prepare_postgres_syntax(syntax, &context, options.search_path, &oids)?, oids.len())
         };
         self.retain_prepared(source, oids, shape)
     }
@@ -215,7 +215,7 @@ impl ProtocolSession {
             ExecutableSyntax::Control(control) => self.execute_columns(control_shape(PreparedControl::Batch(control.bind(&options)?), 0)?),
             ExecutableSyntax::Sql(syntax) => {
                 let context = self.session.prepare_context(&self.token()).await?;
-                sql_shape(PreparedSql::prepare_postgres_statement(syntax, &context, options.search_path, &[])?, 0)
+                sql_shape(self.node.prepare_postgres_statement(syntax, &context, options.search_path)?, 0)
             }
         };
         drop(allocation);

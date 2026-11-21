@@ -104,7 +104,7 @@ impl StatementHandle {
                 Source::Sql { text, prepared, .. } => {
                     if text.is_empty() { return Err(Anomaly::incorrect("xtdb.adbc/no-sql", "SQL query not set")); }
                     let context = session.prepare_context_for(&self.creation_database, token).await?;
-                    *prepared = Some(PreparedSql::prepare(text, &context, Default::default(), ResultSignaturePolicy::Dynamic)?);
+                    *prepared = Some(session.prepare_sql(text, &context, Default::default(), ResultSignaturePolicy::Dynamic)?);
                 }
                 Source::Show { prepared, .. } => { session.state().revalidate().await?; *prepared = true; }
                 Source::Set(_) => { session.state().revalidate().await?; }
@@ -160,7 +160,7 @@ impl StatementHandle {
                     if prepared.is_none() {
                         if args.is_some() { return Err(Anomaly::incorrect("xtdb.adbc/bind-without-prepare", "Call prepare before executing with bound arguments")); }
                         let context = session.prepare_context_for(&self.creation_database, token).await?;
-                        *prepared = Some(PreparedSql::prepare(text, &context, Default::default(), ResultSignaturePolicy::Dynamic)?);
+                        *prepared = Some(session.prepare_sql(text, &context, Default::default(), ResultSignaturePolicy::Dynamic)?);
                     }
                     let context = session.query_context_for(&self.creation_database, token).await?;
                     let values = argument_row(args, self.session.region.memory())?;
@@ -191,7 +191,7 @@ impl StatementHandle {
                     if text.is_empty() { return Err(Anomaly::incorrect("xtdb.adbc/no-sql", "SQL query not set")); }
                     if prepared.is_none() {
                         let context = session.prepare_context_for(&self.creation_database, token).await?;
-                        *prepared = Some(PreparedSql::prepare(text, &context, Default::default(), ResultSignaturePolicy::Dynamic)?);
+                        *prepared = Some(session.prepare_sql(text, &context, Default::default(), ResultSignaturePolicy::Dynamic)?);
                     }
                     let operation = prepared.as_ref().ok_or_else(not_prepared)?.dml_operation(state.bound.as_ref().map(|bound| bound.arguments.clone()))?;
                     token.run_until_cancelled(session.state_mut().execute_operation(operation)).await.ok_or_else(super::cancelled)??;

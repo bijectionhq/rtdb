@@ -11,14 +11,14 @@ use rtdb_maintenance::CollectionObserver;
 use rtdb_plan::{CatalogMetrics, CatalogUsers};
 use rtdb_query::{CatalogSnapshot, DatabaseSnapshot, PreparedQuery, QueryContext, QueryCursor};
 use rtdb_storage::cache::CacheBudget;
-use rtdb_tx::{RetainedAnomaly, SubmitOptions, SubmittedTx, TransactionAuthorization, TransactionResult, TxOp, prepare_submission_with_sql_options};
+use rtdb_tx::{RetainedAnomaly, StaticMutationCache, SubmitOptions, SubmittedTx, TransactionAuthorization, TransactionResult, TxOp, prepare_submission_with_cache};
 use rtdb_types::{Anomaly, AnomalyCategory, LogicalType, Result, SourcePosition, TimeBasis, TimeUnit, Timestamp, TransactionKey, TxBasis, TxId, Value};
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 
-use crate::{Clock, Database, DatabaseAccess, DatabaseCatalog, ExternalSources, Membership, NativeResources, NodeOptions, QueryBasis, ResourceFactory, Session, SessionIdentity, SessionService, SystemClock,
-    catalog::CatalogCommand, database::{DatabaseDriver, DatabaseFactory}, statement::prepare_query};
+use crate::{Clock, Database, DatabaseAccess, DatabaseCatalog, ExternalSources, Membership, NativeResources, NodeOptions, PreparedSql, QueryBasis, ResourceFactory, ResultSignaturePolicy, Session, SessionIdentity, SessionService, SystemClock,
+    catalog::CatalogCommand, database::{DatabaseDriver, DatabaseFactory}, statement::{QueryPlanCache, prepare_query}};
 
 
 #[derive(Clone)]
@@ -60,6 +60,8 @@ pub struct Node {
     commands: mpsc::Sender<CatalogCommand>,
     cancellation: CancellationToken,
     pub(crate) runtime: Arc<crate::runtime::RuntimeProviders>,
+    query_plans: Arc<QueryPlanCache>,
+    static_mutations: Arc<StaticMutationCache>,
 }
 
 pub struct NodeDriver {
@@ -114,12 +116,14 @@ impl Node {
         options.default_timezone = rtdb_expr::normalize_timezone(&options.default_timezone)?;
         let catalog = DatabaseCatalog::new(options.membership.clone());
         let runtime = Arc::new(crate::runtime::RuntimeProviders { users: services.catalog_users, metrics: services.catalog_metrics });
+        let query_plans = Arc::new(QueryPlanCache::new(&memory));
+        let static_mutations = Arc::new(StaticMutationCache::new(&memory));
         let factory = Arc::new(DatabaseFactory { memory, cache: CacheBudget::new(options.cache_bytes),
             resources: services.resources, authorization: services.transaction_authorization, observer: services.collection_observer, execution_observer: services.execution_observer, tracer: services.tracer,
             external_sources: services.external_sources, clock: services.clock, artefact_kinds: services.artefact_kinds,
             accelerators: Arc::from(if options.scan_acceleration { services.scan_accelerators } else { Vec::new() }), options });
         let (commands, receiver) = mpsc::channel(factory.options.command_capacity);
-        let node = Self { catalog, factory, commands, cancellation: CancellationToken::new(), runtime };
+        let node = Self { catalog, factory, commands, cancellation: CancellationToken::new(), runtime, query_plans, static_mutations };
         let mut initial = Vec::new();
         match node.factory.options.membership.clone() {
             Membership::Durable { primary, skipped } => {
@@ -149,6 +153,12 @@ impl Node {
     }
     pub fn catalog(&self) -> &Arc<DatabaseCatalog> { &self.catalog }
     pub fn memory(&self) -> &Arc<MemoryBudget> { &self.factory.memory }
+    pub fn prepare_postgres_syntax(&self, syntax: rtdb_sql::StatementSyntaxBatch<'_>, context: &Arc<QueryContext>, search_path: Vec<String>, parameter_oids: &[i32]) -> Result<PreparedSql> {
+        PreparedSql::prepare_postgres_syntax_with_cache(syntax, context, search_path, parameter_oids, Some(&self.query_plans))
+    }
+    pub fn prepare_postgres_statement(&self, syntax: rtdb_sql::DeferredStatementSyntax<'_>, context: &Arc<QueryContext>, search_path: Vec<String>) -> Result<PreparedSql> {
+        PreparedSql::prepare_postgres_statement_with_cache(syntax, context, search_path, &[], Some(&self.query_plans))
+    }
     /// The budget a query or a result stream reserves from, as the node's query options shape it.
     pub fn query_memory(&self) -> Arc<MemoryBudget> { self.factory.options.query.query_memory(&self.factory.memory) }
     pub fn cache_budget(&self) -> &Arc<CacheBudget> { &self.factory.cache }
@@ -269,7 +279,7 @@ impl Node {
         options.user = identity.user().map(str::to_owned);
         options.default_tz = rtdb_expr::normalize_timezone(&options.default_tz)?;
         let sql_options = rtdb_sql::PrepareOptions { generate_series_end_exclusive: self.factory.options.query.generate_series_end_exclusive, ..Default::default() };
-        let source = prepare_submission_with_sql_options(operations, options, database.name(), &self.factory.memory, &sql_options)?;
+        let source = prepare_submission_with_cache(operations, options, database.name(), &self.factory.memory, &sql_options, &self.static_mutations)?;
         let payload = source.encode()?.into_bytes();
         let position = cancellation.run_until_cancelled(database.replication.submit_source_encoded(payload, self.now())).await.ok_or_else(cancelled)??;
         Ok(SubmittedTx { tx_id: TxId(position.0) })
@@ -434,10 +444,13 @@ impl NativeSession {
         let basis = self.state.read_basis().await?;
         Ok(self.service.node.query_context(self.state.database(), &basis, self.service.identity.as_ref(), self.state.cancellation()).await?.with_observer(self.service.execution_observer()).with_tracer(self.service.node.tracer(), None))
     }
+    pub fn prepare_sql(&self, source: &str, context: &Arc<QueryContext>, options: rtdb_sql::PrepareOptions, policy: ResultSignaturePolicy) -> Result<PreparedSql> {
+        PreparedSql::prepare_with_cache(source, context, options, policy, Some(&self.service.node.query_plans))
+    }
     pub async fn query_sql(&mut self, sql: &str, arguments: Vec<Value>) -> Result<QueryCursor> {
         let context = self.query_context().await?;
         let options = rtdb_sql::PrepareOptions { parameter_types: arguments.iter().enumerate().map(|(index, value)| (index, rtdb_columnar::execution_type(&value.logical_type()))).collect(), default_timezone: context.timezone.clone(), generate_series_end_exclusive: context.options.generate_series_end_exclusive, ..Default::default() };
-        prepare_query(sql, &context, &options)?.execute(context, arguments).await
+        self.service.node.query_plans.prepare(sql, &context, &options)?.execute(context, arguments).await
     }
     pub async fn query_xtql(&mut self, source: &str, arguments: Vec<Value>) -> Result<QueryCursor> {
         let context = self.query_context().await?;

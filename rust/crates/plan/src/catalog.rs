@@ -221,6 +221,37 @@ enum Lookup {
 #[derive(Clone, Debug, PartialEq)]
 pub struct CatalogLookups(Vec<Lookup>);
 impl CatalogLookups {
+    pub fn retained_bytes(&self) -> Result<usize> {
+        let overflow = || Anomaly::incorrect("rtdb.plan/catalog-size", "Catalog lookup storage exceeds addressable memory");
+        let mut bytes = self.0.capacity().checked_mul(std::mem::size_of::<Lookup>()).ok_or_else(overflow)?;
+        let mut add = |size| -> Result<()> { bytes = bytes.checked_add(size).ok_or_else(overflow)?; Ok(()) };
+        let name_bytes = |name: &QualifiedTable| name.database.capacity().saturating_add(name.table.schema.capacity()).saturating_add(name.table.table.capacity());
+        let table_bytes = |table: &TableBinding| -> Result<usize> {
+            let mut size = name_bytes(&table.name);
+            for (name, ty) in &table.columns {
+                size = size.checked_add(name.capacity()).and_then(|n| n.checked_add(256)).and_then(|n| n.checked_add(ty.retained_bytes().ok()?)).ok_or_else(overflow)?;
+            }
+            Ok(size)
+        };
+        for lookup in &self.0 {
+            match lookup {
+                Lookup::DefaultDatabase(database) => add(database.capacity())?,
+                Lookup::Databases(databases) => for database in databases { add(database.capacity().saturating_add(128))?; },
+                Lookup::Table(name, table) => {
+                    add(name_bytes(name))?;
+                    if let Some(table) = table { add(table_bytes(table)?)?; }
+                }
+                Lookup::Tables(database, tables) => {
+                    add(database.capacity())?;
+                    add(tables.capacity().checked_mul(std::mem::size_of::<TableBinding>()).ok_or_else(overflow)?)?;
+                    for table in tables { add(table_bytes(table)?)?; }
+                }
+                Lookup::TransactionScoped(_) => {}
+            }
+        }
+        Ok(bytes)
+    }
+
     pub fn replay(&self, catalog: &dyn Catalog) -> Result<bool> {
         for lookup in &self.0 {
             let same = match lookup {

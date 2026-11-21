@@ -43,7 +43,7 @@ pub use accelerate::{CandidateVerifier, ConstantEvaluator, CorpusRegistry, Corpu
 pub use context::{CatalogSnapshot, DatabaseSnapshot, QueryContext, QueryOptions};
 pub use cursor::{PreparedQuery, QueryCursor};
 pub use settings::unindexed_tx;
-pub use runtime_schema::RuntimeSchema;
+pub use runtime_schema::{RuntimeSchema, plan_allocation_bound};
 
 fn invalid(code: &str, message: impl std::fmt::Display) -> rtdb_types::Anomaly {
     rtdb_types::Anomaly::incorrect(format!("rtdb.query/{code}"), message.to_string())

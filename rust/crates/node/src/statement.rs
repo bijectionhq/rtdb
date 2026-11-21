@@ -1,7 +1,8 @@
-use std::sync::Arc;
+use std::{collections::{BTreeMap, VecDeque}, sync::Arc};
 
+use parking_lot::Mutex;
 use rtdb_columnar::MemoryReservation;
-use rtdb_plan::{CatalogLookups, ColumnId, Field, RecordingCatalog, Schema, SqlNotice};
+use rtdb_plan::{Catalog, CatalogLookups, ColumnId, Field, PreparedStatement, RecordingCatalog, Schema, SqlNotice, Statement};
 use rtdb_query::{PreparedQuery, QueryContext, QueryCursor, RuntimeSchema};
 use rtdb_sql::{DeferredStatementSyntax, ParsedStatement, PrepareOptions, StatementKind, StatementSyntaxBatch};
 use rtdb_tx::{SqlArguments, TxOp};
@@ -25,7 +26,7 @@ enum PreparedResult { Query { schema: Schema, pg_types: Vec<PgType> }, Dml }
 /// An immutable SQL preparation; each query execution binds against its supplied snapshot.
 /// Session access checks and read-basis capture precede this API and remain the caller's obligation.
 #[derive(Clone)]
-pub struct PreparedSql(Arc<PreparedData>);
+pub struct PreparedSql(Arc<PreparedData>, Option<Arc<QueryPlanCache>>);
 
 /// Binding and planning recurse as deep as the statement's expressions nest, which only long source can reach,
 /// so a long statement is prepared on a stack of its own rather than overflowing the caller's.
@@ -35,7 +36,11 @@ fn deep<T>(source: &str, prepare: impl FnOnce() -> T) -> T {
 }
 
 impl PreparedSql {
-    pub fn prepare(source: &str, context: &Arc<QueryContext>, mut options: PrepareOptions, policy: ResultSignaturePolicy) -> Result<Self> {
+    pub fn prepare(source: &str, context: &Arc<QueryContext>, options: PrepareOptions, policy: ResultSignaturePolicy) -> Result<Self> {
+        Self::prepare_with_cache(source, context, options, policy, None)
+    }
+
+    pub(crate) fn prepare_with_cache(source: &str, context: &Arc<QueryContext>, mut options: PrepareOptions, policy: ResultSignaturePolicy, cache: Option<&Arc<QueryPlanCache>>) -> Result<Self> {
         let source_reservation = admit_source(source, context, &mut options)?;
         let syntax = admit_sql_syntax(source, &context.memory)?;
         let parsed = match one_statement(source, &context.memory) {
@@ -45,7 +50,7 @@ impl PreparedSql {
                 return Err(statement_syntax_error(source, error, &context.memory));
             }
         };
-        deep(source, || Self::prepare_parsed(parsed, context, options, policy, false, false, source_reservation))
+        deep(source, || Self::prepare_parsed(parsed, context, options, policy, false, false, source_reservation, cache))
     }
 
     pub fn prepare_postgres(source: &str, context: &Arc<QueryContext>, search_path: Vec<String>, parameter_oids: &[i32]) -> Result<Self> {
@@ -59,27 +64,39 @@ impl PreparedSql {
     pub fn prepare_postgres_syntax(
         syntax: StatementSyntaxBatch<'_>, context: &Arc<QueryContext>, search_path: Vec<String>, parameter_oids: &[i32],
     ) -> Result<Self> {
+        Self::prepare_postgres_syntax_with_cache(syntax, context, search_path, parameter_oids, None)
+    }
+
+    pub(crate) fn prepare_postgres_syntax_with_cache(
+        syntax: StatementSyntaxBatch<'_>, context: &Arc<QueryContext>, search_path: Vec<String>, parameter_oids: &[i32], cache: Option<&Arc<QueryPlanCache>>,
+    ) -> Result<Self> {
         let parsed = exactly_one_statement(syntax.resolve_in(&context.memory)?)?;
-        Self::prepare_postgres_parsed(parsed, context, search_path, parameter_oids)
+        Self::prepare_postgres_parsed(parsed, context, search_path, parameter_oids, cache)
     }
 
     /// Resolves and prepares the selected statement in the reached query context.
     pub fn prepare_postgres_statement(syntax: DeferredStatementSyntax<'_>, context: &Arc<QueryContext>, search_path: Vec<String>, parameter_oids: &[i32]) -> Result<Self> {
+        Self::prepare_postgres_statement_with_cache(syntax, context, search_path, parameter_oids, None)
+    }
+
+    pub(crate) fn prepare_postgres_statement_with_cache(
+        syntax: DeferredStatementSyntax<'_>, context: &Arc<QueryContext>, search_path: Vec<String>, parameter_oids: &[i32], cache: Option<&Arc<QueryPlanCache>>,
+    ) -> Result<Self> {
         let parsed = syntax.resolve_in(&context.memory)?;
-        Self::prepare_postgres_parsed(parsed, context, search_path, parameter_oids)
+        Self::prepare_postgres_parsed(parsed, context, search_path, parameter_oids, cache)
     }
 
-    fn prepare_postgres_parsed(parsed: ParsedStatement<'_>, context: &Arc<QueryContext>, search_path: Vec<String>, parameter_oids: &[i32]) -> Result<Self> {
+    fn prepare_postgres_parsed(parsed: ParsedStatement<'_>, context: &Arc<QueryContext>, search_path: Vec<String>, parameter_oids: &[i32], cache: Option<&Arc<QueryPlanCache>>) -> Result<Self> {
         let source = parsed.source();
-        deep(source, || Self::prepare_postgres_parsed_at(parsed, context, search_path, parameter_oids))
+        deep(source, || Self::prepare_postgres_parsed_at(parsed, context, search_path, parameter_oids, cache))
     }
 
-    fn prepare_postgres_parsed_at(parsed: ParsedStatement<'_>, context: &Arc<QueryContext>, search_path: Vec<String>, parameter_oids: &[i32]) -> Result<Self> {
+    fn prepare_postgres_parsed_at(parsed: ParsedStatement<'_>, context: &Arc<QueryContext>, search_path: Vec<String>, parameter_oids: &[i32], cache: Option<&Arc<QueryPlanCache>>) -> Result<Self> {
         let source = parsed.source();
         if parsed.kind() == StatementKind::Dml {
             let mut options = PrepareOptions { search_path, ..Default::default() };
             let source_reservation = admit_source(source, context, &mut options)?;
-            return Self::prepare_parsed(parsed, context, options, ResultSignaturePolicy::PostgreSql, false, parameter_oids.is_empty(), source_reservation);
+            return Self::prepare_parsed(parsed, context, options, ResultSignaturePolicy::PostgreSql, false, parameter_oids.is_empty(), source_reservation, cache);
         }
         let count = parsed.parameter_count();
         let _parameters = context.memory.reserve(count.checked_mul(1024).and_then(|n| n.checked_add(1024)).ok_or_else(size_error)?)?;
@@ -92,12 +109,12 @@ impl PreparedSql {
             }
         }
         let source_reservation = admit_source(source, context, &mut options)?;
-        Self::prepare_parsed(parsed, context, options, ResultSignaturePolicy::PostgreSql, dynamic, parameter_oids.is_empty(), source_reservation)
+        Self::prepare_parsed(parsed, context, options, ResultSignaturePolicy::PostgreSql, dynamic, parameter_oids.is_empty(), source_reservation, cache)
     }
 
     fn prepare_parsed(
         parsed: ParsedStatement<'_>, context: &Arc<QueryContext>, options: PrepareOptions, policy: ResultSignaturePolicy,
-        dynamic_pg: bool, dml_notices: bool, source_reservation: Arc<MemoryReservation>,
+        dynamic_pg: bool, dml_notices: bool, source_reservation: Arc<MemoryReservation>, cache: Option<&Arc<QueryPlanCache>>,
     ) -> Result<Self> {
         let source = parsed.source();
         let count = parsed.parameter_count();
@@ -112,12 +129,16 @@ impl PreparedSql {
                 PreparedResult::Dml
             }
             StatementKind::Query => {
-                let prepared = parsed.bind(&context.catalog, &options)?;
-                for (index, ty) in &prepared.parameter_types {
+                let bind = |catalog: &dyn Catalog| parsed.bind(catalog, &options);
+                let bound = match cache {
+                    Some(cache) => cache.bind(source, context, &options, bind)?,
+                    None => Arc::new(BoundQuery::new(bind(&context.catalog)?, &context.memory)?),
+                };
+                for (index, ty) in &bound.parameter_types {
                     if !options.parameter_types.contains_key(index) { parameters[*index] = ty.clone(); }
                 }
-                notices = prepared.notices.clone();
-                let query = PreparedQuery::from_prepared(prepared, &context.memory)?;
+                notices.clone_from(&bound.notices);
+                let query = &bound.query;
                 let schema = if policy == ResultSignaturePolicy::PostgreSql && !dynamic_pg {
                     query.result_schema(context)?.schema().clone()
                 } else {
@@ -132,7 +153,7 @@ impl PreparedSql {
         let bytes = retained_bytes(&source, &options, &parameters, &notices, &result)?;
         let reservation = context.memory.reserve(bytes)?;
         drop(source_reservation);
-        Ok(Self(Arc::new(PreparedData { source, options, parameters, notices, result, policy, _reservation: reservation, plan: Default::default() })))
+        Ok(Self(Arc::new(PreparedData { source, options, parameters, notices, result, policy, _reservation: reservation, plan: Default::default() }), cache.cloned()))
     }
 
     pub fn source(&self) -> &str { &self.0.source }
@@ -191,12 +212,12 @@ impl PreparedSql {
         options.default_timezone = context.timezone.clone();
         if execution { for ty in options.parameter_types.values_mut() { *ty = rtdb_columnar::execution_type(ty); } }
         for (index, ty) in argument_types.iter().enumerate() { options.parameter_types.entry(index).or_insert_with(|| if execution { rtdb_columnar::execution_type(ty) } else { ty.clone() }); }
+        if let Some(cache) = &self.1 { return cache.prepare(&self.0.source, context, &options); }
         let cached = self.0.plan.lock().ok().and_then(|plan| plan.as_ref().filter(|plan| plan.options == options).map(|plan| (plan.lookups.clone(), plan.query.clone())));
         if let Some((lookups, query)) = cached && lookups.replay(&context.catalog)? { return query.recharged(&context.memory); }
         let recording = RecordingCatalog::new(&context.catalog);
         let _syntax = admit_sql_syntax(&self.0.source, &context.memory)?;
         let query = PreparedQuery::from_prepared(rtdb_sql::prepare_in(&self.0.source, &recording, &options, &context.memory)?, &context.memory)?;
-        // A plan's allocations stay charged to the budget it was planned in, so the kept copy is planned in the statement's own.
         if let Some(lookups) = recording.finish() {
             let budget = self.0._reservation.budget();
             let kept = rtdb_sql::prepare_in(&self.0.source, &context.catalog, &options, budget).and_then(|prepared| PreparedQuery::from_prepared(prepared, budget));
@@ -221,6 +242,107 @@ impl PreparedSql {
 /// The last plan a statement bound, and what its planning read from the catalog: a snapshot that answers those
 /// lookups the same plans the statement the same way, so it reuses the plan.
 struct CachedPlan { options: PrepareOptions, lookups: Arc<CatalogLookups>, query: PreparedQuery }
+
+pub(crate) struct QueryPlanCache {
+    memory: Arc<MemoryBudget>,
+    entries: Mutex<VecDeque<Arc<SharedQueryPlan>>>,
+}
+
+struct SharedQueryPlan {
+    source: String,
+    options: PrepareOptions,
+    lookups: CatalogLookups,
+    bound: Arc<BoundQuery>,
+}
+
+struct BoundQuery {
+    query: PreparedQuery,
+    parameter_types: BTreeMap<usize, LogicalType>,
+    notices: Vec<SqlNotice>,
+    _cache_reservation: Option<Arc<MemoryReservation>>,
+}
+
+impl BoundQuery {
+    fn new(mut prepared: PreparedStatement, memory: &Arc<MemoryBudget>) -> Result<Self> {
+        let parameter_types = prepared.parameter_types.clone();
+        let notices = std::mem::take(&mut prepared.notices);
+        let query = PreparedQuery::from_prepared(prepared, memory)?;
+        Ok(Self { query, parameter_types, notices, _cache_reservation: None })
+    }
+
+    fn charge_cache_metadata(mut self, memory: &Arc<MemoryBudget>, key_bytes: usize) -> Result<Self> {
+        let mut bytes = key_bytes;
+        for ty in self.parameter_types.values() {
+            bytes = bytes.checked_add(ty.retained_bytes()?).and_then(|n| n.checked_add(256)).ok_or_else(size_error)?;
+        }
+        for notice in &self.notices {
+            bytes = bytes.checked_add(notice.message.len()).and_then(|n| n.checked_add(64)).ok_or_else(size_error)?;
+        }
+        self._cache_reservation = Some(memory.reserve(bytes)?);
+        Ok(self)
+    }
+}
+
+impl QueryPlanCache {
+    const ENTRIES: usize = 128;
+    const ENTRY_BYTES: usize = 512 << 10;
+
+    pub(crate) fn new(memory: &Arc<MemoryBudget>) -> Self {
+        Self { memory: memory.scope_with_limit((memory.limit_bytes() / 64).min(16 << 20)), entries: Mutex::new(VecDeque::new()) }
+    }
+
+    pub(crate) fn prepare(&self, source: &str, context: &QueryContext, options: &PrepareOptions) -> Result<PreparedQuery> {
+        let mut syntax = None;
+        let bound = self.bind(source, context, options, |catalog| {
+            syntax = Some(admit_sql_syntax(source, &context.memory)?);
+            rtdb_sql::prepare_in(source, catalog, options, &context.memory)
+        })?;
+        drop(syntax);
+        Ok(bound.query.clone())
+    }
+
+    fn bind(&self, source: &str, context: &QueryContext, options: &PrepareOptions, prepare: impl FnOnce(&dyn Catalog) -> Result<PreparedStatement>) -> Result<Arc<BoundQuery>> {
+        context.check_cancelled()?;
+        let cached = {
+            let mut entries = self.entries.lock();
+            let index = entries.iter().position(|entry| entry.source == source && entry.options == *options);
+            index.and_then(|index| entries.remove(index)).map(|entry| { entries.push_back(Arc::clone(&entry)); entry })
+        };
+        if let Some(cached) = cached && cached.lookups.replay(&context.catalog)? { return Ok(Arc::clone(&cached.bound)); }
+        let recording = RecordingCatalog::new(&context.catalog);
+        let prepared = prepare(&recording)?;
+        let cacheable = matches!(&prepared.statement, Statement::Query(_));
+        let bound = BoundQuery::new(prepared, &context.memory)?;
+        if cacheable && let Some(lookups) = recording.finish() {
+            self.remember(source, options, &context.catalog, lookups);
+        }
+        Ok(Arc::new(bound))
+    }
+
+    fn remember(&self, source: &str, options: &PrepareOptions, catalog: &dyn Catalog, lookups: CatalogLookups) {
+        let Ok(bytes) = cache_entry_bytes(source, options, &lookups) else { return; };
+        let budget = self.memory.scope_with_limit(Self::ENTRY_BYTES);
+        let cache_plan = || -> Result<BoundQuery> {
+            let _syntax = admit_sql_syntax(source, &budget)?;
+            // Raw expression forms retain the budget used when parsing them.
+            let prepared = rtdb_sql::prepare_in(source, catalog, options, &budget)?;
+            BoundQuery::new(prepared, &budget)?.charge_cache_metadata(&budget, bytes)
+        };
+        let Ok(bound) = cache_plan() else { return; };
+        let mut entries = self.entries.lock();
+        let index = entries.iter().position(|entry| entry.source == source && entry.options == *options);
+        if let Some(index) = index { entries.remove(index); }
+        if entries.len() == Self::ENTRIES { entries.pop_front(); }
+        entries.push_back(Arc::new(SharedQueryPlan { source: source.to_owned(), options: options.clone(), lookups, bound: Arc::new(bound) }));
+    }
+}
+
+fn cache_entry_bytes(source: &str, options: &PrepareOptions, lookups: &CatalogLookups) -> Result<usize> {
+    let mut bytes = lookups.retained_bytes()?.checked_add(1024).and_then(|n| n.checked_add(source.len())).and_then(|n| n.checked_add(options.default_timezone.len())).ok_or_else(size_error)?;
+    for path in &options.search_path { bytes = bytes.checked_add(path.len()).and_then(|n| n.checked_add(64)).ok_or_else(size_error)?; }
+    for ty in options.parameter_types.values() { bytes = bytes.checked_add(ty.retained_bytes()?).and_then(|n| n.checked_add(256)).ok_or_else(size_error)?; }
+    Ok(bytes)
+}
 
 fn admit_source(source: &str, context: &QueryContext, options: &mut PrepareOptions) -> Result<Arc<MemoryReservation>> {
     context.check_cancelled()?;
@@ -279,4 +401,70 @@ fn retained_bytes(source: &String, options: &PrepareOptions, parameters: &Vec<Lo
         for field in schema.fields() { bytes = bytes.checked_add(field.data_type.retained_bytes()?).and_then(|n| n.checked_add(field.name.capacity())).and_then(|n| n.checked_add(256)).ok_or_else(size_error)?; }
     }
     Ok(bytes)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::QueryPlanCache;
+    use rtdb_index::{PartitionState, TransactionBuffer};
+    use rtdb_query::{CatalogSnapshot, DatabaseSnapshot, QueryContext};
+    use rtdb_sql::PrepareOptions;
+    use rtdb_storage::{MemoryStore, cache::BufferPool};
+    use rtdb_types::{Interval, MemoryBudget, StructFields, TableRef, Timestamp, TransactionKey, TxId, Value};
+    use std::{collections::BTreeMap, sync::Arc};
+    use tokio_util::sync::CancellationToken;
+
+    fn context(partition: &PartitionState, memory: &Arc<MemoryBudget>) -> Arc<QueryContext> {
+        let database = DatabaseSnapshot { partitions: vec![partition.value().snapshot()], storage: Arc::new(BufferPool::new(Arc::new(MemoryStore::default()), 1 << 20)) };
+        let catalog = CatalogSnapshot::new("xtdb", BTreeMap::from([("xtdb".into(), database)]), false).unwrap();
+        QueryContext::new(catalog, memory.scope(), Timestamp(20), "UTC", Default::default(), &CancellationToken::new()).unwrap()
+    }
+
+    fn write(partition: &PartitionState, memory: &Arc<MemoryBudget>, tx: i64, value: Value) {
+        let mut buffer = TransactionBuffer::new(partition.value().snapshot(), TransactionKey { tx_id: TxId(tx), system_time: Timestamp(tx) }, Arc::clone(memory)).unwrap();
+        buffer.put(TableRef::new("public", "docs"), StructFields::from([("_id".into(), Value::I64(tx)), ("v".into(), value)]), Interval::from_micros(0, i64::MAX).unwrap()).unwrap();
+        partition.apply(&buffer.stage().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn shared_query_plans_revalidate_the_catalog_and_charge_the_plan_once_on_hits() {
+        let memory = MemoryBudget::new(1 << 28);
+        let cache = QueryPlanCache::new(&memory);
+        let partition = PartitionState::empty(Default::default()).unwrap();
+        let options = PrepareOptions::default();
+        let sql = "SELECT v FROM docs";
+        write(&partition, &memory, 1, Value::I64(1));
+        let first = cache.prepare(sql, &context(&partition, &memory), &options).unwrap();
+        let next_context = context(&partition, &memory);
+        let next = cache.prepare(sql, &next_context, &options).unwrap();
+        let again = cache.prepare(sql, &next_context, &options).unwrap();
+        assert!(Arc::ptr_eq(next.relation(), again.relation()));
+        assert_eq!(next_context.memory.used_bytes(), 0);
+        write(&partition, &memory, 2, Value::Utf8("text".into()));
+        let changed = cache.prepare(sql, &context(&partition, &memory), &options).unwrap();
+        assert!(!Arc::ptr_eq(first.relation(), changed.relation()));
+        assert_ne!(first.schema(), changed.schema());
+        let still_changed = cache.prepare(sql, &context(&partition, &memory), &options).unwrap();
+        let reused = cache.prepare(sql, &context(&partition, &memory), &options).unwrap();
+        assert_eq!(changed.schema(), reused.schema());
+        assert!(Arc::ptr_eq(still_changed.relation(), reused.relation()));
+    }
+
+    #[test]
+    fn cached_regex_metadata_releases_the_original_query_budget() {
+        let memory = MemoryBudget::new(1 << 28);
+        let partition = PartitionState::empty(Default::default()).unwrap();
+        let cache = QueryPlanCache::new(&memory);
+        let context = context(&partition, &memory);
+        let options = PrepareOptions::default();
+        let sql = "SELECT regexp_replace('abc', 'a', 'x')";
+        let query = cache.prepare(sql, &context, &options).unwrap();
+        assert!(context.memory.used_bytes() > 0);
+        drop(query);
+        assert_eq!(context.memory.used_bytes(), 0);
+        let first_hit = cache.prepare(sql, &context, &options).unwrap();
+        let next_hit = cache.prepare(sql, &context, &options).unwrap();
+        assert!(Arc::ptr_eq(first_hit.relation(), next_hit.relation()));
+        assert_eq!(context.memory.used_bytes(), 0);
+    }
 }

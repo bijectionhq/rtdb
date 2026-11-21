@@ -213,6 +213,11 @@ pub(crate) fn allocation_bound(relation: &Relation) -> Result<usize> {
     Ok(bytes)
 }
 
+/// Estimates bytes for retaining a plan with expressions outside its relation, such as PATCH validity bounds.
+pub fn plan_allocation_bound(relation: &Relation, extra_expressions: &[&Expr]) -> Result<usize> {
+    extra_expressions.iter().try_fold(allocation_bound(relation)?, |bytes, expr| add(bytes, expression_bound(expr)?))
+}
+
 fn field_type(field: &Field, data_type: L) -> Field { let mut field = field.clone(); field.data_type = data_type; field }
 fn relation_types(relation: &Arc<Relation>, emitter: &Emitter<'_>) -> Result<Arc<EmittedRelation>> {
     stacker::maybe_grow(256 * 1024, 2 * 1024 * 1024, || relation_types_at(relation, emitter))
