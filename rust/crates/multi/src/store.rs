@@ -173,7 +173,7 @@ impl CellStoreFactory {
     }
 }
 
-async fn release_region(directory: &dyn Directory, deployment: &str, region: Uuid, uncertain: bool) -> Result<()> {
+pub(crate) async fn release_region(directory: &dyn Directory, deployment: &str, region: Uuid, uncertain: bool) -> Result<()> {
     let Some(mut record) = directory.deployment(deployment).await? else { return Ok(()); };
     if !record.storage_regions.remove(&region) && !uncertain {
         return Ok(());
@@ -551,6 +551,16 @@ pub async fn run_reaper(directory: Arc<dyn Directory>, storage: crate::deploymen
                                 Some(Err(error)) => eprintln!("Disposal of {} is pending: {}", record.id, error.code),
                                 Some(Ok(_)) => {}
                             }
+                        }
+                    }
+                    for record in deployments.iter().filter(|record| record.archive_retirement.as_ref()
+                        .is_some_and(|retirement| retirement.observed_empty_at_ms.is_none()))
+                    {
+                        let Ok(id) = record.id.parse::<Uuid>() else { continue; };
+                        match cancellation.run_until_cancelled(crate::archive::finish_local_retirement(directory.as_ref(), id)).await {
+                            None => return,
+                            Some(Err(error)) => eprintln!("Archive retirement of {id} is pending: {}", error.code),
+                            Some(Ok(_)) => {},
                         }
                     }
                 }

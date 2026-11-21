@@ -176,7 +176,29 @@ pub struct DeploymentRecord {
     pub cell_transfer: Option<CellTransfer>,
     pub disposal: Option<DisposalReceipt>,
     pub checkpoint_recovery: Option<CheckpointRecovery>,
+    /// Every independent archive admitted before a checkpoint copy started.
+    pub checkpoint_captures: BTreeMap<uuid::Uuid, CheckpointCapture>,
+    pub archive_retirement: Option<ArchiveRetirement>,
     pub version: Version,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CheckpointCapture {
+    pub archive: String,
+    pub incarnation: u64,
+    pub log_epoch: i32,
+    pub checkpoint: Checkpoint,
+    /// Payload copying starts only after the archive's witness becomes durable.
+    pub media_bound: bool,
+}
+
+/// The recovery owner releases its hold independently of serving disposal.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ArchiveRetirement {
+    pub deployment: String,
+    pub epoch: u64,
+    pub authorized_at_ms: i64,
+    pub observed_empty_at_ms: Option<i64>,
 }
 
 /// Both directories retain the same routing decision through a cell transfer.
@@ -225,7 +247,7 @@ impl DeploymentRecord {
     pub fn new(name: impl Into<String>, org: impl Into<String>, ensemble: Vec<MemberId>, now_ms: i64) -> Self {
         let id = uuid::Uuid::new_v4().to_string();
         Self { lineage: id.clone(), id, name: name.into(), org: org.into(), incarnation: 1, lifecycle: Lifecycle::Live, epoch: 0, holder: None,
-            ensemble, replica_journals: BTreeSet::new(), storage_regions: BTreeSet::new(), read_width: 1, activation_crashes: 0, created_at_ms: now_ms, move_intent: None, log_epoch: 0, parent: None, move_from: None, linearizable_reads: false, checkpoint: None, moved_at_ms: None, cell_transfer: None, disposal: None, checkpoint_recovery: None, version: 0 }
+            ensemble, replica_journals: BTreeSet::new(), storage_regions: BTreeSet::new(), read_width: 1, activation_crashes: 0, created_at_ms: now_ms, move_intent: None, log_epoch: 0, parent: None, move_from: None, linearizable_reads: false, checkpoint: None, moved_at_ms: None, cell_transfer: None, disposal: None, checkpoint_recovery: None, checkpoint_captures: BTreeMap::new(), archive_retirement: None, version: 0 }
     }
 
     pub fn can_fork(&self) -> bool {

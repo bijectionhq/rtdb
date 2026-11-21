@@ -37,6 +37,8 @@ Usage: rtdb-multi initialize-directory --state PATH\n\
        rtdb-multi delete --directory DIR --storage-root PATH --keys PATH --id UUID\n\
        rtdb-multi schedule-disposal --directory DIR --id UUID\n\
        rtdb-multi disposal --directory DIR --id UUID\n\
+       rtdb-multi schedule-recovery-disposal --directory DIR --id UUID\n\
+       rtdb-multi recovery-disposal --directory DIR --id UUID\n\
        rtdb-multi capture --directory DIR --storage-root PATH --archive-root PATH --keys PATH --id UUID --operation UUID\n\
        rtdb-multi restore --directory DIR --storage-root PATH --archive-root PATH --keys PATH --id UUID --operation UUID\n\n\
 DIR is HOST:PORT of a directory server, or dynamodb:PREFIX for DynamoDB tables named PREFIX-deployments, PREFIX-deployment-names and PREFIX-members\n\
@@ -264,6 +266,21 @@ async fn run(arguments: Vec<String>) -> Result<()> {
                 "epoch": scheduled.epoch,
                 "lifecycle": scheduled.lifecycle,
             }));
+            Ok(())
+        }
+        "schedule-recovery-disposal" => {
+            let directory = directory(arguments.required("directory")?).await?;
+            let scheduled = rtdb_multi::archive::begin_retirement(
+                directory.as_ref(), installation_id(&arguments)?,
+            ).await?;
+            println!("{}", serde_json::to_string_pretty(&scheduled).expect("archive retirement serializes"));
+            Ok(())
+        }
+        "recovery-disposal" => {
+            let directory = directory(arguments.required("directory")?).await?;
+            let id = installation_id(&arguments)?;
+            let receipt = directory.deployment(&id.to_string()).await?.and_then(|record| record.archive_retirement);
+            println!("{}", serde_json::to_string_pretty(&receipt).expect("archive retirement serializes"));
             Ok(())
         }
         "capture" => {

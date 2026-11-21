@@ -128,7 +128,17 @@ definitive provider refusals permit release when its I/O has drained.
 published checkpoint and copies its catalog, table metadata and referenced
 tries as ciphertext to the independent archive. The receipt fixes the
 location, length and digest of each object. Retrying the operation recovers
-the same checkpoint. The key vault stays outside the capture.
+the same checkpoint and destination. The directory registers both and the
+capture's storage region before the first archive write. An archive binds
+its media witness before payload can be copied. The key vault stays outside
+the capture.
+
+The recovery owner calls `rtdb-multi schedule-recovery-disposal --id UUID`
+after the installation's serving receipt exists and recovery holds end.
+The reaper settles each registered local archive after confirming its
+media witness. `rtdb-multi recovery-disposal --id UUID` returns the ordered
+retirement and observed absence. Remote archives stay pending until the
+provider proves that versions and unfinished uploads are absent.
 
 `rtdb-multi restore` accepts the live directory's current checkpoint with
 the original archive manifest and current key. It records a restore intent,

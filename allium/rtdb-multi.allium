@@ -1728,6 +1728,16 @@ rule EraseAndProve {
         Directory.cas(record.id, record.epoch, change: { lifecycle: deleted })
 }
 
+rule RetireCheckpointArchives {
+    when: RecoveryRetirementAuthorized(record)
+
+    requires: ServingDisposalRecorded(record)
+              and RecoveryHoldsReleased(record)
+
+    ensures:
+        RetireRegisteredArchiveCopies(record)
+}
+
 ------------------------------------------------------------
 -- Rules: upgrades
 ------------------------------------------------------------

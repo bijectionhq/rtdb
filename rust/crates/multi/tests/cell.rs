@@ -459,8 +459,20 @@ async fn a_checkpoint_capture_keeps_its_cut_and_archives_only_sealed_objects() {
     assert!(advance(Some(first.block)).await.block > first.block);
     let replay = rtdb_multi::archive::capture(cell.directory.as_ref(), &cell.storage(), &archive, &cell.keys(), id, operation).await.unwrap();
     assert_eq!(replay, capture);
+    let other_destination = tempfile::tempdir().unwrap();
+    let other_archive = CellStorage::Local { root: other_destination.path().to_owned() };
+    assert!(rtdb_multi::archive::capture(cell.directory.as_ref(), &cell.storage(), &other_archive, &cell.keys(), id, operation).await.is_err());
+    assert!(rtdb_multi::archive::begin_retirement(cell.directory.as_ref(), id).await.is_err());
     assert!(rtdb_multi::archive::restore(cell.directory.as_ref(), &cell.storage(), &archive, &cell.keys(), id, operation, 4 << 20).await.is_err());
     drop(client);
+    admin::delete_deployment(cell.directory.as_ref(), &cell.storage(), &cell.keys(), &id.to_string(), 4 << 20).await.unwrap();
+    let scheduled = rtdb_multi::archive::begin_retirement(cell.directory.as_ref(), id).await.unwrap();
+    assert!(scheduled.observed_empty_at_ms.is_none());
+    let retired = rtdb_multi::archive::finish_local_retirement(cell.directory.as_ref(), id).await.unwrap();
+    assert!(retired.observed_empty_at_ms.is_some());
+    assert_eq!(retired.authorized_at_ms, scheduled.authorized_at_ms);
+    assert!(files_under(&destination.path().join(format!("checkpoint-captures/{id}/{operation}"))).is_empty());
+    assert_eq!(rtdb_multi::archive::begin_retirement(cell.directory.as_ref(), id).await.unwrap(), retired);
     cell.stop().await;
 }
 

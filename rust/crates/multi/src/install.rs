@@ -7,7 +7,7 @@ use std::{
 };
 
 use ring::hmac;
-use rtdb_directory::{DeploymentRecord, Directory, DisposalReceipt, Lifecycle};
+use rtdb_directory::{DeploymentRecord, Directory, Lifecycle};
 use rtdb_types::{
     Anomaly,
     AnomalyCategory,
@@ -58,6 +58,7 @@ enum Operation {
     Install,
     ScheduleDisposal,
     InspectDisposal,
+    ScheduleRecoveryDisposal,
 }
 
 #[derive(Serialize)]
@@ -73,6 +74,17 @@ enum Reply {
         epoch: u64,
     },
     Disposed {
+        name: String,
+        authority: Uuid,
+        epoch: u64,
+        evidence: [u8; 32],
+    },
+    RecoveryScheduled {
+        name: String,
+        authority: Uuid,
+        epoch: u64,
+    },
+    RecoveryDisposed {
         name: String,
         authority: Uuid,
         epoch: u64,
@@ -166,7 +178,7 @@ impl Installer {
     async fn dispatch(&self, directory: &dyn Directory, request: Request) -> Result<Reply> {
         let token = match request.operation {
             Operation::Install => Some(&self.install),
-            Operation::ScheduleDisposal | Operation::InspectDisposal => self.disposal.as_ref(),
+            Operation::ScheduleDisposal | Operation::InspectDisposal | Operation::ScheduleRecoveryDisposal => self.disposal.as_ref(),
         };
         if !token.is_some_and(|token| token.accepts(&request.token)) {
             return Ok(Reply::Refused);
@@ -192,7 +204,7 @@ impl Installer {
                         .await?;
                 disposal_reply(installation, request.authority)
             }
-            Operation::InspectDisposal => {
+            Operation::InspectDisposal | Operation::ScheduleRecoveryDisposal => {
                 let Some(installation) = directory.deployment_by_name(&request.name).await? else {
                     return Ok(Reply::Deferred);
                 };
@@ -202,7 +214,24 @@ impl Installer {
                 {
                     return Ok(Reply::Refused);
                 }
-                disposal_reply(installation, request.authority)
+                if matches!(request.operation, Operation::ScheduleRecoveryDisposal) {
+                    let receipt = crate::archive::begin_retirement(directory, request.authority).await?;
+                    if receipt.observed_empty_at_ms.is_some() {
+                        return Ok(Reply::RecoveryDisposed {
+                            name: installation.name,
+                            authority: request.authority,
+                            epoch: receipt.epoch,
+                            evidence: receipt_evidence(&receipt)?,
+                        });
+                    }
+                    Ok(Reply::RecoveryScheduled {
+                        name: installation.name,
+                        authority: request.authority,
+                        epoch: receipt.epoch,
+                    })
+                } else {
+                    disposal_reply(installation, request.authority)
+                }
             }
         }
     }
@@ -225,9 +254,9 @@ fn disposal_reply(installation: DeploymentRecord, authority: Uuid) -> Result<Rep
     }
 }
 
-fn receipt_evidence(receipt: &DisposalReceipt) -> Result<[u8; 32]> {
+fn receipt_evidence(receipt: &impl Serialize) -> Result<[u8; 32]> {
     let bytes = serde_json::to_vec(receipt)
-        .map_err(|_| invalid("Cannot encode the serving disposal receipt"))?;
+        .map_err(|_| invalid("Cannot encode the disposal receipt"))?;
     let digest = ring::digest::digest(&ring::digest::SHA256, &bytes);
     Ok(digest.as_ref().try_into().expect("SHA-256 has 32 bytes"))
 }
