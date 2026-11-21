@@ -99,8 +99,8 @@ A proof of a candidate is conditional on the explicitly stated contract and work
 | Target | Status | Recorded evidence |
 | --- | --- | --- |
 | TX01 · All-or-nothing effects | Partial | [Publication and read-back protocol models](rtdb-engine-proof-evidence.md#main-evidence) · [Private replay admission and marker authority](rtdb-engine-proof-evidence.md#private-replay-admission-and-marker-authority) |
-| TX02 · Ordered resolution | Open | — |
-| TX03 · Staged isolation | Partial | [Publication and read-back protocol models](rtdb-engine-proof-evidence.md#main-evidence) |
+| TX02 · Ordered resolution | Partial | [Lean same-block prefix and native overlay admission](rtdb-engine-proof-evidence.md#same-block-staged-resolution-prefix) |
+| TX03 · Staged isolation | Partial | [Publication and read-back protocol models](rtdb-engine-proof-evidence.md#main-evidence) · [Lean staged views and native overlay observations](rtdb-engine-proof-evidence.md#same-block-staged-resolution-prefix) |
 | TX04 · Static DML equivalence | Open | — |
 | TX05 · Ordered apply | Open | — |
 | TX06 · Read-back agreement | Partial | [Publication and read-back protocol models](rtdb-engine-proof-evidence.md#main-evidence) |

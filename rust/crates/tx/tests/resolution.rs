@@ -224,6 +224,37 @@ async fn staged_txs_read_your_writes_across_a_batch_and_each_argument_row() {
 }
 
 #[tokio::test]
+async fn staged_snapshot_requires_the_predecessor_and_block_of_each_overlay() {
+    let state = PartitionState::empty(Default::default()).unwrap();
+    let captured = state.value().snapshot();
+    let context = context();
+    let mut resolver = TxResolver::new(None, SourcePosition(-1), None, &context.memory).unwrap();
+    let first = resolver.resolve_source(captured.clone(), SourcePosition(0), Timestamp(100),
+        request(vec![put(&context, 10, 0, i64::MAX)], &context), &context).await.unwrap();
+    let second = resolver.resolve_source(captured.clone(), SourcePosition(1), Timestamp(101),
+        request(vec![put(&context, 20, 0, i64::MAX)], &context), &context).await.unwrap();
+
+    let reversed = [Arc::clone(second.writes()), Arc::clone(first.writes())];
+    assert!(matches!(captured.with_staged(&reversed), Err(error) if error.code == "rtdb.index/overlay-order"));
+    let wrong_block = rtdb_types::BlockIndex(captured.block_index().0 + 1);
+    let wrong = rtdb_index::StagedWrite::new(first.result().tx_key(), None, wrong_block, first.writes().tables().clone()).unwrap();
+    assert!(matches!(captured.with_staged(&[Arc::new(wrong)]), Err(error) if error.code == "rtdb.index/overlay-order"));
+
+    let before_apply = resolver.resolving_snapshot(captured.clone()).unwrap();
+    assert_eq!(before_apply.tx_basis(), Some(second.result().tx_key()));
+    assert_eq!(before_apply.iter_segments(&table()).count(), 2);
+    assert_eq!(captured.tx_basis(), None);
+    assert!(!captured.contains_table(&table()));
+
+    state.apply(resolver.take_head().unwrap().writes()).unwrap();
+    let after_apply = resolver.resolving_snapshot(state.value().snapshot()).unwrap();
+    assert_eq!(after_apply.tx_basis(), before_apply.tx_basis());
+    assert_eq!(after_apply.iter_segments(&table()).count(), 2);
+    assert_eq!(state.value().snapshot().tx_basis(), Some(first.result().tx_key()));
+    assert!(!captured.contains_table(&table()));
+}
+
+#[tokio::test]
 async fn indexer_cleans_up_aborted_transactions_2489_and_advances_the_clock() {
     let state = PartitionState::empty(Default::default()).unwrap();
     let context = context();

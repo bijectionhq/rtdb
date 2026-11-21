@@ -159,6 +159,20 @@ The native contract test compares the public bucketer with an independent unsign
 Verus 0.2026.11.05.31e44e6 checked nine functions and rejected all five mutations, including one that accepts an IID with a smaller first differing digit. [Verus study](../../verification/verus/iid_partition/area.json)
 The native run passed 495 tests with `cargo test --manifest-path rust/Cargo.toml --locked -p rtdb-trie -p rtdb-format -p rtdb-index -p rtdb-query`. [Rust contract test](../../rust/crates/trie/tests/contracts.rs)
 
+### Same-block staged resolution prefix
+
+Lean checks that a queue can extend a captured snapshot exactly when each write names the current predecessor and block.
+The resolver view places staged batches in newest-first order ahead of the applied history.
+Moving the first stage into the applied prefix leaves the resolver's bitemporal answer unchanged if the published snapshot matches the overlay, including its block and transaction coordinates.
+Staging leaves the external snapshot in place, and discarding the remaining queue preserves the applied prefix.
+A batch with no rows in the table still advances the projected history's transaction coordinate.
+
+The native regressions reject reversed predecessors and a wrong block in `with_staged`.
+They check that moving an applied head out of the queue preserves the resolver basis and that captured readers cannot see staged data.
+A separate regression reads the predecessor's staged write and then the previous argument row's write within the current transaction.
+The proof takes one table's list of logical effects as input and assumes the segment and publication layers preserve that history.
+The concrete Arrow segment representation, block turnover, and read-back fencing still need composition with those premises. [Lean model](../../verification/lean/StagedPrefix.lean) · [Native overlay tests](../../rust/crates/tx/tests/resolution.rs) · [Snapshot construction](../../rust/crates/index/src/snapshot.rs)
+
 ### Limit opening and count admission
 
 The ordinary native limit opens the input before evaluating OFFSET and then FETCH.

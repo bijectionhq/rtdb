@@ -798,6 +798,35 @@ def verify_table_slugs(args, scratch):
     verify_lean_model(args, scratch, path, "table-slugs", controls, 6)
 
 
+def verify_staged_prefix(args, scratch, history):
+    path = Path("verification/lean/StagedPrefix.lean")
+    controls = {
+        "ignore-block": (
+            "if stage.predecessor = snapshot.head ∧ stage.block = snapshot.block then",
+            "if stage.predecessor = snapshot.head then",
+            ["success_admits_exactly_the_linked_stage_chain"],
+        ),
+        "append-as-oldest": (
+            "stage.rows :: snapshot.history",
+            "snapshot.history ++ [stage.rows]",
+            ["empty_visible_batch_still_advances_the_head",
+             "resolver_reads_the_newest_queued_batches_then_durable"],
+        ),
+        "publish-on-stage": (
+            "| some _ => some ⟨pipeline.applied, pipeline.pending ++ [next]⟩",
+            "| some resolved => some ⟨resolved, pipeline.pending ++ [next]⟩",
+            ["staging_preserves_the_external_snapshot"],
+        ),
+        "discard-applied-rows": (
+            "⟨pipeline.applied, []⟩",
+            "⟨{ pipeline.applied with history := [] }, []⟩",
+            ["discarding_the_queue_preserves_the_applied_prefix"],
+        ),
+    }
+    verify_lean_model(args, scratch, path, "staged-prefix", controls, 8,
+                      os.environ | {"LEAN_PATH": str(history)})
+
+
 def verify_limit_open(args, scratch):
     path = Path("verification/lean/LimitOpen.lean")
     controls = {
@@ -1117,6 +1146,7 @@ def verify_lean(args, scratch):
             verify_explicit_session(args, scratch)
             verify_private_replay(args, scratch)
             verify_limit_open(args, scratch)
+            verify_staged_prefix(args, scratch, directory)
             verify_logkeeper(args, scratch)
             verify_reader_retention(args, scratch)
             verify_generation_retention(args, scratch)
