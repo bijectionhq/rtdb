@@ -512,6 +512,8 @@ rule AddIfNotPresent {
 -- 3. Ordering within leaves: after merge_sort, indices are always ordered by
 --    (IID ascending, row index descending)
 --    This ensures newest rows for same IID appear first in iteration.
+--    Sorting and merging preserve each occurrence of a row index, including repeated indices.
+--    Every successful lookup of a retained row returns the same IID across trie versions that share the row.
 
 -- 4. Log batching: up to log_limit writes are batched before sorting overhead
 

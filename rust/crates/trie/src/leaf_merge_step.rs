@@ -17,7 +17,7 @@ pub(crate) closed spec fn iid_rank(iid_at: IidAt) -> RowRank {
     |row| crate::laws::row_rank(iid_at(row), row)
 }
 
-proof fn iid_rank_exposes_the_row_key(iid_at: IidAt, row: u32)
+pub(crate) proof fn iid_rank_exposes_the_row_key(iid_at: IidAt, row: u32)
     ensures iid_rank(iid_at)(row) == crate::laws::row_rank(iid_at(row), row),
 {
     reveal(iid_rank);
@@ -30,6 +30,31 @@ where F: Fn(u32) -> Result<[u8; 16], E>
 {
     exists |row: u32| (left.contains(row) || right.contains(row))
         && #[trigger] reader.ensures((row,), Err(error))
+}
+
+pub(crate) proof fn record_iid_error<F, E>(left: Seq<u32>, right: Seq<u32>, reader: &F, row: u32, error: E)
+where F: Fn(u32) -> Result<[u8; 16], E>
+requires
+    left.contains(row) || right.contains(row),
+    reader.ensures((row,), Err(error)),
+ensures declined_row(left, right, reader, error),
+{
+}
+
+pub(crate) proof fn widen_iid_error<F, E>(
+    left: Seq<u32>, right: Seq<u32>, allowed: Seq<u32>, reader: &F, error: E,
+)
+where F: Fn(u32) -> Result<[u8; 16], E>
+requires
+    declined_row(left, right, reader, error),
+    forall |row: u32| #![trigger left.contains(row)] #![trigger right.contains(row)]
+        (left.contains(row) || right.contains(row))
+        ==> allowed.contains(row),
+ensures declined_row(allowed, Seq::empty(), reader, error),
+{
+    let row = choose |row: u32| (left.contains(row) || right.contains(row))
+        && #[trigger] reader.ensures((row,), Err(error));
+    assert(allowed.contains(row));
 }
 
 broadcast use {vstd::seq_lib::group_seq_properties, vstd::multiset::group_multiset_properties};
