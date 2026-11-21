@@ -1,0 +1,102 @@
+= RTDB structural redesign
+
+Six guarantees could not be closed in the inherited architecture.
+Three independent designs converged on the replacement below.
+This document is the contract each increment implements; the verification design and the specs cite it.
+
+== Owner decisions
+
+* A client-supplied system time may not lead the source log's append time (tolerance zero).
+* A view admitted before an erasure keeps its answers until the erasure deadline; afterwards a read that needs destroyed key material fails with `rtdb/erased-under-view`.
+  SNAP-1 and DUR-1 are amended accordingly.
+* An erasure in a database also erases the material in forks whose history includes it.
+* Transaction user metadata is retained only for the retry-receipt window, and is erasable with its unit before then.
+* XTDB wire, configuration and storage compatibility is not a constraint.
+
+== Coordinates
+
+History uses transaction system time, bounded by the log clock, and drives no physical decision.
+Reclamation uses a monotone catalog generation recorded by the residence ledger.
+Node-local monotonic durations only expire the holds of readers that stop renewing them.
+Receipt expiry and erasure deadlines use the log time recorded with each record.
+
+== Mechanisms
+
+[cols="1,3,2",options="header"]
+|===
+|Tension |Replacement |Deleted
+
+|System time as a physical clock
+|A client time is admitted only when it advances the head and does not exceed the log append time.
+An external source's commit time is clamped to the node clock.
+|Unbounded future client times and the resulting overflow cliff.
+
+|Erasure versus the log and L0
+|Every durable unit is sealed under a destroyable data key.
+An erasure writes successors without the erased material, publishes them, rotates and destroys the superseded keys within the deadline, and redacts log segments by overlay.
+Recovery and compactor reset start from held recovery roots.
+|Permanent L0 retention, `reset_to_l0`, copy-before-delete fork sharing.
+
+|No reference authority
+|One linearizable residence ledger per database: the Multi directory record, or a conditional-write object in classic deployments.
+Readers hold a catalog generation by compare-and-swap before opening storage and renew while they read.
+The collector advances a floor below every live hold and recovery root and deletes only objects retired at or below it.
+|`garbage_lifetime`, the fixed read lease and its collector wait, the reaper grace and wall-clock release stamps, the unbounded in-process registry.
+
+|Positional names
+|A physical name is the positional key plus the storage epoch and a digest of its inputs, written put-if-absent; a reset starts a new epoch.
+|The reset fence against running collection.
+
+|System state in user tables
+|An engine-owned receipt map keyed by database, principal and key, holding a body digest; the resolver answers a duplicate with the original outcome and a mismatched body with `rtdb/idempotency-conflict`.
+Receipts and transaction metadata expire by log time and are removed physically.
+|`public.rtdb_idempotency_keys` and its SQL guard.
+
+|Proofs versus composition
+|Each premise of a verified decision becomes a capability only its owner can construct: a held view for storage reads, a deletion grant for provider deletes, live key material for cached pages.
+One composed TLA+ model of the residence is checked against traces emitted at every linearization point.
+|Unchecked caller premises.
+|===
+
+== Increments
+
+[cols="1,3,1",options="header"]
+|===
+|# |Increment |Status
+
+|1
+|System-time bound and external clamp.
+|Implemented
+
+|2
+|Engine-owned retry receipts with body digest and principal scope.
+|Planned
+
+|3
+|Epoch- and digest-qualified physical names; delete the reset fence.
+|Planned
+
+|4
+|Residence ledger with holds and collection floor; delete the timer stack.
+|Planned
+
+|5
+|Recovery roots as holds; collectable L0; reset from a root.
+|Planned
+
+|6
+|Sealing and the key ledger for every durable unit.
+|Planned
+
+|7
+|Eraser: successors, log overlays, fork propagation, score-stale artefacts, `erased-under-view`.
+|Planned
+
+|8
+|Transaction metadata retention.
+|Planned
+
+|9
+|Capabilities, the composed residence model and trace validation, extended as each increment lands.
+|Planned
+|===
