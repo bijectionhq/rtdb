@@ -901,3 +901,30 @@ The close control leaves availability over tracked references valid and fails th
 The model takes the generation's dependency relation and atomic registration and collection authorization as premises.
 Physical completion represents a provider-confirmed end to deletion, with all effects of that authorized operation settled.
 The Rust capture path, I/O lifetime, collector, and failover authority need a refinement to this protocol before the theorem applies to deployment behavior.
+
+== Reader retention within one partition authority
+
+The Rust partition registers each captured query or transaction catalog under its state lock.
+The collector captures one consistent view of the current catalog and the retained generations before choosing objects.
+Eligibility stays restricted to garbage in that view and excludes each trie live in a retained catalog.
+The existing group-artefact decision receives the resulting batch.
+Ordinary publication preserves shard watermarks, and compactor reset refuses while an active collection can still touch an old key.
+
+Query opening and cursor advancement pass their captured catalogs into the storage I/O region.
+The provider worker holds that reference through completion even if the waiter is dropped.
+Collection uses the same lifetime transfer for its reset fence.
+The observation depends on I/O being admitted and drained by the existing region.
+
+The link:../verus/reader_retention/proof.rs[reader retention area] checks the exact native selection loop against a list of visibility observations.
+It checks that selection accounts for every catalog, with a law that a retained catalog by itself keeps its dependencies.
+The runner checked three obligations and caught skipping the last catalog with either the original or a matching weakened contract.
+The Rust callback obtains each observation from the immutable catalog captured by the partition.
+
+The selected native suites passed 376 tests.
+The collection test keeps a trie and its files while two readers retain its catalog, collects another eligible trie in that cycle, and collects the retained trie only after both readers close.
+It also checks that reset is refused while a collection is held.
+The storage test checks that cancelled I/O retains its reference until the worker and its undelivered result finish.
+Run the selected suites with `BIJECTION_LOCAL_EXECUTION=owner-authorized cargo test --manifest-path rust/Cargo.toml --locked -p rtdb-index -p rtdb-maintenance -p rtdb-storage -p rtdb-query -p rtdb-node -p rtdb-replication --lib --test gc --test native --test catalogs`.
+
+This deployment boundary covers one installed partition authority and its trie collector.
+Coordination between nodes, other physical deletion paths, and checkpoint and log retention during recovery remain open.

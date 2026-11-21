@@ -90,6 +90,60 @@ async fn trie_gc_deletes_artefacts_and_both_files_before_publishing_and_preserve
 }
 
 #[tokio::test]
+async fn collection_preserves_open_readers_and_can_reclaim_unreferenced_tries() {
+    let table = TableRef::new("public", "docs");
+    let tables = TableCatalog::default().with_seeded_table(table.clone(), Vec::new()).unwrap();
+    let entry = tables.entry(&table).unwrap().clone();
+    let trie = |key: &str| CatalogTrie {
+        key: key.parse().unwrap(), data_file_size: 1, metadata: None, state: TrieState::Live, artefacts: Vec::new(),
+    };
+    let preserved = trie("l01-rc-b00");
+    let unreferenced = trie("l01-rc-b01");
+    let catalog = TrieCatalog::new(16).unwrap().with_tries(table.clone(), [preserved.clone()], Timestamp(100)).unwrap();
+    let state = Arc::new(PartitionState::new(PartitionValue::loaded(catalog, tables, TrieConfig::default()).unwrap()));
+    let first = state.open_snapshot(None);
+    let second = state.snapshot();
+    state.add_tries(&BTreeMap::from([(table.clone(), vec![unreferenced.clone(), trie("l01-rc-b02")])]), Timestamp(100)).unwrap();
+    assert_eq!(first.trie_entries(&table)[0].key, preserved.key);
+    assert_eq!(state.open_snapshot(None).trie_entries(&table)[0].key, trie("l01-rc-b02").key);
+
+    let store = Arc::new(MemoryStore::default());
+    let mut pinned_objects = Vec::new();
+    for candidate in [&preserved, &unreferenced] {
+        let objects = [
+            entry.slug.data_key(&candidate.key),
+            entry.slug.metadata_key(&candidate.key),
+            entry.slug.artefact_key(&candidate.key, "search", "body", 1).unwrap(),
+        ];
+        for path in objects {
+            let key = ObjectKey::new(path).unwrap();
+            store.put(&key, Bytes::from_static(b"contents")).await.unwrap();
+            if candidate.key == preserved.key { pinned_objects.push(key); }
+        }
+    }
+    let publisher = Arc::new(DeletedPublisher { store: store.clone(), table: entry, commits: Mutex::new(Vec::new()) });
+    let collector = TrieCollector::new(store.clone(), state.clone(), publisher.clone(), Arc::new(Observer::default()), GarbageConfig::default()).unwrap();
+    let cancellation = CancellationToken::new();
+    collector.collect_as_of(Timestamp(100), &cancellation).await.unwrap();
+    assert_eq!(publisher.commits.lock().unwrap().as_slice(), &[vec![unreferenced.key.clone()]]);
+    state.delete_tries(&BTreeMap::from([(table, [unreferenced.key].into())]));
+    drop(first);
+    collector.collect_as_of(Timestamp(100), &cancellation).await.unwrap();
+    assert_eq!(publisher.commits.lock().unwrap().len(), 1);
+    for key in &pinned_objects { assert!(store.get(key).await.is_ok()); }
+
+    drop(second);
+    collector.collect_as_of(Timestamp(100), &cancellation).await.unwrap();
+    assert_eq!(publisher.commits.lock().unwrap()[1], vec![preserved.key]);
+    for key in &pinned_objects { assert!(store.head(key).await.is_err()); }
+
+    let collection = state.trie_collection();
+    assert_eq!(state.reset_to_l0(BTreeMap::new()).unwrap_err().code, "rtdb.compactor-reset/collecting");
+    drop(collection);
+    state.reset_to_l0(BTreeMap::new()).unwrap();
+}
+
+#[tokio::test]
 async fn a_groups_artefacts_go_only_with_the_last_member_the_catalog_holds() {
     let table = TableRef::new("public", "docs");
     let tables = TableCatalog::default().with_seeded_table(table.clone(), Vec::new()).unwrap();

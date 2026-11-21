@@ -1,0 +1,39 @@
+{
+  "summary": "Selection checks every captured reader generation before allowing collection of its dependencies.",
+  "flags": ["--no-external-by-default", "--verify-module", "production", "--verify-module", "laws"],
+  "min_verified_functions": 3,
+  "controls": {
+    "skip_last_generation": {
+      "defect": "The last retained catalog is skipped during the dependency test.",
+      "mutate": [{
+        "file": "rust/crates/index/src/reader_retention.rs",
+        "find": "let end = readers;",
+        "replace": "let end = readers.saturating_sub(1);"
+      }],
+      "expect": [{
+        "file": "rust/crates/index/src/reader_retention.rs",
+        "function": "any_reader_requires",
+        "category": "invariant not satisfied before loop"
+      }],
+      "min_verified_functions": 2
+    },
+    "skip_last_generation_with_weakened_contract": {
+      "defect": "Both the runtime and its contract omit the last retained catalog.",
+      "mutate": [{
+        "file": "rust/crates/index/src/reader_retention.rs",
+        "find": "let end = readers;",
+        "replace": "let end = readers.saturating_sub(1);"
+      }, {
+        "file": "rust/crates/index/src/reader_retention.rs",
+        "find": "\n        readers as int\n",
+        "replace": "\n        if readers == 0 { 0 } else { readers as int - 1 }\n"
+      }],
+      "expect": [{
+        "file": "verification/verus/reader_retention/laws.rs",
+        "function": "any_generation_keeps_its_dependencies",
+        "category": "assertion failed"
+      }],
+      "min_verified_functions": 2
+    }
+  }
+}

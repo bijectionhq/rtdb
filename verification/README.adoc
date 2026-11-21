@@ -169,6 +169,8 @@ It also exercises the Azure adapter against a loopback provider and separately m
   `lean/GenerationRetention.lean` proves that a coordinated registry keeps every object required by the current generation, open readers, and in-flight operations available across arbitrary finite histories.
   Each read completion releases exactly one reference, and an unreferenced object admits authorization followed by collection.
   The model treats reference accounting and collection authorization as atomic and requires a conclusive provider completion for the deletion step.
+  Verus checks the native reader selection decision over the locally captured catalog list.
+  The selected Rust maintenance and storage tests exercise the single-partition authority and the transfer of its lifetime into provider I/O.
 * `tla/CompactionGroup.tla` checks durable, complete sibling publication for one replacement.
   `tla/CompactionOverlap.tla` compares exact sibling membership with a high-water mark across two interleaved generations.
   The Rust catalog regression checks the corresponding admission behavior.

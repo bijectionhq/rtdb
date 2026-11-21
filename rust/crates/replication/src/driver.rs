@@ -964,7 +964,7 @@ impl ReplicationDriver {
         };
         let message = SourceMessage::decode(&payload)?;
         drop(payload);
-        let durable = self.partition.value().snapshot();
+        let durable = self.partition.snapshot();
         let leader = self.leader.as_mut().ok_or_else(term_ended)?;
         if position <= leader.resolver()?.source_position() { return Err(invalid("Source reader did not advance")); }
         let block = durable.block_index();
@@ -1093,7 +1093,7 @@ impl ReplicationDriver {
                     let _ = completion.send(Err(Anomaly::incorrect("xtdb/not-external-source", "External writes require an external-source database")));
                     return Ok(());
                 }
-                let durable = self.partition.value().snapshot();
+                let durable = self.partition.snapshot();
                 let mut resolver = leader.resolver.take().ok_or_else(|| invalid("External resolution has no idle resolver"))?;
                 let context = Arc::clone(&self.resolve);
                 let clock = Arc::clone(&self.clock);

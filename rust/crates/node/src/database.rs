@@ -51,7 +51,7 @@ impl Database {
     pub fn trie_catalog(&self) -> Arc<rtdb_index::TrieCatalog> { Arc::clone(self.partition.value().trie_catalog()) }
     pub fn object_store(&self) -> &Arc<dyn ObjectStore> { self.storage.object_store() }
     /// The database's latest applied state, read with no basis or system-time cap.
-    pub fn snapshot(&self) -> rtdb_index::Snapshot { self.partition.value().snapshot() }
+    pub fn snapshot(&self) -> rtdb_index::Snapshot { self.partition.snapshot() }
     pub fn storage(&self) -> &Arc<BufferPool> { &self.storage }
     /// Builds every artefact the lanes can currently build, returning once each is published or with the first failure.
     pub async fn build_artefacts(&self) -> Result<()> {
@@ -163,7 +163,7 @@ impl DatabaseFactory {
             let source = if self.options.replication.enabled && self.options.replication.may_lead && !read_only {
                 match &configuration.external_source { Some(source) => Some(self.external_factory(source)?.open(source, &name, Arc::clone(&io)).await?), None => None }
             } else { None };
-            let supervisor = MaintenanceSupervisor { store: resources.store, snapshots, replication: replication.clone(), compaction: compaction.clone(), artefacts: artefacts.clone(),
+            let supervisor = MaintenanceSupervisor { store: resources.store, partition: Arc::clone(&partition), replication: replication.clone(), compaction: compaction.clone(), artefacts: artefacts.clone(),
                 observer: Arc::clone(&self.observer), options: self.options.clone(), source };
             let database = Arc::new(Database { name, configuration, read_only, partition, storage, logs, replication, compaction, artefacts, cancellation: cancellation.clone(), io: Arc::clone(&io) });
             let driver = DatabaseDriver { database: Arc::clone(&database), replication: replica_driver, compactor, artefacts: artefact_drivers, supervisor, logs: opened_logs.drivers, log_cancellation };
@@ -256,7 +256,7 @@ impl TermRegion {
 
 struct MaintenanceSupervisor {
     store: Arc<dyn ObjectStore>,
-    snapshots: Arc<dyn SnapshotSource>,
+    partition: Arc<PartitionState>,
     replication: ReplicationHandle,
     compaction: Option<CompactionHandle>,
     artefacts: Vec<ArtefactHandle>,
@@ -269,8 +269,8 @@ impl MaintenanceSupervisor {
     async fn start_term(&mut self, handle: TermHandle, parent: &CancellationToken) -> Result<TermRegion> {
         let cancellation = parent.child_token();
         let publisher = Arc::new(PublishDeletions(handle.clone()));
-        let trie_collector = Arc::new(TrieCollector::new(Arc::clone(&self.store), Arc::clone(&self.snapshots), publisher, Arc::clone(&self.observer), self.options.garbage.clone())?);
-        let block_collector = Arc::new(BlockCollector::new(Arc::clone(&self.store), Arc::clone(&self.snapshots), Arc::clone(&self.observer), self.options.garbage.clone())?);
+        let trie_collector = Arc::new(TrieCollector::new(Arc::clone(&self.store), Arc::clone(&self.partition), publisher, Arc::clone(&self.observer), self.options.garbage.clone())?);
+        let block_collector = Arc::new(BlockCollector::new(Arc::clone(&self.store), self.partition.clone(), Arc::clone(&self.observer), self.options.garbage.clone())?);
         let (trie_driver, trie) = CycleDriver::new(trie_collector, self.options.automatic_gc, self.options.command_capacity)?;
         let (block_driver, blocks) = CycleDriver::new(block_collector, self.options.automatic_gc, self.options.command_capacity)?;
         let source = match &mut self.source {

@@ -1,12 +1,13 @@
 use std::collections::{BTreeMap, BTreeSet};
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 
-use parking_lot::RwLock;
+use parking_lot::{Mutex, RwLock};
 use rtdb_format::{catalog::{BlockCatalog, TableBlock}, keys::TrieKey};
 use rtdb_trie::TrieConfig;
 use rtdb_types::{Anomaly, BlockIndex, Result, TableRef, Timestamp};
 
-use crate::{CatalogTrie, LiveIndex, Snapshot, StagedWrite, TableCatalog, TableMeta, TrieCatalog};
+use crate::{CatalogTrie, LiveIndex, Snapshot, StagedWrite, TableCatalog, TableMeta, TrieCatalog, TrieState};
+use crate::reader_retention::any_reader_requires;
 
 #[derive(Clone, Debug)]
 pub struct PartitionValue {
@@ -48,15 +49,74 @@ impl BlockPreparation {
     }
 }
 
+#[derive(Debug, Default)]
+struct Retention {
+    readers: Vec<Weak<TrieCatalog>>,
+    collecting: Weak<()>,
+}
+
+pub struct TrieCollection {
+    current: Arc<PartitionValue>,
+    readers: Vec<Arc<TrieCatalog>>,
+    _collecting: Arc<()>,
+}
+
+impl TrieCollection {
+    pub fn current(&self) -> &PartitionValue { &self.current }
+
+    pub fn eligible(&self, table: &TableRef, as_of: Timestamp) -> Vec<TrieKey> {
+        self.current.trie_catalog().garbage_tries(table, as_of).into_iter()
+            .filter(|candidate| !any_reader_requires(self.readers.len(), |index| {
+                self.readers[index].trie(table, &candidate.key).is_some_and(|trie| trie.state == TrieState::Live)
+            }))
+            .map(|trie| trie.key.clone()).collect()
+    }
+}
+
 #[derive(Debug)]
-pub struct PartitionState { value: RwLock<Arc<PartitionValue>> }
+pub struct PartitionState {
+    value: RwLock<Arc<PartitionValue>>,
+    retention: Mutex<Retention>,
+}
 
 impl PartitionState {
-    pub fn new(initial: PartitionValue) -> Self { Self { value: RwLock::new(Arc::new(initial)) } }
+    pub fn new(initial: PartitionValue) -> Self {
+        Self { value: RwLock::new(Arc::new(initial)), retention: Mutex::new(Retention::default()) }
+    }
     pub fn empty(config: TrieConfig) -> Result<Self> {
         Ok(Self::new(PartitionValue::loaded(TrieCatalog::default(), TableCatalog::default().with_system_tables()?, config)?))
     }
     pub fn value(&self) -> Arc<PartitionValue> { Arc::clone(&self.value.read()) }
+
+    fn retain_catalog(&self, value: &PartitionValue) {
+        let mut retention = self.retention.lock();
+        let identity = Arc::as_ptr(value.trie_catalog());
+        if retention.readers.last().is_some_and(|reader| reader.as_ptr() == identity) {
+            return;
+        }
+        retention.readers.retain(|reader| reader.strong_count() != 0);
+        retention.readers.push(Arc::downgrade(value.trie_catalog()));
+    }
+
+    /// Captures the current catalog and open read references under the same state lock as snapshot admission.
+    pub fn trie_collection(&self) -> TrieCollection {
+        let value = self.value.read();
+        let mut retention = self.retention.lock();
+        let readers = retention.readers.iter().filter_map(Weak::upgrade).collect();
+        let collecting = retention.collecting.upgrade().unwrap_or_else(|| {
+            let collecting = Arc::new(());
+            retention.collecting = Arc::downgrade(&collecting);
+            collecting
+        });
+        TrieCollection { current: Arc::clone(&value), readers, _collecting: collecting }
+    }
+
+    /// Captures the latest applied state for a reader, including transaction resolution.
+    pub fn snapshot(&self) -> Snapshot {
+        let value = self.value.read();
+        self.retain_catalog(&value);
+        value.snapshot()
+    }
 
     /// The caller's basis barrier runs before this capture; this passive object never waits for log progress.
     pub fn open_snapshot(&self, min_system_time: Option<Timestamp>) -> Snapshot {
@@ -64,10 +124,14 @@ impl PartitionState {
         {
             let value = self.value.read();
             if let Some(live) = &value.live_snapshot {
-                if fresh(live) { return Snapshot::new(Arc::clone(&value.trie_catalog), Arc::clone(&value.table_catalog), Arc::clone(live)); }
+                if fresh(live) {
+                    self.retain_catalog(&value);
+                    return Snapshot::new(Arc::clone(&value.trie_catalog), Arc::clone(&value.table_catalog), Arc::clone(live));
+                }
             }
         }
         let mut value = self.value.write();
+        self.retain_catalog(&value);
         if let Some(live) = &value.live_snapshot {
             if fresh(live) { return Snapshot::new(Arc::clone(&value.trie_catalog), Arc::clone(&value.table_catalog), Arc::clone(live)); }
         }
@@ -78,7 +142,7 @@ impl PartitionState {
         snapshot
     }
 
-    pub fn resolving_snapshot(&self, predecessors: &[Arc<StagedWrite>]) -> Result<Snapshot> { self.value().snapshot().with_staged(predecessors) }
+    pub fn resolving_snapshot(&self, predecessors: &[Arc<StagedWrite>]) -> Result<Snapshot> { self.snapshot().with_staged(predecessors) }
 
     pub fn apply(&self, write: &StagedWrite) -> Result<()> {
         let mut value = self.value.write();
@@ -124,6 +188,9 @@ impl PartitionState {
     }
     pub fn reset_to_l0(&self, replacements: BTreeMap<TableRef, Vec<CatalogTrie>>) -> Result<()> {
         let mut value = self.value.write();
+        if self.retention.lock().collecting.strong_count() != 0 {
+            return Err(Anomaly::new(rtdb_types::AnomalyCategory::Conflict, "rtdb.compactor-reset/collecting", "Trie collection is still in progress"));
+        }
         let mut next = value.as_ref().clone();
         next.trie_catalog = Arc::new(value.trie_catalog.reset_to_l0(replacements)?);
         *value = Arc::new(next);

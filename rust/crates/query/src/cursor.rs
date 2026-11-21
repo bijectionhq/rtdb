@@ -196,7 +196,11 @@ impl PreparedQuery {
         self.open(context, parameters, None, Batching::Columns).await
     }
 
-    async fn open(&self, context: Arc<QueryContext>, mut parameters: Vec<Value>, text: Option<&str>, batching: Batching) -> Result<QueryCursor> {
+    async fn open(&self, context: Arc<QueryContext>, parameters: Vec<Value>, text: Option<&str>, batching: Batching) -> Result<QueryCursor> {
+        rtdb_storage::IoRegion::retaining(context.clone(), self.open_retained(context, parameters, text, batching)).await
+    }
+
+    async fn open_retained(&self, context: Arc<QueryContext>, mut parameters: Vec<Value>, text: Option<&str>, batching: Batching) -> Result<QueryCursor> {
         if parameters.len() < self.required_parameter_count { return Err(invalid("missing-parameter", "Query has fewer parameters than its prepared plan")); }
         for dependency in self.relation.dependencies() {
             let Some(current) = context.catalog.table(&dependency.name)? else {
@@ -301,7 +305,9 @@ impl QueryCursor {
         let owner = self.context.owner_cancellation.clone();
         if let Some(trace) = &mut self.trace { trace.start(); }
         let started = std::time::Instant::now();
-        let result = owner.run_until_cancelled(token.run_until_cancelled(self.pull_batch())).await.flatten().ok_or_else(cancelled);
+        let retention = self.context.clone();
+        let pull = owner.run_until_cancelled(token.run_until_cancelled(self.pull_batch()));
+        let result = rtdb_storage::IoRegion::retaining(retention, pull).await.flatten().ok_or_else(cancelled);
         match result {
             Ok(Ok(batch)) => { if let Some(trace) = &mut self.trace { trace.completed(started.elapsed(), batch.as_ref().map(|batch| batch.batch().num_rows())); } if batch.is_none() { self.input = None; } Ok(batch) }
             Ok(Err(error)) | Err(error) => { self.input = None; self.record_error(); Err(error) }

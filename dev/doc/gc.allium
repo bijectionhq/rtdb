@@ -14,6 +14,12 @@
 -- those deletions to the replica log so followers drop them from their
 -- in-memory catalogs at the same logical position.
 --
+-- Native collection within one partition authority captures eligibility and reader references together.
+-- A trie that is live in any captured reader catalog stays out of the collection batch.
+-- Query and transaction snapshots register at the partition owner's state boundary.
+-- An admitted provider operation retains that registration through completion, including after caller cancellation.
+-- Compactor reset requires collection authorization to drain before it can reopen key allocation.
+--
 -- Block-file GC lives in block-gc.allium — block files are consumed only at
 -- startup/catch-up, so they don't need replica-log coordination.
 --

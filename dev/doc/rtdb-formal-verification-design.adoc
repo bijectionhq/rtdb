@@ -659,7 +659,10 @@ The collection study must cover trie data, trie metadata, shared artefacts, cach
 The retained bounded study compared a validated lease and coordinated pin and exhibited age-only and stale-follower counterexamples.
 The first native cursor-and-collection diagnostic timed out waiting for a scheduled event.
 A later native diagnostic with an explicitly invoked eligible collector reproduced a missing required object in an open cursor.
-The default automatic scheduling path and the production retention protocol remain open. link:../../verification/tla/LeaseAdmission.tla[Current bounded comparison] · link:gc.allium[Trie collection contract]
+Rust now registers live query and transaction catalogs with their partition owner.
+The trie collector snapshots that registry with the current state and excludes dependencies of all retained reader catalogs.
+I/O regions keep those references through provider completion, and an in-progress collection prevents a compactor reset from reopening its key allocation.
+Runtime coordination across separate partition owners, recovery holds, and failover remains open. link:../../verification/tla/LeaseAdmission.tla[Bounded comparison] · link:gc.allium[Trie collection contract]
 
 == Production boundary and responsibilities
 
@@ -1082,7 +1085,10 @@ Lean proves the coordinated generation protocol's availability invariant for arb
 It checks the independence of preserving in-flight references from the availability invariant alone.
 The native diagnostic reproduced the failure under explicit eligible collection.
 Verus proved the latest-block and shared-sibling catalog decisions.
-|Choose the user-facing policy, establish its production storage boundary, and replay the resulting protection and collection paths.
+Verus checks the native selection loop's search of every captured reader catalog, under the visibility callback's contract.
+Native tests observe coexistence of open readers and collection of unrelated files, and retention through I/O cancellation for the same authority.
+|Connect reader admission and collection across separate nodes, including authority turnover and provider I/O.
+Establish recovery holds and show how all deletion entry points preserve the same lifetime contract.
 
 |Compaction
 |The exact-generation catalog guard addresses a Rust regression found by the two-generation TLC model.
