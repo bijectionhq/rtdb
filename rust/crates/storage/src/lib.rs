@@ -14,4 +14,4 @@ pub mod remote;
 pub use error::{Error, Result};
 pub use io_region::IoRegion;
 pub use read_lease::ReadLease;
-pub use object_store::{LocalFile, LocalStore, MemoryStore, ObjectKey, ObjectStore, ReadReservation, RetainedBytes, StoredObject};
+pub use object_store::{LocalFile, LocalStore, MemoryStore, ObjectKey, ObjectObservation, ObjectStore, ReadReservation, RetainedBytes, StoredObject};

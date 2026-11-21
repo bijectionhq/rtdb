@@ -259,6 +259,52 @@ mod tests {
         assert!(!config.endpoint_addressing().unwrap().1);
     }
     #[tokio::test]
+    async fn ranged_observation_uses_the_version_from_the_payload_response() {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut config = S3Config::new("cell");
+        config.endpoint = Some(format!("http://{}", listener.local_addr().unwrap()));
+        config.region = Some("us-east-1".into());
+        config.credentials = Some(S3Credentials { access_key: "test".into(), secret_key: "test-secret".into() });
+        let store = config.open_cell(&ObjectKey::new("root").unwrap(), &std::collections::BTreeMap::new(), IoRegion::new()).await.unwrap();
+        let file = ObjectKey::new("pack").unwrap();
+        let server = tokio::spawn(async move {
+            for (method, reply) in [
+                ("HEAD", "HTTP/1.1 200 OK\r\nContent-Length: 8\r\nx-amz-version-id: before\r\nConnection: close\r\n\r\n"),
+                ("GET", "HTTP/1.1 206 Partial Content\r\nContent-Range: bytes 2-4/8\r\nContent-Length: 3\r\nx-amz-version-id: observed\r\nConnection: close\r\n\r\ncde"),
+            ] {
+                let (stream, _) = listener.accept().await.unwrap();
+                let mut reader = BufReader::new(stream);
+                let mut line = String::new();
+                reader.read_line(&mut line).await.unwrap();
+                assert_eq!(line, format!("{method} /cell/root/pack HTTP/1.1\r\n"));
+                let mut ranged = false;
+                while line != "\r\n" {
+                    line.clear();
+                    assert_ne!(reader.read_line(&mut line).await.unwrap(), 0);
+                    ranged |= line.eq_ignore_ascii_case("range: bytes=2-4\r\n");
+                }
+                assert_eq!(ranged, method == "GET");
+                reader.get_mut().write_all(reply.as_bytes()).await.unwrap();
+            }
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            let head = store.observe_head(&file).await.unwrap();
+            assert_eq!(head.value.size, 8);
+            assert_eq!(head.version.unwrap().version, "before");
+            let read = store.observe_range(&file, 2..5).await.unwrap();
+            assert_eq!(read.value.as_ref(), b"cde");
+            let version = read.version.unwrap();
+            assert_eq!(version.key, "root/pack");
+            assert_eq!(version.version, "observed");
+            server.await.unwrap();
+        }).await.unwrap();
+        store.close_and_wait().await;
+    }
+
+    #[tokio::test]
     async fn retirement_observation_accepts_only_exact_version_ids() {
         use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
         use tokio::net::TcpListener;

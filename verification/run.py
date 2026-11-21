@@ -719,6 +719,16 @@ def verify_checkpoint_table_manifest(args, scratch):
                       "checkpoint-table-manifest", controls, 4)
 
 
+def verify_pack_publication_lean(args, scratch):
+    controls = {
+        "trust-trailer": ("trailerMatches : head = current", "trailerMatches : True", ["each_step_preserves_publication"]),
+        "trust-index": ("indexMatches : head = current", "indexMatches : True", ["each_step_preserves_publication"]),
+        "trust-member": ("memberMatches : index = current", "memberMatches : True", ["each_step_preserves_publication"]),
+    }
+    verify_lean_model(args, scratch, Path("verification/lean/PackPublicationObservation.lean"),
+                      "pack-publication-observation", controls, 2)
+
+
 def verify_reader_reclamation_minimality(args, scratch):
     path = Path("verification/lean/ReaderReclamationMinimality.lean")
     controls = {
@@ -1642,6 +1652,7 @@ def verify_lean(args, scratch):
             verify_checkpoint_metadata_retention(args, scratch)
             verify_published_checkpoint(args, scratch)
             verify_checkpoint_table_manifest(args, scratch)
+            verify_pack_publication_lean(args, scratch)
             verify_residence_reader_retention(args, scratch)
             verify_delegated_scan(args, scratch, directory)
             verify_compaction_projection(args, scratch, directory)
@@ -1869,6 +1880,21 @@ TLA_CASES = (
      ('Mutation = "none"', 'Mutation = "trust_path"'), "AcceptedMetadataMatches"),
     ("CheckpointTableManifest", "checkpoint-table-manifest-open-witness",
      ("INVARIANTS CompletePublication AcceptedMetadataMatches", "INVARIANT NeverOpensPublishedRoot"), "NeverOpensPublishedRoot"),
+    ("PackPublicationObservation", "pack-publication-observation", None, None),
+    ("PackPublicationObservation", "pack-publication-trust-trailer",
+     ('Mutation = "none"', 'Mutation = "ignore_trailer_version"'), "Safe"),
+    ("PackPublicationObservation", "pack-publication-trust-index",
+     ('Mutation = "none"', 'Mutation = "ignore_index_version"'), "Safe"),
+    ("PackPublicationObservation", "pack-publication-trust-member",
+     ('Mutation = "none"', 'Mutation = "ignore_member_version"'), "Safe"),
+    ("PackPublicationObservation", "pack-publication-rebind-path",
+     ('Mutation = "none"', 'Mutation = "rebind_same_path"'), "Safe"),
+    ("PackPublicationObservation", "pack-publication-reuse-after-copy",
+     ('Mutation = "none"', 'Mutation = "reuse_copied_index"'), "Safe"),
+    ("PackPublicationObservation", "pack-publication-cold-read-witness",
+     ("INVARIANT Safe", "INVARIANT NeverReadsOriginal"), "NeverReadsOriginal"),
+    ("PackPublicationObservation", "pack-publication-copy-witness",
+     ("INVARIANT Safe", "INVARIANT NeverReadsCopy"), "NeverReadsCopy"),
     ("CheckpointPackEvidence", "checkpoint-pack-evidence", None, None),
     ("CheckpointPackEvidence", "checkpoint-pack-evidence-trust-staged",
      ('Mode = "fresh"', 'Mode = "trust_staged"'), "CheckRequiresStoredPack"),
@@ -2272,6 +2298,13 @@ def verify_apalache(args, scratch):
     check_apalache(args, scratch, "CheckpointTableManifest", "checkpoint-table-manifest-trust-path",
                    "AcceptedMetadataMatches", 8, ('Mutation = "none"', 'Mutation = "trust_path"'),
                    "a valid table block appears under a different registered path")
+    check_apalache(args, scratch, "PackPublicationObservation", "pack-publication-observation", "Safe", 6)
+    check_apalache(args, scratch, "PackPublicationObservation", "pack-publication-trust-member", "MemberCoherent", 6,
+                   ('Mutation = "none"', 'Mutation = "ignore_member_version"'),
+                   "payload and index observations name different physical versions")
+    check_apalache(args, scratch, "PackPublicationObservation", "pack-publication-reuse-after-copy", "IndexCoherent", 6,
+                   ('Mutation = "none"', 'Mutation = "reuse_copied_index"'),
+                   "a moved reference supplies stale index evidence")
     check_apalache(args, scratch, "CheckpointPackEvidence", "checkpoint-pack-evidence", "CheckRequiresStoredPack", 7)
     check_apalache(args, scratch, "CheckpointPackEvidence", "checkpoint-pack-evidence-collection-between-check-and-submit",
                    "SubmitRequiresStoredPack", 7, counterexample="collection follows the fresh check before submission")
@@ -2530,6 +2563,7 @@ def verify_checkpoint_pack_evidence(args, source):
     cargo = ["cargo", "test", "--locked"]
     multi = [*cargo, "-p", "rtdb-multi", "--features", "dynamodb", "--lib"]
     replica = [*cargo, "-p", "rtdb-replication", "--lib"]
+    s3 = [*cargo, "-p", "rtdb-s3", "--features", "versioning", "--lib"]
     pack = "rust/crates/multi/src/packing.rs"
     store = "rust/crates/multi/src/store.rs"
     driver = "rust/crates/replication/src/driver.rs"
@@ -2537,14 +2571,17 @@ def verify_checkpoint_pack_evidence(args, source):
     retry = "packing::tests::an_encrypted_pack_retry_requires_durable_bytes_before_reporting_success"
     admission = "packing::tests::pack_index_admission_requires_entries_within_the_payload"
     promote = "driver::tests::promotion_requires_the_recovered_checkpoint_to_still_be_stored"
+    index_version = "packing::tests::pack_index_requires_one_physical_publication"
+    cached_version = "packing::tests::cached_pack_offsets_require_the_observed_physical_version"
+    member_version = "packing::tests::packed_member_bytes_match_the_admitted_pack_version"
+    copy_version = "packing::tests::a_fork_reads_the_copy_after_checking_the_destination_index"
+    provider = "tests::ranged_observation_uses_the_version_from_the_payload_response"
+    trailer_evidence = "    require_same_version(pack, head.version.as_ref(), trailer.version.as_ref())?;"
+    index_evidence = "    require_same_version(pack, head.version.as_ref(), encoded.version.as_ref())?;"
+    member_evidence = "        require_same_version(&location.pack, location.version.as_deref(), observed.version.as_ref())?;"
+    moved = "        let mut publication = read_pack_index(self.inner.as_ref(), &location.pack, head).await?;"
     header = "    async fn head_fresh(&self, object: &ObjectKey) -> rtdb_storage::Result<StoredObject> {"
-    cached = """        let Some((pack, entry)) = self.locate(object).await? else {
-            return self.inner.head_fresh(object).await;
-        };
-        let physical = self.inner.head_fresh(&pack).await?;
-        if !entry_fits(entry.offset, entry.length, physical.size) {
-            return Err(Error::Task(format!("The stored pack {pack} does not cover {object}")));
-        }"""
+    cached = "        let location = self.observe_location(object, location).await?;\n        Ok(StoredObject { key: object.clone(), size: location.entry.length })"
     forwarding = """    async fn get_fresh(&self, key: &ObjectKey) -> rtdb_storage::Result<Bytes> { self.inner.get_fresh(key).await }
     async fn get_fresh_exact(&self, key: &ObjectKey, length: usize) -> rtdb_storage::Result<Bytes> { self.inner.get_fresh_exact(key, length).await }
     async fn get_range(&self, key: &ObjectKey, range: Range<u64>) -> rtdb_storage::Result<Bytes> { self.inner.get_range(key, range).await }
@@ -2554,13 +2591,17 @@ def verify_checkpoint_pack_evidence(args, source):
         ("encrypted-retry", multi, retry, None),
         ("index-admission", multi, admission, None),
         ("promotion", replica, promote, None),
+        ("index-version", multi, index_version, None),
+        ("cached-version", multi, cached_version, None),
+        ("member-version", multi, member_version, None),
+        ("copy-version", multi, copy_version, None),
+        ("provider-version", s3, provider, None),
         ("trust-staged", multi, fresh, (
             pack, header, header + "\n        if let Some(bytes) = self.held(object) { return Ok(StoredObject { key: object.clone(), size: bytes.len() as u64 }); }",
             "staged bytes cannot supply fresh storage evidence",
         )),
         ("trust-cached", multi, fresh, (
-            pack, cached,
-            "        let Some((_, entry)) = self.locate(object).await? else { return self.inner.head_fresh(object).await; };",
+            pack, cached, "        Ok(StoredObject { key: object.clone(), size: location.entry.length })",
             "a cached pack entry cannot supply fresh storage evidence",
         )),
         ("ignore-index-extents", multi, admission, (
@@ -2575,6 +2616,27 @@ def verify_checkpoint_pack_evidence(args, source):
         ("confirm-missing-root", replica, promote, (
             driver, "        self.blocks.require_confirmation_files(checkpoint, &self.cancellation).await?;", "",
             "a missing recovered root cannot be submitted for confirmation",
+        )),
+        ("trust-trailer-version", multi, index_version, (
+            pack, trailer_evidence, "", "the trailer must match the provider metadata",
+        )),
+        ("trust-index-version", multi, index_version, (
+            pack, index_evidence, "", "the index must match the provider metadata",
+        )),
+        ("trust-member-version", multi, member_version, (
+            pack, member_evidence, "", "the returned bytes must come from the admitted pack",
+        )),
+        ("trust-rebound-path", multi, cached_version, (
+            pack, "            prior.namespace == current.namespace && prior.key != current.key",
+            "            prior.namespace == current.namespace", "the same pack path cannot inherit a cached index across versions",
+        )),
+        ("trust-index-after-copy", multi, copy_version, (
+            pack, moved, "        return Ok(LocatedEntry { version: head.version.map(Arc::new), ..location });\n        " + moved.lstrip(),
+            "a moved reference must validate the destination index",
+        )),
+        ("drop-provider-response-version", s3, provider, (
+            "rust/crates/storage/src/remote.rs", "            let version = physical_version(Some(&namespace), &path, response.meta.version.clone());",
+            "            let version = None;", "called `Option::unwrap()` on a `None` value",
         )),
     )
     for name, command, test, control in cases:
@@ -2596,7 +2658,7 @@ def verify_checkpoint_pack_evidence(args, source):
         if (checked.returncode != 101 or f"{test} ... FAILED" not in checked.stdout
             or failure not in checked.stdout or "0 passed; 1 failed" not in checked.stdout):
             raise ValueError(f"checkpoint pack control {name} missed its declared assertion")
-    print("rust-checkpoint-pack-evidence: four replays passed and five controls failed")
+    print("rust-checkpoint-pack-evidence: nine replays passed and eleven controls failed")
 
 
 def verify_checkpoint_table_manifest_replay(args, source):

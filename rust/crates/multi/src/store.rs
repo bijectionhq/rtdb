@@ -800,6 +800,12 @@ impl ObjectStore for FencedStore {
     fn supports_scan_ranges(&self, key: &ObjectKey) -> bool { self.inner.supports_scan_ranges(key) }
     async fn head(&self, key: &ObjectKey) -> rtdb_storage::Result<StoredObject> { self.inner.head(key).await }
     async fn head_fresh(&self, key: &ObjectKey) -> rtdb_storage::Result<StoredObject> { self.inner.head_fresh(key).await }
+    async fn observe_head(&self, key: &ObjectKey) -> rtdb_storage::Result<rtdb_storage::ObjectObservation<StoredObject>> {
+        self.inner.observe_head(key).await
+    }
+    async fn observe_range(&self, key: &ObjectKey, range: Range<u64>) -> rtdb_storage::Result<rtdb_storage::ObjectObservation<Bytes>> {
+        self.inner.observe_range(key, range).await
+    }
     async fn retirement_version(&self, key: &ObjectKey) -> rtdb_storage::Result<Option<rtdb_types::PhysicalObjectVersion>> {
         self.inner.retirement_version(key).await
     }

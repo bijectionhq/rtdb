@@ -42,6 +42,12 @@ pub struct StoredObject {
     pub size: u64,
 }
 
+/// Metadata or bytes and the physical version named by the same provider response.
+pub struct ObjectObservation<T> {
+    pub value: T,
+    pub version: Option<rtdb_types::PhysicalObjectVersion>,
+}
+
 pub struct ReadReservation {
     length: usize,
     retention: Box<dyn Send + Sync>,
@@ -119,6 +125,10 @@ pub trait ObjectStore: Send + Sync {
     /// Store wrappers must forward this request to the wrapped store's `head_fresh`.
     /// A missing key returns `Error::MissingObject`.
     async fn head_fresh(&self, key: &ObjectKey) -> Result<StoredObject> { self.head(key).await }
+    /// A fresh metadata read, with a provider version when the store can observe one.
+    async fn observe_head(&self, key: &ObjectKey) -> Result<ObjectObservation<StoredObject>> {
+        Ok(ObjectObservation { value: self.head_fresh(key).await?, version: None })
+    }
     /// Observes the current provider version of a loose object owned by this store.
     /// Missing, inherited, packed or unversioned objects return no evidence.
     async fn retirement_version(&self, _key: &ObjectKey) -> Result<Option<rtdb_types::PhysicalObjectVersion>> {
@@ -140,6 +150,10 @@ pub trait ObjectStore: Send + Sync {
     }
     /// Returns exactly the half-open byte range; an unavailable range is an error.
     async fn get_range(&self, key: &ObjectKey, range: Range<u64>) -> Result<Bytes>;
+    /// Reads the exact range and carries the physical version from this read, when available.
+    async fn observe_range(&self, key: &ObjectKey, range: Range<u64>) -> Result<ObjectObservation<Bytes>> {
+        Ok(ObjectObservation { value: self.get_range(key, range).await?, version: None })
+    }
     /// Whether a scan can read a slice without repeatedly loading the whole object.
     fn supports_scan_ranges(&self, _key: &ObjectKey) -> bool { true }
     /// Retains the allocation charge during the read and with the returned bytes.

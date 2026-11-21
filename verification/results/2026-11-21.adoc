@@ -2355,3 +2355,45 @@ The log is `/private/tmp/rtdb-formal.QMjPSJsX/checkpoint-pack-evidence-eab-jvm.l
 
 The checked production behaviour establishes backing-object presence at the read under the store's immutable-object contract.
 Exact provider publication identity, complete transitive checkpoint coverage and a joint hold through confirmation and replay remain open.
+
+=== Physical publication identity in packed reads
+
+The versioned S3 adapter returns each HEAD or range result with the physical identity from that response.
+The packing adapter matches those identities across the header, trailer, index and requested member range.
+Its write path records the version returned by the conditional pack publication.
+On a publication conflict it admits an existing pack only after comparing the prepared bytes with ranges from one verified physical version.
+A loaded index cannot be reused for a different version at the same path.
+A fork whose reference moves to an owned copy checks that copy's index and binds the returned bytes to its version.
+
+TLC checked all 44 states with one pack, a cold or cached index, and one change to absence, another version at the same path, or a fork copy.
+It rejected five weakened rules and reached both a cold read and a checked read of the copy.
+Apalache checked coherence through six transitions and independently found the mixed-member and stale-copy-index counterexamples.
+The model records are under `/private/tmp/rtdb-formal.QMjPSJsX/pack-publication-models-2xow2f23/`. link:../tla/PackPublicationObservation.tla[Model and controls]
+Lean 4.36.0 proved one-step preservation and preservation over arbitrary finite schedules in the abstract versioned read, over an arbitrary provider identity type.
+Three controls fail at the preservation law when the trailer, index or member check is dropped.
+The Lean records are under `/private/tmp/rtdb-formal.QMjPSJsX/pack-publication-lean-n1ba_r4j/`. link:../lean/PackPublicationObservation.lean[Schedule laws]
+The combined Verus run passed all 36 area baselines and matched all 181 controls on the rebased tree, including the production pack extent predicate.
+The records are under `/private/tmp/rtdb-formal.QMjPSJsX/pack-publication-verus-n2_qzwf9/`.
+
+The affected Rust selections passed 310 cases on parent `b55c2e013` with this change, including 85 Multi cell cases, with one optional case ignored.
+The log is `/private/tmp/rtdb-formal.QMjPSJsX/pack-publication-b55-rust-retry.log`.
+The provider replay checks the S3 HTTP adapter against a local endpoint with distinct metadata and range version identifiers.
+After rebasing onto `f536956ed`, nine exact Rust replays passed and all eleven mutations failed at their declared assertions.
+The new controls cover trailer, index and payload identity, a changed version at one path, index reuse after a fork transfer, and missing version evidence from the ranged response.
+The native records are under `/private/tmp/rtdb-formal.QMjPSJsX/pack-publication-native-bi498ewy/`.
+The four affected crate suites and Multi cell integration passed 319 cases on that parent, including 93 cell cases, with one optional case ignored.
+The log is `/private/tmp/rtdb-formal.QMjPSJsX/pack-publication-f536-rust.log`.
+The same 319 tests passed after rebasing onto `182eb4cdf`, with one optional case ignored.
+The log is `/private/tmp/rtdb-formal.QMjPSJsX/pack-publication-182-rust.log`.
+Five native checkpoint recovery cases passed on the same tree, covering interrupted publication, replay and collection overlap.
+The log is `/private/tmp/rtdb-formal.QMjPSJsX/pack-publication-182-recovery-conformance.log`.
+The standard JVM suite on parent `f536956ed` with this change passed 3,198 cases across nine tasks, with no skips.
+It used the library rebuilt from that tree, SHA-256 `8ac402c381aff7ba99fddb46a727d34f9a4382bc09470c22fa523d2297665765`.
+The log is `/private/tmp/rtdb-formal.QMjPSJsX/pack-publication-f536-jvm.log`.
+After the subscriber-freshness rebase onto `ea5265f16`, the affected Rust selections passed 321 cases, including 95 Multi cell cases, with one optional case ignored.
+The log is `/private/tmp/rtdb-formal.QMjPSJsX/pack-publication-ea-rust.log`.
+
+The checked property covers coherence within a versioned pack observation and across use of a cached pack index.
+For a transferred fork reference it assumes the reference and copy path preserves the logical data.
+Stores without a provider identity rely on the immutable-object contract.
+Cold directory admission still needs a durable receipt for the exact selected publication, its dependency closure and the joint checkpoint-and-suffix hold.

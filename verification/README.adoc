@@ -214,6 +214,9 @@ It also exercises the Azure adapter against a loopback provider and separately m
   It also checks the difference between observing the pack and holding it through confirmation submission.
   `verus/pack_extent` verifies the packing adapter's byte-range guard over all representable offsets and lengths.
   The native replays cover pack observations, encrypted retries, index admission and recovered-checkpoint confirmation.
+* `tla/PackPublicationObservation.tla` checks the identity shared by pack metadata, the trailer, the index and member reads, including a fork copy.
+  `lean/PackPublicationObservation.lean` proves preservation through arbitrary finite schedules in the versioned read model.
+  The Rust replays use a versioned memory store for pack inspection and a loopback S3 provider for version evidence from a ranged response.
 * `mcrl2/CheckpointDiscovery.mcrl2` compares the staged metadata discovery with an atomic observation contract after hiding the selection and individual reads.
   It checks divergence-preserving branching bisimilarity on three indices and generates a distinguishing formula for each weakened model.
 * `hyperltl/CheckpointRecovery.hltl` compares every pair of modeled startup schedules with the same stable, readable replacement.

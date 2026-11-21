@@ -14,7 +14,8 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use bytes::{BufMut, Bytes, BytesMut};
 use parking_lot::Mutex;
-use rtdb_storage::{Error, ObjectKey, ObjectStore, object_store::StoredObject};
+use rtdb_storage::{Error, ObjectKey, ObjectObservation, ObjectStore, StoredObject};
+use rtdb_types::PhysicalObjectVersion;
 use serde::{Deserialize, Serialize};
 
 mod extent;
@@ -84,23 +85,60 @@ pub fn encode_pack(objects: &BTreeMap<String, Bytes>, previous: Vec<String>, wri
 }
 
 pub async fn read_index(store: &dyn ObjectStore, pack: &ObjectKey) -> rtdb_storage::Result<PackIndex> {
-    let size = store.head(pack).await?.size;
+    Ok(read_pack_index(store, pack, store.observe_head(pack).await?).await?.value)
+}
+
+async fn read_pack_index(store: &dyn ObjectStore, pack: &ObjectKey, head: ObjectObservation<StoredObject>) -> rtdb_storage::Result<ObjectObservation<PackIndex>> {
+    let size = head.value.size;
     if size < 8 { return Err(Error::Task(format!("{pack} is too short to be a pack"))); }
-    let length = u64::from_be_bytes(store.get_range(pack, size - 8..size).await?.as_ref().try_into().expect("eight bytes"));
+    let trailer = store.observe_range(pack, size - 8..size).await?;
+    require_same_version(pack, head.version.as_ref(), trailer.version.as_ref())?;
+    let trailer = trailer.value.as_ref().try_into().map_err(|_| Error::Task(format!("{pack} has an incomplete trailer")))?;
+    let length = u64::from_be_bytes(trailer);
     let payload_end = (size - 8).checked_sub(length).ok_or_else(|| Error::Task(format!("{pack} has a malformed trailer")))?;
-    let encoded = store.get_range(pack, payload_end..size - 8).await?;
-    let index: PackIndex = serde_json::from_slice(&encoded).map_err(|error| Error::Task(format!("{pack} has a malformed index: {error}")))?;
+    let encoded = store.observe_range(pack, payload_end..size - 8).await?;
+    require_same_version(pack, head.version.as_ref(), encoded.version.as_ref())?;
+    let index: PackIndex = serde_json::from_slice(&encoded.value).map_err(|error| Error::Task(format!("{pack} has a malformed index: {error}")))?;
     if index.entries.values().any(|entry| !entry_fits(entry.offset, entry.length, payload_end)) {
         return Err(Error::Task(format!("{pack} has an entry outside its payload")));
     }
-    Ok(index)
+    Ok(ObjectObservation { value: index, version: head.version })
+}
+
+fn require_same_version(pack: &ObjectKey, expected: Option<&PhysicalObjectVersion>, observed: Option<&PhysicalObjectVersion>) -> rtdb_storage::Result<()> {
+    if expected != observed {
+        return Err(Error::Remote { key: pack.to_string(), message: "The pack publication changed during observation".into() });
+    }
+    Ok(())
+}
+
+#[derive(Clone)]
+struct LocatedEntry {
+    pack: ObjectKey,
+    entry: PackEntry,
+    version: Option<Arc<PhysicalObjectVersion>>,
+}
+
+enum PackRead { Full, Exact(usize), Range(Range<u64>) }
+
+impl PackRead {
+    fn extent(&self, object: &ObjectKey, entry: &PackEntry) -> rtdb_storage::Result<Range<u64>> {
+        let range = match self {
+            Self::Full => 0..entry.length,
+            Self::Exact(length) if *length as u64 == entry.length => 0..entry.length,
+            Self::Exact(_) => return Err(Error::Task(format!("Immutable object {object} has the wrong length"))),
+            Self::Range(range) if range.start <= range.end && range.end <= entry.length => range.clone(),
+            Self::Range(range) => return Err(Error::InvalidRange { key: object.to_string(), start: range.start, end: range.end, length: entry.length }),
+        };
+        Ok(entry.offset + range.start..entry.offset + range.end)
+    }
 }
 
 struct State {
     held: BTreeMap<String, Bytes>,
     held_bytes: usize,
     /// Which pack holds each packed object.
-    located: BTreeMap<String, (ObjectKey, PackEntry)>,
+    located: BTreeMap<String, LocatedEntry>,
     packs: Vec<ObjectKey>,
     discovery: PackDiscovery,
     /// The latest block whose pack this store has read.
@@ -108,6 +146,14 @@ struct State {
 }
 
 impl State {
+    fn register(&mut self, pack: ObjectKey, publication: &ObjectObservation<PackIndex>) {
+        let version = publication.version.clone().map(Arc::new);
+        for (object, entry) in &publication.value.entries {
+            self.located.insert(object.clone(), LocatedEntry { pack: pack.clone(), entry: entry.clone(), version: version.clone() });
+        }
+        if !self.packs.contains(&pack) { self.packs.push(pack); }
+    }
+
     fn hold(&mut self, object: &ObjectKey, bytes: Bytes) -> rtdb_storage::Result<()> {
         match self.held.entry(object.to_string()) {
             std::collections::btree_map::Entry::Occupied(entry) if entry.get() != &bytes => {
@@ -140,11 +186,13 @@ impl PackingStore {
     /// Reads the index of `pack` into the store, unless it already knows it; a pack named by a later one's index that has since been erased is skipped.
     async fn adopt(&self, pack: ObjectKey) -> rtdb_storage::Result<Option<PackIndex>> {
         if self.state.lock().packs.contains(&pack) { return Ok(None); }
-        let index = match read_index(self.inner.as_ref(), &pack).await { Ok(index) => index, Err(Error::MissingObject(_)) => return Ok(None), Err(error) => return Err(error) };
-        let mut state = self.state.lock();
-        for (object, entry) in &index.entries { state.located.insert(object.clone(), (pack.clone(), entry.clone())); }
-        state.packs.push(pack);
-        Ok(Some(index))
+        let publication = match self.observe_index(&pack).await {
+            Ok(publication) => publication,
+            Err(Error::MissingObject(_)) => return Ok(None),
+            Err(error) => return Err(error),
+        };
+        self.state.lock().register(pack, &publication);
+        Ok(Some(publication.value))
     }
 
     async fn refresh(&self) -> rtdb_storage::Result<()> {
@@ -186,38 +234,76 @@ impl PackingStore {
             None => (key(&format!("{PACK_DIRECTORY}/p{:020}-{}.pack", (self.clock)(), uuid::Uuid::new_v4().simple()))?, Vec::new()),
         };
         let (bytes, index) = encode_pack(&held, previous, (self.clock)());
-        if let Err(error) = self.inner.put(&name, bytes).await {
-            // Another store packed the block first: its pack serves, if it holds the same objects.
-            if matches!(error, Error::ConflictingObject(_)) && catalog.is_some() && self.same_pack(&name, &held).await? {
-                self.adopt(name).await?;
-                return Ok(());
+        let publication = match self.inner.put_with_version(&name, bytes).await {
+            Ok(version) => Ok(ObjectObservation { value: index, version }),
+            Err(error @ Error::ConflictingObject(_)) if catalog.is_some() => {
+                self.compare_pack(&name, &held).await.and_then(|same| same.ok_or(error))
             }
-            let mut state = self.state.lock();
-            for (object, bytes) in held { state.held.entry(object).or_insert(bytes); }
-            state.held_bytes = state.held.values().map(Bytes::len).sum();
-            return Err(error);
-        }
+            Err(error) => Err(error),
+        };
         let mut state = self.state.lock();
-        for (object, entry) in index.entries { state.located.insert(object, (name.clone(), entry)); }
-        state.packs.push(name);
-        Ok(())
+        match publication {
+            Ok(publication) => {
+                state.register(name, &publication);
+                Ok(())
+            }
+            Err(error) => {
+                for (object, bytes) in held { state.held.entry(object).or_insert(bytes); }
+                state.held_bytes = state.held.values().map(Bytes::len).sum();
+                Err(error)
+            }
+        }
     }
 
-    /// Whether the stored pack `name` holds exactly `objects`.
-    async fn same_pack(&self, name: &ObjectKey, objects: &BTreeMap<String, Bytes>) -> rtdb_storage::Result<bool> {
-        let index = read_index(self.inner.as_ref(), name).await?;
-        if index.entries.len() != objects.len() { return Ok(false); }
-        for (key, entry) in &index.entries {
-            let Some(bytes) = objects.get(key) else { return Ok(false) };
-            if self.inner.get_range(name, entry.offset..entry.offset + entry.length).await? != *bytes { return Ok(false); }
+    async fn observe_index(&self, pack: &ObjectKey) -> rtdb_storage::Result<ObjectObservation<PackIndex>> {
+        read_pack_index(self.inner.as_ref(), pack, self.inner.observe_head(pack).await?).await
+    }
+
+    /// Verifies an existing publication against all the bytes prepared for the block.
+    async fn compare_pack(&self, name: &ObjectKey, objects: &BTreeMap<String, Bytes>) -> rtdb_storage::Result<Option<ObjectObservation<PackIndex>>> {
+        let index = self.observe_index(name).await?;
+        if index.value.entries.len() != objects.len() { return Ok(None); }
+        for (key, entry) in &index.value.entries {
+            let Some(bytes) = objects.get(key) else { return Ok(None); };
+            let observed = self.inner.observe_range(name, entry.offset..entry.offset + entry.length).await?;
+            require_same_version(name, index.version.as_ref(), observed.version.as_ref())?;
+            if observed.value != *bytes { return Ok(None); }
         }
-        Ok(true)
+        Ok(Some(index))
+    }
+
+    async fn observe_location(&self, object: &ObjectKey, location: LocatedEntry) -> rtdb_storage::Result<LocatedEntry> {
+        let head = self.inner.observe_head(&location.pack).await?;
+        if location.version.as_deref() == head.version.as_ref() {
+            if !entry_fits(location.entry.offset, location.entry.length, head.value.size) {
+                return Err(Error::Task(format!("The stored pack {} does not cover {object}", location.pack)));
+            }
+            return Ok(location);
+        }
+        // A fork's reference can move to its own copy. A new version at the same physical path cannot inherit the admitted index.
+        let copied = location.version.as_deref().zip(head.version.as_ref()).is_some_and(|(prior, current)| {
+            prior.namespace == current.namespace && prior.key != current.key
+        });
+        if !copied {
+            require_same_version(&location.pack, location.version.as_deref(), head.version.as_ref())?;
+        }
+        let mut publication = read_pack_index(self.inner.as_ref(), &location.pack, head).await?;
+        let entry = publication.value.entries.remove(object.as_str()).ok_or_else(|| Error::MissingObject(object.to_string()))?;
+        Ok(LocatedEntry { pack: location.pack.clone(), entry, version: publication.version.map(Arc::new) })
+    }
+
+    async fn read_packed(&self, object: &ObjectKey, location: LocatedEntry, read: PackRead) -> rtdb_storage::Result<Bytes> {
+        let location = self.observe_location(object, location).await?;
+        let range = read.extent(object, &location.entry)?;
+        let observed = self.inner.observe_range(&location.pack, range).await?;
+        require_same_version(&location.pack, location.version.as_deref(), observed.version.as_ref())?;
+        Ok(observed.value)
     }
 
     fn held(&self, object: &ObjectKey) -> Option<Bytes> { self.state.lock().held.get(object.as_str()).cloned() }
-    fn located(&self, object: &ObjectKey) -> Option<(ObjectKey, PackEntry)> { self.state.lock().located.get(object.as_str()).cloned() }
+    fn located(&self, object: &ObjectKey) -> Option<LocatedEntry> { self.state.lock().located.get(object.as_str()).cloned() }
 
-    async fn locate(&self, object: &ObjectKey) -> rtdb_storage::Result<Option<(ObjectKey, PackEntry)>> {
+    async fn locate(&self, object: &ObjectKey) -> rtdb_storage::Result<Option<LocatedEntry>> {
         if let Some(found) = self.located(object) { return Ok(Some(found)); }
         if packed(object.as_str()) { self.refresh().await?; }
         Ok(self.located(object))
@@ -239,43 +325,34 @@ impl ObjectStore for PackingStore {
         if let Some(bytes) = self.held(object) { return Ok(StoredObject { key: object.clone(), size: bytes.len() as u64 }); }
         match self.inner.head(object).await {
             Err(Error::MissingObject(missing)) => match self.locate(object).await? {
-                Some((_, entry)) => Ok(StoredObject { key: object.clone(), size: entry.length }),
+                Some(location) => Ok(StoredObject { key: object.clone(), size: location.entry.length }),
                 None => Err(Error::MissingObject(missing)),
             },
             other => other,
         }
     }
     async fn head_fresh(&self, object: &ObjectKey) -> rtdb_storage::Result<StoredObject> {
-        let Some((pack, entry)) = self.locate(object).await? else {
+        let Some(location) = self.locate(object).await? else {
             return self.inner.head_fresh(object).await;
         };
-        let physical = self.inner.head_fresh(&pack).await?;
-        if !entry_fits(entry.offset, entry.length, physical.size) {
-            return Err(Error::Task(format!("The stored pack {pack} does not cover {object}")));
-        }
-        Ok(StoredObject { key: object.clone(), size: entry.length })
+        let location = self.observe_location(object, location).await?;
+        Ok(StoredObject { key: object.clone(), size: location.entry.length })
     }
-    async fn retirement_version(&self, key: &ObjectKey) -> rtdb_storage::Result<Option<rtdb_types::PhysicalObjectVersion>> {
+    async fn retirement_version(&self, key: &ObjectKey) -> rtdb_storage::Result<Option<PhysicalObjectVersion>> {
         if packed(key.as_str()) { return Ok(None); }
         self.inner.retirement_version(key).await
     }
     async fn get(&self, object: &ObjectKey) -> rtdb_storage::Result<Bytes> {
         if let Some(bytes) = self.held(object) { return Ok(bytes); }
-        if let Some((pack, entry)) = self.locate(object).await? { return self.inner.get_range(&pack, entry.offset..entry.offset + entry.length).await; }
+        if let Some(location) = self.locate(object).await? { return self.read_packed(object, location, PackRead::Full).await; }
         self.inner.get(object).await
     }
     async fn get_fresh(&self, object: &ObjectKey) -> rtdb_storage::Result<Bytes> {
-        if let Some((pack, entry)) = self.locate(object).await? {
-            return self.inner.get_range(&pack, entry.offset..entry.offset + entry.length).await;
-        }
+        if let Some(location) = self.locate(object).await? { return self.read_packed(object, location, PackRead::Full).await; }
         self.inner.get_fresh(object).await
     }
     async fn get_fresh_exact(&self, key: &ObjectKey, length: usize) -> rtdb_storage::Result<Bytes> {
-        let wrong_size = || Error::Task(format!("Immutable object {key} has the wrong length"));
-        if let Some((pack, entry)) = self.locate(key).await? {
-            if entry.length != length as u64 { return Err(wrong_size()); }
-            return self.inner.get_range(&pack, entry.offset..entry.offset + entry.length).await;
-        }
+        if let Some(location) = self.locate(key).await? { return self.read_packed(key, location, PackRead::Exact(length)).await; }
         self.inner.get_fresh_exact(key, length).await
     }
     async fn get_range(&self, object: &ObjectKey, range: Range<u64>) -> rtdb_storage::Result<Bytes> {
@@ -283,10 +360,7 @@ impl ObjectStore for PackingStore {
             if range.start > range.end || range.end > bytes.len() as u64 { return Err(Error::InvalidRange { key: object.to_string(), start: range.start, end: range.end, length: bytes.len() as u64 }); }
             return Ok(bytes.slice(range.start as usize..range.end as usize));
         }
-        if let Some((pack, entry)) = self.locate(object).await? {
-            if range.start > range.end || range.end > entry.length { return Err(Error::InvalidRange { key: object.to_string(), start: range.start, end: range.end, length: entry.length }); }
-            return self.inner.get_range(&pack, entry.offset + range.start..entry.offset + range.end).await;
-        }
+        if let Some(location) = self.locate(object).await? { return self.read_packed(object, location, PackRead::Range(range)).await; }
         self.inner.get_range(object, range).await
     }
     async fn put(&self, object: &ObjectKey, bytes: Bytes) -> rtdb_storage::Result<()> {
@@ -301,7 +375,7 @@ impl ObjectStore for PackingStore {
         if is_catalog(object.as_str()) {
             // Put-if-absent holds for a packed catalog as for any object: the same bytes again succeed, others conflict.
             if self.located(object).is_some() || self.locate(object).await?.is_some() {
-                if self.get(object).await? != bytes { return Err(Error::ConflictingObject(object.to_string())); }
+                if self.get_fresh(object).await? != bytes { return Err(Error::ConflictingObject(object.to_string())); }
                 // The block was packed already, by a deposed holder say: what this store held back for it is in that pack.
                 let mut state = self.state.lock();
                 let packed: Vec<String> = state.held.keys().filter(|key| state.located.contains_key(key.as_str())).cloned().collect();
@@ -342,7 +416,7 @@ impl ObjectStore for PackingStore {
         let mut listed: BTreeMap<String, StoredObject> = self.inner.list(directory).await?.into_iter()
             .filter(|object| !object.key.as_str().starts_with(PACK_DIRECTORY)).map(|object| (object.key.as_str().to_owned(), object)).collect();
         let state = self.state.lock();
-        for (name, (_, entry)) in &state.located { if under(name) { listed.entry(name.clone()).or_insert(StoredObject { key: key(name)?, size: entry.length }); } }
+        for (name, location) in &state.located { if under(name) { listed.entry(name.clone()).or_insert(StoredObject { key: key(name)?, size: location.entry.length }); } }
         for (name, bytes) in &state.held { if under(name) { listed.entry(name.clone()).or_insert(StoredObject { key: key(name)?, size: bytes.len() as u64 }); } }
         Ok(listed.into_values().collect())
     }
@@ -355,6 +429,128 @@ mod tests {
     use rtdb_storage::MemoryStore;
 
     fn object(name: &str) -> ObjectKey { ObjectKey::new(name).unwrap() }
+
+    #[derive(Default)]
+    struct VersionedPacks {
+        inner: MemoryStore,
+        versions: Mutex<BTreeMap<ObjectKey, usize>>,
+        ranges: std::sync::atomic::AtomicUsize,
+        change_on_range: std::sync::atomic::AtomicUsize,
+    }
+
+    impl VersionedPacks {
+        fn version(&self, key: &ObjectKey) -> PhysicalObjectVersion {
+            let version = self.versions.lock()[key];
+            PhysicalObjectVersion {
+                namespace: rtdb_types::S3ObjectNamespace { bucket: "test-cell".into(), endpoint: None, region: None },
+                key: key.to_string(), version: version.to_string(),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl ObjectStore for VersionedPacks {
+        async fn head(&self, key: &ObjectKey) -> rtdb_storage::Result<StoredObject> { self.inner.head(key).await }
+        async fn observe_head(&self, key: &ObjectKey) -> rtdb_storage::Result<ObjectObservation<StoredObject>> {
+            Ok(ObjectObservation { value: self.head(key).await?, version: Some(self.version(key)) })
+        }
+        async fn get(&self, key: &ObjectKey) -> rtdb_storage::Result<Bytes> { self.inner.get(key).await }
+        async fn get_range(&self, key: &ObjectKey, range: Range<u64>) -> rtdb_storage::Result<Bytes> { self.inner.get_range(key, range).await }
+        async fn observe_range(&self, key: &ObjectKey, range: Range<u64>) -> rtdb_storage::Result<ObjectObservation<Bytes>> {
+            use std::sync::atomic::Ordering::SeqCst;
+            let value = self.get_range(key, range).await?;
+            let mut version = self.version(key);
+            if self.ranges.fetch_add(1, SeqCst) + 1 == self.change_on_range.load(SeqCst) {
+                version.version = "changed".into();
+            }
+            Ok(ObjectObservation { value, version: Some(version) })
+        }
+        async fn put(&self, key: &ObjectKey, bytes: Bytes) -> rtdb_storage::Result<()> {
+            self.put_with_version(key, bytes).await.map(drop)
+        }
+        async fn put_with_version(&self, key: &ObjectKey, bytes: Bytes) -> rtdb_storage::Result<Option<PhysicalObjectVersion>> {
+            let existed = self.inner.head(key).await.is_ok();
+            self.inner.put(key, bytes).await?;
+            if !existed { *self.versions.lock().entry(key.clone()).or_default() += 1; }
+            Ok(Some(self.version(key)))
+        }
+        async fn put_file(&self, _: &ObjectKey, _: &Path) -> rtdb_storage::Result<()> { unreachable!("tests publish bytes") }
+        async fn list(&self, directory: Option<&ObjectKey>) -> rtdb_storage::Result<Vec<StoredObject>> { self.inner.list(directory).await }
+        async fn delete(&self, key: &ObjectKey) -> rtdb_storage::Result<()> { self.inner.delete(key).await }
+    }
+
+    #[tokio::test]
+    async fn pack_index_requires_one_physical_publication() {
+        use std::sync::atomic::Ordering::SeqCst;
+        let raw = Arc::new(VersionedPacks::default());
+        let store = PackingStore::open(raw.clone(), PackDiscovery::List).await.unwrap();
+        let root = catalog_key(0).unwrap();
+        store.put(&root, Bytes::from_static(b"catalog")).await.unwrap();
+        let pack = pack_key(0).unwrap();
+        for (read, message) in [(1, "the trailer must match the provider metadata"), (2, "the index must match the provider metadata")] {
+            raw.ranges.store(0, SeqCst);
+            raw.change_on_range.store(read, SeqCst);
+            assert!(matches!(read_index(raw.as_ref(), &pack).await, Err(Error::Remote { .. })), "{message}");
+        }
+        raw.change_on_range.store(0, SeqCst);
+        assert!(read_index(raw.as_ref(), &pack).await.unwrap().entries.contains_key(root.as_str()));
+    }
+
+    #[tokio::test]
+    async fn cached_pack_offsets_require_the_observed_physical_version() {
+        let raw = Arc::new(VersionedPacks::default());
+        let writer = PackingStore::open(raw.clone(), PackDiscovery::List).await.unwrap();
+        let root = catalog_key(0).unwrap();
+        writer.put(&root, Bytes::from_static(b"catalog")).await.unwrap();
+        let reader = PackingStore::open(raw.clone(), PackDiscovery::List).await.unwrap();
+        assert_eq!(reader.get_fresh(&root).await.unwrap().as_ref(), b"catalog");
+
+        let pack = pack_key(0).unwrap();
+        let bytes = raw.get(&pack).await.unwrap();
+        raw.delete(&pack).await.unwrap();
+        raw.put(&pack, bytes).await.unwrap();
+        for store in [writer, reader] {
+            assert!(matches!(store.head_fresh(&root).await, Err(Error::Remote { .. })), "the same pack path cannot inherit a cached index across versions");
+            assert!(matches!(store.get_range(&root, 0..7).await, Err(Error::Remote { .. })));
+        }
+    }
+
+    #[tokio::test]
+    async fn packed_member_bytes_match_the_admitted_pack_version() {
+        use std::sync::atomic::Ordering::SeqCst;
+        let raw = Arc::new(VersionedPacks::default());
+        let writer = PackingStore::open(raw.clone(), PackDiscovery::List).await.unwrap();
+        let root = catalog_key(0).unwrap();
+        writer.put(&root, Bytes::from_static(b"catalog")).await.unwrap();
+        raw.change_on_range.store(1, SeqCst);
+        assert!(matches!(writer.get_fresh_exact(&root, 7).await, Err(Error::Remote { .. })), "the returned bytes must come from the admitted pack");
+        assert_eq!(writer.get_fresh_exact(&root, 7).await.unwrap().as_ref(), b"catalog");
+    }
+
+    #[tokio::test]
+    async fn a_fork_reads_the_copy_after_checking_the_destination_index() {
+        use crate::reference::{Base, Bucket, PrefixedStore, ReferencingStore};
+        use std::sync::atomic::Ordering::SeqCst;
+        let raw = Arc::new(VersionedPacks::default());
+        let bucket: Bucket = raw.clone();
+        let root = catalog_key(0).unwrap();
+        let pack = pack_key(0).unwrap();
+        let entries = [(root.to_string(), Bytes::from_static(b"catalog"))].into_iter().collect();
+        let (contents, _) = encode_pack(&entries, Vec::new(), 0);
+        let parent = object(&format!("parent/{pack}"));
+        raw.put(&parent, contents.clone()).await.unwrap();
+        let own = Arc::new(PrefixedStore::new(bucket.clone(), "child"));
+        let base = Base { objects: BTreeMap::from([(pack.to_string(), "parent".into())]) };
+        let reader = PackingStore::open(Arc::new(ReferencingStore::new(own, bucket, base)), PackDiscovery::List).await.unwrap();
+        assert_eq!(reader.get_fresh(&root).await.unwrap().as_ref(), b"catalog");
+
+        raw.put(&object(&format!("child/{pack}")), contents).await.unwrap();
+        raw.delete(&parent).await.unwrap();
+        raw.ranges.store(0, SeqCst);
+        raw.change_on_range.store(2, SeqCst);
+        assert!(matches!(reader.get_fresh(&root).await, Err(Error::Remote { .. })), "a moved reference must validate the destination index");
+        assert_eq!(reader.get_fresh(&root).await.unwrap().as_ref(), b"catalog");
+    }
 
     #[tokio::test]
     async fn a_flush_costs_one_object_and_every_object_still_reads() {

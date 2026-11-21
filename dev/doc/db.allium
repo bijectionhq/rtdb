@@ -659,6 +659,7 @@ config {
 -- The same fresh storage check applies before submitting a new confirmation of the recovered current checkpoint.
 -- A packed file's check requires the containing pack to be present in storage.
 -- The pack index confines entries to the payload before the trailer.
+-- With provider versions, the pack metadata, trailer, index and each returned member range must name the same physical publication.
 -- Those files remain required until follower adoption.
 -- A failed historical check or older candidate preparation discards the remaining older confirmations.
 -- The writer continues recovery of the selected checkpoint.

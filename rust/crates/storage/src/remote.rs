@@ -1,4 +1,4 @@
-use crate::{Error, IoRegion, ObjectKey, ObjectStore, ReadReservation, Result, RetainedBytes, StoredObject};
+use crate::{Error, IoRegion, ObjectKey, ObjectObservation, ObjectStore, ReadReservation, Result, RetainedBytes, StoredObject};
 use async_trait::async_trait;
 use bytes::Bytes;
 use futures::TryStreamExt;
@@ -129,6 +129,17 @@ impl ObjectStore for RemoteStore {
         let (objects, key) = (Arc::clone(&self.objects), key.clone());
         self.io.run_async(async move { objects.head(&key).await }).await
     }
+    async fn observe_head(&self, key: &ObjectKey) -> Result<ObjectObservation<StoredObject>> {
+        let (objects, key, namespace) = (self.objects.clone(), key.clone(), self.version_namespace.clone());
+        self.io.run_async(async move {
+            let path = objects.path(&key);
+            let metadata = objects.client.head(&path).await.map_err(|error| provider_error(&key, error))?;
+            Ok(ObjectObservation {
+                version: physical_version(namespace.as_deref(), &path, metadata.version),
+                value: StoredObject { key, size: metadata.size },
+            })
+        }).await
+    }
     async fn retirement_version(&self, key: &ObjectKey) -> Result<Option<PhysicalObjectVersion>> {
         let Some(namespace) = self.version_namespace.clone() else { return Ok(None); };
         let objects = self.objects.clone();
@@ -154,6 +165,33 @@ impl ObjectStore for RemoteStore {
     async fn get_range(&self, key: &ObjectKey, range: Range<u64>) -> Result<Bytes> {
         let (objects, key) = (Arc::clone(&self.objects), key.clone());
         self.io.run_async(async move { objects.get_range(&key, range).await }).await
+    }
+    async fn observe_range(&self, key: &ObjectKey, range: Range<u64>) -> Result<ObjectObservation<Bytes>> {
+        let Some(namespace) = self.version_namespace.clone() else {
+            return Ok(ObjectObservation { value: self.get_range(key, range).await?, version: None });
+        };
+        if range.start >= range.end {
+            let observed = self.observe_head(key).await?;
+            if range.start == range.end && range.end <= observed.value.size {
+                return Ok(ObjectObservation { value: Bytes::new(), version: observed.version });
+            }
+            return Err(Error::InvalidRange { key: key.to_string(), start: range.start, end: range.end, length: observed.value.size });
+        }
+        let (objects, key) = (self.objects.clone(), key.clone());
+        self.io.run_async(async move {
+            let path = objects.path(&key);
+            let response = objects.client.get_opts(&path, GetOptions::new().with_range(Some(range.clone())))
+                .await.map_err(|error| provider_error(&key, error))?;
+            if response.range != range || response.meta.size < range.end {
+                return Err(Error::InvalidRange { key: key.to_string(), start: range.start, end: range.end, length: response.meta.size });
+            }
+            let version = physical_version(Some(&namespace), &path, response.meta.version.clone());
+            let value = response.bytes().await.map_err(|error| provider_error(&key, error))?;
+            if value.len() as u64 != range.end - range.start {
+                return Err(Error::Remote { key: key.to_string(), message: "provider returned an incomplete byte range".into() });
+            }
+            Ok(ObjectObservation { value, version })
+        }).await
     }
     async fn get_reserved_range(&self, key: &ObjectKey, range: Range<u64>, reservation: ReadReservation) -> Result<RetainedBytes> {
         reservation.check_range(&range)?;

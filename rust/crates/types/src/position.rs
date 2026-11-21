@@ -33,7 +33,7 @@ pub struct S3ObjectNamespace {
     pub region: Option<String>,
 }
 
-/// An observed version of a loose physical object. This carries no permission to erase it.
+/// An observed version of a physical object. This carries no permission to erase it.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PhysicalObjectVersion {
     pub namespace: S3ObjectNamespace,

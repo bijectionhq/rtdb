@@ -42,6 +42,9 @@ After R5, L0 files are ordinary garbage once compaction supersedes them (as in X
 - Multi fresh storage probes for checkpoint contents resolve through the durable pack or the provider's loose object.
   The writer probes the recovered current checkpoint as well as historical checkpoints before issuing a new confirmation.
   The bounded comparison checks storage presence at the probe and identifies the need for a hold through submission.
+- Versioned S3 pack metadata, index and member slices carry the provider identity of the response that supplied them.
+  A warm pack lookup refuses a different publication at the same physical path, and a fork copy requires a fresh index at the destination.
+  Cold recovery still needs a durable, externally trusted binding to the publication selected at the directory cut.
 - The trie collector protects the installed checkpoint's live and nascent tries within one partition authority.
 - Multi has recovery holds for the replica suffix (`rust/crates/multi/src/recovery_holds.rs`, peer commit `e298879a0`) and checkpoint-metadata holds (`rust/crates/multi/src/checkpoint_retention.rs`).
 - Models: `verification/tla/{InstalledCheckpoint,RecoveryReplay,Checkpoint,ResidenceRetirement}.tla`, `verification/mcrl2/CheckpointDiscovery.mcrl2`, the AutoHyper two-run check, and the Lean checkpoint-metadata laws.

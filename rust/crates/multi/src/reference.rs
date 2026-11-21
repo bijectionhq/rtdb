@@ -93,12 +93,20 @@ impl ObjectStore for PrefixedStore {
     async fn head(&self, key: &ObjectKey) -> rtdb_storage::Result<StoredObject> { Ok(StoredObject { key: key.clone(), size: self.bucket.head(&self.full(key)?).await?.size }) }
     async fn head_fresh(&self, key: &ObjectKey) -> rtdb_storage::Result<StoredObject> { Ok(StoredObject { key: key.clone(), size: self.bucket.head_fresh(&self.full(key)?).await?.size }) }
     async fn get_fresh(&self, key: &ObjectKey) -> rtdb_storage::Result<Bytes> { self.bucket.get_fresh(&self.full(key)?).await }
+    async fn observe_head(&self, key: &ObjectKey) -> rtdb_storage::Result<rtdb_storage::ObjectObservation<StoredObject>> {
+        let mut observed = self.bucket.observe_head(&self.full(key)?).await?;
+        observed.value.key = key.clone();
+        Ok(observed)
+    }
     async fn retirement_version(&self, key: &ObjectKey) -> rtdb_storage::Result<Option<rtdb_types::PhysicalObjectVersion>> {
         self.bucket.retirement_version(&self.full(key)?).await
     }
     async fn get(&self, key: &ObjectKey) -> rtdb_storage::Result<Bytes> { self.bucket.get(&self.full(key)?).await }
     async fn get_fresh_exact(&self, key: &ObjectKey, length: usize) -> rtdb_storage::Result<Bytes> { self.bucket.get_fresh_exact(&self.full(key)?, length).await }
     async fn get_range(&self, key: &ObjectKey, range: Range<u64>) -> rtdb_storage::Result<Bytes> { self.bucket.get_range(&self.full(key)?, range).await }
+    async fn observe_range(&self, key: &ObjectKey, range: Range<u64>) -> rtdb_storage::Result<rtdb_storage::ObjectObservation<Bytes>> {
+        self.bucket.observe_range(&self.full(key)?, range).await
+    }
     async fn put(&self, key: &ObjectKey, bytes: Bytes) -> rtdb_storage::Result<()> {
         let (writer, key) = self.mutation(key)?;
         writer.put(&key, bytes).await
@@ -162,6 +170,11 @@ impl ObjectStore for ReferencingStore {
         let object = self.read(key, |store, key| store.head_fresh(key)).await?;
         Ok(StoredObject { key: key.clone(), size: object.size })
     }
+    async fn observe_head(&self, key: &ObjectKey) -> rtdb_storage::Result<rtdb_storage::ObjectObservation<StoredObject>> {
+        let mut observed = self.read(key, |store, key| store.observe_head(key)).await?;
+        observed.value.key = key.clone();
+        Ok(observed)
+    }
     async fn retirement_version(&self, key: &ObjectKey) -> rtdb_storage::Result<Option<rtdb_types::PhysicalObjectVersion>> {
         if self.base.objects.contains_key(key.as_str()) { return Ok(None); }
         self.own.retirement_version(key).await
@@ -175,6 +188,9 @@ impl ObjectStore for ReferencingStore {
     async fn get_fresh_exact(&self, key: &ObjectKey, length: usize) -> rtdb_storage::Result<Bytes> { self.read(key, |store, key| store.get_fresh_exact(key, length)).await }
     async fn get_range(&self, key: &ObjectKey, range: Range<u64>) -> rtdb_storage::Result<Bytes> {
         self.read(key, |store, key| store.get_range(key, range.clone())).await
+    }
+    async fn observe_range(&self, key: &ObjectKey, range: Range<u64>) -> rtdb_storage::Result<rtdb_storage::ObjectObservation<Bytes>> {
+        self.read(key, |store, key| store.observe_range(key, range.clone())).await
     }
     async fn put(&self, key: &ObjectKey, bytes: Bytes) -> rtdb_storage::Result<()> {
         if self.base.objects.contains_key(key.as_str()) {

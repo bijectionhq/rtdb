@@ -315,6 +315,12 @@ impl ObjectStore for DiskCachedStore {
         let _operation = self.cache.begin_operation()?;
         self.cache.cancellation.run_until_cancelled(self.remote.head_fresh(key)).await.ok_or_else(cache_closed)?
     }
+    async fn observe_head(&self, key: &ObjectKey) -> Result<crate::ObjectObservation<StoredObject>> {
+        self.remote.observe_head(key).await
+    }
+    async fn observe_range(&self, key: &ObjectKey, range: Range<u64>) -> Result<crate::ObjectObservation<Bytes>> {
+        self.remote.observe_range(key, range).await
+    }
     async fn retirement_version(&self, key: &ObjectKey) -> Result<Option<rtdb_types::PhysicalObjectVersion>> {
         let _scope = self.io.admit()?;
         let _operation = self.cache.begin_operation()?;
