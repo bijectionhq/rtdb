@@ -1920,6 +1920,37 @@ def verify_trie_removal_readback(args, source):
     print("rust-trie-removal-readback: installed receipt passed, early receipt failed")
 
 
+def verify_durable_trie_retirement(args, source):
+    env = os.environ | {
+        "CARGO_TARGET_DIR": os.environ.get("CARGO_TARGET_DIR", str(ROOT / "target")),
+        "CARGO_PROFILE_TEST_DEBUG": "0",
+    }
+    test = "durable_retirement_intents_survive_writer_stop_on_both_sides_of_installation"
+    command = ["cargo", "test", "--locked", "-p", "rtdb-maintenance", "--test", "gc", test, "--", "--exact"]
+    baseline = run_case(command, source / "rust", args.evidence, "rust-trie-retirement-intent-baseline", env)
+    if baseline.returncode or f"{test} ... ok" not in baseline.stdout or "1 passed; 0 failed" not in baseline.stdout:
+        raise ValueError("native restart failed to recover the staged retirement")
+
+    journal = source / "rust/crates/maintenance/src/retirement_intent.rs"
+    original = journal.read_bytes()
+    controls = {
+        "skip-stage": ("store.put(&pending.intent, pending.encoded.clone()).await?;", "", "retirement intent was not durable before publication"),
+        "skip-replay": ("if keys.iter().all(|key| !view.retains_trie(&intent.table, key)) {",
+                        "if false && keys.iter().all(|key| !view.retains_trie(&intent.table, key)) {",
+                        "the successor must confirm the staged removal"),
+    }
+    for name, (before, after, failure) in controls.items():
+        try:
+            replace_once(journal, before, after)
+            checked = run_case(command, source / "rust", args.evidence, f"rust-trie-retirement-intent-{name}", env)
+            if (checked.returncode != 101 or f"{test} ... FAILED" not in checked.stdout
+                or failure not in checked.stdout or "0 passed; 1 failed" not in checked.stdout):
+                raise ValueError(f"trie retirement control {name} did not fail at its declared assertion")
+        finally:
+            journal.write_bytes(original)
+    print("rust-trie-retirement-intent: restart passed, omitting stage or replay failed")
+
+
 def verify_replay_prefix(args, source):
     env = os.environ | {
         "CARGO_TARGET_DIR": str(ROOT / "target"),
@@ -2518,6 +2549,7 @@ def main():
         "rust/crates/index/src/trie_catalog.rs",
         "rust/crates/index/tests/catalogs.rs",
         "rust/crates/maintenance/src/gc.rs",
+        "rust/crates/maintenance/src/retirement_intent.rs",
         "rust/crates/maintenance/tests/gc.rs",
         "rust/crates/index/src/partition.rs",
         "rust/crates/query/src/cursor.rs",
@@ -2600,6 +2632,7 @@ def main():
             verify_checkpoint_replay(args, source)
             verify_checkpoint_trie_retention(args, source)
             verify_trie_removal_readback(args, source)
+            verify_durable_trie_retirement(args, source)
             verify_replay_prefix(args, source)
             verify_multi_trim_admission(args, source)
             verify_recovery_hold_replay(args, source)

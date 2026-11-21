@@ -3,12 +3,12 @@ use std::sync::{Arc, Mutex, atomic::{AtomicI64, Ordering}};
 use std::time::Duration;
 use async_trait::async_trait;
 use bytes::Bytes;
-use rtdb_format::{block::proto as pb, catalog::BlockCatalog, keys::{TrieKey, block_key, oversized_key}};
+use rtdb_format::{block::proto as pb, catalog::BlockCatalog, keys::{TRIE_RETIREMENT_DIRECTORY, TrieKey, block_key, oversized_key}};
 use rtdb_index::{CatalogTrie, PartitionState, PartitionValue, TableCatalog, TrieCatalog, TrieState};
 use rtdb_maintenance::{BlockCollector, CollectionObserver, CycleWorker, GarbageConfig, TrieCollector, TrieDeletionPublisher, block_is_garbage};
-use rtdb_storage::{IoRegion, MemoryStore, ObjectKey, ObjectStore};
+use rtdb_storage::{IoRegion, LocalStore, MemoryStore, ObjectKey, ObjectStore};
 use rtdb_trie::TrieConfig;
-use rtdb_types::{Anomaly, BlockIndex, ReplicaPosition, Result, TableRef, Timestamp};
+use rtdb_types::{Anomaly, BlockIndex, CatalogCut, ReplicaPosition, Result, StorageEpoch, StorageVersion, TableRef, Timestamp};
 use tokio_util::sync::CancellationToken;
 
 #[derive(Default)]
@@ -108,6 +108,93 @@ async fn trie_gc_deletes_artefacts_and_both_files_before_publishing_and_preserve
     assert!(store.head(&live_artefact).await.is_ok(), "a live trie's artefacts stay");
     collector.collect_as_of(Timestamp(100), &CancellationToken::new()).await.unwrap();
     assert_eq!(publisher.commits.lock().unwrap().len(), 2);
+}
+
+#[derive(Clone, Copy)]
+enum Removal { StopBeforeInstall, StopAfterInstall, Complete }
+
+struct InstallingPublisher {
+    phase: Removal,
+    state: Arc<PartitionState>,
+    scope: CatalogCut,
+    store: Arc<LocalStore>,
+    pending: ObjectKey,
+    requests: Mutex<Vec<Vec<TrieKey>>>,
+}
+
+#[async_trait]
+impl TrieDeletionPublisher for InstallingPublisher {
+    async fn publish(&self, table: TableRef, keys: Vec<TrieKey>) -> Result<ReplicaPosition> {
+        if !matches!(self.phase, Removal::Complete) {
+            assert_eq!(self.store.list(Some(&self.pending)).await.unwrap().len(), 1, "retirement intent was not durable before publication");
+        }
+        self.requests.lock().unwrap().push(keys.clone());
+        if !matches!(self.phase, Removal::StopBeforeInstall) {
+            let previous = self.state.value().snapshot().catalog_cut().unwrap();
+            self.state.delete_tries(&BTreeMap::from([(table, keys.into_iter().collect())]));
+            let through = ReplicaPosition(previous.through.0 + 1);
+            self.state.publish_catalog_cut(CatalogCut { through, ..self.scope }).unwrap();
+            if matches!(self.phase, Removal::Complete) { return Ok(through); }
+        }
+        Err(Anomaly::fault("test/stopped", "The writer stopped before persisting its receipt"))
+    }
+}
+
+#[tokio::test]
+async fn durable_retirement_intents_survive_writer_stop_on_both_sides_of_installation() {
+    for failed in [Removal::StopBeforeInstall, Removal::StopAfterInstall] {
+        let table = TableRef::new("public", "docs");
+        let tables = TableCatalog::default().with_seeded_table(table.clone(), Vec::new()).unwrap();
+        let old: TrieKey = "l01-rc-b00".parse().unwrap();
+        let newer: TrieKey = "l01-rc-b01".parse().unwrap();
+        let catalog = TrieCatalog::new(16).unwrap().with_tries(table.clone(), [old.clone(), newer].into_iter().map(|key| {
+            CatalogTrie::notification(key, 1, None).unwrap()
+        }), Timestamp(100)).unwrap();
+        let state = Arc::new(PartitionState::new(PartitionValue::loaded(catalog, tables, TrieConfig::default()).unwrap()));
+        let scope = CatalogCut { storage_version: StorageVersion(6), storage_epoch: StorageEpoch(0), replica_epoch: StorageEpoch(0), through: ReplicaPosition(0) };
+        state.publish_catalog_cut(scope).unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let store = Arc::new(LocalStore::open(directory.path()).unwrap());
+        let pending = ObjectKey::new(format!("{TRIE_RETIREMENT_DIRECTORY}/6-0-0/pending")).unwrap();
+        let installed = ObjectKey::new(format!("{TRIE_RETIREMENT_DIRECTORY}/6-0-0/installed")).unwrap();
+        let publisher = |phase, store: Arc<LocalStore>| Arc::new(InstallingPublisher {
+            phase, state: state.clone(), scope, store, pending: pending.clone(), requests: Mutex::new(Vec::new()),
+        });
+        let collector = |store: Arc<LocalStore>, publisher: Arc<InstallingPublisher>, observer: Arc<Observer>| {
+            TrieCollector::new(store, state.clone(), publisher, observer, unleased(), fixed_clock()).unwrap()
+        };
+        let owner = publisher(failed, store.clone());
+        let observer = Arc::new(Observer::default());
+        let first = collector(store.clone(), owner.clone(), observer.clone());
+        let cancellation = CancellationToken::new();
+        first.collect_as_of(Timestamp(100), &cancellation).await.unwrap();
+        drop(first);
+        assert_eq!(*owner.requests.lock().unwrap(), [vec![old.clone()]]);
+        assert_eq!(observer.0.lock().unwrap()[0].code, "test/stopped");
+        let staged = store.list(Some(&pending)).await.unwrap();
+        assert_eq!(staged.len(), 1);
+        let staged_bytes = store.get(&staged[0].key).await.unwrap();
+        assert!(store.list(Some(&installed)).await.unwrap().is_empty());
+        drop(owner);
+        drop(store);
+
+        let store = Arc::new(LocalStore::open(directory.path()).unwrap());
+        let replacement = publisher(Removal::Complete, store.clone());
+        let next = collector(store.clone(), replacement.clone(), Arc::new(Observer::default()));
+        next.collect_as_of(Timestamp(100), &cancellation).await.unwrap();
+        assert_eq!(*replacement.requests.lock().unwrap(), [vec![old.clone()]], "the successor must confirm the staged removal");
+        assert!(!state.value().retains_trie(&table, &old));
+        assert!(store.list(Some(&pending)).await.unwrap().is_empty());
+        let receipts = store.list(Some(&installed)).await.unwrap();
+        assert_eq!(receipts.len(), 1);
+        let receipt = store.get(&receipts[0].key).await.unwrap();
+        assert_eq!(&receipt[8..], staged_bytes.as_ref(), "the receipt retains the accepted intent");
+
+        store.put(&staged[0].key, staged_bytes).await.unwrap();
+        next.collect_as_of(Timestamp(100), &cancellation).await.unwrap();
+        assert_eq!(replacement.requests.lock().unwrap().len(), 1, "the durable receipt already covers the batch");
+        assert!(store.list(Some(&pending)).await.unwrap().is_empty());
+    }
 }
 
 #[tokio::test]

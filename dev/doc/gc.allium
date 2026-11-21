@@ -36,6 +36,11 @@
 -- The native leader acknowledges a trie removal after its known installed replica prefix covers the removal record.
 -- The immutable partition value at acknowledgement contains neither a requested key nor a checkpoint dependency on that key.
 -- A skipped replay record or an unrecognized prefix cannot supply this acknowledgement.
+-- When its partition has an installed catalog cut, the native collector persists an intent for each batch before releasing files or submitting the removal.
+-- It records a later receipt from that journal before releasing the intent marker.
+-- A new collector checks pending intents in the same storage root and journal.
+-- Where the installed catalog and checkpoint already exclude the requested keys, it can re-confirm their removal through replication.
+-- Source-residence retirement metadata stays outside fork publication and cell materialization.
 -- A new collector, after restart or failover, observes afresh.
 -- Both sides measure elapsed time, so clocks need no synchronization; the margin covers twice the rate drift over one lease plus the longest provider request.
 --

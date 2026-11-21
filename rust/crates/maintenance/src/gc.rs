@@ -6,10 +6,11 @@ use futures::{StreamExt, stream};
 use rtdb_format::{catalog::{BlockCatalog, TableEntry}, keys::{PartGroup, TrieKey, block_index_from_key, oversized_block_index}};
 use rtdb_index::PartitionState;
 use rtdb_storage::{IoRegion, ObjectKey, ObjectStore};
-use rtdb_types::{Anomaly, BlockIndex, Result, TableRef, Timestamp};
+use rtdb_types::{Anomaly, BlockIndex, CatalogCut, Result, TableRef, Timestamp};
 use tokio::sync::Semaphore;
 use tokio_util::sync::CancellationToken;
 use crate::{CycleWorker, SnapshotSource, TrieDeletionPublisher};
+use crate::retirement_intent::{self, PendingRetirement};
 
 #[derive(Clone, Debug)]
 pub struct GarbageConfig {
@@ -105,6 +106,12 @@ impl TrieCollector {
 
     pub async fn collect_as_of(&self, as_of: Timestamp, cancellation: &CancellationToken) -> Result<()> {
         let collection = Arc::new(self.partition.trie_collection());
+        let cut = collection.current().snapshot().catalog_cut();
+        if let Some(cut) = cut {
+            IoRegion::retaining(collection.clone(), retirement_intent::resume(
+                self.store.as_ref(), self.publisher.as_ref(), collection.current(), cut, cancellation,
+            )).await?;
+        }
         let tables: Vec<_> = collection.current().table_catalog().entries().cloned().collect();
         let deletes = Arc::new(Semaphore::new(self.config.delete_parallelism));
         let tasks = stream::iter(tables).map(|entry| {
@@ -116,7 +123,7 @@ impl TrieCollector {
                     Err(error) => { self.observer.table_failed(Some(&entry.table), &error); return; }
                 };
                 let groups = finished_groups(collection.current().trie_catalog(), &entry.table, &keys);
-                let result = IoRegion::retaining(collection, self.collect_table(&entry, &keys, &groups, &deletes, cancellation)).await;
+                let result = IoRegion::retaining(collection, self.collect_table(&entry, &keys, &groups, cut, &deletes, cancellation)).await;
                 if let Err(error) = &result { if !cancellation.is_cancelled() { self.observer.table_failed(Some(&entry.table), error); } }
             }
         });
@@ -124,7 +131,17 @@ impl TrieCollector {
         if cancellation.is_cancelled() { Err(crate::closed()) } else { Ok(()) }
     }
 
-    async fn collect_table(&self, entry: &TableEntry, keys: &[TrieKey], groups: &BTreeSet<PartGroup>, deletes: &Semaphore, cancellation: &CancellationToken) -> Result<()> {
+    async fn collect_table(&self, entry: &TableEntry, keys: &[TrieKey], groups: &BTreeSet<PartGroup>, cut: Option<CatalogCut>, deletes: &Semaphore, cancellation: &CancellationToken) -> Result<()> {
+        if keys.iter().any(|key| key.level() == 0) { return Err(crate::invalid("L0 recovery files cannot be garbage collected")); }
+        let mut batches = Vec::new();
+        for chunk in keys.chunks(self.config.chunk_size) {
+            if cancellation.is_cancelled() { return Err(crate::closed()); }
+            let intent = match cut {
+                Some(cut) => Some(PendingRetirement::stage(self.store.as_ref(), cut, &entry.table, chunk).await?),
+                None => None,
+            };
+            batches.push((chunk, intent));
+        }
         // A group's artefacts are derived from every member's data file, so they go before any member's.
         for group in groups {
             if cancellation.is_cancelled() { return Err(crate::closed()); }
@@ -133,9 +150,8 @@ impl TrieCollector {
                 self.store.delete(&artefact.key).await.map_err(crate::invalid)?;
             }
         }
-        for chunk in keys.chunks(self.config.chunk_size) {
+        for (chunk, intent) in batches {
             if cancellation.is_cancelled() { return Err(crate::closed()); }
-            if chunk.iter().any(|key| key.level() == 0) { return Err(crate::invalid("L0 recovery files cannot be garbage collected")); }
             let results = stream::iter(0..chunk.len()).map(|index| async move {
                 let key = &chunk[index];
                 let _permit = deletes.acquire().await.map_err(crate::invalid)?;
@@ -150,7 +166,8 @@ impl TrieCollector {
             }).buffer_unordered(self.config.delete_parallelism).collect::<Vec<Result<()>>>().await;
             for result in results { result?; }
             if cancellation.is_cancelled() { return Err(crate::closed()); }
-            self.publisher.publish(entry.table.clone(), chunk.to_vec()).await?;
+            let position = self.publisher.publish(entry.table.clone(), chunk.to_vec()).await?;
+            if let Some(intent) = intent { intent.finish(self.store.as_ref(), position).await?; }
         }
         Ok(())
     }

@@ -6,6 +6,14 @@ use serde::Serialize;
 
 pub const CURRENT_STORAGE_VERSION: StorageVersion = StorageVersion(6);
 
+/// Retirement intents and installed receipts belong to the residence that writes them.
+pub const TRIE_RETIREMENT_DIRECTORY: &str = "~trie-retirements";
+
+pub fn is_trie_retirement_object(key: &str) -> bool {
+    key == TRIE_RETIREMENT_DIRECTORY || key.strip_prefix(TRIE_RETIREMENT_DIRECTORY)
+        .is_some_and(|suffix| suffix.starts_with('/'))
+}
+
 /// Independently derived ordered indexes belong to one source history.
 pub const ORDERED_INDEX_ROOT: &str = "ordered-index/v2";
 
