@@ -7,6 +7,7 @@ use rtdb_types::{Anomaly, Iid, Result};
 use serde::{Deserialize, Serialize};
 
 use crate::bucketer::invalid_bucket_depth;
+use crate::leaf_merge_step::merge_sorted_rows;
 use crate::partition_step::group_base4_rows;
 use crate::{Bucketer, Path};
 
@@ -184,15 +185,7 @@ fn sort<R: IidReader + ?Sized>(reader: &R, rows: impl Iterator<Item = u32>) -> R
 }
 
 fn merge<R: IidReader + ?Sized>(reader: &R, left: &[u32], right: &[u32]) -> Result<Vec<u32>> {
-    let mut merged = Vec::with_capacity(left.len() + right.len());
-    let (mut li, mut ri) = (0, 0);
-    while li < left.len() && ri < right.len() {
-        if compare(reader, left[li], right[ri])? == Ordering::Less { merged.push(left[li]); li += 1; }
-        else { merged.push(right[ri]); ri += 1; }
-    }
-    merged.extend_from_slice(&left[li..]);
-    merged.extend_from_slice(&right[ri..]);
-    Ok(merged)
+    merge_sorted_rows(left, right, |left, right| compare(reader, left, right))
 }
 
 fn insert_rows<R: IidReader + ?Sized>(

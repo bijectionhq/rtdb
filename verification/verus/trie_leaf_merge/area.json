@@ -1,0 +1,67 @@
+{
+  "summary": "The production leaf merge returns a sorted sequence containing every occurrence from both input runs.",
+  "flags": ["--no-external-by-default", "--verify-module", "production", "--verify-module", "laws"],
+  "min_verified_functions": 14,
+  "controls": {
+    "take_larger_head": {
+      "defect": "The merge selects the larger head before the smaller one.",
+      "mutate": [{
+        "file": "rust/crates/trie/src/leaf_merge_step.rs",
+        "find": "if let Ordering::Less = order {",
+        "replace": "if let Ordering::Greater = order {"
+      }],
+      "expect": [{
+        "file": "rust/crates/trie/src/leaf_merge_step.rs",
+        "function": "merge_sorted_rows",
+        "category": "precondition not satisfied"
+      }, {
+        "file": "rust/crates/trie/src/leaf_merge_step.rs",
+        "function": "merge_sorted_rows",
+        "category": "precondition not satisfied"
+      }],
+      "min_verified_functions": 13
+    },
+    "omit_right_tail": {
+      "defect": "The unconsumed right run is omitted.",
+      "mutate": [{
+        "file": "rust/crates/trie/src/leaf_merge_step.rs",
+        "find": "    merged.extend_from_slice(&right[ri..]);",
+        "replace": ""
+      }],
+      "expect": [{
+        "file": "rust/crates/trie/src/leaf_merge_step.rs",
+        "function": "merge_sorted_rows",
+        "category": "assertion failed"
+      }],
+      "min_verified_functions": 13
+    },
+    "drop_right_head": {
+      "defect": "An occurrence from the right run is consumed without being emitted.",
+      "mutate": [{
+        "file": "rust/crates/trie/src/leaf_merge_step.rs",
+        "find": "            merged.push(right[ri]);",
+        "replace": ""
+      }],
+      "expect": [{
+        "file": "rust/crates/trie/src/leaf_merge_step.rs",
+        "function": "merge_sorted_rows",
+        "category": "assertion failed"
+      }],
+      "min_verified_functions": 13
+    },
+    "reverse_within_iid_order": {
+      "defect": "The reference rank sorts increasing row indices for the same IID.",
+      "mutate": [{
+        "file": "verification/verus/trie_leaf_merge/laws.rs",
+        "find": "unsigned_bytes(iid) * (u32::MAX as int + 1) + (u32::MAX as int - index as int)",
+        "replace": "unsigned_bytes(iid) * (u32::MAX as int + 1) + index as int"
+      }],
+      "expect": [{
+        "file": "verification/verus/trie_leaf_merge/laws.rs",
+        "function": "rank_is_unsigned_iid_then_descending_index",
+        "category": "postcondition not satisfied"
+      }],
+      "min_verified_functions": 13
+    }
+  }
+}

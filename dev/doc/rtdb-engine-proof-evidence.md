@@ -34,6 +34,7 @@ These results apply to the classic and full-text Rust paths at the particular re
 | LOG13 · Journal retirement | Lean proves that replay and compaction preserve the retirement marker, and that completion requires every addressed replica. Kani checks replay of the production `Drop` event and subsequent commit refusal on an empty stream. Native replicas exercise retirement retry, restart, and direct checks for removed payloads. | Prove the runtime journal and fsync transitions, the inventory of all required replicas after copy or move, and the storage and deletion receipt contracts. |
 | CELL09, STORE10 and Multi recovery S2, S5 · Worker loss | A local MinIO and PgWire regression retains the checkpoint and acknowledged suffix, compares current rows and the full bitemporal projection, and verifies new writes after losing one, two, and all three compute workers. | Prove the complete activation and recovery path under the published durable-service and liveness assumptions. |
 | IDX02, IDX04, IDX06, IDX07 | Verus checks the production Rust base-four IID digit, path comparison, and stable partition of an insertion or split batch at every valid depth. The Kani harness also checks all legal depths and the independent bit-extraction rule for width 2, 4, or 8 in the actual bucketer. | Compose grouping, leaf ordering, and recursive replacement at actual Rust and JVM call sites, then connect the resulting trees to traversal and replay. |
+| IDX02, IDX03, IDX07 | Verus checks that the production Rust leaf merge returns every input occurrence in order. An injective logical rank uniquely determines the successful output sequence from those occurrences. | Prove that each leaf supplies correctly ordered runs, that its reader and comparator realize the logical rank, and that the JVM merge satisfies the same contract. |
 | SCAN07, GC01, GC02 | Lean proves the abstract generation retention invariant for arbitrarily many readers, objects, in-flight operations and steps. Verus checks the collector's production selection loop against the visibility observations it receives. | Refine the captured references, provider operations, and authority changes, including the full durable deletion protocol. |
 | GC09, STORE03 · Hosted ordered-index retirement | Lean checks point equivalence after scrubbing known erase cuts. A bounded TLC model checks storage retirement, reader release, scrubbed replay, and conditional completion. Integration tests exercise a held reader and versioned local S3 provider. | Compose the directory and provider contracts with every hosted deployment, reader and primary-file custody path covered by physical disposal. |
 | STORE03 · Read entitlements | Lean proves a lease timing inequality and preservation of read entitlement across arbitrary abstract pin transitions, including close while a read remains active. | Prove clock, I/O completion, decoded page ownership, cache eviction, and provider lifetime assumptions at production call sites. |
@@ -157,6 +158,17 @@ The child-path law composes the production comparator and digit selector to show
 The native tests exercise the last IID digit, repeated rows, and a read failure whose suffix remains unread.
 Verus 0.2026.11.05.31e44e6 checked thirteen functions and rejected all eight mutations, including wrong-child placement, reversed order, and admitting an unreadable row.
 The native run passed 497 tests with `cargo test --manifest-path rust/Cargo.toml --locked -p rtdb-trie -p rtdb-format -p rtdb-index -p rtdb-query`. [Production grouping and tests](../../rust/crates/trie/src/partition_step.rs) · [Verus study](../../verification/verus/iid_partition/area.json)
+
+### Production leaf merge
+
+Rust leaf sorting and compaction use the verified two-run merge.
+With sorted input runs, representable output capacity, and a fallible comparator consistent with a stable rank, Verus proves that a successful merge is sorted and its row multiset is the sum of the two input multisets.
+An injective rank gives one ordered output sequence for that multiset.
+The rank law proves that a fixed-width IID interpreted as an unsigned big-endian number, with a descending row-index suffix, agrees with the specified bytewise IID and row-index order.
+The merge proof takes sorted input runs and the production comparator's agreement with that rank as premises.
+The native tests exercise repeated rows, the unconsumed tail, and propagation of a comparison failure.
+Verus 0.2026.11.05.31e44e6 checked fourteen functions and rejected four mutations that select the larger head, omit the tail, consume a row without emitting it, or reverse the order within an IID.
+The native run passed 499 tests with `cargo test --manifest-path rust/Cargo.toml --locked -p rtdb-trie -p rtdb-format -p rtdb-index -p rtdb-query`. [Production merge and tests](../../rust/crates/trie/src/leaf_merge_step.rs) · [Verus study](../../verification/verus/trie_leaf_merge/area.json)
 
 ## Multi evidence
 
