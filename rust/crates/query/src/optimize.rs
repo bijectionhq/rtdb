@@ -204,6 +204,10 @@ fn has_match_on(predicate: &Expr, column: ColumnId, evaluated: &[ColumnId]) -> b
 }
 
 fn prune(relation: Arc<Relation>, required: &BTreeSet<ColumnId>, ids: &mut Ids) -> Result<Arc<Relation>> {
+    stacker::maybe_grow(256 * 1024, 2 * 1024 * 1024, || prune_at(relation, required, ids))
+}
+
+fn prune_at(relation: Arc<Relation>, required: &BTreeSet<ColumnId>, ids: &mut Ids) -> Result<Arc<Relation>> {
     match relation.node() {
         RelationNode::Project { input, expressions } | RelationNode::Rename { input, expressions, .. } => {
             let expressions = expressions.iter().filter(|named| required.contains(&named.field.id)).cloned().collect::<Vec<_>>();
