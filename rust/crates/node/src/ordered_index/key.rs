@@ -1,4 +1,4 @@
-use rtdb_types::{LogicalType, ScalarType, Value};
+use rtdb_types::{Interval, LogicalType, ScalarType, Timestamp, Value};
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -9,6 +9,7 @@ pub(super) enum Atom {
     Binary(Vec<u8>),
     Uuid([u8; 16]),
     Day(i64),
+    Unordered,
     Null,
 }
 
@@ -47,7 +48,7 @@ impl Atom {
 
     pub(super) fn family(&self) -> Option<Family> {
         Some(match self {
-            Self::Null => return None,
+            Self::Null | Self::Unordered => return None,
             Self::Bool(_) => Family::Bool,
             Self::Integer(_) => Family::Integer,
             Self::Text(_) => Family::Text,
@@ -88,4 +89,47 @@ pub(super) fn family(logical: &LogicalType) -> Option<Family> {
         family = Some(next);
     }
     family
+}
+
+/// An aligned half-open range in the unsigned valid-time domain.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub(super) struct Bucket {
+    level: u32,
+    start: u64,
+}
+
+impl Bucket {
+    pub fn at(time: Timestamp) -> impl Iterator<Item = Self> {
+        let point = Self::offset(time);
+        (0..=64).map(move |level| Self {
+            level,
+            start: (point >> level << level) as u64,
+        })
+    }
+
+    pub fn cover(interval: Interval) -> impl Iterator<Item = Self> {
+        let mut start = Self::offset(interval.lower());
+        let end = if interval.upper() == Timestamp::MAX {
+            1_u128 << 64
+        } else {
+            Self::offset(interval.upper())
+        };
+        let empty = interval.is_empty();
+        std::iter::from_fn(move || {
+            if empty || start >= end {
+                return None;
+            }
+            let level = start.trailing_zeros().min((end - start).ilog2());
+            let bucket = Self {
+                level,
+                start: start as u64,
+            };
+            start += 1_u128 << level;
+            Some(bucket)
+        })
+    }
+
+    fn offset(time: Timestamp) -> u128 {
+        ((time.0 as u64) ^ (1 << 63)) as u128
+    }
 }

@@ -1,45 +1,64 @@
 use std::{
     cmp::Ordering,
-    collections::{BTreeMap, BTreeSet, BinaryHeap, VecDeque},
+    collections::{BTreeSet, BinaryHeap},
 };
 
 use async_trait::async_trait;
 use rtdb_plan::{BinaryOp, ColumnId, Expr, Field};
 use rtdb_query::{ScanAccelerator, ScanRequest};
-use rtdb_types::{Iid, Result, Value};
+use rtdb_types::{AnomalyCategory, Iid, LogicalType, Result, ScalarType, Value};
+use std::sync::Arc;
 
 use super::{
     Definition, definitions,
-    key::{Atom, family},
-    maintenance::{self, Entries},
-    run::{self, Entry, RunReader},
+    key::{Atom, Bucket, family},
+    maintenance::{cancelled, read_root},
+    tree::{Cursor, Key, Tree},
 };
 
 const VERIFY_ROWS: usize = 128;
 const MAX_CANDIDATES: usize = 16_384;
-const MAX_TAIL_FILES: usize = 8;
 
 pub(crate) struct OrderedIndexAccelerator;
 
 #[async_trait]
 impl ScanAccelerator for OrderedIndexAccelerator {
     async fn candidate_iids(&self, request: &ScanRequest<'_>) -> Result<Option<BTreeSet<Iid>>> {
-        let table = &request.scan.table.name.table;
-        if table.schema == super::CATALOG.0
-            || request.scan.iids.is_some()
-            || (request.scan.predicates.is_empty() && request.scan.ordered_top_k.is_none())
-        {
+        Ok(exact(request, None)
+            .await?
+            .map(|ids| ids.into_iter().collect()))
+    }
+
+    async fn ordered_iids(
+        &self,
+        request: &ScanRequest<'_>,
+        limit: usize,
+    ) -> Result<Option<Vec<Iid>>> {
+        if limit > MAX_CANDIDATES {
             return Ok(None);
         }
-        match candidates(request).await {
-            Err(error) if error.category == rtdb_types::AnomalyCategory::Interrupted => Err(error),
-            Err(_) => Ok(None),
-            found => found,
-        }
+        exact(request, Some(limit)).await
     }
 }
 
-async fn candidates(request: &ScanRequest<'_>) -> Result<Option<BTreeSet<Iid>>> {
+async fn exact(request: &ScanRequest<'_>, limit: Option<usize>) -> Result<Option<Vec<Iid>>> {
+    let table = &request.scan.table.name.table;
+    if table.schema == super::CATALOG.0
+        || request.scan.iids.is_some()
+        || !request.bounds.system_time.is_point()
+        || !request.bounds.valid_time.is_point()
+        || (request.scan.predicates.is_empty() && request.scan.ordered_top_k.is_none())
+    {
+        return Ok(None);
+    }
+    match seek(request, limit).await {
+        Err(error) if error.category == AnomalyCategory::Interrupted => Err(error),
+        Err(_) => Ok(None),
+        found => found,
+    }
+}
+
+async fn seek(request: &ScanRequest<'_>, limit: Option<usize>) -> Result<Option<Vec<Iid>>> {
     let definitions = definitions(
         request.database,
         request.snapshot,
@@ -65,11 +84,18 @@ async fn candidates(request: &ScanRequest<'_>) -> Result<Option<BTreeSet<Iid>>> 
             })
             .collect();
         let range = Range::bind(request, &fields).await?;
-        let top = Top::bind(request, &fields, &range).await?;
-        if range.is_open() && top.is_none() {
-            continue;
-        }
-        if let Some(found) = use_index(request, definition, &range, top.as_ref()).await? {
+        let top = if let Some(limit) = limit {
+            let Some(reverse) = order(request, &fields, &range) else {
+                continue;
+            };
+            Some(Top { limit, reverse })
+        } else {
+            if range.is_open() {
+                continue;
+            }
+            None
+        };
+        if let Some(found) = use_index(request, definition, &fields, &range, top).await? {
             return Ok(Some(found));
         }
     }
@@ -365,280 +391,301 @@ fn operands<'a>(
     Some((reversed, left))
 }
 
+#[derive(Clone, Copy)]
 struct Top {
     limit: usize,
     reverse: bool,
-    columns: Vec<ColumnId>,
 }
 
-impl Top {
-    async fn bind(
-        request: &ScanRequest<'_>,
-        fields: &[Option<&Field>],
-        range: &Range,
-    ) -> Result<Option<Self>> {
-        let Some(top) = &request.scan.ordered_top_k else {
-            return Ok(None);
-        };
-        if !request.bounds.system_time.is_point() || !request.bounds.valid_time.is_point() {
-            return Ok(None);
-        }
-        let Some(fields) = fields.iter().copied().collect::<Option<Vec<_>>>() else {
-            return Ok(None);
-        };
-        let columns: Vec<_> = fields.iter().map(|field| field.id).collect();
-        let order: Vec<_> = top
-            .order
-            .iter()
-            .filter_map(|key| {
-                let Expr::Column { id, .. } = &key.expr else {
-                    return None;
-                };
-                Some((*id, key))
+fn order(request: &ScanRequest<'_>, fields: &[Option<&Field>], range: &Range) -> Option<bool> {
+    let order = &request.scan.ordered_top_k.as_ref()?.order;
+    let equal = &fields[..range.prefix.len()];
+    let mut suffix = order.iter().filter(|sort| {
+        !matches!(&sort.expr, Expr::Column { id, .. } if equal.iter().flatten().any(|field| field.id == *id))
+    }).peekable();
+    let reverse = suffix.peek()?.descending;
+    for (position, sort) in suffix.enumerate() {
+        let field = fields.get(range.prefix.len() + position)?.as_ref()?;
+        if !matches!(&sort.expr, Expr::Column { id, .. } if *id == field.id)
+            || family(&field.data_type).is_none()
+            || field.data_type.legs().into_iter().any(|leg| {
+                matches!(
+                    leg,
+                    LogicalType::Scalar(
+                        ScalarType::U8 | ScalarType::U16 | ScalarType::U32 | ScalarType::U64
+                    )
+                )
             })
-            .collect();
-        if order.len() != top.order.len() {
-            return Ok(None);
+            || sort.descending != reverse
+            || (sort.nulls_first != reverse && field.data_type.nullable() && field.name != "_id")
+        {
+            return None;
         }
-        let suffix: Vec<_> = order
-            .into_iter()
-            .filter(|(id, _)| !columns[..range.prefix.len()].contains(id))
-            .collect();
-        if suffix.len() != columns.len() - range.prefix.len() || suffix.is_empty() {
-            return Ok(None);
-        }
-        let reverse = suffix[0].1.descending;
-        for ((id, sort), field) in suffix.iter().zip(&fields[range.prefix.len()..]) {
-            if *id != field.id
-                || family(&field.data_type).is_none()
-                || sort.descending != reverse
-                || (sort.nulls_first != reverse
-                    && field.data_type.nullable()
-                    && field.name != "_id")
-            {
+    }
+    Some(reverse)
+}
+
+#[derive(Debug)]
+enum Predicate {
+    All(Box<Self>, Box<Self>),
+    Either(Box<Self>, Box<Self>),
+    Compare {
+        slot: usize,
+        op: BinaryOp,
+        value: Atom,
+    },
+}
+
+impl Predicate {
+    fn bind<'a>(
+        request: &'a ScanRequest<'_>,
+        fields: &'a [Option<&Field>],
+        expression: &'a Expr,
+    ) -> futures::future::BoxFuture<'a, Result<Option<Self>>> {
+        Box::pin(async move {
+            let Expr::Binary { op, left, right } = expression else {
                 return Ok(None);
+            };
+            match op {
+                BinaryOp::And | BinaryOp::Or => {
+                    let Some(left) = Self::bind(request, fields, left).await? else {
+                        return Ok(None);
+                    };
+                    let Some(right) = Self::bind(request, fields, right).await? else {
+                        return Ok(None);
+                    };
+                    let pair = (Box::new(left), Box::new(right));
+                    Ok(Some(if *op == BinaryOp::And {
+                        Self::All(pair.0, pair.1)
+                    } else {
+                        Self::Either(pair.0, pair.1)
+                    }))
+                }
+                BinaryOp::Eq | BinaryOp::Lt | BinaryOp::LtEq | BinaryOp::Gt | BinaryOp::GtEq => {
+                    for (slot, field) in fields.iter().enumerate() {
+                        let Some(field) = field else {
+                            continue;
+                        };
+                        let Some((op, constant)) = operands(field.id, *op, left, right) else {
+                            continue;
+                        };
+                        let Some(value) = request
+                            .constants
+                            .constant(constant)
+                            .await?
+                            .as_ref()
+                            .and_then(Atom::of)
+                        else {
+                            break;
+                        };
+                        if value == Atom::Null
+                            || family(&field.data_type)
+                                .is_some_and(|family| value.family() == Some(family))
+                        {
+                            return Ok(Some(Self::Compare { slot, op, value }));
+                        }
+                    }
+                    Ok(None)
+                }
+                _ => Ok(None),
+            }
+        })
+    }
+
+    fn matches(&self, tuple: &[Atom]) -> bool {
+        match self {
+            Self::All(left, right) => left.matches(tuple) && right.matches(tuple),
+            Self::Either(left, right) => left.matches(tuple) || right.matches(tuple),
+            Self::Compare { slot, op, value } => {
+                let cell = &tuple[*slot];
+                if matches!(cell, Atom::Null | Atom::Unordered) || *value == Atom::Null {
+                    return false;
+                }
+                match op {
+                    BinaryOp::Eq => cell == value,
+                    BinaryOp::Lt => cell < value,
+                    BinaryOp::LtEq => cell <= value,
+                    BinaryOp::Gt => cell > value,
+                    BinaryOp::GtEq => cell >= value,
+                    _ => unreachable!("only ordering comparisons are bound"),
+                }
             }
         }
-        let limit = match request.constants.constant(&top.limit).await? {
-            Some(Value::I64(n)) => usize::try_from(n).ok(),
-            Some(Value::I32(n)) => usize::try_from(n).ok(),
-            Some(Value::U64(n)) => usize::try_from(n).ok(),
-            _ => None,
-        };
-        Ok(limit
-            .filter(|limit| *limit <= MAX_CANDIDATES)
-            .map(|limit| Self {
-                limit,
-                reverse,
-                columns,
-            }))
     }
 }
 
 async fn use_index(
     request: &ScanRequest<'_>,
     definition: &Definition,
+    fields: &[Option<&Field>],
     range: &Range,
-    top: Option<&Top>,
-) -> Result<Option<BTreeSet<Iid>>> {
+    top: Option<Top>,
+) -> Result<Option<Vec<Iid>>> {
+    if top.is_some_and(|top| top.limit == 0) {
+        return Ok(Some(Vec::new()));
+    }
     let directory = definition.directory()?;
-    let store = request.storage.object_store().as_ref();
-    let through = maintenance::source_frontier(request.snapshot, &definition.table);
-    let manifest = run::latest(store, &directory, through, request.memory).await?;
-    if manifest.through < 0 {
-        return Ok(None);
-    }
-    let files = maintenance::source_files(
+    let tree = Tree {
+        storage: request.storage,
+        directory: &directory,
+        memory: request.memory,
+    };
+    let system_at = request.bounds.system_time.lower();
+    let Some(root) = read_root(
+        &tree,
+        definition,
         request.snapshot,
-        &definition.table,
-        store,
-        manifest.through,
-        through,
+        system_at,
+        request.cancellation,
     )
-    .await?;
-    if files.len() > MAX_TAIL_FILES {
+    .await?
+    else {
         return Ok(None);
-    }
-
-    let mut tail = Entries::new();
-    for (_, file) in files {
-        let mut entries = Entries::from_file(
-            store,
-            &file,
-            &definition.columns,
-            request.memory,
-            request.cancellation,
-        )
-        .await?;
-        entries
-            .rows
-            .retain(|entry| range.position(&entry.key) == Ordering::Equal);
-        tail.merge(entries);
-    }
-    for segment in request.snapshot.iter_segments(&definition.table) {
-        for batch in segment.batches() {
-            tail.add_batch(batch.view(), &definition.columns, request.memory, |key| {
-                range.position(key) == Ordering::Equal
-            })?;
-        }
-    }
-    tail.rows.sort_unstable();
-    tail.rows.dedup();
-    let reverse = top.is_some_and(|top| top.reverse);
-    if reverse {
-        tail.rows.reverse();
-    }
-    let mut live: VecDeque<_> = std::mem::take(&mut tail.rows).into();
-
-    let mut readers: Vec<_> = manifest
-        .runs
-        .iter()
-        .map(|run| {
-            let start = run
-                .pages
-                .partition_point(|page| range.position(&page.last) == Ordering::Less);
-            let end = run
-                .pages
-                .partition_point(|page| range.position(&page.first) != Ordering::Greater);
-            RunReader::new(run, start.min(end), end, reverse)
-        })
-        .collect();
-    let live_slot = readers.len();
-    let mut heap = BinaryHeap::new();
-    for (slot, reader) in readers.iter_mut().enumerate() {
-        if let Some(entry) = next(reader, request, &directory, range).await? {
-            heap.push(Head {
-                entry,
-                slot,
-                reverse,
-            });
-        }
-    }
-    if let Some(entry) = live.pop_front() {
-        heap.push(Head {
-            entry,
-            slot: live_slot,
-            reverse,
-        });
-    }
-
-    let memory = request.memory;
-    let capacity = top.map_or(MAX_CANDIDATES, |top| top.limit.saturating_add(VERIFY_ROWS));
-    let _candidate_charge = memory.reserve(capacity * 96)?;
-    let mut selected = BTreeSet::new();
-    let mut pending = Vec::new();
-    while let Some(Head { entry, slot, .. }) = heap.pop() {
-        if request.cancellation.is_cancelled() {
-            return Err(maintenance::cancelled());
-        }
-        let following = if slot == live_slot {
-            live.pop_front()
-        } else {
-            next(&mut readers[slot], request, &directory, range).await?
-        };
-        if let Some(entry) = following {
-            heap.push(Head {
-                entry,
-                slot,
-                reverse,
-            });
-        }
-        if selected.contains(&entry.iid) {
-            continue;
-        }
-        if let Some(top) = top {
-            if pending.last() != Some(&entry) {
-                pending.push(entry);
-            }
-            if pending.len() >= VERIFY_ROWS.min(top.limit.saturating_sub(selected.len()).max(32)) {
-                verify(request, top, &mut pending, &mut selected).await?;
-                if selected.len() >= top.limit {
-                    break;
-                }
-            }
-        } else {
-            selected.insert(entry.iid);
-            if selected.len() > MAX_CANDIDATES {
-                return Ok(None);
-            }
-        }
-    }
-    if let Some(top) = top {
-        verify(request, top, &mut pending, &mut selected).await?;
-    }
-    Ok(Some(selected))
-}
-
-async fn next(
-    reader: &mut RunReader<'_>,
-    request: &ScanRequest<'_>,
-    directory: &rtdb_storage::ObjectKey,
-    range: &Range,
-) -> Result<Option<Entry>> {
-    while let Some(entry) = reader
-        .next(
-            request.storage.object_store().as_ref(),
-            directory,
-            request.memory,
-        )
-        .await?
-    {
-        if range.position(&entry.key) == Ordering::Equal {
-            return Ok(Some(entry));
-        }
-    }
-    Ok(None)
-}
-
-async fn verify(
-    request: &ScanRequest<'_>,
-    top: &Top,
-    pending: &mut Vec<Entry>,
-    selected: &mut BTreeSet<Iid>,
-) -> Result<()> {
-    if pending.is_empty() || selected.len() >= top.limit {
-        return Ok(());
-    }
-    let ids = pending.iter().map(|entry| entry.iid).collect();
+    };
     let residuals = request
         .scan
         .ordered_top_k
         .as_ref()
         .map_or(&[][..], |plan| plan.residuals.as_slice());
-    let visible = request
-        .verifier
-        .visible_columns(ids, &top.columns, residuals)
-        .await?;
-    let keys: BTreeMap<_, _> = visible
-        .iter()
-        .filter_map(|(iid, row)| {
-            Some((*iid, row.iter().map(Atom::of).collect::<Option<Vec<_>>>()?))
-        })
-        .collect();
-    for entry in pending.drain(..) {
-        if keys.get(&entry.iid) == Some(&entry.key) {
-            selected.insert(entry.iid);
-            if selected.len() == top.limit {
-                break;
+    let mut covered = true;
+    let mut predicates = Vec::new();
+    if top.is_some() {
+        for predicate in request.scan.predicates.iter().chain(residuals) {
+            if let Some(predicate) = Predicate::bind(request, fields, predicate).await? {
+                predicates.push(predicate);
+            } else {
+                covered = false;
             }
         }
     }
+    let reverse = top.is_some_and(|top| top.reverse);
+    let buckets: Vec<_> = Bucket::at(request.bounds.valid_time.lower()).collect();
+    let mut cursors: Vec<_> = buckets
+        .iter()
+        .map(|_| Cursor::new(root.clone(), reverse))
+        .collect();
+    let _scratch = request.memory.reserve(
+        MAX_CANDIDATES
+            .min(top.map_or(MAX_CANDIDATES, |top| top.limit))
+            .saturating_mul(64)
+            .saturating_add(16_384),
+    )?;
+    let mut heap = BinaryHeap::new();
+    for (slot, cursor) in cursors.iter_mut().enumerate() {
+        if let Some(head) = next(cursor, &tree, range, buckets[slot], slot, reverse).await? {
+            heap.push(head);
+        }
+    }
+    let mut selected = Vec::new();
+    let mut pending = Vec::new();
+    while let Some(head) = heap.pop() {
+        if request.cancellation.is_cancelled() {
+            return Err(cancelled());
+        }
+        if predicates
+            .iter()
+            .all(|predicate| predicate.matches(&head.tuple))
+        {
+            if covered {
+                selected.push(head.iid);
+            } else {
+                pending.push(head.iid);
+                if pending.len()
+                    >= VERIFY_ROWS.min(top.map_or(VERIFY_ROWS, |top| {
+                        top.limit.saturating_sub(selected.len()).max(1)
+                    }))
+                {
+                    filter_payload(request, residuals, &mut pending, &mut selected).await?;
+                }
+            }
+            if top.is_some_and(|top| selected.len() >= top.limit) {
+                break;
+            }
+            if selected.len() > MAX_CANDIDATES {
+                return Ok(None);
+            }
+        }
+        let slot = head.slot;
+        if let Some(head) = next(
+            &mut cursors[slot],
+            &tree,
+            range,
+            buckets[slot],
+            slot,
+            reverse,
+        )
+        .await?
+        {
+            heap.push(head);
+        }
+    }
+    filter_payload(request, residuals, &mut pending, &mut selected).await?;
+    Ok(Some(selected))
+}
+
+async fn next(
+    cursor: &mut Cursor,
+    tree: &Tree<'_>,
+    range: &Range,
+    bucket: Bucket,
+    slot: usize,
+    reverse: bool,
+) -> Result<Option<Head>> {
+    let entry = cursor
+        .next(tree, |key| match key {
+            Key::Posting {
+                bucket: candidate,
+                tuple,
+                ..
+            } => candidate.cmp(&bucket).then_with(|| range.position(tuple)),
+            Key::Row(_) | Key::Revision(_) => Ordering::Greater,
+        })
+        .await?;
+    match entry.map(|entry| entry.key) {
+        Some(Key::Posting { tuple, iid, .. }) => Ok(Some(Head {
+            tuple,
+            iid,
+            slot,
+            reverse,
+        })),
+        Some(Key::Row(_) | Key::Revision(_)) => Err(super::format_error(
+            "Ordered index seek escaped its posting prefix",
+        )),
+        None => Ok(None),
+    }
+}
+
+async fn filter_payload(
+    request: &ScanRequest<'_>,
+    residuals: &[Expr],
+    pending: &mut Vec<Iid>,
+    output: &mut Vec<Iid>,
+) -> Result<()> {
+    if pending.is_empty() {
+        return Ok(());
+    }
+    let matching: BTreeSet<_> = request
+        .verifier
+        .visible_columns(pending.iter().copied().collect(), &[], residuals)
+        .await?
+        .into_iter()
+        .map(|(iid, _)| iid)
+        .collect();
+    output.extend(pending.drain(..).filter(|iid| matching.contains(iid)));
     Ok(())
 }
 
 #[derive(PartialEq, Eq)]
 struct Head {
-    entry: Entry,
+    tuple: Arc<[Atom]>,
+    iid: Iid,
     slot: usize,
     reverse: bool,
 }
 
 impl Ord for Head {
     fn cmp(&self, other: &Self) -> Ordering {
-        let order = self
-            .entry
-            .cmp(&other.entry)
-            .then_with(|| self.slot.cmp(&other.slot));
+        let order = (&self.tuple, self.iid, self.slot).cmp(&(&other.tuple, other.iid, other.slot));
         if self.reverse { order } else { order.reverse() }
     }
 }

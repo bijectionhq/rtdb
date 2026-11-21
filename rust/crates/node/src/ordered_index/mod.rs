@@ -1,7 +1,9 @@
 mod accelerate;
+mod checkpoint;
 mod key;
 mod maintenance;
-mod run;
+mod projection;
+mod tree;
 
 use std::{collections::BTreeMap, sync::Arc};
 
@@ -16,6 +18,7 @@ use tokio_util::sync::CancellationToken;
 pub(crate) use accelerate::OrderedIndexAccelerator;
 pub(crate) use maintenance::OrderedIndexMaintenance;
 
+const INDEX_ROOT: &str = "ordered-index/v2";
 const CATALOG: (&str, &str) = ("xt", "ordered_indexes");
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -38,7 +41,7 @@ impl Definition {
             .map_err(format_error)?,
         );
         Ok(ObjectKey::new(format!(
-            "ordered-index/v1/{:016x}-{digest:x}",
+            "{INDEX_ROOT}/{:016x}-{digest:x}",
             self.version
         ))?)
     }

@@ -254,6 +254,91 @@ impl ScanCursor {
     }
 }
 
+pub(crate) async fn ordered_pages(scan: &Scan, execution: &Execution, limit: usize) -> Result<Option<crate::pages::BoxPageCursor>> {
+    if scan.ordered_top_k.is_none() || scan.iids.is_some() || !scan.matches.is_empty() {
+        return Ok(None);
+    }
+    let context = &execution.context;
+    let database = context.catalog.database(&scan.table.name.database)?;
+    let [snapshot] = database.partitions.as_slice() else { return Ok(None); };
+    let storage = &database.storage;
+    let verifier = ScanVerifier { scan, execution, pushdowns: None, partition: snapshot, storage };
+    let bounds = bounds(scan, snapshot, execution).await?;
+    let request = crate::ScanRequest {
+        database: &scan.table.name.database, scan, snapshot, storage, bounds, memory: &context.memory,
+        current_time: context.current_time, cancellation: &context.cancellation,
+        constants: &crate::accelerate::ExecutionConstants(execution), corpora: context.corpora.as_ref(),
+        verifier: &verifier, partitions: &database.partitions,
+    };
+    for accelerator in context.accelerators.iter() {
+        if let Some(iids) = accelerator.ordered_iids(&request, limit).await? {
+            let memory = context.memory.reserve(iids.capacity().saturating_mul(size_of::<Iid>() + 32))?;
+            let mut scan = scan.clone();
+            let width = scan.columns.len();
+            let iid_at = include_iid(&mut scan)?;
+            scan.ordered_top_k = None;
+            scan.top_k = None;
+            scan.predicates.clear();
+            return Ok(Some(Box::new(OrderedRows {
+                scan, execution: execution.clone(), selected: iids.into_iter(), width, iid_at, _memory: memory,
+            })));
+        }
+    }
+    Ok(None)
+}
+
+fn include_iid(scan: &mut Scan) -> Result<usize> {
+    if let Some(position) = scan.columns.iter().position(|field| field.name == "_iid") {
+        return Ok(position);
+    }
+    let position = scan.columns.len();
+    let id = scan.columns.iter().map(|field| field.id.0).max().unwrap_or(0)
+        .checked_add(1).ok_or_else(|| invalid("scan-column", "Column identifier space is exhausted"))?;
+    scan.columns.push(rtdb_plan::Field { id: rtdb_plan::ColumnId(id), name: "_iid".into(), qualifier: None,
+        qualified_only: false, unnamed: true, data_type: rtdb_types::LogicalType::Scalar(rtdb_types::ScalarType::FixedSizeBinary(16)) });
+    Ok(position)
+}
+
+struct OrderedRows {
+    scan: Scan,
+    execution: Execution,
+    selected: std::vec::IntoIter<Iid>,
+    width: usize,
+    iid_at: usize,
+    _memory: Arc<MemoryReservation>,
+}
+
+#[async_trait]
+impl PageCursor for OrderedRows {
+    async fn next_page(&mut self) -> Result<Option<OwnedPage>> {
+        let ids: Vec<_> = self.selected.by_ref().take(128).collect();
+        if ids.is_empty() { return Ok(None); }
+        let memory = &self.execution.context.memory;
+        let _scratch = memory.reserve(ids.len() * 192)?;
+        let mut scan = self.scan.clone();
+        scan.iids = Some(ids.iter().copied().collect());
+        let mut source = ScanCursor::new(scan, self.execution.clone(), None).await?;
+        let mut found = BTreeMap::new();
+        while let Some(mut page) = source.next_page().await? {
+            while let Some(mut row) = page.next() {
+                let Value::FixedSizeBinary(iid) = &row.values[self.iid_at] else {
+                    return Err(invalid("ordered-row-iid", "Ordered scan row has no IID"));
+                };
+                let iid = Iid::from_slice(iid)?;
+                row.values.truncate(self.width);
+                if found.insert(iid, row).is_some() {
+                    return Err(invalid("ordered-row-duplicate", "Ordered point scan returned more than one row for an IID"));
+                }
+            }
+        }
+        let mut output = crate::pages::PageBuilder::new(ids.len(), memory)?;
+        for iid in ids {
+            output.push(found.remove(&iid).ok_or_else(|| invalid("ordered-row-missing", "A row in the ordered index is absent at the read basis"))?)?;
+        }
+        Ok(Some(output.finish()))
+    }
+}
+
 /// Runs the scan itself over one partition, restricted to a batch of IIDs, its predicates applied as the scan's filter applies them; narrowing is skipped because the IIDs are fixed.
 struct ScanVerifier<'a> { scan: &'a Scan, execution: &'a Execution, pushdowns: Option<Arc<crate::pushdown::Pushdowns>>, partition: &'a Snapshot, storage: &'a Arc<BufferPool> }
 
@@ -271,12 +356,8 @@ impl crate::CandidateVerifier for ScanVerifier<'_> {
         scan.top_k = None;
         scan.ordered_top_k = None;
         scan.iids = Some(iids);
-        if !scan.columns.iter().any(|field| field.name == "_iid") {
-            let id = rtdb_plan::ColumnId(scan.columns.iter().map(|field| field.id.0).max().unwrap_or(0) + 1);
-            scan.columns.push(rtdb_plan::Field { id, name: "_iid".into(), qualifier: None, qualified_only: false, unnamed: true, data_type: rtdb_types::LogicalType::Scalar(rtdb_types::ScalarType::FixedSizeBinary(16)) });
-        }
+        let iid_at = include_iid(&mut scan)?;
         let position = |found: &dyn Fn(&rtdb_plan::Field) -> bool| scan.columns.iter().position(|field| found(field)).ok_or_else(|| invalid("verifier-column", "Verified column is not projected by the scan"));
-        let iid_at = position(&|field| field.name == "_iid")?;
         let projected = columns.iter().map(|id| position(&|field| field.id == *id)).collect::<Result<Vec<_>>>()?;
         let schema = Schema::new(scan.columns.clone())?;
         let predicate = scan.predicates.iter().chain(residuals).cloned().reduce(|left, right| Expr::binary(rtdb_plan::BinaryOp::And, left, right));

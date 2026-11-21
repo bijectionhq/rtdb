@@ -4620,6 +4620,7 @@ dependencies = [
  "rtdb-search",
  "rtdb-sql",
  "rtdb-storage",
+ "rtdb-temporal",
  "rtdb-text",
  "rtdb-trie",
  "rtdb-tx",

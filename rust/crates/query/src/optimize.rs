@@ -156,7 +156,7 @@ fn push_top_k(relation: &Arc<Relation>, order: &[rtdb_plan::SortExpr], limit: &E
             let Some(first) = order.first() else { return Ok(None) };
             if residuals.iter().all(ordered_index_filter)
                 && order.iter().all(|key| matches!(&key.expr, Expr::Column { id, .. } if scan.columns.iter().any(|field| field.id == *id))) {
-                scan.ordered_top_k = Some(rtdb_plan::OrderedTopK { order: order.to_vec(), limit: limit.clone(), residuals: residuals.to_vec() });
+                scan.ordered_top_k = Some(rtdb_plan::OrderedTopK { order: order.to_vec(), residuals: residuals.to_vec() });
             } else {
                 if !residuals.is_empty() { return Ok(None); }
                 let Expr::Call { name, args, .. } = &first.expr else { return Ok(None) };

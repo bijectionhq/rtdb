@@ -78,6 +78,7 @@ async fn registry_avro_records_become_documents_and_a_rule_failure_reaches_the_d
     let partition = Arc::clone(&recovered.partition);
     let progress = ProgressMonitor::new(recovered.progress.clone());
     let resolve = Arc::new(rtdb_tx::ResolveContext { database: "connect".into(), storage: cache, memory: Arc::clone(&memory), query_options: Default::default(),
+        scan_accelerators: Default::default(),
         cancellation: CancellationToken::new(), default_tz: "UTC".into(), authorization: Arc::new(Authority), execution_observer: None, tracer: None });
     let (handle, driver) = ReplicationDriver::new(ReplicationConfig { external_source: true, ..Default::default() }, logs, Arc::clone(&blocks), recovered, progress,
         resolve, Arc::new(Effects), CancellationToken::new()).unwrap();

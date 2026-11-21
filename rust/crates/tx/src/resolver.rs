@@ -26,6 +26,7 @@ pub struct ResolveContext {
     pub storage: Arc<BufferPool>,
     pub memory: Arc<MemoryBudget>,
     pub query_options: QueryOptions,
+    pub scan_accelerators: Arc<[Arc<dyn rtdb_query::ScanAccelerator>]>,
     pub cancellation: CancellationToken,
     pub default_tz: String,
     pub authorization: Arc<dyn TransactionAuthorization>,
@@ -36,7 +37,8 @@ pub struct ResolveContext {
 impl ResolveContext {
     fn query_context(&self, snapshot: Snapshot, time: Timestamp, timezone: &str, parent: Option<rtdb_plan::SpanContext>) -> Result<Arc<QueryContext>> {
         let catalog = CatalogSnapshot::new(self.database.clone(), BTreeMap::from([(self.database.clone(), DatabaseSnapshot { partitions: vec![snapshot], storage: Arc::clone(&self.storage) })]), true)?;
-        Ok(QueryContext::new(catalog, Arc::clone(&self.memory), time, timezone, self.query_options.clone(), &self.cancellation)?.with_tracer(self.tracer.clone(), parent))
+        Ok(QueryContext::new(catalog, Arc::clone(&self.memory), time, timezone, self.query_options.clone(), &self.cancellation)?
+            .with_accelerators(Arc::clone(&self.scan_accelerators)).with_tracer(self.tracer.clone(), parent))
     }
     fn transaction_span(&self, parent: Option<rtdb_plan::SpanContext>, name: &str, attributes: &[(&str, rtdb_plan::TraceValue<'_>)]) -> Option<Box<dyn rtdb_plan::TraceSpan>> {
         self.tracer.as_ref().filter(|tracer| tracer.transaction_enabled()).and_then(|tracer| tracer.start(parent, name, attributes))
@@ -349,6 +351,11 @@ impl<'a> OpenTransaction<'a> {
                 if table.database != self.context.database { return Err(Anomaly::incorrect("xtdb/table-not-found", "An ordered index must cover a table in this database")); }
                 check_table(&table.table)?;
                 check_ordered_index_name(&name)?;
+                if columns.iter().collect::<std::collections::BTreeSet<_>>().len() != columns.len()
+                    || columns.iter().any(|column| matches!(column.as_str(), "_iid" | "_valid_from" | "_valid_to" | "_valid_time" | "_system_from" | "_system_to" | "_system_time" | "_recency"))
+                {
+                    return Err(Anomaly::incorrect("xtdb/invalid-index-columns", "An ordered index requires distinct stored columns"));
+                }
                 if self.ordered_index_exists(&name).await? {
                     return Err(Anomaly::incorrect("xtdb/index-already-exists", format!("Index {name} already exists")));
                 }
@@ -685,6 +692,7 @@ mod tests {
         let resolve = ResolveContext {
             database: "xtdb".into(), storage: Arc::new(BufferPool::new(Arc::new(rtdb_storage::MemoryStore::default()), 1 << 20)),
             memory: Arc::clone(&memory), query_options: QueryOptions { batch_rows: 1, ..Default::default() },
+            scan_accelerators: Default::default(),
             cancellation: CancellationToken::new(), default_tz: "UTC".into(), authorization: Arc::new(NoRoleChecks),
             execution_observer: None, tracer: None,
         };
@@ -791,6 +799,7 @@ mod tests {
         let resolve = ResolveContext {
             database: "xtdb".into(), storage: Arc::new(BufferPool::new(Arc::new(rtdb_storage::MemoryStore::default()), 1 << 20)),
             memory: Arc::clone(&memory), query_options: QueryOptions::default(),
+            scan_accelerators: Default::default(),
             cancellation: CancellationToken::new(), default_tz: "UTC".into(), authorization: Arc::new(NoRoleChecks),
             execution_observer: None, tracer: None,
         };

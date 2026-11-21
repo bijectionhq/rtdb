@@ -1,7 +1,6 @@
 -- allium: 3
--- Ordered secondary indexes over RTDB's separately compacted derived runs.
--- The retained level-zero blocks are specified in compaction.allium and gc.allium.
--- Bitemporal resolution belongs to db.allium.
+-- Ordered secondary indexes over resolved table events.
+-- Table events and capture follow db.allium and allium/live-index.allium.
 -- See rust/crates/node/src/ordered_index.
 
 entity Definition {
@@ -10,17 +9,20 @@ entity Definition {
     columns: List<String>
 }
 
-entity Layout {
+entity Checkpoint {
     definition: Definition
     frontier: Integer
+    source_rows: Integer
 }
 
 -- Invariants
 --
--- A layout covers every indexed put in the source blocks through its frontier, subject to ordered erasure.
--- Publishing a layout makes the completed runs available as one immutable manifest.
--- Data compaction preserves the source blocks and changes no ordered-index layout.
--- A query covers the indexed runs, any flushed source past the frontier, and the live tail of its captured snapshot.
--- A candidate can contribute to an ordered page only after the snapshot resolves it and all relevant predicates hold.
--- A captured snapshot with unavailable index coverage uses the ordinary scan.
--- Erasure removes the affected historical entries on the next index maintenance cycle that covers the erase.
+-- A checkpoint covers the table catalog's durable event count at its frontier.
+-- The checkpoint becomes usable after every referenced page is durable.
+-- A root contains each winning indexed row over disjoint valid-time spans at its system-time point.
+-- Aligned bucket decomposition places an eligible row in exactly one of the prefixes containing a valid-time point.
+-- A revision edits both sides of a changed projection. Unchanged spans retain their postings.
+-- The read opens a root at its system-time point and applies captured uncovered events, including erasures.
+-- A point read merges bucket prefixes in key order and fetches payload at the same basis.
+-- An erasure removes the IID's old membership from every affected root and makes unreachable pages collectible.
+-- Data compaction preserves input events and changes no ordered-index checkpoint.

@@ -43,7 +43,7 @@ pub struct Scan {
 pub struct ScanTopK { pub column: ColumnId, pub query: Expr, pub limit: Expr }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub struct OrderedTopK { pub order: Vec<SortExpr>, pub limit: Expr, pub residuals: Vec<Expr> }
+pub struct OrderedTopK { pub order: Vec<SortExpr>, pub residuals: Vec<Expr> }
 
 /// `match(column, query)` with a constant query, as the scan's column `id`: the scan may answer it from an index, reading no text.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]

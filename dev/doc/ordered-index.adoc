@@ -1,42 +1,44 @@
 = Ordered secondary indexes
 
 `CREATE INDEX orders_customer_priority ON orders (customer, priority, _id)` declares an ordered index.
-`DROP INDEX orders_customer_priority` retires that definition.
-The leader builds ordered indexes independently of the full-text search setting.
-The definition is written to `xt.ordered_indexes` at the transaction's position.
-The engine assigns each definition a generation so a reused name sees its own files.
+`DROP INDEX orders_customer_priority` retires the definition.
+The catalog assigns a fresh generation when a name is reused.
 
-An index can narrow equality predicates on a leading prefix and lower or upper bounds on the next column.
-For a matching `ORDER BY ... LIMIT`, the engine seeks the runs in either direction and merges their candidates until it has enough verified rows.
-Include `_id` in the ordering and in the index for deterministic pagination among equal values.
-For example, page after priority 2 and ID 4 using `priority > 2 OR (priority = 2 AND _id > 4)`.
-That predicate can seek within the equality prefix set by `customer = 'a'`.
-The query supports exact system-time and valid-time points for this early stop.
-Other query shapes still use the ordinary temporal scan and sort, with a usable index range applied when one is available.
+For a system-time point and a valid-time point, a matching `ORDER BY ... LIMIT` can read rows directly in index order.
+The scan seeks an equality prefix, lower and upper bounds on the next column, or a lexicographic continuation.
+For example, after priority 2 and ID 4, use `priority > 2 OR (priority = 2 AND _id > 4)` under `customer = 'a'`.
+Include `_id` in the ordering to make continuation deterministic among equal values.
+Reuse both temporal points to continue the same read across SQL statements.
+The scan can reverse the index order and applies predicates before counting rows towards the limit.
+It fetches projected fields from a row's table at the same basis.
 
-The index compares homogeneous Boolean, integer, text, binary, UUID and date columns.
-Mixed or unsupported column types use the ordinary comparison path.
-Ascending index order places nulls last and reversing the order places them first.
-The final sort presents the verified page in the requested SQL order.
+The index orders signed integers, Booleans, text, binary values, UUIDs and calendar dates.
+Ascending order places nulls last and reversing the order places them first.
+The normal SQL executor covers unsupported sort directions, types, temporal intervals and query shapes.
 
-== Storage and publication
+== Membership and storage
 
-Each definition owns an independent set of immutable sorted runs.
-The leader derives new runs from the table's immutable level-zero block files.
-These are the original flushed blocks, which RTDB retains for recovery when data compaction rewrites the serving files.
-The index merges its own equal-level runs as new blocks arrive, then publishes an immutable manifest containing the covered block frontier and the surviving runs.
-Index pages record distinct full tuples and entity IDs in sort order.
-Manifest page fences support a seek without reading pages outside the range.
+A definition owns one ordered tree of postings and a directory of immutable roots by system time.
+A root contains the projected winners at that system time.
+For one row, adjacent valid-time spans with the same key coalesce.
+The tree decomposes each such span into disjoint aligned buckets and orders entries by bucket, key and IID.
+A seek at a valid-time point traverses the bucket prefixes containing it and merges their streams in key order.
+Each eligible IID contributes at most once.
 
-A query captures one RTDB snapshot.
-It covers persistent index runs, committed level-zero blocks ahead of their frontier, and live segments from that snapshot.
-The native temporal resolver and scan predicates verify candidates.
-A changed value or deletion can leave an earlier index candidate, which the resolver drops at bases where the row is no longer visible with that key.
-A missing or invalid index object, incomplete coverage, or a memory budget refusal falls back to the regular scan.
-Compaction and a lost or lagging index can change the work a read does while leaving its results unchanged.
-Maintenance reconstructs missing pages from the retained flushed blocks.
+The projector uses the table's temporal resolver to cut the previous projection with a committed revision's puts, deletes and erases.
+It emits both retractions and insertions when a key or interval moves.
+Payload-only changes with the same projected valid-time spans share the previous root.
+The scan captures a single table snapshot, opens the index root for the requested system time, and applies exact edits from uncovered flushed blocks and live segments in that snapshot.
+The point read applies later erasures to the selected root.
+Repeated head reads reuse an admitted live root and apply only the unconsumed tail of the same open block.
+A missing checkpoint, missing source coverage or memory admission failure uses the normal SQL executor.
 
-When a flushed block contains an erase, index maintenance removes the affected historical keys from the new runs.
-Retired files are collected after the new manifest is published.
-A maintenance cycle only deletes pages it has superseded at its captured frontier.
-A drop ends use of the definition at its transaction; its files are eligible for cleanup on the next maintenance cycle.
+== Maintenance
+
+The index worker packs its own immutable pages and publishes a checkpoint after its pages and revision directory are durable.
+It checks coverage against the table catalog's durable event count before publication.
+Queries can use a complete checkpoint plus replay from the captured table events, and a reopened node can use the same files.
+Table compaction changes neither the logical roots nor the index's publication schedule.
+A damaged checkpoint can be rebuilt from retained level-zero events.
+A maintenance cycle that incorporates an erase removes the affected IID from older roots and collects unreachable pages and manifests.
+A drop makes its generation eligible for collection.

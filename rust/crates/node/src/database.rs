@@ -133,7 +133,10 @@ impl DatabaseFactory {
             let partition = Arc::clone(&recovered.partition);
             let progress = ProgressMonitor::new(recovered.progress.clone());
             let resolve = Arc::new(ResolveContext { database: name.clone(), storage: Arc::clone(&storage), memory: Arc::clone(&self.memory),
-                query_options: self.options.query.clone(), cancellation: cancellation.clone(), default_tz: self.options.default_timezone.clone(), authorization: Arc::clone(&self.authorization), execution_observer: self.execution_observer.clone(), tracer: self.tracer.clone() });
+                query_options: self.options.query.clone(),
+                scan_accelerators: Arc::from([Arc::new(crate::ordered_index::OrderedIndexAccelerator) as Arc<dyn rtdb_query::ScanAccelerator>]),
+                cancellation: cancellation.clone(), default_tz: self.options.default_timezone.clone(), authorization: Arc::clone(&self.authorization),
+                execution_observer: self.execution_observer.clone(), tracer: self.tracer.clone() });
             let effects = Arc::new(CatalogEffects { catalog, commands, primary: name == "xtdb" });
             let mut replication_options = self.options.replication.clone();
             replication_options.may_lead &= !read_only;

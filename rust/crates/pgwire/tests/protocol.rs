@@ -1429,7 +1429,7 @@ async fn ordered_index_ddl_and_keyset_queries_use_the_pgwire_entry_point() {
         loop {
             let installed = database.object_store().list(None).await.unwrap().iter().any(|object| {
                 let key = object.key.as_str();
-                key.starts_with("ordered-index/v1/") && key.contains("/manifests/")
+                key.starts_with("ordered-index/v2/") && key.contains("/manifests/")
             });
             if installed { break; }
             tokio::time::sleep(Duration::from_millis(10)).await;
