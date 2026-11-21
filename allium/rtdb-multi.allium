@@ -1151,12 +1151,15 @@ rule AuditRetainedReplicaHistory {
 
     ensures:
         let samples = RespondingReplicas(deployment)
-        let interval = CommonCommittedRetainedInterval(samples)
-        if WriteQuorum(samples) and interval != null:
-            let chains = Sha256ChainsForInterval(samples, interval)
+        ReplicaWindowsReported(samples)
+        let interval = LatestCommittedRetainedIntervalSharedByQuorum(samples)
+        if interval != null:
+            let chains = Sha256ChainsForInterval(SamplesCovering(samples, interval), interval)
             ReplicaDigestsReported(chains, interval)
             if DistinctDigests(chains):
                 ReplicaDivergenceReported(deployment, interval)
+        if StrictAuditRequested(deployment) and not WriteQuorumCompared(deployment, interval):
+            AuditRejectedForInsufficientEvidence(deployment)
 }
 
 rule VerifyRetainedJournalOffline {

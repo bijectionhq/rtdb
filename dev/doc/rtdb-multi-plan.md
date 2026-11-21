@@ -724,11 +724,13 @@ Running alongside every stage from stage 2 onwards, and concluding the branch:
    The successor seals those same servers, recovers the committed entry, and the servers refuse the delayed append before the successor writes at that position.
    This test drives the logkeepers directly.
 3. A hash-chain auditor verifies, offline, that every deployment's history is one chain across epochs.
-   The `audit` command compares a SHA-256 chain over the common committed, retained interval read independently from responding logkeepers.
+   The `audit` command compares a SHA-256 chain over the latest committed, retained interval shared by a write quorum.
    Each link covers the record position, epoch, timestamp and on-disk payload.
-   The report includes the inclusive interval, each replica's digest and unavailable endpoints.
+   The report includes the inclusive interval, each reachable replica's retained window, the required quorum, the computed digests and unavailable endpoints.
    It reports a divergence if the digests differ.
-   The retained interval starts above the highest trim point among the responding servers.
+   A reachable empty replica cannot prevent the other replicas from being compared.
+   `audit --require-quorum` reports failure when too few distinct endpoints can independently verify that interval.
+   Auditing a pristine deployment leaves its data key unallocated.
    On a stopped logkeeper, `rtdb-multi audit-log --data PATH --stream STREAM --from LSN --through LSN --expect DIGEST` verifies the same interval directly from journal segments.
    The command takes a shared filesystem lock and reads the segments without modifying them.
    A damaged record or a digest mismatch makes the command fail.

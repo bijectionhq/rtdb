@@ -12,6 +12,21 @@ use rtdb_multi::keys::KeyService;
 use tokio_postgres::NoTls;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn auditing_a_pristine_deployment_does_not_allocate_its_encryption_key() {
+    let cell = Cell::start(0, None).await;
+    let deployment = admin::create_deployment(cell.directory.as_ref(), "pristine", "acme", 3).await.unwrap();
+    let keys = cell.keys();
+    assert!(keys.existing(&deployment.id).is_err());
+    let report = admin::audit(cell.directory.as_ref(), &keys, "pristine", 4 << 20).await.unwrap();
+    assert!(report.violations.is_empty());
+    assert!(report.replica_digests.is_empty());
+    assert_eq!(report.required_replica_quorum, 2);
+    assert_eq!(report.replica_windows.len(), 3);
+    assert!(keys.existing(&deployment.id).is_err());
+    cell.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_idle_holding_flushes_then_keeps_serving_under_the_same_epoch() {
     let cell = Cell::start_with_idle_flush(Duration::from_millis(100)).await;
     let directory = cell.directory.as_ref();

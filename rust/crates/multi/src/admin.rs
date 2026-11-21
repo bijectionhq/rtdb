@@ -842,6 +842,10 @@ pub struct AuditReport {
     #[serde(default)]
     pub replica_digests: BTreeMap<String, String>,
     #[serde(default)]
+    pub replica_windows: BTreeMap<String, Option<[i64; 2]>>,
+    #[serde(default)]
+    pub required_replica_quorum: usize,
+    #[serde(default)]
     pub unavailable_replicas: BTreeMap<String, String>,
 }
 
@@ -852,12 +856,12 @@ pub async fn audit(directory: &dyn Directory, keys: &dyn KeyService, name: &str,
     let servers = replica_servers(directory, &current).await?;
     let stream = StreamConfig { write_quorum: write_quorum(servers.len()), servers, stream: current.stream("replica"), maximum_message_bytes };
     let reader = rtdb_logkeeper::open_reader(stream.clone(), CancellationToken::new()).await?;
-    let log = crate::logs::SealedLog::new(reader, &keys.key(&current.id)?, &current.stream("replica"))?;
-    let latest = log.latest()?.0;
-    let mut report = AuditReport::default();
+    let latest = reader.latest()?.0;
+    let log = if latest >= 0 { Some(crate::logs::SealedLog::new(reader, &keys.existing(&current.id)?, &stream.stream)?) } else { None };
+    let mut report = AuditReport { required_replica_quorum: stream.write_quorum, ..AuditReport::default() };
     let (mut next, mut last_tx, mut last_time, mut last_source) = (0i64, i64::MIN, i64::MIN, i64::MIN);
     let entries_per_batch = ((16 << 20) / maximum_message_bytes.max(1)).clamp(1, 1024) as i64;
-    while next <= latest {
+    while let Some(log) = log.as_ref().filter(|_| next <= latest) {
         let records = match log.read_range(rtdb_storage::log::LogOffset(next), rtdb_storage::log::LogOffset((next + entries_per_batch).min(latest + 1))).await {
             // The stream is trimmed below the last published block: the audit covers what remains.
             Err(rtdb_storage::Error::UnavailableLogRange { first_retained, .. }) if first_retained > next => { next = first_retained; continue; }
@@ -890,6 +894,7 @@ pub async fn audit(directory: &dyn Directory, keys: &dyn KeyService, name: &str,
     }
     report.replica_interval = retained.interval;
     report.replica_digests = retained.digests;
+    report.replica_windows = retained.windows;
     report.unavailable_replicas = retained.unavailable;
     Ok(report)
 }
