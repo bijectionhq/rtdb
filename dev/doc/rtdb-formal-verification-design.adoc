@@ -836,6 +836,10 @@ A missing object or header, an empty or `null` version, and an inherited, packed
 Historical intents remain readable with an empty file plan.
 A provider observation identifies one object version at observation time.
 Certification still needs evidence that the selected catalog named that publication and that every reference, including group membership, is excluded.
+The Lean identity model checks that an accepted observation names the selected physical identity and that an exact erase preserves every other publication.
+A replacement can have the same logical key and content digest, and two provider namespaces can have the same local key and version.
+The model also checks the alternative of names qualified by epoch and input digest.
+Those checks assume correct encoding and a provider that enforces immutable publication and erasure by exact identity. link:../../verification/lean/RetirementIdentity.lean[Physical identity model]
 The native driver now defers the trie-removal reply until the installed prefix covers its read-back position.
 It checks the requested trie keys against the current catalog and the installed checkpoint in one immutable partition value before returning a position.
 An unrecognized prefix or a removal skipped under the recovery cutoff cannot produce the reply.
@@ -1358,6 +1362,7 @@ Each of the two new storage and compaction areas includes production-only and jo
 |The trie retirement intent and installed receipt preserve the observed logical file plan and exact version metadata where the serving store can supply it.
 Verus checks the shipped S3 version classifier, with production-only and joint contract mutations.
 A loopback S3 HEAD fixture checks provider key encoding and refusal of missing, empty and replaceable version IDs.
+Lean checks identity matching, exact erase and qualified names, with four controls against weaker operations.
 |Bind the observed version to catalog publication, test other storage representations, and require a directory-installed certificate before a provider erase.
 
 |Concurrent design models

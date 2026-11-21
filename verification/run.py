@@ -527,6 +527,34 @@ def verify_type_join(args, scratch):
     verify_lean_model(args, scratch, path, "type-join", controls, 10)
 
 
+def verify_retirement_identity(args, scratch):
+    path = Path("verification/lean/RetirementIdentity.lean")
+    controls = {
+        "select-by-logical-key": (
+            "  selected.identity = observed.identity\n",
+            "  selected.logicalKey = observed.logicalKey\n",
+            ["accepted_observation_identifies_selected", "a_replacement_can_share_the_key_and_digest",
+             "another_namespace_can_share_the_key_and_version"],
+        ),
+        "erase-by-physical-key": (
+            "decide (publication.identity ≠ identity)",
+            "decide (publication.identity.physicalKey ≠ identity.physicalKey)",
+            ["exact_delete_retains_any_other_publication"],
+        ),
+        "reuse-name-on-reset": (
+            "  ⟨logicalKey, epoch, inputDigest⟩",
+            "  ⟨logicalKey, 0, inputDigest⟩",
+            ["reset_disjoins_qualified_names"],
+        ),
+        "omit-input-digest-from-name": (
+            "  ⟨logicalKey, epoch, inputDigest⟩",
+            "  ⟨logicalKey, epoch, 0⟩",
+            ["different_inputs_disjoin_qualified_names"],
+        ),
+    }
+    verify_lean_model(args, scratch, path, "retirement-identity", controls, 7)
+
+
 def verify_basis_tokens(args, scratch):
     path = Path("verification/lean/BasisTokens.lean")
     controls = {
@@ -1131,6 +1159,7 @@ def verify_lean(args, scratch):
             verify_system_time(args, scratch)
             verify_message_position(args, scratch)
             verify_type_join(args, scratch)
+            verify_retirement_identity(args, scratch)
             verify_basis_tokens(args, scratch)
             verify_run_encoding(args, scratch)
             verify_memory_admission(args, scratch)
