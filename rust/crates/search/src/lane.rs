@@ -97,7 +97,16 @@ impl ArtefactBuilder for SearchBuilder {
         let definition = &job.definition;
         let suspect = crate::runtime::Suspect { database: self.database.clone(), table: definition.table.clone(), owner: job.owner.clone(), artefact_id: definition.id.clone(), version: definition.version };
         let repairing = matches!(source, rtdb_maintenance::ArtefactSource::Stored) && self.runtime.is_suspect(&suspect);
-        let record = |sections: &[crate::file::Section]| ArtefactRecord { kind: Some(KIND.into()), definition_id: Some(definition.id.clone()), definition_version: Some(definition.version), stats: Some(crate::file::encode_sections(sections)), scope: None };
+        let record = |sections: &[crate::file::Section], size: u64| -> Result<ArtefactRecord> {
+            Ok(ArtefactRecord {
+                kind: Some(KIND.into()),
+                definition_id: Some(definition.id.clone()),
+                definition_version: Some(definition.version),
+                stats: Some(crate::file::encode_sections(sections)),
+                scope: None,
+                file_size: Some(i64::try_from(size).map_err(fault)?),
+            })
+        };
         let known = self.columns.lock().get(&(definition.id.clone(), definition.version)).cloned();
         let columns = match known { Some(columns) => columns, None => {
             self.definitions(snapshot, cancellation).await?;
@@ -111,7 +120,12 @@ impl ArtefactBuilder for SearchBuilder {
             self.runtime.forget_file(&self.database, &key);
             self.storage.invalidate(&key).await?;
             match self.runtime.file(&self.database, &self.storage, &key, &columns).await {
-                Ok(file) => { self.runtime.clear(&suspect); return Ok(record(file.sections())); }
+                Ok(file) => {
+                    let size = self.store.head_fresh(&key).await?.size;
+                    let record = record(file.sections(), size)?;
+                    self.runtime.clear(&suspect);
+                    return Ok(record);
+                }
                 Err(crate::runtime::FileError::Unavailable(error)) => return Err(error),
                 Err(crate::runtime::FileError::Missing) => {}
                 Err(crate::runtime::FileError::Corrupt(_)) => {
@@ -161,9 +175,11 @@ impl ArtefactBuilder for SearchBuilder {
             write_group_search_file(&columns, members, &identity, ceiling, directory, output)
         }).await.map_err(|error| Anomaly::fault("rtdb.search/build", error.to_string()))??;
         if cancellation.is_cancelled() { return Err(Anomaly::new(rtdb_types::AnomalyCategory::Interrupted, "rtdb.search/cancelled", "Search build cancelled")); }
+        let size = tokio::fs::metadata(&bundle).await.map_err(fault)?.len();
+        let record = record(&sections, size)?;
         self.store.put_file(&key, &bundle).await?;
         if repairing { self.runtime.clear(&suspect); }
-        Ok(record(&sections))
+        Ok(record)
     }
 }
 

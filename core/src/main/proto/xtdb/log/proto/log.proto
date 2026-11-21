@@ -94,6 +94,8 @@ message ArtefactRecord {
     // Opaque to the core: the artefact kind owns its encoding.
     bytes stats = 4;
     ArtefactScope scope = 5;
+    // Size of the published object, including its headers and auxiliary sections.
+    int64 file_size = 6;
 }
 
 // The data files one artefact is derived from.

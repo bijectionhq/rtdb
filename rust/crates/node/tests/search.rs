@@ -200,6 +200,28 @@ async fn accelerated_match_returns_what_the_unaccelerated_predicate_returns_at_e
     let groups: std::collections::BTreeSet<_> = shared.iter().filter_map(|key| key.part_group()).collect();
     assert_eq!(shared.len(), groups.len() * 4, "every member of a group shares its file: {shared:?}");
     assert!(shared.iter().any(|key| key.level() == 2 && key.recency().is_none()), "the level-2 partition group's members share one search file: {shared:?}");
+    let docs = TableRef::new("public", "docs");
+    let snapshot = database.snapshot();
+    let slug = &snapshot.table_entry(&docs).unwrap().slug;
+    let mut expected_files = std::collections::BTreeMap::new();
+    for trie in snapshot.trie_catalog().current_tries(&docs) {
+        for record in trie.artefacts.iter().filter(|record| record.kind() == "search") {
+            let key = slug.recorded_artefact_key(&trie.key, record).unwrap();
+            expected_files.insert(key, record.file_size.unwrap());
+        }
+    }
+    let files = rows(session.query_sql(
+        "SELECT object_key, file_size FROM xt.live_trie_artefacts WHERE schema_name = 'public' AND table_name = 'docs' AND kind = 'search'",
+        vec![],
+    ).await.unwrap()).await;
+    assert_eq!(files.len(), expected_files.len(), "each live file is charged once");
+    for file in files {
+        let [Value::Utf8(key), Value::I64(size)] = file.as_slice() else { panic!("invalid file usage: {file:?}") };
+        assert_eq!(expected_files.remove(key), Some(*size));
+        let object = rtdb_storage::ObjectKey::new(key.clone()).unwrap();
+        assert_eq!(database.object_store().head_fresh(&object).await.unwrap().size, u64::try_from(*size).unwrap());
+    }
+    assert!(expected_files.is_empty());
     let mut compared = 0;
     let mut answers = std::collections::BTreeMap::<&str, std::collections::BTreeSet<Vec<i64>>>::new();
     for query in ["overdue", "invoice overdue", "red blue", "paid book", "absent", "\"red blue\"", "overdue \"late book\""] {

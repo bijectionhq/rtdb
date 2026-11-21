@@ -272,6 +272,9 @@ Virtual `information_schema` and `pg_catalog` relations resolve from declared sc
 Their rows derive from the captured table registry, column types, database names, and shared PostgreSQL descriptors.
 The declared empty constraint, dependency, extension, and index relations follow the pinned JVM information-schema producers.
 `xt.live_tables`, `xt.live_columns`, and `xt.trie_stats` read retained partition generations.
+`xt.live_trie_artefacts` reports one row per recorded object reachable from a live trie, including partition group objects shared by multiple tries.
+Its rows identify the table, object, definition version, and current or historical family.
+`file_size` is the published object's recorded size in bytes, or null when the record has no size.
 `SystemCursor` computes its allocation bound by borrowing live segments and counting trie catalog entries in place.
 `xt.live_tables` and `xt.live_columns` borrow the same segments to produce rows.
 Runtime user, role, and metric relations require an explicit `CatalogRuntime`; an absent provider reports an unavailable anomaly when that relation is scanned.
