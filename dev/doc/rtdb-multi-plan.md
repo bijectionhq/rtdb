@@ -910,6 +910,15 @@ Three 48-move continuous-write trials per policy measured gap p99 of 38.1–150.
 The move corresponding to the 4.5-second gap also took 4.5 seconds in the administration call.
 The branch keeps the 16-record and 64-live-row limits.
 
+Three seeded release pairs also compared the existing policy with one checkpoint prefetch per target, given a 100 ms window before the source parked.
+The host was compiling and running tests during this comparison.
+All three baseline Zipf trials and two of the three prefetch trials verified their 32,768 updates.
+The remaining trial exposed a query racing with local placement removal, which the placed node now returns to the gateway as a retryable placement change.
+Baseline p99 ranged from 68.8 to 188.2 ms during scale-out and from 119.7 to 253.5 ms during scale-in.
+The completed prefetch trials measured 169.7–686.4 ms during scale-out and 97.1–138.8 ms during scale-in.
+The 48-move gap p99 ranged from 100.3 to 2,358.4 ms on the baseline and from 129.2 to 3,032.8 ms with the prefetch.
+The branch keeps the existing handoff path while the prefetch strategy is evaluated.
+
 ### Stage 12: encryption, lineages, forks and deletion
 
 **Why.**
