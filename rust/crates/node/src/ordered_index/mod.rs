@@ -11,6 +11,7 @@ use std::{collections::BTreeMap, sync::Arc};
 
 use rtdb_columnar::{MemoryBudget, read_value};
 use rtdb_index::Snapshot;
+use rtdb_plan::{Catalog, ColumnId, Field, QualifiedTable, Relation, Scan, TemporalFilter};
 use rtdb_query::{CatalogSnapshot, DatabaseSnapshot, PreparedQuery, QueryContext, QueryOptions};
 use rtdb_storage::{ObjectKey, cache::BufferPool};
 use rtdb_types::{Anomaly, Instant, Result, TableRef, Value};
@@ -57,7 +58,11 @@ async fn definitions(
     now: Instant,
     cancellation: &CancellationToken,
 ) -> Result<Vec<Definition>> {
-    if !snapshot.contains_table(&TableRef::new(CATALOG.0, CATALOG.1)) {
+    let name = QualifiedTable {
+        database: database.to_owned(),
+        table: TableRef::new(CATALOG.0, CATALOG.1),
+    };
+    if !snapshot.contains_table(&name.table) {
         return Ok(Vec::new());
     }
     let catalog = CatalogSnapshot::new(
@@ -79,16 +84,24 @@ async fn definitions(
         QueryOptions::default(),
         cancellation,
     )?;
-    let sql = "SELECT _id, schema_name, table_name, columns, version FROM xt.ordered_indexes";
-    let prepared = rtdb_sql::prepare_in(
-        sql,
-        &context.catalog,
-        &rtdb_sql::PrepareOptions::default(),
-        memory,
-    )?;
-    let mut cursor = PreparedQuery::from_prepared(prepared, memory)?
-        .execute(context, Vec::new())
-        .await?;
+    let table = context.catalog.table(&name)?
+        .ok_or_else(|| format_error("The ordered index catalog is absent at the captured basis"))?;
+    let columns = ["_id", "schema_name", "table_name", "columns", "version"]
+        .into_iter().enumerate().map(|(id, name)| Field {
+            id: ColumnId(id as u32),
+            name: name.to_owned(),
+            qualifier: None,
+            qualified_only: false,
+            unnamed: false,
+            data_type: table.scan_column_type(name),
+        }).collect();
+    let scan = Relation::scan(Scan {
+        table, columns, valid_time: TemporalFilter::Default, system_time: TemporalFilter::Default,
+        clamp_valid_time: false, iids: None, predicates: Vec::new(),
+        top_k: None, ordered_top_k: None, matches: Vec::new(),
+    })?;
+    let mut cursor = PreparedQuery::new_in(Arc::new(scan), memory)?
+        .execute_columns(context, Vec::new()).await?;
     let mut definitions = Vec::new();
     while let Some(batch) = cursor.next_batch().await? {
         let batch = batch.batch();
