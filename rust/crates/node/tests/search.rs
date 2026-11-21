@@ -373,6 +373,81 @@ async fn live_rows_written_between_queries_are_found_as_the_live_index_grows() {
 }
 
 #[tokio::test]
+async fn plain_match_scans_when_the_index_build_cannot_fit() {
+    let mut options = options();
+    options.execution_memory_bytes = 16 << 20;
+    options.automatic_artefacts = false;
+    let (node, driver) = Node::open(options, services()).await.unwrap();
+    let driver = tokio::spawn(driver.run());
+    let mut session = node.session("xtdb", Arc::new(Authority)).unwrap();
+    let statements = [
+        "CREATE SEARCH INDEX docs_body ON docs (body)",
+        "INSERT INTO docs RECORDS {_id: 1, body: 'invoice overdue'}, {_id: 2, body: 'paid'}",
+    ];
+    for statement in statements {
+        assert!(session.state_mut().execute_tx(vec![sql(statement)], AutonomousTxOptions::default()).await.unwrap().committed());
+    }
+    let database = node.catalog().database("xtdb").unwrap();
+    database.flush().await.unwrap();
+    node.sync_all(Duration::from_secs(10), &tokio_util::sync::CancellationToken::new()).await.unwrap();
+    let actual = ids(rows(session.query_sql("SELECT _id FROM docs WHERE MATCH(body, 'invoice')", vec![]).await.unwrap()).await);
+    assert_eq!(actual, [1]);
+    let corpus = rtdb_text::Corpus { documents: 2, tokens: 3, frequencies: [("invoice".into(), 1)].into() };
+    let score = rtdb_text::bm25(&rtdb_text::Query::parse("invoice"), &rtdb_text::tokens("invoice overdue"), Some(&corpus));
+    let scored = rows(session.query_sql("SELECT _id, SEARCH_SCORE(body, 'invoice') FROM docs WHERE MATCH(body, 'invoice')", vec![]).await.unwrap()).await;
+    assert_eq!(scored, [vec![Value::I64(1), Value::F64(score)]]);
+    node.shutdown();
+    tokio::time::timeout(Duration::from_secs(10), driver).await.unwrap().unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn plain_match_scans_historical_pages_with_independent_recency_order() {
+    let mut options = options();
+    options.automatic_artefacts = false;
+    options.compaction.page_size = 1;
+    options.compaction.within_file_recency_branching = true;
+    let (node, driver) = Node::open(options, services()).await.unwrap();
+    let driver = tokio::spawn(driver.run());
+    let mut session = node.session("xtdb", Arc::new(Authority)).unwrap();
+    assert!(session.state_mut().execute_tx(vec![sql("CREATE SEARCH INDEX docs_body ON docs (body)")], AutonomousTxOptions::default()).await.unwrap().committed());
+
+    let mut entities: Vec<i64> = (0..24).collect();
+    entities.sort_by_key(|id| rtdb_types::EntityId::Integer(*id).iid());
+    let operations = entities.iter().enumerate().map(|(offset, id)| {
+        let end = if offset % 2 == 1 { "01:00:00" } else { "12:00:00" };
+        sql(&format!("INSERT INTO docs RECORDS {{_id: {id}, body: 'invoice', _valid_from: TIMESTAMP '1970-01-01Z', _valid_to: TIMESTAMP '1970-01-05T{end}Z'}}"))
+    }).collect();
+    assert!(session.state_mut().execute_tx(operations, AutonomousTxOptions::default()).await.unwrap().committed());
+    let database = node.catalog().database("xtdb").unwrap();
+    database.flush().await.unwrap();
+    node.sync_all(Duration::from_secs(10), &tokio_util::sync::CancellationToken::new()).await.unwrap();
+    database.compaction().unwrap().compact_all().await.unwrap();
+
+    let snapshot = database.snapshot();
+    let table = TableRef::new("public", "docs");
+    let entry = snapshot.table_entry(&table).unwrap();
+    let history = snapshot.trie_entries(&table).into_iter().find(|trie| trie.key.recency().is_some()).unwrap();
+    let key = rtdb_storage::ObjectKey::new(entry.slug.data_key(&history.key)).unwrap();
+    let lease = database.storage().get(&key).await.unwrap();
+    let cancellation = tokio_util::sync::CancellationToken::new();
+    let columns = ["body".to_string()];
+    let physical_iids: Vec<_> = rtdb_search::search_pages(lease.as_slice(), &columns, &cancellation).unwrap()
+        .flat_map(|page| page.unwrap().into_iter().map(|row| row.iid)).collect();
+    assert_eq!(physical_iids.len(), entities.len());
+    assert!(physical_iids.windows(2).any(|pair| pair[0] > pair[1]));
+    drop(lease);
+
+    let query = "SELECT _id FROM docs FOR VALID_TIME AS OF TIMESTAMP '1970-01-05T00:00:00Z' WHERE MATCH(body, 'invoice')";
+    assert_eq!(ids(rows(session.query_sql(query, vec![]).await.unwrap()).await), (0..24).collect::<Vec<_>>());
+    let scored = "SELECT _id, SEARCH_SCORE(body, 'invoice') AS score FROM docs FOR VALID_TIME AS OF TIMESTAMP '1970-01-05T00:00:00Z' WHERE MATCH(body, 'invoice') ORDER BY score DESC, _id LIMIT 1";
+    let corpus = rtdb_text::Corpus { documents: 24, tokens: 24, frequencies: [("invoice".into(), 24)].into() };
+    let score = rtdb_text::bm25(&rtdb_text::Query::parse("invoice"), &rtdb_text::tokens("invoice"), Some(&corpus));
+    assert_eq!(rows(session.query_sql(scored, vec![]).await.unwrap()).await, [vec![Value::I64(0), Value::F64(score)]]);
+    node.shutdown();
+    tokio::time::timeout(Duration::from_secs(10), driver).await.unwrap().unwrap().unwrap();
+}
+
+#[tokio::test]
 async fn a_ranked_cutoff_counts_only_rows_that_pass_every_match() {
     let mut options = options();
     options.file_size_target = 1;

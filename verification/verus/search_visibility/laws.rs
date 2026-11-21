@@ -1,4 +1,4 @@
-use crate::production::{can_shadow, merge_adjacent_valid_time};
+use crate::production::{can_shadow, cut_has_point, cut_rectangle, merge_adjacent_valid_time};
 use vstd::prelude::*;
 
 verus! {
@@ -64,4 +64,22 @@ fn an_erase_can_shadow_a_closed_historical_rectangle(
     erase_system: i64,
 ) -> bool {
     can_shadow(system_start, system_end, erase_system, true)
+}
+
+// LAW RTDB-FTS-04.
+#[verus_spec(out =>
+    ensures
+        cut_has_point(out@, valid_at, system_at)
+        == visible_after_event(rectangle@, valid_at, system_at, event_from, event_to, event_system, erase),
+)]
+fn a_cut_matches_the_reference_at_every_point(
+    rectangle: [i64; 4],
+    event_from: i64,
+    event_to: i64,
+    event_system: i64,
+    erase: bool,
+    valid_at: i64,
+    system_at: i64,
+) -> [Option<[i64; 4]>; 3] {
+    cut_rectangle(rectangle, event_from, event_to, event_system, erase)
 }

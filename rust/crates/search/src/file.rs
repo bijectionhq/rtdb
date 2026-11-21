@@ -189,11 +189,11 @@ where
             for row in page? {
                 if row.values.len() != columns.len() { return Err(fault("Search row values do not cover the file's columns")); }
                 if entity.iid.is_none() && previous_member_iid.is_some_and(|iid| iid >= row.iid) {
-                    return Err(fault("Search file members do not hold disjoint IID ranges in order"));
+                    return Err(Anomaly::unsupported("rtdb.search/input-order", "Search file members do not hold disjoint IID ranges in order"));
                 }
-                if entity.iid.is_some_and(|iid| iid > row.iid) { return Err(fault("Search rows are not in IID order")); }
+                if entity.iid.is_some_and(|iid| iid > row.iid) { return Err(Anomaly::unsupported("rtdb.search/input-order", "Search rows are not in IID order")); }
                 if entity.iid.is_some_and(|iid| iid != row.iid) { runs(&mut writer, &fields, &mut sidecar, std::mem::replace(&mut entity, Entity::new(columns.len())))?; }
-                if entity.rows.last().is_some_and(|(_, last)| last.system_from.0 < row.system_from) { return Err(fault("Search rows are not in system-time-descending order")); }
+                if entity.rows.last().is_some_and(|(_, last)| last.system_from.0 < row.system_from) { return Err(Anomaly::unsupported("rtdb.search/input-order", "Search rows are not in system-time-descending order")); }
                 for docs in &mut sidecar.row_docs { docs.push(NO_DOC); }
                 sidecar.keys.extend_from_slice(&row.iid);
                 for value in [row.system_from, row.valid_from, row.valid_to] { sidecar.keys.extend_from_slice(&value.to_le_bytes()); }

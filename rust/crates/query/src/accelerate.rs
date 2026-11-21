@@ -41,6 +41,13 @@ pub struct ScanRequest<'a> {
 pub trait CandidateVerifier: Send + Sync {
     /// Each visible row's IID with its value of `column`.
     async fn visible(&self, iids: BTreeSet<Iid>, column: rtdb_plan::ColumnId) -> Result<Vec<(Iid, Value)>>;
+
+    /// Counts the corpus from authoritative rows when an optional index cannot supply it.
+    async fn snapshot_corpus(
+        &self, _column: &str, _at: rtdb_types::Timestamp, _partitions: &[Snapshot],
+    ) -> Result<Arc<dyn CorpusSource>> {
+        Err(rtdb_types::Anomaly::unsupported("rtdb.query/scan-corpus-unavailable", "This verifier cannot scan the corpus"))
+    }
 }
 
 /// Something that can count, for any terms, the documents and tokens of the corpus a score is relative to.
@@ -51,23 +58,29 @@ pub trait CorpusSource: Send + Sync {
 /// The corpus sources the scans of one query opened, once each however often a scan reopens; a score sums them all, whatever column or table each came from.
 /// A query text's corpus is fixed at its first use, so every score in one query, and any ranking an accelerator pruned by, is relative to the same corpus.
 #[derive(Default)]
-pub struct CorpusRegistry(parking_lot::Mutex<Corpora>);
+pub struct CorpusRegistry {
+    requested: bool,
+    state: parking_lot::Mutex<Corpora>,
+}
 
 #[derive(Default)]
 pub struct Corpora { sources: std::collections::BTreeMap<String, Arc<dyn CorpusSource>>, computed: std::collections::BTreeMap<String, Option<rtdb_text::Corpus>> }
 
 impl CorpusRegistry {
+    pub(crate) fn for_query(requested: bool) -> Self { Self { requested, state: Default::default() } }
+    pub fn scores_requested(&self) -> bool { self.requested }
+
     /// `key` names the source, such as its object key; a source already registered under it is kept.
     pub fn register(&self, key: String, source: Arc<dyn CorpusSource>) {
-        let mut corpora = self.0.lock();
+        let mut corpora = self.state.lock();
         corpora.sources.entry(key).or_insert(source);
     }
-    pub fn holds(&self, key: &str) -> bool { self.0.lock().sources.contains_key(key) }
+    pub fn holds(&self, key: &str) -> bool { self.state.lock().sources.contains_key(key) }
 }
 
 impl rtdb_expr::CorpusLookup for CorpusRegistry {
     fn corpus(&self, query: &str) -> Option<rtdb_text::Corpus> {
-        let mut corpora = self.0.lock();
+        let mut corpora = self.state.lock();
         if let Some(computed) = corpora.computed.get(query) { return computed.clone(); }
         let terms = rtdb_text::Query::parse(query);
         let mut total = rtdb_text::Corpus::default();

@@ -8,7 +8,7 @@ use rtdb_plan::{BinaryOp, Expr};
 use rtdb_query::{MatchAnswers, ScanAccelerator, ScanRequest};
 use rtdb_storage::ObjectKey;
 use rtdb_text::Query;
-use rtdb_types::{Iid, Interval, Result, TemporalBounds, Timestamp, Value};
+use rtdb_types::{Anomaly, Iid, Interval, Result, TemporalBounds, Timestamp, Value};
 
 use crate::{KIND, SearchDefinition, SearchFile, runtime::{Suspect, TrieFile}};
 
@@ -49,6 +49,11 @@ fn may_be_visible(valid_from: i64, valid_to: i64, system_from: i64, recency: i64
     valid_from < valid.upper().0 && valid_to > valid.lower().0 && system_from < system.upper().0 && valid.lower().0.min(system.lower().0) < recency
 }
 
+fn optional_build_refused(error: &Anomaly) -> bool {
+    matches!(error.code.as_str(),
+        "rtdb/memory-budget-exceeded" | "rtdb.storage/memory-limit" | "rtdb.search/input-order")
+}
+
 #[async_trait]
 impl ScanAccelerator for SearchAccelerator {
     async fn candidate_iids(&self, request: &ScanRequest<'_>) -> Result<Option<BTreeSet<Iid>>> {
@@ -62,7 +67,9 @@ impl ScanAccelerator for SearchAccelerator {
         }
         let Some((column, query, definition)) = chosen else { return Ok(None) };
         if query.terms().is_empty() { return Ok(Some(BTreeSet::new())); }
-        self.register_corpora(request, column, &definition).await?;
+        if request.corpora.scores_requested() {
+            self.register_corpora(request, column, &definition).await?;
+        }
         if let Some(top_k) = &scan.top_k {
             let ranked = scan.columns.iter().find(|field| field.id == top_k.column).is_some_and(|field| field.name == column);
             if ranked { if let Some(candidates) = self.top_k(request, top_k, column, &query, &definition).await? { return Ok(Some(candidates)); } }
@@ -76,7 +83,7 @@ impl ScanAccelerator for SearchAccelerator {
 
     async fn match_answers(&self, request: &ScanRequest<'_>, column: &str, query: &str) -> Result<Option<MatchAnswers>> {
         let Some(definition) = self.definition(request, column).await? else { return Ok(None) };
-        let files = match self.trie_files(request, &definition).await? { TrieFiles::Complete(files) | TrieFiles::Recorded(files) => files };
+        let files = match self.trie_files(request, &definition).await? { TrieFiles::Complete(files) | TrieFiles::Partial(files) => files };
         let query = Query::parse(query);
         let mut answers = MatchAnswers::default();
         for trie in files { answers.insert(&trie.data, Arc::new(self.runtime.match_set(request.database, &trie, column, &query)?.member(trie.member)?)); }
@@ -84,8 +91,7 @@ impl ScanAccelerator for SearchAccelerator {
     }
 }
 
-/// A partition's search files: one for every live trie, or only the recorded ones where building the rest would exceed max_unindexed_bytes.
-enum TrieFiles { Complete(Vec<TrieFile>), Recorded(Vec<TrieFile>) }
+enum TrieFiles { Complete(Vec<TrieFile>), Partial(Vec<TrieFile>) }
 
 /// Cuts a file's documents by the events of the same entity in the partition's other tries and its live segments (fts.allium: CutByLaterEvents).
 struct Cutter<'a> { files: &'a [TrieFile], segments: Vec<&'a Arc<rtdb_index::LiveTable>>, runtime: &'a crate::SearchRuntime, database: &'a str, bounds: TemporalBounds }
@@ -119,18 +125,10 @@ fn cut(rectangles: &mut Vec<[i64; 4]>, events: Vec<crate::file::KeyedEvent>) {
     for event in events {
         let mut kept = Vec::with_capacity(rectangles.len());
         for rectangle in rectangles.drain(..) {
-            let [valid_from, valid_to, system_from, system_to] = rectangle;
-            let erase = event.op == rtdb_types::EventOp::Erase;
-            if !crate::rectangle::can_shadow(system_from, system_to, event.system_from, erase) {
-                kept.push(rectangle);
-                continue;
-            }
-            if erase { continue; }
-            let (cut_from, cut_to) = (event.valid_from.max(valid_from), event.valid_to.min(valid_to));
-            if cut_from >= cut_to { kept.push(rectangle); continue; }
-            if valid_from < cut_from { kept.push([valid_from, cut_from, system_from, system_to]); }
-            if cut_to < valid_to { kept.push([cut_to, valid_to, system_from, system_to]); }
-            kept.push([cut_from, cut_to, system_from, event.system_from]);
+            kept.extend(crate::rectangle::cut_rectangle(
+                rectangle, event.valid_from, event.valid_to, event.system_from,
+                event.op == rtdb_types::EventOp::Erase,
+            ).into_iter().flatten());
         }
         *rectangles = kept;
     }
@@ -170,7 +168,7 @@ impl SearchAccelerator {
         self.trie_files_in(request, request.snapshot, definition, request.bounds, Some(self.max_unindexed_bytes), true).await
     }
 
-    /// The search files of a partition's live tries that can hold an event visible in `bounds`; with a `limit`, only the recorded ones once the tries the lane should have indexed but has not exceed it.
+    /// With a limit, optional builds can leave partial coverage and the scan evaluates the other files.
     /// With `prune`, a recorded trie whose record's lifespan sections all miss the bounds is left unopened.
     async fn trie_files_in(&self, request: &ScanRequest<'_>, snapshot: &Snapshot, definition: &SearchDefinition, bounds: TemporalBounds, limit: Option<i64>, prune: bool) -> Result<TrieFiles> {
         let table = &request.scan.table.name.table;
@@ -206,8 +204,16 @@ impl SearchAccelerator {
             if !by_policy { unindexed = unindexed.saturating_add(trie.data_file_size); }
             unbuilt.push((trie.key.clone(), data));
         }
-        if limit.is_some_and(|limit| unindexed > limit) { return Ok(TrieFiles::Recorded(files)); }
-        for (trie, data) in unbuilt { files.push(self.runtime.built(request.database, request.storage, &trie, &data, &definition.columns, request.memory, request.cancellation).await?); }
+        if limit.is_some_and(|limit| unindexed > limit) { return Ok(TrieFiles::Partial(files)); }
+        for (trie, data) in unbuilt {
+            match self.runtime.built(request.database, request.storage, &trie, &data, &definition.columns, request.memory, request.cancellation).await {
+                Ok(file) => files.push(file),
+                Err(error) if limit.is_some() && optional_build_refused(&error) => {
+                    return Ok(TrieFiles::Partial(files));
+                }
+                Err(error) => return Err(error),
+            }
+        }
         Ok(TrieFiles::Complete(files))
     }
 
@@ -224,7 +230,16 @@ impl SearchAccelerator {
         let mut segments = Vec::new();
         for snapshot in request.partitions {
             // A corpus resolves entities across every source, so no trie is left out by its sections.
-            match self.trie_files_in(request, snapshot, definition, point, None, false).await? { TrieFiles::Complete(found) | TrieFiles::Recorded(found) => files.extend(found) }
+            match self.trie_files_in(request, snapshot, definition, point, None, false).await {
+                Ok(TrieFiles::Complete(found) | TrieFiles::Partial(found)) => files.extend(found),
+                Err(error) if optional_build_refused(&error) => {
+                    drop(files);
+                    let source = request.verifier.snapshot_corpus(column, Timestamp(at), request.partitions).await?;
+                    request.corpora.register(name, source);
+                    return Ok(());
+                }
+                Err(error) => return Err(error),
+            }
             segments.extend(snapshot.iter_segments(table).cloned());
         }
         request.corpora.register(name, Arc::new(TableCorpus { runtime: Arc::clone(&self.runtime), database: request.database.to_string(), files: parking_lot::Mutex::new(Some(files)), computed: std::sync::OnceLock::new(), segments, column: column.to_string(), at }));

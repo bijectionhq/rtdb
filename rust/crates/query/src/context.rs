@@ -120,6 +120,7 @@ impl Default for QueryOptions {
     fn default() -> Self { Self { batch_rows: 1024, list_batch_rows: 1024, sort_memory_bytes: 64 * 1024 * 1024, join_build_rows: 100_000, spill_limit_bytes: 1024 * 1024 * 1024, bypass_temporal_pruning: false, generate_series_end_exclusive: false, object_sort: rtdb_types::ObjectSort::default(), memory_quantum: 0 } }
 }
 
+#[derive(Clone)]
 pub struct QueryContext {
     pub catalog: CatalogSnapshot,
     pub memory: Arc<MemoryBudget>,
@@ -164,6 +165,10 @@ impl QueryContext {
     pub fn with_tracer(self: Arc<Self>, tracer: Option<Arc<dyn rtdb_plan::Tracer>>, parent: Option<rtdb_plan::SpanContext>) -> Arc<Self> {
         Arc::new(Self { catalog: self.catalog.clone(), memory: Arc::clone(&self.memory), current_time: self.current_time,
             timezone: self.timezone.clone(), options: self.options.clone(), cancellation: self.cancellation.clone(), owner_cancellation: self.owner_cancellation.clone(), spill: Arc::clone(&self.spill), execution_observer: self.execution_observer.clone(), tracer, trace_parent: parent, read_basis: self.read_basis.clone(), accelerators: Arc::clone(&self.accelerators), corpora: Arc::clone(&self.corpora) })
+    }
+    pub(crate) fn with_score_corpus(mut self: Arc<Self>, requested: bool) -> Arc<Self> {
+        Arc::make_mut(&mut self).corpora = Arc::new(crate::accelerate::CorpusRegistry::for_query(requested));
+        self
     }
     pub fn check_cancelled(&self) -> Result<()> {
         if self.cancellation.is_cancelled() || self.owner_cancellation.is_cancelled() { Err(cancelled()) } else { Ok(()) }
