@@ -1,14 +1,14 @@
-use std::{collections::BTreeSet, io, str::FromStr, sync::Arc};
+use std::{collections::BTreeSet, io, sync::Arc};
 
 use rtdb_columnar::{MemoryBudget, MemoryReservation};
-use rtdb_format::{data::EventBatch, keys::TrieKey};
+use rtdb_format::data::EventBatch;
 use rtdb_index::Snapshot;
 use rtdb_maintenance::{
     CycleWorker, SnapshotSource,
     input::{open_input, read_page},
 };
 use rtdb_storage::{
-    ObjectKey, ObjectStore,
+    ObjectKey,
     cache::{BufferPool, Cached, View},
 };
 use rtdb_types::{
@@ -173,17 +173,19 @@ impl CycleWorker for OrderedIndexMaintenance {
 async fn flushed_changes(
     tree: &Tree<'_>,
     definition: &Definition,
-    object: &ObjectKey,
+    source: &SourceFile,
     cancellation: &CancellationToken,
 ) -> Result<(i64, Changes)> {
     if cancellation.is_cancelled() {
         return Err(cancelled());
     }
     let store = tree.storage.object_store();
-    let size = usize::try_from(store.head_fresh(object).await?.size).map_err(format_error)?;
-    let _input_bytes = tree.memory.reserve(size)?;
-    let bytes = store.get_fresh(object).await?;
-    if bytes.len() != size {
+    if store.head_fresh(&source.object).await?.size != source.size as u64 {
+        return Err(format_error("An ordered index source differs from the adopted file"));
+    }
+    let _input_bytes = tree.memory.reserve(source.size)?;
+    let bytes = store.get_fresh(&source.object).await?;
+    if bytes.len() != source.size {
         return Err(format_error("An ordered index source file changed length"));
     }
     let (mut input, _footer) = open_input(io::Cursor::new(bytes), tree.memory)?;
@@ -211,16 +213,8 @@ async fn replay_flushed(
 ) -> Result<i64> {
     let mut pending_collection = false;
     let mut rows = 0_i64;
-    for (block, object) in source_files(
-        snapshot,
-        &definition.table,
-        tree.storage.object_store().as_ref(),
-        after,
-        through,
-    )
-    .await?
-    {
-        let (count, changes) = flushed_changes(tree, definition, &object, cancellation).await?;
+    for source in source_files(snapshot, &definition.table, after, through)? {
+        let (count, changes) = flushed_changes(tree, definition, &source, cancellation).await?;
         rows = rows.checked_add(count).ok_or_else(incomplete_source)?;
         let erased = roots
             .apply(tree, changes, EventOrder::NewestFirst, cancellation)
@@ -230,7 +224,7 @@ async fn replay_flushed(
             pending_collection = true;
         }
         // A rebuild and incremental replay must write identical addresses for the same block.
-        roots.archived = checkpoint::store_roots(tree, block, roots, cancellation).await?;
+        roots.archived = checkpoint::store_roots(tree, source.block, roots, cancellation).await?;
         roots.changes.clear();
     }
     Ok(rows)
@@ -355,19 +349,12 @@ async fn read_flushed_root(
     } else {
         (-1, 0, None)
     };
-    let files = source_files(
-        snapshot,
-        &definition.table,
-        tree.storage.object_store().as_ref(),
-        after,
-        through,
-    )
-    .await?;
+    let files = source_files(snapshot, &definition.table, after, through)?;
     if files.len() > MAX_TAIL_FILES {
         return Ok(None);
     }
-    for (_, object) in files {
-        let (count, changes) = flushed_changes(tree, definition, &object, cancellation).await?;
+    for source in files {
+        let (count, changes) = flushed_changes(tree, definition, &source, cancellation).await?;
         rows = rows.checked_add(count).ok_or_else(incomplete_source)?;
         root = changes
             .read(tree, root, system_at, EventOrder::NewestFirst, cancellation)
@@ -395,51 +382,37 @@ fn source_frontier(snapshot: &Snapshot, table: &TableRef) -> i64 {
     snapshot.trie_catalog().l0_max_block_index(table).0
 }
 
-async fn source_files(
+struct SourceFile {
+    block: i64,
+    object: ObjectKey,
+    size: usize,
+}
+
+fn source_files(
     snapshot: &Snapshot,
     table: &TableRef,
-    store: &dyn ObjectStore,
     after: i64,
     through: i64,
-) -> Result<Vec<(i64, ObjectKey)>> {
+) -> Result<Vec<SourceFile>> {
     if after >= through {
         return Ok(Vec::new());
     }
-    let table = snapshot
+    let storage = snapshot
         .table_entry(table)
         .ok_or_else(|| format_error("An index source table has no recorded storage identity"))?;
-    let directory = ObjectKey::new(format!("{}/data", table.slug.table_prefix()))?;
-    let mut files = Vec::new();
-    for object in store.list(Some(&directory)).await? {
-        let Some(file) = object
-            .key
-            .as_str()
-            .rsplit('/')
-            .next()
-            .and_then(|name| name.strip_suffix(".arrow"))
-        else {
-            continue;
-        };
-        let Ok(trie) = TrieKey::from_str(file) else {
-            continue;
-        };
-        let block = trie.block_index().0;
-        if trie == TrieKey::l0(trie.block_index())?
-            && object.key.as_str() == table.slug.data_key(&trie)
-            && block > after
-            && block <= through
-        {
-            files.push((block, object.key));
-        }
-    }
-    files.sort_unstable_by_key(|(block, _)| *block);
-    if files.windows(2).any(|pair| pair[0].0 == pair[1].0) {
+    let files = snapshot
+        .trie_catalog()
+        .l0_source(table, BlockIndex(after), BlockIndex(through))
+        .map(|trie| {
+            Ok(SourceFile {
+                block: trie.key.block_index().0,
+                object: ObjectKey::new(storage.slug.data_key(&trie.key))?,
+                size: usize::try_from(trie.data_file_size).map_err(format_error)?,
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    if files.last().map(|source| source.block) != Some(through) {
         return Err(incomplete_source());
-    }
-    if files.last().map(|(block, _)| *block) != Some(through) {
-        return Err(format_error(
-            "The index source's latest flushed block is unavailable",
-        ));
     }
     Ok(files)
 }

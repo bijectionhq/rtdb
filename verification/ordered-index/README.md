@@ -9,7 +9,7 @@ The checker results and the remaining production obligations appear below.
 | Temporal projection and exact membership | `Temporal.lean` specifies point lookup against independent event interpretation and a single visible span per IID. `Buckets.lean` proves exact coverage for a recursive dyadic decomposition and for any left-to-right tiling. | Connect RTDB's newest-first temporal resolver, coalescing, and greedy bucket iterator to the model. |
 | Signed timestamps, unbounded end and bucket lookup | `domain.rs` checks the production timestamp conversion and aligned bucket lookup. | Connect the greedy iterator's width selection and progression to the tiling contract. |
 | Ordered seek, eligibility and pagination | `SeekRange.lean` states the monotone seek partition and fence pruning laws. `seek.rs` includes the production binary search and directed slot lookup. `OrderedRead.lean` states ordered merge, filtering before limit, and keyset continuation. | Connect Arrow values and SQL comparisons to the order and filters, and the tree cursor and heap to the ordered streams. |
-| Replay and fallback | `Recovery.lean` states equivalence for complete checkpoints and ordered tails. It also states exactly when the event count completes coverage. `Reachability.lean` states layout identity across a checkpoint split. | Establish that the canonical flushed inputs and live offset are an ordered substream of the exact capture. |
+| Replay and fallback | `Recovery.lean` states equivalence for complete checkpoints and ordered tails. It also states exactly when the event count completes coverage. `Reachability.lean` states layout identity across a checkpoint split. | The adopted L0 inventory supplies the flushed input identities and lengths. Connect live segment offsets and the immutable file bytes to the exact capture. |
 | Publication and reclamation | `Checkpoint.tla` models a captured reader, two workers, immutable objects, publication, collection, fallback, and crash. The two control configurations remove checked source identity and complete upload. `Reachability.lean` states how a stale mark preserves later reachable pages under the per-block sharing rule. | Prove the sharing rule for `Tree::persist` and `store_roots`, and connect reader retention, leadership and immutable writes to the protocol. |
 | Erasure | `Temporal.lean` states how erase cuts the captured IID's prior history, including historical system-time reads. | Connect revision-directory scrubbing and physical collection across object and node caches to the model. `ErasureCleanup.tla` models the durable cleanup obligation under a single fail-stop owner. `ErasureRelease.tla` checks the requirement for fenced writes and replica eviction. |
 | Bijection page witnesses | `OrderedRead.lean` proves how agreement over the consumed ordered prefix preserves the page. `DistinctPage.lean` proves the ordered distinct candidate prefix, clearance before deduplication, and the preservation of global prefix keys under each local limit. | Bind the per-world SQL results and protected custody streams to the candidate sets used at acquisition and revalidation. |
@@ -43,8 +43,7 @@ release together.
 
 The cleanup model assumes one fail-stop maintenance owner. Ordered-index
 page reads bypass the durable disk cache, and replay holds its L0 input in
-charged memory. The hosted checkpoint archive enumerates the primary table
-closure, which excludes the derived index directory.
+charged memory. Hosted checkpoint archives, storage forks, and relocation leave derived index pages with their original source.
 In production, a worker's term cancellation and an object-store `put` are separate operations.
 An end-to-end physical erasure argument must cover an already-admitted write by a superseded owner and stale contents on every replica.
 A proof of the cleanup marker under the fail-stop model establishes one step of that argument.
@@ -84,6 +83,11 @@ requires eviction on the modeled replica. Production must establish these
 conditions across its object store and replicas to claim physical completion.
 The proof run checked the models and included Rust decision functions. The
 native RTDB and Bijection runtime regressions remain unexecuted.
+
+On the hosted integration source `ad6d5924903d89613b0bdf714fb75f2023d27867`,
+Lean 4.35.0 checked seven law modules and audited 17 theorems through Rex on the M1.
+The additional module covers exact ascending or descending candidates by
+order rank, clearance before duplicate elimination, and per-source limits.
 
 ## Execution
 

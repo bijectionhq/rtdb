@@ -30,6 +30,14 @@ use crate::keys::KeyService;
 /// The protobuf type name the cell's storage factory is registered under.
 pub const CELL_STORAGE_TYPE: &str = "rtdb.multi.CellStorage";
 pub const GARBAGE_DIRECTORY: &str = "~garbage";
+const ORDERED_INDEX_RELEASE: &str = "-ordered-index";
+
+pub(crate) fn belongs_to_ordered_index(name: &str) -> bool {
+    rtdb_format::keys::is_ordered_index_object(name)
+        || name.strip_prefix(GARBAGE_DIRECTORY)
+            .is_some_and(|record| record.starts_with('/') && record.ends_with(ORDERED_INDEX_RELEASE))
+}
+
 const SEALED_OVERHEAD: u64 = OVERHEAD as u64;
 
 /// The deployment store a node opens, carried in its `DatabaseConfig`.
@@ -632,7 +640,8 @@ impl ObjectStore for GarbageStore {
     async fn delete(&self, key: &ObjectKey) -> rtdb_storage::Result<()> {
         if self.released.lock().contains(key) { return Ok(()); }
         let record = GarbageRecord { key: key.as_str().to_owned(), released_at_ms: (self.clock)() };
-        let name = ObjectKey::new(format!("{GARBAGE_DIRECTORY}/{:020}-{}", record.released_at_ms, uuid::Uuid::new_v4().simple()))
+        let suffix = if rtdb_format::keys::is_ordered_index_object(key.as_str()) { ORDERED_INDEX_RELEASE } else { "" };
+        let name = ObjectKey::new(format!("{GARBAGE_DIRECTORY}/{:020}-{}{suffix}", record.released_at_ms, uuid::Uuid::new_v4().simple()))
             .map_err(|error| Error::Task(error.to_string()))?;
         self.inner.put(&name, Bytes::from(serde_json::to_vec(&record).expect("a record serializes"))).await?;
         self.released.lock().insert(key.clone());

@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::{collections::{BTreeMap, BTreeSet}, ops::Bound::{Excluded, Included}};
 
 use rtdb_types::CivilDate;
 use rtdb_format::{block::proto as block_pb, catalog::TableBlock, keys::{PartGroup, TrieKey}, log::proto as log_pb};
@@ -98,8 +98,10 @@ impl TableTries {
     fn shard_with_floor(&mut self, shard: Shard, block: BlockIndex) -> &mut ShardValue {
         self.shards.entry(shard).or_insert_with(|| ShardValue { max_block_index: block, ..ShardValue::default() })
     }
-    fn drop_covered_l0(&mut self, block: BlockIndex) {
-        self.shard_with_floor(Shard::root(0, None), block).tries.retain(|index, trie| *index > block || trie.state != TrieState::Live);
+    fn cover_l0(&mut self, block: BlockIndex, as_of: Timestamp) {
+        // Compaction stops primary scans using these tries. Their immutable
+        // descriptors still certify the original input to derived indexes.
+        self.shard_with_floor(Shard::root(0, None), block).supersede(block, None, as_of);
     }
     fn apply(&mut self, mut trie: CatalogTrie, file_size_target: i64, as_of: Timestamp) -> Result<()> {
         let shard = Shard::of(&trie.key);
@@ -126,7 +128,7 @@ impl TableTries {
                 state.supersede(block, Some(file_size_target), as_of);
                 trie.state = TrieState::Live;
                 state.insert(trie);
-                self.drop_covered_l0(block);
+                self.cover_l0(block, as_of);
             }
             (2, Some(recency)) => {
                 let state = self.shard_with_floor(shard, block);
@@ -173,6 +175,19 @@ impl TrieCatalog {
         self.tables.get(table).and_then(|table| table.shards.get(shard)).map_or(BlockIndex(-1), |state| state.max_block_index)
     }
     pub fn l0_max_block_index(&self, table: &TableRef) -> BlockIndex { self.max_block_index(table, &Shard::root(0, None)) }
+    /// The adopted source tries in order, including ones covered by primary compaction.
+    pub fn l0_source(
+        &self,
+        table: &TableRef,
+        after: BlockIndex,
+        through: BlockIndex,
+    ) -> impl Iterator<Item = &CatalogTrie> {
+        self.tables.get(table)
+            .and_then(|table| table.shards.get(&Shard::root(0, None)))
+            .filter(|_| after < through)
+            .into_iter()
+            .flat_map(move |source| source.tries.range((Excluded(after), Included(through))).map(|(_, trie)| trie))
+    }
     pub fn iter_tries(&self, table: &TableRef) -> impl Iterator<Item = &CatalogTrie> {
         self.tables.get(table).into_iter().flat_map(|table| table.shards.values()).flat_map(|shard| shard.tries.values())
     }
@@ -214,6 +229,7 @@ impl TrieCatalog {
         let mut next = self.clone();
         if let Some(table) = next.tables.get_mut(table) {
             for key in keys {
+                if key.level() == 0 { continue; }
                 if let Some(shard) = table.shards.get_mut(&Shard::of(key)) {
                     if shard.tries.get(&key.block_index()).is_some_and(|trie| matches!(trie.state, TrieState::Garbage { .. })) {
                         shard.tries.remove(&key.block_index());
@@ -307,7 +323,6 @@ impl TrieCatalog {
                 for wire in partition.tries {
                     let trie = CatalogTrie::from_proto(&wire)?;
                     if Shard::of(&trie.key) != shard { return Err(invalid("Recorded trie differs from its partition")); }
-                    if shard.level == 0 && matches!(trie.state, TrieState::Garbage { .. }) { continue; }
                     value.insert(trie);
                 }
                 value.max_block_index = partition.max_block_index.map(BlockIndex).unwrap_or(value.max_block_index.max(BlockIndex(0)));
@@ -326,7 +341,7 @@ impl TrieCatalog {
             }
             if let Some(block) = state.shards.get(&Shard::root(1, None)).into_iter().flat_map(|state| state.tries.iter().rev())
                 .find_map(|(block, trie)| (trie.state == TrieState::Live).then_some(*block)) {
-                state.drop_covered_l0(block);
+                state.cover_l0(block, as_of);
             }
             catalog.tables.insert(table, state);
         }

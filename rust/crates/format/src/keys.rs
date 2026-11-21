@@ -6,6 +6,15 @@ use serde::Serialize;
 
 pub const CURRENT_STORAGE_VERSION: StorageVersion = StorageVersion(6);
 
+/// Independently derived ordered indexes belong to one source history.
+pub const ORDERED_INDEX_ROOT: &str = "ordered-index/v2";
+
+pub fn is_ordered_index_object(name: &str) -> bool {
+    name == ORDERED_INDEX_ROOT || name.strip_prefix(ORDERED_INDEX_ROOT)
+        .is_some_and(|suffix| suffix.starts_with('/'))
+}
+
+
 pub fn lex_hex(value: u64) -> String {
     let body = format!("{value:x}");
     format!("{:x}{body}", body.len() - 1)

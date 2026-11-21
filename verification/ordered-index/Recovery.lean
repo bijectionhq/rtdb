@@ -103,4 +103,34 @@ theorem count_alone_loses_a_retraction :
       tableAt [put, put] 2 0 ≠ tableAt [put, del] 2 0 := by
   decide
 
+structure AdoptedInput (File : Type) where
+  block : Nat
+  file : File
+  bytes : Nat
+  current : Bool
+
+def coverPrimary {File : Type} (through : Nat) (input : AdoptedInput File) : AdoptedInput File :=
+  if input.block ≤ through then { input with current := false } else input
+
+def exactInputs {File : Type} (after through : Nat) (catalog : List (AdoptedInput File)) :
+    List (Nat × File × Nat) :=
+  (catalog.filter fun input => decide (after < input.block ∧ input.block ≤ through)).map
+    fun input => (input.block, input.file, input.bytes)
+
+/-- Primary compaction changes current scan eligibility while preserving
+every adopted source identity, byte length and position for exact replay. -/
+theorem compact_primary_preserves_index_inputs {File : Type} (after through compacted : Nat)
+    (catalog : List (AdoptedInput File)) :
+    exactInputs after through (catalog.map (coverPrimary compacted)) =
+      exactInputs after through catalog := by
+  induction catalog with
+  | nil => rfl
+  | cons input catalog ih =>
+    have tail := ih
+    simp [exactInputs] at tail
+    simp only [exactInputs, List.map_cons, List.filter_cons]
+    by_cases covered : input.block ≤ compacted <;>
+      by_cases inside : after < input.block ∧ input.block ≤ through <;>
+      simp [coverPrimary, covered, inside, tail]
+
 end RTDB.OrderedIndex
