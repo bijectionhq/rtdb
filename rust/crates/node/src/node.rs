@@ -326,13 +326,12 @@ impl Node {
         if let Some(key) = key {
             if key == IDEMPOTENCY_SENTINEL { return Err(Anomaly::incorrect("rtdb.node/reserved-idempotency-key", format!("'{IDEMPOTENCY_SENTINEL}' is reserved and cannot be an idempotency key"))); }
             // A transaction carrying a key that already committed within the window aborts on its assertion, and awaiting it answers with the original's outcome.
-            let literal = quoted(key);
             let table = rtdb_types::TableRef::new("public", IDEMPOTENCY_TABLE);
             let put = |id: &str, valid_to: Option<rtdb_types::Timestamp>| -> Result<TxOp> {
                 let documents = rtdb_tx::Documents::new(vec![rtdb_types::StructFields::from([("_id".to_owned(), Value::Utf8(id.to_owned()))])], &self.factory.memory)?;
                 Ok(TxOp::PutDocs { table: table.clone(), documents, valid_from: None, valid_to })
             };
-            let assertion = TxOp::Sql { sql: format!("ASSERT NOT EXISTS (SELECT 1 FROM {IDEMPOTENCY_TABLE} WHERE _id = {literal})"), args: None };
+            let assertion = TxOp::Sql { sql: idempotency_guard(key), args: None };
             let value = database.partition.value();
             if value.table_catalog().metadata(&table).is_some() || value.live().tables().contains_key(&table) {
                 operations.insert(0, assertion);
@@ -394,7 +393,7 @@ impl Node {
         self.ensure_indexing()?;
         let db = self.catalog.database(database)?;
         let latest = db.replication.await_tx(tx_id, cancellation).await?;
-        if let Some(result) = &latest && result.committed() {
+        if let Some(result) = &latest && !result.error().is_some_and(|error| error.code == "xtdb/assert-failed") {
             return Ok(result.as_ref().clone());
         }
         let basis = QueryBasis { snapshot: self.snapshot_basis()?, snapshot_time: None, current_time: self.query_instant(), timezone: self.factory.options.default_timezone.clone() };
@@ -413,13 +412,24 @@ impl Node {
         match cell("committed")? {
             Value::Bool(true) => Ok(TransactionResult::Committed { tx_key }),
             Value::Bool(false) => {
-                if let Some(key) = idempotency_key(&cell("user_metadata")?)
+                let error = if let Some(TransactionResult::Aborted { error, .. }) = latest.as_deref() {
+                    error.clone()
+                } else {
+                    match cell("error")? {
+                        Value::Null | Value::Undefined => None,
+                        Value::Transit(bytes) => Some(RetainedAnomaly::from_transit(&bytes, &self.factory.memory)?),
+                        _ => return Err(Anomaly::fault("rtdb.node/tx-result-error", "Stored transaction error is not Transit")),
+                    }
+                };
+                if let Some(error) = &error
+                    && error.code == "xtdb/assert-failed"
+                    && error.context.get("tx-op-idx").and_then(|value| value.as_u64()).is_some_and(|index| index <= 1)
+                    && let Some(key) = idempotency_key(&cell("user_metadata")?)
+                    && error.context.get("sql").and_then(|value| value.as_str()).is_some_and(|sql| sql == idempotency_guard(key))
                     && let Some(original) = self.keyed_transaction(database, key, system_time, identity, cancellation).await?
                 {
                     return Ok(TransactionResult::Committed { tx_key: original });
                 }
-                if let Some(result) = latest { return Ok(result.as_ref().clone()); }
-                let error = match cell("error")? { Value::Null | Value::Undefined => None, Value::Transit(bytes) => Some(RetainedAnomaly::from_transit(&bytes, &self.factory.memory)?), _ => return Err(Anomaly::fault("rtdb.node/tx-result-error", "Stored transaction error is not Transit")) };
                 Ok(TransactionResult::Aborted { tx_key, error })
             }
             _ => Err(Anomaly::fault("rtdb.node/tx-result-status", "Stored transaction result has no commit status")),
@@ -665,7 +675,10 @@ pub(crate) fn with_idempotency_key(metadata: Option<rtdb_tx::UserMetadata>, key:
     rtdb_tx::UserMetadata::new(Value::Struct(fields), memory)
 }
 
-fn quoted(text: &str) -> String { format!("'{}'", text.replace('\'', "''")) }
+fn idempotency_guard(key: &str) -> String {
+    let literal = key.replace('\'', "''");
+    format!("ASSERT NOT EXISTS (SELECT 1 FROM {IDEMPOTENCY_TABLE} WHERE _id = '{literal}')")
+}
 
 /// The code a placed node refuses a command with when it no longer holds the command's database.
 pub const NOT_HELD: &str = "rtdb.node/database-not-held";

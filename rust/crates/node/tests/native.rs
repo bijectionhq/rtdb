@@ -1847,6 +1847,34 @@ async fn duplicate_transaction_outcomes_are_deployment_local_and_repeatable() {
 }
 
 #[tokio::test]
+async fn a_keyed_transaction_rejected_before_its_duplicate_guard_keeps_its_error() {
+    let (node, driver) = running(options(), services()).await;
+    let mut session = node.session("xtdb", Arc::new(Authority)).unwrap();
+    let metadata = rtdb_tx::UserMetadata::new(Value::Struct(StructFields::from([
+        ("idempotency_key".into(), Value::Utf8("order-1".into())),
+    ])), node.memory()).unwrap();
+    let original = session.state_mut().execute_tx(vec![put(&node, 1, 10)], AutonomousTxOptions {
+        user_metadata: Some(metadata.clone()),
+        ..AutonomousTxOptions::default()
+    }).await.unwrap();
+    assert!(original.committed());
+    let retry = session.state_mut().submit_tx(vec![put(&node, 2, 20)], AutonomousTxOptions {
+        system_time: Some(original.tx_key().system_time),
+        user_metadata: Some(metadata),
+        ..AutonomousTxOptions::default()
+    }).await.unwrap();
+    let cancellation = CancellationToken::new();
+    let result = node.await_transaction("xtdb", retry.tx_id, &Authority, &cancellation).await.unwrap();
+    assert_eq!(result.error().map(|error| error.code.as_str()), Some("invalid-system-time"));
+    assert!(session.state_mut().execute_tx(vec![put(&node, 3, 30)], AutonomousTxOptions::default()).await.unwrap().committed());
+    let delayed = node.await_transaction("xtdb", retry.tx_id, &Authority, &cancellation).await.unwrap();
+    assert_eq!(delayed.error().map(|error| error.code.as_str()), Some("invalid-system-time"));
+    assert_eq!(delayed.tx_key(), result.tx_key());
+    drop(session);
+    stop(&node, driver).await;
+}
+
+#[tokio::test]
 async fn a_command_resent_under_its_session_key_on_a_new_session_writes_nothing_again() {
     let (node, driver) = running(options(), services()).await;
     let command = |key: &'static str, ids: [i64; 2]| {
