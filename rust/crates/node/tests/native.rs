@@ -842,6 +842,49 @@ async fn follower_compactor_publishes_results_through_the_writer_without_claimin
 }
 
 #[tokio::test]
+async fn catalog_transactions_advance_system_time_and_replay_in_order() {
+    tokio::time::timeout(Duration::from_secs(30), async {
+        let directory = tempfile::tempdir().unwrap();
+        let mut settings = options();
+        settings.membership = Membership::Durable {
+            primary: local_database(directory.path()), skipped: BTreeSet::from(["secondary".into()]),
+        };
+        let runtime = services();
+        let boot = || NodeServices {
+            resources: Arc::new(NativeResources::default().with_local_log_clock(runtime.clock.clone(), true)),
+            ..runtime.clone()
+        };
+        let (node, driver) = running(settings.clone(), boot()).await;
+        let token = CancellationToken::new();
+        let first_time = Timestamp(1_000_000_000);
+        let mut session = node.session("xtdb", Arc::new(Authority)).unwrap();
+        let put = session.state_mut().execute_tx(vec![put(&node, 1, 10)], AutonomousTxOptions {
+            system_time: Some(first_time), ..Default::default()
+        }).await.unwrap();
+        assert!(put.committed());
+        assert_eq!(put.tx_key().system_time, first_time);
+
+        let attached = node.attach_database("secondary".into(), Default::default(), &Authority, &token)
+            .await.expect("catalog attach must advance past the previous transaction's time");
+        assert!(attached.committed());
+        assert_eq!(attached.tx_key().system_time, Timestamp(first_time.0 + 1));
+        let refused = node.detach_database("xtdb".into(), &Authority, &token).await.unwrap();
+        assert_eq!(refused.error().unwrap().code, "xtdb/cannot-detach-primary");
+        assert_eq!(refused.tx_key().system_time, Timestamp(first_time.0 + 2));
+        stop(&node, driver).await;
+
+        let (reopened, driver) = running(settings, boot()).await;
+        reopened.sync_all(Duration::from_secs(10), &token).await.unwrap();
+        assert!(reopened.catalog().secondary_databases().contains_key("secondary"));
+        assert_eq!(reopened.catalog().database("xtdb").unwrap().progress().current().tx_key, Some(refused.tx_key()));
+        let mut session = reopened.session("xtdb", Arc::new(Authority)).unwrap();
+        let cursor = session.query_sql("SELECT committed FROM xt.txs FOR ALL VALID_TIME ORDER BY _id", vec![]).await.unwrap();
+        assert_eq!(rows(cursor).await, [[Value::Bool(true)], [Value::Bool(true)], [Value::Bool(false)]]);
+        stop(&reopened, driver).await;
+    }).await.unwrap();
+}
+
+#[tokio::test]
 async fn skipped_database_remains_a_member_until_detach_and_await_ignores_unknown_names() {
     tokio::time::timeout(Duration::from_secs(20), async {
         let mut options = options();

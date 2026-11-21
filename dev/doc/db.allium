@@ -1590,8 +1590,10 @@ deferred ResolveExternalSourceTx
   -- See: live-index.allium CommitTransaction
 deferred ResolveDbOp
   -- Resolve an attach or detach as a transaction carrying the database operation, for the catalog to be brought into line with when the record is read back.
+  -- Smooth its source-log time strictly past the resolved head, as for an ordinary transaction without an explicit system time.
 deferred ResolveFailedDbOp
   -- Resolve an attach or detach that would be refused, as an ABORTED transaction carrying the caller fault that refused it.
+  -- It advances the resolved system time under the same rule as a successful attach or detach.
 deferred CheckCanAttach
   -- Whether an attach would be refused, and with which caller fault.
   -- Answered from the catalog's own records folded together with the database operations the resolver still holds: the last one queued for a name says what will be there when this attach applies, and with none the catalog's own records stand.
