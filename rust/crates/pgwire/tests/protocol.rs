@@ -96,6 +96,42 @@ fn rows(frames: &[(u8, Vec<u8>)]) -> Vec<Vec<Option<Vec<u8>>>> {
 }
 
 #[tokio::test]
+async fn copy_to_arrow_stream_uses_the_original_read_transaction() {
+    let running = Running::start(ServerConfig::default(), None).await;
+    let mut writer = Client::connect(&running.server, None).await;
+    let mut reader = Client::connect(&running.server, None).await;
+    assert_eq!(tags(&writer.query("INSERT INTO payloads (_id, val) VALUES (1, X'6162')").await), b"CZ");
+    assert_eq!(tags(&reader.query("BEGIN READ ONLY").await), b"CZ");
+    let first = reader.query("SELECT COUNT(*) FROM payloads").await;
+    assert_eq!(rows(&first), [vec![Some(b"1".to_vec())]]);
+    assert_eq!(tags(&writer.query("INSERT INTO payloads (_id, val) VALUES (2, X'6364')").await), b"CZ");
+
+    reader.parse("arrow", "COPY (SELECT val FROM (
+        SELECT 0::BIGINT AS probe, _id, val FROM payloads WHERE _id <= 1
+        UNION ALL
+        SELECT 1::BIGINT AS probe, _id, val FROM payloads WHERE _id > 1
+    ) AS probes ORDER BY probe, _id) TO STDOUT WITH (FORMAT 'arrow-stream')", &[]).await;
+    assert_eq!(reader.receive().await.0, b'1');
+    reader.bind("transfer", "arrow").await;
+    assert_eq!(reader.receive().await.0, b'2');
+    reader.execute("transfer", 0).await;
+    reader.send(b'S', &[]).await;
+    let frames = reader.through(b'Z').await;
+    assert_eq!(frames[0].0, b'H');
+    assert_eq!(&frames[frames.len() - 3..].iter().map(|frame| frame.0).collect::<Vec<_>>(), b"cCZ");
+    assert_eq!(frames[frames.len() - 2].1, b"COPY 1\0");
+    assert_eq!(frames.last().unwrap().1, b"T");
+    let ipc = frames.into_iter().filter(|frame| frame.0 == b'd').flat_map(|(_, bytes)| bytes).collect::<Vec<_>>();
+    let batches = arrow_ipc::reader::StreamReader::try_new(std::io::Cursor::new(ipc), None).unwrap()
+        .collect::<std::result::Result<Vec<_>, _>>().unwrap();
+    assert_eq!(batches.len(), 1);
+    let array = batches[0].column(0).as_any().downcast_ref::<arrow_array::BinaryArray>().unwrap();
+    assert_eq!(array.value(0), b"ab");
+    assert_eq!(tags(&reader.query("COMMIT").await), b"CZ");
+    running.stop().await;
+}
+
+#[tokio::test]
 async fn duration_literal_overflow_occurs_only_when_query_output_demands_value() {
     let running = Running::start(ServerConfig::default(), None).await;
     let mut client = Client::connect(&running.server, None).await;

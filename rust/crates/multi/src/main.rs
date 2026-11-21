@@ -309,12 +309,14 @@ async fn run(arguments: Vec<String>) -> Result<()> {
             provenance: rtdb_types::BuildInfo,
             standalone_protocol: u32,
             hosted_protocol: u32,
+            pgwire_arrow_copy_out: bool,
         }
         let report = MultiBuildInfo {
             provenance: rtdb_types::compiled_build_info(),
             standalone_protocol: process::STANDALONE_PROTOCOL,
             // Hosted capture adopts a block through the holder's observed source.
             hosted_protocol: 15,
+            pgwire_arrow_copy_out: true,
         };
         let mut output = std::io::stdout().lock();
         serde_json::to_writer(&mut output, &report).map_err(|error| io(std::io::Error::other(error)))?;

@@ -2,7 +2,7 @@
 //! so filters and aggregates can read whole columns, and rows are materialised only for operators that need them.
 use std::sync::Arc;
 
-use arrow_array::{Array, ArrayRef, StructArray, UnionArray};
+use arrow_array::{Array, ArrayRef, ListArray, StructArray, UnionArray};
 use arrow_schema::{DataType, Field as ArrowField};
 use rtdb_columnar::{MemoryBudget, MemoryReservation, read_execution_value, read_execution_value_as};
 use rtdb_index::IndexBatch;
@@ -59,7 +59,63 @@ impl ColumnBatch {
         if bytes <= lease.bytes() { lease.shrink_to(bytes)?; } else { lease.grow_to(bytes)?; }
         Ok(Self { columns, len, _reservation: reservation })
     }
-    fn charged(&self) -> usize { self._reservation.bytes() }
+    pub(crate) fn charged(&self) -> usize { self._reservation.bytes() }
+    pub fn from_owned(batch: rtdb_columnar::OwnedBatch) -> Result<Self> {
+        let schema = batch.batch().schema();
+        let columns = schema.fields().iter().zip(batch.batch().columns()).map(|(field, array)| {
+            Ok(Column::Arrow {
+                array: Arc::clone(array),
+                field: Arc::clone(field),
+                logical: Some(rtdb_columnar::from_field(field)?),
+            })
+        }).collect::<Result<Vec<_>>>()?;
+        Ok(Self { columns, len: batch.batch().num_rows(), _reservation: Arc::clone(batch.reservation()) })
+    }
+
+    /// Gathers nonempty positions in already resolved batches without building row objects.
+    pub fn take_rows(
+        sources: &[impl std::borrow::Borrow<Self>], rows: &[(usize, usize)], positions: &[usize], memory: &Arc<MemoryBudget>,
+    ) -> Result<Self> {
+        let source = |batch: usize| sources[batch].borrow();
+        if rows.is_empty() || sources.iter().map(|source| source.borrow()).any(|source| positions.iter().any(|&position| position >= source.columns.len()))
+            || rows.iter().any(|&(batch, row)| sources.get(batch).is_none_or(|source| row >= source.borrow().len))
+        {
+            return Err(invalid("column-gather", "Row position is outside its source batch"));
+        }
+        let mut reservation = memory.reserve(positions.len().saturating_mul(256).saturating_add(256))?;
+        let mut columns = Vec::with_capacity(positions.len());
+        for &position in positions {
+            let scratch = rows.iter().try_fold(
+                sources.len().saturating_mul(256).saturating_add(4096),
+                |bound, &(batch, row)| {
+                    bound.checked_add(source(batch).columns[position].bound(row)?.saturating_mul(4))
+                        .ok_or_else(size_error)
+                },
+            )?;
+            let _scratch = memory.reserve(scratch)?;
+            let mut name = "";
+            let arrow = sources.iter().map(|source| match &source.borrow().columns[position] {
+                Column::Arrow { array, field, logical } => {
+                    name = field.name();
+                    Some((array.data_type() != &DataType::Null)
+                        .then(|| (array.clone(), field.clone(), logical.clone())))
+                }
+                Column::Values(_) => None,
+            }).collect::<Option<Vec<_>>>();
+            let column = match arrow {
+                Some(arrow) => gather_cells(&arrow, rows, name)?,
+                None => Column::Values(rows.iter().map(|&(batch, row)| {
+                    source(batch).columns[position].value(row)
+                }).collect::<Result<_>>()?),
+            };
+            let retained = column.retained_bytes()?;
+            let lease = Arc::get_mut(&mut reservation).expect("ordered gather owns its reservation");
+            lease.grow_to(lease.bytes().checked_add(retained).ok_or_else(size_error)?)?;
+            columns.push(column);
+        }
+        Self::settled(columns, rows.len(), reservation)
+    }
+
     /// A page of rows as columns of values, charged as each column is built.
     pub fn from_page(page: &OwnedPage, memory: &Arc<MemoryBudget>) -> Result<Self> {
         let width = page.rows().first().map_or(0, |row| row.values.len());
@@ -176,14 +232,33 @@ fn stored(sources: &[Source], cells: &[(usize, usize)], name: &str) -> Result<Co
         let index = fields.iter().position(|field| field.name() == name)?;
         Some((Arc::clone(source.put.column(index)), Arc::clone(&fields[index]), source.batch.put_field_type(index).cloned()))
     }).collect();
-    let Some((_, field, logical)) = children.iter().flatten().next().cloned() else { return Ok(Column::Values(vec![Value::Null; cells.len()])) };
+    gather_cells(&children, cells, name)
+}
+
+fn gather_cells(children: &[Option<(ArrayRef, Arc<ArrowField>, Option<LogicalType>)>], cells: &[(usize, usize)], name: &str) -> Result<Column> {
+    let Some((_, field, logical)) = children.iter().flatten().next().cloned() else {
+        return Ok(Column::Arrow {
+            array: Arc::new(arrow_array::NullArray::new(cells.len())),
+            field: Arc::new(ArrowField::new(name, DataType::Null, true)),
+            logical: Some(LogicalType::Null),
+        });
+    };
     let uniform = children.iter().all(|child| child.as_ref().is_some_and(|(_, other, other_logical)| other == &field && other_logical == &logical));
-    if uniform && flat(field.data_type()) {
+    if uniform {
         let arrays: Vec<&dyn Array> = children.iter().flatten().map(|(array, ..)| array.as_ref()).collect();
-        let array = interleave(&arrays, cells)?;
-        return Ok(Column::Arrow { array, field, logical });
+        let flat_layout = flat(field.data_type());
+        if flat_layout || arrays.iter().all(|array| can_interleave_nested(*array)) {
+            match interleave(&arrays, cells) {
+                Ok(array) => return Ok(Column::Arrow { array, field, logical }),
+                Err(error) if flat_layout => return Err(error),
+                Err(_) => {}
+            }
+        }
     }
-    if !uniform && let Some(column) = joined_union(&children, cells, name)? { return Ok(column); }
+    if !uniform {
+        if let Some(column) = joined_nullable(children, cells, &field, &logical)? { return Ok(column); }
+        if let Some(column) = joined_union(children, cells, name)? { return Ok(column); }
+    }
     cells.iter().map(|&(source, offset)| match &children[source] {
         None => Ok(Value::Null),
         Some((array, field, logical)) => {
@@ -191,6 +266,31 @@ fn stored(sources: &[Source], cells: &[(usize, usize)], name: &str) -> Result<Co
             Ok(if matches!(value, Value::Undefined) { Value::Null } else { value })
         }
     }).collect::<Result<Vec<_>>>().map(Column::Values)
+}
+
+fn joined_nullable(children: &[Option<(ArrayRef, Arc<ArrowField>, Option<LogicalType>)>], cells: &[(usize, usize)],
+    field: &ArrowField, logical: &Option<LogicalType>) -> Result<Option<Column>> {
+    let Some(logical) = logical else { return Ok(None) };
+    if matches!(field.data_type(), DataType::Union(..)) { return Ok(None); }
+    let nullable = logical.clone().maybe();
+    for (array, other_field, other_logical) in children.iter().flatten() {
+        if other_field.data_type() != field.data_type() || other_field.metadata() != field.metadata()
+            || other_logical.as_ref().is_none_or(|other| other.clone().maybe() != nullable)
+            || !can_interleave_nested(array.as_ref()) {
+            return Ok(None);
+        }
+    }
+    let selected: Vec<_> = cells.iter().map(|&(source, row)| {
+        if children[source].is_some() { (source, row) } else { (children.len(), 0) }
+    }).collect();
+    let nulls = arrow_array::new_null_array(field.data_type(), usize::from(children.iter().any(Option::is_none)));
+    let arrays: Vec<_> = children.iter().map(|child| child.as_ref().map_or(nulls.as_ref(), |(array, ..)| array.as_ref()))
+        .chain(std::iter::once(nulls.as_ref())).collect();
+    match interleave(&arrays, &selected) {
+        Ok(array) => Ok(Some(Column::Arrow { array, field: Arc::new(field.clone().with_nullable(true)), logical: Some(nullable) })),
+        Err(error) if flat(field.data_type()) => Err(error),
+        Err(_) => Ok(None),
+    }
 }
 
 /// Gathers a column whose sources store it in different scalar layouts, as a column written with several integer widths
@@ -285,6 +385,15 @@ pub(crate) fn interleave(arrays: &[&dyn Array], cells: &[(usize, usize)]) -> Res
         arrow_select::interleave::interleave(&children, &picks[id as usize]).map_err(|error| invalid("column-gather", error))
     }).collect::<Result<Vec<_>>>()?;
     Ok(Arc::new(UnionArray::try_new(fields.clone(), datafusion_common::arrow::buffer::ScalarBuffer::from(ids), Some(datafusion_common::arrow::buffer::ScalarBuffer::from(offsets)), children).map_err(|error| invalid("column-gather", error))?))
+}
+
+fn can_interleave_nested(array: &dyn Array) -> bool {
+    if flat(array.data_type()) { return true; }
+    if let Some(structs) = array.as_any().downcast_ref::<StructArray>() {
+        return structs.columns().iter().all(|child| can_interleave_nested(child.as_ref()));
+    }
+    let (DataType::List(field), Some(lists)) = (array.data_type(), array.as_any().downcast_ref::<ListArray>()) else { return false; };
+    (field.is_nullable() || !lists.values().is_nullable()) && can_interleave_nested(lists.values().as_ref())
 }
 
 pub(crate) fn flat(data_type: &DataType) -> bool {
@@ -392,7 +501,7 @@ impl crate::pages::PageCursor for BatchRows {
 
 impl ColumnBatch {
     /// Keeps the rows `mask` selects, column by column.
-    fn select(self, mask: &[bool], memory: &Arc<MemoryBudget>) -> Result<Self> {
+    pub(crate) fn select(self, mask: &[bool], memory: &Arc<MemoryBudget>) -> Result<Self> {
         let selected = mask.iter().filter(|keep| **keep).count();
         if selected == self.len { return Ok(self); }
         // A selection holds a subset of each column's cells, so it retains no more than the page it is taken from.
@@ -1050,6 +1159,18 @@ impl BatchCursor for BatchExpressions {
         let mut columns = Vec::with_capacity(self.expressions.len());
         let mut reservation = self.execution.context.memory.reserve(256)?;
         for (expression, kernel) in self.expressions.iter().zip(clocked) {
+            // An ordinal such as 0::BIGINT is shared by every row of a probe.
+            if batch.len != 0 && matches!(expression, rtdb_plan::Expr::Cast { expr, .. } if matches!(expr.as_ref(), rtdb_plan::Expr::Literal(_))) {
+                let scope = self.execution.scope()?;
+                let mut value = self.execution.evaluate(&scope, expression, &rtdb_plan::Schema::default(), &[]).await?;
+                value.admit_expression_dates()?;
+                rtdb_expr::validate_projection_value(&value)?;
+                let bytes = value.retained_bytes()?.saturating_add(std::mem::size_of::<Value>()).checked_mul(batch.len).ok_or_else(size_error)?;
+                let lease = Arc::get_mut(&mut reservation).expect("batch projection owns its reservation");
+                lease.grow_to(lease.bytes().checked_add(bytes).ok_or_else(size_error)?)?;
+                columns.push(Column::Values(vec![value; batch.len]));
+                continue;
+            }
             if let Some(bound) = projection::bound(kernel, &self.schema, &batch)? {
                 let lease = Arc::get_mut(&mut reservation).ok_or_else(|| invalid("column-size", "A column page's charge is shared"))?;
                 lease.grow_to(lease.bytes().checked_add(bound).ok_or_else(size_error)?)?;

@@ -181,7 +181,11 @@ impl PreparedQuery {
     /// Opens the query with one output batch for each column batch where the whole plan runs a column at a time,
     /// keeping each column already in the result's layout rather than copying its cells; otherwise as `execute`.
     pub async fn execute_columns(&self, context: Arc<QueryContext>, parameters: Vec<Value>) -> Result<QueryCursor> {
-        self.open(context, parameters, None, Batching::Columns).await
+        self.execute_columns_with_text(context, parameters, None).await
+    }
+
+    pub async fn execute_columns_with_text(&self, context: Arc<QueryContext>, parameters: Vec<Value>, text: Option<&str>) -> Result<QueryCursor> {
+        self.open(context, parameters, text, Batching::Columns).await
     }
 
     async fn open(&self, context: Arc<QueryContext>, mut parameters: Vec<Value>, text: Option<&str>, batching: Batching) -> Result<QueryCursor> {
@@ -346,7 +350,7 @@ impl QueryCursor {
 
 /// The batch a page of the same rows would encode: a column already in the result's layout is kept, any other is
 /// copied from the cells a row would hold.
-fn column_batch(schema: &Schema, memory: &Arc<MemoryBudget>, batch: crate::columnar::ColumnBatch) -> Result<OwnedBatch> {
+pub(crate) fn column_batch(schema: &Schema, memory: &Arc<MemoryBudget>, batch: crate::columnar::ColumnBatch) -> Result<OwnedBatch> {
     let overflow = || invalid("batch-size", "Output batch allocation bound overflow");
     if batch.columns.len() != schema.len() { return Err(invalid("row-width", "Operator output differs from its declared schema")); }
     let fields = schema.fields().iter().map(|field| to_field(&field.name, &field.data_type)).collect::<Result<Vec<_>>>()?;

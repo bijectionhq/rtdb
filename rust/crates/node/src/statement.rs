@@ -167,13 +167,26 @@ impl PreparedSql {
 
     /// Opens one argument row using its vector field types, preserving typed nulls and empty containers.
     /// Unsigned storage types and values enter execution at the corresponding signed width.
-    pub async fn open_query_typed(&self, context: Arc<QueryContext>, mut arguments: Vec<Value>, types: &[LogicalType]) -> Result<QueryCursor> {
+    pub async fn open_query_typed(&self, context: Arc<QueryContext>, arguments: Vec<Value>, types: &[LogicalType]) -> Result<QueryCursor> {
+        self.open_query_batches(context, arguments, types, false).await
+    }
+
+    /// Opens Arrow batches directly for a client that consumes Arrow.
+    pub async fn open_query_columns_typed(&self, context: Arc<QueryContext>, arguments: Vec<Value>, types: &[LogicalType]) -> Result<QueryCursor> {
+        self.open_query_batches(context, arguments, types, true).await
+    }
+
+    async fn open_query_batches(&self, context: Arc<QueryContext>, mut arguments: Vec<Value>, types: &[LogicalType], columnar: bool) -> Result<QueryCursor> {
         if arguments.len() != self.parameter_count() { return Err(parameter_error("Argument count differs from the prepared statement")); }
         arguments.iter_mut().for_each(rtdb_columnar::admit_execution_value);
         for (index, ty) in &self.0.options.parameter_types { arguments[*index] = rtdb_expr::cast(&arguments[*index], &rtdb_columnar::execution_type(ty), &context.timezone)?; }
         let query = deep(self.source(), || self.bind(&context, types, true))?;
         if self.0.policy == ResultSignaturePolicy::Exact { self.check_signature(query.schema())?; }
-        let cursor = query.execute_with_text(context, arguments, Some(self.source())).await?;
+        let cursor = if columnar {
+            query.execute_columns_with_text(context, arguments, Some(self.source())).await?
+        } else {
+            query.execute_with_text(context, arguments, Some(self.source())).await?
+        };
         if self.0.policy == ResultSignaturePolicy::PostgreSql { self.check_signature(cursor.runtime_schema())?; }
         Ok(cursor)
     }

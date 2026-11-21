@@ -11,7 +11,7 @@ use tokio::io::AsyncWrite;
 use tokio_util::sync::CancellationToken;
 use crate::{ServerConfig, connection::{Startup, apply_startup, display_parameter}, error::{cancelled, protocol}, server::CancellationSlot, wire::{Column, Frame, Input, Writer}};
 
-enum PreparedKind { Empty, Query(PreparedSql), Dml(PreparedSql), Control(PreparedControl), Keywords }
+enum PreparedKind { Empty, Query(PreparedSql), CopyOut(PreparedSql), Dml(PreparedSql), Control(PreparedControl), Keywords }
 enum PreparedControl { Batch(ControlStatement), Extended(AdmittedControl) }
 impl PreparedControl {
     fn statement(&self) -> &ControlStatement {
@@ -142,7 +142,7 @@ impl ProtocolSession {
                     let decoded = rtdb_pg_codec::decode(ty, format, bytes, self.node.memory()).map_err(|error| invalid_argument(error, index, format))?;
                     let (value, charge) = decoded.into_parts(); arguments.push(value); charges.push(charge);
                 }
-                let requires_exact_arity = matches!(prepared.ordinary_kind(), Some(PreparedKind::Query(_)))
+                let requires_exact_arity = matches!(prepared.ordinary_kind(), Some(PreparedKind::Query(_) | PreparedKind::CopyOut(_)))
                     || matches!(prepared.control(), Some(ControlStatement::Execute { .. }));
                 if requires_exact_arity && count != prepared.oids.len() { return Err(protocol("Argument count differs from prepared statement")); }
                 let count = usize::from(input.short()?); let result_formats = (0..count).map(|_| Format::from_code(input.short()? as i16)).collect::<Result<Vec<_>>>()?; input.end()?;
@@ -196,7 +196,10 @@ impl ProtocolSession {
             keyword_shape()
         } else if let Some(control) = rtdb_sql::parse_admitted_control_in(source, &options, self.node.memory())
             .map_err(|error| extended_syntax_error(source, original, error, self.node.memory()))? {
-            self.execute_columns(control_shape(PreparedControl::Extended(control), oids.len())?)
+            match control.statement() {
+                ControlStatement::CopyOut { query } => self.prepare_copy_out(query, options, &oids).await?,
+                _ => self.execute_columns(control_shape(PreparedControl::Extended(control), oids.len())?),
+            }
         } else {
             let context = self.session.prepare_context(&self.token()).await?;
             let _rewrite_syntax = admit_rewrite_syntax(original.len(), source.len(), &context.memory)?;
@@ -212,7 +215,10 @@ impl ProtocolSession {
         let options = self.options();
         let shape = match syntax {
             ExecutableSyntax::FrontendResponse(_) => keyword_shape(),
-            ExecutableSyntax::Control(control) => self.execute_columns(control_shape(PreparedControl::Batch(control.bind(&options)?), 0)?),
+            ExecutableSyntax::Control(control) => match control.bind(&options)? {
+                ControlStatement::CopyOut { query } => self.prepare_copy_out(&query, options, &[]).await?,
+                control => self.execute_columns(control_shape(PreparedControl::Batch(control), 0)?),
+            },
             ExecutableSyntax::Sql(syntax) => {
                 let context = self.session.prepare_context(&self.token()).await?;
                 sql_shape(PreparedSql::prepare_postgres_statement(syntax, &context, options.search_path, &[])?, 0)
@@ -220,6 +226,22 @@ impl ProtocolSession {
         };
         drop(allocation);
         self.retain_prepared(source, Vec::new(), shape)
+    }
+
+    async fn prepare_copy_out(
+        &mut self, query: &str, mut options: rtdb_sql::PrepareOptions, oids: &[i32],
+    ) -> Result<PreparedShape> {
+        let context = self.session.prepare_context(&self.token()).await?;
+        for (index, &oid) in oids.iter().enumerate() {
+            if let Some(ty) = PgType::from_oid(oid).and_then(PgType::logical_type) {
+                options.parameter_types.insert(index, ty.maybe());
+            }
+        }
+        let query = PreparedSql::prepare(query, &context, options, rtdb_node::ResultSignaturePolicy::Dynamic)?;
+        if query.is_dml() { return Err(protocol("COPY TO requires a read query")); }
+        let parameter_count = query.parameter_count();
+        if oids.len() > parameter_count { return Err(protocol("Too many COPY parameter types")); }
+        Ok(PreparedShape { kind: PreparedKind::CopyOut(query), columns: None, parameter_count })
     }
 
     fn retain_prepared(&self, source: &str, mut oids: Vec<i32>, shape: PreparedShape) -> Result<Arc<Prepared>> {
@@ -247,7 +269,7 @@ impl ProtocolSession {
     }
 
     async fn planning_warnings<W: AsyncWrite + Unpin>(prepared: &Prepared, writer: &mut Writer<W>) -> Result<()> {
-        if let Some(PreparedKind::Query(statement) | PreparedKind::Dml(statement)) = prepared.ordinary_kind() {
+        if let Some(PreparedKind::Query(statement) | PreparedKind::CopyOut(statement) | PreparedKind::Dml(statement)) = prepared.ordinary_kind() {
             for notice in statement.notices() { writer.planning_warning(&notice.message).await?; }
         }
         Ok(())
@@ -261,6 +283,14 @@ impl ProtocolSession {
         let mut portal = Portal { prepared: Arc::clone(&prepared), arguments, columns, state: PortalState::Ready, cancellation: token.clone(), _charges: charges, _bind_storage: None };
         let control_options = self.control_options();
         let cursor = match (prepared.ordinary_kind(), prepared.control()) {
+            (Some(PreparedKind::CopyOut(query)), _) => {
+                if self.session.state().is_read_write() { return Err(protocol("COPY TO requires a read transaction")); }
+                let _active = self.cancellations.enter(&token);
+                let context = self.session.query_context_with(&token, true).await?;
+                let types = portal.arguments.iter().map(Value::logical_type).collect::<Vec<_>>();
+                Some(token.run_until_cancelled(query.open_query_columns_typed(context, std::mem::take(&mut portal.arguments), &types))
+                    .await.ok_or_else(cancelled)??)
+            },
             (Some(PreparedKind::Query(query)), _) => {
                 let _active = self.cancellations.enter(&token);
                 let checked = !self.session.state().is_read_write();
@@ -318,6 +348,18 @@ impl ProtocolSession {
                 let token = portal.cancellation.clone(); let _active = self.cancellations.enter(&token);
                 token.run_until_cancelled(self.stream(portal, source, limit, writer)).await.ok_or_else(cancelled)?
                     .map_err(|error| if token.is_cancelled() { cancelled() } else { error })
+            }
+            (PreparedKind::CopyOut(_), _) => {
+                if limit != 0 { return Err(protocol("COPY TO cannot suspend a portal")); }
+                self.begin_implicit(Some(true))?;
+                let PortalState::Query(query) = std::mem::replace(&mut portal.state, PortalState::Ready) else {
+                    return Err(protocol("COPY TO portal has no cursor"));
+                };
+                let memory = self.node.query_memory();
+                let token = portal.cancellation.clone();
+                let _active = self.cancellations.enter(&token);
+                token.run_until_cancelled(crate::copy::write_arrow(query.cursor, &memory, writer))
+                    .await.ok_or_else(cancelled)?
             }
             (PreparedKind::Dml(statement), _) => {
                 if self.config.read_only { return Err(Anomaly::incorrect("xtdb/dml-in-read-only-server", "DML is not allowed on the READ ONLY server")); }

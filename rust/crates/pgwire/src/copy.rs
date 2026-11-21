@@ -13,6 +13,53 @@ use tempfile::NamedTempFile;
 use tokio_util::sync::CancellationToken;
 use crate::error::{cancelled, protocol};
 
+/// Encodes each batch while its source buffers are in scope and releases
+/// them before waiting on the connection.
+pub(crate) async fn write_arrow<W: tokio::io::AsyncWrite + Unpin>(
+    mut cursor: rtdb_query::QueryCursor, memory: &Arc<MemoryBudget>, wire: &mut crate::wire::Writer<W>,
+) -> Result<()> {
+    let schema = cursor.runtime_schema();
+    let bound = schema.fields().iter().try_fold(8192usize, |bytes, field| {
+        let field_bytes = field.data_type.retained_bytes()?.saturating_add(field.name.len());
+        bytes.checked_add(field_bytes.saturating_mul(64).saturating_add(4096))
+            .ok_or_else(|| protocol("COPY TO schema is too large"))
+    })?;
+    let _schema = memory.reserve(bound)?;
+    let fields = schema.fields().iter().map(|field| rtdb_columnar::to_field(&field.name, &field.data_type))
+        .collect::<Result<Vec<_>>>()?;
+    let schema = arrow_schema::Schema::new(fields);
+    let mut encoder = arrow_ipc::writer::StreamWriter::try_new(Vec::new(), &schema).map_err(arrow_output_error)?;
+    wire.send(b'H', &[1, 0, 1, 0, 1]).await?;
+    wire.send(b'd', &std::mem::take(encoder.get_mut())).await?;
+    wire.flush().await?;
+    let mut count = 0u64;
+    loop {
+        let Some(batch) = cursor.next_batch().await? else { break; };
+        let encoded = (|| -> Result<_> {
+            let batch = rtdb_columnar::conform_batch(batch, &schema, memory)?;
+            let bytes = batch.batch().get_array_memory_size().checked_mul(6)
+                .and_then(|bytes| bytes.checked_add(bound)).ok_or_else(|| protocol("COPY TO batch is too large"))?;
+            let reservation = memory.reserve(bytes)?;
+            encoder.write(batch.batch()).map_err(arrow_output_error)?;
+            Ok((batch.batch().num_rows() as u64, std::mem::take(encoder.get_mut()), reservation))
+        })();
+        let (rows, bytes, _reservation) = encoded.inspect_err(|_| cursor.record_consumer_error())?;
+        count = count.checked_add(rows).ok_or_else(|| protocol("COPY TO row count overflow"))?;
+        for chunk in bytes.chunks(64 * 1024) {
+            wire.send(b'd', chunk).await?;
+        }
+        wire.flush().await?;
+    }
+    encoder.finish().map_err(arrow_output_error)?;
+    wire.send(b'd', encoder.get_ref()).await?;
+    wire.empty(b'c').await?;
+    wire.string(b'C', &format!("COPY {count}")).await
+}
+
+fn arrow_output_error(error: arrow_schema::ArrowError) -> Anomaly {
+    Anomaly::incorrect("xtdb.pgwire/copy-output", error.to_string())
+}
+
 pub(crate) struct CopyInput { file: NamedTempFile, format: CopyFormat, table: TableRef, length: u64, limit: u64, _reservation: Arc<MemoryReservation> }
 impl CopyInput {
     pub fn new(table: Vec<Identifier>, format: Option<CopyFormat>, memory: &Arc<MemoryBudget>, limit: u64) -> Result<Self> {
