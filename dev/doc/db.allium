@@ -641,6 +641,13 @@ config {
 -- A trimmed first required offset triggers refresh and may select only a strictly newer reported checkpoint.
 -- Other admission failures end startup with the provider error.
 -- The replication driver consumes the admitted cursor for that same log and boundary.
+-- In the Rust partition owner, a query captures the catalog and its installed replica cut in the same partition value.
+-- Ordinary recovery with a matching journal boundary seeds the cut after the driver opens its replica tail.
+-- The driver advances the cut through delivered records after pending block adoption and resolution read-back buffers have drained.
+-- Snapshots captured before the advance retain their original cut.
+-- Exact and restored recovery modes and checkpoints without a matching journal boundary leave the cut unavailable.
+-- An unrecognized replica body stops further advances on that open partition.
+-- A direct compactor reset suspends new cuts on that open partition.
 -- Providers that defer cursor admission can still report an advisory floor and open the tail in the replication driver.
 -- Exact recovery keeps its selected block. Archive recovery requires its anchor and probes only its contiguous successors.
 -- A successful cursor admission does not reserve the replica suffix against later trimming.

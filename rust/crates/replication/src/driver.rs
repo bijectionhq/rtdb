@@ -7,7 +7,7 @@ use bytes::Bytes;
 use futures::future::BoxFuture;
 use rtdb_columnar::{MemoryBudget, MemoryReservation};
 use rtdb_format::{catalog::{BlockCatalog, legacy_table_ref}, database::proto::DatabaseConfig, envelope::{ReplicaBody, ReplicaEnvelope, SourceBody, SourceMessage}, keys::TrieKey, log::proto::{self, resolved_tx::DbOp}};
-use rtdb_index::{CatalogTrie, PartitionState, TrieCatalog};
+use rtdb_index::{CatalogCut, CatalogTrie, PartitionState, TrieCatalog};
 use rtdb_storage::{log::{LogRecord, LogTail, ReplayHead}, object_store::ReadReservation};
 use rtdb_tx::{ResolveContext, ResolvedTx, SourceTransaction, TransactionResult, TransactionWriter, TxResolver};
 use rtdb_types::{Anomaly, AnomalyCategory, BlockIndex, ReplicaPosition, Result, SourcePosition, TableRef, Term, TermSequence, Timestamp, TxId};
@@ -277,6 +277,7 @@ pub struct ReplicationDriver {
     resolve: Arc<ResolveContext>, effects: Arc<dyn DatabaseEffects>, cancellation: CancellationToken, clock: ReplicationClock,
     recovered_confirmation: Option<RecoveredBlockConfirmation>,
     compaction_replay_cutoff: Option<ReplicaPosition>,
+    track_catalog_cut: bool,
     historical_confirmations: VecDeque<RecoveredBlockConfirmation>,
     fence: TermFence, read_position: ReplicaPosition, pending_block: Option<PendingBlock>, claim: Option<ReplicaPosition>, claiming: Option<Claim>,
     replica_tail: Option<Box<dyn LogTail>>, replica_poll: Option<Poll>, replica_batch: VecDeque<LogRecord>, replica_head: Option<ReplayHead>,
@@ -305,6 +306,7 @@ impl ReplicationDriver {
             logs.validate_source_boundary(&resolve.database, boundary)?;
         }
         let read_position = recovered.replica_start(&logs)?;
+        let track_catalog_cut = config.enabled && recovered.can_track_catalog_cut(&logs);
         let initial = DriverStatus { role: Role::Following, highest_term: recovered.fence.highest_term(), replica_position: read_position,
             open_block: recovered.partition.value().live().block_index(), adopted_block: recovered.block.clone().map(Arc::new), promotion_failure: None, last_block_upload_epoch_seconds: 0 };
         let (status, receiver) = watch::channel(initial);
@@ -317,7 +319,7 @@ impl ReplicationDriver {
         } else { None };
         let replica_tail = recovered.take_replay_tail(&logs, read_position)?;
         let restart = if config.enabled { progress.prepare_driver_restart() } else { None };
-        Ok((handle, Self { config, logs, blocks, partition: recovered.partition, progress, restart, resolve, effects, cancellation, clock, recovered_confirmation, compaction_replay_cutoff: recovered.compaction_replay_cutoff, historical_confirmations: VecDeque::new(), fence: recovered.fence,
+        Ok((handle, Self { config, logs, blocks, partition: recovered.partition, progress, restart, resolve, effects, cancellation, clock, recovered_confirmation, compaction_replay_cutoff: recovered.compaction_replay_cutoff, track_catalog_cut, historical_confirmations: VecDeque::new(), fence: recovered.fence,
             read_position, pending_block: None, claim: None, claiming: None, replica_tail, replica_poll: None, replica_batch: VecDeque::new(), replica_head: None, leader: None, commands, status, flush_timer }))
     }
     pub async fn run(mut self) -> Result<()> {
@@ -349,6 +351,7 @@ impl ReplicationDriver {
         let Some(history) = cancellation.run_until_cancelled(self.prove_historical_confirmations()).await else { return Ok(()); };
         self.historical_confirmations = history.unwrap_or_default();
         if self.cancellation.is_cancelled() { return Ok(()); }
+        self.publish_catalog_cut()?;
         self.progress.driver_initialized(self.restart.take())?;
         self.replica_tail = Some(tail);
         if self.config.may_lead && self.fence.highest_term() == Term(0) { self.start_claim()?; }
@@ -606,6 +609,20 @@ impl ReplicationDriver {
         self.status.send_replace(DriverStatus { role, highest_term: self.fence.highest_term(), replica_position: self.read_position,
             open_block: value.live().block_index(), adopted_block: value.table_catalog().block().cloned().map(Arc::new), promotion_failure, last_block_upload_epoch_seconds });
     }
+    fn publish_catalog_cut(&self) -> Result<()> {
+        let apply_deferred = self.leader.as_ref().is_some_and(|leader| !leader.held.is_empty());
+        if let Some(through) = crate::catalog_cut::completed_prefix(
+            self.read_position.0, self.track_catalog_cut, self.pending_block.is_some(), apply_deferred,
+        ) {
+            self.partition.publish_catalog_cut(CatalogCut {
+                storage_version: self.logs.storage_version,
+                storage_epoch: self.logs.storage_epoch,
+                replica_epoch: self.logs.replica_epoch,
+                through: ReplicaPosition(through),
+            })?;
+        }
+        Ok(())
+    }
     fn record_block_upload(&self) {
         let upload_time = (self.clock)().0.div_euclid(1_000_000);
         self.status.send_modify(|status| status.last_block_upload_epoch_seconds = upload_time);
@@ -620,7 +637,12 @@ impl ReplicationDriver {
             Some(reservation) => self.logs.decode_reserved_replica(raw, reservation)?,
             None => self.logs.decode_replica(raw)?,
         };
-        let Some(record) = decoded else { self.read_position = position; return Ok(()); };
+        let Some(record) = decoded else {
+            // The protobuf body can be omitted or too new for this reader to recognize.
+            self.track_catalog_cut = false;
+            self.read_position = position;
+            return Ok(());
+        };
         let observed_term = record.envelope.term;
         let (admission, record) = self.fence.admit_record(record)?;
         let wins = self.claim == Some(position) && admission.opens_term();
@@ -640,6 +662,7 @@ impl ReplicationDriver {
             }
         }
         self.read_position = position;
+        self.publish_catalog_cut()?;
         self.publish_status(self.role());
         if admission.verdict == Verdict::Voided { self.start_claim()?; }
         Ok(())
@@ -963,7 +986,7 @@ impl ReplicationDriver {
             }
         }
         for record in held { self.apply_admitted(record).await?; }
-        Ok(())
+        self.publish_catalog_cut()
     }
     async fn resolve_next_source(&mut self) -> Result<()> {
         let Some(leader) = &mut self.leader else { return Ok(()); };

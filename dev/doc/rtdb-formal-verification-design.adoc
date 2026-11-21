@@ -764,7 +764,16 @@ TLC compares those three observations with an atomic capture of the installed ca
 Using the received position, reading the installed position after capture, or reusing the transaction basis each admits a view with a dependency still needed at an older cut.
 The model's successful variant refuses the stale capture and admits a replacement after collection.
 That result assumes a monotone retirement floor certified at publication by the collector's authority.
-Mapping pending and skipped control records, recovery's checkpoint boundary, and direct maintenance operations into the same cut requires a production refinement. link:../../verification/tla/CatalogCutPublication.tla[Capture and publication model] · link:../../rust/crates/replication/src/driver.rs[Driver transitions]
+The Rust partition stores the storage version, storage epoch, journal epoch and conservative installed position beside the trie catalog.
+Captures with a cached live index use the cut of the same partition value that supplies their physical catalog.
+Ordinary startup seeds the cut at the empty journal prefix or a checkpoint boundary in the opened journal epoch, after the driver opens the replay tail.
+After a record or a completed resolution, the driver advances the cut only when the pending block and deferred application queues have drained.
+An unrecognized replica body freezes the last cut.
+Exact and restored startup, or an ordinary checkpoint without a matching journal boundary, leave the cut unavailable.
+A direct compactor reset suspends cuts for the open partition.
+The snapshot prefix supplies one prerequisite for distributed reader admission.
+The directory still needs to bind it to the physical residence and serialize reader admission against certified object retirement.
+Recovery from a reset also needs a durable rule for retired object identities before a collector can use this cut. link:../../verification/tla/CatalogCutPublication.tla[Capture and publication model] · link:../../rust/crates/replication/src/driver.rs[Driver transitions]
 
 === Delegated scans keep the coordinator's captured view
 

@@ -12,7 +12,7 @@ use rtdb_index::TransactionBuffer;
 use rtdb_storage::{MemoryStore, ObjectStore, cache::BufferPool, log::{LocalLog, LocalLogOptions, Log, LogMetadata, LogOffset, LogRecord, MemoryLog, ReadOnlyLocalLog, ReadOnlyLocalLogOptions}};
 use rtdb_trie::TrieConfig;
 use rtdb_tx::{Documents, ResolveContext, SourceTransaction, SubmitOptions, TransactionAuthorization, TxOp};
-use rtdb_types::{Anomaly, BlockIndex, Interval, Result, SourcePosition, StorageEpoch, TableRef, Term, TermSequence, Timestamp, TransactionKey, TxId, Value};
+use rtdb_types::{Anomaly, BlockIndex, Interval, ReplicaPosition, Result, SourcePosition, StorageEpoch, TableRef, Term, TermSequence, Timestamp, TransactionKey, TxId, Value};
 use tokio::sync::oneshot;
 use tokio::sync::oneshot::error::TryRecvError::Empty;
 use tokio_util::sync::CancellationToken;
@@ -306,6 +306,81 @@ async fn held_records_replay_below_the_fence_after_a_higher_term_upload() {
     fixture.driver.consume(raw(3, 2, 2, resolved(8, 2))).await.unwrap();
     assert_eq!(fixture.handle.progress().current().tx_id(), TxId(8));
     assert_eq!(fixture.driver.fence.position(), TermPosition::Expecting(TermSequence(3)));
+}
+
+#[tokio::test]
+async fn catalog_cut_tracks_the_captured_catalog_after_a_pending_block_drains() {
+    let mut fixture = fixture(ReplicationConfig { may_lead: false, ..Default::default() }, 1 << 27).await;
+    let partition = Arc::clone(&fixture.driver.partition);
+    let table = TableRef::new("public", "docs");
+    assert_eq!(partition.open_snapshot(None).catalog_cut(), None);
+    fixture.driver.consume(raw(0, 1, 0, resolved(0, 0))).await.unwrap();
+    let before = partition.open_snapshot(None);
+    assert_eq!(before.catalog_cut().unwrap().through, ReplicaPosition(0));
+    fixture.driver.consume(raw(1, 1, 1, boundary(0, 0))).await.unwrap();
+    let pending = fixture.driver.pending_block.as_ref().unwrap();
+    fixture.blocks.produce(&pending.prepared, &pending.boundary, BTreeMap::new()).await.unwrap();
+    let added = ReplicaBody::TriesAdded(proto::TriesAdded {
+        storage_version: Some(CURRENT_STORAGE_VERSION.0), storage_epoch: Some(0), source_msg_id: Some(1),
+        tries: vec![proto::TrieDetails {
+            table_name: Some(table.schema_and_table()), trie_key: Some("l00-rc-b00".into()), data_file_size: Some(1),
+            ..Default::default()
+        }],
+    });
+    fixture.driver.consume(raw(2, 1, 2, added)).await.unwrap();
+    let held = partition.open_snapshot(None);
+    assert_eq!(fixture.handle.status().replica_position, ReplicaPosition(2));
+    assert_eq!(held.catalog_cut(), before.catalog_cut());
+    assert!(held.trie_entries(&table).is_empty());
+
+    fixture.driver.consume(raw(3, 1, 3, upload(0, 0))).await.unwrap();
+    let installed = partition.open_snapshot(None);
+    assert_eq!(installed.catalog_cut().unwrap().through, ReplicaPosition(3));
+    assert_eq!(installed.trie_entries(&table).len(), 1);
+    assert_eq!(held.catalog_cut().unwrap().through, ReplicaPosition(0));
+    assert!(held.trie_entries(&table).is_empty());
+}
+
+#[tokio::test]
+async fn catalog_cut_cannot_cross_an_unrecognized_replica_body() {
+    let mut fixture = fixture(ReplicationConfig { may_lead: false, ..Default::default() }, 1 << 27).await;
+    let partition = Arc::clone(&fixture.driver.partition);
+    fixture.driver.consume(raw(0, 1, 0, resolved(0, 0))).await.unwrap();
+    let mut unknown = raw(1, 1, 1, resolved(1, 1));
+    unknown.payload = unknown.payload.slice(..1);
+    fixture.driver.consume(unknown).await.unwrap();
+    fixture.driver.consume(raw(2, 1, 1, resolved(2, 2))).await.unwrap();
+
+    assert_eq!(fixture.handle.status().replica_position, ReplicaPosition(2));
+    assert_eq!(partition.snapshot().tx_basis().unwrap().tx_id, TxId(2));
+    assert_eq!(partition.snapshot().catalog_cut().unwrap().through, ReplicaPosition(0));
+}
+
+#[tokio::test]
+async fn catalog_cut_advances_when_resolution_releases_deferred_records() {
+    let mut fixture = fixture(ReplicationConfig { may_lead: false, external_source: true, ..Default::default() }, 1 << 27).await;
+    let partition = Arc::clone(&fixture.driver.partition);
+    fixture.driver.consume(raw(0, 1, 0, ReplicaBody::NoOp(proto::NoOp { src_msg_id: None }))).await.unwrap();
+    fixture.driver.promote().await.unwrap();
+    let receipt = fixture.handle.term().unwrap()
+        .submit_external(Box::new(CommitExternal), Some(Timestamp(100)), None).await.unwrap();
+    let command = fixture.driver.commands.try_recv().unwrap();
+    fixture.driver.command(command).await.unwrap();
+    let table = TableRef::new("public", "docs");
+    let deleted = ReplicaBody::TriesDeleted(proto::TriesDeleted {
+        table_name: Some(table.schema_and_table()), trie_keys: vec!["l00-rc-b00".into()],
+    });
+    fixture.driver.consume(raw(1, 1, 1, deleted)).await.unwrap();
+    assert_eq!(fixture.driver.leader.as_ref().unwrap().held.len(), 1);
+    assert_eq!(fixture.handle.status().replica_position, ReplicaPosition(1));
+    assert_eq!(partition.open_snapshot(None).catalog_cut().unwrap().through, ReplicaPosition(0));
+
+    let resolution = &mut fixture.driver.leader.as_mut().unwrap().resolution;
+    let (resolver, result) = super::pending_resolution(resolution).await;
+    fixture.driver.resolution_finished(resolver, result).await.unwrap();
+    assert_eq!(partition.open_snapshot(None).catalog_cut().unwrap().through, ReplicaPosition(1));
+    fixture.driver.demote().await.unwrap();
+    drop(receipt);
 }
 
 #[tokio::test]
@@ -780,7 +855,11 @@ async fn a_recovered_checkpoint_uses_only_matching_admitted_confirmation_and_acc
             assert_eq!(restarted.recovered_confirmation.is_some(), index < 7);
         }
         assert!(restarted.recovered_confirmation.is_none());
-        assert!(Arc::ptr_eq(&restarted.partition.value(), &before));
+        let current = restarted.partition.value();
+        assert!(Arc::ptr_eq(current.trie_catalog(), before.trie_catalog()));
+        assert!(Arc::ptr_eq(current.table_catalog(), before.table_catalog()));
+        assert!(Arc::ptr_eq(current.live(), before.live()));
+        assert_eq!(current.snapshot().catalog_cut().unwrap().through, ReplicaPosition(7));
         assert_eq!(handle.progress().current().source_position, SourcePosition(-1));
         assert!(handle.progress().current().tx_key.is_none());
 
@@ -1194,6 +1273,8 @@ async fn compactor_reset_receipt_requires_block_adoption_and_fails_on_term_loss(
     fixture.logs.append_source(&rtdb_format::envelope::SourceMessage::Protobuf(rtdb_format::envelope::SourceBody::FlushBlock(Default::default())), Timestamp(1)).await.unwrap();
     fixture.driver.consume(raw(0, 1, 0, resolved(1, 0))).await.unwrap();
     fixture.driver.promote().await.unwrap();
+    let old_snapshot = fixture.driver.partition.snapshot();
+    assert_eq!(old_snapshot.catalog_cut().unwrap().through, ReplicaPosition(0));
     let value = fixture.driver.partition.value();
     let (completion, mut receipt) = tokio::sync::oneshot::channel();
     fixture.driver.command(super::Command::ResetCompactor {
@@ -1202,9 +1283,12 @@ async fn compactor_reset_receipt_requires_block_adoption_and_fails_on_term_loss(
     }).await.unwrap();
     assert!(matches!(receipt.try_recv(), Err(tokio::sync::oneshot::error::TryRecvError::Empty)));
     assert!(fixture.driver.leader.as_ref().unwrap().compactor_reset.is_some());
+    assert_eq!(fixture.driver.partition.open_snapshot(None).catalog_cut(), None);
     fixture.driver.consume(raw(1, 2, 0, ReplicaBody::NoOp(proto::NoOp { src_msg_id: None }))).await.unwrap();
     assert_eq!(receipt.await.unwrap().unwrap_err().code, "xtdb/leader-term-ended");
     assert!(fixture.handle.progress().fault().is_none());
+    assert_eq!(fixture.driver.partition.snapshot().catalog_cut(), None);
+    assert_eq!(old_snapshot.catalog_cut().unwrap().through, ReplicaPosition(0));
 }
 
 #[tokio::test]
