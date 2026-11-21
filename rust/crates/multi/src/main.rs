@@ -305,10 +305,13 @@ async fn run(arguments: Vec<String>) -> Result<()> {
             #[serde(flatten)]
             provenance: rtdb_types::BuildInfo,
             standalone_protocol: u32,
+            hosted_protocol: u32,
         }
         let report = MultiBuildInfo {
             provenance: rtdb_types::compiled_build_info(),
             standalone_protocol: process::STANDALONE_PROTOCOL,
+            // Exact historical checkpoint staging and private inspection of the held stage.
+            hosted_protocol: 7,
         };
         let mut output = std::io::stdout().lock();
         serde_json::to_writer(&mut output, &report).map_err(|error| io(std::io::Error::other(error)))?;
@@ -600,6 +603,7 @@ async fn run(arguments: Vec<String>) -> Result<()> {
                 directory, &archive, &storage, keys.as_ref(), intent, hosted_task(&arguments)?,
             ).await?;
             println!("{}", serde_json::to_string(&receipt).expect("a stage receipt serializes"));
+            Ok(())
         }
         "read-checkpoint-stage" => {
             if std::env::var_os("RTDB_TRANSFER_BINDING").is_some() {
