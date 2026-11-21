@@ -35,6 +35,8 @@ struct Hooks {
     fail_delete: bool,
     fail_copy: bool,
     lose_put_reply: bool,
+    fail_before_put: bool,
+    forget_put_witness: bool,
     deny_list: bool,
 }
 
@@ -65,8 +67,14 @@ impl fmt::Display for ControlledStore {
 
 #[async_trait]
 impl ProviderStore for ControlledStore {
-    async fn put_opts(&self, location: &Path, payload: PutPayload, options: PutOptions) -> object_store::Result<PutResult> {
+    async fn put_opts(&self, location: &Path, payload: PutPayload, mut options: PutOptions) -> object_store::Result<PutResult> {
         self.called();
+        if self.hooks.fail_before_put {
+            return Err(injected("provider publication is unconfirmed"));
+        }
+        if self.hooks.forget_put_witness {
+            options.attributes = Default::default();
+        }
         let result = self.inner.put_opts(location, payload, options).await?;
         if self.hooks.lose_put_reply {
             return Err(injected("lost publication reply"));
@@ -157,7 +165,7 @@ async fn bounded<F: Future>(future: F) -> F::Output {
 }
 
 #[tokio::test]
-async fn a_drained_single_put_region_distinguishes_a_refusal_from_a_lost_reply() {
+async fn a_drained_single_put_region_recovers_only_its_exact_committed_write() {
     let key = ObjectKey::new("data.arrow").unwrap();
     let contents = Bytes::from_static(b"sealed");
     let prefix = ObjectKey::new("cell").unwrap();
@@ -173,11 +181,24 @@ async fn a_drained_single_put_region_distinguishes_a_refusal_from_a_lost_reply()
 
     let io = IoRegion::new();
     let provider = ControlledStore::new(Hooks { lose_put_reply: true, ..Default::default() });
-    let store = RemoteStore::new_single_put(provider.clone(), prefix, io.clone());
-    assert!(matches!(store.put(&key, contents).await, Err(Error::Remote { .. })));
+    let store = RemoteStore::new_single_put(provider.clone(), prefix.clone(), io.clone());
+    store.put(&key, contents.clone()).await.unwrap();
     io.close_and_wait().await;
-    assert!(io.has_unknown_publication());
+    assert!(!io.has_unknown_publication());
     assert_eq!(paths(&provider.inner).await, ["cell/data.arrow"]);
+
+    for (hooks, objects) in [
+        (Hooks { fail_before_put: true, ..Default::default() }, Vec::<&str>::new()),
+        (Hooks { lose_put_reply: true, forget_put_witness: true, ..Default::default() }, vec!["cell/data.arrow"]),
+    ] {
+        let io = IoRegion::new();
+        let provider = ControlledStore::new(hooks);
+        let store = RemoteStore::new_single_put(provider.clone(), prefix.clone(), io.clone());
+        assert!(matches!(store.put(&key, contents.clone()).await, Err(Error::Remote { .. })));
+        io.close_and_wait().await;
+        assert!(io.has_unknown_publication());
+        assert_eq!(paths(&provider.inner).await, objects);
+    }
 }
 
 async fn assert_pending<F: Future + ?Sized>(mut future: Pin<&mut F>) {

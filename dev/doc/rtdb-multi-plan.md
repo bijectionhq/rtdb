@@ -128,9 +128,11 @@ persisted lock. A missing lock witness keeps the region pending. For remote
 storage, a producer that exits without acknowledging drain keeps cleanup
 pending until the provider's outstanding work can be accounted for.
 Each remote serving object is published with one conditional PUT of its
-sealed bytes directly to its final key. A drained host region with a lost
-write response keeps its directory admission. Successful writes and
-definitive provider refusals permit release when its I/O has drained.
+sealed bytes directly to its final key. The PUT carries a unique publication
+identity in its metadata. An ambiguous response settles only if a fresh
+HEAD returns that identity. Missing or unrelated metadata keeps the region's
+admission pending. A confirmed publication or definitive provider refusal
+permits release when its I/O has drained.
 
 `rtdb-multi capture --id UUID --operation UUID` retains the selected
 published checkpoint and copies its catalog, table metadata and referenced

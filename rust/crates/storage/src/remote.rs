@@ -2,7 +2,7 @@ use crate::{Error, IoRegion, ObjectKey, ObjectStore, ReadReservation, Result, Re
 use async_trait::async_trait;
 use bytes::Bytes;
 use futures::TryStreamExt;
-use object_store::{ObjectStore as ProviderStore, ObjectStoreExt, PutMode, PutOptions, path::Path};
+use object_store::{Attribute, GetOptions, ObjectStore as ProviderStore, ObjectStoreExt, PutMode, PutOptions, path::Path};
 use std::{ops::Range, sync::Arc};
 use tokio::io::{AsyncReadExt, AsyncSeekExt};
 
@@ -28,6 +28,8 @@ impl RemoteStore {
 
     /// Cell storage publishes a final object with one conditional provider
     /// write. The underlying client must not retry that request automatically.
+    /// A lost reply can be recovered only by observing this write's unique
+    /// metadata on the resulting object.
     pub fn new_single_put(client: Arc<dyn ProviderStore>, prefix: ObjectKey, io: Arc<IoRegion>) -> Self {
         Self { objects: Arc::new(RemoteObjects { client, prefix: Some(prefix) }), io, single_put: true }
     }
@@ -198,14 +200,33 @@ impl RemoteObjects {
     }
 
     async fn put(&self, key: &ObjectKey, bytes: Bytes, authority: Option<&IoRegion>) -> Result<()> {
-        let options = PutOptions { mode: PutMode::Create, ..Default::default() };
+        let mut options = PutOptions { mode: PutMode::Create, ..Default::default() };
+        let witness = authority.map(|_| {
+            let attribute = Attribute::Metadata("rtdb-publication".into());
+            let value = uuid::Uuid::new_v4().to_string();
+            options.attributes.insert(attribute.clone(), value.clone().into());
+            (attribute, value)
+        });
         let publication = authority.map(IoRegion::publication);
-        let response = self.client.put_opts(&self.path(key), bytes.clone().into(), options).await;
-        if let Some(publication) = publication
-            && matches!(response, Ok(_) | Err(object_store::Error::AlreadyExists { .. }
+        let path = self.path(key);
+        let response = self.client.put_opts(&path, bytes.clone().into(), options).await;
+        if let Some(publication) = publication {
+            if matches!(&response, Ok(_) | Err(object_store::Error::AlreadyExists { .. }
                 | object_store::Error::Precondition { .. } | object_store::Error::PermissionDenied { .. }))
-        {
-            publication.confirm();
+            {
+                publication.confirm();
+            } else if let Some((attribute, value)) = witness {
+                // An identical object from another attempt cannot settle a
+                // still-in-flight write. Match this request's metadata from
+                // the same atomic PUT. HEAD failures leave the hold pending.
+                let head = self.client.get_opts(&path, GetOptions::new().with_head(true)).await;
+                if head.is_ok_and(|object| {
+                    object.attributes.get(&attribute).is_some_and(|receipt| receipt.as_ref() == value.as_str())
+                }) {
+                    publication.confirm();
+                    return Ok(());
+                }
+            }
         }
         match response {
             Ok(_) => Ok(()),
