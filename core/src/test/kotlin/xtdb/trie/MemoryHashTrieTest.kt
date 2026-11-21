@@ -92,15 +92,48 @@ class MemoryHashTrieTest {
 
     @Test
     fun `addRange exactly at log limit triggers single compaction`() {
-        // Pins the boundary case in `Leaf.addAll` where combinedLogCount == logLimit:
-        // append in place, then run one-pass compactLogs (matching single-add at
-        // the same boundary).
         val n = 8
         writeRandomIids(n)
         val byRange = emptyTrie(logLimit = 8, pageLimit = 32).addRange(0, n)
         val byFold = (0 until n).fold(emptyTrie(logLimit = 8, pageLimit = 32)) { t, i -> t + i }
         assertEquals(byFold.indexSet(), byRange.indexSet())
         assertEquals((0 until n).toSet(), byRange.indexSet())
+    }
+
+    @Test
+    fun `single inserts from the same trie preserve both versions`() {
+        writeRandomIids(3)
+        val base = emptyTrie() + 0
+        val first = base + 1
+        val second = base + 2
+
+        assertEquals(setOf(0), base.indexSet())
+        assertEquals(setOf(0, 1), first.indexSet())
+        assertEquals(setOf(0, 2), second.indexSet())
+    }
+
+    @Test
+    fun `batches below the log limit preserve sibling versions`() {
+        writeRandomIids(5)
+        val base = emptyTrie() + 0
+        val first = base.addAll(intArrayOf(1, 2))
+        val second = base.addAll(intArrayOf(3, 4))
+
+        assertEquals(setOf(0), base.indexSet())
+        assertEquals(setOf(0, 1, 2), first.indexSet())
+        assertEquals(setOf(0, 3, 4), second.indexSet())
+    }
+
+    @Test
+    fun `a range filling the log preserves an earlier sibling version`() {
+        writeRandomIids(4)
+        val base = emptyTrie(logLimit = 3) + 0
+        val first = base + 1
+        val second = base.addRange(2, 2)
+
+        assertEquals(setOf(0), base.indexSet())
+        assertEquals(setOf(0, 1), first.indexSet())
+        assertEquals(setOf(0, 2, 3), second.indexSet())
     }
 
     @Test

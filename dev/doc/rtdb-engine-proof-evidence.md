@@ -187,6 +187,22 @@ Lean 4.35.0 audited five theorems and rejected both mutations.
 Verus 0.2026.11.05.31e44e6 checked nine functions and rejected five mutations.
 The native run passed 503 tests with `cargo test --manifest-path rust/Cargo.toml --locked -p rtdb-trie -p rtdb-format -p rtdb-index -p rtdb-query`. [Lean model](../../verification/lean/LiveRowAddress.lean) · [Verus study](../../verification/verus/live_row_address/area.json) · [Snapshot regression](../../rust/crates/index/tests/live_index.rs)
 
+### JVM trie pending-log ownership
+
+IDX05 requires a retained trie version to keep its rows through later changes, including writes to a sibling version from the same parent.
+Before the fix, two inserts of rows 7 and 9 into versions derived from the same empty JVM trie both read back row 9.
+The JVM single-insert and bounded-batch paths now write into a newly allocated array before the new leaf becomes visible.
+The compiled JVM reproduction reads row 7 from the first sibling and row 9 from the second after the fix.
+Bytecode inspection shows the store and bulk copy target the array returned by `Arrays.copyOf`.
+The Lean model proves that the new leaf sees the previous visible prefix followed by the inserted rows and that arbitrary sequences of forks preserve every previously captured log.
+The model checks a shared-buffer witness of the old implementation.
+The instruction model proves that resizing and writing into the fresh destination produces the specified log for both a single store and a bulk copy.
+Lean 4.35.0 audited six theorems and rejected mutations that reuse the parent's buffer, discard its visible prefix, or copy just the first incoming row of a batch.
+The production mapping assumes Kotlin's array copy allocates a fresh array, bulk copying touches only its destination, published arrays stay read-only, and each trie reads stable IIDs at its captured row indices.
+JVM regressions cover sibling single inserts, sibling batches below the threshold, and a sibling range insert reaching the compaction threshold.
+Run these cases with `./gradlew :xtdb-core:test --tests 'xtdb.trie.MemoryHashTrieTest'`.
+Whole-trie JVM refinement across splits and the native ownership and publication proof remain open. [Immutable trie contract](../../allium/memory-hash-trie.allium) · [Lean proof](../../verification/lean/JvmTriePendingLogs.lean) · [JVM regressions](../../core/src/test/kotlin/xtdb/trie/MemoryHashTrieTest.kt)
+
 ## Multi evidence
 
 The multi models describe the separate `e86af7f12` branch baseline and its directory, Logkeeper, and object-store assumptions.
