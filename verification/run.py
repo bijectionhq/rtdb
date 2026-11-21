@@ -704,8 +704,8 @@ def verify_checkpoint_replay(args, source):
         [*command, "--test", "recovery"], source / "rust", args.evidence, "rust-checkpoint-baseline", env,
     )
     if baseline.returncode or not all(
-        f"{count} passed; 0 failed" in baseline.stdout for count in (1, 3)
-    ):
+        f"{count} passed; 0 failed" in baseline.stdout for count in (1, 4)
+    ) or "recovery_preserves_queries_through_tiered_publication ... ok" not in baseline.stdout:
         raise ValueError("checkpoint replay baseline failed")
     blocks = source / "rust/crates/replication/src/blocks.rs"
     original = blocks.read_bytes()
@@ -730,7 +730,7 @@ def verify_checkpoint_replay(args, source):
     ):
         raise ValueError("root-first mutation did not fail at checkpoint startup")
     blocks.write_bytes(original)
-    print("rust-checkpoint-replay: four tests passed, root-first production mutation rejected")
+    print("rust-checkpoint-replay: five tests passed, root-first production mutation rejected")
 
 
 def verify_catalog_replay(args, source):

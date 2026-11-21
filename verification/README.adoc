@@ -96,7 +96,7 @@ The pinned Verus release replaces the earlier proposed source build of 31e44e6.
 The optional Rust boundary check compiles an unchanged copy and two mutated copies of the replica driver imported from the current Git commit.
 The optional native replay reads the same seeded 4,096-observation trace that the Lean evaluator checks, exercising both temporal resolvers and the unbounded visibility rectangles.
 It also compiles the unmodified and unpadded text scorer to replay the binary64 boundary witness.
-The same option runs the local checkpoint interruption and manifest-recovery tests and replays a root-first mutation of the checkpoint writer.
+The same option runs the local checkpoint interruption, partial compaction and manifest-recovery tests and replays a root-first mutation of the checkpoint writer.
 It also tests catalog promotion after a binary checkpoint round trip.
 The production controls omit the pending historical index and let a tiered replacement publish without its fourth bucket.
 It also exercises the Azure adapter against a loopback provider and separately mutates premature copy acknowledgement and cleanup on an unknown outcome.

@@ -565,3 +565,19 @@ Every resumed step agrees with uninterrupted execution on persisted trie members
 All eighteen catalog tests and seventeen maintenance integration tests passed.
 The production proof depends on the Rust catalog looking up the four branches at one level, recency and parent prefix.
 The replay checks the persisted catalog transition. Full data and metadata closure and equality of query answers through concurrent storage operations remain open.
+
+== Native SQL replay through a partial tiered checkpoint
+
+The durable-node case `recovery_preserves_queries_through_tiered_publication` runs the Rust compaction worker, replica log, checkpoint writer and SQL engine on local storage.
+One worker publishes the first three buckets and pauses the fourth before its upload.
+The node serves all four current parents while the first three children are nascent.
+The fixture waits for the next checkpoint's actual adoption and decodes its table block to check that it contains those three nascent children.
+It then completes compaction and restarts from that checkpoint.
+Before the driver begins replay, the restored catalog holds those same three nascent entries.
+The final replica notice activates the four children.
+
+Both ordered SQL results, one with 129 current rows and one with 132 historical rows, agree before compaction, while the group is partial, after the group is live and after restart.
+The comparison includes values and temporal interval columns.
+All four native node fault cases and the manifest recovery case passed.
+The case uses one table with four input blocks and local durable storage.
+Collection is disabled so the result isolates publication, checkpointing and replay.
