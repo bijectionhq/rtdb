@@ -2130,6 +2130,18 @@ The log is `/private/tmp/rtdb-formal.QMjPSJsX/hosted-retirement-release-5f41-rus
 The exact restart replay passed on parent `f71c07a0c` with this change.
 Seven mutations failed at their declared assertions, including queueing before installation and losing the plan on partial release.
 The per-case native build and test records are under `/private/tmp/rtdb-formal.QMjPSJsX/hosted-trie-release-native-en304von/`.
+The Verus lane completed all 35 area baselines and 173 controls against the sources in `dadbcaecf`.
+It includes the exact production receipt, catalog admission and cutoff decisions.
+The records are under `/private/tmp/rtdb-formal.QMjPSJsX/hosted-trie-release-current-verus-ya6bug80/`.
+
+The combined JVM test and property run used the JVM sources from parent `5f41a7d13` and the native library from `5a891cf09`.
+It recorded 6,503 passes and nine failures.
+All 3,315 core property and simulation cases passed.
+Six PostgreSQL source property cases failed in Docker fixture setup, and the root authentication fixture could not download its Keycloak image.
+The root property task also failed during Docker-dependent test discovery before recording any cases.
+Two read-only node tests timed out while waiting for source progress.
+The source-progress failures were observed with the reused native library.
+The log is `/private/tmp/rtdb-formal.QMjPSJsX/hosted-retirement-release-5f41-jvm-test-and-property.log`.
 
 The handoff controls new release markers from the hosted trie collector.
 The downstream reaper still acts on logical keys and its grace period.
