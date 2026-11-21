@@ -194,6 +194,7 @@ struct DecodedPages {
 pub(super) struct Tree<'a> {
     pub storage: &'a BufferPool,
     pub directory: &'a ObjectKey,
+    pub scope: u64,
     pub memory: &'a Arc<MemoryBudget>,
     decoded: Mutex<DecodedPages>,
 }
@@ -203,8 +204,13 @@ impl<'scope> Tree<'scope> {
         storage: &'scope BufferPool,
         directory: &'scope ObjectKey,
         memory: &'scope Arc<MemoryBudget>,
+        scope: u64,
     ) -> Self {
-        Self { storage, directory, memory, decoded: Mutex::default() }
+        Self { storage, directory, scope, memory, decoded: Mutex::default() }
+    }
+
+    pub fn pages(&self) -> Result<ObjectKey> {
+        Ok(ObjectKey::new(format!("{}/generations/{:016x}/pages", self.directory, self.scope))?)
     }
 
     fn page_key(&self, generation: i64, digest: &str) -> Result<ObjectKey> {
@@ -215,8 +221,7 @@ impl<'scope> Tree<'scope> {
             return Err(format_error("Invalid ordered index page address"));
         }
         Ok(ObjectKey::new(format!(
-            "{}/pages/{generation:016x}/{digest}",
-            self.directory.as_str()
+            "{}/generations/{:016x}/pages/{generation:016x}/{digest}", self.directory, self.scope,
         ))?)
     }
 

@@ -401,7 +401,7 @@ mod tests {
         let directory = ObjectKey::new("index").unwrap();
         let storage = BufferPool::new(Arc::new(MemoryStore::default()), 8 << 20);
         let memory = MemoryBudget::new(32 << 20);
-        let tree = Tree::new(&storage, &directory, &memory);
+        let tree = Tree::new(&storage, &directory, &memory, 0);
         let token = CancellationToken::new();
         let mut roots = RevisionRoots::default();
         let original = put(1, 0, Interval::from_micros(0, 16).unwrap(), 90);
@@ -442,7 +442,7 @@ mod tests {
         let directory = ObjectKey::new("index").unwrap();
         let storage = BufferPool::new(Arc::new(MemoryStore::default()), 8 << 20);
         let memory = MemoryBudget::new(32 << 20);
-        let tree = Tree::new(&storage, &directory, &memory);
+        let tree = Tree::new(&storage, &directory, &memory, 0);
         let token = CancellationToken::new();
         let mut roots = RevisionRoots::default();
         let original = put(1, 0, Interval::ALL, 2);

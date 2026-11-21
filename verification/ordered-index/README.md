@@ -120,10 +120,9 @@ ingress functions. The joint controls failed
 included Bijection decision sources are unchanged in the companion clearance
 update at `aa7c7fd086423689a772ccd8fd6b75a1674a6cb7`.
 
-The integration branches still need a native run against the paired RTDB
-and Bijection builds. Physical erasure of the remaining provider objects must
-bind garbage release, superseded publication settlement, and active read
-scopes to the provider's completion evidence.
+Physical erasure of the remaining provider objects must bind garbage release,
+superseded publication settlement, and active read scopes to the provider's
+completion evidence.
 
 ## Generation retirement model
 
@@ -142,7 +141,23 @@ Removing either upload settlement fairness or reader release fairness produced a
 The hosted implementation still needs a generation authority shared by read admission, the provider publication journal, and erasure completion.
 The authority must close the generation before inspecting the journal. It must settle each admitted upload by completion or confirmed abort, then verify deletion at the provider.
 Each replica must drain the old generation's operations and decoded pages before releasing its reader admission.
-Recovery must scrub erased history before producing any replacement page at the provider, including pages written before the replacement manifest is published.
+Replay on consolidated RTDB discovers erase cuts from adopted L0 files before
+writing any replacement page. `Recovery.lean` checks
+`scrubbed_replay_preserves_points`: for one IID, filtering out strictly
+earlier events preserves the point interpretation and retains source order
+within the erase revision. Lean 4.35.0 checked the theorem with warnings
+promoted to errors and reported dependencies on `propext` and `Quot.sound`.
+
+Every checkpoint now names one page scope, determined by the last source
+block containing an erase. Pages retain their original source-block
+addresses inside that scope. Collection releases earlier scopes only after
+the replacement checkpoint is durable, and leaves pages staged in later
+scopes alone. Four ordered-index unit tests and eight native regressions
+passed on the consolidated engine. The regressions cover exact repair when
+an old dirty address cannot be reused, a same-revision erase and reinsertion,
+and preservation of an unpublished later scope. The PgWire declaration and
+keyset regression also passed. The hosted directory still needs to fence old
+admissions and record physical provider completion.
 
 ## Execution
 

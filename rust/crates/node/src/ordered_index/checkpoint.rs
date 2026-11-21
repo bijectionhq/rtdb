@@ -3,8 +3,8 @@ use std::{
     sync::Arc,
 };
 
-use rtdb_columnar::MemoryReservation;
-use rtdb_storage::{Error, ObjectKey};
+use rtdb_columnar::{MemoryBudget, MemoryReservation};
+use rtdb_storage::{Error, ObjectKey, cache::BufferPool};
 use rtdb_types::Result;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -17,11 +17,12 @@ use super::{
     tree::{Item, Key, Link, Pointer, Root, Tree},
 };
 
-const MANIFESTS: &str = "manifests/scrubbed";
+const MANIFESTS: &str = "manifests/scoped";
 
 #[derive(Serialize, Deserialize)]
 pub(super) struct Checkpoint {
     pub through: i64,
+    pub scope: u64,
     pub source_rows: i64,
     revisions: Option<Arc<Pointer>>,
     #[serde(skip)]
@@ -57,7 +58,7 @@ impl Checkpoint {
     }
 
     async fn pending_collection(&self, tree: &Tree<'_>) -> Result<Vec<ObjectKey>> {
-        let root = key(tree, "cleanup")?;
+        let root = key(tree.directory, "cleanup")?;
         Ok(tree
             .storage
             .object_store()
@@ -82,8 +83,9 @@ impl Checkpoint {
             tree.mark(Arc::clone(pointer), &mut reachable).await?;
         }
         let store = tree.storage.object_store();
-        let prefix = key(tree, "pages")?;
-        let objects = store.list(Some(&prefix)).await?;
+        let prefix = tree.pages()?;
+        let generations = key(tree.directory, "generations")?;
+        let objects = store.list(Some(&generations)).await?;
         let present: BTreeSet<_> = objects.iter().map(|object| &object.key).collect();
         if !reachable.iter().all(|key| present.contains(key)) {
             return Err(format_error(
@@ -95,15 +97,31 @@ impl Checkpoint {
             if cancellation.is_cancelled() {
                 return Err(cancelled());
             }
-            let generation = object
-                .key
-                .as_str()
-                .strip_prefix(prefix.as_str())
-                .and_then(|suffix| suffix.trim_start_matches('/').split_once('/'))
-                .and_then(|(generation, _)| i64::from_str_radix(generation, 16).ok());
-            if generation.is_some_and(|generation| generation <= self.through)
-                && !reachable.contains(&object.key)
+            let Some((scope, _)) = object.key.as_str()
+                .strip_prefix(generations.as_str())
+                .and_then(|suffix| suffix.strip_prefix('/'))
+                .and_then(|suffix| suffix.split_once('/'))
+            else {
+                continue;
+            };
+            let Ok(scope) = u64::from_str_radix(scope, 16) else {
+                continue;
+            };
+            let block = page_block(&object.key, &prefix);
+            if scope < self.scope
+                || (block.is_some_and(|block| block <= self.through)
+                    && !reachable.contains(&object.key))
             {
+                store.delete(&object.key).await?;
+                tree.storage.invalidate(&object.key).await?;
+            }
+        }
+        let legacy = key(tree.directory, "pages")?;
+        for object in store.list(Some(&legacy)).await? {
+            if cancellation.is_cancelled() {
+                return Err(cancelled());
+            }
+            if page_block(&object.key, &legacy).is_some_and(|block| block <= self.through) {
                 store.delete(&object.key).await?;
                 tree.storage.invalidate(&object.key).await?;
             }
@@ -123,8 +141,8 @@ impl Checkpoint {
         cancellation: &CancellationToken,
     ) -> Result<()> {
         let store = tree.storage.object_store();
-        let published = key(tree, MANIFESTS)?;
-        for object in store.list(Some(&key(tree, "manifests")?)).await? {
+        let published = key(tree.directory, MANIFESTS)?;
+        for object in store.list(Some(&key(tree.directory, "manifests")?)).await? {
             if cancellation.is_cancelled() {
                 return Err(cancelled());
             }
@@ -141,7 +159,7 @@ impl Checkpoint {
 
 /// Recovery may advance the manifest before the sweep finishes.
 pub(super) async fn request_collection(tree: &Tree<'_>, through: i64) -> Result<()> {
-    let debt = key(tree, format_args!("cleanup/{through:016x}"))?;
+    let debt = key(tree.directory, format_args!("cleanup/{through:016x}"))?;
     tree.storage
         .object_store()
         .put(&debt, Vec::<u8>::new().into())
@@ -149,24 +167,35 @@ pub(super) async fn request_collection(tree: &Tree<'_>, through: i64) -> Result<
     Ok(())
 }
 
-fn key(tree: &Tree<'_>, suffix: impl std::fmt::Display) -> Result<ObjectKey> {
-    Ok(ObjectKey::new(format!("{}/{suffix}", tree.directory))?)
+fn key(directory: &ObjectKey, suffix: impl std::fmt::Display) -> Result<ObjectKey> {
+    Ok(ObjectKey::new(format!("{directory}/{suffix}"))?)
+}
+
+fn page_block(object: &ObjectKey, pages: &ObjectKey) -> Option<i64> {
+    let path = object.as_str().strip_prefix(pages.as_str())?.strip_prefix('/')?;
+    let (block, _) = path.split_once('/')?;
+    i64::from_str_radix(block, 16).ok()
 }
 
 fn frontier(key: &ObjectKey) -> Option<i64> {
     i64::from_str_radix(key.as_str().rsplit('/').next()?, 16).ok()
 }
 
-pub(super) async fn latest(tree: &Tree<'_>, through: i64) -> Result<Option<Checkpoint>> {
+pub(super) async fn latest(
+    storage: &BufferPool,
+    directory: &ObjectKey,
+    memory: &Arc<MemoryBudget>,
+    through: i64,
+) -> Result<Option<Checkpoint>> {
     if through < 0 {
         return Ok(None);
     }
-    let store = tree.storage.object_store();
-    let head = key(tree, format_args!("{MANIFESTS}/{through:016x}"))?;
+    let store = storage.object_store();
+    let head = key(directory, format_args!("{MANIFESTS}/{through:016x}"))?;
     let object = match store.head_fresh(&head).await {
         Ok(object) => Some(object),
         Err(Error::MissingObject(_)) => store
-            .list(Some(&key(tree, MANIFESTS)?))
+            .list(Some(&key(directory, MANIFESTS)?))
             .await?
             .into_iter()
             .filter(|object| frontier(&object.key).is_some_and(|block| block <= through))
@@ -177,9 +206,7 @@ pub(super) async fn latest(tree: &Tree<'_>, through: i64) -> Result<Option<Check
         return Ok(None);
     };
     let size = usize::try_from(object.size).map_err(format_error)?;
-    let allocation = tree
-        .memory
-        .reserve(size.saturating_mul(8).saturating_add(4096))?;
+    let allocation = memory.reserve(size.saturating_mul(8).saturating_add(4096))?;
     let bytes = store.get_fresh(&object.key).await?;
     if bytes.len() != size {
         return Err(format_error("Ordered index manifest length changed"));
@@ -194,6 +221,8 @@ pub(super) async fn latest(tree: &Tree<'_>, through: i64) -> Result<Option<Check
             Sha256::digest(serde_json::to_vec(&checkpoint).map_err(format_error)?)
         )
         || frontier(&object.key) != Some(checkpoint.through)
+        || checkpoint.through < 0
+        || checkpoint.scope > checkpoint.through as u64 + 1
         || checkpoint.source_rows < 0
         || checkpoint
             .revisions
@@ -265,6 +294,7 @@ pub(super) async fn publish(
     };
     let checkpoint = Checkpoint {
         through,
+        scope: tree.scope,
         source_rows,
         revisions,
         _allocation: None,
@@ -279,12 +309,12 @@ pub(super) async fn publish(
     if cancellation.is_cancelled() {
         return Err(cancelled());
     }
-    let manifest = key(tree, format_args!("{MANIFESTS}/{through:016x}"))?;
+    let manifest = key(tree.directory, format_args!("{MANIFESTS}/{through:016x}"))?;
     tree.storage
         .object_store()
         .put(&manifest, encoded.into())
         .await?;
-    latest(tree, through)
+    latest(tree.storage, tree.directory, tree.memory, through)
         .await?
         .ok_or_else(|| format_error("Published checkpoint is unavailable"))
 }
@@ -301,11 +331,11 @@ mod tests {
         let storage = BufferPool::new(Arc::new(MemoryStore::default()), 1 << 20);
         let memory = MemoryBudget::new(1 << 20);
         let directory = ObjectKey::new("index").unwrap();
-        let tree = Tree::new(&storage, &directory, &memory);
+        let tree = Tree::new(&storage, &directory, &memory, 0);
         let token = CancellationToken::new();
         let store = storage.object_store();
-        let erased = key(&tree, "pages/0000000000000000/erased").unwrap();
-        let later = key(&tree, "pages/0000000000000003/later").unwrap();
+        let erased = key(&tree.pages().unwrap(), "0000000000000000/erased").unwrap();
+        let later = key(&tree.pages().unwrap(), "0000000000000003/later").unwrap();
         for page in [&erased, &later] {
             store.put(page, Vec::<u8>::new().into()).await.unwrap();
         }
@@ -313,7 +343,7 @@ mod tests {
         request_collection(&tree, 1).await.unwrap();
         publish(&tree, 1, 2, None, &token).await.unwrap();
 
-        let reopened = latest(&tree, 1).await.unwrap().unwrap();
+        let reopened = latest(&storage, &directory, &memory, 1).await.unwrap().unwrap();
         assert_eq!(reopened.through, 1);
         let advanced = publish(&tree, 2, 3, None, &token).await.unwrap();
         advanced.finish(&tree, &token).await.unwrap();
@@ -324,6 +354,28 @@ mod tests {
         ));
         assert!(store.head(&later).await.is_ok());
         assert!(advanced.pending_collection(&tree).await.unwrap().is_empty());
-        assert_eq!(latest(&tree, 2).await.unwrap().unwrap().through, 2);
+        assert_eq!(latest(&storage, &directory, &memory, 2).await.unwrap().unwrap().through, 2);
+    }
+
+    #[tokio::test]
+    async fn sweeping_a_scope_preserves_pages_staged_in_a_later_scope() {
+        let storage = BufferPool::new(Arc::new(MemoryStore::default()), 1 << 20);
+        let memory = MemoryBudget::new(1 << 20);
+        let directory = ObjectKey::new("index").unwrap();
+        let tree = Tree::new(&storage, &directory, &memory, 2);
+        let token = CancellationToken::new();
+        let store = storage.object_store();
+        let older = key(&directory, "generations/0000000000000000/pages/0000000000000000/page").unwrap();
+        let newer = key(&directory, "generations/0000000000000003/pages/0000000000000000/page").unwrap();
+        for page in [&older, &newer] {
+            store.put(page, Vec::<u8>::new().into()).await.unwrap();
+        }
+
+        request_collection(&tree, 1).await.unwrap();
+        let checkpoint = publish(&tree, 1, 2, None, &token).await.unwrap();
+        checkpoint.finish(&tree, &token).await.unwrap();
+
+        assert!(matches!(store.head(&older).await, Err(Error::MissingObject(_))));
+        assert!(store.head(&newer).await.is_ok());
     }
 }

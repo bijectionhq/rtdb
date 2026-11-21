@@ -65,8 +65,7 @@ impl OrderedIndexMaintenance {
         let mut directories = BTreeSet::new();
         for definition in active {
             let directory = definition.directory()?;
-            let tree = Tree::new(&self.storage, &directory, &self.memory);
-            self.refresh_index(snapshot, &definition, &tree, cancellation)
+            self.refresh_index(snapshot, &definition, &directory, cancellation)
                 .await?;
             directories.insert(directory);
         }
@@ -83,7 +82,7 @@ impl OrderedIndexMaintenance {
         &self,
         snapshot: &Snapshot,
         definition: &Definition,
-        tree: &Tree<'_>,
+        directory: &ObjectKey,
         cancellation: &CancellationToken,
     ) -> Result<()> {
         let through = source_frontier(snapshot, &definition.table);
@@ -91,11 +90,13 @@ impl OrderedIndexMaintenance {
             return Ok(());
         }
         let expected = source_rows(snapshot, &definition.table);
-        if let Ok(Some(checkpoint)) = checkpoint::latest(tree, through).await
+        if let Ok(Some(checkpoint)) =
+            checkpoint::latest(&self.storage, directory, &self.memory, through).await
             && checkpoint.source_rows <= expected
         {
+            let tree = Tree::new(&self.storage, directory, &self.memory, checkpoint.scope);
             if checkpoint.through == through && checkpoint.source_rows == expected {
-                match checkpoint.collect(tree, cancellation).await {
+                match checkpoint.collect(&tree, cancellation).await {
                     Ok(()) => return Ok(()),
                     Err(error) if error.category == AnomalyCategory::Interrupted => {
                         return Err(error);
@@ -105,23 +106,22 @@ impl OrderedIndexMaintenance {
             } else {
                 let sources =
                     source_files(snapshot, &definition.table, checkpoint.through, through)?;
-                let cuts = erase_cuts(tree, &sources, cancellation).await?;
-                if cuts.is_empty() {
+                let cuts = erase_cuts(&self.storage, &self.memory, &sources, cancellation).await?;
+                if cuts.scope == 0 {
                     let mut roots = checkpoint.roots();
                     let advanced =
-                        replay_flushed(tree, definition, &sources, &cuts, &mut roots, cancellation)
-                            .await;
+                        replay_flushed(&tree, definition, &sources, &cuts, &mut roots, cancellation).await;
                     match advanced {
                         Ok(rows) if checkpoint.source_rows.checked_add(rows) == Some(expected) => {
                             let next = checkpoint::publish(
-                                tree,
+                                &tree,
                                 through,
                                 expected,
                                 roots.archived,
                                 cancellation,
                             )
                             .await?;
-                            return next.finish(tree, cancellation).await;
+                            return next.finish(&tree, cancellation).await;
                         }
                         Err(error) if error.category == AnomalyCategory::Interrupted => {
                             return Err(error);
@@ -132,17 +132,18 @@ impl OrderedIndexMaintenance {
             }
         }
         let sources = source_files(snapshot, &definition.table, -1, through)?;
-        let cuts = erase_cuts(tree, &sources, cancellation).await?;
-        checkpoint::request_collection(tree, through).await?;
+        let cuts = erase_cuts(&self.storage, &self.memory, &sources, cancellation).await?;
+        let tree = Tree::new(&self.storage, directory, &self.memory, cuts.scope);
+        checkpoint::request_collection(&tree, through).await?;
         let mut roots = RevisionRoots::default();
         let rows =
-            replay_flushed(tree, definition, &sources, &cuts, &mut roots, cancellation).await?;
+            replay_flushed(&tree, definition, &sources, &cuts, &mut roots, cancellation).await?;
         if rows != expected {
             return Err(incomplete_source());
         }
         let checkpoint =
-            checkpoint::publish(tree, through, expected, roots.archived, cancellation).await?;
-        checkpoint.collect(tree, cancellation).await
+            checkpoint::publish(&tree, through, expected, roots.archived, cancellation).await?;
+        checkpoint.collect(&tree, cancellation).await
     }
 }
 
@@ -155,7 +156,8 @@ impl CycleWorker for OrderedIndexMaintenance {
 }
 
 async fn read_flushed(
-    tree: &Tree<'_>,
+    storage: &BufferPool,
+    memory: &Arc<MemoryBudget>,
     source: &SourceFile,
     cancellation: &CancellationToken,
     mut visit: impl FnMut(&EventBatch) -> Result<()> + Send,
@@ -163,22 +165,22 @@ async fn read_flushed(
     if cancellation.is_cancelled() {
         return Err(cancelled());
     }
-    let store = tree.storage.object_store();
+    let store = storage.object_store();
     if store.head_fresh(&source.object).await?.size != source.size as u64 {
         return Err(format_error("An ordered index source differs from the adopted file"));
     }
-    let _input_bytes = tree.memory.reserve(source.size)?;
+    let _input_bytes = memory.reserve(source.size)?;
     let bytes = store.get_fresh(&source.object).await?;
     if bytes.len() != source.size {
         return Err(format_error("An ordered index source file changed length"));
     }
-    let (mut input, _footer) = open_input(Cursor::new(bytes), tree.memory)?;
+    let (mut input, _footer) = open_input(Cursor::new(bytes), memory)?;
     let mut rows = 0_i64;
     for page in 0..input.page_count() {
         if cancellation.is_cancelled() {
             return Err(cancelled());
         }
-        let page = read_page(&mut input, page, tree.memory)?;
+        let page = read_page(&mut input, page, memory)?;
         let batch = EventBatch::new(page.batch().clone())?;
         rows = rows
             .checked_add(i64::try_from(batch.len()).map_err(format_error)?)
@@ -188,29 +190,35 @@ async fn read_flushed(
     Ok(rows)
 }
 
-type ErasureCuts = BTreeMap<Iid, (Timestamp, Arc<MemoryReservation>)>;
+#[derive(Default)]
+struct ErasureCuts {
+    scope: u64,
+    by_iid: BTreeMap<Iid, (Timestamp, Arc<MemoryReservation>)>,
+}
 
 async fn erase_cuts(
-    tree: &Tree<'_>,
+    storage: &BufferPool,
+    memory: &Arc<MemoryBudget>,
     sources: &[SourceFile],
     cancellation: &CancellationToken,
 ) -> Result<ErasureCuts> {
-    let mut cuts = ErasureCuts::new();
+    let mut cuts = ErasureCuts::default();
     for source in sources {
-        read_flushed(tree, source, cancellation, |batch| {
+        read_flushed(storage, memory, source, cancellation, |batch| {
             for row in 0..batch.len() {
                 if cancellation.is_cancelled() {
                     return Err(cancelled());
                 }
                 let header = batch.header(row)?;
                 if header.op == EventOp::Erase {
-                    match cuts.entry(header.iid) {
+                    cuts.scope = (source.block as u64 + 1).max(cuts.scope);
+                    match cuts.by_iid.entry(header.iid) {
                         Entry::Occupied(mut entry) => {
                             let cut = &mut entry.get_mut().0;
                             *cut = (*cut).max(header.system_from);
                         }
                         Entry::Vacant(entry) => {
-                            entry.insert((header.system_from, tree.memory.reserve(128)?));
+                            entry.insert((header.system_from, memory.reserve(128)?));
                         }
                     }
                 }
@@ -230,7 +238,7 @@ async fn flushed_changes(
     retain: impl Fn(rtdb_types::EventHeader) -> bool + Send + Sync,
 ) -> Result<(i64, Changes)> {
     let mut changes = Changes::default();
-    let rows = read_flushed(tree, source, cancellation, |batch| {
+    let rows = read_flushed(tree.storage, tree.memory, source, cancellation, |batch| {
         changes.add_batch(
             batch,
             0,
@@ -255,7 +263,7 @@ async fn replay_flushed(
     let mut rows = 0_i64;
     for source in sources {
         let (count, changes) = flushed_changes(tree, definition, source, cancellation, |header| {
-            cuts.get(&header.iid)
+            cuts.by_iid.get(&header.iid)
                 .is_none_or(|(cut, _)| header.system_from >= *cut)
         })
         .await?;
@@ -276,10 +284,12 @@ pub(super) async fn read_root(
     tree: &Tree<'_>,
     definition: &Definition,
     snapshot: &Snapshot,
+    checkpoint: Option<checkpoint::Checkpoint>,
     system_at: Timestamp,
     cancellation: &CancellationToken,
 ) -> Result<Option<Root>> {
-    let Some(root) = read_flushed_root(tree, definition, snapshot, system_at, cancellation).await?
+    let Some(root) =
+        read_flushed_root(tree, definition, snapshot, checkpoint, system_at, cancellation).await?
     else {
         return Ok(None);
     };
@@ -305,11 +315,11 @@ async fn read_flushed_root(
     tree: &Tree<'_>,
     definition: &Definition,
     snapshot: &Snapshot,
+    checkpoint: Option<checkpoint::Checkpoint>,
     system_at: Timestamp,
     cancellation: &CancellationToken,
 ) -> Result<Option<Root>> {
     let through = source_frontier(snapshot, &definition.table);
-    let checkpoint = checkpoint::latest(tree, through).await?;
     if checkpoint.is_none() && through >= 0 {
         return Ok(None);
     }
@@ -353,7 +363,7 @@ fn incomplete_source() -> Anomaly {
     format_error("Ordered index inputs do not cover the captured table rows")
 }
 
-fn source_frontier(snapshot: &Snapshot, table: &TableRef) -> i64 {
+pub(super) fn source_frontier(snapshot: &Snapshot, table: &TableRef) -> i64 {
     snapshot.trie_catalog().l0_max_block_index(table).0
 }
 
