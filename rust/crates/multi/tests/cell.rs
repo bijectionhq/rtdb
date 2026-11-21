@@ -499,6 +499,9 @@ async fn restoring_the_current_archive_preserves_the_ordered_tail_and_authority(
     let operation = uuid::Uuid::new_v4();
     let storage = cell.storage();
     let capture = rtdb_multi::archive::capture(cell.directory.clone(), &storage, &archive, &cell.keys(), id, operation, None).await.unwrap();
+    let accepted = cell.directory.deployment(&id.to_string()).await.unwrap().unwrap();
+    let manifest = capture.manifest_sha256().unwrap();
+    assert_eq!(accepted.checkpoint_captures[&operation].manifest_sha256.as_deref(), Some(manifest.as_str()));
     let successor_operation = uuid::Uuid::new_v4();
     rtdb_multi::archive::capture(cell.directory.clone(), &storage, &archive, &cell.keys(), id, successor_operation, None).await.unwrap();
     let object = capture.objects.iter().find(|object| object.name.ends_with(".arrow")).unwrap();

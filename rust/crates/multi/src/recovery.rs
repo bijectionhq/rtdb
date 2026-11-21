@@ -111,21 +111,29 @@ impl RecoveryService {
         }
         match request.action {
             Action::CaptureCheckpoint => {
-                let capture = archive::capture(
-                    directory,
-                    &self.storage,
-                    &self.archive,
-                    self.keys.as_ref(),
-                    request.authority,
-                    request.capture,
-                    self.hosted_task.clone(),
-                )
-                .await?;
-                let manifest_sha256 = capture.manifest_sha256()?;
+                let retained = archive::capture_receipt(
+                    &installation, &self.archive, request.authority, request.capture,
+                )?;
+                let (point, manifest_sha256) = match retained {
+                    Some(receipt) => receipt,
+                    None => {
+                        let capture = archive::capture(
+                            directory,
+                            &self.storage,
+                            &self.archive,
+                            self.keys.as_ref(),
+                            request.authority,
+                            request.capture,
+                            self.hosted_task.clone(),
+                        ).await?;
+                        let digest = capture.manifest_sha256()?;
+                        (capture.point, digest)
+                    }
+                };
                 Ok(Reply::Captured {
                     name: installation.name,
                     authority: request.authority,
-                    point: capture.point,
+                    point,
                     manifest_sha256,
                 })
             }

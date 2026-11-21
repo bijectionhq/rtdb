@@ -150,8 +150,10 @@ tries as ciphertext to the independent archive. The receipt fixes the
 location, length and digest of each object. Retrying the operation recovers
 the same checkpoint and destination. The directory registers both and the
 capture's storage region before the first archive write. An archive binds
-its media witness before payload can be copied. The key vault stays outside
-the capture.
+its media witness before payload can be copied. The original directory
+accepts the verified manifest digest before the capture releases its region.
+A hosted retry recovers that receipt from the original cell. The key vault
+stays outside the capture.
 
 The recovery owner calls `rtdb-multi schedule-recovery-disposal --id UUID`
 after the installation's serving receipt exists and recovery holds end.

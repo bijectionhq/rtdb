@@ -433,6 +433,25 @@ fn capture_point(record: &DeploymentRecord, deployment: Uuid, operation: Uuid, a
     })
 }
 
+pub(crate) fn capture_receipt(
+    record: &DeploymentRecord,
+    archive: &CellStorage,
+    deployment: Uuid,
+    operation: Uuid,
+) -> Result<Option<(CapturePoint, String)>> {
+    let Some(registered) = record.checkpoint_captures.get(&operation) else {
+        return Ok(None);
+    };
+    let point = capture_point(record, deployment, operation, &archive_binding(archive)?)?;
+    let Some(manifest) = &registered.manifest_sha256 else {
+        return Ok(None);
+    };
+    if !registered.media_bound {
+        return Err(inconsistent("The capture receipt has no archive media binding"));
+    }
+    Ok(Some((point, manifest.clone())))
+}
+
 fn archive_witness(deployment: Uuid, operation: Uuid) -> Result<ObjectKey> {
     key(&format!("checkpoint-authorities/{deployment}/{operation}.json")).map_err(Into::into)
 }
@@ -548,6 +567,7 @@ pub async fn capture(
                 log_epoch: record.log_epoch,
                 checkpoint,
                 media_bound: false,
+                manifest_sha256: None,
                 remote_disposal: None,
             });
         }
@@ -575,7 +595,31 @@ pub async fn capture(
     };
     let result = async {
         let point = capture_point(&record, deployment, operation, &binding)?;
-        capture_registered(directory.as_ref(), storage, destination, keys, &record, point, io.clone()).await
+        let capture = capture_registered(
+            directory.as_ref(), storage, destination, keys, &record, point, io.clone(),
+        ).await?;
+        let manifest = capture.manifest_sha256()?;
+        update_installation(directory.as_ref(), &id, |current| {
+            if !same_incarnation(current, &capture.point)
+                || !current.storage_regions.contains_key(&region)
+                || current.archive_retirement.is_some()
+                || capture_point(current, deployment, operation, &binding)? != capture.point
+            {
+                return Err(inconsistent("The capture lost its original storage admission"));
+            }
+            let bound = current.checkpoint_captures.get_mut(&operation)
+                .filter(|registered| registered.media_bound)
+                .ok_or_else(|| inconsistent("The capture has no archive media binding"))?;
+            match &bound.manifest_sha256 {
+                Some(prior) if prior == &manifest => Ok(()),
+                Some(_) => Err(inconsistent("The original capture has another manifest")),
+                None => {
+                    bound.manifest_sha256 = Some(manifest.clone());
+                    Ok(())
+                }
+            }
+        }).await?;
+        Ok(capture)
     }.await;
     io.close_and_wait().await;
     drop(io);
@@ -751,6 +795,12 @@ pub(crate) async fn restore_checkpoint(
     if let Some(receipt) = read_receipt(&current)? {
         return Ok(receipt);
     }
+    let (point, manifest_sha256) = capture_receipt(&current, archive, deployment, operation)?
+        .ok_or_else(|| unavailable("The checkpoint capture has no retained manifest receipt"))?;
+    require_manifest(&manifest_sha256)?;
+    if !same_incarnation(&current, &point) || current.checkpoint != Some(point.checkpoint) {
+        return Err(inconsistent("The archive is not the current durable checkpoint"));
+    }
     let region = IoRegion::new();
     let archive_bucket = archive.bucket(region.clone()).await?;
     let prefix = format!("checkpoint-captures/{deployment}/{operation}");
@@ -758,19 +808,11 @@ pub(crate) async fn restore_checkpoint(
     let capture = read::<Capture>(&metadata, &key("capture.json")?)
         .await?
         .ok_or_else(|| unavailable("The checkpoint capture is incomplete"))?;
-    let manifest_sha256 = capture.manifest_sha256()?;
-    require_manifest(&manifest_sha256)?;
-    let point = capture.point.clone();
     let intent = read::<CapturePoint>(&metadata, &key("intent.json")?).await?;
-    if intent.as_ref() != Some(&point)
-        || point != capture_point(&current, deployment, operation, &archive_binding)?
+    if intent.as_ref() != Some(&point) || capture.point != point
+        || capture.manifest_sha256()? != manifest_sha256
     {
-        return Err(inconsistent("The archive belongs to another capture"));
-    }
-    if !same_incarnation(&current, &point) || current.checkpoint != Some(point.checkpoint) {
-        return Err(inconsistent(
-            "The archive is not the current durable checkpoint",
-        ));
+        return Err(inconsistent("The archive differs from its retained manifest receipt"));
     }
     let material = keys
         .existing_key(&current.key_id())
@@ -785,7 +827,8 @@ pub(crate) async fn restore_checkpoint(
         if !same_incarnation(record, &point)
             || record.checkpoint != Some(point.checkpoint)
             || record.move_from.is_some()
-            || capture_point(record, deployment, operation, &archive_binding)? != point
+            || capture_receipt(record, archive, deployment, operation)?
+                != Some((point.clone(), manifest_sha256.clone()))
         {
             return Err(inconsistent("The installation changed before restore"));
         }
@@ -1152,6 +1195,7 @@ mod tests {
                     system_time: 100,
                 },
                 media_bound: true,
+                manifest_sha256: None,
                 remote_disposal: None,
             },
         );

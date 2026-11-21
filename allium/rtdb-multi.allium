@@ -1744,11 +1744,14 @@ rule HostedCheckpointCapture {
 
     requires: ConfiguredOrganizationOwns(authority, name)
               and RootInstallation(authority)
-              and CaptureEligible(authority)
+              and CaptureEligibleOrCompleted(authority, capture_id)
 
     ensures:
-        RegisterAndVerifyCheckpointArchive(authority, capture_id, ConfiguredArchive)
-        ReturnExactCheckpointAndManifestDigest(authority, capture_id)
+        if RetainedCaptureReceipt(authority, capture_id, ConfiguredArchive):
+            ReturnOriginalCaptureReceipt(authority, capture_id)
+        else:
+            RegisterAndVerifyCheckpointArchive(authority, capture_id, ConfiguredArchive)
+            RetainAndReturnExactCheckpointAndManifestDigest(authority, capture_id)
 }
 
 rule HostedCheckpointRecovery {

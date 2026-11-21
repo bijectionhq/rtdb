@@ -248,6 +248,8 @@ pub struct CheckpointCapture {
     pub checkpoint: Checkpoint,
     /// Payload copying starts only after the archive's witness becomes durable.
     pub media_bound: bool,
+    /// The immutable manifest accepted after verifying the complete archive.
+    pub manifest_sha256: Option<String>,
     /// The bound archive provider confirmed no remaining versions or uploads.
     pub remote_disposal: Option<[u8; 32]>,
 }
