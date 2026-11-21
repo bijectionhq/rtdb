@@ -6,8 +6,15 @@ use rtdb_format::{catalog::{BlockCatalog, TableBlock}, keys::TrieKey};
 use rtdb_trie::TrieConfig;
 use rtdb_types::{Anomaly, BlockIndex, Result, TableRef, Timestamp};
 
-use crate::{CatalogTrie, LiveIndex, Snapshot, StagedWrite, TableCatalog, TableMeta, TrieCatalog, TrieState};
+use crate::{CatalogCut, CatalogTrie, LiveIndex, Snapshot, StagedWrite, TableCatalog, TableMeta, TrieCatalog, TrieState};
 use crate::reader_retention::any_reference_requires;
+
+#[derive(Clone, Copy, Debug)]
+enum CatalogPublication {
+    Untracked,
+    Installed(CatalogCut),
+    Suspended,
+}
 
 #[derive(Clone, Debug)]
 pub struct PartitionValue {
@@ -16,6 +23,7 @@ pub struct PartitionValue {
     table_catalog: Arc<TableCatalog>,
     live: Arc<LiveIndex>,
     live_snapshot: Option<Arc<LiveIndex>>,
+    catalog_publication: CatalogPublication,
 }
 
 impl PartitionValue {
@@ -24,12 +32,20 @@ impl PartitionValue {
         let latest_completed_tx = table_catalog.block().and_then(BlockCatalog::latest_completed_tx);
         let checkpoint_tries = table_catalog.block_index().map(|_| Arc::new(CheckpointTries::capture(&trie_catalog)));
         Ok(Self { trie_catalog: Arc::new(trie_catalog), checkpoint_tries, table_catalog: Arc::new(table_catalog),
-            live: Arc::new(LiveIndex::new(block_index, latest_completed_tx, config)), live_snapshot: None })
+            live: Arc::new(LiveIndex::new(block_index, latest_completed_tx, config)), live_snapshot: None, catalog_publication: CatalogPublication::Untracked })
     }
     pub fn trie_catalog(&self) -> &Arc<TrieCatalog> { &self.trie_catalog }
     pub fn table_catalog(&self) -> &Arc<TableCatalog> { &self.table_catalog }
     pub fn live(&self) -> &Arc<LiveIndex> { &self.live }
-    pub fn snapshot(&self) -> Snapshot { Snapshot::new(Arc::clone(&self.trie_catalog), Arc::clone(&self.table_catalog), Arc::clone(&self.live)) }
+    pub fn snapshot(&self) -> Snapshot { self.snapshot_with_live(&self.live) }
+
+    fn snapshot_with_live(&self, live: &Arc<LiveIndex>) -> Snapshot {
+        let cut = match self.catalog_publication {
+            CatalogPublication::Installed(cut) => Some(cut),
+            CatalogPublication::Untracked | CatalogPublication::Suspended => None,
+        };
+        Snapshot::new(Arc::clone(&self.trie_catalog), Arc::clone(&self.table_catalog), Arc::clone(live)).with_catalog_cut(cut)
+    }
 }
 
 #[derive(Debug)]
@@ -142,6 +158,28 @@ impl PartitionState {
         value.snapshot()
     }
 
+    /// Publishes a prefix after the replica driver has finished installing it.
+    /// The unversioned reset suspends publication for this open partition.
+    pub fn publish_catalog_cut(&self, cut: CatalogCut) -> Result<()> {
+        let mut value = self.value.write();
+        match value.catalog_publication {
+            CatalogPublication::Suspended => return Ok(()),
+            CatalogPublication::Installed(previous) => {
+                if cut.storage_version != previous.storage_version || cut.storage_epoch != previous.storage_epoch
+                    || cut.replica_epoch != previous.replica_epoch || cut.through < previous.through
+                {
+                    return Err(invalid("Installed catalog prefix changed history or moved backwards"));
+                }
+                if cut == previous { return Ok(()); }
+            }
+            CatalogPublication::Untracked => {}
+        }
+        let mut next = value.as_ref().clone();
+        next.catalog_publication = CatalogPublication::Installed(cut);
+        *value = Arc::new(next);
+        Ok(())
+    }
+
     /// The caller's basis barrier runs before this capture; this passive object never waits for log progress.
     pub fn open_snapshot(&self, min_system_time: Option<Timestamp>) -> Snapshot {
         let fresh = |live: &LiveIndex| min_system_time.is_none_or(|minimum| live.latest_completed_tx().is_some_and(|basis| basis.system_time >= minimum));
@@ -150,14 +188,14 @@ impl PartitionState {
             if let Some(live) = &value.live_snapshot {
                 if fresh(live) {
                     self.retain_catalog(&value);
-                    return Snapshot::new(Arc::clone(&value.trie_catalog), Arc::clone(&value.table_catalog), Arc::clone(live));
+                    return value.snapshot_with_live(live);
                 }
             }
         }
         let mut value = self.value.write();
         self.retain_catalog(&value);
         if let Some(live) = &value.live_snapshot {
-            if fresh(live) { return Snapshot::new(Arc::clone(&value.trie_catalog), Arc::clone(&value.table_catalog), Arc::clone(live)); }
+            if fresh(live) { return value.snapshot_with_live(live); }
         }
         let mut next = value.as_ref().clone();
         next.live_snapshot = Some(Arc::clone(&next.live));
@@ -217,6 +255,7 @@ impl PartitionState {
         }
         let mut next = value.as_ref().clone();
         next.trie_catalog = Arc::new(value.trie_catalog.reset_to_l0(replacements)?);
+        next.catalog_publication = CatalogPublication::Suspended;
         *value = Arc::new(next);
         Ok(())
     }
@@ -245,7 +284,8 @@ impl PartitionState {
         }
         let live = value.live.next_block()?;
         *value = Arc::new(PartitionValue { trie_catalog: Arc::new(trie_catalog), checkpoint_tries,
-            table_catalog: Arc::new(table_catalog), live: Arc::new(live), live_snapshot: None });
+            table_catalog: Arc::new(table_catalog), live: Arc::new(live), live_snapshot: None,
+            catalog_publication: value.catalog_publication });
         Ok(())
     }
 }

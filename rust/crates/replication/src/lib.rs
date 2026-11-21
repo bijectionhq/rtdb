@@ -2,6 +2,7 @@ mod admission;
 mod admission_step;
 mod appender;
 mod blocks;
+mod catalog_cut;
 mod checkpoint_discovery;
 mod replay_floor;
 mod driver;

@@ -152,10 +152,16 @@ async fn two_databases_share_a_slot_until_cancelled_uploads_finish() {
     let mut completion = Box::pin(second_handle.compact_all());
     assert!(futures::poll!(completion.as_mut()).is_pending());
     assert!(futures::poll!(second_run.as_mut()).is_pending());
-    assert_eq!(completion.await.unwrap_err(), denied());
+    let (run, outcome) = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        tokio::join!(second_run, async {
+            let outcome = completion.await;
+            second_cancel.cancel();
+            outcome
+        })
+    }).await.unwrap();
+    run.unwrap();
+    assert_eq!(outcome.unwrap_err(), denied());
     assert_eq!(second.calls.load(Ordering::SeqCst), 1);
-    second_cancel.cancel();
-    second_run.await.unwrap();
     assert_eq!(slots.available_permits(), 1);
 }
 
