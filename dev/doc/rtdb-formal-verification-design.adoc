@@ -1004,11 +1004,13 @@ For the local authorization already granted to the verification effort, the exis
 [source,sh]
 ----
 BIJECTION_LOCAL_EXECUTION=owner-authorized VERUS_Z3_PATH=/path/to/z3 \
+  DOTNET_ROOT=/path/to/dotnet8 \
   python3 verification/run.py \
   --lean /path/to/lean --verus /path/to/verus \
   --java /path/to/java --tlc /path/to/tla2tools.jar --alloy /path/to/alloy.jar \
   --apalache /path/to/apalache-mc --maude /path/to/maude \
   --mcrl2-bin /path/to/mCRL2.app/Contents/bin \
+  --autohyper /path/to/AutoHyper \
   --rust-boundary --native-replay \
   --evidence /path/to/new-evidence-directory
 ----
@@ -1057,6 +1059,7 @@ A durable-node test verifies current and system-history SQL results before, duri
 Production discovery now advances to a newer advertised root when collection removes the selected root or a table block during startup.
 Native runs verify both cases using the block collector, and Verus checks the strict progress decision.
 mCRL2 checks the observable results of the staged discovery model against the atomic contract for three reported indices.
+AutoHyper checks that startup with one transient collection interruption agrees with direct startup on the eventually admitted block when both observe the same stable replacement.
 TLC and Apalache check two overlapping checkpoint generations, one recovery reference, protected objects, and its required log suffix under delayed collection.
 Lean checks the pending historical promotion reconstructed from a checkpoint. Verus checks the exact four-member guard in the tiered catalog.
 |Generalize recovery from decoded metadata to the full trie dependency closure and a usable log suffix while compaction and collection are active.

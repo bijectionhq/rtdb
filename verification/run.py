@@ -734,6 +734,39 @@ def verify_mcrl2(args, scratch):
         print(f"{case}: {'equivalent to the checkpoint contract' if name == 'baseline' else 'negative control distinguished'}")
 
 
+def verify_hyperltl(args, scratch):
+    model = Path("verification/hyperltl/CheckpointRecovery.smv")
+    property_path = Path("verification/hyperltl/CheckpointRecovery.hltl")
+    reachable = Path("verification/hyperltl/CheckpointRecoveryReachable.hltl")
+    cases = (
+        ("baseline", property_path, None, "SAT", False),
+        ("reachable", reachable, None, "SAT", True),
+        ("fail-fast", property_path, (
+            "phase = refresh                                               : read_root;",
+            "phase = refresh                                               : failed;",
+        ), "UNSAT", True),
+        ("stale-refresh", property_path, (
+            "phase = refresh               : stable_head;",
+            "phase = refresh               : candidate;",
+        ), "UNSAT", True),
+    )
+    for name, law, mutation, expected, needs_witness in cases:
+        case = f"hyperltl-checkpoint-{name}"
+        directory = scratch / case
+        source = clone_file(model, directory)
+        formula = clone_file(law, directory)
+        if mutation:
+            replace_once(source, *mutation)
+        checked = run_case([args.autohyper, "--nusmv", "--witness", str(source), str(formula)],
+                           directory, args.evidence, case)
+        verdicts = [line for line in checked.stdout.splitlines() if line in {"SAT", "UNSAT"}]
+        if checked.returncode or verdicts != [expected]:
+            raise ValueError(f"{case}: expected {expected}, observed {verdicts}")
+        if needs_witness and not all(marker in checked.stdout for marker in ("Witnesses", "\nA: ", "\nB: ")):
+            raise ValueError(f"{case}: no two-run witness")
+        print(f"{case}: {expected}")
+
+
 def capture_production(source):
     source.mkdir()
     subprocess.run(["git", "diff", "--exit-code", "HEAD", "--", "rust"], cwd=ROOT, check=True)
@@ -999,6 +1032,7 @@ def main():
     parser.add_argument("--apalache", required=True)
     parser.add_argument("--maude", required=True)
     parser.add_argument("--mcrl2-bin", type=Path)
+    parser.add_argument("--autohyper")
     parser.add_argument("--rust-boundary", action="store_true")
     parser.add_argument("--native-replay", action="store_true")
     parser.add_argument("--evidence", required=True, type=Path)
@@ -1011,6 +1045,21 @@ def main():
                       ("lean", "verus", "z3", "java", "tlc", "alloy", "apalache", "maude")}
     if args.mcrl2_bin:
         supplied_tools.update({name: args.mcrl2_bin / name for name in ("mcrl22lps", "lps2lts", "ltscompare")})
+    if args.autohyper:
+        app = Path(shutil.which(args.autohyper) or args.autohyper).resolve()
+        paths = app.with_name("paths.json")
+        paths_config = json.loads(paths.read_text())
+        supplied_tools.update({
+            "autohyper": app,
+            "autohyper_config": paths,
+            "autohyper_dll": app.with_name("AutoHyper.dll"),
+            "autohyper_omega_dll": app.with_name("FsOmegaLib.dll"),
+            "autohyper_system_dll": app.with_name("TransitionSystemLib.dll"),
+            "autfilt": paths_config["autfilt"],
+            "ltl2tgba": paths_config["ltl2tgba"],
+        })
+        if dotnet_root := os.environ.get("DOTNET_ROOT"):
+            supplied_tools["dotnet"] = Path(dotnet_root) / "dotnet"
     tools = {}
     for name, supplied in supplied_tools.items():
         executable = Path(shutil.which(supplied) or supplied).resolve()
@@ -1025,7 +1074,7 @@ def main():
     }, indent=2) + "\n")
     source_paths = [
         path for path in (ROOT / "verification").rglob("*")
-        if path.is_file() and path.suffix in {".lean", ".tla", ".cfg", ".als", ".maude", ".mcrl2", ".py", ".rs", ".json", ".tsv", ".smt2"}
+        if path.is_file() and path.suffix in {".lean", ".tla", ".cfg", ".als", ".maude", ".mcrl2", ".hltl", ".smv", ".py", ".rs", ".json", ".tsv", ".smt2"}
     ]
     source_paths.extend(ROOT / path for path in (
         "rust/crates/text/src/lib.rs",
@@ -1073,6 +1122,8 @@ def main():
         verify_maude(args, directory)
         if args.mcrl2_bin:
             verify_mcrl2(args, directory)
+        if args.autohyper:
+            verify_hyperltl(args, directory)
         if args.rust_boundary or args.native_replay:
             source = directory / "production"
             capture_production(source)

@@ -1,0 +1,4 @@
+exists A. exists B.
+  ({"stable_head"_A = "stable_head"_B} &
+    F ({"admitted"_A} & !{"admitted"_B}) &
+    F ({"admitted"_A} & {"admitted"_B} & {"candidate"_A = "candidate"_B}))

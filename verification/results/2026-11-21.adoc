@@ -654,3 +654,16 @@ The native replay covered seven checkpoint and recovery cases with their root-fi
 The input manifest SHA-256 is `ae1040a40927f1f8cb2bb6dfcd1c89c95b1ae217a46cd29662e3e681e02da083`.
 A separate run on the same revision passed 111 tests in the node and replication packages with
 `BIJECTION_LOCAL_EXECUTION=owner-authorized cargo test --manifest-path rust/Cargo.toml --locked -p rtdb-node --test native -p rtdb-replication --lib`.
+
+== Two-run agreement on a stable recovery checkpoint
+
+AutoHyper with Spot checked link:../hyperltl/CheckpointRecovery.hltl[the universal pair property] over link:../hyperltl/CheckpointRecovery.smv[the finite startup model].
+The two public stable head choices each permit three startup paths.
+A direct startup reads the stable head, while the other paths start with an older listed block and encounter one missing root or table block.
+The refresh returns the stable head and its metadata is readable.
+
+Every pair whose stable head agrees eventually admits the same candidate in both runs.
+The separately checked reachability formula produces a pair in which one run is admitted first and both later agree.
+AutoHyper produced distinct lasso witnesses when fail-fast recovery stops and when a refresh keeps the failed candidate.
+This establishes the two-run property for the modeled stable listing and completed read steps.
+It leaves completion time, continuing provider failures, and the replica-log suffix outside the observation.
