@@ -153,3 +153,8 @@ Lean and the production Rust temporal resolver agreed on 4,096 generated point o
 The retained seed includes alternate admission horizons, valid interval endpoints, multiple entities and same-batch put, delete and erase.
 The mathematical BM25 term fraction increases with a greater frequency and lower normalization term under the ordered arithmetic premises.
 The concrete floating-point window implementation still needs a rounding and frontier proof.
+
+The combined local runner passed from `5076d2cd1` with both Rust options enabled.
+The native package run passed 532 tests across query, search, temporal, replication, storage and maintenance, with one ignored benchmark.
+The native node search suite passed all 17 tests.
+The retention protocol and provider refinement remain open.
