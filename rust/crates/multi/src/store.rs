@@ -400,9 +400,14 @@ pub(crate) async fn reconcile_storage_regions(
     }
     for (&region, state) in &record.storage_regions {
         match state {
-            StorageRegion::Local { .. } if matches!(storage, CellStorage::Local { .. }) && keys.local_storage_region_drained(region)? => {
+            StorageRegion::Local { .. } | StorageRegion::ReplicaReplay { custody: rtdb_directory::ReplayCustody::Local, .. }
+                if matches!(storage, CellStorage::Local { .. }) && keys.local_storage_region_drained(region)? => {
                 release_region(directory, &record.id, region, false).await?;
                 keys.forget_local_storage_region(region)?;
+            }
+            StorageRegion::ReplicaReplay { custody: rtdb_directory::ReplayCustody::Hosted { owner: Some(owner) }, .. }
+                if directory.hosted_task_stopped(owner).await? => {
+                release_region(directory, &record.id, region, false).await?;
             }
             StorageRegion::Remote { archive, owner, publications, closed, .. } => {
                 if !*closed {
@@ -838,7 +843,7 @@ pub async fn run_reaper(
                     if let Some(keys) = keys.as_deref() {
                         for record in &deployments {
                             if record.ordered_indexes.is_empty() && record.ordered_index_catalogs.is_empty()
-                                && !record.storage_regions.values().any(|region| matches!(region, StorageRegion::Remote { .. }))
+                                && !record.storage_regions.values().any(|region| matches!(region, StorageRegion::Remote { .. } | StorageRegion::ReplicaReplay { .. }))
                             {
                                 continue;
                             }

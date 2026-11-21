@@ -22,7 +22,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::cipher::{Cipher, SEALED_OVERHEAD};
 use crate::deployment::LogkeeperLogConfig;
-use crate::keys::KeyService;
+use crate::recovery_holds::{RecoveryAdmission, RecoveryHolds, ReplayHold};
 
 /// How many already-resolved intake records stay retained behind the holder's read position.
 const INTAKE_RETAINED_BEHIND: i64 = 1024;
@@ -38,10 +38,18 @@ pub trait EnsembleRecorder: Send + Sync {
     async fn record(&self, deployment: &str, epoch: u64, ensemble: Vec<rtdb_directory::MemberId>) -> Result<()>;
 }
 
-pub struct LogkeeperLogFactory { pub maximum_message_bytes: usize, pub keys: Arc<dyn KeyService>, pub writers: Writers, pub recorder: Arc<dyn EnsembleRecorder> }
+pub(crate) struct LogkeeperLogFactory {
+    maximum_message_bytes: usize,
+    writers: Writers,
+    recorder: DirectoryRecorder,
+    holds: Arc<RecoveryHolds>,
+}
 
 impl LogkeeperLogFactory {
-    pub fn new(maximum_message_bytes: usize, keys: Arc<dyn KeyService>, writers: Writers, recorder: Arc<dyn EnsembleRecorder>) -> Arc<Self> { Arc::new(Self { maximum_message_bytes, keys, writers, recorder }) }
+    pub fn new(maximum_message_bytes: usize, writers: Writers, holds: Arc<RecoveryHolds>) -> Arc<Self> {
+        let recorder = DirectoryRecorder { directory: Arc::clone(&holds.directory) };
+        Arc::new(Self { maximum_message_bytes, writers, recorder, holds })
+    }
 }
 
 pub struct DirectoryRecorder { pub directory: Arc<dyn rtdb_directory::Directory> }
@@ -108,7 +116,7 @@ impl LogFactory for LogkeeperLogFactory {
         let stream = StreamConfig { servers: config.servers.clone(), stream: config.replica_stream.clone(), write_quorum: config.write_quorum, maximum_message_bytes: self.maximum_message_bytes };
         let (quorum, key): (Arc<dyn Log>, _) = match access {
             LogAccess::ReadWrite => {
-                let key = self.keys.require_existing(&config.key_id).await?;
+                let key = self.holds.keys.require_existing(&config.key_id).await?;
                 // An interrupted copy can leave records even if the new
                 // ensemble never becomes the reported serving ensemble.
                 self.recorder.record_journals(&config.deployment, config.epoch, &stream.servers).await?;
@@ -126,17 +134,13 @@ impl LogFactory for LogkeeperLogFactory {
                 (writer, key)
             }
             LogAccess::ReadOnly => {
-                let key = self.keys.require_existing(&config.key_id).await?;
+                let key = self.holds.keys.require_existing(&config.key_id).await?;
                 (rtdb_logkeeper::open_reader(stream, cancellation.clone()).await?, key)
             }
             LogAccess::SourceWriter => return Err(Anomaly::unsupported("rtdb.multi/source-writer",
                 "A deployment has one writer, its holder; submissions reach it through the gateway")),
         };
-        let replica: Arc<dyn Log> = Arc::new(SealedLog::new(
-            quorum,
-            &key,
-            &config.replica_seal_scope,
-        )?);
+        let replica: Arc<dyn Log> = Arc::new(SealedLog::for_serving(quorum, &key, &config, Arc::clone(&self.holds))?);
         let next = next_source_offset(replica.as_ref(), epoch).await?;
         let intake = Arc::new(IntakeLog { log: MemoryLog::starting_at(self.maximum_message_bytes, LogOffset(next)), consumed: Arc::new(AtomicI64::new(next - 1)), start: next });
         let trimming = {
@@ -241,10 +245,23 @@ pub fn renumber_into(tail: &mut [ReplicaEnvelope], epoch: StorageEpoch) -> Resul
 }
 
 /// A log whose payloads are sealed under the deployment's key, so a logkeeper never holds a row in the clear.
-pub struct SealedLog { inner: Arc<dyn Log>, cipher: Arc<Cipher>, stream: Arc<str> }
+pub struct SealedLog {
+    inner: Arc<dyn Log>,
+    cipher: Arc<Cipher>,
+    stream: Arc<str>,
+    recovery: Option<RecoveryAdmission>,
+}
 
 impl SealedLog {
-    pub fn new(inner: Arc<dyn Log>, key: &[u8], stream: &str) -> Result<Self> { Ok(Self { inner, cipher: Arc::new(Cipher::new(key)?), stream: Arc::from(stream) }) }
+    pub fn new(inner: Arc<dyn Log>, key: &[u8], stream: &str) -> Result<Self> {
+        Ok(Self { inner, cipher: Arc::new(Cipher::new(key)?), stream: Arc::from(stream), recovery: None })
+    }
+
+    fn for_serving(inner: Arc<dyn Log>, key: &[u8], config: &LogkeeperLogConfig, holds: Arc<RecoveryHolds>) -> Result<Self> {
+        let mut log = Self::new(inner, key, &config.replica_seal_scope)?;
+        log.recovery = Some(RecoveryAdmission::new(holds, config));
+        Ok(log)
+    }
 }
 
 fn opened(cipher: &Cipher, stream: &str, record: LogRecord) -> rtdb_storage::Result<LogRecord> {
@@ -259,12 +276,19 @@ impl Log for SealedLog {
     fn latest(&self) -> rtdb_storage::Result<LogOffset> { self.inner.latest() }
     async fn retained_floor(&self) -> rtdb_storage::Result<Option<LogOffset>> { self.inner.retained_floor().await }
     async fn recovery_tail(&self, after: LogOffset) -> rtdb_storage::Result<Option<Box<dyn LogTail>>> {
-        Ok(self.inner.recovery_tail(after).await?.map(|inner| {
-            Box::new(SealedTail { inner, cipher: Arc::clone(&self.cipher), stream: Arc::clone(&self.stream) }) as Box<dyn LogTail>
-        }))
+        let hold = match &self.recovery {
+            Some(recovery) => Some(recovery.hold(after).await?),
+            None => None,
+        };
+        let Some(inner) = self.inner.recovery_tail(after).await? else { return Ok(None); };
+        let hold = if let Some(hold) = hold {
+            let through = self.inner.latest()?;
+            (after < through).then_some((through, hold))
+        } else { None };
+        Ok(Some(Box::new(SealedTail { inner, cipher: Arc::clone(&self.cipher), stream: Arc::clone(&self.stream), hold })))
     }
     async fn tail(&self, after: LogOffset) -> rtdb_storage::Result<Box<dyn LogTail>> {
-        Ok(Box::new(SealedTail { inner: self.inner.tail(after).await?, cipher: Arc::clone(&self.cipher), stream: Arc::clone(&self.stream) }))
+        Ok(Box::new(SealedTail { inner: self.inner.tail(after).await?, cipher: Arc::clone(&self.cipher), stream: Arc::clone(&self.stream), hold: None }))
     }
     async fn range(&self, from: LogOffset, to: LogOffset) -> rtdb_storage::Result<Box<dyn LogRange>> {
         Ok(Box::new(SealedRange { inner: self.inner.range(from, to).await?, cipher: Arc::clone(&self.cipher), stream: Arc::clone(&self.stream) }))
@@ -274,12 +298,28 @@ impl Log for SealedLog {
     }
 }
 
-struct SealedTail { inner: Box<dyn LogTail>, cipher: Arc<Cipher>, stream: Arc<str> }
+struct SealedTail {
+    inner: Box<dyn LogTail>,
+    cipher: Arc<Cipher>,
+    stream: Arc<str>,
+    hold: Option<(LogOffset, ReplayHold)>,
+}
+
+impl SealedTail {
+    fn delivered(&mut self, offset: LogOffset) {
+        if self.hold.as_ref().is_some_and(|(through, _)| offset >= *through) {
+            self.hold = None;
+        }
+    }
+}
 
 #[async_trait]
 impl LogTail for SealedTail {
     async fn poll(&mut self, timeout: Duration) -> rtdb_storage::Result<Vec<LogRecord>> {
-        self.inner.poll(timeout).await?.into_iter().map(|record| opened(&self.cipher, &self.stream, record)).collect()
+        let records = self.inner.poll(timeout).await?.into_iter().map(|record| opened(&self.cipher, &self.stream, record))
+            .collect::<rtdb_storage::Result<Vec<_>>>()?;
+        if let Some(last) = records.last() { self.delivered(last.metadata.offset); }
+        Ok(records)
     }
     fn replay(&mut self) -> Option<&mut dyn LogReplayTail> { if self.inner.replay().is_some() { Some(self) } else { None } }
 }
@@ -293,7 +333,9 @@ impl LogReplayTail for SealedTail {
     async fn read_head(&mut self, head: ReplayHead, reservation: ReadReservation) -> rtdb_storage::Result<LogRecord> {
         let sealed = ReplayHead { payload_len: head.payload_len + SEALED_OVERHEAD, ..head };
         let record = self.inner.replay().expect("checked when replay was offered").read_head(sealed, reservation).await?;
-        opened(&self.cipher, &self.stream, record)
+        let record = opened(&self.cipher, &self.stream, record)?;
+        self.delivered(record.metadata.offset);
+        Ok(record)
     }
 }
 
@@ -361,6 +403,7 @@ impl LogReplayTail for IntakeTail {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::keys::KeyService;
     use rtdb_format::log::proto;
     use rtdb_types::Term;
 
@@ -389,7 +432,8 @@ mod tests {
             previous_servers: None,
         };
         let configuration = Any { type_url: String::new(), value: serde_json::to_vec(&configuration).unwrap() };
-        let factory = LogkeeperLogFactory::new(1024, keys.clone(), Default::default(), Arc::new(DirectoryRecorder { directory: directory.clone() }));
+        let holds = Arc::new(RecoveryHolds { directory: directory.clone(), keys: keys.clone(), custody: rtdb_directory::ReplayCustody::Local, tasks: Default::default() });
+        let factory = LogkeeperLogFactory::new(1024, Default::default(), holds);
 
         for access in [LogAccess::ReadOnly, LogAccess::ReadWrite] {
             let refused = factory.open(&configuration, access, CancellationToken::new()).await.err().unwrap();
@@ -397,6 +441,45 @@ mod tests {
             assert!(directory.deployment(&record.id).await.unwrap().unwrap().replica_journals.is_empty());
             assert!(keys.existing_key(&record.key_id()).await.unwrap().is_none());
         }
+    }
+
+    #[tokio::test]
+    async fn recovery_keeps_a_hold_until_delivery_and_refuses_an_authorized_trim() {
+        use rtdb_directory::{Cas, DeploymentRecord, Directory, MemoryDirectory, ReplayCustody, ReplicaTrim, StorageRegion};
+        use rtdb_storage::Error;
+
+        let directory = MemoryDirectory::new();
+        let record = directory.create_deployment(DeploymentRecord::new("shop", "acme", vec![], 0)).await.unwrap();
+        let config = LogkeeperLogConfig {
+            servers: vec![], deployment: record.id.clone(), key_id: record.key_id(),
+            replica_stream: record.stream("replica"), replica_seal_scope: record.replica_seal_scope(),
+            epoch: record.epoch, log_epoch: record.log_epoch, ensemble: vec![], frozen_at: None,
+            previous_servers: None, write_quorum: 1,
+        };
+        let files = tempfile::tempdir().unwrap();
+        let holds = Arc::new(RecoveryHolds {
+            directory: directory.clone(), keys: Arc::new(crate::keys::LocalKeyService::new(files.path()).unwrap()),
+            custody: ReplayCustody::Local, tasks: Default::default(),
+        });
+        let replica = SealedLog::for_serving(Arc::new(MemoryLog::new(1024)), &[7; 32], &config, holds.clone()).unwrap();
+        for _ in 0..4 {
+            replica.enqueue(Bytes::from_static(b"entry"), Timestamp(0)).await.unwrap().durable().await.unwrap();
+        }
+        let mut tail = replica.recovery_tail(LogOffset(1)).await.unwrap().unwrap();
+        let protected = directory.deployment(&record.id).await.unwrap().unwrap();
+        assert!(matches!(protected.storage_regions.values().next(), Some(StorageRegion::ReplicaReplay { first_required: 2, .. })));
+        let records = tail.poll(Duration::ZERO).await.unwrap();
+        assert_eq!(records.last().unwrap().metadata.offset, LogOffset(3));
+        holds.tasks.close();
+        holds.tasks.wait().await;
+
+        let mut released = directory.deployment(&record.id).await.unwrap().unwrap();
+        assert!(released.storage_regions.is_empty());
+        let version = released.version;
+        released.replica_trim = Some(ReplicaTrim { stream: config.replica_stream.clone(), log_epoch: config.log_epoch, through: 2 });
+        assert!(matches!(directory.replace_deployment(released, version).await.unwrap(), Cas::Applied(_)));
+        assert!(matches!(replica.recovery_tail(LogOffset(1)).await,
+            Err(Error::UnavailableLogRange { requested: 2, first_retained: 3 })));
     }
 
     async fn append(log: &MemoryLog, message: ReplicaBody) {

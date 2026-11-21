@@ -21,6 +21,7 @@ pub mod logs;
 mod ordered_index_storage;
 pub mod packing;
 pub mod recovery;
+mod recovery_holds;
 pub mod reference;
 pub mod process;
 pub mod relay;

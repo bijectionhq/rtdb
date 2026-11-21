@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use parking_lot::Mutex;
-use rtdb_directory::{Cas, DeploymentRecord, Directory, Lifecycle, MemberId, MemberRecord, MemberState, claim, effective_holder, now_ms, park};
+use rtdb_directory::{Cas, DeploymentRecord, Directory, Lifecycle, MemberId, MemberRecord, MemberState, ReplicaTrim, StorageRegion, claim, effective_holder, now_ms, park};
 use rtdb_node::{Database, Node};
 use rtdb_replication::Role as DriverRole;
 use rtdb_types::{Anomaly, AnomalyCategory, Result};
@@ -119,7 +119,7 @@ pub struct NodeAgent {
     writers: crate::logs::Writers,
     subscriptions: Mutex<BTreeMap<String, LocalSubscription>>,
     /// The lsn each deployment's stream was last trimmed through by this node.
-    trimmed: Mutex<HashMap<String, i64>>,
+    trimmed: Mutex<HashMap<(String, i32), i64>>,
     /// One activation, subscription or park at a time per deployment name.
     turns: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
     /// How many fragments this node has read for other nodes' scans, by deployment, table and prefix.
@@ -469,8 +469,9 @@ impl NodeAgent {
         let Ok(database) = self.node.catalog().database(name) else { return };
         let Some(block) = database.status().adopted_block else { return };
         let Some(position) = block.boundary_replica_position() else { return };
-        let Ok(Some(record)) = self.directory.deployment(id).await else { return };
-        if record.epoch != epoch || record.holder.as_ref() != Some(&self.member()) { return; }
+        let Ok(Some(mut record)) = self.directory.deployment(id).await else { return };
+        if record.epoch != epoch || record.holder.as_ref() != Some(&self.member())
+            || !matches!(record.lifecycle, Lifecycle::Live | Lifecycle::Quarantined) { return; }
 
         let log_epoch = rtdb_types::StorageEpoch(record.log_epoch);
         let boundary = position.after_offset(log_epoch);
@@ -481,14 +482,35 @@ impl NodeAgent {
             let source = block.latest_source_position().map_or(-1, |position| position.after_offset(log_epoch));
             let system_time = block.latest_completed_tx().map_or(i64::MIN, |tx| tx.system_time.0);
             next.checkpoint = Some(rtdb_directory::Checkpoint { block: block_index, boundary, source, system_time });
-            if !matches!(self.directory.replace_deployment(next, record.version).await, Ok(Cas::Applied(_))) { return; }
+            let Ok(Cas::Applied(published)) = self.directory.replace_deployment(next, record.version).await else { return; };
+            record = published;
         }
 
-        if boundary == 0 || self.trimmed.lock().get(id).is_some_and(|trimmed| *trimmed >= boundary - 1) { return; }
+        let Some(checkpoint) = record.checkpoint else { return; };
+        let stream_name = record.stream("replica");
+        let trim_key = (stream_name.clone(), record.log_epoch);
+        let first_retained = record.storage_regions.values().filter_map(|region| match region {
+            StorageRegion::ReplicaReplay { stream, log_epoch, first_required, .. }
+                if stream == &stream_name && *log_epoch == record.log_epoch => Some(*first_required),
+            _ => None,
+        }).fold(boundary.min(checkpoint.boundary), i64::min);
+        if first_retained <= 0 { return; }
+        let through = first_retained - 1;
+        if self.trimmed.lock().get(&trim_key).is_some_and(|trimmed| *trimmed >= through) { return; }
+        if record.replica_trim.as_ref().is_some_and(|trim| {
+            trim.stream == stream_name && trim.log_epoch == record.log_epoch && trim.through > through
+        }) { return; }
+
         let Ok(members) = self.members().await else { return };
         let Ok(servers) = Self::servers(&record, &members) else { return };
-        let stream = rtdb_logkeeper::StreamConfig { write_quorum: crate::deployment::write_quorum(servers.len()), servers, stream: record.stream("replica"), maximum_message_bytes: 4 << 20 };
-        if rtdb_logkeeper::trim(&stream, rtdb_storage::log::LogOffset(boundary - 1)).await.is_ok() { self.trimmed.lock().insert(id.to_owned(), boundary - 1); }
+        let version = record.version;
+        record.replica_trim = Some(ReplicaTrim { stream: stream_name.clone(), log_epoch: record.log_epoch, through });
+        // The same CAS orders hold admission and authorizes the trim before any logkeeper can apply it.
+        let Ok(Cas::Applied(_)) = self.directory.replace_deployment(record, version).await else { return; };
+        let stream = rtdb_logkeeper::StreamConfig { write_quorum: crate::deployment::write_quorum(servers.len()), servers, stream: stream_name, maximum_message_bytes: 4 << 20 };
+        if rtdb_logkeeper::trim(&stream, rtdb_storage::log::LogOffset(through)).await.is_ok() {
+            self.trimmed.lock().insert(trim_key, through);
+        }
     }
 
     #[doc(hidden)]

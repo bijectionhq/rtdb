@@ -430,7 +430,8 @@ contract LogService {
         --   This is what a holder serving a linearizable read waits on (ServeLinearizableReadOnWriter).
 
     @invariant TrimFollowsPublication
-        -- A deployment's records at or below its checkpoint's lsn may be trimmed; nothing above it may be.
+        -- Trim authorization keeps the checkpoint boundary and all records needed by admitted startup replay.
+        -- Authorization advances monotonically for the exact replica stream and log epoch.
         -- The boundary must belong to this deployment's log, including when its first readable block came from a parent.
         -- A physical segment is reclaimed once every deployment's records in it are trimmed.
         -- A deployment whose tail pins a segment past log_max_retention is force-flushed (FlushOnRetention).
@@ -1218,9 +1219,33 @@ rule PublishCheckpoint {
             ),
             loglets: LogletsAbove(holding.deployment.loglets, record.through_lsn)
         })
-        LogTrimmed(holding.deployment.id, through: record.through_lsn)
         holding.tail_bytes = TailBytesAbove(holding, record.through_lsn)
         holding.oldest_unflushed_at = OldestAbove(holding, record.through_lsn)
+}
+
+rule AdmitCheckpointReplay {
+    when: CheckpointReplayRequested(deployment, first_required: Lsn, owner)
+
+    ensures:
+        -- The deployment's version orders admission against authorized trim for the same stream and log epoch.
+        -- A replay whose first required offset is already authorized for trim refreshes checkpoint discovery.
+        RegisterReplayHold(deployment, first_required, owner)
+}
+
+rule TrimCheckpointPrefix {
+    when: CheckpointPrefixTrimRequested(holding)
+
+    ensures:
+        -- Persist the authorized floor before sending the trim to the logkeepers.
+        -- It stays below both the published checkpoint boundary and the oldest admitted replay start.
+        AuthorizeAndTrimCheckpointPrefix(holding)
+}
+
+rule ReleaseCheckpointReplay {
+    when: ReplayCaughtUpOrDrained(replay) or ReplayOwnerConfirmedStopped(replay)
+
+    ensures:
+        ReleaseReplayHold(replay)
 }
 
 ------------------------------------------------------------

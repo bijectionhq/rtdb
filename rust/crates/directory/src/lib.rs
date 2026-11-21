@@ -178,6 +178,9 @@ pub struct DeploymentRecord {
     /// The deployment's last published block, from which a cold start finds its latest without listing storage.
     #[serde(default)]
     pub checkpoint: Option<Checkpoint>,
+    /// Replica offsets a logkeeper may already have trimmed, even if the RPC reply was lost.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub replica_trim: Option<ReplicaTrim>,
     /// When a deployment that moved to another cell left this one: the tombstone's objects here are erased once the reaper's grace has passed since.
     #[serde(default)]
     pub moved_at_ms: Option<i64>,
@@ -229,8 +232,28 @@ impl HostedTask {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReplicaTrim {
+    pub stream: String,
+    pub log_epoch: i32,
+    pub through: i64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum ReplayCustody {
+    Local,
+    Hosted { owner: Option<HostedTask> },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "state", rename_all = "snake_case")]
 pub enum StorageRegion {
+    ReplicaReplay {
+        stream: String,
+        log_epoch: i32,
+        first_required: i64,
+        custody: ReplayCustody,
+    },
     Local {
         archive: Option<uuid::Uuid>,
         #[serde(default)]
@@ -274,6 +297,7 @@ impl StorageRegion {
         match self {
             Self::Local { tracks_ordered_index_pages, .. } |
             Self::Remote { tracks_ordered_index_pages, .. } => *tracks_ordered_index_pages,
+            Self::ReplicaReplay { .. } => false,
         }
     }
 }
@@ -480,7 +504,7 @@ impl DeploymentRecord {
     pub fn new(name: impl Into<String>, org: impl Into<String>, ensemble: Vec<MemberId>, now_ms: i64) -> Self {
         let id = uuid::Uuid::new_v4().to_string();
         Self { lineage: id.clone(), id, name: name.into(), org: org.into(), incarnation: 1, lifecycle: Lifecycle::Live, epoch: 0, holder: None,
-            ensemble, replica_journals: BTreeSet::new(), storage_regions: BTreeMap::new(), ordered_indexes: BTreeMap::new(), ordered_index_catalogs: BTreeMap::new(), read_width: 1, activation_crashes: 0, created_at_ms: now_ms, move_intent: None, log_epoch: 0, parent: None, move_from: None, linearizable_reads: false, checkpoint: None, moved_at_ms: None, cell_transfer: None, disposal: None, retired_residences: BTreeMap::new(), checkpoint_recovery: None, checkpoint_stage: None, checkpoint_repair_receipts: BTreeMap::new(), checkpoint_captures: BTreeMap::new(), checkpoint_capture_retirements: BTreeMap::new(), archive_retirement: None, version: 0 }
+            ensemble, replica_journals: BTreeSet::new(), storage_regions: BTreeMap::new(), ordered_indexes: BTreeMap::new(), ordered_index_catalogs: BTreeMap::new(), read_width: 1, activation_crashes: 0, created_at_ms: now_ms, move_intent: None, log_epoch: 0, parent: None, move_from: None, linearizable_reads: false, checkpoint: None, replica_trim: None, moved_at_ms: None, cell_transfer: None, disposal: None, retired_residences: BTreeMap::new(), checkpoint_recovery: None, checkpoint_stage: None, checkpoint_repair_receipts: BTreeMap::new(), checkpoint_captures: BTreeMap::new(), checkpoint_capture_retirements: BTreeMap::new(), archive_retirement: None, version: 0 }
     }
 
     pub fn can_fork(&self) -> bool {
