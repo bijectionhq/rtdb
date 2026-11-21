@@ -718,22 +718,36 @@ async fn an_unavailable_move_target_releases_the_reservation_and_late_parks_leav
 async fn a_deployment_whose_activations_crash_is_quarantined_to_the_isolation_pool() {
     let cell = Cell::start_with(vec![MemberPool::General, MemberPool::Isolation], None).await;
     let record = admin::create_deployment(cell.directory.as_ref(), "shop", "acme", 3).await.unwrap();
-    let client = cell.connect("shop").await;
+    let node = cell.node(0);
+    assert!(matches!(node.agent.activate("shop").await.unwrap(), Response::Held { .. }));
+    let (client, connection) = tokio_postgres::Config::new().host("127.0.0.1").port(node.pgwire_address.port())
+        .user("xtdb").password("cell-test").dbname("shop").connect(NoTls).await.unwrap();
+    let connection = tokio::spawn(connection);
     client.simple_query("INSERT INTO orders (_id, total) VALUES (1, 10)").await.unwrap();
     drop(client);
-    cell.node(0).agent.park("shop").await.unwrap();
-    let current = cell.directory.deployment(&record.id).await.unwrap().unwrap();
-    let mut broken = current.clone();
-    broken.ensemble = vec![rtdb_directory::MemberId("no-such-logkeeper".into())];
-    cell.directory.replace_deployment(broken, current.version).await.unwrap();
+    connection.await.unwrap().unwrap();
+    node.agent.park("shop").await.unwrap();
+    let original_ensemble = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let current = cell.directory.deployment(&record.id).await.unwrap().unwrap();
+            let mut broken = current.clone();
+            broken.ensemble = vec![MemberId("no-such-logkeeper".into())];
+            if cell.directory.replace_deployment(broken, current.version).await.unwrap().applied().is_some() {
+                break current.ensemble;
+            }
+            tokio::task::yield_now().await;
+        }
+    }).await.expect("the directory accepted the bad ensemble");
 
-    for _ in 0..3 { let _ = tokio_postgres::connect(&format!("host=127.0.0.1 port={} user=xtdb password=cell-test dbname=shop", cell.gateway.port()), NoTls).await; }
+    for _ in 0..2 {
+        assert!(tokio_postgres::connect(&format!("host=127.0.0.1 port={} user=xtdb password=cell-test dbname=shop", cell.gateway.port()), NoTls).await.is_err());
+    }
     let quarantined = cell.directory.deployment_by_name("shop").await.unwrap().unwrap();
     assert_eq!(quarantined.lifecycle, rtdb_directory::Lifecycle::Quarantined);
     assert!(cell.node(0).agent.held().is_empty(), "a general node no longer takes it");
 
     let mut repaired = quarantined.clone();
-    repaired.ensemble = current.ensemble;
+    repaired.ensemble = original_ensemble;
     cell.directory.replace_deployment(repaired, quarantined.version).await.unwrap().applied().unwrap();
     let isolated = cell.connect("shop").await;
     assert_eq!(cell.holder("shop").await, Some(1));
