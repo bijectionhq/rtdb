@@ -54,6 +54,14 @@ The node and cross-cell connections still use the cell's private network transpo
 Hosting can install its existing deployment authority with `rtdb-multi install --id UUID --name NAME --org ORG`.
 The directory allocates both name and authority conditionally, and an identical retry returns the same deployment.
 This entry point enables linearizable reads on the holder.
+A PostgreSQL startup database of `NAME@UUID`, with the UUID in lowercase 32-digit hexadecimal, requires that installation before connecting.
+The gateway confirms the matched UUID in the startup parameter `rtdb_installation_id`.
+`SHOW rtdb_hosted_source_barrier` returns the deployment ID after the holder confirms the current directory assignment, confirms its epoch with the logkeeper quorum, and applies the sampled source cut.
+The holder must recover the checkpoint published in the directory or an authenticated successor before answering.
+A gateway reconnect keeps the original deployment ID.
+Restoring an older node or object copy requires a recoverable checkpoint and tail from the live directory and logkeeper ensemble.
+The directory and acknowledged quorum stream must survive this restore, and the production logkeepers must acknowledge durable writes.
+Recovery from a replacement directory or a rolled-back quorum requires a new deployment identity.
 
 Nodes and logkeepers bound to a wildcard address require `--advertise-host` with their reachable DNS name or IP.
 A durable logkeeper uses the same advertised address and data directory after restart.

@@ -138,6 +138,13 @@ impl rtdb_node::ReadFence for FenceSlot {
     async fn confirm(&self, database: &str) -> Result<()> {
         match self.0.get() { Some(agent) => agent.confirm_read(database).await, None => Ok(()) }
     }
+
+    async fn confirm_hosted(&self, database: &rtdb_node::Database) -> Result<String> {
+        let agent = self.0.get().ok_or_else(|| Anomaly::new(
+            AnomalyCategory::Unavailable, rtdb_node::NOT_HELD, "This node is not holding a hosted database",
+        ))?;
+        agent.confirm_hosted_read(database).await
+    }
 }
 
 pub struct LogkeeperSettings {

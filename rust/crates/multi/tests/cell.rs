@@ -67,10 +67,12 @@ async fn failed_disposal_reuses_the_fence_on_retry() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_deployment_is_served_through_the_gateway_and_survives_its_holder_dying() {
     let mut cell = Cell::start(2, None).await;
-    admin::create_deployment(cell.directory.as_ref(), "shop", "acme", 3).await.unwrap();
+    let history = uuid::Uuid::new_v4();
+    admin::install_deployment(cell.directory.as_ref(), history, "shop", "acme", 3).await.unwrap();
     let client = cell.connect("shop").await;
     client.simple_query("INSERT INTO orders (_id, total) VALUES (1, 10)").await.unwrap();
-    assert_eq!(values(&client, "SELECT total FROM orders").await, ["10"]);
+    let basis = values(&client, "SELECT _system_from FROM orders WHERE _id = 1").await.remove(0);
+    client.simple_query("INSERT INTO orders (_id, total) VALUES (2, 20)").await.unwrap();
     drop(client);
 
     let first = cell.holder("shop").await.expect("the first connection placed the deployment");
@@ -78,12 +80,35 @@ async fn a_deployment_is_served_through_the_gateway_and_survives_its_holder_dyin
     cell.nodes[first].take().unwrap().kill().await.unwrap();
 
     let client = connect_eventually(&cell, "shop").await;
-    assert_eq!(values(&client, "SELECT total FROM orders").await, ["10"], "nothing acknowledged is lost when the holder dies");
-    client.simple_query("INSERT INTO orders (_id, total) VALUES (2, 20)").await.unwrap();
-    assert_eq!(values(&client, "SELECT total FROM orders").await, ["10", "20"]);
+    assert_eq!(values(&client, "SHOW rtdb_hosted_source_barrier").await, [history.to_string()]);
+    assert_eq!(values(&client, "SELECT total FROM orders").await, ["10", "20"], "nothing acknowledged is lost when the holder dies");
+    let exact = format!("SELECT total FROM orders FOR SYSTEM_TIME AS OF TIMESTAMP '{basis}'");
+    assert_eq!(values(&client, &exact).await, ["10"]);
+    client.simple_query("INSERT INTO orders (_id, total) VALUES (3, 30)").await.unwrap();
+    assert_eq!(values(&client, "SELECT total FROM orders").await, ["10", "20", "30"]);
     let record = cell.directory.deployment_by_name("shop").await.unwrap().unwrap();
     assert!(record.epoch > epoch, "the survivor holds it under a later epoch");
     assert_ne!(cell.holder("shop").await, Some(first));
+    drop(client);
+    cell.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_hosted_source_barrier_refuses_a_missing_directory_checkpoint() {
+    let cell = Cell::start(1, None).await;
+    let history = uuid::Uuid::new_v4();
+    let directory = cell.directory.as_ref();
+    admin::install_deployment(directory, history, "shop", "acme", 3).await.unwrap();
+    let client = cell.connect("shop").await;
+    assert_eq!(values(&client, "SHOW rtdb_hosted_source_barrier").await, [history.to_string()]);
+
+    let mut record = directory.deployment(&history.to_string()).await.unwrap().unwrap();
+    let expected_version = record.version;
+    record.checkpoint = Some(rtdb_directory::Checkpoint { block: 7, boundary: 11, source: 11, system_time: 100 });
+    assert!(matches!(directory.replace_deployment(record, expected_version).await.unwrap(), rtdb_directory::Cas::Applied(_)));
+
+    let refusal = client.simple_query("SHOW rtdb_hosted_source_barrier").await.unwrap_err();
+    assert!(refusal.as_db_error().unwrap().message().contains("has not recovered the directory's durable checkpoint"));
     drop(client);
     cell.stop().await;
 }

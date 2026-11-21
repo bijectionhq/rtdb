@@ -533,6 +533,8 @@ entity DeploymentRecord {
     -- Empty when the tail is sealed and flushed.
     loglets: List<Loglet>
     checkpoint: Checkpoint?
+    -- A holder confirms its epoch with a quorum for reads.
+    linearizable_reads: Boolean
     -- How many ranks of the affinity order may serve reads.
     read_width: Integer
     -- Activations that ended in the holder crashing, within quarantine_window.
@@ -1502,6 +1504,27 @@ rule ServeLinearizableReadOnWriter {
             Replied(query, moved: Directory.read(holding.deployment.id).holder)
 }
 
+rule ConfirmHostedSource {
+    when: HostedSourceBarrierRequested(holding, session)
+
+    requires: session.deployment = holding.deployment.id
+    requires: holding.state = serving
+    requires: Directory.read(holding.deployment.id).holder = holding.member
+    requires: Directory.read(holding.deployment.id).epoch = holding.epoch
+    requires: Directory.read(holding.deployment.id).linearizable_reads
+    requires: Directory.read(holding.deployment.id).checkpoint = null
+              or holding.applied_lsn >= Directory.read(holding.deployment.id).checkpoint.lsn
+
+    ensures:
+        let round = NextRoundAcknowledged(holding)
+        if not SealedIn(round, holding.deployment):
+            let cut = SampleSource(holding)
+            AwaitApplied(holding, cut)
+            HostedSourceConfirmed(session, history: holding.deployment.id, cut: cut)
+        else:
+            Replied(session, unavailable: true)
+}
+
 rule ServeOnSubscriber {
     when: QueryArrived(subscription, query, session)
 
@@ -1935,6 +1958,7 @@ surface ClientAccess {
         -- An authenticated idle session retains its acknowledged named prepared statements across holder changes.
         -- A failed startup ends the client's authentication exchange.
         -- A finite reconnect window bounds the time an established session waits for a replacement holder.
+        -- A replacement connection must resolve the original deployment identity.
 
     @guarantee ReadYourWrites
         -- Within a session, every read sees every transaction the session was acknowledged.

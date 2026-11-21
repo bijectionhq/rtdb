@@ -115,11 +115,17 @@ async fn connection(client: TcpStream, directory: Arc<dyn Directory>, options: G
         startup.parameters.insert("database".into(), name.clone());
         startup.bytes = encode_startup(&startup.parameters);
     }
-    let router = Arc::new(GatewayRouter { directory: Arc::clone(&directory), name: name.clone(), expected, read_only: startup.read_only(), snapshot: startup.snapshot(), options: options.clone() });
-    let (server, control, epoch, deployment) = match router.route_with_record().await {
+    let read_only = startup.read_only();
+    let snapshot = startup.snapshot();
+    let expected_history = expected.map(|id| id.hyphenated().to_string());
+    let (server, control, epoch, deployment) = match route(&directory, &name, expected_history.as_deref(), read_only, snapshot, &options).await {
         Ok(route) => route,
         Err(error) => return refuse(&mut client, "08006", error.message.as_deref().unwrap_or(error.code.as_ref())).await,
     };
+    let router = Arc::new(GatewayRouter {
+        directory: Arc::clone(&directory), name: name.clone(), deployment: deployment.clone(),
+        read_only, snapshot, options: options.clone(),
+    });
     let touching = control.map(|control| {
         let name = name.clone();
         let interval = options.touch_interval;
@@ -132,8 +138,8 @@ async fn connection(client: TcpStream, directory: Arc<dyn Directory>, options: G
             }
         })
     });
-    let grants = options.capabilities.clone().map(|secret| crate::session::Grants { secret, parameters: startup.parameters.clone(), read_only: startup.read_only() });
-    let keyed = !startup.read_only();
+    let grants = options.capabilities.clone().map(|secret| crate::session::Grants { secret, parameters: startup.parameters.clone(), read_only });
+    let keyed = !read_only;
     let session = crate::session::Session::new(Bytes::from(startup.bytes), router, directory, deployment, grants, keyed)
         .with_installation(expected);
     let outcome = tokio::select! {
@@ -157,31 +163,26 @@ async fn elsewhere(directory: &Arc<dyn Directory>, name: &str, options: &Gateway
 struct GatewayRouter {
     directory: Arc<dyn Directory>,
     name: String,
-    expected: Option<Uuid>,
+    deployment: String,
     read_only: bool,
     snapshot: bool,
     options: GatewayOptions,
 }
 
-impl GatewayRouter {
-    async fn route_with_record(&self) -> Result<(TcpStream, Option<String>, u64, String)> {
-        route(&self.directory, &self.name, self.expected, self.read_only, self.snapshot, &self.options).await
-    }
-}
-
 #[async_trait::async_trait]
 impl crate::session::Router for GatewayRouter {
     async fn route(&self) -> Result<(TcpStream, Option<String>, u64)> {
-        let (stream, control, epoch, _) = self.route_with_record().await?;
+        let (stream, control, epoch, _) =
+            route(&self.directory, &self.name, Some(&self.deployment), self.read_only, self.snapshot, &self.options).await?;
         Ok((stream, control, epoch))
     }
 }
 
 /// The open connection to the deployment's holder, and that holder's control address.
-async fn route(directory: &Arc<dyn Directory>, name: &str, expected: Option<Uuid>, read_only: bool, snapshot: bool, options: &GatewayOptions) -> Result<(TcpStream, Option<String>, u64, String)> {
+async fn route(directory: &Arc<dyn Directory>, name: &str, expected: Option<&str>, read_only: bool, snapshot: bool, options: &GatewayOptions) -> Result<(TcpStream, Option<String>, u64, String)> {
     let record = directory.deployment_by_name(name).await?
         .ok_or_else(|| Anomaly::incorrect("rtdb.multi/unknown-deployment", format!("No deployment is named {name}")))?;
-    if expected.is_some_and(|id| id.hyphenated().to_string() != record.id) {
+    if expected.is_some_and(|id| id != record.id.as_str()) {
         return Err(Anomaly::incorrect("rtdb.multi/install-identity", format!("Database {name} has another installation ID")));
     }
     match record.lifecycle {
@@ -360,6 +361,18 @@ mod tests {
         fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
             rustls::crypto::aws_lc_rs::default_provider().signature_verification_algorithms.supported_schemes()
         }
+    }
+
+    #[tokio::test]
+    async fn reconnect_refuses_a_different_deployment_with_the_same_name() {
+        let directory = rtdb_directory::MemoryDirectory::new();
+        directory.create_deployment(DeploymentRecord::new("shop", "acme", Vec::new(), 0)).await.unwrap();
+        let router = GatewayRouter {
+            directory, name: "shop".into(), deployment: "original".into(),
+            read_only: false, snapshot: false, options: GatewayOptions::default(),
+        };
+        let result = crate::session::Router::route(&router).await;
+        assert_eq!(result.unwrap_err().code, "rtdb.multi/install-identity");
     }
 
     #[tokio::test]

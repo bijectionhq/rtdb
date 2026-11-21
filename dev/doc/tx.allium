@@ -39,6 +39,8 @@
 -- It is an idle-session operation and does not open or pin a transaction.
 -- A subsequent read on that connection observes at least that applied cut, including submissions from other sessions.
 -- Databases with external transaction sources and nodes without indexing cannot serve this barrier.
+-- SHOW rtdb_hosted_source_barrier is the hosted variant and returns the confirmed deployment identity.
+-- It requires a current holder with linearizable reads, a recovered directory checkpoint, and a fresh quorum confirmation.
 --
 -- == Boundaries ==
 --
