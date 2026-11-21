@@ -190,6 +190,23 @@ implementation and the selected failure schedules. The model assumes the
 provider's confirmed abort and inventory contracts. Primary L0 files are a
 separate custody boundary.
 
+### Retiring dropped definitions
+
+The captured catalog retains the definition fence after the last physical
+scope is removed. The reaper discovers old definitions through provider
+version and multipart inventories, including definitions that were already
+dropped when generation tracking began. The hosted versioned-provider
+regression verifies both erase and drop. Its node queries use the direct
+catalog scan and passed with default Tokio stack sizing. The directory unit
+test reclaimed an unregistered dropped definition and rejected admission
+before and after reclamation.
+
+TLC explored 16 reachable states in both `CatalogRetirement.cfg` and
+`CatalogRetirementLiveness.cfg`. Ignoring previous versions left an old object
+after acknowledgement. Discarding the durable catalog fence allowed a stale
+capture to reopen the removed definition. The positive configurations
+preserved its replacement.
+
 ## Page and read witness composition
 
 Lean 4.35.0 checked `distinct_runs_refine_membership` and
@@ -207,6 +224,14 @@ rows, continuation, the authenticated consumed predicate, and successful
 revalidation at the same observation. It runs against a dedicated local
 RTDB endpoint. The theorem assumes exact candidate membership and replay
 coverage, whose production bindings are exercised by these runtime tests.
+
+On newer Bijection main source `ebaa9bbe2f49afbb3ad6f2838affbdcd007a38a2`,
+Verus checked 12 candidate-window and seven overlay-admission obligations
+from the production files. Lean checked `RtdbCandidatePrefixes` and
+`RtdbOverlayHistory`. Together these establish the retained first distinct
+union prefix and the effect of keeping the protected history and clear suffix
+through the newest clear reset. The proofs require authentic source prefixes,
+ancestry, and operation decoding.
 
 ## Execution
 

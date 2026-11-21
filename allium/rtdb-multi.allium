@@ -1473,7 +1473,8 @@ rule ReapUnreachable {
 
 rule RetireOrderedIndexPages {
     -- An independently compacted index publishes its scrubbed replacement before closing earlier page scopes.
-    -- Drop closes the named index definition. A new definition has its own physical name.
+    -- The captured catalog closes dropped definitions, including prefixes that only exist in provider inventories.
+    -- A new definition has its own physical name. The catalog retains the closure after its page inventory is removed.
     -- Serving replicas register a scope before retaining any decoded page or starting provider I/O.
     -- Each provider upload records its exact upload ID in the same directory authority that closes the scope.
     -- Closure ends new replica registrations and upload admissions. Registered replicas stop taking
