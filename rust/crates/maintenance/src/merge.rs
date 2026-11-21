@@ -427,6 +427,60 @@ mod tests {
     }
 
     #[test]
+    fn same_time_compaction_preserves_the_winning_put_or_delete_at_each_valid_time() {
+        use rtdb_types::{ScalarType, Value};
+
+        let intervals = [(0, 1), (0, 2), (0, 3), (1, 1), (1, 2), (1, 3), (2, 3)];
+        let choices = intervals.len() * 2;
+        let ordinal_type = LogicalType::Scalar(ScalarType::I64);
+        let fields = StructFields::from([("ordinal".into(), ordinal_type.clone())]);
+        let contains = |span: Interval, time: i64| span.lower().0 <= time && time < span.upper().0;
+        let memory = MemoryBudget::new(1 << 20);
+
+        for count in 0..=3 {
+            for mut choice in 0..choices.pow(count) {
+                let commands: Vec<_> = (0..count).map(|ordinal| {
+                    let selected = choice % choices;
+                    choice /= choices;
+                    let (lower, upper) = intervals[selected / 2];
+                    let operation = if selected % 2 == 0 {
+                        StoredOperation::Put(StructFields::from([("ordinal".into(), Value::I64(i64::from(ordinal)))]))
+                    } else { StoredOperation::Delete };
+                    StoredEvent {
+                        iid: Iid([1; 16]),
+                        system_from: Timestamp(100),
+                        valid_time: Interval::from_micros(lower, upper).unwrap(),
+                        operation,
+                        recency: None,
+                    }
+                }).collect();
+                let input = build_event_batch(&commands, Some(fields.clone()), None).unwrap();
+                let input = EventBatch::new(input).unwrap().page_events().unwrap();
+                let (resolved, charges) = resolve_same_time(&input, &memory).unwrap();
+
+                for instant in -1..=4 {
+                    let expected = commands.iter().find(|row| contains(row.valid_time, instant)).map(|row| match &row.operation {
+                        StoredOperation::Put(document) => Some(document.get("ordinal").unwrap().clone()),
+                        StoredOperation::Delete => None,
+                        StoredOperation::Erase => unreachable!(),
+                    });
+                    let mut covering = resolved.iter().filter(|row| contains(row.valid_time, instant));
+                    let observed = covering.next().map(|row| match row.op {
+                        EventOp::Put => Some(row.put_cell("ordinal", &ordinal_type).unwrap().into_owned()),
+                        EventOp::Delete => None,
+                        EventOp::Erase => unreachable!(),
+                    });
+                    assert!(covering.next().is_none(), "resolved same-time fragments overlap at {instant}");
+                    assert_eq!(observed, expected, "same-time resolution changed the winning command at {instant}");
+                }
+
+                drop((resolved, charges));
+                assert_eq!(memory.used_bytes(), 0);
+            }
+        }
+    }
+
+    #[test]
     fn same_time_compaction_resolves_a_lone_event_with_only_its_output_row() {
         let input = page(&[StoredEvent {
             iid: Iid([1; 16]),

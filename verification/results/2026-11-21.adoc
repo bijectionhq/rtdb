@@ -857,3 +857,19 @@ The local directory and multi suites ran 192 cases, including the held stage and
 Six cases were marked ignored and five S3 cases exited at their endpoint gate.
 Run the selected suites with `BIJECTION_LOCAL_EXECUTION=owner-authorized cargo test --manifest-path rust/Cargo.toml --locked -p rtdb-multi -p rtdb-directory --features rtdb-multi/dynamodb --lib --tests`.
 Live S3 and DynamoDB were outside the run.
+
+== Same-time valid interval normalization
+
+The Lean model in link:../lean/CompactionIntervals.lean[CompactionIntervals.lean] treats a cohort as the put and delete commands for one IID at one system time, newest ordinal first.
+An older command contributes its valid interval minus every higher-priority command interval.
+The model proves exact half-open point coverage, disjoint fragments for well-formed intervals, and the same winning command or absence at every valid instant.
+The observed result distinguishes a winning delete from the absence of any command.
+The runner audited six theorems and rejected dropping the first uncovered point, forgetting a newer blocker, and losing a fragment's payload.
+
+The native replay calls `resolve_same_time` on 2,955 cohorts of up to three commands drawn from seven intervals and two operations.
+For each cohort it checks six valid instants against a direct first-matching-command oracle and requires at most one covering fragment.
+The replay rejected preserving a shadowed fragment and dropping a visible leading fragment.
+The `--native-replay` option runs the test and both controls, using an archive of the production Rust source.
+
+The model isolates a single put-and-delete cohort.
+Composition with erase barriers, whole-page temporal ceilings, and the published history still needs its own refinement proof.

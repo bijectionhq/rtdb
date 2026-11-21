@@ -1090,6 +1090,8 @@ The heap emits a minimum coordinate, advances exactly one cursor, and preserves 
 The native adapter binds one immutable set of Arrow pages to the heap for its lifetime and is replayed against independent sorting.
 Lean compares the overlay's selected task to independent per-segment routing and proves exact row occurrence coverage under well-placed input metadata and job clipping.
 A native replay runs the compactor on mixed IID depths and recency branches, then checks the encoded output against independently filtered input rows for six partitions.
+Lean proves that same-time put and delete fragments are disjoint and preserve the winning command at every valid instant.
+A native replay checks short sequences against a first-matching-command oracle.
 |Prove that each accepted piece represents precisely the input coverage and that the merged bitemporal events refine the original history.
 Include retry, restart, overlapping jobs, metadata depth and clipping, and every route to publication.
 |===

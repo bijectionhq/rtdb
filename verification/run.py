@@ -245,7 +245,7 @@ def verify_compaction_projection(args, scratch, history):
         print(f"{case}: {'negative control rejected' if mutation else 'proved'}")
 
 
-def verify_lean_model(args, scratch, path, study, controls, theorems):
+def verify_lean_model(args, scratch, path, study, controls, theorems, env=None):
     allowed = {"propext", "Classical.choice", "Quot.sound"}
     for name, mutation in {"baseline": None, **controls}.items():
         case = f"lean-{study}-{name}"
@@ -253,7 +253,7 @@ def verify_lean_model(args, scratch, path, study, controls, theorems):
         source = clone_file(path, directory)
         if mutation:
             replace_once(source, mutation[0], mutation[1])
-        checked = run_case([args.lean, str(path)], directory, args.evidence, case)
+        checked = run_case([args.lean, str(path)], directory, args.evidence, case, env)
         if mutation:
             observed = lean_error_theorems(source, path, checked.stdout)
             expected = sorted(mutation[2])
@@ -368,6 +368,27 @@ def verify_compaction_planner(args, scratch):
     verify_lean_model(args, scratch, path, "compaction-planner", controls, 3)
 
 
+def verify_compaction_intervals(args, scratch, history):
+    path = Path("verification/lean/CompactionIntervals.lean")
+    controls = {
+        "drop-first-uncovered-point": (
+            "max span.lower blocker.upper", "max span.lower (blocker.upper + 1)",
+            ["subtraction_preserves_exactly_uncovered_points"] * 2,
+        ),
+        "forget-new-blocker": (
+            "normalize (command.span :: blockers) older", "normalize blockers older",
+            ["normalization_preserves_visible_winners", "normalized_commands_respect_prior_blockers",
+             "normalization_makes_all_output_fragments_disjoint", "normalization_makes_all_output_fragments_disjoint"],
+        ),
+        "lose-payload": (
+            "map fun piece => { command with span := piece }", "map fun piece => { command with span := piece, value := none }",
+            ["clipped_command_preserves_payload_when_visible"] * 2,
+        ),
+    }
+    env = os.environ | {"LEAN_PATH": str(history)}
+    verify_lean_model(args, scratch, path, "compaction-intervals", controls, 6, env)
+
+
 def verify_system_time(args, scratch):
     path = Path("verification/lean/SystemTime.lean")
     controls = {
@@ -465,6 +486,7 @@ def verify_lean(args, scratch):
             verify_compaction_projection(args, scratch, directory)
             verify_compaction_planner(args, scratch)
             verify_compaction_merge(args, scratch)
+            verify_compaction_intervals(args, scratch, directory)
             verify_search_windows(args, scratch)
             verify_partitioned_top_k(args, scratch)
             verify_catalog_recovery(args, scratch)
@@ -1150,6 +1172,40 @@ def verify_planner_replay(args, source):
     print("rust-planner-replay: six partitions matched the row oracle, all three mutations rejected")
 
 
+def verify_same_time_replay(args, source):
+    env = os.environ | {
+        "CARGO_TARGET_DIR": str(ROOT / "target"),
+        "CARGO_PROFILE_DEV_DEBUG": "0",
+        "CARGO_PROFILE_TEST_DEBUG": "0",
+        "CARGO_INCREMENTAL": "0",
+    }
+    test = "merge::tests::same_time_compaction_preserves_the_winning_put_or_delete_at_each_valid_time"
+    command = ["cargo", "test", "--locked", "-p", "rtdb-maintenance", "--lib", test, "--", "--exact"]
+    checked = run_case(command, source / "rust", args.evidence, "rust-same-time-baseline", env)
+    if checked.returncode or f"{test} ... ok" not in checked.stdout:
+        raise ValueError("native same-time resolution did not preserve the winning commands")
+
+    merge = source / "rust/crates/maintenance/src/merge.rs"
+    original = merge.read_bytes()
+    controls = (
+        ("keep-shadowed-fragment", "system_to >= event.system_from", "resolved same-time fragments overlap"),
+        ("drop-visible-start", "system_to > event.system_from && event.valid_time.lower() != valid_from",
+         "same-time resolution changed the winning command"),
+    )
+    for name, replacement, expected in controls:
+        try:
+            replace_once(merge, "system_to > event.system_from", replacement)
+            checked = run_case(command, source / "rust", args.evidence, f"rust-same-time-{name}", env)
+            if (
+                checked.returncode != 101 or f"{test} ... FAILED" not in checked.stdout
+                or expected not in checked.stdout or "0 passed; 1 failed" not in checked.stdout
+            ):
+                raise ValueError(f"{name}: expected the same-time oracle to reject the mutation")
+        finally:
+            merge.write_bytes(original)
+    print("rust-same-time-replay: winners and non-overlap checked, both mutations rejected")
+
+
 def verify_azure_replay(args, source):
     env = os.environ | {
         "CARGO_TARGET_DIR": str(ROOT / "target"),
@@ -1365,6 +1421,7 @@ def main():
             verify_system_time_replay(args, source)
             verify_merge_replay(args, source)
             verify_planner_replay(args, source)
+            verify_same_time_replay(args, source)
             verify_azure_replay(args, source)
 
 
