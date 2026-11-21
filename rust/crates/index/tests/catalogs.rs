@@ -187,3 +187,28 @@ fn a_partition_groups_members_are_looked_up_by_key_whatever_their_state() {
     assert_eq!(partial.group_members(&table(), &group).iter().map(|trie| (trie.key.to_string(), trie.state)).collect::<Vec<_>>(),
         [("l02-rc-p0-b00".to_string(), TrieState::Nascent), ("l02-rc-p3-b00".to_string(), TrieState::Nascent)]);
 }
+
+#[test]
+fn a_newer_nascent_sibling_cannot_complete_an_older_group() {
+    let catalog = apply(&[
+        ("l01-rc-b00", 2),
+        ("l02-rc-p2-b01", 10),
+        ("l02-rc-p0-b00", 10),
+        ("l02-rc-p1-b00", 10),
+        ("l02-rc-p3-b00", 10),
+        ("l02-rc-p2-b00", 10),
+    ]);
+    let keys = |catalog: &TrieCatalog| {
+        catalog.current_tries(&table()).iter().map(|trie| trie.key.to_string()).collect::<Vec<_>>()
+    };
+    assert_eq!(keys(&catalog), ["l01-rc-b00"], "the parent covers every bucket until a complete group can replace it");
+
+    let complete = catalog.with_tries(table(), [
+        notification("l02-rc-p0-b01", 10),
+        notification("l02-rc-p1-b01", 10),
+        notification("l02-rc-p3-b01", 10),
+    ], Timestamp(101)).unwrap();
+    assert_eq!(keys(&complete), [
+        "l02-rc-p0-b01", "l02-rc-p1-b01", "l02-rc-p2-b01", "l02-rc-p3-b01",
+    ]);
+}

@@ -144,7 +144,12 @@ impl TableTries {
                     let mut part = parent_part.clone(); part.push(bucket);
                     Shard { level: shard.level, recency: shard.recency, part }
                 }).collect();
-                if siblings.iter().all(|key| self.shards.get(key).is_some_and(|value| value.max_block_index >= block)) {
+                // A higher watermark can belong to a different, still-nascent group.
+                // Retire the parent only when this block has a serving candidate in every bucket.
+                if siblings.iter().all(|key| self.shards.get(key)
+                    .and_then(|shard| shard.tries.get(&block))
+                    .is_some_and(|sibling| matches!(sibling.state, TrieState::Nascent | TrieState::Live)))
+                {
                     for sibling in siblings {
                         if let Some(value) = self.shards.get_mut(&sibling) { value.promote(block); }
                     }

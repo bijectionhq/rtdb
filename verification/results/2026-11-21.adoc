@@ -348,3 +348,29 @@ It represents notices as a set because exact duplicate notices leave catalog cov
 It abstracts row equivalence, overlapping jobs, rejected input, cache, and the lifetime and physical readability of a previously captured generation.
 The production trie catalog uses per-shard block high-water marks.
 A refinement proof must establish when a higher watermark supplies the earlier generation's complete source coverage, including late and interleaved notices.
+
+== Interleaved sibling generations
+
+The two-generation model keeps the parent active until four exact outputs are present.
+TLC explored 288 states for this rule.
+The reachability witness activated a replacement.
+The watermark variant let three generation-1 notices and one generation-2 notice retire the parent, leaving one generation-1 bucket without coverage.
+
+The catalog regression reproduced this counterexample through the Rust catalog's admission path.
+It delivered a later notice for bucket 2, then delivered the earlier group's notices.
+The old implementation exposed only buckets 0, 1 and 3 of the earlier group.
+The fix checks for a nascent or live sibling at the group's exact block in every bucket.
+The catalog keeps the parent for the incomplete group and activates all four members when the later group completes.
+All 16 catalog tests and four maintenance GC tests passed after the fix.
+
+This case establishes the catalog defect and checks the repair for the specified notice order.
+The bounded model abstracts job input coverage, merge output equivalence, recovery of pending jobs and storage faults.
+
+== Combined local verification after reclamation and single-group checks
+
+The complete runner passed on commit `a14100ce3`.
+Lean, TLC, Verus, Alloy, Apalache, Maude and the arithmetic solver ran with the declared controls.
+The Rust checks included replica admission compile failures, 4,096 temporal observations, the ranking witness and mutation, four recovery tests and the root-first mutation, and the Azure copy cases and mutations.
+The SHA-256 of the combined run's `inputs.json` is
+`da019a9521a95b5bf821e946da3ca0e85c5bcfa5cccfb213e51bd4ecc9248c25`.
+The later overlapping-group change has its focused TLC and Rust evidence above.
