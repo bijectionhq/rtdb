@@ -31,6 +31,9 @@ use crate::keys::KeyService;
 use crate::checkpoint_retention::checkpoint_metadata_collectable;
 use crate::ordered_index_storage::{self, HostedIndexPages};
 
+#[path = "key_enrollment.rs"]
+mod key_enrollment;
+
 /// The protobuf type name the cell's storage factory is registered under.
 pub const CELL_STORAGE_TYPE: &str = "rtdb.multi.CellStorage";
 pub const GARBAGE_DIRECTORY: &str = "~garbage";
@@ -251,7 +254,33 @@ impl RemoteStorageFactory for CellStoreFactory {
         let record = self.directory.deployment(&config.deployment).await?
             .filter(|record| record.storage_prefix() == config.prefix)
             .ok_or_else(|| storage_region_error("The cached store belongs to another residence"))?;
-        Ok(Arc::new(EncryptingStore::new(cached, &self.keys.key(&record.key_id()).await?)?))
+        let id = record.key_id();
+        let material = match self.keys.existing_key(&id).await? {
+            Some(material) => material,
+            None => self.enroll_serving_key(&config, &id).await?,
+        };
+        Ok(Arc::new(EncryptingStore::new(cached, &material)?))
+    }
+}
+
+impl CellStoreFactory {
+    async fn enroll_serving_key(&self, config: &CellStoreConfig, allow_id: &str) -> Result<[u8; crate::keys::KEY_BYTES]> {
+        let unavailable = || Anomaly::new(rtdb_types::AnomalyCategory::Unavailable, "rtdb.multi/key-missing", "The serving key is unavailable");
+        let record = self.directory.deployment(&config.deployment).await?
+            .filter(|record| record.storage_prefix() == config.prefix && record.key_id() == allow_id)
+            .ok_or_else(unavailable)?;
+        let current_writer = config.writer_epoch == Some(record.epoch) && record.holder.is_some()
+            && matches!(record.lifecycle, Lifecycle::Live | Lifecycle::Quarantined);
+        let original_residence = record.incarnation == 1 && record.log_epoch == 0 && record.lineage == record.id
+            && record.parent.is_none() && record.move_from.is_none() && record.cell_transfer.is_none()
+            && record.storage_generation.is_none() && record.retired_residences.is_empty();
+        let observed_history = record.checkpoint.is_some() || record.checkpoint_recovery.is_some()
+            || record.checkpoint_stage.is_some() || record.replica_anchor.is_some() || !record.replica_journals.is_empty()
+            || !record.log_copy_servers.is_empty();
+        if !key_enrollment::may_enroll(current_writer, original_residence, observed_history) {
+            return Err(unavailable());
+        }
+        self.keys.key(allow_id).await
     }
 }
 
@@ -1222,6 +1251,46 @@ mod tests {
         let result = factory.open(&config, &key("v06"), IoRegion::new()).await;
         assert!(matches!(result, Err(error) if error.code == rtdb_node::NOT_HELD));
         assert_eq!(bucket.list(None).await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn only_the_current_pristine_writer_can_enroll_a_missing_serving_key() {
+        let directory = rtdb_directory::MemoryDirectory::new();
+        let root = tempfile::tempdir().unwrap();
+        let storage = CellStorage::Local { root: root.path().join("objects") };
+        let keys = Arc::new(crate::keys::LocalKeyService::new(root.path().join("keys")).unwrap());
+        let bucket = storage.bucket(IoRegion::new()).await.unwrap();
+        let storage_namespaces = crate::deployment::storage_namespaces(bucket.as_ref(), keys.as_ref()).await.unwrap();
+        let factory = CellStoreFactory {
+            directory: directory.clone(), keys: keys.clone(), storage_namespaces,
+            storage_regions: TaskTracker::new(), scoped_writes: None, hosted_task: None, local_witnesses: None,
+        };
+        let mut record = DeploymentRecord::new("shop", "acme", Vec::new(), 0);
+        record.epoch = 2;
+        record.holder = Some(MemberId("writer".into()));
+        let record = directory.create_deployment(record).await.unwrap();
+        let configuration = |writer_epoch| Any { type_url: CELL_STORAGE_TYPE.into(), value: serde_json::to_vec(&CellStoreConfig {
+            storage: storage.clone(), prefix: record.storage_prefix(), deployment: record.id.clone(),
+            writer_epoch, compactor: false, snapshot_block: None,
+        }).unwrap() };
+        let cached: Arc<dyn ObjectStore> = Arc::new(MemoryStore::default());
+        for writer_epoch in [None, Some(1)] {
+            let result = factory.wrap_cached(&configuration(writer_epoch), cached.clone()).await;
+            assert!(matches!(result, Err(error) if error.code == "rtdb.multi/key-missing"));
+        }
+        assert_eq!(keys.existing_key(&record.key_id()).await.unwrap(), None);
+        factory.wrap_cached(&configuration(Some(2)), cached.clone()).await.unwrap();
+        assert!(keys.existing_key(&record.key_id()).await.unwrap().is_some());
+        factory.wrap_cached(&configuration(None), cached.clone()).await.unwrap();
+
+        std::fs::remove_file(root.path().join("keys").join(format!("{}.key", record.key_id()))).unwrap();
+        crate::admin::update_installation(directory.as_ref(), &record.id, |record| {
+            record.replica_journals.insert("replica".to_owned());
+            Ok(())
+        }).await.unwrap();
+        let result = factory.wrap_cached(&configuration(Some(2)), cached).await;
+        assert!(matches!(result, Err(error) if error.code == "rtdb.multi/key-missing"));
+        assert_eq!(keys.existing_key(&record.key_id()).await.unwrap(), None);
     }
 
     #[tokio::test]

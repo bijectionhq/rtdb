@@ -816,6 +816,10 @@ Crash detection, provider copy and pack sharing remain separate implementation o
 === Hosted key custody
 
 The vault installs one current key per deployment, checkpoint or stage identity.
+A serving residence opens with its existing key.
+A missing key can be enrolled only by the current writer of an original residence with no durable evidence of earlier storage or journal use.
+The writer checks the directory again after observing the missing key.
+Journal reservation precedes durable journal writes, so a writer arriving after that reservation cannot create a replacement key.
 A conditional creation may succeed only while the object is absent.
 Withdrawal replaces the current value with a tombstone conditional on the observed state.
 The vault confirms withdrawal from the tombstone and requires the bucket to have never enabled versioning.
