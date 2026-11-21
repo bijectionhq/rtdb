@@ -7,15 +7,22 @@ use super::invalid;
 #[cfg(test)]
 mod tests;
 
+pub(super) fn needs_normalization(message: &arrow_ipc::Message<'_>) -> Result<bool> {
+    let batch = message.header_as_record_batch().or_else(|| message.header_as_dictionary_batch().and_then(|dictionary| dictionary.data()));
+    let Some(batch) = batch else { return Ok(false); };
+    let nodes = batch.nodes().ok_or_else(|| invalid("Arrow batch has no field nodes"))?;
+    if nodes.iter().any(|node| node.null_count() < -1) { return Err(invalid("Arrow null count is below the unknown-count sentinel")); }
+    Ok(nodes.iter().any(|node| node.null_count() == -1))
+}
+
 #[allow(deprecated)]
 pub(super) fn normalize(metadata: &mut [u8], body: &[u8], schema: &Schema) -> Result<()> {
     let patches = {
         let message = arrow_ipc::root_as_message(metadata).map_err(invalid)?;
-        let batch = message.header_as_record_batch().or_else(|| message.header_as_dictionary_batch().and_then(|dictionary| dictionary.data()));
-        let Some(batch) = batch else { return Ok(()); };
+        if !needs_normalization(&message)? { return Ok(()); }
+        let batch = message.header_as_record_batch().or_else(|| message.header_as_dictionary_batch().and_then(|dictionary| dictionary.data()))
+            .ok_or_else(|| invalid("Arrow block header has no record batch"))?;
         let nodes = batch.nodes().ok_or_else(|| invalid("Arrow batch has no field nodes"))?;
-        if nodes.iter().any(|node| node.null_count() < -1) { return Err(invalid("Arrow null count is below the unknown-count sentinel")); }
-        if !nodes.iter().any(|node| node.null_count() == -1) { return Ok(()); }
         let mut counts = NullCounts { batch, body, version: message.version(), metadata_base: metadata.as_ptr() as usize,
             node: 0, buffer: 0, variadic: 0, patches: Vec::with_capacity(nodes.len()) };
         if let Some(dictionary) = message.header_as_dictionary_batch() {

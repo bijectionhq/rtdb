@@ -1,4 +1,4 @@
-use std::{collections::BTreeMap, fs::{self, File, OpenOptions}, io::{Read, Seek, SeekFrom, Write}, ops::Range, path::{Path, PathBuf}, sync::{Arc, OnceLock, atomic::{AtomicU64, Ordering}}, time::SystemTime};
+use std::{collections::BTreeMap, fs::{self, File, OpenOptions}, io::{Read, Write}, ops::Range, path::{Path, PathBuf}, sync::{Arc, OnceLock, atomic::{AtomicU64, Ordering}}, time::SystemTime};
 use async_trait::async_trait;
 use bytes::Bytes;
 use fs2::FileExt;
@@ -297,13 +297,11 @@ impl ObjectStore for DiskCachedStore {
             return Err(Error::InvalidRange { key: key.to_string(), start: range.start, end: range.end, length: lease.size() });
         }
         let operation = self.cache.begin_operation()?.and(scope);
+        let key = key.clone();
         IoRegion::run_admitted(operation, move || {
-            let lease = lease;
-            let mut file = lease.open().map_err(|error| Error::io(lease.path(), error))?;
-            file.seek(SeekFrom::Start(range.start)).map_err(|error| Error::io(lease.path(), error))?;
-            let mut bytes = vec![0; reservation.length()];
-            file.read_exact(&mut bytes).map_err(|error| Error::io(lease.path(), error))?;
-            reservation.finish(Bytes::from(bytes))
+            let path = lease.path();
+            let file = lease.open().map_err(|error| Error::io(&path, error))?;
+            crate::LocalFile::new(file, Some(lease)).read_reserved_range(&path, &key, range, reservation)
         }).await
     }
     async fn put(&self, key: &ObjectKey, bytes: Bytes) -> Result<()> { let _scope = self.io.admit()?; let _operation = self.cache.begin_operation()?; self.remote.put(key, bytes).await }

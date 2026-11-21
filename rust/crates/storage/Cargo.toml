@@ -15,6 +15,7 @@ rtdb-types.workspace = true
 rtdb-columnar.workspace = true
 async-trait.workspace = true
 bytes.workspace = true
+memmap2.workspace = true
 fs2.workspace = true
 futures = { workspace = true, optional = true }
 object_store = { workspace = true, optional = true }

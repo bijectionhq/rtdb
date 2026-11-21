@@ -161,6 +161,7 @@ impl CacheBudget {
 pub struct CacheLease {
     allocation: Arc<RetainedBytes>,
     range: Range<usize>,
+    cache_charged: bool,
 }
 
 impl AsRef<[u8]> for CacheLease {
@@ -169,6 +170,7 @@ impl AsRef<[u8]> for CacheLease {
 
 impl CacheLease {
     pub fn as_slice(&self) -> &[u8] { &self.allocation.as_slice()[self.range.clone()] }
+    pub fn is_cache_charged(&self) -> bool { self.cache_charged }
 
     /// The slice retains the entire allocation and its byte reservation.
     pub fn slice(&self, range: Range<usize>) -> Result<Self> {
@@ -178,7 +180,7 @@ impl CacheLease {
                 end: range.end as u64, length: self.range.len() as u64,
             });
         }
-        Ok(Self { allocation: self.allocation.clone(), range: self.range.start + range.start..self.range.start + range.end })
+        Ok(Self { allocation: self.allocation.clone(), range: self.range.start + range.start..self.range.start + range.end, cache_charged: self.cache_charged })
     }
 }
 
@@ -300,28 +302,32 @@ impl BufferPool {
         let slot = entry.allocation.try_lock().ok()?;
         let allocation = slot.as_ref()?;
         let (start, end) = (usize::try_from(range.start).ok()?, usize::try_from(range.end).ok()?);
-        (start <= end && end <= allocation.len()).then(|| CacheLease { allocation: allocation.clone(), range: start..end })
+        (start <= end && end <= allocation.len()).then(|| CacheLease { allocation: allocation.clone(), range: start..end, cache_charged: true })
     }
 
-    async fn fetch(&self, key: &ObjectKey, range: Range<u64>, reserve: impl FnOnce(usize) -> Result<Arc<MemoryReservation>>) -> Result<CacheLease> {
+    async fn fetch(&self, key: &ObjectKey, range: Range<u64>, reserve: impl FnOnce(usize) -> Result<(Arc<MemoryReservation>, bool)>) -> Result<CacheLease> {
         let length = range.end.checked_sub(range.start).and_then(|length| usize::try_from(length).ok())
             .ok_or_else(|| Error::Task("Object range is inverted or exceeds addressable memory".into()))?;
-        let reservation = ReadReservation::new(length, reserve(length)?);
+        let (reservation, cache_charged) = reserve(length)?;
+        let reservation = ReadReservation::new(length, reservation);
         let allocation = Arc::new(self.store.get_reserved_range(key, range, reservation).await?);
-        Ok(CacheLease { allocation, range: 0..length })
+        Ok(CacheLease { allocation, range: 0..length, cache_charged })
     }
 
     /// `range` of an object: a slice of the object where the pool holds all of it, and otherwise those bytes alone,
     /// fetched and charged to the pool's budget for as long as the lease lives, but not kept.
     pub async fn get_range(&self, key: &ObjectKey, range: Range<u64>) -> Result<CacheLease> {
         if let Some(lease) = self.held_range(key, &range) { return Ok(lease); }
-        self.fetch(key, range, |length| self.budget.reserve(length)).await
+        self.fetch(key, range, |length| self.budget.reserve(length).map(|reservation| (reservation, true))).await
     }
 
     /// As `get_range`, charging the bytes to `fallback` where the pool's budget cannot hold them.
     pub async fn get_range_or(&self, key: &ObjectKey, range: Range<u64>, fallback: &Arc<MemoryBudget>) -> Result<CacheLease> {
         if let Some(lease) = self.held_range(key, &range) { return Ok(lease); }
-        self.fetch(key, range, |length| self.budget.reserve(length).or_else(|_| reserve_from(fallback, length))).await
+        self.fetch(key, range, |length| {
+            self.budget.reserve(length).map(|reservation| (reservation, true))
+                .or_else(|_| reserve_from(fallback, length).map(|reservation| (reservation, false)))
+        }).await
     }
 
     /// As `get`, except that an object the pool cannot admit is read whole under `fallback`, and not kept.
@@ -329,7 +335,7 @@ impl BufferPool {
         match self.get(key).await {
             Err(Error::MemoryLimit { .. }) => {
                 let size = self.store.head(key).await?.size;
-                self.fetch(key, 0..size, |length| reserve_from(fallback, length)).await
+                self.fetch(key, 0..size, |length| reserve_from(fallback, length).map(|reservation| (reservation, false))).await
             }
             fetched => fetched,
         }
@@ -365,7 +371,7 @@ impl BufferPool {
         };
         cleanup.armed = false;
         let length = allocation.len();
-        Ok(CacheLease { allocation, range: 0..length })
+        Ok(CacheLease { allocation, range: 0..length, cache_charged: true })
     }
 
     /// Reserves `bytes` from the pool's budget for a view about to be decoded, evicting idle entries to make room.

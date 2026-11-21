@@ -38,6 +38,11 @@ An empty entry is removed when its last fetcher fails or is cancelled.
 Pools sharing a payload budget report its retained encoded bytes and in-flight read reservations.
 An evicted payload remains charged until its last lease or slice drops.
 
+Trie scans cache the Arrow footer and fetch the ranges for its dictionaries and selected record batches.
+Uncompressed Arrow buffers that satisfy alignment and compatibility checks retain the fetched range directly.
+Reserved reads from local and disk-cache files map the requested range when the platform allows it.
+A mapped cache range keeps the disk lease alive until the last view drops.
+
 `DiskCache` is a shared monitor for immutable remote files, with per-entry load exclusion and passive leases that prevent eviction during reads.
 Downloads publish a complete temporary file atomically and charge each in-flight chunk and retained entry to the supplied allocation budget.
 Cancelled or failed loads release their temporary files and allow a later reader to retry.

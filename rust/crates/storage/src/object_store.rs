@@ -1,6 +1,7 @@
 use crate::{Error, IoRegion, Result};
 use async_trait::async_trait;
 use bytes::Bytes;
+use memmap2::{Mmap, MmapOptions};
 use parking_lot::RwLock;
 use std::collections::BTreeMap;
 use std::fs::{self, File};
@@ -180,6 +181,29 @@ pub struct LocalFile { file: std::fs::File, _lease: Option<crate::disk_cache::Di
 impl LocalFile {
     pub(crate) fn new(file: std::fs::File, lease: Option<crate::disk_cache::DiskLease>) -> Self { Self { file, _lease: lease } }
     pub fn file(&self) -> &std::fs::File { &self.file }
+
+    pub(crate) fn read_reserved_range(mut self, path: &Path, key: &ObjectKey, range: Range<u64>, reservation: ReadReservation) -> Result<RetainedBytes> {
+        reservation.check_range(&range)?;
+        let length = self.file.metadata().map_err(|error| Error::io(path, error))?.len();
+        let slice = checked_range(key, range.clone(), length)?;
+        if !slice.is_empty() {
+            // SAFETY: both stores publish immutable files. Cache retirement and deletion only rename or unlink
+            // the inode, and the disk lease pins its bytes through the last mapped view.
+            if let Ok(mapping) = unsafe { MmapOptions::new().offset(range.start).len(slice.len()).map(&self.file) } {
+                return reservation.finish(Bytes::from_owner(MappedRange { mapping, _lease: self._lease }));
+            }
+        }
+        self.file.seek(SeekFrom::Start(range.start)).map_err(|error| Error::io(path, error))?;
+        let mut bytes = vec![0; slice.len()];
+        self.file.read_exact(&mut bytes).map_err(|error| Error::io(path, error))?;
+        reservation.finish(Bytes::from(bytes))
+    }
+}
+
+struct MappedRange { mapping: Mmap, _lease: Option<crate::disk_cache::DiskLease> }
+
+impl AsRef<[u8]> for MappedRange {
+    fn as_ref(&self) -> &[u8] { self.mapping.as_ref() }
 }
 
 pub struct LocalStore {
@@ -320,7 +344,10 @@ impl ObjectStore for LocalStore {
     async fn get_reserved_range(&self, key: &ObjectKey, range: Range<u64>, reservation: ReadReservation) -> Result<RetainedBytes> {
         reservation.check_range(&range)?;
         let (path, key) = (self.path(key), key.clone());
-        self.io.run(move || reservation.finish(read_local_range(&path, &key, range)?)).await
+        self.io.run(move || {
+            let file = open_object(&path, &key)?;
+            LocalFile::new(file, None).read_reserved_range(&path, &key, range, reservation)
+        }).await
     }
 
     async fn put(&self, key: &ObjectKey, bytes: Bytes) -> Result<()> {

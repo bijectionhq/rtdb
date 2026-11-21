@@ -4910,6 +4910,7 @@ dependencies = [
  "fs2",
  "futures",
  "libc",
+ "memmap2",
  "object_store",
  "parking_lot",
  "percent-encoding",

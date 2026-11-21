@@ -349,6 +349,29 @@ async fn successful_file_upload_warms_cache_and_deleting_through_the_store_drops
 }
 
 #[tokio::test]
+async fn a_mapped_range_keeps_an_invalidated_file_alive_until_its_last_view_drops() {
+    let directory = tempfile::tempdir().unwrap();
+    let memory = MemoryBudget::new(4 << 20);
+    let cache = DiskCache::open(directory.path(), 100, Arc::clone(&memory)).unwrap();
+    let remote = Arc::new(MemoryStore::default());
+    let key = ObjectKey::new("object").unwrap();
+    remote.put(&key, Bytes::from_static(b"abcdefgh")).await.unwrap();
+    let store = cache.scope(ObjectKey::new("db/0").unwrap(), remote).unwrap();
+
+    let mapped = store.get_reserved_range(&key, 1..5, ReadReservation::new(4, memory.reserve(4).unwrap())).await.unwrap();
+    assert_eq!(cache.stats().pinned_bytes, 8);
+    store.delete(&key).await.unwrap();
+    assert!(!directory.path().join("db/0/object").exists());
+    assert_eq!(mapped.as_slice(), b"bcde");
+    let temp = directory.path().join(".tmp");
+    let retired = || std::fs::read_dir(&temp).unwrap().map(|entry| entry.unwrap())
+        .filter(|entry| entry.file_name().to_string_lossy().starts_with("retired-")).count();
+    assert_eq!(retired(), 1);
+    drop(mapped);
+    assert_eq!(retired(), 0);
+}
+
+#[tokio::test]
 async fn an_invalidated_file_outlives_its_leases_and_nothing_else() {
     let directory = tempfile::tempdir().unwrap();
     let memory = MemoryBudget::new(4 * 1024 * 1024);

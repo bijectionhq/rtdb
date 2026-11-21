@@ -20,6 +20,63 @@ fn tx(state: &PartitionState, budget: &Arc<MemoryBudget>, id: i64, system: i64) 
 fn timestamp(value: i64) -> Value { Value::Timestamp { value, unit: TimeUnit::Microsecond, timezone: Some("UTC".into()) } }
 
 #[tokio::test]
+async fn a_cold_point_scan_reads_only_its_page_in_a_file_larger_than_the_query_budget() {
+    use rtdb_format::data::{StoredEvent, StoredOperation};
+
+    let state = PartitionState::empty(TrieConfig::default()).unwrap();
+    let write_memory = MemoryBudget::new(128 << 20);
+    let small_id = 1;
+    let small_iid = EntityId::Integer(small_id).iid();
+    let small_bucket = usize::from(small_iid.0[0] >> 6);
+    let large_id = (2..).find(|id| usize::from(EntityId::Integer(*id).iid().0[0] >> 6) != small_bucket).unwrap();
+    let large_iid = EntityId::Integer(large_id).iid();
+    let mut tx = tx(&state, &write_memory, 0, 10);
+    tx.put(table(), document(small_id, Value::Utf8("selected".into())), Interval::ALL).unwrap();
+    state.apply(&tx.stage().unwrap()).unwrap();
+
+    let prepared = state.prepare_block().unwrap();
+    let catalog = prepared.table_catalog().unwrap();
+    let fields = prepared.value().snapshot().column_types(&table());
+    let page = |id, iid, text| {
+        let event = StoredEvent { iid, system_from: Timestamp(10), valid_time: Interval::ALL,
+            operation: StoredOperation::Put(document(id, Value::Utf8(text))), recency: None };
+        build_event_batch(&[event], Some(fields.clone()), None).unwrap()
+    };
+    let small = page(small_id, small_iid, "selected".into());
+    let large = page(large_id, large_iid, "x".repeat(8 << 20));
+    let bytes = write_file(small.schema().as_ref(), &[small.clone(), large.clone()]).unwrap();
+    let query_limit = 2 << 20;
+    assert!(bytes.len() > query_limit);
+
+    let mut metadata = MetadataBuilder::new(false, false);
+    let mut children = [None; 4];
+    children[small_bucket] = Some(metadata.write_leaf(&small).unwrap());
+    children[usize::from(large_iid.0[0] >> 6)] = Some(metadata.write_leaf(&large).unwrap());
+    metadata.write_iid_branch(children).unwrap();
+    let (metadata, statistics) = metadata.finish().unwrap();
+    let trie = TrieKey::l0(prepared.block_index()).unwrap();
+    let slug = &catalog.entry(&table()).unwrap().slug;
+    let data_key = ObjectKey::new(slug.data_key(&trie)).unwrap();
+    let metadata_key = ObjectKey::new(slug.metadata_key(&trie)).unwrap();
+    let entry = CatalogTrie::notification(trie, bytes.len() as i64, Some(statistics)).unwrap();
+    state.add_tries(&BTreeMap::from([(table(), vec![entry])]), Timestamp(20)).unwrap();
+
+    let directory = tempfile::tempdir().unwrap();
+    let store = Arc::new(rtdb_storage::LocalStore::open(directory.path()).unwrap());
+    store.put(&data_key, bytes.into()).await.unwrap();
+    store.put(&metadata_key, metadata.write().unwrap().into()).await.unwrap();
+    let storage = Arc::new(BufferPool::new(store, 1 << 20));
+    let database = DatabaseSnapshot { partitions: vec![state.value().snapshot()], storage: Arc::clone(&storage) };
+    let catalog = CatalogSnapshot::new("xtdb", BTreeMap::from([("xtdb".into(), database)]), false).unwrap();
+    let memory = MemoryBudget::new(query_limit);
+    let context = QueryContext::new(catalog, Arc::clone(&memory), Timestamp(50), "UTC", QueryOptions::default(), &CancellationToken::new()).unwrap();
+    let relation = scan(&context, &["v"], TemporalFilter::All, TemporalFilter::Default, Some(BTreeSet::from([small_iid])));
+    assert_eq!(collect(relation, context).await.unwrap(), vec![vec![Value::Utf8("selected".into())]]);
+    assert!(!storage.holds(&data_key));
+    assert_eq!(memory.used_bytes(), 0);
+}
+
+#[tokio::test]
 async fn live_unsigned_cells_open_signed_while_native_metadata_rejects_unsigned_storage() {
     let budget = MemoryBudget::new(1 << 27);
     let state = PartitionState::empty(TrieConfig::new(32, 32).unwrap()).unwrap();

@@ -21,3 +21,61 @@ fn a_file_opened_from_its_footer_reads_a_page_from_that_page_s_bytes_alone() {
     assert_eq!(reader.read_page(1).unwrap(), pages[1]);
     assert!(reader.read_page(0).is_err(), "a page whose bytes were not fetched cannot be read");
 }
+
+#[test]
+fn a_selected_batch_can_read_its_dictionary_without_other_batch_bytes() {
+    use arrow_array::{builder::StringDictionaryBuilder, types::Int32Type};
+    use arrow_ipc::writer::FileWriter;
+    use rtdb_format::ipc::{ArrowFileFooter, ArrowFilePages, file_footer_range};
+
+    let mut values = StringDictionaryBuilder::<Int32Type>::new();
+    values.append("often").unwrap();
+    values.append("rarely").unwrap();
+    values.append("often").unwrap();
+    let array = Arc::new(values.finish()) as ArrayRef;
+    let schema = Arc::new(Schema::new(vec![Field::new("status", array.data_type().clone(), false)]));
+    let page = RecordBatch::try_new(Arc::clone(&schema), vec![array]).unwrap();
+    let mut writer = FileWriter::try_new(Vec::new(), &schema).unwrap();
+    writer.write(&page).unwrap();
+    writer.write(&page).unwrap();
+    let bytes = writer.into_inner().unwrap();
+
+    let trailer = bytes[bytes.len() - 10..].try_into().unwrap();
+    let footer_range = file_footer_range(bytes.len() as u64, trailer).unwrap();
+    let footer = ArrowFileFooter::parse(&bytes[footer_range.start as usize..footer_range.end as usize], footer_range.start).unwrap();
+    let mut reader = ArrowFilePages::new(&footer).unwrap();
+    for (index, range) in footer.dictionary_ranges().enumerate() {
+        let range = range.unwrap();
+        let bytes = bytes[range.start as usize..range.end as usize].to_vec();
+        assert!(footer.dictionary_allocation_bound(index, &bytes).unwrap() >= bytes.len());
+        reader.read_dictionary(&footer, index, bytes).unwrap();
+    }
+
+    let range = reader.page_range(1).unwrap();
+    let bytes = bytes[range.start as usize..range.end as usize].to_vec();
+    assert!(reader.page_allocation_bound(1, &bytes).unwrap() >= bytes.len());
+    assert!(reader.page_allocation_bound(1, &bytes[..bytes.len() - 1]).is_err());
+    let decoded = reader.read_page(1, bytes).unwrap();
+    drop(reader);
+    assert_eq!(decoded, page);
+}
+
+#[test]
+fn native_page_arrays_keep_the_fetched_bytes_without_copying_them() {
+    use rtdb_format::ipc::{ArrowFileFooter, ArrowFilePages, file_footer_range};
+
+    let schema = Arc::new(Schema::new(vec![Field::new("n", DataType::Int64, false)]));
+    let page = RecordBatch::try_new(Arc::clone(&schema), vec![Arc::new(Int64Array::from(vec![100, 200]))]).unwrap();
+    let bytes = write_file(&schema, std::slice::from_ref(&page)).unwrap();
+    let trailer = bytes[bytes.len() - 10..].try_into().unwrap();
+    let footer_range = file_footer_range(bytes.len() as u64, trailer).unwrap();
+    let footer = ArrowFileFooter::parse(&bytes[footer_range.start as usize..footer_range.end as usize], footer_range.start).unwrap();
+    let reader = ArrowFilePages::new(&footer).unwrap();
+    let range = reader.page_range(0).unwrap();
+    let range = bytes[range.start as usize..range.end as usize].to_vec();
+    let address = range.as_ptr_range();
+    let decoded = reader.read_page(0, range).unwrap();
+    let column = decoded.column(0).as_any().downcast_ref::<Int64Array>().unwrap();
+    assert!(address.contains(&column.values().as_ptr().cast()));
+    assert_eq!(decoded, page);
+}
