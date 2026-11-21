@@ -203,6 +203,10 @@ It also exercises the Azure adapter against a loopback provider and separately m
   The reachability witnesses show a successful refresh and a separate trim after admission.
 * `tla/RecoveryReplay.tla` models the earlier checkpoint selection check against the observed replica prefix, refresh, and subsequent tail opening.
   It checks recovery with a newer checkpoint and reaches a separate loss between the probe and tail opening.
+* `tla/PublishedCheckpoint.tla` checks that a directory-admitted checkpoint and a replay retry keep the authorized journal and advance both coordinates.
+  `lean/PublishedCheckpoint.lean` proves the coordinate relationship for arbitrary retry histories.
+  `verus/checkpoint_discovery` checks the exact Rust predicate for the admitted boundary and a valid successor.
+  Native replays exercise a mismatched checkpoint, a different journal, a prefix gap and successful recovery from a later boundary.
 * `mcrl2/CheckpointDiscovery.mcrl2` compares the staged metadata discovery with an atomic observation contract after hiding the selection and individual reads.
   It checks divergence-preserving branching bisimilarity on three indices and generates a distinguishing formula for each weakened model.
 * `hyperltl/CheckpointRecovery.hltl` compares every pair of modeled startup schedules with the same stable, readable replacement.

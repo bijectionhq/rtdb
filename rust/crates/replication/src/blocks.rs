@@ -20,6 +20,7 @@ pub struct RecoveredPartition {
     pub fence: TermFence,
     pub(crate) compaction_replay_cutoff: Option<ReplicaPosition>,
     refresh_allowed: bool,
+    published_checkpoint: Option<PublishedCheckpoint>,
     replay_tail: Option<PreparedReplay>,
     table_blocks: BTreeMap<rtdb_types::TableRef, TableBlock>,
 }
@@ -129,6 +130,24 @@ pub struct ProducedBlock {
     pub tries: BTreeMap<rtdb_types::TableRef, Vec<CatalogTrie>>,
 }
 
+/// The block and replica position admitted together by the serving directory.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PublishedCheckpoint {
+    pub block: BlockIndex,
+    pub boundary: ReplicaPosition,
+}
+
+impl PublishedCheckpoint {
+    fn accepts(self, block: &BlockCatalog) -> bool {
+        let loaded = block.boundary_replica_position()
+            .map(|position| position.after_offset(self.boundary.epoch()))
+            .filter(|offset| *offset >= 0);
+        crate::checkpoint_discovery::accepts_published_checkpoint(
+            self.block.0, self.boundary.after_offset(self.boundary.epoch()), block.block_index().0, loaded,
+        )
+    }
+}
+
 /// How recovery finds a partition's latest block.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum BlockDiscovery {
@@ -138,13 +157,15 @@ pub enum BlockDiscovery {
     /// Probes forward from a known block, one head per block.
     /// Listing handles a missing hint or refreshes discovery after a missing metadata read.
     From(BlockIndex),
-    /// A published and admitted lower bound. A refreshed listing must also respect it.
-    FromPublished(BlockIndex),
+    /// A published and admitted lower bound in one replica journal.
+    FromPublished(PublishedCheckpoint),
     /// A restored serving generation requires its archived checkpoint and suppresses
     /// physical compaction effects from the sealed history preceding restoration.
     FromRestored { checkpoint: BlockIndex, compaction_cutoff: ReplicaPosition },
     /// Recovers exactly this block, for a reader of the state as of it.
     At(BlockIndex),
+    /// Recovers exactly the block and journal boundary admitted by the directory.
+    AtPublished(PublishedCheckpoint),
 }
 
 pub struct BlockStore {
@@ -160,13 +181,21 @@ impl BlockStore {
         Ok(Arc::new(Self { store, cache, memory, file_size_target }))
     }
     pub async fn recover(&self, config: TrieConfig, source_floor: SourcePosition, now: Timestamp, discovery: BlockDiscovery) -> Result<RecoveredPartition> {
-        self.restore(config, source_floor, now, discovery, self.load_selected_checkpoint(discovery, None).await?)
+        let published = match discovery {
+            BlockDiscovery::FromPublished(checkpoint) | BlockDiscovery::AtPublished(checkpoint) => Some(checkpoint),
+            _ => None,
+        };
+        let selected = self.load_selected_checkpoint(discovery, None, published).await?;
+        self.restore(config, source_floor, now, discovery, published, selected)
     }
 
     /// Admits an ordinary latest checkpoint with the same cursor the driver will consume.
     /// An exact or restored checkpoint specifies its own recovery anchor.
     pub async fn recover_for_replay(&self, mut recovered: RecoveredPartition, logs: &Arc<PartitionLogs>,
         config: TrieConfig, now: Timestamp, cancellation: &CancellationToken) -> Result<RecoveredPartition> {
+        if recovered.published_checkpoint.is_some_and(|checkpoint| checkpoint.boundary.epoch() != logs.replica_epoch) {
+            return Err(invalid("The admitted checkpoint belongs to a different replica journal than the opened log"));
+        }
         let source_floor = logs.source_floor()?;
         if !recovered.refresh_allowed { return Ok(recovered.with_source_floor(source_floor)); }
         let work = async {
@@ -181,17 +210,19 @@ impl BlockStore {
                     Err(error) => return Err(error.into()),
                 };
                 let previous = recovered.block.as_ref().map(BlockCatalog::block_index);
+                let published = recovered.published_checkpoint;
                 drop(recovered);
-                let Some(replacement) = self.load_selected_checkpoint(BlockDiscovery::List, previous).await? else {
+                let Some(replacement) = self.load_selected_checkpoint(BlockDiscovery::List, previous, published).await? else {
                     return Err(gap.into());
                 };
-                recovered = self.restore(config, source_floor, now, BlockDiscovery::List, Some(replacement))?;
+                recovered = self.restore(config, source_floor, now, BlockDiscovery::List, published, Some(replacement))?;
             }
         };
         cancellation.run_until_cancelled(work).await.ok_or_else(crate::progress::cancelled)?
     }
 
     fn restore(&self, config: TrieConfig, source_floor: SourcePosition, now: Timestamp, discovery: BlockDiscovery,
+        published: Option<PublishedCheckpoint>,
         selected: Option<(BlockCatalog, BTreeMap<rtdb_types::TableRef, TableBlock>)>) -> Result<RecoveredPartition> {
         let compaction_replay_cutoff = match discovery {
             BlockDiscovery::FromRestored { compaction_cutoff, .. } => Some(compaction_cutoff),
@@ -211,9 +242,13 @@ impl BlockStore {
         };
         let fence = match &block { Some(block) => TermFence::from_catalog(block)?, None => TermFence::from_boundary(rtdb_types::Term(0), None)? };
         let refresh_allowed = matches!(discovery, BlockDiscovery::List | BlockDiscovery::From(_) | BlockDiscovery::FromPublished(_));
-        Ok(RecoveredPartition { partition, block, progress, fence, table_blocks, compaction_replay_cutoff, refresh_allowed, replay_tail: None }.with_source_floor(source_floor))
+        let published_checkpoint = published.and(block.as_ref()).and_then(|block| {
+            block.boundary_replica_position().map(|boundary| PublishedCheckpoint { block: block.block_index(), boundary })
+        });
+        Ok(RecoveredPartition { partition, block, progress, fence, table_blocks, compaction_replay_cutoff, refresh_allowed, published_checkpoint, replay_tail: None }.with_source_floor(source_floor))
     }
-    async fn load_selected_checkpoint(&self, discovery: BlockDiscovery, previous: Option<BlockIndex>) -> Result<Option<(BlockCatalog, BTreeMap<rtdb_types::TableRef, TableBlock>)>> {
+    async fn load_selected_checkpoint(&self, discovery: BlockDiscovery, previous: Option<BlockIndex>,
+        published: Option<PublishedCheckpoint>) -> Result<Option<(BlockCatalog, BTreeMap<rtdb_types::TableRef, TableBlock>)>> {
         let latest = self.latest_block(discovery).await?;
         let selected = match previous {
             Some(previous) => crate::checkpoint_discovery::newer_checkpoint(previous.0, latest.map(|index| index.0)).map(BlockIndex),
@@ -222,7 +257,7 @@ impl BlockStore {
         let Some(mut index) = selected else { return Ok(None); };
         let refresh = matches!(discovery, BlockDiscovery::List | BlockDiscovery::From(_) | BlockDiscovery::FromPublished(_));
         loop {
-            match self.load(index).await {
+            match self.load_checkpoint(index, published).await {
                 Err(error) if refresh && error.code == "rtdb.storage/missing-object" => {
                     let listed = self.latest_block(BlockDiscovery::List).await?.map(|index| index.0);
                     let Some(next) = crate::checkpoint_discovery::newer_checkpoint(index.0, listed) else {
@@ -243,15 +278,24 @@ impl BlockStore {
                 Err(error) => Err(rtdb_types::Anomaly::from(error)),
             }
         };
+        let discovery = match discovery {
+            BlockDiscovery::AtPublished(published) => BlockDiscovery::At(published.block),
+            other => other,
+        };
         let mut latest = match discovery {
             BlockDiscovery::At(block) if exists(block).await? => return Ok(Some(block)),
             BlockDiscovery::At(block) => return Err(rtdb_types::Anomaly::new(rtdb_types::AnomalyCategory::Unavailable, "rtdb.replication/block-gone", format!("Block {} is no longer stored", block.0))),
-            BlockDiscovery::From(hint) | BlockDiscovery::FromPublished(hint) if exists(hint).await? => hint,
-            BlockDiscovery::FromPublished(hint) => return self.latest_listed_block().await?
-                .filter(|index| *index >= hint).map(Some).ok_or_else(|| rtdb_types::Anomaly::new(
-                    rtdb_types::AnomalyCategory::Unavailable, "rtdb.replication/block-gone",
-                    format!("Published checkpoint {} and its successors could not be found", hint.0),
-                )),
+            BlockDiscovery::From(hint) if exists(hint).await? => hint,
+            BlockDiscovery::FromPublished(checkpoint) => {
+                if !exists(checkpoint.block).await? {
+                    return self.latest_listed_block().await?.filter(|index| *index >= checkpoint.block)
+                        .map(Some).ok_or_else(|| rtdb_types::Anomaly::new(
+                            rtdb_types::AnomalyCategory::Unavailable, "rtdb.replication/block-gone",
+                            format!("Published checkpoint {} and its successors could not be found", checkpoint.block.0),
+                        ));
+                }
+                checkpoint.block
+            }
             BlockDiscovery::FromRestored { checkpoint, .. } if exists(checkpoint).await? => checkpoint,
             BlockDiscovery::FromRestored { checkpoint, .. } => return Err(rtdb_types::Anomaly::new(
                 rtdb_types::AnomalyCategory::Unavailable, "rtdb.replication/block-gone",
@@ -329,7 +373,14 @@ impl BlockStore {
     }
 
     pub async fn load(&self, index: BlockIndex) -> Result<(BlockCatalog, BTreeMap<rtdb_types::TableRef, TableBlock>)> {
+        self.load_checkpoint(index, None).await
+    }
+
+    async fn load_checkpoint(&self, index: BlockIndex, published: Option<PublishedCheckpoint>) -> Result<(BlockCatalog, BTreeMap<rtdb_types::TableRef, TableBlock>)> {
         let block = self.load_catalog(index).await?;
+        if published.is_some_and(|expected| !expected.accepts(&block)) {
+            return Err(invalid("The stored checkpoint does not match or advance the admitted checkpoint in its replica journal"));
+        }
         let mut tables = BTreeMap::new();
         for entry in block.table_entries()? {
             let lease = self.cache.get(&ObjectKey::new(entry.slug.block_key(index)?)?).await?;

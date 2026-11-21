@@ -1426,6 +1426,9 @@ Native runs verify both cases using the block collector, and Verus checks the st
 For providers that support recovery cursor admission, the database admits the cursor before installing an ordinary checkpoint.
 A trimmed first required offset triggers strictly newer checkpoint discovery.
 The replication driver uses that same cursor after checking the log and checkpoint boundary.
+Ordinary hosted discovery validates the block and journal boundary captured in the directory admission.
+A retry following prefix collection checks the successor against the last accepted checkpoint.
+Verus checks the coordinate decision. Lean proves preservation across successive replacements, and native replays exercise refusal and successful recovery.
 Verus checks the exact first-required-offset rule.
 The native memory-provider run selects a later checkpoint and replays its retained suffix with the cursor admitted during startup.
 TLC checks cursor admission, reuse and strict progress before refusal and reaches a state with later trimming after admission.
@@ -1437,7 +1440,7 @@ The native trie collector protects live and nascent trie files from the latest i
 The reference comes from the persisted table blocks, and it changes atomically with local block adoption.
 Verus checks the selection decision independently of whether a query reader exists.
 TLC and Apalache check the installed-checkpoint rule separately from the current catalog, including nascent trie dependencies and delayed deletion.
-|Extend protection across checkpoint discovery, replacement, and multiple authorities.
+|Bind the admitted coordinate to a complete dependency manifest and extend protection across multiple authorities.
 Protect the required log suffix through replay and account for deletion entry points outside trie collection.
 Establish supported remote configurations and any eventual retry and staging cleanup guarantees.
 

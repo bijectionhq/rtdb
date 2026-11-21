@@ -670,6 +670,38 @@ def verify_hosted_trie_release(args, scratch):
                       "hosted-trie-release", controls, 4)
 
 
+def verify_published_checkpoint(args, scratch):
+    controls = {
+        "ignore-journal": (
+            "  candidate.journal = anchor.journal ∧",
+            "  True ∧",
+            ["an_accepted_checkpoint_keeps_its_journal"],
+        ),
+        "reuse-boundary": (
+            "(anchor.block < candidate.block ∧ anchor.boundary < candidate.boundary)",
+            "(anchor.block < candidate.block ∧ anchor.boundary ≤ candidate.boundary)",
+            ["advancing_the_block_advances_its_boundary"],
+        ),
+        "change-boundary-at-same-block": (
+            "(candidate.block = anchor.block ∧ candidate.boundary = anchor.boundary)",
+            "(candidate.block = anchor.block ∧ candidate.boundary ≥ anchor.boundary)",
+            ["keeping_the_block_keeps_its_boundary"],
+        ),
+        "unit-successors-only": (
+            "(anchor.block < candidate.block ∧ anchor.boundary < candidate.boundary)",
+            "(anchor.block < candidate.block ∧ anchor.boundary + 1 = candidate.boundary)",
+            ["accepts_transitively"],
+        ),
+        "retry-without-guard": (
+            "(advance : agreesOrAdvances current next)",
+            "(advance : True)",
+            ["every_retry_respects_the_original_checkpoint"],
+        ),
+    }
+    verify_lean_model(args, scratch, Path("verification/lean/PublishedCheckpoint.lean"),
+                      "published-checkpoint", controls, 5)
+
+
 def verify_reader_reclamation_minimality(args, scratch):
     path = Path("verification/lean/ReaderReclamationMinimality.lean")
     controls = {
@@ -1591,6 +1623,7 @@ def verify_lean(args, scratch):
             verify_replica_trim_admission(args, scratch)
             verify_replica_hold_close(args, scratch)
             verify_checkpoint_metadata_retention(args, scratch)
+            verify_published_checkpoint(args, scratch)
             verify_residence_reader_retention(args, scratch)
             verify_delegated_scan(args, scratch, directory)
             verify_compaction_projection(args, scratch, directory)
@@ -1746,6 +1779,17 @@ TLA_CASES = (
       "INVARIANT NoReplacementOpenAfterCollection"),
      "NoReplacementOpenAfterCollection"),
     ("RecoveryDiscovery", "checkpoint-discovery", None, None),
+    ("PublishedCheckpoint", "published-checkpoint", None, None),
+    ("PublishedCheckpoint", "published-checkpoint-trust-block",
+     ('Mutation = "none"', 'Mutation = "trust_block"'), "MatchesAdmittedBoundary"),
+    ("PublishedCheckpoint", "published-checkpoint-ignore-journal",
+     ('Mutation = "none"', 'Mutation = "ignore_journal"'), "MatchesAdmittedBoundary"),
+    ("PublishedCheckpoint", "published-checkpoint-forget-retry-anchor",
+     ('Mutation = "none"', 'Mutation = "forget_retry_anchor"'), "MatchesAdmittedBoundary"),
+    ("PublishedCheckpoint", "published-checkpoint-open-wrong-journal",
+     ('Mutation = "none"', 'Mutation = "open_wrong_journal"'), "OpensAdmittedJournal"),
+    ("PublishedCheckpoint", "published-checkpoint-advance-witness",
+     ("INVARIANTS MatchesAdmittedBoundary OpensAdmittedJournal", "INVARIANT NeverOpensAfterAdvancing"), "NeverOpensAfterAdvancing"),
     ("RecoveryDiscovery", "checkpoint-discovery-fail-fast", ('Mutation = "none"', 'Mutation = "fail_fast"'), "MissingFailureHasRefreshed"),
     ("RecoveryDiscovery", "checkpoint-discovery-allow-same", ('Mutation = "none"', 'Mutation = "allow_same"'), "AttemptsAdvance"),
     ("RecoveryDiscovery", "checkpoint-discovery-ignore-newer", ('Mutation = "none"', 'Mutation = "ignore_newer"'), "UsesNewerListing"),
@@ -2130,6 +2174,10 @@ def verify_apalache(args, scratch):
     )
 
     check_apalache(args, scratch, "RecoveryDiscovery", "checkpoint-discovery", "DiscoverySafe", 10)
+    check_apalache(args, scratch, "PublishedCheckpoint", "published-checkpoint", "Safe", 5)
+    check_apalache(args, scratch, "PublishedCheckpoint", "published-checkpoint-forget-retry-anchor",
+                   "MatchesAdmittedBoundary", 5, ('Mutation = "none"', 'Mutation = "forget_retry_anchor"'),
+                   "retry regresses the installed boundary")
     check_apalache(
         args, scratch, "RecoveryDiscovery", "checkpoint-discovery-fail-fast", "MissingFailureHasRefreshed", 10,
         ('Mutation = "none"', 'Mutation = "fail_fast"'), "missing checkpoint without refreshed discovery",
@@ -2371,6 +2419,59 @@ def verify_checkpoint_replay(args, source):
     finally:
         blocks.write_bytes(original)
     print("rust-checkpoint-replay: nine tests passed, root-first and fail-fast mutations rejected")
+
+
+def verify_published_checkpoint_replay(args, source):
+    env = os.environ | {
+        "CARGO_TARGET_DIR": os.environ.get("CARGO_TARGET_DIR", str(ROOT / "target")),
+        "CARGO_PROFILE_TEST_DEBUG": "0",
+    }
+    command = ["cargo", "test", "--locked", "-p", "rtdb-replication", "--lib"]
+    test = "driver::tests::hosted_checkpoint_recovery_preserves_its_admitted_journal_boundary"
+    witness = "driver::tests::hosted_checkpoint_recovery_can_use_a_later_boundary_after_prefix_collection"
+    for name, case in (("baseline", test), ("advance-witness", witness)):
+        checked = run_case([*command, case, "--", "--exact"], source / "rust",
+                           args.evidence, f"rust-published-checkpoint-{name}", env)
+        if checked.returncode or f"{case} ... ok" not in checked.stdout or "1 passed; 0 failed" not in checked.stdout:
+            raise ValueError(f"the hosted checkpoint replay {name} failed")
+
+    blocks = "rust/crates/replication/src/blocks.rs"
+    step = "rust/crates/replication/src/checkpoint_discovery.rs"
+    controls = {
+        "changed-exact-boundary": (
+            step, "Some(boundary) if loaded_block == published_block => boundary == published_boundary,",
+            "Some(_) if loaded_block == published_block => true,",
+            "the exact snapshot must match the boundary the directory admitted",
+        ),
+        "foreign-epoch": (
+            blocks, ".map(|position| position.after_offset(self.boundary.epoch()))",
+            ".map(|position| position.offset())",
+            "a replay retry must reject a successor from a different journal",
+        ),
+        "forget-retry-anchor": (
+            blocks, "let published = recovered.published_checkpoint;",
+            "let published = None;",
+            "a replay retry must reject a successor from a different journal",
+        ),
+        "open-wrong-journal": (
+            blocks, "if recovered.published_checkpoint.is_some_and(|checkpoint| checkpoint.boundary.epoch() != logs.replica_epoch) {",
+            "if false && recovered.published_checkpoint.is_some_and(|checkpoint| checkpoint.boundary.epoch() != logs.replica_epoch) {",
+            "the admitted snapshot cannot be installed against a different replica journal",
+        ),
+    }
+    for name, (relative, before, after, failure) in controls.items():
+        path = source / relative
+        original = path.read_bytes()
+        try:
+            replace_once(path, before, after)
+            checked = run_case([*command, test, "--", "--exact"], source / "rust", args.evidence,
+                               f"rust-published-checkpoint-{name}", env)
+            if (checked.returncode != 101 or f"{test} ... FAILED" not in checked.stdout
+                or failure not in checked.stdout or "0 passed; 1 failed" not in checked.stdout):
+                raise ValueError(f"hosted checkpoint control {name} missed its declared assertion")
+        finally:
+            path.write_bytes(original)
+    print("rust-published-checkpoint: both replays passed and four journal controls failed")
 
 
 def verify_checkpoint_trie_retention(args, source):
@@ -3305,6 +3406,7 @@ def main():
             replay_rank_witness(args, directory)
             replay_rust_trace(args)
             verify_checkpoint_replay(args, source)
+            verify_published_checkpoint_replay(args, source)
             verify_checkpoint_trie_retention(args, source)
             verify_trie_removal_readback(args, source)
             verify_durable_trie_retirement(args, source)

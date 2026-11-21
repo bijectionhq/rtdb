@@ -506,16 +506,75 @@ async fn block_production_is_repeatable_and_adoption_folds_rows_once() {
     assert_eq!(fixture.driver.partition.value().table_catalog().metadata(&table).unwrap().row_count, 8);
     assert_eq!(fixture.driver.partition.value().live().block_row_count(), 0);
     use crate::BlockDiscovery::{At, From, FromPublished, List};
-    for discovery in [List, From(BlockIndex(0)), From(BlockIndex(5)), FromPublished(BlockIndex(0)), At(BlockIndex(0))] {
+    let published = PublishedCheckpoint { block: BlockIndex(0), boundary: ReplicaPosition(0) };
+    for discovery in [List, From(BlockIndex(0)), From(BlockIndex(5)), FromPublished(published), At(BlockIndex(0))] {
         let recovered = fixture.blocks.recover(TrieConfig::default(), SourcePosition(-1), Timestamp(1000), discovery).await.unwrap();
         assert_eq!(recovered.block.as_ref().map(|block| block.block_index()), Some(BlockIndex(0)), "{discovery:?} finds the latest block");
         assert_eq!(recovered.progress.tx_key, Some(key));
         assert_eq!(recovered.fence.position(), TermPosition::Expecting(TermSequence(1)));
         assert_eq!(recovered.partition.value().table_catalog().metadata(&table).unwrap().row_count, 8);
     }
-    let missing = fixture.blocks.recover(TrieConfig::default(), SourcePosition(-1), Timestamp(1000), FromPublished(BlockIndex(5)))
+    let missing = fixture.blocks.recover(TrieConfig::default(), SourcePosition(-1), Timestamp(1000),
+        FromPublished(PublishedCheckpoint { block: BlockIndex(5), boundary: ReplicaPosition(5) }))
         .await.err().expect("an admitted published bound cannot fall back to an older block");
     assert_eq!(missing.code, "rtdb.replication/block-gone");
+}
+
+#[tokio::test]
+async fn hosted_checkpoint_recovery_preserves_its_admitted_journal_boundary() {
+    use rtdb_format::{block::proto::Block, catalog::BlockCatalog, keys::block_key};
+    use rtdb_storage::ObjectKey;
+
+    let fixture = produced_memory_checkpoint(true).await;
+    let published = PublishedCheckpoint { block: BlockIndex(0), boundary: ReplicaPosition(1) };
+    let snapshot = fixture.blocks.recover(TrieConfig::default(), SourcePosition(-1), Timestamp(0),
+        BlockDiscovery::AtPublished(published)).await.unwrap();
+    assert_eq!(snapshot.block.as_ref().unwrap().boundary_replica_position(), Some(published.boundary));
+    let another_log = PartitionLogs::new(fixture.source.clone(), fixture.replica.clone(),
+        StorageEpoch(0), StorageEpoch(1), CURRENT_STORAGE_VERSION, StorageEpoch(0), fixture.store.clone(),
+        Arc::new(BufferPool::new(fixture.store.clone(), 1 << 20)), fixture.memory.clone()).unwrap();
+    let wrong_log = fixture.blocks.recover_for_replay(snapshot, &another_log, TrieConfig::default(),
+        Timestamp(0), &CancellationToken::new()).await;
+    assert_eq!(wrong_log.err().map(|error| error.code), Some("rtdb.replication/invalid-block".into()),
+        "the admitted snapshot cannot be installed against a different replica journal");
+    let wrong = PublishedCheckpoint { boundary: ReplicaPosition(0), ..published };
+    let attempt = fixture.blocks.recover(TrieConfig::default(), SourcePosition(-1), Timestamp(0), BlockDiscovery::AtPublished(wrong)).await;
+    assert_eq!(attempt.err().map(|error| error.code), Some("rtdb.replication/invalid-block".into()),
+        "the exact snapshot must match the boundary the directory admitted");
+    let recovered = fixture.blocks.recover(TrieConfig::default(), SourcePosition(-1), Timestamp(0),
+        BlockDiscovery::FromPublished(published)).await.unwrap();
+
+    // The first recovered checkpoint loses its log suffix while its replacement becomes visible.
+    for sequence in [2, 3] {
+        let envelope = ReplicaEnvelope { term: Term(1), term_sequence: Some(TermSequence(sequence)),
+            message: ReplicaBody::NoOp(proto::NoOp { src_msg_id: None }) };
+        fixture.logs.enqueue_replica(&envelope, BlockIndex(1), Timestamp(0)).await.unwrap().durable().await.unwrap();
+    }
+    fixture.replica.truncate_before(LogOffset(3)).unwrap();
+    assert!(matches!(fixture.logs.recovery_tail(published.boundary).await, Err(rtdb_storage::Error::UnavailableLogRange { .. })));
+    let foreign = ReplicaPosition::from_epoch_offset(StorageEpoch(1), 3).unwrap();
+    let later = BlockCatalog::from_proto(Block {
+        block_index: Some(1), boundary_replica_msg_id: Some(foreign.0), ..Default::default()
+    }).unwrap();
+    fixture.store.put(&ObjectKey::new(block_key(BlockIndex(1)).unwrap()).unwrap(), later.encode().into()).await.unwrap();
+    let retry = fixture.blocks.recover_for_replay(recovered, &fixture.logs, TrieConfig::default(),
+        Timestamp(0), &CancellationToken::new()).await;
+    assert_eq!(retry.err().map(|error| error.code), Some("rtdb.replication/invalid-block".into()),
+        "a replay retry must reject a successor from a different journal");
+}
+
+#[tokio::test]
+async fn hosted_checkpoint_recovery_can_use_a_later_boundary_after_prefix_collection() {
+    let fixture = produced_memory_checkpoint(true).await;
+    let published = PublishedCheckpoint { block: BlockIndex(0), boundary: ReplicaPosition(1) };
+    let recovered = fixture.blocks.recover(TrieConfig::default(), SourcePosition(-1), Timestamp(0),
+        BlockDiscovery::FromPublished(published)).await.unwrap();
+    let mut writer = produce_newer_memory_checkpoint(&fixture).await;
+    deliver_checkpoint_record(&fixture, &mut writer, 2, 2, ReplicaBody::NoOp(proto::NoOp { src_msg_id: None })).await.unwrap();
+    fixture.replica.truncate_before(LogOffset(4)).unwrap();
+    let selected = fixture.blocks.recover_for_replay(recovered, &fixture.logs, TrieConfig::default(),
+        Timestamp(0), &CancellationToken::new()).await.unwrap();
+    assert_eq!(selected.block.unwrap().boundary_replica_position(), Some(ReplicaPosition(3)));
 }
 
 #[tokio::test]

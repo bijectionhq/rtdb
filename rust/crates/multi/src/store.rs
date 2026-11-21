@@ -198,7 +198,7 @@ impl RemoteStorageFactory for CellStoreFactory {
         let config: CellStoreConfig = serde_json::from_slice(&configuration.value)
             .map_err(|error| Anomaly::incorrect("rtdb.multi/storage-config", format!("Cell storage configuration is malformed: {error}")))?;
         let (record, region, owner, release, checkpoint_metadata) = self.admit_region(&config, io).await?;
-        let blocks = discovery_from_admitted_record(&config, &record);
+        let blocks = discovery_from_admitted_record(&config, &record)?;
         let fragment_storage = crate::fragments::storage_identity(self.storage_namespaces.objects, &record);
         let checkpoint_metadata: Arc<dyn Send + Sync> = Arc::new(checkpoint_metadata);
         let opened = IoRegion::retaining(Arc::clone(&checkpoint_metadata), async {
@@ -293,15 +293,21 @@ impl CellStoreFactory {
 
 pub(crate) const CHECKPOINT_ADVANCED: &str = "rtdb.multi/checkpoint-advanced";
 
-fn discovery_from_admitted_record(config: &CellStoreConfig, record: &DeploymentRecord) -> rtdb_replication::BlockDiscovery {
-    use rtdb_replication::BlockDiscovery;
-    use rtdb_types::{BlockIndex, ReplicaPosition};
-    if let Some(block) = config.snapshot_block { return BlockDiscovery::At(BlockIndex(block)); }
-    let Some(checkpoint) = record.checkpoint else { return BlockDiscovery::List; };
-    match record.compaction_replay_cutoff {
-        Some(cutoff) => BlockDiscovery::FromRestored { checkpoint: BlockIndex(checkpoint.block), compaction_cutoff: ReplicaPosition(cutoff) },
-        None => BlockDiscovery::FromPublished(BlockIndex(checkpoint.block)),
+fn discovery_from_admitted_record(config: &CellStoreConfig, record: &DeploymentRecord) -> Result<rtdb_replication::BlockDiscovery> {
+    use rtdb_replication::{BlockDiscovery, PublishedCheckpoint};
+    use rtdb_types::{BlockIndex, ReplicaPosition, StorageEpoch};
+    let Some(checkpoint) = record.checkpoint else { return Ok(BlockDiscovery::List); };
+    let block = BlockIndex(checkpoint.block);
+    let exact = config.snapshot_block.is_some();
+    if let Some(cutoff) = record.compaction_replay_cutoff {
+        return Ok(if exact { BlockDiscovery::At(block) }
+            else { BlockDiscovery::FromRestored { checkpoint: block, compaction_cutoff: ReplicaPosition(cutoff) } });
     }
+    if checkpoint.boundary < 0 { return Err(storage_region_error("The published checkpoint has no replica boundary")); }
+    let published = PublishedCheckpoint {
+        block, boundary: ReplicaPosition::from_epoch_offset(StorageEpoch(record.log_epoch), checkpoint.boundary)?,
+    };
+    Ok(if exact { BlockDiscovery::AtPublished(published) } else { BlockDiscovery::FromPublished(published) })
 }
 
 impl CellStoreFactory {
@@ -1825,7 +1831,9 @@ mod tests {
             writer_epoch: None, compactor: false, snapshot_block,
         }).unwrap() };
         let mut opened = storage_factory.open_for_recovery(&configuration(None), &key("v06"), io.clone()).await.unwrap();
-        assert_eq!(opened.blocks, BlockDiscovery::FromPublished(BlockIndex(0)));
+        assert_eq!(opened.blocks, BlockDiscovery::FromPublished(rtdb_replication::PublishedCheckpoint {
+            block: BlockIndex(0), boundary: rtdb_types::ReplicaPosition(1),
+        }));
         let mut current = directory.deployment(&record.id).await.unwrap().unwrap();
         assert_eq!(current.storage_regions.values().filter_map(StorageRegion::checkpoint_metadata_from).collect::<Vec<_>>(), [0]);
         let version = current.version;

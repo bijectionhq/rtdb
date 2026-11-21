@@ -28,6 +28,9 @@ After R5, L0 files are ordinary garbage once compaction supersedes them (as in X
 ## State on main (2026-11-21)
 
 - Discovery already advances to a newer advertised root when collection removes the selected root or a table block during startup, and recovery admits its replica cursor before installing a checkpoint (`rust/crates/replication/src/checkpoint_discovery.rs`, `replay_floor.rs`).
+- Ordinary hosted recovery validates the directory's admitted block and replica boundary against the stored catalog before loading table metadata.
+  Successor selection and replay retries preserve the journal and advance both coordinates.
+  This binds the recovery coordinate. The manifest for its data and artefact dependencies remains open.
 - The trie collector protects the installed checkpoint's live and nascent tries within one partition authority.
 - Multi has recovery holds for the replica suffix (`rust/crates/multi/src/recovery_holds.rs`, peer commit `e298879a0`) and checkpoint-metadata holds (`rust/crates/multi/src/checkpoint_retention.rs`).
 - Models: `verification/tla/{InstalledCheckpoint,RecoveryReplay,Checkpoint,ResidenceRetirement}.tla`, `verification/mcrl2/CheckpointDiscovery.mcrl2`, the AutoHyper two-run check, and the Lean checkpoint-metadata laws.

@@ -2154,3 +2154,40 @@ The combined invocation remains recorded with its original failure status.
 The handoff controls new release markers from the hosted trie collector.
 The downstream reaper still acts on logical keys and its grace period.
 An exact deletion certificate still needs recovery and fork dependency coverage and enforcement at the provider effect.
+
+=== Hosted checkpoint identity through recovery retries
+
+The directory admission now passes the published block number and replica boundary to ordinary hosted recovery and exact hosted snapshot opens.
+The loader checks the stored root before reading its table metadata.
+The admitted block must carry the same boundary. A successor must advance both coordinates in the admitted replica epoch.
+The replay retry retains its last accepted checkpoint as the next bound, and refuses a configured log from a different epoch.
+Archive restore retains its explicit checkpoint and replay cutoff.
+
+The Verus checkpoint-discovery area verified nine functions and rejected eight single and joint controls at their declared sites.
+The checked Rust function operates on boundary offsets normalized to the admitted journal by the loader.
+The Verus run is under `/private/tmp/rtdb-formal.QMjPSJsX/published-checkpoint-verus-gvrwmrr9/`. link:../verus/checkpoint_discovery/proof.rs[Production inclusion]
+TLC explored 21 distinct states with one published checkpoint, six candidate observations, two journal epochs and one replay restart.
+Four controls failed at the expected safety properties, and the reachability witness opened a later boundary after a prefix gap.
+Apalache checked five transitions and independently caught a retry that discarded its last accepted boundary.
+The model records are under `/private/tmp/rtdb-formal.QMjPSJsX/published-checkpoint-models-08wq7qne/`. link:../tla/PublishedCheckpoint.tla[Model and controls]
+Lean 4.36.0 audited five theorems about exact matches, forward movement, same-journal selection, composition and arbitrary finite retry histories.
+All five rule mutations failed at their named laws.
+The run is under `/private/tmp/rtdb-formal.QMjPSJsX/published-checkpoint-lean-7r6lkbg4/`. link:../lean/PublishedCheckpoint.lean[Transition and history laws]
+
+The replication and Multi selections passed 268 native cases on parent `d78a8fce2` with this change, including the hosted cell suite.
+One optional test was ignored.
+The log is `/private/tmp/rtdb-formal.QMjPSJsX/published-checkpoint-d78-rust.log`.
+The two exact startup replays passed.
+Four mutations failed at their named assertions, including dropping the admitted coordinate on a replay retry and opening a different log epoch.
+The command records are under `/private/tmp/rtdb-formal.QMjPSJsX/published-checkpoint-native-qjh0b8pb/`.
+The five conformance tests selected by `node_faults recovery` also passed on the same parent, including restart, root and table collection overlap, and tiered publication.
+The log is `/private/tmp/rtdb-formal.QMjPSJsX/published-checkpoint-d78-conformance.log`.
+The standard JVM test run executed nine test tasks and passed 3,198 cases with no failures or skips.
+It used the JVM inputs at parent `d78a8fce2` and the native library from `818a6dfd5`.
+Both previously timed-out read-only cases and all authentication tests ran successfully.
+The log is `/private/tmp/rtdb-formal.QMjPSJsX/published-checkpoint-d78-jvm.log`.
+After rebasing onto `7f9bc1573`, the replication crate rebuilt and both new hosted checkpoint replays passed again.
+The log is `/private/tmp/rtdb-formal.QMjPSJsX/published-checkpoint-7f9-rust.log`.
+
+This establishes the hosted recovery coordinate under the existing deployment-to-log configuration binding.
+The root's full dependency manifest, protection of that manifest across reaping and fork creation, and archive-specific refinement remain open.
