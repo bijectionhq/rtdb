@@ -2669,6 +2669,105 @@ async fn ordered_index_publishes_its_own_roots_and_seeks_both_directions_at_a_ba
 }
 
 #[tokio::test]
+async fn ordered_index_pages_zoned_instants_at_head_and_at_a_retained_system_time() {
+    let observer = Arc::new(OrderedIndexReads::default());
+    let mut services = services();
+    services.scan_accelerators.push(observer.clone());
+    let mut config = options();
+    config.automatic_artefacts = false;
+    let (node, driver) = running(config, services).await;
+    let mut session = node.session("xtdb", Arc::new(Authority)).unwrap();
+    let database = node.catalog().database("xtdb").unwrap();
+    index_sql(
+        &mut session,
+        "CREATE INDEX orders_effective ON orders (effective, _id)",
+    )
+    .await;
+
+    let instant = |value, zone: &str| Value::Timestamp {
+        value,
+        unit: rtdb_types::TimeUnit::Microsecond,
+        timezone: Some(zone.into()),
+    };
+    let row = |id, micros| {
+        StructFields::from([
+            ("_id".into(), Value::I64(id)),
+            ("effective".into(), instant(micros, "UTC")),
+        ])
+    };
+    let past = session
+        .state_mut()
+        .execute_tx(
+            vec![put_rows(
+                &node,
+                "orders",
+                vec![row(1, -1), row(2, 0), row(3, 0), row(4, 2)],
+                None,
+                None,
+            )],
+            AutonomousTxOptions::default(),
+        )
+        .await
+        .unwrap();
+    assert!(past.committed());
+    index_flush(&node, &database).await;
+    database.build_artefacts().await.unwrap();
+
+    let revised = session
+        .state_mut()
+        .execute_tx(
+            vec![put_rows(&node, "orders", vec![row(1, 3)], None, None)],
+            AutonomousTxOptions::default(),
+        )
+        .await
+        .unwrap();
+    assert!(revised.committed());
+    observer.take();
+
+    let current = "SELECT _id, effective FROM orders ORDER BY effective DESC, _id DESC LIMIT 2";
+    assert_eq!(
+        rows(session.query_sql(current, vec![]).await.unwrap()).await,
+        [
+            vec![Value::I64(1), instant(3, "UTC")],
+            vec![Value::I64(4), instant(2, "UTC")],
+        ]
+    );
+    assert!(observer.take().is_empty());
+
+    let old = "SELECT _id, effective FROM orders FOR SYSTEM_TIME AS OF ?
+               WHERE effective >= ? ORDER BY effective, _id LIMIT 1";
+    let basis = instant(past.tx_key().system_time.0, "UTC");
+    assert_eq!(
+        rows(
+            session
+                .query_sql(old, vec![basis.clone(), instant(-1, "+01:00")])
+                .await
+                .unwrap()
+        )
+        .await,
+        [vec![Value::I64(1), instant(-1, "UTC")],]
+    );
+    assert!(observer.take().is_empty());
+
+    let continuation = "SELECT _id FROM orders FOR SYSTEM_TIME AS OF ?
+                        WHERE effective > ? OR (effective = ? AND _id > 2)
+                        ORDER BY effective, _id LIMIT 2";
+    let boundary = instant(0, "+01:00");
+    assert_eq!(
+        rows(
+            session
+                .query_sql(continuation, vec![basis, boundary.clone(), boundary])
+                .await
+                .unwrap()
+        )
+        .await,
+        [vec![Value::I64(3)], vec![Value::I64(4)],]
+    );
+    assert!(observer.take().is_empty());
+    stop(&node, driver).await;
+}
+
+#[tokio::test]
 async fn ordered_index_gathers_projected_table_columns_at_the_original_basis() {
     let observer = Arc::new(OrderedIndexReads::default());
     let mut services = services();
