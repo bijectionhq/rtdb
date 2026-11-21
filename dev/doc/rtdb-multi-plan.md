@@ -58,7 +58,9 @@ The directory allocates both name and authority conditionally, and an identical 
 This entry point enables linearizable reads on the holder.
 A PostgreSQL startup database of `NAME@UUID`, with the UUID in lowercase 32-digit hexadecimal, requires that installation before connecting.
 The gateway confirms the matched UUID in the startup parameter `rtdb_installation_id`.
-`SHOW rtdb_hosted_source_barrier` returns the deployment ID after the holder confirms the current directory assignment, confirms its epoch with the logkeeper quorum, and applies the sampled source cut.
+Hosted protocol 16 returns the deployment ID, applied transaction ID and ordered system time from `SHOW rtdb_hosted_source_barrier` after the holder confirms the current directory assignment, confirms its epoch with the logkeeper quorum, and applies the sampled source cut.
+The two transaction fields are null together when the deployment has applied no transaction.
+A consumer can require the returned transaction in `xt.txs` in its actual read snapshot after reconnect.
 The holder must recover the checkpoint published in the directory or an authenticated successor before answering.
 A gateway reconnect keeps the original deployment ID.
 Restoring an older node or object copy requires a recoverable checkpoint and tail from the live directory and logkeeper ensemble.

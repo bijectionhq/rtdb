@@ -52,6 +52,12 @@ pub trait ReadFence: Send + Sync {
         Err(hosted_source_unavailable())
     }
 }
+
+pub(crate) struct HostedSource {
+    pub(crate) history: String,
+    pub(crate) applied: Option<TransactionKey>,
+}
+
 fn default_search() -> SearchServices {
     #[cfg(feature = "search")] {
         let runtime = rtdb_search::SearchRuntime::new(256 << 20);
@@ -228,7 +234,7 @@ impl Node {
     }
     pub(crate) async fn await_durable_source(
         &self, database: &str, identity: &dyn SessionIdentity, hosted: bool, cancellation: &CancellationToken,
-    ) -> Result<Option<String>> {
+    ) -> Result<Option<HostedSource>> {
         self.admit(database, DatabaseAccess::Read, identity, cancellation).await?;
         self.ensure_indexing()?;
         let database = self.catalog.database(database)?;
@@ -240,10 +246,11 @@ impl Node {
                 None
             };
             database.await_durable_source(cancellation).await?;
-            if hosted && !Arc::ptr_eq(&database, &self.catalog.database(database.name())?) {
+            let Some(history) = history else { return Ok(None); };
+            if !Arc::ptr_eq(&database, &self.catalog.database(database.name())?) {
                 return Err(hosted_source_unavailable());
             }
-            Ok(history)
+            Ok(Some(HostedSource { history, applied: database.progress().current().tx_key }))
         });
         tokio::time::timeout(Duration::from_secs(60), barrier)
             .await.map_err(|_| timeout_error())?.ok_or_else(cancelled)?

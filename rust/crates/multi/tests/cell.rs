@@ -110,14 +110,34 @@ async fn a_deployment_is_served_through_the_gateway_and_survives_its_holder_dyin
     client.simple_query("INSERT INTO orders (_id, total) VALUES (1, 10)").await.unwrap();
     let basis = values(&client, "SELECT _system_from FROM orders WHERE _id = 1").await.remove(0);
     client.simple_query("INSERT INTO orders (_id, total) VALUES (2, 20)").await.unwrap();
+    let observer = cell.connect("shop").await;
+    let barrier = observer.simple_query("SHOW rtdb_hosted_source_barrier").await.unwrap();
+    let receipt = barrier.iter().find_map(|message| match message {
+        tokio_postgres::SimpleQueryMessage::Row(row) => Some(row),
+        _ => None,
+    }).unwrap();
+    assert_eq!(receipt.get("rtdb_hosted_source_barrier"), Some(history.to_string().as_str()));
+    let offset: i64 = receipt.get("tx_id").unwrap().parse().unwrap();
+    let ordered_at = receipt.get("system_time").unwrap();
+    drop(observer);
     drop(client);
 
     let first = cell.holder("shop").await.expect("the first connection placed the deployment");
     let epoch = cell.directory.deployment_by_name("shop").await.unwrap().unwrap().epoch;
     cell.nodes[first].take().unwrap().kill().await.unwrap();
 
-    let client = connect_eventually(&cell, "shop").await;
+    let mut client = connect_eventually(&cell, "shop").await;
     assert_eq!(values(&client, "SHOW rtdb_hosted_source_barrier").await, [history.to_string()]);
+    let snapshot = client.build_transaction().read_only(true).start().await.unwrap();
+    let prefix = snapshot.simple_query(&format!(
+        "SELECT system_time FROM xt.txs FOR ALL VALID_TIME WHERE _id = {offset}"
+    )).await.unwrap();
+    let times: Vec<_> = prefix.iter().filter_map(|message| match message {
+        tokio_postgres::SimpleQueryMessage::Row(row) => row.get(0),
+        _ => None,
+    }).collect();
+    assert_eq!(times, [ordered_at]);
+    snapshot.commit().await.unwrap();
     assert_eq!(values(&client, "SELECT total FROM orders").await, ["10", "20"], "nothing acknowledged is lost when the holder dies");
     let exact = format!("SELECT total FROM orders FOR SYSTEM_TIME AS OF TIMESTAMP '{basis}'");
     assert_eq!(values(&client, &exact).await, ["10"]);
