@@ -446,6 +446,25 @@ def verify_type_join(args, scratch):
     verify_lean_model(args, scratch, path, "type-join", controls, 10)
 
 
+def verify_basis_tokens(args, scratch):
+    path = Path("verification/lean/BasisTokens.lean")
+    controls = {
+        "take-the-smaller-required-position": (
+            "List.zipWith max left right",
+            "List.zipWith min left right",
+            ["merged_positions_cover_both_tokens", "a_common_upper_bound_covers_the_merge"],
+        ),
+        "treat-the-entire-first-second-as-absent": (
+            "if wire = zeroTime then none else some wire",
+            "if wire.seconds = 0 then none else some wire",
+            ["every_non_default_time_round_trips_without_losing_precision",
+             "maps_preserve_positions_and_normalize_only_the_default_time",
+             "maps_preserve_positions_and_normalize_only_the_default_time"],
+        ),
+    }
+    verify_lean_model(args, scratch, path, "basis-tokens", controls, 6)
+
+
 def verify_run_encoding(args, scratch):
     path = Path("verification/lean/RunEncoding.lean")
     controls = {
@@ -754,6 +773,7 @@ def verify_lean(args, scratch):
             verify_system_time(args, scratch)
             verify_message_position(args, scratch)
             verify_type_join(args, scratch)
+            verify_basis_tokens(args, scratch)
             verify_run_encoding(args, scratch)
             verify_memory_admission(args, scratch)
             verify_outer_join(args, scratch)

@@ -77,7 +77,7 @@ A proof of a candidate is conditional on the explicitly stated contract and work
 | SCAN08 · Read tier equivalence | Open | — |
 | SCAN09 · Fragment equivalence | Open | — |
 | SCAN10 · Read guarantees | Open | — |
-| SCAN11 · Per-partition bases | Open | — |
+| SCAN11 · Per-partition bases | Partial | [Partition order in snapshot tokens and null-partition observation](rtdb-engine-proof-evidence.md#main-evidence) |
 
 ## Sessions and transaction boundaries
 
@@ -86,7 +86,7 @@ A proof of a candidate is conditional on the explicitly stated contract and work
 | SESS01 · Legal states | Partial | [Lean explicit phases and terminal closure](rtdb-engine-proof-evidence.md#main-evidence) |
 | SESS02 · Access mode | Partial | [Lean first-statement resolution and Rust session tests](rtdb-engine-proof-evidence.md#main-evidence) |
 | SESS03 · Pinned read basis | Partial | [Lean explicit basis preservation and Rust session observations](rtdb-engine-proof-evidence.md#main-evidence) |
-| SESS04 · Await and snapshot tokens | Open | — |
+| SESS04 · Await and snapshot tokens | Partial | [Lean componentwise await-token merge and native token checks](rtdb-engine-proof-evidence.md#main-evidence) |
 | SESS05 · Read your writes | Open | — |
 | SESS06 · Buffer ownership | Partial | [Lean ordered buffer and modeled commit boundary](rtdb-engine-proof-evidence.md#main-evidence) |
 | SESS07 · Rollback and rejection | Partial | [Lean discard and failed-state rejection, and Rust session tests](rtdb-engine-proof-evidence.md#main-evidence) |
