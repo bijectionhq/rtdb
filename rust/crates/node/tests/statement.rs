@@ -85,6 +85,30 @@ async fn prepared_parameter_projection_canonicalizes_masked_and_boolean_buffers(
 }
 
 #[tokio::test]
+async fn prepared_parameter_projection_selects_the_first_row_and_releases_the_batch() {
+    use arrow_array::{RecordBatch, StringArray, cast::AsArray};
+    use arrow_schema::{DataType, Field, Schema};
+    use rtdb_columnar::OwnedBatch;
+
+    let memory = MemoryBudget::new(1 << 24);
+    let context = context(None, &memory);
+    let schema = Arc::new(Schema::new(vec![Field::new("input", DataType::Utf8, false)]));
+    let unused = "x".repeat(1 << 20);
+    let batch = RecordBatch::try_new(schema, vec![Arc::new(StringArray::from(vec!["first", unused.as_str()]))]).unwrap();
+    let bound = OwnedBatch::new(batch, &memory).unwrap();
+    let upload = Arc::downgrade(bound.reservation());
+    let types = [LogicalType::Scalar(ScalarType::Utf8)];
+    let query = PreparedSql::prepare("SELECT $1 AS label", &context, PrepareOptions::default(), ResultSignaturePolicy::Dynamic).unwrap();
+    let mut cursor = query.try_open_parameter_projection(context, &bound, &types).await.unwrap().unwrap();
+    drop(bound);
+
+    assert!(upload.upgrade().is_none());
+    let output = cursor.next_batch().await.unwrap().unwrap();
+    assert_eq!(output.batch().column(0).as_string::<i32>().iter().collect::<Vec<_>>(), [Some("first")]);
+    assert!(cursor.next_batch().await.unwrap().is_none());
+}
+
+#[tokio::test]
 async fn postgres_preparation_keeps_inline_xtql_source_and_result_fields() {
     let memory = MemoryBudget::new(1 << 26);
     let context = context(None, &memory);

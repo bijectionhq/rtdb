@@ -176,11 +176,11 @@ impl PreparedSql {
         self.open_query_batches(context, arguments, types, true).await
     }
 
-    /// Uses a single Arrow parameter row directly when the query only projects parameters.
+    /// Uses the first Arrow parameter row directly when the query only projects parameters.
     pub async fn try_open_parameter_projection(&self, context: Arc<QueryContext>, arguments: &OwnedBatch, types: &[LogicalType]) -> Result<Option<QueryCursor>> {
         if !matches!(&self.0.result, PreparedResult::Query { parameter_projection: true, .. })
             || self.0.policy != ResultSignaturePolicy::Dynamic || !self.0.options.parameter_types.is_empty()
-            || arguments.batch().num_rows() != 1 || types.len() != self.parameter_count() {
+            || arguments.batch().num_rows() == 0 || types.len() != self.parameter_count() {
             return Ok(None);
         }
         let projection = async {
