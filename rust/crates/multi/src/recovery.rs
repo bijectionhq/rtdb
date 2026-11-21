@@ -41,6 +41,10 @@ struct Request {
 #[serde(tag = "operation", rename_all = "snake_case", deny_unknown_fields)]
 enum Action {
     CaptureCheckpoint,
+    VerifyCheckpointCapture {
+        manifest_sha256: String,
+        observation: Uuid,
+    },
     RecoverCheckpoint {
         manifest_sha256: String,
     },
@@ -69,6 +73,13 @@ enum Reply {
         authority: Uuid,
         point: CapturePoint,
         manifest_sha256: String,
+    },
+    Verified {
+        name: String,
+        authority: Uuid,
+        point: CapturePoint,
+        manifest_sha256: String,
+        observation: Uuid,
     },
     Recovered {
         name: String,
@@ -190,6 +201,32 @@ impl RecoveryService {
                     authority: request.authority,
                     point,
                     manifest_sha256,
+                })
+            }
+            Action::VerifyCheckpointCapture {
+                manifest_sha256,
+                observation,
+            } => {
+                if !valid_manifest(&manifest_sha256) || observation.is_nil() {
+                    return Ok(Reply::Refused);
+                }
+                let point = archive::verify_checkpoint_capture(
+                    directory.as_ref(),
+                    &installation,
+                    &self.archive,
+                    self.keys.as_ref(),
+                    request.authority,
+                    request.capture,
+                    &manifest_sha256,
+                    self.hosted_task.as_ref(),
+                )
+                .await?;
+                Ok(Reply::Verified {
+                    name: installation.name,
+                    authority: request.authority,
+                    point,
+                    manifest_sha256,
+                    observation,
                 })
             }
             Action::RecoverCheckpoint { manifest_sha256 } => {

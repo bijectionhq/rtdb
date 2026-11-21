@@ -59,7 +59,7 @@ use uuid::Uuid;
 use crate::{
     admin::{administration_stream, await_storage_drain, update_installation},
     cipher::Cipher,
-    deployment::{CellStorage, S3_CELL_ROOT},
+    deployment::CellStorage,
     keys::KeyService,
     packing::PackDiscovery,
     reference::{PrefixedStore, key},
@@ -477,6 +477,64 @@ pub(crate) fn capture_receipt(
     Ok(Some((point, manifest.clone())))
 }
 
+/// Re-observe the accepted closure in independent custody, without
+/// opening the serving deployment or selecting a new checkpoint.
+pub(crate) async fn verify_checkpoint_capture(
+    directory: &dyn Directory,
+    source: &DeploymentRecord,
+    archive: &CellStorage,
+    keys: &dyn KeyService,
+    deployment: Uuid,
+    operation: Uuid,
+    manifest: &str,
+    hosted_task: Option<&rtdb_directory::HostedTask>,
+) -> Result<CapturePoint> {
+    let (point, manifest) = capture_receipt(source, archive, deployment, operation)?
+        .filter(|(_, retained)| retained == manifest)
+        .ok_or_else(|| inconsistent("The capture does not retain the supplied manifest"))?;
+    stage::with_region(
+        directory, keys, &source.id, archive, hosted_task, Some(operation), None,
+        |record| {
+            if record.archive_retirement.is_some()
+                || capture_receipt(record, archive, deployment, operation)?.as_ref() != Some(&(point.clone(), manifest.clone()))
+            {
+                return Err(inconsistent("The capture no longer admits archive access"));
+            }
+            Ok(())
+        },
+        |region| async {
+            let bucket = archive.bucket(region).await?;
+            if read::<CapturePoint>(bucket.as_ref(), &archive_witness(deployment, operation)?).await?.as_ref() != Some(&point) {
+                return Err(inconsistent("The archive belongs to another captured checkpoint"));
+            }
+            verified_archive(bucket, &point, &manifest, keys).await?;
+            Ok(())
+        },
+    ).await?;
+    Ok(point)
+}
+
+async fn verified_archive(
+    bucket: Arc<dyn ObjectStore>,
+    point: &CapturePoint,
+    manifest: &str,
+    keys: &dyn KeyService,
+) -> Result<(Capture, [u8; crate::keys::KEY_BYTES])> {
+    let prefix = format!("checkpoint-captures/{}/{}", point.deployment, point.operation);
+    let metadata = PrefixedStore::new(bucket.clone(), &prefix);
+    let capture = read::<Capture>(&metadata, &key("capture.json")?).await?
+        .ok_or_else(|| unavailable("The captured manifest is unavailable"))?;
+    if &capture.point != point
+        || capture.manifest_sha256()? != manifest
+        || read::<CapturePoint>(&metadata, &key("intent.json")?).await?.as_ref() != Some(point)
+    {
+        return Err(inconsistent("The archive differs from its accepted capture"));
+    }
+    let material = archive_key(keys, point).await?;
+    capture.verify(bucket, &prefix, &material).await?;
+    Ok((capture, material))
+}
+
 fn archive_key_id(point: &CapturePoint) -> String {
     format!("checkpoint-{}-{}-{}", point.deployment, point.incarnation, point.operation)
 }
@@ -571,6 +629,9 @@ pub async fn capture(
     let id = deployment.to_string();
     let region = Uuid::new_v4();
     let local = matches!((storage, destination), (CellStorage::Local { .. }, CellStorage::Local { .. }));
+    if !local && hosted_task.is_none() {
+        return Err(inconsistent("Remote checkpoint capture requires its installed ECS task"));
+    }
     let witness = if local { keys.hold_local_storage_region(region)? } else { None };
     let witnessed = witness.is_some();
     let mut io = IoRegion::new().child_holding(witness.map(|file| Arc::new(file) as Arc<dyn Send + Sync>));
@@ -1027,7 +1088,7 @@ fn remote_archive(
         &registration.archive,
         &point,
     ))?;
-    let root = config.object_prefix(&key(S3_CELL_ROOT)?)?.to_string();
+    let root = CellStorage::s3_root(&config)?.to_string();
     if config.endpoint.is_some() || config.credentials.is_some() || config.remote.is_some() {
         return Err(unavailable(
             "The archive requires its own provider's disposal authority",

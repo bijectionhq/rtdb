@@ -29,7 +29,7 @@ impl CellStorage {
             .map_err(|error| rtdb_types::Anomaly::fault("rtdb.multi/storage-root", error.to_string()))
     }
 
-    fn s3_root(config: &rtdb_s3::S3Config) -> rtdb_storage::Result<rtdb_storage::ObjectKey> {
+    pub(crate) fn s3_root(config: &rtdb_s3::S3Config) -> rtdb_storage::Result<rtdb_storage::ObjectKey> {
         let prefix = config.prefix.as_deref().unwrap_or_default().trim_matches('/');
         rtdb_storage::ObjectKey::new(if prefix.is_empty() {
             S3_CELL_ROOT.to_owned()
@@ -81,6 +81,7 @@ impl CellStorage {
         io: std::sync::Arc<rtdb_storage::IoRegion>,
     ) -> rtdb_types::Result<std::sync::Arc<rtdb_storage::remote::RemoteStore>> {
         let root = rtdb_storage::ObjectKey::new(S3_CELL_ROOT)?;
+        let config = Self::rooted_s3_config(config)?;
         config.open_cell(&root, &std::collections::BTreeMap::<String, rtdb_s3::S3Credentials>::new(), io).await
     }
 
@@ -88,8 +89,17 @@ impl CellStorage {
         config: &rtdb_s3::S3Config,
     ) -> rtdb_types::Result<rtdb_s3::VersionedInventory> {
         let root = rtdb_storage::ObjectKey::new(S3_CELL_ROOT)?;
+        let config = Self::rooted_s3_config(config)?;
         let remotes = std::collections::BTreeMap::<String, rtdb_s3::S3Credentials>::new();
         config.versioned_inventory(&root, &remotes).await
+    }
+
+    // S3Config treats a provided prefix as the full root. CellStorage owns the
+    // additional cell segment, shared by object access, disposal and custody.
+    fn rooted_s3_config(config: &rtdb_s3::S3Config) -> rtdb_storage::Result<rtdb_s3::S3Config> {
+        let mut rooted = config.clone();
+        rooted.prefix = Some(Self::s3_root(config)?.to_string());
+        Ok(rooted)
     }
 
     pub(crate) async fn purge_serving_inventory(
@@ -206,6 +216,23 @@ pub fn moving_config(record: &DeploymentRecord, servers: Vec<String>, moving: Op
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn prefixed_cell_access_and_disposal_open_the_same_root_as_custody() {
+        for (archive, expected) in [
+            ("s3://bucket?region=us-east-1", "cell"),
+            ("s3://bucket/histories/example?region=us-east-1", "histories/example/cell"),
+        ] {
+            let CellStorage::S3 { config } = CellStorage::parse(archive).unwrap() else {
+                panic!("S3 archive");
+            };
+            let root = CellStorage::s3_root(&config).unwrap();
+            let installed = CellStorage::rooted_s3_config(&config).unwrap();
+            let fallback = rtdb_storage::ObjectKey::new(S3_CELL_ROOT).unwrap();
+            assert_eq!(root.as_str(), expected);
+            assert_eq!(installed.object_prefix(&fallback).unwrap(), root);
+        }
+    }
 
     #[test]
     fn a_holder_opens_its_streams_at_the_record_epoch_under_its_own_prefix() {

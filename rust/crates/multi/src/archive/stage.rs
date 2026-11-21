@@ -12,8 +12,8 @@ use rtdb_types::Result;
 use uuid::Uuid;
 
 use super::{
-    ArchivedObject, Capture, CapturePoint, archive_key, capture_receipt, checkpoint_storage_root,
-    digest, encode, inconsistent, read, read_object, unavailable,
+    ArchivedObject, CapturePoint, capture_receipt, checkpoint_storage_root, digest, encode,
+    inconsistent, read_object, unavailable, verified_archive,
 };
 use crate::{
     admin::{begin_disposal, cell_media, installation_record, update_installation},
@@ -347,23 +347,7 @@ async fn copy_checkpoint(
         "checkpoint-captures/{}/{}",
         point.deployment, point.operation
     );
-    let metadata = PrefixedStore::new(bucket.clone(), &prefix);
-    let capture = read::<Capture>(&metadata, &key("capture.json")?)
-        .await?
-        .ok_or_else(|| unavailable("The captured manifest is unavailable"))?;
-    if &capture.point != point
-        || capture.manifest_sha256()? != manifest
-        || read::<CapturePoint>(&metadata, &key("intent.json")?)
-            .await?
-            .as_ref()
-            != Some(point)
-    {
-        return Err(inconsistent(
-            "The archive differs from its accepted capture",
-        ));
-    }
-    let material = archive_key(keys, point).await?;
-    capture.verify(bucket.clone(), &prefix, &material).await?;
+    let (capture, material) = verified_archive(bucket.clone(), point, manifest, keys).await?;
     let source_cipher = Cipher::new(&material)?;
     let media_key = keys.key(&target.key_id()).await?;
     if media_key == material {

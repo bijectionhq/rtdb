@@ -157,6 +157,14 @@ media key belongs to that capture and stays in the original cell's key vault.
 It survives serving-key withdrawal. Application-level ciphertext is copied
 as data and its keys are never part of the capture.
 
+The cell's S3 root is `cell` under the configured prefix. The archive
+namespace, S3 access and disposal inventory all derive from that root.
+A remote capture registers the ECS task that owns its provider I/O.
+`verify_checkpoint_capture` opens a fresh archive admission, reads the
+witness and exact manifest, and verifies every object under the capture's
+media key. The receipt binds the supplied observation ID to the original
+capture point and digest.
+
 The recovery owner calls `rtdb-multi schedule-recovery-disposal --id UUID`
 after the installation's serving receipt exists and recovery holds end.
 The reaper settles each registered local archive after confirming its
