@@ -1782,15 +1782,17 @@ rule EraseAndProve {
         Directory.cas(record.id, record.epoch, change: { lifecycle: deleted, deletion_record: proof })
 }
 
-rule PublishCurrentInventoryReceipt {
-    when: CurrentInventoryEmptied(record, namespaces)
+rule PublishInventoryReceipt {
+    -- A local store attests to the current inventory.
+    -- An S3 store attests to its version inventory after removing data versions and delete markers.
+    when: InventoryEmptied(record, namespaces, inventory_scope)
 
     requires: record.lifecycle = deleting
     requires: record.storage_namespaces = namespaces
 
     ensures:
         KeyService.destroy(record.key_id)
-        let proof = DeletionRecord(deployment: record.id, epoch: record.epoch, namespaces: namespaces, inventory_scope: current_objects, signature: SignedByCell())
+        let proof = DeletionRecord(deployment: record.id, epoch: record.epoch, namespaces: namespaces, inventory_scope: inventory_scope, signature: SignedByCell())
         Directory.cas(record.id, record.epoch, change: { lifecycle: deleted, deletion_record: proof })
 }
 

@@ -170,6 +170,7 @@ pub struct StorageNamespaces {
 #[serde(rename_all = "snake_case")]
 pub enum DeletionInventory {
     CurrentObjects,
+    AllVersions,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

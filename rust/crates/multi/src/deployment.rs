@@ -62,6 +62,19 @@ impl CellStorage {
         }
     }
 
+    pub(crate) async fn purge_versions(&self, deployment: &ObjectKey) -> Result<rtdb_directory::DeletionInventory> {
+        match self {
+            Self::Local { .. } => Ok(rtdb_directory::DeletionInventory::CurrentObjects),
+            Self::S3 { config } => {
+                let cell = ObjectKey::new(S3_CELL_ROOT)?;
+                let remotes = std::collections::BTreeMap::<String, rtdb_s3::S3Credentials>::new();
+                let inventory = config.versioned_inventory(&cell, &remotes).await?;
+                inventory.purge(deployment).await?;
+                Ok(rtdb_directory::DeletionInventory::AllVersions)
+            }
+        }
+    }
+
     pub(crate) fn cleanup_contains(&self, other: &Self, deployment: &ObjectKey) -> Result<bool> {
         match (self, other) {
             (Self::Local { root }, Self::Local { root: other_root }) => {

@@ -1,4 +1,9 @@
 mod credential;
+#[cfg(feature = "versioning")]
+mod versions;
+
+#[cfg(feature = "versioning")]
+pub use versions::VersionedInventory;
 
 use std::sync::Arc;
 use object_store::{StaticCredentialProvider, aws::{AmazonS3Builder, AmazonS3ConfigKey, AwsCredential, S3ConditionalPut, S3CopyIfNotExists}};
@@ -83,7 +88,30 @@ impl S3Config {
         Ok(Arc::new(RemoteStore::new_in(Arc::new(client), Some(prefix), io)))
     }
 
-    fn endpoint_addressing(&self) -> Result<(Option<url::Url>, bool)> {
+    #[cfg(feature = "versioning")]
+    pub async fn versioned_inventory(&self, storage_root: &ObjectKey, remotes: &dyn S3CredentialResolver) -> Result<VersionedInventory> {
+        if self.bucket.is_empty() { return Err(Anomaly::incorrect("xtdb.aws/invalid-config", "S3 bucket is empty")); }
+        let root = self.object_prefix(storage_root)?;
+        let endpoint = self.configured_endpoint()?;
+        let environment = AmazonS3Builder::from_env();
+        let default_region = || environment.get_config_value(&AmazonS3ConfigKey::Region).unwrap_or_else(|| "us-east-1".into());
+        let mut config = aws_config::defaults(aws_config::BehaviorVersion::latest());
+        if let Some(region) = &self.region { config = config.region(aws_config::Region::new(region.clone())); }
+        if let Some(credentials) = self.resolve_credentials(remotes)? {
+            if credentials.access_key.is_empty() || credentials.secret_key.is_empty() { return Err(Anomaly::incorrect("xtdb.aws/invalid-config", "S3 credentials require nonempty access and secret keys")); }
+            if self.region.is_none() { config = config.region(aws_config::Region::new(default_region())); }
+            config = config.credentials_provider(aws_credential_types::Credentials::new(credentials.access_key, credentials.secret_key, None, None, "rtdb-s3"));
+        }
+        let config = config.load().await;
+        let region = config.region().cloned().unwrap_or_else(|| aws_config::Region::new(default_region()));
+        let mut builder = aws_sdk_s3::config::Builder::from(&config)
+            .region(region)
+            .force_path_style(!self.virtual_hosted(endpoint.as_ref()));
+        builder.set_endpoint_url(endpoint.map(|endpoint| endpoint.to_string()));
+        Ok(VersionedInventory::new(aws_sdk_s3::Client::from_conf(builder.build()), self.bucket.clone(), root))
+    }
+
+    fn configured_endpoint(&self) -> Result<Option<url::Url>> {
         let environment = AmazonS3Builder::from_env();
         let endpoint = self.endpoint.clone().or_else(|| environment.get_config_value(&AmazonS3ConfigKey::S3Endpoint)).or_else(|| environment.get_config_value(&AmazonS3ConfigKey::Endpoint));
         let endpoint = endpoint.as_ref().map(|endpoint| url::Url::parse(endpoint)
@@ -91,12 +119,21 @@ impl S3Config {
         if endpoint.as_ref().is_some_and(|endpoint| !matches!(endpoint.scheme(), "http" | "https") || endpoint.host_str().is_none() || !endpoint.username().is_empty() || endpoint.password().is_some() || endpoint.query().is_some() || endpoint.fragment().is_some()) {
             return Err(Anomaly::incorrect("xtdb.aws/invalid-config", "S3 endpoint must be an HTTP URL without embedded credentials, query, or fragment"));
         }
+        Ok(endpoint)
+    }
+
+    fn virtual_hosted(&self, endpoint: Option<&url::Url>) -> bool {
         let dns_bucket = (3..=63).contains(&self.bucket.len()) && self.bucket.bytes().all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-' || byte == b'.')
             && self.bucket.as_bytes().first().is_some_and(u8::is_ascii_alphanumeric) && self.bucket.as_bytes().last().is_some_and(u8::is_ascii_alphanumeric)
             && !self.bucket.contains("..") && self.bucket.parse::<std::net::IpAddr>().is_err();
-        let https = endpoint.as_ref().is_none_or(|endpoint| endpoint.scheme() == "https");
-        let virtual_hosted = !self.path_style_access_enabled && dns_bucket && !(https && self.bucket.contains('.'))
-            && !endpoint.as_ref().is_some_and(|endpoint| matches!(endpoint.host(), Some(url::Host::Ipv4(_) | url::Host::Ipv6(_))));
+        let https = endpoint.is_none_or(|endpoint| endpoint.scheme() == "https");
+        !self.path_style_access_enabled && dns_bucket && !(https && self.bucket.contains('.'))
+            && !endpoint.is_some_and(|endpoint| matches!(endpoint.host(), Some(url::Host::Ipv4(_) | url::Host::Ipv6(_))))
+    }
+
+    fn endpoint_addressing(&self) -> Result<(Option<url::Url>, bool)> {
+        let endpoint = self.configured_endpoint()?;
+        let virtual_hosted = self.virtual_hosted(endpoint.as_ref());
         let endpoint = endpoint.map(|mut endpoint| {
             if virtual_hosted {
                 let host = format!("{}.{}", self.bucket, endpoint.host_str().unwrap_or_default());

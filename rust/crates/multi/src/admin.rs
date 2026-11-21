@@ -5,7 +5,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 pub use rtdb_directory::DeletionRecord;
-use rtdb_directory::{Cas, CellMove, CellMovePhase, DeletionFacts, DeletionInventory, DeploymentRecord, MoveNamespaces, Directory, Lifecycle, MemberId, MemberPool, MemberRecord, MemberRole, MemberState, PlacementMove, StorageNamespaces, effective_holder, now_ms};
+use rtdb_directory::{Cas, CellMove, CellMovePhase, DeletionFacts, DeploymentRecord, MoveNamespaces, Directory, Lifecycle, MemberId, MemberPool, MemberRecord, MemberRole, MemberState, PlacementMove, StorageNamespaces, effective_holder, now_ms};
 use rtdb_logkeeper::StreamConfig;
 use rtdb_storage::log::Log;
 use rtdb_types::{Anomaly, AnomalyCategory, Result};
@@ -589,7 +589,7 @@ pub async fn delete_deployment(directory: &dyn Directory, storage: &CellStorage,
     let stream = StreamConfig { write_quorum: write_quorum(servers.len()), servers, stream: fenced.stream("replica"), maximum_message_bytes };
     rtdb_logkeeper::drop_stream(&stream, fenced.epoch).await?;
     let others: Vec<DeploymentRecord> = directory.deployments().await?.into_iter().filter(|record| record.id != fenced.id).collect();
-    let receipt = finish_deletion(bucket.as_ref(), &fenced, &others, keys).await?;
+    let receipt = finish_deletion(storage, bucket.as_ref(), &fenced, &others, keys).await?;
     let deleted = update(directory, name, |record| {
         if record.id != fenced.id || record.epoch != fenced.epoch || record.storage_prefix() != receipt.facts.storage_prefix {
             return Err(deletion_changed(name));
@@ -630,7 +630,7 @@ fn deletion_receipt(mut tombstone: DeploymentRecord) -> Result<DeletionRecord> {
     Ok(receipt)
 }
 
-async fn finish_deletion(bucket: &dyn rtdb_storage::ObjectStore, deployment: &DeploymentRecord, others: &[DeploymentRecord], keys: &dyn KeyService) -> Result<DeletionRecord> {
+async fn finish_deletion(storage: &CellStorage, bucket: &dyn rtdb_storage::ObjectStore, deployment: &DeploymentRecord, others: &[DeploymentRecord], keys: &dyn KeyService) -> Result<DeletionRecord> {
     let storage_prefix = deployment.storage_prefix();
     let namespaces = deployment.storage_namespaces.ok_or_else(|| {
         Anomaly::fault("rtdb.multi/storage-binding-missing", format!("{} has no storage binding", deployment.name))
@@ -638,6 +638,7 @@ async fn finish_deletion(bucket: &dyn rtdb_storage::ObjectStore, deployment: &De
     if !crate::reference::erase_deployment(bucket, &storage_prefix, others).await? {
         return Err(Anomaly::new(AnomalyCategory::Unavailable, "rtdb.multi/deletion-incomplete", format!("Storage still contains objects for {}", deployment.name)));
     }
+    let inventory = storage.purge_versions(&rtdb_storage::ObjectKey::new(&storage_prefix)?).await?;
     let objects_erased_at_ms = now_ms();
     keys.destroy(&deployment.id)?;
     keys.sign_deletion(DeletionFacts {
@@ -646,7 +647,7 @@ async fn finish_deletion(bucket: &dyn rtdb_storage::ObjectStore, deployment: &De
         epoch: deployment.epoch,
         storage_prefix,
         namespaces,
-        inventory: DeletionInventory::CurrentObjects,
+        inventory,
         key_destroyed_at_ms: now_ms(),
         objects_erased_at_ms,
         verified_empty: true,
@@ -844,6 +845,7 @@ mod tests {
     async fn deletion_can_retry_and_keeps_the_key_if_the_prefix_is_still_populated() {
         let data = tempfile::tempdir().unwrap();
         let keys = LocalKeyService::new(data.path()).unwrap();
+        let storage = CellStorage::Local { root: data.path().join("objects") };
         let mut deployment = DeploymentRecord::new("shop", "acme", vec![], 0);
         deployment.lifecycle = Lifecycle::Deleting;
         let key = keys.key(&deployment.id).unwrap();
@@ -852,11 +854,11 @@ mod tests {
         let object = ObjectKey::new(format!("{}/v06/rows", deployment.storage_prefix())).unwrap();
         bucket.put(&object, Bytes::from_static(b"data")).await.unwrap();
 
-        let error = finish_deletion(&RetainingStore(&bucket), &deployment, &[], &keys).await.unwrap_err();
+        let error = finish_deletion(&storage, &RetainingStore(&bucket), &deployment, &[], &keys).await.unwrap_err();
         assert_eq!(error.code, "rtdb.multi/deletion-incomplete");
         assert_eq!(keys.key(&deployment.id).unwrap(), key);
 
-        let proof = finish_deletion(&bucket, &deployment, &[], &keys).await.unwrap();
+        let proof = finish_deletion(&storage, &bucket, &deployment, &[], &keys).await.unwrap();
         assert!(proof.facts.verified_empty);
         assert!(bucket.list(Some(&ObjectKey::new(deployment.storage_prefix()).unwrap())).await.unwrap().is_empty());
         assert_eq!(keys.existing(&deployment.id).unwrap_err().code, "rtdb.multi/key-destroyed");
