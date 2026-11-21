@@ -21,6 +21,9 @@ These results apply to the classic and full-text Rust paths at the particular re
 | TX09 | Lean checks strictly ordered system times for arbitrary modeled mixed resolver histories and restart from the last completed time. Bounded TLC and a native catalog-clock replay check other portions of the same contract. | Refine the remaining ingress, time sources, resolve/apply paths, and provider-specific ordering. |
 | LOG08, LOG09, GC05, STORE10, STORE11 | Bounded checkpoint discovery and replay models check a readable root and retained suffix, including the handoff at the observed log floor. A native test exercises the newer-checkpoint refresh and suffix replay. | Compose checkpoint publication, root and dependency discovery, trim authority and provider behavior over arbitrary executions. |
 | LOG08, FMT01 · Packed log positions | Lean proves the exact signed epoch limit, lexicographic order, quotient and remainder extraction, and the start sentinel. Kani checks the Rust admission predicate and checks encoding and resumption on the admitted domain. JVM tests exercise the same boundary. | Compose the codec with admitted checkpoint metadata, all supported readers, and retained-log recovery. |
+| LOG05 and Multi recovery S3 · Logkeeper seal | Lean proves that replaying any finite sequence of later promise events preserves the seal's lower bound, and composes this with majority intersection for a fixed ensemble. Kani checks production promise replay and empty-stream commit admission across all epoch and sync inputs. | Refine durable journal settlement, message handling, directory-issued epochs and ensemble changes. |
+| LOG11 and Multi recovery S4 · Seal reply rank | Lean proves that the selected reply dominates all replies in an arbitrary nonempty list, and that it reaches a retained commit witness's slot in the same epoch or reports a later sync. Kani checks production ranking and its tie choice for one through three replies. | Establish which production replies witness the exact retained payloads and carry that through the repair and journal transitions. |
+| CELL09, STORE10 and Multi recovery S2, S5 · Worker loss | A local MinIO and PgWire regression retains the checkpoint and acknowledged suffix, compares current rows and the full bitemporal projection, and verifies new writes after losing one, two, and all three compute workers. | Prove the complete activation and recovery path under the published durable-service and liveness assumptions. |
 | IDX04 | Verus checks the Rust base-four IID bucket function. The Kani harness also checks all legal depths and the independent bit-extraction rule for width 2, 4, or 8 in the actual bucketer. | Prove every admitted row is placed and found under the corresponding serialized and live subtree through insertion, splitting, and replay. |
 | SCAN07, GC01, GC02 | Lean proves the abstract generation retention invariant for arbitrarily many readers, objects, in-flight operations and steps. Verus checks the collector's production selection loop against the visibility observations it receives. | Refine the captured references, provider operations, and authority changes, including the full durable deletion protocol. |
 | STORE04, STORE08 | An offline Azure provider replay exercised pending-copy acknowledgment and checked the corrected publication path. The checkpoint interruption model separates the provider's durable outcome from the reply. | Cover all provider adapters and their ambiguous, retried, and concurrent publication paths. |
@@ -58,6 +61,16 @@ Lean proves that distinct positive decimal suffixes give distinct keys and that 
 The preservation theorem assumes the existing registry has distinct slugs.
 The runner rejects selecting occupied slugs, dropping recorded entries, and reducing the candidate count to the number of occupied slugs. [Table slug theorems](../../verification/lean/TableSlugs.lean) · [Rust catalog regression](../../rust/crates/index/tests/catalogs.rs) · [JVM catalog regression](../../core/src/test/kotlin/xtdb/catalog/TableCatalogTest.kt) · [Native SQL regression](../../rust/crates/node/tests/native.rs)
 
+The Logkeeper theorems assume that seal replies represent recorded promises for the same journal identities in a fixed ensemble and that later promise events replay with `max`.
+The rank theorem assumes a same-epoch seal reply covers the commit slot and proves a rank bound, leaving payload identity and completeness as separate obligations.
+The runner rejects writer admission without checking the promise and selecting the smaller reply rank. [Promise theorems](../../verification/multi/lean/ReplicaPromise.lean) · [Winner theorems](../../verification/multi/lean/RecoveryWinner.lean) · [Rust harnesses](../../rust/crates/logkeeper/tests/proofs.rs)
+
+The worker-loss fixture keeps MinIO, the in-memory directory, local key files, the gateway, and three fsync-enabled journal replicas available.
+Replacement compute nodes get fresh cache directories.
+With a configured 1.5-second lease, the first integrated Multi run based on `e06764b1f` measured 1.58, 1.59, and 1.47 seconds from initiating worker loss to verifying the first recovered query results.
+The run after prepared replay landed at `773adfde9` measured 1.65, 1.73, and 1.56 seconds in the same fixture.
+These are local observations with a small checkpoint and suffix. [S3 fixture](../../rust/crates/multi/tests/s3.rs) · [Cell configuration](../../rust/crates/multi/tests/common/mod.rs)
+
 ## Multi evidence
 
 The multi models describe the separate `e86af7f12` branch baseline and its directory, Logkeeper, and object-store assumptions.
@@ -87,11 +100,12 @@ It checks the ledger's catalog coverage, compiles the Lean source, and reruns al
 LEAN=/path/to/lean TLA2TOOLS_JAR=/path/to/tla2tools.jar bash verification/multi/check.sh
 ```
 
-The supplementary Rust position and IID harnesses on main use Kani 0.68.0.
+The supplementary Rust position, IID, and Logkeeper harnesses on main use Kani 0.68.0.
 
 ```sh
 cd rust
 cargo kani -p rtdb-types -p rtdb-trie --tests --output-format terse
+cargo kani -p rtdb-logkeeper --features simulation --tests --output-format terse
 cargo kani -p rtdb-types --lib --output-format terse
 cargo kani -p rtdb-columnar --tests --output-format terse
 ```

@@ -119,13 +119,13 @@ A proof of a candidate is conditional on the explicitly stated contract and work
 | LOG02 · Read progress | Open | — |
 | LOG03 · Retention and durability assumptions | Open | — |
 | LOG04 · Claim admission | Partial | [Kernel model and Rust term admission](rtdb-engine-proof-evidence.md#main-evidence) |
-| LOG05 · Term fencing | Partial | [Kernel model and Rust term admission](rtdb-engine-proof-evidence.md#main-evidence) |
+| LOG05 · Term fencing | Partial | [Kernel and Rust term admission, and Multi Logkeeper seal proof](rtdb-engine-proof-evidence.md#main-evidence) |
 | LOG06 · Role transitions | Open | — |
 | LOG07 · Block ownership | Open | — |
 | LOG08 · Publication and adoption | Partial | [Checkpoint selection and suffix replay](rtdb-engine-proof-evidence.md#main-evidence) · [Rust position packing and resume](rtdb-engine-proof-evidence.md#multi-evidence) |
 | LOG09 · Follower convergence | Partial | [Checkpoint selection and suffix replay](rtdb-engine-proof-evidence.md#main-evidence) |
 | LOG10 · Failure reporting | Open | — |
-| LOG11 · Stream separation | Partial | [Lean model of retained journal slot identity](rtdb-engine-proof-evidence.md#multi-evidence) |
+| LOG11 · Stream separation | Partial | [Main Logkeeper reply rank](rtdb-engine-proof-evidence.md#main-evidence) · [Lean model of retained journal slot identity](rtdb-engine-proof-evidence.md#multi-evidence) |
 | LOG12 · Retained-history audit | Open | — |
 | LOG13 · Terminal stream retirement | Open | — |
 
@@ -201,7 +201,7 @@ A proof of a candidate is conditional on the explicitly stated contract and work
 | CELL06 · Fault detection independence | Open | — |
 | CELL07 · Isolation and engine selection | Open | — |
 | CELL08 · Planned handoff | Open | — |
-| CELL09 · Cold activation | Partial | [Multi-mode worker-loss regression](rtdb-engine-proof-evidence.md#multi-evidence) |
+| CELL09 · Cold activation | Partial | [Integrated Multi worker-loss and bitemporal replay regression](rtdb-engine-proof-evidence.md#main-evidence) |
 | CELL10 · Cross-cell cutover | Open | — |
 | CELL11 · Move retries | Open | — |
 | CELL12 · Fork isolation | Open | — |
@@ -222,7 +222,7 @@ A proof of a candidate is conditional on the explicitly stated contract and work
 | STORE07 · Publication visibility | Open | — |
 | STORE08 · Multipart confirmation | Partial | [Checkpoint publication and Azure completion replay](rtdb-engine-proof-evidence.md#main-evidence) |
 | STORE09 · Archive completeness | Open | — |
-| STORE10 · Restore equivalence | Partial | [Checkpoint selection and suffix replay](rtdb-engine-proof-evidence.md#main-evidence) |
+| STORE10 · Restore equivalence | Partial | [Checkpoint selection, suffix replay, and integrated Multi worker loss](rtdb-engine-proof-evidence.md#main-evidence) |
 | STORE11 · Discovery contract | Partial | [Checkpoint selection and suffix replay](rtdb-engine-proof-evidence.md#main-evidence) |
 | STORE12 · Key custody | Open | — |
 

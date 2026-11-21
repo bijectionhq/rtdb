@@ -536,6 +536,36 @@ def verify_replica_trim_admission(args, scratch):
     verify_lean_model(args, scratch, path, "replica-trim-admission", controls, 3)
 
 
+def verify_logkeeper(args, scratch):
+    models = Path("verification/multi/lean")
+    dependency = scratch / "lean-logkeeper-quorum"
+    quorum = models / "Quorum.lean"
+    clone_file(quorum, dependency)
+    built = run_case([args.lean, "-DwarningAsError=true", "-o", "Quorum.olean", str(quorum)],
+                     dependency, args.evidence, "lean-logkeeper-quorum")
+    if built.returncode:
+        raise ValueError("Lean Logkeeper quorum dependency failed")
+
+    promise_controls = {
+        "ignore-promised-epoch": (
+            "dropped = false ∧ promised = writer ∧ synced = some writer",
+            "dropped = false ∧ synced = some writer",
+            ["a_stale_writer_cannot_append_after_a_seal"],
+        ),
+    }
+    verify_lean_model(args, scratch, models / "ReplicaPromise.lean", "logkeeper-promise",
+                      promise_controls, 3, os.environ | {"LEAN_PATH": str(dependency)})
+
+    winner_controls = {
+        "prefer-smaller-rank": (
+            "if Dominates candidate current then candidate else current",
+            "if Dominates candidate current then current else candidate",
+            ["choose_dominates_both"] * 5,
+        ),
+    }
+    verify_lean_model(args, scratch, models / "RecoveryWinner.lean", "logkeeper-winner", winner_controls, 3)
+
+
 def verify_generation_retention(args, scratch):
     path = Path("verification/lean/GenerationRetention.lean")
     controls = {
@@ -649,6 +679,7 @@ def verify_lean(args, scratch):
             verify_memory_admission(args, scratch)
             verify_outer_join(args, scratch)
             verify_table_slugs(args, scratch)
+            verify_logkeeper(args, scratch)
             verify_reader_retention(args, scratch)
             verify_generation_retention(args, scratch)
             verify_replica_trim_admission(args, scratch)
