@@ -41,6 +41,7 @@ pub struct ScanRequest<'a> {
 pub trait CandidateVerifier: Send + Sync {
     /// Each visible row's IID with its value of `column`.
     async fn visible(&self, iids: BTreeSet<Iid>, column: rtdb_plan::ColumnId) -> Result<Vec<(Iid, Value)>>;
+    async fn visible_columns(&self, iids: BTreeSet<Iid>, columns: &[rtdb_plan::ColumnId], residuals: &[Expr]) -> Result<Vec<(Iid, Vec<Value>)>>;
 }
 
 /// Something that can count, for any terms, the documents and tokens of the corpus a score is relative to.

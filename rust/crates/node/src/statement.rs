@@ -15,6 +15,7 @@ struct PreparedData {
     options: PrepareOptions,
     parameters: Vec<LogicalType>,
     notices: Vec<SqlNotice>,
+    ordered_index_command_tag: Option<&'static str>,
     result: PreparedResult,
     policy: ResultSignaturePolicy,
     _reservation: Arc<MemoryReservation>,
@@ -101,6 +102,7 @@ impl PreparedSql {
     ) -> Result<Self> {
         let source = parsed.source();
         let count = parsed.parameter_count();
+        let ordered_index_command_tag = parsed.ordered_index_command_tag();
         if options.parameter_types.keys().any(|index| *index >= count) { return Err(parameter_error("Declared parameter lies outside the statement")); }
         let parameter_bytes = options.parameter_types.values().try_fold(count.checked_mul(1024).and_then(|n| n.checked_add(1024)).ok_or_else(size_error)?, |bytes, ty| bytes.checked_add(ty.retained_bytes()?).ok_or_else(size_error))?;
         let _parameters = context.memory.reserve(parameter_bytes)?;
@@ -132,7 +134,7 @@ impl PreparedSql {
         let bytes = retained_bytes(&source, &options, &parameters, &notices, &result)?;
         let reservation = context.memory.reserve(bytes)?;
         drop(source_reservation);
-        Ok(Self(Arc::new(PreparedData { source, options, parameters, notices, result, policy, _reservation: reservation, plan: Default::default() })))
+        Ok(Self(Arc::new(PreparedData { source, options, parameters, notices, ordered_index_command_tag, result, policy, _reservation: reservation, plan: Default::default() })))
     }
 
     pub fn source(&self) -> &str { &self.0.source }
@@ -141,6 +143,7 @@ impl PreparedSql {
     /// Planning warnings in source traversal order; repeated occurrences are retained.
     /// Execution-time rebinding does not append warnings to this immutable preparation.
     pub fn notices(&self) -> &[SqlNotice] { &self.0.notices }
+    pub fn ordered_index_command_tag(&self) -> Option<&'static str> { self.0.ordered_index_command_tag }
     pub fn is_dml(&self) -> bool { matches!(&self.0.result, PreparedResult::Dml) }
     pub fn prepared_schema(&self) -> Option<&Schema> { match &self.0.result { PreparedResult::Query { schema, .. } => Some(schema), PreparedResult::Dml => None } }
     pub fn postgres_types(&self) -> Option<&[PgType]> { match &self.0.result { PreparedResult::Query { pg_types, .. } => Some(pg_types), PreparedResult::Dml => None } }

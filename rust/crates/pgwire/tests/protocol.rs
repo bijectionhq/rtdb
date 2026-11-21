@@ -1408,3 +1408,47 @@ async fn an_extended_execute_describes_the_rows_of_the_statement_it_names() {
     drop(client);
     running.stop().await;
 }
+
+#[tokio::test]
+async fn ordered_index_ddl_and_keyset_queries_use_the_pgwire_entry_point() {
+    let running = Running::start(ServerConfig::default(), None).await;
+    let mut client = Client::connect(&running.server, None).await;
+    let statements = [
+        ("/* define access path */ CREATE INDEX orders_customer_priority ON orders (customer, priority, _id)", "CREATE INDEX"),
+        ("INSERT INTO orders RECORDS {_id: 10, customer: 'a', priority: 1}, {_id: 11, customer: 'a', priority: 1}, {_id: 12, customer: 'a', priority: 3}", "INSERT 0 0"),
+    ];
+    for (statement, tag) in statements {
+        let frames = client.query(statement).await;
+        assert_eq!(tags(&frames), b"CZ");
+        assert_eq!(frames[0].1, cstring(tag));
+    }
+    let database = running.node.catalog().database("xtdb").unwrap();
+    database.flush().await.unwrap();
+    running.node.sync_all(Duration::from_secs(10), &tokio_util::sync::CancellationToken::new()).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let installed = database.object_store().list(None).await.unwrap().iter().any(|object| {
+                let key = object.key.as_str();
+                key.starts_with("ordered-index/v1/") && key.contains("/manifests/")
+            });
+            if installed { break; }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }).await.unwrap();
+
+    let page = client.query(
+        "SELECT _id FROM orders WHERE customer = 'a' AND (priority > 1 OR (priority = 1 AND _id > 10)) ORDER BY priority, _id LIMIT 2",
+    ).await;
+    assert_eq!(rows(&page), [vec![Some(b"11".to_vec())], vec![Some(b"12".to_vec())]]);
+
+    client.parse("drop_orders_index", "DROP INDEX orders_customer_priority", &[]).await;
+    client.bind("drop_orders_index", "drop_orders_index").await;
+    client.execute("drop_orders_index", 0).await;
+    client.send(b'S', &[]).await;
+    let frames = client.through(b'Z').await;
+    assert_eq!(tags(&frames), b"12CZ");
+    assert_eq!(frames[2].1, cstring("DROP INDEX"));
+    assert!(rows(&client.query("SELECT _id FROM xt.ordered_indexes").await).is_empty());
+    drop(client);
+    running.stop().await;
+}

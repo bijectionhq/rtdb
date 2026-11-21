@@ -160,7 +160,7 @@ impl<S> VisitMut for StatementTree<S> {
             Syntax::Erase(delete) => delete.visit(visitor)?,
             Syntax::Assert(value, _) | Syntax::Set { value, .. } => value.visit(visitor)?,
             Syntax::Records { records, .. } => records.visit(visitor)?,
-            Syntax::CreateTable { .. } | Syntax::CreateSearchIndex { .. } | Syntax::DropSearchIndex { .. } | Syntax::GrantRole { .. } | Syntax::Show(_) => (),
+            Syntax::CreateTable { .. } | Syntax::CreateSearchIndex { .. } | Syntax::DropSearchIndex { .. } | Syntax::CreateOrderedIndex { .. } | Syntax::DropOrderedIndex { .. } | Syntax::GrantRole { .. } | Syntax::Show(_) => (),
         }
         for clause in &mut self.temporal { clause.extent.visit(visitor)?; }
         self.settings.visit(visitor)
@@ -198,6 +198,13 @@ impl<'input> ParsedStatement<'input> {
     pub fn source(&self) -> &'input str { self.tree.source.text() }
 
     pub fn parameter_count(&self) -> usize { self.parameter_count }
+    pub fn ordered_index_command_tag(&self) -> Option<&'static str> {
+        match &self.tree.statement {
+            Syntax::CreateOrderedIndex { .. } => Some("CREATE INDEX"),
+            Syntax::DropOrderedIndex { .. } => Some("DROP INDEX"),
+            _ => None,
+        }
+    }
     /// Identifies parsed reads and table mutations that cannot change database/storage configuration or execute a named prepared statement.
     /// This is a syntax classification, not authorization, binding, or proof that referenced tables exist.
     /// Session controls require their separate typed control parser.
@@ -212,7 +219,7 @@ impl<'input> ParsedStatement<'input> {
         match &self.tree.statement {
             Syntax::Standard(statement) => standard(statement),
             Syntax::Erase(_) | Syntax::Assert(_, _) | Syntax::Records { .. } | Syntax::CreateTable { .. }
-            | Syntax::CreateSearchIndex { .. } | Syntax::DropSearchIndex { .. } => true,
+            | Syntax::CreateSearchIndex { .. } | Syntax::DropSearchIndex { .. } | Syntax::CreateOrderedIndex { .. } | Syntax::DropOrderedIndex { .. } => true,
             _ => false,
         }
     }
@@ -220,7 +227,7 @@ impl<'input> ParsedStatement<'input> {
         match &self.tree.statement {
             Syntax::Standard(ast::Statement::Query(_) | ast::Statement::Explain { .. }) => StatementKind::Query,
             Syntax::Records { .. } | Syntax::CreateTable { .. } | Syntax::GrantRole { .. }
-            | Syntax::CreateSearchIndex { .. } | Syntax::DropSearchIndex { .. }
+            | Syntax::CreateSearchIndex { .. } | Syntax::DropSearchIndex { .. } | Syntax::CreateOrderedIndex { .. } | Syntax::DropOrderedIndex { .. }
             | Syntax::Erase(_) | Syntax::Assert(_, _)
             | Syntax::Standard(ast::Statement::Insert(_) | ast::Statement::Update(_) | ast::Statement::Delete(_)) => StatementKind::Dml,
             _ => StatementKind::Session,
@@ -238,6 +245,8 @@ pub(crate) enum Syntax {
     GrantRole { user: Identifier, role: Identifier, revoke: bool },
     CreateSearchIndex { name: Identifier, table: ast::ObjectName, columns: Vec<Identifier>, history: bool },
     DropSearchIndex { name: Identifier },
+    CreateOrderedIndex { name: Identifier, table: ast::ObjectName, columns: Vec<Identifier> },
+    DropOrderedIndex { name: Identifier },
     Set { name: Vec<Identifier>, value: ast::Expr, local: bool },
     Show(Vec<Identifier>),
 }
@@ -422,10 +431,13 @@ pub(super) fn parse_statement_syntax<'input>(
         }
         if parser.peek_token().token != Token::EOF { return Err(sql_error("Unexpected input after CREATE TABLE", sql, parser.peek_token().span)); }
         Syntax::CreateTable { table, columns }
-    } else if word(tokens.first(), "CREATE") && word(tokens.get(1), "SEARCH") && word(tokens.get(2), "INDEX") {
-        let mut parser = Parser::new(&dialect).with_tokens_with_locations(tokens[3..].to_vec());
+    } else if word(tokens.first(), "CREATE")
+        && (word(tokens.get(1), "INDEX") || (word(tokens.get(1), "SEARCH") && word(tokens.get(2), "INDEX"))) {
+        let search = word(tokens.get(1), "SEARCH");
+        let first = if search { 3 } else { 2 };
+        let mut parser = Parser::new(&dialect).with_tokens_with_locations(tokens[first..].to_vec());
         let name = identifier_token(&parser.next_token())?;
-        if !word(Some(&parser.next_token()), "ON") { return Err(sql_error("Expected ON after the search index name", sql, slice[0].span)); }
+        if !word(Some(&parser.next_token()), "ON") { return Err(sql_error("Expected ON after the index name", sql, slice[0].span)); }
         let table = parser.parse_object_name(false).map_err(|error| parser_error(error, sql, slice[0].span))?;
         parser.expect_token(&Token::LParen).map_err(|error| parser_error(error, sql, parser.peek_token().span))?;
         let mut columns = Vec::new();
@@ -435,7 +447,7 @@ pub(super) fn parse_statement_syntax<'input>(
             parser.expect_token(&Token::Comma).map_err(|error| parser_error(error, sql, parser.peek_token().span))?;
         }
         let mut history = true;
-        if word(Some(&parser.peek_token()), "WITH") {
+        if search && word(Some(&parser.peek_token()), "WITH") {
             parser.next_token();
             parser.expect_token(&Token::LParen).map_err(|error| parser_error(error, sql, parser.peek_token().span))?;
             let option = parser.next_token();
@@ -445,11 +457,17 @@ pub(super) fn parse_statement_syntax<'input>(
             history = if word(Some(&value), "TRUE") { true } else if word(Some(&value), "FALSE") { false } else { return Err(sql_error("Expected TRUE or FALSE for history", sql, value.span)) };
             parser.expect_token(&Token::RParen).map_err(|error| parser_error(error, sql, parser.peek_token().span))?;
         }
-        if parser.peek_token().token != Token::EOF { return Err(sql_error("Unexpected input after CREATE SEARCH INDEX", sql, parser.peek_token().span)); }
-        Syntax::CreateSearchIndex { name, table, columns, history }
-    } else if word(tokens.first(), "DROP") && word(tokens.get(1), "SEARCH") && word(tokens.get(2), "INDEX") {
-        if tokens.len() != 4 { return Err(sql_error("Expected one search index name", sql, slice[0].span)); }
-        Syntax::DropSearchIndex { name: identifier_token(&tokens[3])? }
+        if parser.peek_token().token != Token::EOF { return Err(sql_error("Unexpected input after index definition", sql, parser.peek_token().span)); }
+        if search { Syntax::CreateSearchIndex { name, table, columns, history } }
+        else { Syntax::CreateOrderedIndex { name, table, columns } }
+    } else if word(tokens.first(), "DROP")
+        && (word(tokens.get(1), "INDEX") || (word(tokens.get(1), "SEARCH") && word(tokens.get(2), "INDEX"))) {
+        let search = word(tokens.get(1), "SEARCH");
+        let first = if search { 3 } else { 2 };
+        if tokens.len() != first + 1 { return Err(sql_error("Expected one index name", sql, slice[0].span)); }
+        let name = identifier_token(&tokens[first])?;
+        if search { Syntax::DropSearchIndex { name } }
+        else { Syntax::DropOrderedIndex { name } }
     } else if word(tokens.first(), "GRANT") || word(tokens.first(), "REVOKE") {
         let revoke = word(tokens.first(), "REVOKE");
         if tokens.len() != 4 || !word(tokens.get(2), if revoke { "FROM" } else { "TO" }) { return Err(sql_error("Expected one role and one user", sql, slice[0].span)); }

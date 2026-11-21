@@ -260,18 +260,26 @@ struct ScanVerifier<'a> { scan: &'a Scan, execution: &'a Execution, pushdowns: O
 #[async_trait]
 impl crate::CandidateVerifier for ScanVerifier<'_> {
     async fn visible(&self, iids: std::collections::BTreeSet<Iid>, column: rtdb_plan::ColumnId) -> Result<Vec<(Iid, Value)>> {
+        self.visible_columns(iids, &[column], &[]).await?.into_iter().map(|(iid, mut values)| {
+            Ok((iid, values.pop().ok_or_else(|| invalid("verifier-column", "Verified column is missing"))?))
+        }).collect()
+    }
+
+    async fn visible_columns(&self, iids: std::collections::BTreeSet<Iid>, columns: &[rtdb_plan::ColumnId], residuals: &[Expr]) -> Result<Vec<(Iid, Vec<Value>)>> {
         if iids.is_empty() { return Ok(Vec::new()); }
         let mut scan = self.scan.clone();
         scan.top_k = None;
+        scan.ordered_top_k = None;
         scan.iids = Some(iids);
         if !scan.columns.iter().any(|field| field.name == "_iid") {
             let id = rtdb_plan::ColumnId(scan.columns.iter().map(|field| field.id.0).max().unwrap_or(0) + 1);
             scan.columns.push(rtdb_plan::Field { id, name: "_iid".into(), qualifier: None, qualified_only: false, unnamed: true, data_type: rtdb_types::LogicalType::Scalar(rtdb_types::ScalarType::FixedSizeBinary(16)) });
         }
         let position = |found: &dyn Fn(&rtdb_plan::Field) -> bool| scan.columns.iter().position(|field| found(field)).ok_or_else(|| invalid("verifier-column", "Verified column is not projected by the scan"));
-        let (iid_at, column_at) = (position(&|field| field.name == "_iid")?, position(&|field| field.id == column)?);
+        let iid_at = position(&|field| field.name == "_iid")?;
+        let projected = columns.iter().map(|id| position(&|field| field.id == *id)).collect::<Result<Vec<_>>>()?;
         let schema = Schema::new(scan.columns.clone())?;
-        let predicate = scan.predicates.iter().cloned().reduce(|left, right| Expr::binary(rtdb_plan::BinaryOp::And, left, right));
+        let predicate = scan.predicates.iter().chain(residuals).cloned().reduce(|left, right| Expr::binary(rtdb_plan::BinaryOp::And, left, right));
         let mut cursor = ScanCursor::over(scan, self.execution.clone(), self.pushdowns.clone(), std::slice::from_ref(self.partition), self.storage).await?;
         let metadata = self.execution.scope()?;
         let invocation = predicate.as_ref().map(|predicate| self.execution.prepare_expression(predicate, &schema, &metadata)).transpose()?;
@@ -283,7 +291,7 @@ impl crate::CandidateVerifier for ScanVerifier<'_> {
                     if !rtdb_expr::is_true(&self.execution.evaluate_invocation(&scope, invocation, &row.values).await?)? { continue; }
                 }
                 let Value::FixedSizeBinary(iid) = &row.values[iid_at] else { return Err(invalid("verifier-iid", "Verified row has no IID")) };
-                visible.push((Iid::from_slice(iid)?, row.values[column_at].clone()));
+                visible.push((Iid::from_slice(iid)?, projected.iter().map(|column| row.values[*column].clone()).collect()));
             }
         }
         Ok(visible)
@@ -845,7 +853,7 @@ mod tests {
         let id = Field { id: ColumnId(0), name: "_id".into(), qualifier: None, qualified_only: false, unnamed: false, data_type: LogicalType::Scalar(ScalarType::I64) };
         let table = rtdb_plan::TableBinding { name: QualifiedTable { database: "xtdb".into(), table: TableRef::new("public", "docs") }, oid: None, columns: Default::default() };
         let scan = |predicate: Expr| Scan { table: table.clone(), columns: vec![id.clone()], valid_time: TemporalFilter::Default, system_time: TemporalFilter::Default,
-            clamp_valid_time: false, iids: None, predicates: vec![predicate], top_k: None, matches: Vec::new() };
+            clamp_valid_time: false, iids: None, predicates: vec![predicate], top_k: None, ordered_top_k: None, matches: Vec::new() };
         let equals = |value: Expr| Expr::binary(rtdb_plan::BinaryOp::Eq, id.expression(), value);
         let parameter = Expr::Parameter { index: 0, data_type: LogicalType::Scalar(ScalarType::Utf8) };
         let iid = |value: Value| value.entity_id().unwrap().iid();
@@ -888,7 +896,7 @@ mod tests {
         let field = Field { id: ColumnId(0), name: "v".into(), qualifier: None, qualified_only: false, unnamed: false, data_type: binding.columns["v"].clone() };
         let scan = Scan {
             table: binding, columns: vec![field], valid_time: TemporalFilter::All, system_time: TemporalFilter::All,
-            clamp_valid_time: false, iids: None, predicates: Vec::new(), top_k: None, matches: Vec::new(),
+            clamp_valid_time: false, iids: None, predicates: Vec::new(), top_k: None, ordered_top_k: None, matches: Vec::new(),
         };
         let memory = MemoryBudget::new(1 << 24);
         let context = QueryContext::new(catalog, Arc::clone(&memory), Timestamp(100), "UTC", QueryOptions::default(), &CancellationToken::new()).unwrap();
@@ -1311,7 +1319,7 @@ mod tests {
         }).collect();
         let scan = Scan {
             table: binding, columns, valid_time: TemporalFilter::All, system_time: TemporalFilter::All,
-            clamp_valid_time: false, iids: None, predicates: Vec::new(), top_k: None, matches: Vec::new(),
+            clamp_valid_time: false, iids: None, predicates: Vec::new(), top_k: None, ordered_top_k: None, matches: Vec::new(),
         };
         let root = MemoryBudget::new(1 << 24);
         let memory = root.scope();

@@ -1,0 +1,42 @@
+= Ordered secondary indexes
+
+`CREATE INDEX orders_customer_priority ON orders (customer, priority, _id)` declares an ordered index.
+`DROP INDEX orders_customer_priority` retires that definition.
+The leader builds ordered indexes independently of the full-text search setting.
+The definition is written to `xt.ordered_indexes` at the transaction's position.
+The engine assigns each definition a generation so a reused name sees its own files.
+
+An index can narrow equality predicates on a leading prefix and lower or upper bounds on the next column.
+For a matching `ORDER BY ... LIMIT`, the engine seeks the runs in either direction and merges their candidates until it has enough verified rows.
+Include `_id` in the ordering and in the index for deterministic pagination among equal values.
+For example, page after priority 2 and ID 4 using `priority > 2 OR (priority = 2 AND _id > 4)`.
+That predicate can seek within the equality prefix set by `customer = 'a'`.
+The query supports exact system-time and valid-time points for this early stop.
+Other query shapes still use the ordinary temporal scan and sort, with a usable index range applied when one is available.
+
+The index compares homogeneous Boolean, integer, text, binary, UUID and date columns.
+Mixed or unsupported column types use the ordinary comparison path.
+Ascending index order places nulls last and reversing the order places them first.
+The final sort presents the verified page in the requested SQL order.
+
+== Storage and publication
+
+Each definition owns an independent set of immutable sorted runs.
+The leader derives new runs from the table's immutable level-zero block files.
+These are the original flushed blocks, which RTDB retains for recovery when data compaction rewrites the serving files.
+The index merges its own equal-level runs as new blocks arrive, then publishes an immutable manifest containing the covered block frontier and the surviving runs.
+Index pages record distinct full tuples and entity IDs in sort order.
+Manifest page fences support a seek without reading pages outside the range.
+
+A query captures one RTDB snapshot.
+It covers persistent index runs, committed level-zero blocks ahead of their frontier, and live segments from that snapshot.
+The native temporal resolver and scan predicates verify candidates.
+A changed value or deletion can leave an earlier index candidate, which the resolver drops at bases where the row is no longer visible with that key.
+A missing or invalid index object, incomplete coverage, or a memory budget refusal falls back to the regular scan.
+Compaction and a lost or lagging index can change the work a read does while leaving its results unchanged.
+Maintenance reconstructs missing pages from the retained flushed blocks.
+
+When a flushed block contains an erase, index maintenance removes the affected historical keys from the new runs.
+Retired files are collected after the new manifest is published.
+A maintenance cycle only deletes pages it has superseded at its captured frontier.
+A drop ends use of the definition at its transaction; its files are eligible for cleanup on the next maintenance cycle.

@@ -92,8 +92,9 @@ impl ServerDriver {
             Some(clock) => resources.with_log_clock(clock),
             None => resources,
         };
-        let services = NodeServices { resources: Arc::new(resources), external_sources, execution_observer: Some(metrics.clone()), tracer,
+        let mut services = NodeServices { resources: Arc::new(resources), external_sources, execution_observer: Some(metrics.clone()), tracer,
             ..NodeServices::local(auth.clone(), metrics.clone(), auth.clone(), metrics.clone()) };
+        if !config.search.enabled { services.scan_accelerators.clear(); }
         let (node, driver) = Node::open_with_memory(options, services, memory).await?;
         let cancellation = CancellationToken::new();
         let listeners = async {

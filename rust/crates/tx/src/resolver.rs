@@ -313,6 +313,12 @@ impl<'a> OpenTransaction<'a> {
         self.execute_mutation(mutation, context, arguments, Some(syntax)).await.map_err(with_sql)
     }
 
+    async fn ordered_index_exists(&self, name: &str) -> Result<bool> {
+        if !self.snapshot()?.contains_table(&TableRef::new("xt", "ordered_indexes")) { return Ok(false); }
+        let mut query = self.open_query("SELECT _id FROM xt.ordered_indexes WHERE _id = ?", vec![Value::Utf8(name.into())]).await?;
+        Ok(query.next_batch().await?.is_some())
+    }
+
     async fn execute_mutation(&mut self, mutation: rtdb_sql::Mutation, context: Arc<QueryContext>, arguments: Option<&[Value]>, syntax: Option<Arc<MemoryReservation>>) -> Result<()> {
         use rtdb_sql::Mutation;
         let (table, input, kind) = match mutation {
@@ -338,6 +344,29 @@ impl<'a> OpenTransaction<'a> {
             Mutation::DropSearchIndex { name } => {
                 check_search_index_name(&name)?;
                 return self.buffer.delete(TableRef::new("xt", "search_indexes"), &rtdb_types::EntityId::String(name), interval(self.tx_key().system_time, Timestamp::MAX)?);
+            }
+            Mutation::CreateOrderedIndex { name, table, columns } => {
+                if table.database != self.context.database { return Err(Anomaly::incorrect("xtdb/table-not-found", "An ordered index must cover a table in this database")); }
+                check_table(&table.table)?;
+                check_ordered_index_name(&name)?;
+                if self.ordered_index_exists(&name).await? {
+                    return Err(Anomaly::incorrect("xtdb/index-already-exists", format!("Index {name} already exists")));
+                }
+                let document = StructFields::from([
+                    ("_id".into(), Value::Utf8(name)),
+                    ("schema_name".into(), Value::Utf8(table.table.schema)),
+                    ("table_name".into(), Value::Utf8(table.table.table)),
+                    ("columns".into(), Value::List(columns.into_iter().map(Value::Utf8).collect())),
+                    ("version".into(), Value::I64(self.tx_key().tx_id.0)),
+                ]);
+                return self.buffer.put(TableRef::new("xt", "ordered_indexes"), document, interval(self.tx_key().system_time, Timestamp::MAX)?);
+            }
+            Mutation::DropOrderedIndex { name } => {
+                check_ordered_index_name(&name)?;
+                if !self.ordered_index_exists(&name).await? {
+                    return Err(Anomaly::incorrect("xtdb/index-not-found", format!("Index {name} does not exist")));
+                }
+                return self.buffer.delete(TableRef::new("xt", "ordered_indexes"), &rtdb_types::EntityId::String(name), interval(self.tx_key().system_time, Timestamp::MAX)?);
             }
             Mutation::GrantRole { user, role, revoke } => {
                 if self.context.database != "xtdb" { return Err(Anomaly::incorrect("xtdb/role-membership-non-primary", "Role membership can only be managed on the primary 'xtdb' database.").with_context("db", self.context.database.clone().into())); }
@@ -812,6 +841,13 @@ mod tests {
 fn check_search_index_name(name: &str) -> Result<()> {
     if name.is_empty() || matches!(name, "." | "..") || name.contains(['/', '\\', '\0', '~']) {
         return Err(Anomaly::incorrect("xtdb/invalid-search-index-name", format!("Invalid search index name: {name}")));
+    }
+    Ok(())
+}
+
+fn check_ordered_index_name(name: &str) -> Result<()> {
+    if name.is_empty() {
+        return Err(Anomaly::incorrect("xtdb/invalid-index-name", "An ordered index name cannot be empty"));
     }
     Ok(())
 }

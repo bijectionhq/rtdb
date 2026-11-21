@@ -184,7 +184,7 @@ fn system_scan(context: &QueryContext, table: &str, columns: &[&str]) -> Arc<Rel
         data_type: binding.columns[*column].clone(),
     }).collect();
     Arc::new(Relation::scan(Scan { table: binding, columns, valid_time: TemporalFilter::All, system_time: TemporalFilter::All,
-        clamp_valid_time: false, iids: None, predicates: Vec::new(), top_k: None, matches: Vec::new() }).unwrap())
+        clamp_valid_time: false, iids: None, predicates: Vec::new(), top_k: None, ordered_top_k: None, matches: Vec::new() }).unwrap())
 }
 
 fn at(value: i64) -> TemporalFilter { TemporalFilter::At(Expr::Literal(timestamp(value))) }
@@ -204,7 +204,7 @@ fn scan(context: &QueryContext, columns: &[&str], valid_time: TemporalFilter, sy
         };
         Field { id: ColumnId(id as u32), name: (*name).into(), qualifier: None, qualified_only: false, unnamed: false, data_type }
     }).collect();
-    Arc::new(Relation::scan(Scan { table: binding, columns: fields, valid_time, system_time, clamp_valid_time: false, iids, predicates: Vec::new(), top_k: None, matches: Vec::new() }).unwrap())
+    Arc::new(Relation::scan(Scan { table: binding, columns: fields, valid_time, system_time, clamp_valid_time: false, iids, predicates: Vec::new(), top_k: None, ordered_top_k: None, matches: Vec::new() }).unwrap())
 }
 async fn collect(relation: Arc<Relation>, context: Arc<QueryContext>) -> Result<Vec<Vec<Value>>> {
     collect_rows(PreparedQuery::new(relation)?.execute(context, vec![]).await?).await

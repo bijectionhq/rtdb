@@ -1,0 +1,26 @@
+-- allium: 3
+-- Ordered secondary indexes over RTDB's separately compacted derived runs.
+-- The retained level-zero blocks are specified in compaction.allium and gc.allium.
+-- Bitemporal resolution belongs to db.allium.
+-- See rust/crates/node/src/ordered_index.
+
+entity Definition {
+    identity: String
+    generation: Integer
+    columns: List<String>
+}
+
+entity Layout {
+    definition: Definition
+    frontier: Integer
+}
+
+-- Invariants
+--
+-- A layout covers every indexed put in the source blocks through its frontier, subject to ordered erasure.
+-- Publishing a layout makes the completed runs available as one immutable manifest.
+-- Data compaction preserves the source blocks and changes no ordered-index layout.
+-- A query covers the indexed runs, any flushed source past the frontier, and the live tail of its captured snapshot.
+-- A candidate can contribute to an ordered page only after the snapshot resolves it and all relevant predicates hold.
+-- A captured snapshot with unavailable index coverage uses the ordinary scan.
+-- Erasure removes the affected historical entries on the next index maintenance cycle that covers the erase.

@@ -327,7 +327,10 @@ impl ProtocolSession {
                 let _arguments = self.node.memory().reserve(bound)?;
                 let args = if portal.arguments.is_empty() { None } else { Some(rtdb_tx::SqlArguments::from_rows(vec![portal.arguments.clone()], self.node.memory())?) };
                 self.session.state_mut().execute_operation(statement.dml_operation(args)?).await?;
-                writer.string(b'C', &dml_tag(source)).await
+                match statement.ordered_index_command_tag() {
+                    Some(tag) => writer.string(b'C', tag).await,
+                    None => writer.string(b'C', &dml_tag(source)).await,
+                }
             }
             (PreparedKind::Control(control), _) => {
                 let statement = control.statement();
