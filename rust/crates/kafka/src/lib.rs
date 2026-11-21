@@ -207,6 +207,10 @@ impl Log for KafkaLog {
         Ok(Some(LogOffset(low)))
     }
 
+    async fn recovery_tail(&self, after: LogOffset) -> StorageResult<Option<Box<dyn LogTail>>> {
+        self.tail(after).await.map(Some)
+    }
+
     async fn tail(&self, after: LogOffset) -> StorageResult<Box<dyn LogTail>> {
         Ok(Box::new(tail::KafkaTail::new(consumer(&self.configuration, &self.options)?, self.options.clone(), Arc::clone(&self.progress), after)?))
     }

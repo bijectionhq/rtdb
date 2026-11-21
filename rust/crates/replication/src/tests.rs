@@ -1755,8 +1755,8 @@ async fn startup_replay_preserves_exact_and_restored_anchors_across_prefix_loss(
     fixture.store.delete(&rtdb_storage::ObjectKey::new(rtdb_format::keys::block_key(BlockIndex(1)).unwrap()).unwrap()).await.unwrap();
     fixture.replica.truncate_before(LogOffset(5)).unwrap();
     let boundary = rtdb_types::ReplicaPosition(1);
-    assert!(matches!(fixture.logs.observed_replica_gap(boundary).await.unwrap(),
-        Some(rtdb_storage::Error::UnavailableLogRange { requested: 2, first_retained: 5 })));
+    assert!(matches!(fixture.logs.recovery_tail(boundary).await,
+        Err(rtdb_storage::Error::UnavailableLogRange { requested: 2, first_retained: 5 })));
 
     let cancellation = CancellationToken::new();
     for (discovery, cutoff) in [

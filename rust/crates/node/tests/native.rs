@@ -990,7 +990,8 @@ async fn follower_compactor_publishes_results_through_the_writer_without_claimin
 
 #[tokio::test]
 async fn startup_selects_a_newer_checkpoint_when_its_initial_replica_prefix_was_trimmed() {
-    use rtdb_storage::log::{LogOffset, MemoryLog};
+    use rtdb_storage::{Result as StorageResult, log::{AppendReceipt, Log, LogOffset, LogRange, LogRecord, LogTail, MemoryLog}};
+    use std::sync::atomic::AtomicUsize;
 
     struct SharedLogs {
         source: Arc<MemoryLog>,
@@ -998,7 +999,38 @@ async fn startup_selects_a_newer_checkpoint_when_its_initial_replica_prefix_was_
         store: Arc<rtdb_storage::MemoryStore>,
     }
 
-    struct LogOpening { reached: Semaphore, release: Semaphore }
+    struct LogOpening {
+        reached: Semaphore,
+        release: Semaphore,
+        attempted: AtomicUsize,
+        reopened: AtomicUsize,
+    }
+    struct StartupLog { inner: Arc<MemoryLog>, opening: Arc<LogOpening> }
+
+    #[async_trait]
+    impl Log for StartupLog {
+        async fn enqueue(&self, payload: prost::bytes::Bytes, timestamp: Timestamp) -> StorageResult<AppendReceipt> {
+            self.inner.enqueue(payload, timestamp).await
+        }
+        fn latest(&self) -> StorageResult<LogOffset> { self.inner.latest() }
+        async fn recovery_tail(&self, after: LogOffset) -> StorageResult<Option<Box<dyn LogTail>>> {
+            if self.opening.attempted.fetch_add(1, Ordering::SeqCst) == 0 {
+                self.opening.reached.add_permits(1);
+                self.opening.release.acquire().await.unwrap().forget();
+            }
+            self.inner.recovery_tail(after).await
+        }
+        async fn tail(&self, after: LogOffset) -> StorageResult<Box<dyn LogTail>> {
+            self.opening.reopened.fetch_add(1, Ordering::SeqCst);
+            self.inner.tail(after).await
+        }
+        async fn range(&self, from: LogOffset, to: LogOffset) -> StorageResult<Box<dyn LogRange>> {
+            self.inner.range(from, to).await
+        }
+        async fn read_range(&self, from: LogOffset, to: LogOffset) -> StorageResult<Vec<LogRecord>> {
+            self.inner.read_range(from, to).await
+        }
+    }
     struct Resources { shared: Arc<SharedLogs>, opening: Option<Arc<LogOpening>> }
 
     #[async_trait]
@@ -1016,12 +1048,12 @@ async fn startup_selects_a_newer_checkpoint_when_its_initial_replica_prefix_was_
         }
 
         async fn open_logs(&self, _: &str, _: &DatabaseConfig, _: LogAccess, _: CancellationToken, _: &DatabaseStorage) -> Result<OpenedLogs> {
-            if let Some(opening) = &self.opening {
-                opening.reached.add_permits(1);
-                opening.release.acquire().await.unwrap().forget();
-            }
+            let replica: Arc<dyn Log> = match &self.opening {
+                Some(opening) => Arc::new(StartupLog { inner: self.shared.replica.clone(), opening: opening.clone() }),
+                None => self.shared.replica.clone(),
+            };
             Ok(OpenedLogs {
-                source: self.shared.source.clone(), replica: self.shared.replica.clone(),
+                source: self.shared.source.clone(), replica,
                 source_epoch: rtdb_types::StorageEpoch(0), replica_epoch: rtdb_types::StorageEpoch(0), drivers: Vec::new(),
             })
         }
@@ -1043,12 +1075,17 @@ async fn startup_selects_a_newer_checkpoint_when_its_initial_replica_prefix_was_
         writer.sync_all(Duration::from_secs(10), &token).await.unwrap();
         let initial = database.status().adopted_block.unwrap();
 
-        let opening = Arc::new(LogOpening { reached: Semaphore::new(0), release: Semaphore::new(0) });
+        let opening = Arc::new(LogOpening {
+            reached: Semaphore::new(0), release: Semaphore::new(0), attempted: AtomicUsize::new(0), reopened: AtomicUsize::new(0),
+        });
         let reader_resources = Arc::new(Resources { shared: shared.clone(), opening: Some(opening.clone()) });
         let mut reader_options = options();
         reader_options.read_only = true;
-        let starting = tokio::spawn(Node::open(reader_options, NodeServices { resources: reader_resources, ..runtime }));
-        opening.reached.acquire().await.unwrap().forget();
+        let mut starting = tokio::spawn(Node::open(reader_options, NodeServices { resources: reader_resources, ..runtime }));
+        tokio::select! {
+            _ = &mut starting => panic!("startup completed before admitting its replica cursor"),
+            reached = opening.reached.acquire() => reached.unwrap().forget(),
+        }
 
         session.state_mut().execute_operation(put(&writer, 2, 20)).await.unwrap();
         database.flush().await.unwrap();
@@ -1062,8 +1099,12 @@ async fn startup_selects_a_newer_checkpoint_when_its_initial_replica_prefix_was_
         opening.release.add_permits(1);
 
         let (reader, driver) = starting.await.unwrap().expect("startup must find a checkpoint with a retained replica suffix");
+        let selected = reader.catalog().database("xtdb").unwrap().status().adopted_block.unwrap();
+        assert_eq!(selected.block_index(), replacement.block_index());
+        assert_eq!(opening.attempted.load(Ordering::SeqCst), 2);
         let reader_driver = tokio::spawn(driver.run());
         reader.sync_all(Duration::from_secs(10), &token).await.expect("startup must replay the retained replica suffix");
+        assert_eq!(opening.reopened.load(Ordering::SeqCst), 0, "the driver must reuse startup's admitted cursor");
         let resumed = reader.catalog().database("xtdb").unwrap().status().adopted_block.unwrap();
         assert_eq!(resumed.block_index(), replacement.block_index());
         let mut session = reader.session("xtdb", Arc::new(Authority)).unwrap();

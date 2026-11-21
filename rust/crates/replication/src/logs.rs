@@ -67,10 +67,23 @@ impl PartitionLogs {
     pub(crate) async fn open_replica_tail(&self, after: ReplicaPosition) -> rtdb_storage::Result<Box<dyn LogTail>> {
         self.replica.tail(LogOffset(after.after_offset(self.replica_epoch))).await
     }
-    pub(crate) async fn observed_replica_gap(&self, after: ReplicaPosition) -> rtdb_storage::Result<Option<StorageError>> {
-        let Some(LogOffset(first_retained)) = self.replica.retained_floor().await? else { return Ok(None); };
-        Ok(crate::replay_floor::missing_replay_offset(after.after_offset(self.replica_epoch), first_retained)
-            .map(|requested| StorageError::UnavailableLogRange { requested, first_retained }))
+    pub(crate) async fn recovery_tail(&self, after: ReplicaPosition) -> rtdb_storage::Result<Option<Box<dyn LogTail>>> {
+        let offset = after.after_offset(self.replica_epoch);
+        let tail = self.replica.recovery_tail(LogOffset(offset)).await?;
+        if tail.is_none()
+            && let Some(LogOffset(first_retained)) = self.replica.retained_floor().await?
+            && let Some(requested) = crate::replay_floor::missing_replay_offset(offset, first_retained)
+        {
+            return Err(StorageError::UnavailableLogRange { requested, first_retained });
+        }
+        Ok(tail)
+    }
+    pub(crate) fn is_recovery_prefix_gap(&self, after: ReplicaPosition, error: &StorageError) -> bool {
+        match error {
+            StorageError::UnavailableLogRange { requested, first_retained } =>
+                crate::replay_floor::missing_replay_offset(after.after_offset(self.replica_epoch), *first_retained) == Some(*requested),
+            _ => false,
+        }
     }
     pub async fn source_range(&self, from: SourcePosition, to: SourcePosition) -> Result<Box<dyn rtdb_storage::log::LogRange>> {
         let (from, to) = inspection_offsets(from.0, to.0, self.source_epoch)?;

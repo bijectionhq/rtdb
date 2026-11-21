@@ -6,7 +6,7 @@ use futures::future::BoxFuture;
 use rtdb_columnar::{MemoryBudget, MemoryReservation};
 use rtdb_format::{block::proto as block_pb, catalog::{BlockCatalog, TableBlock, legacy_table_ref}, database::proto::DatabaseConfig, envelope::ReplicaBody, ipc::ArrowFileWriter, keys::{block_index_from_key, block_key, TrieKey}, log::proto, metadata::MetadataBuilder};
 use rtdb_index::{BlockPages, BlockPreparation, CatalogTrie, PartitionState, PartitionValue, TableCatalog, TrieCatalog};
-use rtdb_storage::{ObjectKey, ObjectStore, cache::BufferPool};
+use rtdb_storage::{ObjectKey, ObjectStore, cache::BufferPool, log::LogTail};
 use rtdb_trie::{TrieConfig, TrieNode};
 use rtdb_types::{Anomaly, BlockIndex, ReplicaPosition, Result, SourcePosition, StorageEpoch, StorageVersion, Timestamp};
 use tokio_util::sync::CancellationToken;
@@ -20,9 +20,24 @@ pub struct RecoveredPartition {
     pub fence: TermFence,
     pub(crate) compaction_replay_cutoff: Option<ReplicaPosition>,
     refresh_allowed: bool,
+    replay_tail: Option<PreparedReplay>,
     table_blocks: BTreeMap<rtdb_types::TableRef, TableBlock>,
 }
+struct PreparedReplay {
+    logs: Arc<PartitionLogs>,
+    after: ReplicaPosition,
+    tail: Box<dyn LogTail>,
+}
+
 impl RecoveredPartition {
+    pub(crate) fn take_replay_tail(&mut self, logs: &Arc<PartitionLogs>, after: ReplicaPosition) -> Result<Option<Box<dyn LogTail>>> {
+        let Some(prepared) = self.replay_tail.take() else { return Ok(None); };
+        if !Arc::ptr_eq(&prepared.logs, logs) || prepared.after != after {
+            return Err(invalid("The prepared replica cursor belongs to a different log or checkpoint boundary"));
+        }
+        Ok(Some(prepared.tail))
+    }
+
     /// Selects initial source progress for the configured log epoch while retaining persisted identities.
     pub fn with_source_floor(mut self, source_floor: SourcePosition) -> Self {
         self.progress.source_position = self.progress.source_position.max(source_floor);
@@ -140,17 +155,22 @@ impl BlockStore {
         self.restore(config, source_floor, now, discovery, self.load_selected_checkpoint(discovery, None).await?)
     }
 
-    /// Reconsiders an ordinary latest checkpoint when the replica log reports a trimmed prefix.
+    /// Admits an ordinary latest checkpoint with the same cursor the driver will consume.
     /// An exact or restored checkpoint specifies its own recovery anchor.
-    pub async fn recover_for_replay(&self, mut recovered: RecoveredPartition, logs: &PartitionLogs,
+    pub async fn recover_for_replay(&self, mut recovered: RecoveredPartition, logs: &Arc<PartitionLogs>,
         config: TrieConfig, now: Timestamp, cancellation: &CancellationToken) -> Result<RecoveredPartition> {
         let source_floor = logs.source_floor()?;
         if !recovered.refresh_allowed { return Ok(recovered.with_source_floor(source_floor)); }
         let work = async {
             loop {
                 let after = recovered.replica_start(logs)?;
-                let Some(gap) = logs.observed_replica_gap(after).await? else {
-                    return Ok(recovered.with_source_floor(source_floor));
+                let gap = match logs.recovery_tail(after).await {
+                    Ok(tail) => {
+                        recovered.replay_tail = tail.map(|tail| PreparedReplay { logs: Arc::clone(logs), after, tail });
+                        return Ok(recovered.with_source_floor(source_floor));
+                    }
+                    Err(error) if logs.is_recovery_prefix_gap(after, &error) => error,
+                    Err(error) => return Err(error.into()),
                 };
                 let previous = recovered.block.as_ref().map(BlockCatalog::block_index);
                 drop(recovered);
@@ -183,7 +203,7 @@ impl BlockStore {
         };
         let fence = match &block { Some(block) => TermFence::from_catalog(block)?, None => TermFence::from_boundary(rtdb_types::Term(0), None)? };
         let refresh_allowed = matches!(discovery, BlockDiscovery::List | BlockDiscovery::From(_));
-        Ok(RecoveredPartition { partition, block, progress, fence, table_blocks, compaction_replay_cutoff, refresh_allowed }.with_source_floor(source_floor))
+        Ok(RecoveredPartition { partition, block, progress, fence, table_blocks, compaction_replay_cutoff, refresh_allowed, replay_tail: None }.with_source_floor(source_floor))
     }
     async fn load_selected_checkpoint(&self, discovery: BlockDiscovery, previous: Option<BlockIndex>) -> Result<Option<(BlockCatalog, BTreeMap<rtdb_types::TableRef, TableBlock>)>> {
         let latest = self.latest_block(discovery).await?;

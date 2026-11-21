@@ -637,12 +637,13 @@ config {
 -- Recovery derives that protection from the restored catalog. Block adoption derives it from the persisted table blocks.
 -- Ordinary latest-block recovery refreshes discovery after a missing root or table block.
 -- It retries only when the refreshed listing reveals a strictly newer block.
--- Before installing an ordinary latest checkpoint, startup also checks for an observed replica
--- prefix gap and may use only a strictly newer reported checkpoint if that check finds one.
--- Exact recovery keeps its selected block. Archive recovery requires its anchor and probes only
--- its contiguous successors. The replica tail is still opened and validated by the driver.
--- Exact-block and restored-archive discovery keep their own checkpoint requirements.
--- The retained-prefix observation does not hold the suffix in place.
+-- With a provider that admits a cursor during recovery, ordinary startup opens the replica tail before installing the checkpoint.
+-- A trimmed first required offset triggers refresh and may select only a strictly newer reported checkpoint.
+-- Other admission failures end startup with the provider error.
+-- The replication driver consumes the admitted cursor for that same log and boundary.
+-- Providers that defer cursor admission can still report an advisory floor and open the tail in the replication driver.
+-- Exact recovery keeps its selected block. Archive recovery requires its anchor and probes only its contiguous successors.
+-- A successful cursor admission does not reserve the replica suffix against later trimming.
 --
 -- A new leader can always reconstruct correct state from the last persisted block and the follower's in-memory state, which has been built by processing replica messages.
 --

@@ -1068,9 +1068,12 @@ Relate the native postings iterator and persisted sidecar to the modeled complet
 A durable-node test verifies current and system-history SQL results before, during and after tiered publication, then recovers the partial checkpoint and replays the last notice.
 Production discovery now advances to a newer advertised root when collection removes the selected root or a table block during startup.
 Native runs verify both cases using the block collector, and Verus checks the strict progress decision.
-An observed replica prefix gap also triggers strictly newer checkpoint discovery before installing the state.
-Verus checks the exact first-required-offset rule. The native memory-provider run selects a later checkpoint and replays its retained suffix.
-A separate model distinguishes observation from retention through tail opening.
+For providers that support recovery cursor admission, the database admits the cursor before installing an ordinary checkpoint.
+A trimmed first required offset triggers strictly newer checkpoint discovery.
+The replication driver uses that same cursor after checking the log and checkpoint boundary.
+Verus checks the exact first-required-offset rule.
+The native memory-provider run selects a later checkpoint and replays its retained suffix with the cursor admitted during startup.
+TLC checks cursor admission, reuse and strict progress before refusal and reaches a state with later trimming after admission.
 mCRL2 checks the observable results of the staged discovery model against the atomic contract for three reported indices.
 AutoHyper checks that startup with one transient collection interruption agrees with direct startup on the eventually admitted block when both observe the same stable replacement.
 TLC and Apalache check two overlapping checkpoint generations, one recovery reference, protected objects, and its required log suffix under delayed collection.

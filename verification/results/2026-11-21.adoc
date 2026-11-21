@@ -1020,3 +1020,16 @@ It recorded 115 Verus obligations, 63 source controls, and 21 TLC baseline confi
 Its input manifest SHA-256 is `d92c0b97b24a6b19719564c7eea6816d9b6aff16c6ae59439d79a52d2a2a4e67`.
 The native replay and Rust boundary flags were omitted from this invocation.
 Distributed reader and recovery retention, hosted provider settlement, and the replica log suffix remain outside the local runtime guarantee.
+
+=== Prepared replica cursor during checkpoint recovery
+
+The ordinary recovery path asks a supporting replica log to admit a cursor before installing a checkpoint.
+It retries a strictly newer checkpoint only when the error identifies the first requested offset as part of a discarded prefix.
+The driver takes the admitted cursor with its original log and boundary identity.
+Exact and restored-archive recovery retain their existing anchors.
+Local file logs and providers that defer admission still open the cursor when the driver runs and retain their optional earlier floor check.
+
+TLC checked 171 reachable states of link:../tla/PreparedReplay.tla[PreparedReplay].
+The controls reject installation without admission, refusal without refresh, and use of a different cursor by the driver.
+Two additional traces witness successful recovery on a newer checkpoint and trimming after admission.
+The latter remains possible because cursor admission carries no retention entitlement on a remote log.

@@ -802,6 +802,19 @@ TLA_CASES = (
      ('Mutation = "none"', 'Mutation = "ignore_nascent"'), "InstalledReadable"),
     ("InstalledCheckpoint", "installed-checkpoint-collection-witness",
      ("INVARIANTS TypeOK InstalledReadable ReaderReadable", "INVARIANT OldFilesNeverCollected"), "OldFilesNeverCollected"),
+    ("PreparedReplay", "prepared-replay", None, None),
+    ("PreparedReplay", "prepared-replay-skip-admission",
+     ('Mutation = "none"', 'Mutation = "install_without_admission"'), "InstallHasAdmission"),
+    ("PreparedReplay", "prepared-replay-reopen",
+     ('Mutation = "none"', 'Mutation = "reopen"'), "DriverUsesPrepared"),
+    ("PreparedReplay", "prepared-replay-early-refusal",
+     ('Mutation = "none"', 'Mutation = "refuse_without_refresh"'), "RefreshBeforeRefusing"),
+    ("PreparedReplay", "prepared-replay-replacement-witness",
+     ("INVARIANTS InstallHasAdmission DriverUsesPrepared OnlyNewerCheckpointsRetried RefreshBeforeRefusing",
+      "INVARIANT NeverReplaysReplacement"), "NeverReplaysReplacement"),
+    ("PreparedReplay", "prepared-replay-later-trim-witness",
+     ("INVARIANTS InstallHasAdmission DriverUsesPrepared OnlyNewerCheckpointsRetried RefreshBeforeRefusing",
+      "INVARIANT NeverTrimmedAfterAdmission"), "NeverTrimmedAfterAdmission"),
     ("RecoveryReplay", "checkpoint-replay-prefix", None, None),
     ("RecoveryReplay", "checkpoint-replay-skip-probe", ('Mutation = "none"', 'Mutation = "skip_probe"'), "ObservedAdmission"),
     ("RecoveryReplay", "checkpoint-replay-fail-fast", ('Mutation = "none"', 'Mutation = "fail_fast"'), "RefreshBeforeRefusing"),
@@ -1191,17 +1204,30 @@ def verify_replay_prefix(args, source):
     gate = "let recovered = if self.options.replication.enabled {"
     try:
         replace_once(database, gate, gate.replace("if self", "if false && self"))
-        checked = run_case(command, source / "rust", args.evidence, "rust-replay-prefix-skip-probe", env)
+        checked = run_case(command, source / "rust", args.evidence, "rust-replay-prefix-skip-admission", env)
         if (
             checked.returncode != 101 or f"{test} ... FAILED" not in checked.stdout
-            or "startup must replay the retained replica suffix" not in checked.stdout
-            or 'code: "rtdb.storage/log-range-unavailable"' not in checked.stdout
+            or "startup completed before admitting its replica cursor" not in checked.stdout
             or "0 passed; 1 failed" not in checked.stdout
         ):
-            raise ValueError("skipping the observed replica prefix check did not fail during replay startup")
+            raise ValueError("skipping cursor admission did not fail during replay startup")
     finally:
         database.write_bytes(original)
-    print("rust-replay-prefix: checkpoint selection and suffix replay passed, skipping the probe failed")
+    driver = source / "rust/crates/replication/src/driver.rs"
+    original = driver.read_bytes()
+    try:
+        replace_once(driver, "let replica_tail = recovered.take_replay_tail(&logs, read_position)?;",
+                     "let replica_tail = None;")
+        checked = run_case(command, source / "rust", args.evidence, "rust-replay-prefix-reopen-accepted-cursor", env)
+        if (
+            checked.returncode != 101 or f"{test} ... FAILED" not in checked.stdout
+            or "the driver must reuse startup's admitted cursor" not in checked.stdout
+            or "0 passed; 1 failed" not in checked.stdout
+        ):
+            raise ValueError("reopening an admitted cursor did not fail the handoff assertion")
+    finally:
+        driver.write_bytes(original)
+    print("rust-replay-prefix: checkpoint selection and same-cursor replay passed, both controls rejected")
 
 
 def verify_catalog_replay(args, source):
@@ -1599,6 +1625,8 @@ def main():
         "rust/crates/storage/src/log/mod.rs",
         "rust/crates/storage/src/log/memory.rs",
         "rust/crates/kafka/src/lib.rs",
+        "rust/crates/logkeeper/src/client/mod.rs",
+        "rust/crates/multi/src/logs.rs",
     ))
     for path in list(source_paths):
         if path.name == "proof.rs":

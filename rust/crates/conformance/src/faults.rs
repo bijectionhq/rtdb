@@ -12,7 +12,7 @@ use tokio_util::sync::CancellationToken;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum Operation { Enqueue, DurableReceipt, Tail, Poll, ReplayPrepare, ReplayDelivery, Range, RangeNext, ReadRange, Head, Get, GetRange, Put, PutFile, List, Delete, Copy }
+pub enum Operation { Enqueue, DurableReceipt, RecoveryTail, Tail, Poll, ReplayPrepare, ReplayDelivery, Range, RangeNext, ReadRange, Head, Get, GetRange, Put, PutFile, List, Delete, Copy }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum ReplayMode { Batch, Selected }
@@ -369,6 +369,12 @@ impl FaultLog {
     pub fn new(inner: Arc<dyn Log>, name: String, schedule: Arc<FaultSchedule>) -> Arc<Self> {
         Arc::new(Self { inner, owner: FaultEndpoint { name, schedule } })
     }
+
+    fn wrap_tail(&self, mut inner: Box<dyn LogTail>) -> Result<Box<dyn LogTail>> {
+        let mode = self.owner.schedule.replay_mode(&self.owner.name);
+        if mode == ReplayMode::Selected { self.owner.require_replay(inner.as_mut())?; }
+        Ok(Box::new(FaultTail { inner, owner: self.owner.clone(), mode }))
+    }
 }
 #[async_trait]
 impl Log for FaultLog {
@@ -379,11 +385,12 @@ impl Log for FaultLog {
     }
     fn latest(&self) -> Result<LogOffset> { self.inner.latest() }
     async fn retained_floor(&self) -> Result<Option<LogOffset>> { self.inner.retained_floor().await }
+    async fn recovery_tail(&self, after: LogOffset) -> Result<Option<Box<dyn LogTail>>> {
+        let tail = self.owner.around(Operation::RecoveryTail, None, self.inner.recovery_tail(after)).await?;
+        tail.map(|tail| self.wrap_tail(tail)).transpose()
+    }
     async fn tail(&self, after: LogOffset) -> Result<Box<dyn LogTail>> {
-        let mut inner = self.owner.around(Operation::Tail, None, self.inner.tail(after)).await?;
-        let mode = self.owner.schedule.replay_mode(&self.owner.name);
-        if mode == ReplayMode::Selected { self.owner.require_replay(inner.as_mut())?; }
-        Ok(Box::new(FaultTail { inner, owner: self.owner.clone(), mode }))
+        self.wrap_tail(self.owner.around(Operation::Tail, None, self.inner.tail(after)).await?)
     }
     async fn range(&self, from: LogOffset, to: LogOffset) -> Result<Box<dyn LogRange>> {
         let inner = self.owner.around(Operation::Range, None, self.inner.range(from, to)).await?;

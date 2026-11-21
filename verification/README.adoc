@@ -115,7 +115,7 @@ The production controls publish the root too early and stop on a missing checkpo
 The native collection replay checks that live and pending trie files remain protected until the installed checkpoint is replaced.
 Its control removes the checkpoint from collection eligibility.
 The startup replay test also covers a selected checkpoint whose first required replica offset is below the reported retained floor.
-The archived control skips the prefix check and must fail when the driver opens that suffix.
+The archived controls skip cursor admission and reopen an admitted cursor.
 It also tests catalog promotion after a binary checkpoint round trip.
 The production controls omit the pending historical index and let a tiered replacement publish without its fourth bucket.
 The catalog clock test commits a transaction at an explicit system time, issues an attach and a refused detach, and reopens the same local log.
@@ -163,7 +163,10 @@ It also exercises the Azure adapter against a loopback provider and separately m
   TLC explores its finite state space, and Apalache cross-checks retention through ten transitions.
 * `tla/RecoveryDiscovery.tla` models a separate fallback for missing checkpoint metadata during startup.
   The fallback requires a newer checkpoint in a refreshed listing and has no effect on replica-log retention.
-* `tla/RecoveryReplay.tla` models a checkpoint selection check against the observed replica prefix, refresh, and subsequent tail opening.
+* `tla/PreparedReplay.tla` models admitting a replica cursor before installing an ordinary checkpoint and transferring that cursor to the driver.
+  Its controls check early installation, early refusal, and reopening an admitted cursor.
+  The reachability witnesses show a successful refresh and a separate trim after admission.
+* `tla/RecoveryReplay.tla` models the earlier checkpoint selection check against the observed replica prefix, refresh, and subsequent tail opening.
   It checks recovery with a newer checkpoint and reaches a separate loss between the probe and tail opening.
 * `mcrl2/CheckpointDiscovery.mcrl2` compares the staged metadata discovery with an atomic observation contract after hiding the selection and individual reads.
   It checks divergence-preserving branching bisimilarity on three indices and generates a distinguishing formula for each weakened model.
