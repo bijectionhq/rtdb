@@ -40,7 +40,7 @@ A proof of a candidate is conditional on the explicitly stated contract and work
 | VAL05 · Promotion and casts | Open | — |
 | VAL06 · Equality, hashing, and ordering | Open | — |
 | VAL07 · Extension types | Open | — |
-| VAL08 · Physical encoding | Partial | [Lean sliced runs and Rust Arrow lookup checks](rtdb-engine-proof-evidence.md#main-evidence) |
+| VAL08 · Physical encoding | Partial | [Lean sliced runs and Arrow physical-position correspondence](rtdb-engine-proof-evidence.md#arrow-run-end-lookup) |
 | VAL09 · Batch schema | Open | — |
 | VAL10 · Row and vector agreement | Open | — |
 

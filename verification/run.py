@@ -523,15 +523,30 @@ def verify_run_encoding(args, scratch):
         "inclusive-end": (
             "if logicalIndex < stop",
             "if logicalIndex ≤ stop",
-            ["end_lookup_matches_expansion", "end_lookup_matches_expansion"],
+            ["a_returned_value_has_a_covering_run", "a_returned_value_has_a_covering_run",
+             "end_lookup_matches_expansion", "end_lookup_matches_expansion",
+             "first_end_after_at_position", "first_end_after_at_position"],
         ),
         "lose-slice-origin": (
             "firstEndAfter (start + row) runs",
             "firstEndAfter (0 + row) runs",
-            ["encoded_slice_read_matches_plain"],
+            ["arrow_search_for_a_slice_matches_plain", "encoded_slice_read_matches_plain"],
+        ),
+        "stay-at-exact-end": (
+            "| .found j => j + 1", "| .found j => j",
+            ["arrow_physical_index_is_first_exclusive_end", "arrow_physical_index_is_first_exclusive_end"],
+        ),
+        "read-before-insertion": (
+            "| .absent j => j", "| .absent j => j - 1",
+            ["arrow_physical_index_is_first_exclusive_end", "arrow_physical_index_is_first_exclusive_end"],
+        ),
+        "drop-slice-offset-in-cast": (
+            "(BitVec.ofNat width (start + row)).toInt = Int.ofNat (start + row)",
+            "(BitVec.ofNat width row).toInt = Int.ofNat (start + row)",
+            ["signed_index_cast_preserves_sliced_coordinate"],
         ),
     }
-    verify_lean_model(args, scratch, path, "run-encoding", controls, 5)
+    verify_lean_model(args, scratch, path, "run-encoding", controls, 9)
 
 
 def verify_memory_admission(args, scratch):

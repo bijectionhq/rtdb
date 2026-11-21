@@ -13,7 +13,7 @@ These results apply to the classic and full-text Rust paths at the particular re
 | --- | --- | --- |
 | TIME01, TIME02, TIME04–TIME11 | Lean relates the descending ceiling scan to the captured-history point query, including the exclusive query upper bound. Verus checks the production interval intersection, ceiling vector split and overwrite, cell selection, clipping, and per-fragment admission. Both native resolvers agreed with the reference for 4,096 observations. | SQL normalization, snapshot assembly, input coverage and operation order, the event and allocation shell, and the full assembly and projection of Rust fragments. |
 | VAL03, VAL04 · Type join and sparse fields | Lean proves associativity, commutativity and idempotence over arbitrary scalar families and flat struct fields. It distinguishes bottom, an explicit null, a field absent from both structs, and a field absent from one contributing struct. | Relate the model to the production type representations and prove nested collections, normalization, and the supported layout contracts. |
-| VAL08 · Run-end layout | Lean proves round-trip expansion, strictly increasing exclusive ends, and equivalence of sliced reads to plain reads for arbitrary lists. Kani verifies Arrow's `RunEndBuffer::get_physical_index` for two runs and all admitted slices in each signed run-end width. | Relate the native encoders, representation equality, Arrow access over arbitrary run counts, and all selection, copy, and union paths to the logical model. |
+| VAL08 · Run-end layout | Lean proves round-trip expansion and connects Arrow's hit and insertion-point cases to the same sliced row for arbitrary run counts. Kani checks Arrow's concrete lookup for two runs in each signed run-end width. | Establish the actual array and buffer contracts, and refine representation equality, selection, copy, and union paths. |
 | QRY04, QRY05 · Left join predicate placement | Lean proves that a preserved-side `WHERE` predicate can filter the left input and an unpreserved-side `ON` conjunct can filter the right input. A `WHERE ... IS NULL` counterexample shows why prefiltering the nullable side can add a row despite reapplying the residual predicate. The native optimizer test checks these placements. | Relate the modeled predicates and rows to Rust plan construction and execution, including error and evaluation-context contracts and the other join kinds and rewrites. |
 | QRY09, QRY10, SCAN06 · Ordered scans and distinct prefixes | The ordered-index models check sorted merge, early predicate application and keyset continuation, distinct runs and local limits, and page exclusion under valid fences. Production Verus checks cover seek decisions, and recorded native tests cover ordered distinct and keyset queries. | Relate SQL comparison, collation, null and other ordering rules, Arrow page metadata, and arbitrary grouping and window plans to their applicable reference semantics. |
 | SESS01–SESS03, SESS06, SESS07 · Explicit transactions | Lean checks read and write phase resolution, preservation of the captured read basis throughout nonterminal commands, ordered buffering, submission at the modeled commit boundary, discard, and terminal closure. Native session tests exercise the same behaviors and a separate native node test retains a null partition entry from the captured basis. | Refine every protocol and runtime session path, including implicit transactions, capture and await, argument batch coalescing, memory failure, cancellation, and submission or replay outcomes. |
@@ -125,6 +125,16 @@ It starts disposable local services and records its logs under `build/proof-runs
 cargo build --locked --manifest-path rust/Cargo.toml -p rtdb-server --features kafka,s3 --bin rtdb
 RTDB_CLASSIC_BIN="$PWD/rust/target/debug/rtdb" bash verification/classic-kafka-s3.sh
 ```
+
+### Arrow run-end lookup
+
+Lean checks the hit and insertion-point cases in Arrow 58.4.1's `RunEndBuffer::get_physical_index`.
+The binary search is assumed to return a matching position on a hit or partition the run ends around the query on a miss.
+For any strictly increasing covered run list, an exact hit advances to the following run and a miss uses the insertion point, giving the first end strictly greater than the absolute row.
+The resulting run value agrees with the corresponding plain row for an arbitrary encoded slice.
+The signed coordinate cast preserves the slice origin and relative row whenever their sum fits the selected signed width.
+Lean 4.35.0 audited nine theorems and rejected five controls, including staying on the matched exclusive end and reading before the insertion point.
+The concrete Arrow and fixed-width byte readers still need refinement against their buffer and array invariants. [Run encoding and physical position theorems](../../verification/lean/RunEncoding.lean) · [Bounded Arrow harnesses](../../rust/crates/columnar/tests/proofs.rs)
 
 ### Memory trie lookup and coverage
 
