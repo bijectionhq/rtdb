@@ -35,7 +35,7 @@ These results apply to the classic and full-text Rust paths at the particular re
 | CELL09, STORE10 and Multi recovery S2, S5 · Worker loss | A local MinIO and PgWire regression retains the checkpoint and acknowledged suffix, compares current rows and the full bitemporal projection, and verifies new writes after losing one, two, and all three compute workers. | Prove the complete activation and recovery path under the published durable-service and liveness assumptions. |
 | IDX02, IDX04, IDX06, IDX07 | Verus checks the production Rust base-four IID digit, path comparison, partition, and recursive and one-level split. The Kani harness also checks all legal depths using independent bit extraction for widths 2, 4, and 8. | Check the native node construction and live insertion and traversal boundaries, then refine JVM splitting and connect both trees to replay. |
 | IDX02, IDX03, IDX07, IDX09 | Verus checks the production native sort, merge, persisted order validation and leaf split. OpenJML checks order and multiplicity of the production JVM merge. An injective logical rank uniquely determines an ordered leaf from its row occurrences. | Establish IID stability at each runtime reader, prove JVM pending-run sorting, and propagate stored-run order through insertion, caches and traversal. |
-| IDX01, IDX08 | Verus checks the production Rust search, append, and adjacent chunk replacement against one contiguous-layout invariant. Lean proves that appending rows and joining adjacent chunks preserve existing ordinal reads. | Prove the Arrow row-content obligation and refine snapshot ownership across block transitions in both engines. |
+| IDX01, IDX08 | Verus checks production Rust row addressing and proves that appending or joining adjacent chunks preserves the exact 16-byte IID at a retained ordinal under the ordered payload contract. Lean proves the corresponding arbitrary-history law. | Establish the Arrow and cached-header content contract and refine snapshot ownership across block transitions in both engines. |
 | SCAN07, GC01, GC02 | Lean proves the abstract generation retention invariant for arbitrarily many readers, objects, in-flight operations and steps. Verus checks the collector's production selection loop against the visibility observations it receives. | Refine the captured references, provider operations, and authority changes, including the full durable deletion protocol. |
 | GC09, STORE03 · Hosted ordered-index retirement | Lean checks point equivalence after scrubbing known erase cuts. A bounded TLC model checks storage retirement, reader release, scrubbed replay, and conditional completion. Integration tests exercise a held reader and versioned local S3 provider. | Compose the directory and provider contracts with every hosted deployment, reader and primary-file custody path covered by physical disposal. |
 | STORE03 · Read entitlements | Lean proves a lease timing inequality and preservation of read entitlement across arbitrary abstract pin transitions, including close while a read remains active. | Prove clock, I/O completion, decoded page ownership, cache eviction, and provider lifetime assumptions at production call sites. |
@@ -275,6 +275,15 @@ The native tests check chunk boundaries, repeated starts, retained reads after a
 Lean 4.35.0 audited five theorems and rejected both mutations.
 Verus 0.2026.11.05.31e44e6 checked nine functions and rejected five mutations.
 The native run passed 503 tests with `cargo test --manifest-path rust/Cargo.toml --locked -p rtdb-trie -p rtdb-format -p rtdb-index -p rtdb-query`. [Lean model](../../verification/lean/LiveRowAddress.lean) · [Verus study](../../verification/verus/live_row_address/area.json) · [Snapshot regression](../../rust/crates/index/tests/live_index.rs)
+
+### Retained IID contents in native chunks
+
+Verus checks the production row-address search, append, and tail replacement with chunks carrying sixteen-byte IID values.
+The checked reader returns the value at the unique owning cell of every in-range ordinal, even when empty chunks repeat a start address.
+Appending a chunk preserves that value for every retained ordinal, including when an overflowing append returns an error.
+Replacing the tail pair preserves the same value when the replacement's cells equal the earlier payload followed by the later payload.
+The study rejects reading the first cell instead of the located cell, ignoring the appended length, and reversing the two payloads while preserving their combined extent.
+The payload premise still needs to be established by Arrow concatenation and the live table's cached header reader. [Typed IID correspondence](../../verification/verus/live_iid_contents/contents.rs) · [Production row-address operations](../../rust/crates/index/src/row_address.rs) · [Live table and header reader](../../rust/crates/index/src/live.rs)
 
 ### JVM shared snapshot ownership
 
