@@ -179,21 +179,34 @@ impl DiskCache {
                 temporary.write_all(bytes.as_slice()).map_err(|error| Error::io(temporary.path(), error))?;
                 offset = end;
             }
-            let path = self.root.join(cache_key.as_str());
-            let parent = path.parent().ok_or_else(|| Error::InvalidKey(cache_key.to_string()))?;
-            fs::create_dir_all(parent).map_err(|error| Error::io(parent, error))?;
-            temporary.persist(&path).map_err(|error| Error::io(&path, error.error))?;
-            lease.entry.file.set(CachedFile { path: parking_lot::RwLock::new(path), size: object.size }).map_err(|_| Error::Task("Disk cache load published twice".into()))?;
+            self.publish(cache_key, &lease.entry, temporary, object.size)?;
         }
         drop(guard);
         self.trim(None);
         Ok(lease)
     }
+
+    fn publish(&self, key: &ObjectKey, entry: &Arc<Entry>, temporary: tempfile::NamedTempFile, size: u64) -> Result<()> {
+        let state = self.state.lock();
+        let path = if state.entries.get(key).is_some_and(|current| Arc::ptr_eq(current, entry)) {
+            let path = self.root.join(key.as_str());
+            let parent = path.parent().ok_or_else(|| Error::InvalidKey(key.to_string()))?;
+            fs::create_dir_all(parent).map_err(|error| Error::io(parent, error))?;
+            temporary.persist(&path).map_err(|error| Error::io(&path, error.error))?;
+            path
+        } else {
+            debug_assert!(entry.retired.load(Ordering::Acquire));
+            temporary.keep().map_err(|error| Error::io(error.file.path(), error.error))?.1
+        };
+        entry.file.set(CachedFile { path: parking_lot::RwLock::new(path), size })
+            .map_err(|_| Error::Task("Disk cache entry published twice".into()))
+    }
+
     /// Drops the cached copy of a key, so the next read goes to the remote store.
     /// An idle file is removed now. A leased one moves into the staging directory, where its readers keep it until the last lease ends and a restart clears it.
     pub fn invalidate(&self, cache_key: &ObjectKey) -> Result<()> {
-        let removed = self.state.lock().entries.remove(cache_key);
-        let Some(entry) = removed else { return Ok(()) };
+        let mut state = self.state.lock();
+        let Some(entry) = state.entries.get(cache_key) else { return Ok(()) };
         if let Some(file) = entry.file.get() {
             let staging = self.root.join(".tmp");
             let retired = tempfile::Builder::new().prefix("retired-").tempfile_in(&staging).map_err(|error| Error::io(&staging, error))?
@@ -201,11 +214,15 @@ impl DiskCache {
             let mut path = file.path.write();
             match fs::rename(&*path, &retired) {
                 Ok(()) => *path = retired,
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => { let _ = fs::remove_file(&retired); },
-                Err(error) => return Err(Error::io(&*path, error)),
+                Err(error) => {
+                    let _ = fs::remove_file(&retired);
+                    if error.kind() != std::io::ErrorKind::NotFound { return Err(Error::io(&*path, error)); }
+                    *path = retired;
+                }
             }
         }
         entry.retired.store(true, Ordering::Release);
+        state.entries.remove(cache_key);
         Ok(())
     }
     pub fn scope(self: &Arc<Self>, namespace: ObjectKey, remote: Arc<dyn ObjectStore>) -> Result<Arc<dyn ObjectStore>> {
@@ -247,12 +264,7 @@ impl DiskCache {
                 temporary.write_all(&chunk[..length]).map_err(|error| Error::io(temporary.path(), error))?;
                 remaining -= length as u64;
             }
-            let path = cache.root.join(key.as_str());
-            let parent = path.parent().ok_or_else(|| Error::InvalidKey(key.to_string()))?;
-            fs::create_dir_all(parent).map_err(|error| Error::io(parent, error))?;
-            temporary.persist(&path).map_err(|error| Error::io(&path, error.error))?;
-            lease.entry.file.set(CachedFile { path: parking_lot::RwLock::new(path), size }).map_err(|_| Error::Task("Disk cache upload published twice".into()))?;
-            Ok(())
+            cache.publish(&key, &lease.entry, temporary, size)
         }).await
     }
 }
