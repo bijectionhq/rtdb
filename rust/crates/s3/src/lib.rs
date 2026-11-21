@@ -1,4 +1,6 @@
 mod credential;
+mod scoped;
+pub use scoped::{SCOPED_S3_CLOCK_ALLOWANCE, SCOPED_S3_WRITE_TTL, ScopedS3Writes, WriteAuthorization};
 #[cfg(feature = "versioning")]
 mod versions;
 
@@ -6,6 +8,7 @@ mod versions;
 pub use versions::VersionedInventory;
 
 use std::sync::Arc;
+use aws_credential_types::provider::SharedCredentialsProvider;
 use object_store::{RetryConfig, StaticCredentialProvider, aws::{AmazonS3Builder, AmazonS3ConfigKey, AwsCredential, S3ConditionalPut, S3CopyIfNotExists}};
 use rtdb_format::generated::xtdb::aws::proto as pb;
 use rtdb_format::keys::StorageRoot;
@@ -42,6 +45,11 @@ pub struct S3Config {
     pub remote: Option<String>,
 }
 
+enum S3Authorization {
+    Static(S3Credentials),
+    Rotating { provider: SharedCredentialsProvider, region: Option<String> },
+}
+
 impl S3Config {
     pub fn new(bucket: impl Into<String>) -> Self {
         Self { bucket: bucket.into(), region: None, prefix: None, credentials: None, endpoint: None, path_style_access_enabled: false, remote: None }
@@ -76,7 +84,26 @@ impl S3Config {
     async fn open_store(&self, storage_root: &ObjectKey, remotes: &dyn S3CredentialResolver, io: Arc<IoRegion>, cell: bool) -> Result<Arc<RemoteStore>> {
         if self.bucket.is_empty() { return Err(Anomaly::incorrect("xtdb.aws/invalid-config", "S3 bucket is empty")); }
         let prefix = self.object_prefix(storage_root)?;
-        let credentials = self.resolve_credentials(remotes)?;
+        let authorization = if let Some(credentials) = self.resolve_credentials(remotes)? {
+            S3Authorization::Static(credentials)
+        } else {
+            let mut configuration = aws_config::defaults(aws_config::BehaviorVersion::latest());
+            if let Some(region) = &self.region { configuration = configuration.region(aws_config::Region::new(region.clone())); }
+            let configuration = configuration.load().await;
+            let provider = configuration.credentials_provider().ok_or_else(|| Anomaly::incorrect("xtdb.aws/credentials", "AWS default credential provider is unavailable"))?;
+            S3Authorization::Rotating { provider, region: configuration.region().map(|region| region.as_ref().to_owned()) }
+        };
+        self.open_authorized(prefix, authorization, io, cell)
+    }
+
+    fn open_authorized(&self, prefix: ObjectKey, authorization: S3Authorization, io: Arc<IoRegion>, cell: bool) -> Result<Arc<RemoteStore>> {
+        #[cfg(feature = "versioning")]
+        let uploads = (cell && io.publication_journal().is_some())
+            .then(|| self.authorized_inventory(prefix.clone(), &authorization)).transpose()?;
+        #[cfg(not(feature = "versioning"))]
+        if cell && io.publication_journal().is_some() {
+            return Err(Anomaly::incorrect("xtdb.aws/managed-uploads", "Managed cell publications require S3 inventory support"));
+        }
         let (endpoint, virtual_hosted) = self.endpoint_addressing()?;
         let mut builder = AmazonS3Builder::from_env().with_bucket_name(&self.bucket)
             .with_virtual_hosted_style_request(virtual_hosted)
@@ -88,32 +115,51 @@ impl S3Config {
         };
         if let Some(region) = &self.region { builder = builder.with_region(region); }
         if let Some(endpoint) = endpoint { builder = builder.with_config(AmazonS3ConfigKey::S3Endpoint, endpoint.as_str()).with_allow_http(endpoint.scheme() == "http"); }
-        if let Some(credentials) = credentials {
-            if credentials.access_key.is_empty() || credentials.secret_key.is_empty() { return Err(Anomaly::incorrect("xtdb.aws/invalid-config", "S3 credentials require nonempty access and secret keys")); }
-            builder = builder.with_credentials(Arc::new(StaticCredentialProvider::new(AwsCredential { key_id: credentials.access_key, secret_key: credentials.secret_key, token: None })));
-        } else {
-            let mut configuration = aws_config::defaults(aws_config::BehaviorVersion::latest());
-            if let Some(region) = &self.region { configuration = configuration.region(aws_config::Region::new(region.clone())); }
-            let configuration = configuration.load().await;
-            if let Some(region) = configuration.region() { builder = builder.with_region(region.as_ref()); }
-            let provider = configuration.credentials_provider().ok_or_else(|| Anomaly::incorrect("xtdb.aws/credentials", "AWS default credential provider is unavailable"))?;
-            builder = builder.with_credentials(Arc::new(credential::CredentialBridge::new(provider)));
-        }
+        builder = match authorization {
+            S3Authorization::Static(credentials) => {
+                if credentials.access_key.is_empty() || credentials.secret_key.is_empty() { return Err(Anomaly::incorrect("xtdb.aws/invalid-config", "S3 credentials require nonempty access and secret keys")); }
+                builder.with_credentials(Arc::new(StaticCredentialProvider::new(AwsCredential { key_id: credentials.access_key, secret_key: credentials.secret_key, token: None })))
+            }
+            S3Authorization::Rotating { provider, region } => {
+                if let Some(region) = region { builder = builder.with_region(region); }
+                builder.with_credentials(Arc::new(credential::CredentialBridge::new(provider)))
+            }
+        };
         let client = builder.build().map_err(|error| Anomaly::incorrect("xtdb.aws/invalid-config", error.to_string()))?;
         let client = Arc::new(client);
         if !cell {
             return Ok(Arc::new(RemoteStore::new_in(client, Some(prefix), io)));
         }
-        if io.publication_journal().is_some() {
-            #[cfg(feature = "versioning")]
-            {
-                let uploads = self.versioned_inventory(storage_root, remotes).await?;
-                return Ok(Arc::new(RemoteStore::new_managed(client, prefix, io, Arc::new(uploads))));
-            }
-            #[cfg(not(feature = "versioning"))]
-            return Err(Anomaly::incorrect("xtdb.aws/managed-uploads", "Managed cell publications require S3 inventory support"));
+        #[cfg(feature = "versioning")]
+        if let Some(uploads) = uploads {
+            return Ok(Arc::new(RemoteStore::new_managed(client, prefix, io, Arc::new(uploads))));
         }
         Ok(Arc::new(RemoteStore::new_single_put(client, prefix, io)))
+    }
+
+    #[cfg(feature = "versioning")]
+    fn authorized_inventory(&self, root: ObjectKey, authorization: &S3Authorization) -> Result<VersionedInventory> {
+        let endpoint = self.configured_endpoint()?;
+        let environment = AmazonS3Builder::from_env();
+        let (provider, provider_region) = match authorization {
+            S3Authorization::Static(credentials) => (SharedCredentialsProvider::new(
+                aws_credential_types::Credentials::new(&credentials.access_key, &credentials.secret_key, None, None, "rtdb-s3"),
+            ), None),
+            S3Authorization::Rotating { provider, region } => (provider.clone(), region.clone()),
+        };
+        let region = self.region.clone().or(provider_region)
+            .or_else(|| environment.get_config_value(&AmazonS3ConfigKey::Region))
+            .unwrap_or_else(|| "us-east-1".into());
+        let requester_pays = environment.get_config_value(&AmazonS3ConfigKey::RequestPayer)
+            .is_some_and(|value| matches!(value.to_ascii_lowercase().as_str(), "1" | "true" | "on" | "yes" | "y"));
+        let mut builder = aws_sdk_s3::config::Builder::new()
+            .behavior_version(aws_config::BehaviorVersion::latest())
+            .region(aws_config::Region::new(region))
+            .credentials_provider(provider)
+            .force_path_style(!self.virtual_hosted(endpoint.as_ref()));
+        let scope_multipart_listing = endpoint.is_none();
+        builder.set_endpoint_url(endpoint.map(|endpoint| endpoint.to_string()));
+        Ok(VersionedInventory::new(aws_sdk_s3::Client::from_conf(builder.build()), self.bucket.clone(), root, requester_pays, scope_multipart_listing))
     }
 
     #[cfg(feature = "versioning")]

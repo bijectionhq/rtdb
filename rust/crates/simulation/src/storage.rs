@@ -498,13 +498,15 @@ impl World {
         for outcome in outcomes { erased += outcome.map_err(|error| format!("the reaper failed in cell {cell}: {error}"))?.erased; }
         self.summary.reaper_passes += 1;
         self.summary.erased += erased;
-        self.summary.cleaned_moves += store::finish_moves(bucket.as_ref(), &records, self.now(), grace, None)
-            .await.map_err(|error| format!("cleaning up moves from cell {cell}: {error}"))?;
-        for record in &records {
-            if record.moved_at_ms.is_some_and(|moved| moved + GRACE_MS <= self.now())
-                && !bucket.list(Some(&object(&record.storage_prefix())?)).await.map_err(|error| error.to_string())?.is_empty()
-            {
-                return Err(format!("cell {cell} still holds {} after its move grace", record.name));
+        let others: Vec<_> = records.iter().filter(|record| record.moved_at_ms.is_none()).cloned().collect();
+        let now = self.now();
+        for record in records.iter().filter(|record| record.moved_at_ms.is_some_and(|moved| moved + GRACE_MS <= now)) {
+            let prefix = object(&record.storage_prefix())?;
+            if !bucket.list(Some(&prefix)).await.map_err(|error| error.to_string())?.is_empty() {
+                if !reference::erase_deployment(bucket.as_ref(), prefix.as_str(), &others).await.map_err(|error| error.to_string())? {
+                    return Err(format!("cell {cell} still holds {} after its move grace", record.name));
+                }
+                self.summary.cleaned_moves += 1;
             }
         }
         self.note(format!("the reaper passes over cell {cell}, erasing {erased}"));

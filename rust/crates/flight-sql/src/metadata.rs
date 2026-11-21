@@ -34,12 +34,17 @@ impl Service {
                 Command::CommandGetTableTypes(command) => { self.connection(&call, &call.database).await?; let mut builder = command.into_builder(); builder.append("TABLE"); builder.build().map_err(arrow)? }
                 Command::CommandGetCatalogs(command) => {
                     self.connection(&call, &call.database).await?;
-                    let databases = self.0.node.catalog().open_database_snapshot(self.memory()).map_err(status)?;
-                    let bytes = databases.rows().iter().try_fold(8192, |bytes, database| wire::add(bytes, wire::add(wire::mul(database.name().len(), 8)?, 512)?))?;
-                    charges.push(self.memory().reserve(bytes).map_err(status)?);
-                    // A placed node's other databases are other tenants': the session sees only its own.
-                    let placed = self.0.node.catalog().is_placed();
-                    let mut builder = command.into_builder(); for database in databases.rows().iter().filter(|database| !placed || database.name() == call.database) { builder.append(database.name()); } builder.build().map_err(arrow)?
+                    let mut builder = command.into_builder();
+                    if let Some(database) = call.session.placed_database() {
+                        charges.push(self.memory().reserve(wire::add(8192, wire::mul(database.len(), 8)?)?).map_err(status)?);
+                        builder.append(database);
+                    } else {
+                        let databases = self.0.node.catalog().open_database_snapshot(self.memory()).map_err(status)?;
+                        let bytes = databases.rows().iter().try_fold(8192, |bytes, database| wire::add(bytes, wire::add(wire::mul(database.name().len(), 8)?, 512)?))?;
+                        charges.push(self.memory().reserve(bytes).map_err(status)?);
+                        for database in databases.rows() { builder.append(database.name()); }
+                    }
+                    builder.build().map_err(arrow)?
                 }
                 command => {
                     let connection = self.connection(&call, &call.database).await?;

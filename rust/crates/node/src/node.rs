@@ -1,6 +1,6 @@
 use rtdb_types::StructFields;
 use std::collections::{BTreeMap, BTreeSet};
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -13,7 +13,7 @@ use rtdb_query::{CatalogSnapshot, DatabaseSnapshot, PreparedQuery, QueryContext,
 use rtdb_storage::cache::CacheBudget;
 use rtdb_tx::{RetainedAnomaly, SubmitOptions, SubmittedTx, TransactionAuthorization, TransactionResult, TxOp, prepare_submission_with_sql_options};
 use rtdb_types::{Anomaly, AnomalyCategory, LogicalType, Result, SourcePosition, TimeBasis, TimeUnit, Timestamp, TransactionKey, TxBasis, TxId, Value};
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{Semaphore, mpsc, oneshot};
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 
@@ -78,8 +78,6 @@ pub struct Node {
     pub(crate) runtime: Arc<crate::runtime::RuntimeProviders>,
     read_fence: Option<Arc<dyn ReadFence>>,
     scan_fragmenter: Option<Arc<dyn rtdb_query::ScanFragmenter>>,
-    /// The idempotency keys of transactions this node submitted and has not yet seen resolved, so an abort by a duplicate key can be answered with the original's outcome.
-    keyed: Arc<parking_lot::Mutex<BTreeMap<TxId, String>>>,
 }
 
 pub struct NodeDriver {
@@ -136,13 +134,15 @@ impl Node {
         let runtime = Arc::new(crate::runtime::RuntimeProviders { users: services.catalog_users, metrics: services.catalog_metrics });
         let read_fence = services.read_fence.clone();
         let scan_fragmenter = services.scan_fragmenter.clone();
+        let compaction_slots = (matches!(options.membership, Membership::Placed) && options.compaction_threads > 0)
+            .then(|| Arc::new(Semaphore::new(options.compaction_threads.min(Semaphore::MAX_PERMITS))));
         services.scan_accelerators.insert(0, Arc::new(crate::ordered_index::OrderedIndexAccelerator));
         let factory = Arc::new(DatabaseFactory { memory, cache: CacheBudget::new(options.cache_bytes),
             resources: services.resources, authorization: services.transaction_authorization, observer: services.collection_observer, execution_observer: services.execution_observer, tracer: services.tracer,
-            external_sources: services.external_sources, compaction_relay: services.compaction_relay, clock: services.clock, artefact_kinds: services.artefact_kinds,
+            external_sources: services.external_sources, compaction_relay: services.compaction_relay, compaction_slots, clock: services.clock, artefact_kinds: services.artefact_kinds,
             accelerators: Arc::from(if options.scan_acceleration { services.scan_accelerators } else { Vec::new() }), options });
         let (commands, receiver) = mpsc::channel(factory.options.command_capacity);
-        let node = Self { catalog, factory, commands, cancellation: CancellationToken::new(), runtime, read_fence, scan_fragmenter, keyed: Arc::default() };
+        let node = Self { catalog, factory, commands, cancellation: CancellationToken::new(), runtime, read_fence, scan_fragmenter };
         let mut initial = Vec::new();
         match node.factory.options.membership.clone() {
             Membership::Durable { primary, skipped } => {
@@ -193,7 +193,7 @@ impl Node {
         self.ensure_open()?;
         // A placed node may stop holding a session's database at any moment; the command is refused before anything runs, so the gateway may resend it to the new holder.
         if matches!(self.factory.options.membership, Membership::Placed) && self.catalog.database(database).is_err() {
-            return Err(Anomaly::new(AnomalyCategory::Unavailable, NOT_HELD, format!("This node no longer holds {database}")).with_context("db-name", database.into()));
+            return Err(lost_placement(database));
         }
         identity.authorize_database(database, access)
     }
@@ -202,8 +202,9 @@ impl Node {
         self.ensure_open()?;
         let database = database.into();
         identity.authorize_database(&database, DatabaseAccess::Read)?;
-        self.catalog.database(&database)?;
-        let service = Arc::new(NativeSessionService { node: self.clone(), identity, database: database.clone() });
+        let local = self.catalog.database(&database)?;
+        let placement = self.catalog.is_placed().then(|| Arc::downgrade(&local));
+        let service = Arc::new(NativeSessionService { node: self.clone(), identity, database: database.clone(), placement });
         let state = Session::new(service.clone(), database, &self.factory.options.default_timezone, &self.cancellation)?;
         Ok(NativeSession { state, service })
     }
@@ -226,12 +227,12 @@ impl Node {
     fn ensure_indexing(&self) -> Result<()> {
         if self.factory.options.replication.enabled { Ok(()) } else { Err(Anomaly::fault("xtdb/log-processor-not-initialised", "log processor not initialised")) }
     }
-    pub(crate) async fn await_durable_source(
-        &self, database: &str, identity: &dyn SessionIdentity, hosted: bool, cancellation: &CancellationToken,
+    async fn await_durable_source(
+        &self, database: &str, identity: &dyn SessionIdentity, hosted: bool, placement: Option<&Weak<Database>>, cancellation: &CancellationToken,
     ) -> Result<Option<String>> {
         self.admit(database, DatabaseAccess::Read, identity, cancellation).await?;
         self.ensure_indexing()?;
-        let database = self.catalog.database(database)?;
+        let database = self.attached_database(database, placement)?;
         let barrier = cancellation.run_until_cancelled(async {
             let history = if hosted {
                 let fence = self.read_fence.as_ref().ok_or_else(hosted_source_unavailable)?;
@@ -291,16 +292,32 @@ impl Node {
         tokio::time::timeout(timeout, work).await.map_err(|_| timeout_error())?
     }
 
+    fn attached_database(&self, database: &str, placement: Option<&Weak<Database>>) -> Result<Arc<Database>> {
+        let current = self.catalog.database(database).map_err(|error| if self.catalog.is_placed() { lost_placement(database) } else { error })?;
+        if placement.is_some_and(|expected| !std::ptr::eq(expected.as_ptr(), Arc::as_ptr(&current))) {
+            return Err(lost_placement(database));
+        }
+        Ok(current)
+    }
+
     pub async fn query_context(&self, database: &str, basis: &QueryBasis, identity: &dyn SessionIdentity, cancellation: &CancellationToken) -> Result<Arc<QueryContext>> {
+        self.query_context_in_placement(database, basis, identity, None, cancellation).await
+    }
+
+    async fn query_context_in_placement(&self, database: &str, basis: &QueryBasis, identity: &dyn SessionIdentity, placement: Option<&Weak<Database>>, cancellation: &CancellationToken) -> Result<Arc<QueryContext>> {
         self.admit(database, DatabaseAccess::Read, identity, cancellation).await?;
+        let placed = self.catalog.is_placed();
+        let held = placed.then(|| self.attached_database(database, placement)).transpose()?;
         if let Some(fence) = &self.read_fence { fence.confirm(database).await?; }
+        if let Some(previous) = &held {
+            let current = self.catalog.database(database).map_err(|_| lost_placement(database))?;
+            if !Arc::ptr_eq(previous, &current) { return Err(lost_placement(database)); }
+        }
+
         let mut snapshots = BTreeMap::new();
-        // A placed node's databases belong to different tenants: a session sees its own database and no other.
-        let isolated = matches!(self.factory.options.membership, Membership::Placed);
-        let database_name = database;
-        for (name, database) in self.catalog.open_databases() {
-            if isolated && name != database_name { continue; }
-            if identity.authorize_database(&name, DatabaseAccess::Read).is_err() { continue; }
+        let classic = if placed { BTreeMap::new() } else { self.catalog.open_databases() };
+        for (name, database) in held.into_iter().map(|held| (database.to_owned(), held)).chain(classic) {
+            if !placed && identity.authorize_database(&name, DatabaseAccess::Read).is_err() { continue; }
             let head = database.partition.value().live().latest_completed_tx().map(|key| key.system_time);
             let snapshot = database.partition.open_snapshot(head);
             let requested = basis.snapshot.databases.get(&name).and_then(|partitions| partitions.first()).copied().flatten();
@@ -337,20 +354,22 @@ impl Node {
         rtdb_query::evaluate_fragment(context, fragment).await
     }
 
-    async fn submit(&self, database: &str, mut operations: Vec<TxOp>, mut options: SubmitOptions, identity: &dyn SessionIdentity, cancellation: &CancellationToken) -> Result<SubmittedTx> {
+    async fn submit(&self, database: &str, mut operations: Vec<TxOp>, mut options: SubmitOptions, identity: &dyn SessionIdentity, placement: Option<&Weak<Database>>, cancellation: &CancellationToken) -> Result<SubmittedTx> {
         self.admit(database, DatabaseAccess::Write, identity, cancellation).await?;
-        let key = idempotency_key(&options);
-        let database = self.catalog.database(database)?;
-        if let Some(key) = &key {
+        let key = options.user_metadata.as_ref().and_then(|metadata| idempotency_key(metadata.value()));
+        let database = self.attached_database(database, placement)?;
+        let admission = if self.catalog.is_placed() {
+            Some(cancellation.run_until_cancelled(database.admit_transaction()).await.ok_or_else(cancelled)??)
+        } else { None };
+        if let Some(key) = key {
             if key == IDEMPOTENCY_SENTINEL { return Err(Anomaly::incorrect("rtdb.node/reserved-idempotency-key", format!("'{IDEMPOTENCY_SENTINEL}' is reserved and cannot be an idempotency key"))); }
             // A transaction carrying a key that already committed within the window aborts on its assertion, and awaiting it answers with the original's outcome.
-            let literal = quoted(key);
             let table = rtdb_types::TableRef::new("public", IDEMPOTENCY_TABLE);
             let put = |id: &str, valid_to: Option<rtdb_types::Timestamp>| -> Result<TxOp> {
                 let documents = rtdb_tx::Documents::new(vec![rtdb_types::StructFields::from([("_id".to_owned(), Value::Utf8(id.to_owned()))])], &self.factory.memory)?;
                 Ok(TxOp::PutDocs { table: table.clone(), documents, valid_from: None, valid_to })
             };
-            let assertion = TxOp::Sql { sql: format!("ASSERT NOT EXISTS (SELECT 1 FROM {IDEMPOTENCY_TABLE} WHERE _id = {literal})"), args: None };
+            let assertion = TxOp::Sql { sql: idempotency_guard(key), args: None };
             let value = database.partition.value();
             if value.table_catalog().metadata(&table).is_some() || value.live().tables().contains_key(&table) {
                 operations.insert(0, assertion);
@@ -369,62 +388,60 @@ impl Node {
         let source = prepare_submission_with_sql_options(operations, options, database.name(), &self.factory.memory, &sql_options)?;
         let payload = source.encode()?.into_bytes();
         let position = cancellation.run_until_cancelled(database.replication.submit_source_encoded(payload, self.now())).await.ok_or_else(cancelled)??;
-        if let Some(key) = key {
-            let mut keyed = self.keyed.lock();
-            keyed.insert(TxId(position.0), key);
-            while keyed.len() > KEYED_RETAINED { keyed.pop_first(); }
+        if let Some(admission) = &admission {
+            let mut latest = admission.lock();
+            *latest = (*latest).max(Some(position));
         }
         Ok(SubmittedTx { tx_id: TxId(position.0) })
     }
 
-    /// The transaction that committed with `key`, if one has.
-    async fn keyed_transaction(&self, database: &str, key: &str, identity: &dyn SessionIdentity, cancellation: &CancellationToken) -> Result<Option<TxId>> {
+    /// The committed outcome visible to the retry when its duplicate guard ran.
+    async fn keyed_transaction(&self, database: &str, key: &str, retry_time: Timestamp, identity: &dyn SessionIdentity, placement: Option<&Weak<Database>>, cancellation: &CancellationToken) -> Result<Option<TransactionKey>> {
         let basis = QueryBasis { snapshot: self.snapshot_basis()?, snapshot_time: None, current_time: self.query_instant(), timezone: self.factory.options.default_timezone.clone() };
-        let basis = &basis;
-        let rows = |sql: String| async move {
-            let context = self.query_context(database, basis, identity, cancellation).await?;
-            let options = rtdb_sql::PrepareOptions { default_timezone: context.timezone.clone(), generate_series_end_exclusive: context.options.generate_series_end_exclusive, ..Default::default() };
-            let mut cursor = match prepare_query(&sql, &context, &options) {
-                Ok(prepared) => prepared.execute(context, Vec::new()).await?,
-                // No keyed transaction has committed yet, so the table does not exist.
-                Err(error) if error.code == "xtdb/table-not-found" || error.code.contains("unknown-table") => return Ok(Vec::new()),
-                Err(error) => return Err(error),
-            };
-            let mut rows = Vec::new();
-            while let Some(batch) = cursor.next_batch().await? {
-                let batch = batch.batch();
-                for row in 0..batch.num_rows() {
-                    rows.push((0..batch.num_columns()).map(|column| read_value(batch.schema().field(column), batch.column(column).as_ref(), row)).collect::<Result<Vec<_>>>()?);
-                }
-            }
-            Ok::<_, Anomaly>(rows)
+        let context = self.query_context_in_placement(database, &basis, identity, placement, cancellation).await?;
+        let time = Value::Timestamp { value: retry_time.0, unit: TimeUnit::Microsecond, timezone: Some("UTC".into()) };
+        let arguments = vec![time.clone(), time, Value::Utf8(key.to_owned())];
+        let options = rtdb_sql::PrepareOptions {
+            parameter_types: arguments.iter().enumerate().map(|(index, value)| (index, value.logical_type())).collect(),
+            default_timezone: context.timezone.clone(),
+            generate_series_end_exclusive: context.options.generate_series_end_exclusive,
+            ..Default::default()
         };
-        // The committed transaction whose system time the key's row was written at; only a retry pays for this.
-        let sql = format!("SELECT _id FROM xt.txs FOR ALL VALID_TIME WHERE committed = true AND system_time = (SELECT k._system_from FROM {IDEMPOTENCY_TABLE} AS k WHERE k._id = {})", quoted(key));
-        match rows(sql).await {
-            Ok(found) => Ok(found.first().and_then(|row| row.first()).and_then(|id| match id { Value::I64(id) => Some(TxId(*id)), _ => None })),
-            Err(error) if error.code == "xtdb/table-not-found" => Ok(None),
-            Err(error) => Err(error),
+        let sql = format!("SELECT _id, system_time FROM xt.txs FOR ALL VALID_TIME WHERE committed = true AND system_time = (SELECT k._system_from FROM {IDEMPOTENCY_TABLE} FOR SYSTEM_TIME AS OF ? FOR VALID_TIME AS OF ? AS k WHERE k._id = ?)");
+        let prepared = match prepare_query(&sql, &context, &options) {
+            Ok(prepared) => prepared,
+            Err(error) if error.code == "xtdb/table-not-found" || error.code.contains("unknown-table") => return Ok(None),
+            Err(error) => return Err(error),
+        };
+        let mut cursor = prepared.execute(context, arguments).await?;
+        while let Some(batch) = cursor.next_batch().await? {
+            let batch = batch.batch();
+            if batch.num_rows() == 0 { continue; }
+            let id = read_value(batch.schema().field(0), batch.column(0).as_ref(), 0)?;
+            let time = read_value(batch.schema().field(1), batch.column(1).as_ref(), 0)?;
+            let (Value::I64(id), Value::Timestamp { value, unit: TimeUnit::Microsecond, .. }) = (id, time) else {
+                return Err(Anomaly::fault("rtdb.node/idempotency-result", "Stored idempotency outcome has no transaction key"));
+            };
+            return Ok(Some(TransactionKey { tx_id: TxId(id), system_time: Timestamp(value) }));
         }
+        Ok(None)
     }
     pub async fn await_transaction(&self, database: &str, tx_id: TxId, identity: &dyn SessionIdentity, cancellation: &CancellationToken) -> Result<TransactionResult> {
+        self.await_transaction_in_placement(database, tx_id, identity, None, cancellation).await
+    }
+
+    async fn await_transaction_in_placement(&self, database: &str, tx_id: TxId, identity: &dyn SessionIdentity, placement: Option<&Weak<Database>>, cancellation: &CancellationToken) -> Result<TransactionResult> {
         self.admit(database, DatabaseAccess::Read, identity, cancellation).await?;
         self.ensure_indexing()?;
-        let db = self.catalog.database(database)?;
-        if let Some(result) = db.replication.await_tx(tx_id, cancellation).await? {
-            let key = self.keyed.lock().remove(&tx_id);
-            // Aborted because another transaction with its key committed first: its outcome is the original's.
-            if let (TransactionResult::Aborted { .. }, Some(key)) = (result.as_ref(), key) {
-                if let Some(original) = self.keyed_transaction(database, &key, identity, cancellation).await?.filter(|original| *original != tx_id) {
-                    return Box::pin(self.await_transaction(database, original, identity, cancellation)).await;
-                }
-            }
+        let db = self.attached_database(database, placement)?;
+        let latest = db.replication.await_tx(tx_id, cancellation).await?;
+        if let Some(result) = &latest && !result.error().is_some_and(|error| error.code == "xtdb/assert-failed") {
             return Ok(result.as_ref().clone());
         }
         let basis = QueryBasis { snapshot: self.snapshot_basis()?, snapshot_time: None, current_time: self.query_instant(), timezone: self.factory.options.default_timezone.clone() };
-        let context = self.query_context(database, &basis, identity, cancellation).await?;
+        let context = self.query_context_in_placement(database, &basis, identity, placement, cancellation).await?;
         let options = rtdb_sql::PrepareOptions { parameter_types: BTreeMap::from([(0, LogicalType::Scalar(rtdb_types::ScalarType::I64))]), default_timezone: context.timezone.clone(), generate_series_end_exclusive: context.options.generate_series_end_exclusive, ..Default::default() };
-        let mut cursor = prepare_query("SELECT system_time, committed, error FROM xt.txs FOR ALL VALID_TIME WHERE _id = ?", &context, &options)?
+        let mut cursor = prepare_query("SELECT system_time, committed, error, user_metadata FROM xt.txs FOR ALL VALID_TIME WHERE _id = ?", &context, &options)?
             .execute(context, vec![Value::I64(tx_id.0)]).await?;
         let batch = cursor.next_batch().await?.ok_or_else(|| Anomaly::fault("xtdb/tx-await-missing", format!("tx {tx_id} not found after await")))?;
         let schema = batch.batch().schema();
@@ -437,7 +454,24 @@ impl Node {
         match cell("committed")? {
             Value::Bool(true) => Ok(TransactionResult::Committed { tx_key }),
             Value::Bool(false) => {
-                let error = match cell("error")? { Value::Null | Value::Undefined => None, Value::Transit(bytes) => Some(RetainedAnomaly::from_transit(&bytes, &self.factory.memory)?), _ => return Err(Anomaly::fault("rtdb.node/tx-result-error", "Stored transaction error is not Transit")) };
+                let error = if let Some(TransactionResult::Aborted { error, .. }) = latest.as_deref() {
+                    error.clone()
+                } else {
+                    match cell("error")? {
+                        Value::Null | Value::Undefined => None,
+                        Value::Transit(bytes) => Some(RetainedAnomaly::from_transit(&bytes, &self.factory.memory)?),
+                        _ => return Err(Anomaly::fault("rtdb.node/tx-result-error", "Stored transaction error is not Transit")),
+                    }
+                };
+                if let Some(error) = &error
+                    && error.code == "xtdb/assert-failed"
+                    && error.context.get("tx-op-idx").and_then(|value| value.as_u64()).is_some_and(|index| index <= 1)
+                    && let Some(key) = idempotency_key(&cell("user_metadata")?)
+                    && error.context.get("sql").and_then(|value| value.as_str()).is_some_and(|sql| sql == idempotency_guard(key))
+                    && let Some(original) = self.keyed_transaction(database, key, system_time, identity, placement, cancellation).await?
+                {
+                    return Ok(TransactionResult::Committed { tx_key: original });
+                }
                 Ok(TransactionResult::Aborted { tx_key, error })
             }
             _ => Err(Anomaly::fault("rtdb.node/tx-result-status", "Stored transaction result has no commit status")),
@@ -592,7 +626,7 @@ impl NativeSession {
     pub fn state_mut(&mut self) -> &mut Session { &mut self.state }
     pub async fn query_context(&mut self) -> Result<Arc<QueryContext>> {
         let basis = self.state.read_basis().await?;
-        Ok(self.service.node.query_context(self.state.database(), &basis, self.service.identity.as_ref(), self.state.cancellation()).await?.with_observer(self.service.execution_observer()).with_tracer(self.service.node.tracer(), None))
+        Ok(self.service.query_context(self.state.database(), &basis, self.state.cancellation()).await?.with_observer(self.service.execution_observer()).with_tracer(self.service.node.tracer(), None))
     }
     pub async fn query_sql(&mut self, sql: &str, arguments: Vec<Value>) -> Result<QueryCursor> {
         let context = self.query_context().await?;
@@ -635,38 +669,82 @@ impl NativeSession {
     }
 }
 
-pub(crate) struct NativeSessionService { pub(crate) node: Node, pub(crate) identity: Arc<dyn SessionIdentity>, pub(crate) database: String }
+pub(crate) struct NativeSessionService {
+    pub(crate) node: Node,
+    pub(crate) identity: Arc<dyn SessionIdentity>,
+    pub(crate) database: String,
+    placement: Option<Weak<Database>>,
+}
+
+impl NativeSessionService {
+    fn database(&self) -> Result<Arc<Database>> {
+        self.node.attached_database(&self.database, self.placement.as_ref())
+    }
+
+    pub(crate) async fn query_context(&self, database: &str, basis: &QueryBasis, cancellation: &CancellationToken) -> Result<Arc<QueryContext>> {
+        self.node.query_context_in_placement(database, basis, self.identity.as_ref(), self.placement.as_ref(), cancellation).await
+    }
+
+    pub(crate) async fn await_durable_source(&self, database: &str, hosted: bool, cancellation: &CancellationToken) -> Result<Option<String>> {
+        self.node.await_durable_source(database, self.identity.as_ref(), hosted, self.placement.as_ref(), cancellation).await
+    }
+
+    pub(crate) fn visible_databases(&self) -> Result<BTreeMap<String, Arc<Database>>> {
+        let catalog = self.node.catalog();
+        if catalog.is_placed() {
+            let database = self.database()?;
+            Ok(BTreeMap::from([(self.database.clone(), database)]))
+        } else {
+            Ok(catalog.open_databases())
+        }
+    }
+}
 #[async_trait]
 impl SessionService for NativeSessionService {
     fn memory(&self) -> &Arc<MemoryBudget> { self.node.memory() }
     fn execution_observer(&self) -> Option<Arc<dyn rtdb_plan::ExecutionObserver>> { self.node.factory.execution_observer.clone() }
     fn user(&self) -> Option<&str> { self.identity.user() }
-    fn check_open(&self) -> Result<()> { self.node.ensure_open() }
-    async fn revalidate(&self) -> Result<()> { self.node.ensure_open()?; self.identity.revalidate(self.node.now()).await }
+    fn check_open(&self) -> Result<()> {
+        self.node.ensure_open()?;
+        if self.placement.is_some() { self.database()?; }
+        Ok(())
+    }
+    async fn revalidate(&self) -> Result<()> { self.check_open()?; self.identity.revalidate(self.node.now()).await }
     fn now(&self) -> Timestamp { self.node.now() }
     fn query_instant(&self) -> rtdb_types::Instant { self.node.query_instant() }
     fn snapshot_basis(&self) -> Result<TimeBasis> {
-        let mut basis = self.node.snapshot_basis()?;
-        // On a placed node the other databases are other tenants': a session's basis names only its own.
-        if self.node.catalog.is_placed() { basis.databases.retain(|name, _| *name == self.database); }
-        Ok(basis)
+        if !self.node.catalog.is_placed() { return self.node.snapshot_basis(); }
+        self.node.ensure_open()?;
+        let database = self.database()?;
+        let time = database.partition.value().live().latest_completed_tx().map(|key| key.system_time.into());
+        Ok(TimeBasis { databases: BTreeMap::from([(self.database.clone(), vec![time])]) })
     }
-    async fn await_basis(&self, basis: Option<TxBasis>, timeout: Duration, cancellation: &CancellationToken) -> Result<()> { self.node.await_basis(basis, timeout, cancellation).await }
-    async fn submit(&self, database: &str, operations: Vec<TxOp>, options: SubmitOptions, cancellation: &CancellationToken) -> Result<SubmittedTx> { self.node.submit(database, operations, options, self.identity.as_ref(), cancellation).await }
-    async fn await_transaction(&self, database: &str, tx_id: TxId, cancellation: &CancellationToken) -> Result<TransactionResult> { self.node.await_transaction(database, tx_id, self.identity.as_ref(), cancellation).await }
+    async fn await_basis(&self, basis: Option<TxBasis>, timeout: Duration, cancellation: &CancellationToken) -> Result<()> {
+        if !self.node.catalog.is_placed() { return self.node.await_basis(basis, timeout, cancellation).await; }
+        self.node.ensure_open()?;
+        let Some(position) = basis.as_ref().and_then(|basis| basis.databases.get(&self.database)).and_then(|positions| positions.first()) else {
+            return Ok(());
+        };
+        self.node.ensure_indexing()?;
+        let database = self.database()?;
+        tokio::time::timeout(timeout, database.replication.await_source(SourcePosition(position.0), cancellation)).await.map_err(|_| timeout_error())??;
+        Ok(())
+    }
+    async fn submit(&self, database: &str, operations: Vec<TxOp>, options: SubmitOptions, cancellation: &CancellationToken) -> Result<SubmittedTx> { self.node.submit(database, operations, options, self.identity.as_ref(), self.placement.as_ref(), cancellation).await }
+    async fn await_transaction(&self, database: &str, tx_id: TxId, cancellation: &CancellationToken) -> Result<TransactionResult> { self.node.await_transaction_in_placement(database, tx_id, self.identity.as_ref(), self.placement.as_ref(), cancellation).await }
 }
 
 /// Where a transaction's idempotency key is recorded, keyed by the key, so a retry finds it with one point lookup.
 pub const IDEMPOTENCY_TABLE: &str = "rtdb_idempotency_keys";
-const KEYED_RETAINED: usize = 16_384;
 const IDEMPOTENCY_SENTINEL: &str = "~table";
 /// How long a committed transaction's key keeps a retry from running it again (`idempotency_window`).
 const IDEMPOTENCY_WINDOW: std::time::Duration = std::time::Duration::from_secs(3600);
 
 /// The `idempotency_key` a transaction's metadata carries, set with `BEGIN READ WRITE WITH (METADATA = {idempotency_key: '...'})`.
-fn idempotency_key(options: &SubmitOptions) -> Option<String> {
-    let Value::Struct(fields) = options.user_metadata.as_ref()?.value() else { return None };
-    fields.iter().find(|(name, _)| name.as_str() == "idempotency_key").and_then(|(_, value)| match value { Value::Utf8(key) => Some(key.clone()), _ => None })
+fn idempotency_key(metadata: &Value) -> Option<&str> {
+    let Value::Struct(fields) = metadata else { return None };
+    let Value::Utf8(key) = fields.get("idempotency_key")? else { return None };
+    Some(key)
 }
 
 /// The session parameter a gateway sets at the start of each command: the command's transactions are keyed by it and their order within the command.
@@ -683,10 +761,17 @@ pub(crate) fn with_idempotency_key(metadata: Option<rtdb_tx::UserMetadata>, key:
     rtdb_tx::UserMetadata::new(Value::Struct(fields), memory)
 }
 
-fn quoted(text: &str) -> String { format!("'{}'", text.replace('\'', "''")) }
+fn idempotency_guard(key: &str) -> String {
+    let literal = key.replace('\'', "''");
+    format!("ASSERT NOT EXISTS (SELECT 1 FROM {IDEMPOTENCY_TABLE} WHERE _id = '{literal}')")
+}
 
 /// The code a placed node refuses a command with when it no longer holds the command's database.
 pub const NOT_HELD: &str = "rtdb.node/database-not-held";
+
+fn lost_placement(database: &str) -> Anomaly {
+    Anomaly::new(AnomalyCategory::Unavailable, NOT_HELD, format!("This node no longer holds {database}")).with_context("db-name", database.into())
+}
 
 fn closed() -> Anomaly { Anomaly::new(AnomalyCategory::Interrupted, "xtdb/node-closed", "Node is closed") }
 fn cancelled() -> Anomaly { Anomaly::new(AnomalyCategory::Interrupted, "xtdb/operation-cancelled", "Operation was cancelled") }

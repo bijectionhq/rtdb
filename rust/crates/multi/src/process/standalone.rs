@@ -167,11 +167,13 @@ pub async fn serve_standalone(
     let lease = MemberLease::reclaim_logkeeper(
         Arc::clone(&directory),
         Registration {
+            engine_version: super::ENGINE_VERSION.to_owned(),
             role: MemberRole::Logkeeper,
             address: journal_address,
             control_address: None,
             availability_zone: "local".into(),
             pool: MemberPool::General,
+            storage_namespaces: None,
         },
         authority.journal,
         true,
@@ -189,6 +191,7 @@ pub async fn serve_standalone(
         let mut node = start_node(
             Arc::clone(&directory),
             NodeSettings {
+                engine_version: None,
                 configuration,
                 allocation_limit_bytes: 1 << 30,
                 control: LOOPBACK,

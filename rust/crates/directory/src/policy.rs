@@ -4,26 +4,29 @@
 
 use std::collections::BTreeMap;
 
-use crate::{DeploymentRecord, Lifecycle, MemberId, MemberPool, MemberRecord};
+use crate::{DeploymentRecord, MemberId, MemberRecord};
 
 /// The holder that counts: the recorded holder, only while its member may hold.
 pub fn effective_holder<'a>(record: &'a DeploymentRecord, members: &BTreeMap<MemberId, MemberRecord>, now_ms: i64) -> Option<&'a MemberId> {
-    record.holder.as_ref().filter(|holder| members.get(*holder).is_some_and(|member| member.may_hold(now_ms)))
+    record.holder.as_ref().filter(|holder| members.get(*holder)
+        .is_some_and(|member| record.may_hold_on(member, now_ms)))
 }
 
 /// The record that makes `claimant` the holder under the next epoch, or `None` if the deployment may not be claimed by it now.
 /// A live holder other than the claimant blocks the claim; the claimant's own stale holding does not, so a restarted member's successor process can reclaim.
 pub fn claim(record: &DeploymentRecord, claimant: &MemberId, members: &BTreeMap<MemberId, MemberRecord>, now_ms: i64) -> Option<DeploymentRecord> {
-    let member = members.get(claimant).filter(|member| member.may_receive_placements(now_ms))?;
-    let pool = match record.lifecycle { Lifecycle::Live => MemberPool::General, Lifecycle::Quarantined => MemberPool::Isolation, _ => return None };
-    if member.pool != pool { return None; }
-    // A move reserves the claim for its target only while the target can still take it; a move to a member that has since died binds nobody.
-    if record.move_intent.as_ref().is_some_and(|target| target != claimant && members.get(target).is_some_and(|target| target.may_receive_placements(now_ms))) { return None; }
+    members.get(claimant).filter(|member| record.may_place_on(member, now_ms))?;
+    // A move reserves the claim only while its target is eligible to take this deployment.
+    if record.active_move(now_ms).is_some_and(|intent| &intent.target != claimant
+        && members.get(&intent.target).is_some_and(|target| record.may_place_on(target, now_ms))) {
+        return None;
+    }
     if effective_holder(record, members, now_ms).is_some_and(|holder| holder != claimant) { return None; }
     let mut next = record.clone();
     next.epoch += 1;
     next.holder = Some(claimant.clone());
     next.move_intent = None;
+    next.placement_move = None;
     Some(next)
 }
 
@@ -39,11 +42,11 @@ pub fn park(record: &DeploymentRecord, holder: &MemberId, epoch: u64) -> Option<
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{MemberRole, MemberState};
+    use crate::{Lifecycle, MemberPool, MemberRole, MemberState, PlacementMove};
 
     fn node(id: &str, state: MemberState, lease: i64) -> MemberRecord {
         MemberRecord { id: MemberId(id.into()), role: MemberRole::Node, address: String::new(), control_address: None, availability_zone: "a".into(),
-            engine_version: "0".into(), lease_expires_at_ms: lease, state, pool: MemberPool::General, version: 1 }
+            engine_version: "0".into(), lease_expires_at_ms: lease, state, drain_target_engine: None, pool: MemberPool::General, storage_namespaces: None, version: 1 }
     }
 
     fn members(list: &[MemberRecord]) -> BTreeMap<MemberId, MemberRecord> { list.iter().map(|member| (member.id.clone(), member.clone())).collect() }
@@ -73,11 +76,19 @@ mod tests {
         assert!(claim(&record, &MemberId("a".into()), &members, 10).is_none());
         assert!(claim(&record, &MemberId("i".into()), &members, 10).is_some());
         record.lifecycle = Lifecycle::Live;
-        record.move_intent = Some(MemberId("b".into()));
+        let intent = |target: &str| PlacementMove { request: uuid::Uuid::nil(), target: MemberId(target.into()), expires_at_ms: 20 };
+        record.placement_move = Some(intent("b"));
         assert!(claim(&record, &MemberId("a".into()), &members, 10).is_none(), "a move reserves the next claim for its target");
-        assert_eq!(claim(&record, &MemberId("b".into()), &members, 10).unwrap().move_intent, None, "claiming completes the move");
-        record.move_intent = Some(MemberId("gone".into()));
+        assert_eq!(claim(&record, &MemberId("b".into()), &members, 10).unwrap().placement_move, None, "claiming completes the move");
+        record.placement_move = Some(intent("gone"));
         assert!(claim(&record, &MemberId("a".into()), &members, 10).is_some(), "a move to a member that is gone binds nobody");
+        record.placement_move = Some(intent("i"));
+        assert!(claim(&record, &MemberId("a".into()), &members, 10).is_some());
+        record.placement_move = Some(intent("b"));
+        assert!(claim(&record, &MemberId("a".into()), &members, 20).is_some());
+        record.placement_move = None;
+        record.move_intent = Some(serde_json::from_str(r#""b""#).unwrap());
+        assert!(claim(&record, &MemberId("a".into()), &members, 10).is_some());
     }
 
     #[test]

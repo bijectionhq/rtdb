@@ -1,13 +1,40 @@
 //! What a node opens for a deployment: the `DatabaseConfig` derived from its directory record.
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 
-use rtdb_directory::DeploymentRecord;
+use futures::StreamExt;
+use futures::future::BoxFuture;
+use futures::stream::FuturesUnordered;
+use rtdb_directory::{DeploymentRecord, Directory, MemberId, MemberRecord, MemberRole};
 use rtdb_format::database::proto::{DatabaseConfig, RemoteStorage, database_config};
+use rtdb_storage::{Error as StoreError, ObjectKey, ObjectStore};
+use rtdb_types::{Anomaly, Result};
 use serde::{Deserialize, Serialize};
 
 /// The protobuf type name the logkeeper log factory is registered under.
 pub const LOGKEEPER_LOG_TYPE: &str = "rtdb.multi.LogkeeperLog";
+
+pub(crate) async fn live_holdings(directory: &dyn Directory, members: &BTreeMap<MemberId, MemberRecord>, now_ms: i64) -> Result<Vec<DeploymentRecord>> {
+    const CONCURRENT_HOLDER_QUERIES: usize = 8;
+    let eligible: Vec<_> = members.values().filter(|member| member.may_hold(now_ms) && member.pool != rtdb_directory::MemberPool::Compaction)
+        .map(|member| member.id.clone()).collect();
+    let mut eligible = eligible.into_iter();
+    let mut queries = FuturesUnordered::<BoxFuture<'_, Result<Vec<DeploymentRecord>>>>::new();
+    let mut deployments = BTreeMap::<String, DeploymentRecord>::new();
+    loop {
+        for member in eligible.by_ref().take(CONCURRENT_HOLDER_QUERIES - queries.len()) {
+            queries.push(Box::pin(async move { directory.deployments_held_by(&member).await }));
+        }
+        let Some(found) = queries.next().await else { break };
+        for record in found? {
+            if deployments.get(&record.id).is_none_or(|stored| stored.version < record.version) {
+                deployments.insert(record.id.clone(), record);
+            }
+        }
+    }
+    Ok(deployments.into_values().collect())
+}
 
 /// Where a cell keeps its deployments' objects.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -21,6 +48,12 @@ pub enum CellStorage {
 
 /// The key under an S3 configuration's prefix that a cell's objects are kept below.
 pub(crate) const S3_CELL_ROOT: &str = "cell";
+const STORAGE_NAMESPACE_MARKER: &str = "~cell-namespace";
+
+pub(crate) fn s3_write_lease_horizon(at_ms: i64) -> i64 {
+    let interval = rtdb_s3::SCOPED_S3_WRITE_TTL + rtdb_s3::SCOPED_S3_CLOCK_ALLOWANCE;
+    at_ms.saturating_add(interval.as_millis() as i64)
+}
 
 impl CellStorage {
     fn local_root(root: &std::path::Path) -> rtdb_types::Result<PathBuf> {
@@ -29,13 +62,8 @@ impl CellStorage {
             .map_err(|error| rtdb_types::Anomaly::fault("rtdb.multi/storage-root", error.to_string()))
     }
 
-    pub(crate) fn s3_root(config: &rtdb_s3::S3Config) -> rtdb_storage::Result<rtdb_storage::ObjectKey> {
-        let prefix = config.prefix.as_deref().unwrap_or_default().trim_matches('/');
-        rtdb_storage::ObjectKey::new(if prefix.is_empty() {
-            S3_CELL_ROOT.to_owned()
-        } else {
-            format!("{prefix}/{S3_CELL_ROOT}")
-        })
+    pub(crate) fn s3_root(config: &rtdb_s3::S3Config) -> Result<ObjectKey> {
+        config.object_prefix(&ObjectKey::new(S3_CELL_ROOT)?)
     }
 
     pub(crate) fn overlaps(&self, other: &Self) -> rtdb_types::Result<bool> {
@@ -68,6 +96,21 @@ impl CellStorage {
         Ok(digest.as_ref().try_into().expect("SHA-256 has 32 bytes"))
     }
 
+    /// Serializes administrative object mutations on a shared local volume.
+    pub(crate) fn try_local_maintenance(&self) -> Result<Option<std::fs::File>> {
+        let Self::Local { root } = self else { return Ok(None); };
+        let path = Self::local_root(root)?.join("~cell-maintenance-lock");
+        let unavailable = |error: std::io::Error| Anomaly::new(
+            rtdb_types::AnomalyCategory::Unavailable, "rtdb.multi/storage-maintenance", format!("{}: {error}", path.display()));
+        let lock = std::fs::OpenOptions::new().write(true).create(true).truncate(false).open(&path).map_err(&unavailable)?;
+        match lock.try_lock() {
+            Ok(()) => Ok(Some(lock)),
+            Err(std::fs::TryLockError::WouldBlock) => Err(Anomaly::new(rtdb_types::AnomalyCategory::Busy,
+                "rtdb.multi/storage-maintenance-busy", "A cell operation is changing the local object inventory")),
+            Err(std::fs::TryLockError::Error(error)) => Err(unavailable(error)),
+        }
+    }
+
     /// The cell's objects as one store, keyed relative to the cell's storage root.
     pub async fn bucket(&self, io: std::sync::Arc<rtdb_storage::IoRegion>) -> rtdb_types::Result<crate::reference::Bucket> {
         match self {
@@ -81,7 +124,6 @@ impl CellStorage {
         io: std::sync::Arc<rtdb_storage::IoRegion>,
     ) -> rtdb_types::Result<std::sync::Arc<rtdb_storage::remote::RemoteStore>> {
         let root = rtdb_storage::ObjectKey::new(S3_CELL_ROOT)?;
-        let config = Self::rooted_s3_config(config)?;
         config.open_cell(&root, &std::collections::BTreeMap::<String, rtdb_s3::S3Credentials>::new(), io).await
     }
 
@@ -89,17 +131,8 @@ impl CellStorage {
         config: &rtdb_s3::S3Config,
     ) -> rtdb_types::Result<rtdb_s3::VersionedInventory> {
         let root = rtdb_storage::ObjectKey::new(S3_CELL_ROOT)?;
-        let config = Self::rooted_s3_config(config)?;
         let remotes = std::collections::BTreeMap::<String, rtdb_s3::S3Credentials>::new();
         config.versioned_inventory(&root, &remotes).await
-    }
-
-    // S3Config treats a provided prefix as the full root. CellStorage owns the
-    // additional cell segment, shared by object access, disposal and custody.
-    fn rooted_s3_config(config: &rtdb_s3::S3Config) -> rtdb_storage::Result<rtdb_s3::S3Config> {
-        let mut rooted = config.clone();
-        rooted.prefix = Some(Self::s3_root(config)?.to_string());
-        Ok(rooted)
     }
 
     pub(crate) async fn purge_serving_inventory(
@@ -112,6 +145,37 @@ impl CellStorage {
                 Self::s3_inventory(config).await?.purge(deployment).await?;
                 Ok(rtdb_directory::ServingInventory::S3VersionsAndUploads)
             }
+        }
+    }
+
+    pub(crate) async fn purge_inventory(&self, deployment: &ObjectKey) -> Result<rtdb_directory::DeletionInventory> {
+        match self {
+            Self::Local { .. } => Ok(rtdb_directory::DeletionInventory::CurrentObjects),
+            Self::S3 { config } => {
+                Self::s3_inventory(config).await?.purge(deployment).await?;
+                Ok(rtdb_directory::DeletionInventory::AllVersionsAndMultipartUploads)
+            }
+        }
+    }
+
+    pub(crate) fn cleanup_contains(&self, other: &Self, deployment: &ObjectKey) -> Result<bool> {
+        match (self, other) {
+            (Self::Local { root }, Self::Local { root: other_root }) => {
+                let canonical = |path: &std::path::Path| {
+                    std::fs::canonicalize(path).map_err(|error| {
+                        Anomaly::new(rtdb_types::AnomalyCategory::Unavailable, "rtdb.multi/storage-namespace", format!("{}: {error}", path.display()))
+                    })
+                };
+                Ok(canonical(other_root)?.starts_with(canonical(root)?.join(deployment.as_str())))
+            }
+            (Self::S3 { config }, Self::S3 { config: other_config }) if config.bucket == other_config.bucket => {
+                let cell = ObjectKey::new(S3_CELL_ROOT)?;
+                let root = config.object_prefix(&cell)?;
+                let other_root = other_config.object_prefix(&cell)?;
+                let Some(relative) = other_root.as_str().strip_prefix(&format!("{root}/")) else { return Ok(false) };
+                Ok(ObjectKey::new(relative)?.is_under(deployment))
+            }
+            _ => Ok(false),
         }
     }
 
@@ -131,6 +195,42 @@ impl CellStorage {
             }
         }
         Ok(CellStorage::S3 { config })
+    }
+}
+
+pub(crate) async fn storage_namespace(bucket: &dyn ObjectStore) -> Result<uuid::Uuid> {
+    if let Some(id) = existing_storage_namespace(bucket).await? { return Ok(id); }
+    let marker = ObjectKey::new(STORAGE_NAMESPACE_MARKER)?;
+    let id = uuid::Uuid::new_v4();
+    let bytes = match bucket.put(&marker, bytes::Bytes::copy_from_slice(id.as_bytes())).await {
+        Ok(()) => return Ok(id),
+        Err(StoreError::ConflictingObject(_)) => bucket.get(&marker).await?,
+        Err(error) => return Err(error.into()),
+    };
+    namespace_id(&bytes)
+}
+
+pub(crate) async fn existing_storage_namespace(bucket: &dyn ObjectStore) -> Result<Option<uuid::Uuid>> {
+    match bucket.get(&ObjectKey::new(STORAGE_NAMESPACE_MARKER)?).await {
+        Ok(bytes) => namespace_id(&bytes).map(Some),
+        Err(StoreError::MissingObject(_)) => Ok(None),
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn namespace_id(bytes: &[u8]) -> Result<uuid::Uuid> {
+    uuid::Uuid::from_slice(bytes).map_err(|_| Anomaly::fault("rtdb.multi/storage-namespace", "The cell storage has an invalid namespace marker"))
+}
+
+pub(crate) async fn storage_namespaces(bucket: &dyn ObjectStore, keys: &dyn crate::keys::KeyService) -> Result<rtdb_directory::StorageNamespaces> {
+    Ok(rtdb_directory::StorageNamespaces { objects: storage_namespace(bucket).await?, keys: keys.namespace_id().await? })
+}
+
+pub(crate) fn require_storage_namespaces(record: &DeploymentRecord, namespaces: rtdb_directory::StorageNamespaces) -> Result<()> {
+    match record.storage_namespaces {
+        Some(stored) if stored == namespaces => Ok(()),
+        Some(_) => Err(rtdb_types::Anomaly::incorrect("rtdb.multi/storage-binding-mismatch", format!("{} belongs to a different object or key namespace", record.name))),
+        None => Err(rtdb_types::Anomaly::incorrect("rtdb.multi/storage-binding-missing", format!("{} has no storage binding", record.name))),
     }
 }
 
@@ -173,6 +273,32 @@ pub struct LogkeeperLogConfig {
 }
 
 pub fn write_quorum(ensemble: usize) -> usize { ensemble / 2 + 1 }
+
+pub(crate) fn select_logkeepers<'a>(key: &str, width: usize, mut selected: Vec<&'a MemberRecord>, candidates: &[&'a MemberRecord]) -> Vec<&'a MemberRecord> {
+    let mut addresses: BTreeSet<_> = selected.iter().map(|member| member.address.as_str()).collect();
+    let mut zones: BTreeSet<_> = selected.iter().map(|member| member.availability_zone.as_str()).collect();
+    let mut same_zone = Vec::new();
+    for member in rtdb_affinity::rank(key, candidates, |member| member.id.as_str()).into_iter().copied() {
+        if selected.len() == width { return selected; }
+        if addresses.contains(member.address.as_str()) { continue; }
+        if zones.insert(member.availability_zone.as_str()) {
+            addresses.insert(member.address.as_str());
+            selected.push(member);
+        } else {
+            same_zone.push(member);
+        }
+    }
+    let unfilled = width.saturating_sub(selected.len());
+    selected.extend(same_zone.into_iter().filter(|member| addresses.insert(member.address.as_str())).take(unfilled));
+    selected
+}
+
+pub(crate) fn ensemble_servers(record: &DeploymentRecord, members: &BTreeMap<MemberId, MemberRecord>) -> Result<Vec<String>> {
+    record.ensemble.iter().map(|id| {
+        members.get(id).filter(|member| member.role == MemberRole::Logkeeper).map(|member| member.address.clone())
+            .ok_or_else(|| Anomaly::fault("rtdb.multi/unknown-logkeeper", format!("Logkeeper {id} is not a member")))
+    }).collect()
+}
 
 /// The configuration a node opens `record` with, given its ensemble's addresses.
 pub fn database_config(record: &DeploymentRecord, servers: Vec<String>, storage: &CellStorage, role: Role) -> DatabaseConfig {
@@ -217,6 +343,82 @@ pub fn moving_config(record: &DeploymentRecord, servers: Vec<String>, moving: Op
 mod tests {
     use super::*;
 
+    #[tokio::test]
+    async fn placement_reads_live_holdings_and_follows_holder_changes() {
+        use rtdb_directory::{MemberPool, MemberState, MemoryDirectory};
+        let directory = MemoryDirectory::new();
+        let member = |id: &str, expires, pool| MemberRecord {
+            id: MemberId(id.into()), role: MemberRole::Node, address: String::new(), control_address: None,
+            availability_zone: "test".into(), engine_version: "test".into(), lease_expires_at_ms: expires,
+            state: MemberState::Eligible, drain_target_engine: None, pool, storage_namespaces: None, version: 1,
+        };
+        let members: BTreeMap<_, _> = [
+            member("node", 20, MemberPool::General),
+            member("isolated", 20, MemberPool::Isolation),
+            member("expired", 5, MemberPool::General),
+            member("worker", 20, MemberPool::Compaction),
+        ].into_iter().map(|member| (member.id.clone(), member)).collect();
+        let mut active = DeploymentRecord::new("active", "acme", vec![], 0);
+        active.holder = Some(MemberId("node".into()));
+        let active = directory.create_deployment(active).await.unwrap();
+        for holder in [None, Some("expired"), Some("worker")] {
+            let mut record = DeploymentRecord::new(holder.unwrap_or("parked"), "acme", vec![], 0);
+            record.holder = holder.map(|id| MemberId(id.into()));
+            directory.create_deployment(record).await.unwrap();
+        }
+        assert_eq!(live_holdings(directory.as_ref(), &members, 10).await.unwrap(), [active.clone()]);
+        let mut moved = active.clone();
+        moved.holder = Some(MemberId("isolated".into()));
+        moved.epoch += 1;
+        moved.lifecycle = rtdb_directory::Lifecycle::Quarantined;
+        let moved = directory.replace_deployment(moved, active.version).await.unwrap().applied().unwrap();
+        assert!(directory.deployments_held_by(&MemberId("node".into())).await.unwrap().is_empty());
+        assert_eq!(live_holdings(directory.as_ref(), &members, 10).await.unwrap(), [moved]);
+    }
+
+    #[test]
+    fn the_s3_custody_fingerprint_is_stable_and_independent_of_credentials() {
+        let mut config = rtdb_s3::S3Config::new("rtdb-fixture");
+        config.prefix = Some("cell-prefix".into());
+        config.endpoint = Some("https://s3.example.test".into());
+        let initial = CellStorage::S3 { config: config.clone() }.custody_namespace().unwrap();
+        let encoded: String = initial.iter().map(|byte| format!("{byte:02x}")).collect();
+        assert_eq!(encoded, "ad7ca5b2df452a10a1e838fb3041ef12f1fb8dd08107ee80a195e363961676d9");
+
+        config.credentials = Some(rtdb_s3::S3Credentials { access_key: "fixture".into(), secret_key: "fixture".into() });
+        assert_eq!(CellStorage::S3 { config: config.clone() }.custody_namespace().unwrap(), initial);
+
+        config.prefix = Some("another-cell".into());
+        assert_ne!(CellStorage::S3 { config }.custody_namespace().unwrap(), initial);
+    }
+
+    #[test]
+    fn an_ensemble_prefers_distinct_zones_and_keeps_its_existing_live_members() {
+        let member = |id: &str, address: &str, zone: &str| MemberRecord {
+            id: MemberId(id.into()), role: MemberRole::Logkeeper, address: address.into(), control_address: None,
+            availability_zone: zone.into(), engine_version: "test".into(), lease_expires_at_ms: 100,
+            state: rtdb_directory::MemberState::Eligible, drain_target_engine: None, pool: Default::default(), storage_namespaces: None, version: 1,
+        };
+        let (a, alternative, b, c, reused) = (member("a", "a", "one"), member("a2", "a2", "one"),
+            member("b", "b", "two"), member("c", "c", "three"), member("reused", "a", "one"));
+        let candidates = [&a, &alternative, &b, &c, &reused];
+        for index in 0..50 {
+            let key = format!("deployment-{index}");
+            let selected = select_logkeepers(&key, 3, Vec::new(), &candidates);
+            assert_eq!(selected.iter().map(|member| &member.availability_zone).collect::<BTreeSet<_>>().len(), 3);
+            let replacement = select_logkeepers(&key, 3, vec![&a, &b], &candidates);
+            assert_eq!(replacement, [&a, &b, &c]);
+        }
+        let updated_zone = member("updated", "a2", "two");
+        for index in 0..50 {
+            let candidate = select_logkeepers(&format!("moving-{index}"), 2, vec![&a], &[&alternative, &updated_zone]);
+            assert_eq!(candidate, [&a, &updated_zone]);
+        }
+        let local = select_logkeepers("local", 3, Vec::new(), &[&a, &alternative, &reused]);
+        assert_eq!(local.len(), 2);
+        assert_ne!(local[0].address, local[1].address);
+    }
+
     #[test]
     fn prefixed_cell_access_and_disposal_open_the_same_root_as_custody() {
         for (archive, expected) in [
@@ -227,10 +429,7 @@ mod tests {
                 panic!("S3 archive");
             };
             let root = CellStorage::s3_root(&config).unwrap();
-            let installed = CellStorage::rooted_s3_config(&config).unwrap();
-            let fallback = rtdb_storage::ObjectKey::new(S3_CELL_ROOT).unwrap();
             assert_eq!(root.as_str(), expected);
-            assert_eq!(installed.object_prefix(&fallback).unwrap(), root);
         }
     }
 

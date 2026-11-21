@@ -1,6 +1,6 @@
 use std::{sync::{Arc, atomic::{AtomicI64, Ordering}}, time::Duration};
 use arrow_array::{Int64Array, RecordBatch, StringArray};
-use arrow_flight::{Action, FlightDescriptor, FlightInfo, flight_service_client::FlightServiceClient, sql::{Any, ActionBeginTransactionRequest, ActionBeginTransactionResult, ActionCreatePreparedStatementRequest, ActionCreatePreparedStatementResult, ActionEndTransactionRequest, CommandGetCatalogs, CommandGetSqlInfo, CommandGetTables, CommandPreparedStatementQuery, CommandPreparedStatementUpdate, CommandStatementIngest, CommandStatementQuery, CommandStatementUpdate, EndTransaction, ProstMessageExt}};
+use arrow_flight::{Action, FlightDescriptor, FlightInfo, flight_service_client::FlightServiceClient, sql::{Any, ActionBeginTransactionRequest, ActionBeginTransactionResult, ActionClosePreparedStatementRequest, ActionCreatePreparedStatementRequest, ActionCreatePreparedStatementResult, ActionEndTransactionRequest, CommandGetCatalogs, CommandGetSqlInfo, CommandGetTables, CommandPreparedStatementQuery, CommandPreparedStatementUpdate, CommandStatementIngest, CommandStatementQuery, CommandStatementUpdate, EndTransaction, ProstMessageExt}};
 use arrow_schema::{DataType, Field, Schema};
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -10,7 +10,7 @@ use rtdb_auth::{AuthConfig, Authenticator, HttpRequest, HttpResponse, HttpTransp
 use rtdb_columnar::MemoryBudget;
 use rtdb_flight_sql::{FlightConfig, ServerDriver, ServerHandle};
 use rtdb_maintenance::CollectionObserver;
-use rtdb_node::{Clock, Node, NodeOptions, NodeServices};
+use rtdb_node::{Clock, Membership, Node, NodeOptions, NodeServices};
 use rtdb_plan::{CatalogMetric, CatalogMetrics, CatalogRows};
 use rtdb_types::{Anomaly, Result, TableRef, Timestamp};
 use tonic::{Request, Status, metadata::MetadataMap, transport::Channel};
@@ -28,12 +28,15 @@ struct ManualClock(AtomicI64);
 impl Clock for ManualClock { fn now(&self) -> Timestamp { Timestamp(self.0.load(Ordering::Relaxed)) } }
 struct Running { node: Node, node_task: tokio::task::JoinHandle<Result<()>>, server: ServerHandle, server_task: tokio::task::JoinHandle<Result<()>>, clock: Arc<ManualClock> }
 impl Running {
-    async fn start(password: Option<&str>, mut config: FlightConfig) -> Self {
+    async fn start(password: Option<&str>, config: FlightConfig) -> Self { Self::start_with_placements(password, config, &[]).await }
+    async fn start_with_placements(password: Option<&str>, mut config: FlightConfig, placements: &[&str]) -> Self {
         let node_clock: Arc<dyn Clock> = Arc::new(TickClock(AtomicI64::new(1_000_000)));
         let auth = Authenticator::open(AuthConfig::SingleRootUser { password: password.map(Secret::new) }, MemoryBudget::new(64 << 20), node_clock.clone(), Arc::new(NoHttp)).await.unwrap();
         let services = NodeServices { clock: node_clock, ..NodeServices::local(auth.clone(), Arc::new(Observer), auth.clone(), Arc::new(Metrics)) };
         let mut options = NodeOptions::default(); options.automatic_compaction = false; options.automatic_gc = false; options.replication.assertion_interval = Duration::from_millis(1); options.replication.election_seed = 1;
+        if !placements.is_empty() { options.membership = Membership::Placed; }
         let (node, driver) = Node::open(options, services).await.unwrap(); let node_task = tokio::spawn(driver.run());
+        for &database in placements { node.database_or_attach(database.into(), Default::default()).await.unwrap().unwrap(); }
         config.address = "127.0.0.1:0".parse().unwrap(); let clock = Arc::new(ManualClock(AtomicI64::new(0)));
         let (server, driver) = ServerDriver::bind_with_clock(config, node.clone(), auth, clock.clone()).await.unwrap(); let server_task = tokio::spawn(driver.run());
         Self { node, node_task, server, server_task, clock }
@@ -47,9 +50,13 @@ impl Running {
 struct Client { client: FlightServiceClient<Channel>, headers: MetadataMap }
 impl Client {
     async fn connect(server: &ServerHandle, basic: Option<&str>) -> Self {
+        Self::connect_with_database(server, basic, None).await
+    }
+    async fn connect_with_database(server: &ServerHandle, basic: Option<&str>, database: Option<&str>) -> Self {
         let channel = Channel::from_shared(format!("http://{}", server.address())).unwrap().connect().await.unwrap();
         let client = FlightServiceClient::new(channel); let mut this = Self { client, headers: MetadataMap::new() };
         if let Some(basic) = basic { use base64::Engine; this.headers.insert("authorization", format!("Basic {}", base64::engine::general_purpose::STANDARD.encode(basic)).parse().unwrap()); }
+        if let Some(database) = database { this.headers.insert("x-xtdb-database", database.parse().unwrap()); }
         let request = this.request(futures::stream::iter(vec![arrow_flight::HandshakeRequest::default()]));
         let response = this.client.handshake(request).await.unwrap();
         if let Some(cookie) = response.metadata().get("set-cookie") { this.headers.insert("cookie", cookie.clone()); }
@@ -94,6 +101,50 @@ impl Client {
 }
 fn integer(batch: &RecordBatch, column: usize, row: usize) -> i64 { batch.column(column).as_any().downcast_ref::<Int64Array>().unwrap().value(row) }
 fn arguments(values: Vec<i64>) -> RecordBatch { RecordBatch::try_new(Arc::new(Schema::new(vec![Field::new("any-client-name", DataType::Int64, false)])), vec![Arc::new(Int64Array::from(values))]).unwrap() }
+
+#[tokio::test]
+async fn placed_flight_sessions_scope_catalogs_tickets_and_handles_to_their_attachment() {
+    let running = Running::start_with_placements(None, FlightConfig::default(), &["first", "second"]).await;
+    let mut first = Client::connect_with_database(&running.server, None, Some("first")).await;
+    let mut second = Client::connect_with_database(&running.server, None, Some("second")).await;
+    first.headers.remove("x-xtdb-database");
+    second.headers.remove("x-xtdb-database");
+    let catalogs = FlightDescriptor::new_cmd(CommandGetCatalogs {}.as_any().encode_to_vec());
+    let first_catalogs = first.client.get_flight_info(first.request(catalogs.clone())).await.unwrap().into_inner();
+    let batches = first.redeem(&first_catalogs).await;
+    let names = batches[0].column(0).as_any().downcast_ref::<StringArray>().unwrap();
+    assert_eq!(names.iter().collect::<Vec<_>>(), [Some("first")]);
+
+    let mut switched = first.request(catalogs.clone());
+    switched.metadata_mut().insert("x-xtdb-database", "second".parse().unwrap());
+    assert_eq!(first.client.get_flight_info(switched).await.unwrap_err().code(), tonic::Code::PermissionDenied);
+
+    let info = first.info("SELECT 42::BIGINT AS n", None).await;
+    let ticket = info.endpoint[0].ticket.clone().unwrap();
+    assert_eq!(second.client.do_get(second.request(ticket)).await.unwrap_err().code(), tonic::Code::PermissionDenied);
+    assert_eq!(integer(&first.redeem(&info).await[0], 0, 0), 42);
+
+    let transaction = first.begin().await;
+    assert_eq!(second.end(transaction.clone(), false).await.unwrap_err().code(), tonic::Code::NotFound);
+    first.end(transaction, false).await.unwrap();
+
+    let prepared = first.prepare("SELECT 7::BIGINT AS n", None).await.prepared_statement_handle;
+    let statement = FlightDescriptor::new_cmd(CommandPreparedStatementQuery { prepared_statement_handle: prepared.clone() }.as_any().encode_to_vec());
+    assert_eq!(second.client.get_flight_info(second.request(statement.clone())).await.unwrap_err().code(), tonic::Code::NotFound);
+    second.action("ClosePreparedStatement", ActionClosePreparedStatementRequest { prepared_statement_handle: prepared }.as_any().encode_to_vec().into()).await.unwrap();
+    let result = first.client.get_flight_info(first.request(statement)).await.unwrap().into_inner();
+    assert_eq!(integer(&first.redeem(&result).await[0], 0, 0), 7);
+
+    running.node.detach_local("first".into()).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while running.node.catalog().is_draining("first") { tokio::task::yield_now().await; }
+    }).await.unwrap();
+    running.node.database_or_attach("first".into(), Default::default()).await.unwrap().unwrap();
+    assert_eq!(first.client.get_flight_info(first.request(catalogs)).await.unwrap_err().code(), tonic::Code::Unavailable);
+    let mut replacement = Client::connect_with_database(&running.server, None, Some("first")).await;
+    assert_eq!(integer(&replacement.query("SELECT 9::BIGINT AS n").await[0], 0, 0), 9);
+    running.stop().await;
+}
 
 #[tokio::test]
 async fn unsigned_parameter_fields_and_bits_admit_signed_query_and_dml_values() {

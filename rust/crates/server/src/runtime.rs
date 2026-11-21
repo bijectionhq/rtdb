@@ -27,6 +27,7 @@ pub struct PlacedOptions {
     pub claim_wait: Duration,
     /// Accepts capabilities minted by the cell's gateways in place of a password.
     pub capabilities: Option<Arc<dyn rtdb_pgwire::CapabilityVerifier>>,
+    pub flight_peer: Option<Arc<dyn rtdb_flight_sql::FlightPeerVerifier>>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -127,6 +128,8 @@ impl ServerDriver {
         let read_fence = placed.as_ref().and_then(|placed| placed.read_fence.clone());
         let scan_fragmenter = placed.as_ref().and_then(|placed| placed.scan_fragmenter.clone());
         let capabilities = placed.as_ref().and_then(|placed| placed.capabilities.clone());
+        let flight_peer = placed.as_ref().and_then(|placed| placed.flight_peer.clone());
+        let gateway_session_state = placed.is_some();
         if let Some(placed) = placed {
             for (protobuf_type, factory) in placed.log_factories { resources = resources.register_log(protobuf_type, factory)?; }
             for (protobuf_type, factory) in placed.storage_factories { resources = resources.register_storage(protobuf_type, factory)?; }
@@ -145,7 +148,7 @@ impl ServerDriver {
             for (port, read_only) in [(settings.port, false), (settings.read_only_port, true)] {
                 if port < 0 { continue; }
                 let mut configuration = rtdb_pgwire::ServerConfig { address: address(&settings.host, port).await?, maximum_connections: settings.connections,
-                    pending_connections: settings.connections, read_only, playground: config.playground, tls: tls.clone(), capabilities: capabilities.clone(), ..Default::default() };
+                    pending_connections: settings.connections, read_only, playground: config.playground, tls: tls.clone(), capabilities: capabilities.clone(), gateway_session_state, ..Default::default() };
                 if let Some(zone) = &config.default_timezone {
                     configuration.parameters.insert("timezone".into(), zone.clone());
                 }
@@ -159,7 +162,8 @@ impl ServerDriver {
             Some(settings) if settings.port >= 0 => {
                 let configuration = rtdb_flight_sql::FlightConfig { address: address(&settings.host, settings.port).await?,
                     transaction_idle_timeout: settings.transaction_idle_timeout, prepared_statement_idle_timeout: settings.prepared_statement_idle_timeout,
-                    session_idle_timeout: settings.session_idle_timeout, session_unclaimed_timeout: settings.session_unclaimed_timeout, playground: config.playground, ..Default::default() };
+                    session_idle_timeout: settings.session_idle_timeout, session_unclaimed_timeout: settings.session_unclaimed_timeout, playground: config.playground,
+                    forwarded_peer: flight_peer, ..Default::default() };
                 let (handle, driver) = rtdb_flight_sql::ServerDriver::bind(configuration, node.clone(), auth.clone()).await?;
                 addresses.flight_sql = Some(handle.address());
                 Some((handle, driver))

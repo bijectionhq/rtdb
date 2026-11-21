@@ -1,7 +1,7 @@
 //! The production directory: DynamoDB, single region, on-demand capacity.
 //!
 //! One table per record kind, keyed by id, plus a names table that makes deployment names unique.
-//! Each item carries the record as a JSON blob beside the attributes DynamoDB has to see: the key, `version` for conditions, `holder` for the index.
+//! Each item carries a versioned record beside the attributes DynamoDB uses for lookups, conditions and the holder index.
 //! Every replace is a `PutItem` conditional on `version = expected`, and every read is strongly consistent except the holder index query.
 //! The deployments table streams its new images, which the directory follows as its change feed.
 
@@ -12,19 +12,20 @@ use std::time::Duration;
 use async_trait::async_trait;
 use aws_sdk_dynamodb::Client;
 use aws_sdk_dynamodb::error::{DisplayErrorContext, ProvideErrorMetadata, SdkError};
+use aws_sdk_dynamodb::primitives::Blob;
 use aws_sdk_dynamodb::types::{
     AttributeDefinition, AttributeValue, BillingMode, ConditionCheck, GlobalSecondaryIndex, IndexStatus, KeySchemaElement, KeyType, Projection, ProjectionType, Put,
     ReturnValuesOnConditionCheckFailure, ScalarAttributeType, StreamSpecification, StreamViewType, TableStatus, TransactWriteItem,
 };
 use aws_sdk_dynamodbstreams::Client as StreamsClient;
 use parking_lot::Mutex;
-use tokio::sync::broadcast;
 use rtdb_types::{Anomaly, AnomalyCategory, Result};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 
 use crate::{check_fork_parent, exists, fork_conflict, fork_parent_id, Cas, ChangeFeed, DeploymentRecord, Directory, HostedTask, MemberId, MemberRecord, Version};
 
+mod parked;
 mod streams;
 
 type Item = HashMap<String, AttributeValue>;
@@ -33,6 +34,7 @@ type Item = HashMap<String, AttributeValue>;
 const ID: &str = "id";
 const NAME: &str = "name";
 const VERSION: &str = "version";
+const EPOCH: &str = "epoch";
 const HOLDER: &str = "holder";
 const RECORD: &str = "record";
 /// The index on the deployments table answering `deployments_held_by`; it projects only keys, since every hit is re-read strongly.
@@ -63,6 +65,7 @@ pub struct DynamoDirectory {
     client: Client,
     streams: StreamsClient,
     tables: DynamoTables,
+    pack_parked_records: bool,
     /// The deployments table's stream, followed from the first `deployment_changes` until the directory is dropped.
     changes: Arc<ChangeFeed>,
     following: Mutex<bool>,
@@ -70,7 +73,7 @@ pub struct DynamoDirectory {
 
 impl DynamoDirectory {
     pub fn new(client: Client, streams: StreamsClient, tables: DynamoTables) -> Self {
-        Self { client, streams, tables, changes: Arc::new(ChangeFeed::new()), following: Mutex::new(false) }
+        Self { client, streams, tables, pack_parked_records: false, changes: Arc::new(ChangeFeed::new()), following: Mutex::new(false) }
     }
 
     pub fn from_sdk_config(config: &aws_types::SdkConfig, tables: DynamoTables) -> Self { Self::new(Client::new(config), StreamsClient::new(config), tables) }
@@ -105,6 +108,12 @@ impl DynamoDirectory {
     }
 
     pub fn tables(&self) -> &DynamoTables { &self.tables }
+
+    /// Enables binary writes for eligible unheld deployments after every directory reader supports the format.
+    pub fn with_packed_parked_records(mut self) -> Self {
+        self.pack_parked_records = true;
+        self
+    }
 
     /// Creates any of the tables that do not exist, on-demand, with the holder index and the deployments' stream of new images, and waits until all are active.
     /// For tests and local cells; production tables belong to the cell's infrastructure code.
@@ -245,10 +254,10 @@ fn string_attribute<'a>(item: &'a Item, name: &str) -> Result<&'a str> {
     }
 }
 
-fn version_attribute(item: &Item) -> Result<Version> {
-    match item.get(VERSION) {
-        Some(AttributeValue::N(value)) => value.parse().map_err(|_| Anomaly::fault("rtdb.directory/item", format!("A directory item's version is not a u64: {value}"))),
-        _ => Err(Anomaly::fault("rtdb.directory/item", "A directory item has no version")),
+fn number_attribute(item: &Item, name: &str) -> Result<u64> {
+    match item.get(name) {
+        Some(AttributeValue::N(value)) => value.parse().map_err(|_| Anomaly::fault("rtdb.directory/item", format!("A directory item's {name} is not a u64: {value}"))),
+        _ => Err(Anomaly::fault("rtdb.directory/item", format!("A directory item has no number attribute {name}"))),
     }
 }
 
@@ -259,21 +268,29 @@ fn blob<T: Serialize>(record: &T) -> Result<AttributeValue> {
 /// The record in `item`, with the item's `version` attribute as its version: that attribute is the one conditions check.
 fn decode<T: DeserializeOwned>(item: &Item, set_version: impl FnOnce(&mut T, Version)) -> Result<T> {
     let mut record: T = serde_json::from_str(string_attribute(item, RECORD)?).map_err(|error| Anomaly::fault("rtdb.directory/decode", error.to_string()))?;
-    set_version(&mut record, version_attribute(item)?);
+    set_version(&mut record, number_attribute(item, VERSION)?);
     Ok(record)
 }
 
-fn decode_deployment(item: &Item) -> Result<DeploymentRecord> { decode(item, |record: &mut DeploymentRecord, version| record.version = version) }
+fn decode_deployment(item: &Item) -> Result<DeploymentRecord> {
+    match item.get(RECORD) {
+        Some(AttributeValue::B(bytes)) => parked::decode(bytes.as_ref(), string_attribute(item, ID)?, string_attribute(item, NAME)?,
+            number_attribute(item, EPOCH)?, number_attribute(item, VERSION)?),
+        _ => decode(item, |record: &mut DeploymentRecord, version| record.version = version),
+    }
+}
 
 fn decode_member(item: &Item) -> Result<MemberRecord> { decode(item, |record: &mut MemberRecord, version| record.version = version) }
 
-fn deployment_item(record: &DeploymentRecord) -> Result<Item> {
+fn deployment_item(record: &DeploymentRecord, pack_parked: bool) -> Result<Item> {
+    let packed = pack_parked.then(|| parked::encode(record)).flatten();
+    let body = match packed { Some(bytes) => AttributeValue::B(Blob::new(bytes)), None => blob(record)? };
     let mut item = Item::from([
         (ID.to_owned(), AttributeValue::S(record.id.clone())),
         (NAME.to_owned(), AttributeValue::S(record.name.clone())),
         (VERSION.to_owned(), number(record.version)),
-        ("epoch".to_owned(), number(record.epoch)),
-        (RECORD.to_owned(), blob(record)?),
+        (EPOCH.to_owned(), number(record.epoch)),
+        (RECORD.to_owned(), body),
     ]);
     // Absent rather than null, so an unheld deployment is not in the sparse holder index at all.
     if let Some(holder) = &record.holder { item.insert(HOLDER.to_owned(), AttributeValue::S(holder.0.clone())); }
@@ -291,7 +308,7 @@ fn member_item(record: &MemberRecord) -> Result<Item> {
 impl DynamoDirectory {
     async fn insert_deployment(&self, mut record: DeploymentRecord, parent: Option<ConditionCheck>) -> Result<DeploymentRecord> {
         record.version = 1;
-        let deployment = Put::builder().table_name(&self.tables.deployments).set_item(Some(deployment_item(&record)?))
+        let deployment = Put::builder().table_name(&self.tables.deployments).set_item(Some(deployment_item(&record, self.pack_parked_records)?))
             .condition_expression("attribute_not_exists(#id)").expression_attribute_names("#id", ID).build().map_err(build_fault)?;
         let name_item = Item::from([(NAME.to_owned(), AttributeValue::S(record.name.clone())), (ID.to_owned(), AttributeValue::S(record.id.clone()))]);
         let name = Put::builder().table_name(&self.tables.deployment_names).set_item(Some(name_item))
@@ -363,6 +380,7 @@ impl Directory for DynamoDirectory {
 
     /// The index lags writes, so a deployment claimed a moment ago may be missing; every hit is re-read strongly, so none is stale.
     async fn deployments_held_by(&self, member: &MemberId) -> Result<Vec<DeploymentRecord>> {
+        const CONCURRENT_POINT_READS: usize = 16;
         let mut pages = self.client.query().table_name(&self.tables.deployments).index_name(HOLDER_INDEX)
             .key_condition_expression("#h = :holder").expression_attribute_names("#h", HOLDER)
             .expression_attribute_values(":holder", AttributeValue::S(member.0.clone()))
@@ -371,13 +389,15 @@ impl Directory for DynamoDirectory {
         while let Some(page) = pages.next().await {
             for item in page.map_err(|error| sdk_anomaly("Query", error))?.items.unwrap_or_default() { ids.push(string_attribute(&item, ID)?.to_owned()); }
         }
+        let mut ids = ids.into_iter();
         let mut reads = tokio::task::JoinSet::new();
-        for id in ids {
-            let (client, table) = (self.client.clone(), self.tables.deployments.clone());
-            reads.spawn(async move { get_item(&client, &table, ID, &id).await?.as_ref().map(decode_deployment).transpose() });
-        }
         let mut held = Vec::new();
-        while let Some(read) = reads.join_next().await {
+        loop {
+            for id in ids.by_ref().take(CONCURRENT_POINT_READS - reads.len()) {
+                let (client, table) = (self.client.clone(), self.tables.deployments.clone());
+                reads.spawn(async move { get_item(&client, &table, ID, &id).await?.as_ref().map(decode_deployment).transpose() });
+            }
+            let Some(read) = reads.join_next().await else { break; };
             let read = read.map_err(|error| Anomaly::fault("rtdb.directory/task", error.to_string()))?;
             held.extend(read?.filter(|record| record.holder.as_ref() == Some(member)));
         }
@@ -388,7 +408,7 @@ impl Directory for DynamoDirectory {
     async fn replace_deployment(&self, mut record: DeploymentRecord, expected: Version) -> Result<Cas<DeploymentRecord>> {
         record.version = expected + 1;
         let name = record.name.clone();
-        match self.put_conditional(&self.tables.deployments, deployment_item(&record)?, expected, Some(&name)).await? {
+        match self.put_conditional(&self.tables.deployments, deployment_item(&record, self.pack_parked_records)?, expected, Some(&name)).await? {
             Ok(()) => Ok(Cas::Applied(record)),
             Err(None) => Ok(Cas::Conflict(None)),
             Err(Some(current)) => {
@@ -421,7 +441,13 @@ impl Directory for DynamoDirectory {
     }
 
     /// Outside a Tokio runtime there is nothing to follow the stream on, so there is no feed.
-    fn deployment_changes(&self) -> Option<broadcast::Receiver<DeploymentRecord>> {
+    fn deployment_changes(&self) -> Option<tokio::sync::broadcast::Receiver<DeploymentRecord>> {
+        let receiver = self.changes.subscribe();
+        self.change_feed()?;
+        Some(receiver)
+    }
+
+    fn change_feed(&self) -> Option<&ChangeFeed> {
         let mut following = self.following.lock();
         if !*following {
             let runtime = tokio::runtime::Handle::try_current().ok()?;
@@ -430,13 +456,14 @@ impl Directory for DynamoDirectory {
             runtime.spawn(follower.run());
             *following = true;
         }
-        Some(self.changes.subscribe())
+        Some(&self.changes)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
+    use tokio::sync::broadcast;
 
     use super::*;
     use crate::contract;
@@ -459,6 +486,71 @@ mod tests {
     async fn dynamodb_directory_meets_the_contract() {
         let Some(directory) = local().await else { return };
         contract::run(&directory).await;
+    }
+
+    fn parked_record() -> DeploymentRecord {
+        DeploymentRecord::new("parked-999999", "bench", (0..3).map(|_| MemberId::fresh()).collect(), 1_795_224_375_000)
+    }
+
+    #[test]
+    fn common_parked_items_round_trip_below_the_record_budget() {
+        let pristine = parked_record();
+        let mut reopened = pristine.clone();
+        reopened.epoch = 17;
+        reopened.version = 65;
+        reopened.checkpoint = Some(crate::Checkpoint { block: 87, boundary: 34_567, source: 31_234, system_time: 1_795_224_375_000_000 });
+        reopened.storage_namespaces = Some(crate::StorageNamespaces { objects: uuid::Uuid::new_v4(), keys: [42; 32] });
+        let mut hosted = reopened.clone();
+        hosted.replica_journals.extend(["10.42.0.10:7654", "10.42.1.10:7654", "10.42.2.10:7654"].map(str::to_owned));
+        for (name, record) in [("pristine", &pristine), ("previously active", &reopened), ("with journal custody", &hosted)] {
+            let compact = deployment_item(record, true).unwrap();
+            assert!(matches!(compact[RECORD], AttributeValue::B(_)));
+            assert_eq!(&decode_deployment(&compact).unwrap(), record);
+            let item_size = |item: &Item| item.iter().map(|(name, value)| name.len() + match value {
+                AttributeValue::S(text) => text.len(),
+                AttributeValue::B(bytes) => bytes.as_ref().len(),
+                AttributeValue::N(number) => number.len().div_ceil(2) + 1,
+                other => panic!("unexpected item attribute {other:?}"),
+            }).sum::<usize>();
+            let json = deployment_item(record, false).unwrap();
+            assert_eq!(&decode_deployment(&json).unwrap(), record);
+            println!("{name}: packed item {} bytes, JSON item {} bytes", item_size(&compact), item_size(&json));
+            assert!(item_size(&compact) < 300);
+        }
+
+        reopened.org = "other".into();
+        reopened.ensemble[0] = MemberId("legacy-address-based-member".into());
+        let fallback = deployment_item(&reopened, true).unwrap();
+        assert!(matches!(fallback[RECORD], AttributeValue::S(_)));
+        assert_eq!(decode_deployment(&fallback).unwrap(), reopened);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn packed_and_legacy_items_are_readable_by_both_read_modes_and_the_change_feed() {
+        let Some(reader) = local().await else { return };
+        let writer = DynamoDirectory::new(reader.client.clone(), reader.streams.clone(), reader.tables.clone()).with_packed_parked_records();
+        let legacy = reader.create_deployment(DeploymentRecord::new("legacy", "bench", vec![], 0)).await.unwrap();
+        assert_eq!(writer.deployment_by_name("legacy").await.unwrap().as_ref(), Some(&legacy));
+        let mut feed = reader.deployment_changes().unwrap();
+        await_versions(&mut feed, &[legacy]).await;
+
+        let packed = writer.create_deployment(parked_record()).await.unwrap();
+        await_versions(&mut feed, std::slice::from_ref(&packed)).await;
+        let raw = reader.get(&reader.tables.deployments, ID, &packed.id).await.unwrap().unwrap();
+        assert!(matches!(raw[RECORD], AttributeValue::B(_)));
+        assert_eq!(reader.deployment_by_name(&packed.name).await.unwrap().as_ref(), Some(&packed));
+        let mut next = packed.clone();
+        let holder = MemberId::fresh();
+        next.holder = Some(holder.clone());
+        next.epoch = 1;
+        let held = writer.replace_deployment(next, packed.version).await.unwrap().applied().unwrap();
+        assert_eq!(reader.deployments_held_by(&holder).await.unwrap(), [held.clone()]);
+        let mut parked = crate::park(&held, &holder, held.epoch).unwrap();
+        parked.checkpoint = Some(crate::Checkpoint { block: 0, boundary: 2, source: 1, system_time: 65 });
+        let parked = writer.replace_deployment(parked, held.version).await.unwrap().applied().unwrap();
+        await_versions(&mut feed, std::slice::from_ref(&parked)).await;
+        assert_eq!(reader.deployment(&parked.id).await.unwrap().as_ref(), Some(&parked));
+        assert!(matches!(writer.replace_deployment(packed, held.version).await.unwrap(), Cas::Conflict(Some(current)) if current == parked));
     }
 
     #[tokio::test]
@@ -530,6 +622,66 @@ mod tests {
 
         let created = directory.create_deployment(DeploymentRecord::new("shop-late", "acme", vec![], 0)).await.unwrap();
         await_versions(&mut receiver, std::slice::from_ref(&created)).await;
+    }
+
+    #[derive(Debug)]
+    struct CountScans(Arc<std::sync::atomic::AtomicUsize>);
+
+    impl aws_sdk_dynamodb::config::Intercept for CountScans {
+        fn name(&self) -> &'static str { "CountScans" }
+        fn read_before_transmit(
+            &self,
+            context: &aws_sdk_dynamodb::config::interceptors::BeforeTransmitInterceptorContextRef<'_>,
+            _: &aws_sdk_dynamodb::config::RuntimeComponents,
+            _: &mut aws_sdk_dynamodb::config::ConfigBag,
+        ) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> {
+            if context.request().headers().get("x-amz-target").is_some_and(|target| target.ends_with(".Scan")) {
+                self.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+            Ok(())
+        }
+    }
+
+    #[derive(Debug)]
+    struct HoldIterator(Arc<std::sync::atomic::AtomicBool>);
+
+    impl aws_sdk_dynamodbstreams::config::Intercept for HoldIterator {
+        fn name(&self) -> &'static str { "HoldIterator" }
+        fn read_before_transmit(
+            &self,
+            context: &aws_sdk_dynamodbstreams::config::interceptors::BeforeTransmitInterceptorContextRef<'_>,
+            _: &aws_sdk_dynamodbstreams::config::RuntimeComponents,
+            _: &mut aws_sdk_dynamodbstreams::config::ConfigBag,
+        ) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> {
+            if context.request().headers().get("x-amz-target").is_some_and(|target| target.ends_with(".GetShardIterator"))
+                && !self.0.load(std::sync::atomic::Ordering::Relaxed)
+            {
+                return Err("the stream iterator is held until the first update commits".into());
+            }
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn a_keyed_dynamodb_watch_recovers_an_update_during_startup_without_scanning_the_table() {
+        let Some(writer) = local().await else { return };
+        let mut record = writer.create_deployment(DeploymentRecord::new("shop", "acme", vec![], 0)).await.unwrap();
+        let scans = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let ready = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let client = Client::from_conf(writer.client.config().to_builder().interceptor(CountScans(scans.clone())).build());
+        let streams = StreamsClient::from_conf(writer.streams.config().to_builder().interceptor(HoldIterator(ready.clone())).build());
+        let reader = Arc::new(DynamoDirectory::new(client, streams, writer.tables.clone()));
+        let mut watched = crate::watch_deployment(reader, record.id.clone(), Duration::from_secs(60));
+        drop(watched.wait_for(|current| current.is_some()).await.unwrap());
+
+        record.epoch = 1;
+        let version = record.version;
+        writer.replace_deployment(record, version).await.unwrap().applied().unwrap();
+        ready.store(true, std::sync::atomic::Ordering::Relaxed);
+        drop(tokio::time::timeout(Duration::from_secs(10), watched.wait_for(|record| {
+            record.as_ref().is_some_and(|record| record.epoch == 1)
+        })).await.unwrap().unwrap());
+        assert_eq!(scans.load(std::sync::atomic::Ordering::Relaxed), 0);
     }
 
     #[tokio::test]

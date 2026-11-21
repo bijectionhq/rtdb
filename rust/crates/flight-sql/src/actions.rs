@@ -16,12 +16,12 @@ impl Service {
                     let _: ActionBeginTransactionRequest = unpack(&action.body)?;
                     let shared = self.connection(&call, &call.database).await?;
                     let shared = shared.borrow().await?;
-                    let mut native = self.0.node.session(&call.database, call.session.caller.principal.clone()).map_err(status)?;
+                    let mut native = call.session.open_native(&call.database, &self.0.node)?;
                     native.state_mut().set_await_token(shared.state().effective_await_token().map(str::to_owned)).map_err(status)?;
                     native.state_mut().set_timezone(shared.state().effective_timezone()).map_err(status)?;
                     native.state_mut().set_auto_commit(false).await.map_err(status)?;
                     let handle = Bytes::copy_from_slice(Uuid::new_v4().as_bytes());
-                    let tx = Arc::new(Transaction::new(call.session.caller.owner, ConnectionResource::new(native), self.memory().reserve(512).map_err(status)?));
+                    let tx = Arc::new(Transaction::new(call.session.owner(), ConnectionResource::new(native), self.memory().reserve(512).map_err(status)?));
                     self.0.transactions.insert(handle.clone(), tx, self.0.config.transaction_idle_timeout, self.0.config.transaction_idle_timeout, false, 16).map_err(status)?;
                     Ok(vec![Ok(packed(&ActionBeginTransactionResult { transaction_id: handle }, self)?)])
                 }
@@ -59,7 +59,7 @@ impl Service {
                     let shape = self.prepare_shape(connection, &request.query, None).await?;
                     let scope = request.transaction_id.map_or_else(|| PreparedScope::Session(call.database.clone()), PreparedScope::Transaction);
                     let charge = self.memory().reserve(wire::add(request.query.capacity(), wire::add(call.database.len(), 1024)?)?).map_err(status)?;
-                    let prepared = Arc::new(Prepared::new(call.session.caller.owner, request.query, scope, charge));
+                    let prepared = Arc::new(Prepared::new(call.session.owner(), request.query, scope, charge));
                     let handle = Bytes::copy_from_slice(Uuid::new_v4().as_bytes());
                     let _parameters = self.memory().reserve(wire::add(wire::mul(shape.parameters, 1024)?, 4096)?).map_err(status)?;
                     let parameters = Schema::new((0..shape.parameters).map(|_| Field::new("", DataType::Null, true)).collect::<Vec<_>>());
@@ -70,7 +70,7 @@ impl Service {
                 }
                 "ClosePreparedStatement" => {
                     let request: ActionClosePreparedStatementRequest = unpack(&action.body)?;
-                    if let Lookup::Found(prepared) = self.0.prepared.lookup(&request.prepared_statement_handle, false) { if prepared.owner == call.session.caller.owner { if let Lookup::Found(prepared) = self.0.prepared.take(&request.prepared_statement_handle) { prepared.close(); } } }
+                    if let Lookup::Found(prepared) = self.0.prepared.lookup(&request.prepared_statement_handle, false) { if call.session.owns(&prepared.owner) { if let Lookup::Found(prepared) = self.0.prepared.take(&request.prepared_statement_handle) { prepared.close(); } } }
                     Ok(Vec::new())
                 }
                 "GetSessionOptions" => {
@@ -82,6 +82,9 @@ impl Service {
                     let request = protocol::SessionOptions::decode(action.body.as_ref()).map_err(arrow)?; let mut errors = BTreeMap::new();
                     for (name, value) in request.session_options {
                         let error = match name.as_str() {
+                            "catalog" if call.session.placed_database().is_some() => {
+                                if matches!(value.value, Some(protocol::OptionValue::String(value)) if value.is_empty() || value == call.database) { None } else { Some(2) }
+                            }
                             "catalog" => match value.value {
                                 Some(protocol::OptionValue::String(value)) if value.is_empty() => { call.session.select_catalog(None, &self.0.node)?; None }
                                 Some(protocol::OptionValue::String(value)) => { if self.admit_database(&value).await? { call.session.select_catalog(Some(value), &self.0.node)?; None } else { Some(2) } }

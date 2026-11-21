@@ -1,13 +1,14 @@
 //! The RTDB multi cell processes.
 
 use std::collections::BTreeMap;
-use std::io::{Read, Write};
+use std::io::Read;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
 use rtdb_directory::{Directory, MemoryDirectory, RemoteDirectory};
+use rtdb_multi::cells::{CellMap, MemoryCellMap, RemoteCellMap};
 use rtdb_multi::{admin, agent::AgentOptions, deployment::CellStorage, gateway, lease::LeaseOptions, process};
 use rtdb_server::config::NodeConfiguration;
 use rtdb_types::{Anomaly, Result};
@@ -20,38 +21,45 @@ Usage: rtdb-multi --build-info\n\
        rtdb-multi standalone --state PATH --name NAME --id UUID --certificate FILE --private-key FILE --password-file FILE --ready-file FILE [--parent-stdin]\n\
        rtdb-multi directory --state PATH --listen ADDR\n\
        rtdb-multi logkeeper --directory DIR --listen ADDR --data PATH [--advertise-host HOST] [--zone ZONE] [--cache-bytes BYTES] [--no-fsync]\n\
-       rtdb-multi node --directory DIR --storage-root PATH --keys PATH --cache PATH [--config FILE] [--control ADDR] [--advertise-host HOST] [--zone ZONE] [--ecs-cluster ARN] [--park-after SECONDS] [--max-active N] [--max-tail-rows N] [--isolation | --compaction-worker] [--no-local-compaction] [--memory-limit BYTES] [--cell-secret FILE]\n\
-       rtdb-multi gateway --directory DIR --listen ADDR [--config FILE] [--cell NAME --cell-map ADDR] [--cell-secret FILE]\n\
+       rtdb-multi node --directory DIR --storage-root PATH --keys PATH --cache PATH [--config FILE] [--control ADDR] [--advertise-host HOST] [--zone ZONE] [--engine-version VERSION] [--ecs-cluster ARN] [--park-after SECONDS] [--min-residency SECONDS] [--max-active N] [--activations-per-second N] [--s3-write-role ARN] [--sts-endpoint URL] [--s3-compat-write-policy] [--max-tail-rows N] [--isolation | --compaction-worker] [--no-local-compaction] [--memory-limit BYTES] [--cell-secret FILE]\n\
+       rtdb-multi init-storage --storage-root PATH --keys PATH\n\
+       rtdb-multi gateway --directory DIR --listen ADDR [--flight-listen ADDR] [--config FILE] [--cell NAME --cell-map ADDR] [--cell-secret FILE] [--max-connections N] [--max-connections-per-deployment N] [--max-buffered-bytes BYTES]\n\
                           [--install-listen ADDR --install-token-file FILE --install-org ORG --install-replicas N]\n\
                           [--disposal-token-file FILE]\n\
-       rtdb-multi cell-map --listen ADDR\n\
+       rtdb-multi cell-map --listen ADDR [--dynamodb-prefix PREFIX]\n\
        rtdb-multi move-cell --cell-map ADDR --name NAME --from CELL --from-directory DIR --from-storage-root PATH --from-keys PATH --to CELL --to-directory DIR --to-storage-root PATH --to-keys PATH [--ecs-cluster ARN]\n\
        rtdb-multi prepare-cell-transfer [--transfer FILE | --transfer-bucket BUCKET --transfer-digest SHA256] --from CELL --from-directory DIR --from-storage-root PATH --from-keys PATH --to CELL --to-directory DIR --to-storage-root PATH --to-keys PATH [--ecs-cluster ARN]\n\
        rtdb-multi activate-cell-transfer [--transfer FILE | --transfer-bucket BUCKET --transfer-digest SHA256] --from CELL --from-directory DIR --from-storage-root PATH --from-keys PATH --to CELL --to-directory DIR --to-storage-root PATH --to-keys PATH\n\
        rtdb-multi controller --directory DIR [--rebalance MOVES] [--cell-secret FILE]\n\
-       rtdb-multi reaper --directory DIR --storage-root PATH [--keys PATH] [--ecs-cluster ARN] [--grace SECONDS] [--recovery-listen ADDR --recovery-config FILE --recovery-token-file FILE --recovery-org ORG --archive-root PATH]\n\
+       rtdb-multi reaper --directory DIR --storage-root PATH [--keys PATH] [--ecs-cluster ARN] [--grace SECONDS] [--recovery-listen ADDR --recovery-config FILE --recovery-token-file FILE --recovery-org ORG --archive-root PATH --cell-secret FILE]\n\
        rtdb-multi create --directory DIR --name NAME [--org ORG] [--replicas N]\n\
        rtdb-multi install --directory DIR --id UUID --name NAME --org ORG [--replicas N]\n\
        rtdb-multi list --directory DIR\n\
        rtdb-multi drain --directory DIR --member ID\n\
-       rtdb-multi status --directory DIR [--target-per-node N]\n\
-       rtdb-multi audit --directory DIR --keys PATH --name NAME\n\
+       rtdb-multi roll-engine --directory DIR --version VERSION\n\
+       rtdb-multi status --directory DIR [--target-per-node N] [--placements-only]\n\
+       rtdb-multi audit --directory DIR --keys PATH --name NAME [--require-quorum]\n\
+       rtdb-multi audit-log --data PATH --stream STREAM [--from LSN --through LSN] [--prefix-report FILE] [--expect DIGEST]\n\
        rtdb-multi move --directory DIR --name NAME --to MEMBER [--cell-secret FILE]\n\
+       rtdb-multi pin-engine --directory DIR --name NAME (--version VERSION | --clear)\n\
        rtdb-multi read-width --directory DIR --name NAME --width N\n\
        rtdb-multi unquarantine --directory DIR --name NAME\n\
        rtdb-multi fork --directory DIR --storage-root PATH --keys PATH --from NAME --name NAME [--at-block N | --at-time RFC3339] [--grace SECONDS] [--cell-secret FILE]\n\
-       rtdb-multi delete --directory DIR --storage-root PATH --keys PATH --id UUID\n\
+       rtdb-multi delete --directory DIR --storage-root PATH --keys PATH (--name NAME | --id UUID)\n\
        rtdb-multi schedule-disposal --directory DIR --id UUID\n\
        rtdb-multi disposal --directory DIR --id UUID\n\
        rtdb-multi schedule-recovery-disposal --directory DIR --id UUID\n\
        rtdb-multi recovery-disposal --directory DIR --id UUID\n\
-       rtdb-multi capture --directory DIR --storage-root PATH --archive-root PATH --keys PATH --id UUID --operation UUID [--ecs-cluster ARN]\n\
+       rtdb-multi capture --directory DIR --storage-root PATH --archive-root PATH --keys PATH --id UUID --operation UUID [--ecs-cluster ARN --cell-secret FILE]\n\
        rtdb-multi stage-checkpoint --directory DIR --archive-root PATH --storage-root PATH --keys PATH --stage-request FILE [--ecs-cluster ARN]\n\
        rtdb-multi read-checkpoint-stage --directory DIR --storage-root PATH --keys PATH --id UUID --operation UUID --manifest-sha256 SHA256 --certificate FILE --private-key FILE --password-file FILE --ready-file FILE [--ecs-cluster ARN] [--parent-stdin]\n\
        rtdb-multi restore --directory DIR --storage-root PATH --archive-root PATH --keys PATH --id UUID --operation UUID [--ecs-cluster ARN]\n\n\
-DIR is HOST:PORT of a directory server, or dynamodb:PREFIX for the deployments, deployment-names, members and stopped-tasks tables\n\
-(RTDB_DYNAMODB_ENDPOINT points at DynamoDB Local; requires the `dynamodb` feature).\n\
-For `--keys` use a private local directory or dynamodb:TABLE with an independently installed key table.\n";
+       rtdb-multi deletion-key --keys PATH\n\n\
+       rtdb-multi verify-deletion --record PATH --public-key KEY\n\n\
+DIR is HOST:PORT of a directory server, or dynamodb:PREFIX for DynamoDB tables named PREFIX-deployments, PREFIX-deployment-names, PREFIX-members and PREFIX-stopped-tasks\n\
+Use dynamodb+packed:PREFIX to write packed parked rows after all readers have upgraded.\n\
+MAP is HOST:PORT of a cell-map server, or dynamodb:PREFIX for tables named PREFIX-cells and PREFIX-placements.\n\
+DynamoDB requires the `dynamodb` feature. RTDB_DYNAMODB_ENDPOINT points at DynamoDB Local.\n";
 
 #[tokio::main]
 async fn main() {
@@ -310,8 +318,8 @@ async fn run(arguments: Vec<String>) -> Result<()> {
         let report = MultiBuildInfo {
             provenance: rtdb_types::compiled_build_info(),
             standalone_protocol: process::STANDALONE_PROTOCOL,
-            // The archive owner can fence and retire individual captured checkpoints.
-            hosted_protocol: 12,
+            // Hosted capture adopts a block through the holder's observed source.
+            hosted_protocol: 13,
         };
         let mut output = std::io::stdout().lock();
         serde_json::to_writer(&mut output, &report).map_err(|error| io(std::io::Error::other(error)))?;
@@ -363,14 +371,25 @@ async fn run(arguments: Vec<String>) -> Result<()> {
                 None => NodeConfiguration::from_yaml("server:\n  port: 0\n")?,
             };
             let mut agent = AgentOptions::new(CellStorage::parse(arguments.required("storage-root")?)?);
+            if arguments.present("s3-write-role") {
+                let sts_endpoint = if arguments.present("sts-endpoint") { Some(arguments.required("sts-endpoint")?.to_owned()) } else { None };
+                agent.s3_write_role = Some(rtdb_multi::agent::S3WriteRole { arn: arguments.required("s3-write-role")?.to_owned(),
+                    sts_endpoint, require_conditional_put: !arguments.present("s3-compat-write-policy") });
+            } else if arguments.present("sts-endpoint") || arguments.present("s3-compat-write-policy") {
+                return Err(usage("STS endpoint and compatibility options require --s3-write-role".into()));
+            }
+            agent.activations_per_second = arguments.number("activations-per-second", agent.activations_per_second)?;
             agent.max_tail_rows = arguments.optional("max-tail-rows").map(|count| count.parse()).transpose().map_err(|_| usage("--max-tail-rows must be a number".into()))?;
             agent.max_active = arguments.optional("max-active").map(|count| count.parse()).transpose().map_err(|_| usage("--max-active must be a number".into()))?;
             agent.park_after = arguments.optional("park-after").map(|seconds| seconds.parse().map(Duration::from_secs)).transpose().map_err(|_| usage("--park-after must be a number of seconds".into()))?;
+            agent.min_residency = Duration::from_secs(arguments.number("min-residency", 0)?);
             let node = process::start_node(directory, process::NodeSettings {
                 advertise_host: arguments.optional("advertise-host").map(str::to_owned),
                 hosted_task: hosted_task(&arguments)?,
                 configuration, allocation_limit_bytes: arguments.number("memory-limit", 1usize << 30)?, control: arguments.address("control", "127.0.0.1:0")?,
-                availability_zone: arguments.optional("zone").unwrap_or("local").into(), agent, lease: LeaseOptions::default(), claim_wait: Duration::from_millis(20),
+                availability_zone: arguments.optional("zone").unwrap_or("local").into(),
+                engine_version: if arguments.present("engine-version") { Some(arguments.required("engine-version")?.to_owned()) } else { None },
+                agent, lease: LeaseOptions::default(), claim_wait: Duration::from_millis(2),
                 pool: if arguments.present("isolation") { rtdb_directory::MemberPool::Isolation } else if arguments.present("compaction-worker") { rtdb_directory::MemberPool::Compaction } else { rtdb_directory::MemberPool::General },
                 local_compaction: !arguments.present("no-local-compaction"), capabilities: cell_secret(&arguments)?,
                 keys: key_service(arguments.required("keys")?).await?, cache_dir: PathBuf::from(arguments.required("cache")?),
@@ -378,6 +397,12 @@ async fn run(arguments: Vec<String>) -> Result<()> {
             eprintln!("node {} serving pgwire on {}, control on {}", node.lease.id(), node.pgwire_address, node.control_address);
             cancellation.cancelled().await;
             node.shutdown().await
+        }
+        "init-storage" => {
+            let storage = CellStorage::parse(arguments.required("storage-root")?)?;
+            let namespaces = admin::initialize_storage(&storage, key_service(arguments.required("keys")?).await?.as_ref()).await?;
+            println!("{}", serde_json::to_string(&namespaces).expect("storage namespaces serialize"));
+            Ok(())
         }
         "gateway" => {
             let directory = directory(arguments.required("directory")?).await?;
@@ -392,12 +417,28 @@ async fn run(arguments: Vec<String>) -> Result<()> {
                 None
             };
             let mut options = gateway::GatewayOptions { capabilities: cell_secret(&arguments)?, tls: tls.clone(), ..Default::default() };
+            options.maximum_connections = arguments.number("max-connections", options.maximum_connections)?;
+            options.maximum_connections_per_deployment = arguments.number("max-connections-per-deployment", options.maximum_connections_per_deployment)?;
+            options.maximum_buffered_bytes = arguments.number("max-buffered-bytes", options.maximum_buffered_bytes)?;
             if let (Some(cell), Some(map)) = (arguments.optional("cell"), arguments.optional("cell-map")) {
-                let map: Arc<dyn rtdb_multi::cells::CellMap> = rtdb_multi::cells::RemoteCellMap::new(map);
+                let map = cell_map(map).await?;
                 let advertised = arguments.optional("advertise").map(str::to_owned).unwrap_or(listener.local_addr().map_err(io)?.to_string());
                 map.register_cell(cell, &advertised).await?;
                 options.cells = Some((map, cell.to_owned()));
             }
+            let flight = if arguments.present("flight-listen") {
+                let endpoint = arguments.required("flight-listen")?.parse::<SocketAddr>()
+                    .map_err(|_| usage("--flight-listen must be HOST:PORT".into()))?;
+                let flight = tokio::net::TcpListener::bind(endpoint).await.map_err(io)?;
+                eprintln!("Flight SQL gateway listening on {}", flight.local_addr().map_err(io)?);
+                Some(flight)
+            } else { None };
+            let flight = async {
+                match flight {
+                    Some(flight) => rtdb_multi::flight_gateway::serve(flight, Arc::clone(&directory), options.clone(), cancellation.clone()).await,
+                    None => std::future::pending().await,
+                }
+            };
             if arguments.present("install-listen") {
                 let tls = tls.ok_or_else(|| usage("The installation listener requires a TLS configuration".into()))?;
                 let installer = rtdb_multi::install::Installer::from_file(
@@ -408,11 +449,15 @@ async fn run(arguments: Vec<String>) -> Result<()> {
                 )?;
                 let installs = tokio::net::TcpListener::bind(arguments.address("install-listen", "127.0.0.1:0")?).await.map_err(io)?;
                 tokio::select! {
-                    gateway = gateway::serve(listener, directory.clone(), options, cancellation.clone()) => gateway,
-                    installation = rtdb_multi::install::serve(installs, tls, directory, Arc::new(installer), cancellation) => installation,
+                    gateway = gateway::serve(listener, directory.clone(), options.clone(), cancellation.clone()) => gateway,
+                    flight = flight => flight,
+                    installation = rtdb_multi::install::serve(installs, tls, directory.clone(), Arc::new(installer), cancellation.clone()) => installation,
                 }
             } else {
-                gateway::serve(listener, directory, options, cancellation).await
+                tokio::select! {
+                    gateway = gateway::serve(listener, directory.clone(), options.clone(), cancellation.clone()) => gateway,
+                    flight = flight => flight,
+                }
             }
         }
         "controller" => {
@@ -423,8 +468,12 @@ async fn run(arguments: Vec<String>) -> Result<()> {
         }
         "cell-map" => {
             let listener = tokio::net::TcpListener::bind(arguments.address("listen", "127.0.0.1:7000")?).await.map_err(io)?;
+            let map: Arc<dyn CellMap> = match arguments.optional("dynamodb-prefix") {
+                Some(prefix) => dynamo_cell_map(prefix).await?,
+                None => MemoryCellMap::new(),
+            };
             eprintln!("cell map listening on {}", listener.local_addr().map_err(io)?);
-            rtdb_multi::cells::serve(listener, rtdb_multi::cells::MemoryCellMap::new(), cancellation).await
+            rtdb_multi::cells::serve(listener, map, cancellation).await
         }
         "move-cell" | "prepare-cell-transfer" | "activate-cell-transfer" => {
             admit_hosted_transfer(&command, &arguments).await?;
@@ -465,13 +514,19 @@ async fn run(arguments: Vec<String>) -> Result<()> {
                 let tls_settings = configuration.server.and_then(|server| server.ssl)
                     .ok_or_else(|| usage("The recovery configuration must provide server.ssl".into()))?;
                 let tls = rtdb_server::tls::load(&tls_settings, &rtdb_columnar::MemoryBudget::new(16 << 20))?;
+                let task = hosted_task(&arguments)?;
+                let control = rtdb_multi::control::ControlKey(cell_secret(&arguments)?);
+                if task.is_some() && control.0.is_none() {
+                    return Err(usage("Hosted recovery requires the installed --cell-secret".into()));
+                }
                 let service = rtdb_multi::recovery::RecoveryService::from_file(
                     std::path::Path::new(arguments.required("recovery-token-file")?),
                     arguments.required("recovery-org")?.to_owned(),
                     storage.clone(),
                     CellStorage::parse(arguments.required("archive-root")?)?,
                     keys.clone().ok_or_else(|| usage("The recovery endpoint requires --keys".into()))?,
-                    hosted_task(&arguments)?,
+                    task,
+                    control,
                 )?;
                 let listener = tokio::net::TcpListener::bind(
                     arguments.address("recovery-listen", "127.0.0.1:0")?,
@@ -498,6 +553,20 @@ async fn run(arguments: Vec<String>) -> Result<()> {
         "move" => {
             let directory = directory(arguments.required("directory")?).await?;
             admin::move_deployment(directory.as_ref(), arguments.required("name")?, &rtdb_directory::MemberId(arguments.required("to")?.into()), &rtdb_multi::control::ControlKey(cell_secret(&arguments)?)).await
+        }
+        "pin-engine" => {
+            let version = match (arguments.present("clear"), arguments.present("version")) {
+                (false, true) => Some(arguments.required("version")?),
+                (true, false) if arguments.optional("clear").is_none() => None,
+                _ => return Err(usage("Specify exactly one of --version VERSION or --clear".into())),
+            };
+            let directory = directory(arguments.required("directory")?).await?;
+            admin::pin_engine(directory.as_ref(), arguments.required("name")?, version).await.map(|_| ())
+        }
+        "roll-engine" => {
+            let directory = directory(arguments.required("directory")?).await?;
+            for member in admin::roll_engine(directory.as_ref(), arguments.required("version")?).await? { println!("{member}"); }
+            Ok(())
         }
         "read-width" => {
             let directory = directory(arguments.required("directory")?).await?;
@@ -531,10 +600,27 @@ async fn run(arguments: Vec<String>) -> Result<()> {
         "delete" => {
             let directory = directory(arguments.required("directory")?).await?;
             let storage = CellStorage::parse(arguments.required("storage-root")?)?;
-            let id = installation_id(&arguments)?;
             let keys = key_service(arguments.required("keys")?).await?;
-            let deletion = admin::delete_deployment(directory.as_ref(), &storage, keys.as_ref(), &id.to_string(), 4 << 20).await?;
+            let deletion = match (arguments.optional("name"), arguments.optional("id")) {
+                (Some(name), None) => serde_json::to_value(admin::delete_deployment(directory.as_ref(), &storage, keys.as_ref(), name, 4 << 20).await?),
+                (None, Some(_)) => {
+                    let id = installation_id(&arguments)?;
+                    serde_json::to_value(admin::delete_installation(directory.as_ref(), &storage, keys.as_ref(), &id.to_string(), 4 << 20).await?)
+                }
+                _ => return Err(usage("delete requires exactly one of --name or --id".into())),
+            }.expect("a deletion receipt serializes");
             println!("{}", serde_json::to_string_pretty(&deletion).expect("a record serializes"));
+            Ok(())
+        }
+        "deletion-key" => {
+            println!("{}", key_service(arguments.required("keys")?).await?.deletion_verification_key().await?);
+            Ok(())
+        }
+        "verify-deletion" => {
+            let contents = std::fs::read(arguments.required("record")?).map_err(io)?;
+            let receipt = serde_json::from_slice(&contents).map_err(|error| usage(format!("Invalid deletion receipt: {error}")))?;
+            rtdb_multi::keys::verify_deletion(&receipt, arguments.required("public-key")?)?;
+            println!("Deletion receipt signature verified");
             Ok(())
         }
         "disposal" => {
@@ -576,9 +662,22 @@ async fn run(arguments: Vec<String>) -> Result<()> {
             let storage = CellStorage::parse(arguments.required("storage-root")?)?;
             let archive = CellStorage::parse(arguments.required("archive-root")?)?;
             let keys = key_service(arguments.required("keys")?).await?;
+            let id = installation_id(&arguments)?;
+            let operation = required_uuid(&arguments, "operation")?;
+            let task = hosted_task(&arguments)?;
+            let flushed = if task.is_some() {
+                let original = directory.deployment(&id.to_string()).await?
+                    .ok_or_else(|| usage("The capture's installation is unavailable".into()))?;
+                if original.checkpoint_captures.contains_key(&operation) {
+                    None
+                } else {
+                    Some(admin::flush_checkpoint(directory.as_ref(), &original,
+                        &rtdb_multi::control::ControlKey(cell_secret(&arguments)?)).await?)
+                }
+            } else { None };
             let capture = rtdb_multi::archive::capture(
                 directory, &storage, &archive, keys.as_ref(),
-                installation_id(&arguments)?, required_uuid(&arguments, "operation")?, hosted_task(&arguments)?,
+                id, operation, task, flushed.as_ref(),
             ).await?;
             println!("{}", serde_json::to_string_pretty(&capture).expect("a capture serializes"));
             Ok(())
@@ -656,15 +755,59 @@ async fn run(arguments: Vec<String>) -> Result<()> {
         }
         "status" => {
             let directory = directory(arguments.required("directory")?).await?;
-            let status = admin::cell_status(directory.as_ref(), arguments.number("target-per-node", 1000usize)?).await?;
-            println!("{}", serde_json::to_string_pretty(&status).expect("a status serializes"));
+            let target = arguments.number("target-per-node", 1000usize)?;
+            let json = if arguments.present("placements-only") {
+                serde_json::to_string_pretty(&admin::placement_status(directory.as_ref(), target).await?)
+            } else {
+                serde_json::to_string_pretty(&admin::cell_status(directory.as_ref(), target).await?)
+            };
+            println!("{}", json.expect("a status serializes"));
             Ok(())
         }
         "audit" => {
             let directory = directory(arguments.required("directory")?).await?;
             let report = admin::audit(directory.as_ref(), key_service(arguments.required("keys")?).await?.as_ref(), arguments.required("name")?, 4 << 20).await?;
             println!("{}", serde_json::to_string_pretty(&report).expect("a report serializes"));
-            if report.violations.is_empty() { Ok(()) } else { Err(Anomaly::fault("rtdb.multi/audit", format!("{} violations", report.violations.len()))) }
+            if !report.violations.is_empty() { return Err(Anomaly::fault("rtdb.multi/audit", format!("{} violations", report.violations.len()))); }
+            if arguments.present("require-quorum") && report.replica_digests.len() < report.required_replica_quorum {
+                return Err(Anomaly::new(rtdb_types::AnomalyCategory::Unavailable, "rtdb.multi/audit-quorum", "A write quorum could not verify a common committed interval"));
+            }
+            Ok(())
+        }
+        "audit-log" => {
+            #[derive(serde::Deserialize)]
+            struct PrefixReport { stream: String, interval: [i64; 2], digest: String }
+
+            let data = PathBuf::from(arguments.required("data")?);
+            let stream = arguments.required("stream")?.to_owned();
+            let interval = match (arguments.present("from"), arguments.present("through")) {
+                (true, true) => Some([
+                    arguments.required("from")?.parse::<i64>().map_err(|_| usage("--from must be a log position".into()))?,
+                    arguments.required("through")?.parse::<i64>().map_err(|_| usage("--through must be a log position".into()))?,
+                ]),
+                (false, false) => None,
+                _ => return Err(usage("--from and --through must be supplied together".into())),
+            };
+            let prefix = if arguments.present("prefix-report") {
+                let file = std::fs::File::open(arguments.required("prefix-report")?).map_err(io)?;
+                let report: PrefixReport = serde_json::from_reader(file)
+                    .map_err(|error| usage(format!("Invalid journal prefix report: {error}")))?;
+                Some(rtdb_logkeeper::JournalDigest { stream: report.stream, interval: report.interval, digest: report.digest })
+            } else {
+                None
+            };
+            let journal_stream = stream.clone();
+            let proof = tokio::task::spawn_blocking(move || rtdb_logkeeper::inspect_retained_with_prefix(&data, &journal_stream, interval, prefix.as_ref())).await
+                .map_err(|error| Anomaly::fault("rtdb.multi/audit-log", error.to_string()))??;
+            println!("{}", serde_json::json!({"stream": stream, "interval": proof.as_ref().map(|proof| proof.interval),
+                "digest": proof.as_ref().map(|proof| &proof.digest)}));
+            if arguments.present("expect") {
+                let expected = arguments.required("expect")?;
+                if proof.is_none_or(|proof| proof.digest != expected) {
+                    return Err(Anomaly::fault("rtdb.multi/audit-log", "The retained journal digest differs from the expected value"));
+                }
+            }
+            Ok(())
         }
         "drain" => {
             let directory = directory(arguments.required("directory")?).await?;
@@ -722,8 +865,33 @@ async fn dynamo_keys(_: &str) -> Result<Arc<dyn rtdb_multi::keys::KeyService>> {
     Err(Anomaly::unsupported("rtdb.multi/dynamodb", "This binary was built without the dynamodb feature"))
 }
 
+async fn cell_map(spec: &str) -> Result<Arc<dyn CellMap>> {
+    if let Some(prefix) = spec.strip_prefix("dynamodb:") { return dynamo_cell_map(prefix).await; }
+    Ok(RemoteCellMap::new(spec))
+}
+
+#[cfg(feature = "dynamodb")]
+async fn dynamo_cell_map(prefix: &str) -> Result<Arc<dyn CellMap>> {
+    use rtdb_multi::cells::DynamoCellMap;
+    let map = match std::env::var("RTDB_DYNAMODB_ENDPOINT") {
+        Ok(endpoint) => {
+            let map = DynamoCellMap::new(rtdb_directory::DynamoDirectory::local_client(&endpoint), prefix);
+            map.create_tables().await?;
+            map
+        }
+        Err(_) => DynamoCellMap::new(aws_sdk_dynamodb::Client::new(&aws_config::load_from_env().await), prefix),
+    };
+    Ok(Arc::new(map))
+}
+
+#[cfg(not(feature = "dynamodb"))]
+async fn dynamo_cell_map(_: &str) -> Result<Arc<dyn CellMap>> {
+    Err(Anomaly::unsupported("rtdb.multi/dynamodb", "This binary was built without the dynamodb feature"))
+}
+
 async fn directory(spec: &str) -> Result<Arc<dyn Directory>> {
-    if let Some(prefix) = spec.strip_prefix("dynamodb:") { return dynamodb(prefix).await; }
+    if let Some(prefix) = spec.strip_prefix("dynamodb:") { return dynamodb(prefix, false).await; }
+    if let Some(prefix) = spec.strip_prefix("dynamodb+packed:") { return dynamodb(prefix, true).await; }
     let mut attempts = 0;
     loop {
         match RemoteDirectory::connect(spec).await {
@@ -735,7 +903,7 @@ async fn directory(spec: &str) -> Result<Arc<dyn Directory>> {
 }
 
 #[cfg(feature = "dynamodb")]
-async fn dynamodb(prefix: &str) -> Result<Arc<dyn Directory>> {
+async fn dynamodb(prefix: &str, pack_parked: bool) -> Result<Arc<dyn Directory>> {
     let tables = rtdb_directory::DynamoTables::with_prefix(prefix);
     let directory = match std::env::var("RTDB_DYNAMODB_ENDPOINT") {
         Ok(endpoint) => {
@@ -747,11 +915,12 @@ async fn dynamodb(prefix: &str) -> Result<Arc<dyn Directory>> {
             &aws_config::load_defaults(aws_config::BehaviorVersion::latest()).await, tables,
         ),
     };
+    let directory = if pack_parked { directory.with_packed_parked_records() } else { directory };
     Ok(Arc::new(directory))
 }
 
 #[cfg(not(feature = "dynamodb"))]
-async fn dynamodb(_: &str) -> Result<Arc<dyn Directory>> {
+async fn dynamodb(_: &str, _: bool) -> Result<Arc<dyn Directory>> {
     Err(Anomaly::unsupported("rtdb.multi/dynamodb", "This binary was built without the dynamodb feature"))
 }
 

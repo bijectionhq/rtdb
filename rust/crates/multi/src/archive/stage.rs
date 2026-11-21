@@ -49,16 +49,18 @@ pub(crate) async fn discard_checkpoint_stage(
                 .ok_or_else(|| inconsistent("Discard requires the exact original capture"))?;
             let mut tombstone =
                 installation_record(request.destination, &request.name, &request.org)?;
+            let bucket = storage.bucket(IoRegion::new()).await?;
+            tombstone.storage_namespaces = Some(crate::deployment::storage_namespaces(bucket.as_ref(), keys).await?);
             tombstone.lifecycle = Lifecycle::Deleting;
             tombstone.epoch = 1;
-            tombstone.checkpoint_stage = Some(CheckpointStage {
+            tombstone.checkpoint_stage = Some(Box::new(CheckpointStage {
                 intent: request.clone(),
                 source_incarnation: point.incarnation,
                 source_log_epoch: point.log_epoch,
                 checkpoint: point.checkpoint,
                 media: media.clone(),
                 staged_manifest_sha256: None,
-            });
+            }));
             match directory.create_deployment(tombstone).await {
                 Ok(accepted) => accepted,
                 Err(error) => directory.deployment(&id).await?.ok_or(error)?,
@@ -84,7 +86,7 @@ pub(crate) async fn discard_checkpoint_stage(
         Lifecycle::Deleting => Ok(None),
         Lifecycle::Deleted => record
             .disposal
-            .map(Some)
+            .map(|receipt| Some(*receipt))
             .ok_or_else(|| inconsistent("The stage tombstone has no physical disposal receipt")),
         _ => Err(inconsistent("Discard requires a held checkpoint stage")),
     }
@@ -139,8 +141,11 @@ pub async fn stage_checkpoint(
         media,
         staged_manifest_sha256: None,
     };
+    let bucket = storage.bucket(IoRegion::new()).await?;
+    let namespaces = crate::deployment::storage_namespaces(bucket.as_ref(), keys).await?;
+    target.storage_namespaces = Some(namespaces);
     target.lifecycle = Lifecycle::Restoring;
-    target.checkpoint_stage = Some(intent.clone());
+    target.checkpoint_stage = Some(Box::new(intent.clone()));
     let retained = match directory.deployment(&target_id).await? {
         Some(record) => record,
         None => match directory.create_deployment(target).await {
@@ -151,8 +156,9 @@ pub async fn stage_checkpoint(
     if let Some(complete) = staged(&retained, &intent.intent, &intent.media)? {
         return Ok(complete);
     }
+    crate::deployment::require_storage_namespaces(&retained, namespaces)?;
     if retained.lifecycle != Lifecycle::Restoring
-        || retained.checkpoint_stage.as_ref() != Some(&intent)
+        || retained.checkpoint_stage.as_deref() != Some(&intent)
     {
         return Err(inconsistent(
             "The target does not hold this checkpoint stage",
@@ -194,7 +200,7 @@ pub async fn stage_checkpoint(
                     Some((Arc::clone(directory), intent.intent.operation)),
                     |current| {
                         if current.lifecycle != Lifecycle::Restoring
-                            || current.checkpoint_stage.as_ref() != Some(intent)
+                            || current.checkpoint_stage.as_deref() != Some(intent)
                         {
                             return Err(inconsistent(
                                 "The target no longer admits this checkpoint stage",
@@ -225,7 +231,7 @@ pub async fn stage_checkpoint(
         }
         if current.lifecycle != Lifecycle::Restoring
             || !current.storage_regions.is_empty()
-            || current.checkpoint_stage.as_ref() != Some(&intent)
+            || current.checkpoint_stage.as_deref() != Some(&intent)
         {
             return Err(unavailable(
                 "The staging target changed or still has open storage admissions",
@@ -250,7 +256,7 @@ fn staged(
 ) -> Result<Option<CheckpointStage>> {
     let retained = record
         .checkpoint_stage
-        .as_ref()
+        .as_deref()
         .filter(|stage| {
             &stage.intent == request
                 && &stage.media == media
@@ -359,7 +365,7 @@ async fn copy_checkpoint(
         storage.bucket(target_io).await?,
         format!("{}/{}", target.storage_prefix(), checkpoint_storage_root()?),
     );
-    crate::store::confirm_root(&destination, &target.id, true).await?;
+    crate::store::check_root(&destination, &target.id, true).await?;
     let mut objects = Vec::with_capacity(capture.objects.len());
     let manifest_name = key(STAGED_MANIFEST)?;
     let mut expected = BTreeSet::from([key(ROOT_MARKER)?, manifest_name.clone()]);

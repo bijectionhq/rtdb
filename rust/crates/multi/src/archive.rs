@@ -47,6 +47,7 @@ use rtdb_types::{
     Anomaly,
     AnomalyCategory,
     BlockIndex,
+    ReplicaPosition,
     Result,
     StorageEpoch,
 };
@@ -197,6 +198,7 @@ impl ArchivedCheckpoint {
             wall_clock(),
         )
         .await?;
+        let mut roots = Vec::new();
         for (name, object) in &self.objects {
             let plaintext = self.read_plaintext(name, object).await?;
             match serving.get(name).await {
@@ -206,7 +208,15 @@ impl ArchivedCheckpoint {
                 Err(error) => return Err(error.into()),
             }
             let ciphertext = self.serving_cipher.seal_deterministic(name.as_str(), &plaintext)?;
-            physical.put(name, ciphertext).await?;
+            if name.as_str().starts_with("blocks/") && rtdb_format::keys::block_index_from_key(name.as_str()).is_ok() {
+                roots.push((name, ciphertext));
+            } else {
+                physical.put(name, ciphertext).await?;
+            }
+        }
+        // The move validates the packed root after its required objects are present.
+        for (name, ciphertext) in roots {
+            serving.put(name, ciphertext).await?;
         }
         Ok(())
     }
@@ -622,6 +632,7 @@ pub async fn capture(
     deployment: Uuid,
     operation: Uuid,
     hosted_task: Option<rtdb_directory::HostedTask>,
+    flushed: Option<&DeploymentRecord>,
 ) -> Result<Capture> {
     if deployment.is_nil() || operation.is_nil() || same_storage(storage, destination) {
         return Err(inconsistent(
@@ -655,6 +666,15 @@ pub async fn capture(
                 return Err(inconsistent("The capture operation already names another archive or lifetime"));
             }
         } else {
+            if let Some(flushed) = flushed
+                && (record.id != flushed.id || record.incarnation != flushed.incarnation
+                    || record.log_epoch != flushed.log_epoch
+                    || !record.checkpoint.zip(flushed.checkpoint).is_some_and(|(current, cut)| {
+                        current.block >= cut.block && current.source >= cut.source
+                    }))
+            {
+                return Err(inconsistent("The capture no longer reaches its flushed source cut"));
+            }
             if record.checkpoint_repair_receipts.contains_key(&operation) {
                 return Err(inconsistent("The capture operation has a repair in another residence"));
             }
@@ -884,7 +904,11 @@ pub(crate) async fn restore_checkpoint(
         .await?
         .ok_or_else(|| unavailable("The selected installation is unavailable"))?;
     let read_receipt = |record: &DeploymentRecord| -> Result<Option<CheckpointRecovery>> {
-        let Some(recovery) = record.checkpoint_repair_receipts.get(&operation) else {
+        let Some(recovery) = record.checkpoint_repair_receipts.get(&operation).or_else(|| {
+            record.checkpoint_recovery.as_deref().filter(|recovery| {
+                recovery.operation == operation && recovery.completed_at_ms.is_some()
+            })
+        }) else {
             return Ok(None);
         };
         if recovery.operation != operation || recovery.archive != archive_binding
@@ -944,7 +968,7 @@ pub(crate) async fn restore_checkpoint(
             .epoch
             .checked_add(1)
             .ok_or_else(|| inconsistent("No writer epochs remain"))?;
-        record.checkpoint_recovery = Some(CheckpointRecovery {
+        record.checkpoint_recovery = Some(Box::new(CheckpointRecovery {
             operation,
             checkpoint: point.checkpoint,
             epoch,
@@ -952,7 +976,7 @@ pub(crate) async fn restore_checkpoint(
             archive: archive_binding.clone(),
             manifest_sha256: manifest_sha256.clone(),
             completed_at_ms: None,
-        });
+        }));
         record.lifecycle = Lifecycle::Restoring;
         record.epoch = epoch;
         record.holder = None;
@@ -965,7 +989,7 @@ pub(crate) async fn restore_checkpoint(
     }
     let pending = fenced
         .checkpoint_recovery
-        .as_ref()
+        .as_deref()
         .filter(|recovery| {
             recovery.operation == operation && recovery.archive == archive_binding
                 && recovery.manifest_sha256 == manifest_sha256 && recovery.epoch == fenced.epoch
@@ -974,7 +998,11 @@ pub(crate) async fn restore_checkpoint(
         .ok_or_else(|| inconsistent("Missing the accepted checkpoint restore"))?;
     await_storage_drain(directory, storage, keys, &fenced).await?;
     let source = administration_stream(directory, &fenced, maximum_message_bytes).await?;
-    rtdb_logkeeper::seal(&source, pending.epoch).await?;
+    let sealed = rtdb_logkeeper::seal(&source, pending.epoch).await?;
+    let cutoff = ReplicaPosition::from_epoch_offset(StorageEpoch(fenced.log_epoch), sealed.0)?;
+    if cutoff.0 < pending.checkpoint.boundary {
+        return Err(inconsistent("The sealed replica history ends before the archived checkpoint"));
+    }
 
     let completed = update_installation(directory, &id, |record| {
         if read_receipt(record)?.is_some() {
@@ -985,11 +1013,12 @@ pub(crate) async fn restore_checkpoint(
         }
         let recovery = record
             .checkpoint_recovery
-            .as_mut()
+            .as_deref_mut()
             .filter(|recovery| &**recovery == pending)
             .ok_or_else(|| inconsistent("Another checkpoint restore replaced this operation"))?;
         recovery.completed_at_ms = Some(rtdb_directory::now_ms());
         record.lifecycle = recovery.previous_lifecycle;
+        record.compaction_replay_cutoff = Some(cutoff.0);
         record.checkpoint_repair_receipts.insert(operation, recovery.clone());
         Ok(())
     })
@@ -1288,7 +1317,7 @@ mod tests {
             CellStorage::parse("s3://archive-fixture/histories/example?region=us-east-1")?;
         record.epoch = 4;
         record.lifecycle = Lifecycle::Deleted;
-        record.disposal = Some(DisposalReceipt {
+        record.disposal = Some(Box::new(DisposalReceipt {
             deployment: record.id.clone(),
             incarnation: record.incarnation,
             epoch: record.epoch,
@@ -1297,7 +1326,7 @@ mod tests {
             key_withdrawn_at_ms: 1,
             serving_prefix_observed_empty_at_ms: 1,
             serving_inventory: rtdb_directory::ServingInventory::S3VersionsAndUploads,
-        });
+        }));
         record.checkpoint_captures.insert(
             operation,
             CheckpointCapture {

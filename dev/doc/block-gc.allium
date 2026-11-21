@@ -112,6 +112,7 @@ rule LeaderOpensBlockGc {
 rule LeaderClosesBlockGc {
     -- Cancels the GC loop. In-flight DELETEs are cancelled; pending awaiters
     -- have their deferreds cancelled.
+    -- A cycle closed with its term reports cancellation to its waiters.
     -- See: indexer/LeaderLogProcessor.kt (close), BlockGarbageCollector.close
     when: lp: db/LogProcessor.mode transitions_to Follower
     requires: block_gc.is_running

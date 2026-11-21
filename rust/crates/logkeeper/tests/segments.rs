@@ -1,7 +1,7 @@
 mod common;
 
 use common::{Server, append};
-use rtdb_logkeeper::{ServerOptions, StreamConfig, open_reader, open_writer, retire, seal, trim};
+use rtdb_logkeeper::{ServerOptions, StreamConfig, drop_stream, open_reader, open_writer, retire, seal, trim};
 use rtdb_storage::Error;
 use rtdb_storage::log::{Log, LogOffset};
 use rtdb_types::AnomalyCategory;
@@ -10,7 +10,13 @@ use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 
 fn segments(data_dir: &Path) -> (usize, u64) {
-    let files: Vec<_> = std::fs::read_dir(data_dir.join("segments")).unwrap().map(|entry| entry.unwrap().metadata().unwrap().len()).collect();
+    let files: Vec<_> = std::fs::read_dir(data_dir.join("segments")).unwrap().filter_map(|entry| {
+        match entry.unwrap().metadata() {
+            Ok(metadata) => Some(metadata.len()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) => panic!("{error}"),
+        }
+    }).collect();
     (files.len(), files.iter().sum())
 }
 
@@ -66,6 +72,38 @@ async fn a_server_caching_almost_nothing_serves_every_entry_from_its_segments_ac
     share_compact_and_replay(4 * 1024).await;
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn compaction_reclaims_dropped_payloads_and_keeps_the_terminal_record() {
+    let directory = tempfile::tempdir().unwrap();
+    let server = start(directory.path(), 4 * 1024).await;
+    let dropped = config(&server, 1);
+    let writer = open_writer(dropped.clone(), 1, CancellationToken::new()).await.unwrap();
+    let other = open_writer(config(&server, 2), 1, CancellationToken::new()).await.unwrap();
+    let payload = "x".repeat(40 * 1024);
+    for position in 0..40 { append(writer.as_ref(), &payload, position).await; }
+    append(other.as_ref(), "live neighbor", 40).await;
+    drop((writer, other));
+
+    let before = segments(directory.path()).1;
+    drop_stream(&dropped, 2).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let (count, bytes) = segments(directory.path());
+            if count == 1 && bytes < before / 2 { return; }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }).await.expect("the shared journal reclaims the dropped stream's payloads");
+    server.stop().await;
+
+    let server = start(directory.path(), 4 * 1024).await;
+    let dropped = config(&server, 1);
+    assert!(open_reader(dropped.clone(), CancellationToken::new()).await.is_err());
+    assert!(open_writer(dropped, 3, CancellationToken::new()).await.is_err());
+    let other = open_reader(config(&server, 2), CancellationToken::new()).await.unwrap();
+    assert_eq!(payloads(other.as_ref(), 0).await, ["live neighbor"]);
+    server.stop().await;
+}
+
 async fn share_compact_and_replay(cache_bytes: usize) {
     let directory = tempfile::tempdir().unwrap();
     let server = start(directory.path(), cache_bytes).await;
@@ -87,6 +125,13 @@ async fn share_compact_and_replay(cache_bytes: usize) {
     let before = segments(directory.path()).1;
     trim(&config(&server, 0), LogOffset(40)).await.unwrap();
     append(writers[0].as_ref(), "after the trim", 43).await;
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let reader = open_reader(config(&server, 0), CancellationToken::new()).await.unwrap();
+            if reader.latest().unwrap() == LogOffset(43) { break; }
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+    }).await.expect("the reader can see the appended entry before the journal stops");
     let mut compacted = segments(directory.path());
     for _ in 0..100 {
         if compacted.1 < before / 2 { break; }
@@ -105,7 +150,8 @@ async fn share_compact_and_replay(cache_bytes: usize) {
     let reader = open_reader(config(&server, 0), CancellationToken::new()).await.unwrap();
     assert!(matches!(reader.read_range(LogOffset(0), LogOffset(44)).await, Err(Error::UnavailableLogRange { requested: 0, first_retained: 41 })));
     let tail = payloads(reader.as_ref(), 41).await;
-    assert_eq!((tail.len(), tail[2].as_str()), (3, "after the trim"));
+    assert_eq!(tail.len(), 3);
+    assert_eq!(tail[2], "after the trim");
     assert_eq!(seal(&config(&server, 7), 1).await.unwrap_err().category, AnomalyCategory::Conflict, "promises survive the restart");
     let writer = open_writer(config(&server, 0), 3, CancellationToken::new()).await.unwrap();
     assert_eq!(append(writer.as_ref(), "next", 44).await.offset, LogOffset(44));

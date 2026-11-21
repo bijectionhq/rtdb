@@ -80,13 +80,17 @@ pub struct MemberRecord {
     pub engine_version: String,
     pub lease_expires_at_ms: i64,
     pub state: MemberState,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub drain_target_engine: Option<String>,
     /// Which nodes may hold what: a quarantined deployment is placed only on the isolation pool.
     #[serde(default)]
     pub pool: MemberPool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub storage_namespaces: Option<StorageNamespaces>,
     pub version: Version,
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Default, Hash, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum MemberPool {
     #[default]
@@ -125,6 +129,96 @@ pub enum Lifecycle {
     Deleted,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PlacementMove {
+    pub request: uuid::Uuid,
+    pub target: MemberId,
+    pub expires_at_ms: i64,
+}
+
+/// A cross-cell move owned by the source record until cutover is complete.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CellMove {
+    pub destination: String,
+    pub namespaces: MoveNamespaces,
+    pub phase: CellMovePhase,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MoveNamespaces {
+    pub source_objects: uuid::Uuid,
+    pub destination_objects: uuid::Uuid,
+    pub source_keys: [u8; 32],
+    pub destination_keys: [u8; 32],
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum CellMovePhase {
+    Preparing { generation: uuid::Uuid },
+    Ready { generation: uuid::Uuid, previous_ensemble: Vec<String>, ensemble: Vec<MemberId> },
+}
+
+impl CellMovePhase {
+    pub fn generation(&self) -> uuid::Uuid {
+        match self {
+            Self::Preparing { generation } | Self::Ready { generation, .. } => *generation,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SourceCleanup {
+    ObjectsErased,
+    ObjectsAndKeyErased,
+}
+
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StorageNamespaces {
+    pub objects: uuid::Uuid,
+    pub keys: [u8; 32],
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DeletionInventory {
+    CurrentObjects,
+    AllVersions,
+    AllVersionsAndMultipartUploads,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DeletionObservation {
+    Fenced { leases_expire_at_ms: i64 },
+    Empty { observed_at_ms: i64 },
+    Verified { first_empty_at_ms: i64, last_empty_at_ms: i64 },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DeletionFacts {
+    pub deployment: String,
+    pub name: String,
+    pub epoch: u64,
+    pub storage_prefix: String,
+    pub namespaces: StorageNamespaces,
+    pub inventory: DeletionInventory,
+    pub key_destroyed_at_ms: i64,
+    pub objects_erased_at_ms: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub first_empty_observed_at_ms: Option<i64>,
+    pub verified_empty: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DeletionRecord {
+    pub facts: DeletionFacts,
+    pub signature: String,
+}
+
 /// One deployment, as the directory records it.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DeploymentRecord {
@@ -146,17 +240,21 @@ pub struct DeploymentRecord {
     pub ensemble: Vec<MemberId>,
     /// Every journal endpoint authorized to receive this installation's
     /// replica stream, retained before a new ensemble receives a copy.
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
     pub replica_journals: BTreeSet<String>,
     /// Serving and archival storage admissions, retained until the owner
     /// drains its I/O and any ambiguous publications are confirmed.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub storage_regions: BTreeMap<uuid::Uuid, StorageRegion>,
     /// How many ranks of the affinity order may serve reads.
     pub read_width: u32,
     pub activation_crashes: u32,
     pub created_at_ms: i64,
-    /// A planned move in progress: only this member may claim the deployment until it does.
+    /// Kept with its original wire type for readers that predate expiring placements.
     #[serde(default)]
     pub move_intent: Option<MemberId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub placement_move: Option<PlacementMove>,
     /// The namespace of the deployment's log positions; bumped when it starts again on fresh logs over existing objects, as a fork does.
     #[serde(default)]
     pub log_epoch: i32,
@@ -166,27 +264,59 @@ pub struct DeploymentRecord {
     /// Source logkeepers still needed to stage the replica tail before a cell transfer can activate.
     #[serde(default)]
     pub move_from: Option<Vec<String>>,
+    /// Endpoints a stream copy may have reached, including incomplete transfers and retired ensembles.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub log_copy_servers: Vec<String>,
     /// Whether its holder confirms its leadership with the logkeepers before serving each query.
     #[serde(default)]
     pub linearizable_reads: bool,
     /// The deployment's last published block, from which a cold start finds its latest without listing storage.
     #[serde(default)]
     pub checkpoint: Option<Checkpoint>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub replica_anchor: Option<Box<JournalAnchor>>,
     /// When a deployment that moved to another cell left this one: the tombstone's objects here are erased once the reaper's grace has passed since.
     #[serde(default)]
     pub moved_at_ms: Option<i64>,
-    pub cell_transfer: Option<CellTransfer>,
-    pub disposal: Option<DisposalReceipt>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_cleanup: Option<SourceCleanup>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cell_move: Option<Box<CellMove>>,
+    /// Each attempted copy uses a different prefix, so a superseded copier can never modify a live destination.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub storage_generation: Option<uuid::Uuid>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub storage_namespaces: Option<StorageNamespaces>,
+    /// The last time a previously issued S3 write session may still be usable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub s3_write_lease_until_ms: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deletion_observation: Option<DeletionObservation>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub engine_pin: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deletion_record: Option<Box<DeletionRecord>>,
+    pub cell_transfer: Option<Box<CellTransfer>>,
+    pub disposal: Option<Box<DisposalReceipt>>,
     /// Serving and archive receipts for earlier stays in this same cell.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub retired_residences: BTreeMap<u64, RetiredResidence>,
-    pub checkpoint_recovery: Option<CheckpointRecovery>,
+    pub checkpoint_recovery: Option<Box<CheckpointRecovery>>,
+    /// Replay retains logical transactions through this position, but the restored checkpoint
+    /// replaces the former serving storage and its compaction effects through the same position.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compaction_replay_cutoff: Option<i64>,
     /// A historical checkpoint staged under this fresh, held installation.
-    pub checkpoint_stage: Option<CheckpointStage>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub checkpoint_stage: Option<Box<CheckpointStage>>,
     /// Terminal same-history repair receipts survive later repairs and moves.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub checkpoint_repair_receipts: BTreeMap<uuid::Uuid, CheckpointRecovery>,
     /// Every independent archive admitted before a checkpoint copy started.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub checkpoint_captures: BTreeMap<uuid::Uuid, CheckpointCapture>,
     /// Closed capture IDs cannot admit new copies, readers or archive keys.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub checkpoint_capture_retirements: BTreeMap<uuid::Uuid, CheckpointCaptureRetirement>,
     pub archive_retirement: Option<ArchiveRetirement>,
     pub version: Version,
@@ -368,6 +498,14 @@ pub struct Checkpoint {
     pub system_time: i64,
 }
 
+/// The digest of an inclusive replica interval, rooted in its first physical residence.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct JournalAnchor {
+    pub root_incarnation: u64,
+    pub interval: [i64; 2],
+    pub digest: [u8; 32],
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CheckpointStageIntent {
@@ -407,13 +545,41 @@ impl DeploymentRecord {
     pub fn new(name: impl Into<String>, org: impl Into<String>, ensemble: Vec<MemberId>, now_ms: i64) -> Self {
         let id = uuid::Uuid::new_v4().to_string();
         Self { lineage: id.clone(), id, name: name.into(), org: org.into(), incarnation: 1, lifecycle: Lifecycle::Live, epoch: 0, holder: None,
-            ensemble, replica_journals: BTreeSet::new(), storage_regions: BTreeMap::new(), read_width: 1, activation_crashes: 0, created_at_ms: now_ms, move_intent: None, log_epoch: 0, parent: None, move_from: None, linearizable_reads: false, checkpoint: None, moved_at_ms: None, cell_transfer: None, disposal: None, retired_residences: BTreeMap::new(), checkpoint_recovery: None, checkpoint_stage: None, checkpoint_repair_receipts: BTreeMap::new(), checkpoint_captures: BTreeMap::new(), checkpoint_capture_retirements: BTreeMap::new(), archive_retirement: None, version: 0 }
+            ensemble, replica_journals: BTreeSet::new(), storage_regions: BTreeMap::new(), read_width: 1, activation_crashes: 0, created_at_ms: now_ms, move_intent: None, placement_move: None, log_epoch: 0, parent: None, move_from: None, log_copy_servers: Vec::new(), linearizable_reads: false, checkpoint: None, replica_anchor: None, moved_at_ms: None, source_cleanup: None, cell_move: None, storage_generation: None, storage_namespaces: None, deletion_record: None, s3_write_lease_until_ms: None, engine_pin: None, deletion_observation: None,
+            cell_transfer: None, disposal: None, retired_residences: BTreeMap::new(), checkpoint_recovery: None, compaction_replay_cutoff: None, checkpoint_stage: None, checkpoint_repair_receipts: BTreeMap::new(),
+            checkpoint_captures: BTreeMap::new(), checkpoint_capture_retirements: BTreeMap::new(), archive_retirement: None, version: 0 }
+    }
+
+    pub fn writer_pool(&self) -> Option<MemberPool> {
+        match self.lifecycle {
+            Lifecycle::Live => Some(MemberPool::General),
+            Lifecycle::Quarantined => Some(MemberPool::Isolation),
+            _ => None,
+        }
     }
 
     pub fn can_fork(&self) -> bool {
-        matches!(self.lifecycle, Lifecycle::Live | Lifecycle::Quarantined)
-            && self.move_from.is_none()
-            && self.checkpoint_recovery.is_none()
+        self.writer_pool().is_some() && self.move_from.is_none() && self.checkpoint_recovery.is_none()
+    }
+
+    pub fn permits_engine(&self, member: &MemberRecord) -> bool {
+        self.engine_pin.as_deref().is_none_or(|pin| member.engine_version == pin)
+    }
+
+    pub fn may_hold_on(&self, member: &MemberRecord, now_ms: i64) -> bool {
+        self.writer_pool() == Some(member.pool) && self.permits_engine(member) && member.may_hold(now_ms)
+    }
+
+    pub fn may_place_on(&self, member: &MemberRecord, now_ms: i64) -> bool {
+        self.writer_pool() == Some(member.pool) && self.permits_engine(member) && member.may_receive_placements(now_ms)
+    }
+
+    pub fn active_move(&self, now_ms: i64) -> Option<&PlacementMove> {
+        self.placement_move.as_ref().filter(|reservation| reservation.expires_at_ms > now_ms)
+    }
+
+    pub fn active_s3_write_lease(&self, now_ms: i64) -> Option<i64> {
+        self.s3_write_lease_until_ms.filter(|deadline| *deadline > now_ms)
     }
 
     /// The affinity key of a residence, stable across writer epochs.
@@ -422,7 +588,11 @@ impl DeploymentRecord {
     /// The only prefix this deployment's objects may live under.
     /// The leading hash spreads deployments over the object store's request partitions.
     pub fn storage_prefix(&self) -> String {
-        format!("{:04x}/{}/{}/{}/{}", fnv16(self.id.as_bytes()), self.org, self.lineage, self.id, self.incarnation)
+        let store = self.storage_generation.map_or_else(
+            || self.incarnation.to_string(),
+            |generation| format!("{}-{}", self.incarnation, generation.simple()),
+        );
+        format!("{:04x}/{}/{}/{}/{store}", fnv16(self.id.as_bytes()), self.org, self.lineage, self.id)
     }
 
     /// The key custody record for one residence. Withdrawing an old
@@ -430,6 +600,8 @@ impl DeploymentRecord {
     pub fn key_id(&self) -> String {
         if self.checkpoint_stage.is_some() {
             format!("stage-{}-{}", self.id, self.incarnation)
+        } else if self.incarnation == 1 {
+            self.id.clone()
         } else {
             format!("{}-{}", self.id, self.incarnation)
         }
@@ -440,7 +612,7 @@ impl DeploymentRecord {
 
     /// The ciphertext binds to the logical deployment. A transfer copies
     /// the records into the destination journal at their original offsets.
-    pub fn replica_seal_scope(&self) -> String { format!("{}/replica", self.id) }
+    pub fn replica_seal_scope(&self) -> String { format!("{}/1/replica", self.id) }
 }
 
 /// FNV-1a folded to 16 bits, as Bijection's `tenant_prefix`.
@@ -467,7 +639,7 @@ impl<T> Cas<T> {
 pub trait Directory: Send + Sync {
     /// Stores a new deployment; refuses if its id or name is taken.
     async fn create_deployment(&self, record: DeploymentRecord) -> Result<DeploymentRecord>;
-    /// Publishes a fork and its name only while the expected parent is still eligible.
+    /// Creates the child and its name atomically with checking that its parent can still be forked at this version.
     async fn create_fork(&self, child: DeploymentRecord, expected_parent: Version) -> Result<DeploymentRecord>;
     async fn deployment(&self, id: &str) -> Result<Option<DeploymentRecord>>;
     async fn deployment_by_name(&self, name: &str) -> Result<Option<DeploymentRecord>>;
@@ -484,13 +656,15 @@ pub trait Directory: Send + Sync {
     async fn members(&self) -> Result<Vec<MemberRecord>>;
     async fn replace_member(&self, record: MemberRecord, expected: Version) -> Result<Cas<MemberRecord>>;
 
+    /// Starts the backend's shared feed on demand, when supported.
+    fn change_feed(&self) -> Option<&ChangeFeed> { None }
     /// A retained observation of the exact hosting task in terminal STOPPED.
     async fn hosted_task_stopped(&self, _task: &HostedTask) -> Result<bool> { Ok(false) }
 
     /// Every deployment record applied from now on, as the backend learns of it; `None` if this backend has no feed, and its watches poll.
     /// A receiver sees each record's versions in order, possibly late; it may miss some, and then sees `RecvError::Lagged` or a later version only.
     /// Called within a Tokio runtime, since a backend may start following its source on the first call.
-    fn deployment_changes(&self) -> Option<tokio::sync::broadcast::Receiver<DeploymentRecord>> { None }
+    fn deployment_changes(&self) -> Option<tokio::sync::broadcast::Receiver<DeploymentRecord>> { self.change_feed().map(ChangeFeed::subscribe) }
 }
 
 pub fn now_ms() -> i64 {
@@ -531,8 +705,10 @@ pub struct MemoryDirectory {
 #[derive(Default, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct MemoryState {
-    deployments: BTreeMap<String, DeploymentRecord>,
+    deployments: BTreeMap<String, Box<DeploymentRecord>>,
     names: BTreeMap<String, String>,
+    #[serde(skip)]
+    held: BTreeMap<MemberId, BTreeSet<String>>,
     members: BTreeMap<MemberId, MemberRecord>,
     #[serde(skip)]
     failed: bool,
@@ -547,7 +723,12 @@ impl MemoryDirectory {
 
     pub fn open(root: &Path) -> Result<Arc<Self>> {
         let file = state_file::StateFile::lock(root)?;
-        let state = file.load()?;
+        let mut state = file.load()?;
+        for deployment in state.deployments.values() {
+            if let Some(holder) = &deployment.holder {
+                state.held.entry(holder.clone()).or_default().insert(deployment.id.clone());
+            }
+        }
         Ok(Arc::new(Self { state: Mutex::new(state), changes: ChangeFeed::default(), file: Some(file) }))
     }
 
@@ -575,7 +756,10 @@ impl MemoryDirectory {
         if state.names.contains_key(&record.name) { return Err(exists("Deployment name", &record.name)); }
         record.version = 1;
         state.names.insert(record.name.clone(), record.id.clone());
-        state.deployments.insert(record.id.clone(), record.clone());
+        if let Some(holder) = &record.holder {
+            state.held.entry(holder.clone()).or_default().insert(record.id.clone());
+        }
+        state.deployments.insert(record.id.clone(), Box::new(record.clone()));
         self.persist(state)?;
         self.changes.publish(record.clone());
         Ok(record)
@@ -590,25 +774,38 @@ impl Directory for MemoryDirectory {
     }
     async fn create_fork(&self, child: DeploymentRecord, expected_parent: Version) -> Result<DeploymentRecord> {
         let mut state = self.state()?;
-        check_fork_parent(&child, state.deployments.get(fork_parent_id(&child)?), expected_parent)?;
+        check_fork_parent(&child, state.deployments.get(fork_parent_id(&child)?).map(Box::as_ref), expected_parent)?;
         self.insert_deployment(&mut state, child)
     }
-    async fn deployment(&self, id: &str) -> Result<Option<DeploymentRecord>> { Ok(self.state()?.deployments.get(id).cloned()) }
+    async fn deployment(&self, id: &str) -> Result<Option<DeploymentRecord>> { Ok(self.state()?.deployments.get(id).map(Box::as_ref).cloned()) }
     async fn deployment_by_name(&self, name: &str) -> Result<Option<DeploymentRecord>> {
         let state = self.state()?;
-        Ok(state.names.get(name).and_then(|id| state.deployments.get(id)).cloned())
+        Ok(state.names.get(name).and_then(|id| state.deployments.get(id)).map(Box::as_ref).cloned())
     }
-    async fn deployments(&self) -> Result<Vec<DeploymentRecord>> { Ok(self.state()?.deployments.values().cloned().collect()) }
+    async fn deployments(&self) -> Result<Vec<DeploymentRecord>> { Ok(self.state()?.deployments.values().map(Box::as_ref).cloned().collect()) }
     async fn deployments_held_by(&self, member: &MemberId) -> Result<Vec<DeploymentRecord>> {
-        Ok(self.state()?.deployments.values().filter(|record| record.holder.as_ref() == Some(member)).cloned().collect())
+        let state = self.state()?;
+        Ok(state.held.get(member).into_iter().flatten().map(|id| state.deployments[id].as_ref().clone()).collect())
     }
     async fn replace_deployment(&self, mut record: DeploymentRecord, expected: Version) -> Result<Cas<DeploymentRecord>> {
         let mut state = self.state()?;
-        let Some(current) = state.deployments.get(&record.id) else { return Ok(Cas::Conflict(None)); };
-        if current.version != expected { return Ok(Cas::Conflict(Some(current.clone()))); }
+        let MemoryState { deployments, held, .. } = &mut *state;
+        let Some(current) = deployments.get_mut(&record.id) else { return Ok(Cas::Conflict(None)); };
+        if current.version != expected { return Ok(Cas::Conflict(Some(current.as_ref().clone()))); }
         if current.name != record.name { return Err(Anomaly::incorrect("rtdb.directory/rename", "A deployment's name never changes")); }
+        if current.holder != record.holder {
+            if let Some(previous) = current.holder.clone()
+                && let Some(existing) = held.get_mut(&previous)
+            {
+                existing.remove(&record.id);
+                if existing.is_empty() { held.remove(&previous); }
+            }
+            if let Some(holder) = &record.holder {
+                held.entry(holder.clone()).or_default().insert(record.id.clone());
+            }
+        }
         record.version = expected + 1;
-        state.deployments.insert(record.id.clone(), record.clone());
+        **current = record.clone();
         self.persist(&mut state)?;
         self.changes.publish(record.clone());
         Ok(Cas::Applied(record))
@@ -632,7 +829,7 @@ impl Directory for MemoryDirectory {
         self.persist(&mut state)?;
         Ok(Cas::Applied(record))
     }
-    fn deployment_changes(&self) -> Option<tokio::sync::broadcast::Receiver<DeploymentRecord>> { Some(self.changes.subscribe()) }
+    fn change_feed(&self) -> Option<&ChangeFeed> { Some(&self.changes) }
 }
 
 pub mod contract;

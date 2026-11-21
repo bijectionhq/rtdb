@@ -178,7 +178,7 @@ impl World {
             self.slots[slot].generation += 1;
             let member = MemberId(format!("m{slot}.{generation}"));
             let record = MemberRecord { id: member.clone(), role: MemberRole::Node, address: String::new(), control_address: None, availability_zone: format!("az{slot}"),
-                engine_version: "0".into(), lease_expires_at_ms: self.now + LEASE, state: MemberState::Eligible, pool: MemberPool::General, version: 0 };
+                engine_version: "0".into(), lease_expires_at_ms: self.now + LEASE, state: MemberState::Eligible, drain_target_engine: None, pool: MemberPool::General, storage_namespaces: None, version: 0 };
             block_on(self.directory.register_member(record)).map_err(|error| error.to_string())?;
             let skew = self.rng.range(-CLOCK_SKEW, CLOCK_SKEW);
             self.slots[slot].process = Some(Process { id: self.next_process, member: member.clone(), writer: None, last_time: i64::MIN, skew });
@@ -533,5 +533,6 @@ fn describe_reply(body: &ResponseBody) -> String {
         ResponseBody::Sealed(sealed) => format!("sealed (promised {}, synced {}, trim {}, last {}, commit {})", sealed.promised, sealed.synced, sealed.trim_lsn, sealed.last_lsn, sealed.commit_lsn),
         ResponseBody::Entries(entries) => format!("entries {:?} (trim {}, last {})", entries.entries.iter().map(|entry| entry.lsn).collect::<Vec<_>>(), entries.trim_lsn, entries.last_lsn),
         ResponseBody::Failed(failed) => format!("failed: {}", failed.message),
+        ResponseBody::PageDigest(page) => format!("digest through {}", page.through_lsn),
     }
 }

@@ -48,6 +48,7 @@ pub async fn run(directory: &dyn Directory) {
     deleting.holder = None;
     deleting.epoch += 1;
     let deleting = directory.replace_deployment(deleting, applied.version).await.unwrap().applied().unwrap();
+    assert!(directory.deployments_held_by(&holder).await.unwrap().is_empty());
     let mut refused = DeploymentRecord::new(format!("{name}-refused"), &deleting.org, vec![], 0);
     refused.parent = Some(deleting.id.clone());
     refused.lineage = deleting.lineage.clone();
@@ -58,7 +59,7 @@ pub async fn run(directory: &dyn Directory) {
     }
 
     let member = MemberRecord { id: MemberId(format!("member-{suffix}")), role: MemberRole::Node, address: "127.0.0.1:1".into(), control_address: Some("127.0.0.1:2".into()),
-        availability_zone: "a".into(), engine_version: "0".into(), lease_expires_at_ms: 10, state: MemberState::Joining, pool: Default::default(), version: 0 };
+        availability_zone: "a".into(), engine_version: "0".into(), lease_expires_at_ms: 10, state: MemberState::Joining, drain_target_engine: None, pool: Default::default(), storage_namespaces: None, version: 0 };
     let registered = directory.register_member(member.clone()).await.unwrap();
     assert_eq!(registered.version, 1);
     assert!(directory.register_member(member).await.is_err(), "member ids are unique");
@@ -84,7 +85,7 @@ pub async fn concurrent_claims(directories: &[Arc<dyn Directory>], claimants: us
     let mut members = BTreeMap::new();
     for index in 0..claimants {
         let member = MemberRecord { id: MemberId(format!("claimant-{index}-{suffix}")), role: MemberRole::Node, address: String::new(), control_address: None,
-            availability_zone: "a".into(), engine_version: "0".into(), lease_expires_at_ms: lease, state: MemberState::Eligible, pool: Default::default(), version: 0 };
+            availability_zone: "a".into(), engine_version: "0".into(), lease_expires_at_ms: lease, state: MemberState::Eligible, drain_target_engine: None, pool: Default::default(), storage_namespaces: None, version: 0 };
         let registered = admin.register_member(member).await.expect("register claimant");
         members.insert(registered.id.clone(), registered);
     }

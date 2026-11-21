@@ -34,7 +34,8 @@ pub type Writers = Arc<parking_lot::Mutex<std::collections::HashMap<String, std:
 /// Records a completed ensemble move, as the holder that made it at `epoch`, before anything is appended on the new ensemble.
 #[async_trait]
 pub trait EnsembleRecorder: Send + Sync {
-    async fn record_journals(&self, deployment: &str, epoch: u64, servers: &[String]) -> Result<()>;
+    /// Records every endpoint a copy can touch before any bytes move.
+    async fn reserve_copy(&self, deployment: &str, epoch: u64, servers: &[String]) -> Result<()>;
     async fn record(&self, deployment: &str, epoch: u64, ensemble: Vec<rtdb_directory::MemberId>) -> Result<()>;
 }
 
@@ -48,21 +49,22 @@ pub struct DirectoryRecorder { pub directory: Arc<dyn rtdb_directory::Directory>
 
 #[async_trait]
 impl EnsembleRecorder for DirectoryRecorder {
-    async fn record_journals(&self, deployment: &str, epoch: u64, servers: &[String]) -> Result<()> {
-        use rtdb_directory::Lifecycle;
+    async fn reserve_copy(&self, deployment: &str, epoch: u64, servers: &[String]) -> Result<()> {
         for _ in 0..8 {
-            let current = self.directory.deployment(deployment).await?.ok_or_else(|| {
-                Anomaly::incorrect("rtdb.multi/unknown-deployment", format!("No deployment {deployment}"))
-            })?;
-            if current.epoch != epoch || !matches!(current.lifecycle, Lifecycle::Live | Lifecycle::Quarantined) {
-                return Err(Anomaly::new(rtdb_types::AnomalyCategory::Conflict, "rtdb.multi/deposed", "The deployment ceased to accept this writer's journal inventory"));
+            let mut record = self.directory.deployment(deployment).await?.ok_or_else(|| Anomaly::incorrect("rtdb.multi/unknown-deployment", format!("No deployment {deployment}")))?;
+            if record.epoch != epoch || record.holder.is_none()
+                || !matches!(record.lifecycle, rtdb_directory::Lifecycle::Live | rtdb_directory::Lifecycle::Quarantined) {
+                return Err(Anomaly::new(rtdb_types::AnomalyCategory::Conflict, "rtdb.multi/deposed", "The deployment moved on before its journal inventory was reserved"));
             }
-            if servers.iter().all(|server| current.replica_journals.contains(server)) { return Ok(()); }
-            let mut next = current.clone();
-            next.replica_journals.extend(servers.iter().cloned());
-            if let rtdb_directory::Cas::Applied(_) = self.directory.replace_deployment(next, current.version).await? { return Ok(()); }
+            let mut endpoints = record.replica_journals.clone();
+            endpoints.extend(record.log_copy_servers.iter().cloned());
+            endpoints.extend(servers.iter().cloned());
+            if endpoints == record.replica_journals { return Ok(()); }
+            record.replica_journals = endpoints;
+            let version = record.version;
+            if let rtdb_directory::Cas::Applied(_) = self.directory.replace_deployment(record, version).await? { return Ok(()); }
         }
-        Err(Anomaly::new(rtdb_types::AnomalyCategory::Conflict, "rtdb.multi/record-contended", "The deployment kept changing while its journal inventory was recorded"))
+        Err(Anomaly::new(rtdb_types::AnomalyCategory::Conflict, "rtdb.multi/record-contended", "The deployment kept changing while its log copy was reserved"))
     }
 
     async fn record(&self, deployment: &str, epoch: u64, ensemble: Vec<rtdb_directory::MemberId>) -> Result<()> {
@@ -106,14 +108,15 @@ impl LogFactory for LogkeeperLogFactory {
             return frozen_checkpoint(checkpoint, epoch, self.maximum_message_bytes);
         }
         let stream = StreamConfig { servers: config.servers.clone(), stream: config.replica_stream.clone(), write_quorum: config.write_quorum, maximum_message_bytes: self.maximum_message_bytes };
-        let quorum: Arc<dyn Log> = match access {
+        let (quorum, key): (Arc<dyn Log>, _) = match access {
             LogAccess::ReadWrite => {
+                let key = self.keys.existing(&config.key_id).await?;
                 // An interrupted copy can leave records even if the new
                 // ensemble never becomes the reported serving ensemble.
-                self.recorder.record_journals(&config.deployment, config.epoch, &stream.servers).await?;
+                self.recorder.reserve_copy(&config.deployment, config.epoch, &stream.servers).await?;
                 let writer = match &config.previous_servers {
                     Some(previous) => {
-                        self.recorder.record_journals(&config.deployment, config.epoch, previous).await?;
+                        self.recorder.reserve_copy(&config.deployment, config.epoch, previous).await?;
                         let moved = rtdb_logkeeper::open_writer_on(vec![rtdb_logkeeper::Loglet { servers: previous.clone(), start_lsn: 0 }], stream, config.epoch, rtdb_logkeeper::CopyFrom::Retained, cancellation.clone()).await?;
                         // Recorded before the writer appends: until then the old ensemble, sealed and complete, still holds everything.
                         self.recorder.record(&config.deployment, config.epoch, config.ensemble.iter().map(|id| rtdb_directory::MemberId(id.clone())).collect()).await?;
@@ -122,15 +125,18 @@ impl LogFactory for LogkeeperLogFactory {
                     None => rtdb_logkeeper::open_writer(stream, config.epoch, cancellation.clone()).await?,
                 };
                 self.writers.lock().insert(config.deployment.clone(), Arc::downgrade(&writer));
-                writer
+                (writer, key)
             }
-            LogAccess::ReadOnly => rtdb_logkeeper::open_reader(stream, cancellation.clone()).await?,
+            LogAccess::ReadOnly => {
+                let key = self.keys.existing(&config.key_id).await?;
+                (rtdb_logkeeper::open_reader(stream, cancellation.clone()).await?, key)
+            }
             LogAccess::SourceWriter => return Err(Anomaly::unsupported("rtdb.multi/source-writer",
                 "A deployment has one writer, its holder; submissions reach it through the gateway")),
         };
         let replica: Arc<dyn Log> = Arc::new(SealedLog::new(
             quorum,
-            &self.keys.key(&config.key_id).await?,
+            &key,
             &config.replica_seal_scope,
         )?);
         let next = next_source_offset(replica.as_ref(), epoch).await?;
@@ -253,6 +259,7 @@ impl Log for SealedLog {
         self.inner.enqueue(self.cipher.seal(&self.stream, &payload)?, timestamp).await
     }
     fn latest(&self) -> rtdb_storage::Result<LogOffset> { self.inner.latest() }
+    async fn retained_floor(&self) -> rtdb_storage::Result<Option<LogOffset>> { self.inner.retained_floor().await }
     async fn tail(&self, after: LogOffset) -> rtdb_storage::Result<Box<dyn LogTail>> {
         Ok(Box::new(SealedTail { inner: self.inner.tail(after).await?, cipher: Arc::clone(&self.cipher), stream: Arc::clone(&self.stream) }))
     }
@@ -353,6 +360,39 @@ mod tests {
     use super::*;
     use rtdb_format::log::proto;
     use rtdb_types::Term;
+
+    #[tokio::test]
+    async fn a_log_open_without_a_serving_key_never_reserves_journal_endpoints() {
+        use rtdb_directory::{DeploymentRecord, Directory, MemberId, MemoryDirectory};
+
+        let files = tempfile::tempdir().unwrap();
+        let keys = Arc::new(crate::keys::LocalKeyService::new(files.path()).unwrap());
+        let directory = MemoryDirectory::new();
+        let mut record = DeploymentRecord::new("shop", "acme", vec![], 0);
+        record.holder = Some(MemberId("holder".to_owned()));
+        record.epoch = 1;
+        let record = directory.create_deployment(record).await.unwrap();
+        let configuration = LogkeeperLogConfig {
+            servers: vec!["127.0.0.1:1".to_owned()],
+            deployment: record.id.clone(),
+            key_id: record.key_id(),
+            replica_stream: record.stream("replica"),
+            replica_seal_scope: record.replica_seal_scope(),
+            write_quorum: 1,
+            epoch: record.epoch,
+            log_epoch: record.log_epoch,
+            ensemble: vec![],
+            frozen_at: None,
+            previous_servers: None,
+        };
+        let configuration = Any { type_url: String::new(), value: serde_json::to_vec(&configuration).unwrap() };
+        let factory = LogkeeperLogFactory::new(1024, keys.clone(), Default::default(), Arc::new(DirectoryRecorder { directory: directory.clone() }));
+
+        let refused = factory.open(&configuration, LogAccess::ReadWrite, CancellationToken::new()).await.err().unwrap();
+        assert_eq!(refused.code, "rtdb.multi/key-missing");
+        assert!(directory.deployment(&record.id).await.unwrap().unwrap().replica_journals.is_empty());
+        assert!(keys.existing_key(&record.key_id()).await.unwrap().is_none());
+    }
 
     async fn append(log: &MemoryLog, message: ReplicaBody) {
         let envelope = ReplicaEnvelope { term: Term(1), term_sequence: None, message };

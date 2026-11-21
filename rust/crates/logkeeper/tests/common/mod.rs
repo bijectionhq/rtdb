@@ -1,6 +1,7 @@
 #![allow(dead_code)]
 
 use bytes::Bytes;
+use prost::Message;
 use rtdb_logkeeper::{ServerOptions, StreamConfig, serve};
 use rtdb_storage::log::{Log, LogMetadata};
 use rtdb_types::Timestamp;
@@ -78,7 +79,39 @@ pub async fn append(log: &dyn Log, payload: &str, timestamp: i64) -> LogMetadata
 pub struct CountingProxy {
     pub address: SocketAddr,
     pub requests: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    appends: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    commits: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    drop_commits: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    held_overwrites: tokio::sync::watch::Sender<bool>,
+    held_overwrite_count: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    append_refusal_epoch: std::sync::Arc<std::sync::atomic::AtomicU64>,
     held: tokio::sync::watch::Sender<bool>,
+}
+
+#[derive(prost::Message)]
+struct CountedRequest {
+    #[prost(uint64, tag = "1")]
+    id: u64,
+    #[prost(bytes = "bytes", optional, tag = "2")]
+    append: Option<Bytes>,
+    #[prost(bytes = "bytes", optional, tag = "7")]
+    commit: Option<Bytes>,
+    #[prost(bytes = "bytes", optional, tag = "6")]
+    overwrite: Option<Bytes>,
+}
+
+#[derive(prost::Message)]
+struct ResponseWithRefusal {
+    #[prost(uint64, tag = "1")]
+    id: u64,
+    #[prost(message, optional, tag = "3")]
+    refusal: Option<Refusal>,
+}
+
+#[derive(prost::Message)]
+struct Refusal {
+    #[prost(uint64, tag = "1")]
+    promised: u64,
 }
 
 impl CountingProxy {
@@ -87,33 +120,86 @@ impl CountingProxy {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let requests = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let appends = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let commits = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let drop_commits = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let append_refusal_epoch = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
         let counter = std::sync::Arc::clone(&requests);
+        let append_counter = std::sync::Arc::clone(&appends);
+        let commit_counter = std::sync::Arc::clone(&commits);
+        let dropping_commits = std::sync::Arc::clone(&drop_commits);
+        let refusals = std::sync::Arc::clone(&append_refusal_epoch);
         let held = tokio::sync::watch::channel(false).0;
         let holding = held.clone();
+        let held_overwrites = tokio::sync::watch::channel(false).0;
+        let mutating = held_overwrites.clone();
+        let held_overwrite_count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let overwrite_counter = std::sync::Arc::clone(&held_overwrite_count);
         tokio::spawn(async move {
             while let Ok((client, _)) = listener.accept().await {
                 let Ok(server) = tokio::net::TcpStream::connect(target).await else { continue };
                 let (mut client_reader, mut client_writer) = client.into_split();
                 let (mut server_reader, mut server_writer) = server.into_split();
                 let counter = std::sync::Arc::clone(&counter);
+                let append_counter = std::sync::Arc::clone(&append_counter);
+                let commit_counter = std::sync::Arc::clone(&commit_counter);
+                let dropping_commits = std::sync::Arc::clone(&dropping_commits);
+                let refusals = std::sync::Arc::clone(&refusals);
+                let pending_appends = std::sync::Arc::new(parking_lot::Mutex::new(std::collections::BTreeSet::new()));
+                let append_ids = std::sync::Arc::clone(&pending_appends);
                 let mut holding = holding.subscribe();
+                let mut held_overwrites = mutating.subscribe();
+                let held_overwrite_count = std::sync::Arc::clone(&overwrite_counter);
                 tokio::spawn(async move {
                     loop {
                         let Ok(length) = client_reader.read_u32().await else { break };
                         let mut body = vec![0; length as usize];
                         if client_reader.read_exact(&mut body).await.is_err() { break; }
                         counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        if let Ok(request) = CountedRequest::decode(body.as_slice()) {
+                            if request.append.is_some() {
+                                append_ids.lock().insert(request.id);
+                                append_counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                            }
+                            if request.overwrite.is_some() && *held_overwrites.borrow() {
+                                held_overwrite_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                                if held_overwrites.wait_for(|held| !held).await.is_err() { break; }
+                            }
+                            if request.commit.is_some() {
+                                commit_counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                                if dropping_commits.load(std::sync::atomic::Ordering::SeqCst) { continue; }
+                            }
+                        }
                         if holding.wait_for(|held| !held).await.is_err() { break; }
                         if server_writer.write_all(&length.to_be_bytes()).await.is_err() || server_writer.write_all(&body).await.is_err() { break; }
                     }
                 });
-                tokio::spawn(async move { let _ = tokio::io::copy(&mut server_reader, &mut client_writer).await; });
+                tokio::spawn(async move {
+                    while let Ok(length) = server_reader.read_u32().await {
+                        let mut body = vec![0; length as usize];
+                        if server_reader.read_exact(&mut body).await.is_err() { break; }
+                        if let Ok(response) = ResponseWithRefusal::decode(body.as_slice())
+                            && pending_appends.lock().remove(&response.id)
+                            && let Some(refusal) = response.refusal
+                        {
+                            refusals.fetch_max(refusal.promised, std::sync::atomic::Ordering::SeqCst);
+                        }
+                        if client_writer.write_all(&length.to_be_bytes()).await.is_err() || client_writer.write_all(&body).await.is_err() { break; }
+                    }
+                });
             }
         });
-        Self { address, requests, held }
+        Self { address, requests, appends, commits, drop_commits, held_overwrites, held_overwrite_count, append_refusal_epoch, held }
     }
 
     pub fn hold(&self, held: bool) { self.held.send_replace(held); }
 
+    pub fn hold_overwrites(&self, held: bool) { self.held_overwrites.send_replace(held); }
+    pub fn held_overwrites(&self) -> usize { self.held_overwrite_count.load(std::sync::atomic::Ordering::SeqCst) }
+
     pub fn requests(&self) -> usize { self.requests.load(std::sync::atomic::Ordering::SeqCst) }
+    pub fn appends(&self) -> usize { self.appends.load(std::sync::atomic::Ordering::SeqCst) }
+    pub fn commits(&self) -> usize { self.commits.load(std::sync::atomic::Ordering::SeqCst) }
+    pub fn drop_commits(&self) { self.drop_commits.store(true, std::sync::atomic::Ordering::SeqCst); }
+    pub fn append_refusal_epoch(&self) -> u64 { self.append_refusal_epoch.load(std::sync::atomic::Ordering::SeqCst) }
 }

@@ -177,6 +177,19 @@ impl RetainedBasis {
     }
 }
 
+#[derive(serde::Serialize, serde::Deserialize)]
+struct GatewaySettings {
+    parameters: BTreeMap<String, Option<String>>,
+    timezone: String,
+    access_mode: Option<AccessMode>,
+}
+
+fn portable_parameter(name: &str) -> bool {
+    !["user", "database", "options", "rtdb.read", "rtdb.capability", "rtdb.delegable",
+        "rtdb.gateway_await_token", "rtdb.gateway_settings", crate::node::IDEMPOTENCY_KEY_PARAMETER]
+        .iter().any(|reserved| name.eq_ignore_ascii_case(reserved))
+}
+
 pub struct Session {
     service: Arc<dyn SessionService>,
     database: RetainedText,
@@ -186,6 +199,8 @@ pub struct Session {
     timezone: RetainedText,
     initial_timezone: RetainedText,
     await_token: Option<RetainedText>,
+    await_token_revision: u64,
+    settings_revision: u64,
     last_submitted: Option<LastSubmittedTx>,
     parameters: BTreeMap<String, Parameter>,
     /// The session key its transactions were last keyed under, and the sequence number of the next.
@@ -200,7 +215,7 @@ impl Session {
         let database = RetainedText::new(database.into(), service.memory())?;
         let timezone = RetainedText::new(timezone, service.memory())?;
         Ok(Self { service, database, lifecycle: Lifecycle::Open(None), auto_commit: true, default_access_mode: None,
-            initial_timezone: timezone.clone(), timezone, await_token: None, last_submitted: None, parameters: BTreeMap::new(), idempotency_sequence: None, cancellation: parent.child_token() })
+            initial_timezone: timezone.clone(), timezone, await_token: None, await_token_revision: 0, settings_revision: 0, last_submitted: None, parameters: BTreeMap::new(), idempotency_sequence: None, cancellation: parent.child_token() })
     }
     fn ensure_open(&self) -> Result<()> {
         if matches!(self.lifecycle, Lifecycle::Closed) { return Err(Anomaly::incorrect("xtdb/connection-closed", "Connection is closed")); }
@@ -227,6 +242,7 @@ impl Session {
     pub fn effective_timezone(&self) -> &str { self.transaction().map_or(&self.timezone, |tx| &tx.timezone) }
     pub fn session_timezone(&self) -> &str { self.transaction().map_or(&self.timezone, |tx| &tx.session_timezone) }
     pub fn effective_await_token(&self) -> Option<&str> { self.transaction().and_then(Transaction::await_token).or(self.await_token.as_deref()) }
+    pub fn connection_await_token(&self) -> (u64, Option<&str>) { (self.await_token_revision, self.await_token.as_deref()) }
     pub fn last_submitted(&self) -> Option<&LastSubmittedTx> { self.last_submitted.as_ref() }
     pub fn cancellation(&self) -> &CancellationToken { &self.cancellation }
     pub fn status(&self) -> TransactionStatus {
@@ -239,16 +255,83 @@ impl Session {
     }
     pub fn is_read_only(&self) -> bool { matches!(self.transaction().map(|tx| &tx.phase), Some(Phase::Reading { .. } | Phase::Pending(Some(_)))) }
     pub fn is_read_write(&self) -> bool { matches!(self.transaction().map(|tx| &tx.phase), Some(Phase::Writing { .. })) }
-    pub fn set_await_token(&mut self, token: Option<String>) -> Result<()> { self.ensure_open()?; self.await_token = token.map(|token| RetainedText::new(token, self.service.memory())).transpose()?; Ok(()) }
-    pub fn set_session_characteristics(&mut self, access: Option<AccessMode>) -> Result<()> { self.ensure_open()?; self.default_access_mode = access; Ok(()) }
+    pub fn set_await_token(&mut self, token: Option<String>) -> Result<()> {
+        self.ensure_open()?;
+        let token = token.map(|token| RetainedText::new(token, self.service.memory())).transpose()?;
+        self.replace_await_token(token);
+        Ok(())
+    }
+    fn replace_await_token(&mut self, token: Option<RetainedText>) {
+        if self.await_token.as_deref() != token.as_deref() {
+            self.await_token = token;
+            self.await_token_revision = self.await_token_revision.wrapping_add(1);
+        }
+    }
+    pub fn set_session_characteristics(&mut self, access: Option<AccessMode>) -> Result<()> {
+        self.ensure_open()?;
+        if self.default_access_mode != access {
+            self.default_access_mode = access;
+            self.settings_revision = self.settings_revision.wrapping_add(1);
+        }
+        Ok(())
+    }
     pub fn set_parameter(&mut self, name: impl Into<String>, value: Option<String>) -> Result<()> {
         self.ensure_open()?;
         let name = name.into();
         let value = value.map(|value| RetainedText::new(value, self.service.memory())).transpose()?;
         let entry = self.service.memory().reserve(name.capacity().checked_add(256).ok_or_else(allocation_overflow)?)?;
+        if portable_parameter(&name) {
+            self.settings_revision = self.settings_revision.wrapping_add(1);
+        }
         self.parameters.insert(name, Parameter { value, _entry: entry });
         Ok(())
     }
+    pub fn settings_revision(&self) -> u64 { self.settings_revision }
+
+    /// Encodes the mutable settings of the idle session for restoration after a gateway reconnect.
+    pub fn encode_gateway_settings(&self) -> Result<(Vec<u8>, Arc<MemoryReservation>)> {
+        let entries = self.parameter_entries().filter(|(name, _)| portable_parameter(name));
+        let bound = entries.clone().try_fold(1024 + 8 * self.timezone.len(), |size, (name, value)| {
+            let bytes = name.len().checked_add(value.map_or(0, str::len))?.checked_mul(8)?;
+            size.checked_add(bytes)?.checked_add(256)
+        }).ok_or_else(allocation_overflow)?;
+        let reservation = self.service.memory().reserve(bound)?;
+        let settings = GatewaySettings {
+            parameters: entries.map(|(name, value)| (name.to_owned(), value.map(str::to_owned))).collect(),
+            timezone: self.timezone.to_string(),
+            access_mode: self.default_access_mode,
+        };
+        let encoded = serde_json::to_vec(&settings).map_err(|error| Anomaly::fault("rtdb.node/gateway-settings", error.to_string()))?;
+        Ok((encoded, reservation))
+    }
+
+    pub fn restore_gateway_settings(&mut self, encoded: &[u8]) -> Result<()> {
+        self.ensure_open()?;
+        if self.status() != TransactionStatus::Idle {
+            return Err(Anomaly::incorrect("rtdb.node/gateway-settings", "Gateway settings require an idle session"));
+        }
+        let memory = self.service.memory();
+        let _scratch = memory.reserve(encoded.len().checked_mul(4).and_then(|bytes| bytes.checked_add(2048)).ok_or_else(allocation_overflow)?)?;
+        let settings: GatewaySettings = serde_json::from_slice(encoded)
+            .map_err(|error| Anomaly::incorrect("rtdb.node/gateway-settings", error.to_string()))?;
+        let timezone = RetainedText::new(rtdb_expr::normalize_timezone(&settings.timezone)?, memory)?;
+        let mut restored = BTreeMap::new();
+        for (name, value) in settings.parameters {
+            if !portable_parameter(&name) {
+                return Err(Anomaly::incorrect("rtdb.node/gateway-settings", "Gateway settings contain a reserved parameter"));
+            }
+            let value = value.map(|value| RetainedText::new(value, memory)).transpose()?;
+            let entry = memory.reserve(name.capacity().checked_add(256).ok_or_else(allocation_overflow)?)?;
+            restored.insert(name, Parameter { value, _entry: entry });
+        }
+        self.parameters.retain(|name, _| !portable_parameter(name));
+        self.parameters.append(&mut restored);
+        self.timezone = timezone;
+        self.default_access_mode = settings.access_mode;
+        self.settings_revision = self.settings_revision.wrapping_add(1);
+        Ok(())
+    }
+
     pub fn parameter(&self, name: &str) -> Option<&str> { self.parameters.get(name).and_then(|entry| entry.value.as_deref()) }
     pub fn parameter_entries(&self) -> impl Iterator<Item = (&str, Option<&str>)> + Clone { self.parameters.iter().map(|(name, entry)| (name.as_str(), entry.value.as_deref())) }
     pub fn parameters(&self) -> BTreeMap<String, Option<String>> {
@@ -317,8 +400,14 @@ impl Session {
                 return Err(Anomaly::incorrect("xtdb/set-tz-in-write-tx", "Cannot SET TIME ZONE in a read-write transaction with buffered writes"));
             }
             tx.timezone = timezone.clone(); tx.session_timezone = timezone;
-        } else { self.timezone = timezone; }
+        } else { self.replace_timezone(timezone); }
         Ok(())
+    }
+    fn replace_timezone(&mut self, timezone: RetainedText) {
+        if &*self.timezone != &*timezone {
+            self.timezone = timezone;
+            self.settings_revision = self.settings_revision.wrapping_add(1);
+        }
     }
     pub fn fail_transaction(&mut self) { if let Some(tx) = self.transaction_mut() { tx.failed = true; } }
     pub fn rollback_tx(&mut self) -> Result<()> { self.ensure_open()?; self.lifecycle = Lifecycle::Open(None); Ok(()) }
@@ -329,7 +418,11 @@ impl Session {
     pub fn reset(&mut self) -> Result<()> {
         self.ensure_open()?;
         if self.transaction().is_some() { return Err(Anomaly::incorrect("xtdb/discard-in-tx", "DISCARD ALL cannot run inside a transaction block")); }
-        self.parameters.clear(); self.timezone = self.initial_timezone.clone(); self.await_token = None; self.default_access_mode = None;
+        self.parameters.clear();
+        self.timezone = self.initial_timezone.clone();
+        self.replace_await_token(None);
+        self.default_access_mode = None;
+        self.settings_revision = self.settings_revision.wrapping_add(1);
         Ok(())
     }
     pub async fn set_auto_commit(&mut self, enabled: bool) -> Result<()> {
@@ -439,14 +532,14 @@ impl Session {
         let token = match &self.await_token { Some(token) => decode_tx_basis(token)?.merge(&next)?, None => next };
         let token = RetainedText::new(encode_tx_basis(&token), self.service.memory())?;
         match mode {
-            CommitMode::Async => { self.await_token = Some(token); self.last_submitted = Some(LastSubmittedTx::Submitted(submitted)); Ok(CommitResult::Submitted(submitted)) }
+            CommitMode::Async => { self.replace_await_token(Some(token)); self.last_submitted = Some(LastSubmittedTx::Submitted(submitted)); Ok(CommitResult::Submitted(submitted)) }
             CommitMode::Sync => {
                 let result = {
                     let _await = rtdb_plan::ExecutionSample::new(observer.clone(), rtdb_plan::ExecutionTimer::TxAwait);
                     self.service.await_transaction(&database, submitted.tx_id, &self.cancellation).await?
                 };
                 if matches!(result, TransactionResult::Aborted { .. }) { if let Some(observer) = &observer { observer.record_error(rtdb_plan::ExecutionError::Transaction); } }
-                self.await_token = Some(token); self.last_submitted = Some(LastSubmittedTx::Executed(result.clone()));
+                self.replace_await_token(Some(token)); self.last_submitted = Some(LastSubmittedTx::Executed(result.clone()));
                 Ok(CommitResult::Executed(result))
             }
         }
@@ -475,7 +568,7 @@ impl Session {
         self.require_usable_transaction()?;
         let Lifecycle::Open(tx) = &mut self.lifecycle else { return Err(Anomaly::incorrect("xtdb/connection-closed", "Connection is closed")); };
         let Some(tx) = tx.take() else { return Ok(CommitResult::NoTransaction); };
-        self.timezone = tx.session_timezone;
+        self.replace_timezone(tx.session_timezone);
         let Phase::Writing { buffer, options } = tx.phase else { return Ok(CommitResult::NoTransaction); };
         let mode = mode.unwrap_or(if options.asynchronous { CommitMode::Async } else { CommitMode::Sync });
         let (operations, reservations): (Vec<_>, Vec<_>) = buffer.operations.into_iter().map(|entry| (entry.operation, entry._reservation)).unzip();

@@ -63,7 +63,7 @@ impl KeyService for DynamoKeyService {
     }
 
     async fn copy(&self, from: &str, to: &str) -> Result<()> {
-        self.install(to, self.key(from).await?).await
+        self.install(to, <Self as KeyService>::existing(self, from).await?).await
     }
 
     async fn destroy(&self, id: &str) -> Result<()> {

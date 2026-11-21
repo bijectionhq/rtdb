@@ -1046,7 +1046,7 @@ def verify_checkpoint_replay(args, source):
         raise ValueError("root-first mutation did not fail at checkpoint startup")
     blocks.write_bytes(original)
 
-    missing = 'Err(error) if error.code == "rtdb.storage/missing-object" => {'
+    missing = 'Err(error) if refresh && error.code == "rtdb.storage/missing-object" => {'
     try:
         replace_once(blocks, missing, missing.replace("if ", "if false && ", 1))
         collected = run_case(

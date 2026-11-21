@@ -5,13 +5,14 @@
 //! An entry is committed once a write quorum holds it durably; readers see committed entries only.
 
 mod client;
+mod history;
 mod protocol;
 mod local;
 mod server;
 
-pub use client::{CopyFrom, Loglet, QuorumLog, StreamConfig, copy_retained, open_reader, open_reader_on, open_writer, open_writer_on, retire, seal, trim};
+pub use client::{CopyFrom, Loglet, QuorumLog, RetainedAudit, StreamConfig, audit_retained, certify_committed_prefix, copy_retained, drop_stream, open_reader, open_reader_on, open_writer, open_writer_on, retire, seal, trim};
 pub use local::LocalListener;
-pub use server::{PreparedJournal, ServerOptions, serve};
+pub use server::{JournalDigest, PreparedJournal, ServerOptions, inspect_retained, inspect_retained_with_prefix, serve};
 
 /// The pure pieces `rtdb-simulation` drives directly: one stream's server state machine, the recovery planning rules, and the messages they exchange.
 /// Not API: they change with the protocol.

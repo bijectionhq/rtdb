@@ -164,7 +164,7 @@ async fn serve_stage(
     let media = cell_media(storage, keys)?;
     let stage = record
         .checkpoint_stage
-        .as_ref()
+        .as_deref()
         .filter(|stage| {
             stage.intent.destination == selector.destination
                 && stage.intent.operation == selector.operation
@@ -226,7 +226,7 @@ impl StageReadAuthority {
             || record.holder.is_some()
             || !record.ensemble.is_empty()
             || record.checkpoint.is_some()
-            || record.checkpoint_stage.as_ref() != Some(&self.stage)
+            || record.checkpoint_stage.as_deref() != Some(&self.stage)
         {
             return Err(inconsistent(
                 "The staged checkpoint is no longer held under this receipt",
@@ -513,6 +513,7 @@ async fn serve_reader(
         compaction_relay: None,
         claim_wait: Duration::from_secs(1),
         capabilities: None,
+        flight_peer: None,
     };
     let auth = match &transport {
         Transport::Loopback { password, .. } => format!("password: \"{password}\""),

@@ -1,6 +1,7 @@
 //! Capabilities (value `Capability`): short-lived grants a gateway signs for one session's principal on one deployment.
 //! A node accepts one in place of the principal's password, so a gateway can reconnect an authenticated session to a new holder.
 
+use std::net::IpAddr;
 use std::path::Path;
 use std::time::Duration;
 
@@ -8,6 +9,7 @@ use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use ring::hmac;
 use ring::rand::{SecureRandom, SystemRandom};
+use rtdb_format::database::proto::database_config;
 use rtdb_pgwire::{CapabilityVerifier, VerifiedCapability};
 use rtdb_types::{Anomaly, AnomalyCategory, Result};
 use serde::{Deserialize, Serialize};
@@ -41,6 +43,14 @@ impl CellSecret {
         if self.verify(grant, deployment)?.principal == NODE_PRINCIPAL { Ok(()) } else { Err(refused("The grant is not a node's")) }
     }
 
+    pub(crate) fn flight_session_cipher(&self) -> Result<crate::cipher::Cipher> {
+        crate::cipher::Cipher::new(hmac::sign(&self.key, b"rtdb.multi/flight-sql/session-route/v1").as_ref())
+    }
+
+    pub(crate) fn flight_peer(&self, deployment: &str, epoch: u64, peer: IpAddr) -> String {
+        self.mint(&flight_peer_scope(deployment, epoch), &peer.to_string(), true, Duration::from_secs(60))
+    }
+
     /// A capability for `principal` on `deployment`, valid for `ttl`.
     pub fn mint(&self, deployment: &str, principal: &str, read_only: bool, ttl: Duration) -> String {
         let claims = Claims { deployment: deployment.into(), principal: principal.into(), read_only, expires_at_ms: rtdb_directory::now_ms() + ttl.as_millis() as i64 };
@@ -62,6 +72,27 @@ impl CapabilityVerifier for CellSecret {
         Ok(VerifiedCapability { principal: claims.principal, read_only: claims.read_only })
     }
 }
+
+impl std::fmt::Debug for CellSecret {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { formatter.write_str("CellSecret") }
+}
+
+impl rtdb_flight_sql::FlightPeerVerifier for CellSecret {
+    fn verify(&self, proof: &str, attachment: &rtdb_node::Database) -> Result<IpAddr> {
+        let Some(database_config::Storage::RemoteStorage(remote)) = &attachment.configuration().storage else {
+            return Err(refused("The Flight SQL attachment has no cell storage identity"));
+        };
+        let config = remote.object_store.as_ref().filter(|config| config.type_url.rsplit('/').next() == Some(crate::store::CELL_STORAGE_TYPE))
+            .ok_or_else(|| refused("The Flight SQL attachment has no cell storage identity"))?;
+        let config: crate::store::CellStoreConfig = serde_json::from_slice(&config.value)
+            .map_err(|_| refused("The Flight SQL attachment has an invalid cell storage identity"))?;
+        let epoch = config.writer_epoch.ok_or_else(|| refused("The Flight SQL route requires a writer attachment"))?;
+        let peer = <Self as CapabilityVerifier>::verify(self, proof, &flight_peer_scope(&config.deployment, epoch))?;
+        peer.principal.parse().map_err(|_| refused("The Flight SQL peer address is invalid"))
+    }
+}
+
+fn flight_peer_scope(deployment: &str, epoch: u64) -> String { format!("~flight/peer/{deployment}/{epoch}") }
 
 const NODE_PRINCIPAL: &str = "~cell-node";
 

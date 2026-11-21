@@ -317,6 +317,7 @@ config {
     activations_per_node_per_second: Integer = 200
     moves_per_node_per_pass: Integer = 8
     handoff_lag_threshold: Duration = 10.milliseconds
+    move_reservation: Duration = 70.seconds
     quarantine_crashes: Integer = 2
     quarantine_window: Duration = 10.minutes
 }
@@ -327,6 +328,7 @@ config {
 
 contract CellMap {
     -- The only global state: which cell a deployment lives in.
+    -- A placement change is conditional on the currently assigned cell, and the committed placement survives a cell-map process restart.
     -- Near-immutable: a row changes only when a deployment moves cells.
     -- Encoded in the deployment's hostname where the client protocol allows, so the request path makes no global lookup.
     cell_of: (deployment: DeploymentId) -> CellId
@@ -357,24 +359,43 @@ contract Directory {
 
     @invariant WatchesMayLagButNeverRewind
         -- A watcher receives each record's changes in epoch order, possibly late, and discards any change older than the one it holds.
+        -- Sessions in one process that follow the same deployment share the feed and safety-net polls.
+        -- A process consuming only keyed watches retains watch state for the deployments it follows.
+        -- When a DynamoDB feed starts or reconnects, keyed watches refresh their own records after the stream is ready.
+        -- A watch observation earlier than a confirmed route or holder epoch keeps that route or holding valid.
+        -- A holding follows the shared deployment watch from its claim version onward.
+        -- A newer placement can retire a local holding.
         --   A late change costs a redirect, never a wrong answer, because no watcher authorises anything by what it has seen.
 
     @invariant StaticStability
         -- A directory outage stalls activations, moves, flush publication and lifecycle changes.
         -- It does not stop a placed holder from committing or serving reads.
         --   Tails grow while publication is stalled, bounded by log-server capacity, and flush backpressure turns that bound into write stalls rather than data risk.
+
+    @invariant DirectoryFormatsPreservePlacement
+        -- During the parked-row format rollout, upgraded readers accept both layouts.
+        -- Both layouts carry the same deployment state and use the item's version for CAS.
+        -- Enable packed writes after all readers can decode them.
+
+    @invariant PlacementWorkScalesWithHoldings
+        -- Rebalancing and compaction placement find candidates through live members' holding indexes.
+        -- An indexed candidate's current record is checked before it affects placement.
+        -- An index entry that has yet to appear is picked up on a later pass.
+        -- A compaction worker checks the current record before treating an absent index entry as a revocation.
 }
 
 contract LogService {
     -- What a cell's log servers supply, per deployment.
     -- The log servers are logkeepers, built for this contract; the loglet kind is recorded per loglet, so another kind can back a deployment from its next epoch.
     -- A deployment's log is a dense sequence of records addressed by Lsn, carried by a chain of loglets.
+    -- Each server address contributes at most one acknowledgement to a loglet's quorum.
     append: (deployment: DeploymentId, epoch: Epoch, lsn: Lsn, records: List<LogRecord>) -> Lsn
     seal: (deployment: DeploymentId, loglet: Loglet, epoch: Epoch) -> SealReply
     check: (deployment: DeploymentId, epoch: Epoch) -> Epoch
     read: (deployment: DeploymentId, from: Lsn) -> List<LogRecord>
     subscribe: (deployment: DeploymentId, from: Lsn) -> Stream<LogRecord>
     trim: (deployment: DeploymentId, through: Lsn) -> Lsn
+    drop_stream: (deployment: DeploymentId, epoch: Epoch) -> ()
 
     @invariant AppendIsConditionalOnEpochAndPosition
         -- A log server accepts an append for a deployment only if its epoch equals the server's promised epoch for that deployment, the server is synced at that epoch, and its lsn is one above the server's last.
@@ -400,6 +421,7 @@ contract LogService {
     @invariant SealIsAPromise
         -- A seal at epoch e durably raises the server's promised epoch for the deployment to at least e, and returns the epoch it is synced at, its last lsn, and the epoch of every record above the deployment's trim point.
         -- Once write_quorum servers of a loglet have answered a seal at e, no append below e reaches a quorum of that loglet.
+        -- The promise applies to appends already in flight when the seal was made durable.
         --   Any commit quorum and any seal quorum of one ensemble intersect.
 
     @invariant NothingCommittedIsLost
@@ -426,11 +448,23 @@ contract LogService {
     @invariant TrimFollowsPublication
         -- A deployment's records at or below its checkpoint's lsn may be trimmed; nothing above it may be.
         -- The boundary must belong to this deployment's log, including when its first readable block came from a parent.
+        -- A holder saves an agreed digest through the last position it intends to discard before requesting a trim.
+        -- The directory advances the digest only when a durable write quorum independently computes the same committed history.
+        -- A replica that cannot extend the saved digest across contiguous positions cannot contribute proof.
         -- A physical segment is reclaimed once every deployment's records in it are trimmed.
         -- A deployment whose tail pins a segment past log_max_retention is force-flushed (FlushOnRetention).
 
+    @invariant DroppedStreamsAreTerminal
+        -- A drop at the deletion epoch durably removes the stream from the server's readable and writable state.
+        -- Acknowledged and uncommitted entries are both released.
+        -- A dropped stream remains closed after restart and journal compaction.
+        -- An acknowledgement from every addressed replica is required before deletion advances.
+        -- A copy records its source and destination endpoints before transferring bytes.
+        -- Deletion addresses both the current ensemble and the recorded endpoints of earlier copy attempts.
+
     @invariant DurabilityIsConfiguredNotHoped
         -- Expected of the operator: each ensemble spans three availability zones, and a server acknowledges only after fsync.
+        -- New assignments prefer distinct zones, and repair keeps surviving endpoints while using distinct zones for available slots.
 }
 
 contract ObjectStorage {
@@ -497,6 +531,7 @@ entity MemberRecord {
     pool: general | isolation | dedicated
     -- The member renews this every member_heartbeat while alive.
     lease_expires_at: Timestamp
+    storage_namespaces: StorageNamespaces?
     state: MemberState
 
     transitions state {
@@ -515,6 +550,17 @@ entity MemberRecord {
     may_receive_placements: role = node and state = eligible
 }
 
+value PlacementMove {
+    request: String
+    target: MemberId
+    expires_at: Timestamp
+}
+
+value StorageNamespaces {
+    objects: String
+    keys: String
+}
+
 entity DeploymentRecord {
     -- One deployment, as the directory records it.
     -- About 300 bytes when parked.
@@ -527,14 +573,17 @@ entity DeploymentRecord {
     parent: DeploymentId?
     fork_basis: Basis?
     storage_root: StorageRoot
+    storage_namespaces: StorageNamespaces?
     -- The KeyService key wrapping this deployment's object data keys.
     key_id: String
     lifecycle: Lifecycle
+    deletion_observation: DeletionObservation?
+    deletion_record: DeletionRecord?
     isolation_class: IsolationClass
     -- Members permitted when isolation_class is pinned or dedicated.
     pinned_members: Set<MemberId>
-    -- The engine versions permitted to hold this deployment.
-    engine_pin: String
+    -- An exact engine version for the holder and its compaction worker.
+    engine_pin: String?
     format_version: Integer
     quotas: Quotas
 
@@ -550,8 +599,8 @@ entity DeploymentRecord {
     read_width: Integer
     -- Activations that ended in the holder crashing, within quarantine_window.
     activation_crashes: Integer
-    -- A planned move in progress, naming its target.
-    move_intent: MemberId?
+    -- A planned move in progress, naming its target and deadline.
+    move_intent: PlacementMove?
     -- Whether producers may submit to an intake stream without waiting for a holder.
     intake_enabled: Boolean
     -- When a request last reached this deployment, maintained coarsely by the holder; orders the drainer.
@@ -576,6 +625,11 @@ entity DeploymentRecord {
     -- A holder counts only while its member may hold; a dead member's placements are unheld without any write to them.
     effective_holder: holder when holder != null and members[holder].may_hold
     is_held: effective_holder != null
+    active_move_target: move_intent.target when move_intent != null
+        and now < move_intent.expires_at
+        and members[move_intent.target].may_receive_placements
+        and ((lifecycle = live and members[move_intent.target].pool = general)
+             or (lifecycle = quarantined and members[move_intent.target].pool = isolation))
     tail_open: loglets != []
     is_parked: not is_held and not tail_open
 }
@@ -621,6 +675,19 @@ entity LogServerStream {
     last_lsn: Lsn
     commit_lsn: Lsn
     trimmed_through: Lsn
+    -- Consecutive retained log positions grouped by their writer epoch.
+    retained_epoch_runs: List<EpochRun>
+    retained_bytes: Integer
+}
+
+rule AdmitJournalMutation {
+    when: JournalMutationReceived(server, mutation)
+
+    requires: PendingJournalCapacityAvailable(server, mutation)
+
+    ensures:
+        JournalCapacityReservedUntilCompletion(server, mutation)
+        MutationMayBeDecided(mutation)
 }
 
 entity LogRecord {
@@ -751,8 +818,12 @@ entity Session {
     deployment: DeploymentId
     capability: Capability
     -- Parameters, prepared statements, the transaction buffer up to commit.
+    -- The pgwire gateway keeps mutable connection settings at idle command boundaries.
+    -- A new backend restores the settings before preparing statements or running another command.
     state: Bytes
     -- The highest basis this session has been acknowledged or has read at.
+    -- The pgwire gateway retains the backend's connection await token at idle command boundaries.
+    -- A new backend restores that token before preparing statements or running another command.
     basis: Basis?
     freshness: ReadFreshness
     -- Present while a cursor is open; pins the session's reads to that member until the cursor closes.
@@ -784,13 +855,23 @@ entity GarbageCandidate {
     released_at: Timestamp
 }
 
+value DeletionObservation {
+    leases_expire_at: Timestamp?
+    first_empty_at: Timestamp?
+    second_empty_at: Timestamp?
+}
+
 entity DeletionRecord {
-    -- The signed proof that a deployment's data is gone.
+    -- A cell signs the inventory it observed and the key destruction it confirmed.
     deployment: DeploymentId
+    epoch: Epoch
+    storage_prefix: String
+    namespaces: StorageNamespaces
+    inventory_scope: current_objects | all_versions | all_versions_and_multipart_uploads
     key_destroyed_at: Timestamp
     prefix_empty_first_at: Timestamp
-    prefix_empty_second_at: Timestamp
-    transferred_objects: Integer
+    prefix_empty_second_at: Timestamp?
+    transferred_objects: Integer?
     signature: String
 }
 
@@ -814,6 +895,7 @@ rule CreateDeployment {
     when: CreateRequested(org, cell)
 
     requires: count(cell.deployments) < config.cell_max_deployments
+    requires: IsStoragePathComponent(org.id)
 
     ensures:
         let id = DeploymentId.created()
@@ -881,6 +963,15 @@ rule ConfirmSuspicion {
         member.state = dead
 }
 
+rule ProbeMemberLiveness {
+    -- A controller pass issues up to sixteen member probes at a time.
+    -- Missing replies count against the endpoint that was probed.
+    when: ControllerProbeDue(cell)
+
+    ensures:
+        LiveNodeEndpointsProbed(cell)
+}
+
 rule AdmitMember {
     when: MemberPrewarmed(member)
 
@@ -911,14 +1002,18 @@ rule RetireDrainedMember {
 rule Claim {
     -- A member takes a deployment under the next epoch.
     -- Triggered by a request the gateway routed to it, by the drainer sweeping open tails, or by a move intent naming it.
+    -- A general node claims live deployments, and an isolation node claims quarantined deployments.
+    -- A move reserves a placement only while its target is eligible in the deployment's pool.
     when: ClaimAttempted(member, record, expected_epoch)
 
-    requires: members[member].may_receive_placements or record.move_intent = member
-    requires: record.lifecycle = live or (record.lifecycle = quarantined and members[member].pool = isolation)
+    requires: members[member].may_receive_placements
+    requires: (record.lifecycle = live and members[member].pool = general)
+              or (record.lifecycle = quarantined and members[member].pool = isolation)
+    requires: record.active_move_target = null or record.active_move_target = member
     requires: EngineSatisfiesPin(members[member].engine_version, record.engine_pin)
     requires: record.isolation_class in {shared, isolation} or member in record.pinned_members
     requires: record.epoch = expected_epoch
-    requires: not record.is_held or record.move_intent = member
+    requires: not record.is_held or record.holder = member
 
     ensures:
         let e = Epoch(value: expected_epoch.value + 1)
@@ -976,6 +1071,9 @@ rule RecoverTail {
     --   Records keep the epoch they were written at, so a record's own epoch does not say whether its server holds a later writer's whole history; the synced epoch does.
     -- Its records above the checkpoint are the tail: every committed record is in it (NothingCommittedIsLost).
     -- Records a deposed holder put on a minority were never acknowledged; recovery may keep or drop them, and a client retry with the same idempotency key settles the outcome either way.
+    -- Durable sync acknowledgements can confirm the recovered commit when they already report it on a write quorum.
+    -- Opening waits for durable commit acknowledgements from a write quorum.
+    -- A replica that does not finish recovery with the quorum can rejoin through background repair.
     when: holding: Holding.state becomes recovering
 
     ensures:
@@ -1023,6 +1121,7 @@ rule SubmitThroughGateway {
 }
 
 rule AnswerRetryFromWindow {
+    -- A stored retry identifies its original by key in its own deployment, as of the retry's system time.
     when: TxArrived(holding, tx, key)
 
     requires: holding.state = serving
@@ -1086,6 +1185,40 @@ rule RejectOverQuota {
         Replied(tx, outcome: throttled)
 }
 
+rule AuditRetainedReplicaHistory {
+    when: RetainedHistoryAuditRequested(deployment)
+
+    ensures:
+        let samples = RespondingReplicas(deployment)
+        ReplicaWindowsReported(samples)
+        let interval = LatestCommittedRetainedIntervalSharedByQuorum(samples)
+        if interval != null:
+            let chains = Sha256ChainsForInterval(SamplesCovering(samples, interval), interval)
+            ReplicaDigestsReported(chains, interval)
+            if DistinctDigests(chains):
+                ReplicaDivergenceReported(deployment, interval)
+        if StrictAuditRequested(deployment) and not WriteQuorumCompared(deployment, interval):
+            AuditRejectedForInsufficientEvidence(deployment)
+        if SavedHistoryAnchor(deployment) != null:
+            HistoryAnchorReported(deployment)
+            if ContiguousSuffixVerifiedByDurableQuorum(deployment):
+                ContinuedHistoryDigestReported(deployment)
+}
+
+rule VerifyRetainedJournalOffline {
+    -- A saved digest for the same stream can supply the chain through the position immediately before the requested interval.
+    when: JournalVerificationRequested(logkeeper, stream, interval, expected_digest)
+
+    requires: logkeeper.stopped
+
+    ensures:
+        let digest = Sha256ChainForJournalInterval(logkeeper, stream, interval)
+        if digest = expected_digest:
+            JournalIntervalVerified(logkeeper, stream, interval)
+        else:
+            JournalMismatchReported(logkeeper, stream, interval)
+}
+
 ------------------------------------------------------------
 -- Rules: optional intake
 --
@@ -1141,6 +1274,7 @@ rule FlushOnAge {
 }
 
 rule FlushOnIdle {
+    -- Each node bounds the idle flushes it starts in one reconciliation pass.
     when: holding: Holding.last_request_at + config.clean_after_idle <= now
 
     requires: holding.state = serving
@@ -1183,6 +1317,7 @@ rule WritePackAndManifest {
     -- A small flush writes one pack: every table's trie data, metadata and catalog delta, with a footer index, read by range.
     -- A large flush may write one pack per table.
     -- The boot object inlines catalogs, schema and the top trie levels, up to boot_inline_limit.
+    -- A flush waiter returns a holder-lost result when its holding is deposed.
     when: FlushStarted(holding)
 
     ensures:
@@ -1194,7 +1329,9 @@ rule WritePackAndManifest {
 }
 
 rule PublishCheckpoint {
+    -- An explicit flush returns after publishing its adopted checkpoint for the current holding.
     -- Publication is a cas conditional on the epoch, batched per node.
+    -- A checkpointed store with an independent object inventory can recover its packs by name.
     when: AppendCommitted(holding, record: BlockUploaded)
 
     ensures:
@@ -1222,6 +1359,8 @@ rule PublishCheckpoint {
 
 rule RunCompactionJob {
     -- Workers are selected by affinity on (deployment, job_key), so a retry lands on the worker that has the inputs cached.
+    -- A placed node shares its configured execution slots across all deployments.
+    -- A cancelled job keeps its slot until its admitted writes have finished.
     when: job: CompactionJob.state becomes queued
 
     ensures:
@@ -1232,6 +1371,9 @@ rule RunCompactionJob {
 
 rule WriteCompactionOutputs {
     when: JobFinished(job, worker)
+
+    requires: job.deployment.lifecycle = live
+    requires: WorkerTargetsCurrentStorage(worker, job.deployment)
 
     ensures:
         for output in job.outputs:
@@ -1343,8 +1485,25 @@ rule ParkUnderPressure {
             ParkStarted(holding)
 }
 
+rule ReclaimExecutionMemory {
+    -- The placed node starts reclamation at 80 percent of its execution budget and targets 75 percent.
+    -- It attempts a bounded batch of parks, ordered by last activity across its holdings.
+    -- A holding with an open session can be selected under execution-memory pressure.
+    -- A newly touched candidate or a candidate already undergoing a holding operation is skipped.
+    -- A holding that has been open for less than the node’s configured minimum residency is skipped.
+    -- A candidate that lost its placement is detached without flushing.
+    -- On activation the node preserves the requested holding and checks headroom again before attempting a claim.
+    -- Gateways retry temporary pressure refusals within an activation deadline.
+    -- A planned handoff keeps its reservation while retrying a target's pressure refusal.
+    when: ExecutionBudgetHigh(member)
+
+    ensures:
+        ReclamationPass(member)
+}
+
 rule Park {
-    -- Parking flushes whatever tail remains, commits Parked, then clears the holder and the loglets in one cas.
+    -- Parking pauses new submissions and waits for admitted transactions before the final flush.
+    -- The holder publishes the final checkpoint in the same cas that clears the placement.
     when: ParkStarted(holding)
 
     ensures:
@@ -1362,6 +1521,8 @@ rule Park {
 rule ActivateOnDemand {
     -- A request for an unheld deployment claims it on the highest-ranked eligible, unpressured member.
     -- Activations are admitted at most activations_per_node_per_second per node; others queue at the gateway with a deadline, interactive before background.
+    -- The local window covers one rolling second and a rate refusal leaves the placement unchanged.
+    -- An existing reservation admits its handoff independently of the cold activation budget.
     when: ActivationRequested(deployment)
 
     requires: not deployment.is_held
@@ -1397,6 +1558,8 @@ rule DrainOrphanedTails {
 }
 
 rule CountActivationCrash {
+    -- Only the current holder's epoch contributes an activation crash.
+    -- An unavailable log quorum can release a holding without moving the deployment to isolation.
     when: HolderCrashedDuringOrSoonAfterActivation(record)
 
     ensures:
@@ -1412,13 +1575,17 @@ rule CountActivationCrash {
 ------------------------------------------------------------
 
 rule IntendMove {
+    -- A reservation expires, and a refused activation releases its reservation.
+    -- Temporary memory pressure or directory contention can be retried while the reservation remains active.
+    -- A handoff park names the deployment, holding epoch, and current reservation.
     when: MoveChosen(record, target)
 
     requires: record.is_held
     requires: members[target].may_receive_placements
 
     ensures:
-        Directory.cas(record.id, record.epoch, change: { move_intent: target })
+        let reservation = PlacementMove.created(request: FreshMoveId(record), target: target, expires_at: now + config.move_reservation)
+        Directory.cas(record.id, record.epoch, change: { move_intent: reservation })
         Subscription.created(deployment: record, member: target, applied_lsn: record.checkpoint.lsn)
         HotRangesPrefetched(from: record.holder, to: target)
 }
@@ -1428,7 +1595,7 @@ rule HandOff {
     -- The target has applied through Handoff already, so its recovery is empty.
     when: SubscriptionCaughtUp(subscription)
 
-    requires: subscription.deployment.move_intent = subscription.member
+    requires: subscription.deployment.active_move_target = subscription.member
     requires: SubscriptionLag(subscription) <= config.handoff_lag_threshold
 
     ensures:
@@ -1437,6 +1604,23 @@ rule HandOff {
         AppendCommitted(source, Handoff.created(to: subscription.member))
         source.state = deposed
         ClaimAttempted(member: subscription.member, record: subscription.deployment, expected_epoch: source.epoch)
+}
+
+rule ParkForReservedMove {
+    -- This path allows a successor to recover a short tail from the quorum.
+    when: GuardedParkRequested(record, epoch, reservation)
+
+    requires: record.epoch = epoch
+    requires: record.active_move = reservation
+
+    ensures:
+        AdmissionPaused(record)
+        AdmittedWritesApplied(record)
+        if not ShortLocalTail(record):
+            FlushAndAdopt(record)
+        ParkPlacement(record, preserving: reservation)
+        SourceStopsServing(record)
+        RecoverFromReplicaLog(record, reservation.target)
 }
 
 rule AnswerMoved {
@@ -1450,18 +1634,24 @@ rule AnswerMoved {
 
 rule DrainMember {
     -- Scale-in, replacement and rollout drain a member by handing off its active deployments and parking its idle ones, at most moves_per_node_per_pass per pass.
+    -- The source's identity and epoch still match when the drain reserves a handoff.
+    -- A draining member runs one handoff at a time.
+    -- A recent holding stays on its source while the placement pool has no eligible destination.
     when: member: MemberRecord.state becomes draining
 
     ensures:
         for holding in HoldingsOf(member):
-            if holding.residency = active:
+            if RecentlyUsed(holding) and HasEligibleDestination(holding):
                 MoveChosen(holding.deployment, Affinity.next_rank(holding.deployment, excluding: member))
-            else:
+            if IdleForDrain(holding):
                 ParkStarted(holding)
 }
 
 rule Rebalance {
     -- The balancer moves deployments off a node over a watermark on any LoadVector dimension, each to its next eligible rank.
+    -- Each eligible target belongs to the deployment's placement pool.
+    -- A reservation uses the source holding's identity and epoch from the plan.
+    -- A conflicting reservation or a changed source ends the current pass.
     when: NodeOverWatermark(member, dimension)
 
     ensures:
@@ -1469,9 +1659,38 @@ rule Rebalance {
             MoveChosen(holding.deployment, Affinity.next_rank(holding.deployment, excluding: member))
 }
 
+rule ReportPlacementDemand {
+    when: PlacementStatusRequested(cell)
+
+    ensures:
+        HeldDeploymentsReadByMember(cell)
+        HolderCountsReportedByPool(cell)
+        PlacementNodeTargetsReportedByPool(cell)
+}
+
 ------------------------------------------------------------
 -- Rules: reads
 ------------------------------------------------------------
+
+rule BoundInitialGreeting {
+    when: StartupDeadlineElapsed(connection)
+
+    requires: connection.ready = false
+
+    ensures:
+        if connection.startup_received:
+            ClientMayRetryStartup(connection)
+        ConnectionClosed(connection)
+}
+
+rule TouchConnectedBackend {
+    when: BackendTouchDue(gateway, deployment, address)
+
+    requires: GatewayHasConnectedSession(gateway, deployment, address)
+
+    ensures:
+        TouchSent(gateway, deployment, address)
+}
 
 rule RouteRead {
     -- The gateway walks the deployment's affinity order within its read width.
@@ -1486,6 +1705,20 @@ rule RouteRead {
         else:
             Dispatched(query, Affinity.select(key: session.deployment.storage_identity, pool: readers, width: route.read_width))
 }
+
+rule SpreadReplicaSessions {
+    -- Pgwire read-only sessions try the least occupied replica within the deployment's read width.
+    -- Concurrent connection attempts rotate their starting rank before active session counts are available.
+    when: ReplicaSessionRequested(gateway, deployment)
+
+    requires: deployment.read_width > 1
+
+    ensures:
+        EligibleReplicaAttempted(gateway, deployment)
+}
+
+-- A placed query keeps its local database owner while checking authority.
+-- If the local owner detached or changed during the check, the node refuses the query before planning.
 
 rule ServeOnWriter {
     when: QueryArrived(holding, query, session)
@@ -1643,6 +1876,7 @@ rule RefineKeyForLargeDeployments {
 rule Fork {
     -- A fork within an organisation is a new deployment in the parent's lineage.
     -- Its first manifest references the parent's objects at the fork basis, plus one pack holding the parent's tail up to that basis.
+    -- Child publication checks that the parent is still eligible for forks in the writer epoch and storage generation used to prepare the child.
     when: ForkRequested(parent, basis, org)
 
     -- The child and its name publish at a version that still admits forks.
@@ -1692,12 +1926,39 @@ rule ForkReadsAreCapped {
         InheritedObjectsCappedAt(session.deployment.fork_basis)
 }
 
+rule ReadTransferredForkObject {
+    when: ForkObjectRead(record, object)
+
+    requires: object in InheritedReferences(record)
+
+    ensures:
+        ReadLocalCopy(record, object)
+        if LocalCopyMissing(record, object):
+            ReadReferencedCopy(record, object)
+            if ReferencedCopyMissing(record, object):
+                ReadLocalCopy(record, object)
+}
+
 ------------------------------------------------------------
 -- Rules: deletion
 ------------------------------------------------------------
 
+rule LocalStorageMaintenance {
+    when: AdministrativeObjectMutationRequested(cell, operation)
+
+    requires: LocalStorage(cell)
+    requires: NoOtherLocalMaintenanceHoldsLock(cell)
+
+    ensures:
+        LocalMaintenanceLockHeldThroughMutation(cell, operation)
+}
+
 rule BeginDeletion {
     -- The epoch bump fences every writer before anything is destroyed.
+    -- The holder's claim binds the object and key namespaces before it writes.
+    -- The deletion uses those namespaces.
+    -- A pristine root can bind its namespaces in the deletion CAS.
+    -- An unbound deletion started before namespace binding resumes once the live nodes all report the same configuration.
     when: DeleteRequested(record)
 
     requires: record.lifecycle in {live, quarantined}
@@ -1708,10 +1969,56 @@ rule BeginDeletion {
             holder: null,
             lifecycle: deleting
         })
+        if RecordUsesS3(record):
+            RecordLeaseHorizon(record, now + config.credential_ttl)
         for loglet in record.loglets:
             SealSent(loglet, epoch: Epoch(value: record.epoch.value + 1))
         StreamDropped(record.id)
         DeletionScheduled(record, after: now + config.credential_ttl)
+}
+
+rule ClaimStoreRoot {
+    -- Local nodes can prepare a durable locked witness before admitting a storage region.
+    -- Each local region consumes its witness once and keeps the lock until its operations have drained.
+    when: DeploymentStoreOpened(record, storage_prefix, writer_epoch)
+
+    requires: record.lifecycle in {live, quarantined}
+    requires: storage_prefix = record.storage_root.prefix
+    requires: writer_epoch = null or writer_epoch = record.epoch
+
+    ensures:
+        if writer_epoch != null:
+            StoreRootClaimed(record.id, storage_prefix)
+        else:
+            ExistingRootOwnerVerified(record.id, storage_prefix)
+}
+
+rule VerifyWriterDuringWatchStartup {
+    when: StoreWriteRequested(record, epoch)
+
+    requires: WatchHasNoObservationAtOrAfter(record.id, epoch)
+
+    ensures:
+        let current = Directory.read(record.id)
+        if current.epoch = epoch and current.holder != null and current.lifecycle in {live, quarantined}:
+            WriteMayProceed(record)
+        else:
+            WriteRefused(record)
+}
+
+rule RefreshScopedS3Session {
+    when: S3WriteCredentialsRequested(record, writer_epoch)
+
+    requires: DeploymentStillUsesStoragePrefix(record)
+    requires: WriterOrCompactorAuthorized(record, writer_epoch)
+
+    ensures:
+        let session = ProviderAssumedWriteRole(prefix: record.storage_root.prefix, max_age: config.credential_ttl)
+        if WriterOrCompactorAuthorized(record, writer_epoch):
+            if DirectoryRecordsMaximumWriteExpiry(record, session.expiration):
+                ScopedWriteSessionIssued(session)
+        else:
+            WriteRefused(record)
 }
 
 rule TransferSharedObjects {
@@ -1725,18 +2032,39 @@ rule TransferSharedObjects {
 }
 
 rule EraseAndProve {
+    -- If the inventory still contains objects, the deployment remains deleting and can retry with the same epoch.
+    -- A destroyed key cannot be installed or allocated again under the same deployment identity in that cell.
+    -- The terminal CAS keeps the signed receipt with the tombstone so a retry returns the same receipt.
     when: SharedObjectsTransferred(record)
 
-    requires: ServingStorageRegionsDrained(record)
+    requires: DeploymentPrefixIsDisjoint(record)
+              and ServingStorageRegionsDrained(record)
               and ServingPublicationsSettled(record)
 
     ensures:
         RetireReplicaJournals(record.id, record.epoch, AllRecordedJournals(record))
+        AbortMultipartUploadsUnder(record.storage_root.prefix)
         DeleteAllVersionsUnder(record.storage_root.prefix, except: TransferredObjects(record))
         AwaitEmptyInventory(record.storage_root.prefix, twice_separated_by: config.credential_ttl)
         KeyService.destroy(record.key_id)
-        DeletionRecord.created(deployment: record.id, signature: SignedByCell())
-        Directory.cas(record.id, record.epoch, change: { lifecycle: deleted })
+        let proof = DeletionRecord(deployment: record.id, epoch: record.epoch, inventory_scope: all_versions_and_multipart_uploads, signature: SignedByCell())
+        Directory.cas(record.id, record.epoch, change: { lifecycle: deleted, deletion_record: proof })
+}
+
+rule PublishInventoryReceipt {
+    -- A local store attests to the current inventory.
+    -- An S3 store attests to its multipart and version inventories after aborting uploads and removing data versions and delete markers.
+    when: InventoryEmptied(record, namespaces, inventory_scope)
+
+    requires: record.lifecycle = deleting
+    requires: record.storage_namespaces = namespaces
+    requires: RecordedWriteLeasesExpired(record)
+    requires: LocalStorage(record) or record.deletion_observation.second_empty_at != null
+
+    ensures:
+        KeyService.destroy(record.key_id)
+        let proof = DeletionRecord(deployment: record.id, epoch: record.epoch, namespaces: namespaces, inventory_scope: inventory_scope, signature: SignedByCell())
+        Directory.cas(record.id, record.epoch, change: { lifecycle: deleted, deletion_record: proof })
 }
 
 rule HostedCheckpointCapture {
@@ -1779,6 +2107,7 @@ rule StageHistoricalCheckpoint {
 
     ensures:
         ReadArchiveUnderOriginalCustody(capture)
+        BindTargetStorageAndKeyNamespaces(target)
         MaterializeVerifiedClosureWithFreshKey(capture, target)
         RetainStageInventory(target, operation)
         KeepPlacementAndLogsClosed(target)
@@ -1807,6 +2136,26 @@ rule RetireCheckpointArchives {
         WithdrawOnlyRegisteredCaptureKeys(record)
 }
 
+rule ObserveS3Inventory {
+    when: S3DeletionContinued(record)
+
+    requires: record.lifecycle = deleting
+    requires: RecordUsesS3(record)
+    requires: RecordedWriteLeasesExpired(record)
+    requires: S3LeaseHorizonElapsed(record)
+    requires: StreamDropped(record.id)
+
+    ensures:
+        if record.deletion_observation.first_empty_at = null:
+            EraseS3Inventory(record.storage_root.prefix)
+            Directory.cas(record.id, record.version, change: { deletion_observation: DeletionObservation(first_empty_at: now, second_empty_at: null) })
+        else if record.deletion_observation.second_empty_at = null and now >= record.deletion_observation.first_empty_at + config.credential_ttl:
+            if S3InventoryIsEmpty(record.storage_root.prefix):
+                Directory.cas(record.id, record.version, change: { deletion_observation.second_empty_at: now })
+            else:
+                Directory.cas(record.id, record.version, change: { deletion_observation: DeletionObservation(leases_expire_at: now) })
+}
+
 ------------------------------------------------------------
 -- Rules: upgrades
 ------------------------------------------------------------
@@ -1817,8 +2166,20 @@ rule RollEngine {
     when: EngineRolloutStarted(cell, version)
 
     ensures:
-        for member in cell.members where member.engine_version != version:
-            DrainScheduled(member)
+        for member in cell.members where member.engine_version != version and member.may_receive_placements:
+            if EligibleTargetOfVersionAndPoolExists(member, version) and EveryHoldingHasEligibleTargetOfVersion(member, version) and ParkedPinsRetainEligibleMembers(member):
+                DrainScheduled(member, target_engine: version)
+}
+
+rule SetEnginePin {
+    when: EnginePinRequested(record, version)
+
+    requires: record.lifecycle in {live, quarantined}
+    requires: version = null or HolderAndActivePlacementMatchEngine(record, version)
+    requires: version = null or EligibleEngineExists(record, version)
+
+    ensures:
+        Directory.cas(record.id, record.version, change: { engine_pin: version })
 }
 
 rule UpgradeFormatLazily {
@@ -1837,26 +2198,60 @@ rule UpgradeFormatLazily {
 ------------------------------------------------------------
 
 rule BeginCellMove {
+    -- The source and target have distinct object and key namespaces.
+    -- Each cell's object namespace lies outside the other's cleanup prefix for the deployment.
+    -- An incomplete copy can be retried at a fresh destination prefix.
+    -- Only the attempt recorded as prepared can be published.
     when: CellMoveRequested(record, target_cell)
 
     requires: record.lifecycle = live
+    requires: DestinationDeploymentPrefixIsDisjoint(record, target_cell)
+    requires: DestinationCanServeEnginePin(record, target_cell)
 
     ensures:
-        Directory.cas(record.id, record.epoch, change: { lifecycle: moving })
+        Directory.cas(record.id, record.epoch, change: {
+            epoch: Epoch(value: record.epoch.value + 1),
+            holder: null,
+            lifecycle: moving
+        })
         ForkedInto(target_cell, from: record, basis: CurrentBasis(record))
 }
 
 rule MoveCutover {
-    -- The source fences the deployment, the target replays the remaining tail, the cell map flips, and the source keeps a forwarding tombstone.
-    -- After the grace period, the source removes the deployment's remaining objects and destroys its copy of the key once the source prefix is empty.
+    -- The destination accepts placements only after the cell map switches to it.
+    -- The destination's first holder imports the sealed source log before it can serve.
+    -- A retry after the switch finishes publication and leaves the source tombstone.
     -- Forks in the source cell retain access to every object they share.
-    when: TargetCaughtUp(record, target_cell)
+    when: DestinationPrepared(record, target_cell)
+
+    requires: record.lifecycle = moving
+    requires: DestinationCanServeEnginePin(record, target_cell)
 
     ensures:
-        Directory.cas(record.id, record.epoch, change: { epoch: Epoch(value: record.epoch.value + 1), holder: null })
-        RemainingTailCopied(record, to: target_cell)
         CellMapRowWritten(deployment: record.id, cell: target_cell)
-        Directory.cas(record.id, Epoch(value: record.epoch.value + 1), change: { lifecycle: deleted })
+        Directory.cas(record.id, record.epoch, change: { lifecycle: deleted })
+        DestinationOpenedForPlacement(record, target_cell)
+}
+
+rule CleanUpMovedSource {
+    -- The source validates its object namespace and any supplied key namespace against the move's binding.
+    when: MoveGraceElapsed(record)
+
+    requires: record.lifecycle = deleted
+    requires: record.source_namespaces != null
+    requires: StorageNamespacesMatchSource(record)
+    requires: DeploymentPrefixIsDisjoint(record)
+    requires: RecordedWriteLeasesExpired(record)
+
+    ensures:
+        EraseSourceCopyAfterTransferringSharedObjects(record)
+        if SourceUsesS3(record):
+            EmptyMultipartInventoryObserved(record.storage_root.prefix)
+            EmptyVersionInventoryObserved(record.storage_root.prefix)
+        SourceCleanupRecorded(record, objects_erased)
+        if SourceKeyServiceConfigured(record):
+            SourceKeyCopyDestroyed(record.key_id)
+            SourceCleanupRecorded(record, objects_and_key_erased)
 }
 
 ------------------------------------------------------------
@@ -1874,7 +2269,9 @@ rule ChargeQuery {
 }
 
 rule EvictFairly {
-    -- One node-wide cache, keyed by object key and byte range.
+    -- One node-wide cache, keyed by storage identity, object key and byte range.
+    -- A writer, replica and snapshot of the same physical deployment reuse its immutable cached data.
+    -- A new storage generation has an independent cache identity.
     -- Each deployment keeps a small reserved floor; above it, eviction takes from the deployment furthest over its weighted share, least recently used first within it.
     when: CacheFull(member)
 
@@ -1898,6 +2295,7 @@ rule BoundTailMemory {
 invariant CostFollowsActivity {
     -- A parked deployment holds no memory on any member, no log-server state, no timer, no task and no connection.
     -- Its cost is its directory record and its objects.
+    -- A node releases the holding's trim watermark with the holding and the operation lock with its last user.
     for record in DeploymentRecords:
         record.is_parked implies
             (not exists h in Holdings: h.deployment = record and h.state != deposed)
@@ -1956,6 +2354,13 @@ invariant ObjectsStayInTheirLineage {
 
 invariant OneDatabasePerSession {
     -- A session's catalog contains exactly its capability's deployment; the planner cannot name another.
+    -- Placed session transaction inspection reports only the deployment's progress.
+    -- A node session is bound to the placement it opened against.
+    -- A replacement with the same name requires a new backend session.
+    -- Placed Flight SQL selects its deployment on the first authenticated request.
+    -- A session can redeem tickets and use handles only within its deployment.
+    -- A transaction or prepared handle requires its authenticated owner and local attachment.
+    -- A session waits for the positions in its own deployment when applying an await token.
     -- Cross-deployment reads exist only through an explicit grant, served on the snapshot tier.
     -- For a configured user grant list, an exact database rule takes precedence over the user's default rule, including during gateway reconnection.
     for session in Sessions:
@@ -1981,6 +2386,10 @@ actor Gateway {
     -- Terminates client connections, owns sessions, authenticates, mints capabilities and idempotency keys, routes by affinity, reports suspicion.
     -- A gateway configured with a PostgreSQL TLS key store completes the client's TLS handshake before it routes startup.
     -- A configured gateway refuses plaintext startup before any holder receives credentials.
+    -- A Flight SQL gateway forwards the authenticated transport peer using a proof for the deployment and writer epoch.
+    -- The writer authenticates the session with the peer in that proof.
+    -- Each Flight SQL call using a session token resolves its original writer placement.
+    -- A displaced Flight SQL session must establish a new authenticated session.
     identified_by: MemberRecord where role = gateway
 }
 
@@ -2042,10 +2451,26 @@ surface ClientAccess {
     @guarantee MovesAreInvisible
         -- A planned handoff stalls writes for one log round plus a redirect, and touches no client connection.
         -- A failover stalls writes until detection and claim complete, and a retried commit returns the outcome the first attempt had.
+        -- A dispatch failure preserves any complete command response the gateway has received.
+        -- A writable pgwire pipeline waits for ReadyForQuery between command cycles so each autocommit cycle has its own retry key.
+        -- A copy-in transfer can send its input frames before ReadyForQuery.
+        -- An unanswered keyed command can be retried under its original key, including an extended-protocol exchange flushed before Sync.
+        -- A holder's driver shutdown during a command leaves the outcome unknown until a keyed retry returns it.
         -- An authenticated idle session retains its acknowledged named prepared statements across holder changes.
+        -- SQL PREPARE and named pgwire Parse retain the search path and timezone used when they were registered.
+        -- Named pgwire Parse also retains the supplied parameter type identifiers.
+        -- Acknowledged DISCARD ALL clears the prepared statements eligible for replay.
+        -- An open pgwire session renews idle protection for its current backend and stops renewing it when that connection closes.
         -- A failed startup ends the client's authentication exchange.
         -- A finite reconnect window bounds the time an established session waits for a replacement holder.
+        -- A placement notification can start the next reconnect attempt before its fallback timer elapses.
         -- A replacement connection must resolve the original deployment identity.
+
+    @guarantee GatewayConnectionLimits
+        -- Each gateway bounds its accepted sockets and the sessions routed to any deployment.
+        -- A saturated deployment can refuse a new session while another deployment still has a slot.
+        -- Closing a session frees its reserved capacity.
+        -- A gateway admits buffered frame bytes before reading the body and releases the charge when their last owner drops them.
 
     @guarantee ReadYourWrites
         -- Within a session, every read sees every transaction the session was acknowledged.

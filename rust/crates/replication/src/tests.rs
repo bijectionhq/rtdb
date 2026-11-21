@@ -1708,3 +1708,64 @@ async fn a_promotion_that_inherits_a_flushed_block_resumes_the_source_after_the_
     }).collect();
     assert_eq!(later_sources, vec![next.0], "the new term resolves each later source message once and nothing at or before the flush");
 }
+
+#[tokio::test]
+async fn exact_and_restored_recovery_require_the_selected_checkpoint() {
+    use rtdb_format::{block::proto::Block, catalog::{BlockCatalog, TableEntry}, keys::block_key};
+    use rtdb_storage::ObjectKey;
+    use rtdb_types::ReplicaPosition;
+
+    let fixture = fixture(ReplicationConfig::default(), 4096).await;
+    let old = ObjectKey::new(block_key(BlockIndex(0)).unwrap()).unwrap();
+    let latest = ObjectKey::new(block_key(BlockIndex(1)).unwrap()).unwrap();
+    let incomplete = BlockCatalog::from_proto(Block {
+        block_index: Some(0),
+        tables: vec![TableEntry::new(16_384, TableRef::new("public", "docs")).unwrap().to_proto()],
+        ..Default::default()
+    }).unwrap();
+    let complete = BlockCatalog::from_proto(Block { block_index: Some(1), ..Default::default() }).unwrap();
+    fixture.store.put(&old, incomplete.encode().into()).await.unwrap();
+    fixture.store.put(&latest, complete.encode().into()).await.unwrap();
+
+    let exact = fixture.blocks.recover(
+        TrieConfig::default(), SourcePosition(-1), Timestamp(1000), BlockDiscovery::At(BlockIndex(0)),
+    ).await.err().unwrap();
+    assert_eq!(exact.code, "rtdb.storage/missing-object");
+
+    fixture.store.delete(&old).await.unwrap();
+    let restored = fixture.blocks.recover(
+        TrieConfig::default(), SourcePosition(-1), Timestamp(1000),
+        BlockDiscovery::FromRestored { checkpoint: BlockIndex(0), compaction_cutoff: ReplicaPosition(0) },
+    ).await.err().unwrap();
+    assert_eq!(restored.code, "rtdb.replication/block-gone");
+}
+
+#[tokio::test]
+async fn startup_replay_preserves_exact_and_restored_anchors_across_prefix_loss() {
+    let fixture = produced_memory_checkpoint(true).await;
+    produce_newer_memory_checkpoint(&fixture).await;
+    let (_, mut writer) = reopen_memory_checkpoint_with_config(&fixture, ReplicationConfig {
+        may_lead: false, ..Default::default()
+    }).await;
+    deliver_checkpoint_record(&fixture, &mut writer, 3, 0, ReplicaBody::NoOp(proto::NoOp { src_msg_id: None })).await.unwrap();
+    deliver_checkpoint_record(&fixture, &mut writer, 3, 1, boundary(2, -1)).await.unwrap();
+    let pending = writer.pending_block.as_ref().unwrap();
+    let later = writer.blocks.produce(&pending.prepared, &pending.boundary, BTreeMap::new()).await.unwrap();
+    assert_eq!(later.catalog.block_index(), BlockIndex(2));
+    fixture.store.delete(&rtdb_storage::ObjectKey::new(rtdb_format::keys::block_key(BlockIndex(1)).unwrap()).unwrap()).await.unwrap();
+    fixture.replica.truncate_before(LogOffset(5)).unwrap();
+    let boundary = rtdb_types::ReplicaPosition(1);
+    assert!(matches!(fixture.logs.observed_replica_gap(boundary).await.unwrap(),
+        Some(rtdb_storage::Error::UnavailableLogRange { requested: 2, first_retained: 5 })));
+
+    let cancellation = CancellationToken::new();
+    for (discovery, cutoff) in [
+        (BlockDiscovery::At(BlockIndex(0)), None),
+        (BlockDiscovery::FromRestored { checkpoint: BlockIndex(0), compaction_cutoff: boundary }, Some(boundary)),
+    ] {
+        let recovered = fixture.blocks.recover(TrieConfig::default(), SourcePosition(-1), Timestamp(0), discovery).await.unwrap();
+        let selected = fixture.blocks.recover_for_replay(recovered, &fixture.logs, TrieConfig::default(), Timestamp(0), &cancellation).await.unwrap();
+        assert_eq!(selected.block.unwrap().block_index(), BlockIndex(0));
+        assert_eq!(selected.compaction_replay_cutoff, cutoff);
+    }
+}

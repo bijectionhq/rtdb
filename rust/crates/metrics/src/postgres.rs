@@ -21,7 +21,7 @@ impl Drop for Assignment {
 }
 impl SourceMetricsFactory for Registry {
     fn register_source(&self, database: &str, slot: &str) -> Result<Arc<dyn SourceMetrics>> {
-        let bound = database.len().checked_add(slot.len()).and_then(|bytes| bytes.checked_add(std::mem::size_of::<CommitLag>())).and_then(|bytes| bytes.checked_add(4096)).ok_or_else(overflow)?;
+        let bound = database.len().checked_add(slot.len()).and_then(|bytes| bytes.checked_add(CommitLag::RETAINED_BYTES)).and_then(|bytes| bytes.checked_add(4096)).ok_or_else(overflow)?;
         let reservation = self.memory.reserve(bound)?;
         let metrics = Arc::new(PostgresMetrics { database: database.into(), slot: slot.into(), memory: Arc::clone(&self.memory),
             state: Mutex::new(State { events: crate::step::Counter::new(wall_time_millis()), commits: crate::step::Counter::new(wall_time_millis()), lag: Box::new(CommitLag::new(wall_time_millis())), generation: 0, assigned: None }), _reservation: reservation });

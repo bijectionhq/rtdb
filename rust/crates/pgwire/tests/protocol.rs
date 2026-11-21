@@ -384,6 +384,18 @@ async fn transit_copy_fragments_normalize_keyword_ids_and_copy_fail_discards_the
 }
 
 #[tokio::test]
+async fn a_read_only_pgwire_listener_refuses_copy_before_accepting_input() {
+    let running = Running::start(ServerConfig { read_only: true, ..Default::default() }, None).await;
+    let mut client = Client::connect(&running.server, None).await;
+    let refused = client.query("COPY docs FROM STDIN WITH (FORMAT 'transit-json')").await;
+    assert_eq!(tags(&refused), b"EZ");
+    assert!(String::from_utf8_lossy(&refused[0].1).contains("COPY is not allowed on the READ ONLY server"));
+    assert_eq!(tags(&client.query("SELECT 1").await), b"TDCZ");
+    drop(client);
+    running.stop().await;
+}
+
+#[tokio::test]
 async fn ssl_decline_can_continue_to_startup_and_oversized_preauth_frame_is_rejected() {
     let running = Running::start(ServerConfig::default(), None).await;
     let mut stream = TcpStream::connect(running.server.address()).await.unwrap();

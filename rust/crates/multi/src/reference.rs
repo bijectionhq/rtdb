@@ -12,6 +12,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use bytes::Bytes;
+use futures::future::BoxFuture;
 use rtdb_directory::{DeploymentRecord, Lifecycle};
 use rtdb_storage::{Error, ObjectKey, ObjectStore, object_store::StoredObject};
 use rtdb_types::{Anomaly, Result};
@@ -37,11 +38,16 @@ fn bookkeeping(key: &str) -> bool { key == crate::store::ROOT_MARKER || key.star
 impl Base {
     /// The latest manifest of `store`, or none.
     pub async fn load(bucket: &dyn ObjectStore, store: &str) -> Result<Base> {
-        Ok(match latest_manifest(bucket, store).await? {
-            Some((_, name)) => serde_json::from_slice(&bucket.get(&key(&name)?).await.map_err(storage)?)
-                .map_err(|error| Anomaly::fault("rtdb.multi/base-manifest", format!("{name}: {error}")))?,
-            None => Base::default(),
-        })
+        for _ in 0..4 {
+            let Some((_, name)) = latest_manifest(bucket, store).await? else { return Ok(Base::default()); };
+            match bucket.get(&key(&name)?).await {
+                Ok(bytes) => return serde_json::from_slice(&bytes)
+                    .map_err(|error| Anomaly::fault("rtdb.multi/base-manifest", format!("{name}: {error}"))),
+                Err(Error::MissingObject(_)) => continue,
+                Err(error) => return Err(storage(error)),
+            }
+        }
+        Err(Anomaly::new(rtdb_types::AnomalyCategory::Unavailable, "rtdb.multi/base-manifest-changed", format!("The reference manifest for {store} kept changing")))
     }
 
     /// Writes this as `store`'s manifest, after its latest, and forgets the earlier ones.
@@ -64,11 +70,21 @@ async fn latest_manifest(bucket: &dyn ObjectStore, store: &str) -> Result<Option
 }
 
 /// One store within the cell's bucket: its keys, under `prefix`, seen without it.
-pub struct PrefixedStore { bucket: Bucket, prefix: String }
+pub struct PrefixedStore { bucket: Bucket, prefix: String, scoped_writer: Option<Bucket> }
 
 impl PrefixedStore {
-    pub fn new(bucket: Bucket, prefix: impl Into<String>) -> Self { Self { bucket, prefix: prefix.into() } }
+    pub fn new(bucket: Bucket, prefix: impl Into<String>) -> Self { Self { bucket, prefix: prefix.into(), scoped_writer: None } }
+    pub(crate) fn with_writer(mut self, writer: Option<Bucket>) -> Self {
+        self.scoped_writer = writer;
+        self
+    }
     fn full(&self, key: &ObjectKey) -> rtdb_storage::Result<ObjectKey> { self::key(&format!("{}/{}", self.prefix, key.as_str())) }
+    fn mutation(&self, key: &ObjectKey) -> rtdb_storage::Result<(&dyn ObjectStore, ObjectKey)> {
+        match &self.scoped_writer {
+            Some(writer) => Ok((writer.as_ref(), self.full(key)?)),
+            None => Ok((self.bucket.as_ref(), self.full(key)?)),
+        }
+    }
 }
 
 #[async_trait]
@@ -77,8 +93,14 @@ impl ObjectStore for PrefixedStore {
     async fn head_fresh(&self, key: &ObjectKey) -> rtdb_storage::Result<StoredObject> { Ok(StoredObject { key: key.clone(), size: self.bucket.head_fresh(&self.full(key)?).await?.size }) }
     async fn get(&self, key: &ObjectKey) -> rtdb_storage::Result<Bytes> { self.bucket.get(&self.full(key)?).await }
     async fn get_range(&self, key: &ObjectKey, range: Range<u64>) -> rtdb_storage::Result<Bytes> { self.bucket.get_range(&self.full(key)?, range).await }
-    async fn put(&self, key: &ObjectKey, bytes: Bytes) -> rtdb_storage::Result<()> { self.bucket.put(&self.full(key)?, bytes).await }
-    async fn put_file(&self, key: &ObjectKey, source: &Path) -> rtdb_storage::Result<()> { self.bucket.put_file(&self.full(key)?, source).await }
+    async fn put(&self, key: &ObjectKey, bytes: Bytes) -> rtdb_storage::Result<()> {
+        let (writer, key) = self.mutation(key)?;
+        writer.put(&key, bytes).await
+    }
+    async fn put_file(&self, key: &ObjectKey, source: &Path) -> rtdb_storage::Result<()> {
+        let (writer, key) = self.mutation(key)?;
+        writer.put_file(&key, source).await
+    }
     async fn list(&self, directory: Option<&ObjectKey>) -> rtdb_storage::Result<Vec<StoredObject>> {
         let under = match directory { Some(directory) => self.full(directory)?, None => self::key(&self.prefix)? };
         let strip = format!("{}/", self.prefix);
@@ -87,7 +109,10 @@ impl ObjectStore for PrefixedStore {
             Some(self::key(&relative).map(|key| StoredObject { key, size: object.size }))
         }).collect()
     }
-    async fn delete(&self, key: &ObjectKey) -> rtdb_storage::Result<()> { self.bucket.delete(&self.full(key)?).await }
+    async fn delete(&self, key: &ObjectKey) -> rtdb_storage::Result<()> {
+        let (writer, key) = self.mutation(key)?;
+        writer.delete(&key).await
+    }
 }
 
 /// A store's own objects and the objects its manifest references, read own-first.
@@ -97,27 +122,38 @@ impl ReferencingStore {
     /// Opens `own`, a store in the cell's `bucket` whose manifest is `base`.
     pub fn new(own: Arc<dyn ObjectStore>, bucket: Bucket, base: Base) -> Self { Self { own, bucket, base } }
 
-    /// Where `key` is read from: this store's own object, or the one its manifest references.
-    async fn locate(&self, key: &ObjectKey) -> rtdb_storage::Result<(Arc<dyn ObjectStore>, ObjectKey)> {
-        if let (Err(Error::MissingObject(_)), Some(store)) = (self.own.head(key).await, self.base.objects.get(key.as_str())) {
-            return Ok((Arc::clone(&self.bucket), self::key(&format!("{store}/{}", key.as_str()))?));
+    async fn read<T>(&self, key: &ObjectKey, read: impl for<'a> Fn(&'a dyn ObjectStore, &'a ObjectKey) -> BoxFuture<'a, rtdb_storage::Result<T>>) -> rtdb_storage::Result<T> {
+        let own = read(self.own.as_ref(), key).await;
+        if !matches!(own, Err(Error::MissingObject(_))) { return own; }
+        let Some(owner) = self.base.objects.get(key.as_str()) else { return own; };
+        let inherited = self::key(&format!("{owner}/{key}"))?;
+        match read(self.bucket.as_ref(), &inherited).await {
+            // Erasure can copy the object here and remove it from its owner between the two reads.
+            Err(Error::MissingObject(_)) => read(self.own.as_ref(), key).await,
+            result => result,
         }
-        Ok((Arc::clone(&self.own), key.clone()))
     }
 }
 
 #[async_trait]
 impl ObjectStore for ReferencingStore {
     async fn head(&self, key: &ObjectKey) -> rtdb_storage::Result<StoredObject> {
-        let (store, located) = self.locate(key).await?;
-        Ok(StoredObject { key: key.clone(), size: store.head(&located).await?.size })
+        let object = self.read(key, |store, key| store.head(key)).await?;
+        Ok(StoredObject { key: key.clone(), size: object.size })
     }
-    async fn get(&self, key: &ObjectKey) -> rtdb_storage::Result<Bytes> { let (store, located) = self.locate(key).await?; store.get(&located).await }
-    async fn get_range(&self, key: &ObjectKey, range: Range<u64>) -> rtdb_storage::Result<Bytes> { let (store, located) = self.locate(key).await?; store.get_range(&located, range).await }
+    async fn head_fresh(&self, key: &ObjectKey) -> rtdb_storage::Result<StoredObject> {
+        let object = self.read(key, |store, key| store.head_fresh(key)).await?;
+        Ok(StoredObject { key: key.clone(), size: object.size })
+    }
+    async fn get(&self, key: &ObjectKey) -> rtdb_storage::Result<Bytes> {
+        self.read(key, |store, key| store.get(key)).await
+    }
+    async fn get_range(&self, key: &ObjectKey, range: Range<u64>) -> rtdb_storage::Result<Bytes> {
+        self.read(key, |store, key| store.get_range(key, range.clone())).await
+    }
     async fn put(&self, key: &ObjectKey, bytes: Bytes) -> rtdb_storage::Result<()> {
-        // Put-if-absent holds across the references: a shared object is already present.
-        if let (Err(Error::MissingObject(_)), Some(store)) = (self.own.head(key).await, self.base.objects.get(key.as_str())) {
-            return if self.bucket.get(&self::key(&format!("{store}/{}", key.as_str()))?).await? == bytes { Ok(()) } else { Err(Error::ConflictingObject(key.to_string())) };
+        if self.base.objects.contains_key(key.as_str()) {
+            return if self.get(key).await? == bytes { Ok(()) } else { Err(Error::ConflictingObject(key.to_string())) };
         }
         self.own.put(key, bytes).await
     }
@@ -131,8 +167,11 @@ impl ObjectStore for ReferencingStore {
         for name in self.base.objects.keys() {
             let key = self::key(name)?;
             if listed.contains_key(name) || directory.is_some_and(|directory| !key.is_under(directory)) { continue; }
-            // A reference whose object has since been copied in and erased at its source is listed from the copy.
-            if let Ok(object) = self.head(&key).await { listed.insert(name.clone(), object); }
+            match self.head(&key).await {
+                Ok(object) => { listed.insert(name.clone(), object); }
+                Err(Error::MissingObject(_)) => {}
+                Err(error) => return Err(error),
+            }
         }
         Ok(listed.into_values().collect())
     }
@@ -208,6 +247,12 @@ async fn block_pack_location(bucket: &dyn ObjectStore, parent: &str, block: i64)
     Err(Anomaly::incorrect("rtdb.multi/no-such-block", format!("Block {block} has no pack in the deployment's store")))
 }
 
+pub(crate) async fn verify_block_pack(bucket: &dyn ObjectStore, prefix: &str, block: i64) -> Result<()> {
+    let location = block_pack_location(bucket, prefix, block).await?;
+    crate::packing::read_index(bucket, &key(&location)?).await?;
+    Ok(())
+}
+
 /// When `block`'s pack was written in `parent`'s stores, in milliseconds since the epoch, as its index records.
 pub async fn written_at_ms(bucket: &dyn ObjectStore, parent: &str, block: i64) -> Result<i64> {
     let location = block_pack_location(bucket, parent, block).await?;
@@ -231,7 +276,8 @@ impl References {
     /// The references of every deployment in `records` that is not deleted.
     pub async fn scan(bucket: &dyn ObjectStore, records: &[DeploymentRecord]) -> Result<Self> {
         let mut references = Self::default();
-        for record in records.iter().filter(|record| record.lifecycle != Lifecycle::Deleted) {
+        for record in records {
+            if record.lifecycle == Lifecycle::Deleted { continue; }
             for store in stores(bucket, &record.storage_prefix()).await? {
                 // One listing per store, rather than a request per reference, on every reaper pass.
                 let own: BTreeSet<String> = physical_objects(bucket, &store).await?.into_iter().collect();
@@ -268,26 +314,20 @@ pub async fn erase_deployment(bucket: &dyn ObjectStore, prefix: &str, others: &[
     Ok(bucket.list(Some(&key(prefix)?)).await.map_err(storage)?.is_empty())
 }
 
-pub(crate) fn require_disjoint_prefix<'a>(
-    prefix: &ObjectKey,
-    others: impl Iterator<Item = &'a DeploymentRecord>,
-) -> Result<()> {
+pub(crate) fn require_disjoint_prefix<'a>(prefix: &ObjectKey, others: impl Iterator<Item = &'a DeploymentRecord>) -> Result<()> {
     for other in others {
         let other_prefix = key(&other.storage_prefix())?;
         if other_prefix.is_under(prefix) || prefix.is_under(&other_prefix) {
-            return Err(Anomaly::incorrect(
-                "rtdb.multi/overlapping-deployment-prefix",
-                format!("Storage prefix {prefix} overlaps the storage of {}", other.name),
-            ));
+            return Err(Anomaly::incorrect("rtdb.multi/overlapping-deployment-prefix", format!("Storage prefix {prefix} overlaps the storage of {}", other.name)));
         }
     }
     Ok(())
 }
 
-async fn copy_in(from_bucket: &dyn ObjectStore, from: &str, to_bucket: &dyn ObjectStore, to: &str) -> Result<()> {
+async fn copy_in(from_bucket: &dyn ObjectStore, from: &str, to_bucket: &dyn ObjectStore, to: &str) -> rtdb_storage::Result<()> {
     let target = key(to)?;
-    match to_bucket.head(&target).await { Ok(_) => return Ok(()), Err(Error::MissingObject(_)) => {}, Err(error) => return Err(error.into()) }
-    to_bucket.put(&target, from_bucket.get(&key(from)?).await.map_err(storage)?).await.map_err(storage)
+    match to_bucket.head(&target).await { Ok(_) => return Ok(()), Err(Error::MissingObject(_)) => {}, Err(error) => return Err(error) }
+    to_bucket.put(&target, from_bucket.get(&key(from)?).await?).await
 }
 
 /// An earlier attempt can leave objects in the target. Only identical bytes
@@ -322,7 +362,10 @@ pub async fn materialize(from_bucket: &dyn ObjectStore, from: &str, to_bucket: &
                 Err(Error::MissingObject(_)) => match from_bucket.get(&key(&format!("{owner}/{name}"))?).await {
                     // Concurrent retirement materializes the reference before
                     // removing the original, so look again in the fork.
-                    Err(Error::MissingObject(_)) => from_bucket.get(&own).await?,
+                    Err(Error::MissingObject(_)) => match from_bucket.get(&own).await {
+                        Err(Error::MissingObject(_)) if crate::store::garbage_released_at(&name).is_some() => continue,
+                        value => value?,
+                    },
                     value => value?,
                 },
                 value => value?,
@@ -341,7 +384,7 @@ mod tests {
     async fn put(bucket: &Bucket, name: &str, bytes: &[u8]) { bucket.put(&key(name).unwrap(), Bytes::copy_from_slice(bytes)).await.unwrap(); }
 
     #[tokio::test]
-    async fn deleting_an_overlapping_prefix_preserves_the_other_deployment() {
+    async fn deleting_an_overlapping_prefix_leaves_the_other_deployments_objects_intact() {
         let bucket = bucket();
         let other = DeploymentRecord::new("other", "acme", Vec::new(), 0);
         let other_prefix = other.storage_prefix();
@@ -350,7 +393,114 @@ mod tests {
         let (outer, _) = other_prefix.rsplit_once('/').unwrap();
         let error = erase_deployment(bucket.as_ref(), outer, &[other]).await.unwrap_err();
         assert_eq!(error.code, "rtdb.multi/overlapping-deployment-prefix");
-        assert_eq!(bucket.get(&key(&retained).unwrap()).await.unwrap().as_ref(), b"other deployment");
+        assert_eq!(bucket.get(&key(&retained).unwrap()).await.unwrap(), b"other deployment".as_slice());
+    }
+
+    struct TransferringStore {
+        inner: Bucket,
+        original: ObjectKey,
+        copy: ObjectKey,
+        transferred: std::sync::atomic::AtomicBool,
+    }
+
+    impl TransferringStore {
+        async fn transfer_if_read(&self, key: &ObjectKey) -> rtdb_storage::Result<()> {
+            if key == &self.original && !self.transferred.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                self.inner.copy(&self.original, &self.copy).await?;
+                self.inner.delete(&self.original).await?;
+            }
+            Ok(())
+        }
+    }
+
+    #[async_trait]
+    impl ObjectStore for TransferringStore {
+        async fn head(&self, key: &ObjectKey) -> rtdb_storage::Result<StoredObject> {
+            self.transfer_if_read(key).await?;
+            self.inner.head(key).await
+        }
+        async fn get(&self, key: &ObjectKey) -> rtdb_storage::Result<Bytes> {
+            self.transfer_if_read(key).await?;
+            self.inner.get(key).await
+        }
+        async fn get_range(&self, key: &ObjectKey, range: Range<u64>) -> rtdb_storage::Result<Bytes> {
+            self.transfer_if_read(key).await?;
+            self.inner.get_range(key, range).await
+        }
+        async fn put(&self, key: &ObjectKey, bytes: Bytes) -> rtdb_storage::Result<()> { self.inner.put(key, bytes).await }
+        async fn put_file(&self, key: &ObjectKey, source: &Path) -> rtdb_storage::Result<()> { self.inner.put_file(key, source).await }
+        async fn list(&self, directory: Option<&ObjectKey>) -> rtdb_storage::Result<Vec<StoredObject>> { self.inner.list(directory).await }
+        async fn delete(&self, key: &ObjectKey) -> rtdb_storage::Result<()> { self.inner.delete(key).await }
+    }
+
+    #[tokio::test]
+    async fn a_fork_reads_an_object_transferred_during_the_read() {
+        for read in ["get", "get_range", "head", "head_fresh", "list", "put"] {
+            let bucket = bucket();
+            put(&bucket, "parent/v06/row", b"parent").await;
+            fork(bucket.as_ref(), "parent", "child", None).await.unwrap();
+            let base = Base::load(bucket.as_ref(), "child/v06").await.unwrap();
+            let bucket: Bucket = Arc::new(TransferringStore {
+                inner: bucket,
+                original: key("parent/v06/row").unwrap(),
+                copy: key("child/v06/row").unwrap(),
+                transferred: Default::default(),
+            });
+            let store = ReferencingStore::new(Arc::new(PrefixedStore::new(bucket.clone(), "child/v06")), bucket.clone(), base);
+            let row = key("row").unwrap();
+            match read {
+                "get" => assert_eq!(store.get(&row).await.unwrap(), b"parent".as_slice()),
+                "get_range" => assert_eq!(store.get_range(&row, 2..6).await.unwrap(), b"rent".as_slice()),
+                "head" => assert_eq!(store.head(&row).await.unwrap().size, 6),
+                "head_fresh" => assert_eq!(store.head_fresh(&row).await.unwrap().size, 6),
+                "list" => assert_eq!(store.list(None).await.unwrap(), [StoredObject { key: row, size: 6 }]),
+                "put" => {
+                    store.put(&row, Bytes::from_static(b"parent")).await.unwrap();
+                    assert!(matches!(store.put(&row, Bytes::from_static(b"overwrite")).await, Err(Error::ConflictingObject(_))));
+                }
+                _ => unreachable!(),
+            }
+            assert!(!holds(bucket.as_ref(), "parent/v06", "row").await.unwrap());
+        }
+    }
+
+    #[tokio::test]
+    async fn reading_a_manifest_retries_when_its_listed_revision_was_replaced() {
+        let bucket = bucket();
+        let base = Base { objects: BTreeMap::from([("row".into(), "parent/v06".into())]) };
+        base.save(bucket.as_ref(), "child/v06").await.unwrap();
+        let changing = TransferringStore {
+            inner: bucket,
+            original: key(&format!("child/v06/{BASE_MANIFEST}/{:020}", 0)).unwrap(),
+            copy: key(&format!("child/v06/{BASE_MANIFEST}/{:020}", 1)).unwrap(),
+            transferred: Default::default(),
+        };
+        assert_eq!(Base::load(&changing, "child/v06").await.unwrap(), base);
+    }
+
+    #[tokio::test]
+    async fn a_cell_copy_recovers_a_reference_that_changes_owner_during_the_read() {
+        let (here, there) = (bucket(), bucket());
+        put(&here, "parent/v06/row", b"parent").await;
+        fork(here.as_ref(), "parent", "child", None).await.unwrap();
+        let transferring = TransferringStore {
+            inner: here.clone(),
+            original: key("parent/v06/row").unwrap(),
+            copy: key("child/v06/row").unwrap(),
+            transferred: Default::default(),
+        };
+        materialize(&transferring, "child", there.as_ref(), "arrived").await.unwrap();
+        assert_eq!(there.get(&key("arrived/v06/row").unwrap()).await.unwrap().as_ref(), b"parent");
+        assert!(!holds(here.as_ref(), "parent/v06", "row").await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn a_cell_copy_fails_when_an_inherited_object_is_missing_at_both_owners() {
+        let (here, there) = (bucket(), bucket());
+        put(&here, "parent/v06/row", b"parent").await;
+        fork(here.as_ref(), "parent", "child", None).await.unwrap();
+        here.delete(&key("parent/v06/row").unwrap()).await.unwrap();
+        assert!(materialize(here.as_ref(), "child", there.as_ref(), "arrived").await.is_err());
     }
 
     #[tokio::test]

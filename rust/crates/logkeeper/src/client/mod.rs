@@ -1,5 +1,6 @@
 //! The quorum client: a `Log` over a stream replicated on an ensemble of logkeepers.
 
+mod audit;
 mod connection;
 mod ensemble;
 pub(crate) mod recovery;
@@ -13,13 +14,15 @@ use rtdb_storage::log::{AppendReceipt, Log, LogMetadata, LogOffset, LogRange, Lo
 use rtdb_storage::object_store::ReadReservation;
 use rtdb_storage::{Error, Result};
 use rtdb_types::{Anomaly, Timestamp};
-use std::collections::VecDeque;
+use std::collections::{BTreeSet, VecDeque};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicI64, AtomicUsize, Ordering};
 use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 use writer::{Tip, Writer};
+
+pub use audit::{RetainedAudit, audit_retained, certify_committed_prefix};
 
 /// Matches the read-side charge `LogRecord::retain` requires beyond the payload.
 const RECORD_OVERHEAD_BYTES: usize = 256;
@@ -82,6 +85,9 @@ struct Reader {
 fn validate(config: &StreamConfig) -> rtdb_types::Result<()> {
     if config.servers.is_empty() || config.stream.is_empty() {
         return Err(Anomaly::incorrect("rtdb.logkeeper/invalid-stream-config", "a stream needs a name and at least one server"));
+    }
+    if config.servers.iter().collect::<BTreeSet<_>>().len() != config.servers.len() {
+        return Err(Anomaly::incorrect("rtdb.logkeeper/invalid-stream-config", "a server address can occupy only one slot per ensemble"));
     }
     if config.write_quorum == 0 || config.write_quorum > config.servers.len() {
         return Err(Anomaly::incorrect("rtdb.logkeeper/invalid-stream-config", format!("write quorum {} must be between 1 and the {} servers", config.write_quorum, config.servers.len())));
@@ -204,6 +210,29 @@ pub async fn trim(config: &StreamConfig, through: LogOffset) -> rtdb_types::Resu
         return Err(Error::Remote { key: config.stream.clone(), message: format!("trimmed {trimmed} servers, a write quorum is {}", config.write_quorum) }.into());
     }
     Ok(())
+}
+
+/// Fences and permanently drops the stream on every configured server.
+/// A retry at the same epoch completes the drop if a server missed the first attempt.
+pub async fn drop_stream(config: &StreamConfig, epoch: u64) -> rtdb_types::Result<()> {
+    validate(config)?;
+    if epoch == 0 { return Err(Anomaly::incorrect("rtdb.logkeeper/invalid-epoch", "epochs start at 1")); }
+    let ensemble = Ensemble::new(config.clone());
+    let mut pending: FuturesUnordered<_> = (0..ensemble.len()).map(|server| {
+        let ensemble = &ensemble;
+        async move { (server, ensemble.drop_stream(server, epoch).await) }
+    }).collect();
+    let mut failures = Vec::new();
+    while let Some((server, reply)) = pending.next().await {
+        let failure = match reply {
+            Ok(Ack::Accepted(_)) => continue,
+            Ok(Ack::Refused(refused)) => format!("promised epoch {}", refused.promised),
+            Err(error) => error.to_string(),
+        };
+        failures.push(format!("{}: {failure}", config.servers[server]));
+    }
+    if failures.is_empty() { return Ok(()); }
+    Err(Error::Remote { key: config.stream.clone(), message: format!("stream drop is incomplete: {}", failures.join("; ")) }.into())
 }
 
 /// Retires a whole stream on every named journal. Each acknowledgment
@@ -401,6 +430,12 @@ impl Log for QuorumLog {
     }
 
     fn latest(&self) -> Result<LogOffset> { self.shared.latest().map(LogOffset) }
+
+    async fn retained_floor(&self) -> Result<Option<LogOffset>> {
+        let (_, trim) = self.shared.bounds().await?;
+        let first = trim.checked_add(1).ok_or_else(|| Error::Closed("log positions exhausted".into()))?;
+        Ok(Some(LogOffset(first)))
+    }
 
     async fn tail(&self, after: LogOffset) -> Result<Box<dyn LogTail>> {
         let next = after.0.checked_add(1).ok_or_else(|| Error::Closed("log positions exhausted".into()))?;

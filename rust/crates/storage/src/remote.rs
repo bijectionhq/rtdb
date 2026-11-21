@@ -181,12 +181,7 @@ impl RemoteObjects {
         Path::from(match &self.prefix { Some(prefix) => format!("{prefix}/{key}"), None => key.to_string() })
     }
 
-    fn key(&self, path: &Path) -> Result<ObjectKey> {
-        let value = path.as_ref();
-        let relative = match &self.prefix {
-            Some(prefix) => value.strip_prefix(&format!("{prefix}/")).ok_or_else(|| Error::InvalidKey(value.into()))?,
-            None => value,
-        };
+    fn key(relative: &str) -> Result<ObjectKey> {
         // A provider path is percent-encoded segment by segment, so a key it lists is the key that was put only once decoded.
         let decoded = relative.split('/').map(|part| percent_encoding::percent_decode_str(part).decode_utf8().map(|part| part.into_owned()))
             .collect::<std::result::Result<Vec<_>, _>>().map_err(|_| Error::InvalidKey(relative.into()))?.join("/");
@@ -348,7 +343,9 @@ impl RemoteObjects {
     }
 
     async fn list(&self, directory: Option<&ObjectKey>) -> Result<Vec<StoredObject>> {
-        let path = directory.map(|key| self.path(key)).or_else(|| self.prefix.as_ref().map(|key| Path::from(key.as_str())));
+        let namespace = self.prefix.as_ref().map(|key| Path::from(key.as_str()));
+        let path = directory.map(|key| self.path(key)).or_else(|| namespace.clone());
+        let prefix = namespace.map(|path| format!("{path}/"));
         let mut stream = self.client.list(path.as_ref());
         let mut result = Vec::new();
         while let Some(metadata) = stream.try_next().await.map_err(|error| {
@@ -358,15 +355,15 @@ impl RemoteObjects {
                 error => Error::Remote { key, message: error.to_string() },
             }
         })? {
-            if self.prefix.as_ref().is_some_and(|prefix| !metadata.location.as_ref().starts_with(&format!("{prefix}/"))) {
-                continue;
-            }
-            let relative = match &self.prefix {
-                Some(prefix) => metadata.location.as_ref().strip_prefix(&format!("{prefix}/")).unwrap_or_default(),
+            let relative = match &prefix {
+                Some(prefix) => {
+                    let Some(relative) = metadata.location.as_ref().strip_prefix(prefix) else { continue };
+                    relative
+                }
                 None => metadata.location.as_ref(),
             };
             if relative.split('/').any(|part| part == ".tmp") { continue; }
-            let key = self.key(&metadata.location)?;
+            let key = Self::key(relative)?;
             if directory.is_none_or(|directory| key.is_under(directory)) {
                 result.push(StoredObject { key, size: metadata.size });
             }

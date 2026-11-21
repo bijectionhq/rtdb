@@ -24,14 +24,22 @@ pub struct MemberLease {
     lost: CancellationToken,
 }
 
-pub struct Registration { pub role: MemberRole, pub address: String, pub control_address: Option<String>, pub availability_zone: String, pub pool: rtdb_directory::MemberPool }
+pub struct Registration {
+    pub role: MemberRole,
+    pub address: String,
+    pub control_address: Option<String>,
+    pub availability_zone: String,
+    pub engine_version: String,
+    pub pool: rtdb_directory::MemberPool,
+    pub storage_namespaces: Option<rtdb_directory::StorageNamespaces>,
+}
 
 impl Registration {
     fn record(self, id: MemberId) -> MemberRecord {
         MemberRecord {
             id, role: self.role, address: self.address, control_address: self.control_address,
-            availability_zone: self.availability_zone, engine_version: env!("CARGO_PKG_VERSION").into(),
-            lease_expires_at_ms: 0, state: MemberState::Eligible, pool: self.pool, version: 0,
+            availability_zone: self.availability_zone, engine_version: self.engine_version,
+            lease_expires_at_ms: 0, state: MemberState::Eligible, drain_target_engine: None, pool: self.pool, storage_namespaces: self.storage_namespaces, version: 0,
         }
     }
 }

@@ -47,7 +47,7 @@ impl SourceRegistration for Registration {
 }
 impl SourceObserver for Registry {
     fn register(&self, identity: &SourceIdentity, status: watch::Receiver<SourceStatus>) -> Result<Box<dyn SourceRegistration>> {
-        let bound = identity.database.len().checked_add(identity.topic.len()).and_then(|bytes| bytes.checked_add(std::mem::size_of::<Source>())).and_then(|bytes| bytes.checked_add(std::mem::size_of::<CommitLag>())).and_then(|bytes| bytes.checked_add(4096)).ok_or_else(overflow)?;
+        let bound = identity.database.len().checked_add(identity.topic.len()).and_then(|bytes| bytes.checked_add(std::mem::size_of::<Source>())).and_then(|bytes| bytes.checked_add(CommitLag::RETAINED_BYTES)).and_then(|bytes| bytes.checked_add(4096)).ok_or_else(overflow)?;
         let reservation = self.memory.reserve(bound)?;
         let mut sources = self.sources.lock();
         let id = sources.next;

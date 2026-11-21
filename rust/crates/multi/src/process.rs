@@ -24,6 +24,8 @@ use crate::lease::{LeaseOptions, MemberLease, Registration};
 use crate::logs::LogkeeperLogFactory;
 
 const MAXIMUM_LOG_MESSAGE_BYTES: usize = 4 * 1024 * 1024;
+const PLACED_FLUSH_INTERVAL_LIMIT: Duration = Duration::from_secs(15 * 60);
+const ENGINE_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 pub struct NodeSettings {
     pub configuration: NodeConfiguration,
@@ -33,6 +35,7 @@ pub struct NodeSettings {
     pub advertise_host: Option<String>,
     pub hosted_task: Option<rtdb_directory::HostedTask>,
     pub availability_zone: String,
+    pub engine_version: Option<String>,
     pub agent: AgentOptions,
     pub lease: LeaseOptions,
     pub pool: rtdb_directory::MemberPool,
@@ -61,11 +64,31 @@ pub struct RunningNode {
 }
 
 pub async fn start_node(directory: Arc<dyn Directory>, mut settings: NodeSettings) -> Result<RunningNode> {
+    let engine_version = settings.engine_version.take().unwrap_or_else(|| ENGINE_VERSION.into());
+    crate::admin::validate_engine_version(&engine_version)?;
+    let scoped_writes = match (&settings.agent.s3_write_role, &settings.agent.storage) {
+        (Some(role), crate::deployment::CellStorage::S3 { config }) => {
+            let issuer = rtdb_s3::ScopedS3Writes::new(&role.arn, config.region.as_deref(), role.sts_endpoint.as_deref(),
+                role.require_conditional_put).await?;
+            Some(Arc::new(crate::store::ScopedCellWrites::new(issuer)))
+        }
+        (Some(_), _) => return Err(Anomaly::incorrect("rtdb.multi/scoped-storage", "A scoped S3 write role requires S3 cell storage")),
+        (None, _) => None,
+    };
+    let bucket = settings.agent.storage.bucket(rtdb_storage::IoRegion::new()).await?;
+    let storage_namespaces = if scoped_writes.is_some() {
+        let objects = crate::deployment::existing_storage_namespace(bucket.as_ref()).await?
+            .ok_or_else(|| Anomaly::incorrect("rtdb.multi/storage-namespace-missing", "Initialize the cell object namespace before starting a scoped writer"))?;
+        rtdb_directory::StorageNamespaces { objects, keys: settings.keys.namespace_id().await? }
+    } else {
+        crate::deployment::storage_namespaces(bucket.as_ref(), settings.keys.as_ref()).await?
+    };
     if settings.configuration.disk_cache.is_none() {
         settings.configuration.disk_cache = Some(rtdb_server::config::DiskCacheSettings { path: settings.cache_dir.clone(), maximum_bytes: Some(1 << 30), maximum_ratio: 0.5 });
     }
     if !settings.local_compaction && settings.pool != rtdb_directory::MemberPool::Compaction { settings.configuration.compactor.threads = 0; }
     settings.agent.compaction_worker = settings.pool == rtdb_directory::MemberPool::Compaction;
+    settings.configuration.indexer.flush_duration = settings.configuration.indexer.flush_duration.min(PLACED_FLUSH_INTERVAL_LIMIT);
     let options = settings.configuration.node_options(settings.allocation_limit_bytes)?;
     let memory = MemoryBudget::new(options.execution_memory_bytes);
     let writers: crate::logs::Writers = Default::default();
@@ -74,17 +97,23 @@ pub async fn start_node(directory: Arc<dyn Directory>, mut settings: NodeSetting
     let cache_bytes = settings.configuration.disk_cache.as_ref().and_then(|cache| cache.maximum_bytes).unwrap_or(u64::MAX);
     let fragmenter = crate::fragments::CellFragmenter::new(Arc::clone(&directory), &settings.agent.fragments, cache_bytes, settings.capabilities.clone());
     let storage_regions = TaskTracker::new();
+    let local_witnesses = matches!(&settings.agent.storage, crate::deployment::CellStorage::Local { .. })
+        .then(|| crate::store::LocalWitnessPool::new(Arc::clone(&settings.keys), &storage_regions));
     let storage = Arc::new(crate::store::CellStoreFactory {
         directory: Arc::clone(&directory),
         keys: Arc::clone(&settings.keys),
+        storage_namespaces,
+        scoped_writes: scoped_writes.clone(),
         hosted_task: settings.hosted_task,
         storage_regions: storage_regions.clone(),
+        local_witnesses,
     });
     let placed = PlacedOptions {
         log_factories: vec![(LOGKEEPER_LOG_TYPE.into(), LogkeeperLogFactory::new(MAXIMUM_LOG_MESSAGE_BYTES, Arc::clone(&settings.keys), Arc::clone(&writers), recorder))],
         storage_factories: vec![(crate::store::CELL_STORAGE_TYPE.into(), storage)],
         claim_wait: settings.claim_wait,
         capabilities: settings.capabilities.clone().map(|secret| secret as Arc<dyn rtdb_pgwire::CapabilityVerifier>),
+        flight_peer: settings.capabilities.clone().map(|secret| secret as Arc<dyn rtdb_flight_sql::FlightPeerVerifier>),
         read_fence: Some(fence.clone() as Arc<dyn rtdb_node::ReadFence>),
         scan_fragmenter: Some(fragmenter.clone() as Arc<dyn rtdb_query::ScanFragmenter>),
         compaction_relay: match (settings.pool == rtdb_directory::MemberPool::Compaction, &settings.capabilities) {
@@ -99,12 +128,14 @@ pub async fn start_node(directory: Arc<dyn Directory>, mut settings: NodeSetting
     let control_address = control.local_addr().map_err(io)?;
     let pgwire_endpoint = advertised(pgwire_address, settings.advertise_host.as_deref())?;
     let control_endpoint = advertised(control_address, settings.advertise_host.as_deref())?;
+    let flight_endpoint = server.addresses().flight_sql.map(|address| advertised(address, settings.advertise_host.as_deref())).transpose()?;
     let lease = MemberLease::register(Arc::clone(&directory), Registration {
-        role: MemberRole::Node, address: pgwire_endpoint.clone(), control_address: Some(control_endpoint), availability_zone: settings.availability_zone, pool: settings.pool,
+        role: MemberRole::Node, address: pgwire_endpoint.clone(), control_address: Some(control_endpoint), availability_zone: settings.availability_zone, pool: settings.pool, engine_version, storage_namespaces: Some(storage_namespaces),
     }, settings.lease).await?;
+    if let Some(writes) = scoped_writes { writes.set_member(lease.id()); }
     fragmenter.set_member(lease.id());
-    let agent = NodeAgent::new(directory, server.node().clone(), Arc::clone(&lease), pgwire_endpoint, settings.agent, writers, settings.capabilities.clone());
-    let _ = fence.0.set(Arc::clone(&agent));
+    let agent = NodeAgent::new(directory, server.node().clone(), Arc::clone(&lease), pgwire_endpoint, flight_endpoint, settings.agent, storage_namespaces, writers, settings.capabilities.clone());
+    let _ = fence.0.set(Arc::downgrade(&agent));
     let cancellation = CancellationToken::new();
     let lease_cancellation = CancellationToken::new();
     let mut tasks = JoinSet::new();
@@ -155,20 +186,25 @@ impl RunningNode {
 
 /// The read fence, filled once the agent that answers it exists.
 #[derive(Default)]
-struct FenceSlot(std::sync::OnceLock<Arc<NodeAgent>>);
+struct FenceSlot(std::sync::OnceLock<std::sync::Weak<NodeAgent>>);
 
 #[async_trait::async_trait]
 impl rtdb_node::ReadFence for FenceSlot {
     async fn confirm(&self, database: &str) -> Result<()> {
-        match self.0.get() { Some(agent) => agent.confirm_read(database).await, None => Ok(()) }
+        match self.0.get() {
+            Some(agent) => agent.upgrade().ok_or_else(stopped_agent)?.confirm_read(database).await,
+            None => Ok(()),
+        }
     }
 
     async fn confirm_hosted(&self, database: &rtdb_node::Database) -> Result<String> {
-        let agent = self.0.get().ok_or_else(|| Anomaly::new(
-            AnomalyCategory::Unavailable, rtdb_node::NOT_HELD, "This node is not holding a hosted database",
-        ))?;
+        let agent = self.0.get().and_then(std::sync::Weak::upgrade).ok_or_else(stopped_agent)?;
         agent.confirm_hosted_read(database).await
     }
+}
+
+fn stopped_agent() -> Anomaly {
+    Anomaly::new(AnomalyCategory::Unavailable, rtdb_node::NOT_HELD, "The placement agent is unavailable")
 }
 
 pub struct LogkeeperSettings {
@@ -203,7 +239,7 @@ pub async fn start_logkeeper(directory: Arc<dyn Directory>, settings: LogkeeperS
     }
     let lease = MemberLease::reclaim_logkeeper(directory, Registration {
         role: MemberRole::Logkeeper, address: endpoint, control_address: None,
-        availability_zone: settings.availability_zone, pool: Default::default(),
+        availability_zone: settings.availability_zone, engine_version: ENGINE_VERSION.into(), pool: Default::default(), storage_namespaces: None,
     }, MemberId(identity), settings.advertise_host.is_some(), settings.lease).await?;
     let cancellation = CancellationToken::new();
     let mut tasks = JoinSet::new();

@@ -4515,6 +4515,7 @@ dependencies = [
  "aws-sdk-dynamodbstreams",
  "aws-types",
  "parking_lot",
+ "prost",
  "rtdb-types",
  "serde",
  "serde_json",
@@ -4831,6 +4832,7 @@ dependencies = [
 name = "rtdb-multi"
 version = "0.1.0"
 dependencies = [
+ "arrow-flight",
  "async-trait",
  "aws-config",
  "aws-sdk-dynamodb",
@@ -4838,6 +4840,10 @@ dependencies = [
  "bytes",
  "chrono",
  "futures",
+ "http 1.5.0",
+ "http-body-util",
+ "hyper 1.12.0",
+ "hyper-util",
  "parking_lot",
  "prost",
  "prost-types",
@@ -4845,6 +4851,7 @@ dependencies = [
  "rtdb-affinity",
  "rtdb-columnar",
  "rtdb-directory",
+ "rtdb-flight-sql",
  "rtdb-format",
  "rtdb-logkeeper",
  "rtdb-node",
@@ -4862,6 +4869,7 @@ dependencies = [
  "tokio-postgres",
  "tokio-rustls 0.26.6",
  "tokio-util",
+ "tonic",
  "uuid",
 ]
 
@@ -5063,12 +5071,14 @@ dependencies = [
  "aws-config",
  "aws-credential-types",
  "aws-sdk-s3",
+ "aws-sdk-sts",
  "bytes",
  "object_store",
  "rtdb-format",
  "rtdb-storage",
  "rtdb-types",
  "serde",
+ "serde_json",
  "tokio",
  "url",
  "uuid",

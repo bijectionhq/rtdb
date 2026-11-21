@@ -276,6 +276,7 @@ pub struct ReplicationDriver {
     restart: Option<Arc<DriverRestart>>,
     resolve: Arc<ResolveContext>, effects: Arc<dyn DatabaseEffects>, cancellation: CancellationToken, clock: ReplicationClock,
     recovered_confirmation: Option<RecoveredBlockConfirmation>,
+    compaction_replay_cutoff: Option<ReplicaPosition>,
     historical_confirmations: VecDeque<RecoveredBlockConfirmation>,
     fence: TermFence, read_position: ReplicaPosition, pending_block: Option<PendingBlock>, claim: Option<ReplicaPosition>, claiming: Option<Claim>,
     replica_tail: Option<Box<dyn LogTail>>, replica_poll: Option<Poll>, replica_batch: VecDeque<LogRecord>, replica_head: Option<ReplayHead>,
@@ -315,7 +316,7 @@ impl ReplicationDriver {
             recovered.confirmation(logs.replica_epoch, logs.storage_version, logs.storage_epoch, logs.memory())?
         } else { None };
         let restart = if config.enabled { progress.prepare_driver_restart() } else { None };
-        Ok((handle, Self { config, logs, blocks, partition: recovered.partition, progress, restart, resolve, effects, cancellation, clock, recovered_confirmation, historical_confirmations: VecDeque::new(), fence: recovered.fence,
+        Ok((handle, Self { config, logs, blocks, partition: recovered.partition, progress, restart, resolve, effects, cancellation, clock, recovered_confirmation, compaction_replay_cutoff: recovered.compaction_replay_cutoff, historical_confirmations: VecDeque::new(), fence: recovered.fence,
             read_position, pending_block: None, claim: None, claiming: None, replica_tail: None, replica_poll: None, replica_batch: VecDeque::new(), replica_head: None, leader: None, commands, status, flush_timer }))
     }
     pub async fn run(mut self) -> Result<()> {
@@ -810,7 +811,9 @@ impl ReplicationDriver {
                     }
                 }
                 ReplicaBody::TriesAdded(message) => {
-                    if message.storage_version == Some(self.logs.storage_version.0) && message.storage_epoch.unwrap_or_default() == self.logs.storage_epoch.0 {
+                    if self.compaction_replay_cutoff.is_none_or(|cutoff| record.metadata.position > cutoff)
+                        && message.storage_version == Some(self.logs.storage_version.0) && message.storage_epoch.unwrap_or_default() == self.logs.storage_epoch.0
+                    {
                         self.partition.add_tries(&additions(&message.tries)?, record.metadata.timestamp)?;
                     }
                     self.progress.applied(message.source_msg_id.map(SourcePosition), None, None)?;
@@ -847,12 +850,14 @@ impl ReplicationDriver {
                 ReplicaBody::BlockUploaded(_) => return Err(invalid("Block upload has no matching pending boundary")),
                 ReplicaBody::NoOp(message) => { self.progress.applied(message.src_msg_id.map(SourcePosition), None, None)?; self.complete_control(&record); }
                 ReplicaBody::TriesDeleted(message) => {
-                    let table = legacy_table_ref(message.table_name.as_deref().unwrap_or_default())?;
-                    let keys = message.trie_keys.iter().map(|key| key.parse()).collect::<Result<BTreeSet<_>>>()?;
-                    let cached = cached_objects(&self.partition.value(), &table, &keys);
-                    self.partition.delete_tries(&BTreeMap::from([(table, keys)]));
-                    // Every node holds its own cached copies, and the leader's delete reached only the remote store.
-                    for key in cached { let _ = self.resolve.storage.invalidate(&key).await; }
+                    if self.compaction_replay_cutoff.is_none_or(|cutoff| record.metadata.position > cutoff) {
+                        let table = legacy_table_ref(message.table_name.as_deref().unwrap_or_default())?;
+                        let keys = message.trie_keys.iter().map(|key| key.parse()).collect::<Result<BTreeSet<_>>>()?;
+                        let cached = cached_objects(&self.partition.value(), &table, &keys);
+                        self.partition.delete_tries(&BTreeMap::from([(table, keys)]));
+                        // Every node holds its own cached copies, and the leader's delete reached only the remote store.
+                        for key in cached { let _ = self.resolve.storage.invalidate(&key).await; }
+                    }
                     self.complete_control(&record);
                 }
                 ReplicaBody::OversizedMessage(_) => return Err(invalid("Unresolved oversized body reached apply")),

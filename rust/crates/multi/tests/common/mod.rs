@@ -1,6 +1,7 @@
 //! A whole cell in one process (a directory, three logkeepers, nodes and a gateway) for the cell and chaos tests.
 #![allow(dead_code)]
 
+use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -10,18 +11,23 @@ use rtdb_server::config::NodeConfiguration;
 use tokio_postgres::{Client, NoTls, SimpleQueryMessage};
 use tokio_util::sync::CancellationToken;
 
-async fn start_node(directory: &Arc<dyn Directory>, data: &std::path::Path, storage: &CellStorage, index: usize, pool: MemberPool, park_after: Option<Duration>, compaction_workers: bool, watch: Option<Duration>) -> process::RunningNode {
-    let mut agent = AgentOptions::new(storage.clone());
-    if let Some(watch) = watch { agent.watch_interval = watch; }
-    agent.park_after = park_after;
+async fn start_node(directory: &Arc<dyn Directory>, data: &std::path::Path, agent: AgentOptions, index: usize,
+                    pool: MemberPool, compaction_workers: bool, engine_version: Option<String>) -> process::RunningNode {
     let keys: Arc<dyn rtdb_multi::keys::KeyService> = Arc::new(rtdb_multi::keys::LocalKeyService::new(data.join("keys")).unwrap());
+    let claim_wait = std::env::var("RTDB_TEST_PLACED_CLAIM_WAIT_MS").ok().map_or(2, |ms| ms.parse().unwrap());
+    let connections = pgwire_connections();
+    let configuration = NodeConfiguration::from_yaml(&format!("authn: !SingleRootUser\n  password: cell-test\nserver:\n  port: 0\n  numThreads: {connections}\n")).unwrap();
     process::start_node(Arc::clone(directory), process::NodeSettings {
         hosted_task: None,
         advertise_host: None,
-        configuration: NodeConfiguration::from_yaml("authn: !SingleRootUser\n  password: cell-test\nserver:\n  port: 0\n").unwrap(), allocation_limit_bytes: 1 << 30,
-        control: "127.0.0.1:0".parse().unwrap(), availability_zone: format!("zone-{index}"), agent, lease: lease(), claim_wait: Duration::from_millis(20), pool,
+        configuration, allocation_limit_bytes: 1 << 30,
+        control: "127.0.0.1:0".parse().unwrap(), availability_zone: format!("zone-{index}"), engine_version, agent, lease: lease(), claim_wait: Duration::from_millis(claim_wait), pool,
         keys, cache_dir: data.join(format!("cache-{index}")), local_compaction: !compaction_workers, capabilities: Some(secret()),
     }).await.unwrap()
+}
+
+pub fn pgwire_connections() -> usize {
+    std::env::var("RTDB_TEST_PGWIRE_CONNECTIONS").ok().map_or(42, |count| count.parse::<usize>().unwrap())
 }
 
 /// The secret a cell's gateway and nodes share; a test cell's is fixed.
@@ -61,20 +67,64 @@ impl Cell {
 
     /// A cell keeping its objects in `objects`, or in a directory of its own.
     pub async fn start_on(objects: Option<CellStorage>, pools: Vec<MemberPool>, park_after: Option<Duration>, watch: Option<Duration>, cells: Option<(Arc<dyn rtdb_multi::cells::CellMap>, String)>) -> Self {
+        Self::start_configured(objects, pools, park_after, watch, cells, true, |_| {}).await
+    }
+
+    pub async fn start_durable(nodes: usize) -> Self {
+        Self::start_configured(None, vec![MemberPool::General; nodes], None, None, None, true, |_| {}).await
+    }
+
+    pub async fn start_rate_limited(limit: NonZeroUsize) -> Self {
+        Self::start_configured(None, vec![MemberPool::General], None, None, None, false, |agent| agent.activations_per_second = limit).await
+    }
+
+    pub async fn start_with_idle_flush(delay: Duration) -> Self {
+        Self::start_configured(None, vec![MemberPool::General], None, None, None, true, |agent| agent.clean_after_idle = delay).await
+    }
+
+    pub async fn start_with_minimum_residency(minimum: Duration) -> Self {
+        Self::start_configured(None, vec![MemberPool::General], None, None, None, true, |agent| agent.min_residency = minimum).await
+    }
+
+    pub async fn start_scoped(objects: CellStorage, role: rtdb_multi::agent::S3WriteRole) -> Self {
+        Self::start_configured(Some(objects), vec![MemberPool::General; 2], None, None, None, true, |agent| agent.s3_write_role = Some(role)).await
+    }
+
+    async fn start_configured(objects: Option<CellStorage>, pools: Vec<MemberPool>, park_after: Option<Duration>,
+        watch: Option<Duration>, cells: Option<(Arc<dyn rtdb_multi::cells::CellMap>, String)>, fsync: bool, configure: impl FnOnce(&mut AgentOptions)) -> Self {
+        Self::start_configured_with_directory(MemoryDirectory::new(), objects, pools, park_after, watch, cells, fsync, configure).await
+    }
+
+    pub async fn start_with_directory(directory: Arc<dyn Directory>) -> Self {
+        Self::start_configured_with_directory(directory, None, vec![MemberPool::General], None, None, None, true, |_| {}).await
+    }
+
+    async fn start_configured_with_directory(directory: Arc<dyn Directory>, objects: Option<CellStorage>, pools: Vec<MemberPool>,
+        park_after: Option<Duration>, watch: Option<Duration>, cells: Option<(Arc<dyn rtdb_multi::cells::CellMap>, String)>, fsync: bool,
+        configure: impl FnOnce(&mut AgentOptions)) -> Self {
         let compaction_workers = pools.contains(&MemberPool::Compaction);
         let data = tempfile::tempdir().unwrap();
         let objects = objects.unwrap_or_else(|| CellStorage::Local { root: data.path().join("objects") });
-        let directory: Arc<dyn Directory> = MemoryDirectory::new();
         let mut logkeepers = Vec::new();
         for index in 0..3 {
             logkeepers.push(process::start_logkeeper(Arc::clone(&directory), process::LogkeeperSettings {
                 advertise_host: None,
-                listen: "127.0.0.1:0".parse().unwrap(), data_dir: data.path().join(format!("logkeeper-{index}")), fsync: true, cache_bytes: rtdb_logkeeper::ServerOptions::DEFAULT_CACHE_BYTES,
+                listen: "127.0.0.1:0".parse().unwrap(), data_dir: data.path().join(format!("logkeeper-{index}")), fsync, cache_bytes: rtdb_logkeeper::ServerOptions::DEFAULT_CACHE_BYTES,
                 availability_zone: format!("zone-{index}"), lease: lease(),
             }).await.unwrap());
         }
+        let mut agent = AgentOptions::new(objects.clone());
+        if let Some(watch) = watch { agent.watch_interval = watch; }
+        agent.park_after = park_after;
+        configure(&mut agent);
+        if agent.s3_write_role.is_some() {
+            let keys = rtdb_multi::keys::LocalKeyService::new(data.path().join("keys")).unwrap();
+            rtdb_multi::admin::initialize_storage(&objects, &keys).await.unwrap();
+        }
         let mut running = Vec::new();
-        for (index, pool) in pools.into_iter().enumerate() { running.push(Some(start_node(&directory, data.path(), &objects, index, pool, park_after, compaction_workers, watch).await)); }
+        for (index, pool) in pools.into_iter().enumerate() {
+            running.push(Some(start_node(&directory, data.path(), agent.clone(), index, pool, compaction_workers, None).await));
+        }
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let gateway = listener.local_addr().unwrap();
         let gateway_cancellation = CancellationToken::new();
@@ -95,8 +145,13 @@ impl Cell {
 
     /// Starts one more general node, as autoscaling or a replacement would.
     pub async fn add_node(&mut self) -> usize {
+        self.add_node_with_engine(None).await
+    }
+
+    pub async fn add_node_with_engine(&mut self, engine_version: Option<String>) -> usize {
         let index = self.nodes.len();
-        self.nodes.push(Some(start_node(&self.directory, self.data.path(), &self.objects, index, MemberPool::General, None, false, None).await));
+        let agent = AgentOptions::new(self.objects.clone());
+        self.nodes.push(Some(start_node(&self.directory, self.data.path(), agent, index, MemberPool::General, false, engine_version).await));
         index
     }
 

@@ -6,8 +6,9 @@
 //! A retained entry's payload stays in the segment its record was written to, and a reader reads it from there; memory holds only each entry's location and a bounded cache of payloads.
 
 use super::payload::{Cache, Item, Location, Source, Stored};
-use super::state::{Event, StreamState, Window};
-use super::store::Slot;
+use super::state::{Event, Held, StreamState, Window};
+use super::store::{Slot, Store};
+use crate::history::RetainedChain;
 use crate::protocol::{Entries, Entry};
 use bytes::{BufMut, Bytes, BytesMut};
 use fs2::FileExt;
@@ -18,7 +19,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufReader, Write as _};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use tokio::sync::{mpsc, oneshot};
 
@@ -63,8 +64,8 @@ enum Kind {
     /// The first record of a base segment: every earlier segment is superseded.
     #[prost(bool, tag = "10")]
     Base(bool),
-    #[prost(bool, tag = "11")]
-    Retired(bool),
+    #[prost(uint64, tag = "11")]
+    Drop(u64),
 }
 
 #[derive(Clone, PartialEq, Message)]
@@ -83,7 +84,7 @@ fn record(event: &Event) -> Kind {
         Event::Append(entry) => Kind::Append(entry.clone()),
         Event::Commit(lsn) => Kind::Commit(*lsn),
         Event::Trim(through) => Kind::Trim(*through),
-        Event::Retired => Kind::Retired(true),
+        Event::Drop(epoch) => Kind::Drop(*epoch),
     }
 }
 
@@ -117,6 +118,7 @@ pub(crate) enum Write {
 pub(crate) struct Work {
     pub write: Write,
     pub done: oneshot::Sender<std::result::Result<(), String>>,
+    pub _admission: Option<tokio::sync::OwnedSemaphorePermit>,
 }
 
 /// The segment being appended to; touched only by the journal's rounds.
@@ -139,7 +141,7 @@ pub(crate) struct Journal {
     next_id: AtomicU64,
     compaction_queued: AtomicBool,
     compaction_finished: tokio::sync::Notify,
-    compacted: Mutex<HashMap<u64, (u64, i64)>>,
+    compacted: Mutex<HashMap<u64, u64>>,
     /// A handle on every segment from the last base on, for reads.
     files: Mutex<BTreeMap<u64, Arc<File>>>,
     cache: Mutex<Cache>,
@@ -194,17 +196,18 @@ fn sync_directory(directory: &Path, fsync: bool) -> Result<()> {
     rtdb_storage::sync_directory(directory).map_err(|error| io_error(directory, error))
 }
 
-/// Every segment file by sequence, removing temporary files a crashed compaction left.
-fn list_segments(segments: &Path) -> Result<BTreeMap<u64, PathBuf>> {
+fn list_segments(segments: &Path, remove_temporary: bool) -> Result<BTreeMap<u64, PathBuf>> {
     let mut sequences = BTreeMap::new();
     for entry in fs::read_dir(segments).map_err(|error| io_error(segments, error))? {
         let path = entry.map_err(|error| io_error(segments, error))?.path();
         match path.extension().and_then(|extension| extension.to_str()) {
             Some("seg") => {
                 let sequence = path.file_stem().and_then(|stem| stem.to_str()).and_then(|stem| stem.parse::<u64>().ok()).ok_or_else(|| corrupt(&path, "not a segment name"))?;
-                sequences.insert(sequence, path);
+                if sequences.insert(sequence, path.clone()).is_some() {
+                    return Err(corrupt(&path, format!("duplicate segment sequence {sequence}")));
+                }
             }
-            Some("tmp") => fs::remove_file(&path).map_err(|error| io_error(&path, error))?,
+            Some("tmp") if remove_temporary => fs::remove_file(&path).map_err(|error| io_error(&path, error))?,
             _ => (),
         }
     }
@@ -223,6 +226,17 @@ fn is_base(path: &Path) -> Result<bool> {
     Ok(matches!(read_record(&mut reader, length).map_err(|error| io_error(path, error))?, Some((Record { kind: Some(Kind::Base(_)), .. }, _))))
 }
 
+fn current_chain(segments: &Path, remove_temporary: bool) -> Result<Vec<(u64, PathBuf)>> {
+    let mut chain = Vec::new();
+    for (sequence, path) in list_segments(segments, remove_temporary)?.into_iter().rev() {
+        let base = is_base(&path)?;
+        chain.push((sequence, path));
+        if base { break; }
+    }
+    chain.reverse();
+    Ok(chain)
+}
+
 /// Reads the next whole record of a segment of `remaining` bytes from here, with its framed length; none at the first incomplete or damaged one.
 fn read_record(reader: &mut impl std::io::Read, remaining: u64) -> std::io::Result<Option<(Record, u64)>> {
     if remaining < 8 { return Ok(None); }
@@ -238,7 +252,7 @@ fn read_record(reader: &mut impl std::io::Read, remaining: u64) -> std::io::Resu
 }
 
 fn remove_before(segments: &Path, sequence: u64) -> Result<()> {
-    for (_, path) in list_segments(segments)?.range(..sequence) { fs::remove_file(path).map_err(|error| io_error(path, error))?; }
+    for (_, path) in list_segments(segments, true)?.range(..sequence) { fs::remove_file(path).map_err(|error| io_error(path, error))?; }
     Ok(())
 }
 
@@ -287,7 +301,7 @@ impl Journal {
         let lock_path = data_dir.join("LOCK");
         let lock = OpenOptions::new().create(true).truncate(false).write(true).open(&lock_path).map_err(|error| io_error(&lock_path, error))?;
         lock.try_lock_exclusive().map_err(|error| io_error(&lock_path, error))?;
-        let files = list_segments(&segments)?;
+        let files = list_segments(&segments, true)?;
         let member_path = data_dir.join("MEMBER");
         let mut identity = None;
         if let Some(ref mode) = member {
@@ -327,7 +341,7 @@ impl Journal {
         let mut files = BTreeMap::new();
         let last_index = chain.len().checked_sub(1);
         for (index, (sequence, path)) in chain.iter().enumerate() {
-            let (end, length) = replay.segment(*sequence, path)?;
+            let (end, length) = replay.segment(*sequence, path, None)?;
             if end < length {
                 if Some(index) != last_index { return Err(corrupt(path, format!("a damaged record at {end} before the last segment"))); }
                 let file = OpenOptions::new().write(true).open(path).map_err(|error| io_error(path, error))?;
@@ -384,8 +398,8 @@ impl Journal {
 
     pub fn is_durable(&self) -> bool { self.fsync }
 
-    pub fn compacted(&self, stream: u64, epoch: u64, through: i64) -> bool {
-        self.compacted.lock().get(&stream).is_some_and(|stamp| stamp.0 >= epoch && stamp.1 >= through)
+    pub fn compacted_retirement(&self, stream: u64, epoch: u64) -> bool {
+        self.compacted.lock().get(&stream).is_some_and(|stamp| *stamp >= epoch)
     }
 
     /// Writes one round: every work in order, then one sync of the segment.
@@ -470,7 +484,9 @@ impl Journal {
         for stream in captured {
             let (id, state) = (stream.slot.id, &stream.state);
             frame(id, Kind::Declare(stream.slot.name.clone()), &mut buffer);
-            frame(id, Kind::Snapshot(Snapshot { promised: state.promised, synced: state.synced.unwrap_or(0), trim: state.trim, commit: state.commit, retired: state.retired }), &mut buffer);
+            frame(id, Kind::Snapshot(Snapshot {
+                promised: state.promised, synced: state.synced.unwrap_or(0), trim: state.trim, commit: state.commit, retired: state.dropped,
+            }), &mut buffer);
             let mut locations = Vec::with_capacity(state.entries.len());
             for (held, lsn) in state.entries.iter().zip(state.trim + 1..) {
                 let payload = match &held.payload {
@@ -503,9 +519,8 @@ impl Journal {
         remove_before(&self.segments, sequence)?;
         self.files.lock().retain(|segment, _| *segment >= sequence);
         sync_directory(&self.segments, self.fsync)?;
-        *self.compacted.lock() = captured.iter().map(|stream| {
-            (stream.slot.id, (stream.state.promised, stream.state.trim))
-        }).collect();
+        *self.compacted.lock() = captured.iter().filter(|stream| stream.state.dropped)
+            .map(|stream| (stream.slot.id, stream.state.promised)).collect();
         Ok(())
     }
 
@@ -543,12 +558,7 @@ impl Journal {
     fn read(&self, file: Option<&File>, lsn: i64, location: Location) -> Result<Bytes> {
         let path = segment_path(&self.segments, location.segment);
         let file = file.ok_or_else(|| Anomaly::fault("rtdb.logkeeper/segment-retired", format!("lsn {lsn} points at retired segment {}", path.display())))?;
-        let mut frame = vec![0; location.length as usize];
-        read_exact_at(file, &mut frame, location.offset).map_err(|error| io_error(&path, error))?;
-        match next_record(&Bytes::from(frame), &mut 0) {
-            Some(Record { kind: Some(Kind::Append(entry)), .. }) if entry.lsn == lsn => Ok(entry.payload),
-            _ => Err(corrupt(&path, format!("no entry {lsn} at {}", location.offset))),
-        }
+        read_payload(file, &path, lsn, location)
     }
 
     /// Reads every payload a window still needs from its segment, caching what it reads; blocks.
@@ -581,12 +591,12 @@ impl Journal {
 struct Replay {
     names: HashMap<u64, String>,
     states: HashMap<u64, StreamState<Stored>>,
-    compacted: HashMap<u64, (u64, i64)>,
+    compacted: HashMap<u64, u64>,
 }
 
 impl Replay {
     /// Applies a segment's records, reading it once in order, returning where the last whole record ends and the segment's length.
-    fn segment(&mut self, sequence: u64, path: &Path) -> Result<(u64, u64)> {
+    fn segment(&mut self, sequence: u64, path: &Path, selected_stream: Option<&str>) -> Result<(u64, u64)> {
         let file = File::open(path).map_err(|error| io_error(path, error))?;
         let length = file.metadata().map_err(|error| io_error(path, error))?.len();
         let mut reader = BufReader::with_capacity(1 << 20, file);
@@ -596,31 +606,37 @@ impl Replay {
             position += framed;
             let kind = kind.ok_or_else(|| corrupt(path, "a record without a kind"))?;
             if let Kind::Declare(name) = &kind {
+                if selected_stream.is_some_and(|selected| name != selected) { continue; }
                 self.names.insert(stream, name.clone());
                 self.states.entry(stream).or_default();
                 continue;
             }
             if let Kind::Base(_) = kind { continue; }
-            let state = self.states.get_mut(&stream).ok_or_else(|| corrupt(path, format!("stream {stream} was never declared")))?;
+            let state = match self.states.get_mut(&stream) {
+                Some(state) => state,
+                None if selected_stream.is_some() => continue,
+                None => return Err(corrupt(path, format!("stream {stream} was never declared"))),
+            };
             match kind {
                 Kind::Declare(_) | Kind::Base(_) => unreachable!("handled above"),
                 Kind::Snapshot(snapshot) => {
-                    self.compacted.insert(stream, (snapshot.promised, snapshot.trim));
-                    *state = StreamState { promised: snapshot.promised, synced: (snapshot.synced != 0).then_some(snapshot.synced), trim: snapshot.trim, commit: snapshot.commit, retired: snapshot.retired, entries: Default::default() };
+                    if snapshot.retired { self.compacted.insert(stream, snapshot.promised); }
+                    *state = StreamState {
+                        promised: snapshot.promised, synced: (snapshot.synced != 0).then_some(snapshot.synced),
+                        trim: snapshot.trim, commit: snapshot.commit, dropped: snapshot.retired, ..StreamState::default()
+                    };
                 }
                 Kind::Promise(epoch) => state.apply(&Event::Promise(epoch)),
                 Kind::Synced(epoch) => state.apply(&Event::Synced((epoch != 0).then_some(epoch))),
                 Kind::Truncate(from) => state.apply(&Event::Truncate(from)),
                 Kind::Append(entry) => {
                     if entry.lsn != state.last() + 1 { return Err(corrupt(path, format!("stream {stream}'s entry {} follows {}", entry.lsn, state.last()))); }
-                    let (lsn, payload) = (entry.lsn, entry.payload.len() as u32);
-                    state.apply(&Event::Append(Entry { payload: Bytes::new(), ..entry }));
-                    let held = state.held_mut(lsn).expect("just appended");
-                    held.payload = Stored::Written(Location { segment: sequence, offset: at, length: framed as u32, payload });
+                    let location = Location { segment: sequence, offset: at, length: framed as u32, payload: entry.payload.len() as u32 };
+                    state.append_held(entry.lsn, Held { epoch: entry.epoch, timestamp: entry.timestamp, payload: Stored::Written(location) });
                 }
                 Kind::Commit(lsn) => state.apply(&Event::Commit(lsn)),
                 Kind::Trim(through) => state.apply(&Event::Trim(through)),
-                Kind::Retired(_) => state.apply(&Event::Retired),
+                Kind::Drop(epoch) => state.apply(&Event::Drop(epoch)),
             }
         }
         Ok((position, length))
@@ -640,8 +656,92 @@ fn next_record(bytes: &Bytes, position: &mut usize) -> Option<Record> {
     Some(record)
 }
 
+fn read_payload(file: &File, path: &Path, lsn: i64, location: Location) -> Result<Bytes> {
+    let mut frame = vec![0; location.length as usize];
+    read_exact_at(file, &mut frame, location.offset).map_err(|error| io_error(path, error))?;
+    match next_record(&Bytes::from(frame), &mut 0) {
+        Some(Record { kind: Some(Kind::Append(entry)), .. }) if entry.lsn == lsn => Ok(entry.payload),
+        _ => Err(corrupt(path, format!("no entry {lsn} at {}", location.offset))),
+    }
+}
+
+/// A fingerprint of the committed interval read from a stopped logkeeper.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct JournalDigest { pub stream: String, pub interval: [i64; 2], pub digest: String }
+
+impl JournalDigest {
+    pub fn from_digest_bytes(stream: String, interval: [i64; 2], digest: [u8; 32]) -> Self {
+        Self { stream, interval, digest: RetainedChain::from_bytes(digest).digest() }
+    }
+
+    pub fn digest_bytes(&self) -> Option<[u8; 32]> {
+        RetainedChain::continue_from(&self.digest).map(|digest| digest.bytes())
+    }
+}
+
+/// Reads a stopped logkeeper's journal without changing its files.
+pub fn inspect_retained(data_dir: &Path, stream: &str, requested: Option<[i64; 2]>) -> Result<Option<JournalDigest>> {
+    inspect_retained_with_prefix(data_dir, stream, requested, None)
+}
+
+/// Extends a retained digest using the committed entries immediately after its interval.
+pub fn inspect_retained_with_prefix(data_dir: &Path, stream: &str, requested: Option<[i64; 2]>, prefix: Option<&JournalDigest>) -> Result<Option<JournalDigest>> {
+    let lock_path = data_dir.join("LOCK");
+    let lock = File::open(&lock_path).map_err(|error| io_error(&lock_path, error))?;
+    FileExt::try_lock_shared(&lock).map_err(|error| io_error(&lock_path, error))?;
+    let segments = data_dir.join("segments");
+    let chain = current_chain(&segments, false)?;
+    if chain.windows(2).any(|pair| pair[0].0.checked_add(1) != Some(pair[1].0)) {
+        return Err(corrupt(&segments, "the journal's current chain has a missing segment"));
+    }
+    let mut replay = Replay::default();
+    for (sequence, path) in &chain {
+        let (end, length) = replay.segment(*sequence, path, Some(stream))?;
+        if end != length { return Err(corrupt(path, format!("a damaged record at {end}"))); }
+    }
+    let mut ids = replay.names.iter().filter(|(_, name)| name.as_str() == stream).map(|(id, _)| *id);
+    let id = ids.next()
+        .ok_or_else(|| Anomaly::incorrect("rtdb.logkeeper/unknown-stream", format!("The journal has no stream named {stream}")))?;
+    if ids.next().is_some() { return Err(corrupt(&segments, format!("more than one stream id names {stream}"))); }
+    let state = replay.states.remove(&id).expect("each declared stream has state");
+    if state.commit > state.last() { return Err(corrupt(&segments, format!("the commit position for {stream} exceeds its last record"))); }
+    let retained = state.trim.saturating_add(1);
+    let through = state.commit;
+    let [first, last] = match requested {
+        Some([first, last]) if first >= retained && last <= through && first <= last => [first, last],
+        Some(_) => return Err(Anomaly::incorrect("rtdb.logkeeper/audit-range", format!("The journal's retained committed interval is {retained} through {through}"))),
+        None if retained > through && prefix.is_none() => return Ok(None),
+        None if retained > through => return Err(Anomaly::incorrect("rtdb.logkeeper/audit-range", "The journal has no committed suffix to audit")),
+        None => [retained, through],
+    };
+    let (chain_first, mut digest) = if let Some(prefix) = prefix {
+        let [prefix_first, prefix_last] = prefix.interval;
+        if prefix.stream != stream || prefix_first < 0 || prefix_first > prefix_last || prefix_last.checked_add(1) != Some(first) {
+            return Err(Anomaly::incorrect("rtdb.logkeeper/audit-prefix", "The prefix must name this stream and end immediately before the audited interval"));
+        }
+        let digest = RetainedChain::continue_from(&prefix.digest)
+            .ok_or_else(|| Anomaly::incorrect("rtdb.logkeeper/audit-prefix", "The prefix digest must be a lowercase SHA-256 value"))?;
+        (prefix_first, digest)
+    } else {
+        (first, RetainedChain::new(stream, first))
+    };
+    let paths: BTreeMap<_, _> = chain.into_iter().collect();
+    let mut file: Option<(u64, File)> = None;
+    for lsn in first..=last {
+        let held = state.entries.get((lsn - retained) as usize).ok_or_else(|| corrupt(&segments, format!("missing committed position {lsn}")))?;
+        let Stored::Written(location) = held.payload else { return Err(corrupt(&segments, format!("unfinished committed position {lsn}"))); };
+        let path = paths.get(&location.segment).ok_or_else(|| corrupt(&segments, format!("missing segment for position {lsn}")))?;
+        if file.as_ref().is_none_or(|(sequence, _)| *sequence != location.segment) {
+            file = Some((location.segment, File::open(path).map_err(|error| io_error(path, error))?));
+        }
+        let payload = read_payload(&file.as_ref().expect("opened segment").1, path, lsn, location)?;
+        digest.append(&Entry { lsn, epoch: held.epoch, timestamp: held.timestamp, payload });
+    }
+    Ok(Some(JournalDigest { stream: stream.to_owned(), interval: [chain_first, last], digest: digest.digest() }))
+}
+
 /// Group commit: whatever has queued while the previous round was syncing goes into the next round together, across every stream.
-pub(crate) async fn run(journal: Arc<Journal>, mut queue: mpsc::UnboundedReceiver<Work>) -> Result<()> {
+pub(crate) async fn run(journal: Arc<Journal>, store: Weak<Store>, mut queue: mpsc::UnboundedReceiver<Work>) -> Result<()> {
     const MAXIMUM_ROUND: usize = 8192;
     while let Some(first) = queue.recv().await {
         let mut works = vec![first];
@@ -655,7 +755,17 @@ pub(crate) async fn run(journal: Arc<Journal>, mut queue: mpsc::UnboundedReceive
             (works, result)
         }).await.map_err(|error| Anomaly::fault("rtdb.logkeeper/journal-task", error.to_string()))?;
         match result {
-            Ok(()) => for work in works { let _ = work.done.send(Ok(())); },
+            Ok(()) => {
+                let mut released = false;
+                for work in works {
+                    match &work.write {
+                        Write::Events(_, events) => released |= events.iter().any(|event| matches!(event, Event::Trim(_) | Event::Drop(_))),
+                        Write::Compact(_) => released = false,
+                    }
+                    let _ = work.done.send(Ok(()));
+                }
+                if released && let Some(store) = store.upgrade() { store.compact_if_mostly_dead(); }
+            }
             Err(error) => {
                 for work in works { let _ = work.done.send(Err(error.to_string())); }
                 queue.close();
@@ -677,7 +787,7 @@ mod tests {
 
     fn sized(lsn: i64, epoch: u64, bytes: usize) -> Entry { Entry { lsn, epoch, timestamp: lsn, payload: Bytes::from(format!("{lsn}@{epoch}:{}", "x".repeat(bytes))) } }
 
-    fn work(write: Write) -> Work { Work { write, done: oneshot::channel().0 } }
+    fn work(write: Write) -> Work { Work { write, done: oneshot::channel().0, _admission: None } }
 
     fn slot(journal: &Journal, name: &str) -> Arc<Slot> {
         Arc::new(Slot { id: journal.allocate_id(), name: name.into(), state: Default::default(), progressed: Default::default() })

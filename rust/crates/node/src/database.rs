@@ -10,7 +10,7 @@ use rtdb_replication::{BlockStore, PartitionLogs, ProgressMonitor, ReplicationDr
 use rtdb_storage::{IoRegion, ObjectStore, cache::{BufferPool, CacheBudget}};
 use rtdb_tx::{ResolveContext, TransactionAuthorization};
 use rtdb_types::{Anomaly, AnomalyCategory, ReplicaPosition, Result, SourcePosition, TableRef, Term};
-use tokio::sync::{mpsc, watch};
+use tokio::sync::{RwLock, RwLockReadGuard, RwLockWriteGuard, Semaphore, mpsc, watch};
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 
@@ -27,6 +27,7 @@ pub struct Database {
     pub(crate) storage: Arc<BufferPool>,
     pub(crate) logs: Arc<PartitionLogs>,
     pub(crate) replication: ReplicationHandle,
+    transaction_admission: RwLock<parking_lot::Mutex<Option<SourcePosition>>>,
     compaction: Option<CompactionHandle>,
     artefacts: Vec<ArtefactHandle>,
     ordered_cycle: Option<OrderedIndexCycle>,
@@ -60,9 +61,25 @@ impl Database {
     pub fn external_source(&self) -> bool { self.configuration.external_source.is_some() }
     pub fn progress(&self) -> &Arc<ProgressMonitor> { self.replication.progress() }
     pub fn status(&self) -> rtdb_replication::DriverStatus { self.replication.status() }
+    /// Observes the replication driver's current status and subsequent changes.
+    pub fn watch_status(&self) -> watch::Receiver<rtdb_replication::DriverStatus> { self.replication.watch_status() }
     pub fn compaction(&self) -> Option<&CompactionHandle> { self.compaction.as_ref() }
     /// Rows applied since the last block, held in the live index until the next flush.
     pub fn live_rows(&self) -> u64 { self.partition.value().live().block_row_count() }
+    /// Pauses new user submissions and waits for the admitted ones to apply.
+    pub async fn pause_transactions(&self) -> Result<PausedTransactions<'_>> {
+        let paused = self.transaction_admission.write().await;
+        let latest = *paused.lock();
+        if let Some(latest) = latest { self.replication.await_source(latest, &self.cancellation).await?; }
+        Ok(PausedTransactions { _admission: paused })
+    }
+    pub(crate) async fn admit_transaction(&self) -> Result<RwLockReadGuard<'_, parking_lot::Mutex<Option<SourcePosition>>>> {
+        let permit = self.transaction_admission.read().await;
+        if self.cancellation.is_cancelled() {
+            return Err(Anomaly::new(AnomalyCategory::Unavailable, crate::node::NOT_HELD, format!("This node no longer holds {}", self.name)));
+        }
+        Ok(permit)
+    }
     /// Publishes a compaction produced elsewhere, as this database's writer.
     pub async fn publish_compaction(&self, notification: TriesAdded, cancellation: &CancellationToken) -> Result<SourcePosition> {
         self.require_writable()?;
@@ -103,6 +120,8 @@ impl Database {
     }
 }
 
+pub struct PausedTransactions<'a> { _admission: RwLockWriteGuard<'a, parking_lot::Mutex<Option<SourcePosition>>> }
+
 pub(crate) struct DatabaseFactory {
     pub options: NodeOptions,
     pub resources: Arc<dyn ResourceFactory>,
@@ -117,6 +136,7 @@ pub(crate) struct DatabaseFactory {
     pub compaction_relay: Option<Arc<dyn CompactionRelay>>,
     pub artefact_kinds: Vec<Arc<dyn ArtefactKind>>,
     pub accelerators: Arc<[Arc<dyn rtdb_query::ScanAccelerator>]>,
+    pub compaction_slots: Option<Arc<Semaphore>>,
 }
 
 /// Publishes a compaction a read-only database produced through the database's writer, which alone may append it.
@@ -165,7 +185,7 @@ impl DatabaseFactory {
             let logs = PartitionLogs::new(opened_logs.source, opened_logs.replica, opened_logs.source_epoch, opened_logs.replica_epoch,
                 resources.storage_version, resources.storage_epoch, Arc::clone(&resources.store), Arc::clone(&storage), Arc::clone(&self.memory))?;
             let recovered = if self.options.replication.enabled {
-                blocks.recover_for_replay(recovered, &logs, self.options.trie, self.clock.now(), resources.blocks, &cancellation).await?
+                blocks.recover_for_replay(recovered, &logs, self.options.trie, self.clock.now(), &cancellation).await?
             } else { recovered.with_source_floor(logs.source_floor()?) };
             let secondaries = recovered.block.as_ref().map(|block| block.secondary_databases().clone()).unwrap_or_default();
             let partition = Arc::clone(&recovered.partition);
@@ -197,6 +217,10 @@ impl DatabaseFactory {
             let (compactor, compaction) = match publisher { None => (None, None), Some(publisher) => {
                 let executor = Arc::new(TimedCompaction { executor: SegmentCompactor::new(Arc::clone(&resources.store), Arc::clone(&snapshots), Arc::clone(&self.memory), resources.storage_version, resources.storage_epoch, self.options.compaction.clone())?.with_artefacts(builders.iter().map(|(_, builder)| Arc::clone(builder)).collect()), observer: self.execution_observer.clone() });
                 let (driver, handle) = CompactionDriver::new(Arc::clone(&snapshots), executor, publisher, self.options.compaction_threads, self.options.command_capacity, !self.options.automatic_compaction)?;
+                let driver = match &self.compaction_slots {
+                    Some(slots) => driver.with_job_slots(Arc::clone(slots)),
+                    None => driver,
+                };
                 (Some(driver), Some(handle))
             } };
             let mut artefact_drivers = Vec::new();
@@ -217,7 +241,7 @@ impl DatabaseFactory {
             let ordered_cycle = ordered_worker.as_ref().map(|_| watch::channel(None).0);
             let supervisor = MaintenanceSupervisor { store: resources.store, partition: Arc::clone(&partition), replication: replication.clone(), compaction: compaction.clone(), artefacts: artefacts.clone(),
                 observer: Arc::clone(&self.observer), options: self.options.clone(), source, ordered_worker, ordered_cycle: ordered_cycle.clone() };
-            let database = Arc::new(Database { name, configuration, read_only, partition, storage, logs, replication, compaction, artefacts, ordered_cycle, cancellation: cancellation.clone(), io: Arc::clone(&io) });
+            let database = Arc::new(Database { name, configuration, read_only, partition, storage, logs, replication, transaction_admission: RwLock::default(), compaction, artefacts, ordered_cycle, cancellation: cancellation.clone(), io: Arc::clone(&io) });
             let driver = DatabaseDriver { database: Arc::clone(&database), replication: replica_driver, compactor, artefacts: artefact_drivers, supervisor, logs: opened_logs.drivers, log_cancellation };
             Ok(OpenedDatabase { database, driver, secondaries })
         }.await;

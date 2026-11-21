@@ -5,16 +5,17 @@
 //! - `GarbageStore` turns a delete into a garbage record; only the reaper erases an object, once it has been garbage for the grace period (`OnlyTheReaperDeletes`, `ReapUnreachable`).
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::fs::File;
 use std::ops::Range;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
-use std::time::Duration;
+use std::sync::{Arc, OnceLock};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
 use bytes::Bytes;
 use parking_lot::Mutex;
 use prost_types::Any;
-use rtdb_directory::{Cas, DeploymentRecord, Directory, HostedTask, Lifecycle, StoragePublication, StorageRegion, now_ms};
+use rtdb_directory::{Cas, DeploymentRecord, Directory, Lifecycle, MemberId, MemberPool, MemberRole, MemberState, HostedTask, StoragePublication, StorageRegion, now_ms};
 use rtdb_node::RemoteStorageFactory;
 use rtdb_storage::{Error, IoRegion, ObjectKey, ObjectStore, object_store::StoredObject, remote::PublicationJournal};
 use rtdb_types::{Anomaly, Result};
@@ -57,11 +58,121 @@ pub struct CellStoreConfig {
     pub snapshot_block: Option<i64>,
 }
 
+impl CellStoreConfig {
+    fn cache_identity(&self) -> Result<Vec<u8>> {
+        serde_json::to_vec(&(&self.storage, &self.prefix, &self.deployment))
+            .map_err(|error| Anomaly::fault("rtdb.multi/cache-identity", error.to_string()))
+    }
+}
+
 pub struct CellStoreFactory {
     pub directory: Arc<dyn Directory>,
     pub keys: Arc<dyn KeyService>,
+    pub storage_namespaces: rtdb_directory::StorageNamespaces,
     pub(crate) hosted_task: Option<HostedTask>,
     pub(crate) storage_regions: TaskTracker,
+    pub(crate) scoped_writes: Option<Arc<ScopedCellWrites>>,
+    pub(crate) local_witnesses: Option<Arc<LocalWitnessPool>>,
+}
+
+enum LocalWitnessSlot {
+    Empty,
+    Preparing,
+    Ready(Uuid, File),
+}
+
+pub(crate) struct LocalWitnessPool {
+    keys: Arc<dyn KeyService>,
+    slot: Mutex<LocalWitnessSlot>,
+}
+
+impl LocalWitnessPool {
+    pub(crate) fn new(keys: Arc<dyn KeyService>, tasks: &TaskTracker) -> Arc<Self> {
+        let pool = Arc::new(Self { keys, slot: Mutex::new(LocalWitnessSlot::Empty) });
+        let _ = pool.take(tasks);
+        pool
+    }
+
+    fn take(self: &Arc<Self>, tasks: &TaskTracker) -> Option<(Uuid, File)> {
+        let ready = match std::mem::replace(&mut *self.slot.lock(), LocalWitnessSlot::Preparing) {
+            LocalWitnessSlot::Preparing => return None,
+            LocalWitnessSlot::Empty => None,
+            LocalWitnessSlot::Ready(id, file) => Some((id, file)),
+        };
+        let pool = Arc::clone(self);
+        tasks.spawn_blocking(move || {
+            let id = Uuid::new_v4();
+            let prepared = match pool.keys.hold_local_storage_region(id) {
+                Ok(Some(file)) => LocalWitnessSlot::Ready(id, file),
+                Ok(None) => LocalWitnessSlot::Empty,
+                Err(error) => {
+                    eprintln!("Could not prepare a standby storage witness: {}", error.code);
+                    LocalWitnessSlot::Empty
+                }
+            };
+            *pool.slot.lock() = prepared;
+        });
+        ready
+    }
+}
+
+impl Drop for LocalWitnessPool {
+    fn drop(&mut self) {
+        if let LocalWitnessSlot::Ready(id, file) = std::mem::replace(self.slot.get_mut(), LocalWitnessSlot::Empty) {
+            drop(file);
+            if let Err(error) = self.keys.forget_local_storage_region(id) {
+                eprintln!("Could not remove standby storage witness {id}: {}", error.code);
+            }
+        }
+    }
+}
+
+pub(crate) struct ScopedCellWrites {
+    issuer: rtdb_s3::ScopedS3Writes,
+    member: OnceLock<MemberId>,
+}
+
+impl ScopedCellWrites {
+    pub fn new(issuer: rtdb_s3::ScopedS3Writes) -> Self { Self { issuer, member: OnceLock::new() } }
+    pub fn set_member(&self, member: MemberId) { self.member.set(member).expect("a storage factory has one member"); }
+}
+
+struct ScopedWriter {
+    directory: Arc<dyn Directory>,
+    deployment: String,
+    prefix: String,
+    epoch: Option<u64>,
+    member: MemberId,
+}
+
+#[async_trait]
+impl rtdb_s3::WriteAuthorization for ScopedWriter {
+    async fn authorize(&self, expires: Option<SystemTime>) -> Result<()> {
+        let inactive = || Anomaly::new(rtdb_types::AnomalyCategory::Unavailable, rtdb_node::NOT_HELD, "The deployment's write grant is fenced");
+        let lease_until = expires.map(|expires| {
+            let expires = expires.checked_add(rtdb_s3::SCOPED_S3_CLOCK_ALLOWANCE)
+                .ok_or_else(|| Anomaly::fault("rtdb.multi/storage-lease", "The storage lease expiration is out of range"))?;
+            let elapsed = expires.duration_since(UNIX_EPOCH).map_err(|error| Anomaly::fault("rtdb.multi/storage-lease", error.to_string()))?;
+            i64::try_from(elapsed.as_millis()).map_err(|error| Anomaly::fault("rtdb.multi/storage-lease", error.to_string()))
+        }).transpose()?;
+        for _ in 0..8 {
+            let (current, member) = tokio::try_join!(self.directory.deployment(&self.deployment), self.directory.member(&self.member))?;
+            let (mut current, member) = current.zip(member).ok_or_else(&inactive)?;
+            let now = now_ms();
+            let admitted = current.storage_prefix() == self.prefix && match self.epoch {
+                Some(epoch) => current.epoch == epoch && current.holder.as_ref() == Some(&self.member) && current.may_hold_on(&member, now),
+                None => current.lifecycle == Lifecycle::Live && member.role == MemberRole::Node && member.pool == MemberPool::Compaction
+                    && member.state == MemberState::Eligible && member.is_live(now) && current.permits_engine(&member),
+            };
+            if !admitted { return Err(inactive()); }
+            let Some(lease_until) = lease_until.filter(|deadline| current.s3_write_lease_until_ms.is_none_or(|existing| *deadline > existing))
+                else { return Ok(()); };
+            current.s3_write_lease_until_ms = Some(lease_until);
+            let version = current.version;
+            if let Cas::Applied(_) = self.directory.replace_deployment(current, version).await? { return Ok(()); }
+        }
+        Err(Anomaly::new(rtdb_types::AnomalyCategory::Busy, "rtdb.multi/storage-lease-contended", "The deployment kept changing while recording a write session"))
+    }
 }
 
 #[async_trait]
@@ -75,18 +186,40 @@ impl RemoteStorageFactory for CellStoreFactory {
         } else {
             None
         };
-        let bucket = config.storage.bucket(region).await?;
+        if record.storage_namespaces.is_some() {
+            crate::deployment::require_storage_namespaces(&record, self.storage_namespaces)?;
+        }
+        let bucket = config.storage.bucket(Arc::clone(&region)).await?;
         let store = format!("{}/{}", config.prefix, storage_root.as_str());
-        let root = FencedStore {
-            inner: Arc::new(crate::reference::PrefixedStore::new(Arc::clone(&bucket), store.clone())),
+        let writer = match (&self.scoped_writes, &config.storage) {
+            (Some(scoped), crate::deployment::CellStorage::S3 { config: storage }) if config.writer_epoch.is_some() || config.compactor => {
+                let cell_root = ObjectKey::new(crate::deployment::S3_CELL_ROOT)?;
+                let root = ObjectKey::new(format!("{cell_root}/{store}"))?;
+                let member = scoped.member.get().cloned()
+                    .ok_or_else(|| Anomaly::fault("rtdb.multi/write-member-missing", "The node has no registered identity for scoped writes"))?;
+                let authorization = Arc::new(ScopedWriter { directory: Arc::clone(&self.directory), deployment: config.deployment.clone(),
+                    prefix: config.prefix.clone(), epoch: config.writer_epoch, member });
+                Some(scoped.issuer.open(storage, &cell_root, &root, authorization, region)?)
+            }
+            _ => None,
+        };
+        let local = Arc::new(crate::reference::PrefixedStore::new(Arc::clone(&bucket), store.clone()).with_writer(writer));
+        let root: Arc<dyn ObjectStore> = Arc::new(FencedStore {
+            inner: local,
             directory: self.directory.clone(),
             deployment: config.deployment.clone(),
+            prefix: config.prefix.clone(),
             fence: Fence::from(&config),
             _release: Some(release),
-        };
-        confirm_root(&root, &config.deployment, config.writer_epoch.is_some()).await?;
-        let discovery = match record.checkpoint { Some(checkpoint) => crate::packing::PackDiscovery::From(checkpoint.block), None => crate::packing::PackDiscovery::List };
-        Ok(open_with_scoped_store(bucket, &store, Arc::new(root), discovery, wall_clock(), recovery).await?)
+        });
+        check_root(root.as_ref(), &config.deployment, config.writer_epoch.is_some()).await?;
+        Ok(open_cell_store(bucket, &store, root, &record, wall_clock(), recovery).await?)
+    }
+
+    fn cache_identity<'a>(&self, configuration: &'a Any) -> Result<std::borrow::Cow<'a, [u8]>> {
+        let store: CellStoreConfig = serde_json::from_slice(&configuration.value)
+            .map_err(|error| Anomaly::incorrect("rtdb.multi/storage-config", format!("Cell storage configuration is malformed: {error}")))?;
+        Ok(std::borrow::Cow::Owned(store.cache_identity()?))
     }
 
     /// A deployment with a published checkpoint recovers from it without listing its store.
@@ -94,7 +227,16 @@ impl RemoteStorageFactory for CellStoreFactory {
         let config: CellStoreConfig = serde_json::from_slice(&configuration.value)
             .map_err(|error| Anomaly::incorrect("rtdb.multi/storage-config", format!("Cell storage configuration is malformed: {error}")))?;
         if let Some(block) = config.snapshot_block { return Ok(rtdb_replication::BlockDiscovery::At(rtdb_types::BlockIndex(block))); }
-        Ok(match self.checkpoint(&config).await? { Some(block) => rtdb_replication::BlockDiscovery::From(rtdb_types::BlockIndex(block)), None => rtdb_replication::BlockDiscovery::List })
+        use rtdb_replication::BlockDiscovery;
+        let record = self.directory.deployment(&config.deployment).await?;
+        Ok(match record.as_ref().and_then(|record| record.checkpoint.map(|checkpoint| (checkpoint, record.compaction_replay_cutoff))) {
+            Some((checkpoint, Some(cutoff))) => BlockDiscovery::FromRestored {
+                checkpoint: rtdb_types::BlockIndex(checkpoint.block),
+                compaction_cutoff: rtdb_types::ReplicaPosition(cutoff),
+            },
+            Some((checkpoint, None)) => BlockDiscovery::From(rtdb_types::BlockIndex(checkpoint.block)),
+            None => BlockDiscovery::List,
+        })
     }
 
     /// Encryption sits above the node's disk cache, which therefore holds ciphertext.
@@ -118,14 +260,17 @@ impl CellStoreFactory {
         let keys = self.keys.clone();
         let config = config.clone();
         let hosted_task = self.hosted_task.clone();
-        let id = Uuid::new_v4();
+        let local = matches!(config.storage, CellStorage::Local { .. });
+        let prepared = self.local_witnesses.as_ref().filter(|_| local).and_then(|pool| pool.take(&self.storage_regions));
+        let id = prepared.as_ref().map_or_else(Uuid::new_v4, |(id, _)| *id);
         let (release, dropped) = oneshot::channel();
         let (ready, admitted) = oneshot::channel();
         // The worker owns both the admission and its release. Dropping the
         // opening future cannot strand a request that has reached the directory.
         self.storage_regions.spawn(async move {
-            let local = matches!(config.storage, crate::deployment::CellStorage::Local { .. });
-            let witness = if local {
+            let witness = if let Some((_, file)) = prepared {
+                Some(file)
+            } else if local {
                 match keys.hold_local_storage_region(id) {
                     Ok(witness) => witness,
                     Err(error) => {
@@ -144,9 +289,9 @@ impl CellStoreFactory {
             let accepted = crate::admin::update_installation(directory.as_ref(), &config.deployment, |record| {
                 if !matches!(record.lifecycle, Lifecycle::Live | Lifecycle::Quarantined)
                     || record.storage_prefix() != config.prefix
-                    || config.writer_epoch.is_some_and(|epoch| epoch != record.epoch)
+                    || config.writer_epoch.is_some_and(|epoch| epoch != record.epoch || record.holder.is_none())
                 {
-                    return Err(Anomaly::incorrect("rtdb.multi/storage-authority", format!("Installation {} no longer authorizes this store", config.deployment)));
+                    return Err(Anomaly::new(rtdb_types::AnomalyCategory::Unavailable, rtdb_node::NOT_HELD, format!("Installation {} no longer authorizes this store", config.deployment)));
                 }
                 let repair = record.checkpoint_recovery.as_ref()
                     .filter(|repair| repair.completed_at_ms.is_some())
@@ -163,7 +308,7 @@ impl CellStoreFactory {
             // The admission predicate and missing installation are local
             // refusals. Other directory errors may hide an applied CAS.
             let uncertain = accepted.as_ref().err().is_some_and(|error| !matches!(
-                error.code.as_str(), "rtdb.multi/storage-authority" | "rtdb.multi/unknown-installation"
+                error.code.as_str(), rtdb_node::NOT_HELD | "rtdb.multi/unknown-installation"
             ));
             if ready.send(accepted.map(|record| (record, io.clone()))).is_ok() && opened {
                 let _ = dropped.await;
@@ -191,10 +336,6 @@ impl CellStoreFactory {
             "The serving storage region could not be admitted",
         ))??;
         Ok((record, region, release))
-    }
-
-    async fn checkpoint(&self, config: &CellStoreConfig) -> Result<Option<i64>> {
-        Ok(self.directory.deployment(&config.deployment).await?.and_then(|record| record.checkpoint).map(|checkpoint| checkpoint.block))
     }
 }
 
@@ -487,18 +628,37 @@ pub(crate) async fn open_deployment_store_with_archive(
     archive: Option<crate::archive::ArchivedCheckpoint>,
 ) -> Result<Arc<GarbageStore>> {
     let local: Arc<dyn ObjectStore> = Arc::new(crate::reference::PrefixedStore::new(Arc::clone(&bucket), store.to_owned()));
-    open_with_scoped_store(bucket, store, local, discovery, clock, archive).await
+    let base = crate::reference::Base::load(bucket.as_ref(), store).await?;
+    open_with_base(bucket, local, base, discovery, clock, archive).await
 }
 
-async fn open_with_scoped_store(
+async fn open_cell_store(
     bucket: crate::reference::Bucket,
     store: &str,
     local: Arc<dyn ObjectStore>,
+    record: &DeploymentRecord,
+    clock: Clock,
+    recovery: Option<crate::archive::ArchivedCheckpoint>,
+) -> Result<Arc<GarbageStore>> {
+    let discovery = record.checkpoint.map_or(crate::packing::PackDiscovery::List, |checkpoint| {
+        crate::packing::PackDiscovery::From(checkpoint.block)
+    });
+    let base = if record.parent.is_none() || record.storage_generation.is_some() {
+        crate::reference::Base::default()
+    } else {
+        crate::reference::Base::load(bucket.as_ref(), store).await?
+    };
+    open_with_base(bucket, local, base, discovery, clock, recovery).await
+}
+
+async fn open_with_base(
+    bucket: crate::reference::Bucket,
+    local: Arc<dyn ObjectStore>,
+    base: crate::reference::Base,
     discovery: crate::packing::PackDiscovery,
     clock: Clock,
     archive: Option<crate::archive::ArchivedCheckpoint>,
 ) -> Result<Arc<GarbageStore>> {
-    let base = crate::reference::Base::load(bucket.as_ref(), store).await?;
     let own: Arc<dyn ObjectStore> = if base.objects.is_empty() { local } else { Arc::new(crate::reference::ReferencingStore::new(local, bucket, base)) };
     let packed = crate::packing::PackingStore::open_with_clock(own, discovery, Arc::clone(&clock)).await?;
     let store = match archive {
@@ -512,6 +672,7 @@ struct FencedStore {
     inner: Arc<dyn ObjectStore>,
     directory: Arc<dyn Directory>,
     deployment: String,
+    prefix: String,
     fence: Fence,
     _release: Option<oneshot::Sender<()>>,
 }
@@ -527,8 +688,9 @@ impl FencedStore {
         let current = self.directory.deployment(&self.deployment).await
             .map_err(|error| Error::Remote { key: key.to_string(), message: error.code.into() })?
             .ok_or_else(|| Error::Remote { key: key.to_string(), message: "Deployment authority is missing".into() })?;
+        if current.storage_prefix() != self.prefix { return Err(read_only()); }
         match self.fence {
-            Fence::Writer { epoch } if current.epoch == epoch
+            Fence::Writer { epoch } if current.epoch == epoch && current.holder.is_some()
                 && matches!(current.lifecycle, Lifecycle::Live | Lifecycle::Quarantined) => Ok(()),
             Fence::Writer { epoch } => Err(Error::Deposed { epoch, promised: current.epoch }),
             Fence::Compactor if current.lifecycle == Lifecycle::Live => Ok(()),
@@ -651,12 +813,13 @@ impl ObjectStore for GarbageStore {
 
 pub const ROOT_MARKER: &str = "~root";
 
-/// Only a writer can create the ownership marker for a new store.
-pub(crate) async fn confirm_root(store: &dyn ObjectStore, deployment: &str, writer: bool) -> Result<()> {
+/// Verifies the store's owner and lets a holder claim a new root.
+pub(crate) async fn check_root(store: &dyn ObjectStore, deployment: &str, claim: bool) -> Result<()> {
     let marker = ObjectKey::new(ROOT_MARKER)?;
     let owner = match store.get(&marker).await {
         Ok(owner) => owner,
-        Err(Error::MissingObject(_)) if writer => match store.put(&marker, Bytes::copy_from_slice(deployment.as_bytes())).await {
+        Err(Error::MissingObject(_)) if !claim => return Ok(()),
+        Err(Error::MissingObject(_)) => match store.put(&marker, Bytes::copy_from_slice(deployment.as_bytes())).await {
             Ok(()) => return Ok(()),
             Err(Error::ConflictingObject(_)) => store.get(&marker).await?,
             Err(error) => return Err(error.into()),
@@ -683,6 +846,7 @@ pub async fn reap(bucket: &dyn ObjectStore, record: &DeploymentRecord, grace: Du
 pub async fn reap_as_of(bucket: &dyn ObjectStore, record: &DeploymentRecord, now_ms: i64, grace: Duration, references: &crate::reference::References) -> Result<Reaped> {
     use crate::reference::{Base, physical_objects};
     let mut reaped = Reaped::default();
+    if matches!(record.lifecycle, Lifecycle::Moving | Lifecycle::Deleting | Lifecycle::Deleted) { return Ok(reaped); }
     let threshold = now_ms - grace.as_millis() as i64;
     for store in crate::reference::stores(bucket, &record.storage_prefix()).await? {
         let mut base = Base::load(bucket, &store).await?;
@@ -771,11 +935,13 @@ pub async fn run_reaper(
         tokio::select! {
             _ = cancellation.cancelled() => return,
             _ = tokio::time::sleep(interval) => {
+                let Ok(maintenance) = storage.try_local_maintenance() else { continue; };
                 if let Ok(deployments) = directory.deployments().await {
                     if let Some(keys) = keys.as_deref() {
-                        for record in deployments.iter().filter(|record| record.storage_regions.values()
-                            .any(|region| matches!(region, StorageRegion::Remote { closed: true, .. })))
-                        {
+                        for record in &deployments {
+                            if !record.storage_regions.values().any(|region| matches!(region, StorageRegion::Remote { .. })) {
+                                continue;
+                            }
                             if cancellation.is_cancelled() { return; }
                             if let Err(error) = reconcile_storage_regions(directory.as_ref(), &storage, keys, record).await {
                                 eprintln!("Storage publications for {} are pending: {}", record.id, error.code);
@@ -784,6 +950,7 @@ pub async fn run_reaper(
                     }
                     let now = wall_clock()();
                     let _ = reaper_pass(bucket.as_ref(), &deployments, now, grace).await;
+                    drop(maintenance);
                     if let Some(keys) = keys.as_deref() {
                         for record in &deployments {
                             for (&capture, release) in &record.checkpoint_capture_retirements {
@@ -850,7 +1017,13 @@ pub fn move_cleanup_due(record: &DeploymentRecord, now_ms: i64, grace: Duration)
 pub async fn reaper_pass(bucket: &dyn ObjectStore, deployments: &[DeploymentRecord], now_ms: i64, grace: Duration) -> Result<Vec<Result<Reaped>>> {
     let references = crate::reference::References::scan(bucket, deployments).await?;
     let mut reaped = Vec::new();
-    for record in deployments.iter().filter(|record| matches!(record.lifecycle, Lifecycle::Live | Lifecycle::Quarantined)) {
+    for record in deployments {
+        if !matches!(record.lifecycle, Lifecycle::Live | Lifecycle::Quarantined) { continue; }
+        // Leave a closed region's exact publication witness available until
+        // the provider observation is durably accepted by the directory.
+        if record.storage_regions.values().any(|region| matches!(region, StorageRegion::Remote { archive: None, closed: true, .. })) {
+            continue;
+        }
         reaped.push(reap_as_of(bucket, record, now_ms, grace, &references).await);
     }
     Ok(reaped)
@@ -860,18 +1033,113 @@ pub async fn reaper_pass(bucket: &dyn ObjectStore, deployments: &[DeploymentReco
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_new_storage_generation_uses_an_independent_cache_identity() {
+        let mut config = CellStoreConfig {
+            storage: crate::deployment::CellStorage::Local { root: PathBuf::from("/cell/objects") },
+            prefix: "acme/deployments/installation/1".into(),
+            deployment: "installation".into(),
+            writer_epoch: Some(8),
+            compactor: false,
+            snapshot_block: None,
+        };
+        let original = config.cache_identity().unwrap();
+        config.writer_epoch = Some(9);
+        assert_eq!(config.cache_identity().unwrap(), original);
+        config.writer_epoch = None;
+        config.compactor = true;
+        assert_eq!(config.cache_identity().unwrap(), original);
+        config.compactor = false;
+        config.snapshot_block = Some(7);
+        assert_eq!(config.cache_identity().unwrap(), original);
+        config.prefix.push_str("/generation-2");
+        assert_ne!(config.cache_identity().unwrap(), original);
+    }
+
+    #[tokio::test]
+    async fn a_prepared_local_witness_keeps_its_lock_through_admission_and_only_unused_witnesses_are_discarded() {
+        let directory = tempfile::tempdir().unwrap();
+        let keys = Arc::new(crate::keys::LocalKeyService::new(directory.path()).unwrap());
+        let tasks = TaskTracker::new();
+        let pool = LocalWitnessPool::new(keys.clone(), &tasks);
+        tasks.close();
+        tasks.wait().await;
+
+        let (id, file) = pool.take(&tasks).expect("the standby witness is ready");
+        assert!(!keys.local_storage_region_drained(id).unwrap());
+        tasks.wait().await;
+        let standby = match *pool.slot.lock() {
+            LocalWitnessSlot::Ready(id, _) => id,
+            _ => panic!("the standby witness was replenished"),
+        };
+        assert_ne!(id, standby);
+        assert!(directory.path().join(format!("{standby}.storage-region")).exists());
+        drop(pool);
+        assert!(!directory.path().join(format!("{standby}.storage-region")).exists());
+
+        assert!(!keys.local_storage_region_drained(id).unwrap());
+        drop(file);
+        assert!(keys.local_storage_region_drained(id).unwrap());
+        keys.forget_local_storage_region(id).unwrap();
+        assert!(std::fs::read_dir(directory.path()).unwrap().next().is_none());
+    }
     use rtdb_storage::LocalStore;
     use rtdb_storage::MemoryStore;
 
     fn key(name: &str) -> ObjectKey { ObjectKey::new(name).unwrap() }
 
-    struct PutFailure {
+    #[tokio::test]
+    async fn an_attach_after_the_deletion_fence_does_not_create_a_root_marker() {
+        let directory = rtdb_directory::MemoryDirectory::new();
+        let root = tempfile::tempdir().unwrap();
+        let storage = crate::deployment::CellStorage::Local { root: root.path().join("objects") };
+        let keys = Arc::new(crate::keys::LocalKeyService::new(root.path().join("keys")).unwrap());
+        let bucket = storage.bucket(IoRegion::new()).await.unwrap();
+        let storage_namespaces = crate::deployment::storage_namespaces(bucket.as_ref(), keys.as_ref()).await.unwrap();
+        let mut deleting = DeploymentRecord::new("shop", "acme", Vec::new(), 0);
+        deleting.lifecycle = Lifecycle::Deleting;
+        let deleting = directory.create_deployment(deleting).await.unwrap();
+        let config = CellStoreConfig { storage, prefix: deleting.storage_prefix(), deployment: deleting.id, writer_epoch: None, compactor: false, snapshot_block: None };
+        let factory = CellStoreFactory { directory, keys, storage_namespaces, storage_regions: TaskTracker::new(), scoped_writes: None, hosted_task: None, local_witnesses: None };
+        let config = Any { type_url: CELL_STORAGE_TYPE.into(), value: serde_json::to_vec(&config).unwrap() };
+        let result = factory.open(&config, &key("v06"), IoRegion::new()).await;
+        assert!(matches!(result, Err(error) if error.code == rtdb_node::NOT_HELD));
+        assert_eq!(bucket.list(None).await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_compactor_follows_writer_changes_and_refuses_a_deleting_prefix() {
+        let directory = rtdb_directory::MemoryDirectory::new();
+        let record = directory.create_deployment(DeploymentRecord::new("shop", "acme", Vec::new(), 0)).await.unwrap();
+        let store = FencedStore {
+            inner: Arc::new(MemoryStore::default()),
+            fence: Fence::Compactor,
+            deployment: record.id.clone(),
+            prefix: record.storage_prefix(),
+            directory: directory.clone(),
+            _release: None,
+        };
+        store.put(&key("tables/orders/data/l01-before"), Bytes::from_static(b"data")).await.unwrap();
+        let mut next = record.clone();
+        next.epoch += 1;
+        let next = directory.replace_deployment(next, record.version).await.unwrap().applied().unwrap();
+        store.put(&key("tables/orders/data/l01-after-move"), Bytes::from_static(b"data")).await.unwrap();
+        let mut deleting = next.clone();
+        deleting.lifecycle = Lifecycle::Deleting;
+        directory.replace_deployment(deleting, next.version).await.unwrap().applied().unwrap();
+        assert!(matches!(store.put(&key("tables/orders/data/l01-after-fence"), Bytes::from_static(b"data")).await, Err(Error::ReadOnlyLog(_))));
+        assert_eq!(store.list(None).await.unwrap().len(), 2);
+    }
+
+    struct StoreFaults {
         inner: MemoryStore,
         fail: std::sync::atomic::AtomicBool,
+        deny_list: std::sync::atomic::AtomicBool,
     }
 
     #[async_trait]
-    impl ObjectStore for PutFailure {
+    impl ObjectStore for StoreFaults {
         async fn head(&self, key: &ObjectKey) -> rtdb_storage::Result<StoredObject> { self.inner.head(key).await }
         async fn get(&self, key: &ObjectKey) -> rtdb_storage::Result<Bytes> { self.inner.get(key).await }
         async fn get_range(&self, key: &ObjectKey, range: Range<u64>) -> rtdb_storage::Result<Bytes> { self.inner.get_range(key, range).await }
@@ -882,21 +1150,26 @@ mod tests {
             self.inner.put(key, bytes).await
         }
         async fn put_file(&self, key: &ObjectKey, source: &Path) -> rtdb_storage::Result<()> { self.inner.put_file(key, source).await }
-        async fn list(&self, directory: Option<&ObjectKey>) -> rtdb_storage::Result<Vec<StoredObject>> { self.inner.list(directory).await }
+        async fn list(&self, directory: Option<&ObjectKey>) -> rtdb_storage::Result<Vec<StoredObject>> {
+            if self.deny_list.load(std::sync::atomic::Ordering::Relaxed) {
+                return Err(Error::Task("listing is disabled".into()));
+            }
+            self.inner.list(directory).await
+        }
         async fn delete(&self, key: &ObjectKey) -> rtdb_storage::Result<()> { self.inner.delete(key).await }
     }
 
     #[tokio::test]
     async fn a_failed_root_marker_write_is_returned_to_activation() {
-        let inner = PutFailure { inner: MemoryStore::default(), fail: true.into() };
-        assert_eq!(confirm_root(&inner, "shop", true).await.unwrap_err().code, "rtdb.storage/task");
+        let inner = StoreFaults { inner: MemoryStore::default(), fail: true.into(), deny_list: false.into() };
+        assert_eq!(check_root(&inner, "shop", true).await.unwrap_err().code, "rtdb.storage/task");
         assert!(matches!(inner.get(&key(ROOT_MARKER)).await, Err(Error::MissingObject(_))));
-        confirm_root(&inner, "shop", true).await.unwrap();
+        check_root(&inner, "shop", true).await.unwrap();
     }
 
     #[tokio::test]
     async fn a_failed_release_is_visible_and_can_be_retried() {
-        let inner = Arc::new(PutFailure { inner: MemoryStore::default(), fail: false.into() });
+        let inner = Arc::new(StoreFaults { inner: MemoryStore::default(), fail: false.into(), deny_list: false.into() });
         let store = GarbageStore::open(inner.clone()).await.unwrap();
         let object = key("tables/t/data/a.arrow");
         store.put(&object, Bytes::from_static(b"rows")).await.unwrap();
@@ -982,20 +1255,37 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_holders_store_refuses_writes_once_the_directory_moves_past_its_epoch() {
+    async fn a_writer_checks_the_directory_on_every_mutation() {
         let directory = rtdb_directory::MemoryDirectory::new();
         let mut record = directory.create_deployment(DeploymentRecord::new("shop", "acme", vec![], 0)).await.unwrap();
+        record.epoch = 1;
+        record.holder = Some(rtdb_directory::MemberId("holder".into()));
+        record = directory.replace_deployment(record.clone(), record.version).await.unwrap().applied().unwrap();
         let store = FencedStore {
-            inner: Arc::new(MemoryStore::default()),
-            directory: directory.clone(),
-            deployment: record.id.clone(),
-            fence: Fence::Writer { epoch: 0 },
-            _release: None,
+            inner: Arc::new(MemoryStore::default()), fence: Fence::Writer { epoch: 1 },
+            directory: directory.clone(), deployment: record.id.clone(), prefix: record.storage_prefix(), _release: None,
         };
         store.put(&key("blocks/a"), Bytes::from_static(b"a")).await.unwrap();
+        record.epoch = 2;
+        directory.replace_deployment(record.clone(), record.version).await.unwrap().applied().unwrap();
+        assert!(matches!(store.put(&key("blocks/b"), Bytes::from_static(b"b")).await, Err(Error::Deposed { epoch: 1, promised: 2 })));
+    }
+
+    #[tokio::test]
+    async fn a_holders_store_refuses_writes_once_the_directory_moves_past_its_epoch() {
+        let directory = rtdb_directory::MemoryDirectory::new();
+        let mut record = DeploymentRecord::new("shop", "acme", vec![], 0);
         record.epoch = 1;
+        record.holder = Some(rtdb_directory::MemberId("holder".into()));
+        let mut record = directory.create_deployment(record).await.unwrap();
+        let store = FencedStore {
+            inner: Arc::new(MemoryStore::default()), fence: Fence::Writer { epoch: 1 },
+            directory: directory.clone(), deployment: record.id.clone(), prefix: record.storage_prefix(), _release: None,
+        };
+        store.put(&key("blocks/a"), Bytes::from_static(b"a")).await.unwrap();
+        record.epoch = 2;
         directory.replace_deployment(record.clone(), record.version).await.unwrap();
-        assert!(matches!(store.put(&key("blocks/b"), Bytes::from_static(b"b")).await, Err(Error::Deposed { epoch: 0, promised: 1 })), "a deposed holder writes nothing");
+        assert!(matches!(store.put(&key("blocks/b"), Bytes::from_static(b"b")).await, Err(Error::Deposed { epoch: 1, promised: 2 })), "a deposed holder writes nothing");
         assert!(store.delete(&key("blocks/a")).await.is_err(), "and releases nothing");
         assert_eq!(store.get(&key("blocks/a")).await.unwrap().as_ref(), b"a", "reads still serve its snapshots");
     }
@@ -1008,6 +1298,7 @@ mod tests {
             inner: Arc::new(MemoryStore::default()),
             directory: directory.clone(),
             deployment: installation.id.clone(),
+            prefix: installation.storage_prefix(),
             fence: Fence::Compactor,
             _release: None,
         };
@@ -1028,19 +1319,26 @@ mod tests {
         let keys = Arc::new(crate::keys::LocalKeyService::new(files.path().join("keys")).unwrap());
         let storage = crate::deployment::CellStorage::Local { root: files.path().join("objects") };
         let directory = rtdb_directory::MemoryDirectory::new();
-        let record = directory.create_deployment(DeploymentRecord::new("shop", "acme", vec![], 0)).await.unwrap();
+        let bucket = storage.bucket(IoRegion::new()).await.unwrap();
+        let storage_namespaces = crate::deployment::storage_namespaces(bucket.as_ref(), keys.as_ref()).await.unwrap();
+        let mut record = DeploymentRecord::new("shop", "acme", vec![], 0);
+        record.storage_namespaces = Some(storage_namespaces);
+        let record = directory.create_deployment(record).await.unwrap();
         let key = keys.key(&record.key_id()).await.unwrap();
         let factory = CellStoreFactory {
             directory: directory.clone(),
             keys: keys.clone(),
-            hosted_task: None,
             storage_regions: TaskTracker::new(),
+            local_witnesses: None,
+            storage_namespaces,
+            scoped_writes: None,
+            hosted_task: None,
         };
         let config = CellStoreConfig {
             storage: storage.clone(),
             prefix: record.storage_prefix(),
             deployment: record.id.clone(),
-            writer_epoch: Some(record.epoch),
+            writer_epoch: None,
             compactor: false,
             snapshot_block: None,
         };
@@ -1112,6 +1410,8 @@ mod tests {
         let region = Uuid::new_v4();
         let witness = keys.hold_local_storage_region(region).unwrap().unwrap();
         let mut record = DeploymentRecord::new("shop", "acme", vec![], 0);
+        let bucket = storage.bucket(IoRegion::new()).await.unwrap();
+        record.storage_namespaces = Some(crate::deployment::storage_namespaces(bucket.as_ref(), &keys).await.unwrap());
         record.storage_regions.insert(region, StorageRegion::Local { archive: None });
         let record = directory.create_deployment(record).await.unwrap();
         crate::admin::begin_disposal(directory.as_ref(), &record.id).await.unwrap();
@@ -1175,8 +1475,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_store_opened_from_a_checkpoint_behind_its_latest_block_still_finds_it_after_the_reaper_passes() {
-        let bucket: crate::reference::Bucket = Arc::new(MemoryStore::default());
+    async fn a_checkpointed_root_recovers_the_latest_block_after_reaping_with_listing_disabled() {
+        let raw = Arc::new(StoreFaults { inner: MemoryStore::default(), fail: false.into(), deny_list: false.into() });
+        let bucket: crate::reference::Bucket = raw.clone();
         let mut record = DeploymentRecord::new("shop", "acme", vec![], 0);
         let store = format!("{}/v06", record.storage_prefix());
         let open = |discovery| open_deployment_store(Arc::clone(&bucket), &store, discovery, wall_clock());
@@ -1188,7 +1489,9 @@ mod tests {
         record.checkpoint = Some(rtdb_directory::Checkpoint { block: 0, boundary: 0, source: 0, system_time: 0 });
         for name in ["tables/t/data/l00-rc-b01.arrow", "blocks/b01.binpb"] { writer.delete(&key(name)).await.unwrap(); }
         reap(bucket.as_ref(), &record, Duration::ZERO, &Default::default()).await.unwrap();
-        let cold = open(crate::packing::PackDiscovery::From(0)).await.unwrap();
+        raw.deny_list.store(true, std::sync::atomic::Ordering::Relaxed);
+        let local = Arc::new(crate::reference::PrefixedStore::new(Arc::clone(&bucket), &store));
+        let cold = open_cell_store(bucket, &store, local, &record, wall_clock(), None).await.unwrap();
         assert_eq!(cold.get(&key("tables/t/data/l00-rc-b02.arrow")).await.unwrap().as_ref(), b"rows 2", "a block after a fully released one is found from the checkpoint");
     }
 
@@ -1196,10 +1499,61 @@ mod tests {
     async fn a_store_refuses_a_deployment_it_was_not_created_for() {
         let directory = tempfile::tempdir().unwrap();
         let store = LocalStore::open(directory.path()).unwrap();
-        assert!(confirm_root(&store, "one", false).await.is_err());
-        assert!(matches!(store.get(&key(ROOT_MARKER)).await, Err(Error::MissingObject(_))));
-        confirm_root(&store, "one", true).await.unwrap();
-        confirm_root(&store, "one", false).await.unwrap();
-        assert_eq!(confirm_root(&store, "two", true).await.unwrap_err().code, "rtdb.multi/foreign-root");
+        check_root(&store, "one", true).await.unwrap();
+        check_root(&store, "one", true).await.unwrap();
+        assert_eq!(check_root(&store, "two", true).await.unwrap_err().code, "rtdb.multi/foreign-root");
+    }
+
+    #[tokio::test]
+    async fn a_read_only_attach_verifies_root_ownership_without_writing() {
+        let store = MemoryStore::default();
+        check_root(&store, "one", false).await.unwrap();
+        assert!(matches!(store.head(&key(ROOT_MARKER)).await, Err(Error::MissingObject(_))));
+        check_root(&store, "two", true).await.unwrap();
+        assert_eq!(check_root(&store, "one", false).await.unwrap_err().code, "rtdb.multi/foreign-root");
+        check_root(&store, "two", false).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn storage_grant_refresh_requires_the_current_writer_or_live_compactor() {
+        use rtdb_s3::WriteAuthorization;
+
+        let directory = rtdb_directory::MemoryDirectory::new();
+        let register = |id: &str, pool| rtdb_directory::MemberRecord {
+            id: MemberId(id.into()), role: MemberRole::Node, address: String::new(), control_address: None,
+            availability_zone: "local".into(), engine_version: "test".into(), lease_expires_at_ms: now_ms() + 60_000,
+            state: MemberState::Eligible, drain_target_engine: None, pool, storage_namespaces: None, version: 0,
+        };
+        let mut holder = directory.register_member(register("holder", MemberPool::General)).await.unwrap();
+        let worker = directory.register_member(register("compactor", MemberPool::Compaction)).await.unwrap();
+        let mut initial = DeploymentRecord::new("shop", "acme", vec![], 0);
+        initial.epoch = 1;
+        initial.holder = Some(holder.id.clone());
+        let mut record = directory.create_deployment(initial).await.unwrap();
+        let writer = ScopedWriter { directory: directory.clone(), deployment: record.id.clone(),
+            prefix: record.storage_prefix(), epoch: Some(record.epoch), member: holder.id.clone() };
+        let compactor = ScopedWriter { directory: directory.clone(), deployment: record.id.clone(),
+            prefix: record.storage_prefix(), epoch: None, member: worker.id };
+        let latest = SystemTime::now() + Duration::from_secs(60);
+        writer.authorize(Some(latest)).await.unwrap();
+        record = directory.deployment(&record.id).await.unwrap().unwrap();
+        let recorded = record.s3_write_lease_until_ms;
+        assert_eq!(recorded, Some((latest + rtdb_s3::SCOPED_S3_CLOCK_ALLOWANCE).duration_since(UNIX_EPOCH).unwrap().as_millis() as i64));
+        compactor.authorize(Some(latest - Duration::from_secs(30))).await.unwrap();
+        assert_eq!(directory.deployment(&record.id).await.unwrap().unwrap().s3_write_lease_until_ms, recorded);
+
+        holder.lease_expires_at_ms = 0;
+        directory.replace_member(holder.clone(), holder.version).await.unwrap().applied().unwrap();
+        assert_eq!(writer.authorize(None).await.unwrap_err().code, rtdb_node::NOT_HELD);
+
+        record.epoch += 1;
+        record = directory.replace_deployment(record.clone(), record.version).await.unwrap().applied().unwrap();
+        assert_eq!(writer.authorize(None).await.unwrap_err().code, rtdb_node::NOT_HELD);
+        compactor.authorize(None).await.unwrap();
+
+        record.lifecycle = Lifecycle::Deleting;
+        directory.replace_deployment(record.clone(), record.version).await.unwrap().applied().unwrap();
+        assert_eq!(compactor.authorize(Some(latest + Duration::from_secs(30))).await.unwrap_err().code, rtdb_node::NOT_HELD);
+        assert_eq!(directory.deployment(&record.id).await.unwrap().unwrap().s3_write_lease_until_ms, recorded);
     }
 }

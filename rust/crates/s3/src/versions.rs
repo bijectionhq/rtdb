@@ -29,10 +29,23 @@ impl VersionedInventory {
 
     /// Empties multipart uploads, object versions and delete markers under a deployment prefix.
     pub async fn purge(&self, deployment: &ObjectKey) -> Result<()> {
-        let path = object_store::path::Path::from(format!("{}/{deployment}", self.root));
-        let prefix = format!("{path}/");
+        let prefix = self.prefix(deployment);
         self.abort_uploads(&prefix).await?;
-        self.purge_versions(&prefix).await
+        self.purge_versions(&prefix).await?;
+        if self.is_empty(deployment).await? { Ok(()) }
+        else { Err(unavailable("The version or multipart inventory changed during erasure")) }
+    }
+
+    /// Observes the version and multipart inventories without modifying either.
+    pub async fn is_empty(&self, deployment: &ObjectKey) -> Result<bool> {
+        let prefix = self.prefix(deployment);
+        if !self.multipart_batch(&prefix).await?.is_empty() { return Ok(false); }
+        Ok(self.version_batch(&prefix).await?.is_empty())
+    }
+
+    fn prefix(&self, deployment: &ObjectKey) -> String {
+        let path = object_store::path::Path::from(format!("{}/{deployment}", self.root));
+        format!("{path}/")
     }
 
     async fn abort_uploads(&self, prefix: &str) -> Result<()> {
@@ -97,24 +110,8 @@ impl VersionedInventory {
     async fn purge_versions(&self, prefix: &str) -> Result<()> {
         let mut previous = Vec::new();
         loop {
-            let page = self.client.list_object_versions().bucket(&self.bucket).prefix(prefix).max_keys(1000)
-                .set_request_payer(self.request_payer.clone()).send().await
-                .map_err(|error| unavailable(format!("Listing object versions failed: {error}")))?;
-            let mut versions = Vec::new();
-            for (key, version) in page.versions().iter().map(|entry| (entry.key(), entry.version_id()))
-                .chain(page.delete_markers().iter().map(|entry| (entry.key(), entry.version_id())))
-            {
-                let key = key.filter(|key| key.starts_with(prefix))
-                    .ok_or_else(|| unavailable("S3 returned a key outside the deployment prefix"))?;
-                let version = version.filter(|version| !version.is_empty())
-                    .ok_or_else(|| unavailable("S3 returned a key without a version identifier"))?;
-                versions.push(ObjectIdentifier::builder().key(key).version_id(version).build()
-                    .map_err(|error| unavailable(error.to_string()))?);
-            }
-            if versions.is_empty() {
-                if page.is_truncated() == Some(true) { return Err(unavailable("S3 returned an empty truncated version listing")); }
-                return Ok(());
-            }
+            let versions = self.version_batch(prefix).await?;
+            if versions.is_empty() { return Ok(()); }
             if versions == previous { return Err(unavailable("A batch of deleted versions is still listed")); }
             let delete = Delete::builder().set_objects(Some(versions.clone())).quiet(true).build()
                 .map_err(|error| unavailable(error.to_string()))?;
@@ -126,6 +123,25 @@ impl VersionedInventory {
             }
             previous = versions;
         }
+    }
+
+    async fn version_batch(&self, prefix: &str) -> Result<Vec<ObjectIdentifier>> {
+        let page = self.client.list_object_versions().bucket(&self.bucket).prefix(prefix).max_keys(1000)
+            .set_request_payer(self.request_payer.clone()).send().await
+            .map_err(|error| unavailable(format!("Listing object versions failed: {error}")))?;
+        let mut versions = Vec::new();
+        for (key, version) in page.versions().iter().map(|entry| (entry.key(), entry.version_id()))
+            .chain(page.delete_markers().iter().map(|entry| (entry.key(), entry.version_id())))
+        {
+            let key = key.filter(|key| key.starts_with(prefix))
+                .ok_or_else(|| unavailable("S3 returned a key outside the deployment prefix"))?;
+            let version = version.filter(|version| !version.is_empty())
+                .ok_or_else(|| unavailable("S3 returned a key without a version identifier"))?;
+            versions.push(ObjectIdentifier::builder().key(key).version_id(version).build()
+                .map_err(|error| unavailable(error.to_string()))?);
+        }
+        if versions.is_empty() && page.is_truncated() == Some(true) { return Err(unavailable("S3 returned an empty truncated version listing")); }
+        Ok(versions)
     }
 }
 
@@ -241,8 +257,11 @@ mod tests {
             pending.push(id.to_owned());
         }
 
+        assert!(!inventory.is_empty(&deployment).await.unwrap());
         inventory.purge(&deployment).await.unwrap();
         inventory.purge(&deployment).await.unwrap();
+        assert!(inventory.is_empty(&deployment).await.unwrap());
+        assert!(!inventory.is_empty(&neighbor).await.unwrap());
         let after = client.list_object_versions().bucket(&bucket).prefix(&target).send().await.unwrap();
         assert!(after.versions().is_empty());
         assert!(after.delete_markers().is_empty());

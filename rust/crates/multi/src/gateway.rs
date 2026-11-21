@@ -3,17 +3,20 @@
 //! Routing never authorises: a node may refuse or redirect, and the gateway walks on.
 
 use std::collections::BTreeMap;
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 use std::time::Duration;
 
 use rtdb_directory::{DeploymentRecord, Directory, Lifecycle, MemberId, MemberRecord, MemberRole, effective_holder, now_ms};
-use rtdb_types::{Anomaly, AnomalyCategory, Result};
+use rtdb_types::{Anomaly, AnomalyCategory, MemoryBudget, Result};
 use bytes::Bytes;
+use parking_lot::Mutex;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::Semaphore;
 use tokio_rustls::{TlsAcceptor, rustls};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
+use tokio_util::task::AbortOnDropHandle;
 
 use crate::control::{self, Request, Response};
 
@@ -24,7 +27,7 @@ const PROTOCOL_3: i32 = 196608;
 const MAXIMUM_STARTUP_BYTES: usize = 10_000;
 const SNAPSHOT_PARAMETER: &str = "rtdb.read";
 
-fn database_selector(selector: &str) -> Result<(&str, Option<Uuid>)> {
+pub(crate) fn database_selector(selector: &str) -> Result<(&str, Option<Uuid>)> {
     let Some((name, authority)) = selector.split_once('@') else {
         return Ok((selector, None));
     };
@@ -41,6 +44,10 @@ pub struct GatewayOptions {
     pub control_timeout: Duration,
     /// When set, every frontend must negotiate TLS before startup.
     pub tls: Option<Arc<rustls::ServerConfig>>,
+    pub startup_timeout: Duration,
+    pub maximum_connections: usize,
+    pub maximum_connections_per_deployment: usize,
+    pub maximum_buffered_bytes: usize,
     /// How often an open connection tells its holder it is in use.
     pub touch_interval: Duration,
     /// The cell's secret, with which the gateway mints a capability for each reconnection of an authenticated session.
@@ -48,19 +55,79 @@ pub struct GatewayOptions {
 }
 
 impl Default for GatewayOptions {
-    fn default() -> Self { Self { cells: None, tls: None, control_timeout: Duration::from_secs(35), touch_interval: Duration::from_secs(10), capabilities: None } }
+    fn default() -> Self {
+        Self {
+            cells: None, tls: None, startup_timeout: crate::session::STARTUP_WITHIN,
+            control_timeout: Duration::from_secs(35), touch_interval: Duration::from_secs(10),
+            maximum_connections: 4096, maximum_connections_per_deployment: 256,
+            maximum_buffered_bytes: crate::session::DEFAULT_GATEWAY_FRAME_BYTES, capabilities: None,
+        }
+    }
+}
+
+pub(crate) struct DeploymentConnections {
+    limit: usize,
+    counts: Mutex<BTreeMap<String, usize>>,
+}
+
+pub(crate) struct DeploymentConnection {
+    registry: Arc<DeploymentConnections>,
+    name: String,
+}
+
+impl DeploymentConnections {
+    pub(crate) fn new(limit: usize) -> Self { Self { limit, counts: Mutex::default() } }
+    pub(crate) fn admit(self: &Arc<Self>, name: &str) -> Option<DeploymentConnection> {
+        let mut active = self.counts.lock();
+        let count = active.entry(name.to_owned()).or_default();
+        if *count >= self.limit { return None; }
+        *count += 1;
+        Some(DeploymentConnection { registry: Arc::clone(self), name: name.to_owned() })
+    }
+}
+
+impl Drop for DeploymentConnection {
+    fn drop(&mut self) {
+        let mut active = self.registry.counts.lock();
+        let count = active.get_mut(&self.name).expect("an admission owns a connection slot");
+        *count -= 1;
+        if *count == 0 { active.remove(&self.name); }
+    }
 }
 
 pub async fn serve(listener: TcpListener, directory: Arc<dyn Directory>, options: GatewayOptions, cancellation: CancellationToken) -> Result<()> {
+    if !(1..=Semaphore::MAX_PERMITS).contains(&options.maximum_connections) || options.maximum_connections_per_deployment == 0 {
+        return Err(Anomaly::incorrect("rtdb.multi/gateway-connections", "Gateway connection limits must be positive and supported by the runtime"));
+    }
+    if options.maximum_buffered_bytes == 0 {
+        return Err(Anomaly::incorrect("rtdb.multi/gateway-buffer", "The gateway's frame memory budget must be positive"));
+    }
+    let frame_memory = MemoryBudget::new(options.maximum_buffered_bytes);
+    let connections = Arc::new(Semaphore::new(options.maximum_connections));
+    let deployments = Arc::new(DeploymentConnections::new(options.maximum_connections_per_deployment));
+    let heartbeats = Arc::new(Heartbeats::default());
+    let mut connection_index = 0usize;
     loop {
         let (client, _) = tokio::select! {
             _ = cancellation.cancelled() => return Ok(()),
             accepted = listener.accept() => accepted.map_err(io)?,
         };
+        let Ok(permit) = Arc::clone(&connections).try_acquire_owned() else { continue; };
+        let deployments = Arc::clone(&deployments);
+        let frame_memory = Arc::clone(&frame_memory);
         let directory = Arc::clone(&directory);
         let options = options.clone();
+        let heartbeats = Arc::clone(&heartbeats);
         let cancellation = cancellation.child_token();
-        tokio::spawn(async move { let _ = connection(client, directory, options, cancellation).await; });
+        let index = connection_index;
+        connection_index = connection_index.wrapping_add(1);
+        tokio::spawn(async move {
+            let _permit = permit;
+            tokio::select! {
+                _ = cancellation.cancelled() => {}
+                _ = connection(client, directory, options, cancellation.clone(), heartbeats, deployments, frame_memory, index) => {}
+            }
+        });
     }
 }
 
@@ -89,8 +156,10 @@ trait Transport: AsyncRead + AsyncWrite + Unpin + Send {}
 impl<T: AsyncRead + AsyncWrite + Unpin + Send> Transport for T {}
 type Client = Box<dyn Transport>;
 
-async fn connection(client: TcpStream, directory: Arc<dyn Directory>, options: GatewayOptions, cancellation: CancellationToken) -> Result<()> {
-    let startup = tokio::time::timeout(options.control_timeout, read_startup(Box::new(client), options.tls.as_ref()));
+async fn connection(client: TcpStream, directory: Arc<dyn Directory>, options: GatewayOptions, cancellation: CancellationToken,
+                    heartbeats: Arc<Heartbeats>, deployments: Arc<DeploymentConnections>, frame_memory: Arc<MemoryBudget>, connection_index: usize) -> Result<()> {
+    let startup_deadline = tokio::time::Instant::now() + options.startup_timeout;
+    let startup = tokio::time::timeout_at(startup_deadline, read_startup(Box::new(client), options.tls.as_ref()));
     let Some(result) = cancellation.run_until_cancelled(startup).await else { return Ok(()); };
     let Some((mut client, mut startup)) = result.map_err(|_| Anomaly::new(AnomalyCategory::Unavailable, "rtdb.multi/startup-timeout", "PostgreSQL startup did not finish"))?? else { return Ok(()); };
     let selector = startup.parameters.get("database");
@@ -103,51 +172,52 @@ async fn connection(client: TcpStream, directory: Arc<dyn Directory>, options: G
         Ok(_) => return refuse(&mut client, "3D000", "The startup message names no database").await,
         Err(error) => return refuse(&mut client, "3D000", error.message.as_deref().unwrap_or_default()).await,
     };
-    if let Some(gateway) = elsewhere(&directory, &name, &options).await {
-        let mut forward = match connect(&gateway).await { Ok(forward) => forward, Err(error) => return refuse(&mut client, "08006", error.message.as_deref().unwrap_or_default()).await };
-        forward.write_all(&startup.bytes).await.map_err(io)?;
-        return tokio::select! {
-            _ = cancellation.cancelled() => Ok(()),
-            copied = tokio::io::copy_bidirectional(&mut client, &mut forward) => copied.map(|_| ()).map_err(io),
+    let Some(_deployment_connection) = deployments.admit(&name) else {
+        return refuse(&mut client, "53300", "This deployment has reached its gateway connection limit").await;
+    };
+    let Ok(remote_gateway) = tokio::time::timeout_at(startup_deadline, elsewhere(&directory, &name, &options)).await else {
+        return refuse(&mut client, "57P03", "Timed out looking up the deployment's cell").await;
+    };
+    if let Some(gateway) = remote_gateway {
+        let forward = tokio::time::timeout_at(startup_deadline, async {
+            let mut forward = connect(&gateway).await?;
+            forward.write_all(&startup.bytes).await.map_err(io)?;
+            Ok::<_, Anomaly>(forward)
+        }).await;
+        let mut forward = match forward {
+            Ok(Ok(forward)) => forward,
+            Ok(Err(error)) => return refuse(&mut client, "08006", error.message.as_deref().unwrap_or_default()).await,
+            Err(_) => return refuse(&mut client, "57P03", "Timed out forwarding startup to the deployment's cell").await,
         };
+        return tokio::io::copy_bidirectional(&mut client, &mut forward).await.map(|_| ()).map_err(io);
     }
-    if expected.is_some() {
-        startup.parameters.insert("database".into(), name.clone());
-        startup.bytes = encode_startup(&startup.parameters);
-    }
+    if expected.is_some() { startup.parameters.insert("database".into(), name.clone()); }
+    startup.parameters.insert(rtdb_pgwire::GATEWAY_AWAIT_TOKEN_PARAMETER.into(), "on".into());
+    startup.parameters.insert(rtdb_pgwire::GATEWAY_SETTINGS_PARAMETER.into(), "on".into());
+    startup.bytes = encode_startup(&startup.parameters);
     let read_only = startup.read_only();
-    let snapshot = startup.snapshot();
-    let expected_history = expected.map(|id| id.hyphenated().to_string());
-    let (server, control, epoch, deployment) = match route(&directory, &name, expected_history.as_deref(), read_only, snapshot, &options).await {
-        Ok(route) => route,
-        Err(error) => return refuse(&mut client, "08006", error.message.as_deref().unwrap_or(error.code.as_ref())).await,
+    let mut router = GatewayRouter {
+        directory: Arc::clone(&directory), name,
+        deployment: expected.map(|id| id.hyphenated().to_string()),
+        read_only, snapshot: startup.snapshot(), options: options.clone(), heartbeats, connection_index,
     };
-    let router = Arc::new(GatewayRouter {
-        directory: Arc::clone(&directory), name: name.clone(), deployment: deployment.clone(),
-        read_only, snapshot, options: options.clone(),
-    });
-    let touching = control.map(|control| {
-        let name = name.clone();
-        let interval = options.touch_interval;
-        let timeout = options.control_timeout;
-        let key = control::ControlKey(options.capabilities.clone());
-        tokio::spawn(async move {
-            loop {
-                tokio::time::sleep(interval).await;
-                let _ = control::call(&control, &Request::Touch { name: name.clone() }, timeout, &key).await;
-            }
-        })
-    });
-    let grants = options.capabilities.clone().map(|secret| crate::session::Grants { secret, parameters: startup.parameters.clone(), read_only });
-    let keyed = !read_only;
+    let route_initial = tokio::time::timeout_at(startup_deadline, router.route_with_record()).await;
+    let (server, control, epoch, deployment) = match route_initial {
+        Ok(Ok(route)) => route,
+        Err(_) => return refuse(&mut client, "57P03", "Timed out routing startup to the deployment's holder").await,
+        Ok(Err(error)) => return refuse(&mut client, "08006", error.message.as_deref().unwrap_or(error.code.as_ref())).await,
+    };
+    router.deployment = Some(deployment.clone());
+    let router = Arc::new(router);
+    let grants = options.capabilities.clone().map(|secret| crate::session::Grants { secret, parameters: startup.parameters.clone(), read_only: startup.read_only() });
+    let keyed = !startup.read_only();
     let session = crate::session::Session::new(Bytes::from(startup.bytes), router, directory, deployment, grants, keyed)
+        .with_frame_memory(frame_memory)
         .with_installation(expected);
-    let outcome = tokio::select! {
+    tokio::select! {
         _ = cancellation.cancelled() => Ok(()),
-        outcome = session.run(client, server, epoch) => outcome,
-    };
-    if let Some(touching) = touching { touching.abort(); }
-    outcome
+        outcome = session.run_before(client, server, control, epoch, startup_deadline) => outcome,
+    }
 }
 
 /// The gateway of the cell a deployment lives in, when that is not this gateway's cell.
@@ -163,26 +233,91 @@ async fn elsewhere(directory: &Arc<dyn Directory>, name: &str, options: &Gateway
 struct GatewayRouter {
     directory: Arc<dyn Directory>,
     name: String,
-    deployment: String,
+    deployment: Option<String>,
     read_only: bool,
     snapshot: bool,
     options: GatewayOptions,
+    heartbeats: Arc<Heartbeats>,
+    connection_index: usize,
+}
+
+type HeartbeatTarget = (String, String);
+
+#[derive(Default)]
+struct Heartbeats(Mutex<BTreeMap<HeartbeatTarget, Weak<Heartbeat>>>);
+
+struct Heartbeat {
+    registry: Weak<Heartbeats>,
+    target: HeartbeatTarget,
+    _task: AbortOnDropHandle<()>,
+}
+
+impl Heartbeats {
+    fn sort_by_sessions(&self, deployment: &str, candidates: &mut [&MemberRecord]) {
+        let active = self.0.lock();
+        candidates.sort_by_cached_key(|candidate| candidate.control_address.as_ref()
+            .and_then(|address| active.get(&(deployment.to_owned(), address.clone())))
+            .map_or(0, Weak::strong_count));
+    }
+
+    fn register(self: &Arc<Self>, deployment: &str, address: String, options: &GatewayOptions) -> Arc<Heartbeat> {
+        let target = (deployment.to_owned(), address);
+        let mut active = self.0.lock();
+        if let Some(heartbeat) = active.get(&target).and_then(Weak::upgrade) { return heartbeat; }
+        let (name, address) = target.clone();
+        let interval = options.touch_interval;
+        let timeout = options.control_timeout;
+        let key = control::ControlKey(options.capabilities.clone());
+        let request = Request::Touch { name };
+        let task = tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(interval).await;
+                let _ = control::call(&address, &request, timeout, &key).await;
+            }
+        });
+        let heartbeat = Arc::new(Heartbeat { registry: Arc::downgrade(self), target: target.clone(), _task: AbortOnDropHandle::new(task) });
+        active.insert(target, Arc::downgrade(&heartbeat));
+        heartbeat
+    }
+}
+
+impl Drop for Heartbeat {
+    fn drop(&mut self) {
+        if let Some(registry) = self.registry.upgrade() {
+            let mut active = registry.0.lock();
+            if active.get(&self.target).is_some_and(|entry| std::ptr::eq(entry.as_ptr(), self)) {
+                active.remove(&self.target);
+            }
+        }
+    }
+}
+
+impl GatewayRouter {
+    async fn route_with_record(&self) -> Result<(TcpStream, Option<String>, u64, String)> {
+        control::retry_activation(self.options.control_timeout, || route(self)).await
+    }
 }
 
 #[async_trait::async_trait]
 impl crate::session::Router for GatewayRouter {
     async fn route(&self) -> Result<(TcpStream, Option<String>, u64)> {
-        let (stream, control, epoch, _) =
-            route(&self.directory, &self.name, Some(&self.deployment), self.read_only, self.snapshot, &self.options).await?;
+        let (stream, control, epoch, _) = self.route_with_record().await?;
         Ok((stream, control, epoch))
+    }
+
+    fn start_touching(&self, address: String) -> Option<Arc<dyn Send + Sync>> {
+        Some(self.heartbeats.register(&self.name, address, &self.options))
     }
 }
 
 /// The open connection to the deployment's holder, and that holder's control address.
-async fn route(directory: &Arc<dyn Directory>, name: &str, expected: Option<&str>, read_only: bool, snapshot: bool, options: &GatewayOptions) -> Result<(TcpStream, Option<String>, u64, String)> {
+async fn route(router: &GatewayRouter) -> Result<(TcpStream, Option<String>, u64, String)> {
+    let directory = &router.directory;
+    let name = router.name.as_str();
+    let options = &router.options;
     let record = directory.deployment_by_name(name).await?
         .ok_or_else(|| Anomaly::incorrect("rtdb.multi/unknown-deployment", format!("No deployment is named {name}")))?;
-    if expected.is_some_and(|id| id != record.id.as_str()) {
+    if router.deployment.as_deref().is_some_and(|id| id != record.id.as_str()) {
         return Err(Anomaly::incorrect("rtdb.multi/install-identity", format!("Database {name} has another installation ID")));
     }
     match record.lifecycle {
@@ -192,7 +327,7 @@ async fn route(directory: &Arc<dyn Directory>, name: &str, expected: Option<&str
         Lifecycle::Deleting | Lifecycle::Deleted => return Err(Anomaly::incorrect("rtdb.multi/deleted", format!("{name} has been deleted"))),
     }
     let members: BTreeMap<MemberId, MemberRecord> = directory.members().await?.into_iter().map(|member| (member.id.clone(), member)).collect();
-    if snapshot && record.checkpoint.is_some() && record.lifecycle == Lifecycle::Live {
+    if router.snapshot && record.checkpoint.is_some() && record.lifecycle == Lifecycle::Live {
         for reader in snapshot_readers(&record, &members) {
             let Some(control_address) = &reader.control_address else { continue; };
             if let Ok(Response::Subscribed { address }) = control::call(control_address, &Request::Snapshot { name: name.to_owned() }, options.control_timeout, &control::ControlKey(options.capabilities.clone())).await {
@@ -200,8 +335,14 @@ async fn route(directory: &Arc<dyn Directory>, name: &str, expected: Option<&str
             }
         }
     }
-    if read_only && record.read_width > 1 && record.lifecycle == Lifecycle::Live {
-        for replica in replicas(&record, &members) {
+    if router.read_only && record.read_width > 1 && record.lifecycle == Lifecycle::Live {
+        let mut readers = replicas(&record, &members);
+        let count = readers.len();
+        if count > 1 {
+            readers.rotate_left(router.connection_index % count);
+            router.heartbeats.sort_by_sessions(name, &mut readers);
+        }
+        for replica in readers {
             let Some(control_address) = &replica.control_address else { continue; };
             if let Ok(Response::Subscribed { address }) = control::call(control_address, &Request::Subscribe { name: name.to_owned() }, options.control_timeout, &control::ControlKey(options.capabilities.clone())).await {
                 if let Ok(stream) = connect(&address).await { return Ok((stream, Some(control_address.clone()), record.epoch, record.id.clone())); }
@@ -209,6 +350,8 @@ async fn route(directory: &Arc<dyn Directory>, name: &str, expected: Option<&str
         }
     }
     let mut last = None;
+    let mut retryable = None;
+    let mut refused = None;
     for candidate in candidates(&record, &members) {
         let Some(control_address) = &candidate.control_address else { continue; };
         match control::call(control_address, &Request::Activate { name: name.to_owned() }, options.control_timeout, &control::ControlKey(options.capabilities.clone())).await {
@@ -217,12 +360,18 @@ async fn route(directory: &Arc<dyn Directory>, name: &str, expected: Option<&str
                 let control = members.get(&MemberId(holder)).and_then(|member| member.control_address.clone());
                 return Ok((connect(&address).await?, control, record.epoch, record.id.clone()));
             }
-            Ok(Response::Refused { code, message }) => last = Some(Anomaly::new(AnomalyCategory::Unavailable, code, message)),
-            Ok(Response::Done | Response::Subscribed { .. } | Response::Published { .. } | Response::Fragment { .. }) => {}
+            Ok(Response::Refused { code, message }) if control::retryable_activation(&code) => {
+                retryable = Some(Anomaly::new(AnomalyCategory::Unavailable, code, message));
+            }
+            Ok(Response::Refused { code, message }) if code == control::NOT_CLAIMABLE => {
+                last = Some(Anomaly::new(AnomalyCategory::Unavailable, code, message));
+            }
+            Ok(Response::Refused { code, message }) => refused = Some(Anomaly::new(AnomalyCategory::Unavailable, code, message)),
+            Ok(Response::Done | Response::Flushed { .. } | Response::Subscribed { .. } | Response::Published { .. } | Response::Fragment { .. } | Response::FlightEndpoint { .. }) => {}
             Err(error) => last = Some(error),
         }
     }
-    Err(last.unwrap_or_else(|| Anomaly::new(AnomalyCategory::Unavailable, "rtdb.multi/no-node", "No node can serve this deployment")))
+    Err(refused.or(retryable).or(last).unwrap_or_else(|| Anomaly::new(AnomalyCategory::Unavailable, "rtdb.multi/no-node", "No node can serve this deployment")))
 }
 
 /// The nodes that may serve a snapshot read: every node that may take a placement, in the deployment's affinity order, the holder last, so snapshots spare the writer.
@@ -240,7 +389,7 @@ fn snapshot_readers<'a>(record: &DeploymentRecord, members: &'a BTreeMap<MemberI
 fn replicas<'a>(record: &DeploymentRecord, members: &'a BTreeMap<MemberId, MemberRecord>) -> Vec<&'a MemberRecord> {
     let now = now_ms();
     let holder = effective_holder(record, members, now).cloned();
-    let nodes: Vec<&MemberRecord> = members.values().filter(|member| member.role == MemberRole::Node && member.may_receive_placements(now)).collect();
+    let nodes: Vec<&MemberRecord> = members.values().filter(|member| record.may_place_on(member, now)).collect();
     rtdb_affinity::rank(&record.storage_identity(), &nodes, |member| member.id.as_str()).into_iter().copied()
         .filter(|member| holder.as_ref() != Some(&member.id)).take(record.read_width.saturating_sub(1) as usize).collect()
 }
@@ -249,9 +398,13 @@ fn replicas<'a>(record: &DeploymentRecord, members: &'a BTreeMap<MemberId, Membe
 fn candidates<'a>(record: &DeploymentRecord, members: &'a BTreeMap<MemberId, MemberRecord>) -> Vec<&'a MemberRecord> {
     let now = now_ms();
     let holder = effective_holder(record, members, now).and_then(|holder| members.get(holder));
-    let nodes: Vec<&MemberRecord> = members.values().filter(|member| member.role == MemberRole::Node && member.may_receive_placements(now)).collect();
+    let nodes: Vec<&MemberRecord> = members.values().filter(|member| record.may_place_on(member, now)).collect();
+    let reserved = record.active_move(now).and_then(|intent| members.get(&intent.target))
+        .filter(|member| record.may_place_on(member, now) && holder.is_none_or(|holder| holder.id != member.id));
     let ranked = rtdb_affinity::rank(&record.storage_identity(), &nodes, |member| member.id.as_str());
-    holder.into_iter().chain(ranked.into_iter().copied().filter(|member| holder.is_none_or(|holder| holder.id != member.id))).collect()
+    holder.into_iter().chain(reserved).chain(ranked.into_iter().copied().filter(|member| {
+        holder.is_none_or(|holder| holder.id != member.id) && reserved.is_none_or(|target| target.id != member.id)
+    })).collect()
 }
 
 async fn connect(address: &str) -> Result<TcpStream> {
@@ -369,8 +522,9 @@ mod tests {
         let directory = rtdb_directory::MemoryDirectory::new();
         directory.create_deployment(DeploymentRecord::new("shop", "acme", Vec::new(), 0)).await.unwrap();
         let router = GatewayRouter {
-            directory, name: "shop".into(), deployment: "original".into(),
-            read_only: false, snapshot: false, options: GatewayOptions::default(),
+            directory, name: "shop".into(), deployment: Some("original".into()),
+            read_only: false, snapshot: false, options: GatewayOptions::default(), heartbeats: Arc::new(Heartbeats::default()),
+            connection_index: 0,
         };
         let result = crate::session::Router::route(&router).await;
         assert_eq!(result.unwrap_err().code, "rtdb.multi/install-identity");
@@ -407,5 +561,29 @@ mod tests {
         socket.write_all(&message).await.unwrap();
         socket.flush().await.unwrap();
         assert_eq!(read.await.unwrap().parameters, parameters);
+    }
+
+    #[tokio::test]
+    async fn simultaneous_sessions_share_backend_heartbeats_until_the_last_disconnect() {
+        let heartbeats = Arc::new(Heartbeats::default());
+        let options = GatewayOptions::default();
+        let first = heartbeats.register("shop", "old".to_owned(), &options);
+        let second = heartbeats.register("shop", "old".to_owned(), &options);
+        let moved = heartbeats.register("shop", "new".to_owned(), &options);
+        let other = heartbeats.register("other-shop", "old".to_owned(), &options);
+        assert!(Arc::ptr_eq(&first, &second));
+        assert!(!Arc::ptr_eq(&first, &moved));
+        assert!(!Arc::ptr_eq(&first, &other));
+        assert_eq!(heartbeats.0.lock().len(), 3);
+
+        drop(first);
+        assert_eq!(heartbeats.0.lock().len(), 3);
+        drop(second);
+        let active = heartbeats.0.lock();
+        assert!(!active.contains_key(&("shop".to_owned(), "old".to_owned())));
+        assert_eq!(active.len(), 2);
+        drop(active);
+        drop((moved, other));
+        assert!(heartbeats.0.lock().is_empty());
     }
 }
