@@ -565,6 +565,21 @@ def verify_logkeeper(args, scratch):
     }
     verify_lean_model(args, scratch, models / "RecoveryWinner.lean", "logkeeper-winner", winner_controls, 3)
 
+    audit_controls = {
+        "restart-chain-on-every-page": (
+            "pages.foldl (chain link) seed",
+            "pages.foldl (fun _ page => chain link seed page) seed",
+            ["online_pages_preserve_the_flat_committed_chain"],
+        ),
+        "accept-without-quorum": (
+            "quorum ≤ covered.length",
+            "0 ≤ covered.length",
+            ["strict_agreement_requires_quorum_coverage", "strict_agreement_requires_equal_returned_digests",
+             "strict_agreement_reports_insufficient_when_agreeing_proofs_fall_short"],
+        ),
+    }
+    verify_lean_model(args, scratch, models / "RetainedAudit.lean", "logkeeper-audit", audit_controls, 5)
+
 
 def verify_generation_retention(args, scratch):
     path = Path("verification/lean/GenerationRetention.lean")
