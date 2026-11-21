@@ -43,7 +43,10 @@ release together.
 
 The cleanup model assumes one fail-stop maintenance owner. Ordered-index
 page reads bypass the durable disk cache, and replay holds its L0 input in
-charged memory. Hosted checkpoint archives, storage forks, and relocation leave derived index pages with their original source.
+charged memory. Hosted checkpoint archives, storage forks, and relocation leave derived
+index pages with their original source. Decoded pages belong to the active read
+or maintenance operation. The replica does not keep an idle ordered-index
+page cache or a live replay tip.
 In production, a worker's term cancellation and an object-store `put` are separate operations.
 An end-to-end physical erasure argument must cover an already-admitted write by a superseded owner and stale contents on every replica.
 A proof of the cleanup marker under the fail-stop model establishes one step of that argument.
@@ -84,10 +87,11 @@ conditions across its object store and replicas to claim physical completion.
 The proof run checked the models and included Rust decision functions. The
 native RTDB and Bijection runtime regressions remain unexecuted.
 
-On the hosted integration source `ad6d5924903d89613b0bdf714fb75f2023d27867`,
-Lean 4.35.0 checked seven law modules and audited 17 theorems through Rex on the M1.
-The additional module covers exact ascending or descending candidates by
-order rank, clearance before duplicate elimination, and per-source limits.
+On the hosted integration source `671274af9f8e92b912a2958f1b8ea75a8a602a75`,
+Lean 4.35.0 checked seven law modules and audited 18 theorems through Rex on the M1.
+The added laws cover distinct candidate order, clearance before duplicate
+elimination, preservation under per-source limits, and replay input provenance
+across primary compaction.
 
 ## Execution
 

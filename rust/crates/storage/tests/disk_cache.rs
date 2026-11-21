@@ -330,6 +330,26 @@ async fn database_scopes_keep_equal_remote_keys_separate_and_return_charged_rang
 }
 
 #[tokio::test]
+async fn a_fresh_read_has_no_durable_cache_dependency() {
+    let directory = tempfile::tempdir().unwrap();
+    let cache = DiskCache::open(directory.path(), 100, MemoryBudget::new(4 * 1024 * 1024)).unwrap();
+    let remote = Arc::new(MemoryStore::default());
+    let scope = ObjectKey::new("db/0").unwrap();
+    let store = cache.scope(scope, remote.clone()).unwrap();
+    let key = ObjectKey::new("derived/page").unwrap();
+    let durable_copy = directory.path().join("db/0/derived/page");
+    remote.put(&key, Bytes::from_static(b"page")).await.unwrap();
+
+    assert_eq!(store.get_fresh(&key).await.unwrap().as_ref(), b"page");
+    assert!(!durable_copy.exists());
+
+    assert_eq!(store.get(&key).await.unwrap().as_ref(), b"page");
+    assert!(durable_copy.exists());
+    remote.delete(&key).await.unwrap();
+    assert!(matches!(store.get_fresh(&key).await, Err(Error::MissingObject(_))));
+}
+
+#[tokio::test]
 async fn successful_file_upload_warms_cache_and_deleting_through_the_store_drops_the_cached_copy() {
     let directory = tempfile::tempdir().unwrap();
     let cache = DiskCache::open(directory.path(), 100, MemoryBudget::new(4 * 1024 * 1024)).unwrap();

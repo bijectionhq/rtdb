@@ -7,10 +7,8 @@ use std::{
 };
 
 use rtdb_columnar::{MemoryBudget, MemoryReservation};
-use rtdb_storage::{
-    ObjectKey,
-    cache::{BufferPool, Cached, View},
-};
+use parking_lot::Mutex;
+use rtdb_storage::{ObjectKey, cache::BufferPool};
 use rtdb_types::{Iid, Interval, Result, Timestamp};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -24,6 +22,7 @@ use super::{
 };
 
 const FANOUT: usize = 64;
+const PAGE_CACHE_LIMIT: usize = 8 << 20;
 type Work<'a, T> = Pin<Box<dyn Future<Output = Result<T>> + Send + 'a>>;
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -125,13 +124,6 @@ pub(super) enum Link {
 }
 
 impl Link {
-    pub fn dirty_bytes(&self) -> usize {
-        match self {
-            Self::Stored(_) => 0,
-            Self::New(node) => node.dirty_bytes,
-        }
-    }
-
     fn first(&self) -> &Key {
         match self {
             Self::Stored(pointer) => &pointer.first,
@@ -151,10 +143,7 @@ impl Link {
 pub(super) struct Node {
     page: Page,
     _memory: Arc<MemoryReservation>,
-    pub(super) dirty_bytes: usize,
 }
-
-impl Cached for Node {}
 
 #[derive(Debug)]
 enum Page {
@@ -196,13 +185,28 @@ enum StoredPage {
 
 pub(super) type Root = Option<Link>;
 
+#[derive(Default)]
+struct DecodedPages {
+    bytes: usize,
+    entries: BTreeMap<ObjectKey, Arc<Node>>,
+}
+
 pub(super) struct Tree<'a> {
     pub storage: &'a BufferPool,
     pub directory: &'a ObjectKey,
     pub memory: &'a Arc<MemoryBudget>,
+    decoded: Mutex<DecodedPages>,
 }
 
-impl Tree<'_> {
+impl<'a> Tree<'a> {
+    pub fn new(
+        storage: &'a BufferPool,
+        directory: &'a ObjectKey,
+        memory: &'a Arc<MemoryBudget>,
+    ) -> Self {
+        Self { storage, directory, memory, decoded: Mutex::default() }
+    }
+
     fn page_key(&self, generation: i64, digest: &str) -> Result<ObjectKey> {
         if generation < 0
             || digest.len() != 64
@@ -220,18 +224,7 @@ impl Tree<'_> {
         let memory = self
             .memory
             .reserve(page.bytes().saturating_mul(2).saturating_add(256))?;
-        let children = match &page {
-            Page::Branch(children) => children.iter().fold(0usize, |bytes, child| {
-                bytes.saturating_add(child.dirty_bytes())
-            }),
-            Page::Leaf(_) => 0,
-        };
-        let dirty_bytes = memory.bytes().saturating_add(children);
-        Ok(Link::New(Arc::new(Node {
-            page,
-            _memory: memory,
-            dirty_bytes,
-        })))
+        Ok(Link::New(Arc::new(Node { page, _memory: memory })))
     }
 
     async fn open(&self, link: &Link) -> Result<Arc<Node>> {
@@ -240,7 +233,8 @@ impl Tree<'_> {
             Link::Stored(pointer) => pointer,
         };
         let object = self.page_key(pointer.generation, &pointer.digest)?;
-        if let Some(node) = self.storage.view::<Node>(&object, View::Layout) {
+        let cached = self.decoded.lock().entries.get(&object).cloned();
+        if let Some(node) = cached {
             if node.page.first() != &pointer.first || node.page.last() != &pointer.last {
                 return Err(format_error(
                     "Ordered index page fences differ from its reference",
@@ -249,11 +243,7 @@ impl Tree<'_> {
             return Ok(node);
         }
         let bound = pointer.size.saturating_mul(8).saturating_add(4096);
-        let cached = self.storage.admit(bound);
-        let memory = match &cached {
-            Some(memory) => Arc::clone(memory),
-            None => self.memory.reserve(bound)?,
-        };
+        let memory = self.memory.reserve(bound)?;
         // Derived index pages are rebuildable, and must never make a durable
         // replica-local copy outside the object owner's erasure inventory.
         let store = self.storage.object_store();
@@ -294,14 +284,14 @@ impl Tree<'_> {
                 "Ordered index page fences differ from its reference",
             ));
         }
-        let node = Arc::new(Node {
-            page,
-            _memory: memory,
-            dirty_bytes: 0,
-        });
-        if cached.is_some() {
-            self.storage
-                .insert_view(&object, View::Layout, Arc::clone(&node));
+        let node = Arc::new(Node { page, _memory: memory });
+        // The read or maintenance operation owns the decoded pages. An idle
+        // replica has no independently retained copy after it releases the tree.
+        let mut decoded = self.decoded.lock();
+        let limit = PAGE_CACHE_LIMIT.min(self.memory.limit_bytes() / 16);
+        if bound <= limit.saturating_sub(decoded.bytes) && !decoded.entries.contains_key(&object) {
+            decoded.entries.insert(object, Arc::clone(&node));
+            decoded.bytes += bound;
         }
         Ok(node)
     }

@@ -1,18 +1,15 @@
 use std::{collections::BTreeSet, io, sync::Arc};
 
-use rtdb_columnar::{MemoryBudget, MemoryReservation};
+use rtdb_columnar::MemoryBudget;
 use rtdb_format::data::EventBatch;
 use rtdb_index::Snapshot;
 use rtdb_maintenance::{
     CycleWorker, SnapshotSource,
     input::{open_input, read_page},
 };
-use rtdb_storage::{
-    ObjectKey,
-    cache::{BufferPool, Cached, View},
-};
+use rtdb_storage::{ObjectKey, cache::BufferPool};
 use rtdb_types::{
-    Anomaly, AnomalyCategory, BlockIndex, Result, TableRef, Timestamp, TransactionKey,
+    Anomaly, AnomalyCategory, BlockIndex, Result, TableRef, Timestamp,
 };
 use tokio_util::sync::CancellationToken;
 
@@ -68,11 +65,7 @@ impl OrderedIndexMaintenance {
         let mut directories = BTreeSet::new();
         for definition in active {
             let directory = definition.directory()?;
-            let tree = Tree {
-                storage: &self.storage,
-                directory: &directory,
-                memory: &self.memory,
-            };
+            let tree = Tree::new(&self.storage, &directory, &self.memory);
             self.refresh_index(snapshot, &definition, &tree, cancellation)
                 .await?;
             directories.insert(directory);
@@ -239,45 +232,13 @@ pub(super) async fn read_root(
     system_at: Timestamp,
     cancellation: &CancellationToken,
 ) -> Result<Option<Root>> {
-    let segments = snapshot.segments(&definition.table);
-    let reusable = !snapshot.has_overlays()
-        && snapshot
-            .tx_basis()
-            .filter(|basis| basis.system_time == system_at)
-            .is_some();
-    let key = tip_key(tree.directory)?;
-    let tip = if reusable {
-        tree.storage.view::<Tip>(&key, View::Layout)
-    } else {
-        None
-    };
-    let row_count = segments.first().map_or(0, |segment| segment.row_count());
-    let cached = tip.filter(|tip| {
-        tip.block == snapshot.block_index()
-            && tip.rows <= row_count
-            && snapshot
-                .tx_basis()
-                .is_some_and(|basis| tip.basis.tx_id <= basis.tx_id)
-    });
-    if let Some(tip) = &cached
-        && tip.rows == row_count
-    {
-        return Ok(Some(tip.root.clone()));
-    }
-    let mut root = if let Some(tip) = &cached {
-        tip.root.clone()
-    } else {
-        let Some(root) =
-            read_flushed_root(tree, definition, snapshot, system_at, cancellation).await?
-        else {
-            return Ok(None);
-        };
-        root
+    let Some(root) = read_flushed_root(tree, definition, snapshot, system_at, cancellation).await?
+    else {
+        return Ok(None);
     };
     let mut live = Changes::default();
-    for segment in segments.iter().rev() {
-        let from = cached.as_ref().map_or(0, |tip| tip.rows);
-        for (batch, skip) in segment.batches_from(from) {
+    for segment in snapshot.segments(&definition.table).iter().rev() {
+        for (batch, skip) in segment.batches_from(0) {
             live.add_batch(
                 batch.view(),
                 skip,
@@ -287,44 +248,9 @@ pub(super) async fn read_root(
             )?;
         }
     }
-    root = live
-        .read(tree, root, system_at, EventOrder::OldestFirst, cancellation)
-        .await?;
-    if reusable
-        && let Some(basis) = snapshot.tx_basis()
-        && let Some(memory) = tree.storage.admit(
-            root.as_ref()
-                .map_or(0, |root| root.dirty_bytes())
-                .saturating_add(1024),
-        )
-    {
-        tree.storage.insert_view(
-            &key,
-            View::Layout,
-            Arc::new(Tip {
-                block: snapshot.block_index(),
-                basis,
-                rows: row_count,
-                root: root.clone(),
-                _memory: memory,
-            }),
-        );
-    }
-    Ok(Some(root))
-}
-
-struct Tip {
-    block: BlockIndex,
-    basis: TransactionKey,
-    rows: u32,
-    root: Root,
-    _memory: Arc<MemoryReservation>,
-}
-
-impl Cached for Tip {}
-
-pub(super) fn tip_key(directory: &ObjectKey) -> Result<ObjectKey> {
-    Ok(ObjectKey::new(format!("{directory}/live"))?)
+    live.read(tree, root, system_at, EventOrder::OldestFirst, cancellation)
+        .await
+        .map(Some)
 }
 
 async fn read_flushed_root(

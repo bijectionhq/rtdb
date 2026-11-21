@@ -544,11 +544,7 @@ async fn use_index(
         return Ok(Some(Vec::new()));
     }
     let directory = definition.directory()?;
-    let tree = Tree {
-        storage: request.storage,
-        directory: &directory,
-        memory: request.memory,
-    };
+    let tree = Tree::new(request.storage, &directory, request.memory);
     let system_at = request.bounds.system_time.lower();
     let Some(root) = read_root(
         &tree,
