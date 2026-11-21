@@ -623,3 +623,23 @@ The model bounds the number of published generations to three and allows stale o
 This recovery path advances once a refreshed listing reveals a newer checkpoint and the needed metadata can be read.
 The production change covers checkpoint metadata discovery.
 It leaves full trie closure, replica-log suffix protection, and storage-provider availability as separate proof obligations.
+
+The combined formal and native runner passed on `f8fe52cb6`, including both startup tests and the mutation that disables refreshing.
+The input manifest SHA-256 is `49b0c50b2ac84788921aff22fe8479d2cbb92ee1fdd63b4c762b4d70e7cde4f4`.
+The same fallback is on `rtdb-multi` at `9a5875ea8` for ordinary latest-checkpoint recovery.
+That branch passed 101 tests, including both local Node cases and the refusal checks for exact-block and restored-archive recovery.
+
+== Observable checkpoint discovery
+
+mCRL2 202607.0 checked link:../mcrl2/CheckpointDiscovery.mcrl2[the staged and atomic models] over three reported indices.
+It compares the input observations and the outputs for admitted checkpoint, empty database, unavailable checkpoint and corrupt metadata.
+Candidate selection and the root and table reads are hidden.
+The staged and atomic systems have 326 and 146 reachable states respectively.
+They are divergence-preserving branching bisimilar.
+Three weakened policies are distinguishable by formulas over the visible actions.
+They fail early on missing metadata, retry the same index, or report an empty database after a missing checkpoint and an empty listing.
+The runner retains both systems and each counterexample formula.
+
+The comparison treats a listing and its two read outcomes as the environment's input for one attempt.
+The state-space proof applies to that finite observation model.
+The separate TLA+ study covers interleavings with publication and physical collection, and the native tests cover the two selected production schedules.

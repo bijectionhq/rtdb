@@ -1,0 +1,69 @@
+% One metadata discovery session over three ordered checkpoint indices.
+% An observation supplies a listing and the responses for that attempt.
+% Selection and the two metadata reads are internal. Failure and admission are visible.
+sort
+  Block = struct b0 | b1 | b2;
+  Candidate = struct no_block | checkpoint(index: Block);
+  Read = struct readable | missing | damaged;
+  Offer = struct report(advertised: Candidate, root: Read, table: Read);
+
+map
+  position: Candidate -> Nat;
+  outcome: Read # Read -> Read;
+
+var
+  first, second: Read;
+
+eqn
+  position(no_block) = 0;
+  position(checkpoint(b0)) = 1;
+  position(checkpoint(b1)) = 2;
+  position(checkpoint(b2)) = 3;
+  outcome(first, second) = if(first == readable, second, first);
+
+act
+  observed: Offer;
+  opened: Block;
+  empty_database, unavailable, corrupt;
+  select_candidate, read_root, read_table;
+
+proc
+  Contract(previous: Candidate) =
+    sum offer: Offer . observed(offer) .
+      (
+        (advertised(offer) == no_block && previous == no_block) -> empty_database . delta
+        + (position(advertised(offer)) <= position(previous) && previous != no_block) ->
+            unavailable . delta
+        + (position(advertised(offer)) > position(previous)) ->
+          (
+            (outcome(root(offer), table(offer)) == readable) -> opened(index(advertised(offer))) . delta
+            + (outcome(root(offer), table(offer)) == damaged) -> corrupt . delta
+            + (outcome(root(offer), table(offer)) == missing) -> Contract(advertised(offer))
+          )
+      );
+
+  Discover(previous: Candidate) =
+    sum offer: Offer . observed(offer) . select_candidate . Select(previous, offer);
+
+  Select(previous: Candidate, offer: Offer) =
+    (previous == no_block && advertised(offer) == no_block) -> empty_database . delta
+    + (
+        advertised(offer) != no_block && position(advertised(offer)) > position(previous)
+      ) -> read_root . ReadRoot(offer)
+    + (
+        previous != no_block && position(advertised(offer)) <= position(previous)
+      ) -> unavailable . delta;
+
+  ReadRoot(offer: Offer) =
+    (root(offer) == readable) -> read_table . ReadTable(offer)
+    + (root(offer) == damaged) -> corrupt . delta
+    + (root(offer) == missing) -> Refresh(advertised(offer));
+
+  ReadTable(offer: Offer) =
+    (table(offer) == readable) -> opened(index(advertised(offer))) . delta
+    + (table(offer) == damaged) -> corrupt . delta
+    + (table(offer) == missing) -> Refresh(advertised(offer));
+
+  Refresh(previous: Candidate) = Discover(previous);
+
+init hide({select_candidate, read_root, read_table}, Discover(no_block));

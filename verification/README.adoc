@@ -86,12 +86,17 @@ BIJECTION_LOCAL_EXECUTION=owner-authorized VERUS_Z3_PATH=/path/to/z3 \
   --lean /path/to/lean --verus /path/to/verus \
   --java /path/to/java --tlc /path/to/tla2tools.jar --alloy /path/to/alloy.jar \
   --apalache /path/to/apalache-mc --maude /path/to/maude \
+  --mcrl2-bin /path/to/mCRL2.app/Contents/bin \
   --rust-boundary --native-replay \
   --evidence /path/to/new-evidence-directory
 ----
 
 The local toolchain for this study is Lean 4.36.0, Verus 0.2026.11.20.9da409b with Rust 1.100.0 and Z3 4.16.0, and TLC 2026.11.19.180144 and Alloy 6.2.0 with Java 21.0.13.
 The independent comparison also uses Maude 3.5.1 and Apalache 0.63.0.
+Pass `--mcrl2-bin` to include the behavioural comparison with mCRL2 202607.0.
+The pinned Apple Silicon image is `mcrl2-202607.0_arm64.dmg`, whose released SHA-256 is
+`e584919454b0d774800eff964f19dad2e0a0eac91e571f788aae4ab1a87a207f`.
+The runner records the identities of `mcrl22lps`, `lps2lts` and `ltscompare` and retains the generated transition systems and distinguishing formulas. https://mcrl2.org/web/home/download.html[mCRL2 release downloads]
 The pinned Verus release replaces the earlier proposed source build of 31e44e6.
 The optional Rust boundary check compiles an unchanged copy and two mutated copies of the replica driver imported from the current Git commit.
 The optional native replay reads the same seeded 4,096-observation trace that the Lean evaluator checks, exercising both temporal resolvers and the unbounded visibility rectangles.
@@ -125,6 +130,8 @@ It also exercises the Azure adapter against a loopback provider and separately m
   TLC explores its finite state space and Apalache independently checks the same safety conditions up to ten transitions.
 * `tla/RecoveryDiscovery.tla` models a separate fallback for missing checkpoint metadata during startup.
   The fallback requires a newer checkpoint in a refreshed listing and has no effect on replica-log retention.
+* `mcrl2/CheckpointDiscovery.mcrl2` compares the staged metadata discovery with an atomic observation contract after hiding the selection and individual reads.
+  It checks divergence-preserving branching bisimilarity on three indices and generates a distinguishing formula for each weakened model.
 * `tla/LeaseAdmission.tla` compares validated expiring leases and coordinated pins against age-only collection and stale-follower admission.
 * `tla/ReaderIO.tla` separates admission and in-flight I/O, with controls for clock error, expiry, overrun, release, and authority change.
   `lean/ReaderRetention.lean` proves strict lease timing and preservation of an abstract counted pin, with matching expiry and close controls.

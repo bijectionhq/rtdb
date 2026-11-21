@@ -673,6 +673,67 @@ def verify_maude(args, scratch):
     print("maude: serialized and validated models hold, blind model has a counterexample")
 
 
+def verify_mcrl2(args, scratch):
+    model = Path("verification/mcrl2/CheckpointDiscovery.mcrl2")
+    impl = "init hide({select_candidate, read_root, read_table}, Discover(no_block));"
+    usable = "advertised(offer) != no_block && position(advertised(offer)) > position(previous)"
+    stays = "previous != no_block && position(advertised(offer)) <= position(previous)"
+    variants = {
+        "contract": [(impl, "init Contract(no_block);")],
+        "baseline": [],
+        "fail-fast": [
+            ("Refresh(previous: Candidate) = Discover(previous);",
+             "Refresh(previous: Candidate) = unavailable . delta;"),
+        ],
+        "retry-same": [
+            (usable, usable.replace(" > ", " >= ")),
+            (stays, "previous != no_block && "
+             "(advertised(offer) == no_block || position(advertised(offer)) < position(previous))"),
+        ],
+        "reset-on-empty": [
+            ("previous == no_block && advertised(offer) == no_block", "advertised(offer) == no_block"),
+            (stays, "previous != no_block && advertised(offer) != no_block && "
+             "position(advertised(offer)) <= position(previous)"),
+        ],
+    }
+    systems = {}
+    for name, mutations in variants.items():
+        case = f"mcrl2-checkpoint-{name}"
+        directory = scratch / case
+        source = clone_file(model, directory)
+        for find, replacement in mutations:
+            replace_once(source, find, replacement)
+        linear = run_case([args.mcrl22lps, str(source), "checkpoint.lps"],
+                          directory, args.evidence, f"{case}-linear")
+        if linear.returncode:
+            raise ValueError(f"{case}: linearization failed")
+        automaton = args.evidence / f"{case}.aut"
+        generated = run_case([args.lps2lts, "checkpoint.lps", str(automaton)],
+                              directory, args.evidence, f"{case}-states")
+        if generated.returncode or not automaton.is_file():
+            raise ValueError(f"{case}: state-space generation failed")
+        systems[name] = automaton
+        if name == "contract":
+            continue
+        comparison = [args.ltscompare]
+        counterexample = args.evidence / f"{case}.mcf"
+        if name == "baseline":
+            comparison.append("--equivalence=dpbranching-bisim")
+        else:
+            comparison.extend(["--equivalence=branching-bisim", "--counter-example",
+                               f"--counter-example-file={counterexample}"])
+        checked = run_case(
+            [*comparison, str(systems["contract"]), str(automaton)],
+            directory, args.evidence, f"{case}-compare",
+        )
+        expected = "true" if name == "baseline" else "false"
+        if checked.returncode or checked.stdout.strip() != expected:
+            raise ValueError(f"{case}: expected {expected}, observed {checked.stdout.strip()}")
+        if name != "baseline" and (not counterexample.is_file() or "observed(" not in counterexample.read_text()):
+            raise ValueError(f"{case}: expected a distinguishing formula over observations")
+        print(f"{case}: {'equivalent to the checkpoint contract' if name == 'baseline' else 'negative control distinguished'}")
+
+
 def capture_production(source):
     source.mkdir()
     subprocess.run(["git", "diff", "--exit-code", "HEAD", "--", "rust"], cwd=ROOT, check=True)
@@ -937,6 +998,7 @@ def main():
     parser.add_argument("--alloy", required=True)
     parser.add_argument("--apalache", required=True)
     parser.add_argument("--maude", required=True)
+    parser.add_argument("--mcrl2-bin", type=Path)
     parser.add_argument("--rust-boundary", action="store_true")
     parser.add_argument("--native-replay", action="store_true")
     parser.add_argument("--evidence", required=True, type=Path)
@@ -945,9 +1007,12 @@ def main():
         parser.error("local proof execution requires BIJECTION_LOCAL_EXECUTION=owner-authorized")
     args.evidence = args.evidence.resolve()
     args.evidence.mkdir(parents=True, exist_ok=False)
+    supplied_tools = {name: getattr(args, name) for name in
+                      ("lean", "verus", "z3", "java", "tlc", "alloy", "apalache", "maude")}
+    if args.mcrl2_bin:
+        supplied_tools.update({name: args.mcrl2_bin / name for name in ("mcrl22lps", "lps2lts", "ltscompare")})
     tools = {}
-    for name in ("lean", "verus", "z3", "java", "tlc", "alloy", "apalache", "maude"):
-        supplied = getattr(args, name)
+    for name, supplied in supplied_tools.items():
         executable = Path(shutil.which(supplied) or supplied).resolve()
         setattr(args, name, str(executable))
         with executable.open("rb") as handle:
@@ -960,7 +1025,7 @@ def main():
     }, indent=2) + "\n")
     source_paths = [
         path for path in (ROOT / "verification").rglob("*")
-        if path.is_file() and path.suffix in {".lean", ".tla", ".cfg", ".als", ".maude", ".py", ".rs", ".json", ".tsv", ".smt2"}
+        if path.is_file() and path.suffix in {".lean", ".tla", ".cfg", ".als", ".maude", ".mcrl2", ".py", ".rs", ".json", ".tsv", ".smt2"}
     ]
     source_paths.extend(ROOT / path for path in (
         "rust/crates/text/src/lib.rs",
@@ -1006,6 +1071,8 @@ def main():
         verify_alloy(args, directory)
         verify_apalache(args, directory)
         verify_maude(args, directory)
+        if args.mcrl2_bin:
+            verify_mcrl2(args, directory)
         if args.rust_boundary or args.native_replay:
             source = directory / "production"
             capture_production(source)

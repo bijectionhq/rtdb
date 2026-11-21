@@ -1008,6 +1008,7 @@ BIJECTION_LOCAL_EXECUTION=owner-authorized VERUS_Z3_PATH=/path/to/z3 \
   --lean /path/to/lean --verus /path/to/verus \
   --java /path/to/java --tlc /path/to/tla2tools.jar --alloy /path/to/alloy.jar \
   --apalache /path/to/apalache-mc --maude /path/to/maude \
+  --mcrl2-bin /path/to/mCRL2.app/Contents/bin \
   --rust-boundary --native-replay \
   --evidence /path/to/new-evidence-directory
 ----
@@ -1051,10 +1052,11 @@ The native score witness passes and the unpadded mutation fails.
 Relate the native postings iterator and persisted sidecar to the modeled complete term-window summaries.
 
 |Recovery and Azure
-|Five native recovery tests and the root-first control, and two loopback Azure tests and their two source controls, cover selected production failure paths.
+|Seven native recovery tests and the root-first and fail-fast controls, and two loopback Azure tests and their two source controls, cover selected production failure paths.
 A durable-node test verifies current and system-history SQL results before, during and after tiered publication, then recovers the partial checkpoint and replays the last notice.
 Production discovery now advances to a newer advertised root when collection removes the selected root or a table block during startup.
 Native runs verify both cases using the block collector, and Verus checks the strict progress decision.
+mCRL2 checks the observable results of the staged discovery model against the atomic contract for three reported indices.
 TLC and Apalache check two overlapping checkpoint generations, one recovery reference, protected objects, and its required log suffix under delayed collection.
 Lean checks the pending historical promotion reconstructed from a checkpoint. Verus checks the exact four-member guard in the tiered catalog.
 |Generalize recovery from decoded metadata to the full trie dependency closure and a usable log suffix while compaction and collection are active.
