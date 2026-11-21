@@ -2793,6 +2793,11 @@ async fn ordered_index_publishes_its_own_roots_and_seeks_both_directions_at_a_ba
     assert_eq!(rows(session.query_sql(warm, vec![]).await.unwrap()).await, [vec![Value::I64(1)]]);
     assert!(observer.take().is_empty());
 
+    let bounded = "SELECT _id FROM orders WHERE customer = 'a' ORDER BY priority, _id LIMIT ? OFFSET ?";
+    assert_eq!(rows(session.query_sql(bounded, vec![Value::I64(2), Value::I64(1)]).await.unwrap()).await,
+        [vec![Value::I64(2)], vec![Value::I64(4)]]);
+    assert!(observer.take().is_empty());
+
     index_sql(&mut session, "UPDATE orders SET priority = 9 WHERE _id = 1").await;
     index_sql(&mut session, "DELETE FROM orders WHERE _id = 2").await;
     index_sql(&mut session, "INSERT INTO orders RECORDS {_id: 7, customer: 'a', priority: 2}").await;

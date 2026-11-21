@@ -58,7 +58,7 @@ A proof of a candidate is conditional on the explicitly stated contract and work
 | QRY08 · Join and set semantics | Open | — |
 | QRY09 · Aggregation | Partial | [Ordered-index distinct runs and bounded query prefixes](rtdb-engine-proof-evidence.md#main-evidence) |
 | QRY10 · Ordering and windows | Partial | [Ordered merge, filtering before limit and keyset continuation](rtdb-engine-proof-evidence.md#main-evidence) |
-| QRY11 · Evaluation context | Open | — |
+| QRY11 · Evaluation context | Partial | [Lean limit-opening order, checked production bounds, and native evaluation regressions](rtdb-engine-proof-evidence.md#limit-opening-and-count-admission) |
 | QRY12 · Streaming equivalence | Open | — |
 | QRY13 · Query framing | Open | — |
 | QRY14 · Rewrite termination (Candidate) | Open | — |

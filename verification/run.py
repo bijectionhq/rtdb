@@ -798,6 +798,37 @@ def verify_table_slugs(args, scratch):
     verify_lean_model(args, scratch, path, "table-slugs", controls, 6)
 
 
+def verify_limit_open(args, scratch):
+    path = Path("verification/lean/LimitOpen.lean")
+    controls = {
+        "offset-before-input-failure": (
+            "| .error issue => ([.input], .error issue)",
+            "| .error issue => match bound .offset offset with\n"
+            "    | .error offsetIssue => ([.offset], .error offsetIssue)\n"
+            "    | .ok _ => ([.input], .error issue)",
+            ["input_failure_precedes_every_bound"],
+        ),
+        "fetch-before-offset": (
+            "match bound .offset offset with",
+            "match bound .fetch fetch with",
+            ["direct_bounds_can_skip_evaluating_the_counts", "fetch_refusal_follows_valid_offset",
+             "offset_refusal_precedes_fetch"],
+        ),
+        "coerce-direct-negative-to-zero": (
+            "if 0 ≤ integer ∧ integer ≤ 9223372036854775807 then some (some integer.toNat) else none",
+            "if integer ≤ 9223372036854775807 then some (some integer.toNat) else none",
+            ["direct_bound_has_the_same_success"],
+        ),
+        "overflow-positive-acceptance": (
+            "if 0 ≤ integer ∧ integer ≤ 9223372036854775807 then .ok (some integer.toNat)",
+            "if 0 ≤ integer ∧ integer ≤ 9223372036854775808 then .ok (some integer.toNat)",
+            ["direct_bound_has_the_same_success", "minus_one_and_overflow_are_refused",
+             "nonnegative_representable_integer_is_preserved"],
+        ),
+    }
+    verify_lean_model(args, scratch, path, "limit-open", controls, 10)
+
+
 def verify_private_replay(args, scratch):
     path = Path("verification/lean/PrivateReplay.lean")
     controls = {
@@ -1080,6 +1111,7 @@ def verify_lean(args, scratch):
             verify_table_slugs(args, scratch)
             verify_explicit_session(args, scratch)
             verify_private_replay(args, scratch)
+            verify_limit_open(args, scratch)
             verify_logkeeper(args, scratch)
             verify_reader_retention(args, scratch)
             verify_generation_retention(args, scratch)

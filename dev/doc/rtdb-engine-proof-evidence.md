@@ -159,6 +159,20 @@ The native contract test compares the public bucketer with an independent unsign
 Verus 0.2026.11.05.31e44e6 checked nine functions and rejected all five mutations, including one that accepts an IID with a smaller first differing digit. [Verus study](../../verification/verus/iid_partition/area.json)
 The native run passed 495 tests with `cargo test --manifest-path rust/Cargo.toml --locked -p rtdb-trie -p rtdb-format -p rtdb-index -p rtdb-query`. [Rust contract test](../../rust/crates/trie/tests/contracts.rs)
 
+### Limit opening and count admission
+
+The ordinary native limit opens the input before evaluating OFFSET and then FETCH.
+An input that evaluates its rows eagerly can fail on open.
+An expression deferred by a projection remains deferred when the bound fails.
+A present FETCH and valid bounds that can be read directly from literals or captured parameters enable an ordered seek.
+An invalid count falls back to ordinary opening, where the earlier input error keeps its precedence.
+
+Lean proves the abstract open and bound order, the preservation of bound-expression errors, and equality of successfully decoded direct and ordinary counts.
+The direct-count law assumes the expression denotes the captured scalar that the endpoint reads.
+Verus checks the production count decoder and the capped offset-plus-fetch prefix, including the signed endpoint and overflowing unsigned sums.
+Native statement tests exercise eager and deferred evaluation, and the ordered-index tests require both literal and parameter counts to seek without an ordinary candidate scan.
+Full refinement still needs the async opener, the expression evaluator and optimizer's ordering and resource contracts. [Lean model](../../verification/lean/LimitOpen.lean) · [Verus study](../../verification/verus/limit_bounds/area.json) · [Production operators](../../rust/crates/query/src/operators.rs) · [Statement regression](../../rust/crates/node/tests/statement.rs)
+
 ### Submission clock and durable retry attribution
 
 Native submissions with an application idempotency key use a finite one-hour marker interval measured from submission.

@@ -8,6 +8,7 @@ use rtdb_types::{Result, Value};
 
 use crate::context::Execution;
 use crate::cursor::{BoxCursor, OwnedRow};
+use crate::limit_bounds::{checked_row_count, sort_prefix_len};
 use crate::runtime_schema::{EmittedRelation, RuntimeSchema};
 use crate::{invalid, QueryContext};
 use crate::pages::{BoxPageCursor,OwnedPage,PageBuilder,PageCursor};
@@ -262,14 +263,13 @@ fn build_pages_constrained(runtime: Arc<EmittedRelation>, execution: Execution, 
         RelationNode::SortLimit { order_by,offset,fetch,.. } => {
             let mut constraints = constraints;for order in order_by { constraints.require(&order.expr); }
             let pushdowns = if offset.is_some() || fetch.is_some() { None } else { pushdowns };
-            let offset_value = row_limit(offset.as_ref(),&execution).await?.unwrap_or(0);
-            let remaining = row_limit(fetch.as_ref(),&execution).await?;
-            let row_limit = offset_value.saturating_add(remaining.unwrap_or(i64::MAX as u64)).min(i64::MAX as u64);
-            if !order_by.is_empty() && fetch.is_some()
-                && let Ok(limit) = usize::try_from(row_limit)
+            if !order_by.is_empty()
+                && let Some(offset_value) = offset.as_ref().map_or(Some(0), |bound| direct_row_count(bound, &execution))
+                && let Some(fetch_value) = fetch.as_ref().and_then(|bound| direct_row_count(bound, &execution))
+                && let Ok(limit) = usize::try_from(sort_prefix_len(offset_value, Some(fetch_value)))
                 && let Some(input) = ordered_input(runtime.child(0)?, execution.child(0), limit).await?
             {
-                let pages = Box::new(Limit { input: Some(input), offset: offset_value, remaining, execution });
+                let pages = Box::new(Limit { input: Some(input), offset: offset_value, remaining: Some(fetch_value), execution });
                 let pages = crate::pages::retain_page_state(pages, state_reservation);
                 return Ok(crate::trace::wrap(crate::analysis::wrap(pages, analysis), &traced_relation, &traced_context));
             }
@@ -281,6 +281,9 @@ fn build_pages_constrained(runtime: Arc<EmittedRelation>, execution: Execution, 
                 Some(batches) => Ok(batches),
                 None => Err(build_pages_constrained(runtime.child(0)?,execution.child(0),constraints,pushdowns).await?),
             };
+            let offset_value = row_limit(offset.as_ref(),&execution).await?.unwrap_or(0);
+            let remaining = row_limit(fetch.as_ref(),&execution).await?;
+            let row_limit = sort_prefix_len(offset_value, remaining);
             let mut pages: BoxPageCursor = match input {
                 Ok((batches,projected)) if crate::sort::SortCursor::batch_eligible(&schema,order_by,row_limit) =>
                     Box::new(crate::sort::SortCursor::top_batches(batches,projected,schema,order_by.clone(),row_limit,execution.clone())),
@@ -385,11 +388,20 @@ fn build_pages_constrained(runtime: Arc<EmittedRelation>, execution: Execution, 
     }
 }) }
 
+fn direct_row_count(expr: &Expr, execution: &Execution) -> Option<u64> {
+    let value = match expr {
+        Expr::Literal(value) => value,
+        Expr::Parameter { index, .. } => execution.parameters.values().get(*index)?,
+        _ => return None,
+    };
+    integer(value).and_then(checked_row_count)
+}
+
 async fn row_limit(expr: Option<&Expr>, execution: &Execution) -> Result<Option<u64>> {
     let Some(expr) = expr else { return Ok(None); };
     let scope = execution.scope()?;
     let value = execution.evaluate(&scope, expr, &Schema::default(), &[]).await?;
-    if let Some(value) = integer(&value).filter(|value| (0..=i128::from(i64::MAX)).contains(value)) { return Ok(Some(value as u64)); }
+    if let Some(count) = integer(&value).and_then(checked_row_count) { return Ok(Some(count)); }
     let description = match value {
         Value::Null | Value::Undefined => "null".to_owned(),
         Value::Utf8(value) => value,
