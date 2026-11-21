@@ -60,8 +60,8 @@ impl RemoteStorageFactory for CellStoreFactory {
         let bucket = config.storage.bucket(io).await?;
         let store = format!("{}/{}", config.prefix, storage_root.as_str());
         claim_root(&crate::reference::PrefixedStore::new(Arc::clone(&bucket), store.clone()), &config.deployment).await?;
-        let discovery = match self.checkpoint(&config).await? { Some(block) => crate::packing::PackDiscovery::From(block), None => crate::packing::PackDiscovery::List };
-        Ok(open_deployment_store(bucket, &store, discovery, wall_clock()).await?)
+        let record = self.directory.deployment(&config.deployment).await?;
+        Ok(open_cell_store(bucket, &store, record.as_ref(), wall_clock()).await?)
     }
 
     /// A deployment with a published checkpoint recovers from it without listing its store.
@@ -126,8 +126,22 @@ pub fn wall_clock() -> Clock {
 
 /// One store of a deployment in the cell's `bucket` (a prefix and a storage version), as a node opens it below its disk cache: its own objects and those its manifest references, packed, with deletes as releases.
 pub async fn open_deployment_store(bucket: crate::reference::Bucket, store: &str, discovery: crate::packing::PackDiscovery, clock: Clock) -> Result<Arc<GarbageStore>> {
-    let local: Arc<dyn ObjectStore> = Arc::new(crate::reference::PrefixedStore::new(Arc::clone(&bucket), store.to_owned()));
     let base = crate::reference::Base::load(bucket.as_ref(), store).await?;
+    open_with_base(bucket, store, base, discovery, clock).await
+}
+
+async fn open_cell_store(bucket: crate::reference::Bucket, store: &str, record: Option<&DeploymentRecord>, clock: Clock) -> Result<Arc<GarbageStore>> {
+    let discovery = record.and_then(|record| record.checkpoint).map_or(crate::packing::PackDiscovery::List, |checkpoint| {
+        crate::packing::PackDiscovery::From(checkpoint.block)
+    });
+    if record.is_some_and(|record| record.parent.is_none() || record.storage_generation.is_some()) {
+        return open_with_base(bucket, store, crate::reference::Base::default(), discovery, clock).await;
+    }
+    open_deployment_store(bucket, store, discovery, clock).await
+}
+
+async fn open_with_base(bucket: crate::reference::Bucket, store: &str, base: crate::reference::Base, discovery: crate::packing::PackDiscovery, clock: Clock) -> Result<Arc<GarbageStore>> {
+    let local: Arc<dyn ObjectStore> = Arc::new(crate::reference::PrefixedStore::new(Arc::clone(&bucket), store.to_owned()));
     let own: Arc<dyn ObjectStore> = if base.objects.is_empty() { local } else { Arc::new(crate::reference::ReferencingStore::new(local, bucket, base)) };
     let packed = crate::packing::PackingStore::open_with_clock(own, discovery, Arc::clone(&clock)).await?;
     GarbageStore::open_with_clock(packed, clock).await
@@ -422,13 +436,14 @@ mod tests {
 
     fn key(name: &str) -> ObjectKey { ObjectKey::new(name).unwrap() }
 
-    struct PutFailure {
+    struct StoreFaults {
         inner: MemoryStore,
         fail: std::sync::atomic::AtomicBool,
+        deny_list: std::sync::atomic::AtomicBool,
     }
 
     #[async_trait]
-    impl ObjectStore for PutFailure {
+    impl ObjectStore for StoreFaults {
         async fn head(&self, key: &ObjectKey) -> rtdb_storage::Result<StoredObject> { self.inner.head(key).await }
         async fn get(&self, key: &ObjectKey) -> rtdb_storage::Result<Bytes> { self.inner.get(key).await }
         async fn get_range(&self, key: &ObjectKey, range: Range<u64>) -> rtdb_storage::Result<Bytes> { self.inner.get_range(key, range).await }
@@ -439,13 +454,18 @@ mod tests {
             self.inner.put(key, bytes).await
         }
         async fn put_file(&self, key: &ObjectKey, source: &Path) -> rtdb_storage::Result<()> { self.inner.put_file(key, source).await }
-        async fn list(&self, directory: Option<&ObjectKey>) -> rtdb_storage::Result<Vec<StoredObject>> { self.inner.list(directory).await }
+        async fn list(&self, directory: Option<&ObjectKey>) -> rtdb_storage::Result<Vec<StoredObject>> {
+            if self.deny_list.load(std::sync::atomic::Ordering::Relaxed) {
+                return Err(Error::Task("listing is disabled".into()));
+            }
+            self.inner.list(directory).await
+        }
         async fn delete(&self, key: &ObjectKey) -> rtdb_storage::Result<()> { self.inner.delete(key).await }
     }
 
     #[tokio::test]
     async fn a_failed_root_marker_write_is_returned_to_activation() {
-        let inner = PutFailure { inner: MemoryStore::default(), fail: true.into() };
+        let inner = StoreFaults { inner: MemoryStore::default(), fail: true.into(), deny_list: false.into() };
         assert_eq!(claim_root(&inner, "shop").await.unwrap_err().code, "rtdb.storage/task");
         assert!(matches!(inner.get(&key(ROOT_MARKER)).await, Err(Error::MissingObject(_))));
         claim_root(&inner, "shop").await.unwrap();
@@ -453,7 +473,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_failed_release_is_visible_and_can_be_retried() {
-        let inner = Arc::new(PutFailure { inner: MemoryStore::default(), fail: false.into() });
+        let inner = Arc::new(StoreFaults { inner: MemoryStore::default(), fail: false.into(), deny_list: false.into() });
         let store = GarbageStore::open(inner.clone()).await.unwrap();
         let object = key("tables/t/data/a.arrow");
         store.put(&object, Bytes::from_static(b"rows")).await.unwrap();
@@ -613,8 +633,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_store_opened_from_a_checkpoint_behind_its_latest_block_still_finds_it_after_the_reaper_passes() {
-        let bucket: crate::reference::Bucket = Arc::new(MemoryStore::default());
+    async fn a_checkpointed_root_recovers_the_latest_block_after_reaping_with_listing_disabled() {
+        let raw = Arc::new(StoreFaults { inner: MemoryStore::default(), fail: false.into(), deny_list: false.into() });
+        let bucket: crate::reference::Bucket = raw.clone();
         let mut record = DeploymentRecord::new("shop", "acme", vec![], 0);
         let store = format!("{}/v06", record.storage_prefix());
         let open = |discovery| open_deployment_store(Arc::clone(&bucket), &store, discovery, wall_clock());
@@ -626,7 +647,8 @@ mod tests {
         record.checkpoint = Some(rtdb_directory::Checkpoint { block: 0, boundary: 0, source: 0, system_time: 0 });
         for name in ["tables/t/data/l00-rc-b01.arrow", "blocks/b01.binpb"] { writer.delete(&key(name)).await.unwrap(); }
         reap(bucket.as_ref(), &record, Duration::ZERO, &Default::default()).await.unwrap();
-        let cold = open(crate::packing::PackDiscovery::From(0)).await.unwrap();
+        raw.deny_list.store(true, std::sync::atomic::Ordering::Relaxed);
+        let cold = open_cell_store(bucket, &store, Some(&record), wall_clock()).await.unwrap();
         assert_eq!(cold.get(&key("tables/t/data/l00-rc-b02.arrow")).await.unwrap().as_ref(), b"rows 2", "a block after a fully released one is found from the checkpoint");
     }
 

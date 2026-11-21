@@ -375,6 +375,8 @@ Small deployments must cost one PUT per flush and one GET per cold start (spec r
 
 1. **Pack format** in `format`: every table's trie data and metadata and the catalog delta in one object with a footer index; the trie readers in `trie` and `index` read by range.
 2. **Boot object**: catalogs, schema and top trie levels inlined up to `boot_inline_limit`, so opening a deployment is one GET.
+   A checkpointed root or materialized deployment skips the base-manifest listing and opens its packs by name.
+   A fork with inherited objects still reads its base manifest.
 3. **Flush triggers** in `HoldingDriver`: tail bytes, estimated replay, oldest-record age, idle, ensemble degradation, retention, rows (spec rules `FlushOn*`), replacing `flush_timeout` and `rows_per_block` for multi mode.
 4. **Checkpoint publication**: a CAS conditional on the epoch, batched per node, then log trim.
 

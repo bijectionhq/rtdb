@@ -1200,6 +1200,7 @@ rule WritePackAndManifest {
 
 rule PublishCheckpoint {
     -- Publication is a cas conditional on the epoch, batched per node.
+    -- A checkpointed store with an independent object inventory can recover its packs by name.
     when: AppendCommitted(holding, record: BlockUploaded)
 
     ensures:
