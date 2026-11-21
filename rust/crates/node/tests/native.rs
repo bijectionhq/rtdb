@@ -2599,9 +2599,12 @@ async fn ordered_index_limits_distinct_visible_keys_in_both_directions() {
 
 #[tokio::test]
 async fn a_covered_ordered_scan_yields_a_batch_before_opening_later_leaves() {
+    let observer = Arc::new(OrderedIndexReads::default());
+    let mut services = services();
+    services.scan_accelerators.push(observer.clone());
     let mut config = options();
     config.automatic_artefacts = false;
-    let (node, driver) = running(config, services()).await;
+    let (node, driver) = running(config, services).await;
     let mut session = node.session("xtdb", Arc::new(Authority)).unwrap();
     let database = node.catalog().database("xtdb").unwrap();
     index_sql(&mut session, "CREATE INDEX orders_key ON orders (world, key, label)").await;
@@ -2615,14 +2618,13 @@ async fn a_covered_ordered_scan_yields_a_batch_before_opening_later_leaves() {
     let first = cursor.next_batch().await.unwrap().unwrap();
     assert_eq!(first.batch().num_rows(), 128);
     assert_eq!(first.batch().num_columns(), 1);
+    assert!(observer.take().is_empty(), "the first batch came from the ordered index");
 
     let objects = database.object_store();
     let root = rtdb_storage::ObjectKey::new(rtdb_format::keys::ORDERED_INDEX_ROOT).unwrap();
     let mut removed = 0;
     for page in objects.list(Some(&root)).await.unwrap() {
-        if !page.key.as_str().contains("/pages/") { continue; }
-        let bytes = objects.get(&page.key).await.unwrap();
-        if bytes.get(1..16) == Some([0; 15].as_slice()) && bytes.windows(b"key-0399".len()).any(|cell| cell == b"key-0399") {
+        if page.key.as_str().contains("/pages/") {
             objects.delete(&page.key).await.unwrap();
             removed += 1;
         }
@@ -2632,8 +2634,12 @@ async fn a_covered_ordered_scan_yields_a_batch_before_opening_later_leaves() {
     loop {
         match cursor.next_batch().await {
             Ok(Some(batch)) => delivered += batch.batch().num_rows(),
-            Ok(None) => panic!("A missing page completed the index stream"),
-            Err(_) => break,
+            Ok(None) => panic!("The index stream completed after {delivered} rows with later pages unavailable"),
+            Err(error) => {
+                assert_eq!(error.code, "rtdb.storage/missing-object");
+                assert!(error.context["key"].as_str().is_some_and(|key| key.contains("/pages/")));
+                break;
+            }
         }
     }
     assert!(delivered < 400);
