@@ -373,6 +373,18 @@ def verify_lean_model(args, scratch, path, study, controls, theorems, env=None):
         print(f"{case}: {'negative control rejected' if mutation else 'proved'}")
 
 
+
+def verify_search_member_bounds(args, scratch):
+    path = Path("verification/lean/SearchMemberBounds.lean")
+    assignment = "prefixCount doc (startsFrom 0 counts) - 1"
+    laws = ["directory_owner_is_the_reference_owner", "empty_members_on_either_side_do_not_own_the_document"]
+    controls = {
+        "strict-start": (assignment, "(List.takeWhile (· < doc) (startsFrom 0 counts)).length - 1", laws),
+        "collapse-empty": (assignment, "prefixCount doc (startsFrom 0 (counts.filter (· != 0))) - 1", laws),
+    }
+    verify_lean_model(args, scratch, path, "search-member-bounds", controls, 4)
+
+
 def verify_search_windows(args, scratch):
     path = Path("verification/lean/SearchWindows.lean")
     controls = {
@@ -1400,6 +1412,7 @@ def verify_lean(args, scratch):
             verify_compaction_merge(args, scratch)
             verify_compaction_intervals(args, scratch, directory)
             verify_search_windows(args, scratch)
+            verify_search_member_bounds(args, scratch)
             verify_partitioned_top_k(args, scratch)
             verify_catalog_recovery(args, scratch)
             verify_checkpoint_discovery(args, scratch)

@@ -19,6 +19,7 @@ use tantivy::store::Compressor;
 use tantivy::tokenizer::{PreTokenizedString, Token};
 use tantivy::{Directory, HasLen, Index, IndexSettings, TantivyDocument, Term};
 
+use crate::member_bounds::{MemberStart, document_member};
 use crate::rank_windows::{document_range, extend_impact, window_of};
 use crate::rectangle::merge_adjacent_valid_time;
 
@@ -137,10 +138,6 @@ pub fn build_search_file(columns: &[String], rows: &[SearchRow], identity: &str)
     write_search_file(columns, [Ok(rows.to_vec())], identity, None, RamDirectory::create(), &mut bundle)?;
     Ok(bundle)
 }
-
-/// A member's starting offsets in the shared page and document sequences.
-#[derive(Clone, Copy)]
-struct MemberStart { page: u32, doc: u32 }
 
 /// What the writer accumulates beside tantivy's segment, to become the sidecar.
 struct Accumulated { ceiling: i64, member_starts: Vec<MemberStart>, page_starts: Vec<u32>, row_docs: Vec<Vec<u32>>, column_docs: Vec<u32>, keys: Vec<u8>, doc_iids: Vec<[u8; 16]>, doc_classes: Vec<u8>, sections: BTreeMap<u8, Section>, rectangle_starts: Vec<u32>, rectangles: Vec<[i64; 4]> }
@@ -572,7 +569,7 @@ impl Sidecar {
         Ok(first..end)
     }
     fn doc_match(&self, doc: u32) -> DocMatch {
-        let member = self.member_starts.partition_point(|start| start.doc <= doc) - 1;
+        let member = document_member(&self.member_starts, doc);
         DocMatch { doc, iid: self.doc_iid(doc), member: member as u32 }
     }
     fn doc_iid(&self, doc: u32) -> [u8; 16] { self.data()[self.doc_iids + doc as usize * 16..][..16].try_into().unwrap_or_default() }

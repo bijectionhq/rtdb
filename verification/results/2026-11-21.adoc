@@ -1999,3 +1999,23 @@ The full JVM behavior result from the preceding section remains separate.
 The archived naming-epoch, admission-floor and durable-intent fixtures also completed at the prior integration boundary.
 Both naming controls, both floor controls and all four durable-intent controls failed at the declared assertions.
 The archived command records are in `/private/tmp/rtdb-formal.QMjPSJsX/catalog-replay-final-9o0olj0u/`.
+
+=== Document ownership in a shared search file
+
+A shared file's member directory stores cumulative document starts.
+An empty member can share the next member's starting ordinal.
+Lean 4.36.0 audited four theorems comparing a lookup in this directory with a linear walk over the member counts.
+Every document ordinal in the file has a member, and the directory chooses that same one.
+Two controls reject an exclusive lower bound and collapsing empty members before assigning member ordinals. link:../lean/SearchMemberBounds.lean[Offset proof]
+
+Verus checks the exact Rust search used by the sidecar for nondecreasing starts beginning at zero.
+It proves index bounds and selection of the last start at or before the queried ordinal.
+The first control fails the binary search's invariant after an inclusive comparison becomes exclusive.
+The joint control picks the first eligible member and weakens the function's contract to allow that answer.
+The law still requires the member that contains the offset and fails at its postcondition.
+The sidecar parser validates the zero start and adjacent ordering before the search is reachable.
+The model takes the writer's member counts and the posting's ordinal as inputs.
+Proof of the entire sidecar codec and the shared-file ranking frontier remains open.
+The command records are in `/private/tmp/rtdb-formal.QMjPSJsX/search-member-proof-evidence-xa4nofps/`. link:../verus/search_member/area.json[Production proof and controls]
+The scoped native suite passed 66 cases, including all 19 node search tests and both the shared-file member fixture and the selected-member ranking and corpus fixture.
+The exact native command and output are recorded in `/private/tmp/rtdb-formal.QMjPSJsX/search-member-ownership-native.log`.

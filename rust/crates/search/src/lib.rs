@@ -6,6 +6,7 @@ pub mod corpus;
 pub mod definitions;
 pub mod file;
 pub mod lane;
+mod member_bounds;
 mod rank_cutoff;
 mod rank_windows;
 mod rectangle;

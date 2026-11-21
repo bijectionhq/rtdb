@@ -1401,6 +1401,8 @@ Verus checks that the production cutoff requires strict dominance of both the sc
 Lean proves that complete term-window summaries preserve all conjunctive matches.
 It also proves that retaining every local score tie preserves the global result, including the page after an offset.
 Verus checks production posting assignment, scan range and impact accumulation.
+Lean proves that cumulative member offsets locate the reference owner of each in-range document.
+Verus checks the Rust binary search used by the shared-file reader, including equal starts for empty members.
 The native score witness passes and the unpadded mutation fails.
 |Prove that the planner, visibility verification, and index supply a complete frontier for every qualifying row, and that each supplied maximum covers its whole source.
 Relate the native postings iterator and persisted sidecar to the modeled complete term-window summaries.
