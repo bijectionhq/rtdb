@@ -20,7 +20,7 @@ use rtdb_server::{PlacedOptions, ServerDriver, config::NodeConfiguration};
 use rtdb_storage::{Error, IoRegion, ObjectKey, ObjectStore, object_store::StoredObject};
 use rtdb_types::{Anomaly, BlockIndex, Result, StorageEpoch};
 use serde::Serialize;
-use tokio::{io::AsyncWriteExt, net::TcpStream};
+use tokio::{io::AsyncWriteExt, net::TcpStream, time::Instant};
 use tokio_rustls::{rustls::ServerConfig, server::TlsStream};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
@@ -82,7 +82,10 @@ enum Transport {
         tls: Arc<ServerConfig>,
         ready_file: PathBuf,
     },
-    Tunnel(TlsStream<TcpStream>),
+    Tunnel {
+        stream: TlsStream<TcpStream>,
+        deadline: Instant,
+    },
 }
 
 /// Opens only the held stage on an isolated loopback TLS listener. The reader
@@ -131,6 +134,7 @@ pub(crate) async fn tunnel_staged_checkpoint(
     storage: &CellStorage,
     keys: &dyn KeyService,
     selector: StageSelector,
+    deadline: Instant,
     hosted_task: Option<HostedTask>,
     stop: CancellationToken,
     stream: TlsStream<TcpStream>,
@@ -142,7 +146,7 @@ pub(crate) async fn tunnel_staged_checkpoint(
         selector,
         hosted_task,
         stop,
-        Transport::Tunnel(stream),
+        Transport::Tunnel { stream, deadline },
     )
     .await
 }
@@ -185,6 +189,10 @@ async fn serve_stage(
         directory: Arc::clone(&directory),
         stage: stage.clone(),
         id: id.clone(),
+        deadline: match &transport {
+            Transport::Tunnel { deadline, .. } => Some(*deadline),
+            Transport::Loopback { .. } => None,
+        },
     };
     with_region(
         directory.as_ref(),
@@ -212,11 +220,15 @@ struct StageReadAuthority {
     directory: Arc<dyn Directory>,
     stage: CheckpointStage,
     id: String,
+    deadline: Option<Instant>,
 }
 
 impl StageReadAuthority {
     fn require_held(&self, record: &DeploymentRecord) -> Result<()> {
-        if record.id != self.id
+        if self
+            .deadline
+            .is_some_and(|deadline| Instant::now() >= deadline)
+            || record.id != self.id
             || record.lineage != self.id
             || record.name != self.stage.intent.name
             || record.org != self.stage.intent.org
@@ -516,7 +528,7 @@ async fn serve_reader(
     };
     let auth = match &transport {
         Transport::Loopback { password, .. } => format!("password: \"{password}\""),
-        Transport::Tunnel(_) => "password: null".into(),
+        Transport::Tunnel { .. } => "password: null".into(),
     };
     let mut options = NodeConfiguration::from_yaml(&format!(
         "server: null\nflightSql: null\nauthn: !SingleRootUser\n  {auth}\n",
@@ -559,9 +571,13 @@ async fn serve_reader(
             Transport::Loopback {
                 tls, ready_file, ..
             } => (tls, ready_file),
-            Transport::Tunnel(mut stream) => {
+            Transport::Tunnel {
+                mut stream,
+                deadline,
+            } => {
                 let stop = stop.child_token();
-                tokio::time::timeout(Duration::from_secs(15), async {
+                let acknowledge_by = deadline.min(Instant::now() + Duration::from_secs(15));
+                tokio::time::timeout_at(acknowledge_by, async {
                     stream.write_all(b"RTDB checkpoint PgWire 1\n").await?;
                     stream.flush().await
                 })
@@ -570,6 +586,7 @@ async fn serve_reader(
                 .map_err(|_| unavailable("The checkpoint reader caller disconnected"))?;
                 let mut wire = std::pin::pin!(rtdb_pgwire::serve_read_only_tls(
                     stream,
+                    deadline,
                     node,
                     auth,
                     BTreeMap::from([(rtdb_pgwire::CHECKPOINT_STAGE_PARAMETER.into(), parameter)]),

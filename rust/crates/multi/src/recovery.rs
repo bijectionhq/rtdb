@@ -27,12 +27,16 @@ use crate::{
     keys::KeyService,
 };
 
-const FRAME_BYTES: u64 = 2048;
+mod stage_grant;
+use stage_grant::StageGrant;
+
+const FRAME_BYTES: u64 = 4096;
 const SOCKET_DEADLINE: Duration = Duration::from_secs(15);
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Request {
+    #[serde(default)]
     token: String,
     name: String,
     authority: Uuid,
@@ -63,6 +67,14 @@ enum Action {
         source_manifest_sha256: String,
         destination: Uuid,
         stage_operation: Uuid,
+    },
+    GrantCheckpointStageRead {
+        grant: StageGrant,
+    },
+    OpenGrantedCheckpointStage {
+        grant: StageGrant,
+        signature: String,
+        worker: String,
     },
     OpenCheckpointStage {
         destination: Uuid,
@@ -121,6 +133,9 @@ enum Reply {
         stage_operation: Uuid,
         disposal: DisposalReceipt,
     },
+    StageReadGranted {
+        signature: String,
+    },
     Refused,
     Deferred,
 }
@@ -169,10 +184,18 @@ impl RecoveryService {
         directory: &dyn Directory,
         request: &Request,
     ) -> Result<Option<DeploymentRecord>> {
-        if !self.token.accepts(&request.token)
-            || request.capture.is_nil()
-            || request.authority.is_nil()
-        {
+        if !self.token.accepts(&request.token) {
+            return Ok(None);
+        }
+        self.source_installation(directory, request).await
+    }
+
+    async fn source_installation(
+        &self,
+        directory: &dyn Directory,
+        request: &Request,
+    ) -> Result<Option<DeploymentRecord>> {
+        if request.capture.is_nil() || request.authority.is_nil() {
             return Ok(None);
         }
         // Retain exact receipt access after the named route moves or closes.
@@ -194,6 +217,22 @@ impl RecoveryService {
         let Some(installation) = self.authorize(directory.as_ref(), &request).await? else {
             return Ok(Reply::Refused);
         };
+        if let Action::GrantCheckpointStageRead { grant } = &request.action {
+            if installation.checkpoint_stage.is_some() {
+                return Ok(Reply::Refused);
+            }
+            let Some(stage) = directory.deployment(&grant.destination.to_string()).await? else {
+                return Ok(Reply::Refused);
+            };
+            return Ok(match &self.control.0 {
+                Some(key) if grant.matches(&request, &stage, &self.org) => grant
+                    .issue(&request, key)
+                    .map_or(Reply::Refused, |signature| Reply::StageReadGranted {
+                        signature,
+                    }),
+                _ => Reply::Refused,
+            });
+        }
         let discard = matches!(request.action, Action::DiscardCheckpointStage { .. });
         match request.action {
             Action::CaptureCheckpoint => {
@@ -413,7 +452,9 @@ impl RecoveryService {
                     staged_manifest_sha256,
                 })
             }
-            Action::OpenCheckpointStage { .. } => Ok(Reply::Refused),
+            Action::GrantCheckpointStageRead { .. }
+            | Action::OpenCheckpointStage { .. }
+            | Action::OpenGrantedCheckpointStage { .. } => Ok(Reply::Refused),
         }
     }
 
@@ -441,47 +482,109 @@ impl RecoveryService {
         mut socket: TlsStream<TcpStream>,
         stop: CancellationToken,
     ) -> Result<()> {
-        let authorized = self.authorize(directory.as_ref(), &request).await?;
-        let Action::OpenCheckpointStage {
-            destination,
-            stage_operation,
-            staged_manifest_sha256,
-        } = request.action
-        else {
-            unreachable!("only stage-reader requests are routed here")
-        };
-        if authorized.is_none_or(|source| source.checkpoint_stage.is_some())
-            || destination.is_nil()
-            || stage_operation.is_nil()
-            || !valid_manifest(&staged_manifest_sha256)
-        {
+        let target = self.stage_reader(directory.as_ref(), &request).await?;
+        let Some((selector, deadline)) = target else {
             let _ =
                 tokio::time::timeout(SOCKET_DEADLINE, write_reply(&mut socket, &Reply::Refused))
                     .await;
             return Ok(());
-        }
-        let selector = archive::StageSelector {
-            destination,
-            operation: stage_operation,
-            manifest_sha256: staged_manifest_sha256,
-            source: Some((request.authority, request.capture, self.org.clone())),
         };
         let mut reader = std::pin::pin!(archive::tunnel_staged_checkpoint(
             directory,
             &self.storage,
             self.keys.as_ref(),
             selector,
+            deadline,
             self.hosted_task.clone(),
             stop.clone(),
             socket,
         ));
         tokio::select! {
-            result = &mut reader => result,
-            _ = tokio::time::sleep(Duration::from_secs(29 * 60)) => {
+            biased;
+            _ = tokio::time::sleep_until(deadline) => {
                 stop.cancel();
                 reader.await
             },
+            result = &mut reader => result,
         }
+    }
+
+    async fn stage_reader(
+        &self,
+        directory: &dyn Directory,
+        request: &Request,
+    ) -> Result<Option<(archive::StageSelector, tokio::time::Instant)>> {
+        let (destination, operation, manifest, deadline) = match &request.action {
+            Action::OpenCheckpointStage {
+                destination,
+                stage_operation,
+                staged_manifest_sha256,
+            } => {
+                if self
+                    .authorize(directory, request)
+                    .await?
+                    .is_none_or(|source| source.checkpoint_stage.is_some())
+                    || destination.is_nil()
+                    || stage_operation.is_nil()
+                    || !valid_manifest(staged_manifest_sha256)
+                {
+                    return Ok(None);
+                }
+                (
+                    *destination,
+                    *stage_operation,
+                    staged_manifest_sha256,
+                    tokio::time::Instant::now() + Duration::from_secs(29 * 60),
+                )
+            }
+            Action::OpenGrantedCheckpointStage {
+                grant,
+                signature,
+                worker,
+            } => {
+                if !request.token.is_empty() {
+                    return Ok(None);
+                }
+                let Some(deadline) = self
+                    .control
+                    .0
+                    .as_ref()
+                    .and_then(|key| grant.admit(request, key, signature, worker))
+                else {
+                    return Ok(None);
+                };
+                if self
+                    .source_installation(directory, request)
+                    .await?
+                    .is_none_or(|source| source.checkpoint_stage.is_some())
+                {
+                    return Ok(None);
+                }
+                let Some(stage) = directory.deployment(&grant.destination.to_string()).await?
+                else {
+                    return Ok(None);
+                };
+                if !grant.matches(request, &stage, &self.org)
+                    || deadline <= tokio::time::Instant::now()
+                {
+                    return Ok(None);
+                }
+                (
+                    grant.destination,
+                    grant.stage_operation,
+                    &grant.staged_manifest_sha256,
+                    deadline,
+                )
+            }
+            _ => unreachable!("only stage-reader requests are routed here"),
+        };
+        let selector = archive::StageSelector {
+            destination,
+            operation,
+            manifest_sha256: manifest.clone(),
+            source: Some((request.authority, request.capture, self.org.clone())),
+        };
+        Ok(Some((selector, deadline)))
     }
 }
 
@@ -547,7 +650,10 @@ pub async fn serve(
                     .await;
                     return;
                 };
-                if matches!(request.action, Action::OpenCheckpointStage { .. }) {
+                if matches!(
+                    request.action,
+                    Action::OpenCheckpointStage { .. } | Action::OpenGrantedCheckpointStage { .. }
+                ) {
                     let _ = service.open_stage(directory, request, socket, stop).await;
                     return;
                 }

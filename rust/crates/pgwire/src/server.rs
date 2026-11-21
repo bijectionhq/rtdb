@@ -10,6 +10,8 @@ use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 use crate::{ServerConfig, error::network};
 
+mod deadline;
+
 #[derive(Clone, Debug, Default)]
 pub struct ServerStatus { pub active_connections: usize, pub pending_connections: usize, pub accepted_connections: u64, pub refused_connections: u64, pub stopped: bool }
 
@@ -93,6 +95,7 @@ impl ServerDriver {
 /// authorizes entry into the stream. PgWire also applies its node authenticator.
 pub async fn serve_read_only_tls(
     stream: tokio_rustls::server::TlsStream<tokio::net::TcpStream>,
+    deadline: tokio::time::Instant,
     node: Node,
     auth: Arc<Authenticator>,
     parameters: BTreeMap<String, String>,
@@ -106,7 +109,7 @@ pub async fn serve_read_only_tls(
         observer: node.execution_observer(),
     });
     crate::connection::ConnectionDriver::new(
-        1, stream, address, true, node, auth, Arc::new(config),
+        1, deadline::Expiring::new(stream, deadline), address, true, node, auth, Arc::new(config),
         registry, cancellation, CancellationToken::new(),
     ).run().await
 }

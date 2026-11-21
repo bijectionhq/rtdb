@@ -215,6 +215,12 @@ the acknowledgement and serves one read-only PgWire session on that same
 connection. It closes the session on loss of the directory fence or when
 the recovery action's lifetime expires.
 
+A source cell's authenticated recovery operator may request `grant_checkpoint_stage_read` for that held stage, its exact cut, the restore target, and a digest of a random 32-byte worker secret.
+The issued signature is scoped to stage reads and expires at the requested absolute deadline within the recovery lifetime.
+`open_granted_checkpoint_stage` requires the same selection, the cell signature, and the worker secret.
+The receiving worker needs only that grant and the source TLS trust.
+The read fence checks the held stage, and the PostgreSQL transport stops accepting and sending bytes when the deadline passes.
+
 The hosted `discard_checkpoint_stage` action binds the original capture
 digest and stage operation. It reserves a disposal tombstone if a stage has
 yet to appear, so a late stage cannot reopen it. It returns the retained

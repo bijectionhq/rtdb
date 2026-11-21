@@ -43,7 +43,11 @@ impl CellSecret {
 
     /// A capability for `principal` on `deployment`, valid for `ttl`.
     pub fn mint(&self, deployment: &str, principal: &str, read_only: bool, ttl: Duration) -> String {
-        let claims = Claims { deployment: deployment.into(), principal: principal.into(), read_only, expires_at_ms: rtdb_directory::now_ms() + ttl.as_millis() as i64 };
+        self.mint_until(deployment, principal, read_only, rtdb_directory::now_ms() + ttl.as_millis() as i64)
+    }
+
+    pub(crate) fn mint_until(&self, deployment: &str, principal: &str, read_only: bool, expires_at_ms: i64) -> String {
+        let claims = Claims { deployment: deployment.into(), principal: principal.into(), read_only, expires_at_ms };
         let payload = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&claims).expect("claims serialize"));
         let tag = URL_SAFE_NO_PAD.encode(hmac::sign(&self.key, payload.as_bytes()));
         format!("{payload}.{tag}")

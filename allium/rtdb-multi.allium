@@ -1797,6 +1797,31 @@ rule ReadHeldCheckpoint {
         DrainReadersBeforeReleasingStageStorage(target)
 }
 
+rule GrantCrossCellHeldCheckpointRead {
+    when: AuthenticatedRecoveryReadGrantRequested(stage, cut, target, worker_digest, expires_at)
+
+    requires: ExactHeldStageForCut(stage, cut)
+              and FreshRestoreTarget(target)
+              and FutureBoundedDeadline(expires_at)
+
+    ensures:
+        SignCellGrantForHeldStageRead(stage, cut, target, worker_digest, expires_at)
+}
+
+rule OpenGrantedHeldCheckpointRead {
+    when: GrantedHeldStageReadRequested(grant, stage, cut, target, worker_secret)
+
+    requires: ExactHeldStageForCut(stage, cut)
+              and ValidCellGrantForHeldStageRead(grant, stage, cut, target)
+              and WorkerSecretMatchesGrant(worker_secret, grant)
+              and GrantHasNotExpired(grant)
+
+    ensures:
+        AdmitOnlyFrozenStageRead(stage, cut)
+        StopReadDeliveryByGrantDeadline(grant)
+        DrainReadersBeforeReleasingStageStorage(stage)
+}
+
 rule RetireCheckpointArchives {
     when: RecoveryRetirementAuthorized(record)
 
