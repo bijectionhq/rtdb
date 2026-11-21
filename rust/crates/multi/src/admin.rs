@@ -6,7 +6,6 @@ use std::time::Duration;
 
 use rtdb_directory::{Cas, CellTransfer, DeploymentRecord, Directory, DisposalReceipt, Lifecycle, MemberId, MemberRecord, MemberRole, MemberState, effective_holder, now_ms};
 use rtdb_logkeeper::StreamConfig;
-use rtdb_storage::log::LogOffset;
 use rtdb_types::{Anomaly, AnomalyCategory, Result};
 use tokio_util::sync::CancellationToken;
 
@@ -239,6 +238,7 @@ async fn fork_with_tail(directory: &dyn Directory, storage: &CellStorage, keys: 
         // Written before the fork is recorded, so no holder can open it until its stream holds the tail.
         let members = members(directory).await?;
         let servers: Vec<String> = child.ensemble.iter().filter_map(|id| members.get(id).map(|member| member.address.clone())).collect();
+        child.replica_journals.extend(servers.iter().cloned());
         let stream = StreamConfig { write_quorum: write_quorum(servers.len()), servers, stream: child.stream("replica"), maximum_message_bytes };
         let writer = crate::logs::SealedLog::new(rtdb_logkeeper::open_writer(stream.clone(), child.epoch, tokio_util::sync::CancellationToken::new()).await?, &keys.key(&child.id).await?, &stream.stream)?;
         use rtdb_storage::log::Log;
@@ -431,9 +431,12 @@ pub async fn delete_deployment(directory: &dyn Directory, storage: &CellStorage,
     if let Some(receipt) = fenced.disposal {
         return Ok(receipt);
     }
-    let stream = administration_stream(directory, &fenced, maximum_message_bytes).await?;
-    let last = rtdb_logkeeper::seal(&stream, fenced.epoch).await?;
-    if last.0 >= 0 { rtdb_logkeeper::trim(&stream, LogOffset(last.0)).await?; }
+    let mut stream = administration_stream(directory, &fenced, maximum_message_bytes).await?;
+    stream.servers.extend(fenced.replica_journals.iter().cloned());
+    stream.servers.sort();
+    stream.servers.dedup();
+    rtdb_logkeeper::retire(&stream, fenced.epoch).await?;
+    let journals_retired_at_ms = now_ms();
     keys.destroy(&fenced.id).await?;
     let key_withdrawn_at_ms = now_ms();
     let bucket = storage.bucket(rtdb_storage::IoRegion::new()).await?;
@@ -446,6 +449,8 @@ pub async fn delete_deployment(directory: &dyn Directory, storage: &CellStorage,
         deployment: fenced.id,
         incarnation: fenced.incarnation,
         epoch: fenced.epoch,
+        journals: stream.servers.into_iter().collect(),
+        journals_retired_at_ms,
         key_withdrawn_at_ms,
         serving_prefix_observed_empty_at_ms: now_ms(),
     };

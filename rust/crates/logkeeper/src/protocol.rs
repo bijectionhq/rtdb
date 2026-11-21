@@ -117,6 +117,15 @@ pub(crate) struct Trim {
     pub through_lsn: i64,
 }
 
+/// Fences a disposed installation and awaits removal of its journal payloads.
+#[derive(Clone, PartialEq, Message)]
+pub(crate) struct Retire {
+    #[prost(string, tag = "1")]
+    pub stream: String,
+    #[prost(uint64, tag = "2")]
+    pub epoch: u64,
+}
+
 /// Asks whether the stream is still unsealed beyond `epoch`, for a writer confirming its leadership: `Accepted` when the promise is at most `epoch`, `Refused` carrying the higher promise otherwise.
 /// It changes nothing, so it is answered without a journal round.
 #[derive(Clone, PartialEq, Message)]
@@ -145,13 +154,15 @@ pub(crate) enum RequestBody {
     Trim(Trim),
     #[prost(message, tag = "9")]
     Check(Check),
+    #[prost(message, tag = "10")]
+    Retire(Retire),
 }
 
 #[derive(Clone, PartialEq, Message)]
 pub(crate) struct Request {
     #[prost(uint64, tag = "1")]
     pub id: u64,
-    #[prost(oneof = "RequestBody", tags = "2, 3, 4, 5, 6, 7, 8, 9")]
+    #[prost(oneof = "RequestBody", tags = "2, 3, 4, 5, 6, 7, 8, 9, 10")]
     pub body: Option<RequestBody>,
 }
 

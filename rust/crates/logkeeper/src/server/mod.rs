@@ -110,6 +110,13 @@ async fn connection(socket: TcpStream, store: Arc<Store>, tasks: TaskTracker, ca
                 }
             }
             Some(RequestBody::Check(check)) => { let _ = replies.send(reply(store.check(&check.stream, check.epoch))); }
+            Some(RequestBody::Retire(retire)) => {
+                let (store, replies) = (Arc::clone(&store), replies.clone());
+                tasks.spawn(async move {
+                    let body = store.retire(retire).await;
+                    let _ = replies.send(Response { id, body: Some(body) });
+                });
+            }
             Some(RequestBody::Read(read)) => {
                 let (store, replies, cancellation) = (Arc::clone(&store), replies.clone(), cancellation.clone());
                 tasks.spawn(async move {

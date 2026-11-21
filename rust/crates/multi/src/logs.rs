@@ -34,6 +34,7 @@ pub type Writers = Arc<parking_lot::Mutex<std::collections::HashMap<String, std:
 /// Records a completed ensemble move, as the holder that made it at `epoch`, before anything is appended on the new ensemble.
 #[async_trait]
 pub trait EnsembleRecorder: Send + Sync {
+    async fn record_journals(&self, deployment: &str, epoch: u64, servers: &[String]) -> Result<()>;
     async fn record(&self, deployment: &str, epoch: u64, ensemble: Vec<rtdb_directory::MemberId>) -> Result<()>;
 }
 
@@ -47,6 +48,23 @@ pub struct DirectoryRecorder { pub directory: Arc<dyn rtdb_directory::Directory>
 
 #[async_trait]
 impl EnsembleRecorder for DirectoryRecorder {
+    async fn record_journals(&self, deployment: &str, epoch: u64, servers: &[String]) -> Result<()> {
+        use rtdb_directory::Lifecycle;
+        for _ in 0..8 {
+            let current = self.directory.deployment(deployment).await?.ok_or_else(|| {
+                Anomaly::incorrect("rtdb.multi/unknown-deployment", format!("No deployment {deployment}"))
+            })?;
+            if current.epoch != epoch || !matches!(current.lifecycle, Lifecycle::Live | Lifecycle::Quarantined) {
+                return Err(Anomaly::new(rtdb_types::AnomalyCategory::Conflict, "rtdb.multi/deposed", "The deployment ceased to accept this writer's journal inventory"));
+            }
+            if servers.iter().all(|server| current.replica_journals.contains(server)) { return Ok(()); }
+            let mut next = current.clone();
+            next.replica_journals.extend(servers.iter().cloned());
+            if let rtdb_directory::Cas::Applied(_) = self.directory.replace_deployment(next, current.version).await? { return Ok(()); }
+        }
+        Err(Anomaly::new(rtdb_types::AnomalyCategory::Conflict, "rtdb.multi/record-contended", "The deployment kept changing while its journal inventory was recorded"))
+    }
+
     async fn record(&self, deployment: &str, epoch: u64, ensemble: Vec<rtdb_directory::MemberId>) -> Result<()> {
         for _ in 0..8 {
             let current = self.directory.deployment(deployment).await?.ok_or_else(|| Anomaly::incorrect("rtdb.multi/unknown-deployment", format!("No deployment {deployment}")))?;
@@ -76,8 +94,12 @@ impl LogFactory for LogkeeperLogFactory {
         let stream = StreamConfig { servers: config.servers.clone(), stream: config.replica_stream.clone(), write_quorum: config.write_quorum, maximum_message_bytes: self.maximum_message_bytes };
         let quorum: Arc<dyn Log> = match access {
             LogAccess::ReadWrite => {
+                // An interrupted copy can leave records even if the new
+                // ensemble never becomes the reported serving ensemble.
+                self.recorder.record_journals(&config.deployment, config.epoch, &stream.servers).await?;
                 let writer = match &config.previous_servers {
                     Some(previous) => {
+                        self.recorder.record_journals(&config.deployment, config.epoch, previous).await?;
                         let moved = rtdb_logkeeper::open_writer_on(vec![rtdb_logkeeper::Loglet { servers: previous.clone(), start_lsn: 0 }], stream, config.epoch, rtdb_logkeeper::CopyFrom::Retained, cancellation.clone()).await?;
                         // Recorded before the writer appends: until then the old ensemble, sealed and complete, still holds everything.
                         self.recorder.record(&config.deployment, config.epoch, config.ensemble.iter().map(|id| rtdb_directory::MemberId(id.clone())).collect()).await?;

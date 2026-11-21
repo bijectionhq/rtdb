@@ -18,6 +18,7 @@ pub enum Event {
     Append(Entry),
     Commit(i64),
     Trim(i64),
+    Retired,
 }
 
 /// How a held entry's payload is kept.
@@ -55,6 +56,7 @@ pub struct StreamState<P = Bytes> {
     /// Entries at or below this lsn are dropped.
     pub trim: i64,
     pub commit: i64,
+    pub retired: bool,
     /// Entry `i` has lsn `trim + 1 + i`.
     pub entries: VecDeque<Held<P>>,
 }
@@ -73,7 +75,7 @@ fn dense(first: i64, entries: &[Entry]) -> bool {
 }
 
 impl<P> Default for StreamState<P> {
-    fn default() -> Self { Self { promised: 0, synced: None, trim: -1, commit: -1, entries: VecDeque::new() } }
+    fn default() -> Self { Self { promised: 0, synced: None, trim: -1, commit: -1, retired: false, entries: VecDeque::new() } }
 }
 
 impl<P: Payload> StreamState<P> {
@@ -100,6 +102,7 @@ impl<P: Payload> StreamState<P> {
                 self.entries.push_back(Held { epoch: entry.epoch, timestamp: entry.timestamp, payload: P::decided(&entry.payload) });
             }
             Event::Commit(lsn) => self.commit = self.commit.max((*lsn).min(self.last())),
+            Event::Retired => self.retired = true,
             Event::Trim(through) => {
                 if *through <= self.trim { return; }
                 if *through >= self.last() {
@@ -125,7 +128,7 @@ impl<P: Payload> StreamState<P> {
 
     /// Refuses a writer that is not the one this server is synced to.
     fn check_writer(&self, epoch: u64) -> Option<ResponseBody> {
-        (self.promised != epoch || self.synced != Some(epoch)).then(|| self.refused())
+        (self.retired || self.promised != epoch || self.synced != Some(epoch)).then(|| self.refused())
     }
 
     fn commit_event(&self, commit: i64, last: i64) -> Option<Event> {
@@ -146,7 +149,7 @@ impl<P: Payload> StreamState<P> {
 
     pub fn overwrite(&mut self, epoch: u64, from: i64, entries: Vec<Entry>, complete: bool, commit: i64) -> Decision {
         if epoch == 0 { return invalid("epochs start at 1"); }
-        if self.promised > epoch { return Decision { events: Vec::new(), reply: self.refused() }; }
+        if self.retired || self.promised > epoch { return Decision { events: Vec::new(), reply: self.refused() }; }
         if from <= self.trim || from > self.last() + 1 || from <= self.commit {
             return invalid(format!("an overwrite at {from} must start above trim {} and commit {} and at most one past last {}", self.trim, self.commit, self.last()));
         }
@@ -177,17 +180,34 @@ impl<P: Payload> StreamState<P> {
 
     pub fn seal(&mut self, epoch: u64) -> Decision {
         if epoch == 0 { return invalid("epochs start at 1"); }
+        if self.retired { return Decision { events: Vec::new(), reply: self.refused() }; }
         let events = (epoch > self.promised).then_some(Event::Promise(epoch)).into_iter().collect();
         self.persist(events, Self::sealed)
     }
 
     pub fn trim(&mut self, through: i64) -> Decision {
+        if self.retired { return Decision { events: Vec::new(), reply: self.refused() }; }
         let events = (through > self.trim).then_some(Event::Trim(through)).into_iter().collect();
         self.persist(events, Self::accepted)
     }
 
+    pub fn retire(&mut self, epoch: u64) -> Decision {
+        if epoch == 0 { return invalid("epochs start at 1"); }
+        if self.retired {
+            return Decision { events: Vec::new(), reply: if epoch == self.promised { self.accepted() } else { self.refused() } };
+        }
+        if epoch < self.promised { return Decision { events: Vec::new(), reply: self.refused() }; }
+        let mut events = Vec::new();
+        if epoch > self.promised { events.push(Event::Promise(epoch)); }
+        if self.synced.is_some() { events.push(Event::Synced(None)); }
+        let last = self.last();
+        if last > self.trim { events.push(Event::Trim(last)); }
+        events.push(Event::Retired);
+        self.persist(events, Self::accepted)
+    }
+
     pub fn check(&self, epoch: u64) -> ResponseBody {
-        if self.promised > epoch { self.refused() } else { self.accepted() }
+        if self.retired || self.promised > epoch { self.refused() } else { self.accepted() }
     }
 
     pub fn sealed(&self) -> ResponseBody {

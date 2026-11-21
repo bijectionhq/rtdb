@@ -38,6 +38,8 @@ struct Snapshot {
     trim: i64,
     #[prost(sint64, tag = "4")]
     commit: i64,
+    #[prost(bool, tag = "5")]
+    retired: bool,
 }
 
 #[derive(Clone, PartialEq, prost::Oneof)]
@@ -62,13 +64,15 @@ enum Kind {
     /// The first record of a base segment: every earlier segment is superseded.
     #[prost(bool, tag = "10")]
     Base(bool),
+    #[prost(bool, tag = "11")]
+    Retired(bool),
 }
 
 #[derive(Clone, PartialEq, Message)]
 struct Record {
     #[prost(uint64, tag = "9")]
     stream: u64,
-    #[prost(oneof = "Kind", tags = "1, 2, 3, 4, 5, 6, 7, 8, 10")]
+    #[prost(oneof = "Kind", tags = "1, 2, 3, 4, 5, 6, 7, 8, 10, 11")]
     kind: Option<Kind>,
 }
 
@@ -80,6 +84,7 @@ fn record(event: &Event) -> Kind {
         Event::Append(entry) => Kind::Append(entry.clone()),
         Event::Commit(lsn) => Kind::Commit(*lsn),
         Event::Trim(through) => Kind::Trim(*through),
+        Event::Retired => Kind::Retired(true),
     }
 }
 
@@ -134,6 +139,8 @@ pub(crate) struct Journal {
     bytes: AtomicU64,
     next_id: AtomicU64,
     compaction_queued: AtomicBool,
+    compaction_finished: tokio::sync::Notify,
+    compacted: Mutex<HashMap<u64, (u64, i64)>>,
     /// A handle on every segment from the last base on, for reads.
     files: Mutex<BTreeMap<u64, Arc<File>>>,
     cache: Mutex<Cache>,
@@ -223,7 +230,10 @@ impl Journal {
             if base { break; }
         }
         chain.reverse();
-        if let Some((first, _)) = chain.first() { remove_before(&segments, *first)?; }
+        if let Some((first, _)) = chain.first() {
+            remove_before(&segments, *first)?;
+            sync_directory(&segments, fsync)?;
+        }
         let mut replay = Replay::default();
         let mut total = 0u64;
         let mut files = BTreeMap::new();
@@ -254,6 +264,8 @@ impl Journal {
             bytes: AtomicU64::new(total),
             next_id: AtomicU64::new(next_id),
             compaction_queued: AtomicBool::new(false),
+            compaction_finished: tokio::sync::Notify::new(),
+            compacted: Mutex::new(replay.compacted),
             files: Mutex::new(files),
             cache: Mutex::new(Cache::new(cache_bytes)),
         };
@@ -267,7 +279,20 @@ impl Journal {
     /// Claims the one compaction that may be queued at a time; the journal releases it once the compaction's round is written.
     pub fn claim_compaction(&self) -> bool { !self.compaction_queued.swap(true, Ordering::AcqRel) }
 
-    pub fn release_compaction(&self) { self.compaction_queued.store(false, Ordering::Release); }
+    pub fn release_compaction(&self) {
+        self.compaction_queued.store(false, Ordering::Release);
+        self.compaction_finished.notify_waiters();
+    }
+
+    pub fn compaction_finished(&self) -> impl std::future::Future<Output = ()> + '_ {
+        self.compaction_finished.notified()
+    }
+
+    pub fn is_durable(&self) -> bool { self.fsync }
+
+    pub fn compacted(&self, stream: u64, epoch: u64, through: i64) -> bool {
+        self.compacted.lock().get(&stream).is_some_and(|stamp| stamp.0 >= epoch && stamp.1 >= through)
+    }
 
     /// Writes one round: every work in order, then one sync of the segment.
     /// Commit records are synced like any other: a sealed loglet's commit lsn is written once, by the move that ends it, and no later writer re-establishes it.
@@ -351,7 +376,7 @@ impl Journal {
         for stream in captured {
             let (id, state) = (stream.slot.id, &stream.state);
             frame(id, Kind::Declare(stream.slot.name.clone()), &mut buffer);
-            frame(id, Kind::Snapshot(Snapshot { promised: state.promised, synced: state.synced.unwrap_or(0), trim: state.trim, commit: state.commit }), &mut buffer);
+            frame(id, Kind::Snapshot(Snapshot { promised: state.promised, synced: state.synced.unwrap_or(0), trim: state.trim, commit: state.commit, retired: state.retired }), &mut buffer);
             let mut locations = Vec::with_capacity(state.entries.len());
             for (held, lsn) in state.entries.iter().zip(state.trim + 1..) {
                 let payload = match &held.payload {
@@ -383,7 +408,11 @@ impl Journal {
         for (stream, locations) in captured.iter().zip(copies) { self.moved(stream, &locations); }
         remove_before(&self.segments, sequence)?;
         self.files.lock().retain(|segment, _| *segment >= sequence);
-        sync_directory(&self.segments, self.fsync)
+        sync_directory(&self.segments, self.fsync)?;
+        *self.compacted.lock() = captured.iter().map(|stream| {
+            (stream.slot.id, (stream.state.promised, stream.state.trim))
+        }).collect();
+        Ok(())
     }
 
     /// Points a captured stream's entries at their copies in the base segment.
@@ -458,6 +487,7 @@ impl Journal {
 struct Replay {
     names: HashMap<u64, String>,
     states: HashMap<u64, StreamState<Stored>>,
+    compacted: HashMap<u64, (u64, i64)>,
 }
 
 impl Replay {
@@ -481,7 +511,8 @@ impl Replay {
             match kind {
                 Kind::Declare(_) | Kind::Base(_) => unreachable!("handled above"),
                 Kind::Snapshot(snapshot) => {
-                    *state = StreamState { promised: snapshot.promised, synced: (snapshot.synced != 0).then_some(snapshot.synced), trim: snapshot.trim, commit: snapshot.commit, entries: Default::default() };
+                    self.compacted.insert(stream, (snapshot.promised, snapshot.trim));
+                    *state = StreamState { promised: snapshot.promised, synced: (snapshot.synced != 0).then_some(snapshot.synced), trim: snapshot.trim, commit: snapshot.commit, retired: snapshot.retired, entries: Default::default() };
                 }
                 Kind::Promise(epoch) => state.apply(&Event::Promise(epoch)),
                 Kind::Synced(epoch) => state.apply(&Event::Synced((epoch != 0).then_some(epoch))),
@@ -495,6 +526,7 @@ impl Replay {
                 }
                 Kind::Commit(lsn) => state.apply(&Event::Commit(lsn)),
                 Kind::Trim(through) => state.apply(&Event::Trim(through)),
+                Kind::Retired(_) => state.apply(&Event::Retired),
             }
         }
         Ok((position, length))

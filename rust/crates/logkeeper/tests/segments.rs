@@ -1,7 +1,7 @@
 mod common;
 
 use common::{Server, append};
-use rtdb_logkeeper::{ServerOptions, StreamConfig, open_reader, open_writer, seal, trim};
+use rtdb_logkeeper::{ServerOptions, StreamConfig, open_reader, open_writer, retire, seal, trim};
 use rtdb_storage::Error;
 use rtdb_storage::log::{Log, LogOffset};
 use rtdb_types::AnomalyCategory;
@@ -23,6 +23,38 @@ async fn payloads(log: &dyn Log, from: i64) -> Vec<String> {
 }
 
 async fn start(data_dir: &Path, cache_bytes: usize) -> Server { Server::start_with(data_dir, "127.0.0.1:0".parse().unwrap(), cache_bytes).await }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn retirement_rewrites_every_journal_and_permanently_closes_the_stream() {
+    let mut ensemble = common::Ensemble::start(3).await;
+    let disposed = ensemble.config("disposal-target");
+    let retained = ensemble.config("unrelated");
+    let writer = open_writer(disposed.clone(), 1, CancellationToken::new()).await.unwrap();
+    let other = open_writer(retained.clone(), 1, CancellationToken::new()).await.unwrap();
+    const PAYLOAD: &str = "remove this exact payload from the journals";
+    append(writer.as_ref(), PAYLOAD, 0).await;
+    append(other.as_ref(), "retain another stream", 0).await;
+    drop((writer, other));
+
+    ensemble.stop(2).await;
+    assert!(retire(&disposed, 2).await.is_err(), "a quorum cannot certify every journal");
+    ensemble.restart(2).await;
+    retire(&disposed, 2).await.unwrap();
+    for index in 0..3 {
+        let segments = std::fs::read_dir(ensemble.directories[index].path().join("segments")).unwrap();
+        for segment in segments {
+            let bytes = std::fs::read(segment.unwrap().path()).unwrap();
+            assert!(!bytes.windows(PAYLOAD.len()).any(|window| window == PAYLOAD.as_bytes()));
+        }
+        ensemble.stop(index).await;
+        ensemble.restart(index).await;
+    }
+    retire(&disposed, 2).await.unwrap();
+    assert!(open_writer(disposed, 3, CancellationToken::new()).await.is_err());
+    let other = open_reader(retained, CancellationToken::new()).await.unwrap();
+    assert_eq!(payloads(other.as_ref(), 0).await, ["retain another stream"]);
+    for index in 0..3 { ensemble.stop(index).await; }
+}
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn streams_share_segments_that_a_trim_compacts_and_a_restart_replays() {
