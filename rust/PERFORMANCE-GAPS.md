@@ -155,7 +155,25 @@ At 100,000 rows the only ratio below 1 in this set was Flight full-scan p95, wit
 At 1,000,000 rows default jemalloc lowered memory and narrowed the update gap.
 Flight ingest remained well behind XTDB, and pgwire ingest was slower than with glibc in this sample.
 The system was shared with other Docker and host work during portions of these measurements.
-The next comparison uses a dedicated Colima profile and retains the same limits inside each container.
+The Mac mini 2 comparison runs only one benchmark container at a time under the same limits.
+
+### Mac mini 2
+
+The first matched 1,000,000-row pair used RTDB `ff72d7394`, XTDB `c84f9334e` and glibc defaults.
+Both engines completed their pgwire and Flight row-count checks.
+Other work on the host can affect timing, so the first pair is provisional.
+
+| Metric | RTDB | XTDB |
+| --- | ---: | ---: |
+| pgwire ingest | 43.0k rows/s | 47.5k rows/s |
+| Flight prepared INSERT | 90.3k rows/s | 88.9k rows/s |
+| pgwire concurrent INSERT | 1,305 tx/s | 1,138 tx/s |
+| pgwire UPDATE of 10% of orders | 1,527 ms | 868 ms |
+| Peak working set during pgwire | 1,454 MiB | 771 MiB |
+
+The first pair places Flight ingest and concurrent pgwire writes at or above the reference.
+The largest remaining pgwire gaps in this pair are working set and set-based UPDATE.
+The reversed pair, both 100,000-row pairs, and the allocator comparison are in progress.
 
 ## Verification
 
