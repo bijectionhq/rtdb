@@ -1737,3 +1737,15 @@ Dropping the log bound fails the decision's contract, and fails both laws when t
 A resolution test refuses a time one microsecond ahead of the log and the maximum timestamp, then commits at the log time and follows the log with the next automatic time.
 The affected tx, node, conformance, Multi, server, pgwire and Flight SQL suites passed after two fixtures that relied on future times were rewritten: the catalog-time test now reaches a head above the log clock by stepping that clock back, and the synthetic simulation tape's external commit times no longer lead its node clock.
 
+== Engine-owned retry receipts
+
+The resolver now decides retries from engine-owned receipts in `xt.idempotency_receipts`, which SQL cannot write.
+A receipt is keyed by the authenticated principal and the idempotency key and records a SHA-256 digest of the operations, timezone, explicit system time and the rest of the metadata.
+It is valid for one hour of system time from its transaction, so every replica decides identically from the logged record.
+A retry with the same body aborts with `rtdb/idempotency-duplicate`, which the node answers with the original's committed outcome; a different body aborts with `rtdb/idempotency-conflict`.
+The public `rtdb_idempotency_keys` table, its sentinel row and the SQL assertion guard are removed.
+A resolver test covers the duplicate, the conflict, another principal's independent identity and expiry at the end of the window.
+The node, Multi and gateway resend tests now resend the same bodies and check that a changed body is refused.
+The affected suites passed 817 of 818 tests; `copy_to_arrow_stream_uses_the_original_read_transaction` times out on the base commit `c165a2a9d` without this change.
+Expired receipts remain in bitemporal history until the metadata-retention increment removes them physically.
+

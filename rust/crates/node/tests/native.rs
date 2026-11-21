@@ -2243,15 +2243,15 @@ async fn concurrent_transactions_with_one_idempotency_key_commit_once_and_both_r
     let mut second = node.session("xtdb", Arc::new(Authority)).unwrap();
     let (a, b) = tokio::join!(
         first.state_mut().execute_tx(vec![put(&node, 1, 10)], metadata()),
-        second.state_mut().execute_tx(vec![put(&node, 2, 20)], metadata()),
+        second.state_mut().execute_tx(vec![put(&node, 1, 10)], metadata()),
     );
     let (a, b) = (a.unwrap(), b.unwrap());
     assert!(a.committed() && b.committed(), "both callers are told the keyed transaction committed");
     assert_eq!(a.tx_key(), b.tx_key(), "and both are told it is the same transaction");
     assert_eq!(rows(first.query_sql("SELECT COUNT(*) FROM docs", vec![]).await.unwrap()).await, [vec![Value::I64(1)]], "only one of them ran");
-    let mut reserved = AutonomousTxOptions::default();
-    reserved.user_metadata = Some(rtdb_tx::UserMetadata::new(Value::Struct(StructFields::from([("idempotency_key".into(), Value::Utf8("~table".into()))])), node.memory()).unwrap());
-    assert!(first.state_mut().execute_tx(vec![put(&node, 3, 30)], reserved).await.is_err(), "the key the keys table is created with is not a caller's to use");
+    let different = first.state_mut().execute_tx(vec![put(&node, 2, 20)], metadata()).await.unwrap();
+    assert_eq!(different.error().map(|error| error.code.as_str()), Some("rtdb/idempotency-conflict"), "the key cannot name a different transaction");
+    assert_eq!(rows(first.query_sql("SELECT COUNT(*) FROM docs", vec![]).await.unwrap()).await, [vec![Value::I64(1)]]);
     drop((first, second));
     stop(&node, driver).await;
 }
@@ -2283,8 +2283,8 @@ async fn duplicate_transaction_outcomes_are_deployment_local_and_repeatable() {
     let blog_original = blog.state_mut().execute_tx(vec![put(&node, 1, 20)], metadata("article-1")).await.unwrap();
     assert!(shop_original.committed() && blog_original.committed());
 
-    let shop_retry = shop.state_mut().submit_tx(vec![put(&node, 2, 11)], metadata("order-1")).await.unwrap();
-    let blog_retry = blog.state_mut().submit_tx(vec![put(&node, 2, 21)], metadata("article-1")).await.unwrap();
+    let shop_retry = shop.state_mut().submit_tx(vec![put(&node, 1, 10)], metadata("order-1")).await.unwrap();
+    let blog_retry = blog.state_mut().submit_tx(vec![put(&node, 1, 20)], metadata("article-1")).await.unwrap();
     assert_eq!(shop_retry.tx_id, blog_retry.tx_id);
     let cancellation = CancellationToken::new();
     for (name, retry, original) in [
@@ -2350,8 +2350,13 @@ async fn a_command_resent_under_its_session_key_on_a_new_session_writes_nothing_
         }
     };
     command("first", [1, 2]).await;
-    command("first", [3, 4]).await;
+    command("first", [1, 2]).await;
     command("second", [5, 6]).await;
+    let mut altered = node.session("xtdb", Arc::new(Authority)).unwrap();
+    altered.state_mut().set_parameter(rtdb_node::IDEMPOTENCY_KEY_PARAMETER, Some("first".into())).unwrap();
+    let refused = altered.state_mut().execute_tx(vec![put(&node, 3, 3)], AutonomousTxOptions::default()).await.unwrap();
+    assert_eq!(refused.error().map(|error| error.code.as_str()), Some("rtdb/idempotency-conflict"), "a resend that changes a transaction is refused");
+    drop(altered);
     let mut session = node.session("xtdb", Arc::new(Authority)).unwrap();
     assert_eq!(rows(session.query_sql("SELECT _id FROM docs ORDER BY _id", vec![]).await.unwrap()).await, [[Value::I64(1)], [Value::I64(2)], [Value::I64(5)], [Value::I64(6)]].map(Vec::from),
         "the resent command's transactions take the keys the first run's did, in order, and run no more");

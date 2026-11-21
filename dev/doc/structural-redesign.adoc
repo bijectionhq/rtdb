@@ -66,11 +66,11 @@ One composed TLA+ model of the residence is checked against traces emitted at ev
 
 |1
 |System-time bound and external clamp.
-|Implemented
+|Landed
 
 |2
 |Engine-owned retry receipts with body digest and principal scope.
-|Planned
+|Landed; physical expiry follows increment 8
 
 |3
 |Epoch- and digest-qualified physical names; delete the reset fence.

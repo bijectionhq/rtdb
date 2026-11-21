@@ -169,6 +169,10 @@ impl TxResolver {
         };
         let mut tx = OpenTransaction::new(base.clone(), key, &request.options, context)?;
         tx.trace_parent = span.as_ref().map(|span| span.context());
+        // A retry identity is scoped to the submitting principal; its receipt records what the original asked for.
+        let receipt = request.idempotency_key()
+            .map(|retry_key| Ok::<_, Anomaly>((format!("{}\u{1f}{retry_key}", request.options.user.as_deref().unwrap_or("")), request.body_digest()?)))
+            .transpose()?;
         let outcome = if let Some((requested, previous)) = invalid_time {
             Err(Anomaly::incorrect("invalid-system-time", "specified system-time must be later than current tx")
                 .with_context("tx-key", tx_key_context(TransactionKey { tx_id: TxId(position.0), system_time: requested })?)
@@ -182,8 +186,8 @@ impl TxResolver {
                 .with_context("tx-key", tx_key_context(TransactionKey { tx_id: TxId(position.0), system_time: requested })?)
                 .with_context("log-time", transit::to_json_value(&T::instant(log_time.into())?)?))
         } else {
-            let mut outcome = Ok(());
-            for (index, operation) in request.operations.iter().enumerate() {
+            let mut outcome = match &receipt { Some((id, digest)) => tx.receipt_outcome(id, digest).await?, None => Ok(()) };
+            for (index, operation) in request.operations.iter().enumerate().take_while(|_| outcome.is_ok()) {
                 context.check_cancelled()?;
                 if let Err(error) = validate_document_operation(operation) {
                     outcome = Err(error);
@@ -198,6 +202,7 @@ impl TxResolver {
                     break;
                 }
             }
+            if let (Ok(()), Some((id, digest))) = (&outcome, &receipt) { tx.put_receipt(id, digest)?; }
             outcome
         };
         let result = match outcome {
@@ -346,6 +351,39 @@ impl<'a> OpenTransaction<'a> {
             }
         };
         self.execute_mutation(mutation, context, arguments, Some(syntax)).await.map_err(with_sql)
+    }
+
+    /// Whether a live receipt names this retry identity: the same body is a duplicate of the original, a different one a conflict.
+    async fn receipt_outcome(&self, id: &str, digest: &str) -> Result<Result<()>> {
+        if !self.snapshot()?.contains_table(&receipts_table()) { return Ok(Ok(())); }
+        let mut query = self.open_query("SELECT digest, tx_id, tx_system_time FROM xt.idempotency_receipts WHERE _id = ?", vec![Value::Utf8(id.into())]).await?;
+        while let Some(batch) = query.next_batch().await? {
+            let batch = batch.batch();
+            if batch.num_rows() == 0 { continue; }
+            let cell = |index: usize| rtdb_columnar::read_value(batch.schema().field(index), batch.column(index).as_ref(), 0);
+            let (Value::Utf8(stored), Value::I64(tx_id), Value::Timestamp { value: system_time, .. }) = (cell(0)?, cell(1)?, cell(2)?) else {
+                return Err(Anomaly::fault("rtdb.tx/idempotency-receipt", "A retry receipt has no digest or original transaction"));
+            };
+            let original = tx_key_context(TransactionKey { tx_id: TxId(tx_id), system_time: Timestamp(system_time) })?;
+            let error = if stored == digest {
+                Anomaly::incorrect("rtdb/idempotency-duplicate", "A transaction with this idempotency key already committed")
+            } else {
+                Anomaly::new(rtdb_types::AnomalyCategory::Conflict, "rtdb/idempotency-conflict", "This idempotency key already committed a different transaction")
+            };
+            return Ok(Err(error.with_context("original", original)
+                .with_context("original-tx-id", tx_id.into()).with_context("original-system-time-micros", system_time.into())));
+        }
+        Ok(Ok(()))
+    }
+
+    fn put_receipt(&mut self, id: &str, digest: &str) -> Result<()> {
+        let key = self.tx_key();
+        let document = StructFields::from([
+            ("_id".into(), Value::Utf8(id.into())), ("digest".into(), Value::Utf8(digest.into())),
+            ("tx_id".into(), Value::I64(key.tx_id.0)), ("tx_system_time".into(), time_value(key.system_time)),
+        ]);
+        let expires = Timestamp(key.system_time.0.saturating_add(RECEIPT_WINDOW_MICROS));
+        self.buffer.put(receipts_table(), document, interval(key.system_time, expires)?)
     }
 
     async fn ordered_index_exists(&self, name: &str) -> Result<bool> {
@@ -579,6 +617,10 @@ impl<'a> OpenTransaction<'a> {
         self.buffer.declare_document_types(&table, [(&error_column, &LogicalType::Scalar(ScalarType::Transit).maybe()), (&metadata_column, &LogicalType::Struct(StructFields::new()).maybe())])
     }
 }
+
+/// How long, in system time, a committed transaction's receipt answers retries of its identity.
+pub const RECEIPT_WINDOW_MICROS: i64 = 3_600_000_000;
+fn receipts_table() -> TableRef { TableRef::new("xt", "idempotency_receipts") }
 
 fn db_op_bytes(operation: Option<&DbOp>) -> Result<usize> {
     let encoded = match operation { Some(DbOp::AttachDatabase(value)) => value.encoded_len(), Some(DbOp::DetachDatabase(value)) => value.encoded_len(), None => 0 };

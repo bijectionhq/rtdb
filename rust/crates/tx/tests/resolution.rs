@@ -400,3 +400,34 @@ async fn a_client_system_time_ahead_of_the_log_is_refused_and_cannot_strand_the_
     let next = resolver.resolve_source(state.value().snapshot(), SourcePosition(3), Timestamp(300), request(vec![], &context), &context).await.unwrap();
     assert_eq!(next.result().tx_key().system_time, Timestamp(300), "automatic time follows the log once no client time leads it");
 }
+
+#[tokio::test]
+async fn a_retry_identity_answers_its_own_body_and_refuses_another_within_its_window() {
+    let state = PartitionState::empty(Default::default()).unwrap();
+    let context = context();
+    let mut resolver = TxResolver::new(None, SourcePosition(-1), None, &context.memory).unwrap();
+    let keyed = |user: &str, id: i64| {
+        let metadata = UserMetadata::new(Value::Struct(StructFields::from([("idempotency_key".into(), Value::Utf8("order-1".into()))])), &context.memory).unwrap();
+        SourceTransaction::new(vec![put(&context, id, 0, i64::MAX)], SubmitOptions { user: Some(user.into()), user_metadata: Some(metadata), ..Default::default() }, &context.memory).unwrap()
+    };
+    let mut position = 0;
+    let mut resolve = async |request: SourceTransaction, log_time: i64| {
+        let resolved = resolver.resolve_source(state.value().snapshot(), SourcePosition(position), Timestamp(log_time), request, &context).await.unwrap();
+        position += 1;
+        state.apply(resolver.take_head().unwrap().writes()).unwrap();
+        resolved
+    };
+
+    let original = resolve(keyed("alice", 1), 100).await;
+    assert!(original.result().committed());
+    let duplicate = resolve(keyed("alice", 1), 200).await;
+    let error = duplicate.result().error().unwrap();
+    assert_eq!(error.code, "rtdb/idempotency-duplicate");
+    assert_eq!(error.context["original-tx-id"], original.result().tx_key().tx_id.0);
+    assert_eq!(duplicate.writes().tables().keys().collect::<Vec<_>>(), [&TableRef::new("xt", "txs")], "a duplicate writes nothing but its own outcome");
+    let conflict = resolve(keyed("alice", 2), 300).await;
+    assert_eq!(conflict.result().error().unwrap().code, "rtdb/idempotency-conflict");
+    assert!(resolve(keyed("bob", 2), 400).await.result().committed(), "another principal's identity is independent");
+    let after = resolve(keyed("alice", 3), 100 + RECEIPT_WINDOW_MICROS).await;
+    assert!(after.result().committed(), "the identity is free again once the window has passed");
+}

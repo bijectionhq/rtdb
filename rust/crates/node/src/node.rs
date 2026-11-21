@@ -380,30 +380,10 @@ impl Node {
 
     async fn submit(&self, database: &str, mut operations: Vec<TxOp>, mut options: SubmitOptions, identity: &dyn SessionIdentity, placement: Option<&Weak<Database>>, cancellation: &CancellationToken) -> Result<SubmittedTx> {
         self.admit(database, DatabaseAccess::Write, identity, cancellation).await?;
-        let key = options.user_metadata.as_ref().and_then(|metadata| idempotency_key(metadata.value()));
         let database = self.attached_database(database, placement)?;
         let admission = if self.catalog.is_placed() {
             Some(cancellation.run_until_cancelled(database.admit_transaction()).await.ok_or_else(cancelled)??)
         } else { None };
-        if let Some(key) = key {
-            if key == IDEMPOTENCY_SENTINEL { return Err(Anomaly::incorrect("rtdb.node/reserved-idempotency-key", format!("'{IDEMPOTENCY_SENTINEL}' is reserved and cannot be an idempotency key"))); }
-            // A transaction carrying a key that already committed within the window aborts on its assertion, and awaiting it answers with the original's outcome.
-            let table = rtdb_types::TableRef::new("public", IDEMPOTENCY_TABLE);
-            let put = |id: &str, valid_to: Option<rtdb_types::Timestamp>| -> Result<TxOp> {
-                let documents = rtdb_tx::Documents::new(vec![rtdb_types::StructFields::from([("_id".to_owned(), Value::Utf8(id.to_owned()))])], &self.factory.memory)?;
-                Ok(TxOp::PutDocs { table: table.clone(), documents, valid_from: None, valid_to })
-            };
-            let assertion = TxOp::Sql { sql: idempotency_guard(key), args: None };
-            let value = database.partition.value();
-            if value.table_catalog().metadata(&table).is_some() || value.live().tables().contains_key(&table) {
-                operations.insert(0, assertion);
-            } else {
-                // Until the keys table exists, a sentinel row creates it within the transaction, so the assertion can read it.
-                operations.splice(0..0, [put(IDEMPOTENCY_SENTINEL, None)?, assertion]);
-            }
-            // A key expires after the window, so the table's current rows stay as few as the keys still in use.
-            operations.push(put(key, Some(rtdb_types::Timestamp(self.now().0 + IDEMPOTENCY_WINDOW.as_micros() as i64)))?);
-        }
         database.require_writable()?;
         if database.external_source() { return Err(Anomaly::incorrect("xtdb/submit-tx-to-external-source-db", "Cannot submit transactions to an external-source database").with_context("db-name", database.name().into())); }
         options.user = identity.user().map(str::to_owned);
@@ -421,37 +401,6 @@ impl Node {
         Ok(SubmittedTx { tx_id: TxId(position.0) })
     }
 
-    /// The committed outcome visible to the retry when its duplicate guard ran.
-    async fn keyed_transaction(&self, database: &str, key: &str, retry_time: Timestamp, identity: &dyn SessionIdentity, placement: Option<&Weak<Database>>, cancellation: &CancellationToken) -> Result<Option<TransactionKey>> {
-        let basis = QueryBasis { snapshot: self.snapshot_basis()?, snapshot_time: None, current_time: self.query_instant(), timezone: self.factory.options.default_timezone.clone() };
-        let context = self.query_context_in_placement(database, &basis, identity, placement, cancellation).await?;
-        let time = Value::Timestamp { value: retry_time.0, unit: TimeUnit::Microsecond, timezone: Some("UTC".into()) };
-        let arguments = vec![time.clone(), time, Value::Utf8(key.to_owned())];
-        let options = rtdb_sql::PrepareOptions {
-            parameter_types: arguments.iter().enumerate().map(|(index, value)| (index, value.logical_type())).collect(),
-            default_timezone: context.timezone.clone(),
-            generate_series_end_exclusive: context.options.generate_series_end_exclusive,
-            ..Default::default()
-        };
-        let sql = format!("SELECT _id, system_time FROM xt.txs FOR ALL VALID_TIME WHERE committed = true AND system_time = (SELECT k._system_from FROM {IDEMPOTENCY_TABLE} FOR SYSTEM_TIME AS OF ? FOR VALID_TIME AS OF ? AS k WHERE k._id = ?)");
-        let prepared = match prepare_query(&sql, &context, &options) {
-            Ok(prepared) => prepared,
-            Err(error) if error.code == "xtdb/table-not-found" || error.code.contains("unknown-table") => return Ok(None),
-            Err(error) => return Err(error),
-        };
-        let mut cursor = prepared.execute(context, arguments).await?;
-        while let Some(batch) = cursor.next_batch().await? {
-            let batch = batch.batch();
-            if batch.num_rows() == 0 { continue; }
-            let id = read_value(batch.schema().field(0), batch.column(0).as_ref(), 0)?;
-            let time = read_value(batch.schema().field(1), batch.column(1).as_ref(), 0)?;
-            let (Value::I64(id), Value::Timestamp { value, unit: TimeUnit::Microsecond, .. }) = (id, time) else {
-                return Err(Anomaly::fault("rtdb.node/idempotency-result", "Stored idempotency outcome has no transaction key"));
-            };
-            return Ok(Some(TransactionKey { tx_id: TxId(id), system_time: Timestamp(value) }));
-        }
-        Ok(None)
-    }
     pub async fn await_transaction(&self, database: &str, tx_id: TxId, identity: &dyn SessionIdentity, cancellation: &CancellationToken) -> Result<TransactionResult> {
         self.await_transaction_in_placement(database, tx_id, identity, None, cancellation).await
     }
@@ -461,8 +410,8 @@ impl Node {
         self.ensure_indexing()?;
         let db = self.attached_database(database, placement)?;
         let latest = db.replication.await_tx(tx_id, cancellation).await?;
-        if let Some(result) = &latest && !result.error().is_some_and(|error| error.code == "xtdb/assert-failed") {
-            return Ok(result.as_ref().clone());
+        if let Some(result) = &latest {
+            return Ok(answer_duplicate(result.as_ref().clone()));
         }
         let basis = QueryBasis { snapshot: self.snapshot_basis()?, snapshot_time: None, current_time: self.query_instant(), timezone: self.factory.options.default_timezone.clone() };
         let context = self.query_context_in_placement(database, &basis, identity, placement, cancellation).await?;
@@ -489,16 +438,7 @@ impl Node {
                         _ => return Err(Anomaly::fault("rtdb.node/tx-result-error", "Stored transaction error is not Transit")),
                     }
                 };
-                if let Some(error) = &error
-                    && error.code == "xtdb/assert-failed"
-                    && error.context.get("tx-op-idx").and_then(|value| value.as_u64()).is_some_and(|index| index <= 1)
-                    && let Some(key) = idempotency_key(&cell("user_metadata")?)
-                    && error.context.get("sql").and_then(|value| value.as_str()).is_some_and(|sql| sql == idempotency_guard(key))
-                    && let Some(original) = self.keyed_transaction(database, key, system_time, identity, placement, cancellation).await?
-                {
-                    return Ok(TransactionResult::Committed { tx_key: original });
-                }
-                Ok(TransactionResult::Aborted { tx_key, error })
+                Ok(answer_duplicate(TransactionResult::Aborted { tx_key, error }))
             }
             _ => Err(Anomaly::fault("rtdb.node/tx-result-status", "Stored transaction result has no commit status")),
         }
@@ -763,11 +703,16 @@ impl SessionService for NativeSessionService {
     async fn await_transaction(&self, database: &str, tx_id: TxId, cancellation: &CancellationToken) -> Result<TransactionResult> { self.node.await_transaction_in_placement(database, tx_id, self.identity.as_ref(), self.placement.as_ref(), cancellation).await }
 }
 
-/// Where a transaction's idempotency key is recorded, keyed by the key, so a retry finds it with one point lookup.
-pub const IDEMPOTENCY_TABLE: &str = "rtdb_idempotency_keys";
-const IDEMPOTENCY_SENTINEL: &str = "~table";
-/// How long a committed transaction's key keeps a retry from running it again (`idempotency_window`).
-const IDEMPOTENCY_WINDOW: std::time::Duration = std::time::Duration::from_secs(3600);
+/// A retry of a committed transaction under the same identity and body is answered with the original's outcome.
+fn answer_duplicate(result: TransactionResult) -> TransactionResult {
+    let TransactionResult::Aborted { error: Some(error), .. } = &result else { return result };
+    if error.code != "rtdb/idempotency-duplicate" { return result; }
+    let field = |name: &str| error.context.get(name).and_then(serde_json::Value::as_i64);
+    match (field("original-tx-id"), field("original-system-time-micros")) {
+        (Some(tx_id), Some(system_time)) => TransactionResult::Committed { tx_key: TransactionKey { tx_id: TxId(tx_id), system_time: Timestamp(system_time) } },
+        _ => result,
+    }
+}
 
 /// The `idempotency_key` a transaction's metadata carries, set with `BEGIN READ WRITE WITH (METADATA = {idempotency_key: '...'})`.
 fn idempotency_key(metadata: &Value) -> Option<&str> {
@@ -789,10 +734,6 @@ pub(crate) fn with_idempotency_key(metadata: Option<rtdb_tx::UserMetadata>, key:
     rtdb_tx::UserMetadata::new(Value::Struct(fields), memory)
 }
 
-fn idempotency_guard(key: &str) -> String {
-    let literal = key.replace('\'', "''");
-    format!("ASSERT NOT EXISTS (SELECT 1 FROM {IDEMPOTENCY_TABLE} WHERE _id = '{literal}')")
-}
 
 /// The code a placed node refuses a command with when it no longer holds the command's database.
 pub const NOT_HELD: &str = "rtdb.node/database-not-held";

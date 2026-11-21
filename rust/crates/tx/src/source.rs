@@ -101,6 +101,30 @@ impl SourceTransaction {
     }
 
     /// Encodes the operations as supplied; submit-time SQL expansion is a separate caller operation.
+    /// The retry identity's key, when the transaction's metadata names one.
+    pub(crate) fn idempotency_key(&self) -> Option<&str> {
+        let Value::Struct(fields) = self.options.user_metadata.as_ref()?.value() else { return None };
+        match fields.get("idempotency_key")? { Value::Utf8(key) => Some(key), _ => None }
+    }
+
+    /// A digest of everything that determines this transaction's effects, apart from its idempotency key.
+    /// Every replica computes it from the same logged record, so the retry decision is deterministic.
+    pub(crate) fn body_digest(&self) -> Result<String> {
+        use sha2::{Digest, Sha256};
+        let mut hash = Sha256::new();
+        let mut field = |bytes: &[u8]| { hash.update((bytes.len() as u64).to_be_bytes()); hash.update(bytes); };
+        let batch = self.operation_batch()?;
+        field(crate::ipc::encode(batch.batch().schema().as_ref(), [batch.batch()], &self.memory)?.as_slice());
+        field(self.options.default_tz.as_bytes());
+        field(&self.options.system_time.map_or([0; 9], |time| { let mut bytes = [1; 9]; bytes[1..].copy_from_slice(&time.0.to_be_bytes()); bytes }));
+        if let Some(Value::Struct(fields)) = self.options.user_metadata.as_ref().map(UserMetadata::value) {
+            let mut rest = fields.clone();
+            rest.remove("idempotency_key");
+            field(encode_metadata(&UserMetadata::new(Value::Struct(rest), &self.memory)?, &self.memory)?.as_slice());
+        }
+        Ok(hash.finalize().iter().map(|byte| format!("{byte:02x}")).collect())
+    }
+
     pub fn encode(&self) -> Result<RetainedBytes> {
         let batch = self.operation_batch()?;
         let bytes = crate::ipc::encode(batch.batch().schema().as_ref(), [batch.batch()], &self.memory)?;

@@ -2644,6 +2644,9 @@ surface ClientAccess {
 
     @guarantee OneOutcomePerKey
         -- A transaction retried with the same idempotency key within idempotency_window has exactly one outcome, whichever member answers.
+        -- The identity is the database, the authenticated principal and the key; its receipt records a digest of the transaction's operations and effect-bearing options.
+        -- A retry with the same body is answered with the original's outcome; a different body under the identity aborts with rtdb/idempotency-conflict.
+        -- The resolver decides from engine-owned receipts in xt.idempotency_receipts, which SQL cannot write, valid for idempotency_window of system time.
         -- A string application key takes precedence over the gateway key and must be stable across attempts for deduplication.
         -- A transaction without a usable application key uses the gateway key and its transaction ordinal.
 }
