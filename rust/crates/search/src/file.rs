@@ -21,6 +21,9 @@ use tantivy::{Directory, HasLen, Index, IndexSettings, TantivyDocument, Term};
 
 use crate::rectangle::merge_adjacent_valid_time;
 
+#[cfg(feature = "experiments")]
+pub(crate) mod experiment;
+
 const MAGIC: &[u8; 8] = b"RTSRCH01";
 /// Identifies the bundle bytes produced by the builder, including visibility encoding.
 pub const FORMAT_VERSION: i32 = 7;

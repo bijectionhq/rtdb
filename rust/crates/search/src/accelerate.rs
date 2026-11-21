@@ -1,3 +1,6 @@
+#[cfg(feature = "experiments")]
+pub mod experiment;
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
