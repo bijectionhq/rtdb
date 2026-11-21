@@ -7,6 +7,7 @@ use ring::rand::{SecureRandom, SystemRandom};
 use rtdb_types::{Anomaly, AnomalyCategory, Result};
 
 pub const KEY_BYTES: usize = 32;
+const DESTROYED: &[u8] = b"RTDB-key-destroyed-v1";
 
 pub trait KeyService: Send + Sync {
     /// A durable identity for the namespace in which this service creates and destroys keys.
@@ -15,7 +16,7 @@ pub trait KeyService: Send + Sync {
     fn key(&self, deployment: &str) -> Result<[u8; KEY_BYTES]>;
     /// Reads the deployment's existing key without allocating one.
     fn existing(&self, deployment: &str) -> Result<[u8; KEY_BYTES]>;
-    /// Removes this service's copy of the deployment key.
+    /// Destroys this service's copy and prevents recreation under the same deployment id.
     fn destroy(&self, deployment: &str) -> Result<()>;
     /// Checks whether an incoming key could be installed without replacing a different key.
     fn validate_install(&self, deployment: &str, key: &[u8; KEY_BYTES]) -> Result<()>;
@@ -94,11 +95,19 @@ impl KeyService for LocalKeyService {
         require_matching_key(deployment, &key, &installed)
     }
     fn destroy(&self, deployment: &str) -> Result<()> {
-        match std::fs::remove_file(self.path(deployment)) {
-            Ok(()) => self.sync_directory(),
-            Err(error) if error.kind() == ErrorKind::NotFound => Ok(()),
-            Err(error) => Err(io(error)),
+        let path = self.path(deployment);
+        match std::fs::read(&path) {
+            Ok(bytes) if bytes == DESTROYED => return self.sync_directory(),
+            Ok(_) => {}
+            Err(error) if error.kind() == ErrorKind::NotFound => {}
+            Err(error) => return Err(io(error)),
         }
+        let mut replacement = tempfile::NamedTempFile::new_in(&self.directory).map_err(io)?;
+        replacement.write_all(DESTROYED).map_err(io)?;
+        rtdb_storage::sync_file(replacement.as_file()).map_err(io)?;
+        // Replacing the file keeps an in-flight install from finding the key's name vacant.
+        replacement.persist(&path).map_err(|error| io(error.error))?;
+        self.sync_directory()
     }
 }
 
@@ -110,6 +119,9 @@ fn require_matching_key(deployment: &str, key: &[u8; KEY_BYTES], installed: &[u8
 }
 
 fn read_key(path: &Path, bytes: Vec<u8>) -> Result<[u8; KEY_BYTES]> {
+    if bytes == DESTROYED {
+        return Err(Anomaly::new(AnomalyCategory::NotFound, "rtdb.multi/key-destroyed", format!("The key at {} was destroyed", path.display())));
+    }
     bytes.try_into().map_err(|_| Anomaly::fault("rtdb.multi/key-corrupt", format!("{} has an invalid key length", path.display())))
 }
 
@@ -120,21 +132,23 @@ mod tests {
     use super::*;
 
     #[test]
-    fn a_key_is_stable_until_destroyed_and_a_copy_is_independent() {
+    fn a_destroyed_key_cannot_be_read_recreated_or_reinstalled() {
         let directory = tempfile::tempdir().unwrap();
         let keys = LocalKeyService::new(directory.path()).unwrap();
         let key = keys.key("a").unwrap();
         assert_eq!(keys.key("a").unwrap(), key);
         keys.install("b", keys.existing("a").unwrap()).unwrap();
         keys.destroy("a").unwrap();
-        assert!(keys.existing("a").is_err());
-        assert!(!keys.path("a").exists());
-        assert_ne!(keys.key("a").unwrap(), key, "a destroyed key is never recovered");
-        assert_eq!(keys.key("b").unwrap(), key, "a fork's copy survives its parent's deletion");
+        assert_eq!(keys.existing("a").unwrap_err().code, "rtdb.multi/key-destroyed");
+        let restarted = LocalKeyService::new(directory.path()).unwrap();
+        assert_eq!(restarted.key("a").unwrap_err().code, "rtdb.multi/key-destroyed");
+        assert_eq!(restarted.install("a", key).unwrap_err().code, "rtdb.multi/key-destroyed");
+        assert_eq!(restarted.validate_install("a", &key).unwrap_err().code, "rtdb.multi/key-destroyed");
+        assert_eq!(restarted.key("b").unwrap(), key);
     }
 
     #[test]
-    fn destroying_a_key_unlinks_only_the_selected_copy() {
+    fn destroying_a_key_replaces_only_the_selected_copy() {
         let directory = tempfile::tempdir().unwrap();
         let keys = LocalKeyService::new(directory.path()).unwrap();
         let key = keys.key("source").unwrap();
@@ -142,7 +156,7 @@ mod tests {
         keys.destroy("source").unwrap();
         keys.destroy("source").unwrap();
         assert_eq!(keys.key("copy").unwrap(), key);
-        assert!(!keys.path("source").exists());
+        assert_eq!(keys.existing("source").unwrap_err().code, "rtdb.multi/key-destroyed");
     }
 
     #[test]
@@ -154,6 +168,24 @@ mod tests {
         let conflict = keys.install("deployment", [2; KEY_BYTES]).unwrap_err();
         assert_eq!(conflict.code, "rtdb.multi/key-conflict");
         assert_eq!(keys.key("deployment").unwrap(), [1; KEY_BYTES]);
+    }
+
+    #[test]
+    fn a_concurrent_install_cannot_leave_a_destroyed_key_readable() {
+        let directory = tempfile::tempdir().unwrap();
+        let keys = LocalKeyService::new(directory.path()).unwrap();
+        std::thread::scope(|scope| {
+            for id in 0..16 {
+                let keys = &keys;
+                scope.spawn(move || {
+                    let _ = keys.install(&id.to_string(), [1; KEY_BYTES]);
+                });
+                keys.destroy(&id.to_string()).unwrap();
+            }
+        });
+        for id in 0..16 {
+            assert_eq!(keys.key(&id.to_string()).unwrap_err().code, "rtdb.multi/key-destroyed");
+        }
     }
 
     #[test]

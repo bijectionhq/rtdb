@@ -58,6 +58,7 @@ Update this section as work lands.
 - After a definitive fork rejection, the administrator attempts to remove the staged key, objects and tail independently.
   If cleanup fails, the orphaned artifacts still need removal.
 - Deletion retains its epoch and key when storage still holds objects, so a later retry can finish the erasure.
+- Local key destruction atomically replaces the key file with a durable marker that rejects future reads or installs for that deployment ID.
 
 - A promotion that inherited a flushed block reopened its source tail behind the flush and stopped with "Source reader did not advance" (`ReplicationDriver::promote`); it affected classic failover too.
 - A planned move whose target died afterwards left a move intent no node could ever satisfy.

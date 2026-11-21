@@ -1690,6 +1690,7 @@ rule TransferSharedObjects {
 
 rule EraseAndProve {
     -- If the inventory still contains objects, the deployment remains deleting and can retry with the same epoch.
+    -- A destroyed key cannot be installed or allocated again under the same deployment identity in that cell.
     when: SharedObjectsTransferred(record)
 
     ensures:

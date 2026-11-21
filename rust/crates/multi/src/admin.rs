@@ -609,7 +609,7 @@ mod tests {
         let proof = finish_deletion(&bucket, &deployment, &[], &keys).await.unwrap();
         assert!(proof.verified_empty);
         assert!(bucket.list(None).await.unwrap().is_empty());
-        assert!(!data.path().join(format!("{}.key", deployment.id)).exists());
+        assert_eq!(keys.existing(&deployment.id).unwrap_err().code, "rtdb.multi/key-destroyed");
     }
 
     #[tokio::test]
@@ -641,7 +641,9 @@ mod tests {
         assert!(directory.deployment_by_name("refused").await.unwrap().is_none());
         let after = bucket.list(None).await.unwrap().into_iter().map(|item| item.key).collect::<Vec<_>>();
         assert_eq!(after, before);
-        assert_eq!(std::fs::read_dir(key_dir).unwrap().count(), 2);
+        let live_keys = std::fs::read_dir(key_dir).unwrap().map(|entry| entry.unwrap().metadata().unwrap().len())
+            .filter(|length| *length == crate::keys::KEY_BYTES as u64).count();
+        assert_eq!(live_keys, 2);
     }
 
     #[tokio::test]

@@ -7,6 +7,7 @@ use std::time::Duration;
 use common::*;
 use rtdb_directory::MemberPool;
 use rtdb_multi::admin;
+use rtdb_multi::keys::KeyService;
 use tokio_postgres::NoTls;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -223,7 +224,7 @@ async fn a_fork_starts_from_its_parents_data_and_diverges_and_a_deletion_leaves_
     assert!(deletion.verified_empty);
     assert!(files_under(&root.join(parent.storage_prefix())).is_empty(), "the parent's objects are erased");
     assert!(own(&child.storage_prefix()) > written, "after the fork's shared objects were copied into it");
-    assert!(!cell.data.path().join("keys").join(format!("{}.key", parent.id)).exists(), "its key is destroyed");
+    assert_eq!(cell.keys().existing(&parent.id).unwrap_err().code, "rtdb.multi/key-destroyed");
     assert_eq!(cell.directory.deployment_by_name("shop").await.unwrap().unwrap().lifecycle, rtdb_directory::Lifecycle::Deleted);
     assert!(tokio_postgres::connect(&format!("host=127.0.0.1 port={} user=xtdb password=cell-test dbname=shop", cell.gateway.port()), NoTls).await.is_err(), "a deleted deployment is refused");
     let preview = connect_eventually(&cell, "shop-preview").await;
@@ -441,7 +442,7 @@ async fn a_deployment_moves_cells_with_its_unflushed_tail_and_its_old_gateway_fo
     assert_eq!(rtdb_multi::store::finish_moves(east_bucket.as_ref(), &deployments, rtdb_directory::now_ms(), hour, Some(&keys)).await.unwrap(), 0, "and keeps them within the grace");
     assert_eq!(rtdb_multi::store::finish_moves(east_bucket.as_ref(), &deployments, rtdb_directory::now_ms() + hour.as_millis() as i64, hour, Some(&keys)).await.unwrap(), 1);
     assert_eq!(left_behind().await, 0, "after the grace, the old cell erases what the move left");
-    assert!(!east.data.path().join("keys").join(format!("{}.key", tombstone.id)).exists(), "and destroys its copy of the key");
+    assert_eq!(keys.existing(&tombstone.id).unwrap_err().code, "rtdb.multi/key-destroyed");
     assert_eq!(values(&through_west, "SELECT total FROM orders").await, ["10", "20", "30"], "while the deployment reads on in its new cell");
     drop((through_east, through_west));
     east.stop().await;
