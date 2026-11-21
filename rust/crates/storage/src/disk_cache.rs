@@ -298,7 +298,6 @@ impl ObjectStore for DiskCachedStore {
         self.remote.index_page_lifecycle()
     }
 
-    fn supports_scan_ranges(&self, key: &ObjectKey) -> bool { self.remote.supports_scan_ranges(key) }
     async fn head(&self, key: &ObjectKey) -> Result<StoredObject> {
         let _scope = self.io.admit()?;
         let _operation = self.cache.begin_operation()?;
@@ -339,6 +338,8 @@ impl ObjectStore for DiskCachedStore {
             reservation.finish(Bytes::from(bytes))
         }).await
     }
+    fn supports_scan_ranges(&self, key: &ObjectKey) -> bool { self.remote.supports_scan_ranges(key) }
+
     async fn get_reserved_scan_range(&self, key: &ObjectKey, range: Range<u64>, reservation: ReadReservation) -> Result<RetainedBytes> {
         let scope = self.io.admit()?;
         let operation = self.cache.begin_operation()?.and(scope);

@@ -100,8 +100,6 @@ pub trait IndexPageLifecycle: Send + Sync {
 #[async_trait]
 pub trait ObjectStore: Send + Sync {
     fn index_page_lifecycle(&self) -> Option<&dyn IndexPageLifecycle> { None }
-    /// Whether a scan can read a slice without repeatedly loading the whole object.
-    fn supports_scan_ranges(&self, _key: &ObjectKey) -> bool { true }
     async fn head(&self, key: &ObjectKey) -> Result<StoredObject>;
     /// Reads current metadata for the key from the backing provider.
     /// The default is suitable when `head` already obtains current provider metadata.
@@ -114,6 +112,8 @@ pub trait ObjectStore: Send + Sync {
     async fn get_fresh(&self, key: &ObjectKey) -> Result<Bytes> { self.get(key).await }
     /// Returns exactly the half-open byte range; an unavailable range is an error.
     async fn get_range(&self, key: &ObjectKey, range: Range<u64>) -> Result<Bytes>;
+    /// Whether a scan can read a slice without repeatedly loading the whole object.
+    fn supports_scan_ranges(&self, _key: &ObjectKey) -> bool { true }
     /// Retains the allocation charge during the read and with the returned bytes.
     /// Implementations that offload work beyond this future must move the reservation into that work.
     async fn get_reserved_range(&self, key: &ObjectKey, range: Range<u64>, reservation: ReadReservation) -> Result<RetainedBytes> {
