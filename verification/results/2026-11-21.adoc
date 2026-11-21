@@ -955,6 +955,11 @@ The new maintenance test observes the collector and its store before and after i
 It checks that both file pairs stay present when the live and nascent tries recorded by the original checkpoint become garbage in the serving catalog.
 It checks that a later checkpoint no longer depending on them permits collection and its deletion notice.
 Use `BIJECTION_LOCAL_EXECUTION=owner-authorized cargo test --manifest-path rust/Cargo.toml --locked -p rtdb-maintenance -p rtdb-index -p rtdb-query -p rtdb-node -p rtdb-replication --lib --test gc --test live_index --test scan --test native`.
+The complete link:../README.adoc[combined runner] passed on `2f1019b68` with both `--rust-boundary` and `--native-replay`.
+Its archived-source control removed the checkpoint from the collector decision and failed at the original checkpoint hold assertion.
+The run verified 115 Verus obligations across 15 areas, attributed 63 source controls, and checked the 20 TLC baseline configurations with their controls.
+Lean, Apalache, Alloy, SMT, Maude, mCRL2, and AutoHyper completed their configured cases.
+Its input manifest SHA-256 is `6a03ec9402f0575c5e58c6fdeb2169a04b465cf3da630fa33603645d93c5e068`.
 
 This protection covers data and metadata selected by the Rust trie collector within one partition authority.
 The file-presence test uses the in-memory object provider.
@@ -970,3 +975,48 @@ Using the current catalog in place of the installed checkpoint and omitting the 
 The reachability check produced a trace that collects both original objects after replacement adoption.
 Apalache independently checked the two safety invariants through ten transitions and found the omitted nascent dependency.
 The model assumes one authority, atomic transitions, and immutable object identities. It abstracts object bytes, I/O cancellation, replica log retention, and remote discovery.
+
+=== Integrated model and ordered-index checks
+
+The combined formal runner passed again at `e68e49995` with the installed-checkpoint model and the concurrently merged ordered-index code.
+The native replay and Rust boundary flags were omitted for this second combined run.
+Its input manifest SHA-256 is `445f97669e6371714380c28acda31f6c8396cd7ff06e268c2cb92d5199ec7f53`.
+The separate `verification/multi/check.sh` run checked ten Lean modules and 14 TLC configurations at the same revision.
+Each expected negative configuration failed its named invariant.
+The ordered-index suite checked six Lean law modules, audited 13 exported theorems, and verified ten domain and six seek obligations under the installed Verus version.
+The separate large ordered-index TLC run remains recorded at its original revision. link:../ordered-index/README.md[Ordered-index evidence and reproduction]
+
+During the native integration run at `e68e49995`, the ordered-index rebuild test requested repair while the reopened node still reported the following role.
+Commit `1d04609de` made the explicit ordered artefact request wait for the elected node's maintenance worker.
+The consolidated native suite retains the checks for exact original manifest bytes and the recovered page.
+
+=== Hosted and Multi branch consolidation
+
+The consolidation includes hosted ordered-index tip `49bd0c804` and RTDB Multi tip `b03fde804` as ancestors.
+Ordinary checkpoint discovery keeps the strictly newer refresh rule.
+Exact and restored-archive discovery preserve their recovery anchors and the restored compaction replay cutoff.
+Local collection continues to account for installed checkpoint membership and active readers.
+Storage admission transfers both reader and hosted provider-region lifetimes through detached operations.
+The compaction driver acquires the shared job slot before dispatching CPU-bound work to a blocking worker.
+
+The redirected generation-retirement model run checked the 605 reachable states and rejected the three weakened upload settlement, reader drain, and replay scrubbing configurations.
+The reported state counts describe the model of two publishers and two readers.
+
+The native consolidation run at `1ff7e09d8` passed 739 selected tests across 20 binaries.
+It included the closed-history recovery fixture, the current Arrow page heap oracle, native ordered-index rebuild, group-artefact GC, replica replay, object-store I/O, and Multi's library tests.
+The test suite keeps one heap oracle on the production Arrow-backed row representation after resolving the duplicate imported from Multi.
+Reproduce with `BIJECTION_LOCAL_EXECUTION=owner-authorized cargo test --manifest-path rust/Cargo.toml --locked --no-fail-fast -p rtdb-node -p rtdb-index -p rtdb-storage -p rtdb-maintenance -p rtdb-query -p rtdb-replication -p rtdb-multi -p rtdb-directory -p rtdb-logkeeper -p rtdb-pgwire -p rtdb-conformance --lib --test gc --test native --test catalogs --test disk_cache --test remote --test node_faults --test recovery --test protocol --test search`.
+The combined formal input manifest at `93974d258` is `07aa342d77224a6f90eeff1f49706d77e2328297336e9b53c76aa633e18c6189`.
+The additional ordered-index Verus domain run at `16ae17a9f` checked 20 obligations, including the production maximum aligned bucket step.
+Its explicit-fairness generation-retirement configuration checked the temporal property over the same 605 reachable states.
+
+The follow-up merge `91c446b75` includes Multi tip `a7f795eb`.
+Its 271 selected tests pass across the Multi library, local cell, Flight SQL gateway, types library, and quantized budget suites.
+They exercise the newer resident-idle and parking lifecycle, direct writer routing, stale installation refusal, and active Flight SQL call retention.
+Reproduce with `BIJECTION_LOCAL_EXECUTION=owner-authorized cargo test --manifest-path rust/Cargo.toml --locked --no-fail-fast -p rtdb-multi -p rtdb-types --lib --test cell --test flight_gateway --test quantized_budget -- --test-threads=4`.
+Lean checked the imported repair boundary and repair prefix modules followed by `RetainedJournal.lean`, with warnings promoted to errors.
+The combined formal runner passed at `91c446b75` with Lean, Verus, TLC, Apalache, Alloy, Z3, Maude, mCRL2, and AutoHyper.
+It recorded 115 Verus obligations, 63 source controls, and 21 TLC baseline configurations.
+Its input manifest SHA-256 is `d92c0b97b24a6b19719564c7eea6816d9b6aff16c6ae59439d79a52d2a2a4e67`.
+The native replay and Rust boundary flags were omitted from this invocation.
+Distributed reader and recovery retention, hosted provider settlement, and the replica log suffix remain outside the local runtime guarantee.
