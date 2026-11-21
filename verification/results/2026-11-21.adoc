@@ -876,3 +876,9 @@ Its controls discard intervening events or reverse the priority of same-time com
 A native replay compacts an Arrow input containing a same-time put and delete and an erase, then combines the decoded output with untouched older rows.
 It matches the original history at 440 combinations of IID, system time, and valid time, and rejects dropping the erase from the output.
 General refinement of cohort formation, erase handling, and final layout through catalog publication remains open.
+
+The combined runner passed on `0050d0833` with mCRL2, AutoHyper, and both Rust options enabled.
+That run included the six interval theorems and the native cohort controls.
+Its input manifest SHA-256 is `3c3acf9ff1d60f596032f31d1ac80f4e36b3ed2d3d1508efb89928826a92643a`.
+On `d31830530`, the focused runner audited all seven interval and history theorems, rejected their five controls, and passed both native replays with all three controls.
+The selected Rust maintenance suites also passed 40 tests at that revision.
