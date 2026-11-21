@@ -10,14 +10,14 @@ use rtdb_replication::{BlockStore, PartitionLogs, ProgressMonitor, ReplicationDr
 use rtdb_storage::{IoRegion, ObjectStore, cache::{BufferPool, CacheBudget}};
 use rtdb_tx::{ResolveContext, TransactionAuthorization};
 use rtdb_types::{Anomaly, AnomalyCategory, ReplicaPosition, Result, SourcePosition, TableRef, Term};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 
 use crate::ordered_index::OrderedIndexMaintenance;
 use crate::{Clock, DatabaseCatalog, ExternalSource, ExternalSourceFactory, ExternalSources, NodeOptions, ResourceDriver, ResourceFactory, catalog::{CatalogCommand, CatalogEffects}};
 
-type OrderedIndexCycle = Arc<parking_lot::RwLock<Option<CycleHandle>>>;
+type OrderedIndexCycle = watch::Sender<Option<CycleHandle>>;
 
 pub struct Database {
     name: String,
@@ -29,7 +29,7 @@ pub struct Database {
     pub(crate) replication: ReplicationHandle,
     compaction: Option<CompactionHandle>,
     artefacts: Vec<ArtefactHandle>,
-    ordered_cycle: OrderedIndexCycle,
+    ordered_cycle: Option<OrderedIndexCycle>,
     cancellation: CancellationToken,
     io: Arc<IoRegion>,
 }
@@ -60,8 +60,15 @@ impl Database {
     /// Builds every artefact the lanes can currently build, returning once each is published or with the first failure.
     pub async fn build_artefacts(&self) -> Result<()> {
         for lane in &self.artefacts { lane.build_all().await?; }
-        let order = self.ordered_cycle.read().clone();
-        if let Some(order) = order { order.await_cycle().await?; }
+        if let Some(cycle) = &self.ordered_cycle {
+            let mut installed = cycle.subscribe();
+            let wait = async {
+                let cycle = installed.wait_for(Option::is_some).await.map_err(|_| closed())?;
+                cycle.as_ref().cloned().ok_or_else(closed)
+            };
+            let order = self.cancellation.run_until_cancelled(wait).await.ok_or_else(closed)??;
+            order.await_cycle().await?;
+        }
         Ok(())
     }
     pub async fn flush(&self) -> Result<SourcePosition> {
@@ -172,12 +179,13 @@ impl DatabaseFactory {
             let source = if self.options.replication.enabled && self.options.replication.may_lead && !read_only {
                 match &configuration.external_source { Some(source) => Some(self.external_factory(source)?.open(source, &name, Arc::clone(&io)).await?), None => None }
             } else { None };
-            let ordered_cycle: OrderedIndexCycle = Default::default();
-            let ordered_worker = (!read_only && matches!(self.options.membership, crate::Membership::Durable { .. })).then(|| Arc::new(OrderedIndexMaintenance::new(
+            let ordered_worker = (!read_only && self.options.replication.enabled && self.options.replication.may_lead
+                && matches!(self.options.membership, crate::Membership::Durable { .. })).then(|| Arc::new(OrderedIndexMaintenance::new(
                 name.clone(), Arc::clone(&storage), Arc::clone(&self.memory), Arc::clone(&self.clock), Arc::clone(&snapshots),
             )));
+            let ordered_cycle = ordered_worker.as_ref().map(|_| watch::channel(None).0);
             let supervisor = MaintenanceSupervisor { store: resources.store, partition: Arc::clone(&partition), replication: replication.clone(), compaction: compaction.clone(), artefacts: artefacts.clone(),
-                observer: Arc::clone(&self.observer), options: self.options.clone(), source, ordered_worker, ordered_cycle: Arc::clone(&ordered_cycle) };
+                observer: Arc::clone(&self.observer), options: self.options.clone(), source, ordered_worker, ordered_cycle: ordered_cycle.clone() };
             let database = Arc::new(Database { name, configuration, read_only, partition, storage, logs, replication, compaction, artefacts, ordered_cycle, cancellation: cancellation.clone(), io: Arc::clone(&io) });
             let driver = DatabaseDriver { database: Arc::clone(&database), replication: replica_driver, compactor, artefacts: artefact_drivers, supervisor, logs: opened_logs.drivers, log_cancellation };
             Ok(OpenedDatabase { database, driver, secondaries })
@@ -277,7 +285,7 @@ struct MaintenanceSupervisor {
     options: NodeOptions,
     source: Option<Box<dyn ExternalSource>>,
     ordered_worker: Option<Arc<OrderedIndexMaintenance>>,
-    ordered_cycle: OrderedIndexCycle,
+    ordered_cycle: Option<OrderedIndexCycle>,
 }
 
 impl MaintenanceSupervisor {
@@ -308,7 +316,7 @@ impl MaintenanceSupervisor {
             handle.signal();
             Some(handle)
         } else { None };
-        *self.ordered_cycle.write() = ordered.clone();
+        if let Some(cycle) = &self.ordered_cycle { cycle.send_replace(ordered.clone()); }
         Ok(TermRegion { term: handle.term(), cancellation, trie, blocks, ordered, tasks })
     }
     async fn run(mut self, cancellation: CancellationToken) -> Result<()> {
@@ -320,7 +328,7 @@ impl MaintenanceSupervisor {
             let current = status.borrow_and_update().clone();
             let term = match current.role { Role::Leading(term) => Some(term), _ => None };
             if region.as_ref().map(|region| region.term) != term {
-                self.ordered_cycle.write().take();
+                if let Some(cycle) = &self.ordered_cycle { cycle.send_replace(None); }
                 if let Some(previous) = region.take() { if let Err(error) = previous.join().await { if !cancellation.is_cancelled() && error.category != AnomalyCategory::Interrupted { break Err(error); } } }
                 if let Some(handle) = self.replication.term() {
                     tokio::select! {
@@ -349,7 +357,7 @@ impl MaintenanceSupervisor {
                 result = async { region.as_mut().expect("guarded term region").tasks.join_next().await }, if region.is_some() => break Err(component_exit(result)),
             }
         };
-        self.ordered_cycle.write().take();
+        if let Some(cycle) = &self.ordered_cycle { cycle.send_replace(None); }
         if let Some(region) = region { let drained = region.join().await; if result.is_ok() && !cancellation.is_cancelled() { return drained; } }
         result
     }
