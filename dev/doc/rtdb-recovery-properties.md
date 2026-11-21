@@ -186,6 +186,8 @@ Durable pack completeness is a premise at upload, and publication checks the wri
 Applying that theorem to Logkeepers requires distinct inventory entries tied to the correct journals and a durable promise that survives restart.
 [IdempotencyWindow.lean](../lean/IdempotencyWindow.lean) checks arbitrary commit, reply, and disconnect traces for a single eligible key before expiration.
 Its commit transition installs the outcome atomically with the only mutation, which is the contract the Rust resolver and idempotency table must establish.
+The private engine replay study checks the shared cutoff, protected marker creation and durable outcome lookup.
+The deployed claim still requires the gateway to send the same permit on each attempt and to enforce writer compatibility and command eligibility. [Engine replay evidence](rtdb-engine-proof-evidence.md#private-replay-admission-and-marker-authority)
 [GatewayReplay.lean](../../verification/multi/lean/GatewayReplay.lean) proves effective-key preservation for a fixed application key or a private command key and ordinal.
 It also proves that any number of replacements preserve the first recovery cutoff.
 The [gateway model](../../verification/multi/tla/RTDBGatewayReplay.tla) checks a bounded single-command schedule with three weakened configurations.

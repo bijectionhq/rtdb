@@ -31,11 +31,18 @@ message Tx {
     bytes user_metadata = 5;
     bytes external_source_token = 6;
     IdempotencyGuard idempotency_guard = 7;
+    ReplaySubmission replay_submission = 8;
 }
 
 message IdempotencyGuard {
     int64 submitted_at_micros = 1;
     bool after_bootstrap = 2;
+}
+
+message ReplaySubmission {
+    string key = 1;
+    int64 submitted_at_micros = 2;
+    int64 not_after_micros = 3;
 }
 
 message BlockUploaded {

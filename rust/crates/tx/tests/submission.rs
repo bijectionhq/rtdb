@@ -246,3 +246,39 @@ fn separate_puts_of_heterogeneous_documents_mark_absent_union_columns_nullable()
     let message = SourceMessage::decode(transaction.encode().unwrap().as_slice()).unwrap().unwrap();
     SourceTransaction::decode(&message, &memory).unwrap();
 }
+
+#[test]
+fn replay_submission_wire_checks_presence_before_resolving() {
+    use rtdb_format::{envelope::SourceBody, log::proto::IdempotencyGuard};
+    use rtdb_types::Timestamp;
+
+    let memory = MemoryBudget::new(1 << 24);
+    let key = "00112233445566778899aabbccddeeff/0";
+    let replay = ReplaySubmission::admit(key, Timestamp(0), Timestamp(1)).unwrap();
+    let transaction = SourceTransaction::new(
+        vec![TxOp::Sql { sql: "INSERT INTO docs (_id) VALUES (1)".into(), args: None }],
+        SubmitOptions::default(),
+        &memory,
+    ).unwrap().with_replay_submission(replay);
+    let encoded = transaction.encode().unwrap();
+    let Some(SourceMessage::Protobuf(SourceBody::Tx(tx))) = SourceMessage::decode(encoded.as_slice()).unwrap() else {
+        panic!("expected structured source transaction");
+    };
+    let metadata = tx.replay_submission.as_ref().unwrap();
+    assert_eq!(metadata.key.as_deref(), Some(key));
+    assert_eq!(metadata.submitted_at_micros, Some(0));
+    assert_eq!(metadata.not_after_micros, Some(1));
+    let decoded = SourceTransaction::decode(&SourceMessage::Protobuf(SourceBody::Tx(tx.clone())), &memory).unwrap();
+    assert_eq!(decoded.encode().unwrap().as_slice(), encoded.as_slice());
+
+    let mut missing_cutoff = tx.clone();
+    missing_cutoff.replay_submission.as_mut().unwrap().not_after_micros = None;
+    let mut expired = tx.clone();
+    expired.replay_submission.as_mut().unwrap().not_after_micros = Some(0);
+    let mut ambiguous = tx;
+    ambiguous.idempotency_guard = Some(IdempotencyGuard { submitted_at_micros: Some(0), after_bootstrap: Some(false) });
+    for invalid in [missing_cutoff, expired, ambiguous] {
+        let message = SourceMessage::Protobuf(SourceBody::Tx(invalid));
+        assert_eq!(SourceTransaction::decode(&message, &memory).err().unwrap().code, "rtdb.tx/invalid-source-transaction");
+    }
+}

@@ -98,7 +98,7 @@ A proof of a candidate is conditional on the explicitly stated contract and work
 
 | Target | Status | Recorded evidence |
 | --- | --- | --- |
-| TX01 · All-or-nothing effects | Partial | [Publication and read-back protocol models](rtdb-engine-proof-evidence.md#main-evidence) |
+| TX01 · All-or-nothing effects | Partial | [Publication and read-back protocol models](rtdb-engine-proof-evidence.md#main-evidence) · [Private replay admission and marker authority](rtdb-engine-proof-evidence.md#private-replay-admission-and-marker-authority) |
 | TX02 · Ordered resolution | Open | — |
 | TX03 · Staged isolation | Partial | [Publication and read-back protocol models](rtdb-engine-proof-evidence.md#main-evidence) |
 | TX04 · Static DML equivalence | Open | — |
@@ -108,7 +108,7 @@ A proof of a candidate is conditional on the explicitly stated contract and work
 | TX08 · Progress monitor | Open | — |
 | TX09 · Transaction clocks | Partial | [Mixed system-clock proof and replay](rtdb-engine-proof-evidence.md#main-evidence) |
 | TX10 · Statement semantics at commit | Open | — |
-| TX11 · Known outcome | Partial | [Publication and read-back protocol models](rtdb-engine-proof-evidence.md#main-evidence) · [Native submission clock and durable retry attribution](rtdb-engine-proof-evidence.md#submission-clock-and-durable-retry-attribution) |
+| TX11 · Known outcome | Partial | [Publication and read-back protocol models](rtdb-engine-proof-evidence.md#main-evidence) · [Native submission clock and durable retry attribution](rtdb-engine-proof-evidence.md#submission-clock-and-durable-retry-attribution) · [Private replay admission and marker authority](rtdb-engine-proof-evidence.md#private-replay-admission-and-marker-authority) |
 | TX12 · Strict serializability (Candidate) | Open | — |
 
 ## Logs, leadership, and block adoption
@@ -148,7 +148,7 @@ A proof of a candidate is conditional on the explicitly stated contract and work
 | Target | Status | Recorded evidence |
 | --- | --- | --- |
 | FMT01 · Codec round trips | Partial | [Signed position bounds and production codec checks](rtdb-engine-proof-evidence.md#main-evidence) · [Rust position packing and resume](rtdb-engine-proof-evidence.md#multi-evidence) |
-| FMT02 · Optional field presence | Partial | [Native source guard presence and legacy replay regression](rtdb-engine-proof-evidence.md#submission-clock-and-durable-retry-attribution) |
+| FMT02 · Optional field presence | Partial | [Native source guard presence and legacy replay regression](rtdb-engine-proof-evidence.md#submission-clock-and-durable-retry-attribution) · [Private replay admission and marker authority](rtdb-engine-proof-evidence.md#private-replay-admission-and-marker-authority) |
 | FMT03 · Arrow event fidelity | Open | — |
 | FMT04 · Version dispatch | Open | — |
 | FMT05 · Errors and referenced payloads | Open | — |

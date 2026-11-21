@@ -5,7 +5,6 @@ mod catalog;
 mod config;
 mod database;
 mod node;
-mod idempotency_window;
 mod backends;
 mod runtime;
 mod metrics;

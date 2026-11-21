@@ -23,6 +23,9 @@ pub trait SessionService: Send + Sync {
     fn snapshot_basis(&self) -> Result<TimeBasis>;
     async fn await_basis(&self, basis: Option<TxBasis>, timeout: Duration, cancellation: &CancellationToken) -> Result<()>;
     async fn submit(&self, database: &str, operations: Vec<TxOp>, options: SubmitOptions, cancellation: &CancellationToken) -> Result<SubmittedTx>;
+    async fn submit_replay(&self, _database: &str, _operations: Vec<TxOp>, _options: SubmitOptions, _permit: ReplaySubmissionPermit, _cancellation: &CancellationToken) -> Result<SubmittedTx> {
+        Err(Anomaly::unsupported("rtdb.node/private-replay-unsupported", "This session service cannot submit a private replay"))
+    }
     async fn await_transaction(&self, database: &str, tx_id: TxId, cancellation: &CancellationToken) -> Result<TransactionResult>;
 }
 
@@ -68,6 +71,14 @@ pub enum AccessSettings { ReadOnly(ReadOnlySettings), ReadWrite(ReadWriteSetting
 pub struct TransactionSettings {
     pub access: Option<AccessSettings>,
     pub timezone: OptionUpdate<String>,
+}
+
+/// A trusted frontend's one-command key and exclusive submission cutoff in UTC microseconds.
+/// The key is 32 hexadecimal digits followed by `/0`.
+/// The frontend supplies the same permit on the initial submission and each retry.
+pub struct ReplaySubmissionPermit {
+    pub key: String,
+    pub not_after: Timestamp,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -517,23 +528,28 @@ impl Session {
         Ok(None)
     }
     async fn submit_operations(&mut self, operations: Vec<TxOp>, options: SubmitOptions, mode: CommitMode) -> Result<CommitResult> {
-        self.submit_to(self.database.to_string(), operations, options, mode).await
+        self.submit_to(self.database.to_string(), operations, options, mode, None).await
     }
-    async fn submit_to(&mut self, database: String, operations: Vec<TxOp>, mut options: SubmitOptions, mode: CommitMode) -> Result<CommitResult> {
+    async fn submit_to(&mut self, database: String, operations: Vec<TxOp>, mut options: SubmitOptions, mode: CommitMode, replay: Option<ReplaySubmissionPermit>) -> Result<CommitResult> {
         let observer = self.service.execution_observer();
         let _sample = rtdb_plan::ExecutionSample::new(observer.clone(), match mode { CommitMode::Async => rtdb_plan::ExecutionTimer::TxSubmit, CommitMode::Sync => rtdb_plan::ExecutionTimer::TxExecute });
         self.revalidate().await?;
         self.ensure_open()?;
         options.user = self.service.user().map(str::to_owned);
         if options.default_tz.is_empty() { options.default_tz = self.timezone.to_string(); }
-        if let Some((key, sequence)) = &mut self.gateway_key {
-            options.user_metadata = Some(crate::node::with_idempotency_key(options.user_metadata.take(), &format!("{}/{sequence}", &**key), self.service.memory())?);
-            *sequence += 1;
-        } else if let Some(key) = self.parameter(crate::node::IDEMPOTENCY_KEY_PARAMETER).filter(|key| !key.is_empty()).map(str::to_owned) {
-            let sequence = match &mut self.idempotency_sequence { Some((current, next)) if *current == key => { *next += 1; *next - 1 } sequence => { *sequence = Some((key.clone(), 1)); 0 } };
-            options.user_metadata = Some(crate::node::with_idempotency_key(options.user_metadata.take(), &format!("{key}/{sequence}"), self.service.memory())?);
+        if replay.is_none() {
+            if let Some((key, sequence)) = &mut self.gateway_key {
+                options.user_metadata = Some(crate::node::with_idempotency_key(options.user_metadata.take(), &format!("{}/{sequence}", &**key), self.service.memory())?);
+                *sequence += 1;
+            } else if let Some(key) = self.parameter(crate::node::IDEMPOTENCY_KEY_PARAMETER).filter(|key| !key.is_empty()).map(str::to_owned) {
+                let sequence = match &mut self.idempotency_sequence { Some((current, next)) if *current == key => { *next += 1; *next - 1 } sequence => { *sequence = Some((key.clone(), 1)); 0 } };
+                options.user_metadata = Some(crate::node::with_idempotency_key(options.user_metadata.take(), &format!("{key}/{sequence}"), self.service.memory())?);
+            }
         }
-        let submitted = self.service.submit(&database, operations, options, &self.cancellation).await.inspect_err(|_| {
+        let submitted = match replay {
+            Some(permit) => self.service.submit_replay(&database, operations, options, permit, &self.cancellation).await,
+            None => self.service.submit(&database, operations, options, &self.cancellation).await,
+        }.inspect_err(|_| {
             if let Some(observer) = &observer { observer.record_error(rtdb_plan::ExecutionError::Transaction); }
         })?;
         let next = TxBasis { databases: BTreeMap::from([(database.clone(), vec![submitted.tx_id])]) };
@@ -557,7 +573,7 @@ impl Session {
         if self.transaction().is_some() { return Err(Anomaly::incorrect("xtdb/tx-already-in-progress", "Cannot submit a transaction while another is in progress on this connection - commit or roll back first")); }
         let timezone = rtdb_expr::normalize_timezone(options.default_timezone.as_deref().unwrap_or(&self.timezone))?;
         self.submit_to(options.database.unwrap_or_else(|| self.database.to_string()), operations,
-            SubmitOptions { default_tz: timezone, system_time: options.system_time, user: None, user_metadata: options.user_metadata }, mode).await
+            SubmitOptions { default_tz: timezone, system_time: options.system_time, user: None, user_metadata: options.user_metadata }, mode, None).await
     }
     pub async fn submit_tx(&mut self, operations: Vec<TxOp>, options: AutonomousTxOptions) -> Result<SubmittedTx> {
         match self.autonomous(operations, options, CommitMode::Async).await? {
@@ -572,16 +588,34 @@ impl Session {
         }
     }
     pub async fn commit_tx(&mut self, mode: Option<CommitMode>) -> Result<CommitResult> {
+        self.commit_tx_inner(mode, None).await
+    }
+
+    /// Commits one buffered write synchronously under a trusted frontend's private permit.
+    /// A duplicate returns the original committed key when resolution reaches its marker.
+    /// An empty or multi-operation write buffer is rejected.
+    pub async fn commit_tx_with_replay_permit(&mut self, permit: ReplaySubmissionPermit) -> Result<CommitResult> {
+        self.commit_tx_inner(Some(CommitMode::Sync), Some(permit)).await
+    }
+
+    async fn commit_tx_inner(&mut self, mode: Option<CommitMode>, replay: Option<ReplaySubmissionPermit>) -> Result<CommitResult> {
         self.revalidate().await?;
         self.require_usable_transaction()?;
         let Lifecycle::Open(tx) = &mut self.lifecycle else { return Err(Anomaly::incorrect("xtdb/connection-closed", "Connection is closed")); };
-        let Some(tx) = tx.take() else { return Ok(CommitResult::NoTransaction); };
+        let Some(tx) = tx.take() else {
+            return if replay.is_some() { Err(replay_operation_count()) } else { Ok(CommitResult::NoTransaction) };
+        };
         self.replace_timezone(tx.session_timezone);
-        let Phase::Writing { buffer, options } = tx.phase else { return Ok(CommitResult::NoTransaction); };
+        let Phase::Writing { buffer, options } = tx.phase else {
+            return if replay.is_some() { Err(replay_operation_count()) } else { Ok(CommitResult::NoTransaction) };
+        };
+        if replay.is_some() && buffer.operations.len() != 1 { return Err(replay_operation_count()); }
         let mode = mode.unwrap_or(if options.asynchronous { CommitMode::Async } else { CommitMode::Sync });
         let (operations, reservations): (Vec<_>, Vec<_>) = buffer.operations.into_iter().map(|entry| (entry.operation, entry._reservation)).unzip();
-        let result = self.submit_operations(operations, SubmitOptions { default_tz: tx.timezone.to_string(), system_time: options.system_time,
-            user: None, user_metadata: options.user_metadata }, mode).await;
+        let result = self.submit_to(self.database.to_string(), operations, SubmitOptions {
+            default_tz: tx.timezone.to_string(), system_time: options.system_time,
+            user: None, user_metadata: options.user_metadata,
+        }, mode, replay).await;
         drop(reservations);
         result
     }
@@ -603,3 +637,7 @@ fn update_text(update: &OptionUpdate<String>, old: &Option<RetainedText>, memory
     }
 }
 fn allocation_overflow() -> Anomaly { Anomaly::incorrect("rtdb.node/session-allocation", "Session allocation size exceeds usize") }
+
+fn replay_operation_count() -> Anomaly {
+    Anomaly::incorrect("rtdb.node/private-replay-operation-count", "Private replay requires exactly one buffered write operation")
+}

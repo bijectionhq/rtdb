@@ -373,6 +373,9 @@ variant TxMessage : SourceMessage {
     -- For a record carrying the envelope, the failed assertion must have the recorded position to identify a duplicate.
     -- Typed outcome lookup selects the latest marker visible at the retry's system time whose validity extends past the retry's submission sample.
     -- Outcome lookup for a record without that envelope uses the legacy guard convention and the retry's system time as its valid-time point.
+    -- A private replay submission instead carries its engine key, admission sample and exclusive cutoff.
+    -- These values are required together when the private replay envelope is present.
+    -- Submission refuses a sample at or after the cutoff before appending a source record.
     -- Source encoding admits and builds operation body columns one at a time.
     -- A document union leg retains columns in their first encounter order across document operations for the same table and mutation kind.
     system_time: Timestamp?
@@ -874,6 +877,12 @@ rule LeaderProcessesTx {
         -- An invalid SQL table projection contributes its error before dependent column binding and INSERT schema errors in the same abort.
     -- For concrete document writes, forbidden columns abort with the table reference and offending column names in source schema order.
     -- SQL insert plans report each forbidden projection as a planning error.
+        -- The resolver looks up a private replay key against its ordered prefix before applying user operations.
+        -- A matching marker has a validity interval overlapping the submission sample or a later instant.
+        -- A successful first execution records its marker atomically with its user effects.
+        -- The marker expires at the later of the permit cutoff and one hour after the admission sample.
+        -- Private replay markers can be created by the resolver only and are protected from application writes and erases.
+        -- A duplicate records the original transaction key in its durable outcome and skips the user operations.
         let resolved = ResolveTx(tx_resolver, msg)
         AppendTx(resolved, src_msg_id: msg.msg_id)
 }

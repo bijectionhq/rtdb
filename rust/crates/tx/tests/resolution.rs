@@ -380,3 +380,29 @@ async fn resolved_series_dml_uses_the_resolving_nodes_endpoint_policy() {
         assert_eq!(document["v"],Value::List((1..if end_exclusive {3} else {4}).map(Value::I64).collect()));
     }
 }
+
+#[tokio::test]
+async fn external_event_writer_cannot_erase_private_replay_markers() {
+    struct ExternalWriter;
+
+    #[async_trait::async_trait]
+    impl TransactionWriter for ExternalWriter {
+        async fn write(&mut self, transaction: &mut OpenTransaction<'_>) -> Result<WriterResult> {
+            let error = transaction.append(TableRef::new("xt", "rtdb_replay_keys"), rtdb_format::data::StoredEvent {
+                iid: Value::Utf8("00112233445566778899aabbccddeeff/0".into()).entity_id()?.iid(),
+                system_from: transaction.tx_key().system_time,
+                valid_time: Interval::ALL,
+                operation: StoredOperation::Erase,
+                recency: None,
+            }).unwrap_err();
+            Ok(WriterResult::Aborted { error, user_metadata: None })
+        }
+    }
+
+    let state = PartitionState::empty(Default::default()).unwrap();
+    let context = context();
+    let mut resolver = TxResolver::new(None, SourcePosition(-1), None, &context.memory).unwrap();
+    let resolved = resolver.resolve_external(state.value().snapshot(), Timestamp(100), None, None, &mut ExternalWriter, &context).await.unwrap();
+    assert_eq!(resolved.result().error().unwrap().code, "xtdb/forbidden-table");
+    assert!(!resolved.writes().tables().contains_key(&TableRef::new("xt", "rtdb_replay_keys")));
+}

@@ -360,17 +360,25 @@ impl Node {
         rtdb_query::evaluate_fragment(context, fragment).await
     }
 
-    async fn submit(&self, database: &str, mut operations: Vec<TxOp>, mut options: SubmitOptions, identity: &dyn SessionIdentity, placement: Option<&Weak<Database>>, cancellation: &CancellationToken) -> Result<SubmittedTx> {
+    async fn submit(&self, database: &str, mut operations: Vec<TxOp>, mut options: SubmitOptions, permit: Option<crate::ReplaySubmissionPermit>, identity: &dyn SessionIdentity, placement: Option<&Weak<Database>>, cancellation: &CancellationToken) -> Result<SubmittedTx> {
         self.admit(database, DatabaseAccess::Write, identity, cancellation).await?;
         let key = options.user_metadata.as_ref().and_then(|metadata| idempotency_key(metadata.value()));
         let database = self.attached_database(database, placement)?;
         let admission = if self.catalog.is_placed() {
             Some(cancellation.run_until_cancelled(database.admit_transaction()).await.ok_or_else(cancelled)??)
         } else { None };
-        let guard = if let Some(key) = key {
+        let replay = if let Some(permit) = permit {
+            if key.is_some_and(|key| key != permit.key) {
+                return Err(Anomaly::incorrect("rtdb.node/conflicting-replay-key", "Application key conflicts with the private replay permit"));
+            }
+            let submitted_at = self.now();
+            let replay = rtdb_tx::ReplaySubmission::admit(&permit.key, submitted_at, permit.not_after)?;
+            Some((replay, submitted_at))
+        } else { None };
+        let guard = if let (Some(key), None) = (key, &replay) {
             if key == IDEMPOTENCY_SENTINEL { return Err(Anomaly::incorrect("rtdb.node/reserved-idempotency-key", format!("'{IDEMPOTENCY_SENTINEL}' is reserved and cannot be an idempotency key"))); }
             let submitted_at = self.now();
-            let expires_at = crate::idempotency_window::expiration(submitted_at.0).map(Timestamp)
+            let expires_at = rtdb_tx::idempotency_expiration(submitted_at.0).map(Timestamp)
                 .ok_or_else(|| Anomaly::incorrect("xtdb/time-overflow", "Idempotency key expiration exceeds the timestamp range"))?;
             // A transaction carrying a key that already committed within the window aborts on its assertion, and awaiting it answers with the original's outcome.
             let table = rtdb_types::TableRef::new("public", IDEMPOTENCY_TABLE);
@@ -399,9 +407,14 @@ impl Node {
         if let Some((submitted_at, after_bootstrap)) = guard {
             source = source.with_idempotency_guard(submitted_at, after_bootstrap);
         }
+        let (source, submitted_at) = match replay {
+            Some((replay, submitted_at)) => (source.with_replay_submission(replay), Some(submitted_at)),
+            None => (source, None),
+        };
         let payload = source.encode()?.into_bytes();
         let submitted_bytes = payload.len() as u64;
-        let position = cancellation.run_until_cancelled(database.replication.submit_source_encoded(payload, self.now())).await.ok_or_else(cancelled)??;
+        let append_time = submitted_at.unwrap_or_else(|| self.now());
+        let position = cancellation.run_until_cancelled(database.replication.submit_source_encoded(payload, append_time)).await.ok_or_else(cancelled)??;
         if let Some(admission) = &admission {
             database.record_submission(submitted_bytes);
             let mut latest = admission.lock();
@@ -455,6 +468,9 @@ impl Node {
         let db = self.attached_database(database, placement)?;
         let latest = db.replication.await_tx(tx_id, cancellation).await?;
         if let Some(result) = &latest && !result.error().is_some_and(|error| error.code == "xtdb/assert-failed") {
+            if let Some(original) = result.error().map(rtdb_tx::private_replay_original).transpose()?.flatten() {
+                return Ok(TransactionResult::Committed { tx_key: original });
+            }
             return Ok(result.as_ref().clone());
         }
         let basis = QueryBasis { snapshot: self.snapshot_basis()?, snapshot_time: None, current_time: self.query_instant(), timezone: self.factory.options.default_timezone.clone() };
@@ -482,6 +498,9 @@ impl Node {
                         _ => return Err(Anomaly::fault("rtdb.node/tx-result-error", "Stored transaction error is not Transit")),
                     }
                 };
+                if let Some(error) = &error && let Some(original) = rtdb_tx::private_replay_original(error)? {
+                    return Ok(TransactionResult::Committed { tx_key: original });
+                }
                 if let Some(error) = &error
                     && error.code == "xtdb/assert-failed"
                     && let Some(key) = idempotency_key(&cell("user_metadata")?)
@@ -751,7 +770,12 @@ impl SessionService for NativeSessionService {
         tokio::time::timeout(timeout, database.replication.await_source(SourcePosition(position.0), cancellation)).await.map_err(|_| timeout_error())??;
         Ok(())
     }
-    async fn submit(&self, database: &str, operations: Vec<TxOp>, options: SubmitOptions, cancellation: &CancellationToken) -> Result<SubmittedTx> { self.node.submit(database, operations, options, self.identity.as_ref(), self.placement.as_ref(), cancellation).await }
+    async fn submit(&self, database: &str, operations: Vec<TxOp>, options: SubmitOptions, cancellation: &CancellationToken) -> Result<SubmittedTx> {
+        self.node.submit(database, operations, options, None, self.identity.as_ref(), self.placement.as_ref(), cancellation).await
+    }
+    async fn submit_replay(&self, database: &str, operations: Vec<TxOp>, options: SubmitOptions, permit: crate::ReplaySubmissionPermit, cancellation: &CancellationToken) -> Result<SubmittedTx> {
+        self.node.submit(database, operations, options, Some(permit), self.identity.as_ref(), self.placement.as_ref(), cancellation).await
+    }
     async fn await_transaction(&self, database: &str, tx_id: TxId, cancellation: &CancellationToken) -> Result<TransactionResult> { self.node.await_transaction_in_placement(database, tx_id, self.identity.as_ref(), self.placement.as_ref(), cancellation).await }
 }
 
