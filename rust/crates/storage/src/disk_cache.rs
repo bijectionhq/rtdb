@@ -316,6 +316,7 @@ impl ObjectStore for DiskCachedStore {
         let _operation = self.cache.begin_operation()?;
         self.cache.cancellation.run_until_cancelled(self.remote.get_fresh(key)).await.ok_or_else(cache_closed)?
     }
+    async fn get_fresh_exact(&self, key: &ObjectKey, length: usize) -> Result<Bytes> { self.remote.get_fresh_exact(key, length).await }
     async fn get_range(&self, key: &ObjectKey, range: Range<u64>) -> Result<Bytes> {
         let length = usize::try_from(range.end.checked_sub(range.start).ok_or_else(|| Error::InvalidRange { key: key.to_string(), start: range.start, end: range.end, length: 0 })?).map_err(|error| Error::Task(error.to_string()))?;
         let reservation = ReadReservation::new(length, self.cache.reserve(length)?);

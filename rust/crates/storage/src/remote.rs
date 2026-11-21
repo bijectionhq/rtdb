@@ -114,6 +114,10 @@ impl ObjectStore for RemoteStore {
         let (objects, key) = (Arc::clone(&self.objects), key.clone());
         self.io.run_async(async move { objects.get(&key).await }).await
     }
+    async fn get_fresh_exact(&self, key: &ObjectKey, length: usize) -> Result<Bytes> {
+        let (objects, key) = (Arc::clone(&self.objects), key.clone());
+        self.io.run_async(async move { objects.get_exact(&key, length).await }).await
+    }
     async fn get_range(&self, key: &ObjectKey, range: Range<u64>) -> Result<Bytes> {
         let (objects, key) = (Arc::clone(&self.objects), key.clone());
         self.io.run_async(async move { objects.get_range(&key, range).await }).await
@@ -224,6 +228,32 @@ impl RemoteObjects {
     async fn get(&self, key: &ObjectKey) -> Result<Bytes> {
         self.client.get(&self.path(key)).await.map_err(|error| provider_error(key, error))?
             .bytes().await.map_err(|error| provider_error(key, error))
+    }
+
+    async fn get_exact(&self, key: &ObjectKey, length: usize) -> Result<Bytes> {
+        let object = self.client.get(&self.path(key)).await.map_err(|error| provider_error(key, error))?;
+        let wrong_size = || crate::object_store::wrong_size(key, length);
+        if object.meta.size != length as u64 || object.range != (0..length as u64) {
+            return Err(wrong_size());
+        }
+        let mut stream = object.into_stream();
+        let first = stream.try_next().await.map_err(|error| provider_error(key, error))?.unwrap_or_default();
+        if first.len() > length { return Err(wrong_size()); }
+        if first.len() == length {
+            while let Some(chunk) = stream.try_next().await.map_err(|error| provider_error(key, error))? {
+                if !chunk.is_empty() { return Err(wrong_size()); }
+            }
+            return Ok(first);
+        }
+        let mut bytes = Vec::with_capacity(length);
+        bytes.extend_from_slice(&first);
+        drop(first);
+        while let Some(chunk) = stream.try_next().await.map_err(|error| provider_error(key, error))? {
+            if chunk.len() > length - bytes.len() { return Err(wrong_size()); }
+            bytes.extend_from_slice(&chunk);
+        }
+        if bytes.len() != length { return Err(wrong_size()); }
+        Ok(bytes.into())
     }
 
     async fn get_range(&self, key: &ObjectKey, range: Range<u64>) -> Result<Bytes> {

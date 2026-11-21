@@ -110,6 +110,16 @@ pub trait ObjectStore: Send + Sync {
     /// Reads without creating or trusting a node-local durable cache copy.
     /// Store wrappers must forward this request across any cache boundary.
     async fn get_fresh(&self, key: &ObjectKey) -> Result<Bytes> { self.get(key).await }
+    /// Reads an immutable object of the expected size without creating a durable cache entry.
+    /// Providers with response metadata can validate the size and read the body in one operation.
+    async fn get_fresh_exact(&self, key: &ObjectKey, length: usize) -> Result<Bytes> {
+        if self.head_fresh(key).await?.size != length as u64 {
+            return Err(wrong_size(key, length));
+        }
+        let bytes = self.get_fresh(key).await?;
+        if bytes.len() != length { return Err(wrong_size(key, length)); }
+        Ok(bytes)
+    }
     /// Returns exactly the half-open byte range; an unavailable range is an error.
     async fn get_range(&self, key: &ObjectKey, range: Range<u64>) -> Result<Bytes>;
     /// Whether a scan can read a slice without repeatedly loading the whole object.
@@ -141,6 +151,10 @@ pub trait ObjectStore: Send + Sync {
     }
 }
 
+pub(crate) fn wrong_size(key: &ObjectKey, length: usize) -> Error {
+    Error::Task(format!("Immutable object {key} has a different length from {length}"))
+}
+
 #[derive(Default)]
 pub struct MemoryStore {
     objects: RwLock<BTreeMap<ObjectKey, Bytes>>,
@@ -165,6 +179,12 @@ impl ObjectStore for MemoryStore {
 
     async fn get(&self, key: &ObjectKey) -> Result<Bytes> {
         self.objects.read().get(key).cloned().ok_or_else(|| Error::MissingObject(key.to_string()))
+    }
+
+    async fn get_fresh_exact(&self, key: &ObjectKey, length: usize) -> Result<Bytes> {
+        let bytes = self.get(key).await?;
+        if bytes.len() != length { return Err(wrong_size(key, length)); }
+        Ok(bytes)
     }
 
     async fn get_range(&self, key: &ObjectKey, range: Range<u64>) -> Result<Bytes> {
@@ -346,6 +366,22 @@ impl ObjectStore for LocalStore {
             let mut file = open_object(&path, &key)?;
             let mut bytes = Vec::new();
             file.read_to_end(&mut bytes).map_err(|error| Error::io(&path, error))?;
+            Ok(Bytes::from(bytes))
+        }).await
+    }
+
+    async fn get_fresh_exact(&self, key: &ObjectKey, length: usize) -> Result<Bytes> {
+        let (path, key) = (self.path(key), key.clone());
+        self.io.run(move || {
+            let mut file = open_object(&path, &key)?;
+            if file.metadata().map_err(|error| Error::io(&path, error))?.len() != length as u64 {
+                return Err(wrong_size(&key, length));
+            }
+            let mut bytes = vec![0; length];
+            file.read_exact(&mut bytes).map_err(|error| Error::io(&path, error))?;
+            if file.read(&mut [0]).map_err(|error| Error::io(&path, error))? != 0 {
+                return Err(wrong_size(&key, length));
+            }
             Ok(Bytes::from(bytes))
         }).await
     }
