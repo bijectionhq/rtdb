@@ -1,21 +1,51 @@
 use std::sync::Arc;
-use arrow_array::{Array, ArrayRef, NullArray, UnionArray, make_array};
+use arrow_array::{Array, ArrayRef, BooleanArray, NullArray, UnionArray, make_array};
 use arrow_buffer::ScalarBuffer;
+use arrow_data::ArrayData;
 use arrow_schema::{DataType, Field, UnionFields, UnionMode};
 use rtdb_types::{LogicalType as L, Result};
 use crate::{copy_array, from_field, leg_name, to_field};
 
+pub(super) fn additional_bytes(data: &ArrayData, target: &Field) -> Result<usize> {
+    let null_bytes = |target: &Field| {
+        crate::estimate_builder_bytes_refs(&from_field(target)?.maybe(), std::iter::repeat_n(&rtdb_types::Value::Null, data.len()))
+    };
+    match (data.data_type(), target.data_type()) {
+        (_, DataType::Union(..)) => super::add(super::multiply(data.len(), 64)?, data.get_slice_memory_size().map_err(crate::arrow_error)?),
+        (DataType::Null, _) => null_bytes(target),
+        (DataType::Struct(source), DataType::Struct(target)) => target.iter().try_fold(0, |bytes, field| {
+            let extra = match source.iter().position(|original| original.name() == field.name()) {
+                Some(index) => additional_bytes(&data.child_data()[index], field)?,
+                None => null_bytes(field)?,
+            };
+            super::add(bytes, extra)
+        }),
+        (DataType::List(_), DataType::List(field)) | (DataType::FixedSizeList(..), DataType::FixedSizeList(field, _))
+        | (DataType::Map(..), DataType::Map(field, _)) => additional_bytes(&data.child_data()[0], field),
+        _ => Ok(0),
+    }
+}
+
 pub(super) fn relayout(array: ArrayRef, source: &Field, target: &Field) -> Result<(Field, ArrayRef)> {
     if let DataType::Union(fields, UnionMode::Dense) = target.data_type() {
         return union(array, source, target, fields);
+    }
+    if source.data_type() == &DataType::Null && target.data_type() != &DataType::Null {
+        let field = target.clone().with_nullable(true);
+        return Ok((field, arrow_array::new_null_array(target.data_type(), array.len())));
     }
     let data = array.to_data();
     let mut children = Vec::with_capacity(data.child_data().len());
     let data_type = match (source.data_type(), target.data_type()) {
         (DataType::Struct(source_fields), DataType::Struct(target_fields)) => {
             let fields = target_fields.iter().map(|target| {
-                let index = source_fields.iter().position(|source| source.name() == target.name()).ok_or_else(incompatible)?;
-                let (field, child) = relayout(make_array(data.child_data()[index].clone()), &source_fields[index], target)?;
+                let (field, child) = match source_fields.iter().position(|source| source.name() == target.name()) {
+                    Some(index) => relayout(make_array(data.child_data()[index].clone()), &source_fields[index], target)?,
+                    None => {
+                        let null = Field::new(target.name(), DataType::Null, true);
+                        relayout(Arc::new(NullArray::new(data.len())), &null, target)?
+                    }
+                };
                 children.push(child.to_data());
                 Ok(field)
             }).collect::<Result<Vec<_>>>()?;
@@ -55,9 +85,10 @@ pub(super) fn relayout(array: ArrayRef, source: &Field, target: &Field) -> Resul
 fn union(array: ArrayRef, source: &Field, target: &Field, targets: &UnionFields) -> Result<(Field, ArrayRef)> {
     let canonical = array.as_any().downcast_ref::<UnionArray>();
     let source_fields = match source.data_type() { DataType::Union(fields, UnionMode::Dense) => Some(fields), _ => None };
-    let source_leg = if source_fields.is_none() {
-        from_field(source)?.legs().into_iter().find(|leg| !matches!(leg, L::Null | L::Nothing)).map(|leg| leg_name(&leg)).transpose()?
-    } else { None };
+    let source_type = if source_fields.is_none() { from_field(source)?.legs().into_iter().find(|leg| !matches!(leg, L::Null | L::Nothing)) } else { None };
+    let source_leg = source_type.as_ref().map(leg_name).transpose()?;
+    let scalar = matches!(source_type, Some(L::Scalar(_)));
+    let valid = array.nulls().filter(|nulls| scalar && nulls.null_count() > 0);
     let mut fields = Vec::with_capacity(targets.len());
     let mut children = Vec::with_capacity(targets.len());
     let mut mappings = Vec::with_capacity(targets.len());
@@ -76,7 +107,11 @@ fn union(array: ArrayRef, source: &Field, target: &Field, targets: &UnionFields)
             (to_field(target_field.name(), &L::Null)?, Arc::new(NullArray::new(array.len())) as ArrayRef)
         } else if source_leg.as_deref() == Some(name.as_str()) {
             nonnull_id = Some(target_id);
-            (source.clone(), Arc::clone(&array))
+            let child = match valid {
+                Some(valid) => arrow_select::filter::filter(array.as_ref(), &BooleanArray::new(valid.inner().clone(), None)).map_err(crate::arrow_error)?,
+                None => Arc::clone(&array),
+            };
+            (source.clone().with_nullable(source.is_nullable() && !scalar), child)
         } else { (to_field(target_field.name(), &logical)?, copy_array(&logical, &[])?) };
         let (field, child) = relayout(child, &source_field, target_field)?;
         fields.push((target_id, field));
@@ -84,12 +119,17 @@ fn union(array: ArrayRef, source: &Field, target: &Field, targets: &UnionFields)
     }
     let mut ids = Vec::with_capacity(array.len());
     let mut offsets = Vec::with_capacity(array.len());
+    let mut value_offset = 0;
     for row in 0..array.len() {
         let (id, offset) = if let Some(source) = canonical {
             let id = mappings.iter().find(|(id, _)| *id == source.type_id(row)).map(|(_, target)| *target).ok_or_else(incompatible)?;
             (id, source.value_offset(row))
+        } else if array.data_type() == &DataType::Null || array.is_null(row) {
+            (null_id.ok_or_else(incompatible)?, row)
         } else {
-            (if array.is_null(row) { null_id } else { nonnull_id }.ok_or_else(incompatible)?, row)
+            let offset = if valid.is_some() { value_offset } else { row };
+            value_offset += 1;
+            (nonnull_id.ok_or_else(incompatible)?, offset)
         };
         ids.push(id);
         offsets.push(i32::try_from(offset).map_err(|_| super::fault("page-allocation-size", "Union child exceeds i32 offsets"))?);

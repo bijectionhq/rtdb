@@ -10,13 +10,14 @@ use rtdb_format::envelope::{SourceBody, SourceMessage};
 use prost::Message;
 use rtdb_types::{Anomaly, EntityId, Iid, LogicalType, Result, ScalarType, TableRef, TimeUnit, Timestamp, Value};
 
-use crate::{Documents, EntityIds, RetainedBytes, SqlArguments, SubmitOptions, TxOp, UserMetadata};
+use crate::{ArrowDocuments, Documents, EntityIds, RetainedBytes, SqlArguments, SubmitOptions, TxOp, UserMetadata};
 use crate::values::DecodedDocumentLayout;
 
 #[derive(Clone, Debug)]
 pub(crate) enum Operation {
     Public(TxOp),
     PutIids { table: TableRef, documents: Documents, iids: Vec<Iid>, valid_from: Option<Timestamp>, valid_to: Option<Timestamp> },
+    PutArrowIids { table: TableRef, documents: ArrowDocuments, iids: Vec<Iid>, valid_from: Option<Timestamp>, valid_to: Option<Timestamp> },
     PatchIids { table: TableRef, documents: Documents, iids: Vec<Iid>, valid_from: Option<Timestamp>, valid_to: Option<Timestamp> },
     Removed(String),
 }
@@ -38,8 +39,8 @@ impl SourceTransaction {
         for operation in &operations {
             let (text, table, ids) = match operation {
                 Operation::Public(TxOp::Sql { sql, .. } | TxOp::SqlBytes { sql, .. }) => (sql.capacity(), None, 0),
-                Operation::Public(TxOp::PutDocs { table, .. } | TxOp::PatchDocs { table, .. } | TxOp::DeleteDocs { table, .. } | TxOp::EraseDocs { table, .. }) => (0, Some(table), 0),
-                Operation::PutIids { table, iids, .. } | Operation::PatchIids { table, iids, .. } => (0, Some(table), iids.capacity().checked_mul(16).ok_or_else(overflow)?),
+                Operation::Public(TxOp::PutDocs { table, .. } | TxOp::PutArrowDocs { table, .. } | TxOp::PatchDocs { table, .. } | TxOp::DeleteDocs { table, .. } | TxOp::EraseDocs { table, .. }) => (0, Some(table), 0),
+                Operation::PutIids { table, iids, .. } | Operation::PutArrowIids { table, iids, .. } | Operation::PatchIids { table, iids, .. } => (0, Some(table), iids.capacity().checked_mul(16).ok_or_else(overflow)?),
                 Operation::Removed(name) => (name.capacity(), None, 0),
             };
             bytes = bytes.checked_add(text).and_then(|size| size.checked_add(ids)).and_then(|size| size.checked_add(table.map_or(0, |table| table.schema.capacity() + table.table.capacity()))).and_then(|size| size.checked_add(256)).ok_or_else(overflow)?;
@@ -121,8 +122,11 @@ impl SourceTransaction {
         let scratch = self.operations.iter().try_fold(65_536usize, |bytes, operation| {
             let extra = match operation {
                 Operation::Public(TxOp::PutDocs { documents, .. } | TxOp::PatchDocs { documents, .. }) | Operation::PutIids { documents, .. } | Operation::PatchIids { documents, .. } => documents.rows().iter().try_fold(0usize, |bytes, document| bytes.checked_add(Value::document_retained_bytes(document)?).ok_or_else(overflow))?,
+                Operation::Public(TxOp::PutArrowDocs { documents, .. }) | Operation::PutArrowIids { documents, .. } => {
+                    documents.array().len().checked_mul(64).ok_or_else(overflow)?
+                }
                 Operation::Public(TxOp::Sql { sql, args }) => {
-                    let rows = args.as_ref().map(|args| args.rows().flatten().try_fold(0usize, |bytes, value| bytes.checked_add(value.retained_bytes()?).ok_or_else(overflow))).transpose()?.unwrap_or(0);
+                    let rows = args.as_ref().map(SqlArguments::value_bytes).transpose()?.unwrap_or(0);
                     rows.checked_add(sql.capacity()).ok_or_else(overflow)?
                 }
                 Operation::Public(TxOp::SqlBytes { sql, arg_bytes }) => sql.capacity().checked_add(arg_bytes.as_slice().len()).ok_or_else(overflow)?,
@@ -146,7 +150,7 @@ impl SourceTransaction {
             })
         })?;
         let mut arrays = BatchBuilder::new(metadata_bound, &self.memory)?;
-        let union = named_union(entries, |leg| operation_leg(leg, &mut arrays))?;
+        let union = named_union(entries, |leg| operation_leg(leg, &mut arrays, &self.memory))?;
         let schema = Arc::new(Schema::new(vec![Field::new("tx-ops", union.data_type().clone(), false)]));
         let batch = RecordBatch::try_new(schema, vec![union]).map_err(|error| invalid(error.to_string()))?;
         arrays.finish(batch)
@@ -155,7 +159,15 @@ impl SourceTransaction {
 
 struct SourceOperation<'a> {
     body: StructFields<Value>,
-    documents: Option<(String, &'a Documents)>,
+    documents: Option<(String, SourceDocuments<'a>)>,
+}
+
+enum SourceDocuments<'a> { Rows(&'a Documents), Arrow(&'a ArrowDocuments) }
+
+impl SourceDocuments<'_> {
+    fn columns(&self) -> &[String] {
+        match self { Self::Rows(documents) => documents.columns(), Self::Arrow(documents) => documents.columns() }
+    }
 }
 
 fn operation_value<'a>(operation: &'a Operation, memory: &Arc<MemoryBudget>) -> Result<(String, SourceOperation<'a>)> {
@@ -178,13 +190,29 @@ fn operation_value<'a>(operation: &'a Operation, memory: &Arc<MemoryBudget>) -> 
             }).collect::<Result<_>>()?;
             body.insert("iids".into(), Value::List(iids));
             time_fields(&mut body, *valid_from, *valid_to);
-            docs = Some((table_name(table), documents));
+            docs = Some((table_name(table), SourceDocuments::Rows(documents)));
             if matches!(operation, Operation::Public(TxOp::PatchDocs { .. })) { "patch-docs" } else { "put-docs" }
+        }
+        Operation::Public(TxOp::PutArrowDocs { table, documents }) => {
+            let reader = documents.id_reader()?;
+            let iids = (0..documents.array().len()).map(|row| {
+                documents.iid(row, reader.as_ref(), memory).map(|iid| Value::FixedSizeBinary(iid.0.to_vec()))
+            }).collect::<Result<_>>()?;
+            body.insert("iids".into(), Value::List(iids));
+            time_fields(&mut body, None, None);
+            docs = Some((table_name(table), SourceDocuments::Arrow(documents)));
+            "put-docs"
+        }
+        Operation::PutArrowIids { table, documents, iids, valid_from, valid_to } => {
+            body.insert("iids".into(), Value::List(iids.iter().map(|iid| Value::FixedSizeBinary(iid.0.to_vec())).collect()));
+            time_fields(&mut body, *valid_from, *valid_to);
+            docs = Some((table_name(table), SourceDocuments::Arrow(documents)));
+            "put-docs"
         }
         Operation::PutIids { table, documents, iids, valid_from, valid_to } | Operation::PatchIids { table, documents, iids, valid_from, valid_to } => {
             body.insert("iids".into(), Value::List(iids.iter().map(|iid| Value::FixedSizeBinary(iid.0.to_vec())).collect()));
             time_fields(&mut body, *valid_from, *valid_to);
-            docs = Some((table_name(table), documents));
+            docs = Some((table_name(table), SourceDocuments::Rows(documents)));
             if matches!(operation, Operation::PatchIids { .. }) { "patch-docs" } else { "put-docs" }
         }
         Operation::Public(TxOp::DeleteDocs { table, ids, valid_from, valid_to }) => {
@@ -245,7 +273,7 @@ fn named_union<T>(
     Ok(Arc::new(UnionArray::try_new(UnionFields::new((0..fields.len()).map(|id| id as i8), fields), ScalarBuffer::from(ids), Some(ScalarBuffer::from(offsets)), children).map_err(|error| invalid(error.to_string()))?))
 }
 
-fn operation_leg(values: Vec<SourceOperation<'_>>, arrays: &mut BatchBuilder) -> Result<ArrayRef> {
+fn operation_leg(values: Vec<SourceOperation<'_>>, arrays: &mut BatchBuilder, memory: &Arc<MemoryBudget>) -> Result<ArrayRef> {
     let (values, documents): (Vec<_>, Vec<_>) = values.into_iter().map(|value| (value.body, value.documents)).unzip();
     let types = values.iter().map(|value| LogicalType::Struct(value.iter().map(|(name, value)| (name.clone(), value.logical_type())).collect())).collect::<Vec<_>>();
     let LogicalType::Struct(mut types) = LogicalType::join_all(&types) else { return Err(invalid("Transaction operation leg has no struct layout")); };
@@ -271,7 +299,7 @@ fn operation_leg(values: Vec<SourceOperation<'_>>, arrays: &mut BatchBuilder) ->
         fields.push(Arc::new(to_field(&name, &ty)?));
         if name == "iids" {
             if let Some(documents) = documents.take() {
-                let documents = named_union(documents.into_iter().flatten(), |leg| document_leg(leg, arrays))?;
+                let documents = named_union(documents.into_iter().flatten(), |leg| document_leg(leg, arrays, memory))?;
                 fields.push(Arc::new(Field::new("documents", documents.data_type().clone(), false)));
                 columns.push(documents);
             }
@@ -281,7 +309,146 @@ fn operation_leg(values: Vec<SourceOperation<'_>>, arrays: &mut BatchBuilder) ->
     rtdb_columnar::build_struct_array(fields.into(), &columns, values.len(), None).map_err(|error| invalid(error.to_string()))
 }
 
-fn document_leg(lists: Vec<&Documents>, arrays: &mut BatchBuilder) -> Result<ArrayRef> {
+fn document_leg(lists: Vec<SourceDocuments<'_>>, arrays: &mut BatchBuilder, memory: &Arc<MemoryBudget>) -> Result<ArrayRef> {
+    let arrow = lists.iter().map(|list| match list {
+        SourceDocuments::Arrow(documents) => Some(documents.array()),
+        SourceDocuments::Rows(_) => None,
+    }).collect::<Option<Vec<_>>>();
+    if let Some(pages) = arrow && let Some(leg) = arrow_document_leg(&pages, arrays)? {
+        return Ok(leg);
+    }
+    let rows = lists.iter().map(|list| match list {
+        SourceDocuments::Rows(documents) => Ok((*documents).clone()),
+        SourceDocuments::Arrow(documents) => documents.to_rows(false, memory),
+    }).collect::<Result<Vec<_>>>()?;
+    row_document_leg(rows.iter().collect(), arrays)
+}
+
+fn arrow_document_leg(pages: &[&StructArray], arrays: &mut BatchBuilder) -> Result<Option<ArrayRef>> {
+    let Some(first) = pages.first() else { return Ok(None); };
+    let mut offsets = vec![0i32];
+    for page in pages {
+        let length = i32::try_from(page.len()).map_err(|_| overflow())?;
+        offsets.push(offsets.last().unwrap().checked_add(length).ok_or_else(overflow)?);
+    }
+    if pages.len() == 1 {
+        let bound = first.get_array_memory_size().checked_add(4096).ok_or_else(overflow)?;
+        let structs = arrays.column(bound, || Ok(Arc::new((*first).clone())))?;
+        return document_list(structs, offsets).map(Some);
+    }
+
+    let mut layout = StructFields::<Field>::new();
+    for page in pages {
+        for field in page.fields() {
+            let Some(previous) = layout.get(field.name()) else {
+                layout.insert(field.name().clone(), field.as_ref().clone());
+                continue;
+            };
+            let merged = if previous.data_type() == field.data_type() && previous.metadata() == field.metadata() {
+                previous.clone().with_nullable(previous.is_nullable() || field.is_nullable())
+            } else if previous.data_type() == &DataType::Null && previous.is_nullable() {
+                field.as_ref().clone().with_nullable(true)
+            } else if field.data_type() == &DataType::Null && field.is_nullable() {
+                previous.clone().with_nullable(true)
+            } else if let Some(merged) = merge_document_fields(previous, field)? {
+                merged
+            } else {
+                return Ok(None);
+            };
+            layout.insert(field.name().clone(), merged);
+        }
+    }
+    let mut output_layout = Vec::with_capacity(layout.len());
+    for (name, field) in layout {
+        let nullable = field.is_nullable() || pages.iter().any(|page| page.column_by_name(&name).is_none());
+        let field = if nullable && matches!(field.data_type(), DataType::Union(..)) {
+            let Some(logical) = document_relayout_type(&field)? else { return Ok(None) };
+            to_field(name, &logical.maybe())?
+        } else {
+            field.with_nullable(nullable)
+        };
+        output_layout.push(field);
+    }
+    let mut fields = Vec::with_capacity(output_layout.len());
+    let mut columns = Vec::with_capacity(output_layout.len());
+    for field in output_layout {
+        let union = matches!(field.data_type(), DataType::Union(..));
+        let inputs: Vec<_> = pages.iter().map(|page| {
+            page.fields().iter().zip(page.columns()).find(|(source, _)| source.name() == field.name())
+                .filter(|(source, _)| union || source.data_type() != &DataType::Null || field.data_type() == &DataType::Null)
+        }).collect();
+        let logical = from_field(&field)?;
+        let bound = pages.iter().zip(&inputs).try_fold(4096usize, |bytes, (page, column)| {
+            let size = match column {
+                Some((source, column)) => {
+                    let size = column.get_array_memory_size();
+                    if source.data_type() == field.data_type() { size } else {
+                        size.checked_add(rtdb_columnar::arrow_relayout_bound(column.as_ref(), &field)?).ok_or_else(overflow)?
+                    }
+                }
+                None => estimate_builder_bytes_refs(&logical, std::iter::repeat_n(&Value::Null, page.len()))?,
+            };
+            size.checked_mul(4).and_then(|size| bytes.checked_add(size)).ok_or_else(overflow)
+        })?;
+        columns.push(arrays.column(bound, || {
+            let inputs = pages.iter().zip(inputs).map(|(page, column)| {
+                match column {
+                    Some((source, column)) if source.data_type() == field.data_type() => Ok(Arc::clone(column)),
+                    Some((source, column)) => rtdb_columnar::relayout_arrow_column(Arc::clone(column), source, &field).map(|(_, column)| column),
+                    None if union => {
+                        let null = Field::new(field.name(), DataType::Null, true);
+                        let array = Arc::new(arrow_array::NullArray::new(page.len()));
+                        rtdb_columnar::relayout_arrow_column(array, &null, &field).map(|(_, column)| column)
+                    }
+                    None => Ok(arrow_array::new_null_array(field.data_type(), page.len())),
+                }
+            }).collect::<Result<Vec<_>>>()?;
+            let inputs = inputs.iter().map(|array| array.as_ref()).collect::<Vec<_>>();
+            arrow_select::concat::concat(&inputs).map_err(|error| invalid(error.to_string()))
+        })?);
+        fields.push(Arc::new(field));
+    }
+    let structs = rtdb_columnar::build_struct_array(fields.into(), &columns, *offsets.last().unwrap() as usize, None)?;
+    document_list(structs, offsets).map(Some)
+}
+
+fn merge_document_fields(left: &Field, right: &Field) -> Result<Option<Field>> {
+    let (Some(left), Some(right_type)) = (document_relayout_type(left)?, document_relayout_type(right)?) else {
+        return Ok(None);
+    };
+    let joint = left.join(&right_type);
+    if !document_relayout_supported(&joint) { return Ok(None); }
+    to_field(right.name(), &joint).map(Some)
+}
+
+fn document_relayout_type(field: &Field) -> Result<Option<LogicalType>> {
+    fn supported_field(field: &Field) -> bool {
+        field.metadata().is_empty() && match field.data_type() {
+            DataType::Struct(fields) => fields.iter().all(|field| supported_field(field)),
+            DataType::List(field) => supported_field(field),
+            DataType::Union(fields, UnionMode::Dense) => fields.iter().all(|(_, field)| {
+                field.metadata().is_empty() && (!field.is_nullable() || field.data_type() == &DataType::Null)
+            }),
+            _ => true,
+        }
+    }
+    if !supported_field(field) { return Ok(None); }
+    let logical = from_field(field)?;
+    Ok(document_relayout_supported(&logical).then_some(logical))
+}
+
+fn document_relayout_supported(logical: &LogicalType) -> bool {
+    match logical {
+        LogicalType::Maybe(value) => document_relayout_supported(value),
+        LogicalType::Struct(fields) => fields.values().all(document_relayout_supported),
+        LogicalType::List { kind: rtdb_types::ListKind::List, element } => document_relayout_supported(element),
+        LogicalType::Union(legs) => legs.iter().all(|leg| matches!(leg, LogicalType::Scalar(_) | LogicalType::Null)),
+        LogicalType::Scalar(_) | LogicalType::Null | LogicalType::Nothing => true,
+        _ => false,
+    }
+}
+
+fn row_document_leg(lists: Vec<&Documents>, arrays: &mut BatchBuilder) -> Result<ArrayRef> {
     let mut fields = BTreeMap::<&str, (LogicalType, usize)>::new();
     let mut order = Vec::new();
     let mut offsets = vec![0i32];
@@ -323,6 +490,10 @@ fn document_leg(lists: Vec<&Documents>, arrays: &mut BatchBuilder) -> Result<Arr
         schema.push(Arc::new(to_field(name, &ty)?));
     }
     let structs = rtdb_columnar::build_struct_array(schema.into(), &columns, length, None).map_err(|error| invalid(error.to_string()))?;
+    document_list(structs, offsets)
+}
+
+fn document_list(structs: ArrayRef, offsets: Vec<i32>) -> Result<ArrayRef> {
     let field = Arc::new(Field::new("$data$", structs.data_type().clone(), false));
     Ok(Arc::new(ListArray::try_new(field, OffsetBuffer::new(ScalarBuffer::from(offsets)), structs, None).map_err(|error| invalid(error.to_string()))?))
 }
@@ -413,16 +584,20 @@ impl SourceOperationReader<'_> {
                 if lists.is_null(docs_offset) { return Err(invalid("Documents are not a list")); }
                 let rows = lists.value(docs_offset);
                 let structs = rows.as_any().downcast_ref::<StructArray>().ok_or_else(|| invalid("Document is not a struct"))?;
+                let valid_from = optional_timestamp(value("_valid_from")?)?;
+                let valid_to = optional_timestamp(value("_valid_to")?)?;
+                let iids = match value("iids")? { Value::Null | Value::Undefined => None, values => Some(iids(values)?) };
+                if iids.as_ref().is_some_and(|iids| iids.len() != structs.len()) { return Err(invalid("Document and IID counts differ")); }
                 let identity = structs.fields().as_ptr() as usize;
                 let layout = match self.layouts.entry(identity) {
                     std::collections::btree_map::Entry::Occupied(layout) => Arc::clone(layout.get()),
                     std::collections::btree_map::Entry::Vacant(layout) => Arc::clone(layout.insert(DecodedDocumentLayout::new(structs.fields(), memory)?)),
                 };
+                if name == "put-docs" && iids.is_some()
+                    && let Some(documents) = ArrowDocuments::from_source(structs, Arc::clone(&layout)) {
+                    return Ok(Operation::PutArrowIids { table, documents, iids: iids.expect("put contains IIDs"), valid_from, valid_to });
+                }
                 let documents = Documents::read_arrow(structs, layout, name == "put-docs", memory)?;
-                let valid_from = optional_timestamp(value("_valid_from")?)?;
-                let valid_to = optional_timestamp(value("_valid_to")?)?;
-                let iids = match value("iids")? { Value::Null | Value::Undefined => None, values => Some(iids(values)?) };
-                if iids.as_ref().is_some_and(|iids| iids.len() != documents.rows().len()) { return Err(invalid("Document and IID counts differ")); }
                 if name == "put-docs" {
                     if let Some(iids) = iids { return Ok(Operation::PutIids { table, documents, iids, valid_from, valid_to }); }
                     TxOp::PutDocs { table, documents, valid_from, valid_to }
@@ -444,15 +619,37 @@ impl SourceOperationReader<'_> {
 }
 
 pub(crate) fn encode_arguments(arguments: &SqlArguments, memory: &Arc<MemoryBudget>) -> Result<RetainedBytes> {
+    if let Some(pages) = arguments.uniform_arrow_pages() {
+        let first = pages[0];
+        let _reservation = memory.reserve(pages.iter().try_fold(4096usize, |bytes, page| {
+            page.get_array_memory_size().checked_mul(4).and_then(|size| bytes.checked_add(size)).ok_or_else(overflow)
+        })?)?;
+        let fields = first.schema_ref().fields().iter().enumerate().map(|(index, field)| {
+            field.as_ref().clone().with_name(format!("?_{index}"))
+        }).collect::<Vec<_>>();
+        let schema = Arc::new(Schema::new(fields));
+        let combined;
+        let page = if pages.len() == 1 {
+            first
+        } else {
+            combined = arrow_select::concat::concat_batches(first.schema_ref(), pages).map_err(|error| invalid(error.to_string()))?;
+            &combined
+        };
+        let options = arrow_array::RecordBatchOptions::new().with_row_count(Some(page.num_rows()));
+        let page = RecordBatch::try_new_with_options(Arc::clone(&schema), page.columns().to_vec(), &options)
+            .map_err(|error| invalid(error.to_string()))?;
+        return crate::ipc::encode(&schema, [&page], memory);
+    }
+    let rows = arguments.rows().collect::<Result<Vec<_>>>()?;
     let bound = arguments.types().iter().enumerate().try_fold(4096usize, |bytes, (index, ty)| {
-        bytes.checked_add(rtdb_columnar::estimate_builder_bytes_refs(ty, arguments.rows().map(|row| &row[index]))?).ok_or_else(overflow)
+        bytes.checked_add(rtdb_columnar::estimate_builder_bytes_refs(ty, rows.iter().map(|row| &row[index]))?).ok_or_else(overflow)
     })?;
     let reservation = memory.reserve(bound)?;
     let mut fields = Vec::new();
     let mut arrays = Vec::new();
     for (index, ty) in arguments.types().iter().enumerate() {
         fields.push(to_field(&format!("?_{index}"), ty)?);
-        arrays.push(copy_array(ty, &arguments.rows().map(|row| row[index].clone()).collect::<Vec<_>>())?);
+        arrays.push(copy_array(ty, &rows.iter().map(|row| row[index].clone()).collect::<Vec<_>>())?);
     }
     let options = arrow_array::RecordBatchOptions::new().with_row_count(Some(arguments.row_count()));
     let batch = RecordBatch::try_new_with_options(Arc::new(Schema::new(fields)), arrays, &options).map_err(|error| invalid(error.to_string()))?;
@@ -469,12 +666,16 @@ pub(crate) fn decode_arguments(bytes: &[u8], memory: &Arc<MemoryBudget>) -> Resu
             return Err(Anomaly::incorrect("xtdb/invalid-param-names", "SQL argument fields must follow positional order"));
         }
     }
-    let types = schema.fields().iter().map(|field| from_field(field)).collect::<Result<_>>()?;
-    let mut arguments = SqlArguments::new(types, Vec::new(), memory)?;
-    for page in stream.pages() {
+    let mut pages = stream.pages().iter();
+    let Some(first) = pages.next() else {
+        let types = schema.fields().iter().map(|field| from_field(field)).collect::<Result<Vec<_>>>()?;
+        return SqlArguments::new(types, Vec::new(), memory);
+    };
+    if first.batch().schema() != schema { return Err(invalid("SQL argument stream changes schema")); }
+    let mut arguments = SqlArguments::from_arrow(first.clone(), memory)?;
+    for page in pages {
         if page.batch().schema() != schema { return Err(invalid("SQL argument stream changes schema")); }
-        let rows = (0..page.batch().num_rows()).map(|row| schema.fields().iter().enumerate().map(|(column, field)| read_value(field, page.batch().column(column).as_ref(), row)).collect::<Result<Vec<_>>>()).collect::<Result<Vec<_>>>()?;
-        arguments.append_page(SqlArguments::new(arguments.types().to_vec(), rows, memory)?)?;
+        arguments.append_page(SqlArguments::from_arrow(page.clone(), memory)?)?;
     }
     Ok(arguments)
 }
@@ -530,8 +731,8 @@ pub(crate) fn is_reserved_write_schema(schema: &str) -> bool {
 }
 fn check_writable_table(operation: &Operation) -> Result<()> {
     let table = match operation {
-        Operation::Public(TxOp::PutDocs { table, .. } | TxOp::PatchDocs { table, .. } | TxOp::DeleteDocs { table, .. } | TxOp::EraseDocs { table, .. })
-        | Operation::PutIids { table, .. } | Operation::PatchIids { table, .. } => table,
+        Operation::Public(TxOp::PutDocs { table, .. } | TxOp::PutArrowDocs { table, .. } | TxOp::PatchDocs { table, .. } | TxOp::DeleteDocs { table, .. } | TxOp::EraseDocs { table, .. })
+        | Operation::PutIids { table, .. } | Operation::PutArrowIids { table, .. } | Operation::PatchIids { table, .. } => table,
         _ => return Ok(()),
     };
     parse_table(&table_name(table))?;
@@ -561,6 +762,212 @@ mod tests {
     }
 
     #[test]
+    fn arrow_sql_arguments_keep_their_buffers_and_replay_with_positional_fields() {
+        let memory = budget();
+        let schema = Arc::new(Schema::new(vec![Field::new("client_name", DataType::UInt64, true)]));
+        let arguments = |values| {
+            let column = Arc::new(arrow_array::UInt64Array::from(values));
+            let batch = RecordBatch::try_new(Arc::clone(&schema), vec![column]).unwrap();
+            let data = batch.column(0).to_data();
+            let batch = OwnedBatch::new(batch, &memory).unwrap();
+            let arguments = SqlArguments::from_arrow(batch, &memory).unwrap();
+            let pages = arguments.uniform_arrow_pages().unwrap();
+            assert_eq!(pages[0].column(0).to_data().buffers()[0].as_ptr(), data.buffers()[0].as_ptr());
+            arguments
+        };
+        let mut arguments = arguments(vec![Some(u64::MAX), None]);
+        let other = RecordBatch::try_new(schema, vec![Arc::new(arrow_array::UInt64Array::from(vec![5]))]).unwrap();
+        arguments.append(SqlArguments::from_arrow(OwnedBatch::new(other, &memory).unwrap(), &memory).unwrap()).unwrap();
+        let source = SourceTransaction::new(
+            vec![TxOp::Sql { sql: "UPDATE docs SET v = ?".into(), args: Some(arguments) }],
+            SubmitOptions::default(),
+            &memory,
+        ).unwrap();
+
+        let replayed = roundtrip(&source);
+
+        let [Operation::Public(TxOp::Sql { args: Some(arguments), .. })] = replayed.operations.as_slice() else {
+            panic!("Expected SQL arguments");
+        };
+        let pages = arguments.uniform_arrow_pages().unwrap();
+        assert_eq!(pages.len(), 1);
+        assert_eq!(pages[0].schema_ref().field(0).name(), "?_0");
+        assert_eq!(pages[0].schema_ref().field(0).data_type(), &DataType::UInt64);
+        let rows: Vec<_> = arguments.indexed_rows().map(|row| {
+            let (index, values) = row.unwrap();
+            (index, values[0].clone())
+        }).collect();
+        assert_eq!(rows, [(0, Value::U64(u64::MAX)), (1, Value::Null), (2, Value::U64(5))]);
+    }
+
+    #[test]
+    fn an_arrow_put_matches_the_source_codec_for_the_same_documents() {
+        let memory = budget();
+        let schema = Arc::new(Schema::new(vec![Field::new("_id", DataType::Int64, true), Field::new("v", DataType::Utf8, true)]));
+        let batch = RecordBatch::try_new(schema, vec![
+            Arc::new(arrow_array::Int64Array::from(vec![1, 2])),
+            Arc::new(arrow_array::StringArray::from(vec![Some("text"), None])),
+        ]).unwrap();
+        let table = TableRef::new("public", "docs");
+        let rows = vec![
+            StructFields::from([("_id".into(), Value::I64(1)), ("v".into(), Value::Utf8("text".into()))]),
+            StructFields::from([("_id".into(), Value::I64(2)), ("v".into(), Value::Null)]),
+        ];
+        let row_put = SourceTransaction::new(vec![TxOp::PutDocs {
+            table: table.clone(), documents: Documents::new(rows, &memory).unwrap(),
+            valid_from: None, valid_to: None,
+        }], SubmitOptions::default(), &memory).unwrap();
+        let batch = OwnedBatch::new(batch, &memory).unwrap();
+        let documents = ArrowDocuments::from_batch(&batch, &memory).unwrap().unwrap();
+        let arrow_put = SourceTransaction::new(vec![TxOp::PutArrowDocs { table, documents }], SubmitOptions::default(), &memory).unwrap();
+
+        assert_eq!(row_put.encode().unwrap().as_slice(), arrow_put.encode().unwrap().as_slice());
+        let replayed = roundtrip(&arrow_put);
+        let [Operation::PutArrowIids { documents, iids, .. }] = replayed.operations.as_slice() else { panic!("expected columnar replay"); };
+        assert_eq!(documents.array().len(), 2);
+        assert_eq!(iids, &[EntityId::Integer(1).iid(), EntityId::Integer(2).iid()]);
+    }
+
+    #[test]
+    fn arrow_document_batches_combine_missing_columns_in_first_seen_order() {
+        let memory = budget();
+        let first = StructArray::try_new(
+            vec![Field::new("a", DataType::Utf8, false), Field::new("_id", DataType::Int64, false)].into(),
+            vec![Arc::new(arrow_array::StringArray::from(vec!["left"])), Arc::new(arrow_array::Int64Array::from(vec![1]))],
+            None,
+        ).unwrap();
+        let second = StructArray::try_new(
+            vec![Field::new("_id", DataType::Int64, false), Field::new("b", DataType::Boolean, false)].into(),
+            vec![Arc::new(arrow_array::Int64Array::from(vec![2])), Arc::new(arrow_array::BooleanArray::from(vec![true]))],
+            None,
+        ).unwrap();
+        let mut arrays = BatchBuilder::new(4096, &memory).unwrap();
+
+        let result = arrow_document_leg(&[&first, &second], &mut arrays).unwrap().unwrap();
+
+        let lists = result.as_any().downcast_ref::<ListArray>().unwrap();
+        assert_eq!(lists.value_offsets(), &[0, 1, 2]);
+        let values = lists.values().as_any().downcast_ref::<StructArray>().unwrap();
+        assert_eq!(values.fields().iter().map(|field| field.name().as_str()).collect::<Vec<_>>(), ["a", "_id", "b"]);
+        assert_eq!(read_value(&values.fields()[0], values.column(0).as_ref(), 0).unwrap(), Value::Utf8("left".into()));
+        assert!(values.column(0).is_null(1));
+        assert!(values.column(2).is_null(0));
+        assert_eq!(read_value(&values.fields()[2], values.column(2).as_ref(), 1).unwrap(), Value::Bool(true));
+    }
+
+    #[test]
+    fn arrow_puts_with_different_scalar_types_replay_as_dense_unions() {
+        let memory = budget();
+        let put = |id, value: ArrayRef| {
+            let schema = Arc::new(Schema::new(vec![
+                Field::new("_id", DataType::Int64, false),
+                Field::new("v", value.data_type().clone(), false),
+            ]));
+            let batch = RecordBatch::try_new(schema, vec![Arc::new(arrow_array::Int64Array::from(vec![id])), value]).unwrap();
+            let batch = OwnedBatch::new(batch, &memory).unwrap();
+            let documents = ArrowDocuments::from_batch(&batch, &memory).unwrap().unwrap();
+            TxOp::PutArrowDocs { table: TableRef::new("public", "docs"), documents }
+        };
+        let source = SourceTransaction::new(vec![
+            put(1, Arc::new(arrow_array::Int64Array::from(vec![7]))),
+            put(2, Arc::new(arrow_array::StringArray::from(vec!["text"]))),
+        ], SubmitOptions::default(), &memory).unwrap();
+
+        let replay = roundtrip(&source);
+
+        let expected = [Value::I64(7), Value::Utf8("text".into())];
+        for (operation, expected) in replay.operations.iter().zip(expected) {
+            let Operation::PutArrowIids { documents, .. } = operation else {
+                panic!("Expected Arrow documents on replay");
+            };
+            let array = documents.array().column_by_name("v").unwrap();
+            let field = documents.array().fields().iter().find(|field| field.name() == "v").unwrap();
+            assert!(array.as_any().is::<UnionArray>());
+            assert_eq!(read_value(field, array.as_ref(), 0).unwrap(), expected);
+        }
+    }
+
+    #[test]
+    fn mixed_arrow_scalar_layouts_keep_null_and_missing_values_in_the_union() {
+        let memory = budget();
+        let table = TableRef::new("public", "docs");
+        let put = |ids: Vec<i64>, column: Option<ArrayRef>| {
+            let mut fields = vec![Field::new("_id", DataType::Int64, false)];
+            let mut columns = vec![Arc::new(arrow_array::Int64Array::from(ids)) as ArrayRef];
+            if let Some(column) = column {
+                fields.push(Field::new("v", column.data_type().clone(), true));
+                columns.push(column);
+            }
+            let batch = RecordBatch::try_new(Arc::new(Schema::new(fields)), columns).unwrap();
+            let batch = OwnedBatch::new(batch, &memory).unwrap();
+            let documents = ArrowDocuments::from_batch(&batch, &memory).unwrap().unwrap();
+            TxOp::PutArrowDocs { table: table.clone(), documents }
+        };
+        let source = SourceTransaction::new(vec![
+            put(vec![1, 2, 3], Some(Arc::new(arrow_array::Int64Array::from(vec![Some(7), None, Some(9)])))),
+            put(vec![4], Some(Arc::new(arrow_array::StringArray::from(vec!["text"])))),
+            put(vec![5], None),
+            put(vec![6], Some(Arc::new(arrow_array::NullArray::new(1)))),
+        ], SubmitOptions::default(), &memory).unwrap();
+
+        let replay = roundtrip(&source);
+
+        let expected = [vec![Value::I64(7), Value::Null, Value::I64(9)], vec![Value::Utf8("text".into())], vec![Value::Null], vec![Value::Null]];
+        assert_eq!(replay.operations.len(), expected.len());
+        for (operation, expected) in replay.operations.iter().zip(expected) {
+            let Operation::PutArrowIids { documents, .. } = operation else {
+                panic!("Expected Arrow documents on replay");
+            };
+            let array = documents.array().column_by_name("v").unwrap();
+            let field = documents.array().fields().iter().find(|field| field.name() == "v").unwrap();
+            assert!(array.as_any().is::<UnionArray>());
+            let values = (0..array.len()).map(|row| read_value(field, array.as_ref(), row).unwrap()).collect::<Vec<_>>();
+            assert_eq!(values, expected);
+        }
+    }
+
+    #[test]
+    fn evolving_structs_inside_arrow_lists_replay_columnarly() {
+        let memory = budget();
+        let put = |id, name: &str, number| {
+            let list = Value::List(vec![Value::Struct(StructFields::from([
+                (name.into(), Value::Bool(true)), ("number".into(), number),
+            ]))]);
+            let logical = list.logical_type();
+            let fields = vec![Field::new("_id", DataType::Int64, false), to_field("items", &logical).unwrap()];
+            let columns = vec![
+                Arc::new(arrow_array::Int64Array::from(vec![id])) as ArrayRef,
+                build_array(&logical, &[list]).unwrap(),
+            ];
+            let batch = RecordBatch::try_new(Arc::new(Schema::new(fields)), columns).unwrap();
+            let batch = OwnedBatch::new(batch, &memory).unwrap();
+            let documents = ArrowDocuments::from_batch(&batch, &memory).unwrap().unwrap();
+            TxOp::PutArrowDocs { table: TableRef::new("public", "docs"), documents }
+        };
+        let source = SourceTransaction::new(vec![
+            put(1, "first", Value::I64(7)), put(2, "later", Value::Utf8("text".into())),
+        ], SubmitOptions::default(), &memory).unwrap();
+
+        let replay = roundtrip(&source);
+
+        let expected = [(true, false, Value::I64(7)), (false, true, Value::Utf8("text".into()))];
+        assert_eq!(replay.operations.len(), expected.len());
+        for (operation, (first, later, number)) in replay.operations.iter().zip(expected) {
+            let Operation::PutArrowIids { documents, .. } = operation else {
+                panic!("Expected Arrow documents on replay");
+            };
+            let list = documents.array().column_by_name("items").unwrap().as_any().downcast_ref::<ListArray>().unwrap();
+            let item = list.value(0);
+            let item = item.as_any().downcast_ref::<StructArray>().unwrap();
+            assert_eq!(item.fields().iter().map(|field| field.name().as_str()).collect::<Vec<_>>(), ["first", "number", "later"]);
+            assert_eq!(item.column(0).is_valid(0), first);
+            assert_eq!(item.column(2).is_valid(0), later);
+            assert!(item.column(1).as_any().is::<UnionArray>());
+            assert_eq!(read_value(&item.fields()[1], item.column(1).as_ref(), 0).unwrap(), number);
+        }
+    }
+
+    #[test]
     fn a_nested_struct_key_first_written_after_its_struct_was_undefined_is_nullable() {
         let memory = budget();
         let put = |row: StructFields<Value>| TxOp::PutDocs { table: TableRef::new("public", "docs"), documents: Documents::new(vec![row], &memory).unwrap(), valid_from: None, valid_to: None };
@@ -570,7 +977,8 @@ mod tests {
         ])))]);
         let source = SourceTransaction::new(vec![put(StructFields::from([("_id".to_owned(), Value::I64(1))])), put(quux)], SubmitOptions::default(), &memory).unwrap();
         let decoded = roundtrip(&source);
-        let Operation::PutIids { documents, .. } = &decoded.operations[0] else { panic!("put"); };
+        let Operation::PutArrowIids { documents, .. } = &decoded.operations[0] else { panic!("put"); };
+        let documents = documents.to_rows(true, &memory).unwrap();
         let utf8 = LogicalType::Scalar(ScalarType::Utf8);
         let expected = LogicalType::Struct(StructFields::from([
             ("a".to_owned(), LogicalType::Scalar(ScalarType::Bool)),
@@ -602,16 +1010,19 @@ mod tests {
         let replayed = roundtrip(&decoded);
         for tx in [&decoded, &replayed] {
             let mut operations = tx.operations.iter();
-            let Operation::PutIids { documents, .. } = operations.next().unwrap() else { panic!("first put"); };
+            let Operation::PutArrowIids { documents, .. } = operations.next().unwrap() else { panic!("first put"); };
+            let documents = documents.to_rows(true, &memory).unwrap();
             assert_eq!(documents.columns(), ["z", "_id", "n", "b"]);
             assert_eq!(documents.rows()[0]["z"], Value::Utf8("last".into()));
             assert_eq!(documents.declared_types().unwrap()["n"], LogicalType::Null);
             assert!(!documents.rows()[0].contains_key("n"));
-            let Operation::PutIids { documents, .. } = operations.next().unwrap() else { panic!("second put"); };
+            let Operation::PutArrowIids { documents, .. } = operations.next().unwrap() else { panic!("second put"); };
+            let documents = documents.to_rows(true, &memory).unwrap();
             assert_eq!(documents.columns(), ["_id", "e"]);
             assert_eq!(documents.declared_types().unwrap()["e"], LogicalType::Null);
             assert!(!documents.rows()[0].contains_key("e"));
-            let Operation::PutIids { documents, .. } = operations.next().unwrap() else { panic!("third put"); };
+            let Operation::PutArrowIids { documents, .. } = operations.next().unwrap() else { panic!("third put"); };
+            let documents = documents.to_rows(true, &memory).unwrap();
             assert_eq!(documents.columns(), ["z", "_id", "n", "b"]);
             assert_eq!(documents.rows()[0]["z"], Value::I64(7));
             assert_eq!(documents.rows()[0]["b"], Value::Bool(true));
@@ -660,7 +1071,8 @@ mod tests {
         let message = SourceMessage::decode(encoded.as_slice()).unwrap().unwrap();
         let decoded = SourceTransaction::decode(&message, &memory).unwrap();
         assert_eq!(decoded.operations.len(), 100);
-        let Operation::PutIids { documents, .. } = &decoded.operations[99] else { panic!("Expected decoded put"); };
+        let Operation::PutArrowIids { documents, .. } = &decoded.operations[99] else { panic!("Expected columnar decoded put"); };
+        let documents = documents.to_rows(true, &memory).unwrap();
         assert_eq!(documents.columns().len(), 1001);
         assert_eq!(documents.rows()[0]["field_99_9"], Value::Utf8("value_99_9".into()));
         assert_eq!(documents.declared_types().unwrap()["field_0_0"], LogicalType::Scalar(ScalarType::Utf8).maybe());
@@ -691,7 +1103,7 @@ mod tests {
             Operation::PatchIids { table, documents, iids: vec![iid], valid_from: Some(Timestamp(30)), valid_to: None },
         ], SubmitOptions::default(), &memory).unwrap();
         let decoded = roundtrip(&source);
-        assert!(matches!(&decoded.operations[0], Operation::PutIids { iids, valid_from: Some(Timestamp(10)), valid_to: Some(Timestamp(20)), .. } if iids == &vec![iid]));
+        assert!(matches!(&decoded.operations[0], Operation::PutArrowIids { iids, valid_from: Some(Timestamp(10)), valid_to: Some(Timestamp(20)), .. } if iids == &vec![iid]));
         assert!(matches!(&decoded.operations[1], Operation::PatchIids { iids, valid_from: Some(Timestamp(30)), valid_to: None, .. } if iids == &vec![iid]));
     }
 
@@ -719,7 +1131,7 @@ mod tests {
             let decoded = roundtrip(&source);
             let Operation::Public(TxOp::Sql { args: Some(args), .. }) = &decoded.operations[0] else { panic!("Expected SQL arguments") };
             assert_eq!(args.types(), &[value.logical_type()]);
-            assert_eq!(args.rows().collect::<Vec<_>>(), vec![std::slice::from_ref(&value)]);
+            assert_eq!(args.rows().map(|row| row.unwrap().to_vec()).collect::<Vec<_>>(), vec![std::slice::from_ref(&value)]);
         }
     }
 

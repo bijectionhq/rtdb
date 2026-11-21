@@ -158,6 +158,13 @@ impl DiskCache {
             }
         }
     }
+    fn cached_file(self: &Arc<Self>, key: &ObjectKey) -> Option<DiskLease> {
+        let mut state = self.state.lock();
+        let entry = state.entries.get(key).filter(|entry| entry.file.get().is_some()).cloned()?;
+        state.clock = state.clock.saturating_add(1);
+        entry.accessed.store(state.clock, Ordering::Relaxed);
+        Some(DiskLease { cache: Arc::clone(self), entry })
+    }
     fn cached_size(&self, key: &ObjectKey) -> Option<u64> { self.state.lock().entries.get(key).and_then(|entry| entry.file.get()).map(|file| file.size) }
 
     /// Concurrent readers share a load; cancellation discards its temporary file and leaves the next caller able to retry.
@@ -169,10 +176,14 @@ impl DiskCache {
         if lease.entry.file.get().is_none() {
             let object = self.cancellation.run_until_cancelled(store.head(remote_key)).await.ok_or_else(cache_closed)??;
             let mut temporary = tempfile::NamedTempFile::new_in(self.root.join(".tmp")).map_err(|error| Error::io(&self.root, error))?;
-            let chunk_size = (1024 * 1024).min(self.memory.limit_bytes().saturating_sub(self.memory.used_bytes()) / 2).max(1);
+            let chunk_size = if store.supports_scan_ranges(remote_key) {
+                (1024 * 1024).min(self.memory.limit_bytes().saturating_sub(self.memory.used_bytes()) / 2).max(1) as u64
+            } else {
+                object.size.max(1)
+            };
             let mut offset = 0;
             while offset < object.size {
-                let end = object.size.min(offset.saturating_add(chunk_size as u64));
+                let end = object.size.min(offset.saturating_add(chunk_size));
                 let length = usize::try_from(end - offset).map_err(|error| Error::Task(error.to_string()))?;
                 let reservation = ReadReservation::new(length, self.reserve(length)?);
                 let bytes = self.cancellation.run_until_cancelled(store.get_reserved_range(remote_key, offset..end, reservation)).await.ok_or_else(cache_closed)??;
@@ -325,6 +336,21 @@ impl ObjectStore for DiskCachedStore {
             let mut bytes = vec![0; reservation.length()];
             file.read_exact(&mut bytes).map_err(|error| Error::io(lease.path(), error))?;
             reservation.finish(Bytes::from(bytes))
+        }).await
+    }
+    fn supports_scan_ranges(&self, key: &ObjectKey) -> bool { self.remote.supports_scan_ranges(key) }
+
+    async fn get_reserved_scan_range(&self, key: &ObjectKey, range: Range<u64>, reservation: ReadReservation) -> Result<RetainedBytes> {
+        let scope = self.io.admit()?;
+        let operation = self.cache.begin_operation()?.and(scope);
+        let Some(lease) = self.cache.cached_file(&self.key(key)?) else {
+            return self.cache.cancellation.run_until_cancelled(self.remote.get_reserved_scan_range(key, range, reservation))
+                .await.ok_or_else(cache_closed)?;
+        };
+        let key = key.clone();
+        IoRegion::run_admitted(operation, move || {
+            let file = lease.open().map_err(|error| Error::io(lease.path(), error))?;
+            crate::object_store::map_range(crate::LocalFile::new(file, Some(lease)), &key, range, reservation)
         }).await
     }
     async fn put(&self, key: &ObjectKey, bytes: Bytes) -> Result<()> { let _scope = self.io.admit()?; let _operation = self.cache.begin_operation()?; self.remote.put(key, bytes).await }

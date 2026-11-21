@@ -194,7 +194,7 @@ mod tests {
         let batch = RecordBatch::try_new(Arc::clone(&schema), columns).unwrap();
         let arguments = arguments(&batch, &memory).unwrap();
         let expected: Vec<Vec<Value>> = (0..2).map(|row| (0..3).map(|column| read_value(schema.field(column), batch.column(column).as_ref(), row).unwrap()).collect()).collect();
-        assert_eq!(arguments.rows().map(<[Value]>::to_vec).collect::<Vec<_>>(), expected);
+        assert_eq!(arguments.rows().map(|row| row.unwrap().to_vec()).collect::<Vec<_>>(), expected);
     }
     #[test]
     fn declared_flight_schema_keeps_nonnullable_timestamp_with_conformed_null_buffers() {
@@ -330,7 +330,7 @@ mod tests {
             assert_eq!(read_value(decoded.batch().schema().field(0), decoded.batch().column(0).as_ref(), 0).unwrap(), value);
             let bytes = parameter_ipc(&batch, &memory).unwrap().unwrap(); let parameters = parameter_batch(&bytes, &memory).unwrap();
             let args = arguments(parameters.batch(), &memory).unwrap();
-            assert_eq!(args.types(), &[ty]); assert_eq!(args.rows().next().unwrap(), &[value]);
+            assert_eq!(args.types(), &[ty]); assert_eq!(&*args.rows().next().unwrap().unwrap(), &[value]);
             drop(args); drop(parameters); drop(bytes); drop(decoded); drop(decoder); assert_eq!(memory.used_bytes(), 0);
         }
     }

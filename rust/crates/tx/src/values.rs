@@ -1,10 +1,10 @@
 use rtdb_types::StructFields;
 use std::collections::BTreeSet;
-use std::sync::Arc;
+use std::{borrow::Cow, ops::Deref, sync::Arc};
 
-use arrow_array::{Array, StructArray};
+use arrow_array::{Array, ArrayRef, ArrowPrimitiveType, ListArray, PrimitiveArray, RecordBatch, StructArray, cast::AsArray, types::{Int8Type, Int16Type, Int32Type, Int64Type, UInt8Type, UInt16Type, UInt32Type, UInt64Type}};
 use arrow_schema::{DataType, Fields, Schema};
-use rtdb_columnar::{MemoryBudget, MemoryReservation, from_field};
+use rtdb_columnar::{ColumnReader, MemoryBudget, MemoryReservation, OwnedBatch, from_field};
 use rtdb_types::{Anomaly, EntityId, LogicalType, Result, TableRef, Timestamp, TransactionKey, TxId, Value};
 
 #[derive(Clone, Debug)]
@@ -148,6 +148,116 @@ impl Documents {
 }
 
 #[derive(Clone, Debug)]
+pub struct ArrowDocuments {
+    array: StructArray,
+    layout: Arc<DecodedDocumentLayout>,
+}
+
+impl ArrowDocuments {
+    pub fn from_batch(batch: &OwnedBatch, memory: &Arc<MemoryBudget>) -> Result<Option<Self>> {
+        let batch = batch.batch();
+        let schema = batch.schema();
+        if batch.num_rows() == 0 || schema.fields().iter().zip(batch.columns()).any(|(field, _)| !Self::compatible(field)) {
+            return Ok(None);
+        }
+        let _schema = memory.reserve(rtdb_format::ipc::schema_translation_bound(&schema)?)?;
+        let names = schema.fields().iter().map(|field| field.name()).collect::<BTreeSet<_>>();
+        if names.len() != schema.fields().len() { return Ok(None); }
+        let columns = schema.fields().iter().zip(batch.columns()).map(|(field, array)| {
+            let nulls = array.logical_null_count();
+            let array = if nulls == array.len() {
+                Arc::new(arrow_array::NullArray::new(array.len())) as ArrayRef
+            } else {
+                normalized_document_array(array)?
+            };
+            Some((arrow_schema::Field::new(field.name(), array.data_type().clone(), nulls != 0), array))
+        }).collect::<Option<Vec<_>>>();
+        let Some(columns) = columns else { return Ok(None); };
+        let (fields, columns): (Vec<_>, Vec<_>) = columns.into_iter().unzip();
+        let fields = Fields::from(fields);
+        let layout = DecodedDocumentLayout::new(&fields, memory)?;
+        let array = StructArray::try_new_with_length(fields, columns, None, batch.num_rows())
+            .map_err(|error| Anomaly::incorrect("rtdb.tx/document-schema", error.to_string()))?;
+        Ok(Some(Self { array, layout }))
+    }
+
+    fn compatible(field: &arrow_schema::Field) -> bool {
+        field.metadata().is_empty() && match field.data_type() {
+            DataType::Struct(fields) => fields.iter().all(|field| Self::compatible(field)),
+            DataType::List(field) => Self::compatible(field),
+            DataType::Union(fields, arrow_schema::UnionMode::Dense) => fields.iter().all(|(_, field)| {
+                Self::compatible(field) && from_field(field).is_ok_and(|ty| rtdb_columnar::execution_type(&ty) == ty)
+            }),
+            DataType::Null | DataType::Boolean | DataType::Int8 | DataType::Int16 | DataType::Int32 | DataType::Int64 |
+            DataType::UInt8 | DataType::UInt16 | DataType::UInt32 | DataType::UInt64 |
+            DataType::Float32 | DataType::Float64 | DataType::Utf8 | DataType::Binary | DataType::FixedSizeBinary(_) |
+            DataType::Timestamp(arrow_schema::TimeUnit::Microsecond, Some(_)) => true,
+            _ => false,
+        }
+    }
+
+    pub(crate) fn from_source(array: &StructArray, layout: Arc<DecodedDocumentLayout>) -> Option<Self> {
+        (!array.is_empty() && array.null_count() == 0 && array.fields().iter().all(|field| Self::compatible(field)))
+            .then(|| Self { array: array.clone(), layout })
+    }
+
+    pub(crate) fn array(&self) -> &StructArray { &self.array }
+    pub(crate) fn columns(&self) -> &[String] { &self.layout.columns }
+
+    pub(crate) fn to_rows(&self, omit_nulls: bool, memory: &Arc<MemoryBudget>) -> Result<Documents> {
+        Documents::read_arrow(&self.array, Arc::clone(&self.layout), omit_nulls, memory)
+    }
+
+    pub(crate) fn iid(&self, row: usize, reader: Option<&(usize, ColumnReader)>, memory: &Arc<MemoryBudget>) -> Result<rtdb_types::Iid> {
+        if let Some((index, reader)) = reader {
+            let column = self.array.column(*index);
+            if column.is_valid(row) {
+                let _scratch = memory.reserve(rtdb_columnar::estimate_read_cell_bytes(&self.array.fields()[*index], column.as_ref(), row)?)?;
+                return Ok(reader.read(column.as_ref(), row)?.entity_id()?.iid());
+            }
+        }
+        let slice = self.array.slice(row, 1);
+        let rows = Documents::read_arrow(&slice, Arc::clone(&self.layout), false, memory)?;
+        crate::source::document_id(&rows.rows()[0], memory).map(|id| id.iid())
+    }
+
+    pub(crate) fn id_reader(&self) -> Result<Option<(usize, ColumnReader)>> {
+        self.array.fields().iter().enumerate().find(|(_, field)| field.name() == "_id")
+            .map(|(index, field)| Ok((index, ColumnReader::new(field)?))).transpose()
+    }
+}
+
+fn normalized_document_array(array: &ArrayRef) -> Option<ArrayRef> {
+    Some(match array.data_type() {
+        DataType::UInt8 => signed_column::<UInt8Type, Int8Type>(array.as_ref()),
+        DataType::UInt16 => signed_column::<UInt16Type, Int16Type>(array.as_ref()),
+        DataType::UInt32 => signed_column::<UInt32Type, Int32Type>(array.as_ref()),
+        DataType::UInt64 => signed_column::<UInt64Type, Int64Type>(array.as_ref()),
+        DataType::Struct(fields) => {
+            let source = array.as_any().downcast_ref::<StructArray>()?;
+            let children = source.columns().iter().map(normalized_document_array).collect::<Option<Vec<_>>>()?;
+            let fields = fields.iter().zip(&children).map(|(field, child)| {
+                field.as_ref().clone().with_data_type(child.data_type().clone())
+            }).collect::<Fields>();
+            Arc::new(StructArray::try_new_with_length(fields, children, source.nulls().cloned(), source.len()).ok()?)
+        }
+        DataType::List(field) => {
+            let source = array.as_any().downcast_ref::<ListArray>()?;
+            let values = normalized_document_array(source.values())?;
+            let field = field.as_ref().clone().with_data_type(values.data_type().clone());
+            Arc::new(ListArray::try_new(Arc::new(field), source.offsets().clone(), values, source.nulls().cloned()).ok()?)
+        }
+        _ => Arc::clone(array),
+    })
+}
+
+fn signed_column<From: ArrowPrimitiveType, To: ArrowPrimitiveType>(array: &dyn Array) -> ArrayRef {
+    let source = array.as_primitive::<From>();
+    let values = arrow_buffer::ScalarBuffer::from(source.values().inner().clone());
+    Arc::new(PrimitiveArray::<To>::new(values, source.nulls().cloned()))
+}
+
+#[derive(Clone, Debug)]
 pub struct EntityIds { ids: Arc<Vec<EntityId>>, _reservation: Arc<MemoryReservation> }
 impl EntityIds {
     pub fn new(ids: Vec<EntityId>, memory: &Arc<MemoryBudget>) -> Result<Self> {
@@ -180,7 +290,58 @@ impl UserMetadata {
 }
 
 #[derive(Clone, Debug)]
-struct ArgumentChunk { rows: Vec<Vec<Value>>, _reservation: Arc<MemoryReservation> }
+enum ArgumentChunk {
+    Rows { rows: Vec<Vec<Value>>, _reservation: Arc<MemoryReservation> },
+    Arrow { batch: OwnedBatch, types: Arc<Vec<LogicalType>>, _reservation: Arc<MemoryReservation> },
+}
+
+impl ArgumentChunk {
+    fn len(&self) -> usize {
+        match self {
+            Self::Rows { rows, .. } => rows.len(),
+            Self::Arrow { batch, .. } => batch.batch().num_rows(),
+        }
+    }
+
+    fn row(&self, index: usize, memory: &Arc<MemoryBudget>) -> Result<ArgumentRow<'_>> {
+        match self {
+            Self::Rows { rows, .. } => Ok(ArgumentRow::borrowed(&rows[index])),
+            Self::Arrow { batch, types, .. } => {
+                let batch = batch.batch();
+                let schema = batch.schema_ref();
+                let columns = || schema.fields().iter().zip(batch.columns());
+                let base = types.len().checked_mul(std::mem::size_of::<Value>()).ok_or_else(overflow)?;
+                let bound = columns().try_fold(base, |bytes, (field, column)| {
+                    bytes.checked_add(rtdb_columnar::estimate_read_value_bytes(field, column.as_ref(), index)?)
+                        .ok_or_else(overflow)
+                })?;
+                let reservation = memory.reserve(bound)?;
+                let mut values = types.iter().zip(columns()).map(|(ty, (field, column))| {
+                    rtdb_columnar::read_value_as(ty, field, column.as_ref(), index)
+                }).collect::<Result<Vec<_>>>()?;
+                values.iter_mut().for_each(Value::admit_object_dates);
+                Ok(ArgumentRow { values: Cow::Owned(values), _reservation: Some(reservation) })
+            }
+        }
+    }
+}
+
+pub struct ArgumentRow<'a> {
+    values: Cow<'a, [Value]>,
+    _reservation: Option<Arc<MemoryReservation>>,
+}
+
+impl<'a> ArgumentRow<'a> {
+    pub(crate) fn borrowed(values: &'a [Value]) -> Self {
+        Self { values: Cow::Borrowed(values), _reservation: None }
+    }
+}
+
+impl Deref for ArgumentRow<'_> {
+    type Target = [Value];
+
+    fn deref(&self) -> &[Value] { &self.values }
+}
 
 #[derive(Clone, Debug)]
 pub struct SqlArguments {
@@ -203,8 +364,16 @@ impl SqlArguments {
         }
         let schema_reservation = memory.reserve(schema_bytes(&types)?)?;
         let row_count = rows.len();
-        let chunk = Arc::new(ArgumentChunk { rows, _reservation: memory.reserve(bytes.checked_add(256).ok_or_else(overflow)?)? });
+        let chunk = Arc::new(ArgumentChunk::Rows { rows, _reservation: memory.reserve(bytes.checked_add(256).ok_or_else(overflow)?)? });
         Ok(Self { types: Arc::new(types), chunks: Arc::new(vec![(0, chunk)]), memory: Arc::clone(memory), schema_reservation, row_count })
+    }
+    pub fn from_arrow(batch: OwnedBatch, memory: &Arc<MemoryBudget>) -> Result<Self> {
+        let schema = batch.batch().schema();
+        let schema_reservation = memory.reserve(rtdb_format::ipc::schema_translation_bound(&schema)?)?;
+        let types = Arc::new(schema.fields().iter().map(|field| from_field(field)).collect::<Result<Vec<_>>>()?);
+        let row_count = batch.batch().num_rows();
+        let chunk = Arc::new(ArgumentChunk::Arrow { batch, types: Arc::clone(&types), _reservation: Arc::clone(&schema_reservation) });
+        Ok(Self { types, chunks: Arc::new(vec![(0, chunk)]), memory: Arc::clone(memory), schema_reservation, row_count })
     }
     pub fn from_rows(rows: Vec<Vec<Value>>, memory: &Arc<MemoryBudget>) -> Result<Self> {
         let width = rows.first().map_or(0, Vec::len);
@@ -219,8 +388,33 @@ impl SqlArguments {
     /// Opened-vector field types for query or DML binding; source payload fields remain available through `types`.
     pub fn execution_types(&self) -> impl Iterator<Item = LogicalType> + '_ { self.types.iter().map(rtdb_columnar::execution_type) }
     pub fn row_count(&self) -> usize { self.row_count }
-    pub fn rows(&self) -> impl Iterator<Item = &[Value]> { self.chunks.iter().flat_map(|(_, chunk)| chunk.rows.iter().map(Vec::as_slice)) }
-    pub(crate) fn indexed_rows(&self) -> impl Iterator<Item = (usize, &[Value])> { self.chunks.iter().flat_map(|(start, chunk)| chunk.rows.iter().enumerate().map(move |(index, row)| (*start + index, row.as_slice()))) }
+    pub fn rows(&self) -> impl Iterator<Item = Result<ArgumentRow<'_>>> {
+        self.indexed_rows().map(|row| row.map(|(_, values)| values))
+    }
+
+    pub(crate) fn indexed_rows(&self) -> impl Iterator<Item = Result<(usize, ArgumentRow<'_>)>> {
+        self.chunks.iter().flat_map(move |(start, chunk)| {
+            (0..chunk.len()).map(move |index| chunk.row(index, &self.memory).map(|row| (start + index, row)))
+        })
+    }
+
+    pub(crate) fn uniform_arrow_pages(&self) -> Option<Vec<&RecordBatch>> {
+        let pages = self.chunks.iter().map(|(_, chunk)| match chunk.as_ref() {
+            ArgumentChunk::Arrow { batch, .. } => Some(batch.batch()),
+            ArgumentChunk::Rows { .. } => None,
+        }).collect::<Option<Vec<_>>>()?;
+        let first = pages.first()?.schema_ref();
+        pages.iter().all(|page| page.schema_ref() == first).then_some(pages)
+    }
+
+    pub(crate) fn value_bytes(&self) -> Result<usize> {
+        self.chunks.iter().try_fold(0usize, |bytes, (_, chunk)| match chunk.as_ref() {
+            ArgumentChunk::Arrow { batch, .. } => bytes.checked_add(batch.batch().get_array_memory_size()).ok_or_else(overflow),
+            ArgumentChunk::Rows { rows, .. } => rows.iter().flatten().try_fold(bytes, |bytes, value| {
+                bytes.checked_add(value.retained_bytes()?).ok_or_else(overflow)
+            }),
+        })
+    }
     /// Appends argument rows in order and widens each positional column's type.
     pub fn append(&mut self, other: Self) -> Result<()> {
         self.append_rows(other, self.row_count)
@@ -252,6 +446,7 @@ pub enum TxOp {
     Sql { sql: String, args: Option<SqlArguments> },
     SqlBytes { sql: String, arg_bytes: RetainedBytes },
     PutDocs { table: TableRef, documents: Documents, valid_from: Option<Timestamp>, valid_to: Option<Timestamp> },
+    PutArrowDocs { table: TableRef, documents: ArrowDocuments },
     PatchDocs { table: TableRef, documents: Documents, valid_from: Option<Timestamp>, valid_to: Option<Timestamp> },
     DeleteDocs { table: TableRef, ids: EntityIds, valid_from: Option<Timestamp>, valid_to: Option<Timestamp> },
     EraseDocs { table: TableRef, ids: EntityIds },
@@ -344,9 +539,9 @@ mod tests {
         let memory = MemoryBudget::new(1 << 20);
         let mut args = SqlArguments::from_rows(vec![vec![Value::I64(1)], vec![Value::I64(2)]], &memory).unwrap();
         args.append_page(SqlArguments::from_rows(vec![vec![Value::I64(3)]], &memory).unwrap()).unwrap();
-        assert_eq!(args.indexed_rows().map(|(index, _)| index).collect::<Vec<_>>(), [0, 1, 0]);
+        assert_eq!(args.indexed_rows().map(|row| row.unwrap().0).collect::<Vec<_>>(), [0, 1, 0]);
         let mut coalesced = SqlArguments::from_rows(vec![vec![Value::I64(1)]], &memory).unwrap();
         coalesced.append(SqlArguments::from_rows(vec![vec![Value::I64(2)]], &memory).unwrap()).unwrap();
-        assert_eq!(coalesced.indexed_rows().map(|(index, _)| index).collect::<Vec<_>>(), [0, 1]);
+        assert_eq!(coalesced.indexed_rows().map(|row| row.unwrap().0).collect::<Vec<_>>(), [0, 1]);
     }
 }

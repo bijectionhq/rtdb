@@ -8,6 +8,21 @@ use crate::{MemoryBudget, MemoryReservation, OwnedBatch, copy_array, estimate_bu
 
 mod physical;
 
+/// Adapts compatible physical layouts, sharing value buffers when the target can use them.
+/// The caller reserves the space reported by `arrow_relayout_bound`.
+/// The returned field carries the actual nullability, including nested fields.
+pub fn relayout_arrow_column(array: ArrayRef, source: &arrow_schema::Field, target: &arrow_schema::Field) -> Result<(arrow_schema::Field, ArrayRef)> {
+    let target_type = from_field(target)?;
+    let source_type = from_field(source)?;
+    layout(&target_type, &source_type)?;
+    physical::relayout(array, source, target)
+}
+
+/// Bounds the temporary and new allocations needed to relayout an already owned array.
+pub fn arrow_relayout_bound(array: &dyn arrow_array::Array, target: &arrow_schema::Field) -> Result<usize> {
+    add(multiply(target.size(), 8)?, physical::additional_bytes(&array.to_data(), target)?)
+}
+
 /// A page in a declared wire layout, retaining its schema and allocation charges.
 /// The safe Rust batch marks null-bearing fields nullable; the declared wire schema preserves the caller's flags.
 /// Integer buffers may retain signed execution bits under a same-width unsigned declared field.
@@ -38,38 +53,55 @@ pub fn conform_batch(batch: OwnedBatch, declared: &Schema, memory: &Arc<MemoryBu
         if source.fields().get(index).is_some_and(|candidate| candidate.name() == field.name()) { Some(index) }
         else { source.fields().iter().rposition(|candidate| candidate.name() == field.name()) }
     }).collect::<Vec<_>>();
-    let mut decoded_bound = multiply(batch.batch().num_rows(), multiply(declared.fields().len(), std::mem::size_of::<Value>())?)?;
-    for position in positions.iter().flatten() {
-        for row in 0..batch.batch().num_rows() { decoded_bound = add(decoded_bound, estimate_read_value_bytes(source.field(*position), batch.batch().column(*position).as_ref(), row)?)?; }
-    }
-    let decoded = memory.reserve(add(decoded_bound, 4096)?)?;
-    let mut values = Vec::with_capacity(declared.fields().len());
-    let mut logical = Vec::with_capacity(declared.fields().len());
+    let mut output = memory.reserve(schema_bound)?;
     let mut fields = Vec::with_capacity(declared.fields().len());
-    for (field, position) in declared.fields().iter().zip(&positions) {
+    let mut arrays: Vec<ArrayRef> = Vec::with_capacity(declared.fields().len());
+    for (field, position) in declared.fields().iter().zip(positions) {
+        let input = position.map(|position| (source.field(position), batch.batch().column(position)));
+        let output = Arc::get_mut(&mut output).expect("Conformance owns the output reservation");
+        if let Some((source_field, array)) = input && source_field == field.as_ref() {
+            output.grow_to(add(output.bytes(), array.get_array_memory_size())?)?;
+            fields.push(field.as_ref().clone());
+            arrays.push(Arc::clone(array));
+            continue;
+        }
         let target = from_field(field)?;
-        let source_type = position.map(|position| from_field(source.field(position))).transpose()?.unwrap_or(L::Null);
-        if position.is_none() && !target.nullable() { return Err(fault("page-missing-non-nullable", "Page lacks a required declared field")); }
+        let source_type = input.map(|(field, _)| from_field(field)).transpose()?.unwrap_or(L::Null);
+        if input.is_none() && !target.nullable() { return Err(fault("page-missing-non-nullable", "Page lacks a required declared field")); }
         let ty = layout(&target, &source_type)?;
-        let column = (0..batch.batch().num_rows()).map(|row| match position {
-            Some(position) => read_value(source.field(*position), batch.batch().column(*position).as_ref(), row),
+        if let Some((source_field, array)) = input {
+            let bound = arrow_relayout_bound(array.as_ref(), field)?;
+            if let Ok(_scratch) = memory.reserve(bound)
+                && let Ok((physical, retained)) = physical::relayout(Arc::clone(array), source_field, field) {
+                output.grow_to(add(output.bytes(), retained.get_array_memory_size())?)?;
+                fields.push(physical);
+                arrays.push(retained);
+                continue;
+            }
+        }
+        let rows = batch.batch().num_rows();
+        let base = multiply(rows, std::mem::size_of::<Value>())?;
+        let bound = match input {
+            Some((source_field, array)) => (0..rows).try_fold(base, |bytes, row| {
+                add(bytes, estimate_read_value_bytes(source_field, array.as_ref(), row)?)
+            })?,
+            None => base,
+        };
+        let _decoded = memory.reserve(bound)?;
+        let column = (0..rows).map(|row| match input {
+            Some((source_field, array)) => read_value(source_field, array.as_ref(), row),
             None => Ok(Value::Null),
         }).collect::<Result<Vec<_>>>()?;
         let physical = to_field(field.name(), &ty)?.with_metadata(field.metadata().clone());
-        fields.push(physical); logical.push(ty); values.push(column);
-    }
-    let bound = logical.iter().zip(&values).try_fold(schema_bound, |bytes, (ty, values)| add(bytes, multiply(estimate_builder_bytes(ty, values)?, 2)?))?;
-    let output = memory.reserve(bound)?;
-    let mut arrays: Vec<ArrayRef> = Vec::with_capacity(fields.len());
-    for (((ty, values), field), target) in logical.iter().zip(&values).zip(&mut fields).zip(declared.fields()) {
-        let (physical, array) = physical::relayout(copy_array(ty, values)?, field, target)?;
-        *field = physical;
+        let bound = multiply(estimate_builder_bytes(&ty, &column)?, 2)?;
+        output.grow_to(add(output.bytes(), bound)?)?;
+        let (physical, array) = physical::relayout(copy_array(&ty, &column)?, &physical, field)?;
+        fields.push(physical);
         arrays.push(array);
     }
     let schema = Arc::new(Schema::new(fields).with_metadata(declared.metadata().clone()));
     let physical = RecordBatch::try_new_with_options(schema, arrays, &RecordBatchOptions::new().with_row_count(Some(batch.batch().num_rows()))).map_err(crate::arrow_error)?;
     let batch = OwnedBatch::with_reservation(physical, output)?;
-    drop(values); drop(decoded);
     Ok(DeclaredBatch { batch, declared, _reservation: reservation })
 }
 
