@@ -45,6 +45,9 @@ All three designers proposed the same mechanism; differences are noted inline.
 - **Certificate and renewal evidence:** the [Lean certificate model](../lean/RetirementCertificate.lean) proves exact identity and hold preservation across arbitrary histories, under an authenticated retirement premise.
   The [TLC renewal model](../tla/RenewedResidenceHold.tla) checks two observations of one ticket, a delayed renewal reply and bounded in-flight work.
   The [SMT margin check](../smt/residence-clock-margin.smt2) covers separate monotonic clock rates and bounded provider use.
+  The [Lean reclamation proof](../lean/ReaderReclamationMinimality.lean) shows that a collector can guarantee safety and progress only with observations or environment assumptions that eliminate outstanding use at the chosen collection point.
+  When a live operation and an abandoned operation can produce the same observations for any finite prefix, a safe timing-only decision cannot reclaim that object.
+  Use a provider-use bound that covers the last possible dependency access, or a sound observation of drain for providers whose use has no such bound.
   The production ledger still needs renewable holds and a capability consumed by the reaper.
 - **Classic side:** nothing yet. Readers are protected by bounded monotonic leases (default 1 h, 60 s margin) and the collector waits a lease after first observing a trie; see the "Reader leases across nodes" section of `verification/results/2026-11-21.adoc`.
 - **Directory implementations:** `MemoryDirectory`, `DynamoDirectory`, `RemoteDirectory` exist; there is no object-store-backed one.

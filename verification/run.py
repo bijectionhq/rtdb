@@ -648,6 +648,21 @@ def verify_retirement_certificate(args, scratch):
                       "retirement-certificate", controls, 6, os.environ | {"LEAN_PATH": str(directory)})
 
 
+def verify_reader_reclamation_minimality(args, scratch):
+    path = Path("verification/lean/ReaderReclamationMinimality.lean")
+    controls = {
+        "reap-too-early": (
+            "| [time] => decide (limit ≤ time)", "| [time] => decide (limit ≤ time + 1)",
+            ["a_valid_bound_makes_timed_reclamation_safe"],
+        ),
+        "assume-drained": (
+            "| [result] => result.drained", "| [_] => true",
+            ["confirmed_drain_makes_reclamation_safe"],
+        ),
+    }
+    verify_lean_model(args, scratch, path, "reader-reclamation-minimality", controls, 5)
+
+
 def verify_basis_tokens(args, scratch):
     path = Path("verification/lean/BasisTokens.lean")
     controls = {
@@ -1382,6 +1397,7 @@ def verify_lean(args, scratch):
             verify_floor_preservation(args, scratch)
             verify_retirement_identity(args, scratch)
             verify_retirement_certificate(args, scratch)
+            verify_reader_reclamation_minimality(args, scratch)
             verify_basis_tokens(args, scratch)
             verify_run_encoding(args, scratch)
             verify_memory_admission(args, scratch)

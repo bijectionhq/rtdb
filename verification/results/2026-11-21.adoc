@@ -2018,4 +2018,23 @@ The model takes the writer's member counts and the posting's ordinal as inputs.
 Proof of the entire sidecar codec and the shared-file ranking frontier remains open.
 The command records are in `/private/tmp/rtdb-formal.QMjPSJsX/search-member-proof-evidence-xa4nofps/`. link:../verus/search_member/area.json[Production proof and controls]
 The scoped native suite passed 66 cases, including all 19 node search tests and both the shared-file member fixture and the selected-member ranking and corpus fixture.
-The exact native command and output are recorded in `/private/tmp/rtdb-formal.QMjPSJsX/search-member-ownership-native.log`.
+The native output is in `/private/tmp/rtdb-formal.QMjPSJsX/search-member-ownership-native.log`.
+
+[source,sh]
+----
+BIJECTION_LOCAL_EXECUTION=owner-authorized CARGO_PROFILE_TEST_DEBUG=0 cargo test \
+  --manifest-path rust/Cargo.toml --locked --offline -p rtdb-search -p rtdb-node \
+  --lib --test search --no-fail-fast
+----
+
+=== When a collector can release an abandoned reader's files
+
+Lean 4.36.0 checked five theorems for a collector whose decisions depend on its observations up to a sweep.
+If for each finite sweep an admissible execution still using the bytes has exactly the observations of the abandoned execution, any safe decision leaves the files allocated in the abandoned execution.
+Two acceptance programs meet both obligations under different premises.
+A timed policy collects at a verified upper bound on outstanding use.
+A drain policy collects once it observes a sound confirmation that the last outstanding use ended.
+Two controls reject advancing the timed bound and accepting an unconfirmed drain.
+These are theorems about the observation contract and its premises.
+Provider duration and drain evidence still need to be established for each production collector.
+The command records and diagnostics are in `/private/tmp/rtdb-formal.QMjPSJsX/lean-reader-reclamation-minimality-nknjb4oi/`. link:../lean/ReaderReclamationMinimality.lean[Reclamation proof and acceptance programs]
