@@ -359,6 +359,28 @@ fn stored_list_projection_uses_arrow_for_contiguous_and_sparse_rows() {
     }
 }
 
+#[test]
+fn result_projection_keeps_a_scalar_union_already_in_its_output_layout() {
+    use rtdb_types::ScalarType;
+
+    let logical = LogicalType::from_legs([
+        LogicalType::Scalar(ScalarType::I64),
+        LogicalType::Scalar(ScalarType::Utf8),
+        LogicalType::Null,
+    ]);
+    let field = Arc::new(rtdb_columnar::to_field("v", &logical).unwrap());
+    let input = rtdb_columnar::copy_array(&logical, &[Value::I64(1), Value::Null, Value::Utf8("x".into())]).unwrap();
+    let column = Column::Arrow {
+        array: Arc::clone(&input),
+        field: Arc::clone(&field),
+        logical: Some(logical.clone()),
+    };
+
+    let result = conform(&column, &logical, &field).unwrap();
+
+    assert!(Arc::ptr_eq(&input, &result));
+}
+
 fn can_interleave_nested(array: &dyn Array) -> bool {
     if flat(array.data_type()) { return true; }
     if let Some(structs) = array.as_any().downcast_ref::<StructArray>() {
@@ -409,6 +431,14 @@ fn conform_array(array: &ArrayRef, logical: &LogicalType, target: &LogicalType, 
         (LogicalType::Scalar(scalar), LogicalType::Scalar(expected)) => {
             let kept = copyable(&scalar) || scalar == rtdb_types::ScalarType::DateDay;
             (scalar == expected && kept && array.data_type() == field.data_type()).then(|| Arc::clone(array))
+        }
+        (LogicalType::Union(legs), LogicalType::Union(expected)) => {
+            let kept = legs.iter().all(|leg| match leg {
+                LogicalType::Scalar(scalar) => copyable(scalar) || *scalar == rtdb_types::ScalarType::DateDay,
+                LogicalType::Null => true,
+                _ => false,
+            });
+            (kept && legs == expected && array.data_type() == field.data_type()).then(|| Arc::clone(array))
         }
         // A copied record's fields take the order of the result's, whatever order the cells came in.
         (LogicalType::Struct(children), LogicalType::Struct(expected)) => {
