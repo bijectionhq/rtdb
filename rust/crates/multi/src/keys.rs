@@ -1,6 +1,8 @@
-//! Per-deployment data keys (`KeyService`): each deployment's objects are encrypted under its own key, and destroying the key is what deletion proves.
+//! Per-deployment key provisioning, fork copies and durable withdrawal.
 
-use std::path::PathBuf;
+use std::fs::{self, File};
+use std::io::{ErrorKind, Write};
+use std::path::{Path, PathBuf};
 
 use ring::rand::{SecureRandom, SystemRandom};
 use rtdb_types::{Anomaly, AnomalyCategory, Result};
@@ -13,7 +15,7 @@ pub trait KeyService: Send + Sync {
     async fn key(&self, deployment: &str) -> Result<[u8; KEY_BYTES]>;
     /// Gives `to` the key `from` has, for a fork whose objects are copies of its parent's.
     async fn copy(&self, from: &str, to: &str) -> Result<()>;
-    /// Destroys the deployment's key irreversibly; its objects are unreadable from then on.
+    /// Withdraws the key and permanently refuses provisioning for this deployment ID.
     async fn destroy(&self, deployment: &str) -> Result<()>;
     /// Installs a key brought from another cell's key service, for a deployment that moved here.
     async fn install(&self, deployment: &str, key: [u8; KEY_BYTES]) -> Result<()>;
@@ -30,26 +32,51 @@ impl LocalKeyService {
     }
     fn path(&self, deployment: &str) -> PathBuf { self.directory.join(format!("{deployment}.key")) }
 
+    fn publish(&self, path: &Path, contents: &[u8], withdraw: bool) -> Result<()> {
+        let temporary = path.with_extension(format!("{}.tmp", uuid::Uuid::new_v4().simple()));
+        let mut pending = File::options().write(true).create_new(true).open(&temporary).map_err(io)?;
+        let published = (|| -> std::io::Result<()> {
+            pending.write_all(contents)?;
+            pending.sync_all()?;
+            if withdraw {
+                fs::rename(&temporary, path)?;
+            } else {
+                // Provisioning cannot overwrite another writer's key or undo withdrawal.
+                match fs::hard_link(&temporary, path) {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == ErrorKind::AlreadyExists => {}
+                    Err(error) => return Err(error),
+                }
+            }
+            Ok(())
+        })();
+        drop(pending);
+        match fs::remove_file(&temporary) {
+            Ok(()) => {}
+            Err(error) if error.kind() == ErrorKind::NotFound => {}
+            Err(error) => return Err(io(error)),
+        }
+        published.map_err(io)?;
+        File::open(&self.directory).and_then(|directory| directory.sync_all()).map_err(io)
+    }
     fn local_key(&self, deployment: &str) -> Result<[u8; KEY_BYTES]> {
         let path = self.path(deployment);
-        match std::fs::read(&path) {
-            Ok(bytes) => bytes.try_into().map_err(|_| malformed()),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                let key = new_key()?;
-                let temporary = path.with_extension(format!("{}.tmp", uuid::Uuid::new_v4().simple()));
-                std::fs::write(&temporary, key).map_err(io)?;
-                let published = std::fs::hard_link(&temporary, &path);
-                let _ = std::fs::remove_file(&temporary);
-                match published {
-                    Ok(()) => Ok(key),
-                    Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists =>
-                        std::fs::read(&path).map_err(io)?.try_into().map_err(|_| malformed()),
-                    Err(error) => Err(io(error)),
-                }
+        match fs::read(&path) {
+            Ok(bytes) => decode_key(deployment, bytes),
+            Err(error) if error.kind() == ErrorKind::NotFound => {
+                self.publish(&path, &new_key()?, false)?;
+                decode_key(deployment, fs::read(&path).map_err(io)?)
             }
             Err(error) => Err(io(error)),
         }
     }
+}
+
+fn decode_key(deployment: &str, bytes: Vec<u8>) -> Result<[u8; KEY_BYTES]> {
+    if bytes.is_empty() {
+        return Err(Anomaly::incorrect("rtdb.multi/key-withdrawn", format!("The key of {deployment} was withdrawn")));
+    }
+    bytes.try_into().map_err(|_| malformed())
 }
 
 #[async_trait::async_trait]
@@ -57,18 +84,21 @@ impl KeyService for LocalKeyService {
     async fn key(&self, deployment: &str) -> Result<[u8; KEY_BYTES]> {
         self.local_key(deployment)
     }
+
     async fn copy(&self, from: &str, to: &str) -> Result<()> {
-        let key = self.local_key(from)?;
-        std::fs::write(self.path(to), key).map_err(io)
+        self.install(to, self.local_key(from)?).await
     }
-    async fn install(&self, deployment: &str, key: [u8; KEY_BYTES]) -> Result<()> { std::fs::write(self.path(deployment), key).map_err(io) }
-    async fn destroy(&self, deployment: &str) -> Result<()> {
+
+    async fn install(&self, deployment: &str, key: [u8; KEY_BYTES]) -> Result<()> {
         let path = self.path(deployment);
-        if path.exists() {
-            std::fs::write(&path, [0u8; KEY_BYTES]).map_err(io)?;
-            std::fs::remove_file(&path).map_err(io)?;
+        self.publish(&path, &key, false)?;
+        if decode_key(deployment, fs::read(&path).map_err(io)?)? != key {
+            return Err(Anomaly::new(AnomalyCategory::Conflict, "rtdb.multi/key-conflict", format!("A different key is already installed for {deployment}")));
         }
         Ok(())
+    }
+    async fn destroy(&self, deployment: &str) -> Result<()> {
+        self.publish(&self.path(deployment), &[], true)
     }
 }
 
@@ -97,7 +127,11 @@ mod tests {
         assert_eq!(keys.key("a").await.unwrap(), key);
         keys.copy("a", "b").await.unwrap();
         keys.destroy("a").await.unwrap();
-        assert_ne!(keys.key("a").await.unwrap(), key, "a destroyed key is never recovered");
+        keys.destroy("a").await.unwrap();
+        let keys = LocalKeyService::new(directory.path()).unwrap();
+        assert!(keys.key("a").await.is_err());
+        assert!(keys.install("a", key).await.is_err());
+        assert!(keys.copy("b", "a").await.is_err());
         assert_eq!(keys.key("b").await.unwrap(), key, "a fork's copy survives its parent's deletion");
     }
 

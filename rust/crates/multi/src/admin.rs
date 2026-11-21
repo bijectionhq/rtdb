@@ -4,7 +4,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 use std::time::Duration;
 
-use rtdb_directory::{Cas, DeploymentRecord, Directory, Lifecycle, MemberId, MemberRecord, MemberRole, MemberState, effective_holder, now_ms};
+use rtdb_directory::{Cas, DeploymentRecord, Directory, DisposalReceipt, Lifecycle, MemberId, MemberRecord, MemberRole, MemberState, effective_holder, now_ms};
 use rtdb_logkeeper::StreamConfig;
 use rtdb_storage::log::LogOffset;
 use rtdb_types::{Anomaly, AnomalyCategory, Result};
@@ -295,33 +295,88 @@ pub async fn move_cell(map: &dyn crate::cells::CellMap, from: &CellHandle<'_>, t
     Ok(arrived)
 }
 
-/// What a deletion did, kept as its record.
-#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
-pub struct DeletionRecord { pub deployment: String, pub name: String, pub key_destroyed_at_ms: i64, pub objects_erased_at_ms: i64, pub verified_empty: bool }
+async fn update_disposal(
+    directory: &dyn Directory,
+    id: &str,
+    change: impl Fn(&mut DeploymentRecord) -> Result<()>,
+) -> Result<DeploymentRecord> {
+    for _ in 0..8 {
+        let current = directory.deployment(id).await?.ok_or_else(|| {
+            Anomaly::incorrect("rtdb.multi/unknown-installation", format!("No installation has ID {id}"))
+        })?;
+        let mut next = current.clone();
+        change(&mut next)?;
+        if next == current {
+            return Ok(current);
+        }
+        if let Cas::Applied(stored) = directory.replace_deployment(next, current.version).await? {
+            return Ok(stored);
+        }
+    }
+    Err(Anomaly::new(AnomalyCategory::Conflict, "rtdb.multi/disposal-contended", format!("Installation {id} kept changing during disposal")))
+}
 
-/// Fences every writer, seals and trims the deployment's stream, destroys its key, erases its objects and proves its prefix empty.
-pub async fn delete_deployment(directory: &dyn Directory, storage: &CellStorage, keys: &dyn KeyService, name: &str, maximum_message_bytes: usize) -> Result<DeletionRecord> {
-    let fenced = update(directory, name, |record| {
-        if matches!(record.lifecycle, Lifecycle::Deleted) { return Err(Anomaly::incorrect("rtdb.multi/deleted", format!("{name} is already deleted"))); }
-        record.lifecycle = Lifecycle::Deleting;
-        record.epoch += 1;
-        record.holder = None;
-        Ok(())
+/// Fences and removes an installation's serving storage. The installation's tombstone
+/// retains the receipt so a lost response can be recovered without opening that storage.
+pub async fn delete_deployment(directory: &dyn Directory, storage: &CellStorage, keys: &dyn KeyService, id: &str, maximum_message_bytes: usize) -> Result<DisposalReceipt> {
+    let fenced = update_disposal(directory, id, |record| {
+        match record.lifecycle {
+            Lifecycle::Deleted if record.disposal.is_some() => Ok(()),
+            Lifecycle::Deleting => Ok(()),
+            Lifecycle::Live | Lifecycle::Quarantined if record.move_from.is_none() => {
+                record.lifecycle = Lifecycle::Deleting;
+                record.epoch = record.epoch.checked_add(1).ok_or_else(|| {
+                    Anomaly::fault("rtdb.multi/epoch-exhausted", format!("Installation {id} has no remaining writer epochs"))
+                })?;
+                record.holder = None;
+                record.move_intent = None;
+                Ok(())
+            }
+            _ => Err(Anomaly::new(AnomalyCategory::Conflict, "rtdb.multi/not-disposable", format!("Installation {id} cannot be disposed in this cell"))),
+        }
     }).await?;
+    if let Some(receipt) = fenced.disposal {
+        return Ok(receipt);
+    }
     let members = members(directory).await?;
-    let servers: Vec<String> = fenced.ensemble.iter().filter_map(|id| members.get(id).map(|member| member.address.clone())).collect();
-    let stream = StreamConfig { write_quorum: write_quorum(servers.len()), servers, stream: fenced.stream("replica"), maximum_message_bytes };
+    let servers: Vec<String> = fenced.ensemble.iter().map(|id| {
+        members.get(id).map(|member| member.address.clone()).ok_or_else(|| {
+            Anomaly::new(AnomalyCategory::Unavailable, "rtdb.multi/disposal-ensemble", format!("Logkeeper {id} is missing from the directory"))
+        })
+    }).collect::<Result<_>>()?;
+    let stream = StreamConfig { write_quorum: write_quorum(fenced.ensemble.len()), servers, stream: fenced.stream("replica"), maximum_message_bytes };
     let last = rtdb_logkeeper::seal(&stream, fenced.epoch).await?;
     if last.0 >= 0 { rtdb_logkeeper::trim(&stream, LogOffset(last.0)).await?; }
     keys.destroy(&fenced.id).await?;
-    let key_destroyed_at_ms = now_ms();
+    let key_withdrawn_at_ms = now_ms();
     let bucket = storage.bucket(rtdb_storage::IoRegion::new()).await?;
     // Its forks keep what they share with it: those objects are copied into them before it goes.
     let others: Vec<DeploymentRecord> = directory.deployments().await?.into_iter().filter(|record| record.id != fenced.id).collect();
-    let verified_empty = crate::reference::erase_deployment(bucket.as_ref(), &fenced.storage_prefix(), &others).await?;
-    let deletion = DeletionRecord { deployment: fenced.id.clone(), name: name.to_owned(), key_destroyed_at_ms, objects_erased_at_ms: now_ms(), verified_empty };
-    update(directory, name, |record| { record.lifecycle = Lifecycle::Deleted; Ok(()) }).await?;
-    Ok(deletion)
+    if !crate::reference::erase_deployment(bucket.as_ref(), &fenced.storage_prefix(), &others).await? {
+        return Err(Anomaly::new(AnomalyCategory::Unavailable, "rtdb.multi/disposal-prefix", format!("Installation {id} still has serving objects")));
+    }
+    let receipt = DisposalReceipt {
+        deployment: fenced.id,
+        incarnation: fenced.incarnation,
+        epoch: fenced.epoch,
+        key_withdrawn_at_ms,
+        serving_prefix_observed_empty_at_ms: now_ms(),
+    };
+    let deleted = update_disposal(directory, id, |record| {
+        if record.epoch != receipt.epoch || record.incarnation != receipt.incarnation {
+            return Err(Anomaly::new(AnomalyCategory::Conflict, "rtdb.multi/disposal-fence", format!("Installation {id} changed during disposal")));
+        }
+        match record.lifecycle {
+            Lifecycle::Deleted if record.disposal.is_some() => Ok(()),
+            Lifecycle::Deleting => {
+                record.disposal = Some(receipt.clone());
+                record.lifecycle = Lifecycle::Deleted;
+                Ok(())
+            }
+            _ => Err(Anomaly::new(AnomalyCategory::Conflict, "rtdb.multi/disposal-fence", format!("Installation {id} left disposal"))),
+        }
+    }).await?;
+    deleted.disposal.ok_or_else(|| Anomaly::fault("rtdb.multi/disposal-receipt", format!("Installation {id} lacks a disposal receipt")))
 }
 
 /// What auditing a deployment's history found (`NoTwoWritersHaveEffect`, `SystemTimeRises`).

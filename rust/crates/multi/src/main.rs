@@ -31,7 +31,8 @@ Usage: rtdb-multi directory --listen ADDR\n\
        rtdb-multi read-width --directory DIR --name NAME --width N\n\
        rtdb-multi unquarantine --directory DIR --name NAME\n\
        rtdb-multi fork --directory DIR --storage-root PATH --keys PATH --from NAME --name NAME [--at-block N | --at-time RFC3339] [--grace SECONDS] [--cell-secret FILE]\n\
-       rtdb-multi delete --directory DIR --storage-root PATH --keys PATH --name NAME\n\n\
+       rtdb-multi delete --directory DIR --storage-root PATH --keys PATH --id UUID\n\
+       rtdb-multi disposal --directory DIR --id UUID\n\n\
 DIR is HOST:PORT of a directory server, or dynamodb:PREFIX for DynamoDB tables named PREFIX-deployments, PREFIX-deployment-names and PREFIX-members\n\
 (RTDB_DYNAMODB_ENDPOINT points at DynamoDB Local; requires the `dynamodb` feature).\n\
 For `--keys` use a private local directory or dynamodb:TABLE with an independently installed key table.\n";
@@ -67,6 +68,12 @@ impl Arguments {
     fn number<T: std::str::FromStr>(&self, name: &str, default: T) -> Result<T> {
         self.optional(name).map(|value| value.parse().map_err(|_| usage(format!("--{name} must be a number")))).transpose().map(|value| value.unwrap_or(default))
     }
+}
+
+fn installation_id(arguments: &Arguments) -> Result<uuid::Uuid> {
+    let raw_id = arguments.required("id")?;
+    uuid::Uuid::parse_str(raw_id).ok().filter(|id| !id.is_nil() && id.to_string() == raw_id)
+        .ok_or_else(|| usage("--id must be a canonical, nonzero UUID".into()))
 }
 
 async fn run(arguments: Vec<String>) -> Result<()> {
@@ -208,8 +215,17 @@ async fn run(arguments: Vec<String>) -> Result<()> {
         "delete" => {
             let directory = directory(arguments.required("directory")?).await?;
             let storage = CellStorage::parse(arguments.required("storage-root")?)?;
-            let deletion = admin::delete_deployment(directory.as_ref(), &storage, key_service(arguments.required("keys")?).await?.as_ref(), arguments.required("name")?, 4 << 20).await?;
+            let id = installation_id(&arguments)?;
+            let keys = key_service(arguments.required("keys")?).await?;
+            let deletion = admin::delete_deployment(directory.as_ref(), &storage, keys.as_ref(), &id.to_string(), 4 << 20).await?;
             println!("{}", serde_json::to_string_pretty(&deletion).expect("a record serializes"));
+            Ok(())
+        }
+        "disposal" => {
+            let directory = directory(arguments.required("directory")?).await?;
+            let id = installation_id(&arguments)?;
+            let receipt = directory.deployment(&id.to_string()).await?.and_then(|record| record.disposal);
+            println!("{}", serde_json::to_string_pretty(&receipt).expect("a receipt serializes"));
             Ok(())
         }
         "create" => {
@@ -220,9 +236,7 @@ async fn run(arguments: Vec<String>) -> Result<()> {
         }
         "install" => {
             let directory = directory(arguments.required("directory")?).await?;
-            let raw_id = arguments.required("id")?;
-            let id = uuid::Uuid::parse_str(raw_id).ok().filter(|id| id.to_string() == raw_id)
-                .ok_or_else(|| usage("--id must be a canonical UUID".into()))?;
+            let id = installation_id(&arguments)?;
             let record = admin::install_deployment(
                 directory.as_ref(), id, arguments.required("name")?, arguments.required("org")?,
                 arguments.number("replicas", 3usize)?,
