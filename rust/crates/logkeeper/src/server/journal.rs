@@ -171,7 +171,9 @@ fn list_segments(segments: &Path, remove_temporary: bool) -> Result<BTreeMap<u64
         match path.extension().and_then(|extension| extension.to_str()) {
             Some("seg") => {
                 let sequence = path.file_stem().and_then(|stem| stem.to_str()).and_then(|stem| stem.parse::<u64>().ok()).ok_or_else(|| corrupt(&path, "not a segment name"))?;
-                sequences.insert(sequence, path);
+                if sequences.insert(sequence, path.clone()).is_some() {
+                    return Err(corrupt(&path, format!("duplicate segment sequence {sequence}")));
+                }
             }
             Some("tmp") if remove_temporary => fs::remove_file(&path).map_err(|error| io_error(&path, error))?,
             _ => (),

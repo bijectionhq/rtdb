@@ -68,6 +68,12 @@ async fn a_stopped_journal_matches_the_online_digest_across_epochs_and_preserves
 
     let segment = std::fs::read_dir(&segments).unwrap().map(|entry| entry.unwrap().path())
         .filter(|path| path.extension().is_some_and(|extension| extension == "seg")).max().unwrap();
+    let sequence: u64 = segment.file_stem().unwrap().to_str().unwrap().parse().unwrap();
+    let alias = segments.join(format!("{sequence}.seg"));
+    std::fs::copy(&segment, &alias).unwrap();
+    assert!(rtdb_logkeeper::inspect_retained(directory, &stream.stream, None).is_err());
+    std::fs::remove_file(alias).unwrap();
+
     std::fs::OpenOptions::new().append(true).open(&segment).unwrap().write_all(b"damaged").unwrap();
     let damaged = std::fs::read(&segment).unwrap();
     assert!(rtdb_logkeeper::inspect_retained(directory, &stream.stream, None).is_err());
