@@ -744,6 +744,13 @@ impl NodeAgent {
         if record.move_from.is_some() {
             return Err(Anomaly::new(AnomalyCategory::Unavailable, "rtdb.multi/log-move-pending", format!("{name}'s holder has yet to adopt its log")));
         }
+        if self.holdings.lock().get(name).is_some_and(|holding| holding.id == record.id && holding.epoch == record.epoch) {
+            return Ok(Response::Subscribed { address: self.address.clone() });
+        }
+        let members = self.members().await?;
+        if !fragments && !crate::deployment::read_replicas(&record, &members, now_ms()).iter().any(|member| member.id == self.member()) {
+            return Err(Anomaly::new(AnomalyCategory::Unavailable, "rtdb.multi/read-width", format!("This node is outside the read width of {name}")));
+        }
         if let Some(subscription) = self.subscriptions.lock().get_mut(name) {
             // A snapshot never advances, so it is replaced by a replica rather than served as one.
             if subscription.id == record.id && !matches!(subscription.role, Role::Snapshot(_)) && self.node.catalog().database(name).is_ok() {
@@ -752,8 +759,6 @@ impl NodeAgent {
                 return Ok(Response::Subscribed { address: self.address.clone() });
             }
         }
-        if self.holdings.lock().contains_key(name) { return Ok(Response::Subscribed { address: self.address.clone() }); }
-        let members = self.members().await?;
         let configuration = database_config(&record, ensemble_servers(&record, &members)?, &self.options.storage, Role::Subscriber);
         self.stop_running(name).await;
         self.node.database_or_attach(name.to_owned(), configuration).await?
@@ -1041,8 +1046,18 @@ impl NodeAgent {
         if let Some(limit) = self.options.max_tail_rows { self.bound_tails(limit).await; }
         let subscribed: Vec<(String, String, Instant, Instant, bool, bool)> = self.subscriptions.lock().iter().filter(|(_, subscription)| subscription.role != Role::Compactor)
             .map(|(name, subscription)| (name.clone(), subscription.id.clone(), subscription.last_touch, subscription.opened, matches!(subscription.role, Role::Snapshot(_)), subscription.fragments)).collect();
+        let reader_members = if subscribed.iter().any(|(_, _, _, _, snapshot, fragments)| !snapshot && !fragments) {
+            self.members().await.ok()
+        } else { None };
         for (name, id, last_touch, opened, snapshot, fragments) in subscribed {
-            let wanted = matches!(self.directory.deployment(&id).await, Ok(Some(record)) if record.lifecycle == Lifecycle::Live && (snapshot || fragments || record.read_width > 1));
+            let wanted = match self.directory.deployment(&id).await {
+                Ok(Some(record)) if record.lifecycle == Lifecycle::Live => snapshot || fragments
+                    || (record.read_width > 1 && reader_members.as_ref().is_none_or(|members| {
+                        crate::deployment::read_replicas(&record, members, now_ms()).iter().any(|member| member.id == me)
+                    })),
+                Ok(_) => false,
+                Err(_) => true,
+            };
             // A snapshot closes before the reaper's grace could erase what it reads.
             let expired = snapshot && opened.elapsed() >= self.options.snapshot_lifetime;
             if draining || !wanted || expired || last_touch.elapsed() >= self.options.unsubscribe_after || self.node.catalog().database(&name).is_err() {

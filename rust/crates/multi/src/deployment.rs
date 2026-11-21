@@ -293,6 +293,17 @@ pub(crate) fn select_logkeepers<'a>(key: &str, width: usize, mut selected: Vec<&
     selected
 }
 
+pub(crate) fn read_replicas<'a>(record: &DeploymentRecord, members: &'a BTreeMap<MemberId, MemberRecord>, now: i64) -> Vec<&'a MemberRecord> {
+    if record.read_width <= 1 { return Vec::new(); }
+    let holder = rtdb_directory::effective_holder(record, members, now);
+    let nodes: Vec<_> = members.values().filter(|member| {
+        holder != Some(&member.id) && record.may_place_on(member, now) && member.control_address.is_some()
+            && record.storage_namespaces.is_none_or(|namespaces| member.storage_namespaces == Some(namespaces))
+    }).collect();
+    rtdb_affinity::rank(&record.storage_identity(), &nodes, |member| member.id.as_str()).into_iter().copied()
+        .take(record.read_width.saturating_sub(1) as usize).collect()
+}
+
 pub(crate) fn ensemble_servers(record: &DeploymentRecord, members: &BTreeMap<MemberId, MemberRecord>) -> Result<Vec<String>> {
     record.ensemble.iter().map(|id| {
         members.get(id).filter(|member| member.role == MemberRole::Logkeeper).map(|member| member.address.clone())

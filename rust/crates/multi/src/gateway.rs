@@ -348,7 +348,7 @@ async fn route(router: &GatewayRouter) -> Result<(TcpStream, Option<String>, u64
         }
     }
     if router.read_only && record.read_width > 1 && record.lifecycle == Lifecycle::Live {
-        let mut readers = replicas(&record, &members);
+        let mut readers = crate::deployment::read_replicas(&record, &members, now_ms());
         let count = readers.len();
         if count > 1 {
             readers.rotate_left(router.connection_index % count);
@@ -406,15 +406,6 @@ fn snapshot_readers<'a>(record: &DeploymentRecord, members: &'a BTreeMap<MemberI
         .partition(|member| holder.as_ref() != Some(&member.id));
     others.extend(holders);
     others
-}
-
-/// The nodes that may serve the deployment's reads beside its holder: the ranks after the holder's, within its read width.
-fn replicas<'a>(record: &DeploymentRecord, members: &'a BTreeMap<MemberId, MemberRecord>) -> Vec<&'a MemberRecord> {
-    let now = now_ms();
-    let holder = effective_holder(record, members, now).cloned();
-    let nodes: Vec<&MemberRecord> = members.values().filter(|member| record.may_place_on(member, now)).collect();
-    rtdb_affinity::rank(&record.storage_identity(), &nodes, |member| member.id.as_str()).into_iter().copied()
-        .filter(|member| holder.as_ref() != Some(&member.id)).take(record.read_width.saturating_sub(1) as usize).collect()
 }
 
 /// The holder that counts, then every node that may take a placement, in the deployment's affinity order.

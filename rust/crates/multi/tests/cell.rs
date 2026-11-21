@@ -890,6 +890,14 @@ async fn read_only_sessions_spread_across_the_deployments_read_width() {
     for reader in &readers {
         assert_eq!(values(reader, "SELECT total FROM orders").await, ["10"]);
     }
+    admin::set_read_width(cell.directory.as_ref(), "shop", 2).await.unwrap();
+    let replicas = (0..3).filter(|replica| *replica != holder).collect::<Vec<_>>();
+    for &replica in &replicas { cell.node(replica).agent.reconcile().await; }
+    let (active, closed): (Vec<_>, Vec<_>) = replicas.into_iter()
+        .partition(|&replica| cell.node(replica).agent.subscribed() == ["shop"]);
+    assert_eq!((active.len(), closed.len()), (1, 1));
+    assert_eq!(cell.node(closed[0]).agent.subscribe("shop").await.unwrap_err().code, "rtdb.multi/read-width");
+    for reader in &readers { assert_eq!(values(reader, "SELECT total FROM orders").await, ["10"]); }
     drop((readers, writer));
     cell.stop().await;
 }
@@ -2338,6 +2346,9 @@ async fn a_snapshot_session_reads_the_checkpoint_from_object_storage_on_another_
     assert!(cell.node(1 - holder).agent.subscribed().contains(&"shop".to_owned()), "on a node that does not hold it");
     assert!(snapshot.simple_query("INSERT INTO orders (_id, total) VALUES (7, 1)").await.is_err(), "and it never writes");
     let reader = cell.node(1 - holder);
+    assert_eq!(reader.agent.subscribe("shop").await.unwrap_err().code, "rtdb.multi/read-width");
+    assert!(reader.agent.subscribed_snapshots().contains(&"shop".to_owned()));
+    admin::set_read_width(cell.directory.as_ref(), "shop", 2).await.unwrap();
     assert!(matches!(reader.agent.subscribe("shop").await, Err(_) | Ok(rtdb_multi::control::Response::Subscribed { .. })));
     assert!(!reader.agent.subscribed_snapshots().contains(&"shop".to_owned()), "asked for a replica, a node replaces its snapshot rather than serve it as one");
     drop((snapshot, client));

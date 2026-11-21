@@ -1838,6 +1838,7 @@ rule WidenOnPressure {
 }
 
 rule NarrowOnQuiet {
+    -- A replica outside the remaining affinity ranks retires when the node observes the narrower width.
     when: ReadQuiet(deployment)
 
     requires: deployment.read_width > 1

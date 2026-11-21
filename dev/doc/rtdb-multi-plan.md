@@ -820,6 +820,9 @@ Read-your-writes across tiers; a zombie holder cannot serve a linearizable read;
 
 **Done when** a hot deployment's reads spread across its read width with bounded staleness.
 
+Nodes use the same eligible affinity ranks as the gateway when opening a log-fed read replica.
+A narrower width retires existing out-of-rank replicas, and their gateway sessions reconnect within the remaining width.
+
 ### Stage 11: the controller
 
 **Why.**
