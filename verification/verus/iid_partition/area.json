@@ -188,6 +188,10 @@
         "file": "rust/crates/trie/src/leaf_split_step.rs",
         "function": "split_subtree",
         "category": "assertion failed"
+      }, {
+        "file": "rust/crates/trie/src/leaf_split_step.rs",
+        "function": "split_subtree",
+        "category": "assertion failed"
       }],
       "min_verified_functions": 24
     },
