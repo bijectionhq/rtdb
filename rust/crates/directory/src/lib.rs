@@ -228,6 +228,12 @@ impl DeploymentRecord {
             ensemble, replica_journals: BTreeSet::new(), storage_regions: BTreeSet::new(), read_width: 1, activation_crashes: 0, created_at_ms: now_ms, move_intent: None, log_epoch: 0, parent: None, move_from: None, linearizable_reads: false, checkpoint: None, moved_at_ms: None, cell_transfer: None, disposal: None, checkpoint_recovery: None, version: 0 }
     }
 
+    pub fn can_fork(&self) -> bool {
+        matches!(self.lifecycle, Lifecycle::Live | Lifecycle::Quarantined)
+            && self.move_from.is_none()
+            && self.checkpoint_recovery.is_none()
+    }
+
     /// The affinity key: stable across epochs and residency, distinct across incarnations.
     pub fn storage_identity(&self) -> String { format!("{}/{}", self.id, self.incarnation) }
 
@@ -265,6 +271,8 @@ impl<T> Cas<T> {
 pub trait Directory: Send + Sync {
     /// Stores a new deployment; refuses if its id or name is taken.
     async fn create_deployment(&self, record: DeploymentRecord) -> Result<DeploymentRecord>;
+    /// Publishes a fork and its name only while the expected parent is still eligible.
+    async fn create_fork(&self, child: DeploymentRecord, expected_parent: Version) -> Result<DeploymentRecord>;
     async fn deployment(&self, id: &str) -> Result<Option<DeploymentRecord>>;
     async fn deployment_by_name(&self, name: &str) -> Result<Option<DeploymentRecord>>;
     async fn deployments(&self) -> Result<Vec<DeploymentRecord>>;
@@ -292,6 +300,25 @@ pub fn now_ms() -> i64 {
 
 pub fn exists(what: &str, key: &str) -> Anomaly {
     Anomaly::new(AnomalyCategory::Conflict, "rtdb.directory/exists", format!("{what} already exists: {key}")).with_context("key", key.into())
+}
+
+fn fork_parent_id(child: &DeploymentRecord) -> Result<&str> {
+    child.parent.as_deref().filter(|id| *id != child.id)
+        .ok_or_else(|| Anomaly::incorrect("rtdb.directory/fork-parent", "A fork must name its parent deployment"))
+}
+
+fn fork_conflict() -> Anomaly {
+    Anomaly::new(AnomalyCategory::Conflict, "rtdb.directory/fork-parent-changed", "The fork's parent changed before the child could be published")
+}
+
+fn check_fork_parent(child: &DeploymentRecord, parent: Option<&DeploymentRecord>, expected: Version) -> Result<()> {
+    if parent.is_some_and(|parent| parent.version == expected && parent.can_fork()
+        && parent.org == child.org && parent.lineage == child.lineage)
+    {
+        Ok(())
+    } else {
+        Err(fork_conflict())
+    }
 }
 
 /// A single-process directory with an optional durable local state file.
@@ -344,20 +371,28 @@ impl MemoryDirectory {
         }
         Ok(())
     }
-}
-
-#[async_trait]
-impl Directory for MemoryDirectory {
-    async fn create_deployment(&self, mut record: DeploymentRecord) -> Result<DeploymentRecord> {
-        let mut state = self.state()?;
+    fn insert_deployment(&self, state: &mut MemoryState, mut record: DeploymentRecord) -> Result<DeploymentRecord> {
         if state.deployments.contains_key(&record.id) { return Err(exists("Deployment", &record.id)); }
         if state.names.contains_key(&record.name) { return Err(exists("Deployment name", &record.name)); }
         record.version = 1;
         state.names.insert(record.name.clone(), record.id.clone());
         state.deployments.insert(record.id.clone(), record.clone());
-        self.persist(&mut state)?;
+        self.persist(state)?;
         self.changes.publish(record.clone());
         Ok(record)
+    }
+}
+
+#[async_trait]
+impl Directory for MemoryDirectory {
+    async fn create_deployment(&self, record: DeploymentRecord) -> Result<DeploymentRecord> {
+        let mut state = self.state()?;
+        self.insert_deployment(&mut state, record)
+    }
+    async fn create_fork(&self, child: DeploymentRecord, expected_parent: Version) -> Result<DeploymentRecord> {
+        let mut state = self.state()?;
+        check_fork_parent(&child, state.deployments.get(fork_parent_id(&child)?), expected_parent)?;
+        self.insert_deployment(&mut state, child)
     }
     async fn deployment(&self, id: &str) -> Result<Option<DeploymentRecord>> { Ok(self.state()?.deployments.get(id).cloned()) }
     async fn deployment_by_name(&self, name: &str) -> Result<Option<DeploymentRecord>> {

@@ -1634,7 +1634,10 @@ rule Fork {
     -- Its first manifest references the parent's objects at the fork basis, plus one pack holding the parent's tail up to that basis.
     when: ForkRequested(parent, basis, org)
 
+    -- The child and its name publish at a version that still admits forks.
+    -- The writer epoch and storage generation match the staged basis.
     requires: org = parent.org
+              and parent.lifecycle in {live, quarantined}
 
     ensures:
         let child = DeploymentId.created()

@@ -71,6 +71,7 @@ mod tests {
     #[async_trait]
     impl Directory for Scripted {
         async fn create_deployment(&self, record: DeploymentRecord) -> Result<DeploymentRecord> { self.inner.create_deployment(record).await }
+        async fn create_fork(&self, child: DeploymentRecord, expected_parent: Version) -> Result<DeploymentRecord> { self.inner.create_fork(child, expected_parent).await }
         async fn deployment(&self, id: &str) -> Result<Option<DeploymentRecord>> {
             let next = { let mut replies = self.replies.lock(); (!replies.is_empty()).then(|| replies.remove(0)) };
             match next { Some(record) => Ok(Some(record)), None => self.inner.deployment(id).await }

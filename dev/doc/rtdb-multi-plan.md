@@ -93,6 +93,13 @@ the receipt. Gateway sessions close when they observe retirement. Object
 versions, external backups and key copies in other cells have separate
 physical custody.
 
+A deployment fork stages its reference manifest and tail before publishing
+the child. The directory checks the parent's eligible version in the same
+transaction that creates the child and its name. Once retirement has fenced
+the parent, a staged child cannot acquire a visible reference to its objects.
+A publication with an uncertain outcome leaves the staged data available for
+the directory to resolve.
+
 On the private hosted lifecycle listener, every request includes its operation.
 The optional disposal credential authorizes `schedule_disposal` and
 `inspect_disposal` for a named root with an exact authority UUID. Scheduling

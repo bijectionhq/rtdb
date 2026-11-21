@@ -28,6 +28,7 @@ const MAX_LINE: u64 = 64 << 20;
 #[serde(rename_all = "snake_case")]
 enum Op {
     CreateDeployment { record: DeploymentRecord },
+    CreateFork { child: DeploymentRecord, expected_parent: Version },
     Deployment { id: String },
     DeploymentByName { name: String },
     Deployments,
@@ -90,6 +91,7 @@ struct Response { id: u64, result: std::result::Result<Reply, Anomaly> }
 async fn dispatch(directory: &dyn Directory, op: Op) -> Result<Reply> {
     Ok(match op {
         Op::CreateDeployment { record } => Reply::Deployment(directory.create_deployment(record).await?),
+        Op::CreateFork { child, expected_parent } => Reply::Deployment(directory.create_fork(child, expected_parent).await?),
         Op::Deployment { id } => Reply::OptionalDeployment(directory.deployment(&id).await?),
         Op::DeploymentByName { name } => Reply::OptionalDeployment(directory.deployment_by_name(&name).await?),
         Op::Deployments => Reply::Deployments(directory.deployments().await?),
@@ -417,6 +419,9 @@ fn protocol(reply: Reply) -> Anomaly {
 impl Directory for RemoteDirectory {
     async fn create_deployment(&self, record: DeploymentRecord) -> Result<DeploymentRecord> {
         match self.call(Op::CreateDeployment { record }).await? { Reply::Deployment(record) => Ok(record), other => Err(protocol(other)) }
+    }
+    async fn create_fork(&self, child: DeploymentRecord, expected_parent: Version) -> Result<DeploymentRecord> {
+        match self.call(Op::CreateFork { child, expected_parent }).await? { Reply::Deployment(record) => Ok(record), other => Err(protocol(other)) }
     }
     async fn deployment(&self, id: &str) -> Result<Option<DeploymentRecord>> {
         match self.call(Op::Deployment { id: id.to_owned() }).await? { Reply::OptionalDeployment(record) => Ok(record), other => Err(protocol(other)) }
