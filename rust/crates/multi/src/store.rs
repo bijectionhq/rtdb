@@ -1444,6 +1444,74 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn ordered_index_reaper_aborts_a_superseded_provider_upload() {
+        use rtdb_directory::OrderedIndexStorage;
+        use rtdb_storage::remote::PublicationUploads;
+
+        let Ok(endpoint) = std::env::var("RTDB_S3_ENDPOINT") else { return };
+        if !endpoint.starts_with("http://127.0.0.1:") { return; }
+        let bucket_name = std::env::var("RTDB_S3_BUCKET").expect("a versioned fixture bucket");
+        let mut config = rtdb_s3::S3Config::new(&bucket_name);
+        config.endpoint = Some(endpoint);
+        config.region = Some("us-east-1".into());
+        config.path_style_access_enabled = true;
+        config.prefix = Some(format!("ordered-index-upload-{}", Uuid::new_v4()));
+        let root = CellStorage::s3_root(&config).unwrap();
+        let inventory = CellStorage::s3_inventory(&config).await.unwrap();
+        let storage = CellStorage::S3 { config };
+        let bucket = storage.bucket(IoRegion::new()).await.unwrap();
+
+        let directory = rtdb_directory::MemoryDirectory::new();
+        let region = Uuid::new_v4();
+        let attempt = Uuid::new_v4();
+        let mut record = DeploymentRecord::new("shop", "acme", Vec::new(), 0);
+        record.epoch = 1;
+        record.storage_regions.insert(region, remote_storage_region(None, None));
+        let index = format!(
+            "{}/v06/{}/0000000000000001-{}", record.storage_prefix(),
+            rtdb_format::keys::ORDERED_INDEX_ROOT, "a".repeat(64),
+        );
+        record.ordered_indexes.insert(index.clone(), OrderedIndexStorage {
+            generations: BTreeMap::from([(0, BTreeMap::from([(Uuid::new_v4(), region)]))]),
+            ..Default::default()
+        });
+        let record = directory.create_deployment(record).await.unwrap();
+        let old = key(&format!("{index}/generations/0000000000000000"));
+        let replacement = key(&format!("{index}/generations/0000000000000002"));
+        let object = key(&format!("{old}/pages/pending"));
+        let upload_path = format!("{root}/{object}").into();
+        let upload = inventory.reserve(&upload_path, attempt).await.unwrap();
+        let journal = DirectoryPublications {
+            directory: directory.clone(), deployment: record.id.clone(), region,
+            writer_epoch: Some(record.epoch), owner: PublicationOwner::Serving,
+        };
+        journal.admit(&object, attempt, &upload).await.unwrap();
+        bucket.put(&key(&format!("{old}/pages/visible")), Bytes::from_static(b"old")).await.unwrap();
+        bucket.put(&key(&format!("{replacement}/pages/visible")), Bytes::from_static(b"replacement")).await.unwrap();
+
+        let closed = crate::admin::update_installation(directory.as_ref(), &record.id, |current| {
+            current.epoch = 2;
+            current.ordered_indexes.get_mut(&index).unwrap().retire_earlier(2);
+            Ok(())
+        }).await.unwrap();
+        assert!(journal.admit(&object, Uuid::new_v4(), &upload).await.is_err());
+        ordered_index_storage::reap(directory.as_ref(), &storage, bucket.as_ref(), &closed).await.unwrap();
+        assert!(!inventory.is_empty(&old).await.unwrap());
+
+        release_region(directory.as_ref(), &record.id, region, false).await.unwrap();
+        let drained = directory.deployment(&record.id).await.unwrap().unwrap();
+        ordered_index_storage::reap(directory.as_ref(), &storage, bucket.as_ref(), &drained).await.unwrap();
+        assert!(inventory.complete(&upload_path, &upload, Bytes::from_static(b"late")).await.is_err());
+        assert!(inventory.is_empty(&old).await.unwrap());
+        assert!(!inventory.is_empty(&replacement).await.unwrap());
+        let reaped = directory.deployment(&record.id).await.unwrap().unwrap();
+        assert!(!reaped.ordered_indexes[&index].generations.contains_key(&0));
+        assert!(matches!(&reaped.storage_regions[&region], StorageRegion::Remote { publications, .. }
+            if !publications.contains_key(&attempt)));
+        inventory.purge(&replacement).await.unwrap();
+    }
+
+    #[tokio::test]
     async fn the_local_reaper_recovers_a_region_after_its_owner_drops_the_witness() {
         let files = tempfile::tempdir().unwrap();
         let keys = crate::keys::LocalKeyService::new(files.path().join("keys")).unwrap();

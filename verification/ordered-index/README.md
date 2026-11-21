@@ -4,15 +4,15 @@ The reference answer resolves the original captured event stream at the requeste
 The proof sources in this directory decompose that specification.
 The checker results and the remaining production obligations appear below.
 
-| Property | Proof source | Production refinement still required |
+| Property | Proof source | Production boundary |
 | --- | --- | --- |
-| Temporal projection and exact membership | `Temporal.lean` specifies point lookup against independent event interpretation and a single visible span per IID. `Buckets.lean` proves exact coverage for a recursive dyadic decomposition and for any left-to-right tiling. | Connect RTDB's newest-first temporal resolver, coalescing, and greedy bucket iterator to the model. |
-| Signed timestamps, unbounded end and bucket lookup | `domain.rs` checks production timestamp conversion, aligned bucket lookup and the maximal aligned step used by the bucket iterator. | Relate the iterator state and termination to the complete tiling in `Buckets.lean`. |
-| Ordered seek, eligibility and pagination | `SeekRange.lean` states the monotone seek partition and fence pruning laws. `seek.rs` includes the production binary search and directed slot lookup. `OrderedRead.lean` states ordered merge, filtering before limit, and keyset continuation. | Connect Arrow values and SQL comparisons to the order and filters, and the tree cursor and heap to the ordered streams. |
-| Replay and fallback | `Recovery.lean` states equivalence for complete checkpoints and ordered tails. It also states exactly when the event count completes coverage. `Reachability.lean` states layout identity across a checkpoint split. | The adopted L0 inventory supplies the flushed input identities and lengths. Connect live segment offsets and the immutable file bytes to the exact capture. |
-| Publication and reclamation | `Checkpoint.tla` models a captured reader, two workers, immutable objects, publication, collection, fallback, and crash. The two control configurations remove checked source identity and complete upload. `Reachability.lean` states how a stale mark preserves later reachable pages under the per-block sharing rule. | Prove the sharing rule for `Tree::persist` and `store_roots`, and connect reader retention, leadership and immutable writes to the protocol. |
-| Erasure | `Temporal.lean` states how erase cuts the captured IID's prior history, including historical system-time reads. | Connect revision-directory scrubbing and physical collection across object and node caches to the model. `ErasureCleanup.tla` models the durable cleanup obligation under a single fail-stop owner. `ErasureRelease.tla` checks the requirement for fenced writes and replica eviction. |
-| Bijection page witnesses | `OrderedRead.lean` proves how agreement over the consumed ordered prefix preserves the page. `DistinctPage.lean` proves the ordered distinct candidate prefix, clearance before deduplication, and the preservation of global prefix keys under each local limit. | Bind the per-world SQL results and protected custody streams to the candidate sets used at acquisition and revalidation. |
+| Temporal projection and exact membership | `Temporal.lean` specifies point lookup against independent event interpretation and a single visible span per IID. `Buckets.lean` proves exact coverage for a recursive dyadic decomposition and for any left-to-right tiling. | The projection uses the admitted temporal resolver. The composition uses exact tiling and checked timestamp and ceiling decisions. |
+| Signed timestamps, unbounded end and bucket lookup | `domain.rs` checks production timestamp conversion, aligned bucket lookup and the maximal aligned step used by the bucket iterator. | The iterator supplies a complete aligned tiling. Each production step preserves the range and advances to the maximal aligned boundary. |
+| Ordered seek, eligibility and pagination | `SeekRange.lean` states the monotone seek partition and fence pruning laws. `seek.rs` includes the production binary search and directed slot lookup. `OrderedRead.lean` states ordered merge, filtering before limit, and keyset continuation. | The native path interprets Arrow comparisons and filters before limiting the merged streams. The paired run checks that path at labelled forward and reverse reads. |
+| Replay and fallback | `Recovery.lean` states equivalence for complete checkpoints and ordered tails. It also states exactly when the event count completes coverage. `Reachability.lean` states layout identity across a checkpoint split. | The adopted L0 inventory supplies flushed identities and lengths. Exact immutable bytes and the live segments must come from the captured snapshot. |
+| Publication and reclamation | `Checkpoint.tla` models a captured reader, two workers, immutable objects, publication, collection, fallback, and crash. The two control configurations remove checked source identity and complete upload. `Reachability.lean` states how a stale mark preserves later reachable pages under the per-block sharing rule. | The missing-root regression checks stable addresses through repair. The protocol uses immutable publication and tracked replica permits. |
+| Erasure | `Temporal.lean` states how erase cuts the captured IID's prior history, including historical system-time reads. | Capture-based replay scrubs before publishing. `ErasureCleanup.tla` checks the cleanup obligation, and `ScopeRetirement.tla` checks the provider admission, replica permit, settlement, and reclamation protocol. |
+| Bijection page witnesses | `OrderedRead.lean` proves how agreement over the consumed ordered prefix preserves the page. `DistinctPage.lean` proves the ordered distinct candidate prefix, clearance before deduplication, and the preservation of global prefix keys under each local limit. | The paired fixture binds the per-world SQL results and custody streams to acquisition and revalidation. Complete SQL prefixes and authentic custody inputs are refinement premises. |
 
 `CheckpointCountOnly.cfg` should produce a wrong answer when a replay substitutes an event with a duplicate while preserving the count.
 `CheckpointEarlyPublish.cfg` should expose a reachable manifest that references a missing object.
@@ -185,7 +185,11 @@ The hosted PgWire regression exercised erase, replica permits, the production
 reaper, and the retained page against a version-enabled MinIO instance.
 A separate S3 runtime regression checked noncurrent versions, a delete marker,
 a prefix containing only a multipart upload, exact upload abort, and isolation
-from a neighboring generation. These tests cover the local provider
+from a neighboring generation. A provider fault regression also exercised the
+production journal with a superseded writer. The reaper kept the scope while
+its serving region was active, then confirmed abort and reclaimed its versions.
+An attempted completion with the original upload ID failed after reclamation.
+These tests cover the local provider
 implementation and the selected failure schedules. The model assumes the
 provider's confirmed abort and inventory contracts. Primary L0 files are a
 separate custody boundary.
