@@ -1728,6 +1728,7 @@ surface QueryAccess {
 
     @guarantee ColumnarScanProjection
         -- A scan preserves compatible list and struct columns as Arrow arrays when projecting selected rows.
+        -- A projected field missing from some pages uses Arrow nulls when the available columns share a layout or form a scalar dense union.
         -- A projected scalar dense union retains its Arrow array when it already matches the result layout.
 }
 

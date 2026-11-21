@@ -84,6 +84,7 @@ Spill files are scoped temporary resources with a retained-byte quota.
 * Persisted scans open the Arrow footer and request the pages that survive pruning.
   Compatible uncompressed columns can keep their source buffers through IPC decoding and through contiguous scan selections.
   Compatible lists and structs stay columnar through scan projection.
+  Projected columns use Arrow nulls for pages where the field is absent when the other pages share a layout or form a scalar union.
   A scalar dense union that matches the result layout keeps its Arrow array at the query cursor.
   The buffer pool can retain decoded pages and parsed footers independently of the file's encoded payload.
 * The temporal resolver sees puts, deletes, and erases before a projected document reaches a value predicate.

@@ -176,7 +176,13 @@ fn stored(sources: &[Source], cells: &[(usize, usize)], name: &str) -> Result<Co
         let index = fields.iter().position(|field| field.name() == name)?;
         Some((Arc::clone(source.put.column(index)), Arc::clone(&fields[index]), source.batch.put_field_type(index).cloned()))
     }).collect();
-    let Some((_, field, logical)) = children.iter().flatten().next().cloned() else { return Ok(Column::Values(vec![Value::Null; cells.len()])) };
+    let Some((_, field, logical)) = children.iter().flatten().next().cloned() else {
+        return Ok(Column::Arrow {
+            array: Arc::new(arrow_array::NullArray::new(cells.len())),
+            field: Arc::new(ArrowField::new(name, DataType::Null, true)),
+            logical: Some(LogicalType::Null),
+        });
+    };
     let uniform = children.iter().all(|child| child.as_ref().is_some_and(|(_, other, other_logical)| other == &field && other_logical == &logical));
     if uniform {
         let arrays: Vec<&dyn Array> = children.iter().flatten().map(|(array, ..)| array.as_ref()).collect();
@@ -189,7 +195,10 @@ fn stored(sources: &[Source], cells: &[(usize, usize)], name: &str) -> Result<Co
             }
         }
     }
-    if !uniform && let Some(column) = joined_union(&children, cells, name)? { return Ok(column); }
+    if !uniform {
+        if let Some(column) = joined_nullable(&children, cells, &field, &logical)? { return Ok(column); }
+        if let Some(column) = joined_union(&children, cells, name)? { return Ok(column); }
+    }
     cells.iter().map(|&(source, offset)| match &children[source] {
         None => Ok(Value::Null),
         Some((array, field, logical)) => {
@@ -199,15 +208,42 @@ fn stored(sources: &[Source], cells: &[(usize, usize)], name: &str) -> Result<Co
     }).collect::<Result<Vec<_>>>().map(Column::Values)
 }
 
-/// Gathers a column whose sources store it in different scalar layouts, as a column written with several integer widths
-/// across transactions is, into the dense union of their layouts. `None` where a leg can't be told apart by its layout.
+fn joined_nullable(children: &[Option<(ArrayRef, Arc<ArrowField>, Option<LogicalType>)>], cells: &[(usize, usize)],
+    field: &ArrowField, logical: &Option<LogicalType>) -> Result<Option<Column>> {
+    let Some(logical) = logical else { return Ok(None) };
+    if matches!(field.data_type(), DataType::Union(..)) { return Ok(None); }
+    let nullable = logical.clone().maybe();
+    for (array, other_field, other_logical) in children.iter().flatten() {
+        if other_field.data_type() != field.data_type() || other_field.metadata() != field.metadata()
+            || other_logical.as_ref().is_none_or(|other| other.clone().maybe() != nullable)
+            || !can_interleave_nested(array.as_ref()) {
+            return Ok(None);
+        }
+    }
+    let selected: Vec<_> = cells.iter().map(|&(source, row)| {
+        if children[source].is_some() { (source, row) } else { (children.len(), 0) }
+    }).collect();
+    let nulls = arrow_array::new_null_array(field.data_type(), usize::from(children.iter().any(Option::is_none)));
+    let arrays: Vec<_> = children.iter().map(|child| child.as_ref().map_or(nulls.as_ref(), |(array, ..)| array.as_ref()))
+        .chain(std::iter::once(nulls.as_ref())).collect();
+    match interleave(&arrays, &selected) {
+        Ok(array) => Ok(Some(Column::Arrow { array, field: Arc::new(field.clone().with_nullable(true)), logical: Some(nullable) })),
+        Err(error) if flat(field.data_type()) => Err(error),
+        Err(_) => Ok(None),
+    }
+}
+
+/// Gathers different scalar layouts into a dense union with a null leg for any missing sources.
+/// Returns `None` when a leg cannot be identified unambiguously by its physical layout.
 fn joined_union(children: &[Option<(ArrayRef, Arc<ArrowField>, Option<LogicalType>)>], cells: &[(usize, usize)], name: &str) -> Result<Option<Column>> {
-    enum Layout<'a> { Scalar(i8, &'a dyn Array), Union(&'a UnionArray, Vec<Option<i8>>) }
+    enum Layout<'a> { Missing, Scalar(i8, &'a dyn Array), Union(&'a UnionArray, Vec<Option<i8>>) }
     let mut logicals = Vec::with_capacity(children.len());
     for child in children {
-        let Some((_, field, Some(logical))) = child else { return Ok(None) };
-        if !flat(field.data_type()) { return Ok(None); }
-        logicals.push(logical);
+        match child {
+            None => logicals.push(&LogicalType::Null),
+            Some((_, field, Some(logical))) if flat(field.data_type()) => logicals.push(logical),
+            _ => return Ok(None),
+        }
     }
     let logical = LogicalType::join_all(logicals.iter().copied());
     let target = rtdb_columnar::to_field(name, &logical)?;
@@ -219,7 +255,8 @@ fn joined_union(children: &[Option<(ArrayRef, Arc<ArrowField>, Option<LogicalTyp
     };
     let null_leg = legs.iter().find(|(_, leg)| leg.data_type() == &DataType::Null).map(|(id, _)| id);
     let mut layouts = Vec::with_capacity(children.len());
-    for (array, field, _) in children.iter().flatten() {
+    for child in children {
+        let Some((array, field, _)) = child else { layouts.push(Layout::Missing); continue; };
         layouts.push(match field.data_type() {
             DataType::Union(source_legs, _) => {
                 let union = array.as_any().downcast_ref::<UnionArray>().ok_or_else(|| invalid("column-gather", "A union source is not a union"))?;
@@ -239,7 +276,7 @@ fn joined_union(children: &[Option<(ArrayRef, Arc<ArrowField>, Option<LogicalTyp
     for &(source, row) in cells {
         let (leg, offset) = match &layouts[source] {
             Layout::Scalar(leg, array) if !array.is_null(row) => (*leg, row),
-            Layout::Scalar(..) => match null_leg { Some(leg) => (leg, row), None => return Ok(None) },
+            Layout::Missing | Layout::Scalar(..) => match null_leg { Some(leg) => (leg, row), None => return Ok(None) },
             Layout::Union(union, map) => match map.get(union.type_id(row) as usize).copied().flatten() {
                 Some(leg) => (leg, union.value_offset(row)),
                 None => return Err(invalid("column-gather", "A union cell names no leg")),
@@ -256,7 +293,7 @@ fn joined_union(children: &[Option<(ArrayRef, Arc<ArrowField>, Option<LogicalTyp
         let empty = arrow_array::new_empty_array(leg.data_type());
         let arrays: Vec<&dyn Array> = layouts.iter().map(|layout| match layout {
             Layout::Scalar(source, array) if *source == id => *array,
-            Layout::Scalar(..) => empty.as_ref(),
+            Layout::Missing | Layout::Scalar(..) => empty.as_ref(),
             Layout::Union(union, map) => map.iter().position(|target| *target == Some(id)).map_or(empty.as_ref(), |source| union.child(source as i8).as_ref()),
         }).collect();
         arrow_select::interleave::interleave(&arrays, picked).map_err(|error| invalid("column-gather", error))
@@ -381,6 +418,40 @@ fn result_projection_keeps_a_scalar_union_already_in_its_output_layout() {
     assert!(Arc::ptr_eq(&input, &result));
 }
 
+#[test]
+fn projections_keep_typed_arrays_when_a_page_lacks_the_column() {
+    use rtdb_types::ScalarType;
+
+    let int = LogicalType::Scalar(ScalarType::I64);
+    let text = LogicalType::Scalar(ScalarType::Utf8);
+    let list = LogicalType::list(int.clone());
+    let column = |logical: &LogicalType, value| {
+        Some((rtdb_columnar::copy_array(logical, &[value]).unwrap(),
+            Arc::new(rtdb_columnar::to_field("v", logical).unwrap()), Some(logical.clone())))
+    };
+
+    let lists = [None, column(&list, Value::List(vec![Value::I64(2)]))];
+    let (_, field, logical) = lists[1].as_ref().unwrap();
+    let list = joined_nullable(&lists, &[(0, 0), (1, 0)], field, logical).unwrap().unwrap();
+    assert!(matches!(list, Column::Arrow { .. }));
+    assert_eq!(list.value(0).unwrap(), Value::Null);
+    assert_eq!(list.value(1).unwrap(), Value::List(vec![Value::I64(2)]));
+
+    let scalars = [column(&int, Value::I64(1)), None, column(&text, Value::Utf8("three".into()))];
+    let union = joined_union(&scalars, &[(2, 0), (1, 0), (0, 0)], "v").unwrap().unwrap();
+    assert!(matches!(union, Column::Arrow { .. }));
+    assert_eq!(union.value(0).unwrap(), Value::Utf8("three".into()));
+    assert_eq!(union.value(1).unwrap(), Value::Null);
+    assert_eq!(union.value(2).unwrap(), Value::I64(1));
+}
+
+#[test]
+fn a_projection_absent_from_every_page_is_an_arrow_null_array() {
+    let column = stored(&[], &[(0, 0), (0, 1)], "missing").unwrap();
+    assert!(matches!(&column, Column::Arrow { array, .. } if array.data_type() == &DataType::Null && array.len() == 2));
+    assert_eq!(column.value(0).unwrap(), Value::Null);
+}
+
 fn can_interleave_nested(array: &dyn Array) -> bool {
     if flat(array.data_type()) { return true; }
     if let Some(structs) = array.as_any().downcast_ref::<StructArray>() {
@@ -428,6 +499,8 @@ fn conform_array(array: &ArrayRef, logical: &LogicalType, target: &LogicalType, 
     if !field.is_nullable() && array.null_count() != 0 { return None; }
     let strip = |logical: &LogicalType| match logical { LogicalType::Maybe(inner) => inner.as_ref().clone(), other => other.clone() };
     match (strip(logical), strip(target)) {
+        (LogicalType::Null | LogicalType::Nothing, LogicalType::Null | LogicalType::Nothing)
+            if array.data_type() == &DataType::Null && field.data_type() == &DataType::Null => Some(Arc::clone(array)),
         (LogicalType::Scalar(scalar), LogicalType::Scalar(expected)) => {
             let kept = copyable(&scalar) || scalar == rtdb_types::ScalarType::DateDay;
             (scalar == expected && kept && array.data_type() == field.data_type()).then(|| Arc::clone(array))
