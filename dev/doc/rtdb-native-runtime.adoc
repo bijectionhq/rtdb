@@ -73,6 +73,9 @@ JVM object-valued configuration hooks require a native replacement.
 
 == Packaging and comparison evidence
 
+The link:../../rust/XTDB-VS-RTDB.md[benchmark comparison] records the matched packaged-engine results at 100,000 and 1,000,000 rows.
+The link:../../rust/PERFORMANCE-GAPS.md[performance gap inventory] records the measured revisions, run ranges and conformance follow-ups.
+
 The link:../../rust/release/README.adoc[release recipes] retain source revisions, feature selections, immutable image identities and extracted artifact hashes.
 Each package remains unqualified until its selected backend and client lanes have executed.
 No native package is available from the source-writing phase.

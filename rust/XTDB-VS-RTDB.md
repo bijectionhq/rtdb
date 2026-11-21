@@ -1,10 +1,37 @@
 # XTDB and RTDB compared
 
 RTDB is the Rust port of XTDB in `rust/`.
-This page records how closely it agrees with the reference engine and how fast each runs the same work.
-Every number here comes from one RTDB revision, `15df08a4d`, compared against the reference XTDB checkout at `c84f9334e`.
 
-## Correctness
+## Latest performance results
+
+Packaged RTDB `55277dbf3` met or exceeded XTDB `c84f9334e` on all 110 evaluated medians across the 100,000-row and 1,000,000-row workloads on Mac mini 2.
+The engines ran in Colima with 4 CPUs, a 4 GiB container memory limit, local logs and storage, a 768 MiB cache, and two compaction workers.
+Each engine ran twice at each size with alternating engine order, and Flight SQL followed pgwire on the same node.
+The benchmarks use psycopg for pgwire and ADBC for Flight SQL. [Benchmark clients](bench/)
+
+| Workload | 100k RTDB / XTDB | 1M RTDB / XTDB |
+| --- | ---: | ---: |
+| pgwire ingest | 67.7k / 51.2k rows/s | 46.5k / 43.9k rows/s |
+| Flight prepared INSERT | 163.1k / 104.7k rows/s | 125.0k / 77.7k rows/s |
+| pgwire concurrent INSERT | 2,685 / 2,313 tx/s | 1,825 / 1,473 tx/s |
+| Flight concurrent INSERT | 1,520 / 717 tx/s | 1,429 / 922 tx/s |
+| Flight single INSERT p50 | 1.471 / 1.979 ms | 2.148 / 3.202 ms |
+| pgwire UPDATE of 10% of orders | 43 / 121 ms | 631 / 780 ms |
+| Flight full-scan fetch p50 | 216 / 247 ms | 2,379 / 3,006 ms |
+| Peak working set during pgwire | 126 / 736 MiB | 655 / 885 MiB |
+| Peak working set during Flight | 185 / 667 MiB | 583 / 868 MiB |
+
+The million-row pgwire ingest median pools two full runs and two matching ingest-only runs per engine.
+In the full runs alone, the medians were 46.5k for RTDB and 56.0k for XTDB.
+XTDB's fastest individual run reached 67.0k rows/s. [Run ranges and diagnostics](PERFORMANCE-GAPS.md#1000000-rows)
+
+The measured build uses fewer temporary allocations in Flight parameter binding and SQL submission, reuses IIDs during trie merges, and reduces compaction work through direct local reads and faster Bloom construction.
+The packaged allocator returns unused heap pages through jemalloc's background purge. [Changes included in the measured build](PERFORMANCE-GAPS.md#changes-included-in-the-measured-build)
+
+## Historical correctness run
+
+The tables in this section record RTDB `15df08a4d` against XTDB `c84f9334e`.
+See the [later correctness checks](PERFORMANCE-GAPS.md#correctness-checks) and [conformance follow-ups](PERFORMANCE-GAPS.md#conformance-follow-ups).
 
 ### SQL logic tests
 
@@ -32,10 +59,13 @@ The corpus runner loads every XTDB Clojure test namespace and runs it against th
 | Not applicable: exercise JVM internals (`jvm-internal`, `jvm-api-boundary`) | 571 |
 | Not applicable: need unavailable infrastructure, have no assertions, or are integration-only | 72 |
 
-The one error is `xtdb.indexer-test/test-multi-block-metadata`, which compares an on-disk block file with a golden file and has differed in every run so far; it remains open.
-`xtdb.authn-test` failed to load in this run because its Docker container could not start in this environment, so it counts among the unavailable-infrastructure tests rather than as a failure; its tests are JVM-internal anyway.
+The error in this run was `xtdb.indexer-test/test-multi-block-metadata`, which reported a difference from the golden block file.
+`xtdb.authn-test` counted as unavailable infrastructure because its Docker container failed to start during the run.
 
-## Performance
+## Earlier 100,000-row performance run
+
+<details>
+<summary>Results for RTDB 15df08a4d against XTDB c84f9334e</summary>
 
 ### Method
 
@@ -124,9 +154,9 @@ At the 95th percentile, RTDB's latency is lower than XTDB's for:
 | 8 concurrent writers | 1,210 tx/s | 1,170 tx/s | 0.97× |
 | 8 concurrent readers | 1,607 queries/s | 2,241 queries/s | 1.39× |
 
-### Where RTDB is still slower
+### Gaps in this run
 
-RTDB is slower than XTDB on 11 of the 32 metrics, and three of those are within 3%.
+RTDB trailed XTDB on 11 of the 32 metrics in this run, with three differences within 3%.
 
 - **Joins.** RTDB builds its hash table and copies matched rows one row at a time, where XTDB's join works on whole Arrow vectors. This makes joins the largest gap on both protocols.
 - **pgwire filtered aggregate and valid-time as-of.** These run more slowly than the same queries over Flight SQL. psycopg writes small integers as `int2` and `int4`, so `_id` is stored as a union of integer types. RTDB reads union columns value by value instead of through its column kernels.
@@ -134,7 +164,7 @@ RTDB is slower than XTDB on 11 of the 32 metrics, and three of those are within 
 
 The concurrent-writer numbers vary from run to run on this host for both engines, so treat the two concurrent-writer rows as level.
 
-### How the gap was closed
+### Changes measured in this run
 
 In the first matched run of this benchmark over both protocols, RTDB was slower than XTDB on 24 of 32 metrics.
 Each slow path was then profiled against the native server, compared with what the reference does, and changed.
@@ -165,3 +195,5 @@ An independent review of these changes found several places where they changed b
 - a panic on nested columns.
 
 The same review led to a fix for an older problem: a WHERE clause of about a thousand conjuncts used to abort the process with a stack overflow.
+
+</details>

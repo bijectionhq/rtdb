@@ -27,6 +27,7 @@ See link:../dev/doc/rtdb-crates-and-test-parity.md[crate contracts] and link:../
 Implementation status and evidence are tracked in link:implementation-status.json[the status manifest].
 The link:source-review.adoc[source review record] identifies concrete paths, source discrepancies, and missing production traces.
 The link:../dev/doc/rtdb-native-runtime.adoc[native runtime reference] connects the client, operational, packaging and comparison surfaces to their detailed documentation.
+The link:XTDB-VS-RTDB.md[benchmark comparison] summarizes the latest matched results, and the link:PERFORMANCE-GAPS.md[performance gap inventory] records the run ranges and fixes.
 
 == Ownership
 

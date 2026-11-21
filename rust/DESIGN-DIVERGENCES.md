@@ -1,11 +1,11 @@
 # RTDB and XTDB: design divergences
 
-This page lists where RTDB (the Rust port, `rust/crates/*`) is built differently from XTDB (the JVM reference, `rtdb-ref`), and estimates where each difference can make RTDB slower or faster.
-It is a deeper companion to [`XTDB-VS-RTDB.md`](XTDB-VS-RTDB.md), which gives the benchmark numbers.
+This historical source audit compares RTDB (the Rust port, `rust/crates/*`) with XTDB (the JVM reference, `rtdb-ref`) and estimates the performance effects of their implementation differences.
+It describes RTDB at `b1b48ab8d`, the commit that made leaf column statistics lazy.
+The figures below refer to the builds examined at the time. [Latest matched results](PERFORMANCE-GAPS.md#latest-matched-results)
 
-Everything here comes from reading source; nothing was built, run or profiled.
-Each claim names a file and function.
-A claim marked **(inference)** is reasoned from the code rather than read directly from it, and every performance estimate is an inference unless it cites a measurement.
+The audit names the files and functions it reviewed.
+Performance estimates come from reading the source unless the text cites a measurement.
 
 Path abbreviations:
 
@@ -14,13 +14,11 @@ Path abbreviations:
 - `XC/` is `rtdb-ref/core/src/main/clojure/xtdb/`.
 - `XM/` is `rtdb-ref/modules/`.
 
-This page describes RTDB as of the commit that made leaf column statistics lazy (`perf(format): a read trie metadata file decodes a leaf's column statistics only when a scan visits it`).
-
-One measurement corrects the reading: a profile of point lookups over a 1,000,000-row table in Docker spent 75% of its time in `MetadataFile::read_reader`.
+An earlier profile of point lookups over a 1,000,000-row table in Docker attributed 75% of its time to `MetadataFile::read_reader`.
 The level-1 metadata file's decode bound (121 MB) exceeded the metadata cache's per-file limit, so every lookup decoded the whole file again.
-That commit fixes it; the remaining costs of reading metadata are in [Reading metadata](#reading-metadata) and row 11 of the ranked table.
+The lazy statistics change addressed that repeated file decoding. [Costs identified in the audit](#reading-metadata)
 
-## Summary
+## Historical summary
 
 RTDB copies XTDB's *architecture* closely:
 
@@ -37,13 +35,13 @@ The divergences are almost all in *representation and caching*:
 3. RTDB reads whole objects into heap memory and decodes pages into a second cache, where XTDB memory-maps the byte slice of one record batch.
 4. RTDB charges memory per row or per value through a shared atomic chain, where XTDB charges per Arrow buffer allocation.
 
-These explain the measured pattern (inference):
+These differences helped explain the earlier benchmark results (inference).
 
-- RTDB wins on startup, footprint, plain full scans and concurrency of short reads.
-- RTDB loses on joins, aggregates over union columns and anything that falls off its column path.
-- RTDB loses on point operations once the data outgrows the live index. At 1M rows, point lookups and updates are about 15× slower than XTDB, joins about 4.5× slower.
+- RTDB led on startup, footprint, plain full scans and concurrency of short reads.
+- RTDB trailed on joins, aggregates over union columns and queries that used its row path.
+- In the earlier million-row benchmark, RTDB point lookups and updates were about 15× slower than XTDB, and joins were about 4.5× slower.
 
-Point operations at 1M rows are where the per-file, per-page and per-statement costs below all add up.
+Point operations at this size incurred the per-file, per-page and per-statement costs described below.
 
 ---
 
@@ -180,7 +178,7 @@ Point operations at 1M rows are where the per-file, per-page and per-statement c
 
 - **Point operations scale with versions and files rather than with matches.** XTDB does about log₂(1024) comparisons per page and stops at the first visible version. RTDB pushes every row of the leaf through a heap and the full polygon calculator, per file.
   - This grows with data size, since more L0/L1 files cover each IID path, and with update count, since an entity has more versions.
-  - It is the most plausible size-dependent cause of the 15× point-lookup and update gap at 1M rows **(inference)**.
+  - The audit considered this a candidate explanation for the earlier million-row point-lookup and update results **(inference)**.
   - Compaction lag (§9) makes it worse, because uncompacted L0 files each cover the whole IID space.
 - **System columns are never columnar.** Any query projecting or filtering on `_valid_from`, `_system_from` and the like (valid-time history, `FOR VALID_TIME AS OF` outputs, all UPDATE/DELETE inputs, which read `_iid` and the valid-time columns) goes through `Value` per cell, a `String` allocation per timestamp, and the row fallback in every operator above.
 - **Decoded pages cost a page decode per cold read.** A page is decoded once into the pool, which then drops the raw file, so warm reads are cheap but every eviction costs a decode, where XTDB maps the raw page in place (inference).
@@ -512,7 +510,7 @@ Point operations at 1M rows are where the per-file, per-page and per-statement c
 
 ## Ranked divergences by likely performance cost
 
-Ranking is impact × breadth, judged from the code and the benchmark pattern (inference throughout).
+The ranking reflects the code and benchmark results available at the time of the audit (inference throughout).
 
 | # | Divergence | Where it costs | One-line recommendation | Files |
 | --: | --- | --- | --- | --- |
