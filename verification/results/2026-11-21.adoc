@@ -218,4 +218,11 @@ Treating copy acceptance as completion publishes a root without its data object 
 The offline Azure diagnostic passed through the production adapter at `6f0094f47`, with a provider returning `202 Accepted` and `x-ms-copy-status: pending`.
 The adapter returned success from file publication and deleted the copy source.
 The fixture observed the premature success on loopback.
-Live Azure behavior under load, completion handling and cleanup of interrupted remote copies remain open.
+
+The combined local runner passed from `be1a66831` with both Rust options enabled.
+The corrected adapter waits for the same copy identifier to report success before acknowledging and removing staging.
+An unavailable status check preserves staging, and a retry sees an in-progress destination as unavailable.
+Both native controls compiled and failed at their declared assertions after removing the completion check or deleting staging on an unknown outcome.
+The Azure and storage package run with remote support passed 204 tests.
+The provider wait uses the client's default retry duration.
+Live Azure behavior under load, remediation of a terminal failed destination, and eventual cleanup of abandoned staging remain open.
