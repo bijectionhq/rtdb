@@ -189,7 +189,10 @@ impl CellStoreFactory {
         self.storage_regions.spawn(async move {
             let local = matches!(config.storage, crate::deployment::CellStorage::Local { .. });
             let witness = if local {
-                match keys.hold_local_storage_region(id) {
+                let owner = keys.clone();
+                let opened = tokio::task::spawn_blocking(move || owner.hold_local_storage_region(id)).await
+                    .map_err(|error| storage_region_error(&error.to_string())).and_then(|result| result);
+                match opened {
                     Ok(witness) => witness,
                     Err(error) => {
                         let _ = ready.send(Err(error));
@@ -240,8 +243,12 @@ impl CellStoreFactory {
                     tokio::time::sleep(Duration::from_secs(1)).await;
                 }
             }
-            if witnessed && let Err(error) = keys.forget_local_storage_region(id) {
-                eprintln!("Could not remove storage region witness {id}: {}", error.code);
+            if witnessed {
+                let removed = tokio::task::spawn_blocking(move || keys.forget_local_storage_region(id)).await
+                    .map_err(|error| storage_region_error(&error.to_string())).and_then(|result| result);
+                if let Err(error) = removed {
+                    eprintln!("Could not remove storage region witness {id}: {}", error.code);
+                }
             }
         });
         let (record, region) = admitted.await.map_err(|_| Anomaly::new(

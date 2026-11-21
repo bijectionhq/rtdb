@@ -105,6 +105,12 @@ impl LocalKeyService {
     fn sync_directory(&self) -> Result<()> {
         rtdb_types::directory_io::open_for_sync(&self.directory).and_then(|directory| directory.sync_all()).map_err(io)
     }
+    async fn load_key(&self, path: PathBuf) -> Result<[u8; KEY_BYTES]> {
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else { return self.key_at(&path); };
+        let authority = Self { directory: self.directory.clone() };
+        runtime.spawn_blocking(move || authority.key_at(&path)).await
+            .map_err(|error| Anomaly::fault("rtdb.multi/local-key-task", error.to_string()))?
+    }
     fn key_at(&self, path: &Path) -> Result<[u8; KEY_BYTES]> {
         let _lock = self.lock_key(path)?;
         match fs::read(path) {
@@ -125,18 +131,18 @@ impl LocalKeyService {
 
 #[async_trait::async_trait]
 impl KeyService for LocalKeyService {
-    async fn namespace_id(&self) -> Result<[u8; KEY_BYTES]> { self.key_at(&self.directory.join(".namespace")) }
+    async fn namespace_id(&self) -> Result<[u8; KEY_BYTES]> { self.load_key(self.directory.join(".namespace")).await }
 
     async fn sign_deletion(&self, facts: DeletionFacts) -> Result<DeletionRecord> {
-        sign_deletion(self.key_at(&self.directory.join(".deletion-signer"))?, facts)
+        sign_deletion(self.load_key(self.directory.join(".deletion-signer")).await?, facts)
     }
 
     async fn deletion_verification_key(&self) -> Result<String> {
-        verification_key(self.key_at(&self.directory.join(".deletion-signer"))?)
+        verification_key(self.load_key(self.directory.join(".deletion-signer")).await?)
     }
 
     async fn key(&self, deployment: &str) -> Result<[u8; KEY_BYTES]> {
-        self.key_at(&self.path(deployment))
+        self.load_key(self.path(deployment)).await
     }
 
     fn custody_namespace(&self) -> Result<String> {
@@ -278,6 +284,26 @@ fn io(error: std::io::Error) -> Anomaly { Anomaly::new(AnomalyCategory::Unavaila
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn opening_a_key_does_not_block_the_executor_on_a_held_file_lock() {
+        let directory = tempfile::tempdir().unwrap();
+        let keys = LocalKeyService::new(directory.path()).unwrap();
+        let lock = keys.lock_key(&keys.path("shop")).unwrap();
+        let (release, released) = std::sync::mpsc::channel();
+        let watchdog = std::thread::spawn(move || {
+            let _ = released.recv_timeout(std::time::Duration::from_secs(1));
+            drop(lock);
+        });
+
+        let opening = keys.key("shop");
+        tokio::pin!(opening);
+        let waiting = tokio::time::timeout(std::time::Duration::from_millis(30), &mut opening).await.is_err();
+        let _ = release.send(());
+        watchdog.join().unwrap();
+        assert!(waiting);
+        assert_eq!(opening.await.unwrap(), keys.existing("shop").await.unwrap());
+    }
 
     #[tokio::test]
     async fn receipt_survives_a_key_service_restart_and_binds_the_inventory_and_identity() {

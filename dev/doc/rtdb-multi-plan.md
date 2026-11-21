@@ -121,8 +121,9 @@ work has drained, including work whose caller was cancelled. Disposal,
 cross-cell transfer and same-history recovery wait for those admissions to
 clear after fencing. On a standalone local disk, each provider operation
 retains a lock in the independent key directory. After a node exits, the
-reaper can recover its recorded region only by acquiring that same
-persisted lock. A missing lock witness keeps the region pending. For remote
+reaper can recover its recorded region only by acquiring that same persisted lock.
+The serving node performs key opens and storage-region witness file I/O on the blocking pool.
+A missing lock witness keeps the region pending. For remote
 storage, a producer that exits without acknowledging drain keeps cleanup
 pending until the provider's outstanding work can be accounted for.
 Remote serving and checkpoint writers reserve an empty S3 multipart upload
