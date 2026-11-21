@@ -7,6 +7,9 @@
 --
 -- Status: target design, ahead of the implementation.
 -- dev/doc/rtdb-multi-plan.md stages the implementation and names the code each part grows from.
+-- The target serving protocol uses scoped attempt receipts and a loglet read index.
+-- The implementation still exposes numeric intake positions, fences on member lease loss and lacks the subscriber read index.
+-- verification/redesign/authority-boundaries.md describes the migration and proof premises.
 -- Where this spec and an existing spec describe the same mechanism, the existing spec describes the code as it stands and this one describes where it is going:
 --   - election and the term fence: log-processor-lifecycle.allium
 --   - the source log, the replica log and the block cycle: db.allium
@@ -388,8 +391,9 @@ contract Directory {
 
     @invariant StaticStability
         -- A directory outage stalls activations, moves, flush publication and lifecycle changes.
-        -- It does not stop a placed holder from committing or serving reads.
-        --   Tails grow while publication is stalled, bounded by log-server capacity, and flush backpressure turns that bound into write stalls rather than data risk.
+        -- An installed holder continues to commit while its own loglet quorum accepts its epoch and has capacity.
+        -- A node may serve while it can establish the requested freshness and its storage entitlement covers the read.
+        -- Flush backpressure limits the unpublished tail.
 
     @invariant DirectoryFormatsPreservePlacement
         -- During the parked-row format rollout, upgraded readers accept both layouts.
@@ -1159,7 +1163,10 @@ rule AnswerRetryFromWindow {
 }
 
 rule ResolveAndAppend {
-    -- The holder resolves against its state, pipelining later transactions against speculative state, and exposes nothing until the append commits.
+    -- The holder resolves against its state, pipelining later transactions against speculative state.
+    -- An asynchronous intake receipt identifies the history, writer epoch and local attempt sequence.
+    -- The resolved replica record carries the exact attempt identity.
+    -- Only its durable applied outcome supplies a causal basis.
     when: TxArrived(holding, tx, key)
 
     requires: holding.state = serving
@@ -1178,6 +1185,8 @@ rule ResolveAndAppend {
 }
 
 rule ApplyOnCommit {
+    -- The applied outcome and its basis are retained against the exact attempt through the receipt window, including at recovery.
+    -- Closing an epoch lets receipt lookup distinguish an unresolved attempt from a pending one after recovering the sealed prefix.
     when: AppendCommitted(holding, record: ResolvedTx)
 
     requires: holding.state = serving
@@ -1918,9 +1927,12 @@ rule ServeOnSubscriber {
 
     ensures:
         if session.freshness = linearizable:
-            let committed = ReadIndexFromHolder(subscription.deployment)
-            AwaitApplied(subscription, committed)
-            Served(query, tier: subscriber, at: committed)
+            let committed = ConfirmActiveLogletReadIndex(subscription.deployment)
+            if committed != null:
+                AwaitApplied(subscription, committed)
+                Served(query, tier: subscriber, at: committed)
+            else:
+                Replied(query, behind: true)
         else if subscription.applied_lsn >= session.basis.lsn:
             Served(query, tier: subscriber, at: subscription.applied_lsn)
         else:
@@ -2033,6 +2045,7 @@ rule RefineKeyForLargeDeployments {
 rule Fork {
     -- A fork within an organisation is a new deployment in the parent's lineage.
     -- Its first manifest references the parent's objects at the fork basis, plus one pack holding the parent's tail up to that basis.
+    -- The shared key grants are in the same erasure custody domain.
     -- Child publication checks that the parent is still eligible for forks in the writer epoch and storage generation used to prepare the child.
     when: ForkRequested(parent, basis, org)
 
@@ -2065,6 +2078,7 @@ rule Fork {
 rule ForkAcrossOrganisations {
     -- A fork into another organisation creates its own lineage and key.
     -- Its checkpoint closure and its selected tail are copied under the child's key before the directory publishes the child.
+    -- This copy has independent key custody and its own erasure authority.
     -- Publication checks the parent in the writer epoch and storage generation used to prepare the copy.
     when: ForkRequested(parent, basis, org)
 

@@ -4,7 +4,7 @@ Nov 21, 2026 · Sacha Ichbiah
 
 Nine workstreams remain before RTDB can claim its requirements end to end; each brief below is self-contained so it can be handed to one agent.
 Source of truth: `dev/doc/rtdb-formal-verification-design.adoc`, `dev/doc/structural-redesign.adoc` and `verification/results/2026-11-21.adoc` on RTDB main.
-The shared copy of this programme is the Claude Docs page "RTDB verification programme"; this file mirrors it.
+This programme supersedes the earlier Claude Docs copy after the second structural review.
 
 ## Ground rules
 
@@ -22,14 +22,15 @@ Every agent works in RTDB (`github.com/bijectionhq/rtdb`), not Bijection, and fo
 
 ## Owner decisions
 
-The owner decided these on 2026-11-21; treat them as settled.
+The first review set the original choices on 2026-11-21.
+The second review narrows the fork decision to shared custody and defines how erasure can commit.
 
 | Decision | Outcome |
 | --- | --- |
 | Read basis and resumption | A basis is a logical coordinate (transaction lower bound plus optional system-time cap). An admitted handle keeps its captured view for its lifetime and is never resumed; a client re-admits at the same basis, and the answer may differ only by erasures committed in between. |
 | Reader lifetime | Readers are protected by renewable holds on the residence ledger (R4). Until R4 lands, bounded monotonic leases (default 1 h, 1 min margin) protect them. |
 | Erasure versus admitted views | A view admitted before an erasure keeps its answers until the erasure deadline (≤ 120 s); after that a read that needs destroyed key material fails with `rtdb/erased-under-view`. SNAP-1 and DUR-1 are amended accordingly. |
-| Forks | An erasure also erases the material in forks whose history includes it. |
+| Forks | Erasure reaches shared history within its key custody domain. Independently keyed copies have their own erasure authority. |
 | Future system time | A client may not supply a system time later than the source log's append time (tolerance zero). Landed. |
 | Retry identities | Required for transaction submit, scoped to (database, principal, key) with a body digest and a conflict outcome. Landed. |
 | Transaction metadata | Retained only for the receipt window, and erasable with its unit before then (R8). |
@@ -159,6 +160,7 @@ Goal: accelerated MATCH returns the reference scan's rows, and ranked early term
 2. Prove that each supplied maximum covers its whole source.
 3. Relate the native postings iterator and persisted sidecar to the modelled complete term-window summaries.
 4. Discharge the frontier proof's premise: a qualifying row's matching event is present in a pending entry or an unexpanded window.
+5. Extend the cutoff to the full SQL rank key where a conservative secondary-key bound is available, and test dense ties with offset and limit.
 
 **Done when:** FTS-1 and FTS-2's comparisons (shared files, erasures, history modes, missing files, budget fallback, exact ties, multiple MATCH predicates) run natively against the scan oracle, with a dropped-predicate and a pruned-tie mutation failing at the expected law.
 
@@ -202,14 +204,16 @@ Goal: one reproducible claim per requirement, on one committed tree.
 
 Increments R1 (system time bounded by the log, `d85286ba2`), R2 (engine-owned retry receipts, `85a868c07`) and R3 (epoch-qualified physical names, `ae7b66e10`) are on main; the remaining six replace mechanisms rather than patch them, and supersede the matching obligations in W1, W2 and W8.
 Each has a design and handoff note in [`verification/redesign/`](redesign/README.md).
-The contract and owner decisions are in `dev/doc/structural-redesign.adoc`; update its status table as each lands.
+The target contract and status are in `dev/doc/structural-redesign.adoc`.
+The later serving review adds typed placed receipts, on-demand freshness checks, and a recoverability boundary for CDC.
+See [Authority boundaries](redesign/authority-boundaries.md).
 
 | ID | Increment | Depends on | Exit test |
 | --- | --- | --- | --- |
 | [R4](redesign/R4-residence-ledger.md) | Residence ledger (Multi directory record; classic conditional-write object) with renewable holds and a collection floor; delete `garbage_lifetime`, the fixed lease and collector wait, the reaper grace, wall-clock release stamps and the unbounded in-process registry | Peer model `verification/tla/ResidenceRetirement.tla` | A follower behind the log tip serves a held generation; the collector never deletes below a live hold |
 | [R5](redesign/R5-recovery-roots.md) | Recovery roots as holds; L0 becomes collectable; compactor reset starts a new epoch from a root | R4 | Crash during compaction and reset recovers from a root plus the log suffix |
-| [R6](redesign/R6-sealing.md) | Seal every durable unit (log segments, tries, artefacts, checkpoints) under destroyable data keys; caches keyed by key id | — | Every stored byte is ciphertext; destroying a key makes the unit and its cached pages unreadable |
-| [R7](redesign/R7-eraser.md) | Eraser: successors without erased material, log redaction overlays, propagation to forks sharing the history, score-stale artefacts, `rtdb/erased-under-view` after the deadline (≤ 120 s) | R5, R6 | After the deadline a provider-wide plaintext scan finds no erased IID; a pre-erase view gets `erased-under-view` |
+| [R6](redesign/R6-sealing.md) | Seal every durable unit under a publication-bound key slot in its custody domain | — | No recoverable source key survives revocation; independent copies use independent key slots |
+| [R7](redesign/R7-eraser.md) | Separate horizon collection from privacy erasure; publish readable successors and arm revocation before committing | R5, R6 | A held view survives ordinary collection; privacy revocation meets its committed deadline while clean roots and independent exports remain readable |
 | [R8](redesign/R8-metadata-retention.md) | Transaction metadata and retry receipts retained only for the receipt window, removed physically | R7 | Expired receipts and metadata are absent from every storage class |
 | [R9](redesign/R9-capabilities-and-composition.md) | Capabilities for storage reads, provider deletes and cached pages; one composed residence model checked against emitted traces | Grows with R3–R8 | Every mutation named in the redesign fails under both TLC and the trace checker |
 

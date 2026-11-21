@@ -7,10 +7,16 @@ Metadata naming an erased unit is erased with it before the window ends.
 
 ## Converged design
 
-- Designers proposed an engine-owned system keyspace with no bitemporal history for receipts and transaction metadata, so expiry is physical by construction.
-- R2 landed receipts as bitemporal rows in `xt.idempotency_receipts` instead (valid for one hour of system time, unwritable by SQL), to reuse the resolver's existing read path. R8 either moves them to a non-history keyspace or removes them physically with the R7 machinery; the non-history keyspace is simpler if it can be checkpointed and replayed deterministically.
-- Move `xt.txs.user_metadata` under the same retention: kept for the receipt window, removed physically afterwards, and erasable with the unit it names.
-- Expiry is measured in log time at resolution, so every replica removes the same rows.
+- Store receipts and transaction metadata in an engine-owned keyspace whose checkpoint contains its live entries.
+  R2 currently stores application receipts as bitemporal rows in `xt.idempotency_receipts` with a one-hour valid interval.
+- Keep application retry receipts and placed attempt outcome receipts under their own identities.
+  Expiring either receipt leaves the committed transaction coordinate valid as a causal basis.
+  A closed epoch and the retained receipt frontier distinguish an unresolved attempt from an expired one.
+- Project `xt.txs.user_metadata` from the retained metadata store.
+  It expires after the receipt window and participates in privacy erasure when it names an erased unit.
+- Expiry uses log time at resolution so replicas select the same entries.
+  Sealed immutable log and checkpoint copies need the same physical retirement contract as the live keyspace.
+  The retention claim depends on releasing the replay closure or revoking the applicable keys after a complete successor is published.
 
 ## Invariants
 
@@ -24,9 +30,11 @@ Metadata naming an erased unit is erased with it before the window ends.
 
 ## Handoff notes
 
-1. Land after R7 if you remove rows physically through the eraser; a non-history keyspace can land earlier, but must be part of checkpoints so recovery restores live receipts.
-2. Keep the resolver's decision deterministic: whatever store you choose, the duplicate or conflict outcome must be computed from the logged record and the replayed state only.
-3. Decide what `xt.txs` keeps after the window (transaction id, system time, committed flag and error are history; metadata is not).
+1. Land the checkpointed keyspace and replay first.
+   The physical expiry guarantee additionally needs coverage of log and checkpoint copies through R5–R7.
+2. Compute duplicate and conflict outcomes from the logged request and the replayed receipt state.
+3. Preserve the transaction id, system time and committed flag as history.
+   Include structured error fields in the retention inventory before classifying them as historical or expiring metadata.
 
 ## Tests and proofs
 

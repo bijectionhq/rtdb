@@ -1,49 +1,56 @@
-# R6 · Seal every durable unit under destroyable data keys
+# R6 · Seal durable units within a custody domain
 
-## Goal
+## Contract
 
-Every byte RTDB writes (log records, trie data and metadata, artefacts, checkpoints, block files) is ciphertext under a data key that can be destroyed.
-Destroying a key must make the unit and every cached copy unreadable, wherever copies sit: object versions, Kafka records, replicas, backups and forks.
-This is what lets R7 meet the 120 s erasure bound without rewriting append-only logs in place.
+Every durable data unit is sealed under an independently destroyable data key.
+A custody domain is the authority that can enumerate and revoke every means of decrypting its units, including active grants, caches, recoverable key versions and backups.
+A storage copy within the domain retains that identity.
+An independent copy receives a fresh domain, new unit identities and new keys before publication.
+A same-domain fork holds references to the source's units and follows erasure of their shared history.
+A cross-organization export or an independent archive publishes re-encrypted data under its own authority.
+A move that preserves the same logical database transfers custody with the history and obtains a receipt retiring the predecessor's serving path.
 
-## Converged design
+## Unit publication
 
-- **Units and keys.** Each durable unit gets its own data key (DEK): a log segment (a log range closed at each block flush), a trie file, an artefact, a checkpoint.
-- **Wrapping.** DEKs are wrapped under a store key-encryption key (KEK) and listed in the ledger's key catalog (R4).
-  Designer I proposed per-entity keys derived from a shard key epoch instead, which avoids rewriting files on erasure; the other two kept per-unit keys and rewrite successors (R7). Per-unit keys are the converged choice.
-- **Cipher.** Reuse Multi's AES-256-GCM cipher with name-bound associated data and deterministic object nonces (`rust/crates/multi/src/cipher.rs`), moved down to the storage layer so classic and Multi deployments share it.
-  Deterministic nonces keep put-if-absent convergence for redundant compactors.
-- **Clear material stays inside the ciphertext.** Ordered-index keys, blinded values and unit names remain plaintext inside sealed units, so sort order and lookups work after decryption and erasure still reaches them.
-- **Caches.** Decrypted pages are keyed by (object identity, DEK id). A destroyed DEK invalidates them: in-memory caches drop entries, and on-disk caches hold ciphertext only.
-- **Key custody.** KEKs live in a key service that can destroy keys durably. Multi's `KeyService` (`rust/crates/multi/src/keys.rs`, with `LocalKeyService` and the `keys/` backends) already provisions, copies to forks and withdraws per-deployment keys with deletion receipts; R6 extends it to wrap per-unit DEKs.
+The passive unit identity binds domain, purpose, generation, unique publication and chunk number where applicable.
+Create an opaque key slot for that exact publication using conditional creation.
+A losing writer opens the winning publication or abandons its unpublished unit.
+This resolves concurrent job convergence at publication, so ciphertext from separate attempts may differ.
+Authenticate the unit label and chunk coordinates.
+Keep a single logical publication inside the root even when a provider retry created several physical versions.
+The residence ledger inventories all recoverable wraps and copies before a unit can appear in a root.
 
-## Invariants
+Persisting a recoverable wrapped data key in an immutable backup would preserve decryption after ledger deletion.
+Use key slots with provider-backed revocation and an inventory of any recoverable wrapping versions.
+Decrypted pages need an authority-bound lease and invalidation tied to the slot.
+Persistent caches contain ciphertext.
+Log segments need their own slot and a manifest that describes the replacement root and replay interval.
 
-- **S1.** No durable unit is written in the clear.
-- **S2.** A unit whose DEK is destroyed cannot be read through any cache or copy after the destruction notice is observed (bounded by the notice latency, which R7 budgets).
+## Enrollment
 
-## State on main (2026-11-21)
+The provider must offer a permanent create-once lineage anchor or equivalent non-reusable storage identity.
+Opening existing encrypted storage requires its exact anchor and key identity.
+Provisioning is conditional on creating a new anchor and binding the key slot to it.
+An unknown create outcome is resolved against the same attempt identity.
+An existing or tombstoned anchor forbids enrollment, including after loss of directory metadata.
+`KeyLineageEnrollment.tla` checks binding an installed key to its claimed anchor, refusal of re-enrollment over surviving ciphertext, and terminal withdrawal.
+Its transitions assume durable conditional creation of the anchor.
+The provider tests must exercise an object surviving stale or missing directory data.
+The current Verus decision about boolean enrollment predicates remains applicable only after these premises have been established.
 
-- Multi already seals every object and its log under one per-deployment key: `EncryptingStore` in `rust/crates/multi/src/store.rs` (wrapped at `store.rs` around line 269), `Cipher` in `cipher.rs`. `multi/tests/cell.rs` `nothing_a_deployment_stores_is_readable_at_rest` checks that no plaintext marker reaches disk.
-- Classic deployments write everything in the clear.
-- There are no per-unit keys and no key catalog yet.
+## Object roles and implementation boundary
 
-## Handoff notes
+The key service is a passive collaborator that exposes enrollment, opening and revocation for an exact slot.
+The residence authority owns atomic publication of roots and their key dependencies.
+The active eraser coordinates preparation and publication with that authority.
+The key-grant monitor owns the current grant generation and wakes revoked readers.
+Classic and Multi storage can share the sealing format and the custody contract.
 
-1. Move `Cipher` and `EncryptingStore` into `rust/crates/storage` (or a small crate it depends on) and make Multi use them from there; delete Multi's copies.
-2. Introduce the DEK hierarchy behind the existing `ObjectStore` boundary, so callers above storage do not change: a sealed store resolves a unit's DEK from the key catalog, decrypts on read and encrypts on write.
-3. Seal log payloads per segment for both local logs and Kafka; segment boundaries at block flush keep the R7 destruction granularity aligned with checkpoints.
-4. Classic key custody needs a decision: a local key file with real deletion for development, and a KMS-backed service for production. Mirror Multi's `KeyService` trait rather than inventing a second one.
-5. Key caches by DEK id now, even before R7 destroys anything, so R7 only adds the destruction notice.
-6. Watch performance: deterministic-nonce AES-GCM over whole objects means ranged reads decrypt whole units unless units are chunked. Decide the chunking before landing.
+Multi currently encrypts under a deployment key and uses shared bytes in several copy paths.
+Classic deployments currently lack the corresponding sealing protocol.
+Per-unit custody is still a target.
+Before landing, qualify ranged reads and object naming on each supported provider, including lost create replies and redundant compaction jobs.
+Prove that an independent copy retains no decryption handle that can access the source ciphertext.
+Verify the cache fence and nonce uniqueness against shipped source.
 
-## Tests and proofs
-
-- **Native:** extend the at-rest test to classic deployments and to logs, checkpoints, artefacts and caches; destroying a DEK makes the unit and its cached pages unreadable; redundant compactors still converge with put-if-absent.
-- **Verus:** the name-bound associated data and nonce derivation (a unit's ciphertext cannot be substituted for another's).
-- **Mutations that must fail:** writing one unit class in the clear (the at-rest scan finds the marker); serving a cached page after its DEK is destroyed.
-
-## Open questions
-
-- Classic KEK custody (local file versus KMS) and the supported KMS providers.
-- Chunk size for sealed units, and its interaction with ranged reads and the disk cache.
+[Current cipher](../../rust/crates/multi/src/cipher.rs) · [Key service](../../rust/crates/multi/src/keys.rs) · [Fork references](../../rust/crates/multi/src/reference.rs) · [R7](R7-eraser.md)

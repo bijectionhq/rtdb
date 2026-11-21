@@ -7,11 +7,16 @@ After R5, L0 files are ordinary garbage once compaction supersedes them (as in X
 
 ## Converged design
 
-- **Recovery root.** A published checkpoint whose manifest names its complete dependency closure (table blocks, trie data and metadata, artefacts) and the first replica record it needs.
+- **Recovery root.** A published checkpoint whose manifest names its complete dependency closure (table blocks, trie data and metadata, artefacts), with exact publication identities.
+  The root also records the first required replica position, the history and resume token at its cut, and the custody identities needed to open it.
+  Recovery acquires the root and suffix hold as one admission before replay starts.
 - **Roots are holds.** A root is a ledger hold (R4) without expiry. It is released only when a newer root is complete, and completeness is checked through its manifest. The collection floor (R4) therefore never passes a live root's closure.
 - **L0 becomes collectable.** The collector's L0 refusal goes, and the catalog stops retaining L0 identities after primary compaction supersedes them.
 - **Reset from a root.** A compactor reset rebuilds from a root rather than from retained L0 files, and starts a new naming epoch (the epoch already exists from R3).
-- **Log suffix.** The replica log may be trimmed below the oldest live root's first required record; recovery holds keep that suffix through replay.
+- **Log suffix.** The replica log may be trimmed below the oldest live root's first required record.
+  Recovery holds keep that suffix through replay.
+  Upstream acknowledgement may use an applied token covered by a durable root and a protected committed suffix.
+  See [the upstream acknowledgement boundary](authority-boundaries.md#recovery-roots-and-upstream-acknowledgement).
 
 ## Invariants
 

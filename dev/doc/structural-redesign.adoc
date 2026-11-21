@@ -2,14 +2,16 @@
 
 Six guarantees could not be closed in the inherited architecture.
 Three independent designs converged on the replacement below.
-This document is the contract each increment implements; the verification design and the specs cite it.
+This document is the target contract for the redesign increments.
+The second review's Multi serving and custody boundaries extend that design.
 
 == Owner decisions
 
 * A client-supplied system time may not lead the source log's append time (tolerance zero).
 * A view admitted before an erasure keeps its answers until the erasure deadline; afterwards a read that needs destroyed key material fails with `rtdb/erased-under-view`.
   SNAP-1 and DUR-1 are amended accordingly.
-* An erasure in a database also erases the material in forks whose history includes it.
+* An erasure reaches forks that retain shared custody of that history.
+  An independent export or archive is re-encrypted and governed by its own custody authority.
 * Transaction user metadata is retained only for the retry-receipt window, and is erasable with its unit before then.
 * XTDB wire, configuration and storage compatibility is not a constraint.
 
@@ -18,7 +20,8 @@ This document is the contract each increment implements; the verification design
 History uses transaction system time, bounded by the log clock, and drives no physical decision.
 Reclamation uses a monotone catalog generation recorded by the residence ledger.
 Node-local monotonic durations only expire the holds of readers that stop renewing them.
-Receipt expiry and erasure deadlines use the log time recorded with each record.
+Receipt expiry uses the record's log time.
+Erasure starts at publication of the erasing generation and uses the custody authority's bounded grant clock.
 
 == Mechanisms
 
@@ -31,11 +34,32 @@ Receipt expiry and erasure deadlines use the log time recorded with each record.
 An external source's commit time is clamped to the node clock.
 |Unbounded future client times and the resulting overflow cliff.
 
-|Erasure versus the log and L0
-|Every durable unit is sealed under a destroyable data key.
-An erasure writes successors without the erased material, publishes them, rotates and destroys the superseded keys within the deadline, and redacts log segments by overlay.
+|History retention and privacy erasure
+|History collection retires data below a cut protected by the residence ledger.
+Privacy erasure prepares readable successors, then publishes them and arms bounded key revocation within the affected custody domain.
 Recovery and compactor reset start from held recovery roots.
-|Permanent L0 retention, `reset_to_l0`, copy-before-delete fork sharing.
+|Permanent L0 retention, `reset_to_l0`, live recovery data sharing a destruction deadline without a successor.
+
+|Shared bytes and independently erasable custody
+|A publication has a unique key slot and a conditionally installed identity.
+Dependent forks retain scoped key grants.
+Independent exports own fresh keys.
+|Convergence based on independently generated ciphertext, copied keys in independent custody.
+
+|Volatile intake positions and durable transaction identity
+|An intake receipt names an epoch-qualified attempt.
+A checkpointed replica outcome binds the attempt to an applied causal basis.
+|Public reuse of volatile source offsets.
+
+|Directory leases, idle cost and fresh reads
+|The installed loglet confirms its writer epoch and supplies an on-demand read index.
+A fresh reader waits for that prefix to apply.
+|Directory authority over log serving, periodic freshness writes.
+
+|Search relevance and optional acceleration
+|Two-argument scores use only the document and query.
+Corpus-relative scores take the corpus statistics as arguments.
+|Scan-driven registration of SQL score parameters.
 
 |No reference authority
 |One linearizable residence ledger per database: the Multi directory record, or a conditional-write object in classic deployments.
@@ -89,11 +113,11 @@ Renewal, recovery-root integration, identity-bound certification and timer remov
 
 |6
 |Sealing and the key ledger for every durable unit.
-|Planned
+|Revised design
 
 |7
-|Eraser: successors, log overlays, fork propagation, score-stale artefacts, `erased-under-view`.
-|Planned
+|History collection and custody-scoped erasure with readable successors and `erased-under-view`.
+|Modeled after the second review
 
 |8
 |Transaction metadata retention.
@@ -103,3 +127,27 @@ Renewal, recovery-root integration, identity-bound certification and timer remov
 |Capabilities, the composed residence model and trace validation, extended as each increment lands.
 |Planned
 |===
+
+== Placed serving and search
+
+link:../../verification/redesign/authority-boundaries.md[Authority boundaries] specifies placed attempt receipts, read indexes, logkeeper safety and CDC acknowledgement.
+The placed serving model checks receipt and freshness transitions on an abstract committed replica prefix.
+The native scoring contract is specified in link:fts.allium[Full-text search].
+
+=== Ranked cutoff at ties
+
+The existing cutoff uses a strict score bound and keeps all ties at the boundary.
+This preserves SQL results but may require scanning most postings when many documents have equal scores.
+Document-local scoring also removes document length from the rank key, so term-frequency ties deserve explicit coverage.
+
+Extend early termination only where the planner can prove a complete SQL ordering key and the search file can supply a conservative bound for that key.
+The bound combines each window's upper score with its earliest possible secondary key under the SQL comparator, including direction, null ordering and collation.
+Resident and persisted candidates share that comparator.
+The native index must encode a usable secondary key for the admitted ordering; an IID's hash order can bound a SQL ID only where the representation preserves that order.
+A window with an equal or unknown bound remains eligible for examination.
+The rank proof must cover each unread window, including those whose score ties the last retained row.
+Tests compare an exhaustive scan with the pruned plan over tied scores, across partitions, and with offset and limit.
+
+The five-argument score uses the caller's corpus observations and the declared stored-length statistic.
+A corpus computed with an ordinary SQL aggregate pays for its selected rows.
+A future precomputed corpus would need an exact visibility and temporal scope before a query could reuse it.

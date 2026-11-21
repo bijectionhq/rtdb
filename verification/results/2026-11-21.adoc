@@ -2155,6 +2155,51 @@ The handoff controls new release markers from the hosted trie collector.
 The downstream reaper still acts on logical keys and its grace period.
 An exact deletion certificate still needs recovery and fork dependency coverage and enforcement at the provider effect.
 
+== Structural review follow-through
+
+The native score path now evaluates two-argument `SEARCH_SCORE` from the document and query, with unit weights and length normalization.
+Five-argument BM25 consumes caller-provided statistics.
+The native search suite passed 19 cases, including ranking across partitions, alternate MATCH plans, dropping the index, unrelated rows, historical visibility and explicit statistics.
+The Z3 rank-arithmetic check passed all five baseline obligations and found the expected counterexamples for missing padding and incorrect minimum length.
+The affected Rust crate suites passed 1,889 tests with one ignored.
+The serial Gradle suite passed all 3,198 tests using the locally rebuilt Rust FFI library from the scoring change on parent `5adef2c18`.
+
+TLC checked the new bounded design models below.
+They specify target protocols and leave native refinement open.
+
+[cols="1,1,3",options="header"]
+|===
+|Model |Distinct states |Controls and reachability
+
+|PlacedServingAuthority
+|181,080
+|Reusing the intake slot and issuing a basis before commit each violates the intended identity invariant.
+A sealed loglet, a missing quorum read, or a missing apply wait each admits a stale reply.
+A reachability check finds a completed write and fresh read during a directory outage.
+The model assumes a correct committed prefix and active-loglet check and bounds the state space to two epochs, two intake slots per epoch and one read.
+
+|ErasureCustody
+|136
+|Skipping the successor, retaining a copied key, sharing an export key, accepting an unresolved copy, and suppressing deadline progress each violates its safety or progress property.
+A reachability check finds expiry with a resolved copy, both kinds of fork and a held old view.
+The model has one source domain, one detached key, one provider copy and an abstract two-tick grant expiry with weak fairness.
+Provider timing, backup inventory, cache fences and production transitions remain open.
+
+|KeyLineageEnrollment
+|39
+|Trusting missing directory history permits re-enrollment over orphaned ciphertext.
+Installing a different attempt or forgetting a withdrawal violates the anchor binding or terminal withdrawal invariant.
+A reachability check opens an existing key after directory history is lost.
+The model assumes an independent durable anchor for one lineage and two possible enrollment attempts.
+|===
+
+The existing fixed-ensemble recovery model passed all 342,407 reachable states under its declared bounds.
+It covers promises, acknowledged writes, partial repair and checkpoint-authorized trim.
+The remaining composition must cover loglet moves, the read index and production effects.
+
+The main runner includes the three new baselines and their controls.
+See link:../redesign/authority-boundaries.md[Authority boundaries] and link:../redesign/R7-eraser.md[History collection and privacy erasure].
+
 === Hosted checkpoint identity through recovery retries
 
 The directory admission now passes the published block number and replica boundary to ordinary hosted recovery and exact hosted snapshot opens.
