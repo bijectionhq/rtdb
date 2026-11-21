@@ -1,7 +1,7 @@
 use rtdb_types::{Interval, LogicalType, ScalarType, Timestamp, Value};
 use serde::{Deserialize, Serialize};
 
-use super::domain::{bucket_start, offset, upper_bound};
+use super::domain::{bucket_start, cover_step, offset, upper_bound};
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub(super) enum Atom {
@@ -117,12 +117,12 @@ impl Bucket {
             if empty || start >= end {
                 return None;
             }
-            let level = start.trailing_zeros().min((end - start).ilog2());
+            let (level, next) = cover_step(start, end);
             let bucket = Self {
                 level,
                 start: start as u64,
             };
-            start += 1_u128 << level;
+            start = next;
             Some(bucket)
         })
     }
