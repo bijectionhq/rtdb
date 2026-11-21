@@ -2038,3 +2038,27 @@ Two controls reject advancing the timed bound and accepting an unconfirmed drain
 These are theorems about the observation contract and its premises.
 Provider duration and drain evidence still need to be established for each production collector.
 The command records and diagnostics are in `/private/tmp/rtdb-formal.QMjPSJsX/lean-reader-reclamation-minimality-nknjb4oi/`. link:../lean/ReaderReclamationMinimality.lean[Reclamation proof and acceptance programs]
+
+=== Integrated verifier and simulation reruns
+
+On `7174d3295`, the combined runner completed 176 Lean and 178 TLC cases, including baselines, reachability witnesses and expected failures.
+Verus then reported three assertions for the deliberately swapped trie children, while the manifest listed two.
+The additional diagnostic was the row-accounting assertion in the same function.
+The production baseline passed.
+The scoped IID area rerun confirmed the three diagnostics and all its other expectations before the manifest correction landed in `134b5be71`.
+The full Verus lane on that revision completed 205 cases across 34 areas, including the new shared-search area.
+The mCRL2 and AutoHyper checkpoint checks on the same sources also completed their baselines and controls.
+Their command records are under the `merged-main-134b5be71-verus-and-process-*` evidence directory.
+
+On `f29b333e6`, the OpenJML, Z3, Alloy, Apalache and Maude lanes completed their baselines and controls, including the exact-version and clock-margin studies.
+A scoped launcher used incomplete arguments for mCRL2 after the Maude step.
+The successful separate process run supplied the three executable paths explicitly.
+The independent lanes retain their output under `merged-main-f29b333e6-independent-models-*`.
+These results span several revisions and leave the final single-tree verification gate open. link:../PROGRAMME.md[Workstream evidence and exit gates]
+
+The Gradle property and simulation run used the worktree for `63bfb280c`, JDK 25 and the reused native library from `5a891cf09`.
+All 3,348 recorded cases passed.
+They comprise 27 root tests, 3,315 core tests and simulations, and six PostgreSQL source properties and simulations.
+The core reports include 33 simulation methods with 100 iterations each.
+The Gradle log is `/private/tmp/rtdb-formal.QMjPSJsX/catalog-publication-and-search-property-test.log`.
+The prior full JVM suite's eight failures remain open.

@@ -60,6 +60,20 @@ All three designers proposed the same mechanism; differences are noted inline.
 4. Thread the hold through `QueryContext` where the read lease is today (`CatalogSnapshot::read_lease`, cursor `IoRegion::leased`), and through served scan fragments (`Node::scan_fragment`).
 5. Classic conditional writes: check each provider adapter (`storage/src/remote.rs`, local store) supports the primitive you choose; record any provider without it as unsupported rather than emulating it.
 
+## Production admission and reclamation paths
+
+The current call paths serve as the refinement checklist for the residence ledger.
+Each physical effect needs a release decision tied to the authority that admits its dependencies.
+
+| Path | Current boundary | Remaining obligation |
+| --- | --- | --- |
+| Cursor and distributed scan | Snapshot admission registers a Multi catalog hold through the backing store. Cursor and fragment polling retain their context for provider work. | Connect all attempts and cancellation paths to a renewable hold or confirmed drain, including classic stores and transaction and export entry points. [Snapshot helper](../../rust/crates/query/src/context.rs) · [Cursor](../../rust/crates/query/src/cursor.rs) · [Fragment](../../rust/crates/query/src/fragment.rs) |
+| Trie compaction output | Hosted output notices carry provider versions for witnessed loose data and metadata. A durable retirement intent carries that observed version and the installed cut needed for floor advancement. | Couple the installed receipt, every dependency hold, the admission floor and the provider identity in one certificate. [Collector](../../rust/crates/maintenance/src/gc.rs) · [Intent and receipt](../../rust/crates/maintenance/src/retirement_intent.rs) |
+| Classic trie and block collection | The classic store's catalog hooks have default no-op admission and floor behavior. Trie collection uses the lease window and snapshot registry. The block collector uses an installed snapshot and configured retention. | Install the classic ledger and make the raw object effect consume its authorization. [Storage contract](../../rust/crates/storage/src/object_store.rs) · [Collectors](../../rust/crates/maintenance/src/gc.rs) |
+| Multi loose and packed objects | The general reaper classifies releases and pack entries and uses the cell's copied-reference inventory. | Authorize loose versions against residence and fork holds. Authorize a pack as one provider object only after proving retirement of every dependency on its entries and pack metadata. [Reaper](../../rust/crates/multi/src/store.rs) · [Fork references](../../rust/crates/multi/src/reference.rs) |
+| Derived artefacts and ordered pages | The artefact lane retires definition files and unused builds. Hosted ordered pages have a separate directory-backed lifecycle and reaper. | Bind artefact retirement and repair to an exact publication, prove the last shared member is covered, and show how ordered-page scopes refine the residence ledger. [Artefact lane](../../rust/crates/maintenance/src/artefact.rs) · [Ordered pages](../../rust/crates/multi/src/ordered_index_storage.rs) |
+| Captures, moves and installation disposal | The lifecycle paths use captured archive and installation identities, and the disposal code inventories provider objects. | Prove each lifecycle fence covers every affected reader, recovery and fork dependency, including provider work outstanding when the route changes. [Capture retirement](../../rust/crates/multi/src/archive/retirement.rs) · [Installation disposal](../../rust/crates/multi/src/admin.rs) |
+
 ## Tests and proofs
 
 - **Native:** a follower behind the log tip serves a held generation; the collector never deletes below a live hold; an abandoned hold expires after two sweeps and its generation becomes reclaimable (LIVE-2). Reuse the follower fixtures in `rust/crates/conformance/tests/node_faults.rs` (`follower_cursor_during_collection`).
