@@ -2,13 +2,13 @@ use rtdb_types::StructFields;
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use arrow_array::{Array, ArrayRef, ListArray, RecordBatch, StructArray, UnionArray};
+use arrow_array::{Array, ArrayRef, ListArray, RecordBatch, StructArray, UnionArray, cast::AsArray};
 use arrow_buffer::{OffsetBuffer, ScalarBuffer};
 use arrow_schema::{DataType, Field, Schema, UnionFields, UnionMode};
 use rtdb_columnar::{BatchBuilder, MemoryBudget, MemoryReservation, OwnedBatch, build_array, copy_array, estimate_builder_bytes, estimate_builder_bytes_refs, estimate_read_value_bytes, from_field, read_value, struct_field_cell, to_field};
 use rtdb_format::envelope::{SourceBody, SourceMessage};
 use prost::Message;
-use rtdb_types::{Anomaly, EntityId, Iid, LogicalType, Result, ScalarType, TableRef, TimeUnit, Timestamp, Value};
+use rtdb_types::{Anomaly, EntityId, Iid, LogicalType, OrderedSet, Result, ScalarType, TableRef, TimeUnit, Timestamp, Value};
 
 use crate::{ArrowDocuments, Documents, EntityIds, ReplaySubmission, RetainedBytes, SqlArguments, SubmitOptions, TxOp, UserMetadata};
 use crate::values::DecodedDocumentLayout;
@@ -256,6 +256,9 @@ impl SourceDocuments<'_> {
     fn columns(&self) -> &[String] {
         match self { Self::Rows(documents) => documents.columns(), Self::Arrow(documents) => documents.columns() }
     }
+    fn len(&self) -> usize {
+        match self { Self::Rows(documents) => documents.rows().len(), Self::Arrow(documents) => documents.array().len() }
+    }
 }
 
 fn operation_value<'a>(operation: &'a Operation, memory: &Arc<MemoryBudget>) -> Result<(String, SourceOperation<'a>)> {
@@ -402,23 +405,122 @@ fn document_leg(lists: Vec<SourceDocuments<'_>>, arrays: &mut BatchBuilder, memo
         SourceDocuments::Arrow(documents) => Some(documents.array()),
         SourceDocuments::Rows(_) => None,
     }).collect::<Option<Vec<_>>>();
-    if let Some(pages) = arrow && let Some(leg) = arrow_document_leg(&pages, arrays)? {
+    if let Some(pages) = arrow {
+        if let Some(leg) = arrow_document_leg(&pages, arrays)? { return Ok(leg); }
+    } else if lists.iter().any(|list| matches!(list, SourceDocuments::Arrow(_)))
+        && let Some(leg) = mixed_document_leg(&lists, arrays)? {
         return Ok(leg);
     }
     let rows = lists.iter().map(|list| match list {
         SourceDocuments::Rows(documents) => Ok((*documents).clone()),
         SourceDocuments::Arrow(documents) => documents.to_rows(false, memory),
     }).collect::<Result<Vec<_>>>()?;
-    row_document_leg(rows.iter().collect(), arrays)
+    let rows = rows.iter().collect::<Vec<_>>();
+    let offsets = document_offsets(rows.iter().map(|documents| documents.rows().len()))?;
+    let structs = row_document_struct(&rows, *offsets.last().unwrap() as usize, arrays)?;
+    document_list(structs, offsets)
+}
+
+fn mixed_document_leg(lists: &[SourceDocuments<'_>], arrays: &mut BatchBuilder) -> Result<Option<ArrayRef>> {
+    let offsets = document_offsets(lists.iter().map(SourceDocuments::len))?;
+    let length = *offsets.last().unwrap() as usize;
+    let names = lists.iter().flat_map(SourceDocuments::columns).collect::<OrderedSet<_>>();
+    let mut layout = Vec::with_capacity(names.len());
+    for name in names {
+        let mut ty = LogicalType::Nothing;
+        let mut present = 0;
+        for list in lists {
+            match list {
+                SourceDocuments::Arrow(documents) => {
+                    if let Some((field, _)) = document_column(documents.array(), name) {
+                        let Some(actual) = document_relayout_type(field)? else { return Ok(None); };
+                        if !canonical_union_layouts(field) { return Ok(None); }
+                        if ty != actual { ty = ty.join(&actual); }
+                        present += list.len();
+                    }
+                }
+                SourceDocuments::Rows(documents) => {
+                    if let Some(declared) = documents.declared_types().and_then(|columns| columns.get(name)) {
+                        if &ty != declared { ty = ty.join(declared); }
+                    }
+                    for value in documents.rows().iter().filter_map(|row| row.get(name)) {
+                        let actual = value.logical_type();
+                        if ty != actual { ty = ty.join(&actual); }
+                        present += 1;
+                    }
+                }
+            }
+        }
+        if present < length || present == 0 { ty = ty.maybe(); }
+        let depth = struct_backfill_depth(&ty);
+        if depth != 0 {
+            let scratch = length.checked_mul(depth + 1).and_then(|cells| cells.checked_mul(std::mem::size_of::<WriterCell<'_>>())).ok_or_else(overflow)?;
+            let _cells = arrays.reserve_scratch(scratch)?;
+            let mut cells = Vec::with_capacity(length);
+            cells.extend(lists.iter().flat_map(|list| {
+                let column = match list {
+                    SourceDocuments::Arrow(documents) => document_column(documents.array(), name),
+                    SourceDocuments::Rows(_) => None,
+                };
+                (0..list.len()).map(move |row| match list {
+                    SourceDocuments::Rows(documents) => documents.rows()[row].get(name).map_or(WriterCell::Null, WriterCell::of),
+                    SourceDocuments::Arrow(_) => column.map_or(WriterCell::Null, |(field, array)| WriterCell::arrow(field, array, row)),
+                })
+            }));
+            ty = backfilled_nullability(ty, &cells);
+        }
+        if !document_relayout_supported(&ty) { return Ok(None); }
+        layout.push((to_field(name, &ty)?, ty));
+    }
+
+    let mut columns = Vec::with_capacity(layout.len());
+    let mut fields = Vec::with_capacity(layout.len());
+    for (field, ty) in layout {
+        let bound = lists.iter().try_fold(4096usize, |bytes, list| {
+            let size = match list {
+                SourceDocuments::Rows(documents) => {
+                    let values = documents.rows().iter().map(|row| struct_field_cell(row, field.name(), &ty));
+                    estimate_builder_bytes_refs(&ty, values)?
+                }
+                SourceDocuments::Arrow(documents) => document_column_bound(documents.array(), &field, &ty)?,
+            };
+            bytes.checked_add(size).ok_or_else(overflow)
+        })?;
+        columns.push(arrays.column(bound, || {
+            let inputs = lists.iter().map(|list| match list {
+                SourceDocuments::Rows(documents) => {
+                    let values = documents.rows().iter().map(|row| struct_field_cell(row, field.name(), &ty).clone()).collect::<Vec<_>>();
+                    copy_array(&ty, &values)
+                }
+                SourceDocuments::Arrow(documents) => align_document_column(documents.array(), &field),
+            }).collect::<Result<Vec<_>>>()?;
+            concat_document_columns(&inputs)
+        })?);
+        fields.push(Arc::new(field));
+    }
+    let structs = rtdb_columnar::build_struct_array(fields.into(), &columns, length, None)?;
+    document_list(structs, offsets).map(Some)
+}
+
+fn canonical_union_layouts(field: &Field) -> bool {
+    match field.data_type() {
+        DataType::Union(fields, UnionMode::Dense) => {
+            let mut names = OrderedSet::with_capacity(fields.len());
+            from_field(field).is_ok_and(|ty| matches!(ty, LogicalType::Union(_)))
+                && fields.iter().all(|(_, field)| {
+                    canonical_union_layouts(field) && from_field(field)
+                        .and_then(|ty| rtdb_columnar::leg_name(&ty)).is_ok_and(|name| names.insert(name))
+                })
+        }
+        DataType::Struct(fields) => fields.iter().all(|field| canonical_union_layouts(field)),
+        DataType::List(field) => canonical_union_layouts(field),
+        _ => true,
+    }
 }
 
 fn arrow_document_leg(pages: &[&StructArray], arrays: &mut BatchBuilder) -> Result<Option<ArrayRef>> {
     let Some(first) = pages.first() else { return Ok(None); };
-    let mut offsets = vec![0i32];
-    for page in pages {
-        let length = i32::try_from(page.len()).map_err(|_| overflow())?;
-        offsets.push(offsets.last().unwrap().checked_add(length).ok_or_else(overflow)?);
-    }
+    let offsets = document_offsets(pages.iter().map(|page| page.len()))?;
     if pages.len() == 1 {
         let bound = first.get_array_memory_size().checked_add(4096).ok_or_else(overflow)?;
         let structs = arrays.column(bound, || Ok(Arc::new((*first).clone())))?;
@@ -455,49 +557,65 @@ fn arrow_document_leg(pages: &[&StructArray], arrays: &mut BatchBuilder) -> Resu
         } else {
             field.with_nullable(nullable)
         };
+        if pages.iter().any(|page| document_column(page, field.name()).is_some_and(|(source, _)| {
+            source.data_type() != field.data_type() && !canonical_union_layouts(source)
+        })) {
+            return Ok(None);
+        }
         output_layout.push(field);
     }
     let mut fields = Vec::with_capacity(output_layout.len());
     let mut columns = Vec::with_capacity(output_layout.len());
     for field in output_layout {
-        let union = matches!(field.data_type(), DataType::Union(..));
-        let inputs: Vec<_> = pages.iter().map(|page| {
-            page.fields().iter().zip(page.columns()).find(|(source, _)| source.name() == field.name())
-                .filter(|(source, _)| union || source.data_type() != &DataType::Null || field.data_type() == &DataType::Null)
-        }).collect();
         let logical = from_field(&field)?;
-        let bound = pages.iter().zip(&inputs).try_fold(4096usize, |bytes, (page, column)| {
-            let size = match column {
-                Some((source, column)) => {
-                    let size = column.get_array_memory_size();
-                    if source.data_type() == field.data_type() { size } else {
-                        size.checked_add(rtdb_columnar::arrow_relayout_bound(column.as_ref(), &field)?).ok_or_else(overflow)?
-                    }
-                }
-                None => estimate_builder_bytes_refs(&logical, std::iter::repeat_n(&Value::Null, page.len()))?,
-            };
-            size.checked_mul(4).and_then(|size| bytes.checked_add(size)).ok_or_else(overflow)
+        let bound = pages.iter().try_fold(4096usize, |bytes, page| {
+            bytes.checked_add(document_column_bound(page, &field, &logical)?).ok_or_else(overflow)
         })?;
         columns.push(arrays.column(bound, || {
-            let inputs = pages.iter().zip(inputs).map(|(page, column)| {
-                match column {
-                    Some((source, column)) if source.data_type() == field.data_type() => Ok(Arc::clone(column)),
-                    Some((source, column)) => rtdb_columnar::relayout_arrow_column(Arc::clone(column), source, &field).map(|(_, column)| column),
-                    None if union => {
-                        let null = Field::new(field.name(), DataType::Null, true);
-                        let array = Arc::new(arrow_array::NullArray::new(page.len()));
-                        rtdb_columnar::relayout_arrow_column(array, &null, &field).map(|(_, column)| column)
-                    }
-                    None => Ok(arrow_array::new_null_array(field.data_type(), page.len())),
-                }
-            }).collect::<Result<Vec<_>>>()?;
-            let inputs = inputs.iter().map(|array| array.as_ref()).collect::<Vec<_>>();
-            arrow_select::concat::concat(&inputs).map_err(|error| invalid(error.to_string()))
+            let inputs = pages.iter().map(|page| align_document_column(page, &field)).collect::<Result<Vec<_>>>()?;
+            concat_document_columns(&inputs)
         })?);
         fields.push(Arc::new(field));
     }
     let structs = rtdb_columnar::build_struct_array(fields.into(), &columns, *offsets.last().unwrap() as usize, None)?;
     document_list(structs, offsets).map(Some)
+}
+
+fn document_column<'a>(page: &'a StructArray, name: &str) -> Option<(&'a Field, &'a ArrayRef)> {
+    page.fields().iter().zip(page.columns()).find(|(field, _)| field.name() == name).map(|(field, array)| (field.as_ref(), array))
+}
+
+fn align_document_column(page: &StructArray, field: &Field) -> Result<ArrayRef> {
+    let union = matches!(field.data_type(), DataType::Union(..));
+    match document_column(page, field.name()) {
+        Some((source, column)) if source.data_type() == field.data_type() => Ok(Arc::clone(column)),
+        Some((source, column)) if source.data_type() != &DataType::Null || union => {
+            rtdb_columnar::relayout_arrow_column(Arc::clone(column), source, field).map(|(_, column)| column)
+        }
+        None if union => {
+            let null = Field::new(field.name(), DataType::Null, true);
+            let array = Arc::new(arrow_array::NullArray::new(page.len()));
+            rtdb_columnar::relayout_arrow_column(array, &null, field).map(|(_, column)| column)
+        }
+        _ => Ok(arrow_array::new_null_array(field.data_type(), page.len())),
+    }
+}
+
+fn document_column_bound(page: &StructArray, field: &Field, ty: &LogicalType) -> Result<usize> {
+    let bytes = match document_column(page, field.name()) {
+        Some((source, column)) if source.data_type() == field.data_type() => column.get_array_memory_size(),
+        Some((source, column)) if source.data_type() != &DataType::Null || matches!(field.data_type(), DataType::Union(..)) => {
+            column.get_array_memory_size()
+                .checked_add(rtdb_columnar::arrow_relayout_bound(column.as_ref(), source, field)?).ok_or_else(overflow)?
+        }
+        _ => estimate_builder_bytes_refs(ty, std::iter::repeat_n(&Value::Null, page.len()))?,
+    };
+    bytes.checked_mul(4).ok_or_else(overflow)
+}
+
+fn concat_document_columns(inputs: &[ArrayRef]) -> Result<ArrayRef> {
+    let inputs = inputs.iter().map(|array| array.as_ref()).collect::<Vec<_>>();
+    arrow_select::concat::concat(&inputs).map_err(|error| invalid(error.to_string()))
 }
 
 fn merge_document_fields(left: &Field, right: &Field) -> Result<Option<Field>> {
@@ -515,7 +633,7 @@ fn document_relayout_type(field: &Field) -> Result<Option<LogicalType>> {
             DataType::Struct(fields) => fields.iter().all(|field| supported_field(field)),
             DataType::List(field) => supported_field(field),
             DataType::Union(fields, UnionMode::Dense) => fields.iter().all(|(_, field)| {
-                field.metadata().is_empty() && (!field.is_nullable() || field.data_type() == &DataType::Null)
+                supported_field(field) && (!field.is_nullable() || field.data_type() == &DataType::Null)
             }),
             _ => true,
         }
@@ -530,18 +648,16 @@ fn document_relayout_supported(logical: &LogicalType) -> bool {
         LogicalType::Maybe(value) => document_relayout_supported(value),
         LogicalType::Struct(fields) => fields.values().all(document_relayout_supported),
         LogicalType::List { kind: rtdb_types::ListKind::List, element } => document_relayout_supported(element),
-        LogicalType::Union(legs) => legs.iter().all(|leg| matches!(leg, LogicalType::Scalar(_) | LogicalType::Null)),
+        LogicalType::Union(legs) => legs.iter().all(document_relayout_supported),
         LogicalType::Scalar(_) | LogicalType::Null | LogicalType::Nothing => true,
         _ => false,
     }
 }
 
-fn row_document_leg(lists: Vec<&Documents>, arrays: &mut BatchBuilder) -> Result<ArrayRef> {
+fn row_document_struct(lists: &[&Documents], length: usize, arrays: &mut BatchBuilder) -> Result<ArrayRef> {
     let mut fields = BTreeMap::<&str, (LogicalType, usize)>::new();
     let mut order = Vec::new();
-    let mut offsets = vec![0i32];
-    let mut length = 0usize;
-    for list in &lists {
+    for list in lists {
         for name in list.columns() {
             let declared = list.declared_types().and_then(|columns| columns.get(name));
             if let std::collections::btree_map::Entry::Vacant(field) = fields.entry(name.as_str()) {
@@ -560,8 +676,6 @@ fn row_document_leg(lists: Vec<&Documents>, arrays: &mut BatchBuilder) -> Result
                 *present = present.checked_add(1).ok_or_else(overflow)?;
             }
         }
-        length = length.checked_add(list.rows().len()).ok_or_else(overflow)?;
-        offsets.push(i32::try_from(length).map_err(|_| overflow())?);
     }
 
     let mut columns = Vec::new();
@@ -577,8 +691,16 @@ fn row_document_leg(lists: Vec<&Documents>, arrays: &mut BatchBuilder) -> Result
         columns.push(array);
         schema.push(Arc::new(to_field(name, &ty)?));
     }
-    let structs = rtdb_columnar::build_struct_array(schema.into(), &columns, length, None).map_err(|error| invalid(error.to_string()))?;
-    document_list(structs, offsets)
+    rtdb_columnar::build_struct_array(schema.into(), &columns, length, None).map_err(|error| invalid(error.to_string()))
+}
+
+fn document_offsets(lengths: impl IntoIterator<Item = usize>) -> Result<Vec<i32>> {
+    let mut offsets = vec![0i32];
+    for length in lengths {
+        let length = i32::try_from(length).map_err(|_| overflow())?;
+        offsets.push(offsets.last().unwrap().checked_add(length).ok_or_else(overflow)?);
+    }
+    Ok(offsets)
 }
 
 fn document_list(structs: ArrayRef, offsets: Vec<i32>) -> Result<ArrayRef> {
@@ -588,11 +710,38 @@ fn document_list(structs: ArrayRef, offsets: Vec<i32>) -> Result<ArrayRef> {
 
 /// One row of a document column as the reference's struct writers see it.
 #[derive(Clone, Copy)]
-enum WriterCell<'a> { Undefined, Null, Value(&'a Value) }
+enum WriterCell<'a> { Undefined, Null, Value(&'a Value), ArrowStruct(&'a StructArray, usize), ArrowScalar }
 
 impl<'a> WriterCell<'a> {
     fn of(value: &'a Value) -> Self { match value { Value::Null => Self::Null, Value::Undefined => Self::Undefined, value => Self::Value(value) } }
-    fn fields(&self) -> Option<&'a StructFields<Value>> { match self { Self::Value(Value::Struct(fields)) => Some(fields), _ => None } }
+    fn arrow(field: &Field, array: &'a ArrayRef, row: usize) -> Self {
+        if field.data_type() == &DataType::Null {
+            return if field.is_nullable() { Self::Null } else { Self::Undefined };
+        }
+        if let Some(union) = array.as_union_opt() {
+            let id = union.type_id(row);
+            let DataType::Union(legs, _) = field.data_type() else { unreachable!("Arrow union field has union legs"); };
+            let leg = legs.iter().find(|(tag, _)| *tag == id).expect("Arrow union tag has a field").1;
+            return Self::arrow(leg, union.child(id), union.value_offset(row));
+        }
+        if array.is_null(row) { return Self::Null; }
+        array.as_struct_opt().map_or(Self::ArrowScalar, |array| Self::ArrowStruct(array, row))
+    }
+    fn field(&self, name: &str) -> Option<Self> {
+        match self {
+            Self::Value(Value::Struct(fields)) => fields.get(name).map(Self::of),
+            Self::ArrowStruct(array, row) => document_column(array, name).map(|(field, array)| Self::arrow(field, array, *row)),
+            _ => None,
+        }
+    }
+}
+
+fn struct_backfill_depth(ty: &LogicalType) -> usize {
+    match ty {
+        LogicalType::Maybe(inner) => struct_backfill_depth(inner),
+        LogicalType::Struct(children) => 1 + children.values().map(struct_backfill_depth).max().unwrap_or(0),
+        _ => 0,
+    }
 }
 
 /// The reference's writer backfills a struct key first written at row `r` into the struct's earlier rows: undefined where
@@ -603,21 +752,21 @@ impl<'a> WriterCell<'a> {
 fn backfilled_nullability(ty: LogicalType, cells: &[WriterCell<'_>]) -> LogicalType {
     let (nullable, inner) = match ty { LogicalType::Maybe(inner) => (true, *inner), other => (false, other) };
     let LogicalType::Struct(children) = inner else { return if nullable { inner.maybe() } else { inner }; };
-    if !cells.iter().all(|cell| !matches!(cell, WriterCell::Value(value) if !matches!(value, Value::Struct(_)))) {
+    if cells.iter().any(|cell| matches!(cell, WriterCell::ArrowScalar) || matches!(cell, WriterCell::Value(value) if !matches!(value, Value::Struct(_)))) {
         let inner = LogicalType::Struct(children);
         return if nullable { inner.maybe() } else { inner };
     }
     let adjusted = children.into_iter().map(|(name, child)| {
-        let first = cells.iter().position(|cell| cell.fields().is_some_and(|fields| fields.contains_key(&name)));
+        let first = cells.iter().position(|cell| cell.field(&name).is_some());
         let child_cells = match first {
             None => return (name, child),
             Some(first) => {
                 let parent_nullable = cells[..first].iter().any(|cell| matches!(cell, WriterCell::Null));
                 cells.iter().enumerate().map(|(row, cell)| match (row < first, cell) {
-                    (_, WriterCell::Value(Value::Struct(fields))) => fields.get(&name).map_or(WriterCell::Null, WriterCell::of),
+                    (_, WriterCell::Value(Value::Struct(_)) | WriterCell::ArrowStruct(..)) => cell.field(&name).unwrap_or(WriterCell::Null),
                     (true, WriterCell::Undefined) if !parent_nullable => WriterCell::Null,
                     (_, WriterCell::Undefined | WriterCell::Null) => WriterCell::Undefined,
-                    (_, WriterCell::Value(_)) => WriterCell::Undefined,
+                    (_, WriterCell::Value(_) | WriterCell::ArrowScalar) => WriterCell::Undefined,
                 }).collect::<Vec<_>>()
             }
         };
@@ -727,6 +876,9 @@ pub(crate) fn encode_arguments(arguments: &SqlArguments, memory: &Arc<MemoryBudg
         let page = RecordBatch::try_new_with_options(Arc::clone(&schema), page.columns().to_vec(), &options)
             .map_err(|error| invalid(error.to_string()))?;
         return crate::ipc::encode(&schema, [&page], memory);
+    }
+    if let Ok(Some(batch)) = arguments.source_columnar_batch(memory) {
+        return crate::ipc::encode(batch.batch().schema_ref(), [batch.batch()], memory);
     }
     let rows = arguments.rows().collect::<Result<Vec<_>>>()?;
     let bound = arguments.types().iter().enumerate().try_fold(4096usize, |bytes, (index, ty)| {
@@ -841,6 +993,7 @@ fn invalid(message: impl Into<String>) -> Anomaly { Anomaly::incorrect("rtdb.tx/
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rtdb_types::ListKind;
 
     fn budget() -> Arc<MemoryBudget> { MemoryBudget::new(128 * 1024 * 1024) }
     fn roundtrip(source: &SourceTransaction) -> SourceTransaction {
@@ -886,6 +1039,121 @@ mod tests {
             (index, values[0].clone())
         }).collect();
         assert_eq!(rows, [(0, Value::U64(u64::MAX)), (1, Value::Null), (2, Value::U64(5))]);
+    }
+
+    #[test]
+    fn coalesced_argument_chunks_align_arrow_columns_and_replay_in_input_order() {
+        let memory = budget();
+        let page = |names: [&str; 2], row: [Value; 2]| {
+            let types = row.each_ref().map(Value::logical_type);
+            let fields = names.into_iter().zip(&types).map(|(name, ty)| to_field(name, ty).unwrap()).collect::<Vec<_>>();
+            let columns = row.iter().zip(&types).map(|(value, ty)| build_array(ty, std::slice::from_ref(value)).unwrap()).collect();
+            let batch = RecordBatch::try_new(Arc::new(Schema::new(fields)), columns).unwrap();
+            SqlArguments::from_arrow(OwnedBatch::new(batch, &memory).unwrap(), &memory).unwrap()
+        };
+        let a = Value::List(vec![Value::I64(7)]);
+        let b = Value::Bool(true);
+        let record = |fields| Value::Struct(StructFields::from(fields));
+        let mut arguments = page(["raw", "document"], [Value::U64(u64::MAX), record([("a".into(), a.clone())])]);
+        arguments.append(page(["number", "details"], [Value::I64(9), record([("b".into(), b.clone())])])).unwrap();
+        arguments.append(SqlArguments::from_rows(vec![vec![Value::Null, Value::Null]], &memory).unwrap()).unwrap();
+        assert!(arguments.uniform_arrow_pages().is_none());
+
+        let batch = arguments.source_columnar_batch(&memory).unwrap().unwrap();
+        let schema = batch.batch().schema();
+        assert_eq!(schema.fields().iter().map(|field| field.name().as_str()).collect::<Vec<_>>(), ["?_0", "?_1"]);
+        assert!(batch.batch().column(0).as_any().is::<UnionArray>());
+        assert!(batch.batch().column(1).as_any().is::<StructArray>());
+        let bytes = encode_arguments(&arguments, &memory).unwrap();
+        let replayed = decode_arguments(bytes.as_slice(), &memory).unwrap();
+
+        let rows = replayed.indexed_rows().map(|row| {
+            let (ordinal, row) = row.unwrap();
+            (ordinal, row.to_vec())
+        }).collect::<Vec<_>>();
+        assert_eq!(rows, [
+            (0, vec![Value::U64(u64::MAX), Value::Struct(StructFields::from([("a".into(), a), ("b".into(), Value::Null)]))]),
+            (1, vec![Value::I64(9), Value::Struct(StructFields::from([("a".into(), Value::Null), ("b".into(), b)]))]),
+            (2, vec![Value::Null, Value::Null]),
+        ]);
+    }
+
+    #[test]
+    fn coalesced_argument_chunks_keep_explicit_union_nulls_inside_lists() {
+        let memory = budget();
+        let element = LogicalType::from_legs([LogicalType::Scalar(ScalarType::I64), LogicalType::Scalar(ScalarType::Utf8), LogicalType::Null]);
+        let types = [ListKind::List, ListKind::FixedSizeList(2)].map(|kind| LogicalType::List { kind, element: Box::new(element.clone()) });
+        let chunk = |names: [&str; 2], values: &[Value; 2]| {
+            let fields = names.into_iter().zip(&types).map(|(name, ty)| to_field(name, ty).unwrap()).collect::<Vec<_>>();
+            let arrays = values.iter().zip(&types).map(|(value, ty)| build_array(ty, std::slice::from_ref(value)).unwrap()).collect();
+            let batch = RecordBatch::try_new(Arc::new(Schema::new(fields)), arrays).unwrap();
+            SqlArguments::from_arrow(OwnedBatch::new(batch, &memory).unwrap(), &memory).unwrap()
+        };
+        let first = [Value::List(vec![Value::I64(4), Value::Null]), Value::FixedSizeList(vec![Value::Null, Value::Utf8("x".into())])];
+        let second = [Value::List(vec![Value::Null]), Value::FixedSizeList(vec![Value::I64(5), Value::Null])];
+        let mut arguments = chunk(["left_list", "left_pair"], &first);
+        arguments.append(chunk(["right_list", "right_pair"], &second)).unwrap();
+        assert!(arguments.uniform_arrow_pages().is_none());
+        assert!(arguments.source_columnar_batch(&memory).unwrap().is_some());
+
+        let bytes = encode_arguments(&arguments, &memory).unwrap();
+        let replayed = decode_arguments(bytes.as_slice(), &memory).unwrap();
+
+        assert_eq!(replayed.rows().map(|row| row.unwrap().to_vec()).collect::<Vec<_>>(), [first.to_vec(), second.to_vec()]);
+    }
+
+    #[test]
+    fn coalesced_argument_chunks_discard_children_of_null_structs_and_lists() {
+        let memory = budget();
+        let binary = Arc::new(Field::new("payload", DataType::Binary, false));
+        let payload = vec![19; 65536];
+        let values = Arc::new(arrow_array::BinaryArray::from_iter_values([payload.as_slice(), b"keep"]));
+        let mask = arrow_buffer::NullBuffer::from(vec![false, true]);
+        let records = rtdb_columnar::build_struct_array(vec![Arc::clone(&binary)].into(), &[values.clone()], 2, Some(mask.clone())).unwrap();
+        let lists: ArrayRef = Arc::new(ListArray::try_new(binary, arrow_buffer::OffsetBuffer::new(vec![0i32, 1, 2].into()), values, Some(mask)).unwrap());
+        let chunk = |names: [&str; 2], row| {
+            let fields = [records.data_type(), lists.data_type()].into_iter().zip(names)
+                .map(|(ty, name)| Field::new(name, ty.clone(), true)).collect::<Vec<_>>();
+            let batch = RecordBatch::try_new(Arc::new(Schema::new(fields)), vec![records.slice(row, 1), lists.slice(row, 1)]).unwrap();
+            SqlArguments::from_arrow(OwnedBatch::new(batch, &memory).unwrap(), &memory).unwrap()
+        };
+        let mut arguments = chunk(["record", "list"], 0);
+        arguments.append(chunk(["document", "items"], 1)).unwrap();
+        let batch = arguments.source_columnar_batch(&memory).unwrap().unwrap();
+        let records = batch.batch().column(0).as_struct();
+        let lists = batch.batch().column(1).as_list::<i32>();
+        assert_eq!(records.column(0).as_binary::<i32>().value_data(), b"keep");
+        assert_eq!(lists.values().as_binary::<i32>().value_data(), b"keep");
+        assert_eq!(lists.value_offsets(), &[0, 0, 1]);
+
+        let bytes = encode_arguments(&arguments, &memory).unwrap();
+        let replayed = decode_arguments(bytes.as_slice(), &memory).unwrap();
+
+        assert!(bytes.as_slice().len() < payload.len());
+        assert_eq!(&*replayed.rows().next().unwrap().unwrap(), &[Value::Null, Value::Null]);
+    }
+
+    #[test]
+    fn coalescing_rejects_a_null_value_in_a_nonnullable_arrow_union() {
+        let memory = budget();
+        let ty = LogicalType::Scalar(ScalarType::I64).join(&LogicalType::Scalar(ScalarType::Utf8));
+        let chunk = |name, value: Option<i64>| {
+            let field = to_field(name, &ty).unwrap();
+            let DataType::Union(legs, UnionMode::Dense) = field.data_type() else { panic!("Expected union"); };
+            let array = UnionArray::try_new(legs.clone(), vec![0i8].into(), Some(vec![0i32].into()), vec![
+                Arc::new(arrow_array::Int64Array::from(vec![value])),
+                Arc::new(arrow_array::StringArray::from(Vec::<&str>::new())),
+            ]).unwrap();
+            let batch = RecordBatch::try_new(Arc::new(Schema::new(vec![field])), vec![Arc::new(array)]).unwrap();
+            SqlArguments::from_arrow(OwnedBatch::new(batch, &memory).unwrap(), &memory).unwrap()
+        };
+        let mut arguments = chunk("a", None);
+        arguments.append(chunk("b", Some(7))).unwrap();
+        assert!(arguments.uniform_arrow_pages().is_none());
+
+        let error = encode_arguments(&arguments, &memory).unwrap_err();
+
+        assert_eq!(error.code, "rtdb/column-type-mismatch");
     }
 
     #[test]
@@ -1012,6 +1280,252 @@ mod tests {
             let values = (0..array.len()).map(|row| read_value(field, array.as_ref(), row).unwrap()).collect::<Vec<_>>();
             assert_eq!(values, expected);
         }
+    }
+
+    #[test]
+    fn different_nested_container_kinds_replay_with_typed_union_children() {
+        let memory = budget();
+        let record = |fields: &[(&str, Value)]| Value::Struct(fields.iter()
+            .map(|(name, value)| (name.to_string(), value.clone())).collect());
+        let put = |id, values: Vec<Value>| {
+            let logical = LogicalType::join_all(values.iter().map(Value::logical_type).collect::<Vec<_>>().iter());
+            let fields = vec![Field::new("_id", DataType::Int64, false), to_field("v", &logical).unwrap()];
+            let columns = vec![
+                Arc::new(arrow_array::Int64Array::from_iter_values(id..id + values.len() as i64)) as ArrayRef,
+                build_array(&logical, &values).unwrap(),
+            ];
+            let batch = RecordBatch::try_new(Arc::new(Schema::new(fields)), columns).unwrap();
+            let batch = OwnedBatch::new(batch, &memory).unwrap();
+            let documents = ArrowDocuments::from_batch(&batch, &memory).unwrap().unwrap();
+            TxOp::PutArrowDocs { table: TableRef::new("public", "docs"), documents }
+        };
+        let list = Value::List(vec![Value::Utf8("list".into())]);
+        let source = SourceTransaction::new(vec![
+            put(1, vec![Value::Null, record(&[("a", Value::I64(7))]), record(&[("a", Value::I64(9))])]),
+            put(4, vec![list.clone(), Value::Null]),
+            put(6, vec![record(&[("b", Value::Bool(true))])]),
+        ], SubmitOptions::default(), &memory).unwrap();
+        let replay = roundtrip(&source);
+
+        let expected = [
+            vec![Value::Null, record(&[("a", Value::I64(7)), ("b", Value::Null)]), record(&[("a", Value::I64(9)), ("b", Value::Null)])],
+            vec![list, Value::Null],
+            vec![record(&[("a", Value::Null), ("b", Value::Bool(true))])],
+        ];
+        assert_eq!(replay.operations.len(), expected.len());
+        for (operation, expected) in replay.operations.iter().zip(expected) {
+            let Operation::PutArrowIids { documents, .. } = operation else { panic!("Expected Arrow documents on replay"); };
+            let v = documents.array().column_by_name("v").unwrap();
+            let field = documents.array().fields().iter().find(|field| field.name() == "v").unwrap();
+            let union = v.as_any().downcast_ref::<UnionArray>().unwrap();
+            let DataType::Union(fields, UnionMode::Dense) = field.data_type() else { panic!("Expected a dense union"); };
+            assert_eq!(fields.iter().map(|(_, field)| field.name().as_str()).collect::<Vec<_>>(), ["struct", "null", "list"]);
+            for (row, value) in expected.into_iter().enumerate() {
+                assert_eq!(read_value(field, union, row).unwrap(), value);
+            }
+        }
+    }
+
+    #[test]
+    fn mixed_documents_encode_under_a_budget_that_cannot_materialize_arrow_rows() {
+        let memory = MemoryBudget::new(512 * 1024);
+        let schema = Arc::new(Schema::new(vec![Field::new("flag", DataType::Boolean, false)]));
+        let flag = Arc::new(arrow_array::BooleanArray::from(vec![true; 8192]));
+        let batch = OwnedBatch::new(RecordBatch::try_new(schema, vec![flag]).unwrap(), &memory).unwrap();
+        let arrow = ArrowDocuments::from_batch(&batch, &memory).unwrap().unwrap();
+        let rows = Documents::new(vec![StructFields::from([("flag".into(), Value::Bool(false))])], &memory).unwrap();
+        assert!(arrow.to_rows(false, &memory).is_err());
+        let mut arrays = BatchBuilder::new(4096, &memory).unwrap();
+
+        let documents = document_leg(vec![SourceDocuments::Arrow(&arrow), SourceDocuments::Rows(&rows)], &mut arrays, &memory).unwrap();
+
+        let documents = documents.as_any().downcast_ref::<ListArray>().unwrap();
+        let values = documents.values().as_any().downcast_ref::<StructArray>().unwrap();
+        let flags = values.column(0).as_any().downcast_ref::<arrow_array::BooleanArray>().unwrap();
+        assert_eq!(documents.value_offsets(), [0, 8192, 8193]);
+        assert!(flags.iter().take(8192).all(|value| value == Some(true)));
+        assert_eq!(flags.iter().last(), Some(Some(false)));
+    }
+
+    #[test]
+    fn row_and_arrow_puts_share_the_source_layout_in_transaction_order() {
+        let memory = budget();
+        let table = TableRef::new("public", "docs");
+        let values = [vec![Value::I64(7), Value::Null], vec![Value::List(vec![Value::Bool(true)])]];
+        let rows = {
+            let mut first = StructFields::from([("row_field".into(), Value::Bool(true)), ("_id".into(), Value::I64(1))]);
+            first.insert("v".into(), values[0][0].clone());
+            let second = StructFields::from([("_id".into(), Value::I64(2))]);
+            let documents = Documents::new(vec![first, second], &memory).unwrap();
+            TxOp::PutDocs { table: table.clone(), documents, valid_from: None, valid_to: None }
+        };
+        let arrow = {
+            let logical = values[1][0].logical_type();
+            let fields = vec![Field::new("_id", DataType::Int64, false), to_field("v", &logical).unwrap(), Field::new("arrow_field", DataType::Utf8, false)];
+            let columns = vec![Arc::new(arrow_array::Int64Array::from(vec![3])) as ArrayRef,
+                build_array(&logical, &values[1]).unwrap(), Arc::new(arrow_array::StringArray::from(vec!["arrow"]))];
+            let batch = OwnedBatch::new(RecordBatch::try_new(Arc::new(Schema::new(fields)), columns).unwrap(), &memory).unwrap();
+            let documents = ArrowDocuments::from_batch(&batch, &memory).unwrap().unwrap();
+            TxOp::PutArrowDocs { table: table.clone(), documents }
+        };
+        let source = SourceTransaction::new(vec![rows, arrow], SubmitOptions::default(), &memory).unwrap();
+
+        let replay = roundtrip(&source);
+
+        assert_eq!(replay.operations.len(), values.len());
+        let ids: [&[i64]; 2] = [&[1, 2], &[3]];
+        for (position, ((operation, values), ids)) in replay.operations.iter().zip(values).zip(ids).enumerate() {
+            let Operation::PutArrowIids { documents, iids, .. } = operation else { panic!("Expected Arrow documents on replay"); };
+            let batch = documents.array();
+            assert_eq!(documents.columns(), ["row_field", "_id", "v", "arrow_field"]);
+            assert_eq!(iids, &ids.iter().map(|id| EntityId::Integer(*id).iid()).collect::<Vec<_>>());
+            assert_eq!(batch.column(0).is_valid(0), position != 1);
+            assert_eq!(batch.column(3).is_valid(0), position == 1);
+            let union = batch.column(2).as_union();
+            let DataType::Union(legs, UnionMode::Dense) = union.data_type() else { panic!("Expected a dense union"); };
+            assert_eq!(legs.iter().map(|(_, field)| field.name().as_str()).collect::<Vec<_>>(), ["i64", "list", "null"]);
+            for (row, value) in values.into_iter().enumerate() {
+                assert_eq!(read_value(&batch.fields()[2], union, row).unwrap(), value);
+            }
+        }
+    }
+
+    #[test]
+    fn mixed_documents_normalize_arrow_union_aliases_before_replay() {
+        let memory = budget();
+        let table = TableRef::new("public", "docs");
+        let ints = || Arc::new(arrow_array::Int64Array::from(vec![7])) as ArrayRef;
+        let int = Field::new("i64", DataType::Int64, false);
+        let cases = [
+            (vec![3, 8], vec![int.clone(), Field::new("null", DataType::Null, true)],
+                vec![ints(), Arc::new(arrow_array::NullArray::new(1)) as ArrayRef], vec![3, 8], vec![Value::I64(7), Value::Null]),
+            (vec![3, 8, 9], vec![int.clone(), int.with_name("second_i64"), Field::new("utf8", DataType::Utf8, false)],
+                vec![ints(), ints(), Arc::new(arrow_array::StringArray::from(vec!["s"]))], vec![8, 9], vec![Value::I64(7), Value::Utf8("s".into())]),
+            (vec![3, 8, 9], vec![Field::new("a", DataType::UInt64, false), Field::new("b", DataType::Int64, false), Field::new("s", DataType::Utf8, false)],
+                vec![Arc::new(arrow_array::UInt64Array::from(vec![u64::MAX])), ints(), Arc::new(arrow_array::StringArray::from(vec!["s"]))],
+                vec![3, 9], vec![Value::I64(-1), Value::Utf8("s".into())]),
+        ];
+        for (tags, fields, children, selected, expected) in cases {
+            let legs = UnionFields::try_new(tags, fields).unwrap();
+            let column = UnionArray::try_new(legs, selected.into(), Some(vec![0i32, 0].into()), children).unwrap();
+            let schema = Arc::new(Schema::new(vec![Field::new("_id", DataType::Int64, false), Field::new("v", column.data_type().clone(), false)]));
+            let batch = RecordBatch::try_new(schema, vec![Arc::new(arrow_array::Int64Array::from(vec![1, 2])), Arc::new(column)]).unwrap();
+            let batch = OwnedBatch::new(batch, &memory).unwrap();
+            let arrow = ArrowDocuments::from_batch(&batch, &memory).unwrap().unwrap();
+            drop(batch);
+            let (_, column) = document_column(arrow.array(), "v").unwrap();
+            match column.data_type() {
+                DataType::Int64 => assert_eq!(expected[1], Value::Null),
+                DataType::Union(legs, UnionMode::Dense) => {
+                    assert_ne!(expected[1], Value::Null);
+                    assert_eq!(legs.iter().map(|(tag, field)| (tag, field.name().as_str())).collect::<Vec<_>>(), [(0, "i64"), (1, "utf8")]);
+                }
+                other => panic!("Unexpected normalized layout {other:?}"),
+            }
+            let row = StructFields::from([("_id".into(), Value::I64(3)), ("v".into(), Value::I64(9))]);
+            let rows = Documents::new(vec![row], &memory).unwrap();
+            let source = SourceTransaction::new(vec![
+                TxOp::PutArrowDocs { table: table.clone(), documents: arrow },
+                TxOp::PutDocs { table: table.clone(), documents: rows, valid_from: None, valid_to: None },
+            ], SubmitOptions::default(), &memory).unwrap();
+
+            let replay = roundtrip(&source);
+
+            assert_eq!(replay.operations.len(), 2);
+            for (operation, expected) in replay.operations.iter().zip([expected, vec![Value::I64(9)]]) {
+                let Operation::PutArrowIids { documents, .. } = operation else { panic!("Expected Arrow documents on replay"); };
+                let array = documents.array();
+                let (field, values) = document_column(array, "v").unwrap();
+                let actual = (0..array.len()).map(|row| read_value(field, values.as_ref(), row).unwrap()).collect::<Vec<_>>();
+                assert_eq!(actual, expected);
+            }
+        }
+    }
+
+    #[test]
+    fn nullable_one_kind_union_inside_a_list_keeps_its_declared_nullability() {
+        for (tags, expected) in [
+            (vec![3i8, 8, 3], [Some(7), None, Some(7)]),
+            (vec![3i8, 3, 3], [Some(7), Some(7), Some(7)]),
+        ] {
+            let memory = budget();
+            let nullable = tags.contains(&8);
+            let legs = UnionFields::try_new([3, 8], [Field::new("i64", DataType::Int64, false), Field::new("null", DataType::Null, true)]).unwrap();
+            let items = UnionArray::try_new(legs, tags.into(), Some(vec![0i32, 0, 0].into()),
+                vec![Arc::new(arrow_array::Int64Array::from(vec![7])), Arc::new(arrow_array::NullArray::new(usize::from(nullable)))]).unwrap();
+            let item = Arc::new(Field::new("$data$", items.data_type().clone(), nullable));
+            let list = ListArray::try_new(item, OffsetBuffer::new(vec![0i32, 3].into()), Arc::new(items), None).unwrap();
+            let schema = Arc::new(Schema::new(vec![Field::new("v", list.data_type().clone(), false)]));
+            let batch = OwnedBatch::new(RecordBatch::try_new(schema, vec![Arc::new(list)]).unwrap(), &memory).unwrap();
+            let documents = ArrowDocuments::from_batch(&batch, &memory).unwrap().unwrap();
+            drop(batch);
+
+            let (field, list) = document_column(documents.array(), "v").unwrap();
+            let list = list.as_any().downcast_ref::<ListArray>().unwrap();
+            let DataType::List(item) = field.data_type() else { panic!("Expected normalized Arrow list"); };
+            assert!(item.is_nullable());
+            assert_eq!(list.values().as_primitive::<arrow_array::types::Int64Type>().iter().collect::<Vec<_>>(), expected);
+            drop(documents);
+            assert_eq!(memory.used_bytes(), 0);
+        }
+    }
+
+    #[test]
+    fn duplicate_union_tags_keep_input_owned_when_normalization_cannot_reserve() {
+        let memory = MemoryBudget::new(384 * 1024);
+        let legs = UnionFields::try_new([3, 8], [Field::new("left", DataType::Binary, false), Field::new("right", DataType::Binary, false)]).unwrap();
+        let left = vec![1; 64 * 1024];
+        let right = vec![2; 64 * 1024];
+        let array = UnionArray::try_new(legs, vec![3i8, 8].into(), Some(vec![0i32, 0].into()), vec![
+            Arc::new(arrow_array::BinaryArray::from(vec![left.as_slice()])),
+            Arc::new(arrow_array::BinaryArray::from(vec![right.as_slice()])),
+        ]).unwrap();
+        let schema = Arc::new(Schema::new(vec![Field::new("v", array.data_type().clone(), false)]));
+        let batch = OwnedBatch::new(RecordBatch::try_new(schema, vec![Arc::new(array)]).unwrap(), &memory).unwrap();
+
+        let documents = ArrowDocuments::from_batch(&batch, &memory).unwrap().unwrap();
+
+        assert!(Arc::ptr_eq(documents.array().column(0), batch.batch().column(0)));
+    }
+
+    #[test]
+    fn optional_union_copy_does_not_displace_document_schema_admission() {
+        let mut fields = (0..96).map(|index| Field::new(format!("v{index}"), DataType::Int64, false)).collect::<Vec<_>>();
+        let mut columns = vec![Arc::new(arrow_array::Int64Array::from(vec![1, 2])) as ArrayRef; fields.len()];
+        let legs = UnionFields::try_new([3, 8], [Field::new("a", DataType::Binary, false), Field::new("b", DataType::Binary, false)]).unwrap();
+        let payload = vec![0u8; 8 * 1024];
+        let child = || Arc::new(arrow_array::BinaryArray::from(vec![payload.as_slice()])) as ArrayRef;
+        let union = UnionArray::try_new(legs, vec![3i8, 8].into(), Some(vec![0i32, 0].into()), vec![child(), child()]).unwrap();
+        fields.push(Field::new("payload", union.data_type().clone(), false));
+        columns.push(Arc::new(union));
+        let schema = Arc::new(Schema::new(fields));
+        let bound = rtdb_format::ipc::schema_translation_bound(&schema).unwrap();
+        let batch = RecordBatch::try_new(schema, columns).unwrap();
+        let memory = MemoryBudget::new(batch.get_array_memory_size() + 2 * bound);
+        let batch = OwnedBatch::new(batch, &memory).unwrap();
+
+        let documents = ArrowDocuments::from_batch(&batch, &memory).unwrap().unwrap();
+
+        assert!(Arc::ptr_eq(documents.array().column(96), batch.batch().column(96)));
+    }
+
+    #[test]
+    fn an_arrow_document_keeps_distinct_shapes_in_same_kind_union_children() {
+        let memory = budget();
+        let a = Value::Struct(StructFields::from([("a".into(), Value::I64(7))]));
+        let b = Value::Struct(StructFields::from([("b".into(), Value::I64(9))]));
+        let children = [&a, &b].map(|value| build_array(&value.logical_type(), std::slice::from_ref(value)).unwrap());
+        let legs = UnionFields::try_new([3, 8], children.iter().zip(["a", "b"]).map(|(child, name)| Field::new(name, child.data_type().clone(), false))).unwrap();
+        let array = UnionArray::try_new(legs, vec![3i8, 8].into(), Some(vec![0i32, 0].into()), Vec::from(children)).unwrap();
+        let schema = Arc::new(Schema::new(vec![Field::new("v", array.data_type().clone(), false)]));
+        let batch = OwnedBatch::new(RecordBatch::try_new(schema, vec![Arc::new(array)]).unwrap(), &memory).unwrap();
+
+        let documents = ArrowDocuments::from_batch(&batch, &memory).unwrap().unwrap();
+
+        let (field, array) = document_column(documents.array(), "v").unwrap();
+        assert!(Arc::ptr_eq(array, batch.batch().column(0)));
+        assert_eq!(read_value(field, array.as_ref(), 0).unwrap(), a);
+        assert_eq!(read_value(field, array.as_ref(), 1).unwrap(), b);
     }
 
     #[test]

@@ -2,12 +2,14 @@
 //! Arrow-rs admits only a union's declared type ids, so pages are translated between that form and the native one:
 //! leg 0 holding a null in a slot its non-nullable field never otherwise holds.
 
+use std::sync::Arc;
 use arrow_array::{ArrayRef, BooleanArray, RecordBatch, make_array, new_null_array};
 use arrow_buffer::{Buffer, ScalarBuffer};
 use arrow_data::ArrayData;
-use arrow_schema::{DataType, UnionMode};
+use arrow_schema::{DataType, Field, UnionMode};
+use rtdb_columnar::{MemoryBudget, MemoryReservation, copy_event_cells, estimate_event_copy_cell_bytes};
 use rtdb_types::Result;
-use super::invalid;
+use super::{allocation_add, allocation_mul, invalid};
 
 /// Rewrites a page decoded without union validation into the native form, then validates it in full.
 pub(super) fn reinstate(batch: RecordBatch) -> Result<RecordBatch> {
@@ -52,33 +54,65 @@ fn native(data: &ArrayData) -> Result<ArrayData> {
 /// Rewrites a native page into the reference's form for persistence: a leg-0 null in a non-nullable leg becomes type id -1
 /// with offset 0, and its slot leaves the child. The result is for encoding only; arrow-rs would reject it on validation.
 pub(super) fn undefine(batch: &RecordBatch) -> Result<RecordBatch> {
+    undefine_page(batch, &mut None)
+}
+
+pub(super) struct EventCopies<'a> {
+    pub(super) memory: &'a Arc<MemoryBudget>,
+    pub(super) retained: Vec<Arc<MemoryReservation>>,
+}
+
+pub(super) fn undefine_page(batch: &RecordBatch, copies: &mut Option<EventCopies<'_>>) -> Result<RecordBatch> {
     let mut changed = false;
-    let columns = batch.columns().iter().map(|column| Ok(make_array(reference(&column.to_data(), &mut changed)?))).collect::<Result<Vec<ArrayRef>>>()?;
+    let columns = batch.columns().iter().map(|column| Ok(make_array(reference(&column.to_data(), &mut changed, copies)?))).collect::<Result<Vec<ArrayRef>>>()?;
     if !changed { return Ok(batch.clone()); }
     // SAFETY: the columns keep the schema's types and the batch's row count; the batch is only encoded.
     Ok(unsafe { RecordBatch::new_unchecked(batch.schema(), columns, batch.num_rows()) })
 }
 
 /// Filters the native leg-0 child before converting any descendant, since `filter` only accepts valid arrays.
-fn reference(data: &ArrayData, changed: &mut bool) -> Result<ArrayData> {
-    let convert = |children: &[ArrayData], changed: &mut bool| children.iter().map(|child| reference(child, changed)).collect::<Result<Vec<_>>>();
-    let unchanged = |data: &ArrayData, changed: &mut bool| Ok(rebuilt(data, None, convert(data.child_data(), changed)?));
-    let (DataType::Union(fields, _), Some((ids, offsets))) = (data.data_type(), dense_union_ids(data)?) else { return unchanged(data, changed); };
-    let Some((first, first_field)) = fields.iter().next() else { return unchanged(data, changed); };
+fn reference(data: &ArrayData, changed: &mut bool, copies: &mut Option<EventCopies<'_>>) -> Result<ArrayData> {
+    let convert = |children: &[ArrayData], changed: &mut bool, copies: &mut Option<EventCopies<'_>>| {
+        children.iter().map(|child| reference(child, changed, copies)).collect::<Result<Vec<_>>>()
+    };
+    let unchanged = |data: &ArrayData, changed: &mut bool, copies: &mut Option<EventCopies<'_>>| {
+        Ok(rebuilt(data, None, convert(data.child_data(), changed, copies)?))
+    };
+    let (DataType::Union(fields, _), Some((ids, offsets))) = (data.data_type(), dense_union_ids(data)?) else { return unchanged(data, changed, copies); };
+    let Some((first, first_field)) = fields.iter().next() else { return unchanged(data, changed, copies); };
     let source = &data.child_data()[0];
-    if first_field.is_nullable() || source.nulls().is_none() { return unchanged(data, changed); }
+    if first_field.is_nullable() || source.nulls().is_none() { return unchanged(data, changed, copies); }
     let undefined = |id: i8, offset: i32| id == first && source.is_null(offset as usize);
-    if !ids.iter().zip(offsets.iter()).any(|(id, offset)| undefined(*id, *offset)) { return unchanged(data, changed); }
+    if !ids.iter().zip(offsets.iter()).any(|(id, offset)| undefined(*id, *offset)) { return unchanged(data, changed, copies); }
     *changed = true;
-    let keep = BooleanArray::from((0..source.len()).map(|slot| !source.is_null(slot)).collect::<Vec<_>>());
     let mut remapped = vec![0i32; source.len()];
     let mut next = 0;
-    for slot in 0..source.len() { if keep.value(slot) { remapped[slot] = next; next += 1; } }
+    for (slot, position) in remapped.iter_mut().enumerate() {
+        if source.is_valid(slot) { *position = next; next += 1; }
+    }
     let mut children = data.child_data().to_vec();
-    children[0] = arrow_select::filter::filter(make_array(source.clone()).as_ref(), &keep).map_err(invalid)?.to_data();
-    let children = convert(&children, changed)?;
+    children[0] = defined_cells(source, first_field, copies)?;
+    let children = convert(&children, changed, copies)?;
     let (ids, offsets): (Vec<i8>, Vec<i32>) = ids.iter().zip(offsets.iter()).map(|(id, offset)| {
         if undefined(*id, *offset) { (-1, 0) } else if *id == first { (*id, remapped[*offset as usize]) } else { (*id, *offset) }
     }).unzip();
     Ok(rebuilt(data, Some(vec![Buffer::from_vec(ids), Buffer::from_vec(offsets)]), children))
+}
+
+fn defined_cells(source: &ArrayData, field: &Field, copies: &mut Option<EventCopies<'_>>) -> Result<ArrayData> {
+    let array = make_array(source.clone());
+    if let Some(copies) = copies
+        && !source.child_data().is_empty()
+    {
+        let base = allocation_add(allocation_mul(field.size(), 8)?, allocation_mul(source.len(), 32)?)?;
+        let bound = (0..source.len()).filter(|&row| source.is_valid(row)).try_fold(base, |bytes, row| {
+            let cell = estimate_event_copy_cell_bytes(field, array.as_ref(), row)?;
+            allocation_add(bytes, allocation_mul(cell, 4)?)
+        })?;
+        copies.retained.push(copies.memory.reserve(bound)?);
+        let picks = (0..source.len()).filter(|&row| source.is_valid(row)).map(|row| Some((0, row))).collect::<Vec<_>>();
+        return Ok(copy_event_cells(&[array.as_ref()], &picks)?.to_data());
+    }
+    let keep = BooleanArray::from((0..source.len()).map(|slot| !source.is_null(slot)).collect::<Vec<_>>());
+    Ok(arrow_select::filter::filter(array.as_ref(), &keep).map_err(invalid)?.to_data())
 }

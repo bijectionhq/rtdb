@@ -226,6 +226,11 @@ fn attach_data(data: ArrayData, reservation: &Arc<MemoryReservation>) -> Result<
     data.into_builder().buffers(buffers).child_data(children).nulls(nulls).build().map_err(super::arrow_error)
 }
 
+/// Keeps a copy's allocation charge with its Arrow buffers through moves and slices.
+pub fn retain_array(array: ArrayRef, reservation: &Arc<MemoryReservation>) -> Result<ArrayRef> {
+    attach_data(array.to_data(), reservation).map(make_array)
+}
+
 fn selection_bound(batch: &RecordBatch, indices: &[u32]) -> Result<usize> {
     let mut bound = indices.len().checked_mul(std::mem::size_of::<u32>()).ok_or_else(allocation_overflow)?;
     for array in batch.columns() {

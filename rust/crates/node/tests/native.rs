@@ -2968,6 +2968,44 @@ async fn arrow_probe_unions_sort_stably_in_memory_and_in_spill_runs() {
 }
 
 #[tokio::test]
+async fn columnar_sort_spills_for_buffers_held_by_selected_payloads() {
+    let trace = BatchSortTrace::default();
+    let mut services = services();
+    services.tracer = Some(Arc::new(trace.clone()));
+    let mut config = options();
+    config.automatic_compaction = false;
+    config.query.sort_memory_bytes = 32 * 1024;
+    config.query.batch_rows = 2;
+    let (node, driver) = running(config, services).await;
+    let mut session = node.session("xtdb", Arc::new(Authority)).unwrap();
+    let database = node.catalog().database("xtdb").unwrap();
+    let payload = |id| Value::FixedSizeList(vec![Value::I64(id)]);
+    for id in [3, 1, 2] {
+        let documents = Documents::new(vec![StructFields::from([
+            ("_id".into(), Value::I64(id)), ("cost".into(), Value::I64(4 - id)), ("payload".into(), payload(id)),
+            ("unprojected".into(), Value::Binary(vec![id as u8; 64 * 1024])),
+        ])], node.memory()).unwrap();
+        let operation = TxOp::PutDocs {
+            table: TableRef::new("public", "loads"), documents, valid_from: None, valid_to: None,
+        };
+        let result = session.state_mut().execute_tx(vec![operation], AutonomousTxOptions::default()).await.unwrap();
+        assert!(result.committed(), "{result:?}");
+        index_flush(&node, &database).await;
+    }
+    let context = session.query_context().await.unwrap();
+    let prepared = PreparedSql::prepare(
+        "SELECT _id, payload FROM loads ORDER BY cost", &context, Default::default(), ResultSignaturePolicy::Dynamic,
+    ).unwrap();
+
+    let result = rows(prepared.open_query_columns_typed(context, vec![], &[]).await.unwrap()).await;
+
+    assert_eq!(result, [3, 2, 1].map(|id| vec![Value::I64(id), payload(id)]));
+    let reported_spill = trace.0.lock().unwrap().get("sort_columnar_spill").copied();
+    assert_eq!(reported_spill, Some(1));
+    stop(&node, driver).await;
+}
+
+#[tokio::test]
 async fn ordered_index_declaration_if_not_exists_preserves_the_definition() {
     let (node, driver) = running(options(), services()).await;
     let mut session = node.session("xtdb", Arc::new(Authority)).unwrap();
@@ -3212,11 +3250,11 @@ async fn ordered_index_gathers_projected_table_columns_at_the_original_basis() {
     let database = node.catalog().database("xtdb").unwrap();
     index_sql(&mut session, "CREATE INDEX orders_key ON orders (customer, priority, _id)").await;
     index_sql(&mut session,
-        "INSERT INTO orders RECORDS {_id: 1, customer: 'a', priority: 3, payload: 'third'},
-         {_id: 2, customer: 'a', priority: 1, payload: 'first'}").await;
+        "INSERT INTO orders RECORDS {_id: 1, customer: 'a', priority: 3, payload: 'third', detail: {a: 3}},
+         {_id: 2, customer: 'a', priority: 1, payload: 'first', detail: {a: 1}}").await;
     index_flush(&node, &database).await;
     let past = index_sql(&mut session,
-        "INSERT INTO orders RECORDS {_id: 3, customer: 'a', priority: 2, payload: 'second'},
+        "INSERT INTO orders RECORDS {_id: 3, customer: 'a', priority: 2, payload: 'second', detail: {b: 2}},
          {_id: 4, customer: 'a', priority: 4}").await;
     index_flush(&node, &database).await;
     database.build_artefacts().await.unwrap();
@@ -3238,6 +3276,16 @@ async fn ordered_index_gathers_projected_table_columns_at_the_original_basis() {
     assert_eq!(rows(session.query_sql(query, vec![at]).await.unwrap()).await,
         [vec![Value::Utf8("third".into()), Value::I64(1)]]);
     assert!(observer.take().is_empty(), "the index feeds the columnar residual filter");
+    let query = "SELECT detail, _id FROM orders FOR SYSTEM_TIME AS OF ? WHERE customer = 'a'
+                 ORDER BY priority, _id LIMIT 3 OFFSET 1";
+    let at = Value::Timestamp { value: past.0, unit: rtdb_types::TimeUnit::Microsecond, timezone: Some("UTC".into()) };
+    let record = |a, b| Value::Struct(StructFields::from([("a".into(), a), ("b".into(), b)]));
+    assert_eq!(rows(session.query_sql(query, vec![at]).await.unwrap()).await, [
+        vec![record(Value::Null, Value::I64(2)), Value::I64(3)],
+        vec![record(Value::I64(3), Value::Null), Value::I64(1)],
+        vec![Value::Null, Value::I64(4)],
+    ]);
+    assert!(observer.take().is_empty(), "the ordered seek supplied the nested payload rows");
     stop(&node, driver).await;
 }
 

@@ -7,6 +7,9 @@ use arrow_schema::{DataType, Fields, Schema};
 use rtdb_columnar::{ColumnReader, MemoryBudget, MemoryReservation, OwnedBatch, from_field};
 use rtdb_types::{Anomaly, EntityId, LogicalType, Result, TableRef, Timestamp, TransactionKey, TxId, Value};
 
+mod arguments;
+mod union;
+
 #[derive(Clone, Debug)]
 pub struct RetainedBytes { data: Arc<Vec<u8>>, _reservation: Arc<MemoryReservation> }
 impl RetainedBytes {
@@ -157,23 +160,35 @@ impl ArrowDocuments {
     pub fn from_batch(batch: &OwnedBatch, memory: &Arc<MemoryBudget>) -> Result<Option<Self>> {
         let batch = batch.batch();
         let schema = batch.schema();
-        if batch.num_rows() == 0 || schema.fields().iter().zip(batch.columns()).any(|(field, _)| !Self::compatible(field)) {
+        if batch.num_rows() == 0 || schema.fields().iter().any(|field| !Self::compatible(field, true)) {
             return Ok(None);
         }
         let _schema = memory.reserve(rtdb_format::ipc::schema_translation_bound(&schema)?)?;
         let names = schema.fields().iter().map(|field| field.name()).collect::<BTreeSet<_>>();
         if names.len() != schema.fields().len() { return Ok(None); }
-        let columns = schema.fields().iter().zip(batch.columns()).map(|(field, array)| {
+        match Self::prepare_columns(batch, &schema, memory, true) {
+            Err(error) if error.code == "rtdb/memory-budget-exceeded" => {
+                if !schema.fields().iter().all(|field| Self::compatible(field, false)) { return Ok(None); }
+                Self::prepare_columns(batch, &schema, memory, false)
+            }
+            result => result,
+        }
+    }
+
+    fn prepare_columns(batch: &RecordBatch, schema: &Schema, memory: &Arc<MemoryBudget>, normalize_unions: bool) -> Result<Option<Self>> {
+        let mut fields = Vec::with_capacity(schema.fields().len());
+        let mut columns = Vec::with_capacity(schema.fields().len());
+        for (field, array) in schema.fields().iter().zip(batch.columns()) {
             let nulls = array.logical_null_count();
             let array = if nulls == array.len() {
                 Arc::new(arrow_array::NullArray::new(array.len())) as ArrayRef
             } else {
-                normalized_document_array(array)?
+                let Some(array) = normalized_document_array(array, memory, normalize_unions)? else { return Ok(None); };
+                array
             };
-            Some((arrow_schema::Field::new(field.name(), array.data_type().clone(), nulls != 0), array))
-        }).collect::<Option<Vec<_>>>();
-        let Some(columns) = columns else { return Ok(None); };
-        let (fields, columns): (Vec<_>, Vec<_>) = columns.into_iter().unzip();
+            fields.push(normalized_field(&field.as_ref().clone().with_nullable(nulls != 0), &array));
+            columns.push(array);
+        }
         let fields = Fields::from(fields);
         let layout = DecodedDocumentLayout::new(&fields, memory)?;
         let array = StructArray::try_new_with_length(fields, columns, None, batch.num_rows())
@@ -181,12 +196,12 @@ impl ArrowDocuments {
         Ok(Some(Self { array, layout }))
     }
 
-    fn compatible(field: &arrow_schema::Field) -> bool {
+    fn compatible(field: &arrow_schema::Field, normalize: bool) -> bool {
         field.metadata().is_empty() && match field.data_type() {
-            DataType::Struct(fields) => fields.iter().all(|field| Self::compatible(field)),
-            DataType::List(field) => Self::compatible(field),
+            DataType::Struct(fields) => fields.iter().all(|field| Self::compatible(field, normalize)),
+            DataType::List(field) => Self::compatible(field, normalize),
             DataType::Union(fields, arrow_schema::UnionMode::Dense) => fields.iter().all(|(_, field)| {
-                Self::compatible(field) && from_field(field).is_ok_and(|ty| rtdb_columnar::execution_type(&ty) == ty)
+                Self::compatible(field, normalize) && (normalize || from_field(field).is_ok_and(|ty| rtdb_columnar::execution_type(&ty) == ty))
             }),
             DataType::Null | DataType::Boolean | DataType::Int8 | DataType::Int16 | DataType::Int32 | DataType::Int64 |
             DataType::UInt8 | DataType::UInt16 | DataType::UInt32 | DataType::UInt64 |
@@ -197,7 +212,7 @@ impl ArrowDocuments {
     }
 
     pub(crate) fn from_source(array: &StructArray, layout: Arc<DecodedDocumentLayout>) -> Option<Self> {
-        (!array.is_empty() && array.null_count() == 0 && array.fields().iter().all(|field| Self::compatible(field)))
+        (!array.is_empty() && array.null_count() == 0 && array.fields().iter().all(|field| Self::compatible(field, false)))
             .then(|| Self { array: array.clone(), layout })
     }
 
@@ -227,28 +242,44 @@ impl ArrowDocuments {
     }
 }
 
-fn normalized_document_array(array: &ArrayRef) -> Option<ArrayRef> {
-    Some(match array.data_type() {
+fn normalized_document_array(array: &ArrayRef, memory: &Arc<MemoryBudget>, normalize_unions: bool) -> Result<Option<ArrayRef>> {
+    Ok(Some(match array.data_type() {
         DataType::UInt8 => signed_column::<UInt8Type, Int8Type>(array.as_ref()),
         DataType::UInt16 => signed_column::<UInt16Type, Int16Type>(array.as_ref()),
         DataType::UInt32 => signed_column::<UInt32Type, Int32Type>(array.as_ref()),
         DataType::UInt64 => signed_column::<UInt64Type, Int64Type>(array.as_ref()),
         DataType::Struct(fields) => {
-            let source = array.as_any().downcast_ref::<StructArray>()?;
-            let children = source.columns().iter().map(normalized_document_array).collect::<Option<Vec<_>>>()?;
-            let fields = fields.iter().zip(&children).map(|(field, child)| {
-                field.as_ref().clone().with_data_type(child.data_type().clone())
-            }).collect::<Fields>();
-            Arc::new(StructArray::try_new_with_length(fields, children, source.nulls().cloned(), source.len()).ok()?)
+            let source = array.as_struct();
+            let children = source.columns().iter().map(|child| normalized_document_array(child, memory, normalize_unions)).collect::<Result<Vec<_>>>()?;
+            let Some(children) = children.into_iter().collect::<Option<Vec<_>>>() else { return Ok(None); };
+            if source.columns().iter().zip(&children).all(|(source, child)| Arc::ptr_eq(source, child)) { return Ok(Some(Arc::clone(array))); }
+            let fields = fields.iter().zip(&children).map(|(field, child)| normalized_field(field, child)).collect::<Fields>();
+            match StructArray::try_new_with_length(fields, children, source.nulls().cloned(), source.len()) {
+                Ok(array) => Arc::new(array),
+                Err(_) => return Ok(None),
+            }
         }
         DataType::List(field) => {
-            let source = array.as_any().downcast_ref::<ListArray>()?;
-            let values = normalized_document_array(source.values())?;
-            let field = field.as_ref().clone().with_data_type(values.data_type().clone());
-            Arc::new(ListArray::try_new(Arc::new(field), source.offsets().clone(), values, source.nulls().cloned()).ok()?)
+            let source = array.as_list::<i32>();
+            let Some(values) = normalized_document_array(source.values(), memory, normalize_unions)? else { return Ok(None); };
+            if Arc::ptr_eq(source.values(), &values) { return Ok(Some(Arc::clone(array))); }
+            let field = normalized_field(field, &values);
+            match ListArray::try_new(Arc::new(field), source.offsets().clone(), values, source.nulls().cloned()) {
+                Ok(array) => Arc::new(array),
+                Err(_) => return Ok(None),
+            }
         }
+        DataType::Union(_, arrow_schema::UnionMode::Dense) if normalize_unions => return union::normalize(array, memory),
         _ => Arc::clone(array),
-    })
+    }))
+}
+
+fn normalized_field(field: &arrow_schema::Field, array: &ArrayRef) -> arrow_schema::Field {
+    let changed = array.data_type() != field.data_type();
+    let nullable = field.is_nullable() || (changed && !matches!(array.data_type(), DataType::Union(..)) && (
+        array.is_nullable() || (matches!(field.data_type(), DataType::Union(..)) && from_field(field).is_ok_and(|ty| ty.nullable()))
+    ));
+    field.clone().with_data_type(array.data_type().clone()).with_nullable(nullable)
 }
 
 fn signed_column<From: ArrowPrimitiveType, To: ArrowPrimitiveType>(array: &dyn Array) -> ArrayRef {

@@ -133,6 +133,8 @@ impl IndexBatch {
         self.headers.0.get(row).copied().ok_or_else(|| Anomaly::incorrect("rtdb.index/event-row", "Event row exceeds batch length"))
     }
     pub fn arrow(&self) -> &RecordBatch { self.owned.batch() }
+    /// Any retained Arrow child can keep this entire allocation charged.
+    pub fn arrow_reservation(&self) -> &Arc<MemoryReservation> { self.owned.reservation() }
     pub fn len(&self) -> usize { self.events.len() }
     pub fn is_empty(&self) -> bool { self.events.is_empty() }
     pub fn put_types(&self) -> &StructFields<LogicalType> { &self.put_types }

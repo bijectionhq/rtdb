@@ -4,7 +4,7 @@ use std::cmp::Ordering;
 use arrow_array::{
     Array, Int8Array, Int16Array, Int32Array, Int64Array, StringArray, TimestampMicrosecondArray,
 };
-use arrow_schema::{DataType, TimeUnit as ArrowTime};
+use arrow_schema::{DataType, Field, TimeUnit as ArrowTime};
 use rtdb_plan::{Schema, SortExpr};
 use rtdb_types::{LogicalType, ScalarType, TimeUnit, Value};
 
@@ -48,33 +48,34 @@ impl Kind {
                 array,
                 field,
                 logical,
-            } => {
-                if array.data_type() == &DataType::Null {
-                    return true;
-                }
-                let logical_kind = logical.as_ref().map_or_else(
-                    || {
-                        rtdb_columnar::from_field(field)
-                            .ok()
-                            .and_then(|ty| Self::of(&ty))
-                    },
-                    Self::of,
-                );
-                if logical_kind != Some(self) {
-                    return false;
-                }
-                match (self, array.data_type()) {
-                    (
-                        Self::Integer,
-                        DataType::Int8 | DataType::Int16 | DataType::Int32 | DataType::Int64,
-                    )
-                    | (Self::Text, DataType::Utf8) => true,
-                    (Self::UtcMicros, DataType::Timestamp(ArrowTime::Microsecond, Some(zone))) => {
-                        zone.as_ref() == "UTC"
-                    }
-                    _ => false,
-                }
+            } => self.accepts_arrow(array.as_ref(), field, logical.as_ref()),
+            Column::Selected(selected) => selected
+                .source_layouts()
+                .all(|(array, field, logical)| self.accepts_arrow(array, field, logical)),
+        }
+    }
+
+    fn accepts_arrow(self, array: &dyn Array, field: &Field, logical: Option<&LogicalType>) -> bool {
+        if array.data_type() == &DataType::Null {
+            return field.is_nullable() && logical != Some(&LogicalType::Nothing);
+        }
+        let logical_kind = logical.map_or_else(
+            || rtdb_columnar::from_field(field).ok().and_then(|ty| Self::of(&ty)),
+            Self::of,
+        );
+        if logical_kind != Some(self) {
+            return false;
+        }
+        match (self, array.data_type()) {
+            (
+                Self::Integer,
+                DataType::Int8 | DataType::Int16 | DataType::Int32 | DataType::Int64,
+            )
+            | (Self::Text, DataType::Utf8) => true,
+            (Self::UtcMicros, DataType::Timestamp(ArrowTime::Microsecond, Some(zone))) => {
+                zone.as_ref() == "UTC"
             }
+            _ => false,
         }
     }
 
@@ -101,29 +102,34 @@ impl Kind {
     fn read(self, column: &Column, row: usize) -> Key<'_> {
         match column {
             Column::Values(values) => self.value(&values[row]).expect("admitted scalar key"),
-            Column::Arrow { array, .. } => {
-                if array.data_type() == &DataType::Null || array.is_null(row) {
-                    return Key::Null;
-                }
-                macro_rules! cell {
-                    ($ty:ty) => {
-                        array
-                            .as_any()
-                            .downcast_ref::<$ty>()
-                            .expect("admitted physical key")
-                            .value(row)
-                    };
-                }
-                match array.data_type() {
-                    DataType::Int8 => Key::Number(i64::from(cell!(Int8Array))),
-                    DataType::Int16 => Key::Number(i64::from(cell!(Int16Array))),
-                    DataType::Int32 => Key::Number(i64::from(cell!(Int32Array))),
-                    DataType::Int64 => Key::Number(cell!(Int64Array)),
-                    DataType::Utf8 => Key::Text(cell!(StringArray).as_bytes()),
-                    DataType::Timestamp(..) => Key::Number(cell!(TimestampMicrosecondArray)),
-                    _ => unreachable!("only admitted sort keys are read"),
-                }
-            }
+            Column::Arrow { array, .. } => Self::read_arrow(array.as_ref(), row),
+            Column::Selected(selected) => selected
+                .source_cell(row)
+                .map_or(Key::Null, |(array, row)| Self::read_arrow(array, row)),
+        }
+    }
+
+    fn read_arrow(array: &dyn Array, row: usize) -> Key<'_> {
+        if array.data_type() == &DataType::Null || array.is_null(row) {
+            return Key::Null;
+        }
+        macro_rules! cell {
+            ($ty:ty) => {
+                array
+                    .as_any()
+                    .downcast_ref::<$ty>()
+                    .expect("admitted physical key")
+                    .value(row)
+            };
+        }
+        match array.data_type() {
+            DataType::Int8 => Key::Number(i64::from(cell!(Int8Array))),
+            DataType::Int16 => Key::Number(i64::from(cell!(Int16Array))),
+            DataType::Int32 => Key::Number(i64::from(cell!(Int32Array))),
+            DataType::Int64 => Key::Number(cell!(Int64Array)),
+            DataType::Utf8 => Key::Text(cell!(StringArray).as_bytes()),
+            DataType::Timestamp(..) => Key::Number(cell!(TimestampMicrosecondArray)),
+            _ => unreachable!("only admitted sort keys are read"),
         }
     }
 }
@@ -199,4 +205,24 @@ impl NativeOrder {
         }
         Ordering::Equal
     }
+}
+
+#[test]
+fn borrowed_sort_keys_follow_selected_arrow_positions_and_missing_sources() {
+    use crate::columnar::SelectedColumn;
+    use std::sync::Arc;
+
+    let ty = LogicalType::Scalar(ScalarType::Utf8).maybe();
+    let field = Arc::new(rtdb_columnar::to_field("name", &ty).unwrap());
+    let array = Arc::new(StringArray::from(vec![Some("earlier"), None, Some("later")]));
+    let column = Column::Selected(SelectedColumn::new(
+        vec![Some((array, field, Some(ty), None)), None],
+        Arc::new(vec![(0, 2), (1, 0), (0, 0), (0, 1)]),
+    ));
+
+    assert!(Kind::Text.accepts(&column));
+    assert!(matches!(Kind::Text.read(&column, 0), Key::Text(bytes) if bytes == b"later"));
+    assert!(matches!(Kind::Text.read(&column, 1), Key::Null));
+    assert!(matches!(Kind::Text.read(&column, 2), Key::Text(bytes) if bytes == b"earlier"));
+    assert!(matches!(Kind::Text.read(&column, 3), Key::Null));
 }

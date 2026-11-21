@@ -809,7 +809,8 @@ impl NodeAgent {
             return Err(Anomaly::new(AnomalyCategory::Unavailable, "rtdb.multi/fragment-reader-cold", format!("This node is opening a replica of {name}")));
         }
         self.touch(name);
-        let bytes = self.node.scan_fragment(fragment, self.options.fragments.catch_up, &CancellationToken::new()).await?;
+        let response = self.node.scan_fragment_retained(fragment, self.options.fragments.catch_up, &CancellationToken::new()).await?;
+        let bytes = response.as_slice();
         // A slice too large to answer in one response is read by its coordinator instead.
         if bytes.len() as u64 > crate::control::MAXIMUM_RESPONSE_BYTES / 4 * 3 - 1024 {
             return Err(Anomaly::new(AnomalyCategory::Unavailable, "rtdb.multi/fragment-too-large", format!("A fragment of {name} is larger than one response carries")));

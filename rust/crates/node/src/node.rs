@@ -357,6 +357,12 @@ impl Node {
     /// Waits for this node's copy to reach the delegated fragment's transaction basis.
     /// The evaluator checks the exact snapshot it captures after the wait.
     pub async fn scan_fragment(&self, fragment: &rtdb_query::ScanFragment, catch_up: Duration, cancellation: &CancellationToken) -> Result<Vec<u8>> {
+        Ok(self.scan_fragment_retained(fragment, catch_up, cancellation).await?.into_bytes())
+    }
+
+    /// Serves the fragment with a reservation for the response's retained bytes.
+    pub async fn scan_fragment_retained(&self, fragment: &rtdb_query::ScanFragment, catch_up: Duration,
+        cancellation: &CancellationToken) -> Result<rtdb_query::FragmentBytes> {
         self.ensure_open()?;
         let database = self.catalog.database(fragment.database())?;
         if !fragment.residence.as_ref().is_some_and(|expected| database.fragment_residence() == Some(expected)) {
@@ -376,7 +382,7 @@ impl Node {
         let mut catalog = CatalogSnapshot::new(database.name(), snapshots, false)?;
         if let Some(lease) = &lease { catalog = catalog.with_read_lease(Arc::clone(lease)); }
         let context = QueryContext::with_owner(catalog, Arc::clone(&self.factory.memory), self.query_instant(), fragment.timezone.clone(), self.factory.options.query.clone(), cancellation, &self.cancellation)?;
-        rtdb_storage::IoRegion::leased(lease, rtdb_query::evaluate_fragment(context, fragment)).await
+        rtdb_storage::IoRegion::leased(lease, rtdb_query::evaluate_fragment_retained(context, fragment)).await
     }
 
     async fn submit(&self, database: &str, operations: Vec<TxOp>, mut options: SubmitOptions, permit: Option<crate::ReplaySubmissionPermit>, identity: &dyn SessionIdentity, placement: Option<&Weak<Database>>, cancellation: &CancellationToken) -> Result<SubmittedTx> {

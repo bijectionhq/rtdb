@@ -219,11 +219,13 @@ async fn flight_redeems_ordered_distinct_from_index_batches_at_the_ticket_basis(
 async fn prepared_update_info_buffers_the_bound_operation_once() {
     let running = Running::start(None, FlightConfig::default()).await;
     let mut client = Client::connect(&running.server, None).await;
-    client.update("INSERT INTO docs (_id,n) VALUES (1,10)", None).await;
+    client.update("INSERT INTO docs (_id,n) VALUES (1,10), (2,20)", None).await;
     let transaction = client.begin().await;
-    let prepared = client.prepare("UPDATE docs SET n = n + ? WHERE _id = 1", Some(transaction.clone())).await;
+    let prepared = client.prepare("UPDATE docs SET n = n + ? WHERE _id = ?", Some(transaction.clone())).await;
     let command = CommandPreparedStatementQuery { prepared_statement_handle: prepared.prepared_statement_handle };
-    client.upload(command.clone(), vec![arguments(vec![2])]).await;
+    let schema = Arc::new(Schema::new(vec![Field::new("increment", DataType::Int64, false), Field::new("id", DataType::Int64, false)]));
+    let batch = RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(vec![2, 4])), Arc::new(Int64Array::from(vec![1, 2]))]).unwrap();
+    client.upload(command.clone(), vec![batch]).await;
     let descriptor = FlightDescriptor::new_cmd(command.as_any().encode_to_vec());
     let request = client.request(descriptor);
     let info = client.client.get_flight_info(request).await.unwrap().into_inner();
@@ -231,7 +233,9 @@ async fn prepared_update_info_buffers_the_bound_operation_once() {
     assert!(client.redeem(&info).await.is_empty());
     assert!(client.redeem(&info).await.is_empty());
     client.end(transaction, true).await.unwrap();
-    assert_eq!(integer(&client.query("SELECT n FROM docs").await[0], 0, 0), 12);
+    let result = client.query("SELECT n FROM docs ORDER BY _id").await;
+    let actual = result.iter().flat_map(|batch| (0..batch.num_rows()).map(|row| integer(batch, 0, row))).collect::<Vec<_>>();
+    assert_eq!(actual, [12, 24]);
     running.stop().await;
 }
 
@@ -260,6 +264,40 @@ async fn prepared_parameters_are_positional_all_batches_update_and_old_ticket_ke
     let request = client.request(descriptor); let old = client.client.get_flight_info(request).await.unwrap().into_inner();
     client.upload(CommandPreparedStatementQuery { prepared_statement_handle: query.prepared_statement_handle }, vec![arguments(vec![42])]).await;
     assert_eq!(integer(&client.redeem(&old).await[0], 0, 0), 41); running.stop().await;
+}
+
+#[tokio::test]
+async fn prepared_updates_coalesce_compatible_parameter_layouts_across_uploads() {
+    use rtdb_types::Value;
+
+    let running = Running::start(None, FlightConfig::default()).await;
+    let mut client = Client::connect(&running.server, None).await;
+    client.update("INSERT INTO docs (_id,v) VALUES (1,0),(2,0),(3,0)", None).await;
+    let transaction = client.begin().await;
+    let prepared = client.prepare("UPDATE docs SET v = ? WHERE _id = ?", Some(transaction.clone())).await;
+    let command = CommandPreparedStatementUpdate { prepared_statement_handle: prepared.prepared_statement_handle };
+    let arguments = |label: &str, value: Value, id| {
+        let ty = value.logical_type();
+        let schema = Arc::new(Schema::new(vec![
+            rtdb_columnar::to_field(label, &ty).unwrap(),
+            Field::new(format!("{label}_id"), DataType::Int64, false),
+        ]));
+        RecordBatch::try_new(schema, vec![rtdb_columnar::build_array(&ty, &[value]).unwrap(), Arc::new(Int64Array::from(vec![id]))]).unwrap()
+    };
+    client.upload(command.clone(), vec![arguments("number", Value::U64(u64::MAX), 1)]).await;
+    client.upload(command.clone(), vec![arguments("text", Value::Utf8("changed".into()), 2)]).await;
+    client.upload(command, vec![arguments("absent", Value::Null, 3)]).await;
+    client.end(transaction, true).await.unwrap();
+
+    let mut rows = client.query("SELECT _id, v FROM docs").await.iter().flat_map(|batch| {
+        let schema = batch.schema();
+        (0..batch.num_rows()).map(|row| {
+            (integer(batch, 0, row), rtdb_columnar::read_value(schema.field(1), batch.column(1).as_ref(), row).unwrap())
+        }).collect::<Vec<_>>()
+    }).collect::<Vec<_>>();
+    rows.sort_by_key(|(id, _)| *id);
+    assert_eq!(rows, [(1, Value::I64(-1)), (2, Value::Utf8("changed".into())), (3, Value::Null)]);
+    running.stop().await;
 }
 
 #[tokio::test]
@@ -326,6 +364,62 @@ async fn bulk_ingest_preserves_nested_arrow_lists_with_signed_execution_values()
         column.iter().map(|value| value.unwrap().as_any().downcast_ref::<Int64Array>().unwrap().iter().collect::<Vec<_>>())
     }).collect();
     assert_eq!(lists, [vec![Some(-1), None], vec![Some(9)]]);
+    running.stop().await;
+}
+
+#[tokio::test]
+async fn mixed_nested_ingest_returns_arrow_unions_from_cold_persisted_pages() {
+    use arrow_array::{Array, UInt64Array, UnionArray};
+    use arrow_schema::UnionFields;
+    use rtdb_types::{LogicalType, StructFields, Value};
+
+    let running = Running::start(None, FlightConfig::default()).await;
+    let mut client = Client::connect(&running.server, None).await;
+    let record = Value::Struct(StructFields::from([("a".into(), Value::I64(7))]));
+    let list = Value::List(vec![Value::Utf8("list".into())]);
+    let upload = |ids: Vec<i64>, logical: LogicalType, values: &[Value]| {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("_id", DataType::Int64, false),
+            rtdb_columnar::to_field("v", &logical).unwrap(),
+        ]));
+        RecordBatch::try_new(schema, vec![
+            Arc::new(Int64Array::from(ids)),
+            rtdb_columnar::build_array(&logical, values).unwrap(),
+        ]).unwrap()
+    };
+    let tx = client.begin().await;
+    let command = CommandStatementIngest { table: "docs".into(), transaction_id: Some(tx.clone()), ..Default::default() };
+    client.upload(command.clone(), vec![upload(vec![1, 2], record.logical_type().maybe(), &[record.clone(), Value::Null])]).await;
+    client.upload(command.clone(), vec![upload(vec![3], list.logical_type(), std::slice::from_ref(&list))]).await;
+    let aliases = UnionFields::try_new([3, 8], [Field::new("u", DataType::UInt64, false), Field::new("s", DataType::Int64, false)]).unwrap();
+    let aliases = UnionArray::try_new(aliases, vec![3i8, 8].into(), Some(vec![0i32, 0].into()),
+        vec![Arc::new(UInt64Array::from(vec![u64::MAX])), Arc::new(Int64Array::from(vec![9]))]).unwrap();
+    let schema = Arc::new(Schema::new(vec![Field::new("_id", DataType::Int64, false), Field::new("v", aliases.data_type().clone(), false)]));
+    let aliases = RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(vec![4, 5])), Arc::new(aliases)]).unwrap();
+    client.upload(command, vec![aliases]).await;
+    client.end(tx, true).await.unwrap();
+
+    let database = running.node.catalog().database("xtdb").unwrap();
+    database.flush().await.unwrap();
+    running.node.sync_all(Duration::from_secs(10), &tokio_util::sync::CancellationToken::new()).await.unwrap();
+    let snapshot = database.snapshot();
+    let table = TableRef::new("public", "docs");
+    let entry = snapshot.table_entry(&table).unwrap();
+    let trie = rtdb_format::keys::TrieKey::l0(snapshot.trie_catalog().l0_max_block_index(&table)).unwrap();
+    let key = entry.slug.data_key(&trie);
+    let persisted = database.object_store().list(None).await.unwrap().into_iter()
+        .find(|object| object.key.as_str() == key).unwrap();
+    database.storage().invalidate(&persisted.key).await.unwrap();
+
+    let mut rows: Vec<_> = client.query("SELECT _id, v FROM docs").await.iter().flat_map(|batch| {
+        let schema = batch.schema();
+        let field = schema.field(1);
+        assert!(matches!(rtdb_columnar::from_field(field).unwrap(), LogicalType::Union(_)));
+        let array = batch.column(1).as_any().downcast_ref::<UnionArray>().unwrap();
+        (0..batch.num_rows()).map(|row| (integer(batch, 0, row), rtdb_columnar::read_value(field, array, row).unwrap())).collect::<Vec<_>>()
+    }).collect();
+    rows.sort_by_key(|(id, _)| *id);
+    assert_eq!(rows, [(1, record), (2, Value::Null), (3, list), (4, Value::I64(-1)), (5, Value::I64(9))]);
     running.stop().await;
 }
 

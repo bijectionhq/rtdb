@@ -419,6 +419,10 @@ pub fn read_stream(bytes: Arc<[u8]>) -> Result<(SchemaRef, Vec<RecordBatch>)> {
     Ok((schema, reader.collect::<Result<Vec<_>>>()?))
 }
 
+/// Applies IPC stream field nullability to an already decoded batch without copying its value buffers.
+/// Returns a replacement only when the stream reader would change the schema.
+pub fn adapt_stream_batch(batch: &RecordBatch) -> Result<Option<RecordBatch>> { decoded_schema::adapt_batch(batch) }
+
 /// Owns a complete IPC stream's schema and decoded Arrow buffers under one reservation.
 pub struct OwnedStream {
     schema: SchemaRef,
@@ -648,8 +652,9 @@ impl<W: Write> JavaFile<W> {
     }
     fn write(&mut self, page: &RecordBatch) -> Result<()> {
         self.decimal_schema.validate_batch(page)?;
-        self.writer.write(&undefined::undefine(page)?).map_err(invalid)
+        self.write_translated(&undefined::undefine(page)?)
     }
+    fn write_translated(&mut self, page: &RecordBatch) -> Result<()> { self.writer.write(page).map_err(invalid) }
     fn sink(&mut self) -> &mut W { &mut self.writer.get_mut().inner.inner.inner }
     /// Bytes the sink has received plus those the end-marker lookahead still holds.
     fn pending_bytes(&mut self) -> u64 { self.writer.get_mut().pending.len() as u64 }
@@ -735,9 +740,30 @@ impl ArrowFileWriter {
     }
 
     pub fn write(&mut self, page: &RecordBatch) -> Result<()> {
+        self.write_page(page, &mut None)
+    }
+
+    /// Writes a compact event page, charging IPC scratch and nested union cleanup through the write.
+    pub fn write_event_page(&mut self, page: &RecordBatch, memory: &Arc<MemoryBudget>) -> Result<()> {
+        let bound = page.columns().iter().try_fold(schema_translation_bound(page.schema_ref())?, |bytes, column| {
+            allocation_add(bytes, allocation_mul(column.get_array_memory_size(), 4)?)
+        })?;
+        let _encoding = memory.reserve(bound)?;
+        let mut copies = Some(undefined::EventCopies { memory, retained: Vec::new() });
+        self.write_page(page, &mut copies)
+    }
+
+    fn write_page(&mut self, page: &RecordBatch, copies: &mut Option<undefined::EventCopies<'_>>) -> Result<()> {
         self.writer.decimal_schema.validate_batch(page)?;
-        if let WriterAllocation::Owned { memory, blocks, block_bound, .. } = &mut self.allocation { blocks.push(memory.reserve(*block_bound)?); }
-        self.writer.write(page)
+        let block = match &self.allocation {
+            WriterAllocation::CallerReserved => None,
+            WriterAllocation::Owned { memory, block_bound, .. } => Some(memory.reserve(*block_bound)?),
+        };
+        self.writer.write_translated(&undefined::undefine_page(page, copies)?)?;
+        if let (WriterAllocation::Owned { blocks, .. }, Some(block)) = (&mut self.allocation, block) {
+            blocks.push(block);
+        }
+        Ok(())
     }
 
     /// Finishes the JVM-compatible end marker and returns the caller-owned file at its end.

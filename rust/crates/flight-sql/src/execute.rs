@@ -13,7 +13,7 @@ use crate::{error::{cancelled, invalid, status}, service::{Call, Output, Service
 
 pub(crate) struct Shape { pub schema: Option<wire::OwnedSchema>, pub parameters: usize }
 impl Service {
-    pub async fn prepare_shape(&self, connection: Arc<ConnectionResource>, source: &str, params: Option<&Bytes>) -> Result<Shape, Status> {
+    pub async fn prepare_shape(&self, connection: Arc<ConnectionResource>, source: &str) -> Result<Shape, Status> {
         let mut native = connection.borrow().await?;
         let token = native.state().cancellation().child_token(); let _cancel = token.clone().drop_guard();
         let options = options(&native);
@@ -25,15 +25,15 @@ impl Service {
         let prepared = PreparedSql::prepare(source, &context, options, ResultSignaturePolicy::Dynamic)
             .map_err(status)?;
         let schema = if prepared.is_dml() { None } else {
-            Some(self.parameterized_schema(&prepared, &context, params)?)
+            Some(self.parameterized_schema(&prepared, &context, None)?)
         };
         Ok(Shape { schema, parameters: prepared.parameter_count() })
     }
     fn parameterized_schema(
-        &self, prepared: &PreparedSql, context: &Arc<QueryContext>, params: Option<&Bytes>,
+        &self, prepared: &PreparedSql, context: &Arc<QueryContext>, params: Option<&wire::BoundParameters>,
     ) -> Result<wire::OwnedSchema, Status> {
         let schema = if let Some(params) = params {
-            let types = wire::parameter_types(params, self.memory())?;
+            let types = wire::ParameterTypes::from_batch(params.batch(), self.memory())?;
             prepared.result_schema(context, types.as_slice()).map_err(status)?
         } else {
             prepared.result_schema(context, prepared.parameter_types()).map_err(status)?
@@ -41,8 +41,8 @@ impl Service {
         wire::plan_schema(schema.schema(), self.memory())
     }
 
-    pub async fn describe(&self, connection: Arc<ConnectionResource>, source: &str, params: Option<&Bytes>) -> Result<(wire::OwnedSchema, usize), Status> {
-        let shape = self.prepare_shape(connection, source, params).await?;
+    pub async fn describe(&self, connection: Arc<ConnectionResource>, source: &str) -> Result<(wire::OwnedSchema, usize), Status> {
+        let shape = self.prepare_shape(connection, source).await?;
         Ok((shape.schema.ok_or_else(|| invalid("executeSchema only supports queries (DML and SET return no result set)"))?, shape.parameters))
     }
     pub async fn execute_update(&self, connection: &Arc<ConnectionResource>, source: &str, arguments: Option<SqlArguments>) -> Result<(), Status> {
@@ -66,17 +66,13 @@ impl Service {
         Ok((wire::OwnedSchema::empty(self.memory())?, query_ticket(Ticket::Empty {}.encode(self.memory())?, self.memory())?))
     }
 
-    pub async fn query_info(&self, connection: Arc<ConnectionResource>, source: &str, params: Option<Bytes>) -> Result<(wire::OwnedSchema, Bytes), Status> {
+    pub async fn query_info(&self, connection: Arc<ConnectionResource>, source: &str, params: Option<Arc<wire::BoundParameters>>) -> Result<(wire::OwnedSchema, Bytes), Status> {
         let mut native = connection.borrow().await?;
         let token = native.state().cancellation().child_token(); let _cancel = token.clone().drop_guard();
         let options = options(&native);
-        let decode_arguments = || params.as_ref().map(|params| {
-            let batch = wire::parameter_batch(params, self.memory())?;
-            wire::arguments(batch.batch(), self.memory())
-        }).transpose();
         let (basis, schema) = if let Some(control) = rtdb_sql::parse_admitted_control_in(source, &options, self.memory()).map_err(status)? {
             let Some(schema) = control_schema(control.statement()).map_err(status)? else {
-                let arguments = decode_arguments()?;
+                let arguments = params.as_ref().map(|params| wire::arguments(params.batch(), self.memory())).transpose()?;
                 execute_control_update(&mut native, control.statement(), arguments.as_ref(), &token).await?;
                 drop(control);
                 return self.empty_update_info();
@@ -90,7 +86,7 @@ impl Service {
                     .map_err(status)?
             };
             if prepared.is_dml() {
-                let arguments = decode_arguments()?;
+                let arguments = params.as_ref().map(|params| params.update_arguments(self.memory())).transpose()?;
                 native.prepare_context(&token).await.map_err(status)?;
                 execute_prepared_update(&mut native, &prepared, arguments).await?;
                 return self.empty_update_info();
@@ -99,10 +95,11 @@ impl Service {
             let basis = native.state_mut().read_basis().await.map_err(status)?;
             let context = native.query_context_at(&basis, &token).await.map_err(status)?;
             let prepared = PreparedSql::prepare(source, &context, options, ResultSignaturePolicy::Dynamic).map_err(status)?;
-            let schema = self.parameterized_schema(&prepared, &context, params.as_ref())?;
+            let schema = self.parameterized_schema(&prepared, &context, params.as_deref())?;
             (basis, schema)
         };
         let basis_bytes = basis.snapshot.databases.iter().try_fold(8192usize, |size, (database, times)| wire::add(size, wire::add(wire::mul(database.len(), 8)?, wire::mul(times.len(), 128)?)?))?;
+        let params = params.as_ref().map(|params| wire::parameter_ipc(params.batch(), self.memory())).transpose()?.flatten();
         let _ticket = self.memory().reserve(wire::add(basis_bytes, wire::mul(wire::add(source.len(), params.as_ref().map_or(0, Bytes::len))?, 8)?)?).map_err(status)?;
         let ticket = Ticket::run(native.state().database().into(), source.into(), params.as_ref(), &basis)?.encode(self.memory())?;
         Ok((schema, query_ticket(ticket, self.memory())?))

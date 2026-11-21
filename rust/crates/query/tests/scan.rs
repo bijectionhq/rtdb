@@ -72,6 +72,60 @@ async fn delegated_scan_refuses_a_later_erase_horizon_and_falls_back() {
 }
 
 #[tokio::test]
+async fn a_cold_fragment_sends_selected_fixed_lists_as_arrow() {
+    use arrow_array::{Array, cast::AsArray};
+    use arrow_schema::DataType;
+    use rtdb_query::{ScanFragment, TriePrefix, evaluate_fragment};
+
+    let state = PartitionState::empty(TrieConfig::default()).unwrap();
+    let budget = MemoryBudget::new(1 << 27);
+    let store = Arc::new(MemoryStore::default());
+    let width = 1 << 16;
+    let selected = Value::FixedSizeList(vec![Value::I64(7)]);
+    let skipped = Value::FixedSizeList(vec![Value::FixedSizeBinary(vec![13; width])]);
+    let mut write = tx(&state, &budget, 0, 10);
+    write.put(table(), document(1, selected.clone()), Interval::ALL).unwrap();
+    write.put(table(), document(2, skipped), Interval::ALL).unwrap();
+    state.apply(&write.stage().unwrap()).unwrap();
+    persist(&state, &store).await;
+    let snapshot = state.snapshot();
+    let basis = snapshot.tx_basis().unwrap();
+    let context = query_context(snapshot, store, true);
+    let relation = scan(&context, &["_id", "v"], TemporalFilter::All, at(10), None);
+    let rtdb_plan::RelationNode::Scan(scan) = relation.node() else { unreachable!() };
+    let mut scan = scan.clone();
+    scan.predicates.push(Expr::binary(BinaryOp::NotEq, scan.columns[0].expression(), Expr::Literal(Value::I64(2))));
+    let fragment = ScanFragment {
+        scan,
+        prefix: TriePrefix::new(Vec::new()).unwrap(),
+        basis,
+        residence: None,
+        bounds: rtdb_types::TemporalBounds { valid_time: Interval::ALL, system_time: Interval::from_micros(10, 11).unwrap() },
+        timezone: "UTC".into(),
+    };
+
+    let wire = evaluate_fragment(context, &fragment).await.unwrap();
+
+    let (length, bytes) = wire.split_first_chunk::<8>().unwrap();
+    assert_eq!(u64::from_be_bytes(*length) as usize, bytes.len());
+    assert!(bytes.len() < width);
+    let mut reader = arrow_ipc::reader::StreamReader::try_new(std::io::Cursor::new(bytes), None).unwrap();
+    let batch = reader.next().unwrap().unwrap();
+    assert_eq!(batch.num_rows(), 1);
+    assert!(reader.next().is_none());
+    let schema = batch.schema();
+    let field = schema.field(1);
+    assert_eq!(field.metadata()["rtdb.fragment.column"], "arrow");
+    assert!(matches!(field.data_type(), DataType::FixedSizeList(_, 1)));
+    let list = batch.column(1).as_fixed_size_list();
+    let storage_union = list.values().as_union();
+    let DataType::Union(legs, _) = storage_union.data_type() else { unreachable!() };
+    let wide = legs.iter().find(|(_, field)| field.data_type() == &DataType::FixedSizeBinary(width as i32)).unwrap().0;
+    assert!(storage_union.child(wide).is_empty());
+    assert_eq!(read_value(field, list, 0).unwrap(), selected);
+}
+
+#[tokio::test]
 async fn delegated_scan_keeps_its_snapshot_until_cancelled_provider_reads_drain() {
     use rtdb_query::{ScanFragment, TriePrefix, evaluate_fragment};
     use rtdb_storage::{IoRegion, StoredObject};

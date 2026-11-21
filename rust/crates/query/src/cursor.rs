@@ -424,8 +424,7 @@ impl QueryCursor {
     }
 }
 
-/// The batch a page of the same rows would encode: a column already in the result's layout is kept, any other is
-/// copied from the cells a row would hold.
+/// Aligns a column page with the result schema, retaining matching Arrow arrays.
 pub(crate) fn column_batch(schema: &Schema, memory: &Arc<MemoryBudget>, batch: crate::columnar::ColumnBatch) -> Result<OwnedBatch> {
     let overflow = || invalid("batch-size", "Output batch allocation bound overflow");
     if batch.columns.len() != schema.len() { return Err(invalid("row-width", "Operator output differs from its declared schema")); }
@@ -434,8 +433,14 @@ pub(crate) fn column_batch(schema: &Schema, memory: &Arc<MemoryBudget>, batch: c
     let kept_bytes = kept.iter().flatten().try_fold(4096usize, |bytes, array| bytes.checked_add(array.get_array_memory_size()).ok_or_else(overflow))?;
     let mut reservation = memory.reserve(kept_bytes)?;
     let mut arrays = Vec::with_capacity(kept.len());
-    for ((kept, column), field) in kept.into_iter().zip(&batch.columns).zip(schema.fields()) {
+    for (((kept, column), field), arrow) in kept.into_iter().zip(&batch.columns).zip(schema.fields()).zip(&fields) {
         if let Some(array) = kept { arrays.push(array); continue; }
+        if let Some((array, _scratch)) = crate::columnar::relayout_output(column, &field.data_type, arrow, memory)? {
+            let lease = Arc::get_mut(&mut reservation).ok_or_else(|| invalid("batch-size", "An output batch's charge is shared"))?;
+            lease.grow_to(lease.bytes().checked_add(array.get_array_memory_size()).ok_or_else(overflow)?)?;
+            arrays.push(array);
+            continue;
+        }
         let mut cells = batch.len.checked_mul(std::mem::size_of::<Value>()).and_then(|bytes| bytes.checked_add(256)).ok_or_else(overflow)?;
         for row in 0..batch.len { cells = cells.checked_add(column.bound(row)?).ok_or_else(overflow)?; }
         let _cells = memory.reserve(cells)?;
@@ -467,5 +472,42 @@ mod slab_tests {
         assert_eq!(memory.used_bytes(), row.bytes());
         drop((row, slab));
         assert_eq!(memory.used_bytes(), 0);
+    }
+
+    #[test]
+    fn query_output_relayouts_nested_union_children_without_copying_values() {
+        use arrow_array::{Array, Int64Array, StructArray, UnionArray};
+        use arrow_schema::DataType;
+        use rtdb_types::{ScalarType, StructFields};
+
+        let memory = MemoryBudget::new(1 << 22);
+        let integer = LogicalType::Scalar(ScalarType::I64);
+        let source = LogicalType::Struct(StructFields::from([("a".into(), integer.clone())]));
+        let target = LogicalType::from_legs([
+            LogicalType::list(integer.clone()),
+            LogicalType::Struct(StructFields::from([("a".into(), integer.clone()), ("b".into(), integer.maybe())])),
+            LogicalType::Null,
+        ]);
+        let values = [Value::Struct(StructFields::from([("a".into(), Value::I64(5))]))];
+        let column = copy_array(&source, &values).unwrap();
+        let array = column.as_any().downcast_ref::<StructArray>().unwrap();
+        let original = array.column(0).as_any().downcast_ref::<Int64Array>().unwrap().values().as_ptr();
+        let input = RecordBatch::try_new(Arc::new(ArrowSchema::new(vec![to_field("v", &source).unwrap()])), vec![column]).unwrap();
+        let input = OwnedBatch::new(input, &memory).unwrap();
+        let input = crate::columnar::ColumnBatch::from_owned(input).unwrap();
+        let schema = Schema::new(vec![rtdb_plan::Field {
+            id: rtdb_plan::ColumnId(0), name: "v".into(), qualifier: None,
+            qualified_only: false, unnamed: false, data_type: target,
+        }]).unwrap();
+
+        let output = column_batch(&schema, &memory, input).unwrap();
+
+        let array = output.batch().column(0).as_any().downcast_ref::<UnionArray>().unwrap();
+        let DataType::Union(fields, _) = array.data_type() else { panic!("Expected the declared union"); };
+        let (id, _) = fields.iter().find(|(_, field)| field.name() == "struct").unwrap();
+        assert_eq!(array.type_id(0), id);
+        let child = array.child(id).as_any().downcast_ref::<StructArray>().unwrap();
+        assert_eq!(child.column(0).as_any().downcast_ref::<Int64Array>().unwrap().values().as_ptr(), original);
+        assert!(child.column(1).is_null(0));
     }
 }

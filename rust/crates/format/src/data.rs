@@ -1,3 +1,5 @@
+mod columns;
+
 use rtdb_types::StructFields;
 use std::sync::Arc;
 
@@ -278,16 +280,21 @@ enum PutLeg { First, Last }
 /// Builds an owned index batch with scratch for one document column at a time, laid out as a live page.
 /// `copy` selects the stored-cell writer, which preserves existing decimal coefficients.
 pub fn owned_event_batch<E: EncodedEvent>(events: &[E], put_fields: Option<StructFields<LogicalType>>, copy: bool, memory: &Arc<MemoryBudget>) -> Result<OwnedBatch> {
-    let metadata = put_fields.as_ref().map_or(Ok(4096), |fields| {
+    let (mut builder, metadata) = event_builder(events.len(), put_fields.as_ref(), memory)?;
+    let batch = event_batch(events, put_fields, None, copy, Some(&mut builder), PutLeg::Last)?;
+    builder.finish_with_metadata(batch, metadata)
+}
+
+fn event_builder(rows: usize, put_fields: Option<&StructFields<LogicalType>>, memory: &Arc<MemoryBudget>) -> Result<(BatchBuilder, usize)> {
+    let metadata = put_fields.map_or(Ok(4096), |fields| {
         fields.iter().try_fold(4096usize, |bytes, (name, ty)| {
             ty.retained_bytes()?.checked_add(name.len()).and_then(|bytes| bytes.checked_add(256))
                 .and_then(|bytes| bytes.checked_mul(8)).and_then(|size| bytes.checked_add(size)).ok_or_else(event_size)
         })
     })?;
-    let headers = events.len().checked_mul(256).and_then(|bytes| bytes.checked_add(65_536)).ok_or_else(event_size)?;
-    let mut builder = BatchBuilder::new(metadata.checked_add(headers).ok_or_else(event_size)?, memory)?;
-    let batch = event_batch(events, put_fields, None, copy, Some(&mut builder), PutLeg::Last)?;
-    builder.finish_with_metadata(batch, metadata)
+    let headers = rows.checked_mul(256).and_then(|bytes| bytes.checked_add(65_536)).ok_or_else(event_size)?;
+    let builder = BatchBuilder::new(metadata.checked_add(headers).ok_or_else(event_size)?, memory)?;
+    Ok((builder, metadata))
 }
 
 pub fn owned_put_batch(documents: ArrayRef, headers: &[EventHeader], memory: &Arc<MemoryBudget>) -> Result<OwnedBatch> {
@@ -386,7 +393,7 @@ fn put_columns<E: EncodedEvent>(
     let mut columns = Vec::with_capacity(fields.len());
     for (name, ty) in fields {
         let field = to_field(&name, &ty)?;
-        if copy && let Some(column) = gather_column(documents, &field, builder.as_deref_mut())? {
+        if copy && let Some(column) = columns::gather_column(documents, &field, &ty, builder.as_deref_mut())? {
             schema.push(Arc::new(field));
             columns.push(column);
             continue;
@@ -417,122 +424,33 @@ fn put_columns<E: EncodedEvent>(
     build_struct_array(schema.into(), &columns, documents.len(), None)
 }
 
-/// The column `field` describes, copied from the arrays its documents' pages store it in, when every page stores it
-/// under that same flat layout (or lacks it, for a nullable column): the array `copy_array` builds from the cells read.
-fn gather_column<E: EncodedEvent>(documents: &[&E], field: &Field, builder: Option<&mut BatchBuilder>) -> Result<Option<ArrayRef>> {
-    use arrow_schema::TimeUnit as Unit;
-    let flat = match field.data_type() {
-        DataType::Boolean | DataType::Int8 | DataType::Int16 | DataType::Int32 | DataType::Int64 | DataType::UInt8 | DataType::UInt16 | DataType::UInt32 | DataType::UInt64
-            | DataType::Float32 | DataType::Float64 | DataType::Date32 | DataType::Date64 | DataType::Timestamp(_, _) | DataType::Duration(_)
-            | DataType::Decimal32(_, _) | DataType::Decimal64(_, _) | DataType::Decimal128(_, _) | DataType::Decimal256(_, _)
-            | DataType::Utf8 | DataType::Binary | DataType::FixedSizeBinary(_) => true,
-        DataType::Time32(unit) => matches!(unit, Unit::Second | Unit::Millisecond),
-        DataType::Time64(unit) => matches!(unit, Unit::Microsecond | Unit::Nanosecond),
-        _ => false,
-    };
-    if !flat || !field.metadata().is_empty() { return Ok(None); }
-    let mut sources = Vec::with_capacity(documents.len());
-    for document in documents {
-        match document.put_column(field.name()) {
-            Some(PutColumn::Stored(source, array, row)) if source.data_type() == field.data_type() && source.metadata().is_empty() => {
-                if !field.is_nullable() && array.is_null(row) { return Ok(None); }
-                sources.push(array.is_valid(row).then_some((array, row)));
-            }
-            Some(PutColumn::Absent) if field.is_nullable() => sources.push(None),
-            _ => return Ok(None),
-        }
-    }
-    let build = || gather(field.data_type(), &sources);
-    let column = match builder {
-        Some(builder) => {
-            let base = sources.len().checked_mul(64).and_then(|bytes| bytes.checked_add(4096)).ok_or_else(event_size)?;
-            let bound = sources.iter().flatten().try_fold(base, |bytes, (array, row)| {
-                rtdb_columnar::estimate_read_cell_bytes(field, *array, *row)?.checked_mul(4)
-                    .and_then(|size| bytes.checked_add(size)).ok_or_else(event_size)
-            })?;
-            builder.column(bound, build)?
-        }
-        None => build()?,
-    };
-    Ok(Some(column))
-}
-
-fn gather(data_type: &DataType, sources: &[Option<(&dyn Array, usize)>]) -> Result<ArrayRef> {
-    use arrow_array::{builder::{BinaryBuilder, BooleanBuilder, FixedSizeBinaryBuilder, PrimitiveBuilder, StringBuilder}, cast::AsArray, types::*};
-    use arrow_schema::TimeUnit as Unit;
-    let layout = || invalid("Stored put column disagrees with its declared layout");
-    macro_rules! primitive {
-        ($ty:ty) => {{
-            let mut builder = PrimitiveBuilder::<$ty>::with_capacity(sources.len()).with_data_type(data_type.clone());
-            for source in sources {
-                match source {
-                    Some((array, row)) => builder.append_value(array.as_primitive_opt::<$ty>().ok_or_else(layout)?.value(*row)),
-                    None => builder.append_null(),
-                }
-            }
-            Arc::new(builder.finish()) as ArrayRef
-        }};
-    }
-    macro_rules! cells {
-        ($builder:expr, |$array:ident, $row:ident| $cell:expr) => {{
-            let mut builder = $builder;
-            for source in sources {
-                match source {
-                    Some(($array, $row)) => { let ($array, $row) = (*$array, *$row); builder.append_value($cell); }
-                    None => builder.append_null(),
-                }
-            }
-            Arc::new(builder.finish()) as ArrayRef
-        }};
-    }
-    Ok(match data_type {
-        DataType::Int8 => primitive!(Int8Type), DataType::Int16 => primitive!(Int16Type), DataType::Int32 => primitive!(Int32Type), DataType::Int64 => primitive!(Int64Type),
-        DataType::UInt8 => primitive!(UInt8Type), DataType::UInt16 => primitive!(UInt16Type), DataType::UInt32 => primitive!(UInt32Type), DataType::UInt64 => primitive!(UInt64Type),
-        DataType::Float32 => primitive!(Float32Type), DataType::Float64 => primitive!(Float64Type),
-        DataType::Date32 => primitive!(Date32Type), DataType::Date64 => primitive!(Date64Type),
-        DataType::Time32(Unit::Second) => primitive!(Time32SecondType), DataType::Time32(Unit::Millisecond) => primitive!(Time32MillisecondType),
-        DataType::Time64(Unit::Microsecond) => primitive!(Time64MicrosecondType), DataType::Time64(Unit::Nanosecond) => primitive!(Time64NanosecondType),
-        DataType::Timestamp(Unit::Second, _) => primitive!(TimestampSecondType), DataType::Timestamp(Unit::Millisecond, _) => primitive!(TimestampMillisecondType),
-        DataType::Timestamp(Unit::Microsecond, _) => primitive!(TimestampMicrosecondType), DataType::Timestamp(Unit::Nanosecond, _) => primitive!(TimestampNanosecondType),
-        DataType::Duration(Unit::Second) => primitive!(DurationSecondType), DataType::Duration(Unit::Millisecond) => primitive!(DurationMillisecondType),
-        DataType::Duration(Unit::Microsecond) => primitive!(DurationMicrosecondType), DataType::Duration(Unit::Nanosecond) => primitive!(DurationNanosecondType),
-        DataType::Decimal32(_, _) => primitive!(Decimal32Type), DataType::Decimal64(_, _) => primitive!(Decimal64Type),
-        DataType::Decimal128(_, _) => primitive!(Decimal128Type), DataType::Decimal256(_, _) => primitive!(Decimal256Type),
-        DataType::Boolean => cells!(BooleanBuilder::with_capacity(sources.len()), |array, row| array.as_boolean_opt().ok_or_else(layout)?.value(row)),
-        DataType::Utf8 => cells!(StringBuilder::with_capacity(sources.len(), 0), |array, row| array.as_string_opt::<i32>().ok_or_else(layout)?.value(row)),
-        DataType::Binary => cells!(BinaryBuilder::with_capacity(sources.len(), 0), |array, row| array.as_binary_opt::<i32>().ok_or_else(layout)?.value(row)),
-        DataType::FixedSizeBinary(width) => {
-            let mut builder = FixedSizeBinaryBuilder::with_capacity(sources.len(), *width);
-            for source in sources {
-                match source {
-                    Some((array, row)) => builder.append_value(array.as_fixed_size_binary_opt().ok_or_else(layout)?.value(*row)).map_err(invalid)?,
-                    None => builder.append_null(),
-                }
-            }
-            Arc::new(builder.finish()) as ArrayRef
-        }
-        _ => return Err(layout()),
-    })
-}
-
 /// Keeps the declared recency column even when a page is empty.
 pub fn build_event_batch_with_recency(events: &[StoredEvent], put_fields: Option<StructFields<LogicalType>>, iid_encoding: Option<RunEndWidth>, recency: bool) -> Result<RecordBatch> {
-    event_batch_with_recency(events, put_fields, iid_encoding, recency, false)
+    event_batch_with_recency(events, put_fields, iid_encoding, recency, false, None)
 }
 
 /// Copies stored cells with the same ownership obligations as `copy_event_batch`, retaining empty-page recency metadata.
 pub fn copy_event_batch_with_recency(events: &[StoredEvent], put_fields: Option<StructFields<LogicalType>>, iid_encoding: Option<RunEndWidth>, recency: bool) -> Result<RecordBatch> {
-    event_batch_with_recency(events, put_fields, iid_encoding, recency, true)
+    event_batch_with_recency(events, put_fields, iid_encoding, recency, true, None)
 }
 
 /// As `copy_event_batch_with_recency`, for events of any kind that encode their own cells.
 pub fn copy_encoded_batch_with_recency<E: EncodedEvent>(events: &[E], put_fields: Option<StructFields<LogicalType>>, iid_encoding: Option<RunEndWidth>, recency: bool) -> Result<RecordBatch> {
-    event_batch_with_recency(events, put_fields, iid_encoding, recency, true)
+    event_batch_with_recency(events, put_fields, iid_encoding, recency, true, None)
 }
 
-fn event_batch_with_recency<E: EncodedEvent>(events: &[E], put_fields: Option<StructFields<LogicalType>>, iid_encoding: Option<RunEndWidth>, recency: bool, copy: bool) -> Result<RecordBatch> {
+/// Copies a compaction page and retains its output arrays under the caller's memory budget.
+pub fn owned_encoded_batch_with_recency<E: EncodedEvent>(
+    events: &[E], put_fields: Option<StructFields<LogicalType>>, iid_encoding: Option<RunEndWidth>, recency: bool, memory: &Arc<MemoryBudget>,
+) -> Result<OwnedBatch> {
+    let (mut builder, metadata) = event_builder(events.len(), put_fields.as_ref(), memory)?;
+    let batch = event_batch_with_recency(events, put_fields, iid_encoding, recency, true, Some(&mut builder))?;
+    builder.finish_with_metadata(batch, metadata)
+}
+
+fn event_batch_with_recency<E: EncodedEvent>(events: &[E], put_fields: Option<StructFields<LogicalType>>, iid_encoding: Option<RunEndWidth>, recency: bool, copy: bool, builder: Option<&mut BatchBuilder>) -> Result<RecordBatch> {
     if events.iter().any(|event| event.recency().is_some() != recency) { return Err(invalid("Event recency does not match the declared schema")); }
-    let batch = event_batch(events, put_fields, iid_encoding, copy, None, PutLeg::First)?;
+    let batch = event_batch(events, put_fields, iid_encoding, copy, builder, PutLeg::First)?;
     if recency && events.is_empty() {
         let mut fields = batch.schema().fields().to_vec();
         fields.push(Arc::new(Field::new("_recency", DataType::Timestamp(ArrowTimeUnit::Microsecond, Some("UTC".into())), false)));
@@ -564,20 +482,25 @@ mod tests {
     #[test]
     fn a_column_every_page_stores_under_its_output_layout_is_copied_from_the_pages() {
         let events = [page(Value::I64(1)), page(Value::I64(2))].concat();
-        let field = to_field("v", &LogicalType::Scalar(ScalarType::I64)).unwrap();
+        let ty = LogicalType::Scalar(ScalarType::I64);
+        let field = to_field("v", &ty).unwrap();
         let memory = MemoryBudget::new(1 << 20);
         let mut builder = BatchBuilder::new(4096, &memory).unwrap();
-        let selected = gather_column(&events.iter().collect::<Vec<_>>(), &field, Some(&mut builder)).unwrap().unwrap();
+        let selected = columns::gather_column(&events.iter().collect::<Vec<_>>(), &field, &ty, Some(&mut builder)).unwrap().unwrap();
         let values = selected.as_any().downcast_ref::<arrow_array::Int64Array>().unwrap();
         assert_eq!(values.values().as_ref(), &[1, 2]);
     }
 
     #[test]
-    fn a_column_a_page_stores_under_another_layout_is_built_from_its_cells() {
+    fn a_column_stored_under_two_layouts_joins_their_arrow_vectors() {
         let events = [page(Value::I64(1)), page(Value::Utf8("a".into()))].concat();
-        let union = LogicalType::Scalar(ScalarType::I64).join(&LogicalType::Scalar(ScalarType::Utf8));
-        for ty in [LogicalType::Scalar(ScalarType::I64), union] {
-            assert!(gather_column(&events.iter().collect::<Vec<_>>(), &to_field("v", &ty).unwrap(), None).unwrap().is_none());
-        }
+        let events: Vec<_> = events.iter().collect();
+        let integer = LogicalType::Scalar(ScalarType::I64);
+        assert!(columns::gather_column(&events, &to_field("v", &integer).unwrap(), &integer, None).unwrap().is_none());
+        let union = integer.join(&LogicalType::Scalar(ScalarType::Utf8));
+        let field = to_field("v", &union).unwrap();
+        let selected = columns::gather_column(&events, &field, &union, None).unwrap().unwrap();
+        assert_eq!(rtdb_columnar::read_value(&field, selected.as_ref(), 0).unwrap(), Value::I64(1));
+        assert_eq!(rtdb_columnar::read_value(&field, selected.as_ref(), 1).unwrap(), Value::Utf8("a".into()));
     }
 }

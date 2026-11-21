@@ -6,12 +6,17 @@ The source and regression cases remain uncompiled and unexecuted during Phase 1.
 Schema descriptions retain the supplied physical parameter fields, while query execution opens their signed vector view.
 Retained parameter IPC remains lossless.
 Prepared updates retain uploaded Arrow parameter batches through transaction buffering and encoding when the batch layouts agree.
+Separate uploads of the same statement can have different schemas when they are coalesced in a transaction.
+The source encoder aligns compatible argument vectors by position in Arrow and preserves the order of the argument rows.
 Bulk ingestion retains compatible Arrow document columns during source-log encoding, replay and transaction staging.
 This includes lists and structs with compatible child fields.
 When a struct gains fields between compatible Arrow uploads, source encoding joins those fields in Arrow, including structs inside lists.
 Arrow batches targeting the same table can share a source-log document layout when their common columns agree and other columns are absent.
-Scalar columns with compatible union legs share a dense union when their types differ between batches.
+When the same transaction also contains compatible row-backed puts for that table, source encoding builds vectors from those rows and combines them with the uploaded vectors in transaction order.
+Columns with compatible union legs share a dense union when their scalar types or nested container kinds differ between batches.
 Null and missing values use the union's null leg.
+Uploads can gather multiple tags for the same value layout into one Arrow child, including signed execution aliases.
+When a union with one value layout is normalized, the typed Arrow array's validity represents null entries.
 The typed document writer handles layouts that require cell conversion.
 
 == Composition and ownership
@@ -95,6 +100,8 @@ SQL BEGIN, COMMIT, and ROLLBACK use the shared Flight SQL control rejection; tra
 Prepared handles are re-prepared against the current execution context on each use.
 Their parameter metadata uses positional unnamed nullable fields, and the source's field-4 `is_update` extension is retained.
 Prepared query binding retains the first Arrow batch.
+Flight SQL derives the result schema from the bound Arrow fields and encodes the batch when issuing a query ticket.
+An update submitted through `GetFlightInfo` passes the bound batch to the transaction path as Arrow arguments.
 Prepared update binding accumulates all Arrow batches by column position.
 Zero columns mean an unbound execution; columns with zero rows preserve an empty execution batch.
 

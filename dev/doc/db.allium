@@ -367,12 +367,17 @@ entity SourceMessage {
 
 variant TxMessage : SourceMessage {
     -- Client-submitted transaction operations.
+    -- Coalesced SQL argument batches align compatible Arrow columns by position and preserve argument row order in source IPC.
     -- Source encoding retains compatible Arrow document vectors and admits reconstructed columns one at a time.
     -- Compatible Arrow document vectors include nested lists and structs.
     -- Struct fields added across compatible uploads join in Arrow with typed nulls for earlier documents, including structs inside lists.
     -- Batches with compatible column types retain first-seen column order and represent missing columns as nulls without converting the documents to rows.
-    -- Differently typed scalar columns can share a dense union in the source message and retain their Arrow representation on replay.
+    -- Source encoding retains compatible Arrow vectors when the same table's puts also contain row-backed documents.
+    -- Differently typed columns can share a dense union in the source message and retain their Arrow representation on replay.
+    -- Union children can be compatible nested containers such as lists and structs.
     -- Null and missing values use that union's null leg.
+    -- When the allocation budget allows, uploaded union tags for the same value layout share a canonical Arrow child, including signed execution aliases.
+    -- A normalized union with one value layout uses that Arrow type and its validity bitmap.
     -- A historical native keyed submission can carry an optional guard envelope with a submission clock sample and guard position.
     -- Current ordinary keyed submissions carry the key in metadata and omit the historical guard envelope.
     -- The key marker is valid from its submission sample, inclusive, until one hour later, exclusive.
@@ -1758,7 +1763,14 @@ surface QueryAccess {
     @guarantee ColumnarScanProjection
         -- A scan preserves compatible list and struct columns as Arrow arrays when projecting selected rows.
         -- A projected field missing from some pages uses Arrow nulls when the available columns share a layout or form a scalar dense union.
-        -- A projected scalar dense union retains its Arrow array when it already matches the result layout.
+        -- A projected dense union with compatible children retains its Arrow array when it already matches the result layout.
+        -- A compatible projected array can be aligned to the result's nested fields and union legs in Arrow.
+        -- When selected cells need layout alignment before they can share one array, the scan retains their source vectors and positions.
+        -- Reading a selected struct during evaluation preserves which keys its source has.
+        -- Compatible fixed-size lists stay in Arrow through sparse selection and output.
+        -- A sparse selection of compatible in-memory maps also stays in Arrow.
+        -- A delegated scan sends selected source vectors in Arrow IPC in their scan order.
+        -- Each fragment frame preserves its source fields and the coordinator can filter its Arrow vectors by position.
 }
 
 ---- Deferred Specifications
