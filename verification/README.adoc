@@ -95,6 +95,7 @@ The pinned Verus release replaces the earlier proposed source build of 31e44e6.
 The optional Rust boundary check compiles an unchanged copy and two mutated copies of the replica driver imported from the current Git commit.
 The optional native replay reads the same seeded 4,096-observation trace that the Lean evaluator checks.
 It also compiles the unmodified and unpadded text scorer to replay the binary64 boundary witness.
+The same option runs the local checkpoint interruption and manifest-recovery tests and replays a root-first mutation of the checkpoint writer.
 
 == Evidence boundaries
 
@@ -107,6 +108,8 @@ It also compiles the unmodified and unpadded text scorer to replay the binary64 
   Apalache checks the same TLA+ transitions symbolically and `maude/Resolution.maude` gives an independent rewrite model.
 * `tla/CacheGeneration.tla` models the cache pathname ownership race independently from the shared artefact reference counts.
 * `tla/ReadBack.tla` separates append, record delivery, apply, and acknowledgement across a crash and restart.
+* `tla/Checkpoint.tla` separates durable object publication, lost replies, listing, and log replay across a restart.
+  It checks one root and three dependencies with finite failures, including early publication, loss of an acknowledged dependency, and log trimming followed by a listing omission.
 * `tla/LeaseAdmission.tla` compares validated expiring leases and coordinated pins against age-only collection and stale-follower admission.
 * `alloy/Reclamation.als` independently checks the structural last-reference rule over a finite scope, including one deliberately faulty collector.
 * `smt/rank-bound.smt2` checks the exact-real inequalities behind the binary64 score bound under the normal-rounding model and its two negative controls.

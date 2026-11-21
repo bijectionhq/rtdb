@@ -166,3 +166,27 @@ It also checks the exact-rational extremum inequality and preservation of order 
 The Lean frontier law checks that a row supported by a pending score or an unexpanded window prevents cutoff if it can tie the threshold.
 Its premise requires that every qualifying row on an unseen IID has such support.
 Production search and scan replay exercise that premise over concrete inputs.
+
+== Study 3 · Checkpoint publication and recovery
+
+Question.
+Can an interruption between object publication and its reply change the committed rows recovered by a restart?
+
+The production checkpoint writer persists L0 data, trie metadata and per-table block metadata before writing the root block catalog.
+Recovery selects a root from the provider listing and opens its referenced table blocks.
+The replica tail supplies subsequent admitted records.
+An interruption before the root is written leaves log replay responsible for the committed prefix.
+An interruption after its durable write may leave a usable checkpoint even before the writer receives a reply or announces the block on the replica log.
+
+The finite model separates durable writes from the receipts the writer sees.
+It starts with one admitted log prefix and allows listing to omit the new root.
+An early root can name missing children.
+Deleting a dependency after its durable write has the same effect.
+Trimming the log after a successful root put can strand recovery if listing omits that root.
+These counterexamples identify what the publisher, provider and retention authority each must guarantee.
+
+The local replay interrupts the real node on both sides of the root put, reopens the same storage, and checks the full system-time history.
+A production mutation moves the root ahead of its table blocks and the after-put recovery trace must fail while opening the checkpoint.
+The manifest case also reopens a closed multi-transaction history and checks that a wrong manifest digest is refused.
+The local provider observations and bounded model apply to a single root without concurrent reclamation.
+Remote listing, provider failover and coordinated retention require separate evidence.

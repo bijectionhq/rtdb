@@ -100,7 +100,8 @@ pub trait ObjectStore: Send + Sync {
     /// Publishes an immutable object, accepting an identical existing object as a completed retry.
     async fn put(&self, key: &ObjectKey, bytes: Bytes) -> Result<()>;
     async fn put_file(&self, key: &ObjectKey, source: &Path) -> Result<()>;
-    /// Returns a lexicographically ordered snapshot of object names under a directory.
+    /// Returns the object names reported under a directory, ordered lexicographically.
+    /// A listing may observe concurrent writes or deletions while enumerating the names.
     async fn list(&self, directory: Option<&ObjectKey>) -> Result<Vec<StoredObject>>;
     async fn delete(&self, key: &ObjectKey) -> Result<()>;
     /// Drops any copy of the object held on this node, leaving the remote object untouched.

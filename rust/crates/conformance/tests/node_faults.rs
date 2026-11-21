@@ -2,12 +2,13 @@ use async_trait::async_trait;
 use rtdb_columnar::read_value;
 use rtdb_conformance::faults::{Action, FaultResources, FaultSchedule, KeyMatch, Operation, Phase, Rule};
 use rtdb_format::database::proto::{DatabaseConfig, LocalLog, LocalStorage, database_config};
+use rtdb_format::keys::block_key;
 use rtdb_maintenance::CollectionObserver;
 use rtdb_node::{AutonomousTxOptions, Clock, DatabaseAccess, Membership, NativeResources, Node, NodeOptions, NodeServices, SessionIdentity};
 use rtdb_plan::{CatalogMetric, CatalogMetrics, CatalogRows, CatalogUser, CatalogUsers};
 use rtdb_query::QueryCursor;
 use rtdb_tx::{Documents, TransactionAuthorization, TxOp};
-use rtdb_types::{Anomaly, Result, TableRef, Timestamp, Value};
+use rtdb_types::{Anomaly, BlockIndex, Result, TableRef, Timestamp, Value};
 use rtdb_types::StructFields;
 use std::{sync::{Arc, atomic::{AtomicI64, Ordering}}, time::Duration};
 
@@ -98,5 +99,68 @@ async fn lost_source_acknowledgement_recovers_the_original_write_exactly_once() 
     assert_eq!(rows(session.query_sql("SELECT _id, value FROM docs FOR ALL SYSTEM_TIME", vec![]).await.unwrap()).await,
                vec![vec![Value::I64(1), Value::I64(42)]]);
     node.shutdown(); owner.await.unwrap().unwrap();
+    replay.assert_exhausted().unwrap();
+}
+
+#[tokio::test]
+async fn recovery_replays_the_log_if_interrupted_before_putting_the_checkpoint_root() {
+    recover_interrupted_checkpoint(Phase::Before).await;
+}
+
+#[tokio::test]
+async fn recovery_reads_the_complete_checkpoint_if_interrupted_after_putting_the_root() {
+    recover_interrupted_checkpoint(Phase::After).await;
+}
+
+async fn recover_interrupted_checkpoint(phase: Phase) {
+    let block = BlockIndex(0);
+    let root = block_key(block).unwrap();
+    let directory = tempfile::tempdir().unwrap();
+    let clock = Arc::new(ClockFixture(AtomicI64::new(1_000_000)));
+    let schedule = FaultSchedule::new(vec![Rule {
+        owner: "xtdb/store".into(), operation: Operation::Put, phase,
+        key: KeyMatch::Exact(root), occurrence: 1, action: Action::Hold("checkpoint-root".into()),
+    }], 10_000).unwrap();
+    let (node, driver) = Node::open(options(directory.path()), services(clock.clone(), schedule.clone())).await.unwrap();
+    let owner = tokio::spawn(driver.run());
+    let mut session = node.session("xtdb", Arc::new(Identity)).unwrap();
+    let documents = Documents::new(vec![StructFields::from([
+        ("_id".into(), Value::I64(1)), ("value".into(), Value::I64(42)),
+    ])], node.memory()).unwrap();
+    let write = session.state_mut().execute_tx(vec![TxOp::PutDocs {
+        table: TableRef::new("public", "docs"), documents, valid_from: None, valid_to: None,
+    }], AutonomousTxOptions::default()).await.unwrap();
+    assert!(write.committed());
+
+    let database = node.catalog().database("xtdb").unwrap();
+    database.flush().await.unwrap();
+    tokio::time::timeout(Duration::from_secs(10), schedule.wait_for_rule(0)).await.unwrap().unwrap();
+    assert!(database.status().adopted_block.is_none(), "the root put had not returned");
+    node.shutdown();
+    schedule.close();
+    tokio::time::timeout(Duration::from_secs(10), owner).await.unwrap().unwrap().unwrap();
+    schedule.assert_exhausted().unwrap();
+    drop(session);
+    drop(database);
+    drop(node);
+
+    let replay = FaultSchedule::new(vec![], 10_000).unwrap();
+    let (node, driver) = Node::open(options(directory.path()), services(clock, replay.clone())).await
+        .unwrap_or_else(|error| panic!("checkpoint could not open after {phase:?} interruption: {error}"));
+    let database = node.catalog().database("xtdb").unwrap();
+    assert_eq!(
+        database.status().adopted_block.as_ref().map(|catalog| catalog.block_index()),
+        (phase == Phase::After).then_some(block),
+    );
+    let owner = tokio::spawn(driver.run());
+    node.sync_all(Duration::from_secs(10), node.cancellation()).await.unwrap();
+    let mut session = node.session("xtdb", Arc::new(Identity)).unwrap();
+    assert_eq!(
+        rows(session.query_sql("SELECT _id, value FROM docs FOR ALL SYSTEM_TIME", vec![]).await.unwrap()).await,
+        vec![vec![Value::I64(1), Value::I64(42)]],
+        "{phase:?}",
+    );
+    node.shutdown();
+    tokio::time::timeout(Duration::from_secs(10), owner).await.unwrap().unwrap().unwrap();
     replay.assert_exhausted().unwrap();
 }

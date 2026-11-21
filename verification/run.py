@@ -290,6 +290,10 @@ TLA_CASES = (
     ("LeaseAdmission", "coordinated-reader-pin", ('Mode = "validated_lease"', 'Mode = "pin"'), None),
     ("LeaseAdmission", "age-only-collection", ('Mode = "validated_lease"', 'Mode = "age_only"'), "LiveReaderHasObject"),
     ("LeaseAdmission", "stale-follower-admission", ('Mode = "validated_lease"', 'Mode = "stale_follower"'), "LiveReaderHasObject"),
+    ("Checkpoint", "checkpoint-root-last", None, None),
+    ("Checkpoint", "checkpoint-root-after-data", ('Mutation = "none"', 'Mutation = "root_after_data"'), "CompletePublishedRoot"),
+    ("Checkpoint", "checkpoint-lost-dependency", ('Mutation = "none"', 'Mutation = "durability_lie"'), "CompletePublishedRoot"),
+    ("Checkpoint", "checkpoint-trim-with-stale-listing", ('Mutation = "none"', 'Mutation = "trim_with_unvalidated_listing"'), "RecoveryHasRepresentation"),
 )
 
 
@@ -379,8 +383,7 @@ def verify_maude(args, scratch):
     print("maude: serialized and validated models hold, blind model has a counterexample")
 
 
-def verify_replica_boundary(args, scratch):
-    source = scratch / "replica-apply"
+def capture_production(source):
     source.mkdir()
     subprocess.run(["git", "diff", "--exit-code", "HEAD", "--", "rust"], cwd=ROOT, check=True)
     with subprocess.Popen(["git", "archive", "--format=tar", "HEAD"], cwd=ROOT, stdout=subprocess.PIPE) as git:
@@ -389,6 +392,8 @@ def verify_replica_boundary(args, scratch):
         if git.wait():
             raise ValueError("Could not capture the production source at HEAD")
 
+
+def verify_replica_boundary(args, source):
     driver = source / "rust/crates/replication/src/driver.rs"
     original = driver.read_bytes()
     anchor = "        let observed_term = record.envelope.term;"
@@ -423,6 +428,46 @@ def verify_replica_boundary(args, scratch):
         ):
             raise ValueError(f"replica-boundary-{name}: wrong failure site")
         print(f"replica-boundary-{name}: {'rejected with ' + control[1] if control else 'compiled'}")
+    driver.write_bytes(original)
+
+
+def verify_checkpoint_replay(args, source):
+    env = os.environ | {
+        "CARGO_TARGET_DIR": str(ROOT / "target"),
+        "CARGO_PROFILE_DEV_DEBUG": "0",
+        "CARGO_PROFILE_TEST_DEBUG": "0",
+        "CARGO_INCREMENTAL": "0",
+    }
+    command = ["cargo", "test", "--locked", "-p", "rtdb-conformance", "--test", "node_faults"]
+    baseline = run_case(
+        [*command, "--test", "recovery"], source / "rust", args.evidence, "rust-checkpoint-baseline", env,
+    )
+    if baseline.returncode or not all(
+        f"{count} passed; 0 failed" in baseline.stdout for count in (1, 3)
+    ):
+        raise ValueError("checkpoint replay baseline failed")
+    blocks = source / "rust/crates/replication/src/blocks.rs"
+    table_writes = """        for entry in table_catalog.entries() {
+            check_cancelled(cancellation)?;
+            let block = table_blocks.get(&entry.table).ok_or_else(|| invalid("Recorded table has no block metadata"))?;
+            self.store.put(&ObjectKey::new(entry.slug.block_key(index)?)?, Bytes::from(block.encode())).await?;
+        }
+"""
+    root_write = "        self.store.put(&key, Bytes::from(catalog.encode())).await?;\n"
+    replace_once(blocks, table_writes, "")
+    replace_once(blocks, root_write, root_write + table_writes)
+    test = "recovery_reads_the_complete_checkpoint_if_interrupted_after_putting_the_root"
+    checked = run_case(
+        [*command, test, "--", "--exact"], source / "rust", args.evidence, "rust-checkpoint-root-first", env,
+    )
+    if (
+        checked.returncode != 101
+        or f"{test} ... FAILED" not in checked.stdout
+        or "checkpoint could not open after After interruption" not in checked.stdout
+        or "0 passed; 1 failed" not in checked.stdout
+    ):
+        raise ValueError("root-first mutation did not fail at checkpoint startup")
+    print("rust-checkpoint-replay: four tests passed, root-first production mutation rejected")
 
 
 def replay_rust_trace(args):
@@ -505,6 +550,10 @@ def main():
         "rust/crates/expr/src/search.rs",
         "rust/crates/expr/src/evaluate.rs",
         "rust/crates/query/src/accelerate.rs",
+        "rust/crates/replication/src/blocks.rs",
+        "rust/crates/conformance/src/faults.rs",
+        "rust/crates/conformance/tests/node_faults.rs",
+        "rust/crates/conformance/tests/recovery.rs",
     ))
     for path in list(source_paths):
         if path.name == "proof.rs":
@@ -524,11 +573,15 @@ def main():
         verify_alloy(args, directory)
         verify_apalache(args, directory)
         verify_maude(args, directory)
+        if args.rust_boundary or args.native_replay:
+            source = directory / "production"
+            capture_production(source)
         if args.rust_boundary:
-            verify_replica_boundary(args, directory)
+            verify_replica_boundary(args, source)
         if args.native_replay:
             replay_rank_witness(args, directory)
             replay_rust_trace(args)
+            verify_checkpoint_replay(args, source)
 
 
 if __name__ == "__main__":
