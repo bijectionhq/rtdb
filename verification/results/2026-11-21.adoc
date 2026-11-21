@@ -581,3 +581,17 @@ The comparison includes values and temporal interval columns.
 All four native node fault cases and the manifest recovery case passed.
 The case uses one table with four input blocks and local durable storage.
 Collection is disabled so the result isolates publication, checkpointing and replay.
+
+== Combined verification through native tiered recovery
+
+The complete runner passed on `e20479c2c` with both Rust options enabled.
+It checked 74 Verus obligations across ten areas and matched diagnostics for all 42 Verus controls.
+TLC completed 17 bounded baselines and found all 39 expected counterexamples or reachability witnesses.
+Lean, Z3, Alloy, Apalache and Maude passed their recorded checks.
+Native replay passed five recovery cases, eighteen catalog tests, 4,096 temporal observations, the replica admission compiler controls, and the binary64 and loopback Azure cases.
+Both catalog mutations failed at the expected assertion, including the one that permits retiring the parent with three children.
+The input manifest SHA-256 is `44e515d3760196453298918fe79047f5812db67d997f6d09e431f307226e9e0b`.
+
+The same revision passed all 139 library and integration tests in the native index, maintenance and replication packages.
+Run those suites from the checkout root with
+`BIJECTION_LOCAL_EXECUTION=owner-authorized cargo test --manifest-path rust/Cargo.toml --locked -p rtdb-index -p rtdb-maintenance -p rtdb-replication --lib --tests`.
