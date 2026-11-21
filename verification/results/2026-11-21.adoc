@@ -1920,3 +1920,40 @@ The focused Gradle retry exited zero with 415 passes using a previously built na
 It included all 398 binding tests and all 17 tests in the filtered multi-database namespace, including the earlier SSL setup failure.
 The focused log is `/private/tmp/rtdb-formal.QMjPSJsX/catalog-floor-gradle-focused.log`.
 A new native-library build from the published source and a full Gradle run using that library are in progress.
+
+=== Direct check of the integrated Multi verification lane
+
+On `b1ee6c84d`, the Multi runner completed all 18 Lean files and 30 TLC configurations, including the expected failures and reachability witness.
+This is model evidence for the merged designs.
+The output is in `/private/tmp/rtdb-formal.QMjPSJsX/merged-main-b1ee6c84d-multi.log`. link:../multi/check.sh[Multi runner]
+
+The earlier full JVM retry compiled an FFI library from `5a891cf09` and ran on `e941898bb`, whose only change between those revisions is the evidence ledger.
+With JDK 25, Docker and that native library, 3,189 of 3,197 cases passed.
+The eight failures were two bindings queries, one coroutine limit in the Roaring serializer test, a PgWire timeout, three compaction waits, and one EDGAR synchronization fixture wait.
+The fresh library run cleared the earlier FFI load and PostgreSQL SSL setup failures.
+The failed suite is recorded in `/private/tmp/rtdb-formal.QMjPSJsX/catalog-floor-gradle-with-fresh-ffi.log` and the failure causes remain open.
+
+=== Residence ledger certificates and renewable holds
+
+Lean 4.35.0 checked six theorems for a single retirement in one residence over arbitrary finite histories.
+Issuing a certificate binds the selected provider identity and advances the floor in the ledger revision checked by the proposal.
+Any intervening hold admission, release or head publication invalidates the proposal.
+The proof covers reader, recovery-root and fork holds as well as admissions after issuance.
+Exact deletion preserves every publication required by a live hold if the authenticated retirement has established that all cuts at or after the retirement are independent of the selected identity.
+An eligible unheld retirement can issue a certificate in two transitions.
+Four controls fail at the preservation theorem when a proposal ignores holds or its revision, compares only the physical key, or admits a new hold below the floor.
+Lean audited the six theorems with standard axioms only.
+The evidence is in `/private/tmp/rtdb-formal.QMjPSJsX/lean-retirement-certificate-evidence-3hq1aesf`. link:../lean/RetirementCertificate.lean[Ledger proof and acceptance program]
+
+TLC exhausted 9,074 states for one hold, four possible renewal starts, an abstract clock bounded after all valid deadlines, and at most one outstanding I/O request.
+The model separates renewal submission, ledger publication and acknowledgement.
+It checks reader entitlement and eventual collection after abandonment under fair time, observation, expiry and collection steps.
+The witness reaches collection after an acknowledged renewal.
+Five safety controls reject early expiry, stale observations, a deadline anchored to the reply, a missing I/O fence, and I/O beyond the assumed bound.
+Removing expiry fairness invalidates the progress property.
+TLC output is in `/private/tmp/rtdb-formal.QMjPSJsX/renewed-residence-hold-evidence-disvgsg1`. link:../tla/RenewedResidenceHold.tla[Renewal model]
+
+Z3 excludes expiry overlapping an admitted provider operation when the margin is at least twice the fractional clock drift times the timeout plus the maximum real duration of provider use.
+The formula allows separate monotonic clocks with different rates, requires the first observation to follow renewal start, and bounds each rate relative to physical time.
+Dropping either term yields a satisfiable overlap.
+The deployed clock-drift and provider-duration bounds, complete recovery-root manifests, the production certificate path and the collector's typestate enforcement are still open. link:../smt/residence-clock-margin.smt2[Margin constraints and controls]

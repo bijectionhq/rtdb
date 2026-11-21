@@ -211,6 +211,16 @@ def verify_jvm_leaf_merge(args, scratch):
         print(f"{case}: {'negative control rejected' if mutation else 'proved'}")
 
 
+def verify_residence_clock_margin(args, scratch):
+    path = Path("verification/smt/residence-clock-margin.smt2")
+    directory = scratch / "smt-residence-clock-margin"
+    clone_file(path, directory)
+    checked = run_case([args.z3, str(path)], directory, args.evidence, "smt-residence-clock-margin")
+    if checked.returncode or checked.stdout.split() != ["unsat", "sat", "sat"]:
+        raise ValueError("Clock and I/O margin must exclude overlap, and omitting either bound must admit it")
+    print("smt-residence-clock-margin: sufficient margin and two counterexamples checked")
+
+
 def verify_rank_bound(args, scratch):
     path = Path("verification/smt/rank-bound.smt2")
     baseline = {
@@ -589,6 +599,41 @@ def verify_retirement_identity(args, scratch):
         ),
     }
     verify_lean_model(args, scratch, path, "retirement-identity", controls, 7)
+
+
+
+def verify_retirement_certificate(args, scratch):
+    dependency = Path("verification/lean/RetirementIdentity.lean")
+    directory = scratch / "lean-retirement-certificate-dependency"
+    clone_file(dependency, directory)
+    compiled = run_case([args.lean, "-o", "RetirementIdentity.olean", str(dependency)],
+                        directory, args.evidence, "lean-retirement-certificate-dependency")
+    if compiled.returncode:
+        raise ValueError("Lean retirement certificate dependency failed")
+    controls = {
+        "ignore-holds": (
+            "retirement ≤ state.head ∧ allHoldsAfter retirement state",
+            "retirement ≤ state.head ∧ True",
+            ["certificate_preserved_by_step"],
+        ),
+        "accept-stale-observation": (
+            "(fresh : state.proposal = some state.revision)",
+            "(fresh : state.proposal.isSome = true)",
+            ["certificate_preserved_by_step"],
+        ),
+        "match-by-key": (
+            "(samePublication : selected = observed)",
+            "(samePublication : selected.physicalKey = observed.physicalKey)",
+            ["certificate_preserved_by_step"],
+        ),
+        "admit-below-floor": (
+            "(aboveFloor : state.floor ≤ hold.generation)",
+            "(aboveFloor : 0 ≤ hold.generation)",
+            ["certificate_preserved_by_step"],
+        ),
+    }
+    verify_lean_model(args, scratch, Path("verification/lean/RetirementCertificate.lean"),
+                      "retirement-certificate", controls, 6, os.environ | {"LEAN_PATH": str(directory)})
 
 
 def verify_basis_tokens(args, scratch):
@@ -1324,6 +1369,7 @@ def verify_lean(args, scratch):
             verify_type_join(args, scratch)
             verify_floor_preservation(args, scratch)
             verify_retirement_identity(args, scratch)
+            verify_retirement_certificate(args, scratch)
             verify_basis_tokens(args, scratch)
             verify_run_encoding(args, scratch)
             verify_memory_admission(args, scratch)
@@ -1448,7 +1494,7 @@ TLA_CASES = (
     ("Resolution", "serialized", ('Mode = "validated"', 'Mode = "serialized"'), None),
     ("Resolution", "blind", ('Mode = "validated"', 'Mode = "blind"'), "NoLostUpdates"),
     ("Kernel", "eventual-ack", None, None),
-    ("Kernel", "unfair-apply", ("SPECIFICATION FairSpec", "SPECIFICATION Spec"), "temporal"),
+    ("Kernel", "unfair-apply", ("SPECIFICATION FairSpec", "SPECIFICATION Spec"), "temporal:EventuallyAcknowledged"),
     ("CacheGeneration", "cache-current-publisher", None, None),
     ("CacheGeneration", "cache-late-publisher", ("LatePublish = FALSE", "LatePublish = TRUE"), "FreshLeaseReachable"),
     ("ReadBack", "readback", None, None),
@@ -1643,6 +1689,21 @@ TLA_CASES = (
      ('Policy = "reference"\n  Mutation = "none"\nINVARIANTS TypeOK PublishedChildReadable',
       'Policy = "copy"\n  Mutation = "none"\nINVARIANT NeverRefusesAfterSourceCollection'),
      "NeverRefusesAfterSourceCollection"),
+    ("RenewedResidenceHold", "renewed-residence-hold", None, None),
+    ("RenewedResidenceHold", "renewed-residence-hold-stale-observation",
+     ('Mutation = "none"', 'Mutation = "reuse_observation"'), "EntitlementPreservesBytes"),
+    ("RenewedResidenceHold", "renewed-residence-hold-early-expiry",
+     ('Mutation = "none"', 'Mutation = "expire_on_first_observation"'), "EntitlementPreservesBytes"),
+    ("RenewedResidenceHold", "renewed-residence-hold-reply-clock",
+     ('Mutation = "none"', 'Mutation = "deadline_at_reply"'), "EntitlementPreservesBytes"),
+    ("RenewedResidenceHold", "renewed-residence-hold-no-io-fence",
+     ('Mutation = "none"', 'Mutation = "omit_io_fence"'), "EntitlementPreservesBytes"),
+    ("RenewedResidenceHold", "renewed-residence-hold-unbounded-io",
+     ('Mutation = "none"', 'Mutation = "ignore_io_bound"'), "EntitlementPreservesBytes"),
+    ("RenewedResidenceHold", "renewed-residence-hold-unfair-expiry",
+     ('Mutation = "none"', 'Mutation = "unfair_expiry"'), "temporal:AbandonEventuallyCollects"),
+    ("RenewedResidenceHold", "renewed-residence-hold-collection-witness",
+     ("INVARIANT EntitlementPreservesBytes", "INVARIANT NeverCollectsAfterRenewal"), "NeverCollectsAfterRenewal"),
     ("ResidenceReaderRetention", "residence-reader-floor-stale-admission",
      ('Mutation = "none"', 'Mutation = "admit_stale"'), "ReaderReadable"),
     ("ResidenceReaderRetention", "residence-reader-floor-ignore-holds",
@@ -1736,8 +1797,8 @@ def verify_tla(args, scratch):
             config.parent, args.evidence, case,
         )
         if invariant:
-            if invariant == "temporal":
-                message = "Temporal property EventuallyAcknowledged was violated"
+            if invariant.startswith("temporal:"):
+                message = f"Temporal property {invariant.removeprefix('temporal:')} was violated"
             elif invariant.startswith("action:"):
                 message = f"Action property {invariant.removeprefix('action:')} is violated"
             else:
@@ -2933,6 +2994,7 @@ def main():
         if args.openjml:
             verify_jvm_leaf_merge(args, directory)
         verify_rank_bound(args, directory)
+        verify_residence_clock_margin(args, directory)
         verify_rank_cutoff_order(args, directory)
         verify_alloy(args, directory)
         verify_apalache(args, directory)

@@ -42,6 +42,10 @@ All three designers proposed the same mechanism; differences are noted inline.
   - `dd5a0b0fa` registers held catalog captures with the serving residence: `rust/crates/multi/src/catalog_readers.rs`, the directory's `catalog_readers` map (`CatalogReader { owner, storage_root, replica_epoch, cut }` in `rust/crates/directory/src/lib.rs`), and Verus area `verification/verus/catalog_reader_admission`.
   - `aa52621d3` models residence retirement and holds: `verification/tla/ResidenceRetirement.tla`.
   - `b3adb3df5` compares retention policies: `verification/tla/ResidenceReaderRetention.tla` and the Lean laws above.
+- **Certificate and renewal evidence:** the [Lean certificate model](../lean/RetirementCertificate.lean) proves exact identity and hold preservation across arbitrary histories, under an authenticated retirement premise.
+  The [TLC renewal model](../tla/RenewedResidenceHold.tla) checks two observations of one ticket, a delayed renewal reply and bounded in-flight work.
+  The [SMT margin check](../smt/residence-clock-margin.smt2) covers separate monotonic clock rates and bounded provider use.
+  The production ledger still needs renewable holds and a capability consumed by the reaper.
 - **Classic side:** nothing yet. Readers are protected by bounded monotonic leases (default 1 h, 60 s margin) and the collector waits a lease after first observing a trie; see the "Reader leases across nodes" section of `verification/results/2026-11-21.adoc`.
 - **Directory implementations:** `MemoryDirectory`, `DynamoDirectory`, `RemoteDirectory` exist; there is no object-store-backed one.
 
