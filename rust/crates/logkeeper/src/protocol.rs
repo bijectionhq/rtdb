@@ -261,6 +261,10 @@ pub(crate) fn encode_frame(message: &impl Message, buffer: &mut BytesMut) {
 
 /// `None` is a clean end of stream between frames.
 pub(crate) async fn read_frame<M: Message + Default>(reader: &mut (impl AsyncRead + Unpin)) -> std::io::Result<Option<M>> {
+    Ok(read_sized_frame(reader).await?.map(|(message, _)| message))
+}
+
+pub(crate) async fn read_sized_frame<M: Message + Default>(reader: &mut (impl AsyncRead + Unpin)) -> std::io::Result<Option<(M, usize)>> {
     let length = match reader.read_u32().await {
         Ok(length) => length as usize,
         Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
@@ -271,7 +275,17 @@ pub(crate) async fn read_frame<M: Message + Default>(reader: &mut (impl AsyncRea
     }
     let mut body = vec![0; length];
     reader.read_exact(&mut body).await?;
-    M::decode(Bytes::from(body)).map(Some).map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))
+    M::decode(Bytes::from(body)).map(|message| Some((message, length))).map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))
+}
+
+#[cfg(test)]
+#[tokio::test]
+async fn a_frame_is_charged_for_its_wire_bytes_even_if_decoding_discards_unknown_fields() {
+    let mut frame = [0, 0, 0, 3, 0xf8, 0x07, 1].as_slice();
+    let (request, bytes) = read_sized_frame::<Request>(&mut frame).await.unwrap().unwrap();
+    assert_eq!(bytes, 3);
+    assert_eq!(request.encoded_len(), 0);
+    assert!(frame.is_empty());
 }
 
 /// Groups consecutive lsns written at the same epoch.

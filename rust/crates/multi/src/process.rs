@@ -24,6 +24,7 @@ use crate::lease::{LeaseOptions, MemberLease, Registration};
 use crate::logs::LogkeeperLogFactory;
 
 const MAXIMUM_LOG_MESSAGE_BYTES: usize = 4 * 1024 * 1024;
+const PLACED_FLUSH_INTERVAL_LIMIT: Duration = Duration::from_secs(15 * 60);
 const ENGINE_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 pub struct NodeSettings {
@@ -87,6 +88,7 @@ pub async fn start_node(directory: Arc<dyn Directory>, mut settings: NodeSetting
     }
     if !settings.local_compaction && settings.pool != rtdb_directory::MemberPool::Compaction { settings.configuration.compactor.threads = 0; }
     settings.agent.compaction_worker = settings.pool == rtdb_directory::MemberPool::Compaction;
+    settings.configuration.indexer.flush_duration = settings.configuration.indexer.flush_duration.min(PLACED_FLUSH_INTERVAL_LIMIT);
     let options = settings.configuration.node_options(settings.allocation_limit_bytes)?;
     let memory = MemoryBudget::new(options.execution_memory_bytes);
     let writers: crate::logs::Writers = Default::default();

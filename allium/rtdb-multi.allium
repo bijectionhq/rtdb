@@ -675,6 +675,16 @@ entity LogServerStream {
     retained_bytes: Integer
 }
 
+rule AdmitJournalMutation {
+    when: JournalMutationReceived(server, mutation)
+
+    requires: PendingJournalCapacityAvailable(server, mutation)
+
+    ensures:
+        JournalCapacityReservedUntilCompletion(server, mutation)
+        MutationMayBeDecided(mutation)
+}
+
 entity LogRecord {
     deployment: DeploymentId
     epoch: Epoch
@@ -1158,12 +1168,15 @@ rule AuditRetainedReplicaHistory {
 
     ensures:
         let samples = RespondingReplicas(deployment)
-        let interval = CommonCommittedRetainedInterval(samples)
-        if WriteQuorum(samples) and interval != null:
-            let chains = Sha256ChainsForInterval(samples, interval)
+        ReplicaWindowsReported(samples)
+        let interval = LatestCommittedRetainedIntervalSharedByQuorum(samples)
+        if interval != null:
+            let chains = Sha256ChainsForInterval(SamplesCovering(samples, interval), interval)
             ReplicaDigestsReported(chains, interval)
             if DistinctDigests(chains):
                 ReplicaDivergenceReported(deployment, interval)
+        if StrictAuditRequested(deployment) and not WriteQuorumCompared(deployment, interval):
+            AuditRejectedForInsufficientEvidence(deployment)
 }
 
 rule VerifyRetainedJournalOffline {
@@ -1234,6 +1247,7 @@ rule FlushOnAge {
 }
 
 rule FlushOnIdle {
+    -- Each node bounds the idle flushes it starts in one reconciliation pass.
     when: holding: Holding.last_request_at + config.clean_after_idle <= now
 
     requires: holding.state = serving
@@ -1591,6 +1605,7 @@ rule AnswerMoved {
 rule DrainMember {
     -- Scale-in, replacement and rollout drain a member by handing off its active deployments and parking its idle ones, at most moves_per_node_per_pass per pass.
     -- The source's identity and epoch still match when the drain reserves a handoff.
+    -- A draining member runs at most two handoffs at once.
     -- A recent holding stays on its source while the placement pool has no eligible destination.
     when: member: MemberRecord.state becomes draining
 
@@ -1625,6 +1640,15 @@ rule BoundInitialGreeting {
         if connection.startup_received:
             ClientMayRetryStartup(connection)
         ConnectionClosed(connection)
+}
+
+rule TouchConnectedBackend {
+    when: BackendTouchDue(gateway, deployment, address)
+
+    requires: GatewayHasConnectedSession(gateway, deployment, address)
+
+    ensures:
+        TouchSent(gateway, deployment, address)
 }
 
 rule RouteRead {

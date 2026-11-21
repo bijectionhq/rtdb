@@ -76,14 +76,14 @@ pub trait Router: Send + Sync {
     /// A connection to the deployment's current holder, the control address to touch it at, and the epoch it holds under.
     async fn route(&self) -> Result<(TcpStream, Option<String>, u64)>;
     /// Keeps a routed backend warm for the duration of its connection.
-    fn start_touching(&self, _address: String) -> Option<tokio::task::JoinHandle<()>> { None }
+    fn start_touching(&self, _address: String) -> Option<Arc<dyn Send + Sync>> { None }
 }
 
 struct Backend {
     writer: OwnedWriteHalf,
     frames: mpsc::Receiver<std::io::Result<Frame>>,
     _reader: AbortOnDropHandle<()>,
-    heartbeat: Option<AbortOnDropHandle<()>>,
+    heartbeat: Option<Arc<dyn Send + Sync>>,
     epoch: u64,
     drain_deadline: Option<tokio::time::Instant>,
 }
@@ -198,7 +198,7 @@ impl Session {
                 _ => {}
             }
         }
-        backend.heartbeat = control.and_then(|address| self.router.start_touching(address)).map(AbortOnDropHandle::new);
+        backend.heartbeat = control.and_then(|address| self.router.start_touching(address));
         Ok(backend)
     }
 
@@ -227,7 +227,7 @@ impl Session {
         let (client_read, mut client_write) = tokio::io::split(client);
         let (mut requests, _client_reader) = pump(client_read);
         let mut first = Backend::new(first, first_epoch);
-        first.heartbeat = first_control.and_then(|address| self.router.start_touching(address)).map(AbortOnDropHandle::new);
+        first.heartbeat = first_control.and_then(|address| self.router.start_touching(address));
         let mut backend = Some(first);
         enum Event {
             Request(Option<std::io::Result<Frame>>),

@@ -32,6 +32,26 @@ async fn an_audit_distinguishes_equal_committed_positions_with_different_payload
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_reachable_empty_replica_does_not_hide_the_fsynced_quorum_from_an_audit() {
+    let ensemble = Ensemble::start(3).await;
+    let writer = open_writer(ensemble.config_of(&[0, 1], "audit-quorum"), 1, CancellationToken::new()).await.unwrap();
+    append(writer.as_ref(), "first", 42).await;
+    append(writer.as_ref(), "second", 43).await;
+    let all = ensemble.config("audit-quorum");
+    let report = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let report = rtdb_logkeeper::audit_retained(&all).await.unwrap();
+            if report.interval == Some([0, 1]) { break report; }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }).await.unwrap();
+    assert_eq!(report.digests.len(), 2);
+    assert_eq!(report.digests[&all.servers[0]], report.digests[&all.servers[1]]);
+    assert_eq!(report.windows[&all.servers[2]], None);
+    assert!(report.unavailable.is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_stopped_journal_matches_the_online_digest_across_epochs_and_preserves_damaged_bytes() {
     use std::io::Write;
 

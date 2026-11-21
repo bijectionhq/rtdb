@@ -38,7 +38,7 @@ Usage: rtdb-multi --build-info\n\
        rtdb-multi drain --directory DIR --member ID\n\
        rtdb-multi roll-engine --directory DIR --version VERSION\n\
        rtdb-multi status --directory DIR [--target-per-node N]\n\
-       rtdb-multi audit --directory DIR --keys PATH --name NAME\n\
+       rtdb-multi audit --directory DIR --keys PATH --name NAME [--require-quorum]\n\
        rtdb-multi audit-log --data PATH --stream STREAM [--from LSN --through LSN] [--expect DIGEST]\n\
        rtdb-multi move --directory DIR --name NAME --to MEMBER [--cell-secret FILE]\n\
        rtdb-multi pin-engine --directory DIR --name NAME (--version VERSION | --clear)\n\
@@ -510,7 +510,11 @@ async fn run(arguments: Vec<String>) -> Result<()> {
             let directory = directory(arguments.required("directory")?).await?;
             let report = admin::audit(directory.as_ref(), key_service(arguments.required("keys")?).await?.as_ref(), arguments.required("name")?, 4 << 20).await?;
             println!("{}", serde_json::to_string_pretty(&report).expect("a report serializes"));
-            if report.violations.is_empty() { Ok(()) } else { Err(Anomaly::fault("rtdb.multi/audit", format!("{} violations", report.violations.len()))) }
+            if !report.violations.is_empty() { return Err(Anomaly::fault("rtdb.multi/audit", format!("{} violations", report.violations.len()))); }
+            if arguments.present("require-quorum") && report.replica_digests.len() < report.required_replica_quorum {
+                return Err(Anomaly::new(rtdb_types::AnomalyCategory::Unavailable, "rtdb.multi/audit-quorum", "A write quorum could not verify a common committed interval"));
+            }
+            Ok(())
         }
         "audit-log" => {
             let data = PathBuf::from(arguments.required("data")?);

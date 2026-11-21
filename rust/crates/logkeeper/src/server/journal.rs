@@ -118,6 +118,7 @@ pub(crate) enum Write {
 pub(crate) struct Work {
     pub write: Write,
     pub done: oneshot::Sender<std::result::Result<(), String>>,
+    pub _admission: Option<tokio::sync::OwnedSemaphorePermit>,
 }
 
 /// The segment being appended to; touched only by the journal's rounds.
@@ -760,7 +761,7 @@ mod tests {
 
     fn sized(lsn: i64, epoch: u64, bytes: usize) -> Entry { Entry { lsn, epoch, timestamp: lsn, payload: Bytes::from(format!("{lsn}@{epoch}:{}", "x".repeat(bytes))) } }
 
-    fn work(write: Write) -> Work { Work { write, done: oneshot::channel().0 } }
+    fn work(write: Write) -> Work { Work { write, done: oneshot::channel().0, _admission: None } }
 
     fn slot(journal: &Journal, name: &str) -> Arc<Slot> {
         Arc::new(Slot { id: journal.allocate_id(), name: name.into(), state: Default::default(), progressed: Default::default() })

@@ -438,6 +438,9 @@ A cell needs a quorum log shared by every deployment, with group commit across d
    One append-only segment file per writer member, a per-deployment index mapping `(deployment, lsn)` to segment offsets, a per-deployment `LogServerStream` (promised epoch, last epoch and lsn, trim point), fsync before acknowledgement, group commit within `group_commit_window`, seal announcements in every round's acknowledgement, trim and segment reclamation.
    The logkeeper maintains retained byte counts and epoch ranges while applying journal records.
    A seal reads the epoch ranges without scanning each retained entry, and compaction eligibility reads the byte count of each stream.
+   A logkeeper charges the original frame size and reserves queue capacity before changing the stream state.
+   Capacity is released when the journal work finishes.
+   A full queue waits for a durable round before accepting more work.
 2. **Logkeeper loglet.**
    A client in `loglet` holding one connection per ensemble member per node, multiplexing every deployment the node holds, with write quorum 2 of 3 across zones.
 3. **Ensemble assignment.**
@@ -461,6 +464,9 @@ The measurement covers enqueue through durable receipt after writer setup and wa
 | 1 | 4,651–6,924 | 0.139–0.146 | 0.248–0.285 |
 | 64 | 37,990–51,919 | 1.021–1.045 | 4.880–11.020 |
 | 256 | 50,507–60,314 | 3.835–4.089 | 10.459–14.254 |
+
+After adding bounded admission and incremental retained-epoch summaries, one release repeat measured 8,720, 40,660, and 41,178 commits/s at 1, 64, and 256 streams respectively.
+Median commit latencies were 0.111, 1.056, and 4.187 ms, and p99 latencies were 0.201, 1.680, and 21.346 ms.
 
 ```sh
 RTDB_LOG_BENCH_STREAMS=64 RTDB_LOG_BENCH_APPENDS=1000 \
@@ -539,6 +545,9 @@ Small deployments must cost one PUT per flush and one GET per cold start (spec r
    A checkpointed root or materialized deployment skips the base-manifest listing and opens its packs by name.
    A fork with inherited objects still reads its base manifest.
 3. **Flush triggers** in `HoldingDriver`: tail bytes, estimated replay, oldest-record age, idle, ensemble degradation, retention, rows (spec rules `FlushOn*`), replacing `flush_timeout` and `rows_per_block` for multi mode.
+   A placed node honors shorter configured flush intervals and caps the interval at 15 minutes.
+   After 60 seconds without use it flushes unflushed rows while keeping the holder and epoch.
+   Each pass starts at most two idle flushes.
 4. **Checkpoint publication**: a CAS conditional on the epoch, batched per node, then log trim.
 
 **Tests.**
@@ -619,6 +628,7 @@ Moves are invisible to clients only if the gateway owns connections and session 
 3. **Crate `affinity`**, ported from Bijection's `crates/affinity` with its score vectors, and routing by it (`RouteRead`), with per-key in-flight bounds and pressure.
 4. **Redirects**: `NotHolder`, `Moved`, `Behind`, followed by the gateway without the client noticing.
    The gateway renews a deployment's idle protection at the backend connected to the session, including after a move.
+   Sessions on one gateway share a heartbeat for each deployment and backend address until the last connection to that backend closes.
    Local pgwire startup, including routing and the holder's greeting, has a 35-second deadline.
    If a holder accepts a socket but stalls before `ReadyForQuery`, the gateway closes startup with SQLSTATE `57P03` so the client can retry.
    A retry waits for a placement change or the 100 ms fallback timer, whichever arrives first.
@@ -854,11 +864,13 @@ Running alongside every stage from stage 2 onwards, and concluding the branch:
    The successor seals those same servers, recovers the committed entry, and the servers refuse the delayed append before the successor writes at that position.
    This test drives the logkeepers directly.
 3. A hash-chain auditor verifies, offline, that every deployment's history is one chain across epochs.
-   The `audit` command compares a SHA-256 chain over the common committed, retained interval read independently from responding logkeepers.
+   The `audit` command compares a SHA-256 chain over the latest committed, retained interval shared by a write quorum.
    Each link covers the record position, epoch, timestamp and on-disk payload.
-   The report includes the inclusive interval, each replica's digest and unavailable endpoints.
+   The report includes the inclusive interval, each reachable replica's retained window, the required quorum, the computed digests and unavailable endpoints.
    It reports a divergence if the digests differ.
-   The retained interval starts above the highest trim point among the responding servers.
+   A reachable empty replica cannot prevent the other replicas from being compared.
+   `audit --require-quorum` reports failure when too few distinct endpoints can independently verify that interval.
+   Auditing a pristine deployment leaves its data key unallocated.
    On a stopped logkeeper, `rtdb-multi audit-log --data PATH --stream STREAM --from LSN --through LSN --expect DIGEST` verifies the same interval directly from journal segments.
    The command takes a shared filesystem lock and reads the segments without modifying them.
    A damaged record or a digest mismatch makes the command fail.
@@ -963,8 +975,22 @@ The four-connection workload used up to 128 pgwire sessions on the cell.
 With four connections, scale-in send-to-reply p99 was 10.7–19.1 ms.
 The scale-in end-to-end p99 still exceeded 30 ms.
 
+Three subsequent paired release trials used the same 256-connection limit, four sessions per deployment, and 32,768 writes per run.
+Each run preserved the exact counter values through scale-out and scale-in.
+The next table compares how many handoffs a draining member could execute concurrently.
+
+| Concurrent handoffs | Durable updates/s | Overall p99 (ms) | Scale-out p99 (ms) | Scale-in p99 (ms) |
+| ---: | ---: | ---: | ---: | ---: |
+| 8 | 2,958–4,953 | 14.0–23.7 | 12.7–119.7 | 18.4–208.3 |
+| 2 | 4,570–4,827 | 13.8–14.8 | 12.8–24.2 | 11.1–19.5 |
+
+The draining node now runs two handoffs at a time and still takes up to eight per pass.
+The optional latency limit fails a run when either scale transition reaches the specified p99.
+On the integrated build with journal backpressure, shared gateway heartbeats and idle flushing, two of three trials passed the 30 ms limit in both transitions.
+The third scale-in measured 36.4 ms p99, and every counter still matched.
+
 ```sh
-RTDB_TEST_PGWIRE_CONNECTIONS=256 RTDB_CELL_BENCH_CONNECTIONS=4 RTDB_CELL_BENCH_COMMANDS=1024 RTDB_CELL_BENCH_SCALE=1 \
+RTDB_TEST_PGWIRE_CONNECTIONS=256 RTDB_CELL_BENCH_CONNECTIONS=4 RTDB_CELL_BENCH_SCALE=1 RTDB_CELL_BENCH_SCALE_P99_LIMIT_MS=30 \
   cargo test --manifest-path rust/Cargo.toml -p rtdb-multi --release --test load \
   durable_pgwire_updates_under_zipf_activity -- --ignored --nocapture
 ```
