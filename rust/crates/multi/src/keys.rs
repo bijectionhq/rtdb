@@ -1,6 +1,6 @@
 //! Per-deployment key provisioning, fork copies and durable withdrawal.
 
-use std::fs::{self, File};
+use std::fs::{self, File, TryLockError};
 use std::io::{ErrorKind, Write};
 #[cfg(unix)]
 use std::os::unix::fs::OpenOptionsExt;
@@ -23,6 +23,12 @@ pub trait KeyService: Send + Sync {
     async fn destroy(&self, deployment: &str) -> Result<()>;
     /// Installs a key brought from another cell's key service, for a deployment that moved here.
     async fn install(&self, deployment: &str, key: [u8; KEY_BYTES]) -> Result<()>;
+
+    /// The standalone key authority can witness the lifetime of a local I/O
+    /// region. Providers without a local authority use explicit drain receipts.
+    fn hold_local_storage_region(&self, _region: uuid::Uuid) -> Result<Option<File>> { Ok(None) }
+    fn local_storage_region_drained(&self, _region: uuid::Uuid) -> Result<bool> { Ok(false) }
+    fn forget_local_storage_region(&self, _region: uuid::Uuid) -> Result<()> { Ok(()) }
 }
 
 /// Keys kept as files in a directory apart from the objects they protect, standing in for a key-management service.
@@ -35,6 +41,9 @@ impl LocalKeyService {
         Ok(Self { directory })
     }
     fn path(&self, deployment: &str) -> PathBuf { self.directory.join(format!("{deployment}.key")) }
+    fn region_path(&self, region: uuid::Uuid) -> PathBuf {
+        self.directory.join(format!("{region}.storage-region"))
+    }
 
     fn lock_key(&self, path: &Path) -> Result<File> {
         let lock = File::options()
@@ -135,6 +144,39 @@ impl KeyService for LocalKeyService {
             return self.sync_directory();
         }
         self.publish(&path, &[])
+    }
+
+    fn hold_local_storage_region(&self, region: uuid::Uuid) -> Result<Option<File>> {
+        let mut options = File::options();
+        options.read(true).write(true).create_new(true);
+        #[cfg(unix)]
+        options.mode(0o600);
+        let witness = options.open(self.region_path(region)).map_err(io)?;
+        witness.lock().map_err(io)?;
+        witness.sync_all().map_err(io)?;
+        self.sync_directory()?;
+        Ok(Some(witness))
+    }
+
+    fn local_storage_region_drained(&self, region: uuid::Uuid) -> Result<bool> {
+        let witness = match File::options().read(true).write(true).open(self.region_path(region)) {
+            Ok(witness) => witness,
+            Err(error) if error.kind() == ErrorKind::NotFound => return Ok(false),
+            Err(error) => return Err(io(error)),
+        };
+        match witness.try_lock() {
+            Ok(()) => Ok(true),
+            Err(TryLockError::WouldBlock) => Ok(false),
+            Err(TryLockError::Error(error)) => Err(io(error)),
+        }
+    }
+
+    fn forget_local_storage_region(&self, region: uuid::Uuid) -> Result<()> {
+        match fs::remove_file(self.region_path(region)) {
+            Ok(()) => self.sync_directory(),
+            Err(error) if error.kind() == ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(io(error)),
+        }
     }
 }
 

@@ -12,6 +12,7 @@ use rtdb_types::{Anomaly, AnomalyCategory, Result};
 use tokio::net::TcpListener;
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
+use tokio_util::task::TaskTracker;
 
 use crate::agent::{AgentOptions, NodeAgent};
 use crate::deployment::LOGKEEPER_LOG_TYPE;
@@ -50,6 +51,7 @@ pub struct RunningNode {
     pub pgwire_address: SocketAddr,
     cancellation: CancellationToken,
     lease_cancellation: CancellationToken,
+    storage_regions: TaskTracker,
     tasks: JoinSet<Result<()>>,
 }
 
@@ -66,7 +68,12 @@ pub async fn start_node(directory: Arc<dyn Directory>, mut settings: NodeSetting
     let recorder = Arc::new(crate::logs::DirectoryRecorder { directory: Arc::clone(&directory) });
     let cache_bytes = settings.configuration.disk_cache.as_ref().and_then(|cache| cache.maximum_bytes).unwrap_or(u64::MAX);
     let fragmenter = crate::fragments::CellFragmenter::new(Arc::clone(&directory), &settings.agent.fragments, cache_bytes, settings.capabilities.clone());
-    let storage = Arc::new(crate::store::CellStoreFactory { directory: Arc::clone(&directory), keys: Arc::clone(&settings.keys) });
+    let storage_regions = TaskTracker::new();
+    let storage = Arc::new(crate::store::CellStoreFactory {
+        directory: Arc::clone(&directory),
+        keys: Arc::clone(&settings.keys),
+        storage_regions: storage_regions.clone(),
+    });
     let placed = PlacedOptions {
         log_factories: vec![(LOGKEEPER_LOG_TYPE.into(), LogkeeperLogFactory::new(MAXIMUM_LOG_MESSAGE_BYTES, Arc::clone(&settings.keys), Arc::clone(&writers), recorder))],
         storage_factories: vec![(crate::store::CELL_STORAGE_TYPE.into(), storage)],
@@ -99,7 +106,7 @@ pub async fn start_node(directory: Arc<dyn Directory>, mut settings: NodeSetting
     { let lease = Arc::clone(&lease); let cancellation = lease_cancellation.clone(); tasks.spawn(async move { lease.run(cancellation).await; Ok(()) }); }
     { let agent = Arc::clone(&agent); let cancellation = cancellation.clone(); tasks.spawn(async move { agent.run(cancellation).await; Ok(()) }); }
     tasks.spawn(crate::control::serve(control, agent.clone(), crate::control::ControlKey(settings.capabilities.clone()), cancellation.clone()));
-    Ok(RunningNode { server, agent, fragmenter, lease, control_address, pgwire_address, cancellation, lease_cancellation, tasks })
+    Ok(RunningNode { server, agent, fragmenter, lease, control_address, pgwire_address, cancellation, lease_cancellation, storage_regions, tasks })
 }
 
 impl RunningNode {
@@ -122,10 +129,21 @@ impl RunningNode {
         self.lease_cancellation.cancel();
         self.cancellation.cancel();
         self.server.shutdown();
+        let mut failure = None;
         while let Some(result) = self.tasks.join_next().await {
-            if let Ok(Err(error)) = result { if error.category != AnomalyCategory::Interrupted { return Err(error); } }
+            if let Ok(Err(error)) = result && error.category != AnomalyCategory::Interrupted {
+                failure.get_or_insert(error);
+            }
         }
-        Ok(())
+        self.storage_regions.close();
+        if tokio::time::timeout(Duration::from_secs(10), self.storage_regions.wait()).await.is_err() {
+            failure.get_or_insert_with(|| Anomaly::new(
+                AnomalyCategory::Unavailable,
+                "rtdb.multi/storage-release-pending",
+                "The directory has not confirmed all serving storage region releases",
+            ));
+        }
+        failure.map_or(Ok(()), Err)
     }
 }
 

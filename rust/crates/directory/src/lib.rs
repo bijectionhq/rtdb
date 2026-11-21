@@ -145,6 +145,9 @@ pub struct DeploymentRecord {
     /// Every journal endpoint authorized to receive this installation's
     /// replica stream, retained before a new ensemble receives a copy.
     pub replica_journals: BTreeSet<String>,
+    /// Open serving storage regions. The region owner removes its admission
+    /// only when all of its provider operations have drained.
+    pub storage_regions: BTreeSet<uuid::Uuid>,
     /// How many ranks of the affinity order may serve reads.
     pub read_width: u32,
     pub activation_crashes: u32,
@@ -222,7 +225,7 @@ impl DeploymentRecord {
     pub fn new(name: impl Into<String>, org: impl Into<String>, ensemble: Vec<MemberId>, now_ms: i64) -> Self {
         let id = uuid::Uuid::new_v4().to_string();
         Self { lineage: id.clone(), id, name: name.into(), org: org.into(), incarnation: 1, lifecycle: Lifecycle::Live, epoch: 0, holder: None,
-            ensemble, replica_journals: BTreeSet::new(), read_width: 1, activation_crashes: 0, created_at_ms: now_ms, move_intent: None, log_epoch: 0, parent: None, move_from: None, linearizable_reads: false, checkpoint: None, moved_at_ms: None, cell_transfer: None, disposal: None, checkpoint_recovery: None, version: 0 }
+            ensemble, replica_journals: BTreeSet::new(), storage_regions: BTreeSet::new(), read_width: 1, activation_crashes: 0, created_at_ms: now_ms, move_intent: None, log_epoch: 0, parent: None, move_from: None, linearizable_reads: false, checkpoint: None, moved_at_ms: None, cell_transfer: None, disposal: None, checkpoint_recovery: None, version: 0 }
     }
 
     /// The affinity key: stable across epochs and residency, distinct across incarnations.

@@ -1713,6 +1713,8 @@ rule TransferSharedObjects {
 rule EraseAndProve {
     when: SharedObjectsTransferred(record)
 
+    requires: ServingStorageRegionsDrained(record)
+
     ensures:
         RetireReplicaJournals(record.id, record.epoch, AllRecordedJournals(record))
         DeleteAllVersionsUnder(record.storage_root.prefix, except: TransferredObjects(record))

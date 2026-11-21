@@ -254,6 +254,18 @@ async fn run(arguments: Vec<String>) -> Result<()> {
             println!("{}", serde_json::to_string_pretty(&receipt).expect("a receipt serializes"));
             Ok(())
         }
+        "schedule-disposal" => {
+            let directory = directory(arguments.required("directory")?).await?;
+            let id = installation_id(&arguments)?;
+            let scheduled = admin::begin_disposal(directory.as_ref(), &id.to_string()).await?;
+            println!("{}", serde_json::json!({
+                "deployment": scheduled.id,
+                "incarnation": scheduled.incarnation,
+                "epoch": scheduled.epoch,
+                "lifecycle": scheduled.lifecycle,
+            }));
+            Ok(())
+        }
         "capture" => {
             let directory = directory(arguments.required("directory")?).await?;
             let storage = CellStorage::parse(arguments.required("storage-root")?)?;
@@ -276,18 +288,6 @@ async fn run(arguments: Vec<String>) -> Result<()> {
                 installation_id(&arguments)?, required_uuid(&arguments, "operation")?, 4 << 20,
             ).await?;
             println!("{}", serde_json::to_string_pretty(&recovery).expect("a restore receipt serializes"));
-            Ok(())
-        }
-        "schedule-disposal" => {
-            let directory = directory(arguments.required("directory")?).await?;
-            let id = installation_id(&arguments)?;
-            let scheduled = admin::begin_disposal(directory.as_ref(), &id.to_string()).await?;
-            println!("{}", serde_json::json!({
-                "deployment": scheduled.id,
-                "incarnation": scheduled.incarnation,
-                "epoch": scheduled.epoch,
-                "lifecycle": scheduled.lifecycle,
-            }));
             Ok(())
         }
         "create" => {
