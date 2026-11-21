@@ -236,4 +236,3 @@ mod tests {
         assert!(matches!(call(&address.to_string(), &Request::Ping, Duration::from_secs(5), &ControlKey::default()).await.unwrap(), Response::Done));
     }
 }
-

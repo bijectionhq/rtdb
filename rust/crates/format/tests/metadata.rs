@@ -3,7 +3,7 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use rtdb_format::bloom::{BloomFilter, hashes};
-use rtdb_format::metadata::{MetadataFile, MetadataNode};
+use rtdb_format::metadata::{LeafColumns, MetadataFile, MetadataNode};
 use rtdb_types::{LogicalType, ScalarType, Timestamp, Value};
 
 #[test]
@@ -32,10 +32,10 @@ fn columns() -> Vec<Value> {
 #[test]
 fn metadata_roundtrip_retains_iid_and_recency_branch_order() {
     let nodes = vec![
-        MetadataNode::Leaf { data_page_index: 0, columns: columns() },
-        MetadataNode::Leaf { data_page_index: 1, columns: columns() },
+        MetadataNode::Leaf { data_page_index: 0, columns: LeafColumns::new(columns()) },
+        MetadataNode::Leaf { data_page_index: 1, columns: LeafColumns::new(columns()) },
         MetadataNode::IidBranch(vec![None, Some(0), None, Some(1)]),
-        MetadataNode::Leaf { data_page_index: 2, columns: columns() },
+        MetadataNode::Leaf { data_page_index: 2, columns: LeafColumns::new(columns()) },
         MetadataNode::RecencyBranch(vec![(Timestamp(100), 2), (Timestamp::MAX, 3)]),
     ];
     let original = MetadataFile::from_nodes(nodes.clone(), true).unwrap();
@@ -52,7 +52,7 @@ fn imported_metadata_rewrites_raw_decimal_cells_without_declared_precision_valid
         let mut columns = columns();
         let Value::Struct(column) = &mut columns[0] else { panic!("Expected column metadata") };
         column.insert("decimal-value".into(), Value::Decimal(rtdb_types::DecimalValue::new(123i128.to_be_bytes().to_vec(), precision, i32::MAX, 128).unwrap()));
-        let original = MetadataFile::from_nodes(vec![MetadataNode::Leaf { data_page_index: 0, columns }], false).unwrap();
+        let original = MetadataFile::from_nodes(vec![MetadataNode::Leaf { data_page_index: 0, columns: LeafColumns::new(columns) }], false).unwrap();
         let bytes = original.write().unwrap();
         let loaded = MetadataFile::read(bytes.clone().into()).unwrap();
         assert_eq!(loaded.nodes(), original.nodes());
@@ -152,11 +152,58 @@ fn metadata_builder_rebases_nested_column_indices_across_data_pages() {
     let MetadataNode::Leaf { columns: first_columns, .. } = &file.nodes()[first] else { panic!("First node must be a leaf") };
     let MetadataNode::Leaf { columns: second_columns, .. } = &file.nodes()[second] else { panic!("Second node must be a leaf") };
     let nested = |columns: &[Value]| columns.iter().find(|column| column.field("col-name") == Some(&Value::Utf8("nested".into()))).unwrap().field("struct").unwrap().clone();
-    assert_eq!(nested(first_columns), Value::List(vec![Value::I32(4)]));
-    assert_eq!(nested(second_columns), Value::List(vec![Value::I32(4 + first_columns.len() as i32)]));
+    assert_eq!(nested(&first_columns.values().unwrap()), Value::List(vec![Value::I32(4)]));
+    assert_eq!(nested(&second_columns.values().unwrap()), Value::List(vec![Value::I32(4 + first_columns.values().unwrap().len() as i32)]));
     assert_eq!(summary.row_count, Some(2));
     let temporal = summary.temporal_metadata.unwrap();
     assert_eq!(temporal.min_valid_from, Some(0));
     assert_eq!(temporal.max_valid_to, Some(100));
     assert_eq!(MetadataFile::read(Arc::from(file.write().unwrap())).unwrap().leaves(), [(vec![0], 0), (vec![3], 1)]);
+}
+
+#[test]
+fn a_sliced_pages_temporal_bounds_are_those_of_its_own_rows() {
+    use rtdb_format::data::{StoredEvent, StoredOperation, build_event_batch};
+    use rtdb_format::metadata::MetadataBuilder;
+    use rtdb_types::{Iid, Interval};
+
+    let event = |n: i64| StoredEvent { iid: Iid([n as u8; 16]), system_from: Timestamp(10 * n), valid_time: Interval::from_micros(n, 100 * n).unwrap(), operation: StoredOperation::Delete, recency: None };
+    let batch = build_event_batch(&[event(1), event(2), event(3), event(4)], None, None).unwrap().slice(1, 2);
+    let mut writer = MetadataBuilder::new(false, false);
+    writer.write_leaf(&batch).unwrap();
+    let temporal = writer.finish().unwrap().1.temporal_metadata.unwrap();
+    assert_eq!((temporal.min_valid_from, temporal.max_valid_from, temporal.min_valid_to, temporal.max_valid_to), (Some(2), Some(3), Some(200), Some(300)));
+    assert_eq!((temporal.min_system_from, temporal.max_system_from), (Some(20), Some(30)));
+}
+
+#[test]
+fn a_read_metadata_file_retains_its_stored_nodes_rather_than_their_decoded_statistics() {
+    use rtdb_format::data::{StoredEvent, StoredOperation, build_event_batch};
+    use rtdb_format::ipc::inspect_file_reserved;
+    use rtdb_format::metadata::MetadataBuilder;
+    use rtdb_types::{EntityId, Interval};
+
+    let mut builder = MetadataBuilder::new(false, true);
+    let mut written = Vec::new();
+    for page in 0..64i64 {
+        let events = (page * 1024..page * 1024 + 1024).map(|id| StoredEvent {
+            iid: EntityId::Integer(id).iid(), system_from: Timestamp(1), valid_time: Interval::ALL,
+            operation: StoredOperation::Put(StructFields::from([("_id".into(), Value::I64(id)), ("sku".into(), Value::Utf8(format!("sku-{id}")))])), recency: None,
+        }).collect::<Vec<_>>();
+        let fields = BTreeMap::from([("_id".into(), LogicalType::Scalar(ScalarType::I64)), ("sku".into(), LogicalType::Scalar(ScalarType::Utf8))]);
+        builder.write_leaf(&build_event_batch(&events, Some(fields.into()), None).unwrap()).unwrap();
+    }
+    let (metadata, _) = builder.finish().unwrap();
+    for node in metadata.nodes() { if let MetadataNode::Leaf { columns, .. } = node { written.push(columns.values().unwrap().into_owned()); } }
+    let bytes = metadata.write().unwrap();
+    let mut cursor = std::io::Cursor::new(bytes.clone());
+    let bound = inspect_file_reserved(&mut cursor, |bytes| rtdb_columnar::MemoryBudget::new(1 << 40).reserve(bytes)).unwrap().full_allocation_bound().unwrap();
+    let read = MetadataFile::read(bytes.into()).unwrap();
+    assert!(read.stored_bytes() * 2 < bound, "a read file retains {} of the {bound} its decoding is bounded by", read.stored_bytes());
+    let decoded = read.nodes().iter().filter_map(|node| match node { MetadataNode::Leaf { columns, .. } => Some(columns.values().unwrap().into_owned()), _ => None }).collect::<Vec<_>>();
+    let present = |columns: &[Value]| columns.iter().map(|column| match column {
+        Value::Struct(fields) => Value::Struct(fields.iter().filter(|(_, value)| !matches!(value, Value::Null)).map(|(key, value)| (key.clone(), value.clone())).collect()),
+        other => other.clone(),
+    }).collect::<Vec<_>>();
+    assert_eq!(decoded.iter().map(|columns| present(columns)).collect::<Vec<_>>(), written.iter().map(|columns| present(columns)).collect::<Vec<_>>(), "a statistic a page lacks reads back as null");
 }

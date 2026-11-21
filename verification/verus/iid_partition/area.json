@@ -1,0 +1,71 @@
+{
+  "summary": "Query and compaction share the same base-four IID digit for every valid depth.",
+  "flags": ["--no-external-by-default", "--verify-module", "production", "--verify-module", "laws"],
+  "min_verified_functions": 7,
+  "controls": {
+    "drop_last_digit": {
+      "defect": "The final base-four digit cannot be selected.",
+      "mutate": [{
+        "file": "rust/crates/trie/src/partition_step.rs",
+        "find": "if depth >= 64",
+        "replace": "if depth >= 63"
+      }],
+      "expect": [{
+        "file": "rust/crates/trie/src/partition_step.rs",
+        "function": "base4_bucket",
+        "category": "postcondition not satisfied"
+      }],
+      "min_verified_functions": 6
+    },
+    "drop_last_digit_with_weakened_contract": {
+      "defect": "Both the function and the local contract promise only the first 63 digits.",
+      "mutate": [{
+        "file": "rust/crates/trie/src/partition_step.rs",
+        "find": "if depth >= 64",
+        "replace": "if depth >= 63"
+      }, {
+        "file": "rust/crates/trie/src/partition_step.rs",
+        "find": "(depth < 64)",
+        "replace": "(depth < 63)"
+      }],
+      "expect": [{
+        "file": "verification/verus/iid_partition/laws.rs",
+        "function": "every_iid_digit_can_be_selected",
+        "category": "assertion failed"
+      }],
+      "min_verified_functions": 6
+    },
+    "collapse_buckets": {
+      "defect": "Only bucket zero is returned for every valid IID depth.",
+      "mutate": [{
+        "file": "rust/crates/trie/src/partition_step.rs",
+        "find": "    Some(bucket)",
+        "replace": "    Some(0)"
+      }],
+      "expect": [{
+        "file": "rust/crates/trie/src/partition_step.rs",
+        "function": "base4_bucket",
+        "category": "postcondition not satisfied"
+      }],
+      "min_verified_functions": 6
+    },
+    "collapse_buckets_with_weakened_contract": {
+      "defect": "Both the function and its local contract assign all valid inputs to bucket zero.",
+      "mutate": [{
+        "file": "rust/crates/trie/src/partition_step.rs",
+        "find": "    Some(bucket)",
+        "replace": "    Some(0)"
+      }, {
+        "file": "rust/crates/trie/src/partition_step.rs",
+        "find": "(out->Some_0) as int == digit(iid@[(depth as int) / 4] as int, (depth as int) % 4)",
+        "replace": "(out->Some_0) == 0"
+      }],
+      "expect": [{
+        "file": "verification/verus/iid_partition/laws.rs",
+        "function": "a_high_leading_byte_cannot_belong_to_bucket_zero",
+        "category": "assertion failed"
+      }],
+      "min_verified_functions": 6
+    }
+  }
+}

@@ -1,9 +1,11 @@
+use std::collections::BTreeSet;
 use std::sync::Arc;
 use std::time::Duration;
 use async_trait::async_trait;
 use futures::{StreamExt, stream};
-use rtdb_format::{catalog::{BlockCatalog, TableEntry}, keys::{TrieKey, block_index_from_key, oversized_block_index}};
-use rtdb_storage::{ObjectKey, ObjectStore};
+use rtdb_format::{catalog::{BlockCatalog, TableEntry}, keys::{PartGroup, TrieKey, block_index_from_key, oversized_block_index}};
+use rtdb_index::PartitionState;
+use rtdb_storage::{IoRegion, ObjectKey, ObjectStore};
 use rtdb_types::{Anomaly, BlockIndex, Result, TableRef, Timestamp};
 use tokio::sync::Semaphore;
 use tokio_util::sync::CancellationToken;
@@ -36,22 +38,22 @@ pub trait CollectionObserver: Send + Sync {
 }
 
 pub fn block_is_garbage(block: BlockIndex, latest: BlockIndex, keep: usize) -> bool {
-    block != latest && i128::from(block.0) <= i128::from(latest.0) - keep as i128
+    crate::retention::block_is_eligible(block.0, latest.0, keep)
 }
 
 pub struct TrieCollector {
     store: Arc<dyn ObjectStore>,
-    snapshots: Arc<dyn SnapshotSource>,
+    partition: Arc<PartitionState>,
     publisher: Arc<dyn TrieDeletionPublisher>,
     observer: Arc<dyn CollectionObserver>,
     config: GarbageConfig,
 }
 
 impl TrieCollector {
-    pub fn new(store: Arc<dyn ObjectStore>, snapshots: Arc<dyn SnapshotSource>, publisher: Arc<dyn TrieDeletionPublisher>,
+    pub fn new(store: Arc<dyn ObjectStore>, partition: Arc<PartitionState>, publisher: Arc<dyn TrieDeletionPublisher>,
         observer: Arc<dyn CollectionObserver>, config: GarbageConfig) -> Result<Self> {
         config.validate()?;
-        Ok(Self { store, snapshots, publisher, observer, config })
+        Ok(Self { store, partition, publisher, observer, config })
     }
 
     pub async fn default_garbage_as_of(&self) -> Result<Option<Timestamp>> {
@@ -65,15 +67,16 @@ impl TrieCollector {
     }
 
     pub async fn collect_as_of(&self, as_of: Timestamp, cancellation: &CancellationToken) -> Result<()> {
-        let snapshot = self.snapshots.snapshot();
-        let tables: Vec<_> = snapshot.table_catalog().entries().cloned().collect();
+        let collection = Arc::new(self.partition.trie_collection());
+        let tables: Vec<_> = collection.current().table_catalog().entries().cloned().collect();
         let deletes = Arc::new(Semaphore::new(self.config.delete_parallelism));
         let tasks = stream::iter(tables).map(|entry| {
             let deletes = Arc::clone(&deletes);
-            let snapshot = Arc::clone(&snapshot);
+            let collection = Arc::clone(&collection);
             async move {
-                let keys = snapshot.trie_catalog().garbage_tries(&entry.table, as_of).into_iter().map(|trie| trie.key.clone()).collect::<Vec<_>>();
-                let result = self.collect_table(&entry, &keys, &deletes, cancellation).await;
+                let keys = collection.eligible(&entry.table, as_of);
+                let groups = finished_groups(collection.current().trie_catalog(), &entry.table, &keys);
+                let result = IoRegion::retaining(collection, self.collect_table(&entry, &keys, &groups, &deletes, cancellation)).await;
                 if let Err(error) = &result { if !cancellation.is_cancelled() { self.observer.table_failed(Some(&entry.table), error); } }
             }
         });
@@ -81,7 +84,15 @@ impl TrieCollector {
         if cancellation.is_cancelled() { Err(crate::closed()) } else { Ok(()) }
     }
 
-    async fn collect_table(&self, entry: &TableEntry, keys: &[TrieKey], deletes: &Semaphore, cancellation: &CancellationToken) -> Result<()> {
+    async fn collect_table(&self, entry: &TableEntry, keys: &[TrieKey], groups: &BTreeSet<PartGroup>, deletes: &Semaphore, cancellation: &CancellationToken) -> Result<()> {
+        // A group's artefacts are derived from every member's data file, so they go before any member's.
+        for group in groups {
+            if cancellation.is_cancelled() { return Err(crate::closed()); }
+            let artefacts = ObjectKey::new(entry.slug.group_artefact_prefix(group)).map_err(crate::invalid)?;
+            for artefact in self.store.list(Some(&artefacts)).await.map_err(crate::invalid)? {
+                self.store.delete(&artefact.key).await.map_err(crate::invalid)?;
+            }
+        }
         for chunk in keys.chunks(self.config.chunk_size) {
             if cancellation.is_cancelled() { return Err(crate::closed()); }
             if chunk.iter().any(|key| key.level() == 0) { return Err(crate::invalid("L0 recovery files cannot be garbage collected")); }
@@ -89,6 +100,11 @@ impl TrieCollector {
                 let key = &chunk[index];
                 let _permit = deletes.acquire().await.map_err(crate::invalid)?;
                 if cancellation.is_cancelled() { return Err(crate::closed()); }
+                // Artefacts carry the data file's content, so they go first; listing catches any whose record has not reached this catalog.
+                let artefacts = ObjectKey::new(entry.slug.artefact_prefix(key)).map_err(crate::invalid)?;
+                for artefact in self.store.list(Some(&artefacts)).await.map_err(crate::invalid)? {
+                    self.store.delete(&artefact.key).await.map_err(crate::invalid)?;
+                }
                 self.store.delete(&ObjectKey::new(entry.slug.data_key(key)).map_err(crate::invalid)?).await.map_err(crate::invalid)?;
                 self.store.delete(&ObjectKey::new(entry.slug.metadata_key(key)).map_err(crate::invalid)?).await.map_err(crate::invalid)
             }).buffer_unordered(self.config.delete_parallelism).collect::<Vec<Result<()>>>().await;
@@ -98,6 +114,23 @@ impl TrieCollector {
         }
         Ok(())
     }
+}
+
+/// The partition groups of tries being collected none of whose members the catalog holds besides them: their artefacts serve no trie once these go.
+fn finished_groups(catalog: &rtdb_index::TrieCatalog, table: &TableRef, keys: &[TrieKey]) -> BTreeSet<PartGroup> {
+    use rtdb_format::keys::BRANCH_FACTOR;
+
+    let collected: BTreeSet<&TrieKey> = keys.iter().collect();
+    keys.iter().filter_map(TrieKey::part_group)
+        .filter(|group| {
+            let members = group.members();
+            let held: [Option<bool>; BRANCH_FACTOR as usize] = std::array::from_fn(|bucket| {
+                let key = &members[bucket];
+                catalog.trie(table, key).map(|_| collected.contains(key))
+            });
+            crate::retention::all_held_members_scheduled(held)
+        })
+        .collect()
 }
 
 #[async_trait]

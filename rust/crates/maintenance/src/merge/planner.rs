@@ -1,4 +1,4 @@
-use rtdb_format::{data::StoredEvent, metadata::MetadataNode};
+use rtdb_format::{data::PageEvent, metadata::MetadataNode};
 use rtdb_types::{Iid, Result};
 use super::{InputSegment, row_heap};
 
@@ -16,7 +16,9 @@ fn expand(segment: usize, index: usize, inputs: &[InputSegment], output: &mut Ve
 
 pub(super) fn matches_path(iid: Iid, path: &[u8]) -> bool { path.iter().enumerate().all(|(depth, expected)| bucket(iid, depth) == *expected) }
 
-pub(super) fn bucket(iid: Iid, depth: usize) -> u8 { (iid.0[depth / 4] >> (6 - 2 * (depth % 4))) & 3 }
+pub(super) fn bucket(iid: Iid, depth: usize) -> u8 {
+    rtdb_trie::base4_bucket(&iid.0, depth).expect("the compaction path fits in the IID")
+}
 
 pub(super) fn plan(inputs: &[InputSegment], part: &[u8]) -> Result<Vec<Task>> {
     if part.len() > 64 || part.iter().any(|bucket| *bucket > 3) { return Err(crate::invalid("Compaction IID path is invalid")); }
@@ -54,18 +56,18 @@ pub(super) fn plan(inputs: &[InputSegment], part: &[u8]) -> Result<Vec<Task>> {
 }
 
 pub(super) struct RowHeap<'a> {
-    streams: &'a [Vec<StoredEvent>],
+    streams: &'a [Vec<PageEvent>],
     heads: Vec<row_heap::Head>,
 }
 
 impl<'a> RowHeap<'a> {
-    pub fn new(streams: &'a [Vec<StoredEvent>]) -> Result<Self> {
+    pub fn new(streams: &'a [Vec<PageEvent>]) -> Result<Self> {
         let heads = row_heap::from_pages(streams.len(), |stream| streams[stream].len(), |head| Self::key(streams, head))
             .ok_or_else(|| crate::invalid("Compaction page is not IID ascending and system-time descending"))?;
         Ok(Self { streams, heads })
     }
 
-    fn key(streams: &[Vec<StoredEvent>], (stream, row): row_heap::Head) -> row_heap::Key {
+    fn key(streams: &[Vec<PageEvent>], (stream, row): row_heap::Head) -> row_heap::Key {
         let event = &streams[stream][row];
         (u128::from_be_bytes(event.iid.0), event.system_from.0)
     }

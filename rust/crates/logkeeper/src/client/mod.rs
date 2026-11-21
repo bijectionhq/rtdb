@@ -437,6 +437,10 @@ impl Log for QuorumLog {
         Ok(Some(LogOffset(first)))
     }
 
+    async fn recovery_tail(&self, after: LogOffset) -> Result<Option<Box<dyn LogTail>>> {
+        self.tail(after).await.map(Some)
+    }
+
     async fn tail(&self, after: LogOffset) -> Result<Box<dyn LogTail>> {
         let next = after.0.checked_add(1).ok_or_else(|| Error::Closed("log positions exhausted".into()))?;
         let (tip, trim) = self.shared.bounds().await?;

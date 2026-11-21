@@ -330,7 +330,27 @@ async fn database_scopes_keep_equal_remote_keys_separate_and_return_charged_rang
 }
 
 #[tokio::test]
-async fn successful_file_upload_warms_cache_and_remote_deletion_preserves_cached_reads() {
+async fn a_fresh_read_has_no_durable_cache_dependency() {
+    let directory = tempfile::tempdir().unwrap();
+    let cache = DiskCache::open(directory.path(), 100, MemoryBudget::new(4 * 1024 * 1024)).unwrap();
+    let remote = Arc::new(MemoryStore::default());
+    let scope = ObjectKey::new("db/0").unwrap();
+    let store = cache.scope(scope, remote.clone()).unwrap();
+    let key = ObjectKey::new("derived/page").unwrap();
+    let durable_copy = directory.path().join("db/0/derived/page");
+    remote.put(&key, Bytes::from_static(b"page")).await.unwrap();
+
+    assert_eq!(store.get_fresh(&key).await.unwrap().as_ref(), b"page");
+    assert!(!durable_copy.exists());
+
+    assert_eq!(store.get(&key).await.unwrap().as_ref(), b"page");
+    assert!(durable_copy.exists());
+    remote.delete(&key).await.unwrap();
+    assert!(matches!(store.get_fresh(&key).await, Err(Error::MissingObject(_))));
+}
+
+#[tokio::test]
+async fn successful_file_upload_warms_cache_and_deleting_through_the_store_drops_the_cached_copy() {
     let directory = tempfile::tempdir().unwrap();
     let cache = DiskCache::open(directory.path(), 100, MemoryBudget::new(4 * 1024 * 1024)).unwrap();
     let remote = Arc::new(ObservedStore::new(false));
@@ -340,10 +360,72 @@ async fn successful_file_upload_warms_cache_and_remote_deletion_preserves_cached
     let key = ObjectKey::new("table/data.arrow").unwrap();
     store.put_file(&key, source.path()).await.unwrap();
     assert!(source.path().exists());
+    assert_eq!(store.get(&key).await.unwrap().as_ref(), b"arrow file");
+    assert_eq!(remote.reads.load(Ordering::SeqCst), 0, "the upload warmed the cache");
     store.delete(&key).await.unwrap();
     assert!(store.list(None).await.unwrap().is_empty());
-    assert_eq!(store.get(&key).await.unwrap().as_ref(), b"arrow file");
-    assert_eq!(remote.reads.load(Ordering::SeqCst), 0);
+    assert!(store.get(&key).await.is_err(), "a deleted object is no longer served from the cache");
+    assert!(!directory.path().join("db/0/table/data.arrow").exists());
+}
+
+#[tokio::test]
+async fn an_invalidated_file_outlives_its_leases_and_nothing_else() {
+    let directory = tempfile::tempdir().unwrap();
+    let memory = MemoryBudget::new(4 * 1024 * 1024);
+    let store = ObservedStore::new(false);
+    let key = ObjectKey::new("db/0/table/file").unwrap();
+    store.put(&key, Bytes::from_static(b"erased later")).await.unwrap();
+    {
+        let cache = DiskCache::open(directory.path(), 100, memory.clone()).unwrap();
+        let lease = cache.get(&key, &store, &key).await.unwrap();
+        cache.invalidate(&key).unwrap();
+        assert!(!directory.path().join("db/0/table/file").exists());
+        assert!(lease.path().starts_with(directory.path().canonicalize().unwrap().join(".tmp")));
+        assert_eq!(std::fs::read(lease.path()).unwrap(), b"erased later", "a reader holding the lease keeps reading");
+        let retired = lease.path();
+        drop(lease);
+        assert!(!retired.exists(), "the last lease takes the file with it");
+        drop(cache.get(&key, &store, &key).await.unwrap());
+        assert_eq!(store.reads.load(Ordering::SeqCst), 2, "the next read goes to the store");
+        cache.invalidate(&key).unwrap();
+    }
+    store.delete(&key).await.unwrap();
+    let cache = DiskCache::open(directory.path(), 100, memory).unwrap();
+    assert!(cache.get(&key, &store, &key).await.is_err(), "an invalidated file is not rediscovered after a restart");
+}
+
+#[tokio::test]
+async fn an_invalidated_loader_cannot_unlink_the_replacement_file() {
+    let directory = tempfile::tempdir().unwrap();
+    let cache = DiskCache::open(directory.path(), 100, MemoryBudget::new(4 * 1024 * 1024)).unwrap();
+    let store = ObservedStore::new(true);
+    let key = ObjectKey::new("db/0/table/file").unwrap();
+    store.put(&key, Bytes::from_static(b"data")).await.unwrap();
+    let mut old = Box::pin(cache.get(&key, &store, &key));
+    assert_pending(old.as_mut()).await;
+    cache.invalidate(&key).unwrap();
+    let fresh = cache.get(&key, &store, &key).await.unwrap();
+    store.release.add_permits(1);
+    let retired = old.await.unwrap();
+    let retired_path = retired.path();
+    assert_ne!(retired_path, fresh.path());
+    drop(retired);
+    assert!(!retired_path.exists());
+    assert_eq!(std::fs::read(fresh.path()).unwrap(), b"data");
+}
+
+#[tokio::test]
+async fn invalidating_a_buffer_pool_entry_keeps_open_leases_and_misses_afterwards() {
+    let remote = Arc::new(MemoryStore::default());
+    let pool = BufferPool::new(remote.clone(), 1 << 20);
+    let key = ObjectKey::new("tables/docs/data/l01-rc-b00.arrow").unwrap();
+    remote.put(&key, Bytes::from_static(b"data")).await.unwrap();
+    let lease = pool.get(&key).await.unwrap();
+    remote.delete(&key).await.unwrap();
+    assert_eq!(pool.get(&key).await.unwrap().as_slice(), b"data", "until invalidated, the pool serves its copy");
+    pool.invalidate(&key).await.unwrap();
+    assert_eq!(lease.as_slice(), b"data");
+    assert!(pool.get(&key).await.is_err());
 }
 
 #[tokio::test]
@@ -540,4 +622,23 @@ fn lock_symlink_is_rejected_before_orphan_cleanup() {
     assert!(DiskCache::open(directory.path(), 100, MemoryBudget::new(1 << 20)).is_err());
     assert_eq!(std::fs::read(&target).unwrap(), b"outside cache");
     assert_eq!(std::fs::read(temporary.join("unclaimed")).unwrap(), b"preserved");
+}
+
+#[tokio::test]
+async fn a_local_file_of_a_cached_object_is_pinned_while_held() {
+    use std::io::Read;
+    let directory = tempfile::tempdir().unwrap();
+    let cache = DiskCache::open(directory.path(), 4, MemoryBudget::new(4 * 1024 * 1024)).unwrap();
+    let remote = Arc::new(MemoryStore::default());
+    let key = ObjectKey::new("tables/docs/first").unwrap();
+    remote.put(&key, Bytes::from_static(b"123456")).await.unwrap();
+    let store = cache.scope(ObjectKey::new("db").unwrap(), remote).unwrap();
+    let local = store.local_file(&key).await.unwrap().expect("a disk-cached store keeps a local file");
+    let mut bytes = Vec::new();
+    local.file().try_clone().unwrap().read_to_end(&mut bytes).unwrap();
+    assert_eq!(bytes, b"123456");
+    assert_eq!(cache.stats().pinned_bytes, 6, "held over capacity, as any lease is");
+    drop(local);
+    assert_eq!(cache.stats().pinned_bytes + cache.stats().evictable_bytes, 0);
+    assert!(matches!(store.local_file(&ObjectKey::new("tables/docs/absent").unwrap()).await, Err(Error::MissingObject(_))));
 }

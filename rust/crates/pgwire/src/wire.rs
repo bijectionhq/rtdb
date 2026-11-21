@@ -84,6 +84,13 @@ impl<W: AsyncWrite + Unpin> Writer<W> {
         let bound = columns.iter().try_fold(2usize, |n, column| n.checked_add(column.name.len() + 19).ok_or_else(|| protocol("Column description too large")))?;
         self.record(b'T', bound, |bytes| { count(bytes, columns.len())?; for column in columns { let ty = if column.ty == PgType::Default { fallback } else { column.ty }; let descriptor = ty.descriptor(); cstring(bytes, &column.name)?; bytes.extend_from_slice(&0i32.to_be_bytes()); bytes.extend_from_slice(&0i16.to_be_bytes()); bytes.extend_from_slice(&descriptor.oid.to_be_bytes()); bytes.extend_from_slice(&descriptor.length.to_be_bytes()); bytes.extend_from_slice(&(-1i32).to_be_bytes()); bytes.extend_from_slice(&column.format.code().to_be_bytes()); } Ok(()) }).await
     }
+    /// Writes a data row whose column count and cells, each a length then its bytes, `body` already holds.
+    pub async fn row_body(&mut self, body: &[u8]) -> Result<()> {
+        let length = body.len().checked_add(4).and_then(|length| i32::try_from(length).ok()).ok_or_else(|| protocol("Row message too large"))?;
+        self.output.write_u8(b'D').await.map_err(network)?;
+        self.output.write_i32(length).await.map_err(network)?;
+        self.output.write_all(body).await.map_err(network)
+    }
     pub async fn row(&mut self, values: &[Option<EncodedValue>]) -> Result<()> {
         let length = values.iter().try_fold(6usize, |n, value| n.checked_add(4 + value.as_ref().map_or(0, |value| value.as_slice().len())).ok_or_else(|| protocol("Row message too large")))?;
         self.output.write_u8(b'D').await.map_err(network)?; self.output.write_i32(i32::try_from(length).map_err(|_| protocol("Row message too large"))?).await.map_err(network)?;

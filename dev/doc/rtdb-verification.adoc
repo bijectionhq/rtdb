@@ -1,0 +1,250 @@
+= RTDB kernel verification
+
+This is the first study brief for the Rust-native engine of a single database.
+The requirements are proposed for review against the existing Allium contracts.
+The link:rtdb-formal-verification-design.adoc[formal verification design] defines the full requirements, tool choices, production boundaries, and evidence gates.
+The reference state is an ordered history of committed transactions.
+A read selects a committed prefix and asks what the facts in it say at a valid-time and system-time point or range.
+Physical files, live index segments and search indexes are representations of that state.
+
+== Mechanisms
+
+* Admit a record to the replica stream using its authoritative term and sequence, and apply an admitted commit atomically.
+* Pin the applied basis and the data needed to read it, with a separate overlay for staged writes in transaction resolution.
+* Resolve ordered entity events over half-open valid-time and system-time intervals, including same-time precedence, DELETE and ERASE.
+* Publish compaction outputs and switch catalog coverage together, then reclaim objects once their retention and reference obligations allow it.
+* Treat secondary indexes as derived evidence for the scan.
+  A candidate filter may overinclude entity IDs.
+  A ranked cutoff may discard an entity only after a sound bound rules it out against fully admitted rows.
+
+Each mechanism protects a separate transition that can be weakened independently.
+SQL, protocol methods, Arrow layout and Tantivy are entry points or representations.
+Compare an index-free fold, conservative candidate selection followed by a scan, and candidate selection with ranked early termination against the same observation and traces.
+Keep sufficiency, expressiveness and independence claims relative to the agreed requirements.
+
+== Requirements and evidence
+
+[cols="1,3,2",options="header"]
+|===
+|ID |Required property |First verification target
+
+|TX-1
+|The visible state advances by whole applied commits in the admitted order.
+A stale term, rejected transaction or staged write cannot publish rows.
+A success acknowledgement is tied to the applied commit.
+|Verus on term and sequence admission.
+Model-check append, read-back, publish and acknowledgement under failover.
+
+|SNAP-1
+|A pinned basis yields one consistent view for the lifetime the engine promises.
+Replaying equivalent durable inputs from a valid checkpoint reconstructs the same state.
+|Model-check atomic publication and replay.
+Replay the same trace through the node after restart.
+
+|TIME-1
+|At each point, the resolver emits exactly the winning version of the entity or its specified absence.
+Range answers agree with this pointwise definition.
+DELETE changes the covered interval.
+ERASE follows its history-wide semantics with respect to the events in the captured basis.
+|Verus on the ceiling and rectangle decisions used by the scan and compactor, including their admission of ordered input.
+
+|COMPACT-1
+|Changing a pinned basis's physical representation preserves every supported read.
+A partially published replacement cannot hide rows or expose duplicate coverage.
+|Verus on IID path and recency pruning.
+Model-check catalog transitions for incomplete and reordered publication.
+
+|GC-1
+|A reachable reader can open each data object its basis is entitled to use.
+A shared artefact can be reclaimed only when every catalog reference that requires it has gone.
+|Model-check publication, retention, object deletion and retry.
+Exercise cache invalidation and overlapping readers in deterministic simulation.
+
+|FTS-1
+|Accelerated MATCH yields the same rows as the reference scan.
+Under one defined score corpus and SQL tie semantics, ranked pruning preserves the top K.
+Missing indexes and optional work denied by the acceleration budget permit a scan when its inputs are readable.
+|Verus on rectangle merging, temporal cut decisions and cutoff admission.
+Differentially compare accelerated and scan-only execution over the same basis.
+|===
+
+Acceptance traces include a retroactive correction with reads before and after its system timestamp, a partially overlapping delete, erase followed by reinsertion, a pinned read across compaction and collection, failover between append and acknowledgement, duplicate and stale notifications, and ranked search with two independent MATCH predicates.
+Record the expected refusals and observable answers with the trace.
+
+== Assumptions and boundaries
+
+* State the authoritative log and object-store contracts before proving publication or replay.
+  Test stale leaders, duplicates, conflicting sequence positions and interruption between object write and catalog publication.
+* State where IID partition coverage, event ordering and tie precedence are established.
+  The resolver's proof depends on these conditions and the entry-point audit must trace each producer.
+* Erased query results and physical disappearance of data are separate requirements.
+  Physical erasure needs a separate retention contract covering logs, checkpoints, caches, replicas, exports and backups.
+* Treat availability and eventual reclamation as liveness claims under explicit delivery, storage and scheduling assumptions.
+  The first study covers safety.
+
+The initial production seams are the term fence in `rust/crates/replication/src/admission.rs`, atomic partition publication in `rust/crates/index/src/partition.rs`, and the temporal resolver in `rust/crates/temporal/src/lib.rs`.
+The query scan and compaction merge both call the resolver.
+Search narrows the scan earlier and therefore owes a refinement argument of its own.
+Audit all callers and adapters before claiming that a verified decision is unavoidable.
+
+== Study 1 · Search visibility across files
+
+Question.
+Does combining adjacent visibility fragments in the production search builder preserve which points survive a write in another file?
+
+The counterexample has one entity.
+In system-time order, write `apple` over valid time [0, 10) at 10, `pear` over [0, ∞) at 20, then `apple` over [0, 10) at 30.
+Put both finite versions in one historical file and the unbounded version in a current file.
+At valid time 5, searching for `apple` must succeed at system times 15 and 35 and fail at 25.
+When the builder joins the `apple` rectangles across system time, the cut at 20 removes the later match along with the superseded one.
+
+Amendment 001.
+Keep each originating system start and merge adjacent valid-time intervals only when their entire system-time intervals agree.
+Versions with the same tokens still share one posting document.
+Long runs of successive writes may use more sidecar bytes to retain the boundaries.
+The format version identifies bundles built under the new rule.
+
+The working hypothesis is that the valid-only merge preserves both origin and pointwise membership under the declared one-event cut.
+The harness includes the exact function the production builder calls.
+The law's pointwise predicate is independent of the function's postcondition.
+The base and both negative controls must be run from the same source revision.
+
+[cols="1,3,1",options="header"]
+|===
+|Law |Statement |Evidence
+
+|RTDB-FTS-01
+|A merge refuses rectangles with different originating system starts.
+|Verified on the production merge function.
+
+|RTDB-FTS-02
+|After any one event cut allowed by the model, a point survives a successful merge exactly when it survives in either input.
+|Verified for the production merge and declared event-cut predicate.
+|===
+
+The single control removes the system-start equality check from production.
+The joint control also weakens the local contract, so the independent laws must reject it.
+The manifest records predicted failure locations.
+The Rust regression case exercises file building and candidate selection over both inputs.
+The study leaves the validity of the full `Cutter`, chronological precedence, artefact decoding and end-to-end scan equivalence as follow-on obligations.
+
+Study files live in `verification/verus/search_visibility/`.
+The baseline, both merge mutations and the Rust regression passed in the owner-authorized local run.
+See link:../../verification/README.adoc[the runner] and link:../../verification/results/2026-11-21.adoc[the evidence ledger] for tool identities and proof scope.
+
+The next bitemporal study should compare the direct pointwise reference to the scan ceiling and the search cut.
+The ranking path now verifies the full scan restriction before scoring a row, with a node regression for two independent MATCH predicates.
+The search review also identified outstanding obligations for memory refusal and scan fallback and for historical pages with within-file recency branching.
+Track counterexamples by law and amend the mechanism or the production code that owns it.
+
+== Study 2 · Ranked window bounds
+
+Question.
+Does the maximum frequency and minimum stored length in a window bound each row's binary64 score?
+
+The unrounded quotient has that property.
+With weight 1, average length 1,340,810,819 and stored length 402,653,208, frequencies 402,652,755 and 402,652,756 produce scores with bit patterns `0x40019999992e8a4d` and `0x40019999992e8a4c`, respectively.
+This refutes the unpadded extremum.
+The previous implementation added a margin after summing terms.
+
+Amendment 002.
+Use one prepared scorer for the window bounds, the candidate verifier and SQL evaluation.
+Admit ranked pruning only when each weight is zero or lies in `[2^-64, 64]`.
+For each term, score the window extrema with the same arithmetic as a row and multiply by `1 + 16 × f64::EPSILON` before accumulating.
+Both sides add in query-term order.
+
+The proof treats the computed binary64 length penalty as an input to each quotient.
+For a shared positive corpus average, that penalty increases monotonically with stored length.
+Without an average, the stored length is a `u32`, so multiplying it by 0.75 is exact and dividing by the same positive length yields 0.75.
+The zero-length branch then gives the same normalization of 1.
+A positive corpus average is between `2^-64` and `2^64` from its nonzero `u64` counters.
+The penalty is within `[1/4, 2^98]`.
+With the admitted weight, positive `u32` frequency and fixed numerator scale between 2 and 3, the two numerator products, the denominator addition, the quotient and the padding multiplication all have exact results in the normal binary64 range.
+
+The SMT model uses unit roundoff `ε = 2^-53`.
+It checks that each rounded quotient lies between `1 − 8ε` and `1 + 8ε` times its idealized value, and that the padding covers the gap even if its own multiplication rounds down.
+It also checks the exact-rational extremum inequality and preservation of order under rounding and addition.
+The Lean frontier law checks that a row supported by a pending score or an unexpanded window prevents cutoff if it can tie the threshold.
+Its premise requires that every qualifying row on an unseen IID has such support.
+Production search and scan replay exercise that premise over concrete inputs.
+
+== Study 3 · Checkpoint publication and recovery
+
+Question.
+Can an interruption between object publication and its reply change the committed rows recovered by a restart?
+
+The production checkpoint writer persists L0 data, trie metadata and per-table block metadata before writing the root block catalog.
+Recovery selects a root from the provider listing and opens its referenced table blocks.
+The replica tail supplies subsequent admitted records.
+An interruption before the root is written leaves log replay responsible for the committed prefix.
+An interruption after its durable write may leave a usable checkpoint even before the writer receives a reply or announces the block on the replica log.
+
+The finite model separates durable writes from the receipts the writer sees.
+It starts with one admitted log prefix and allows listing to omit the new root.
+An early root can name missing children.
+Deleting a dependency after its durable write has the same effect.
+Trimming the log after a successful root put can strand recovery if listing omits that root.
+These counterexamples identify what the publisher, provider and retention authority each must guarantee.
+
+The local replay interrupts the real node on both sides of the root put, reopens the same storage, and checks the full system-time history.
+A production mutation moves the root ahead of its table blocks and the after-put recovery trace must fail while opening the checkpoint.
+The manifest case also reopens a closed multi-transaction history and checks that a wrong manifest digest is refused.
+The local provider observations and bounded model apply to a single root without concurrent reclamation.
+Remote listing, provider failover and coordinated retention require separate evidence.
+
+=== Provider contracts
+
+The S3 adapter uses conditional creation and conditional multipart completion.
+AWS documents strong read and list consistency for completed operations in the same region.
+The checkpoint protocol composes those single-object operations, and recovery still needs a retained log suffix after the root it selects.
+See link:https://docs.aws.amazon.com/AmazonS3/latest/userguide/Welcome.html#ConsistencyModel[the S3 consistency model] and link:https://docs.aws.amazon.com/AmazonS3/latest/API/API_PutObject.html[conditional PutObject].
+
+The Kafka adapter forces `acks=all` and reads committed records.
+It warns about observed low minimum ISR and unclean election settings.
+Recovery also depends on the broker retaining the required log records and on survival of the acknowledged in-sync state through failover.
+See link:https://kafka.apache.org/44/configuration/topic-configs/[Kafka topic configuration] and link:https://kafka.apache.org/40/design/design/[Kafka's replication design].
+
+The Azure checkpoint path uploads a staged blob and conditionally copies it to its immutable name.
+The pinned `object_store` Azure client returns success from `copy_request` on a successful HTTP response without interpreting `x-ms-copy-status`.
+The protocol allows a successful acceptance response with status `pending`.
+An offline HTTP fixture sent that response to the real adapter and observed a successful file publication and staging deletion before a completed destination existed.
+Accepting the response as proof of a durable child also violates the checkpoint model.
+See link:https://learn.microsoft.com/en-us/rest/api/storageservices/copy-blob[Azure Copy Blob response semantics].
+
+Amendment 003.
+The Azure transport now completes the copy request only after the provider reports success for that copy.
+A pending reply requires a copy identifier, and each authenticated status check must report the same identifier.
+The wait uses the Azure client's default retry duration.
+A transport or status ambiguity returns an unavailable error and keeps the private staging blob.
+A normal metadata read reports a pending destination as unavailable, so a retry can check the immutable bytes after the provider finishes.
+The provider still owns the terminal outcome.
+When it fails or cannot establish that outcome, retrying or cleaning a failed destination and finding abandoned staging blobs require separate recovery evidence.
+
+== Study 4 · A ceiling at one valid coordinate
+
+Question.
+Does the temporal ceiling produce exactly the same values as the history query at every point?
+
+Project the admitted history onto one valid coordinate and IID, retaining writes and deletes that affect it and truncating older events at an erase.
+The remaining events retain nonincreasing system time and their input order at a tie.
+Each event replaces the system upper edge for the next event at that coordinate.
+Only puts emit a value, and their system intervals have an exclusive upper edge.
+
+The Lean model proves that this fold returns precisely the point evaluator's answer for every such history.
+It also proves that dropping ordinary events at or beyond the requested system upper bound preserves answers inside the range.
+The proof treats erase separately from that optimization.
+Reordering three concrete inputs reopens the ceiling after an emission and can emit twice.
+Controls remove the ceiling update and make its upper edge inclusive.
+
+The native replay compares the same fixture with the ordinary resolver, its memory-admitted version and the unbounded visibility rectangles.
+The Lean result is for a projected ceiling at one coordinate.
+The Rust ceiling stores a strictly ordered vector of valid-time boundaries and one system-time ceiling for each adjacent pair.
+Verus proves that the executable split and overwrite preserve this representation, update exactly the requested span, and retain each ceiling outside it.
+The same proof area checks binary search, the cell window, and clipping, including empty windows at the sentinels.
+The scan uses the checked intersection and fragment admission to select overlaps on both axes and preserves point membership with either valid-time clipping mode.
+The system-time interval is returned in full.
+Controls exercise copying the wrong ceiling or stale suffix, skipping a write, including an upper-endpoint cell, widening a clip, and admitting a disjoint system interval.
+
+The proof uses the standard Verus contracts for Rust vectors and slices.
+The native replay supplies evidence for allocation, setup and handoff in the resolver, including the lazy initial ceiling and reused buffers.
+The remaining end-to-end obligation is to connect that stateful event and allocation shell to the point model for arbitrary histories.

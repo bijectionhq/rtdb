@@ -1086,7 +1086,7 @@ async fn stage_cell_storage(
             return Err(cell_move_conflict(from, to, &staged.name));
         }
         record.storage_regions.insert(region, if local {
-            StorageRegion::Local { archive: None }
+            StorageRegion::Local { archive: None, tracks_ordered_index_pages: true }
         } else {
             crate::store::remote_storage_region(None, hosted_task.clone())
         });

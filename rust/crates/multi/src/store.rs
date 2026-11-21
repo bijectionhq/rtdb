@@ -17,7 +17,7 @@ use parking_lot::Mutex;
 use prost_types::Any;
 use rtdb_directory::{Cas, DeploymentRecord, Directory, Lifecycle, MemberId, MemberPool, MemberRole, MemberState, HostedTask, StoragePublication, StorageRegion, now_ms};
 use rtdb_node::RemoteStorageFactory;
-use rtdb_storage::{Error, IoRegion, ObjectKey, ObjectStore, object_store::StoredObject, remote::PublicationJournal};
+use rtdb_storage::{Error, IoRegion, ObjectKey, ObjectStore, object_store::{IndexPageLifecycle, StoredObject}, remote::PublicationJournal};
 use rtdb_types::{Anomaly, Result};
 use serde::{Deserialize, Serialize};
 use tokio::sync::oneshot;
@@ -27,10 +27,19 @@ use uuid::Uuid;
 use crate::cipher::{Cipher, SEALED_OVERHEAD as OVERHEAD};
 use crate::deployment::CellStorage;
 use crate::keys::KeyService;
+use crate::ordered_index_storage::{self, HostedIndexPages};
 
 /// The protobuf type name the cell's storage factory is registered under.
 pub const CELL_STORAGE_TYPE: &str = "rtdb.multi.CellStorage";
 pub const GARBAGE_DIRECTORY: &str = "~garbage";
+const ORDERED_INDEX_RELEASE: &str = "-ordered-index";
+
+pub(crate) fn belongs_to_ordered_index(name: &str) -> bool {
+    rtdb_format::keys::is_ordered_index_object(name)
+        || name.strip_prefix(GARBAGE_DIRECTORY)
+            .is_some_and(|record| record.starts_with('/') && record.ends_with(ORDERED_INDEX_RELEASE))
+}
+
 const SEALED_OVERHEAD: u64 = OVERHEAD as u64;
 
 /// The deployment store a node opens, carried in its `DatabaseConfig`.
@@ -172,7 +181,7 @@ impl RemoteStorageFactory for CellStoreFactory {
     async fn open(&self, configuration: &Any, storage_root: &ObjectKey, io: Arc<IoRegion>) -> Result<Arc<dyn ObjectStore>> {
         let config: CellStoreConfig = serde_json::from_slice(&configuration.value)
             .map_err(|error| Anomaly::incorrect("rtdb.multi/storage-config", format!("Cell storage configuration is malformed: {error}")))?;
-        let (record, region, release) = self.admit_region(&config, io).await?;
+        let (record, region, owner, release) = self.admit_region(&config, io).await?;
         let recovery = if storage_root.as_str() == crate::archive::checkpoint_storage_root()? {
             crate::archive::ArchivedCheckpoint::load(&record, self.keys.as_ref(), region.clone()).await?
         } else {
@@ -205,7 +214,12 @@ impl RemoteStorageFactory for CellStoreFactory {
             _release: Some(release),
         });
         check_root(root.as_ref(), &config.deployment, config.writer_epoch.is_some()).await?;
-        Ok(open_cell_store(bucket, &store, root, &record, wall_clock(), recovery).await?)
+        let pages = HostedIndexPages::new(
+            self.directory.clone(), config.deployment, store.clone(), owner, config.writer_epoch, self.storage_regions.clone(),
+        );
+        let mut opened = open_cell_store(bucket, &store, root, &record, wall_clock(), recovery).await?;
+        Arc::get_mut(&mut opened).expect("the new store has one owner").index_pages = Some(pages);
+        Ok(opened)
     }
 
     fn cache_identity<'a>(&self, configuration: &'a Any) -> Result<std::borrow::Cow<'a, [u8]>> {
@@ -247,7 +261,7 @@ impl CellStoreFactory {
         &self,
         config: &CellStoreConfig,
         parent: Arc<IoRegion>,
-    ) -> Result<(DeploymentRecord, Arc<IoRegion>, oneshot::Sender<()>)> {
+    ) -> Result<(DeploymentRecord, Arc<IoRegion>, Uuid, oneshot::Sender<()>)> {
         let directory = self.directory.clone();
         let keys = self.keys.clone();
         let config = config.clone();
@@ -289,9 +303,9 @@ impl CellStoreFactory {
                     .filter(|repair| repair.completed_at_ms.is_some())
                     .map(|repair| repair.operation);
                 record.storage_regions.insert(id, if local {
-                    StorageRegion::Local { archive: repair }
+                    StorageRegion::Local { archive: repair, tracks_ordered_index_pages: true }
                 } else {
-                    StorageRegion::Remote { archive: None, repair_archive: repair, owner: hosted_task.clone(),
+                    StorageRegion::Remote { tracks_ordered_index_pages: true, archive: None, repair_archive: repair, owner: hosted_task.clone(),
                         closed: false, publications: BTreeMap::new() }
                 });
                 Ok(())
@@ -327,12 +341,12 @@ impl CellStoreFactory {
             "rtdb.multi/storage-admission",
             "The serving storage region could not be admitted",
         ))??;
-        Ok((record, region, release))
+        Ok((record, region, id, release))
     }
 }
 
 pub(crate) fn remote_storage_region(archive: Option<Uuid>, owner: Option<HostedTask>) -> StorageRegion {
-    StorageRegion::Remote { archive, repair_archive: None, owner, closed: false, publications: BTreeMap::new() }
+    StorageRegion::Remote { tracks_ordered_index_pages: true, archive, repair_archive: None, owner, closed: false, publications: BTreeMap::new() }
 }
 
 pub(crate) fn track_publications(
@@ -413,6 +427,9 @@ impl PublicationJournal for DirectoryPublications {
                 crate::archive::require_capture_open(record, *capture)?;
             }
             require_publication_key(record, *archive, key)?;
+            if matches!(self.owner, PublicationOwner::Serving) && archive.is_none() {
+                ordered_index_storage::require_page_publication(record, self.region, key)?;
+            }
             let Some(StorageRegion::Remote { publications, .. }) = record.storage_regions.get_mut(&self.region) else {
                 unreachable!("the publication region was just checked");
             };
@@ -494,9 +511,14 @@ pub(crate) async fn reconcile_storage_regions(
     }
     for (&region, state) in &record.storage_regions {
         match state {
-            StorageRegion::Local { .. } if matches!(storage, CellStorage::Local { .. }) && keys.local_storage_region_drained(region)? => {
+            StorageRegion::Local { .. } | StorageRegion::ReplicaReplay { custody: rtdb_directory::ReplayCustody::Local, .. }
+                if matches!(storage, CellStorage::Local { .. }) && keys.local_storage_region_drained(region)? => {
                 release_region(directory, &record.id, region, false).await?;
                 keys.forget_local_storage_region(region)?;
+            }
+            StorageRegion::ReplicaReplay { custody: rtdb_directory::ReplayCustody::Hosted { owner: Some(owner) }, .. }
+                if directory.hosted_task_stopped(owner).await? => {
+                release_region(directory, &record.id, region, false).await?;
             }
             StorageRegion::Remote { archive, owner, publications, closed, .. } => {
                 if !*closed {
@@ -717,9 +739,13 @@ fn plain(object: StoredObject) -> StoredObject { StoredObject { size: object.siz
 
 #[async_trait]
 impl ObjectStore for EncryptingStore {
+    fn index_page_lifecycle(&self) -> Option<&dyn IndexPageLifecycle> { self.inner.index_page_lifecycle() }
     async fn head(&self, key: &ObjectKey) -> rtdb_storage::Result<StoredObject> { self.inner.head(key).await.map(plain) }
     async fn head_fresh(&self, key: &ObjectKey) -> rtdb_storage::Result<StoredObject> { self.inner.head_fresh(key).await.map(plain) }
     async fn get(&self, key: &ObjectKey) -> rtdb_storage::Result<Bytes> { self.open(key, self.inner.get(key).await?) }
+    async fn get_fresh(&self, key: &ObjectKey) -> rtdb_storage::Result<Bytes> {
+        self.open(key, self.inner.get_fresh(key).await?)
+    }
     async fn get_range(&self, key: &ObjectKey, range: Range<u64>) -> rtdb_storage::Result<Bytes> {
         let plaintext = self.get(key).await?;
         let length = plaintext.len() as u64;
@@ -728,7 +754,7 @@ impl ObjectStore for EncryptingStore {
     }
     async fn put(&self, key: &ObjectKey, bytes: Bytes) -> rtdb_storage::Result<()> {
         // An immutable put retried with identical content is a completed retry; sealing twice gives different bytes, so the retry is recognised before sealing.
-        if let Ok(existing) = self.get(key).await { return if existing == bytes { Ok(()) } else { Err(Error::Task(format!("{key} already exists with different content"))) }; }
+        if let Ok(existing) = self.get_fresh(key).await { return if existing == bytes { Ok(()) } else { Err(Error::Task(format!("{key} already exists with different content"))) }; }
         self.inner.put(key, self.seal(key, &bytes)?).await
     }
     async fn put_file(&self, key: &ObjectKey, source: &Path) -> rtdb_storage::Result<()> {
@@ -739,6 +765,7 @@ impl ObjectStore for EncryptingStore {
         Ok(self.inner.list(directory).await?.into_iter().map(plain).collect())
     }
     async fn delete(&self, key: &ObjectKey) -> rtdb_storage::Result<()> { self.inner.delete(key).await }
+    async fn forget(&self, key: &ObjectKey) -> rtdb_storage::Result<()> { self.inner.forget(key).await }
 }
 
 /// A garbage record: an object released by its deployment, which the reaper may erase once `released_at_ms` is older than its grace period.
@@ -748,6 +775,7 @@ pub struct GarbageRecord { pub key: String, pub released_at_ms: i64 }
 /// Only a listing needs to know what has been released, so the released set is read on the first one, not on open.
 pub struct GarbageStore {
     inner: Arc<dyn ObjectStore>,
+    index_pages: Option<HostedIndexPages>,
     loaded_releases: tokio::sync::OnceCell<()>,
     released: Mutex<BTreeSet<ObjectKey>>,
     clock: Clock,
@@ -756,7 +784,7 @@ pub struct GarbageStore {
 impl GarbageStore {
     pub async fn open(inner: Arc<dyn ObjectStore>) -> Result<Arc<Self>> { Self::open_with_clock(inner, wall_clock()).await }
 
-    pub async fn open_with_clock(inner: Arc<dyn ObjectStore>, clock: Clock) -> Result<Arc<Self>> { Ok(Arc::new(Self { inner, loaded_releases: tokio::sync::OnceCell::new(), released: Mutex::new(BTreeSet::new()), clock })) }
+    pub async fn open_with_clock(inner: Arc<dyn ObjectStore>, clock: Clock) -> Result<Arc<Self>> { Ok(Arc::new(Self { inner, index_pages: None, loaded_releases: tokio::sync::OnceCell::new(), released: Mutex::new(BTreeSet::new()), clock })) }
 
     async fn load_releases(&self) -> rtdb_storage::Result<()> {
         self.loaded_releases.get_or_try_init(|| async {
@@ -775,6 +803,9 @@ impl GarbageStore {
 
 #[async_trait]
 impl ObjectStore for GarbageStore {
+    fn index_page_lifecycle(&self) -> Option<&dyn IndexPageLifecycle> {
+        self.index_pages.as_ref().map(|pages| pages as &dyn IndexPageLifecycle)
+    }
     async fn head(&self, key: &ObjectKey) -> rtdb_storage::Result<StoredObject> { self.inner.head(key).await }
     async fn head_fresh(&self, key: &ObjectKey) -> rtdb_storage::Result<StoredObject> { self.inner.head_fresh(key).await }
     async fn get(&self, key: &ObjectKey) -> rtdb_storage::Result<Bytes> { self.inner.get(key).await }
@@ -790,7 +821,8 @@ impl ObjectStore for GarbageStore {
     async fn delete(&self, key: &ObjectKey) -> rtdb_storage::Result<()> {
         if self.released.lock().contains(key) { return Ok(()); }
         let record = GarbageRecord { key: key.as_str().to_owned(), released_at_ms: (self.clock)() };
-        let name = ObjectKey::new(format!("{GARBAGE_DIRECTORY}/{:020}-{}", record.released_at_ms, uuid::Uuid::new_v4().simple()))
+        let suffix = if rtdb_format::keys::is_ordered_index_object(key.as_str()) { ORDERED_INDEX_RELEASE } else { "" };
+        let name = ObjectKey::new(format!("{GARBAGE_DIRECTORY}/{:020}-{}{suffix}", record.released_at_ms, uuid::Uuid::new_v4().simple()))
             .map_err(|error| Error::Task(error.to_string()))?;
         self.inner.put(&name, Bytes::from(serde_json::to_vec(&record).expect("a record serializes"))).await?;
         self.released.lock().insert(key.clone());
@@ -926,13 +958,34 @@ pub async fn run_reaper(
                 if let Ok(deployments) = directory.deployments().await {
                     if let Some(keys) = keys.as_deref() {
                         for record in &deployments {
-                            if !record.storage_regions.values().any(|region| matches!(region, StorageRegion::Remote { .. })) {
+                            if record.ordered_indexes.is_empty() && record.ordered_index_catalogs.is_empty()
+                                && !record.storage_regions.values().any(|region| matches!(region, StorageRegion::Remote { .. } | StorageRegion::ReplicaReplay { .. }))
+                            {
                                 continue;
                             }
                             if cancellation.is_cancelled() { return; }
                             if let Err(error) = reconcile_storage_regions(directory.as_ref(), &storage, keys, record).await {
                                 eprintln!("Storage publications for {} are pending: {}", record.id, error.code);
                             }
+                        }
+                    }
+                    for record in &deployments {
+                        if !matches!(record.lifecycle, Lifecycle::Live | Lifecycle::Quarantined)
+                            || (record.ordered_indexes.is_empty() && record.ordered_index_catalogs.is_empty())
+                        {
+                            continue;
+                        }
+                        // Read again after process-death reconciliation confirmed its I/O drained.
+                        let Some(Ok(Some(current))) = cancellation.run_until_cancelled(directory.deployment(&record.id)).await else {
+                            if cancellation.is_cancelled() { return; }
+                            continue;
+                        };
+                        match cancellation.run_until_cancelled(
+                            ordered_index_storage::reap(directory.as_ref(), &storage, bucket.as_ref(), &current)
+                        ).await {
+                            None => return,
+                            Some(Ok(())) => {}
+                            Some(Err(error)) => eprintln!("Ordered index pages for {} are retained: {}", record.id, error.code),
                         }
                     }
                     let now = wall_clock()();
@@ -1329,7 +1382,7 @@ mod tests {
             compactor: false,
             snapshot_block: None,
         };
-        let (admitted, region, attachment) = factory.admit_region(&config, IoRegion::new()).await.unwrap();
+        let (admitted, region, _, attachment) = factory.admit_region(&config, IoRegion::new()).await.unwrap();
         assert_eq!(admitted.storage_regions.len(), 1);
 
         let (entered, active) = oneshot::channel();
@@ -1377,6 +1430,7 @@ mod tests {
         journal.admit(&object, attempt, "upload").await.unwrap();
         let before = directory.deployment(&record.id).await.unwrap().unwrap();
         assert_eq!(before.storage_regions[&region], StorageRegion::Remote {
+            tracks_ordered_index_pages: true,
             archive: None, repair_archive: None, owner: None, closed: false, publications: BTreeMap::from([(attempt, StoragePublication { key: object.to_string(), upload_id: "upload".to_owned() })]),
         });
         release_region(directory.as_ref(), &record.id, region, false).await.unwrap();
@@ -1384,8 +1438,77 @@ mod tests {
         assert!(journal.admit(&object, Uuid::new_v4(), "upload").await.is_err());
         let retained = directory.deployment(&record.id).await.unwrap().unwrap();
         assert_eq!(retained.storage_regions[&region], StorageRegion::Remote {
+            tracks_ordered_index_pages: true,
             archive: None, repair_archive: None, owner: None, closed: true, publications: BTreeMap::from([(attempt, StoragePublication { key: object.to_string(), upload_id: "upload".to_owned() })]),
         });
+    }
+
+    #[tokio::test]
+    async fn ordered_index_reaper_aborts_a_superseded_provider_upload() {
+        use rtdb_directory::OrderedIndexStorage;
+        use rtdb_storage::remote::PublicationUploads;
+
+        let Ok(endpoint) = std::env::var("RTDB_S3_ENDPOINT") else { return };
+        if !endpoint.starts_with("http://127.0.0.1:") { return; }
+        let bucket_name = std::env::var("RTDB_S3_BUCKET").expect("a versioned fixture bucket");
+        let mut config = rtdb_s3::S3Config::new(&bucket_name);
+        config.endpoint = Some(endpoint);
+        config.region = Some("us-east-1".into());
+        config.path_style_access_enabled = true;
+        config.prefix = Some(format!("ordered-index-upload-{}", Uuid::new_v4()));
+        let root = CellStorage::s3_root(&config).unwrap();
+        let inventory = CellStorage::s3_inventory(&config).await.unwrap();
+        let storage = CellStorage::S3 { config };
+        let bucket = storage.bucket(IoRegion::new()).await.unwrap();
+
+        let directory = rtdb_directory::MemoryDirectory::new();
+        let region = Uuid::new_v4();
+        let attempt = Uuid::new_v4();
+        let mut record = DeploymentRecord::new("shop", "acme", Vec::new(), 0);
+        record.epoch = 1;
+        record.storage_regions.insert(region, remote_storage_region(None, None));
+        let index = format!(
+            "{}/v06/{}/0000000000000001-{}", record.storage_prefix(),
+            rtdb_format::keys::ORDERED_INDEX_ROOT, "a".repeat(64),
+        );
+        record.ordered_indexes.insert(index.clone(), OrderedIndexStorage {
+            generations: BTreeMap::from([(0, BTreeMap::from([(Uuid::new_v4(), region)]))]),
+            ..Default::default()
+        });
+        let record = directory.create_deployment(record).await.unwrap();
+        let old = key(&format!("{index}/generations/0000000000000000"));
+        let replacement = key(&format!("{index}/generations/0000000000000002"));
+        let object = key(&format!("{old}/pages/pending"));
+        let upload_path = format!("{root}/{object}").into();
+        let upload = inventory.reserve(&upload_path, attempt).await.unwrap();
+        let journal = DirectoryPublications {
+            directory: directory.clone(), deployment: record.id.clone(), region,
+            writer_epoch: Some(record.epoch), owner: PublicationOwner::Serving,
+        };
+        journal.admit(&object, attempt, &upload).await.unwrap();
+        bucket.put(&key(&format!("{old}/pages/visible")), Bytes::from_static(b"old")).await.unwrap();
+        bucket.put(&key(&format!("{replacement}/pages/visible")), Bytes::from_static(b"replacement")).await.unwrap();
+
+        let closed = crate::admin::update_installation(directory.as_ref(), &record.id, |current| {
+            current.epoch = 2;
+            current.ordered_indexes.get_mut(&index).unwrap().retire_earlier(2);
+            Ok(())
+        }).await.unwrap();
+        assert!(journal.admit(&object, Uuid::new_v4(), &upload).await.is_err());
+        ordered_index_storage::reap(directory.as_ref(), &storage, bucket.as_ref(), &closed).await.unwrap();
+        assert!(!inventory.is_empty(&old).await.unwrap());
+
+        release_region(directory.as_ref(), &record.id, region, false).await.unwrap();
+        let drained = directory.deployment(&record.id).await.unwrap().unwrap();
+        ordered_index_storage::reap(directory.as_ref(), &storage, bucket.as_ref(), &drained).await.unwrap();
+        assert!(inventory.complete(&upload_path, &upload, Bytes::from_static(b"late")).await.is_err());
+        assert!(inventory.is_empty(&old).await.unwrap());
+        assert!(!inventory.is_empty(&replacement).await.unwrap());
+        let reaped = directory.deployment(&record.id).await.unwrap().unwrap();
+        assert!(!reaped.ordered_indexes[&index].generations.contains_key(&0));
+        assert!(matches!(&reaped.storage_regions[&region], StorageRegion::Remote { publications, .. }
+            if !publications.contains_key(&attempt)));
+        inventory.purge(&replacement).await.unwrap();
     }
 
     #[tokio::test]
@@ -1399,7 +1522,7 @@ mod tests {
         let mut record = DeploymentRecord::new("shop", "acme", vec![], 0);
         let bucket = storage.bucket(IoRegion::new()).await.unwrap();
         record.storage_namespaces = Some(crate::deployment::storage_namespaces(bucket.as_ref(), &keys).await.unwrap());
-        record.storage_regions.insert(region, StorageRegion::Local { archive: None });
+        record.storage_regions.insert(region, StorageRegion::Local { archive: None, tracks_ordered_index_pages: true });
         let record = directory.create_deployment(record).await.unwrap();
         crate::admin::begin_disposal(directory.as_ref(), &record.id).await.unwrap();
 
@@ -1411,6 +1534,32 @@ mod tests {
             .await.unwrap();
         assert_eq!(receipt.deployment, record.id);
         assert!(!keys.local_storage_region_drained(region).unwrap(), "the consumed witness is removed");
+    }
+
+    #[tokio::test]
+    async fn the_local_reaper_leaves_other_recovery_holds_in_place() {
+        let files = tempfile::tempdir().unwrap();
+        let keys = crate::keys::LocalKeyService::new(files.path().join("keys")).unwrap();
+        let storage = CellStorage::Local { root: files.path().join("objects") };
+        let directory = rtdb_directory::MemoryDirectory::new();
+        let mut record = DeploymentRecord::new("shop", "acme", vec![], 0);
+        let stopped = Uuid::new_v4();
+        let running = Uuid::new_v4();
+        let stopped_witness = keys.hold_local_storage_region(stopped).unwrap().unwrap();
+        let running_witness = keys.hold_local_storage_region(running).unwrap().unwrap();
+        for id in [stopped, running] {
+            record.storage_regions.insert(id, StorageRegion::ReplicaReplay { first_required: 5, custody: rtdb_directory::ReplayCustody::Local });
+        }
+        let record = directory.create_deployment(record).await.unwrap();
+        drop(stopped_witness);
+        reconcile_storage_regions(directory.as_ref(), &storage, &keys, &record).await.unwrap();
+        let current = directory.deployment(&record.id).await.unwrap().unwrap();
+        assert_eq!(current.storage_regions.len(), 1);
+        assert!(current.storage_regions.contains_key(&running));
+        assert!(!keys.local_storage_region_drained(stopped).unwrap());
+        drop(running_witness);
+        reconcile_storage_regions(directory.as_ref(), &storage, &keys, &current).await.unwrap();
+        assert!(directory.deployment(&record.id).await.unwrap().unwrap().storage_regions.is_empty());
     }
 
     #[tokio::test]

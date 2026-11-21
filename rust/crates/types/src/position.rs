@@ -16,16 +16,26 @@ position!(SourcePosition: i64, ReplicaPosition: i64, TxId: i64, BlockIndex: i64,
     Term: i64, TermSequence: i64, StorageEpoch: i32, StorageVersion: i32);
 
 const OFFSET_LIMIT: i64 = 1_i64 << 48;
-const EPOCH_LIMIT: i32 = 1_i32 << 16;
+const EPOCH_LIMIT: i32 = 1_i32 << 15;
+
+fn is_encodable_log_epoch(epoch: i32) -> bool { (0..EPOCH_LIMIT).contains(&epoch) }
 
 fn encode_message_id(epoch: StorageEpoch, offset: i64) -> Result<i64> {
-    if epoch.0 >= EPOCH_LIMIT {
-        return Err(Anomaly::incorrect("xtdb/invalid-log-epoch", "Epoch exceeds the 16-bit encoding limit"));
+    if !is_encodable_log_epoch(epoch.0) {
+        return Err(Anomaly::incorrect("xtdb/invalid-log-epoch", "Log epoch must be in 0..=32767"));
     }
     if offset >= OFFSET_LIMIT {
         return Err(Anomaly::incorrect("xtdb/invalid-log-offset", "Offset exceeds the 48-bit encoding limit"));
     }
     Ok((i64::from(epoch.0) << 48).wrapping_add(offset))
+}
+
+#[allow(unexpected_cfgs)]
+#[cfg(kani)]
+#[kani::proof]
+fn encoder_admits_exactly_the_representable_log_epochs() {
+    let epoch: i32 = kani::any();
+    assert_eq!(is_encodable_log_epoch(epoch), i16::try_from(epoch).is_ok_and(|value| value >= 0));
 }
 
 macro_rules! message_position {

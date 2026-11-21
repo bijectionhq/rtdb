@@ -216,12 +216,16 @@ fn trie_block(name: &str) -> Option<i64> {
 /// Forks the deployment at `parent` (a prefix in the cell's bucket) into `child`, referencing every object the parent's stores hold or reference, or, from a past block, those it may need.
 /// A past block's packs are the ones its own pack names, its releases those before it was written, and its trie files those of blocks up to it; every other object is referenced too, since sealing makes anything the fork writes again the same bytes.
 /// A trie file of a later block is the parent's history after the fork point, under a name the fork's own compaction writes with its own rows.
+/// Derived ordered-index pages, manifests, and releases stay with their original source.
 pub async fn fork(bucket: &dyn ObjectStore, parent: &str, child: &str, at_block: Option<i64>) -> Result<()> {
     let past = match at_block { Some(block) => Some((block, block_packs(bucket, parent, block).await?, written_at_ms(bucket, parent, block).await?)), None => None };
-    let wanted = |name: &str| match &past {
-        None => true,
-        Some((_, packs, _)) if name.starts_with(&format!("{}/", crate::packing::PACK_DIRECTORY)) => packs.contains(name),
-        Some((block, _, written)) => trie_block(name).is_none_or(|trie| trie <= *block) && crate::store::garbage_released_at(name).is_none_or(|released| released <= *written),
+    let wanted = |name: &str| {
+        if crate::store::belongs_to_ordered_index(name) { return false; }
+        match &past {
+            None => true,
+            Some((_, packs, _)) if name.starts_with(&format!("{}/", crate::packing::PACK_DIRECTORY)) => packs.contains(name),
+            Some((block, _, written)) => trie_block(name).is_none_or(|trie| trie <= *block) && crate::store::garbage_released_at(name).is_none_or(|released| released <= *written),
+        }
     };
     for store in stores(bucket, parent).await? {
         let version = store.rsplit('/').next().expect("a store has a version").to_owned();
@@ -337,18 +341,21 @@ async fn stage_object(bucket: &dyn ObjectStore, key: &ObjectKey, bytes: Bytes) -
     }
 }
 
-/// Copies a deployment's stores from `from` in one cell's bucket to `to` in another's, resolving every reference into an object of its own.
+/// Copies a deployment's stores from `from` in one cell's bucket to `to` in another's, resolving retained references into objects of its own.
+/// The destination builds its own ordered index from its authoritative tries.
 pub async fn materialize(from_bucket: &dyn ObjectStore, from: &str, to_bucket: &dyn ObjectStore, to: &str) -> Result<()> {
     for store in stores(from_bucket, from).await? {
         let version = store.rsplit('/').next().expect("a store has a version").to_owned();
         let target = format!("{to}/{version}");
         let base = Base::load(from_bucket, &store).await?;
         for name in physical_objects(from_bucket, &store).await? {
+            if crate::store::belongs_to_ordered_index(&name) { continue; }
             let source = key(&format!("{store}/{name}"))?;
             let destination = key(&format!("{target}/{name}"))?;
             stage_object(to_bucket, &destination, from_bucket.get(&source).await?).await?;
         }
         for (name, owner) in base.objects {
+            if crate::store::belongs_to_ordered_index(&name) { continue; }
             let destination = key(&format!("{target}/{name}"))?;
             let own = key(&format!("{store}/{name}"))?;
             let bytes = match from_bucket.get(&own).await {
@@ -505,6 +512,24 @@ mod tests {
         there.delete(&key("target/v06/blocks/b00").unwrap()).await.unwrap();
         materialize(here.as_ref(), "source", there.as_ref(), "target").await.unwrap();
         materialize(here.as_ref(), "source", there.as_ref(), "target").await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn derived_ordered_indexes_stay_with_their_original_store() {
+        let (here, there) = (bucket(), bucket());
+        let prefix = rtdb_format::keys::ORDERED_INDEX_ROOT;
+        let page = format!("{prefix}/idx/pages/block/hash");
+        let manifest = format!("{prefix}/idx/manifests/block");
+        let release = "~garbage/00000000000000001000-debt-ordered-index";
+        put(&here, "source/v06/blocks/b00", b"catalog").await;
+        for name in [page.as_str(), manifest.as_str(), release] {
+            put(&here, &format!("source/v06/{name}"), b"only the original store owns these bytes").await;
+        }
+        fork(here.as_ref(), "source", "child", None).await.unwrap();
+        let base = Base::load(here.as_ref(), "child/v06").await.unwrap();
+        assert_eq!(base.objects.into_keys().collect::<Vec<_>>(), ["blocks/b00"]);
+        materialize(here.as_ref(), "source", there.as_ref(), "target").await.unwrap();
+        assert_eq!(physical_objects(there.as_ref(), "target/v06").await.unwrap(), ["blocks/b00"]);
     }
 
     #[tokio::test]

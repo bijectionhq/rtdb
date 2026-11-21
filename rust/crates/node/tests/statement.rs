@@ -193,11 +193,12 @@ async fn sorted_and_unsorted_limits_open_their_inputs_before_resolving_bounds() 
         ("SELECT 1 / 0 LIMIT $1", "xtdb/expected-number"),
         ("SELECT v FROM (VALUES (1)) t(v) ORDER BY v LIMIT $1", "xtdb/expected-number"),
     ] {
+        let before = context.memory.used_bytes();
         let statement = PreparedSql::prepare(sql, &context, PrepareOptions::default(), ResultSignaturePolicy::Dynamic).unwrap();
-        let retained_plan = context.memory.used_bytes();
         let error = statement.open_query(Arc::clone(&context), vec![Value::Utf8("1".into())]).await.err().unwrap();
         assert_eq!(error.code, code, "{sql}");
-        assert_eq!(context.memory.used_bytes(), retained_plan, "{sql}");
+        drop(statement);
+        assert_eq!(context.memory.used_bytes(), before, "{sql}: a failed open leaves nothing beyond the statement, which keeps its plan");
     }
     assert_eq!(context.memory.used_bytes(), 0);
 }
@@ -563,7 +564,7 @@ fn query_rebinding_admits_syntax_in_the_reached_budget_through_plan_admission() 
     let schema = statement.result_schema(&reached, &[]).unwrap();
     assert_eq!(schema.schema().fields()[0].name, "value");
     assert_eq!(probe.used_bytes(), schema_bytes);
-    assert_eq!(origin.used_bytes(), origin_retained);
+    assert!(origin.used_bytes() > origin_retained, "the statement keeps the plan it bound, charged to its own budget");
     drop(schema);
     drop((statement, dml));
     assert_eq!(probe.used_bytes(), 0);
@@ -732,7 +733,7 @@ fn postgres_validates_the_complete_syntax_input_before_retaining_dml_source() {
 fn statements_outside_the_reference_grammar_are_sql_errors_while_session_control_stays_on_the_session_api() {
     let memory = MemoryBudget::new(1 << 26);
     let context = context(None, &memory);
-    for sql in ["CREATE VIEW v AS SELECT 1", "DROP TABLE foo", "CREATE INDEX i ON foo (a)", "TRUNCATE foo", "ALTER TABLE foo ADD COLUMN x INT"] {
+    for sql in ["CREATE VIEW v AS SELECT 1", "DROP TABLE foo", "CREATE UNIQUE INDEX i ON foo (a)", "TRUNCATE foo", "ALTER TABLE foo ADD COLUMN x INT"] {
         let error = PreparedSql::prepare(sql, &context, PrepareOptions::default(), ResultSignaturePolicy::Dynamic).err().unwrap();
         assert_eq!((error.code.as_str(), error.category), ("xtdb/sql-error", rtdb_types::AnomalyCategory::Incorrect), "{sql}");
         let error = PreparedSql::prepare_postgres(sql, &context, vec!["public".into()], &[]).err().unwrap();
@@ -908,4 +909,115 @@ async fn a_mixed_width_id_column_filters_and_reads_as_the_row_path_does() {
     let ordered = run("SELECT _id, v FROM mixed ORDER BY v LIMIT 1000").await;
     let rows = run("SELECT _id, v FROM mixed ORDER BY v").await;
     assert_eq!(ordered, rows);
+}
+
+#[tokio::test]
+async fn a_column_written_at_several_widths_across_transactions_reads_and_filters_as_written() {
+    let memory = MemoryBudget::new(1 << 28);
+    let state = PartitionState::empty(rtdb_trie::TrieConfig::new(32, 32).unwrap()).unwrap();
+    let mut written = Vec::new();
+    for tx in 0..4i64 {
+        let mut buffer = TransactionBuffer::new(state.value().snapshot(), TransactionKey { tx_id: TxId(tx + 1), system_time: Timestamp(tx + 1) }, Arc::clone(&memory)).unwrap();
+        for n in (tx * 150)..(tx * 150 + 150) {
+            let id = match (tx, n % 3) { (0, _) | (3, 0) => Value::I16(n as i16), (1, _) | (3, 1) => Value::I32(40_000 + n as i32), _ => Value::I64(n) };
+            let w = if tx % 2 == 0 { Value::I64(n) } else { Value::Utf8(format!("w{n}")) };
+            buffer.put(TableRef::new("public", "widths"), StructFields::from([("_id".into(), id.clone()), ("v".into(), Value::F64(n as f64)), ("w".into(), w.clone())]), Interval::from_micros(0, i64::MAX).unwrap()).unwrap();
+            written.push(vec![id, Value::F64(n as f64), w]);
+        }
+        state.apply(&buffer.stage().unwrap()).unwrap();
+    }
+    let context = context(Some(&state), &memory);
+    let run = |sql: &'static str| { let context = Arc::clone(&context); async move {
+        let statement = PreparedSql::prepare(sql, &context, PrepareOptions::default(), ResultSignaturePolicy::Dynamic).unwrap();
+        rows_of(statement.open_query(Arc::clone(&context), vec![]).await.unwrap()).await
+    } };
+    let key = |row: &Vec<Value>| match row[1] { Value::F64(v) => v as i64, _ => panic!("v is a float") };
+    let mut rows = run("SELECT _id, v, w FROM widths").await;
+    rows.sort_by_key(key);
+    written.sort_by_key(key);
+    assert_eq!(rows, written);
+    let id = |value: &Value| match value { Value::I16(id) => i64::from(*id), Value::I32(id) => i64::from(*id), Value::I64(id) => *id, _ => panic!("_id is an integer") };
+    let expected = written.iter().filter(|row| id(&row[0]) < 300).collect::<Vec<_>>();
+    let sum: f64 = expected.iter().map(|row| match row[1] { Value::F64(v) => v, _ => 0.0 }).sum();
+    assert_eq!(run("SELECT COUNT(*), SUM(v) FROM widths WHERE _id < 300").await, vec![vec![Value::I64(expected.len() as i64), Value::F64(sum)]]);
+}
+
+#[tokio::test]
+async fn a_prepared_query_replans_once_a_write_changes_the_columns_it_read() {
+    let memory = MemoryBudget::new(1 << 28);
+    let state = PartitionState::empty(rtdb_trie::TrieConfig::new(32, 32).unwrap()).unwrap();
+    let write = |tx: i64, doc: StructFields<Value>| {
+        let mut buffer = TransactionBuffer::new(state.value().snapshot(), TransactionKey { tx_id: TxId(tx), system_time: Timestamp(tx) }, Arc::clone(&memory)).unwrap();
+        buffer.put(TableRef::new("public", "docs"), doc, Interval::from_micros(0, i64::MAX).unwrap()).unwrap();
+        state.apply(&buffer.stage().unwrap()).unwrap();
+    };
+    write(1, StructFields::from([("_id".into(), Value::I64(1)), ("v".into(), Value::I64(10))]));
+    let statement = PreparedSql::prepare("SELECT * FROM docs WHERE _id > $1 ORDER BY _id", &context(Some(&state), &memory), PrepareOptions::default(), ResultSignaturePolicy::Dynamic).unwrap();
+    let run = || async { rows_of(statement.open_query(context(Some(&state), &memory), vec![Value::I64(0)]).await.unwrap()).await };
+    assert_eq!(run().await, vec![vec![Value::I64(1), Value::I64(10)]]);
+    write(2, StructFields::from([("_id".into(), Value::I64(2)), ("v".into(), Value::I64(20))]));
+    assert_eq!(run().await, vec![vec![Value::I64(1), Value::I64(10)], vec![Value::I64(2), Value::I64(20)]], "a later snapshot with the same columns reads its new rows");
+    write(3, StructFields::from([("_id".into(), Value::I64(3)), ("v".into(), Value::I64(30)), ("w".into(), Value::Utf8("new".into()))]));
+    assert_eq!(run().await, vec![
+        vec![Value::I64(1), Value::I64(10), Value::Null],
+        vec![Value::I64(2), Value::I64(20), Value::Null],
+        vec![Value::I64(3), Value::I64(30), Value::Utf8("new".into())],
+    ]);
+}
+
+#[tokio::test]
+async fn a_join_and_aggregate_over_integer_keys_of_several_widths_and_null_keys_match_the_data() {
+    let memory = MemoryBudget::new(1 << 28);
+    let state = PartitionState::empty(rtdb_trie::TrieConfig::new(32, 32).unwrap()).unwrap();
+    let regions = ["eu", "us", "apac"];
+    let mut tx = 0;
+    let mut write = |table: &str, docs: Vec<StructFields<Value>>| {
+        tx += 1;
+        let mut buffer = TransactionBuffer::new(state.value().snapshot(), TransactionKey { tx_id: TxId(tx), system_time: Timestamp(tx) }, Arc::clone(&memory)).unwrap();
+        for doc in docs { buffer.put(TableRef::new("public", table), doc, Interval::from_micros(0, i64::MAX).unwrap()).unwrap(); }
+        state.apply(&buffer.stage().unwrap()).unwrap();
+    };
+    write("customers", (0..30i64).map(|id| StructFields::from([("_id".into(), Value::I64(id)), ("region".into(), Value::Utf8(regions[(id % 3) as usize].into()))])).collect());
+    let mut expected: BTreeMap<&str, (i64, f64)> = BTreeMap::new();
+    for (batch, width) in [(0i64, 16), (1, 32), (2, 64)] {
+        let docs = (batch * 100..batch * 100 + 100).map(|order| {
+            let customer = order % 37;
+            let key = if order % 11 == 0 { Value::Null } else { match width { 16 => Value::I16(customer as i16), 32 => Value::I32(customer as i32), _ => Value::I64(customer) } };
+            if !matches!(key, Value::Null) && customer < 30 {
+                let entry = expected.entry(regions[(customer % 3) as usize]).or_default();
+                entry.0 += 1;
+                entry.1 += order as f64 / 4.0;
+            }
+            StructFields::from([("_id".into(), Value::I64(order)), ("customer_id".into(), key), ("amount".into(), Value::F64(order as f64 / 4.0))])
+        }).collect();
+        write("orders", docs);
+    }
+    let context = context(Some(&state), &memory);
+    let statement = PreparedSql::prepare("SELECT c.region, COUNT(*), SUM(o.amount) FROM orders o JOIN customers c ON o.customer_id = c._id GROUP BY c.region ORDER BY c.region", &context, PrepareOptions::default(), ResultSignaturePolicy::Dynamic).unwrap();
+    let rows = rows_of(statement.open_query(Arc::clone(&context), vec![]).await.unwrap()).await;
+    assert_eq!(rows.len(), expected.len());
+    for (row, (region, (count, sum))) in rows.iter().zip(&expected) {
+        assert_eq!(row[0], Value::Utf8((*region).into()));
+        assert_eq!(row[1], Value::I64(*count));
+        let Value::F64(actual) = row[2] else { panic!("SUM over floats is a float: {:?}", row[2]) };
+        assert!((actual - sum).abs() < 1e-9, "{region}: {actual} against {sum}");
+    }
+}
+
+#[tokio::test]
+async fn an_inner_join_whose_left_input_exceeds_the_build_limit_builds_its_right_input_and_keeps_its_columns() {
+    let memory = MemoryBudget::new(1 << 28);
+    let state = PartitionState::empty(rtdb_trie::TrieConfig::new(32, 32).unwrap()).unwrap();
+    let mut buffer = TransactionBuffer::new(state.value().snapshot(), TransactionKey { tx_id: TxId(1), system_time: Timestamp(1) }, Arc::clone(&memory)).unwrap();
+    for id in 0..30i64 { buffer.put(TableRef::new("public", "customers"), StructFields::from([("_id".into(), Value::I64(id)), ("name".into(), Value::Utf8(format!("c{id}")))]), Interval::from_micros(0, i64::MAX).unwrap()).unwrap(); }
+    for id in 0..300i64 { buffer.put(TableRef::new("public", "orders"), StructFields::from([("_id".into(), Value::I64(1000 + id)), ("customer_id".into(), Value::I64(id % 40))]), Interval::from_micros(0, i64::MAX).unwrap()).unwrap(); }
+    state.apply(&buffer.stage().unwrap()).unwrap();
+    let base = context(Some(&state), &memory);
+    let context = QueryContext::new(base.catalog.clone(), Arc::clone(&memory), Timestamp(100), "UTC", QueryOptions { join_build_rows: 50, ..Default::default() }, &CancellationToken::new()).unwrap();
+    let statement = PreparedSql::prepare("SELECT c.name, COUNT(*), SUM(o._id) FROM orders o JOIN customers c ON o.customer_id = c._id GROUP BY c.name ORDER BY c.name", &context, PrepareOptions::default(), ResultSignaturePolicy::Dynamic).unwrap();
+    let rows = rows_of(statement.open_query(Arc::clone(&context), vec![]).await.unwrap()).await;
+    let mut expected: BTreeMap<String, (i64, i64)> = BTreeMap::new();
+    for id in (0..300i64).filter(|id| id % 40 < 30) { let entry = expected.entry(format!("c{}", id % 40)).or_default(); entry.0 += 1; entry.1 += 1000 + id; }
+    let expected = expected.into_iter().map(|(name, (count, sum))| vec![Value::Utf8(name), Value::I64(count), Value::I64(sum)]).collect::<Vec<_>>();
+    assert_eq!(rows, expected);
 }

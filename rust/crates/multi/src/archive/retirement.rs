@@ -119,7 +119,7 @@ pub(crate) async fn finish_capture_retirement(
     }
     let pending = |record: &DeploymentRecord| {
         record.storage_regions.values().any(|region| {
-            matches!(region, StorageRegion::Local { archive: Some(operation) } |
+            matches!(region, StorageRegion::Local { archive: Some(operation), .. } |
             StorageRegion::Remote { archive: Some(operation), .. } |
             StorageRegion::Remote { repair_archive: Some(operation), .. } if *operation == capture)
         })

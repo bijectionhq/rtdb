@@ -1,0 +1,39 @@
+{
+  "summary": "The production replica fence rejects a displaced term and classifies exact, duplicate and missing sequence positions.",
+  "flags": ["--no-external-by-default", "--verify-module", "production", "--verify-module", "laws"],
+  "min_verified_functions": 5,
+  "controls": {
+    "ignore_sequence_gap": {
+      "defect": "A record past a missing predecessor is discarded without voiding the term.",
+      "mutate": [{
+        "file": "rust/crates/replication/src/admission_step.rs",
+        "find": "        Some(sequence) if sequence > expected => SequenceDecision::Void,\n",
+        "replace": ""
+      }],
+      "expect": [{
+        "file": "rust/crates/replication/src/admission_step.rs",
+        "function": "classify_sequence",
+        "category": "postcondition not satisfied"
+      }],
+      "min_verified_functions": 4
+    },
+    "forget_term_fence_with_weakened_contract": {
+      "defect": "Both the function and its contract permit records from a displaced leader.",
+      "mutate": [{
+        "file": "rust/crates/replication/src/admission_step.rs",
+        "find": "    observed < highest\n}",
+        "replace": "    false\n}"
+      }, {
+        "file": "rust/crates/replication/src/admission_step.rs",
+        "find": "ensures out == (observed < highest),",
+        "replace": "ensures !out,"
+      }],
+      "expect": [{
+        "file": "verification/verus/replica_admission/laws.rs",
+        "function": "a_displaced_term_is_always_fenced",
+        "category": "postcondition not satisfied"
+      }],
+      "min_verified_functions": 4
+    }
+  }
+}

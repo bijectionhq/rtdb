@@ -44,8 +44,8 @@ pub struct CompactionDriver {
     requests: mpsc::Receiver<Completion>,
 }
 
-struct Completion { reply: oneshot::Sender<Result<()>>, _permit: OwnedSemaphorePermit }
-impl Completion { fn send(self, result: Result<()>) { let _ = self.reply.send(result); } }
+pub(crate) struct Completion { pub(crate) reply: oneshot::Sender<Result<()>>, pub(crate) _permit: OwnedSemaphorePermit }
+impl Completion { pub(crate) fn send(self, result: Result<()>) { let _ = self.reply.send(result); } }
 
 type JobKey = (TableRef, TrieKey);
 
@@ -107,8 +107,19 @@ impl CompactionDriver {
                                     permit = slots.acquire_owned() => permit.map_err(|_| crate::closed())?,
                                 })
                             } else { None };
-                            if !available_jobs(snapshots.snapshot().trie_catalog())?.iter().any(|available| available == &job) { return Ok(()); }
-                            executor.execute(&job, &token).await?
+                            let worker_token = token.clone();
+                            let runtime = tokio::runtime::Handle::current();
+                            let worker = tokio::task::spawn_blocking(move || runtime.block_on(async move {
+                                if !available_jobs(snapshots.snapshot().trie_catalog())?.iter().any(|available| available == &job) {
+                                    return Ok(None);
+                                }
+                                executor.execute(&job, &worker_token).await.map(Some)
+                            }));
+                            let result = worker.await.map_err(|error| Anomaly::fault(
+                                "rtdb.maintenance/compaction-worker", format!("Compaction worker failed: {error}"),
+                            ))??;
+                            let Some(notification) = result else { return Ok(()); };
+                            notification
                         };
                         tokio::select! {
                             biased;

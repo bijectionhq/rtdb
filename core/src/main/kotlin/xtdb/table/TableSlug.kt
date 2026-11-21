@@ -29,13 +29,10 @@ data class TableSlug(val slug: String) {
         val tablesDir = "tables".asPath
 
         /**
-         * The slug a table takes when nothing has recorded one for it — whether because it is new, or
-         * because it predates the registry.
+         * The escaped name used by checkpoints that predate the registry and the default for newly allocated tables.
          *
-         * Those two cases must produce the same answer, which is why this stays the escaped name: a table
-         * already on disk has to resolve to the path it has always had. Changing it orphans every file
-         * written by a node that hasn't got the change yet, so it can only move at a release boundary at
-         * which every node reads the recorded slug instead of calling this. See #4037.
+         * A names-only checkpoint uses this exact path to locate its existing files.
+         * The catalog gives a new table a free suffix when this default is already in use.
          */
         @JvmStatic
         fun of(table: TableRef) =

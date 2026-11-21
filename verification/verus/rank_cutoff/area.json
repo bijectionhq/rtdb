@@ -1,0 +1,75 @@
+{
+  "summary": "Ranked search stops only when the kth verified score strictly exceeds both frontier bounds.",
+  "flags": ["--no-external-by-default", "--verify-module", "production", "--verify-module", "laws"],
+  "min_verified_functions": 8,
+  "controls": {
+    "allows_rank_ties": {
+      "defect": "An equal score is treated as a lower bound.",
+      "mutate": [{
+        "file": "rust/crates/search/src/rank_cutoff.rs",
+        "find": "Some(key) => key < kth,",
+        "replace": "Some(key) => key <= kth,"
+      }],
+      "expect": [{
+        "file": "rust/crates/search/src/rank_cutoff.rs",
+        "function": "strictly_below",
+        "category": "postcondition not satisfied"
+      }],
+      "min_verified_functions": 7
+    },
+    "allows_rank_ties_with_weakened_contract": {
+      "defect": "The decision and its contract both allow cutoff at an equal score.",
+      "mutate": [{
+        "file": "rust/crates/search/src/rank_cutoff.rs",
+        "find": "Some(key) => key < kth,",
+        "replace": "Some(key) => key <= kth,"
+      }, {
+        "file": "rust/crates/search/src/rank_cutoff.rs",
+        "find": "Some(key) => key < score,",
+        "replace": "Some(key) => key <= score,"
+      }],
+      "expect": [{
+        "file": "verification/verus/rank_cutoff/laws.rs",
+        "function": "pending_tie_blocks_cutoff",
+        "category": "assertion failed"
+      }, {
+        "file": "verification/verus/rank_cutoff/laws.rs",
+        "function": "unread_tie_blocks_cutoff",
+        "category": "assertion failed"
+      }],
+      "min_verified_functions": 6
+    },
+    "ignores_unread_windows": {
+      "defect": "The decision considers only the already-scored candidates.",
+      "mutate": [{
+        "file": "rust/crates/search/src/rank_cutoff.rs",
+        "find": " && strictly_below(unread, key)",
+        "replace": ""
+      }],
+      "expect": [{
+        "file": "rust/crates/search/src/rank_cutoff.rs",
+        "function": "can_stop",
+        "category": "postcondition not satisfied"
+      }],
+      "min_verified_functions": 7
+    },
+    "ignores_unread_windows_with_weakened_contract": {
+      "defect": "The decision and its contract both omit unread windows.",
+      "mutate": [{
+        "file": "rust/crates/search/src/rank_cutoff.rs",
+        "find": " && strictly_below(unread, key)",
+        "replace": ""
+      }, {
+        "file": "rust/crates/search/src/rank_cutoff.rs",
+        "find": " && bound_is_lower(unread, key)",
+        "replace": ""
+      }],
+      "expect": [{
+        "file": "verification/verus/rank_cutoff/laws.rs",
+        "function": "unread_tie_blocks_cutoff",
+        "category": "assertion failed"
+      }],
+      "min_verified_functions": 7
+    }
+  }
+}

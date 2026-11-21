@@ -1,0 +1,46 @@
+MODULE main
+
+VAR
+  stable_head : 1..2;
+  path : 0..2;
+  phase : 0..5;
+  candidate : 0..2;
+  admitted : boolean;
+
+DEFINE
+  direct := 0;
+  root_disappears := 1;
+  table_disappears := 2;
+  start := 0;
+  read_root := 1;
+  read_table := 2;
+  refresh := 3;
+  ready := 4;
+  failed := 5;
+
+ASSIGN
+  init(stable_head) := {1, 2};
+  next(stable_head) := stable_head;
+  init(path) := {direct, root_disappears, table_disappears};
+  next(path) := path;
+  init(phase) := start;
+  init(candidate) := 0;
+  init(admitted) := FALSE;
+
+  next(candidate) := case
+    phase = start & path = direct : stable_head;
+    phase = refresh               : stable_head;
+    TRUE                          : candidate;
+  esac;
+
+  next(phase) := case
+    phase = start                                                 : read_root;
+    phase = read_root & candidate < stable_head & path = root_disappears : refresh;
+    phase = read_root                                             : read_table;
+    phase = read_table & candidate < stable_head                   : refresh;
+    phase = read_table                                            : ready;
+    phase = refresh                                               : read_root;
+    TRUE                                                          : phase;
+  esac;
+
+  next(admitted) := admitted | (phase = read_table & candidate = stable_head);

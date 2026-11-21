@@ -16,6 +16,7 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
 use crate::{BlockCycle, BlockStore, FlushTimer, PartitionLogs, PendingBlock, ProgressMonitor, RecoveredPartition, ReplicaRecord, TermFence, TermPosition, Verdict};
+use crate::admission::AdmittedReplica;
 use crate::appender::{Applied, AppenderHandle, PendingWrite, ReplicaAppender, WriteBody, complete_record, join_error, now};
 use crate::blocks::{RecoveredBlockConfirmation, matches_catalog_boundary, matches_confirmation};
 use crate::logs::replica_decode_bound;
@@ -103,6 +104,18 @@ impl ReplicationHandle {
     pub fn shutdown(&self) { self.cancellation.cancel(); }
     pub async fn publish_compaction(&self, message: proto::TriesAdded, cancellation: &CancellationToken) -> Result<SourcePosition> {
         let position = self.submit_source(&SourceMessage::Protobuf(SourceBody::TriesAdded(message)), (self.clock)()).await?;
+        self.await_source(position, cancellation).await?;
+        Ok(position)
+    }
+    /// Returns once this node has applied the message; an entry the leader did not accept is recorded on no trie.
+    pub async fn publish_artefacts(&self, message: proto::ArtefactsAdded, cancellation: &CancellationToken) -> Result<SourcePosition> {
+        let position = self.submit_source(&SourceMessage::Protobuf(SourceBody::ArtefactsAdded(message)), (self.clock)()).await?;
+        self.await_source(position, cancellation).await?;
+        Ok(position)
+    }
+    /// Returns once this node has applied the removal.
+    pub async fn remove_artefacts(&self, message: proto::ArtefactsRemoved, cancellation: &CancellationToken) -> Result<SourcePosition> {
+        let position = self.submit_source(&SourceMessage::Protobuf(SourceBody::ArtefactsRemoved(message)), (self.clock)()).await?;
         self.await_source(position, cancellation).await?;
         Ok(position)
     }
@@ -239,7 +252,7 @@ async fn pending_production(production: &mut Option<Production>) -> ProductionRe
 struct LeaderState {
     term: Term, resolver: Option<TxResolver>, resolution: Option<Resolution>, production: Option<Production>, confirmed: bool,
     recovery_write: Option<Arc<PendingWrite>>,
-    held: VecDeque<ReplicaRecord>, held_bytes: usize, cycle: BlockCycle, pending: VecDeque<Arc<PendingWrite>>,
+    held: VecDeque<AdmittedReplica>, held_bytes: usize, cycle: BlockCycle, pending: VecDeque<Arc<PendingWrite>>,
     source_tail: Option<Box<dyn LogTail>>, source_poll: Option<Poll>, source_batch: VecDeque<LogRecord>, source_head: Option<ReplayHead>,
     appender: AppenderHandle, job: Option<JoinHandle<Result<()>>>, cancellation: CancellationToken,
     deferred_commands: VecDeque<Command>,
@@ -279,7 +292,7 @@ impl ReplicationDriver {
     /// Source submissions accept caller timestamps, and log providers determine the timestamps in records.
     /// Returns a handle and an idle driver after checking configuration, recovered progress, log boundaries and memory admission.
     pub fn new_with_clock(
-        config: ReplicationConfig, logs: Arc<PartitionLogs>, blocks: Arc<BlockStore>, recovered: RecoveredPartition,
+        config: ReplicationConfig, logs: Arc<PartitionLogs>, blocks: Arc<BlockStore>, mut recovered: RecoveredPartition,
         progress: Arc<ProgressMonitor>, resolve: Arc<ResolveContext>, effects: Arc<dyn DatabaseEffects>,
         cancellation: CancellationToken, clock: ReplicationClock,
     ) -> Result<(ReplicationHandle, Self)> {
@@ -302,9 +315,10 @@ impl ReplicationDriver {
         let recovered_confirmation = if config.enabled && config.may_lead {
             recovered.confirmation(logs.replica_epoch, logs.storage_version, logs.storage_epoch, logs.memory())?
         } else { None };
+        let replica_tail = recovered.take_replay_tail(&logs, read_position)?;
         let restart = if config.enabled { progress.prepare_driver_restart() } else { None };
         Ok((handle, Self { config, logs, blocks, partition: recovered.partition, progress, restart, resolve, effects, cancellation, clock, recovered_confirmation, compaction_replay_cutoff: recovered.compaction_replay_cutoff, historical_confirmations: VecDeque::new(), fence: recovered.fence,
-            read_position, pending_block: None, claim: None, claiming: None, replica_tail: None, replica_poll: None, replica_batch: VecDeque::new(), replica_head: None, leader: None, commands, status, flush_timer }))
+            read_position, pending_block: None, claim: None, claiming: None, replica_tail, replica_poll: None, replica_batch: VecDeque::new(), replica_head: None, leader: None, commands, status, flush_timer }))
     }
     pub async fn run(mut self) -> Result<()> {
         let result = self.run_inner().await;
@@ -326,7 +340,10 @@ impl ReplicationDriver {
         }
         let cancellation = self.cancellation.clone();
         if cancellation.is_cancelled() { return Ok(()); }
-        let tail = self.logs.replica_tail(self.read_position).await;
+        let tail = match self.replica_tail.take() {
+            Some(tail) => Ok(tail),
+            None => self.logs.replica_tail(self.read_position).await,
+        };
         if cancellation.is_cancelled() { return Ok(()); }
         let tail = tail?;
         let Some(history) = cancellation.run_until_cancelled(self.prove_historical_confirmations()).await else { return Ok(()); };
@@ -564,7 +581,7 @@ impl ReplicationDriver {
         self.publish_status(self.role());
         Ok(())
     }
-    async fn demote(&mut self) -> Result<VecDeque<ReplicaRecord>> {
+    async fn demote(&mut self) -> Result<VecDeque<AdmittedReplica>> {
         if let Some(mut leader) = self.leader.take() {
             leader.cancellation.cancel();
             drop(leader.compactor_reset.take());
@@ -604,19 +621,20 @@ impl ReplicationDriver {
             None => self.logs.decode_replica(raw)?,
         };
         let Some(record) = decoded else { self.read_position = position; return Ok(()); };
-        let admission = self.fence.admit(record.envelope.term, record.envelope.term_sequence)?;
+        let observed_term = record.envelope.term;
+        let (admission, record) = self.fence.admit_record(record)?;
         let wins = self.claim == Some(position) && admission.opens_term();
         if let Some(claim) = &mut self.claiming {
-            if record.envelope.term == claim.term && admission.opens_term() { claim.observed = Some(position); }
+            if observed_term == claim.term && admission.opens_term() { claim.observed = Some(position); }
         }
         if self.claim == Some(position) { self.claim = None; }
         if self.leader.as_ref().is_some_and(|leader| admission.highest_term > leader.term || admission.verdict == Verdict::Voided) {
             let held = self.demote().await?;
             for held in held { self.apply_admitted(held).await?; }
         }
-        if admission.verdict == Verdict::Apply {
+        if let Some(record) = record {
             if wins { self.try_promote().await?; }
-            let record = self.logs.resolve_oversized(record).await?;
+            let record = record.resolve_payload(&self.logs).await?;
             if !self.confirm_recovered_block(&record).await? {
                 self.apply_admitted(record).await?;
             }
@@ -683,7 +701,7 @@ impl ReplicationDriver {
         Ok(())
     }
 
-    async fn apply_admitted(&mut self, record: ReplicaRecord) -> Result<()> {
+    async fn apply_admitted(&mut self, record: AdmittedReplica) -> Result<()> {
         if matches!(&record.envelope.message, ReplicaBody::NoOp(message) if message.src_msg_id.is_none()) { return Ok(()); }
         if let Some(leader) = &mut self.leader {
             if leader.resolution.is_some() {
@@ -710,10 +728,10 @@ impl ReplicationDriver {
                 }
                 let ReplicaBody::BlockUploaded(message) = &record.envelope.message else { return Err(invalid("Matching upload changed type")); };
                 let pending = self.pending_block.as_ref().ok_or_else(|| invalid("Matching upload has no pending block"))?;
-                let (catalog, _) = self.blocks.load(pending.block_index()).await?;
+                let (catalog, table_blocks) = self.blocks.load(pending.block_index()).await?;
                 crate::blocks::validate_boundary(&catalog, &pending.prepared, &pending.boundary)?;
                 let tries = additions(&message.tries)?;
-                self.partition.adopt_block(pending.prepared.clone(), catalog, &tries, record.metadata.timestamp)?;
+                self.partition.adopt_block(pending.prepared.clone(), catalog, &table_blocks, &tries, record.metadata.timestamp)?;
                 self.progress.applied(message.latest_processed_msg_id.map(SourcePosition), None, message.external_source_token.clone())?;
                 let pending = self.pending_block.take().ok_or_else(|| invalid("Adopted block disappeared"))?;
                 let mut held = pending.into_records();
@@ -805,9 +823,30 @@ impl ReplicationDriver {
                     self.progress.applied(message.source_msg_id.map(SourcePosition), None, None)?;
                     self.complete_control(&record);
                 }
+                ReplicaBody::ArtefactsAdded(message) => {
+                    if message.storage_version == Some(self.logs.storage_version.0) && message.storage_epoch.unwrap_or_default() == self.logs.storage_epoch.0 {
+                        if let Ok(table) = legacy_table_ref(message.table_name.as_deref().unwrap_or_default()) { self.partition.add_artefacts(&table, artefact_entries(&message.entries)); }
+                    }
+                    self.progress.applied(message.source_msg_id.map(SourcePosition), None, None)?;
+                    self.complete_control(&record);
+                }
+                ReplicaBody::ArtefactsRemoved(message) => {
+                    if message.storage_version == Some(self.logs.storage_version.0) && message.storage_epoch.unwrap_or_default() == self.logs.storage_epoch.0 {
+                        if let Ok(table) = legacy_table_ref(message.table_name.as_deref().unwrap_or_default()) {
+                            let entries = artefact_entries(&message.entries);
+                            let slug = self.partition.value().table_catalog().entry(&table).map(|entry| entry.slug.clone());
+                            self.partition.remove_artefacts(&table, entries.clone());
+                            // The lane deletes the objects from the store next; this node's cached copies are its own to drop.
+                            let keys = slug.iter().flat_map(|slug| entries.iter().filter_map(move |(trie, record)| slug.recorded_artefact_key(trie, record).ok()));
+                            for key in keys.filter_map(|key| rtdb_storage::ObjectKey::new(key).ok()).collect::<BTreeSet<_>>() { let _ = self.resolve.storage.invalidate(&key).await; }
+                        }
+                    }
+                    self.progress.applied(message.source_msg_id.map(SourcePosition), None, None)?;
+                    self.complete_control(&record);
+                }
                 ReplicaBody::BlockBoundary(_) => {
                     let prepared = self.partition.prepare_block()?;
-                    self.pending_block = Some(PendingBlock::new(record.clone(), prepared, self.config.pending_block_records, self.config.pending_block_bytes)?);
+                    self.pending_block = Some(PendingBlock::new(ReplicaRecord::clone(&record), prepared, self.config.pending_block_records, self.config.pending_block_bytes)?);
                     if let Some(leader) = &mut self.leader { leader.cycle = BlockCycle::Cut; }
                     self.complete_control(&record);
                     if self.leader.is_some() { self.produce_pending()?; }
@@ -818,7 +857,10 @@ impl ReplicationDriver {
                     if self.compaction_replay_cutoff.is_none_or(|cutoff| record.metadata.position > cutoff) {
                         let table = legacy_table_ref(message.table_name.as_deref().unwrap_or_default())?;
                         let keys = message.trie_keys.iter().map(|key| key.parse()).collect::<Result<BTreeSet<_>>>()?;
+                        let cached = cached_objects(&self.partition.value(), &table, &keys);
                         self.partition.delete_tries(&BTreeMap::from([(table, keys)]));
+                        // Every node holds its own cached copies, and the leader's delete reached only the remote store.
+                        for key in cached { let _ = self.resolve.storage.invalidate(&key).await; }
                     }
                     self.complete_control(&record);
                 }
@@ -851,6 +893,8 @@ impl ReplicationDriver {
         match &record.envelope.message {
             ReplicaBody::ResolvedTx(message) => message.tx_id.unwrap_or_default() <= progress.tx_id().0,
             ReplicaBody::TriesAdded(message) => message.source_msg_id.unwrap_or_default() <= progress.source_position.0,
+            ReplicaBody::ArtefactsAdded(message) => message.source_msg_id.unwrap_or_default() <= progress.source_position.0,
+            ReplicaBody::ArtefactsRemoved(message) => message.source_msg_id.unwrap_or_default() <= progress.source_position.0,
             ReplicaBody::BlockBoundary(message) => message.block_index.unwrap_or_default() <= block,
             ReplicaBody::BlockUploaded(message) => message.block_index.unwrap_or_default() <= block,
             ReplicaBody::NoOp(message) => message.src_msg_id.is_some_and(|source| source <= progress.source_position.0),
@@ -939,7 +983,7 @@ impl ReplicationDriver {
         };
         let message = SourceMessage::decode(&payload)?;
         drop(payload);
-        let durable = self.partition.value().snapshot();
+        let durable = self.partition.snapshot();
         let leader = self.leader.as_mut().ok_or_else(term_ended)?;
         if position <= leader.resolver()?.source_position() { return Err(invalid("Source reader did not advance")); }
         let block = durable.block_index();
@@ -982,6 +1026,25 @@ impl ReplicationDriver {
             Some(SourceMessage::Protobuf(SourceBody::TriesAdded(mut message))) => {
                 message.source_msg_id = Some(position.0);
                 leader.enqueue(WriteBody::Message(ReplicaBody::TriesAdded(message)), block, None, &self.resolve.memory)?;
+                leader.resolver_mut()?.advance_source(position)?;
+                None
+            }
+            Some(SourceMessage::Protobuf(SourceBody::ArtefactsAdded(mut message))) => {
+                let rejected = accept_artefacts(&mut message, &durable, self.logs.storage_version.0, self.logs.storage_epoch.0);
+                message.source_msg_id = Some(position.0);
+                leader.enqueue(WriteBody::Message(ReplicaBody::ArtefactsAdded(message)), block, None, &self.resolve.memory)?;
+                leader.resolver_mut()?.advance_source(position)?;
+                // Readers treat a missing artefact as absent, so these deletes are best effort, and must not hold up resolution.
+                if !rejected.is_empty() {
+                    let store = Arc::clone(self.resolve.storage.object_store());
+                    tokio::spawn(async move { for key in rejected { let _ = store.delete(&key).await; } });
+                }
+                None
+            }
+            Some(SourceMessage::Protobuf(SourceBody::ArtefactsRemoved(mut message))) => {
+                if message.storage_version != Some(self.logs.storage_version.0) || message.storage_epoch.unwrap_or_default() != self.logs.storage_epoch.0 { message.entries.clear(); }
+                message.source_msg_id = Some(position.0);
+                leader.enqueue(WriteBody::Message(ReplicaBody::ArtefactsRemoved(message)), block, None, &self.resolve.memory)?;
                 leader.resolver_mut()?.advance_source(position)?;
                 None
             }
@@ -1049,7 +1112,7 @@ impl ReplicationDriver {
                     let _ = completion.send(Err(Anomaly::incorrect("xtdb/not-external-source", "External writes require an external-source database")));
                     return Ok(());
                 }
-                let durable = self.partition.value().snapshot();
+                let durable = self.partition.snapshot();
                 let mut resolver = leader.resolver.take().ok_or_else(|| invalid("External resolution has no idle resolver"))?;
                 let context = Arc::clone(&self.resolve);
                 let clock = Arc::clone(&self.clock);
@@ -1071,6 +1134,48 @@ fn additions(details: &[proto::TrieDetails]) -> Result<BTreeMap<TableRef, Vec<Ca
     }
     Ok(result)
 }
+/// Keeps the entries whose trie is live in the durable catalog under this node's storage version and epoch, and returns the object keys of refused entries to delete.
+/// Artefacts are advisory, so an entry that does not parse is dropped rather than faulting the log.
+/// An entry under another storage version or epoch is dropped without deleting: its key is computed here, under this node's storage root, and may name another builder's file.
+/// A group's object is deleted only when the catalog holds none of its members, since a member it still holds may take the same object later or be collected with it.
+fn accept_artefacts(message: &mut proto::ArtefactsAdded, durable: &rtdb_index::Snapshot, version: i32, epoch: i32) -> Vec<rtdb_storage::ObjectKey> {
+    let entries = std::mem::take(&mut message.entries);
+    let Ok(table) = legacy_table_ref(message.table_name.as_deref().unwrap_or_default()) else { return Vec::new() };
+    if message.storage_version != Some(version) || message.storage_epoch.unwrap_or_default() != epoch { return Vec::new(); }
+    let slug = durable.table_entry(&table).map(|entry| entry.slug.clone());
+    let catalog = durable.trie_catalog();
+    let mut rejected = BTreeSet::new();
+    for entry in entries {
+        let (Ok(key), Some(record)) = (entry.trie_key.as_deref().unwrap_or_default().parse::<TrieKey>(), &entry.record) else { continue };
+        if catalog.trie(&table, &key).is_some_and(|trie| trie.state == rtdb_index::TrieState::Live) { message.entries.push(entry); continue; }
+        let Ok(owner) = rtdb_format::keys::ArtefactOwner::of(&key, record) else { continue };
+        if owner.tries().iter().any(|member| member != &key && catalog.trie(&table, member).is_some()) { continue; }
+        if let Some(object) = slug.as_ref().and_then(|slug| slug.owner_artefact_key(&owner, record.kind(), record.definition_id(), record.definition_version()).ok()).and_then(|key| rtdb_storage::ObjectKey::new(key).ok()) {
+            rejected.insert(object);
+        }
+    }
+    rejected.into_iter().collect()
+}
+
+/// The objects of collected tries this node may hold copies of: data, meta, and the artefacts their entries record.
+/// A group's artefact goes only with the last member the catalog holds.
+fn cached_objects(value: &rtdb_index::PartitionValue, table: &TableRef, keys: &BTreeSet<TrieKey>) -> Vec<rtdb_storage::ObjectKey> {
+    let Some(entry) = value.table_catalog().entry(table) else { return Vec::new() };
+    let tries = value.trie_catalog();
+    let objects: BTreeSet<String> = keys.iter().flat_map(|key| {
+        let artefacts = tries.trie(table, key).into_iter().flat_map(|trie| trie.artefacts.iter())
+            .filter_map(|record| rtdb_format::keys::ArtefactOwner::of(key, record).ok().map(|owner| (owner, record)))
+            .filter(|(owner, _)| owner.tries().iter().all(|member| keys.contains(member) || tries.trie(table, member).is_none()))
+            .filter_map(|(owner, record)| entry.slug.owner_artefact_key(&owner, record.kind(), record.definition_id(), record.definition_version()).ok());
+        [entry.slug.data_key(key), entry.slug.metadata_key(key)].into_iter().chain(artefacts).collect::<Vec<_>>()
+    }).collect();
+    objects.into_iter().filter_map(|key| rtdb_storage::ObjectKey::new(key).ok()).collect()
+}
+
+fn artefact_entries(entries: &[proto::ArtefactEntry]) -> Vec<(TrieKey, proto::ArtefactRecord)> {
+    entries.iter().filter_map(|entry| Some((entry.trie_key.as_deref()?.parse().ok()?, entry.record.clone()?))).collect()
+}
+
 fn check_db_op(effects: &dyn DatabaseEffects, resolver: &TxResolver, operation: &DbOp) -> Result<()> {
     let name = match operation { DbOp::AttachDatabase(message) => message.db_name.as_deref(), DbOp::DetachDatabase(message) => message.db_name.as_deref() }.unwrap_or_default();
     match (operation, resolver.staged_db_op(name)) {

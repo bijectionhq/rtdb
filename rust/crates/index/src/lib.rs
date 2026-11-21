@@ -1,12 +1,14 @@
 mod catalog;
 mod live;
 mod partition;
+mod reader_retention;
 mod snapshot;
+mod tiered_publication;
 mod trie_catalog;
 
 pub use catalog::{TableCatalog, TableMeta, absent_type, declare_column_types, merge_column_types};
-pub use live::{BlockPages, IndexBatch, LiveIndex, LiveTable, RowSource, StagedWrite, TableWrite, TransactionBuffer};
-pub use partition::{BlockPreparation, PartitionState, PartitionValue};
+pub use live::{BlockPages, IndexBatch, LiveIndex, LiveTable, LocatedRows, RowSource, StagedWrite, TableWrite, TransactionBuffer};
+pub use partition::{BlockPreparation, PartitionState, PartitionValue, TrieCollection};
 pub use snapshot::Snapshot;
 pub use trie_catalog::{CatalogTrie, Shard, TrieCatalog, TrieState};
 pub use rtdb_format::catalog::TableEntry;

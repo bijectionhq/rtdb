@@ -3,9 +3,9 @@ use std::sync::{Arc, atomic::{AtomicU64, Ordering}};
 
 use async_trait::async_trait;
 use rtdb_columnar::MemoryBudget;
-use rtdb_format::{database::proto::{DatabaseConfig, database_config}, keys::TrieKey, log::proto::TriesAdded};
+use rtdb_format::{database::proto::{DatabaseConfig, database_config}, keys::TrieKey, log::proto::{ArtefactsAdded, ArtefactsRemoved, TriesAdded}};
 use rtdb_index::PartitionState;
-use rtdb_maintenance::{BlockCollector, CollectionObserver, CompactionDriver, CompactionExecutor, CompactionJob, CompactionHandle, CompactionPublisher, CycleDriver, CycleHandle, SegmentCompactor, SnapshotSource, TrieCollector, TrieDeletionPublisher};
+use rtdb_maintenance::{ArtefactDatabase, ArtefactDriver, ArtefactHandle, ArtefactKind, ArtefactPublisher, BlockCollector, CollectionObserver, CompactionDriver, CompactionExecutor, CompactionHandle, CompactionJob, CompactionPublisher, CycleDriver, CycleHandle, SegmentCompactor, SnapshotSource, TrieCollector, TrieDeletionPublisher};
 use rtdb_replication::{BlockStore, PartitionLogs, ProgressMonitor, ReplicationDriver, ReplicationHandle, Role, TermHandle};
 use rtdb_storage::{IoRegion, ObjectStore, cache::{BufferPool, CacheBudget}};
 use rtdb_tx::{ResolveContext, TransactionAuthorization};
@@ -14,7 +14,10 @@ use tokio::sync::{RwLock, RwLockReadGuard, RwLockWriteGuard, Semaphore, mpsc, wa
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 
+use crate::ordered_index::OrderedIndexMaintenance;
 use crate::{Clock, DatabaseCatalog, ExternalSource, ExternalSourceFactory, ExternalSources, NodeOptions, ResourceDriver, ResourceFactory, catalog::{CatalogCommand, CatalogEffects}};
+
+type OrderedIndexCycle = watch::Sender<Option<CycleHandle>>;
 
 pub struct Database {
     name: String,
@@ -28,6 +31,8 @@ pub struct Database {
     submitted_bytes: AtomicU64,
     query_cpu: Option<Arc<rtdb_query::QueryCpu>>,
     compaction: Option<CompactionHandle>,
+    artefacts: Vec<ArtefactHandle>,
+    ordered_cycle: Option<OrderedIndexCycle>,
     cancellation: CancellationToken,
     io: Arc<IoRegion>,
 }
@@ -90,6 +95,25 @@ impl Database {
         self.require_writable()?;
         self.replication.publish_compaction(notification, cancellation).await
     }
+    pub fn trie_catalog(&self) -> Arc<rtdb_index::TrieCatalog> { Arc::clone(self.partition.value().trie_catalog()) }
+    pub fn object_store(&self) -> &Arc<dyn ObjectStore> { self.storage.object_store() }
+    /// The database's latest applied state, read with no basis or system-time cap.
+    pub fn snapshot(&self) -> rtdb_index::Snapshot { self.partition.snapshot() }
+    pub fn storage(&self) -> &Arc<BufferPool> { &self.storage }
+    /// Builds every artefact the lanes can currently build, returning once each is published or with the first failure.
+    pub async fn build_artefacts(&self) -> Result<()> {
+        for lane in &self.artefacts { lane.build_all().await?; }
+        if let Some(cycle) = &self.ordered_cycle {
+            let mut installed = cycle.subscribe();
+            let wait = async {
+                let cycle = installed.wait_for(Option::is_some).await.map_err(|_| closed())?;
+                cycle.as_ref().cloned().ok_or_else(closed)
+            };
+            let order = self.cancellation.run_until_cancelled(wait).await.ok_or_else(closed)??;
+            order.await_cycle().await?;
+        }
+        Ok(())
+    }
     pub async fn flush(&self) -> Result<SourcePosition> {
         self.require_writable()?;
         self.replication.flush().await
@@ -120,6 +144,8 @@ pub(crate) struct DatabaseFactory {
     pub tracer: Option<Arc<dyn rtdb_plan::Tracer>>,
     pub external_sources: ExternalSources,
     pub compaction_relay: Option<Arc<dyn CompactionRelay>>,
+    pub artefact_kinds: Vec<Arc<dyn ArtefactKind>>,
+    pub accelerators: Arc<[Arc<dyn rtdb_query::ScanAccelerator>]>,
     pub compaction_slots: Option<Arc<Semaphore>>,
 }
 
@@ -175,7 +201,10 @@ impl DatabaseFactory {
             let partition = Arc::clone(&recovered.partition);
             let progress = ProgressMonitor::new(recovered.progress.clone());
             let resolve = Arc::new(ResolveContext { database: name.clone(), storage: Arc::clone(&storage), memory: Arc::clone(&self.memory),
-                query_options: self.options.query.clone(), cancellation: cancellation.clone(), default_tz: self.options.default_timezone.clone(), authorization: Arc::clone(&self.authorization), execution_observer: self.execution_observer.clone(), tracer: self.tracer.clone() });
+                query_options: self.options.query.clone(),
+                scan_accelerators: Arc::clone(&self.accelerators),
+                cancellation: cancellation.clone(), default_tz: self.options.default_timezone.clone(), authorization: Arc::clone(&self.authorization),
+                execution_observer: self.execution_observer.clone(), tracer: self.tracer.clone() });
             let query_cpu = catalog.is_placed().then(|| Arc::new(rtdb_query::QueryCpu::default()));
             let effects = Arc::new(CatalogEffects { catalog, commands, primary: name == "xtdb" });
             let mut replication_options = self.options.replication.clone();
@@ -184,6 +213,12 @@ impl DatabaseFactory {
             replication_options.assertion_interval = assertion_interval(configuration.log.as_ref(), replication_options.assertion_interval);
             let (replication, replica_driver) = ReplicationDriver::new(replication_options, Arc::clone(&logs), blocks, recovered, progress, resolve, effects, cancellation.clone())?;
             let snapshots: Arc<dyn SnapshotSource> = partition.clone();
+            let builders = if read_only || self.options.artefact_threads == 0 { Vec::new() } else {
+                self.artefact_kinds.iter().map(|kind| {
+                    let clock = Arc::clone(&self.clock);
+                    Ok((Arc::clone(kind), kind.builder(ArtefactDatabase { name: name.clone(), store: Arc::clone(&resources.store), storage: Arc::clone(&storage), memory: Arc::clone(&self.memory), clock: Arc::new(move || clock.now()) })?))
+                }).collect::<Result<Vec<_>>>()?
+            };
             let publisher: Option<Arc<dyn CompactionPublisher>> = match (&self.compaction_relay, read_only) {
                 _ if self.options.compaction_threads == 0 => None,
                 (_, false) => Some(Arc::new(PublishCompaction { replication: replication.clone(), cancellation: cancellation.clone() })),
@@ -191,7 +226,7 @@ impl DatabaseFactory {
                 (None, true) => None,
             };
             let (compactor, compaction) = match publisher { None => (None, None), Some(publisher) => {
-                let executor = Arc::new(TimedCompaction { executor: SegmentCompactor::new(Arc::clone(&resources.store), Arc::clone(&snapshots), Arc::clone(&self.memory), resources.storage_version, resources.storage_epoch, self.options.compaction.clone())?, observer: self.execution_observer.clone() });
+                let executor = Arc::new(TimedCompaction { executor: SegmentCompactor::new(Arc::clone(&resources.store), Arc::clone(&snapshots), Arc::clone(&self.memory), resources.storage_version, resources.storage_epoch, self.options.compaction.clone())?.with_artefacts(builders.iter().map(|(_, builder)| Arc::clone(builder)).collect()), observer: self.execution_observer.clone() });
                 let (driver, handle) = CompactionDriver::new(Arc::clone(&snapshots), executor, publisher, self.options.compaction_threads, self.options.command_capacity, !self.options.automatic_compaction)?;
                 let driver = match &self.compaction_slots {
                     Some(slots) => driver.with_job_slots(Arc::clone(slots)),
@@ -199,13 +234,26 @@ impl DatabaseFactory {
                 };
                 (Some(driver), Some(handle))
             } };
+            let mut artefact_drivers = Vec::new();
+            let mut artefacts = Vec::new();
+            for (kind, builder) in builders {
+                let publisher = Arc::new(PublishArtefacts { replication: replication.clone(), cancellation: cancellation.clone() });
+                let (driver, handle) = ArtefactDriver::new(Arc::clone(&snapshots), builder, publisher, (resources.storage_version, resources.storage_epoch), kind.name(), Arc::clone(&resources.store),
+                    self.options.artefact_threads, self.options.command_capacity, self.options.automatic_artefacts)?;
+                artefact_drivers.push(driver);
+                artefacts.push(handle);
+            }
             let source = if self.options.replication.enabled && self.options.replication.may_lead && !read_only {
                 match &configuration.external_source { Some(source) => Some(self.external_factory(source)?.open(source, &name, Arc::clone(&io)).await?), None => None }
             } else { None };
-            let supervisor = MaintenanceSupervisor { store: resources.store, snapshots, replication: replication.clone(), compaction: compaction.clone(),
-                observer: Arc::clone(&self.observer), options: self.options.clone(), source };
-            let database = Arc::new(Database { name, configuration, read_only, partition, storage, logs, replication, transaction_admission: RwLock::default(), submitted_bytes: AtomicU64::new(0), query_cpu, compaction, cancellation: cancellation.clone(), io: Arc::clone(&io) });
-            let driver = DatabaseDriver { database: Arc::clone(&database), replication: replica_driver, compactor, supervisor, logs: opened_logs.drivers, log_cancellation };
+            let ordered_worker = (!read_only && self.options.replication.enabled && self.options.replication.may_lead).then(|| Arc::new(OrderedIndexMaintenance::new(
+                name.clone(), Arc::clone(&storage), Arc::clone(&self.memory), Arc::clone(&self.clock), Arc::clone(&snapshots),
+            )));
+            let ordered_cycle = ordered_worker.as_ref().map(|_| watch::channel(None).0);
+            let supervisor = MaintenanceSupervisor { store: resources.store, partition: Arc::clone(&partition), replication: replication.clone(), compaction: compaction.clone(), artefacts: artefacts.clone(),
+                observer: Arc::clone(&self.observer), options: self.options.clone(), source, ordered_worker, ordered_cycle: ordered_cycle.clone() };
+            let database = Arc::new(Database { name, configuration, read_only, partition, storage, logs, replication, transaction_admission: RwLock::default(), submitted_bytes: AtomicU64::new(0), query_cpu, compaction, artefacts, ordered_cycle, cancellation: cancellation.clone(), io: Arc::clone(&io) });
+            let driver = DatabaseDriver { database: Arc::clone(&database), replication: replica_driver, compactor, artefacts: artefact_drivers, supervisor, logs: opened_logs.drivers, log_cancellation };
             Ok(OpenedDatabase { database, driver, secondaries })
         }.await;
         if opened.is_err() { io.close_and_wait().await; }
@@ -217,6 +265,7 @@ pub(crate) struct DatabaseDriver {
     database: Arc<Database>,
     replication: ReplicationDriver,
     compactor: Option<CompactionDriver>,
+    artefacts: Vec<ArtefactDriver>,
     supervisor: MaintenanceSupervisor,
     logs: Vec<ResourceDriver>,
     log_cancellation: CancellationToken,
@@ -229,6 +278,7 @@ impl DatabaseDriver {
         let mut tasks = JoinSet::new();
         tasks.spawn(self.replication.run());
         if let Some(compactor) = self.compactor { tasks.spawn(compactor.run(self.database.cancellation.clone())); }
+        for lane in self.artefacts { tasks.spawn(lane.run(self.database.cancellation.clone())); }
         tasks.spawn(self.supervisor.run(self.database.cancellation.clone()));
         let failure = tokio::select! {
             biased;
@@ -269,13 +319,19 @@ impl CompactionExecutor for TimedCompaction {
 impl CompactionPublisher for PublishCompaction {
     async fn publish(&self, notification: TriesAdded) -> Result<SourcePosition> { self.replication.publish_compaction(notification, &self.cancellation).await }
 }
+struct PublishArtefacts { replication: ReplicationHandle, cancellation: CancellationToken }
+#[async_trait]
+impl ArtefactPublisher for PublishArtefacts {
+    async fn publish(&self, message: ArtefactsAdded) -> Result<SourcePosition> { self.replication.publish_artefacts(message, &self.cancellation).await }
+    async fn remove(&self, message: ArtefactsRemoved) -> Result<SourcePosition> { self.replication.remove_artefacts(message, &self.cancellation).await }
+}
 struct PublishDeletions(TermHandle);
 #[async_trait]
 impl TrieDeletionPublisher for PublishDeletions {
     async fn publish(&self, table: TableRef, keys: Vec<TrieKey>) -> Result<ReplicaPosition> { self.0.publish_deletions(table, keys).await }
 }
 
-struct TermRegion { term: Term, cancellation: CancellationToken, trie: CycleHandle, blocks: CycleHandle, tasks: JoinSet<Result<()>> }
+struct TermRegion { term: Term, cancellation: CancellationToken, trie: CycleHandle, blocks: CycleHandle, ordered: Option<CycleHandle>, tasks: JoinSet<Result<()>> }
 impl TermRegion {
     async fn join(mut self) -> Result<()> {
         self.cancellation.cancel();
@@ -287,20 +343,23 @@ impl TermRegion {
 
 struct MaintenanceSupervisor {
     store: Arc<dyn ObjectStore>,
-    snapshots: Arc<dyn SnapshotSource>,
+    partition: Arc<PartitionState>,
     replication: ReplicationHandle,
     compaction: Option<CompactionHandle>,
+    artefacts: Vec<ArtefactHandle>,
     observer: Arc<dyn CollectionObserver>,
     options: NodeOptions,
     source: Option<Box<dyn ExternalSource>>,
+    ordered_worker: Option<Arc<OrderedIndexMaintenance>>,
+    ordered_cycle: Option<OrderedIndexCycle>,
 }
 
 impl MaintenanceSupervisor {
     async fn start_term(&mut self, handle: TermHandle, parent: &CancellationToken) -> Result<TermRegion> {
         let cancellation = parent.child_token();
         let publisher = Arc::new(PublishDeletions(handle.clone()));
-        let trie_collector = Arc::new(TrieCollector::new(Arc::clone(&self.store), Arc::clone(&self.snapshots), publisher, Arc::clone(&self.observer), self.options.garbage.clone())?);
-        let block_collector = Arc::new(BlockCollector::new(Arc::clone(&self.store), Arc::clone(&self.snapshots), Arc::clone(&self.observer), self.options.garbage.clone())?);
+        let trie_collector = Arc::new(TrieCollector::new(Arc::clone(&self.store), Arc::clone(&self.partition), publisher, Arc::clone(&self.observer), self.options.garbage.clone())?);
+        let block_collector = Arc::new(BlockCollector::new(Arc::clone(&self.store), self.partition.clone(), Arc::clone(&self.observer), self.options.garbage.clone())?);
         let (trie_driver, trie) = CycleDriver::new(trie_collector, self.options.automatic_gc, self.options.command_capacity)?;
         let (block_driver, blocks) = CycleDriver::new(block_collector, self.options.automatic_gc, self.options.command_capacity)?;
         let source = match &mut self.source {
@@ -316,7 +375,15 @@ impl MaintenanceSupervisor {
             let token = cancellation.clone();
             tasks.spawn(async move { source.run(term, after, status, token).await });
         }
-        Ok(TermRegion { term: handle.term(), cancellation, trie, blocks, tasks })
+        let ordered = if let Some(worker) = &self.ordered_worker {
+            let worker: Arc<dyn rtdb_maintenance::CycleWorker> = worker.clone();
+            let (driver, handle) = CycleDriver::new(worker, self.options.automatic_artefacts, self.options.command_capacity)?;
+            tasks.spawn(driver.run(cancellation.clone()));
+            handle.signal();
+            Some(handle)
+        } else { None };
+        if let Some(cycle) = &self.ordered_cycle { cycle.send_replace(ordered.clone()); }
+        Ok(TermRegion { term: handle.term(), cancellation, trie, blocks, ordered, tasks })
     }
     async fn run(mut self, cancellation: CancellationToken) -> Result<()> {
         let mut status = self.replication.watch_status();
@@ -327,6 +394,7 @@ impl MaintenanceSupervisor {
             let current = status.borrow_and_update().clone();
             let term = match current.role { Role::Leading(term) => Some(term), _ => None };
             if region.as_ref().map(|region| region.term) != term {
+                if let Some(cycle) = &self.ordered_cycle { cycle.send_replace(None); }
                 if let Some(previous) = region.take() { if let Err(error) = previous.join().await { if !cancellation.is_cancelled() && error.category != AnomalyCategory::Interrupted { break Err(error); } } }
                 if let Some(handle) = self.replication.term() {
                     tokio::select! {
@@ -341,7 +409,12 @@ impl MaintenanceSupervisor {
             if next != adopted {
                 adopted = next;
                 if let Some(compaction) = &self.compaction { compaction.signal_block(); }
-                if let Some(region) = &region { region.trie.signal(); region.blocks.signal(); }
+                for lane in &self.artefacts { lane.signal_block(); }
+                if let Some(region) = &region {
+                    region.trie.signal();
+                    region.blocks.signal();
+                    if let Some(ordered) = &region.ordered { ordered.signal(); }
+                }
             }
             tokio::select! {
                 biased;
@@ -350,6 +423,7 @@ impl MaintenanceSupervisor {
                 result = async { region.as_mut().expect("guarded term region").tasks.join_next().await }, if region.is_some() => break Err(component_exit(result)),
             }
         };
+        if let Some(cycle) = &self.ordered_cycle { cycle.send_replace(None); }
         if let Some(region) = region { let drained = region.join().await; if result.is_ok() && !cancellation.is_cancelled() { return drained; } }
         result
     }

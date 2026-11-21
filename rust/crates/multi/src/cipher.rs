@@ -72,4 +72,3 @@ mod tests {
         assert_ne!(cipher.seal("stream", b"payload").unwrap(), cipher.seal("stream", b"payload").unwrap());
     }
 }
-

@@ -26,4 +26,27 @@ class MsgIdUtilTest {
         assertEquals(epoch, MsgIdUtil.msgIdToEpoch(txId))
         assertEquals(offset, MsgIdUtil.msgIdToOffset(txId))
     }
+
+    @Test
+    fun maximumEpochPreservesOrderAndResume() {
+        val epoch = Short.MAX_VALUE.toInt()
+        val offset = (1L shl 48) - 1
+        val lastInPreviousEpoch = MsgIdUtil.offsetToMsgId(epoch - 1, offset)
+        val first = MsgIdUtil.offsetToMsgId(epoch, 0)
+        val last = MsgIdUtil.offsetToMsgId(epoch, offset)
+
+        assertTrue(lastInPreviousEpoch < first)
+        assertEquals(Long.MAX_VALUE, last)
+        assertEquals(epoch, MsgIdUtil.msgIdToEpoch(last))
+        assertEquals(offset, MsgIdUtil.afterMsgIdToOffset(epoch, last))
+        assertEquals(-1L, MsgIdUtil.afterMsgIdToOffset(epoch, lastInPreviousEpoch))
+    }
+
+    @Test
+    fun rejectsEpochsOutsideTheMessageIdRange() {
+        for (epoch in listOf(Int.MIN_VALUE, -1, 32768, 65535, Int.MAX_VALUE)) {
+            assertThrows(IllegalArgumentException::class.java) { MsgIdUtil.offsetToMsgId(epoch, 0) }
+            assertThrows(IllegalArgumentException::class.java) { MsgIdUtil.offsetToMsgId(epoch, -1) }
+        }
+    }
 }

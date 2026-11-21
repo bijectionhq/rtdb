@@ -1,3 +1,4 @@
+mod ordered_index;
 mod session;
 mod resources;
 mod catalog;

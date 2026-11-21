@@ -244,3 +244,25 @@ fn row_count(relation: &Relation,execution: &Execution) -> Result<i64> {
 #[cfg(test)]
 #[path = "join_empty_page_tests.rs"]
 mod empty_page_tests;
+
+/// The rows a join input holds at most: its tables' flushed block rows and live rows, or `i64::MAX` where it can't tell.
+pub(crate) fn rows_at_most(relation: &Relation,execution: &Execution) -> Result<i64> {
+    match relation.node() {
+        RelationNode::Scan(scan) => {
+            let partitions = &execution.context.catalog.database(&scan.table.name.database)?.partitions;
+            if partitions.is_empty() { return Ok(i64::MAX); }
+            let mut rows = 0i64;
+            for partition in partitions {
+                let table = &scan.table.name.table;
+                let flushed = partition.table_catalog().metadata(table).map(|meta| meta.row_count);
+                let live = partition.iter_segments(table).map(|segment| i64::from(segment.row_count())).sum::<i64>();
+                if flushed.is_none() && live == 0 { return Ok(i64::MAX); }
+                rows = rows.checked_add(flushed.unwrap_or(0)).and_then(|rows| rows.checked_add(live)).ok_or_else(size_error)?;
+            }
+            Ok(rows)
+        }
+        RelationNode::Project { input,.. } | RelationNode::Extend { input,.. } | RelationNode::Rename { input,.. } | RelationNode::Filter { input,.. } => rows_at_most(input,execution),
+        RelationNode::Values { rows } => i64::try_from(rows.len()).map_err(|_|size_error()),
+        _ => Ok(i64::MAX),
+    }
+}

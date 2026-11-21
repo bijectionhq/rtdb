@@ -5,14 +5,14 @@ mod row_heap;
 use rtdb_types::StructFields;
 use std::collections::BTreeMap;
 use std::fs::{File, OpenOptions};
-use std::io::{Seek, SeekFrom, Write};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use async_trait::async_trait;
 use arrow_schema::{DataType, SchemaRef};
 use rtdb_types::CivilDate;
 use rtdb_columnar::{MemoryBudget, MemoryReservation, OwnedBatch, from_field};
-use rtdb_format::{data::{EventBatch, StoredEvent, copy_event_batch_with_recency}, ipc::{ArrowFile, ArrowFileWriter, inspect_file_reserved}, keys::TrieKey,
+use rtdb_format::{data::{EncodedEvent, EventBatch, PageEvent, copy_encoded_batch_with_recency}, ipc::{ArrowFile, ArrowFileWriter, inspect_file_reserved}, keys::TrieKey,
     log::proto::{TriesAdded, TrieDetails}, metadata::MetadataFile};
 use rtdb_storage::{ObjectKey, ObjectStore, ReadReservation};
 use rtdb_temporal::AdmittedPolygonCalculator;
@@ -45,13 +45,35 @@ pub struct SegmentCompactor {
     version: StorageVersion,
     epoch: StorageEpoch,
     config: MergeConfig,
+    artefacts: Vec<Arc<dyn crate::ArtefactBuilder>>,
 }
 
 impl SegmentCompactor {
     pub fn new(store: Arc<dyn ObjectStore>, snapshots: Arc<dyn SnapshotSource>, memory: Arc<MemoryBudget>,
         version: StorageVersion, epoch: StorageEpoch, config: MergeConfig) -> Result<Self> {
         if config.page_size == 0 || config.temporary_byte_limit == 0 { return Err(crate::invalid("Compaction page size and temporary byte limit must be positive")); }
-        Ok(Self { store, snapshots, memory, version, epoch, config })
+        Ok(Self { store, snapshots, memory, version, epoch, config, artefacts: Vec::new() })
+    }
+
+    /// Builds the artefacts these builders' definitions want on each output trie from its data file before the trie is published, and records them with it.
+    pub fn with_artefacts(mut self, artefacts: Vec<Arc<dyn crate::ArtefactBuilder>>) -> Self { self.artefacts = artefacts; self }
+
+    /// The records of every artefact built on an output; one that fails is left to the artefact lane, which builds whatever a live trie lacks.
+    async fn artefacts_of(&self, snapshot: &Arc<rtdb_index::PartitionValue>, table: &rtdb_types::TableRef, trie: &TrieKey, data: &Path, size: u64, cancellation: &CancellationToken) -> Vec<rtdb_format::log::proto::ArtefactRecord> {
+        let mut records = Vec::new();
+        let size_signed = i64::try_from(size).unwrap_or(i64::MAX);
+        for builder in &self.artefacts {
+            let Ok(definitions) = builder.definitions(snapshot, cancellation).await else { continue };
+            for definition in definitions.into_iter().filter(|definition| &definition.table == table && crate::wants(definition, trie, size_signed, snapshot.trie_catalog().file_size_target())) {
+                // Tiered compaction publishes one bucket at a time; the lane sees the whole group once it is live.
+                if trie.part_group().is_some() && definition.group_bytes.is_some_and(|limit| size_signed <= limit) { continue; }
+                let job = crate::ArtefactJob { definition, owner: rtdb_format::keys::ArtefactOwner::Trie(trie.clone()) };
+                if let Ok(record) = builder.build(&job, crate::ArtefactSource::Local { data, size }, snapshot, cancellation).await {
+                    records.push(rtdb_format::log::proto::ArtefactRecord { scope: Some(job.scope() as i32), ..record });
+                }
+            }
+        }
+        records
     }
 }
 
@@ -69,8 +91,8 @@ struct MergeFile {
 struct OutputSchema { put: Option<StructFields<LogicalType>>, iid_encoding: Option<RunEndWidth>, recency: bool }
 
 impl OutputSchema {
-    fn batch(&self, events: &[StoredEvent]) -> Result<arrow_array::RecordBatch> {
-        copy_event_batch_with_recency(events, self.put.clone(), self.iid_encoding, self.recency)
+    fn batch(&self, events: &[PageEvent]) -> Result<arrow_array::RecordBatch> {
+        copy_encoded_batch_with_recency(events, self.put.clone(), self.iid_encoding, self.recency)
     }
     fn schema(&self) -> Result<SchemaRef> { Ok(self.batch(&[])?.schema()) }
 }
@@ -79,18 +101,12 @@ fn create_file(path: &Path) -> Result<File> {
     OpenOptions::new().create_new(true).write(true).read(true).open(path).map_err(crate::invalid)
 }
 
-fn row_bytes(event: &StoredEvent) -> Result<usize> {
-    let bytes = match &event.operation {
-        rtdb_format::data::StoredOperation::Put(document) => document.iter().try_fold(0usize, |total, (key, value)| {
-            let value_bytes = value.retained_bytes()?;
-            total.checked_add(key.len()).and_then(|bytes| bytes.checked_add(96)).and_then(|bytes| bytes.checked_add(value_bytes)).ok_or_else(|| crate::invalid("Compaction row size overflow"))
-        })?,
-        _ => 0,
-    };
-    bytes.checked_add(std::mem::size_of::<StoredEvent>() + 128).ok_or_else(|| crate::invalid("Compaction row size overflow"))
+/// What encoding an event may hold at once: its document's decoded cells, and the event itself.
+fn row_bytes(event: &PageEvent) -> Result<usize> {
+    event.document_bytes()?.checked_add(std::mem::size_of::<PageEvent>() + 128).ok_or_else(|| crate::invalid("Compaction row size overflow"))
 }
 
-fn event_reservation(memory: &Arc<MemoryBudget>, events: &[StoredEvent], multiplier: usize) -> Result<Arc<MemoryReservation>> {
+fn event_reservation(memory: &Arc<MemoryBudget>, events: &[PageEvent], multiplier: usize) -> Result<Arc<MemoryReservation>> {
     let size = events.iter().try_fold(65_536usize, |size, event| size.checked_add(row_bytes(event)?).ok_or_else(|| crate::invalid("Compaction row size overflow")))?;
     memory.reserve(size.checked_mul(multiplier).ok_or_else(|| crate::invalid("Compaction allocation bound overflow"))?)
 }
@@ -116,15 +132,15 @@ fn limit_writer(writer: &mut ArrowFileWriter, directory: &Path, limit: u64) -> R
     writer.set_byte_limit(allowance)
 }
 
-async fn download(store: &dyn ObjectStore, memory: &Arc<MemoryBudget>, key: &ObjectKey, path: &Path, cancellation: &CancellationToken) -> Result<File> {
-    let object = store.head(key).await.map_err(crate::invalid)?;
+pub async fn download(store: &dyn ObjectStore, memory: &Arc<MemoryBudget>, key: &ObjectKey, path: &Path, cancellation: &CancellationToken) -> Result<File> {
+    let object = store.head(key).await?;
     let mut file = create_file(path)?;
     let mut position = 0;
     while position < object.size {
         if cancellation.is_cancelled() { return Err(crate::closed()); }
         let count = usize::try_from((object.size - position).min(1024 * 1024)).map_err(crate::invalid)?;
         let reservation = ReadReservation::new(count, memory.reserve(count)?);
-        let bytes = store.get_reserved_range(key, position..position + count as u64, reservation).await.map_err(crate::invalid)?;
+        let bytes = store.get_reserved_range(key, position..position + count as u64, reservation).await?;
         file.write_all(bytes.as_slice()).map_err(crate::invalid)?;
         position += count as u64;
     }
@@ -132,14 +148,17 @@ async fn download(store: &dyn ObjectStore, memory: &Arc<MemoryBudget>, key: &Obj
     Ok(file)
 }
 
-fn open_input(mut file: File, memory: &Arc<MemoryBudget>) -> Result<(ArrowFile, Arc<MemoryReservation>)> {
+pub fn open_input(
+    mut file: impl Read + Seek + Send + 'static,
+    memory: &Arc<MemoryBudget>,
+) -> Result<(ArrowFile, Arc<MemoryReservation>)> {
     let layout = inspect_file_reserved(&mut file, |bytes| memory.reserve(bytes))?;
     let reservation = memory.reserve(layout.opening_allocation_bound()?)?;
     let reader = ArrowFile::from_inspected_reader(file, None, layout)?;
     Ok((reader, reservation))
 }
 
-fn read_page(reader: &mut ArrowFile, index: usize, memory: &Arc<MemoryBudget>) -> Result<OwnedBatch> {
+pub fn read_page(reader: &mut ArrowFile, index: usize, memory: &Arc<MemoryBudget>) -> Result<OwnedBatch> {
     let bound = reader.page_allocation_bound(index)?;
     let reservation = memory.reserve(bound)?;
     OwnedBatch::with_reservation(reader.read_page(index)?, reservation)
@@ -170,7 +189,7 @@ fn merged_put_schema(inputs: &[InputSegment]) -> Result<Option<StructFields<Logi
     Ok(Some(fields))
 }
 
-fn resolve_same_time(events: &[StoredEvent], memory: &Arc<MemoryBudget>) -> Result<(Vec<StoredEvent>, Vec<Arc<MemoryReservation>>)> {
+fn resolve_same_time(events: &[PageEvent], memory: &Arc<MemoryBudget>) -> Result<(Vec<PageEvent>, Vec<Arc<MemoryReservation>>)> {
     let mut result = Vec::new();
     let mut charges = Vec::new();
     let mut calculator = AdmittedPolygonCalculator::new(None, Arc::clone(memory));
@@ -254,8 +273,7 @@ impl CompactionExecutor for SegmentCompactor {
                 let input = &mut inputs[page.segment];
                 let batch = read_page(&mut input.reader, page.page, &self.memory)?;
                 let _decoded = self.memory.reserve(decoded_bound(batch.batch())?)?;
-                let events = EventBatch::new(batch.batch().clone())?;
-                let mut events = (0..events.len()).map(|row| events.read_event(row)).collect::<Result<Vec<_>>>()?;
+                let mut events = EventBatch::new(batch.batch().clone())?.page_events()?;
                 if input.key.level() == 0 {
                     let (resolved, reservations) = resolve_same_time(&events, &self.memory)?;
                     events = resolved;
@@ -268,7 +286,7 @@ impl CompactionExecutor for SegmentCompactor {
             }
             let mut heap = planner::RowHeap::new(&rows)?;
             let mut calculator = AdmittedPolygonCalculator::new(None, Arc::clone(&self.memory));
-            let mut buckets: BTreeMap<usize, Vec<StoredEvent>> = BTreeMap::new();
+            let mut buckets: BTreeMap<usize, Vec<PageEvent>> = BTreeMap::new();
             let mut bucket_charges = Vec::new();
             while let Some((stream, row)) = heap.next() {
                 let event = &rows[stream][row];
@@ -313,7 +331,8 @@ impl CompactionExecutor for SegmentCompactor {
             let metadata_key = ObjectKey::new(entry.slug.metadata_key(&key)).map_err(crate::invalid)?;
             self.store.put_file(&metadata_key, &meta_path).await.map_err(|error| rtdb_types::Anomaly::from(error)
                 .with_context("key", metadata_key.to_string().into()).with_context("operation", "put_file".into()))?;
-            tries.push(TrieDetails { table_name: Some(entry.table.schema_and_table()), trie_key: Some(key.to_string()), data_file_size: Some(i64::try_from(size).map_err(crate::invalid)?), trie_metadata: Some(metadata), ..Default::default() });
+            let artefacts = self.artefacts_of(&snapshot, &job.table, &key, &data_path, size, cancellation).await;
+            tries.push(TrieDetails { table_name: Some(entry.table.schema_and_table()), trie_key: Some(key.to_string()), data_file_size: Some(i64::try_from(size).map_err(crate::invalid)?), trie_metadata: Some(metadata), artefacts, ..Default::default() });
         }
         Ok(TriesAdded { storage_version: Some(self.version.0), storage_epoch: Some(self.epoch.0), tries, ..Default::default() })
     }
@@ -326,7 +345,7 @@ impl MergeFile {
         let writer = ArrowFileWriter::new_bounded_reserved(create_file(&path)?, schema.schema()?.as_ref(), disk_remaining(directory, config.temporary_byte_limit)?, memory)?;
         Ok(Self { path, part: part.to_vec(), recency, carries_recency, writer: Some(writer), leaves: Vec::new() })
     }
-    fn write(&mut self, events: &[StoredEvent], path: Vec<u8>, put: &Option<StructFields<LogicalType>>, config: &MergeConfig) -> Result<()> {
+    fn write(&mut self, events: &[PageEvent], path: Vec<u8>, put: &Option<StructFields<LogicalType>>, config: &MergeConfig) -> Result<()> {
         if events.is_empty() { return Ok(()); }
         let schema = OutputSchema { put: put.clone(), iid_encoding: (config.run_end_encoded_iids && self.recency.is_some()).then_some(RunEndWidth::I32), recency: self.carries_recency };
         let writer = self.writer.as_mut().ok_or_else(|| crate::invalid("Merge file already ended"))?;
@@ -347,7 +366,10 @@ impl MergeFile {
 mod tests {
     use super::*;
     use rtdb_format::data::StoredOperation;
+    use rtdb_format::data::{StoredEvent, build_event_batch};
     use rtdb_types::Iid;
+
+    fn page(events: &[StoredEvent]) -> Vec<PageEvent> { EventBatch::new(build_event_batch(events, None, None).unwrap()).unwrap().page_events().unwrap() }
 
     #[test]
     fn row_heap_matches_flatten_and_sort_without_losing_occurrences() {
@@ -369,13 +391,13 @@ mod tests {
 
         let mut pages = vec![Vec::new()];
         for (index, event) in events.iter().enumerate() {
-            pages.push(vec![event.clone()]);
+            pages.push(page(std::slice::from_ref(event)));
             for later in &events[index..] {
-                pages.push(vec![event.clone(), later.clone()]);
+                pages.push(page(&[event.clone(), later.clone()]));
             }
         }
 
-        let key = |event: &StoredEvent| (event.iid, Reverse(event.system_from));
+        let key = |event: &PageEvent| (event.iid, Reverse(event.system_from));
         for count in 0..=4 {
             for mut choice in 0..pages.len().pow(count) {
                 let streams: Vec<_> = (0..count).map(|_| {
@@ -401,21 +423,75 @@ mod tests {
         }
 
         for [later, earlier] in [[&events[1], &events[0]], [&events[2], &events[0]]] {
-            let unsorted = [vec![later.clone(), earlier.clone()]];
+            let unsorted = [page(&[later.clone(), earlier.clone()])];
             let error = planner::RowHeap::new(&unsorted).err().unwrap();
             assert_eq!(error.message.as_deref(), Some("Compaction page is not IID ascending and system-time descending"));
         }
     }
 
     #[test]
+    fn same_time_compaction_preserves_the_winning_put_or_delete_at_each_valid_time() {
+        use rtdb_types::{ScalarType, Value};
+
+        let intervals = [(0, 1), (0, 2), (0, 3), (1, 1), (1, 2), (1, 3), (2, 3)];
+        let choices = intervals.len() * 2;
+        let ordinal_type = LogicalType::Scalar(ScalarType::I64);
+        let fields = StructFields::from([("ordinal".into(), ordinal_type.clone())]);
+        let contains = |span: Interval, time: i64| span.lower().0 <= time && time < span.upper().0;
+        let memory = MemoryBudget::new(1 << 20);
+
+        for count in 0..=3 {
+            for mut choice in 0..choices.pow(count) {
+                let commands: Vec<_> = (0..count).map(|ordinal| {
+                    let selected = choice % choices;
+                    choice /= choices;
+                    let (lower, upper) = intervals[selected / 2];
+                    let operation = if selected % 2 == 0 {
+                        StoredOperation::Put(StructFields::from([("ordinal".into(), Value::I64(i64::from(ordinal)))]))
+                    } else { StoredOperation::Delete };
+                    StoredEvent {
+                        iid: Iid([1; 16]),
+                        system_from: Timestamp(100),
+                        valid_time: Interval::from_micros(lower, upper).unwrap(),
+                        operation,
+                        recency: None,
+                    }
+                }).collect();
+                let input = build_event_batch(&commands, Some(fields.clone()), None).unwrap();
+                let input = EventBatch::new(input).unwrap().page_events().unwrap();
+                let (resolved, charges) = resolve_same_time(&input, &memory).unwrap();
+
+                for instant in -1..=4 {
+                    let expected = commands.iter().find(|row| contains(row.valid_time, instant)).map(|row| match &row.operation {
+                        StoredOperation::Put(document) => Some(document.get("ordinal").unwrap().clone()),
+                        StoredOperation::Delete => None,
+                        StoredOperation::Erase => unreachable!(),
+                    });
+                    let mut covering = resolved.iter().filter(|row| contains(row.valid_time, instant));
+                    let observed = covering.next().map(|row| match row.op {
+                        EventOp::Put => Some(row.put_cell("ordinal", &ordinal_type).unwrap().into_owned()),
+                        EventOp::Delete => None,
+                        EventOp::Erase => unreachable!(),
+                    });
+                    assert!(covering.next().is_none(), "resolved same-time fragments overlap at {instant}");
+                    assert_eq!(observed, expected, "same-time resolution changed the winning command at {instant}");
+                }
+
+                drop((resolved, charges));
+                assert_eq!(memory.used_bytes(), 0);
+            }
+        }
+    }
+
+    #[test]
     fn same_time_compaction_resolves_a_lone_event_with_only_its_output_row() {
-        let input = [StoredEvent {
+        let input = page(&[StoredEvent {
             iid: Iid([1; 16]),
             system_from: Timestamp(100),
             valid_time: Interval::from_micros(10, 20).unwrap(),
             operation: StoredOperation::Delete,
             recency: None,
-        }];
+        }]);
         let output = row_bytes(&input[0]).unwrap() * 2;
         let memory = MemoryBudget::new(output - 1);
         let error = resolve_same_time(&input, &memory).err().unwrap();
@@ -440,7 +516,7 @@ mod tests {
             operation: StoredOperation::Delete,
             recency: None,
         };
-        let input = [event(10, 20), event(30, 40)];
+        let input = page(&[event(10, 20), event(30, 40)]);
         let ceiling = 7 * std::mem::size_of::<Timestamp>() + 256;
         let output = row_bytes(&input[0]).unwrap() * 2;
         let limit = output + ceiling - 1;

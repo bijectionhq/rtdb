@@ -1,0 +1,136 @@
+{
+  "summary": "A posting's window scans the assigned document IDs and combines conservative impact bounds.",
+  "flags": [
+    "--no-external-by-default",
+    "--verify-module",
+    "production",
+    "--verify-module",
+    "laws"
+  ],
+  "min_verified_functions": 6,
+  "controls": {
+    "assign_to_next_window": {
+      "defect": "The posting is summarized in the next window.",
+      "mutate": [
+        {
+          "file": "rust/crates/search/src/rank_windows.rs",
+          "find": "    doc / WINDOW\n",
+          "replace": "    doc / WINDOW + 1\n"
+        }
+      ],
+      "expect": [
+        {
+          "file": "rust/crates/search/src/rank_windows.rs",
+          "function": "window_of",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 5
+    },
+    "assign_to_next_window_with_weakened_contract": {
+      "defect": "The assignment and its contract both shift the posting to the next window.",
+      "mutate": [
+        {
+          "file": "rust/crates/search/src/rank_windows.rs",
+          "find": "    doc / WINDOW\n",
+          "replace": "    doc / WINDOW + 1\n"
+        },
+        {
+          "file": "rust/crates/search/src/rank_windows.rs",
+          "find": "out as int == (doc as int) / 128,",
+          "replace": "out as int == (doc as int) / 128 + 1,"
+        }
+      ],
+      "expect": [
+        {
+          "file": "verification/verus/search_windows/laws.rs",
+          "function": "exactly_the_assigned_window_reads_the_document",
+          "category": "assertion failed"
+        }
+      ],
+      "min_verified_functions": 5
+    },
+    "empty_scan_range": {
+      "defect": "The scan stops at the start of the same window.",
+      "mutate": [
+        {
+          "file": "rust/crates/search/src/rank_windows.rs",
+          "find": "window.saturating_add(1).saturating_mul(WINDOW),",
+          "replace": "window.saturating_mul(WINDOW),"
+        }
+      ],
+      "expect": [
+        {
+          "file": "rust/crates/search/src/rank_windows.rs",
+          "function": "document_range",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 5
+    },
+    "empty_scan_range_with_weakened_contract": {
+      "defect": "The range and its contract both set its upper endpoint to its start.",
+      "mutate": [
+        {
+          "file": "rust/crates/search/src/rank_windows.rs",
+          "find": "window.saturating_add(1).saturating_mul(WINDOW),",
+          "replace": "window.saturating_mul(WINDOW),"
+        },
+        {
+          "file": "rust/crates/search/src/rank_windows.rs",
+          "find": "(out.1 as int) == if ((window as int) + 1) * 128 <= u32::MAX as int {\n            ((window as int) + 1) * 128\n        } else {\n            u32::MAX as int\n        },",
+          "replace": "out.1 == out.0,"
+        }
+      ],
+      "expect": [
+        {
+          "file": "verification/verus/search_windows/laws.rs",
+          "function": "exactly_the_assigned_window_reads_the_document",
+          "category": "assertion failed"
+        }
+      ],
+      "min_verified_functions": 5
+    },
+    "choose_longer_length": {
+      "defect": "The combined impact keeps the longer document length.",
+      "mutate": [
+        {
+          "file": "rust/crates/search/src/rank_windows.rs",
+          "find": "old_length.min(length)",
+          "replace": "old_length.max(length)"
+        }
+      ],
+      "expect": [
+        {
+          "file": "rust/crates/search/src/rank_windows.rs",
+          "function": "extend_impact",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 5
+    },
+    "choose_longer_length_with_weakened_contract": {
+      "defect": "The implementation and its contract both keep the longer document length.",
+      "mutate": [
+        {
+          "file": "rust/crates/search/src/rank_windows.rs",
+          "find": "old_length.min(length)",
+          "replace": "old_length.max(length)"
+        },
+        {
+          "file": "rust/crates/search/src/rank_windows.rs",
+          "find": "old_length <= length",
+          "replace": "old_length >= length"
+        }
+      ],
+      "expect": [
+        {
+          "file": "verification/verus/search_windows/laws.rs",
+          "function": "impact_covers_both_postings",
+          "category": "assertion failed"
+        }
+      ],
+      "min_verified_functions": 5
+    }
+  }
+}

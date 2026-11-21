@@ -181,6 +181,17 @@ value Checkpoint {
     format_version: Integer
 }
 
+value ReplicaReplayHold {
+    id: String
+    first_required: Lsn
+    owner: MemberId
+}
+
+value CertifiedReplicaPrefix {
+    through: Lsn
+    digest: String
+}
+
 value Loglet {
     -- One epoch's segment of a deployment's log.
     epoch: Epoch
@@ -484,7 +495,7 @@ contract ObjectStorage {
 
     @invariant OnlyTheReaperDeletes
         -- No node, gateway or worker holds a credential that can delete.
-        -- The reaper deletes, and only objects the reachability rule (ReapUnreachable) has found unreachable for reaper_grace.
+        -- The reaper deletes objects after a reachability release or a completed ordered-page retirement fence.
 
     @invariant VisibilityIsByReference
         -- An object has effect only once a committed log record or a published manifest references it.
@@ -593,6 +604,8 @@ entity DeploymentRecord {
     -- Empty when the tail is sealed and flushed.
     loglets: List<Loglet>
     checkpoint: Checkpoint?
+    replica_anchor: CertifiedReplicaPrefix?
+    replica_replays: Set<ReplicaReplayHold>
     -- A holder confirms its epoch with a quorum for reads.
     linearizable_reads: Boolean
     -- How many ranks of the affinity order may serve reads.
@@ -1347,9 +1360,51 @@ rule PublishCheckpoint {
             ),
             loglets: LogletsAbove(holding.deployment.loglets, record.through_lsn)
         })
-        LogTrimmed(holding.deployment.id, through: record.through_lsn)
         holding.tail_bytes = TailBytesAbove(holding, record.through_lsn)
         holding.oldest_unflushed_at = OldestAbove(holding, record.through_lsn)
+}
+
+rule TrimCertifiedReplicaPrefix {
+    -- The checkpoint's boundary record supplies the intake position on reopen.
+    when: ReplicaPrefixCertified(holding, through, digest)
+
+    requires: through < Directory.read(holding.deployment.id).checkpoint.lsn
+    requires: not exists replay in Directory.read(holding.deployment.id).replica_replays: replay.first_required <= through
+
+    ensures:
+        Directory.cas(holding.deployment.id, holding.epoch, change: {
+            replica_anchor: CertifiedReplicaPrefix.created(through: through, digest: digest)
+        })
+        LogTrimmed(holding.deployment.id, through: through)
+}
+
+rule AdmitLatestCheckpointReplay {
+    when: LatestCheckpointReplayRequested(deployment, after: Lsn, tip: Lsn, owner)
+
+    ensures:
+        let record = Directory.read(deployment.id)
+        if record.replica_anchor != null and after < record.replica_anchor.through:
+            RefreshCheckpointDiscovery(deployment, after: after)
+        else:
+            if after < tip:
+                let replay = ReplicaReplayHold.created(id: FreshIdentity(), first_required: Successor(after), owner: owner)
+                Directory.cas(deployment.id, record.version, change: {
+                    replica_replays: record.replica_replays + {replay}
+                })
+            AdmitReplicaCursor(deployment, after: after)
+}
+
+rule ReleaseReplicaReplay {
+    -- A close fences an ambiguous registration even when its hold is absent.
+    when: ReplicaReplayReleaseRequested(deployment, replay)
+
+    requires: ReplayCaughtUpOrDrained(replay) or ReplayOwnerConfirmedStopped(replay)
+
+    ensures:
+        let record = Directory.read(deployment.id)
+        Directory.cas(deployment.id, record.version, change: {
+            replica_replays: record.replica_replays - {replay}
+        })
 }
 
 ------------------------------------------------------------
@@ -1441,6 +1496,25 @@ rule ReapUnreachable {
     ensures:
         ObjectStorage.delete_all_versions(candidate.object.key)
         candidate.deleted = true
+}
+
+rule RetireOrderedIndexPages {
+    -- An independently compacted index publishes its scrubbed replacement before closing earlier page scopes.
+    -- The captured catalog closes dropped definitions, including prefixes that only exist in provider inventories.
+    -- A new definition has its own physical name. The catalog retains the closure after its page inventory is removed.
+    -- Serving replicas register a scope before retaining any decoded page or starting provider I/O.
+    -- Each provider upload records its exact upload ID in the same directory authority that closes the scope.
+    -- Closure ends new replica registrations and upload admissions. Registered replicas stop taking
+    -- new work after seeing closure and release their permit only after their retained copies and I/O drain.
+    when: OrderedPageScopeClosed(scope)
+
+    requires:
+        EveryServingPermitReleasedOrOwnerStopped(scope)
+        and EveryAdmittedProviderUploadSettled(scope)
+
+    ensures:
+        EveryObjectVersionAndUploadRemoved(scope)
+        EmptyProviderInventoryRecorded(scope)
 }
 
 rule ScrubOrphans {
@@ -1679,7 +1753,7 @@ rule Rebalance {
     -- A reservation uses the source holding's identity and epoch from the plan.
     -- A conflicting reservation or a changed source ends the current pass.
     -- Configured byte watermarks use sampled live batch and in-memory object cache charges on active writers.
-    -- A target must fit both configured watermarks after the proposed move.
+    -- A target must fit every configured watermark after the proposed move.
     -- A busy source samples only its local active holders.
     when: NodeOverWatermark(member, dimension)
 

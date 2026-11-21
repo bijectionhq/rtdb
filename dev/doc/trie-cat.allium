@@ -6,6 +6,7 @@
 -- Tries are added by block flushes (see db.allium) and compaction (see compaction.allium).
 -- Tries are read by the scan operator for query execution.
 -- Tries are garbage-collected by gc.allium once superseded by compaction output.
+-- The native catalog retains adopted L0 identities and lengths for recovery after primary compaction supersedes them.
 --
 -- See: trie/TrieCatalog.kt, log/proto/log.proto (TrieDetails, TrieState)
 
@@ -29,6 +30,38 @@ value TrieDetails {
     trie_metadata: TrieMetadata
     trie_state: TrieState
     garbage_as_of: Instant?
+    -- Files derived from this trie's data file, or from its partition group's data files, at most one per (kind, definition id, definition version).
+    -- Empty for a trie no artefact lane has reached.
+    artefacts: List<ArtefactRecord>
+}
+
+value ArtefactRecord {
+    -- One file derived from a trie's data file, or from its partition group's, such as a search file (fts.allium).
+    -- See: log/proto/log.proto (ArtefactRecord), index/src/trie_catalog.rs
+    kind: String
+    definition_id: String
+    definition_version: Integer
+    -- Opaque to the catalog: the artefact kind owns its encoding.
+    stats: Bytes
+    -- A record without one is its trie's.
+    scope: ArtefactScope
+}
+
+-- trie: derived from its trie's data file alone, and stored under the trie's artefact prefix.
+-- part_group: derived from every member's data file of its trie's partition group, stored once under the group's artefact prefix, and recorded alike on each member's entry.
+enum ArtefactScope { trie | part_group }
+
+value PartGroup {
+    -- The branch_factor sibling outputs of tiered compaction at one block (rule InsertTrie_General): the same level, recency and parent part, one per bucket.
+    -- Only tiered tries belong to one: current tries at level 2 and up, and historical tries at level 3 and up.
+    -- The members become live together and are each superseded on their own, so a group-scoped artefact serves whichever members are live.
+    -- See: format/src/keys.rs (PartGroup)
+    level: Long
+    recency: LocalDate?
+    parent_part: Bytes
+    block_index: Long
+
+    -- Serialised as the members' key with `g` for `l` and the members' own bucket dropped, e.g. g02-rc-b05 for l02-rc-p0-b05 to l02-rc-p3-b05.
 }
 
 value TrieMetadata {
@@ -132,6 +165,18 @@ entity TrieCatalog {
     -- refresh: rebuild the entire catalog from block metadata in the object store.
     --   Used by read-only followers after a new block appears.
     -- deleteTries(tries): remove garbage entries from the catalog after file deletion.
+    -- withArtefacts(table, entries): record artefacts on their tries' entries (rule AddArtefact).
+    -- withoutArtefacts(table, entries): remove artefact records from their tries' entries (rule RemoveArtefact).
+    -- holds(table, trie_key): whether any shard of the table holds the trie, as live, nascent or garbage.
+    -- is_live(table, trie_key): whether the table holds the trie in a live shard list.
+    -- artefacts(table, trie_key): the artefact records on the trie's entry.
+    -- artefact_prefix(table, trie_key): tables/<slug>/artefacts/<trie_key>, under which every artefact of the trie lives.
+    -- artefact_key(table, trie_key, kind, definition_id, definition_version): <prefix>/<kind>/<definition_id>-v<definition_version>.bin.
+    --   A function of its arguments alone, so every builder of one job writes to one key.
+    -- group_members(table, group): the entries the catalog holds for the group's members, live, nascent or garbage; a member it does not hold is left out.
+    -- group_has_obsolete_member(table, trie_key): the trie's partition group has an original member that is garbage or absent from the catalog.
+    -- group_artefact_prefix(table, group): tables/<slug>/artefacts/<group>, under which every artefact of the group lives.
+    -- recorded_artefact_key(table, trie_key, record): artefact_key under the trie's prefix for a trie-scoped record, and under its group's prefix for a group-scoped one.
     tries: Map<TableRef, Map<Shard, ShardState>>
 }
 
@@ -374,6 +419,40 @@ rule FollowerRefreshes {
 
     ensures:
         trie_catalog.refresh(block_index)
+}
+
+------------------------------------------------------------
+-- Rules: Artefacts
+------------------------------------------------------------
+
+rule AddArtefact {
+    -- Records an artefact on its trie's entry, on applying an artefacts-added record (db.allium: LeaderAppliesOwnArtefactsAdded, HandleReplicaMessage).
+    -- A trie keeps the first record for each (kind, definition id, definition version).
+    -- A live trie can replace its group-scoped record with its own after an original member becomes obsolete.
+    -- Later group records leave the replacement in place.
+    -- The record is part of the trie's TrieDetails, so the table-block files a block upload writes carry it, and a recovery restores it.
+    when: AddArtefact(table, trie_key, record)
+    requires: trie_catalog.holds(table, trie_key)
+
+    let existing = trie_catalog.artefacts(table, trie_key).filter(r => r.kind = record.kind and r.definition_id = record.definition_id and r.definition_version = record.definition_version)
+
+    ensures:
+        if not existing.any(r => true):
+            trie_catalog.artefacts(table, trie_key) = trie_catalog.artefacts(table, trie_key) + [record]
+        if record.scope = :trie
+           and existing.any(r => r.scope = :part_group)
+           and group_has_obsolete_member(table, trie_key)
+           and trie_catalog.is_live(table, trie_key):
+            trie_catalog.artefacts(table, trie_key) = trie_catalog.artefacts(table, trie_key).filter(r => not (r.kind = record.kind and r.definition_id = record.definition_id and r.definition_version = record.definition_version)) + [record]
+}
+
+rule RemoveArtefact {
+    -- Removes an artefact's record from its trie's entry, on applying an artefacts-removed record (db.allium: LeaderAppliesOwnArtefactsRemoved, HandleReplicaMessage).
+    -- A record matches on kind, definition id and definition version; with none matching, or no such trie, nothing changes.
+    when: RemoveArtefact(table, trie_key, record)
+
+    ensures:
+        trie_catalog.artefacts(table, trie_key) = trie_catalog.artefacts(table, trie_key).filter(r => not (r.kind = record.kind and r.definition_id = record.definition_id and r.definition_version = record.definition_version))
 }
 
 ------------------------------------------------------------

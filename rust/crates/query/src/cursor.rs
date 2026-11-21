@@ -109,7 +109,24 @@ pub(crate) type BoxCursor = Box<dyn RowCursor>;
 pub struct PreparedQuery { relation: Arc<Relation>, settings: Arc<rtdb_plan::QuerySettings>, output: QueryOutput, required_parameter_count: usize, _plan_reservation: Option<Arc<MemoryReservation>> }
 #[derive(Clone)]
 enum QueryOutput { Rows, Plan(Arc<crate::explain::ExplainPlan>), Analyze(Schema) }
+
+fn uses_search_score(relation: &Relation) -> bool {
+    for expression in relation.expressions() {
+        let mut found = false;
+        expression.visit(&mut |expr| {
+            found |= matches!(expr, rtdb_plan::Expr::Call { name, .. } if name.eq_ignore_ascii_case("search_score"));
+        });
+        if found { return true; }
+    }
+    relation.children().into_iter().any(|child| uses_search_score(child))
+}
+
 impl PreparedQuery {
+    /// The same plan, its retained bytes charged to `memory` instead: a plan kept beyond one query moves its charge to its keeper.
+    pub fn recharged(&self, memory: &Arc<MemoryBudget>) -> Result<Self> {
+        let _plan_reservation = self._plan_reservation.as_ref().map(|reservation| memory.reserve(reservation.bytes())).transpose()?;
+        Ok(Self { _plan_reservation, ..self.clone() })
+    }
     pub fn new(relation: Arc<Relation>) -> Result<Self> { Self::with_settings(relation, rtdb_plan::QuerySettings::default()) }
     /// Retains a validated relation with its existing operator shape.
     /// The supplied budget holds the plan charge until the last prepared query or cursor drops.
@@ -167,23 +184,31 @@ impl PreparedQuery {
         self.execute_with_text(context, parameters, None).await
     }
     pub async fn execute_with_text(&self, context: Arc<QueryContext>, parameters: Vec<Value>, text: Option<&str>) -> Result<QueryCursor> {
-        self.open(context, parameters, text, false).await
+        self.open(context, parameters, text, Batching::Rows).await
     }
     /// Opens the query with one output batch for each page delivered by its root operator.
     pub async fn execute_pages(&self, context: Arc<QueryContext>, parameters: Vec<Value>) -> Result<QueryCursor> {
-        self.open(context, parameters, None, true).await
+        self.open(context, parameters, None, Batching::Pages).await
+    }
+    /// Opens the query with one output batch for each column batch where the whole plan runs a column at a time,
+    /// keeping each column already in the result's layout rather than copying its cells; otherwise as `execute`.
+    pub async fn execute_columns(&self, context: Arc<QueryContext>, parameters: Vec<Value>) -> Result<QueryCursor> {
+        self.open(context, parameters, None, Batching::Columns).await
     }
 
-    async fn open(&self, context: Arc<QueryContext>, parameters: Vec<Value>, text: Option<&str>, preserve_pages: bool) -> Result<QueryCursor> {
+    async fn open(&self, context: Arc<QueryContext>, parameters: Vec<Value>, text: Option<&str>, batching: Batching) -> Result<QueryCursor> {
         let counter = context.query_cpu.clone();
-        let mut plan = std::pin::pin!(self.open_plan(context, parameters, text, preserve_pages));
-        match counter {
-            Some(counter) => crate::query_cpu::measure(counter, plan.as_mut()).await,
-            None => plan.await,
-        }
+        let open = self.open_retained(context.clone(), parameters, text, batching);
+        rtdb_storage::IoRegion::retaining(context, async {
+            let mut open = std::pin::pin!(open);
+            match counter {
+                Some(counter) => crate::query_cpu::measure(counter, open.as_mut()).await,
+                None => open.await,
+            }
+        }).await
     }
 
-    async fn open_plan(&self, context: Arc<QueryContext>, mut parameters: Vec<Value>, text: Option<&str>, preserve_pages: bool) -> Result<QueryCursor> {
+    async fn open_retained(&self, context: Arc<QueryContext>, mut parameters: Vec<Value>, text: Option<&str>, batching: Batching) -> Result<QueryCursor> {
         if parameters.len() < self.required_parameter_count { return Err(invalid("missing-parameter", "Query has fewer parameters than its prepared plan")); }
         for dependency in self.relation.dependencies() {
             let Some(current) = context.catalog.table(&dependency.name)? else {
@@ -210,6 +235,8 @@ impl PreparedQuery {
             cursor.plan_reservation = self._plan_reservation.clone();
             return Ok(cursor);
         }
+        let scores_requested = !context.accelerators.is_empty() && uses_search_score(&self.relation);
+        let context = context.with_score_corpus(scores_requested);
         let types = parameter_types(&self.relation, &parameters, EmissionMode::Execution);
         let parameters = Arc::new(crate::parameters::BoundParameters::new(parameters, types, &context.memory)?);
         drop(temporary);
@@ -220,10 +247,13 @@ impl PreparedQuery {
         let owner = context.owner_cancellation.clone();
         let operators = Arc::clone(&runtime_schema);
         let input = owner.run_until_cancelled(cancellation.run_until_cancelled(async {
-            if preserve_pages && analysis.is_none() {
-                crate::operators::build_pages(operators, execution).await.map(QueryInput::Pages)
-            } else {
-                crate::operators::build(operators, execution).await.map(QueryInput::Rows)
+            match batching {
+                Batching::Pages if analysis.is_none() => crate::operators::build_pages(operators, execution).await.map(QueryInput::Pages),
+                Batching::Columns if analysis.is_none() => match crate::operators::build_columns(Arc::clone(&operators), execution.clone()).await? {
+                    Some(batches) => Ok(QueryInput::Columns(batches)),
+                    None => crate::operators::build(operators, execution).await.map(QueryInput::Rows),
+                },
+                _ => crate::operators::build(operators, execution).await.map(QueryInput::Rows),
             }
         })).await.flatten().ok_or_else(cancelled)??;
         let sample = Some(ExecutionSample::new(context.execution_observer.clone(), ExecutionTimer::Query));
@@ -251,7 +281,9 @@ fn reserve_plan(relation: &Relation, settings: &rtdb_plan::QuerySettings, memory
     memory.reserve(bytes)
 }
 
-enum QueryInput { Rows(BoxCursor), Pages(crate::pages::BoxPageCursor) }
+enum QueryInput { Rows(BoxCursor), Pages(crate::pages::BoxPageCursor), Columns(crate::columnar::BoxBatchCursor) }
+#[derive(Clone, Copy)]
+enum Batching { Rows, Pages, Columns }
 
 pub struct QueryCursor { schema: Arc<RuntimeSchema>, runtime_schema: Arc<RuntimeSchema>, input: Option<QueryInput>, context: Arc<QueryContext>, sample: Option<ExecutionSample>, trace: Option<crate::trace::CursorTrace>, query_span: Option<crate::trace::QueryTrace>, plan_reservation: Option<Arc<MemoryReservation>> }
 impl QueryCursor {
@@ -281,14 +313,16 @@ impl QueryCursor {
         let owner = self.context.owner_cancellation.clone();
         if let Some(trace) = &mut self.trace { trace.start(); }
         let started = std::time::Instant::now();
+        let retention = self.context.clone();
         let counter = self.context.query_cpu.clone();
-        let result = {
+        let pull = async {
             let mut pull = std::pin::pin!(self.pull_batch());
             match counter {
                 Some(counter) => owner.run_until_cancelled(token.run_until_cancelled(crate::query_cpu::measure(counter, pull.as_mut()))).await,
                 None => owner.run_until_cancelled(token.run_until_cancelled(pull)).await,
             }
-        }.flatten().ok_or_else(cancelled);
+        };
+        let result = rtdb_storage::IoRegion::retaining(retention, pull).await.flatten().ok_or_else(cancelled);
         match result {
             Ok(Ok(batch)) => { if let Some(trace) = &mut self.trace { trace.completed(started.elapsed(), batch.as_ref().map(|batch| batch.batch().num_rows())); } if batch.is_none() { self.input = None; } Ok(batch) }
             Ok(Err(error)) | Err(error) => { self.input = None; self.record_error(); Err(error) }
@@ -306,6 +340,10 @@ impl QueryCursor {
     async fn pull_batch(&mut self) -> Result<Option<OwnedBatch>> {
         let Some(input) = &mut self.input else { return Ok(None); };
         let page = match input {
+            QueryInput::Columns(input) => loop {
+                let Some(batch) = input.next_batch().await? else { return Ok(None); };
+                if batch.len != 0 { return column_batch(self.runtime_schema.schema(), &self.context.memory, batch).map(Some); }
+            },
             QueryInput::Pages(input) => {
                 let Some(page) = input.next_page().await? else { return Ok(None); };
                 page
@@ -339,6 +377,33 @@ impl QueryCursor {
         let batch = RecordBatch::try_new_with_options(Arc::new(ArrowSchema::new(fields)), arrays, &options).map_err(|error| invalid("output-arrow", error))?;
         OwnedBatch::with_reservation(batch, reservation).map(Some)
     }
+}
+
+/// The batch a page of the same rows would encode: a column already in the result's layout is kept, any other is
+/// copied from the cells a row would hold.
+fn column_batch(schema: &Schema, memory: &Arc<MemoryBudget>, batch: crate::columnar::ColumnBatch) -> Result<OwnedBatch> {
+    let overflow = || invalid("batch-size", "Output batch allocation bound overflow");
+    if batch.columns.len() != schema.len() { return Err(invalid("row-width", "Operator output differs from its declared schema")); }
+    let fields = schema.fields().iter().map(|field| to_field(&field.name, &field.data_type)).collect::<Result<Vec<_>>>()?;
+    let kept: Vec<Option<ArrayRef>> = batch.columns.iter().zip(schema.fields()).zip(&fields).map(|((column, field), arrow)| crate::columnar::conform(column, &field.data_type, arrow)).collect();
+    let kept_bytes = kept.iter().flatten().try_fold(4096usize, |bytes, array| bytes.checked_add(array.get_array_memory_size()).ok_or_else(overflow))?;
+    let mut reservation = memory.reserve(kept_bytes)?;
+    let mut arrays = Vec::with_capacity(kept.len());
+    for ((kept, column), field) in kept.into_iter().zip(&batch.columns).zip(schema.fields()) {
+        if let Some(array) = kept { arrays.push(array); continue; }
+        let mut cells = batch.len.checked_mul(std::mem::size_of::<Value>()).and_then(|bytes| bytes.checked_add(256)).ok_or_else(overflow)?;
+        for row in 0..batch.len { cells = cells.checked_add(column.bound(row)?).ok_or_else(overflow)?; }
+        let _cells = memory.reserve(cells)?;
+        let values = (0..batch.len).map(|row| column.value(row)).collect::<Result<Vec<_>>>()?;
+        let bytes = estimate_builder_bytes_refs(&field.data_type, values.iter())?;
+        let lease = Arc::get_mut(&mut reservation).ok_or_else(|| invalid("batch-size", "An output batch's charge is shared"))?;
+        lease.grow_to(lease.bytes().checked_add(bytes).ok_or_else(overflow)?)?;
+        arrays.push(copy_array(&field.data_type, &values)?);
+    }
+    let options = RecordBatchOptions::new().with_row_count(Some(batch.len));
+    let output = RecordBatch::try_new_with_options(Arc::new(ArrowSchema::new(fields)), arrays, &options).map_err(|error| invalid("output-arrow", error))?;
+    drop(batch);
+    OwnedBatch::with_reservation(output, reservation)
 }
 struct OwnedRows { rows: std::vec::IntoIter<Vec<Value>>, reservation: Arc<MemoryReservation> }
 #[async_trait]

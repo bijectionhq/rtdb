@@ -525,6 +525,23 @@ mod tests {
         assert_eq!(decode_deployment(&fallback).unwrap(), reopened);
     }
 
+    #[test]
+    fn parked_items_preserve_ordered_index_fences_in_json() {
+        let mut with_index = parked_record();
+        with_index.ordered_indexes.insert("index".into(), crate::OrderedIndexStorage {
+            oldest_generation: 7, dropped: true, ..Default::default()
+        });
+        let mut with_catalog = parked_record();
+        with_catalog.ordered_index_catalogs.insert("store".into(), crate::OrderedIndexCatalog {
+            through: 11, active: Default::default(), prior_prefixes_discovered: true,
+        });
+        for record in [with_index, with_catalog] {
+            let item = deployment_item(&record, true).unwrap();
+            assert!(matches!(item[RECORD], AttributeValue::S(_)));
+            assert_eq!(decode_deployment(&item).unwrap(), record);
+        }
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn packed_and_legacy_items_are_readable_by_both_read_modes_and_the_change_feed() {
         let Some(reader) = local().await else { return };

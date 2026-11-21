@@ -14,6 +14,15 @@
 -- those deletions to the replica log so followers drop them from their
 -- in-memory catalogs at the same logical position.
 --
+-- Native collection within one partition authority captures eligibility and reader references together.
+-- A trie that is live in any captured reader catalog stays out of the collection batch.
+-- At the same cut, the native collector excludes tries recorded as live or nascent in the latest installed checkpoint.
+-- Block adoption installs the replacement protection from the persisted table blocks together with the new block index.
+-- Pending tries remain required because a retained replica notice can complete their compaction cohort after recovery.
+-- Query and transaction snapshots register at the partition owner's state boundary.
+-- An admitted provider operation retains that registration through completion, including after caller cancellation.
+-- Compactor reset requires collection authorization to drain before it can reopen key allocation.
+--
 -- Block-file GC lives in block-gc.allium — block files are consumed only at
 -- startup/catch-up, so they don't need replica-log coordination.
 --
@@ -322,10 +331,21 @@ rule DeleteAndCommitChunkRule {
     --
     -- Any DELETE failure aborts the chunk before the publish happens.
     -- Followers must never drop catalog entries for files still on disk.
+    --
+    -- A trie's artefacts, such as its search files (fts.allium), go before its data file: they carry the data file's content, so they must not outlive it.
+    -- They are found by listing the trie's artefact prefix rather than by reading its entry's records, which also catches an artefact whose record had not been applied when this cycle read its snapshot.
+    -- A partition group's artefacts (trie-cat.allium: ArtefactScope) are derived from every member's data file, so they go once the cycle collects the last member the catalog holds, before any chunk.
+    -- A member the catalog holds and this cycle does not collect, live or not yet past its garbage lifetime, keeps them.
+    -- See: maintenance/src/gc.rs (collect_table, finished_groups)
     when: DeleteAndCommitChunk(table, chunk)
 
     ensures:
+        for group in finished_groups(table, chunk):
+            for key in ObjectStoreList(trie_cat/group_artefact_prefix(table, group)):
+                ObjectStoreDelete(key)
         for trie_key in chunk:
+            for key in ObjectStoreList(trie_cat/artefact_prefix(table, trie_key)):
+                ObjectStoreDelete(key)
             ObjectStoreDelete(data_file_path(table, trie_key))
             ObjectStoreDelete(meta_file_path(table, trie_key))
 
@@ -452,6 +472,10 @@ surface TrieGcAdmin {
 --                                   (storage/PathTools.kt)
 --   meta_file_path(table, key)    — table + trie_key -> ObjectStore key (meta)
 --                                   (storage/PathTools.kt)
+--   ObjectStoreList(prefix)       — every key under a prefix (storage/ObjectStore.kt)
+--   finished_groups(table, chunk) — for the cycle's first chunk of a table, the partition groups of every trie the cycle collects from it
+--                                   none of whose members the catalog holds besides those tries; empty for its later chunks
+--                                   (maintenance/src/gc.rs)
 --   default_garbage_as_of()       — block-time threshold minus garbage_lifetime
 --                                   (TrieGarbageCollector.kt: defaultGarbageAsOf)
 --   parse_table_ref(db, name)     — TableRef.parse (api/.../table/TableRef.kt)

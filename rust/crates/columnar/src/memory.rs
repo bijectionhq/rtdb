@@ -130,7 +130,8 @@ impl OwnedBatch {
     }
 }
 
-fn shared_allocation_size(batch: &RecordBatch) -> Result<usize> {
+/// The bytes a batch's distinct allocations hold, counting a buffer that several arrays share once.
+pub fn shared_allocation_size(batch: &RecordBatch) -> Result<usize> {
     let mut buffers = BTreeMap::new();
     let mut descriptors = std::mem::size_of::<RecordBatch>();
     for array in batch.columns() {

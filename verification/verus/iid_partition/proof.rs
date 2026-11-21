@@ -1,0 +1,8 @@
+#![feature(proc_macro_hygiene)]
+
+#[path = "../../../rust/crates/trie/src/partition_step.rs"]
+mod production;
+
+mod laws;
+
+fn main() {}

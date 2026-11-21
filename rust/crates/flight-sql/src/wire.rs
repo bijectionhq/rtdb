@@ -5,7 +5,7 @@ use arrow_flight::FlightData;
 use arrow_ipc::writer::{CompressionContext, DictionaryTracker, IpcDataGenerator, IpcWriteOptions};
 use arrow_schema::{Schema, SchemaRef};
 use bytes::Bytes;
-use rtdb_columnar::{MemoryBudget, MemoryReservation, OwnedBatch, estimate_read_value_bytes, read_value, from_field};
+use rtdb_columnar::{MemoryBudget, MemoryReservation, OwnedBatch, estimate_read_value_bytes, read_value_as, from_field};
 use rtdb_tx::SqlArguments;
 use rtdb_types::{LogicalType, Value};
 use tonic::Status;
@@ -174,7 +174,7 @@ pub(crate) fn arguments(batch: &RecordBatch, memory: &Arc<MemoryBudget>) -> Resu
     for row in 0..batch.num_rows() { for (column, field) in schema.fields().iter().enumerate() { bound = add(bound, estimate_read_value_bytes(field, batch.column(column).as_ref(), row).map_err(status)?)?; } }
     let _scratch = memory.reserve(bound).map_err(status)?;
     let types = logical_parameter_types(schema)?;
-    let rows = (0..batch.num_rows()).map(|row| schema.fields().iter().enumerate().map(|(column, field)| read_value(field, batch.column(column).as_ref(), row).map_err(status)).collect::<Result<Vec<Value>, _>>()).collect::<Result<Vec<_>, _>>()?;
+    let rows = (0..batch.num_rows()).map(|row| schema.fields().iter().zip(&types).enumerate().map(|(column, (field, ty))| read_value_as(ty, field, batch.column(column).as_ref(), row).map_err(status)).collect::<Result<Vec<Value>, _>>()).collect::<Result<Vec<_>, _>>()?;
     SqlArguments::new(types, rows, memory).map_err(status)
 }
 
@@ -182,7 +182,20 @@ pub(crate) fn arguments(batch: &RecordBatch, memory: &Arc<MemoryBudget>) -> Resu
 mod tests {
     use super::*;
     use arrow_array::Int64Array;
+    use rtdb_columnar::read_value;
     use arrow_schema::{DataType, Field};
+    #[test]
+    fn argument_rows_are_each_cell_read_under_its_columns_field() {
+        let memory = MemoryBudget::new(1 << 22);
+        let schema = Arc::new(Schema::new(vec![Field::new("n", DataType::Int64, true), Field::new("s", DataType::Utf8, false),
+            Field::new("t", DataType::Timestamp(arrow_schema::TimeUnit::Microsecond, Some("UTC".into())), true)]));
+        let columns: Vec<ArrayRef> = vec![Arc::new(Int64Array::from(vec![Some(1), None])), Arc::new(arrow_array::StringArray::from(vec!["a", "b"])),
+            Arc::new(arrow_array::TimestampMicrosecondArray::from(vec![None, Some(5)]).with_timezone("UTC"))];
+        let batch = RecordBatch::try_new(Arc::clone(&schema), columns).unwrap();
+        let arguments = arguments(&batch, &memory).unwrap();
+        let expected: Vec<Vec<Value>> = (0..2).map(|row| (0..3).map(|column| read_value(schema.field(column), batch.column(column).as_ref(), row).unwrap()).collect()).collect();
+        assert_eq!(arguments.rows().map(<[Value]>::to_vec).collect::<Vec<_>>(), expected);
+    }
     #[test]
     fn declared_flight_schema_keeps_nonnullable_timestamp_with_conformed_null_buffers() {
         let memory = MemoryBudget::new(1 << 22);

@@ -131,6 +131,11 @@ pub trait Log: Send + Sync {
     /// Reports a prefix floor without opening a cursor. This applies to providers where the first
     /// requested replay offset is the preceding offset plus one. An observation does not reserve records.
     async fn retained_floor(&self) -> Result<Option<LogOffset>> { Ok(None) }
+    /// Opens a replay cursor during database recovery, before the log driver starts.
+    /// Providers returning a cursor must validate its starting position at admission.
+    /// A discarded prefix reports the first requested and first retained offsets.
+    /// Providers that defer admission return None and open the cursor when the driver runs.
+    async fn recovery_tail(&self, _after: LogOffset) -> Result<Option<Box<dyn LogTail>>> { Ok(None) }
     async fn tail(&self, after: LogOffset) -> Result<Box<dyn LogTail>>;
     /// Captures record starts in [from, to), bounded by the current durable tip.
     /// A missing start within the captured tip is an error; starts beyond the tip return an empty range.

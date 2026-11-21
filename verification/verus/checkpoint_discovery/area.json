@@ -1,0 +1,105 @@
+{
+  "summary": "Checkpoint recovery may retry only a strictly newer advertised checkpoint.",
+  "flags": [
+    "--no-external-by-default",
+    "--verify-module",
+    "production",
+    "--verify-module",
+    "laws"
+  ],
+  "min_verified_functions": 4,
+  "controls": {
+    "repeat_same_checkpoint": {
+      "defect": "An unchanged listing can cause a retry without progress.",
+      "mutate": [
+        {
+          "file": "rust/crates/replication/src/checkpoint_discovery.rs",
+          "find": "    match listed {\n        Some(index) if index > attempted => Some(index),\n        _ => None,\n    }",
+          "replace": "    match listed {\n        Some(index) if index >= attempted => Some(index),\n        _ => None,\n    }"
+        }
+      ],
+      "expect": [
+        {
+          "file": "rust/crates/replication/src/checkpoint_discovery.rs",
+          "function": "newer_checkpoint",
+          "category": "postcondition not satisfied"
+        },
+        {
+          "file": "rust/crates/replication/src/checkpoint_discovery.rs",
+          "function": "newer_checkpoint",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 3
+    },
+    "repeat_same_checkpoint_with_weakened_contract": {
+      "defect": "Both the decision and its contract allow an unchanged listing to cause a retry.",
+      "mutate": [
+        {
+          "file": "rust/crates/replication/src/checkpoint_discovery.rs",
+          "find": "    match listed {\n        Some(index) if index > attempted => Some(index),\n        _ => None,\n    }",
+          "replace": "    match listed {\n        Some(index) if index >= attempted => Some(index),\n        _ => None,\n    }"
+        },
+        {
+          "file": "rust/crates/replication/src/checkpoint_discovery.rs",
+          "find": "        out == match listed {\n            Some(index) if index > attempted => Some(index),\n            _ => None,\n        },",
+          "replace": "        out == match listed {\n            Some(index) if index >= attempted => Some(index),\n            _ => None,\n        },"
+        },
+        {
+          "file": "rust/crates/replication/src/checkpoint_discovery.rs",
+          "find": "(i64::MAX as int) - (out.unwrap() as int)\n            < (i64::MAX as int) - (attempted as int)",
+          "replace": "(i64::MAX as int) - (out.unwrap() as int)\n            <= (i64::MAX as int) - (attempted as int)"
+        }
+      ],
+      "expect": [
+        {
+          "file": "verification/verus/checkpoint_discovery/laws.rs",
+          "function": "same_or_older_checkpoint_cannot_retry",
+          "category": "assertion failed"
+        }
+      ],
+      "min_verified_functions": 3
+    },
+    "refuse_newer_checkpoint": {
+      "defect": "A newer advertised checkpoint can never be tried.",
+      "mutate": [
+        {
+          "file": "rust/crates/replication/src/checkpoint_discovery.rs",
+          "find": "    match listed {\n        Some(index) if index > attempted => Some(index),\n        _ => None,\n    }",
+          "replace": "    None"
+        }
+      ],
+      "expect": [
+        {
+          "file": "rust/crates/replication/src/checkpoint_discovery.rs",
+          "function": "newer_checkpoint",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 3
+    },
+    "refuse_newer_checkpoint_with_weakened_contract": {
+      "defect": "The Rust function and its contract agree to refuse every listing.",
+      "mutate": [
+        {
+          "file": "rust/crates/replication/src/checkpoint_discovery.rs",
+          "find": "    match listed {\n        Some(index) if index > attempted => Some(index),\n        _ => None,\n    }",
+          "replace": "    None"
+        },
+        {
+          "file": "rust/crates/replication/src/checkpoint_discovery.rs",
+          "find": "        out == match listed {\n            Some(index) if index > attempted => Some(index),\n            _ => None,\n        },",
+          "replace": "        out == None,"
+        }
+      ],
+      "expect": [
+        {
+          "file": "verification/verus/checkpoint_discovery/laws.rs",
+          "function": "a_newer_checkpoint_can_be_tried",
+          "category": "assertion failed"
+        }
+      ],
+      "min_verified_functions": 3
+    }
+  }
+}

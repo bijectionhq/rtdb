@@ -2,7 +2,7 @@ use crate::{Error, IoRegion, Result};
 use async_trait::async_trait;
 use bytes::Bytes;
 use parking_lot::RwLock;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::ops::Range;
@@ -80,8 +80,26 @@ impl RetainedBytes {
     pub fn is_empty(&self) -> bool { self.bytes.is_empty() }
 }
 
+/// A derived ordered index's published page namespace.
+#[derive(Clone, Copy)]
+pub struct IndexPageScope<'a> {
+    pub index: &'a ObjectKey,
+    pub generation: u64,
+}
+
+/// The hosted store's authority over indexed page copies and their retirement.
+/// A retained permit covers decoded pages and provider requests spawned while
+/// holding it. The retirement operation records the obligation before returning.
+#[async_trait]
+pub trait IndexPageLifecycle: Send + Sync {
+    async fn retain(&self, scope: IndexPageScope<'_>) -> Result<Arc<dyn Send + Sync>>;
+    async fn retire_before(&self, scope: IndexPageScope<'_>) -> Result<()>;
+    async fn retire_dropped(&self, active: &BTreeSet<ObjectKey>, through: i64) -> Result<()>;
+}
+
 #[async_trait]
 pub trait ObjectStore: Send + Sync {
+    fn index_page_lifecycle(&self) -> Option<&dyn IndexPageLifecycle> { None }
     async fn head(&self, key: &ObjectKey) -> Result<StoredObject>;
     /// Reads current metadata for the key from the backing provider.
     /// The default is suitable when `head` already obtains current provider metadata.
@@ -89,6 +107,9 @@ pub trait ObjectStore: Send + Sync {
     /// A missing key returns `Error::MissingObject`.
     async fn head_fresh(&self, key: &ObjectKey) -> Result<StoredObject> { self.head(key).await }
     async fn get(&self, key: &ObjectKey) -> Result<Bytes>;
+    /// Reads without creating or trusting a node-local durable cache copy.
+    /// Store wrappers must forward this request across any cache boundary.
+    async fn get_fresh(&self, key: &ObjectKey) -> Result<Bytes> { self.get(key).await }
     /// Returns exactly the half-open byte range; an unavailable range is an error.
     async fn get_range(&self, key: &ObjectKey, range: Range<u64>) -> Result<Bytes>;
     /// Retains the allocation charge during the read and with the returned bytes.
@@ -100,9 +121,14 @@ pub trait ObjectStore: Send + Sync {
     /// Publishes an immutable object, accepting an identical existing object as a completed retry.
     async fn put(&self, key: &ObjectKey, bytes: Bytes) -> Result<()>;
     async fn put_file(&self, key: &ObjectKey, source: &Path) -> Result<()>;
-    /// Returns a lexicographically ordered snapshot of object names under a directory.
+    /// Returns the object names reported under a directory, ordered lexicographically.
+    /// A listing may observe concurrent writes or deletions while enumerating the names.
     async fn list(&self, directory: Option<&ObjectKey>) -> Result<Vec<StoredObject>>;
     async fn delete(&self, key: &ObjectKey) -> Result<()>;
+    /// Drops any copy of the object held on this node, leaving the remote object untouched.
+    async fn forget(&self, _key: &ObjectKey) -> Result<()> { Ok(()) }
+    /// The object as a file on this node's disk, for a reader that maps it rather than holding its bytes; `None` where the store keeps no local file.
+    async fn local_file(&self, _key: &ObjectKey) -> Result<Option<LocalFile>> { Ok(None) }
 
     async fn copy(&self, source: &ObjectKey, destination: &ObjectKey) -> Result<()> {
         self.put(destination, self.get(source).await?).await
@@ -164,6 +190,14 @@ impl ObjectStore for MemoryStore {
         self.objects.write().remove(key);
         Ok(())
     }
+}
+
+/// An object opened from this node's disk, kept there for as long as the value lives.
+pub struct LocalFile { file: std::fs::File, _lease: Option<crate::disk_cache::DiskLease> }
+
+impl LocalFile {
+    pub(crate) fn new(file: std::fs::File, lease: Option<crate::disk_cache::DiskLease>) -> Self { Self { file, _lease: lease } }
+    pub fn file(&self) -> &std::fs::File { &self.file }
 }
 
 pub struct LocalStore {
@@ -372,6 +406,12 @@ impl ObjectStore for LocalStore {
             result.sort_by(|a, b| a.key.cmp(&b.key));
             Ok(result)
         }).await
+    }
+
+    /// A local object is never rewritten under its key, and an open file outlives a delete, so the file is the object for as long as it is held.
+    async fn local_file(&self, key: &ObjectKey) -> Result<Option<LocalFile>> {
+        let (path, key) = (self.path(key), key.clone());
+        self.io.run(move || Ok(Some(LocalFile::new(open_object(&path, &key)?, None)))).await
     }
 
     async fn delete(&self, key: &ObjectKey) -> Result<()> {

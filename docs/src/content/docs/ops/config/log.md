@@ -102,7 +102,7 @@ log: !<LogType>
 Where:
 
 - `<LogType>` is the chosen log implementation (e.g., `!Kafka`, `!Local`).
-- `<new-epoch>` is a positive integer greater than the previous epoch.
+- `<new-epoch>` is a positive integer no greater than 32,767 and strictly greater than the previous epoch.
 
 All nodes within the same cluster **must** use an identical epoch value at startup.
 

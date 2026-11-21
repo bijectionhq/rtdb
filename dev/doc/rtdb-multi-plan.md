@@ -840,7 +840,8 @@ Placement must follow load and the fleet must scale both ways (spec surface `Con
    A rebalancer ends its current pass when another operation has reserved the deployment or changed the source holding.
    The optional `--rebalance-write-bytes-per-second`, `--rebalance-query-cpu-ms-per-second`, `--rebalance-tail-bytes` and `--rebalance-cache-bytes` are per-node watermarks.
    The controller samples up to 16 eligible endpoints concurrently and chooses moves from the strongest configured pressure.
-   The live tail sample counts applied event batches and their headers, and the cache sample counts the deployment's in-memory object pool.
+   The live tail sample counts the current block's retained event batches and their headers.
+   The cache sample counts bytes charged to the deployment's in-memory pool, including decoded views and outstanding read leases.
    The write rate uses encoded source bytes accepted by the holder between two observations of the same epoch.
    The query CPU rate records thread CPU spent opening native queries and producing result batches on the holder.
    Linux and macOS nodes start measuring that counter on the first controller probe that requests it for a holding.
@@ -1190,6 +1191,7 @@ Writes convert eligible rows as they are created or updated.
 Switching writers back to `dynamodb:PREFIX` stops new packed writes.
 Existing packed rows require a rewrite to JSON before downgrading any reader.
 Held deployments, operation journals and records with non-UUID logkeeper IDs continue to use JSON.
+Parked records with ordered-index fences also use JSON.
 DynamoDB Local verifies mixed layouts, the holder index, conditional updates and Streams delivery.
 Rebalancing and compaction placement query live members' holdings with bounded concurrency.
 The DynamoDB holder index omits unheld rows and verifies each hit by a strongly consistent read.

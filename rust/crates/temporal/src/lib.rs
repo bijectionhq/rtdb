@@ -3,6 +3,9 @@ use std::sync::Arc;
 use rtdb_types::{Anomaly, EventHeader, EventOp, Iid, Interval, MemoryBudget, MemoryReservation, Result, TemporalBounds, Timestamp};
 use serde::{Deserialize, Serialize};
 
+mod event_step;
+mod ceiling_step;
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(try_from = "PolygonParts", into = "PolygonParts")]
 pub struct Polygon {
@@ -41,8 +44,9 @@ impl From<Polygon> for PolygonParts {
 fn range_recency(ranges: impl DoubleEndedIterator<Item = (Timestamp, Timestamp, Timestamp)>) -> Timestamp {
     let mut recency = Timestamp::MIN;
     for (valid_from, valid_to, system_to) in ranges.rev() {
-        recency = recency.max(system_to.min(valid_to));
-        if recency >= valid_from { return recency; }
+        let (bound, finished) = event_step::recency_step(recency.0, valid_from.0, valid_to.0, system_to.0);
+        recency = Timestamp(bound);
+        if finished { return recency; }
     }
     recency
 }
@@ -56,11 +60,7 @@ pub struct PolygonView<'a> {
 
 impl<'a> PolygonView<'a> {
     fn new(valid_times: &'a [Timestamp], system_time_ceilings: &'a [Timestamp], interval: Interval) -> Self {
-        let first = valid_times.partition_point(|bound| *bound <= interval.lower()).saturating_sub(1)
-            .min(system_time_ceilings.len() - 1);
-        let last = if interval.is_empty() { first } else {
-            valid_times.partition_point(|bound| *bound < interval.upper()) - 1
-        };
+        let (first, last) = ceiling_step::cell_window(valid_times, system_time_ceilings, interval.lower(), interval.upper());
         Self { valid_times: &valid_times[first..last + 2], system_time_ceilings: &system_time_ceilings[first..=last], interval }
     }
 
@@ -68,7 +68,10 @@ impl<'a> PolygonView<'a> {
     /// An empty valid-time interval produces one zero-width range.
     pub fn ranges(&self) -> impl DoubleEndedIterator<Item = (Timestamp, Timestamp, Timestamp)> + '_ {
         self.valid_times.windows(2).zip(self.system_time_ceilings)
-            .map(move |(valid, &system_to)| (valid[0].max(self.interval.lower()), valid[1].min(self.interval.upper()), system_to))
+            .map(move |(valid, &system_to)| {
+                let (lower, upper) = ceiling_step::clip_cell((valid[0], valid[1]), (self.interval.lower(), self.interval.upper()));
+                (lower, upper, system_to)
+            })
     }
 
     pub fn recency(&self) -> Timestamp { range_recency(self.ranges()) }
@@ -106,24 +109,8 @@ impl Ceiling {
         Polygon { valid_times, system_time_ceilings }
     }
 
-    fn split_at(&mut self, at: Timestamp) -> usize {
-        match self.valid_times.binary_search(&at) {
-            Ok(idx) => idx,
-            Err(idx) => {
-                self.valid_times.insert(idx, at);
-                self.system_time_ceilings.insert(idx, self.system_time_ceilings[idx - 1]);
-                idx
-            }
-        }
-    }
-
     pub fn apply_event(&mut self, system_from: Timestamp, interval: Interval) {
-        if interval.is_empty() { return; }
-        let start = self.split_at(interval.lower());
-        let end = self.split_at(interval.upper());
-        self.system_time_ceilings[start] = system_from;
-        self.valid_times.drain(start + 1..end);
-        self.system_time_ceilings.drain(start + 1..end);
+        ceiling_step::overwrite(&mut self.valid_times, &mut self.system_time_ceilings, interval.lower(), interval.upper(), system_from);
     }
 }
 
@@ -160,9 +147,11 @@ impl<C> CalculatorState<C> {
             }
             erased = same_entity && entity.erased;
         }
-        let outside_bounds = header.op != EventOp::Erase
-            && self.bounds.is_some_and(|bounds| header.system_from >= bounds.system_time.upper());
-        Ok(EventStep { same_entity, applies: !erased && !outside_bounds })
+        let applies = event_step::applies(
+            erased, header.op == EventOp::Erase, header.system_from.0,
+            self.bounds.map(|bounds| bounds.system_time.upper().0),
+        );
+        Ok(EventStep { same_entity, applies })
     }
 
     fn advance(&mut self, header: &EventHeader, step: EventStep) -> &mut EntityState<C> {
@@ -408,11 +397,9 @@ impl HistoryResolver {
                 let valid_time = Interval::new(valid_from, valid_to)?;
                 if header.system_from >= system_to { continue; }
                 let system_time = Interval::new(header.system_from, system_to)?;
-                if !bounds.valid_time.intersects(valid_time) || !bounds.system_time.intersects(system_time) { continue; }
-                let valid_time = if clamp_valid_time {
-                    match valid_time.intersection(bounds.valid_time) { Some(interval) => interval, None => continue }
-                } else { valid_time };
-                emit(valid_time, system_time)?;
+                if let Some(fragment) = bounds.admit_fragment(TemporalBounds { valid_time, system_time }, clamp_valid_time) {
+                    emit(fragment.valid_time, fragment.system_time)?;
+                }
             }
             Ok(())
         };
@@ -436,4 +423,20 @@ pub fn resolve_ordered<'a, R: Clone>(
     let mut result = Vec::new();
     for (header, source) in events { result.extend(resolver.resolve(header, source)?); }
     Ok(result)
+}
+
+/// A region of valid time × system time where an event is the visible version of its entity.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Rectangle { pub valid_time: Interval, pub system_time: Interval }
+
+impl Rectangle {
+    /// Whether a scan at `bounds` emits this rectangle, as `HistoryResolver` decides it.
+    pub fn meets(&self, bounds: TemporalBounds) -> bool { bounds.valid_time.intersects(self.valid_time) && bounds.system_time.intersects(self.system_time) }
+}
+
+/// Every rectangle where each event of an IID-ascending, system-time-descending history is visible, as the scan resolves it with no bounds.
+/// A scan at any bounds emits exactly the rectangles that meet them, so an index holding these answers visibility as the scan does.
+pub fn visibility<'a, R: Clone>(events: impl IntoIterator<Item = (&'a EventHeader, R)>) -> Result<Vec<(R, Rectangle)>> {
+    let all = TemporalBounds { valid_time: Interval::ALL, system_time: Interval::ALL };
+    Ok(resolve_ordered(events, all, false)?.into_iter().map(|row| (row.source, Rectangle { valid_time: row.valid_time, system_time: row.system_time })).collect())
 }

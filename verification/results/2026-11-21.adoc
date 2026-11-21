@@ -1,0 +1,1175 @@
+= Native kernel study results, 2026-11-21
+
+The combined local run used the production sources through commit `9f2311110` and the model and runner sources in this study commit.
+The command in link:../README.adoc[the runner instructions] used all six named tools and enabled the Rust boundary controls.
+Logs include input hashes, solver diagnostics, and bounded counterexample traces.
+
+== Checked results
+
+[cols="1,2,2",options="header"]
+|===
+|Tool |Positive evidence |Controls and limits
+
+|Lean 4.36.0
+|The one-pass history evaluator refines the independent point definition.
+Admitted answers survive later publication.
+Arbitrary older histories agree after an erase of the observed key.
+The model proves key projection, point constancy between valid and system boundaries, and an abstract strict cutoff bound.
+|Half-open interval, future ERASE and tied-cutoff mutations fail.
+The audited theorems use standard Lean axioms.
+These are theorems about the model.
+
+|Verus 0.2026.11.20.9da409b, Z3 4.16.0
+|Fourteen verified functions across the production search rectangle decisions, temporal admission and replica admission areas.
+|All seven declared mutations failed at the expected functions.
+The proofs cover the included decisions, including two joint controls.
+The actual partition publication transitions, scan coverage and token-to-effect composition need further proof.
+
+|TLC 2026.11.19.180144
+|The pin and copy variants reached 8,140 and 7,012 states.
+The serialized and validated resolver variants reached 9 and 24 states.
+The fair stable-service case reached 8,140 states.
+The cache generation check reached 9 states.
+|All ten negative configurations produce a violation.
+The protocol assumes atomic append to one durable log, two terms, two requests, two roots and one reader.
+Progress assumes stable availability and weak fairness for apply and acknowledgement.
+
+|Apalache 0.63.0
+|Serialized and validated resolution hold through eight transitions.
+|Blind publication loses an update at transition four.
+
+|Maude 3.5.1
+|Independent rewrite models of serialized and validated resolution explore 9 and 24 states with no lost update.
+|The blind variant reaches revision two with value one.
+
+|Alloy 6.2.0
+|The last-reference rule preserves reachability in scope four.
+A satisfying shared-file retention case witnesses a nonempty model.
+|Deleting on the first member's removal admits a counterexample.
+
+|Rust compiler
+|The admitted-record apply boundary compiles on the unchanged production copy.
+|Minting the token from the driver fails with E0423.
+Passing a raw decoded record to apply fails with E0308 at the actual call site.
+
+|Rust runtime
+|238 tests passed across search, temporal, replication, storage and maintenance, with one ignored benchmark.
+All 15 node search tests passed.
+Lean and the Rust resolver both matched all 13 shared trace observations.
+|The tests exercise the local database, logs, compaction, cache races and search.
+No hosted provider fault test is included in this result.
+|===
+
+== Counterexamples and amendments
+
+[cols="1,2,2",options="header"]
+|===
+|Property |Small trace |Amendment or surviving rule
+
+|Atomic batch
+|Resolve, then publish the debit alone.
+|Make the full batch the unit of the admitted log transition.
+
+|Durable acknowledgement
+|Resolve, then acknowledge without append.
+|In the model, only an applied batch can be acknowledged.
+
+|Term fencing
+|Resolve in an old term, hand over, then publish the pending batch.
+|Reject stale terms and preserve admission through deferred apply.
+
+|Retry identity
+|Resolve one identity, append, retry that identity, append again.
+|Preserve a durable receipt or refuse an ambiguous retry under the provider contract.
+The model checks uniqueness for its receipt policy.
+
+|Read basis
+|Pin, resolve a new request, append, apply and change the pinned read history.
+|Keep the captured observation stable.
+
+|Durable root
+|Publish a manifest before storing its replacement object.
+|Publish the durable replacement before retiring its predecessor.
+
+|Shared reclamation
+|Pin an old generation, store and publish its replacement, then collect the pinned generation.
+|Allow collection only after references reach zero.
+
+|Cache generation
+|Start loading, invalidate, publish a replacement and complete the old load.
+|An obsolete loader can publish only a private path.
+In production, cache invalidation and pathname publication share the state lock.
+
+|Search visibility and rank
+|Merge two historical writes across their system origins, or count a row whose second MATCH predicate fails.
+|Retain system origins, apply strictly later erases to older rectangles, and score only resolved rows that pass the scan restriction.
+
+|Compaction schema
+|Decode a spill page whose Arrow union has a null leg, then copy it into a writer whose declared field differs in nullability.
+|Re-encode the original rows to the declared schema when passthrough would violate that schema.
+|===
+
+== Remaining proof obligations
+
+The complete native temporal ceiling and rectangle emitter still need a refinement proof against the point evaluator.
+At this stage the search ranking proof still needed coverage of the production floating-point score frontier, alternate physical recency page layouts, and optional build failure under memory pressure.
+The later ranking entries below identify the parts of the frontier now checked.
+The durable protocol models assume provider behavior.
+Provider faults, object-store recovery, the full trie coverage transition and cross-node lease accounting need production refinement evidence.
+The observations here support specific component claims and bounded protocol claims.
+
+== Expanded refinement run
+
+Production sources through `b2609268a` now use the Verus-checked single-event rectangle subtraction and temporal recency fold step.
+The combined proof run verified 19 functions across three areas and rejected all nine Verus mutations at their declared functions.
+Lean checked the full mathematical recency fold against the early-exit fold for ordered valid intervals.
+It also proved that retaining the required ordered prefix preserves top K and gave independence witnesses for whole batches, the admission horizon, the private prefix and operation order.
+Public `Polygon::recency` preserves its existing behavior for arbitrary constructed shapes.
+The early-exit refinement relies on ordered native intervals.
+
+Seventeen node search tests passed.
+The new tests compare plain MATCH and exact scores with a scan corpus when an index build exceeds the memory budget or historical physical pages are out of global IID order.
+The count-star plan also keeps the projection empty when only cardinality is needed.
+
+[cols="2,1,3",options="header"]
+|===
+|Additional TLC model |Distinct states |Rejected alternatives
+|Read-back and acknowledgement |195
+|Apply before delivery and acknowledgement on append each violate their own invariant.
+|Validated generation lease |350
+|Age-only collection and stale-follower admission can strand a reader.
+|Coordinated generation pin |415
+|The reader remains entitled until release, so the model forbids deletion while it holds the generation.
+|===
+
+The native trie collector currently selects garbage from the latest catalog and a retention timestamp.
+It has no distributed evidence of which generations readers still need.
+The lease model requires generation validation at admission and an enforced expiry on reads.
+The coordinated pin model requires an authority that serializes pin acquisition and reclamation, plus a contract for abandoned readers.
+Both alternatives are conditional on the modeled provider and clock assumptions.
+
+== Shared trace and ranking algebra
+
+Lean and the production Rust temporal resolver agreed on 4,096 generated point observations over 128 histories, in addition to the 13 hand-written observations.
+The retained seed includes alternate admission horizons, valid interval endpoints, multiple entities and same-batch put, delete and erase.
+The mathematical BM25 term fraction increases with a greater frequency and lower normalization term under the ordered arithmetic premises.
+The concrete floating-point window implementation still needs a rounding and frontier proof.
+
+The combined local runner passed from `5076d2cd1` with both Rust options enabled.
+The native package run passed 532 tests across query, search, temporal, replication, storage and maintenance, with one ignored benchmark.
+The native node search suite passed all 17 tests.
+The retention protocol and provider refinement remain open.
+
+== Binary64 score bounds and frontier
+
+The combined runner passed from `5daed1770` with both Rust options enabled, using the toolchain listed in link:../README.adoc[the runner instructions].
+The underlying scorer preserves the BM25 expression and its addition order.
+Window, candidate and SQL scoring now share one computed set of term weights.
+The old unpadded extremum can be one representable value below a row's score. The previous aggregate margin was present and this witness does not refute it.
+
+|===
+|Evidence |Result and scope
+
+|Lean 4.36.0
+|The frontier of pending scores and unexpanded windows covers every row with evidence in either source.
+A possible tie prevents a strict cutoff.
+Dropping unexpanded windows fails at `frontier_covers_supported_row`, and admitting equality fails the tied-cutoff controls.
+
+|Z3 4.16.0
+|Five counterexample queries are unsatisfiable over the exact-real model of rounded BM25.
+Removing the per-term padding and reversing the length premise each makes just its own query satisfiable.
+Separate binary64 queries check the one-value reversal and its repaired bound.
+
+|Native Rust replay
+|The binary64 witness passes on the exact production scorer.
+The source mutation that removes padding compiles and fails at the bound assertion.
+The text and search unit suites passed all 32 tests, and the node search suite passed all 17 tests, including ranked-versus-full sorting and candidate reduction across partitions.
+The combined runner also replayed all 4,096 native temporal observations.
+|===
+
+The numeric proof depends on the IEEE round-to-nearest operations and the source-to-model correspondence stated in link:../../dev/doc/rtdb-verification.adoc[Study 2].
+The frontier proof assumes completeness of the qualifying row's matching event in a pending entry or unexpanded window.
+The production evidence exercises those paths, including shared-file members, without a general proof of index decoding, temporal candidate coverage or planner eligibility.
+The durable storage and cross-node reader-retention obligations remain open.
+
+== Checkpoint interruption on local durable storage
+
+The combined runner passed from `11131976a` with both Rust options enabled.
+TLC explored all 97 reachable states of the single-root model.
+The shortest early-root trace is three transitions.
+A second variant loses a child after its durable write in eight transitions.
+The log-retention variant removes the prefix, crashes, and then cannot find the root in eleven transitions.
+
+Four native conformance tests passed, including interruptions immediately before and after the root write, loss of a source acknowledgement, and recovery against a closed history manifest.
+The pre-write replay rebuilt from the retained log.
+The post-write replay opened the stored checkpoint and observed the same single system-time row.
+Moving the root write ahead of the table blocks in a disposable copy made the post-write replay fail at startup on the missing object `tables/public$docs/blocks/b00.binpb`.
+
+The first combined run exposed a race in the fault fixture.
+Injected closure can reach the shutting-down driver's log poll before cancellation is selected.
+The final test accepts that exact injected error as an interruption and still checks the durable checkpoint and recovered history on both sides of the write.
+
+These are local provider observations and a bounded model of checkpoint publication under the stated retention and durability assumptions.
+The referenced-trie closure across concurrent compaction and GC, and behavior on remote storage, remain separate obligations.
+
+== Azure pending copy counterexample
+
+The checkpoint model that waits for copy completion holds in all 155 reachable states.
+Treating copy acceptance as completion publishes a root without its data object in six transitions.
+The offline Azure diagnostic passed through the production adapter at `6f0094f47`, with a provider returning `202 Accepted` and `x-ms-copy-status: pending`.
+The adapter returned success from file publication and deleted the copy source.
+The fixture observed the premature success on loopback.
+
+The combined local runner passed from `be1a66831` with both Rust options enabled.
+The corrected adapter waits for the same copy identifier to report success before acknowledging and removing staging.
+An unavailable status check preserves staging, and a retry sees an in-progress destination as unavailable.
+Both native controls compiled and failed at their declared assertions after removing the completion check or deleting staging on an unknown outcome.
+The Azure and storage package run with remote support passed 204 tests.
+The provider wait uses the client's default retry duration.
+Live Azure behavior under load, remediation of a terminal failed destination, and eventual cleanup of abandoned staging remain open.
+
+== Projected ceiling and shared interval decision
+
+The combined local runner passed from `90d44b4c5` with both Rust options enabled.
+The input manifest SHA-256 was `4477d684b03144bd290aa15cd2dd8d3c7b1c20ac9b6a3b4324dfdfbfb694c995`.
+Lean proved the unrestricted and request-bounded ceiling folds against the reference point query and exhibited a duplicate emission on unordered input.
+The inclusive upper edge and unchanged ceiling each failed their declared proof obligations.
+
+The production interval intersection now backs both intersection and overlap queries.
+Verus verified that exact decision and two independent law wrappers, plus 19 functions in the previous areas.
+The combined run rejected all 12 Verus controls, including the joint mutations that weakened the intersection contract.
+The complete Rust ceiling vector and range emitter still need a refinement proof against the projected model.
+
+Both native resolvers and the unbounded rectangles agreed with the mathematical answer on all 4,096 generated observations.
+There were 240 passing Rust type and temporal tests and 17 passing node search tests at the same revision.
+The combined suite also reran the checkpoint and Azure production controls and the 11 positive and 18 negative TLC configurations.
+
+== Production ceiling layout and fragment admission
+
+The combined local runner passed from `7a1937642` with both Rust options enabled.
+The input manifest SHA-256 was `d904a0fce7bc45577176e8564cb7404b92dd2bcb75b48a1eda57fe65923f57be`.
+Verus reported 43 verified obligations across five areas.
+All 18 Verus negative controls failed at their declared sites.
+The new controls exercise splitting, stale cells after compaction of the vectors, a skipped overwrite, an upper endpoint, a widened fragment, and admission that ignores system time.
+
+The verified production ceiling step preserves alignment of the two vectors and their strictly increasing boundaries.
+Splitting preserves point answers, and an overwrite changes exactly the points in its half-open range.
+The same area verifies which cells a scan visits and their clipping.
+The interval area checks that per-fragment admission tests both query axes, optionally clamps valid time, and preserves system time.
+
+The native run passed 302 tests across types, temporal, maintenance and search, with one ignored benchmark.
+The node search suite passed 17 tests.
+The combined run replayed all 4,096 generated observations against both Rust resolvers and unbounded visibility, four checkpoint tests and their root-first mutation, two Azure tests and their copy-status and staging mutations, and the binary64 score witness and its unpadded mutation.
+TLC reran 11 passing bounded configurations and found counterexamples in all 18 weakened configurations.
+
+The proof covers the actual vector operations under the standard Verus vector specifications.
+The allocation and event shell, production input order and the full resolver's assembly of fragments still rely on source inspection and replay.
+
+== Integrated main and in-flight reader obligations
+
+The combined runner passed with both Rust options from `95c6b37d6`, after integrating the FTS architecture experiments and the existing verification branch.
+The exact input manifest SHA-256 was `d67ef6fb71fa9c8cb0e6e8eee5e89d6dd7409a7fd0e7499001e02dfe75bfb7c6`.
+A separate native package run passed 99 tests, including 18 node search tests, and the FTS architecture benchmark example compiled.
+The combined run checked all five Verus areas and 18 associated controls and replayed the temporal, score, checkpoint and Azure observations.
+
+A follow-on study distinguishes permission to start a read from the obligation to keep its object available during I/O.
+Lean proves that completion precedes the collection threshold if the authority bounds the reader's clock error, the read starts with strict room for its full I/O bound, and the provider meets that bound.
+A second Lean result proves that an atomic pin protocol preserves protection under arbitrary histories and any count of active operations.
+A control admitting equality at expiry fails the lease theorem.
+A control releasing the pin on handle close fails the inductive pin step.
+All three audited theorems use standard Lean axioms.
+
+TLC explored 1,238 states for the lease and 3,664 states for the pin.
+Five weakened variants violate `InflightHasObject`.
+They omit the clock margin, admit equality at expiry, allow I/O to overrun, release a pin before active I/O ends, or forget a pin during authority change.
+The model permits terminal states at its finite time bound.
+Explicit grouping of the pin assignments on close and finish matters.
+The release-on-close mutant remained green before that grouping was corrected.
+
+These are model results for the checked retention contracts.
+The lease result assumes completion or cancellation that is conclusive at the provider, not just a caller timeout.
+The pin result assumes atomic registration and retention across the authority's relevant lifecycle.
+The earlier native cursor attempt timed out and does not establish a production counterexample.
+
+== Native reader reclamation witness
+
+The fixture in link:../traces/reader_reclamation_diagnostic.rs[the native diagnostic] observed a reader availability failure on source revision `cb9a0c795`.
+A real local node compacts a table, opens a SQL cursor against the first serving trie without consuming its first page, and then compacts a replacement.
+The fixture passes the replacement's catalog to the production trie collector and explicitly invokes it with an eligible retention cutoff.
+The collector uses the same object store as the cursor.
+The fixture substitutes a recorder for the deletion notice publisher.
+An object check observes the selected old data and metadata missing, and the old cursor returns `rtdb.storage/missing-object` for that trie's metadata.
+A fresh query successfully returns both committed rows.
+
+This is a native witness for an explicitly invoked eligible collection cycle.
+It establishes that the cursor's old catalog does not keep its required object alive in this configuration.
+It leaves automatic scheduling, the default retention horizon, remote coordination, and durable deletion notice publication outside this run.
+The earlier scheduled diagnostic timed out and remains inconclusive for its own scenario.
+
+Reproduce the witness in an isolated checkout at `cb9a0c795` by appending the retained diagnostic to `rust/crates/conformance/tests/node_faults.rs`, then running the exact named case from `rust/`.
+
+[source,sh]
+----
+BIJECTION_LOCAL_EXECUTION=owner-authorized cargo test --locked -p rtdb-conformance \
+  --test node_faults eligible_trie_collection_strands_an_admitted_native_reader -- --exact --nocapture
+----
+
+== Catalog reclamation decisions
+
+Verus checked four functions in link:../verus/catalog_reclamation/proof.rs[the production reclamation area].
+The block decision is equivalent to requiring a strictly earlier block and a position at least the configured distance behind the latest block.
+The calculation uses widened arithmetic and covers zero retention and all representable arguments.
+The group decision permits reclamation only when every catalog-held member of the candidate group is in the selected batch.
+Each of the four slots comes from the same catalog snapshot, for the exact table and trie key returned by the group's bucket order.
+The batch contains only garbage tries eligible at its cutoff.
+
+Verus rejected selecting the latest block at zero retention and ignoring the fourth member.
+In two additional joint controls the weakened function still met its local contract.
+The independent latest-block or surviving-sibling law failed at the expected assertion.
+
+The proof covers the two synchronous predicates.
+It depends on the listed catalog lookups and the caller's batch construction.
+Reader and recovery dependencies outside that snapshot, generation fencing, provider outcomes, and effects after admission remain separate obligations.
+
+== Complete sibling publication
+
+TLC explored all 163 states of link:../tla/CompactionGroup.tla[the single-group model], with four buckets, one durable input and one cursor that may close and reopen.
+The model distinguishes durable output writes, independent notices, and the catalog change that activates the complete replacement.
+Each fresh capture has exactly one source of coverage for each bucket.
+All published outputs have completed their writes.
+A separate witness reaches a cursor that captured the replacement.
+
+Enabling one child while the parent remains gives duplicate coverage.
+Retiring the parent after the first notice leaves uncovered buckets.
+Accepting a notice for an incomplete write permits a complete-looking publication with unreadable outputs.
+TLC found each violation with the corresponding mutation.
+
+The model has one replacement generation.
+It represents notices as a set because exact duplicate notices leave catalog coverage unchanged in this model.
+It abstracts row equivalence, overlapping jobs, rejected input, cache, and the lifetime and physical readability of a previously captured generation.
+The production trie catalog uses per-shard block high-water marks.
+A refinement proof must establish when a higher watermark supplies the earlier generation's complete source coverage, including late and interleaved notices.
+
+== Interleaved sibling generations
+
+The two-generation model keeps the parent active until four exact outputs are present.
+TLC explored 288 states for this rule.
+The reachability witness activated a replacement.
+The watermark variant let three generation-1 notices and one generation-2 notice retire the parent, leaving one generation-1 bucket without coverage.
+
+The catalog regression reproduced this counterexample through the Rust catalog's admission path.
+It delivered a later notice for bucket 2, then delivered the earlier group's notices.
+The old implementation exposed only buckets 0, 1 and 3 of the earlier group.
+The fix checks for a nascent or live sibling at the group's exact block in every bucket.
+The catalog keeps the parent for the incomplete group and activates all four members when the later group completes.
+All 16 catalog tests and four maintenance GC tests passed after the fix.
+
+This case establishes the catalog defect and checks the repair for the specified notice order.
+The bounded model abstracts job input coverage, merge output equivalence, recovery of pending jobs and storage faults.
+
+== Combined local verification after reclamation and single-group checks
+
+The complete runner passed on commit `a14100ce3`.
+Lean, TLC, Verus, Alloy, Apalache, Maude and the arithmetic solver ran with the declared controls.
+The Rust checks included replica admission compile failures, 4,096 temporal observations, the ranking witness and mutation, four recovery tests and the root-first mutation, and the Azure copy cases and mutations.
+The SHA-256 of the combined run's `inputs.json` is
+`da019a9521a95b5bf821e946da3ca0e85c5bcfa5cccfb213e51bd4ecc9248c25`.
+The later overlapping-group change has its focused TLC and Rust evidence above.
+
+== IID bucket agreement
+
+The default trie bucketer and compaction planner now use the same Rust function.
+Verus verified seven obligations in link:../verus/iid_partition/proof.rs[the IID partition area].
+For every 128-bit identifier, the function returns the corresponding big-endian base-four digit at depths 0 through 63 and refuses greater depths.
+Its arithmetic specification uses division and remainder, and the executable uses a shift and mask.
+Two production controls select only 63 digits or collapse all valid depths to bucket zero.
+With each local contract also weakened, the independent final-digit or bucket coverage law fails.
+
+All five trie contract tests and all 18 maintenance merge tests passed.
+The proof concerns default base-four extraction and assumes callers use their checked depth.
+It leaves the alternative-width paths, query range endpoints, event equivalence and selection across a complete trie catalog to separate proofs.
+
+== Combined verification through the IID proof
+
+The complete combined run passed on `63e162d6f`.
+It checked 54 Verus obligations across seven areas and rejected 26 Verus controls.
+Fifteen bounded TLC baselines passed and 29 mutations or reachability configurations yielded the declared counterexamples.
+The native replay and compiler controls also passed.
+The runner retained the tool identities in `run.json` and the per-case commands alongside the diagnostics.
+The input manifest SHA-256 is `f1781a86a23686c9a02089b36a13d53aa6fca2d8745833b6788c633aeb33b5c6`.
+
+== Multiple-reader deletion authorization
+
+TLC explored all 97 states of link:../tla/ReclamationAuthority.tla[the authorization model], with two readers, at most one protected operation per reader, and two generations.
+A reachability control shows that the old generation can be deleted.
+Ignoring the second reader, granting a stale admission after authorizing deletion, and reusing a physical pathname each violate the recorded invariant.
+The baseline preserves both readers' dependencies and the current generation through a delayed deletion.
+It assumes synchronized admission and authorization, immutable object identities, and confirmed completion of protected operations.
+This is bounded model evidence for those premises. The model does not implement reader coordination in the Rust database.
+
+== Point reads through ordered compaction buckets
+
+Lean checked link:../lean/Compaction.lean[the projection from the reference history to one bucket] for every event list and every key-to-bucket function.
+Filtering a bucket again by key preserves exactly that key's ordered event sequence.
+The resulting point evaluation agrees with the unpartitioned reference at every system and valid coordinate.
+Both directions of routing are necessary.
+The model rejects storing an event in the adjacent bucket and looking up the adjacent bucket.
+The audited proofs use standard Lean axioms.
+
+The result composes with a partitioner that supplies the proved ordered filters, including the precise placement of erasures.
+It does not claim that the native compaction merger already supplies that complete refinement.
+
+== Combined check of the expanded models
+
+The complete formal suite passed on `7f38bfa7e`.
+It includes the ordered bucket proof, the two-reader authorization model, 16 bounded TLC baselines with 33 failure or reachability controls, and the prior 54 Verus obligations with 26 controls.
+Its input manifest SHA-256 is `528e740c7815a74ff1cab78fe9007c5557a4996e211c1aa9c45b52e14fdfee2e`.
+The Rust source is identical to the source in the combined run at `63e162d6f`, which included compiler and native replay controls.
+
+== Strict production ranking cutoff
+
+Verus checked eight obligations in link:../verus/rank_cutoff/proof.rs[the cutoff area].
+When the pending heap and unread windows supply their respective maximum bounds, the decision allows an early stop exactly when a valid kth score strictly exceeds every supplied bound.
+An empty source imposes no comparison.
+The two signed zeroes compare equal and an invalid input to the decision prevents an early stop.
+The SQL ranker's decision calls the verified Rust function.
+
+Both production-only mutations failed their local postconditions.
+Allowing equality and weakening the matching contract failed both independent tie laws.
+Omitting unread windows and weakening the matching contract failed the unread-window tie law.
+
+Z3 found no counterexample to equality of binary64 strict order and the unsigned key comparison across the admitted domain.
+Removing signed-zero normalization gave a counterexample.
+All 29 search-crate unit tests and all 18 native SQL search tests passed, along with seven node unit tests.
+
+The proof depends on the frontier inputs.
+Showing that candidate visibility checks, heap selection, window enumeration and index metadata collectively supply an upper bound for every qualifying row is a separate obligation.
+
+The combined formal runner passed on `de7a2f7b3` with 62 Verus obligations in eight areas and 30 rejected Verus controls.
+It ran the Lean, TLC, Verus, Z3, Alloy, Apalache, and Maude cases.
+The input manifest SHA-256 is `e309ab163d74616f48eb5e6d7c711e3d0cf670185b4fe0186e4d56addb2f37ef`.
+The search tests were run separately from the formal runner.
+
+== Ranked search window coverage
+
+Lean checked link:../lean/SearchWindows.lean[the model] for all posting lists, document IDs, and term lists with at least one matching term.
+A posting's window summary has a frequency at least as large as the posting's and a length at most as large as its length.
+If each term's list contains every window holding that term, their intersection contains the window of every document with all the terms.
+The half-open interval of the assigned window contains the document, including at the first document of a window.
+Three model controls failed their general laws and concrete witnesses when choosing the longest length, consulting the next window in an intersection, or shifting a range's start.
+
+Verus checked six obligations in link:../verus/search_windows/proof.rs[the production window area].
+The Rust functions agree on assignment and the half-open scan interval for every document ID below the maximum word.
+The impact accumulator preserves the maximum frequency and minimum length when a posting joins the window.
+The single mutations failed their contracts.
+With the contracts also weakened, the assignment and scanning law caught both routing mutations and the impact law caught the length mutation.
+
+The 29 search unit tests, 18 SQL search tests, and seven node unit tests passed.
+Reproduce the native search checks from the checkout root with
+`BIJECTION_LOCAL_EXECUTION=owner-authorized cargo test --manifest-path rust/Cargo.toml --locked -p rtdb-search --lib -p rtdb-node --test search`.
+
+The model and verified functions leave several premises at the call sites.
+Tantivy must enumerate sorted postings of the queried term and preserve document identity.
+The persisted sidecar must represent the same postings and extrema as a computation on demand.
+The remaining native loop, intersection, visibility, and frontier-coverage steps need refinement evidence that these premises hold at the ranker's cutoff.
+
+== Global top K and offset after partition pruning
+
+Lean checked five theorems in link:../lean/PartitionedTopK.lean[the partitioned ranking model].
+For any result list ordered by descending primary score, a row in its first k positions has fewer than k strictly higher-scoring rows in its partition.
+Keeping every such row in every partition therefore preserves the entire ordered prefix, including ties in the original reference order.
+Using the sum of offset and fetch as the local bound preserves the requested SQL page.
+The proofs cover empty inputs, zero limits, and limits longer than the result.
+
+The model rejected breaking ties locally by a different row identifier order, which changes what a query could select with its own tie-break.
+It separately rejected applying a local bound of fetch alone when the offset is nonzero.
+Each mutation failed a general theorem and a concrete two-row case.
+The native SQL search suite exercises ranked reads across multiple partitions and checks offset results against full sorting.
+
+The theorem starts with the resolved, qualifying reference rows and their scores.
+It assumes the implementation retains every row admitted by the modeled predicate and reproduces the reference tie order in the final sort.
+The Rust candidate verification and scan planner still need this refinement proof.
+
+== Combined search verification and native replay
+
+The combined formal suite passed on `bd1de1b76` with 68 Verus obligations in nine areas and 36 rejected Verus controls.
+It included sixteen TLC baselines and 33 mutation or reachability controls.
+Its input manifest SHA-256 is `9503cda16e08665372e47daff7e88007e83667230a432cc6edd0b181f6fb02a1`.
+
+The Rust source was identical to `3899a0bda`, whose combined run passed the replica compile controls, rank witness and mutation, and 4,096 native temporal observations before the checkpoint build ran out of disk space.
+After removal of completed build outputs, the checkpoint and Azure portions passed in a fresh archive of that same revision.
+The retried cases included four native checkpoint tests and the root-first mutation, two native loopback Azure tests, and two rejected Azure source mutations.
+The input manifest for that Rust source is `f271f14e6a4355837c4a34b210ccc464a13608234e83ccd0443cc0c57a8094a5`.
+
+== Recovery across checkpoint publication and collection
+
+TLC explored all 53 states of link:../tla/RecoveryCollection.tla[the two-generation model].
+Each generation has a root and one private trie, and both use a shared object.
+One recovery invocation can select either advertised root whose basis is still covered by the log.
+Selecting a root takes a reference that persists through successful open or confirmed abandonment.
+Deletion authorization protects the union of advertised and recovery-held dependency sets.
+The authorized deletion can complete in a later step.
+Log trimming preserves the suffix required by the selected root even after a complete replacement is published.
+
+The five altered transition rules each violate their targeted invariant.
+They admit incomplete publication, omit the recovery reference, forget the replacement's shared object, trim using only the head, or admit recovery below the log floor.
+A reachability control opens the replacement after collection of the old private trie and advancement of the log floor.
+Apalache checked the same safety conditions up to ten transitions and independently found the missing suffix when trimming used only the current head.
+
+This is bounded model evidence under synchronized selection and deletion authorization, immutable identities, atomic durable head publication, and truthful durability.
+The model represents suffix retention with an ordered floor and assumes recovery can consult the advertised roots.
+It abstracts object discovery failures, concurrent recoveries, exact writes and log offsets, and the production implementation of a recovery reference.
+
+== Combined verification through recovery collection
+
+The complete runner passed on `c50748e38` with both Rust options enabled.
+It checked 68 Verus obligations in nine areas and captured the expected diagnostics for 36 Rust proof mutations.
+TLC completed 17 bounded baselines and found the expected counterexamples or reachability witnesses in 39 controls.
+Lean, Z3, Alloy, Apalache, and Maude also passed their recorded checks.
+The same run checked replica compile failures, the binary64 witness and its mutation, the 4,096-observation native temporal replay, all four checkpoint tests and the root-first mutation, and the two loopback Azure cases with their two source mutations.
+The input manifest SHA-256 is `3bd0140877aef40ef8be727633318d2f33609db813eddabfda4e4b521d0824f7`.
+
+== Pending historical trie promotion after checkpoint restore
+
+A catalog-level regression failed at `4077e49b2`.
+After L1H notices at distinct recencies and blocks, the persisted catalog held the nascent entries but restoration left their pending promotion index empty.
+The same L1C notice then dropped its covered L0 entries in both executions and promoted the historical entries in the uninterrupted execution only.
+
+The Rust loader now rebuilds the index from the final decoded nascent L1H entries.
+The regression round-trips the binary table block and checks the live trie set after each of two L1C notices.
+The fixed catalog suite passed all seventeen tests.
+
+Lean checked four theorems in link:../lean/CatalogRecovery.lean[the catalog recovery model].
+For any list of root-level historical entries, the rebuilt index names exactly the nascent block and recency pairs.
+Using that index gives the same promotion as scanning the catalog, for any sequence of current block notices.
+The controls check loss of the pending index and lookup at the next block.
+The proof abstracts decoding and the rest of catalog mutation.
+The Rust regression covers the catalog interface with split notices. It does not establish that the native L0 compactor emits those notices separately.
+
+The combined runner passed on `d9725442d`, including native replay of the production mutation that omits the pending index.
+All thirteen catalog tests passed with the same fix on `rtdb-multi` at `2047bc424`.
+The first run's input manifest SHA-256 is `614fbf0073fd69e87c57065a3436b200a875310304c1b593983a4478fd9f5a7c`.
+
+== Production tiered publication and checkpoint replay
+
+The catalog now calls link:../verus/tiered_publication/proof.rs[the verified tiered publication guard] before it promotes the replacement and supersedes the parent.
+Verus checked six obligations.
+The guard requires all four buckets to supply an entry at the target block in nascent or live state.
+Three source changes that omit a bucket, admit a newer generation, or count a garbage member fail their local contracts.
+Changing each contract along with its function still fails an independent law.
+
+A native catalog test runs 70 order-preserving interleavings of two four-notice groups in each of two catalog layouts.
+The layouts exercise current and historical tiers.
+At all 1,260 checkpoint cuts, the test serializes and decodes the table block, then replays the remaining notices.
+Every resumed step agrees with uninterrupted execution on persisted trie membership, phases and watermarks.
+All eighteen catalog tests and seventeen maintenance integration tests passed.
+The production proof depends on the Rust catalog looking up the four branches at one level, recency and parent prefix.
+The replay checks the persisted catalog transition. Full data and metadata closure and equality of query answers through concurrent storage operations remain open.
+
+== Native SQL replay through a partial tiered checkpoint
+
+The durable-node case `recovery_preserves_queries_through_tiered_publication` runs the Rust compaction worker, replica log, checkpoint writer and SQL engine on local storage.
+One worker publishes the first three buckets and pauses the fourth before its upload.
+The node serves all four current parents while the first three children are nascent.
+The fixture waits for the next checkpoint's actual adoption and decodes its table block to check that it contains those three nascent children.
+It then completes compaction and restarts from that checkpoint.
+Before the driver begins replay, the restored catalog holds those same three nascent entries.
+The final replica notice activates the four children.
+
+Both ordered SQL results, one with 129 current rows and one with 132 historical rows, agree before compaction, while the group is partial, after the group is live and after restart.
+The comparison includes values and temporal interval columns.
+All four native node fault cases and the manifest recovery case passed.
+The case uses one table with four input blocks and local durable storage.
+Collection is disabled so the result isolates publication, checkpointing and replay.
+
+== Combined verification through native tiered recovery
+
+The complete runner passed on `e20479c2c` with both Rust options enabled.
+It checked 74 Verus obligations across ten areas and matched diagnostics for all 42 Verus controls.
+TLC completed 17 bounded baselines and found all 39 expected counterexamples or reachability witnesses.
+Lean, Z3, Alloy, Apalache and Maude passed their recorded checks.
+Native replay passed five recovery cases, eighteen catalog tests, 4,096 temporal observations, the replica admission compiler controls, and the binary64 and loopback Azure cases.
+Both catalog mutations failed at the expected assertion, including the one that permits retiring the parent with three children.
+The input manifest SHA-256 is `44e515d3760196453298918fe79047f5812db67d997f6d09e431f307226e9e0b`.
+
+The same revision passed all 139 library and integration tests in the native index, maintenance and replication packages.
+Run those suites from the checkout root with
+`BIJECTION_LOCAL_EXECUTION=owner-authorized cargo test --manifest-path rust/Cargo.toml --locked -p rtdb-index -p rtdb-maintenance -p rtdb-replication --lib --tests`.
+
+== Checkpoint discovery during block collection
+
+Two durable-node tests failed on `94d8dfa9e` with a missing-object result even though a newer complete checkpoint existed.
+One test holds a listing result while the writer advances and the block collector retires the listed root.
+The other holds a table-block read after recovery has read the root.
+The tests use the production block collector, local object store and replica log.
+On the repaired implementation, both startup paths select the newer checkpoint and serve the two expected SQL rows.
+
+The Rust loader refreshes discovery after a missing root or table block.
+It retries only on a strictly greater reported block index.
+An unchanged, older or empty listing returns the missing-object error.
+The existing native test still fails closed on a malformed catalog or a missing table block with no replacement, before opening the log.
+
+Link:../verus/checkpoint_discovery/proof.rs[The Verus area] checks four obligations, including strict decrease of the distance to the largest representable index.
+The single and joint controls reject retrying the same index and refusing a newer one.
+Link:../lean/CheckpointDiscovery.lean[Lean] proves that attempts form a strictly increasing sequence for any list of observations and that its retry count is bounded by the remaining index range.
+The same-index mutation fails both general theorems and a concrete witness.
+
+TLC explored all 519 states of link:../tla/RecoveryDiscovery.tla[the metadata-discovery model].
+The model checks that failure caused by missing metadata refreshes discovery, only a newer index can be attempted, and neither an empty refresh nor invalid content can become a successful replacement.
+Five mutations break named invariants and a reachability case recovers after a refresh.
+Apalache checked the same safety conditions through ten transitions and independently found the fail-fast counterexample.
+
+The model bounds the number of published generations to three and allows stale or incomplete listings.
+This recovery path advances once a refreshed listing reveals a newer checkpoint and the needed metadata can be read.
+The production change covers checkpoint metadata discovery.
+It leaves full trie closure, replica-log suffix protection, and storage-provider availability as separate proof obligations.
+
+The combined formal and native runner passed on `f8fe52cb6`, including both startup tests and the mutation that disables refreshing.
+The input manifest SHA-256 is `49b0c50b2ac84788921aff22fe8479d2cbb92ee1fdd63b4c762b4d70e7cde4f4`.
+The same fallback is on `rtdb-multi` at `9a5875ea8` for ordinary latest-checkpoint recovery.
+That branch passed 101 tests, including both local Node cases and the refusal checks for exact-block and restored-archive recovery.
+
+== Observable checkpoint discovery
+
+mCRL2 202607.0 checked link:../mcrl2/CheckpointDiscovery.mcrl2[the staged and atomic models] over three reported indices.
+It compares the input observations and the outputs for admitted checkpoint, empty database, unavailable checkpoint and corrupt metadata.
+Candidate selection and the root and table reads are hidden.
+The staged and atomic systems have 326 and 146 reachable states respectively.
+They are divergence-preserving branching bisimilar.
+Three weakened policies are distinguishable by formulas over the visible actions.
+They fail early on missing metadata, retry the same index, or report an empty database after a missing checkpoint and an empty listing.
+The runner retains both systems and each counterexample formula.
+
+The comparison treats a listing and its two read outcomes as the environment's input for one attempt.
+The state-space proof applies to that finite observation model.
+The separate TLA+ study covers interleavings with publication and physical collection, and the native tests cover the two selected production schedules.
+
+== Combined verification through checkpoint discovery
+
+The complete runner passed on `061e83de6` with both Rust options and mCRL2 enabled.
+It checked 78 Verus obligations in eleven areas and matched all 46 Verus diagnostic controls.
+TLC completed all 18 bounded baselines and found the expected counterexamples or reachability witnesses for 45 controls.
+Lean, Z3, Alloy, Apalache, Maude and mCRL2 passed their recorded checks.
+The native replay covered seven checkpoint and recovery cases with their root-first and fail-fast controls, eighteen catalog tests with their two controls, the binary64 witness, 4,096 native temporal observations, replica admission compiler checks and the loopback Azure cases.
+The input manifest SHA-256 is `ae1040a40927f1f8cb2bb6dfcd1c89c95b1ae217a46cd29662e3e681e02da083`.
+A separate run on the same revision passed 111 tests in the node and replication packages with
+`BIJECTION_LOCAL_EXECUTION=owner-authorized cargo test --manifest-path rust/Cargo.toml --locked -p rtdb-node --test native -p rtdb-replication --lib`.
+
+== Two-run agreement on a stable recovery checkpoint
+
+AutoHyper with Spot checked link:../hyperltl/CheckpointRecovery.hltl[the universal pair property] over link:../hyperltl/CheckpointRecovery.smv[the finite startup model].
+The two public stable head choices each permit three startup paths.
+A direct startup reads the stable head, while the other paths start with an older listed block and encounter one missing root or table block.
+The refresh returns the stable head and its metadata is readable.
+
+Every pair whose stable head agrees eventually admits the same candidate in both runs.
+The separately checked reachability formula produces a pair in which one run is admitted first and both later agree.
+AutoHyper produced distinct lasso witnesses when fail-fast recovery stops and when a refresh keeps the failed candidate.
+This establishes the two-run property for the modeled stable listing and completed read steps.
+It leaves completion time, continuing provider failures, and the replica-log suffix outside the observation.
+
+== Combined verification through two-run checkpoint agreement
+
+The complete runner passed on `48a98ea71` with mCRL2, AutoHyper and both Rust replay options enabled.
+It checked 78 Verus obligations and matched all 46 diagnostic controls.
+TLC completed 18 bounded baselines and found the expected counterexamples or reachability witnesses for 45 controls.
+All other recorded formal checks and native replays passed, including the seven checkpoint and recovery cases and their root-first and fail-fast mutations.
+AutoHyper returned `SAT` for the pair property and the witness that distinguishes completion order.
+It returned `UNSAT` for both weakened models and supplied two traces per counterexample.
+The input manifest SHA-256 is `6401c5caecdb02079ea455bdfa013741d97c13e1f5c089bea898412feb1dcc8b`.
+
+== Ordered compaction page merge
+
+Link:../lean/CompactionMerge.lean[Lean] proves five laws of the abstract merge.
+Every finite batch admits a complete merge execution.
+For individually ordered pages, taking a minimum head until every page is exhausted emits a permutation of all input occurrences in key order.
+Its key sequence equals the result of flattening and sorting the input.
+A two-page witness permits either relative order for distinct payloads of equal key.
+Allowing a head above an available minimum and allowing completion with one remaining row each fail the associated law.
+
+The native differential test calls the production heap before temporal resolution.
+It enumerates all 54,241 batches of zero through four pages of length zero through two, using four keys formed from two IIDs and two signed timestamps.
+For each batch it verifies per-page occurrence order, exhaustion, and equality with a separate sort of IID ascending and system time descending.
+Reversing the heap's system-time ordering and dropping the last row each fail their expected assertion in an archived source copy.
+This replay covers the stated finite input family. A source proof of the heap invariants for arbitrary page counts and equivalence through temporal resolution and layout remain open.
+
+The full runner passed on `cbcfb34a5` with mCRL2, AutoHyper and both Rust options enabled.
+It checked 78 Verus obligations, matched 46 Verus diagnostic controls and completed 18 TLC baselines with 45 expected counterexamples or reachability witnesses.
+All other formal and native checks passed, including the five merge theorems and both model and native merge controls.
+The input manifest SHA-256 is `6f6a2387847a9dd3c3b171867ddc8de3321f74c92e4314b2b13913f4f625cf0e`.
+
+== System-time assignment for catalog transactions
+
+A native test on the baseline `a7b99a25c` committed an ordinary transaction with an explicit time ahead of the local log clock.
+The next attach failed at staging because its raw log time preceded the resolved head.
+The repaired resolver uses the same automatic clock decision for ordinary, external, skipped and catalog transactions.
+An explicit time that fails the same strict comparison still produces a refused outcome at its assigned automatic time.
+The private staging boundary checks that the write and result have the same transaction key and that the key's time is strictly later than the previous resolved time.
+
+The native test observes a successful attach at the next microsecond and a refused detach one microsecond later.
+It reopens the local node, observes the attached database in the catalog, verifies the recovered transaction key and reads the three ordered outcomes with SQL.
+The full selected node, replication and transaction suites passed 153 tests with the change on `main` and 158 tests with the corresponding change on `rtdb-multi` at `e86af7f12`.
+The scoped package command is
+`BIJECTION_LOCAL_EXECUTION=owner-authorized cargo test --manifest-path rust/Cargo.toml --locked -p rtdb-node --test native -p rtdb-tx --test resolution -p rtdb-replication --lib`.
+
+Link:../verus/system_time/proof.rs[Verus] checks two production functions and six laws over signed 64-bit input.
+It checks the first and advancing clock cases, the next-tick rule for a stalled clock, strict advancement, numeric exhaustion and refusal of a tied or older explicit time.
+Four controls pair production-only mutations with variants whose contracts were weakened as well.
+The common scalar module has identical contents on both branches.
+These proofs cover clock decisions before the transaction buffer validates intervals and before storage or replay.
+
+Link:../lean/SystemTime.lean[Lean] proves strict order for any finite mixed request list and proves that a completed prefix's final time suffices to resume its clock trace.
+The control that uses raw catalog time fails the local advancement lemma and a mixed sequence witness.
+Link:../tla/SystemClock.tla[TLC] explores all 129 states with four timestamps and at most two staged outcomes.
+It finds a tied time in two stages if catalog time is taken raw or if staging consults the durable head while earlier work is staged.
+With the restart seed removed, staging, publishing, crashing, restarting and staging again suffices to repeat the first timestamp.
+The baseline admits a later catalog transaction through that same restart sequence.
+Apalache checks strict ordering through eight transitions and independently finds the empty-restart counterexample.
+
+The models assume one resolver per ordered prefix and an intact recovered durable prefix.
+The native restart uses one local provider and one schedule.
+Existing persisted replica records retain their original decoding and replay rules.
+
+The full runner passed on `6c4ac85c1` with mCRL2, AutoHyper and both Rust options enabled.
+It checked 86 Verus obligations and 50 diagnostic controls, and completed 19 TLC baselines and 49 control or reachability cases.
+The archived native clock test passes and restoring the original raw assignment fails at the attach, with the predecessor-order error seen on the baseline.
+All other formal and native checks in the runner passed.
+The input manifest SHA-256 is `411931297c575c6a62cd4ffaee50a057c1b72661211bb239ade135cb437ff56c`.
+
+== Checkpoint selection against the replica log floor
+
+On baseline `c765b039a`, a startup test with the native memory log and object store failed while opening the selected checkpoint's replica tail.
+A newer complete checkpoint was available.
+The repaired startup checks the first required offset against the reported prefix floor before installing the recovered state.
+If it observes a gap, it refreshes checkpoint discovery and requires a strictly newer candidate.
+The log check runs again for each replacement. An unchanged, older or empty listing preserves the log-range error.
+
+The native test selects the newer checkpoint and replays a transaction written after it.
+The follower returns all three expected rows in order.
+The selected node, replication, conformance and storage suites passed 193 tests.
+The scoped package command is
+`BIJECTION_LOCAL_EXECUTION=owner-authorized cargo test --manifest-path rust/Cargo.toml --locked -p rtdb-node -p rtdb-conformance -p rtdb-replication -p rtdb-storage --test native --test node_faults --test recovery --lib`.
+
+The memory provider reports its retained floor and the Kafka adapter uses the broker's low watermark.
+Providers without this observation continue through the driver's tail-opening check.
+The standalone Kafka adapter compiled and 831 library tests passed with CMake 4.5.1 from the pinned release archive.
+The SHA-256 of `cmake-4.5.1-macos-universal.tar.gz` is `e1fb288543e4eb2a410e385ecebc64323bda51f0205782f2b094ccd5d572ca2d`.
+The package command is `BIJECTION_LOCAL_EXECUTION=owner-authorized cargo test --manifest-path rust/Cargo.toml --locked -p rtdb-kafka --lib`, with CMake on `PATH`.
+These tests establish the crate's local behavior. A live Kafka broker was outside the run.
+https://github.com/Kitware/CMake/releases/tag/v4.5.1[CMake 4.5.1]
+
+Link:../verus/replay_floor/proof.rs[Verus] checks the exact signed-offset decision and four laws.
+Starting at the first retained record is allowed, a true gap identifies the first missing record, the origin is valid for an untrimmed log, and a maximum offset cannot be below a retained floor.
+Four controls catch using the covered boundary instead of its successor and excluding the exact first retained record, including variants with matching weakened contracts.
+The strictly newer checkpoint predicate is shared with the verified metadata-discovery fallback.
+
+Link:../tla/RecoveryReplay.tla[TLC] explored all 161 states with three checkpoints and possible staleness in listings.
+It rejected controls for skipping the probe, failing without refreshing, retrying the same block and trusting an earlier probe when opening the tail.
+Separate reachability cases select a usable replacement and reach a loss between the probe and tail opening.
+Apalache checked the admitted-offset properties through ten transitions and independently found the counterexample to trusting the probe.
+The observation grants no reservation. Production protection of the suffix through replay and full storage dependency closure are open obligations.
+
+The corresponding recovery change is on `rtdb-multi` at `6d2fa63b6`.
+Its sealed log forwards the floor obtained from logkeeper using the same bounds query as tail opening.
+The selected node, replica and logkeeper suites passed 156 tests on the original patch base, including the memory-provider restart and a local logkeeper trim contract for readers and writers.
+A separate 45-test replication run adds exact-block and restored-anchor coverage when the log prefix has been trimmed and a later checkpoint lies beyond the contiguous chain.
+The patch was rebased after the remote advanced. `git range-diff` confirmed the patch contents were identical, and the `rtdb-multi` binary compiled on the new head.
+
+The full runner passed on `46c0deca8` with mCRL2, AutoHyper and both Rust options enabled.
+It checked 91 Verus obligations and 54 diagnostic controls, and completed 20 TLC baselines and 55 control or reachability cases.
+The archived startup test passed. Skipping the prefix check failed at native replica startup with the same log-range error as the baseline.
+All other formal and native checks in the runner passed.
+The input manifest SHA-256 is `2ce24bf34cb8f4c64ac867d03350a300b784b071da96776dae0020c6fd3e3021`.
+
+== Production compaction page heap
+
+The link:../verus/compaction_heap/proof.rs[Verus area] includes the exact Rust source of the production page heap.
+The constructor accepts precisely the pages whose adjacent keys are ordered and initializes one coordinate for each nonempty page.
+Heap construction and sift preserve the coordinate multiset and establish parent-to-child order under the documented input conditions.
+Each extraction returns the root, proves it is a minimum, and advances the selected page by one row or removes its exhausted coordinate.
+The transition keeps every other occurrence, including distinct rows whose keys tie.
+The proofs apply at all representable page lengths under the length and key callback contracts.
+The native wrapper supplies these callbacks from one immutable set of decoded pages for the heap's lifetime.
+
+The area checks 20 obligations.
+Four production mutations reverse the timestamp ordering, choose the later child, skip page validation, or return row zero.
+The joint mutation returns row zero and changes the function's contract to match.
+The independent root and row-identity laws then fail at their declared sites.
+
+The native replay enumerates 54,241 batches and compares row order with an independent flatten and sort.
+It also checks exhaustion, per-page row identity, and rejection of pages inverted by IID or by system time.
+Its test keys distinguish byte order and signed timestamp comparison.
+Four native controls catch the wrong child, a missing final row, a repeated coordinate, and the wrong IID byte order.
+The selected maintenance suites passed 37 tests on `main` and 30 tests on `rtdb-multi` at `e6adada1a`.
+Both branches compile the same heap source and use the adapter for their respective decoded row representation.
+The scoped command is `BIJECTION_LOCAL_EXECUTION=owner-authorized cargo test --manifest-path rust/Cargo.toml --locked -p rtdb-maintenance --lib --tests`.
+
+The link:../lean/CompactionMerge.lean[Lean merge model] proves whole-input occurrence and ordering laws.
+The source proof ends at the coordinates exposed by the page heap.
+Metadata traversal, clipping, interpretation of same-time and bitemporal events, and preservation after encoding and publication remain separate obligations.
+
+The combined runner passed on `bce1ab43b` with mCRL2, AutoHyper, and both Rust options enabled.
+It checked 111 Verus obligations and rejected 59 Verus mutation cases at their declared sites.
+TLC completed 20 baselines and found 55 expected counterexamples or reachability witnesses.
+The other formal models, compiler controls, and native replays passed.
+The input manifest SHA-256 is `e89fb0d25f7ecaea1a10f349f80a0c21391fd55c333ab78e586193b62450b5f9`.
+
+== Compaction planner row coverage
+
+The model in link:../lean/CompactionPlanner.lean[CompactionPlanner.lean] compares one overlay task with independently routing each input segment and filtering its flat rows.
+The first theorem proves that the overlay task carries exactly the routed input pages for any finite admitted outline.
+The second proves that its list of matching row occurrences equals filtering all input leaves when every leaf's rows agree with the IID edges above it.
+The third extends the equality to clipping by the job prefix.
+The argument permits coarser leaves beside deeper IID branches and concatenates recency children at the same IID depth.
+Each result quantifies over the full row value and preserves multiplicities.
+
+The pinned Lean runner checks all three theorems and audits their axioms.
+It rejects dropping a coarse leaf when another segment splits, selecting the wrong scheduled branch, and disabling clipping.
+
+The native compactor replay writes one legacy historical leaf and one historical trie with mixed IID depths and a recency branch to the in-memory object store.
+It compares the decoded compaction output to raw input rows filtered and ordered by an independent oracle.
+Six partitions cover the whole input, paths above, at, and below the task depth, and an empty partition.
+The output schema drops the input recency annotation in this case, consistent with the preserve-mode contract for inputs with mixed schemas.
+The replay catches dropping the coarse page, omitting recency expansion, and clipping only to the task path when the job prefix goes deeper.
+The complete selected Rust maintenance suites passed 38 tests after adding this replay.
+Run the baseline with `BIJECTION_LOCAL_EXECUTION=owner-authorized cargo test --manifest-path rust/Cargo.toml --locked -p rtdb-maintenance --test merge mixed_trie_depths_preserve_every_row_in_the_requested_partition -- --exact`.
+The combined runner's `--native-replay` option runs the baseline and all three controls from an isolated Git archive.
+
+The row-placement premise connects the model to a logical metadata tree in which every physical row is represented once.
+The Rust metadata decoder and task builder still need a source-level refinement argument.
+The finite native witness selects histories with disjoint valid intervals and checks their encoded rows.
+Full bitemporal preservation, including same-time conflicts and erasures, remains open.
+
+The combined runner passed on `8517dfc71` after the FTS experiment merge, with mCRL2, AutoHyper, and both Rust options enabled.
+It retained the 111 Verus obligations, 59 Verus mutation cases, 20 TLC baselines, and 55 TLC counterexample or reachability cases.
+It also passed the three audited planner theorems, their three mutants, and the native planner replay with its three mutants.
+The input manifest SHA-256 is `7957fd76d42e124a8fa8812cb0790f0a966f94e193b933c483ba987c6d8e7a67`.
+
+== Hosted authority branch integration
+
+The standalone-authority follow-ups through `f5a058624` are on `rtdb-multi` at `edcc54427`.
+The merged explicit flush waits for a block covering the accepted source position and publishes the checkpoint under the same holder epoch before returning its block number.
+Historical stages bind their storage and key namespaces so the existing disposal path can validate the exact installation.
+The first merged test run caught a duplicated S3 root segment.
+Cell access, inventory, and custody now use the prefix composed by the existing S3 configuration API.
+
+The local directory and multi suites ran 192 cases, including the held stage and repair lifecycle, with DynamoDB support compiled in.
+Six cases were marked ignored and five S3 cases exited at their endpoint gate.
+Run the selected suites with `BIJECTION_LOCAL_EXECUTION=owner-authorized cargo test --manifest-path rust/Cargo.toml --locked -p rtdb-multi -p rtdb-directory --features rtdb-multi/dynamodb --lib --tests`.
+Live S3 and DynamoDB were outside the run.
+
+== Same-time valid interval normalization
+
+The Lean model in link:../lean/CompactionIntervals.lean[CompactionIntervals.lean] treats a cohort as the put and delete commands for one IID at one system time, newest ordinal first.
+An older command contributes its valid interval minus every higher-priority command interval.
+The model proves exact half-open point coverage, disjoint fragments for well-formed intervals, and the same winning command or absence at every valid instant.
+The observed result distinguishes a winning delete from the absence of any command.
+The runner audited six theorems and rejected dropping the first uncovered point, forgetting a newer blocker, and losing a fragment's payload.
+
+The native replay calls `resolve_same_time` on 2,955 cohorts of up to three commands drawn from seven intervals and two operations.
+For each cohort it checks six valid instants against a direct first-matching-command oracle and requires at most one covering fragment.
+The replay rejected preserving a shadowed fragment and dropping a visible leading fragment.
+The `--native-replay` option runs the test and both controls, using an archive of the production Rust source.
+
+The history theorem proves that substituting normalized cohorts anywhere in the reference history preserves every point query when all other events retain their positions.
+Its controls discard intervening events or reverse the priority of same-time commands.
+A native replay compacts an Arrow input containing a same-time put and delete and an erase, then combines the decoded output with untouched older rows.
+It matches the original history at 440 combinations of IID, system time, and valid time, and rejects dropping the erase from the output.
+General refinement of cohort formation, erase handling, and final layout through catalog publication remains open.
+
+The combined runner passed on `0050d0833` with mCRL2, AutoHyper, and both Rust options enabled.
+That run included the six interval theorems and the native cohort controls.
+Its input manifest SHA-256 is `3c3acf9ff1d60f596032f31d1ac80f4e36b3ed2d3d1508efb89928826a92643a`.
+On `d31830530`, the focused runner audited all seven interval and history theorems, rejected their five controls, and passed both native replays with all three controls.
+The selected Rust maintenance suites also passed 40 tests at that revision.
+The combined runner passed on the equivalent proof and program sources at `f58954ea5` with mCRL2, AutoHyper, and both Rust options enabled.
+It included the surrounding-history theorem and the archived native erase control.
+Its input manifest SHA-256 is `6ae698322fe3f1d27e4b0758d498df2142bc8c1f4e3535d820f55d119bdcd2ca`.
+
+== Coordinated generation retention
+
+The link:../lean/GenerationRetention.lean[Lean model] proves an availability invariant for the current generation, every open reader, and every in-flight operation.
+The invariant holds for all finite histories from a safe initial state, with arbitrary generation and object identities and overlapping dependencies.
+An object required by any protected generation is present and has no outstanding collection authorization.
+Closing a reader preserves its in-flight references, and completing one read removes exactly one reference while preserving all other counts.
+The model also admits a two-step authorization and collection program for any present object with no reference.
+
+The five audited theorems pass in the pinned Lean runner.
+The four controls admit a pending object into a published generation, drop I/O on close, authorize against only the current generation, or complete every operation for the same generation.
+The close control leaves availability over tracked references valid and fails the independent reference-preservation law.
+
+The model takes the generation's dependency relation and atomic registration and collection authorization as premises.
+Physical completion represents a provider-confirmed end to deletion, with all effects of that authorized operation settled.
+The Rust capture path, I/O lifetime, collector, and failover authority need a refinement to this protocol before the theorem applies to deployment behavior.
+
+== Reader retention within one partition authority
+
+The Rust partition registers each captured query or transaction catalog under its state lock.
+The collector captures one consistent view of the current catalog and the retained generations before choosing objects.
+Eligibility stays restricted to garbage in that view and excludes each trie live in a retained catalog.
+The existing group-artefact decision receives the resulting batch.
+Ordinary publication preserves shard watermarks, and compactor reset refuses while an active collection can still touch an old key.
+
+Query opening and cursor advancement pass their captured catalogs into the storage I/O region.
+The provider worker holds that reference through completion even if the waiter is dropped.
+Collection uses the same lifetime transfer for its reset fence.
+The observation depends on I/O being admitted and drained by the existing region.
+
+The link:../verus/reader_retention/proof.rs[reader retention area] checks the exact native selection loop against a list of visibility observations.
+It checks that selection accounts for every catalog, with a law that a retained catalog by itself keeps its dependencies.
+The runner checked three obligations and caught skipping the last catalog with either the original or a matching weakened contract.
+The Rust callback obtains each observation from the immutable catalog captured by the partition.
+
+The selected native suites passed 376 tests.
+The collection test keeps a trie and its files while two readers retain its catalog, collects another eligible trie in that cycle, and collects the retained trie only after both readers close.
+It also checks that reset is refused while a collection is held.
+The storage test checks that cancelled I/O retains its reference until the worker and its undelivered result finish.
+Run the selected suites with `BIJECTION_LOCAL_EXECUTION=owner-authorized cargo test --manifest-path rust/Cargo.toml --locked -p rtdb-index -p rtdb-maintenance -p rtdb-storage -p rtdb-query -p rtdb-node -p rtdb-replication --lib --test gc --test native --test catalogs`.
+
+The combined formal runner passed on `b4b5001ec`, including 114 Verus obligations, 61 Verus controls, and the Lean, TLC, Apalache, Alloy, Maude, mCRL2, AutoHyper, and SMT studies.
+The replay options were omitted for this invocation.
+Its input manifest SHA-256 is `8cdc8277a31e53e99eb508db2be62aea3840116d4cab2aedd306d4591044d7f2`.
+The follow-up collection test composes the storage and collector checks.
+The last query catalog moves into a running I/O operation, and the test confirms that collection preserves its objects even after cancelling the waiter.
+It then waits for the I/O region to drain and verifies that collection reclaims them.
+All five tests in the maintenance `gc` suite passed with that follow-up.
+
+This deployment boundary covers one installed partition authority and its trie collector.
+Coordination between nodes, other physical deletion paths, and checkpoint and log retention during recovery remain open.
+
+== Trie dependencies of the installed checkpoint
+
+Commit `2f1019b68` records the exact live and nascent trie identities of the installed checkpoint.
+Startup derives them from the same restored trie catalog used by the partition.
+Block adoption derives them from the persisted table blocks and installs them atomically with the new block index.
+The collector observes that set, the current catalog, and retained reader catalogs at one local cut.
+A nascent trie is a recovery dependency because replay can complete its compaction cohort.
+
+The link:../verus/reader_retention/proof.rs[production retention area] verifies four obligations, with independent laws for the installed checkpoint and open readers.
+Dropping either dependency source fails its original contract or, when the contract is weakened with it, fails the corresponding law.
+The proof assumes the caller supplies checkpoint membership and reader observations from the captured cut.
+It checks selection over those observations.
+
+The selected Rust suites passed 377 tests.
+The new maintenance test observes the collector and its store before and after installing a replacement checkpoint.
+It checks that both file pairs stay present when the live and nascent tries recorded by the original checkpoint become garbage in the serving catalog.
+It checks that a later checkpoint no longer depending on them permits collection and its deletion notice.
+Use `BIJECTION_LOCAL_EXECUTION=owner-authorized cargo test --manifest-path rust/Cargo.toml --locked -p rtdb-maintenance -p rtdb-index -p rtdb-query -p rtdb-node -p rtdb-replication --lib --test gc --test live_index --test scan --test native`.
+The complete link:../README.adoc[combined runner] passed on `2f1019b68` with both `--rust-boundary` and `--native-replay`.
+Its archived-source control removed the checkpoint from the collector decision and failed at the original checkpoint hold assertion.
+The run verified 115 Verus obligations across 15 areas, attributed 63 source controls, and checked the 20 TLC baseline configurations with their controls.
+Lean, Apalache, Alloy, SMT, Maude, mCRL2, and AutoHyper completed their configured cases.
+Its input manifest SHA-256 is `6a03ec9402f0575c5e58c6fdeb2169a04b465cf3da630fa33603645d93c5e068`.
+
+This protection covers data and metadata selected by the Rust trie collector within one partition authority.
+The file-presence test uses the in-memory object provider.
+Reader or recovery holds across authorities, roots and payloads eligible for block collection, and the replica suffix require separate production coverage.
+Checkpoint-adoption latency and inventory memory overhead have no benchmark result in this study.
+
+=== Installed-checkpoint protocol model
+
+The link:../tla/InstalledCheckpoint.tla[installed checkpoint model] separates current catalog supersession, replacement checkpoint publication, local adoption, reader capture and close, and physical deletion.
+It has two catalog cuts, one reader, a live and a nascent entry in the first cut, and one replacement entry.
+TLC visited all 31 reachable states without violating `InstalledReadable` or `ReaderReadable`.
+Using the current catalog in place of the installed checkpoint and omitting the nascent entry each violated `InstalledReadable`.
+The reachability check produced a trace that collects both original objects after replacement adoption.
+Apalache independently checked the two safety invariants through ten transitions and found the omitted nascent dependency.
+The model assumes one authority, atomic transitions, and immutable object identities. It abstracts object bytes, I/O cancellation, replica log retention, and remote discovery.
+
+=== Integrated model and ordered-index checks
+
+The combined formal runner passed again at `e68e49995` with the installed-checkpoint model and the concurrently merged ordered-index code.
+The native replay and Rust boundary flags were omitted for this second combined run.
+Its input manifest SHA-256 is `445f97669e6371714380c28acda31f6c8396cd7ff06e268c2cb92d5199ec7f53`.
+The separate `verification/multi/check.sh` run checked ten Lean modules and 14 TLC configurations at the same revision.
+Each expected negative configuration failed its named invariant.
+The ordered-index suite checked six Lean law modules, audited 13 exported theorems, and verified ten domain and six seek obligations under the installed Verus version.
+The separate large ordered-index TLC run remains recorded at its original revision. link:../ordered-index/README.md[Ordered-index evidence and reproduction]
+
+During the native integration run at `e68e49995`, the ordered-index rebuild test requested repair while the reopened node still reported the following role.
+Commit `1d04609de` made the explicit ordered artefact request wait for the elected node's maintenance worker.
+The consolidated native suite retains the checks for exact original manifest bytes and the recovered page.
+
+=== Hosted and Multi branch consolidation
+
+The consolidation includes hosted ordered-index tip `49bd0c804` and RTDB Multi tip `b03fde804` as ancestors.
+Ordinary checkpoint discovery keeps the strictly newer refresh rule.
+Exact and restored-archive discovery preserve their recovery anchors and the restored compaction replay cutoff.
+Local collection continues to account for installed checkpoint membership and active readers.
+Storage admission transfers both reader and hosted provider-region lifetimes through detached operations.
+The compaction driver acquires the shared job slot before dispatching CPU-bound work to a blocking worker.
+
+The redirected generation-retirement model run checked the 605 reachable states and rejected the three weakened upload settlement, reader drain, and replay scrubbing configurations.
+The reported state counts describe the model of two publishers and two readers.
+
+The native consolidation run at `1ff7e09d8` passed 739 selected tests across 20 binaries.
+It included the closed-history recovery fixture, the current Arrow page heap oracle, native ordered-index rebuild, group-artefact GC, replica replay, object-store I/O, and Multi's library tests.
+The test suite keeps one heap oracle on the production Arrow-backed row representation after resolving the duplicate imported from Multi.
+Reproduce with `BIJECTION_LOCAL_EXECUTION=owner-authorized cargo test --manifest-path rust/Cargo.toml --locked --no-fail-fast -p rtdb-node -p rtdb-index -p rtdb-storage -p rtdb-maintenance -p rtdb-query -p rtdb-replication -p rtdb-multi -p rtdb-directory -p rtdb-logkeeper -p rtdb-pgwire -p rtdb-conformance --lib --test gc --test native --test catalogs --test disk_cache --test remote --test node_faults --test recovery --test protocol --test search`.
+The combined formal input manifest at `93974d258` is `07aa342d77224a6f90eeff1f49706d77e2328297336e9b53c76aa633e18c6189`.
+The additional ordered-index Verus domain run at `16ae17a9f` checked 20 obligations, including the production maximum aligned bucket step.
+Its explicit-fairness generation-retirement configuration checked the temporal property over the same 605 reachable states.
+
+The follow-up merge `91c446b75` includes Multi tip `a7f795eb`.
+Its 271 selected tests pass across the Multi library, local cell, Flight SQL gateway, types library, and quantized budget suites.
+They exercise the newer resident-idle and parking lifecycle, direct writer routing, stale installation refusal, and active Flight SQL call retention.
+Reproduce with `BIJECTION_LOCAL_EXECUTION=owner-authorized cargo test --manifest-path rust/Cargo.toml --locked --no-fail-fast -p rtdb-multi -p rtdb-types --lib --test cell --test flight_gateway --test quantized_budget -- --test-threads=4`.
+Lean checked the imported repair boundary and repair prefix modules followed by `RetainedJournal.lean`, with warnings promoted to errors.
+The combined formal runner passed at `91c446b75` with Lean, Verus, TLC, Apalache, Alloy, Z3, Maude, mCRL2, and AutoHyper.
+It recorded 115 Verus obligations, 63 source controls, and 21 TLC baseline configurations.
+Its input manifest SHA-256 is `d92c0b97b24a6b19719564c7eea6816d9b6aff16c6ae59439d79a52d2a2a4e67`.
+The native replay and Rust boundary flags were omitted from this invocation.
+Distributed reader and recovery retention, hosted provider settlement, and the replica log suffix remain outside the local runtime guarantee.
+
+=== Prepared replica cursor during checkpoint recovery
+
+The ordinary recovery path asks a supporting replica log to admit a cursor before installing a checkpoint.
+It retries a strictly newer checkpoint only when the error identifies the first requested offset as part of a discarded prefix.
+The driver takes the admitted cursor with its original log and boundary identity.
+Exact and restored-archive recovery retain their existing anchors.
+Local file logs and providers that defer admission still open the cursor when the driver runs and retain their optional earlier floor check.
+
+TLC checked 171 reachable states of link:../tla/PreparedReplay.tla[PreparedReplay].
+The controls reject installation without admission, refusal without refresh, and use of a different cursor by the driver.
+Two additional traces witness successful recovery on a newer checkpoint and trimming after admission.
+The latter remains possible because cursor admission carries no retention entitlement on a remote log.
+
+The native suites passed 433 tests on `773adfde9`, including the Multi and logkeeper cold-start path after trimming.
+The gated native case checks the selected block before the consumer starts, the recovered SQL result, two recovery admissions, and zero independent tail opens by the driver.
+The source control run at `1740907ed` rejected leaving admission out of startup and discarding the admitted cursor.
+Use `BIJECTION_LOCAL_EXECUTION=owner-authorized cargo test --manifest-path rust/Cargo.toml --locked --no-fail-fast -p rtdb-node -p rtdb-storage -p rtdb-replication -p rtdb-logkeeper -p rtdb-multi -p rtdb-conformance --lib --test native --test contract --test node_faults --test cell -- --test-threads=4`.
+The combined formal runner passed at `773adfde9` with input manifest SHA-256 `9198b230b9f18f27d4280e3ff32da536919f4bd4085e9bd55d0df6e66ce55b7e`.
+The combined run used the formal flags and the separate native run exercised the actual cursor handoff.
+
+=== Shared authorization for replay retention
+
+Link:../tla/ReplicaTrimAdmission.tla[ReplicaTrimAdmission] studies the next protocol with two simultaneous recovery handles, three candidate offsets and delayed physical trimming.
+A trim authorization advances a durable floor, which new recovery admissions consult even while the physical trim is pending.
+Authorization must preserve the smallest position required by every active recovery.
+TLC checked all 75 reachable states and caught both weakened rules.
+The reachability witness admits a new reader after an actual trim.
+
+Link:../lean/ReplicaTrimAdmission.lean[The Lean model] proves that no authorized physical trim removes an active recovery's starting position, for arbitrary finite histories and any reader type with decidable equality.
+The three audited theorems use only `propext` and `Quot.sound`.
+Both admission-control mutations fail the invariant-preservation theorem.
+This model assumes one stream with one durable authority, atomic registration and trim authorization, and a provider that completes only authorized trims.
+The proposed shared authority and recovery holds are still open production work.
+
+The combined formal runner passed on `17ad591d6` with 23 TLC baseline configurations and the new Lean and TLC controls.
+Its input manifest SHA-256 is `eb714e7df2ca08815f25ccd5c8c84491cb06e43486a56c36dae22498ea185a4a`.
+The Kafka adapter passed `BIJECTION_LOCAL_EXECUTION=owner-authorized cargo check --offline --locked --manifest-path rust/Cargo.toml -p rtdb-kafka --lib` with the pinned CMake 4.5.1 on `PATH`.
+This adapter check did not connect to a broker.
+
+=== Multi recovery admission against an authorized trim
+
+Commit `e0192fdfd` makes the serving Multi log read the directory's certified replica prefix when admitting an ordinary recovery cursor.
+An outdated start reports the first required offset and the first offset outside the authorized prefix, allowing the checkpoint-discovery loop to seek a strictly newer root.
+The decision is scoped to the physical replica stream and log epoch, and the writer epoch may change without resetting the boundary.
+The provider still validates its own cursor.
+
+Verus checks three obligations on the actual offset decision in `rust/crates/multi/src/replica_retention.rs`.
+The controls exclude the first retained record, weaken the specification to match that behavior, and jointly drop the authorization rule and its contract.
+Each control reports its declared failure.
+The native test witnesses the directory refusing an outdated start while the backing log still has the requested record and accepts a start at the first retained record.
+The backing provider for that test is `MemoryLog`.
+The separate `cell` suite exercises real local logkeepers and cold recovery after their physical trim.
+`1dd4b2a42` passed 96 Multi library tests and 75 cell tests.
+
+[source,sh]
+----
+cd rust
+BIJECTION_LOCAL_EXECUTION=owner-authorized CARGO_TARGET_DIR=../target \
+  CARGO_BUILD_JOBS=2 CARGO_INCREMENTAL=0 CARGO_PROFILE_DEV_DEBUG=0 \
+  CARGO_PROFILE_TEST_DEBUG=0 cargo test --offline --locked -p rtdb-multi --lib --test cell
+----
+
+The `verify_multi_trim_admission` case in the formal runner's `--native-replay` lane reruns the focused test and a source control that omits the directory check.
+The focused baseline and expected assertion failure were both observed at `1dd4b2a42`.
+The native control's original `logs.rs` SHA-256 is `9e29de26443852521f5fc1a494b368884738950c1cdf6391a9037071e179a56e`.
+
+=== Recovery hold closure and owner loss
+
+TLC explored 22,494 reachable states with two hold identities, three offsets, a delayed directory admission, and independently delayed physical trim.
+The safety checks cover closure after a drain or confirmed stop, retention through an active or draining read, and the inability of a delayed admission to recreate a released hold.
+The three controls reject premature closure on cancellation, treating timeout as stop evidence, and skipping the closing CAS when no hold is visible.
+A fourth case reaches a physical trim after an owner's stop is confirmed and the hold is removed. link:../tla/ReplicaHoldLifecycle.tla[Lifecycle model]
+
+Lean proves `close_consumes_only_its_hold`, `close_fences_prior_admissions`, and `a_missing_hold_still_fences_its_ambiguous_admission` for arbitrary reader identities with decidable equality.
+The proofs use `propext` and `Quot.sound` and assume a monotone directory revision and a successful atomic close.
+The controls keep the revision unchanged and drop another reader's hold. link:../lean/ReplicaHoldClose.lean[Close and fencing laws]
+
+The admission check covers trims authorized before the directory read.
+A later trim is still possible because the production cursor does not register a durable hold.
+The models leave provider drain and conclusive owner death as refinement premises, and they abstract the release schedule and provider protocol.
+
+The combined formal runner passed at `1dd4b2a42` with Lean, Verus, Z3, TLC, Apalache, Alloy, Maude, mCRL2, and AutoHyper.
+It checked 24 TLC baseline configurations and the registered controls and witnesses.
+The native replay and Rust boundary flags were omitted in this combined run.
+Its input manifest SHA-256 is `9db36db755083ddc52a18203d897c48d7771710baef0854202f4a7311affd4f1`.
+See the link:../README.adoc#_run_the_studies[runner command and tool versions].
+
+=== Durable holds for Multi's ordinary catch-up
+
+Commit `e298879a0` stores each nonempty catch-up window as a recovery hold on the same deployment record as the authorized replica trim.
+The serving cursor captures the observed committed tip and registers its first required position before opening the provider cursor.
+The holder certifies a trim strictly below both the published checkpoint boundary and the least position in any recovery hold.
+The directory CAS validates both observations before physical trim can begin.
+The hold ends when the cursor has delivered its captured tip or when the cursor and its pending read have been dropped.
+The serving-region drain keeps whole-residence disposal behind outstanding holds.
+
+The release worker survives cancellation of its opener and uses the storage-region close CAS to fence an ambiguous admission.
+The reaper can act on a drained local witness or a confirmed stop of the exact hosted task.
+A missing stop witness leaves the hold in place.
+The local reaper test clears a discharged witness while preserving another live hold at the same offset.
+The local cell test blocks the reply to a successful hold registration, publishes a newer checkpoint, observes a real logkeeper trim that retains the first required record, then checks the subscriber's SQL rows and later trim progress.
+
+The native run at `a456fd6c5` passed 98 library tests and 76 cell tests.
+The rebase to `e298879a0` changed independent ordered-index proof files and preserved the tested Rust, Allium, and Verus sources byte for byte.
+
+[source,sh]
+----
+cd rust
+BIJECTION_LOCAL_EXECUTION=owner-authorized CARGO_TARGET_DIR=../target \
+  CARGO_BUILD_JOBS=2 CARGO_INCREMENTAL=0 CARGO_PROFILE_DEV_DEBUG=0 \
+  CARGO_PROFILE_TEST_DEBUG=0 cargo test --offline --locked -p rtdb-multi --lib --test cell
+----
+
+Verus verifies six obligations in the production replica-trim area.
+The additional single control drops the earliest hold from the cap.
+The joint control changes the contract along with the implementation, and the explicit retention law still fails.
+The Lean and TLC models cover closed and ambiguous holds under their stated authority and provider premises.
+The Rust arithmetic proof assumes its supplied minimum reflects the directory record, and runtime evidence for that adapter comes from the local cell case.
+
+The focused `verify_recovery_hold_replay` and `verify_multi_trim_admission` runner cases both passed on the landed Rust source.
+The first control omits holds from the trim input and fails the physical-retention assertion in the real cell test.
+The second omits the authorized-prefix check and fails the pending-trim admission assertion.
+Both expected failures ran with one selected test apiece.
+The originals have SHA-256 `0872a179d04164527539ef1af82ef1bfa40b11a7934f59e494c2a2bfabebb53e` for `agent.rs` and `e1e941202be4c3a5662c48ec9ffa506b89fc54c01b2776907ed13883b3841d29` for `recovery_holds.rs`.
+Both cases can be selected through the runner's `--native-replay` lane.
+
+The production hold covers an ordinary Multi startup's captured replica suffix.
+Checkpoint-object reachability across authorities, the live tail after catch-up, provider-side proof of hosted stop and drain, and retained-history reads for separate exact restore paths have different lifetime obligations.
+
+The combined formal runner passed at `a456fd6c5` with Lean, Verus, Z3, TLC, Apalache, Alloy, Maude, mCRL2, and AutoHyper.
+It exercised 24 TLC baseline configurations and the registered controls and witnesses.
+The native replay and Rust boundary flags were omitted from the combined run, and the focused native results are recorded above.
+The input manifest SHA-256 is `1b8ebc14ef98cfa0ce628c009e7d3607635e40aec0364a702d410a788071bf21`. link:../README.adoc#_run_the_studies[Runner command and tool versions]
+
+=== Checkpoint metadata reaping across authorities
+
+At `ae0957678`, the metadata model covers publication, admission, release, preparation of a deletion, and the provider's later removal of the object.
+Its scope is one immutable physical residence and checkpoint metadata ordered by block.
+It assumes authoritative versioned admission, a forward published block, and no reuse of the released object's identity.
+The model abstracts the clock threshold, provider transport, and ancestry references.
+
+TLC explored 79 reachable states with two readers and three blocks.
+It rejected stale admissions, overlooking existing holds, and backward publication at the named safety properties.
+The reachability witness removes both old blocks and retains the latest one with a live startup reader.
+Use `java -cp tla2tools.jar tlc2.TLC -config verification/tla/CheckpointMetadataRetention.cfg verification/tla/CheckpointMetadataRetention.tla` from the repository root.
+
+Lean checked `plans_survive_interleavings`, `reachable_plans_are_safe`, and `admitted_metadata_cannot_be_deleted` for finite histories with arbitrary reader identities and block indices.
+The axiom audit reports `propext` and `Quot.sound` only.
+Replay the positive proof with `lean verification/lean/CheckpointMetadataRetention.lean` on Lean 4.36.0.
+The standard local Lean run reached its wall-clock timeout during host contention.
+A focused rerun with `lean -j 1` and the default proof budgets verified the same baseline and rejected all three controls at `plans_survive_interleavings`.
+The registered runner cases specify the bounded witnesses, mutations, and expected failure sites. link:../lean/CheckpointMetadataRetention.lean[Lean laws] · link:../tla/CheckpointMetadataRetention.tla[TLA+ model]

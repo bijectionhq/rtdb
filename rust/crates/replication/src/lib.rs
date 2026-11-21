@@ -1,4 +1,5 @@
 mod admission;
+mod admission_step;
 mod appender;
 mod blocks;
 mod checkpoint_discovery;

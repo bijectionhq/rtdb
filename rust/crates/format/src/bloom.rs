@@ -55,6 +55,28 @@ impl BloomFilter {
         Ok(())
     }
 
+    /// Adds the `rows` of a string, binary or fixed-size binary array as `insert_cell` adds each, hashing every cell's
+    /// bytes in place and entering their positions in one union; false, adding nothing, for any other layout.
+    pub fn insert_byte_cells<'a>(&mut self, array: &'a dyn Array, rows: impl Iterator<Item = usize>) -> bool {
+        use arrow_array::cast::AsArray;
+        let cell: Box<dyn Fn(usize) -> &'a [u8] + 'a> = match array.data_type() {
+            arrow_schema::DataType::Utf8 => { let array = array.as_string::<i32>(); Box::new(move |row| array.value(row).as_bytes()) }
+            arrow_schema::DataType::Binary => { let array = array.as_binary::<i32>(); Box::new(move |row| array.value(row)) }
+            arrow_schema::DataType::FixedSizeBinary(_) => { let array = array.as_fixed_size_binary(); Box::new(move |row| array.value(row)) }
+            _ => return false,
+        };
+        let mut positions = Vec::new();
+        for row in rows {
+            let (first, second) = if array.is_null(row) { (0, 0) } else {
+                let bytes = cell(row);
+                (rtdb_columnar::xxhash32(bytes, 0) as i32, rtdb_columnar::murmur3_32(bytes, 0) as i32)
+            };
+            positions.extend(hashes(first, second));
+        }
+        self.insert_positions(&mut positions);
+        true
+    }
+
     pub fn insert_cell(&mut self, field: &Field, array: &dyn Array, row: usize) -> Result<()> {
         let (first, second) = byte_hashes(&rtdb_columnar::read_value(field, array, row)?)?;
         self.insert_hashes(first, second);

@@ -155,15 +155,23 @@ class TableCatalog(private val flow: StateFlow<State>) {
          * order transactions themselves arrive does not.
          */
         fun withEntriesFor(tables: Collection<TableRef>): State {
-            val fresh = tables.filterNot { it in entriesByTable }.sortedBy { it.schemaAndTable }
+            val fresh = tables.filterNot { it in entriesByTable }.distinct().sortedBy { it.schemaAndTable }
             if (fresh.isEmpty()) return this
 
             val firstOid = entries.maxOfOrNull { it.oid + 1 } ?: TableEntry.FIRST_OID
+            val usedSlugs = entries.mapTo(mutableSetOf()) { it.slug }
+            val minted = fresh.mapIndexed { idx, table ->
+                val entry = TableEntry.mint(firstOid + idx, table)
+                if (usedSlugs.add(entry.slug)) table to entry
+                else {
+                    val slug = generateSequence(1L) { it + 1 }
+                        .map { TableSlug("${entry.slug.slug}~$it") }
+                        .first(usedSlugs::add)
+                    table to entry.copy(slug = slug)
+                }
+            }
 
-            return copy(
-                entriesByTable = entriesByTable +
-                        fresh.mapIndexed { idx, table -> table to TableEntry.mint(firstOid + idx, table) }
-            )
+            return copy(entriesByTable = entriesByTable + minted)
         }
 
         /**

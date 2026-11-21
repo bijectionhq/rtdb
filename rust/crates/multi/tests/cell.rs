@@ -125,8 +125,15 @@ async fn stopping_a_node_releases_its_agent_and_its_standby_storage_witness() {
     cell.stop().await;
 }
 
+#[derive(Default)]
+struct RecoveryGate {
+    registered: tokio::sync::Notify,
+    resume: tokio::sync::Notify,
+}
+
 struct ObservedDirectory {
     inner: Arc<MemoryDirectory>,
+    recovery_gate: std::sync::Mutex<Option<Arc<RecoveryGate>>>,
     reads: std::sync::atomic::AtomicUsize,
     holder_queries: std::sync::atomic::AtomicUsize,
     membership_scans: std::sync::atomic::AtomicUsize,
@@ -134,7 +141,7 @@ struct ObservedDirectory {
 
 impl ObservedDirectory {
     fn new() -> Arc<Self> {
-        Arc::new(Self { inner: MemoryDirectory::new(), reads: Default::default(), holder_queries: Default::default(), membership_scans: Default::default() })
+        Arc::new(Self { inner: MemoryDirectory::new(), recovery_gate: Default::default(), reads: Default::default(), holder_queries: Default::default(), membership_scans: Default::default() })
     }
 }
 
@@ -152,7 +159,20 @@ impl Directory for ObservedDirectory {
         self.holder_queries.fetch_add(1, Ordering::Relaxed);
         self.inner.deployments_held_by(id).await
     }
-    async fn replace_deployment(&self, record: DeploymentRecord, expected: rtdb_directory::Version) -> Result<rtdb_directory::Cas<DeploymentRecord>> { self.inner.replace_deployment(record, expected).await }
+    async fn replace_deployment(&self, record: DeploymentRecord, expected: rtdb_directory::Version) -> Result<rtdb_directory::Cas<DeploymentRecord>> {
+        let result = self.inner.replace_deployment(record, expected).await?;
+        let gate = match &result {
+            rtdb_directory::Cas::Applied(record) if record.storage_regions.values().any(|region| matches!(region, rtdb_directory::StorageRegion::ReplicaReplay { .. })) => {
+                self.recovery_gate.lock().unwrap().take()
+            }
+            _ => None,
+        };
+        if let Some(gate) = gate {
+            gate.registered.notify_one();
+            gate.resume.notified().await;
+        }
+        Ok(result)
+    }
     async fn register_member(&self, member: rtdb_directory::MemberRecord) -> Result<rtdb_directory::MemberRecord> { self.inner.register_member(member).await }
     async fn member(&self, id: &MemberId) -> Result<Option<rtdb_directory::MemberRecord>> { self.inner.member(id).await }
     async fn members(&self) -> Result<Vec<rtdb_directory::MemberRecord>> {
@@ -2093,6 +2113,77 @@ async fn a_node_over_its_tail_budget_flushes_its_largest_tail_first() {
     assert_eq!((rows("big"), rows("small")), (0, small_tail), "the largest tail is flushed, and only as much as needed to fit");
     assert_eq!(values(&big, "SELECT COUNT(*) FROM orders").await, ["40"]);
     drop((big, small));
+    cell.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_recovering_subscriber_keeps_its_suffix_through_a_concurrent_trim() {
+    use rtdb_directory::StorageRegion;
+    use rtdb_storage::log::{Log, LogOffset};
+
+    let directory = ObservedDirectory::new();
+    let mut cell = Cell::start_with_directory(directory.clone()).await;
+    let deployment = admin::create_deployment(directory.as_ref(), "shop", "acme", 3).await.unwrap();
+    let client = cell.connect("shop").await;
+    client.simple_query("INSERT INTO orders (_id, total) VALUES (1, 10)").await.unwrap();
+    cell.node(0).agent.flush("shop").await.unwrap();
+    let initial = directory.deployment(&deployment.id).await.unwrap().unwrap().checkpoint.unwrap();
+    client.simple_query("INSERT INTO orders (_id, total) VALUES (2, 20), (3, 30)").await.unwrap();
+    let subscriber = cell.add_node().await;
+    admin::set_read_width(directory.as_ref(), "shop", 2).await.unwrap();
+    let gate = Arc::new(RecoveryGate::default());
+    *directory.recovery_gate.lock().unwrap() = Some(gate.clone());
+    let agent = Arc::clone(&cell.node(subscriber).agent);
+    let opening = tokio::spawn(async move { agent.subscribe("shop").await });
+    tokio::time::timeout(Duration::from_secs(5), gate.registered.notified()).await.expect("subscriber registered a durable replay hold");
+
+    let held = directory.deployment(&deployment.id).await.unwrap().unwrap();
+    let first_required = held.storage_regions.values().find_map(|region| match region {
+        StorageRegion::ReplicaReplay { first_required, .. } => Some(*first_required),
+        _ => None,
+    }).unwrap();
+    assert_eq!(first_required, initial.boundary + 1);
+    cell.node(0).agent.flush("shop").await.unwrap();
+    let updated = directory.deployment(&deployment.id).await.unwrap().unwrap().checkpoint.unwrap();
+    assert!(updated.boundary - 1 >= first_required);
+    let members = directory.members().await.unwrap().into_iter().map(|member| (member.id.clone(), member.address)).collect::<BTreeMap<_, _>>();
+    let servers = held.ensemble.iter().map(|id| members[id].clone()).collect();
+    let reader = rtdb_logkeeper::open_reader(rtdb_logkeeper::StreamConfig {
+        write_quorum: 2, servers, stream: held.stream("replica"), maximum_message_bytes: 4 << 20,
+    }, Default::default()).await.unwrap();
+    let retained = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let floor = reader.retained_floor().await.unwrap().unwrap();
+            if floor.0 >= first_required { break floor; }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }).await.expect("holder trimmed up to the recovering subscriber");
+    assert_eq!(retained, LogOffset(first_required), "trim must retain the first required replica record");
+    assert_eq!(reader.read_range(LogOffset(first_required), LogOffset(first_required + 1)).await.unwrap().len(), 1);
+
+    gate.resume.notify_one();
+    tokio::time::timeout(Duration::from_secs(5), opening).await.unwrap().unwrap().unwrap();
+    let database = cell.node(subscriber).server.node().catalog().database("shop").unwrap();
+    let mut status = database.watch_status();
+    tokio::time::timeout(Duration::from_secs(5), status.wait_for(|status| {
+        status.replica_position.offset() >= updated.boundary || matches!(status.role, rtdb_replication::Role::Stopped)
+    })).await.unwrap().unwrap();
+    assert!(database.status().replica_position.offset() >= updated.boundary, "subscriber applied the newer block boundary");
+    let (follower, connection) = tokio_postgres::Config::new().host("127.0.0.1").port(cell.gateway.port())
+        .user("xtdb").password("cell-test").dbname("shop").options("-c default_transaction_read_only=on")
+        .connect(NoTls).await.unwrap();
+    tokio::spawn(connection);
+    assert_eq!(cell.node(subscriber).agent.subscribed(), ["shop"]);
+    assert_eq!(values(&follower, "SELECT total FROM orders").await, ["10", "20", "30"]);
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let record = directory.deployment(&deployment.id).await.unwrap().unwrap();
+            let held = record.storage_regions.values().any(|region| matches!(region, StorageRegion::ReplicaReplay { .. }));
+            if !held && reader.retained_floor().await.unwrap().unwrap().0 >= updated.boundary { break; }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }).await.expect("closed replay hold lets the holder finish trimming");
+    drop((follower, client, database));
     cell.stop().await;
 }
 

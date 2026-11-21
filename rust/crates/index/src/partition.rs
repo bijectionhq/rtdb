@@ -1,16 +1,18 @@
 use std::collections::{BTreeMap, BTreeSet};
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 
-use parking_lot::RwLock;
+use parking_lot::{Mutex, RwLock};
 use rtdb_format::{catalog::{BlockCatalog, TableBlock}, keys::TrieKey};
 use rtdb_trie::TrieConfig;
 use rtdb_types::{Anomaly, BlockIndex, Result, TableRef, Timestamp};
 
-use crate::{CatalogTrie, LiveIndex, Snapshot, StagedWrite, TableCatalog, TableMeta, TrieCatalog};
+use crate::{CatalogTrie, LiveIndex, Snapshot, StagedWrite, TableCatalog, TableMeta, TrieCatalog, TrieState};
+use crate::reader_retention::any_reference_requires;
 
 #[derive(Clone, Debug)]
 pub struct PartitionValue {
     trie_catalog: Arc<TrieCatalog>,
+    checkpoint_tries: Option<Arc<CheckpointTries>>,
     table_catalog: Arc<TableCatalog>,
     live: Arc<LiveIndex>,
     live_snapshot: Option<Arc<LiveIndex>>,
@@ -20,13 +22,32 @@ impl PartitionValue {
     pub fn loaded(trie_catalog: TrieCatalog, table_catalog: TableCatalog, config: TrieConfig) -> Result<Self> {
         let block_index = BlockIndex(table_catalog.block_index().map_or(-1, |index| index.0).checked_add(1).ok_or_else(|| invalid("Block index exhausted"))?);
         let latest_completed_tx = table_catalog.block().and_then(BlockCatalog::latest_completed_tx);
-        Ok(Self { trie_catalog: Arc::new(trie_catalog), table_catalog: Arc::new(table_catalog),
+        let checkpoint_tries = table_catalog.block_index().map(|_| Arc::new(CheckpointTries::capture(&trie_catalog)));
+        Ok(Self { trie_catalog: Arc::new(trie_catalog), checkpoint_tries, table_catalog: Arc::new(table_catalog),
             live: Arc::new(LiveIndex::new(block_index, latest_completed_tx, config)), live_snapshot: None })
     }
     pub fn trie_catalog(&self) -> &Arc<TrieCatalog> { &self.trie_catalog }
     pub fn table_catalog(&self) -> &Arc<TableCatalog> { &self.table_catalog }
     pub fn live(&self) -> &Arc<LiveIndex> { &self.live }
     pub fn snapshot(&self) -> Snapshot { Snapshot::new(Arc::clone(&self.trie_catalog), Arc::clone(&self.table_catalog), Arc::clone(&self.live)) }
+}
+
+#[derive(Debug)]
+struct CheckpointTries(BTreeMap<TableRef, BTreeSet<TrieKey>>);
+
+impl CheckpointTries {
+    fn capture(catalog: &TrieCatalog) -> Self {
+        Self(catalog.tables().map(|table| {
+            let keys = catalog.iter_tries(table)
+                .filter(|trie| matches!(trie.state, TrieState::Live | TrieState::Nascent))
+                .map(|trie| trie.key.clone()).collect();
+            (table.clone(), keys)
+        }).collect())
+    }
+
+    fn requires(&self, table: &TableRef, key: &TrieKey) -> bool {
+        self.0.get(table).is_some_and(|keys| keys.contains(key))
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -48,15 +69,78 @@ impl BlockPreparation {
     }
 }
 
+#[derive(Debug, Default)]
+struct Retention {
+    readers: Vec<Weak<TrieCatalog>>,
+    collecting: Weak<()>,
+}
+
+pub struct TrieCollection {
+    current: Arc<PartitionValue>,
+    readers: Vec<Arc<TrieCatalog>>,
+    _collecting: Arc<()>,
+}
+
+impl TrieCollection {
+    pub fn current(&self) -> &PartitionValue { &self.current }
+
+    pub fn eligible(&self, table: &TableRef, as_of: Timestamp) -> Vec<TrieKey> {
+        self.current.trie_catalog().garbage_tries(table, as_of).into_iter()
+            .filter(|candidate| {
+                let checkpoint_requires = self.current.checkpoint_tries.as_ref()
+                    .is_some_and(|checkpoint| checkpoint.requires(table, &candidate.key));
+                !any_reference_requires(checkpoint_requires, self.readers.len(), |index| {
+                    self.readers[index].trie(table, &candidate.key).is_some_and(|trie| trie.state == TrieState::Live)
+                })
+            })
+            .map(|trie| trie.key.clone()).collect()
+    }
+}
+
 #[derive(Debug)]
-pub struct PartitionState { value: RwLock<Arc<PartitionValue>> }
+pub struct PartitionState {
+    value: RwLock<Arc<PartitionValue>>,
+    retention: Mutex<Retention>,
+}
 
 impl PartitionState {
-    pub fn new(initial: PartitionValue) -> Self { Self { value: RwLock::new(Arc::new(initial)) } }
+    pub fn new(initial: PartitionValue) -> Self {
+        Self { value: RwLock::new(Arc::new(initial)), retention: Mutex::new(Retention::default()) }
+    }
     pub fn empty(config: TrieConfig) -> Result<Self> {
         Ok(Self::new(PartitionValue::loaded(TrieCatalog::default(), TableCatalog::default().with_system_tables()?, config)?))
     }
     pub fn value(&self) -> Arc<PartitionValue> { Arc::clone(&self.value.read()) }
+
+    fn retain_catalog(&self, value: &PartitionValue) {
+        let mut retention = self.retention.lock();
+        let identity = Arc::as_ptr(value.trie_catalog());
+        if retention.readers.last().is_some_and(|reader| reader.as_ptr() == identity) {
+            return;
+        }
+        retention.readers.retain(|reader| reader.strong_count() != 0);
+        retention.readers.push(Arc::downgrade(value.trie_catalog()));
+    }
+
+    /// Captures the current catalog and open read references under the same state lock as snapshot admission.
+    pub fn trie_collection(&self) -> TrieCollection {
+        let value = self.value.read();
+        let mut retention = self.retention.lock();
+        let readers = retention.readers.iter().filter_map(Weak::upgrade).collect();
+        let collecting = retention.collecting.upgrade().unwrap_or_else(|| {
+            let collecting = Arc::new(());
+            retention.collecting = Arc::downgrade(&collecting);
+            collecting
+        });
+        TrieCollection { current: Arc::clone(&value), readers, _collecting: collecting }
+    }
+
+    /// Captures the latest applied state for a reader, including transaction resolution.
+    pub fn snapshot(&self) -> Snapshot {
+        let value = self.value.read();
+        self.retain_catalog(&value);
+        value.snapshot()
+    }
 
     /// The caller's basis barrier runs before this capture; this passive object never waits for log progress.
     pub fn open_snapshot(&self, min_system_time: Option<Timestamp>) -> Snapshot {
@@ -64,10 +148,14 @@ impl PartitionState {
         {
             let value = self.value.read();
             if let Some(live) = &value.live_snapshot {
-                if fresh(live) { return Snapshot::new(Arc::clone(&value.trie_catalog), Arc::clone(&value.table_catalog), Arc::clone(live)); }
+                if fresh(live) {
+                    self.retain_catalog(&value);
+                    return Snapshot::new(Arc::clone(&value.trie_catalog), Arc::clone(&value.table_catalog), Arc::clone(live));
+                }
             }
         }
         let mut value = self.value.write();
+        self.retain_catalog(&value);
         if let Some(live) = &value.live_snapshot {
             if fresh(live) { return Snapshot::new(Arc::clone(&value.trie_catalog), Arc::clone(&value.table_catalog), Arc::clone(live)); }
         }
@@ -78,7 +166,7 @@ impl PartitionState {
         snapshot
     }
 
-    pub fn resolving_snapshot(&self, predecessors: &[Arc<StagedWrite>]) -> Result<Snapshot> { self.value().snapshot().with_staged(predecessors) }
+    pub fn resolving_snapshot(&self, predecessors: &[Arc<StagedWrite>]) -> Result<Snapshot> { self.snapshot().with_staged(predecessors) }
 
     pub fn apply(&self, write: &StagedWrite) -> Result<()> {
         let mut value = self.value.write();
@@ -100,6 +188,20 @@ impl PartitionState {
         *value = Arc::new(next);
         Ok(())
     }
+    pub fn add_artefacts(&self, table: &TableRef, entries: Vec<(TrieKey, rtdb_format::log::proto::ArtefactRecord)>) {
+        let mut value = self.value.write();
+        let trie_catalog = value.trie_catalog.with_artefacts(table, entries);
+        let mut next = value.as_ref().clone();
+        next.trie_catalog = Arc::new(trie_catalog);
+        *value = Arc::new(next);
+    }
+    pub fn remove_artefacts(&self, table: &TableRef, entries: Vec<(TrieKey, rtdb_format::log::proto::ArtefactRecord)>) {
+        let mut value = self.value.write();
+        let trie_catalog = value.trie_catalog.without_artefacts(table, entries);
+        let mut next = value.as_ref().clone();
+        next.trie_catalog = Arc::new(trie_catalog);
+        *value = Arc::new(next);
+    }
     pub fn delete_tries(&self, deletions: &BTreeMap<TableRef, BTreeSet<TrieKey>>) {
         let mut value = self.value.write();
         let mut trie_catalog = value.trie_catalog.as_ref().clone();
@@ -110,6 +212,9 @@ impl PartitionState {
     }
     pub fn reset_to_l0(&self, replacements: BTreeMap<TableRef, Vec<CatalogTrie>>) -> Result<()> {
         let mut value = self.value.write();
+        if self.retention.lock().collecting.strong_count() != 0 {
+            return Err(Anomaly::new(rtdb_types::AnomalyCategory::Conflict, "rtdb.compactor-reset/collecting", "Trie collection is still in progress"));
+        }
         let mut next = value.as_ref().clone();
         next.trie_catalog = Arc::new(value.trie_catalog.reset_to_l0(replacements)?);
         *value = Arc::new(next);
@@ -121,8 +226,12 @@ impl PartitionState {
         Ok(BlockPreparation { captured, metadata })
     }
 
-    /// Storage must publish the block file before this atomic adoption.
-    pub fn adopt_block(&self, prepared: BlockPreparation, block: BlockCatalog, tries: &BTreeMap<TableRef, Vec<CatalogTrie>>, as_of: Timestamp) -> Result<()> {
+    /// Storage must publish the root and its table blocks before this atomic adoption.
+    /// Collection protects the tries used to restore the recorded checkpoint.
+    pub fn adopt_block(&self, prepared: BlockPreparation, block: BlockCatalog, table_blocks: &BTreeMap<TableRef, TableBlock>,
+        tries: &BTreeMap<TableRef, Vec<CatalogTrie>>, as_of: Timestamp) -> Result<()> {
+        let durable_tries = TrieCatalog::load(table_blocks, prepared.captured.trie_catalog.file_size_target(), as_of)?;
+        let checkpoint_tries = Some(Arc::new(CheckpointTries::capture(&durable_tries)));
         let mut value = self.value.write();
         if !Arc::ptr_eq(&value.live, &prepared.captured.live) { return Err(invalid("Live data moved while the block was being prepared")); }
         if block.block_index() != value.live.block_index() || block.latest_completed_tx() != value.live.latest_completed_tx() {
@@ -131,8 +240,12 @@ impl PartitionState {
         let mut trie_catalog = value.trie_catalog.as_ref().clone();
         for (table, tries) in tries { trie_catalog = trie_catalog.with_tries(table.clone(), tries.clone(), as_of)?; }
         let table_catalog = value.table_catalog.adopt(block, &prepared.metadata)?;
+        if !table_catalog.tables().keys().eq(table_blocks.keys()) {
+            return Err(invalid("Table blocks do not match the adopted checkpoint registry"));
+        }
         let live = value.live.next_block()?;
-        *value = Arc::new(PartitionValue { trie_catalog: Arc::new(trie_catalog), table_catalog: Arc::new(table_catalog), live: Arc::new(live), live_snapshot: None });
+        *value = Arc::new(PartitionValue { trie_catalog: Arc::new(trie_catalog), checkpoint_tries,
+            table_catalog: Arc::new(table_catalog), live: Arc::new(live), live_snapshot: None });
         Ok(())
     }
 }

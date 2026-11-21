@@ -88,6 +88,21 @@ fn rejected_event_releases_its_reservation_and_does_not_create_a_table() {
 }
 
 #[test]
+fn events_appended_by_reference_and_by_value_stage_as_one_tables_rows() {
+    use rtdb_index::StoredEvent;
+    let state = PartitionState::empty(TrieConfig::default()).unwrap();
+    let budget = MemoryBudget::new(1 << 24);
+    let mut tx = TransactionBuffer::new(state.resolving_snapshot(&[]).unwrap(), key(0), Arc::clone(&budget)).unwrap();
+    let event = |id| StoredEvent { iid: EntityId::Integer(id).iid(), system_from: key(0).system_time, valid_time: Interval::ALL, operation: StoredOperation::Put(document(id, id)), recency: None };
+    tx.append_to(&table(), event(1)).unwrap();
+    tx.append(table(), event(2)).unwrap();
+    tx.append_to(&table(), event(3)).unwrap();
+    let staged = tx.stage().unwrap();
+    assert_eq!(staged.tables().keys().collect::<Vec<_>>(), [&table()]);
+    assert_eq!(staged.row_count().unwrap(), 3);
+}
+
+#[test]
 fn staged_predecessors_and_own_writes_are_each_scanned_once() {
     let state = PartitionState::empty(TrieConfig::default()).unwrap();
     let budget = MemoryBudget::new(1 << 24);
@@ -158,7 +173,8 @@ fn block_adoption_publishes_catalogs_and_rollover_together() {
             }
         }
     });
-    state.adopt_block(prepared, durable, &tries, Timestamp(101)).unwrap();
+    let table_blocks = prepared.table_blocks(&tries, Timestamp(101)).unwrap();
+    state.adopt_block(prepared, durable, &table_blocks, &tries, Timestamp(101)).unwrap();
     reader.join().unwrap();
     assert_eq!(rows(&held), 1);
     assert_eq!(rows(&state.open_snapshot(None)), 0);
@@ -178,7 +194,8 @@ fn failed_adoption_and_stale_apply_leave_one_unchanged_value() {
     state.apply(&stage(&state, &budget, 1)).unwrap();
     let before = state.value();
     assert!(state.apply(&first).is_err());
-    assert!(state.adopt_block(prepared, durable, &BTreeMap::new(), Timestamp(102)).is_err());
+    let table_blocks = prepared.table_blocks(&BTreeMap::new(), Timestamp(102)).unwrap();
+    assert!(state.adopt_block(prepared, durable, &table_blocks, &BTreeMap::new(), Timestamp(102)).is_err());
     assert!(Arc::ptr_eq(&before, &state.value()));
     assert_eq!(state.value().live().block_row_count(), 2);
 }

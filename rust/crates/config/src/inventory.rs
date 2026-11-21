@@ -48,7 +48,7 @@ fn walk(value: &Yaml, shape: Shape, path: &str, report: &mut QualificationReport
         }
     } else { (value, shape) };
     let allowed: &[&str] = match shape {
-        Shape::Node => &["log", "storage", "logClusters", "remotes", "memoryCache", "diskCache", "healthz", "indexer", "nodeId", "server", "flightSql", "defaultTz", "compactor", "garbageCollector", "authn", "tracer", "modules", "readOnlyDatabases", "skipDbs"],
+        Shape::Node => &["log", "storage", "logClusters", "remotes", "memoryCache", "diskCache", "healthz", "indexer", "nodeId", "server", "flightSql", "defaultTz", "compactor", "garbageCollector", "search", "authn", "tracer", "modules", "readOnlyDatabases", "skipDbs"],
         Shape::Ingest => &["databases", "logClusters", "remotes", "memoryCache", "diskCache", "healthz", "indexer", "nodeId"],
         Shape::Database => &["log", "storage", "mode", "externalSource", "critical", "partitions"],
         Shape::Fields(fields) => fields,
@@ -86,6 +86,7 @@ fn walk(value: &Yaml, shape: Shape, path: &str, report: &mut QualificationReport
                     "diskCache" => Shape::Fields(&["path", "maxSizeBytes", "maxSizeRatio"]),
                     "compactor" => Shape::Fields(&["threads", "reeIids", "withinFileRecencyBranching"]),
                     "garbageCollector" => Shape::Fields(&["enabled", "blocksToKeep", "garbageLifetime"]),
+                    "search" => Shape::Fields(&["enabled", "threads"]),
                     "tracer" => Shape::Fields(&["enabled", "endpoint", "serviceName", "queryTracing", "transactionTracing"]),
                     "users" => Shape::Users,
                     "rules" => Shape::Rules,

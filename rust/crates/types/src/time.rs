@@ -1,4 +1,4 @@
-use crate::{Anomaly, Iid, Result};
+use crate::{Anomaly, Iid, Result, Timestamp, interval_step};
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -33,10 +33,6 @@ impl From<Timestamp> for Instant {
         Self { seconds, nanos: nanos as u32 }
     }
 }
-
-/// Signed microseconds since the Unix epoch; the extrema are unbounded sentinels.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
-pub struct Timestamp(pub i64);
 
 impl Timestamp {
     pub const MIN: Self = Self(i64::MIN);
@@ -89,13 +85,13 @@ impl Interval {
     pub fn contains(self, time: Timestamp) -> bool { self.lower <= time && time < self.upper }
     pub fn is_point(self) -> bool { self.lower.0.checked_add(1) == Some(self.upper.0) }
     pub fn intersects(self, other: Self) -> bool {
-        !self.is_empty() && !other.is_empty() && self.lower < other.upper && other.lower < self.upper
+        self.intersection(other).is_some()
     }
     pub fn intersection(self, other: Self) -> Option<Self> {
-        let lower = self.lower.max(other.lower);
-        let upper = self.upper.min(other.upper);
-        (lower < upper).then_some(Self { lower, upper })
+        interval_step::intersect(self.endpoints(), other.endpoints())
+            .map(|(lower, upper)| Self { lower: Timestamp(lower), upper: Timestamp(upper) })
     }
+    fn endpoints(self) -> (i64, i64) { (self.lower.0, self.upper.0) }
 }
 
 impl TryFrom<IntervalParts> for Interval {
@@ -113,6 +109,15 @@ pub struct TemporalBounds { pub valid_time: Interval, pub system_time: Interval 
 impl TemporalBounds {
     pub fn intersects(self, other: Self) -> bool {
         self.valid_time.intersects(other.valid_time) && self.system_time.intersects(other.system_time)
+    }
+
+    /// Admits a history fragment that overlaps both requested axes, optionally clipping its valid time.
+    pub fn admit_fragment(self, fragment: Self, clamp_valid: bool) -> Option<Self> {
+        let (lower, upper) = interval_step::admit_fragment(
+            fragment.valid_time.endpoints(), fragment.system_time.endpoints(),
+            self.valid_time.endpoints(), self.system_time.endpoints(), clamp_valid,
+        )?;
+        Some(Self { valid_time: Interval { lower: Timestamp(lower), upper: Timestamp(upper) }, system_time: fragment.system_time })
     }
 }
 

@@ -578,6 +578,51 @@ async fn asynchronous_submission_is_recorded_before_application_and_read_awaits_
 }
 
 #[tokio::test]
+async fn tables_with_colliding_escaped_names_keep_separate_rows_after_restart() {
+    tokio::time::timeout(Duration::from_secs(30), async {
+        let directory = tempfile::tempdir().unwrap();
+        let configuration = DatabaseConfig {
+            log: Some(database_config::Log::LocalLog(LocalLog { path: Some(directory.path().join("log").to_string_lossy().into_owned()), epoch: Some(0) })),
+            storage: Some(database_config::Storage::LocalStorage(LocalStorage { path: Some(directory.path().join("store").to_string_lossy().into_owned()), epoch: Some(0) })),
+            ..Default::default()
+        };
+        let mut settings = options();
+        settings.membership = Membership::Durable { primary: configuration, skipped: BTreeSet::new() };
+        let runtime = services();
+        let (node, driver) = running(settings.clone(), fresh_local_services(&runtime)).await;
+        let mut session = node.session("xtdb", Arc::new(Authority)).unwrap();
+        for statement in [r#"INSERT INTO "a$b" (_id, value) VALUES (2, 22)"#, r#"INSERT INTO "a$b~1" (_id, value) VALUES (3, 33)"#] {
+            let outcome = session.state_mut().execute_tx(vec![TxOp::Sql { sql: statement.into(), args: None }], AutonomousTxOptions::default()).await.unwrap();
+            assert!(outcome.committed(), "{statement}: {:?}", outcome.error());
+        }
+        let database = node.catalog().database("xtdb").unwrap();
+        let cancellation = CancellationToken::new();
+        database.flush().await.unwrap();
+        node.sync_all(Duration::from_secs(10), &cancellation).await.unwrap();
+
+        let statement = r#"INSERT INTO "a.b" (_id, value) VALUES (1, 11)"#;
+        let outcome = session.state_mut().execute_tx(vec![TxOp::Sql { sql: statement.into(), args: None }], AutonomousTxOptions::default()).await.unwrap();
+        assert!(outcome.committed(), "{:?}", outcome.error());
+        database.flush().await.unwrap();
+        node.sync_all(Duration::from_secs(10), &cancellation).await.unwrap();
+        drop((session, database));
+        stop(&node, driver).await;
+        drop(node);
+
+        let (reopened, driver) = running(settings, fresh_local_services(&runtime)).await;
+        let mut session = reopened.session("xtdb", Arc::new(Authority)).unwrap();
+        for (statement, expected) in [
+            (r#"SELECT value FROM "a.b""#, 11),
+            (r#"SELECT value FROM "a$b""#, 22),
+            (r#"SELECT value FROM "a$b~1""#, 33),
+        ] {
+            assert_eq!(rows(session.query_sql(statement, vec![]).await.unwrap()).await, vec![vec![Value::I64(expected)]]);
+        }
+        stop(&reopened, driver).await;
+    }).await.unwrap();
+}
+
+#[tokio::test]
 async fn local_recovery_reads_flushed_and_unflushed_transactions_and_retained_batches_survive_shutdown() {
     tokio::time::timeout(Duration::from_secs(30), async {
         let directory = tempfile::tempdir().unwrap();
@@ -945,7 +990,8 @@ async fn follower_compactor_publishes_results_through_the_writer_without_claimin
 
 #[tokio::test]
 async fn startup_selects_a_newer_checkpoint_when_its_initial_replica_prefix_was_trimmed() {
-    use rtdb_storage::log::{LogOffset, MemoryLog};
+    use rtdb_storage::{Result as StorageResult, log::{AppendReceipt, Log, LogOffset, LogRange, LogRecord, LogTail, MemoryLog}};
+    use std::sync::atomic::AtomicUsize;
 
     struct SharedLogs {
         source: Arc<MemoryLog>,
@@ -953,7 +999,38 @@ async fn startup_selects_a_newer_checkpoint_when_its_initial_replica_prefix_was_
         store: Arc<rtdb_storage::MemoryStore>,
     }
 
-    struct LogOpening { reached: Semaphore, release: Semaphore }
+    struct LogOpening {
+        reached: Semaphore,
+        release: Semaphore,
+        attempted: AtomicUsize,
+        reopened: AtomicUsize,
+    }
+    struct StartupLog { inner: Arc<MemoryLog>, opening: Arc<LogOpening> }
+
+    #[async_trait]
+    impl Log for StartupLog {
+        async fn enqueue(&self, payload: prost::bytes::Bytes, timestamp: Timestamp) -> StorageResult<AppendReceipt> {
+            self.inner.enqueue(payload, timestamp).await
+        }
+        fn latest(&self) -> StorageResult<LogOffset> { self.inner.latest() }
+        async fn recovery_tail(&self, after: LogOffset) -> StorageResult<Option<Box<dyn LogTail>>> {
+            if self.opening.attempted.fetch_add(1, Ordering::SeqCst) == 0 {
+                self.opening.reached.add_permits(1);
+                self.opening.release.acquire().await.unwrap().forget();
+            }
+            self.inner.recovery_tail(after).await
+        }
+        async fn tail(&self, after: LogOffset) -> StorageResult<Box<dyn LogTail>> {
+            self.opening.reopened.fetch_add(1, Ordering::SeqCst);
+            self.inner.tail(after).await
+        }
+        async fn range(&self, from: LogOffset, to: LogOffset) -> StorageResult<Box<dyn LogRange>> {
+            self.inner.range(from, to).await
+        }
+        async fn read_range(&self, from: LogOffset, to: LogOffset) -> StorageResult<Vec<LogRecord>> {
+            self.inner.read_range(from, to).await
+        }
+    }
     struct Resources { shared: Arc<SharedLogs>, opening: Option<Arc<LogOpening>> }
 
     #[async_trait]
@@ -971,12 +1048,12 @@ async fn startup_selects_a_newer_checkpoint_when_its_initial_replica_prefix_was_
         }
 
         async fn open_logs(&self, _: &str, _: &DatabaseConfig, _: LogAccess, _: CancellationToken, _: &DatabaseStorage) -> Result<OpenedLogs> {
-            if let Some(opening) = &self.opening {
-                opening.reached.add_permits(1);
-                opening.release.acquire().await.unwrap().forget();
-            }
+            let replica: Arc<dyn Log> = match &self.opening {
+                Some(opening) => Arc::new(StartupLog { inner: self.shared.replica.clone(), opening: opening.clone() }),
+                None => self.shared.replica.clone(),
+            };
             Ok(OpenedLogs {
-                source: self.shared.source.clone(), replica: self.shared.replica.clone(),
+                source: self.shared.source.clone(), replica,
                 source_epoch: rtdb_types::StorageEpoch(0), replica_epoch: rtdb_types::StorageEpoch(0), drivers: Vec::new(),
             })
         }
@@ -998,12 +1075,17 @@ async fn startup_selects_a_newer_checkpoint_when_its_initial_replica_prefix_was_
         writer.sync_all(Duration::from_secs(10), &token).await.unwrap();
         let initial = database.status().adopted_block.unwrap();
 
-        let opening = Arc::new(LogOpening { reached: Semaphore::new(0), release: Semaphore::new(0) });
+        let opening = Arc::new(LogOpening {
+            reached: Semaphore::new(0), release: Semaphore::new(0), attempted: AtomicUsize::new(0), reopened: AtomicUsize::new(0),
+        });
         let reader_resources = Arc::new(Resources { shared: shared.clone(), opening: Some(opening.clone()) });
         let mut reader_options = options();
         reader_options.read_only = true;
-        let starting = tokio::spawn(Node::open(reader_options, NodeServices { resources: reader_resources, ..runtime }));
-        opening.reached.acquire().await.unwrap().forget();
+        let mut starting = tokio::spawn(Node::open(reader_options, NodeServices { resources: reader_resources, ..runtime }));
+        tokio::select! {
+            _ = &mut starting => panic!("startup completed before admitting its replica cursor"),
+            reached = opening.reached.acquire() => reached.unwrap().forget(),
+        }
 
         session.state_mut().execute_operation(put(&writer, 2, 20)).await.unwrap();
         database.flush().await.unwrap();
@@ -1017,8 +1099,12 @@ async fn startup_selects_a_newer_checkpoint_when_its_initial_replica_prefix_was_
         opening.release.add_permits(1);
 
         let (reader, driver) = starting.await.unwrap().expect("startup must find a checkpoint with a retained replica suffix");
+        let selected = reader.catalog().database("xtdb").unwrap().status().adopted_block.unwrap();
+        assert_eq!(selected.block_index(), replacement.block_index());
+        assert_eq!(opening.attempted.load(Ordering::SeqCst), 2);
         let reader_driver = tokio::spawn(driver.run());
         reader.sync_all(Duration::from_secs(10), &token).await.expect("startup must replay the retained replica suffix");
+        assert_eq!(opening.reopened.load(Ordering::SeqCst), 0, "the driver must reuse startup's admitted cursor");
         let resumed = reader.catalog().database("xtdb").unwrap().status().adopted_block.unwrap();
         assert_eq!(resumed.block_index(), replacement.block_index());
         let mut session = reader.session("xtdb", Arc::new(Authority)).unwrap();
@@ -2123,5 +2209,491 @@ async fn a_command_resent_under_its_session_key_on_a_new_session_writes_nothing_
     assert_eq!(rows(session.query_sql("SELECT _id FROM docs ORDER BY _id", vec![]).await.unwrap()).await, [[Value::I64(1)], [Value::I64(2)], [Value::I64(5)], [Value::I64(6)]].map(Vec::from),
         "the resent command's transactions take the keys the first run's did, in order, and run no more");
     drop(session);
+    stop(&node, driver).await;
+}
+
+#[tokio::test]
+async fn each_argument_row_of_a_batched_update_reads_what_the_rows_before_it_wrote() {
+    tokio::time::timeout(Duration::from_secs(20), async {
+        let (node, driver) = running(options(), services()).await;
+        let mut session = node.session("xtdb", Arc::new(Authority)).unwrap();
+        let insert = TxOp::Sql { sql: "INSERT INTO docs (_id, value) VALUES (?, ?)".into(), args: Some(SqlArguments::from_rows(vec![vec![Value::I64(1), Value::I64(10)], vec![Value::I64(2), Value::I64(20)]], node.memory()).unwrap()) };
+        assert!(session.state_mut().execute_tx(vec![insert], AutonomousTxOptions::default()).await.unwrap().committed());
+        let arguments = vec![vec![Value::I64(5), Value::I64(1)], vec![Value::I64(7), Value::I64(2)], vec![Value::I64(100), Value::I64(1)]];
+        let update = TxOp::Sql { sql: "UPDATE docs SET added = ?, value = value + 1 WHERE _id = ?".into(), args: Some(SqlArguments::from_rows(arguments, node.memory()).unwrap()) };
+        let updated = session.state_mut().execute_tx(vec![update], AutonomousTxOptions::default()).await.unwrap();
+        assert!(updated.committed(), "{:?}", updated.error());
+        assert_eq!(rows(session.query_sql("SELECT _id, value, added FROM docs ORDER BY _id", vec![]).await.unwrap()).await,
+            vec![vec![Value::I64(1), Value::I64(12), Value::I64(100)], vec![Value::I64(2), Value::I64(21), Value::I64(7)]]);
+        stop(&node, driver).await;
+    }).await.unwrap();
+}
+
+fn put_rows(node: &Node, table: &str, documents: Vec<StructFields<Value>>, valid_from: Option<Timestamp>, valid_to: Option<Timestamp>) -> TxOp {
+    TxOp::PutDocs { table: TableRef::new("public", table), documents: Documents::new(documents, node.memory()).unwrap(), valid_from, valid_to }
+}
+fn sql(node: &Node, sql: &str, arguments: Vec<Value>) -> TxOp {
+    TxOp::Sql { sql: sql.into(), args: (!arguments.is_empty()).then(|| SqlArguments::from_rows(vec![arguments], node.memory()).unwrap()) }
+}
+
+#[tokio::test]
+async fn a_set_based_update_rewrites_exactly_the_rows_whose_assigned_values_differ() {
+    tokio::time::timeout(Duration::from_secs(30), async {
+        let (node, driver) = running(options(), services()).await;
+        let mut session = node.session("xtdb", Arc::new(Authority)).unwrap();
+        let instant = |micros: i64| Value::Timestamp { value: micros, unit: rtdb_types::TimeUnit::Microsecond, timezone: Some("UTC".into()) };
+        let row = |id: i64, f: Value, t: Value, n: Value, ts: Value, d: Value| StructFields::from([("_id".into(), Value::I64(id)), ("f".into(), f), ("t".into(), t), ("n".into(), n), ("ts".into(), ts), ("d".into(), d)]);
+        let documents = vec![
+            row(1, Value::F64(1.5), Value::Utf8("a".into()), Value::I64(1), instant(1_000), Value::DateDay(18_000)),
+            row(2, Value::F64(f64::NAN), Value::Null, Value::Null, Value::Null, Value::Null),
+            row(3, Value::F64(0.0), Value::Utf8(String::new()), Value::I64(2), instant(-1), Value::DateDay(-1)),
+            row(4, Value::Null, Value::Utf8("b".into()), Value::I64(3), instant(i64::MAX - 1), Value::DateDay(0)),
+        ];
+        assert!(session.state_mut().execute_tx(vec![put_rows(&node, "items", documents, None, None)], AutonomousTxOptions::default()).await.unwrap().committed());
+        for (statement, arguments) in [
+            // Only NaN differs from itself; a null equals a null.
+            ("UPDATE items SET f = f", vec![]),
+            // -0.0 equals 0.0, so the stored 0.0 keeps its sign.
+            ("UPDATE items SET f = ? WHERE _id = 3", vec![Value::F64(-0.0)]),
+            ("UPDATE items SET t = t, ts = ts, d = d", vec![]),
+            ("UPDATE items SET n = n + 1", vec![]),
+            ("UPDATE items SET f = f * 1.01 WHERE n < 100", vec![]),
+        ] {
+            let result = session.state_mut().execute_tx(vec![sql(&node, statement, arguments)], AutonomousTxOptions::default()).await.unwrap();
+            assert!(result.committed(), "{statement}: {:?}", result.error());
+        }
+        let versions = rows(session.query_sql("SELECT _id, COUNT(*) AS versions FROM items FOR ALL SYSTEM_TIME GROUP BY _id ORDER BY _id", vec![]).await.unwrap()).await;
+        assert_eq!(versions, [1, 2, 3, 4].into_iter().zip([3, 2, 2, 2]).map(|(id, count)| vec![Value::I64(id), Value::I64(count)]).collect::<Vec<_>>());
+        let current = rows(session.query_sql("SELECT _id, f, t, n, ts, d FROM items ORDER BY _id", vec![]).await.unwrap()).await;
+        let f = |row: usize| match current[row][1] { Value::F64(value) => Some(value.to_bits()), Value::Null => None, ref other => panic!("{other:?}") };
+        assert_eq!([f(0), f(2), f(3)], [Some((1.5f64 * 1.01).to_bits()), Some(0.0f64.to_bits()), None]);
+        assert!(f64::from_bits(f(1).unwrap()).is_nan());
+        assert_eq!(current.iter().map(|row| row[3].clone()).collect::<Vec<_>>(), [Value::I64(2), Value::Null, Value::I64(3), Value::I64(4)]);
+        assert_eq!(current.iter().map(|row| (row[2].clone(), row[4].clone(), row[5].clone())).collect::<Vec<_>>(), [
+            (Value::Utf8("a".into()), instant(1_000), Value::DateDay(18_000)), (Value::Null, Value::Null, Value::Null),
+            (Value::Utf8(String::new()), instant(-1), Value::DateDay(-1)), (Value::Utf8("b".into()), instant(i64::MAX - 1), Value::DateDay(0)),
+        ]);
+        stop(&node, driver).await;
+    }).await.unwrap();
+}
+
+#[tokio::test]
+async fn an_updated_row_is_valid_from_the_transaction_time_to_the_end_of_the_version_it_replaces() {
+    tokio::time::timeout(Duration::from_secs(30), async {
+        let (node, driver) = running(options(), services()).await;
+        let mut session = node.session("xtdb", Arc::new(Authority)).unwrap();
+        let instant = |time: Timestamp| Value::Timestamp { value: time.0, unit: rtdb_types::TimeUnit::Microsecond, timezone: Some("UTC".into()) };
+        let row = |id: i64, value: i64| StructFields::from([("_id".into(), Value::I64(id)), ("v".into(), Value::I64(value))]);
+        let (start, end) = (Timestamp(500), Timestamp(10_000_000_000));
+        let bounded = session.state_mut().execute_tx(vec![put_rows(&node, "spans", vec![row(1, 10)], Some(start), Some(end))], AutonomousTxOptions::default()).await.unwrap();
+        let open = session.state_mut().execute_tx(vec![put_rows(&node, "spans", vec![row(2, 20)], None, None)], AutonomousTxOptions::default()).await.unwrap();
+        assert!(bounded.committed() && open.committed());
+        let updated = session.state_mut().execute_tx(vec![sql(&node, "UPDATE spans SET v = v + 1", vec![])], AutonomousTxOptions::default()).await.unwrap();
+        assert!(updated.committed(), "{:?}", updated.error());
+        let now = updated.tx_key().system_time;
+        let history = rows(session.query_sql("SELECT _id, v, _valid_from, _valid_to FROM spans FOR ALL VALID_TIME ORDER BY _id, _valid_from", vec![]).await.unwrap()).await;
+        assert_eq!(history, vec![
+            vec![Value::I64(1), Value::I64(10), instant(start), instant(now)],
+            vec![Value::I64(1), Value::I64(11), instant(now), instant(end)],
+            vec![Value::I64(2), Value::I64(20), instant(open.tx_key().system_time), instant(now)],
+            vec![Value::I64(2), Value::I64(21), instant(now), Value::Null],
+        ]);
+        stop(&node, driver).await;
+    }).await.unwrap();
+}
+
+#[derive(Default)]
+struct OrderedIndexReads(std::sync::Mutex<Vec<Option<usize>>>);
+
+#[async_trait]
+impl rtdb_query::ScanAccelerator for OrderedIndexReads {
+    async fn candidate_iids(&self, request: &rtdb_query::ScanRequest<'_>) -> Result<Option<BTreeSet<rtdb_types::Iid>>> {
+        if request.scan.table.name.table == TableRef::new("public", "orders") {
+            self.0.lock().unwrap().push(request.scan.iids.as_ref().map(BTreeSet::len));
+        }
+        Ok(None)
+    }
+}
+
+impl OrderedIndexReads {
+    fn take(&self) -> Vec<Option<usize>> { std::mem::take(&mut *self.0.lock().unwrap()) }
+}
+
+async fn index_sql(session: &mut NativeSession, statement: &str) -> rtdb_types::Timestamp {
+    let result = session.state_mut().execute_tx(
+        vec![TxOp::Sql { sql: statement.into(), args: None }], AutonomousTxOptions::default(),
+    ).await.unwrap();
+    assert!(result.committed(), "{statement}: {result:?}");
+    result.tx_key().system_time
+}
+
+async fn index_flush(node: &Node, database: &Database) {
+    database.flush().await.unwrap();
+    node.sync_all(Duration::from_secs(10), &CancellationToken::new()).await.unwrap();
+}
+
+#[tokio::test]
+async fn ordered_index_declaration_if_not_exists_preserves_the_definition() {
+    let (node, driver) = running(options(), services()).await;
+    let mut session = node.session("xtdb", Arc::new(Authority)).unwrap();
+    index_sql(&mut session, "CREATE INDEX IF NOT EXISTS orders_key ON orders (priority, _id)").await;
+    let query = "SELECT columns, version FROM xt.ordered_indexes WHERE _id = 'orders_key'";
+    let original = rows(session.query_sql(query, vec![]).await.unwrap()).await;
+    assert_eq!(original.len(), 1);
+    index_sql(&mut session, "CREATE INDEX IF NOT EXISTS orders_key ON orders (_id)").await;
+    assert_eq!(rows(session.query_sql(query, vec![]).await.unwrap()).await, original);
+    stop(&node, driver).await;
+}
+
+#[tokio::test]
+async fn ordered_index_publishes_its_own_roots_and_seeks_both_directions_at_a_basis() {
+    let observer = Arc::new(OrderedIndexReads::default());
+    let mut services = services();
+    services.scan_accelerators.push(observer.clone());
+    let mut config = options();
+    config.automatic_artefacts = false;
+    let (node, driver) = running(config, services).await;
+    let mut session = node.session("xtdb", Arc::new(Authority)).unwrap();
+    let database = node.catalog().database("xtdb").unwrap();
+    index_sql(&mut session, "CREATE INDEX orders_by_customer ON orders (customer, priority, _id)").await;
+
+    index_sql(&mut session, "INSERT INTO orders RECORDS {_id: 1, customer: 'a', priority: 1}, {_id: 2, customer: 'a', priority: 2}, {_id: 3, customer: 'b', priority: 0}").await;
+    index_flush(&node, &database).await;
+    database.build_artefacts().await.unwrap();
+    let past = index_sql(&mut session, "INSERT INTO orders RECORDS {_id: 4, customer: 'a', priority: 2}, {_id: 5, customer: 'a', priority: 3}, {_id: 6, customer: 'a', priority: 5}").await;
+    index_flush(&node, &database).await;
+    database.build_artefacts().await.unwrap();
+
+    let root = rtdb_storage::ObjectKey::new("ordered-index/v2").unwrap();
+    let paths = database.object_store().list(Some(&root)).await.unwrap();
+    let manifests: Vec<_> = paths.iter().filter(|entry| entry.key.as_str().contains("/manifests/")).collect();
+    assert_eq!(manifests.len(), 1);
+    let manifest: serde_json::Value = serde_json::from_slice(&database.object_store().get(&manifests[0].key).await.unwrap()).unwrap();
+    assert_eq!(manifest["layout"]["source_rows"], 6);
+    assert!(manifest["layout"]["revisions"].is_object());
+    assert!(database.snapshot().trie_entries(&TableRef::new("public", "orders")).iter().all(|trie| trie.key.level() == 0));
+
+    let warm = "SELECT _id FROM orders WHERE customer = 'a' ORDER BY priority, _id LIMIT 1";
+    assert_eq!(rows(session.query_sql(warm, vec![]).await.unwrap()).await, [vec![Value::I64(1)]]);
+    assert!(observer.take().is_empty());
+
+    index_sql(&mut session, "UPDATE orders SET priority = 9 WHERE _id = 1").await;
+    index_sql(&mut session, "DELETE FROM orders WHERE _id = 2").await;
+    index_sql(&mut session, "INSERT INTO orders RECORDS {_id: 7, customer: 'a', priority: 2}").await;
+    let current = "SELECT _id FROM orders WHERE customer = 'a' AND priority >= 2 ORDER BY priority, _id LIMIT 2";
+    observer.take();
+    assert_eq!(rows(session.query_sql(current, vec![]).await.unwrap()).await, [vec![Value::I64(4)], vec![Value::I64(7)]]);
+    assert!(observer.take().is_empty());
+
+    let next = "SELECT _id FROM orders WHERE customer = 'a' AND (priority > 2 OR (priority = 2 AND _id > 4)) ORDER BY priority, _id LIMIT 2";
+    assert_eq!(rows(session.query_sql(next, vec![]).await.unwrap()).await, [vec![Value::I64(7)], vec![Value::I64(5)]]);
+    assert!(observer.take().is_empty());
+
+    let offset = "SELECT _id FROM orders WHERE customer = 'a' ORDER BY priority, _id LIMIT 2 OFFSET 1";
+    assert_eq!(rows(session.query_sql(offset, vec![]).await.unwrap()).await, [vec![Value::I64(7)], vec![Value::I64(5)]]);
+    assert!(observer.take().is_empty());
+
+    let reverse = "SELECT _id FROM orders WHERE customer = 'a' ORDER BY priority DESC, _id DESC LIMIT 2";
+    assert_eq!(rows(session.query_sql(reverse, vec![]).await.unwrap()).await, [vec![Value::I64(1)], vec![Value::I64(6)]]);
+    assert!(observer.take().is_empty());
+
+    let old = "SELECT _id FROM orders FOR SYSTEM_TIME AS OF ? WHERE customer = 'a' ORDER BY priority, _id LIMIT 2";
+    let at = Value::Timestamp { value: past.0, unit: rtdb_types::TimeUnit::Microsecond, timezone: Some("UTC".into()) };
+    assert_eq!(rows(session.query_sql(old, vec![at]).await.unwrap()).await, [vec![Value::I64(1)], vec![Value::I64(2)]]);
+    assert!(observer.take().is_empty());
+
+    stop(&node, driver).await;
+}
+
+#[tokio::test]
+async fn ordered_index_limits_distinct_visible_keys_in_both_directions() {
+    let observer = Arc::new(OrderedIndexReads::default());
+    let mut services = services();
+    services.scan_accelerators.push(observer.clone());
+    let mut config = options();
+    config.automatic_artefacts = false;
+    let (node, driver) = running(config, services).await;
+    let mut session = node.session("xtdb", Arc::new(Authority)).unwrap();
+    let database = node.catalog().database("xtdb").unwrap();
+
+    let index = "CREATE INDEX IF NOT EXISTS orders_candidates ON orders (world, key, label)";
+    index_sql(&mut session, index).await;
+    index_sql(&mut session, index).await;
+    index_sql(&mut session, "INSERT INTO orders RECORDS
+        {_id: 1, world: 4, key: 'a', label: 'hidden'},
+        {_id: 2, world: 4, key: 'b', label: 'public'},
+        {_id: 3, world: 4, key: 'b', label: 'low'},
+        {_id: 4, world: 4, key: 'c', label: 'low'},
+        {_id: 5, world: 4, key: 'c', label: 'public'},
+        {_id: 6, world: 8, key: 'd', label: 'public'}").await;
+    index_flush(&node, &database).await;
+    database.build_artefacts().await.unwrap();
+
+    for (direction, expected) in [("ASC", ["b", "c"]), ("DESC", ["c", "b"])] {
+        let query = format!("SELECT DISTINCT key FROM orders WHERE world = 4
+            AND (label = 'low' OR label = 'public') ORDER BY key {direction} LIMIT 2");
+        assert_eq!(rows(session.query_sql(&query, vec![]).await.unwrap()).await,
+            expected.map(|key| vec![Value::Utf8(key.into())]));
+        assert!(observer.take().is_empty(), "the ordered index answered without opening a candidate scan");
+    }
+
+    let query = "SELECT DISTINCT key FROM orders WHERE world = 4 AND key > 'b'
+        AND (label = 'low' OR label = 'public') ORDER BY key LIMIT 1";
+    assert_eq!(rows(session.query_sql(query, vec![]).await.unwrap()).await, [vec![Value::Utf8("c".into())]]);
+    assert!(observer.take().is_empty(), "the ordered index answered the continuation");
+    stop(&node, driver).await;
+}
+
+#[tokio::test]
+async fn ordered_index_retires_erased_keys_and_drop_recreate_gets_a_fresh_generation() {
+    let mut config = options();
+    config.automatic_artefacts = false;
+    let (node, driver) = running(config, services()).await;
+    let mut session = node.session("xtdb", Arc::new(Authority)).unwrap();
+    let database = node.catalog().database("xtdb").unwrap();
+    index_sql(&mut session, "CREATE INDEX orders_key ON orders (customer, _id)").await;
+    let original = index_sql(&mut session, "INSERT INTO orders RECORDS {_id: 1, customer: 'erased-index-value'}, {_id: 2, customer: 'retained'}").await;
+    index_flush(&node, &database).await;
+    database.build_artefacts().await.unwrap();
+    let prefix = rtdb_storage::ObjectKey::new("ordered-index/v2").unwrap();
+    let store = database.object_store();
+    let mut erased_pages = Vec::new();
+    for entry in store.list(Some(&prefix)).await.unwrap() {
+        if entry.key.as_str().contains("/pages/") && String::from_utf8_lossy(&store.get(&entry.key).await.unwrap()).contains("erased-index-value") {
+            erased_pages.push(entry.key);
+        }
+    }
+    assert!(!erased_pages.is_empty());
+    assert!(erased_pages.iter().all(|page| page.as_str().contains("/generations/0000000000000000/")));
+
+    let erasure = session.state_mut().execute_tx(
+        ["INSERT INTO orders RECORDS {_id: 1, customer: 'erased-in-revision'}",
+         "ERASE FROM orders WHERE _id = 1",
+         "INSERT INTO orders RECORDS {_id: 1, customer: 'z-reinserted'}"]
+            .into_iter().map(|sql| TxOp::Sql { sql: sql.into(), args: None }).collect(),
+        AutonomousTxOptions::default(),
+    ).await.unwrap();
+    assert!(erasure.committed());
+    index_flush(&node, &database).await;
+    database.build_artefacts().await.unwrap();
+    let objects = database.object_store().list(Some(&prefix)).await.unwrap();
+    assert!(objects.iter().any(|entry| entry.key.as_str().contains("/pages/")));
+    for entry in &objects {
+        let bytes = database.object_store().get(&entry.key).await.unwrap();
+        assert!(!String::from_utf8_lossy(&bytes).contains("erased-index-value"));
+        assert!(!String::from_utf8_lossy(&bytes).contains("erased-in-revision"));
+    }
+    let manifest = objects.iter().find(|entry| entry.key.as_str().contains("/manifests/")).unwrap();
+    let encoded = store.get(&manifest.key).await.unwrap();
+    let obsolete = rtdb_storage::ObjectKey::new(manifest.key.as_str().replace("/manifests/scoped/", "/manifests/scrubbed/")).unwrap();
+    store.put(&obsolete, Vec::from("obsolete replay layout").into()).await.unwrap();
+    let checkpoint: serde_json::Value = serde_json::from_slice(&encoded).unwrap();
+    let scope = checkpoint["layout"]["scope"].as_u64().unwrap();
+    assert!(scope > 0);
+    let generation_dir = format!("/generations/{scope:016x}/pages/");
+    assert!(objects.iter().filter(|entry| entry.key.as_str().contains("/pages/")).all(|entry| entry.key.as_str().contains(&generation_dir)));
+    let root = &checkpoint["layout"]["revisions"];
+    let generation = root["generation"].as_i64().unwrap();
+    let digest = root["digest"].as_str().unwrap();
+    let root_suffix = format!("/pages/{generation:016x}/{digest}");
+    let current_page = objects.iter().find(|entry| entry.key.as_str().ends_with(&root_suffix)).unwrap();
+    store.delete(&current_page.key).await.unwrap();
+    for page in &erased_pages {
+        store.put(page, Vec::from("reserved erased page address").into()).await.unwrap();
+    }
+    database.build_artefacts().await.unwrap();
+    assert_eq!(store.get(&manifest.key).await.unwrap(), encoded);
+    assert!(matches!(store.head(&obsolete).await, Err(rtdb_storage::Error::MissingObject(_))));
+    store.head(&current_page.key).await.unwrap();
+    for page in &erased_pages {
+        assert!(matches!(store.head(page).await, Err(rtdb_storage::Error::MissingObject(_))));
+    }
+    let query = "SELECT _id FROM orders WHERE customer >= 'a' ORDER BY customer, _id LIMIT 2";
+    let retained = [vec![Value::I64(2)], vec![Value::I64(1)]];
+    assert_eq!(rows(session.query_sql(query, vec![]).await.unwrap()).await, retained);
+    let history = "SELECT _id FROM orders FOR SYSTEM_TIME AS OF ? WHERE customer >= 'a' ORDER BY customer, _id LIMIT 2";
+    let at = Value::Timestamp { value: original.0, unit: rtdb_types::TimeUnit::Microsecond, timezone: Some("UTC".into()) };
+    assert_eq!(rows(session.query_sql(history, vec![at]).await.unwrap()).await, [vec![Value::I64(2)]]);
+
+    index_sql(&mut session, "DROP INDEX orders_key").await;
+    database.build_artefacts().await.unwrap();
+    assert!(database.object_store().list(Some(&prefix)).await.unwrap().is_empty());
+    index_sql(&mut session, "CREATE INDEX orders_key ON orders (customer, _id)").await;
+    index_flush(&node, &database).await;
+    database.build_artefacts().await.unwrap();
+    assert_eq!(rows(session.query_sql(query, vec![]).await.unwrap()).await, retained);
+    for entry in database.object_store().list(Some(&prefix)).await.unwrap() {
+        let bytes = database.object_store().get(&entry.key).await.unwrap();
+        assert!(!String::from_utf8_lossy(&bytes).contains("erased-index-value"));
+    }
+    stop(&node, driver).await;
+}
+
+#[tokio::test]
+async fn ordered_index_reopens_its_manifest_and_covers_flushed_lag() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut config = options();
+    config.automatic_artefacts = false;
+    config.membership = Membership::Durable { primary: local_database(directory.path()), skipped: BTreeSet::new() };
+    let mut template = services();
+    let observer = Arc::new(OrderedIndexReads::default());
+    template.scan_accelerators.push(observer.clone());
+
+    let (node, driver) = running(config.clone(), fresh_local_services(&template)).await;
+    let mut session = node.session("xtdb", Arc::new(Authority)).unwrap();
+    let database = node.catalog().database("xtdb").unwrap();
+    index_sql(&mut session, "CREATE INDEX orders_key ON orders (priority, _id)").await;
+    index_sql(&mut session, "INSERT INTO orders RECORDS {_id: 1, priority: 5}, {_id: 2, priority: 7}").await;
+    index_flush(&node, &database).await;
+    database.build_artefacts().await.unwrap();
+    index_sql(&mut session, "INSERT INTO orders RECORDS {_id: 3, priority: 6}").await;
+    index_sql(&mut session, "UPDATE orders SET priority = 10 WHERE _id = 2").await;
+    index_sql(&mut session, "DELETE FROM orders WHERE _id = 3").await;
+    index_sql(&mut session, "INSERT INTO orders RECORDS {_id: 4, priority: 8}").await;
+    index_flush(&node, &database).await;
+    drop(session);
+    drop(database);
+    stop(&node, driver).await;
+    drop(node);
+
+    let (node, driver) = running(config, fresh_local_services(&template)).await;
+    node.sync_all(Duration::from_secs(10), &CancellationToken::new()).await.unwrap();
+    let mut session = node.session("xtdb", Arc::new(Authority)).unwrap();
+    observer.take();
+    let query = "SELECT _id FROM orders WHERE priority > 5 ORDER BY priority, _id LIMIT 1";
+    assert_eq!(rows(session.query_sql(query, vec![]).await.unwrap()).await, [vec![Value::I64(4)]]);
+    assert!(observer.take().is_empty());
+    stop(&node, driver).await;
+}
+
+#[tokio::test]
+async fn ordered_index_serves_later_pages_after_independent_data_compaction() {
+    let observer = Arc::new(OrderedIndexReads::default());
+    let mut template = services();
+    template.scan_accelerators.push(observer.clone());
+    let mut config = options();
+    config.automatic_artefacts = false;
+    let (node, driver) = running(config, template).await;
+    let mut session = node.session("xtdb", Arc::new(Authority)).unwrap();
+    let database = node.catalog().database("xtdb").unwrap();
+    index_sql(&mut session, "CREATE INDEX orders_key ON orders (priority, _id)").await;
+    let records = (0..540).map(|id| format!("{{_id: {id}, priority: {id}}}")).collect::<Vec<_>>().join(", ");
+    index_sql(&mut session, &format!("INSERT INTO orders RECORDS {records}")).await;
+    index_flush(&node, &database).await;
+    database.build_artefacts().await.unwrap();
+
+    let root = rtdb_storage::ObjectKey::new("ordered-index/v2").unwrap();
+    let paths = database.object_store().list(Some(&root)).await.unwrap();
+    let manifest = paths.iter().find(|entry| entry.key.as_str().contains("/manifests/")).unwrap();
+    let encoded = database.object_store().get(&manifest.key).await.unwrap();
+    assert!(paths.iter().filter(|entry| entry.key.as_str().contains("/pages/")).count() > 3);
+    database.compaction().unwrap().compact_all().await.unwrap();
+    assert_eq!(database.object_store().get(&manifest.key).await.unwrap(), encoded);
+
+    let query = "SELECT _id FROM orders WHERE priority >= 520 ORDER BY priority, _id LIMIT 2";
+    assert_eq!(rows(session.query_sql(query, vec![]).await.unwrap()).await, [vec![Value::I64(520)], vec![Value::I64(521)]]);
+    assert!(observer.take().is_empty());
+
+    let reverse = "SELECT _id FROM orders WHERE priority < 520 ORDER BY priority DESC, _id DESC LIMIT 2";
+    assert_eq!(rows(session.query_sql(reverse, vec![]).await.unwrap()).await, [vec![Value::I64(519)], vec![Value::I64(518)]]);
+    assert!(observer.take().is_empty());
+
+    let gap = "SELECT _id FROM orders WHERE priority > 519 AND priority < 520 ORDER BY priority, _id LIMIT 1";
+    assert!(rows(session.query_sql(gap, vec![]).await.unwrap()).await.is_empty());
+    assert!(observer.take().is_empty());
+    stop(&node, driver).await;
+}
+
+
+#[tokio::test]
+async fn rebuilding_a_missing_ordered_root_preserves_the_incremental_manifest() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut config = options();
+    config.automatic_artefacts = false;
+    config.membership = Membership::Durable { primary: local_database(directory.path()), skipped: BTreeSet::new() };
+    let mut template = services();
+    let observer = Arc::new(OrderedIndexReads::default());
+    template.scan_accelerators.push(observer.clone());
+
+    let (node, driver) = running(config.clone(), fresh_local_services(&template)).await;
+    let mut session = node.session("xtdb", Arc::new(Authority)).unwrap();
+    let database = node.catalog().database("xtdb").unwrap();
+    index_sql(&mut session, "CREATE INDEX orders_key ON orders (priority, _id)").await;
+    index_sql(&mut session, "INSERT INTO orders RECORDS {_id: 1, priority: 2}").await;
+    index_flush(&node, &database).await;
+    database.build_artefacts().await.unwrap();
+    index_sql(&mut session, "INSERT INTO orders RECORDS {_id: 2, priority: 1}").await;
+    index_flush(&node, &database).await;
+    database.build_artefacts().await.unwrap();
+    let prefix = rtdb_storage::ObjectKey::new("ordered-index/v2").unwrap();
+    let objects = database.object_store().list(Some(&prefix)).await.unwrap();
+    let manifest = objects.iter().find(|entry| entry.key.as_str().contains("/manifests/")).unwrap();
+    let manifest_key = manifest.key.clone();
+    let manifest_bytes = database.object_store().get(&manifest_key).await.unwrap();
+    let checkpoint: serde_json::Value = serde_json::from_slice(&manifest_bytes).unwrap();
+    let root = &checkpoint["layout"]["revisions"];
+    let generation = root["generation"].as_i64().unwrap();
+    let digest = root["digest"].as_str().unwrap();
+    let page_suffix = format!("/pages/{generation:016x}/{digest}");
+    let page = objects.iter().find(|object| object.key.as_str().ends_with(&page_suffix)).unwrap();
+    database.object_store().delete(&page.key).await.unwrap();
+    drop(session);
+    drop(database);
+    stop(&node, driver).await;
+    drop(node);
+
+    let (node, driver) = running(config, fresh_local_services(&template)).await;
+    node.sync_all(Duration::from_secs(10), &CancellationToken::new()).await.unwrap();
+    let mut session = node.session("xtdb", Arc::new(Authority)).unwrap();
+    let database = node.catalog().database("xtdb").unwrap();
+    let query = "SELECT _id FROM orders WHERE priority >= 1 ORDER BY priority, _id LIMIT 1";
+    observer.take();
+    assert_eq!(rows(session.query_sql(query, vec![]).await.unwrap()).await, [vec![Value::I64(2)]]);
+    assert_eq!(observer.take(), [None]);
+
+    database.build_artefacts().await.unwrap();
+    assert_eq!(database.object_store().get(&manifest_key).await.unwrap(), manifest_bytes);
+    assert!(database.object_store().head(&page.key).await.is_ok());
+    assert_eq!(rows(session.query_sql(query, vec![]).await.unwrap()).await, [vec![Value::I64(2)]]);
+    assert!(observer.take().is_empty());
+    stop(&node, driver).await;
+}
+
+#[tokio::test]
+async fn ordered_coverage_uses_only_adopted_l0_files() {
+    let mut config = options();
+    config.automatic_artefacts = false;
+    let observer = Arc::new(OrderedIndexReads::default());
+    let mut services = services();
+    services.scan_accelerators.push(observer.clone());
+    let (node, driver) = running(config, services).await;
+    let mut session = node.session("xtdb", Arc::new(Authority)).unwrap();
+    let database = node.catalog().database("xtdb").unwrap();
+    index_sql(&mut session, "CREATE INDEX orders_key ON orders (priority, _id)").await;
+    index_sql(&mut session, "INSERT INTO orders RECORDS {_id: 1, priority: 9}").await;
+    index_flush(&node, &database).await;
+
+    let snapshot = database.snapshot();
+    let table = TableRef::new("public", "orders");
+    let entry = snapshot.table_entry(&table).unwrap();
+    let trie = rtdb_format::keys::TrieKey::l0(snapshot.trie_catalog().l0_max_block_index(&table)).unwrap();
+    let canonical = entry.slug.data_key(&trie);
+    let canonical = rtdb_storage::ObjectKey::new(canonical).unwrap();
+    index_sql(&mut session, "INSERT INTO unrelated RECORDS {_id: 1}").await;
+    index_flush(&node, &database).await;
+    let gap = database.snapshot().trie_catalog().l0_max_block_index(&TableRef::new("public", "unrelated"));
+    assert!(gap > trie.block_index());
+    let unadopted = rtdb_format::keys::TrieKey::l0(gap).unwrap();
+    let copy = rtdb_storage::ObjectKey::new(entry.slug.data_key(&unadopted)).unwrap();
+    let store = database.object_store();
+    store.put(&copy, store.get(&canonical).await.unwrap()).await.unwrap();
+    index_sql(&mut session, "INSERT INTO orders RECORDS {_id: 2, priority: 2}").await;
+    index_flush(&node, &database).await;
+
+    database.build_artefacts().await.unwrap();
+    let query = "SELECT _id FROM orders ORDER BY priority, _id LIMIT 1";
+    observer.take();
+    assert_eq!(rows(session.query_sql(query, vec![]).await.unwrap()).await, [vec![Value::I64(2)]]);
+    assert!(observer.take().is_empty());
     stop(&node, driver).await;
 }

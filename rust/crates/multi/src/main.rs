@@ -61,10 +61,13 @@ Use dynamodb+packed:PREFIX to write packed parked rows after all readers have up
 MAP is HOST:PORT of a cell-map server, or dynamodb:PREFIX for tables named PREFIX-cells and PREFIX-placements.\n\
 DynamoDB requires the `dynamodb` feature. RTDB_DYNAMODB_ENDPOINT points at DynamoDB Local.\n";
 
-#[tokio::main]
-async fn main() {
+fn main() {
+    let runtime = match tokio::runtime::Builder::new_multi_thread().thread_stack_size(rtdb_node::WORKER_STACK_BYTES).enable_all().build() {
+        Ok(runtime) => runtime,
+        Err(error) => { eprintln!("{error}"); std::process::exit(1); }
+    };
     let arguments: Vec<String> = std::env::args().skip(1).collect();
-    if let Err(error) = run(arguments).await {
+    if let Err(error) = runtime.block_on(run(arguments)) {
         eprintln!("{}: {}", error.code, error.message.as_deref().unwrap_or(""));
         std::process::exit(1);
     }

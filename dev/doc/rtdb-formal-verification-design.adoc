@@ -1,0 +1,1150 @@
+= RTDB formal verification design
+:toc:
+:sectnums:
+
+== Decision and scope
+
+RTDB's Rust-native engine should refine a reference database defined by an ordered history of atomic transaction batches.
+A successful observation has to be one that the reference database permits at the observation's admitted basis.
+A successful commit acknowledgement has to name an applied batch that remains recoverable under the declared provider contracts.
+A maintenance transition may change the representation of the history while preserving its observable answers and the availability promised to readers and recovery.
+
+The unit of the first assurance claim is one database and its replica and maintenance processes.
+An individual SQL statement, cursor, or transaction may have a different lifetime for its read basis.
+The cross-database consistency of a query needs a separate contract for the vector of bases it uses.
+Consensus, physical erasure from all copies, external source effects, and broad SQL optimizer correctness are separate extensions with their own requirements.
+The plan covers SQL and native entry points where they reach the same kernel effect, including any exported, admin, startup, and replay paths that can publish, open, or delete a representation.
+
+The requirements below are proposed targets.
+The status and scope of completed results live in the evidence ledger.
+The unresolved product choice is the lifetime of a previously admitted read across compaction and collection.
+Both a bounded lease and a coordinated pin are candidates.
+A native diagnostic reproduces an open-cursor failure under explicit collection. link:rtdb-verification.adoc[Existing study brief] · link:../../verification/results/2026-11-21.adoc[Evidence ledger]
+
+=== Key terms
+
+[cols="1,3",options="header"]
+|===
+|Term |Meaning
+
+|Commit position
+|An identity in the logical order of committed batches for a database.
+A source position, replica position, transaction ID, and system timestamp each have their own mapping to that order.
+The mapping has to be stated and checked at the boundary that uses it.
+
+|Admission horizon
+|The prefix of committed history the engine admits a read to observe.
+ERASE semantics use the admitted history.
+
+|Requested system time
+|The time coordinate at which the query asks which version of an entity was visible within the admitted history.
+A fresh query for an old system time and a continuation of an already admitted read are different operations.
+
+|Valid time
+|The time coordinate to which an entity fact applies.
+Validity spans use half-open intervals.
+
+|Representation generation
+|A coherent physical catalog and the immutable buffers and objects reachable through it.
+Several generations can implement the same logical history.
+A physical generation identifier and a logical read basis can advance independently.
+
+|Reader entitlement
+|The right to use a generation, or an independently owned immutable copy sufficient to answer the read.
+A lease or pin implementation must account for active storage operations as well as the lifetime of the handle.
+
+|Recoverable root
+|A checkpoint root with the required closure of readable objects and a sufficient replay suffix.
+Recovery policy determines which roots are eligible.
+
+|Derived evidence
+|An index or summary used to reduce query work while preserving the reference observation.
+Its provenance determines the answers for which it can be used.
+|===
+
+== Reference semantics
+
+=== Ordered history and transaction resolution
+
+Let the reference history be a sequence of complete committed batches.
+Each batch contains an ordered sequence of facts.
+The order of two operations in one batch remains observable even when they have the same system timestamp.
+Apply advances the public history as one step.
+A refusal, aborted batch, or still-private tentative batch leaves the public history unchanged.
+
+A transaction's resolving view consists of an eligible committed basis and the ordered prefix of operations already resolved inside that transaction.
+A pipelined resolver may also consume staged predecessors if the publication protocol guarantees that they become exactly its committed predecessors before its effects are visible.
+The protocol must discard or re-resolve dependent work if that condition ceases to hold.
+The proof fixes which effects determine an eligible predecessor, including any predicate reads used to decide a conditional write.
+Validation of a version alone is sufficient only when the version covers every decision input relevant to the allowed ordering.
+
+A source receipt proves acceptance at its documented stage.
+A commit receipt proves application of the admitted batch and the recovery promise stated for that provider.
+The model separates acceptance, append, delivery, apply, and acknowledgement.
+For any API with retry identity, a stable identity binds to one request or one durable result for its stated lifetime.
+Repeated delivery of a replica record and client resubmission after an ambiguous reply have distinct identities and contracts.
+
+=== Point and range answers
+
+Use the following executable interface for the reference evaluator.
+The actual implementation may use ordered histories, intervals, polygons, or sorted immutable files.
+
+[source,text]
+----
+Admit(history, horizon) -> captured history
+ResolvePoint(captured, entity, requested_system_time, valid_time) -> row or absence
+ResolveRange(captured, entity, system_window, valid_window) -> visible fragments
+Observe(query, admitted basis, representation) -> rows or specified refusal
+----
+
+For a point, first select the admitted prefix.
+Apply the latest applicable ERASE for the entity in the captured history, respecting within-batch order.
+Then select the last surviving event for that entity that covers the valid point and is visible at the requested system coordinate.
+A winning PUT supplies the row and a winning DELETE supplies absence.
+A prior ERASE can leave a subsequent PUT visible only under the normal time and ordering rules.
+The source-to-model map must state whether committed ordering and system timestamps alone determine precedence or need an additional transaction or operation coordinate.
+
+For a range, the returned fragments represent exactly the same answers at every included point.
+They carry the identity and system origin needed by exposed projections and later visibility operations.
+For each answerable point, a row origin contributes at most one visible answer for its entity.
+When fragment decomposition is an implementation detail, compare the induced point observations.
+When a supported projection exposes system endpoints, valid endpoints, row identity, cardinality, or order, compare those observations as required by that projection.
+Half-open bounds, equal endpoints, unbounded queries, and representable extrema are part of the domain.
+Treat sentinel encodings as explicit conventions in the refinement map.
+
+Two snapshots of the same history may choose different admissible physical representations.
+Equivalent representations must agree on every observable read within their shared entitlement.
+For successful accelerated search, normalize the query arguments, analyzer and corpus at the same admitted basis before comparing outputs.
+Correctness of cancellation and resource refusal is a separate observation from the rows of a successful result.
+
+=== Abstraction and simulation relations
+
+Relate an engine state to an abstract state through the applied log prefix, a coherent catalog and its live overlays, snapshots admitted to that prefix or a lawful earlier basis, and any outstanding durability and reclamation obligations.
+A concrete apply step corresponds to one abstract commit, and a physical compaction or cache operation leaves the abstract history unchanged.
+A staged write changes only its resolver view.
+A recovery step may replay several concrete records while reconstructing the same committed prefix.
+When proving a step composition, state which intermediate observations are visible and which are internal.
+For concurrent models, every concrete observable trace must be permitted by the reference contract at the same declared boundary.
+
+Record the refinement map for each component as a program definition or a reviewable table next to the model.
+List the production fields that implement each abstract coordinate, the writer and synchronization point that establishes it, and the processing stage that consumes it.
+Examples include authoritative term, applied position, admitted prefix, generation identity, immutable object identity, and original event order in a compacted page.
+Treat a mismatch between those fields and the abstract premise as an open proof obligation until the production path establishes it.
+
+=== Shared law signatures
+
+The following schematic predicates identify the checks that should agree across the formal models, production contracts, and replay oracle.
+The brackets around a time span denote inclusion and exclusion at its stated endpoints.
+The term `required` is determined by the declared representation and fallback contract.
+
+[source,text]
+----
+WholeCommit:
+  visible_after = visible_before
+  or visible_after = append(visible_before, one_complete_admitted_batch)
+
+EligibleResolution:
+  publish(batch, predecessor) implies
+    exists legal_order where predecessor precedes batch
+    and resolved(batch) = evaluate_operations(predecessor, batch.in_original_order)
+
+StableObservation:
+  entitled(handle, state) and read(handle, query, state) succeeds with answer
+    imply answer is allowed by Observe(query, handle.captured_history)
+
+TemporalPointRefinement:
+  for every (entity, system, valid) in the query window,
+    project_fragments(engine_range, entity, system, valid)
+    = ResolvePoint(captured, entity, system, valid)
+
+RecoverableAcknowledgement:
+  commit_acknowledged(batch) implies applied(batch)
+  and every supported recovered state contains batch in its committed history
+
+ProtectedObject:
+  object in required(entitled_handles, protected_operations, eligible_recovery)
+    implies the exact object is readable under the provider contract
+
+SafeReclaim:
+  authorize_delete(object, epoch) implies no protected obligation needs object
+  and a protection obligation cannot be acquired for that identity during deletion
+
+DerivedQueryRefinement:
+  accelerated_success(query, basis) implies
+    observed_result is in the results allowed by complete_scan(query, basis)
+----
+
+The acknowledgement law quantifies over failures in the supported deployment contract.
+The protected-object law distinguishes logical reachability from an available I/O path.
+For progress, formulate eventual closure or reclamation as a temporal property of a service suffix in which its fairness and availability assumptions hold.
+For ranked pruning, maintain a frontier that covers every qualifying row still unexamined through either a pending candidate or an unread window.
+A cutoff may remove a row only once the remaining bounds and tie rules prove that the reference result has been retained.
+
+== Requirements
+
+Each requirement has a stable identifier and an acceptance observation.
+These identifiers refine the earlier study's TX-1, SNAP-1, TIME-1, COMPACT-1, GC-1, and FTS-1.
+A claim of validity is relative to the guarantees and assumptions in this document.
+A claim of expressiveness requires a witnessed acceptance program for each required positive scenario and the specified outcome for each refusal.
+
+=== Safety and refinement
+
+[cols="1,3,3",options="header"]
+|===
+|ID |Guarantee |Observable acceptance criterion
+
+|TX-1
+|A complete admitted batch becomes visible as one ordered transition.
+Displaced terms, sequence gaps, duplicates, incomplete batches, refusals, and private writes cannot independently advance public history.
+|A transfer exposes both legs at the same basis.
+A delayed record from a displaced leader leaves the applied position and rows unchanged.
+Replay of an already applied record leaves the same result.
+
+|TX-2
+|Every state-dependent result is consistent with the allowed serial resolution order.
+A batch resolves its own earlier operations in their original order and consumes only eligible predecessor work.
+|Two conditional increments produce the outcome of two serialized increments.
+A conditional operation can observe a prior operation of its own batch.
+An aborted batch leaves the external view unchanged.
+
+|SNAP-1
+|Each read observes its admitted history for the promised lifetime.
+The engine refuses or waits for requests beyond what the selected node can lawfully serve according to the API contract.
+|A cursor opened before another commit continues to observe its original view.
+A fresh admission observes the later state when the basis policy requires it.
+A future basis yields the specified timeout, wait, or refusal.
+
+|TIME-1
+|Point and range reads agree with the bitemporal reference evaluation, including operation precedence, clipping, and interval endpoints.
+|Open and closed history queries agree at every cell boundary in the fixture.
+Same-system-time operations produce the correct final point answer in either original operation order.
+
+|TIME-2
+|DELETE changes the specified valid span from its system-time position forward where it wins.
+ERASE suppresses earlier versions in a fresh view that includes the ERASE, including views asking for an earlier system coordinate.
+|A historical query under a pre-erase admitted view and a fresh historical query under the post-erase horizon yield their separately specified answers.
+Subsequent reinsertion is visible only in its admitted system and valid ranges.
+
+|DUR-1
+|Every successful commit acknowledgement names an admitted, applied batch and implies the specified recoverability.
+A recovered durable prefix and replay suffix reconstruct the same visible history.
+|Interrupt before and after append, delivery, apply, and acknowledgement.
+On restart, validate returned receipts against the recovered history and compare exact rows and positions.
+
+|DUR-2
+|A root eligible for recovery names a complete, readable dependency closure plus a sufficient replay suffix.
+Root selection and deletion of old checkpoints preserve at least one usable recovery path for the supported fault model.
+|With a lost publication reply or omitted listing entry, recovery still finds a usable representation or retained log according to its contract.
+A pending copy cannot count as a complete dependency.
+
+|COMPACT-1
+|Eligible compaction preserves every in-scope read at a fixed basis.
+Publication changes the selected coverage coherently, including complete sibling groups, without hiding or duplicating rows.
+|Observe the same basis before, during, and after publication of a partition group.
+Compare narrow historical reads and full-range output, including an IID and valid interval on a partition boundary.
+
+|GC-1
+|A required object stays readable while an entitled reader, an in-flight operation covered by the contract, or an eligible recovery path depends on it.
+A shared artefact stays alive under its declared catalog reference rule.
+|An admitted read and a concurrent collector satisfy the chosen lifetime contract.
+Collecting one of several catalog references leaves the shared object available to surviving members.
+The last eligible removal may collect it.
+
+|GC-2
+|Deletion is authorized for the intended physical identity and remains consistent across retries, lost replies, and leader turnover.
+Catalog publication, recovery roots, deletion notices, and cache invalidation preserve their ordering contracts.
+|Pause deletion and change the generation before resuming.
+Check that the authorized identity is the only object affected.
+After interruption between physical deletion and its notice, retry converges on the same eligible state.
+
+|FTS-1
+|Accelerated MATCH yields the reference scan's qualifying rows at the same basis.
+Every narrowing decision retains every qualifying visible row.
+Required fallback preserves the predicate and score corpus when the underlying data is readable.
+|Compare result bags and exposed temporal columns across indexed and scan-only runs, including shared files, erasures, history modes, missing files, and admission-budget fallback.
+
+|FTS-2
+|Ranked early termination preserves SQL's top results under the chosen corpus, numerical evaluation order, residual predicates, and tie rules.
+|Compare top K with a fully evaluated sort for exact ties, floating-point boundaries, and multiple MATCH predicates.
+If SQL defines a total tie-break order, compare the exact ordered rows.
+Otherwise compare results using the orderings SQL permits.
+|===
+
+=== Progress, conditional guarantees, and contract choices
+
+[cols="1,3,3",options="header"]
+|===
+|ID |Guarantee or decision |Premises and scope
+
+|LIVE-1
+|An eligible accepted request progresses to its documented result in stable service.
+|The serving term stabilizes, providers keep the required data available, relevant work is scheduled fairly, and the environment eventually delivers the request and its dependencies.
+Each retry policy and configured deadline defines a separate observable outcome.
+
+|LIVE-2
+|A retired generation is eventually reclaimable after its last obligation ends, and eligible deletion work eventually completes.
+|Reader I/O terminates or can be drained safely, the policy resolves abandoned handles, the collector gets opportunities to run, and provider operations eventually succeed or become conclusively absent.
+
+|OPT-1
+|Client retries with the same supported identity resolve to one committed effect or a documented refusal.
+A different request using that identity follows the explicit conflict rule.
+|An API must define the identity domain, receipt retention, expiry, and recovery across a lost reply first.
+Replica duplicate suppression is already covered by TX-1.
+
+|OPT-2
+|Physically erased material is removed from the classes of storage named by an erasure contract within its declared conditions and schedule.
+|Require an inventory of logs, checkpoints, object versions, caches, replicas, exports, backups, keys, and any separately governed storage.
+TIME-2 covers query semantics while this decision remains open.
+
+|OPT-3
+|Unauthorized or erased data has the declared effect on observable rows, scores, errors, metadata, or timing.
+|Define observers, authorized views, permitted indirect effects, and included channels before comparing executions.
+Precise query erasure under TIME-2 is one possible functional projection of this stronger requirement.
+|===
+
+Adopting a liveness requirement requires a progress witness in a representative configuration and a mutation that disables the necessary progress step or fairness assumption.
+A bound on allowed clock skew, request duration, or retention capacity belongs in the product or deployment contract when a proof relies on it.
+An overloaded or permanently inaccessible provider may prevent forward progress.
+The safety claim under those failures is preservation of the last valid history and precise refusal or interruption where the API requires it.
+
+=== Acceptance programs
+
+[cols="1,2,2,2",options="header"]
+|===
+|Trace |Program |Expected observation |Primary requirements
+
+|A01
+|Publish the debit and credit of one transfer, reading between candidate publication steps.
+|Only the old balance pair and the complete new pair are observable.
+|TX-1, SNAP-1
+
+|A02
+|Resolve two conditional increments concurrently from a shared starting value.
+In the first batch, read its own prior tentative PUT.
+|An eligible legal order produces the final value.
+The external reader sees no private intermediate row.
+|TX-2
+
+|A03
+|Hand over leadership with an older record and a later sequence position in flight.
+Deliver a genuine duplicate as well.
+|The old term is fenced, the gap follows the configured term rule, and the duplicate causes no extra application.
+|TX-1, DUR-1
+
+|A04
+|Write a broad interval, apply a retroactive correction, then DELETE a partially overlapping span.
+Read each endpoint and the cells between them under both system bases.
+|The returned fragments and point answers agree, including the open upper boundary.
+|TIME-1, TIME-2
+
+|A05
+|Admit a read, ERASE its entity, then reinsert in a narrower interval.
+Read at the old requested system time through both the original and a fresh admission.
+Repeat with the opposite operation order inside one batch.
+|The fresh observation follows the new horizon.
+The original admission follows its entitlement and captured history.
+The later operation wins within one batch.
+|SNAP-1, TIME-1, TIME-2
+
+|A06
+|Interrupt a writer before and after the root operation and its acknowledgement.
+Include a root whose dependency upload has returned a pending result.
+|The root is eligible only after dependency completion.
+Recovered observations equal the durable history through the correct replay path.
+|DUR-1, DUR-2
+
+|A07
+|Produce a four-member compaction group and apply output notifications in different allowed orders.
+Churn an overlapping write or search artefact at the same time.
+|A coherent serving catalog has complete coverage.
+A query pinned to either complete representation agrees with the reference evaluator.
+|COMPACT-1, FTS-1
+
+|A08
+|Admit a reader, start a storage read, replace the generation, and advance collection eligibility.
+Exercise release, expiry, cancellation, and follower lag.
+|The chosen contract determines legal completions and refusals.
+Reclamation happens after the last protected dependency is discharged.
+|SNAP-1, GC-1, LIVE-2
+
+|A09
+|Retire one member of a group, then the last member.
+Interrupt after deleting an eligible object and before the replica notice.
+|Survivors retain the shared artefact according to its contract.
+Retrying a completed delete and applying its notice is consistent with catalog recovery.
+|GC-1, GC-2
+
+|A10
+|Execute the same MATCH and ranked LIMIT with and without acceleration.
+Include a high-scoring posting that fails a second predicate, score ties, and an optional index that cannot be opened.
+|Qualifying rows, score observations, and top K satisfy the same SQL semantics.
+|FTS-1, FTS-2
+
+|A11
+|Request a future, closed, or expired basis and then issue a valid request.
+|Each unavailable admission takes the declared refusal or wait path.
+The valid request exercises the success path and rules out a model that refuses everything.
+|SNAP-1, LIVE-1
+
+|A12
+|Submit one supported retry identity, lose the reply, restart, and retry the same identity and a different body under that identity.
+|For a surface adopting OPT-1, the duplicate receives its documented result and the mismatched body receives the conflict outcome.
+|OPT-1
+|===
+
+== Candidate kernel and comparison
+
+=== Mechanisms
+
+Each mechanism is a rule a design could plausibly weaken independently.
+The granularity follows which invariant must change atomically and which user observation could expose a weakening.
+One Rust method may implement several mechanisms.
+Several API methods may spell the same mechanism.
+
+[cols="1,3,2,2",options="header"]
+|===
+|ID |Semantic transition |Why it is an independent subject of proof |Weakening or replacement to study
+
+|M1 · Admit and apply
+|Admit a record against authoritative order and term, then publish its whole applied batch at one visible boundary.
+|Term and order eligibility govern which batch may advance, and the apply boundary determines what a concurrent read can see.
+Their independence deserves separate weakenings even if one owner applies both.
+|Advance from an unfenced source.
+Treat a gap as harmless.
+Allow a partial batch to become visible.
+
+|M2 · Resolve against an eligible private view
+|Resolve each operation against the chosen committed basis and the ordered private prefix, and ensure its basis remains eligible at publication.
+|Two executions can publish whole batches while still resolving incompatible decisions from a stale basis.
+|Compare serialized resolution, validation and re-resolution, and blind publication.
+
+|M3 · Capture and evaluate a read
+|Admit a read to a stable logical prefix and resolve the ordered facts at its requested valid and system coordinates.
+|A fixed order leaves open what a bitemporal read means and how a fresh historical read reacts to ERASE.
+|Conflate the admission horizon with requested system time.
+Discard same-commit operation order.
+Replace intervals with an equivalent persistent representation.
+
+|M4 · Publish a complete representation
+|Prepare a complete replacement and expose its covering catalog or recoverable root at the declared publication step.
+Preserve the replay suffix needed to recover.
+|Representations may change without adding a transaction.
+Readers and recovery use distinct completeness premises.
+|Expose a partial sibling group.
+Publish a root before one dependency completes.
+Trim the suffix before recovery can discover a usable root.
+
+|M5 · Hold and discharge representation obligations
+|Represent the right to read or recover the required objects and permit reclamation only after the applicable obligations end.
+|A fully correct new representation can coexist with an older reader or recovery path that still needs the previous one.
+|Compare copied data, validated leases, and coordinated pins.
+Try time-based collection alone and deletion after the first shared reference disappears.
+
+|M6 · Refine through optional evidence
+|Allow a narrower candidate set or ranked cutoff only when the resulting observation equals the reference query, and apply the declared fallback when needed.
+|Search can change how much of the correct underlying representation is visited.
+|Omit a qualifying candidate or residual predicate.
+Cut off a possible tie.
+Disable optional acceleration entirely and measure which requirements remain.
+|===
+
+The minimality result is relative to the chosen requirements.
+If the requirements permit scan-only MATCH and express no acceleration or cost target, M6 is a contract for an optional optimization.
+Its weakening may violate correctness, while removing the optimization entirely may preserve the semantic kernel.
+A cache layout, artefact layout, API spelling, worker count, or chosen lease duration requires a separate reason to appear in the minimal mechanism set.
+Include a durable request identity rule only for a surface whose retry contract requires it.
+
+=== Independent designs and common tests
+
+Three isolated GPT-6.2 Astra designers received the same requirements brief and produced independent proposals before seeing the production source or each other's reports.
+Each arrived at ordered atomic publication, a private resolution prefix, a captured read horizon separate from requested system time, and a representation boundary.
+The convergence is design evidence.
+Necessity comes from explicit countermodels or required programs that become unwritable.
+
+[cols="1,2,2,2",options="header"]
+|===
+|Design |Resolve and publish |Read and erase |Study implication
+
+|A
+|Publish a resolved batch with a version precondition.
+A serialized writer turn is another implementation of the eligibility constraint.
+|Retain already-admitted handles under their entitlement.
+New read admission follows the current erasure boundary according to its API policy.
+|Test whether history reads remain expressible when old admissions and old system coordinates are routed separately.
+
+|B
+|Serialize resolution and durable extension.
+A private list gives the resolver read-your-writes.
+|A fresh old-system-time query uses the current capture.
+A copied immutable answer can replace a generation pin if admission and copying establish the required ownership.
+|Compare copying, holding a generation, and caching only a subset against A05 and A08.
+
+|C
+|Append resolved facts and represent historical answers with persistent interval maps.
+|Use separate coordinates for the erase horizon and historical system basis.
+|Check that an old root alone lacks the current horizon information needed by a fresh historical query.
+|===
+
+Retain one shared model vocabulary and acceptance suite when comparing designs.
+Encode serialized, validated, and deliberately blind resolution in the same transition system.
+Encode explicit leases, pins, copied ownership, and the age-only comparison against the same reader obligation.
+Keep common input restrictions fixed or declare exactly which assumption differs between variants.
+If a variant rejects a supported positive acceptance trace, record the expressiveness gap alongside any passing safety results.
+Run an independent re-derivation again if a counterexample forces a material change to the requirements.
+Give each author the same requirements and acceptance programs, isolate their reports and models until handoff, and independently replay the reported results. link:../../verification/README.adoc[Independent derivations and existing comparisons]
+
+== Assumptions and deployment obligations
+
+Every assumption has an owner, an affected guarantee, and a way to detect or test a violated premise where feasible.
+Keep the production premises in the study that consumes them.
+An assumption promoted to a kernel rule must have an enforcing transition and an acceptance case.
+An environment contract must identify the supported providers and settings.
+
+[cols="1,3,3",options="header"]
+|===
+|ID |Required premise |Owner and evidence
+
+|E1 · Log order
+|Readers of a replica log agree on record identity and position.
+A delivery cannot silently skip a retained position.
+The meaning of an empty read, prepared delivery, and accepted append is explicit.
+An acknowledged record remains available above the declared retention floor under the supported failures.
+|The provider and deployment own storage and delivery guarantees.
+RTDB owns term admission, gap handling, replay position, and use of the retention floor.
+Check each adapter and deployment profile against the durable order contract. link:../../allium/log-processor-lifecycle.allium[Log lifecycle]
+
+|E2 · Object completion
+|Successful publication gives the exact immutable bytes at the address expected by consumers.
+Partial multipart uploads and pending copies are distinct states.
+A lost reply can mean completion, refusal, or unresolved outcome.
+|The adapter interprets completion and preserves evidence on ambiguous responses.
+The provider and configuration establish visibility, durability, and conditional creation assumptions.
+Check put, file upload, copy, direct open, list, and delete individually. link:rtdb-verification.adoc#_provider_contracts[Provider study]
+
+|E3 · Discovery and root closure
+|A selected root is complete with respect to every object needed for recovery from it and the replay suffix.
+A reader or recovery process either discovers an eligible root under its contract or has another supported recovery path.
+|The checkpoint writer orders dependencies and root publication.
+Recovery owns root selection and retry behavior.
+Maintenance owns retirement and suffix retention.
+Provider listing, direct reads, and retention settings are inputs. link:db.allium[Database processing] · link:block-gc.allium[Block collection]
+
+|E4 · Identity and fencing
+|An object identity binds to one immutable generation's bytes.
+A delayed operation and a newly created generation cannot be confused by reuse of a pathname.
+An obsolete worker cannot publish or delete for a new term beyond the authority its issued capability still carries.
+|Use disjoint immutable names or a provider condition on the exact object identity where required.
+Audit data, metadata, artefact, staging, cache, and recovery keys independently.
+Record which effect needs a term fence and how queued operations inherit it. link:trie-cat.allium[Trie catalog]
+
+|E5 · Time
+|Temporal row coordinates, monotonic elapsed time, and timestamps used by retention policy have defined domains.
+Any clock used for lease entitlement has a stated authority, skew and restart assumptions.
+|Coordinate interpretation belongs to the temporal engine and API.
+Expiry enforcement belongs to the reader and reclamation protocol.
+Time-source and skew assumptions belong to deployment.
+Exercise equal boundaries and an elapsed-time advance near expiry.
+
+|E6 · Physical input order and coverage
+|The resolver receives the required order for each entity and operation.
+An IID path covers its declared key range.
+File and memory representations preserve original precedence through filtering and merge.
+|Audit the writer, reader, page descriptors, live overlay order, compaction merge, and historical recency layout.
+Verify narrow checks and replay across physical layouts. link:compaction.allium[Compaction] · link:../../allium/live-index.allium[Live index]
+
+|E7 · Resource and cancellation behavior
+|A successful operation holds the resources it needs until the contract permits release.
+Any fallback or refusal stays within the declared memory and cancellation behavior.
+Cancellation completion and provider I/O completion can be distinct events.
+|Query and maintenance lifecycles own joins, reservations, and guard release.
+Use native fault injection to distinguish cancellation requested, cancellation observed, underlying I/O finished, and handle dropped.
+
+|E8 · Progress and fault domain
+|For progress, the environment eventually provides a stable term, a reachable provider, sufficient resources for an eligible operation, and fair opportunities to run.
+The fault model states which crashes, partitions, retries, and losses can coexist.
+|Model scheduling and environment steps explicitly, then qualify claims on supported deployments.
+Keep the safety invariant checked on adverse schedules within the fault domain even when the liveness premises fail.
+|===
+
+The local storage, S3, Azure, and Kafka claims have separate obligation records.
+Use only the assumptions of the deployment named in a result.
+For local storage, define what durable write, rename and process restart mean for the required failure class.
+A process-interruption replay and a power-loss guarantee require different evidence.
+For S3, account for the provider semantics of completed operations and the adapter's conditional creation path.
+For Azure, explicitly include pending copy, stable copy identity, terminal status and uncertainty about staging cleanup.
+For Kafka, justify ordered delivery, retained suffix, and survival of acknowledgement under the chosen broker configuration. link:rtdb-verification.adoc#_provider_contracts[Sources and adapter notes]
+
+== Reader lifetime and reclamation protocol
+
+The common safety condition is that every entitled read can use every required object in its selected generation, including the storage steps the contract allows to complete.
+The common reclamation condition is that all obligations relevant to an object have ended and no new obligation can be created for that retired identity.
+The proof distinguishes an optional search artefact with valid scan fallback from required data or metadata.
+The shared artefact reference rule also imposes its own obligation even when the file is optional for producing an answer.
+
+=== Candidate policies
+
+[cols="1,3,3,3",options="header"]
+|===
+|Policy |User-visible promise |Mechanism to prove |Main open premise
+
+|Validated bounded lease
+|The admitted handle is usable through its declared deadline, with specified treatment of I/O started before expiry.
+New operations after expiry receive the specified refusal or must obtain a fresh admission.
+|Bind a lease to an eligible generation through an authoritative check.
+Bound the admission against retirement and model any renewal as another checked decision.
+Hold the necessary obligation for previously started I/O until completion or confirmed cancellation if the contract allows it to finish.
+|Define clock authority, any safety margin, the lease period and renewal bound, and the semantics of a resumed or transferred handle.
+Decide whether a stale follower waits, redirects, or refuses when it cannot establish admission.
+
+|Coordinated pin
+|The admitted handle can continue until close or another explicit event in its documented lifecycle.
+The pin covers the generation and any in-flight reads the contract protects.
+|Serialize pin acquisition with retirement and reclamation at a common authority.
+Close the acquisition path before deleting a retired generation.
+Release only when the handle and its protected operations have discharged their obligations.
+|Distinguish a slow live reader from an abandoned owner under the stated failure model.
+If pins expire on owner failure, define how the old owner is fenced before collection.
+
+|Owned immutable copy
+|The reader continues using a complete captured answer or complete independent inputs for the promised duration.
+|Protect copying until all required bytes or observations are transferred, then release original-store responsibility for that reader.
+The consumer owns the copy through its lifetime.
+|Demonstrate support for streaming, backpressure, large queries, and bounded memory or spill storage.
+A partial cache of future inputs needs an independent entitlement for what remains.
+
+|Age-based collection comparison
+|The configured collection threshold limits how long superseded files ordinarily remain.
+|Try to derive reader safety from an upper bound on lawful admission age plus elapsed duration through the last required I/O.
+Include stale node admission, restart, and clocks in that argument.
+|A retention timestamp alone provides no explicit evidence of live readers.
+The finite comparison found a violation for its age-only variant.
+|===
+
+Keep the lease deadline and the retirement timestamp separate from transaction system time.
+When a lease protects an open cursor, define whether beginning each object request needs a fresh entitlement check.
+If an already started request may finish after expiry, represent that obligation separately from permission to start a new request.
+If expiry interrupts an operation, let collection proceed only when the provider can no longer touch the protected object under that operation.
+Granting a read from a stale catalog is safe only when authoritative retention covers that generation through the full promise.
+
+For a pin that lasts until close, give the release protocol a named event for a lost process or abandoned session, or acknowledge that such a pin can persist and defer eventual reclamation.
+Test term turnover and partitions explicitly.
+A generation record should express both the acquisition state and the outstanding obligations understood by the collection authority.
+Operations that could reintroduce reachability after deletion authorization must establish a new physical identity or use a revocable authorization whose revocation the effect checks.
+
+=== Proposed transitions and linearization points
+
+The model treats the following events independently wherever the implementation might interleave them.
+
+. *Capture and validate.* Capture the logical basis and physical generation, then establish that admission is still valid at the authority that controls retirement.
+Retry capture when the selected generation changes before eligibility is established, or return the declared outcome.
+. *Begin use.* Before opening metadata, data, an object-backed mapping, or a required range read, confirm entitlement or ownership of sufficient independent bytes.
+Register a protected operation if completion extends beyond handle close or expiry.
+. *Publish replacement.* Commit a complete new coverage map.
+Retire the old generation for new admissions according to the chosen policy.
+A maintenance cycle may now consider its objects, subject to the remaining obligations.
+. *End use.* Release the active operation after the documented completion or cancellation boundary.
+Release the reader only when its lifetime ends and its outstanding obligations have been transferred or discharged.
+. *Authorize deletion.* At the authority that controls acquisition and retirement, confirm the exact immutable identity, absence of protected dependencies, and the required term or epoch condition.
+Keep that reasoning valid through the actual provider delete.
+. *Delete and publish.* Apply the provider mutation idempotently under the exact identity.
+Publish the applicable catalog notice and invalidate cache entries according to their ordered boundaries.
+After a lost reply, distinguish a conclusive absence of that identity from an unresolved outcome.
+
+The pure admission and reclamation functions may implement the table of legal decisions.
+The owner that serializes acquisition and retirement is what makes their inputs true when a mutation is dispatched.
+A capability can carry the outcome of a decision.
+An authority or identity constraint must also preserve the outcome across any delay before effect.
+The collection study must cover trie data, trie metadata, shared artefacts, cached pathnames, checkpoint roots, table blocks, and log payloads with their own reachability rules.
+
+The retained bounded study compared a validated lease and coordinated pin and exhibited age-only and stale-follower counterexamples.
+The first native cursor-and-collection diagnostic timed out waiting for a scheduled event.
+A later native diagnostic with an explicitly invoked eligible collector reproduced a missing required object in an open cursor.
+Rust now registers live query and transaction catalogs with their partition owner.
+The trie collector snapshots that registry with the current state and excludes dependencies of all retained reader catalogs.
+I/O regions keep those references through provider completion, and an in-progress collection prevents a compactor reset from reopening its key allocation.
+Runtime coordination for query snapshots and object reclamation across separate partition owners remains open. link:../../verification/tla/LeaseAdmission.tla[Bounded comparison] · link:gc.allium[Trie collection contract]
+
+=== Multi replica recovery holds
+
+An ordinary recovery selects a checkpoint in one physical residence and opens a cursor on that residence's replica stream.
+The directory's certified replica prefix advances before a physical trim request can remove records.
+Recovery can refresh to a strictly newer checkpoint if the authorized prefix already covers its first required record.
+A nonempty catch-up window requires a recovery hold before the provider cursor opens.
+
+The serving log registers each hold by a fresh identity on the same versioned deployment record that owns the certified prefix.
+The CAS serializes registering the first required offset and authorizing a conflicting trim.
+The hold is admitted only for the record's residence and log epoch, so a writer handoff leaves protection in place and a transferred record clears source custody.
+The holder caps its certified trim at both the published checkpoint and the earliest required replica record.
+The storage-region inventory makes retirement wait for outstanding holds.
+
+For an ambiguous registration, the closing operation needs a successful CAS even when the hold is absent in the latest observation.
+A delayed request issued against the old version then fails its precondition.
+Cancellation closes new admissions and preserves the hold until prior reads are drained.
+Confirmed owner death can substitute for a drain if the witness identifies the exact owner and recovery can no longer consume that owner's results.
+A local lock and a hosted task's recorded stop each need source and adapter evidence establishing that premise.
+Directory revision monotonicity, unique hold IDs, and writer fencing are explicit assumptions of the close model.
+
+The protected interval ends at the committed tip observed when recovery prepares to open the cursor.
+The cursor releases its hold after it has delivered the record at that tip or when it is dropped after its pending read is dropped.
+The live subscription then follows the ordinary live-tail contract.
+A task tracker joins the acquisition and release worker so a cancelled opener cannot abandon its own in-flight directory request.
+The local reaper checks the precise file lock, and the hosted reaper checks the registered task's confirmed stop record.
+Checkpoint object reclamation, ensemble movement, cell moves, and remote stop confirmation each need separate refinement evidence.
+All deployed versions permitted to authorize trims must use the same hold contract before it can protect a recovery.
+
+The bounded model distinguishes a delayed CAS, locally observed cancellation, drained I/O, confirmed owner death, and completed physical trim.
+Lean proves that closing one modeled hold leaves the others alone and that the resulting monotone revision fences older requests.
+The local cell regression pauses a real subscriber after registration, publishes a newer checkpoint, verifies that the physical trim retains the required record, and observes the subscriber's SQL state and trim progress after release. link:../../verification/tla/ReplicaHoldLifecycle.tla[Hold lifecycle] · link:../../verification/lean/ReplicaHoldClose.lean[Close and fencing laws]
+
+== Production boundary and responsibilities
+
+Use the existing database and maintenance owners.
+A production object that publishes state or starts work must have a defined lifetime, cancellation owner and write authority.
+A pure step should return a decision or new value to its caller.
+The async owner sequences I/O, installs a checked value, and publishes the precise result to observers.
+Use an immutable value with one publication point when several fields must agree for readers.
+Each proposed new owner needs an explicit role and the smallest state that constitutes one coherent value.
+
+[cols="1,2,3",options="header"]
+|===
+|Area |Owner or decision boundary |Source audit and proposed enforcement
+
+|Replica admission and apply
+|The database replication driver chooses the next protocol event.
+The fence is passive decision state.
+The applied partition value is the publication boundary.
+|Trace replica decoding, deferred delivery, oversized payload resolution, leader and follower apply, and recovery imports.
+The admitted-record type is already used in the driver.
+Check that every write path reaches the intended publication and that the externally visible applied position and rows agree. link:../../rust/crates/replication/src/admission_step.rs[Admission step] · link:../../rust/crates/replication/src/driver.rs[Driver]
+
+|Resolution and overlay
+|The resolver owns its staged, ordered batch prefix before publication.
+A snapshot is a passive captured value.
+|Audit all constructors for committed, staged, and transaction-local views.
+Check isolation of staged rows and predecessor validation for successful apply.
+Confirm which session lifetime or minimum basis each frontend requests. link:../../rust/crates/index/src/partition.rs[Partition publication] · link:tx.allium[Transaction surface]
+
+|Temporal resolution
+|The ceiling and visibility transitions are passive value operations.
+The caller owns allocation, event order, iteration, and row emission.
+|Verify the vectors, window selection, pointwise masking, and intersection laws in exact production source.
+Establish initialization, equal-time order, IID grouping, recency assumptions and visitor behavior at each caller.
+Cover both query and compaction. link:../../rust/crates/temporal/src/ceiling_step.rs[Ceiling step] · link:../../rust/crates/types/src/interval_step.rs[Intervals]
+
+|Compaction and catalog
+|The compaction driver selects and owns running jobs.
+Each merge completes on its caller.
+The partition value publishes a coherent catalog.
+|Audit standalone and in-node job scheduling, retry, output upload, notification, sibling group completion and block adoption.
+Check that rejected or late notices preserve serving coverage and respect object identity.
+Replay rows across live, nascent, and published generations. link:../../rust/crates/maintenance/src/job.rs[Job selection] · link:trie-cat.allium[Catalog]
+
+|Read entitlement and GC
+|The snapshot handle is a passive value with a defined region.
+The selected policy needs a generation authority that serializes registration and reclamation.
+A monitor is appropriate only where callers wait on a changing condition.
+The maintenance supervisor owns cycle scheduling.
+|Trace query contexts, transaction snapshots, follower capture, cursors, spill or materialization, administrative collection, reset, and export.
+Inventory every provider delete that can touch a serving or recovery object.
+Require an exact decision at the effect boundary and exercise close, cancellation, and leadership changes. link:../../rust/crates/maintenance/src/gc.rs[Collectors]
+
+|Storage and recovery
+|The checkpoint operation is passive relative to its caller.
+The database owner selects when to publish or adopt it.
+The adapter owns provider receipts, immutable writes, and the outcomes it returns.
+|Trace root and table writes, copy completion, log floor changes, opens on restart, and manifest-based recovery.
+Prove the preparation and commit decisions if a suitable pure boundary exists.
+Use provider replay to exercise I/O ordering and genuine lost replies. link:../../rust/crates/replication/src/blocks.rs[Checkpoint store] · link:../../rust/crates/storage/src/remote.rs[Remote storage]
+
+|Cache
+|The cache owns pathname and generation state.
+Per-load intermediates remain private until the cache admits them to the corresponding generation.
+|Audit invalidation, concurrent fills and replacement publication.
+Prove identity-specific finalization if extracted and replay paused old loads with actual file leases. link:../../rust/crates/storage/src/disk_cache.rs[Disk cache]
+
+|Search
+|The builder and candidate decisions operate on derived evidence.
+The scan owns resolved row visibility and residual evaluation.
+|Audit group member selection, artefact version and fallback, row origins, page eligibility, score corpus and ranked candidate admission.
+Ensure each path to early termination consumes the same score and tie conditions. link:../../rust/crates/search/src/file.rs[Search file] · link:../../rust/crates/query/src/scan.rs[Scan] · link:fts.allium[Search contracts]
+|===
+
+For each effect, record the production entry point, the checked decision, and what keeps the decision valid until the effect.
+Start with direct effect writers and public raw helpers, then look for admin paths, replay paths and alternate providers.
+A private type constructor is useful only when the effect has no unchecked sibling entry point.
+Test attempted construction in a real caller and an attempted raw effect invocation.
+Run the unchanged code through the same compile check before treating either diagnostic as evidence.
+
+== Verification methods
+
+=== Design and contracts
+
+. *Allium and acceptance traces.* Keep the human-facing state and API contracts in the owning specifications.
+Link each requirement to its owning rule, observable acceptance case, and proof or test.
+Give the reference model explicit inputs for environment assumptions.
+Review each change to user-visible behavior before rewriting the oracle.
+. *Bounded falsification.* In TLC, represent work that can pause as separate transitions.
+Model independent log and object operations and separate client-visible receipts from internal progress.
+Use small configurations for each failure family and at least one larger or independent check for important results.
+Record exact constants, state constraints, fairness, and the shortest trace found under the search configuration.
+Check a positive reachability witness so a model that never admits, publishes or collects cannot pass by inactivity. https://lamport.azurewebsites.net/tla/tools.html[TLA+ tools]
+. *Unbounded reference proof.* In Lean, define inductive histories and a simple executable oracle.
+Prove preservation of the reference laws by induction on the transition or history.
+Prove composition for each claimed refinement and state the relation between inputs explicitly.
+Provide acceptance programs and one independence countermodel or failed expressiveness argument per mechanism weakening.
+Audit the axioms of the exported theorems and report admitted work separately. https://lean-lang.org/theorem_proving_in_lean4/Induction-and-Recursion/[Lean induction and recursion]
+
+=== Production decisions and bypass checks
+
+A Verus area should use `proof.rs` to include the production files by path, `laws.rs` for independent requirement statements, and `area.json` for the area description, verified obligation floor and controls.
+Each law should carry a stable marker identifying its requirement and theorem or model predicate.
+Include the same source and machine value types that the production caller uses.
+Where necessary, move a pure synchronous decision out of the I/O shell, keeping the production call through it.
+Keep proof-only definitions and ghost state distinguishable from executable behavior.
+Specify arithmetic domains, vector and map invariants, preconditions, effects on success, and refusal behavior.
+Audit external specifications and state where the production shell establishes every premise.
+An internal loop invariant may be stronger than the final observation law.
+
+A Verus negative control mutates the executable production decision and names which diagnostic should fail.
+A joint control changes the decision and its local contract together and requires the independent law to detect the weakened behavior.
+Retain the result of the unchanged baseline, and require the mutant to fail for the expected proof obligation.
+Classify a parse failure, wrong error site, missing mutation anchor or unrelated compiler failure as a control harness error.
+Require proof code to satisfy the project's no-cheating checks and make the trusted library or tool assumptions reviewable. https://verus-lang.github.io/verus/guide/[Verus tutorial and reference]
+
+A separate compile-fail check verifies call-path enforcement.
+Examples include forging a replica admission witness or invoking a protected effect with the unadmitted type.
+The mutant must fail at the intended API boundary and the baseline must compile.
+Check effect ownership with source inventory too, particularly for public helpers and admin, replay and provider paths.
+Rust module privacy protects private construction at its declared visibility boundary.
+Provider fences and synchronization establish that a value checked in Rust remains valid at the effect. https://doc.rust-lang.org/reference/visibility-and-privacy.html[Rust visibility and privacy]
+
+=== Independent and specialized tools
+
+[cols="1,3,2",options="header"]
+|===
+|Tool |Use in RTDB |Evidence and limits
+
+|Apalache
+|Cross-check the TLA+ resolution and retention invariants symbolically.
+Use it to vary numbers of readers, generations, retries, and depth when the model and solver support them.
+|The configured check holds through its reported number of transitions and parameter bounds.
+Keep the relation to the TLC model explicit. https://apalache-mc.org/docs/apalache/running.html[Running Apalache]
+
+|Alloy
+|Check the static relation between catalog entries, generations, shared artefacts, required objects, reader obligations, and recovery roots.
+Ask for a genuine shared-file witness as well as a deletion counterexample.
+|Structural results are exhaustive within the declared scope.
+Use a temporal model for the ordering of retirement, deletion, and notice publication. https://alloytools.org/tutorials/online/sidenote-format-check.html[Alloy assertion scope]
+
+|Maude
+|Give resolution and eligible-publication rules an independent executable interpretation.
+Compare the reachable outcomes of serial execution, validated optimistic execution, and the intentionally broken blind variant.
+|Exploration covers the chosen rewrite system and explored bounds.
+A second encoding helps reveal assumptions common to variants of a single model. https://maude.cs.illinois.edu/manual/[Maude manual]
+
+|Z3 with SMT-LIB
+|Check arithmetic side conditions for ranked search, including conservative upper bounds under rounding.
+Use exact binary64 operations for specific rounding witnesses and state the domain of any exact-real rounding envelope.
+|An unsatisfiable obligation excludes the encoded counterexample under its precise premises.
+A satisfiable witness can be replayed in production.
+Prove separately that production feeds the expression the modeled values and preserves addition order. https://smt-lib.org/theories-FloatingPoint.shtml[SMT-LIB floating-point theory]
+
+|mCRL2
+|When a provider protocol has several hidden steps, compare its labelled transition system with the abstract contract.
+A checkpoint publication study can retain completed publication, receipt, recovery, and refusal as observable labels while hiding internal polls and retries.
+Decide which equivalence or refinement relation preserves the observations and progress relevant to DUR-2.
+|A result applies to the compared transition systems, the declared observations, and the chosen relation.
+Keep the provider refinement and the matching native adapter traces in the same study. https://mcrl2.org/web/user_manual/tools/release/ltscompare.html[mCRL2 transition system comparison]
+
+|AutoHyper with Spot
+|Use if OPT-3 adopts a property over pairs of executions, such as identical public observations when only earlier erased material differs.
+Compare the same public schedule or state the allowed scheduling relation.
+Specify whether rows, scores, errors, aborts, or timing are included.
+|The result covers the selected finite model and observables.
+A Lean theorem about paired histories can cover unbounded histories for a simpler functional observation. https://arxiv.org/abs/2301.11229[AutoHyper paper]
+
+|Policy analysis
+|If a requirement concerns actual authorization rules, analyze the real policy language and its request and entity schema.
+Use a Cedar analyzer only if Cedar is the policy substrate being verified.
+|Policy results depend on the modeled attributes and the boundary enforcing the decision. https://docs.cedarpolicy.com/[Cedar reference]
+|===
+
+Lean, TLC, Verus, the Rust compiler and native replay are the spine of the effort.
+Select a specialist tool when it adds independent evidence about a named property or assumption.
+Usage of a tool alone never raises the strength of a reported result.
+
+=== Native and provider evidence
+
+Use the same observations in model fixtures and runtime assertions, with explicit adapters for timestamps, batch order, tokens, and physical generation identities.
+Persist the suite seed, fault schedule, input data, observed provider operations, exact returned rows or refusals, and the model verdict.
+Minimize failing schedules so a regression can specify which state change matters.
+For example, a recovery test must distinguish interruption before root publication from interruption after the provider has made the root visible.
+
+Use a runtime harness that can hold and release named storage and log operations and observe both invocation and completion.
+Ensure the intended operation was reached and check the final state after all relevant tasks join.
+Classify a timeout before the intended observation as an incomplete replay.
+Retain the exact trace and timeout reason supported by the output.
+A provider mock exercises the actual adapter's protocol interpretation when the adapter runs against it.
+Use separately authorized qualification for deployment-specific assumptions such as log retention, object consistency, cancellation, and concurrent failover.
+Capture the verified source identity and provider configuration for each such result. https://www.foundationdb.org/files/fdb-paper.pdf[Deterministic simulation in FoundationDB]
+
+The principal differential suites run the following comparisons.
+
+* The reference point evaluator, native query resolver, compaction resolver, and search visibility decisions agree over the same generated histories and boundary coordinates.
+* Native queries agree before and after physical compaction and recovery at the same basis, including history ranges, same-time precedence, erasures, and selected partition groups.
+* Accelerated and scan-only queries agree for MATCH, NOT, NULL behavior, phrases, residual filters, COUNT, and ranking at the same admitted basis.
+Test a full sort as the reference for top K.
+Combine tied rows, score boundaries, non-text column values, indexed and unindexed members, absent files, and resource refusal.
+* Real provider adapters produce only the declared outcomes for completion, ambiguity, retry, loss of an acknowledgement, and concurrent delete.
+Keep provider mock and real deployment evidence identified separately.
+* Replay transaction and snapshot traces at public entry points as well as in the native core when frontends own different basis or session lifetimes.
+
+=== Counterexample and amendment process
+
+Give each study a question, the source revision, an abstraction boundary, candidate variants, requirement IDs, resource bounds, tool versions, and named baseline and control configurations.
+Start by observing at least one intentional failure.
+Check the baseline with its positive reachability or acceptance witnesses.
+Escalate from a small model to an independent encoding or larger bound and then to the necessary unbounded or production proof.
+Use a native counterexample before changing deployment behavior where practical, or explicitly record when the confirmed failure exists only in a model.
+
+For a newly found failure, retain the smallest available trace, affected requirement, violated premise, and evidence scope.
+Classify the cause as a contract ambiguity, design violation, production violation, model or harness error, verifier support issue, or incomplete proof.
+A production fix keeps the original law and adds a targeted regression.
+A harness fix retains the intended baseline and deliberate failure.
+A requirement change records the product decision that changed the expected observation.
+Re-run the original trace and the affected composed checks.
+
+[cols="1,2,2,2",options="header"]
+|===
+|Requirement |Deliberate weakening |Expected failure |Evidence to pair with it
+
+|TX-1
+|Publish one leg of a transfer, accept a displaced term, or proceed past a sequence gap.
+|A transfer invariant, term law, or gap postcondition fails at the named check.
+|A01 and A03 plus the replica admission area.
+
+|TX-2
+|Allow a resolved write to publish using an obsolete predecessor, or drop a same-batch predecessor.
+|Two increments produce one increment, or a required local read loses its own write.
+|A02 through TLC, Apalache, Maude and the production resolver.
+
+|SNAP-1 and GC-1
+|Admit a stale follower without protection, ignore active I/O on expiry, or delete when the first shared reference disappears.
+|An entitled observation loses a required object, or a surviving reference loses its shared file.
+|A08 and A09 in the selected policy model and native replay.
+
+|TIME-1 and TIME-2
+|Include the upper endpoint, skip a ceiling update, widen a fragment, or forget the admission horizon.
+|A law catches an extra or missing point answer, an incorrect fragment, or resurrection of erased history.
+|A04 and A05 through Lean, Verus and the common trace.
+
+|DUR-1 and DUR-2
+|Acknowledge at append, publish the root first, treat copy acceptance as completion, or trim before a usable recovery path exists.
+|A receipt lacks a corresponding application or recovery selects an incomplete representation.
+|A06 and the native interruption and Azure controls.
+
+|COMPACT-1
+|Expose a nascent sibling as serving output before the group covers its input.
+|A query has a gap or double coverage relative to the reference basis.
+|A07 over the catalog state machine and real group publication.
+
+|GC-2
+|Allow a retired cache load to publish at a live pathname or let an obsolete delete target a replacement identity.
+|The generation or identity-specific effect invariant fails.
+|A09 plus the invalidation and retirement schedules.
+
+|FTS-1 and FTS-2
+|Merge distinct system origins, admit a ranking witness before full residual evaluation, or prune at a possible tie.
+|A qualifying observation disappears or the first-K guarantee fails.
+|A10 through the proofs, a numeric witness, and full-scan comparison.
+
+|LIVE-1 and LIVE-2
+|Remove the modeled progress obligation or suppress the only step that can discharge an abandoned owner.
+|A permitted infinite execution keeps eligible work pending or a generation unreclaimable where the contract promises progress.
+|A08 and A11, with explicit stability and fairness.
+|===
+
+The brief already numbers amendments 001 for search origin preservation, 002 for rounded rank bounds, and 003 for Azure copy completion.
+Preserve those references and append future amendments to the evidence ledger with the rule change, short trace, scope, and checks.
+Keep additional proved or observed bugs and fixes cross-referenced through their source commits. link:rtdb-verification.adoc[Existing amendments]
+
+== Execution plan and acceptance gates
+
+=== Stage 1 · Freeze the observations
+
+Review the single-database scope, requirements, supported providers and accepted fault domains.
+Resolve the product meaning of an explicit read basis, an already admitted handle, and an attempted resumption after release or expiry.
+Decide whether A12 and OPT-2 or OPT-3 are required for any supported surface.
+Write an owner-approved policy decision for reader lifetime with explicit begin-I/O and finish-I/O semantics.
+Initial verification of independent components and both policy candidates can proceed before that decision.
+
+The stage is complete when the reference model has executable examples for every accepted observation and refusal, and open decisions are recorded with the claims they affect.
+
+=== Stage 2 · Complete and compare the design models
+
+Extend the reference history, ceiling, independence and search theorems.
+For each requirement, write a sufficient reference transition and a weakening or an alternate mechanism.
+Use TLA+ to compare serialized and validated resolution, safe representation publication, restart under retained roots, and candidate retention protocols.
+Extend the reader model with multiple readers and generations, begin/end of I/O, expiry, stale followers, cancellation and authority turnover.
+Extend checkpoint closure to interacting compaction, retired roots, outstanding recovery reads and log retention.
+Use Alloy for shared reference structure, Apalache for deeper traces where feasible, and Maude or mCRL2 for independently useful comparisons.
+
+The stage is complete for a property when the documented model checks have a passing baseline, a specific negative control, a reachability witness, and an explicit bound or theorem.
+Record any inequivalence between alternative designs as an observation with its responsible requirement.
+
+=== Stage 3 · Verify production transitions and expose bypasses
+
+Survey current verified seams and enumerate every effect path before extracting another one.
+Retain useful law statements from any stale harness and replace its production binding as needed.
+Prioritize replica admission to apply, full temporal composition, compaction coverage, generation entitlement to physical deletion, and search candidate and cutoff coverage.
+Keep each area small enough for targeted proof and review.
+For each, attach the exact source map, definition of its abstract transition, proof of the decision, and independent laws.
+Add compiler-enforced tokens where a call-path audit shows the protected effect can otherwise be invoked without admission.
+Include real failure entry points, ownership changes, provider effects and synchronization in the applicability argument.
+
+The stage is complete for a production decision when the exact shipped source verifies with its controls and all in-scope entry points either establish its premises or have an explicitly recorded separate proof obligation.
+A bypass path with unknown behavior keeps the associated system claim open.
+
+=== Stage 4 · Replay and qualify
+
+Run the shared model and native fixtures, including time and ranking boundaries, full search versus scan, and replay versus live state.
+Replay model counterexamples on equivalent production boundaries and retain cases that can reach the intended event.
+Once the reader contract is selected, demonstrate both lawful use during its lifetime and the chosen refusal or release after it ends.
+Exercise the provider combinations covered by the submitted claim, including partition and failover limits where supported.
+Run the selected integrated suites and deployment checks under their authorization and scope.
+
+The stage is complete for a runtime observation after the expected effects and final result are seen and the fixture can be reproduced at the recorded revision.
+A mocked provider run and a real provider qualification establish different observations.
+Each open or incomplete case remains in the ledger with its missing observation.
+
+=== Stage 5 · Combine evidence and change control
+
+Re-run the selected proof areas, controls, model configurations and native traces together on one exact committed source tree.
+Record the executable identities, complete commands, environment, input hashes and logs.
+Publish a readiness matrix by requirement with separate verdicts for model validity, acceptance expressiveness, minimality, production decisions, bypass coverage and composed behavior.
+State each trusted premise beside the claim that uses it.
+Use model and native mutations to check that the reported result would fail if its enforcing rule were weakened.
+Make later changes to an accepted law, proof boundary, provider contract or intentional control link back to the affected requirement and evidence.
+
+The target claim is that RTDB's named reference rules suffice for the chosen requirements, that the required programs can be expressed, and that the concrete covered paths refine those rules under their stated assumptions.
+A separate minimality claim requires a witness for each explicitly chosen weakening.
+Claim a whole-system or release-level guarantee only for a named scope whose execution and provider obligations have been established.
+
+== Reproduction and current evidence
+
+The maintained entry point for the combined study is `verification/run.py`.
+Give it explicit paths to the pinned executables and JARs and a new evidence destination.
+For the local authorization already granted to the verification effort, the existing runner expects the following invocation shape.
+
+[source,sh]
+----
+BIJECTION_LOCAL_EXECUTION=owner-authorized VERUS_Z3_PATH=/path/to/z3 \
+  DOTNET_ROOT=/path/to/dotnet8 \
+  python3 verification/run.py \
+  --lean /path/to/lean --verus /path/to/verus \
+  --java /path/to/java --tlc /path/to/tla2tools.jar --alloy /path/to/alloy.jar \
+  --apalache /path/to/apalache-mc --maude /path/to/maude \
+  --mcrl2-bin /path/to/mCRL2.app/Contents/bin \
+  --autohyper /path/to/AutoHyper \
+  --rust-boundary --native-replay \
+  --evidence /path/to/new-evidence-directory
+----
+
+The runner copies controlled variants into a disposable work area.
+The production controls should test committed source, with intended mutations applied only to copies.
+Retain the source commit, model and production hashes, tool versions and checksums, exact command and exit status, baseline diagnostics, and every expected failure.
+Pin shared dependencies and include provider configuration or a description of the mock used.
+Record the limits on number of entities, readers, terms, roots, time, steps or other dimensions as applicable.
+For a timeout or tool limitation, retain the failing step and observable result rather than counting it as a successful experiment. link:../../verification/README.adoc[Runner and pinned toolchain]
+
+[cols="1,2,2",options="header"]
+|===
+|Area |Retained evidence |Remaining assurance work
+
+|Reference history
+|Lean theorems for the oracle, erase projection, captured history, projected ceiling, abstract frontier, and several independence witnesses.
+The seeded trace agreed with both native resolvers and unbounded visibility on 4,096 point observations.
+|Complete end-to-end contracts for event order, resource and visitor shells, and observable range decomposition.
+
+|System-time assignment
+|Verus checks the exact Rust admission and clock decisions over signed timestamps.
+Lean proves that every modeled mixed history is strictly ordered and that a completed prefix supplies the clock seed for the rest of that history.
+TLC and Apalache check bounded staging over a private resolved prefix, publication, and restart.
+A local node test observes a successful attach and a refused detach advance past an explicit later time, then replays their outcomes.
+|Establish the durable-to-resolved handoff across all providers and identify which imported histories satisfy strict system-time ordering.
+
+|Exact Rust decisions
+|The runner checks temporal and interval decisions, replica admission, one-event search visibility, catalog reclamation, and base-four IID bucketing in exact production source.
+Compiler controls reject forging and raw use of the replica admission witness.
+Each of the two new storage and compaction areas includes production-only and joint contract mutations.
+|Extend coverage from these functions to their effect paths, concurrent publication, reader protection, and ranked pipeline decisions.
+
+|Concurrent design models
+|TLC covers bounded writer admission, query capture, resolution, recovery, cache, reader I/O, and compaction publication variants.
+The ledger gives per-model state counts and scopes, plus bounded Apalache, Alloy, and Maude results.
+|Connect multi-generation reader and recovery overlap and the modeled in-flight I/O transitions to production synchronization and the chosen liveness assumptions.
+
+|Ranking
+|Lean covers the abstract frontier condition.
+Z3 covers the declared rounding premises, a concrete binary64 witness, and exact binary64 ordering of the cutoff keys.
+Verus checks that the production cutoff requires strict dominance of both the scored-candidate and unread-window frontier bounds.
+Lean proves that complete term-window summaries preserve all conjunctive matches.
+It also proves that retaining every local score tie preserves the global result, including the page after an offset.
+Verus checks production posting assignment, scan range and impact accumulation.
+The native score witness passes and the unpadded mutation fails.
+|Prove that the planner, visibility verification, and index supply a complete frontier for every qualifying row, and that each supplied maximum covers its whole source.
+Relate the native postings iterator and persisted sidecar to the modeled complete term-window summaries.
+
+|Recovery and Azure
+|Seven native recovery tests and the root-first and fail-fast controls, and two loopback Azure tests and their two source controls, cover selected production failure paths.
+A durable-node test verifies current and system-history SQL results before, during and after tiered publication, then recovers the partial checkpoint and replays the last notice.
+Production discovery now advances to a newer advertised root when collection removes the selected root or a table block during startup.
+Native runs verify both cases using the block collector, and Verus checks the strict progress decision.
+For providers that support recovery cursor admission, the database admits the cursor before installing an ordinary checkpoint.
+A trimmed first required offset triggers strictly newer checkpoint discovery.
+The replication driver uses that same cursor after checking the log and checkpoint boundary.
+Verus checks the exact first-required-offset rule.
+The native memory-provider run selects a later checkpoint and replays its retained suffix with the cursor admitted during startup.
+TLC checks cursor admission, reuse and strict progress before refusal and reaches a state with later trimming after admission.
+mCRL2 checks the observable results of the staged discovery model against the atomic contract for three reported indices.
+AutoHyper checks that startup with one transient collection interruption agrees with direct startup on the eventually admitted block when both observe the same stable replacement.
+TLC and Apalache check two overlapping checkpoint generations, one recovery reference, protected objects, and its required log suffix under delayed collection.
+Lean checks the pending historical promotion reconstructed from a checkpoint. Verus checks the exact four-member guard in the tiered catalog.
+The native trie collector protects live and nascent trie files from the latest installed checkpoint within one partition authority.
+The reference comes from the persisted table blocks, and it changes atomically with local block adoption.
+Verus checks the selection decision independently of whether a query reader exists.
+TLC and Apalache check the installed-checkpoint rule separately from the current catalog, including nascent trie dependencies and delayed deletion.
+|Extend protection across checkpoint discovery, replacement, and multiple authorities.
+Protect the required log suffix through replay and account for deletion entry points outside trie collection.
+Establish supported remote configurations and any eventual retry and staging cleanup guarantees.
+
+|Retention
+|The bounded lease and pin designs pass their recorded finite instances.
+The weakened alternatives yield model counterexamples.
+Lean proves the coordinated generation protocol's availability invariant for arbitrary finite histories and overlapping reader and I/O references.
+It checks the independence of preserving in-flight references from the availability invariant alone.
+The native diagnostic reproduced the failure under explicit eligible collection.
+Verus proved the latest-block and shared-sibling catalog decisions.
+Verus checks the native selection loop's search of every captured reader catalog, under the visibility callback's contract.
+Native tests observe coexistence of open readers and collection of unrelated files, and retention through I/O cancellation for the same authority.
+|Connect reader admission and collection across separate nodes, including authority turnover and provider I/O.
+Establish recovery holds and show how all deletion entry points preserve the same lifetime contract.
+
+|Compaction
+|The exact-generation catalog guard addresses a Rust regression found by the two-generation TLC model.
+Verus checks the base-four bucket selection shared by default trie reads and compaction output partitioning.
+Verus also checks the production merge heap over arbitrary representable ordered pages, under the adapter's length and key contracts.
+The heap emits a minimum coordinate, advances exactly one cursor, and preserves every other occurrence.
+The native adapter binds one immutable set of Arrow pages to the heap for its lifetime and is replayed against independent sorting.
+Lean compares the overlay's selected task to independent per-segment routing and proves exact row occurrence coverage under well-placed input metadata and job clipping.
+A native replay runs the compactor on mixed IID depths and recency branches, then checks the encoded output against independently filtered input rows for six partitions.
+Lean proves that same-time put and delete fragments are disjoint and preserve the winning command at every valid instant.
+It also proves that substituting normalized cohorts in an arbitrary surrounding history preserves the point query when all other events retain their positions.
+Native replays check short sequences and a compacted history with an erase and untouched older rows.
+|Prove that each accepted piece represents precisely the input coverage and that the merged bitemporal events refine the original history.
+Include retry, restart, overlapping jobs, metadata depth and clipping, and every route to publication.
+|===
+
+The verification effort is active.
+The current milestone supports component-level production proofs, bounded protocol checks, and selected composed observations.
+The strongest open applicability questions concern reader entitlement and in-flight I/O, recovery root closure during concurrent maintenance, and production coverage of temporal and ranked search premises. link:../../verification/results/2026-11-21.adoc[Full evidence ledger]

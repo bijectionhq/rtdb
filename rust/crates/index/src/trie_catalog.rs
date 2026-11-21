@@ -1,7 +1,7 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::{collections::{BTreeMap, BTreeSet}, ops::Bound::{Excluded, Included}};
 
 use rtdb_types::CivilDate;
-use rtdb_format::{block::proto as block_pb, catalog::TableBlock, keys::TrieKey, log::proto as log_pb};
+use rtdb_format::{block::proto as block_pb, catalog::TableBlock, keys::{BRANCH_FACTOR, PartGroup, TrieKey}, log::proto as log_pb};
 use rtdb_types::{Anomaly, BlockIndex, Result, TableRef, Timestamp};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -13,13 +13,15 @@ pub struct CatalogTrie {
     pub data_file_size: i64,
     pub metadata: Option<log_pb::TrieMetadata>,
     pub state: TrieState,
+    /// Files derived from this trie's data file, at most one per (kind, definition id, definition version).
+    pub artefacts: Vec<log_pb::ArtefactRecord>,
 }
 
 impl CatalogTrie {
     pub fn notification(key: TrieKey, data_file_size: i64, mut metadata: Option<log_pb::TrieMetadata>) -> Result<Self> {
         if data_file_size < 0 { return Err(invalid("Trie file size is negative")); }
         if let Some(metadata) = &mut metadata { metadata.iid_bloom = None; }
-        Ok(Self { key, data_file_size, metadata, state: TrieState::Nascent })
+        Ok(Self { key, data_file_size, metadata, state: TrieState::Nascent, artefacts: Vec::new() })
     }
 
     pub fn from_proto(value: &log_pb::TrieDetails) -> Result<Self> {
@@ -32,7 +34,7 @@ impl CatalogTrie {
         };
         let data_file_size = value.data_file_size.unwrap_or_default();
         if data_file_size < 0 { return Err(invalid("Trie file size is negative")); }
-        Ok(Self { key, data_file_size, metadata: value.trie_metadata.clone(), state })
+        Ok(Self { key, data_file_size, metadata: value.trie_metadata.clone(), state, artefacts: value.artefacts.clone() })
     }
 
     pub fn to_proto(&self, table: &TableRef) -> log_pb::TrieDetails {
@@ -43,8 +45,12 @@ impl CatalogTrie {
         log_pb::TrieDetails {
             table_name: Some(table.schema_and_table()), trie_key: Some(self.key.to_string()),
             data_file_size: Some(self.data_file_size), trie_metadata: self.metadata.clone(),
-            trie_state: Some(state), garbage_as_of,
+            trie_state: Some(state), garbage_as_of, artefacts: self.artefacts.clone(),
         }
+    }
+
+    pub fn artefact(&self, kind: &str, definition_id: &str, definition_version: i64) -> Option<&log_pb::ArtefactRecord> {
+        self.artefacts.iter().find(|record| same_artefact(record, kind, definition_id, definition_version))
     }
 
     fn garbage(&mut self, as_of: Timestamp) { self.state = TrieState::Garbage { as_of }; self.metadata = None; }
@@ -92,8 +98,10 @@ impl TableTries {
     fn shard_with_floor(&mut self, shard: Shard, block: BlockIndex) -> &mut ShardValue {
         self.shards.entry(shard).or_insert_with(|| ShardValue { max_block_index: block, ..ShardValue::default() })
     }
-    fn drop_covered_l0(&mut self, block: BlockIndex) {
-        self.shard_with_floor(Shard::root(0, None), block).tries.retain(|index, trie| *index > block || trie.state != TrieState::Live);
+    fn cover_l0(&mut self, block: BlockIndex, as_of: Timestamp) {
+        // Compaction stops primary scans using these tries. Their immutable
+        // descriptors still certify the original input to derived indexes.
+        self.shard_with_floor(Shard::root(0, None), block).supersede(block, None, as_of);
     }
     fn apply(&mut self, mut trie: CatalogTrie, file_size_target: i64, as_of: Timestamp) -> Result<()> {
         let shard = Shard::of(&trie.key);
@@ -122,7 +130,7 @@ impl TableTries {
                 state.supersede(block, Some(file_size_target), as_of);
                 trie.state = TrieState::Live;
                 state.insert(trie);
-                self.drop_covered_l0(block);
+                self.cover_l0(block, as_of);
             }
             (2, Some(recency)) => {
                 let state = self.shard_with_floor(shard, block);
@@ -136,16 +144,17 @@ impl TableTries {
                 if parent_part.pop().is_none() { return Err(invalid("Tiered trie has no IID partition")); }
                 trie.state = TrieState::Nascent;
                 self.shards.entry(shard.clone()).or_default().insert(trie);
-                let siblings: Vec<_> = (0..4).map(|bucket| {
-                    let mut part = parent_part.clone(); part.push(bucket);
+                let siblings: [Shard; BRANCH_FACTOR as usize] = std::array::from_fn(|bucket| {
+                    let mut part = parent_part.clone();
+                    part.push(bucket as u8);
                     Shard { level: shard.level, recency: shard.recency, part }
-                }).collect();
-                // A higher watermark can belong to a different, still-nascent group.
-                // Retire the parent only when this block has a serving candidate in every bucket.
-                if siblings.iter().all(|key| self.shards.get(key)
-                    .and_then(|shard| shard.tries.get(&block))
-                    .is_some_and(|sibling| matches!(sibling.state, TrieState::Nascent | TrieState::Live)))
-                {
+                });
+                let members = siblings.each_ref().map(|key| {
+                    let member = self.shards.get(key)?.tries.get(&block)?;
+                    let usable = matches!(member.state, TrieState::Nascent | TrieState::Live);
+                    Some((member.key.block_index().0, usable))
+                });
+                if crate::tiered_publication::can_publish(members, block.0) {
                     for sibling in siblings {
                         if let Some(value) = self.shards.get_mut(&sibling) { value.promote(block); }
                     }
@@ -174,6 +183,19 @@ impl TrieCatalog {
         self.tables.get(table).and_then(|table| table.shards.get(shard)).map_or(BlockIndex(-1), |state| state.max_block_index)
     }
     pub fn l0_max_block_index(&self, table: &TableRef) -> BlockIndex { self.max_block_index(table, &Shard::root(0, None)) }
+    /// The adopted source tries in order, including ones covered by primary compaction.
+    pub fn l0_source(
+        &self,
+        table: &TableRef,
+        after: BlockIndex,
+        through: BlockIndex,
+    ) -> impl Iterator<Item = &CatalogTrie> {
+        self.tables.get(table)
+            .and_then(|table| table.shards.get(&Shard::root(0, None)))
+            .filter(|_| after < through)
+            .into_iter()
+            .flat_map(move |source| source.tries.range((Excluded(after), Included(through))).map(|(_, trie)| trie))
+    }
     pub fn iter_tries(&self, table: &TableRef) -> impl Iterator<Item = &CatalogTrie> {
         self.tables.get(table).into_iter().flat_map(|table| table.shards.values()).flat_map(|shard| shard.tries.values())
     }
@@ -187,6 +209,14 @@ impl TrieCatalog {
     }
     pub fn current_tries(&self, table: &TableRef) -> Vec<&CatalogTrie> {
         self.all_tries(table).into_iter().filter(|trie| trie.state == TrieState::Live).collect()
+    }
+    /// The entry the catalog holds for `key`, live, nascent or garbage.
+    pub fn trie(&self, table: &TableRef, key: &TrieKey) -> Option<&CatalogTrie> {
+        self.tables.get(table)?.shards.get(&Shard::of(key))?.tries.get(&key.block_index()).filter(|trie| &trie.key == key)
+    }
+    /// The entries the catalog holds for a partition group's members, in bucket order; a member it does not hold is left out.
+    pub fn group_members(&self, table: &TableRef, group: &PartGroup) -> Vec<&CatalogTrie> {
+        group.members().iter().filter_map(|key| self.trie(table, key)).collect()
     }
     pub(crate) fn has_current_tries(&self, table: &TableRef) -> bool {
         self.iter_tries(table).any(|trie| trie.state == TrieState::Live)
@@ -207,11 +237,45 @@ impl TrieCatalog {
         let mut next = self.clone();
         if let Some(table) = next.tables.get_mut(table) {
             for key in keys {
+                if key.level() == 0 { continue; }
                 if let Some(shard) = table.shards.get_mut(&Shard::of(key)) {
                     if shard.tries.get(&key.block_index()).is_some_and(|trie| matches!(trie.state, TrieState::Garbage { .. })) {
                         shard.tries.remove(&key.block_index());
                     }
                 }
+            }
+        }
+        next
+    }
+    /// Keeps the first record for each definition version, except when a live trie replaces its obsolete group's record with its own.
+    pub fn with_artefacts(&self, table: &TableRef, entries: impl IntoIterator<Item = (TrieKey, log_pb::ArtefactRecord)>) -> Self {
+        let mut next = self.clone();
+        if let Some(state) = next.tables.get_mut(table) {
+            for (key, record) in entries {
+                let Some(trie) = state.shards.get_mut(&Shard::of(&key)).and_then(|shard| shard.tries.get_mut(&key.block_index())).filter(|trie| trie.key == key) else { continue };
+                let (kind, id, version) = (record.kind(), record.definition_id(), record.definition_version());
+                let held = trie.artefacts.iter_mut().find(|held| same_artefact(held, kind, id, version));
+                match held {
+                    None => trie.artefacts.push(record),
+                    Some(held) if held.scope() == log_pb::ArtefactScope::PartGroup
+                        && record.scope() == log_pb::ArtefactScope::Trie
+                        && trie.state == TrieState::Live
+                        && key.part_group().is_some_and(|group| group.members().iter().any(|member| {
+                            self.trie(table, member).is_none_or(|trie| matches!(trie.state, TrieState::Garbage { .. }))
+                        })) => *held = record,
+                    Some(_) => {}
+                }
+            }
+        }
+        next
+    }
+    /// A record matches an entry on kind, definition id and definition version alone.
+    pub fn without_artefacts(&self, table: &TableRef, entries: impl IntoIterator<Item = (TrieKey, log_pb::ArtefactRecord)>) -> Self {
+        let mut next = self.clone();
+        if let Some(state) = next.tables.get_mut(table) {
+            for (key, record) in entries {
+                let Some(trie) = state.shards.get_mut(&Shard::of(&key)).and_then(|shard| shard.tries.get_mut(&key.block_index())).filter(|trie| trie.key == key) else { continue };
+                trie.artefacts.retain(|held| (held.kind(), held.definition_id(), held.definition_version()) != (record.kind(), record.definition_id(), record.definition_version()));
             }
         }
         next
@@ -267,7 +331,6 @@ impl TrieCatalog {
                 for wire in partition.tries {
                     let trie = CatalogTrie::from_proto(&wire)?;
                     if Shard::of(&trie.key) != shard { return Err(invalid("Recorded trie differs from its partition")); }
-                    if shard.level == 0 && matches!(trie.state, TrieState::Garbage { .. }) { continue; }
                     value.insert(trie);
                 }
                 value.max_block_index = partition.max_block_index.map(BlockIndex).unwrap_or(value.max_block_index.max(BlockIndex(0)));
@@ -294,12 +357,16 @@ impl TrieCatalog {
             }
             if let Some(block) = state.shards.get(&Shard::root(1, None)).into_iter().flat_map(|state| state.tries.iter().rev())
                 .find_map(|(block, trie)| (trie.state == TrieState::Live).then_some(*block)) {
-                state.drop_covered_l0(block);
+                state.cover_l0(block, as_of);
             }
             catalog.tables.insert(table, state);
         }
         Ok(catalog)
     }
+}
+
+fn same_artefact(record: &log_pb::ArtefactRecord, kind: &str, definition_id: &str, definition_version: i64) -> bool {
+    record.kind() == kind && record.definition_id() == definition_id && record.definition_version() == definition_version
 }
 
 fn table_partitions(block: &TableBlock) -> Result<Vec<block_pb::Partition>> {

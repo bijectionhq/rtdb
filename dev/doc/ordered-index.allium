@@ -1,0 +1,36 @@
+-- allium: 3
+-- Ordered secondary indexes over resolved table events.
+-- Table events and capture follow db.allium and allium/live-index.allium.
+-- See rust/crates/node/src/ordered_index.
+
+entity Definition {
+    identity: String
+    generation: Integer
+    columns: List<String>
+}
+
+entity Checkpoint {
+    definition: Definition
+    frontier: Integer
+    page_scope: Integer
+    source_rows: Integer
+}
+
+-- Invariants
+--
+-- Repeating a declaration with IF NOT EXISTS preserves the definition and its generation.
+-- A checkpoint covers the table catalog's durable event count at its frontier.
+-- The checkpoint becomes usable after every referenced page is durable.
+-- A root contains each winning indexed row over disjoint valid-time spans at its system-time point.
+-- Aligned bucket decomposition places an eligible row in exactly one of the prefixes containing a valid-time point.
+-- A revision edits both sides of a changed projection. Unchanged spans retain their postings.
+-- The read opens a root at its system-time point and applies captured uncovered events, including erasures.
+-- A read or maintenance cycle owns decoded index pages for its own lifetime.
+-- A point read merges bucket prefixes in key order and fetches payload at the same basis.
+-- An ordered distinct page filters eligible rows before counting each distinct key once.
+-- An erasure removes the IID's old membership from every affected root and makes unreachable pages collectible.
+-- Replay discovers captured erase cuts before it writes pages, and projects each IID from its latest erase onward.
+-- A checkpoint's page scope is zero before the first captured erase, and one past the last source block containing an erase afterward.
+-- Every page reachable from a checkpoint uses that checkpoint's scope. Page addresses within the scope retain their source block.
+-- After the replacement checkpoint is published, collection releases older scopes and preserves pages staged in newer scopes.
+-- Data compaction preserves input events and changes no ordered-index checkpoint.

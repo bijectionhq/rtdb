@@ -1,0 +1,80 @@
+{
+  "summary": "The compaction heap initializes one head per ordered page, extracts the minimum occurrence and retains exactly the remaining cursors.",
+  "flags": ["--no-external-by-default", "--verify-module", "production", "--verify-module", "laws"],
+  "min_verified_functions": 20,
+  "controls": {
+    "reverse_system_time": {
+      "mutate": [{
+        "file": "rust/crates/maintenance/src/merge/row_heap.rs",
+        "find": "left.1 > right.1",
+        "replace": "left.1 < right.1"
+      }],
+      "expect": [{
+        "file": "rust/crates/maintenance/src/merge/row_heap.rs",
+        "function": "precedes",
+        "category": "postcondition not satisfied"
+      }],
+      "min_verified_functions": 19
+    },
+    "choose_later_child": {
+      "mutate": [{
+        "file": "rust/crates/maintenance/src/merge/row_heap.rs",
+        "find": "precedes(right_key, child_key)",
+        "replace": "precedes(child_key, right_key)"
+      }],
+      "expect": [{
+        "file": "rust/crates/maintenance/src/merge/row_heap.rs",
+        "function": "sift",
+        "category": "assertion failed"
+      }],
+      "min_verified_functions": 19
+    },
+    "skip_page_order_validation": {
+      "mutate": [{
+        "file": "rust/crates/maintenance/src/merge/row_heap.rs",
+        "find": "if precedes(current, previous)",
+        "replace": "if false && precedes(current, previous)"
+      }],
+      "expect": [{
+        "file": "rust/crates/maintenance/src/merge/row_heap.rs",
+        "function": "from_pages",
+        "category": "assertion failed"
+      }],
+      "min_verified_functions": 19
+    },
+    "return_first_coordinate": {
+      "mutate": [{
+        "file": "rust/crates/maintenance/src/merge/row_heap.rs",
+        "find": "\n    result\n}",
+        "replace": "\n    (result.0, 0)\n}"
+      }],
+      "expect": [{
+        "file": "rust/crates/maintenance/src/merge/row_heap.rs",
+        "function": "take_minimum",
+        "category": "postcondition not satisfied"
+      }],
+      "min_verified_functions": 19
+    },
+    "return_first_coordinate_with_weakened_contract": {
+      "mutate": [{
+        "file": "rust/crates/maintenance/src/merge/row_heap.rs",
+        "find": "\n    result\n}",
+        "replace": "\n    (result.0, 0)\n}"
+      }, {
+        "file": "rust/crates/maintenance/src/merge/row_heap.rs",
+        "find": "out == old(heads)@[0],",
+        "replace": "out == (old(heads)@[0].0, 0usize),"
+      }],
+      "expect": [{
+        "file": "verification/verus/compaction_heap/laws.rs",
+        "function": "extraction_reports_the_selected_occurrence",
+        "category": "assertion failed"
+      }, {
+        "file": "verification/verus/compaction_heap/laws.rs",
+        "function": "every_remaining_head_is_at_or_after_the_minimum",
+        "category": "assertion failed"
+      }],
+      "min_verified_functions": 18
+    }
+  }
+}
