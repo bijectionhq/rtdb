@@ -786,6 +786,7 @@ Owner teardown can discard the registration once storage has drained or process 
 The reaper still needs a certified retirement cut and a directory floor before it can use these reader records.
 
 The bounded-lease path observes installed replica progress before taking a new snapshot.
+A system-role membership query takes its lease from the primary database whose snapshot it captures.
 It uses a separate status field that advances when deferred effects have applied.
 An unrecognized record freezes this progress even if the replica keeps receiving records.
 The cut embedded in a snapshot remains the authority for the exact captured catalog, including captures taken before the watch advanced. link:../../verification/tla/CatalogCutPublication.tla[Capture and publication model] · link:../../rust/crates/replication/src/driver.rs[Driver transitions] · link:../../rust/crates/multi/src/catalog_readers.rs[Hosted reader registration]

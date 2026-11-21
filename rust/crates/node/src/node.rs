@@ -325,9 +325,7 @@ impl Node {
         let classic = if placed { BTreeMap::new() } else { self.catalog.open_databases() };
         for (name, database) in held.into_iter().map(|held| (database.to_owned(), held)).chain(classic) {
             if !placed && identity.authorize_database(&name, DatabaseAccess::Read).is_err() { continue; }
-            // Another node may collect what this catalog references; without log processing there is no confirmed catalog to lease.
-            if self.factory.options.replication.enabled {
-                let database_lease = database.read_lease(&self.factory.clock, &self.factory.options.garbage).await?;
+            if let Some(database_lease) = self.catalog_read_lease(&database).await? {
                 lease = Some(match lease { Some(lease) => lease.earlier(database_lease), None => database_lease });
             }
             let head = database.partition.value().live().latest_completed_tx().map(|key| key.system_time);
@@ -350,6 +348,11 @@ impl Node {
             .map(|context| context.with_query_cpu(query_cpu))
     }
 
+    pub(crate) async fn catalog_read_lease(&self, database: &Database) -> Result<Option<Arc<rtdb_storage::ReadLease>>> {
+        if !self.factory.options.replication.enabled { return Ok(None); }
+        database.read_lease(&self.factory.clock, &self.factory.options.garbage).await.map(Some)
+    }
+
     /// Waits for this node's copy to reach the delegated fragment's transaction basis.
     /// The evaluator checks the exact snapshot it captures after the wait.
     pub async fn scan_fragment(&self, fragment: &rtdb_query::ScanFragment, catch_up: Duration, cancellation: &CancellationToken) -> Result<Vec<u8>> {
@@ -365,7 +368,7 @@ impl Node {
             }
             cancellation.run_until_cancelled(tokio::time::sleep(Duration::from_millis(5))).await.ok_or_else(cancelled)?;
         }
-        let lease = if self.factory.options.replication.enabled { Some(database.read_lease(&self.factory.clock, &self.factory.options.garbage).await?) } else { None };
+        let lease = self.catalog_read_lease(&database).await?;
         let snapshot = database.partition.open_snapshot(Some(fragment.basis.system_time));
         let snapshot = rtdb_query::retain_catalog_snapshot(snapshot, &database.storage).await?;
         let snapshots = BTreeMap::from([(database.name().to_owned(), DatabaseSnapshot { partitions: vec![snapshot], storage: Arc::clone(&database.storage) })]);
