@@ -54,12 +54,16 @@ impl Drop for CursorTrace {
     }
 }
 pub(crate) fn wrap(input: BoxPageCursor, relation: &Relation, context: &Arc<QueryContext>) -> BoxPageCursor {
-    if context.trace_parent.is_none() { return input; }
+    match operator_trace(relation, context) { Some(trace) => Box::new(TracedCursor { input: Some(input), trace }), None => input }
+}
+
+fn operator_trace(relation: &Relation, context: &Arc<QueryContext>) -> Option<CursorTrace> {
+    context.trace_parent?;
     let kind = crate::analysis::operator(relation);
     let extra = match relation.node() { RelationNode::Scan(scan) => scan.table.name.table.schema.len().saturating_add(scan.table.name.table.table.len()), _ => 0 };
-    let Ok(_name) = context.memory.reserve(extra.saturating_add(1024)) else { return input; };
+    let _name = context.memory.reserve(extra.saturating_add(1024)).ok()?;
     let name = match relation.node() { RelationNode::Scan(scan) => format!("query.cursor.scan.{}.{}", scan.table.name.table.schema, scan.table.name.table.table), _ => format!("query.cursor.{kind}") };
-    match CursorTrace::new(context, kind, &name, true) { Some(trace) => Box::new(TracedCursor { input: Some(input), trace }), None => input }
+    CursorTrace::new(context, kind, &name, true)
 }
 pub(crate) fn wrap_batches(input: crate::columnar::BoxBatchCursor, relation: &Relation, context: &Arc<QueryContext>) -> crate::columnar::BoxBatchCursor {
     match operator_trace(relation, context) { Some(trace) => Box::new(TracedBatches { input, trace }), None => input }
