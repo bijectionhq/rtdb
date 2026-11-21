@@ -204,6 +204,7 @@ entity StagedTxTable {
     -- One transaction's rows for one table, imported into the matching durable LiveTable when the transaction is applied.
     -- Staging retains the completed rows and their schema.
     -- Staging copies compatible Arrow document columns from their input arrays when combining writes in transaction order.
+    -- Staging views retain shared Arrow source allocations while exposing only the buffer spans they use.
     -- A staged put preserves its declared column types, including columns with only null cells.
     -- A table's columns, a struct's fields and a union's legs keep the order they were first written in; types compare without regard to that order.
     -- Temporary memory used during construction is released before staging.

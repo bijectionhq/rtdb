@@ -1861,6 +1861,32 @@ async fn xtql_projections_keep_their_written_column_order() {
 }
 
 #[tokio::test]
+async fn source_document_slices_fit_the_transaction_budget() {
+    for (count, extra_fields) in [(100, 10), (2000, 0)] {
+        let mut options = options();
+        options.execution_memory_bytes = 256 * 1024 * 1024;
+        let (node, driver) = running(options, services()).await;
+        let mut session = node.session("xtdb", Arc::new(Authority)).unwrap();
+        let table = TableRef::new("public", "docs");
+        let writes = (0..count).map(|id| {
+            let mut document = StructFields::from([("_id".into(), Value::I64(id))]);
+            for field in 0..extra_fields {
+                document.insert(format!("field_{id}_{field}"), Value::Utf8(format!("value_{id}_{field}")));
+            }
+            TxOp::PutDocs {
+                table: table.clone(), documents: Documents::new(vec![document], node.memory()).unwrap(),
+                valid_from: None, valid_to: None,
+            }
+        }).collect();
+        let result = session.state_mut().execute_tx(writes, AutonomousTxOptions::default()).await.unwrap();
+        assert!(result.committed(), "{count} operations: {:?}", result.error());
+        let projected = rows(session.query_sql("SELECT _id FROM docs", vec![]).await.unwrap()).await;
+        assert_eq!(projected.len(), count as usize);
+        stop(&node, driver).await;
+    }
+}
+
+#[tokio::test]
 async fn wide_heterogeneous_documents_flush_and_delete_across_blocks() {
     let mut options = options();
     options.execution_memory_bytes = 128 * 1024 * 1024;
