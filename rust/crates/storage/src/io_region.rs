@@ -19,11 +19,16 @@ pub struct IoRegion {
 pub(crate) struct IoAdmission {
     lifetimes: Vec<Arc<dyn Send + Sync>>,
     tokens: Vec<TaskTrackerToken>,
+    lease: Option<Arc<ReadLease>>,
 }
 impl IoAdmission {
     pub(crate) fn and(mut self, other: Self) -> Self {
         self.tokens.extend(other.tokens);
         self.lifetimes.extend(other.lifetimes);
+        self.lease = match (self.lease, other.lease) {
+            (Some(mine), Some(theirs)) => Some(mine.earlier(theirs)),
+            (mine, theirs) => mine.or(theirs),
+        };
         self
     }
 }
@@ -43,7 +48,7 @@ impl IoRegion {
         RETAINED_OWNER.scope(owner, work).await
     }
     /// Checks the lease when each provider operation is admitted while polling the work.
-    /// A nested lease narrows the enclosing one.
+    /// A nested lease narrows the one in scope where `leased` is called.
     /// Returns the work itself or its scoped future, so a lease adds no copy of the work to the caller's future.
     pub fn leased<F: std::future::Future>(lease: Option<Arc<ReadLease>>, work: F) -> impl std::future::Future<Output = F::Output> {
         use tokio_util::either::Either;
@@ -86,9 +91,10 @@ impl IoRegion {
     pub(crate) fn admit(&self) -> Result<IoAdmission> {
         let closed = self.closed.lock();
         if *closed { return Err(Error::Closed("I/O region is closed".into())); }
-        if self.parent.is_none() { if let Ok(lease) = READ_LEASE.try_with(Arc::clone) { lease.check()?; } }
+        let lease = if self.parent.is_none() { READ_LEASE.try_with(Arc::clone).ok() } else { None };
+        if let Some(lease) = &lease { lease.check()?; }
         let mut admission = self.parent.as_ref().map(|parent| parent.admit()).transpose()?
-            .unwrap_or_else(|| IoAdmission { tokens: Vec::new(), lifetimes: RETAINED_OWNER.try_with(Arc::clone).into_iter().collect() });
+            .unwrap_or_else(|| IoAdmission { tokens: Vec::new(), lifetimes: RETAINED_OWNER.try_with(Arc::clone).into_iter().collect(), lease });
         admission.tokens.push(self.tasks.token());
         admission.lifetimes.extend(self.lifetime.iter().cloned());
         Ok(admission)
@@ -110,6 +116,11 @@ impl IoRegion {
         Self::run_admitted(operation, work).await
     }
     pub(crate) async fn run_admitted<T: Send + 'static>(operation: IoAdmission, work: impl FnOnce() -> Result<T> + Send + 'static) -> Result<T> {
+        let lease = operation.lease.clone();
+        let result = Self::run_admitted_unclassified(operation, work).await;
+        match lease { Some(lease) => lease.classify(result), None => result }
+    }
+    async fn run_admitted_unclassified<T: Send + 'static>(operation: IoAdmission, work: impl FnOnce() -> Result<T> + Send + 'static) -> Result<T> {
         let (sender, receiver) = tokio::sync::oneshot::channel();
         tokio::task::spawn_blocking(move || {
             let operation = operation;
@@ -124,6 +135,12 @@ impl IoRegion {
     }
     #[cfg(any(feature = "remote", test))]
     pub(crate) async fn run_async_admitted<T: Send + 'static>(operation: IoAdmission, work: impl std::future::Future<Output = Result<T>> + Send + 'static) -> Result<T> {
+        let lease = operation.lease.clone();
+        let result = Self::run_async_admitted_unclassified(operation, work).await;
+        match lease { Some(lease) => lease.classify(result), None => result }
+    }
+    #[cfg(any(feature = "remote", test))]
+    async fn run_async_admitted_unclassified<T: Send + 'static>(operation: IoAdmission, work: impl std::future::Future<Output = Result<T>> + Send + 'static) -> Result<T> {
         let (sender, receiver) = tokio::sync::oneshot::channel();
         tokio::spawn(async move {
             let operation = operation;

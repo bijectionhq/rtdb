@@ -58,12 +58,13 @@ pub fn block_is_garbage(block: BlockIndex, latest: BlockIndex, keep: usize) -> b
     crate::retention::block_is_eligible(block.0, latest.0, keep)
 }
 
-pub type CollectorClock = Arc<dyn Fn() -> Timestamp + Send + Sync>;
+/// Monotonic microseconds; the collector measures only the time elapsed since it first observed a trie.
+pub type CollectorClock = Arc<dyn Fn() -> i64 + Send + Sync>;
 
 pub struct TrieCollector {
     clock: CollectorClock,
     /// When this collector first saw each trie as eligible; a new collector starts empty and waits afresh.
-    first_observed: Mutex<BTreeMap<(TableRef, TrieKey), Timestamp>>,
+    first_observed: Mutex<BTreeMap<(TableRef, TrieKey), i64>>,
     store: Arc<dyn ObjectStore>,
     partition: Arc<PartitionState>,
     publisher: Arc<dyn TrieDeletionPublisher>,
@@ -88,7 +89,7 @@ impl TrieCollector {
         drop(current);
         Ok(eligible.into_iter().filter(|key| {
             let first = *first_observed.entry((table.clone(), key.clone())).or_insert(now);
-            rtdb_storage::read_lease::collection_waited(first.0, lease, now.0)
+            rtdb_storage::read_lease::collection_waited(first, lease, now)
         }).collect())
     }
 

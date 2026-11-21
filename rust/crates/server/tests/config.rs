@@ -15,6 +15,8 @@ fn startup_defaults_match_the_pinned_factories() {
     assert_eq!(config.indexer.flush_duration, Duration::from_secs(900));
     assert_eq!(config.garbage.blocks_to_keep, 10);
     assert_eq!(config.garbage.garbage_lifetime, Duration::from_secs(86400));
+    assert_eq!(config.garbage.reader_lease, Duration::from_secs(3600));
+    assert_eq!(config.garbage.reader_lease_margin, Duration::from_secs(60));
     assert_eq!(config.memory_cache.maximum_ratio, 0.5);
     assert!(config.disk_cache.is_none());
     assert!(matches!(config.auth, AuthConfig::SingleRootUser { password: None }));
@@ -107,7 +109,7 @@ fn durations_keep_fractional_and_component_sign_semantics() {
 
 #[test]
 fn node_options_apply_indexer_compactor_gc_and_shared_memory_settings() {
-    let config = decode("memoryCache: {maxSizeBytes: 1024}\nindexer: {enabled: false, rowsPerBlock: 42, pageLimit: 16, logLimit: 8, skipTxs: [3, 9], flushDuration: PT5S}\ncompactor: {threads: 0, reeIids: true, withinFileRecencyBranching: true}\ngarbageCollector: {enabled: false, blocksToKeep: 4, garbageLifetime: PT12H}\nreadOnlyDatabases: true").unwrap();
+    let config = decode("memoryCache: {maxSizeBytes: 1024}\nindexer: {enabled: false, rowsPerBlock: 42, pageLimit: 16, logLimit: 8, skipTxs: [3, 9], flushDuration: PT5S}\ncompactor: {threads: 0, reeIids: true, withinFileRecencyBranching: true}\ngarbageCollector: {enabled: false, blocksToKeep: 4, garbageLifetime: PT12H, readerLease: PT30M, readerLeaseMargin: PT20S}\nreadOnlyDatabases: true").unwrap();
     let options = config.node_options(8192).unwrap();
     assert_eq!(options.cache_bytes, 1024);
     assert_eq!(options.execution_memory_bytes, 7168);
@@ -122,6 +124,8 @@ fn node_options_apply_indexer_compactor_gc_and_shared_memory_settings() {
     assert!(options.compaction.within_file_recency_branching);
     assert!(!options.automatic_gc);
     assert_eq!(options.garbage.blocks_to_keep, 4);
+    assert_eq!(options.garbage.reader_lease, Duration::from_secs(1800));
+    assert_eq!(options.garbage.reader_lease_margin, Duration::from_secs(20));
     assert!(options.read_only);
     assert!(config.node_options(1024).is_err());
 }

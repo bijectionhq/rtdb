@@ -17,7 +17,7 @@ impl CollectionObserver for Observer { fn table_failed(&self, _: Option<&TableRe
 
 /// No reader on another node holds a lease, so collection need not wait.
 fn unleased() -> GarbageConfig { GarbageConfig { reader_lease: Duration::ZERO, reader_lease_margin: Duration::ZERO, ..GarbageConfig::default() } }
-fn fixed_clock() -> rtdb_maintenance::CollectorClock { Arc::new(|| Timestamp(0)) }
+fn fixed_clock() -> rtdb_maintenance::CollectorClock { Arc::new(|| 0) }
 
 fn block(index: i64) -> BlockCatalog {
     BlockCatalog::from_proto(pb::Block { block_index: Some(index), latest_completed_tx: Some(pb::TxKey { tx_id: Some(index), system_time: Some(index * 1_000_000), ..Default::default() }), ..Default::default() }).unwrap()
@@ -287,7 +287,7 @@ async fn collection_waits_a_whole_reader_lease_after_first_observing_garbage() {
     let publisher = Arc::new(DeletedPublisher { store: store.clone(), table: entry.clone(), commits: Mutex::new(Vec::new()) });
     let state = Arc::new(PartitionState::new(PartitionValue::loaded(catalog, tables, TrieConfig::default()).unwrap()));
     let now = Arc::new(AtomicI64::new(1_000));
-    let clock = { let now = Arc::clone(&now); Arc::new(move || Timestamp(now.load(Ordering::Relaxed))) };
+    let clock = { let now = Arc::clone(&now); Arc::new(move || now.load(Ordering::Relaxed)) };
     let config = GarbageConfig { reader_lease: Duration::from_micros(500), reader_lease_margin: Duration::from_micros(100), ..GarbageConfig::default() };
     let collector = TrieCollector::new(store.clone(), state, publisher.clone(), Arc::new(Observer::default()), config, clock).unwrap();
     let cancellation = CancellationToken::new();

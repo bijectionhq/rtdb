@@ -663,12 +663,14 @@ Rust now registers live query and transaction catalogs with their partition owne
 The trie collector snapshots that registry with the current state and excludes dependencies of all retained reader catalogs.
 I/O regions keep those references through provider completion, and an in-progress collection prevents a compactor reset from reopening its key allocation.
 Readers on other nodes hold a validated bounded lease, the alternative the bounded study admitted without a coordination channel from readers to the collector.
-A node anchors the lease at a clock reading taken before it reads the replica tip, once its catalog has applied that tip, and every provider request checks the deadline when it is admitted.
-The collector waits a whole lease on its own clock after first observing a trie as eligible.
-Verus checks that a request the lease admits finishes before any such deletion, given the stated bounds on clock skew and request duration.
+A node anchors the lease at a monotonic clock reading taken before it reads the replica tip, once its catalog has applied that tip, and every provider request checks the deadline when it is admitted.
+The collector waits a whole lease on its own monotonic clock after first observing a trie as eligible.
+Both sides measure elapsed time, so the argument needs a bound on clock rate drift over one lease rather than synchronized clocks.
+Verus checks that a request the lease admits finishes before any such deletion, given that drift bound and a request-duration bound.
+Objects are immutable, so a request that overruns the duration bound can only fail, and it reports the expired lease.
 A native replay shows a follower cursor keeping its files within its lease and refused with a typed error after it.
-The Multi cell reaper deletes through durable garbage records outside this collector and is not covered by the lease.
-Recovery holds across authorities and the trust in clock and request-duration bounds remain open. link:../../verification/tla/LeaseAdmission.tla[Bounded comparison] · link:../../verification/verus/read_lease/laws.rs[Lease law] · link:gc.allium[Trie collection contract]
+In Multi, the collector's deletion records a release that the cell reaper erases only after its grace, so the lease wait precedes it.
+Recovery holds across authorities remain open. link:../../verification/tla/LeaseAdmission.tla[Bounded comparison] · link:../../verification/verus/read_lease/laws.rs[Lease law] · link:gc.allium[Trie collection contract]
 
 === Fork publication while the source is being collected
 

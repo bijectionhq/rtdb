@@ -941,17 +941,20 @@ Coordination between nodes, other physical deletion paths, and checkpoint and lo
 
 The previous boundary left readers on other nodes unprotected, because their catalogs never reach the writer's collector.
 Every node now gives each query snapshot a bounded read lease.
-A node reads its clock, then the replica log tip, and anchors the lease once its catalog has applied that tip.
+A node reads its monotonic clock, then the replica log tip, and anchors the lease once its catalog has applied that tip.
 A snapshot captured afterwards may begin provider requests strictly before the anchor plus `reader_lease` minus `reader_lease_margin`, one hour and one minute by default.
 The storage I/O region checks the lease as it admits each provider request and refuses a late one with `rtdb.storage/read-lease-expired`.
 A node that cannot confirm its catalog waits up to the margin for its log processor and then holds an expired lease.
-The trie collector deletes an eligible trie only after a whole lease has passed on its own clock since it first observed the trie as eligible.
+The trie collector deletes an eligible trie only after a whole lease has passed on its own monotonic clock since it first observed the trie as eligible.
+In Multi, that deletion records a release that the cell reaper erases only after its grace.
 A collector starts with no observations after restart or failover.
 A node that reads a scan fragment for another node's query captures its own snapshot and holds its own lease.
 
 The link:../verus/read_lease/laws.rs[read lease area] verifies the three production decisions and two laws.
-The composed law assumes the reader's clock stays within `skew` of the collector's, the anchor precedes publication of the retirement, and a request takes at most `io_bound`.
-Under `2 * skew + io_bound <= margin`, an admitted request finishes before any deletion the collector permits.
+The composed law relates each node's monotonic readings to real time: over one lease, measured and real elapsed time differ by at most `drift`.
+It assumes the anchor precedes the collector's first observation in real time and a request takes at most `io_bound`.
+Under `2 * drift + io_bound <= margin`, an admitted request finishes before any deletion the collector permits.
+No clock synchronization between nodes is assumed; the default one-minute margin over a one-hour lease tolerates up to 30 seconds of drift per lease, less half the request allowance.
 Admitting a request at the deadline fails the original contract, and fails both laws when the contract is weakened with it.
 Dropping the margin or the collector's wait, together with its contract, fails the composed law.
 The runner reported 5 verified functions for the baseline and the expected diagnostics for all four controls.
@@ -974,10 +977,11 @@ The Multi idempotency test overflowed a worker stack because the lease scope sto
 Two node search tests timed out awaiting indexed progress under machine load and passed on rerun.
 The maintenance `two_databases_share_a_slot_until_cancelled_uploads_finish` test also hangs on the base commit.
 
-The lease bounds rest on the stated clock-skew and request-duration assumptions, which no runtime check enforces.
-A provider request that outlives `io_bound` can still observe a deletion.
+Objects are immutable, so a request that outlives `io_bound` can only fail; the I/O region classifies a missing object reported after the deadline as `rtdb.storage/read-lease-expired`.
+A missing object within the lease remains `rtdb.storage/missing-object`, which marks a violated drift or retirement premise.
+Storage tests check admission at the deadline, the overrun classification and lease narrowing.
+The `garbageCollector` configuration accepts `readerLease` and `readerLeaseMargin` as ISO-8601 durations.
 Nodes with log processing disabled hold no lease, because they have no confirmed catalog; the native follower path always processes the log.
-The lease and margin are node options without server configuration keys.
 Transaction resolution on the leader remains protected by the partition registry and holds no lease.
 
 == Trie dependencies of the installed checkpoint

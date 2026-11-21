@@ -37,6 +37,7 @@ impl CatalogMetrics for Catalog {
 struct ClockFixture(AtomicI64);
 impl Clock for ClockFixture {
     fn now(&self) -> Timestamp { Timestamp(self.0.fetch_add(1000, Ordering::Relaxed)) }
+    fn monotonic_micros(&self) -> i64 { self.0.load(Ordering::Relaxed) }
 }
 
 fn options(directory: &std::path::Path) -> NodeOptions {

@@ -43,7 +43,7 @@ pub struct CompactorSettings { pub threads: usize, pub run_end_encoded_iids: boo
 #[derive(Clone, Debug)]
 pub struct SearchSettings { pub enabled: bool, pub threads: usize }
 #[derive(Clone, Debug)]
-pub struct GarbageSettings { pub enabled: bool, pub blocks_to_keep: usize, pub garbage_lifetime: Duration }
+pub struct GarbageSettings { pub enabled: bool, pub blocks_to_keep: usize, pub garbage_lifetime: Duration, pub reader_lease: Duration, pub reader_lease_margin: Duration }
 #[derive(Clone, Debug)]
 pub struct TracingSettings { pub enabled: bool, pub endpoint: String, pub service_name: String, pub query_tracing: bool, pub transaction_tracing: bool }
 #[derive(Clone, Debug)]
@@ -225,7 +225,8 @@ fn compactor(value: Option<Yaml>, environment: &impl Fn(&str) -> Option<String>)
 }
 fn garbage(value: Option<Yaml>) -> Result<GarbageSettings> {
     let mut fields = YamlFields::new(value.unwrap_or_else(empty), "garbageCollector")?;
-    let result = GarbageSettings { enabled: fields.boolean("enabled")?.unwrap_or(true), blocks_to_keep: positive(fields.integer("blocksToKeep")?.unwrap_or(10) as i64, "blocksToKeep")?, garbage_lifetime: duration(&mut fields, "garbageLifetime", 24 * 3600)? };
+    let result = GarbageSettings { enabled: fields.boolean("enabled")?.unwrap_or(true), blocks_to_keep: positive(fields.integer("blocksToKeep")?.unwrap_or(10) as i64, "blocksToKeep")?, garbage_lifetime: duration(&mut fields, "garbageLifetime", 24 * 3600)?,
+        reader_lease: duration(&mut fields, "readerLease", 3600)?, reader_lease_margin: duration(&mut fields, "readerLeaseMargin", 60)? };
     fields.finish()?;
     Ok(result)
 }

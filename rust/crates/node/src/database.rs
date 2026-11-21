@@ -9,7 +9,7 @@ use rtdb_maintenance::{ArtefactDatabase, ArtefactDriver, ArtefactHandle, Artefac
 use rtdb_replication::{BlockStore, PartitionLogs, ProgressMonitor, ReplicationDriver, ReplicationHandle, Role, TermHandle};
 use rtdb_storage::{IoRegion, ObjectStore, cache::{BufferPool, CacheBudget}};
 use rtdb_tx::{ResolveContext, TransactionAuthorization};
-use rtdb_types::{Anomaly, AnomalyCategory, ReplicaPosition, Result, SourcePosition, TableRef, Term, Timestamp};
+use rtdb_types::{Anomaly, AnomalyCategory, ReplicaPosition, Result, SourcePosition, TableRef, Term};
 use tokio::sync::{RwLock, RwLockReadGuard, RwLockWriteGuard, Semaphore, mpsc, watch};
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
@@ -73,14 +73,14 @@ impl Database {
     pub(crate) async fn read_lease(&self, clock: &Arc<dyn Clock>, garbage: &rtdb_maintenance::GarbageConfig) -> Result<Arc<rtdb_storage::ReadLease>> {
         use rtdb_storage::read_lease::{lease_admits, lease_deadline};
         let (lease, margin) = (garbage.reader_lease_micros()?, garbage.reader_lease_margin_micros()?);
-        let deadline = |anchor: Option<Timestamp>| anchor.and_then(|anchor| lease_deadline(anchor.0, lease, margin));
-        let observed_at = clock.now();
+        let deadline = |anchor: Option<i64>| anchor.and_then(|anchor| lease_deadline(anchor, lease, margin));
+        let observed_at = clock.monotonic_micros();
         if self.currency.needs_observation(observed_at, lease / 4) {
             let logs = Arc::clone(&self.logs);
             if let Ok(Ok(tip)) = self.io.run_blocking(move || Ok(logs.latest_replica_position())).await { self.currency.observe(observed_at, tip); }
         }
         let mut current = deadline(self.currency.anchor(self.replication.status().replica_position));
-        if current.is_none_or(|deadline| !lease_admits(clock.now().0, deadline)) {
+        if current.is_none_or(|deadline| !lease_admits(clock.monotonic_micros(), deadline)) {
             if let Some(tip) = self.currency.pending_tip() {
                 let mut status = self.replication.watch_status();
                 let caught_up = status.wait_for(|status| status.replica_position >= tip);
@@ -89,7 +89,7 @@ impl Database {
             }
         }
         let clock = Arc::clone(clock);
-        Ok(Arc::new(rtdb_storage::ReadLease::new(current, Arc::new(move || clock.now().0))))
+        Ok(Arc::new(rtdb_storage::ReadLease::new(current, Arc::new(move || clock.monotonic_micros()))))
     }
     pub async fn block_lag(&self) -> Result<i64> {
         let current = self.status().adopted_block.as_ref().map_or(-1, |block| block.block_index().0);
@@ -417,7 +417,7 @@ impl MaintenanceSupervisor {
         let publisher = Arc::new(PublishDeletions(handle.clone()));
         let trie_collector = Arc::new(TrieCollector::new(Arc::clone(&self.store), Arc::clone(&self.partition), publisher, Arc::clone(&self.observer), self.options.garbage.clone(), {
             let clock = Arc::clone(&self.clock);
-            Arc::new(move || clock.now())
+            Arc::new(move || clock.monotonic_micros())
         })?);
         let block_collector = Arc::new(BlockCollector::new(Arc::clone(&self.store), self.partition.clone(), Arc::clone(&self.observer), self.options.garbage.clone())?);
         let (trie_driver, trie) = CycleDriver::new(trie_collector, self.options.automatic_gc, self.options.command_capacity)?;
@@ -455,7 +455,7 @@ impl MaintenanceSupervisor {
             // Keeps the read lease anchor fresh while the log processor applies records, so queries rarely observe the tip themselves.
             if self.options.replication.enabled {
                 if let Ok(lease) = self.options.garbage.reader_lease_micros() {
-                    let observed_at = self.clock.now();
+                    let observed_at = self.clock.monotonic_micros();
                     if self.currency.needs_observation(observed_at, lease / 4) {
                         let logs = Arc::clone(&self.logs);
                         if let Ok(Ok(tip)) = tokio::task::spawn_blocking(move || logs.latest_replica_position()).await { self.currency.observe(observed_at, tip); }
