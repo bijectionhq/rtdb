@@ -183,12 +183,43 @@ pub struct DeploymentRecord {
     pub version: Version,
 }
 
+/// The immutable identity of the ECS task that opened a hosted storage region.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HostedTask {
+    cluster_arn: String,
+    task_arn: String,
+}
+
+impl HostedTask {
+    pub fn new(cluster_arn: &str, task_arn: &str) -> Result<Self> {
+        let invalid = || Anomaly::incorrect("rtdb.directory/hosted-task", "The task ARN does not belong to the installed ECS cluster");
+        let (authority, cluster) = cluster_arn.split_once(":cluster/").ok_or_else(invalid)?;
+        let (region, account) = authority.strip_prefix("arn:aws:ecs:")
+            .and_then(|authority| authority.split_once(':')).ok_or_else(invalid)?;
+        if region.is_empty() || !region.bytes().all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+            || account.len() != 12 || !account.bytes().all(|byte| byte.is_ascii_digit())
+            || cluster.is_empty() || !cluster.bytes().all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+        {
+            return Err(invalid());
+        }
+        let id = task_arn.strip_prefix(&format!("{authority}:task/{cluster}/")).ok_or_else(invalid)?;
+        if id.len() != 32 || !id.bytes().all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase()) {
+            return Err(invalid());
+        }
+        Ok(Self { cluster_arn: cluster_arn.to_owned(), task_arn: task_arn.to_owned() })
+    }
+
+    pub fn cluster_arn(&self) -> &str { &self.cluster_arn }
+    pub fn task_arn(&self) -> &str { &self.task_arn }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "state", rename_all = "snake_case")]
 pub enum StorageRegion {
     Local,
     Remote {
         archive: Option<uuid::Uuid>,
+        owner: Option<HostedTask>,
         /// When closed, the region owner has joined its I/O and may issue
         /// no further requests. Uncertain publications still need evidence.
         closed: bool,
@@ -335,6 +366,9 @@ pub trait Directory: Send + Sync {
     async fn member(&self, id: &MemberId) -> Result<Option<MemberRecord>>;
     async fn members(&self) -> Result<Vec<MemberRecord>>;
     async fn replace_member(&self, record: MemberRecord, expected: Version) -> Result<Cas<MemberRecord>>;
+
+    /// A retained observation of the exact hosting task in terminal STOPPED.
+    async fn hosted_task_stopped(&self, _task: &HostedTask) -> Result<bool> { Ok(false) }
 
     /// Every deployment record applied from now on, as the backend learns of it; `None` if this backend has no feed, and its watches poll.
     /// A receiver sees each record's versions in order, possibly late; it may miss some, and then sees `RecvError::Lagged` or a later version only.
@@ -508,5 +542,22 @@ mod tests {
         assert!(first.ends_with(&format!("/acme/{}/{}/1", record.id, record.id)), "{first}");
         record.incarnation = 2;
         assert_ne!(first, record.storage_prefix());
+    }
+}
+
+#[cfg(test)]
+mod hosted_task_tests {
+    use super::HostedTask;
+
+    #[test]
+    fn a_hosted_task_must_name_the_exact_installed_cluster() {
+        let cluster = "arn:aws:ecs:eu-north-1:111122223333:cluster/bj-prod-cell-test";
+        let task = "arn:aws:ecs:eu-north-1:111122223333:task/bj-prod-cell-test/84d0704dd3e548d496883a065ccc01c7";
+        let owner = HostedTask::new(cluster, task).unwrap();
+        assert_eq!(owner.task_arn(), task);
+        assert_eq!(owner.cluster_arn(), cluster);
+        assert!(HostedTask::new(&cluster.replace("cell-test", "cell-other"), task).is_err());
+        assert!(HostedTask::new(&cluster.replace("eu-north-1", "eu-west-1"), task).is_err());
+        assert!(HostedTask::new(cluster, &task[..task.len()-1]).is_err());
     }
 }

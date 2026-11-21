@@ -31,6 +31,7 @@ pub struct NodeSettings {
     pub control: SocketAddr,
     /// The address peers use when the listeners bind on all interfaces.
     pub advertise_host: Option<String>,
+    pub hosted_task: Option<rtdb_directory::HostedTask>,
     pub availability_zone: String,
     pub agent: AgentOptions,
     pub lease: LeaseOptions,
@@ -76,6 +77,7 @@ pub async fn start_node(directory: Arc<dyn Directory>, mut settings: NodeSetting
     let storage = Arc::new(crate::store::CellStoreFactory {
         directory: Arc::clone(&directory),
         keys: Arc::clone(&settings.keys),
+        hosted_task: settings.hosted_task,
         storage_regions: storage_regions.clone(),
     });
     let placed = PlacedOptions {

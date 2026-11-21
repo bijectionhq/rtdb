@@ -522,6 +522,7 @@ pub async fn capture(
     keys: &dyn KeyService,
     deployment: Uuid,
     operation: Uuid,
+    hosted_task: Option<rtdb_directory::HostedTask>,
 ) -> Result<Capture> {
     if deployment.is_nil() || operation.is_nil() || same_storage(storage, destination) {
         return Err(inconsistent(
@@ -565,7 +566,7 @@ pub async fn capture(
         record.storage_regions.insert(region, if local {
             rtdb_directory::StorageRegion::Local
         } else {
-            crate::store::remote_storage_region(Some(operation))
+            crate::store::remote_storage_region(Some(operation), hosted_task.clone())
         });
         Ok(())
     }).await;

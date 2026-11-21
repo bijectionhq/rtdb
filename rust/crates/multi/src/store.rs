@@ -14,7 +14,7 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use parking_lot::Mutex;
 use prost_types::Any;
-use rtdb_directory::{Cas, DeploymentRecord, Directory, Lifecycle, StorageRegion, now_ms};
+use rtdb_directory::{Cas, DeploymentRecord, Directory, HostedTask, Lifecycle, StorageRegion, now_ms};
 use rtdb_node::RemoteStorageFactory;
 use rtdb_storage::{Error, IoRegion, ObjectKey, ObjectStore, object_store::StoredObject, remote::PublicationJournal};
 use rtdb_types::{Anomaly, Result};
@@ -52,6 +52,7 @@ pub struct CellStoreConfig {
 pub struct CellStoreFactory {
     pub directory: Arc<dyn Directory>,
     pub keys: Arc<dyn KeyService>,
+    pub(crate) hosted_task: Option<HostedTask>,
     pub(crate) storage_regions: TaskTracker,
 }
 
@@ -101,6 +102,7 @@ impl CellStoreFactory {
         let directory = self.directory.clone();
         let keys = self.keys.clone();
         let config = config.clone();
+        let hosted_task = self.hosted_task.clone();
         let id = Uuid::new_v4();
         let (release, dropped) = oneshot::channel();
         let (ready, admitted) = oneshot::channel();
@@ -134,7 +136,7 @@ impl CellStoreFactory {
                 record.storage_regions.insert(id, if local {
                     StorageRegion::Local
                 } else {
-                    remote_storage_region(None)
+                    remote_storage_region(None, hosted_task.clone())
                 });
                 Ok(())
             }).await;
@@ -177,8 +179,8 @@ impl CellStoreFactory {
     }
 }
 
-pub(crate) fn remote_storage_region(archive: Option<Uuid>) -> StorageRegion {
-    StorageRegion::Remote { archive, closed: false, publications: BTreeMap::new() }
+pub(crate) fn remote_storage_region(archive: Option<Uuid>, owner: Option<HostedTask>) -> StorageRegion {
+    StorageRegion::Remote { archive, owner, closed: false, publications: BTreeMap::new() }
 }
 
 pub(crate) fn track_publications(
@@ -279,8 +281,8 @@ pub(crate) async fn release_region(directory: &dyn Directory, deployment: &str, 
     ))
 }
 
-/// Local locks witness process death. For a closed remote admission the
-/// provider must confirm exactly the retained publications.
+/// A local lock or ECS stop record can witness process death. Remote
+/// admission also requires confirmation of its exact provider publications.
 pub(crate) async fn reconcile_storage_regions(
     directory: &dyn Directory,
     storage: &CellStorage,
@@ -293,9 +295,16 @@ pub(crate) async fn reconcile_storage_regions(
                 release_region(directory, &record.id, region, false).await?;
                 keys.forget_local_storage_region(region)?;
             }
-            StorageRegion::Remote { archive, publications, closed: true }
-                if confirm_remote_publications(storage, record, *archive, publications).await? =>
-            {
+            StorageRegion::Remote { archive, owner, publications, closed } => {
+                if !*closed {
+                    let Some(owner) = owner else { continue; };
+                    if !directory.hosted_task_stopped(owner).await? {
+                        continue;
+                    }
+                }
+                if !publications.is_empty() && !confirm_remote_publications(storage, record, *archive, publications).await? {
+                    continue;
+                }
                 crate::admin::update_installation(directory, &record.id, |current| {
                     if current.storage_regions.get(&region) == Some(state) {
                         current.storage_regions.remove(&region);
@@ -956,6 +965,7 @@ mod tests {
         let factory = CellStoreFactory {
             directory: directory.clone(),
             keys: keys.clone(),
+            hosted_task: None,
             storage_regions: TaskTracker::new(),
         };
         let config = CellStoreConfig {
@@ -1004,7 +1014,7 @@ mod tests {
         let region = Uuid::new_v4();
         let attempt = Uuid::new_v4();
         let mut record = DeploymentRecord::new("shop", "acme", vec![], 0);
-        record.storage_regions.insert(region, remote_storage_region(None));
+        record.storage_regions.insert(region, remote_storage_region(None, None));
         let record = directory.create_deployment(record).await.unwrap();
         let object = key(&format!("{}/v06/data", record.storage_prefix()));
         let journal = DirectoryPublications {
@@ -1014,14 +1024,14 @@ mod tests {
         journal.admit(&object, attempt).await.unwrap();
         let before = directory.deployment(&record.id).await.unwrap().unwrap();
         assert_eq!(before.storage_regions[&region], StorageRegion::Remote {
-            archive: None, closed: false, publications: BTreeMap::from([(attempt, object.to_string())]),
+            archive: None, owner: None, closed: false, publications: BTreeMap::from([(attempt, object.to_string())]),
         });
         release_region(directory.as_ref(), &record.id, region, false).await.unwrap();
         release_region(directory.as_ref(), &record.id, region, false).await.unwrap();
         assert!(journal.admit(&object, Uuid::new_v4()).await.is_err());
         let retained = directory.deployment(&record.id).await.unwrap().unwrap();
         assert_eq!(retained.storage_regions[&region], StorageRegion::Remote {
-            archive: None, closed: true, publications: BTreeMap::from([(attempt, object.to_string())]),
+            archive: None, owner: None, closed: true, publications: BTreeMap::from([(attempt, object.to_string())]),
         });
     }
 

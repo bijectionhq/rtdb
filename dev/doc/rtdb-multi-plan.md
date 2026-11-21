@@ -135,9 +135,12 @@ metadata. An acknowledged success or definite refusal clears the attempt.
 For an ambiguous response, only a fresh HEAD returning that exact identity
 can confirm the publication. When the owner closes its I/O, a reaper can
 release the closed admission after checking every retained attempt.
-Ordinary serving collection preserves those object keys. An owner that
-exits before recording its close still leaves an open admission and its
-write-ahead inventory.
+Ordinary serving collection preserves those object keys. On ECS, a cell
+records the exact task ARN when opening a region. The independent ECS event
+delivery retains terminal STOPPED observations in the cell directory. The
+reaper may settle an open region only after observing its exact owning task
+stop and confirming every recorded publication. A task stop alone does not
+settle provider work.
 
 `rtdb-multi capture --id UUID --operation UUID` retains the selected
 published checkpoint and copies its catalog, table metadata and referenced

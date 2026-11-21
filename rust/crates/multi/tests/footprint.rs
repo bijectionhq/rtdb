@@ -27,6 +27,7 @@ async fn the_resident_cost_of_an_idle_deployment() {
         }).await.unwrap());
     }
     let node = process::start_node(Arc::clone(&directory), process::NodeSettings {
+        hosted_task: None,
         advertise_host: None,
         configuration: NodeConfiguration::from_yaml("server:\n  port: 0\n").unwrap(), allocation_limit_bytes: 4 << 30, control: "127.0.0.1:0".parse().unwrap(),
         availability_zone: "z0".into(), agent: AgentOptions::new(CellStorage::Local { root: data.path().join("objects") }), lease, claim_wait: Duration::from_millis(20),

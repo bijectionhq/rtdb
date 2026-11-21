@@ -20,14 +20,14 @@ Usage: rtdb-multi --build-info\n\
        rtdb-multi standalone --state PATH --name NAME --id UUID --certificate FILE --private-key FILE --password-file FILE --ready-file FILE [--parent-stdin]\n\
        rtdb-multi directory --state PATH --listen ADDR\n\
        rtdb-multi logkeeper --directory DIR --listen ADDR --data PATH [--advertise-host HOST] [--zone ZONE] [--cache-bytes BYTES] [--no-fsync]\n\
-       rtdb-multi node --directory DIR --storage-root PATH --keys PATH --cache PATH [--config FILE] [--control ADDR] [--advertise-host HOST] [--zone ZONE] [--park-after SECONDS] [--max-active N] [--max-tail-rows N] [--isolation | --compaction-worker] [--no-local-compaction] [--memory-limit BYTES] [--cell-secret FILE]\n\
+       rtdb-multi node --directory DIR --storage-root PATH --keys PATH --cache PATH [--config FILE] [--control ADDR] [--advertise-host HOST] [--zone ZONE] [--ecs-cluster ARN] [--park-after SECONDS] [--max-active N] [--max-tail-rows N] [--isolation | --compaction-worker] [--no-local-compaction] [--memory-limit BYTES] [--cell-secret FILE]\n\
        rtdb-multi gateway --directory DIR --listen ADDR [--config FILE] [--cell NAME --cell-map ADDR] [--cell-secret FILE]\n\
                           [--install-listen ADDR --install-token-file FILE --install-org ORG --install-replicas N]\n\
                           [--disposal-token-file FILE]\n\
        rtdb-multi cell-map --listen ADDR\n\
        rtdb-multi move-cell --cell-map ADDR --name NAME --from CELL --from-directory DIR --from-storage-root PATH --from-keys PATH --to CELL --to-directory DIR --to-storage-root PATH --to-keys PATH\n\
        rtdb-multi controller --directory DIR [--rebalance MOVES] [--cell-secret FILE]\n\
-       rtdb-multi reaper --directory DIR --storage-root PATH [--keys PATH] [--grace SECONDS] [--recovery-listen ADDR --recovery-config FILE --recovery-token-file FILE --recovery-org ORG --archive-root PATH]\n\
+       rtdb-multi reaper --directory DIR --storage-root PATH [--keys PATH] [--ecs-cluster ARN] [--grace SECONDS] [--recovery-listen ADDR --recovery-config FILE --recovery-token-file FILE --recovery-org ORG --archive-root PATH]\n\
        rtdb-multi create --directory DIR --name NAME [--org ORG] [--replicas N]\n\
        rtdb-multi install --directory DIR --id UUID --name NAME --org ORG [--replicas N]\n\
        rtdb-multi list --directory DIR\n\
@@ -45,7 +45,7 @@ Usage: rtdb-multi --build-info\n\
        rtdb-multi recovery-disposal --directory DIR --id UUID\n\
        rtdb-multi capture --directory DIR --storage-root PATH --archive-root PATH --keys PATH --id UUID --operation UUID\n\
        rtdb-multi restore --directory DIR --storage-root PATH --archive-root PATH --keys PATH --id UUID --operation UUID\n\n\
-DIR is HOST:PORT of a directory server, or dynamodb:PREFIX for DynamoDB tables named PREFIX-deployments, PREFIX-deployment-names and PREFIX-members\n\
+DIR is HOST:PORT of a directory server, or dynamodb:PREFIX for the deployments, deployment-names, members and stopped-tasks tables\n\
 (RTDB_DYNAMODB_ENDPOINT points at DynamoDB Local; requires the `dynamodb` feature).\n\
 For `--keys` use a private local directory or dynamodb:TABLE with an independently installed key table.\n";
 
@@ -80,6 +80,16 @@ impl Arguments {
     fn number<T: std::str::FromStr>(&self, name: &str, default: T) -> Result<T> {
         self.optional(name).map(|value| value.parse().map_err(|_| usage(format!("--{name} must be a number")))).transpose().map(|value| value.unwrap_or(default))
     }
+}
+
+fn hosted_task(arguments: &Arguments) -> Result<Option<rtdb_directory::HostedTask>> {
+    let Some(cluster) = arguments.optional("ecs-cluster") else {
+        if arguments.present("ecs-cluster") { return Err(usage("--ecs-cluster needs the installed cluster ARN".into())); }
+        return Ok(None);
+    };
+    let task = std::env::var("RTDB_ECS_TASK_ARN")
+        .map_err(|_| usage("The hosted entrypoint must supply the current ECS task ARN".into()))?;
+    Ok(Some(rtdb_directory::HostedTask::new(cluster, &task)?))
 }
 
 fn installation_id(arguments: &Arguments) -> Result<uuid::Uuid> {
@@ -169,6 +179,7 @@ async fn run(arguments: Vec<String>) -> Result<()> {
             agent.park_after = arguments.optional("park-after").map(|seconds| seconds.parse().map(Duration::from_secs)).transpose().map_err(|_| usage("--park-after must be a number of seconds".into()))?;
             let node = process::start_node(directory, process::NodeSettings {
                 advertise_host: arguments.optional("advertise-host").map(str::to_owned),
+                hosted_task: hosted_task(&arguments)?,
                 configuration, allocation_limit_bytes: arguments.number("memory-limit", 1usize << 30)?, control: arguments.address("control", "127.0.0.1:0")?,
                 availability_zone: arguments.optional("zone").unwrap_or("local").into(), agent, lease: LeaseOptions::default(), claim_wait: Duration::from_millis(20),
                 pool: if arguments.present("isolation") { rtdb_directory::MemberPool::Isolation } else if arguments.present("compaction-worker") { rtdb_directory::MemberPool::Compaction } else { rtdb_directory::MemberPool::General },
@@ -262,6 +273,7 @@ async fn run(arguments: Vec<String>) -> Result<()> {
                     storage.clone(),
                     CellStorage::parse(arguments.required("archive-root")?)?,
                     keys.clone().ok_or_else(|| usage("The recovery endpoint requires --keys".into()))?,
+                    hosted_task(&arguments)?,
                 )?;
                 let listener = tokio::net::TcpListener::bind(
                     arguments.address("recovery-listen", "127.0.0.1:0")?,
@@ -368,7 +380,7 @@ async fn run(arguments: Vec<String>) -> Result<()> {
             let keys = key_service(arguments.required("keys")?).await?;
             let capture = rtdb_multi::archive::capture(
                 directory, &storage, &archive, keys.as_ref(),
-                installation_id(&arguments)?, required_uuid(&arguments, "operation")?,
+                installation_id(&arguments)?, required_uuid(&arguments, "operation")?, None,
             ).await?;
             println!("{}", serde_json::to_string_pretty(&capture).expect("a capture serializes"));
             Ok(())

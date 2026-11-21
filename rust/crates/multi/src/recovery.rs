@@ -3,7 +3,7 @@
 use std::{path::Path, sync::Arc, time::Duration};
 
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
-use rtdb_directory::Directory;
+use rtdb_directory::{Directory, HostedTask};
 use rtdb_types::{Anomaly, AnomalyCategory, Result};
 use serde::{Deserialize, Serialize};
 use tokio::{
@@ -69,6 +69,7 @@ pub struct RecoveryService {
     storage: CellStorage,
     archive: CellStorage,
     keys: Arc<dyn KeyService>,
+    hosted_task: Option<HostedTask>,
 }
 
 impl RecoveryService {
@@ -78,6 +79,7 @@ impl RecoveryService {
         storage: CellStorage,
         archive: CellStorage,
         keys: Arc<dyn KeyService>,
+        hosted_task: Option<HostedTask>,
     ) -> Result<Self> {
         Ok(Self {
             token: Token::new(&Token::read(token)?)?,
@@ -85,6 +87,7 @@ impl RecoveryService {
             storage,
             archive,
             keys,
+            hosted_task,
         })
     }
 
@@ -113,6 +116,7 @@ impl RecoveryService {
                     self.keys.as_ref(),
                     request.authority,
                     request.capture,
+                    self.hosted_task.clone(),
                 )
                 .await?;
                 let manifest_sha256 = capture.manifest_sha256()?;
@@ -284,6 +288,7 @@ mod tests {
         directory.create_deployment(installation).await.unwrap();
         let token = "a".repeat(64);
         let service = RecoveryService {
+            hosted_task: None,
             token: Token::new(&token).unwrap(),
             org: "cell".into(),
             storage: CellStorage::Local {

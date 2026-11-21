@@ -192,6 +192,7 @@ pub async fn serve_standalone(
                 configuration,
                 allocation_limit_bytes: 1 << 30,
                 control: LOOPBACK,
+                hosted_task: None,
                 advertise_host: None,
                 availability_zone: "local".into(),
                 agent: AgentOptions::new(storage.clone()),
