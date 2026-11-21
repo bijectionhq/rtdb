@@ -387,3 +387,21 @@ With each local contract also weakened, the independent final-digit or bucket co
 All five trie contract tests and all 18 maintenance merge tests passed.
 The proof concerns default base-four extraction and assumes callers use their checked depth.
 It leaves the alternative-width paths, query range endpoints, event equivalence and selection across a complete trie catalog to separate proofs.
+
+== Combined verification through the IID proof
+
+The complete combined run passed on `63e162d6f`.
+It checked 54 Verus obligations across seven areas and rejected 26 Verus controls.
+Fifteen bounded TLC baselines passed and 29 mutations or reachability configurations yielded the declared counterexamples.
+The native replay and compiler controls also passed.
+The runner retained the tool identities in `run.json` and the per-case commands alongside the diagnostics.
+The input manifest SHA-256 is `f1781a86a23686c9a02089b36a13d53aa6fca2d8745833b6788c633aeb33b5c6`.
+
+== Multiple-reader deletion authorization
+
+TLC explored all 97 states of link:../tla/ReclamationAuthority.tla[the authorization model], with two readers, at most one protected operation per reader, and two generations.
+A reachability control shows that the old generation can be deleted.
+Ignoring the second reader, granting a stale admission after authorizing deletion, and reusing a physical pathname each violate the recorded invariant.
+The baseline preserves both readers' dependencies and the current generation through a delayed deletion.
+It assumes synchronized admission and authorization, immutable object identities, and confirmed completion of protected operations.
+This is bounded model evidence for those premises. The model does not implement reader coordination in the Rust database.
