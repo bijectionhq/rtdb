@@ -4475,6 +4475,7 @@ dependencies = [
 name = "rtdb-index"
 version = "0.1.0"
 dependencies = [
+ "arc-swap",
  "arrow-array",
  "arrow-schema",
  "arrow-select",

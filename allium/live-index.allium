@@ -292,6 +292,8 @@ entity LiveTableTx {
 --     An L0 that reaches the trie catalog ahead of its block's adoption is covered by "L0 supersession" above.
 --   - Commits are atomic: all of a transaction's rows become visible together, or none do.
 --   - Multiple snapshots can be held concurrently without interference.
+--   - A native reader can open a snapshot of the published partition value while a writer prepares the next value.
+--   - Publishing a native write within the current block preserves any concurrent advance of the shared snapshot.
 --   - Writes don't block reads: the shared external snapshot is rebuilt lazily, and an existing snapshot stays valid until released.
 --
 -- Sharing:
@@ -299,6 +301,7 @@ entity LiveTableTx {
 --   Each reader's snapshot takes the catalogs as they stand when it opens.
 --   A snapshot's segments survive exactly as long as their last holder.
 --   Transaction snapshots are per-transaction and are not shared.
+--   Native transaction snapshots can share a frozen staged segment from a predecessor.
 ------------------------------------------------------------
 
 entity Snapshot {

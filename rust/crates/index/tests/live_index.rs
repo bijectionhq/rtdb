@@ -120,6 +120,22 @@ fn staged_predecessors_and_own_writes_are_each_scanned_once() {
 }
 
 #[test]
+fn resolving_snapshots_share_each_predecessors_frozen_segment() {
+    let state = PartitionState::empty(TrieConfig::default()).unwrap();
+    let budget = MemoryBudget::new(1 << 24);
+    let predecessors = [Arc::new(stage(&state, &budget, 0))];
+    let held = state.resolving_snapshot(&predecessors).unwrap();
+    let next = state.resolving_snapshot(&predecessors).unwrap();
+    assert!(Arc::ptr_eq(&held.segments(&table())[0], &next.segments(&table())[0]));
+    assert_eq!(rows(&state.open_snapshot(None)), 0);
+
+    state.apply(&predecessors[0]).unwrap();
+    state.apply(&stage(&state, &budget, 1)).unwrap();
+    assert_eq!(rows(&held), 1);
+    assert_eq!(rows(&state.open_snapshot(Some(key(1).system_time))), 2);
+}
+
+#[test]
 fn cached_snapshot_rebuilds_only_when_a_newer_basis_is_demanded() {
     let state = PartitionState::empty(TrieConfig::default()).unwrap();
     let budget = MemoryBudget::new(1 << 24);

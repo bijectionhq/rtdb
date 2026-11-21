@@ -248,27 +248,47 @@ impl LiveTable {
         next.last_system_time = Some(system_time);
         Ok(next)
     }
-    /// Merges the newest chunk into the one before it while it is at least as large, they share a layout and together
-    /// stay small, so a table written a row per transaction is read from chunks of up to `MERGED_CHUNK_ROWS` rows.
     /// Chunks keep their row addresses, since a merged chunk starts where the earlier one did.
     fn merge_small_chunks(&mut self) -> Result<()> {
         const MERGED_CHUNK_ROWS: usize = 8192;
-        while let [.., (start, previous), (_, last)] = self.chunks.as_slice() {
-            if last.len() < previous.len() || previous.len() + last.len() > MERGED_CHUNK_ROWS || previous.arrow().schema() != last.arrow().schema() { break; }
-            let schema = previous.arrow().schema();
-            let budget = Arc::clone(previous.owned.reservation().budget());
-            let bound = previous.arrow().get_array_memory_size().checked_add(last.arrow().get_array_memory_size()).and_then(|bytes| bytes.checked_add(4096))
-                .ok_or_else(|| invalid("Merged live chunk exceeds addressable memory"))?;
-            let mut reservation = budget.reserve(bound)?;
-            let merged = arrow_select::concat::concat_batches(&schema, [previous.arrow(), last.arrow()]).map_err(invalid)?;
-            // Concatenating a dense union sizes every leg for all of its rows, so the merge can outgrow its inputs.
-            let lease = Arc::get_mut(&mut reservation).ok_or_else(|| invalid("A merged chunk's charge is shared"))?;
-            lease.grow_to(lease.bytes().max(merged.get_array_memory_size()))?;
-            let merged = IndexBatch::from_owned(OwnedBatch::with_reservation(merged, reservation)?)?;
-            let start = *start;
-            self.chunks.truncate(self.chunks.len() - 2);
-            self.chunks.push((start, merged));
+        while let [.., (_, previous), (_, last)] = self.chunks.as_slice() {
+            let schema = last.arrow().schema_ref();
+            let can_merge = |previous: &IndexBatch, rows| {
+                previous.len() <= rows && previous.len() + rows <= MERGED_CHUNK_ROWS && previous.arrow().schema_ref() == schema
+            };
+            if !can_merge(previous, last.len()) { break; }
+            let last_pair = self.chunks.len() - 2;
+            let mut first = last_pair;
+            let mut rows = previous.len() + last.len();
+            let budget = previous.owned.reservation().budget();
+            for (_, earlier) in self.chunks[..last_pair].iter().rev() {
+                if !can_merge(earlier, rows) || !Arc::ptr_eq(budget, earlier.owned.reservation().budget()) { break; }
+                first -= 1;
+                rows += earlier.len();
+            }
+            match self.merge_chunk_suffix(first) {
+                Err(error) if first < last_pair && error.code == "rtdb/memory-budget-exceeded" => self.merge_chunk_suffix(last_pair)?,
+                result => result?,
+            }
         }
+        Ok(())
+    }
+    fn merge_chunk_suffix(&mut self, first: usize) -> Result<()> {
+        let chunks = &self.chunks[first..];
+        let (start, oldest) = &chunks[0];
+        let schema = oldest.arrow().schema_ref();
+        let budget = oldest.owned.reservation().budget();
+        let bound = chunks.iter().try_fold(4096usize, |bytes, (_, batch)| bytes.checked_add(batch.arrow().get_array_memory_size()))
+            .ok_or_else(|| invalid("Merged live chunk exceeds addressable memory"))?;
+        let mut reservation = budget.reserve(bound)?;
+        let merged = arrow_select::concat::concat_batches(schema, chunks.iter().map(|(_, batch)| batch.arrow())).map_err(invalid)?;
+        // Concatenating a dense union sizes every leg for all of its rows, so the merge can outgrow its inputs.
+        let lease = Arc::get_mut(&mut reservation).ok_or_else(|| invalid("A merged chunk's charge is shared"))?;
+        lease.grow_to(lease.bytes().max(merged.get_array_memory_size()))?;
+        let merged = IndexBatch::from_owned(OwnedBatch::with_reservation(merged, reservation)?)?;
+        let start = *start;
+        self.chunks.truncate(first);
+        self.chunks.push((start, merged));
         Ok(())
     }
     pub fn ordered_events(&self) -> Result<Vec<EventRow<RowSource>>> {
@@ -368,6 +388,7 @@ pub struct StagedWrite {
     predecessor: Option<TransactionKey>,
     block_index: BlockIndex,
     tables: BTreeMap<TableRef, TableWrite>,
+    segments: OnceLock<Vec<(TableRef, Arc<LiveTable>)>>,
 }
 impl StagedWrite {
     pub fn new(tx_key: TransactionKey, predecessor: Option<TransactionKey>, block_index: BlockIndex, tables: BTreeMap<TableRef, TableWrite>) -> Result<Self> {
@@ -379,13 +400,21 @@ impl StagedWrite {
                 return Err(invalid("Staged event has another transaction's system time"));
             }
         }
-        Ok(Self { tx_key, predecessor, block_index, tables })
+        Ok(Self { tx_key, predecessor, block_index, tables, segments: OnceLock::new() })
     }
     pub fn tx_key(&self) -> TransactionKey { self.tx_key }
     pub fn predecessor(&self) -> Option<TransactionKey> { self.predecessor }
     pub fn block_index(&self) -> BlockIndex { self.block_index }
     pub fn tables(&self) -> &BTreeMap<TableRef, TableWrite> { &self.tables }
     pub fn row_count(&self) -> Result<u64> { self.tables.values().try_fold(0u64, |count, write| count.checked_add(write.row_count() as u64).ok_or_else(|| invalid("Transaction row count overflow"))) }
+    pub(crate) fn segments(&self) -> Result<&[(TableRef, Arc<LiveTable>)]> {
+        if let Some(segments) = self.segments.get() { return Ok(segments); }
+        let segments = self.tables.iter().map(|(table, write)| {
+            let segment = LiveTable::new(table.clone(), self.block_index, TrieConfig::default()).append(write, self.tx_key.system_time)?;
+            Ok((table.clone(), Arc::new(segment)))
+        }).collect::<Result<_>>()?;
+        Ok(self.segments.get_or_init(|| segments))
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -732,6 +761,35 @@ mod row_column_type_tests {
 mod chunk_tests {
     use super::*;
     use rtdb_types::EntityId;
+
+    #[test]
+    fn a_merge_suffix_fits_without_admitting_intermediate_batches() {
+        let memory = MemoryBudget::new(1 << 27);
+        let mut live = LiveTable::new(TableRef::new("public", "docs"), BlockIndex(0), TrieConfig::default());
+        for count in [2048, 1024, 512, 512] {
+            let start = live.row_count;
+            let events = (start..start + count).map(|row| {
+                let id = i64::from(row);
+                StoredEvent { iid: EntityId::Integer(id).iid(), system_from: Timestamp(id), valid_time: Interval::ALL,
+                    operation: StoredOperation::Put(StructFields::from([("_id".into(), Value::I64(id)), ("v".into(), Value::Utf8(id.to_string()))])), recency: None }
+            }).collect::<Vec<_>>();
+            let batch = IndexBatch::copy_events(&events, &StructFields::new(), &memory).unwrap();
+            live.chunks.push((start, batch));
+            live.row_count += count;
+        }
+        let held = live.clone();
+        let available = live.batches().map(|batch| batch.arrow().get_array_memory_size()).sum::<usize>()
+            + IndexBatch::header_bytes(live.row_count as usize).unwrap() + 4096;
+        let _remaining = memory.reserve(memory.limit_bytes() - memory.used_bytes() - available).unwrap();
+
+        live.merge_small_chunks().unwrap();
+
+        assert_eq!(live.batches().map(|batch| batch.len()).collect::<Vec<_>>(), [4096]);
+        assert_eq!(held.batches().map(|batch| batch.len()).collect::<Vec<_>>(), [2048, 1024, 512, 512]);
+        for row in [0, 2047, 2048, 3071, 3072, 3583, 3584, 4095] {
+            assert_eq!(live.header(row).unwrap(), held.header(row).unwrap());
+        }
+    }
 
     #[test]
     fn a_table_written_a_row_per_transaction_is_held_in_merged_chunks_with_its_rows_in_place() {
