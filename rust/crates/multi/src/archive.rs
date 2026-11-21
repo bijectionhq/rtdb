@@ -559,7 +559,7 @@ pub async fn capture(
                 remote_disposal: None,
             });
         }
-        record.storage_regions.insert(region);
+        record.storage_regions.insert(region, rtdb_directory::StorageRegion::Open);
         Ok(())
     }).await;
     let record = match admitted {
@@ -577,7 +577,9 @@ pub async fn capture(
     let point = capture_point(&record, deployment, operation, &binding)?;
     let result = capture_registered(directory, storage, destination, keys, &record, point, io.clone()).await;
     io.close_and_wait().await;
-    if io.has_unknown_publication() {
+    let pending = io.pending_publications();
+    if !pending.is_empty() {
+        crate::store::close_remote_region(directory, &id, region, Some(operation), &pending).await?;
         return Err(unavailable("The archive provider's publication is unconfirmed"));
     }
     drop(io);

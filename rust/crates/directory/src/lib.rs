@@ -146,9 +146,9 @@ pub struct DeploymentRecord {
     /// Every journal endpoint authorized to receive this installation's
     /// replica stream, retained before a new ensemble receives a copy.
     pub replica_journals: BTreeSet<String>,
-    /// Open serving storage regions. The region owner removes its admission
-    /// only when all of its provider operations have drained.
-    pub storage_regions: BTreeSet<uuid::Uuid>,
+    /// Serving and archival storage admissions, retained until the owner
+    /// drains its I/O and any ambiguous publications are confirmed.
+    pub storage_regions: BTreeMap<uuid::Uuid, StorageRegion>,
     /// How many ranks of the affinity order may serve reads.
     pub read_width: u32,
     pub activation_crashes: u32,
@@ -181,6 +181,18 @@ pub struct DeploymentRecord {
     pub checkpoint_captures: BTreeMap<uuid::Uuid, CheckpointCapture>,
     pub archive_retirement: Option<ArchiveRetirement>,
     pub version: Version,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum StorageRegion {
+    Open,
+    /// The owner joined all I/O and retained each ambiguous write by the
+    /// exact provider publication identity and key. No new I/O can start.
+    ClosedRemote {
+        archive: Option<uuid::Uuid>,
+        publications: BTreeMap<uuid::Uuid, String>,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -259,7 +271,7 @@ impl DeploymentRecord {
     pub fn new(name: impl Into<String>, org: impl Into<String>, ensemble: Vec<MemberId>, now_ms: i64) -> Self {
         let id = uuid::Uuid::new_v4().to_string();
         Self { lineage: id.clone(), id, name: name.into(), org: org.into(), incarnation: 1, lifecycle: Lifecycle::Live, epoch: 0, holder: None,
-            ensemble, replica_journals: BTreeSet::new(), storage_regions: BTreeSet::new(), read_width: 1, activation_crashes: 0, created_at_ms: now_ms, move_intent: None, log_epoch: 0, parent: None, move_from: None, linearizable_reads: false, checkpoint: None, moved_at_ms: None, cell_transfer: None, disposal: None, checkpoint_recovery: None, checkpoint_captures: BTreeMap::new(), archive_retirement: None, version: 0 }
+            ensemble, replica_journals: BTreeSet::new(), storage_regions: BTreeMap::new(), read_width: 1, activation_crashes: 0, created_at_ms: now_ms, move_intent: None, log_epoch: 0, parent: None, move_from: None, linearizable_reads: false, checkpoint: None, moved_at_ms: None, cell_transfer: None, disposal: None, checkpoint_recovery: None, checkpoint_captures: BTreeMap::new(), archive_retirement: None, version: 0 }
     }
 
     pub fn can_fork(&self) -> bool {

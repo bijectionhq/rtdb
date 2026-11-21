@@ -38,6 +38,13 @@ impl RemoteStore {
     /// This closes the complete shared region when the store was opened with `new_in`.
     pub async fn close_and_wait(&self) { self.io.close_and_wait().await; }
 
+    /// Checks whether a fresh provider observation is the result of this
+    /// exact conditional publication. An absent object is still uncertain.
+    pub async fn publication_confirmed(&self, key: &ObjectKey, attempt: uuid::Uuid) -> Result<bool> {
+        let (objects, key) = (Arc::clone(&self.objects), key.clone());
+        self.io.run_async(async move { objects.publication_confirmed(&key, attempt).await }).await
+    }
+
     /// Copies between explicit roots backed by the same provider client.
     /// Distinct client instances are rejected before I/O, even when they name the same bucket.
     /// The provider must support conditional copy; existing destinations are accepted only when their bytes match.
@@ -167,6 +174,8 @@ impl RemoteObjects {
     }
 }
 
+fn publication_attribute() -> Attribute { Attribute::Metadata("rtdb-publication".into()) }
+
 fn provider_error(key: &ObjectKey, error: object_store::Error) -> Error {
     match error {
         object_store::Error::NotFound { .. } => Error::MissingObject(key.to_string()),
@@ -201,31 +210,20 @@ impl RemoteObjects {
 
     async fn put(&self, key: &ObjectKey, bytes: Bytes, authority: Option<&IoRegion>) -> Result<()> {
         let mut options = PutOptions { mode: PutMode::Create, ..Default::default() };
-        let witness = authority.map(|_| {
-            let attribute = Attribute::Metadata("rtdb-publication".into());
-            let value = uuid::Uuid::new_v4().to_string();
-            options.attributes.insert(attribute.clone(), value.clone().into());
-            (attribute, value)
+        let publication = authority.map(|io| {
+            let attempt = uuid::Uuid::new_v4();
+            options.attributes.insert(publication_attribute(), attempt.to_string().into());
+            (attempt, io.publication(attempt, key.clone()))
         });
-        let publication = authority.map(IoRegion::publication);
-        let path = self.path(key);
-        let response = self.client.put_opts(&path, bytes.clone().into(), options).await;
-        if let Some(publication) = publication {
+        let response = self.client.put_opts(&self.path(key), bytes.clone().into(), options).await;
+        if let Some((attempt, publication)) = publication {
             if matches!(&response, Ok(_) | Err(object_store::Error::AlreadyExists { .. }
                 | object_store::Error::Precondition { .. } | object_store::Error::PermissionDenied { .. }))
             {
                 publication.confirm();
-            } else if let Some((attribute, value)) = witness {
-                // An identical object from another attempt cannot settle a
-                // still-in-flight write. Match this request's metadata from
-                // the same atomic PUT. HEAD failures leave the hold pending.
-                let head = self.client.get_opts(&path, GetOptions::new().with_head(true)).await;
-                if head.is_ok_and(|object| {
-                    object.attributes.get(&attribute).is_some_and(|receipt| receipt.as_ref() == value.as_str())
-                }) {
-                    publication.confirm();
-                    return Ok(());
-                }
+            } else if matches!(self.publication_confirmed(key, attempt).await, Ok(true)) {
+                publication.confirm();
+                return Ok(());
             }
         }
         match response {
@@ -233,6 +231,18 @@ impl RemoteObjects {
             Err(object_store::Error::AlreadyExists { .. } | object_store::Error::Precondition { .. }) => {
                 if self.get(key).await? == bytes { Ok(()) } else { Err(Error::ConflictingObject(key.to_string())) }
             }
+            Err(error) => Err(provider_error(key, error)),
+        }
+    }
+
+    async fn publication_confirmed(&self, key: &ObjectKey, attempt: uuid::Uuid) -> Result<bool> {
+        match self.client.get_opts(&self.path(key), GetOptions::new().with_head(true)).await {
+            Ok(object) => {
+                let expected = attempt.to_string();
+                Ok(object.attributes.get(&publication_attribute())
+                    .is_some_and(|receipt| receipt.as_ref() == expected.as_str()))
+            }
+            Err(object_store::Error::NotFound { .. }) => Ok(false),
             Err(error) => Err(provider_error(key, error)),
         }
     }

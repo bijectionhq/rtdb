@@ -561,7 +561,7 @@ pub async fn finish_disposal(directory: &dyn Directory, storage: &CellStorage, k
         Anomaly::incorrect("rtdb.multi/unknown-installation", format!("No installation has ID {id}"))
     })?;
     if fenced.lifecycle == Lifecycle::Deleting && !fenced.storage_regions.is_empty() {
-        crate::store::reconcile_local_regions(directory, storage, keys, &fenced).await?;
+        crate::store::reconcile_storage_regions(directory, storage, keys, &fenced).await?;
         fenced = directory.deployment(id).await?.ok_or_else(|| {
             Anomaly::incorrect("rtdb.multi/unknown-installation", format!("No installation has ID {id}"))
         })?;
@@ -641,7 +641,7 @@ pub(crate) async fn await_storage_drain(directory: &dyn Directory, storage: &Cel
         if start.elapsed() >= CONTROL_TIMEOUT {
             return Err(pending);
         }
-        crate::store::reconcile_local_regions(directory, storage, keys, &current).await?;
+        crate::store::reconcile_storage_regions(directory, storage, keys, &current).await?;
         tokio::time::sleep(Duration::from_millis(100)).await;
         current = directory.deployment(&fence.id).await?
             .filter(|current| current.epoch == fence.epoch && (

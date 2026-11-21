@@ -64,16 +64,16 @@ impl S3Config {
     /// Credential aliases are resolved at opening; default credentials refresh during requests.
     /// The owner closes and joins `io` after store consumers finish and before shutting down the runtime.
     pub async fn open(&self, storage_root: &ObjectKey, remotes: &dyn S3CredentialResolver, io: Arc<IoRegion>) -> Result<Arc<dyn ObjectStore>> {
-        self.open_store(storage_root, remotes, io, false).await
+        Ok(self.open_store(storage_root, remotes, io, false).await?)
     }
 
     /// Opens the cell's immutable namespace. Any result that leaves an
     /// individual write uncertain belongs to the region's retirement owner.
-    pub async fn open_cell(&self, storage_root: &ObjectKey, remotes: &dyn S3CredentialResolver, io: Arc<IoRegion>) -> Result<Arc<dyn ObjectStore>> {
+    pub async fn open_cell(&self, storage_root: &ObjectKey, remotes: &dyn S3CredentialResolver, io: Arc<IoRegion>) -> Result<Arc<RemoteStore>> {
         self.open_store(storage_root, remotes, io, true).await
     }
 
-    async fn open_store(&self, storage_root: &ObjectKey, remotes: &dyn S3CredentialResolver, io: Arc<IoRegion>, cell: bool) -> Result<Arc<dyn ObjectStore>> {
+    async fn open_store(&self, storage_root: &ObjectKey, remotes: &dyn S3CredentialResolver, io: Arc<IoRegion>, cell: bool) -> Result<Arc<RemoteStore>> {
         if self.bucket.is_empty() { return Err(Anomaly::incorrect("xtdb.aws/invalid-config", "S3 bucket is empty")); }
         let prefix = self.object_prefix(storage_root)?;
         let credentials = self.resolve_credentials(remotes)?;

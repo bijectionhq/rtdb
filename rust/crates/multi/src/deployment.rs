@@ -27,11 +27,16 @@ impl CellStorage {
     pub async fn bucket(&self, io: std::sync::Arc<rtdb_storage::IoRegion>) -> rtdb_types::Result<crate::reference::Bucket> {
         match self {
             CellStorage::Local { root } => Ok(std::sync::Arc::new(rtdb_storage::LocalStore::open_in(root, io)?)),
-            CellStorage::S3 { config } => {
-                let root = rtdb_storage::ObjectKey::new(S3_CELL_ROOT).map_err(rtdb_types::Anomaly::from)?;
-                config.open_cell(&root, &std::collections::BTreeMap::<String, rtdb_s3::S3Credentials>::new(), io).await
-            }
+            CellStorage::S3 { config } => Ok(Self::s3_bucket(config, io).await?),
         }
+    }
+
+    pub(crate) async fn s3_bucket(
+        config: &rtdb_s3::S3Config,
+        io: std::sync::Arc<rtdb_storage::IoRegion>,
+    ) -> rtdb_types::Result<std::sync::Arc<rtdb_storage::remote::RemoteStore>> {
+        let root = rtdb_storage::ObjectKey::new(S3_CELL_ROOT)?;
+        config.open_cell(&root, &std::collections::BTreeMap::<String, rtdb_s3::S3Credentials>::new(), io).await
     }
 
     pub(crate) async fn purge_serving_inventory(
