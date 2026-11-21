@@ -446,6 +446,9 @@ contract LogService {
     @invariant TrimFollowsPublication
         -- A deployment's records at or below its checkpoint's lsn may be trimmed; nothing above it may be.
         -- The boundary must belong to this deployment's log, including when its first readable block came from a parent.
+        -- A holder saves an agreed digest through the last position it intends to discard before requesting a trim.
+        -- The directory advances the digest only when a durable write quorum independently computes the same committed history.
+        -- A replica that cannot extend the saved digest across contiguous positions cannot contribute proof.
         -- A physical segment is reclaimed once every deployment's records in it are trimmed.
         -- A deployment whose tail pins a segment past log_max_retention is force-flushed (FlushOnRetention).
 
@@ -1188,6 +1191,10 @@ rule AuditRetainedReplicaHistory {
                 ReplicaDivergenceReported(deployment, interval)
         if StrictAuditRequested(deployment) and not WriteQuorumCompared(deployment, interval):
             AuditRejectedForInsufficientEvidence(deployment)
+        if SavedHistoryAnchor(deployment) != null:
+            HistoryAnchorReported(deployment)
+            if ContiguousSuffixVerifiedByDurableQuorum(deployment):
+                ContinuedHistoryDigestReported(deployment)
 }
 
 rule VerifyRetainedJournalOffline {

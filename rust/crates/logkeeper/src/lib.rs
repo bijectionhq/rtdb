@@ -10,7 +10,7 @@ mod protocol;
 mod local;
 mod server;
 
-pub use client::{CopyFrom, Loglet, QuorumLog, RetainedAudit, StreamConfig, audit_retained, copy_retained, drop_stream, open_reader, open_reader_on, open_writer, open_writer_on, retire, seal, trim};
+pub use client::{CopyFrom, Loglet, QuorumLog, RetainedAudit, StreamConfig, audit_retained, certify_committed_prefix, copy_retained, drop_stream, open_reader, open_reader_on, open_writer, open_writer_on, retire, seal, trim};
 pub use local::LocalListener;
 pub use server::{JournalDigest, PreparedJournal, ServerOptions, inspect_retained, inspect_retained_with_prefix, serve};
 

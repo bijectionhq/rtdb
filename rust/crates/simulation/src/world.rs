@@ -533,5 +533,6 @@ fn describe_reply(body: &ResponseBody) -> String {
         ResponseBody::Sealed(sealed) => format!("sealed (promised {}, synced {}, trim {}, last {}, commit {})", sealed.promised, sealed.synced, sealed.trim_lsn, sealed.last_lsn, sealed.commit_lsn),
         ResponseBody::Entries(entries) => format!("entries {:?} (trim {}, last {})", entries.entries.iter().map(|entry| entry.lsn).collect::<Vec<_>>(), entries.trim_lsn, entries.last_lsn),
         ResponseBody::Failed(failed) => format!("failed: {}", failed.message),
+        ResponseBody::PageDigest(page) => format!("digest through {}", page.through_lsn),
     }
 }

@@ -669,6 +669,16 @@ fn read_payload(file: &File, path: &Path, lsn: i64, location: Location) -> Resul
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct JournalDigest { pub stream: String, pub interval: [i64; 2], pub digest: String }
 
+impl JournalDigest {
+    pub fn from_digest_bytes(stream: String, interval: [i64; 2], digest: [u8; 32]) -> Self {
+        Self { stream, interval, digest: RetainedChain::from_bytes(digest).digest() }
+    }
+
+    pub fn digest_bytes(&self) -> Option<[u8; 32]> {
+        RetainedChain::continue_from(&self.digest).map(|digest| digest.bytes())
+    }
+}
+
 /// Reads a stopped logkeeper's journal without changing its files.
 pub fn inspect_retained(data_dir: &Path, stream: &str, requested: Option<[i64; 2]>) -> Result<Option<JournalDigest>> {
     inspect_retained_with_prefix(data_dir, stream, requested, None)

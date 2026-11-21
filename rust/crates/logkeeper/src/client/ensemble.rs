@@ -2,7 +2,8 @@
 
 use super::connection::{Connection, connection, remote};
 use super::StreamConfig;
-use crate::protocol::{Accepted, Check, Commit, DropStream, Entries, Entry, Fetch, Overwrite, Read, Refused, RequestBody, ResponseBody, Retire, Seal, Sealed, Trim};
+use crate::protocol::{Accepted, Check, Commit, DigestPage, DropStream, Entries, Entry, Fetch, Overwrite, PageDigest, Read, Refused, RequestBody, ResponseBody, Retire, Seal, Sealed, Trim};
+use bytes::Bytes;
 use rtdb_storage::{Error, Result};
 use std::sync::Arc;
 use std::time::Duration;
@@ -97,6 +98,15 @@ impl Ensemble {
         let body = RequestBody::Fetch(Fetch { stream: self.stream(), from_lsn: from, to_lsn: to, max_entries, max_bytes: MAXIMUM_BATCH_BYTES });
         let reply = self.links[server].call(body).await;
         self.entries(server, reply)
+    }
+
+    pub async fn digest_page(&self, server: usize, from_lsn: i64, through_lsn: i64, preceding_digest: Option<[u8; 32]>) -> Result<PageDigest> {
+        let preceding_digest = preceding_digest.map_or_else(Bytes::new, |digest| Bytes::copy_from_slice(&digest));
+        let request = RequestBody::DigestPage(DigestPage { stream: self.stream(), from_lsn, through_lsn, preceding_digest });
+        match self.links[server].call(request).await? {
+            ResponseBody::PageDigest(page) => Ok(page),
+            other => Err(self.unexpected(server, other)),
+        }
     }
 
     pub async fn read(&self, server: usize, from: i64, max_entries: u32, wait: Duration) -> Result<Entries> {

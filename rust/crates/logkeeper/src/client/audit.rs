@@ -7,6 +7,7 @@ use rtdb_types::{Anomaly, AnomalyCategory, Result};
 use super::ensemble::{Ensemble, MAXIMUM_BATCH_ENTRIES};
 use super::{StreamConfig, validate};
 use crate::history::RetainedChain;
+use crate::server::JournalDigest;
 
 /// Fingerprints of the same committed range on all responding members of an ensemble.
 #[derive(Debug, Default)]
@@ -53,6 +54,74 @@ pub async fn audit_retained(config: &StreamConfig) -> Result<RetainedAudit> {
         }
     }
     Ok(audit)
+}
+
+/// Obtains agreement from a durable write quorum for the committed interval ending at `through`.
+/// A supplied prefix must belong to the same stream and adjoin the interval to hash.
+pub async fn certify_committed_prefix(config: &StreamConfig, through: i64, prefix: Option<&JournalDigest>) -> Result<JournalDigest> {
+    validate(config)?;
+    if through < 0 { return Err(Anomaly::incorrect("rtdb.logkeeper/audit-range", "A journal position must be nonnegative")); }
+    let ensemble = Ensemble::new(config.clone());
+    let probes = (0..ensemble.len()).map(|server| {
+        let ensemble = &ensemble;
+        async move { (server, ensemble.read(server, 0, 0, Duration::ZERO).await) }
+    }).collect::<FuturesUnordered<_>>();
+    let mut windows: Vec<(usize, i64)> = probes.collect::<Vec<_>>().await.into_iter().filter_map(|(server, probe)| {
+        let bounds = probe.ok()?;
+        (bounds.commit_lsn >= through && bounds.trim_lsn < through)
+            .then_some((server, bounds.trim_lsn.saturating_add(1).max(0)))
+    }).collect();
+    windows.sort_unstable_by_key(|(_, first)| *first);
+
+    let insufficient = || Anomaly::new(AnomalyCategory::Unavailable, "rtdb.logkeeper/audit-quorum", format!(
+        "Fewer than {} durable replicas could prove the prefix through {through}", config.write_quorum));
+    let (start, from, digest) = if let Some(prefix) = prefix {
+        let [start, end] = prefix.interval;
+        if prefix.stream != config.stream || start < 0 || end < start || end >= through {
+            return Err(Anomaly::incorrect("rtdb.logkeeper/audit-prefix", "The prefix must name this stream and precede the requested position"));
+        }
+        let digest = RetainedChain::continue_from(&prefix.digest)
+            .ok_or_else(|| Anomaly::incorrect("rtdb.logkeeper/audit-prefix", "The prefix digest must be a lowercase SHA-256 value"))?;
+        (start, end + 1, Some(digest.bytes()))
+    } else {
+        let first = windows.get(config.write_quorum - 1).ok_or_else(&insufficient)?.1;
+        (first, first, None)
+    };
+    let mut proofs = windows.into_iter().filter(|(_, first)| *first <= from).map(|(server, _)| {
+        let ensemble = &ensemble;
+        async move { durable_chain(ensemble, server, from, through, digest).await }
+    }).collect::<FuturesUnordered<_>>();
+    let mut accepted = None;
+    let mut agreeing = 0;
+    while let Some(proof) = proofs.next().await {
+        let digest = match proof {
+            Ok(digest) => digest,
+            Err(error) if error.category == AnomalyCategory::Unavailable => continue,
+            Err(error) => return Err(error),
+        };
+        if accepted.as_ref().is_some_and(|first| *first != digest) {
+            return Err(Anomaly::fault("rtdb.logkeeper/audit-divergence", format!("Replicas disagree on committed positions {from} through {through}")));
+        }
+        accepted = Some(digest);
+        agreeing += 1;
+    }
+    let digest = accepted.filter(|_| agreeing >= config.write_quorum).ok_or_else(insufficient)?;
+    Ok(JournalDigest { stream: config.stream.clone(), interval: [start, through], digest })
+}
+
+async fn durable_chain(ensemble: &Ensemble, server: usize, mut from: i64, through: i64, mut preceding_digest: Option<[u8; 32]>) -> Result<String> {
+    loop {
+        let page = ensemble.digest_page(server, from, through, preceding_digest).await?;
+        let Ok(digest) = <[u8; 32]>::try_from(page.digest.as_ref()) else {
+            return Err(Anomaly::fault("rtdb.logkeeper/audit-proof", "A replica returned an invalid digest"));
+        };
+        if page.through_lsn < from || page.through_lsn > through {
+            return Err(Anomaly::fault("rtdb.logkeeper/audit-proof", "A replica returned an invalid digest interval"));
+        }
+        if page.through_lsn == through { return Ok(RetainedChain::from_bytes(digest).digest()); }
+        preceding_digest = Some(digest);
+        from = page.through_lsn + 1;
+    }
 }
 
 fn quorum_overlap(windows: &[(usize, [i64; 2])], quorum: usize) -> Option<[i64; 2]> {

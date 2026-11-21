@@ -1012,7 +1012,13 @@ Running alongside every stage from stage 2 onwards, and concluding the branch:
    The saved report must name the same stream and end immediately before the retained interval being verified.
    Compare the result with an independently known full-chain digest using `--expect DIGEST`.
    The supplied report serves as evidence for the discarded prefix.
-   Automatically recording an authoritative prefix before each trim remains open.
+   Before trimming a published block’s replica prefix, the holder asks a durable write quorum for matching SHA-256 digests and records the agreed interval in the directory.
+   The logkeepers hash bounded pages locally after the selected commit is durable, returning only the page digest and end position.
+   The next trim extends that saved prefix, and a cell move carries it with the deployment.
+   An installation whose prefix was trimmed before this feature can certify history only from its first available quorum-retained record.
+   `audit` reports the recorded prefix as `replica_anchor` and, when a durable quorum can verify the adjacent suffix, reports the extended digest as `replica_continued_digest`.
+   Save the `replica_anchor` object on its own as the offline command’s `--prefix-report`, and use the extended digest as `--expect`.
+   Install the new directory, logkeeper and node versions together before relying on continuous anchors.
 4. A staging cell holds ten million deployments (300 bytes each when parked) under Zipf activity.
 
 **Local parked-density measurement**

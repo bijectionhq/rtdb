@@ -1495,6 +1495,15 @@ async fn erase_inventory(storage: &CellStorage, bucket: &dyn rtdb_storage::Objec
     storage.purge_inventory(&rtdb_storage::ObjectKey::new(&storage_prefix)?).await
 }
 
+/// A saved replica prefix that can be passed to the offline verifier.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct AuditAnchor {
+    pub stream: String,
+    pub root_incarnation: u64,
+    pub interval: [i64; 2],
+    pub digest: String,
+}
+
 /// What auditing a deployment's history found (`NoTwoWritersHaveEffect`, `SystemTimeRises`).
 #[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
 pub struct AuditReport {
@@ -1512,6 +1521,10 @@ pub struct AuditReport {
     pub required_replica_quorum: usize,
     #[serde(default)]
     pub unavailable_replicas: BTreeMap<String, String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub replica_anchor: Option<AuditAnchor>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub replica_continued_digest: Option<String>,
 }
 
 /// Audits the retained replica stream and compares the common committed range on its reachable replicas.
@@ -1556,6 +1569,17 @@ pub async fn audit(directory: &dyn Directory, keys: &dyn KeyService, name: &str,
     if let Some(first) = digests.next() && digests.any(|digest| digest != first) {
         let [from, through] = retained.interval.expect("digests describe an interval");
         report.violations.push(format!("replicas disagree on committed positions {from} through {through}"));
+    }
+    if let Some(anchor) = current.replica_anchor {
+        let prefix = rtdb_logkeeper::JournalDigest::from_digest_bytes(stream.stream.clone(), anchor.interval, anchor.digest);
+        if let Some([_, through]) = retained.interval.filter(|[_, through]| *through > anchor.interval[1]) {
+            match rtdb_logkeeper::certify_committed_prefix(&stream, through, Some(&prefix)).await {
+                Ok(proof) => report.replica_continued_digest = Some(proof.digest),
+                Err(error) if error.category == AnomalyCategory::Unavailable => (),
+                Err(error) => return Err(error),
+            }
+        }
+        report.replica_anchor = Some(AuditAnchor { stream: prefix.stream, root_incarnation: anchor.root_incarnation, interval: prefix.interval, digest: prefix.digest });
     }
     report.replica_interval = retained.interval;
     report.replica_digests = retained.digests;

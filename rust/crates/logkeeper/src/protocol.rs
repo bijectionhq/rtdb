@@ -144,6 +144,18 @@ pub(crate) struct DropStream {
     pub epoch: u64,
 }
 
+#[derive(Clone, PartialEq, Message)]
+pub(crate) struct DigestPage {
+    #[prost(string, tag = "1")]
+    pub stream: String,
+    #[prost(sint64, tag = "2")]
+    pub from_lsn: i64,
+    #[prost(sint64, tag = "3")]
+    pub through_lsn: i64,
+    #[prost(bytes = "bytes", tag = "4")]
+    pub preceding_digest: Bytes,
+}
+
 #[derive(Clone, PartialEq, prost::Oneof)]
 pub(crate) enum RequestBody {
     #[prost(message, tag = "2")]
@@ -166,13 +178,15 @@ pub(crate) enum RequestBody {
     DropStream(DropStream),
     #[prost(message, tag = "11")]
     Retire(Retire),
+    #[prost(message, tag = "12")]
+    DigestPage(DigestPage),
 }
 
 #[derive(Clone, PartialEq, Message)]
 pub(crate) struct Request {
     #[prost(uint64, tag = "1")]
     pub id: u64,
-    #[prost(oneof = "RequestBody", tags = "2, 3, 4, 5, 6, 7, 8, 9, 10, 11")]
+    #[prost(oneof = "RequestBody", tags = "2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12")]
     pub body: Option<RequestBody>,
 }
 
@@ -230,6 +244,14 @@ pub struct Failed {
     pub message: String,
 }
 
+#[derive(Clone, PartialEq, Message)]
+pub struct PageDigest {
+    #[prost(sint64, tag = "1")]
+    pub through_lsn: i64,
+    #[prost(bytes = "bytes", tag = "2")]
+    pub digest: Bytes,
+}
+
 #[derive(Clone, PartialEq, prost::Oneof)]
 pub enum ResponseBody {
     #[prost(message, tag = "2")]
@@ -242,13 +264,15 @@ pub enum ResponseBody {
     Entries(Entries),
     #[prost(message, tag = "6")]
     Failed(Failed),
+    #[prost(message, tag = "7")]
+    PageDigest(PageDigest),
 }
 
 #[derive(Clone, PartialEq, Message)]
 pub(crate) struct Response {
     #[prost(uint64, tag = "1")]
     pub id: u64,
-    #[prost(oneof = "ResponseBody", tags = "2, 3, 4, 5, 6")]
+    #[prost(oneof = "ResponseBody", tags = "2, 3, 4, 5, 6, 7")]
     pub body: Option<ResponseBody>,
 }
 

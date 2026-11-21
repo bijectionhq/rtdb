@@ -181,6 +181,13 @@ async fn connection(
                     let _ = replies.send(Response { id, body: Some(body) });
                 });
             }
+            Some(RequestBody::DigestPage(page)) => {
+                let (store, replies) = (Arc::clone(&store), replies.clone());
+                tasks.spawn(async move {
+                    let body = store.digest_page(page).await;
+                    let _ = replies.send(Response { id, body: Some(body) });
+                });
+            }
             Some(RequestBody::Read(read)) => {
                 let (store, replies, cancellation) = (Arc::clone(&store), replies.clone(), cancellation.clone());
                 tasks.spawn(async move {

@@ -3,7 +3,9 @@
 use super::journal::{Captured, Journal, Recovered, Work, Write};
 use super::payload::{Item, Source, Stored};
 use super::state::{Decision, StreamState, Window};
-use crate::protocol::{Entries, Entry, Failed, MAXIMUM_FRAME_BYTES, RequestBody, ResponseBody};
+use crate::history::RetainedChain;
+use crate::protocol::{DigestPage, Entries, Entry, Failed, MAXIMUM_FRAME_BYTES, PageDigest, RequestBody, ResponseBody};
+use bytes::Bytes;
 use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -14,6 +16,9 @@ use tokio_util::sync::CancellationToken;
 const COMPACTION_SLACK_BYTES: u64 = 1 << 20;
 const PENDING_WRITE_BYTES: usize = MAXIMUM_FRAME_BYTES + 1024;
 const MINIMUM_WRITE_CHARGE: usize = 1024;
+const DIGEST_PAGE_ENTRIES: usize = 1024;
+const DIGEST_PAGE_BYTES: usize = 4 << 20;
+const CONCURRENT_DIGEST_PAGES: usize = 2;
 
 /// A stream's state; a stream with no waiting reader owns no task and no timer.
 pub(crate) struct Slot {
@@ -30,6 +35,7 @@ pub(crate) struct Store {
     streams: Mutex<HashMap<String, Arc<Slot>>>,
     queue: mpsc::UnboundedSender<Work>,
     pending_writes: Arc<Semaphore>,
+    digest_pages: Semaphore,
 }
 
 pub(crate) enum Outcome {
@@ -46,7 +52,7 @@ impl Store {
             let slot = Slot { id: stream.id, name: stream.name.clone(), state: Mutex::new(stream.state), progressed: Notify::new() };
             (stream.name, Arc::new(slot))
         }).collect();
-        Self { journal, streams: Mutex::new(streams), queue, pending_writes: Arc::new(Semaphore::new(PENDING_WRITE_BYTES)) }
+        Self { journal, streams: Mutex::new(streams), queue, pending_writes: Arc::new(Semaphore::new(PENDING_WRITE_BYTES)), digest_pages: Semaphore::new(CONCURRENT_DIGEST_PAGES) }
     }
 
     fn slot(&self, name: &str) -> Arc<Slot> {
@@ -74,7 +80,7 @@ impl Store {
             RequestBody::Seal(seal) => (seal.stream, Box::new(move |state| state.seal(seal.epoch))),
             RequestBody::Trim(trim) => (trim.stream, Box::new(move |state| state.trim(trim.through_lsn))),
             RequestBody::DropStream(drop) => (drop.stream, Box::new(move |state| state.drop_stream(drop.epoch))),
-            RequestBody::Read(_) | RequestBody::Fetch(_) | RequestBody::Check(_) | RequestBody::Retire(_) => return Outcome::Now(failed("not a direct mutation")),
+            RequestBody::Read(_) | RequestBody::Fetch(_) | RequestBody::Check(_) | RequestBody::Retire(_) | RequestBody::DigestPage(_) => return Outcome::Now(failed("not a direct mutation")),
         };
         let slot = self.slot(&stream);
         let mut state = slot.state.lock();
@@ -169,6 +175,54 @@ impl Store {
             Ok(Ok(entries)) => ResponseBody::Entries(entries),
             Ok(Err(error)) => failed(format!("reading the segments failed: {error}")),
             Err(error) => failed(format!("reading the segments failed: {error}")),
+        }
+    }
+
+    pub async fn digest_page(&self, page: DigestPage) -> ResponseBody {
+        if !self.journal.is_durable() { return failed("history proofs require a durable journal"); }
+        if page.from_lsn < 0 || page.through_lsn < page.from_lsn {
+            return failed("invalid digest interval");
+        }
+        let mut chain = if page.preceding_digest.is_empty() {
+            RetainedChain::new(&page.stream, page.from_lsn)
+        } else if let Ok(digest) = <[u8; 32]>::try_from(page.preceding_digest.as_ref()) {
+            RetainedChain::from_bytes(digest)
+        } else {
+            return failed("invalid preceding digest");
+        };
+        let Ok(_page) = self.digest_pages.try_acquire() else { return failed("history proof capacity exhausted"); };
+        let Some(slot) = self.existing(&page.stream) else { return failed("the stream was not found"); };
+        let (window, durable) = {
+            let state = slot.state.lock();
+            if state.dropped || page.from_lsn <= state.trim || page.through_lsn > state.commit {
+                return failed("the digest interval is outside the committed retained window");
+            }
+            let window = self.select(&state, page.from_lsn, page.through_lsn, DIGEST_PAGE_ENTRIES, DIGEST_PAGE_BYTES);
+            let (done, durable) = oneshot::channel();
+            // A selected commit can still be queued for fsync. The barrier is ordered after that commit.
+            if self.queue.send(Work { write: Write::Events(Arc::clone(&slot), Vec::new()), done, _admission: None }).is_err() {
+                return failed("the journal has stopped");
+            }
+            (window, durable)
+        };
+        if !matches!(durable.await, Ok(Ok(()))) { return failed("the digest interval was not made durable"); }
+        let journal = Arc::clone(&self.journal);
+        match tokio::task::spawn_blocking(move || {
+            let entries = match journal.resolve(window) {
+                Ok(entries) => entries.entries,
+                Err(error) => return failed(error.to_string()),
+            };
+            let Some(last) = entries.last() else { return failed("the digest page is empty"); };
+            for (offset, entry) in entries.iter().enumerate() {
+                if page.from_lsn.checked_add(offset as i64) != Some(entry.lsn) {
+                    return failed("the digest page is not contiguous");
+                }
+                chain.append(entry);
+            }
+            ResponseBody::PageDigest(PageDigest { through_lsn: last.lsn, digest: Bytes::copy_from_slice(&chain.bytes()) })
+        }).await {
+            Ok(reply) => reply,
+            Err(error) => failed(error.to_string()),
         }
     }
 

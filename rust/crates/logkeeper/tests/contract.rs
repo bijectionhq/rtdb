@@ -29,6 +29,7 @@ async fn an_audit_distinguishes_equal_committed_positions_with_different_payload
     assert_eq!(report.digests.len(), 2);
     assert_ne!(report.digests[&stream.servers[0]], report.digests[&stream.servers[1]]);
     assert!(report.unavailable.is_empty());
+    assert_eq!(rtdb_logkeeper::certify_committed_prefix(&stream, 0, None).await.unwrap_err().code, "rtdb.logkeeper/audit-divergence");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -49,6 +50,54 @@ async fn a_reachable_empty_replica_does_not_hide_the_fsynced_quorum_from_an_audi
     assert_eq!(report.digests[&all.servers[0]], report.digests[&all.servers[1]]);
     assert_eq!(report.windows[&all.servers[2]], None);
     assert!(report.unavailable.is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_durable_quorum_proves_multiple_pages_and_continues_the_prefix_after_trim() {
+    use rtdb_logkeeper::{certify_committed_prefix, inspect_retained, trim};
+
+    let mut ensemble = Ensemble::start(3).await;
+    let stream = ensemble.config("durable-prefix");
+    let writer = open_writer(stream.clone(), 1, CancellationToken::new()).await.unwrap();
+    let mut receipts = Vec::new();
+    for position in 0..1050 {
+        receipts.push(writer.enqueue(Bytes::from(position.to_string()), Timestamp(position)).await.unwrap());
+    }
+    for receipt in receipts { receipt.durable().await.unwrap(); }
+    let wait_for_prefix = |through, prefix| {
+        let stream = &stream;
+        async move {
+            tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    match certify_committed_prefix(stream, through, prefix).await {
+                        Ok(proof) => break proof,
+                        Err(error) if error.code == "rtdb.logkeeper/audit-quorum" => tokio::time::sleep(Duration::from_millis(10)).await,
+                        Err(error) => panic!("{error}"),
+                    }
+                }
+            }).await.unwrap()
+        }
+    };
+    let prefix = wait_for_prefix(1024, None).await;
+    let full = wait_for_prefix(1049, None).await;
+    assert_eq!(prefix.interval, [0, 1024]);
+    assert_eq!(full.interval, [0, 1049]);
+    trim(&stream, LogOffset(1024)).await.unwrap();
+    assert_eq!(wait_for_prefix(1049, Some(&prefix)).await, full);
+
+    let mut wrong = prefix.clone();
+    wrong.stream = "another-deployment".into();
+    assert_eq!(certify_committed_prefix(&stream, 1049, Some(&wrong)).await.unwrap_err().code, "rtdb.logkeeper/audit-prefix");
+    wrong.stream.clone_from(&stream.stream);
+    wrong.interval[1] -= 1;
+    assert_eq!(certify_committed_prefix(&stream, 1049, Some(&wrong)).await.unwrap_err().code, "rtdb.logkeeper/audit-quorum");
+    drop(writer);
+    ensemble.stop(0).await;
+    ensemble.stop(1).await;
+    let suffix = rtdb_logkeeper::inspect_retained_with_prefix(ensemble.directories[0].path(), &stream.stream, None, Some(&prefix)).unwrap().unwrap();
+    assert_eq!(suffix, full);
+    assert_eq!(inspect_retained(ensemble.directories[0].path(), &stream.stream, None).unwrap().unwrap().interval, [1025, 1049]);
+    assert_eq!(certify_committed_prefix(&stream, 1049, Some(&prefix)).await.unwrap_err().code, "rtdb.logkeeper/audit-quorum");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

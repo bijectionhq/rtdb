@@ -2,7 +2,7 @@ use prost::Message;
 use rtdb_types::{Anomaly, Result};
 use uuid::Uuid;
 
-use crate::{Checkpoint, DeploymentRecord, Lifecycle, MemberId, StorageNamespaces, Version};
+use crate::{Checkpoint, DeploymentRecord, JournalAnchor, Lifecycle, MemberId, StorageNamespaces, Version};
 
 const WIRE_VERSION: u8 = 1;
 
@@ -44,6 +44,8 @@ struct ParkedDeployment {
     replica_journals: Vec<String>,
     #[prost(sint64, optional, tag = "18")]
     compaction_replay_cutoff: Option<i64>,
+    #[prost(message, optional, tag = "19")]
+    replica_anchor: Option<PackedJournalAnchor>,
 }
 
 #[derive(Clone, Copy, PartialEq, Message)]
@@ -58,10 +60,22 @@ struct PackedCheckpoint {
     system_time: i64,
 }
 
+#[derive(Clone, PartialEq, Message)]
+struct PackedJournalAnchor {
+    #[prost(uint64, tag = "1")]
+    root_incarnation: u64,
+    #[prost(sint64, tag = "2")]
+    first: i64,
+    #[prost(sint64, tag = "3")]
+    through: i64,
+    #[prost(bytes = "vec", tag = "4")]
+    digest: Vec<u8>,
+}
+
 pub(super) fn encode(record: &DeploymentRecord) -> Option<Vec<u8>> {
     let DeploymentRecord {
         id, name: _, org, lineage, incarnation, lifecycle, epoch: _, holder, ensemble, created_at_ms, read_width,
-        activation_crashes, log_epoch, parent, linearizable_reads, checkpoint, storage_generation,
+        activation_crashes, log_epoch, parent, linearizable_reads, checkpoint, replica_anchor, storage_generation,
         storage_namespaces, s3_write_lease_until_ms, engine_pin, deletion_observation, move_intent, placement_move, move_from, log_copy_servers, cell_move, moved_at_ms,
         source_cleanup, deletion_record, replica_journals, storage_regions, cell_transfer, disposal, checkpoint_recovery,
         checkpoint_stage, checkpoint_repair_receipts, checkpoint_captures, checkpoint_capture_retirements,
@@ -101,6 +115,9 @@ pub(super) fn encode(record: &DeploymentRecord) -> Option<Vec<u8>> {
         parent: parent.clone(),
         linearizable_reads: *linearizable_reads,
         checkpoint: checkpoint.map(|Checkpoint { block, boundary, source, system_time }| PackedCheckpoint { block, boundary, source, system_time }),
+        replica_anchor: replica_anchor.as_deref().map(|anchor| PackedJournalAnchor {
+            root_incarnation: anchor.root_incarnation, first: anchor.interval[0], through: anchor.interval[1], digest: anchor.digest.to_vec(),
+        }),
         storage_generation: storage_generation.map_or_else(Vec::new, |id| id.as_bytes().to_vec()),
         storage_namespaces: namespaces,
         quarantined: *lifecycle == Lifecycle::Quarantined,
@@ -138,6 +155,13 @@ pub(super) fn decode(bytes: &[u8], id: &str, name: &str, epoch: u64, version: Ve
             })
         }
     };
+    let replica_anchor = packed.replica_anchor.map(|anchor| {
+        if anchor.root_incarnation == 0 || anchor.root_incarnation > packed.incarnation || anchor.first < 0 || anchor.through < anchor.first {
+            return Err(invalid("Invalid replica anchor range or residence"));
+        }
+        let digest = anchor.digest.try_into().map_err(|_| invalid("Invalid replica anchor digest"))?;
+        Ok(Box::new(JournalAnchor { root_incarnation: anchor.root_incarnation, interval: [anchor.first, anchor.through], digest }))
+    }).transpose()?;
     Ok(DeploymentRecord {
         id: id.to_owned(),
         name: name.to_owned(),
@@ -159,6 +183,7 @@ pub(super) fn decode(bytes: &[u8], id: &str, name: &str, epoch: u64, version: Ve
         log_copy_servers: Vec::new(),
         linearizable_reads: packed.linearizable_reads,
         checkpoint: packed.checkpoint.map(|PackedCheckpoint { block, boundary, source, system_time }| Checkpoint { block, boundary, source, system_time }),
+        replica_anchor,
         moved_at_ms: None,
         source_cleanup: None,
         cell_move: None,
@@ -187,6 +212,15 @@ pub(super) fn decode(bytes: &[u8], id: &str, name: &str, epoch: u64, version: Ve
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parking_preserves_the_replica_anchor_in_binary_form() {
+        let mut record = DeploymentRecord::new("shop", "acme", vec![], 1_000);
+        record.replica_anchor = Some(Box::new(JournalAnchor { root_incarnation: record.incarnation, interval: [0, 63], digest: [0xd1; 32] }));
+        let bytes = encode(&record).unwrap();
+        assert_eq!(decode(&bytes, &record.id, &record.name, record.epoch, record.version).unwrap(), record);
+        assert!(bytes.windows(32).any(|window| window == [0xd1; 32]));
+    }
 
     #[test]
     fn parking_preserves_the_scoped_write_lease_expiration() {

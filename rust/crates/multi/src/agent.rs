@@ -10,7 +10,7 @@ use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use parking_lot::Mutex;
-use rtdb_directory::{Cas, Checkpoint, DeploymentRecord, Directory, Lifecycle, MemberId, MemberRecord, MemberState, claim, effective_holder, now_ms, park};
+use rtdb_directory::{Cas, Checkpoint, DeploymentRecord, Directory, JournalAnchor, Lifecycle, MemberId, MemberRecord, MemberState, claim, effective_holder, now_ms, park};
 use rtdb_format::catalog::BlockCatalog;
 use rtdb_node::{Database, Node};
 use rtdb_replication::Role as DriverRole;
@@ -668,26 +668,38 @@ impl NodeAgent {
         Err(Anomaly::new(AnomalyCategory::Conflict, "rtdb.multi/checkpoint-contended", "The deployment kept changing while publishing its checkpoint"))
     }
 
-    /// Publishes the holding's last adopted block as the deployment's checkpoint, and trims its stream below that block's boundary, whose records the block now holds (`TrimFollowsPublication`).
-    /// The boundary record itself is kept: it names the source position a later holder's intake starts past.
-    async fn publish_and_trim(&self, name: &str, id: &str, epoch: u64) {
+    // The retained boundary record supplies the source position where the next holder resumes intake.
+    async fn publish_and_trim(&self, name: &str, current: &DeploymentRecord) {
+        let epoch = current.epoch;
         let Ok(database) = self.node.catalog().database(name) else { return };
         let Some(block) = database.status().adopted_block else { return };
-        let Ok(Some((record, checkpoint))) = self.publish_checkpoint(id, epoch, &block).await else { return; };
-        let boundary = checkpoint.boundary;
-
-        if boundary == 0 || !self.holdings.lock().get(name).is_some_and(|holding| {
-            holding.id == id && holding.epoch == epoch && holding.trimmed_through.is_none_or(|trimmed| trimmed < boundary - 1)
-        }) {
-            return;
-        }
+        let Some(checkpoint) = checkpoint_for_block(&block, StorageEpoch(current.log_epoch)) else { return };
+        let through = checkpoint.boundary - 1;
+        let needs_trim = self.holdings.lock().get(name).is_some_and(|holding| {
+            holding.id == current.id && holding.epoch == epoch && holding.trimmed_through.is_none_or(|trimmed| trimmed < through)
+        });
+        let needs_publication = current.checkpoint.is_none_or(|published| published.block < checkpoint.block);
+        if !needs_publication && (through < 0 || !needs_trim) { return; }
+        let Ok(Some((mut record, _))) = self.publish_checkpoint(&current.id, epoch, &block).await else { return; };
+        if through < 0 || !needs_trim { return; }
         let Ok(members) = self.members().await else { return };
         let Ok(servers) = ensemble_servers(&record, &members) else { return };
         let stream = rtdb_logkeeper::StreamConfig { write_quorum: crate::deployment::write_quorum(servers.len()), servers, stream: record.stream("replica"), maximum_message_bytes: 4 << 20 };
-        if rtdb_logkeeper::trim(&stream, rtdb_storage::log::LogOffset(boundary - 1)).await.is_ok()
-            && let Some(holding) = self.holdings.lock().get_mut(name).filter(|holding| holding.id == id && holding.epoch == epoch)
+        if record.replica_anchor.as_ref().is_none_or(|anchor| anchor.interval[1] < through) {
+            let prefix = record.replica_anchor.as_ref().map(|anchor| rtdb_logkeeper::JournalDigest::from_digest_bytes(stream.stream.clone(), anchor.interval, anchor.digest));
+            let Ok(proof) = rtdb_logkeeper::certify_committed_prefix(&stream, through, prefix.as_ref()).await else { return; };
+            let Some(digest) = proof.digest_bytes() else { return; };
+            let root_incarnation = record.replica_anchor.as_ref().map_or(record.incarnation, |anchor| anchor.root_incarnation);
+            let version = record.version;
+            record.replica_anchor = Some(Box::new(JournalAnchor { root_incarnation, interval: proof.interval, digest }));
+            if !matches!(self.directory.replace_deployment(record, version).await, Ok(Cas::Applied(_))) {
+                return;
+            }
+        }
+        if rtdb_logkeeper::trim(&stream, rtdb_storage::log::LogOffset(through)).await.is_ok()
+            && let Some(holding) = self.holdings.lock().get_mut(name).filter(|holding| holding.id == current.id && holding.epoch == epoch)
         {
-            holding.trimmed_through = Some(boundary - 1);
+            holding.trimmed_through = Some(through);
         }
     }
 
@@ -782,7 +794,6 @@ impl NodeAgent {
                 if placed_here && stopped { self.release_failed_holding(&id, epoch, true).await; }
                 continue;
             }
-            self.publish_and_trim(&name, &id, epoch).await;
             if draining {
                 let Some(record) = current.as_ref() else { continue };
                 if target_engine.is_none() && record.engine_pin.is_none() && last_touch.elapsed() >= active_within {
@@ -801,6 +812,7 @@ impl NodeAgent {
                 }
                 continue;
             }
+            if let Some(record) = current.as_ref() { self.publish_and_trim(&name, record).await; }
             let over = self.options.max_active.is_some_and(|limit| rank >= limit);
             if over || self.options.park_after.is_some_and(|after| last_touch.elapsed() >= after) {
                 let _ = self.park(&name).await;

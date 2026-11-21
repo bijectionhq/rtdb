@@ -1700,9 +1700,25 @@ async fn a_deployment_moves_cells_with_its_unflushed_tail_and_its_old_gateway_fo
     let (placed, _) = admin::create_in_cells(map.as_ref(), &[handle("east", &east, &east_storage, &east_keys, 10), handle("west", &west, &west_storage, &west_keys, 0)], "shop", "acme", 3).await.unwrap();
     assert_eq!(placed, "east", "a deployment goes to a cell with room");
     let client = east.connect("shop").await;
+    client.simple_query("INSERT INTO anchor_probe (_id) VALUES (1)").await.unwrap();
+    east.node(0).agent.flush("shop").await.unwrap();
+    let anchor = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let record = east.directory.deployment_by_name("shop").await.unwrap().unwrap();
+            if let Some(anchor) = record.replica_anchor { break *anchor; }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }).await.unwrap();
     client.simple_query("INSERT INTO orders (_id, total) VALUES (1, 10)").await.unwrap();
     client.simple_query("INSERT INTO orders (_id, total) VALUES (2, 20)").await.unwrap();
     drop(client);
+    let preceding = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let report = admin::audit(east.directory.as_ref(), &east_keys, "shop", 4 << 20).await.unwrap();
+            if report.transactions >= 2 && let Some(digest) = report.replica_continued_digest { break digest; }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }).await.unwrap();
 
     let source = handle("east", &east, &east_storage, &east_keys, 10);
     let destination = handle("west", &west, &west_storage, &west_keys, 10);
@@ -1716,6 +1732,9 @@ async fn a_deployment_moves_cells_with_its_unflushed_tail_and_its_old_gateway_fo
     assert!(fenced.replica_journals.is_disjoint(&pending.replica_journals));
     let replay = admin::audit(west.directory.as_ref(), &west_keys, "shop", 4 << 20).await.unwrap();
     assert!(replay.transactions >= 2 && replay.violations.is_empty());
+    assert_eq!(pending.replica_anchor.as_deref(), Some(&anchor));
+    assert_eq!(replay.replica_continued_digest.as_deref(), Some(preceding.as_str()));
+    assert_eq!(replay.replica_anchor.unwrap().stream, pending.stream("replica"));
 
     let arrived = admin::move_cell(map.as_ref(), &source, &destination, "shop", 4 << 20, None).await.unwrap();
     assert_eq!(arrived.epoch, fenced.epoch);
@@ -1795,6 +1814,9 @@ async fn a_stream_is_trimmed_below_its_last_published_block_and_still_recovers()
     use rtdb_storage::log::Log;
     assert!(matches!(reader.read_range(rtdb_storage::log::LogOffset(0), rtdb_storage::log::LogOffset(1)).await, Err(rtdb_storage::Error::UnavailableLogRange { .. })), "the stream is trimmed below the published blocks");
     assert_eq!(record.checkpoint.map(|checkpoint| checkpoint.block), Some(2), "the directory names the last published block, which a cold start starts from");
+    let anchor = *record.replica_anchor.unwrap();
+    assert_eq!(anchor.interval, [0, record.checkpoint.unwrap().boundary - 1]);
+    assert_eq!(anchor.root_incarnation, record.incarnation);
     drop(client);
 
     let holder = cell.holder("shop").await.unwrap();
@@ -1811,6 +1833,8 @@ async fn a_stream_is_trimmed_below_its_last_published_block_and_still_recovers()
     }).await.unwrap();
     assert!(report.violations.is_empty(), "{:?}", report.violations);
     assert!(report.replica_interval.unwrap()[0] > 0);
+    assert_eq!(report.replica_anchor.unwrap().interval, anchor.interval);
+    assert!(report.replica_continued_digest.is_some());
     drop(client);
     cell.add_node().await;
     cell.stop().await;

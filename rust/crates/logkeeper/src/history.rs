@@ -22,8 +22,12 @@ impl RetainedChain {
         for (index, byte) in digest.iter_mut().enumerate() {
             *byte = u8::from_str_radix(&encoded[2 * index..2 * index + 2], 16).ok()?;
         }
-        Some(Self(digest.into()))
+        Some(Self::from_bytes(digest))
     }
+
+    pub fn from_bytes(digest: [u8; 32]) -> Self { Self(digest.into()) }
+
+    pub fn bytes(&self) -> [u8; 32] { self.0.into() }
 
     pub fn append(&mut self, entry: &Entry) {
         let mut link = Sha256::new();
