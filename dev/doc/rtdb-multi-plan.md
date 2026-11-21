@@ -658,6 +658,8 @@ Reads must scale with read load without standing followers (spec rules `ServeOnW
 **Changes.**
 
 1. `Subscription`: the follower apply path from `ReplicationDriver`, fed by `Loglet::subscribe` from the checkpoint, created when a deployment's read width admits a member and torn down when demand stops.
+   Each gateway tries the replica with the fewest connected sessions within the deployment's affinity ranks and uses the holder if those replicas refuse.
+   New sessions rotate the starting rank to spread simultaneous connection attempts.
 2. The snapshot tier: any member serves reads at a basis at or below the checkpoint from object storage and cache, with no log.
 3. Linearizable reads on the holder wait for the next round's seal announcements; on a subscriber they fetch a read index from the holder.
 4. Read width widened and narrowed by the controller from per-key overflow.

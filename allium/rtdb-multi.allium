@@ -1676,6 +1676,17 @@ rule RouteRead {
             Dispatched(query, Affinity.select(key: session.deployment.storage_identity, pool: readers, width: route.read_width))
 }
 
+rule SpreadReplicaSessions {
+    -- Pgwire read-only sessions try the least occupied replica within the deployment's read width.
+    -- Concurrent connection attempts rotate their starting rank before active session counts are available.
+    when: ReplicaSessionRequested(gateway, deployment)
+
+    requires: deployment.read_width > 1
+
+    ensures:
+        EligibleReplicaAttempted(gateway, deployment)
+}
+
 rule ServeOnWriter {
     when: QueryArrived(holding, query, session)
 

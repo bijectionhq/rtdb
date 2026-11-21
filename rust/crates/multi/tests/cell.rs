@@ -529,6 +529,33 @@ async fn a_draining_node_keeps_a_recently_used_deployment_until_a_target_is_avai
 
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn read_only_sessions_spread_across_the_deployments_read_width() {
+    let cell = Cell::start(3, None).await;
+    admin::create_deployment(cell.directory.as_ref(), "shop", "acme", 3).await.unwrap();
+    let writer = cell.connect("shop").await;
+    writer.simple_query("INSERT INTO orders (_id, total) VALUES (1, 10)").await.unwrap();
+    let holder = cell.holder("shop").await.unwrap();
+    cell.node(holder).agent.flush("shop").await.unwrap();
+    admin::set_read_width(cell.directory.as_ref(), "shop", 3).await.unwrap();
+
+    let mut readers = Vec::new();
+    for _ in 0..2 {
+        let (reader, connection) = tokio_postgres::Config::new().host("127.0.0.1").port(cell.gateway.port()).user("xtdb").password("cell-test").dbname("shop")
+            .options("-c default_transaction_read_only=on").connect(NoTls).await.unwrap();
+        tokio::spawn(connection);
+        readers.push(reader);
+    }
+    for replica in (0..3).filter(|replica| *replica != holder) {
+        assert_eq!(cell.node(replica).agent.subscribed(), ["shop"]);
+    }
+    for reader in &readers {
+        assert_eq!(values(reader, "SELECT total FROM orders").await, ["10"]);
+    }
+    drop((readers, writer));
+    cell.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_read_only_session_is_served_by_a_log_fed_replica() {
     let cell = Cell::start(2, None).await;
     admin::create_deployment(cell.directory.as_ref(), "shop", "acme", 3).await.unwrap();
