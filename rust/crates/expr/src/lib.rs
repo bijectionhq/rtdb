@@ -14,6 +14,7 @@ mod interval_constructor;
 mod decimal;
 mod period;
 mod search;
+mod vector;
 mod string;
 mod pg_catalog;
 mod session_info;

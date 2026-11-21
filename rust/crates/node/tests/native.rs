@@ -2697,3 +2697,33 @@ async fn ordered_coverage_uses_only_adopted_l0_files() {
     assert!(observer.take().is_empty());
     stop(&node, driver).await;
 }
+
+#[tokio::test]
+async fn cosine_distance_ranks_the_versions_that_pass_the_filter_at_each_valid_point() {
+    let (node, driver) = running(options(), services()).await;
+    let mut session = node.session("xtdb", Arc::new(Authority)).unwrap();
+    let embedding = |x, y| Value::FixedSizeList(vec![Value::F32(x), Value::F32(y)]);
+    let document = |id, status: &str, vector| StructFields::from([
+        ("_id".into(), Value::I64(id)),
+        ("status".into(), Value::Utf8(status.into())),
+        ("embedding".into(), vector),
+    ]);
+    let initial = put_rows(&node, "vectors", vec![
+        document(1, "open", embedding(1.0, 0.0)),
+        document(2, "open", embedding(0.0, 1.0)),
+        document(3, "closed", embedding(1.0, 0.0)),
+    ], Some(Timestamp(0)), None);
+    assert!(session.state_mut().execute_tx(vec![initial], AutonomousTxOptions::default()).await.unwrap().committed());
+
+    let correction = put_rows(&node, "vectors", vec![
+        document(1, "open", embedding(-1.0, 0.0)),
+    ], Some(Timestamp(2_000_000)), Some(Timestamp(3_000_000)));
+    assert!(session.state_mut().execute_tx(vec![correction], AutonomousTxOptions::default()).await.unwrap().committed());
+
+    for (second, expected) in [(1, 1), (2, 2), (3, 1)] {
+        let query = format!("SELECT _id FROM vectors FOR VALID_TIME AS OF TIMESTAMP '1970-01-01T00:00:0{second}Z' WHERE status = 'open' ORDER BY COSINE_DISTANCE(embedding, $1), _id LIMIT 1");
+        let result = session.query_sql(&query, vec![embedding(1.0, 0.0)]).await.unwrap();
+        assert_eq!(rows(result).await, [vec![Value::I64(expected)]]);
+    }
+    stop(&node, driver).await;
+}

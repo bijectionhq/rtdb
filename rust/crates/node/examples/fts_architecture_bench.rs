@@ -19,6 +19,8 @@ use tokio_util::sync::CancellationToken;
 mod corpus_checkpoint;
 #[path = "support/fts_generations.rs"]
 mod generations;
+#[path = "support/vector_workload.rs"]
+mod vector_workload;
 #[cfg(feature = "fts-experiments")]
 #[path = "support/fts_same_files.rs"]
 mod same_files;
@@ -176,6 +178,12 @@ fn bench_services(clock: &Arc<TickClock>) -> NodeServices {
 async fn main() {
     let mut args = std::env::args().skip(1);
     let workload = args.next().unwrap();
+    if workload == "vectors" {
+        let data = std::path::PathBuf::from(args.next().expect("embedding data directory"));
+        let queries = args.next().expect("query count").parse().unwrap();
+        vector_workload::run(&data, queries).await;
+        return;
+    }
     if workload == "checkpoint" {
         corpus_checkpoint::run(args.next().unwrap().parse().unwrap()).await;
         return;
