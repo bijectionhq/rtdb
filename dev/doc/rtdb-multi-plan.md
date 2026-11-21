@@ -90,6 +90,12 @@ the receipt. Gateway sessions close when they observe retirement. Object
 versions, external backups and key copies in other cells have separate
 physical custody.
 
+`rtdb-multi capture --id UUID --operation UUID` retains the selected
+published checkpoint and copies its catalog, table metadata and referenced
+tries as ciphertext to the independent archive. The receipt fixes the
+location, length and digest of each object. Retrying the operation recovers
+the same checkpoint. The key vault stays outside the capture.
+
 **Fixed on the way.**
 
 - A newly activated fork could publish its parent's boundary and trim its own log before its first flush completed.

@@ -5,6 +5,7 @@
 
 pub mod admin;
 pub mod agent;
+pub mod archive;
 pub mod capability;
 pub mod cells;
 pub mod cipher;

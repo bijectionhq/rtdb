@@ -15,6 +15,8 @@ pub const KEY_BYTES: usize = 32;
 pub trait KeyService: Send + Sync {
     /// The deployment's key, created on first use.
     async fn key(&self, deployment: &str) -> Result<[u8; KEY_BYTES]>;
+    /// Read current custody without creating a key.
+    async fn existing_key(&self, deployment: &str) -> Result<Option<[u8; KEY_BYTES]>>;
     /// Gives `to` the key `from` has, for a fork whose objects are copies of its parent's.
     async fn copy(&self, from: &str, to: &str) -> Result<()>;
     /// Withdraws the key and permanently refuses provisioning for this deployment ID.
@@ -98,6 +100,14 @@ fn decode_key(deployment: &str, bytes: Vec<u8>) -> Result<[u8; KEY_BYTES]> {
 impl KeyService for LocalKeyService {
     async fn key(&self, deployment: &str) -> Result<[u8; KEY_BYTES]> {
         self.local_key(deployment)
+    }
+
+    async fn existing_key(&self, deployment: &str) -> Result<Option<[u8; KEY_BYTES]>> {
+        match fs::read(self.path(deployment)) {
+            Ok(bytes) => decode_key(deployment, bytes).map(Some),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(io(error)),
+        }
     }
 
     async fn copy(&self, from: &str, to: &str) -> Result<()> {

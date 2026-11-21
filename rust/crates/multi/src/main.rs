@@ -34,7 +34,8 @@ Usage: rtdb-multi initialize-directory --state PATH\n\
        rtdb-multi unquarantine --directory DIR --name NAME\n\
        rtdb-multi fork --directory DIR --storage-root PATH --keys PATH --from NAME --name NAME [--at-block N | --at-time RFC3339] [--grace SECONDS] [--cell-secret FILE]\n\
        rtdb-multi delete --directory DIR --storage-root PATH --keys PATH --id UUID\n\
-       rtdb-multi disposal --directory DIR --id UUID\n\n\
+       rtdb-multi disposal --directory DIR --id UUID\n\
+       rtdb-multi capture --directory DIR --storage-root PATH --archive-root PATH --keys PATH --id UUID --operation UUID\n\n\
 DIR is HOST:PORT of a directory server, or dynamodb:PREFIX for DynamoDB tables named PREFIX-deployments, PREFIX-deployment-names and PREFIX-members\n\
 (RTDB_DYNAMODB_ENDPOINT points at DynamoDB Local; requires the `dynamodb` feature).\n\
 For `--keys` use a private local directory or dynamodb:TABLE with an independently installed key table.\n";
@@ -73,9 +74,13 @@ impl Arguments {
 }
 
 fn installation_id(arguments: &Arguments) -> Result<uuid::Uuid> {
-    let raw_id = arguments.required("id")?;
+    required_uuid(arguments, "id")
+}
+
+fn required_uuid(arguments: &Arguments, name: &str) -> Result<uuid::Uuid> {
+    let raw_id = arguments.required(name)?;
     uuid::Uuid::parse_str(raw_id).ok().filter(|id| !id.is_nil() && id.to_string() == raw_id)
-        .ok_or_else(|| usage("--id must be a canonical, nonzero UUID".into()))
+        .ok_or_else(|| usage(format!("--{name} must be a canonical, nonzero UUID")))
 }
 
 async fn run(arguments: Vec<String>) -> Result<()> {
@@ -243,6 +248,18 @@ async fn run(arguments: Vec<String>) -> Result<()> {
             let id = installation_id(&arguments)?;
             let receipt = directory.deployment(&id.to_string()).await?.and_then(|record| record.disposal);
             println!("{}", serde_json::to_string_pretty(&receipt).expect("a receipt serializes"));
+            Ok(())
+        }
+        "capture" => {
+            let directory = directory(arguments.required("directory")?).await?;
+            let storage = CellStorage::parse(arguments.required("storage-root")?)?;
+            let archive = CellStorage::parse(arguments.required("archive-root")?)?;
+            let keys = key_service(arguments.required("keys")?).await?;
+            let capture = rtdb_multi::archive::capture(
+                directory.as_ref(), &storage, &archive, keys.as_ref(),
+                installation_id(&arguments)?, required_uuid(&arguments, "operation")?,
+            ).await?;
+            println!("{}", serde_json::to_string_pretty(&capture).expect("a capture serializes"));
             Ok(())
         }
         "create" => {
