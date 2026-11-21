@@ -197,6 +197,40 @@ def verify_ceiling(args, scratch, history):
         print(f"{case}: {'negative control rejected' if mutation else 'proved'}")
 
 
+def verify_compaction_projection(args, scratch, history):
+    path = Path("verification/lean/Compaction.lean")
+    controls = {
+        "baseline": None,
+        "write-to-other-bucket": (
+            "bucketOf event.fact.key = bucket", "bucketOf event.fact.key + 1 = bucket",
+            ["key_projection_through_its_bucket"],
+        ),
+        "read-from-other-bucket": (
+            "point (forBucket view bucketOf (bucketOf key)) system key valid",
+            "point (forBucket view bucketOf (bucketOf key + 1)) system key valid",
+            ["partitioned_point_refines_the_reference"],
+        ),
+    }
+    allowed = {"propext", "Classical.choice", "Quot.sound"}
+    env = os.environ | {"LEAN_PATH": str(history)}
+    for name, mutation in controls.items():
+        case = f"lean-compaction-{name}"
+        directory = scratch / case
+        source = clone_file(path, directory)
+        if mutation:
+            replace_once(source, mutation[0], mutation[1])
+        checked = run_case([args.lean, str(path)], directory, args.evidence, case, env)
+        if mutation:
+            observed = lean_error_theorems(source, path, checked.stdout)
+            if not checked.returncode or observed != mutation[2]:
+                raise ValueError(f"{case}: expected {mutation[2]}, observed {observed}")
+        else:
+            audited = re.findall(r"depends on axioms: \[([^\]]*)\]", checked.stdout)
+            if checked.returncode or len(audited) != 2 or any(set(axioms.split(", ")) - allowed for axioms in audited):
+                raise ValueError("Lean compaction projection proof or axiom audit failed")
+        print(f"{case}: {'negative control rejected' if mutation else 'proved'}")
+
+
 def verify_reader_retention(args, scratch):
     path = Path("verification/lean/ReaderRetention.lean")
     controls = {
@@ -278,6 +312,7 @@ def verify_lean(args, scratch):
             env = os.environ | {"LEAN_PATH": str(directory)}
             verify_ceiling(args, scratch, directory)
             verify_reader_retention(args, scratch)
+            verify_compaction_projection(args, scratch, directory)
             independence = Path("verification/lean/Minimality.lean")
             clone_file(independence, directory)
             checked = run_case(

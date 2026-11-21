@@ -405,3 +405,15 @@ Ignoring the second reader, granting a stale admission after authorizing deletio
 The baseline preserves both readers' dependencies and the current generation through a delayed deletion.
 It assumes synchronized admission and authorization, immutable object identities, and confirmed completion of protected operations.
 This is bounded model evidence for those premises. The model does not implement reader coordination in the Rust database.
+
+== Point reads through ordered compaction buckets
+
+Lean checked link:../lean/Compaction.lean[the projection from the reference history to one bucket] for every event list and every key-to-bucket function.
+Filtering a bucket again by key preserves exactly that key's ordered event sequence.
+The resulting point evaluation agrees with the unpartitioned reference at every system and valid coordinate.
+Both directions of routing are necessary.
+The model rejects storing an event in the adjacent bucket and looking up the adjacent bucket.
+The audited proofs use standard Lean axioms.
+
+The result composes with a partitioner that supplies the proved ordered filters, including the precise placement of erasures.
+It does not claim that the native compaction merger already supplies that complete refinement.
