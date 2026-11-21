@@ -10,7 +10,7 @@ mod retention;
 pub use artefact::{ArtefactBuilder, ArtefactSource, wants, ArtefactDatabase, ArtefactDefinition, ArtefactKind, ArtefactDriver, ArtefactHandle, ArtefactJob, ArtefactPublisher, available_artefact_jobs, retired_artefacts, stray_artefacts};
 pub use driver::{CompactionDriver, CompactionHandle, CompactionExecutor, CycleDriver, CycleHandle, CycleWorker};
 pub use failure::{CompactionFailure, CompactionObserver, StderrCompactionObserver};
-pub use gc::{BlockCollector, CollectionObserver, GarbageConfig, TrieCollector, block_is_garbage};
+pub use gc::{BlockCollector, CollectionObserver, CollectorClock, GarbageConfig, TrieCollector, block_is_garbage};
 pub use job::{CompactionJob, RecencyMode, available_jobs};
 pub use merge::{MergeConfig, RecencyPartition, SegmentCompactor, recency_partition};
 pub use publication::{CompactionPublisher, SnapshotSource, TrieDeletionPublisher};

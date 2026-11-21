@@ -199,13 +199,14 @@ impl PreparedQuery {
     async fn open(&self, context: Arc<QueryContext>, parameters: Vec<Value>, text: Option<&str>, batching: Batching) -> Result<QueryCursor> {
         let counter = context.query_cpu.clone();
         let open = self.open_retained(context.clone(), parameters, text, batching);
-        rtdb_storage::IoRegion::retaining(context, async {
+        let lease = context.catalog.read_lease();
+        rtdb_storage::IoRegion::retaining(context, rtdb_storage::IoRegion::leased(lease, async {
             let mut open = std::pin::pin!(open);
             match counter {
                 Some(counter) => crate::query_cpu::measure(counter, open.as_mut()).await,
                 None => open.await,
             }
-        }).await
+        })).await
     }
 
     async fn open_retained(&self, context: Arc<QueryContext>, mut parameters: Vec<Value>, text: Option<&str>, batching: Batching) -> Result<QueryCursor> {
@@ -320,6 +321,7 @@ impl QueryCursor {
         if let Some(trace) = &mut self.trace { trace.start(); }
         let started = std::time::Instant::now();
         let retention = self.context.clone();
+        let lease = self.context.catalog.read_lease();
         let counter = self.context.query_cpu.clone();
         let pull = async {
             let mut pull = std::pin::pin!(self.pull_batch());
@@ -328,7 +330,7 @@ impl QueryCursor {
                 None => owner.run_until_cancelled(token.run_until_cancelled(pull)).await,
             }
         };
-        let result = rtdb_storage::IoRegion::retaining(retention, pull).await.flatten().ok_or_else(cancelled);
+        let result = rtdb_storage::IoRegion::retaining(retention, rtdb_storage::IoRegion::leased(lease, pull)).await.flatten().ok_or_else(cancelled);
         match result {
             Ok(Ok(batch)) => { if let Some(trace) = &mut self.trace { trace.completed(started.elapsed(), batch.as_ref().map(|batch| batch.batch().num_rows())); } if batch.is_none() { self.input = None; } Ok(batch) }
             Ok(Err(error)) | Err(error) => { self.input = None; self.record_error(); Err(error) }

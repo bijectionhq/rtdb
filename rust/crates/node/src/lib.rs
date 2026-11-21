@@ -4,6 +4,7 @@ mod resources;
 mod catalog;
 mod config;
 mod database;
+mod read_currency;
 mod node;
 mod backends;
 mod runtime;

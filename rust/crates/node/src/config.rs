@@ -57,6 +57,14 @@ pub trait Clock: Send + Sync {
     fn now(&self) -> Timestamp;
     /// Supplies an exact query-clock reading; the default lifts the durable microsecond clock.
     fn query_instant(&self) -> rtdb_types::Instant { self.now().into() }
+    /// Microseconds on a clock that never steps back, counted from an arbitrary origin in this process.
+    /// Read leases and the collector's wait measure durations on it, so they assume a bounded rate drift between nodes rather than synchronized clocks.
+    fn monotonic_micros(&self) -> i64 { process_monotonic_micros() }
+}
+
+pub fn process_monotonic_micros() -> i64 {
+    static ORIGIN: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    i64::try_from(ORIGIN.get_or_init(std::time::Instant::now).elapsed().as_micros()).unwrap_or(i64::MAX)
 }
 pub struct SystemClock;
 impl Clock for SystemClock {

@@ -15,6 +15,7 @@ use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 
 use crate::ordered_index::OrderedIndexMaintenance;
+use crate::read_currency::ReadCurrency;
 use crate::{Clock, DatabaseCatalog, ExternalSource, ExternalSourceFactory, ExternalSources, NodeOptions, ResourceDriver, ResourceFactory, catalog::{CatalogCommand, CatalogEffects}};
 
 type OrderedIndexCycle = watch::Sender<Option<CycleHandle>>;
@@ -47,6 +48,7 @@ pub struct Database {
     ordered_cycle: Option<OrderedIndexCycle>,
     cancellation: CancellationToken,
     io: Arc<IoRegion>,
+    currency: Arc<ReadCurrency>,
 }
 
 impl Database {
@@ -66,6 +68,29 @@ impl Database {
         self.replication.await_source(position, cancellation).await
     }
 
+    /// The lease for a snapshot of this database captured after this returns.
+    /// A node whose catalog cannot be confirmed current waits up to the lease margin for it, then holds an expired lease.
+    pub(crate) async fn read_lease(&self, clock: &Arc<dyn Clock>, garbage: &rtdb_maintenance::GarbageConfig) -> Result<Arc<rtdb_storage::ReadLease>> {
+        use rtdb_storage::read_lease::{lease_admits, lease_deadline};
+        let (lease, margin) = (garbage.reader_lease_micros()?, garbage.reader_lease_margin_micros()?);
+        let deadline = |anchor: Option<i64>| anchor.and_then(|anchor| lease_deadline(anchor, lease, margin));
+        let observed_at = clock.monotonic_micros();
+        if self.currency.needs_observation(observed_at, lease / 4) {
+            let logs = Arc::clone(&self.logs);
+            if let Ok(Ok(tip)) = self.io.run_blocking(move || Ok(logs.latest_replica_position())).await { self.currency.observe(observed_at, tip); }
+        }
+        let mut current = deadline(self.currency.anchor(self.replication.status().replica_position));
+        if current.is_none_or(|deadline| !lease_admits(clock.monotonic_micros(), deadline)) {
+            if let Some(tip) = self.currency.pending_tip() {
+                let mut status = self.replication.watch_status();
+                let caught_up = status.wait_for(|status| status.replica_position >= tip);
+                let _ = tokio::time::timeout(garbage.reader_lease_margin, self.cancellation.run_until_cancelled(caught_up)).await;
+                current = deadline(self.currency.anchor(self.replication.status().replica_position));
+            }
+        }
+        let clock = Arc::clone(clock);
+        Ok(Arc::new(rtdb_storage::ReadLease::new(current, Arc::new(move || clock.monotonic_micros()))))
+    }
     pub async fn block_lag(&self) -> Result<i64> {
         let current = self.status().adopted_block.as_ref().map_or(-1, |block| block.block_index().0);
         let prefix = rtdb_storage::ObjectKey::new("blocks")?;
@@ -269,14 +294,15 @@ impl DatabaseFactory {
                 name.clone(), Arc::clone(&storage), Arc::clone(&self.memory), Arc::clone(&self.clock), Arc::clone(&snapshots),
             )));
             let ordered_cycle = ordered_worker.as_ref().map(|_| watch::channel(None).0);
-            let supervisor = MaintenanceSupervisor { store: resources.store, partition: Arc::clone(&partition), replication: replication.clone(), compaction: compaction.clone(), artefacts: artefacts.clone(),
-                observer: Arc::clone(&self.observer), options: self.options.clone(), source, ordered_worker, ordered_cycle: ordered_cycle.clone() };
+            let currency = Arc::<ReadCurrency>::default();
+            let supervisor = MaintenanceSupervisor { currency: Arc::clone(&currency), logs: Arc::clone(&logs), store: resources.store, partition: Arc::clone(&partition), replication: replication.clone(), compaction: compaction.clone(), artefacts: artefacts.clone(),
+                observer: Arc::clone(&self.observer), options: self.options.clone(), source, ordered_worker, ordered_cycle: ordered_cycle.clone(), clock: Arc::clone(&self.clock) };
             let fragment_residence = resources.fragment_storage.map(|storage| rtdb_query::FragmentResidence {
                 storage, replica_epoch: logs.replica_epoch.0,
             });
             let database = Arc::new(Database { name, configuration, read_only, partition, storage, logs, replication,
                 transaction_admission: RwLock::default(), submitted_bytes: AtomicU64::new(0), replica_read_sessions: AtomicUsize::new(0),
-                query_cpu, fragment_residence, compaction, artefacts, ordered_cycle, cancellation: cancellation.clone(), io: Arc::clone(&io) });
+                query_cpu, fragment_residence, compaction, artefacts, ordered_cycle, cancellation: cancellation.clone(), io: Arc::clone(&io), currency });
             let driver = DatabaseDriver { database: Arc::clone(&database), replication: replica_driver, compactor, artefacts: artefact_drivers, supervisor, logs: opened_logs.drivers, log_cancellation };
             Ok(OpenedDatabase { database, driver, secondaries })
         };
@@ -380,13 +406,19 @@ struct MaintenanceSupervisor {
     source: Option<Box<dyn ExternalSource>>,
     ordered_worker: Option<Arc<OrderedIndexMaintenance>>,
     ordered_cycle: Option<OrderedIndexCycle>,
+    clock: Arc<dyn Clock>,
+    currency: Arc<ReadCurrency>,
+    logs: Arc<PartitionLogs>,
 }
 
 impl MaintenanceSupervisor {
     async fn start_term(&mut self, handle: TermHandle, parent: &CancellationToken) -> Result<TermRegion> {
         let cancellation = parent.child_token();
         let publisher = Arc::new(PublishDeletions(handle.clone()));
-        let trie_collector = Arc::new(TrieCollector::new(Arc::clone(&self.store), Arc::clone(&self.partition), publisher, Arc::clone(&self.observer), self.options.garbage.clone())?);
+        let trie_collector = Arc::new(TrieCollector::new(Arc::clone(&self.store), Arc::clone(&self.partition), publisher, Arc::clone(&self.observer), self.options.garbage.clone(), {
+            let clock = Arc::clone(&self.clock);
+            Arc::new(move || clock.monotonic_micros())
+        })?);
         let block_collector = Arc::new(BlockCollector::new(Arc::clone(&self.store), self.partition.clone(), Arc::clone(&self.observer), self.options.garbage.clone())?);
         let (trie_driver, trie) = CycleDriver::new(trie_collector, self.options.automatic_gc, self.options.command_capacity)?;
         let (block_driver, blocks) = CycleDriver::new(block_collector, self.options.automatic_gc, self.options.command_capacity)?;
@@ -420,6 +452,17 @@ impl MaintenanceSupervisor {
         let result = loop {
             if cancellation.is_cancelled() { break Ok(()); }
             let current = status.borrow_and_update().clone();
+            // Keeps the read lease anchor fresh while the log processor applies records, so queries rarely observe the tip themselves.
+            if self.options.replication.enabled {
+                if let Ok(lease) = self.options.garbage.reader_lease_micros() {
+                    let observed_at = self.clock.monotonic_micros();
+                    if self.currency.needs_observation(observed_at, lease / 4) {
+                        let logs = Arc::clone(&self.logs);
+                        if let Ok(Ok(tip)) = tokio::task::spawn_blocking(move || logs.latest_replica_position()).await { self.currency.observe(observed_at, tip); }
+                    }
+                    self.currency.anchor(current.replica_position);
+                }
+            }
             let term = match current.role { Role::Leading(term) => Some(term), _ => None };
             if region.as_ref().map(|region| region.term) != term {
                 if let Some(cycle) = &self.ordered_cycle { cycle.send_replace(None); }

@@ -1,5 +1,6 @@
 use std::collections::BTreeMap;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, atomic::{AtomicI64, Ordering}};
+use std::time::Duration;
 use async_trait::async_trait;
 use bytes::Bytes;
 use rtdb_format::{block::proto as pb, catalog::BlockCatalog, keys::{TrieKey, block_key, oversized_key}};
@@ -13,6 +14,10 @@ use tokio_util::sync::CancellationToken;
 #[derive(Default)]
 struct Observer(Mutex<Vec<Anomaly>>);
 impl CollectionObserver for Observer { fn table_failed(&self, _: Option<&TableRef>, error: &Anomaly) { self.0.lock().unwrap().push(error.clone()); } }
+
+/// No reader on another node holds a lease, so collection need not wait.
+fn unleased() -> GarbageConfig { GarbageConfig { reader_lease: Duration::ZERO, reader_lease_margin: Duration::ZERO, ..GarbageConfig::default() } }
+fn fixed_clock() -> rtdb_maintenance::CollectorClock { Arc::new(|| 0) }
 
 fn block(index: i64) -> BlockCatalog {
     BlockCatalog::from_proto(pb::Block { block_index: Some(index), latest_completed_tx: Some(pb::TxKey { tx_id: Some(index), system_time: Some(index * 1_000_000), ..Default::default() }), ..Default::default() }).unwrap()
@@ -96,7 +101,7 @@ async fn trie_gc_deletes_artefacts_and_both_files_before_publishing_and_preserve
     store.put(&live_artefact, Bytes::from_static(b"artefact")).await.unwrap();
     let publisher = Arc::new(DeletedPublisher { store: store.clone(), table: entry.clone(), commits: Mutex::new(Vec::new()) });
     let state = Arc::new(PartitionState::new(PartitionValue::loaded(catalog, tables, TrieConfig::default()).unwrap()));
-    let collector = TrieCollector::new(store.clone(), state, publisher.clone(), Arc::new(Observer::default()), GarbageConfig::default()).unwrap();
+    let collector = TrieCollector::new(store.clone(), state, publisher.clone(), Arc::new(Observer::default()), unleased(), fixed_clock()).unwrap();
     collector.collect_as_of(Timestamp(100), &CancellationToken::new()).await.unwrap();
     assert_eq!(*publisher.commits.lock().unwrap(), vec![vec!["l01-rc-b00".parse::<TrieKey>().unwrap()]]);
     assert!(store.head(&ObjectKey::new(entry.slug.data_key(&"l00-rc-b00".parse().unwrap())).unwrap()).await.is_ok());
@@ -146,7 +151,7 @@ async fn collection_preserves_live_and_pending_tries_of_the_installed_checkpoint
     }
     let observer = Arc::new(Observer::default());
     let publisher = Arc::new(DeletedPublisher { store: store.clone(), table: entry.clone(), commits: Mutex::new(Vec::new()) });
-    let collector = TrieCollector::new(store.clone(), state.clone(), publisher.clone(), observer.clone(), GarbageConfig::default()).unwrap();
+    let collector = TrieCollector::new(store.clone(), state.clone(), publisher.clone(), observer.clone(), unleased(), fixed_clock()).unwrap();
     let cancellation = CancellationToken::new();
     collector.collect_as_of(Timestamp(200), &cancellation).await.unwrap();
     assert!(publisher.commits.lock().unwrap().is_empty(), "an installed checkpoint still needs both tries");
@@ -197,7 +202,7 @@ async fn collection_preserves_open_readers_and_their_inflight_io() {
         }
     }
     let publisher = Arc::new(DeletedPublisher { store: store.clone(), table: entry, commits: Mutex::new(Vec::new()) });
-    let collector = TrieCollector::new(store.clone(), state.clone(), publisher.clone(), Arc::new(Observer::default()), GarbageConfig::default()).unwrap();
+    let collector = TrieCollector::new(store.clone(), state.clone(), publisher.clone(), Arc::new(Observer::default()), unleased(), fixed_clock()).unwrap();
     let cancellation = CancellationToken::new();
     collector.collect_as_of(Timestamp(100), &cancellation).await.unwrap();
     assert_eq!(publisher.commits.lock().unwrap().as_slice(), &[vec![unreferenced.key.clone()]]);
@@ -252,7 +257,7 @@ async fn a_groups_artefacts_go_only_with_the_last_member_the_catalog_holds() {
         async move {
             let publisher = Arc::new(DeletedPublisher { store: store.clone(), table: entry, commits: Mutex::new(Vec::new()) });
             let state = Arc::new(PartitionState::new(PartitionValue::loaded(catalog, tables, TrieConfig::default()).unwrap()));
-            let collector = TrieCollector::new(store, state, publisher.clone(), Arc::new(Observer::default()), GarbageConfig::default()).unwrap();
+            let collector = TrieCollector::new(store, state, publisher.clone(), Arc::new(Observer::default()), unleased(), fixed_clock()).unwrap();
             collector.collect_as_of(Timestamp(200), &CancellationToken::new()).await.unwrap();
             publisher.commits.lock().unwrap().concat()
         }
@@ -264,4 +269,51 @@ async fn a_groups_artefacts_go_only_with_the_last_member_the_catalog_holds() {
     let all_superseded = (1..4).fold(collected, supersede);
     assert_eq!(collect(all_superseded).await.len(), 3);
     assert!(store.head(&object).await.is_err(), "the last members take the group's artefacts with them");
+}
+
+#[tokio::test]
+async fn collection_waits_a_whole_reader_lease_after_first_observing_garbage() {
+    let table = TableRef::new("public", "docs");
+    let tables = TableCatalog::default().with_seeded_table(table.clone(), Vec::new()).unwrap();
+    let entry = tables.entry(&table).unwrap().clone();
+    let mut catalog = TrieCatalog::new(16).unwrap();
+    for key in ["l00-rc-b00", "l01-rc-b00", "l01-rc-b01"] {
+        catalog = catalog.with_tries(table.clone(), [CatalogTrie { key: key.parse().unwrap(), data_file_size: 1, metadata: None, state: TrieState::Live, artefacts: Vec::new() }], Timestamp(100)).unwrap();
+    }
+    let store = Arc::new(MemoryStore::default());
+    let garbage: TrieKey = "l01-rc-b00".parse().unwrap();
+    store.put(&ObjectKey::new(entry.slug.data_key(&garbage)).unwrap(), Bytes::from_static(b"data")).await.unwrap();
+    store.put(&ObjectKey::new(entry.slug.metadata_key(&garbage)).unwrap(), Bytes::from_static(b"metadata")).await.unwrap();
+    let publisher = Arc::new(DeletedPublisher { store: store.clone(), table: entry.clone(), commits: Mutex::new(Vec::new()) });
+    let state = Arc::new(PartitionState::new(PartitionValue::loaded(catalog, tables, TrieConfig::default()).unwrap()));
+    let now = Arc::new(AtomicI64::new(1_000));
+    let clock = { let now = Arc::clone(&now); Arc::new(move || now.load(Ordering::Relaxed)) };
+    let config = GarbageConfig { reader_lease: Duration::from_micros(500), reader_lease_margin: Duration::from_micros(100), ..GarbageConfig::default() };
+    let collector = TrieCollector::new(store.clone(), state, publisher.clone(), Arc::new(Observer::default()), config, clock).unwrap();
+    let cancellation = CancellationToken::new();
+
+    collector.collect_as_of(Timestamp(100), &cancellation).await.unwrap();
+    now.store(1_499, Ordering::Relaxed);
+    collector.collect_as_of(Timestamp(100), &cancellation).await.unwrap();
+    assert!(publisher.commits.lock().unwrap().is_empty());
+    assert!(store.head(&ObjectKey::new(entry.slug.data_key(&garbage)).unwrap()).await.is_ok());
+
+    now.store(1_500, Ordering::Relaxed);
+    collector.collect_as_of(Timestamp(100), &cancellation).await.unwrap();
+    assert_eq!(*publisher.commits.lock().unwrap(), vec![vec![garbage.clone()]]);
+    assert!(store.head(&ObjectKey::new(entry.slug.data_key(&garbage)).unwrap()).await.is_err());
+}
+
+#[test]
+fn a_reader_lease_must_exceed_its_margin() {
+    let config = |lease, margin| GarbageConfig { reader_lease: Duration::from_secs(lease), reader_lease_margin: Duration::from_secs(margin), ..GarbageConfig::default() };
+    let store = Arc::new(MemoryStore::default());
+    let state = Arc::new(PartitionState::empty(TrieConfig::default()).unwrap());
+    let table = TableCatalog::default().with_seeded_table(TableRef::new("public", "docs"), Vec::new()).unwrap();
+    let entry = table.entry(&TableRef::new("public", "docs")).unwrap().clone();
+    let publisher = Arc::new(DeletedPublisher { store: store.clone(), table: entry, commits: Mutex::new(Vec::new()) });
+    for (lease, margin, valid) in [(60, 59, true), (60, 60, false), (0, 0, true), (0, 1, false)] {
+        let built = TrieCollector::new(store.clone(), state.clone(), publisher.clone(), Arc::new(Observer::default()), config(lease, margin), fixed_clock());
+        assert_eq!(built.is_ok(), valid, "lease {lease}s, margin {margin}s");
+    }
 }

@@ -1,0 +1,105 @@
+{
+  "summary": "A request a reader lease admits finishes before the collector may delete any file its catalog referenced.",
+  "flags": [
+    "--no-external-by-default",
+    "--verify-module",
+    "production",
+    "--verify-module",
+    "laws"
+  ],
+  "min_verified_functions": 5,
+  "controls": {
+    "inclusive_deadline": {
+      "defect": "A request may begin at the deadline itself.",
+      "mutate": [
+        {
+          "file": "rust/crates/storage/src/lease_decision.rs",
+          "find": "    now < deadline\n",
+          "replace": "    now <= deadline\n"
+        }
+      ],
+      "expect": [
+        {
+          "file": "rust/crates/storage/src/lease_decision.rs",
+          "function": "lease_admits",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 4
+    },
+    "inclusive_deadline_with_weakened_contract": {
+      "defect": "Both the runtime and its contract admit a request at the deadline.",
+      "mutate": [
+        {
+          "file": "rust/crates/storage/src/lease_decision.rs",
+          "find": "    now < deadline\n",
+          "replace": "    now <= deadline\n"
+        },
+        {
+          "file": "rust/crates/storage/src/lease_decision.rs",
+          "find": "ensures out == (now < deadline),",
+          "replace": "ensures out == (now <= deadline),"
+        }
+      ],
+      "expect": [
+        {
+          "file": "verification/verus/read_lease/laws.rs",
+          "function": "a_read_at_its_deadline_is_refused",
+          "category": "assertion failed"
+        },
+        {
+          "file": "verification/verus/read_lease/laws.rs",
+          "function": "an_admitted_read_finishes_before_collection",
+          "category": "assertion failed"
+        }
+      ],
+      "min_verified_functions": 3
+    },
+    "omit_margin_with_weakened_contract": {
+      "defect": "The deadline ignores clock skew and request duration, in the runtime and its contract.",
+      "mutate": [
+        {
+          "file": "rust/crates/storage/src/lease_decision.rs",
+          "find": "Some(end) => end.checked_sub(margin),",
+          "replace": "Some(end) => Some(end),"
+        },
+        {
+          "file": "rust/crates/storage/src/lease_decision.rs",
+          "find": "        && i64::MIN as int <= anchor as int + lease as int - margin as int <= i64::MAX as int {\n        Some((anchor as int + lease as int - margin as int) as i64)",
+          "replace": "        {\n        Some((anchor as int + lease as int) as i64)"
+        }
+      ],
+      "expect": [
+        {
+          "file": "verification/verus/read_lease/laws.rs",
+          "function": "an_admitted_read_finishes_before_collection",
+          "category": "assertion failed"
+        }
+      ],
+      "min_verified_functions": 4
+    },
+    "collect_without_waiting_with_weakened_contract": {
+      "defect": "The collector deletes as soon as it observes garbage, in the runtime and its contract.",
+      "mutate": [
+        {
+          "file": "rust/crates/storage/src/lease_decision.rs",
+          "find": "Some(end) => end <= now,",
+          "replace": "Some(_) => first_observed <= now,"
+        },
+        {
+          "file": "rust/crates/storage/src/lease_decision.rs",
+          "find": "ensures out == (i64::MIN as int <= first_observed as int + lease as int <= now as int),",
+          "replace": "ensures out == (i64::MIN as int <= first_observed as int + lease as int <= i64::MAX as int && first_observed <= now),"
+        }
+      ],
+      "expect": [
+        {
+          "file": "verification/verus/read_lease/laws.rs",
+          "function": "an_admitted_read_finishes_before_collection",
+          "category": "assertion failed"
+        }
+      ],
+      "min_verified_functions": 4
+    }
+  }
+}

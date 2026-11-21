@@ -23,6 +23,19 @@
 -- An admitted provider operation retains that registration through completion, including after caller cancellation.
 -- Compactor reset requires collection authorization to drain before it can reopen key allocation.
 --
+-- Query snapshots on every node also hold a bounded read lease, because another node's collector cannot see them.
+-- A node anchors its lease at a monotonic clock reading taken before it reads the replica log's tip, once its catalog has applied that tip.
+-- A snapshot captured after that confirmation may begin provider requests strictly before the anchor plus `reader_lease` minus `reader_lease_margin`.
+-- Each provider request checks the lease when it is admitted; a request admitted in time runs to completion.
+-- Objects are immutable, so a request that overruns the deadline can only fail; a missing object it then reports is classified as the expired lease.
+-- A node reading a scan fragment for another node's query captures its own snapshot and holds its own lease.
+-- A later request fails with `rtdb.storage/read-lease-expired` rather than reading a file that may be gone.
+-- A node whose catalog cannot be confirmed current waits up to the margin for its log processor, then holds an expired lease.
+-- The native collector deletes an eligible trie only once `reader_lease` has passed on its own monotonic clock since it first observed that trie as eligible.
+-- In Multi, that deletion records a release, which the cell reaper erases only after its grace.
+-- A new collector, after restart or failover, observes afresh.
+-- Both sides measure elapsed time, so clocks need no synchronization; the margin covers twice the rate drift over one lease plus the longest provider request.
+--
 -- Block-file GC lives in block-gc.allium — block files are consumed only at
 -- startup/catch-up, so they don't need replica-log coordination.
 --

@@ -1,5 +1,5 @@
-use std::collections::BTreeSet;
-use std::sync::Arc;
+use std::collections::{BTreeMap, BTreeSet};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use async_trait::async_trait;
 use futures::{StreamExt, stream};
@@ -18,10 +18,16 @@ pub struct GarbageConfig {
     pub table_parallelism: usize,
     pub delete_parallelism: usize,
     pub chunk_size: usize,
+    /// How long a reader on any node may begin provider requests after its catalog was confirmed current.
+    /// The collector waits this long on its own clock after first observing a trie as garbage.
+    pub reader_lease: Duration,
+    /// Subtracted from a reader's lease: twice the bound on clock skew between nodes, plus the longest provider request.
+    pub reader_lease_margin: Duration,
 }
 
 impl Default for GarbageConfig {
-    fn default() -> Self { Self { blocks_to_keep: 10, garbage_lifetime: Duration::from_secs(24 * 60 * 60), table_parallelism: 8, delete_parallelism: 64, chunk_size: 1024 } }
+    fn default() -> Self { Self { blocks_to_keep: 10, garbage_lifetime: Duration::from_secs(24 * 60 * 60), table_parallelism: 8, delete_parallelism: 64, chunk_size: 1024,
+        reader_lease: Duration::from_secs(60 * 60), reader_lease_margin: Duration::from_secs(60) } }
 }
 
 impl GarbageConfig {
@@ -29,8 +35,19 @@ impl GarbageConfig {
         if self.blocks_to_keep == 0 || self.table_parallelism == 0 || self.delete_parallelism == 0 || self.chunk_size == 0 || self.chunk_size > 1024 {
             return Err(crate::invalid("Garbage collection requires positive retention and concurrency, with at most 1024 trie keys per chunk"));
         }
+        if self.reader_lease_margin >= self.reader_lease && !(self.reader_lease.is_zero() && self.reader_lease_margin.is_zero()) {
+            return Err(crate::invalid("The reader lease must exceed its margin; a zero lease admits no provider request from another node"));
+        }
+        self.reader_lease_micros()?;
+        self.reader_lease_margin_micros()?;
         Ok(())
     }
+    pub fn reader_lease_micros(&self) -> Result<i64> { micros(self.reader_lease) }
+    pub fn reader_lease_margin_micros(&self) -> Result<i64> { micros(self.reader_lease_margin) }
+}
+
+fn micros(duration: Duration) -> Result<i64> {
+    i64::try_from(duration.as_micros()).map_err(|_| crate::invalid("Reader lease exceeds the timestamp range"))
 }
 
 pub trait CollectionObserver: Send + Sync {
@@ -41,7 +58,13 @@ pub fn block_is_garbage(block: BlockIndex, latest: BlockIndex, keep: usize) -> b
     crate::retention::block_is_eligible(block.0, latest.0, keep)
 }
 
+/// Monotonic microseconds; the collector measures only the time elapsed since it first observed a trie.
+pub type CollectorClock = Arc<dyn Fn() -> i64 + Send + Sync>;
+
 pub struct TrieCollector {
+    clock: CollectorClock,
+    /// When this collector first saw each trie as eligible; a new collector starts empty and waits afresh.
+    first_observed: Mutex<BTreeMap<(TableRef, TrieKey), i64>>,
     store: Arc<dyn ObjectStore>,
     partition: Arc<PartitionState>,
     publisher: Arc<dyn TrieDeletionPublisher>,
@@ -51,9 +74,23 @@ pub struct TrieCollector {
 
 impl TrieCollector {
     pub fn new(store: Arc<dyn ObjectStore>, partition: Arc<PartitionState>, publisher: Arc<dyn TrieDeletionPublisher>,
-        observer: Arc<dyn CollectionObserver>, config: GarbageConfig) -> Result<Self> {
+        observer: Arc<dyn CollectionObserver>, config: GarbageConfig, clock: CollectorClock) -> Result<Self> {
         config.validate()?;
-        Ok(Self { store, partition, publisher, observer, config })
+        Ok(Self { clock, first_observed: Mutex::default(), store, partition, publisher, observer, config })
+    }
+
+    /// Keeps the eligible tries whose reader lease has elapsed since this collector first observed them.
+    fn leased_out(&self, table: &TableRef, eligible: Vec<TrieKey>) -> Result<Vec<TrieKey>> {
+        let lease = self.config.reader_lease_micros()?;
+        let now = (self.clock)();
+        let mut first_observed = self.first_observed.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let current: BTreeSet<&TrieKey> = eligible.iter().collect();
+        first_observed.retain(|(observed, key), _| observed != table || current.contains(key));
+        drop(current);
+        Ok(eligible.into_iter().filter(|key| {
+            let first = *first_observed.entry((table.clone(), key.clone())).or_insert(now);
+            rtdb_storage::read_lease::collection_waited(first, lease, now)
+        }).collect())
     }
 
     pub async fn default_garbage_as_of(&self) -> Result<Option<Timestamp>> {
@@ -74,7 +111,10 @@ impl TrieCollector {
             let deletes = Arc::clone(&deletes);
             let collection = Arc::clone(&collection);
             async move {
-                let keys = collection.eligible(&entry.table, as_of);
+                let keys = match self.leased_out(&entry.table, collection.eligible(&entry.table, as_of)) {
+                    Ok(keys) => keys,
+                    Err(error) => { self.observer.table_failed(Some(&entry.table), &error); return; }
+                };
                 let groups = finished_groups(collection.current().trie_catalog(), &entry.table, &keys);
                 let result = IoRegion::retaining(collection, self.collect_table(&entry, &keys, &groups, &deletes, cancellation)).await;
                 if let Err(error) = &result { if !cancellation.is_cancelled() { self.observer.table_failed(Some(&entry.table), error); } }
