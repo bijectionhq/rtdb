@@ -202,7 +202,10 @@ The model admits a valid frame before the receipt arrives, prevents a changed fr
 
 End-to-end refinement still needs the concurrent appender and driver to refine the queue model, including a provider append that becomes durable after cancellation and replay through a later term.
 The frame check applies to the native driver when it admits read-back at the current leader's term.
-The Kotlin path checks the transaction ID against the staged head and still applies the replica record's catalog operation ahead of that check.
+The Kotlin path checks the transaction ID against the staged head before applying that head's catalog operation.
+A JVM regression supplies an attach in a read-back with no matching staged transaction and checks that the catalog and applied progress stay unchanged.
+The existing attach regression checks that the catalog effect occurs on valid read-back. [JVM leader tests](../../core/src/test/kotlin/xtdb/indexer/LeaderLogProcessorTest.kt)
+The remaining Kotlin refinement needs a check of exact append and frame agreement beyond comparing their transaction IDs.
 Inherited recovery still relies on the log and object providers to return the stored records and on the follower decoder to reconstruct the same effects.
 
 ### Limit opening and count admission

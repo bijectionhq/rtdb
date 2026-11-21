@@ -25,6 +25,7 @@ import xtdb.api.DatabaseName
 import xtdb.api.TableRef
 import xtdb.api.TransactionResult
 import xtdb.api.error.Fault
+import xtdb.api.log.DbOp
 import xtdb.api.log.InMemoryLog
 import xtdb.api.log.Log
 import xtdb.api.log.ReplicaMessage
@@ -149,15 +150,19 @@ internal class LeaderLogProcessorTest : LeaderTermTest() {
     }
 
     @Test
-    fun `a tx of the leader's own term that it did not resolve next fails rather than applying`() = runTest {
+    fun `an unmatched own read-back leaves both the catalog and transaction unapplied`() = runTest {
         val watchers = Watchers(latestTxId = -1, latestSourceMsgId = -1)
-        val proc = unstartedTerm(watchers).proc
+        val dbCatalog = RecordingDbCatalog()
+        val proc = unstartedTerm(watchers, dbCatalog = dbCatalog).proc
 
         val fault = assertThrows<Fault> {
             proc.applyReplicaMessage(
                 Log.Record(
                     0, 0, Instant.now(),
-                    ReplicaMessage.ResolvedTx(0, Instant.now(), true, null, emptyMap(), srcMsgId = 0, termId = 1)
+                    ReplicaMessage.ResolvedTx(
+                        0, Instant.now(), true, null, emptyMap(),
+                        dbOp = DbOp.Attach("new_db", Database.Config()), srcMsgId = 0, termId = 1,
+                    )
                 )
             )
         }
@@ -166,7 +171,8 @@ internal class LeaderLogProcessorTest : LeaderTermTest() {
             Keyword.intern("xtdb.indexer", "leader-read-back-mismatch"),
             fault.data.valAt(Keyword.intern("xtdb.error", "code")),
         )
-        assertEquals(-1L, watchers.latestTxId, "nothing was applied")
+        assertEquals(-1L, watchers.latestTxId)
+        assertTrue(dbCatalog.databaseNames.isEmpty())
     }
 
     private fun record(msgId: Long, msg: ReplicaMessage) = Log.Record(0, msgId, Instant.now(), msg)

@@ -1133,8 +1133,9 @@ rule LeaderAppliesRecord {
 rule LeaderAppliesOwnTx {
     -- The leader reads its own staged transaction back at its own term and IMPORTS it, from the resolver's QUEUE HEAD.
     -- Apply must find the corresponding staged transaction at the head of the resolver queue, or it faults with xtdb.indexer/leader-read-back-mismatch.
-    -- The catalog operation below describes native apply.
-    -- The Kotlin leader currently applies the replica record's catalog operation before checking the staged head.
+    -- The matched staged transaction supplies the catalog operation on both engines.
+    -- The native driver applies the partition before the catalog operation.
+    -- The Kotlin leader applies the catalog operation before importing the staged rows.
     --
     -- This is the point at which the transaction becomes queryable: the DURABLE head advances here, the watchers advance here, and an external caller's durability handle completes here — after, not before, the transaction is durable.
     --

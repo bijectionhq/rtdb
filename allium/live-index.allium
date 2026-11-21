@@ -524,6 +524,7 @@ rule ApplyResolvedTx {
     --
     -- The native read-back must confirm the encoded transaction at its pending append sequence before the leader can buffer or apply it.
     -- Before importing rows from the queue head, the native leader checks that it is the transaction owned by that pending append.
+    -- Both engines apply the queue head's catalog operation after matching the transaction.
     -- A native read-back fault reaches the pending caller when the admitted term and sequence identify its submission.
     -- A failure applying the staged transaction or advancing its progress reaches that transaction's pending caller.
     --
