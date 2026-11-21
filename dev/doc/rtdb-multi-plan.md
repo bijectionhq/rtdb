@@ -723,6 +723,13 @@ Moves are invisible to clients only if the gateway owns connections and session 
    If a holder accepts a socket but stalls before `ReadyForQuery`, the gateway closes startup with SQLSTATE `57P03` so the client can retry.
    A retry waits for a placement change or the 100 ms fallback timer, whichever arrives first.
    If a placed database detaches or changes while a query checks authority, the node refuses before planning so the gateway can retry.
+   A direct Flight SQL session on a placed node supplies `x-xtdb-database` on its first authenticated request.
+   Later calls can omit the header and use the bound deployment.
+   A conflicting header or a ticket naming a different deployment is refused.
+   Transaction and prepared-statement handles are scoped to their authenticated owner and local placement.
+   Listing catalogs through a placed Flight SQL endpoint reports the session's deployment.
+   A backend session belongs to the local placement it opens against.
+   If the node opens a new placement with the same name, the gateway must establish a new backend session.
    A driver that stops during execution can leave the outcome unknown.
    The gateway replays the command under its original key when the client has received no answer.
    Writable pgwire sessions accept pipelined frames and dispatch one command cycle at a time.

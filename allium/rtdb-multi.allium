@@ -2355,6 +2355,11 @@ invariant ObjectsStayInTheirLineage {
 invariant OneDatabasePerSession {
     -- A session's catalog contains exactly its capability's deployment; the planner cannot name another.
     -- Placed session transaction inspection reports only the deployment's progress.
+    -- A node session is bound to the placement it opened against.
+    -- A replacement with the same name requires a new backend session.
+    -- Placed Flight SQL selects its deployment on the first authenticated request.
+    -- A session can redeem tickets and use handles only within its deployment.
+    -- A transaction or prepared handle requires its authenticated owner and local attachment.
     -- A session waits for the positions in its own deployment when applying an await token.
     -- Cross-deployment reads exist only through an explicit grant, served on the snapshot tier.
     -- For a configured user grant list, an exact database rule takes precedence over the user's default rule, including during gateway reconnection.

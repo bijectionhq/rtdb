@@ -5,7 +5,7 @@ use futures::Stream;
 use prost::Message;
 use rtdb_auth::Authenticator;
 use rtdb_columnar::{MemoryBudget, MemoryReservation};
-use rtdb_node::{Clock, Node, SessionIdentity};
+use rtdb_node::{Clock, DatabaseAccess, Node, SessionIdentity};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, watch};
 use tokio_util::sync::CancellationToken;
 use tonic::{Request, Response, Status, Streaming};
@@ -88,6 +88,7 @@ impl Service {
             wire::add(bytes, wire::mul(size, 16)?)
         })?;
         let reservation = self.memory().reserve(wire::add(header_bytes, wire::mul(body_bytes, 32)?)?).map_err(status)?;
+        let requested_database = request.metadata().get("x-xtdb-database").map(|value| value.to_str().map_err(arrow)).transpose()?;
         let credentials = Credentials::parse(request)?;
         let cookie = auth::cookie(request); let bearer = credentials.bearer();
         if let (Some(cookie), Some(bearer)) = (cookie, bearer) { if !auth::equal(cookie.as_bytes(), bearer.as_bytes()) { return Err(auth::unauthenticated("the session cookie and bearer token name different sessions")); } }
@@ -107,12 +108,20 @@ impl Service {
         } else {
             let peer = request.remote_addr().map(|address| address.ip().to_string());
             let caller = self.0.cancellation.run_until_cancelled(self.0.auth.authenticate(&credentials, peer.as_deref())).await.ok_or_else(cancelled)??;
-            let session = Arc::new(Session::new(Uuid::new_v4().to_string(), caller, self.memory().reserve(1024).map_err(status)?));
+            let catalog = self.0.node.catalog();
+            let placement = if catalog.is_placed() {
+                let name = requested_database.filter(|name| !name.is_empty())
+                    .ok_or_else(|| Status::invalid_argument("A placed Flight SQL session requires x-xtdb-database"))?;
+                caller.principal.authorize_database(name, DatabaseAccess::Read).map_err(status)?;
+                Some(catalog.database(name).map_err(status)?)
+            } else { None };
+            let capacity = 1024 + placement.as_ref().map_or(0, |database| database.name().len());
+            let session = Arc::new(Session::new(Uuid::new_v4().to_string(), caller, placement.as_ref(), self.memory().reserve(capacity).map_err(status)?));
             self.0.sessions.insert(session.id.clone(), Arc::clone(&session), self.0.config.session_idle_timeout, self.0.config.session_unclaimed_timeout, true, session.id.len()).map_err(status)?;
             let lease = AcquiredSession { service: self.clone(), session: Arc::clone(&session) };
             (session, true, lease)
         };
-        let database = request.metadata().get("x-xtdb-database").map(|value| value.to_str().map_err(arrow)).transpose().and_then(|header| session.database(header))?;
+        let database = session.database(requested_database, &self.0.node)?;
         let call = Call { service: self.clone(), session, minted, database, cancellation: self.0.cancellation.child_token(), _admission: admission, _lease: Some(lease), _reservation: reservation };
         self.publish(); Ok(call)
     }
@@ -126,11 +135,11 @@ impl Service {
     }
     pub fn transaction(&self, call: &Call, handle: &Bytes) -> Result<Arc<Transaction>, Status> {
         let value = found(self.0.transactions.lookup(handle, false), "transaction")?;
-        if value.owner != call.session.caller.owner { return Err(Status::not_found("unknown transaction")); } Ok(value)
+        if !call.session.owns(&value.owner) { return Err(Status::not_found("unknown transaction")); } Ok(value)
     }
     pub fn prepared(&self, call: &Call, handle: &Bytes) -> Result<Arc<Prepared>, Status> {
         let value = found(self.0.prepared.lookup(handle, false), "prepared statement")?;
-        if value.owner != call.session.caller.owner { return Err(Status::not_found("unknown prepared statement")); } Ok(value)
+        if !call.session.owns(&value.owner) { return Err(Status::not_found("unknown prepared statement")); } Ok(value)
     }
     pub async fn scoped(&self, call: &Call, scope: &PreparedScope) -> Result<Arc<ConnectionResource>, Status> {
         match scope { PreparedScope::Session(database) => self.connection(call, database).await, PreparedScope::Transaction(handle) => Ok(Arc::clone(&self.transaction(call, handle)?.connection)) }

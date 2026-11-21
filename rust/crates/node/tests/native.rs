@@ -107,6 +107,32 @@ async fn a_placed_query_refuses_a_database_detached_or_replaced_while_checking_i
 }
 
 #[tokio::test]
+async fn a_placed_session_cannot_reopen_a_replaced_database() {
+    let mut config = options();
+    config.membership = Membership::Placed;
+    let (node, driver) = running(config, services()).await;
+    node.database_or_attach("shop".into(), Default::default()).await.unwrap().unwrap();
+    let mut original = node.session("shop", Arc::new(Authority)).unwrap();
+    let result = original.query_sql("SELECT 1", vec![]).await.unwrap();
+    assert_eq!(rows(result).await, [vec![Value::I64(1)]]);
+
+    node.detach_local("shop".into()).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while node.catalog().is_draining("shop") { tokio::task::yield_now().await; }
+    }).await.unwrap();
+    node.database_or_attach("shop".into(), Default::default()).await.unwrap().unwrap();
+    let mut replacement = node.session("shop", Arc::new(Authority)).unwrap();
+    assert_eq!(rows(replacement.query_sql("SELECT 2", vec![]).await.unwrap()).await, [vec![Value::I64(2)]]);
+    let Err(error) = original.query_sql("SELECT 3", vec![]).await else {
+        panic!("the stale session opened a query on the replacement");
+    };
+    assert_eq!(error.code, NOT_HELD);
+    let error = original.state_mut().submit_tx(Vec::new(), Default::default()).await.unwrap_err();
+    assert_eq!(error.code, NOT_HELD);
+    stop(&node, driver).await;
+}
+
+#[tokio::test]
 async fn a_placed_session_waits_for_its_own_await_basis() {
     let mut config = options();
     config.membership = Membership::Placed;
