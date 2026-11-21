@@ -11,8 +11,8 @@ use rtdb_maintenance::CollectionObserver;
 use rtdb_plan::{CatalogMetrics, CatalogUsers};
 use rtdb_query::{CatalogSnapshot, DatabaseSnapshot, PreparedQuery, QueryContext, QueryCursor};
 use rtdb_storage::cache::CacheBudget;
-use rtdb_tx::{RetainedAnomaly, SubmitOptions, SubmittedTx, TransactionAuthorization, TransactionResult, TxOp, prepare_submission_with_sql_options};
-use rtdb_types::{Anomaly, AnomalyCategory, LogicalType, Result, SourcePosition, TimeBasis, TimeUnit, Timestamp, TransactionKey, TxBasis, TxId, Value};
+use rtdb_tx::{IDEMPOTENCY_GUARD_RESULT, RetainedAnomaly, SubmitOptions, SubmittedTx, TransactionAuthorization, TransactionResult, TxOp, prepare_submission_with_sql_options};
+use rtdb_types::{Anomaly, AnomalyCategory, Instant, LogicalType, Result, SourcePosition, TimeBasis, TimeUnit, Timestamp, TransactionKey, TxBasis, TxId, Value};
 use tokio::sync::{Semaphore, mpsc, oneshot};
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
@@ -378,21 +378,35 @@ impl Node {
         rtdb_storage::IoRegion::leased(lease, rtdb_query::evaluate_fragment(context, fragment)).await
     }
 
-    async fn submit(&self, database: &str, mut operations: Vec<TxOp>, mut options: SubmitOptions, identity: &dyn SessionIdentity, placement: Option<&Weak<Database>>, cancellation: &CancellationToken) -> Result<SubmittedTx> {
+    async fn submit(&self, database: &str, operations: Vec<TxOp>, mut options: SubmitOptions, permit: Option<crate::ReplaySubmissionPermit>, identity: &dyn SessionIdentity, placement: Option<&Weak<Database>>, cancellation: &CancellationToken) -> Result<SubmittedTx> {
         self.admit(database, DatabaseAccess::Write, identity, cancellation).await?;
         let database = self.attached_database(database, placement)?;
         let admission = if self.catalog.is_placed() {
             Some(cancellation.run_until_cancelled(database.admit_transaction()).await.ok_or_else(cancelled)??)
         } else { None };
+        let replay = permit.map(|permit| {
+            let key = options.user_metadata.as_ref().and_then(|metadata| idempotency_key(metadata.value()));
+            if key.is_some_and(|key| key != permit.key) {
+                return Err(Anomaly::incorrect("rtdb.node/conflicting-replay-key", "Application key conflicts with the private replay permit"));
+            }
+            let submitted_at = self.now();
+            let replay = rtdb_tx::ReplaySubmission::admit(&permit.key, submitted_at, permit.not_after)?;
+            Ok((replay, submitted_at))
+        }).transpose()?;
         database.require_writable()?;
         if database.external_source() { return Err(Anomaly::incorrect("xtdb/submit-tx-to-external-source-db", "Cannot submit transactions to an external-source database").with_context("db-name", database.name().into())); }
         options.user = identity.user().map(str::to_owned);
         options.default_tz = rtdb_expr::normalize_timezone(&options.default_tz)?;
         let sql_options = rtdb_sql::PrepareOptions { generate_series_end_exclusive: self.factory.options.query.generate_series_end_exclusive, ..Default::default() };
         let source = prepare_submission_with_sql_options(operations, options, database.name(), &self.factory.memory, &sql_options)?;
+        let (source, submitted_at) = match replay {
+            Some((replay, submitted_at)) => (source.with_replay_submission(replay), Some(submitted_at)),
+            None => (source, None),
+        };
         let payload = source.encode()?.into_bytes();
         let submitted_bytes = payload.len() as u64;
-        let position = cancellation.run_until_cancelled(database.replication.submit_source_encoded(payload, self.now())).await.ok_or_else(cancelled)??;
+        let append_time = submitted_at.unwrap_or_else(|| self.now());
+        let position = cancellation.run_until_cancelled(database.replication.submit_source_encoded(payload, append_time)).await.ok_or_else(cancelled)??;
         if let Some(admission) = &admission {
             database.record_submission(submitted_bytes);
             let mut latest = admission.lock();
@@ -401,6 +415,37 @@ impl Node {
         Ok(SubmittedTx { tx_id: TxId(position.0) })
     }
 
+    /// The committed outcome visible to the retry when its duplicate guard ran.
+    async fn historical_keyed_transaction(&self, database: &str, key: &str, retry_time: Timestamp, submitted_at: Timestamp, identity: &dyn SessionIdentity, placement: Option<&Weak<Database>>, cancellation: &CancellationToken) -> Result<Option<TransactionKey>> {
+        let basis = QueryBasis { snapshot: self.snapshot_basis()?, snapshot_time: None, current_time: self.query_instant(), timezone: self.factory.options.default_timezone.clone() };
+        let context = self.query_context_in_placement(database, &basis, identity, placement, cancellation).await?;
+        let timestamp = |time: Timestamp| Value::Timestamp { value: time.0, unit: TimeUnit::Microsecond, timezone: Some("UTC".into()) };
+        let arguments = vec![timestamp(retry_time), timestamp(submitted_at), Value::Utf8(key.to_owned())];
+        let options = rtdb_sql::PrepareOptions {
+            parameter_types: arguments.iter().enumerate().map(|(index, value)| (index, value.logical_type())).collect(),
+            default_timezone: context.timezone.clone(),
+            generate_series_end_exclusive: context.options.generate_series_end_exclusive,
+            ..Default::default()
+        };
+        let sql = "SELECT _id, system_time FROM xt.txs FOR ALL VALID_TIME WHERE committed = true AND system_time = (SELECT k._system_from FROM public.rtdb_idempotency_keys FOR SYSTEM_TIME AS OF ? FOR VALID_TIME FROM ? TO NULL AS k WHERE k._id = ? ORDER BY k._system_from DESC LIMIT 1)";
+        let prepared = match prepare_query(sql, &context, &options) {
+            Ok(prepared) => prepared,
+            Err(error) if error.code == "xtdb/table-not-found" || error.code.contains("unknown-table") => return Ok(None),
+            Err(error) => return Err(error),
+        };
+        let mut cursor = prepared.execute(context, arguments).await?;
+        while let Some(batch) = cursor.next_batch().await? {
+            let batch = batch.batch();
+            if batch.num_rows() == 0 { continue; }
+            let id = read_value(batch.schema().field(0), batch.column(0).as_ref(), 0)?;
+            let time = read_value(batch.schema().field(1), batch.column(1).as_ref(), 0)?;
+            let (Value::I64(id), Value::Timestamp { value, unit: TimeUnit::Microsecond, .. }) = (id, time) else {
+                return Err(Anomaly::fault("rtdb.node/idempotency-result", "Stored idempotency outcome has no transaction key"));
+            };
+            return Ok(Some(TransactionKey { tx_id: TxId(id), system_time: Timestamp(value) }));
+        }
+        Ok(None)
+    }
     pub async fn await_transaction(&self, database: &str, tx_id: TxId, identity: &dyn SessionIdentity, cancellation: &CancellationToken) -> Result<TransactionResult> {
         self.await_transaction_in_placement(database, tx_id, identity, None, cancellation).await
     }
@@ -410,8 +455,13 @@ impl Node {
         self.ensure_indexing()?;
         let db = self.attached_database(database, placement)?;
         let latest = db.replication.await_tx(tx_id, cancellation).await?;
-        if let Some(result) = &latest {
-            return Ok(answer_duplicate(result.as_ref().clone()));
+        if let Some(result) = &latest && !result.error().is_some_and(is_historical_guard_abort) {
+            if !db.external_source()
+                && let Some(original) = result.error().map(rtdb_tx::private_replay_original).transpose()?.flatten()
+            {
+                return Ok(TransactionResult::Committed { tx_key: original });
+            }
+            return Ok(if db.external_source() { result.as_ref().clone() } else { answer_duplicate(result.as_ref().clone()) });
         }
         let basis = QueryBasis { snapshot: self.snapshot_basis()?, snapshot_time: None, current_time: self.query_instant(), timezone: self.factory.options.default_timezone.clone() };
         let context = self.query_context_in_placement(database, &basis, identity, placement, cancellation).await?;
@@ -438,7 +488,23 @@ impl Node {
                         _ => return Err(Anomaly::fault("rtdb.node/tx-result-error", "Stored transaction error is not Transit")),
                     }
                 };
-                Ok(answer_duplicate(TransactionResult::Aborted { tx_key, error }))
+                if !db.external_source()
+                    && let Some(error) = &error
+                    && let Some(original) = rtdb_tx::private_replay_original(error)?
+                {
+                    return Ok(TransactionResult::Committed { tx_key: original });
+                }
+                if !db.external_source()
+                    && let Some(error) = &error
+                    && is_historical_guard_abort(error)
+                    && let Some(key) = idempotency_key(&cell("user_metadata")?)
+                    && let Some(submitted_at) = historical_guard_sample(error)
+                    && let Some(original) = self.historical_keyed_transaction(database, key, system_time, submitted_at, identity, placement, cancellation).await?
+                {
+                    return Ok(TransactionResult::Committed { tx_key: original });
+                }
+                let result = TransactionResult::Aborted { tx_key, error };
+                Ok(if db.external_source() { result } else { answer_duplicate(result) })
             }
             _ => Err(Anomaly::fault("rtdb.node/tx-result-status", "Stored transaction result has no commit status")),
         }
@@ -699,7 +765,12 @@ impl SessionService for NativeSessionService {
         tokio::time::timeout(timeout, database.replication.await_source(SourcePosition(position.0), cancellation)).await.map_err(|_| timeout_error())??;
         Ok(())
     }
-    async fn submit(&self, database: &str, operations: Vec<TxOp>, options: SubmitOptions, cancellation: &CancellationToken) -> Result<SubmittedTx> { self.node.submit(database, operations, options, self.identity.as_ref(), self.placement.as_ref(), cancellation).await }
+    async fn submit(&self, database: &str, operations: Vec<TxOp>, options: SubmitOptions, cancellation: &CancellationToken) -> Result<SubmittedTx> {
+        self.node.submit(database, operations, options, None, self.identity.as_ref(), self.placement.as_ref(), cancellation).await
+    }
+    async fn submit_replay(&self, database: &str, operations: Vec<TxOp>, options: SubmitOptions, permit: crate::ReplaySubmissionPermit, cancellation: &CancellationToken) -> Result<SubmittedTx> {
+        self.node.submit(database, operations, options, Some(permit), self.identity.as_ref(), self.placement.as_ref(), cancellation).await
+    }
     async fn await_transaction(&self, database: &str, tx_id: TxId, cancellation: &CancellationToken) -> Result<TransactionResult> { self.node.await_transaction_in_placement(database, tx_id, self.identity.as_ref(), self.placement.as_ref(), cancellation).await }
 }
 
@@ -734,6 +805,13 @@ pub(crate) fn with_idempotency_key(metadata: Option<rtdb_tx::UserMetadata>, key:
     rtdb_tx::UserMetadata::new(Value::Struct(fields), memory)
 }
 
+fn historical_guard_sample(error: &Anomaly) -> Option<Timestamp> {
+    error.context.get(IDEMPOTENCY_GUARD_RESULT)?.as_i64().map(Timestamp)
+}
+
+fn is_historical_guard_abort(error: &Anomaly) -> bool {
+    error.code == "xtdb/assert-failed" && historical_guard_sample(error).is_some()
+}
 
 /// The code a placed node refuses a command with when it no longer holds the command's database.
 pub const NOT_HELD: &str = "rtdb.node/database-not-held";

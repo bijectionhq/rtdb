@@ -224,6 +224,37 @@ async fn staged_txs_read_your_writes_across_a_batch_and_each_argument_row() {
 }
 
 #[tokio::test]
+async fn staged_snapshot_requires_the_predecessor_and_block_of_each_overlay() {
+    let state = PartitionState::empty(Default::default()).unwrap();
+    let captured = state.value().snapshot();
+    let context = context();
+    let mut resolver = TxResolver::new(None, SourcePosition(-1), None, &context.memory).unwrap();
+    let first = resolver.resolve_source(captured.clone(), SourcePosition(0), Timestamp(100),
+        request(vec![put(&context, 10, 0, i64::MAX)], &context), &context).await.unwrap();
+    let second = resolver.resolve_source(captured.clone(), SourcePosition(1), Timestamp(101),
+        request(vec![put(&context, 20, 0, i64::MAX)], &context), &context).await.unwrap();
+
+    let reversed = [Arc::clone(second.writes()), Arc::clone(first.writes())];
+    assert!(matches!(captured.with_staged(&reversed), Err(error) if error.code == "rtdb.index/overlay-order"));
+    let wrong_block = rtdb_types::BlockIndex(captured.block_index().0 + 1);
+    let wrong = rtdb_index::StagedWrite::new(first.result().tx_key(), None, wrong_block, first.writes().tables().clone()).unwrap();
+    assert!(matches!(captured.with_staged(&[Arc::new(wrong)]), Err(error) if error.code == "rtdb.index/overlay-order"));
+
+    let before_apply = resolver.resolving_snapshot(captured.clone()).unwrap();
+    assert_eq!(before_apply.tx_basis(), Some(second.result().tx_key()));
+    assert_eq!(before_apply.iter_segments(&table()).count(), 2);
+    assert_eq!(captured.tx_basis(), None);
+    assert!(!captured.contains_table(&table()));
+
+    state.apply(resolver.take_head().unwrap().writes()).unwrap();
+    let after_apply = resolver.resolving_snapshot(state.value().snapshot()).unwrap();
+    assert_eq!(after_apply.tx_basis(), before_apply.tx_basis());
+    assert_eq!(after_apply.iter_segments(&table()).count(), 2);
+    assert_eq!(state.value().snapshot().tx_basis(), Some(first.result().tx_key()));
+    assert!(!captured.contains_table(&table()));
+}
+
+#[tokio::test]
 async fn indexer_cleans_up_aborted_transactions_2489_and_advances_the_clock() {
     let state = PartitionState::empty(Default::default()).unwrap();
     let context = context();
@@ -430,4 +461,30 @@ async fn a_retry_identity_answers_its_own_body_and_refuses_another_within_its_wi
     assert!(resolve(keyed("bob", 2), 400).await.result().committed(), "another principal's identity is independent");
     let after = resolve(keyed("alice", 3), 100 + RECEIPT_WINDOW_MICROS).await;
     assert!(after.result().committed(), "the identity is free again once the window has passed");
+}
+
+#[tokio::test]
+async fn external_event_writer_cannot_erase_private_replay_markers() {
+    struct ExternalWriter;
+
+    #[async_trait::async_trait]
+    impl TransactionWriter for ExternalWriter {
+        async fn write(&mut self, transaction: &mut OpenTransaction<'_>) -> Result<WriterResult> {
+            let error = transaction.append(TableRef::new("xt", "rtdb_replay_keys"), rtdb_format::data::StoredEvent {
+                iid: Value::Utf8("00112233445566778899aabbccddeeff/0".into()).entity_id()?.iid(),
+                system_from: transaction.tx_key().system_time,
+                valid_time: Interval::ALL,
+                operation: StoredOperation::Erase,
+                recency: None,
+            }).unwrap_err();
+            Ok(WriterResult::Aborted { error, user_metadata: None })
+        }
+    }
+
+    let state = PartitionState::empty(Default::default()).unwrap();
+    let context = context();
+    let mut resolver = TxResolver::new(None, SourcePosition(-1), None, &context.memory).unwrap();
+    let resolved = resolver.resolve_external(state.value().snapshot(), Timestamp(100), None, None, &mut ExternalWriter, &context).await.unwrap();
+    assert_eq!(resolved.result().error().unwrap().code, "xtdb/forbidden-table");
+    assert!(!resolved.writes().tables().contains_key(&TableRef::new("xt", "rtdb_replay_keys")));
 }

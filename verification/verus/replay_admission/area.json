@@ -1,0 +1,34 @@
+{
+  "summary": "Gateway replay requires a supported finite permit or non-executing setup frames.",
+  "flags": ["--no-external-by-default", "--verify-module", "production", "--verify-module", "laws"],
+  "min_verified_functions": 5,
+  "controls": {
+    "treat_execute_as_setup": {
+      "mutate": [{
+        "file": "rust/crates/multi/src/replay_admission.rs",
+        "find": "    matches!(tag, b'P' | b'B' | b'D' | b'C' | b'H' | b'S')",
+        "replace": "    matches!(tag, b'P' | b'B' | b'D' | b'C' | b'H' | b'S' | b'E')"
+      }],
+      "expect": [{"file": "rust/crates/multi/src/replay_admission.rs", "function": "is_setup_frame", "category": "postcondition not satisfied"}],
+      "min_verified_functions": 4
+    },
+    "allow_expired_or_legacy": {
+      "mutate": [{
+        "file": "rust/crates/multi/src/replay_admission.rs",
+        "find": "    original_supports_permit && still_before_cutoff",
+        "replace": "    original_supports_permit || still_before_cutoff"
+      }],
+      "expect": [{"file": "rust/crates/multi/src/replay_admission.rs", "function": "may_send_simple_replay", "category": "postcondition not satisfied"}],
+      "min_verified_functions": 4
+    },
+    "allow_infinite_permit": {
+      "mutate": [{
+        "file": "rust/crates/multi/src/replay_admission.rs",
+        "find": "    if cutoff == i64::MAX { None } else { Some(cutoff) }",
+        "replace": "    Some(cutoff)"
+      }],
+      "expect": [{"file": "rust/crates/multi/src/replay_admission.rs", "function": "cutoff_micros", "category": "postcondition not satisfied"}],
+      "min_verified_functions": 4
+    }
+  }
+}
