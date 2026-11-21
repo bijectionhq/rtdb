@@ -329,3 +329,22 @@ The independent latest-block or surviving-sibling law failed at the expected ass
 The proof covers the two synchronous predicates.
 It depends on the listed catalog lookups and the caller's batch construction.
 Reader and recovery dependencies outside that snapshot, generation fencing, provider outcomes, and effects after admission remain separate obligations.
+
+== Complete sibling publication
+
+TLC explored all 163 states of link:../tla/CompactionGroup.tla[the single-group model], with four buckets, one durable input and one cursor that may close and reopen.
+The model distinguishes durable output writes, independent notices, and the catalog change that activates the complete replacement.
+Each fresh capture has exactly one source of coverage for each bucket.
+All published outputs have completed their writes.
+A separate witness reaches a cursor that captured the replacement.
+
+Enabling one child while the parent remains gives duplicate coverage.
+Retiring the parent after the first notice leaves uncovered buckets.
+Accepting a notice for an incomplete write permits a complete-looking publication with unreadable outputs.
+TLC found each violation with the corresponding mutation.
+
+The model has one replacement generation.
+It represents notices as a set because exact duplicate notices leave catalog coverage unchanged in this model.
+It abstracts row equivalence, overlapping jobs, rejected input, cache, and the lifetime and physical readability of a previously captured generation.
+The production trie catalog uses per-shard block high-water marks.
+A refinement proof must establish when a higher watermark supplies the earlier generation's complete source coverage, including late and interleaved notices.
