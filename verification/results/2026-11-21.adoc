@@ -226,3 +226,19 @@ Both native controls compiled and failed at their declared assertions after remo
 The Azure and storage package run with remote support passed 204 tests.
 The provider wait uses the client's default retry duration.
 Live Azure behavior under load, remediation of a terminal failed destination, and eventual cleanup of abandoned staging remain open.
+
+== Projected ceiling and shared interval decision
+
+The combined local runner passed from `90d44b4c5` with both Rust options enabled.
+The input manifest SHA-256 was `4477d684b03144bd290aa15cd2dd8d3c7b1c20ac9b6a3b4324dfdfbfb694c995`.
+Lean proved the unrestricted and request-bounded ceiling folds against the reference point query and exhibited a duplicate emission on unordered input.
+The inclusive upper edge and unchanged ceiling each failed their declared proof obligations.
+
+The production interval intersection now backs both intersection and overlap queries.
+Verus verified that exact decision and two independent law wrappers, plus 19 functions in the previous areas.
+The combined run rejected all 12 Verus controls, including the joint mutations that weakened the intersection contract.
+The complete Rust ceiling vector and range emitter still need a refinement proof against the projected model.
+
+Both native resolvers and the unbounded rectangles agreed with the mathematical answer on all 4,096 generated observations.
+There were 240 passing Rust type and temporal tests and 17 passing node search tests at the same revision.
+The combined suite also reran the checkpoint and Azure production controls and the 11 positive and 18 negative TLC configurations.
