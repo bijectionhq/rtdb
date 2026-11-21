@@ -677,3 +677,23 @@ All other recorded formal checks and native replays passed, including the seven 
 AutoHyper returned `SAT` for the pair property and the witness that distinguishes completion order.
 It returned `UNSAT` for both weakened models and supplied two traces per counterexample.
 The input manifest SHA-256 is `6401c5caecdb02079ea455bdfa013741d97c13e1f5c089bea898412feb1dcc8b`.
+
+== Ordered compaction page merge
+
+Link:../lean/CompactionMerge.lean[Lean] proves five laws of the abstract merge.
+Every finite batch admits a complete merge execution.
+For individually ordered pages, taking a minimum head until every page is exhausted emits a permutation of all input occurrences in key order.
+Its key sequence equals the result of flattening and sorting the input.
+A two-page witness permits either relative order for distinct payloads of equal key.
+Allowing a head above an available minimum and allowing completion with one remaining row each fail the associated law.
+
+The native differential test calls the production heap before temporal resolution.
+It enumerates all 54,241 batches of zero through four pages of length zero through two, using four keys formed from two IIDs and two signed timestamps.
+For each batch it verifies per-page occurrence order, exhaustion, and equality with a separate sort of IID ascending and system time descending.
+Reversing the heap's system-time ordering and dropping the last row each fail their expected assertion in an archived source copy.
+This replay covers the stated finite input family. A source proof of the heap invariants for arbitrary page counts and equivalence through temporal resolution and layout remain open.
+
+The full runner passed on `cbcfb34a5` with mCRL2, AutoHyper and both Rust options enabled.
+It checked 78 Verus obligations, matched 46 Verus diagnostic controls and completed 18 TLC baselines with 45 expected counterexamples or reachability witnesses.
+All other formal and native checks passed, including the five merge theorems and both model and native merge controls.
+The input manifest SHA-256 is `6f6a2387847a9dd3c3b171867ddc8de3321f74c92e4314b2b13913f4f625cf0e`.
