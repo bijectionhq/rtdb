@@ -2487,6 +2487,8 @@ surface ClientAccess {
         -- A finite reconnect window bounds the time an established session waits for a replacement holder.
         -- A placement notification can start the next reconnect attempt before its fallback timer elapses.
         -- A replacement connection must resolve the original deployment identity.
+        -- When startup specifies an installation, the backend verifies the identity of its attached database before the gateway confirms readiness.
+        -- Replacement backends verify the same installation before the gateway replays settings or commands.
 
     @guarantee GatewayConnectionLimits
         -- Each gateway bounds its accepted sockets and the sessions routed to any deployment.

@@ -132,7 +132,7 @@ struct RememberedStatement { order: u64, frame: Frame }
 pub struct Session {
     startup: Bytes,
     frame_memory: Arc<MemoryBudget>,
-    installation_status: Option<Frame>,
+    expected_installation: Option<uuid::Uuid>,
     grants: Option<Grants>,
     /// The principal the first backend authenticated and reported it may be vouched for, for whom the gateway mints its reconnections' capabilities.
     authenticated: Option<String>,
@@ -165,7 +165,7 @@ pub struct Session {
 impl Session {
     pub fn new(startup: Bytes, router: Arc<dyn Router>, directory: Arc<dyn Directory>, deployment: String, grants: Option<Grants>, keyed: bool) -> Self {
         let record = rtdb_directory::watch_deployment(directory, deployment, RECONNECT_RETRY_DELAY);
-        Self { startup, frame_memory: MemoryBudget::new(DEFAULT_GATEWAY_FRAME_BYTES), installation_status: None, grants, authenticated: None, greeting: Greeting::default(), router, record, prepared: BTreeMap::new(), next_statement_order: 0, await_token: None, settings: None, status: Status::Busy, pending: Vec::new(), prepared_responses: 0, answered: false, lost_unanswered: false, discarding: false, keyed, key: None, swallowing: 0 }
+        Self { startup, frame_memory: MemoryBudget::new(DEFAULT_GATEWAY_FRAME_BYTES), expected_installation: None, grants, authenticated: None, greeting: Greeting::default(), router, record, prepared: BTreeMap::new(), next_statement_order: 0, await_token: None, settings: None, status: Status::Busy, pending: Vec::new(), prepared_responses: 0, answered: false, lost_unanswered: false, discarding: false, keyed, key: None, swallowing: 0 }
     }
 
     pub(crate) fn with_frame_memory(mut self, memory: Arc<MemoryBudget>) -> Self {
@@ -174,12 +174,7 @@ impl Session {
     }
 
     pub(crate) fn with_installation(mut self, installation: Option<uuid::Uuid>) -> Self {
-        self.installation_status = installation.map(|id| {
-            let mut body = BytesMut::from(&b"rtdb_installation_id\0"[..]);
-            body.extend_from_slice(id.simple().to_string().as_bytes());
-            body.put_u8(0);
-            Frame { tag: b'S', body: body.freeze() }
-        });
+        self.expected_installation = installation;
         self
     }
 
@@ -209,6 +204,9 @@ impl Session {
         stream.write_all(&self.reconnection_startup()).await.map_err(io)?;
         let mut backend = Backend::new(stream, epoch, Arc::clone(&self.frame_memory));
         let features = replay_ready(&mut backend.frames).await?;
+        if self.expected_installation.is_some_and(|expected| features.installation != Some(expected)) {
+            return Err(Anomaly::incorrect("rtdb.multi/install-identity", "The replacement holder did not verify the requested installation"));
+        }
         if self.await_token.is_some() && !features.await_token {
             return Err(Anomaly::new(AnomalyCategory::Unsupported, "rtdb.multi/reconnect-basis", "The new holder cannot restore the session's await token"));
         }
@@ -361,15 +359,27 @@ impl Session {
                             continue;
                         }
                         if !self.greeting.done {
-                            if frame.tag == b'S' && frame.body.split(|byte| *byte == 0).next() == Some(GATEWAY_SETTINGS_PARAMETER.as_bytes()) {
-                                continue;
+                            if let Some((name, value)) = parameter_status(&frame) {
+                                if name == rtdb_pgwire::VERIFIED_INSTALLATION_PARAMETER {
+                                    self.greeting.installation = uuid::Uuid::parse_str(value).ok();
+                                    continue;
+                                }
+                                if matches!(name, GATEWAY_SETTINGS_PARAMETER | rtdb_pgwire::REQUIRED_INSTALLATION_PARAMETER) { continue; }
+                            }
+                            if frame.tag == b'Z' && self.expected_installation.is_some_and(|expected| self.greeting.installation != Some(expected)) {
+                                client_write.write_all(&error_frame("3D000", "The holder did not verify the requested installation").encode()).await.map_err(io)?;
+                                client_write.flush().await.map_err(io)?;
+                                break Ok(());
                             }
                             self.greeting.observe(&frame, &mut self.authenticated);
                             tokio::time::timeout_at(startup_deadline, async {
                                 if self.greeting.done {
                                     self.status = Status::Idle;
-                                    if let Some(installation) = self.installation_status.take() {
-                                        client_write.write_all(&installation.encode()).await.map_err(io)?;
+                                    if let Some(installation) = self.expected_installation {
+                                        let mut body = BytesMut::from(&b"rtdb_installation_id\0"[..]);
+                                        body.extend_from_slice(installation.simple().to_string().as_bytes());
+                                        body.put_u8(0);
+                                        client_write.write_all(&Frame { tag: b'S', body: body.freeze() }.encode()).await.map_err(io)?;
                                     }
                                 }
                                 client_write.write_all(&frame.encode()).await.map_err(io)?;
@@ -513,7 +523,7 @@ impl Session {
 }
 
 #[derive(Default)]
-struct ReplayFeatures { await_token: bool, settings: bool, sql_prepare: bool, named_parse: bool }
+struct ReplayFeatures { await_token: bool, settings: bool, sql_prepare: bool, named_parse: bool, installation: Option<uuid::Uuid> }
 
 async fn replay_ready(frames: &mut mpsc::Receiver<std::io::Result<Frame>>) -> Result<ReplayFeatures> {
     let mut features = ReplayFeatures::default();
@@ -529,10 +539,21 @@ async fn replay_ready(frames: &mut mpsc::Receiver<std::io::Result<Frame>>) -> Re
                 Some(GATEWAY_NAMED_PARSE_KIND) => features.named_parse = true,
                 _ => {}
             },
+            b'S' => {
+                if let Some((rtdb_pgwire::VERIFIED_INSTALLATION_PARAMETER, value)) = parameter_status(&frame) {
+                    features.installation = uuid::Uuid::parse_str(value).ok();
+                }
+            }
             b'Z' => return Ok(features),
             _ => {}
         }
     }
+}
+
+fn parameter_status(frame: &Frame) -> Option<(&str, &str)> {
+    if frame.tag != b'S' { return None; }
+    let mut fields = frame.body.split(|byte| *byte == 0);
+    Some((std::str::from_utf8(fields.next()?).ok()?, std::str::from_utf8(fields.next()?).ok()?))
 }
 
 fn placement(record: &Option<DeploymentRecord>) -> Option<(u64, Lifecycle)> {
@@ -573,7 +594,7 @@ fn parse_name(frame: &Frame) -> String {
 /// What the first backend's greeting, everything before its first ReadyForQuery, has reported.
 /// Only the greeting counts: a parameter status later in the session reports a `SET`, which the client chose.
 #[derive(Default)]
-struct Greeting { done: bool, authenticated: bool, user: Option<String>, delegable: bool }
+struct Greeting { done: bool, authenticated: bool, user: Option<String>, delegable: bool, installation: Option<uuid::Uuid> }
 
 impl Greeting {
     fn observe(&mut self, frame: &Frame, vouched: &mut Option<String>) {

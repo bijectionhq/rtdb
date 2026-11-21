@@ -55,7 +55,9 @@ Hosting can install its existing deployment authority with `rtdb-multi install -
 The directory allocates both name and authority conditionally, and an identical retry returns the same deployment.
 This entry point enables linearizable reads on the holder.
 A PostgreSQL startup database of `NAME@UUID`, with the UUID in lowercase 32-digit hexadecimal, requires that installation before connecting.
-The gateway confirms the matched UUID in the startup parameter `rtdb_installation_id`.
+The gateway confirms the matched UUID in the startup parameter `rtdb_installation_id` after the backend checks its attached database.
+A replacement backend must verify the same installation before the gateway replays session state.
+Deploy nodes with the cell secret and this protocol support before routing gateways that require installation verification.
 `SHOW rtdb_hosted_source_barrier` returns the deployment ID after the holder confirms the current directory assignment, confirms its epoch with the logkeeper quorum, and applies the sampled source cut.
 The holder must recover the checkpoint published in the directory or an authenticated successor before answering.
 A gateway reconnect keeps the original deployment ID.

@@ -191,7 +191,10 @@ async fn connection(client: TcpStream, directory: Arc<dyn Directory>, options: G
         };
         return tokio::io::copy_bidirectional(&mut client, &mut forward).await.map(|_| ()).map_err(io);
     }
-    if expected.is_some() { startup.parameters.insert("database".into(), name.clone()); }
+    if let Some(installation) = expected {
+        startup.parameters.insert("database".into(), name.clone());
+        startup.parameters.insert(rtdb_pgwire::REQUIRED_INSTALLATION_PARAMETER.into(), installation.to_string());
+    }
     startup.parameters.insert(rtdb_pgwire::GATEWAY_AWAIT_TOKEN_PARAMETER.into(), "on".into());
     startup.parameters.insert(rtdb_pgwire::GATEWAY_SETTINGS_PARAMETER.into(), "on".into());
     startup.bytes = encode_startup(&startup.parameters);
@@ -452,6 +455,8 @@ async fn read_startup(mut client: Client, tls: Option<&Arc<rustls::ServerConfig>
                 }
                 // Only a gateway grants capabilities: one a client sends is dropped.
                 parameters.remove(rtdb_pgwire::CAPABILITY_PARAMETER);
+                parameters.retain(|key, _| !key.eq_ignore_ascii_case(rtdb_pgwire::REQUIRED_INSTALLATION_PARAMETER)
+                    && !key.eq_ignore_ascii_case(rtdb_pgwire::VERIFIED_INSTALLATION_PARAMETER));
                 return Ok(Some((client, Startup { bytes: encode_startup(&parameters), parameters })));
             }
             _ => return Err(Anomaly::incorrect("rtdb.multi/startup", format!("Unsupported startup code {code}"))),

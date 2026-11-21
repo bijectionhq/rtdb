@@ -8,7 +8,7 @@ use rtdb_types::{Anomaly, AnomalyCategory, PgType, Result};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
-use crate::{CAPABILITY_PARAMETER, DELEGABLE_PARAMETER, GATEWAY_AWAIT_TOKEN_PARAMETER, GATEWAY_SETTINGS_PARAMETER, ServerConfig, error::{network, protocol}, server::CancellationRegistry, wire::{Input, Reader, Writer, STARTUP_LIMIT}};
+use crate::{CAPABILITY_PARAMETER, DELEGABLE_PARAMETER, GATEWAY_AWAIT_TOKEN_PARAMETER, GATEWAY_SETTINGS_PARAMETER, REQUIRED_INSTALLATION_PARAMETER, ServerConfig, VERIFIED_INSTALLATION_PARAMETER, error::{network, protocol}, server::CancellationRegistry, wire::{Input, Reader, Writer, STARTUP_LIMIT}};
 
 trait Socket: AsyncRead + AsyncWrite + Unpin + Send {}
 impl<T: AsyncRead + AsyncWrite + Unpin + Send> Socket for T {}
@@ -81,6 +81,7 @@ async fn startup(process: i32, transport: &mut Option<Stream>, address: SocketAd
         let extra = if config.gateway_session_state {
             GATEWAY_AWAIT_TOKEN_PARAMETER.len() + GATEWAY_SETTINGS_PARAMETER.len() + 2 * ("on".len() + 2)
         } else { 0 };
+        let extra = extra + if config.capabilities.is_some() { REQUIRED_INSTALLATION_PARAMETER.len() + 36 + 2 } else { 0 };
         let frame = Reader::new(&mut **stream, Arc::clone(node.memory())).startup(extra).await?;
         let mut input = Input::new(&frame.body); let version = input.integer()?;
         match version {
@@ -104,6 +105,10 @@ async fn startup(process: i32, transport: &mut Option<Stream>, address: SocketAd
                 if requested.keys().any(|key| key.eq_ignore_ascii_case(crate::config::CHECKPOINT_STAGE_PARAMETER)) {
                     return Err(protocol("The checkpoint stage is assigned by the reader"));
                 }
+                if requested.keys().any(|key| key.eq_ignore_ascii_case(VERIFIED_INSTALLATION_PARAMETER)) {
+                    return Err(protocol("The installation verification is assigned by the server"));
+                }
+                let required_installation = requested.remove(REQUIRED_INSTALLATION_PARAMETER);
                 let capability = requested.remove(CAPABILITY_PARAMETER);
                 let gateway_session_state = requested.remove(GATEWAY_AWAIT_TOKEN_PARAMETER).as_deref() == Some("on")
                     && config.gateway_session_state;
@@ -111,7 +116,12 @@ async fn startup(process: i32, transport: &mut Option<Stream>, address: SocketAd
                     && gateway_session_state;
                 let database = requested.get("database").map_or("xtdb", String::as_str);
                 if config.playground { node.database_or_attach(database.to_owned(), Default::default()).await?; }
-                node.catalog().database(database).map_err(|_| Anomaly::incorrect("xtdb.pgwire/invalid-catalog", format!("database '{database}' does not exist")).with_context("sql-state", "3D000".into()))?;
+                let local = node.catalog().database(database).map_err(|_| Anomaly::incorrect("xtdb.pgwire/invalid-catalog", format!("database '{database}' does not exist")).with_context("sql-state", "3D000".into()))?;
+                let verified_attachment = if let Some(required) = &required_installation {
+                    let verifier = config.capabilities.as_ref().ok_or_else(installation_changed)?;
+                    verifier.require_installation(required, &local).map_err(|_| installation_changed())?;
+                    Some(local)
+                } else { None };
                 let user = requested.get("user").map(String::as_str); let remote = address.ip().to_string();
                 let method = if capability.is_some() { Method::Trust } else { auth.method_for(user, Some(&remote)).ok_or_else(|| Anomaly::new(AnomalyCategory::Forbidden, "xtdb.authn/no-matching-rule", format!("no authentication record found for user: {}", user.unwrap_or_default())))? };
                 let identity: Arc<dyn SessionIdentity> = if let Some(token) = &capability {
@@ -138,6 +148,10 @@ async fn startup(process: i32, transport: &mut Option<Stream>, address: SocketAd
                 } };
                 let delegable = identity.delegable();
                 let mut session = node.session(database, identity)?;
+                if let Some(verified) = &verified_attachment {
+                    let current = node.catalog().database(database).map_err(|_| installation_changed())?;
+                    if !Arc::ptr_eq(verified, &current) { return Err(installation_changed()); }
+                }
                 let size = config.parameters.iter().chain(requested.iter()).try_fold(8192usize, |size, (key, value)| size.checked_add(key.len().checked_mul(4)?).and_then(|size| size.checked_add(value.len())).and_then(|size| size.checked_add(256))).ok_or_else(|| protocol("Startup parameters exceed memory range"))?;
                 let reservation = node.memory().reserve(size)?;
                 let mut parameters: BTreeMap<_, _> = config.parameters.iter().map(|(key, value)| (key.to_ascii_lowercase(), value.clone())).collect(); for (key, value) in requested { parameters.insert(key.to_ascii_lowercase(), value); }
@@ -147,6 +161,7 @@ async fn startup(process: i32, transport: &mut Option<Stream>, address: SocketAd
                 apply_startup(&mut session, &parameters, &mut writer).await?;
                 // Tells a gateway it may vouch for this session's user when it reconnects it elsewhere.
                 if delegable { writer.parameter(DELEGABLE_PARAMETER, "on").await?; }
+                if let Some(required) = &required_installation { writer.parameter(VERIFIED_INSTALLATION_PARAMETER, required).await?; }
                 writer.backend_key(process).await?;
                 if gateway_session_state { writer.gateway_await_token(None).await?; }
                 if gateway_settings {
@@ -160,6 +175,11 @@ async fn startup(process: i32, transport: &mut Option<Stream>, address: SocketAd
             _ => return Err(protocol("Unknown protocol version")),
         }
     }
+}
+
+fn installation_changed() -> Anomaly {
+    Anomaly::incorrect("rtdb.pgwire/installation", "The node does not hold the requested installation")
+        .with_context("sql-state", "3D000".into())
 }
 
 /// A principal admitted by a capability: the access the capability grants bounds what the principal may do.

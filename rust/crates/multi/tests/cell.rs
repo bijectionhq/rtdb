@@ -201,7 +201,7 @@ async fn the_local_directory_reopens_the_same_installation_and_fence() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn hosted_install_retries_recover_the_same_authority() {
-    let cell = Cell::start(1, None).await;
+    let cell = Cell::start(2, None).await;
     let id = uuid::Uuid::new_v4();
     let directory = cell.directory.as_ref();
     let (first, second) = tokio::join!(
@@ -226,8 +226,43 @@ async fn hosted_install_retries_recover_the_same_authority() {
     tokio::spawn(connection);
     client.simple_query("INSERT INTO orders (_id, total) VALUES (1, 10)").await.unwrap();
     assert_eq!(values(&client, "SELECT total FROM orders").await, ["10"]);
+    let holder = cell.holder("shop").await.unwrap();
+    admin::move_deployment(directory, "shop", &cell.node(1 - holder).lease.id(), &control()).await.unwrap();
+    assert_eq!(values(&client, "SELECT total FROM orders").await, ["10"]);
     drop(client);
     assert_eq!(admin::install_deployment(directory, id, "shop", "acme", 3).await.unwrap().id, installed.id);
+    cell.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_pgwire_holder_refuses_a_gateway_with_a_stale_installation_route() {
+    let cell = Cell::start(1, None).await;
+    let serving = uuid::Uuid::new_v4();
+    admin::install_deployment(cell.directory.as_ref(), serving, "shop", "acme", 3).await.unwrap();
+    assert!(matches!(cell.node(0).agent.activate("shop").await.unwrap(), Response::Held { .. }));
+
+    let stale = uuid::Uuid::new_v4();
+    let cached: Arc<dyn Directory> = MemoryDirectory::new();
+    for member in cell.directory.members().await.unwrap() { cached.register_member(member).await.unwrap(); }
+    let mut stale_record = cell.directory.deployment_by_name("shop").await.unwrap().unwrap();
+    stale_record.id = stale.to_string();
+    stale_record.lineage = stale.to_string();
+    cached.create_deployment(stale_record).await.unwrap();
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let cancel = tokio_util::sync::CancellationToken::new();
+    let options = rtdb_multi::gateway::GatewayOptions { capabilities: Some(secret()), ..Default::default() };
+    let gateway = tokio::spawn(rtdb_multi::gateway::serve(listener, cached, options, cancel.clone()));
+
+    let mut client = tokio_postgres::Config::new();
+    client.host("127.0.0.1").port(address.port()).user("xtdb").password("cell-test");
+    client.dbname(&format!("shop@{}", stale.simple()));
+    let Err(error) = client.connect(NoTls).await else { panic!("the stale route accepted a different installation"); };
+    assert_eq!(error.code(), Some(&tokio_postgres::error::SqlState::INVALID_CATALOG_NAME));
+
+    cancel.cancel();
+    gateway.await.unwrap().unwrap();
     cell.stop().await;
 }
 
