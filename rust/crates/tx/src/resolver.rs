@@ -4,18 +4,20 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use prost::Message;
-use arrow_array::Array;
-use rtdb_columnar::{MemoryBudget, MemoryReservation};
+use arrow_array::{Array, RecordBatch, cast::AsArray};
+use arrow_schema::{DataType, Schema};
+use rtdb_columnar::{MemoryBudget, MemoryReservation, OwnedBatch};
 use rtdb_format::{envelope::ReplicaBody, data::{StoredEvent, StoredOperation}, generated::xtdb::log::proto::{ResolvedTx as WireResolvedTx, resolved_tx::DbOp}};
 use rtdb_format::transit::{self, TransitValue as T};
 use rtdb_index::{Snapshot, StagedWrite, TransactionBuffer};
 use rtdb_query::{CatalogSnapshot, DatabaseSnapshot, PreparedQuery, QueryContext, QueryCursor, QueryOptions};
 use rtdb_storage::cache::BufferPool;
-use rtdb_types::{Anomaly, AnomalyCategory, Iid, Interval, LogicalType, Result, ScalarType, SourcePosition, TableRef, TimeUnit, Timestamp, TransactionKey, TxId, Value};
+use rtdb_types::{Anomaly, AnomalyCategory, EventHeader, EventOp, Iid, Interval, LogicalType, Result, ScalarType, SourcePosition, TableRef, TimeUnit, Timestamp, TransactionKey, TxId, Value};
 use tokio_util::sync::CancellationToken;
 
 use crate::replay_submission::{ReplaySubmission, duplicate_replay, is_replay_table, replay_table};
-use crate::{SourceTransaction, SubmitOptions, TransactionResult, TxOp, UserMetadata, source::{Operation, SourceGuard, decode_arguments, is_reserved_write_schema, table_name}};
+use crate::values::plain_scalar_field;
+use crate::{ArrowDocuments, SourceTransaction, SubmitOptions, TransactionResult, TxOp, UserMetadata, source::{Operation, SourceGuard, decode_arguments, is_reserved_write_schema, table_name}};
 
 pub const IDEMPOTENCY_GUARD_RESULT: &str = "rtdb/idempotency-guard";
 
@@ -508,6 +510,16 @@ impl<'a> OpenTransaction<'a> {
         let mut cursor = execute(input, context, arguments, syntax).await?;
         let system_time = self.tx_key().system_time;
         while let Some(batch) = cursor.next_batch().await? {
+            if matches!(kind, MutationKind::Put) {
+                match mutation_put_batch(batch.batch(), system_time, &self.context.memory)
+                    .and_then(|put| put.map(|put| self.buffer.append_batch(&table.table, put)).transpose())
+                {
+                    Ok(Some(())) => continue,
+                    Ok(None) => {},
+                    Err(error) if error.code == "rtdb/memory-budget-exceeded" => {}
+                    Err(error) => return Err(error),
+                }
+            }
             mutation_events(batch.batch(), kind, system_time, |event| self.buffer.append_to(&table.table, event))?;
         }
         Ok(())
@@ -607,7 +619,6 @@ impl<'a> OpenTransaction<'a> {
         Ok(())
     }
     fn put_arrow_documents(&mut self, table: &TableRef, documents: &crate::ArrowDocuments, iids: Option<&[Iid]>, from: Option<Timestamp>, to: Option<Timestamp>) -> Result<()> {
-        use rtdb_types::{EventHeader, EventOp};
         let array = documents.array();
         let memory = &self.context.memory;
         let bytes = array.len().checked_mul(128).and_then(|bytes| bytes.checked_add(4096)).ok_or_else(overflow)?;
@@ -771,11 +782,63 @@ fn interval(from: Timestamp, to: Timestamp) -> Result<Interval> {
 #[derive(Clone, Copy)]
 enum MutationKind { Put, Delete, Erase }
 
+fn mutation_put_batch(batch: &RecordBatch, system_time: Timestamp, memory: &Arc<MemoryBudget>) -> Result<Option<OwnedBatch>> {
+    let Some((index, _)) = batch.schema_ref().column_with_name("doc") else { return Ok(None); };
+    let Some(content) = batch.column(index).as_struct_opt() else { return Ok(None); };
+    if content.is_empty() || content.null_count() != 0 || !content.fields().iter().all(|field| {
+        plain_scalar_field(field) && !matches!(field.data_type(), DataType::UInt8 | DataType::UInt16 | DataType::UInt32 | DataType::UInt64)
+    }) {
+        return Ok(None);
+    }
+    // A nullable field stores the scalar leg before null. When a later write adds a different type,
+    // a null seen before the first scalar must still take its position in the transaction's union.
+    if content.columns().iter().any(|array| array.is_null(0) && array.null_count() != array.len()) {
+        return Ok(None);
+    }
+
+    let iid = mutation_column(batch, "_iid")?;
+    let from = mutation_column(batch, "_valid_from")?;
+    let to = mutation_column(batch, "_valid_to")?;
+    let bound = content.fields().iter().try_fold(4096usize, |bytes, field| {
+        bytes.checked_add(field.size().checked_mul(4).ok_or_else(overflow)?).ok_or_else(overflow)
+    })?.checked_add(rtdb_index::IndexBatch::header_bytes(batch.num_rows())?).ok_or_else(overflow)?;
+    let _scratch = memory.reserve(bound)?;
+    let read_header = |row| -> Result<EventHeader> {
+        Ok(EventHeader {
+            iid: iid.iid(row)?, system_from: system_time,
+            valid_time: interval(from.time(row, system_time)?, to.time(row, Timestamp::MAX)?)?, op: EventOp::Put,
+        })
+    };
+    let mut headers = Vec::with_capacity(batch.num_rows());
+    for row in 0..batch.num_rows() {
+        // The row path orders header errors against admission of earlier documents.
+        let Ok(header) = read_header(row) else { return Ok(None); };
+        headers.push(header);
+    }
+    let copy_bound = content.columns().iter().try_fold(
+        content.len().checked_mul(64).and_then(|bytes| bytes.checked_add(4096)).ok_or_else(overflow)?,
+        |bytes, array| bytes.checked_add(array.get_array_memory_size().checked_mul(4).ok_or_else(overflow)?).ok_or_else(overflow),
+    )?;
+    let _copy = memory.reserve(copy_bound)?;
+    let cells = (0..content.len()).map(|row| Some((0, row))).collect::<Vec<_>>();
+    let columns = content.columns().iter().map(|array| {
+        rtdb_columnar::copy_nullable_cells(&[array.as_ref()], &cells)
+    }).collect::<Result<Vec<_>>>()?;
+    let schema = Arc::new(Schema::new(content.fields().clone()));
+    let content = RecordBatch::try_new(schema, columns).map_err(|error| Anomaly::fault("rtdb.tx/mutation-schema", error.to_string()))?;
+    let Some(documents) = ArrowDocuments::from_record_batch(&content, memory)? else { return Ok(None); };
+    rtdb_format::data::owned_put_batch(Arc::new(documents.array().clone()), &headers, memory).map(Some)
+}
+
+fn mutation_column<'a>(batch: &'a RecordBatch, name: &str) -> Result<OutputColumn<'a>> {
+    let schema = batch.schema_ref();
+    let index = schema.index_of(name).map_err(|error| Anomaly::fault("rtdb.tx/mutation-schema", error.to_string()))?;
+    OutputColumn::new(schema.field(index), batch.column(index).as_ref())
+}
+
 /// The events one batch of a mutation's output writes, in its row order.
-fn mutation_events(batch: &arrow_array::RecordBatch, kind: MutationKind, system_time: Timestamp, mut append: impl FnMut(StoredEvent) -> Result<()>) -> Result<()> {
-    let schema = batch.schema();
-    let column = |name| schema.index_of(name).map_err(|error| Anomaly::fault("rtdb.tx/mutation-schema", error.to_string()))
-        .and_then(|index| OutputColumn::new(schema.field(index), batch.column(index).as_ref()));
+fn mutation_events(batch: &RecordBatch, kind: MutationKind, system_time: Timestamp, mut append: impl FnMut(StoredEvent) -> Result<()>) -> Result<()> {
+    let column = |name| mutation_column(batch, name);
     let iids = column("_iid")?;
     let times = match kind { MutationKind::Erase => None, _ => Some((column("_valid_from")?, column("_valid_to")?)) };
     let documents = match kind { MutationKind::Put => Some(column("doc")?), _ => None };
@@ -980,6 +1043,56 @@ mod tests {
             }
         }
         events
+    }
+
+    #[test]
+    fn scalar_mutation_put_stages_the_same_events_without_retaining_the_query_batch() {
+        use arrow_array::{ArrayRef, FixedSizeBinaryArray, Int64Array, StructArray, TimestampMicrosecondArray, types::Int64Type};
+        use arrow_schema::{Field, TimeUnit as ArrowTimeUnit};
+
+        let memory = MemoryBudget::new(1 << 24);
+        let ids = Arc::new(Int64Array::from(vec![1, 2]));
+        let make_documents = |cells| StructArray::try_new(vec![
+            Arc::new(Field::new("_id", DataType::Int64, false)),
+            Arc::new(Field::new("n", DataType::Int64, true)),
+            Arc::new(Field::new("nulls", DataType::Int64, true)),
+        ].into(), vec![ids.clone(), Arc::new(Int64Array::from(cells)), Arc::new(Int64Array::from(vec![None::<i64>; 2]))], None).unwrap();
+        let iids = FixedSizeBinaryArray::try_from_iter([[1_u8; 16], [2; 16]].into_iter()).unwrap();
+        let times = DataType::Timestamp(ArrowTimeUnit::Microsecond, Some("UTC".into()));
+        let make_columns = |cells| -> Vec<ArrayRef> { vec![Arc::new(iids.clone()),
+            Arc::new(TimestampMicrosecondArray::from(vec![None, Some(1)]).with_timezone("UTC")),
+            Arc::new(TimestampMicrosecondArray::from(vec![Some(12), None]).with_timezone("UTC")),
+            Arc::new(make_documents(cells)),
+        ] };
+        let columns = make_columns(vec![Some(7), None]);
+        let schema = Arc::new(Schema::new(vec![Field::new("_iid", DataType::FixedSizeBinary(16), false),
+            Field::new("_valid_from", times.clone(), true), Field::new("_valid_to", times, true),
+            Field::new("doc", columns[3].data_type().clone(), false),
+        ]));
+        let output = RecordBatch::try_new(Arc::clone(&schema), columns).unwrap();
+        let system_time = Timestamp(10);
+        let mut events = Vec::new();
+        mutation_events(&output, MutationKind::Put, system_time, |event| { events.push(event); Ok(()) }).unwrap();
+        let expected = rtdb_index::IndexBatch::copy_events(&events, &StructFields::new(), &memory).unwrap();
+
+        let put = mutation_put_batch(&output, system_time, &memory).unwrap().unwrap();
+
+        assert_eq!(put.batch(), expected.arrow());
+        let content = put.batch().column_by_name("op").unwrap().as_union().child(2).as_struct();
+        assert_ne!(content.column(0).as_primitive::<Int64Type>().values().as_ptr(), ids.values().as_ptr());
+
+        let null_first = RecordBatch::try_new(Arc::clone(&schema), make_columns(vec![None, Some(7)])).unwrap();
+        assert!(mutation_put_batch(&null_first, system_time, &memory).unwrap().is_none());
+
+        let mut invalid_times = make_columns(vec![Some(7), None]);
+        invalid_times[2] = Arc::new(TimestampMicrosecondArray::from(vec![Some(12), Some(0)]).with_timezone("UTC"));
+        let invalid_times = RecordBatch::try_new(schema, invalid_times).unwrap();
+        assert!(mutation_put_batch(&invalid_times, system_time, &memory).unwrap().is_none());
+        let error = mutation_events(&invalid_times, MutationKind::Put, system_time, |_| {
+            memory.reserve(memory.limit_bytes())?;
+            Ok(())
+        }).unwrap_err();
+        assert_eq!(error.code, "rtdb/memory-budget-exceeded");
     }
 
     #[tokio::test]

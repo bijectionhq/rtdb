@@ -563,10 +563,7 @@ impl TransactionBuffer {
         for (name, ty) in fields {
             let existing = pending.declared.get(name);
             if existing == Some(ty) { continue; }
-            let bytes = ty.retained_bytes()?.checked_add(existing.map_or(Ok(0), LogicalType::retained_bytes)?)
-                .and_then(|bytes| bytes.checked_add(name.len())).and_then(|bytes| bytes.checked_add(512))
-                .and_then(|bytes| bytes.checked_mul(8)).ok_or_else(|| invalid("Declared schema size overflow"))?;
-            let reservation = self.budget.reserve(bytes)?;
+            let reservation = self.budget.reserve(document_type_bytes(name, ty, existing)?)?;
             let merged = existing.map_or_else(|| ty.clone(), |existing| existing.join(ty));
             pending.declared.insert(name.clone(), merged);
             pending.reservations.push(reservation);
@@ -605,9 +602,21 @@ impl TransactionBuffer {
             return Err(invalid("Transaction batch has another system time"));
         }
         let reservation = self.budget.reserve(table.schema.len() + table.table.len() + 4096)?;
-        if !self.tables.contains_key(table) { self.tables.insert(table.clone(), PendingTable::default()); }
-        self.declare_document_types(table, batch.put_types.iter())?;
+        let pending = self.tables.get(table);
+        let mut declarations = Vec::new();
+        for (name, ty) in &batch.put_types {
+            let existing = pending.and_then(|pending| pending.declared.get(name));
+            if existing == Some(ty) { continue; }
+            let reservation = self.budget.reserve(document_type_bytes(name, ty, existing)?)?;
+            let merged = existing.map_or_else(|| ty.clone(), |existing| existing.join(ty));
+            declarations.push((name.clone(), merged, reservation));
+        }
+        if pending.is_none() { self.tables.insert(table.clone(), PendingTable::default()); }
         let pending = self.tables.get_mut(table).ok_or_else(|| invalid("Transaction table write disappeared"))?;
+        for (name, ty, reservation) in declarations {
+            pending.declared.insert(name, ty);
+            pending.reservations.push(reservation);
+        }
         pending.batches.push((pending.events.len(), batch));
         pending.reservations.push(reservation);
         Ok(())
@@ -643,6 +652,12 @@ impl TransactionBuffer {
         }).collect::<Result<_>>()?;
         StagedWrite::new(self.tx_key, self.base.tx_basis(), self.base.block_index(), tables)
     }
+}
+
+fn document_type_bytes(name: &str, ty: &LogicalType, previous: Option<&LogicalType>) -> Result<usize> {
+    ty.retained_bytes()?.checked_add(previous.map_or(Ok(0), LogicalType::retained_bytes)?)
+        .and_then(|bytes| bytes.checked_add(name.len())).and_then(|bytes| bytes.checked_add(512))
+        .and_then(|bytes| bytes.checked_mul(8)).ok_or_else(|| invalid("Declared schema size overflow"))
 }
 
 fn invalid(message: impl std::fmt::Display) -> Anomaly { Anomaly::incorrect("rtdb.index/invalid-live-index", message.to_string()) }
@@ -720,6 +735,30 @@ fn staged_batches_release_event_builder_scratch_before_they_enter_the_live_index
     assert_ne!(memory.used_bytes(), 0);
     drop(arrow);
     assert_eq!(memory.used_bytes(), 0);
+}
+
+#[cfg(test)]
+#[test]
+fn a_denied_append_keeps_the_transaction_schema_and_budget_unchanged() {
+    let memory = MemoryBudget::new(1 << 20);
+    let table = TableRef::new("public", "docs");
+    let system_from = Timestamp(10);
+    let event = StoredEvent {
+        iid: EntityId::Integer(1).iid(), system_from, valid_time: Interval::ALL,
+        operation: StoredOperation::Put(StructFields::from([("_id".into(), Value::I64(1)), ("v".into(), Value::I64(2))])),
+        recency: None,
+    };
+    let batch = IndexBatch::copy_events(&[event.clone()], &StructFields::new(), &memory).unwrap();
+    let first = document_type_bytes("_id", &batch.put_types()["_id"], None).unwrap();
+    let budget = MemoryBudget::new(table.schema.len() + table.table.len() + 4096 + first);
+    let partition = crate::PartitionState::empty(Default::default()).unwrap();
+    let key = TransactionKey { tx_id: rtdb_types::TxId(0), system_time: system_from };
+    let mut transaction = TransactionBuffer::new(partition.value().snapshot(), key, Arc::clone(&budget)).unwrap();
+
+    assert_eq!(transaction.append_batch(&table, batch.owned.clone()).unwrap_err().code, "rtdb/memory-budget-exceeded");
+    assert!(transaction.tables.is_empty());
+    assert_eq!(budget.used_bytes(), 0);
+    transaction.append_to(&table, event).unwrap();
 }
 
 #[cfg(test)]

@@ -11,6 +11,7 @@ use rtdb_types::{Anomaly, Result, Timestamp, Value};
 use rtdb_sql::StaticMutationKind;
 
 use crate::{ArrowDocuments, Documents, SourceTransaction, SqlArguments, SubmitOptions, TxOp};
+use crate::values::plain_scalar_field;
 
 struct SubmissionCatalog<'a>(&'a str);
 impl Catalog for SubmissionCatalog<'_> {
@@ -61,8 +62,8 @@ fn expand(sql: &str, args: Option<&SqlArguments>, options: &SubmitOptions, datab
         let mut count = 0; expr.visit(&mut |expr| { if let rtdb_plan::Expr::Parameter { index, .. } = expr { count = count.max(index + 1); } }); count
     }).max().unwrap_or(0));
     if args.map_or(0, |args| args.types().len()) < parameter_count { return Ok(None); }
-    if matches!(plan.kind, StaticMutationKind::Put) && let Some(batch) = args.and_then(SqlArguments::single_arrow_batch) {
-        match projected_arrow_documents(&plan.input, batch, memory) {
+    if matches!(plan.kind, StaticMutationKind::Put) && let Some(pages) = args.and_then(SqlArguments::uniform_arrow_pages) {
+        match projected_arrow_documents(&plan.input, &pages, memory) {
             Ok(Some(documents)) => return Ok(Some(vec![TxOp::PutArrowDocs { table: plan.table.table, documents }])),
             Ok(None) => {}
             Err(error) if error.code == "rtdb/memory-budget-exceeded" => {}
@@ -128,7 +129,8 @@ fn expand(sql: &str, args: Option<&SqlArguments>, options: &SubmitOptions, datab
     Ok((!operations.is_empty()).then_some(operations))
 }
 
-fn projected_arrow_documents(input: &Relation, batch: &RecordBatch, memory: &Arc<MemoryBudget>) -> Result<Option<ArrowDocuments>> {
+fn projected_arrow_documents(input: &Relation, pages: &[&RecordBatch], memory: &Arc<MemoryBudget>) -> Result<Option<ArrowDocuments>> {
+    let Some(first) = pages.first() else { return Ok(None); };
     let RelationNode::Rename { input: values, expressions, .. } = input.node() else { return Ok(None); };
     let RelationNode::Values { rows } = values.node() else { return Ok(None); };
     let [row] = rows.as_slice() else { return Ok(None); };
@@ -136,15 +138,8 @@ fn projected_arrow_documents(input: &Relation, batch: &RecordBatch, memory: &Arc
         return Ok(None);
     }
 
-    let schema = batch.schema_ref();
-    let scalar_arguments = schema.fields().iter().all(|field| field.metadata().is_empty() && match field.data_type() {
-        DataType::Boolean | DataType::Int8 | DataType::Int16 | DataType::Int32 | DataType::Int64 |
-        DataType::UInt8 | DataType::UInt16 | DataType::UInt32 | DataType::UInt64 |
-        DataType::Float32 | DataType::Float64 | DataType::Utf8 | DataType::Binary | DataType::FixedSizeBinary(_) => true,
-        DataType::Null => field.is_nullable(),
-        _ => false,
-    });
-    if !scalar_arguments {
+    let schema = first.schema_ref();
+    if !schema.fields().iter().all(|field| plain_scalar_field(field)) {
         return Ok(None);
     }
 
@@ -152,14 +147,14 @@ fn projected_arrow_documents(input: &Relation, batch: &RecordBatch, memory: &Arc
         let Expr::Column { id, .. } = expr.expr else { return None; };
         let Expr::Parameter { index, .. } = row.get(values.schema().position(id)?)? else { return None; };
         let field = schema.fields().get(*index)?;
-        Some((expr.field.name.as_str(), field, batch.column(*index)))
+        Some((expr.field.name.as_str(), field, *index))
     });
     let mut bound = 4096usize;
     let mut has_id = false;
     for column in projection() {
-        let Some((name, field, array)) = column else { return Ok(None); };
+        let Some((name, field, index)) = column else { return Ok(None); };
         if name == "_id" {
-            if array.logical_null_count() != 0 { return Ok(None); }
+            if pages.iter().any(|page| page.column(index).logical_null_count() != 0) { return Ok(None); }
             has_id = true;
         }
         bound = field.size().checked_add(name.len()).and_then(|bytes| bytes.checked_add(256))
@@ -169,28 +164,39 @@ fn projected_arrow_documents(input: &Relation, batch: &RecordBatch, memory: &Arc
     let _schema = memory.reserve(bound)?;
     let mut fields = Vec::with_capacity(expressions.len());
     let mut columns = Vec::with_capacity(expressions.len());
-    for (name, field, array) in projection().flatten() {
+    for (name, field, index) in projection().flatten() {
         fields.push(field.as_ref().clone().with_name(name));
-        columns.push(canonical_argument_column(array, memory)?);
+        columns.push(canonical_argument_column(pages, index, memory)?);
     }
     let projection = RecordBatch::try_new(Arc::new(arrow_schema::Schema::new(fields)), columns)
         .map_err(|error| Anomaly::fault("rtdb.tx/static-plan", error.to_string()))?;
     ArrowDocuments::from_record_batch(&projection, memory)
 }
 
-fn canonical_argument_column(array: &ArrayRef, memory: &Arc<MemoryBudget>) -> Result<ArrayRef> {
-    let nulls = array.logical_null_count();
-    if nulls == array.len() || (nulls == 0 && array.data_type() != &DataType::Boolean) {
-        return Ok(Arc::clone(array));
+fn canonical_argument_column(pages: &[&RecordBatch], index: usize, memory: &Arc<MemoryBudget>) -> Result<ArrayRef> {
+    if let [page] = pages {
+        let array = page.column(index);
+        let nulls = array.logical_null_count();
+        if nulls == array.len() || (nulls == 0 && array.data_type() != &DataType::Boolean) {
+            return Ok(Arc::clone(array));
+        }
     }
 
     // The source body digest includes the payload beneath null slots and the padding on a Boolean vector.
-    let bound = array.get_array_memory_size().checked_mul(4)
-        .and_then(|bytes| bytes.checked_add(array.len().checked_mul(64)?))
+    let rows = pages.iter().try_fold(0usize, |rows, page| rows.checked_add(page.num_rows()).ok_or_else(overflow))?;
+    let base = rows.checked_mul(64).and_then(|bytes| bytes.checked_add(pages.len().checked_mul(64)?))
         .and_then(|bytes| bytes.checked_add(4096)).ok_or_else(overflow)?;
+    let bound = pages.iter().try_fold(base, |bytes, page| {
+        bytes.checked_add(page.column(index).get_array_memory_size().checked_mul(4).ok_or_else(overflow)?).ok_or_else(overflow)
+    })?;
     let mut reservation = memory.reserve(bound)?;
-    let cells = (0..array.len()).map(|index| Some((0, index))).collect::<Vec<_>>();
-    let column = rtdb_columnar::copy_nullable_cells(&[array.as_ref()], &cells)?;
+    let mut cells = Vec::with_capacity(rows);
+    let sources = pages.iter().enumerate().map(|(source, page)| {
+        cells.extend((0..page.num_rows()).map(|row| Some((source, row))));
+        page.column(index).as_ref()
+    }).collect::<Vec<_>>();
+    let column = rtdb_columnar::copy_nullable_cells(&sources, &cells)?;
+    drop(sources);
     drop(cells);
     Arc::get_mut(&mut reservation).expect("argument selection owns its reservation").shrink_to(column.get_array_memory_size())?;
     rtdb_columnar::retain_array(column, &reservation)
@@ -245,13 +251,45 @@ mod tests {
         }], SubmitOptions::default(), "xtdb", &memory).unwrap();
         let rows = args.rows().map(|row| row.unwrap().to_vec()).collect();
         let boxed = submit(SqlArguments::new(args.types().to_vec(), rows, &memory).unwrap());
-        let shared = args.single_arrow_batch().unwrap().column(0).clone();
+        let shared = args.uniform_arrow_pages().unwrap()[0].column(0).clone();
 
         let projected = submit(args);
 
         let crate::source::Operation::Public(TxOp::PutArrowDocs { documents, .. }) = &projected.operations[0]
             else { panic!("Expected Arrow documents") };
         assert!(Arc::ptr_eq(documents.array().column(1), &shared));
+        assert_eq!(projected.encode().unwrap().as_slice(), boxed.encode().unwrap().as_slice());
+    }
+
+    #[test]
+    fn static_insert_projects_all_uniform_arrow_argument_pages_in_order() {
+        use arrow_array::{Int64Array, StringArray};
+        use arrow_schema::Field;
+        use rtdb_columnar::OwnedBatch;
+
+        let memory = MemoryBudget::new(1 << 24);
+        let schema = Arc::new(arrow_schema::Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("label", DataType::Utf8, true),
+        ]));
+        let upload = |ids: Vec<i64>, labels: Vec<Option<&str>>| {
+            let columns: Vec<ArrayRef> = vec![Arc::new(Int64Array::from(ids)), Arc::new(StringArray::from(labels))];
+            let batch = RecordBatch::try_new(Arc::clone(&schema), columns).unwrap();
+            SqlArguments::from_arrow(OwnedBatch::new(batch, &memory).unwrap(), &memory).unwrap()
+        };
+        let mut args = upload(vec![1, 2], vec![Some("first"), None]);
+        args.append(upload(vec![], vec![])).unwrap();
+        args.append(upload(vec![3], vec![Some("last")])).unwrap();
+        let rows = args.rows().map(|row| row.unwrap().to_vec()).collect();
+        let submit = |arguments| prepare_submission(vec![TxOp::Sql {
+            sql: "INSERT INTO docs (_id, label) VALUES (?, ?)".into(), args: Some(arguments),
+        }], SubmitOptions::default(), "xtdb", &memory).unwrap();
+        let boxed = submit(SqlArguments::new(args.types().to_vec(), rows, &memory).unwrap());
+
+        let projected = submit(args);
+
+        let [crate::source::Operation::Public(TxOp::PutArrowDocs { .. })] = projected.operations.as_slice()
+            else { panic!("Expected one Arrow write in upload order") };
         assert_eq!(projected.encode().unwrap().as_slice(), boxed.encode().unwrap().as_slice());
     }
 
