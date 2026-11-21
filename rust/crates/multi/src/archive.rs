@@ -1090,6 +1090,7 @@ mod tests {
             journals_retired_at_ms: 1,
             key_withdrawn_at_ms: 1,
             serving_prefix_observed_empty_at_ms: 1,
+            serving_inventory: rtdb_directory::ServingInventory::S3VersionsAndUploads,
         });
         record.checkpoint_captures.insert(
             operation,

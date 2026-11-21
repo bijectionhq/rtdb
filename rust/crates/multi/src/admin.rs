@@ -572,6 +572,10 @@ pub async fn finish_disposal(directory: &dyn Directory, storage: &CellStorage, k
         _ => return Err(Anomaly::new(AnomalyCategory::Conflict, "rtdb.multi/disposal-unaccepted", format!("The directory has not accepted disposal of {id}"))),
     }
     require_storage_drained(&fenced)?;
+    let prefix = crate::reference::key(&fenced.storage_prefix())?;
+    let others: Vec<DeploymentRecord> = directory.deployments().await?.into_iter()
+        .filter(|record| record.id != fenced.id).collect();
+    crate::reference::require_disjoint_prefix(&prefix, others.iter())?;
     let mut stream = administration_stream(directory, &fenced, maximum_message_bytes).await?;
     stream.servers.extend(fenced.replica_journals.iter().cloned());
     stream.servers.sort();
@@ -584,10 +588,10 @@ pub async fn finish_disposal(directory: &dyn Directory, storage: &CellStorage, k
     let key_withdrawn_at_ms = now_ms().max(journals_retired_at_ms);
     let bucket = storage.bucket(rtdb_storage::IoRegion::new()).await?;
     // Its forks keep what they share with it: those objects are copied into them before it goes.
-    let others: Vec<DeploymentRecord> = directory.deployments().await?.into_iter().filter(|record| record.id != fenced.id).collect();
-    if !crate::reference::erase_deployment(bucket.as_ref(), &fenced.storage_prefix(), &others).await? {
+    if !crate::reference::erase_deployment(bucket.as_ref(), prefix.as_str(), &others).await? {
         return Err(Anomaly::new(AnomalyCategory::Unavailable, "rtdb.multi/disposal-prefix", format!("Installation {id} still has serving objects")));
     }
+    let serving_inventory = storage.purge_serving_inventory(&prefix).await?;
     let receipt = DisposalReceipt {
         deployment: fenced.id,
         incarnation: fenced.incarnation,
@@ -596,6 +600,7 @@ pub async fn finish_disposal(directory: &dyn Directory, storage: &CellStorage, k
         journals_retired_at_ms,
         key_withdrawn_at_ms,
         serving_prefix_observed_empty_at_ms: now_ms().max(key_withdrawn_at_ms),
+        serving_inventory,
     };
     let deleted = update_installation(directory, id, |record| {
         if record.epoch != receipt.epoch || record.incarnation != receipt.incarnation {

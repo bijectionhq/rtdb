@@ -87,6 +87,7 @@ enum Reply {
         name: String,
         authority: Uuid,
         epoch: u64,
+        serving_inventory: rtdb_directory::ServingInventory,
         evidence: [u8; 32],
     },
     RecoveryScheduled {
@@ -285,6 +286,7 @@ fn disposal_reply(installation: DeploymentRecord, authority: Uuid) -> Result<Rep
             name: installation.name,
             authority,
             epoch: receipt.epoch,
+            serving_inventory: receipt.serving_inventory,
             evidence: receipt_evidence(&receipt)?,
         }),
         (Lifecycle::Deleting, None) => Ok(Reply::Scheduled {

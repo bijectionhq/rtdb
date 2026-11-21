@@ -34,6 +34,21 @@ impl CellStorage {
         }
     }
 
+    pub(crate) async fn purge_serving_inventory(
+        &self,
+        deployment: &rtdb_storage::ObjectKey,
+    ) -> rtdb_types::Result<rtdb_directory::ServingInventory> {
+        match self {
+            Self::Local { .. } => Ok(rtdb_directory::ServingInventory::LocalDirectory),
+            Self::S3 { config } => {
+                let root = rtdb_storage::ObjectKey::new(S3_CELL_ROOT)?;
+                let remotes = std::collections::BTreeMap::<String, rtdb_s3::S3Credentials>::new();
+                config.versioned_inventory(&root, &remotes).await?.purge(deployment).await?;
+                Ok(rtdb_directory::ServingInventory::S3VersionsAndUploads)
+            }
+        }
+    }
+
     /// The storage `spec` names: `s3://BUCKET[/PREFIX]`, with `endpoint`, `region` and `path_style` as query parameters, or a local directory.
     pub fn parse(spec: &str) -> rtdb_types::Result<Self> {
         let Some(location) = spec.strip_prefix("s3://") else { return Ok(CellStorage::Local { root: PathBuf::from(spec) }) };

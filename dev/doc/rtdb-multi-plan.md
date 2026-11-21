@@ -110,7 +110,10 @@ The optional disposal credential authorizes `schedule_disposal` and
 `inspect_disposal` for a named root with an exact authority UUID. Scheduling
 also fences an empty identity if retirement arrives before installation.
 Inspection reads the directory without fencing. A settled response identifies
-the retired writer epoch and hashes the receipt retained by the directory.
+the retired writer epoch, identifies the provider inventory, and hashes the
+receipt retained by the directory. On S3 the reaper accounts for object
+versions, delete markers and unfinished uploads inside the deployment prefix
+before reporting that inventory as empty.
 
 Nodes register a serving storage region in the deployment record before
 opening objects. Holders and compactors consult the current directory record

@@ -212,6 +212,14 @@ pub struct CellTransfer {
     pub epoch: u64,
 }
 
+/// The provider inventory shown empty by a serving disposal.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ServingInventory {
+    LocalDirectory,
+    S3VersionsAndUploads,
+}
+
 /// The cell's completed serving disposal, retained on the installation's tombstone.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DisposalReceipt {
@@ -222,6 +230,7 @@ pub struct DisposalReceipt {
     pub journals_retired_at_ms: i64,
     pub key_withdrawn_at_ms: i64,
     pub serving_prefix_observed_empty_at_ms: i64,
+    pub serving_inventory: ServingInventory,
 }
 
 /// The directory's record of a deployment's last published block (value `Checkpoint`): its index, the replica offset of its boundary record, and the last source offset it covers.
