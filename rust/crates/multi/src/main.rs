@@ -224,13 +224,6 @@ impl TransferExchange {
         }
         Ok(bytes.to_vec())
     }
-
-    async fn write_receipt(&self, receipt: &rtdb_directory::PreparedCellTransfer) -> Result<()> {
-        let key = rtdb_storage::ObjectKey::new("receipt.json")?;
-        let encoded = serde_json::to_vec(receipt).expect("a transfer receipt serializes");
-        self.store.put(&key, encoded.into()).await?;
-        Ok(())
-    }
 }
 
 async fn transfer_document<T: serde::de::DeserializeOwned>(
@@ -268,9 +261,7 @@ async fn execute_managed_transfer(
             admin::activate_managed_cell_transfer(from, to, &prepared).await?;
             prepared
         };
-        if let Some(exchange) = &exchange {
-            exchange.write_receipt(&receipt).await?;
-        } else {
+        if exchange.is_none() {
             println!("{}", serde_json::to_string(&receipt).expect("a transfer receipt serializes"));
         }
         Ok(())
