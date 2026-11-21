@@ -2062,3 +2062,26 @@ They comprise 27 root tests, 3,315 core tests and simulations, and six PostgreSQ
 The core reports include 33 simulation methods with 100 iterations each.
 The Gradle log is `/private/tmp/rtdb-formal.QMjPSJsX/catalog-publication-and-search-property-test.log`.
 The prior full JVM suite's eight failures remain open.
+
+=== Publication identity for shared artefacts
+
+The native search builder records the provider response's exact identity when a publication supplies it.
+The artefact record travels through the existing log and checkpoint catalog.
+The trie collector binds an individual artefact to its recorded version.
+For a group file it also requires every remaining record for that same file to carry the same identity.
+An idempotent upload can return a successful binding.
+A replacement, a mixed group, a record without publication evidence, or a file without any retained record stays unbound.
+The binding adds evidence for the retirement intent.
+The effect certificate, fork coverage and definition-lane retirement remain open.
+
+Lean 4.36.0 audited five theorems about agreement over arbitrary lists of held records.
+Two controls reject accepting a group with no witness and trusting any one member.
+The native group fixture supersedes one sibling, then the other three.
+The group files survive the first collection and enter the last batch's receipt only once.
+The fixture checks provider observations for groups whose records agree, disagree or lack a version.
+The 132-case scoped Rust run passed, and the JVM Core schema build regenerated Protobuf classes and compiled the production and test sources.
+The logs are `group-artefacts-publication-native.log` and `group-artefacts-publication-jvm-schema.log` under `/private/tmp/rtdb-formal.QMjPSJsX/`.
+The Lean evidence is under `group-publication-lean-evidence-b8nfzkav/` in the same directory. link:../lean/GroupPublication.lean[Group binding laws]
+The selected native replay ran the two trie publication checks and the shared artefact fixture against an isolated source copy, then rejected all three controls at their named assertions.
+The shared-file control trusts the first member despite conflicting retained records.
+The command records are under `native-group-publication-controls-qy2o5ni5/` in the same evidence directory.

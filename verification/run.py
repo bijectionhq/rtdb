@@ -663,6 +663,23 @@ def verify_reader_reclamation_minimality(args, scratch):
     verify_lean_model(args, scratch, path, "reader-reclamation-minimality", controls, 5)
 
 
+
+def verify_group_publication(args, scratch):
+    path = Path("verification/lean/GroupPublication.lean")
+    controls = {
+        "accept-unwitnessed-group": (
+            "!records.isEmpty && records.all", "records.all",
+            ["a_binding_covers_each_held_record", "an_unwitnessed_group_cannot_bind"],
+        ),
+        "trust-any-member": (
+            "records.all (fun publication", "records.any (fun publication",
+            ["a_binding_covers_each_held_record", "a_legacy_member_cannot_bind_the_group",
+             "several_versions_cannot_bind_the_same_group"],
+        ),
+    }
+    verify_lean_model(args, scratch, path, "group-publication", controls, 5)
+
+
 def verify_basis_tokens(args, scratch):
     path = Path("verification/lean/BasisTokens.lean")
     controls = {
@@ -1397,6 +1414,7 @@ def verify_lean(args, scratch):
             verify_floor_preservation(args, scratch)
             verify_retirement_identity(args, scratch)
             verify_retirement_certificate(args, scratch)
+            verify_group_publication(args, scratch)
             verify_reader_reclamation_minimality(args, scratch)
             verify_basis_tokens(args, scratch)
             verify_run_encoding(args, scratch)
@@ -2364,6 +2382,11 @@ def verify_compaction_publication_versions(args, source):
          "rust/crates/maintenance/src/retirement_intent.rs",
          "published.as_ref().is_some_and(|expected| *expected == PublishedObjectVersion::from(observed.clone()))",
          "published.is_some()", "an observed replacement cannot stand in for the catalog's publication"),
+        ("a_groups_artefacts_go_only_with_the_last_member_the_catalog_holds",
+         ["-p", "rtdb-maintenance", "--test", "gc"], "group-publication-match",
+         "rust/crates/maintenance/src/gc.rs",
+         "versions.all(|version| version == Some(first)).then_some(first)", "Some(first)",
+         "differing member publications cannot bind the group file"),
     )
     for test, selection, name, file, before, after, failure in cases:
         command = ["cargo", "test", "--locked", *selection, test, "--", "--exact"]
@@ -2380,7 +2403,7 @@ def verify_compaction_publication_versions(args, source):
                 raise ValueError(f"{name}: mutation did not fail at its declared assertion")
         finally:
             path.write_bytes(original)
-        print(f"rust-{name}: exact version passed, substituting a different version failed")
+        print(f"rust-{name}: publication baseline passed, weakened binding failed")
 
 
 def verify_s3_object_version(args, source):

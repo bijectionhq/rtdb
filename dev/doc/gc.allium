@@ -361,6 +361,7 @@ rule DeleteAndCommitChunkRule {
     -- A trie's artefacts, such as its search files (fts.allium), go before its data file: they carry the data file's content, so they must not outlive it.
     -- They are found by listing the trie's artefact prefix rather than by reading its entry's records, which also catches an artefact whose record had not been applied when this cycle read its snapshot.
     -- A partition group's artefacts (trie-cat.allium: ArtefactScope) are derived from every member's data file, so they go once the cycle collects the last member the catalog holds, before any chunk.
+    -- A recorded shared file binds to an observed provider version only when at least one retained record names it and every retained record for that file witnesses that same publication.
     -- A member the catalog holds and this cycle does not collect, live or not yet past its garbage lifetime, keeps them.
     -- See: maintenance/src/gc.rs (collect_table, finished_groups)
     when: DeleteAndCommitChunk(table, chunk)

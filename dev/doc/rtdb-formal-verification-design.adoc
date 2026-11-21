@@ -839,6 +839,9 @@ For new hosted compaction outputs, the catalog now preserves the version returne
 An idempotent retry takes the version from the same provider response that returned the matching bytes.
 An uncertain multipart completion takes the version only from a provider response bearing that exact attempt's witness.
 The retirement journal records a publication match only for an observed version equal to the selected catalog's recorded version.
+The search builder preserves the exact provider version when its upload supplies one.
+A group artefact binds only if there is a retained catalog record for it and every retained record naming the same group file carries the observed identity.
+The Lean group law checks agreement for arbitrary lists of held records. link:../../verification/lean/GroupPublication.lean[Group publication proof]
 An inherited or packed file, a historical catalog without recorded versions, or a replacement at the same key carries no publication match.
 The publication model compares these bindings with separate HEAD requests and key-only retirement observations. link:../../verification/tla/PublicationVersion.tla[Publication version model]
 Certification still needs to exclude every relevant recovery and fork reference, including group membership, and authorize the exact provider effect.
@@ -1387,7 +1390,7 @@ Verus checks the exact cutoff decision.
 Verus checks the shipped S3 version classifier, with production-only and joint contract mutations.
 A loopback S3 HEAD fixture checks provider key encoding and refusal of missing, empty and replaceable version IDs.
 Lean checks identity matching, exact erase and qualified names, with four controls against weaker operations.
-|Extend version binding to shared artefacts and other storage representations, and require a directory-installed certificate before a provider erase.
+|Extend version binding to other storage representations and artefact retirement outside trie collection, and require a directory-installed certificate before a provider erase.
 
 |Concurrent design models
 |TLC covers bounded writer admission, query capture, resolution, recovery, cache, reader I/O, and compaction publication variants.

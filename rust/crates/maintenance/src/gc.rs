@@ -3,8 +3,12 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use async_trait::async_trait;
 use futures::{StreamExt, stream};
-use rtdb_format::{catalog::{BlockCatalog, TableEntry}, keys::{PartGroup, TrieKey, block_index_from_key, oversized_block_index}};
-use rtdb_index::PartitionState;
+use rtdb_format::{
+    catalog::{BlockCatalog, TableEntry},
+    keys::{ArtefactOwner, PartGroup, TrieKey, block_index_from_key, oversized_block_index},
+    log::proto::{ArtefactScope, PublishedObjectVersion},
+};
+use rtdb_index::{PartitionState, TrieCatalog};
 use rtdb_storage::{IoRegion, ObjectKey, ObjectStore};
 use rtdb_types::{Anomaly, BlockIndex, CatalogCut, Result, TableRef, Timestamp};
 use tokio::sync::Semaphore;
@@ -137,7 +141,7 @@ impl TrieCollector {
         if cancellation.is_cancelled() { Err(crate::closed()) } else { Ok(()) }
     }
 
-    async fn collect_table(&self, entry: &TableEntry, keys: &[TrieKey], groups: &BTreeSet<PartGroup>, cut: Option<CatalogCut>, catalog: &rtdb_index::TrieCatalog, deletes: &Semaphore, cancellation: &CancellationToken) -> Result<()> {
+    async fn collect_table(&self, entry: &TableEntry, keys: &[TrieKey], groups: &BTreeSet<PartGroup>, cut: Option<CatalogCut>, catalog: &TrieCatalog, deletes: &Semaphore, cancellation: &CancellationToken) -> Result<()> {
         if keys.iter().any(|key| key.level() == 0) { return Err(crate::invalid("L0 recovery files cannot be garbage collected")); }
         let chunk_size = self.config.chunk_size;
         // A shared file belongs in the receipt of the last batch removing members
@@ -175,7 +179,8 @@ impl TrieCollector {
                     if let Some(metadata) = &files.metadata { published.insert(ObjectKey::new(entry.slug.metadata_key(key))?, metadata); }
                 }
                 let files = stream::iter(keys).map(|key| {
-                    let version = published.get(&key).map(|version| (*version).clone());
+                    let version = published.get(&key).copied()
+                        .or_else(|| published_artefact(catalog, entry, &key)).cloned();
                     async move {
                         let _permit = deletes.acquire().await.map_err(crate::invalid)?;
                         if cancellation.is_cancelled() { return Err(crate::closed()); }
@@ -209,8 +214,23 @@ impl TrieCollector {
     }
 }
 
+fn published_artefact<'a>(catalog: &'a TrieCatalog, entry: &TableEntry, key: &ObjectKey) -> Option<&'a PublishedObjectVersion> {
+    let (owner, kind, id, version) = entry.slug.parse_artefact_key(key.as_str())?;
+    let scope = match &owner {
+        ArtefactOwner::Trie(_) => ArtefactScope::Trie,
+        ArtefactOwner::Group(_) => ArtefactScope::PartGroup,
+    };
+    let mut versions = owner.tries().into_iter()
+        .filter_map(|key| catalog.trie(&entry.table, &key))
+        .filter_map(|trie| trie.artefact(&kind, &id, version))
+        .filter(|record| record.scope() == scope)
+        .map(|record| record.published_version.as_ref());
+    let first = versions.next().flatten()?;
+    versions.all(|version| version == Some(first)).then_some(first)
+}
+
 /// The partition groups of tries being collected none of whose members the catalog holds besides them: their artefacts serve no trie once these go.
-fn finished_groups(catalog: &rtdb_index::TrieCatalog, table: &TableRef, keys: &[TrieKey]) -> BTreeSet<PartGroup> {
+fn finished_groups(catalog: &TrieCatalog, table: &TableRef, keys: &[TrieKey]) -> BTreeSet<PartGroup> {
     use rtdb_format::keys::BRANCH_FACTOR;
 
     let collected: BTreeSet<&TrieKey> = keys.iter().collect();

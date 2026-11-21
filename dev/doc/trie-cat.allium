@@ -47,6 +47,16 @@ value ArtefactRecord {
     scope: ArtefactScope
     -- Published object length. A shared group object is counted once.
     file_size: Long?
+    -- Exact provider identity supplied by the write response or verified idempotent publication.
+    published_version: PublishedObjectVersion?
+}
+
+value PublishedObjectVersion {
+    bucket: String
+    endpoint: String?
+    region: String?
+    physical_key: String
+    version: String
 }
 
 -- trie: derived from its trie's data file alone, and stored under the trie's artefact prefix.

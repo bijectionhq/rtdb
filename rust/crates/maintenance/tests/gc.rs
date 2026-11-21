@@ -456,12 +456,31 @@ async fn a_groups_artefacts_go_only_with_the_last_member_the_catalog_holds() {
     for bucket in 0..4 { catalog = add(catalog, &format!("l02-rc-p{bucket}-b00"), 100); }
     let supersede = |mut catalog: TrieCatalog, part: u8| { for bucket in 0..4 { catalog = add(catalog, &format!("l03-rc-p{part}{bucket}-b01"), 100 + i64::from(part)); } catalog };
     let group = "l02-rc-p0-b00".parse::<TrieKey>().unwrap().part_group().unwrap();
-    let object = ObjectKey::new(entry.slug.group_artefact_prefix(&group) + "/search/body-v1.bin").unwrap();
+    let object = |definition| ObjectKey::new(entry.slug.group_artefact_prefix(&group) + &format!("/search/{definition}-v1.bin")).unwrap();
+    let (agreed, mixed, legacy) = (object("body"), object("mixed"), object("legacy"));
     let store = Arc::new(MemoryStore::default());
-    store.put(&object, Bytes::from_static(b"artefact")).await.unwrap();
+    for key in [&agreed, &mixed, &legacy] {
+        store.put(key, Bytes::from_static(b"artefact")).await.unwrap();
+    }
+    for (member, trie) in group.members().into_iter().enumerate() {
+        use rtdb_format::log::proto::{ArtefactRecord, ArtefactScope};
+        let records = [("body", &agreed), ("mixed", &mixed), ("legacy", &legacy)].map(|(name, key)| {
+            let version = if name == "mixed" && member == 2 { "stale-file-version" } else { "group-file-version" };
+            (trie.clone(), ArtefactRecord {
+                kind: Some("search".into()),
+                definition_id: Some(name.into()),
+                definition_version: Some(1),
+                scope: Some(ArtefactScope::PartGroup as i32),
+                published_version: (name != "legacy" || member != 3).then(|| provider_version(key, version).into()),
+                ..Default::default()
+            })
+        });
+        catalog = catalog.with_artefacts(&table, records);
+    }
     let observing = Arc::new(ObservedStore {
         inner: store.clone(),
-        versions: BTreeMap::from([(object.clone(), provider_version(&object, "group-file-version"))]),
+        versions: [&agreed, &mixed, &legacy].into_iter()
+            .map(|key| (key.clone(), provider_version(key, "group-file-version"))).collect(),
     });
     let collect = |catalog: TrieCatalog| {
         let (store, observing, tables, entry) = (store.clone(), observing.clone(), tables.clone(), entry.clone());
@@ -480,30 +499,39 @@ async fn a_groups_artefacts_go_only_with_the_last_member_the_catalog_holds() {
     };
     let receipts = async || {
         let installed = ObjectKey::new(format!("{TRIE_RETIREMENT_DIRECTORY}/6-0-0/installed")).unwrap();
-        let mut recorded = Vec::new();
+        let mut recorded = BTreeMap::new();
         for receipt in store.list(Some(&installed)).await.unwrap() {
             let bytes = store.get(&receipt.key).await.unwrap();
             let intent: serde_json::Value = serde_json::from_slice(&bytes[8..]).unwrap();
             for file in intent["files"].as_array().unwrap() {
-                if file["key"] == object.as_str() { recorded.push((intent["tries"].clone(), file["version"].clone())); }
+                let key = file["key"].as_str().unwrap();
+                if [&agreed, &mixed, &legacy].iter().any(|object| object.as_str() == key) {
+                    assert!(recorded.insert(key.to_owned(), (intent["tries"].clone(), file.clone())).is_none());
+                }
             }
         }
         recorded
     };
     let one_superseded = supersede(catalog.clone(), 0);
     assert_eq!(collect(one_superseded.clone()).await, ["l02-rc-p0-b00".parse::<TrieKey>().unwrap()]);
-    assert!(store.head(&object).await.is_ok(), "three members are still live");
+    assert!(store.head(&agreed).await.is_ok(), "three members are still live");
     assert!(receipts().await.is_empty());
     let collected = one_superseded.without_tries(&table, &["l02-rc-p0-b00".parse().unwrap()].into());
     let all_superseded = (1..4).fold(collected, supersede);
     let retired = collect(all_superseded).await;
     assert_eq!(retired.len(), 3);
-    assert!(store.head(&object).await.is_err(), "the last members take the group's artefacts with them");
     let recorded = receipts().await;
-    assert_eq!(recorded.len(), 1);
-    assert_eq!(recorded[0].0, serde_json::json!([retired.last().unwrap().to_string()]));
-    assert_eq!(recorded[0].1["key"], format!("test-residence/{object}"));
-    assert_eq!(recorded[0].1["version"], "group-file-version");
+    assert_eq!(recorded.len(), 3);
+    for key in [&agreed, &mixed, &legacy] {
+        assert!(store.head(key).await.is_err(), "the last members take the group's artefacts with them");
+        let (tries, file) = &recorded[key.as_str()];
+        assert_eq!(*tries, serde_json::json!([retired.last().unwrap().to_string()]));
+        assert_eq!(file["version"]["key"], format!("test-residence/{key}"));
+        assert_eq!(file["version"]["version"], "group-file-version");
+    }
+    assert_eq!(recorded[agreed.as_str()].1["matches_publication"], true);
+    assert!(recorded[mixed.as_str()].1.get("matches_publication").is_none(), "differing member publications cannot bind the group file");
+    assert!(recorded[legacy.as_str()].1.get("matches_publication").is_none(), "a member without a publication cannot bind the group file");
 }
 
 #[tokio::test]

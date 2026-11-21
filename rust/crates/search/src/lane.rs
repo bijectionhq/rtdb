@@ -105,6 +105,7 @@ impl ArtefactBuilder for SearchBuilder {
                 stats: Some(crate::file::encode_sections(sections)),
                 scope: None,
                 file_size: Some(i64::try_from(size).map_err(fault)?),
+                published_version: None,
             })
         };
         let known = self.columns.lock().get(&(definition.id.clone(), definition.version)).cloned();
@@ -176,8 +177,8 @@ impl ArtefactBuilder for SearchBuilder {
         }).await.map_err(|error| Anomaly::fault("rtdb.search/build", error.to_string()))??;
         if cancellation.is_cancelled() { return Err(Anomaly::new(rtdb_types::AnomalyCategory::Interrupted, "rtdb.search/cancelled", "Search build cancelled")); }
         let size = tokio::fs::metadata(&bundle).await.map_err(fault)?.len();
-        let record = record(&sections, size)?;
-        self.store.put_file(&key, &bundle).await?;
+        let mut record = record(&sections, size)?;
+        record.published_version = self.store.put_file_with_version(&key, &bundle).await?.map(Into::into);
         if repairing { self.runtime.clear(&suspect); }
         Ok(record)
     }
