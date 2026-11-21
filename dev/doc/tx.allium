@@ -184,6 +184,8 @@ value CommitOpts {
     -- grammar). Their very presence implies the transaction is Writing.
     -- The transaction's effective timezone is NOT a commit-opt: it is set by BEGIN or SET TRANSACTION as the tx's tx_default_tz (see Transaction), not deferred to COMMIT.
     --   system_time   — the system-time to record the transaction at.
+    --                   It must advance the history and must not be later than the source log's append time for the record.
+    --                   A later time aborts the transaction with rtdb/future-system-time, so history time never leads the log's clock.
     --   user_metadata — per-transaction metadata.
     --                   RTDB recognises the Boolean rtdb_ordered_system_time field as an opt-in to rejecting an explicit system time behind the source log.
     --                   The PgWire SHOW rtdb_ordered_system_time value is 1 when the server supports this guard.

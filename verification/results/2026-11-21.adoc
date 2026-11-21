@@ -1687,3 +1687,15 @@ and `/private/tmp/rtdb-formal.QMjPSJsX/leaf-openjml-final/`.
 The native logs are `/private/tmp/rtdb-formal.QMjPSJsX/leaf-dfbeb7e0d-native.log`,
 `/private/tmp/rtdb-formal.QMjPSJsX/leaf-arrow-timing-focused.log`,
 and `/private/tmp/rtdb-formal.QMjPSJsX/leaf-arrow-timing-sampled.log`.
+
+
+== Client system time bounded by the source log
+
+A client-supplied system time must advance the head and must not exceed the source log's append time for its record; otherwise the transaction aborts with `rtdb/future-system-time` at the automatic time.
+History time therefore never leads the log clock, which removes the far-future pinning of later automatic times and the `xtdb/time-overflow` refusal after a write at the maximum timestamp.
+An external source's commit time is clamped to the node clock before smoothing.
+The link:../verus/system_time/laws.rs[system-time area] verifies the admission decision with two new laws: an admitted client time never leads the log, and it always leaves a following chronon when the log time is below the maximum.
+Dropping the log bound fails the decision's contract, and fails both laws when the contract is weakened with it; the runner reported 11 verified functions and the expected diagnostics for all six controls.
+A resolution test refuses a time one microsecond ahead of the log and the maximum timestamp, then commits at the log time and follows the log with the next automatic time.
+The affected tx, node, conformance, Multi, server, pgwire and Flight SQL suites passed after two fixtures that relied on future times were rewritten: the catalog-time test now reaches a head above the log clock by stepping that clock back, and the synthetic simulation tape's external commit times no longer lead its node clock.
+

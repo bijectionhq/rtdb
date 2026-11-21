@@ -1238,20 +1238,26 @@ async fn catalog_transactions_advance_system_time_and_replay_in_order() {
         settings.membership = Membership::Durable {
             primary: local_database(directory.path()), skipped: BTreeSet::from(["secondary".into()]),
         };
-        let runtime = services();
+        // A client time may not lead the log, so the head passes the log clock only when that clock steps back.
+        struct SteppedClock(AtomicI64);
+        impl Clock for SteppedClock { fn now(&self) -> Timestamp { Timestamp(self.0.load(Ordering::Relaxed)) } }
+        let first_time = Timestamp(1_000_000_000);
+        let clock = Arc::new(SteppedClock(AtomicI64::new(first_time.0)));
+        let mut runtime = services();
+        runtime.clock = clock.clone();
         let boot = || NodeServices {
             resources: Arc::new(NativeResources::default().with_local_log_clock(runtime.clock.clone(), true)),
             ..runtime.clone()
         };
         let (node, driver) = running(settings.clone(), boot()).await;
         let token = CancellationToken::new();
-        let first_time = Timestamp(1_000_000_000);
         let mut session = node.session("xtdb", Arc::new(Authority)).unwrap();
         let put = session.state_mut().execute_tx(vec![put(&node, 1, 10)], AutonomousTxOptions {
             system_time: Some(first_time), ..Default::default()
         }).await.unwrap();
         assert!(put.committed());
         assert_eq!(put.tx_key().system_time, first_time);
+        clock.0.store(1_000_000, Ordering::Relaxed);
 
         let attached = node.attach_database("secondary".into(), Default::default(), &Authority, &token)
             .await.expect("catalog attach must advance past the previous transaction's time");

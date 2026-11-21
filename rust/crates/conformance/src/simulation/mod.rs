@@ -473,7 +473,7 @@ mod tests {
         let mut inputs = vec![Event { sequence: 1, event: Input::Flush { offset: 0, time: [100, 1_100] } }];
         for action in 0..30u32 {
             let committed = action != 29;
-            let time = [101, 1000 * (i64::from(action) + 1)];
+            let time = [99, 1000 * (i64::from(action) + 1)];
             let sequence = 11 + action as usize * 4;
             inputs.push(Event { sequence, event: Input::ExternalStart { action, token: tape::token(action),
                 tx_id: i64::from(action), time, documents: committed.then(|| vec![uuid::Uuid::from_u128(u128::from(action))]) } });

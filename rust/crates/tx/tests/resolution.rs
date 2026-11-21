@@ -380,3 +380,23 @@ async fn resolved_series_dml_uses_the_resolving_nodes_endpoint_policy() {
         assert_eq!(document["v"],Value::List((1..if end_exclusive {3} else {4}).map(Value::I64).collect()));
     }
 }
+
+#[tokio::test]
+async fn a_client_system_time_ahead_of_the_log_is_refused_and_cannot_strand_the_clock() {
+    let state = PartitionState::empty(Default::default()).unwrap();
+    let context = context();
+    let mut resolver = TxResolver::new(None, SourcePosition(-1), None, &context.memory).unwrap();
+    let at = |time| SourceTransaction::new(vec![put(&context, 3, 0, i64::MAX)], SubmitOptions { system_time: Some(Timestamp(time)), ..Default::default() }, &context.memory).unwrap();
+
+    for (position, requested) in [(0, 101), (1, i64::MAX)] {
+        let refused = resolver.resolve_source(state.value().snapshot(), SourcePosition(position), Timestamp(100), at(requested), &context).await.unwrap();
+        assert_eq!(refused.result().error().unwrap().code, "rtdb/future-system-time");
+        assert!(refused.result().tx_key().system_time.0 <= 101, "a refused time never becomes the head");
+        assert_eq!(refused.writes().tables().keys().collect::<Vec<_>>(), [&TableRef::new("xt", "txs")]);
+    }
+    let at_log = resolver.resolve_source(state.value().snapshot(), SourcePosition(2), Timestamp(200), at(200), &context).await.unwrap();
+    assert!(at_log.result().committed());
+    assert_eq!(at_log.result().tx_key().system_time, Timestamp(200));
+    let next = resolver.resolve_source(state.value().snapshot(), SourcePosition(3), Timestamp(300), request(vec![], &context), &context).await.unwrap();
+    assert_eq!(next.result().tx_key().system_time, Timestamp(300), "automatic time follows the log once no client time leads it");
+}

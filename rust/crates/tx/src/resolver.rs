@@ -154,12 +154,14 @@ impl TxResolver {
         let default_time = self.smooth(log_time)?;
         let invalid_time = request.options.system_time.zip(self.resolved_head)
             .filter(|(time, previous)| !crate::system_time::advances(Some(previous.system_time.0), time.0));
+        let ahead_of_log = request.options.system_time
+            .filter(|time| invalid_time.is_none() && !crate::system_time::admits_client_time(self.previous_system_time(), time.0, log_time.0));
         let behind_log = request.options.system_time.filter(|time| {
             *time < log_time && request.options.user_metadata.as_ref().is_some_and(UserMetadata::requires_ordered_system_time)
         });
         let key = TransactionKey {
             tx_id: TxId(position.0),
-            system_time: if invalid_time.is_some() || behind_log.is_some() {
+            system_time: if invalid_time.is_some() || ahead_of_log.is_some() || behind_log.is_some() {
                 default_time
             } else {
                 request.options.system_time.unwrap_or(default_time)
@@ -171,6 +173,10 @@ impl TxResolver {
             Err(Anomaly::incorrect("invalid-system-time", "specified system-time must be later than current tx")
                 .with_context("tx-key", tx_key_context(TransactionKey { tx_id: TxId(position.0), system_time: requested })?)
                 .with_context("latest-completed-tx", tx_key_context(previous)?))
+        } else if let Some(requested) = ahead_of_log {
+            Err(Anomaly::incorrect("rtdb/future-system-time", "specified system-time is later than the source-log timestamp")
+                .with_context("tx-key", tx_key_context(TransactionKey { tx_id: TxId(position.0), system_time: requested })?)
+                .with_context("log-time", transit::to_json_value(&T::instant(log_time.into())?)?))
         } else if let Some(requested) = behind_log {
             Err(Anomaly::incorrect("rtdb/ordered-system-time", "specified system-time precedes the source-log timestamp")
                 .with_context("tx-key", tx_key_context(TransactionKey { tx_id: TxId(position.0), system_time: requested })?)
@@ -214,7 +220,8 @@ impl TxResolver {
         let durable = rtdb_query::retain_catalog_snapshot(durable, &context.storage).await?;
         let base = self.resolving_snapshot(durable)?;
         let id = self.resolved_head.map_or(-1, |key| key.tx_id.0).checked_add(1).ok_or_else(overflow)?;
-        let key = TransactionKey { tx_id: TxId(id), system_time: self.smooth(system_time.unwrap_or(now))? };
+        // A source's own commit time labels history only up to this node's clock, so history never leads the clock that assigns it.
+        let key = TransactionKey { tx_id: TxId(id), system_time: self.smooth(system_time.map_or(now, |time| Timestamp(time.0.min(now.0))))? };
         let options = SubmitOptions { default_tz: context.default_tz.clone(), ..SubmitOptions::default() };
         let mut tx = OpenTransaction::new(base.clone(), key, &options, context)?;
         let (result, metadata) = match writer.write(&mut tx).await? {

@@ -16,6 +16,18 @@ pub(crate) fn advances(previous: Option<i64>, candidate: i64) -> bool {
     }
 }
 
+/// A client may name a system time that advances the history and does not run ahead of the log's append time.
+/// History time therefore never leads the log's clock, so automatic assignment keeps a following chronon.
+#[cfg_attr(verus_keep_ghost, verus_spec(out =>
+    ensures out == (match previous {
+        Some(last) => last < candidate,
+        None => true,
+    } && candidate <= log_time),
+))]
+pub(crate) fn admits_client_time(previous: Option<i64>, candidate: i64, log_time: i64) -> bool {
+    advances(previous, candidate) && candidate <= log_time
+}
+
 #[cfg_attr(verus_keep_ghost, verus_spec(out =>
     ensures out == match previous {
         Some(last) if candidate <= last =>
