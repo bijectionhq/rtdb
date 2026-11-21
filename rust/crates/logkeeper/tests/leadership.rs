@@ -35,6 +35,45 @@ async fn a_successor_skips_commit_requests_when_the_synced_quorum_has_committed_
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_slow_replica_does_not_delay_a_durable_recovery_quorum() {
+    let ensemble = Ensemble::start(3).await;
+    let config = ensemble.config("slow-recovery");
+    let previous = open_writer(config.clone(), 1, CancellationToken::new()).await.unwrap();
+    append(previous.as_ref(), "first", 1).await;
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let audit = rtdb_logkeeper::audit_retained(&config).await.unwrap();
+            if audit.digests.len() == 3 { break; }
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+    }).await.unwrap();
+
+    let slow = CountingProxy::start(ensemble.addresses[2]).await;
+    slow.hold_overwrites(true);
+    let mut proxied = config.clone();
+    proxied.servers[2] = slow.address.to_string();
+    let recovering = tokio::spawn(open_writer(proxied, 2, CancellationToken::new()));
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while slow.held_overwrites() == 0 { tokio::time::sleep(Duration::from_millis(2)).await; }
+    }).await.unwrap();
+    let successor = tokio::time::timeout(Duration::from_millis(500), recovering).await
+        .expect("the held overwrite left a complete recovery quorum").unwrap().unwrap();
+    assert_eq!(append(successor.as_ref(), "second", 2).await.offset, LogOffset(1));
+
+    slow.hold_overwrites(false);
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let audit = rtdb_logkeeper::audit_retained(&config).await.unwrap();
+            if audit.interval == Some([0, 1]) && audit.digests.len() == 3 {
+                assert!(audit.digests.values().all(|digest| digest == &audit.digests[&config.servers[0]]));
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+    }).await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_successor_publishes_a_recovered_tip_when_the_previous_commit_requests_were_lost() {
     let ensemble = Ensemble::start(3).await;
     let config = ensemble.config("unpublished-tip");
@@ -52,7 +91,9 @@ async fn a_successor_publishes_a_recovered_tip_when_the_previous_commit_requests
     assert_eq!(reader.latest().unwrap(), LogOffset(-1));
 
     let proxied = StreamConfig { servers: after.iter().map(|proxy| proxy.address.to_string()).collect(), ..config.clone() };
-    let successor = open_writer(proxied, 2, CancellationToken::new()).await.unwrap();
+    after[2].drop_commits();
+    let successor = tokio::time::timeout(Duration::from_millis(500), open_writer(proxied, 2, CancellationToken::new())).await
+        .expect("two surviving commit acknowledgments complete recovery").unwrap();
     assert_eq!(successor.latest().unwrap(), LogOffset(0));
     assert!(after.iter().map(CountingProxy::commits).sum::<usize>() >= 2);
     let reader = open_reader(config, CancellationToken::new()).await.unwrap();

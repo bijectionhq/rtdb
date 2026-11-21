@@ -1066,6 +1066,8 @@ rule RecoverTail {
     -- Its records above the checkpoint are the tail: every committed record is in it (NothingCommittedIsLost).
     -- Records a deposed holder put on a minority were never acknowledged; recovery may keep or drop them, and a client retry with the same idempotency key settles the outcome either way.
     -- Durable sync acknowledgements can confirm the recovered commit when they already report it on a write quorum.
+    -- Opening waits for durable commit acknowledgements from a write quorum.
+    -- A replica that does not finish recovery with the quorum can rejoin through background repair.
     when: holding: Holding.state becomes recovering
 
     ensures:

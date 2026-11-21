@@ -82,6 +82,8 @@ pub struct CountingProxy {
     appends: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     commits: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     drop_commits: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    held_overwrites: tokio::sync::watch::Sender<bool>,
+    held_overwrite_count: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     append_refusal_epoch: std::sync::Arc<std::sync::atomic::AtomicU64>,
     held: tokio::sync::watch::Sender<bool>,
 }
@@ -94,6 +96,8 @@ struct CountedRequest {
     append: Option<Bytes>,
     #[prost(bytes = "bytes", optional, tag = "7")]
     commit: Option<Bytes>,
+    #[prost(bytes = "bytes", optional, tag = "6")]
+    overwrite: Option<Bytes>,
 }
 
 #[derive(prost::Message)]
@@ -127,6 +131,10 @@ impl CountingProxy {
         let refusals = std::sync::Arc::clone(&append_refusal_epoch);
         let held = tokio::sync::watch::channel(false).0;
         let holding = held.clone();
+        let held_overwrites = tokio::sync::watch::channel(false).0;
+        let mutating = held_overwrites.clone();
+        let held_overwrite_count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let overwrite_counter = std::sync::Arc::clone(&held_overwrite_count);
         tokio::spawn(async move {
             while let Ok((client, _)) = listener.accept().await {
                 let Ok(server) = tokio::net::TcpStream::connect(target).await else { continue };
@@ -140,6 +148,8 @@ impl CountingProxy {
                 let pending_appends = std::sync::Arc::new(parking_lot::Mutex::new(std::collections::BTreeSet::new()));
                 let append_ids = std::sync::Arc::clone(&pending_appends);
                 let mut holding = holding.subscribe();
+                let mut held_overwrites = mutating.subscribe();
+                let held_overwrite_count = std::sync::Arc::clone(&overwrite_counter);
                 tokio::spawn(async move {
                     loop {
                         let Ok(length) = client_reader.read_u32().await else { break };
@@ -150,6 +160,10 @@ impl CountingProxy {
                             if request.append.is_some() {
                                 append_ids.lock().insert(request.id);
                                 append_counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                            }
+                            if request.overwrite.is_some() && *held_overwrites.borrow() {
+                                held_overwrite_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                                if held_overwrites.wait_for(|held| !held).await.is_err() { break; }
                             }
                             if request.commit.is_some() {
                                 commit_counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -175,10 +189,13 @@ impl CountingProxy {
                 });
             }
         });
-        Self { address, requests, appends, commits, drop_commits, append_refusal_epoch, held }
+        Self { address, requests, appends, commits, drop_commits, held_overwrites, held_overwrite_count, append_refusal_epoch, held }
     }
 
     pub fn hold(&self, held: bool) { self.held.send_replace(held); }
+
+    pub fn hold_overwrites(&self, held: bool) { self.held_overwrites.send_replace(held); }
+    pub fn held_overwrites(&self) -> usize { self.held_overwrite_count.load(std::sync::atomic::Ordering::SeqCst) }
 
     pub fn requests(&self) -> usize { self.requests.load(std::sync::atomic::Ordering::SeqCst) }
     pub fn appends(&self) -> usize { self.appends.load(std::sync::atomic::Ordering::SeqCst) }
