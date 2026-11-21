@@ -46,6 +46,30 @@ fn conforming_unloader_promotes_present_nulls_without_changing_declared_fields()
 }
 
 #[test]
+fn matching_columns_reuse_buffers_when_other_columns_need_conformance() {
+    let memory = MemoryBudget::new(1 << 22);
+    let text = StringArray::from(vec![Some("keep this buffer"), None]);
+    let address = text.value_data().as_ptr();
+    let text_field = Field::new("text", DataType::Utf8, true);
+    let source = RecordBatch::try_new(
+        Arc::new(Schema::new(vec![text_field.clone(), Field::new("number", DataType::Null, true)])),
+        vec![Arc::new(text), Arc::new(NullArray::new(2))],
+    ).unwrap();
+    let target = Schema::new(vec![Field::new("number", DataType::Int64, true), text_field]);
+
+    let page = conform_batch(OwnedBatch::new(source, &memory).unwrap(), &target, &memory).unwrap();
+
+    assert_eq!(page.batch().schema().as_ref(), &target);
+    assert_eq!(page.batch().column(0).null_count(), 2);
+    let text = page.batch().column(1).as_any().downcast_ref::<StringArray>().unwrap();
+    assert_eq!(text.value_data().as_ptr(), address);
+    assert_eq!(text.value(0), "keep this buffer");
+    assert!(text.is_null(1));
+    drop(page);
+    assert_eq!(memory.used_bytes(), 0);
+}
+
+#[test]
 fn declared_layout_preserves_nested_nulls_and_reorders_columns() {
     let memory = MemoryBudget::new(1 << 22);
     let input_type = LogicalType::list(LogicalType::Null);

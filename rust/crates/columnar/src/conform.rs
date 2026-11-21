@@ -38,15 +38,31 @@ pub fn conform_batch(batch: OwnedBatch, declared: &Schema, memory: &Arc<MemoryBu
         if source.fields().get(index).is_some_and(|candidate| candidate.name() == field.name()) { Some(index) }
         else { source.fields().iter().rposition(|candidate| candidate.name() == field.name()) }
     }).collect::<Vec<_>>();
-    let mut decoded_bound = multiply(batch.batch().num_rows(), multiply(declared.fields().len(), std::mem::size_of::<Value>())?)?;
-    for position in positions.iter().flatten() {
-        for row in 0..batch.batch().num_rows() { decoded_bound = add(decoded_bound, estimate_read_value_bytes(source.field(*position), batch.batch().column(*position).as_ref(), row)?)?; }
+    let reusable = declared.fields().iter().zip(&positions).map(|(field, position)| {
+        position.filter(|&position| source.field(position) == field.as_ref())
+    }).collect::<Vec<_>>();
+    let rebuilt_count = reusable.iter().filter(|position| position.is_none()).count();
+    let mut decoded_bound = multiply(batch.batch().num_rows(), multiply(rebuilt_count, std::mem::size_of::<Value>())?)?;
+    for (position, reused) in positions.iter().zip(&reusable) {
+        if let (Some(position), None) = (position, reused) {
+            for row in 0..batch.batch().num_rows() {
+                decoded_bound = add(decoded_bound, estimate_read_value_bytes(source.field(*position), batch.batch().column(*position).as_ref(), row)?)?;
+            }
+        }
     }
-    let decoded = memory.reserve(add(decoded_bound, 4096)?)?;
-    let mut values = Vec::with_capacity(declared.fields().len());
-    let mut logical = Vec::with_capacity(declared.fields().len());
+    let _decoded = memory.reserve(decoded_bound)?;
+    let reused_bytes = reusable.iter().flatten().try_fold(schema_bound, |bytes, &position| {
+        add(bytes, batch.batch().column(position).get_array_memory_size())
+    })?;
+    let mut output = memory.reserve(reused_bytes)?;
     let mut fields = Vec::with_capacity(declared.fields().len());
-    for (field, position) in declared.fields().iter().zip(&positions) {
+    let mut arrays: Vec<ArrayRef> = Vec::with_capacity(declared.fields().len());
+    for ((field, position), reused) in declared.fields().iter().zip(&positions).zip(reusable) {
+        if let Some(position) = reused {
+            fields.push(field.as_ref().clone());
+            arrays.push(Arc::clone(batch.batch().column(position)));
+            continue;
+        }
         let target = from_field(field)?;
         let source_type = position.map(|position| from_field(source.field(position))).transpose()?.unwrap_or(L::Null);
         if position.is_none() && !target.nullable() { return Err(fault("page-missing-non-nullable", "Page lacks a required declared field")); }
@@ -56,20 +72,16 @@ pub fn conform_batch(batch: OwnedBatch, declared: &Schema, memory: &Arc<MemoryBu
             None => Ok(Value::Null),
         }).collect::<Result<Vec<_>>>()?;
         let physical = to_field(field.name(), &ty)?.with_metadata(field.metadata().clone());
-        fields.push(physical); logical.push(ty); values.push(column);
-    }
-    let bound = logical.iter().zip(&values).try_fold(schema_bound, |bytes, (ty, values)| add(bytes, multiply(estimate_builder_bytes(ty, values)?, 2)?))?;
-    let output = memory.reserve(bound)?;
-    let mut arrays: Vec<ArrayRef> = Vec::with_capacity(fields.len());
-    for (((ty, values), field), target) in logical.iter().zip(&values).zip(&mut fields).zip(declared.fields()) {
-        let (physical, array) = physical::relayout(copy_array(ty, values)?, field, target)?;
-        *field = physical;
+        let bound = multiply(estimate_builder_bytes(&ty, &column)?, 2)?;
+        let reservation = Arc::get_mut(&mut output).expect("Conformance owns the output reservation");
+        reservation.grow_to(add(reservation.bytes(), bound)?)?;
+        let (physical, array) = physical::relayout(copy_array(&ty, &column)?, &physical, field)?;
+        fields.push(physical);
         arrays.push(array);
     }
     let schema = Arc::new(Schema::new(fields).with_metadata(declared.metadata().clone()));
     let physical = RecordBatch::try_new_with_options(schema, arrays, &RecordBatchOptions::new().with_row_count(Some(batch.batch().num_rows()))).map_err(crate::arrow_error)?;
     let batch = OwnedBatch::with_reservation(physical, output)?;
-    drop(values); drop(decoded);
     Ok(DeclaredBatch { batch, declared, _reservation: reservation })
 }
 
