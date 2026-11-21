@@ -154,8 +154,8 @@ async fn a_read_only_session_is_served_by_a_log_fed_replica() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_planned_move_and_a_rebalance_hand_deployments_over_without_losing_them() {
-    let cell = Cell::start(2, None).await;
+async fn a_planned_move_and_a_rebalance_hand_deployments_over_inside_their_pool() {
+    let cell = Cell::start_with(vec![MemberPool::General, MemberPool::General, MemberPool::Isolation, MemberPool::Compaction], None).await;
     for name in ["a1", "a2", "a3", "a4"] {
         admin::create_deployment(cell.directory.as_ref(), name, "acme", 3).await.unwrap();
         let client = cell.connect(name).await;
@@ -164,6 +164,14 @@ async fn a_planned_move_and_a_rebalance_hand_deployments_over_without_losing_the
     let target = cell.node(0).lease.id();
     for name in ["a1", "a2", "a3", "a4"] { admin::move_deployment(cell.directory.as_ref(), name, &target, &control()).await.unwrap(); }
     assert_eq!(cell.node(0).agent.held().len(), 4, "every deployment moved to the target");
+    let before = cell.directory.deployment_by_name("a1").await.unwrap().unwrap();
+    for wrong_pool in [2, 3] {
+        let error = admin::move_deployment(cell.directory.as_ref(), "a1", &cell.node(wrong_pool).lease.id(), &control()).await.unwrap_err();
+        assert_eq!(error.code, "rtdb.multi/not-placeable");
+        let current = cell.directory.deployment_by_name("a1").await.unwrap().unwrap();
+        assert_eq!((current.epoch, current.holder.as_ref(), current.placement_move.as_ref()),
+            (before.epoch, before.holder.as_ref(), before.placement_move.as_ref()));
+    }
     let moved = admin::rebalance(cell.directory.as_ref(), 10, &control()).await.unwrap();
     assert_eq!(moved, 2);
     assert_eq!((cell.node(0).agent.held().len(), cell.node(1).agent.held().len()), (2, 2), "rebalancing evens the holdings out");
@@ -171,6 +179,49 @@ async fn a_planned_move_and_a_rebalance_hand_deployments_over_without_losing_the
         let client = cell.connect(name).await;
         assert_eq!(values(&client, "SELECT label FROM items").await, [name], "nothing is lost in a move");
     }
+    cell.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_unavailable_move_target_releases_the_reservation_and_late_parks_leave_the_new_holding() {
+    use rtdb_multi::control::{self as rpc, MoveTicket, Request, Response};
+
+    let cell = Cell::start(1, None).await;
+    admin::create_deployment(cell.directory.as_ref(), "shop", "acme", 3).await.unwrap();
+    let client = cell.connect("shop").await;
+    client.simple_query("INSERT INTO orders (_id, total) VALUES (1, 10)").await.unwrap();
+    let old = cell.directory.deployment_by_name("shop").await.unwrap().unwrap();
+    let old_member = old.holder.as_ref().unwrap();
+    let mut target = cell.directory.member(old_member).await.unwrap().unwrap();
+    target.id = rtdb_directory::MemberId::fresh();
+    let unavailable = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    target.control_address = Some(unavailable.local_addr().unwrap().to_string());
+    drop(unavailable);
+    let target = cell.directory.register_member(target).await.unwrap();
+
+    assert!(admin::move_deployment(cell.directory.as_ref(), "shop", &target.id, &control()).await.is_err());
+    let parked = cell.directory.deployment(&old.id).await.unwrap().unwrap();
+    assert!(parked.holder.is_none());
+    assert!(parked.placement_move.is_none());
+    let ticket = MoveTicket { deployment: old.id.clone(), request: uuid::Uuid::new_v4() };
+    let late_activate = rpc::call(
+        &cell.node(0).control_address.to_string(), &Request::ActivateForMove { name: "shop".into(), ticket: ticket.clone() },
+        Duration::from_secs(5), &control(),
+    ).await.unwrap();
+    assert!(matches!(late_activate, Response::Refused { code, .. } if code == "rtdb.multi/stale-handoff"));
+    assert_eq!(values(&client, "SELECT total FROM orders").await, ["10"]);
+    let recovered = cell.directory.deployment(&old.id).await.unwrap().unwrap();
+    assert!(recovered.epoch > old.epoch);
+    assert_eq!(recovered.holder.as_ref(), Some(old_member));
+
+    let late = rpc::call(
+        &cell.node(0).control_address.to_string(), &Request::ParkForMove { name: "shop".into(), epoch: old.epoch, ticket },
+        Duration::from_secs(5), &control(),
+    ).await.unwrap();
+    assert!(matches!(late, Response::Refused { code, .. } if code == "rtdb.multi/stale-handoff"));
+    let current = cell.directory.deployment(&old.id).await.unwrap().unwrap();
+    assert_eq!((current.epoch, current.holder), (recovered.epoch, recovered.holder));
+    drop(client);
     cell.stop().await;
 }
 
@@ -191,6 +242,18 @@ async fn a_deployment_whose_activations_crash_is_quarantined_to_the_isolation_po
     let quarantined = cell.directory.deployment_by_name("shop").await.unwrap().unwrap();
     assert_eq!(quarantined.lifecycle, rtdb_directory::Lifecycle::Quarantined);
     assert!(cell.node(0).agent.held().is_empty(), "a general node no longer takes it");
+
+    let mut repaired = quarantined.clone();
+    repaired.ensemble = current.ensemble;
+    cell.directory.replace_deployment(repaired, quarantined.version).await.unwrap().applied().unwrap();
+    let isolated = cell.connect("shop").await;
+    assert_eq!(cell.holder("shop").await, Some(1));
+    let released = admin::unquarantine(cell.directory.as_ref(), "shop").await.unwrap();
+    assert!(released.holder.is_none());
+    assert_eq!(released.activation_crashes, 0);
+    assert_eq!(values(&isolated, "SELECT total FROM orders").await, ["10"]);
+    assert_eq!(cell.holder("shop").await, Some(0));
+    drop(isolated);
     cell.stop().await;
 }
 

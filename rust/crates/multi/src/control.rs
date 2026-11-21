@@ -16,8 +16,10 @@ use tokio_util::sync::CancellationToken;
 pub enum Request {
     /// Become the deployment's holder, or name who is.
     Activate { name: String },
+    ActivateForMove { name: String, ticket: MoveTicket },
     /// Flush, release the placement, and stop running the deployment.
     Park { name: String },
+    ParkForMove { name: String, epoch: u64, ticket: MoveTicket },
     /// Answers Done while the agent is serving: the controller's liveness probe.
     Ping,
     /// A client is using the deployment through a gateway.
@@ -32,6 +34,12 @@ pub enum Request {
     PublishCompaction { name: String, notification: Vec<u8>, grant: String },
     /// Read a fragment of another node's scan of the deployment, at the fragment's basis (`RefineKeyForLargeDeployments`).
     ScanFragment { name: String, fragment: rtdb_query::ScanFragment, grant: String },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MoveTicket {
+    pub deployment: String,
+    pub request: uuid::Uuid,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

@@ -120,6 +120,13 @@ pub enum Lifecycle {
     Deleted,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PlacementMove {
+    pub request: uuid::Uuid,
+    pub target: MemberId,
+    pub expires_at_ms: i64,
+}
+
 /// A cross-cell move owned by the source record until cutover is complete.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CellMove {
@@ -172,9 +179,11 @@ pub struct DeploymentRecord {
     pub read_width: u32,
     pub activation_crashes: u32,
     pub created_at_ms: i64,
-    /// A planned move in progress: only this member may claim the deployment until it does.
+    /// Kept with its original wire type for readers that predate expiring placements.
     #[serde(default)]
     pub move_intent: Option<MemberId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub placement_move: Option<PlacementMove>,
     /// The namespace of the deployment's log positions; bumped when it starts again on fresh logs over existing objects, as a fork does.
     #[serde(default)]
     pub log_epoch: i32,
@@ -216,11 +225,25 @@ impl DeploymentRecord {
     pub fn new(name: impl Into<String>, org: impl Into<String>, ensemble: Vec<MemberId>, now_ms: i64) -> Self {
         let id = uuid::Uuid::new_v4().to_string();
         Self { lineage: id.clone(), id, name: name.into(), org: org.into(), incarnation: 1, lifecycle: Lifecycle::Live, epoch: 0, holder: None,
-            ensemble, read_width: 1, activation_crashes: 0, created_at_ms: now_ms, move_intent: None, log_epoch: 0, parent: None, move_from: None, linearizable_reads: false, checkpoint: None, moved_at_ms: None, cell_move: None, storage_generation: None, version: 0 }
+            ensemble, read_width: 1, activation_crashes: 0, created_at_ms: now_ms, move_intent: None, placement_move: None, log_epoch: 0, parent: None, move_from: None, linearizable_reads: false, checkpoint: None, moved_at_ms: None, cell_move: None, storage_generation: None, version: 0 }
     }
 
-    pub fn can_fork(&self) -> bool {
-        matches!(self.lifecycle, Lifecycle::Live | Lifecycle::Quarantined)
+    pub fn writer_pool(&self) -> Option<MemberPool> {
+        match self.lifecycle {
+            Lifecycle::Live => Some(MemberPool::General),
+            Lifecycle::Quarantined => Some(MemberPool::Isolation),
+            _ => None,
+        }
+    }
+
+    pub fn can_fork(&self) -> bool { self.writer_pool().is_some() }
+
+    pub fn may_place_on(&self, member: &MemberRecord, now_ms: i64) -> bool {
+        self.writer_pool() == Some(member.pool) && member.may_receive_placements(now_ms)
+    }
+
+    pub fn active_move(&self, now_ms: i64) -> Option<&PlacementMove> {
+        self.placement_move.as_ref().filter(|reservation| reservation.expires_at_ms > now_ms)
     }
 
     /// The affinity key: stable across epochs and residency, distinct across incarnations.

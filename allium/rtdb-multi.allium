@@ -316,6 +316,7 @@ config {
     activations_per_node_per_second: Integer = 200
     moves_per_node_per_pass: Integer = 8
     handoff_lag_threshold: Duration = 10.milliseconds
+    move_reservation: Duration = 70.seconds
     quarantine_crashes: Integer = 2
     quarantine_window: Duration = 10.minutes
 }
@@ -507,6 +508,12 @@ entity MemberRecord {
     may_receive_placements: role = node and state = eligible
 }
 
+value PlacementMove {
+    request: String
+    target: MemberId
+    expires_at: Timestamp
+}
+
 entity DeploymentRecord {
     -- One deployment, as the directory records it.
     -- About 300 bytes when parked.
@@ -540,8 +547,8 @@ entity DeploymentRecord {
     read_width: Integer
     -- Activations that ended in the holder crashing, within quarantine_window.
     activation_crashes: Integer
-    -- A planned move in progress, naming its target.
-    move_intent: MemberId?
+    -- A planned move in progress, naming its target and deadline.
+    move_intent: PlacementMove?
     -- Whether producers may submit to an intake stream without waiting for a holder.
     intake_enabled: Boolean
     -- When a request last reached this deployment, maintained coarsely by the holder; orders the drainer.
@@ -566,6 +573,11 @@ entity DeploymentRecord {
     -- A holder counts only while its member may hold; a dead member's placements are unheld without any write to them.
     effective_holder: holder when holder != null and members[holder].may_hold
     is_held: effective_holder != null
+    active_move_target: move_intent.target when move_intent != null
+        and now < move_intent.expires_at
+        and members[move_intent.target].may_receive_placements
+        and ((lifecycle = live and members[move_intent.target].pool = general)
+             or (lifecycle = quarantined and members[move_intent.target].pool = isolation))
     tail_open: loglets != []
     is_parked: not is_held and not tail_open
 }
@@ -898,14 +910,18 @@ rule RetireDrainedMember {
 rule Claim {
     -- A member takes a deployment under the next epoch.
     -- Triggered by a request the gateway routed to it, by the drainer sweeping open tails, or by a move intent naming it.
+    -- A general node claims live deployments, and an isolation node claims quarantined deployments.
+    -- A move reserves a placement only while its target is eligible in the deployment's pool.
     when: ClaimAttempted(member, record, expected_epoch)
 
-    requires: members[member].may_receive_placements or record.move_intent = member
-    requires: record.lifecycle = live or (record.lifecycle = quarantined and members[member].pool = isolation)
+    requires: members[member].may_receive_placements
+    requires: (record.lifecycle = live and members[member].pool = general)
+              or (record.lifecycle = quarantined and members[member].pool = isolation)
+    requires: record.active_move_target = null or record.active_move_target = member
     requires: EngineSatisfiesPin(members[member].engine_version, record.engine_pin)
     requires: record.isolation_class in {shared, isolation} or member in record.pinned_members
     requires: record.epoch = expected_epoch
-    requires: not record.is_held or record.move_intent = member
+    requires: not record.is_held or record.holder = member
 
     ensures:
         let e = Epoch(value: expected_epoch.value + 1)
@@ -1384,6 +1400,8 @@ rule DrainOrphanedTails {
 }
 
 rule CountActivationCrash {
+    -- Only the current holder's epoch contributes an activation crash.
+    -- An unavailable log quorum can release a holding without moving the deployment to isolation.
     when: HolderCrashedDuringOrSoonAfterActivation(record)
 
     ensures:
@@ -1399,13 +1417,16 @@ rule CountActivationCrash {
 ------------------------------------------------------------
 
 rule IntendMove {
+    -- A reservation expires, and a refused activation releases its reservation.
+    -- A handoff park names the deployment, holding epoch, and current reservation.
     when: MoveChosen(record, target)
 
     requires: record.is_held
     requires: members[target].may_receive_placements
 
     ensures:
-        Directory.cas(record.id, record.epoch, change: { move_intent: target })
+        let reservation = PlacementMove.created(request: FreshMoveId(record), target: target, expires_at: now + config.move_reservation)
+        Directory.cas(record.id, record.epoch, change: { move_intent: reservation })
         Subscription.created(deployment: record, member: target, applied_lsn: record.checkpoint.lsn)
         HotRangesPrefetched(from: record.holder, to: target)
 }
@@ -1415,7 +1436,7 @@ rule HandOff {
     -- The target has applied through Handoff already, so its recovery is empty.
     when: SubscriptionCaughtUp(subscription)
 
-    requires: subscription.deployment.move_intent = subscription.member
+    requires: subscription.deployment.active_move_target = subscription.member
     requires: SubscriptionLag(subscription) <= config.handoff_lag_threshold
 
     ensures:
@@ -1449,6 +1470,7 @@ rule DrainMember {
 
 rule Rebalance {
     -- The balancer moves deployments off a node over a watermark on any LoadVector dimension, each to its next eligible rank.
+    -- Each eligible target belongs to the deployment's placement pool.
     when: NodeOverWatermark(member, dimension)
 
     ensures:

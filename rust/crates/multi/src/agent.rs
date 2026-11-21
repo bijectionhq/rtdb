@@ -15,7 +15,7 @@ use rtdb_replication::Role as DriverRole;
 use rtdb_types::{Anomaly, AnomalyCategory, Result};
 use tokio_util::sync::CancellationToken;
 
-use crate::control::{Handler, Request, Response};
+use crate::control::{Handler, MoveTicket, Request, Response};
 use crate::deployment::{CellStorage, Role, database_config, ensemble_servers};
 use crate::lease::MemberLease;
 
@@ -107,12 +107,17 @@ impl NodeAgent {
         self.directory.deployment_by_name(name).await?.ok_or_else(|| Anomaly::incorrect("rtdb.multi/unknown-deployment", format!("No deployment is named {name}")))
     }
 
-    pub async fn activate(&self, name: &str) -> Result<Response> {
+    pub async fn activate(&self, name: &str) -> Result<Response> { self.activate_holding(name, None).await }
+
+    async fn activate_holding(&self, name: &str, moving: Option<&MoveTicket>) -> Result<Response> {
         let turn = self.turn(name);
         let _turn = turn.lock().await;
         let me = self.member();
         for _ in 0..4 {
             let record = self.record(name).await?;
+            if moving.is_some_and(|ticket| ticket.deployment != record.id) {
+                return Err(stale_handoff(name));
+            }
             let members = self.members().await?;
             if let Some(holding) = self.holdings.lock().get_mut(name) {
                 if holding.id == record.id && holding.epoch == record.epoch && record.holder.as_ref() == Some(&me) && self.node.catalog().database(name).is_ok() {
@@ -120,13 +125,17 @@ impl NodeAgent {
                     return Ok(Response::Held { epoch: record.epoch, address: self.address.clone() });
                 }
             }
-            if let Some(holder) = effective_holder(&record, &members, now_ms()) {
+            let now = now_ms();
+            if moving.is_some_and(|ticket| !record.active_move(now).is_some_and(|intent| intent.request == ticket.request && intent.target == me)) {
+                return Err(stale_handoff(name));
+            }
+            if let Some(holder) = effective_holder(&record, &members, now) {
                 if *holder != me {
                     let address = members.get(holder).map(|member| member.address.clone()).unwrap_or_default();
                     return Ok(Response::Redirect { holder: holder.to_string(), address });
                 }
             }
-            let Some(next) = claim(&record, &me, &members, now_ms()) else {
+            let Some(next) = claim(&record, &me, &members, now) else {
                 return Err(Anomaly::new(AnomalyCategory::Conflict, "rtdb.multi/not-claimable", format!("{name} cannot be claimed by this member now")));
             };
             match self.directory.replace_deployment(next, record.version).await? {
@@ -152,7 +161,8 @@ impl NodeAgent {
             }
             Err(error) => {
                 self.stop_running(&record.name).await;
-                self.count_crash(&record.id, Some(record.epoch)).await;
+                let crashed = !matches!(error.category, AnomalyCategory::Unavailable | AnomalyCategory::Busy | AnomalyCategory::Interrupted | AnomalyCategory::Conflict);
+                self.release_failed_holding(&record.id, record.epoch, crashed).await;
                 Err(error)
             }
         }
@@ -233,12 +243,16 @@ impl NodeAgent {
     }
 
     /// Counts an activation that failed or a holding whose database stopped, releasing the placement if this member still has it, and quarantines the deployment once failures reach the threshold.
-    async fn count_crash(&self, id: &str, released_epoch: Option<u64>) {
+    async fn release_failed_holding(&self, id: &str, epoch: u64, crashed: bool) {
         for _ in 0..4 {
             let Ok(Some(record)) = self.directory.deployment(id).await else { return };
-            let mut next = match released_epoch.and_then(|epoch| park(&record, &self.member(), epoch)) { Some(parked) => parked, None => record.clone() };
-            next.activation_crashes += 1;
-            if next.activation_crashes >= self.options.quarantine_after && next.lifecycle == Lifecycle::Live { next.lifecycle = Lifecycle::Quarantined; }
+            let Some(mut next) = park(&record, &self.member(), epoch) else { return };
+            if crashed {
+                next.activation_crashes += 1;
+                if next.activation_crashes >= self.options.quarantine_after && next.lifecycle == Lifecycle::Live {
+                    next.lifecycle = Lifecycle::Quarantined;
+                }
+            }
             if let Ok(Cas::Applied(_)) = self.directory.replace_deployment(next, record.version).await { return; }
         }
     }
@@ -272,14 +286,36 @@ impl NodeAgent {
         Ok(Response::Done)
     }
 
-    pub async fn park(&self, name: &str) -> Result<Response> {
+    pub async fn park(&self, name: &str) -> Result<Response> { self.park_holding(name, None).await }
+
+    async fn park_holding(&self, name: &str, moving: Option<(u64, &MoveTicket)>) -> Result<Response> {
         let turn = self.turn(name);
         let _turn = turn.lock().await;
         let Some((id, epoch)) = self.holdings.lock().get(name).map(|holding| (holding.id.clone(), holding.epoch)) else { return Ok(Response::Done); };
-        // A park releases the placement only once the flushed block is adopted, so the next holder starts from a closed block rather than a dangling one.
+        let is_requested = |record: &DeploymentRecord| moving.is_none_or(|(epoch, ticket)| {
+            record.id == ticket.deployment && record.epoch == epoch && record.holder.as_ref() == Some(&self.member())
+                && record.active_move(now_ms()).is_some_and(|intent| intent.request == ticket.request)
+        });
+        if let Some((move_epoch, ticket)) = moving {
+            if id != ticket.deployment || epoch != move_epoch
+                || !self.directory.deployment(&id).await?.as_ref().is_some_and(is_requested) {
+                return Err(stale_handoff(name));
+            }
+        }
+
+        // The next holder starts from a closed block once the flushed block has been adopted.
         if let Ok(database) = self.node.catalog().database(name) { self.flush_and_adopt(&database).await?; }
-        if let Some(record) = self.directory.deployment(&id).await? {
-            if let Some(parked) = park(&record, &self.member(), epoch) { self.directory.replace_deployment(parked, record.version).await?; }
+        for _ in 0..8 {
+            let Some(record) = self.directory.deployment(&id).await? else { break };
+            if !is_requested(&record) { return Err(stale_handoff(name)); }
+            let Some(parked) = park(&record, &self.member(), epoch) else { break };
+            if let Cas::Applied(_) = self.directory.replace_deployment(parked, record.version).await? {
+                self.stop_running(name).await;
+                return Ok(Response::Done);
+            }
+        }
+        if self.directory.deployment(&id).await?.as_ref().is_some_and(|record| record.epoch == epoch && record.holder.as_ref() == Some(&self.member())) {
+            return Err(Anomaly::new(AnomalyCategory::Conflict, "rtdb.multi/update-contended", format!("{name} kept changing while it was parked")));
         }
         self.stop_running(name).await;
         Ok(Response::Done)
@@ -469,7 +505,7 @@ impl NodeAgent {
                 if !self.holdings.lock().get(&name).is_some_and(|holding| holding.id == id && holding.epoch == epoch) { continue; }
                 let stopped = self.node.catalog().database(&name).map_or(true, |database| matches!(database.status().role, DriverRole::Stopped));
                 self.stop_running(&name).await;
-                if placed_here && stopped { self.count_crash(&id, Some(epoch)).await; }
+                if placed_here && stopped { self.release_failed_holding(&id, epoch, true).await; }
                 continue;
             }
             self.publish_and_trim(&name, &id, epoch).await;
@@ -487,7 +523,9 @@ impl NodeAgent {
             if draining || !wanted || expired || last_touch.elapsed() >= self.options.unsubscribe_after || self.node.catalog().database(&name).is_err() {
                 let turn = self.turn(&name);
                 let _turn = turn.lock().await;
-                self.stop_running(&name).await;
+                if self.subscriptions.lock().get(&name).is_some_and(|current| current.id == id && current.opened == opened) {
+                    self.stop_running(&name).await;
+                }
             }
         }
     }
@@ -511,12 +549,18 @@ impl NodeAgent {
     }
 }
 
+fn stale_handoff(name: &str) -> Anomaly {
+    Anomaly::new(AnomalyCategory::Conflict, "rtdb.multi/stale-handoff", format!("The requested holding of {name} has changed"))
+}
+
 #[async_trait]
 impl Handler for NodeAgent {
     async fn handle(&self, request: Request) -> Response {
         let result = match request {
             Request::Activate { name } => self.activate(&name).await,
+            Request::ActivateForMove { name, ticket } => self.activate_holding(&name, Some(&ticket)).await,
             Request::Park { name } => self.park(&name).await,
+            Request::ParkForMove { name, epoch, ticket } => self.park_holding(&name, Some((epoch, &ticket))).await,
             Request::Touch { name } => { self.touch(&name); Ok(Response::Done) }
             Request::Ping => Ok(Response::Done),
             Request::Subscribe { name } => self.subscribe(&name).await,

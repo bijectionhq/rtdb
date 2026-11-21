@@ -196,7 +196,7 @@ fn snapshot_readers<'a>(record: &DeploymentRecord, members: &'a BTreeMap<MemberI
 fn replicas<'a>(record: &DeploymentRecord, members: &'a BTreeMap<MemberId, MemberRecord>) -> Vec<&'a MemberRecord> {
     let now = now_ms();
     let holder = effective_holder(record, members, now).cloned();
-    let nodes: Vec<&MemberRecord> = members.values().filter(|member| member.role == MemberRole::Node && member.may_receive_placements(now)).collect();
+    let nodes: Vec<&MemberRecord> = members.values().filter(|member| record.may_place_on(member, now)).collect();
     rtdb_affinity::rank(&record.storage_identity(), &nodes, |member| member.id.as_str()).into_iter().copied()
         .filter(|member| holder.as_ref() != Some(&member.id)).take(record.read_width.saturating_sub(1) as usize).collect()
 }
@@ -205,9 +205,13 @@ fn replicas<'a>(record: &DeploymentRecord, members: &'a BTreeMap<MemberId, Membe
 fn candidates<'a>(record: &DeploymentRecord, members: &'a BTreeMap<MemberId, MemberRecord>) -> Vec<&'a MemberRecord> {
     let now = now_ms();
     let holder = effective_holder(record, members, now).and_then(|holder| members.get(holder));
-    let nodes: Vec<&MemberRecord> = members.values().filter(|member| member.role == MemberRole::Node && member.may_receive_placements(now)).collect();
+    let nodes: Vec<&MemberRecord> = members.values().filter(|member| record.may_place_on(member, now)).collect();
+    let reserved = record.active_move(now).and_then(|intent| members.get(&intent.target))
+        .filter(|member| record.may_place_on(member, now) && holder.is_none_or(|holder| holder.id != member.id));
     let ranked = rtdb_affinity::rank(&record.storage_identity(), &nodes, |member| member.id.as_str());
-    holder.into_iter().chain(ranked.into_iter().copied().filter(|member| holder.is_none_or(|holder| holder.id != member.id))).collect()
+    holder.into_iter().chain(reserved).chain(ranked.into_iter().copied().filter(|member| {
+        holder.is_none_or(|holder| holder.id != member.id) && reserved.is_none_or(|target| target.id != member.id)
+    })).collect()
 }
 
 async fn connect(address: &str) -> Result<TcpStream> {

@@ -4,13 +4,13 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-use rtdb_directory::{Cas, CellMove, CellMovePhase, DeploymentRecord, MoveNamespaces, Directory, Lifecycle, MemberId, MemberRecord, MemberRole, MemberState, effective_holder, now_ms};
+use rtdb_directory::{Cas, CellMove, CellMovePhase, DeploymentRecord, MoveNamespaces, Directory, Lifecycle, MemberId, MemberPool, MemberRecord, MemberRole, MemberState, PlacementMove, effective_holder, now_ms};
 use rtdb_logkeeper::StreamConfig;
 use rtdb_storage::log::{Log, LogOffset};
 use rtdb_types::{Anomaly, AnomalyCategory, Result};
 use tokio_util::sync::CancellationToken;
 
-use crate::control::{self, ControlKey, Request, Response};
+use crate::control::{self, ControlKey, MoveTicket, Request, Response};
 use crate::deployment::{CellStorage, ensemble_servers, write_quorum};
 use crate::keys::KeyService;
 
@@ -78,7 +78,8 @@ pub async fn ensure_held(directory: &dyn Directory, name: &str, control: &Contro
     let current = record(directory, name).await?;
     let members = members(directory).await?;
     if let Some(holder) = effective_holder(&current, &members, now_ms()) { return Ok(holder.clone()); }
-    let nodes: Vec<&MemberRecord> = members.values().filter(|member| member.role == MemberRole::Node && member.may_receive_placements(now_ms())).collect();
+    let now = now_ms();
+    let nodes: Vec<&MemberRecord> = members.values().filter(|member| current.may_place_on(member, now)).collect();
     let mut last = None;
     for node in rtdb_affinity::rank(&current.storage_identity(), &nodes, |member| member.id.as_str()) {
         let Some(address) = &node.control_address else { continue };
@@ -92,40 +93,85 @@ pub async fn ensure_held(directory: &dyn Directory, name: &str, control: &Contro
     Err(last.unwrap_or_else(|| Anomaly::new(AnomalyCategory::Unavailable, "rtdb.multi/no-node", "No node can hold this deployment")))
 }
 
-/// A planned move: reserves the next claim for `target`, has the holder park, and has `target` claim.
+/// A planned move reserves the next claim while the current holder flushes and parks.
 pub async fn move_deployment(directory: &dyn Directory, name: &str, target: &MemberId, control: &ControlKey) -> Result<()> {
     let members = members(directory).await?;
-    if !members.get(target).is_some_and(|member| member.may_receive_placements(now_ms())) {
-        return Err(Anomaly::incorrect("rtdb.multi/not-placeable", format!("{target} may not take placements")));
+    let address = control_address(&members, target)?;
+    let reservation = PlacementMove {
+        request: uuid::Uuid::new_v4(),
+        target: target.clone(),
+        expires_at_ms: now_ms().saturating_add((2 * CONTROL_TIMEOUT).as_millis() as i64),
+    };
+    let intended = update(directory, name, |record| {
+        let now = now_ms();
+        if !members.get(target).is_some_and(|member| record.may_place_on(member, now)) {
+            return Err(Anomaly::incorrect("rtdb.multi/not-placeable", format!("{target} may not take placements of {name}")));
+        }
+        if effective_holder(record, &members, now) == Some(target) { return Ok(()); }
+        if record.active_move(now).is_some_and(|intent| members.get(&intent.target).is_some_and(|member| record.may_place_on(member, now))) {
+            return Err(Anomaly::new(AnomalyCategory::Conflict, "rtdb.multi/move-in-progress", format!("{name} already has a reserved placement")));
+        }
+        record.move_intent = None;
+        record.placement_move = Some(reservation.clone());
+        Ok(())
+    }).await?;
+    if effective_holder(&intended, &members, now_ms()) == Some(target) { return Ok(()); }
+    if intended.placement_move.as_ref() != Some(&reservation) {
+        return Err(Anomaly::new(AnomalyCategory::Conflict, "rtdb.multi/move-reservation-lost", "The directory did not retain the move reservation"));
     }
-    let intended = update(directory, name, |record| { record.move_intent = Some(target.clone()); Ok(()) }).await?;
-    if let Some(holder) = effective_holder(&intended, &members, now_ms()).filter(|holder| *holder != target) {
-        expect(&control_address(&members, holder)?, Request::Park { name: name.to_owned() }, control).await?;
+
+    let outcome = async {
+        let ticket = MoveTicket { deployment: intended.id.clone(), request: reservation.request };
+        if let Some(holder) = effective_holder(&intended, &members, now_ms()) {
+            expect(&control_address(&members, holder)?, Request::ParkForMove { name: name.to_owned(), epoch: intended.epoch, ticket: ticket.clone() }, control).await?;
+        }
+        match expect(&address, Request::ActivateForMove { name: name.to_owned(), ticket }, control).await? {
+            Response::Held { .. } => Ok(()),
+            other => Err(Anomaly::new(AnomalyCategory::Conflict, "rtdb.multi/move-failed", format!("The target answered {other:?}"))),
+        }
+    }.await;
+    if outcome.is_err()
+        && let Err(error) = clear_move_reservation(directory, &intended.id, reservation.request).await {
+        eprintln!("RTDB could not clear the move reservation for {name}: {error}");
     }
-    match expect(&control_address(&members, target)?, Request::Activate { name: name.to_owned() }, control).await? {
-        Response::Held { .. } => Ok(()),
-        other => Err(Anomaly::new(AnomalyCategory::Conflict, "rtdb.multi/move-failed", format!("The target answered {other:?}"))),
-    }
+    outcome
 }
 
-/// Moves at most `moves` deployments from the most loaded nodes to the least loaded, where their holding counts differ by more than one.
+async fn clear_move_reservation(directory: &dyn Directory, id: &str, request: uuid::Uuid) -> Result<()> {
+    for _ in 0..8 {
+        let Some(mut current) = directory.deployment(id).await? else { return Ok(()) };
+        if !current.placement_move.as_ref().is_some_and(|reservation| reservation.request == request) { return Ok(()); }
+        current.placement_move = None;
+        let version = current.version;
+        if let Cas::Applied(_) = directory.replace_deployment(current, version).await? { return Ok(()); }
+    }
+    Err(Anomaly::new(AnomalyCategory::Conflict, "rtdb.multi/update-contended", "The deployment kept changing while clearing its move reservation"))
+}
+
+/// Balances holdings among eligible nodes in each placement pool.
 pub async fn rebalance(directory: &dyn Directory, moves: usize, control: &ControlKey) -> Result<usize> {
     let members = members(directory).await?;
+    let deployments = directory.deployments().await?;
     let now = now_ms();
-    let mut load: BTreeMap<MemberId, Vec<String>> = members.values().filter(|member| member.role == MemberRole::Node && member.may_receive_placements(now))
-        .map(|member| (member.id.clone(), Vec::new())).collect();
-    for deployment in directory.deployments().await? {
-        if let Some(holder) = effective_holder(&deployment, &members, now) { if let Some(held) = load.get_mut(holder) { held.push(deployment.name.clone()); } }
-    }
     let mut moved = 0;
-    while moved < moves {
-        let Some((busiest, busy)) = load.iter().max_by_key(|(_, held)| held.len()).map(|(id, held)| (id.clone(), held.len())) else { break };
-        let Some((idlest, idle)) = load.iter().min_by_key(|(_, held)| held.len()).map(|(id, held)| (id.clone(), held.len())) else { break };
-        if busy <= idle + 1 { break; }
-        let name = load.get_mut(&busiest).and_then(Vec::pop).expect("the busiest node holds something");
-        move_deployment(directory, &name, &idlest, control).await?;
-        load.get_mut(&idlest).expect("listed").push(name);
-        moved += 1;
+    for pool in [MemberPool::General, MemberPool::Isolation] {
+        let mut load: BTreeMap<MemberId, Vec<&str>> = members.values()
+            .filter(|member| member.pool == pool && member.may_receive_placements(now) && member.control_address.is_some())
+            .map(|member| (member.id.clone(), Vec::new())).collect();
+        for record in deployments.iter().filter(|record| record.writer_pool() == Some(pool)) {
+            if let Some(held) = effective_holder(record, &members, now).and_then(|holder| load.get_mut(holder)) {
+                held.push(&record.name);
+            }
+        }
+        while moved < moves {
+            let Some((busiest, busy)) = load.iter().max_by_key(|(_, held)| held.len()).map(|(id, held)| (id.clone(), held.len())) else { break };
+            let Some((idlest, idle)) = load.iter().min_by_key(|(_, held)| held.len()).map(|(id, held)| (id.clone(), held.len())) else { break };
+            if busy <= idle + 1 { break; }
+            let name = load.get_mut(&busiest).and_then(Vec::pop).expect("the busiest node holds something");
+            move_deployment(directory, name, &idlest, control).await?;
+            load.get_mut(&idlest).expect("listed").push(name);
+            moved += 1;
+        }
     }
     Ok(moved)
 }
@@ -139,7 +185,17 @@ pub async fn set_linearizable_reads(directory: &dyn Directory, name: &str, on: b
 }
 
 pub async fn unquarantine(directory: &dyn Directory, name: &str) -> Result<DeploymentRecord> {
-    update(directory, name, |record| { if record.lifecycle == Lifecycle::Quarantined { record.lifecycle = Lifecycle::Live; } record.activation_crashes = 0; Ok(()) }).await
+    update(directory, name, |record| {
+        if record.lifecycle == Lifecycle::Quarantined {
+            record.lifecycle = Lifecycle::Live;
+            record.epoch += 1;
+            record.holder = None;
+            record.move_intent = None;
+            record.placement_move = None;
+        }
+        record.activation_crashes = 0;
+        Ok(())
+    }).await
 }
 
 async fn fork_source(directory: &dyn Directory, parent: &str) -> Result<DeploymentRecord> {
@@ -348,6 +404,7 @@ pub async fn move_cell(map: &dyn crate::cells::CellMap, from: &CellHandle<'_>, t
         fencing.epoch += 1;
         fencing.holder = None;
         fencing.move_intent = None;
+        fencing.placement_move = None;
     }
     fencing.cell_move = Some(CellMove { destination: to.name.to_owned(), namespaces, phase: CellMovePhase::Preparing { generation } });
     let fenced = from.directory.replace_deployment(fencing, current.version).await?.applied()
@@ -404,6 +461,7 @@ async fn finish_cell_move(map: &dyn crate::cells::CellMap, from: &CellHandle<'_>
     incoming.cell_move = None;
     incoming.moved_at_ms = None;
     incoming.move_intent = None;
+    incoming.placement_move = None;
     incoming.activation_crashes = 0;
     incoming.move_from = Some(previous_ensemble.clone());
     incoming.ensemble = ensemble.clone();

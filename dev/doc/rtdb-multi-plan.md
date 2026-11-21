@@ -481,6 +481,10 @@ Placement must follow load and the fleet must scale both ways (spec surface `Con
 
 1. Crate `controller`: suspicion confirmation from corroborated gateway reports; admission of prewarmed members; drain (`DrainMember`); rebalancing on `LoadVector` watermarks (`Rebalance`); the drainer for orphaned tails (`DrainOrphanedTails`); quarantine (`CountActivationCrash`); engine rollouts (`RollEngine`).
 2. Planned handoff (`IntendMove`, `HandOff`): subscription warm-up, hot-range prefetch from the source, admission pause, `Handoff` record, claim by move intent.
+   The gateway, claim rule, and rebalancer use the same eligibility check for the general and isolation pools.
+   Clearing quarantine fences the isolation holder so the next claim returns the deployment to the general pool.
+   A planned move reserves a target for a bounded interval and releases the reservation if activation fails.
+   The source park verifies the holding epoch and reservation, and a delayed target activation requires the reservation at its claim.
 3. Autoscaling signals per pool, published as metrics through `metrics` and `server/src/metric_export`: nodes by the binding `LoadVector` dimension, logkeepers by ingest, workers by queue depth, gateways by connections.
 
 **Tests.**
