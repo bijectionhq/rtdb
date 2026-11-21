@@ -95,6 +95,8 @@ impl S3Config {
         let endpoint = self.configured_endpoint()?;
         let environment = AmazonS3Builder::from_env();
         let default_region = || environment.get_config_value(&AmazonS3ConfigKey::Region).unwrap_or_else(|| "us-east-1".into());
+        let requester_pays = environment.get_config_value(&AmazonS3ConfigKey::RequestPayer)
+            .is_some_and(|value| matches!(value.to_ascii_lowercase().as_str(), "1" | "true" | "on" | "yes" | "y"));
         let mut config = aws_config::defaults(aws_config::BehaviorVersion::latest());
         if let Some(region) = &self.region { config = config.region(aws_config::Region::new(region.clone())); }
         if let Some(credentials) = self.resolve_credentials(remotes)? {
@@ -108,7 +110,7 @@ impl S3Config {
             .region(region)
             .force_path_style(!self.virtual_hosted(endpoint.as_ref()));
         builder.set_endpoint_url(endpoint.map(|endpoint| endpoint.to_string()));
-        Ok(VersionedInventory::new(aws_sdk_s3::Client::from_conf(builder.build()), self.bucket.clone(), root))
+        Ok(VersionedInventory::new(aws_sdk_s3::Client::from_conf(builder.build()), self.bucket.clone(), root, requester_pays))
     }
 
     fn configured_endpoint(&self) -> Result<Option<url::Url>> {

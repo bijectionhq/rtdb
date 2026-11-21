@@ -1,5 +1,5 @@
 use aws_sdk_s3::Client;
-use aws_sdk_s3::types::{Delete, ObjectIdentifier};
+use aws_sdk_s3::types::{Delete, ObjectIdentifier, RequestPayer};
 use rtdb_storage::ObjectKey;
 use rtdb_types::{Anomaly, AnomalyCategory, Result};
 
@@ -7,10 +7,13 @@ pub struct VersionedInventory {
     client: Client,
     bucket: String,
     root: ObjectKey,
+    request_payer: Option<RequestPayer>,
 }
 
 impl VersionedInventory {
-    pub(crate) fn new(client: Client, bucket: String, root: ObjectKey) -> Self { Self { client, bucket, root } }
+    pub(crate) fn new(client: Client, bucket: String, root: ObjectKey, requester_pays: bool) -> Self {
+        Self { client, bucket, root, request_payer: requester_pays.then_some(RequestPayer::Requester) }
+    }
 
     /// Purges object versions and delete markers under a deployment prefix.
     /// Each batch is followed by a fresh listing from the beginning of that prefix.
@@ -19,7 +22,8 @@ impl VersionedInventory {
         let prefix = format!("{path}/");
         let mut previous = Vec::new();
         loop {
-            let page = self.client.list_object_versions().bucket(&self.bucket).prefix(&prefix).max_keys(1000).send().await
+            let page = self.client.list_object_versions().bucket(&self.bucket).prefix(&prefix).max_keys(1000)
+                .set_request_payer(self.request_payer.clone()).send().await
                 .map_err(|error| unavailable(format!("Listing object versions failed: {error}")))?;
             let mut versions = Vec::new();
             for (key, version) in page.versions().iter().map(|entry| (entry.key(), entry.version_id()))
@@ -39,7 +43,8 @@ impl VersionedInventory {
             if versions == previous { return Err(unavailable("A batch of deleted versions is still listed")); }
             let delete = Delete::builder().set_objects(Some(versions.clone())).quiet(true).build()
                 .map_err(|error| unavailable(error.to_string()))?;
-            let reply = self.client.delete_objects().bucket(&self.bucket).delete(delete).send().await
+            let reply = self.client.delete_objects().bucket(&self.bucket).delete(delete)
+                .set_request_payer(self.request_payer.clone()).send().await
                 .map_err(|error| unavailable(format!("Deleting object versions failed: {error}")))?;
             if let Some(error) = reply.errors().first() {
                 return Err(unavailable(format!("S3 refused a version deletion: {}", error.code().unwrap_or("unknown error"))));
