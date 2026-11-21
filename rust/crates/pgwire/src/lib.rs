@@ -12,3 +12,5 @@ pub use config::{CHECKPOINT_STAGE_PARAMETER, GATEWAY_REPLICA_READ_PARAMETER, REQ
 pub use server::{ServerDriver, ServerHandle, ServerStatus, serve_read_only_tls};
 mod gateway_replay;
 pub use gateway_replay::{GATEWAY_REPLAY_PERMIT_KIND, GatewayReplayMode, GatewayReplayPermit};
+
+pub use server::{SERVING_PROBE, SERVING_REPLY, SERVING_STARTUP};

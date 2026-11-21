@@ -128,8 +128,12 @@ pub async fn start_node(directory: Arc<dyn Directory>, mut settings: NodeSetting
             (false, _) => None,
         },
     };
+    let relay_limit = settings.configuration.server.as_ref()
+        .filter(|_| settings.capabilities.is_some() && !settings.configuration.auth.uses_remote_address())
+        .map(|server| server.connections);
     let (server, driver) = ServerDriver::open_placed(settings.configuration, settings.allocation_limit_bytes, memory, placed).await?;
-    let pgwire_address = server.addresses().pgwire.ok_or_else(|| Anomaly::incorrect("rtdb.multi/no-pgwire", "A cell node needs a pgwire listener"))?;
+    let pgwire = server.primary_pgwire().ok_or_else(|| Anomaly::incorrect("rtdb.multi/no-pgwire", "A cell node needs a pgwire listener"))?;
+    let pgwire_address = pgwire.address();
     let control = TcpListener::bind(settings.control).await.map_err(io)?;
     let control_address = control.local_addr().map_err(io)?;
     let pgwire_endpoint = advertised(pgwire_address, settings.advertise_host.as_deref())?;
@@ -148,7 +152,10 @@ pub async fn start_node(directory: Arc<dyn Directory>, mut settings: NodeSetting
     tasks.spawn(driver.run());
     { let lease = Arc::clone(&lease); let cancellation = lease_cancellation.clone(); tasks.spawn(async move { lease.run(cancellation).await; Ok(()) }); }
     { let agent = Arc::clone(&agent); let cancellation = cancellation.clone(); tasks.spawn(async move { agent.run(cancellation).await; Ok(()) }); }
-    tasks.spawn(crate::control::serve(control, agent.clone(), crate::control::ControlKey(settings.capabilities.clone()), cancellation.clone()));
+    tasks.spawn(crate::control::serve_with_pgwire(
+        control, agent.clone(), crate::control::ControlKey(settings.capabilities.clone()),
+        cancellation.clone(), pgwire_address, relay_limit, pgwire.watch_status(),
+    ));
     Ok(RunningNode { server, agent, fragmenter, lease, control_address, pgwire_address, cancellation, lease_cancellation, storage_regions, tasks })
 }
 

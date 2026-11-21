@@ -340,17 +340,18 @@ async fn route(router: &GatewayRouter) -> Result<(TcpStream, Option<String>, u64
         && let Some(member) = directory.member(holder).await.ok().flatten()
         && record.may_hold_on(&member, now_ms())
         && let Some(control_address) = member.control_address
-        && let Ok((Response::Held { address, epoch }, confirmed)) = confirm_writer(directory.as_ref(), &record, &control_address, options).await
+        && let Ok((Response::Held { address, epoch }, confirmed, probe)) = confirm_writer(directory.as_ref(), &record, &control_address, options).await
     {
-        return Ok((connect_writer(&address, options).await?, Some(confirmed), epoch, record.id));
+        return Ok((connect_serving(&address, &confirmed, probe, options).await?, Some(confirmed), epoch, record.id));
     }
     let members: BTreeMap<MemberId, MemberRecord> = directory.members().await?.into_iter().map(|member| (member.id.clone(), member)).collect();
     if router.snapshot && record.checkpoint.is_some() && record.lifecycle == Lifecycle::Live {
         for reader in snapshot_readers(&record, &members) {
             let Some(control_address) = &reader.control_address else { continue; };
-            if let Ok(Response::Subscribed { address }) = control::call(control_address, &Request::Snapshot { name: name.to_owned() }, options.control_timeout, &control::ControlKey(options.capabilities.clone())).await {
-                if let Ok(stream) = connect(&address).await { return Ok((stream, Some(control_address.clone()), record.epoch, record.id.clone())); }
-            }
+            if let Ok((Response::Subscribed { address }, probe)) = control::call_with_pgwire_probe(control_address,
+                Request::Snapshot { name: name.to_owned() }, options.control_timeout, &control::ControlKey(options.capabilities.clone())).await
+                && let Ok(stream) = connect_serving(&address, control_address, probe, options).await
+            { return Ok((stream, Some(control_address.clone()), record.epoch, record.id.clone())); }
         }
     }
     if router.read_only && record.read_width > 1 && record.lifecycle == Lifecycle::Live {
@@ -362,9 +363,10 @@ async fn route(router: &GatewayRouter) -> Result<(TcpStream, Option<String>, u64
         }
         for replica in readers {
             let Some(control_address) = &replica.control_address else { continue; };
-            if let Ok(Response::Subscribed { address }) = control::call(control_address, &Request::Subscribe { name: name.to_owned() }, options.control_timeout, &control::ControlKey(options.capabilities.clone())).await {
-                if let Ok(stream) = connect(&address).await { return Ok((stream, Some(control_address.clone()), record.epoch, record.id.clone())); }
-            }
+            if let Ok((Response::Subscribed { address }, probe)) = control::call_with_pgwire_probe(control_address,
+                Request::Subscribe { name: name.to_owned() }, options.control_timeout, &control::ControlKey(options.capabilities.clone())).await
+                && let Ok(stream) = connect_serving(&address, control_address, probe, options).await
+            { return Ok((stream, Some(control_address.clone()), record.epoch, record.id.clone())); }
         }
     }
     let mut last = None;
@@ -373,14 +375,14 @@ async fn route(router: &GatewayRouter) -> Result<(TcpStream, Option<String>, u64
     for candidate in candidates(&record, &members) {
         let Some(control_address) = &candidate.control_address else { continue; };
         match confirm_writer(directory.as_ref(), &record, control_address, options).await {
-            Ok((Response::Held { address, epoch }, confirmed)) => return Ok((connect_writer(&address, options).await?, Some(confirmed), epoch, record.id.clone())),
-            Ok((Response::Refused { code, message }, _)) if control::retryable_activation(&code) => {
+            Ok((Response::Held { address, epoch }, confirmed, probe)) => return Ok((connect_serving(&address, &confirmed, probe, options).await?, Some(confirmed), epoch, record.id.clone())),
+            Ok((Response::Refused { code, message }, _, _)) if control::retryable_activation(&code) => {
                 retryable = Some(Anomaly::new(AnomalyCategory::Unavailable, code, message));
             }
-            Ok((Response::Refused { code, message }, _)) if code == control::NOT_CLAIMABLE => {
+            Ok((Response::Refused { code, message }, _, _)) if code == control::NOT_CLAIMABLE => {
                 last = Some(Anomaly::new(AnomalyCategory::Unavailable, code, message));
             }
-            Ok((Response::Refused { code, message }, _)) => refused = Some(Anomaly::new(AnomalyCategory::Unavailable, code, message)),
+            Ok((Response::Refused { code, message }, _, _)) => refused = Some(Anomaly::new(AnomalyCategory::Unavailable, code, message)),
             Ok(_) => {}
             Err(error) => last = Some(error),
         }
@@ -388,19 +390,19 @@ async fn route(router: &GatewayRouter) -> Result<(TcpStream, Option<String>, u64
     Err(refused.or(retryable).or(last).unwrap_or_else(|| Anomaly::new(AnomalyCategory::Unavailable, "rtdb.multi/no-node", "No node can serve this deployment")))
 }
 
-async fn confirm_writer(directory: &dyn Directory, record: &DeploymentRecord, control_address: &str, options: &GatewayOptions) -> Result<(Response, String)> {
+async fn confirm_writer(directory: &dyn Directory, record: &DeploymentRecord, control_address: &str, options: &GatewayOptions) -> Result<(Response, String, Option<u64>)> {
     let key = control::ControlKey(options.capabilities.clone());
     let request = Request::Activate { name: record.name.clone() };
-    let response = control::call(control_address, &request, options.control_timeout, &key).await?;
+    let (response, probe) = control::call_with_pgwire_probe(control_address, request.clone(), options.control_timeout, &key).await?;
     if let Response::Redirect { holder, .. } = &response
         && let Some(member) = directory.member(&MemberId(holder.clone())).await?
         && record.may_hold_on(&member, now_ms())
         && let Some(target) = member.control_address.filter(|address| address != control_address)
     {
-        let response = control::call(&target, &request, options.control_timeout, &key).await?;
-        return Ok((response, target));
+        let (response, probe) = control::call_with_pgwire_probe(&target, request, options.control_timeout, &key).await?;
+        return Ok((response, target, probe));
     }
-    Ok((response, control_address.to_owned()))
+    Ok((response, control_address.to_owned(), probe))
 }
 
 /// The nodes that may serve a snapshot read: every node that may take a placement, in the deployment's affinity order, the holder last, so snapshots spare the writer.
@@ -433,14 +435,47 @@ async fn connect(address: &str) -> Result<TcpStream> {
     Ok(stream)
 }
 
-async fn connect_writer(address: &str, options: &GatewayOptions) -> Result<TcpStream> {
-    let failed = || Anomaly::new(AnomalyCategory::Unavailable, control::WRITER_PGWIRE_UNREACHABLE, "The writer's pgwire endpoint is unreachable");
-    tokio::time::timeout(options.control_timeout.min(WRITER_DIAL_TIMEOUT), connect(address))
-        .await.map_err(|_| failed())?.map_err(|_| failed())
+fn writer_unreachable() -> Anomaly {
+    Anomaly::new(AnomalyCategory::Unavailable, control::WRITER_PGWIRE_UNREACHABLE, "The writer's pgwire endpoint is unreachable")
 }
 
-pub(crate) async fn probe_pgwire(address: &str, timeout: Duration) -> bool {
-    matches!(tokio::time::timeout(timeout, TcpStream::connect(address)).await, Ok(Ok(_)))
+async fn connect_serving(address: &str, control: &str, probe: Option<u64>, options: &GatewayOptions) -> Result<TcpStream> {
+    let timeout = options.control_timeout.min(WRITER_DIAL_TIMEOUT);
+    let key = control::ControlKey(options.capabilities.clone());
+    let direct = async {
+        let mut stream = connect(address).await?;
+        if probe.is_some() { check_pgwire_serving(&mut stream, rtdb_pgwire::SERVING_STARTUP).await?; }
+        Ok::<_, Anomaly>(stream)
+    };
+    if let Ok(Ok(stream)) = tokio::time::timeout(timeout, direct).await { return Ok(stream); }
+    if let Some(before) = probe
+        && matches!(control::ping(control, timeout, &key).await, Ok(Some(after)) if after != before)
+        && let Ok(Ok(stream)) = tokio::time::timeout(timeout, connect(address)).await
+    {
+        return Ok(stream);
+    }
+    let relay = async {
+        let mut stream = control::open_pgwire(control, timeout, &key).await?;
+        check_pgwire_serving(&mut stream, rtdb_pgwire::SERVING_STARTUP).await?;
+        Ok::<_, Anomaly>(stream)
+    };
+    tokio::time::timeout(timeout, relay).await.map_err(|_| writer_unreachable())?.map_err(|_| writer_unreachable())
+}
+
+async fn check_pgwire_serving(stream: &mut TcpStream, preface: [u8; 8]) -> Result<()> {
+    stream.write_all(&preface).await.map_err(io)?;
+    let mut reply = [0; rtdb_pgwire::SERVING_REPLY.len()];
+    stream.read_exact(&mut reply).await.map_err(io)?;
+    if reply == rtdb_pgwire::SERVING_REPLY { Ok(()) } else { Err(writer_unreachable()) }
+}
+
+pub(crate) async fn probe_pgwire(address: &str, timeout: Duration, serving_probe: bool) -> bool {
+    let probe = async {
+        let mut stream = connect(address).await?;
+        if serving_probe { check_pgwire_serving(&mut stream, rtdb_pgwire::SERVING_PROBE).await?; }
+        Ok::<_, Anomaly>(())
+    };
+    matches!(tokio::time::timeout(timeout, probe).await, Ok(Ok(())))
 }
 
 /// Returns None for a cancel request, which this gateway does not forward.

@@ -134,6 +134,8 @@ struct RecoveryGate {
 struct ObservedDirectory {
     inner: Arc<MemoryDirectory>,
     recovery_gate: std::sync::Mutex<Option<Arc<RecoveryGate>>>,
+    lost_anchor_reply: std::sync::Mutex<Option<(u64, Arc<RecoveryGate>)>>,
+    restore_interruption: std::sync::atomic::AtomicUsize,
     reads: std::sync::atomic::AtomicUsize,
     holder_queries: std::sync::atomic::AtomicUsize,
     membership_scans: std::sync::atomic::AtomicUsize,
@@ -141,7 +143,7 @@ struct ObservedDirectory {
 
 impl ObservedDirectory {
     fn new() -> Arc<Self> {
-        Arc::new(Self { inner: MemoryDirectory::new(), recovery_gate: Default::default(), reads: Default::default(), holder_queries: Default::default(), membership_scans: Default::default() })
+        Arc::new(Self { inner: MemoryDirectory::new(), recovery_gate: Default::default(), lost_anchor_reply: Default::default(), restore_interruption: Default::default(), reads: Default::default(), holder_queries: Default::default(), membership_scans: Default::default() })
     }
 }
 
@@ -160,7 +162,28 @@ impl Directory for ObservedDirectory {
         self.inner.deployments_held_by(id).await
     }
     async fn replace_deployment(&self, record: DeploymentRecord, expected: rtdb_directory::Version) -> Result<rtdb_directory::Cas<DeploymentRecord>> {
+        let anchor_reply = self.lost_anchor_reply.lock().unwrap().clone();
+        let anchor_update = if let Some((epoch, gate)) = anchor_reply
+            && record.epoch == epoch && record.replica_anchor.is_some()
+            && self.inner.deployment(&record.id).await?.is_some_and(|before| before.replica_anchor != record.replica_anchor)
+        { Some(gate) } else { None };
+        let interrupted = || Anomaly::new(AnomalyCategory::Unavailable, "test/restore-interrupted", "Restore lost its directory response");
+        if record.checkpoint_recovery.as_ref().is_some_and(|recovery| recovery.completed_at_ms.is_some())
+            && self.restore_interruption.compare_exchange(2, 3, Ordering::Relaxed, Ordering::Relaxed).is_ok()
+        {
+            return Err(interrupted());
+        }
         let result = self.inner.replace_deployment(record, expected).await?;
+        if matches!(&result, rtdb_directory::Cas::Applied(record) if record.lifecycle == Lifecycle::Restoring)
+            && self.restore_interruption.compare_exchange(1, 2, Ordering::Relaxed, Ordering::Relaxed).is_ok()
+        {
+            return Err(interrupted());
+        }
+        if let Some(gate) = anchor_update && matches!(&result, rtdb_directory::Cas::Applied(_)) {
+            gate.registered.notify_one();
+            gate.resume.notified().await;
+            return Err(Anomaly::new(AnomalyCategory::Unavailable, "test/anchor-reply-lost", "The anchor update reply was lost"));
+        }
         let gate = match &result {
             rtdb_directory::Cas::Applied(record) if record.storage_regions.values().any(|region| matches!(region, rtdb_directory::StorageRegion::ReplicaReplay { .. })) => {
                 self.recovery_gate.lock().unwrap().take()
@@ -1651,6 +1674,69 @@ async fn restoring_the_current_archive_preserves_the_ordered_tail_and_authority(
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn s3_a_checkpoint_restore_resumes_after_fencing_and_sealing() {
+    use rtdb_storage::{IoRegion, ObjectKey};
+
+    let (Some(storage), Some(archive)) = (s3_storage(), s3_archive_storage()) else {
+        eprintln!("RTDB_S3_ENDPOINT is not set: skipped");
+        return;
+    };
+    tokio::time::timeout(Duration::from_secs(240), async {
+        let directory = ObservedDirectory::new();
+        let cell = Cell::start_configured_with_directory(directory.clone(), Some(storage.clone()),
+            vec![MemberPool::General; 2], None, None, None, true, |_| {}).await;
+        let deployment = admin::create_deployment(directory.as_ref(), "shop", "acme", 3).await.unwrap();
+        let id = uuid::Uuid::parse_str(&deployment.id).unwrap();
+        let client = cell.connect("shop").await;
+        client.simple_query("INSERT INTO orders (_id, total) VALUES (1, 10), (2, 20)").await.unwrap();
+        let holder = cell.holder("shop").await.unwrap();
+        cell.node(holder).agent.flush("shop").await.unwrap();
+        let checkpoint = directory.deployment(&deployment.id).await.unwrap().unwrap().checkpoint;
+        let operation = uuid::Uuid::new_v4();
+        let keys = cell.keys();
+        let capture = rtdb_multi::archive::capture(directory.clone(), &storage, &archive, &keys, id, operation, Some(hosted_test_owner()), None).await.unwrap();
+        assert!(!capture.objects.is_empty());
+        client.simple_query("UPDATE orders SET total = 11 WHERE _id = 1").await.unwrap();
+        client.simple_query("DELETE FROM orders WHERE _id = 2").await.unwrap();
+        let history = order_history(&client).await;
+        drop(client);
+
+        let owner = hosted_test_owner();
+        let restore = || rtdb_multi::archive::restore(directory.as_ref(), &storage, &archive, &keys, id, operation, 4 << 20, Some(&owner));
+        directory.restore_interruption.store(1, Ordering::Relaxed);
+        assert_eq!(restore().await.unwrap_err().code, "test/restore-interrupted");
+        let fenced = directory.deployment(&deployment.id).await.unwrap().unwrap();
+        assert_eq!(fenced.lifecycle, Lifecycle::Restoring);
+        assert!(fenced.holder.is_none());
+        assert_eq!(fenced.checkpoint, checkpoint);
+
+        let bucket = storage.bucket(IoRegion::new()).await.unwrap();
+        let prefix = ObjectKey::new(fenced.storage_prefix()).unwrap();
+        let objects = bucket.list(Some(&prefix)).await.unwrap();
+        assert!(!objects.is_empty());
+        for object in objects { bucket.delete(&object.key).await.unwrap(); }
+        assert!(bucket.list(Some(&prefix)).await.unwrap().is_empty());
+
+        assert_eq!(restore().await.unwrap_err().code, "test/restore-interrupted");
+        let prepared = directory.deployment(&deployment.id).await.unwrap().unwrap();
+        assert_eq!(prepared.lifecycle, Lifecycle::Restoring);
+        assert_eq!(prepared.epoch, fenced.epoch);
+        assert!(bucket.list(Some(&prefix)).await.unwrap().is_empty());
+
+        let finished = restore().await.unwrap();
+        assert_eq!(finished.epoch, fenced.epoch);
+        assert_eq!(Some(finished.checkpoint), checkpoint);
+        assert!(finished.completed_at_ms.is_some());
+        assert_eq!(restore().await.unwrap(), finished);
+        let recovered = connect_eventually(&cell, "shop").await;
+        assert_eq!(order_history(&recovered).await, history);
+        assert_eq!(values(&recovered, "SELECT total FROM orders").await, ["11"]);
+        drop(recovered);
+        cell.stop().await;
+    }).await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn explicit_flush_publishes_a_checkpoint_before_replying() {
     let cell = Cell::start_watching(vec![MemberPool::General], None, Some(Duration::from_secs(60))).await;
     admin::create_deployment(cell.directory.as_ref(), "shop", "acme", 3).await.unwrap();
@@ -1782,6 +1868,59 @@ async fn controller_probes_can_progress_before_another_member_replies() {
 }
 
 #[tokio::test]
+async fn a_missed_serving_probe_counts_only_without_inspection_overflow() {
+    use rtdb_directory::{MemberRecord, MemberRole, MemberState};
+    use rtdb_multi::control::{self, Handler};
+    use tokio::io::AsyncReadExt;
+    use tokio::net::TcpListener;
+
+    struct Answers;
+    #[async_trait::async_trait]
+    impl Handler for Answers {
+        async fn handle(&self, request: Request) -> Response {
+            assert_eq!(request, Request::Ping);
+            Response::Done
+        }
+    }
+
+    let directory = MemoryDirectory::new();
+    let pgwire = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = pgwire.local_addr().unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let control_address = listener.local_addr().unwrap();
+    let (status, status_view) = tokio::sync::watch::channel(rtdb_pgwire::ServerStatus::default());
+    let stop = tokio_util::sync::CancellationToken::new();
+    let server = tokio::spawn(control::serve_with_pgwire(listener, Arc::new(Answers), control(), stop.clone(), address, None, status_view));
+    let probe = tokio::spawn(async move {
+        for count in 0..4 {
+            let (mut peer, _) = pgwire.accept().await.unwrap();
+            let mut preface = [0; rtdb_pgwire::SERVING_PROBE.len()];
+            peer.read_exact(&mut preface).await.unwrap();
+            assert_eq!(preface, rtdb_pgwire::SERVING_PROBE);
+            if count < 2 { status.send_modify(|current| current.startup_probe_overflows += 1); }
+        }
+    });
+    let member = directory.register_member(MemberRecord {
+        id: MemberId("writer".into()), role: MemberRole::Node, address: address.to_string(),
+        control_address: Some(control_address.to_string()), availability_zone: "local".into(),
+        engine_version: "test".into(), lease_expires_at_ms: rtdb_directory::now_ms() + 30_000,
+        state: MemberState::Eligible, drain_target_engine: None, pool: MemberPool::General, storage_namespaces: None, version: 0,
+    }).await.unwrap();
+    let options = admin::ControllerOptions { control: common::control(), ..Default::default() };
+    let mut failures = BTreeMap::new();
+    for _ in 0..2 {
+        assert_eq!(admin::confirm_suspicions(directory.as_ref(), &mut failures, &options).await.unwrap(), 0);
+        assert!(failures.is_empty());
+    }
+    assert_eq!(admin::confirm_suspicions(directory.as_ref(), &mut failures, &options).await.unwrap(), 0);
+    assert_eq!(admin::confirm_suspicions(directory.as_ref(), &mut failures, &options).await.unwrap(), 1);
+    assert_eq!(directory.member(&member.id).await.unwrap().unwrap().state, MemberState::Dead);
+    probe.await.unwrap();
+    stop.cancel();
+    server.await.unwrap().unwrap();
+}
+
+#[tokio::test]
 async fn the_controller_cannot_confirm_an_endpoint_changed_while_its_probe_is_pending() {
     use rtdb_directory::{MemberRecord, MemberRole, MemberState};
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -1903,6 +2042,15 @@ async fn saturated_pgwire_sessions_do_not_make_the_controller_depose_a_writer() 
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn pgwire_only_failure_promotes_a_writer_and_unblocks_gateway_startup() {
+    exercise_pgwire_failover(false).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_writer_that_accepts_tcp_without_serving_pgwire_is_replaced_during_startup() {
+    exercise_pgwire_failover(true).await;
+}
+
+async fn exercise_pgwire_failover(stalls_after_connect: bool) {
     use rtdb_directory::{Cas, MemberState};
     use rtdb_multi::control::{self, Handler, Request, Response};
     use tokio::net::TcpListener;
@@ -1937,13 +2085,18 @@ async fn pgwire_only_failure_promotes_a_writer_and_unblocks_gateway_startup() {
     let epoch = cell.directory.deployment_by_name("shop").await.unwrap().unwrap().epoch;
 
     let data_endpoint = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let unreachable = data_endpoint.local_addr().unwrap().to_string();
-    drop(data_endpoint);
+    let data_address = data_endpoint.local_addr().unwrap();
+    let unreachable = data_address.to_string();
+    let stalled_listener = stalls_after_connect.then_some(data_endpoint);
     let agent_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let agent_address = agent_listener.local_addr().unwrap().to_string();
     let agent = Arc::new(UnreachableWriter { address: unreachable.clone(), epoch, activated: Default::default() });
     let stop = tokio_util::sync::CancellationToken::new();
-    let running = tokio::spawn(control::serve(agent_listener, agent.clone(), common::control(), stop.clone()));
+    let running = if stalls_after_connect {
+        tokio::spawn(control::serve_with_pgwire(agent_listener, agent.clone(), common::control(), stop.clone(), data_address, None, tokio::sync::watch::channel(Default::default()).1))
+    } else {
+        tokio::spawn(control::serve(agent_listener, agent.clone(), common::control(), stop.clone()))
+    };
     loop {
         let mut record = cell.directory.member(&member).await.unwrap().unwrap();
         record.address = unreachable.clone();
@@ -1971,8 +2124,79 @@ async fn pgwire_only_failure_promotes_a_writer_and_unblocks_gateway_startup() {
     assert_ne!(cell.holder("shop").await, Some(old));
     drop(client);
     driver.await.unwrap().unwrap();
+    drop(stalled_listener);
     stop.cancel();
     running.await.unwrap().unwrap();
+    cell.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_asymmetric_gateway_stall_uses_the_existing_writer_and_preserves_authentication() {
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    use tokio::net::{TcpListener, TcpStream};
+
+    let cell = Cell::start(2, None).await;
+    let original = admin::create_deployment(cell.directory.as_ref(), "shop", "acme", 3).await.unwrap();
+    let client = cell.connect("shop").await;
+    client.simple_query("INSERT INTO orders (_id, total) VALUES (1, 10)").await.unwrap();
+    drop(client);
+    let holder = cell.holder("shop").await.unwrap();
+    let member = cell.node(holder).lease.id();
+    let bound = cell.directory.deployment(&original.id).await.unwrap().unwrap();
+    let actual_control = cell.node(holder).control_address;
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let proxy_address = listener.local_addr().unwrap();
+    let stalls = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let stalled_address = stalls.local_addr().unwrap();
+    let relays = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let attempts = relays.clone();
+    let proxy = tokio_util::task::AbortOnDropHandle::new(tokio::spawn(async move {
+        while let Ok((mut gateway, _)) = listener.accept().await {
+            let attempts = attempts.clone();
+            tokio::spawn(async move {
+                let mut request = String::new();
+                BufReader::new(&mut gateway).read_line(&mut request).await.unwrap();
+                let op: serde_json::Value = serde_json::from_str(&request).unwrap();
+                let mut target = TcpStream::connect(actual_control).await.unwrap();
+                target.write_all(request.as_bytes()).await.unwrap();
+                if op["op"] == "activate" {
+                    let mut reply = String::new();
+                    BufReader::new(&mut target).read_line(&mut reply).await.unwrap();
+                    let mut reply: serde_json::Value = serde_json::from_str(&reply).unwrap();
+                    if reply["outcome"] == "held" { reply["address"] = stalled_address.to_string().into(); }
+                    let _ = gateway.write_all(format!("{}\n", serde_json::to_string(&reply).unwrap()).as_bytes()).await;
+                } else {
+                    if op["op"] == "open_pgwire" { attempts.fetch_add(1, Ordering::Relaxed); }
+                    let _ = tokio::io::copy_bidirectional(&mut gateway, &mut target).await;
+                }
+            });
+        }
+    }));
+    loop {
+        let mut record = cell.directory.member(&member).await.unwrap().unwrap();
+        let version = record.version;
+        record.control_address = Some(proxy_address.to_string());
+        if cell.directory.replace_member(record, version).await.unwrap().applied().is_some() { break; }
+    }
+
+    let options = admin::ControllerOptions { control: control(), ..Default::default() };
+    let mut failures = BTreeMap::new();
+    assert_eq!(admin::confirm_suspicions(cell.directory.as_ref(), &mut failures, &options).await.unwrap(), 0);
+    assert!(failures.is_empty());
+    let bad = tokio::time::timeout(Duration::from_secs(6), tokio_postgres::Config::new()
+        .host("127.0.0.1").port(cell.gateway.port()).user("xtdb").dbname("shop").password("wrong").connect(NoTls)).await.unwrap();
+    assert_eq!(bad.err().unwrap().as_db_error().unwrap().code().code(), "28P01");
+
+    let client = tokio::time::timeout(Duration::from_secs(6), cell.connect("shop")).await.unwrap();
+    client.simple_query("UPDATE orders SET total = total + 1").await.unwrap();
+    assert_eq!(values(&client, "SELECT total FROM orders").await, ["11"]);
+    assert_eq!(relays.load(Ordering::Relaxed), 2);
+    assert_eq!(cell.holder("shop").await, Some(holder));
+    assert_eq!(cell.directory.deployment(&original.id).await.unwrap().unwrap().epoch, bound.epoch);
+    assert_eq!(admin::confirm_suspicions(cell.directory.as_ref(), &mut failures, &options).await.unwrap(), 0);
+    assert!(failures.is_empty());
+
+    drop((client, stalls, proxy));
     cell.stop().await;
 }
 
@@ -2007,6 +2231,82 @@ async fn a_new_holder_moves_a_degraded_stream_to_live_logkeepers() {
     client.simple_query("INSERT INTO orders (_id, total) VALUES (3, 30)").await.unwrap();
     assert_eq!(values(&client, "SELECT total FROM orders").await, ["10", "20", "30"], "a second original logkeeper's death leaves a quorum of the new ensemble");
     drop(client);
+    cell.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+async fn journal_replacement_keeps_acknowledged_history_after_interrupted_trim() {
+    use rtdb_storage::log::Log;
+
+    let directory = ObservedDirectory::new();
+    let mut cell = Cell::start_with_directory(directory.clone()).await;
+    cell.add_node().await;
+    cell.add_logkeeper().await;
+    let deployment = admin::create_deployment(directory.as_ref(), "shop", "acme", 3).await.unwrap();
+    let client = cell.connect("shop").await;
+    client.simple_query("INSERT INTO orders (_id, total) VALUES (1, 10), (2, 20)").await.unwrap();
+    let holder = cell.holder("shop").await.unwrap();
+    let serving = directory.deployment(&deployment.id).await.unwrap().unwrap();
+    let lost_reply = Arc::new(RecoveryGate::default());
+    *directory.lost_anchor_reply.lock().unwrap() = Some((serving.epoch, lost_reply.clone()));
+    cell.node(holder).agent.flush("shop").await.unwrap();
+    tokio::time::timeout(Duration::from_secs(5), lost_reply.registered.notified()).await.unwrap();
+
+    client.simple_query("UPDATE orders SET total = 11 WHERE _id = 1").await.unwrap();
+    client.simple_query("DELETE FROM orders WHERE _id = 2").await.unwrap();
+    let history = values(&client, "SELECT total FROM orders FOR ALL SYSTEM_TIME FOR ALL VALID_TIME").await;
+    let latest = values(&client, "SHOW AWAIT_TOKEN").await.pop().unwrap();
+    drop(client);
+
+    let checkpointed = directory.deployment(&deployment.id).await.unwrap().unwrap();
+    let checkpoint = checkpointed.checkpoint.unwrap();
+    let anchor = checkpointed.replica_anchor.as_ref().unwrap();
+    assert_eq!(anchor.interval[1], checkpoint.boundary - 1);
+    let live = directory.members().await.unwrap().into_iter()
+        .map(|member| (member.id, member.address)).collect::<BTreeMap<_, _>>();
+    let reader = rtdb_logkeeper::open_reader(rtdb_logkeeper::StreamConfig {
+        servers: checkpointed.ensemble.iter().map(|id| live[id].clone()).collect(),
+        stream: checkpointed.stream("replica"),
+        write_quorum: 2,
+        maximum_message_bytes: 4 << 20,
+    }, Default::default()).await.unwrap();
+    let floor = reader.retained_floor().await.unwrap().unwrap().0;
+    assert!(floor < checkpoint.boundary, "the published anchor reply has not authorized the trim call");
+
+    let missing = &checkpointed.ensemble[0];
+    let index = cell.logkeepers.iter().position(|keeper| keeper.lease.id() == *missing).unwrap();
+    cell.logkeepers.remove(index).stop().await.unwrap();
+    let writer = cell.nodes[holder].take().unwrap();
+    writer.stop_renewing();
+    let kill = tokio::spawn(async move { writer.kill().await });
+    let member = serving.holder.as_ref().unwrap();
+    loop {
+        let mut writer = directory.member(member).await.unwrap().unwrap();
+        let version = writer.version;
+        writer.state = rtdb_directory::MemberState::Dead;
+        if directory.replace_member(writer, version).await.unwrap().applied().is_some() { break; }
+    }
+    lost_reply.resume.notify_one();
+    kill.await.unwrap().unwrap();
+
+    let recovered = connect_eventually(&cell, "shop").await;
+    let moved = directory.deployment(&deployment.id).await.unwrap().unwrap();
+    assert!(moved.epoch > checkpointed.epoch);
+    assert_eq!(moved.checkpoint, Some(checkpoint));
+    assert_eq!(moved.replica_anchor.as_ref(), Some(anchor));
+    assert!(!moved.ensemble.contains(missing));
+    assert_eq!(values(&recovered, "SELECT total FROM orders").await, ["11"]);
+    assert_eq!(values(&recovered, "SELECT total FROM orders FOR ALL SYSTEM_TIME FOR ALL VALID_TIME").await, history);
+    recovered.simple_query(&format!("SET AWAIT_TOKEN TO '{latest}'")).await.unwrap();
+    assert_eq!(values(&recovered, "SELECT total FROM orders").await, ["11"]);
+
+    let second = cell.logkeepers.iter().position(|keeper| {
+        keeper.lease.id() != *missing && checkpointed.ensemble.contains(&keeper.lease.id())
+    }).unwrap();
+    cell.logkeepers.remove(second).stop().await.unwrap();
+    recovered.simple_query("INSERT INTO orders (_id, total) VALUES (3, 30)").await.unwrap();
+    assert_eq!(values(&recovered, "SELECT total FROM orders").await, ["11", "30"]);
+    drop(recovered);
     cell.stop().await;
 }
 
@@ -2117,12 +2417,22 @@ impl KeyService for InterruptedInstall {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_cell_move_resumes_when_preparation_or_the_placement_switch_is_interrupted() {
-    use rtdb_directory::Lifecycle;
-    use rtdb_multi::cells::CellMap;
+    exercise_interrupted_cell_move(None, None, None).await;
+}
 
-    let map = std::sync::Arc::new(InterruptedCutover::default());
-    let east = Cell::start_in("east", map.clone(), 1).await;
-    let west = Cell::start_in("west", map.clone(), 2).await;
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn s3_a_cell_move_resumes_after_key_install_and_cutover_interruptions() {
+    let (Some(east), Some(west)) = (s3_storage(), s3_storage()) else {
+        eprintln!("RTDB_S3_ENDPOINT is not set: skipped");
+        return;
+    };
+    tokio::time::timeout(Duration::from_secs(240), exercise_interrupted_cell_move(Some(east), Some(west), Some(hosted_test_owner()))).await.unwrap();
+}
+
+async fn exercise_interrupted_cell_move(east: Option<CellStorage>, west: Option<CellStorage>, owner: Option<rtdb_directory::HostedTask>) {
+    let map = Arc::new(InterruptedCutover::default());
+    let east = Cell::start_on(east, vec![MemberPool::General], None, None, Some((map.clone(), "east".into()))).await;
+    let west = Cell::start_on(west, vec![MemberPool::General; 2], None, None, Some((map.clone(), "west".into()))).await;
     let (east_storage, west_storage) = (east.storage(), west.storage());
     let east_keys = east.keys();
     let west_keys = InterruptedInstall { keys: west.keys(), failed: Default::default() };
@@ -2133,9 +2443,10 @@ async fn a_cell_move_resumes_when_preparation_or_the_placement_switch_is_interru
     client.simple_query("INSERT INTO orders (_id, total) VALUES (1, 10)").await.unwrap();
     east.node(east.holder("shop").await.unwrap()).agent.flush("shop").await.unwrap();
     client.simple_query("INSERT INTO orders (_id, total) VALUES (2, 20)").await.unwrap();
+    let history = order_history(&client).await;
     drop(client);
 
-    let move_shop = || admin::move_cell(map.as_ref(), &from, &to, "shop", 4 << 20, None);
+    let move_shop = || admin::move_cell(map.as_ref(), &from, &to, "shop", 4 << 20, owner.clone());
     assert_eq!(move_shop().await.unwrap_err().code, "test/key-install-interrupted");
     let incomplete = east.directory.deployment(&original.id).await.unwrap().unwrap();
     assert_eq!(incomplete.lifecycle, Lifecycle::Moving);
@@ -2170,6 +2481,7 @@ async fn a_cell_move_resumes_when_preparation_or_the_placement_switch_is_interru
 
     let reader = east.connect("shop").await;
     assert_eq!(values(&reader, "SELECT total FROM orders").await, ["10", "20"]);
+    assert_eq!(order_history(&reader).await, history);
     let adopted = west.directory.deployment(&original.id).await.unwrap().unwrap();
     assert!(adopted.move_from.is_none());
     assert_eq!(adopted.ensemble.len(), staged.ensemble.len());

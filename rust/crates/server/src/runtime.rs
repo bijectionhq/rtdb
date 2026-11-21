@@ -39,6 +39,7 @@ pub struct ServerHandle {
     auth: Arc<Authenticator>,
     metrics: Arc<Registry>,
     addresses: ListenerAddresses,
+    primary_pgwire: Option<rtdb_pgwire::ServerHandle>,
     cancellation: CancellationToken,
 }
 impl ServerHandle {
@@ -46,6 +47,7 @@ impl ServerHandle {
     pub fn authenticator(&self) -> &Arc<Authenticator> { &self.auth }
     pub fn metrics(&self) -> &Arc<Registry> { &self.metrics }
     pub fn addresses(&self) -> &ListenerAddresses { &self.addresses }
+    pub fn primary_pgwire(&self) -> Option<&rtdb_pgwire::ServerHandle> { self.primary_pgwire.as_ref() }
     pub fn shutdown(&self) { self.cancellation.cancel(); }
 }
 
@@ -185,7 +187,9 @@ impl ServerDriver {
             Ok(listeners) => listeners,
             Err(error) => return match driver.close_without_run().await { Ok(()) => Err(error), Err(close) => Err(error.with_context("resource-close-error", close.to_string().into())) },
         };
-        let handle = ServerHandle { node, auth, metrics, addresses, cancellation };
+        let primary_pgwire = pgwire.iter().find(|(listener, _)| Some(listener.address()) == addresses.pgwire)
+            .map(|(listener, _)| listener.clone());
+        let handle = ServerHandle { node, auth, metrics, addresses, primary_pgwire, cancellation };
         Ok((handle.clone(), Self { handle, node: driver, pgwire, flight, health, registrations, tracing, metric_export }))
     }
 

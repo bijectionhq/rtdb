@@ -1173,6 +1173,7 @@ impl Handler for NodeAgent {
             Request::ParkForMove { name, epoch, ticket } => self.park_holding(&name, Some((epoch, &ticket))).await,
             Request::Touch { name } => { self.touch(&name); Ok(Response::Done) }
             Request::Ping => Ok(Response::Done),
+            Request::OpenPgwire => Err(Anomaly::unsupported("rtdb.multi/control-request", "This control endpoint does not provide Pgwire")),
             Request::HoldingLoads { measure_query_cpu } => Ok(Response::HoldingLoads { holdings: self.holding_loads(measure_query_cpu) }),
             Request::ReadLoads => Ok(Response::ReadLoads { loads: self.read_loads() }),
             Request::FlightEndpoint => self.flight_endpoint.clone().map(|address| Response::FlightEndpoint { address })

@@ -570,6 +570,30 @@ The model treats a reachable replacement and available directory and quorum as p
 The weakened variants mask data endpoint failure with a healthy control response, confirm death from stale observations, or abandon the first failed dial.
 The native cell regression keeps the control endpoint responsive, breaks pgwire, and verifies the same client startup reaches the replacement and reads the committed data.
 A separate native test changes the pgwire address between the probe and publication.
-The TCP probe measures reachability without competing for a pgwire session slot.
+The serving probe runs before Pgwire authentication and occupies no authenticated session slot.
 The capacity regression fills the writer's configured session slots and verifies that the controller keeps the writer live.
-Post-connect stalls and gateway-only network splits invisible to the controller fall outside this recovery claim. [Lean proof](../../verification/multi/lean/ServingFailure.lean) · [TLA+ model](../../verification/multi/tla/RTDBServingFailure.tla) · [Verus checks](../../verification/verus/member_probe/area.json) · [Cell tests](../../rust/crates/multi/tests/cell.rs)
+The gateway sends a Pgwire startup only after a supported endpoint answers the serving preface.
+An eligible gateway can relay through the same writer's signed control endpoint while the controller continues to see a healthy writer.
+The relay is available when the writer's authentication rules are independent of peer addresses.
+TLC checks a writer-wide serving stall, a gateway-only isolation, and a missed probe during inspection overflow.
+Removing the wire reply, fallback, authorization constraint, or overflow check produces a counterexample.
+These results cover the serving handshake under a reachable successor or an authorized relay path. [Lean proof](../../verification/multi/lean/ServingFailure.lean) · [TLA+ serving paths](../../verification/multi/tla/RTDBGatewayPaths.tla) · [Verus checks](../../verification/verus/member_probe/area.json) · [Cell tests](../../rust/crates/multi/tests/cell.rs)
+
+### Interrupted journal replacement and trim
+
+The local integration test publishes an anchor and loses its directory response before physical trim.
+It acknowledges an update and a delete above the checkpoint, loses a journal and the writer, and recovers onto a repaired ensemble.
+The new writer sees the full bitemporal history and ordered tail, then accepts a new write after losing a second original journal.
+TLC checks that a checkpoint and the selected ensemble still cover every acknowledged slot through interrupted publication, trim, and replacement.
+Allowing replacement before the entire sealed suffix is copied, or trimming before checkpoint publication, breaks that invariant.
+The model abstracts each durable ensemble to a contiguous prefix and uses the existing quorum and checkpoint recovery premises. [TLA+ model](../../verification/multi/tla/RTDBJournalReplacement.tla) · [Cell tests](../../rust/crates/multi/tests/cell.rs)
+
+### Provider-backed interruption tests
+
+The AWS S3 fixtures use separate storage namespaces for two cells and a physically separate archive bucket.
+The move test interrupts key installation, loses a placement reply before application, and loses the next placement reply after application.
+The restore test loses the fence reply, removes the serving objects, then interrupts completion after journal seal.
+A later restore recovers the original checkpoint and bitemporal tail.
+The deletion fixture puts an object into the fenced prefix after the first empty observation and verifies that the key survives until a new observation sequence succeeds.
+The tests exercise real S3 object requests with local directory and logkeeper processes.
+They supply a fixture task identity for hosted storage ownership and exercise the deletion interval with controlled timestamps. [Move and restore tests](../../rust/crates/multi/tests/cell.rs) · [Deletion tests](../../rust/crates/multi/tests/s3.rs) · [Deletion model](../../verification/multi/tla/RTDBDeletion.tla)

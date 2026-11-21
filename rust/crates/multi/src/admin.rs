@@ -1795,11 +1795,16 @@ pub async fn confirm_suspicions(directory: &dyn Directory, failures: &mut BTreeM
     });
     let mut probes = std::pin::pin!(futures::stream::iter(members).map(|member| async move {
         let address = member.control_address.as_deref().expect("members without control addresses were filtered");
-        let (control, pgwire_ok) = tokio::join!(
-            control::call(address, &Request::Ping, options.probe_timeout, &options.control),
-            crate::gateway::probe_pgwire(&member.address, options.probe_timeout),
-        );
-        (member, matches!(control, Ok(Response::Done)), pgwire_ok)
+        match control::ping(address, options.probe_timeout, &options.control).await {
+            Ok(overflows) => {
+                let pgwire_ok = crate::gateway::probe_pgwire(&member.address, options.probe_timeout, overflows.is_some()).await;
+                let crowded = if !pgwire_ok && let Some(before) = overflows {
+                    matches!(control::ping(address, options.probe_timeout, &options.control).await, Ok(Some(after)) if before != after)
+                } else { false };
+                (member, true, pgwire_ok || crowded)
+            }
+            Err(_) => (member, false, false),
+        }
     }).buffer_unordered(CONCURRENT_SUSPICION_PROBES));
     let mut confirmed = 0;
     while let Some((member, control_ok, pgwire_ok)) = probes.next().await {

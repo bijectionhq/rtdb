@@ -1006,7 +1006,10 @@ rule ConfirmSuspicion {
 
 rule ProbeMemberLiveness {
     -- A controller pass probes up to sixteen members at a time.
-    -- A round succeeds when the control endpoint answers and the pgwire TCP endpoint accepts a connection.
+    -- A round succeeds when control answers and the Pgwire listener returns its serving probe response.
+    -- During a rollout, the controller checks TCP reachability for a member without the serving probe.
+    -- The serving probe is admitted separately from authenticated sessions.
+    -- A missed probe during startup-admission overflow gives no failure evidence.
     -- A successful round or a change to either endpoint clears preceding failures.
     when: ControllerProbeDue(cell)
 
@@ -1845,6 +1848,18 @@ rule BoundInitialGreeting {
         if connection.startup_received:
             ClientMayRetryStartup(connection)
         ConnectionClosed(connection)
+}
+
+rule RouteWriterThroughControl {
+    when: DirectPgwireStartupUnavailable(gateway, holder)
+
+    requires: GatewayHasCellGrant(gateway)
+    requires: PgwireAuthenticationIsPeerAddressIndependent(holder)
+
+    ensures:
+        LocalPgwireConnectionOpened(holder)
+        StartupSentToHolderForAuthentication(gateway, holder)
+        PlacementUnchanged(holder)
 }
 
 rule TouchConnectedBackend {

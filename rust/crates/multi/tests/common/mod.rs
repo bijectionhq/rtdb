@@ -11,6 +11,42 @@ use rtdb_server::config::NodeConfiguration;
 use tokio_postgres::{Client, NoTls, SimpleQueryMessage};
 use tokio_util::sync::CancellationToken;
 
+pub fn s3_storage() -> Option<CellStorage> {
+    s3_storage_in(&std::env::var("RTDB_S3_BUCKET").unwrap_or_else(|_| "rtdb-test".into()))
+}
+
+pub fn s3_archive_storage() -> Option<CellStorage> {
+    s3_storage_in(&std::env::var("RTDB_S3_ARCHIVE_BUCKET").ok()?)
+}
+
+pub fn hosted_test_owner() -> rtdb_directory::HostedTask {
+    rtdb_directory::HostedTask::new(
+        "arn:aws:ecs:us-east-1:123456789012:cluster/rtdb-proof",
+        "arn:aws:ecs:us-east-1:123456789012:task/rtdb-proof/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    ).unwrap()
+}
+
+fn s3_storage_in(bucket: &str) -> Option<CellStorage> {
+    let endpoint = std::env::var("RTDB_S3_ENDPOINT").ok()?;
+    Some(CellStorage::parse(&format!("s3://{bucket}/run-{}?endpoint={endpoint}&path_style=true&region=us-east-1", uuid::Uuid::new_v4().simple())).unwrap())
+}
+
+pub async fn order_history(client: &tokio_postgres::Client) -> Vec<Vec<Option<String>>> {
+    use tokio_postgres::SimpleQueryMessage;
+
+    let history = "SELECT _id, total, _valid_from, _valid_to, _system_from, _system_to \
+                   FROM orders FOR ALL SYSTEM_TIME FOR ALL VALID_TIME";
+    let mut rows: Vec<Vec<Option<String>>> = client.simple_query(history).await.unwrap()
+        .into_iter()
+        .filter_map(|message| match message {
+            SimpleQueryMessage::Row(row) => Some((0..6).map(|index| row.get(index).map(str::to_owned)).collect()),
+            _ => None,
+        })
+        .collect();
+    rows.sort();
+    rows
+}
+
 async fn start_node(directory: &Arc<dyn Directory>, data: &std::path::Path, agent: AgentOptions, index: usize,
                     pool: MemberPool, compaction_workers: bool, engine_version: Option<String>) -> process::RunningNode {
     let keys: Arc<dyn rtdb_multi::keys::KeyService> = Arc::new(rtdb_multi::keys::LocalKeyService::new(data.join("keys")).unwrap());
@@ -108,7 +144,7 @@ impl Cell {
         Self::start_configured_with_directory(directory, None, vec![MemberPool::General], None, None, None, true, |_| {}).await
     }
 
-    async fn start_configured_with_directory(directory: Arc<dyn Directory>, objects: Option<CellStorage>, pools: Vec<MemberPool>,
+    pub async fn start_configured_with_directory(directory: Arc<dyn Directory>, objects: Option<CellStorage>, pools: Vec<MemberPool>,
         park_after: Option<Duration>, watch: Option<Duration>, cells: Option<(Arc<dyn rtdb_multi::cells::CellMap>, String)>, fsync: bool,
         configure: impl FnOnce(&mut AgentOptions)) -> Self {
         let compaction_workers = pools.contains(&MemberPool::Compaction);

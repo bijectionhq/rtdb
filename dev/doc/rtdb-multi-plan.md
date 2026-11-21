@@ -875,12 +875,18 @@ Placement must follow load and the fleet must scale both ways (spec surface `Con
 
 1. Crate `controller` covers serving endpoint health, admission of prewarmed members, drain, load-watermark rebalancing, orphaned tails, quarantine and engine rollouts.
    The controller probes at most 16 live node endpoints concurrently.
-   Each round checks the control response and pgwire TCP reachability in parallel for each node.
-   The TCP probe needs no pgwire session slot.
+   Each round checks the control response and the Pgwire listener's response to a private serving probe.
+   The serving probe needs no authenticated Pgwire session slot.
+   A listener whose control response predates the serving probe is checked for TCP reachability.
    Consecutive failures count only for one unchanged address pair.
    A ready round resets the count, and a member with either address changed cannot be confirmed dead by the old observation.
-   The gateway retries a failed writer dial within its existing startup or replay budget so a successor can claim the deployment.
-   This recovery requires the controller to observe the serving failure and an eligible successor to reach storage and a write quorum.
+   A capable listener answers a private serving preface before the gateway sends a Pgwire startup message.
+   The gateway can retry a missed preface without repeating authentication.
+   The controller clears failure evidence when it observes startup inspection overflow during a probe.
+   A gateway with a failed direct route can reach the same writer through a signed control-plane relay to that writer's local Pgwire listener.
+   The relay runs the ordinary Pgwire authentication and is available when the node's authentication rules are independent of the peer address.
+   A gateway's direct-path failure alone leaves placement unchanged.
+   When the writer's serving endpoint fails from the controller's perspective, progress requires an eligible successor that reaches storage and a write quorum.
    A draining node hands off up to eight recently used deployments per pass and parks its idle deployments.
    It runs the handoffs one at a time.
    The source's identity and epoch must still match at reservation.

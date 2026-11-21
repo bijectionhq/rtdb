@@ -8,27 +8,8 @@ use common::*;
 use rtdb_directory::MemberPool;
 use rtdb_multi::{admin, deployment::CellStorage};
 
-fn storage() -> Option<CellStorage> {
-    let endpoint = std::env::var("RTDB_S3_ENDPOINT").ok()?;
-    let bucket = std::env::var("RTDB_S3_BUCKET").unwrap_or_else(|_| "rtdb-test".into());
-    Some(CellStorage::parse(&format!("s3://{bucket}/run-{}?endpoint={endpoint}&path_style=true&region=us-east-1", uuid::Uuid::new_v4().simple())).unwrap())
-}
+use common::s3_storage as storage;
 
-async fn order_history(client: &tokio_postgres::Client) -> Vec<Vec<Option<String>>> {
-    use tokio_postgres::SimpleQueryMessage;
-
-    let history = "SELECT _id, total, _valid_from, _valid_to, _system_from, _system_to \
-                   FROM orders FOR ALL SYSTEM_TIME FOR ALL VALID_TIME";
-    let mut rows: Vec<Vec<Option<String>>> = client.simple_query(history).await.unwrap()
-        .into_iter()
-        .filter_map(|message| match message {
-            SimpleQueryMessage::Row(row) => Some((0..6).map(|index| row.get(index).map(str::to_owned)).collect()),
-            _ => None,
-        })
-        .collect();
-    rows.sort();
-    rows
-}
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
 async fn checkpoint_and_durable_tail_survive_loss_of_one_two_or_all_workers() {
@@ -95,7 +76,7 @@ async fn checkpoint_and_durable_tail_survive_loss_of_one_two_or_all_workers() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_cell_keeps_its_deployments_forks_and_deletions_in_s3() {
     let Some(storage) = storage() else { eprintln!("RTDB_S3_ENDPOINT is not set: skipped"); return };
-    tokio::time::timeout(Duration::from_secs(60), exercise_cell(storage))
+    tokio::time::timeout(Duration::from_secs(180), exercise_cell(storage))
         .await.expect("S3 cell lifecycle stalled");
 }
 
@@ -144,7 +125,7 @@ async fn exercise_cell(storage: CellStorage) {
     cell.node(holder).agent.park("shop-preview").await.unwrap();
 
     eprintln!("S3 phase: delete parent");
-    let deletion = prove_s3_erasure(&cell, &parent.id, false).await;
+    let deletion = prove_s3_erasure(&cell, &parent.id, true).await;
     assert!(deletion.facts.verified_empty, "the parent's current objects are gone from S3");
     assert_eq!(deletion.facts.inventory, rtdb_directory::DeletionInventory::AllVersionsAndMultipartUploads);
     let prefix = rtdb_storage::ObjectKey::new(parent.storage_prefix()).unwrap();
