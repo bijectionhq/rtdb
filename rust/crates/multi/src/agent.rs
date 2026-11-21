@@ -157,17 +157,18 @@ impl NodeAgent {
                 return Err(stale_handoff(name));
             }
             let members = self.members().await?;
+            let now = now_ms();
+            let holder = effective_holder(&record, &members, now);
             if let Some(holding) = self.holdings.lock().get_mut(name) {
-                if holding.id == record.id && holding.epoch == record.epoch && record.holder.as_ref() == Some(&me) && self.node.catalog().database(name).is_ok() {
+                if holding.id == record.id && holding.epoch == record.epoch && holder == Some(&me) && self.node.catalog().database(name).is_ok() {
                     holding.last_touch = Instant::now();
                     return Ok(Response::Held { epoch: record.epoch, address: self.address.clone() });
                 }
             }
-            let now = now_ms();
             if moving.is_some_and(|ticket| !record.active_move(now).is_some_and(|intent| intent.request == ticket.request && intent.target == me)) {
                 return Err(stale_handoff(name));
             }
-            if let Some(holder) = effective_holder(&record, &members, now) {
+            if let Some(holder) = holder {
                 if *holder != me {
                     let address = members.get(holder).map(|member| member.address.clone()).unwrap_or_default();
                     return Ok(Response::Redirect { holder: holder.to_string(), address });
@@ -301,23 +302,35 @@ impl NodeAgent {
     }
 
     /// Flushes `database` and waits until the block that was open is adopted.
-    async fn flush_and_adopt(&self, database: &Arc<Database>) -> Result<()> {
-        let open = database.status().open_block;
-        database.flush().await?;
-        let deadline = Instant::now() + self.options.activation_timeout;
-        while database.status().adopted_block.as_ref().is_none_or(|block| block.block_index() < open) {
-            if Instant::now() > deadline { return Err(Anomaly::new(AnomalyCategory::Unavailable, "rtdb.multi/flush-timeout", "The flush did not complete in time")); }
-            tokio::time::sleep(Duration::from_millis(5)).await;
+    async fn flush_and_adopt(&self, database: &Arc<Database>, id: &str, epoch: u64) -> Result<()> {
+        let member = self.member();
+        let mut watched = rtdb_directory::watch_deployment(self.directory.clone(), id.to_owned(), Duration::from_millis(100));
+        let deposed = watched.wait_for(|snapshot| snapshot.as_ref().is_some_and(|record| {
+            record.epoch > epoch || record.epoch == epoch && record.holder.as_ref() != Some(&member)
+        }));
+        let flush = async {
+            let open = database.status().open_block;
+            database.flush().await?;
+            while database.status().adopted_block.as_ref().is_none_or(|block| block.block_index() < open) {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            Ok(())
+        };
+        tokio::select! {
+            _ = deposed => Err(Anomaly::new(AnomalyCategory::Unavailable, rtdb_node::NOT_HELD, "The holder was deposed while waiting for its flush")),
+            flushed = tokio::time::timeout(self.options.activation_timeout, flush) => flushed.unwrap_or_else(|_| {
+                Err(Anomaly::new(AnomalyCategory::Unavailable, "rtdb.multi/flush-timeout", "The flush did not complete in time"))
+            }),
         }
-        Ok(())
     }
 
     pub async fn flush(&self, name: &str) -> Result<Response> {
         let turn = self.turn(name);
         let _turn = turn.lock().await;
-        if !self.holdings.lock().contains_key(name) { return Err(Anomaly::incorrect("rtdb.multi/not-held", format!("This node does not hold {name}"))); }
+        let (id, epoch) = self.holdings.lock().get(name).map(|holding| (holding.id.clone(), holding.epoch))
+            .ok_or_else(|| Anomaly::incorrect("rtdb.multi/not-held", format!("This node does not hold {name}")))?;
         let database = self.node.catalog().database(name)?;
-        self.flush_and_adopt(&database).await?;
+        self.flush_and_adopt(&database, &id, epoch).await?;
         Ok(Response::Done)
     }
 
@@ -339,7 +352,7 @@ impl NodeAgent {
         }
 
         // The next holder starts from a closed block once the flushed block has been adopted.
-        if let Ok(database) = self.node.catalog().database(name) { self.flush_and_adopt(&database).await?; }
+        if let Ok(database) = self.node.catalog().database(name) { self.flush_and_adopt(&database, &id, epoch).await?; }
         for _ in 0..8 {
             let Some(record) = self.directory.deployment(&id).await? else { break };
             if !is_requested(&record) { return Err(stale_handoff(name)); }

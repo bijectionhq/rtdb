@@ -103,3 +103,122 @@ async fn a_cell_move_refuses_overlapping_s3_locations() {
     east.stop().await;
     west.stop().await;
 }
+
+#[derive(Default)]
+struct PackUpload {
+    armed: std::sync::atomic::AtomicBool,
+    held: tokio::sync::Notify,
+    resume: tokio::sync::Notify,
+    completed: tokio::sync::Notify,
+    reply_status: std::sync::atomic::AtomicU16,
+}
+
+async fn pause_pack_upload(upstream: hyper::Uri) -> (std::net::SocketAddr, std::sync::Arc<PackUpload>, tokio::task::JoinHandle<()>) {
+    use std::sync::atomic::Ordering;
+    use http_body_util::{BodyExt, Full};
+    use hyper::body::{Bytes, Incoming};
+    use hyper::service::service_fn;
+    use hyper_util::client::legacy::Client;
+    use hyper_util::rt::{TokioExecutor, TokioIo};
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let upload = std::sync::Arc::new(PackUpload::default());
+    let gate = upload.clone();
+    let client: Client<_, Full<Bytes>> = Client::builder(TokioExecutor::new()).build_http();
+    let proxy = tokio::spawn(async move {
+        while let Ok((stream, _)) = listener.accept().await {
+            let (upstream, gate, client) = (upstream.clone(), gate.clone(), client.clone());
+            tokio::spawn(async move {
+                let service = service_fn(move |request: hyper::Request<Incoming>| {
+                    let (upstream, gate, client) = (upstream.clone(), gate.clone(), client.clone());
+                    async move {
+                        let (mut parts, body) = request.into_parts();
+                        let mut uri = upstream.into_parts();
+                        uri.path_and_query = parts.uri.path_and_query().cloned();
+                        parts.uri = hyper::Uri::from_parts(uri).unwrap();
+                        let block_pack = parts.uri.path().rsplit('/').next()
+                            .is_some_and(|name| name.starts_with('b') && name.ends_with(".pack"));
+                        let request = hyper::Request::from_parts(parts, Full::new(body.collect().await.map_err(std::io::Error::other)?.to_bytes()));
+                        if request.method() == hyper::Method::PUT && block_pack && gate.armed.swap(false, Ordering::Relaxed) {
+                            // The complete request remains deliverable even if the deposed holder closes its socket.
+                            let delayed = tokio::spawn(async move {
+                                gate.held.notify_one();
+                                gate.resume.notified().await;
+                                let response = client.request(request).await;
+                                gate.reply_status.store(response.as_ref().map_or(0, |reply| reply.status().as_u16()), Ordering::Relaxed);
+                                gate.completed.notify_one();
+                                response
+                            });
+                            return delayed.await.map_err(std::io::Error::other)?.map_err(std::io::Error::other);
+                        }
+                        client.request(request).await.map_err(std::io::Error::other)
+                    }
+                });
+                let _ = hyper::server::conn::http1::Builder::new().serve_connection(TokioIo::new(stream), service).await;
+            });
+        }
+    });
+    (address, upload, proxy)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_holder_paused_at_a_pack_upload_cannot_replace_its_successors_block() {
+    use std::sync::atomic::Ordering;
+
+    let Some(upstream) = storage() else { return };
+    let CellStorage::S3 { mut config } = upstream.clone() else { unreachable!() };
+    let endpoint: hyper::Uri = config.endpoint.as_deref().unwrap().parse().unwrap();
+    if endpoint.scheme_str() != Some("http") { return; }
+    let (address, upload, proxy) = pause_pack_upload(endpoint).await;
+    config.endpoint = Some(format!("http://{address}"));
+
+    tokio::time::timeout(Duration::from_secs(90), async {
+        let cell = Cell::start_on(Some(CellStorage::S3 { config }), vec![MemberPool::General; 2], None, None, None).await;
+        let deployment = admin::create_deployment(cell.directory.as_ref(), "shop", "acme", 3).await.unwrap();
+        let client = cell.connect("shop").await;
+        client.simple_query("INSERT INTO orders (_id, total) VALUES (1, 10)").await.unwrap();
+        drop(client);
+
+        let original = cell.holder("shop").await.unwrap();
+        let old = cell.node(original);
+        upload.armed.store(true, Ordering::Relaxed);
+        let mut flushing = tokio::spawn({ let agent = old.agent.clone(); async move { agent.flush("shop").await } });
+        tokio::select! {
+            () = upload.held.notified() => {}
+            result = &mut flushing => panic!("the flush completed before its upload was paused: {result:?}"),
+            () = tokio::time::sleep(Duration::from_secs(10)) => panic!("the old holder did not reach its block upload"),
+        }
+
+        let old_member = old.lease.id();
+        old.stop_renewing();
+        while cell.directory.member(&old_member).await.unwrap().unwrap().is_live(rtdb_directory::now_ms()) {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        let client = connect_eventually(&cell, "shop").await;
+        let successor = cell.holder("shop").await.unwrap();
+        assert_ne!(successor, original);
+        client.simple_query("INSERT INTO orders (_id, total) VALUES (2, 20)").await.unwrap();
+        cell.node(successor).agent.flush("shop").await.unwrap();
+
+        let bucket = upstream.bucket(rtdb_storage::IoRegion::new()).await.unwrap();
+        let catalog = rtdb_format::keys::block_key(rtdb_types::BlockIndex(0)).unwrap();
+        let pack = rtdb_storage::ObjectKey::new(format!("{}/v06/{}", deployment.storage_prefix(), rtdb_multi::packing::block_pack(&catalog))).unwrap();
+        let recovered = bucket.get(&pack).await.unwrap();
+        let abandoned = tokio::time::timeout(Duration::from_secs(5), flushing).await.unwrap().unwrap().unwrap_err();
+        assert_eq!(abandoned.code, rtdb_node::NOT_HELD);
+        upload.resume.notify_one();
+        tokio::time::timeout(Duration::from_secs(5), upload.completed.notified()).await.unwrap();
+        assert_eq!(upload.reply_status.load(Ordering::Relaxed), 412);
+        assert_eq!(bucket.get(&pack).await.unwrap(), recovered);
+        assert_eq!(values(&client, "SELECT total FROM orders").await, ["10", "20"]);
+
+        drop(client);
+        cell.node(successor).agent.park("shop").await.unwrap();
+        let restarted = connect_eventually(&cell, "shop").await;
+        assert_eq!(values(&restarted, "SELECT total FROM orders").await, ["10", "20"]);
+        drop(restarted);
+        cell.stop().await;
+    }).await.expect("paused S3 upload scenario stalled");
+    proxy.abort();
+}
