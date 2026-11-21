@@ -93,8 +93,8 @@ impl OrderedIndexMaintenance {
         if let Ok(Some(checkpoint)) =
             checkpoint::latest(&self.storage, directory, &self.memory, through).await
             && checkpoint.source_rows <= expected
+            && let Ok(tree) = Tree::new(&self.storage, directory, &self.memory, checkpoint.scope).await
         {
-            let tree = Tree::new(&self.storage, directory, &self.memory, checkpoint.scope);
             if checkpoint.through == through && checkpoint.source_rows == expected {
                 match checkpoint.collect(&tree, cancellation).await {
                     Ok(()) => return Ok(()),
@@ -133,7 +133,7 @@ impl OrderedIndexMaintenance {
         }
         let sources = source_files(snapshot, &definition.table, -1, through)?;
         let cuts = erase_cuts(&self.storage, &self.memory, &sources, cancellation).await?;
-        let tree = Tree::new(&self.storage, directory, &self.memory, cuts.scope);
+        let tree = Tree::new(&self.storage, directory, &self.memory, cuts.scope).await?;
         checkpoint::request_collection(&tree, through).await?;
         let mut roots = RevisionRoots::default();
         let rows =
@@ -409,6 +409,10 @@ async fn prune_dropped(
     cancellation: &CancellationToken,
 ) -> Result<()> {
     let store = storage.object_store();
+    let managed = store.index_page_lifecycle();
+    if let Some(lifecycle) = managed {
+        lifecycle.retire_dropped(active, through).await?;
+    }
     let root = ObjectKey::new(INDEX_ROOT)?;
     for object in store.list(Some(&root)).await? {
         if cancellation.is_cancelled() {
@@ -424,6 +428,9 @@ async fn prune_dropped(
         if generation.is_some_and(|generation| generation <= through)
             && !active.iter().any(|index| object.key.is_under(index))
         {
+            if managed.is_some() && object.key.as_str().contains("/pages/") {
+                continue;
+            }
             store.delete(&object.key).await?;
             storage.invalidate(&object.key).await?;
         }

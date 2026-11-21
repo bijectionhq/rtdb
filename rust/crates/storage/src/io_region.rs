@@ -3,6 +3,10 @@ use parking_lot::Mutex;
 use tokio_util::task::{TaskTracker, task_tracker::TaskTrackerToken};
 use crate::{Error, Result};
 
+tokio::task_local! {
+    static RETAINED_OWNER: Arc<dyn Send + Sync>;
+}
+
 pub struct IoRegion {
     closed: Mutex<bool>,
     tasks: TaskTracker,
@@ -12,8 +16,8 @@ pub struct IoRegion {
     publication_journal: Option<Arc<dyn crate::remote::PublicationJournal>>,
 }
 pub(crate) struct IoAdmission {
-    tokens: Vec<TaskTrackerToken>,
     lifetimes: Vec<Arc<dyn Send + Sync>>,
+    tokens: Vec<TaskTrackerToken>,
 }
 impl IoAdmission {
     pub(crate) fn and(mut self, other: Self) -> Self {
@@ -25,6 +29,17 @@ impl IoAdmission {
 impl IoRegion {
     pub fn new() -> Arc<Self> {
         Self::region(None, None)
+    }
+    /// Extends the owner's lifetime through provider operations admitted while polling the work.
+    /// A nested operation inherits the enclosing owners.
+    pub async fn retaining<T>(
+        owner: Arc<dyn Send + Sync>, work: impl std::future::Future<Output = T>,
+    ) -> T {
+        let owner = match RETAINED_OWNER.try_with(Arc::clone) {
+            Ok(parent) if !Arc::ptr_eq(&parent, &owner) => Arc::new((parent, owner)),
+            _ => owner,
+        };
+        RETAINED_OWNER.scope(owner, work).await
     }
     /// Operations admitted through this child also belong to every ancestor's drain.
     /// Closing a child leaves siblings open; closing an ancestor rejects subsequent admissions through the child.
@@ -58,7 +73,7 @@ impl IoRegion {
         let closed = self.closed.lock();
         if *closed { return Err(Error::Closed("I/O region is closed".into())); }
         let mut admission = self.parent.as_ref().map(|parent| parent.admit()).transpose()?
-            .unwrap_or_else(|| IoAdmission { tokens: Vec::new(), lifetimes: Vec::new() });
+            .unwrap_or_else(|| IoAdmission { tokens: Vec::new(), lifetimes: RETAINED_OWNER.try_with(Arc::clone).into_iter().collect() });
         admission.tokens.push(self.tasks.token());
         admission.lifetimes.extend(self.lifetime.iter().cloned());
         Ok(admission)
@@ -120,20 +135,24 @@ mod tests {
     #[tokio::test]
     async fn drain_waits_for_cancelled_result_destruction() {
         let region = IoRegion::new();
+        let retained = Arc::new(());
+        let owner = Arc::downgrade(&retained);
         let (working, started) = tokio::sync::oneshot::channel();
         let (finish_work, work_release) = std::sync::mpsc::channel();
         let (dropping, drop_started) = tokio::sync::oneshot::channel();
         let (finish_drop, drop_release) = std::sync::mpsc::channel();
-        let mut request = Box::pin(region.run_blocking(move || {
+        let mut request = Box::pin(IoRegion::retaining(retained, region.run_blocking(move || {
             working.send(()).unwrap(); work_release.recv().unwrap();
             Ok(HeldDrop { entered: Some(dropping), release: drop_release })
-        }));
+        })));
         poll_fn(|context| { assert!(request.as_mut().poll(context).is_pending()); Poll::Ready(()) }).await;
         started.await.unwrap(); drop(request); finish_work.send(()).unwrap();
         drop_started.await.unwrap();
+        assert!(owner.upgrade().is_some());
         let mut close = Box::pin(region.close_and_wait());
         poll_fn(|context| { assert!(close.as_mut().poll(context).is_pending()); Poll::Ready(()) }).await;
         finish_drop.send(()).unwrap(); close.await;
+        assert!(owner.upgrade().is_none());
     }
 
     #[tokio::test]

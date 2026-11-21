@@ -75,3 +75,76 @@ async fn exercise_cell(storage: CellStorage) {
     eprintln!("S3 phase: stop cell");
     cell.stop().await;
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn ordered_index_erasure_retires_the_old_hosted_provider_generation() {
+    use std::collections::BTreeMap;
+    use std::sync::Arc;
+    use rtdb_storage::{IoRegion, ObjectKey};
+    use tokio_util::sync::CancellationToken;
+
+    let Some(storage @ CellStorage::S3 { .. }) = storage() else {
+        eprintln!("RTDB_S3_ENDPOINT is not set: skipped");
+        return;
+    };
+    tokio::time::timeout(Duration::from_secs(60), async {
+        let CellStorage::S3 { config } = &storage else { unreachable!() };
+        let root = ObjectKey::new("cell").unwrap();
+        let mut config = config.clone();
+        let prefix = config.prefix.as_deref().unwrap().trim_matches('/');
+        config.prefix = Some(format!("{prefix}/{root}"));
+        let inventory = config.versioned_inventory(&root, &BTreeMap::new()).await.unwrap();
+        let bucket = storage.bucket(IoRegion::new()).await.unwrap();
+
+        let cell = Cell::start_on(Some(storage.clone()), vec![MemberPool::General; 2], None, None).await;
+        let deployment = admin::create_deployment(cell.directory.as_ref(), "ordered", "acme", 3).await.unwrap();
+        let client = cell.connect("ordered").await;
+        client.simple_query("CREATE INDEX order_keys ON orders (key, _id)").await.unwrap();
+        client.simple_query("INSERT INTO orders RECORDS {_id: 1, key: 'erased'}, {_id: 2, key: 'kept'}").await.unwrap();
+
+        let holder = cell.holder("ordered").await.unwrap();
+        let node = cell.node(holder);
+        let database = node.server.node().catalog().database("ordered").unwrap();
+        node.agent.flush("ordered").await.unwrap();
+        database.build_artefacts().await.unwrap();
+
+        let deployed = cell.directory.deployment(&deployment.id).await.unwrap().unwrap();
+        let index = deployed.ordered_indexes.keys().next().unwrap().clone();
+        let original = ObjectKey::new(format!("{index}/generations/0000000000000000")).unwrap();
+        assert!(!inventory.is_empty(&original).await.unwrap());
+        assert_eq!(values(&client, "SELECT DISTINCT key FROM orders WHERE key >= 'a' ORDER BY key LIMIT 2").await,
+                   ["erased", "kept"]);
+
+        client.simple_query("ERASE FROM orders WHERE _id = 1").await.unwrap();
+        node.agent.flush("ordered").await.unwrap();
+        database.build_artefacts().await.unwrap();
+        let advanced = cell.directory.deployment(&deployment.id).await.unwrap().unwrap();
+        let scope = advanced.ordered_indexes[&index].oldest_generation;
+        assert!(scope > 0);
+
+        let stop = CancellationToken::new();
+        let reaper = tokio::spawn(rtdb_multi::store::run_reaper(
+            cell.directory.clone(), storage.clone(), Some(Arc::new(cell.keys())),
+            Duration::from_secs(3600), Duration::from_millis(20), stop.clone(),
+        ));
+        let observed = loop {
+            let current = cell.directory.deployment(&deployment.id).await.unwrap().unwrap();
+            let state = &current.ordered_indexes[&index];
+            if state.audited_before >= scope && !state.generations.contains_key(&0) {
+                break current;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        };
+        stop.cancel();
+        reaper.await.unwrap();
+
+        assert!(inventory.is_empty(&original).await.unwrap());
+        assert!(bucket.list(Some(&original)).await.unwrap().is_empty());
+        assert!(observed.ordered_indexes[&index].generations.contains_key(&scope));
+        assert_eq!(values(&client, "SELECT DISTINCT key FROM orders WHERE key >= 'a' ORDER BY key LIMIT 2").await,
+                   ["kept"]);
+        drop(database);
+        drop(client);
+        cell.stop().await;
+    }).await.expect("hosted ordered-index retirement stalled");
+}

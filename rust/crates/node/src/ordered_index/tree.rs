@@ -8,7 +8,7 @@ use std::{
 
 use rtdb_columnar::{MemoryBudget, MemoryReservation};
 use parking_lot::Mutex;
-use rtdb_storage::{ObjectKey, cache::BufferPool};
+use rtdb_storage::{IoRegion, ObjectKey, cache::BufferPool, object_store::IndexPageScope};
 use rtdb_types::{Iid, Interval, Result, Timestamp};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -197,16 +197,33 @@ pub(super) struct Tree<'a> {
     pub scope: u64,
     pub memory: &'a Arc<MemoryBudget>,
     decoded: Mutex<DecodedPages>,
+    // Drop this after the decoded cache.
+    permit: Option<Arc<dyn Send + Sync>>,
 }
 
 impl<'scope> Tree<'scope> {
-    pub fn new(
+    pub async fn new(
         storage: &'scope BufferPool,
         directory: &'scope ObjectKey,
         memory: &'scope Arc<MemoryBudget>,
         scope: u64,
-    ) -> Self {
-        Self { storage, directory, scope, memory, decoded: Mutex::default() }
+    ) -> Result<Self> {
+        let permit = match storage.object_store().index_page_lifecycle() {
+            Some(lifecycle) => Some(lifecycle.retain(IndexPageScope { index: directory, generation: scope }).await?),
+            None => None,
+        };
+        Ok(Self { storage, directory, scope, memory, decoded: Mutex::default(), permit })
+    }
+
+    pub fn page_scope(&self) -> IndexPageScope<'_> {
+        IndexPageScope { index: self.directory, generation: self.scope }
+    }
+
+    async fn admitted<T>(&self, work: impl Future<Output = T>) -> T {
+        match &self.permit {
+            Some(permit) => IoRegion::retaining(permit.clone(), work).await,
+            None => work.await,
+        }
     }
 
     pub fn pages(&self) -> Result<ObjectKey> {
@@ -252,10 +269,10 @@ impl<'scope> Tree<'scope> {
         // Derived index pages are rebuildable, and must never make a durable
         // replica-local copy outside the object owner's erasure inventory.
         let store = self.storage.object_store();
-        if store.head_fresh(&object).await?.size != pointer.size as u64 {
+        if self.admitted(store.head_fresh(&object)).await?.size != pointer.size as u64 {
             return Err(format_error("Ordered index page has the wrong length"));
         }
-        let bytes = store.get_fresh(&object).await?;
+        let bytes = self.admitted(store.get_fresh(&object)).await?;
         if bytes.len() != pointer.size
             || format!("{:x}", Sha256::digest(bytes.as_ref())) != pointer.digest
         {
@@ -513,10 +530,8 @@ impl<'scope> Tree<'scope> {
             .map_err(format_error)?;
             let digest = format!("{:x}", Sha256::digest(&encoded));
             let size = encoded.len();
-            self.storage
-                .object_store()
-                .put(&self.page_key(generation, &digest)?, encoded.into())
-                .await?;
+            let object = self.page_key(generation, &digest)?;
+            self.admitted(self.storage.object_store().put(&object, encoded.into())).await?;
             let pointer = Arc::new(Pointer {
                 digest,
                 generation,

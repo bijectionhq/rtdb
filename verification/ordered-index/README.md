@@ -108,13 +108,8 @@ Physical erasure of the remaining provider objects must bind garbage release,
 superseded publication settlement, and active read scopes to the provider's
 completion evidence.
 
-Replay discovers erase cuts from adopted L0 files before writing replacement pages.
-Each checkpoint records the page scope determined by the last source block containing an erase.
-Collection releases earlier scopes after the replacement checkpoint is durable and preserves pages staged in later scopes.
-
-The erasure replay and page scope regression histories were exercised on consolidated RTDB.
-The protocol 15 release backport has source review only.
-The hosted directory still needs to fence old admissions and record physical provider completion.
+Hosted ordered-index retirement records generation closure and waits for admitted readers and publications to drain before removing provider versions.
+The protocol 15 backport has source review only.
 
 ## Execution
 

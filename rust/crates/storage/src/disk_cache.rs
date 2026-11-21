@@ -271,6 +271,10 @@ impl DiskCachedStore {
 }
 #[async_trait]
 impl ObjectStore for DiskCachedStore {
+    fn index_page_lifecycle(&self) -> Option<&dyn crate::object_store::IndexPageLifecycle> {
+        self.remote.index_page_lifecycle()
+    }
+
     async fn head(&self, key: &ObjectKey) -> Result<StoredObject> {
         let _scope = self.io.admit()?;
         let _operation = self.cache.begin_operation()?;

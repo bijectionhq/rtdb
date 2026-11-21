@@ -93,6 +93,10 @@ impl Checkpoint {
             ));
         }
         self.retire_manifests(tree, cancellation).await?;
+        let managed = store.index_page_lifecycle();
+        if let Some(lifecycle) = managed {
+            lifecycle.retire_before(tree.page_scope()).await?;
+        }
         for object in objects {
             if cancellation.is_cancelled() {
                 return Err(cancelled());
@@ -108,7 +112,7 @@ impl Checkpoint {
                 continue;
             };
             let block = page_block(&object.key, &prefix);
-            if scope < self.scope
+            if (managed.is_none() && scope < self.scope)
                 || (block.is_some_and(|block| block <= self.through)
                     && !reachable.contains(&object.key))
             {
@@ -116,14 +120,16 @@ impl Checkpoint {
                 tree.storage.invalidate(&object.key).await?;
             }
         }
-        let legacy = key(tree.directory, "pages")?;
-        for object in store.list(Some(&legacy)).await? {
-            if cancellation.is_cancelled() {
-                return Err(cancelled());
-            }
-            if page_block(&object.key, &legacy).is_some_and(|block| block <= self.through) {
-                store.delete(&object.key).await?;
-                tree.storage.invalidate(&object.key).await?;
+        if managed.is_none() {
+            let legacy = key(tree.directory, "pages")?;
+            for object in store.list(Some(&legacy)).await? {
+                if cancellation.is_cancelled() {
+                    return Err(cancelled());
+                }
+                if page_block(&object.key, &legacy).is_some_and(|block| block <= self.through) {
+                    store.delete(&object.key).await?;
+                    tree.storage.invalidate(&object.key).await?;
+                }
             }
         }
         for debt in pending {
@@ -331,7 +337,7 @@ mod tests {
         let storage = BufferPool::new(Arc::new(MemoryStore::default()), 1 << 20);
         let memory = MemoryBudget::new(1 << 20);
         let directory = ObjectKey::new("index").unwrap();
-        let tree = Tree::new(&storage, &directory, &memory, 0);
+        let tree = Tree::new(&storage, &directory, &memory, 0).await.unwrap();
         let token = CancellationToken::new();
         let store = storage.object_store();
         let erased = key(&tree.pages().unwrap(), "0000000000000000/erased").unwrap();
@@ -362,7 +368,7 @@ mod tests {
         let storage = BufferPool::new(Arc::new(MemoryStore::default()), 1 << 20);
         let memory = MemoryBudget::new(1 << 20);
         let directory = ObjectKey::new("index").unwrap();
-        let tree = Tree::new(&storage, &directory, &memory, 2);
+        let tree = Tree::new(&storage, &directory, &memory, 2).await.unwrap();
         let token = CancellationToken::new();
         let store = storage.object_store();
         let older = key(&directory, "generations/0000000000000000/pages/0000000000000000/page").unwrap();

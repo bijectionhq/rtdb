@@ -17,6 +17,7 @@ pub mod install;
 pub mod keys;
 pub mod lease;
 pub mod logs;
+mod ordered_index_storage;
 pub mod packing;
 pub mod recovery;
 pub mod reference;
