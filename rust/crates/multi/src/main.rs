@@ -35,6 +35,7 @@ Usage: rtdb-multi directory --listen ADDR\n\
        rtdb-multi deletion-key --keys PATH\n\n\
        rtdb-multi verify-deletion --record PATH --public-key KEY\n\n\
 DIR is HOST:PORT of a directory server, or dynamodb:PREFIX for DynamoDB tables named PREFIX-deployments, PREFIX-deployment-names and PREFIX-members\n\
+Use dynamodb+packed:PREFIX to write packed parked rows after all readers have upgraded.\n\
 MAP is HOST:PORT of a cell-map server, or dynamodb:PREFIX for tables named PREFIX-cells and PREFIX-placements.\n\
 DynamoDB requires the `dynamodb` feature. RTDB_DYNAMODB_ENDPOINT points at DynamoDB Local.\n";
 
@@ -283,7 +284,8 @@ async fn dynamo_cell_map(_: &str) -> Result<Arc<dyn CellMap>> {
 }
 
 async fn directory(spec: &str) -> Result<Arc<dyn Directory>> {
-    if let Some(prefix) = spec.strip_prefix("dynamodb:") { return dynamodb(prefix).await; }
+    if let Some(prefix) = spec.strip_prefix("dynamodb:") { return dynamodb(prefix, false).await; }
+    if let Some(prefix) = spec.strip_prefix("dynamodb+packed:") { return dynamodb(prefix, true).await; }
     let mut attempts = 0;
     loop {
         match RemoteDirectory::connect(spec).await {
@@ -295,18 +297,19 @@ async fn directory(spec: &str) -> Result<Arc<dyn Directory>> {
 }
 
 #[cfg(feature = "dynamodb")]
-async fn dynamodb(prefix: &str) -> Result<Arc<dyn Directory>> {
+async fn dynamodb(prefix: &str, pack_parked: bool) -> Result<Arc<dyn Directory>> {
     let tables = rtdb_directory::DynamoTables::with_prefix(prefix);
     let directory = match std::env::var("RTDB_DYNAMODB_ENDPOINT") {
         Ok(endpoint) => rtdb_directory::DynamoDirectory::local(&endpoint, tables),
         Err(_) => rtdb_directory::DynamoDirectory::from_sdk_config(&aws_config::load_from_env().await, tables),
     };
     directory.create_tables().await?;
+    let directory = if pack_parked { directory.with_packed_parked_records() } else { directory };
     Ok(Arc::new(directory))
 }
 
 #[cfg(not(feature = "dynamodb"))]
-async fn dynamodb(_: &str) -> Result<Arc<dyn Directory>> {
+async fn dynamodb(_: &str, _: bool) -> Result<Arc<dyn Directory>> {
     Err(Anomaly::unsupported("rtdb.multi/dynamodb", "This binary was built without the dynamodb feature"))
 }
 

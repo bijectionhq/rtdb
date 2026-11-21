@@ -12,7 +12,7 @@ use rtdb_types::{Anomaly, AnomalyCategory, Result};
 use tokio_util::sync::CancellationToken;
 
 use crate::control::{self, ControlKey, MoveTicket, Request, Response};
-use crate::deployment::{CellStorage, ensemble_servers, require_storage_namespaces, select_logkeepers, storage_namespaces, write_quorum};
+use crate::deployment::{CellStorage, ensemble_servers, live_holdings, require_storage_namespaces, select_logkeepers, storage_namespaces, write_quorum};
 use crate::keys::KeyService;
 
 const CONTROL_TIMEOUT: Duration = Duration::from_secs(35);
@@ -162,7 +162,7 @@ async fn clear_move_reservation(directory: &dyn Directory, id: &str, request: uu
 /// Balances holdings among eligible nodes in each placement pool.
 pub async fn rebalance(directory: &dyn Directory, moves: usize, control: &ControlKey) -> Result<usize> {
     let members = members(directory).await?;
-    let deployments = directory.deployments().await?;
+    let deployments = live_holdings(directory, &members, now_ms()).await?;
     let now = now_ms();
     let mut moved = 0;
     for pool in [MemberPool::General, MemberPool::Isolation] {

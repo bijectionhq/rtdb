@@ -3,7 +3,10 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 
-use rtdb_directory::{DeploymentRecord, MemberId, MemberRecord, MemberRole};
+use futures::StreamExt;
+use futures::future::BoxFuture;
+use futures::stream::FuturesUnordered;
+use rtdb_directory::{DeploymentRecord, Directory, MemberId, MemberRecord, MemberRole};
 use rtdb_format::database::proto::{DatabaseConfig, RemoteStorage, database_config};
 use rtdb_storage::{Error as StoreError, ObjectKey, ObjectStore};
 use rtdb_types::{Anomaly, Result};
@@ -11,6 +14,27 @@ use serde::{Deserialize, Serialize};
 
 /// The protobuf type name the logkeeper log factory is registered under.
 pub const LOGKEEPER_LOG_TYPE: &str = "rtdb.multi.LogkeeperLog";
+
+pub(crate) async fn live_holdings(directory: &dyn Directory, members: &BTreeMap<MemberId, MemberRecord>, now_ms: i64) -> Result<Vec<DeploymentRecord>> {
+    const CONCURRENT_HOLDER_QUERIES: usize = 8;
+    let eligible: Vec<_> = members.values().filter(|member| member.may_hold(now_ms) && member.pool != rtdb_directory::MemberPool::Compaction)
+        .map(|member| member.id.clone()).collect();
+    let mut eligible = eligible.into_iter();
+    let mut queries = FuturesUnordered::<BoxFuture<'_, Result<Vec<DeploymentRecord>>>>::new();
+    let mut deployments = BTreeMap::<String, DeploymentRecord>::new();
+    loop {
+        for member in eligible.by_ref().take(CONCURRENT_HOLDER_QUERIES - queries.len()) {
+            queries.push(Box::pin(async move { directory.deployments_held_by(&member).await }));
+        }
+        let Some(found) = queries.next().await else { break };
+        for record in found? {
+            if deployments.get(&record.id).is_none_or(|stored| stored.version < record.version) {
+                deployments.insert(record.id.clone(), record);
+            }
+        }
+    }
+    Ok(deployments.into_values().collect())
+}
 
 /// Where a cell keeps its deployments' objects.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -203,6 +227,39 @@ pub fn moving_config(record: &DeploymentRecord, servers: Vec<String>, moving: Op
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn placement_reads_live_holdings_and_follows_holder_changes() {
+        use rtdb_directory::{MemberPool, MemberState, MemoryDirectory};
+        let directory = MemoryDirectory::new();
+        let member = |id: &str, expires, pool| MemberRecord {
+            id: MemberId(id.into()), role: MemberRole::Node, address: String::new(), control_address: None,
+            availability_zone: "test".into(), engine_version: "test".into(), lease_expires_at_ms: expires,
+            state: MemberState::Eligible, pool, storage_namespaces: None, version: 1,
+        };
+        let members: BTreeMap<_, _> = [
+            member("node", 20, MemberPool::General),
+            member("isolated", 20, MemberPool::Isolation),
+            member("expired", 5, MemberPool::General),
+            member("worker", 20, MemberPool::Compaction),
+        ].into_iter().map(|member| (member.id.clone(), member)).collect();
+        let mut active = DeploymentRecord::new("active", "acme", vec![], 0);
+        active.holder = Some(MemberId("node".into()));
+        let active = directory.create_deployment(active).await.unwrap();
+        for holder in [None, Some("expired"), Some("worker")] {
+            let mut record = DeploymentRecord::new(holder.unwrap_or("parked"), "acme", vec![], 0);
+            record.holder = holder.map(|id| MemberId(id.into()));
+            directory.create_deployment(record).await.unwrap();
+        }
+        assert_eq!(live_holdings(directory.as_ref(), &members, 10).await.unwrap(), [active.clone()]);
+        let mut moved = active.clone();
+        moved.holder = Some(MemberId("isolated".into()));
+        moved.epoch += 1;
+        moved.lifecycle = rtdb_directory::Lifecycle::Quarantined;
+        let moved = directory.replace_deployment(moved, active.version).await.unwrap().applied().unwrap();
+        assert!(directory.deployments_held_by(&MemberId("node".into())).await.unwrap().is_empty());
+        assert_eq!(live_holdings(directory.as_ref(), &members, 10).await.unwrap(), [moved]);
+    }
 
     #[test]
     fn an_ensemble_prefers_distinct_zones_and_keeps_its_existing_live_members() {

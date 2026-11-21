@@ -513,17 +513,27 @@ impl NodeAgent {
 
     /// A compaction worker opens, as a compacting replica, every held deployment that ranks it first among the cell's live workers, and closes the rest.
     async fn reconcile_compaction(&self) {
-        let (Ok(deployments), Ok(members)) = (self.directory.deployments().await, self.members().await) else { return };
+        let Ok(members) = self.members().await else { return };
+        let Ok(deployments) = crate::deployment::live_holdings(self.directory.as_ref(), &members, now_ms()).await else { return };
         let now = now_ms();
         let workers: Vec<&MemberRecord> = members.values().filter(|member| member.pool == rtdb_directory::MemberPool::Compaction && member.is_live(now)).collect();
         let me = self.member();
-        let mut wanted = BTreeMap::new();
-        for record in deployments.iter().filter(|record| record.lifecycle == Lifecycle::Live && record.move_from.is_none() && effective_holder(record, &members, now).is_some()) {
+        let assigned_here = |record: &DeploymentRecord| {
+            if record.lifecycle != Lifecycle::Live || record.move_from.is_some() || effective_holder(record, &members, now).is_none() { return false; }
             let ranked = rtdb_affinity::rank(&format!("{}/compaction", record.storage_identity()), &workers, |member| member.id.as_str());
-            if ranked.first().is_some_and(|first| first.id == me) { wanted.insert(record.name.clone(), record.clone()); }
-        }
+            ranked.first().is_some_and(|first| first.id == me)
+        };
+        let mut wanted: BTreeMap<_, _> = deployments.into_iter().filter(&assigned_here).map(|record| (record.name.clone(), record)).collect();
         let current: Vec<(String, String)> = self.subscriptions.lock().iter().filter(|(_, subscription)| subscription.role == Role::Compactor).map(|(name, subscription)| (name.clone(), subscription.id.clone())).collect();
         for (name, id) in current {
+            // A handoff can become visible on the record before its new holder index entry appears.
+            if !wanted.contains_key(&name) {
+                match self.directory.deployment(&id).await {
+                    Ok(Some(record)) if assigned_here(&record) => { wanted.insert(name.clone(), record); }
+                    Ok(_) => {}
+                    Err(_) => continue,
+                }
+            }
             if wanted.get(&name).is_none_or(|record| record.id != id) || self.node.catalog().database(&name).is_err() {
                 let turn = self.turn(&name);
                 let _turn = turn.lock().await;

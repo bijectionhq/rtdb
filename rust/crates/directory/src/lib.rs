@@ -4,7 +4,7 @@
 //! Every change is a replace conditional on the record's version, so a writer that has been superseded can change nothing.
 //! It is never on the commit path: a placed holder commits and serves reads while the directory is unavailable.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -387,6 +387,7 @@ pub struct MemoryDirectory { state: Mutex<MemoryState>, changes: ChangeFeed }
 struct MemoryState {
     deployments: BTreeMap<String, DeploymentRecord>,
     names: BTreeMap<String, String>,
+    held: BTreeMap<MemberId, BTreeSet<String>>,
     members: BTreeMap<MemberId, MemberRecord>,
 }
 
@@ -398,6 +399,9 @@ impl MemoryDirectory {
         if state.names.contains_key(&record.name) { return Err(exists("Deployment name", &record.name)); }
         record.version = 1;
         state.names.insert(record.name.clone(), record.id.clone());
+        if let Some(holder) = &record.holder {
+            state.held.entry(holder.clone()).or_default().insert(record.id.clone());
+        }
         state.deployments.insert(record.id.clone(), record.clone());
         self.changes.publish(record.clone());
         Ok(record)
@@ -421,13 +425,25 @@ impl Directory for MemoryDirectory {
     }
     async fn deployments(&self) -> Result<Vec<DeploymentRecord>> { Ok(self.state.lock().deployments.values().cloned().collect()) }
     async fn deployments_held_by(&self, member: &MemberId) -> Result<Vec<DeploymentRecord>> {
-        Ok(self.state.lock().deployments.values().filter(|record| record.holder.as_ref() == Some(member)).cloned().collect())
+        let state = self.state.lock();
+        Ok(state.held.get(member).into_iter().flatten().map(|id| state.deployments[id].clone()).collect())
     }
     async fn replace_deployment(&self, mut record: DeploymentRecord, expected: Version) -> Result<Cas<DeploymentRecord>> {
         let mut state = self.state.lock();
         let Some(current) = state.deployments.get(&record.id) else { return Ok(Cas::Conflict(None)); };
         if current.version != expected { return Ok(Cas::Conflict(Some(current.clone()))); }
         if current.name != record.name { return Err(Anomaly::incorrect("rtdb.directory/rename", "A deployment's name never changes")); }
+        if current.holder != record.holder {
+            if let Some(previous) = current.holder.clone()
+                && let Some(held) = state.held.get_mut(&previous)
+            {
+                held.remove(&record.id);
+                if held.is_empty() { state.held.remove(&previous); }
+            }
+            if let Some(holder) = &record.holder {
+                state.held.entry(holder.clone()).or_default().insert(record.id.clone());
+            }
+        }
         record.version = expected + 1;
         state.deployments.insert(record.id.clone(), record.clone());
         self.changes.publish(record.clone());

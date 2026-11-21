@@ -26,7 +26,7 @@ Paths are relative to `rust/crates/` unless they start with another top-level di
 What runs on the `rtdb-multi` branch, stage by stage, and where it still departs from the spec.
 Update this section as work lands.
 
-`rtdb-multi` runs every cell process: `directory`, `cell-map`, `logkeeper`, `node`, `gateway`, `controller`, `reaper`, plus the administrative commands `create`, `list`, `status`, `drain`, `move`, `move-cell`, `read-width`, `unquarantine`, `fork`, `delete` and `audit`.
+`rtdb-multi` runs every cell process: `directory`, `cell-map`, `logkeeper`, `node`, `gateway`, `controller`, `reaper`, plus the administrative commands `create`, `list`, `status`, `drain`, `move`, `move-cell`, `read-width`, `unquarantine`, `fork`, `delete`, `deletion-key`, `verify-deletion` and `audit`.
 `crates/multi/tests/cell.rs` drives an in-process cell (or two) through tokio-postgres; `tests/chaos.rs` runs a writer against a seeded sequence of faults and audits the history afterwards; `tests/footprint.rs` measures an idle deployment.
 
 | Stage | Built | Departures and gaps |
@@ -43,7 +43,7 @@ Update this section as work lands.
 | 9 | the gateway reads pgwire frames, survives a planned move or a holder's death while the session is idle, replays the startup and prepared statements, and resends a command a former holder refused as not held; once the first holder has authenticated the client, each reconnection carries a capability the gateway signs with the cell's secret, which a node accepts in place of the password for that deployment alone | the first connection's authentication is still the node's, relayed by the gateway |
 | 10 | read replicas fed by the log for read-only sessions within a deployment's read width; opt-in linearizable reads confirmed with the logkeepers before each query ; a snapshot session (`rtdb.read=snapshot`) reads the deployment as of its checkpoint on any node, the holder last, opened from object storage with frozen logs and no logkeeper, and closed before the reaper's grace runs out, serving any basis at or below the checkpoint ; a deployment whose persisted tries outgrow a node's disk cache (by default; `AgentOptions::fragments` sets the threshold and depth, and no command-line flag does yet) splits each whole-table scan into 16 trie-prefix fragments, each read at the coordinator's basis by the node that ranks first for `{storage identity}/{table}/{prefix}` among the nodes that may take placements, which opens a log-fed replica for it if it has none, and answered over the control protocol as Arrow IPC; a fragment whose reader fails or is not at the basis is read by the coordinator itself | scan fragments are split by the scan on the coordinating node, not by a cell-wide planner, and the size test is the deployment's persisted trie bytes against the node's disk-cache size rather than `PerMemberCacheShare`; a fragment carries the projection, the evaluated temporal bounds and the predicates any node evaluates alike, but not those on parameters, outer rows, the clock or chance, which the coordinator alone applies, and comes back whole in one response rather than streamed, a slice too large for one response being read by the coordinator instead; a reader at or past the coordinator's basis serves a fragment as of the basis, except that what was erased since is gone; `_id` lookups and multi-partition databases are never split |
 | 11 | the controller reaps expired members, confirms silent nodes dead by probing, and rebalances; planned moves; quarantine to the isolation pool; `status` as the autoscaling signal | autoscaling acts on the signal outside RTDB |
-| 12 | per-deployment AES-256-GCM keys for objects (above the disk cache) and log payloads; forks by reference into the parent's lineage on fresh logs: a fork's `~base` manifest names where each object it shares physically lives, and whatever erases a shared object (the reaper, the parent's deletion) copies it into the forks still referencing it first; a cell move materializes every reference; deletion that seals, trims, verifies the current object inventory is empty, then removes the key; a fork can also be taken at a past block younger than the reaper's grace, referencing only what existed when that block was written | a fork is of the current state, of a past block, or of a time at or after the checkpoint, whose tail up to it is copied into the fork's stream, rather than of any basis with its tail in a pack; a time before the checkpoint must be forked as a past block, and a tail holding an oversized transaction is refused; a forked tail's transactions take new ids in the fork's log epoch; a referenced object is copied out before its owner erases it rather than kept in place, and the reaper and forks use a grace interval, and enforcing concurrent reference publication requires the spec's lineage fence |
+| 12 | per-deployment AES-256-GCM keys for objects (above the disk cache) and log payloads; forks by reference into the parent's lineage on fresh logs: a fork's `~base` manifest names where each object it shares physically lives, and whatever erases a shared object (the reaper, the parent's deletion) copies it into the forks still referencing it first; a cell move materializes every reference; deletion durably drops the stream from addressed replicas, verifies the current inventory, destroys the local key and stores a signed receipt bound to the deployment’s namespaces; a fork can also be taken at a past block younger than the reaper's grace, referencing only what existed when that block was written | a fork is of the current state, of a past block, or of a time at or after the checkpoint, whose tail up to it is copied into the fork's stream, rather than of any basis with its tail in a pack; a time before the checkpoint must be forked as a past block, and a tail holding an oversized transaction is refused; a forked tail's transactions take new ids in the fork's log epoch; a referenced object is copied out before its owner erases it rather than kept in place, and the reaper and forks use a grace interval, and enforcing concurrent reference publication requires the spec's lineage fence |
 | 13 | persistent cell placement with DynamoDB and a local in-memory cell map, gateway forwarding, creation in the least occupied cell, restartable cell moves that carry the unflushed tail across; the old cell's reaper erases what a move left there once the grace has passed since the move | the copy runs after the source is fenced, so the stall includes copy time; failed copy generations still need orphan collection; supply the old cell's key directory via `reaper --keys` to destroy that cell's copy of the key |
 | 14 | the chaos test and the history audit; `crates/simulation` runs one deployment's single-writer protocol from a seed (members claiming through the directory, three logkeeper state machines, a modelled writer, crashes, partitions, broken connections) and checks the epoch and log invariants after every step; it also runs a cell's storage lifecycle from a seed (deployments writing through their real store stacks, releasing, forking now and at a past block, reaper passes, deletions and cell moves, over in-memory buckets on a simulated clock, with injected pack read failures and move cleanup), checking that each deployment reads exactly what it wrote or inherited and has not released and nothing its parent wrote after the fork point, and gateway sessions (the real session over loopback TCP to stub backends that die during startup, before or after executing, between replies, or after preparing a named statement), checking that every command runs at most once, exactly once if the client was told it succeeded, and that the client sees only its own command's replies | three simulations of parts of a cell rather than one of a whole cell: the storage run has no nodes, directory or logkeepers and its admin sequences are modelled around the real calls, the session backends are stubs, with simple commands and extended-protocol prepared reads; combined directory, provider and runtime failures remain to be simulated |
 
@@ -330,6 +330,10 @@ RTDB_LOG_BENCH_STREAMS=64 RTDB_LOG_BENCH_APPENDS=1000 \
 ```
 
 The cross-availability-zone performance gate remains to be measured with one server per zone.
+After adding durable stream drops, an interleaved rerun compared three trials of the earlier and current binaries at each concurrency on the same host.
+The 64-stream median commit latency stayed between 1.007 and 1.030 ms across both builds, but current throughput varied from 8,587 to 40,412 commits/s against 39,622 to 53,284 earlier.
+At 256 streams the current range was 48,842 to 61,942 commits/s against 48,271 to 65,516 earlier.
+The source of the intermittent long tail and lower aggregate throughput on the 64-stream runs remains unverified.
 
 **Specs.**
 `rtdb-multi.allium`'s `LogService` contract, corrected by what the implementation teaches.
@@ -588,8 +592,32 @@ RTDB_PARKED_BENCH_DEPLOYMENTS=1000000 \
   parked_directory_density -- --ignored --nocapture
 ```
 
-The 516-byte JSON measurement exceeds the 300-byte record budget by itself.
-The staging run still needs the production directory, ten million records and an active Zipf workload.
+**DynamoDB parked item size**
+
+For an unheld deployment with three UUID logkeeper IDs, the prepared DynamoDB item uses the following estimated storage from attribute names and values.
+Both forms round-trip the same directory record.
+
+| Representative deployment | JSON item | Packed item |
+| --- | ---: | ---: |
+| Pristine root | 605 B | 146 B |
+| Previously active root with checkpoint and storage binding | 855 B | 218 B |
+
+The estimates exclude DynamoDB's 100-byte per-item storage overhead and the separate deployment-name item.
+Numeric attributes use DynamoDB's approximate size formula. [DynamoDB item sizes and formats](https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/CapacityUnitCalculations.html)
+
+Upgraded readers and Streams followers accept both formats with unchanged lookup keys and CAS conditions.
+Upgrade every direct DynamoDB client, including admin and reaper processes and Streams followers, before enabling packed writes.
+Use `dynamodb+packed:PREFIX` for writers to store eligible unheld deployments in the packed format.
+Writes convert eligible rows as they are created or updated.
+Switching writers back to `dynamodb:PREFIX` stops new packed writes.
+Existing packed rows require a rewrite to JSON before downgrading any reader.
+Held deployments, operation journals and records with non-UUID logkeeper IDs continue to use JSON.
+DynamoDB Local verifies mixed layouts, the holder index, conditional updates and Streams delivery.
+Rebalancing and compaction placement query live members' holdings with bounded concurrency.
+The DynamoDB holder index omits unheld rows and verifies each hit by a strongly consistent read.
+An existing compaction assignment also checks the deployment record when its holder index entry is missing during a handoff.
+The in-memory directory updates its holder index in the same critical section as each deployment record.
+The production staging run still needs ten million records and an active Zipf workload.
 
 **Local durable pgwire measurement**
 

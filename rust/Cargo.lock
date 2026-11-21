@@ -3948,6 +3948,7 @@ dependencies = [
  "aws-sdk-dynamodbstreams",
  "aws-types",
  "parking_lot",
+ "prost",
  "rtdb-types",
  "serde",
  "serde_json",

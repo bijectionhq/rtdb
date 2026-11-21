@@ -48,6 +48,7 @@ pub async fn run(directory: &dyn Directory) {
     deleting.holder = None;
     deleting.epoch += 1;
     let deleting = directory.replace_deployment(deleting, applied.version).await.unwrap().applied().unwrap();
+    assert!(directory.deployments_held_by(&holder).await.unwrap().is_empty());
     let mut refused = DeploymentRecord::new(format!("{name}-refused"), &deleting.org, vec![], 0);
     refused.parent = Some(deleting.id.clone());
     refused.lineage = deleting.lineage.clone();

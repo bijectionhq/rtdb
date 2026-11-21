@@ -14,7 +14,7 @@ use aws_sdk_dynamodbstreams::Client as StreamsClient;
 use aws_sdk_dynamodbstreams::types::{AttributeValue, ShardIteratorType};
 use rtdb_types::{Anomaly, Result};
 
-use super::{decode_deployment, sdk_anomaly, RECORD, VERSION};
+use super::{EPOCH, ID, NAME, RECORD, VERSION, decode_deployment, parked, sdk_anomaly};
 use crate::{ChangeFeed, DeploymentRecord};
 
 /// How long an idle follower waits before reading its shards again; a shard allows five reads a second.
@@ -204,8 +204,15 @@ struct ListedShard { id: String, parent: Option<String>, open: bool }
 
 /// The deployment in a stream image, with the item's `version` attribute as its version; `None` for an image that is not a deployment item.
 fn decode_image(image: &HashMap<String, AttributeValue>) -> Option<DeploymentRecord> {
-    let (Some(AttributeValue::S(json)), Some(AttributeValue::N(version))) = (image.get(RECORD), image.get(VERSION)) else { return None };
-    let mut record: DeploymentRecord = serde_json::from_str(json).ok()?;
-    record.version = version.parse().ok()?;
-    Some(record)
+    let version = image.get(VERSION)?.as_n().ok()?.parse().ok()?;
+    match image.get(RECORD)? {
+        AttributeValue::S(json) => {
+            let mut record: DeploymentRecord = serde_json::from_str(json).ok()?;
+            record.version = version;
+            Some(record)
+        }
+        AttributeValue::B(bytes) => parked::decode(bytes.as_ref(), image.get(ID)?.as_s().ok()?, image.get(NAME)?.as_s().ok()?,
+            image.get(EPOCH)?.as_n().ok()?.parse().ok()?, version).ok(),
+        _ => None,
+    }
 }
