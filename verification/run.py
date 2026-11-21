@@ -798,6 +798,38 @@ def verify_table_slugs(args, scratch):
     verify_lean_model(args, scratch, path, "table-slugs", controls, 6)
 
 
+def verify_private_replay(args, scratch):
+    path = Path("verification/lean/PrivateReplay.lean")
+    controls = {
+        "inclusive-cutoff": (
+            "decide (sample < cutoff)",
+            "decide (sample ≤ cutoff)",
+            ["admits_overlap_every_retained_marker", "exact_cutoff_refuses"],
+        ),
+        "shorten-marker": (
+            "max (sample + 3600000000) cutoff",
+            "sample + 3600000000",
+            ["installed_marker_covers_cutoff"],
+        ),
+        "point-lookup": (
+            "decide (sample < marker.expiresAt)",
+            "decide (marker.startsAt ≤ sample ∧ sample < marker.expiresAt)",
+            ["admits_overlap_every_retained_marker", "overlap_realizes_valid_time_range"],
+        ),
+        "duplicate-side-effect": (
+            "if overlaps marker attempt.submittedAt then\n          (state, .committed marker.original)",
+            "if overlaps marker attempt.submittedAt then\n          ({ state with effects := state.effects + 1 }, .committed marker.original)",
+            ["duplicates_preserve_the_original_for_any_admitted_sample"],
+        ),
+        "install-aborted-marker": (
+            "else (state, .aborted)",
+            "else ({ state with marker := some ⟨attempt.submittedAt, markerEnd cutoff attempt.submittedAt, attempt.outcome⟩ }, .aborted)",
+            ["step_preserves_atomic_effect"],
+        ),
+    }
+    verify_lean_model(args, scratch, path, "private-replay", controls, 8)
+
+
 def verify_explicit_session(args, scratch):
     path = Path("verification/lean/ExplicitSession.lean")
     controls = {
@@ -1047,6 +1079,7 @@ def verify_lean(args, scratch):
             verify_outer_join(args, scratch)
             verify_table_slugs(args, scratch)
             verify_explicit_session(args, scratch)
+            verify_private_replay(args, scratch)
             verify_logkeeper(args, scratch)
             verify_reader_retention(args, scratch)
             verify_generation_retention(args, scratch)
