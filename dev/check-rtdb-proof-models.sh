@@ -27,10 +27,14 @@ done
 while IFS='|' read -r module config expected_status expected_message; do
     log="$run/$config.log"
     mkdir -p "$run/$config/tmp"
+    cp "dev/tla/$config.cfg" "dev/tla/$module.tla" "$run/$config/"
     status=0
-    java "-Djava.io.tmpdir=$run/$config/tmp" -XX:+UseParallelGC -Xmx1300m \
-        -jar "$TLA2TOOLS_JAR" -workers 2 -metadir "$run/$config/states" \
-        -config "dev/tla/$config.cfg" "dev/tla/$module.tla" > "$log" 2>&1 || status=$?
+    (
+        cd "$run/$config"
+        java "-Djava.io.tmpdir=$run/$config/tmp" -XX:+UseParallelGC -Xmx1300m \
+            -jar "$TLA2TOOLS_JAR" -workers 2 -metadir states \
+            -config "$config.cfg" "$module.tla"
+    ) > "$log" 2>&1 || status=$?
     if [[ "$status" != "$expected_status" ]] || ! rg -Fq "$expected_message" "$log"; then
         cat "$log" >&2
         exit 1
