@@ -1926,6 +1926,19 @@ async fn index_flush(node: &Node, database: &Database) {
 }
 
 #[tokio::test]
+async fn ordered_index_declaration_if_not_exists_preserves_the_definition() {
+    let (node, driver) = running(options(), services()).await;
+    let mut session = node.session("xtdb", Arc::new(Authority)).unwrap();
+    index_sql(&mut session, "CREATE INDEX IF NOT EXISTS orders_key ON orders (priority, _id)").await;
+    let query = "SELECT columns, version FROM xt.ordered_indexes WHERE _id = 'orders_key'";
+    let original = rows(session.query_sql(query, vec![]).await.unwrap()).await;
+    assert_eq!(original.len(), 1);
+    index_sql(&mut session, "CREATE INDEX IF NOT EXISTS orders_key ON orders (_id)").await;
+    assert_eq!(rows(session.query_sql(query, vec![]).await.unwrap()).await, original);
+    stop(&node, driver).await;
+}
+
+#[tokio::test]
 async fn ordered_index_publishes_its_own_roots_and_seeks_both_directions_at_a_basis() {
     let observer = Arc::new(OrderedIndexReads::default());
     let mut services = services();

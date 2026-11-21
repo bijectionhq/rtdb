@@ -245,7 +245,7 @@ pub(crate) enum Syntax {
     GrantRole { user: Identifier, role: Identifier, revoke: bool },
     CreateSearchIndex { name: Identifier, table: ast::ObjectName, columns: Vec<Identifier>, history: bool },
     DropSearchIndex { name: Identifier },
-    CreateOrderedIndex { name: Identifier, table: ast::ObjectName, columns: Vec<Identifier> },
+    CreateOrderedIndex { name: Identifier, table: ast::ObjectName, columns: Vec<Identifier>, if_not_exists: bool },
     DropOrderedIndex { name: Identifier },
     Set { name: Vec<Identifier>, value: ast::Expr, local: bool },
     Show(Vec<Identifier>),
@@ -436,6 +436,11 @@ pub(super) fn parse_statement_syntax<'input>(
         let search = word(tokens.get(1), "SEARCH");
         let first = if search { 3 } else { 2 };
         let mut parser = Parser::new(&dialect).with_tokens_with_locations(tokens[first..].to_vec());
+        let if_not_exists = !search && word(tokens.get(first), "IF")
+            && word(tokens.get(first + 1), "NOT") && word(tokens.get(first + 2), "EXISTS");
+        if if_not_exists {
+            for _ in 0..3 { parser.next_token(); }
+        }
         let name = identifier_token(&parser.next_token())?;
         if !word(Some(&parser.next_token()), "ON") { return Err(sql_error("Expected ON after the index name", sql, slice[0].span)); }
         let table = parser.parse_object_name(false).map_err(|error| parser_error(error, sql, slice[0].span))?;
@@ -459,7 +464,7 @@ pub(super) fn parse_statement_syntax<'input>(
         }
         if parser.peek_token().token != Token::EOF { return Err(sql_error("Unexpected input after index definition", sql, parser.peek_token().span)); }
         if search { Syntax::CreateSearchIndex { name, table, columns, history } }
-        else { Syntax::CreateOrderedIndex { name, table, columns } }
+        else { Syntax::CreateOrderedIndex { name, table, columns, if_not_exists } }
     } else if word(tokens.first(), "DROP")
         && (word(tokens.get(1), "INDEX") || (word(tokens.get(1), "SEARCH") && word(tokens.get(2), "INDEX"))) {
         let search = word(tokens.get(1), "SEARCH");

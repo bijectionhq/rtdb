@@ -20,7 +20,7 @@ pub enum Dml {
     /// `history` is false when the index covers only the current side (fts.allium: SearchIndexDefinition).
     CreateSearchIndex { name: String, table: QualifiedTable, columns: Vec<String>, history: bool },
     DropSearchIndex { name: String },
-    CreateOrderedIndex { name: String, table: QualifiedTable, columns: Vec<String> },
+    CreateOrderedIndex { name: String, table: QualifiedTable, columns: Vec<String>, if_not_exists: bool },
     DropOrderedIndex { name: String },
 }
 

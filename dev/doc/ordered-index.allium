@@ -17,6 +17,7 @@ entity Checkpoint {
 
 -- Invariants
 --
+-- Repeating a declaration with IF NOT EXISTS preserves the definition and its generation.
 -- A checkpoint covers the table catalog's durable event count at its frontier.
 -- The checkpoint becomes usable after every referenced page is durable.
 -- A root contains each winning indexed row over disjoint valid-time spans at its system-time point.

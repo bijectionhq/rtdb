@@ -357,7 +357,7 @@ impl<'a> OpenTransaction<'a> {
                 check_search_index_name(&name)?;
                 return self.buffer.delete(TableRef::new("xt", "search_indexes"), &rtdb_types::EntityId::String(name), interval(self.tx_key().system_time, Timestamp::MAX)?);
             }
-            Mutation::CreateOrderedIndex { name, table, columns } => {
+            Mutation::CreateOrderedIndex { name, table, columns, if_not_exists } => {
                 if table.database != self.context.database { return Err(Anomaly::incorrect("xtdb/table-not-found", "An ordered index must cover a table in this database")); }
                 check_table(&table.table)?;
                 check_ordered_index_name(&name)?;
@@ -367,6 +367,7 @@ impl<'a> OpenTransaction<'a> {
                     return Err(Anomaly::incorrect("xtdb/invalid-index-columns", "An ordered index requires distinct stored columns"));
                 }
                 if self.ordered_index_exists(&name).await? {
+                    if if_not_exists { return Ok(()); }
                     return Err(Anomaly::incorrect("xtdb/index-already-exists", format!("Index {name} already exists")));
                 }
                 let document = StructFields::from([

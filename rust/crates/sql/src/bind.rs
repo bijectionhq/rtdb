@@ -309,11 +309,11 @@ impl Context<'_> {
                 Ok(Statement::Dml(Dml::CreateSearchIndex { name: name.normalized(), table: self.target(table)?, columns, history: *history }))
             }
             Syntax::DropSearchIndex { name } => Ok(Statement::Dml(Dml::DropSearchIndex { name: name.normalized() })),
-            Syntax::CreateOrderedIndex { name, table, columns } => {
+            Syntax::CreateOrderedIndex { name, table, columns, if_not_exists } => {
                 let columns: Vec<_> = columns.iter().map(Identifier::normalized).collect();
                 if columns.iter().collect::<BTreeSet<_>>().len() != columns.len() { return Err(error("CREATE INDEX repeats a column")); }
                 if columns.iter().any(|name| name.starts_with('_') && name != "_id") { return Err(error("CREATE INDEX cannot index internal columns")); }
-                Ok(Statement::Dml(Dml::CreateOrderedIndex { name: name.normalized(), table: self.target(table)?, columns }))
+                Ok(Statement::Dml(Dml::CreateOrderedIndex { name: name.normalized(), table: self.target(table)?, columns, if_not_exists: *if_not_exists }))
             }
             Syntax::DropOrderedIndex { name } => Ok(Statement::Dml(Dml::DropOrderedIndex { name: name.normalized() })),
             Syntax::Records { patch, table, records } => {

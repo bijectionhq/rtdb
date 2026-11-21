@@ -14,7 +14,7 @@ pub enum Mutation {
     GrantRole { user: String, role: String, revoke: bool },
     CreateSearchIndex { name: String, table: QualifiedTable, columns: Vec<String>, history: bool },
     DropSearchIndex { name: String },
-    CreateOrderedIndex { name: String, table: QualifiedTable, columns: Vec<String> },
+    CreateOrderedIndex { name: String, table: QualifiedTable, columns: Vec<String>, if_not_exists: bool },
     DropOrderedIndex { name: String },
 }
 
@@ -139,7 +139,7 @@ fn lower(dml: Dml, catalog: &dyn Catalog) -> Result<Mutation> {
         Dml::GrantRole { user, role, revoke } => Mutation::GrantRole { user, role, revoke },
         Dml::CreateSearchIndex { name, table, columns, history } => Mutation::CreateSearchIndex { name, table, columns, history },
         Dml::DropSearchIndex { name } => Mutation::DropSearchIndex { name },
-        Dml::CreateOrderedIndex { name, table, columns } => Mutation::CreateOrderedIndex { name, table, columns },
+        Dml::CreateOrderedIndex { name, table, columns, if_not_exists } => Mutation::CreateOrderedIndex { name, table, columns, if_not_exists },
         Dml::DropOrderedIndex { name } => Mutation::DropOrderedIndex { name },
     })
 }
