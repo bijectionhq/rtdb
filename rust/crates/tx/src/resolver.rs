@@ -149,7 +149,8 @@ impl TxResolver {
         context.check_cancelled()?;
         let base = self.resolving_snapshot(durable)?;
         let default_time = self.smooth(log_time)?;
-        let invalid_time = request.options.system_time.zip(self.resolved_head).filter(|(time, previous)| *time <= previous.system_time);
+        let invalid_time = request.options.system_time.zip(self.resolved_head)
+            .filter(|(time, previous)| !crate::system_time::advances(Some(previous.system_time.0), time.0));
         let key = TransactionKey { tx_id: TxId(position.0), system_time: if invalid_time.is_some() { default_time } else { request.options.system_time.unwrap_or(default_time) } };
         let mut tx = OpenTransaction::new(base.clone(), key, &request.options, context)?;
         tx.trace_parent = span.as_ref().map(|span| span.context());
@@ -213,7 +214,7 @@ impl TxResolver {
 
     pub fn resolve_db_op(&mut self, durable: Snapshot, position: SourcePosition, log_time: Timestamp, operation: DbOp, verdict: Result<()>, context: &ResolveContext) -> Result<Arc<ResolvedTx>> {
         let base = self.resolving_snapshot(durable)?;
-        let key = TransactionKey { tx_id: TxId(position.0), system_time: log_time };
+        let key = TransactionKey { tx_id: TxId(position.0), system_time: self.smooth(log_time)? };
         let (result, operation) = match verdict {
             Ok(()) => (TransactionResult::Committed { tx_key: key }, Some(operation)),
             Err(error) if error.is_caller_error() => (TransactionResult::Aborted { tx_key: key, error: Some(crate::RetainedAnomaly::new(error, &context.memory)?) }, None),
@@ -227,10 +228,19 @@ impl TxResolver {
     }
 
     fn smooth(&self, candidate: Timestamp) -> Result<Timestamp> {
-        match self.resolved_head { Some(previous) if candidate <= previous.system_time => previous.system_time.next(), _ => Ok(candidate) }
+        crate::system_time::automatic_time(self.previous_system_time(), candidate.0)
+            .map(Timestamp)
+            .ok_or_else(|| Anomaly::incorrect("xtdb/time-overflow", "Timestamp has no following chronon"))
     }
+
+    fn previous_system_time(&self) -> Option<i64> { self.resolved_head.map(|key| key.system_time.0) }
+
     fn stage(&mut self, writes: StagedWrite, result: TransactionResult, position: SourcePosition, token: Option<Vec<u8>>, db_op: Option<DbOp>, context: &ResolveContext) -> Result<Arc<ResolvedTx>> {
         if position < self.source_position { return Err(Anomaly::fault("rtdb.tx/source-watermark", "Resolve-side source watermark moved backwards")); }
+        let key = result.tx_key();
+        if writes.tx_key() != key || !crate::system_time::advances(self.previous_system_time(), key.system_time.0) {
+            return Err(Anomaly::fault("rtdb.tx/system-time", "Resolved transaction does not advance its predecessor's system time"));
+        }
         let bound = 4096usize.checked_add(token.as_ref().map_or(0, Vec::capacity)).and_then(|bytes| bytes.checked_add(db_op_bytes(db_op.as_ref()).ok()?)).and_then(|bytes| bytes.checked_add(result.error().map(crate::values::anomaly_bytes).transpose().ok()?.unwrap_or(0))).ok_or_else(overflow)?;
         let reservation = context.memory.reserve(bound)?;
         let next_token_charge = token.as_ref().map(|token| self.memory.reserve(token.capacity().checked_add(512).ok_or_else(overflow)?)).transpose()?;
@@ -242,7 +252,7 @@ impl TxResolver {
         }
         let resolved = Arc::new(ResolvedTx { writes: Arc::new(writes), result, source_position: position, external_token: token, db_op, _reservation: reservation });
         self.queue.push_back(Arc::clone(&resolved));
-        self.resolved_head = Some(resolved.result.tx_key());
+        self.resolved_head = Some(key);
         self.source_position = position;
         if let Some(token) = &resolved.external_token {
             self.external_token = Some(token.clone());
