@@ -314,37 +314,75 @@ fn document_leg(lists: Vec<SourceDocuments<'_>>, arrays: &mut BatchBuilder, memo
         SourceDocuments::Arrow(documents) => Some(documents.array()),
         SourceDocuments::Rows(_) => None,
     }).collect::<Option<Vec<_>>>();
-    if let Some(pages) = arrow && let Some(first) = pages.first()
-        && pages.iter().all(|page| page.fields().len() == first.fields().len()
-            && page.fields().iter().zip(first.fields()).all(|(left, right)| left.name() == right.name() && left.data_type() == right.data_type())) {
-        let mut offsets = Vec::with_capacity(pages.len() + 1);
-        offsets.push(0i32);
-        for page in &pages {
-            offsets.push(offsets.last().unwrap().checked_add(i32::try_from(page.len()).map_err(|_| overflow())?).ok_or_else(overflow)?);
-        }
-        let structs: ArrayRef = if pages.len() == 1 {
-            let bound = first.get_array_memory_size().checked_add(4096).ok_or_else(overflow)?;
-            arrays.column(bound, || Ok(Arc::new((*first).clone())))?
-        } else {
-            let mut fields = Vec::new();
-            let mut columns = Vec::new();
-            for (index, field) in first.fields().iter().enumerate() {
-                let inputs = pages.iter().map(|page| page.column(index).as_ref()).collect::<Vec<_>>();
-                let bound = inputs.iter().try_fold(4096usize, |bytes, column| {
-                    column.get_array_memory_size().checked_mul(4).and_then(|size| bytes.checked_add(size)).ok_or_else(overflow)
-                })?;
-                fields.push(field.as_ref().clone().with_nullable(pages.iter().any(|page| page.fields()[index].is_nullable())));
-                columns.push(arrays.column(bound, || arrow_select::concat::concat(&inputs).map_err(|error| invalid(error.to_string())))?);
-            }
-            rtdb_columnar::build_struct_array(fields.into(), &columns, *offsets.last().unwrap() as usize, None)?
-        };
-        return document_list(structs, offsets);
+    if let Some(pages) = arrow && let Some(leg) = arrow_document_leg(&pages, arrays)? {
+        return Ok(leg);
     }
     let rows = lists.iter().map(|list| match list {
         SourceDocuments::Rows(documents) => Ok((*documents).clone()),
         SourceDocuments::Arrow(documents) => documents.to_rows(false, memory),
     }).collect::<Result<Vec<_>>>()?;
     row_document_leg(rows.iter().collect(), arrays)
+}
+
+fn arrow_document_leg(pages: &[&StructArray], arrays: &mut BatchBuilder) -> Result<Option<ArrayRef>> {
+    let Some(first) = pages.first() else { return Ok(None); };
+    let mut offsets = vec![0i32];
+    for page in pages {
+        let length = i32::try_from(page.len()).map_err(|_| overflow())?;
+        offsets.push(offsets.last().unwrap().checked_add(length).ok_or_else(overflow)?);
+    }
+    if pages.len() == 1 {
+        let bound = first.get_array_memory_size().checked_add(4096).ok_or_else(overflow)?;
+        let structs = arrays.column(bound, || Ok(Arc::new((*first).clone())))?;
+        return document_list(structs, offsets).map(Some);
+    }
+
+    let mut layout = StructFields::<Field>::new();
+    for page in pages {
+        for field in page.fields() {
+            let Some(previous) = layout.get(field.name()) else {
+                layout.insert(field.name().clone(), field.as_ref().clone());
+                continue;
+            };
+            let merged = if previous.data_type() == field.data_type() && previous.metadata() == field.metadata() {
+                previous.clone().with_nullable(previous.is_nullable() || field.is_nullable())
+            } else if previous.data_type() == &DataType::Null && previous.is_nullable() {
+                field.as_ref().clone().with_nullable(true)
+            } else if field.data_type() == &DataType::Null && field.is_nullable() {
+                previous.clone().with_nullable(true)
+            } else {
+                return Ok(None);
+            };
+            layout.insert(field.name().clone(), merged);
+        }
+    }
+    let mut fields = Vec::with_capacity(layout.len());
+    let mut columns = Vec::with_capacity(layout.len());
+    for (name, field) in layout {
+        let inputs: Vec<_> = pages.iter().map(|page| {
+            page.column_by_name(&name).filter(|column| column.data_type() == field.data_type())
+        }).collect();
+        let nullable = field.is_nullable() || inputs.iter().any(Option::is_none);
+        let field = field.with_nullable(nullable);
+        let logical = from_field(&field)?;
+        let bound = pages.iter().zip(&inputs).try_fold(4096usize, |bytes, (page, column)| {
+            let size = match column {
+                Some(column) => column.get_array_memory_size(),
+                None => estimate_builder_bytes_refs(&logical, std::iter::repeat_n(&Value::Null, page.len()))?,
+            };
+            size.checked_mul(4).and_then(|size| bytes.checked_add(size)).ok_or_else(overflow)
+        })?;
+        columns.push(arrays.column(bound, || {
+            let inputs = pages.iter().zip(inputs).map(|(page, column)| {
+                column.cloned().unwrap_or_else(|| arrow_array::new_null_array(field.data_type(), page.len()))
+            }).collect::<Vec<_>>();
+            let inputs = inputs.iter().map(|array| array.as_ref()).collect::<Vec<_>>();
+            arrow_select::concat::concat(&inputs).map_err(|error| invalid(error.to_string()))
+        })?);
+        fields.push(Arc::new(field));
+    }
+    let structs = rtdb_columnar::build_struct_array(fields.into(), &columns, *offsets.last().unwrap() as usize, None)?;
+    document_list(structs, offsets).map(Some)
 }
 
 fn row_document_leg(lists: Vec<&Documents>, arrays: &mut BatchBuilder) -> Result<ArrayRef> {
@@ -728,6 +766,33 @@ mod tests {
     }
 
     #[test]
+    fn arrow_document_batches_combine_missing_columns_in_first_seen_order() {
+        let memory = budget();
+        let first = StructArray::try_new(
+            vec![Field::new("a", DataType::Utf8, false), Field::new("_id", DataType::Int64, false)].into(),
+            vec![Arc::new(arrow_array::StringArray::from(vec!["left"])), Arc::new(arrow_array::Int64Array::from(vec![1]))],
+            None,
+        ).unwrap();
+        let second = StructArray::try_new(
+            vec![Field::new("_id", DataType::Int64, false), Field::new("b", DataType::Boolean, false)].into(),
+            vec![Arc::new(arrow_array::Int64Array::from(vec![2])), Arc::new(arrow_array::BooleanArray::from(vec![true]))],
+            None,
+        ).unwrap();
+        let mut arrays = BatchBuilder::new(4096, &memory).unwrap();
+
+        let result = arrow_document_leg(&[&first, &second], &mut arrays).unwrap().unwrap();
+
+        let lists = result.as_any().downcast_ref::<ListArray>().unwrap();
+        assert_eq!(lists.value_offsets(), &[0, 1, 2]);
+        let values = lists.values().as_any().downcast_ref::<StructArray>().unwrap();
+        assert_eq!(values.fields().iter().map(|field| field.name().as_str()).collect::<Vec<_>>(), ["a", "_id", "b"]);
+        assert_eq!(read_value(&values.fields()[0], values.column(0).as_ref(), 0).unwrap(), Value::Utf8("left".into()));
+        assert!(values.column(0).is_null(1));
+        assert!(values.column(2).is_null(0));
+        assert_eq!(read_value(&values.fields()[2], values.column(2).as_ref(), 1).unwrap(), Value::Bool(true));
+    }
+
+    #[test]
     fn a_nested_struct_key_first_written_after_its_struct_was_undefined_is_nullable() {
         let memory = budget();
         let put = |row: StructFields<Value>| TxOp::PutDocs { table: TableRef::new("public", "docs"), documents: Documents::new(vec![row], &memory).unwrap(), valid_from: None, valid_to: None };
@@ -737,7 +802,8 @@ mod tests {
         ])))]);
         let source = SourceTransaction::new(vec![put(StructFields::from([("_id".to_owned(), Value::I64(1))])), put(quux)], SubmitOptions::default(), &memory).unwrap();
         let decoded = roundtrip(&source);
-        let Operation::PutIids { documents, .. } = &decoded.operations[0] else { panic!("put"); };
+        let Operation::PutArrowIids { documents, .. } = &decoded.operations[0] else { panic!("put"); };
+        let documents = documents.to_rows(true, &memory).unwrap();
         let utf8 = LogicalType::Scalar(ScalarType::Utf8);
         let expected = LogicalType::Struct(StructFields::from([
             ("a".to_owned(), LogicalType::Scalar(ScalarType::Bool)),

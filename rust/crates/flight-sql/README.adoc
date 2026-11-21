@@ -7,6 +7,8 @@ Schema descriptions retain the supplied physical parameter fields, while query e
 Retained parameter IPC remains lossless.
 Prepared updates retain uploaded Arrow parameter batches through transaction buffering and encoding when the batch layouts agree.
 Bulk ingestion retains compatible Arrow document columns during source-log encoding, replay and transaction staging.
+This includes lists and structs with compatible child fields.
+Arrow batches targeting the same table can share a source-log document layout when their common columns agree and other columns are absent.
 The typed document writer handles layouts that require cell conversion.
 
 == Composition and ownership

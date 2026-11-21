@@ -2,7 +2,7 @@ use rtdb_types::StructFields;
 use std::collections::BTreeSet;
 use std::{borrow::Cow, ops::Deref, sync::Arc};
 
-use arrow_array::{Array, ArrayRef, ArrowPrimitiveType, PrimitiveArray, RecordBatch, StructArray, cast::AsArray, types::{Int8Type, Int16Type, Int32Type, Int64Type, UInt8Type, UInt16Type, UInt32Type, UInt64Type}};
+use arrow_array::{Array, ArrayRef, ArrowPrimitiveType, ListArray, PrimitiveArray, RecordBatch, StructArray, cast::AsArray, types::{Int8Type, Int16Type, Int32Type, Int64Type, UInt8Type, UInt16Type, UInt32Type, UInt64Type}};
 use arrow_schema::{DataType, Fields, Schema};
 use rtdb_columnar::{ColumnReader, MemoryBudget, MemoryReservation, OwnedBatch, from_field};
 use rtdb_types::{Anomaly, EntityId, LogicalType, Result, TableRef, Timestamp, TransactionKey, TxId, Value};
@@ -163,21 +163,17 @@ impl ArrowDocuments {
         let _schema = memory.reserve(rtdb_format::ipc::schema_translation_bound(&schema)?)?;
         let names = schema.fields().iter().map(|field| field.name()).collect::<BTreeSet<_>>();
         if names.len() != schema.fields().len() { return Ok(None); }
-        let (fields, columns): (Vec<_>, Vec<_>) = schema.fields().iter().zip(batch.columns()).map(|(field, array)| {
+        let columns = schema.fields().iter().zip(batch.columns()).map(|(field, array)| {
             let nulls = array.logical_null_count();
             let array = if nulls == array.len() {
                 Arc::new(arrow_array::NullArray::new(array.len())) as ArrayRef
             } else {
-                match array.data_type() {
-                    DataType::UInt8 => signed_column::<UInt8Type, Int8Type>(array.as_ref()),
-                    DataType::UInt16 => signed_column::<UInt16Type, Int16Type>(array.as_ref()),
-                    DataType::UInt32 => signed_column::<UInt32Type, Int32Type>(array.as_ref()),
-                    DataType::UInt64 => signed_column::<UInt64Type, Int64Type>(array.as_ref()),
-                    _ => Arc::clone(array),
-                }
+                normalized_document_array(array)?
             };
-            (arrow_schema::Field::new(field.name(), array.data_type().clone(), nulls != 0), array)
-        }).unzip();
+            Some((arrow_schema::Field::new(field.name(), array.data_type().clone(), nulls != 0), array))
+        }).collect::<Option<Vec<_>>>();
+        let Some(columns) = columns else { return Ok(None); };
+        let (fields, columns): (Vec<_>, Vec<_>) = columns.into_iter().unzip();
         let fields = Fields::from(fields);
         let layout = DecodedDocumentLayout::new(&fields, memory)?;
         let array = StructArray::try_new_with_length(fields, columns, None, batch.num_rows())
@@ -186,11 +182,15 @@ impl ArrowDocuments {
     }
 
     fn compatible(field: &arrow_schema::Field) -> bool {
-        field.metadata().is_empty() && matches!(field.data_type(),
+        field.metadata().is_empty() && match field.data_type() {
+            DataType::Struct(fields) => fields.iter().all(|field| Self::compatible(field)),
+            DataType::List(field) => Self::compatible(field),
             DataType::Null | DataType::Boolean | DataType::Int8 | DataType::Int16 | DataType::Int32 | DataType::Int64 |
             DataType::UInt8 | DataType::UInt16 | DataType::UInt32 | DataType::UInt64 |
             DataType::Float32 | DataType::Float64 | DataType::Utf8 | DataType::Binary | DataType::FixedSizeBinary(_) |
-            DataType::Timestamp(arrow_schema::TimeUnit::Microsecond, Some(_)))
+            DataType::Timestamp(arrow_schema::TimeUnit::Microsecond, Some(_)) => true,
+            _ => false,
+        }
     }
 
     pub(crate) fn from_source(array: &StructArray, layout: Arc<DecodedDocumentLayout>) -> Option<Self> {
@@ -222,6 +222,30 @@ impl ArrowDocuments {
         self.array.fields().iter().enumerate().find(|(_, field)| field.name() == "_id")
             .map(|(index, field)| Ok((index, ColumnReader::new(field)?))).transpose()
     }
+}
+
+fn normalized_document_array(array: &ArrayRef) -> Option<ArrayRef> {
+    Some(match array.data_type() {
+        DataType::UInt8 => signed_column::<UInt8Type, Int8Type>(array.as_ref()),
+        DataType::UInt16 => signed_column::<UInt16Type, Int16Type>(array.as_ref()),
+        DataType::UInt32 => signed_column::<UInt32Type, Int32Type>(array.as_ref()),
+        DataType::UInt64 => signed_column::<UInt64Type, Int64Type>(array.as_ref()),
+        DataType::Struct(fields) => {
+            let source = array.as_any().downcast_ref::<StructArray>()?;
+            let children = source.columns().iter().map(normalized_document_array).collect::<Option<Vec<_>>>()?;
+            let fields = fields.iter().zip(&children).map(|(field, child)| {
+                field.as_ref().clone().with_data_type(child.data_type().clone())
+            }).collect::<Fields>();
+            Arc::new(StructArray::try_new_with_length(fields, children, source.nulls().cloned(), source.len()).ok()?)
+        }
+        DataType::List(field) => {
+            let source = array.as_any().downcast_ref::<ListArray>()?;
+            let values = normalized_document_array(source.values())?;
+            let field = field.as_ref().clone().with_data_type(values.data_type().clone());
+            Arc::new(ListArray::try_new(Arc::new(field), source.offsets().clone(), values, source.nulls().cloned()).ok()?)
+        }
+        _ => Arc::clone(array),
+    })
 }
 
 fn signed_column<From: ArrowPrimitiveType, To: ArrowPrimitiveType>(array: &dyn Array) -> ArrayRef {
