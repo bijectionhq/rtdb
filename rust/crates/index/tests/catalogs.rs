@@ -171,6 +171,19 @@ fn table_oid_allocation_is_sorted_and_recorded_slugs_stay_frozen() {
     assert_eq!(next.entry(&zeta).unwrap().oid, 20_002);
 }
 
+#[test]
+fn catalog_allocates_the_first_free_suffix_for_colliding_table_slugs() {
+    let original = TableRef::new("public", "a$b");
+    let suffix_owner = TableRef::new("public", "a$b~1");
+    let dotted = TableRef::new("public", "a.b");
+    let catalog = TableCatalog::default().with_entries_for([suffix_owner.clone(), original.clone()]).unwrap();
+    let next = catalog.with_entries_for([dotted.clone(), dotted.clone()]).unwrap();
+    assert_eq!(next.entry(&original), catalog.entry(&original));
+    assert_eq!(next.entry(&suffix_owner), catalog.entry(&suffix_owner));
+    assert_eq!(next.entry(&dotted).unwrap().slug.as_str(), "public$a$b~2");
+    assert_eq!(next.entries().count(), 3);
+}
+
 fn artefact(definition_id: &str, version: i64, stats: u8) -> rtdb_format::log::proto::ArtefactRecord {
     rtdb_format::log::proto::ArtefactRecord { kind: Some("search".into()), definition_id: Some(definition_id.into()), definition_version: Some(version), stats: Some(vec![stats]), scope: None }
 }

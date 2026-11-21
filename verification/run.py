@@ -497,6 +497,28 @@ def verify_outer_join(args, scratch):
     verify_lean_model(args, scratch, path, "outer-join", controls, 5)
 
 
+def verify_table_slugs(args, scratch):
+    path = Path("verification/lean/TableSlugs.lean")
+    controls = {
+        "select-claimed-slug": (
+            "candidates.find? (fun slug => decide (slug ∉ used))",
+            "candidates.find? (fun slug => decide (slug ∈ used))",
+            ["a_selected_slug_is_unclaimed", "enough_distinct_candidates_supply_a_slug"],
+        ),
+        "omit-old-records": (
+            "item ∈ (name, slug) :: records := by",
+            "item ∈ [(name, slug)] := by",
+            ["registration_preserves_recorded_slugs"],
+        ),
+        "scope-too-few-candidates": (
+            "List.range' 1 (used.length + 1)",
+            "List.range' 1 used.length",
+            ["first_sufficient_suffixes_always_supply_a_slug"],
+        ),
+    }
+    verify_lean_model(args, scratch, path, "table-slugs", controls, 6)
+
+
 def verify_generation_retention(args, scratch):
     path = Path("verification/lean/GenerationRetention.lean")
     controls = {
@@ -609,6 +631,7 @@ def verify_lean(args, scratch):
             verify_run_encoding(args, scratch)
             verify_memory_admission(args, scratch)
             verify_outer_join(args, scratch)
+            verify_table_slugs(args, scratch)
             verify_reader_retention(args, scratch)
             verify_generation_retention(args, scratch)
             verify_compaction_projection(args, scratch, directory)

@@ -152,8 +152,8 @@ A proof of a candidate is conditional on the explicitly stated contract and work
 | FMT03 · Arrow event fidelity | Open | — |
 | FMT04 · Version dispatch | Open | — |
 | FMT05 · Errors and referenced payloads | Open | — |
-| FMT06 · Key and namespace fidelity | Open | — |
-| FMT07 · Stable table identities | Open | — |
+| FMT06 · Key and namespace fidelity | Partial | [Lean slug allocation and native checkpoint key collision regression](rtdb-engine-proof-evidence.md#main-evidence) |
+| FMT07 · Stable table identities | Partial | [Lean preservation of recorded slugs and Rust and JVM catalog regressions](rtdb-engine-proof-evidence.md#main-evidence) |
 | FMT08 · Canonical encoding | Open | — |
 | FMT09 · Safe format errors | Open | — |
 

@@ -2,7 +2,7 @@ use rtdb_types::StructFields;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
-use rtdb_format::{block::proto as block_pb, catalog::{BlockCatalog, TableBlock, TableEntry, FIRST_TABLE_OID}, columns::column_from_type};
+use rtdb_format::{block::proto as block_pb, catalog::{BlockCatalog, TableBlock, TableEntry, FIRST_TABLE_OID}, columns::column_from_type, keys::TableSlug};
 use rtdb_types::{Anomaly, BlockIndex, LogicalType, Result, TableRef};
 
 pub fn absent_type(types: &StructFields<LogicalType>) -> LogicalType {
@@ -92,8 +92,20 @@ impl TableCatalog {
         fresh.sort_by_key(TableRef::schema_and_table);
         let mut next = self.clone();
         let mut oid = self.entries.values().map(|entry| entry.oid).max().map_or(Ok(FIRST_TABLE_OID), |oid| oid.checked_add(1).ok_or_else(|| invalid("Table OID space exhausted")))?;
+        let mut used_slugs: BTreeSet<_> = self.entries.values().map(|entry| entry.slug.clone()).collect();
         for (index, table) in fresh.iter().enumerate() {
-            next.entries.insert(table.clone(), TableEntry::new(oid, table.clone())?);
+            let mut entry = TableEntry::new(oid, table.clone())?;
+            if !used_slugs.insert(entry.slug.clone()) {
+                let base = entry.slug.as_str();
+                for suffix in 1_u64.. {
+                    let candidate = TableSlug::recorded(format!("{base}~{suffix}"))?;
+                    if used_slugs.insert(candidate.clone()) {
+                        entry.slug = candidate;
+                        break;
+                    }
+                }
+            }
+            next.entries.insert(table.clone(), entry);
             if index + 1 < fresh.len() { oid = oid.checked_add(1).ok_or_else(|| invalid("Table OID space exhausted"))?; }
         }
         Ok(next)

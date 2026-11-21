@@ -1577,10 +1577,14 @@ contract TableEntries {
     @invariant EveryTableTheBlockNamesHasAnEntry
         -- A block records an entry for each table it names, taking the entry from the preceding block wherever that block held one.
 
-    @invariant UnrecordedTableTakesItsEscapedName
-        -- A table a block does not record takes the escaped form of its name as its slug.
-        -- - This is what a block carrying names alone resolves to, so the files its tables have already written stay where they are.
-        -- - Oids for those tables are derived in name order, so every node resolving the same block resolves the same entries.
+    @invariant NamesOnlyBlockUsesLegacySlugs
+        -- A block carrying names alone resolves its tables through the escaped form of their names.
+        -- Oids for those tables are derived in name order, so every node resolving the same block resolves the same entries.
+
+    @invariant NewlyAllocatedSlugsAreUnique
+        -- A new table takes its escaped name when the slug is free.
+        -- If that slug already belongs to a table, the new table takes the first unused slug formed by appending a tilde and a positive integer in increasing order.
+        -- The catalog allocates slugs in table name order within each transaction.
 
     @invariant SlugPrecedesTheFirstWrite
         -- A table's slug is fixed before anything is written under its path.

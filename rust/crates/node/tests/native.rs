@@ -578,6 +578,51 @@ async fn asynchronous_submission_is_recorded_before_application_and_read_awaits_
 }
 
 #[tokio::test]
+async fn tables_with_colliding_escaped_names_keep_separate_rows_after_restart() {
+    tokio::time::timeout(Duration::from_secs(30), async {
+        let directory = tempfile::tempdir().unwrap();
+        let configuration = DatabaseConfig {
+            log: Some(database_config::Log::LocalLog(LocalLog { path: Some(directory.path().join("log").to_string_lossy().into_owned()), epoch: Some(0) })),
+            storage: Some(database_config::Storage::LocalStorage(LocalStorage { path: Some(directory.path().join("store").to_string_lossy().into_owned()), epoch: Some(0) })),
+            ..Default::default()
+        };
+        let mut settings = options();
+        settings.membership = Membership::Durable { primary: configuration, skipped: BTreeSet::new() };
+        let runtime = services();
+        let (node, driver) = running(settings.clone(), fresh_local_services(&runtime)).await;
+        let mut session = node.session("xtdb", Arc::new(Authority)).unwrap();
+        for statement in [r#"INSERT INTO "a$b" (_id, value) VALUES (2, 22)"#, r#"INSERT INTO "a$b~1" (_id, value) VALUES (3, 33)"#] {
+            let outcome = session.state_mut().execute_tx(vec![TxOp::Sql { sql: statement.into(), args: None }], AutonomousTxOptions::default()).await.unwrap();
+            assert!(outcome.committed(), "{statement}: {:?}", outcome.error());
+        }
+        let database = node.catalog().database("xtdb").unwrap();
+        let cancellation = CancellationToken::new();
+        database.flush().await.unwrap();
+        node.sync_all(Duration::from_secs(10), &cancellation).await.unwrap();
+
+        let statement = r#"INSERT INTO "a.b" (_id, value) VALUES (1, 11)"#;
+        let outcome = session.state_mut().execute_tx(vec![TxOp::Sql { sql: statement.into(), args: None }], AutonomousTxOptions::default()).await.unwrap();
+        assert!(outcome.committed(), "{:?}", outcome.error());
+        database.flush().await.unwrap();
+        node.sync_all(Duration::from_secs(10), &cancellation).await.unwrap();
+        drop((session, database));
+        stop(&node, driver).await;
+        drop(node);
+
+        let (reopened, driver) = running(settings, fresh_local_services(&runtime)).await;
+        let mut session = reopened.session("xtdb", Arc::new(Authority)).unwrap();
+        for (statement, expected) in [
+            (r#"SELECT value FROM "a.b""#, 11),
+            (r#"SELECT value FROM "a$b""#, 22),
+            (r#"SELECT value FROM "a$b~1""#, 33),
+        ] {
+            assert_eq!(rows(session.query_sql(statement, vec![]).await.unwrap()).await, vec![vec![Value::I64(expected)]]);
+        }
+        stop(&reopened, driver).await;
+    }).await.unwrap();
+}
+
+#[tokio::test]
 async fn local_recovery_reads_flushed_and_unflushed_transactions_and_retained_batches_survive_shutdown() {
     tokio::time::timeout(Duration::from_secs(30), async {
         let directory = tempfile::tempdir().unwrap();
