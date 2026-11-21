@@ -23,6 +23,7 @@ These results apply to the classic and full-text Rust paths at the particular re
 | SCAN07, GC01, GC02 | Lean proves the abstract generation retention invariant for arbitrarily many readers, objects, in-flight operations and steps. Verus checks the collector's production selection loop against the visibility observations it receives. | Refine the captured references, provider operations, and authority changes, including the full durable deletion protocol. |
 | STORE04, STORE08 | An offline Azure provider replay exercised pending-copy acknowledgment and checked the corrected publication path. The checkpoint interruption model separates the provider's durable outcome from the reply. | Cover all provider adapters and their ambiguous, retried, and concurrent publication paths. |
 | FTS04–FTS07 | Verus checks the production visibility merge and ranking cutoff decisions, and Lean proves ordered pages are preserved by the specified partition pruning. Native replays compare successful acceleration with the same admitted predicates and scores. | Establish corpus and candidate completeness through every artifact coverage mode, and compose the full search-and-scan refinement. |
+| RES01, RES02 · Quantized admission | Lean proves that rounding covers the requested charge, that a settled refusal restores the prior accounting, and that an admitted reservation satisfies both the child and parent limits. The native regression exercises both rounded-grant overflow and total-grant overflow in the actual budget. | Relate arbitrary native ancestor chains and interleavings to the settled admission contract, and prove release and lifetime accounting for all reservation types. |
 | COMPAT06 | The runner records checked input and tool digests, commands, diagnostics and the source revision. | Establish provenance across the whole release and compatibility matrix. |
 
 Main's [kernel design](rtdb-formal-verification-design.adoc) gives the public observation and simulation contracts used by those studies.
@@ -39,6 +40,11 @@ The runner rejects intersecting scalar legs and omitting the null contribution f
 The run encoding model uses decidable value equality and mathematical offsets.
 The corresponding Rust check uses Arrow 58.4.1 on a 64-bit target, with positive increasing ends and a valid row in a covered slice.
 The model runner rejects a closed run end and a read that drops the slice origin. [Run encoding theorems](../../verification/lean/RunEncoding.lean) · [Arrow harnesses](../../rust/crates/columnar/tests/proofs.rs)
+
+At baseline `5eba8e9ea`, a failing quantized reservation returned `rtdb/allocation-overflow` with child usage `18446744073709551615` and parent usage `0` on a 64-bit build.
+The regression uses accounting limits and reservation handles, with no allocation proportional to the requested size.
+The Lean model compares counters after a reservation call settles and assumes the rounded grant uses a positive quantum.
+The runner rejects omitting rollback and admitting a charge without the parent limit. [Memory-admission theorems](../../verification/lean/MemoryAdmission.lean) · [Native regression](../../rust/crates/types/tests/quantized_budget.rs)
 
 ## Multi evidence
 

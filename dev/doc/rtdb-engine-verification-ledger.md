@@ -265,8 +265,8 @@ A proof of a candidate is conditional on the explicitly stated contract and work
 
 | Target | Status | Recorded evidence |
 | --- | --- | --- |
-| RES01 · Reservation ownership | Open | — |
-| RES02 · Budget enforcement | Open | — |
+| RES01 · Reservation ownership | Partial | [Lean refusal accounting and native grant overflow regression](rtdb-engine-proof-evidence.md#main-evidence) |
+| RES02 · Budget enforcement | Partial | [Lean quantized grant and limit checks](rtdb-engine-proof-evidence.md#main-evidence) |
 | RES03 · Error and cancel cleanup | Open | — |
 | RES04 · Queue and frame admission | Open | — |
 | RES05 · Scoped shutdown | Open | — |

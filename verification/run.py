@@ -463,6 +463,23 @@ def verify_run_encoding(args, scratch):
     verify_lean_model(args, scratch, path, "run-encoding", controls, 5)
 
 
+def verify_memory_admission(args, scratch):
+    path = Path("verification/lean/MemoryAdmission.lean")
+    controls = {
+        "omit-rollback": (
+            "else (false, rollBack provisional request)",
+            "else (false, provisional)",
+            ["a_refused_admission_restores_both_counters"],
+        ),
+        "omit-parent-limit": (
+            "nextGrant ≤ limits.wordMaximum ∧ nextParent ≤ limits.parent",
+            "nextGrant ≤ limits.wordMaximum",
+            ["a_refused_admission_restores_both_counters", "admitted_charge_stays_within_its_limits"],
+        ),
+    }
+    verify_lean_model(args, scratch, path, "memory-admission", controls, 6)
+
+
 def verify_generation_retention(args, scratch):
     path = Path("verification/lean/GenerationRetention.lean")
     controls = {
@@ -573,6 +590,7 @@ def verify_lean(args, scratch):
             verify_message_position(args, scratch)
             verify_type_join(args, scratch)
             verify_run_encoding(args, scratch)
+            verify_memory_admission(args, scratch)
             verify_reader_retention(args, scratch)
             verify_generation_retention(args, scratch)
             verify_compaction_projection(args, scratch, directory)
