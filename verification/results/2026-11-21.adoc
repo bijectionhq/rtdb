@@ -936,3 +936,37 @@ All five tests in the maintenance `gc` suite passed with that follow-up.
 
 This deployment boundary covers one installed partition authority and its trie collector.
 Coordination between nodes, other physical deletion paths, and checkpoint and log retention during recovery remain open.
+
+== Trie dependencies of the installed checkpoint
+
+Commit `2f1019b68` records the exact live and nascent trie identities of the installed checkpoint.
+Startup derives them from the same restored trie catalog used by the partition.
+Block adoption derives them from the persisted table blocks and installs them atomically with the new block index.
+The collector observes that set, the current catalog, and retained reader catalogs at one local cut.
+A nascent trie is a recovery dependency because replay can complete its compaction cohort.
+
+The link:../verus/reader_retention/proof.rs[production retention area] verifies four obligations, with independent laws for the installed checkpoint and open readers.
+Dropping either dependency source fails its original contract or, when the contract is weakened with it, fails the corresponding law.
+The proof assumes the caller supplies checkpoint membership and reader observations from the captured cut.
+It checks selection over those observations.
+
+The selected Rust suites passed 377 tests.
+The new maintenance test observes the collector and its store before and after installing a replacement checkpoint.
+It checks that both file pairs stay present when the live and nascent tries recorded by the original checkpoint become garbage in the serving catalog.
+It checks that a later checkpoint no longer depending on them permits collection and its deletion notice.
+Use `BIJECTION_LOCAL_EXECUTION=owner-authorized cargo test --manifest-path rust/Cargo.toml --locked -p rtdb-maintenance -p rtdb-index -p rtdb-query -p rtdb-node -p rtdb-replication --lib --test gc --test live_index --test scan --test native`.
+
+This protection covers data and metadata selected by the Rust trie collector within one partition authority.
+The file-presence test uses the in-memory object provider.
+Reader or recovery holds across authorities, roots and payloads eligible for block collection, and the replica suffix require separate production coverage.
+Checkpoint-adoption latency and inventory memory overhead have no benchmark result in this study.
+
+=== Installed-checkpoint protocol model
+
+The link:../tla/InstalledCheckpoint.tla[installed checkpoint model] separates current catalog supersession, replacement checkpoint publication, local adoption, reader capture and close, and physical deletion.
+It has two catalog cuts, one reader, a live and a nascent entry in the first cut, and one replacement entry.
+TLC visited all 31 reachable states without violating `InstalledReadable` or `ReaderReadable`.
+Using the current catalog in place of the installed checkpoint and omitting the nascent entry each violated `InstalledReadable`.
+The reachability check produced a trace that collects both original objects after replacement adoption.
+Apalache independently checked the two safety invariants through ten transitions and found the omitted nascent dependency.
+The model assumes one authority, atomic transitions, and immutable object identities. It abstracts object bytes, I/O cancellation, replica log retention, and remote discovery.

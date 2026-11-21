@@ -158,6 +158,9 @@ It also exercises the Azure adapter against a loopback provider and separately m
   It compares an acknowledged pending copy with a copy whose completion is checked.
 * `tla/RecoveryCollection.tla` checks overlapping checkpoint generations, an active recovery reference, the required log suffix, and delayed object deletion.
   TLC explores its finite state space and Apalache independently checks the same safety conditions up to ten transitions.
+* `tla/InstalledCheckpoint.tla` models the local trie collector while compaction, checkpoint publication, checkpoint adoption, readers, and physical deletion advance separately.
+  It checks the distinct requirements supplied by live and nascent checkpoint entries and allows old files to be collected after the replacement is installed.
+  TLC explores its finite state space, and Apalache cross-checks retention through ten transitions.
 * `tla/RecoveryDiscovery.tla` models a separate fallback for missing checkpoint metadata during startup.
   The fallback requires a newer checkpoint in a refreshed listing and has no effect on replica-log retention.
 * `tla/RecoveryReplay.tla` models a checkpoint selection check against the observed replica prefix, refresh, and subsequent tail opening.

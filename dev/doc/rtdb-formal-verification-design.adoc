@@ -1078,6 +1078,7 @@ Lean checks the pending historical promotion reconstructed from a checkpoint. Ve
 The native trie collector protects live and nascent trie files from the latest installed checkpoint within one partition authority.
 The reference comes from the persisted table blocks, and it changes atomically with local block adoption.
 Verus checks the selection decision independently of whether a query reader exists.
+TLC and Apalache check the installed-checkpoint rule separately from the current catalog, including nascent trie dependencies and delayed deletion.
 |Extend protection across checkpoint discovery, replacement, and multiple authorities.
 Protect the required log suffix through replay and account for deletion entry points outside trie collection.
 Establish supported remote configurations and any eventual retry and staging cleanup guarantees.

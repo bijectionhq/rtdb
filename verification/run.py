@@ -681,6 +681,13 @@ TLA_CASES = (
      ("INVARIANTS TypeOK AttemptsAdvance NoEmptyAfterMissing UsesNewerListing CorruptionIsTerminal MissingFailureHasRefreshed",
       "INVARIANT NeverRecoveredAfterRefresh"),
      "NeverRecoveredAfterRefresh"),
+    ("InstalledCheckpoint", "installed-checkpoint", None, None),
+    ("InstalledCheckpoint", "installed-checkpoint-follows-current",
+     ('Mutation = "none"', 'Mutation = "follow_current"'), "InstalledReadable"),
+    ("InstalledCheckpoint", "installed-checkpoint-ignores-nascent",
+     ('Mutation = "none"', 'Mutation = "ignore_nascent"'), "InstalledReadable"),
+    ("InstalledCheckpoint", "installed-checkpoint-collection-witness",
+     ("INVARIANTS TypeOK InstalledReadable ReaderReadable", "INVARIANT OldFilesNeverCollected"), "OldFilesNeverCollected"),
     ("RecoveryReplay", "checkpoint-replay-prefix", None, None),
     ("RecoveryReplay", "checkpoint-replay-skip-probe", ('Mutation = "none"', 'Mutation = "skip_probe"'), "ObservedAdmission"),
     ("RecoveryReplay", "checkpoint-replay-fail-fast", ('Mutation = "none"', 'Mutation = "fail_fast"'), "RefreshBeforeRefusing"),
@@ -785,6 +792,11 @@ def verify_apalache(args, scratch):
     check_apalache(
         args, scratch, "RecoveryDiscovery", "checkpoint-discovery-fail-fast", "MissingFailureHasRefreshed", 10,
         ('Mutation = "none"', 'Mutation = "fail_fast"'), "missing checkpoint without refreshed discovery",
+    )
+    check_apalache(args, scratch, "InstalledCheckpoint", "installed-checkpoint", "RetentionSafe", 10)
+    check_apalache(
+        args, scratch, "InstalledCheckpoint", "installed-checkpoint-ignores-nascent", "InstalledReadable", 10,
+        ('Mutation = "none"', 'Mutation = "ignore_nascent"'), "lost nascent dependency",
     )
     check_apalache(args, scratch, "RecoveryReplay", "checkpoint-replay-prefix", "ReplaySafe", 10)
     check_apalache(
