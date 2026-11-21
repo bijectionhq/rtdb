@@ -12,6 +12,62 @@ use rtdb_multi::keys::KeyService;
 use tokio_postgres::NoTls;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_idle_holding_flushes_then_keeps_serving_under_the_same_epoch() {
+    let cell = Cell::start_with_idle_flush(Duration::from_millis(100)).await;
+    let directory = cell.directory.as_ref();
+    let deployment = admin::create_deployment(directory, "shop", "acme", 3).await.unwrap();
+    let client = cell.connect("shop").await;
+    client.simple_query("INSERT INTO orders (_id, total) VALUES (1, 23)").await.unwrap();
+    let original = directory.deployment(&deployment.id).await.unwrap().unwrap();
+    drop(client);
+
+    let flushed = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let current = directory.deployment(&deployment.id).await.unwrap().unwrap();
+            if current.checkpoint.is_some() { return current; }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }).await.unwrap();
+    assert_eq!((flushed.epoch, flushed.holder), (original.epoch, original.holder));
+    let client = cell.connect("shop").await;
+    assert_eq!(values(&client, "SELECT total FROM orders").await, ["23"]);
+    drop(client);
+    cell.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_saturated_holder_declines_gateway_startup_without_stalling_existing_sessions() {
+    use rtdb_multi::gateway::{GatewayOptions, serve};
+    use tokio_util::sync::CancellationToken;
+
+    let cell = Cell::start(1, None).await;
+    admin::create_deployment(cell.directory.as_ref(), "shop", "acme", 3).await.unwrap();
+    let mut clients = Vec::new();
+    for _ in 0..pgwire_connections() { clients.push(cell.connect("shop").await); }
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let shutdown = CancellationToken::new();
+    let options = GatewayOptions { startup_timeout: Duration::from_millis(250), capabilities: Some(secret()), ..Default::default() };
+    let gateway = tokio::spawn(serve(listener, cell.directory.clone(), options, shutdown.clone()));
+    let connection_string = format!("host=127.0.0.1 port={port} user=xtdb password=cell-test dbname=shop");
+    let Ok(Err(error)) = tokio::time::timeout(Duration::from_secs(3), tokio_postgres::connect(&connection_string, NoTls)).await
+        else { panic!("the saturated holder did not report its startup deadline") };
+    assert_eq!(error.code(), Some(&tokio_postgres::error::SqlState::CANNOT_CONNECT_NOW));
+    assert_eq!(values(&clients[0], "SELECT 23").await, ["23"]);
+
+    drop(clients.pop());
+    let (client, connection) = tokio::time::timeout(Duration::from_secs(3), tokio_postgres::connect(&connection_string, NoTls)).await.unwrap().unwrap();
+    let connection = tokio::spawn(connection);
+    assert_eq!(values(&client, "SELECT 24").await, ["24"]);
+    drop((client, clients));
+    connection.await.unwrap().unwrap();
+    shutdown.cancel();
+    gateway.await.unwrap().unwrap();
+    cell.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_engine_pin_constrains_claims_and_moves_until_explicitly_cleared() {
     let mut cell = Cell::start(1, None).await;
     let newer = cell.add_node_with_engine(Some("next-image".into())).await;

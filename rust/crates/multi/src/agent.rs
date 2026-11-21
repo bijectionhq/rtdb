@@ -30,6 +30,8 @@ pub struct AgentOptions {
     pub activations_per_second: NonZeroUsize,
     /// How often held deployments are checked against the directory.
     pub watch_interval: Duration,
+    /// How long a holding's unflushed rows may sit without requests.
+    pub clean_after_idle: Duration,
     /// Park a deployment nobody has touched for this long; never, if absent.
     pub park_after: Option<Duration>,
     /// Drop a read replica nobody has touched for this long.
@@ -54,7 +56,7 @@ pub struct S3WriteRole { pub arn: String, pub sts_endpoint: Option<String>, pub 
 impl AgentOptions {
     pub fn new(storage: CellStorage) -> Self {
         Self { storage, s3_write_role: None, activation_timeout: Duration::from_secs(30), activations_per_second: NonZeroUsize::new(200).unwrap(),
-            watch_interval: Duration::from_millis(250), park_after: None,
+            watch_interval: Duration::from_millis(250), clean_after_idle: Duration::from_secs(60), park_after: None,
             unsubscribe_after: Duration::from_secs(60), max_active: None, quarantine_after: 2, compaction_worker: false, max_tail_rows: None, snapshot_lifetime: SNAPSHOT_LIFETIME,
             fragments: crate::fragments::FragmentOptions::default() }
     }
@@ -66,6 +68,7 @@ pub const SNAPSHOT_LIFETIME: Duration = Duration::from_secs(30 * 60);
 const CONFIRM_WITHIN: Duration = Duration::from_secs(2);
 const PRESSURE_WAIT: Duration = Duration::from_millis(500);
 const PRESSURE_PARKS_PER_PASS: usize = 8;
+const IDLE_FLUSHES_PER_PASS: usize = 2;
 const HANDOFF_REPLAY_ROWS: u64 = 64;
 const HANDOFF_REPLAY_RECORDS: i64 = 16;
 const DRAIN_HANDOFFS_PER_PASS: usize = 8;
@@ -692,6 +695,7 @@ impl NodeAgent {
         let destinations = if draining { self.members().await.ok() } else { None };
         let active_within = self.options.park_after.map_or(ACTIVE_DRAIN_WINDOW, |after| after.min(ACTIVE_DRAIN_WINDOW));
         let mut handoffs = Vec::new();
+        let mut idle_flushes = 0;
         let mut held: Vec<(String, String, u64, Instant)> = self.holdings.lock().iter().map(|(name, holding)| (name.clone(), holding.id.clone(), holding.epoch, holding.last_touch)).collect();
         held.sort_by_key(|(.., touched)| std::cmp::Reverse(*touched));
         for (rank, (name, id, epoch, last_touch)) in held.into_iter().enumerate() {
@@ -728,7 +732,14 @@ impl NodeAgent {
                 continue;
             }
             let over = self.options.max_active.is_some_and(|limit| rank >= limit);
-            if over || self.options.park_after.is_some_and(|after| last_touch.elapsed() >= after) { let _ = self.park(&name).await; }
+            if over || self.options.park_after.is_some_and(|after| last_touch.elapsed() >= after) {
+                let _ = self.park(&name).await;
+            } else if idle_flushes < IDLE_FLUSHES_PER_PASS && last_touch.elapsed() >= self.options.clean_after_idle
+                && self.node.catalog().database(&name).is_ok_and(|database| database.live_rows() > 0)
+            {
+                idle_flushes += 1;
+                let _ = self.flush(&name).await;
+            }
         }
         if !handoffs.is_empty() {
             let control = crate::control::ControlKey(self.secret.clone());

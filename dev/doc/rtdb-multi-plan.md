@@ -405,6 +405,9 @@ Small deployments must cost one PUT per flush and one GET per cold start (spec r
    A checkpointed root or materialized deployment skips the base-manifest listing and opens its packs by name.
    A fork with inherited objects still reads its base manifest.
 3. **Flush triggers** in `HoldingDriver`: tail bytes, estimated replay, oldest-record age, idle, ensemble degradation, retention, rows (spec rules `FlushOn*`), replacing `flush_timeout` and `rows_per_block` for multi mode.
+   A placed node honors shorter configured flush intervals and caps the interval at 15 minutes.
+   After 60 seconds without use it flushes unflushed rows while keeping the holder and epoch.
+   Each pass starts at most two idle flushes.
 4. **Checkpoint publication**: a CAS conditional on the epoch, batched per node, then log trim.
 
 **Tests.**

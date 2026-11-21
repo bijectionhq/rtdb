@@ -1227,6 +1227,7 @@ rule FlushOnAge {
 }
 
 rule FlushOnIdle {
+    -- Each node bounds the idle flushes it starts in one reconciliation pass.
     when: holding: Holding.last_request_at + config.clean_after_idle <= now
 
     requires: holding.state = serving
