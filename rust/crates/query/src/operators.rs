@@ -116,8 +116,9 @@ pub(crate) fn build_ordered_columns(
             RelationNode::SortLimit { order_by, offset, fetch: Some(fetch), .. }
                 if window.is_none() && !order_by.is_empty() =>
             {
-                let offset = row_limit(offset.as_ref(), &execution).await?.unwrap_or(0);
-                let remaining = row_limit(Some(fetch), &execution).await?.unwrap_or(i64::MAX as u64);
+                let Some((offset, remaining)) = ordered_window(offset.as_ref(), fetch, &execution) else {
+                    return Ok(None);
+                };
                 let limit = offset.saturating_add(remaining).min(i64::MAX as u64);
                 let (Ok(limit), Ok(offset)) = (usize::try_from(limit), usize::try_from(offset)) else { return Ok(None); };
                 let Some(input) = build_ordered_columns(runtime.child(0)?, execution.child(0), Some((limit, offset))).await? else {
@@ -323,14 +324,12 @@ async fn build_pages_at(runtime: Arc<EmittedRelation>, execution: Execution, con
         RelationNode::SortLimit { order_by,offset,fetch,.. } => {
             let mut constraints = constraints;for order in order_by { constraints.require(&order.expr); }
             let pushdowns = if offset.is_some() || fetch.is_some() { None } else { pushdowns };
-            let offset_value = row_limit(offset.as_ref(),&execution).await?.unwrap_or(0);
-            let remaining = row_limit(fetch.as_ref(),&execution).await?;
-            let row_limit = offset_value.saturating_add(remaining.unwrap_or(i64::MAX as u64)).min(i64::MAX as u64);
-            if !order_by.is_empty() && fetch.is_some()
-                && let Ok(limit) = usize::try_from(row_limit)
+            if !order_by.is_empty()
+                && let Some((offset, remaining)) = fetch.as_ref().and_then(|fetch| ordered_window(offset.as_ref(), fetch, &execution))
+                && let Ok(limit) = usize::try_from(offset.saturating_add(remaining).min(i64::MAX as u64))
                 && let Some(input) = ordered_input(runtime.child(0)?, execution.child(0), limit).await?
             {
-                let pages = Box::new(Limit { input: Some(input), offset: offset_value, remaining, execution });
+                let pages = Box::new(Limit { input: Some(input), offset, remaining: Some(remaining), execution });
                 let pages = crate::pages::retain_page_state(pages, state_reservation);
                 return Ok(crate::trace::wrap(crate::analysis::wrap(pages, analysis), &traced_relation, &traced_context));
             }
@@ -342,6 +341,9 @@ async fn build_pages_at(runtime: Arc<EmittedRelation>, execution: Execution, con
                 Some(batches) => Ok(batches),
                 None => Err(build_pages_constrained(runtime.child(0)?,execution.child(0),constraints,pushdowns).await?),
             };
+            let offset_value = row_limit(offset.as_ref(), &execution).await?.unwrap_or(0);
+            let remaining = row_limit(fetch.as_ref(), &execution).await?;
+            let row_limit = offset_value.saturating_add(remaining.unwrap_or(i64::MAX as u64)).min(i64::MAX as u64);
             let mut pages: BoxPageCursor = match input {
                 Ok((batches,projected)) if crate::sort::SortCursor::batch_eligible(&schema,order_by,row_limit) =>
                     Box::new(crate::sort::SortCursor::top_batches(batches,projected,schema,order_by.clone(),row_limit,execution.clone())),
@@ -446,11 +448,28 @@ async fn build_pages_at(runtime: Arc<EmittedRelation>, execution: Execution, con
     }
 }
 
+/// A valid literal or bound parameter can size a seek before the normal input opens.
+fn ordered_window(offset: Option<&Expr>, fetch: &Expr, execution: &Execution) -> Option<(u64, u64)> {
+    let bound = |expr: &Expr| {
+        let value = match expr {
+            Expr::Literal(value) => value,
+            Expr::Parameter { index, .. } => execution.parameters.values().get(*index)?,
+            _ => return None,
+        };
+        row_count(value)
+    };
+    Some((match offset { Some(expr) => bound(expr)?, None => 0 }, bound(fetch)?))
+}
+
+fn row_count(value: &Value) -> Option<u64> {
+    integer(value).filter(|value| (0..=i128::from(i64::MAX)).contains(value)).map(|value| value as u64)
+}
+
 async fn row_limit(expr: Option<&Expr>, execution: &Execution) -> Result<Option<u64>> {
     let Some(expr) = expr else { return Ok(None); };
     let scope = execution.scope()?;
     let value = execution.evaluate(&scope, expr, &Schema::default(), &[]).await?;
-    if let Some(value) = integer(&value).filter(|value| (0..=i128::from(i64::MAX)).contains(value)) { return Ok(Some(value as u64)); }
+    if let Some(value) = row_count(&value) { return Ok(Some(value)); }
     let description = match value {
         Value::Null | Value::Undefined => "null".to_owned(),
         Value::Utf8(value) => value,

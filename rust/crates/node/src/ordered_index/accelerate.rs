@@ -4,9 +4,9 @@ use std::{
 };
 
 use arrow_array::{
-    ArrayRef, BinaryArray, BooleanArray, Date32Array, Int8Array, Int16Array, Int32Array,
-    Int64Array, RecordBatch, StringArray, UInt8Array, UInt16Array, UInt32Array, UInt64Array,
-    builder::FixedSizeBinaryBuilder,
+    ArrayRef, BooleanArray, Date32Array, Int8Array, Int16Array, Int32Array, Int64Array,
+    RecordBatch, UInt8Array, UInt16Array, UInt32Array, UInt64Array,
+    builder::{BinaryBuilder, FixedSizeBinaryBuilder, StringBuilder},
 };
 use arrow_schema::Schema;
 use async_trait::async_trait;
@@ -827,7 +827,7 @@ impl Covered {
             let bound = retained
                 .saturating_mul(2)
                 .saturating_add(rows.len() * 64 + 1024);
-            arrays.push(builder.column(bound, || covered_array(scalar, cells()))?);
+            arrays.push(builder.column(bound, || covered_array(scalar, retained, cells()))?);
         }
         let options = arrow_array::RecordBatchOptions::new().with_row_count(Some(rows.len()));
         let batch = RecordBatch::try_new_with_options(Arc::clone(&self.schema), arrays, &options)
@@ -838,6 +838,7 @@ impl Covered {
 
 fn covered_array<'a>(
     scalar: &ScalarType,
+    payload_bytes: usize,
     cells: impl ExactSizeIterator<Item = AtomRef<'a>>,
 ) -> Result<ArrayRef> {
     let bad_type = || super::format_error("Posting does not have the covered field's type");
@@ -861,8 +862,16 @@ fn covered_array<'a>(
     }
     use ScalarType as S;
     Ok(match scalar {
-        S::Utf8 => Arc::new(cells!(Text, |value| value).collect::<Result<StringArray>>()?),
-        S::Binary => Arc::new(cells!(Binary, |value| value).collect::<Result<BinaryArray>>()?),
+        S::Utf8 => {
+            let mut builder = StringBuilder::with_capacity(cells.len(), payload_bytes);
+            for value in cells!(Text, |value| value) { builder.append_option(value?); }
+            Arc::new(builder.finish())
+        }
+        S::Binary => {
+            let mut builder = BinaryBuilder::with_capacity(cells.len(), payload_bytes);
+            for value in cells!(Binary, |value| value) { builder.append_option(value?); }
+            Arc::new(builder.finish())
+        }
         S::Bool => Arc::new(cells!(Bool, |value| value).collect::<Result<BooleanArray>>()?),
         S::DateDay => Arc::new(
             cells!(Day, |value| i32::try_from(value)
