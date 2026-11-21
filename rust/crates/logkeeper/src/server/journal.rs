@@ -6,7 +6,7 @@
 //! A retained entry's payload stays in the segment its record was written to, and a reader reads it from there; memory holds only each entry's location and a bounded cache of payloads.
 
 use super::payload::{Cache, Item, Location, Source, Stored};
-use super::state::{Event, StreamState, Window};
+use super::state::{Event, Held, StreamState, Window};
 use super::store::{Slot, Store};
 use crate::history::RetainedChain;
 use crate::protocol::{Entries, Entry};
@@ -503,10 +503,8 @@ impl Replay {
                 Kind::Truncate(from) => state.apply(&Event::Truncate(from)),
                 Kind::Append(entry) => {
                     if entry.lsn != state.last() + 1 { return Err(corrupt(path, format!("stream {stream}'s entry {} follows {}", entry.lsn, state.last()))); }
-                    let (lsn, payload) = (entry.lsn, entry.payload.len() as u32);
-                    state.apply(&Event::Append(Entry { payload: Bytes::new(), ..entry }));
-                    let held = state.held_mut(lsn).expect("just appended");
-                    held.payload = Stored::Written(Location { segment: sequence, offset: at, length: framed as u32, payload });
+                    let location = Location { segment: sequence, offset: at, length: framed as u32, payload: entry.payload.len() as u32 };
+                    state.append_held(entry.lsn, Held { epoch: entry.epoch, timestamp: entry.timestamp, payload: Stored::Written(location) });
                 }
                 Kind::Commit(lsn) => state.apply(&Event::Commit(lsn)),
                 Kind::Trim(through) => state.apply(&Event::Trim(through)),

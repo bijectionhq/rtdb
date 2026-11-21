@@ -656,6 +656,9 @@ entity LogServerStream {
     last_lsn: Lsn
     commit_lsn: Lsn
     trimmed_through: Lsn
+    -- Consecutive retained log positions grouped by their writer epoch.
+    retained_epoch_runs: List<EpochRun>
+    retained_bytes: Integer
 }
 
 entity LogRecord {

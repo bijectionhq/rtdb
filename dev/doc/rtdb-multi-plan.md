@@ -299,6 +299,8 @@ A cell needs a quorum log shared by every deployment, with group commit across d
 
 1. **Crate `logkeeper`.**
    One append-only segment file per writer member, a per-deployment index mapping `(deployment, lsn)` to segment offsets, a per-deployment `LogServerStream` (promised epoch, last epoch and lsn, trim point), fsync before acknowledgement, group commit within `group_commit_window`, seal announcements in every round's acknowledgement, trim and segment reclamation.
+   The logkeeper maintains retained byte counts and epoch ranges while applying journal records.
+   A seal reads the epoch ranges without scanning each retained entry, and compaction eligibility reads the byte count of each stream.
 2. **Logkeeper loglet.**
    A client in `loglet` holding one connection per ensemble member per node, multiplexing every deployment the node holds, with write quorum 2 of 3 across zones.
 3. **Ensemble assignment.**
