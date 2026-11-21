@@ -85,7 +85,7 @@ BIJECTION_LOCAL_EXECUTION=owner-authorized VERUS_Z3_PATH=/path/to/z3 \
   --lean /path/to/lean --verus /path/to/verus \
   --java /path/to/java --tlc /path/to/tla2tools.jar --alloy /path/to/alloy.jar \
   --apalache /path/to/apalache-mc --maude /path/to/maude \
-  --rust-boundary \
+  --rust-boundary --native-replay \
   --evidence /path/to/new-evidence-directory
 ----
 
@@ -93,6 +93,7 @@ The local toolchain for this study is Lean 4.36.0, Verus 0.2026.11.20.9da409b wi
 The independent comparison also uses Maude 3.5.1 and Apalache 0.63.0.
 The pinned Verus release replaces the earlier proposed source build of 31e44e6.
 The optional Rust boundary check compiles an unchanged copy and two mutated copies of the replica driver imported from the current Git commit.
+The optional native replay reads the same seeded 4,096-observation trace that the Lean evaluator checks.
 
 == Evidence boundaries
 

@@ -154,6 +154,14 @@ theorem cutoff_keeps_possible_ties (actual frontier kth : Int)
     (isBound : actual ≤ frontier) (canTie : kth ≤ actual) :
     ¬ frontier < kth := by omega
 
+theorem idealized_bm25_term_bound (frequency upperFrequency lowerNorm norm : Nat)
+    (frequencyBound : frequency ≤ upperFrequency) (normBound : lowerNorm ≤ norm) :
+    frequency * (upperFrequency + lowerNorm) ≤ upperFrequency * (frequency + norm) := by
+  have bound := Nat.mul_le_mul frequencyBound normBound
+  simp only [Nat.mul_add]
+  rw [Nat.mul_comm upperFrequency frequency]
+  omega
+
 theorem keeping_first_rows_preserves_top_k {Row : Type} (keep : Row → Bool)
     (count : Nat) (ordered : List Row)
     (preserved : ∀ row ∈ ordered.take count, keep row = true) :
@@ -324,6 +332,7 @@ example : point (admit [correction.reverse, original] 2) 2 0 3 = none := by deci
 #print axioms resolution_sees_last_tentative_put
 #print axioms candidate_superset_refines_scan
 #print axioms cutoff_keeps_possible_ties
+#print axioms idealized_bm25_term_bound
 #print axioms keeping_first_rows_preserves_top_k
 #print axioms key_partition_preserves_answer
 #print axioms scan_constant_between_valid_endpoints

@@ -146,3 +146,10 @@ It has no distributed evidence of which generations readers still need.
 The lease model requires generation validation at admission and an enforced expiry on reads.
 The coordinated pin model requires an authority that serializes pin acquisition and reclamation, plus a contract for abandoned readers.
 Both alternatives are conditional on the modeled provider and clock assumptions.
+
+== Shared trace and ranking algebra
+
+Lean and the production Rust temporal resolver agreed on 4,096 generated point observations over 128 histories, in addition to the 13 hand-written observations.
+The retained seed includes alternate admission horizons, valid interval endpoints, multiple entities and same-batch put, delete and erase.
+The mathematical BM25 term fraction increases with a greater frequency and lower normalization term under the ordered arithmetic premises.
+The concrete floating-point window implementation still needs a rounding and frontier proof.

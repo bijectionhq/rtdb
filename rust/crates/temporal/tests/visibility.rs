@@ -39,7 +39,10 @@ fn the_production_resolver_agrees_with_the_reference_trace() {
     let mut events: Vec<(EventHeader, Option<i64>)> = Vec::new();
     let mut name = "";
     let mut observations = 0;
-    for line in include_str!("../../../../verification/traces/temporal.tsv").lines() {
+    let input = std::env::var_os("RTDB_TEMPORAL_TRACE")
+        .map(|path| std::fs::read_to_string(path).unwrap())
+        .unwrap_or_else(|| include_str!("../../../../verification/traces/temporal.tsv").to_string());
+    for line in input.lines() {
         let fields: Vec<_> = line.split('\t').collect();
         let event = |system, key, valid_time, op| EventHeader {
             system_from: Timestamp(number(system)), iid: iid(key), valid_time, op,
@@ -75,7 +78,7 @@ fn the_production_resolver_agrees_with_the_reference_trace() {
             _ => panic!("{name}: malformed trace row {line}"),
         }
     }
-    assert_eq!(observations, 13);
+    assert!(observations > 0);
 }
 
 #[test]

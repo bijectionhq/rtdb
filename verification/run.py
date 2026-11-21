@@ -5,6 +5,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import random
 import re
 import subprocess
 import tarfile
@@ -103,16 +104,19 @@ def verify_lean(args, scratch):
     path = Path("verification/lean/History.lean")
     controls = {
         "baseline": None,
-        "closed-upper": ("valid < span.upper", "valid ≤ span.upper", "half_open"),
+        "closed-upper": (
+            "valid < span.upper", "valid ≤ span.upper",
+            ["contains_between_endpoints", "half_open"],
+        ),
         "erase-at-query-time": (
             "if key = other then none else scan system key valid tail",
             "if key = other ∧ event.commit ≤ system then none else scan system key valid tail",
-            "scan_refines_point",
+            ["erased_history_cannot_change_fresh_answer", "key_partition_preserves_answer", "scan_refines_point"],
         ),
         "allow-tied-cutoff": (
             "    ¬ frontier < kth := by omega",
             "    ¬ frontier ≤ kth := by omega",
-            "cutoff_keeps_possible_ties",
+            ["cutoff_keeps_possible_ties"],
         ),
     }
     for name, mutation in controls.items():
@@ -126,11 +130,14 @@ def verify_lean(args, scratch):
         unsupported = re.findall(r"depends on axioms: \[([^\]]*)\]", result.stdout)
         allowed = {"propext", "Classical.choice", "Quot.sound"}
         if mutation:
-            failed_law = bool(re.search(
-                rf"'RTDB\.{mutation[2]}' depends on axioms: \[[^\]\n]*sorryAx", result.stdout
-            ))
-            if not result.returncode or not failed_law:
-                raise ValueError(f"{case}: expected {mutation[2]} to fail")
+            source_lines = source.read_text().splitlines()
+            errors = re.findall(r"^verification/lean/History\.lean:(\d+):\d+: error", result.stdout, re.M)
+            observed = sorted(
+                re.findall(r"^theorem (\w+)", "\n".join(source_lines[:int(line)]), re.M)[-1]
+                for line in errors
+            )
+            if not result.returncode or observed != mutation[2]:
+                raise ValueError(f"{case}: expected {mutation[2]}, observed {observed}")
         elif result.returncode or not unsupported or any(
             set(axioms.split(", ")) - allowed for axioms in unsupported
         ):
@@ -160,6 +167,59 @@ def verify_lean(args, scratch):
             if checked.returncode or "13 trace observations match" not in checked.stdout:
                 raise ValueError("Lean shared trace failed")
             print(f"lean-shared-trace: {checked.stdout.strip()}")
+            generated = args.evidence / "temporal-seed-52544442.tsv"
+            count = write_generated_temporal_trace(generated)
+            checked = run_case(
+                [args.lean, "--run", str(replay), str(generated)], directory, args.evidence,
+                "lean-generated-trace", env,
+            )
+            if checked.returncode or f"{count} trace observations match" not in checked.stdout:
+                raise ValueError("Lean rejected the generated temporal trace")
+            print(f"lean-generated-trace: {checked.stdout.strip()}")
+
+
+def write_generated_temporal_trace(path):
+    rng = random.Random(0x52544442)
+    lines = []
+    observations = 0
+    for case in range(128):
+        lines.append(("case", f"generated_{case}"))
+        facts = []
+        for commit in range(1, 6):
+            for _ in range(rng.randrange(1, 6)):
+                key = rng.randrange(4)
+                lower = rng.randrange(-10, 31)
+                upper = lower + rng.randrange(0, 12)
+                operation = rng.choice(("put", "put", "put", "delete", "erase"))
+                value = rng.randrange(1_000)
+                line = (operation, commit, key)
+                if operation != "erase":
+                    line += (lower, upper)
+                if operation == "put":
+                    line += (value,)
+                lines.append(line)
+                facts.append((commit, key, operation, lower, upper, value))
+        for _ in range(32):
+            horizon = rng.randrange(1, 6)
+            system = rng.randrange(1, horizon + 1)
+            key = rng.randrange(4)
+            candidates = [bound for _, _, op, lower, upper, _ in facts
+                          if op != "erase" for bound in (lower, upper)]
+            valid = rng.choice(candidates) if candidates else 0
+            expected = "none"
+            for commit, subject, operation, lower, upper, value in reversed(facts):
+                if commit > horizon or subject != key:
+                    continue
+                if operation == "erase":
+                    break
+                if commit <= system and lower <= valid < upper:
+                    if operation == "put":
+                        expected = value
+                    break
+            lines.append(("expect", horizon, system, key, valid, expected))
+            observations += 1
+    path.write_text("".join("\t".join(map(str, line)) + "\n" for line in lines))
+    return observations
 
 
 TLA_CASES = (
@@ -321,6 +381,24 @@ def verify_replica_boundary(args, scratch):
         print(f"replica-boundary-{name}: {'rejected with ' + control[1] if control else 'compiled'}")
 
 
+def replay_rust_trace(args):
+    env = os.environ | {
+        "RTDB_TEMPORAL_TRACE": str(args.evidence / "temporal-seed-52544442.tsv"),
+        "CARGO_TARGET_DIR": str(ROOT / "target"),
+        "CARGO_PROFILE_DEV_DEBUG": "0",
+        "CARGO_PROFILE_TEST_DEBUG": "0",
+        "CARGO_INCREMENTAL": "0",
+    }
+    log = run_case(
+        ["cargo", "test", "--locked", "-p", "rtdb-temporal", "--test", "visibility",
+         "the_production_resolver_agrees_with_the_reference_trace", "--", "--exact"],
+        ROOT / "rust", args.evidence, "rust-generated-trace", env,
+    )
+    if log.returncode or "1 passed; 0 failed" not in log.stdout:
+        raise ValueError("Production resolver rejected the generated temporal trace")
+    print("rust-generated-trace: production resolver agrees on all 4096 observations")
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--lean", required=True)
@@ -331,6 +409,7 @@ def main():
     parser.add_argument("--apalache", required=True)
     parser.add_argument("--maude", required=True)
     parser.add_argument("--rust-boundary", action="store_true")
+    parser.add_argument("--native-replay", action="store_true")
     parser.add_argument("--evidence", required=True, type=Path)
     args = parser.parse_args()
     if os.environ.get("BIJECTION_LOCAL_EXECUTION") != "owner-authorized":
@@ -360,6 +439,8 @@ def main():
         verify_maude(args, directory)
         if args.rust_boundary:
             verify_replica_boundary(args, directory)
+        if args.native_replay:
+            replay_rust_trace(args)
 
 
 if __name__ == "__main__":
