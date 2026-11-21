@@ -107,8 +107,10 @@ impl TableTries {
                 trie.state = if self.shards.get(&current).is_some_and(|state| state.tries.range(block..).any(|(_, trie)| trie.state == TrieState::Live)) {
                     TrieState::Live
                 } else { TrieState::Nascent };
+                if trie.state == TrieState::Nascent && shard.part.is_empty() {
+                    self.l1h_recencies.entry(block).or_default().insert(recency);
+                }
                 self.shards.entry(shard).or_default().insert(trie);
-                self.l1h_recencies.entry(block).or_default().insert(recency);
             }
             (1, None) => {
                 if let Some(recencies) = self.l1h_recencies.remove(&block) {
@@ -270,6 +272,14 @@ impl TrieCatalog {
                 }
                 value.max_block_index = partition.max_block_index.map(BlockIndex).unwrap_or(value.max_block_index.max(BlockIndex(0)));
                 state.shards.insert(shard, value);
+            }
+            for (shard, value) in &state.shards {
+                let (1, Some(recency), []) = (shard.level, shard.recency, shard.part.as_slice()) else { continue; };
+                for (block, trie) in &value.tries {
+                    if trie.state == TrieState::Nascent {
+                        state.l1h_recencies.entry(*block).or_default().insert(recency);
+                    }
+                }
             }
             if reconstruct_watermarks {
                 let floors: Vec<_> = state.shards.iter().map(|(shard, value)| (shard.clone(), value.max_block_index)).collect();

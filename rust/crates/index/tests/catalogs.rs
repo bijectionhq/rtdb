@@ -58,6 +58,31 @@ fn l1_current_before_historical_and_replayed_l0_are_idempotent_4301_4545() {
 }
 
 #[test]
+fn a_checkpoint_preserves_pending_historical_promotion_for_each_block() {
+    let initial = apply(&[
+        ("l00-rc-b00", 10),
+        ("l00-rc-b01", 10),
+        ("l01-r20200101-b00", 5),
+        ("l01-r20200102-b00", 5),
+        ("l01-r20200101-b01", 5),
+    ]);
+    let block = TableBlock::from_parts(BTreeMap::new(), &Default::default(), 0, initial.partitions(&table()).unwrap()).unwrap();
+    let block = TableBlock::decode(&block.encode()).unwrap();
+    let loaded = TrieCatalog::load(&BTreeMap::from([(table(), block)]), 20, Timestamp(101)).unwrap();
+    for mut catalog in [initial, loaded] {
+        assert_eq!(current(&catalog), names(&["l00-rc-b00", "l00-rc-b01"]));
+        catalog = catalog.with_tries(table(), [notification("l01-rc-b00", 20)], Timestamp(102)).unwrap();
+        assert_eq!(current(&catalog), names(&[
+            "l00-rc-b01", "l01-rc-b00", "l01-r20200101-b00", "l01-r20200102-b00",
+        ]));
+        catalog = catalog.with_tries(table(), [notification("l01-rc-b01", 20)], Timestamp(103)).unwrap();
+        assert_eq!(current(&catalog), names(&[
+            "l01-rc-b00", "l01-rc-b01", "l01-r20200101-b00", "l01-r20200101-b01", "l01-r20200102-b00",
+        ]));
+    }
+}
+
+#[test]
 fn persisted_partitions_repair_covered_l0_and_drop_old_l0_garbage_5395() {
     let mut live_l0 = notification("l00-rc-b00", 10); live_l0.state = TrieState::Live;
     let mut garbage_l0 = notification("l00-rc-b01", 10); garbage_l0.state = TrieState::Garbage { as_of: Timestamp(100) };
