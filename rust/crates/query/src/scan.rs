@@ -898,7 +898,10 @@ impl PartitionScan {
         let page_test = crate::page_metadata::PageTest::for_scan(&self.scan, &self.execution).await?;
         let table = &self.scan.table.name.table;
         let catalog = self.snapshot.trie_catalog();
-        let current_tries = || catalog.iter_tries(table).filter(|trie| trie.state == TrieState::Live);
+        // A trie without rows has no temporal bounds to record, and a candidate without bounds stops the selection below
+        // from pruning any other: compaction writes such a current trie whenever every row it merges has a finite recency.
+        let current_tries = || catalog.iter_tries(table).filter(|trie| trie.state == TrieState::Live
+            && !trie.metadata.as_ref().is_some_and(|metadata| metadata.row_count == Some(0)));
         let trie_count = current_tries().count();
         let candidate_reservation = if trie_count == 0 { None } else {
             let bytes = trie_count.checked_mul(std::mem::size_of::<&CatalogTrie>()).and_then(|bytes| bytes.checked_add(256))

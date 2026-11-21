@@ -29,24 +29,24 @@ impl CatalogMetrics for CatalogFixtures { fn metrics(&self) -> Result<CatalogRow
 struct TickClock(AtomicI64);
 impl Clock for TickClock { fn now(&self) -> Timestamp { Timestamp(self.0.fetch_add(1000, Ordering::Relaxed)) } }
 
-struct Fixture { node: Node, driver: tokio::task::JoinHandle<Result<()>>, session: NativeSession }
+struct Fixture { node: Node, driver: tokio::task::JoinHandle<Result<()>>, session: NativeSession, clock: Arc<TickClock> }
 
 impl Fixture {
-    async fn open() -> Self { Self::open_with(|_| {}).await }
-    async fn open_with(configure: impl FnOnce(&mut NodeOptions)) -> Self {
-        let clock = Arc::new(TickClock(AtomicI64::new(1_000_000)));
-        let services = NodeServices { resources: Arc::new(NativeResources::default().with_local_log_clock(clock.clone(), false)), clock, ..NodeServices::local(Arc::new(Authority), Arc::new(Observer), Arc::new(CatalogFixtures), Arc::new(CatalogFixtures)) };
+    async fn open() -> Self { Self::open_at(1_000_000).await }
+    /// A node whose clock, and so its system time, starts at `now`.
+    async fn open_at(now: i64) -> Self {
+        let clock = Arc::new(TickClock(AtomicI64::new(now)));
+        let services = NodeServices { resources: Arc::new(NativeResources::default().with_local_log_clock(clock.clone(), false)), clock: clock.clone(), ..NodeServices::local(Arc::new(Authority), Arc::new(Observer), Arc::new(CatalogFixtures), Arc::new(CatalogFixtures)) };
         let mut options = NodeOptions::default();
         options.replication.assertion_interval = Duration::from_millis(1);
         options.replication.election_seed = 1;
         options.replication.flush_timeout = Duration::from_secs(3600);
         options.automatic_compaction = false;
         options.automatic_gc = false;
-        configure(&mut options);
         let (node, driver) = Node::open(options, services).await.unwrap();
         let driver = tokio::spawn(driver.run());
         let session = node.session("xtdb", Arc::new(Authority)).unwrap();
-        Self { node, driver, session }
+        Self { node, driver, session, clock }
     }
     async fn close(self) {
         drop(self.session);
@@ -296,5 +296,94 @@ async fn a_limit_over_hashed_ids_in_id_order_sorts_them() {
     fixture.flush().await;
     assert_eq!(fixture.rows("SELECT v FROM docs ORDER BY _id DESC LIMIT 3", vec![]).await, [vec![Value::I64(2_999)], vec![Value::I64(2_998)], vec![Value::I64(2_997)]]);
     assert_eq!(fixture.rows("SELECT v FROM docs WHERE _id >= ? ORDER BY _id LIMIT 2", vec![text_id(1_500)]).await, [vec![Value::I64(1_500)], vec![Value::I64(1_501)]]);
+    fixture.close().await;
+}
+
+const WEEK: i64 = 7 * 86_400_000_000;
+/// 2020-01-06T00:00:00Z, a Monday, so that week `n` after it is one recency partition.
+const EPOCH: i64 = 1_578_268_800_000_000;
+fn instant(micros: i64) -> Value { Value::Timestamp { value: micros, unit: rtdb_types::TimeUnit::Microsecond, timezone: Some("UTC".into()) } }
+fn timestamp_literal(micros: i64) -> String {
+    let (seconds, fraction) = (micros.div_euclid(1_000_000), micros.rem_euclid(1_000_000));
+    let (days, second) = (seconds.div_euclid(86_400), seconds.rem_euclid(86_400));
+    let date = rtdb_types::CivilDate::from_epoch_day(days).unwrap();
+    format!("TIMESTAMP '{date}T{:02}:{:02}:{:02}.{fraction:06}Z'", second / 3600, second % 3600 / 60, second % 60)
+}
+
+#[tokio::test]
+async fn a_valid_time_read_prunes_the_files_and_pages_whose_valid_extents_lie_outside_it() {
+    let mut fixture = Fixture::open_at(EPOCH + 20 * WEEK).await;
+    // Twelve weeks of instants: each row is valid for the one microsecond it was sampled at.
+    const WEEKS: i64 = 12;
+    const PER_WEEK: i64 = 400;
+    let at = |week: i64, sample: i64| EPOCH + week * WEEK + sample * (WEEK / PER_WEEK) + 1;
+    let rows: Vec<Vec<Value>> = (0..WEEKS).flat_map(|week| (0..PER_WEEK).map(move |sample| (week, sample)))
+        .map(|(week, sample)| vec![uuid(point_id(1, (week * PER_WEEK + sample) as u64, 0)), Value::I64(week * PER_WEEK + sample), instant(at(week, sample)), instant(at(week, sample) + 1)]).collect();
+    fixture.commit("INSERT INTO samples (_id, n, _valid_from, _valid_to) VALUES (?, ?, ?, ?)", rows).await.unwrap();
+    fixture.flush().await;
+    fixture.compact().await;
+    let tries = fixture.node.catalog().database("xtdb").unwrap().trie_catalog().current_tries(&TableRef::new("public", "samples")).len() as i64;
+    assert!(tries >= WEEKS, "compaction wrote a file per week of recency: {tries}");
+
+    let numbers = |rows: Vec<Vec<Value>>| { let mut numbers: Vec<i64> = rows.into_iter().map(|row| match row[0] { Value::I64(n) => n, _ => panic!("n is an integer") }).collect(); numbers.sort_unstable(); numbers };
+    // One week, the instants at its two ends included and excluded as a half-open period is.
+    let week = format!("SELECT n FROM samples FOR VALID_TIME FROM {} TO {}", timestamp_literal(at(5, 0)), timestamp_literal(at(6, 0)));
+    assert_eq!(numbers(fixture.rows(&week, vec![]).await), (5 * PER_WEEK..6 * PER_WEEK).collect::<Vec<_>>());
+    let counters = fixture.counters(&week, vec![]).await;
+    assert!(counters["scan_files_used"] <= 2 && counters["scan_files_pruned"] >= tries - 2, "one week of {tries} files: {counters:?}");
+
+    let point = format!("SELECT n FROM samples FOR VALID_TIME AS OF {}", timestamp_literal(at(7, 123)));
+    assert_eq!(numbers(fixture.rows(&point, vec![]).await), [7 * PER_WEEK + 123]);
+    let counters = fixture.counters(&point, vec![]).await;
+    assert!(counters["scan_files_used"] <= 1 && counters["scan_pages_used"] <= 1, "one instant: {counters:?}");
+    assert_eq!(numbers(fixture.rows(&format!("SELECT n FROM samples FOR VALID_TIME AS OF {}", timestamp_literal(at(7, 123) + 1)), vec![]).await), Vec::<i64>::new());
+
+    // Three weeks, and every instant: nothing in range is dropped.
+    let span = format!("SELECT n FROM samples FOR VALID_TIME FROM {} TO {}", timestamp_literal(at(2, 100)), timestamp_literal(at(5, 100)));
+    assert_eq!(numbers(fixture.rows(&span, vec![]).await), (2 * PER_WEEK + 100..5 * PER_WEEK + 100).collect::<Vec<_>>());
+    let counters = fixture.counters(&span, vec![]).await;
+    assert!(counters["scan_files_used"] <= 5 && counters["scan_files_pruned"] >= tries - 5, "{counters:?}");
+    assert_eq!(numbers(fixture.rows("SELECT n FROM samples FOR ALL VALID_TIME", vec![]).await), (0..WEEKS * PER_WEEK).collect::<Vec<_>>());
+
+    // Rows written after the compaction are read from the live index beside the pruned files.
+    fixture.commit("INSERT INTO samples (_id, n, _valid_from, _valid_to) VALUES (?, ?, ?, ?)", vec![vec![uuid(point_id(1, 1 << 30, 0)), Value::I64(-1), instant(at(5, 7) + 3), instant(at(5, 7) + 4)]]).await.unwrap();
+    let mut expected: Vec<i64> = (5 * PER_WEEK..6 * PER_WEEK).collect();
+    expected.insert(0, -1);
+    assert_eq!(numbers(fixture.rows(&week, vec![]).await), expected);
+    let counters = fixture.counters(&week, vec![]).await;
+    assert!(counters["scan_files_pruned"] >= tries - 2, "{counters:?}");
+    fixture.close().await;
+}
+
+#[tokio::test]
+async fn a_read_of_a_long_history_prunes_the_files_of_versions_superseded_before_it() {
+    let mut fixture = Fixture::open_at(EPOCH).await;
+    // One entity rewritten every week, each version holding from the moment it was accepted.
+    const WEEKS: i64 = 12;
+    for week in 0..WEEKS {
+        fixture.clock.0.store(EPOCH + week * WEEK + 3_600_000_000, Ordering::Relaxed);
+        fixture.commit("INSERT INTO prices (_id, n) VALUES (?, ?)", vec![vec![Value::Utf8("widget".into()), Value::I64(week)]]).await.unwrap();
+    }
+    fixture.clock.0.store(EPOCH + WEEKS * WEEK, Ordering::Relaxed);
+    fixture.flush().await;
+    fixture.compact().await;
+    let tries = fixture.node.catalog().database("xtdb").unwrap().trie_catalog().current_tries(&TableRef::new("public", "prices")).len() as i64;
+    assert!(tries >= WEEKS - 1, "compaction wrote a file per week in which a version was superseded: {tries}");
+
+    // The value now: the files of the versions superseded before this week are behind the read.
+    assert_eq!(fixture.rows("SELECT n FROM prices", vec![]).await, [vec![Value::I64(WEEKS - 1)]]);
+    let counters = fixture.counters("SELECT n FROM prices", vec![]).await;
+    assert!(counters["scan_files_used"] <= 2 && counters["scan_files_pruned"] >= tries - 2, "{tries} files: {counters:?}");
+    // The value at an earlier instant, and as it was recorded at one.
+    for week in [0, 4, WEEKS - 2] {
+        let instant = timestamp_literal(EPOCH + week * WEEK + WEEK / 2);
+        for period in [format!("FOR VALID_TIME AS OF {instant}"), format!("FOR SYSTEM_TIME AS OF {instant}")] {
+            let sql = format!("SELECT n FROM prices {period}");
+            assert_eq!(fixture.rows(&sql, vec![]).await, [vec![Value::I64(week)]], "{sql}");
+        }
+        let counters = fixture.counters(&format!("SELECT n FROM prices FOR VALID_TIME AS OF {instant}"), vec![]).await;
+        assert!(counters["scan_files_used"] <= 3 && counters["scan_files_pruned"] >= tries - 3, "week {week} of {tries} files: {counters:?}");
+    }
+    assert_eq!(fixture.rows("SELECT COUNT(*) FROM prices FOR ALL VALID_TIME", vec![]).await, [vec![Value::I64(WEEKS)]]);
     fixture.close().await;
 }
