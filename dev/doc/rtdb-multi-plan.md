@@ -328,6 +328,9 @@ The measurement covers enqueue through durable receipt after writer setup and wa
 | 64 | 37,990–51,919 | 1.021–1.045 | 4.880–11.020 |
 | 256 | 50,507–60,314 | 3.835–4.089 | 10.459–14.254 |
 
+After adding bounded admission and incremental retained-epoch summaries, one release repeat measured 8,720, 40,660, and 41,178 commits/s at 1, 64, and 256 streams respectively.
+Median commit latencies were 0.111, 1.056, and 4.187 ms, and p99 latencies were 0.201, 1.680, and 21.346 ms.
+
 ```sh
 RTDB_LOG_BENCH_STREAMS=64 RTDB_LOG_BENCH_APPENDS=1000 \
   cargo test --manifest-path rust/Cargo.toml -p rtdb-logkeeper --release \
@@ -846,6 +849,8 @@ The next table compares how many handoffs a draining member could execute concur
 
 The draining node now runs two handoffs at a time and still takes up to eight per pass.
 The optional latency limit fails a run when either scale transition reaches the specified p99.
+On the integrated build with journal backpressure, shared gateway heartbeats and idle flushing, two of three trials passed the 30 ms limit in both transitions.
+The third scale-in measured 36.4 ms p99, and every counter still matched.
 
 ```sh
 RTDB_TEST_PGWIRE_CONNECTIONS=256 RTDB_CELL_BENCH_CONNECTIONS=4 RTDB_CELL_BENCH_SCALE=1 RTDB_CELL_BENCH_SCALE_P99_LIMIT_MS=30 \
