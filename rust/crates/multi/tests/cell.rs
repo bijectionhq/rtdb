@@ -1084,6 +1084,36 @@ async fn restoring_the_current_archive_preserves_the_ordered_tail_and_authority(
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn park_drains_admission_before_flushing_and_publishes_its_checkpoint() {
+    let cell = Cell::start_durable(1).await;
+    admin::create_deployment(cell.directory.as_ref(), "shop", "acme", 3).await.unwrap();
+    let client = cell.connect("shop").await;
+    client.simple_query("INSERT INTO orders (_id, total) VALUES (1, 9)").await.unwrap();
+    drop(client);
+    let database = cell.node(0).server.node().catalog().database("shop").unwrap();
+    let position = database.latest_submitted_position().unwrap();
+    {
+        let admission = database.pause_transactions().await.unwrap();
+        let park = cell.node(0).agent.park("shop");
+        tokio::pin!(park);
+        assert!(tokio::time::timeout(Duration::from_millis(120), &mut park).await.is_err());
+        assert!(database.status().adopted_block.is_none());
+        drop(admission);
+        park.await.unwrap();
+    }
+
+    let parked = cell.directory.deployment_by_name("shop").await.unwrap().unwrap();
+    assert!(parked.holder.is_none());
+    let checkpoint = parked.checkpoint.expect("a parked deployment publishes its final checkpoint");
+    assert!(checkpoint.source >= position.after_offset(rtdb_types::StorageEpoch(parked.log_epoch)));
+    drop(database);
+    let client = cell.connect("shop").await;
+    assert_eq!(values(&client, "SELECT total FROM orders").await, ["9"]);
+    drop(client);
+    cell.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_small_flush_writes_one_pack_and_its_catalog() {
     let cell = Cell::start(1, None).await;
     let record = admin::create_deployment(cell.directory.as_ref(), "shop", "acme", 3).await.unwrap();

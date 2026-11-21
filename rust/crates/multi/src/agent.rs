@@ -10,7 +10,8 @@ use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use parking_lot::Mutex;
-use rtdb_directory::{Cas, DeploymentRecord, Directory, Lifecycle, MemberId, MemberRecord, MemberState, claim, effective_holder, now_ms, park};
+use rtdb_directory::{Cas, Checkpoint, DeploymentRecord, Directory, Lifecycle, MemberId, MemberRecord, MemberState, claim, effective_holder, now_ms, park};
+use rtdb_format::catalog::BlockCatalog;
 use rtdb_node::{Database, Node};
 use rtdb_replication::Role as DriverRole;
 use rtdb_types::{Anomaly, AnomalyCategory, Result, StorageEpoch};
@@ -392,6 +393,10 @@ impl NodeAgent {
     /// Stops running `name` on this node, waiting for its resources to drain so the name can be opened again.
     async fn stop_running(&self, name: &str) {
         self.stop_serving(name).await;
+        self.wait_until_detached(name).await;
+    }
+
+    async fn wait_until_detached(&self, name: &str) {
         while self.node.catalog().is_draining(name) { tokio::time::sleep(Duration::from_millis(5)).await; }
     }
 
@@ -462,24 +467,33 @@ impl NodeAgent {
         let database = self.node.catalog().database(name).ok();
         let deadline = tokio::time::Instant::now() + flush_wait;
         let remaining = || deadline.saturating_duration_since(tokio::time::Instant::now());
-        let write_pause = match (database.as_ref(), log_epoch) {
-            (Some(database), Some(log_epoch)) => {
-                if !short_handoff_tail(database, log_epoch) { self.flush_and_adopt(database, &id, epoch, remaining()).await?; }
-                let pause = tokio::time::timeout_at(deadline, database.pause_transactions()).await.map_err(|_| {
-                    Anomaly::new(AnomalyCategory::Unavailable, "rtdb.multi/handoff-drain-timeout", "The holder could not drain its admitted writes in time")
-                })??;
-                if !short_handoff_tail(database, log_epoch) { self.flush_and_adopt(database, &id, epoch, remaining()).await?; }
-                Some(pause)
+        let write_pause = if let Some(database) = database.as_ref() {
+            if log_epoch.is_some_and(|epoch| !short_handoff_tail(database, epoch)) {
+                self.flush_and_adopt(database, &id, epoch, remaining()).await?;
             }
-            (Some(database), None) => { self.flush_and_adopt(database, &id, epoch, remaining()).await?; None }
-            (None, _) => None,
-        };
+            let pause = tokio::time::timeout_at(deadline, database.pause_transactions()).await.map_err(|_| {
+                let code = if moving.is_some() { "rtdb.multi/handoff-drain-timeout" } else { "rtdb.multi/park-drain-timeout" };
+                Anomaly::new(AnomalyCategory::Unavailable, code, "The holder could not drain its admitted writes in time")
+            })??;
+            if log_epoch.is_none_or(|epoch| !short_handoff_tail(database, epoch)) {
+                self.flush_and_adopt(database, &id, epoch, remaining()).await?;
+            }
+            Some(pause)
+        } else { None };
+        let adopted = database.as_ref().and_then(|database| database.status().adopted_block);
         for _ in 0..8 {
             let Some(record) = self.directory.deployment(&id).await? else { break };
             if !is_requested(&record) { return Err(stale_handoff(name)); }
-            let Some(parked) = park(&record, &self.member(), epoch) else { break };
+            let Some(mut parked) = park(&record, &self.member(), epoch) else { break };
+            if let Some(checkpoint) = adopted.as_deref().and_then(|block| checkpoint_for_block(block, StorageEpoch(record.log_epoch)))
+                && record.checkpoint.is_none_or(|previous| previous.block < checkpoint.block)
+            {
+                parked.checkpoint = Some(checkpoint);
+            }
             if let Cas::Applied(_) = self.directory.replace_deployment(parked, record.version).await? {
-                if write_pause.is_some() { self.stop_serving(name).await; } else { self.stop_running(name).await; }
+                self.stop_serving(name).await;
+                drop(write_pause);
+                if moving.is_none() { self.wait_until_detached(name).await; }
                 return Ok(Response::Done);
             }
         }
@@ -622,19 +636,13 @@ impl NodeAgent {
     async fn publish_and_trim(&self, name: &str, id: &str, epoch: u64) {
         let Ok(database) = self.node.catalog().database(name) else { return };
         let Some(block) = database.status().adopted_block else { return };
-        let Some(position) = block.boundary_replica_position() else { return };
         let Ok(Some(record)) = self.directory.deployment(id).await else { return };
         if record.epoch != epoch || record.holder.as_ref() != Some(&self.member()) { return; }
-
-        let log_epoch = rtdb_types::StorageEpoch(record.log_epoch);
-        let boundary = position.after_offset(log_epoch);
-        if boundary < 0 { return; }
-        let block_index = block.block_index().0;
-        if record.checkpoint.is_none_or(|checkpoint| checkpoint.block < block_index) {
+        let Some(checkpoint) = checkpoint_for_block(&block, StorageEpoch(record.log_epoch)) else { return };
+        let boundary = checkpoint.boundary;
+        if record.checkpoint.is_none_or(|previous| previous.block < checkpoint.block) {
             let mut next = record.clone();
-            let source = block.latest_source_position().map_or(-1, |position| position.after_offset(log_epoch));
-            let system_time = block.latest_completed_tx().map_or(i64::MIN, |tx| tx.system_time.0);
-            next.checkpoint = Some(rtdb_directory::Checkpoint { block: block_index, boundary, source, system_time });
+            next.checkpoint = Some(checkpoint);
             if !matches!(self.directory.replace_deployment(next, record.version).await, Ok(Cas::Applied(_))) { return; }
         }
 
@@ -818,6 +826,17 @@ impl NodeAgent {
             }
         }
     }
+}
+
+fn checkpoint_for_block(block: &BlockCatalog, log_epoch: StorageEpoch) -> Option<Checkpoint> {
+    let boundary = block.boundary_replica_position()?.after_offset(log_epoch);
+    if boundary < 0 { return None; }
+    Some(Checkpoint {
+        block: block.block_index().0,
+        boundary,
+        source: block.latest_source_position().map_or(-1, |position| position.after_offset(log_epoch)),
+        system_time: block.latest_completed_tx().map_or(i64::MIN, |tx| tx.system_time.0),
+    })
 }
 
 fn short_handoff_tail(database: &Database, log_epoch: StorageEpoch) -> bool {

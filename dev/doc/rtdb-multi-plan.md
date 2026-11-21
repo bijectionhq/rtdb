@@ -592,6 +592,8 @@ A parked deployment must cost nothing but its record and objects (`CostFollowsAc
 
 1. `Holding.residency` with `active`, `resident_idle` and `parked`.
    Resident-idle drops the tail live index and keeps catalogs; parked releases the holder in one CAS after a final flush and `Parked` record.
+   Ordinary parking waits for admitted user transactions and pauses new submissions before flushing.
+   It publishes the resulting checkpoint in the directory update that releases the holder.
 2. LRU parking under memory pressure after `min_residency` (`ParkUnderPressure`).
    The placed node starts parking its least recently touched holdings at 80 percent of the execution-memory limit and targets 75 percent.
    A new activation rechecks headroom after reclamation before claiming.

@@ -1474,7 +1474,8 @@ rule ReclaimExecutionMemory {
 }
 
 rule Park {
-    -- Parking flushes whatever tail remains, commits Parked, then clears the holder and the loglets in one cas.
+    -- Parking pauses new submissions and waits for admitted transactions before the final flush.
+    -- The holder publishes the final checkpoint in the same cas that clears the placement.
     when: ParkStarted(holding)
 
     ensures:
