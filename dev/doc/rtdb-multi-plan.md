@@ -885,6 +885,14 @@ The trial ranges for scale-out p99 were 112.2–192.6 ms on demand and 38.1–16
 The trial ranges for scale-in p99 were 141.4–217.7 ms on demand and 108.8–208.5 ms with a standby witness.
 These trials shared the host with test builds and leave the 30 ms acceptance gate open.
 
+Three paired runs on the same local host compared the 16-record and 64-live-row policy with a 64-record and 256-live-row policy whose larger tail had to fit in 128 KiB of writer-buffered data.
+All six Zipf trials verified their 32,768 updates.
+The existing policy measured 75.6–156.8 ms p99 during scale-out and 91.8–206.3 ms during scale-in.
+The larger tail measured 87.3–200.8 ms during scale-out and 109.7–453.0 ms during scale-in.
+Three 48-move continuous-write trials per policy measured gap p99 of 38.1–150.0 ms with the existing policy and 132.6–4,498.9 ms with the larger tail.
+The move corresponding to the 4.5-second gap also took 4.5 seconds in the administration call.
+The branch keeps the 16-record and 64-live-row limits.
+
 ### Stage 12: encryption, lineages, forks and deletion
 
 **Why.**
