@@ -26,7 +26,16 @@ async fn hosted_install_retries_recover_the_same_authority() {
     assert!(installed.linearizable_reads);
     assert!(admin::install_deployment(directory, uuid::Uuid::new_v4(), "shop", "acme", 3).await.is_err());
     assert!(admin::install_deployment(directory, id, "other", "acme", 3).await.is_err());
-    let client = cell.connect("shop").await;
+    let mut client = tokio_postgres::Config::new();
+    client.host("127.0.0.1").port(cell.gateway.port()).user("xtdb").password("cell-test");
+    client.dbname(&format!("shop@{}", uuid::Uuid::new_v4().simple()));
+    assert!(client.connect(NoTls).await.is_err());
+    assert!(cell.holder("shop").await.is_none());
+    let authority = id.simple().to_string();
+    client.dbname(&format!("shop@{authority}"));
+    let (client, connection) = client.connect(NoTls).await.unwrap();
+    assert_eq!(connection.parameter("rtdb_installation_id"), Some(authority.as_str()));
+    tokio::spawn(connection);
     client.simple_query("INSERT INTO orders (_id, total) VALUES (1, 10)").await.unwrap();
     assert_eq!(values(&client, "SELECT total FROM orders").await, ["10"]);
     drop(client);
