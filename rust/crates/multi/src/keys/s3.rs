@@ -216,6 +216,10 @@ fn object_path(id: &str) -> Result<String> {
     if matches!(id, NAMESPACE_KEY_ID | DELETION_SIGNING_KEY_ID) {
         return Ok(format!("metadata/{id}"));
     }
+    let canonical_uuid = |text: &str| Uuid::try_parse(text).is_ok_and(|id| id.to_string() == text);
+    if canonical_uuid(id) {
+        return Ok(format!("keys/{id}-1"));
+    }
     let invalid = || Anomaly::incorrect("rtdb.multi/key-id", "Invalid deployment key identity");
     let (rest, checkpoint) = if let Some(rest) = id.strip_prefix("checkpoint-") {
         (rest, true)
@@ -230,7 +234,6 @@ fn object_path(id: &str) -> Result<String> {
     } else {
         (rest, None)
     };
-    let canonical_uuid = |text: &str| Uuid::try_parse(text).is_ok_and(|id| id.to_string() == text);
     if !canonical_uuid(deployment)
         || !incarnation
             .parse::<u64>()
@@ -297,6 +300,16 @@ mod tests {
             "metadata/.rtdb-deletion-signing-seed"
         );
         assert!(object_path("metadata/.rtdb-key-namespace").is_err());
+    }
+
+    #[test]
+    fn the_first_residence_and_its_explicit_incarnation_share_one_vault_entry() {
+        let mut record = rtdb_directory::DeploymentRecord::new("shop", "acme", Vec::new(), 0);
+        assert_eq!(record.incarnation, 1);
+        let first = object_path(&record.key_id()).unwrap();
+        assert_eq!(first, object_path(&format!("{}-1", record.id)).unwrap());
+        record.incarnation = 2;
+        assert_ne!(first, object_path(&record.key_id()).unwrap());
     }
 
     #[test]
