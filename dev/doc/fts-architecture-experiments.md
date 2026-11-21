@@ -344,6 +344,7 @@ The search, node, and text suites passed 227 tests with `rtdb-node/fts-experimen
 The workload harness uses the native SQL planner and executor from `621022aad`.
 It generates tickets with skewed document lengths, recurring phrases, a mix of common and rare terms, and structured status and cohort fields.
 The workload is synthetic and approximates ticket search shapes.
+The measurements use a locked Rust release build with four Tokio workers on an Apple M4 Max and RTDB's in-memory object storage.
 Each measured query and its oracle use the same captured query context, trie files, and BM25 corpus.
 The oracle evaluates MATCH from resolved row values and disables both ranked and unranked candidate narrowing.
 Each comparison checks the ordered IDs, floating-point scores, projected values, and valid and system interval boundaries.
@@ -433,3 +434,5 @@ Use the observed scoring frontier and verification work when evaluating any earl
 
 The focused release run passed all 56 Rust cases.
 That run includes the end-to-end workload regression with a reduced candidate limit so it exercises both fallback decisions on a small fixture.
+The full Gradle unit rerun passed all 3,187 cases.
+The first Gradle run had one local health-check request fail to receive a response, and the case passed both in isolation and in the full rerun.
