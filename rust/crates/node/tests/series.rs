@@ -235,3 +235,66 @@ async fn an_id_range_over_hashed_ids_is_evaluated_on_every_row() {
     assert_eq!(uuids, (1_000..1_100).filter(|index| index % 2 == 0).map(|index| vec![Value::I64(index)]).collect::<Vec<_>>());
     fixture.close().await;
 }
+
+#[tokio::test]
+async fn a_limit_over_uuid_ids_in_id_order_stops_reading_once_it_has_its_rows() {
+    let mut fixture = Fixture::open().await;
+    let all = points(&mut fixture).await;
+    let whole = fixture.counters("SELECT _id FROM pts", vec![]).await;
+    let in_order = |rows: Vec<Vec<Value>>| rows.into_iter().map(|row| match &row[0] { Value::Uuid(bytes) => u128::from_be_bytes(*bytes), other => panic!("expected a UUID, found {other:?}") }).collect::<Vec<_>>();
+    let at = |id: u128| (id >> 32) as u64 & 0xffff_ffff;
+
+    // The newest and oldest points of one series: its ID prefix, in either order.
+    let series = 7 * 0x0400_0001u32;
+    let (first, last) = (point_id(series, 0, 0), point_id(series + 1, 0, 0) - 1);
+    let of_series: Vec<u128> = all.iter().copied().filter(|id| *id >= first && *id <= last).collect();
+    let range = vec![uuid(first), uuid(last)];
+    let latest = "SELECT _id FROM pts WHERE _id >= ? AND _id <= ? ORDER BY _id DESC LIMIT 1";
+    assert_eq!(in_order(fixture.rows(latest, range.clone()).await), [*of_series.last().unwrap()]);
+    let counters = fixture.counters(latest, range.clone()).await;
+    assert!(counters["scan_pages_used"] <= 2, "the newest row is in the last page of the interval: {counters:?} of {whole:?}");
+    let earliest = "SELECT _id FROM pts WHERE _id >= ? AND _id <= ? ORDER BY _id LIMIT 3";
+    assert_eq!(in_order(fixture.rows(earliest, range.clone()).await), of_series[..3]);
+    assert!(fixture.counters(earliest, range.clone()).await["scan_pages_used"] <= 2);
+
+    // The newest point at or before an instant, and a window further in.
+    let before = point_id(series, 250 * 60, 0);
+    let expected: Vec<u128> = of_series.iter().rev().copied().filter(|id| *id <= before).take(5).collect();
+    assert_eq!(in_order(fixture.rows("SELECT _id FROM pts WHERE _id >= ? AND _id <= ? ORDER BY _id DESC LIMIT 5", vec![uuid(first), uuid(before)]).await), expected);
+    let expected: Vec<u128> = of_series.iter().rev().copied().skip(10).take(4).collect();
+    assert_eq!(in_order(fixture.rows("SELECT _id FROM pts WHERE _id >= ? AND _id <= ? ORDER BY _id DESC LIMIT 4 OFFSET 10", range.clone()).await), expected);
+
+    // A predicate on another column is applied before the limit counts a row.
+    let expected: Vec<u128> = of_series.iter().rev().copied().filter(|id| at(*id) < 6_000).take(2).collect();
+    assert_eq!(in_order(fixture.rows("SELECT _id FROM pts WHERE _id >= ? AND _id <= ? AND at < 6000 ORDER BY _id DESC LIMIT 2", range.clone()).await), expected);
+    let expected: Vec<u128> = of_series.iter().copied().filter(|id| at(*id) % 600 == 0 && at(*id) > 0).take(3).collect();
+    assert_eq!(in_order(fixture.rows("SELECT _id FROM (SELECT _id, at FROM pts WHERE _id >= ? AND _id <= ?) AS p WHERE p.at = 600 OR p.at = 1200 OR p.at = 1800 ORDER BY _id LIMIT 3", range.clone()).await), expected);
+
+    // The whole table, whose newest rows are live and whose oldest are persisted.
+    assert_eq!(in_order(fixture.rows("SELECT _id FROM pts ORDER BY _id DESC LIMIT 7", vec![]).await), all.iter().rev().copied().take(7).collect::<Vec<_>>());
+    assert_eq!(in_order(fixture.rows("SELECT _id FROM pts ORDER BY _id LIMIT 7", vec![]).await), all[..7]);
+    let counters = fixture.counters("SELECT _id FROM pts ORDER BY _id LIMIT 7", vec![]).await;
+    assert!(counters["scan_pages_used"] * 8 <= whole["scan_pages_used"], "{counters:?} of {whole:?}");
+    // More rows than a page holds, across many scan tasks, and more than there are.
+    assert_eq!(in_order(fixture.rows("SELECT _id FROM pts ORDER BY _id DESC LIMIT 3000", vec![]).await), all.iter().rev().copied().take(3_000).collect::<Vec<_>>());
+    assert_eq!(in_order(fixture.rows("SELECT _id FROM pts WHERE _id >= ? AND _id <= ? ORDER BY _id DESC LIMIT 100000", range.clone()).await), of_series.iter().rev().copied().collect::<Vec<_>>());
+    assert!(fixture.rows("SELECT _id FROM pts WHERE _id > ? AND _id < ? ORDER BY _id DESC LIMIT 1", vec![uuid(last), uuid(first)]).await.is_empty());
+
+    // A superseded version and a deleted row are not counted towards the limit.
+    let newest = *of_series.last().unwrap();
+    fixture.commit("UPDATE pts SET at = -1 WHERE _id = ?", vec![vec![uuid(newest)]]).await.unwrap();
+    fixture.commit("DELETE FROM pts WHERE _id = ?", vec![vec![uuid(of_series[of_series.len() - 2])]]).await.unwrap();
+    assert_eq!(fixture.rows("SELECT _id, at FROM pts WHERE _id >= ? AND _id <= ? ORDER BY _id DESC LIMIT 2", range.clone()).await,
+        [vec![uuid(newest), Value::I64(-1)], vec![uuid(of_series[of_series.len() - 3]), Value::I64(at(of_series[of_series.len() - 3]) as i64)]]);
+    fixture.close().await;
+}
+
+#[tokio::test]
+async fn a_limit_over_hashed_ids_in_id_order_sorts_them() {
+    let mut fixture = Fixture::open().await;
+    fixture.commit("INSERT INTO docs (_id, v) VALUES (?, ?)", (0..3_000).map(|index| vec![text_id(index), Value::I64(index as i64)]).collect()).await.unwrap();
+    fixture.flush().await;
+    assert_eq!(fixture.rows("SELECT v FROM docs ORDER BY _id DESC LIMIT 3", vec![]).await, [vec![Value::I64(2_999)], vec![Value::I64(2_998)], vec![Value::I64(2_997)]]);
+    assert_eq!(fixture.rows("SELECT v FROM docs WHERE _id >= ? ORDER BY _id LIMIT 2", vec![text_id(1_500)]).await, [vec![Value::I64(1_500)], vec![Value::I64(1_501)]]);
+    fixture.close().await;
+}

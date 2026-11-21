@@ -180,6 +180,10 @@ Point operations at 1M rows are where the per-file, per-page and per-statement c
    - `path_matches` drops trie files, metadata paths, live leaves and scan tasks outside the interval, and `buffer_task` starts and ends its merge inside it.
    - The predicate still runs on the rows read. Like the `_id = v` narrowing, the interval trusts each row's IID to be the one its ID derives: a row replayed under another IID is not found by its ID.
    - A table holding an ID of any other type is not narrowed, since its IDs are hashed into their IIDs.
+9. `ORDER BY _id ... LIMIT n` over such a table reads in IID order and stops (`iid_ordered_input`), which XTDB also has no counterpart for.
+   - The scan hands its tasks out in ascending or descending IID order, and keeps each task's merged rows in one batch in that order.
+   - The scan's predicates run on those batches, and the limit above stops pulling once it has its rows, so the remaining tasks load no page.
+   - It serves one `_id` sort key over a single partition, where no ordered index answers first. Any other sort is sorted as before.
 
 ### Divergence and impact
 

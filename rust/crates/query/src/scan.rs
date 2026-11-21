@@ -230,6 +230,8 @@ pub(crate) struct PartitionScan {
     canonical_entity_iids: bool,
     /// The inclusive IID range the scan is confined to, by its fragment's prefix and its `_id` range predicates; every IID, otherwise.
     confined: Option<(Iid, Iid)>,
+    /// Set where the scan's rows must leave it in the order of their IIDs; they leave page by page, otherwise.
+    order: Option<IidOrder>,
     /// Parallel to the scan's matches: the query (`None` where it is null, so MATCH is too), and an accelerator's answers for some of the partition's data files.
     matches: Vec<(Option<rtdb_text::Query>, Option<crate::MatchAnswers>)>,
     /// Parallel to the scan's columns: the match each evaluates, if any.
@@ -264,6 +266,10 @@ fn id_selection(scan: &Scan, parameters: &[Value]) -> Option<std::collections::B
         clauses.into_iter().map(equality).collect::<Option<std::collections::BTreeSet<_>>>()
     })
 }
+/// The order of a scan's rows by IID.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum IidOrder { Ascending, Descending }
+
 /// The UUID a literal or parameter is, or that the cast of a string one to UUID gives, which is how `UUID '...'` is bound.
 fn uuid_constant(expr: &Expr, parameters: &[Value]) -> Option<[u8; 16]> {
     fn constant<'v>(expr: &'v Expr, parameters: &'v [Value]) -> Option<&'v Value> {
@@ -384,10 +390,11 @@ impl ScanCursor {
     pub async fn new(scan: Scan, execution: Execution, pushdowns: Option<Arc<crate::pushdown::Pushdowns>>) -> Result<Self> {
         let context = Arc::clone(&execution.context);
         let database = context.catalog.database(&scan.table.name.database)?;
-        Self::over(scan, execution, pushdowns, &database.partitions, &database.storage, true).await
+        Self::over(scan, execution, pushdowns, &database.partitions, &database.storage, true, None).await
     }
     /// A scan of the given partitions of its database, which share `storage`.
-    async fn over(mut scan: Scan, execution: Execution, pushdowns: Option<Arc<crate::pushdown::Pushdowns>>, database_partitions: &[Snapshot], storage: &Arc<BufferPool>, accelerate: bool) -> Result<Self> {
+    /// With an `order`, each partition's rows leave in that order of their IIDs, and the partition is read here rather than split into fragments.
+    async fn over(mut scan: Scan, execution: Execution, pushdowns: Option<Arc<crate::pushdown::Pushdowns>>, database_partitions: &[Snapshot], storage: &Arc<BufferPool>, accelerate: bool, order: Option<IidOrder>) -> Result<Self> {
         let fixed_iids = scan.iids.is_some();
         if !fixed_iids { scan.iids = id_selection(&scan, execution.parameters.values()); }
         let interval = match id_interval(&scan, execution.parameters.values()) {
@@ -446,11 +453,11 @@ impl ScanCursor {
                 initialized: false, files: FileDescriptors::default(), pages: PageDescriptors::default(),
                 tasks: None, loaded: BTreeMap::new(), output: VecDeque::new(),
                 output_reservation: None, counts: ScanCounts::default(), pushdowns: pushdowns.clone(),
-                canonical_entity_iids, confined,
+                canonical_entity_iids, confined, order,
             };
             // A scan narrowed to named IIDs reads a few pages wherever they are; only a whole scan of a single-partition database is split.
             let split = match (&fragmenter, snapshot.tx_basis()) {
-                (Some(fragmenter), Some(basis)) if narrowed.iids.is_none() && narrowed.matches.is_empty() && database_partitions.len() == 1 && !snapshot.has_overlays() =>
+                (Some(fragmenter), Some(basis)) if order.is_none() && narrowed.iids.is_none() && narrowed.matches.is_empty() && database_partitions.len() == 1 && !snapshot.has_overlays() =>
                     fragmenter.depth(&name, &scan.table.name.table, persisted_bytes(snapshot)).map(|depth| (depth, basis)),
                 _ => None,
             };
@@ -480,7 +487,7 @@ impl PartitionScan {
             fragment
         });
         Self { snapshot, storage, scan, execution, bounds, matches: Vec::new(), slots, initialized: false, files: FileDescriptors::default(), pages: PageDescriptors::default(), tasks: None, loaded: BTreeMap::new(),
-            output: VecDeque::new(), output_reservation: None, counts: ScanCounts::default(), pushdowns, canonical_entity_iids, confined }
+            output: VecDeque::new(), output_reservation: None, counts: ScanCounts::default(), pushdowns, canonical_entity_iids, confined, order: None }
     }
     /// The scan another node asked this one for: its fragment's rows within the bounds that node evaluated.
     pub(crate) fn fragment(snapshot: Snapshot, storage: Arc<BufferPool>, fragment: &ScanFragment, execution: Execution) -> Self {
@@ -538,6 +545,65 @@ async fn ordered(scan: &Scan, execution: &Execution, window: std::ops::Range<usi
     Ok(None)
 }
 
+/// The scan's rows in the order its `ORDER BY _id` asks for, where every `_id` of the table is a UUID: a UUID is its
+/// own IID, so the rows are read in IID order and whoever takes them stops the read by taking no more. The scan's
+/// predicates and the residual predicates annotated on it are applied here, as an ordered index applies them, and
+/// the rows from `offset` up to `limit` leave as the columns at `positions`.
+async fn iid_ordered_input(scan: &Scan, execution: &Execution, limit: usize, offset: usize, positions: &[usize]) -> Result<Option<crate::operators::OrderedInput>> {
+    let Some(top) = &scan.ordered_top_k else { return Ok(None) };
+    let ([key], false, true) = (top.order.as_slice(), top.distinct, scan.matches.is_empty()) else { return Ok(None) };
+    let Some(id) = scan.columns.iter().find(|field| field.name == "_id") else { return Ok(None) };
+    if id.data_type != rtdb_types::LogicalType::Scalar(rtdb_types::ScalarType::Uuid) || !matches!(&key.expr, Expr::Column { id: column, .. } if *column == id.id) { return Ok(None); }
+    let table = &scan.table.name.table;
+    if crate::inspection::is_inspection(table) || crate::system_schema::definition(table).is_some() { return Ok(None); }
+    let database = execution.context.catalog.database(&scan.table.name.database)?;
+    // Partitions are read one after another, which orders nothing across them.
+    if database.partitions.len() != 1 { return Ok(None); }
+    let order = if key.descending { IidOrder::Descending } else { IidOrder::Ascending };
+    let schema = Schema::new(scan.columns.clone())?;
+    let predicate = scan.predicates.iter().chain(&top.residuals).cloned().reduce(|left, right| Expr::binary(rtdb_plan::BinaryOp::And, left, right));
+    let mut unordered = scan.clone();
+    unordered.ordered_top_k = None;
+    unordered.top_k = None;
+    let rows: crate::columnar::BoxBatchCursor = Box::new(ScanCursor::over(unordered, execution.clone(), None, &database.partitions, &database.storage, true, Some(order)).await?);
+    let rows = match predicate {
+        Some(predicate) => Box::new(crate::columnar::BatchFilter::new(rows, schema, predicate, execution.clone())) as crate::columnar::BoxBatchCursor,
+        None => rows,
+    };
+    let window = Box::new(OrderedWindow { input: Some(rows), counts: None, skip: offset, remaining: limit.saturating_sub(offset), memory: Arc::clone(&execution.context.memory) });
+    let all = positions.len() == scan.columns.len() && positions.iter().enumerate().all(|(index, position)| index == *position);
+    Ok(Some(crate::operators::OrderedInput::Batches(if all { window } else {
+        Box::new(crate::columnar::BatchProject::new(window, positions.to_vec(), Arc::clone(&execution.context.memory)))
+    })))
+}
+
+/// The rows of an ordered input after the first `skip`, up to `remaining` of them; the input is dropped, and so read no further, once they have left.
+struct OrderedWindow { input: Option<crate::columnar::BoxBatchCursor>, counts: Option<ScanCounts>, skip: usize, remaining: usize, memory: Arc<MemoryBudget> }
+
+#[async_trait]
+impl crate::columnar::BatchCursor for OrderedWindow {
+    async fn next_batch(&mut self) -> Result<Option<crate::columnar::ColumnBatch>> {
+        loop {
+            if self.remaining == 0 { self.close(); }
+            let Some(input) = &mut self.input else { return Ok(None) };
+            let Some(batch) = input.next_batch().await? else { self.close(); return Ok(None) };
+            if self.skip >= batch.len { self.skip -= batch.len; continue; }
+            let first = std::mem::take(&mut self.skip);
+            let taken = (batch.len - first).min(self.remaining);
+            self.remaining -= taken;
+            if first == 0 && taken == batch.len { return Ok(Some(batch)); }
+            let mask: Vec<bool> = (0..batch.len).map(|row| row >= first && row < first + taken).collect();
+            return batch.select(&mask, &self.memory).map(Some);
+        }
+    }
+    fn trace_attributes(&self, span: &mut dyn rtdb_plan::TraceSpan) { if let Some(input) = &self.input { input.trace_attributes(span); } }
+    fn scan_counts(&self) -> Option<ScanCounts> { self.input.as_ref().map_or(self.counts, |input| input.scan_counts()) }
+}
+impl OrderedWindow {
+    /// Drops the input, keeping what it counted.
+    fn close(&mut self) { if let Some(input) = self.input.take() { self.counts = input.scan_counts(); } }
+}
+
 pub(crate) async fn ordered_input(scan: &Scan, execution: &Execution, limit: usize, offset: usize, projection: Option<&[usize]>) -> Result<Option<crate::operators::OrderedInput>> {
     use crate::operators::OrderedInput;
     let full;
@@ -545,7 +611,7 @@ pub(crate) async fn ordered_input(scan: &Scan, execution: &Execution, limit: usi
         Some(positions) => positions,
         None => { full = (0..scan.columns.len()).collect::<Vec<_>>(); &full }
     };
-    let Some(output) = ordered(scan, execution, offset..limit, positions).await? else { return Ok(None); };
+    let Some(output) = ordered(scan, execution, offset..limit, positions).await? else { return iid_ordered_input(scan, execution, limit, offset, positions).await; };
     Ok(Some(match output {
         crate::OrderedScan::Covered(batches) => {
             OrderedInput::Batches(Box::new(CoveredBatches { batches, context: Arc::clone(&execution.context) }))
@@ -709,7 +775,7 @@ impl crate::CandidateVerifier for ScanVerifier<'_> {
             .ok_or_else(|| invalid("verifier-column", "Verified column is not projected by the scan"))?;
         let schema = Schema::new(scan.columns.clone())?;
         let predicate = scan.predicates.iter().cloned().reduce(|left, right| Expr::binary(rtdb_plan::BinaryOp::And, left, right));
-        let mut cursor = ScanCursor::over(scan, self.execution.clone(), self.pushdowns.clone(), std::slice::from_ref(self.partition), self.storage, false).await?;
+        let mut cursor = ScanCursor::over(scan, self.execution.clone(), self.pushdowns.clone(), std::slice::from_ref(self.partition), self.storage, false, None).await?;
         let mut visible = Vec::new();
         while let Some(batch) = cursor.next_batch().await? {
             let crate::columnar::Column::Arrow { array, .. } = &batch.columns[iid_at] else {
@@ -746,7 +812,7 @@ impl crate::CandidateVerifier for ScanVerifier<'_> {
             iids: None, predicates: Vec::new(), top_k: None, ordered_top_k: None, matches: Vec::new(),
         };
         let memory = &self.execution.context.memory;
-        let mut cursor = ScanCursor::over(scan, self.execution.clone(), None, partitions, self.storage, false).await?;
+        let mut cursor = ScanCursor::over(scan, self.execution.clone(), None, partitions, self.storage, false, None).await?;
         let mut corpus = rtdb_text::Corpus::default();
         let mut retained = Vec::new();
         while let Some(mut page) = cursor.next_page().await? {
@@ -978,7 +1044,7 @@ impl PartitionScan {
         drop(tries);
         drop(candidate_reservation);
         for (index, page) in pages.entries.iter_mut().enumerate() { page.summary.page_index = u32::try_from(index).map_err(|error| invalid("page-count", error))?; }
-        self.tasks = Some(ScanTaskPlan::new(pages.entries.iter().map(|page|PageRange { lower: page.lower,upper: page.upper }),&self.execution.context.memory)?);
+        self.tasks = Some(ScanTaskPlan::new(pages.entries.iter().map(|page|PageRange { lower: page.lower,upper: page.upper }),self.order == Some(IidOrder::Descending),&self.execution.context.memory)?);
         self.files = files;
         self.pages = pages;
         self.initialized = true;
@@ -1111,7 +1177,8 @@ impl PartitionScan {
             if page.len() <= slot { page.resize(slot + 1, u32::MAX); }
             if page[slot] == u32::MAX { batches.push(Arc::clone(batch)); page[slot] = u32::try_from(batches.len() - 1).map_err(|_| invalid("scan-row-size", "A task reads more batches than u32 names"))?; }
             let source = (page[slot], row);
-            let group: &mut Vec<_> = &mut groups[head.active];
+            // The merge visits rows in IID order across the task's pages, which one group keeps and a group per page does not.
+            let group: &mut Vec<_> = &mut groups[if self.order.is_some() { 0 } else { head.active }];
             let memory = &self.execution.context.memory;
             resolver.resolve_fragments(&head.header, |valid_time, system_time| {
                 if group.len() == group.capacity() {
@@ -1124,7 +1191,10 @@ impl PartitionScan {
                 Ok(())
             })?;
         }
-        self.loaded.retain(|index,_| self.pages.entries[*index].upper > task.range.upper);
+        if self.order == Some(IidOrder::Descending) && let Some(rows) = groups.first_mut() { rows.reverse(); }
+        // A page is kept for the tasks still to come that read it: those above this one, or below it in a descending scan.
+        if self.order == Some(IidOrder::Descending) { self.loaded.retain(|index,_| self.pages.entries[*index].lower < task.range.lower); }
+        else { self.loaded.retain(|index,_| self.pages.entries[*index].upper > task.range.upper); }
         self.output = groups.iter().enumerate().filter(|(_, rows)| !rows.is_empty()).map(|(group, rows)| {
             let page = &self.pages.entries[selected[group]].source;
             crate::columnar::gather(rows, &batches, &self.scan.columns, &self.execution.context.memory, |position| {
@@ -1552,7 +1622,7 @@ mod tests {
             let partition = cursor.front_partition_mut().unwrap();
             partition.initialize().await.unwrap();
             let plan_memory = MemoryBudget::new(memory.limit_bytes());
-            let plan = ScanTaskPlan::new(partition.pages.entries.iter().map(|page| PageRange { lower: page.lower, upper: page.upper }), &plan_memory).unwrap();
+            let plan = ScanTaskPlan::new(partition.pages.entries.iter().map(|page| PageRange { lower: page.lower, upper: page.upper }), false, &plan_memory).unwrap();
             assert_eq!(memory.used_bytes(), cursor_open + file_extent + replacement_extent + plan_memory.used_bytes());
             drop(plan);
             drop(partition.tasks.take().unwrap());
