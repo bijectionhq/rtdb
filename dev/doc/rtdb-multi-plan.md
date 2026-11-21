@@ -27,6 +27,8 @@ What runs on the `rtdb-multi` branch, stage by stage, and where it still departs
 Update this section as work lands.
 
 `rtdb-multi` runs every cell process: `directory`, `cell-map`, `logkeeper`, `node`, `gateway`, `controller`, `reaper`, plus the administrative commands `create`, `list`, `status`, `drain`, `move`, `move-cell`, `read-width`, `unquarantine`, `fork`, `delete` and `audit`.
+The Rust release packager accepts `--variant multi --platform linux/arm64` for the Bijection cell runtime.
+The package retains the image and executable digests, the selected time-zone database and the compiled revision reported by `rtdb-multi --build-info`.
 `crates/multi/tests/cell.rs` drives an in-process cell (or two) through tokio-postgres; `tests/chaos.rs` runs a writer against a seeded sequence of faults and audits the history afterwards; `tests/footprint.rs` measures an idle deployment.
 
 | Stage | Built | Departures and gaps |

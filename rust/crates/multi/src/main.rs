@@ -1,6 +1,7 @@
 //! The RTDB multi cell processes.
 
 use std::collections::BTreeMap;
+use std::io::Write;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -13,7 +14,8 @@ use rtdb_types::{Anomaly, Result};
 use tokio_util::sync::CancellationToken;
 
 const HELP: &str = "RTDB multi\n\n\
-Usage: rtdb-multi initialize-directory --state PATH\n\
+Usage: rtdb-multi --build-info\n\
+       rtdb-multi initialize-directory --state PATH\n\
        rtdb-multi directory --state PATH --listen ADDR\n\
        rtdb-multi logkeeper --directory DIR --listen ADDR --data PATH [--advertise-host HOST] [--zone ZONE] [--cache-bytes BYTES] [--no-fsync]\n\
        rtdb-multi node --directory DIR --storage-root PATH --keys PATH --cache PATH [--config FILE] [--control ADDR] [--advertise-host HOST] [--zone ZONE] [--park-after SECONDS] [--max-active N] [--max-tail-rows N] [--isolation | --compaction-worker] [--no-local-compaction] [--memory-limit BYTES] [--cell-secret FILE]\n\
@@ -90,6 +92,15 @@ fn required_uuid(arguments: &Arguments, name: &str) -> Result<uuid::Uuid> {
 
 async fn run(arguments: Vec<String>) -> Result<()> {
     let Some((command, rest)) = arguments.split_first() else { print!("{HELP}"); return Ok(()); };
+    if command == "--build-info" {
+        if !rest.is_empty() {
+            return Err(usage("--build-info accepts no arguments".into()));
+        }
+        let mut output = std::io::stdout().lock();
+        serde_json::to_writer(&mut output, &rtdb_types::compiled_build_info())
+            .map_err(|error| io(std::io::Error::other(error)))?;
+        return writeln!(output).map_err(io);
+    }
     let arguments = Arguments::parse(rest)?;
     let cancellation = CancellationToken::new();
     { let cancellation = cancellation.clone(); tokio::spawn(async move { shutdown_signal().await; cancellation.cancel(); }); }

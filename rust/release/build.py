@@ -31,7 +31,11 @@ def immutable_image(value):
 
 
 def selected_features(matrix, variant, platform):
-    if matrix.get("schema_version") != 1 or platform not in matrix["platforms"] or variant not in matrix["variants"]:
+    if matrix.get("schema_version") != 1 or platform not in matrix["platforms"]:
+        raise ValueError("release selection is absent from the source matrix")
+    if variant == "multi":
+        return ["rtdb-multi/dynamodb"]
+    if variant not in matrix["variants"]:
         raise ValueError("release selection is absent from the source matrix")
     features = matrix["variants"][variant]
     if any(not re.fullmatch(r"rtdb-(server|config|ffi)/[a-z0-9-]+", feature) for feature in features):
@@ -104,13 +108,27 @@ def retain_tzdb(context, override=None):
     return {"sha256": digest(selected), "bytes": len(data), "selection": "override" if override is not None else "bundled"}
 
 
-def extract_artifacts(commands, image, engine, output):
+def native_executables(variant):
+    return ("rtdb-multi",) if variant == "multi" else ("rtdb", "rtdb-config")
+
+
+def extract_artifacts(commands, image, engine, output, variant=None):
     name = "rtdb-release-" + uuid.uuid4().hex
     destination = output / "artifacts"
     destination.mkdir()
-    paths = {"rtdb": "/usr/local/bin/rtdb", "rtdb-config": "/usr/local/bin/rtdb-config", "librtdb_ffi.so": "/usr/local/lib/librtdb_ffi.so",
-             "librtdb_ffi.a": "/usr/local/lib/librtdb_ffi.a", "rtdb.h": "/usr/local/include/rtdb.h",
-             "build.json": "/usr/share/rtdb/build.json", "tzdb.dat": "/usr/share/rtdb/tzdb.dat"} if engine == "rust" else {"xtdb.jar": "/usr/local/lib/xtdb/xtdb.jar"}
+    if engine == "rust":
+        executables = native_executables(variant)
+        paths = {executable: f"/usr/local/bin/{executable}" for executable in executables}
+        paths.update({"build.json": "/usr/share/rtdb/build.json", "tzdb.dat": "/usr/share/rtdb/tzdb.dat"})
+        if variant != "multi":
+            paths.update({"librtdb_ffi.so": "/usr/local/lib/librtdb_ffi.so",
+                          "librtdb_ffi.a": "/usr/local/lib/librtdb_ffi.a",
+                          "rtdb.h": "/usr/local/include/rtdb.h"})
+        entrypoint = ["--entrypoint", "/bin/sh", image["Id"], "-ec",
+                      "\n".join(f"{paths[executable]} --build-info" for executable in executables)]
+    else:
+        paths = {"xtdb.jar": "/usr/local/lib/xtdb/xtdb.jar"}
+        entrypoint = ["--entrypoint", "/bin/true", image["Id"]]
     volumes, inspected = set(), False
     primary, cleanup_errors = None, []
     def capture_container():
@@ -127,7 +145,6 @@ def extract_artifacts(commands, image, engine, output):
         return containers[0]
     with owned_cancellation() as owner:
         try:
-            entrypoint = ["--entrypoint", "/bin/sh", image["Id"], "-ec", "/usr/local/bin/rtdb --build-info\n/usr/local/bin/rtdb-config --build-info"] if engine == "rust" else ["--entrypoint", "/bin/true", image["Id"]]
             commands.run("artifact-container", ["docker", "create", "--name", name, "--label", "io.rtdb.release=" + name, *entrypoint])
             capture_container()
             inspected = True
@@ -139,9 +156,9 @@ def extract_artifacts(commands, image, engine, output):
                 if state.get("Running") is not False or state.get("Status") != "exited" or state.get("ExitCode") != 0:
                     raise ValueError("packaged build-information commands did not complete successfully")
                 lines = report.read_text().splitlines()
-                if len(lines) != 2:
-                    raise ValueError("packaged executables must emit two build-information records")
-                for executable, line in zip(["rtdb", "rtdb-config"], lines):
+                if len(lines) != len(executables):
+                    raise ValueError("packaged executables must each emit one build-information record")
+                for executable, line in zip(executables, lines):
                     write_json(destination / (executable + "-build-info.json"), json.loads(line))
         except BaseException as error:
             primary = error
@@ -248,6 +265,8 @@ def build(args):
                             "--build-arg", "RTDB_FEATURES=" + ",".join(features),
                             "--build-arg", "RTDB_REVISION=" + revision, "--build-arg", "RTDB_VERSION=" + version,
                             "--build-arg", "RTDB_VARIANT=" + args.variant]
+                if args.variant == "multi":
+                    command += ["--target", "multi"]
             else:
                 variant = jvm["docker_variant"]
                 commands.run("reference-shadow-jar", [repository / "gradlew", "-p", repository, "--no-daemon", "--console=plain", "-PfullJdk", jvm["gradle_task"]])
@@ -273,8 +292,14 @@ def build(args):
                 raise ValueError("packaged image architecture differs from requested platform")
             if image.get("Config", {}).get("Labels", {}).get("org.opencontainers.image.revision") != revision:
                 raise ValueError("packaged image revision label differs from build source")
-            artifacts = extract_artifacts(commands, image, args.engine, output)
-            compiled = verify_native_build_info({item["path"]: output / item["path"] for item in artifacts}, metadata) if args.engine == "rust" else None
+            artifacts = extract_artifacts(commands, image, args.engine, output, args.variant)
+            compiled = None
+            if args.engine == "rust":
+                compiled = verify_native_build_info(
+                    {item["path"]: output / item["path"] for item in artifacts},
+                    metadata,
+                    native_executables(args.variant),
+                )
             archive = output / f"rtdb-{args.engine}-{args.variant}-{expected_arch}.docker.tar"
             commands.run("save-server-image", ["docker", "image", "save", "--output", str(archive), image["Id"]])
             if git(repository, "rev-parse", "HEAD") != revision or git(repository, "status", "--porcelain", "--untracked-files=all"):
