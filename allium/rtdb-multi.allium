@@ -1760,8 +1760,11 @@ rule HostedCheckpointRecovery {
               and ExactCheckpointOrCompletedRecovery(authority, capture_id)
 
     ensures:
-        RecoverUnderWriterFence(authority, capture_id)
-        ReturnRecoveryReceipt(authority, capture_id, manifest_digest)
+        if CompletedRecovery(authority, capture_id, manifest_digest):
+            ReturnOriginalRecoveryReceipt(authority, capture_id)
+        else:
+            RecoverUnderWriterFence(authority, capture_id)
+            RetainAndReturnRecoveryReceipt(authority, capture_id, manifest_digest)
 }
 
 rule RetireCheckpointArchives {

@@ -98,10 +98,12 @@ impl RecoveryService {
         {
             return Ok(Reply::Refused);
         }
-        let Some(installation) = directory.deployment_by_name(&request.name).await? else {
+        // Retain exact receipt access after the named route moves or closes.
+        // New captures and repairs still have their own lifecycle guards.
+        let Some(installation) = directory.deployment(&request.authority.to_string()).await? else {
             return Ok(Reply::Refused);
         };
-        if installation.id != request.authority.to_string()
+        if installation.id != request.authority.to_string() || installation.name != request.name
             || installation.org != self.org
             || installation.parent.is_some()
         {

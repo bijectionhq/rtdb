@@ -552,6 +552,9 @@ pub async fn capture(
                 return Err(inconsistent("The capture operation already names another archive or lifetime"));
             }
         } else {
+            if record.checkpoint_repair_receipts.contains_key(&operation) {
+                return Err(inconsistent("The capture operation has a repair in another residence"));
+            }
             let checkpoint = record.checkpoint
                 .ok_or_else(|| unavailable("The installation has not published a checkpoint"))?;
             record.checkpoint_captures.insert(operation, CheckpointCapture {
@@ -748,14 +751,20 @@ pub(crate) async fn restore_checkpoint(
         .deployment(&id)
         .await?
         .ok_or_else(|| unavailable("The selected installation is unavailable"))?;
-    if let Some(recovery) = &current.checkpoint_recovery {
-        if recovery.operation == operation && recovery.completed_at_ms.is_some() {
-            if recovery.archive != archive_binding {
-                return Err(inconsistent("The restore operation has another archive"));
-            }
-            require_manifest(&recovery.manifest_sha256)?;
-            return Ok(recovery.clone());
+    let read_receipt = |record: &DeploymentRecord| -> Result<Option<CheckpointRecovery>> {
+        let Some(recovery) = record.checkpoint_repair_receipts.get(&operation) else {
+            return Ok(None);
+        };
+        if recovery.operation != operation || recovery.archive != archive_binding
+            || recovery.completed_at_ms.is_none()
+        {
+            return Err(inconsistent("The restore operation has another archive or receipt"));
         }
+        require_manifest(&recovery.manifest_sha256)?;
+        Ok(Some(recovery.clone()))
+    };
+    if let Some(receipt) = read_receipt(&current)? {
+        return Ok(receipt);
     }
     let region = IoRegion::new();
     let archive_bucket = archive.bucket(region.clone()).await?;
@@ -785,6 +794,9 @@ pub(crate) async fn restore_checkpoint(
     capture.verify(archive_bucket, &prefix, &material).await?;
 
     let fenced = update_installation(directory, &id, |record| {
+        if read_receipt(record)?.is_some() {
+            return Ok(());
+        }
         if !same_incarnation(record, &point)
             || record.checkpoint != Some(point.checkpoint)
             || record.move_from.is_some()
@@ -798,8 +810,8 @@ pub(crate) async fn restore_checkpoint(
             && recovery.archive == archive_binding
             && recovery.manifest_sha256 == manifest_sha256
         {
-            if recovery.completed_at_ms.is_some()
-                || record.lifecycle == Lifecycle::Restoring && record.epoch == recovery.epoch
+            if record.lifecycle == Lifecycle::Restoring && record.epoch == recovery.epoch
+                && recovery.completed_at_ms.is_none()
             {
                 return Ok(());
             }
@@ -829,35 +841,41 @@ pub(crate) async fn restore_checkpoint(
         Ok(())
     })
     .await?;
+    if let Some(receipt) = read_receipt(&fenced)? {
+        return Ok(receipt);
+    }
     let pending = fenced
         .checkpoint_recovery
-        .clone()
+        .as_ref()
+        .filter(|recovery| {
+            recovery.operation == operation && recovery.archive == archive_binding
+                && recovery.manifest_sha256 == manifest_sha256 && recovery.epoch == fenced.epoch
+                && recovery.completed_at_ms.is_none() && fenced.lifecycle == Lifecycle::Restoring
+        })
         .ok_or_else(|| inconsistent("Missing the accepted checkpoint restore"))?;
-    if pending.completed_at_ms.is_some() {
-        return Ok(pending);
-    }
     await_storage_drain(directory, storage, keys, &fenced).await?;
     let source = administration_stream(directory, &fenced, maximum_message_bytes).await?;
     rtdb_logkeeper::seal(&source, pending.epoch).await?;
 
     let completed = update_installation(directory, &id, |record| {
+        if read_receipt(record)?.is_some() {
+            return Ok(());
+        }
+        if record.lifecycle != Lifecycle::Restoring || record.epoch != pending.epoch {
+            return Err(inconsistent("The restore lost its fence"));
+        }
         let recovery = record
             .checkpoint_recovery
             .as_mut()
-            .filter(|recovery| recovery.operation == operation && recovery.epoch == pending.epoch)
+            .filter(|recovery| &**recovery == pending)
             .ok_or_else(|| inconsistent("Another checkpoint restore replaced this operation"))?;
-        if recovery.completed_at_ms.is_none() {
-            if record.lifecycle != Lifecycle::Restoring || record.epoch != pending.epoch {
-                return Err(inconsistent("The restore lost its fence"));
-            }
-            recovery.completed_at_ms = Some(rtdb_directory::now_ms());
-            record.lifecycle = recovery.previous_lifecycle;
-        }
+        recovery.completed_at_ms = Some(rtdb_directory::now_ms());
+        record.lifecycle = recovery.previous_lifecycle;
+        record.checkpoint_repair_receipts.insert(operation, recovery.clone());
         Ok(())
     })
     .await?;
-    completed
-        .checkpoint_recovery
+    read_receipt(&completed)?
         .ok_or_else(|| inconsistent("The completed restore has no receipt"))
 }
 

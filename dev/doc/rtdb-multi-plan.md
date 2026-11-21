@@ -165,7 +165,9 @@ the original archive manifest and current key. It records a restore intent,
 fences the old writer at the logkeepers, and verifies the objects. The
 directory then admits the checkpoint archive as a read-only source for
 missing objects. A successor recovers the same ordered tail before serving.
-The directory keeps the accepted manifest and completion for retries.
+The directory keeps each accepted manifest and completion under its capture ID.
+A retry observes that exact receipt after a later repair or cell move. It
+does not open a new writer fence or access the archived objects.
 Retain the archive while an installation uses it.
 
 Hosted operators can give `rtdb-multi reaper` a private TLS recovery listener with its own credential, configured serving storage, independent archive, and current keys.

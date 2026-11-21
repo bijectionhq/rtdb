@@ -499,6 +499,8 @@ async fn restoring_the_current_archive_preserves_the_ordered_tail_and_authority(
     let operation = uuid::Uuid::new_v4();
     let storage = cell.storage();
     let capture = rtdb_multi::archive::capture(cell.directory.clone(), &storage, &archive, &cell.keys(), id, operation, None).await.unwrap();
+    let successor_operation = uuid::Uuid::new_v4();
+    rtdb_multi::archive::capture(cell.directory.clone(), &storage, &archive, &cell.keys(), id, successor_operation, None).await.unwrap();
     let object = capture.objects.iter().find(|object| object.name.ends_with(".arrow")).unwrap();
     let path = archive_dir.path().join(format!("checkpoint-captures/{id}/{operation}/objects/{}", object.name));
     let ciphertext = std::fs::read(&path).unwrap();
@@ -520,6 +522,8 @@ async fn restoring_the_current_archive_preserves_the_ordered_tail_and_authority(
     let restored = rtdb_multi::archive::restore(cell.directory.as_ref(), &storage, &archive, &cell.keys(), id, operation, 4 << 20).await.unwrap();
     assert!(restored.completed_at_ms.is_some());
     assert_eq!(restored.epoch, record.epoch + 1);
+    let successor = rtdb_multi::archive::restore(cell.directory.as_ref(), &storage, &archive, &cell.keys(), id, successor_operation, 4 << 20).await.unwrap();
+    assert!(successor.epoch > restored.epoch);
     let reopened = connect_eventually(&cell, "shop").await;
     assert_eq!(values(&reopened, "SHOW rtdb_hosted_source_barrier").await, [id.to_string()]);
     assert_eq!(values(&reopened, "SELECT total FROM orders ORDER BY _id").await, ["10", "20"]);
@@ -591,6 +595,11 @@ async fn restoring_the_current_archive_preserves_the_ordered_tail_and_authority(
     let active = admin::activate_managed_cell_transfer(&to, &from, &returned).await.unwrap();
     assert_eq!(active.retired_residences[&record.incarnation].serving, retired);
     assert_eq!(active.checkpoint_captures[&operation].incarnation, record.incarnation);
+    let retried_after_return = rtdb_multi::archive::restore(
+        from.directory.as_ref(), from.storage, &archive, from.keys, id, operation, 4 << 20,
+    ).await.unwrap();
+    assert_eq!(retried_after_return, restored);
+    assert!(from.directory.deployment(&id.to_string()).await.unwrap().unwrap().checkpoint_recovery.is_none());
     assert!(from.keys.existing_key(&record.key_id()).await.is_err());
     assert_eq!(from.keys.existing_key(&active.key_id()).await.unwrap(), to.keys.existing_key(&arrived.key_id()).await.unwrap());
     assert!(rtdb_multi::archive::begin_retirement(from.directory.as_ref(), id).await.is_err());
