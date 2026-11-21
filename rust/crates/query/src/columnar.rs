@@ -59,7 +59,7 @@ impl ColumnBatch {
         if bytes <= lease.bytes() { lease.shrink_to(bytes)?; } else { lease.grow_to(bytes)?; }
         Ok(Self { columns, len, _reservation: reservation })
     }
-    fn charged(&self) -> usize { self._reservation.bytes() }
+    pub(crate) fn charged(&self) -> usize { self._reservation.bytes() }
     pub fn from_owned(batch: rtdb_columnar::OwnedBatch) -> Result<Self> {
         let schema = batch.batch().schema();
         let columns = schema.fields().iter().zip(batch.batch().columns()).map(|(field, array)| {
@@ -74,12 +74,13 @@ impl ColumnBatch {
 
     /// Gathers nonempty positions in already resolved batches without building row objects.
     pub fn take_rows(
-        sources: &[Self], rows: &[(usize, usize)], positions: &[usize], memory: &Arc<MemoryBudget>,
+        sources: &[impl std::borrow::Borrow<Self>], rows: &[(usize, usize)], positions: &[usize], memory: &Arc<MemoryBudget>,
     ) -> Result<Self> {
-        if rows.is_empty() || sources.iter().any(|source| positions.iter().any(|&position| position >= source.columns.len()))
-            || rows.iter().any(|&(batch, row)| sources.get(batch).is_none_or(|source| row >= source.len))
+        let source = |batch: usize| sources[batch].borrow();
+        if rows.is_empty() || sources.iter().map(|source| source.borrow()).any(|source| positions.iter().any(|&position| position >= source.columns.len()))
+            || rows.iter().any(|&(batch, row)| sources.get(batch).is_none_or(|source| row >= source.borrow().len))
         {
-            return Err(invalid("column-gather", "Ordered row position is outside its batch"));
+            return Err(invalid("column-gather", "Row position is outside its source batch"));
         }
         let mut reservation = memory.reserve(positions.len().saturating_mul(256).saturating_add(256))?;
         let mut columns = Vec::with_capacity(positions.len());
@@ -87,13 +88,13 @@ impl ColumnBatch {
             let scratch = rows.iter().try_fold(
                 sources.len().saturating_mul(256).saturating_add(4096),
                 |bound, &(batch, row)| {
-                    bound.checked_add(sources[batch].columns[position].bound(row)?.saturating_mul(4))
+                    bound.checked_add(source(batch).columns[position].bound(row)?.saturating_mul(4))
                         .ok_or_else(size_error)
                 },
             )?;
             let _scratch = memory.reserve(scratch)?;
             let mut name = "";
-            let arrow = sources.iter().map(|source| match &source.columns[position] {
+            let arrow = sources.iter().map(|source| match &source.borrow().columns[position] {
                 Column::Arrow { array, field, logical } => {
                     name = field.name();
                     Some((array.data_type() != &DataType::Null)
@@ -104,7 +105,7 @@ impl ColumnBatch {
             let column = match arrow {
                 Some(arrow) => gather_cells(&arrow, rows, name)?,
                 None => Column::Values(rows.iter().map(|&(batch, row)| {
-                    sources[batch].columns[position].value(row)
+                    source(batch).columns[position].value(row)
                 }).collect::<Result<_>>()?),
             };
             let retained = column.retained_bytes()?;
@@ -640,7 +641,7 @@ impl crate::pages::PageCursor for BatchRows {
 
 impl ColumnBatch {
     /// Keeps the rows `mask` selects, column by column.
-    fn select(self, mask: &[bool], memory: &Arc<MemoryBudget>) -> Result<Self> {
+    pub(crate) fn select(self, mask: &[bool], memory: &Arc<MemoryBudget>) -> Result<Self> {
         let selected = mask.iter().filter(|keep| **keep).count();
         if selected == self.len { return Ok(self); }
         // A selection holds a subset of each column's cells, so it retains no more than the page it is taken from.
@@ -1341,6 +1342,18 @@ impl BatchCursor for BatchExpressions {
         let mut columns = Vec::with_capacity(self.expressions.len());
         let mut reservation = self.execution.context.memory.reserve(256)?;
         for (expression, kernel) in self.expressions.iter().zip(clocked) {
+            // An ordinal such as 0::BIGINT is shared by every row of a probe.
+            if batch.len != 0 && matches!(expression, rtdb_plan::Expr::Cast { expr, .. } if matches!(expr.as_ref(), rtdb_plan::Expr::Literal(_))) {
+                let scope = self.execution.scope()?;
+                let mut value = self.execution.evaluate(&scope, expression, &rtdb_plan::Schema::default(), &[]).await?;
+                value.admit_expression_dates()?;
+                rtdb_expr::validate_projection_value(&value)?;
+                let bytes = value.retained_bytes()?.saturating_add(std::mem::size_of::<Value>()).checked_mul(batch.len).ok_or_else(size_error)?;
+                let lease = Arc::get_mut(&mut reservation).expect("batch projection owns its reservation");
+                lease.grow_to(lease.bytes().checked_add(bytes).ok_or_else(size_error)?)?;
+                columns.push(Column::Values(vec![value; batch.len]));
+                continue;
+            }
             if let Some(bound) = projection::bound(kernel, &self.schema, &batch)? {
                 let lease = Arc::get_mut(&mut reservation).ok_or_else(|| invalid("column-size", "A column page's charge is shared"))?;
                 lease.grow_to(lease.bytes().checked_add(bound).ok_or_else(size_error)?)?;

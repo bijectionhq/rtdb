@@ -2493,6 +2493,82 @@ async fn an_ordered_sql_write_can_encode_its_own_revision_exactly() {
     stop(&node, driver).await;
 }
 
+#[derive(Clone, Default)]
+struct BatchSortTrace(Arc<std::sync::Mutex<BTreeMap<String, u64>>>);
+
+impl rtdb_plan::Tracer for BatchSortTrace {
+    fn query_enabled(&self) -> bool { true }
+    fn transaction_enabled(&self) -> bool { false }
+    fn start(&self, _: Option<rtdb_plan::SpanContext>, _: &str, _: &[(&str, rtdb_plan::TraceValue<'_>)]) -> Option<Box<dyn rtdb_plan::TraceSpan>> {
+        Some(Box::new(self.clone()))
+    }
+}
+
+impl rtdb_plan::TraceSpan for BatchSortTrace {
+    fn context(&self) -> rtdb_plan::SpanContext {
+        rtdb_plan::SpanContext { trace_id: [1; 16], span_id: [1; 8] }
+    }
+    fn attribute(&mut self, name: &str, value: rtdb_plan::TraceValue<'_>) {
+        if let rtdb_plan::TraceValue::Unsigned(value) = value {
+            let mut trace = self.0.lock().unwrap();
+            trace.entry(name.into()).and_modify(|old| *old = (*old).max(value)).or_insert(value);
+        }
+    }
+    fn end_at(&mut self, _: std::time::SystemTime) {}
+}
+
+#[tokio::test]
+async fn arrow_probe_unions_sort_stably_in_memory_and_in_spill_runs() {
+    for (sort_memory_bytes, spills) in [(1 << 20, 0), (1, 1)] {
+        let trace = BatchSortTrace::default();
+        let mut services = services();
+        services.tracer = Some(Arc::new(trace.clone()));
+        let mut config = options();
+        config.query.sort_memory_bytes = sort_memory_bytes;
+        config.query.batch_rows = 2;
+        let (node, driver) = running(config, services).await;
+        let mut session = node.session("xtdb", Arc::new(Authority)).unwrap();
+        index_sql(&mut session, "INSERT INTO histories RECORDS
+            {_id: 1, world: 1, key: 'b', idx: 0, value: X'42'},
+            {_id: 2, world: 1, key: 'a', idx: 0, value: X'4c'},
+            {_id: 3, world: 2, key: 'a', idx: 0, value: X'52'},
+            {_id: 4, world: 2, key: 'b', idx: 0, value: X'4e'}").await;
+        let payloads = "SELECT key, value FROM (
+            SELECT 0::BIGINT AS probe, key, value, _system_from, idx FROM histories WHERE world = 1
+            UNION ALL
+            SELECT 0::BIGINT AS probe, key, value, _system_from, idx FROM histories WHERE world = 2
+        ) AS worldstore_probes ORDER BY probe, key, _system_from DESC, idx DESC";
+        let context = session.query_context().await.unwrap();
+        let prepared = PreparedSql::prepare(payloads, &context, Default::default(), ResultSignaturePolicy::Dynamic).unwrap();
+        let result = rows(prepared.open_query_columns_typed(context.clone(), vec![], &[]).await.unwrap()).await;
+        assert_eq!(result, [("a", b'L'), ("a", b'R'), ("b", b'B'), ("b", b'N')]
+            .map(|(key, payload)| vec![Value::Utf8(key.into()), Value::Binary(vec![payload])]));
+        assert_eq!(context.spill_bytes(), 0);
+        {
+            let mut trace = trace.0.lock().unwrap();
+            assert_eq!(trace.get("sort_columnar"), Some(&1));
+            assert_eq!(trace.get("union_all_columnar"), Some(&1));
+            assert_eq!(trace.get("sort_columnar_spill"), Some(&spills));
+            trace.clear();
+        }
+
+        let keys = "SELECT * FROM (
+            SELECT 0::BIGINT AS probe, a.key FROM (
+                SELECT DISTINCT key FROM histories WHERE world = 1 ORDER BY key ASC LIMIT 1) AS a
+            UNION ALL
+            SELECT 1::BIGINT AS probe, b.key FROM (
+                SELECT DISTINCT key FROM histories WHERE world = 2 ORDER BY key DESC LIMIT 1) AS b
+        ) AS worldstore_probes ORDER BY probe, key";
+        let prepared = PreparedSql::prepare(keys, &context, Default::default(), ResultSignaturePolicy::Dynamic).unwrap();
+        assert_eq!(rows(prepared.open_query_columns_typed(context, vec![], &[]).await.unwrap()).await, [
+            vec![Value::I64(0), Value::Utf8("a".into())],
+            vec![Value::I64(1), Value::Utf8("b".into())],
+        ]);
+        assert_eq!(trace.0.lock().unwrap().get("union_all_columnar"), Some(&1));
+        stop(&node, driver).await;
+    }
+}
+
 #[tokio::test]
 async fn ordered_index_declaration_if_not_exists_preserves_the_definition() {
     let (node, driver) = running(options(), services()).await;

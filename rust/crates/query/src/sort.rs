@@ -6,6 +6,7 @@ use rtdb_plan::{Schema, SortExpr};
 use rtdb_types::{LogicalType, Result, Value};
 use crate::{context::Execution, cursor::{OwnedRow, RowCursor}, invalid, pages::{BoxPageCursor, OwnedPage, PageBuilder, PageCursor}, spill::{SpillFile, SpillReader}};
 
+pub(crate) mod batches;
 mod records;
 mod timsort;
 mod legacy;

@@ -106,7 +106,11 @@ async fn copy_to_arrow_stream_uses_the_original_read_transaction() {
     assert_eq!(rows(&first), [vec![Some(b"1".to_vec())]]);
     assert_eq!(tags(&writer.query("INSERT INTO payloads (_id, val) VALUES (2, X'6364')").await), b"CZ");
 
-    reader.parse("arrow", "COPY (SELECT val FROM payloads ORDER BY _id) TO STDOUT WITH (FORMAT 'arrow-stream')", &[]).await;
+    reader.parse("arrow", "COPY (SELECT val FROM (
+        SELECT 0::BIGINT AS probe, _id, val FROM payloads WHERE _id <= 1
+        UNION ALL
+        SELECT 1::BIGINT AS probe, _id, val FROM payloads WHERE _id > 1
+    ) AS probes ORDER BY probe, _id) TO STDOUT WITH (FORMAT 'arrow-stream')", &[]).await;
     assert_eq!(reader.receive().await.0, b'1');
     reader.bind("transfer", "arrow").await;
     assert_eq!(reader.receive().await.0, b'2');

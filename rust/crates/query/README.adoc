@@ -29,6 +29,10 @@ Each retained snapshot keeps its captured transaction head separately from the r
 Executions made from the same context share its memory budget and spill quota.
 `QueryCursor` owns the operator tree and advances it on the caller's coroutine.
 Dropping a cursor releases its operator state and spill files.
+For eligible Arrow queries, UNION ALL forwards its inputs' batches, preserving duplicates and input order.
+A sort over input columns retains the batches and orders their row positions using the SQL key comparator.
+The sort gathers payload columns in the new order and preserves input order for ties.
+When a sort spills, its runs and merge output use Arrow IPC under the query's spill quota.
 The passive Mark cursor completes its shared candidate build in memory or under the query spill quota before producing a nullable Boolean result.
 An uncorrelated build precedes input evaluation and is shared across input rows; correlated builds retain their input row only while constructing and comparing that row's candidates.
 Uncorrelated comparisons stop at true, while correlated VALUES comparisons demand the complete candidate batch.
