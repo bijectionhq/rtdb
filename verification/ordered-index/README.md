@@ -2,17 +2,17 @@
 
 The reference answer resolves the original captured event stream at the requested system and valid points, filters its rows, sorts by the complete order key, and takes the requested page.
 The proof sources in this directory decompose that specification.
-Their first revision has received source review and awaits an execution report.
+The proof and regression sources are source-reviewed and await execution on an authorized runner.
 
 | Property | Proof source | Production refinement still required |
 | --- | --- | --- |
-| Temporal projection and exact membership | `Temporal.lean` proves point lookup against independent event interpretation and a single visible span per IID. `Buckets.lean` proves exact coverage for a recursive dyadic decomposition. | Connect RTDB's newest-first temporal resolver, coalescing, and greedy bucket iterator to the model. |
+| Temporal projection and exact membership | `Temporal.lean` specifies point lookup against independent event interpretation and a single visible span per IID. `Buckets.lean` specifies exact coverage for a recursive dyadic decomposition. | Connect RTDB's newest-first temporal resolver, coalescing, and greedy bucket iterator to the model. |
 | Signed timestamps and unbounded end | `domain.rs` includes the production timestamp conversion directly in the Verus harness. | Connect the admitted query point and the bucket iterator's shift and alignment to the conversion contract. |
-| Ordered seek, eligibility and pagination | `SeekRange.lean` states the monotone seek partition and fence pruning laws. `seek.rs` includes the production binary search and directed slot lookup. `OrderedRead.lean` proves ordered merge, filtering before limit, and keyset continuation. | Connect Arrow values and SQL comparisons to the order and filters, and the tree cursor and heap to the ordered streams. |
-| Replay and fallback | `Recovery.lean` proves interchangeable complete checkpoints and ordered tails. It also states exactly when the event count completes coverage. `Reachability.lean` states layout identity across a checkpoint split. | Establish that the canonical flushed inputs and live offset are an ordered substream of the exact capture. |
-| Publication and reclamation | `Checkpoint.tla` models a captured reader, two workers, immutable objects, publication, collection, fallback, and crash. The two control configurations remove checked source identity and complete upload. `Reachability.lean` proves that a stale mark preserves later reachable pages under the per-block sharing rule. | Prove the sharing rule for `Tree::persist` and `store_roots`, and connect reader retention, leadership and immutable writes to the protocol. |
-| Erasure | `Temporal.lean` proves that erase cuts the captured IID's prior history, including historical system-time reads. | Connect revision-directory scrubbing and physical collection across object and node caches to the model. `ErasureCleanup.tla` models the durable obligation across publication, crash, advancement and repair under a single fail-stop owner. |
-| Bijection page witnesses | `OrderedRead.lean` proves that agreement over the consumed ordered prefix preserves the page, including a lookahead when it is observable. | Implement and prove the Bijection-to-RTDB refinement for world ancestry, labels, custody and range witnesses. The current RTDB accelerator serves SQL. |
+| Ordered seek, eligibility and pagination | `SeekRange.lean` states the monotone seek partition and fence pruning laws. `seek.rs` includes the production binary search and directed slot lookup. `OrderedRead.lean` states ordered merge, filtering before limit, and keyset continuation. | Connect Arrow values and SQL comparisons to the order and filters, and the tree cursor and heap to the ordered streams. |
+| Replay and fallback | `Recovery.lean` states equivalence for complete checkpoints and ordered tails. It also states exactly when the event count completes coverage. `Reachability.lean` states layout identity across a checkpoint split. | Establish that the canonical flushed inputs and live offset are an ordered substream of the exact capture. |
+| Publication and reclamation | `Checkpoint.tla` models a captured reader, two workers, immutable objects, publication, collection, fallback, and crash. The two control configurations remove checked source identity and complete upload. `Reachability.lean` states how a stale mark preserves later reachable pages under the per-block sharing rule. | Prove the sharing rule for `Tree::persist` and `store_roots`, and connect reader retention, leadership and immutable writes to the protocol. |
+| Erasure | `Temporal.lean` states how erase cuts the captured IID's prior history, including historical system-time reads. | Connect revision-directory scrubbing and physical collection across object and node caches to the model. `ErasureCleanup.tla` models the durable obligation across publication, crash, advancement and repair under a single fail-stop owner. |
+| Bijection page witnesses | `OrderedRead.lean` states how agreement over the consumed ordered prefix preserves the page, including a lookahead when it is observable. | Implement and prove the Bijection-to-RTDB refinement for world ancestry, labels, custody and range witnesses. The current RTDB accelerator serves SQL. |
 
 `CheckpointCountOnly.cfg` should produce a wrong answer when a replay substitutes an event with a duplicate while preserving the count.
 `CheckpointEarlyPublish.cfg` should expose a reachable manifest that references a missing object.
@@ -27,6 +27,20 @@ The cleanup marker is written before storing a scrubbed archive or starting a fu
 A later checkpoint sweeps pending markers within its frontier, and clears them after deleting the unreachable pages.
 `ErasureCleanupForgetOnAdvance.cfg` removes that carry-forward rule.
 A physical erasure theorem across overlapping maintenance owners still needs a fence on page writes and a model of each replica's cached copies.
+
+## Evidence boundary
+
+Bijection's [cutover proof evidence](https://github.com/bijectionhq/bijection/blob/2fa0572878a0b812a38e33332818bbb687e8d8c0/verification/cutover-kernel-laws.md) records separate Lean, TLC and Verus checks on its existing kernel cutover.
+The applicable page law is `hidden_write_preserves_page_and_cursor`, over Bijection's projected, ordered observation.
+The native adapter obtains its candidates through the WorldStore scan and does world overlay, label filtering, custody checks and validation there.
+Connecting those observed prefixes to the RTDB ordered tree remains a production refinement obligation.
+
+The cleanup model assumes one fail-stop maintenance owner.
+In production, a worker's term cancellation and an object-store `put` are separate operations.
+An end-to-end physical erasure argument must cover an already-admitted write by a superseded owner and stale contents on every replica.
+A proof of the cleanup marker under the fail-stop model establishes one step of that argument.
+
+The RTDB proof branch requires its own checker reports, with exact source identity and negative-control outcomes.
 
 ## Execution
 
