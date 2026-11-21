@@ -1274,6 +1274,9 @@ rule RunCompactionJob {
 rule WriteCompactionOutputs {
     when: JobFinished(job, worker)
 
+    requires: job.deployment.lifecycle = live
+    requires: WorkerTargetsCurrentStorage(worker, job.deployment)
+
     ensures:
         for output in job.outputs:
             ObjectStorage.put_if_absent(WorkerCredential(job), output, bytes)
@@ -1770,6 +1773,17 @@ rule BeginDeletion {
             SealSent(loglet, epoch: Epoch(value: record.epoch.value + 1))
         StreamDropped(record.id)
         DeletionScheduled(record, after: now + config.credential_ttl)
+}
+
+rule ClaimStoreRoot {
+    when: DeploymentStoreOpened(record, storage_prefix, writer_epoch)
+
+    requires: record.lifecycle in {live, quarantined}
+    requires: storage_prefix = record.storage_root.prefix
+    requires: writer_epoch = null or writer_epoch = record.epoch
+
+    ensures:
+        StoreRootClaimed(record.id, storage_prefix)
 }
 
 rule TransferSharedObjects {
