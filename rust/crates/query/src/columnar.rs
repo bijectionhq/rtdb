@@ -2,13 +2,13 @@
 //! so filters and aggregates can read whole columns, and rows are materialised only for operators that need them.
 use std::sync::Arc;
 
-use arrow_array::{Array, ArrayRef, StructArray, UnionArray};
+use arrow_array::{Array, ArrayRef, ListArray, StructArray, UnionArray};
 use arrow_schema::{DataType, Field as ArrowField};
 use rtdb_columnar::{MemoryBudget, MemoryReservation, read_execution_value, read_execution_value_as};
 use rtdb_index::IndexBatch;
 use rtdb_plan::Field;
 use rtdb_temporal::ResolvedRow;
-use rtdb_types::{LogicalType, Result, Timestamp, Value};
+use rtdb_types::{ListKind, LogicalType, Result, Timestamp, Value};
 
 use crate::{cursor::OwnedRow, invalid, pages::{OwnedPage, PageBuilder}};
 
@@ -178,10 +178,16 @@ fn stored(sources: &[Source], cells: &[(usize, usize)], name: &str) -> Result<Co
     }).collect();
     let Some((_, field, logical)) = children.iter().flatten().next().cloned() else { return Ok(Column::Values(vec![Value::Null; cells.len()])) };
     let uniform = children.iter().all(|child| child.as_ref().is_some_and(|(_, other, other_logical)| other == &field && other_logical == &logical));
-    if uniform && flat(field.data_type()) {
+    if uniform {
         let arrays: Vec<&dyn Array> = children.iter().flatten().map(|(array, ..)| array.as_ref()).collect();
-        let array = interleave(&arrays, cells)?;
-        return Ok(Column::Arrow { array, field, logical });
+        let flat_layout = flat(field.data_type());
+        if flat_layout || arrays.iter().all(|array| can_interleave_nested(*array)) {
+            match interleave(&arrays, cells) {
+                Ok(array) => return Ok(Column::Arrow { array, field, logical }),
+                Err(error) if flat_layout => return Err(error),
+                Err(_) => {}
+            }
+        }
     }
     if !uniform && let Some(column) = joined_union(&children, cells, name)? { return Ok(column); }
     cells.iter().map(|&(source, offset)| match &children[source] {
@@ -260,8 +266,6 @@ fn joined_union(children: &[Option<(ArrayRef, Arc<ArrowField>, Option<LogicalTyp
     Ok(Some(Column::Arrow { array: Arc::new(array), field: Arc::new(target), logical: Some(logical) }))
 }
 
-/// Whether Arrow's interleave copies the layout without validating it: nested layouts are rebuilt and checked, and
-/// stored cells such as nulls under a non-nullable list item fail that check by panicking, so they are read as values.
 /// Interleaves cells of arrays sharing one layout; a dense union gathers each leg's children in bulk, where Arrow's
 /// generic path would extend the union one cell at a time.
 pub(crate) fn interleave(arrays: &[&dyn Array], cells: &[(usize, usize)]) -> Result<ArrayRef> {
@@ -300,6 +304,68 @@ fn interleaving_a_contiguous_range_keeps_its_input_buffer() {
     let selected = selected.as_any().downcast_ref::<arrow_array::Int64Array>().unwrap();
     assert_eq!(selected.values().as_ref(), &[20, 30]);
     assert_eq!(selected.values().as_ptr(), values.values()[1..].as_ptr());
+}
+
+#[test]
+fn stored_list_projection_uses_arrow_for_contiguous_and_sparse_rows() {
+    use arrow_array::Int64Array;
+    use rtdb_index::{StoredEvent, StoredOperation};
+    use rtdb_types::{Iid, Interval, ScalarType, StructFields};
+
+    let memory = MemoryBudget::new(1 << 22);
+    let logical = LogicalType::list(LogicalType::Scalar(ScalarType::I64));
+    let field = Field {
+        id: rtdb_plan::ColumnId(0),
+        name: "items".into(),
+        qualifier: None,
+        qualified_only: false,
+        unnamed: false,
+        data_type: logical.clone(),
+    };
+    let events: Vec<_> = (0..3).map(|number| StoredEvent {
+        iid: Iid([number as u8; 16]),
+        system_from: Timestamp(10),
+        valid_time: Interval::ALL,
+        operation: StoredOperation::Put(StructFields::from([(
+            field.name.clone(), Value::List(vec![Value::I64(number)]),
+        )])),
+        recency: None,
+    }).collect();
+    let declared = StructFields::from([(field.name.clone(), logical.clone())]);
+    let source = IndexBatch::copy_events_with_put_schema(&events, &declared, &memory).unwrap();
+    let ops = source.view().operations().unwrap();
+    let put = ops.child(ops.type_id(0)).as_any().downcast_ref::<StructArray>().unwrap();
+    let values = put.column(0).as_any().downcast_ref::<ListArray>().unwrap().values();
+    let input = values.as_any().downcast_ref::<Int64Array>().unwrap().values();
+    let arrow_field = rtdb_columnar::to_field(&field.name, &logical).unwrap();
+
+    for selection in [[0, 1], [0, 2]] {
+        let rows = selection.map(|row| ResolvedRow {
+            source: (0, row),
+            valid_time: Interval::ALL,
+            system_time: Interval::ALL,
+        });
+        let batch = gather(&rows, std::slice::from_ref(&source), std::slice::from_ref(&field), &memory, |_| Ok(None)).unwrap();
+        let array = conform(&batch.columns[0], &logical, &arrow_field).unwrap();
+        let output = array.as_any().downcast_ref::<ListArray>().unwrap();
+        for (index, value) in selection.into_iter().enumerate() {
+            let values = output.value(index);
+            assert_eq!(values.as_any().downcast_ref::<Int64Array>().unwrap().values().as_ref(), &[i64::from(value)]);
+        }
+        if selection == [0, 1] {
+            let output_values = output.values().as_any().downcast_ref::<Int64Array>().unwrap();
+            assert_eq!(output_values.values().as_ptr(), input.as_ptr());
+        }
+    }
+}
+
+fn can_interleave_nested(array: &dyn Array) -> bool {
+    if flat(array.data_type()) { return true; }
+    if let Some(structs) = array.as_any().downcast_ref::<StructArray>() {
+        return structs.columns().iter().all(|child| can_interleave_nested(child.as_ref()));
+    }
+    let (DataType::List(field), Some(lists)) = (array.data_type(), array.as_any().downcast_ref::<ListArray>()) else { return false; };
+    (field.is_nullable() || !lists.values().is_nullable()) && can_interleave_nested(lists.values().as_ref())
 }
 
 pub(crate) fn flat(data_type: &DataType) -> bool {
@@ -347,13 +413,20 @@ fn conform_array(array: &ArrayRef, logical: &LogicalType, target: &LogicalType, 
         // A copied record's fields take the order of the result's, whatever order the cells came in.
         (LogicalType::Struct(children), LogicalType::Struct(expected)) => {
             let (DataType::Struct(fields), Some(structs)) = (field.data_type(), array.as_any().downcast_ref::<StructArray>()) else { return None };
-            if structs.null_count() != 0 || structs.num_columns() != fields.len() || children.len() != fields.len() || expected.len() != fields.len() { return None; }
+            if structs.num_columns() != fields.len() || children.len() != fields.len() || expected.len() != fields.len() { return None; }
             let mut columns = Vec::with_capacity(fields.len());
             for target_field in fields.iter() {
                 let index = structs.fields().iter().position(|source| source.name() == target_field.name())?;
                 columns.push(conform_array(structs.column(index), children.get(target_field.name())?, expected.get(target_field.name())?, target_field)?);
             }
-            StructArray::try_new(fields.clone(), columns, None).ok().map(|array| Arc::new(array) as ArrayRef)
+            StructArray::try_new_with_length(fields.clone(), columns, structs.nulls().cloned(), structs.len())
+                .ok().map(|array| Arc::new(array) as ArrayRef)
+        }
+        (LogicalType::List { kind: ListKind::List, element }, LogicalType::List { kind: ListKind::List, element: expected }) => {
+            let (DataType::List(target_item), Some(lists)) = (field.data_type(), array.as_any().downcast_ref::<ListArray>()) else { return None; };
+            let values = conform_array(lists.values(), &element, &expected, target_item)?;
+            ListArray::try_new(Arc::clone(target_item), lists.offsets().clone(), values, lists.nulls().cloned())
+                .ok().map(|array| Arc::new(array) as ArrayRef)
         }
         _ => None,
     }

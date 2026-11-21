@@ -83,6 +83,7 @@ Spill files are scoped temporary resources with a retained-byte quota.
   Emitted rows are grouped by contributing source page, with persisted pages before live pages.
 * Persisted scans open the Arrow footer and request the pages that survive pruning.
   Compatible uncompressed columns can keep their source buffers through IPC decoding and through contiguous scan selections.
+  Compatible lists and structs stay columnar through scan projection.
   The buffer pool can retain decoded pages and parsed footers independently of the file's encoded payload.
 * The temporal resolver sees puts, deletes, and erases before a projected document reaches a value predicate.
 * Temporal file selection includes live candidates before dropping persisted files.
