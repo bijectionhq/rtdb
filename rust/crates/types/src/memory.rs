@@ -58,12 +58,16 @@ impl MemoryBudget {
             let used = self.used_bytes.load(Ordering::Acquire);
             if used > *granted {
                 let quanta = (used - *granted).div_ceil(quantized.quantum);
-                let more = quanta.checked_mul(quantized.quantum).ok_or_else(|| Anomaly::incorrect("rtdb/allocation-overflow", "Quantized grant exceeds range"))?;
-                if let Err(error) = parent.acquire_chain(more) {
-                    self.used_bytes.fetch_sub(bytes, Ordering::AcqRel);
-                    return Err(error);
+                let result = quanta.checked_mul(quantized.quantum)
+                    .ok_or_else(|| Anomaly::incorrect("rtdb/allocation-overflow", "Quantized grant exceeds range"))
+                    .and_then(|more| { parent.acquire_chain(more)?; Ok(more) });
+                match result {
+                    Ok(more) => *granted += more,
+                    Err(error) => {
+                        self.used_bytes.fetch_sub(bytes, Ordering::AcqRel);
+                        return Err(error);
+                    }
                 }
-                *granted += more;
             }
             return Ok(());
         }

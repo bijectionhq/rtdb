@@ -29,3 +29,13 @@ fn a_quantized_child_refuses_what_its_parent_cannot_grant_and_keeps_its_count() 
     drop(child);
     assert_eq!(parent.used_bytes(), 0);
 }
+
+#[test]
+fn an_overflowing_quantized_grant_leaves_both_counters_unchanged() {
+    let parent = MemoryBudget::new(usize::MAX);
+    let child = parent.quantized(usize::MAX / 2 + 1);
+    assert_eq!(child.reserve(usize::MAX).unwrap_err().code, "rtdb/allocation-overflow");
+    assert_eq!(child.used_bytes(), 0);
+    assert_eq!(parent.used_bytes(), 0);
+    assert!(child.reserve(1).is_ok());
+}
