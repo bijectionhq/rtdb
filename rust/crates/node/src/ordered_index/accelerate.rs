@@ -147,7 +147,9 @@ impl Range {
                 let Some(value) = request.constants.constant(constant).await? else {
                     continue;
                 };
-                let Some(atom) = Atom::of(&value).filter(|atom| atom.family() == Some(family))
+                let Some(atom) = Atom::of(&value).filter(|atom| {
+                    atom.family() == Some(family) && atom.supports_comparison_bound()
+                })
                 else {
                     continue;
                 };
@@ -255,7 +257,9 @@ impl CursorBound {
             let Some(value) = request.constants.constant(constant).await? else {
                 return Ok(None);
             };
-            let Some(atom) = Atom::of(&value).filter(|atom| atom.family() == Some(expected)) else {
+            let Some(atom) = Atom::of(&value).filter(|atom| {
+                atom.family() == Some(expected) && atom.supports_comparison_bound()
+            }) else {
                 return Ok(None);
             };
             key.push(atom);
@@ -498,8 +502,9 @@ impl Predicate {
                             break;
                         };
                         if value == Atom::Null
-                            || family(&field.data_type)
-                                .is_some_and(|family| value.family() == Some(family))
+                            || (value.supports_comparison_bound()
+                                && family(&field.data_type)
+                                    .is_some_and(|family| value.family() == Some(family)))
                         {
                             return Ok(Some(Self::Compare { slot, op, value }));
                         }
@@ -517,7 +522,7 @@ impl Predicate {
             Self::Either(left, right) => left.matches(tuple) || right.matches(tuple),
             Self::Compare { slot, op, value } => {
                 let cell = &tuple[*slot];
-                if matches!(cell, Atom::Null | Atom::Unordered) || *value == Atom::Null {
+                if matches!(cell, Atom::Null | Atom::Unordered) || cell.is_nan() || *value == Atom::Null {
                     return false;
                 }
                 match op {

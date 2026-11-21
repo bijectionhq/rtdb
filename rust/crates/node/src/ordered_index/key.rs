@@ -1,4 +1,4 @@
-use rtdb_types::{Interval, LogicalType, ScalarType, Timestamp, Value};
+use rtdb_types::{Interval, LogicalType, ScalarType, TimeUnit, Timestamp, Value};
 use serde::{Deserialize, Serialize};
 
 use super::domain::{bucket_start, offset, upper_bound};
@@ -11,6 +11,8 @@ pub(super) enum Atom {
     Binary(Vec<u8>),
     Uuid([u8; 16]),
     Day(i64),
+    InstantMicros(i64),
+    FloatOrder(u64),
     Unordered,
     Null,
 }
@@ -23,6 +25,8 @@ pub(super) enum Family {
     Binary,
     Uuid,
     Day,
+    InstantMicros,
+    Float,
 }
 
 impl Atom {
@@ -44,6 +48,13 @@ impl Atom {
             Value::Date(_) | Value::DateDay(_) | Value::DateMilli(_) => {
                 Self::Day(value.date_days()?)
             }
+            Value::Timestamp {
+                value,
+                unit: TimeUnit::Microsecond,
+                timezone: Some(_),
+            } => Self::InstantMicros(*value),
+            Value::F32(value) => Self::FloatOrder(float_order(f64::from(*value))),
+            Value::F64(value) => Self::FloatOrder(float_order(*value)),
             _ => return None,
         })
     }
@@ -57,7 +68,17 @@ impl Atom {
             Self::Binary(_) => Family::Binary,
             Self::Uuid(_) => Family::Uuid,
             Self::Day(_) => Family::Day,
+            Self::InstantMicros(_) => Family::InstantMicros,
+            Self::FloatOrder(_) => Family::Float,
         })
+    }
+
+    pub(super) fn supports_comparison_bound(&self) -> bool {
+        !matches!(self, Self::FloatOrder(FLOAT_NAN_ORDER | NEGATIVE_ZERO_ORDER | POSITIVE_ZERO_ORDER))
+    }
+
+    pub(super) fn is_nan(&self) -> bool {
+        matches!(self, Self::FloatOrder(FLOAT_NAN_ORDER))
     }
 
     pub(super) fn retained_bytes(&self) -> usize {
@@ -66,6 +87,22 @@ impl Atom {
             Self::Binary(value) => value.len(),
             _ => 0,
         }
+    }
+}
+
+const POSITIVE_ZERO_ORDER: u64 = 1 << 63;
+const NEGATIVE_ZERO_ORDER: u64 = POSITIVE_ZERO_ORDER - 1;
+const FLOAT_NAN_ORDER: u64 = u64::MAX;
+
+fn float_order(value: f64) -> u64 {
+    if value.is_nan() {
+        return FLOAT_NAN_ORDER;
+    }
+    let bits = value.to_bits();
+    if bits & POSITIVE_ZERO_ORDER == 0 {
+        bits ^ POSITIVE_ZERO_ORDER
+    } else {
+        !bits
     }
 }
 
@@ -83,6 +120,11 @@ pub(super) fn family(logical: &LogicalType) -> Option<Family> {
             LogicalType::Scalar(S::Binary) => Family::Binary,
             LogicalType::Scalar(S::Uuid) => Family::Uuid,
             LogicalType::Scalar(S::DateDay | S::DateMilli) => Family::Day,
+            LogicalType::Scalar(S::Timestamp {
+                unit: TimeUnit::Microsecond,
+                timezone: Some(_),
+            }) => Family::InstantMicros,
+            LogicalType::Scalar(S::F32 | S::F64) => Family::Float,
             _ => return None,
         };
         if family.is_some_and(|prior| prior != next) {

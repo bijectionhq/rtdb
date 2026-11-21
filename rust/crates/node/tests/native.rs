@@ -2319,3 +2319,140 @@ async fn ordered_coverage_ignores_a_nested_copy_of_a_canonical_l0_file() {
     assert_eq!(rows(session.query_sql(query, vec![]).await.unwrap()).await, [vec![Value::I64(1)]]);
     stop(&node, driver).await;
 }
+
+#[tokio::test]
+async fn ordered_index_pages_zoned_instants_at_head_and_at_a_retained_system_time() {
+    let observer = Arc::new(OrderedIndexReads::default());
+    let mut services = services();
+    services.scan_accelerators.push(observer.clone());
+    let mut config = options();
+    config.automatic_artefacts = false;
+    let (node, driver) = running(config, services).await;
+    let mut session = node.session("xtdb", Arc::new(Authority)).unwrap();
+    let database = node.catalog().database("xtdb").unwrap();
+    index_sql(
+        &mut session,
+        "CREATE INDEX orders_effective ON orders (effective, _id)",
+    )
+    .await;
+
+    let instant = |value, zone: &str| Value::Timestamp {
+        value,
+        unit: rtdb_types::TimeUnit::Microsecond,
+        timezone: Some(zone.into()),
+    };
+    let row = |id, micros| {
+        StructFields::from([
+            ("_id".into(), Value::I64(id)),
+            ("effective".into(), instant(micros, "UTC")),
+        ])
+    };
+    let past = session
+        .state_mut()
+        .execute_tx(
+            vec![put_rows(
+                &node,
+                "orders",
+                vec![row(1, -1), row(2, 0), row(3, 0), row(4, 2)],
+                None,
+                None,
+            )],
+            AutonomousTxOptions::default(),
+        )
+        .await
+        .unwrap();
+    assert!(past.committed());
+    index_flush(&node, &database).await;
+    database.build_artefacts().await.unwrap();
+
+    let revised = session
+        .state_mut()
+        .execute_tx(
+            vec![put_rows(&node, "orders", vec![row(1, 3)], None, None)],
+            AutonomousTxOptions::default(),
+        )
+        .await
+        .unwrap();
+    assert!(revised.committed());
+    observer.take();
+
+    let current = "SELECT _id, effective FROM orders ORDER BY effective DESC, _id DESC LIMIT 2";
+    assert_eq!(
+        rows(session.query_sql(current, vec![]).await.unwrap()).await,
+        [
+            vec![Value::I64(1), instant(3, "UTC")],
+            vec![Value::I64(4), instant(2, "UTC")],
+        ]
+    );
+    assert!(observer.take().is_empty());
+
+    let old = "SELECT _id, effective FROM orders FOR SYSTEM_TIME AS OF ?
+               WHERE effective >= ? ORDER BY effective, _id LIMIT 1";
+    let basis = instant(past.tx_key().system_time.0, "UTC");
+    assert_eq!(
+        rows(
+            session
+                .query_sql(old, vec![basis.clone(), instant(-1, "+01:00")])
+                .await
+                .unwrap()
+        )
+        .await,
+        [vec![Value::I64(1), instant(-1, "UTC")],]
+    );
+    assert!(observer.take().is_empty());
+
+    let continuation = "SELECT _id FROM orders FOR SYSTEM_TIME AS OF ?
+                        WHERE effective > ? OR (effective = ? AND _id > 2)
+                        ORDER BY effective, _id LIMIT 2";
+    let boundary = instant(0, "+01:00");
+    assert_eq!(
+        rows(
+            session
+                .query_sql(continuation, vec![basis, boundary.clone(), boundary])
+                .await
+                .unwrap()
+        )
+        .await,
+        [vec![Value::I64(3)], vec![Value::I64(4)],]
+    );
+    assert!(observer.take().is_empty());
+    stop(&node, driver).await;
+}
+
+#[tokio::test]
+async fn ordered_float_keys_sort_signed_zeros_and_keep_nan_out_of_comparisons() {
+    let observer = Arc::new(OrderedIndexReads::default());
+    let mut services = services();
+    services.scan_accelerators.push(observer.clone());
+    let mut config = options();
+    config.automatic_artefacts = false;
+    let (node, driver) = running(config, services).await;
+    let mut session = node.session("xtdb", Arc::new(Authority)).unwrap();
+    let database = node.catalog().database("xtdb").unwrap();
+    index_sql(&mut session, "CREATE INDEX orders_amount ON orders (amount, _id)").await;
+    let input = [
+        (1, 0.0), (2, -0.0), (3, f64::NAN), (4, -f64::NAN),
+        (5, 0.5), (6, f64::NEG_INFINITY), (7, f64::INFINITY),
+    ].into_iter().map(|(id, amount)| StructFields::from([
+        ("_id".into(), Value::I64(id)), ("amount".into(), Value::F64(amount)),
+    ])).collect();
+    let commit = session.state_mut().execute_tx(
+        vec![put_rows(&node, "orders", input, None, None)],
+        AutonomousTxOptions::default(),
+    ).await.unwrap();
+    assert!(commit.committed());
+    index_flush(&node, &database).await;
+    database.build_artefacts().await.unwrap();
+    let ids = |ids: &[i64]| ids.iter().map(|&id| vec![Value::I64(id)]).collect::<Vec<_>>();
+    let all = "SELECT _id FROM orders ORDER BY amount, _id LIMIT 7";
+    assert_eq!(rows(session.query_sql(all, vec![]).await.unwrap()).await, ids(&[6, 2, 1, 5, 7, 3, 4]));
+    assert!(observer.take().is_empty(), "the ordered seek should select the rows");
+
+    let above = "SELECT _id FROM orders WHERE amount > ? ORDER BY amount DESC, _id DESC LIMIT 1";
+    assert_eq!(rows(session.query_sql(above, vec![Value::F64(0.25)]).await.unwrap()).await, ids(&[7]));
+    assert!(observer.take().is_empty(), "NaN cannot occupy an indexed limit slot");
+
+    let zeros = "SELECT _id FROM orders WHERE amount = ? ORDER BY amount, _id LIMIT 2";
+    assert_eq!(rows(session.query_sql(zeros, vec![Value::F64(0.0)]).await.unwrap()).await, ids(&[2, 1]));
+    stop(&node, driver).await;
+}

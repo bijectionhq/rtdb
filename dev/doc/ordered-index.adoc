@@ -13,7 +13,9 @@ Reuse both temporal points to continue the same read across SQL statements.
 The scan can reverse the index order and applies predicates before counting rows towards the limit.
 It fetches projected fields from a row's table at the same basis.
 
-The index orders signed integers, Booleans, text, binary values, UUIDs and calendar dates.
+The index orders signed integers, Booleans, text, binary values, UUIDs, calendar dates, zoned instants at microsecond precision and floating-point values.
+Ascending floating-point order places negative zero before positive zero and NaNs after every number.
+Comparisons with a zero or NaN bound use the original values and SQL predicate semantics.
 Ascending order places nulls last and reversing the order places them first.
 The normal SQL executor covers unsupported sort directions, types, temporal intervals and query shapes.
 

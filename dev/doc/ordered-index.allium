@@ -25,6 +25,7 @@ entity Checkpoint {
 -- Aligned bucket decomposition places an eligible row in exactly one of the prefixes containing a valid-time point.
 -- A revision edits both sides of a changed projection. Unchanged spans retain their postings.
 -- The read opens a root at its system-time point and applies captured uncovered events, including erasures.
+-- Floating-point ordering distinguishes signed zeros and ties NaNs last, with SQL comparisons evaluated on the original values when the ordering key cannot preserve them.
 -- A point read merges bucket prefixes in key order and fetches payload at the same basis.
 -- An erasure removes the IID's old membership from every affected root and makes unreachable pages collectible.
 -- Replay discovers captured erase cuts before it writes pages, and projects each IID from its latest erase onward.
