@@ -32,14 +32,17 @@ case "${1:-}" in
         unset RTDB_CONFIGURATION RTDB_TLS_KEYSTORE RTDB_INSTALL_TOKEN RTDB_DISPOSAL_TOKEN RTDB_CELL_SECRET
         exec /usr/local/bin/rtdb-multi "$role" --cell-secret cell.secret "$@"
         ;;
-    recovery)
+    reaper)
         shift
-        cd "$(mktemp -d /tmp/rtdb-recovery.XXXXXXXX)"
-        printf '%s' "${RTDB_TLS_KEYSTORE:?Missing TLS keystore}" | base64 --decode > gateway.p12
-        printf '%s' "${RTDB_RECOVERY_TOKEN:?Missing recovery token}" > recovery.token
-        printf '%s' "${RTDB_CONFIGURATION:?Missing recovery configuration}" > config.yaml
+        if [ -n "${RTDB_RECOVERY_TOKEN:-}" ]; then
+            cd "$(mktemp -d /tmp/rtdb-recovery.XXXXXXXX)"
+            printf '%s' "${RTDB_TLS_KEYSTORE:?Missing recovery TLS keystore}" | base64 --decode > recovery.p12
+            printf '%s' "$RTDB_RECOVERY_TOKEN" > recovery.token
+            printf '%s' "${RTDB_CONFIGURATION:?Missing recovery configuration}" > config.yaml
+            set -- --recovery-config config.yaml --recovery-token-file recovery.token "$@"
+        fi
         unset RTDB_CONFIGURATION RTDB_TLS_KEYSTORE RTDB_RECOVERY_TOKEN
-        exec /usr/local/bin/rtdb-multi recovery --config config.yaml --token-file recovery.token "$@"
+        exec /usr/local/bin/rtdb-multi reaper "$@"
         ;;
     *)
         exec /usr/local/bin/rtdb-multi "$@"
