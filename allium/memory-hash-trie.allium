@@ -330,6 +330,7 @@ rule BuildSubtree {
 --
 -- The merge is O(n) because one input is already sorted.
 -- Only the log needs sorting (typically small: up to log_limit).
+-- A merge can reuse each input's current IID until its row is emitted, since the referenced IID stays stable.
 ------------------------------------------------------------
 
 rule CompactLogs {

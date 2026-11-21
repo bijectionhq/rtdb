@@ -130,7 +130,10 @@ impl IndexBatch {
     }
     pub fn view(&self) -> &EventBatch { &self.events }
     pub fn header(&self, row: usize) -> Result<EventHeader> {
-        self.headers.0.get(row).copied().ok_or_else(|| Anomaly::incorrect("rtdb.index/event-row", "Event row exceeds batch length"))
+        self.header_ref(row).copied()
+    }
+    fn header_ref(&self, row: usize) -> Result<&EventHeader> {
+        self.headers.0.get(row).ok_or_else(|| Anomaly::incorrect("rtdb.index/event-row", "Event row exceeds batch length"))
     }
     pub fn arrow(&self) -> &RecordBatch { self.owned.batch() }
     pub fn len(&self) -> usize { self.events.len() }
@@ -220,10 +223,13 @@ impl LiveTable {
     }
     /// The header of `row`, without taking a handle on its batch.
     pub fn header(&self, row: u32) -> Result<EventHeader> {
+        self.header_ref(row).copied()
+    }
+    fn header_ref(&self, row: u32) -> Result<&EventHeader> {
         if row >= self.row_count { return Err(invalid("Live table row exceeds its retained batches")); }
         let index = self.chunks.partition_point(|(start, _)| *start <= row).checked_sub(1).ok_or_else(|| invalid("Live table row has no owning batch"))?;
         let (start, batch) = &self.chunks[index];
-        batch.header((row - start) as usize)
+        batch.header_ref((row - start) as usize)
     }
     pub fn row(&self, row: u32) -> Result<RowSource> {
         if row >= self.row_count { return Err(invalid("Live table row exceeds its retained batches")); }
@@ -302,7 +308,7 @@ impl LiveTable {
 }
 
 impl IidReader for LiveTable {
-    fn iid(&self, row: u32) -> Result<Iid> { self.header(row).map(|header| header.iid) }
+    fn iid(&self, row: u32) -> Result<Iid> { self.header_ref(row).map(|header| header.iid) }
 }
 
 pub struct BlockPages<'a> {

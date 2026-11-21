@@ -182,15 +182,55 @@ fn sort<R: IidReader + ?Sized>(reader: &R, rows: impl Iterator<Item = u32>) -> R
 }
 
 fn merge<R: IidReader + ?Sized>(reader: &R, left: &[u32], right: &[u32]) -> Result<Vec<u32>> {
+    let Some(&first_left) = left.first() else { return Ok(right.to_vec()); };
+    let Some(&first_right) = right.first() else { return Ok(left.to_vec()); };
+    let (mut left_iid, mut right_iid) = (reader.iid(first_left)?, reader.iid(first_right)?);
     let mut merged = Vec::with_capacity(left.len() + right.len());
     let (mut li, mut ri) = (0, 0);
-    while li < left.len() && ri < right.len() {
-        if compare(reader, left[li], right[ri])? == Ordering::Less { merged.push(left[li]); li += 1; }
-        else { merged.push(right[ri]); ri += 1; }
+    loop {
+        let order = left_iid.cmp(&right_iid).then_with(|| right[ri].cmp(&left[li]));
+        if order == Ordering::Less {
+            merged.push(left[li]);
+            li += 1;
+            let Some(&row) = left.get(li) else { break; };
+            left_iid = reader.iid(row)?;
+        } else {
+            merged.push(right[ri]);
+            ri += 1;
+            let Some(&row) = right.get(ri) else { break; };
+            right_iid = reader.iid(row)?;
+        }
     }
     merged.extend_from_slice(&left[li..]);
     merged.extend_from_slice(&right[ri..]);
     Ok(merged)
+}
+
+#[cfg(test)]
+mod merge_tests {
+    use super::*;
+    use std::cell::Cell;
+
+    #[test]
+    fn merge_reads_each_compared_iid_once_and_keeps_newest_row_first() {
+        struct Rows {
+            iids: [Iid; 5],
+            reads: [Cell<usize>; 5],
+        }
+        impl IidReader for Rows {
+            fn iid(&self, row: u32) -> Result<Iid> {
+                let row = row as usize;
+                self.reads[row].set(self.reads[row].get() + 1);
+                Ok(self.iids[row])
+            }
+        }
+        let reader = Rows {
+            iids: [Iid([1; 16]), Iid([2; 16]), Iid([1; 16]), Iid([2; 16]), Iid([3; 16])],
+            reads: Default::default(),
+        };
+        assert_eq!(merge(&reader, &[0, 1, 4], &[2, 3]).unwrap(), [2, 0, 3, 1, 4]);
+        assert_eq!(reader.reads.map(Cell::into_inner), [1, 1, 1, 1, 0]);
+    }
 }
 
 fn insert_rows<R: IidReader + ?Sized>(
