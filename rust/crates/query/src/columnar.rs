@@ -1424,7 +1424,7 @@ pub(crate) async fn predicate_mask(
 /// Three-valued predicate evaluation over a batch's columns, for the predicate shapes and cell types whose
 /// semantics are exactly those of the scalar evaluator; `None` sends the batch to it instead.
 mod kernel {
-    use arrow_array::{Array, BooleanArray, Float64Array, Int8Array, Int16Array, Int32Array, Int64Array, StringArray, TimestampMicrosecondArray};
+    use arrow_array::{Array, BooleanArray, FixedSizeBinaryArray, Float64Array, Int8Array, Int16Array, Int32Array, Int64Array, StringArray, TimestampMicrosecondArray};
     use arrow_schema::{DataType, TimeUnit as ArrowUnit};
     use rtdb_plan::{BinaryOp, Expr, Schema, UnaryOp};
     use rtdb_types::{ScalarType, TimeUnit, Value};
@@ -1434,9 +1434,11 @@ mod kernel {
 
     /// A comparable cell; integers and floats compare only where the conversion between them is exact.
     #[derive(Clone, Copy, PartialEq, PartialOrd)]
-    enum Cell<'a> { Int(i64), Float(f64), Text(&'a str), Bool(bool), Micros(i64, Option<&'a str>) }
+    enum Cell<'a> { Int(i64), Float(f64), Text(&'a str), Bool(bool), Micros(i64, Option<&'a str>),
+        /// A UUID as the big-endian integer of its bytes, which orders as the bytes do.
+        Uuid(u128) }
 
-    enum Cells<'a> { Int(&'a Int64Array), Int32(&'a Int32Array), Int16(&'a Int16Array), Int8(&'a Int8Array), Float(&'a Float64Array), Text(&'a StringArray), Bool(&'a BooleanArray), Micros(&'a TimestampMicrosecondArray, Option<&'a str>), Values(&'a [Value]), Owned(Vec<Option<Cell<'static>>>),
+    enum Cells<'a> { Uuid(&'a FixedSizeBinaryArray), Int(&'a Int64Array), Int32(&'a Int32Array), Int16(&'a Int16Array), Int8(&'a Int8Array), Float(&'a Float64Array), Text(&'a StringArray), Bool(&'a BooleanArray), Micros(&'a TimestampMicrosecondArray, Option<&'a str>), Values(&'a [Value]), Owned(Vec<Option<Cell<'static>>>),
         /// A dense union whose legs are each a plain cell type, read through the leg each cell's type id names.
         Union { array: &'a arrow_array::UnionArray, legs: Vec<Option<Cells<'a>>> } }
 
@@ -1457,6 +1459,8 @@ mod kernel {
                         DataType::Float64 if plain(ScalarType::F64) => any.downcast_ref().map(Self::Float),
                         DataType::Utf8 if plain(ScalarType::Utf8) => any.downcast_ref().map(Self::Text),
                         DataType::Boolean if plain(ScalarType::Bool) => any.downcast_ref().map(Self::Bool),
+                        // Sixteen bytes are a UUID only where the column's logical type says so.
+                        DataType::FixedSizeBinary(16) if scalar == Some(&ScalarType::Uuid) => any.downcast_ref().map(Self::Uuid),
                         // A cell reads its zone from the column's logical type, or from the layout where it has none.
                         DataType::Timestamp(ArrowUnit::Microsecond, zone) => {
                             let zone = match (logical, scalar) {
@@ -1507,6 +1511,10 @@ mod kernel {
                 Self::Text(array) => valid(*array, row).then(|| Cell::Text(array.value(row))),
                 Self::Bool(array) => valid(*array, row).then(|| Cell::Bool(array.value(row))),
                 Self::Micros(array, zone) => valid(*array, row).then(|| Cell::Micros(array.value(row), *zone)),
+                Self::Uuid(array) => match valid(*array, row).then(|| array.value(row).try_into()) {
+                    Some(bytes) => Some(Cell::Uuid(u128::from_be_bytes(bytes.map_err(|_| ())?))),
+                    None => None,
+                },
                 Self::Values(values) => scalar(&values[row])?,
                 Self::Union { array, legs } => {
                     let leg = usize::try_from(array.type_id(row)).ok().and_then(|id| legs.get(id)).and_then(Option::as_ref).ok_or(())?;
@@ -1519,7 +1527,7 @@ mod kernel {
     /// A computed numeric cell, which borrows nothing.
     fn owned(cell: Cell<'_>) -> Option<Cell<'static>> {
         match cell {
-            Cell::Int(value) => Some(Cell::Int(value)), Cell::Float(value) => Some(Cell::Float(value)), Cell::Bool(value) => Some(Cell::Bool(value)),
+            Cell::Int(value) => Some(Cell::Int(value)), Cell::Float(value) => Some(Cell::Float(value)), Cell::Bool(value) => Some(Cell::Bool(value)), Cell::Uuid(value) => Some(Cell::Uuid(value)),
             Cell::Micros(value, None) => Some(Cell::Micros(value, None)), Cell::Micros(value, Some("UTC")) => Some(Cell::Micros(value, Some("UTC"))),
             Cell::Micros(_, Some(_)) | Cell::Text(_) => None,
         }
@@ -1536,6 +1544,7 @@ mod kernel {
             Value::Utf8(value) => Some(Cell::Text(value)),
             Value::Bool(value) => Some(Cell::Bool(*value)),
             Value::Timestamp { value, unit: TimeUnit::Microsecond, timezone } => Some(Cell::Micros(*value, timezone.as_deref())),
+            Value::Uuid(bytes) => Some(Cell::Uuid(u128::from_be_bytes(*bytes))),
             _ => return Err(()),
         })
     }
@@ -1555,6 +1564,7 @@ mod kernel {
             (Cell::Float(a), Cell::Int(b)) if b.unsigned_abs() < EXACT as u64 => floats(float(a)?, b as f64),
             (Cell::Text(a), Cell::Text(b)) if equality_only || (a.is_ascii() && b.is_ascii()) => Ok(a.cmp(b)),
             (Cell::Bool(a), Cell::Bool(b)) if equality_only => Ok(if a == b { Ordering::Equal } else { Ordering::Less }),
+            (Cell::Uuid(a), Cell::Uuid(b)) => Ok(a.cmp(&b)),
             _ => Err(()),
         }
     }
@@ -1649,6 +1659,7 @@ mod kernel {
                     (Some(Cell::Int(_)), Some(Cell::Float(_))) | (Some(Cell::Float(_)), Some(Cell::Int(_))) => false,
                     (Some(Cell::Text(a)), Some(Cell::Text(b))) => a == b,
                     (Some(Cell::Bool(a)), Some(Cell::Bool(b))) => a == b,
+                    (Some(Cell::Uuid(a)), Some(Cell::Uuid(b))) => a == b,
                     // Timestamps are equal only under the same zone label.
                     (Some(Cell::Micros(a, zone)), Some(Cell::Micros(b, other))) => zone == other && a == b,
                     _ => return None,
@@ -1803,6 +1814,46 @@ mod tests {
         for (op, literal, expected) in [(Lt, Value::F64(0.0), [true, false]), (Lt, Value::I64(0), [true, false]), (GtEq, Value::F64(0.0), [false, true]), (Eq, Value::F64(0.0), [true, true])] {
             let predicate = Expr::binary(op, column.clone(), Expr::Literal(literal));
             assert_eq!(kernel::truth(&predicate, &schema, &batch, &[]), Some(expected.map(Some).to_vec()), "{predicate:?}");
+        }
+    }
+
+    #[test]
+    fn the_column_kernel_compares_uuid_cells_as_the_scalar_evaluator_does() {
+        use arrow_array::FixedSizeBinaryArray;
+        let memory = MemoryBudget::new(1 << 28);
+        let schema = Schema::new(vec![field(0, ScalarType::Uuid), field(1, ScalarType::Uuid)]).unwrap();
+        let mut random = Random(0x2545f4914f6cdd1d);
+        // Few distinct values, differing in their first, middle and last bytes, so equal and adjacent cells are common.
+        let uuid = |random: &mut Random| { let mut bytes = [0u8; 16]; for at in [0, 7, 8, 15] { bytes[at] = [0, 1, 0x7f, 0x80, 0xff][random.below(5) as usize]; } bytes };
+        let comparison = [BinaryOp::Eq, BinaryOp::NotEq, BinaryOp::Lt, BinaryOp::LtEq, BinaryOp::Gt, BinaryOp::GtEq];
+        for round in 0..200 {
+            let cells: Vec<Option<[u8; 16]>> = (0..64).map(|_| (random.below(5) != 0).then(|| uuid(&mut random))).collect();
+            let stored = FixedSizeBinaryArray::try_from_sparse_iter_with_size(cells.iter().map(|cell| cell.as_ref().map(|bytes| bytes.as_slice())), 16).unwrap();
+            let values = (0..64).map(|_| if random.below(5) == 0 { Value::Null } else { Value::Uuid(uuid(&mut random)) }).collect();
+            let batch = ColumnBatch::settled(vec![arrow(Arc::new(stored), ScalarType::Uuid), Column::Values(values)], 64, memory.reserve(0).unwrap()).unwrap();
+            let parameters = [Value::Uuid(uuid(&mut random)), Value::Uuid(uuid(&mut random))];
+            let column = |random: &mut Random| schema.fields()[random.below(2) as usize].expression();
+            let constant = |random: &mut Random| match random.below(3) {
+                0 => Expr::Literal(Value::Uuid(uuid(random))),
+                1 => Expr::Parameter { index: random.below(2) as usize, data_type: LogicalType::Scalar(ScalarType::Uuid) },
+                _ => Expr::Literal(Value::Null),
+            };
+            let predicate = match round % 5 {
+                0 => Expr::binary(comparison[random.below(6) as usize], column(&mut random), constant(&mut random)),
+                1 => Expr::binary(comparison[random.below(6) as usize], constant(&mut random), column(&mut random)),
+                2 => Expr::binary(comparison[random.below(6) as usize], schema.fields()[0].expression(), schema.fields()[1].expression()),
+                3 => Expr::binary(BinaryOp::And, Expr::binary(BinaryOp::GtEq, column(&mut random), constant(&mut random)), Expr::binary(BinaryOp::Lt, column(&mut random), constant(&mut random))),
+                _ => Expr::Call { name: "===".into(), args: vec![column(&mut random), constant(&mut random)], return_type: LogicalType::Scalar(ScalarType::Bool) },
+            };
+            let truth = kernel::truth(&predicate, &schema, &batch, &parameters).unwrap_or_else(|| panic!("the kernel evaluates {predicate:?}"));
+            let scope = rtdb_expr::EvaluationScope::new(&memory).unwrap();
+            let context = rtdb_expr::EvalContext { parameters: &parameters, parameter_types: None, current_time: rtdb_types::Instant::from(Timestamp(0)), timezone: "UTC",
+                outer_rows: &[], snapshot_token: None, allocation: Some(&scope), catalog: None, corpora: None };
+            for (row, expected) in truth.iter().enumerate() {
+                let values: Vec<Value> = batch.columns.iter().map(|column| column.value(row).unwrap()).collect();
+                let actual = match rtdb_expr::evaluate(&predicate, &schema, &values, &context).unwrap() { Value::Bool(value) => Some(value), Value::Null => None, other => panic!("{other:?}") };
+                assert_eq!(actual, *expected, "{predicate:?} on {values:?}");
+            }
         }
     }
 
