@@ -323,6 +323,11 @@ pub struct Capture {
 }
 
 impl Capture {
+    /// The identity of the canonical manifest stored in the independent archive.
+    pub fn manifest_sha256(&self) -> Result<String> {
+        Ok(digest(&encode(self)?))
+    }
+
     async fn verify(
         &self,
         bucket: Arc<dyn ObjectStore>,
@@ -706,6 +711,25 @@ pub async fn restore(
     operation: Uuid,
     maximum_message_bytes: usize,
 ) -> Result<CheckpointRecovery> {
+    restore_checkpoint(directory, storage, archive, keys, deployment, operation, maximum_message_bytes, None).await
+}
+
+pub(crate) async fn restore_checkpoint(
+    directory: &dyn Directory,
+    storage: &CellStorage,
+    archive: &CellStorage,
+    keys: &dyn KeyService,
+    deployment: Uuid,
+    operation: Uuid,
+    maximum_message_bytes: usize,
+    expected_manifest: Option<&str>,
+) -> Result<CheckpointRecovery> {
+    let require_manifest = |actual: &str| {
+        if expected_manifest.is_some_and(|expected| expected != actual) {
+            return Err(inconsistent("The restore manifest differs from the accepted capture"));
+        }
+        Ok(())
+    };
     if deployment.is_nil() || operation.is_nil() || same_storage(storage, archive) {
         return Err(inconsistent(
             "Restore requires one deployment, operation and independent archive",
@@ -722,6 +746,7 @@ pub async fn restore(
             if recovery.archive != archive_binding {
                 return Err(inconsistent("The restore operation has another archive"));
             }
+            require_manifest(&recovery.manifest_sha256)?;
             return Ok(recovery.clone());
         }
     }
@@ -732,7 +757,8 @@ pub async fn restore(
     let capture = read::<Capture>(&metadata, &key("capture.json")?)
         .await?
         .ok_or_else(|| unavailable("The checkpoint capture is incomplete"))?;
-    let manifest_sha256 = digest(&encode(&capture)?);
+    let manifest_sha256 = capture.manifest_sha256()?;
+    require_manifest(&manifest_sha256)?;
     let point = capture.point.clone();
     let intent = read::<CapturePoint>(&metadata, &key("intent.json")?).await?;
     if intent.as_ref() != Some(&point)

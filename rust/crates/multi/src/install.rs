@@ -117,13 +117,13 @@ pub struct Installer {
     replicas: usize,
 }
 
-struct Token {
+pub(crate) struct Token {
     expected: hmac::Tag,
     verifier: hmac::Key,
 }
 
 impl Token {
-    fn read(path: &Path) -> Result<String> {
+    pub(crate) fn read(path: &Path) -> Result<String> {
         let token = std::fs::read_to_string(path)
             .map_err(|_| invalid("Cannot read the hosted lifecycle credential"))?;
         let token = token.trim_end_matches('\n');
@@ -133,14 +133,14 @@ impl Token {
         Ok(token.to_owned())
     }
 
-    fn new(token: &str) -> Result<Self> {
+    pub(crate) fn new(token: &str) -> Result<Self> {
         let verifier = hmac::Key::generate(hmac::HMAC_SHA256, &ring::rand::SystemRandom::new())
             .map_err(|_| invalid("Cannot initialize the hosted lifecycle credential verifier"))?;
         let expected = hmac::sign(&verifier, token.as_bytes());
         Ok(Self { expected, verifier })
     }
 
-    fn accepts(&self, token: &str) -> bool {
+    pub(crate) fn accepts(&self, token: &str) -> bool {
         hmac::verify(&self.verifier, token.as_bytes(), self.expected.as_ref()).is_ok()
     }
 }

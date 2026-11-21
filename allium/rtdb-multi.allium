@@ -1728,6 +1728,31 @@ rule EraseAndProve {
         Directory.cas(record.id, record.epoch, change: { lifecycle: deleted })
 }
 
+rule HostedCheckpointCapture {
+    when: AuthenticatedRecoveryCapture(authority, name, capture_id)
+
+    requires: ConfiguredOrganizationOwns(authority, name)
+              and RootInstallation(authority)
+              and CaptureEligible(authority)
+
+    ensures:
+        RegisterAndVerifyCheckpointArchive(authority, capture_id, ConfiguredArchive)
+        ReturnExactCheckpointAndManifestDigest(authority, capture_id)
+}
+
+rule HostedCheckpointRecovery {
+    when: AuthenticatedRecoveryRestore(authority, name, capture_id, manifest_digest)
+
+    requires: ConfiguredOrganizationOwns(authority, name)
+              and RootInstallation(authority)
+              and AcceptedArchiveManifest(authority, capture_id, manifest_digest)
+              and ExactCheckpointOrCompletedRecovery(authority, capture_id)
+
+    ensures:
+        RecoverUnderWriterFence(authority, capture_id)
+        ReturnRecoveryReceipt(authority, capture_id, manifest_digest)
+}
+
 rule RetireCheckpointArchives {
     when: RecoveryRetirementAuthorized(record)
 
