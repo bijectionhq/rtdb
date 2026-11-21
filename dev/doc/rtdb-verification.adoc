@@ -2,6 +2,7 @@
 
 This is the first study brief for the Rust-native engine of a single database.
 The requirements are proposed for review against the existing Allium contracts.
+The link:rtdb-formal-verification-design.adoc[formal verification design] defines the full requirements, tool choices, production boundaries, and evidence gates.
 The reference state is an ordered history of committed transactions.
 A read selects a committed prefix and asks what the facts in it say at a valid-time and system-time point or range.
 Physical files, live index segments and search indexes are representations of that state.
