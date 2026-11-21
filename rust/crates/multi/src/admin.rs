@@ -862,8 +862,12 @@ async fn prepare_cell_move(
     }
     let mut bound_source = current.clone();
     bind_admin_storage(&mut bound_source, source_binding)?;
-    let material = from.keys.key(&current.key_id()).await?;
-    to.keys.validate_install(&arrival.key_id(), &material).await?;
+    let material = from.keys.existing_key(&current.key_id()).await?;
+    if let Some(material) = material {
+        to.keys.validate_install(&arrival.key_id(), &material).await?;
+    } else if current.checkpoint.is_some() {
+        return Err(Anomaly::fault("rtdb.multi/transfer-key", "The source checkpoint has no key in its original vault"));
+    }
     if let Some(target) = to.directory.deployment(&current.id).await? {
         require_storage_namespaces(&target, target_binding)?;
     }
@@ -883,7 +887,13 @@ async fn prepare_cell_move(
         if record.lifecycle == Lifecycle::Moving && intent_matches(record, intent) && same_media(record) {
             return Ok(());
         }
-        if record.lifecycle != Lifecycle::Live || record.version != current.version || record.move_from.is_some() {
+        if record.lifecycle != Lifecycle::Live || record.incarnation != current.incarnation
+            || record.epoch != current.epoch || record.checkpoint != current.checkpoint
+            || record.storage_prefix() != current.storage_prefix() || record.storage_namespaces != current.storage_namespaces
+            || record.ensemble != current.ensemble || record.replica_journals != current.replica_journals
+            || record.log_copy_servers != current.log_copy_servers || record.log_epoch != current.log_epoch
+            || record.engine_pin != current.engine_pin || record.move_from.is_some()
+        {
             return Err(conflict());
         }
         record.lifecycle = Lifecycle::Moving;
@@ -1013,6 +1023,10 @@ async fn stage_cell_storage(
     let uncertain = admitted.as_ref().is_err_and(|error| error.code != "rtdb.multi/cell-transfer");
     let result = async {
         admitted?;
+        let material = from.keys.existing_key(&source.key_id()).await?;
+        if source.checkpoint.is_some() && material.is_none() {
+            return Err(Anomaly::fault("rtdb.multi/transfer-key", "The source checkpoint has no key in its original vault"));
+        }
         let source_bucket = from.storage.bucket(IoRegion::new()).await?;
         let target_bucket = to.storage.bucket(io.clone()).await?;
         crate::reference::materialize(
@@ -1024,7 +1038,12 @@ async fn stage_cell_storage(
         if let Some(checkpoint) = staged.checkpoint {
             crate::reference::verify_block_pack(target_bucket.as_ref(), &staged.storage_prefix(), checkpoint.block).await?;
         }
-        to.keys.install(&staged.key_id(), from.keys.key(&source.key_id()).await?).await
+        // A never-opened source need not provision a key merely to move.
+        // The source vault is read-only for the transfer operator.
+        if let Some(material) = material {
+            to.keys.install(&staged.key_id(), material).await?;
+        }
+        Ok(())
     }.await;
     io.close_and_wait().await;
     drop(io);
