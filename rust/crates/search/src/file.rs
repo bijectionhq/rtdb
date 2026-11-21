@@ -695,6 +695,12 @@ impl SearchFile {
         segment.inverted_index(field).map_err(fault)?.read_postings(&Term::from_field_text(field, term), IndexRecordOption::Basic).map_err(fault)
     }
 
+    pub(crate) fn document_frequency(&self, column: &str, term: &str) -> Result<u64> {
+        let (Some(field), Some(segment)) = (self.field(column), self.searcher.segment_readers().first()) else { return Ok(0) };
+        let inverted = segment.inverted_index(field).map_err(fault)?;
+        inverted.doc_freq(&Term::from_field_text(field, term)).map(u64::from).map_err(fault)
+    }
+
     /// Every query term and phrase as one conjunction over the column.
     fn conjunction(field: Field, query: &Query) -> BooleanQuery {
         let mut clauses: Vec<(Occur, Box<dyn tantivy::query::Query>)> = query.terms().iter().map(|term| (Occur::Must, Box::new(TermQuery::new(Term::from_field_text(field, term), IndexRecordOption::Basic)) as Box<dyn tantivy::query::Query>)).collect();
@@ -898,14 +904,18 @@ impl Ranked {
     pub fn bound(&self) -> Option<f64> { self.0.as_ref().and_then(|windows| windows.windows.get(windows.next).map(|(bound, _)| *bound)) }
 
     /// The matching visible documents of the next windows, with their exact scores; twice as many windows as the time before.
-    pub fn expand(&mut self) -> Result<Vec<(DocMatch, f64)>> { self.0.as_mut().map_or(Ok(Vec::new()), Windows::expand) }
+    pub fn expand(&mut self) -> Result<Vec<(DocMatch, f64)>> { self.expand_in(None, &mut 0) }
+
+    pub(crate) fn expand_in(&mut self, scope: Option<&BTreeSet<Iid>>, examined: &mut usize) -> Result<Vec<(DocMatch, f64)>> {
+        self.0.as_mut().map_or(Ok(Vec::new()), |windows| windows.expand(scope, examined))
+    }
 
     /// The file the documents belong to.
     pub fn file(&self) -> Option<&Arc<SearchFile>> { self.0.as_ref().map(|windows| &windows.file) }
 }
 
 impl Windows {
-    fn expand(&mut self) -> Result<Vec<(DocMatch, f64)>> {
+    fn expand(&mut self, scope: Option<&BTreeSet<Iid>>, examined: &mut usize) -> Result<Vec<(DocMatch, f64)>> {
         use tantivy::{DocSet, query::Query as _};
         let end = self.next.saturating_add(self.batch).min(self.windows.len());
         let mut windows: Vec<u32> = self.windows[self.next..end].iter().map(|(_, window)| *window).collect();
@@ -922,7 +932,10 @@ impl Windows {
             let (start, stop) = document_range(window);
             let mut doc = if docs.doc() < start { docs.seek(start) } else { docs.doc() };
             while doc < stop && doc != tantivy::TERMINATED {
-                if self.file.visible(doc, self.bounds) { found.push((self.file.sidecar.doc_match(doc), scorer.score(doc))); }
+                if cfg!(feature = "experiments") { *examined += 1; }
+                if scope.is_none_or(|scope| scope.contains(&Iid(self.file.sidecar.doc_iid(doc)))) && self.file.visible(doc, self.bounds) {
+                    found.push((self.file.sidecar.doc_match(doc), scorer.score(doc)));
+                }
                 doc = docs.advance();
             }
         }
