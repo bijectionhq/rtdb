@@ -290,6 +290,27 @@ pub fn owned_event_batch(events: &[StoredEvent], put_fields: Option<StructFields
     builder.finish_with_metadata(batch, metadata)
 }
 
+pub fn owned_put_batch(documents: ArrayRef, headers: &[EventHeader], memory: &Arc<MemoryBudget>) -> Result<OwnedBatch> {
+    if documents.len() != headers.len() || documents.null_count() != 0
+        || !matches!(documents.data_type(), DataType::Struct(_)) || headers.iter().any(|header| header.op != EventOp::Put) {
+        return Err(invalid("Put headers and their Arrow documents disagree"));
+    }
+    let bound = headers.len().checked_mul(128).and_then(|bytes| bytes.checked_add(documents.get_array_memory_size()))
+        .and_then(|bytes| bytes.checked_add(4096)).ok_or_else(event_size)?;
+    let mut reservation = memory.reserve(bound)?;
+    let fields = UnionFields::new(0..3, [
+        Field::new("delete", DataType::Null, true),
+        Field::new("erase", DataType::Null, true),
+        Field::new("put", documents.data_type().clone(), false),
+    ]);
+    let offsets = (0..headers.len()).map(|offset| i32::try_from(offset).map_err(invalid)).collect::<Result<Vec<_>>>()?;
+    let operations = UnionArray::try_new(fields, ScalarBuffer::from(vec![2; headers.len()]), Some(ScalarBuffer::from(offsets)),
+        vec![Arc::new(NullArray::new(0)), Arc::new(NullArray::new(0)), documents]).map_err(invalid)?;
+    let batch = event_columns(headers, Arc::new(operations), None, None)?;
+    Arc::get_mut(&mut reservation).expect("put construction owns its reservation").shrink_to(batch.get_array_memory_size())?;
+    OwnedBatch::with_reservation(batch, reservation)
+}
+
 /// A batch has a `put` leg when it holds a put or declares document columns, as the reference's relation gains one.
 fn event_batch<E: EncodedEvent>(events: &[E], put_fields: Option<StructFields<LogicalType>>, iid_encoding: Option<RunEndWidth>, copy: bool, builder: Option<&mut BatchBuilder>, put_leg: PutLeg) -> Result<RecordBatch> {
     let mut puts = Vec::new();
@@ -324,7 +345,14 @@ fn event_batch<E: EncodedEvent>(events: &[E], put_fields: Option<StructFields<Lo
         children.insert(index, documents);
     }
     let op_fields = UnionFields::new(0..op_fields.len() as i8, op_fields);
-    let op: ArrayRef = Arc::new(UnionArray::try_new(op_fields.clone(), ScalarBuffer::from(ids), Some(ScalarBuffer::from(offsets)), children).map_err(invalid)?);
+    let op: ArrayRef = Arc::new(UnionArray::try_new(op_fields, ScalarBuffer::from(ids), Some(ScalarBuffer::from(offsets)), children).map_err(invalid)?);
+    let recencies = events.iter().any(|event| event.recency().is_some()).then(|| {
+        events.iter().map(|event| event.recency().map(|time| time.0).ok_or_else(|| invalid("Mixed recency presence in one event batch"))).collect::<Result<Vec<_>>>()
+    }).transpose()?;
+    event_columns(&headers, op, iid_encoding, recencies)
+}
+
+fn event_columns(headers: &[EventHeader], op: ArrayRef, iid_encoding: Option<RunEndWidth>, recencies: Option<Vec<i64>>) -> Result<RecordBatch> {
     let iids: Vec<_> = headers.iter().map(|header| header.iid).collect();
     let iids = build_iids(&iids, iid_encoding)?;
     let time_type = DataType::Timestamp(ArrowTimeUnit::Microsecond, Some("UTC".into()));
@@ -333,13 +361,12 @@ fn event_batch<E: EncodedEvent>(events: &[E], put_fields: Option<StructFields<Lo
         Field::new("_system_from", time_type.clone(), false),
         Field::new("_valid_from", time_type.clone(), false),
         Field::new("_valid_to", time_type.clone(), false),
-        Field::new("op", DataType::Union(op_fields, UnionMode::Dense), false),
+        Field::new("op", op.data_type().clone(), false),
     ];
     let times = |values: Vec<i64>| Arc::new(TimestampMicrosecondArray::from(values).with_timezone("UTC")) as ArrayRef;
     let mut columns = vec![iids, times(headers.iter().map(|header| header.system_from.0).collect()),
         times(headers.iter().map(|header| header.valid_time.lower().0).collect()), times(headers.iter().map(|header| header.valid_time.upper().0).collect()), op];
-    if events.iter().any(|event| event.recency().is_some()) {
-        let recencies = events.iter().map(|event| event.recency().map(|time| time.0).ok_or_else(|| invalid("Mixed recency presence in one event batch"))).collect::<Result<Vec<_>>>()?;
+    if let Some(recencies) = recencies {
         fields.push(Field::new("_recency", time_type, false));
         columns.push(times(recencies));
     }

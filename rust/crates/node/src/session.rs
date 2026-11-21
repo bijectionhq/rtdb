@@ -126,7 +126,7 @@ impl DmlBuffer {
     fn append(&mut self, operation: TxOp, memory: &Arc<MemoryBudget>) -> Result<()> {
         let bytes = match &operation {
             TxOp::Sql { sql, .. } | TxOp::SqlBytes { sql, .. } => sql.capacity(),
-            TxOp::PutDocs { table, .. } | TxOp::PatchDocs { table, .. } | TxOp::DeleteDocs { table, .. } | TxOp::EraseDocs { table, .. } => table.schema.capacity().checked_add(table.table.capacity()).ok_or_else(allocation_overflow)?,
+            TxOp::PutDocs { table, .. } | TxOp::PutArrowDocs { table, .. } | TxOp::PatchDocs { table, .. } | TxOp::DeleteDocs { table, .. } | TxOp::EraseDocs { table, .. } => table.schema.capacity().checked_add(table.table.capacity()).ok_or_else(allocation_overflow)?,
         }.checked_add(std::mem::size_of::<BufferedOperation>() * 2 + 128).ok_or_else(allocation_overflow)?;
         let reservation = memory.reserve(bytes)?;
         match (self.operations.last_mut().map(|entry| &mut entry.operation), operation) {

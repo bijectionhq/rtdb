@@ -10,13 +10,14 @@ use rtdb_format::envelope::{SourceBody, SourceMessage};
 use prost::Message;
 use rtdb_types::{Anomaly, EntityId, Iid, LogicalType, Result, ScalarType, TableRef, TimeUnit, Timestamp, Value};
 
-use crate::{Documents, EntityIds, RetainedBytes, SqlArguments, SubmitOptions, TxOp, UserMetadata};
+use crate::{ArrowDocuments, Documents, EntityIds, RetainedBytes, SqlArguments, SubmitOptions, TxOp, UserMetadata};
 use crate::values::DecodedDocumentLayout;
 
 #[derive(Clone, Debug)]
 pub(crate) enum Operation {
     Public(TxOp),
     PutIids { table: TableRef, documents: Documents, iids: Vec<Iid>, valid_from: Option<Timestamp>, valid_to: Option<Timestamp> },
+    PutArrowIids { table: TableRef, documents: ArrowDocuments, iids: Vec<Iid>, valid_from: Option<Timestamp>, valid_to: Option<Timestamp> },
     PatchIids { table: TableRef, documents: Documents, iids: Vec<Iid>, valid_from: Option<Timestamp>, valid_to: Option<Timestamp> },
     Removed(String),
 }
@@ -38,8 +39,8 @@ impl SourceTransaction {
         for operation in &operations {
             let (text, table, ids) = match operation {
                 Operation::Public(TxOp::Sql { sql, .. } | TxOp::SqlBytes { sql, .. }) => (sql.capacity(), None, 0),
-                Operation::Public(TxOp::PutDocs { table, .. } | TxOp::PatchDocs { table, .. } | TxOp::DeleteDocs { table, .. } | TxOp::EraseDocs { table, .. }) => (0, Some(table), 0),
-                Operation::PutIids { table, iids, .. } | Operation::PatchIids { table, iids, .. } => (0, Some(table), iids.capacity().checked_mul(16).ok_or_else(overflow)?),
+                Operation::Public(TxOp::PutDocs { table, .. } | TxOp::PutArrowDocs { table, .. } | TxOp::PatchDocs { table, .. } | TxOp::DeleteDocs { table, .. } | TxOp::EraseDocs { table, .. }) => (0, Some(table), 0),
+                Operation::PutIids { table, iids, .. } | Operation::PutArrowIids { table, iids, .. } | Operation::PatchIids { table, iids, .. } => (0, Some(table), iids.capacity().checked_mul(16).ok_or_else(overflow)?),
                 Operation::Removed(name) => (name.capacity(), None, 0),
             };
             bytes = bytes.checked_add(text).and_then(|size| size.checked_add(ids)).and_then(|size| size.checked_add(table.map_or(0, |table| table.schema.capacity() + table.table.capacity()))).and_then(|size| size.checked_add(256)).ok_or_else(overflow)?;
@@ -121,6 +122,9 @@ impl SourceTransaction {
         let scratch = self.operations.iter().try_fold(65_536usize, |bytes, operation| {
             let extra = match operation {
                 Operation::Public(TxOp::PutDocs { documents, .. } | TxOp::PatchDocs { documents, .. }) | Operation::PutIids { documents, .. } | Operation::PatchIids { documents, .. } => documents.rows().iter().try_fold(0usize, |bytes, document| bytes.checked_add(Value::document_retained_bytes(document)?).ok_or_else(overflow))?,
+                Operation::Public(TxOp::PutArrowDocs { documents, .. }) | Operation::PutArrowIids { documents, .. } => {
+                    documents.array().len().checked_mul(64).ok_or_else(overflow)?
+                }
                 Operation::Public(TxOp::Sql { sql, args }) => {
                     let rows = args.as_ref().map(|args| args.rows().flatten().try_fold(0usize, |bytes, value| bytes.checked_add(value.retained_bytes()?).ok_or_else(overflow))).transpose()?.unwrap_or(0);
                     rows.checked_add(sql.capacity()).ok_or_else(overflow)?
@@ -146,7 +150,7 @@ impl SourceTransaction {
             })
         })?;
         let mut arrays = BatchBuilder::new(metadata_bound, &self.memory)?;
-        let union = named_union(entries, |leg| operation_leg(leg, &mut arrays))?;
+        let union = named_union(entries, |leg| operation_leg(leg, &mut arrays, &self.memory))?;
         let schema = Arc::new(Schema::new(vec![Field::new("tx-ops", union.data_type().clone(), false)]));
         let batch = RecordBatch::try_new(schema, vec![union]).map_err(|error| invalid(error.to_string()))?;
         arrays.finish(batch)
@@ -155,7 +159,15 @@ impl SourceTransaction {
 
 struct SourceOperation<'a> {
     body: StructFields<Value>,
-    documents: Option<(String, &'a Documents)>,
+    documents: Option<(String, SourceDocuments<'a>)>,
+}
+
+enum SourceDocuments<'a> { Rows(&'a Documents), Arrow(&'a ArrowDocuments) }
+
+impl SourceDocuments<'_> {
+    fn columns(&self) -> &[String] {
+        match self { Self::Rows(documents) => documents.columns(), Self::Arrow(documents) => documents.columns() }
+    }
 }
 
 fn operation_value<'a>(operation: &'a Operation, memory: &Arc<MemoryBudget>) -> Result<(String, SourceOperation<'a>)> {
@@ -178,13 +190,29 @@ fn operation_value<'a>(operation: &'a Operation, memory: &Arc<MemoryBudget>) -> 
             }).collect::<Result<_>>()?;
             body.insert("iids".into(), Value::List(iids));
             time_fields(&mut body, *valid_from, *valid_to);
-            docs = Some((table_name(table), documents));
+            docs = Some((table_name(table), SourceDocuments::Rows(documents)));
             if matches!(operation, Operation::Public(TxOp::PatchDocs { .. })) { "patch-docs" } else { "put-docs" }
+        }
+        Operation::Public(TxOp::PutArrowDocs { table, documents }) => {
+            let reader = documents.id_reader()?;
+            let iids = (0..documents.array().len()).map(|row| {
+                documents.iid(row, reader.as_ref(), memory).map(|iid| Value::FixedSizeBinary(iid.0.to_vec()))
+            }).collect::<Result<_>>()?;
+            body.insert("iids".into(), Value::List(iids));
+            time_fields(&mut body, None, None);
+            docs = Some((table_name(table), SourceDocuments::Arrow(documents)));
+            "put-docs"
+        }
+        Operation::PutArrowIids { table, documents, iids, valid_from, valid_to } => {
+            body.insert("iids".into(), Value::List(iids.iter().map(|iid| Value::FixedSizeBinary(iid.0.to_vec())).collect()));
+            time_fields(&mut body, *valid_from, *valid_to);
+            docs = Some((table_name(table), SourceDocuments::Arrow(documents)));
+            "put-docs"
         }
         Operation::PutIids { table, documents, iids, valid_from, valid_to } | Operation::PatchIids { table, documents, iids, valid_from, valid_to } => {
             body.insert("iids".into(), Value::List(iids.iter().map(|iid| Value::FixedSizeBinary(iid.0.to_vec())).collect()));
             time_fields(&mut body, *valid_from, *valid_to);
-            docs = Some((table_name(table), documents));
+            docs = Some((table_name(table), SourceDocuments::Rows(documents)));
             if matches!(operation, Operation::PatchIids { .. }) { "patch-docs" } else { "put-docs" }
         }
         Operation::Public(TxOp::DeleteDocs { table, ids, valid_from, valid_to }) => {
@@ -245,7 +273,7 @@ fn named_union<T>(
     Ok(Arc::new(UnionArray::try_new(UnionFields::new((0..fields.len()).map(|id| id as i8), fields), ScalarBuffer::from(ids), Some(ScalarBuffer::from(offsets)), children).map_err(|error| invalid(error.to_string()))?))
 }
 
-fn operation_leg(values: Vec<SourceOperation<'_>>, arrays: &mut BatchBuilder) -> Result<ArrayRef> {
+fn operation_leg(values: Vec<SourceOperation<'_>>, arrays: &mut BatchBuilder, memory: &Arc<MemoryBudget>) -> Result<ArrayRef> {
     let (values, documents): (Vec<_>, Vec<_>) = values.into_iter().map(|value| (value.body, value.documents)).unzip();
     let types = values.iter().map(|value| LogicalType::Struct(value.iter().map(|(name, value)| (name.clone(), value.logical_type())).collect())).collect::<Vec<_>>();
     let LogicalType::Struct(mut types) = LogicalType::join_all(&types) else { return Err(invalid("Transaction operation leg has no struct layout")); };
@@ -271,7 +299,7 @@ fn operation_leg(values: Vec<SourceOperation<'_>>, arrays: &mut BatchBuilder) ->
         fields.push(Arc::new(to_field(&name, &ty)?));
         if name == "iids" {
             if let Some(documents) = documents.take() {
-                let documents = named_union(documents.into_iter().flatten(), |leg| document_leg(leg, arrays))?;
+                let documents = named_union(documents.into_iter().flatten(), |leg| document_leg(leg, arrays, memory))?;
                 fields.push(Arc::new(Field::new("documents", documents.data_type().clone(), false)));
                 columns.push(documents);
             }
@@ -281,7 +309,45 @@ fn operation_leg(values: Vec<SourceOperation<'_>>, arrays: &mut BatchBuilder) ->
     rtdb_columnar::build_struct_array(fields.into(), &columns, values.len(), None).map_err(|error| invalid(error.to_string()))
 }
 
-fn document_leg(lists: Vec<&Documents>, arrays: &mut BatchBuilder) -> Result<ArrayRef> {
+fn document_leg(lists: Vec<SourceDocuments<'_>>, arrays: &mut BatchBuilder, memory: &Arc<MemoryBudget>) -> Result<ArrayRef> {
+    let arrow = lists.iter().map(|list| match list {
+        SourceDocuments::Arrow(documents) => Some(documents.array()),
+        SourceDocuments::Rows(_) => None,
+    }).collect::<Option<Vec<_>>>();
+    if let Some(pages) = arrow && let Some(first) = pages.first()
+        && pages.iter().all(|page| page.fields().len() == first.fields().len()
+            && page.fields().iter().zip(first.fields()).all(|(left, right)| left.name() == right.name() && left.data_type() == right.data_type())) {
+        let mut offsets = Vec::with_capacity(pages.len() + 1);
+        offsets.push(0i32);
+        for page in &pages {
+            offsets.push(offsets.last().unwrap().checked_add(i32::try_from(page.len()).map_err(|_| overflow())?).ok_or_else(overflow)?);
+        }
+        let structs: ArrayRef = if pages.len() == 1 {
+            let bound = first.get_array_memory_size().checked_add(4096).ok_or_else(overflow)?;
+            arrays.column(bound, || Ok(Arc::new((*first).clone())))?
+        } else {
+            let mut fields = Vec::new();
+            let mut columns = Vec::new();
+            for (index, field) in first.fields().iter().enumerate() {
+                let inputs = pages.iter().map(|page| page.column(index).as_ref()).collect::<Vec<_>>();
+                let bound = inputs.iter().try_fold(4096usize, |bytes, column| {
+                    column.get_array_memory_size().checked_mul(4).and_then(|size| bytes.checked_add(size)).ok_or_else(overflow)
+                })?;
+                fields.push(field.as_ref().clone().with_nullable(pages.iter().any(|page| page.fields()[index].is_nullable())));
+                columns.push(arrays.column(bound, || arrow_select::concat::concat(&inputs).map_err(|error| invalid(error.to_string())))?);
+            }
+            rtdb_columnar::build_struct_array(fields.into(), &columns, *offsets.last().unwrap() as usize, None)?
+        };
+        return document_list(structs, offsets);
+    }
+    let rows = lists.iter().map(|list| match list {
+        SourceDocuments::Rows(documents) => Ok((*documents).clone()),
+        SourceDocuments::Arrow(documents) => documents.to_rows(false, memory),
+    }).collect::<Result<Vec<_>>>()?;
+    row_document_leg(rows.iter().collect(), arrays)
+}
+
+fn row_document_leg(lists: Vec<&Documents>, arrays: &mut BatchBuilder) -> Result<ArrayRef> {
     let mut fields = BTreeMap::<&str, (LogicalType, usize)>::new();
     let mut order = Vec::new();
     let mut offsets = vec![0i32];
@@ -323,6 +389,10 @@ fn document_leg(lists: Vec<&Documents>, arrays: &mut BatchBuilder) -> Result<Arr
         schema.push(Arc::new(to_field(name, &ty)?));
     }
     let structs = rtdb_columnar::build_struct_array(schema.into(), &columns, length, None).map_err(|error| invalid(error.to_string()))?;
+    document_list(structs, offsets)
+}
+
+fn document_list(structs: ArrayRef, offsets: Vec<i32>) -> Result<ArrayRef> {
     let field = Arc::new(Field::new("$data$", structs.data_type().clone(), false));
     Ok(Arc::new(ListArray::try_new(field, OffsetBuffer::new(ScalarBuffer::from(offsets)), structs, None).map_err(|error| invalid(error.to_string()))?))
 }
@@ -413,16 +483,20 @@ impl SourceOperationReader<'_> {
                 if lists.is_null(docs_offset) { return Err(invalid("Documents are not a list")); }
                 let rows = lists.value(docs_offset);
                 let structs = rows.as_any().downcast_ref::<StructArray>().ok_or_else(|| invalid("Document is not a struct"))?;
+                let valid_from = optional_timestamp(value("_valid_from")?)?;
+                let valid_to = optional_timestamp(value("_valid_to")?)?;
+                let iids = match value("iids")? { Value::Null | Value::Undefined => None, values => Some(iids(values)?) };
+                if iids.as_ref().is_some_and(|iids| iids.len() != structs.len()) { return Err(invalid("Document and IID counts differ")); }
                 let identity = structs.fields().as_ptr() as usize;
                 let layout = match self.layouts.entry(identity) {
                     std::collections::btree_map::Entry::Occupied(layout) => Arc::clone(layout.get()),
                     std::collections::btree_map::Entry::Vacant(layout) => Arc::clone(layout.insert(DecodedDocumentLayout::new(structs.fields(), memory)?)),
                 };
+                if name == "put-docs" && iids.is_some()
+                    && let Some(documents) = ArrowDocuments::from_source(structs, Arc::clone(&layout)) {
+                    return Ok(Operation::PutArrowIids { table, documents, iids: iids.expect("put contains IIDs"), valid_from, valid_to });
+                }
                 let documents = Documents::read_arrow(structs, layout, name == "put-docs", memory)?;
-                let valid_from = optional_timestamp(value("_valid_from")?)?;
-                let valid_to = optional_timestamp(value("_valid_to")?)?;
-                let iids = match value("iids")? { Value::Null | Value::Undefined => None, values => Some(iids(values)?) };
-                if iids.as_ref().is_some_and(|iids| iids.len() != documents.rows().len()) { return Err(invalid("Document and IID counts differ")); }
                 if name == "put-docs" {
                     if let Some(iids) = iids { return Ok(Operation::PutIids { table, documents, iids, valid_from, valid_to }); }
                     TxOp::PutDocs { table, documents, valid_from, valid_to }
@@ -530,8 +604,8 @@ pub(crate) fn is_reserved_write_schema(schema: &str) -> bool {
 }
 fn check_writable_table(operation: &Operation) -> Result<()> {
     let table = match operation {
-        Operation::Public(TxOp::PutDocs { table, .. } | TxOp::PatchDocs { table, .. } | TxOp::DeleteDocs { table, .. } | TxOp::EraseDocs { table, .. })
-        | Operation::PutIids { table, .. } | Operation::PatchIids { table, .. } => table,
+        Operation::Public(TxOp::PutDocs { table, .. } | TxOp::PutArrowDocs { table, .. } | TxOp::PatchDocs { table, .. } | TxOp::DeleteDocs { table, .. } | TxOp::EraseDocs { table, .. })
+        | Operation::PutIids { table, .. } | Operation::PutArrowIids { table, .. } | Operation::PatchIids { table, .. } => table,
         _ => return Ok(()),
     };
     parse_table(&table_name(table))?;
@@ -558,6 +632,34 @@ mod tests {
         let encoded = source.encode().unwrap();
         let message = SourceMessage::decode(encoded.as_slice()).unwrap().unwrap();
         SourceTransaction::decode(&message, &source.memory).unwrap()
+    }
+
+    #[test]
+    fn an_arrow_put_matches_the_source_codec_for_the_same_documents() {
+        let memory = budget();
+        let schema = Arc::new(Schema::new(vec![Field::new("_id", DataType::Int64, true), Field::new("v", DataType::Utf8, true)]));
+        let batch = RecordBatch::try_new(schema, vec![
+            Arc::new(arrow_array::Int64Array::from(vec![1, 2])),
+            Arc::new(arrow_array::StringArray::from(vec![Some("text"), None])),
+        ]).unwrap();
+        let table = TableRef::new("public", "docs");
+        let rows = vec![
+            StructFields::from([("_id".into(), Value::I64(1)), ("v".into(), Value::Utf8("text".into()))]),
+            StructFields::from([("_id".into(), Value::I64(2)), ("v".into(), Value::Null)]),
+        ];
+        let row_put = SourceTransaction::new(vec![TxOp::PutDocs {
+            table: table.clone(), documents: Documents::new(rows, &memory).unwrap(),
+            valid_from: None, valid_to: None,
+        }], SubmitOptions::default(), &memory).unwrap();
+        let batch = OwnedBatch::new(batch, &memory).unwrap();
+        let documents = ArrowDocuments::from_batch(&batch, &memory).unwrap().unwrap();
+        let arrow_put = SourceTransaction::new(vec![TxOp::PutArrowDocs { table, documents }], SubmitOptions::default(), &memory).unwrap();
+
+        assert_eq!(row_put.encode().unwrap().as_slice(), arrow_put.encode().unwrap().as_slice());
+        let replayed = roundtrip(&arrow_put);
+        let [Operation::PutArrowIids { documents, iids, .. }] = replayed.operations.as_slice() else { panic!("expected columnar replay"); };
+        assert_eq!(documents.array().len(), 2);
+        assert_eq!(iids, &[EntityId::Integer(1).iid(), EntityId::Integer(2).iid()]);
     }
 
     #[test]
@@ -607,7 +709,8 @@ mod tests {
             assert_eq!(documents.rows()[0]["z"], Value::Utf8("last".into()));
             assert_eq!(documents.declared_types().unwrap()["n"], LogicalType::Null);
             assert!(!documents.rows()[0].contains_key("n"));
-            let Operation::PutIids { documents, .. } = operations.next().unwrap() else { panic!("second put"); };
+            let Operation::PutArrowIids { documents, .. } = operations.next().unwrap() else { panic!("second put"); };
+            let documents = documents.to_rows(true, &memory).unwrap();
             assert_eq!(documents.columns(), ["_id", "e"]);
             assert_eq!(documents.declared_types().unwrap()["e"], LogicalType::Null);
             assert!(!documents.rows()[0].contains_key("e"));
@@ -660,7 +763,8 @@ mod tests {
         let message = SourceMessage::decode(encoded.as_slice()).unwrap().unwrap();
         let decoded = SourceTransaction::decode(&message, &memory).unwrap();
         assert_eq!(decoded.operations.len(), 100);
-        let Operation::PutIids { documents, .. } = &decoded.operations[99] else { panic!("Expected decoded put"); };
+        let Operation::PutArrowIids { documents, .. } = &decoded.operations[99] else { panic!("Expected columnar decoded put"); };
+        let documents = documents.to_rows(true, &memory).unwrap();
         assert_eq!(documents.columns().len(), 1001);
         assert_eq!(documents.rows()[0]["field_99_9"], Value::Utf8("value_99_9".into()));
         assert_eq!(documents.declared_types().unwrap()["field_0_0"], LogicalType::Scalar(ScalarType::Utf8).maybe());
@@ -691,7 +795,7 @@ mod tests {
             Operation::PatchIids { table, documents, iids: vec![iid], valid_from: Some(Timestamp(30)), valid_to: None },
         ], SubmitOptions::default(), &memory).unwrap();
         let decoded = roundtrip(&source);
-        assert!(matches!(&decoded.operations[0], Operation::PutIids { iids, valid_from: Some(Timestamp(10)), valid_to: Some(Timestamp(20)), .. } if iids == &vec![iid]));
+        assert!(matches!(&decoded.operations[0], Operation::PutArrowIids { iids, valid_from: Some(Timestamp(10)), valid_to: Some(Timestamp(20)), .. } if iids == &vec![iid]));
         assert!(matches!(&decoded.operations[1], Operation::PatchIids { iids, valid_from: Some(Timestamp(30)), valid_to: None, .. } if iids == &vec![iid]));
     }
 
