@@ -387,3 +387,30 @@ async fn a_read_of_a_long_history_prunes_the_files_of_versions_superseded_before
     assert_eq!(fixture.rows("SELECT COUNT(*) FROM prices FOR ALL VALID_TIME", vec![]).await, [vec![Value::I64(WEEKS)]]);
     fixture.close().await;
 }
+
+/// A write row as the store adapter shapes one: its typed columns, a 48-character key and a 40-byte image.
+fn write_row(index: usize) -> Vec<Value> {
+    vec![uuid(point_id(index as u32 % 100, index as u64, 0)), Value::I64(1), Value::Utf8(format!("{:048x}", index)), Value::I64(index as i64), Value::Utf8("put".into()),
+        Value::Binary(vec![index as u8; 40]), Value::I64(0), Value::Utf8("label/telemetry".into()), Value::List(vec![Value::Utf8(format!("unit/{}", index % 16))]),
+        Value::Utf8(format!("machine-{:05}", index % 100)), instant(EPOCH + index as i64), Value::F64(index as f64 / 8.0)]
+}
+const WRITE_COLUMNS: &str = "_id, world, key, idx, op, value, number, label, units, series, at, v";
+
+#[tokio::test]
+async fn a_ten_thousand_row_insert_commits_within_the_default_execution_budget() {
+    let mut fixture = Fixture::open_at(EPOCH + 20 * WEEK).await;
+    assert_eq!(fixture.node.memory().limit_bytes(), 512 * 1024 * 1024);
+    let sql = format!("INSERT INTO writes ({WRITE_COLUMNS}) VALUES ({})", placeholders(12));
+    fixture.commit(&sql, (0..10_000).map(write_row).collect()).await.unwrap();
+    let peak = fixture.node.memory().peak_bytes();
+    assert!(peak < 256 * 1024 * 1024, "10,000 rows of some 300 bytes reserved {peak} bytes");
+    // Each row with its own valid time, as an instant sample carries: one put operation per row.
+    let stamped = format!("INSERT INTO samples ({WRITE_COLUMNS}, _valid_from, _valid_to) VALUES ({})", placeholders(14));
+    fixture.commit(&stamped, (0..10_000).map(|index| { let mut row = write_row(index); row.push(instant(EPOCH + index as i64)); row.push(instant(EPOCH + index as i64 + 1)); row }).collect()).await.unwrap();
+    let stamped_peak = fixture.node.memory().peak_bytes();
+    eprintln!("peak execution memory for 10,000 rows: {peak} bytes with one valid time, {stamped_peak} bytes with a valid time each");
+    assert!(stamped_peak < 384 * 1024 * 1024, "10,000 single-row operations reserved {stamped_peak} bytes");
+    assert_eq!(fixture.rows("SELECT COUNT(*) FROM writes", vec![]).await, [vec![Value::I64(10_000)]]);
+    assert_eq!(fixture.rows("SELECT COUNT(*) FROM samples FOR ALL VALID_TIME", vec![]).await, [vec![Value::I64(10_000)]]);
+    fixture.close().await;
+}

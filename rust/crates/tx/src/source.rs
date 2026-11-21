@@ -221,7 +221,8 @@ impl SourceTransaction {
                 Operation::Public(TxOp::DeleteDocs { ids, .. } | TxOp::EraseDocs { ids, .. }) => ids.ids().len().checked_mul(128).ok_or_else(overflow)?,
                 Operation::Removed(name) => name.capacity(),
             };
-            bytes.checked_add(extra.checked_mul(8).and_then(|bytes| bytes.checked_add(65_536)).ok_or_else(overflow)?).ok_or_else(overflow)
+            // An operation's own body is a few small fields beside what `extra` counts; a transaction of many small operations is charged for those, not for a fixed allowance each.
+            bytes.checked_add(extra.checked_mul(8).and_then(|bytes| bytes.checked_add(OPERATION_BODY_BYTES)).ok_or_else(overflow)?).ok_or_else(overflow)
         })?;
         let _scratch_reservation = self.memory.reserve(scratch)?;
         let mut entries = Vec::new();
@@ -230,8 +231,13 @@ impl SourceTransaction {
             if matches!(operation, Operation::Public(TxOp::DeleteDocs { ids, .. } | TxOp::EraseDocs { ids, .. }) if ids.ids().is_empty()) { continue; }
             entries.push(operation_value(operation, &self.memory)?);
         }
+        // Operations on one table with the same columns share one document schema, so its fields are charged once.
+        // Each operation still adds its cells to the type, offset and list buffers that hold the operations together.
+        let mut charged: std::collections::BTreeSet<(&str, &[String])> = Default::default();
         let metadata_bound = entries.iter().try_fold(65_536usize, |bytes, (_, entry)| {
-            let Some((_, doc)) = &entry.documents else { return Ok(bytes); };
+            let bytes = bytes.checked_add(OPERATION_CELL_BYTES).ok_or_else(overflow)?;
+            let Some((table, doc)) = &entry.documents else { return Ok(bytes); };
+            if !charged.insert((table.as_str(), doc.columns())) { return Ok(bytes); }
             doc.columns().iter().try_fold(bytes, |bytes, name| {
                 let size = name.len().checked_mul(8).and_then(|size| size.checked_add(1024)).ok_or_else(overflow)?;
                 bytes.checked_add(size).ok_or_else(overflow)
@@ -244,6 +250,11 @@ impl SourceTransaction {
         arrays.finish(batch)
     }
 }
+
+/// The scratch one operation's body takes while it is encoded, beside its documents, arguments or IDs.
+const OPERATION_BODY_BYTES: usize = 4_096;
+/// The cells one operation adds to the buffers that the encoded batch builds outside its columns.
+const OPERATION_CELL_BYTES: usize = 256;
 
 struct SourceOperation<'a> {
     body: StructFields<Value>,

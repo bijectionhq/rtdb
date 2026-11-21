@@ -64,6 +64,8 @@ fn expand(sql: &str, args: Option<&SqlArguments>, options: &SubmitOptions, datab
         None => Box::new(std::iter::once(Ok(crate::values::ArgumentRow::borrowed(&[])))),
     };
     let mut groups: Vec<((Option<Timestamp>, Option<Timestamp>), Vec<StructFields<Value>>)> = Vec::new();
+    // Where each valid time's group is, so that rows each carrying their own find theirs without searching them all.
+    let mut group_of: std::collections::BTreeMap<(Option<Timestamp>, Option<Timestamp>), usize> = Default::default();
     let mut document_charges = Vec::new();
     let mut expression_count = 0usize;
     fn count(input: &Relation, total: &mut usize) { for expr in input.expressions() { expr.visit(&mut |_| *total += 1); } for child in input.children() { count(child, total); } }
@@ -94,8 +96,10 @@ fn expand(sql: &str, args: Option<&SqlArguments>, options: &SubmitOptions, datab
             };
             let document_bytes = document.iter().try_fold(256usize, |bytes, (name, value)| bytes.checked_add(name.capacity())?.checked_add(std::mem::size_of::<(String, Value)>())?.checked_add(value.retained_bytes().ok()?)).ok_or_else(overflow)?;
             document_charges.push(memory.reserve(document_bytes)?);
-            if let Some((_, rows)) = groups.iter_mut().find(|(key, _)| *key == bounds) { rows.push(document); }
-            else { groups.push((bounds, vec![document])); }
+            match group_of.entry(bounds) {
+                std::collections::btree_map::Entry::Occupied(group) => groups[*group.get()].1.push(document),
+                std::collections::btree_map::Entry::Vacant(group) => { group.insert(groups.len()); groups.push((bounds, vec![document])); }
+            }
         }
     }
     let operations = groups.into_iter().map(|((valid_from, valid_to), documents)| {
