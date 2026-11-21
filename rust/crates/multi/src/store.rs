@@ -1053,7 +1053,7 @@ mod tests {
         let record = directory.create_deployment(record).await.unwrap();
         let object = key(&format!("{}/v06/data", record.storage_prefix()));
         let journal = DirectoryPublications {
-            directory: directory.clone(), deployment: record.id.clone(), region, writer_epoch: Some(record.epoch), transfer: false,
+            directory: directory.clone(), deployment: record.id.clone(), region, writer_epoch: Some(record.epoch), owner: PublicationOwner::Serving,
         };
         assert!(journal.admit(&key("another-installation/data"), attempt, "upload").await.is_err());
         journal.admit(&object, attempt, "upload").await.unwrap();
