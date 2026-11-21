@@ -598,6 +598,7 @@ async fn run(arguments: Vec<String>) -> Result<()> {
                 directory, &archive, &storage, keys.as_ref(), intent, hosted_task(&arguments)?,
             ).await?;
             println!("{}", serde_json::to_string(&receipt).expect("a stage receipt serializes"));
+            Ok(())
         }
         "restore" => {
             let directory = directory(arguments.required("directory")?).await?;
