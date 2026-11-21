@@ -378,6 +378,7 @@ impl Log for FaultLog {
         Ok(AppendReceipt::observed(async move { owner.around(Operation::DurableReceipt, None, receipt.durable()).await }))
     }
     fn latest(&self) -> Result<LogOffset> { self.inner.latest() }
+    async fn retained_floor(&self) -> Result<Option<LogOffset>> { self.inner.retained_floor().await }
     async fn tail(&self, after: LogOffset) -> Result<Box<dyn LogTail>> {
         let mut inner = self.owner.around(Operation::Tail, None, self.inner.tail(after)).await?;
         let mode = self.owner.schedule.replay_mode(&self.owner.name);

@@ -1636,3 +1636,33 @@ async fn exact_and_restored_recovery_require_the_selected_checkpoint() {
     ).await.err().unwrap();
     assert_eq!(restored.code, "rtdb.replication/block-gone");
 }
+
+#[tokio::test]
+async fn startup_replay_preserves_exact_and_restored_anchors_across_prefix_loss() {
+    let fixture = produced_memory_checkpoint(true).await;
+    produce_newer_memory_checkpoint(&fixture).await;
+    let (_, mut writer) = reopen_memory_checkpoint_with_config(&fixture, ReplicationConfig {
+        may_lead: false, ..Default::default()
+    }).await;
+    deliver_checkpoint_record(&fixture, &mut writer, 3, 0, ReplicaBody::NoOp(proto::NoOp { src_msg_id: None })).await.unwrap();
+    deliver_checkpoint_record(&fixture, &mut writer, 3, 1, boundary(2, -1)).await.unwrap();
+    let pending = writer.pending_block.as_ref().unwrap();
+    let later = writer.blocks.produce(&pending.prepared, &pending.boundary, BTreeMap::new()).await.unwrap();
+    assert_eq!(later.catalog.block_index(), BlockIndex(2));
+    fixture.store.delete(&rtdb_storage::ObjectKey::new(rtdb_format::keys::block_key(BlockIndex(1)).unwrap()).unwrap()).await.unwrap();
+    fixture.replica.truncate_before(LogOffset(5)).unwrap();
+    let boundary = rtdb_types::ReplicaPosition(1);
+    assert!(matches!(fixture.logs.observed_replica_gap(boundary).await.unwrap(),
+        Some(rtdb_storage::Error::UnavailableLogRange { requested: 2, first_retained: 5 })));
+
+    let cancellation = CancellationToken::new();
+    for (discovery, cutoff) in [
+        (BlockDiscovery::At(BlockIndex(0)), None),
+        (BlockDiscovery::FromRestored { checkpoint: BlockIndex(0), compaction_cutoff: boundary }, Some(boundary)),
+    ] {
+        let recovered = fixture.blocks.recover(TrieConfig::default(), SourcePosition(-1), Timestamp(0), discovery).await.unwrap();
+        let selected = fixture.blocks.recover_for_replay(recovered, &fixture.logs, TrieConfig::default(), Timestamp(0), &cancellation).await.unwrap();
+        assert_eq!(selected.block.unwrap().block_index(), BlockIndex(0));
+        assert_eq!(selected.compaction_replay_cutoff, cutoff);
+    }
+}

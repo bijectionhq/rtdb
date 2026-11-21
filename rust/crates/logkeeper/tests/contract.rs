@@ -206,8 +206,11 @@ async fn trimmed_positions_are_unavailable_to_tails_and_ranges() {
     let config = ensemble.config("trimmed");
     let log = open_writer(config.clone(), 1, CancellationToken::new()).await.unwrap();
     for position in 0..5 { append(log.as_ref(), "x", position).await; }
+    assert_eq!(log.retained_floor().await.unwrap(), Some(LogOffset(0)));
     rtdb_logkeeper::trim(&config, LogOffset(2)).await.unwrap();
     let reader = open_reader(config, CancellationToken::new()).await.unwrap();
+    assert_eq!(reader.retained_floor().await.unwrap(), Some(LogOffset(3)));
+    assert_eq!(log.retained_floor().await.unwrap(), Some(LogOffset(3)));
     assert!(matches!(reader.tail(LogOffset(0)).await, Err(Error::UnavailableLogRange { requested: 1, first_retained: 3 })));
     assert!(matches!(reader.read_range(LogOffset(0), LogOffset(5)).await, Err(Error::UnavailableLogRange { requested: 0, first_retained: 3 })));
     assert_eq!(reader.read_range(LogOffset(3), LogOffset(5)).await.unwrap().len(), 2);

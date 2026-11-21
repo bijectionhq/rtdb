@@ -431,6 +431,12 @@ impl Log for QuorumLog {
 
     fn latest(&self) -> Result<LogOffset> { self.shared.latest().map(LogOffset) }
 
+    async fn retained_floor(&self) -> Result<Option<LogOffset>> {
+        let (_, trim) = self.shared.bounds().await?;
+        let first = trim.checked_add(1).ok_or_else(|| Error::Closed("log positions exhausted".into()))?;
+        Ok(Some(LogOffset(first)))
+    }
+
     async fn tail(&self, after: LogOffset) -> Result<Box<dyn LogTail>> {
         let next = after.0.checked_add(1).ok_or_else(|| Error::Closed("log positions exhausted".into()))?;
         let (tip, trim) = self.shared.bounds().await?;

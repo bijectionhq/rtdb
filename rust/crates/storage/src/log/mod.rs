@@ -128,6 +128,9 @@ pub trait Log: Send + Sync {
     /// Fixes append order before returning; the receipt reports whether those bytes became durable.
     async fn enqueue(&self, payload: Bytes, timestamp: Timestamp) -> Result<AppendReceipt>;
     fn latest(&self) -> Result<LogOffset>;
+    /// Reports a prefix floor without opening a cursor. This applies to providers where the first
+    /// requested replay offset is the preceding offset plus one. An observation does not reserve records.
+    async fn retained_floor(&self) -> Result<Option<LogOffset>> { Ok(None) }
     async fn tail(&self, after: LogOffset) -> Result<Box<dyn LogTail>>;
     /// Captures record starts in [from, to), bounded by the current durable tip.
     /// A missing start within the captured tip is an error; starts beyond the tip return an empty range.

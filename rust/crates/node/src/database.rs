@@ -158,7 +158,9 @@ impl DatabaseFactory {
             let opened_logs = self.resources.open_logs(&name, &configuration, access, log_cancellation.clone(), &resources).await?;
             let logs = PartitionLogs::new(opened_logs.source, opened_logs.replica, opened_logs.source_epoch, opened_logs.replica_epoch,
                 resources.storage_version, resources.storage_epoch, Arc::clone(&resources.store), Arc::clone(&storage), Arc::clone(&self.memory))?;
-            let recovered = recovered.with_source_floor(logs.source_floor()?);
+            let recovered = if self.options.replication.enabled {
+                blocks.recover_for_replay(recovered, &logs, self.options.trie, self.clock.now(), &cancellation).await?
+            } else { recovered.with_source_floor(logs.source_floor()?) };
             let secondaries = recovered.block.as_ref().map(|block| block.secondary_databases().clone()).unwrap_or_default();
             let partition = Arc::clone(&recovered.partition);
             let progress = ProgressMonitor::new(recovered.progress.clone());

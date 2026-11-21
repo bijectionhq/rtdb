@@ -199,6 +199,14 @@ impl Log for KafkaLog {
         Ok(LogOffset(end - 1))
     }
 
+    async fn retained_floor(&self) -> StorageResult<Option<LogOffset>> {
+        self.progress.check()?;
+        let consumer = consumer(&self.configuration, &self.options)?;
+        let (low, _) = consumer.fetch_watermarks(&self.options.topic, 0, self.options.request_timeout)
+            .map_err(|error| transport_error(&self.options.topic, error))?;
+        Ok(Some(LogOffset(low)))
+    }
+
     async fn tail(&self, after: LogOffset) -> StorageResult<Box<dyn LogTail>> {
         Ok(Box::new(tail::KafkaTail::new(consumer(&self.configuration, &self.options)?, self.options.clone(), Arc::clone(&self.progress), after)?))
     }

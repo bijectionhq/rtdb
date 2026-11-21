@@ -2,6 +2,7 @@ mod admission;
 mod appender;
 mod blocks;
 mod checkpoint_discovery;
+mod replay_floor;
 mod driver;
 mod logs;
 mod progress;

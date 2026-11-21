@@ -244,6 +244,7 @@ impl Log for SealedLog {
         self.inner.enqueue(self.cipher.seal(&self.stream, &payload)?, timestamp).await
     }
     fn latest(&self) -> rtdb_storage::Result<LogOffset> { self.inner.latest() }
+    async fn retained_floor(&self) -> rtdb_storage::Result<Option<LogOffset>> { self.inner.retained_floor().await }
     async fn tail(&self, after: LogOffset) -> rtdb_storage::Result<Box<dyn LogTail>> {
         Ok(Box::new(SealedTail { inner: self.inner.tail(after).await?, cipher: Arc::clone(&self.cipher), stream: Arc::clone(&self.stream) }))
     }

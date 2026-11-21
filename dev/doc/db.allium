@@ -590,6 +590,10 @@ config {
 -- A follower that reopens loads the latest reported checkpoint and applies its retained suffix.
 -- Ordinary latest-block recovery refreshes discovery after a missing root or table block.
 -- It retries only when the refreshed listing reveals a strictly newer block.
+-- Before installing an ordinary latest checkpoint, startup also checks for an observed replica
+-- prefix gap and may use only a strictly newer reported checkpoint if that check finds one.
+-- Exact recovery keeps its selected block. Archive recovery requires its anchor and probes only
+-- its contiguous successors. The replica tail is still opened and validated by the driver.
 -- Exact-block and restored-archive discovery keep their own checkpoint requirements.
 --
 -- A new leader can always reconstruct correct state from the last persisted block and the follower's in-memory state, which has been built by processing replica messages.
