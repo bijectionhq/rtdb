@@ -882,7 +882,7 @@ Running alongside every stage from stage 2 onwards, and concluding the branch:
 
 1. The `simulation` crate drives a whole cell deterministically, with simulated network, clocks, object store and disk faults.
 2. A zombie harness freezes a holder mid-upload, mid-append and mid-flush and resumes it after its successor has taken over.
-   The MinIO test holds the old node's complete conditional pack upload until the successor writes and flushes.
+   The MinIO test holds the old node's conditional multipart completion for a pack until the successor writes and flushes.
    It verifies that the old flush waiter exits when deposed, the late upload reaches storage and receives HTTP 412, and the successor's stored pack and recovered rows remain intact.
    A TCP proxy test holds complete append frames from the old writer before forwarding them to at least two of three fsync-enabled logkeepers.
    The successor seals those same servers, recovers the committed entry, and the servers refuse the delayed append before the successor writes at that position.

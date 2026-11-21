@@ -101,9 +101,9 @@ async fn a_cell_flushes_and_moves_with_deployment_scoped_s3_writes() {
     client.simple_query("UPDATE orders SET total = total + 5 WHERE _id = 1").await.unwrap();
     cell.node(successor).agent.flush("shop").await.unwrap();
     assert_eq!(values(&client, "SELECT total FROM orders").await, ["15"]);
-    assert!(writes.assumed_puts.load(Ordering::Relaxed) >= 3);
-    assert_eq!(writes.other_puts.load(Ordering::Relaxed), 0);
-    assert_eq!(writes.unconditional_puts.load(Ordering::Relaxed), 0);
+    assert!(writes.scoped_publications.load(Ordering::Relaxed) >= 3);
+    assert_eq!(writes.unscoped_writes.load(Ordering::Relaxed), 0);
+    assert_eq!(writes.unconditional_publications.load(Ordering::Relaxed), 0);
     drop(client);
 
     let deployed = cell.directory.deployment_by_name("shop").await.unwrap().unwrap();
@@ -221,9 +221,9 @@ struct PackUpload {
     completed: tokio::sync::Notify,
     reply_status: std::sync::atomic::AtomicU16,
     observe_writes: std::sync::atomic::AtomicBool,
-    assumed_puts: std::sync::atomic::AtomicUsize,
-    other_puts: std::sync::atomic::AtomicUsize,
-    unconditional_puts: std::sync::atomic::AtomicUsize,
+    scoped_publications: std::sync::atomic::AtomicUsize,
+    unscoped_writes: std::sync::atomic::AtomicUsize,
+    unconditional_publications: std::sync::atomic::AtomicUsize,
 }
 
 async fn pause_pack_upload(upstream: hyper::Uri) -> (std::net::SocketAddr, std::sync::Arc<PackUpload>, tokio::task::JoinHandle<()>) {
@@ -253,15 +253,22 @@ async fn pause_pack_upload(upstream: hyper::Uri) -> (std::net::SocketAddr, std::
                         let block_pack = parts.uri.path().rsplit('/').next()
                             .is_some_and(|name| name.starts_with('b') && name.ends_with(".pack"));
                         let request = hyper::Request::from_parts(parts, Full::new(body.collect().await.map_err(std::io::Error::other)?.to_bytes()));
-                        if request.method() == hyper::Method::PUT && gate.observe_writes.load(Ordering::Relaxed) {
-                            let assumed = request.headers().contains_key("x-amz-security-token");
-                            let puts = if assumed { &gate.assumed_puts } else { &gate.other_puts };
-                            puts.fetch_add(1, Ordering::Relaxed);
-                            if request.headers().get("if-none-match").is_none_or(|value| value != "*") {
-                                gate.unconditional_puts.fetch_add(1, Ordering::Relaxed);
+                        let query = request.uri().query().unwrap_or_default();
+                        let multipart = query.split('&').any(|pair| pair.starts_with("uploadId="));
+                        let creates_upload = query.split('&').any(|pair| matches!(pair, "uploads" | "uploads="));
+                        let commits_object = request.method() == hyper::Method::PUT && !multipart
+                            || request.method() == hyper::Method::POST && multipart;
+                        let writes_object = request.method() == hyper::Method::PUT
+                            || request.method() == hyper::Method::POST && (multipart || creates_upload);
+                        if writes_object && gate.observe_writes.load(Ordering::Relaxed) {
+                            let scoped = request.headers().contains_key("x-amz-security-token");
+                            if !scoped { gate.unscoped_writes.fetch_add(1, Ordering::Relaxed); }
+                            if scoped && commits_object { gate.scoped_publications.fetch_add(1, Ordering::Relaxed); }
+                            if commits_object && request.headers().get("if-none-match").is_none_or(|value| value != "*") {
+                                gate.unconditional_publications.fetch_add(1, Ordering::Relaxed);
                             }
                         }
-                        if request.method() == hyper::Method::PUT && block_pack && gate.armed.swap(false, Ordering::Relaxed) {
+                        if commits_object && block_pack && gate.armed.swap(false, Ordering::Relaxed) {
                             // The complete request remains deliverable even if the deposed holder closes its socket.
                             let delayed = tokio::spawn(async move {
                                 gate.held.notify_one();
