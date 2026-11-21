@@ -273,6 +273,38 @@ async fn prepared_parameters_are_positional_all_batches_update_and_old_ticket_ke
 }
 
 #[tokio::test]
+async fn prepared_query_projects_nullable_and_boolean_arrow_parameters() {
+    use arrow_array::{Array, BooleanArray, cast::AsArray};
+
+    let running = Running::start(None, FlightConfig::default()).await;
+    let mut client = Client::connect(&running.server, None).await;
+    let query = client.prepare("SELECT $2 AS b, $1 AS n", None).await;
+    let command = CommandPreparedStatementQuery { prepared_statement_handle: query.prepared_statement_handle };
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("input_n", DataType::Int64, true),
+        Field::new("input_b", DataType::Boolean, false),
+    ]));
+    let arguments = RecordBatch::try_new(schema, vec![
+        Arc::new(Int64Array::from(vec![None])),
+        Arc::new(BooleanArray::from(vec![true])),
+    ]).unwrap();
+    client.upload(command.clone(), vec![arguments]).await;
+    let descriptor = FlightDescriptor::new_cmd(command.as_any().encode_to_vec());
+    let request = client.request(descriptor);
+    let info = client.client.get_flight_info(request).await.unwrap().into_inner();
+    let announced = info.clone().try_decode_schema().unwrap();
+    let batches = client.redeem(&info).await;
+
+    assert_eq!(batches.len(), 1);
+    assert_eq!(batches[0].schema().as_ref(), &announced);
+    assert_eq!(batches[0].num_rows(), 1);
+    assert!(batches[0].column(0).as_boolean().value(0));
+    assert_eq!(batches[0].column(1).data_type(), &DataType::Int64);
+    assert!(batches[0].column(1).is_null(0));
+    running.stop().await;
+}
+
+#[tokio::test]
 async fn prepared_updates_coalesce_compatible_parameter_layouts_across_uploads() {
     use rtdb_types::Value;
 

@@ -51,6 +51,40 @@ async fn prepared_parameter_projection_keeps_the_bound_arrow_buffers() {
 }
 
 #[tokio::test]
+async fn prepared_parameter_projection_canonicalizes_masked_and_boolean_buffers() {
+    use arrow_array::{Array, BooleanArray, Int64Array, NullArray, RecordBatch, cast::AsArray, types::Int64Type};
+    use arrow_buffer::{BooleanBuffer, Buffer, NullBuffer, ScalarBuffer};
+    use arrow_schema::{DataType, Field, Schema};
+    use rtdb_columnar::OwnedBatch;
+
+    let memory = MemoryBudget::new(1 << 24);
+    let context = context(None, &memory);
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("client-int", DataType::Int64, true),
+        Field::new("client-bool", DataType::Boolean, false),
+        Field::new("client-null", DataType::Null, true),
+    ]));
+    let masked = Int64Array::new(ScalarBuffer::from(vec![99]), Some(NullBuffer::new_null(1)));
+    let padded = BooleanArray::new(BooleanBuffer::new(Buffer::from(vec![0xff]), 0, 1), None);
+    let batch = RecordBatch::try_new(schema, vec![Arc::new(masked), Arc::new(padded), Arc::new(NullArray::new(1))]).unwrap();
+    let bound = OwnedBatch::new(batch, &memory).unwrap();
+    let types = [LogicalType::Scalar(ScalarType::I64).maybe(), LogicalType::Scalar(ScalarType::Bool), LogicalType::Null];
+    let query = PreparedSql::prepare("SELECT $2 AS b, $1 AS n, $3 AS empty", &context, PrepareOptions::default(), ResultSignaturePolicy::Dynamic).unwrap();
+    let mut projected = query.try_open_parameter_projection(Arc::clone(&context), &bound, &types).await.unwrap().unwrap();
+    drop(bound);
+    let mut ordinary = query.open_query_columns_typed(context, vec![Value::Null, Value::Bool(true), Value::Null], &types).await.unwrap();
+    let output = projected.next_batch().await.unwrap().unwrap();
+    let expected = ordinary.next_batch().await.unwrap().unwrap();
+
+    assert_eq!(projected.schema(), ordinary.schema());
+    assert_eq!(output.batch(), expected.batch());
+    assert_eq!(output.batch().column(0).as_boolean().values().values(), &[1]);
+    assert!(output.batch().column(1).is_null(0));
+    assert_eq!(output.batch().column(1).as_primitive::<Int64Type>().value(0), 0);
+    assert_eq!(output.batch().column(2).data_type(), &DataType::Null);
+}
+
+#[tokio::test]
 async fn postgres_preparation_keeps_inline_xtql_source_and_result_fields() {
     let memory = MemoryBudget::new(1 << 26);
     let context = context(None, &memory);

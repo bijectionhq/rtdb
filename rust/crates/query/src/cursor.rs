@@ -1,9 +1,9 @@
 use std::sync::Arc;
 
 use arrow_array::{ArrayRef, RecordBatch, RecordBatchOptions};
-use arrow_schema::Schema as ArrowSchema;
+use arrow_schema::{DataType, Schema as ArrowSchema};
 use async_trait::async_trait;
-use rtdb_columnar::{MemoryBudget, MemoryReservation, OwnedBatch, copy_array, estimate_builder_bytes_refs, to_field};
+use rtdb_columnar::{MemoryBudget, MemoryReservation, OwnedBatch, copy_array, copy_nullable_cells, estimate_builder_bytes_refs, estimate_copy_cell_bytes, to_field};
 use rtdb_plan::{Catalog, ExecutionError, ExecutionSample, ExecutionTimer, Expr, Relation, RelationNode, Schema};
 use rtdb_types::{LogicalType, Result, ScalarType, Value};
 
@@ -220,23 +220,40 @@ impl PreparedQuery {
         }
         let schema = self.emit_result_schema(&context, types)?;
         let runtime_schema = EmittedRelation::derive(Arc::clone(&self.relation), &context.catalog, types, &context.memory)?.output();
-        let metadata = context.memory.reserve(crate::runtime_schema::allocation_bound(&self.relation)?)?;
+        let mut metadata = context.memory.reserve(crate::runtime_schema::allocation_bound(&self.relation)?)?;
         let mut fields = Vec::with_capacity(runtime_schema.schema().len());
         let mut arrays = Vec::with_capacity(runtime_schema.schema().len());
+        let mut canonicalize = false;
         for (position, result) in runtime_schema.schema().fields().iter().enumerate() {
             let Some(index) = projected_parameter(&self.relation, position) else { return Ok(None); };
             let field = to_field(&result.name, &result.data_type)?;
             let Some(array) = batch.columns().get(index) else { return Ok(None); };
-            if field.data_type() != array.data_type() || field.metadata() != batch.schema_ref().field(index).metadata()
-                || array.nulls().is_some() {
+            if field.data_type() != array.data_type() || field.metadata() != batch.schema_ref().field(index).metadata() {
                 return Ok(None);
             }
+            canonicalize |= array.nulls().is_some() || array.data_type() == &DataType::Boolean;
             fields.push(field);
-            arrays.push(rtdb_columnar::retain_array(Arc::clone(array), &metadata)?);
+            arrays.push(Arc::clone(array));
         }
+        let reservation = if canonicalize {
+            let bound = fields.iter().zip(&arrays).try_fold(metadata.bytes(), |bytes, (field, array)| {
+                bytes.checked_add(estimate_copy_cell_bytes(field, array.as_ref(), 0)?)
+                    .ok_or_else(|| invalid("parameter-size", "Projected parameters exceed addressable memory"))
+            })?;
+            Arc::get_mut(&mut metadata).expect("projection owns its reservation").grow_to(bound)?;
+            for array in &mut arrays {
+                *array = copy_nullable_cells(&[array.as_ref()], &[Some((0, 0))])?;
+            }
+            metadata
+        } else {
+            for array in &mut arrays {
+                *array = rtdb_columnar::retain_array(Arc::clone(array), &metadata)?;
+            }
+            Arc::clone(arguments.reservation())
+        };
         let options = RecordBatchOptions::new().with_row_count(Some(1));
         let projected = RecordBatch::try_new_with_options(Arc::new(ArrowSchema::new(fields)), arrays, &options).map_err(|error| invalid("output-arrow", error))?;
-        let projected = match OwnedBatch::with_reservation(projected, Arc::clone(arguments.reservation())) {
+        let projected = match OwnedBatch::with_reservation(projected, reservation) {
             Ok(batch) => batch,
             Err(error) if error.code == "rtdb/undersized-reservation" => return Ok(None),
             Err(error) => return Err(error),
@@ -370,7 +387,7 @@ fn projected_parameter(mut relation: &Relation, mut position: usize) -> Option<u
 fn direct_parameter_type(ty: &LogicalType) -> bool {
     match ty {
         LogicalType::Maybe(ty) => direct_parameter_type(ty),
-        LogicalType::Scalar(ScalarType::I8 | ScalarType::I16 | ScalarType::I32 | ScalarType::I64 |
+        LogicalType::Null | LogicalType::Scalar(ScalarType::Bool | ScalarType::I8 | ScalarType::I16 | ScalarType::I32 | ScalarType::I64 |
             ScalarType::F32 | ScalarType::F64 | ScalarType::Utf8 | ScalarType::Binary | ScalarType::FixedSizeBinary(_) | ScalarType::Uuid) => true,
         _ => false,
     }
