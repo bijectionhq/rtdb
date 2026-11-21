@@ -152,7 +152,7 @@ fn deletes_and_erases_are_submitted_as_sql_dml() {
     };
     let Some(TxOp::Sql { sql, args: Some(args) }) = op("delete-docs", vec![Value::I64(1)], true) else { panic!("expected SQL") };
     assert_eq!(sql, "DELETE FROM \"public\".\"docs\" FOR VALID_TIME FROM ? TO ? WHERE _id = ?");
-    assert_eq!(args.rows().collect::<Vec<_>>(), [&[time.clone(), Value::Null, Value::I64(1)][..]]);
+    assert_eq!(args.rows().map(|row| row.unwrap().to_vec()).collect::<Vec<_>>(), [&[time.clone(), Value::Null, Value::I64(1)][..]]);
     let Some(TxOp::Sql { sql, .. }) = op("delete-docs", vec![Value::I64(1)], false) else { panic!("expected SQL") };
     assert_eq!(sql, "DELETE FROM \"public\".\"docs\" WHERE _id = ?");
     let Some(TxOp::Sql { sql, .. }) = op("erase-docs", vec![Value::I64(1)], false) else { panic!("expected SQL") };

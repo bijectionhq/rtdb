@@ -268,6 +268,65 @@ async fn bulk_ingestion_uses_each_arrow_batch_and_catalog_metadata_uses_dense_un
 }
 
 #[tokio::test]
+async fn bulk_ingest_preserves_nested_arrow_lists_with_signed_execution_values() {
+    use arrow_array::{Array, ListArray, types::UInt64Type};
+
+    let running = Running::start(None, FlightConfig::default()).await;
+    let mut client = Client::connect(&running.server, None).await;
+    let items = ListArray::from_iter_primitive::<UInt64Type, _, _>([
+        Some(vec![Some(u64::MAX), None]),
+        Some(vec![Some(9)]),
+    ]);
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("_id", DataType::Int64, false),
+        Field::new("items", items.data_type().clone(), false),
+    ]));
+    let batch = RecordBatch::try_new(schema, vec![
+        Arc::new(Int64Array::from(vec![1, 2])), Arc::new(items),
+    ]).unwrap();
+    client.upload(CommandStatementIngest { table: "docs".into(), ..Default::default() }, vec![batch]).await;
+
+    let actual = client.query("SELECT items FROM docs ORDER BY _id").await;
+
+    let lists: Vec<_> = actual.iter().flat_map(|batch| {
+        let column = batch.column(0).as_any().downcast_ref::<ListArray>().unwrap();
+        column.iter().map(|value| value.unwrap().as_any().downcast_ref::<Int64Array>().unwrap().iter().collect::<Vec<_>>())
+    }).collect();
+    assert_eq!(lists, [vec![Some(-1), None], vec![Some(9)]]);
+    running.stop().await;
+}
+
+#[tokio::test]
+async fn arrow_ingest_batches_and_sql_deletes_keep_transaction_order() {
+    let running = Running::start(None, FlightConfig::default()).await;
+    let mut client = Client::connect(&running.server, None).await;
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("_id", DataType::Int64, false),
+        Field::new("score", DataType::UInt64, true),
+    ]));
+    let batch = |ids, scores| RecordBatch::try_new(Arc::clone(&schema), vec![
+        Arc::new(Int64Array::from(ids)),
+        Arc::new(arrow_array::UInt64Array::from(scores)),
+    ]).unwrap();
+    let tx = client.begin().await;
+    let put = CommandStatementIngest { table: "docs".into(), transaction_id: Some(tx.clone()), ..Default::default() };
+    client.upload(put.clone(), vec![batch(vec![1i64, 2], vec![Some(99u64), None])]).await;
+    client.update("DELETE FROM docs WHERE _id = 1", Some(tx.clone())).await;
+    client.upload(put, vec![batch(vec![1i64], vec![Some(u64::MAX)])]).await;
+    client.end(tx, true).await.unwrap();
+
+    let rows = client.query("SELECT _id, score FROM docs ORDER BY _id").await;
+    assert_eq!(rows.iter().map(RecordBatch::num_rows).sum::<usize>(), 2);
+    let first = &rows[0];
+    assert_eq!(integer(first, 0, 0), 1);
+    assert_eq!(integer(first, 1, 0), -1);
+    let (last, row) = if first.num_rows() == 2 { (first, 1) } else { (&rows[1], 0) };
+    assert_eq!(integer(last, 0, row), 2);
+    assert!(last.column(1).is_null(row));
+    running.stop().await;
+}
+
+#[tokio::test]
 async fn shutdown_joins_a_call_waiting_for_its_first_upload_message() {
     let running = Running::start(None, FlightConfig::default()).await; let mut client = Client::connect(&running.server, None).await;
     let request = client.request(futures::stream::pending::<arrow_flight::FlightData>()); let upload = tokio::spawn(async move { client.client.do_put(request).await });

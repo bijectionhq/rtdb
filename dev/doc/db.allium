@@ -367,7 +367,12 @@ entity SourceMessage {
 
 variant TxMessage : SourceMessage {
     -- Client-submitted transaction operations.
-    -- Source encoding admits and builds operation body columns one at a time.
+    -- Source encoding retains compatible Arrow document vectors and admits reconstructed columns one at a time.
+    -- Compatible Arrow document vectors include nested lists and structs.
+    -- Struct fields added across compatible uploads join in Arrow with typed nulls for earlier documents, including structs inside lists.
+    -- Batches with compatible column types retain first-seen column order and represent missing columns as nulls without converting the documents to rows.
+    -- Differently typed scalar columns can share a dense union in the source message and retain their Arrow representation on replay.
+    -- Null and missing values use that union's null leg.
     -- A document union leg retains columns in their first encounter order across document operations for the same table and mutation kind.
     system_time: Timestamp?
     default_tz: ZoneId               -- always present
@@ -1734,6 +1739,11 @@ surface QueryAccess {
     @guarantee ExecutionReadsOneSnapshot
         -- A single query execution opens one snapshot of this database and derives from it every answer it gives about this database: the schema it resolves names against, the oids `::regclass` resolves through, and the rows it reads.
         -- An execution spanning several databases holds one such snapshot per database.
+
+    @guarantee ColumnarScanProjection
+        -- A scan preserves compatible list and struct columns as Arrow arrays when projecting selected rows.
+        -- A projected field missing from some pages uses Arrow nulls when the available columns share a layout or form a scalar dense union.
+        -- A projected scalar dense union retains its Arrow array when it already matches the result layout.
 }
 
 ---- Deferred Specifications

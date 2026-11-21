@@ -4,7 +4,15 @@
 ADBC Flight SQL drivers use the same `rtdb-node` sessions, SQL preparation, query cursors, transaction resolver, and authentication as the PostgreSQL frontend.
 The source and regression cases remain uncompiled and unexecuted during Phase 1.
 Schema descriptions retain the supplied physical parameter fields, while query execution opens their signed vector view.
-Retained parameter IPC remains lossless, and bulk ingestion admits cells before constructing logical documents.
+Retained parameter IPC remains lossless.
+Prepared updates retain uploaded Arrow parameter batches through transaction buffering and encoding when the batch layouts agree.
+Bulk ingestion retains compatible Arrow document columns during source-log encoding, replay and transaction staging.
+This includes lists and structs with compatible child fields.
+When a struct gains fields between compatible Arrow uploads, source encoding joins those fields in Arrow, including structs inside lists.
+Arrow batches targeting the same table can share a source-log document layout when their common columns agree and other columns are absent.
+Scalar columns with compatible union legs share a dense union when their types differ between batches.
+Null and missing values use the union's null leg.
+The typed document writer handles layouts that require cell conversion.
 
 == Composition and ownership
 
@@ -21,6 +29,8 @@ The driver also waits for the admitted-call monitor to reach zero before reporti
 
 Service methods and response streams are passive caller-owned work.
 The stream advertises the prepared result schema and conforms runtime pages through the passive `rtdb-columnar::DeclaredBatch` adapter.
+Columns that already match their declared field retain their Arrow buffers when the adapter conforms the rest of the page.
+Compatible nested field ordering and dense union identifiers can change while retaining the source value buffers.
 This follows the pinned Flight producer's ADBC `ArrowReader`, including NULL endpoint vectors under advertised timestamp fields.
 The encoder checks the complete declared schema before encoding physical buffers, including signed decimal precision and scale metadata.
 Schema and record-node regression sources remain unexecuted.

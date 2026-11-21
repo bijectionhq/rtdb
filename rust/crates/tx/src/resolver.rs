@@ -444,7 +444,11 @@ impl<'a> OpenTransaction<'a> {
             Operation::Public(TxOp::Sql { sql, args }) => match args {
                 Some(arguments) => {
                     let mut planned = None;
-                    for (index, row) in arguments.indexed_rows() { self.execute_sql_typed(sql, Some(row), Some(arguments.types()), &mut planned).await.map_err(|error| error.with_context("arg-idx", index.into()))?; }
+                    for row in arguments.indexed_rows() {
+                        let (index, row) = row?;
+                        self.execute_sql_typed(sql, Some(&row), Some(arguments.types()), &mut planned)
+                            .await.map_err(|error| error.with_context("arg-idx", index.into()))?;
+                    }
                     Ok(())
                 }
                 None => self.execute_sql(sql, None).await,
@@ -453,9 +457,15 @@ impl<'a> OpenTransaction<'a> {
                 if arg_bytes.as_slice().is_empty() { return self.execute_sql(sql, None).await; }
                 let arguments = decode_arguments(arg_bytes.as_slice(), &self.context.memory)?;
                 let mut planned = None;
-                for (index, row) in arguments.indexed_rows() { self.execute_sql_typed(sql, Some(row), Some(arguments.types()), &mut planned).await.map_err(|error| error.with_context("arg-idx", index.into()))?; }
+                for row in arguments.indexed_rows() {
+                    let (index, row) = row?;
+                    self.execute_sql_typed(sql, Some(&row), Some(arguments.types()), &mut planned)
+                        .await.map_err(|error| error.with_context("arg-idx", index.into()))?;
+                }
                 Ok(())
             }
+            Operation::Public(TxOp::PutArrowDocs { table, documents }) => self.put_arrow_documents(table, documents, None, None, None),
+            Operation::PutArrowIids { table, documents, iids, valid_from, valid_to } => self.put_arrow_documents(table, documents, Some(iids), *valid_from, *valid_to),
             Operation::Public(TxOp::PutDocs { table, documents, valid_from, valid_to }) => self.put_documents(table, documents, None, *valid_from, *valid_to),
             Operation::PutIids { table, documents, iids, valid_from, valid_to } => self.put_documents(table, documents, Some(iids), *valid_from, *valid_to),
             Operation::Public(TxOp::DeleteDocs { table, ids, valid_from, valid_to }) => {
@@ -508,6 +518,39 @@ impl<'a> OpenTransaction<'a> {
             self.buffer.declare_document_types(table, types.iter().filter(|(name, _)| is_content(name)))?;
         }
         Ok(())
+    }
+    fn put_arrow_documents(&mut self, table: &TableRef, documents: &crate::ArrowDocuments, iids: Option<&[Iid]>, from: Option<Timestamp>, to: Option<Timestamp>) -> Result<()> {
+        use rtdb_types::{EventHeader, EventOp};
+        let array = documents.array();
+        let memory = &self.context.memory;
+        let bytes = array.len().checked_mul(128).and_then(|bytes| bytes.checked_add(4096)).ok_or_else(overflow)?;
+        let _scratch = memory.reserve(bytes)?;
+        let id = if iids.is_none() { documents.id_reader()? } else { None };
+        let endpoint = |name: &str| -> Result<_> {
+            array.fields().iter().position(|field| field.name() == name).map(|index| {
+                Ok((rtdb_columnar::ColumnReader::new(&array.fields()[index])?, array.column(index)))
+            }).transpose()
+        };
+        let row_from = endpoint("_valid_from")?;
+        let row_to = endpoint("_valid_to")?;
+        let row_time = |column: &Option<(rtdb_columnar::ColumnReader, &arrow_array::ArrayRef)>, row: usize, default| {
+            match column { Some((reader, values)) => timestamp(&reader.read(values.as_ref(), row)?, default), None => Ok(default) }
+        };
+        let system_from = self.tx_key().system_time;
+        let headers = (0..array.len()).map(|row| {
+            let iid = match iids {
+                Some(iids) => iids.get(row).copied().ok_or_else(|| Anomaly::incorrect("xtdb/invalid-iids", "Document and IID counts differ"))?,
+                None => documents.iid(row, id.as_ref(), memory)?,
+            };
+            let valid_time = interval(row_time(&row_from, row, from.unwrap_or(system_from))?, row_time(&row_to, row, to.unwrap_or(Timestamp::MAX))?)?;
+            Ok(EventHeader { iid, system_from, valid_time, op: EventOp::Put })
+        }).collect::<Result<Vec<_>>>()?;
+        let (fields, columns): (Vec<_>, Vec<_>) = array.fields().iter().zip(array.columns())
+            .filter(|(field, _)| !matches!(field.name().as_str(), "_valid_from" | "_valid_to"))
+            .map(|(field, column)| (Arc::clone(field), Arc::clone(column))).unzip();
+        let content = rtdb_columnar::build_struct_array(fields.into(), &columns, array.len(), None)?;
+        let batch = rtdb_format::data::owned_put_batch(content, &headers, memory)?;
+        self.buffer.append_batch(table, batch)
     }
     fn write_result(&mut self, result: &TransactionResult, metadata: Option<&UserMetadata>) -> Result<()> {
         let key = result.tx_key();
@@ -563,15 +606,18 @@ async fn execute(input: Arc<rtdb_plan::Relation>, context: Arc<QueryContext>, ar
     query.execute_columns(context, arguments.to_vec()).await
 }
 fn validate_document_operation(operation: &Operation) -> Result<()> {
-    let (table, documents, verb, permitted) = match operation {
+    let put_columns = &["_id", "_fn", "_valid_from", "_valid_to"][..];
+    let (table, columns, verb, permitted) = match operation {
         Operation::Public(TxOp::PutDocs { table, documents, .. }) | Operation::PutIids { table, documents, .. } =>
-            (table, documents, "put", &["_id", "_fn", "_valid_from", "_valid_to"][..]),
+            (table, documents.columns(), "put", put_columns),
+        Operation::Public(TxOp::PutArrowDocs { table, documents }) | Operation::PutArrowIids { table, documents, .. } =>
+            (table, documents.columns(), "put", put_columns),
         Operation::Public(TxOp::PatchDocs { table, documents, .. }) | Operation::PatchIids { table, documents, .. } =>
-            (table, documents, "patch", &["_id", "_fn"][..]),
+            (table, documents.columns(), "patch", &["_id", "_fn"][..]),
         _ => return Ok(()),
     };
     check_table(table)?;
-    let forbidden: Vec<_> = documents.columns().iter().map(String::as_str)
+    let forbidden: Vec<_> = columns.iter().map(String::as_str)
         .filter(|name| name.starts_with('_') && !permitted.contains(name)).collect();
     if forbidden.is_empty() { return Ok(()); }
     Err(Anomaly::incorrect("xtdb/forbidden-columns", format!("Cannot {verb} documents with columns: [{}]", forbidden.join(", ")))
@@ -583,8 +629,8 @@ fn validate_document_operation(operation: &Operation) -> Result<()> {
 /// Its patch path has no such wrapper.
 fn document_table(operation: &Operation) -> Option<&TableRef> {
     match operation {
-        Operation::Public(TxOp::PutDocs { table, .. } | TxOp::DeleteDocs { table, .. } | TxOp::EraseDocs { table, .. })
-        | Operation::PutIids { table, .. } => Some(table),
+        Operation::Public(TxOp::PutDocs { table, .. } | TxOp::PutArrowDocs { table, .. } | TxOp::DeleteDocs { table, .. } | TxOp::EraseDocs { table, .. })
+        | Operation::PutIids { table, .. } | Operation::PutArrowIids { table, .. } => Some(table),
         _ => None,
     }
 }

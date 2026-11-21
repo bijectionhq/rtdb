@@ -89,6 +89,7 @@ impl PrefixedStore {
 
 #[async_trait]
 impl ObjectStore for PrefixedStore {
+    fn supports_scan_ranges(&self, key: &ObjectKey) -> bool { self.full(key).is_ok_and(|key| self.bucket.supports_scan_ranges(&key)) }
     async fn head(&self, key: &ObjectKey) -> rtdb_storage::Result<StoredObject> { Ok(StoredObject { key: key.clone(), size: self.bucket.head(&self.full(key)?).await?.size }) }
     async fn head_fresh(&self, key: &ObjectKey) -> rtdb_storage::Result<StoredObject> { Ok(StoredObject { key: key.clone(), size: self.bucket.head_fresh(&self.full(key)?).await?.size }) }
     async fn get(&self, key: &ObjectKey) -> rtdb_storage::Result<Bytes> { self.bucket.get(&self.full(key)?).await }
@@ -137,6 +138,9 @@ impl ReferencingStore {
 
 #[async_trait]
 impl ObjectStore for ReferencingStore {
+    fn supports_scan_ranges(&self, key: &ObjectKey) -> bool { self.own.supports_scan_ranges(key) && self.base.objects.get(key.as_str()).is_none_or(|owner| {
+            self::key(&format!("{owner}/{key}")).is_ok_and(|key| self.bucket.supports_scan_ranges(&key))
+        }) }
     async fn head(&self, key: &ObjectKey) -> rtdb_storage::Result<StoredObject> {
         let object = self.read(key, |store, key| store.head(key)).await?;
         Ok(StoredObject { key: key.clone(), size: object.size })

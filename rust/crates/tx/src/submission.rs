@@ -59,7 +59,10 @@ fn expand(sql: &str, args: Option<&SqlArguments>, options: &SubmitOptions, datab
         let mut count = 0; expr.visit(&mut |expr| { if let rtdb_plan::Expr::Parameter { index, .. } = expr { count = count.max(index + 1); } }); count
     }).max().unwrap_or(0));
     if args.map_or(0, |args| args.types().len()) < parameter_count { return Ok(None); }
-    let parameter_rows: Box<dyn Iterator<Item = &[Value]> + '_> = match args { Some(args) => Box::new(args.rows()), None => Box::new(std::iter::once(&[][..])) };
+    let parameter_rows: Box<dyn Iterator<Item = Result<crate::values::ArgumentRow<'_>>> + '_> = match args {
+        Some(args) => Box::new(args.rows()),
+        None => Box::new(std::iter::once(Ok(crate::values::ArgumentRow::borrowed(&[])))),
+    };
     let mut groups: Vec<((Option<Timestamp>, Option<Timestamp>), Vec<StructFields<Value>>)> = Vec::new();
     let mut document_charges = Vec::new();
     let mut expression_count = 0usize;
@@ -67,6 +70,7 @@ fn expand(sql: &str, args: Option<&SqlArguments>, options: &SubmitOptions, datab
     count(&plan.input, &mut expression_count);
     for parameters in parameter_rows {
         let row_scope = scope.scratch();
+        let parameters = parameters?;
         let parameters = &parameters[..parameter_count];
         let parameter_bytes = parameters.iter().try_fold(1024usize, |bytes, value| bytes.checked_add(value.retained_bytes()?).ok_or_else(overflow))?;
         // Literal values come from the statement text, so their copies scale with its length; only parameters can be copied per expression.
@@ -160,13 +164,13 @@ mod tests {
         let args = SqlArguments::new(vec![rtdb_types::LogicalType::Scalar(rtdb_types::ScalarType::U64)], vec![vec![Value::U64(u64::MAX)]], &memory).unwrap();
         let source = prepare_submission(vec![TxOp::Sql { sql: "INSERT INTO docs (_id, v) VALUES (1, ?)".into(), args: Some(args.clone()) }], SubmitOptions::default(), "xtdb", &memory).unwrap();
         assert_eq!(document(&source)["v"], Value::I64(-1));
-        assert_eq!(args.rows().next().unwrap(), &[Value::U64(u64::MAX)]);
+        assert_eq!(&*args.rows().next().unwrap().unwrap(), &[Value::U64(u64::MAX)]);
         assert_eq!(args.types(), &[rtdb_types::LogicalType::Scalar(rtdb_types::ScalarType::U64)]);
         let encoded = source.encode().unwrap();
         let message = rtdb_format::envelope::SourceMessage::decode(encoded.as_slice()).unwrap().unwrap();
         let replay = SourceTransaction::decode(&message, &memory).unwrap();
-        let crate::source::Operation::PutIids { documents, .. } = &replay.operations[0] else { panic!("Expected decoded static documents") };
-        assert_eq!(documents.rows()[0]["v"], Value::I64(-1));
+        let crate::source::Operation::PutArrowIids { documents, .. } = &replay.operations[0] else { panic!("Expected decoded static documents") };
+        assert_eq!(documents.to_rows(true, &memory).unwrap().rows()[0]["v"], Value::I64(-1));
     }
 
     #[test]
