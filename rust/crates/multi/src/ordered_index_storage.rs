@@ -166,7 +166,8 @@ impl IndexPageLifecycle for HostedIndexPages {
             if catalog.through > through {
                 return Ok(());
             }
-            let mut changed = catalog.active != active;
+            let roster_changed = catalog.active != active;
+            let mut changed = roster_changed;
             for (index, state) in &mut record.ordered_indexes {
                 let Some(relative) = below(index, &self.store) else { continue };
                 if !state.dropped && definition(relative).is_some_and(|version| version <= through)
@@ -180,6 +181,7 @@ impl IndexPageLifecycle for HostedIndexPages {
             if changed {
                 catalog.through = through;
                 catalog.active.clone_from(&active);
+                if roster_changed { catalog.prior_prefixes_discovered = false; }
             }
             Ok(())
         }).await.map_err(storage_error)?;
@@ -569,7 +571,7 @@ mod tests {
         tokio::time::timeout(Duration::from_secs(5), tasks.wait()).await.unwrap();
     }
     #[tokio::test]
-    async fn a_catalog_cut_reclaims_an_unregistered_dropped_definition_and_keeps_it_closed() {
+    async fn a_catalog_cut_reclaims_unregistered_prefixes_for_dropped_definitions_and_replaced_layouts() {
         let directory = MemoryDirectory::new();
         let owner = Uuid::new_v4();
         let mut record = DeploymentRecord::new("shop", "acme", Vec::new(), 0);
@@ -608,6 +610,21 @@ mod tests {
         assert!(reaped.ordered_index_catalogs[&store].prior_prefixes_discovered);
         assert!(reaped.ordered_indexes.is_empty(), "the catalog keeps the fence after the inventory is retired");
         assert!(indexes.retain(stale).await.is_err());
+
+        let replacement = ObjectKey::new(format!("{ORDERED_INDEX_ROOT}/0000000000000003-{}", "c".repeat(64))).unwrap();
+        let next = IndexPageScope { index: &replacement, generation: 0 };
+        let replaced = IndexPageScope { index: &active, generation: 0 };
+        let replacement_key = ObjectKey::new(format!("{store}/{replacement}/generations/0000000000000000/pages/new")).unwrap();
+        indexes.retire_dropped(&BTreeSet::from([replacement.clone()]), 3).await.unwrap();
+        assert!(indexes.retain(replaced).await.is_err());
+        let permit = indexes.retain(next).await.unwrap();
+        bucket.put(&replacement_key, "new layout".as_bytes().into()).await.unwrap();
+        let changed = directory.deployment(&record.id).await.unwrap().unwrap();
+        assert!(!changed.ordered_index_catalogs[&store].prior_prefixes_discovered);
+        reap(directory.as_ref(), &storage, &bucket, &changed).await.unwrap();
+        assert!(matches!(bucket.head(&retained).await, Err(Error::MissingObject(_))));
+        assert!(bucket.head(&replacement_key).await.is_ok());
+        drop(permit);
 
         drop(indexes);
         tasks.close();

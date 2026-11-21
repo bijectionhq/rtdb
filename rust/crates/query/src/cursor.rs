@@ -247,6 +247,12 @@ impl PreparedQuery {
         let owner = context.owner_cancellation.clone();
         let operators = Arc::clone(&runtime_schema);
         let input = owner.run_until_cancelled(cancellation.run_until_cancelled(async {
+            if analysis.is_none() && context.trace_parent.is_none() && !context.accelerators.is_empty()
+                && !matches!(batching, Batching::Pages)
+                && let Some(batches) = crate::operators::build_ordered_columns(Arc::clone(&operators), execution.clone(), None).await?
+            {
+                return Ok(QueryInput::Columns(batches));
+            }
             match batching {
                 Batching::Pages if analysis.is_none() => crate::operators::build_pages(operators, execution).await.map(QueryInput::Pages),
                 Batching::Columns if analysis.is_none() => match crate::operators::build_columns(Arc::clone(&operators), execution.clone()).await? {

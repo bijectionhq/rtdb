@@ -19,6 +19,11 @@ pg-source = ["dep:rtdb-pg-source"]
 all-backends = ["kafka", "kafka-connect", "s3", "azure", "gcs", "pg-source"]
 
 [dependencies]
+arrow-array.workspace = true
+arrow-buffer.workspace = true
+arrow-ipc.workspace = true
+arrow-schema.workspace = true
+bytes.workspace = true
 sha2.workspace = true
 stacker.workspace = true
 rtdb-types.workspace = true

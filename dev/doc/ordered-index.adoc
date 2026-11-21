@@ -11,7 +11,8 @@ For example, after priority 2 and ID 4, use `priority > 2 OR (priority = 2 AND _
 Include `_id` in the ordering to make continuation deterministic among equal values.
 Reuse both temporal points to continue the same read across SQL statements.
 The scan can reverse the index order and applies predicates before counting rows towards the limit.
-It fetches projected fields from a row's table at the same basis.
+When all predicates and result columns are covered, the seek emits Arrow result batches from the index.
+When the query needs additional fields, the scan fetches them from the table at the same basis.
 
 For a ranked full-text query, a bounded seek on a structured predicate can supply an IID scope before MATCH candidates are scored.
 This uses the same captured snapshot and point instants as the text query.
@@ -38,7 +39,12 @@ It emits both retractions and insertions when a key or interval moves.
 Payload-only changes with the same projected valid-time spans share the previous root.
 The scan captures a single table snapshot, opens the index root for the requested system time, and applies exact edits from uncovered flushed blocks and live segments in that snapshot.
 The point read applies later erasures to the selected root.
-Each read or maintenance cycle owns its decoded pages and its live replay state.
+The projector reads typed Arrow cells directly from table events.
+A posting leaf stores an uncompressed Arrow IPC record batch with a compact description of its column types.
+Seeks compare cells in the leaf's Arrow buffers, and a page rewrite copies surviving cells directly into the new buffers.
+Branch fences, correction spans, and the revision directory carry the tree metadata.
+Each read or maintenance cycle owns its page buffers and its live replay state.
+Covered results own their projected buffers independently of the page read.
 Ordered-index inputs bypass the persistent node cache, and replay reads its source bytes within the cycle's memory budget.
 A missing checkpoint, missing source coverage or memory admission failure uses the normal SQL executor.
 
@@ -55,3 +61,5 @@ It projects events from the erase onward, preserving the operation order at the 
 A maintenance cycle that incorporates an erase removes the affected IID from older roots and collects unreachable pages and manifests.
 A durable cleanup marker survives a crash after publication or during a rebuild and is cleared after collection.
 A drop makes its generation eligible for collection.
+A posting layout change gives the definition a fresh derived storage address.
+The writer publishes the new address to the storage owner, which retires the previous address under the same reader and upload fences as a dropped definition.

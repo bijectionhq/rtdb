@@ -2544,6 +2544,14 @@ async fn ordered_index_limits_distinct_visible_keys_in_both_directions() {
     index_flush(&node, &database).await;
     database.build_artefacts().await.unwrap();
 
+    let table = TableRef::new("public", "orders");
+    let snapshot = database.snapshot();
+    let entry = snapshot.table_entry(&table).unwrap();
+    let trie = rtdb_format::keys::TrieKey::l0(snapshot.trie_catalog().l0_max_block_index(&table)).unwrap();
+    let primary = rtdb_storage::ObjectKey::new(entry.slug.data_key(&trie)).unwrap();
+    database.object_store().delete(&primary).await.unwrap();
+    database.storage().invalidate(&primary).await.unwrap();
+
     for (direction, expected) in [("ASC", ["b", "c"]), ("DESC", ["c", "b"])] {
         let query = format!("SELECT DISTINCT key FROM orders WHERE world = 4
             AND (label = 'low' OR label = 'public') ORDER BY key {direction} LIMIT 2");
@@ -2556,6 +2564,10 @@ async fn ordered_index_limits_distinct_visible_keys_in_both_directions() {
         AND (label = 'low' OR label = 'public') ORDER BY key LIMIT 1";
     assert_eq!(rows(session.query_sql(query, vec![]).await.unwrap()).await, [vec![Value::Utf8("c".into())]]);
     assert!(observer.take().is_empty(), "the ordered index answered the continuation");
+    let offset = "SELECT DISTINCT key FROM orders WHERE world = 4 AND (label = 'low' OR label = 'public')
+        ORDER BY key ASC LIMIT 1 OFFSET 1";
+    assert_eq!(rows(session.query_sql(offset, vec![]).await.unwrap()).await, [vec![Value::Utf8("c".into())]]);
+    assert!(observer.take().is_empty());
     stop(&node, driver).await;
 }
 
