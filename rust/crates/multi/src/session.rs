@@ -12,7 +12,7 @@ use std::time::Duration;
 
 use bytes::{BufMut, Bytes, BytesMut};
 use rtdb_directory::{DeploymentRecord, Directory, Lifecycle};
-use rtdb_pgwire::{GATEWAY_SESSION_STATE_TAG, GATEWAY_SETTINGS_KIND, GATEWAY_SETTINGS_PARAMETER};
+use rtdb_pgwire::{GATEWAY_SESSION_STATE_TAG, GATEWAY_SETTINGS_KIND, GATEWAY_SETTINGS_PARAMETER, GATEWAY_SQL_PREPARE_KIND};
 use rtdb_types::{Anomaly, AnomalyCategory, MemoryBudget, MemoryReservation, Result};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -127,6 +127,8 @@ enum Status { Idle, InTransaction, Busy }
 /// What a gateway needs to mint a session's capabilities: the cell's secret and the session's startup.
 pub struct Grants { pub secret: Arc<crate::capability::CellSecret>, pub parameters: std::collections::BTreeMap<String, String>, pub read_only: bool }
 
+struct RememberedStatement { order: u64, frame: Frame }
+
 pub struct Session {
     startup: Bytes,
     frame_memory: Arc<MemoryBudget>,
@@ -138,7 +140,8 @@ pub struct Session {
     greeting: Greeting,
     router: Arc<dyn Router>,
     record: watch::Receiver<Option<DeploymentRecord>>,
-    prepared: BTreeMap<String, Frame>,
+    prepared: BTreeMap<String, RememberedStatement>,
+    next_statement_order: u64,
     await_token: Option<Frame>,
     settings: Option<Frame>,
     status: Status,
@@ -162,7 +165,7 @@ pub struct Session {
 impl Session {
     pub fn new(startup: Bytes, router: Arc<dyn Router>, directory: Arc<dyn Directory>, deployment: String, grants: Option<Grants>, keyed: bool) -> Self {
         let record = rtdb_directory::watch_deployment(directory, deployment, RECONNECT_RETRY_DELAY);
-        Self { startup, frame_memory: MemoryBudget::new(DEFAULT_GATEWAY_FRAME_BYTES), installation_status: None, grants, authenticated: None, greeting: Greeting::default(), router, record, prepared: BTreeMap::new(), await_token: None, settings: None, status: Status::Busy, pending: Vec::new(), prepared_responses: 0, answered: false, lost_unanswered: false, discarding: false, keyed, key: None, swallowing: 0 }
+        Self { startup, frame_memory: MemoryBudget::new(DEFAULT_GATEWAY_FRAME_BYTES), installation_status: None, grants, authenticated: None, greeting: Greeting::default(), router, record, prepared: BTreeMap::new(), next_statement_order: 0, await_token: None, settings: None, status: Status::Busy, pending: Vec::new(), prepared_responses: 0, answered: false, lost_unanswered: false, discarding: false, keyed, key: None, swallowing: 0 }
     }
 
     pub(crate) fn with_frame_memory(mut self, memory: Arc<MemoryBudget>) -> Self {
@@ -212,9 +215,14 @@ impl Session {
         if self.settings.is_some() && !features.settings {
             return Err(Anomaly::new(AnomalyCategory::Unsupported, "rtdb.multi/reconnect-settings", "The new holder cannot restore the session's settings"));
         }
-        if self.settings.is_some() || self.await_token.is_some() || !self.prepared.is_empty() {
+        let mut definitions: Vec<_> = self.prepared.values().collect();
+        if !features.sql_prepare && definitions.iter().any(|definition| definition.frame.tag == GATEWAY_SESSION_STATE_TAG) {
+            return Err(Anomaly::new(AnomalyCategory::Unsupported, "rtdb.multi/reconnect-sql-prepare", "The new holder cannot restore SQL prepared statements"));
+        }
+        definitions.sort_unstable_by_key(|definition| definition.order);
+        if self.settings.is_some() || self.await_token.is_some() || !definitions.is_empty() {
             let send = async {
-                for frame in self.settings.iter().chain(self.await_token.iter()).chain(self.prepared.values()) {
+                for frame in self.settings.iter().chain(self.await_token.iter()).chain(definitions.into_iter().map(|definition| &definition.frame)) {
                     backend.writer.write_all(&frame.encode()).await.map_err(io)?;
                 }
                 backend.writer.write_all(&[b'S', 0, 0, 0, 4]).await.map_err(io)
@@ -338,6 +346,11 @@ impl Session {
                                     Some(0) => self.await_token = None,
                                     Some(1) => self.await_token = Some(frame),
                                     Some(GATEWAY_SETTINGS_KIND) if frame.body.len() > 1 => self.settings = Some(frame),
+                                    Some(GATEWAY_SQL_PREPARE_KIND) if frame.body.len() > 1 => {
+                                        let name = frame.body[1..].split(|byte| *byte == 0).next().and_then(|name| std::str::from_utf8(name).ok())
+                                            .filter(|name| !name.is_empty()).ok_or_else(|| lost("the holder sent an invalid prepared name"))?.to_owned();
+                                        self.remember_statement(name, frame);
+                                    }
                                     _ => {}
                                 }
                             }
@@ -471,6 +484,11 @@ impl Session {
         }
     }
 
+    fn remember_statement(&mut self, name: String, frame: Frame) {
+        self.prepared.insert(name, RememberedStatement { order: self.next_statement_order, frame });
+        self.next_statement_order = self.next_statement_order.wrapping_add(1);
+    }
+
     fn confirm_prepared_change(&mut self, response: u8) {
         let Some((position, request)) = self.pending.iter().enumerate().skip(self.prepared_responses)
             .take_while(|(_, request)| !matches!(request.tag, b'Q' | b'S'))
@@ -479,7 +497,7 @@ impl Session {
         match (response, request.tag) {
             (b'1', b'P') => {
                 let name = parse_name(request);
-                if !name.is_empty() { self.prepared.insert(name, request.clone()); }
+                if !name.is_empty() { self.remember_statement(name, request.clone()); }
             }
             (b'3', b'C') if request.body.first() == Some(&b'S') => {
                 let name = request.body[1..].split(|byte| *byte == 0).next().map(|name| String::from_utf8_lossy(name).into_owned()).unwrap_or_default();
@@ -491,7 +509,7 @@ impl Session {
 }
 
 #[derive(Default)]
-struct ReplayFeatures { await_token: bool, settings: bool }
+struct ReplayFeatures { await_token: bool, settings: bool, sql_prepare: bool }
 
 async fn replay_ready(frames: &mut mpsc::Receiver<std::io::Result<Frame>>) -> Result<ReplayFeatures> {
     let mut features = ReplayFeatures::default();
@@ -503,6 +521,7 @@ async fn replay_ready(frames: &mut mpsc::Receiver<std::io::Result<Frame>>) -> Re
             GATEWAY_SESSION_STATE_TAG => match frame.body.first().copied() {
                 Some(0 | 1) => features.await_token = true,
                 Some(GATEWAY_SETTINGS_KIND) => features.settings = true,
+                Some(GATEWAY_SQL_PREPARE_KIND) => features.sql_prepare = true,
                 _ => {}
             },
             b'Z' => return Ok(features),

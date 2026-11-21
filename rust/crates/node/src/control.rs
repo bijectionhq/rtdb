@@ -52,8 +52,14 @@ pub fn control_schema(statement: &ControlStatement) -> Result<Option<Schema>> {
 impl NativeSession {
     /// `cancellation` must descend from `state().cancellation()`; dropping preparation never pins a bare BEGIN.
     pub async fn prepare_context(&mut self, cancellation: &CancellationToken) -> Result<Arc<QueryContext>> {
+        self.prepare_context_with_timezone(None, cancellation).await
+    }
+
+    /// Prepares on the current catalogue with the timezone captured by a gateway before a move.
+    pub async fn prepare_context_with_timezone(&mut self, timezone: Option<&str>, cancellation: &CancellationToken) -> Result<Arc<QueryContext>> {
         cancellation.run_until_cancelled(async {
-            let basis = self.state.prepare_basis().await?;
+            let mut basis = self.state.prepare_basis().await?;
+            if let Some(timezone) = timezone { basis.timezone = rtdb_expr::normalize_timezone(timezone)?; }
             Ok(self.service.node.query_context(self.state.database(), &basis, self.service.identity.as_ref(), cancellation).await?.with_observer(crate::SessionService::execution_observer(self.service.as_ref())).with_tracer(self.service.node.tracer(), None))
         }).await.ok_or_else(cancelled)?
     }

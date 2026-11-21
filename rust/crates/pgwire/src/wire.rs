@@ -58,6 +58,15 @@ impl<W: AsyncWrite + Unpin> Writer<W> {
             Ok(())
         }).await
     }
+    pub async fn gateway_sql_prepare(&mut self, name: &str, source: &str, search_path: &str, timezone: &str) -> Result<()> {
+        let length = [name, source, search_path, timezone].into_iter().try_fold(1usize, |length, field| length.checked_add(field.len())?.checked_add(1))
+            .ok_or_else(|| protocol("Gateway PREPARE state is too large"))?;
+        self.record(crate::GATEWAY_SESSION_STATE_TAG, length, |body| {
+            body.push(crate::GATEWAY_SQL_PREPARE_KIND);
+            for field in [name, source, search_path, timezone] { cstring(body, field)?; }
+            Ok(())
+        }).await
+    }
     pub async fn ready(&mut self, status: u8) -> Result<()> { self.send(b'Z', &[status]).await?; self.flush().await }
     pub async fn backend_key(&mut self, process: i32) -> Result<()> { self.record(b'K', 8, |bytes| { bytes.extend_from_slice(&process.to_be_bytes()); bytes.extend_from_slice(&0i32.to_be_bytes()); Ok(()) }).await }
     pub async fn parameters(&mut self, oids: &[i32]) -> Result<()> { self.record(b't', 2 + oids.len() * 4, |bytes| { count(bytes, oids.len())?; for oid in oids { bytes.extend_from_slice(&(if *oid == 0 { 25 } else { *oid }).to_be_bytes()); } Ok(()) }).await }

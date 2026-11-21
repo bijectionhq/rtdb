@@ -9,7 +9,7 @@ use rtdb_sql::{AdmittedControl, BatchExecution, ContextualStatementDiagnostic, E
 use rtdb_types::{Anomaly, PgType, Result, Value};
 use tokio::io::AsyncWrite;
 use tokio_util::sync::CancellationToken;
-use crate::{GATEWAY_SESSION_STATE_TAG, GATEWAY_SETTINGS_KIND, ServerConfig, connection::{Startup, apply_startup, display_parameter}, error::{cancelled, protocol}, server::CancellationSlot, wire::{Column, Frame, Input, Writer}};
+use crate::{GATEWAY_SESSION_STATE_TAG, GATEWAY_SETTINGS_KIND, GATEWAY_SQL_PREPARE_KIND, ServerConfig, connection::{Startup, apply_startup, display_parameter}, error::{cancelled, protocol}, server::CancellationSlot, wire::{Column, Frame, Input, Writer}};
 
 enum PreparedKind { Empty, Query(PreparedSql), Dml(PreparedSql), Control(PreparedControl), Keywords }
 enum PreparedControl { Batch(ControlStatement), Extended(AdmittedControl) }
@@ -56,6 +56,13 @@ struct Portal {
     cancellation: CancellationToken,
     _charges: Vec<Arc<MemoryReservation>>,
     _bind_storage: Option<Arc<MemoryReservation>>,
+}
+
+#[derive(Clone, Copy)]
+struct PreparationSettings<'a> { search_path: &'a str, timezone: &'a str }
+
+fn search_path(value: &str) -> Vec<String> {
+    value.split(',').map(|name| name.trim().trim_matches('"').to_owned()).collect()
 }
 
 pub(crate) struct ProtocolSession {
@@ -108,7 +115,7 @@ impl ProtocolSession {
         }
         writer.ready(status).await
     }
-    fn options(&self) -> rtdb_sql::PrepareOptions { rtdb_sql::PrepareOptions { search_path: self.session.state().parameter("search_path").unwrap_or("public").split(',').map(|name| name.trim().trim_matches('"').to_owned()).collect(), ..Default::default() } }
+    fn options(&self) -> rtdb_sql::PrepareOptions { rtdb_sql::PrepareOptions { search_path: search_path(self.session.state().parameter("search_path").unwrap_or("public")), ..Default::default() } }
     fn begin_implicit(&mut self, read_only: Option<bool>) -> Result<()> { if self.session.state().status() != TransactionStatus::Idle { return Ok(()); } let mut settings = rtdb_node::TransactionSettings::default(); settings.access = read_only.map(|read_only| if read_only { rtdb_node::AccessSettings::ReadOnly(Default::default()) } else { rtdb_node::AccessSettings::ReadWrite(Default::default()) }); self.session.state_mut().begin_with(settings)?; self.implicit = true; Ok(()) }
     fn end_transaction(&mut self) { self.portals.clear(); self.implicit = false; self.transaction_generation = self.transaction_generation.wrapping_add(1); }
     async fn commit(&mut self) -> Result<()> { let _sample = rtdb_plan::ExecutionSample::new(self.node.execution_observer(), rtdb_plan::ExecutionTimer::PgwireTransaction); let result = self.session.state_mut().commit_tx(None).await; self.end_transaction(); if let CommitResult::Executed(tx) = result? { if let Some(error) = tx.error() { return Err(error.clone()); } } Ok(()) }
@@ -215,7 +222,7 @@ impl ProtocolSession {
                 self.report_ready(writer).await?;
             }
             GATEWAY_SESSION_STATE_TAG if self.startup.gateway_session_state => {
-                if self.extended || self.copy.is_some() || self.ready() != b'I' {
+                if self.copy.is_some() || self.ready() != b'I' {
                     return Err(protocol("A gateway can restore state only on an idle session"));
                 }
                 match input.byte()? {
@@ -232,6 +239,13 @@ impl ProtocolSession {
                     GATEWAY_SETTINGS_KIND if self.startup.gateway_settings => {
                         self.session.state_mut().restore_gateway_settings(input.remaining())?;
                         self.reported_settings = self.session.state().settings_revision();
+                    }
+                    GATEWAY_SQL_PREPARE_KIND if self.startup.gateway_settings => {
+                        let name = input.string()?;
+                        let source = input.string()?;
+                        let settings = PreparationSettings { search_path: input.string()?, timezone: input.string()? };
+                        input.end()?;
+                        self.restore_sql_prepare(name, source, settings).await?;
                     }
                     _ => return Err(protocol("Invalid gateway session state")),
                 }
@@ -269,14 +283,15 @@ impl ProtocolSession {
         self.retain_prepared(source, oids, shape)
     }
 
-    async fn prepare_batch_command(&mut self, syntax: ExecutableSyntax<'_>, allocation: Arc<MemoryReservation>) -> Result<Arc<Prepared>> {
+    async fn prepare_batch_command(&mut self, syntax: ExecutableSyntax<'_>, allocation: Arc<MemoryReservation>, settings: Option<PreparationSettings<'_>>) -> Result<Arc<Prepared>> {
         let source = syntax.source();
-        let options = self.options();
+        let mut options = self.options();
+        if let Some(settings) = settings { options.search_path = search_path(settings.search_path); }
         let shape = match syntax {
             ExecutableSyntax::FrontendResponse(_) => keyword_shape(),
             ExecutableSyntax::Control(control) => self.execute_columns(control_shape(PreparedControl::Batch(control.bind(&options)?), 0)?),
             ExecutableSyntax::Sql(syntax) => {
-                let context = self.session.prepare_context(&self.token()).await?;
+                let context = self.session.prepare_context_with_timezone(settings.map(|settings| settings.timezone), &self.token()).await?;
                 sql_shape(PreparedSql::prepare_postgres_statement(syntax, &context, options.search_path, &[])?, 0)
             }
         };
@@ -302,10 +317,26 @@ impl ProtocolSession {
         Ok(Arc::new(Prepared { body: PreparedBody::SqlPrepare(syntax), oids, columns: None, _reservation: reservation }))
     }
 
-    async fn install_sql_prepare<W: AsyncWrite + Unpin>(&mut self, name: Cow<'_, str>, prepared: Arc<Prepared>, writer: &mut Writer<W>) -> Result<()> {
+    async fn install_sql_prepare<W: AsyncWrite + Unpin>(&mut self, name: Cow<'_, str>, source: &str, prepared: Arc<Prepared>, writer: &mut Writer<W>) -> Result<()> {
         Self::planning_warnings(&prepared, writer).await?;
-        self.register_statement(name, prepared)?;
+        if self.startup.gateway_settings && !name.is_empty() {
+            self.register_statement(Cow::Borrowed(&name), prepared)?;
+            writer.gateway_sql_prepare(&name, source,
+                self.session.state().parameter("search_path").unwrap_or("public"), self.session.state().effective_timezone()).await?;
+        } else {
+            self.register_statement(name, prepared)?;
+        }
         writer.string(b'C', "PREPARE").await
+    }
+
+    async fn restore_sql_prepare(&mut self, name: &str, source: &str, settings: PreparationSettings<'_>) -> Result<()> {
+        let memory = Arc::clone(self.node.memory());
+        let parsed = rtdb_sql::parse_extended_statement(source, &memory)?;
+        let ExtendedStatement::Prepare(syntax) = parsed.statement else { return Err(protocol("The gateway's statement is not a PREPARE")); };
+        if syntax.name() != name { return Err(protocol("The gateway's PREPARE name does not match its definition")); }
+        let _admission = self.session.admit_frontend_prepare(&[], &self.token()).await?;
+        let prepared = self.prepare_sql_child(syntax.child(&memory)?, Some(settings)).await?;
+        self.register_statement(Cow::Borrowed(name), prepared)
     }
 
     async fn planning_warnings<W: AsyncWrite + Unpin>(prepared: &Prepared, writer: &mut Writer<W>) -> Result<()> {
@@ -425,14 +456,14 @@ impl ProtocolSession {
     ) -> Result<()> {
         let _allocation = self.session.admit_frontend_prepare(&portal.arguments, &portal.cancellation).await?;
         let memory = Arc::clone(self.node.memory());
-        let prepared = self.prepare_sql_child(syntax.child(&memory)?).await?;
-        self.install_sql_prepare(Cow::Borrowed(syntax.name()), prepared, writer).await
+        let prepared = self.prepare_sql_child(syntax.child(&memory)?, None).await?;
+        self.install_sql_prepare(Cow::Borrowed(syntax.name()), syntax.source(), prepared, writer).await
     }
 
-    async fn prepare_sql_child(&mut self, child: SqlPrepareChild<'_>) -> Result<Arc<Prepared>> {
+    async fn prepare_sql_child(&mut self, child: SqlPrepareChild<'_>, settings: Option<PreparationSettings<'_>>) -> Result<Arc<Prepared>> {
         match child {
             SqlPrepareChild::Prepare(child) => self.retain_sql_prepare(child, Vec::new()),
-            SqlPrepareChild::Command { syntax, allocation } => self.prepare_batch_command(syntax, allocation).await,
+            SqlPrepareChild::Command { syntax, allocation } => self.prepare_batch_command(syntax, allocation, settings).await,
         }
     }
 
@@ -539,12 +570,13 @@ impl ProtocolSession {
                 }
                 let token = self.token();
                 let _allocation = self.session.admit_frontend_prepare(&[], &token).await?;
+                let source = statement.source();
                 let (name, child) = statement.into_child()?;
-                let prepared = self.prepare_sql_child(child).await?;
-                return self.install_sql_prepare(name.into(), prepared, writer).await;
+                let prepared = self.prepare_sql_child(child, None).await?;
+                return self.install_sql_prepare(name.into(), source, prepared, writer).await;
             }
         };
-        let prepared = self.prepare_batch_command(syntax, allocation).await?;
+        let prepared = self.prepare_batch_command(syntax, allocation, None).await?;
         Self::planning_warnings(&prepared, writer).await?;
         if !prepared.oids.is_empty() { return Err(protocol("Parameters not allowed in simple queries")); }
         let mut portal = self.bind(prepared, Vec::new(), Vec::new(), &[]).await?;

@@ -33,6 +33,7 @@
 --      The gateway restores the mutable settings and token before replaying prepared statements or resuming application work.
 --      The mutable settings include the timezone, session parameters and default transaction access mode.
 --      DISCARD ALL restores the original startup settings.
+--      SQL PREPARE keeps the search path and timezone at definition across a gateway reconnect.
 --   2. ADBC and Flight SQL: a caller handing the connection SQL text has BEGIN, START TRANSACTION, COMMIT and ROLLBACK rejected with xtdb.adbc/tx-control-as-sql, which names the transaction API.
 --      These callers open and end transactions through their API: ADBC autocommit / commit / rollback, Flight SQL BeginTransaction / EndTransaction, and Xtdb.Connection.begin / commitSync / commitAsync / rollbackTx.
 --      They set characteristics with SET TRANSACTION, which is accepted as SQL, or with Xtdb.Connection.setTransactionReadOnly / setTransactionReadWrite / setTransactionTimeZone.

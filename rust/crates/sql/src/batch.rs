@@ -28,6 +28,7 @@ impl<'input> StatementBatch<'input> {
         Some(match layers.next() {
             Some(outer) => BatchExecution::Prepare(BatchPrepare {
                 name: outer.name,
+                statement: outer.source,
                 layers,
                 syntax,
                 allocation,
@@ -72,6 +73,7 @@ pub enum BatchExecution<'batch, 'input> {
 /// An outer PREPARE with access to the source of its immediate child.
 pub struct BatchPrepare<'batch, 'input> {
     name: String,
+    statement: &'input str,
     layers: std::vec::IntoIter<PrepareSyntax<'input>>,
     syntax: ExecutableSyntax<'input>,
     allocation: Arc<MemoryReservation>,
@@ -79,12 +81,15 @@ pub struct BatchPrepare<'batch, 'input> {
 }
 
 impl<'input> BatchPrepare<'_, 'input> {
+    /// The original outer PREPARE without surrounding statement separators.
+    pub fn source(&self) -> &'input str { self.statement }
+
     /// Returns the registration name and its immediate child.
     /// Both child forms retain the grammar reservation.
     /// A terminal child borrows the input.
     /// The first nested child admits a shared copy of the input against the batch's memory budget and can fail if the reservation is denied.
     pub fn into_child(self) -> Result<(String, SqlPrepareChild<'input>)> {
-        let Self { name, layers, syntax, allocation, source } = self;
+        let Self { name, layers, syntax, allocation, source, .. } = self;
         let child = if layers.as_slice().is_empty() {
             SqlPrepareChild::Command { syntax, allocation }
         } else {
