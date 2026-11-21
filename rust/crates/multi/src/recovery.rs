@@ -19,7 +19,9 @@ use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use crate::{
+    admin::flush_checkpoint,
     archive::{self, CapturePoint},
+    control::ControlKey,
     deployment::CellStorage,
     install::Token,
     keys::KeyService,
@@ -138,6 +140,7 @@ pub struct RecoveryService {
     archive: CellStorage,
     keys: Arc<dyn KeyService>,
     hosted_task: Option<HostedTask>,
+    control: ControlKey,
 }
 
 impl RecoveryService {
@@ -148,6 +151,7 @@ impl RecoveryService {
         archive: CellStorage,
         keys: Arc<dyn KeyService>,
         hosted_task: Option<HostedTask>,
+        control: ControlKey,
     ) -> Result<Self> {
         Ok(Self {
             token: Token::new(&Token::read(token)?)?,
@@ -156,6 +160,7 @@ impl RecoveryService {
             archive,
             keys,
             hosted_task,
+            control,
         })
     }
 
@@ -201,6 +206,18 @@ impl RecoveryService {
                 let (point, manifest_sha256) = match retained {
                     Some(receipt) => receipt,
                     None => {
+                        archive::require_capture_open(&installation, request.capture)?;
+                        let flushed = if installation
+                            .checkpoint_captures
+                            .contains_key(&request.capture)
+                        {
+                            None
+                        } else {
+                            Some(
+                                flush_checkpoint(directory.as_ref(), &installation, &self.control)
+                                    .await?,
+                            )
+                        };
                         let capture = archive::capture(
                             directory,
                             &self.storage,
@@ -209,6 +226,7 @@ impl RecoveryService {
                             request.authority,
                             request.capture,
                             self.hosted_task.clone(),
+                            flushed.as_ref(),
                         )
                         .await?;
                         let digest = capture.manifest_sha256()?;
@@ -597,6 +615,7 @@ mod tests {
         let token = "a".repeat(64);
         let service = RecoveryService {
             hosted_task: None,
+            control: ControlKey::default(),
             token: Token::new(&token).unwrap(),
             org: "cell".into(),
             storage: CellStorage::Local {

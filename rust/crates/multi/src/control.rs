@@ -44,6 +44,7 @@ pub enum Response {
     /// This member serves the deployment's reads from a replica; clients reach it at `address`.
     Subscribed { address: String },
     Done,
+    Flushed { block: i64 },
     Published { position: i64 },
     /// A fragment's rows: length-prefixed Arrow IPC streams, in base64.
     Fragment { batches: String },

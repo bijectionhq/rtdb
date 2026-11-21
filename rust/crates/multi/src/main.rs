@@ -29,7 +29,7 @@ Usage: rtdb-multi --build-info\n\
        rtdb-multi prepare-cell-transfer [--transfer FILE | --transfer-bucket BUCKET --transfer-digest SHA256] --from CELL --from-directory DIR --from-storage-root PATH --from-keys PATH --to CELL --to-directory DIR --to-storage-root PATH --to-keys PATH [--ecs-cluster ARN]\n\
        rtdb-multi activate-cell-transfer [--transfer FILE | --transfer-bucket BUCKET --transfer-digest SHA256] --from CELL --from-directory DIR --from-storage-root PATH --from-keys PATH --to CELL --to-directory DIR --to-storage-root PATH --to-keys PATH\n\
        rtdb-multi controller --directory DIR [--rebalance MOVES] [--cell-secret FILE]\n\
-       rtdb-multi reaper --directory DIR --storage-root PATH [--keys PATH] [--ecs-cluster ARN] [--grace SECONDS] [--recovery-listen ADDR --recovery-config FILE --recovery-token-file FILE --recovery-org ORG --archive-root PATH]\n\
+       rtdb-multi reaper --directory DIR --storage-root PATH [--keys PATH] [--ecs-cluster ARN] [--grace SECONDS] [--recovery-listen ADDR --recovery-config FILE --recovery-token-file FILE --recovery-org ORG --archive-root PATH --cell-secret FILE]\n\
        rtdb-multi create --directory DIR --name NAME [--org ORG] [--replicas N]\n\
        rtdb-multi install --directory DIR --id UUID --name NAME --org ORG [--replicas N]\n\
        rtdb-multi list --directory DIR\n\
@@ -45,7 +45,7 @@ Usage: rtdb-multi --build-info\n\
        rtdb-multi disposal --directory DIR --id UUID\n\
        rtdb-multi schedule-recovery-disposal --directory DIR --id UUID\n\
        rtdb-multi recovery-disposal --directory DIR --id UUID\n\
-       rtdb-multi capture --directory DIR --storage-root PATH --archive-root PATH --keys PATH --id UUID --operation UUID [--ecs-cluster ARN]\n\
+       rtdb-multi capture --directory DIR --storage-root PATH --archive-root PATH --keys PATH --id UUID --operation UUID [--ecs-cluster ARN --cell-secret FILE]\n\
        rtdb-multi stage-checkpoint --directory DIR --archive-root PATH --storage-root PATH --keys PATH --stage-request FILE [--ecs-cluster ARN]\n\
        rtdb-multi read-checkpoint-stage --directory DIR --storage-root PATH --keys PATH --id UUID --operation UUID --manifest-sha256 SHA256 --certificate FILE --private-key FILE --password-file FILE --ready-file FILE [--ecs-cluster ARN] [--parent-stdin]\n\
        rtdb-multi restore --directory DIR --storage-root PATH --archive-root PATH --keys PATH --id UUID --operation UUID [--ecs-cluster ARN]\n\n\
@@ -310,8 +310,8 @@ async fn run(arguments: Vec<String>) -> Result<()> {
         let report = MultiBuildInfo {
             provenance: rtdb_types::compiled_build_info(),
             standalone_protocol: process::STANDALONE_PROTOCOL,
-            // The archive owner can fence and retire individual captured checkpoints.
-            hosted_protocol: 12,
+            // Hosted capture adopts a block through the holder's observed source.
+            hosted_protocol: 13,
         };
         let mut output = std::io::stdout().lock();
         serde_json::to_writer(&mut output, &report).map_err(|error| io(std::io::Error::other(error)))?;
@@ -465,13 +465,19 @@ async fn run(arguments: Vec<String>) -> Result<()> {
                 let tls_settings = configuration.server.and_then(|server| server.ssl)
                     .ok_or_else(|| usage("The recovery configuration must provide server.ssl".into()))?;
                 let tls = rtdb_server::tls::load(&tls_settings, &rtdb_columnar::MemoryBudget::new(16 << 20))?;
+                let task = hosted_task(&arguments)?;
+                let control = rtdb_multi::control::ControlKey(cell_secret(&arguments)?);
+                if task.is_some() && control.0.is_none() {
+                    return Err(usage("Hosted recovery requires the installed --cell-secret".into()));
+                }
                 let service = rtdb_multi::recovery::RecoveryService::from_file(
                     std::path::Path::new(arguments.required("recovery-token-file")?),
                     arguments.required("recovery-org")?.to_owned(),
                     storage.clone(),
                     CellStorage::parse(arguments.required("archive-root")?)?,
                     keys.clone().ok_or_else(|| usage("The recovery endpoint requires --keys".into()))?,
-                    hosted_task(&arguments)?,
+                    task,
+                    control,
                 )?;
                 let listener = tokio::net::TcpListener::bind(
                     arguments.address("recovery-listen", "127.0.0.1:0")?,
@@ -576,9 +582,22 @@ async fn run(arguments: Vec<String>) -> Result<()> {
             let storage = CellStorage::parse(arguments.required("storage-root")?)?;
             let archive = CellStorage::parse(arguments.required("archive-root")?)?;
             let keys = key_service(arguments.required("keys")?).await?;
+            let id = installation_id(&arguments)?;
+            let operation = required_uuid(&arguments, "operation")?;
+            let task = hosted_task(&arguments)?;
+            let flushed = if task.is_some() {
+                let original = directory.deployment(&id.to_string()).await?
+                    .ok_or_else(|| usage("The capture's installation is unavailable".into()))?;
+                if original.checkpoint_captures.contains_key(&operation) {
+                    None
+                } else {
+                    Some(admin::flush_checkpoint(directory.as_ref(), &original,
+                        &rtdb_multi::control::ControlKey(cell_secret(&arguments)?)).await?)
+                }
+            } else { None };
             let capture = rtdb_multi::archive::capture(
                 directory, &storage, &archive, keys.as_ref(),
-                installation_id(&arguments)?, required_uuid(&arguments, "operation")?, hosted_task(&arguments)?,
+                id, operation, task, flushed.as_ref(),
             ).await?;
             println!("{}", serde_json::to_string_pretty(&capture).expect("a capture serializes"));
             Ok(())

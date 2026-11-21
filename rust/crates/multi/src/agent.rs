@@ -292,16 +292,26 @@ impl NodeAgent {
         while self.node.catalog().is_draining(name) { tokio::time::sleep(Duration::from_millis(5)).await; }
     }
 
-    /// Flushes `database` and waits until the block that was open is adopted.
-    async fn flush_and_adopt(&self, database: &Arc<Database>) -> Result<()> {
-        let open = database.status().open_block;
-        database.flush().await?;
+    /// Flushes through the source position observed when this request started.
+    async fn flush_and_adopt(&self, database: &Arc<Database>) -> Result<i64> {
+        let required = database.latest_submitted_position()?;
         let deadline = Instant::now() + self.options.activation_timeout;
-        while database.status().adopted_block.as_ref().is_none_or(|block| block.block_index() < open) {
-            if Instant::now() > deadline { return Err(Anomaly::new(AnomalyCategory::Unavailable, "rtdb.multi/flush-timeout", "The flush did not complete in time")); }
-            tokio::time::sleep(Duration::from_millis(5)).await;
+        loop {
+            let open = database.status().open_block;
+            database.flush().await?;
+            loop {
+                if Instant::now() > deadline { return Err(Anomaly::new(AnomalyCategory::Unavailable, "rtdb.multi/flush-timeout", "The flushed block did not cover the accepted source in time")); }
+                if let Some(block) = database.status().adopted_block.filter(|block| block.block_index() >= open) {
+                    if required.0 < 0 || block.latest_source_position().is_some_and(|position| position >= required) {
+                        return Ok(block.block_index().0);
+                    }
+                    // Another flush may have closed the first block before
+                    // this request reached the source. Flush its successor.
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
         }
-        Ok(())
     }
 
     pub async fn flush(&self, name: &str) -> Result<Response> {
@@ -309,8 +319,8 @@ impl NodeAgent {
         let _turn = turn.lock().await;
         if !self.holdings.lock().contains_key(name) { return Err(Anomaly::incorrect("rtdb.multi/not-held", format!("This node does not hold {name}"))); }
         let database = self.node.catalog().database(name)?;
-        self.flush_and_adopt(&database).await?;
-        Ok(Response::Done)
+        let block = self.flush_and_adopt(&database).await?;
+        Ok(Response::Flushed { block })
     }
 
     pub async fn park(&self, name: &str) -> Result<Response> {

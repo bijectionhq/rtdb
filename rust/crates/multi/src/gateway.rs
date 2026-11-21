@@ -218,7 +218,7 @@ async fn route(directory: &Arc<dyn Directory>, name: &str, expected: Option<&str
                 return Ok((connect(&address).await?, control, record.epoch, record.id.clone()));
             }
             Ok(Response::Refused { code, message }) => last = Some(Anomaly::new(AnomalyCategory::Unavailable, code, message)),
-            Ok(Response::Done | Response::Subscribed { .. } | Response::Published { .. } | Response::Fragment { .. }) => {}
+            Ok(Response::Done | Response::Flushed { .. } | Response::Subscribed { .. } | Response::Published { .. } | Response::Fragment { .. }) => {}
             Err(error) => last = Some(error),
         }
     }

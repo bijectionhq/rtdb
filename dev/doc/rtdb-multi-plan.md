@@ -160,6 +160,10 @@ as data and its keys are never part of the capture.
 The cell's S3 root is `cell` under the configured prefix. The archive
 namespace, S3 access and disposal inventory all derive from that root.
 A remote capture registers the ECS task that owns its provider I/O.
+Before a new hosted capture, the recovery owner asks the same residence's
+holder to flush through its observed source position. It admits capture
+after the directory publishes that block or a later cut in the same
+residence. An interrupted capture retains its original directory cut.
 `verify_checkpoint_capture` opens a fresh archive admission, reads the
 witness and exact manifest, and verifies every object under the capture's
 media key. The receipt binds the supplied observation ID to the original

@@ -622,6 +622,7 @@ pub async fn capture(
     deployment: Uuid,
     operation: Uuid,
     hosted_task: Option<rtdb_directory::HostedTask>,
+    flushed: Option<&DeploymentRecord>,
 ) -> Result<Capture> {
     if deployment.is_nil() || operation.is_nil() || same_storage(storage, destination) {
         return Err(inconsistent(
@@ -655,6 +656,15 @@ pub async fn capture(
                 return Err(inconsistent("The capture operation already names another archive or lifetime"));
             }
         } else {
+            if let Some(flushed) = flushed
+                && (record.id != flushed.id || record.incarnation != flushed.incarnation
+                    || record.log_epoch != flushed.log_epoch
+                    || !record.checkpoint.zip(flushed.checkpoint).is_some_and(|(current, cut)| {
+                        current.block >= cut.block && current.source >= cut.source
+                    }))
+            {
+                return Err(inconsistent("The capture no longer reaches its flushed source cut"));
+            }
             if record.checkpoint_repair_receipts.contains_key(&operation) {
                 return Err(inconsistent("The capture operation has a repair in another residence"));
             }

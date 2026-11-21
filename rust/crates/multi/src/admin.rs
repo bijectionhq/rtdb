@@ -144,6 +144,35 @@ pub async fn ensure_held(directory: &dyn Directory, name: &str, control: &Contro
     Err(last.unwrap_or_else(|| Anomaly::new(AnomalyCategory::Unavailable, "rtdb.multi/no-node", "No node can hold this deployment")))
 }
 
+/// Ask the original installation's holder to publish through its source and
+/// retain the directory cut from that same residence.
+pub async fn flush_checkpoint(directory: &dyn Directory, original: &DeploymentRecord, control: &ControlKey) -> Result<DeploymentRecord> {
+    let holder = ensure_held(directory, &original.name, control).await?;
+    let before = record(directory, &original.name).await?;
+    let matches_original = |current: &DeploymentRecord| current.id == original.id && current.org == original.org
+        && current.incarnation == original.incarnation && current.log_epoch == original.log_epoch
+        && current.holder.as_ref() == Some(&holder);
+    if !matches_original(&before) {
+        return Err(fork_unavailable(&original.name));
+    }
+    let address = control_address(&members(directory).await?, &holder)?;
+    let unavailable = || Anomaly::new(AnomalyCategory::Unavailable, "rtdb.multi/capture-flush", "The holder did not publish an exact checkpoint in the original residence");
+    let Response::Flushed { block } = expect(
+        &address, Request::Flush { name: original.name.clone() }, control,
+    ).await? else { return Err(unavailable()); };
+    let deadline = tokio::time::Instant::now() + CONTROL_TIMEOUT;
+    loop {
+        let after = record(directory, &original.name).await?;
+        if !matches_original(&after) || after.epoch != before.epoch || tokio::time::Instant::now() > deadline {
+            return Err(unavailable());
+        }
+        if after.checkpoint.is_some_and(|cut| cut.block >= block) {
+            return Ok(after);
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+}
+
 /// A planned move: reserves the next claim for `target`, has the holder park, and has `target` claim.
 pub async fn move_deployment(directory: &dyn Directory, name: &str, target: &MemberId, control: &ControlKey) -> Result<()> {
     let members = members(directory).await?;
