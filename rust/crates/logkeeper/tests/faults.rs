@@ -2,7 +2,7 @@ mod common;
 
 use bytes::Bytes;
 use common::{Ensemble, Server, append};
-use rtdb_logkeeper::{StreamConfig, open_reader, open_writer, seal};
+use rtdb_logkeeper::{StreamConfig, drop_stream, open_reader, open_writer, seal};
 use rtdb_storage::Error;
 use rtdb_storage::log::{Log, LogOffset, LogRecord};
 use rtdb_types::{AnomalyCategory, Timestamp};
@@ -115,6 +115,41 @@ async fn a_restarted_server_keeps_its_promise_entries_and_commit() {
     assert_eq!(refused.category, AnomalyCategory::Conflict);
     assert_eq!(seal(&config(&server), 4).await.unwrap(), LogOffset(3));
     server.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_drop_is_retryable_after_one_replica_misses_it_and_survives_restart() {
+    let mut ensemble = Ensemble::start(3).await;
+    let config = ensemble.config("deleted");
+    let writer = open_writer(config.clone(), 1, CancellationToken::new()).await.unwrap();
+    append(writer.as_ref(), "erase this", 1).await;
+    let other = open_writer(ensemble.config("other"), 1, CancellationToken::new()).await.unwrap();
+    append(other.as_ref(), "keep this", 2).await;
+    drop(other);
+
+    ensemble.stop(2).await;
+    assert!(drop_stream(&config, 2).await.is_err());
+    for server in [0, 1] {
+        let dropped = ensemble.config_of(&[server], "deleted");
+        assert!(open_reader(dropped.clone(), CancellationToken::new()).await.is_err());
+        assert!(open_writer(dropped, 3, CancellationToken::new()).await.is_err());
+    }
+    let refused = writer.enqueue(Bytes::from_static(b"late"), Timestamp(3)).await.unwrap().durable().await;
+    assert!(matches!(refused, Err(Error::Deposed { epoch: 1, promised: 2 })), "{refused:?}");
+    drop(writer);
+    ensemble.restart(2).await;
+    drop_stream(&config, 2).await.unwrap();
+    for server in 0..3 {
+        ensemble.stop(server).await;
+        ensemble.restart(server).await;
+        let dropped = ensemble.config_of(&[server], "deleted");
+        assert!(open_reader(dropped.clone(), CancellationToken::new()).await.is_err());
+        assert!(open_writer(dropped, 3, CancellationToken::new()).await.is_err());
+    }
+    assert!(drop_stream(&config, 1).await.is_err());
+    drop_stream(&config, 2).await.unwrap();
+    let other = open_reader(ensemble.config("other"), CancellationToken::new()).await.unwrap();
+    assert_eq!(committed(other.as_ref()).await, ["keep this"]);
 }
 
 #[test]

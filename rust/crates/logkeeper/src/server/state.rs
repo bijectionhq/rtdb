@@ -18,6 +18,7 @@ pub enum Event {
     Append(Entry),
     Commit(i64),
     Trim(i64),
+    Drop(u64),
 }
 
 /// How a held entry's payload is kept.
@@ -50,6 +51,7 @@ pub struct Window<T> {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct StreamState<P = Bytes> {
     pub promised: u64,
+    pub dropped: bool,
     /// The epoch whose writer last brought this server up to that writer's whole history.
     pub synced: Option<u64>,
     /// Entries at or below this lsn are dropped.
@@ -73,7 +75,7 @@ fn dense(first: i64, entries: &[Entry]) -> bool {
 }
 
 impl<P> Default for StreamState<P> {
-    fn default() -> Self { Self { promised: 0, synced: None, trim: -1, commit: -1, entries: VecDeque::new() } }
+    fn default() -> Self { Self { promised: 0, dropped: false, synced: None, trim: -1, commit: -1, entries: VecDeque::new() } }
 }
 
 impl<P: Payload> StreamState<P> {
@@ -111,6 +113,9 @@ impl<P: Payload> StreamState<P> {
                 self.trim = *through;
                 self.commit = self.commit.max(*through);
             }
+            Event::Drop(epoch) => {
+                *self = Self { promised: *epoch, dropped: true, ..Self::default() };
+            }
         }
     }
 
@@ -147,6 +152,7 @@ impl<P: Payload> StreamState<P> {
     pub fn overwrite(&mut self, epoch: u64, from: i64, entries: Vec<Entry>, complete: bool, commit: i64) -> Decision {
         if epoch == 0 { return invalid("epochs start at 1"); }
         if self.promised > epoch { return Decision { events: Vec::new(), reply: self.refused() }; }
+        if self.dropped { return invalid("the stream was dropped"); }
         if from <= self.trim || from > self.last() + 1 || from <= self.commit {
             return invalid(format!("an overwrite at {from} must start above trim {} and commit {} and at most one past last {}", self.trim, self.commit, self.last()));
         }
@@ -177,17 +183,28 @@ impl<P: Payload> StreamState<P> {
 
     pub fn seal(&mut self, epoch: u64) -> Decision {
         if epoch == 0 { return invalid("epochs start at 1"); }
+        if self.dropped { return invalid("the stream was dropped"); }
         let events = (epoch > self.promised).then_some(Event::Promise(epoch)).into_iter().collect();
         self.persist(events, Self::sealed)
     }
 
     pub fn trim(&mut self, through: i64) -> Decision {
+        if self.dropped { return invalid("the stream was dropped"); }
         let events = (through > self.trim).then_some(Event::Trim(through)).into_iter().collect();
         self.persist(events, Self::accepted)
     }
 
     pub fn check(&self, epoch: u64) -> ResponseBody {
-        if self.promised > epoch { self.refused() } else { self.accepted() }
+        if self.promised > epoch { self.refused() }
+        else if self.dropped { invalid("the stream was dropped").reply }
+        else { self.accepted() }
+    }
+
+    pub fn drop_stream(&mut self, epoch: u64) -> Decision {
+        if epoch == 0 { return invalid("epochs start at 1"); }
+        if self.promised > epoch { return Decision { events: Vec::new(), reply: self.refused() }; }
+        let events = (!self.dropped).then_some(Event::Drop(epoch)).into_iter().collect();
+        self.persist(events, Self::accepted)
     }
 
     pub fn sealed(&self) -> ResponseBody {

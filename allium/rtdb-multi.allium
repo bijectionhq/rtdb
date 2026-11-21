@@ -381,6 +381,7 @@ contract LogService {
     read: (deployment: DeploymentId, from: Lsn) -> List<LogRecord>
     subscribe: (deployment: DeploymentId, from: Lsn) -> Stream<LogRecord>
     trim: (deployment: DeploymentId, through: Lsn) -> Lsn
+    drop_stream: (deployment: DeploymentId, epoch: Epoch) -> ()
 
     @invariant AppendIsConditionalOnEpochAndPosition
         -- A log server accepts an append for a deployment only if its epoch equals the server's promised epoch for that deployment, the server is synced at that epoch, and its lsn is one above the server's last.
@@ -425,6 +426,12 @@ contract LogService {
         -- The boundary must belong to this deployment's log, including when its first readable block came from a parent.
         -- A physical segment is reclaimed once every deployment's records in it are trimmed.
         -- A deployment whose tail pins a segment past log_max_retention is force-flushed (FlushOnRetention).
+
+    @invariant DroppedStreamsAreTerminal
+        -- A drop at the deletion epoch durably removes the stream from the server's readable and writable state.
+        -- Acknowledged and uncommitted entries are both released.
+        -- A dropped stream remains closed after restart and journal compaction.
+        -- An acknowledgement from every addressed replica is required before deletion advances.
 
     @invariant DurabilityIsConfiguredNotHoped
         -- Expected of the operator: each ensemble spans three availability zones, and a server acknowledges only after fsync.

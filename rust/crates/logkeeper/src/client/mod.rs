@@ -197,6 +197,29 @@ pub async fn trim(config: &StreamConfig, through: LogOffset) -> rtdb_types::Resu
     Ok(())
 }
 
+/// Fences and permanently drops the stream on every configured server.
+/// A retry at the same epoch completes the drop if a server missed the first attempt.
+pub async fn drop_stream(config: &StreamConfig, epoch: u64) -> rtdb_types::Result<()> {
+    validate(config)?;
+    if epoch == 0 { return Err(Anomaly::incorrect("rtdb.logkeeper/invalid-epoch", "epochs start at 1")); }
+    let ensemble = Ensemble::new(config.clone());
+    let mut pending: FuturesUnordered<_> = (0..ensemble.len()).map(|server| {
+        let ensemble = &ensemble;
+        async move { (server, ensemble.drop_stream(server, epoch).await) }
+    }).collect();
+    let mut failures = Vec::new();
+    while let Some((server, reply)) = pending.next().await {
+        let failure = match reply {
+            Ok(Ack::Accepted(_)) => continue,
+            Ok(Ack::Refused(refused)) => format!("promised epoch {}", refused.promised),
+            Err(error) => error.to_string(),
+        };
+        failures.push(format!("{}: {failure}", config.servers[server]));
+    }
+    if failures.is_empty() { return Ok(()); }
+    Err(Error::Remote { key: config.stream.clone(), message: format!("stream drop is incomplete: {}", failures.join("; ")) }.into())
+}
+
 impl QuorumLog {
     /// The stream's chain as this log reads it, oldest first, ending with the loglet it reads or appends to now.
     pub fn loglets(&self) -> Vec<Loglet> {

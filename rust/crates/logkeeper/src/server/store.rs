@@ -19,7 +19,7 @@ pub(crate) struct Slot {
     pub id: u64,
     pub name: String,
     pub state: Mutex<StreamState<Stored>>,
-    /// Woken when the commit lsn or trim point moves.
+    /// Woken when the commit lsn or trim point moves, or the stream is dropped.
     pub progressed: Notify,
 }
 
@@ -62,28 +62,25 @@ impl Store {
             RequestBody::Commit(commit) => (commit.stream, Box::new(move |state| state.commit(commit.epoch, commit.commit_lsn))),
             RequestBody::Seal(seal) => (seal.stream, Box::new(move |state| state.seal(seal.epoch))),
             RequestBody::Trim(trim) => (trim.stream, Box::new(move |state| state.trim(trim.through_lsn))),
+            RequestBody::DropStream(drop) => (drop.stream, Box::new(move |state| state.drop_stream(drop.epoch))),
             RequestBody::Read(_) | RequestBody::Fetch(_) | RequestBody::Check(_) => return Outcome::Now(failed("not a mutation")),
         };
         let slot = self.slot(&stream);
-        let (outcome, trimmed) = {
-            let mut state = slot.state.lock();
-            let before = (state.commit, state.trim);
-            let decision = decide(&mut state);
-            if matches!(decision.reply, ResponseBody::Refused(_) | ResponseBody::Failed(_)) { return Outcome::Now(decision.reply); }
-            let (done, durable) = oneshot::channel();
-            if self.queue.send(Work { write: Write::Events(Arc::clone(&slot), decision.events), done }).is_err() {
-                return Outcome::Now(failed("the journal has stopped"));
-            }
-            if (state.commit, state.trim) != before { slot.progressed.notify_waiters(); }
-            (Outcome::Durable(durable, decision.reply), state.trim != before.1)
-        };
-        if trimmed { self.compact_if_mostly_dead(); }
-        outcome
+        let mut state = slot.state.lock();
+        let before = (state.commit, state.trim, state.dropped);
+        let decision = decide(&mut state);
+        if matches!(decision.reply, ResponseBody::Refused(_) | ResponseBody::Failed(_)) { return Outcome::Now(decision.reply); }
+        let (done, durable) = oneshot::channel();
+        if self.queue.send(Work { write: Write::Events(Arc::clone(&slot), decision.events), done }).is_err() {
+            return Outcome::Now(failed("the journal has stopped"));
+        }
+        if (state.commit, state.trim, state.dropped) != before { slot.progressed.notify_waiters(); }
+        Outcome::Durable(durable, decision.reply)
     }
 
     /// Queues a compaction once the segments hold more than twice what the streams retain.
     /// Every stream is captured under its lock, all held together while the compaction is queued, so each capture sits exactly where it belongs in its stream's order.
-    fn compact_if_mostly_dead(&self) {
+    pub fn compact_if_mostly_dead(&self) {
         let disk = self.journal.bytes();
         if disk <= COMPACTION_SLACK_BYTES { return; }
         let slots: Vec<Arc<Slot>> = self.streams.lock().values().cloned().collect();
@@ -105,11 +102,12 @@ impl Store {
     }
 
     /// Held entries in `[from, to)`, committed or not; a selection with payloads still on disk is resolved by `entries`.
-    pub fn fetch(&self, stream: &str, from: i64, to: i64, max_entries: usize, max_bytes: usize) -> Selected {
-        let Some(slot) = self.existing(stream) else { return Selected(self.select(&StreamState::default(), from, -1, 0, 0)); };
+    pub fn fetch(&self, stream: &str, from: i64, to: i64, max_entries: usize, max_bytes: usize) -> Result<Selected, ResponseBody> {
+        let Some(slot) = self.existing(stream) else { return Ok(Selected(self.select(&StreamState::default(), from, -1, 0, 0))); };
         let state = slot.state.lock();
+        if state.dropped { return Err(failed("the stream was dropped")); }
         let to = to.saturating_sub(1).min(state.last());
-        Selected(self.select(&state, from, to, max_entries, max_bytes))
+        Ok(Selected(self.select(&state, from, to, max_entries, max_bytes)))
     }
 
     /// Reads whatever payloads a selection still needs from the segments, off the async threads.
@@ -125,10 +123,13 @@ impl Store {
 
     /// Long-polls up to `wait` for a committed entry at `from`.
     pub async fn read(&self, stream: &str, from: i64, max_entries: usize, max_bytes: usize, wait: Duration, cancellation: &CancellationToken) -> ResponseBody {
-        let read = |state: &StreamState<Stored>| Selected(self.select(state, from, state.commit, max_entries, max_bytes));
+        let read = |state: &StreamState<Stored>| {
+            if state.dropped { return Err(failed("the stream was dropped")); }
+            Ok(Selected(self.select(state, from, state.commit, max_entries, max_bytes)))
+        };
         if wait.is_zero() {
             let selected = match self.existing(stream) { Some(slot) => read(&slot.state.lock()), None => read(&StreamState::default()) };
-            return self.entries(selected).await;
+            return match selected { Ok(selected) => self.entries(selected).await, Err(reply) => reply };
         }
         let slot = self.slot(stream);
         let deadline = tokio::time::Instant::now() + wait;
@@ -136,7 +137,7 @@ impl Store {
             let progressed = slot.progressed.notified();
             tokio::pin!(progressed);
             progressed.as_mut().enable();
-            let selected = read(&slot.state.lock());
+            let selected = match read(&slot.state.lock()) { Ok(selected) => selected, Err(reply) => return reply };
             if !selected.0.items.is_empty() || from <= selected.0.trim_lsn { return self.entries(selected).await; }
             tokio::select! {
                 _ = progressed => (),
@@ -164,3 +165,42 @@ impl Selected {
 }
 
 pub(crate) fn failed(message: impl Into<String>) -> ResponseBody { ResponseBody::Failed(Failed { message: message.into() }) }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::protocol::{DropStream, Overwrite};
+    use bytes::Bytes;
+
+    #[tokio::test]
+    async fn a_drop_queued_after_an_older_compaction_schedules_reclamation_again() {
+        let directory = tempfile::tempdir().unwrap();
+        let (journal, recovered) = Journal::open(directory.path(), true, 0).unwrap();
+        let journal = Arc::new(journal);
+        let (queue, work) = mpsc::unbounded_channel();
+        let store = Arc::new(Store::new(Arc::clone(&journal), recovered, queue));
+        assert!(matches!(store.mutate(RequestBody::Overwrite(Overwrite {
+            stream: "drop-me".into(),
+            epoch: 1,
+            from_lsn: 0,
+            entries: vec![Entry { lsn: 0, epoch: 1, timestamp: 0, payload: Bytes::from(vec![1; 2 << 20]) }],
+            complete: true,
+            commit_lsn: 0,
+        })), Outcome::Durable(_, _)));
+        let slot = store.existing("drop-me").unwrap();
+        let capture = Captured { slot: Arc::clone(&slot), state: slot.state.lock().clone() };
+        assert!(journal.claim_compaction());
+        let first_compaction = Work { write: Write::Compact(vec![capture]), done: oneshot::channel().0 };
+        assert!(store.queue.send(first_compaction).is_ok());
+        let Outcome::Durable(dropped, _) = store.mutate(RequestBody::DropStream(DropStream { stream: "drop-me".into(), epoch: 2 })) else {
+            panic!("the drop was refused");
+        };
+        let task = tokio::spawn(super::super::journal::run(Arc::clone(&journal), Arc::downgrade(&store), work));
+        dropped.await.unwrap().unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while journal.bytes() >= COMPACTION_SLACK_BYTES { tokio::time::sleep(Duration::from_millis(10)).await; }
+        }).await.expect("a follow-up compaction reclaimed the drop");
+        drop(store);
+        task.await.unwrap().unwrap();
+    }
+}

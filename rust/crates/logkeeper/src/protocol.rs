@@ -127,6 +127,14 @@ pub(crate) struct Check {
     pub epoch: u64,
 }
 
+#[derive(Clone, PartialEq, Message)]
+pub(crate) struct DropStream {
+    #[prost(string, tag = "1")]
+    pub stream: String,
+    #[prost(uint64, tag = "2")]
+    pub epoch: u64,
+}
+
 #[derive(Clone, PartialEq, prost::Oneof)]
 pub(crate) enum RequestBody {
     #[prost(message, tag = "2")]
@@ -145,13 +153,15 @@ pub(crate) enum RequestBody {
     Trim(Trim),
     #[prost(message, tag = "9")]
     Check(Check),
+    #[prost(message, tag = "10")]
+    DropStream(DropStream),
 }
 
 #[derive(Clone, PartialEq, Message)]
 pub(crate) struct Request {
     #[prost(uint64, tag = "1")]
     pub id: u64,
-    #[prost(oneof = "RequestBody", tags = "2, 3, 4, 5, 6, 7, 8, 9")]
+    #[prost(oneof = "RequestBody", tags = "2, 3, 4, 5, 6, 7, 8, 9, 10")]
     pub body: Option<RequestBody>,
 }
 

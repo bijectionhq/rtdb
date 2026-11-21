@@ -7,7 +7,7 @@ use std::time::Duration;
 pub use rtdb_directory::DeletionRecord;
 use rtdb_directory::{Cas, CellMove, CellMovePhase, DeletionFacts, DeletionInventory, DeploymentRecord, MoveNamespaces, Directory, Lifecycle, MemberId, MemberPool, MemberRecord, MemberRole, MemberState, PlacementMove, StorageNamespaces, effective_holder, now_ms};
 use rtdb_logkeeper::StreamConfig;
-use rtdb_storage::log::{Log, LogOffset};
+use rtdb_storage::log::Log;
 use rtdb_types::{Anomaly, AnomalyCategory, Result};
 use tokio_util::sync::CancellationToken;
 
@@ -342,8 +342,7 @@ async fn discard_fork(bucket: &dyn rtdb_storage::ObjectStore, keys: &dyn KeyServ
     };
     let erase_tail = async {
         if let Some(stream) = stream {
-            let last = rtdb_logkeeper::seal(stream, child.epoch + 1).await?;
-            if last.0 >= 0 { rtdb_logkeeper::trim(stream, last).await?; }
+            rtdb_logkeeper::drop_stream(stream, child.epoch + 1).await?;
         }
         Ok(())
     };
@@ -550,7 +549,7 @@ async fn finish_cell_move(map: &dyn crate::cells::CellMap, from: &CellHandle<'_>
     Ok(destination)
 }
 
-/// Fences every writer, seals and trims the deployment's stream, erases its objects, and removes its key after verifying the prefix is empty.
+/// Fences every writer, drops the deployment's stream, erases its objects, and removes its key after verifying the prefix is empty.
 pub async fn delete_deployment(directory: &dyn Directory, storage: &CellStorage, keys: &dyn KeyService, name: &str, maximum_message_bytes: usize) -> Result<DeletionRecord> {
     let current = record(directory, name).await?;
     if current.lifecycle == Lifecycle::Deleted { return deletion_receipt(current); }
@@ -578,10 +577,14 @@ pub async fn delete_deployment(directory: &dyn Directory, storage: &CellStorage,
         }
     }).await?;
     if fenced.lifecycle == Lifecycle::Deleted { return deletion_receipt(fenced); }
-    let servers = replica_servers(directory, &fenced).await?;
+    let mut servers = ensemble_servers(&fenced, &members(directory).await?)?;
+    if let Some(previous) = &fenced.move_from {
+        for server in previous {
+            if !servers.contains(server) { servers.push(server.clone()); }
+        }
+    }
     let stream = StreamConfig { write_quorum: write_quorum(servers.len()), servers, stream: fenced.stream("replica"), maximum_message_bytes };
-    let last = rtdb_logkeeper::seal(&stream, fenced.epoch).await?;
-    if last.0 >= 0 { rtdb_logkeeper::trim(&stream, LogOffset(last.0)).await?; }
+    rtdb_logkeeper::drop_stream(&stream, fenced.epoch).await?;
     let others: Vec<DeploymentRecord> = directory.deployments().await?.into_iter().filter(|record| record.id != fenced.id).collect();
     let receipt = finish_deletion(bucket.as_ref(), &fenced, &others, keys).await?;
     let deleted = update(directory, name, |record| {

@@ -1,7 +1,7 @@
 mod common;
 
 use common::{Server, append};
-use rtdb_logkeeper::{ServerOptions, StreamConfig, open_reader, open_writer, seal, trim};
+use rtdb_logkeeper::{ServerOptions, StreamConfig, drop_stream, open_reader, open_writer, seal, trim};
 use rtdb_storage::Error;
 use rtdb_storage::log::{Log, LogOffset};
 use rtdb_types::AnomalyCategory;
@@ -10,7 +10,13 @@ use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 
 fn segments(data_dir: &Path) -> (usize, u64) {
-    let files: Vec<_> = std::fs::read_dir(data_dir.join("segments")).unwrap().map(|entry| entry.unwrap().metadata().unwrap().len()).collect();
+    let files: Vec<_> = std::fs::read_dir(data_dir.join("segments")).unwrap().filter_map(|entry| {
+        match entry.unwrap().metadata() {
+            Ok(metadata) => Some(metadata.len()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) => panic!("{error}"),
+        }
+    }).collect();
     (files.len(), files.iter().sum())
 }
 
@@ -32,6 +38,38 @@ async fn streams_share_segments_that_a_trim_compacts_and_a_restart_replays() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_server_caching_almost_nothing_serves_every_entry_from_its_segments_across_a_compaction_and_a_restart() {
     share_compact_and_replay(4 * 1024).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn compaction_reclaims_dropped_payloads_and_keeps_the_terminal_record() {
+    let directory = tempfile::tempdir().unwrap();
+    let server = start(directory.path(), 4 * 1024).await;
+    let dropped = config(&server, 1);
+    let writer = open_writer(dropped.clone(), 1, CancellationToken::new()).await.unwrap();
+    let other = open_writer(config(&server, 2), 1, CancellationToken::new()).await.unwrap();
+    let payload = "x".repeat(40 * 1024);
+    for position in 0..40 { append(writer.as_ref(), &payload, position).await; }
+    append(other.as_ref(), "live neighbor", 40).await;
+    drop((writer, other));
+
+    let before = segments(directory.path()).1;
+    drop_stream(&dropped, 2).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let (count, bytes) = segments(directory.path());
+            if count == 1 && bytes < before / 2 { return; }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }).await.expect("the shared journal reclaims the dropped stream's payloads");
+    server.stop().await;
+
+    let server = start(directory.path(), 4 * 1024).await;
+    let dropped = config(&server, 1);
+    assert!(open_reader(dropped.clone(), CancellationToken::new()).await.is_err());
+    assert!(open_writer(dropped, 3, CancellationToken::new()).await.is_err());
+    let other = open_reader(config(&server, 2), CancellationToken::new()).await.unwrap();
+    assert_eq!(payloads(other.as_ref(), 0).await, ["live neighbor"]);
+    server.stop().await;
 }
 
 async fn share_compact_and_replay(cache_bytes: usize) {

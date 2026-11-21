@@ -7,7 +7,7 @@
 
 use super::payload::{Cache, Item, Location, Source, Stored};
 use super::state::{Event, StreamState, Window};
-use super::store::Slot;
+use super::store::{Slot, Store};
 use crate::protocol::{Entries, Entry};
 use bytes::{BufMut, Bytes, BytesMut};
 use fs2::FileExt;
@@ -19,7 +19,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{BufReader, Write as _};
 use std::os::unix::fs::FileExt as _;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use tokio::sync::{mpsc, oneshot};
 
@@ -62,13 +62,15 @@ enum Kind {
     /// The first record of a base segment: every earlier segment is superseded.
     #[prost(bool, tag = "10")]
     Base(bool),
+    #[prost(uint64, tag = "11")]
+    Drop(u64),
 }
 
 #[derive(Clone, PartialEq, Message)]
 struct Record {
     #[prost(uint64, tag = "9")]
     stream: u64,
-    #[prost(oneof = "Kind", tags = "1, 2, 3, 4, 5, 6, 7, 8, 10")]
+    #[prost(oneof = "Kind", tags = "1, 2, 3, 4, 5, 6, 7, 8, 10, 11")]
     kind: Option<Kind>,
 }
 
@@ -80,6 +82,7 @@ fn record(event: &Event) -> Kind {
         Event::Append(entry) => Kind::Append(entry.clone()),
         Event::Commit(lsn) => Kind::Commit(*lsn),
         Event::Trim(through) => Kind::Trim(*through),
+        Event::Drop(epoch) => Kind::Drop(*epoch),
     }
 }
 
@@ -351,7 +354,12 @@ impl Journal {
         for stream in captured {
             let (id, state) = (stream.slot.id, &stream.state);
             frame(id, Kind::Declare(stream.slot.name.clone()), &mut buffer);
-            frame(id, Kind::Snapshot(Snapshot { promised: state.promised, synced: state.synced.unwrap_or(0), trim: state.trim, commit: state.commit }), &mut buffer);
+            let summary = if state.dropped {
+                Kind::Drop(state.promised)
+            } else {
+                Kind::Snapshot(Snapshot { promised: state.promised, synced: state.synced.unwrap_or(0), trim: state.trim, commit: state.commit })
+            };
+            frame(id, summary, &mut buffer);
             let mut locations = Vec::with_capacity(state.entries.len());
             for (held, lsn) in state.entries.iter().zip(state.trim + 1..) {
                 let payload = match &held.payload {
@@ -481,7 +489,7 @@ impl Replay {
             match kind {
                 Kind::Declare(_) | Kind::Base(_) => unreachable!("handled above"),
                 Kind::Snapshot(snapshot) => {
-                    *state = StreamState { promised: snapshot.promised, synced: (snapshot.synced != 0).then_some(snapshot.synced), trim: snapshot.trim, commit: snapshot.commit, entries: Default::default() };
+                    *state = StreamState { promised: snapshot.promised, synced: (snapshot.synced != 0).then_some(snapshot.synced), trim: snapshot.trim, commit: snapshot.commit, ..StreamState::default() };
                 }
                 Kind::Promise(epoch) => state.apply(&Event::Promise(epoch)),
                 Kind::Synced(epoch) => state.apply(&Event::Synced((epoch != 0).then_some(epoch))),
@@ -495,6 +503,7 @@ impl Replay {
                 }
                 Kind::Commit(lsn) => state.apply(&Event::Commit(lsn)),
                 Kind::Trim(through) => state.apply(&Event::Trim(through)),
+                Kind::Drop(epoch) => state.apply(&Event::Drop(epoch)),
             }
         }
         Ok((position, length))
@@ -515,7 +524,7 @@ fn next_record(bytes: &Bytes, position: &mut usize) -> Option<Record> {
 }
 
 /// Group commit: whatever has queued while the previous round was syncing goes into the next round together, across every stream.
-pub(crate) async fn run(journal: Arc<Journal>, mut queue: mpsc::UnboundedReceiver<Work>) -> Result<()> {
+pub(crate) async fn run(journal: Arc<Journal>, store: Weak<Store>, mut queue: mpsc::UnboundedReceiver<Work>) -> Result<()> {
     const MAXIMUM_ROUND: usize = 8192;
     while let Some(first) = queue.recv().await {
         let mut works = vec![first];
@@ -529,7 +538,17 @@ pub(crate) async fn run(journal: Arc<Journal>, mut queue: mpsc::UnboundedReceive
             (works, result)
         }).await.map_err(|error| Anomaly::fault("rtdb.logkeeper/journal-task", error.to_string()))?;
         match result {
-            Ok(()) => for work in works { let _ = work.done.send(Ok(())); },
+            Ok(()) => {
+                let mut released = false;
+                for work in works {
+                    match &work.write {
+                        Write::Events(_, events) => released |= events.iter().any(|event| matches!(event, Event::Trim(_) | Event::Drop(_))),
+                        Write::Compact(_) => released = false,
+                    }
+                    let _ = work.done.send(Ok(()));
+                }
+                if released && let Some(store) = store.upgrade() { store.compact_if_mostly_dead(); }
+            }
             Err(error) => {
                 for work in works { let _ = work.done.send(Err(error.to_string())); }
                 queue.close();

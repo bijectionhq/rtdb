@@ -39,8 +39,10 @@ pub async fn serve(listener: TcpListener, options: ServerOptions, cancellation: 
     let (journal, recovered) = opened?;
     let journal = Arc::new(journal);
     let (queue, work) = mpsc::unbounded_channel();
+    let has_dropped_streams = recovered.iter().any(|stream| stream.state.dropped);
     let store = Arc::new(Store::new(Arc::clone(&journal), recovered, queue));
-    let mut journal_task = tokio::spawn(journal::run(journal, work));
+    if has_dropped_streams { store.compact_if_mostly_dead(); }
+    let mut journal_task = tokio::spawn(journal::run(journal, Arc::downgrade(&store), work));
     let connections = TaskTracker::new();
     let stopping = cancellation.child_token();
     let result = loop {
@@ -78,9 +80,9 @@ async fn connection(socket: TcpStream, store: Arc<Store>, tasks: TaskTracker, ca
         match request.body {
             None => { let _ = replies.send(reply(failed("a request without a body"))); }
             Some(RequestBody::Fetch(fetch)) => {
-                match store.fetch(&fetch.stream, fetch.from_lsn, fetch.to_lsn, fetch.max_entries as usize, fetch.max_bytes as usize).ready() {
-                    Ok(body) => { let _ = replies.send(reply(body)); }
-                    Err(selected) => {
+                match store.fetch(&fetch.stream, fetch.from_lsn, fetch.to_lsn, fetch.max_entries as usize, fetch.max_bytes as usize).map(|selected| selected.ready()) {
+                    Ok(Ok(body)) | Err(body) => { let _ = replies.send(reply(body)); }
+                    Ok(Err(selected)) => {
                         let (store, replies) = (Arc::clone(&store), replies.clone());
                         tasks.spawn(async move {
                             let body = store.entries(selected).await;

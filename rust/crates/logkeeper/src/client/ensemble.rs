@@ -2,7 +2,7 @@
 
 use super::connection::{Connection, connection, remote};
 use super::StreamConfig;
-use crate::protocol::{Accepted, Check, Commit, Entries, Entry, Fetch, Overwrite, Read, Refused, RequestBody, ResponseBody, Seal, Sealed, Trim};
+use crate::protocol::{Accepted, Check, Commit, DropStream, Entries, Entry, Fetch, Overwrite, Read, Refused, RequestBody, ResponseBody, Seal, Sealed, Trim};
 use rtdb_storage::{Error, Result};
 use std::sync::Arc;
 use std::time::Duration;
@@ -63,6 +63,11 @@ impl Ensemble {
 
     pub async fn trim(&self, server: usize, through: i64) -> Result<Ack> {
         let reply = self.links[server].call(RequestBody::Trim(Trim { stream: self.stream(), through_lsn: through })).await;
+        self.ack(server, reply)
+    }
+
+    pub async fn drop_stream(&self, server: usize, epoch: u64) -> Result<Ack> {
+        let reply = self.links[server].call(RequestBody::DropStream(DropStream { stream: self.stream(), epoch })).await;
         self.ack(server, reply)
     }
 

@@ -506,6 +506,13 @@ Deletion must be provable and forks must be cheap (spec rules `Fork`, `ForkAcros
 2. `Lineage` records with a version bumped by every fork and deletion.
 3. Fork: a new record in the lineage with a fork checkpoint referencing the parent's objects plus one pack of the parent's tail to the fork basis; inherited reads capped at the fork basis; cross-organisation forks copied and re-encrypted.
 4. Deletion: fence by epoch bump, seal and drop the stream, wait `credential_ttl`, re-wrap shared objects to a surviving referrer, delete all versions, prove the prefix empty twice, destroy the key, sign the deletion record.
+   The delete command durably drops the stream from every member of its current ensemble and any pending source ensemble before proceeding to object erasure.
+   A missing replica leaves the deployment fenced in `deleting`.
+   Retry after the replica returns.
+   A terminal logkeeper record prevents reopening the stream after restart.
+   Shared journal segments reclaim dropped payloads during compaction.
+   All logkeepers must support the drop operation before using this deletion path, and binaries predating it cannot open a journal containing its record.
+   Retired ensembles and replacement ensembles copied to before their membership CAS still need tracked cleanup.
    The current deletion path keeps a deployment in `deleting` for retry if objects remain.
    After an empty current inventory and local key destruction, it signs a receipt with the key service's Ed25519 signing key and stores it with the tombstone in one directory CAS.
    Retrying a completed deletion returns the stored receipt.
