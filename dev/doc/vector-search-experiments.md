@@ -79,3 +79,56 @@ done
 The downloaded GloVe data used for the run has SHA-256 `544af1d5e84e112cd4749571dcfd8ca109818a572f850af75a3a09e093a953c4`.
 The run uses the first twelve held-out queries and independently trains 512 centroids for each size.
 The dataset and generated binary files stay in the ignored build directory.
+
+The experiment loads the primary table and centroid index from the same fixed input.
+It does not yet publish an ANN generation through the replica log.
+The index retains the fixture's valid-time point and captured flushed frontier.
+It scores additional puts discovered in the actual live segment and reranks the union against the captured SQL snapshot.
+The primary scan removes stale or erased candidates and reapplies the current filter.
+A different valid-time point, an advanced flushed frontier, a transaction overlay, or a tail over 1,024 events takes the exact SQL path.
+A production generation would need a covered valid-time interval or an explicit schedule of validity boundaries, and durable publication and retirement tied to existing snapshot references.
+An erase must eventually retire the vector bytes as well as removing the row from search results.
+
+## Release measurements
+
+The measurements use an Apple M4 Max, a locked Rust release build, and 100-dimensional GloVe vectors.
+Primary table queries ran against the same captured snapshots and local in-memory primary storage.
+The exact paths alternate order for each query.
+Latency cells show p50 / p95 in milliseconds.
+p95 is nearest rank and equals the largest of the twelve per-query samples.
+Cold ANN latency includes probing, local range reads and SQL reranking.
+Only the ANN object is cold, and its range counts exclude primary table reads.
+
+### 100,000 embeddings
+
+All 60 paired exact SQL queries matched and all five temporal checks passed.
+Each ANN configuration returned the same rows with a fresh and a fully warmed ANN buffer pool.
+The table load took 10.76 s, building the two ordered indexes took 82.35 s, and packing and publishing the centroid ranges took 0.61 s after offline training.
+The packed object occupied 40,400,000 bytes.
+The live insert took 1.49 ms and wrote zero bytes to that object.
+
+| Filter | Exact scan | Ordered acceleration enabled |
+| --- | ---: | ---: |
+| None | 2,730.30 / 3,263.24 | 2,732.52 / 3,371.70 |
+| Random, ~0.1% | 495.05 / 792.86 | 26.69 / 132.00 |
+| Random, ~1% | 836.34 / 1,243.31 | 44.12 / 133.83 |
+| Random, ~10% | 912.21 / 1,547.71 | 355.15 / 538.54 |
+| Whole clusters, ~1% | 773.30 / 1,341.49 | 66.52 / 147.90 |
+
+| Filter | Probes | Warm ANN | Cold ANN | Mean recall@10 | Below exact result count | Cold range reads / MiB, p50 |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| None | 8 | 24.40 / 170.45 | 35.73 / 115.54 | 57.5% | 0 / 12 | 8 / 0.74 |
+| None | 32 | 21.09 / 68.53 | 64.69 / 163.31 | 79.2% | 0 / 12 | 32 / 2.71 |
+| Random, ~0.1% | 8 | 0.48 / 17.90 | 5.85 / 32.83 | 10.8% | 12 / 12 | 8 / 0.74 |
+| Random, ~0.1% | 32 | 2.78 / 69.27 | 31.90 / 69.07 | 26.7% | 9 / 12 | 32 / 2.71 |
+| Random, ~1% | 8 | 3.94 / 69.46 | 41.21 / 190.16 | 17.5% | 2 / 12 | 8 / 0.74 |
+| Random, ~1% | 32 | 33.43 / 99.71 | 32.44 / 163.31 | 42.5% | 0 / 12 | 32 / 2.71 |
+| Random, ~10% | 8 | 12.55 / 116.52 | 47.52 / 204.94 | 42.5% | 0 / 12 | 8 / 0.74 |
+| Random, ~10% | 32 | 26.10 / 142.31 | 57.46 / 96.01 | 63.3% | 0 / 12 | 32 / 2.71 |
+| Whole clusters, ~1% | 8 | 18.06 / 118.86 | 65.33 / 147.66 | 100% | 0 / 12 | 6 / 0.47 |
+| Whole clusters, ~1% | 32 | 11.78 / 139.76 | 53.79 / 223.86 | 100% | 0 / 12 | 6 / 0.47 |
+
+At 32 probes the unfiltered worst query recalled 40% of its exact top 10.
+The ~1% random filter filled all twelve pages at that probe budget and still recalled only 42.5% on average.
+Result count alone is therefore an inadequate signal that the search has covered a filter.
+The whole-cluster predicate could open every qualifying cluster within eight probes.
