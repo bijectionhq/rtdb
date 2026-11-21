@@ -1,6 +1,7 @@
 //! The RTDB multi cell processes.
 
 use std::collections::BTreeMap;
+use std::io::Write;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -93,26 +94,29 @@ fn required_uuid(arguments: &Arguments, name: &str) -> Result<uuid::Uuid> {
 
 async fn run(arguments: Vec<String>) -> Result<()> {
     let Some((command, rest)) = arguments.split_first() else { print!("{HELP}"); return Ok(()); };
+    if command == "--build-info" {
+        if !rest.is_empty() {
+            return Err(usage("--build-info accepts no arguments".into()));
+        }
+        #[derive(serde::Serialize)]
+        struct MultiBuildInfo {
+            #[serde(flatten)]
+            provenance: rtdb_types::BuildInfo,
+            standalone_protocol: u32,
+        }
+        let report = MultiBuildInfo {
+            provenance: rtdb_types::compiled_build_info(),
+            standalone_protocol: process::STANDALONE_PROTOCOL,
+        };
+        let mut output = std::io::stdout().lock();
+        serde_json::to_writer(&mut output, &report).map_err(|error| io(std::io::Error::other(error)))?;
+        use std::io::Write as _;
+        return writeln!(output).map_err(io);
+    }
     let arguments = Arguments::parse(rest)?;
     let cancellation = CancellationToken::new();
     { let cancellation = cancellation.clone(); tokio::spawn(async move { shutdown_signal().await; cancellation.cancel(); }); }
     match command.as_str() {
-        "--build-info" => {
-            #[derive(serde::Serialize)]
-            struct MultiBuildInfo {
-                #[serde(flatten)]
-                provenance: rtdb_types::BuildInfo,
-                standalone_protocol: u32,
-            }
-            let report = MultiBuildInfo {
-                provenance: rtdb_types::compiled_build_info(),
-                standalone_protocol: process::STANDALONE_PROTOCOL,
-            };
-            let mut output = std::io::stdout().lock();
-            serde_json::to_writer(&mut output, &report).map_err(|error| io(std::io::Error::other(error)))?;
-            use std::io::Write as _;
-            writeln!(output).map_err(io)
-        }
         "help" | "--help" | "-h" => { print!("{HELP}"); Ok(()) }
         "initialize-standalone" => {
             process::initialize_standalone(std::path::Path::new(arguments.required("state")?), arguments.required("name")?, installation_id(&arguments)?).await
