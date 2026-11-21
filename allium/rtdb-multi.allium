@@ -389,6 +389,10 @@ contract LogService {
         -- A replacement must reacquire the journal and obtain a new lease after the prior lease ends.
         -- A stable advertised address remains reserved for that journal.
 
+    @invariant LocalJournalHasProcessBoundTransport
+        -- A standalone authority addresses its journal by the retained journal ID.
+        -- Only the process holding the journal can reach that transport.
+
     @invariant CommitIsAWriteQuorum
         -- A record is committed when write_quorum of its loglet's ensemble have made it durable.
         -- Only committed records are acknowledged to a writer, applied visibly, or served to a reader.

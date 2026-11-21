@@ -240,24 +240,37 @@ fn write_member_id(data_dir: &Path, path: &Path, identity: &str, fsync: bool) ->
     sync_directory(data_dir, fsync)
 }
 
+pub(super) enum MemberIdentity<'a> {
+    Open(&'a str),
+    Reopen(&'a str),
+}
+
 impl Journal {
     /// Replays the segments from the last base on, deleting any earlier ones a crash left behind, and opens the last for appending.
     pub fn open(
         data_dir: &Path,
         fsync: bool,
         cache_bytes: usize,
-        new_member_id: Option<&str>,
+        member: Option<MemberIdentity<'_>>,
     ) -> Result<(Self, Vec<Recovered>, Option<String>)> {
         let segments = data_dir.join("segments");
-        fs::create_dir_all(&segments).map_err(|error| io_error(&segments, error))?;
+        if !matches!(member, Some(MemberIdentity::Reopen(_))) {
+            fs::create_dir_all(&segments).map_err(|error| io_error(&segments, error))?;
+        }
         let lock_path = data_dir.join("LOCK");
         let lock = OpenOptions::new().create(true).truncate(false).write(true).open(&lock_path).map_err(|error| io_error(&lock_path, error))?;
         lock.try_lock_exclusive().map_err(|error| io_error(&lock_path, error))?;
         let files = list_segments(&segments)?;
         let member_path = data_dir.join("MEMBER");
         let mut identity = None;
-        if let Some(candidate) = new_member_id {
+        if let Some(ref mode) = member {
+            let candidate = match mode {
+                MemberIdentity::Open(candidate) | MemberIdentity::Reopen(candidate) => candidate,
+            };
             identity = read_member_id(&member_path, candidate.len())?;
+            if matches!(mode, MemberIdentity::Reopen(_)) && identity.as_deref() != Some(*candidate) {
+                return Err(corrupt(&member_path, "the original journal member identity is missing or different"));
+            }
             if identity.is_some() && files.is_empty() {
                 return Err(corrupt(&member_path, "the installed journal has lost its segments"));
             }
@@ -304,7 +317,7 @@ impl Journal {
         let declared = replay.names.keys().copied().collect();
         let next_id = replay.names.keys().max().map_or(0, |id| id + 1);
         let recovered = replay.names.into_iter().map(|(id, name)| Recovered { id, name, state: replay.states.remove(&id).unwrap_or_default() }).collect();
-        if let Some(candidate) = new_member_id.filter(|_| identity.is_none()) {
+        if let Some(MemberIdentity::Open(candidate)) = member && identity.is_none() {
             if fsync { rtdb_storage::sync_file(&file).map_err(|error| io_error(&path, error))?; }
             sync_directory(&segments, fsync)?;
             write_member_id(data_dir, &member_path, candidate, fsync)?;
@@ -680,12 +693,11 @@ mod tests {
     fn an_installed_member_rejects_missing_segments() {
         let directory = tempfile::tempdir().unwrap();
         let first = "c2a4eba6-83a7-455d-a1c1-b80c5cf5f2ba";
-        let next = "33c40ad8-37ef-45dc-ab8b-5a9198b4a7aa";
-        let (journal, _, identity) = Journal::open(directory.path(), true, 0, Some(first)).unwrap();
+        let (journal, _, identity) = Journal::open(directory.path(), true, 0, Some(MemberIdentity::Open(first))).unwrap();
         assert_eq!(identity.as_deref(), Some(first));
         drop(journal);
         fs::remove_dir_all(directory.path().join("segments")).unwrap();
-        assert!(Journal::open(directory.path(), true, 0, Some(next)).is_err());
+        assert!(Journal::open(directory.path(), true, 0, Some(MemberIdentity::Reopen(first))).is_err());
     }
 
     #[test]

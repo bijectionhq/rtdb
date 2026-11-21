@@ -1,5 +1,9 @@
 //! Assembling the cell's processes: a node (server, agent, lease, control listener) and a logkeeper (server and lease).
 
+mod standalone;
+
+pub use standalone::{StandaloneSettings, initialize_standalone, serve_standalone};
+
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;

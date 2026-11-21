@@ -166,6 +166,13 @@ Retain the archive while an installation uses it.
 - Found reviewing the branch: a reconnection's capability named the user the client claimed rather than the principal its holder authenticated, and the control port served a deployment's rows, and published compactions, for anyone who could reach it.
 - Found reviewing the branch: the control protocol authenticated nothing; in a cell with a secret every control request is now signed with it.
 
+Standalone RTDB uses the same ordered journal and authorized PgWire gateway on one machine.
+`initialize-standalone` creates the original directory, journal and key in a private empty directory supplied by the caller.
+A successful initialization records the deployment UUID, journal ID and key digest.
+`standalone` requires those original records and starts a loopback TLS gateway using a supplied certificate, private key and password file.
+The journal accepts connections only inside the standalone process.
+The gateway reports its bound port and installation UUID in the caller's private readiness file.
+
 ## 1. Ground rules
 
 - **Classic mode stays.**

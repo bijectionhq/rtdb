@@ -32,14 +32,11 @@ pub async fn install_deployment(
     org: &str,
     replicas: usize,
 ) -> Result<DeploymentRecord> {
-    if id.is_nil() || !valid_installation_name(name) || !valid_installation_name(org) || replicas == 0 {
-        return Err(Anomaly::incorrect("rtdb.multi/install-identity", "Invalid deployment installation identity or ensemble size"));
+    if replicas == 0 {
+        return Err(Anomaly::incorrect("rtdb.multi/install-identity", "The installation needs a logkeeper ensemble"));
     }
-    let id = id.to_string();
-    let mut installation = DeploymentRecord::new(name, org, Vec::new(), now_ms());
-    installation.id = id.clone();
-    installation.lineage = installation.id.clone();
-    installation.linearizable_reads = true;
+    let mut installation = installation_record(id, name, org)?;
+    let id = installation.id.clone();
     let confirm = |installed: DeploymentRecord| {
         if installed.id == id && installed.org == org && installed.parent.is_none()
             && installed.linearizable_reads && matches!(installed.lifecycle, Lifecycle::Live | Lifecycle::Quarantined)
@@ -61,6 +58,17 @@ pub async fn install_deployment(
             Ok(None) | Err(_) => Err(error),
         },
     }
+}
+
+pub(crate) fn installation_record(id: uuid::Uuid, name: &str, org: &str) -> Result<DeploymentRecord> {
+    if id.is_nil() || !valid_installation_name(name) || !valid_installation_name(org) {
+        return Err(Anomaly::incorrect("rtdb.multi/install-identity", "Invalid deployment installation identity"));
+    }
+    let mut installation = DeploymentRecord::new(name, org, Vec::new(), now_ms());
+    installation.id = id.to_string();
+    installation.lineage = installation.id.clone();
+    installation.linearizable_reads = true;
+    Ok(installation)
 }
 
 fn valid_installation_name(part: &str) -> bool {

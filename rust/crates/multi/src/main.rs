@@ -14,6 +14,8 @@ use tokio_util::sync::CancellationToken;
 
 const HELP: &str = "RTDB multi\n\n\
 Usage: rtdb-multi initialize-directory --state PATH\n\
+       rtdb-multi initialize-standalone --state PATH --name NAME --id UUID\n\
+       rtdb-multi standalone --state PATH --name NAME --id UUID --certificate FILE --private-key FILE --password-file FILE --ready-file FILE\n\
        rtdb-multi directory --state PATH --listen ADDR\n\
        rtdb-multi logkeeper --directory DIR --listen ADDR --data PATH [--advertise-host HOST] [--zone ZONE] [--cache-bytes BYTES] [--no-fsync]\n\
        rtdb-multi node --directory DIR --storage-root PATH --keys PATH --cache PATH [--config FILE] [--control ADDR] [--advertise-host HOST] [--zone ZONE] [--park-after SECONDS] [--max-active N] [--max-tail-rows N] [--isolation | --compaction-worker] [--no-local-compaction] [--memory-limit BYTES] [--cell-secret FILE]\n\
@@ -95,6 +97,20 @@ async fn run(arguments: Vec<String>) -> Result<()> {
     { let cancellation = cancellation.clone(); tokio::spawn(async move { shutdown_signal().await; cancellation.cancel(); }); }
     match command.as_str() {
         "help" | "--help" | "-h" => { print!("{HELP}"); Ok(()) }
+        "initialize-standalone" => {
+            process::initialize_standalone(std::path::Path::new(arguments.required("state")?), arguments.required("name")?, installation_id(&arguments)?).await
+        }
+        "standalone" => {
+            process::serve_standalone(process::StandaloneSettings {
+                root: arguments.required("state")?.into(),
+                name: arguments.required("name")?.into(),
+                id: installation_id(&arguments)?,
+                certificate: arguments.required("certificate")?.into(),
+                private_key: arguments.required("private-key")?.into(),
+                password_file: arguments.required("password-file")?.into(),
+                ready_file: arguments.required("ready-file")?.into(),
+            }, cancellation).await
+        }
         "initialize-directory" => MemoryDirectory::initialize(std::path::Path::new(arguments.required("state")?)),
         "directory" => {
             let directory = MemoryDirectory::open(std::path::Path::new(arguments.required("state")?))?;

@@ -5,15 +5,16 @@ mod payload;
 pub(crate) mod state;
 mod store;
 
+use crate::local::LocalListener;
 use crate::protocol::{Request, RequestBody, Response, ResponseBody, read_frame, encode_frame};
 use bytes::BytesMut;
-use journal::Journal;
+use journal::{Journal, MemberIdentity};
 use rtdb_types::{Anomaly, AnomalyCategory, Result};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 use store::{Outcome, Store, failed};
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, DuplexStream};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
@@ -39,25 +40,41 @@ pub struct PreparedJournal {
 
 impl PreparedJournal {
     pub async fn open(options: ServerOptions) -> Result<Self> {
-        Ok(Self::open_with_identity(options, None).await?.0)
+        Ok(Self::open_with_identity(options, None, false).await?.0)
     }
 
     /// Opens a member journal and recovers its ID before it can be advertised.
     pub async fn open_for_member(options: ServerOptions, candidate: String) -> Result<(Self, String)> {
-        let (journal, identity) = Self::open_with_identity(options, Some(candidate)).await?;
+        let (journal, identity) = Self::open_with_identity(options, Some(candidate), false).await?;
         let identity = identity.ok_or_else(|| Anomaly::fault("rtdb.logkeeper/identity", "The opened journal did not retain a member ID"))?;
         Ok((journal, identity))
     }
 
-    async fn open_with_identity(options: ServerOptions, candidate: Option<String>) -> Result<(Self, Option<String>)> {
-        let (journal, recovered, identity) = tokio::task::spawn_blocking(move ||
-            Journal::open(&options.data_dir, options.fsync, options.cache_bytes, candidate.as_deref()))
-            .await.map_err(|error| Anomaly::fault("rtdb.logkeeper/recovery", error.to_string()))??;
+    /// Requires the retained journal identity before replay or registration.
+    pub async fn reopen_member(options: ServerOptions, expected: String) -> Result<Self> {
+        Ok(Self::open_with_identity(options, Some(expected), true).await?.0)
+    }
+
+    async fn open_with_identity(
+        options: ServerOptions,
+        identity: Option<String>,
+        reopen: bool,
+    ) -> Result<(Self, Option<String>)> {
+        let (journal, recovered, identity) = tokio::task::spawn_blocking(move || {
+            let member = identity.as_deref().map(|id| {
+                if reopen { MemberIdentity::Reopen(id) } else { MemberIdentity::Open(id) }
+            });
+            Journal::open(&options.data_dir, options.fsync, options.cache_bytes, member)
+        }).await.map_err(|error| Anomaly::fault("rtdb.logkeeper/recovery", error.to_string()))??;
         Ok((Self { journal, recovered }, identity))
     }
 
     pub async fn serve(self, listener: TcpListener, cancellation: CancellationToken) -> Result<()> {
-        serve_prepared(listener, self, cancellation).await
+        serve_prepared(Listener::Tcp(listener), self, cancellation).await
+    }
+
+    pub async fn serve_local(self, listener: LocalListener, cancellation: CancellationToken) -> Result<()> {
+        serve_prepared(Listener::Local(listener), self, cancellation).await
     }
 }
 
@@ -67,7 +84,26 @@ pub async fn serve(listener: TcpListener, options: ServerOptions, cancellation: 
     PreparedJournal::open(options).await?.serve(listener, cancellation).await
 }
 
-async fn serve_prepared(listener: TcpListener, opened: PreparedJournal, cancellation: CancellationToken) -> Result<()> {
+enum Listener {
+    Tcp(TcpListener),
+    Local(LocalListener),
+}
+
+enum Socket {
+    Tcp(TcpStream),
+    Local(DuplexStream),
+}
+
+impl Listener {
+    async fn accept(&mut self) -> std::io::Result<Socket> {
+        match self {
+            Self::Tcp(listener) => listener.accept().await.map(|(socket, _)| Socket::Tcp(socket)),
+            Self::Local(listener) => listener.accept().await.map(Socket::Local),
+        }
+    }
+}
+
+async fn serve_prepared(mut listener: Listener, opened: PreparedJournal, cancellation: CancellationToken) -> Result<()> {
     let PreparedJournal { journal, recovered } = opened;
     let journal = Arc::new(journal);
     let (queue, work) = mpsc::unbounded_channel();
@@ -80,7 +116,15 @@ async fn serve_prepared(listener: TcpListener, opened: PreparedJournal, cancella
             _ = cancellation.cancelled() => break Ok(()),
             result = &mut journal_task => break result.map_err(|error| Anomaly::fault("rtdb.logkeeper/journal-task", error.to_string())).and_then(|result| result.and(Err(Anomaly::fault("rtdb.logkeeper/journal-stopped", "the journal stopped")))),
             accepted = listener.accept() => match accepted {
-                Ok((socket, _)) => { connections.spawn(connection(socket, Arc::clone(&store), connections.clone(), stopping.clone())); }
+                Ok(Socket::Tcp(socket)) => {
+                    let _ = socket.set_nodelay(true);
+                    let (reader, writer) = socket.into_split();
+                    connections.spawn(connection(reader, writer, Arc::clone(&store), connections.clone(), stopping.clone()));
+                }
+                Ok(Socket::Local(socket)) => {
+                    let (reader, writer) = tokio::io::split(socket);
+                    connections.spawn(connection(reader, writer, Arc::clone(&store), connections.clone(), stopping.clone()));
+                }
                 Err(error) => break Err(Anomaly::new(AnomalyCategory::Unavailable, "rtdb.logkeeper/accept", error.to_string())),
             },
         }
@@ -95,9 +139,13 @@ async fn serve_prepared(listener: TcpListener, opened: PreparedJournal, cancella
 }
 
 /// One task reads and decides, another writes replies; a reply that waits on durability or a long poll gets a short-lived task of its own.
-async fn connection(socket: TcpStream, store: Arc<Store>, tasks: TaskTracker, cancellation: CancellationToken) {
-    let _ = socket.set_nodelay(true);
-    let (mut reader, writer) = socket.into_split();
+async fn connection(
+    mut reader: impl AsyncRead + Unpin,
+    writer: impl AsyncWrite + Unpin + Send + 'static,
+    store: Arc<Store>,
+    tasks: TaskTracker,
+    cancellation: CancellationToken,
+) {
     let (replies, outbox) = mpsc::unbounded_channel::<Response>();
     let writing = tasks.spawn(write_replies(writer, outbox));
     loop {
@@ -156,7 +204,7 @@ async fn connection(socket: TcpStream, store: Arc<Store>, tasks: TaskTracker, ca
     let _ = writing.await;
 }
 
-async fn write_replies(mut writer: tokio::net::tcp::OwnedWriteHalf, mut outbox: mpsc::UnboundedReceiver<Response>) {
+async fn write_replies(mut writer: impl AsyncWrite + Unpin, mut outbox: mpsc::UnboundedReceiver<Response>) {
     let mut buffer = BytesMut::new();
     while let Some(reply) = outbox.recv().await {
         encode_frame(&reply, &mut buffer);
