@@ -534,6 +534,26 @@ async fn an_activation_parks_a_cold_holding_under_execution_memory_pressure() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn memory_reclamation_respects_a_holdings_minimum_residency() {
+    let cell = Cell::start_with_minimum_residency(Duration::from_secs(60)).await;
+    let node = cell.node(0);
+    for name in ["recent", "next"] {
+        admin::create_deployment(cell.directory.as_ref(), name, "acme", 3).await.unwrap();
+    }
+    assert!(matches!(node.agent.activate("recent").await.unwrap(), Response::Held { .. }));
+    let memory = node.server.node().memory();
+    let pressure = memory.reserve(memory.limit_bytes() - memory.limit_bytes() / 5).unwrap();
+    let error = node.agent.activate("next").await.unwrap_err();
+    assert_eq!(error.code, "rtdb.multi/node-under-pressure");
+    assert_eq!(cell.holder("recent").await, Some(0));
+    assert_eq!(cell.holder("next").await, None);
+    node.agent.park("recent").await.unwrap();
+    assert_eq!(cell.holder("recent").await, None);
+    drop(pressure);
+    cell.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn cold_claims_share_a_node_activation_limit_while_warm_access_continues() {
     let cell = Cell::start_rate_limited(std::num::NonZeroUsize::MIN).await;
     for name in ["first", "second"] {

@@ -82,6 +82,10 @@ impl Cell {
         Self::start_configured(None, vec![MemberPool::General], None, None, None, true, |agent| agent.clean_after_idle = delay).await
     }
 
+    pub async fn start_with_minimum_residency(minimum: Duration) -> Self {
+        Self::start_configured(None, vec![MemberPool::General], None, None, None, true, |agent| agent.min_residency = minimum).await
+    }
+
     pub async fn start_scoped(objects: CellStorage, role: rtdb_multi::agent::S3WriteRole) -> Self {
         Self::start_configured(Some(objects), vec![MemberPool::General; 2], None, None, None, true, |agent| agent.s3_write_role = Some(role)).await
     }

@@ -676,7 +676,9 @@ A parked deployment must cost nothing but its record and objects (`CostFollowsAc
    It can park a holding with an open session when older holdings do not release enough memory.
    Gateways try the other eligible nodes and retry temporary pressure within an activation deadline.
    A planned handoff retains its reservation while retrying its target under pressure.
-   A separate minimum-residency policy remains open.
+   Set `--min-residency SECONDS` to keep newly opened holdings out of memory-pressure reclamation for at least that long.
+   The default is zero seconds.
+   Explicit parks and drains can still release younger holdings.
 3. Activation on demand from the gateway or the intake (`ActivateOnDemand`), admitted per node at `activations_per_node_per_second`.
    A placed node admits up to 200 cold claims in a rolling second by default, configurable with `--activations-per-second N`.
    The gateway tries other eligible nodes and retries a rate refusal within its activation deadline.

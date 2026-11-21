@@ -35,6 +35,7 @@ pub struct AgentOptions {
     pub clean_after_idle: Duration,
     /// Park a deployment nobody has touched for this long; never, if absent.
     pub park_after: Option<Duration>,
+    pub min_residency: Duration,
     /// Drop a read replica nobody has touched for this long.
     pub unsubscribe_after: Duration,
     /// The most deployments this node keeps active; beyond it, the least recently used are parked.
@@ -57,7 +58,7 @@ pub struct S3WriteRole { pub arn: String, pub sts_endpoint: Option<String>, pub 
 impl AgentOptions {
     pub fn new(storage: CellStorage) -> Self {
         Self { storage, s3_write_role: None, activation_timeout: Duration::from_secs(30), activations_per_second: NonZeroUsize::new(200).unwrap(),
-            watch_interval: Duration::from_millis(250), clean_after_idle: Duration::from_secs(60), park_after: None,
+            watch_interval: Duration::from_millis(250), clean_after_idle: Duration::from_secs(60), park_after: None, min_residency: Duration::ZERO,
             unsubscribe_after: Duration::from_secs(60), max_active: None, quarantine_after: 2, compaction_worker: false, max_tail_rows: None, snapshot_lifetime: SNAPSHOT_LIFETIME,
             fragments: crate::fragments::FragmentOptions::default() }
     }
@@ -102,6 +103,7 @@ struct LocalHolding {
     id: String,
     epoch: u64,
     last_touch: Instant,
+    opened: Instant,
     linearizable: bool,
     trimmed_through: Option<i64>,
     database: std::sync::Weak<Database>,
@@ -288,8 +290,9 @@ impl NodeAgent {
         match opened {
             Ok(database) => {
                 let placement = rtdb_directory::watch_deployment(Arc::clone(&self.directory), record.id.clone(), self.options.watch_interval);
+                let opened = Instant::now();
                 self.holdings.lock().insert(record.name.clone(), LocalHolding {
-                    id: record.id.clone(), epoch: record.epoch, last_touch: Instant::now(),
+                    id: record.id.clone(), epoch: record.epoch, last_touch: opened, opened,
                     linearizable: record.linearizable_reads, trimmed_through: None, database: Arc::downgrade(&database),
                     claimed_version: record.version, placement,
                 });
@@ -540,7 +543,7 @@ impl NodeAgent {
         let budget = self.node.memory();
         let target = budget.limit_bytes() - budget.limit_bytes() / 4;
         let mut candidates: Vec<_> = self.holdings.lock().iter()
-            .filter(|(name, _)| Some(name.as_str()) != protected)
+            .filter(|(name, holding)| Some(name.as_str()) != protected && holding.opened.elapsed() >= self.options.min_residency)
             .map(|(name, holding)| (holding.last_touch, name.clone(), holding.id.clone(), holding.epoch))
             .collect();
         candidates.sort_unstable();

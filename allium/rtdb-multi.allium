@@ -1488,6 +1488,7 @@ rule ReclaimExecutionMemory {
     -- It attempts a bounded batch of parks, ordered by last activity across its holdings.
     -- A holding with an open session can be selected under execution-memory pressure.
     -- A newly touched candidate or a candidate already undergoing a holding operation is skipped.
+    -- A holding that has been open for less than the node’s configured minimum residency is skipped.
     -- A candidate that lost its placement is detached without flushing.
     -- On activation the node preserves the requested holding and checks headroom again before attempting a claim.
     -- Gateways retry temporary pressure refusals within an activation deadline.
