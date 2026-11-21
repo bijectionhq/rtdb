@@ -12,7 +12,7 @@ use std::time::Duration;
 
 use bytes::{BufMut, Bytes, BytesMut};
 use rtdb_directory::{DeploymentRecord, Directory, Lifecycle};
-use rtdb_pgwire::{GATEWAY_SESSION_STATE_TAG, GATEWAY_SETTINGS_KIND, GATEWAY_SETTINGS_PARAMETER, GATEWAY_SQL_PREPARE_KIND};
+use rtdb_pgwire::{GATEWAY_NAMED_PARSE_KIND, GATEWAY_SESSION_STATE_TAG, GATEWAY_SETTINGS_KIND, GATEWAY_SETTINGS_PARAMETER, GATEWAY_SQL_PREPARE_KIND};
 use rtdb_types::{Anomaly, AnomalyCategory, MemoryBudget, MemoryReservation, Result};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -216,8 +216,12 @@ impl Session {
             return Err(Anomaly::new(AnomalyCategory::Unsupported, "rtdb.multi/reconnect-settings", "The new holder cannot restore the session's settings"));
         }
         let mut definitions: Vec<_> = self.prepared.values().collect();
-        if !features.sql_prepare && definitions.iter().any(|definition| definition.frame.tag == GATEWAY_SESSION_STATE_TAG) {
-            return Err(Anomaly::new(AnomalyCategory::Unsupported, "rtdb.multi/reconnect-sql-prepare", "The new holder cannot restore SQL prepared statements"));
+        if definitions.iter().any(|definition| definition.frame.tag == GATEWAY_SESSION_STATE_TAG && match definition.frame.body.first().copied() {
+            Some(GATEWAY_SQL_PREPARE_KIND) => !features.sql_prepare,
+            Some(GATEWAY_NAMED_PARSE_KIND) => !features.named_parse,
+            _ => false,
+        }) {
+            return Err(Anomaly::new(AnomalyCategory::Unsupported, "rtdb.multi/reconnect-prepared", "The new holder cannot restore the session's prepared definitions"));
         }
         definitions.sort_unstable_by_key(|definition| definition.order);
         if self.settings.is_some() || self.await_token.is_some() || !definitions.is_empty() {
@@ -346,7 +350,7 @@ impl Session {
                                     Some(0) => self.await_token = None,
                                     Some(1) => self.await_token = Some(frame),
                                     Some(GATEWAY_SETTINGS_KIND) if frame.body.len() > 1 => self.settings = Some(frame),
-                                    Some(GATEWAY_SQL_PREPARE_KIND) if frame.body.len() > 1 => {
+                                    Some(GATEWAY_SQL_PREPARE_KIND | GATEWAY_NAMED_PARSE_KIND) if frame.body.len() > 1 => {
                                         let name = frame.body[1..].split(|byte| *byte == 0).next().and_then(|name| std::str::from_utf8(name).ok())
                                             .filter(|name| !name.is_empty()).ok_or_else(|| lost("the holder sent an invalid prepared name"))?.to_owned();
                                         self.remember_statement(name, frame);
@@ -509,7 +513,7 @@ impl Session {
 }
 
 #[derive(Default)]
-struct ReplayFeatures { await_token: bool, settings: bool, sql_prepare: bool }
+struct ReplayFeatures { await_token: bool, settings: bool, sql_prepare: bool, named_parse: bool }
 
 async fn replay_ready(frames: &mut mpsc::Receiver<std::io::Result<Frame>>) -> Result<ReplayFeatures> {
     let mut features = ReplayFeatures::default();
@@ -522,6 +526,7 @@ async fn replay_ready(frames: &mut mpsc::Receiver<std::io::Result<Frame>>) -> Re
                 Some(0 | 1) => features.await_token = true,
                 Some(GATEWAY_SETTINGS_KIND) => features.settings = true,
                 Some(GATEWAY_SQL_PREPARE_KIND) => features.sql_prepare = true,
+                Some(GATEWAY_NAMED_PARSE_KIND) => features.named_parse = true,
                 _ => {}
             },
             b'Z' => return Ok(features),

@@ -9,7 +9,7 @@ use rtdb_sql::{AdmittedControl, BatchExecution, ContextualStatementDiagnostic, E
 use rtdb_types::{Anomaly, PgType, Result, Value};
 use tokio::io::AsyncWrite;
 use tokio_util::sync::CancellationToken;
-use crate::{GATEWAY_SESSION_STATE_TAG, GATEWAY_SETTINGS_KIND, GATEWAY_SQL_PREPARE_KIND, ServerConfig, connection::{Startup, apply_startup, display_parameter}, error::{cancelled, protocol}, server::CancellationSlot, wire::{Column, Frame, Input, Writer}};
+use crate::{GATEWAY_NAMED_PARSE_KIND, GATEWAY_SESSION_STATE_TAG, GATEWAY_SETTINGS_KIND, GATEWAY_SQL_PREPARE_KIND, ServerConfig, connection::{Startup, apply_startup, display_parameter}, error::{cancelled, protocol}, server::CancellationSlot, wire::{Column, Frame, Input, Writer}};
 
 enum PreparedKind { Empty, Query(PreparedSql), Dml(PreparedSql), Control(PreparedControl), Keywords }
 enum PreparedControl { Batch(ControlStatement), Extended(AdmittedControl) }
@@ -63,6 +63,16 @@ struct PreparationSettings<'a> { search_path: &'a str, timezone: &'a str }
 
 fn search_path(value: &str) -> Vec<String> {
     value.split(',').map(|name| name.trim().trim_matches('"').to_owned()).collect()
+}
+
+fn parse_frontend_definition(bytes: &[u8]) -> Result<(&str, &str, Vec<i32>)> {
+    let mut input = Input::new(bytes);
+    let name = input.string()?;
+    let sql = input.string()?;
+    let count = usize::from(input.short()?);
+    let oids = (0..count).map(|_| input.integer()).collect::<Result<_>>()?;
+    input.end()?;
+    Ok((name, sql, oids))
 }
 
 pub(crate) struct ProtocolSession {
@@ -140,11 +150,15 @@ impl ProtocolSession {
             b'Q' => { let sql = input.string()?; input.end()?; self.simple(sql, writer).await?; }
             b'P' => {
                 self.extended = true;
-                let name = input.string()?; let sql = input.string()?;
-                let count = usize::from(input.short()?); let oids = (0..count).map(|_| input.integer()).collect::<Result<Vec<_>>>()?; input.end()?;
-                let prepared = self.prepare_client(sql, oids).await.inspect_err(|_| { if self.session.state().is_read_write() { self.record_transaction_error(); } })?;
+                let (name, sql, oids) = parse_frontend_definition(&frame.body)?;
+                let prepared = self.prepare_client(sql, oids, None).await.inspect_err(|_| { if self.session.state().is_read_write() { self.record_transaction_error(); } })?;
                 Self::planning_warnings(&prepared, writer).await?;
-                self.register_statement(Cow::Borrowed(name), prepared)?; writer.empty(b'1').await?;
+                self.register_statement(Cow::Borrowed(name), prepared)?;
+                writer.empty(b'1').await?;
+                if self.startup.gateway_settings && !name.is_empty() {
+                    writer.gateway_named_parse(name, self.session.state().parameter("search_path").unwrap_or("public"),
+                        self.session.state().effective_timezone(), &frame.body).await?;
+                }
             }
             b'B' => {
                 self.extended = true;
@@ -247,6 +261,14 @@ impl ProtocolSession {
                         input.end()?;
                         self.restore_sql_prepare(name, source, settings).await?;
                     }
+                    GATEWAY_NAMED_PARSE_KIND if self.startup.gateway_settings => {
+                        let expected = input.string()?;
+                        let settings = PreparationSettings { search_path: input.string()?, timezone: input.string()? };
+                        let (name, sql, oids) = parse_frontend_definition(input.remaining())?;
+                        if name != expected || name.is_empty() { return Err(protocol("The gateway's Parse name does not match its definition")); }
+                        let prepared = self.prepare_client(sql, oids, Some(settings)).await?;
+                        self.register_statement(Cow::Borrowed(name), prepared)?;
+                    }
                     _ => return Err(protocol("Invalid gateway session state")),
                 }
             }
@@ -256,7 +278,7 @@ impl ProtocolSession {
         Ok(())
     }
 
-    async fn prepare_client(&mut self, original: &str, oids: Vec<i32>) -> Result<Arc<Prepared>> {
+    async fn prepare_client(&mut self, original: &str, oids: Vec<i32>, settings: Option<PreparationSettings<'_>>) -> Result<Arc<Prepared>> {
         let input = rtdb_sql::parse_extended_statement(original, self.node.memory())?;
         let source = match input.statement {
             ExtendedStatement::Empty => "",
@@ -265,7 +287,8 @@ impl ProtocolSession {
             ExtendedStatement::Prepare(syntax) => return self.retain_sql_prepare(syntax, oids),
         };
         let source = replace_namespace_query(source, (source, ""));
-        let options = self.options();
+        let mut options = self.options();
+        if let Some(settings) = settings { options.search_path = search_path(settings.search_path); }
         let shape = if source.is_empty() {
             PreparedShape { kind: PreparedKind::Empty, columns: None, parameter_count: 0 }
         } else if legacy_keyword_probe(source) {
@@ -274,7 +297,7 @@ impl ProtocolSession {
             .map_err(|error| extended_syntax_error(source, original, error, self.node.memory()))? {
             self.execute_columns(control_shape(PreparedControl::Extended(control), oids.len())?)
         } else {
-            let context = self.session.prepare_context(&self.token()).await?;
+            let context = self.session.prepare_context_with_timezone(settings.map(|settings| settings.timezone), &self.token()).await?;
             let _rewrite_syntax = admit_rewrite_syntax(original.len(), source.len(), &context.memory)?;
             let syntax = rtdb_sql::parse_syntax_in(source, &context.memory)
                 .map_err(|error| extended_syntax_error(source, original, error, &context.memory))?;
@@ -1006,7 +1029,7 @@ mod tests {
     async fn bind_argument_slots_are_admitted_before_publishing_a_portal() {
         let (mut frontend, driver) = test_frontend().await;
         let memory = Arc::clone(frontend.node.memory());
-        let prepared = frontend.prepare_client("SET TIME ZONE 'UTC'", Vec::new()).await.unwrap();
+        let prepared = frontend.prepare_client("SET TIME ZONE 'UTC'", Vec::new(), None).await.unwrap();
         frontend.register_statement(Cow::Borrowed("zone"), prepared).unwrap();
 
         let count = 1024u16;
@@ -1079,7 +1102,7 @@ mod tests {
         let calibration = memory.reserve(limit / 2 - baseline).unwrap();
         let calibration_floor = memory.used_bytes();
         assert!(calibration_floor > previous_peak);
-        let prepared = frontend.prepare_client(&padded, Vec::new()).await.unwrap();
+        let prepared = frontend.prepare_client(&padded, Vec::new(), None).await.unwrap();
         let successful_headroom = memory.peak_bytes() - calibration_floor;
         let retained = memory.used_bytes() - calibration_floor;
         assert!(successful_headroom >= plan_boundary);
@@ -1091,7 +1114,7 @@ mod tests {
         let retained_at_plan = memory.used_bytes() + before_plan;
         let expected = format!("Cannot reserve {plan_bytes} bytes from budget {limit} with {retained_at_plan} retained");
         for source in [padded.as_str(), original] {
-            let error = frontend.prepare_client(source, Vec::new()).await.err().unwrap();
+            let error = frontend.prepare_client(source, Vec::new(), None).await.err().unwrap();
             assert_eq!(error.code, "rtdb/memory-budget-exceeded");
             assert_eq!(error.message.as_deref(), Some(expected.as_str()));
             assert_eq!(memory.used_bytes(), baseline + short.bytes());
@@ -1100,7 +1123,7 @@ mod tests {
 
         let exact = memory.reserve(limit - baseline - successful_headroom).unwrap();
         for source in [padded.as_str(), original] {
-            let prepared = frontend.prepare_client(source, Vec::new()).await.unwrap();
+            let prepared = frontend.prepare_client(source, Vec::new(), None).await.unwrap();
             assert!(matches!(prepared.ordinary_kind(), Some(PreparedKind::Query(query)) if query.source() == rewritten));
             assert_eq!(memory.used_bytes(), baseline + exact.bytes() + retained);
             drop(prepared);
@@ -1207,7 +1230,7 @@ mod tests {
         let (mut frontend, driver) = test_frontend().await;
         let memory = Arc::clone(frontend.node.memory());
         let baseline = memory.used_bytes();
-        let old = frontend.prepare_client("SET TIME ZONE 'Europe/Paris'", Vec::new()).await.unwrap();
+        let old = frontend.prepare_client("SET TIME ZONE 'Europe/Paris'", Vec::new(), None).await.unwrap();
         let old_statement = Arc::downgrade(&old);
         frontend.register_statement(Cow::Borrowed("zone"), Arc::clone(&old)).unwrap();
         let portal = frontend.bind(old, Vec::new(), Vec::new(), &[]).await.unwrap();
@@ -1259,7 +1282,7 @@ mod tests {
         let memory = Arc::clone(frontend.node.memory());
         let baseline = memory.used_bytes();
         let leaf = "SET TIME ZONE 'UTC'";
-        let old = frontend.prepare_client("SET TIME ZONE 'Europe/Paris'", Vec::new()).await.unwrap();
+        let old = frontend.prepare_client("SET TIME ZONE 'Europe/Paris'", Vec::new(), None).await.unwrap();
         let old_statement = Arc::downgrade(&old);
         frontend.register_statement(Cow::Borrowed("target"), old).unwrap();
 

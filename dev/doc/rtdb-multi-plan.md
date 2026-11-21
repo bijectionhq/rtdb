@@ -738,7 +738,8 @@ Moves are invisible to clients only if the gateway owns connections and session 
    Gateway reconnects restore the session timezone, parameters and default transaction access before preparing statements.
    Replaying the connection state keeps the startup database and authenticated principal.
    The gateway tracks settings and await-token support separately during a rolling update.
-   SQL PREPARE registers a replayable definition with its preparation-time search path and timezone.
+   SQL PREPARE and named pgwire Parse register replayable definitions with their preparation-time search path and timezone.
+   The pgwire definition retains the parameter type OIDs supplied by the client.
    The successor restores the definitions in registration order before accepting another command.
    A single pgwire autocommit write sends `CommandComplete` after the commit succeeds.
    PGwire carries stable placement interruption codes independently of the configured error detail format. [PostgreSQL ErrorResponse format](https://www.postgresql.org/docs/current/protocol-message-formats.html#PROTOCOL-MESSAGE-FORMATS-ERRORRESPONSE)

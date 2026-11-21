@@ -67,6 +67,16 @@ impl<W: AsyncWrite + Unpin> Writer<W> {
             Ok(())
         }).await
     }
+    pub async fn gateway_named_parse(&mut self, name: &str, search_path: &str, timezone: &str, parse: &[u8]) -> Result<()> {
+        let length = [name, search_path, timezone].into_iter().try_fold(1usize, |length, field| length.checked_add(field.len())?.checked_add(1))
+            .and_then(|length| length.checked_add(parse.len())).ok_or_else(|| protocol("Gateway Parse state is too large"))?;
+        self.record(crate::GATEWAY_SESSION_STATE_TAG, length, |body| {
+            body.push(crate::GATEWAY_NAMED_PARSE_KIND);
+            for field in [name, search_path, timezone] { cstring(body, field)?; }
+            body.extend_from_slice(parse);
+            Ok(())
+        }).await
+    }
     pub async fn ready(&mut self, status: u8) -> Result<()> { self.send(b'Z', &[status]).await?; self.flush().await }
     pub async fn backend_key(&mut self, process: i32) -> Result<()> { self.record(b'K', 8, |bytes| { bytes.extend_from_slice(&process.to_be_bytes()); bytes.extend_from_slice(&0i32.to_be_bytes()); Ok(()) }).await }
     pub async fn parameters(&mut self, oids: &[i32]) -> Result<()> { self.record(b't', 2 + oids.len() * 4, |bytes| { count(bytes, oids.len())?; for oid in oids { bytes.extend_from_slice(&(if *oid == 0 { 25 } else { *oid }).to_be_bytes()); } Ok(()) }).await }

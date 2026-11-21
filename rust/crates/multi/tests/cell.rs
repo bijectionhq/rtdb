@@ -1989,20 +1989,23 @@ async fn a_gateway_session_restores_settings_and_discard_all_resets_them_across_
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn sql_prepare_keeps_its_bound_search_path_across_a_move() {
+async fn prepared_statements_keep_their_bound_search_path_across_a_move() {
     let cell = Cell::start(2, None).await;
     admin::create_deployment(cell.directory.as_ref(), "shop", "acme", 3).await.unwrap();
     let client = cell.connect("shop").await;
     client.simple_query("INSERT INTO north.inventory (_id, label) VALUES (1, 'north')").await.unwrap();
     client.simple_query("INSERT INTO south.inventory (_id, label) VALUES (1, 'south')").await.unwrap();
     client.simple_query("SET search_path TO 'north'; PREPARE chosen AS SELECT label FROM inventory").await.unwrap();
+    let prepared = client.prepare_typed("SELECT label FROM inventory WHERE _id = $1", &[tokio_postgres::types::Type::INT8]).await.unwrap();
     client.simple_query("SET search_path TO 'south'").await.unwrap();
     assert_eq!(values(&client, "EXECUTE chosen").await, ["north"]);
+    assert_eq!(client.query_one(&prepared, &[&1i64]).await.unwrap().get::<_, String>(0), "north");
     assert_eq!(values(&client, "SELECT label FROM inventory").await, ["south"]);
 
     let source = cell.holder("shop").await.unwrap();
     admin::move_deployment(cell.directory.as_ref(), "shop", &cell.node(1 - source).agent.member(), &control()).await.unwrap();
     assert_eq!(values(&client, "EXECUTE chosen").await, ["north"]);
+    assert_eq!(client.query_one(&prepared, &[&1i64]).await.unwrap().get::<_, String>(0), "north");
     assert_eq!(values(&client, "SELECT label FROM inventory").await, ["south"]);
     drop(client);
     cell.stop().await;

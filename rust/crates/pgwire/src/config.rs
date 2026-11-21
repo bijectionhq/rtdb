@@ -32,6 +32,7 @@ pub const GATEWAY_AWAIT_TOKEN_PARAMETER: &str = "rtdb.gateway_await_token";
 pub const GATEWAY_SESSION_STATE_TAG: u8 = b'Y';
 pub const GATEWAY_SETTINGS_KIND: u8 = 2;
 pub const GATEWAY_SQL_PREPARE_KIND: u8 = 3;
+pub const GATEWAY_NAMED_PARSE_KIND: u8 = 4;
 pub const GATEWAY_SETTINGS_PARAMETER: &str = "rtdb.gateway_settings";
 
 /// The startup parameter a capability travels in.
