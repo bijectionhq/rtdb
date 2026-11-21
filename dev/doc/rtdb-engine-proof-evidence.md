@@ -236,8 +236,9 @@ Given stable IID reads, Verus checks that success establishes the leaf rank orde
 If the validator returns an order error, the first inverted adjacent pair follows an ordered prefix.
 A reader error propagates when either lookup of the current pair fails.
 The regressions check repeated indices, an inversion confined to the final pair and a failed read after the path pass.
-Verus 0.2026.11.05.31e44e6 checked thirty-four functions and rejected eighteen controls, including skipping the final pair, reading the wrong row, accepting an inversion and rejecting an equal pair.
-The native run passed 508 tests with `CARGO_PROFILE_TEST_DEBUG=0 cargo test --manifest-path rust/Cargo.toml --locked -p rtdb-trie -p rtdb-format -p rtdb-index -p rtdb-query`. [Production validator](../../rust/crates/trie/src/leaf_load_step.rs) · [Importer](../../rust/crates/trie/src/memory.rs) · [Verus study](../../verification/verus/trie_leaf_merge/area.json)
+The persisted-order area uses the comparator and rank contracts checked by the leaf merge area.
+Verus 0.2026.11.20.9da409b checked three functions for persisted-order validation and rejected four controls that skip the final pair, read the wrong row, admit an inversion, or reject equal rows.
+The branch run passed 508 native tests with `CARGO_PROFILE_TEST_DEBUG=0 cargo test --manifest-path rust/Cargo.toml --locked -p rtdb-trie -p rtdb-format -p rtdb-index -p rtdb-query`. [Production validator](../../rust/crates/trie/src/leaf_load_step.rs) · [Importer](../../rust/crates/trie/src/memory.rs) · [Verus study](../../verification/verus/trie_leaf_load/area.json)
 
 ### Leaf runs, compaction and persisted order
 
