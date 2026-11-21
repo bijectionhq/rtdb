@@ -1,5 +1,7 @@
 //! Point-query experiments over the same trie files and corpus as the native SQL accelerator.
 
+pub mod workload;
+
 use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
 

@@ -100,7 +100,7 @@ impl Ranked {
     pub(crate) fn expand_experiment(&mut self) -> Result<(usize, Vec<(DocMatch, f64)>)> {
         let Some(windows) = &mut self.0 else { return Ok((0, Vec::new())) };
         let before = windows.next;
-        let hits = windows.expand()?;
+        let hits = windows.expand(None, &mut 0)?;
         Ok((windows.next - before, hits))
     }
 }
