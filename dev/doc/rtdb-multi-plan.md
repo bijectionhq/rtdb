@@ -172,6 +172,7 @@ A successful initialization records the deployment UUID, journal ID and key dige
 `standalone` requires those original records and starts a loopback TLS gateway using a supplied certificate, private key and password file.
 The journal accepts connections only inside the standalone process.
 The gateway reports its bound port and installation UUID in the caller's private readiness file.
+A supervisor can start the process with `--parent-stdin` so closing its private pipe requests shutdown.
 
 ## 1. Ground rules
 

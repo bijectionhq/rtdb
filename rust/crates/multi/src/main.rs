@@ -15,7 +15,7 @@ use tokio_util::sync::CancellationToken;
 const HELP: &str = "RTDB multi\n\n\
 Usage: rtdb-multi initialize-directory --state PATH\n\
        rtdb-multi initialize-standalone --state PATH --name NAME --id UUID\n\
-       rtdb-multi standalone --state PATH --name NAME --id UUID --certificate FILE --private-key FILE --password-file FILE --ready-file FILE\n\
+       rtdb-multi standalone --state PATH --name NAME --id UUID --certificate FILE --private-key FILE --password-file FILE --ready-file FILE [--parent-stdin]\n\
        rtdb-multi directory --state PATH --listen ADDR\n\
        rtdb-multi logkeeper --directory DIR --listen ADDR --data PATH [--advertise-host HOST] [--zone ZONE] [--cache-bytes BYTES] [--no-fsync]\n\
        rtdb-multi node --directory DIR --storage-root PATH --keys PATH --cache PATH [--config FILE] [--control ADDR] [--advertise-host HOST] [--zone ZONE] [--park-after SECONDS] [--max-active N] [--max-tail-rows N] [--isolation | --compaction-worker] [--no-local-compaction] [--memory-limit BYTES] [--cell-secret FILE]\n\
@@ -101,6 +101,13 @@ async fn run(arguments: Vec<String>) -> Result<()> {
             process::initialize_standalone(std::path::Path::new(arguments.required("state")?), arguments.required("name")?, installation_id(&arguments)?).await
         }
         "standalone" => {
+            if arguments.present("parent-stdin") {
+                let stop = cancellation.clone();
+                std::thread::spawn(move || {
+                    let _ = std::io::copy(&mut std::io::stdin().lock(), &mut std::io::sink());
+                    stop.cancel();
+                });
+            }
             process::serve_standalone(process::StandaloneSettings {
                 root: arguments.required("state")?.into(),
                 name: arguments.required("name")?.into(),
