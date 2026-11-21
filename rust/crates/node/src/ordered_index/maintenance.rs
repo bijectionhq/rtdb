@@ -122,9 +122,7 @@ impl OrderedIndexMaintenance {
                 )
                 .await;
                 match advanced {
-                    Ok((rows, erased))
-                        if checkpoint.source_rows.checked_add(rows) == Some(expected) =>
-                    {
+                    Ok(rows) if checkpoint.source_rows.checked_add(rows) == Some(expected) => {
                         let next = checkpoint::publish(
                             tree,
                             through,
@@ -133,12 +131,7 @@ impl OrderedIndexMaintenance {
                             cancellation,
                         )
                         .await?;
-                        if erased {
-                            next.collect(tree, cancellation).await?;
-                        } else {
-                            next.retire_manifests(tree, cancellation).await?;
-                        }
-                        return Ok(());
+                        return next.finish(tree, cancellation).await;
                     }
                     Err(error) if error.category == AnomalyCategory::Interrupted => {
                         return Err(error);
@@ -147,8 +140,10 @@ impl OrderedIndexMaintenance {
                 }
             }
         }
+        // A repair can recreate old pages before it reaches the erasure that removed them.
+        checkpoint::request_collection(tree, through).await?;
         let mut roots = RevisionRoots::default();
-        let (rows, _) = replay_flushed(
+        let rows = replay_flushed(
             tree,
             definition,
             snapshot,
@@ -215,8 +210,8 @@ async fn replay_flushed(
     through: i64,
     roots: &mut RevisionRoots,
     cancellation: &CancellationToken,
-) -> Result<(i64, bool)> {
-    let mut erased = false;
+) -> Result<i64> {
+    let mut pending_collection = false;
     let mut rows = 0_i64;
     for (block, object) in source_files(
         snapshot,
@@ -229,14 +224,18 @@ async fn replay_flushed(
     {
         let (count, changes) = flushed_changes(tree, definition, &object, cancellation).await?;
         rows = rows.checked_add(count).ok_or_else(incomplete_source)?;
-        erased |= roots
+        let erased = roots
             .apply(tree, changes, EventOrder::NewestFirst, cancellation)
             .await?;
+        if erased && !pending_collection {
+            checkpoint::request_collection(tree, through).await?;
+            pending_collection = true;
+        }
         // A rebuild and incremental replay must write identical addresses for the same block.
         roots.archived = checkpoint::store_roots(tree, block, roots, cancellation).await?;
         roots.changes.clear();
     }
-    Ok((rows, erased))
+    Ok(rows)
 }
 
 const MAX_TAIL_FILES: usize = 8;

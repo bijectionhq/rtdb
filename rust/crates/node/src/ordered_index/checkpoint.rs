@@ -40,7 +40,41 @@ impl Checkpoint {
         }
     }
 
+    pub async fn finish(&self, tree: &Tree<'_>, cancellation: &CancellationToken) -> Result<()> {
+        let pending = self.pending_collection(tree).await?;
+        if pending.is_empty() {
+            self.retire_manifests(tree, cancellation).await
+        } else {
+            self.sweep(tree, pending, cancellation).await
+        }
+    }
+
     pub async fn collect(&self, tree: &Tree<'_>, cancellation: &CancellationToken) -> Result<()> {
+        let pending = self.pending_collection(tree).await?;
+        self.sweep(tree, pending, cancellation).await
+    }
+
+    async fn pending_collection(&self, tree: &Tree<'_>) -> Result<Vec<ObjectKey>> {
+        let root = key(tree, "cleanup")?;
+        Ok(tree
+            .storage
+            .object_store()
+            .list(Some(&root))
+            .await?
+            .into_iter()
+            .filter_map(|object| {
+                let through = frontier(&object.key)?;
+                (through <= self.through).then_some(object.key)
+            })
+            .collect())
+    }
+
+    async fn sweep(
+        &self,
+        tree: &Tree<'_>,
+        pending: Vec<ObjectKey>,
+        cancellation: &CancellationToken,
+    ) -> Result<()> {
         let mut reachable = BTreeSet::new();
         if let Some(pointer) = &self.revisions {
             tree.mark(Arc::clone(pointer), &mut reachable).await?;
@@ -73,10 +107,16 @@ impl Checkpoint {
                 tree.storage.invalidate(&object.key).await?;
             }
         }
+        for debt in pending {
+            if cancellation.is_cancelled() {
+                return Err(cancelled());
+            }
+            store.delete(&debt).await?;
+        }
         Ok(())
     }
 
-    pub async fn retire_manifests(
+    async fn retire_manifests(
         &self,
         tree: &Tree<'_>,
         cancellation: &CancellationToken,
@@ -93,6 +133,16 @@ impl Checkpoint {
         }
         Ok(())
     }
+}
+
+/// Recovery may advance the manifest before the sweep finishes.
+pub(super) async fn request_collection(tree: &Tree<'_>, through: i64) -> Result<()> {
+    let debt = key(tree, format_args!("cleanup/{through:016x}"))?;
+    tree.storage
+        .object_store()
+        .put(&debt, Vec::<u8>::new().into())
+        .await?;
+    Ok(())
 }
 
 fn key(tree: &Tree<'_>, suffix: impl std::fmt::Display) -> Result<ObjectKey> {
@@ -235,4 +285,47 @@ pub(super) async fn publish(
     latest(tree, through)
         .await?
         .ok_or_else(|| format_error("Published checkpoint is unavailable"))
+}
+
+#[cfg(test)]
+mod tests {
+    use rtdb_columnar::MemoryBudget;
+    use rtdb_storage::{MemoryStore, cache::BufferPool};
+
+    use super::*;
+
+    #[tokio::test]
+    async fn advancing_reopens_collection_abandoned_after_manifest_publication() {
+        let storage = BufferPool::new(Arc::new(MemoryStore::default()), 1 << 20);
+        let memory = MemoryBudget::new(1 << 20);
+        let directory = ObjectKey::new("index").unwrap();
+        let tree = Tree {
+            storage: &storage,
+            directory: &directory,
+            memory: &memory,
+        };
+        let token = CancellationToken::new();
+        let store = storage.object_store();
+        let erased = key(&tree, "pages/0000000000000000/erased").unwrap();
+        let later = key(&tree, "pages/0000000000000003/later").unwrap();
+        for page in [&erased, &later] {
+            store.put(page, Vec::<u8>::new().into()).await.unwrap();
+        }
+
+        request_collection(&tree, 1).await.unwrap();
+        publish(&tree, 1, 2, None, &token).await.unwrap();
+
+        let reopened = latest(&tree, 1).await.unwrap().unwrap();
+        assert_eq!(reopened.through, 1);
+        let advanced = publish(&tree, 2, 3, None, &token).await.unwrap();
+        advanced.finish(&tree, &token).await.unwrap();
+
+        assert!(matches!(
+            store.head(&erased).await,
+            Err(Error::MissingObject(_))
+        ));
+        assert!(store.head(&later).await.is_ok());
+        assert!(advanced.pending_collection(&tree).await.unwrap().is_empty());
+        assert_eq!(latest(&tree, 2).await.unwrap().unwrap().through, 2);
+    }
 }
