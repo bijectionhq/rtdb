@@ -129,3 +129,109 @@ async fn a_long_id_list_of_constants_narrows_reads_and_erases_to_its_iids() {
     assert!(fixture.rows(&format!("SELECT _id FROM docs WHERE _id IN ({})", placeholders(256)), erased).await.is_empty());
     fixture.close().await;
 }
+
+/// A clustered UUID: the series in the top 32 bits, then the instant, then a discriminator.
+fn point_id(series: u32, at: u64, discriminator: u32) -> u128 { (u128::from(series) << 96) | (u128::from(at) << 32) | u128::from(discriminator) }
+fn uuid(id: u128) -> Value { Value::Uuid(id.to_be_bytes()) }
+fn mix(mut x: u64) -> u64 { x = x.wrapping_add(0x9e3779b97f4a7c15); x = (x ^ (x >> 30)).wrapping_mul(0xbf58476d1ce4e5b9); x = (x ^ (x >> 27)).wrapping_mul(0x94d049bb133111eb); x ^ (x >> 31) }
+fn ids(rows: Vec<Vec<Value>>) -> Vec<u128> {
+    let mut ids: Vec<u128> = rows.into_iter().map(|row| match &row[0] { Value::Uuid(bytes) => u128::from_be_bytes(*bytes), other => panic!("expected a UUID, found {other:?}") }).collect();
+    ids.sort_unstable();
+    ids
+}
+
+/// 40 series of 500 points each, the first three quarters persisted and compacted, the rest live.
+async fn points(fixture: &mut Fixture) -> Vec<u128> {
+    let all: Vec<u128> = (0..40u32).flat_map(|series| (0..500u64).map(move |tick| point_id(series * 0x0400_0001, tick * 60, mix(u64::from(series) << 32 | tick) as u32))).collect();
+    let (persisted, live) = all.split_at(all.len() * 3 / 4);
+    let rows = |ids: &[u128]| ids.iter().map(|id| vec![uuid(*id), Value::I64((*id >> 32) as i64 & 0xffff_ffff)]).collect::<Vec<_>>();
+    // The order of arrival is not the order of the IDs.
+    let mut shuffled = persisted.to_vec();
+    shuffled.sort_by_key(|id| mix(*id as u64));
+    for chunk in shuffled.chunks(5_000) { fixture.commit("INSERT INTO pts (_id, at) VALUES (?, ?)", rows(chunk)).await.unwrap(); }
+    fixture.flush().await;
+    fixture.compact().await;
+    fixture.commit("INSERT INTO pts (_id, at) VALUES (?, ?)", rows(live)).await.unwrap();
+    let mut all = all;
+    all.sort_unstable();
+    all
+}
+
+#[tokio::test]
+async fn an_id_range_over_uuid_ids_reads_only_the_pages_of_its_iid_interval() {
+    let mut fixture = Fixture::open().await;
+    let all = points(&mut fixture).await;
+    assert_eq!(ids(fixture.rows("SELECT _id FROM pts", vec![]).await), all);
+    let whole = fixture.counters("SELECT _id FROM pts", vec![]).await;
+
+    let expect = |keep: &dyn Fn(u128) -> bool| all.iter().copied().filter(|id| keep(*id)).collect::<Vec<_>>();
+    let series = 7 * 0x0400_0001u32;
+    let (first, last) = (point_id(series, 100 * 60, 0), point_id(series, 200 * 60, 0));
+    let present = all[all.len() / 3];
+    let cases: Vec<(&str, Vec<Value>, Vec<u128>)> = vec![
+        ("_id >= ? AND _id < ?", vec![uuid(first), uuid(last)], expect(&|id| id >= first && id < last)),
+        ("_id > ? AND _id <= ?", vec![uuid(first), uuid(last)], expect(&|id| id > first && id <= last)),
+        ("_id BETWEEN ? AND ?", vec![uuid(first), uuid(last)], expect(&|id| id >= first && id <= last)),
+        ("? <= _id AND ? > _id", vec![uuid(first), uuid(last)], expect(&|id| id >= first && id < last)),
+        // Bounds that are rows: inclusive bounds keep them, strict bounds drop them.
+        ("_id >= ? AND _id <= ?", vec![uuid(present), uuid(present)], vec![present]),
+        ("_id > ? AND _id < ?", vec![uuid(present), uuid(all[all.len() / 3 + 2])], vec![all[all.len() / 3 + 1]]),
+        ("_id >= ? AND _id < ?", vec![uuid(present), uuid(present)], vec![]),
+        ("_id > ? AND _id <= ?", vec![uuid(last), uuid(first)], vec![]),
+        // The lowest and highest IDs there are, and the ends of the ID space.
+        ("_id <= ?", vec![uuid(all[0])], vec![all[0]]),
+        ("_id >= ?", vec![uuid(*all.last().unwrap())], vec![*all.last().unwrap()]),
+        ("_id < ?", vec![uuid(0)], vec![]),
+        ("_id > ?", vec![uuid(u128::MAX)], vec![]),
+        ("_id >= ? AND _id <= ?", vec![uuid(0), uuid(u128::MAX)], all.clone()),
+        // Mixed with predicates on other columns, in either order.
+        ("at >= 6600 AND _id >= ? AND _id < ? AND at < 9000", vec![uuid(first), uuid(last)], expect(&|id| id >= first && id < last && (6600..9000).contains(&((id >> 32) as u64 & 0xffff_ffff)))),
+        ("(_id >= ? AND _id < ?) AND (at = 6600 OR at = 7200)", vec![uuid(first), uuid(last)], expect(&|id| id >= first && id < last && [6600, 7200].contains(&((id >> 32) as u64 & 0xffff_ffff)))),
+        // A disjunction of ranges is evaluated on every row.
+        ("_id < ? OR _id >= ?", vec![uuid(first), uuid(last)], expect(&|id| id < first || id >= last)),
+    ];
+    for (predicate, params, expected) in &cases {
+        let sql = format!("SELECT _id FROM pts WHERE {predicate}");
+        assert_eq!(&ids(fixture.rows(&sql, params.clone()).await), expected, "{sql}");
+    }
+    // A live range in the last series, which was never persisted.
+    let series = 39 * 0x0400_0001u32;
+    let (first, last) = (point_id(series, 0, 0), point_id(series, 50 * 60, 0));
+    assert_eq!(ids(fixture.rows("SELECT _id FROM pts WHERE _id >= ? AND _id < ?", vec![uuid(first), uuid(last)]).await), expect(&|id| id >= first && id < last));
+
+    let series = 7 * 0x0400_0001u32;
+    let (first, last) = (point_id(series, 100 * 60, 0), point_id(series, 200 * 60, 0));
+    let confined = fixture.counters("SELECT _id FROM pts WHERE _id >= ? AND _id < ?", vec![uuid(first), uuid(last)]).await;
+    assert!(confined["scan_pages_used"] * 8 <= whole["scan_pages_used"], "100 of 20,000 rows read {confined:?} of {whole:?}");
+    assert!(confined["scan_rows_read"] <= 4 * 1024, "{confined:?}");
+    let literal = |id: u128| { let hex = format!("{id:032x}"); format!("UUID '{}-{}-{}-{}-{}'", &hex[..8], &hex[8..12], &hex[12..16], &hex[16..20], &hex[20..]) };
+    let by_literal = fixture.counters(&format!("SELECT _id FROM pts WHERE _id >= {} AND _id < {}", literal(first), literal(last)), vec![]).await;
+    assert_eq!(by_literal, confined);
+    let nothing = fixture.counters("SELECT _id FROM pts WHERE _id > ? AND _id < ?", vec![uuid(last), uuid(first)]).await;
+    assert_eq!(nothing.get("scan_pages_used").copied().unwrap_or(0), 0, "{nothing:?}");
+    fixture.close().await;
+}
+
+#[tokio::test]
+async fn an_id_range_over_hashed_ids_is_evaluated_on_every_row() {
+    let mut fixture = Fixture::open().await;
+    // Text IDs, and a table holding both text and UUID IDs: neither orders its IIDs as it orders its IDs.
+    fixture.commit("INSERT INTO docs (_id, v) VALUES (?, ?)", (0..3_000).map(|index| vec![text_id(index), Value::I64(index as i64)]).collect()).await.unwrap();
+    let mixed: Vec<Vec<Value>> = (0..3_000u64).map(|index| vec![if index % 2 == 0 { uuid(u128::from(index) << 64) } else { text_id(index as usize) }, Value::I64(index as i64)]).collect();
+    fixture.commit("INSERT INTO mixed (_id, v) VALUES (?, ?)", mixed).await.unwrap();
+    fixture.flush().await;
+    fixture.compact().await;
+
+    let texts = fixture.rows("SELECT v FROM docs WHERE _id >= ? AND _id < ? ORDER BY v", vec![text_id(1_000), text_id(1_100)]).await;
+    assert_eq!(texts, (1_000..1_100).map(|index| vec![Value::I64(index)]).collect::<Vec<_>>());
+    let integers = "INSERT INTO numbered (_id, v) VALUES (?, ?)";
+    fixture.commit(integers, (0..3_000).map(|index| vec![Value::I64(index), Value::I64(index)]).collect()).await.unwrap();
+    fixture.flush().await;
+    let numbers = fixture.rows("SELECT v FROM numbered WHERE _id >= 1000 AND _id < 1100 ORDER BY v", vec![]).await;
+    assert_eq!(numbers, (1_000..1_100).map(|index| vec![Value::I64(index)]).collect::<Vec<_>>());
+
+    let (first, last) = (uuid(1_000u128 << 64), uuid(1_100u128 << 64));
+    let uuids = fixture.rows("SELECT v FROM mixed WHERE _id >= ? AND _id < ? ORDER BY v", vec![first, last]).await;
+    assert_eq!(uuids, (1_000..1_100).filter(|index| index % 2 == 0).map(|index| vec![Value::I64(index)]).collect::<Vec<_>>());
+    fixture.close().await;
+}

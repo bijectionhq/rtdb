@@ -228,8 +228,8 @@ pub(crate) struct PartitionScan {
     counts: ScanCounts,
     pushdowns: Option<Arc<crate::pushdown::Pushdowns>>,
     canonical_entity_iids: bool,
-    /// The IIDs a fragment's scan is confined to; every IID, otherwise.
-    fragment: Option<(Iid, Iid)>,
+    /// The inclusive IID range the scan is confined to, by its fragment's prefix and its `_id` range predicates; every IID, otherwise.
+    confined: Option<(Iid, Iid)>,
     /// Parallel to the scan's matches: the query (`None` where it is null, so MATCH is too), and an accelerator's answers for some of the partition's data files.
     matches: Vec<(Option<rtdb_text::Query>, Option<crate::MatchAnswers>)>,
     /// Parallel to the scan's columns: the match each evaluates, if any.
@@ -244,6 +244,7 @@ use crate::analysis::ScanCounts;
 fn id_selection(scan: &Scan, parameters: &[Value]) -> Option<std::collections::BTreeSet<Iid>> {
     let id = scan.columns.iter().find(|field| field.name == "_id")?.id;
     let eid = |expr: &Expr| -> Option<Iid> {
+        if let Some(uuid) = uuid_constant(expr, parameters) { return Some(Iid(uuid)); }
         let value = match expr { Expr::Literal(value) => value, Expr::Parameter { index, .. } => parameters.get(*index)?, _ => return None };
         value.entity_id().ok().map(|entity| entity.iid())
     };
@@ -262,6 +263,77 @@ fn id_selection(scan: &Scan, parameters: &[Value]) -> Option<std::collections::B
         disjuncts(predicate, &mut clauses);
         clauses.into_iter().map(equality).collect::<Option<std::collections::BTreeSet<_>>>()
     })
+}
+/// The UUID a literal or parameter is, or that the cast of a string one to UUID gives, which is how `UUID '...'` is bound.
+fn uuid_constant(expr: &Expr, parameters: &[Value]) -> Option<[u8; 16]> {
+    fn constant<'v>(expr: &'v Expr, parameters: &'v [Value]) -> Option<&'v Value> {
+        match expr { Expr::Literal(value) => Some(value), Expr::Parameter { index, .. } => parameters.get(*index), _ => None }
+    }
+    let uuid = rtdb_types::LogicalType::Scalar(rtdb_types::ScalarType::Uuid);
+    let value = match expr {
+        Expr::Cast { expr, target: rtdb_plan::CastTarget::Fixed(target) } if *target == uuid => match constant(expr, parameters)? {
+            text @ Value::Utf8(_) => return match rtdb_expr::cast(text, &uuid, "UTC").ok()? { Value::Uuid(bytes) => Some(bytes), _ => None },
+            value => value,
+        },
+        expr => constant(expr, parameters)?,
+    };
+    match value { Value::Uuid(bytes) => Some(*bytes), _ => None }
+}
+/// The inclusive IID interval that `_id` range predicates select: the conjuncts comparing `_id` with a UUID literal or
+/// parameter by `<`, `<=`, `>`, `>=` or BETWEEN, where every `_id` of the table is a UUID. A UUID is its own IID and
+/// UUIDs order as their bytes do, so those conjuncts hold exactly for the rows whose IID lies in the interval. An ID
+/// of any other type is hashed into its IID, so a table holding one is not narrowed. `Err` where no IID satisfies
+/// the conjuncts. The predicates are applied to the rows read either way.
+fn id_interval(scan: &Scan, parameters: &[Value]) -> std::result::Result<Option<(Iid, Iid)>, Unsatisfiable> {
+    use rtdb_plan::BinaryOp as Op;
+    let Some(field) = scan.columns.iter().find(|field| field.name == "_id") else { return Ok(None) };
+    if field.data_type != rtdb_types::LogicalType::Scalar(rtdb_types::ScalarType::Uuid) { return Ok(None); }
+    let is_id = |expr: &Expr| matches!(expr, Expr::Column { id, .. } if *id == field.id);
+    let uuid = |expr: &Expr| uuid_constant(expr, parameters).map(u128::from_be_bytes);
+    fn conjuncts<'e>(expr: &'e Expr, out: &mut Vec<&'e Expr>) {
+        match expr { Expr::Binary { op: rtdb_plan::BinaryOp::And, left, right } => { conjuncts(left, out); conjuncts(right, out); } other => out.push(other) }
+    }
+    let mut clauses = Vec::new();
+    for predicate in &scan.predicates { conjuncts(predicate, &mut clauses); }
+    let (mut lower, mut upper) = (u128::MIN, u128::MAX);
+    for clause in clauses {
+        match clause {
+            Expr::Binary { op, left, right } => {
+                let (op, bound) = if is_id(left) { (*op, uuid(right)) } else if is_id(right) {
+                    (match op { Op::Lt => Op::Gt, Op::LtEq => Op::GtEq, Op::Gt => Op::Lt, Op::GtEq => Op::LtEq, other => *other }, uuid(left))
+                } else { continue };
+                let Some(bound) = bound else { continue };
+                match op {
+                    Op::GtEq => lower = lower.max(bound),
+                    Op::Gt => lower = lower.max(bound.checked_add(1).ok_or(Unsatisfiable)?),
+                    Op::LtEq => upper = upper.min(bound),
+                    Op::Lt => upper = upper.min(bound.checked_sub(1).ok_or(Unsatisfiable)?),
+                    _ => {}
+                }
+            }
+            Expr::Between { operand, low, high, symmetric: false } if is_id(operand) => {
+                if let Some(low) = uuid(low) { lower = lower.max(low); }
+                if let Some(high) = uuid(high) { upper = upper.min(high); }
+            }
+            _ => {}
+        }
+    }
+    if lower > upper { return Err(Unsatisfiable); }
+    Ok((lower != u128::MIN || upper != u128::MAX).then(|| (Iid(lower.to_be_bytes()), Iid(upper.to_be_bytes()))))
+}
+/// No IID satisfies a scan's `_id` range predicates.
+#[derive(Debug, PartialEq, Eq)]
+struct Unsatisfiable;
+
+/// The IIDs in both inclusive ranges, where each `None` is every IID; `Err` where they share none.
+fn intersect(left: Option<(Iid, Iid)>, right: Option<(Iid, Iid)>) -> std::result::Result<Option<(Iid, Iid)>, Unsatisfiable> {
+    match (left, right) {
+        (Some((first, last)), Some((lower, upper))) => {
+            let range = (first.max(lower), last.min(upper));
+            if range.0 > range.1 { Err(Unsatisfiable) } else { Ok(Some(range)) }
+        }
+        (range, None) | (None, range) => Ok(range),
+    }
 }
 /// One source of a scan's rows: a partition this node reads, or a fragment of one that another node may read for it.
 enum Part { Local(PartitionScan), Fragment(Fragment) }
@@ -318,6 +390,10 @@ impl ScanCursor {
     async fn over(mut scan: Scan, execution: Execution, pushdowns: Option<Arc<crate::pushdown::Pushdowns>>, database_partitions: &[Snapshot], storage: &Arc<BufferPool>, accelerate: bool) -> Result<Self> {
         let fixed_iids = scan.iids.is_some();
         if !fixed_iids { scan.iids = id_selection(&scan, execution.parameters.values()); }
+        let interval = match id_interval(&scan, execution.parameters.values()) {
+            Ok(interval) => interval,
+            Err(Unsatisfiable) => { scan.iids = Some(Default::default()); None }
+        };
         let bytes = scan.table.name.database.len().checked_add(scan.table.name.table.schema.len()).and_then(|bytes| bytes.checked_add(scan.table.name.table.table.len())).and_then(|bytes| bytes.checked_add(4096)).ok_or_else(|| invalid("scan-size", "Scan labels exceed allocation range"))?;
         let reservation = execution.context.memory.reserve(bytes)?;
         let canonical_entity_iids = scan.iids.is_none()
@@ -364,13 +440,13 @@ impl ScanCursor {
                 }
                 matches.push((query.as_deref().map(rtdb_text::Query::parse), answers));
             }
-            let partition = |fragment, matches| PartitionScan {
+            let partition = |confined, matches| PartitionScan {
                 snapshot: snapshot.clone(), storage: Arc::clone(storage), matches,
                 slots: slots.clone(), scan: narrowed.clone(), execution: execution.clone(), bounds,
                 initialized: false, files: FileDescriptors::default(), pages: PageDescriptors::default(),
                 tasks: None, loaded: BTreeMap::new(), output: VecDeque::new(),
                 output_reservation: None, counts: ScanCounts::default(), pushdowns: pushdowns.clone(),
-                canonical_entity_iids, fragment,
+                canonical_entity_iids, confined,
             };
             // A scan narrowed to named IIDs reads a few pages wherever they are; only a whole scan of a single-partition database is split.
             let split = match (&fragmenter, snapshot.tx_basis()) {
@@ -380,12 +456,14 @@ impl ScanCursor {
             };
             match split {
                 Some((depth, basis)) => for prefix in depth.prefixes() {
-                    let fallback = partition(Some(prefix.range()), Vec::new());
+                    // A prefix holding none of the interval's IIDs has no rows to read.
+                    let Ok(confined) = intersect(Some(prefix.range()), interval) else { continue };
+                    let fallback = partition(confined, Vec::new());
                     let residence = execution.context.catalog.fragment_residence.clone();
                     let request = Arc::new(ScanFragment::of(&narrowed, prefix, basis, residence, bounds, &execution.context.timezone));
                     parts.push_back(Part::Fragment(Fragment { request, fallback, state: FragmentState::Pending }));
                 },
-                None => parts.push_back(Part::Local(partition(None, matches))),
+                None => parts.push_back(Part::Local(partition(interval, matches))),
             }
         }
         let fragmenter = fragmenter.filter(|_| parts.iter().any(|part| matches!(part, Part::Fragment(_))));
@@ -395,10 +473,14 @@ impl ScanCursor {
 
 impl PartitionScan {
     #[allow(clippy::too_many_arguments)]
-    fn new(snapshot: Snapshot, storage: Arc<BufferPool>, scan: Scan, execution: Execution, bounds: TemporalBounds, pushdowns: Option<Arc<crate::pushdown::Pushdowns>>, canonical_entity_iids: bool, fragment: Option<(Iid, Iid)>) -> Self {
+    fn new(snapshot: Snapshot, storage: Arc<BufferPool>, mut scan: Scan, execution: Execution, bounds: TemporalBounds, pushdowns: Option<Arc<crate::pushdown::Pushdowns>>, canonical_entity_iids: bool, fragment: Option<(Iid, Iid)>) -> Self {
         let slots = vec![None; scan.columns.len()];
+        let confined = id_interval(&scan, execution.parameters.values()).and_then(|interval| intersect(fragment, interval)).unwrap_or_else(|Unsatisfiable| {
+            scan.iids = Some(Default::default());
+            fragment
+        });
         Self { snapshot, storage, scan, execution, bounds, matches: Vec::new(), slots, initialized: false, files: FileDescriptors::default(), pages: PageDescriptors::default(), tasks: None, loaded: BTreeMap::new(),
-            output: VecDeque::new(), output_reservation: None, counts: ScanCounts::default(), pushdowns, canonical_entity_iids, fragment }
+            output: VecDeque::new(), output_reservation: None, counts: ScanCounts::default(), pushdowns, canonical_entity_iids, confined }
     }
     /// The scan another node asked this one for: its fragment's rows within the bounds that node evaluated.
     pub(crate) fn fragment(snapshot: Snapshot, storage: Arc<BufferPool>, fragment: &ScanFragment, execution: Execution) -> Self {
@@ -735,7 +817,7 @@ impl PartitionScan {
             iid: self.scan.iids.as_ref().filter(|iids| iids.len() == 1).and_then(|iids| iids.first().copied()) }
     }
     fn path_matches(&self, lower: Iid, upper: Iid) -> bool {
-        if self.fragment.is_some_and(|(first, last)| upper < first || last < lower) { return false; }
+        if self.confined.is_some_and(|(first, last)| upper < first || last < lower) { return false; }
         match &self.scan.iids {
             Some(iids) => iids.range(lower..=upper).next().is_some(),
             None => self.pushdowns.as_ref().is_none_or(|filters| filters.path_matches(&self.scan.columns, lower, upper, self.canonical_entity_iids)),
@@ -976,6 +1058,11 @@ impl PartitionScan {
         self.counts.pages_pruned = self.counts.pages_pruned.saturating_add((task.pages.len() - selected.len()) as u64);
         self.counts.pages_used = self.counts.pages_used.saturating_add(selected.len() as u64);
         selected.sort_by_key(|index| (matches!(self.pages.entries[*index].source,PageSource::Live { .. }),self.pages.entries[*index].priority,*index));
+        // The task's rows the scan is confined to; `path_matches` admitted the task, so the two ranges share an IID.
+        let (range_lower, range_upper) = match self.confined {
+            Some((first, last)) => (task.range.lower.max(first), task.range.upper.min(last)),
+            None => (task.range.lower, task.range.upper),
+        };
         let mut groups = Vec::with_capacity(selected.len());
         let mut group_reservations = Vec::with_capacity(selected.len());
         let mut heads = BinaryHeap::with_capacity(selected.len());
@@ -988,11 +1075,11 @@ impl PartitionScan {
             let (mut low, mut high) = (0, rows.len());
             while low < high {
                 let middle = (low + high) / 2;
-                if rows.header(middle)?.iid < task.range.lower { low = middle + 1; } else { high = middle; }
+                if rows.header(middle)?.iid < range_lower { low = middle + 1; } else { high = middle; }
             }
             if low < rows.len() {
                 let header = rows.header(low)?;
-                if header.iid <= task.range.upper { heads.push(Head { header,active: group,priority: self.pages.entries[index].priority,ordinal: low }); }
+                if header.iid <= range_upper { heads.push(Head { header,active: group,priority: self.pages.entries[index].priority,ordinal: low }); }
             }
         }
         let mut resolver = HistoryResolver::new_in(self.bounds, self.scan.clamp_valid_time, Arc::clone(&self.execution.context.memory));
@@ -1009,7 +1096,7 @@ impl PartitionScan {
             let ordinal = head.ordinal + 1;
             let following = if ordinal < rows.len() {
                 let header = rows.header(ordinal)?;
-                (header.iid <= task.range.upper).then_some(Head { header,ordinal,..head })
+                (header.iid <= range_upper).then_some(Head { header,ordinal,..head })
             } else { None };
             // A page's next row that still precedes every other page's head is taken without passing through the heap.
             next = match following {
@@ -1018,7 +1105,6 @@ impl PartitionScan {
                 None => heads.pop(),
             };
             if self.scan.iids.as_ref().is_some_and(|iids| !iids.contains(&head.header.iid)) { continue; }
-            if self.fragment.is_some_and(|(first, last)| head.header.iid < first || last < head.header.iid) { continue; }
             if self.scan.iids.is_none() && self.pushdowns.as_ref().is_some_and(|filters| !filters.iid_matches(&self.scan.columns,head.header.iid,self.canonical_entity_iids)) { continue; }
             let (slot, batch, row) = rows.batch(head.ordinal)?;
             let page = &mut handles[head.active];
@@ -1242,6 +1328,63 @@ mod tests {
         assert_eq!(id_selection(&scan(either), &[Value::Null]), None);
         let range = Expr::binary(rtdb_plan::BinaryOp::Lt, id.expression(), Expr::Literal(Value::I64(7)));
         assert_eq!(id_selection(&scan(range), &[]), None);
+    }
+
+    #[test]
+    fn id_range_predicates_confine_a_scan_of_uuid_ids_to_an_inclusive_iid_interval() {
+        let uuid_type = LogicalType::Scalar(ScalarType::Uuid);
+        let field = |data_type: &LogicalType| Field { id: ColumnId(0), name: "_id".into(), qualifier: None, qualified_only: false, unnamed: false, data_type: data_type.clone() };
+        let other = Field { id: ColumnId(1), name: "v".into(), qualifier: None, qualified_only: false, unnamed: false, data_type: LogicalType::Scalar(ScalarType::I64) };
+        let table = rtdb_plan::TableBinding { name: QualifiedTable { database: "xtdb".into(), table: TableRef::new("public", "docs") }, oid: None, columns: Default::default() };
+        let scan = |id_type: &LogicalType, predicates: Vec<Expr>| Scan { table: table.clone(), columns: vec![field(id_type), other.clone()], valid_time: TemporalFilter::Default, system_time: TemporalFilter::Default,
+            clamp_valid_time: false, iids: None, predicates, top_k: None, ordered_top_k: None, matches: Vec::new() };
+        let id = field(&uuid_type).expression();
+        let at = |value: u128| Expr::Literal(Value::Uuid(value.to_be_bytes()));
+        let compare = |op, value: u128| Expr::binary(op, id.clone(), at(value));
+        let range = |lower: u128, upper: u128| Ok(Some((Iid(lower.to_be_bytes()), Iid(upper.to_be_bytes()))));
+        let interval = |predicates: Vec<Expr>| id_interval(&scan(&uuid_type, predicates), &[]);
+        use rtdb_plan::BinaryOp::{And, Eq, Gt, GtEq, Lt, LtEq, Or};
+
+        assert_eq!(interval(vec![compare(GtEq, 10), compare(LtEq, 20)]), range(10, 20));
+        assert_eq!(interval(vec![compare(Gt, 10), compare(Lt, 20)]), range(11, 19), "strict bounds exclude the bound itself");
+        assert_eq!(interval(vec![Expr::binary(And, compare(GtEq, 10), compare(Lt, 20))]), range(10, 19), "conjuncts of one predicate");
+        assert_eq!(interval(vec![compare(GtEq, 10)]), range(10, u128::MAX));
+        assert_eq!(interval(vec![compare(Lt, 20)]), range(0, 19));
+        assert_eq!(interval(vec![Expr::binary(Lt, at(10), id.clone()), Expr::binary(GtEq, at(20), id.clone())]), range(11, 20), "the bound on the left reverses the comparison");
+        assert_eq!(interval(vec![Expr::between(id.clone(), at(10), at(20), false)]), range(10, 20));
+        assert_eq!(interval(vec![compare(GtEq, 10), compare(GtEq, 15), compare(LtEq, 30), compare(Lt, 20)]), range(15, 19), "the tightest bounds win");
+        assert_eq!(interval(vec![compare(GtEq, 10), Expr::binary(Eq, other.expression(), Expr::Literal(Value::I64(1)))]), range(10, u128::MAX), "other columns' conjuncts leave the interval alone");
+
+        let parameter = |index| Expr::Parameter { index, data_type: uuid_type.clone() };
+        let bound = scan(&uuid_type, vec![Expr::binary(GtEq, id.clone(), parameter(0)), Expr::binary(Lt, id.clone(), parameter(1))]);
+        assert_eq!(id_interval(&bound, &[Value::Uuid(10u128.to_be_bytes()), Value::Uuid(20u128.to_be_bytes())]), range(10, 19));
+        assert_eq!(id_interval(&bound, &[Value::Uuid(10u128.to_be_bytes()), Value::Null]), range(10, u128::MAX), "a bound that is no UUID confines nothing");
+        assert_eq!(id_interval(&bound, &[Value::Utf8("a".into()), Value::I64(7)]), Ok(None));
+
+        let typed = |text: &str| Expr::Cast { expr: Box::new(Expr::Literal(Value::Utf8(text.into()))), target: rtdb_plan::CastTarget::Fixed(uuid_type.clone()) };
+        assert_eq!(interval(vec![Expr::binary(GtEq, id.clone(), typed("00000000-0000-0000-0000-00000000000a")), Expr::binary(Lt, id.clone(), typed("00000000-0000-0000-0000-000000000014"))]), range(10, 19), "UUID '...' is a cast of its text");
+        assert_eq!(interval(vec![Expr::binary(GtEq, id.clone(), typed("not a uuid"))]), Ok(None));
+        assert_eq!(id_selection(&scan(&uuid_type, vec![Expr::binary(Eq, id.clone(), typed("00000000-0000-0000-0000-00000000000a"))]), &[]), Some([Iid(10u128.to_be_bytes())].into()));
+
+        assert_eq!(interval(vec![compare(GtEq, 21), compare(LtEq, 20)]), Err(Unsatisfiable));
+        assert_eq!(interval(vec![compare(GtEq, 20), compare(LtEq, 20)]), range(20, 20));
+        assert_eq!(interval(vec![compare(Gt, u128::MAX)]), Err(Unsatisfiable));
+        assert_eq!(interval(vec![compare(Lt, 0)]), Err(Unsatisfiable));
+        assert_eq!(interval(vec![compare(GtEq, 0), compare(LtEq, u128::MAX)]), Ok(None), "every IID is no confinement");
+        assert_eq!(interval(vec![Expr::binary(Or, compare(GtEq, 10), compare(LtEq, 5))]), Ok(None), "a disjunction is not an interval");
+        assert_eq!(interval(vec![Expr::between(id.clone(), at(20), at(10), true)]), Ok(None), "a symmetric BETWEEN orders its own bounds");
+        assert_eq!(interval(vec![Expr::unary(UnaryOp::Not, compare(GtEq, 10))]), Ok(None));
+
+        // An ID of any other type is hashed into its IID, so its order says nothing about the IID's.
+        for id_type in [LogicalType::Scalar(ScalarType::Utf8), LogicalType::Scalar(ScalarType::I64), LogicalType::join_all(&[uuid_type.clone(), LogicalType::Scalar(ScalarType::Utf8)])] {
+            let id = field(&id_type).expression();
+            assert_eq!(id_interval(&scan(&id_type, vec![Expr::binary(GtEq, id, at(10))]), &[]), Ok(None), "{id_type:?}");
+        }
+
+        assert_eq!(intersect(Some((Iid([1; 16]), Iid([5; 16]))), Some((Iid([3; 16]), Iid([9; 16])))), Ok(Some((Iid([3; 16]), Iid([5; 16])))));
+        assert_eq!(intersect(Some((Iid([1; 16]), Iid([2; 16]))), Some((Iid([3; 16]), Iid([9; 16])))), Err(Unsatisfiable));
+        assert_eq!(intersect(None, Some((Iid([3; 16]), Iid([9; 16])))), Ok(Some((Iid([3; 16]), Iid([9; 16])))));
+        assert_eq!(intersect(None, None), Ok(None));
     }
 
     fn live_table() -> (PartitionState, TableRef, Vec<StoredEvent>) {
