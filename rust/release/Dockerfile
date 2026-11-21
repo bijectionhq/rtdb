@@ -64,7 +64,7 @@ ENV TZ=UTC
 STOPSIGNAL SIGTERM
 
 FROM runtime-environment AS multi
-LABEL io.rtdb.hosted-protocol=13
+LABEL io.rtdb.hosted-protocol=14
 RUN apt-get update \
     && apt-get install --no-install-recommends -y curl jq netcat-openbsd \
     && rm -rf /var/lib/apt/lists/*

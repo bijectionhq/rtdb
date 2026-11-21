@@ -77,6 +77,7 @@ external entity KeyService {
     -- A key-management service (KMS).
     -- Wraps and unwraps data keys under a key bound to an encryption context, and destroys keys irreversibly.
     -- The regional deployment key vault is outside the payload backup and tracks destroyed identities.
+    -- A hosted vault key occupies one unversioned object, atomically replaced by a persistent tombstone on withdrawal.
 }
 
 external entity Clock {

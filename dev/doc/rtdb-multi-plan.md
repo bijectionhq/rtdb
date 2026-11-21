@@ -73,7 +73,11 @@ To replace missing journal data, recover the journal or reconfigure the ensemble
 Ensemble selection counts each advertised log endpoint once.
 
 In AWS, the cell installs its directory tables independently of the runtime roles.
-Use `--keys dynamodb:TABLE` for deployment keys in a dedicated table with string partition key `id`, separate from payload copies and without point-in-time recovery, streams or backup.
+Use `--keys s3://BUCKET?region=REGION` for the hosted key vault.
+Use a dedicated, never-versioned general-purpose bucket with policies prohibiting versioning, replication, object lock, lifecycle and object deletion.
+Restrict access to the vault roles and require conditional writes and SSE-S3.
+An identity stays at one object path under `keys/`, with an empty tombstone replacing withdrawn material.
+The reaper confirms the unversioned tombstone before it reports withdrawal.
 Deleting a key clears its material and keeps a tombstone that prevents recreating that identity on a later open.
 
 For a local cell, initialize an existing private volume directory with

@@ -51,7 +51,7 @@ Usage: rtdb-multi --build-info\n\
        rtdb-multi restore --directory DIR --storage-root PATH --archive-root PATH --keys PATH --id UUID --operation UUID [--ecs-cluster ARN]\n\n\
 DIR is HOST:PORT of a directory server, or dynamodb:PREFIX for the deployments, deployment-names, members and stopped-tasks tables\n\
 (RTDB_DYNAMODB_ENDPOINT points at DynamoDB Local; requires the `dynamodb` feature).\n\
-For `--keys` use a private local directory or dynamodb:TABLE with an independently installed key table.\n";
+For `--keys` use a private local directory or s3://BUCKET?region=REGION with a dedicated never-versioned key bucket.\n";
 
 #[tokio::main]
 async fn main() {
@@ -311,7 +311,7 @@ async fn run(arguments: Vec<String>) -> Result<()> {
             provenance: rtdb_types::compiled_build_info(),
             standalone_protocol: process::STANDALONE_PROTOCOL,
             // Hosted capture adopts a block through the holder's observed source.
-            hosted_protocol: 13,
+            hosted_protocol: 14,
         };
         let mut output = std::io::stdout().lock();
         serde_json::to_writer(&mut output, &report).map_err(|error| io(std::io::Error::other(error)))?;
@@ -721,24 +721,13 @@ fn cell_secret(arguments: &Arguments) -> Result<Option<Arc<rtdb_multi::capabilit
 }
 
 async fn key_service(specification: &str) -> Result<Arc<dyn rtdb_multi::keys::KeyService>> {
-    if let Some(table) = specification.strip_prefix("dynamodb:") {
-        return dynamo_keys(table).await;
+    if specification.starts_with("s3://") {
+        return Ok(Arc::new(rtdb_multi::keys::s3::S3KeyService::open(specification).await?));
+    }
+    if specification.starts_with("dynamodb:") || specification.contains("://") {
+        return Err(Anomaly::incorrect("rtdb.multi/key-vault-config", "Unsupported key vault locator"));
     }
     Ok(Arc::new(rtdb_multi::keys::LocalKeyService::new(specification)?))
-}
-
-#[cfg(feature = "dynamodb")]
-async fn dynamo_keys(table: &str) -> Result<Arc<dyn rtdb_multi::keys::KeyService>> {
-    let client = match std::env::var("RTDB_DYNAMODB_ENDPOINT") {
-        Ok(endpoint) => rtdb_directory::DynamoDirectory::local_client(&endpoint),
-        Err(_) => aws_sdk_dynamodb::Client::new(&aws_config::load_defaults(aws_config::BehaviorVersion::latest()).await),
-    };
-    Ok(Arc::new(rtdb_multi::keys::dynamo::DynamoKeyService::new(client, table.to_owned())?))
-}
-
-#[cfg(not(feature = "dynamodb"))]
-async fn dynamo_keys(_: &str) -> Result<Arc<dyn rtdb_multi::keys::KeyService>> {
-    Err(Anomaly::unsupported("rtdb.multi/dynamodb", "This binary was built without the dynamodb feature"))
 }
 
 async fn directory(spec: &str) -> Result<Arc<dyn Directory>> {

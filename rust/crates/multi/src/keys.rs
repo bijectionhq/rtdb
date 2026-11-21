@@ -194,8 +194,7 @@ fn new_key() -> Result<[u8; KEY_BYTES]> {
 
 fn malformed() -> Anomaly { Anomaly::fault("rtdb.multi/key-corrupt", "Malformed deployment data key") }
 
-#[cfg(feature = "dynamodb")]
-pub mod dynamo;
+pub mod s3;
 
 fn io(error: std::io::Error) -> Anomaly { Anomaly::new(AnomalyCategory::Unavailable, "rtdb.multi/keys", error.to_string()) }
 
