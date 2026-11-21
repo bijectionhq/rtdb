@@ -62,18 +62,20 @@ impl OrderedIndexMaintenance {
             cancellation,
         )
         .await?;
-        let mut directories = BTreeSet::new();
-        for definition in active {
-            let directory = definition.directory()?;
-            self.refresh_index(snapshot, &definition, &directory, cancellation)
-                .await?;
-            directories.insert(directory);
-        }
+        let directories = active
+            .iter()
+            .map(Definition::directory)
+            .collect::<Result<BTreeSet<_>>>()?;
         if let Some(basis) = snapshot
             .tx_basis()
             .filter(|_| snapshot.contains_table(&TableRef::new(super::CATALOG.0, super::CATALOG.1)))
         {
             prune_dropped(&self.storage, &directories, basis.tx_id.0, cancellation).await?;
+        }
+        for definition in active {
+            let directory = definition.directory()?;
+            self.refresh_index(snapshot, &definition, &directory, cancellation)
+                .await?;
         }
         Ok(())
     }

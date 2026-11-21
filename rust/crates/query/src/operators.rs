@@ -104,6 +104,60 @@ pub(crate) async fn build_columns(runtime: Arc<EmittedRelation>, execution: Exec
     Ok(Some(crate::columnar::retain_batch_state(batches, reservation)))
 }
 
+/// A covered ordered result stays columnar through plain SQL projections and the requested window.
+pub(crate) fn build_ordered_columns(
+    runtime: Arc<EmittedRelation>,
+    execution: Execution,
+    window: Option<(usize, usize)>,
+) -> futures::future::BoxFuture<'static, Result<Option<crate::columnar::BoxBatchCursor>>> {
+    let mut build = Box::pin(async move {
+        let relation = runtime.relation();
+        let input: crate::columnar::BoxBatchCursor = match relation.node() {
+            RelationNode::SortLimit { order_by, offset, fetch: Some(fetch), .. }
+                if window.is_none() && !order_by.is_empty() =>
+            {
+                let offset = row_limit(offset.as_ref(), &execution).await?.unwrap_or(0);
+                let remaining = row_limit(Some(fetch), &execution).await?.unwrap_or(i64::MAX as u64);
+                let limit = offset.saturating_add(remaining).min(i64::MAX as u64);
+                let (Ok(limit), Ok(offset)) = (usize::try_from(limit), usize::try_from(offset)) else { return Ok(None); };
+                let Some(input) = build_ordered_columns(runtime.child(0)?, execution.child(0), Some((limit, offset))).await? else {
+                    return Ok(None);
+                };
+                input
+            }
+            RelationNode::Project { expressions, .. } | RelationNode::Rename { expressions, .. } => {
+                let child = runtime.child(0)?;
+                let Some(positions) = expressions.iter().map(|named| match &named.expr {
+                    Expr::Column { id, .. } => child.schema().position(*id),
+                    _ => None,
+                }).collect::<Option<Vec<_>>>() else { return Ok(None); };
+                let Some(input) = build_ordered_columns(child, execution.child(0), window).await? else {
+                    return Ok(None);
+                };
+                Box::new(crate::columnar::BatchProject::new(input, positions, Arc::clone(&execution.context.memory)))
+            }
+            RelationNode::Filter { .. } | RelationNode::Distinct { .. } if window.is_some() => {
+                let Some(input) = build_ordered_columns(runtime.child(0)?, execution.child(0), window).await? else {
+                    return Ok(None);
+                };
+                input
+            }
+            RelationNode::Scan(scan) => {
+                let Some((limit, offset)) = window else { return Ok(None); };
+                let Some(input) = crate::scan::ordered_batches(scan, &execution, limit, offset).await? else {
+                    return Ok(None);
+                };
+                input
+            }
+            _ => return Ok(None),
+        };
+        Ok(Some(crate::columnar::retain_batch_state(input, state_reservation(&runtime, &execution)?)))
+    });
+    Box::pin(std::future::poll_fn(move |context| {
+        stacker::maybe_grow(512 * 1024, 2 * 1024 * 1024, || build.as_mut().poll(context))
+    }))
+}
+
 fn state_reservation(runtime: &Arc<EmittedRelation>, execution: &Execution) -> Result<Arc<rtdb_columnar::MemoryReservation>> {
     let relation = runtime.relation();
     let mut state_bound = crate::runtime_schema::local_allocation_bound(relation)?;

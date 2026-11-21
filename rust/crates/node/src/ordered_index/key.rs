@@ -1,19 +1,32 @@
-use rtdb_types::{Interval, LogicalType, ScalarType, Timestamp, Value};
+use arrow_array::{
+    Array, BinaryArray, BooleanArray, Date32Array, Date64Array, FixedSizeBinaryArray, Int8Array,
+    Int16Array, Int32Array, Int64Array, RunArray, StringArray, UInt8Array, UInt16Array,
+    UInt32Array, UInt64Array, UnionArray,
+    types::{Int16Type, Int32Type, Int64Type},
+};
+use arrow_schema::{DataType, Field, UnionMode};
+use rtdb_types::{Interval, LogicalType, Result, ScalarType, Timestamp, Value};
 use serde::{Deserialize, Serialize};
 
-use super::domain::{bucket_start, cover_step, offset, upper_bound};
+use super::{
+    domain::{bucket_start, cover_step, offset, upper_bound},
+    format_error,
+};
 
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
-pub(super) enum Atom {
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub(super) enum Scalar<Text, Binary> {
     Bool(bool),
     Integer(i128),
-    Text(String),
-    Binary(Vec<u8>),
+    Text(Text),
+    Binary(Binary),
     Uuid([u8; 16]),
     Day(i64),
     Unordered,
     Null,
 }
+
+pub(super) type Atom = Scalar<String, Vec<u8>>;
+pub(super) type AtomRef<'a> = Scalar<&'a str, &'a [u8]>;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Family {
@@ -48,6 +61,109 @@ impl Atom {
         })
     }
 
+    pub(super) fn borrowed(&self) -> AtomRef<'_> {
+        match self {
+            Self::Bool(value) => Scalar::Bool(*value),
+            Self::Integer(value) => Scalar::Integer(*value),
+            Self::Text(value) => Scalar::Text(value),
+            Self::Binary(value) => Scalar::Binary(value),
+            Self::Uuid(value) => Scalar::Uuid(*value),
+            Self::Day(value) => Scalar::Day(*value),
+            Self::Unordered => Scalar::Unordered,
+            Self::Null => Scalar::Null,
+        }
+    }
+}
+
+impl<'a> AtomRef<'a> {
+    pub(super) fn owned(self) -> Atom {
+        match self {
+            Self::Bool(value) => Scalar::Bool(value),
+            Self::Integer(value) => Scalar::Integer(value),
+            Self::Text(value) => Scalar::Text(value.to_owned()),
+            Self::Binary(value) => Scalar::Binary(value.to_vec()),
+            Self::Uuid(value) => Scalar::Uuid(value),
+            Self::Day(value) => Scalar::Day(value),
+            Self::Unordered => Scalar::Unordered,
+            Self::Null => Scalar::Null,
+        }
+    }
+
+    pub(super) fn from_arrow(field: &Field, array: &'a dyn Array, row: usize) -> Result<Self> {
+        if field.data_type() != array.data_type() || row >= array.len() {
+            return Err(format_error(
+                "Indexed column disagrees with its Arrow layout",
+            ));
+        }
+        if let DataType::Union(fields, UnionMode::Dense) = field.data_type() {
+            let union = arrow::<UnionArray>(array)?;
+            let id = union.type_id(row);
+            let child = fields
+                .iter()
+                .find_map(|(tag, field)| (tag == id).then_some(field))
+                .ok_or_else(|| format_error("Indexed union has an unknown leg"))?;
+            return Self::from_arrow(child, union.child(id).as_ref(), union.value_offset(row));
+        }
+        if let DataType::RunEndEncoded(ends, values) = field.data_type() {
+            macro_rules! run_value {
+                ($ty:ty) => {{
+                    let runs = arrow::<RunArray<$ty>>(array)?;
+                    Self::from_arrow(values, runs.values().as_ref(), runs.get_physical_index(row))
+                }};
+            }
+            return match ends.data_type() {
+                DataType::Int16 => run_value!(Int16Type),
+                DataType::Int32 => run_value!(Int32Type),
+                DataType::Int64 => run_value!(Int64Type),
+                _ => Err(format_error("Indexed column has an invalid run-end width")),
+            };
+        }
+        if array.is_null(row) || field.data_type() == &DataType::Null {
+            return Ok(Self::Null);
+        }
+        macro_rules! value {
+            ($ty:ty) => {
+                arrow::<$ty>(array)?.value(row)
+            };
+        }
+        // EventBatch has already validated the field's logical layout.
+        if let Some(extension) = field.metadata().get(rtdb_columnar::EXTENSION_NAME_KEY) {
+            return Ok(match extension.as_str() {
+                "uuid" => Self::Uuid(
+                    value!(FixedSizeBinaryArray)
+                        .try_into()
+                        .map_err(format_error)?,
+                ),
+                _ => Self::Unordered,
+            });
+        }
+        Ok(match field.data_type() {
+            DataType::Boolean => Self::Bool(value!(BooleanArray)),
+            DataType::Int8 => Self::Integer(value!(Int8Array).into()),
+            DataType::Int16 => Self::Integer(value!(Int16Array).into()),
+            DataType::Int32 => Self::Integer(value!(Int32Array).into()),
+            DataType::Int64 => Self::Integer(value!(Int64Array).into()),
+            DataType::UInt8 => Self::Integer(value!(UInt8Array).into()),
+            DataType::UInt16 => Self::Integer(value!(UInt16Array).into()),
+            DataType::UInt32 => Self::Integer(value!(UInt32Array).into()),
+            DataType::UInt64 => Self::Integer(value!(UInt64Array).into()),
+            DataType::Utf8 => Self::Text(value!(StringArray)),
+            DataType::Binary => Self::Binary(value!(BinaryArray)),
+            DataType::Date32 => Self::Day(value!(Date32Array).into()),
+            DataType::Date64 => Self::Day(value!(Date64Array) / 86_400_000),
+            _ => Self::Unordered,
+        })
+    }
+}
+
+pub(super) fn arrow<T: 'static>(array: &dyn Array) -> Result<&T> {
+    array
+        .as_any()
+        .downcast_ref::<T>()
+        .ok_or_else(|| format_error("Unexpected ordered index Arrow array"))
+}
+
+impl<Text, Binary> Scalar<Text, Binary> {
     pub(super) fn family(&self) -> Option<Family> {
         Some(match self {
             Self::Null | Self::Unordered => return None,
@@ -59,11 +175,13 @@ impl Atom {
             Self::Day(_) => Family::Day,
         })
     }
+}
 
+impl<Text: AsRef<str>, Binary: AsRef<[u8]>> Scalar<Text, Binary> {
     pub(super) fn retained_bytes(&self) -> usize {
         match self {
-            Self::Text(value) => value.len(),
-            Self::Binary(value) => value.len(),
+            Self::Text(value) => value.as_ref().len(),
+            Self::Binary(value) => value.as_ref().len(),
             _ => 0,
         }
     }
@@ -96,8 +214,8 @@ pub(super) fn family(logical: &LogicalType) -> Option<Family> {
 /// An aligned half-open range in the unsigned valid-time domain.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub(super) struct Bucket {
-    level: u32,
-    start: u64,
+    pub level: u32,
+    pub start: u64,
 }
 
 impl Bucket {

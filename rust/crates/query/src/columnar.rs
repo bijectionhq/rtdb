@@ -60,6 +60,18 @@ impl ColumnBatch {
         Ok(Self { columns, len, _reservation: reservation })
     }
     fn charged(&self) -> usize { self._reservation.bytes() }
+    pub fn from_owned(batch: rtdb_columnar::OwnedBatch) -> Result<Self> {
+        let schema = batch.batch().schema();
+        let columns = schema.fields().iter().zip(batch.batch().columns()).map(|(field, array)| {
+            Ok(Column::Arrow {
+                array: Arc::clone(array),
+                field: Arc::clone(field),
+                logical: Some(rtdb_columnar::from_field(field)?),
+            })
+        }).collect::<Result<Vec<_>>>()?;
+        Ok(Self { columns, len: batch.batch().num_rows(), _reservation: Arc::clone(batch.reservation()) })
+    }
+
     /// A page of rows as columns of values, charged as each column is built.
     pub fn from_page(page: &OwnedPage, memory: &Arc<MemoryBudget>) -> Result<Self> {
         let width = page.rows().first().map_or(0, |row| row.values.len());
@@ -311,7 +323,7 @@ fn plain_scalar(logical: &LogicalType) -> Option<&rtdb_types::ScalarType> {
 /// Scalars whose cells survive a copy through their own Arrow layout unchanged, with no admission or validation on the way.
 fn copyable(scalar: &rtdb_types::ScalarType) -> bool {
     use rtdb_types::ScalarType as S;
-    matches!(scalar, S::Bool | S::I8 | S::I16 | S::I32 | S::I64 | S::F32 | S::F64 | S::Utf8 | S::FixedSizeBinary(_) | S::Timestamp { .. })
+    matches!(scalar, S::Bool | S::I8 | S::I16 | S::I32 | S::I64 | S::F32 | S::F64 | S::Utf8 | S::Binary | S::Uuid | S::U8 | S::U16 | S::U32 | S::U64 | S::FixedSizeBinary(_) | S::Timestamp { .. })
 }
 
 /// The column's array where it already holds exactly what copying its cells into `field`, the layout of `target`,

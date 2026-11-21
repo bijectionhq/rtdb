@@ -350,7 +350,7 @@ impl Part {
     fn counts(&self) -> ScanCounts { match self { Self::Local(partition) => partition.counts, Self::Fragment(fragment) => fragment.fallback.counts } }
 }
 
-pub(crate) async fn ordered_pages(scan: &Scan, execution: &Execution, limit: usize) -> Result<Option<crate::pages::BoxPageCursor>> {
+async fn ordered(scan: &Scan, execution: &Execution, limit: usize, covered_only: bool) -> Result<Option<crate::OrderedScan>> {
     if scan.ordered_top_k.is_none() || scan.iids.is_some() || !scan.matches.is_empty() {
         return Ok(None);
     }
@@ -367,20 +367,71 @@ pub(crate) async fn ordered_pages(scan: &Scan, execution: &Execution, limit: usi
         verifier: &verifier, partitions: &database.partitions,
     };
     for accelerator in context.accelerators.iter() {
-        if let Some(iids) = accelerator.ordered_iids(&request, limit).await? {
-            let memory = context.memory.reserve(iids.capacity().saturating_mul(size_of::<Iid>() + 32))?;
+        if let Some(output) = accelerator.ordered(&request, limit, covered_only).await? {
+            return Ok(Some(output));
+        }
+    }
+    Ok(None)
+}
+
+pub(crate) async fn ordered_pages(scan: &Scan, execution: &Execution, limit: usize) -> Result<Option<crate::pages::BoxPageCursor>> {
+    let Some(output) = ordered(scan, execution, limit, false).await? else { return Ok(None); };
+    Ok(Some(match output {
+        crate::OrderedScan::Covered(batches) => {
+            let input = CoveredBatches::new(batches, execution, 0);
+            Box::new(crate::columnar::BatchRows::new(Box::new(input), Arc::clone(&execution.context.memory)))
+        }
+        crate::OrderedScan::Iids(iids) => {
+            let memory = execution.context.memory.reserve(iids.capacity().saturating_mul(size_of::<Iid>() + 32))?;
             let mut scan = scan.clone();
             let width = scan.columns.len();
             let iid_at = include_iid(&mut scan)?;
             scan.ordered_top_k = None;
             scan.top_k = None;
             scan.predicates.clear();
-            return Ok(Some(Box::new(OrderedRows {
-                scan, execution: execution.clone(), selected: iids.into_iter(), width, iid_at, _memory: memory,
-            })));
+            Box::new(OrderedRows { scan, execution: execution.clone(), selected: iids.into_iter(), width, iid_at, _memory: memory })
         }
+    }))
+}
+
+pub(crate) async fn ordered_batches(scan: &Scan, execution: &Execution, limit: usize, offset: usize) -> Result<Option<crate::columnar::BoxBatchCursor>> {
+    let Some(crate::OrderedScan::Covered(batches)) = ordered(scan, execution, limit, true).await? else { return Ok(None); };
+    Ok(Some(Box::new(CoveredBatches::new(batches, execution, offset))))
+}
+
+struct CoveredBatches {
+    batches: std::vec::IntoIter<OwnedBatch>,
+    context: Arc<crate::QueryContext>,
+    offset: usize,
+}
+
+impl CoveredBatches {
+    fn new(batches: Vec<OwnedBatch>, execution: &Execution, offset: usize) -> Self {
+        Self { batches: batches.into_iter(), context: Arc::clone(&execution.context), offset }
     }
-    Ok(None)
+}
+
+#[async_trait]
+impl crate::columnar::BatchCursor for CoveredBatches {
+    async fn next_batch(&mut self) -> Result<Option<crate::columnar::ColumnBatch>> {
+        self.context.check_cancelled()?;
+        for batch in self.batches.by_ref() {
+            let rows = batch.batch().num_rows();
+            if self.offset >= rows {
+                self.offset -= rows;
+                continue;
+            }
+            let offset = std::mem::take(&mut self.offset);
+            let batch = if offset == 0 { batch } else { batch.slice(offset, rows - offset)? };
+            return crate::columnar::ColumnBatch::from_owned(batch).map(Some);
+        }
+        Ok(None)
+    }
+
+    fn trace_attributes(&self, span: &mut dyn rtdb_plan::TraceSpan) {
+        span.attribute("scan_ordered_seek", rtdb_plan::TraceValue::Unsigned(1));
+        span.attribute("scan_ordered_covered", rtdb_plan::TraceValue::Unsigned(1));
+    }
 }
 
 fn include_iid(scan: &mut Scan) -> Result<usize> {

@@ -25,8 +25,10 @@ entity Checkpoint {
 -- Aligned bucket decomposition places an eligible row in exactly one of the prefixes containing a valid-time point.
 -- A revision edits both sides of a changed projection. Unchanged spans retain their postings.
 -- The read opens a root at its system-time point and applies captured uncovered events, including erasures.
--- A read or maintenance cycle owns decoded index pages for its own lifetime.
--- A point read merges bucket prefixes in key order and fetches payload at the same basis.
+-- A read or maintenance cycle owns index page buffers for its own lifetime.
+-- A point read merges bucket prefixes in key order.
+-- A covered point read returns typed batches from those postings after applying every predicate.
+-- Queries requiring table payload fetch it at the same basis.
 -- An ordered distinct page filters eligible rows before counting each distinct key once.
 -- An erasure removes the IID's old membership from every affected root and makes unreachable pages collectible.
 -- Replay discovers captured erase cuts before it writes pages, and projects each IID from its latest erase onward.
@@ -34,3 +36,5 @@ entity Checkpoint {
 -- Every page reachable from a checkpoint uses that checkpoint's scope. Page addresses within the scope retain their source block.
 -- After the replacement checkpoint is published, collection releases older scopes and preserves pages staged in newer scopes.
 -- Data compaction preserves input events and changes no ordered-index checkpoint.
+-- The layout version participates in every definition's derived address.
+-- Replacing a layout retires the former address with the same storage fences as a dropped definition.

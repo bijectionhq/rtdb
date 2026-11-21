@@ -3,20 +3,28 @@ use std::{
     collections::{BTreeSet, BinaryHeap},
 };
 
+use arrow_array::{
+    ArrayRef, BinaryArray, BooleanArray, Date32Array, Int8Array, Int16Array, Int32Array,
+    Int64Array, RecordBatch, StringArray, UInt8Array, UInt16Array, UInt32Array, UInt64Array,
+    builder::FixedSizeBinaryBuilder,
+};
+use arrow_schema::Schema;
 use async_trait::async_trait;
+use rtdb_columnar::{BatchBuilder, OwnedBatch, to_field};
 use rtdb_plan::{BinaryOp, ColumnId, Expr, Field};
-use rtdb_query::{ScanAccelerator, ScanRequest};
+use rtdb_query::{OrderedScan, ScanAccelerator, ScanRequest};
 use rtdb_types::{AnomalyCategory, Iid, LogicalType, Result, ScalarType};
 use std::sync::Arc;
 
 use super::{
     Definition, checkpoint, definitions,
-    key::{Atom, Bucket, Family, family},
+    key::{Atom, AtomRef, Bucket, Family, family},
     maintenance::{cancelled, read_root, source_frontier},
-    tree::{Cursor, Key, Tree},
+    postings::Tuple,
+    tree::{Cursor, Hit, KeyRef, Tree},
 };
 
-const VERIFY_ROWS: usize = 128;
+const BATCH_ROWS: usize = 128;
 const MAX_CANDIDATES: usize = 16_384;
 
 pub(crate) struct OrderedIndexAccelerator;
@@ -24,24 +32,30 @@ pub(crate) struct OrderedIndexAccelerator;
 #[async_trait]
 impl ScanAccelerator for OrderedIndexAccelerator {
     async fn candidate_iids(&self, request: &ScanRequest<'_>) -> Result<Option<BTreeSet<Iid>>> {
-        Ok(exact(request, None)
-            .await?
-            .map(|ids| ids.into_iter().collect()))
+        Ok(match exact(request, None, false).await? {
+            Some(OrderedScan::Iids(ids)) => Some(ids.into_iter().collect()),
+            _ => None,
+        })
     }
 
-    async fn ordered_iids(
+    async fn ordered(
         &self,
         request: &ScanRequest<'_>,
         limit: usize,
-    ) -> Result<Option<Vec<Iid>>> {
+        covered_only: bool,
+    ) -> Result<Option<OrderedScan>> {
         if limit > MAX_CANDIDATES {
             return Ok(None);
         }
-        exact(request, Some(limit)).await
+        exact(request, Some(limit), covered_only).await
     }
 }
 
-async fn exact(request: &ScanRequest<'_>, limit: Option<usize>) -> Result<Option<Vec<Iid>>> {
+async fn exact(
+    request: &ScanRequest<'_>,
+    limit: Option<usize>,
+    covered_only: bool,
+) -> Result<Option<OrderedScan>> {
     let table = &request.scan.table.name.table;
     if table.schema == super::CATALOG.0
         || request.scan.iids.is_some()
@@ -51,14 +65,18 @@ async fn exact(request: &ScanRequest<'_>, limit: Option<usize>) -> Result<Option
     {
         return Ok(None);
     }
-    match seek(request, limit).await {
+    match seek(request, limit, covered_only).await {
         Err(error) if error.category == AnomalyCategory::Interrupted => Err(error),
         Err(_) => Ok(None),
         found => found,
     }
 }
 
-async fn seek(request: &ScanRequest<'_>, limit: Option<usize>) -> Result<Option<Vec<Iid>>> {
+async fn seek(
+    request: &ScanRequest<'_>,
+    limit: Option<usize>,
+    covered_only: bool,
+) -> Result<Option<OrderedScan>> {
     let definitions = definitions(
         request.database,
         request.snapshot,
@@ -88,14 +106,20 @@ async fn seek(request: &ScanRequest<'_>, limit: Option<usize>) -> Result<Option<
             let Some((reverse, distinct_slot)) = order(request, &fields, &range) else {
                 continue;
             };
-            Some(Top { limit, reverse, distinct_slot })
+            Some(Top {
+                limit,
+                reverse,
+                distinct_slot,
+            })
         } else {
             if range.is_open() {
                 continue;
             }
             None
         };
-        if let Some(found) = use_index(request, definition, &fields, &range, top).await? {
+        if let Some(found) =
+            use_index(request, definition, &fields, &range, top, covered_only).await?
+        {
             return Ok(Some(found));
         }
     }
@@ -187,11 +211,11 @@ impl Range {
         Ok(range)
     }
 
-    fn position(&self, key: &[Atom]) -> Ordering {
+    fn position(&self, key: Tuple<'_>) -> Ordering {
         let prefix = key
             .iter()
             .zip(&self.prefix)
-            .map(|(value, bound)| value.cmp(bound))
+            .map(|(value, bound)| value.cmp(&bound.borrowed()))
             .find(|order| *order != Ordering::Equal)
             .unwrap_or(Ordering::Equal);
         if prefix != Ordering::Equal {
@@ -200,26 +224,21 @@ impl Range {
         let Some(next) = key.get(self.prefix.len()) else {
             return Ordering::Equal;
         };
-        let suffix = &key[self.prefix.len()..];
-        if self
-            .lower
-            .as_ref()
-            .is_some_and(|(lower, strict)| next < lower || (*strict && next == lower))
-            || self
-                .cursors
-                .iter()
-                .any(|bound| bound.position(suffix) == Ordering::Less)
+        if self.lower.as_ref().is_some_and(|(lower, strict)| {
+            next < lower.borrowed() || (*strict && next == lower.borrowed())
+        }) || self
+            .cursors
+            .iter()
+            .any(|bound| bound.position(key, self.prefix.len()) == Ordering::Less)
         {
             return Ordering::Less;
         }
-        if self
-            .upper
-            .as_ref()
-            .is_some_and(|(upper, strict)| next > upper || (*strict && next == upper))
-            || self
-                .cursors
-                .iter()
-                .any(|bound| bound.position(suffix) == Ordering::Greater)
+        if self.upper.as_ref().is_some_and(|(upper, strict)| {
+            next > upper.borrowed() || (*strict && next == upper.borrowed())
+        }) || self
+            .cursors
+            .iter()
+            .any(|bound| bound.position(key, self.prefix.len()) == Ordering::Greater)
         {
             return Ordering::Greater;
         }
@@ -267,11 +286,12 @@ impl CursorBound {
         }))
     }
 
-    fn position(&self, tuple: &[Atom]) -> Ordering {
+    fn position(&self, tuple: Tuple<'_>, offset: usize) -> Ordering {
         let order = tuple
             .iter()
+            .skip(offset)
             .zip(&self.key)
-            .map(|(value, bound)| value.cmp(bound))
+            .map(|(value, bound)| value.cmp(&bound.borrowed()))
             .find(|order| *order != Ordering::Equal)
             .unwrap_or(Ordering::Equal);
         match (order, self.lower, self.strict) {
@@ -429,7 +449,9 @@ fn order(
         }
     }
     let distinct_slot = if plan.distinct {
-        let [sort] = order.as_slice() else { return None };
+        let [sort] = order.as_slice() else {
+            return None;
+        };
         let slot = range.prefix.len();
         let field = fields.get(slot)?.as_ref()?;
         if family(&field.data_type) != Some(Family::Text)
@@ -511,13 +533,14 @@ impl Predicate {
         })
     }
 
-    fn matches(&self, tuple: &[Atom]) -> bool {
+    fn matches(&self, tuple: Tuple<'_>) -> bool {
         match self {
             Self::All(left, right) => left.matches(tuple) && right.matches(tuple),
             Self::Either(left, right) => left.matches(tuple) || right.matches(tuple),
             Self::Compare { slot, op, value } => {
-                let cell = &tuple[*slot];
-                if matches!(cell, Atom::Null | Atom::Unordered) || *value == Atom::Null {
+                let cell = tuple.cell(*slot);
+                let value = value.borrowed();
+                if matches!(cell, AtomRef::Null | AtomRef::Unordered) || value == AtomRef::Null {
                     return false;
                 }
                 match op {
@@ -539,31 +562,8 @@ async fn use_index(
     fields: &[Option<&Field>],
     range: &Range,
     top: Option<Top>,
-) -> Result<Option<Vec<Iid>>> {
-    if top.is_some_and(|top| top.limit == 0) {
-        return Ok(Some(Vec::new()));
-    }
-    let directory = definition.directory()?;
-    let through = source_frontier(request.snapshot, &definition.table);
-    let checkpoint = checkpoint::latest(request.storage, &directory, request.memory, through).await?;
-    if checkpoint.is_none() && through >= 0 {
-        return Ok(None);
-    }
-    let scope = checkpoint.as_ref().map_or(0, |checkpoint| checkpoint.scope);
-    let tree = Tree::new(request.storage, &directory, request.memory, scope).await?;
-    let system_at = request.bounds.system_time.lower();
-    let Some(root) = read_root(
-        &tree,
-        definition,
-        request.snapshot,
-        checkpoint,
-        system_at,
-        request.cancellation,
-    )
-    .await?
-    else {
-        return Ok(None);
-    };
+    covered_only: bool,
+) -> Result<Option<OrderedScan>> {
     let residuals = request
         .scan
         .ordered_top_k
@@ -584,6 +584,44 @@ async fn use_index(
     if distinct_slot.is_some() && !covered {
         return Ok(None);
     }
+    let projection = if top.is_some() && covered {
+        Covered::bind(request, definition)?
+    } else {
+        None
+    };
+    if covered_only && projection.is_none() {
+        return Ok(None);
+    }
+    if top.is_some_and(|top| top.limit == 0) {
+        return Ok(Some(if projection.is_some() {
+            OrderedScan::Covered(Vec::new())
+        } else {
+            OrderedScan::Iids(Vec::new())
+        }));
+    }
+
+    let directory = definition.directory()?;
+    let through = source_frontier(request.snapshot, &definition.table);
+    let checkpoint =
+        checkpoint::latest(request.storage, &directory, request.memory, through).await?;
+    if checkpoint.is_none() && through >= 0 {
+        return Ok(None);
+    }
+    let scope = checkpoint.as_ref().map_or(0, |checkpoint| checkpoint.scope);
+    let tree = Tree::new(request.storage, &directory, request.memory, scope).await?;
+    let system_at = request.bounds.system_time.lower();
+    let Some(root) = read_root(
+        &tree,
+        definition,
+        request.snapshot,
+        checkpoint,
+        system_at,
+        request.cancellation,
+    )
+    .await?
+    else {
+        return Ok(None);
+    };
     let reverse = top.is_some_and(|top| top.reverse);
     let buckets: Vec<_> = Bucket::at(request.bounds.valid_time.lower()).collect();
     let mut cursors: Vec<_> = buckets
@@ -604,43 +642,63 @@ async fn use_index(
     }
     let mut selected = Vec::new();
     let mut pending = Vec::new();
-    let mut last_distinct = None::<Arc<[Atom]>>;
+    let mut batches = Vec::new();
+    let mut batch_rows = Vec::new();
+    let mut batch_count = 0;
+    let mut last_distinct = None::<Head>;
     while let Some(head) = heap.pop() {
         if request.cancellation.is_cancelled() {
             return Err(cancelled());
         }
+        let slot = head.slot;
+        if head.tuple().len() != definition.columns.len() {
+            return Err(super::format_error(
+                "Posting width differs from its index definition",
+            ));
+        }
         if predicates
             .iter()
-            .all(|predicate| predicate.matches(&head.tuple))
+            .all(|predicate| predicate.matches(head.tuple()))
         {
             if covered {
-                let emit = distinct_slot.is_none_or(|slot| {
-                    last_distinct.as_ref().is_none_or(|prior| prior[slot] != head.tuple[slot])
+                let emit = distinct_slot.is_none_or(|key| {
+                    last_distinct
+                        .as_ref()
+                        .is_none_or(|prior| prior.tuple().cell(key) != head.tuple().cell(key))
                 });
                 if emit {
-                    selected.push(head.iid);
                     if distinct_slot.is_some() {
-                        last_distinct = Some(Arc::clone(&head.tuple));
+                        last_distinct = Some(head.clone());
+                    }
+                    if let Some(projection) = &projection {
+                        batch_rows.push(head);
+                        batch_count += 1;
+                        if batch_rows.len() == BATCH_ROWS {
+                            batches.push(projection.batch(request, &batch_rows)?);
+                            batch_rows.clear();
+                        }
+                    } else {
+                        selected.push(head.iid);
                     }
                 }
             } else {
                 pending.push(head.iid);
                 if pending.len()
-                    >= VERIFY_ROWS.min(top.map_or(VERIFY_ROWS, |top| {
+                    >= BATCH_ROWS.min(top.map_or(BATCH_ROWS, |top| {
                         top.limit.saturating_sub(selected.len()).max(1)
                     }))
                 {
                     filter_payload(request, residuals, &mut pending, &mut selected).await?;
                 }
             }
-            if top.is_some_and(|top| selected.len() >= top.limit) {
+            let count = selected.len() + batch_count;
+            if top.is_some_and(|top| count >= top.limit) {
                 break;
             }
-            if selected.len() > MAX_CANDIDATES {
+            if count > MAX_CANDIDATES {
                 return Ok(None);
             }
         }
-        let slot = head.slot;
         if let Some(head) = next(
             &mut cursors[slot],
             &tree,
@@ -654,8 +712,14 @@ async fn use_index(
             heap.push(head);
         }
     }
+    if let Some(projection) = projection {
+        if !batch_rows.is_empty() {
+            batches.push(projection.batch(request, &batch_rows)?);
+        }
+        return Ok(Some(OrderedScan::Covered(batches)));
+    }
     filter_payload(request, residuals, &mut pending, &mut selected).await?;
-    Ok(Some(selected))
+    Ok(Some(OrderedScan::Iids(selected)))
 }
 
 async fn next(
@@ -666,28 +730,165 @@ async fn next(
     slot: usize,
     reverse: bool,
 ) -> Result<Option<Head>> {
-    let entry = cursor
+    let hit = cursor
         .next(tree, |key| match key {
-            Key::Posting {
-                bucket: candidate,
-                tuple,
-                ..
-            } => candidate.cmp(&bucket).then_with(|| range.position(tuple)),
-            Key::Row(_) | Key::Revision(_) => Ordering::Greater,
+            KeyRef::Posting(candidate, tuple, _) => {
+                candidate.cmp(&bucket).then_with(|| range.position(tuple))
+            }
+            KeyRef::Row(_) | KeyRef::Revision(_) => Ordering::Greater,
         })
         .await?;
-    match entry.map(|entry| entry.key) {
-        Some(Key::Posting { tuple, iid, .. }) => Ok(Some(Head {
-            tuple,
-            iid,
-            slot,
-            reverse,
-        })),
-        Some(Key::Row(_) | Key::Revision(_)) => Err(super::format_error(
+    let Some(hit) = hit else {
+        return Ok(None);
+    };
+    let KeyRef::Posting(_, _, iid) = hit.key() else {
+        return Err(super::format_error(
             "Ordered index seek escaped its posting prefix",
-        )),
-        None => Ok(None),
+        ));
+    };
+    Ok(Some(Head {
+        hit,
+        iid,
+        slot,
+        reverse,
+    }))
+}
+
+struct Covered {
+    columns: Vec<(usize, ScalarType)>,
+    schema: Arc<Schema>,
+}
+
+impl Covered {
+    fn bind(request: &ScanRequest<'_>, definition: &Definition) -> Result<Option<Self>> {
+        let mut columns = Vec::new();
+        for field in &request.scan.columns {
+            let logical = match &field.data_type {
+                LogicalType::Maybe(value) => value.as_ref(),
+                logical => logical,
+            };
+            let LogicalType::Scalar(scalar) = logical else {
+                return Ok(None);
+            };
+            use ScalarType as S;
+            if !matches!(
+                scalar,
+                S::Utf8
+                    | S::Binary
+                    | S::Bool
+                    | S::Uuid
+                    | S::DateDay
+                    | S::I8
+                    | S::I16
+                    | S::I32
+                    | S::I64
+                    | S::U8
+                    | S::U16
+                    | S::U32
+                    | S::U64
+            ) {
+                return Ok(None);
+            }
+            let Some(slot) = definition
+                .columns
+                .iter()
+                .position(|column| column == &field.name)
+            else {
+                return Ok(None);
+            };
+            columns.push((slot, scalar.clone()));
+        }
+        let fields = request
+            .scan
+            .columns
+            .iter()
+            .map(|field| to_field(&field.name, &field.data_type))
+            .collect::<Result<Vec<_>>>()?;
+        Ok(Some(Self {
+            columns,
+            schema: Arc::new(Schema::new(fields)),
+        }))
     }
+
+    fn batch(&self, request: &ScanRequest<'_>, rows: &[Head]) -> Result<OwnedBatch> {
+        let mut builder = BatchBuilder::new(
+            4096 + self.columns.len().saturating_mul(256),
+            request.memory,
+        )?;
+        let mut arrays = Vec::with_capacity(self.columns.len());
+        for (slot, scalar) in &self.columns {
+            let cells = || rows.iter().map(|head| head.tuple().cell(*slot));
+            let retained = cells()
+                .map(|cell| cell.retained_bytes())
+                .fold(0usize, usize::saturating_add);
+            if retained > i32::MAX as usize {
+                return Err(super::format_error("Covered column exceeds Arrow offsets"));
+            }
+            let bound = retained
+                .saturating_mul(2)
+                .saturating_add(rows.len() * 64 + 1024);
+            arrays.push(builder.column(bound, || covered_array(scalar, cells()))?);
+        }
+        let options = arrow_array::RecordBatchOptions::new().with_row_count(Some(rows.len()));
+        let batch = RecordBatch::try_new_with_options(Arc::clone(&self.schema), arrays, &options)
+            .map_err(super::format_error)?;
+        builder.finish(batch)
+    }
+}
+
+fn covered_array<'a>(
+    scalar: &ScalarType,
+    cells: impl ExactSizeIterator<Item = AtomRef<'a>>,
+) -> Result<ArrayRef> {
+    let bad_type = || super::format_error("Posting does not have the covered field's type");
+    macro_rules! cells {
+        ($variant:ident, |$value:ident| $convert:expr) => {
+            cells.map(|cell| match cell {
+                AtomRef::$variant($value) => Ok(Some($convert)),
+                AtomRef::Null => Ok(None),
+                _ => Err(bad_type()),
+            })
+        };
+    }
+    macro_rules! integer {
+        ($array:ty, $ty:ty) => {
+            Arc::new(
+                cells!(Integer, |value| <$ty>::try_from(value)
+                    .map_err(super::format_error)?)
+                .collect::<Result<$array>>()?,
+            )
+        };
+    }
+    use ScalarType as S;
+    Ok(match scalar {
+        S::Utf8 => Arc::new(cells!(Text, |value| value).collect::<Result<StringArray>>()?),
+        S::Binary => Arc::new(cells!(Binary, |value| value).collect::<Result<BinaryArray>>()?),
+        S::Bool => Arc::new(cells!(Bool, |value| value).collect::<Result<BooleanArray>>()?),
+        S::DateDay => Arc::new(
+            cells!(Day, |value| i32::try_from(value)
+                .map_err(super::format_error)?)
+            .collect::<Result<Date32Array>>()?,
+        ),
+        S::I8 => integer!(Int8Array, i8),
+        S::I16 => integer!(Int16Array, i16),
+        S::I32 => integer!(Int32Array, i32),
+        S::I64 => integer!(Int64Array, i64),
+        S::U8 => integer!(UInt8Array, u8),
+        S::U16 => integer!(UInt16Array, u16),
+        S::U32 => integer!(UInt32Array, u32),
+        S::U64 => integer!(UInt64Array, u64),
+        S::Uuid => {
+            let mut builder = FixedSizeBinaryBuilder::with_capacity(cells.len(), 16);
+            for cell in cells!(Uuid, |value| value) {
+                match cell? {
+                    Some(value) => builder.append_value(value).map_err(super::format_error)?,
+                    None => builder.append_null(),
+                }
+            }
+            Arc::new(builder.finish())
+        }
+        _ => return Err(bad_type()),
+    })
 }
 
 async fn filter_payload(
@@ -710,17 +911,36 @@ async fn filter_payload(
     Ok(())
 }
 
-#[derive(PartialEq, Eq)]
+#[derive(Clone)]
 struct Head {
-    tuple: Arc<[Atom]>,
+    hit: Hit,
     iid: Iid,
     slot: usize,
     reverse: bool,
 }
 
+impl Head {
+    fn tuple(&self) -> Tuple<'_> {
+        let KeyRef::Posting(_, tuple, _) = self.hit.key() else {
+            unreachable!("head is a posting")
+        };
+        tuple
+    }
+}
+
+impl PartialEq for Head {
+    fn eq(&self, other: &Self) -> bool {
+        self.cmp(other) == Ordering::Equal
+    }
+}
+impl Eq for Head {}
+
 impl Ord for Head {
     fn cmp(&self, other: &Self) -> Ordering {
-        let order = (&self.tuple, self.iid, self.slot).cmp(&(&other.tuple, other.iid, other.slot));
+        let order = self
+            .tuple()
+            .compare(other.tuple())
+            .then_with(|| (self.iid, self.slot).cmp(&(other.iid, other.slot)));
         if self.reverse { order } else { order.reverse() }
     }
 }

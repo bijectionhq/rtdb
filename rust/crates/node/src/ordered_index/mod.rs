@@ -3,6 +3,7 @@ mod checkpoint;
 mod domain;
 mod key;
 mod maintenance;
+mod postings;
 mod projection;
 mod seek;
 mod tree;
@@ -22,6 +23,7 @@ pub(crate) use accelerate::OrderedIndexAccelerator;
 pub(crate) use maintenance::OrderedIndexMaintenance;
 
 use rtdb_format::keys::ORDERED_INDEX_ROOT as INDEX_ROOT;
+const PAGE_LAYOUT_VERSION: u8 = 1;
 const CATALOG: (&str, &str) = ("xt", "ordered_indexes");
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -40,6 +42,7 @@ impl Definition {
                 &self.table.table,
                 &self.name,
                 self.version,
+                PAGE_LAYOUT_VERSION,
             ))
             .map_err(format_error)?,
         );

@@ -4,19 +4,17 @@ use std::{
     sync::Arc,
 };
 
-use rtdb_columnar::{MemoryBudget, MemoryReservation, estimate_read_cell_bytes};
+use rtdb_columnar::{MemoryBudget, MemoryReservation};
 use rtdb_format::data::{EncodedEvent, EventBatch, PutColumn};
 use rtdb_temporal::HistoryResolver;
-use rtdb_types::{
-    EventHeader, EventOp, Iid, Interval, LogicalType, Result, TemporalBounds, Timestamp,
-};
+use rtdb_types::{EventHeader, EventOp, Iid, Interval, Result, TemporalBounds, Timestamp};
 use tokio_util::sync::CancellationToken;
 
 use super::{
     format_error,
-    key::{Atom, Bucket},
+    key::{Atom, AtomRef, Bucket},
     maintenance::cancelled,
-    tree::{Cursor, Entry, Item, Key, Link, Root, Span, Tree},
+    tree::{Cursor, Hit, Item, Key, KeyRef, Link, Root, Span, Tree},
 };
 
 /// The roots for the partition's system-time points, with erasures applied to every affected root.
@@ -38,9 +36,9 @@ impl RevisionRoots {
         let mut cursor = Cursor::new(self.archived.clone(), true);
         cursor
             .next(tree, |key| match key {
-                Key::Revision(time) if *time <= system_from => Ordering::Equal,
-                Key::Revision(_) => Ordering::Greater,
-                Key::Posting { .. } | Key::Row(_) => Ordering::Less,
+                KeyRef::Revision(time) if time <= system_from => Ordering::Equal,
+                KeyRef::Revision(_) => Ordering::Greater,
+                KeyRef::Posting(..) | KeyRef::Row(_) => Ordering::Less,
             })
             .await?
             .map(archived_revision)
@@ -123,7 +121,8 @@ impl RevisionRoots {
     }
 }
 
-fn archived_revision(entry: Entry) -> Result<(Timestamp, Root)> {
+fn archived_revision(hit: Hit) -> Result<(Timestamp, Root)> {
+    let entry = hit.into_entry();
     match (entry.key, entry.item) {
         (Key::Revision(time), Item::Revision(pointer)) => Ok((time, pointer.map(Link::Stored))),
         _ => Err(format_error(
@@ -284,35 +283,29 @@ impl Changes {
             if !retain(header) {
                 continue;
             }
-            let bytes = if header.op == EventOp::Put {
-                columns.iter().try_fold(256usize, |bytes, name| {
-                    let cell = match event.put_column(name) {
-                        Some(PutColumn::Stored(field, array, row)) => {
-                            estimate_read_cell_bytes(field, array, row)?
-                        }
-                        Some(PutColumn::Absent) | None => 0,
-                    };
-                    Ok::<_, rtdb_types::Anomaly>(
-                        bytes
-                            .saturating_add(cell.saturating_mul(3))
-                            .saturating_add(size_of::<Atom>()),
-                    )
-                })?
-            } else {
-                256
-            };
-            let allocation = memory.reserve(bytes)?;
-            let tuple = if header.op == EventOp::Put {
-                let values = columns
+            let (tuple, allocation) = if header.op == EventOp::Put {
+                let _cells =
+                    memory.reserve(columns.len().saturating_mul(size_of::<AtomRef<'_>>()))?;
+                let cells = columns
                     .iter()
-                    .map(|name| {
-                        let value = event.put_cell(name, &LogicalType::Null)?;
-                        Ok(Atom::of(&value).unwrap_or(Atom::Unordered))
+                    .map(|name| match event.put_column(name) {
+                        Some(PutColumn::Stored(field, array, row)) => {
+                            AtomRef::from_arrow(field, array, row)
+                        }
+                        Some(PutColumn::Absent) => Ok(AtomRef::Null),
+                        None => Err(format_error("An indexed put has no Arrow document")),
                     })
                     .collect::<Result<Vec<_>>>()?;
-                Some(values.into())
+                let bytes = cells.iter().fold(256usize, |bytes, cell| {
+                    bytes
+                        .saturating_add(size_of::<Atom>())
+                        .saturating_add(cell.retained_bytes())
+                });
+                let allocation = memory.reserve(bytes)?;
+                let values = cells.into_iter().map(AtomRef::owned).collect::<Arc<[_]>>();
+                (Some(values), allocation)
             } else {
-                None
+                (None, memory.reserve(256)?)
             };
             self.revisions
                 .entry(header.system_from)
@@ -375,15 +368,13 @@ mod tests {
             let mut cursor = Cursor::new(root.clone(), false);
             while let Some(entry) = cursor
                 .next(tree, |key| match key {
-                    Key::Posting {
-                        bucket: candidate, ..
-                    } => candidate.cmp(&bucket),
-                    Key::Row(_) | Key::Revision(_) => Ordering::Greater,
+                    KeyRef::Posting(candidate, _, _) => candidate.cmp(&bucket),
+                    KeyRef::Row(_) | KeyRef::Revision(_) => Ordering::Greater,
                 })
                 .await
                 .unwrap()
             {
-                let Key::Posting { tuple, iid, .. } = entry.key else {
+                let Key::Posting { tuple, iid, .. } = entry.into_entry().key else {
                     panic!("Expected posting");
                 };
                 let [Atom::Integer(value)] = tuple.as_ref() else {
