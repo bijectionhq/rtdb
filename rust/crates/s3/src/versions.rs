@@ -21,7 +21,9 @@ impl VersionedInventory {
     pub async fn purge(&self, deployment: &ObjectKey) -> Result<()> {
         let prefix = self.prefix(deployment);
         self.abort_uploads(&prefix).await?;
-        self.purge_versions(&prefix).await
+        self.purge_versions(&prefix).await?;
+        if self.is_empty(deployment).await? { Ok(()) }
+        else { Err(unavailable("The version or multipart inventory changed during erasure")) }
     }
 
     /// Observes the version and multipart inventories without modifying either.

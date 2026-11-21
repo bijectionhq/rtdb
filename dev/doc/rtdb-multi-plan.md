@@ -628,6 +628,7 @@ Deletion must be provable and forks must be cheap (spec rules `Fork`, `ForkAcros
    The signed `facts` name the deployment, its fencing epoch, prefix, object and key namespaces, and the inventory scope.
    A local receipt has scope `current_objects`.
    Below the slash-delimited deployment prefix, S3 deletion aborts incomplete multipart uploads and verifies that their parts are gone, then removes retained versions and delete markers by version ID.
+   It rechecks both inventories after these mutations before recording the first empty observation.
    It stores the first empty version and multipart inventories in the directory and reports the next retry time.
    Retry `delete` at least 15 minutes and one second after the first observation for a read-only second inventory.
    If the second inventory finds an object version or multipart upload, it resets the observation and keeps the key.
