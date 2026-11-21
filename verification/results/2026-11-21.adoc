@@ -643,3 +643,14 @@ The runner retains both systems and each counterexample formula.
 The comparison treats a listing and its two read outcomes as the environment's input for one attempt.
 The state-space proof applies to that finite observation model.
 The separate TLA+ study covers interleavings with publication and physical collection, and the native tests cover the two selected production schedules.
+
+== Combined verification through checkpoint discovery
+
+The complete runner passed on `061e83de6` with both Rust options and mCRL2 enabled.
+It checked 78 Verus obligations in eleven areas and matched all 46 Verus diagnostic controls.
+TLC completed all 18 bounded baselines and found the expected counterexamples or reachability witnesses for 45 controls.
+Lean, Z3, Alloy, Apalache, Maude and mCRL2 passed their recorded checks.
+The native replay covered seven checkpoint and recovery cases with their root-first and fail-fast controls, eighteen catalog tests with their two controls, the binary64 witness, 4,096 native temporal observations, replica admission compiler checks and the loopback Azure cases.
+The input manifest SHA-256 is `ae1040a40927f1f8cb2bb6dfcd1c89c95b1ae217a46cd29662e3e681e02da083`.
+A separate run on the same revision passed 111 tests in the node and replication packages with
+`BIJECTION_LOCAL_EXECUTION=owner-authorized cargo test --manifest-path rust/Cargo.toml --locked -p rtdb-node --test native -p rtdb-replication --lib`.
