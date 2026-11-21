@@ -8,6 +8,16 @@ use crate::{MemoryBudget, MemoryReservation, OwnedBatch, copy_array, estimate_bu
 
 mod physical;
 
+/// Adapts compatible physical layouts while retaining their value buffers.
+/// The caller reserves temporary metadata and any new union tags and offsets.
+/// The returned field carries the actual nullability, including nested fields.
+pub fn relayout_arrow_column(array: ArrayRef, source: &arrow_schema::Field, target: &arrow_schema::Field) -> Result<(arrow_schema::Field, ArrayRef)> {
+    let target_type = from_field(target)?;
+    let source_type = from_field(source)?;
+    layout(&target_type, &source_type)?;
+    physical::relayout(array, source, target)
+}
+
 /// A page in a declared wire layout, retaining its schema and allocation charges.
 /// The safe Rust batch marks null-bearing fields nullable; the declared wire schema preserves the caller's flags.
 /// Integer buffers may retain signed execution bits under a same-width unsigned declared field.

@@ -350,6 +350,8 @@ fn arrow_document_leg(pages: &[&StructArray], arrays: &mut BatchBuilder) -> Resu
                 field.as_ref().clone().with_nullable(true)
             } else if field.data_type() == &DataType::Null && field.is_nullable() {
                 previous.clone().with_nullable(true)
+            } else if let (Some(previous), Some(next)) = (nonnull_scalar_legs(previous)?, nonnull_scalar_legs(field)?) {
+                to_field(field.name(), &previous.join(&next))?
             } else {
                 return Ok(None);
             };
@@ -358,24 +360,39 @@ fn arrow_document_leg(pages: &[&StructArray], arrays: &mut BatchBuilder) -> Resu
     }
     let mut fields = Vec::with_capacity(layout.len());
     let mut columns = Vec::with_capacity(layout.len());
+    if layout.iter().any(|(name, field)| matches!(field.data_type(), DataType::Union(..))
+        && pages.iter().any(|page| {
+            page.fields().iter().find(|field| field.name() == name)
+                .is_none_or(|source| source.is_nullable() || source.data_type() == &DataType::Null)
+        })) {
+        return Ok(None);
+    }
     for (name, field) in layout {
         let inputs: Vec<_> = pages.iter().map(|page| {
-            page.column_by_name(&name).filter(|column| column.data_type() == field.data_type())
+            page.fields().iter().zip(page.columns()).find(|(source, _)| source.name() == &name)
+                .filter(|(source, _)| source.data_type() != &DataType::Null || field.data_type() == &DataType::Null)
         }).collect();
         let nullable = field.is_nullable() || inputs.iter().any(Option::is_none);
         let field = field.with_nullable(nullable);
         let logical = from_field(&field)?;
         let bound = pages.iter().zip(&inputs).try_fold(4096usize, |bytes, (page, column)| {
             let size = match column {
-                Some(column) => column.get_array_memory_size(),
+                Some((source, column)) => {
+                    let index_bytes = if source.data_type() == field.data_type() { 0 } else { 64 };
+                    column.get_array_memory_size().checked_add(column.len().checked_mul(index_bytes).ok_or_else(overflow)?).ok_or_else(overflow)?
+                }
                 None => estimate_builder_bytes_refs(&logical, std::iter::repeat_n(&Value::Null, page.len()))?,
             };
             size.checked_mul(4).and_then(|size| bytes.checked_add(size)).ok_or_else(overflow)
         })?;
         columns.push(arrays.column(bound, || {
             let inputs = pages.iter().zip(inputs).map(|(page, column)| {
-                column.cloned().unwrap_or_else(|| arrow_array::new_null_array(field.data_type(), page.len()))
-            }).collect::<Vec<_>>();
+                match column {
+                    Some((source, column)) if source.data_type() == field.data_type() => Ok(Arc::clone(column)),
+                    Some((source, column)) => rtdb_columnar::relayout_arrow_column(Arc::clone(column), source, &field).map(|(_, column)| column),
+                    None => Ok(arrow_array::new_null_array(field.data_type(), page.len())),
+                }
+            }).collect::<Result<Vec<_>>>()?;
             let inputs = inputs.iter().map(|array| array.as_ref()).collect::<Vec<_>>();
             arrow_select::concat::concat(&inputs).map_err(|error| invalid(error.to_string()))
         })?);
@@ -383,6 +400,17 @@ fn arrow_document_leg(pages: &[&StructArray], arrays: &mut BatchBuilder) -> Resu
     }
     let structs = rtdb_columnar::build_struct_array(fields.into(), &columns, *offsets.last().unwrap() as usize, None)?;
     document_list(structs, offsets).map(Some)
+}
+
+fn nonnull_scalar_legs(field: &Field) -> Result<Option<LogicalType>> {
+    if field.is_nullable() || !field.metadata().is_empty() { return Ok(None); }
+    let logical = from_field(field)?;
+    let scalar = match &logical {
+        LogicalType::Scalar(_) => true,
+        LogicalType::Union(legs) => legs.iter().all(|leg| matches!(leg, LogicalType::Scalar(_))),
+        _ => false,
+    };
+    Ok(scalar.then_some(logical))
 }
 
 fn row_document_leg(lists: Vec<&Documents>, arrays: &mut BatchBuilder) -> Result<ArrayRef> {
@@ -793,6 +821,38 @@ mod tests {
     }
 
     #[test]
+    fn arrow_puts_with_different_scalar_types_replay_as_dense_unions() {
+        let memory = budget();
+        let put = |id, value: ArrayRef| {
+            let schema = Arc::new(Schema::new(vec![
+                Field::new("_id", DataType::Int64, false),
+                Field::new("v", value.data_type().clone(), false),
+            ]));
+            let batch = RecordBatch::try_new(schema, vec![Arc::new(arrow_array::Int64Array::from(vec![id])), value]).unwrap();
+            let batch = OwnedBatch::new(batch, &memory).unwrap();
+            let documents = ArrowDocuments::from_batch(&batch, &memory).unwrap().unwrap();
+            TxOp::PutArrowDocs { table: TableRef::new("public", "docs"), documents }
+        };
+        let source = SourceTransaction::new(vec![
+            put(1, Arc::new(arrow_array::Int64Array::from(vec![7]))),
+            put(2, Arc::new(arrow_array::StringArray::from(vec!["text"]))),
+        ], SubmitOptions::default(), &memory).unwrap();
+
+        let replay = roundtrip(&source);
+
+        let expected = [Value::I64(7), Value::Utf8("text".into())];
+        for (operation, expected) in replay.operations.iter().zip(expected) {
+            let Operation::PutArrowIids { documents, .. } = operation else {
+                panic!("Expected Arrow documents on replay");
+            };
+            let array = documents.array().column_by_name("v").unwrap();
+            let field = documents.array().fields().iter().find(|field| field.name() == "v").unwrap();
+            assert!(array.as_any().is::<UnionArray>());
+            assert_eq!(read_value(field, array.as_ref(), 0).unwrap(), expected);
+        }
+    }
+
+    #[test]
     fn a_nested_struct_key_first_written_after_its_struct_was_undefined_is_nullable() {
         let memory = budget();
         let put = |row: StructFields<Value>| TxOp::PutDocs { table: TableRef::new("public", "docs"), documents: Documents::new(vec![row], &memory).unwrap(), valid_from: None, valid_to: None };
@@ -835,7 +895,8 @@ mod tests {
         let replayed = roundtrip(&decoded);
         for tx in [&decoded, &replayed] {
             let mut operations = tx.operations.iter();
-            let Operation::PutIids { documents, .. } = operations.next().unwrap() else { panic!("first put"); };
+            let Operation::PutArrowIids { documents, .. } = operations.next().unwrap() else { panic!("first put"); };
+            let documents = documents.to_rows(true, &memory).unwrap();
             assert_eq!(documents.columns(), ["z", "_id", "n", "b"]);
             assert_eq!(documents.rows()[0]["z"], Value::Utf8("last".into()));
             assert_eq!(documents.declared_types().unwrap()["n"], LogicalType::Null);
@@ -845,7 +906,8 @@ mod tests {
             assert_eq!(documents.columns(), ["_id", "e"]);
             assert_eq!(documents.declared_types().unwrap()["e"], LogicalType::Null);
             assert!(!documents.rows()[0].contains_key("e"));
-            let Operation::PutIids { documents, .. } = operations.next().unwrap() else { panic!("third put"); };
+            let Operation::PutArrowIids { documents, .. } = operations.next().unwrap() else { panic!("third put"); };
+            let documents = documents.to_rows(true, &memory).unwrap();
             assert_eq!(documents.columns(), ["z", "_id", "n", "b"]);
             assert_eq!(documents.rows()[0]["z"], Value::I64(7));
             assert_eq!(documents.rows()[0]["b"], Value::Bool(true));
