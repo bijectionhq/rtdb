@@ -59,8 +59,7 @@ impl RemoteStorageFactory for CellStoreFactory {
     async fn open(&self, configuration: &Any, storage_root: &ObjectKey, io: Arc<IoRegion>) -> Result<Arc<dyn ObjectStore>> {
         let config: CellStoreConfig = serde_json::from_slice(&configuration.value)
             .map_err(|error| Anomaly::incorrect("rtdb.multi/storage-config", format!("Cell storage configuration is malformed: {error}")))?;
-        let region = io.child();
-        let (record, release) = self.admit_region(&config, region.clone()).await?;
+        let (record, region, release) = self.admit_region(&config, io).await?;
         let recovery = crate::archive::ArchivedCheckpoint::load(&record, region.clone()).await?;
         let bucket = config.storage.bucket(region).await?;
         let store = format!("{}/{}", config.prefix, storage_root.as_str());
@@ -96,9 +95,10 @@ impl CellStoreFactory {
     async fn admit_region(
         &self,
         config: &CellStoreConfig,
-        io: Arc<IoRegion>,
-    ) -> Result<(DeploymentRecord, oneshot::Sender<()>)> {
+        parent: Arc<IoRegion>,
+    ) -> Result<(DeploymentRecord, Arc<IoRegion>, oneshot::Sender<()>)> {
         let directory = self.directory.clone();
+        let keys = self.keys.clone();
         let config = config.clone();
         let id = Uuid::new_v4();
         let (release, dropped) = oneshot::channel();
@@ -106,6 +106,20 @@ impl CellStoreFactory {
         // The worker owns both the admission and its release. Dropping the
         // opening future cannot strand a request that has reached the directory.
         self.storage_regions.spawn(async move {
+            let local = matches!(config.storage, crate::deployment::CellStorage::Local { .. });
+            let witness = if local {
+                match keys.hold_local_storage_region(id) {
+                    Ok(witness) => witness,
+                    Err(error) => {
+                        let _ = ready.send(Err(error));
+                        return;
+                    }
+                }
+            } else {
+                None
+            };
+            let witnessed = witness.is_some();
+            let io = parent.child_holding(witness.map(|file| Arc::new(file) as Arc<dyn Send + Sync>));
             let accepted = crate::admin::update_installation(directory.as_ref(), &config.deployment, |record| {
                 if !matches!(record.lifecycle, Lifecycle::Live | Lifecycle::Quarantined)
                     || record.storage_prefix() != config.prefix
@@ -122,29 +136,32 @@ impl CellStoreFactory {
             let uncertain = accepted.as_ref().err().is_some_and(|error| !matches!(
                 error.code.as_str(), "rtdb.multi/storage-authority" | "rtdb.multi/unknown-installation"
             ));
-            if ready.send(accepted).is_ok() && opened {
+            if ready.send(accepted.map(|record| (record, io.clone()))).is_ok() && opened {
                 let _ = dropped.await;
             }
             io.close_and_wait().await;
-            if !opened && !uncertain {
-                return;
-            }
+            drop(io);
             // A failed registration may already be committed. Compare and
             // replace even if absent to fence that attempt's old version.
-            loop {
-                match release_region(directory.as_ref(), &config.deployment, id, uncertain).await {
-                    Ok(()) => break,
-                    Err(error) => eprintln!("Storage region {id} still open in {}: {}", config.deployment, error.code),
+            if opened || uncertain {
+                loop {
+                    match release_region(directory.as_ref(), &config.deployment, id, uncertain).await {
+                        Ok(()) => break,
+                        Err(error) => eprintln!("Storage region {id} still open in {}: {}", config.deployment, error.code),
+                    }
+                    tokio::time::sleep(Duration::from_secs(1)).await;
                 }
-                tokio::time::sleep(Duration::from_secs(1)).await;
+            }
+            if witnessed && let Err(error) = keys.forget_local_storage_region(id) {
+                eprintln!("Could not remove storage region witness {id}: {}", error.code);
             }
         });
-        let record = admitted.await.map_err(|_| Anomaly::new(
+        let (record, region) = admitted.await.map_err(|_| Anomaly::new(
             rtdb_types::AnomalyCategory::Unavailable,
             "rtdb.multi/storage-admission",
             "The serving storage region could not be admitted",
         ))??;
-        Ok((record, release))
+        Ok((record, region, release))
     }
 
     async fn checkpoint(&self, config: &CellStoreConfig) -> Result<Option<i64>> {
@@ -166,6 +183,26 @@ async fn release_region(directory: &dyn Directory, deployment: &str, region: Uui
             "The installation changed while closing a storage region",
         )),
     }
+}
+
+/// The local operating system witnesses process death through the lock.
+/// A missing witness and remote provider operations both stay pending.
+pub(crate) async fn reconcile_local_regions(
+    directory: &dyn Directory,
+    storage: &crate::deployment::CellStorage,
+    keys: &dyn KeyService,
+    record: &DeploymentRecord,
+) -> Result<()> {
+    if !matches!(storage, crate::deployment::CellStorage::Local { .. }) {
+        return Ok(());
+    }
+    for &region in &record.storage_regions {
+        if keys.local_storage_region_drained(region)? {
+            release_region(directory, &record.id, region, false).await?;
+            keys.forget_local_storage_region(region)?;
+        }
+    }
+    Ok(())
 }
 
 #[derive(Clone, Copy)]
@@ -735,8 +772,7 @@ mod tests {
             compactor: false,
             snapshot_block: None,
         };
-        let region = IoRegion::new();
-        let (admitted, attachment) = factory.admit_region(&config, region.clone()).await.unwrap();
+        let (admitted, region, attachment) = factory.admit_region(&config, IoRegion::new()).await.unwrap();
         assert_eq!(admitted.storage_regions.len(), 1);
 
         let (entered, active) = oneshot::channel();
@@ -766,6 +802,29 @@ mod tests {
             .await.unwrap();
         assert_eq!(receipt.deployment, record.id);
         assert!(keys.key(&record.id).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn the_local_reaper_recovers_a_region_after_its_owner_drops_the_witness() {
+        let files = tempfile::tempdir().unwrap();
+        let keys = crate::keys::LocalKeyService::new(files.path().join("keys")).unwrap();
+        let storage = crate::deployment::CellStorage::Local { root: files.path().join("objects") };
+        let directory = rtdb_directory::MemoryDirectory::new();
+        let region = Uuid::new_v4();
+        let witness = keys.hold_local_storage_region(region).unwrap().unwrap();
+        let mut record = DeploymentRecord::new("shop", "acme", vec![], 0);
+        record.storage_regions.insert(region);
+        let record = directory.create_deployment(record).await.unwrap();
+        crate::admin::begin_disposal(directory.as_ref(), &record.id).await.unwrap();
+
+        let pending = crate::admin::finish_disposal(directory.as_ref(), &storage, &keys, &record.id, 4 << 20)
+            .await.unwrap_err();
+        assert_eq!(pending.code, "rtdb.multi/storage-not-drained");
+        drop(witness);
+        let receipt = crate::admin::finish_disposal(directory.as_ref(), &storage, &keys, &record.id, 4 << 20)
+            .await.unwrap();
+        assert_eq!(receipt.deployment, record.id);
+        assert!(!keys.local_storage_region_drained(region).unwrap(), "the consumed witness is removed");
     }
 
     #[tokio::test]

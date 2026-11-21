@@ -324,7 +324,7 @@ pub async fn move_cell(map: &dyn crate::cells::CellMap, from: &CellHandle<'_>, t
         return Err(conflict());
     }
     if fenced.lifecycle == Lifecycle::Moving {
-        await_storage_drain(from.directory, &fenced).await?;
+        await_storage_drain(from.directory, from.storage, from.keys, &fenced).await?;
         if target.is_none() {
             let stream = administration_stream(from.directory, &fenced, maximum_message_bytes).await?;
             rtdb_logkeeper::seal(&stream, fenced.epoch).await?;
@@ -465,15 +465,21 @@ pub(crate) async fn begin_hosted_disposal(directory: &dyn Directory, id: uuid::U
 /// Fences and removes an installation's serving storage. The tombstone retains its receipt.
 pub async fn delete_deployment(directory: &dyn Directory, storage: &CellStorage, keys: &dyn KeyService, id: &str, maximum_message_bytes: usize) -> Result<DisposalReceipt> {
     let fence = begin_disposal(directory, id).await?;
-    await_storage_drain(directory, &fence).await?;
+    await_storage_drain(directory, storage, keys, &fence).await?;
     finish_disposal(directory, storage, keys, id, maximum_message_bytes).await
 }
 
 /// Settles a disposal previously accepted by the directory.
 pub async fn finish_disposal(directory: &dyn Directory, storage: &CellStorage, keys: &dyn KeyService, id: &str, maximum_message_bytes: usize) -> Result<DisposalReceipt> {
-    let fenced = directory.deployment(id).await?.ok_or_else(|| {
+    let mut fenced = directory.deployment(id).await?.ok_or_else(|| {
         Anomaly::incorrect("rtdb.multi/unknown-installation", format!("No installation has ID {id}"))
     })?;
+    if fenced.lifecycle == Lifecycle::Deleting && !fenced.storage_regions.is_empty() {
+        crate::store::reconcile_local_regions(directory, storage, keys, &fenced).await?;
+        fenced = directory.deployment(id).await?.ok_or_else(|| {
+            Anomaly::incorrect("rtdb.multi/unknown-installation", format!("No installation has ID {id}"))
+        })?;
+    }
     match (fenced.lifecycle, fenced.disposal.as_ref()) {
         (Lifecycle::Deleted, Some(receipt)) => return Ok(receipt.clone()),
         (Lifecycle::Deleting, None) => {},
@@ -533,7 +539,7 @@ fn require_storage_drained(record: &DeploymentRecord) -> Result<()> {
     Ok(())
 }
 
-pub(crate) async fn await_storage_drain(directory: &dyn Directory, fence: &DeploymentRecord) -> Result<()> {
+pub(crate) async fn await_storage_drain(directory: &dyn Directory, storage: &CellStorage, keys: &dyn KeyService, fence: &DeploymentRecord) -> Result<()> {
     let start = tokio::time::Instant::now();
     let mut current = fence.clone();
     loop {
@@ -544,6 +550,7 @@ pub(crate) async fn await_storage_drain(directory: &dyn Directory, fence: &Deplo
         if start.elapsed() >= CONTROL_TIMEOUT {
             return Err(pending);
         }
+        crate::store::reconcile_local_regions(directory, storage, keys, &current).await?;
         tokio::time::sleep(Duration::from_millis(100)).await;
         current = directory.deployment(&fence.id).await?
             .filter(|current| current.epoch == fence.epoch && (

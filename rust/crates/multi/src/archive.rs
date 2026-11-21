@@ -682,7 +682,7 @@ pub async fn restore(
     if pending.completed_at_ms.is_some() {
         return Ok(pending);
     }
-    await_storage_drain(directory, &fenced).await?;
+    await_storage_drain(directory, storage, keys, &fenced).await?;
     let source = administration_stream(directory, &fenced, maximum_message_bytes).await?;
     rtdb_logkeeper::seal(&source, pending.epoch).await?;
 
