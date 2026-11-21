@@ -439,6 +439,7 @@ pub async fn finish_moves(directory: &dyn Directory, storage: &crate::deployment
                 return Err(Anomaly::incorrect("rtdb.multi/storage-binding-mismatch", format!("The source of {} belongs to a different object or key namespace", record.name)));
             }
             let prefix = crate::reference::key(&record.storage_prefix())?;
+            crate::reference::require_disjoint_prefix(&prefix, deployments.iter().filter(|other| other.id != record.id))?;
             if !bucket.list(Some(&prefix)).await?.is_empty() && !crate::reference::erase_deployment(bucket.as_ref(), prefix.as_str(), &others).await? {
                 return Err(Anomaly::fault("rtdb.multi/move-cleanup-incomplete", format!("The source still holds objects for {}", record.name)));
             }

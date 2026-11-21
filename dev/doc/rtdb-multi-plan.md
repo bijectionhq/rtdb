@@ -567,6 +567,8 @@ Deletion must be provable and forks must be cheap (spec rules `Fork`, `ForkAcros
    The S3 deletion role needs `s3:ListBucketVersions` and `s3:DeleteObjectVersion` alongside its current-object permissions. [ListObjectVersions](https://docs.aws.amazon.com/AmazonS3/latest/API/API_ListObjectVersions.html) [DeleteObjects](https://docs.aws.amazon.com/AmazonS3/latest/API/API_DeleteObjects.html)
    Upgrade all directory readers before an S3 deletion writes the new scope to its tombstone.
    The timestamps record successful observations during the attempt that publishes the receipt.
+   A new deployment or fork uses an organisation identifier that fits one storage path component.
+   Prefix erasure rejects overlap with another recorded deployment's prefix, including legacy records with older organisation identifiers.
    A holder binds its deployment to the node's configured namespaces in its first claim, and forks and cell moves carry the binding into their destination records.
    Deletion checks that binding before fencing, and a pristine root may take its first binding in the deletion CAS.
    An existing deployment without a binding acquires one from a configured holder before forking or moving.
@@ -600,6 +602,7 @@ Unbounded means adding cells (spec contract `CellMap`).
    Overlapping S3 prefixes in the same named bucket are rejected before writing namespace markers.
    Retry `move-cell` with the same source, destination and namespace configuration when preparation or cutover is interrupted.
    A retry before preparation completes copies to a fresh destination prefix under the original writer fence.
+   The destination prefix must be disjoint from all deployment prefixes recorded in the destination directory.
    Once prepared, the source records the chosen prefix, the destination staged record waits for the placement switch, and retry finishes the same switch or source tombstone.
    The destination's holder imports the old log ensemble before log-fed replicas can serve it.
    The source reaper verifies the recorded object namespace and any supplied key namespace before erasing the old copy.

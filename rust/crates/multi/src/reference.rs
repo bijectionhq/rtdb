@@ -263,10 +263,21 @@ impl References {
 
 /// Erases every object a deployment's `prefix` holds, first copying what the other deployments of the cell (`others`) reference into them, and returns whether the prefix is then empty.
 pub async fn erase_deployment(bucket: &dyn ObjectStore, prefix: &str, others: &[DeploymentRecord]) -> Result<bool> {
+    require_disjoint_prefix(&key(prefix)?, others.iter())?;
     let references = References::scan(bucket, others).await?;
     for store in stores(bucket, prefix).await? { references.erase_store(bucket, &store).await?; }
     for object in bucket.list(Some(&key(prefix)?)).await.map_err(storage)? { bucket.delete(&object.key).await.map_err(storage)?; }
     Ok(bucket.list(Some(&key(prefix)?)).await.map_err(storage)?.is_empty())
+}
+
+pub(crate) fn require_disjoint_prefix<'a>(prefix: &ObjectKey, others: impl Iterator<Item = &'a DeploymentRecord>) -> Result<()> {
+    for other in others {
+        let other_prefix = key(&other.storage_prefix())?;
+        if other_prefix.is_under(prefix) || prefix.is_under(&other_prefix) {
+            return Err(Anomaly::incorrect("rtdb.multi/overlapping-deployment-prefix", format!("Storage prefix {prefix} overlaps the storage of {}", other.name)));
+        }
+    }
+    Ok(())
 }
 
 async fn copy_in(from_bucket: &dyn ObjectStore, from: &str, to_bucket: &dyn ObjectStore, to: &str) -> rtdb_storage::Result<()> {
@@ -307,6 +318,19 @@ mod tests {
 
     fn bucket() -> Bucket { Arc::new(rtdb_storage::MemoryStore::default()) }
     async fn put(bucket: &Bucket, name: &str, bytes: &[u8]) { bucket.put(&key(name).unwrap(), Bytes::copy_from_slice(bytes)).await.unwrap(); }
+
+    #[tokio::test]
+    async fn deleting_an_overlapping_prefix_leaves_the_other_deployments_objects_intact() {
+        let bucket = bucket();
+        let other = DeploymentRecord::new("other", "acme", Vec::new(), 0);
+        let other_prefix = other.storage_prefix();
+        let retained = format!("{other_prefix}/v06/rows");
+        put(&bucket, &retained, b"other deployment").await;
+        let (outer, _) = other_prefix.rsplit_once('/').unwrap();
+        let error = erase_deployment(bucket.as_ref(), outer, &[other]).await.unwrap_err();
+        assert_eq!(error.code, "rtdb.multi/overlapping-deployment-prefix");
+        assert_eq!(bucket.get(&key(&retained).unwrap()).await.unwrap(), b"other deployment".as_slice());
+    }
 
     struct TransferringStore {
         inner: Bucket,

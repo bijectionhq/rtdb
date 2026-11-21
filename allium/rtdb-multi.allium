@@ -847,6 +847,7 @@ rule CreateDeployment {
     when: CreateRequested(org, cell)
 
     requires: count(cell.deployments) < config.cell_max_deployments
+    requires: IsStoragePathComponent(org.id)
 
     ensures:
         let id = DeploymentId.created()
@@ -1802,6 +1803,8 @@ rule EraseAndProve {
     -- The terminal CAS keeps the signed receipt with the tombstone so a retry returns the same receipt.
     when: SharedObjectsTransferred(record)
 
+    requires: DeploymentPrefixIsDisjoint(record)
+
     ensures:
         DeleteAllVersionsUnder(record.storage_root.prefix, except: TransferredObjects(record))
         AwaitEmptyInventory(record.storage_root.prefix, twice_separated_by: config.credential_ttl)
@@ -1861,6 +1864,7 @@ rule BeginCellMove {
     when: CellMoveRequested(record, target_cell)
 
     requires: record.lifecycle = live
+    requires: DestinationDeploymentPrefixIsDisjoint(record, target_cell)
 
     ensures:
         Directory.cas(record.id, record.epoch, change: {
@@ -1893,6 +1897,7 @@ rule CleanUpMovedSource {
     requires: record.lifecycle = deleted
     requires: record.source_namespaces != null
     requires: StorageNamespacesMatchSource(record)
+    requires: DeploymentPrefixIsDisjoint(record)
 
     ensures:
         EraseSourceCopyAfterTransferringSharedObjects(record)

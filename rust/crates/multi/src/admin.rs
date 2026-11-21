@@ -20,9 +20,17 @@ const CONTROL_TIMEOUT: Duration = Duration::from_secs(35);
 /// Creates a deployment, choosing its ensemble from the live logkeepers in its affinity order.
 /// Allocates identity and nothing else: no objects, no log state, no compute.
 pub async fn create_deployment(directory: &dyn Directory, name: &str, org: &str, replicas: usize) -> Result<DeploymentRecord> {
+    validate_org(org)?;
     let mut record = DeploymentRecord::new(name, org, Vec::new(), now_ms());
     record.ensemble = choose_ensemble(directory, &record, replicas).await?;
     directory.create_deployment(record).await
+}
+
+fn validate_org(org: &str) -> Result<()> {
+    if org.contains('/') || rtdb_storage::ObjectKey::new(org).is_err() {
+        return Err(Anomaly::incorrect("rtdb.multi/invalid-organisation", "The organisation must be a single storage path component"));
+    }
+    Ok(())
 }
 
 async fn choose_ensemble(directory: &dyn Directory, record: &DeploymentRecord, replicas: usize) -> Result<Vec<MemberId>> {
@@ -265,6 +273,7 @@ pub async fn fork_at_time(directory: &dyn Directory, storage: &CellStorage, keys
 }
 
 async fn fork_with_tail(directory: &dyn Directory, bucket: &dyn rtdb_storage::ObjectStore, keys: &dyn KeyService, source: &DeploymentRecord, name: &str, at_block: Option<i64>, mut tail: Vec<rtdb_format::envelope::ReplicaEnvelope>, maximum_message_bytes: usize) -> Result<DeploymentRecord> {
+    validate_org(&source.org)?;
     let mut child = DeploymentRecord::new(name, source.org.clone(), Vec::new(), now_ms());
     child.lineage = source.lineage.clone();
     child.parent = Some(source.id.clone());
@@ -358,6 +367,7 @@ pub struct CellHandle<'a> { pub name: &'a str, pub directory: &'a dyn Directory,
 
 /// Creates a deployment in the least occupied cell with room, and records the cell in the cell map.
 pub async fn create_in_cells(map: &dyn crate::cells::CellMap, cells: &[CellHandle<'_>], name: &str, org: &str, replicas: usize) -> Result<(String, DeploymentRecord)> {
+    validate_org(org)?;
     if map.cell_of(name).await?.is_some() { return Err(crate_exists(name)); }
     let mut best = None;
     for cell in cells {
@@ -404,6 +414,9 @@ pub async fn move_cell(map: &dyn crate::cells::CellMap, from: &CellHandle<'_>, t
     )?;
     let source_prefix = rtdb_storage::ObjectKey::new(current.storage_prefix())?;
     let destination_prefix = rtdb_storage::ObjectKey::new(destination.storage_prefix())?;
+    if ready.is_none() {
+        crate::reference::require_disjoint_prefix(&destination_prefix, to.directory.deployments().await?.iter())?;
+    }
     if from.storage.cleanup_contains(to.storage, &source_prefix)? || to.storage.cleanup_contains(from.storage, &destination_prefix)? {
         return Err(Anomaly::incorrect("rtdb.multi/shared-cell-storage", "Cell moves require object stores outside each other's deployment cleanup prefixes"));
     }
@@ -826,8 +839,16 @@ mod tests {
     use rtdb_directory::MemoryDirectory;
     use rtdb_storage::{MemoryStore, ObjectKey, ObjectStore, object_store::StoredObject};
 
-    use super::{CellStorage, DeploymentRecord, Directory, KeyService, Lifecycle, delete_deployment, finish_deletion};
+    use super::{CellStorage, DeploymentRecord, Directory, KeyService, Lifecycle, create_deployment, delete_deployment, finish_deletion};
     use crate::keys::LocalKeyService;
+
+    #[tokio::test]
+    async fn a_new_deployment_rejects_an_organisation_with_multiple_path_components() {
+        let directory = MemoryDirectory::new();
+        let error = create_deployment(directory.as_ref(), "shop", "acme/orders", 0).await.unwrap_err();
+        assert_eq!(error.code, "rtdb.multi/invalid-organisation");
+        assert!(directory.deployments().await.unwrap().is_empty());
+    }
 
     struct RetainingStore<'a>(&'a MemoryStore);
 
