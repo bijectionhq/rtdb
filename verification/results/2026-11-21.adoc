@@ -1563,3 +1563,44 @@ BIJECTION_LOCAL_EXECUTION=owner-authorized cargo test --offline --locked \
 The command logs are under
 `/private/tmp/rtdb-formal.QMjPSJsX/protocol15-vault-1b8bab5af-native.log`
 and `/private/tmp/rtdb-formal.QMjPSJsX/s3-key-custody-focused/`.
+The combined formal run at `1b8bab5af` completed successfully with 457 recorded commands.
+It includes the five S3 custody cases and the other registered baseline, control and reachability checks.
+The vault's production network behavior remains covered by the scoped native tests above.
+
+=== Serving key enrollment and gateway replay
+
+A serving store uses the existing key when custody provides one.
+An absent key reaches enrollment only after a fresh directory check confirms the current writer of the original residence and no durable history.
+The direct store test observes refusal for a reader, a retired writer epoch and a writer whose journal inventory already exists.
+The separate Rust run at `e2b5204a6` passed 196 Multi cases, with one credentialed test ignored.
+Verus checks the production enrollment predicate with five verified functions.
+The single and joint controls for each of its three inputs report the expected failures.
+This proof treats the directory lookup, journal reservation order and conditional provider provisioning as premises.
+
+The latest Multi branch supplies protected gateway command keys and retains the initial deadline across replacement writers.
+The Multi proof runner preserves isolated TLC work directories and checks the branch's gateway replay model with its controls.
+TLC visits 358 reachable baseline states and rejects all three changed variants.
+The Lean laws cover key selection and preservation of deadlines across an arbitrary finite sequence of replacements.
+The same-model controls cover a session reset, malformed metadata and a renewed recovery window.
+Verus checks the production deadline decision and the composed cutoff law, and the jointly weakened contract fails at the composed law.
+The runtime contract still depends on durable duplicate detection using the same effective transaction key within its retention window.
+The Multi proof script passed all 16 Lean files and 18 TLC configurations at `124570088`.
+The integrated native run at `a997308e7` passed 447 cases across Multi, node, PgWire and conformance.
+One credentialed DynamoDB case was ignored.
+The PgWire, socket and Multi cases exercised retained command keys through session reset, rejection of older replacement writers, the fixed deadline across two replacements and availability after the isolation placement closed.
+The simulation library compiled in this run and its scenario integration tests are a separate invocation.
+The directory fixtures now retry or wait for the precise asynchronous operation they depend on, and parser-only fixtures run with replication disabled.
+
+[source,shell]
+----
+cd rust
+BIJECTION_LOCAL_EXECUTION=owner-authorized cargo test --offline --locked \
+  -p rtdb-multi --features dynamodb,s3-key-vault --lib --test cell \
+  -p rtdb-node --test native --test fragments -p rtdb-pgwire --test protocol \
+  -p rtdb-conformance --test node_faults -p rtdb-simulation --no-fail-fast
+----
+
+The machine-local evidence is under
+`/private/tmp/rtdb-formal.QMjPSJsX/gateway-and-key-a997308e7-native.log`,
+`/private/tmp/rtdb-formal.QMjPSJsX/multi-124570088-proofs.log`,
+and `/private/tmp/rtdb-formal.QMjPSJsX/combined-124570088/`.

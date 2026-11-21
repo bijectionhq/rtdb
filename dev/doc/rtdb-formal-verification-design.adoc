@@ -813,6 +813,30 @@ Changing the order alone would leave a crash window in which the catalog has adv
 The production protocol needs replayable retirement intent, proof of final exclusion including shared artefacts, a directory update binding the certificate to the admission floor, and an identity-preserving delete through the storage provider.
 Crash detection, provider copy and pack sharing remain separate implementation obligations. link:../../verification/tla/RetirementPublication.tla[Retirement publication model] · link:../../rust/crates/maintenance/src/gc.rs[Trie collection]
 
+The production certificate must bind the installation, storage namespace, root, journal epoch, terminal catalog cut and immutable physical identity.
+A content digest attests to bytes and can repeat across separate publications.
+A provider version must identify one publication, or publication must allocate an object name that the namespace cannot reuse.
+An adapter that lacks either capability cannot execute a certified deletion.
+
+Keep retirement intent durable before recording the catalog transition so a replacement writer can resume both before and after installation.
+The installed prefix proves which transition took effect.
+The post-transition catalog must exclude the same immutable identity, including every member reference to a shared artefact.
+Publishing the certificate and its admission floor belongs in one directory CAS for that residence.
+The effect can be retried against the same certified identity after loss of a provider reply.
+A checkpoint can retain the intent or its completion through a journal trim only when the new recovery anchor supplies the same evidence.
+
+Recovery, inspection and fork readers also supply retention obligations.
+A currently installed serving catalog can exclude an object that a still-admissible checkpoint needs before replay.
+Retiring a packed entry must account for the other entries and for manifests that name the pack.
+An exact recovery or a shared-reference fork must establish its objects under its own authority before the source may remove them.
+Those premises require composition with the checkpoint, shared-reference and provider models before an ordinary hosted reaper may depend on serving-reader cuts.
+
+A migration activates certified collection only where every serving owner enforces the same admission floor.
+The collector retains uncertified releases in that namespace until they can be matched to authoritative retirement evidence.
+A mixed-version owner that cannot register its captured cut needs a separate hold before any deletion can proceed.
+The runtime replay must cover restart before and after publication, a reader that keeps provider work after cancellation, a fork using physical objects from the old residence, and a new incarnation after a delayed delete.
+
+
 === Hosted key custody
 
 The vault installs one current key per deployment, checkpoint or stage identity.
