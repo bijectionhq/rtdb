@@ -59,7 +59,8 @@ impl ColumnBatch {
         if bytes <= lease.bytes() { lease.shrink_to(bytes)?; } else { lease.grow_to(bytes)?; }
         Ok(Self { columns, len, _reservation: reservation })
     }
-    fn charged(&self) -> usize { self._reservation.bytes() }
+    pub(crate) fn charged(&self) -> usize { self._reservation.bytes() }
+    pub(crate) fn into_reservation(self) -> Arc<MemoryReservation> { self._reservation }
     /// A page of rows as columns of values, charged as each column is built.
     pub fn from_page(page: &OwnedPage, memory: &Arc<MemoryBudget>) -> Result<Self> {
         let width = page.rows().first().map_or(0, |row| row.values.len());
@@ -78,24 +79,28 @@ impl ColumnBatch {
     /// Rows share the page's charge, which ends when the last of them drops.
     pub fn rows(&self, memory: &Arc<MemoryBudget>) -> Result<OwnedPage> { self.rows_admitting(memory, false) }
     pub fn rows_admitting(&self, memory: &Arc<MemoryBudget>, admit_dates: bool) -> Result<OwnedPage> {
-        let mut page = PageBuilder::new(self.len, memory)?;
-        let mut bound = 0usize;
-        for row in 0..self.len {
-            let row_bound = self.columns.iter().try_fold(256usize, |bound, column| bound.checked_add(column.bound(row)?).ok_or_else(size_error))?;
-            bound = bound.checked_add(row_bound).ok_or_else(size_error)?;
-        }
-        let reservation = memory.reserve(bound)?;
-        for row in 0..self.len {
-            let mut values = Vec::with_capacity(self.columns.len());
-            for column in &self.columns {
-                let mut value = column.value(row)?;
-                if admit_dates { value.admit_expression_dates()?; }
-                values.push(value);
-            }
-            page.push(OwnedRow::with_reservation(values, Arc::clone(&reservation))?)?;
-        }
-        Ok(page.finish())
+        rows_from_columns(&self.columns, self.len, memory, admit_dates)
     }
+}
+
+pub(crate) fn rows_from_columns(columns: &[Column], len: usize, memory: &Arc<MemoryBudget>, admit_dates: bool) -> Result<OwnedPage> {
+    let mut page = PageBuilder::new(len, memory)?;
+    let mut bound = 0usize;
+    for row in 0..len {
+        let row_bound = columns.iter().try_fold(256usize, |bound, column| bound.checked_add(column.bound(row)?).ok_or_else(size_error))?;
+        bound = bound.checked_add(row_bound).ok_or_else(size_error)?;
+    }
+    let reservation = memory.reserve(bound)?;
+    for row in 0..len {
+        let mut values = Vec::with_capacity(columns.len());
+        for column in columns {
+            let mut value = column.value(row)?;
+            if admit_dates { value.admit_expression_dates()?; }
+            values.push(value);
+        }
+        page.push(OwnedRow::with_reservation(values, Arc::clone(&reservation))?)?;
+    }
+    Ok(page.finish())
 }
 
 /// The put leg each event batch stores a resolved row's cells in.
@@ -417,8 +422,14 @@ impl BatchCursor for BatchFilter {
     async fn next_batch(&mut self) -> Result<Option<ColumnBatch>> {
         while let Some(batch) = self.input.next_batch().await? {
             self.execution.context.check_cancelled()?;
-            let truth = kernel::truth(&self.predicate, &self.schema, &batch, self.execution.parameters.values())
-                .or_else(|| crate::vector::truth(&self.predicate, &self.schema, &batch, self.execution.parameters.values()));
+            let parameters = self.execution.parameters.values();
+            let memory = &self.execution.context.memory;
+            let truth = kernel::truth(&self.predicate, &self.schema, &batch, parameters);
+            if truth.is_none() && let Some(filtered) = crate::vector::filter(&self.predicate, &self.schema, &batch, parameters, memory) {
+                if filtered.len != 0 { return Ok(Some(filtered)); }
+                continue;
+            }
+            let truth = truth.or_else(|| crate::vector::truth(&self.predicate, &self.schema, &batch, parameters));
             let mask = match truth {
                 Some(truth) => truth.into_iter().map(|value| value == Some(true)).collect::<Vec<_>>(),
                 None => {
@@ -1043,9 +1054,12 @@ impl BatchCursor for BatchExpressions {
     async fn next_batch(&mut self) -> Result<Option<ColumnBatch>> {
         let Some(batch) = self.input.next_batch().await? else { return Ok(None) };
         self.execution.context.check_cancelled()?;
+        let parameters = self.execution.parameters.values();
+        if let Some(projected) = crate::vector::project(&self.expressions, &self.schema, &batch, parameters, &self.execution.context.memory) {
+            return Ok(Some(projected));
+        }
         if self.clocked.is_none() { self.clocked = Some(read_clock(&self.expressions, &self.execution).await?); }
         let clocked = self.clocked.as_deref().unwrap_or_default();
-        let parameters = self.execution.parameters.values();
         let mut page = None;
         let mut columns = Vec::with_capacity(self.expressions.len());
         let mut reservation = self.execution.context.memory.reserve(256)?;

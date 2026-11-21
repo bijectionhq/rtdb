@@ -346,11 +346,17 @@ impl QueryCursor {
 
 /// The batch a page of the same rows would encode: a column already in the result's layout is kept, any other is
 /// copied from the cells a row would hold.
-fn column_batch(schema: &Schema, memory: &Arc<MemoryBudget>, batch: crate::columnar::ColumnBatch) -> Result<OwnedBatch> {
+pub(crate) fn column_batch(schema: &Schema, memory: &Arc<MemoryBudget>, batch: crate::columnar::ColumnBatch) -> Result<OwnedBatch> {
     let overflow = || invalid("batch-size", "Output batch allocation bound overflow");
     if batch.columns.len() != schema.len() { return Err(invalid("row-width", "Operator output differs from its declared schema")); }
     let fields = schema.fields().iter().map(|field| to_field(&field.name, &field.data_type)).collect::<Result<Vec<_>>>()?;
     let kept: Vec<Option<ArrayRef>> = batch.columns.iter().zip(schema.fields()).zip(&fields).map(|((column, field), arrow)| crate::columnar::conform(column, &field.data_type, arrow)).collect();
+    if kept.iter().all(Option::is_some) {
+        let options = RecordBatchOptions::new().with_row_count(Some(batch.len));
+        let output = RecordBatch::try_new_with_options(Arc::new(ArrowSchema::new(fields)), kept.into_iter().flatten().collect(), &options)
+            .map_err(|error| invalid("output-arrow", error))?;
+        return OwnedBatch::with_reservation(output, batch.into_reservation());
+    }
     let kept_bytes = kept.iter().flatten().try_fold(4096usize, |bytes, array| bytes.checked_add(array.get_array_memory_size()).ok_or_else(overflow))?;
     let mut reservation = memory.reserve(kept_bytes)?;
     let mut arrays = Vec::with_capacity(kept.len());

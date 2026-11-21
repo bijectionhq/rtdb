@@ -10,6 +10,8 @@ use datafusion_common::ScalarValue;
 use datafusion_common::config::ConfigOptions;
 use datafusion_expr::{ColumnarValue, Operator};
 use datafusion_physical_expr::{PhysicalExpr, ScalarFunctionExpr, expressions as df};
+use datafusion_physical_expr::projection::{ProjectionExpr, ProjectionExprs};
+use rtdb_columnar::MemoryBudget;
 use rtdb_plan::{BinaryOp, CastTarget, Expr, Schema, UnaryOp};
 use rtdb_types::{LogicalType, ScalarType, Value};
 
@@ -46,16 +48,31 @@ impl Inputs<'_> {
 }
 
 /// A lowered expression, with the divisors whose zeros the evaluator would reject.
-struct Lowering<'a> { inputs: Inputs<'a>, parameters: &'a [Value], divisors: Vec<Arc<dyn PhysicalExpr>>, functions: Vec<(Arc<datafusion_expr::ScalarUDF>, Vec<Arc<dyn PhysicalExpr>>, usize)> }
+struct Lowering<'a> { inputs: Inputs<'a>, parameters: &'a [Value], divisors: Vec<Arc<dyn PhysicalExpr>> }
 
 fn literal(value: &Value, expected: &DataType) -> Option<ScalarValue> {
     Some(match (value, expected) {
+        (Value::Null | Value::Undefined, _) => ScalarValue::try_new_null(expected).ok()?,
         (Value::I8(v), DataType::Int8) => ScalarValue::Int8(Some(*v)), (Value::I16(v), DataType::Int16) => ScalarValue::Int16(Some(*v)),
         (Value::I32(v), DataType::Int32) => ScalarValue::Int32(Some(*v)), (Value::I64(v), DataType::Int64) => ScalarValue::Int64(Some(*v)),
         (Value::F64(v), DataType::Float64) => ScalarValue::Float64(Some(*v)), (Value::Utf8(v), DataType::Utf8) => ScalarValue::Utf8(Some(v.clone())),
         (Value::Bool(v), DataType::Boolean) => ScalarValue::Boolean(Some(*v)),
         _ => return None,
     })
+}
+
+fn comparison_type(left: &DataType, right: &DataType) -> Option<DataType> {
+    match (left, right) {
+        (a, b) if integer(a) && integer(b) => Some(DataType::Int64),
+        (DataType::Utf8, DataType::Utf8) => Some(DataType::Utf8),
+        (DataType::Boolean, DataType::Boolean) => Some(DataType::Boolean),
+        _ => None,
+    }
+}
+
+fn comparison_operand(expr: &Expr) -> Option<DataType> {
+    if matches!(expr, Expr::Literal(Value::Null | Value::Undefined)) { return Some(DataType::Null); }
+    arrow_type(&expr.data_type()).map(|(_, data_type)| data_type)
 }
 
 impl Lowering<'_> {
@@ -73,29 +90,38 @@ impl Lowering<'_> {
                 let op = match op { BinaryOp::Add => Operator::Plus, BinaryOp::Subtract => Operator::Minus, BinaryOp::Multiply => Operator::Multiply, _ => { self.divisors.push(Arc::clone(&right)); Operator::Divide } };
                 Arc::new(df::BinaryExpr::new(left, op, right).with_fail_on_overflow(true))
             }
-            Expr::Binary { op: op @ (BinaryOp::Eq | BinaryOp::NotEq | BinaryOp::Lt | BinaryOp::LtEq | BinaryOp::Gt | BinaryOp::GtEq), left, right } => {
+            Expr::Binary { op: op @ (BinaryOp::Eq | BinaryOp::NotEq | BinaryOp::Lt | BinaryOp::LtEq | BinaryOp::Gt | BinaryOp::GtEq | BinaryOp::IsDistinctFrom | BinaryOp::IsNotDistinctFrom), left, right } => {
                 // Floats compare by IEEE in the evaluator but by total order in Arrow, so only exact domains are lowered.
-                let (_, left_type) = arrow_type(&left.data_type())?;
-                let (_, right_type) = arrow_type(&right.data_type())?;
+                let left_type = comparison_operand(left)?;
+                let right_type = comparison_operand(right)?;
                 let common = match (&left_type, &right_type) {
-                    (a, b) if integer(a) && integer(b) => DataType::Int64,
-                    (DataType::Utf8, DataType::Utf8) => DataType::Utf8,
-                    (DataType::Boolean, DataType::Boolean) => DataType::Boolean,
-                    _ => return None,
+                    (DataType::Null, DataType::Null) => DataType::Boolean,
+                    (DataType::Null, ty) | (ty, DataType::Null) => comparison_type(ty, ty)?,
+                    (a, b) => comparison_type(a, b)?,
                 };
                 let left = self.cast_to(left, &common)?;
                 let right = self.cast_to(right, &common)?;
-                let op = match op { BinaryOp::Eq => Operator::Eq, BinaryOp::NotEq => Operator::NotEq, BinaryOp::Lt => Operator::Lt, BinaryOp::LtEq => Operator::LtEq, BinaryOp::Gt => Operator::Gt, _ => Operator::GtEq };
+                let op = match op {
+                    BinaryOp::Eq => Operator::Eq, BinaryOp::NotEq => Operator::NotEq,
+                    BinaryOp::Lt => Operator::Lt, BinaryOp::LtEq => Operator::LtEq,
+                    BinaryOp::Gt => Operator::Gt, BinaryOp::GtEq => Operator::GtEq,
+                    BinaryOp::IsDistinctFrom => Operator::IsDistinctFrom,
+                    _ => Operator::IsNotDistinctFrom,
+                };
                 Arc::new(df::BinaryExpr::new(left, op, right))
             }
             Expr::Binary { op: op @ (BinaryOp::And | BinaryOp::Or), left, right } => {
-                let (left, left_type) = self.lower(left)?;
-                let (right, right_type) = self.lower(right)?;
-                if left_type != DataType::Boolean || right_type != DataType::Boolean { return None; }
+                let left = self.cast_to(left, &DataType::Boolean)?;
+                let right = self.cast_to(right, &DataType::Boolean)?;
                 Arc::new(df::BinaryExpr::new(left, if *op == BinaryOp::And { Operator::And } else { Operator::Or }, right))
             }
-            Expr::Unary { op: UnaryOp::Not, expr } => { let (inner, inner_type) = self.lower(expr)?; if inner_type != DataType::Boolean { return None; } Arc::new(df::NotExpr::new(inner)) }
-            Expr::Unary { op: UnaryOp::IsNull, expr } => Arc::new(df::IsNullExpr::new(self.lower(expr)?.0)),
+            Expr::Unary { op: UnaryOp::Not, expr } => Arc::new(df::NotExpr::new(self.cast_to(expr, &DataType::Boolean)?)),
+            Expr::Unary { op: op @ (UnaryOp::IsTrue | UnaryOp::IsFalse), expr } => {
+                let inner = self.cast_to(expr, &DataType::Boolean)?;
+                let expected = Arc::new(df::Literal::new(ScalarValue::Boolean(Some(*op == UnaryOp::IsTrue))));
+                Arc::new(df::BinaryExpr::new(inner, Operator::IsNotDistinctFrom, expected))
+            }
+            Expr::Unary { op: UnaryOp::IsNull | UnaryOp::IsUnknown, expr } => Arc::new(df::IsNullExpr::new(self.lower(expr)?.0)),
             Expr::Unary { op: UnaryOp::IsNotNull, expr } => Arc::new(df::IsNotNullExpr::new(self.lower(expr)?.0)),
             Expr::Unary { op: UnaryOp::Negate, expr } => {
                 let inner = self.cast_to(expr, &data_type)?;
@@ -122,6 +148,13 @@ impl Lowering<'_> {
                 let otherwise = self.cast_to(otherwise, &data_type)?;
                 Arc::new(df::CaseExpr::try_new(None, whens, Some(otherwise)).ok()?)
             }
+            Expr::In { expr, values, negated } if !values.is_empty() && values.iter().all(static_input) => {
+                let data_type = comparison_operand(expr)?;
+                let common = comparison_type(&data_type, &data_type)?;
+                let input = self.cast_to(expr, &common)?;
+                let list = values.iter().map(|value| self.cast_to(value, &common)).collect::<Option<Vec<_>>>()?;
+                Arc::new(df::InListExpr::try_new(input, list, *negated, &self.schema()).ok()?)
+            }
             Expr::Call { name, args, .. } if args.len() == 1 => {
                 let function = match (name.to_ascii_lowercase().as_str(), &data_type) {
                     ("upper", DataType::Utf8) => datafusion_functions::string::upper(),
@@ -134,9 +167,9 @@ impl Lowering<'_> {
                 let expected_argument = if matches!(name.to_ascii_lowercase().as_str(), "abs") { data_type.clone() } else { DataType::Utf8 };
                 if argument_type != expected_argument { return None; }
                 let (argument, _) = self.lower(&args[0])?;
-                let index = self.functions.len();
-                self.functions.push((function, vec![argument], index));
-                return self.function(index, data_type);
+                let call = ScalarFunctionExpr::try_new(function, vec![argument], &self.schema(), Arc::new(ConfigOptions::default())).ok()?;
+                if call.return_type() != &data_type { return None; }
+                Arc::new(call)
             }
             _ => return None,
         };
@@ -145,20 +178,33 @@ impl Lowering<'_> {
 
     /// Lowers `expr` and casts it to `target`, where the evaluator converts the operand the same way.
     fn cast_to(&mut self, expr: &Expr, target: &DataType) -> Option<Arc<dyn PhysicalExpr>> {
+        if matches!(expr, Expr::Literal(Value::Null | Value::Undefined)) {
+            return Some(Arc::new(df::Literal::new(ScalarValue::try_new_null(target).ok()?)));
+        }
         let (lowered, data_type) = self.lower(expr)?;
         if &data_type == target { return Some(lowered); }
         let exact = integer(&data_type) && (integer(target) && widens(&data_type, target) || *target == DataType::Float64);
         exact.then(|| Arc::new(df::CastExpr::new(lowered, target.clone(), Some(datafusion_common::arrow::compute::CastOptions { safe: false, ..Default::default() }))) as Arc<dyn PhysicalExpr>)
     }
 
-    /// A function call over the inputs gathered so far, built against their schema.
-    fn function(&mut self, index: usize, data_type: DataType) -> Option<(Arc<dyn PhysicalExpr>, DataType)> {
-        let (function, arguments, _) = self.functions[index].clone();
-        let schema = ArrowSchema::new(self.inputs.fields.clone());
-        let call = ScalarFunctionExpr::try_new(function, arguments, &schema, Arc::new(ConfigOptions::default())).ok()?;
-        (call.return_type() == &data_type).then(|| (Arc::new(call) as Arc<dyn PhysicalExpr>, data_type))
+    fn schema(&self) -> ArrowSchema { ArrowSchema::new(self.inputs.fields.clone()) }
+
+    fn batch(&self) -> Option<RecordBatch> {
+        let columns = self.inputs.positions.iter().map(|position| match &self.inputs.batch.columns[*position] {
+            Column::Arrow { array, .. } => Some(Arc::clone(array)),
+            Column::Values(_) => None,
+        }).collect::<Option<Vec<_>>>()?;
+        let options = arrow_array::RecordBatchOptions::new().with_row_count(Some(self.inputs.batch.len));
+        let batch = RecordBatch::try_new_with_options(Arc::new(self.schema()), columns, &options).ok()?;
+        for divisor in &self.divisors {
+            let values = divisor.evaluate(&batch).ok()?.into_array(batch.num_rows()).ok()?;
+            if zero_present(&values) { return None; }
+        }
+        Some(batch)
     }
 }
+
+fn static_input(expr: &Expr) -> bool { matches!(expr, Expr::Literal(_) | Expr::Parameter { .. }) }
 
 fn widens(from: &DataType, to: &DataType) -> bool {
     let width = |data_type: &DataType| match data_type { DataType::Int8 => 1, DataType::Int16 => 2, DataType::Int32 => 4, DataType::Int64 => 8, _ => 0 };
@@ -168,12 +214,13 @@ fn widens(from: &DataType, to: &DataType) -> bool {
 /// Whether the shape of `expr` could be lowered; its inputs' layouts decide per batch.
 pub(crate) fn lowerable(expr: &Expr) -> bool {
     match expr {
-        Expr::Column { .. } | Expr::Parameter { .. } | Expr::Literal(_) => arrow_type(&expr.data_type()).is_some(),
+        Expr::Column { .. } | Expr::Parameter { .. } | Expr::Literal(_) => comparison_operand(expr).is_some(),
         Expr::Binary { op: BinaryOp::Add | BinaryOp::Subtract | BinaryOp::Multiply | BinaryOp::Divide | BinaryOp::Eq | BinaryOp::NotEq | BinaryOp::Lt | BinaryOp::LtEq
-            | BinaryOp::Gt | BinaryOp::GtEq | BinaryOp::And | BinaryOp::Or, left, right } => lowerable(left) && lowerable(right),
-        Expr::Unary { op: UnaryOp::Not | UnaryOp::IsNull | UnaryOp::IsNotNull | UnaryOp::Negate, expr } => lowerable(expr),
+            | BinaryOp::Gt | BinaryOp::GtEq | BinaryOp::IsDistinctFrom | BinaryOp::IsNotDistinctFrom | BinaryOp::And | BinaryOp::Or, left, right } => lowerable(left) && lowerable(right),
+        Expr::Unary { op: UnaryOp::Not | UnaryOp::IsNull | UnaryOp::IsNotNull | UnaryOp::IsTrue | UnaryOp::IsFalse | UnaryOp::IsUnknown | UnaryOp::Negate, expr } => lowerable(expr),
         Expr::Cast { expr, target: CastTarget::Fixed(_) } => lowerable(expr),
         Expr::Case { branches, otherwise } => branches.iter().all(|(condition, value)| lowerable(condition) && lowerable(value)) && lowerable(otherwise),
+        Expr::In { expr, values, .. } => !values.is_empty() && lowerable(expr) && values.iter().all(|value| static_input(value) && lowerable(value)),
         Expr::Call { name, args, .. } => args.len() == 1 && matches!(name.to_ascii_lowercase().as_str(), "upper" | "lower" | "length" | "character_length" | "char_length" | "abs") && lowerable(&args[0]),
         _ => false,
     }
@@ -182,17 +229,84 @@ pub(crate) fn lowerable(expr: &Expr) -> bool {
 /// Evaluates `expr` over a batch's columns, or `None` where the evaluator must compute this batch.
 pub(crate) fn evaluate(expr: &Expr, schema: &Schema, batch: &ColumnBatch, parameters: &[Value]) -> Option<ArrayRef> {
     if !lowerable(expr) { return None; }
-    let mut lowering = Lowering { inputs: Inputs { schema, batch, positions: Vec::new(), fields: Vec::new() }, parameters, divisors: Vec::new(), functions: Vec::new() };
+    let mut lowering = Lowering { inputs: Inputs { schema, batch, positions: Vec::new(), fields: Vec::new() }, parameters, divisors: Vec::new() };
     let (lowered, data_type) = lowering.lower(expr)?;
-    let columns: Vec<ArrayRef> = lowering.inputs.positions.iter().map(|position| match &batch.columns[*position] { Column::Arrow { array, .. } => Some(Arc::clone(array)), Column::Values(_) => None }).collect::<Option<_>>()?;
-    let input = RecordBatch::try_new_with_options(Arc::new(ArrowSchema::new(lowering.inputs.fields.clone())), columns,
-        &arrow_array::RecordBatchOptions::new().with_row_count(Some(batch.len))).ok()?;
-    for divisor in &lowering.divisors {
-        let divisor = divisor.evaluate(&input).ok()?.into_array(batch.len).ok()?;
-        if zero_present(&divisor) { return None; }
-    }
+    let input = lowering.batch()?;
     let result = match lowered.evaluate(&input).ok()? { ColumnarValue::Array(array) => array, scalar => scalar.into_array(batch.len).ok()? };
     (result.data_type() == &data_type && result.len() == batch.len).then_some(result)
+}
+
+fn expression_bound(expression: &Expr, rows: usize, parameters: &[Value]) -> Option<usize> {
+    let per_node = rows.checked_mul(64)?.checked_add(4096)?;
+    let mut estimate = Some(0usize);
+    expression.visit(&mut |expr| {
+        estimate = estimate.and_then(|bytes| {
+            let bytes = bytes.checked_add(per_node)?;
+            let scalar = match expr {
+                Expr::Call { .. } | Expr::Case { .. } => return None,
+                Expr::Literal(value) => value,
+                Expr::Parameter { index, .. } => parameters.get(*index)?,
+                _ => return Some(bytes),
+            };
+            bytes.checked_add(scalar.retained_bytes().ok()?.checked_mul(4)?)
+        });
+    });
+    estimate
+}
+
+pub(crate) fn filter(predicate: &Expr, schema: &Schema, batch: &ColumnBatch, parameters: &[Value], memory: &Arc<MemoryBudget>) -> Option<ColumnBatch> {
+    if batch.len == 0 || batch.columns.iter().any(|column| matches!(column, Column::Values(_))) || !lowerable(predicate) { return None; }
+    let retained = batch.charged().checked_mul(2)?;
+    let reservation = memory.reserve(retained.checked_add(expression_bound(predicate, batch.len, parameters)?)?).ok()?;
+    let fields = batch.columns.iter().enumerate().map(|(position, column)| match column {
+        Column::Arrow { array, .. } => Some(ArrowField::new(format!("c{position}"), array.data_type().clone(), true)),
+        Column::Values(_) => None,
+    }).collect::<Option<Vec<_>>>()?;
+    let mut lowering = Lowering { inputs: Inputs { schema, batch, positions: (0..fields.len()).collect(), fields }, parameters, divisors: Vec::new() };
+    let (lowered, data_type) = lowering.lower(predicate)?;
+    if data_type != DataType::Boolean { return None; }
+    let filtered = datafusion_physical_plan::filter::batch_filter(&lowering.batch()?, &lowered).ok()?;
+    let columns = filtered.columns().iter().zip(&batch.columns).map(|(array, column)| match column {
+        Column::Arrow { field, logical, .. } => Some(Column::Arrow { array: Arc::clone(array), field: Arc::clone(field), logical: logical.clone() }),
+        Column::Values(_) => None,
+    }).collect::<Option<Vec<_>>>()?;
+    ColumnBatch::settled(columns, filtered.num_rows(), reservation).ok()
+}
+
+fn projection_bound(expressions: &[Expr], schema: &Schema, batch: &ColumnBatch, parameters: &[Value]) -> Option<usize> {
+    expressions.iter().try_fold(4096usize, |total, expression| {
+        let (_, output) = arrow_type(&expression.data_type())?;
+        if !(integer(&output) || matches!(output, DataType::Float64 | DataType::Boolean)) || !lowerable(expression) { return None; }
+        let mut estimate = total.checked_add(expression_bound(expression, batch.len, parameters)?);
+        expression.visit(&mut |node| {
+            if let Expr::Column { id, .. } = node {
+                estimate = estimate.and_then(|bytes| {
+                    bytes.checked_add(batch.columns.get(schema.position(*id)?)?.retained_bytes().ok()?)
+                });
+            }
+        });
+        estimate
+    })
+}
+
+pub(crate) fn project(expressions: &[Expr], schema: &Schema, batch: &ColumnBatch, parameters: &[Value], memory: &Arc<MemoryBudget>) -> Option<ColumnBatch> {
+    let reservation = memory.reserve(projection_bound(expressions, schema, batch, parameters)?).ok()?;
+    let mut lowering = Lowering { inputs: Inputs { schema, batch, positions: Vec::new(), fields: Vec::new() }, parameters, divisors: Vec::new() };
+    let mut physical = Vec::with_capacity(expressions.len());
+    let mut logical = Vec::with_capacity(expressions.len());
+    for (index, expression) in expressions.iter().enumerate() {
+        let (expr, data_type) = lowering.lower(expression)?;
+        physical.push(ProjectionExpr { expr, alias: format!("p{index}") });
+        logical.push((arrow_type(&expression.data_type())?.0, data_type));
+    }
+    let input = lowering.batch()?;
+    let projector = ProjectionExprs::new(physical).make_projector(input.schema().as_ref()).ok()?;
+    let output = projector.project_batch(&input).ok()?;
+    let schema = output.schema();
+    let columns = output.columns().iter().zip(schema.fields()).zip(logical).map(|((array, field), (scalar, data_type))| (array.data_type() == &data_type).then(|| Column::Arrow {
+        array: Arc::clone(array), field: Arc::clone(field), logical: Some(LogicalType::Scalar(scalar)),
+    })).collect::<Option<Vec<_>>>()?;
+    ColumnBatch::settled(columns, output.num_rows(), reservation).ok()
 }
 
 /// Whether any non-null cell of a divisor is zero, which the evaluator rejects even for doubles.
@@ -231,6 +345,133 @@ mod tests {
     use rtdb_columnar::MemoryBudget;
     use rtdb_plan::{ColumnId, Field};
     use rtdb_types::Timestamp;
+
+    #[test]
+    fn datafusion_computes_null_safe_comparisons_and_truth_tests() {
+        let memory = MemoryBudget::new(1 << 20);
+        let schema = Schema::new(vec![field(4, ScalarType::Bool)]).unwrap();
+        let array = Arc::new(BooleanArray::from(vec![Some(true), None, Some(false)]));
+        let column = Column::Arrow { array, field: Arc::new(ArrowField::new("c4", DataType::Boolean, true)), logical: Some(LogicalType::Scalar(ScalarType::Bool)) };
+        let batch = ColumnBatch::settled(vec![column], 3, memory.reserve(0).unwrap()).unwrap();
+        let cases = [
+            (Expr::binary(BinaryOp::IsDistinctFrom, self::column(4), Expr::Literal(Value::Null)), [true, false, true]),
+            (Expr::binary(BinaryOp::IsNotDistinctFrom, self::column(4), Expr::Literal(Value::Bool(false))), [false, false, true]),
+            (Expr::Unary { op: UnaryOp::IsTrue, expr: Box::new(self::column(4)) }, [true, false, false]),
+            (Expr::Unary { op: UnaryOp::IsFalse, expr: Box::new(self::column(4)) }, [false, false, true]),
+            (Expr::Unary { op: UnaryOp::IsUnknown, expr: Box::new(self::column(4)) }, [false, true, false]),
+        ];
+        for (expr, expected) in cases {
+            assert_eq!(truth(&expr, &schema, &batch, &[]).unwrap(), expected.map(Some), "{expr:?}");
+        }
+    }
+
+    #[test]
+    fn datafusion_computes_typed_membership_with_nulls() {
+        let memory = MemoryBudget::new(1 << 20);
+        let schema = Schema::new(vec![field(1, ScalarType::I32)]).unwrap();
+        let array = Arc::new(Int32Array::from(vec![Some(1), Some(2), Some(3), None]));
+        let column = Column::Arrow { array, field: Arc::new(ArrowField::new("c1", DataType::Int32, true)), logical: Some(LogicalType::Scalar(ScalarType::I32)) };
+        let batch = ColumnBatch::settled(vec![column], 4, memory.reserve(0).unwrap()).unwrap();
+        for (negated, expected) in [(false, Some(true)), (true, Some(false))] {
+            let expr = Expr::In {
+                expr: Box::new(self::column(1)),
+                values: vec![
+                    Expr::Literal(Value::I16(1)),
+                    Expr::Parameter { index: 0, data_type: LogicalType::Scalar(ScalarType::I64).maybe() },
+                    Expr::Literal(Value::Null),
+                ],
+                negated,
+            };
+            assert_eq!(truth(&expr, &schema, &batch, &[Value::I64(3)]).unwrap(), [expected, None, expected, None]);
+            assert_eq!(truth(&expr, &schema, &batch, &[Value::Null]).unwrap(), [expected, None, None, None]);
+        }
+    }
+
+    #[test]
+    fn datafusion_filters_all_arrow_columns_and_releases_its_reservation() {
+        let memory = MemoryBudget::new(1 << 20);
+        let schema = Schema::new(vec![field(1, ScalarType::I32), field(3, ScalarType::Utf8)]).unwrap();
+        let arrow = |name, array: ArrayRef, scalar| Column::Arrow {
+            field: Arc::new(ArrowField::new(name, array.data_type().clone(), true)),
+            array,
+            logical: Some(LogicalType::Scalar(scalar)),
+        };
+        let batch = ColumnBatch::settled(vec![
+            arrow("numbers", Arc::new(Int32Array::from(vec![Some(1), None, Some(2), Some(1)])), ScalarType::I32),
+            arrow("labels", Arc::new(StringArray::from(vec!["first", "null", "other", "last"])), ScalarType::Utf8),
+        ], 4, memory.reserve(0).unwrap()).unwrap();
+        let input_bytes = memory.used_bytes();
+        let predicate = Expr::In {
+            expr: Box::new(self::column(1)),
+            values: vec![Expr::Parameter { index: 0, data_type: LogicalType::Scalar(ScalarType::I32) }],
+            negated: false,
+        };
+        let filtered = super::filter(&predicate, &schema, &batch, &[Value::I32(1)], &memory).unwrap();
+        assert_eq!(filtered.len, 2);
+        assert_eq!(filtered.columns[1].value(0).unwrap(), Value::Utf8("first".into()));
+        assert_eq!(filtered.columns[1].value(1).unwrap(), Value::Utf8("last".into()));
+        assert!(memory.used_bytes() > input_bytes);
+        drop(filtered);
+        assert_eq!(memory.used_bytes(), input_bytes);
+
+        let empty = super::filter(&predicate, &schema, &batch, &[Value::I32(9)], &memory).unwrap();
+        assert_eq!(empty.len, 0);
+        assert_eq!(empty.columns.len(), 2);
+        drop(empty);
+        assert_eq!(memory.used_bytes(), input_bytes);
+
+        let small = MemoryBudget::new(1);
+        assert!(super::filter(&predicate, &schema, &batch, &[Value::I32(1)], &small).is_none());
+        assert_eq!(small.used_bytes(), 0);
+    }
+
+    #[test]
+    fn datafusion_projects_multiple_exact_expressions_and_releases_its_reservation() {
+        let memory = MemoryBudget::new(1 << 20);
+        let schema = Schema::new(vec![field(0, ScalarType::I64)]).unwrap();
+        let expressions = [
+            Expr::binary(BinaryOp::Add, self::column(0), Expr::Literal(Value::I64(3))),
+            Expr::binary(BinaryOp::IsDistinctFrom, self::column(0), Expr::Literal(Value::Null)),
+            self::column(0),
+        ];
+        for values in [vec![Some(2), None, Some(5)], Vec::new()] {
+            let len = values.len();
+            let array = Arc::new(Int64Array::from(values));
+            let column = Column::Arrow { array, field: Arc::new(ArrowField::new("source", DataType::Int64, true)), logical: Some(LogicalType::Scalar(ScalarType::I64)) };
+            let input = ColumnBatch::settled(vec![column], len, memory.reserve(0).unwrap()).unwrap();
+            let input_bytes = memory.used_bytes();
+            let output = super::project(&expressions, &schema, &input, &[], &memory).unwrap();
+            assert_eq!(output.len, len);
+            assert_eq!(output.columns.len(), 3);
+            if len != 0 {
+                for (column, expected) in output.columns.iter().zip([
+                    [Value::I64(5), Value::Null, Value::I64(8)],
+                    [Value::Bool(true), Value::Bool(false), Value::Bool(true)],
+                    [Value::I64(2), Value::Null, Value::I64(5)],
+                ]) {
+                    assert_eq!((0..len).map(|row| column.value(row).unwrap()).collect::<Vec<_>>(), expected);
+                }
+            }
+            drop(output);
+            assert_eq!(memory.used_bytes(), input_bytes);
+            let small = MemoryBudget::new(1);
+            assert!(super::project(&expressions, &schema, &input, &[], &small).is_none());
+            assert_eq!(small.used_bytes(), 0);
+        }
+    }
+
+    #[test]
+    fn datafusion_declines_projection_when_arithmetic_overflows() {
+        let memory = MemoryBudget::new(1 << 20);
+        let schema = Schema::new(vec![field(0, ScalarType::I64)]).unwrap();
+        let array = Arc::new(Int64Array::from(vec![i64::MAX]));
+        let column = Column::Arrow { array, field: Arc::new(ArrowField::new("source", DataType::Int64, true)), logical: Some(LogicalType::Scalar(ScalarType::I64)) };
+        let input = ColumnBatch::settled(vec![column], 1, memory.reserve(0).unwrap()).unwrap();
+        let input_bytes = memory.used_bytes();
+        let sum = Expr::binary(BinaryOp::Add, self::column(0), Expr::Literal(Value::I64(1)));
+        assert!(super::project(&[self::column(0), sum], &schema, &input, &[], &memory).is_none());
+        assert_eq!(memory.used_bytes(), input_bytes);
+    }
 
     struct Random(u64);
     impl Random {

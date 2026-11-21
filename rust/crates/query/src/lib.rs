@@ -5,6 +5,7 @@ mod parameters;
 mod cursor;
 mod runtime_schema;
 mod operators;
+mod limit;
 mod list;
 mod column_table;
 #[cfg(test)]

@@ -18,6 +18,62 @@ fn query_context(options: QueryOptions) -> Arc<QueryContext> {
 }
 
 #[tokio::test]
+async fn scalar_scan_projects_and_honors_offset_after_parameter_membership() {
+    use rtdb_index::{PartitionState, TransactionBuffer};
+    use rtdb_plan::{Catalog, QualifiedTable, Scan, TemporalFilter};
+    use rtdb_trie::TrieConfig;
+    use rtdb_types::{Interval, TableRef, TransactionKey, TxId};
+
+    let table = TableRef::new("public", "orders");
+    let memory = MemoryBudget::new(1 << 25);
+    let state = PartitionState::empty(TrieConfig::new(2, 4).unwrap()).unwrap();
+    let key = TransactionKey { tx_id: TxId(0), system_time: Timestamp(10) };
+    let mut transaction = TransactionBuffer::new(state.value().snapshot(), key, Arc::clone(&memory)).unwrap();
+    for id in 0..32 {
+        transaction.put(table.clone(), StructFields::from([
+            ("_id".into(), Value::I64(id)),
+            ("status".into(), Value::I32((id % 4) as i32)),
+        ]), Interval::ALL).unwrap();
+    }
+    state.apply(&transaction.stage().unwrap()).unwrap();
+    let database = DatabaseSnapshot { partitions: vec![state.value().snapshot()], storage: Arc::new(BufferPool::new(Arc::new(MemoryStore::default()), 1 << 20)) };
+    let catalog = CatalogSnapshot::new("xtdb", BTreeMap::from([("xtdb".into(), database)]), false).unwrap();
+    let context = QueryContext::new(catalog, memory, Timestamp(50), "UTC", QueryOptions { batch_rows: 2, ..Default::default() }, &CancellationToken::new()).unwrap();
+    let binding = context.catalog.table(&QualifiedTable { database: "xtdb".into(), table }).unwrap().unwrap();
+    let id = field(0, "_id", binding.columns["_id"].clone());
+    let status = field(1, "status", binding.columns["status"].clone());
+    let scan = Arc::new(Relation::scan(Scan { table: binding, columns: vec![id, status.clone()], valid_time: TemporalFilter::Default, system_time: TemporalFilter::Default,
+        clamp_valid_time: false, iids: None, predicates: vec![Expr::In { expr: Box::new(status.expression()), values: vec![Expr::Parameter { index: 0, data_type: scalar(ScalarType::I32) }, Expr::Literal(Value::I16(2)), Expr::Literal(Value::Null)], negated: false }], top_k: None, matches: vec![] }).unwrap());
+    let limited = Arc::new(scan.clone().limit(Some(Expr::Parameter { index: 1, data_type: scalar(ScalarType::I64) }), Some(Expr::Literal(Value::I64(4)))).unwrap());
+    let adjusted = Expr::binary(BinaryOp::Add, status.expression(), Expr::Literal(Value::I64(10)));
+    let changed = Expr::binary(BinaryOp::IsDistinctFrom, status.expression(), Expr::Literal(Value::I16(0)));
+    let projected = Arc::new(scan.clone().project(vec![
+        NamedExpr { field: field(2, "adjusted", adjusted.data_type()), expr: adjusted },
+        NamedExpr { field: field(3, "changed", changed.data_type()), expr: changed },
+    ]).unwrap());
+    let mut results = Vec::new();
+    for (relation, args) in [(scan, vec![Value::I32(0)]), (limited, vec![Value::I32(0), Value::I64(5)]), (projected, vec![Value::I32(0)])] {
+        let mut cursor = PreparedQuery::new(relation).unwrap().execute(Arc::clone(&context), args).await.unwrap();
+        let mut rows = Vec::new();
+        while let Some(output) = cursor.next_batch().await.unwrap() {
+            let batch = output.batch();
+            for row in 0..batch.num_rows() {
+                rows.push((read_value(batch.schema().field(0), batch.column(0).as_ref(), row).unwrap(), read_value(batch.schema().field(1), batch.column(1).as_ref(), row).unwrap()));
+            }
+        }
+        results.push(rows);
+    }
+    assert_eq!(results[0].len(), 16);
+    assert!(results[0].iter().all(|(_, status)| matches!(status, Value::I32(0 | 2))));
+    assert_eq!(results[1], results[0][5..9]);
+    let expected = results[0].iter().map(|(_, status)| {
+        let Value::I32(status) = status else { unreachable!() };
+        (Value::I64(i64::from(*status) + 10), Value::Bool(*status != 0))
+    }).collect::<Vec<_>>();
+    assert_eq!(results[2], expected);
+}
+
+#[tokio::test]
 async fn direct_parameters_admit_signed_values_before_rows_and_keep_advertised_fields() {
     let unsigned = scalar(ScalarType::U64).maybe();
     let schema = Schema::new(vec![field(0, "v", unsigned.clone())]).unwrap();

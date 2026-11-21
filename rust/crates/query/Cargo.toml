@@ -26,6 +26,7 @@ arrow-select.workspace = true
 datafusion-common.workspace = true
 datafusion-expr.workspace = true
 datafusion-physical-expr.workspace = true
+datafusion-physical-plan.workspace = true
 datafusion-functions.workspace = true
 chrono.workspace = true
 async-trait.workspace = true

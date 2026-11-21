@@ -260,6 +260,19 @@ fn build_pages_constrained(runtime: Arc<EmittedRelation>, execution: Execution, 
             return Ok(crate::trace::wrap(crate::analysis::wrap(pages,analysis),&traced_relation,&traced_context));
         }
         RelationNode::SortLimit { order_by,offset,fetch,.. } => {
+            if order_by.is_empty() && execution.analysis.is_none() && execution.context.tracer.is_none()
+                && let Some(Expr::Literal(value)) = fetch
+                && let Some(count) = integer(value).filter(|count| *count <= i128::from(i64::MAX)).and_then(|count| usize::try_from(count).ok()).and_then(std::num::NonZeroUsize::new) {
+                let child = runtime.child(0)?;
+                if crate::limit::DataFusionLimit::supports(child.schema())
+                    && let Some(input) = build_columns(Arc::clone(&child), execution.child(0)).await? {
+                    let offset = row_limit(offset.as_ref(), &execution).await?.unwrap_or(0);
+                    row_limit(fetch.as_ref(), &execution).await?;
+                    let offset = usize::try_from(offset).map_err(|_| invalid("limit-offset", "Offset exceeds addressable row count"))?;
+                    let limit = crate::limit::DataFusionLimit::new(input, child.schema().clone(), Arc::clone(&execution.context.memory), offset, count)?;
+                    return Ok(crate::pages::retain_page_state(Box::new(limit), state_reservation));
+                }
+            }
             let mut constraints = constraints;for order in order_by { constraints.require(&order.expr); }
             let pushdowns = if offset.is_some() || fetch.is_some() { None } else { pushdowns };
             let schema = runtime.child(0)?.schema().clone();

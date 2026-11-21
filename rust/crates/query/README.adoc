@@ -197,6 +197,49 @@ PULL-many returns null for zero rows and a one-element list for a single empty d
 |Captured prepared dependencies and changing union schemas; execution caller must reprepare
 |===
 
+== DataFusion execution coverage
+
+The SQL and XTQL planners produce the same RTDB relation tree.
+The native query cursor opens that tree against a pinned catalog and uses DataFusion 54.2 for selected physical expressions and limits.
+
+[cols="2,4",options="header"]
+|===
+|Relation nodes |Execution path
+
+|Scan
+|RTDB resolves bitemporal visibility and applies metadata and search pruning before the predicate sees a row.
+When the RTDB filter kernel declines an all-Arrow batch, DataFusion can evaluate a supported predicate and filter the complete record batch within the query's memory budget.
+Other supported predicates can still use DataFusion for expression evaluation before RTDB applies the selection.
+Inspection and system tables use RTDB row pages.
+
+|Filter, Project, Rename, Extend
+|DataFusion's `Projector` evaluates a computed projection in one pass when all expressions lower exactly and their results are fixed-width signed integers, Float64, or Boolean.
+Other batch-capable projections and filters can still lower individual physical expressions to DataFusion.
+Column permutations, row-backed operators, and extensions use RTDB execution.
+
+|Limit, Sort, SortLimit
+|Unordered positive literal limits can use DataFusion's `LimitStream` when the child opens as column batches with plain scalar fields.
+The offset may be a parameter.
+The bridge hands DataFusion Arrow columns with their original charge when their layouts conform and materializes only the selected rows for downstream row cursors.
+The Arrow buffers pin that charge when the final slice outlives the input stream.
+Other limits, ordered sorts, top-k, and their spill paths use RTDB operators.
+
+|Values, LiteralPages, List, ColumnTable, Ordinality, Unnest
+|RTDB controls how and when these nodes demand and publish rows.
+
+|Join, Aggregate, Window, Distinct, Set
+|RTDB owns these operators, including its columnar join and aggregate paths, null semantics, and spill files.
+
+|Let, Reference, Apply, Mark, PatchGaps
+|RTDB owns binding scopes, correlated execution, nullable marks, and temporal patch ranges.
+|===
+
+DataFusion expression lowering covers the supported primitive layouts for checked arithmetic, casts, equality and ordering, Boolean logic and truth tests, `CASE`, and selected string and numeric functions.
+It also covers null-safe comparisons and literal or bound-parameter `IN` lists over signed integral, Boolean, or UTF-8 values.
+The batch bridge retains the XTDB evaluator for domains such as mixed unions, nested containers, custom temporal calculations, and IEEE float comparisons with Arrow total-order differences.
+Volatile and asynchronous calls, correlated lookups, and per-row error behavior still run in RTDB.
+Tracing and `EXPLAIN ANALYZE` use the RTDB operator path for limits and may use DataFusion expressions in scan predicates.
+
 == Remaining execution and resource work
 
 The executor is row-oriented and does not establish vectorized execution or expected production throughput.

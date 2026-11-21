@@ -69,6 +69,7 @@ arrow-select = "=58.4.1"
 datafusion-common = { version = "=54.2.0", default-features = false }
 datafusion-expr = { version = "=54.2.0", default-features = false }
 datafusion-physical-expr = { version = "=54.2.0", default-features = false }
+datafusion-physical-plan = { version = "=54.2.0", default-features = false }
 datafusion-functions = { version = "=54.2.0", default-features = false, features = ["math_expressions", "string_expressions", "unicode_expressions"] }
 arrow-ipc = { version = "=58.4.1", features = ["lz4", "zstd"] }
 async-trait = "0.1"
