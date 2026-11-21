@@ -223,6 +223,27 @@ fn mixed_insertions_and_compaction_match_flat_history_for_every_iid() {
 }
 
 #[test]
+fn leaf_order_matches_unsigned_iids_and_descending_row_indices() {
+    let iids: Vec<_> = (0..16)
+        .rev()
+        .flat_map(|position| (u8::MIN..=u8::MAX).rev().map(move |byte| {
+            let mut iid = [0; 16];
+            iid[position] = byte;
+            Iid(iid)
+        }))
+        .collect();
+    let rows = iids.len() as u32;
+    let mut trie = MemoryHashTrie::new(TrieConfig::new(64, iids.len()).unwrap());
+    for start in (0..rows).step_by(53) {
+        trie = trie.add_range(&iids, start, (rows - start).min(53)).unwrap();
+    }
+    let mut expected: Vec<_> = (0..rows).collect();
+    expected.sort_unstable_by_key(|&row| (u128::from_be_bytes(iids[row as usize].0), Reverse(row)));
+    assert_eq!(trie.leaves().len(), 1);
+    assert_eq!(trie.sorted_rows(&iids).unwrap(), expected);
+}
+
+#[test]
 fn maximum_depth_leaf_retains_every_version_of_one_iid() {
     let iids = vec![iid(42); 50_000];
     let trie = MemoryHashTrie::new(TrieConfig::new(8, 32).unwrap()).add_range(&iids, 0, 50_000).unwrap();

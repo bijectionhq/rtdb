@@ -7,7 +7,7 @@ use rtdb_types::{Anomaly, Iid, Result};
 use serde::{Deserialize, Serialize};
 
 use crate::bucketer::invalid_bucket_depth;
-use crate::leaf_merge_step::merge_sorted_rows;
+use crate::leaf_merge_step::{compare_row_keys, merge_sorted_rows};
 use crate::partition_step::group_base4_rows;
 use crate::{Bucketer, Path};
 
@@ -175,12 +175,16 @@ impl MemoryHashTrie {
 impl Default for MemoryHashTrie { fn default() -> Self { Self::new(TrieConfig::default()) } }
 
 fn compare<R: IidReader + ?Sized>(reader: &R, left: u32, right: u32) -> Result<Ordering> {
-    Ok(reader.iid(left)?.cmp(&reader.iid(right)?).then_with(|| right.cmp(&left)))
+    let left_iid = reader.iid(left)?;
+    let right_iid = reader.iid(right)?;
+    Ok(compare_row_keys(&left_iid.0, left, &right_iid.0, right))
 }
 
 fn sort<R: IidReader + ?Sized>(reader: &R, rows: impl Iterator<Item = u32>) -> Result<Vec<u32>> {
     let mut keyed = rows.map(|row| Ok((reader.iid(row)?, row))).collect::<Result<Vec<_>>>()?;
-    keyed.sort_unstable_by(|a, b| a.0.cmp(&b.0).then_with(|| b.1.cmp(&a.1)));
+    keyed.sort_unstable_by(|(left_iid, left), (right_iid, right)| {
+        compare_row_keys(&left_iid.0, *left, &right_iid.0, *right)
+    });
     Ok(keyed.into_iter().map(|(_, row)| row).collect())
 }
 

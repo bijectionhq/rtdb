@@ -422,13 +422,13 @@ rule Compare {
 
     let left_iid = trie.iid_reader.get(left_idx)
     let right_iid = trie.iid_reader.get(right_idx)
-    let iid_cmp = left_iid.compare_to(right_iid)
+    let iid_cmp = compare_unsigned_bytes(left_iid, right_iid)
 
     ensures:
         if iid_cmp != 0:
             iid_cmp   -- different IIDs: order by IID
         else:
-            right_idx - left_idx   -- same IID: higher index (newer) comes first
+            compare_row_indices(right_idx, left_idx)
 }
 
 ------------------------------------------------------------

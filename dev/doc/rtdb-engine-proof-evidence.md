@@ -34,7 +34,7 @@ These results apply to the classic and full-text Rust paths at the particular re
 | LOG13 · Journal retirement | Lean proves that replay and compaction preserve the retirement marker, and that completion requires every addressed replica. Kani checks replay of the production `Drop` event and subsequent commit refusal on an empty stream. Native replicas exercise retirement retry, restart, and direct checks for removed payloads. | Prove the runtime journal and fsync transitions, the inventory of all required replicas after copy or move, and the storage and deletion receipt contracts. |
 | CELL09, STORE10 and Multi recovery S2, S5 · Worker loss | A local MinIO and PgWire regression retains the checkpoint and acknowledged suffix, compares current rows and the full bitemporal projection, and verifies new writes after losing one, two, and all three compute workers. | Prove the complete activation and recovery path under the published durable-service and liveness assumptions. |
 | IDX02, IDX04, IDX06, IDX07 | Verus checks the production Rust base-four IID digit, path comparison, and stable partition of an insertion or split batch at every valid depth. The Kani harness also checks all legal depths and the independent bit-extraction rule for width 2, 4, or 8 in the actual bucketer. | Compose grouping, leaf ordering, and recursive replacement at actual Rust and JVM call sites, then connect the resulting trees to traversal and replay. |
-| IDX02, IDX03, IDX07 | Verus checks that the production Rust leaf merge returns every input occurrence in order. An injective logical rank uniquely determines the successful output sequence from those occurrences. | Prove that each leaf supplies correctly ordered runs, that its reader and comparator realize the logical rank, and that the JVM merge satisfies the same contract. |
+| IDX02, IDX03, IDX07 | Verus checks that the production Rust leaf merge returns every input occurrence in order. An injective logical rank uniquely determines the successful output sequence from those occurrences. | Compose the checked comparator and merge with the production readers, sorted-run construction, and the JVM merge. |
 | IDX01, IDX08 | Verus checks the production Rust search, append, and adjacent chunk replacement against one contiguous-layout invariant. Lean proves that appending rows and joining adjacent chunks preserve existing ordinal reads. | Prove the Arrow row-content obligation and refine snapshot ownership across block transitions in both engines. |
 | SCAN07, GC01, GC02 | Lean proves the abstract generation retention invariant for arbitrarily many readers, objects, in-flight operations and steps. Verus checks the collector's production selection loop against the visibility observations it receives. | Refine the captured references, provider operations, and authority changes, including the full durable deletion protocol. |
 | GC09, STORE03 · Hosted ordered-index retirement | Lean checks point equivalence after scrubbing known erase cuts. A bounded TLC model checks storage retirement, reader release, scrubbed replay, and conditional completion. Integration tests exercise a held reader and versioned local S3 provider. | Compose the directory and provider contracts with every hosted deployment, reader and primary-file custody path covered by physical disposal. |
@@ -170,6 +170,25 @@ The merge proof takes sorted input runs and the production comparator's agreemen
 The native tests exercise repeated rows, the unconsumed tail, and propagation of a comparison failure.
 Verus 0.2026.11.05.31e44e6 checked fourteen functions and rejected four mutations that select the larger head, omit the tail, consume a row without emitting it, or reverse the order within an IID.
 The native run passed 499 tests with `cargo test --manifest-path rust/Cargo.toml --locked -p rtdb-trie -p rtdb-format -p rtdb-index -p rtdb-query`. [Production merge and tests](../../rust/crates/trie/src/leaf_merge_step.rs) · [Verus study](../../verification/verus/trie_leaf_merge/area.json)
+
+### Production leaf comparison
+
+The Rust pending-log sort, two-run merge and persisted-leaf validation use the same row-key comparison.
+Verus checks that the production comparator returns Less exactly when the logical rank is smaller and Equal exactly when both IID and ordinal agree.
+The proof takes the standard Rust array comparator's lexicographic contract as a library assumption and uses Verus's specification for unsigned integer comparisons.
+It checks the row tie-break and the combination with IID order in the actual Rust function.
+Verus 0.2026.11.05.31e44e6 checked fifteen functions in the comparator and merge study.
+It rejected six controls, including reversing either the IID comparison or the row tie-break in the production comparator.
+
+The JVM comparator uses Arrow's comparison of sixteen-byte IID views and compares row indices in descending order when the IIDs match.
+Inspection of Arrow 19.0.0 bytecode found two word comparisons with byte-order normalization and a sign-bit flip before signed long comparison.
+Lean proves that the sign-bit flip realizes unsigned comparison and that comparing the two words and then the reverse ordinal agrees with the specified leaf order.
+The mapping assumes both readers deliver each row's stable sixteen IID bytes, the Arrow word loads represent those bytes in the documented order, and admitted row indices fit the JVM representation.
+Lean 4.35.0 audited five theorems and rejected signed-word comparison, reversed IID comparison and older-first row ties.
+The Rust and JVM regressions each insert 4,096 rows and check the leaf against an independent order reference across single-byte values at every IID position, including duplicate IIDs.
+The native run passed 504 tests with `cargo test --manifest-path rust/Cargo.toml --locked -p rtdb-trie -p rtdb-format -p rtdb-index -p rtdb-query`.
+Run the JVM case with `./gradlew :xtdb-core:test --tests 'xtdb.trie.MemoryHashTrieTest'`.
+The sorted-run and leaf-state refinement remains open. [Comparator study](../../verification/verus/trie_leaf_merge/area.json) · [JVM order proof](../../verification/lean/IidByteOrder.lean) · [Rust regression](../../rust/crates/trie/tests/contracts.rs) · [JVM regression](../../core/src/test/kotlin/xtdb/trie/MemoryHashTrieTest.kt)
 
 ### Live row addresses across chunk layouts
 

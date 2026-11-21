@@ -534,6 +534,28 @@ def verify_live_row_address(args, scratch):
     verify_lean_model(args, scratch, path, "live-row-address", controls, 5)
 
 
+def verify_iid_byte_order(args, scratch):
+    path = Path("verification/lean/IidByteOrder.lean")
+    controls = {
+        "compare-signed-words": (
+            "(left ^^^ 0x8000000000000000#64).slt (right ^^^ 0x8000000000000000#64) = true",
+            "left.slt right = true",
+            ["arrow_word_comparison_matches_eight_bytes"],
+        ),
+        "reverse-head-order": (
+            "arrowWordBefore leftHead rightHead ∨",
+            "arrowWordBefore rightHead leftHead ∨",
+            ["arrow_leaf_comparison_matches_iid_then_descending_row"],
+        ),
+        "older-row-first": (
+            "(leftTail = rightTail ∧ rightRow < leftRow)))",
+            "(leftTail = rightTail ∧ leftRow < rightRow)))",
+            ["arrow_leaf_comparison_matches_iid_then_descending_row"],
+        ),
+    }
+    verify_lean_model(args, scratch, path, "iid-byte-order", controls, 5)
+
+
 def verify_snapshot_ownership(args, scratch):
     path = Path("verification/lean/SnapshotOwnership.lean")
     controls = {
@@ -878,6 +900,7 @@ def verify_lean(args, scratch):
             verify_run_encoding(args, scratch)
             verify_memory_admission(args, scratch)
             verify_memory_trie(args, scratch)
+            verify_iid_byte_order(args, scratch)
             verify_live_row_address(args, scratch)
             verify_snapshot_ownership(args, scratch)
             verify_jvm_trie_pending_logs(args, scratch)

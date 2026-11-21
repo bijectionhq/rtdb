@@ -13,6 +13,7 @@ import xtdb.trie.proto.branch
 import xtdb.trie.proto.hashTrie
 import xtdb.trie.proto.hashTrieNode
 import xtdb.trie.proto.leaf
+import java.util.Arrays
 import kotlin.random.Random
 
 class MemoryHashTrieTest {
@@ -139,6 +140,28 @@ class MemoryHashTrieTest {
         assertEquals(setOf(0), base.indexSet())
         assertEquals(setOf(0, 1), first.indexSet())
         assertEquals(setOf(0, 2, 3), second.indexSet())
+    }
+
+    @Test
+    fun `leaf order matches unsigned IID bytes and descending row indices`() {
+        val iids = (0 until 16).flatMap { position ->
+            (0..255).map { byte -> ByteArray(16).also { it[position] = byte.toByte() } }
+        }.shuffled(Random(76))
+
+        FixedSizeBinaryVector(allocator, "_iid", false, 16).use { vector ->
+            for (iid in iids) vector.writeBytes(iid)
+
+            var trie = MemoryHashTrie.builder(vector).setPageLimit(iids.size).build()
+            for (start in iids.indices step 53) {
+                trie = trie.addRange(start, minOf(53, iids.size - start))
+            }
+
+            val expected = iids.indices.sortedWith { left, right ->
+                val order = Arrays.compareUnsigned(iids[left], iids[right])
+                if (order == 0) right.compareTo(left) else order
+            }
+            assertEquals(expected, trie.leaves.single().mergeSort(trie).toList())
+        }
     }
 
     @Test

@@ -1,7 +1,7 @@
 {
-  "summary": "The production leaf merge returns a sorted sequence containing every occurrence from both input runs.",
-  "flags": ["--no-external-by-default", "--verify-module", "production", "--verify-module", "laws"],
-  "min_verified_functions": 14,
+  "summary": "The production comparator realizes the leaf rank and the merge returns every occurrence from both sorted runs in order.",
+  "flags": ["--no-external-by-default", "--verify-module", "production", "--verify-module", "laws", "--rlimit", "40"],
+  "min_verified_functions": 15,
   "controls": {
     "take_larger_head": {
       "defect": "The merge selects the larger head before the smaller one.",
@@ -19,7 +19,7 @@
         "function": "merge_sorted_rows",
         "category": "precondition not satisfied"
       }],
-      "min_verified_functions": 13
+      "min_verified_functions": 14
     },
     "omit_right_tail": {
       "defect": "The unconsumed right run is omitted.",
@@ -33,7 +33,7 @@
         "function": "merge_sorted_rows",
         "category": "assertion failed"
       }],
-      "min_verified_functions": 13
+      "min_verified_functions": 14
     },
     "drop_right_head": {
       "defect": "An occurrence from the right run is consumed without being emitted.",
@@ -47,7 +47,39 @@
         "function": "merge_sorted_rows",
         "category": "assertion failed"
       }],
-      "min_verified_functions": 13
+      "min_verified_functions": 14
+    },
+    "older_row_first": {
+      "defect": "The production comparator orders older rows first when IIDs are equal.",
+      "mutate": [{
+        "file": "rust/crates/trie/src/leaf_merge_step.rs",
+        "find": "Ordering::Equal => right_row.cmp(&left_row),",
+        "replace": "Ordering::Equal => left_row.cmp(&right_row),"
+      }],
+      "expect": [{
+        "file": "rust/crates/trie/src/leaf_merge_step.rs",
+        "function": "compare_row_keys",
+        "category": "postcondition not satisfied"
+      }],
+      "min_verified_functions": 14
+    },
+    "reverse_iid_comparison": {
+      "defect": "The production comparator orders IIDs in descending order.",
+      "mutate": [{
+        "file": "rust/crates/trie/src/leaf_merge_step.rs",
+        "find": "match left_iid.cmp(right_iid) {",
+        "replace": "match right_iid.cmp(left_iid) {"
+      }],
+      "expect": [{
+        "file": "rust/crates/trie/src/leaf_merge_step.rs",
+        "function": "compare_row_keys",
+        "category": "postcondition not satisfied"
+      }, {
+        "file": "rust/crates/trie/src/leaf_merge_step.rs",
+        "function": "compare_row_keys",
+        "category": "postcondition not satisfied"
+      }],
+      "min_verified_functions": 14
     },
     "reverse_within_iid_order": {
       "defect": "The reference rank sorts increasing row indices for the same IID.",
@@ -61,7 +93,7 @@
         "function": "rank_is_unsigned_iid_then_descending_index",
         "category": "postcondition not satisfied"
       }],
-      "min_verified_functions": 13
+      "min_verified_functions": 14
     }
   }
 }

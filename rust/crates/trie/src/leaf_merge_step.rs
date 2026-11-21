@@ -62,6 +62,25 @@ proof fn push_minimum(prefix: Seq<u32>, chosen: Seq<u32>, other: Seq<u32>, rank:
 }
 
 #[cfg_attr(verus_keep_ghost, verus_spec(result =>
+    ensures
+        (result == Ordering::Less) ==
+            (crate::laws::row_rank(left_iid@, left_row) < crate::laws::row_rank(right_iid@, right_row)),
+        (result == Ordering::Equal) == (left_iid@ == right_iid@ && left_row == right_row),
+))]
+pub(crate) fn compare_row_keys(
+    left_iid: &[u8; 16], left_row: u32, right_iid: &[u8; 16], right_row: u32,
+) -> Ordering {
+    #[cfg(verus_keep_ghost)]
+    proof! {
+        crate::laws::rank_is_unsigned_iid_then_descending_index(left_iid@, right_iid@, left_row, right_row);
+    }
+    match left_iid.cmp(right_iid) {
+        Ordering::Equal => right_row.cmp(&left_row),
+        order => order,
+    }
+}
+
+#[cfg_attr(verus_keep_ghost, verus_spec(result =>
     with Ghost(rank): Ghost<RowRank>
     requires
         left@.len() + right@.len() <= usize::MAX,

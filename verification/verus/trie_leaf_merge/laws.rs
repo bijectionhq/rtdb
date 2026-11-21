@@ -2,8 +2,15 @@ use crate::production::{ordered, RowRank};
 use vstd::prelude::*;
 use vstd::relations::{sorted_by, total_ordering};
 use vstd::seq_lib::lemma_sorted_unique;
+use vstd::std_specs::cmp::OrdSpec;
 
 verus! {
+
+pub assume_specification<T: Ord, const N: usize> [<[T; N] as Ord>::cmp](
+    left: &[T; N], right: &[T; N],
+) -> (result: core::cmp::Ordering)
+    ensures T::obeys_cmp_spec() ==> result == lex_order(left@, right@),
+;
 
 pub(crate) proof fn multiplicities_determine_the_ordered_row_sequence(
     actual: Seq<u32>, expected: Seq<u32>, rank: RowRank,
@@ -38,15 +45,19 @@ spec fn unsigned_bytes(bytes: Seq<u8>) -> int
     }
 }
 
-spec fn lex_less(left: Seq<u8>, right: Seq<u8>) -> bool
+pub closed spec fn lex_order<T: Ord>(left: Seq<T>, right: Seq<T>) -> core::cmp::Ordering
     decreases left.len(),
 {
+    use core::cmp::Ordering;
     if left.len() == 0 {
-        right.len() > 0
+        if right.len() == 0 { Ordering::Equal } else { Ordering::Less }
     } else if right.len() == 0 {
-        false
+        Ordering::Greater
     } else {
-        left[0] < right[0] || left[0] == right[0] && lex_less(left.drop_first(), right.drop_first())
+        match left[0].cmp_spec(&right[0]) {
+            Ordering::Equal => lex_order(left.drop_first(), right.drop_first()),
+            order => order,
+        }
     }
 }
 
@@ -70,8 +81,9 @@ proof fn unsigned_bytes_fits(bytes: Seq<u8>)
 proof fn unsigned_bytes_preserves_order(left: Seq<u8>, right: Seq<u8>)
     requires left.len() == right.len(),
     ensures
-        (unsigned_bytes(left) < unsigned_bytes(right)) == lex_less(left, right),
+        (unsigned_bytes(left) < unsigned_bytes(right)) == (lex_order(left, right) == core::cmp::Ordering::Less),
         (unsigned_bytes(left) == unsigned_bytes(right)) == (left == right),
+        (lex_order(left, right) == core::cmp::Ordering::Equal) == (left == right),
     decreases left.len(),
 {
     if left.len() == 0 {
@@ -113,15 +125,16 @@ proof fn unsigned_bytes_preserves_order(left: Seq<u8>, right: Seq<u8>)
     }
 }
 
-spec fn row_rank(iid: Seq<u8>, index: u32) -> int {
+pub(crate) closed spec fn row_rank(iid: Seq<u8>, index: u32) -> int {
     unsigned_bytes(iid) * (u32::MAX as int + 1) + (u32::MAX as int - index as int)
 }
 
-proof fn rank_is_unsigned_iid_then_descending_index(left: Seq<u8>, right: Seq<u8>, left_index: u32, right_index: u32)
+pub(crate) proof fn rank_is_unsigned_iid_then_descending_index(left: Seq<u8>, right: Seq<u8>, left_index: u32, right_index: u32)
     requires left.len() == right.len(),
     ensures
-        (row_rank(left, left_index) < row_rank(right, right_index)) == (lex_less(left, right) || left == right && left_index > right_index),
+        (row_rank(left, left_index) < row_rank(right, right_index)) == (lex_order(left, right) == core::cmp::Ordering::Less || left == right && left_index > right_index),
         (row_rank(left, left_index) == row_rank(right, right_index)) == (left == right && left_index == right_index),
+        (lex_order(left, right) == core::cmp::Ordering::Equal) == (left == right),
 {
     unsigned_bytes_preserves_order(left, right);
     if left != right {
