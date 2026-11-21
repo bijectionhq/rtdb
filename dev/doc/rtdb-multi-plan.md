@@ -672,6 +672,9 @@ Running alongside every stage from stage 2 onwards, and concluding the branch:
    The report includes the inclusive interval, each replica's digest and unavailable endpoints.
    It reports a divergence if the digests differ.
    The retained interval starts above the highest trim point among the responding servers.
+   On a stopped logkeeper, `rtdb-multi audit-log --data PATH --stream STREAM --from LSN --through LSN --expect DIGEST` verifies the same interval directly from journal segments.
+   The command takes a shared filesystem lock and reads the segments without modifying them.
+   A damaged record or a digest mismatch makes the command fail.
    A durable anchor and offline verification of the discarded prefix remain open.
 4. A staging cell holds ten million deployments (300 bytes each when parked) under Zipf activity.
 

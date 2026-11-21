@@ -32,6 +32,49 @@ async fn an_audit_distinguishes_equal_committed_positions_with_different_payload
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_stopped_journal_matches_the_online_digest_across_epochs_and_preserves_damaged_bytes() {
+    use std::io::Write;
+
+    let mut ensemble = Ensemble::start(2).await;
+    let stream = ensemble.config("offline-history");
+    let original = open_writer(stream.clone(), 1, CancellationToken::new()).await.unwrap();
+    append(original.as_ref(), "discarded", 1).await;
+    append(original.as_ref(), "first epoch", 2).await;
+    let successor = open_writer(stream.clone(), 2, CancellationToken::new()).await.unwrap();
+    append(successor.as_ref(), "second epoch", 3).await;
+
+    rtdb_logkeeper::trim(&stream, LogOffset(0)).await.unwrap();
+    let online = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let report = rtdb_logkeeper::audit_retained(&stream).await.unwrap();
+            if report.interval == Some([1, 2]) { break report; }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }).await.unwrap();
+    assert!(rtdb_logkeeper::inspect_retained(ensemble.directories[0].path(), &stream.stream, None).is_err());
+    drop((successor, original));
+    ensemble.stop(0).await;
+    ensemble.stop(1).await;
+
+    let directory = ensemble.directories[0].path();
+    let segments = directory.join("segments");
+    let temporary = segments.join("unfinished.tmp");
+    std::fs::write(&temporary, b"pending").unwrap();
+    let offline = rtdb_logkeeper::inspect_retained(directory, &stream.stream, Some([1, 2])).unwrap().unwrap();
+    assert_eq!(offline.interval, [1, 2]);
+    assert_eq!(offline.digest, online.digests[&stream.servers[0]]);
+    assert_eq!(std::fs::read(&temporary).unwrap(), b"pending");
+    assert!(rtdb_logkeeper::inspect_retained(directory, &stream.stream, Some([0, 2])).is_err());
+
+    let segment = std::fs::read_dir(&segments).unwrap().map(|entry| entry.unwrap().path())
+        .filter(|path| path.extension().is_some_and(|extension| extension == "seg")).max().unwrap();
+    std::fs::OpenOptions::new().append(true).open(&segment).unwrap().write_all(b"damaged").unwrap();
+    let damaged = std::fs::read(&segment).unwrap();
+    assert!(rtdb_logkeeper::inspect_retained(directory, &stream.stream, None).is_err());
+    assert_eq!(std::fs::read(&segment).unwrap(), damaged);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn offsets_start_at_zero_and_tails_ranges_and_latest_follow_the_committed_tip() {
     let ensemble = Ensemble::start(3).await;
     let log = open_writer(ensemble.config("contract"), 1, CancellationToken::new()).await.unwrap();

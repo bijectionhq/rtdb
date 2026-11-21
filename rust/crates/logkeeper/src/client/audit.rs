@@ -3,10 +3,10 @@ use std::time::Duration;
 
 use futures::stream::{FuturesUnordered, StreamExt};
 use rtdb_types::{Anomaly, AnomalyCategory, Result};
-use sha2::{Digest, Sha256};
 
 use super::ensemble::{Ensemble, MAXIMUM_BATCH_ENTRIES};
 use super::{StreamConfig, validate};
+use crate::history::RetainedChain;
 
 /// Fingerprints of the same committed range on all responding members of an ensemble.
 #[derive(Debug, Default)]
@@ -51,13 +51,7 @@ pub async fn audit_retained(config: &StreamConfig) -> Result<RetainedAudit> {
 }
 
 async fn chain(ensemble: &Ensemble, server: usize, first: i64, through: i64) -> Result<String> {
-    let stream = &ensemble.config.stream;
-    let mut root = Sha256::new();
-    root.update(b"rtdb.logkeeper.retained-chain.v1\0");
-    root.update((stream.len() as u64).to_be_bytes());
-    root.update(stream.as_bytes());
-    root.update(first.to_be_bytes());
-    let mut digest = root.finalize();
+    let mut chain = RetainedChain::new(&ensemble.config.stream, first);
     let mut next = first;
     loop {
         let page = ensemble.read(server, next, MAXIMUM_BATCH_ENTRIES, Duration::ZERO).await?;
@@ -70,15 +64,8 @@ async fn chain(ensemble: &Ensemble, server: usize, first: i64, through: i64) -> 
         }
         for entry in page.entries {
             if entry.lsn != next { return Err(incomplete(ensemble, server, next)); }
-            let mut link = Sha256::new();
-            link.update(digest);
-            link.update(entry.lsn.to_be_bytes());
-            link.update(entry.epoch.to_be_bytes());
-            link.update(entry.timestamp.to_be_bytes());
-            link.update((entry.payload.len() as u64).to_be_bytes());
-            link.update(entry.payload);
-            digest = link.finalize();
-            if next == through { return Ok(format!("{digest:x}")); }
+            chain.append(&entry);
+            if next == through { return Ok(chain.digest()); }
             next += 1;
         }
     }

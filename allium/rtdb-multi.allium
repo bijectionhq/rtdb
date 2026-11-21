@@ -1139,6 +1139,19 @@ rule AuditRetainedReplicaHistory {
                 ReplicaDivergenceReported(deployment, interval)
 }
 
+rule VerifyRetainedJournalOffline {
+    when: JournalVerificationRequested(logkeeper, stream, interval, expected_digest)
+
+    requires: logkeeper.stopped
+
+    ensures:
+        let digest = Sha256ChainForJournalInterval(logkeeper, stream, interval)
+        if digest = expected_digest:
+            JournalIntervalVerified(logkeeper, stream, interval)
+        else:
+            JournalMismatchReported(logkeeper, stream, interval)
+}
+
 ------------------------------------------------------------
 -- Rules: optional intake
 --

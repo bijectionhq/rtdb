@@ -5,6 +5,8 @@ mod payload;
 pub(crate) mod state;
 mod store;
 
+pub use journal::{JournalDigest, inspect_retained};
+
 use crate::protocol::{Request, RequestBody, Response, ResponseBody, read_frame, encode_frame};
 use bytes::BytesMut;
 use journal::Journal;

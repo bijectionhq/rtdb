@@ -27,6 +27,7 @@ Usage: rtdb-multi directory --listen ADDR\n\
        rtdb-multi drain --directory DIR --member ID\n\
        rtdb-multi status --directory DIR [--target-per-node N]\n\
        rtdb-multi audit --directory DIR --keys PATH --name NAME\n\
+       rtdb-multi audit-log --data PATH --stream STREAM [--from LSN --through LSN] [--expect DIGEST]\n\
        rtdb-multi move --directory DIR --name NAME --to MEMBER [--cell-secret FILE]\n\
        rtdb-multi read-width --directory DIR --name NAME --width N\n\
        rtdb-multi unquarantine --directory DIR --name NAME\n\
@@ -235,6 +236,30 @@ async fn run(arguments: Vec<String>) -> Result<()> {
             let report = admin::audit(directory.as_ref(), keys(&arguments)?.as_ref(), arguments.required("name")?, 4 << 20).await?;
             println!("{}", serde_json::to_string_pretty(&report).expect("a report serializes"));
             if report.violations.is_empty() { Ok(()) } else { Err(Anomaly::fault("rtdb.multi/audit", format!("{} violations", report.violations.len()))) }
+        }
+        "audit-log" => {
+            let data = PathBuf::from(arguments.required("data")?);
+            let stream = arguments.required("stream")?.to_owned();
+            let interval = match (arguments.present("from"), arguments.present("through")) {
+                (true, true) => Some([
+                    arguments.required("from")?.parse::<i64>().map_err(|_| usage("--from must be a log position".into()))?,
+                    arguments.required("through")?.parse::<i64>().map_err(|_| usage("--through must be a log position".into()))?,
+                ]),
+                (false, false) => None,
+                _ => return Err(usage("--from and --through must be supplied together".into())),
+            };
+            let journal_stream = stream.clone();
+            let proof = tokio::task::spawn_blocking(move || rtdb_logkeeper::inspect_retained(&data, &journal_stream, interval)).await
+                .map_err(|error| Anomaly::fault("rtdb.multi/audit-log", error.to_string()))??;
+            println!("{}", serde_json::json!({"stream": stream, "interval": proof.as_ref().map(|proof| proof.interval),
+                "digest": proof.as_ref().map(|proof| &proof.digest)}));
+            if arguments.present("expect") {
+                let expected = arguments.required("expect")?;
+                if proof.is_none_or(|proof| proof.digest != expected) {
+                    return Err(Anomaly::fault("rtdb.multi/audit-log", "The retained journal digest differs from the expected value"));
+                }
+            }
+            Ok(())
         }
         "drain" => {
             let directory = directory(arguments.required("directory")?).await?;
