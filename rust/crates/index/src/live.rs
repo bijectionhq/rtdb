@@ -249,8 +249,8 @@ impl LiveTable {
             }
             let count = u32::try_from(batch.len()).map_err(invalid)?;
             let start = next.row_count;
-            next.row_count = start.checked_add(count).ok_or_else(|| invalid("Live table exceeds u32 row address space"))?;
-            next.chunks.push((start, Arc::clone(batch)));
+            next.row_count = crate::row_address::append_chunk(&mut next.chunks, start, count, Arc::clone(batch))
+                .ok_or_else(|| invalid("Live table exceeds u32 row address space"))?;
             next.trie = self.trie.add_range(&next, start, count)?;
             next.merge_small_chunks()?;
         }
@@ -262,7 +262,7 @@ impl LiveTable {
     /// Chunks keep their row addresses, since a merged chunk starts where the earlier one did.
     fn merge_small_chunks(&mut self) -> Result<()> {
         const MERGED_CHUNK_ROWS: usize = 8192;
-        while let [.., (start, previous), (_, last)] = self.chunks.as_slice() {
+        while let [.., (_, previous), (_, last)] = self.chunks.as_slice() {
             if last.len() < previous.len() || previous.len() + last.len() > MERGED_CHUNK_ROWS || previous.arrow().schema() != last.arrow().schema() { break; }
             let schema = previous.arrow().schema();
             let budget = Arc::clone(previous.owned.reservation().budget());
@@ -276,9 +276,7 @@ impl LiveTable {
             lease.grow_to(lease.bytes().max(merged.get_array_memory_size()))?;
             lease.shrink_to(merged.get_array_memory_size())?;
             let merged = IndexBatch::from_owned(OwnedBatch::with_reservation(merged, reservation)?)?;
-            let start = *start;
-            self.chunks.truncate(self.chunks.len() - 2);
-            self.chunks.push((start, merged));
+            crate::row_address::replace_last_two(&mut self.chunks, merged);
         }
         Ok(())
     }
