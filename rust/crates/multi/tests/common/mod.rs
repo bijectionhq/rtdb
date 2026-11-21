@@ -15,8 +15,10 @@ async fn start_node(directory: &Arc<dyn Directory>, data: &std::path::Path, agen
                     pool: MemberPool, compaction_workers: bool, engine_version: Option<String>) -> process::RunningNode {
     let keys: Arc<dyn rtdb_multi::keys::KeyService> = Arc::new(rtdb_multi::keys::LocalKeyService::new(data.join("keys")).unwrap());
     let claim_wait = std::env::var("RTDB_TEST_PLACED_CLAIM_WAIT_MS").ok().map_or(2, |ms| ms.parse().unwrap());
+    let connections = std::env::var("RTDB_TEST_PGWIRE_CONNECTIONS").ok().map_or(42, |count| count.parse::<usize>().unwrap());
+    let configuration = NodeConfiguration::from_yaml(&format!("authn: !SingleRootUser\n  password: cell-test\nserver:\n  port: 0\n  numThreads: {connections}\n")).unwrap();
     process::start_node(Arc::clone(directory), process::NodeSettings {
-        configuration: NodeConfiguration::from_yaml("authn: !SingleRootUser\n  password: cell-test\nserver:\n  port: 0\n").unwrap(), allocation_limit_bytes: 1 << 30,
+        configuration, allocation_limit_bytes: 1 << 30,
         control: "127.0.0.1:0".parse().unwrap(), availability_zone: format!("zone-{index}"), engine_version, agent, lease: lease(), claim_wait: Duration::from_millis(claim_wait), pool,
         keys, cache_dir: data.join(format!("cache-{index}")), local_compaction: !compaction_workers, capabilities: Some(secret()),
     }).await.unwrap()

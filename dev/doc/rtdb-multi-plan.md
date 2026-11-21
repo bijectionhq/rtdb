@@ -814,6 +814,24 @@ All counters matched the 32,768 writes, with 1,013 updates/s and 155.2 ms p99 in
 Send-to-reply p99 was 31.9 ms during scale-out, 27.6 ms during scale-in, and 16.0 ms outside these intervals.
 The staging acceptance run needs a production directory, ten million parked deployments, and repeatable p99 across live scale transitions.
 
+Two paired release trials per connection setting used 16 workers, 16,384 writes, and a 256-connection limit on each holder.
+All counters matched in every trial.
+The four-connection workload used up to 128 pgwire sessions on the cell.
+
+| Connections per deployment | Durable updates/s | Overall p99 (ms) | Scale-out p99 (ms) | Scale-in p99 (ms) |
+| ---: | ---: | ---: | ---: | ---: |
+| 1 | 3,489–3,736 | 17.5–24.9 | 16.1–16.6 | 39.3–43.9 |
+| 4 | 5,218–5,385 | 11.5–11.8 | 14.2–19.3 | 32.4–39.3 |
+
+With four connections, scale-in send-to-reply p99 was 10.7–19.1 ms.
+The scale-in end-to-end p99 still exceeded 30 ms.
+
+```sh
+RTDB_TEST_PGWIRE_CONNECTIONS=256 RTDB_CELL_BENCH_CONNECTIONS=4 RTDB_CELL_BENCH_COMMANDS=1024 RTDB_CELL_BENCH_SCALE=1 \
+  cargo test --manifest-path rust/Cargo.toml -p rtdb-multi --release --test load \
+  durable_pgwire_updates_under_zipf_activity -- --ignored --nocapture
+```
+
 ## 6. Existing specs affected
 
 | Spec | Stage | Change |

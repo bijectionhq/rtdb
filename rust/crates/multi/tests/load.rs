@@ -8,7 +8,8 @@ use std::time::{Duration, Instant};
 
 use common::{Cell, values};
 use rtdb_multi::admin;
-use tokio::sync::{Barrier, Mutex, Notify};
+use tokio::sync::{Barrier, Mutex, Notify, OnceCell};
+use tokio_postgres::Client;
 use tokio::task::JoinSet;
 
 fn setting(name: &str, default: usize) -> usize {
@@ -49,6 +50,11 @@ struct WriteSample {
     rank: usize,
 }
 
+struct BenchmarkDeployment {
+    initialized: OnceCell<()>,
+    connections: Vec<Mutex<Option<Client>>>,
+}
+
 fn sample_write_latencies<'a>(phase: &str, samples: impl Iterator<Item = &'a WriteSample>) {
     let (mut total, mut queue, mut wire) = (Vec::new(), Vec::new(), Vec::new());
     for sample in samples {
@@ -67,8 +73,14 @@ fn sample_write_latencies<'a>(phase: &str, samples: impl Iterator<Item = &'a Wri
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 #[ignore]
 async fn durable_pgwire_updates_under_zipf_activity() {
+    let seconds = setting("RTDB_CELL_BENCH_TIMEOUT_SECONDS", 180) as u64;
+    tokio::time::timeout(Duration::from_secs(seconds), exercise_zipf_activity()).await.expect("Zipf workload timed out");
+}
+
+async fn exercise_zipf_activity() {
     let deployments = setting("RTDB_CELL_BENCH_DEPLOYMENTS", 32);
     let workers = setting("RTDB_CELL_BENCH_WORKERS", 16);
+    let connections_per_deployment = setting("RTDB_CELL_BENCH_CONNECTIONS", 1).min(workers);
     let scale = std::env::var_os("RTDB_CELL_BENCH_SCALE").is_some();
     let cold = std::env::var_os("RTDB_CELL_BENCH_COLD").is_some();
     let parked = setting("RTDB_CELL_BENCH_PARKED", 0);
@@ -85,18 +97,23 @@ async fn durable_pgwire_updates_under_zipf_activity() {
         }
     }
 
-    let mut connections = Vec::with_capacity(deployments);
+    let mut databases = Vec::with_capacity(deployments);
     for index in 0..deployments {
         let name = format!("bench-{index}");
         admin::create_deployment(cell.directory.as_ref(), &name, "bench", 3).await.unwrap();
-        let client = if cold { None } else {
-            let client = cell.connect(&name).await;
-            client.simple_query("INSERT INTO counters (_id, n) VALUES (1, 0)").await.unwrap();
-            Some(client)
-        };
-        connections.push(Mutex::new(client));
+        let initialized = OnceCell::new();
+        let mut connections = Vec::with_capacity(connections_per_deployment);
+        for _ in 0..connections_per_deployment {
+            let client = if cold { None } else {
+                let client = cell.connect(&name).await;
+                initialized.get_or_init(|| async { client.simple_query("INSERT INTO counters (_id, n) VALUES (1, 0)").await.unwrap(); }).await;
+                Some(client)
+            };
+            connections.push(Mutex::new(client));
+        }
+        databases.push(BenchmarkDeployment { initialized, connections });
     }
-    let connections = Arc::new(connections);
+    let databases = Arc::new(databases);
     let ranks = Arc::new(ranks(deployments));
     let ready = Arc::new(Barrier::new(workers + 1));
     let first_write = Arc::new(Notify::new());
@@ -104,7 +121,7 @@ async fn durable_pgwire_updates_under_zipf_activity() {
     let activations = Arc::new(AtomicUsize::new(0));
     let mut tasks = JoinSet::new();
     for worker in 0..workers {
-        let (connections, ranks, ready) = (connections.clone(), ranks.clone(), ready.clone());
+        let (databases, ranks, ready) = (databases.clone(), ranks.clone(), ready.clone());
         let (first_write, completed) = (first_write.clone(), completed.clone());
         let activations = activations.clone();
         tasks.spawn(async move {
@@ -115,13 +132,16 @@ async fn durable_pgwire_updates_under_zipf_activity() {
             for _ in 0..commands {
                 let rank = pick_rank(&mut rng, &ranks);
                 let started = Instant::now();
-                let mut connection = connections[rank].lock().await;
+                let database = &databases[rank];
+                let mut connection = database.connections[worker % connections_per_deployment].lock().await;
                 let acquired = Instant::now();
                 if connection.is_none() {
                     let client = common::connect(&gateway.to_string(), &format!("bench-{rank}")).await;
-                    client.simple_query("INSERT INTO counters (_id, n) VALUES (1, 0)").await.unwrap();
+                    database.initialized.get_or_init(|| async {
+                        client.simple_query("INSERT INTO counters (_id, n) VALUES (1, 0)").await.unwrap();
+                        activations.fetch_add(1, Ordering::Relaxed);
+                    }).await;
                     *connection = Some(client);
-                    activations.fetch_add(1, Ordering::Relaxed);
                 }
                 let sent = Instant::now();
                 connection.as_ref().unwrap().simple_query("UPDATE counters SET n = n + 1 WHERE _id = 1").await.unwrap();
@@ -135,6 +155,7 @@ async fn durable_pgwire_updates_under_zipf_activity() {
 
     let started = Instant::now();
     ready.wait().await;
+    println!("starting Zipf writes with {workers} workers and {connections_per_deployment} connection slots per deployment");
     let measurements = async {
         let mut totals = vec![0; deployments];
         let mut latencies = Vec::with_capacity(workers * commands);
@@ -183,9 +204,10 @@ async fn durable_pgwire_updates_under_zipf_activity() {
     };
     let ((totals, samples, elapsed), windows) = tokio::join!(measurements, scaling);
 
-    for (rank, (client, expected)) in connections.iter().zip(&totals).enumerate() {
-        if let Some(client) = client.lock().await.as_ref() {
-            assert_eq!(values(client, "SELECT n FROM counters").await, [expected.to_string()]);
+    let databases = Arc::into_inner(databases).expect("all benchmark workers have returned");
+    for (rank, (database, expected)) in databases.into_iter().zip(&totals).enumerate() {
+        if let Some(client) = database.connections.into_iter().find_map(Mutex::into_inner) {
+            assert_eq!(values(&client, "SELECT n FROM counters").await, [expected.to_string()]);
         } else {
             assert_eq!(*expected, 0);
             assert_eq!(cell.holder(&format!("bench-{rank}")).await, None);
@@ -218,11 +240,10 @@ async fn durable_pgwire_updates_under_zipf_activity() {
     assert_eq!(latencies.len(), workers * commands);
     latencies.sort_unstable();
     println!(
-        "deployments={deployments} workers={workers} commits={} hottest_deployment_commits={} duration_s={:.3} commits_per_s={:.0} p50_ms={:.3} p95_ms={:.3} p99_ms={:.3}",
+        "deployments={deployments} workers={workers} connections_per_deployment={connections_per_deployment} commits={} hottest_deployment_commits={} duration_s={:.3} commits_per_s={:.0} p50_ms={:.3} p95_ms={:.3} p99_ms={:.3}",
         latencies.len(), totals[0], elapsed.as_secs_f64(), latencies.len() as f64 / elapsed.as_secs_f64(),
         percentile(&latencies, 50), percentile(&latencies, 95), percentile(&latencies, 99),
     );
-    drop(connections);
     cell.stop().await;
 }
 
