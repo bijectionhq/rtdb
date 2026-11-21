@@ -86,6 +86,8 @@ impl BlockCatalog {
         self.wire.latest_processed_msg_id.map(SourcePosition)
             .or_else(|| self.latest_completed_tx().map(|tx| SourcePosition(tx.tx_id.0)))
     }
+    /// The naming epoch of compaction outputs planned from this block's catalog.
+    pub fn naming_epoch(&self) -> u64 { self.wire.naming_epoch.unwrap_or(0).max(0) as u64 }
 
     pub fn table_entries(&self) -> Result<Vec<TableEntry>> {
         let entries = if !self.wire.tables.is_empty() {

@@ -398,6 +398,7 @@ impl BlockStore {
             tables: table_catalog.entries().map(|entry| entry.to_proto()).collect(), secondary_databases: databases,
             boundary_replica_msg_id: Some(boundary.metadata.position.0), external_source_token: message.external_source_token.clone(),
             term_id: Some(boundary.envelope.term.0), boundary_term_seq: boundary.envelope.term_sequence.map(|sequence| sequence.0),
+            naming_epoch: Some(i64::try_from(prepared.value().trie_catalog().naming_epoch()).map_err(|_| invalid("Naming epoch exceeds the block format"))?),
         })?;
         self.store.put(&key, Bytes::from(catalog.encode())).await?;
         Ok(ProducedBlock { catalog, tries })

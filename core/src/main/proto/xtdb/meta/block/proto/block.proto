@@ -75,4 +75,8 @@ message Block {
     // boundary knows the next position its term expects. Absent for blocks written before
     // this field, or whose boundary carried none. See #6105.
     int64 boundary_term_seq = 10;
+
+    // The naming epoch of compaction outputs planned from this block's catalog.
+    // A compactor reset increments it, so no trie name is published twice.
+    int64 naming_epoch = 11;
 }

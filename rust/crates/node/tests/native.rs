@@ -1034,9 +1034,29 @@ async fn compactor_reset_preserves_l0_history_and_deletes_compacted_files_only_a
         stop(&node, driver).await;
         drop(node);
 
+        settings.compaction_threads = 1;
         let (node, driver) = running(settings, fresh_local_services(&runtime_services)).await;
         let mut session = node.session("xtdb", Arc::new(Authority)).unwrap();
         assert_eq!(rows(session.query_sql(sql, vec![]).await.unwrap()).await, before);
+        let database = node.catalog().database("xtdb").unwrap();
+        assert_eq!(database.snapshot().trie_catalog().naming_epoch(), 1, "the reset's block carries the new naming epoch through restart");
+        database.compaction().unwrap().compact_all().await.unwrap();
+        assert_eq!(rows(session.query_sql(sql, vec![]).await.unwrap()).await, before);
+        let mut recompacted = Vec::new();
+        let mut pending = vec![store.join("v06")];
+        while let Some(directory) = pending.pop() {
+            for entry in std::fs::read_dir(&directory).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() { pending.push(path); continue; }
+                let relative = path.strip_prefix(store.join("v06")).unwrap().to_string_lossy().into_owned();
+                if relative.contains("/data/l") && !relative.contains("/data/l00-") { recompacted.push(relative); }
+            }
+        }
+        assert!(!recompacted.is_empty(), "compaction ran again after the reset");
+        for name in &recompacted {
+            assert!(name.ends_with("-e01.arrow"), "{name} is named in the reset's epoch");
+            assert!(compacted.iter().all(|old| old.as_str() != name), "{name} reuses a name published before the reset");
+        }
         drop(session);
         stop(&node, driver).await;
     }).await.unwrap();

@@ -28,6 +28,7 @@ pub struct PartitionValue {
 
 impl PartitionValue {
     pub fn loaded(trie_catalog: TrieCatalog, table_catalog: TableCatalog, config: TrieConfig) -> Result<Self> {
+        let trie_catalog = trie_catalog.with_naming_epoch(table_catalog.block().map_or(0, BlockCatalog::naming_epoch));
         let block_index = BlockIndex(table_catalog.block_index().map_or(-1, |index| index.0).checked_add(1).ok_or_else(|| invalid("Block index exhausted"))?);
         let latest_completed_tx = table_catalog.block().and_then(BlockCatalog::latest_completed_tx);
         let checkpoint_tries = table_catalog.block_index().map(|_| Arc::new(CheckpointTries::capture(&trie_catalog)));
@@ -93,13 +94,11 @@ impl BlockPreparation {
 #[derive(Debug, Default)]
 struct Retention {
     readers: Vec<Weak<TrieCatalog>>,
-    collecting: Weak<()>,
 }
 
 pub struct TrieCollection {
     current: Arc<PartitionValue>,
     readers: Vec<Arc<TrieCatalog>>,
-    _collecting: Arc<()>,
 }
 
 impl TrieCollection {
@@ -148,12 +147,7 @@ impl PartitionState {
         let value = self.value.read();
         let mut retention = self.retention.lock();
         let readers = retention.readers.iter().filter_map(Weak::upgrade).collect();
-        let collecting = retention.collecting.upgrade().unwrap_or_else(|| {
-            let collecting = Arc::new(());
-            retention.collecting = Arc::downgrade(&collecting);
-            collecting
-        });
-        TrieCollection { current: Arc::clone(&value), readers, _collecting: collecting }
+        TrieCollection { current: Arc::clone(&value), readers }
     }
 
     /// Captures the latest applied state for a reader, including transaction resolution.
@@ -255,9 +249,6 @@ impl PartitionState {
     }
     pub fn reset_to_l0(&self, replacements: BTreeMap<TableRef, Vec<CatalogTrie>>) -> Result<()> {
         let mut value = self.value.write();
-        if self.retention.lock().collecting.strong_count() != 0 {
-            return Err(Anomaly::new(rtdb_types::AnomalyCategory::Conflict, "rtdb.compactor-reset/collecting", "Trie collection is still in progress"));
-        }
         let mut next = value.as_ref().clone();
         next.trie_catalog = Arc::new(value.trie_catalog.reset_to_l0(replacements)?);
         next.catalog_publication = CatalogPublication::Suspended;

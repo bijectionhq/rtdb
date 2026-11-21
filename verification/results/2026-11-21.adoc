@@ -1838,3 +1838,14 @@ The retained Rust log is `/private/tmp/rtdb-formal.QMjPSJsX/version-observations
 Raw proof evidence is in `/private/tmp/rtdb-formal.QMjPSJsX/version-proof-862r1737/` and `/private/tmp/rtdb-formal.QMjPSJsX/identity-lean-geifh20n/`.
 The Lean source SHA-256 is `d3f14c0458d51852f015ecf34481b1da45b2b2de86b811e2eecb1f8301c98c4a`.
 The production Verus input SHA-256 is `9d29767a4279f9d4e022a7e88e7c1a8400dc4349a5c65c44c138bc7f9478a825`.
+
+== Naming epochs for compaction outputs
+
+A compactor reset rewinds the catalog to its L0 tries, after which compaction plans the same positional names again.
+A deletion authorized before the reset, or a file left behind by an interrupted reset, could then meet a newer file under the same name.
+The trie catalog now carries a naming epoch that each reset increments; every compaction output, including the historical outputs of an L0 job, is named in it, as `l02-rc-p0-b00-e01`, and each block persists it for recovery.
+The reset no longer waits for running collection, since a deletion authorized before it cannot reach an output planned after it.
+The native reset test now restarts with compaction enabled, recompacts, and checks that every new compacted file is named in epoch 1 and none reuses a name published before the reset.
+A planning test checks that outputs differ from the pre-reset plan only by epoch, and format tests cover round trips, partition groups and non-canonical epochs.
+The format, index, maintenance, replication, node, conformance, Multi and server suites passed apart from that test before the historical-output fix, and the reset and maintenance suites passed after it.
+

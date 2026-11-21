@@ -319,7 +319,7 @@ impl CompactionExecutor for SegmentCompactor {
         for index in order {
             if cancellation.is_cancelled() { return Err(crate::closed()); }
             let output = &outputs[index];
-            let key = TrieKey::new(job.output.level(), output.recency, job.output.part().to_vec(), job.output.block_index())?;
+            let key = TrieKey::new(job.output.level(), output.recency, job.output.part().to_vec(), job.output.block_index())?.with_epoch(job.output.epoch());
             let data_path = directory.path().join(format!("output-{index}.arrow"));
             let meta_path = directory.path().join(format!("output-{index}.meta.arrow"));
             let (size, metadata) = layout::normalize(output, &put, &self.config, &self.memory, &data_path, &meta_path, cancellation)?;

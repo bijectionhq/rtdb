@@ -102,6 +102,8 @@ value TrieKey {
     --   l00-rc-b00         level 0, current, block 0
     --   l01-r20200106-b00  level 1, historical, week ending 2020-01-06
     --   l02-rc-p0-b00      level 2, current, IID partition 0, block 0
+    --   l02-rc-p0-b00-e01  the same position planned in naming epoch 1
+    -- Compaction outputs carry the catalog's naming epoch, persisted in each block; a compactor reset starts a new epoch, so no name is published twice.
 }
 
 ------------------------------------------------------------

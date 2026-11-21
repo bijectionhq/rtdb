@@ -168,17 +168,20 @@ impl TableTries {
 }
 
 #[derive(Clone, Debug)]
-pub struct TrieCatalog { tables: BTreeMap<TableRef, TableTries>, file_size_target: i64 }
+pub struct TrieCatalog { tables: BTreeMap<TableRef, TableTries>, file_size_target: i64, naming_epoch: u64 }
 
-impl Default for TrieCatalog { fn default() -> Self { Self { tables: BTreeMap::new(), file_size_target: 100 * 1024 * 1024 } } }
+impl Default for TrieCatalog { fn default() -> Self { Self { tables: BTreeMap::new(), file_size_target: 100 * 1024 * 1024, naming_epoch: 0 } } }
 
 impl TrieCatalog {
     pub fn new(file_size_target: i64) -> Result<Self> {
         if file_size_target <= 0 { return Err(invalid("Trie file size target must be positive")); }
-        Ok(Self { tables: BTreeMap::new(), file_size_target })
+        Ok(Self { tables: BTreeMap::new(), file_size_target, naming_epoch: 0 })
     }
     pub fn tables(&self) -> impl Iterator<Item = &TableRef> { self.tables.keys() }
     pub fn file_size_target(&self) -> i64 { self.file_size_target }
+    /// The epoch compaction outputs planned from this catalog are named in.
+    pub fn naming_epoch(&self) -> u64 { self.naming_epoch }
+    pub fn with_naming_epoch(self, naming_epoch: u64) -> Self { Self { naming_epoch, ..self } }
     pub fn max_block_index(&self, table: &TableRef, shard: &Shard) -> BlockIndex {
         self.tables.get(table).and_then(|table| table.shards.get(shard)).map_or(BlockIndex(-1), |state| state.max_block_index)
     }
@@ -280,8 +283,10 @@ impl TrieCatalog {
         }
         next
     }
+    /// Rewinds every table to its surviving L0 tries and starts a new naming epoch, so outputs planned after the reset never reuse a name planned before it.
     pub fn reset_to_l0(&self, replacements: BTreeMap<TableRef, Vec<CatalogTrie>>) -> Result<Self> {
         let mut next = self.clone();
+        next.naming_epoch = self.naming_epoch.checked_add(1).ok_or_else(|| invalid("Naming epoch exhausted"))?;
         for (table, tries) in replacements {
             let mut state = TableTries::default();
             let mut shard = ShardValue::default();

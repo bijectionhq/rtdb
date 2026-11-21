@@ -337,9 +337,9 @@ async fn collection_preserves_open_readers_and_their_inflight_io() {
     for key in &pinned_objects { assert!(store.head(key).await.is_err()); }
 
     let collection = state.trie_collection();
-    assert_eq!(state.reset_to_l0(BTreeMap::new()).unwrap_err().code, "rtdb.compactor-reset/collecting");
+    state.reset_to_l0(BTreeMap::new()).expect("a reset no longer waits for collection, since it names every later output anew");
+    assert_eq!(state.value().trie_catalog().naming_epoch(), collection.current().trie_catalog().naming_epoch() + 1);
     drop(collection);
-    state.reset_to_l0(BTreeMap::new()).unwrap();
 }
 
 struct ObservedGroupStore {

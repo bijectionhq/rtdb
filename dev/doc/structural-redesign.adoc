@@ -44,7 +44,7 @@ The collector advances a floor below every live hold and recovery root and delet
 |`garbage_lifetime`, the fixed read lease and its collector wait, the reaper grace and wall-clock release stamps, the unbounded in-process registry.
 
 |Positional names
-|A physical name is the positional key plus the storage epoch and a digest of its inputs, written put-if-absent; a reset starts a new epoch.
+|A physical name is the positional key plus the catalog's naming epoch, persisted in each block; a compactor reset starts a new epoch.
 |The reset fence against running collection.
 
 |System state in user tables
@@ -73,8 +73,8 @@ One composed TLA+ model of the residence is checked against traces emitted at ev
 |Landed; physical expiry follows increment 8
 
 |3
-|Epoch- and digest-qualified physical names; delete the reset fence.
-|Planned
+|Epoch-qualified physical names; delete the reset fence.
+|Landed; an input digest is unnecessary while an epoch separates every reset
 
 |4
 |Residence ledger with holds and collection floor; delete the timer stack.

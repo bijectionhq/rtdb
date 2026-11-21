@@ -22,6 +22,7 @@ impl CompactionJob {
 pub fn available_jobs(catalog: &TrieCatalog) -> Result<Vec<CompactionJob>> {
     let mut jobs = Vec::new();
     let target = catalog.file_size_target();
+    let epoch = catalog.naming_epoch();
     for table in catalog.tables() {
         let mut shards: BTreeMap<Shard, Vec<&CatalogTrie>> = BTreeMap::new();
         for trie in catalog.current_tries(table) { shards.entry(Shard::of(&trie.key)).or_default().push(trie); }
@@ -34,7 +35,7 @@ pub fn available_jobs(catalog: &TrieCatalog) -> Result<Vec<CompactionJob>> {
             }
             inputs.push(l0.key.clone());
             jobs.push(CompactionJob { table: table.clone(), inputs, part: Vec::new(),
-                output: TrieKey::new(1, None, Vec::new(), l0.key.block_index())?, recency_mode: RecencyMode::Partition });
+                output: TrieKey::new(1, None, Vec::new(), l0.key.block_index())?.with_epoch(epoch), recency_mode: RecencyMode::Partition });
         }
         for (shard, l1h) in &shards {
             if shard.level != 1 || shard.recency.is_none() { continue; }
@@ -46,7 +47,7 @@ pub fn available_jobs(catalog: &TrieCatalog) -> Result<Vec<CompactionJob>> {
                 size = size.checked_add(trie.data_file_size).ok_or_else(|| crate::invalid("Compaction input size overflow"))?;
                 if inputs.len() == 4 || size >= target {
                     jobs.push(CompactionJob { table: table.clone(), inputs: inputs.iter().map(|trie| trie.key.clone()).collect(), part: Vec::new(),
-                        output: TrieKey::new(2, shard.recency, Vec::new(), trie.key.block_index())?, recency_mode: RecencyMode::Preserve });
+                        output: TrieKey::new(2, shard.recency, Vec::new(), trie.key.block_index())?.with_epoch(epoch), recency_mode: RecencyMode::Preserve });
                     break;
                 }
             }
@@ -66,7 +67,7 @@ pub fn available_jobs(catalog: &TrieCatalog) -> Result<Vec<CompactionJob>> {
                 let inputs: Vec<_> = candidates.iter().copied().filter(|trie| trie.key.block_index() > floor).take(4).collect();
                 if inputs.len() == 4 {
                     jobs.push(CompactionJob { table: table.clone(), inputs: inputs.iter().map(|trie| trie.key.clone()).collect(),
-                        output: TrieKey::new(next_level, shard.recency, part.clone(), inputs[3].key.block_index())?,
+                        output: TrieKey::new(next_level, shard.recency, part.clone(), inputs[3].key.block_index())?.with_epoch(epoch),
                         part, recency_mode: RecencyMode::Preserve });
                 }
             }
