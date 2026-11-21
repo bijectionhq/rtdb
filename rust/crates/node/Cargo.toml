@@ -19,6 +19,7 @@ pg-source = ["dep:rtdb-pg-source"]
 all-backends = ["kafka", "kafka-connect", "s3", "azure", "gcs", "pg-source"]
 
 [dependencies]
+tempfile.workspace = true
 sha2.workspace = true
 stacker.workspace = true
 rtdb-types.workspace = true
@@ -27,6 +28,7 @@ rtdb-format.workspace = true
 rtdb-storage.workspace = true
 rtdb-index.workspace = true
 rtdb-trie.workspace = true
+rtdb-temporal.workspace = true
 rtdb-plan.workspace = true
 rtdb-sql.workspace = true
 rtdb-xtql.workspace = true
@@ -54,7 +56,6 @@ tokio.workspace = true
 tokio-util.workspace = true
 
 [dev-dependencies]
-tempfile.workspace = true
 rtdb-text.workspace = true
 tantivy.workspace = true
 

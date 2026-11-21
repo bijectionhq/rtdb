@@ -182,6 +182,12 @@ impl LiveTable {
     pub(crate) fn has_canonical_entity_iids(&self) -> bool { self.canonical_entity_iids }
     pub fn batches(&self) -> impl Iterator<Item = &Arc<IndexBatch>> { self.chunks.iter().map(|(_, batch)| batch) }
     /// The chunk holding `row`, and the row's position within it.
+    /// The unconsumed batches and the prefix to skip in the first one.
+    /// A live table preserves row addresses when it merges its Arrow chunks.
+    pub fn batches_from(&self, row: u32) -> impl Iterator<Item = (&Arc<IndexBatch>, usize)> {
+        let first = self.chunks.partition_point(|(start, batch)| u64::from(*start) + batch.len() as u64 <= u64::from(row));
+        self.chunks[first..].iter().map(move |(start, batch)| (batch, row.saturating_sub(*start) as usize))
+    }
     pub fn locate(&self, row: u32) -> Result<(u32, u32)> {
         if row >= self.row_count { return Err(invalid("Live table row exceeds its retained batches")); }
         let index = self.chunks.partition_point(|(start, _)| *start <= row).checked_sub(1).ok_or_else(|| invalid("Live table row has no owning batch"))?;

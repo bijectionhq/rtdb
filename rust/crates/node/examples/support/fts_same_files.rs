@@ -52,6 +52,10 @@ impl CandidateVerifier for LiteralOnly {
     async fn visible(&self, _: BTreeSet<Iid>, _: rtdb_plan::ColumnId) -> Result<Vec<(Iid, Value)>> {
         panic!("Point ranker must fall back before needing ordinary scan verification")
     }
+
+    async fn visible_columns(&self, _: BTreeSet<Iid>, _: &[rtdb_plan::ColumnId], _: &[Expr]) -> Result<Vec<(Iid, Vec<Value>)>> {
+        panic!("Point ranker must fall back before needing ordinary scan verification")
+    }
 }
 
 #[derive(Clone, Copy)]

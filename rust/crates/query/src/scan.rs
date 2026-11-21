@@ -254,27 +254,116 @@ impl ScanCursor {
     }
 }
 
+pub(crate) async fn ordered_pages(scan: &Scan, execution: &Execution, limit: usize) -> Result<Option<crate::pages::BoxPageCursor>> {
+    if scan.ordered_top_k.is_none() || scan.iids.is_some() || !scan.matches.is_empty() {
+        return Ok(None);
+    }
+    let context = &execution.context;
+    let database = context.catalog.database(&scan.table.name.database)?;
+    let [snapshot] = database.partitions.as_slice() else { return Ok(None); };
+    let storage = &database.storage;
+    let verifier = ScanVerifier { scan, execution, pushdowns: None, partition: snapshot, storage };
+    let bounds = bounds(scan, snapshot, execution).await?;
+    let request = crate::ScanRequest {
+        database: &scan.table.name.database, scan, snapshot, storage, bounds, memory: &context.memory,
+        current_time: context.current_time, cancellation: &context.cancellation,
+        constants: &crate::accelerate::ExecutionConstants(execution), corpora: context.corpora.as_ref(),
+        verifier: &verifier, partitions: &database.partitions,
+    };
+    for accelerator in context.accelerators.iter() {
+        if let Some(iids) = accelerator.ordered_iids(&request, limit).await? {
+            let memory = context.memory.reserve(iids.capacity().saturating_mul(size_of::<Iid>() + 32))?;
+            let mut scan = scan.clone();
+            let width = scan.columns.len();
+            let iid_at = include_iid(&mut scan)?;
+            scan.ordered_top_k = None;
+            scan.top_k = None;
+            scan.predicates.clear();
+            return Ok(Some(Box::new(OrderedRows {
+                scan, execution: execution.clone(), selected: iids.into_iter(), width, iid_at, _memory: memory,
+            })));
+        }
+    }
+    Ok(None)
+}
+
+fn include_iid(scan: &mut Scan) -> Result<usize> {
+    if let Some(position) = scan.columns.iter().position(|field| field.name == "_iid") {
+        return Ok(position);
+    }
+    let position = scan.columns.len();
+    let id = scan.columns.iter().map(|field| field.id.0).max().unwrap_or(0)
+        .checked_add(1).ok_or_else(|| invalid("scan-column", "Column identifier space is exhausted"))?;
+    scan.columns.push(rtdb_plan::Field { id: rtdb_plan::ColumnId(id), name: "_iid".into(), qualifier: None,
+        qualified_only: false, unnamed: true, data_type: rtdb_types::LogicalType::Scalar(rtdb_types::ScalarType::FixedSizeBinary(16)) });
+    Ok(position)
+}
+
+struct OrderedRows {
+    scan: Scan,
+    execution: Execution,
+    selected: std::vec::IntoIter<Iid>,
+    width: usize,
+    iid_at: usize,
+    _memory: Arc<MemoryReservation>,
+}
+
+#[async_trait]
+impl PageCursor for OrderedRows {
+    async fn next_page(&mut self) -> Result<Option<OwnedPage>> {
+        let ids: Vec<_> = self.selected.by_ref().take(128).collect();
+        if ids.is_empty() { return Ok(None); }
+        let memory = &self.execution.context.memory;
+        let _scratch = memory.reserve(ids.len() * 192)?;
+        let mut scan = self.scan.clone();
+        scan.iids = Some(ids.iter().copied().collect());
+        let mut source = ScanCursor::new(scan, self.execution.clone(), None).await?;
+        let mut found = BTreeMap::new();
+        while let Some(mut page) = source.next_page().await? {
+            while let Some(mut row) = page.next() {
+                let Value::FixedSizeBinary(iid) = &row.values[self.iid_at] else {
+                    return Err(invalid("ordered-row-iid", "Ordered scan row has no IID"));
+                };
+                let iid = Iid::from_slice(iid)?;
+                row.values.truncate(self.width);
+                if found.insert(iid, row).is_some() {
+                    return Err(invalid("ordered-row-duplicate", "Ordered point scan returned more than one row for an IID"));
+                }
+            }
+        }
+        let mut output = crate::pages::PageBuilder::new(ids.len(), memory)?;
+        for iid in ids {
+            output.push(found.remove(&iid).ok_or_else(|| invalid("ordered-row-missing", "A row in the ordered index is absent at the read basis"))?)?;
+        }
+        Ok(Some(output.finish()))
+    }
+}
+
 /// Runs the scan itself over one partition, restricted to a batch of IIDs, its predicates applied as the scan's filter applies them; narrowing is skipped because the IIDs are fixed.
 struct ScanVerifier<'a> { scan: &'a Scan, execution: &'a Execution, pushdowns: Option<Arc<crate::pushdown::Pushdowns>>, partition: &'a Snapshot, storage: &'a Arc<BufferPool>, canonical_entity_iids: bool }
 
 #[async_trait]
 impl crate::CandidateVerifier for ScanVerifier<'_> {
-    async fn visible(&self, mut iids: std::collections::BTreeSet<Iid>, column: rtdb_plan::ColumnId) -> Result<Vec<(Iid, Value)>> {
+    async fn visible(&self, iids: std::collections::BTreeSet<Iid>, column: rtdb_plan::ColumnId) -> Result<Vec<(Iid, Value)>> {
+        self.visible_columns(iids, &[column], &[]).await?.into_iter().map(|(iid, mut values)| {
+            Ok((iid, values.pop().ok_or_else(|| invalid("verifier-column", "Verified column is missing"))?))
+        }).collect()
+    }
+
+    async fn visible_columns(&self, mut iids: std::collections::BTreeSet<Iid>, columns: &[rtdb_plan::ColumnId], residuals: &[Expr]) -> Result<Vec<(Iid, Vec<Value>)>> {
         if let Some(pushdowns) = &self.pushdowns {
             iids.retain(|iid| pushdowns.iid_matches(&self.scan.columns, *iid, self.canonical_entity_iids));
         }
         if iids.is_empty() { return Ok(Vec::new()); }
         let mut scan = self.scan.clone();
         scan.top_k = None;
+        scan.ordered_top_k = None;
         scan.iids = Some(iids);
-        if !scan.columns.iter().any(|field| field.name == "_iid") {
-            let id = rtdb_plan::ColumnId(scan.columns.iter().map(|field| field.id.0).max().unwrap_or(0) + 1);
-            scan.columns.push(rtdb_plan::Field { id, name: "_iid".into(), qualifier: None, qualified_only: false, unnamed: true, data_type: rtdb_types::LogicalType::Scalar(rtdb_types::ScalarType::FixedSizeBinary(16)) });
-        }
+        let iid_at = include_iid(&mut scan)?;
         let position = |found: &dyn Fn(&rtdb_plan::Field) -> bool| scan.columns.iter().position(|field| found(field)).ok_or_else(|| invalid("verifier-column", "Verified column is not projected by the scan"));
-        let (iid_at, column_at) = (position(&|field| field.name == "_iid")?, position(&|field| field.id == column)?);
+        let projected = columns.iter().map(|id| position(&|field| field.id == *id)).collect::<Result<Vec<_>>>()?;
         let schema = Schema::new(scan.columns.clone())?;
-        let predicate = scan.predicates.iter().cloned().reduce(|left, right| Expr::binary(rtdb_plan::BinaryOp::And, left, right));
+        let predicate = scan.predicates.iter().chain(residuals).cloned().reduce(|left, right| Expr::binary(rtdb_plan::BinaryOp::And, left, right));
         let mut cursor = ScanCursor::over(scan, self.execution.clone(), self.pushdowns.clone(), std::slice::from_ref(self.partition), self.storage, false).await?;
         let metadata = self.execution.scope()?;
         let invocation = predicate.as_ref().map(|predicate| self.execution.prepare_expression(predicate, &schema, &metadata)).transpose()?;
@@ -286,7 +375,7 @@ impl crate::CandidateVerifier for ScanVerifier<'_> {
                     if !rtdb_expr::is_true(&self.execution.evaluate_invocation(&scope, invocation, &row.values).await?)? { continue; }
                 }
                 let Value::FixedSizeBinary(iid) = &row.values[iid_at] else { return Err(invalid("verifier-iid", "Verified row has no IID")) };
-                visible.push((Iid::from_slice(iid)?, row.values[column_at].clone()));
+                visible.push((Iid::from_slice(iid)?, projected.iter().map(|column| row.values[*column].clone()).collect()));
             }
         }
         Ok(visible)
@@ -910,7 +999,7 @@ mod tests {
         let id = Field { id: ColumnId(0), name: "_id".into(), qualifier: None, qualified_only: false, unnamed: false, data_type: LogicalType::Scalar(ScalarType::I64) };
         let table = rtdb_plan::TableBinding { name: QualifiedTable { database: "xtdb".into(), table: TableRef::new("public", "docs") }, oid: None, columns: Default::default() };
         let scan = |predicate: Expr| Scan { table: table.clone(), columns: vec![id.clone()], valid_time: TemporalFilter::Default, system_time: TemporalFilter::Default,
-            clamp_valid_time: false, iids: None, predicates: vec![predicate], top_k: None, matches: Vec::new() };
+            clamp_valid_time: false, iids: None, predicates: vec![predicate], top_k: None, ordered_top_k: None, matches: Vec::new() };
         let equals = |value: Expr| Expr::binary(rtdb_plan::BinaryOp::Eq, id.expression(), value);
         let parameter = Expr::Parameter { index: 0, data_type: LogicalType::Scalar(ScalarType::Utf8) };
         let iid = |value: Value| value.entity_id().unwrap().iid();
@@ -953,7 +1042,7 @@ mod tests {
         let field = Field { id: ColumnId(0), name: "v".into(), qualifier: None, qualified_only: false, unnamed: false, data_type: binding.columns["v"].clone() };
         let scan = Scan {
             table: binding, columns: vec![field], valid_time: TemporalFilter::All, system_time: TemporalFilter::All,
-            clamp_valid_time: false, iids: None, predicates: Vec::new(), top_k: None, matches: Vec::new(),
+            clamp_valid_time: false, iids: None, predicates: Vec::new(), top_k: None, ordered_top_k: None, matches: Vec::new(),
         };
         let memory = MemoryBudget::new(1 << 24);
         let context = QueryContext::new(catalog, Arc::clone(&memory), Timestamp(100), "UTC", QueryOptions::default(), &CancellationToken::new()).unwrap();
@@ -1247,14 +1336,13 @@ mod tests {
             ..pb::Block::default()
         }).unwrap();
         let additions = BTreeMap::new();
-        let table_blocks = prepared.table_blocks(&additions, Timestamp(200)).unwrap();
-        for (table, table_block) in &table_blocks {
-            let key = catalog.entry(table).unwrap().slug.block_key(prepared.block_index()).unwrap();
+        for (table, table_block) in prepared.table_blocks(&additions, Timestamp(200)).unwrap() {
+            let key = catalog.entry(&table).unwrap().slug.block_key(prepared.block_index()).unwrap();
             store.put(&ObjectKey::new(key).unwrap(), table_block.encode().into()).await.unwrap();
         }
         let key = block_key(prepared.block_index()).unwrap();
         store.put(&ObjectKey::new(key).unwrap(), block.encode().into()).await.unwrap();
-        state.adopt_block(prepared, block, &table_blocks, &additions, Timestamp(200)).unwrap();
+        state.adopt_block(prepared, block, &additions, Timestamp(200)).unwrap();
 
         let memory = MemoryBudget::new(1 << 20);
         let key = TransactionKey { tx_id: TxId(1), system_time: basis.system_time };
@@ -1377,7 +1465,7 @@ mod tests {
         }).collect();
         let scan = Scan {
             table: binding, columns, valid_time: TemporalFilter::All, system_time: TemporalFilter::All,
-            clamp_valid_time: false, iids: None, predicates: Vec::new(), top_k: None, matches: Vec::new(),
+            clamp_valid_time: false, iids: None, predicates: Vec::new(), top_k: None, ordered_top_k: None, matches: Vec::new(),
         };
         let root = MemoryBudget::new(1 << 24);
         let memory = root.scope();

@@ -1,0 +1,45 @@
+= Ordered secondary indexes
+
+`CREATE INDEX orders_customer_priority ON orders (customer, priority, _id)` declares an ordered index.
+`DROP INDEX orders_customer_priority` retires the definition.
+The catalog assigns a fresh generation when a name is reused.
+
+For a system-time point and a valid-time point, a matching `ORDER BY ... LIMIT` can read rows directly in index order.
+The scan seeks an equality prefix, lower and upper bounds on the next column, or a lexicographic continuation.
+For example, after priority 2 and ID 4, use `priority > 2 OR (priority = 2 AND _id > 4)` under `customer = 'a'`.
+Include `_id` in the ordering to make continuation deterministic among equal values.
+Reuse both temporal points to continue the same read across SQL statements.
+The scan can reverse the index order and applies predicates before counting rows towards the limit.
+It fetches projected fields from a row's table at the same basis.
+
+The index orders signed integers, Booleans, text, binary values, UUIDs and calendar dates.
+Ascending order places nulls last and reversing the order places them first.
+The normal SQL executor covers unsupported sort directions, types, temporal intervals and query shapes.
+
+== Membership and storage
+
+A definition owns one ordered tree of postings and a directory of immutable roots by system time.
+A root contains the projected winners at that system time.
+For one row, adjacent valid-time spans with the same key coalesce.
+The tree decomposes each such span into disjoint aligned buckets and orders entries by bucket, key and IID.
+A seek at a valid-time point traverses the bucket prefixes containing it and merges their streams in key order.
+Each eligible IID contributes at most once.
+
+The projector uses the table's temporal resolver to cut the previous projection with a committed revision's puts, deletes and erases.
+It emits both retractions and insertions when a key or interval moves.
+Payload-only changes with the same projected valid-time spans share the previous root.
+The scan captures a single table snapshot, opens the index root for the requested system time, and applies exact edits from uncovered flushed blocks and live segments in that snapshot.
+The point read applies later erasures to the selected root.
+Repeated head reads reuse an admitted live root and apply only the unconsumed tail of the same open block.
+A missing checkpoint, missing source coverage or memory admission failure uses the normal SQL executor.
+
+== Maintenance
+
+The index worker packs its own immutable pages and publishes a checkpoint after its pages and revision directory are durable.
+It checks coverage against the table catalog's durable event count before publication.
+Queries can use a complete checkpoint plus replay from the captured table events, and a reopened node can use the same files.
+Table compaction changes neither the logical roots nor the index's publication schedule.
+A damaged checkpoint can be rebuilt from retained level-zero events.
+A maintenance cycle that incorporates an erase removes the affected IID from older roots and collects unreachable pages and manifests.
+A durable cleanup marker survives a crash after publication or during a rebuild and is cleared after collection.
+A drop makes its generation eligible for collection.

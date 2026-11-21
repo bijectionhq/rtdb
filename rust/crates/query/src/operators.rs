@@ -262,6 +262,17 @@ fn build_pages_constrained(runtime: Arc<EmittedRelation>, execution: Execution, 
         RelationNode::SortLimit { order_by,offset,fetch,.. } => {
             let mut constraints = constraints;for order in order_by { constraints.require(&order.expr); }
             let pushdowns = if offset.is_some() || fetch.is_some() { None } else { pushdowns };
+            let offset_value = row_limit(offset.as_ref(),&execution).await?.unwrap_or(0);
+            let remaining = row_limit(fetch.as_ref(),&execution).await?;
+            let row_limit = offset_value.saturating_add(remaining.unwrap_or(i64::MAX as u64)).min(i64::MAX as u64);
+            if !order_by.is_empty() && fetch.is_some()
+                && let Ok(limit) = usize::try_from(row_limit)
+                && let Some(input) = ordered_input(runtime.child(0)?, execution.child(0), limit).await?
+            {
+                let pages = Box::new(Limit { input: Some(input), offset: offset_value, remaining, execution });
+                let pages = crate::pages::retain_page_state(pages, state_reservation);
+                return Ok(crate::trace::wrap(crate::analysis::wrap(pages, analysis), &traced_relation, &traced_context));
+            }
             let schema = runtime.child(0)?.schema().clone();
             let batches = if !order_by.is_empty() && execution.analysis.is_none() && execution.context.tracer.is_none() && crate::sort::SortCursor::batch_eligible(&schema,order_by,0) {
                 build_batches(runtime.child(0)?,execution.child(0),pushdowns.clone()).await?
@@ -270,9 +281,6 @@ fn build_pages_constrained(runtime: Arc<EmittedRelation>, execution: Execution, 
                 Some(batches) => Ok(batches),
                 None => Err(build_pages_constrained(runtime.child(0)?,execution.child(0),constraints,pushdowns).await?),
             };
-            let offset_value = row_limit(offset.as_ref(),&execution).await?.unwrap_or(0);
-            let remaining = row_limit(fetch.as_ref(),&execution).await?;
-            let row_limit = offset_value.saturating_add(remaining.unwrap_or(i64::MAX as u64)).min(i64::MAX as u64);
             let mut pages: BoxPageCursor = match input {
                 Ok((batches,projected)) if crate::sort::SortCursor::batch_eligible(&schema,order_by,row_limit) =>
                     Box::new(crate::sort::SortCursor::top_batches(batches,projected,schema,order_by.clone(),row_limit,execution.clone())),
@@ -422,6 +430,37 @@ impl PageCursor for LiteralPageCursor {
         Ok(Some(page))
     }
 }
+fn ordered_input(runtime: Arc<EmittedRelation>, execution: Execution, limit: usize)
+    -> futures::future::BoxFuture<'static, Result<Option<BoxPageCursor>>>
+{
+    Box::pin(async move {
+        let relation = runtime.relation();
+        let input: BoxPageCursor = match relation.node() {
+            RelationNode::Scan(scan) => {
+                let Some(input) = crate::scan::ordered_pages(scan, &execution, limit).await? else { return Ok(None); };
+                input
+            }
+            RelationNode::Project { expressions, .. } | RelationNode::Rename { expressions, .. } => {
+                let child = runtime.child(0)?;
+                let Some(input) = ordered_input(Arc::clone(&child), execution.child(0), limit).await? else { return Ok(None); };
+                Box::new(PageProject { input, schema: child.schema().clone(), expressions: expressions.clone(), execution: execution.clone() })
+            }
+            RelationNode::Extend { expressions, .. } => {
+                let child = runtime.child(0)?;
+                let Some(input) = ordered_input(Arc::clone(&child), execution.child(0), limit).await? else { return Ok(None); };
+                Box::new(PageExtend { input, schema: child.schema().clone(), expressions: expressions.clone(), execution: execution.clone() })
+            }
+            RelationNode::Filter { .. } => {
+                let Some(input) = ordered_input(runtime.child(0)?, execution.child(0), limit).await? else { return Ok(None); };
+                input
+            }
+            _ => return Ok(None),
+        };
+        let input = crate::pages::retain_page_state(input, state_reservation(&runtime, &execution)?);
+        Ok(Some(crate::trace::wrap(crate::analysis::wrap(input, execution.analysis.clone()), relation, &execution.context)))
+    })
+}
+
 struct PageProject { input: BoxPageCursor, schema: Schema, expressions: Vec<NamedExpr>, execution: Execution }
 #[async_trait]
 impl PageCursor for PageProject {

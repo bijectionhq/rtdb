@@ -41,6 +41,7 @@ pub struct ScanRequest<'a> {
 pub trait CandidateVerifier: Send + Sync {
     /// Each visible row's IID with its value of `column`.
     async fn visible(&self, iids: BTreeSet<Iid>, column: rtdb_plan::ColumnId) -> Result<Vec<(Iid, Value)>>;
+    async fn visible_columns(&self, iids: BTreeSet<Iid>, columns: &[rtdb_plan::ColumnId], residuals: &[Expr]) -> Result<Vec<(Iid, Vec<Value>)>>;
 
     /// Counts the corpus from authoritative rows when an optional index cannot supply it.
     async fn snapshot_corpus(
@@ -98,6 +99,9 @@ impl rtdb_expr::CorpusLookup for CorpusRegistry {
 #[async_trait]
 pub trait ScanAccelerator: Send + Sync {
     async fn candidate_iids(&self, request: &ScanRequest<'_>) -> Result<Option<BTreeSet<Iid>>>;
+    /// The first matching rows of a point read, in the requested SQL order.
+    /// The returned identities already account for the scan predicates and annotated residual predicates.
+    async fn ordered_iids(&self, _request: &ScanRequest<'_>, _limit: usize) -> Result<Option<Vec<Iid>>> { Ok(None) }
     /// The values of `match(column, query)` on the rows of whichever of the scan's data files the accelerator can answer for, so the scan reads no text there.
     /// Each answer must equal MATCH evaluated on the row.
     async fn match_answers(&self, _request: &ScanRequest<'_>, _column: &str, _query: &str) -> Result<Option<MatchAnswers>> { Ok(None) }

@@ -26,6 +26,7 @@ pub struct ResolveContext {
     pub storage: Arc<BufferPool>,
     pub memory: Arc<MemoryBudget>,
     pub query_options: QueryOptions,
+    pub scan_accelerators: Arc<[Arc<dyn rtdb_query::ScanAccelerator>]>,
     pub cancellation: CancellationToken,
     pub default_tz: String,
     pub authorization: Arc<dyn TransactionAuthorization>,
@@ -36,7 +37,8 @@ pub struct ResolveContext {
 impl ResolveContext {
     fn query_context(&self, snapshot: Snapshot, time: Timestamp, timezone: &str, parent: Option<rtdb_plan::SpanContext>) -> Result<Arc<QueryContext>> {
         let catalog = CatalogSnapshot::new(self.database.clone(), BTreeMap::from([(self.database.clone(), DatabaseSnapshot { partitions: vec![snapshot], storage: Arc::clone(&self.storage) })]), true)?;
-        Ok(QueryContext::new(catalog, Arc::clone(&self.memory), time, timezone, self.query_options.clone(), &self.cancellation)?.with_tracer(self.tracer.clone(), parent))
+        Ok(QueryContext::new(catalog, Arc::clone(&self.memory), time, timezone, self.query_options.clone(), &self.cancellation)?
+            .with_accelerators(Arc::clone(&self.scan_accelerators)).with_tracer(self.tracer.clone(), parent))
     }
     fn transaction_span(&self, parent: Option<rtdb_plan::SpanContext>, name: &str, attributes: &[(&str, rtdb_plan::TraceValue<'_>)]) -> Option<Box<dyn rtdb_plan::TraceSpan>> {
         self.tracer.as_ref().filter(|tracer| tracer.transaction_enabled()).and_then(|tracer| tracer.start(parent, name, attributes))
@@ -323,6 +325,12 @@ impl<'a> OpenTransaction<'a> {
         self.execute_mutation(mutation, context, arguments, Some(syntax)).await.map_err(with_sql)
     }
 
+    async fn ordered_index_exists(&self, name: &str) -> Result<bool> {
+        if !self.snapshot()?.contains_table(&TableRef::new("xt", "ordered_indexes")) { return Ok(false); }
+        let mut query = self.open_query("SELECT _id FROM xt.ordered_indexes WHERE _id = ?", vec![Value::Utf8(name.into())]).await?;
+        Ok(query.next_batch().await?.is_some())
+    }
+
     async fn execute_mutation(&mut self, mutation: rtdb_sql::Mutation, context: Arc<QueryContext>, arguments: Option<&[Value]>, syntax: Option<Arc<MemoryReservation>>) -> Result<()> {
         use rtdb_sql::Mutation;
         let (table, input, kind) = match mutation {
@@ -348,6 +356,34 @@ impl<'a> OpenTransaction<'a> {
             Mutation::DropSearchIndex { name } => {
                 check_search_index_name(&name)?;
                 return self.buffer.delete(TableRef::new("xt", "search_indexes"), &rtdb_types::EntityId::String(name), interval(self.tx_key().system_time, Timestamp::MAX)?);
+            }
+            Mutation::CreateOrderedIndex { name, table, columns } => {
+                if table.database != self.context.database { return Err(Anomaly::incorrect("xtdb/table-not-found", "An ordered index must cover a table in this database")); }
+                check_table(&table.table)?;
+                check_ordered_index_name(&name)?;
+                if columns.iter().collect::<std::collections::BTreeSet<_>>().len() != columns.len()
+                    || columns.iter().any(|column| matches!(column.as_str(), "_iid" | "_valid_from" | "_valid_to" | "_valid_time" | "_system_from" | "_system_to" | "_system_time" | "_recency"))
+                {
+                    return Err(Anomaly::incorrect("xtdb/invalid-index-columns", "An ordered index requires distinct stored columns"));
+                }
+                if self.ordered_index_exists(&name).await? {
+                    return Err(Anomaly::incorrect("xtdb/index-already-exists", format!("Index {name} already exists")));
+                }
+                let document = StructFields::from([
+                    ("_id".into(), Value::Utf8(name)),
+                    ("schema_name".into(), Value::Utf8(table.table.schema)),
+                    ("table_name".into(), Value::Utf8(table.table.table)),
+                    ("columns".into(), Value::List(columns.into_iter().map(Value::Utf8).collect())),
+                    ("version".into(), Value::I64(self.tx_key().tx_id.0)),
+                ]);
+                return self.buffer.put(TableRef::new("xt", "ordered_indexes"), document, interval(self.tx_key().system_time, Timestamp::MAX)?);
+            }
+            Mutation::DropOrderedIndex { name } => {
+                check_ordered_index_name(&name)?;
+                if !self.ordered_index_exists(&name).await? {
+                    return Err(Anomaly::incorrect("xtdb/index-not-found", format!("Index {name} does not exist")));
+                }
+                return self.buffer.delete(TableRef::new("xt", "ordered_indexes"), &rtdb_types::EntityId::String(name), interval(self.tx_key().system_time, Timestamp::MAX)?);
             }
             Mutation::GrantRole { user, role, revoke } => {
                 if self.context.database != "xtdb" { return Err(Anomaly::incorrect("xtdb/role-membership-non-primary", "Role membership can only be managed on the primary 'xtdb' database.").with_context("db", self.context.database.clone().into())); }
@@ -666,6 +702,7 @@ mod tests {
         let resolve = ResolveContext {
             database: "xtdb".into(), storage: Arc::new(BufferPool::new(Arc::new(rtdb_storage::MemoryStore::default()), 1 << 20)),
             memory: Arc::clone(&memory), query_options: QueryOptions { batch_rows: 1, ..Default::default() },
+            scan_accelerators: Default::default(),
             cancellation: CancellationToken::new(), default_tz: "UTC".into(), authorization: Arc::new(NoRoleChecks),
             execution_observer: None, tracer: None,
         };
@@ -772,6 +809,7 @@ mod tests {
         let resolve = ResolveContext {
             database: "xtdb".into(), storage: Arc::new(BufferPool::new(Arc::new(rtdb_storage::MemoryStore::default()), 1 << 20)),
             memory: Arc::clone(&memory), query_options: QueryOptions::default(),
+            scan_accelerators: Default::default(),
             cancellation: CancellationToken::new(), default_tz: "UTC".into(), authorization: Arc::new(NoRoleChecks),
             execution_observer: None, tracer: None,
         };
@@ -822,6 +860,13 @@ mod tests {
 fn check_search_index_name(name: &str) -> Result<()> {
     if name.is_empty() || matches!(name, "." | "..") || name.contains(['/', '\\', '\0', '~']) {
         return Err(Anomaly::incorrect("xtdb/invalid-search-index-name", format!("Invalid search index name: {name}")));
+    }
+    Ok(())
+}
+
+fn check_ordered_index_name(name: &str) -> Result<()> {
+    if name.is_empty() {
+        return Err(Anomaly::incorrect("xtdb/invalid-index-name", "An ordered index name cannot be empty"));
     }
     Ok(())
 }
