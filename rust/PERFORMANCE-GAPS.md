@@ -219,7 +219,34 @@ The glibc run with a 61.1 ms pgwire single-INSERT p95 was followed by 3.09 ms an
 The 100,000-row Flight ingest median still trails the reference, and the million-row Flight median difference is inside the measured XTDB spread.
 Verify the packaged allocator setting and repeat the remaining Flight comparisons with phase-specific profiles.
 The native release image built from `5d0b86b41` on Mac mini 2 loaded the packaged allocator and passed both build-information checks.
-Run the packaged image and the candidate with all write-path changes under the same limits.
+The experimental and packaged libraries are different builds of the same upstream jemalloc 5.3.0 revision.
+Both report the same effective purge settings.
+
+### Packaged allocator baseline
+
+Two fresh full runs per engine compared packaged RTDB `5d0b86b41` with XTDB `c84f9334e` at each size on Mac mini 2.
+All eight runs completed the row-count checks and reported results without client thread failures.
+Host load averaged about 21 at the start and 11 near the end on a 12-logical-CPU machine.
+
+| Rows | Metric | Packaged RTDB median [range] | XTDB median [range] |
+| ---: | --- | ---: | ---: |
+| 100k | pgwire ingest | 30.1k [25.8k, 34.4k] rows/s | 19.4k [16.2k, 22.6k] rows/s |
+| 100k | Flight prepared INSERT | 44.8k [35.1k, 54.4k] rows/s | 29.3k [19.0k, 39.7k] rows/s |
+| 100k | Flight single INSERT p95 | 31.0 [18.9, 43.2] ms | 13.1 [11.5, 14.7] ms |
+| 100k | pgwire concurrent INSERT | 446 [193, 699] tx/s | 616 [594, 637] tx/s |
+| 1M | pgwire ingest | 34.7k [25.3k, 44.2k] rows/s | 37.3k [26.9k, 47.8k] rows/s |
+| 1M | Flight prepared INSERT | 83.6k [61.1k, 106.2k] rows/s | 115.6k [94.6k, 136.6k] rows/s |
+| 1M | pgwire UPDATE of 10% of orders | 715 [607, 822] ms | 789 [635, 943] ms |
+| 1M | Flight concurrent INSERT | 627 [534, 720] tx/s | 996 [909, 1,083] tx/s |
+| 1M | Flight full-scan fetch p50 | 4,316 [4,276, 4,356] ms | 2,796 [2,609, 2,983] ms |
+| 1M | Peak working set during pgwire | 707 [660, 753] MiB | 901 [900, 902] MiB |
+| 1M | Peak working set during Flight | 607 [607, 607] MiB | 838 [755, 920] MiB |
+
+All four million-row Flight runs showed zero container CPU quota throttles during ingest, full-scan fetch and single INSERT.
+The two RTDB full-scan phases took 20.9–24.2 seconds and used 4.4–4.7 server CPU seconds.
+XTDB took 13.1–15.0 seconds and used 3.0–4.7 server CPU seconds.
+Full-scan fetch includes client decoding and transfers, so these timings call for separate server and client measurements.
+The combined write-path candidate `55277dbf3` is the next packaged comparison.
 
 ### Flight and UPDATE CPU samples
 
@@ -239,6 +266,7 @@ Report process RSS, anonymous memory, cgroup working set and total cgroup charge
 Use compaction-disabled runs to identify causes and compaction-enabled runs to judge parity.
 Keep the existing correctness tests and run the relevant Rust, JVM and conformance suites for changes affecting shared behavior.
 The Gradle test and property suites passed all 6,535 tests after the watermark check changed, including 398 native binding tests.
+The 398 native binding tests also passed against a rebuilt library containing the write-path candidates.
 The Rust replication suite passed all 60 tests.
 All 59 tests in the Rust node's native integration suite passed.
 Two Rust search tests failed during compaction with an Arrow page schema mismatch on both the parity branch and its `c67d7a04f` baseline.
