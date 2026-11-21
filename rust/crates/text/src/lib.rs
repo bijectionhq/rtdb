@@ -2,6 +2,7 @@
 //! Behavioural spec: dev/doc/fts.allium.
 
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
 pub const SIMPLE_ANALYZER: &str = "simple";
 
@@ -91,28 +92,74 @@ const LENGTHS: [u32; 256] = [
     536_870_936, 603_979_800, 671_088_664, 738_197_528, 805_306_392, 872_415_256, 939_524_120, 1_006_632_984, 1_073_741_848, 1_207_959_576, 1_342_177_304, 1_476_395_032, 1_610_612_760, 1_744_830_488, 1_879_048_216, 2_013_265_944,
 ];
 
-/// BM25 of a document for a query, from each term's frequency in it and its stored length, relative to a corpus.
-/// Without a corpus, or for a term the corpus does not hold, the term's inverse document frequency is 1 and the document is taken to be of average length.
-/// The search index and a resolved row both score through here, so the two agree to the bit.
-pub fn score(query: &Query, frequencies: &[u32], length: u32, corpus: Option<&Corpus>) -> f64 {
-    query.terms.iter().zip(frequencies).map(|(term, frequency)| term_score(term, *frequency, length, corpus)).sum()
+fn inverse_frequency(term: &str, corpus: Option<&Corpus>) -> f64 {
+    corpus.and_then(|corpus| corpus.frequencies.get(term).map(|df| (corpus.documents as f64, *df as f64)))
+        .map_or(1.0, |(documents, df)| (1.0 + (documents - df + 0.5) / (df + 0.5)).ln())
 }
 
-/// One term's part of `score`: it rises with the term's frequency, and falls with the document's length when the term's inverse document frequency is positive.
-pub fn term_score(term: &str, frequency: u32, length: u32, corpus: Option<&Corpus>) -> f64 {
+fn rounded_term_score(frequency: u32, length: u32, average: Option<f64>, idf: f64) -> f64 {
     let (frequency, length) = (f64::from(frequency), f64::from(length));
-    if frequency == 0.0 { return 0.0; }
-    let average = corpus.filter(|corpus| corpus.documents > 0 && corpus.tokens > 0).map_or(length, |corpus| corpus.tokens as f64 / corpus.documents as f64);
-    let idf = corpus.and_then(|corpus| corpus.frequencies.get(term).map(|df| (corpus.documents as f64, *df as f64)))
-        .map_or(1.0, |(documents, df)| (1.0 + (documents - df + 0.5) / (df + 0.5)).ln());
+    let average = average.unwrap_or(length);
     let norm = if average > 0.0 { 1.0 - B + B * length / average } else { 1.0 };
     idf * frequency * (K1 + 1.0) / (frequency + K1 * norm)
 }
 
+/// BM25 parameters fixed once for the scan and the SQL expressions that score its rows.
+pub struct Scorer {
+    query: Query,
+    average: Option<f64>,
+    idfs: Vec<f64>,
+}
+
+impl Scorer {
+    pub fn new(query: Query, corpus: Option<&Corpus>) -> Self {
+        let average = corpus.filter(|corpus| corpus.documents > 0 && corpus.tokens > 0)
+            .map(|corpus| corpus.tokens as f64 / corpus.documents as f64);
+        let idfs: Vec<f64> = query.terms.iter().map(|term| inverse_frequency(term, corpus)).collect();
+        Self { query, average, idfs }
+    }
+
+    pub fn query(&self) -> &Query { &self.query }
+
+    /// The document's score from its stored length and frequencies in query-term order.
+    pub fn score(&self, frequencies: &[u32], length: u32) -> f64 {
+        self.idfs.iter().zip(frequencies).map(|(&idf, &frequency)| {
+            if frequency == 0 { 0.0 } else { rounded_term_score(frequency, length, self.average, idf) }
+        }).fold(-0.0, |total, term| total + term)
+    }
+
+    pub fn bm25(&self, document: &[String]) -> f64 {
+        let frequencies: Vec<u32> = self.query.terms.iter().map(|term| document.iter().filter(|token| *token == term).count() as u32).collect();
+        self.score(&frequencies, stored_length(document.len()))
+    }
+
+    pub fn for_ranking(self: &Arc<Self>) -> Option<RankScorer> {
+        if self.idfs.iter().any(|&idf| idf != 0.0 && !(f64::EPSILON / 4096.0..=64.0).contains(&idf)) {
+            return None;
+        }
+        Some(RankScorer(Arc::clone(self)))
+    }
+}
+
+/// A scorer whose weights are in the domain of the window bound.
+pub struct RankScorer(Arc<Scorer>);
+
+impl RankScorer {
+    pub fn scorer(&self) -> &Arc<Scorer> { &self.0 }
+
+    /// Bounds a term independently so adding the bounds in score order preserves the bound at each rounding step.
+    /// For positive weights in the admitted range, the four operations after normalization are normal binary64.
+    /// The selected padding covers rounding of both the row's score and the window's score. See verification/smt/rank-bound.smt2.
+    pub fn term_bound(&self, term: usize, maximum_frequency: u32, minimum_length: u32) -> f64 {
+        let idf = self.0.idfs[term];
+        if idf == 0.0 || maximum_frequency == 0 { return 0.0; }
+        rounded_term_score(maximum_frequency, minimum_length, self.0.average, idf) * (1.0 + 16.0 * f64::EPSILON)
+    }
+}
+
 /// BM25 of a document's tokens for a query, relative to a corpus.
 pub fn bm25(query: &Query, document: &[String], corpus: Option<&Corpus>) -> f64 {
-    let frequencies: Vec<u32> = query.terms.iter().map(|term| document.iter().filter(|token| *token == term).count() as u32).collect();
-    score(query, &frequencies, stored_length(document.len()), corpus)
+    Scorer::new(query.clone(), corpus).bm25(document)
 }
 
 #[cfg(test)]
@@ -175,5 +222,26 @@ mod tests {
         assert!(short > long);
         assert_eq!(bm25(&query, &tokens("nothing"), Some(&corpus)), 0.0);
         assert!(bm25(&query, &tokens("rare"), None) > 0.0);
+    }
+
+    #[test]
+    fn a_rounded_frequency_reversal_still_has_a_conservative_window_bound() {
+        let corpus = Corpus { documents: 1, tokens: 1_340_810_819, frequencies: BTreeMap::new() };
+        let scoring = Arc::new(Scorer::new(Query::parse("term"), Some(&corpus)));
+        let scoring_bound = scoring.for_ranking().unwrap();
+        let (frequency, length) = (402_652_755, 402_653_208);
+        let score = scoring.score(&[frequency], length);
+        let unpadded = scoring.score(&[frequency + 1], length);
+        assert_eq!(score.to_bits(), 0x4001_9999_992e_8a4d);
+        assert_eq!(unpadded.to_bits(), 0x4001_9999_992e_8a4c);
+        assert!(score <= scoring_bound.term_bound(0, frequency + 1, length), "rounded score exceeds its window bound");
+    }
+
+    #[test]
+    fn a_weight_outside_the_proof_domain_cannot_admit_ranked_pruning() {
+        let corpus = Corpus { documents: 0, tokens: 0, frequencies: BTreeMap::from([("term".into(), 1)]) };
+        let scoring = Arc::new(Scorer::new(Query::parse("term"), Some(&corpus)));
+        assert!(scoring.for_ranking().is_none());
+        assert!(scoring.score(&[1], 1) < 0.0);
     }
 }

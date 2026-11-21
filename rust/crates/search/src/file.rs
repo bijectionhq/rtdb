@@ -7,7 +7,7 @@ use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use rtdb_text::{Corpus, Query};
+use rtdb_text::{Corpus, Query, RankScorer, Scorer};
 use rtdb_types::{Anomaly, EventHeader, EventOp, Iid, Interval, Result, TemporalBounds, Timestamp};
 use tantivy::collector::DocSetCollector;
 use tantivy::directory::error::{DeleteError, OpenReadError, OpenWriteError};
@@ -698,12 +698,12 @@ impl SearchFile {
         let Some(field) = self.field(column) else { return Ok(Vec::new()) };
         let docs = self.matches(column, matching, bounds)?;
         let Some(segment) = self.searcher.segment_readers().first() else { return Ok(Vec::new()) };
-        let mut scorer = ExactScorer::open(segment, field, scoring, corpus)?;
+        let mut scorer = ExactScorer::open(segment, field, Arc::new(Scorer::new(scoring.clone(), corpus)))?;
         docs.into_iter().map(|doc| Ok((doc, scorer.score(doc.doc)))).collect()
     }
 
     /// The documents matching `matching` and visible in `bounds`, best possible score for `scoring` first, a window of documents at a time.
-    pub fn ranked(self: &Arc<Self>, column: &str, matching: &Query, scoring: &Query, corpus: Option<&Corpus>, bounds: TemporalBounds) -> Result<Ranked> {
+    pub fn ranked(self: &Arc<Self>, column: &str, matching: &Query, scoring: &RankScorer, bounds: TemporalBounds) -> Result<Ranked> {
         let (Some(column), Some(field)) = (self.column(column), self.field(column)) else { return Ok(Ranked(None)) };
         let Some(segment) = self.searcher.segment_readers().first() else { return Ok(Ranked(None)) };
         if matching.terms().is_empty() { return Ok(Ranked(None)); }
@@ -722,18 +722,16 @@ impl SearchFile {
             windows = Some(match windows { None => held, Some(previous) => previous.into_iter().filter(|window| held.binary_search(window).is_ok()).collect() });
         }
         let mut ordered: Vec<(f64, u32)> = windows.unwrap_or_default().into_iter().map(|window| (0.0, window)).collect();
-        for term in scoring.terms() {
+        for (term_index, term) in scoring.scorer().query().terms().iter().enumerate() {
             let impacts = impacts(term)?;
             for (bound, window) in &mut ordered {
                 if let Ok(index) = impacts.binary_search_by_key(window, |impact| impact.window) {
-                    *bound += rtdb_text::term_score(term, impacts[index].frequency, impacts[index].length, corpus).max(0.0);
+                    *bound += scoring.term_bound(term_index, impacts[index].frequency, impacts[index].length);
                 }
             }
         }
-        // A term's part rises with frequency and falls with length exactly, but its rounded value need not; the margin covers that.
-        for (bound, _) in &mut ordered { *bound = *bound * (1.0 + 1e-9) + 1e-12; }
         ordered.sort_by(|left, right| right.0.total_cmp(&left.0).then(left.1.cmp(&right.1)));
-        Ok(Ranked(Some(Windows { file: Arc::clone(self), field, matching: matching.clone(), scoring: scoring.clone(), corpus: corpus.cloned(), bounds, windows: ordered, next: 0, batch: 4 })))
+        Ok(Ranked(Some(Windows { file: Arc::clone(self), field, matching: matching.clone(), scoring: Arc::clone(scoring.scorer()), bounds, windows: ordered, next: 0, batch: 4 })))
     }
 
     /// Whether MATCH holds on each row, through the run it belongs to: `None` where the column is null or absent, as MATCH is on such a row.
@@ -801,13 +799,13 @@ impl rtdb_query::FileMatches for MatchSet {
 }
 
 /// Scores documents in ascending order from the postings of the scoring terms.
-struct ExactScorer { postings: Vec<Option<tantivy::postings::SegmentPostings>>, lengths: tantivy::fieldnorm::FieldNormReader, scoring: Query, corpus: Option<Corpus> }
+struct ExactScorer { postings: Vec<Option<tantivy::postings::SegmentPostings>>, lengths: tantivy::fieldnorm::FieldNormReader, scoring: Arc<Scorer> }
 
 impl ExactScorer {
-    fn open(segment: &tantivy::SegmentReader, field: Field, scoring: &Query, corpus: Option<&Corpus>) -> Result<Self> {
+    fn open(segment: &tantivy::SegmentReader, field: Field, scoring: Arc<Scorer>) -> Result<Self> {
         let inverted = segment.inverted_index(field).map_err(fault)?;
-        let postings = scoring.terms().iter().map(|term| inverted.read_postings(&Term::from_field_text(field, term), IndexRecordOption::WithFreqs).map_err(fault)).collect::<Result<_>>()?;
-        Ok(Self { postings, lengths: segment.get_fieldnorms_reader(field).map_err(fault)?, scoring: scoring.clone(), corpus: corpus.cloned() })
+        let postings = scoring.query().terms().iter().map(|term| inverted.read_postings(&Term::from_field_text(field, term), IndexRecordOption::WithFreqs).map_err(fault)).collect::<Result<_>>()?;
+        Ok(Self { postings, lengths: segment.get_fieldnorms_reader(field).map_err(fault)?, scoring })
     }
     fn score(&mut self, doc: u32) -> f64 {
         use tantivy::{DocSet, postings::Postings};
@@ -815,7 +813,7 @@ impl ExactScorer {
             Some(postings) => if postings.doc() <= doc && postings.seek(doc) == doc { postings.term_freq() } else { 0 },
             None => 0,
         }).collect();
-        rtdb_text::score(&self.scoring, &frequencies, self.lengths.fieldnorm(doc), self.corpus.as_ref())
+        self.scoring.score(&frequencies, self.lengths.fieldnorm(doc))
     }
 }
 
@@ -824,7 +822,7 @@ impl ExactScorer {
 pub struct Ranked(Option<Windows>);
 
 /// The windows holding every matching term, each with the best score a document in it can have, best first, and how far they have been handed out.
-struct Windows { file: Arc<SearchFile>, field: Field, matching: Query, scoring: Query, corpus: Option<Corpus>, bounds: TemporalBounds, windows: Vec<(f64, u32)>, next: usize, batch: usize }
+struct Windows { file: Arc<SearchFile>, field: Field, matching: Query, scoring: Arc<Scorer>, bounds: TemporalBounds, windows: Vec<(f64, u32)>, next: usize, batch: usize }
 
 impl Ranked {
     /// The highest score any document not yet handed out can have, or `None` once all are.
@@ -849,7 +847,7 @@ impl Windows {
         let segment = &searcher.segment_readers()[0];
         let weight = SearchFile::conjunction(self.field, &self.matching).weight(tantivy::query::EnableScoring::disabled_from_searcher(searcher)).map_err(fault)?;
         let mut docs = weight.scorer(segment, 1.0).map_err(fault)?;
-        let mut scorer = ExactScorer::open(segment, self.field, &self.scoring, self.corpus.as_ref())?;
+        let mut scorer = ExactScorer::open(segment, self.field, Arc::clone(&self.scoring))?;
         let mut found = Vec::new();
         for window in windows {
             let (start, stop) = (window.saturating_mul(WINDOW), window.saturating_add(1).saturating_mul(WINDOW));
@@ -1007,7 +1005,8 @@ mod tests {
                 let (matching, scoring) = (Query::parse(matching), Query::parse(scoring));
                 let corpus = file.corpus("body", &scoring).unwrap();
                 let mut expected = file.scored("body", &matching, &scoring, Some(&corpus), bounds).unwrap();
-                let mut ranked = file.ranked("body", &matching, &scoring, Some(&corpus), bounds).unwrap();
+                let rank_scorer = Arc::new(Scorer::new(scoring.clone(), Some(&corpus))).for_ranking().unwrap();
+                let mut ranked = file.ranked("body", &matching, &rank_scorer, bounds).unwrap();
                 let windows: BTreeMap<u32, f64> = ranked.0.as_ref().map_or_else(BTreeMap::new, |windows| windows.windows.iter().map(|(bound, window)| (*window, *bound)).collect());
                 for (doc, score) in &expected {
                     let bound = windows.get(&(doc.doc / WINDOW)).unwrap_or_else(|| panic!("{matching:?}: doc {} is in no window", doc.doc));
@@ -1091,7 +1090,8 @@ mod tests {
         assert_eq!((third.value(0, 0).unwrap(), third.value(0, 1).unwrap()), (Some(true), None));
         assert!(set.member(3).is_err());
 
-        let mut ranked = file.ranked("body", &query, &query, None, at(1, 35)).unwrap();
+        let rank_scorer = Arc::new(Scorer::new(query.clone(), None)).for_ranking().unwrap();
+        let mut ranked = file.ranked("body", &query, &rank_scorer, at(1, 35)).unwrap();
         let mut handed = Vec::new();
         while ranked.bound().is_some() {
             handed.extend(ranked.expand().unwrap().into_iter().map(|(doc, _)| (doc.member, doc.iid[0])));

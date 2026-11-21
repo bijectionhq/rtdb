@@ -94,6 +94,7 @@ The independent comparison also uses Maude 3.5.1 and Apalache 0.63.0.
 The pinned Verus release replaces the earlier proposed source build of 31e44e6.
 The optional Rust boundary check compiles an unchanged copy and two mutated copies of the replica driver imported from the current Git commit.
 The optional native replay reads the same seeded 4,096-observation trace that the Lean evaluator checks.
+It also compiles the unmodified and unpadded text scorer to replay the binary64 boundary witness.
 
 == Evidence boundaries
 
@@ -108,6 +109,9 @@ The optional native replay reads the same seeded 4,096-observation trace that th
 * `tla/ReadBack.tla` separates append, record delivery, apply, and acknowledgement across a crash and restart.
 * `tla/LeaseAdmission.tla` compares validated expiring leases and coordinated pins against age-only collection and stale-follower admission.
 * `alloy/Reclamation.als` independently checks the structural last-reference rule over a finite scope, including one deliberately faulty collector.
+* `smt/rank-bound.smt2` checks the exact-real inequalities behind the binary64 score bound under the normal-rounding model and its two negative controls.
+  `smt/rank-witness.smt2` checks the concrete counterexample with exact binary64 operations.
+  The Lean frontier proof assumes coverage by pending scores or unread windows.
 * `verus/` checks the exact Rust functions called by the search builder, temporal resolvers and replica fence.
   The proofs cover their stated decisions.
   The call sites, complete temporal resolver, storage adapters and full search equivalence need separate refinement and replay evidence.

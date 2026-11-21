@@ -135,3 +135,34 @@ The next bitemporal study should compare the direct pointwise reference to the s
 The ranking path now verifies the full scan restriction before scoring a row, with a node regression for two independent MATCH predicates.
 The search review also identified outstanding obligations for memory refusal and scan fallback and for historical pages with within-file recency branching.
 Track counterexamples by law and amend the mechanism or the production code that owns it.
+
+== Study 2 · Ranked window bounds
+
+Question.
+Does the maximum frequency and minimum stored length in a window bound each row's binary64 score?
+
+The unrounded quotient has that property.
+With weight 1, average length 1,340,810,819 and stored length 402,653,208, frequencies 402,652,755 and 402,652,756 produce scores with bit patterns `0x40019999992e8a4d` and `0x40019999992e8a4c`, respectively.
+This refutes the unpadded extremum.
+The previous implementation added a margin after summing terms.
+
+Amendment 002.
+Use one prepared scorer for the window bounds, the candidate verifier and SQL evaluation.
+Admit ranked pruning only when each weight is zero or lies in `[2^-64, 64]`.
+For each term, score the window extrema with the same arithmetic as a row and multiply by `1 + 16 × f64::EPSILON` before accumulating.
+Both sides add in query-term order.
+
+The proof treats the computed binary64 length penalty as an input to each quotient.
+For a shared positive corpus average, that penalty increases monotonically with stored length.
+Without an average, the stored length is a `u32`, so multiplying it by 0.75 is exact and dividing by the same positive length yields 0.75.
+The zero-length branch then gives the same normalization of 1.
+A positive corpus average is between `2^-64` and `2^64` from its nonzero `u64` counters.
+The penalty is within `[1/4, 2^98]`.
+With the admitted weight, positive `u32` frequency and fixed numerator scale between 2 and 3, the two numerator products, the denominator addition, the quotient and the padding multiplication all have exact results in the normal binary64 range.
+
+The SMT model uses unit roundoff `ε = 2^-53`.
+It checks that each rounded quotient lies between `1 − 8ε` and `1 + 8ε` times its idealized value, and that the padding covers the gap even if its own multiplication rounds down.
+It also checks the exact-rational extremum inequality and preservation of order under rounding and addition.
+The Lean frontier law checks that a row supported by a pending score or an unexpanded window prevents cutoff if it can tie the threshold.
+Its premise requires that every qualifying row on an unseen IID has such support.
+Production search and scan replay exercise that premise over concrete inputs.

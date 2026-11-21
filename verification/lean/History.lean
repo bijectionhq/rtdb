@@ -154,6 +154,27 @@ theorem cutoff_keeps_possible_ties (actual frontier kth : Int)
     (isBound : actual ≤ frontier) (canTie : kth ≤ actual) :
     ¬ frontier < kth := by omega
 
+def rankFrontier (pending windows : List Int) : Option Int :=
+  (pending ++ windows).max?
+
+theorem frontier_covers_supported_row (pending windows : List Int) (row : Int)
+    (covered : ∃ evidence, (evidence ∈ pending ∨ evidence ∈ windows) ∧ row ≤ evidence) :
+    ∃ frontier, rankFrontier pending windows = some frontier ∧ row ≤ frontier := by
+  obtain ⟨evidence, location, bound⟩ := covered
+  have member : evidence ∈ pending ++ windows := List.mem_append.2 location
+  cases found : (pending ++ windows).max? with
+  | none => simp [List.max?_eq_none_iff.1 found] at member
+  | some frontier =>
+    refine ⟨frontier, ?_, Int.le_trans bound ((List.max?_eq_some_iff.1 found).2 evidence member)⟩
+    exact found
+
+theorem unverified_row_prevents_cutoff (pending windows : List Int) (row kth : Int)
+    (covered : ∃ evidence, (evidence ∈ pending ∨ evidence ∈ windows) ∧ row ≤ evidence)
+    (canTie : kth ≤ row) :
+    ∃ frontier, rankFrontier pending windows = some frontier ∧ ¬ frontier < kth := by
+  obtain ⟨frontier, found, bound⟩ := frontier_covers_supported_row pending windows row covered
+  exact ⟨frontier, found, cutoff_keeps_possible_ties row frontier kth bound canTie⟩
+
 theorem idealized_bm25_term_bound (frequency upperFrequency lowerNorm norm : Nat)
     (frequencyBound : frequency ≤ upperFrequency) (normBound : lowerNorm ≤ norm) :
     frequency * (upperFrequency + lowerNorm) ≤ upperFrequency * (frequency + norm) := by
@@ -332,6 +353,8 @@ example : point (admit [correction.reverse, original] 2) 2 0 3 = none := by deci
 #print axioms resolution_sees_last_tentative_put
 #print axioms candidate_superset_refines_scan
 #print axioms cutoff_keeps_possible_ties
+#print axioms frontier_covers_supported_row
+#print axioms unverified_row_prevents_cutoff
 #print axioms idealized_bm25_term_bound
 #print axioms keeping_first_rows_preserves_top_k
 #print axioms key_partition_preserves_answer

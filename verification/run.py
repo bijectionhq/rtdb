@@ -100,6 +100,45 @@ def verify_verus(args, scratch):
             print(f"{case}: {result['verified']} verified, {len(expected)} expected errors")
 
 
+def verify_rank_bound(args, scratch):
+    path = Path("verification/smt/rank-bound.smt2")
+    baseline = {
+        "term-roundoff": "unsat",
+        "padding": "unsat",
+        "frequency-and-length": "unsat",
+        "rounding-monotone": "unsat",
+        "sum-step": "unsat",
+    }
+    controls = {
+        "baseline": None,
+        "no-padding": ("(+ 1 (* 32 epsilon))", "1", "padding"),
+        "bad-minimum-length": (
+            "(<= minimum-penalty penalty)", "(> minimum-penalty penalty)", "frequency-and-length",
+        ),
+    }
+    for name, control in controls.items():
+        case = f"rank-arithmetic-{name}"
+        directory = scratch / case
+        source = clone_file(path, directory)
+        expected = baseline.copy()
+        if control:
+            replace_once(source, control[0], control[1])
+            expected[control[2]] = "sat"
+        checked = run_case([args.z3, "-T:20", str(source)], directory, args.evidence, case)
+        if checked.returncode or checked.stderr or checked.stdout.splitlines() != [
+            line for item in expected.items() for line in item
+        ]:
+            raise ValueError(f"{case}: expected {expected}, observed {checked.stdout.strip()}")
+        print(f"{case}: {'negative control has a counterexample' if control else 'five obligations checked'}")
+    witness = clone_file(Path("verification/smt/rank-witness.smt2"), scratch)
+    checked = run_case([args.z3, "-T:20", str(witness)], scratch, args.evidence, "rank-ieee-witness")
+    if checked.returncode or checked.stderr or checked.stdout.splitlines() != [
+        "exact-unpadded-reversal", "unsat", "exact-padded-bound", "unsat"
+    ]:
+        raise ValueError("binary64 witness did not match")
+    print("rank-ieee-witness: checked exact reversal and padded bound")
+
+
 def verify_lean(args, scratch):
     path = Path("verification/lean/History.lean")
     controls = {
@@ -116,7 +155,12 @@ def verify_lean(args, scratch):
         "allow-tied-cutoff": (
             "    ¬ frontier < kth := by omega",
             "    ¬ frontier ≤ kth := by omega",
-            ["cutoff_keeps_possible_ties"],
+            ["cutoff_keeps_possible_ties", "unverified_row_prevents_cutoff"],
+        ),
+        "ignore-unexpanded-windows": (
+            "  (pending ++ windows).max?\n",
+            "  pending.max?\n",
+            ["frontier_covers_supported_row"],
         ),
     }
     for name, mutation in controls.items():
@@ -399,10 +443,44 @@ def replay_rust_trace(args):
     print("rust-generated-trace: production resolver agrees on all 4096 observations")
 
 
+def replay_rank_witness(args, scratch):
+    test = "tests::a_rounded_frequency_reversal_still_has_a_conservative_window_bound"
+    path = Path("rust/crates/text/src/lib.rs")
+    for mutated in (False, True):
+        case = "rust-rank-unpadded" if mutated else "rust-rank-baseline"
+        directory = scratch / case
+        source = clone_file(path, directory)
+        if mutated:
+            replace_once(source, " * (1.0 + 16.0 * f64::EPSILON)", "")
+        # rtdb-text has no dependencies, so the unchanged source can compile on its own.
+        built = run_case(
+            ["rustc", "--edition=2024", "--test", str(source), "-o", "rtdb-text-tests"],
+            directory, args.evidence, f"{case}-build",
+        )
+        if built.returncode:
+            raise ValueError(f"{case}: Rust witness failed to compile")
+        checked = run_case(
+            ["./rtdb-text-tests", "--exact", test],
+            directory, args.evidence, case,
+        )
+        if mutated:
+            if (
+                checked.returncode != 101
+                or f"{test} ... FAILED" not in checked.stdout
+                or "rounded score exceeds its window bound" not in checked.stdout
+                or "0 passed; 1 failed" not in checked.stdout
+            ):
+                raise ValueError(f"{case}: expected one failed window bound assertion")
+        elif checked.returncode or "1 passed; 0 failed" not in checked.stdout:
+            raise ValueError(f"{case}: expected one passing window bound assertion")
+        print(f"{case}: {'negative control rejected' if mutated else 'production witness passes'}")
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--lean", required=True)
     parser.add_argument("--verus", required=True)
+    parser.add_argument("--z3", default=os.environ.get("VERUS_Z3_PATH"), required="VERUS_Z3_PATH" not in os.environ)
     parser.add_argument("--java", required=True)
     parser.add_argument("--tlc", required=True)
     parser.add_argument("--alloy", required=True)
@@ -418,8 +496,16 @@ def main():
     args.evidence.mkdir(parents=True, exist_ok=False)
     source_paths = [
         path for path in (ROOT / "verification").rglob("*")
-        if path.is_file() and path.suffix in {".lean", ".tla", ".cfg", ".als", ".maude", ".py", ".rs", ".json", ".tsv"}
+        if path.is_file() and path.suffix in {".lean", ".tla", ".cfg", ".als", ".maude", ".py", ".rs", ".json", ".tsv", ".smt2"}
     ]
+    source_paths.extend(ROOT / path for path in (
+        "rust/crates/text/src/lib.rs",
+        "rust/crates/search/src/file.rs",
+        "rust/crates/search/src/accelerate.rs",
+        "rust/crates/expr/src/search.rs",
+        "rust/crates/expr/src/evaluate.rs",
+        "rust/crates/query/src/accelerate.rs",
+    ))
     for path in list(source_paths):
         if path.name == "proof.rs":
             for included in re.findall(r'#\[path\s*=\s*"([^"]+)"\]', path.read_text()):
@@ -434,12 +520,14 @@ def main():
         verify_lean(args, directory)
         verify_tla(args, directory)
         verify_verus(args, directory)
+        verify_rank_bound(args, directory)
         verify_alloy(args, directory)
         verify_apalache(args, directory)
         verify_maude(args, directory)
         if args.rust_boundary:
             verify_replica_boundary(args, directory)
         if args.native_replay:
+            replay_rank_witness(args, directory)
             replay_rust_trace(args)
 
 

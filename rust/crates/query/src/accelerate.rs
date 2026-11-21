@@ -56,7 +56,7 @@ pub trait CorpusSource: Send + Sync {
 }
 
 /// The corpus sources the scans of one query opened, once each however often a scan reopens; a score sums them all, whatever column or table each came from.
-/// A query text's corpus is fixed at its first use, so every score in one query, and any ranking an accelerator pruned by, is relative to the same corpus.
+/// The score parameters for a query text are fixed at its first use and shared by pruning and expression evaluation.
 #[derive(Default)]
 pub struct CorpusRegistry {
     requested: bool,
@@ -64,7 +64,7 @@ pub struct CorpusRegistry {
 }
 
 #[derive(Default)]
-pub struct Corpora { sources: std::collections::BTreeMap<String, Arc<dyn CorpusSource>>, computed: std::collections::BTreeMap<String, Option<rtdb_text::Corpus>> }
+pub struct Corpora { sources: std::collections::BTreeMap<String, Arc<dyn CorpusSource>>, computed: std::collections::BTreeMap<String, Arc<rtdb_text::Scorer>> }
 
 impl CorpusRegistry {
     pub(crate) fn for_query(requested: bool) -> Self { Self { requested, state: Default::default() } }
@@ -79,15 +79,16 @@ impl CorpusRegistry {
 }
 
 impl rtdb_expr::CorpusLookup for CorpusRegistry {
-    fn corpus(&self, query: &str) -> Option<rtdb_text::Corpus> {
+    fn scorer(&self, query: &str) -> Arc<rtdb_text::Scorer> {
         let mut corpora = self.state.lock();
-        if let Some(computed) = corpora.computed.get(query) { return computed.clone(); }
+        if let Some(computed) = corpora.computed.get(query) { return Arc::clone(computed); }
         let terms = rtdb_text::Query::parse(query);
         let mut total = rtdb_text::Corpus::default();
         let summed = corpora.sources.values().try_for_each(|source| { total.add(&source.corpus(&terms).ok()?); Some(()) });
-        let result = summed.filter(|_| total.documents > 0).map(|_| total);
-        corpora.computed.insert(query.to_string(), result.clone());
-        result
+        let corpus = summed.filter(|_| total.documents > 0).map(|_| &total);
+        let scorer = Arc::new(rtdb_text::Scorer::new(terms, corpus));
+        corpora.computed.insert(query.to_string(), Arc::clone(&scorer));
+        scorer
     }
 }
 

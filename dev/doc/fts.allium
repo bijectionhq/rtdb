@@ -210,7 +210,7 @@ rule RepairUnreadableSearchFile {
 --
 -- A query that evaluates SEARCH_SCORE registers CorpusAsOfTheSnapshot once per table and column a MATCH narrows, from every partition the query reads.
 -- When optional search construction cannot fit the query budget or the source page order is unsupported by the search format, the scan evaluates those rows from their data files.
--- A query text's corpus is fixed at its first use, so every score in one query is relative to the same corpus.
+-- A query text's score parameters are fixed at its first use, so pruning and every score in one query use the same binary64 weights and average length.
 --
 -- A score from the index equals SEARCH_SCORE on the resolved row: both take each term's frequency and the document's length rounded to the index's stored lengths.
 --
@@ -221,6 +221,7 @@ rule RepairUnreadableSearchFile {
 --   1. Every matching event that may be visible bounds its IID above by its score, an IID's best event bounding it.
 --      Events in live segments are scored from their rows.
 --      A search file's documents are scored a batch of windows at a time, best window bound first, and a window is scored only once its bound may exceed every event already scored.
+--      A window adds the upper bounds for each term in scoring order. Each term uses the window's maximum frequency and minimum stored length with binary64 roundoff covered before addition.
 --   2. IIDs are taken best bound first, in batches.
 --      Every IID counted toward the cutoff is verified by running the scan itself over the partition restricted to those IIDs, using the scan's own predicates and restrictions and evaluating MATCH on the resolved values.
 --   3. Verification stops once n verified rows score strictly above every bound not yet taken, every unscored window's included.
@@ -228,7 +229,7 @@ rule RepairUnreadableSearchFile {
 --
 -- The visible row of an IID is one of its matching events, so its bound is never below its score, and no IID left out can hold one of the first n rows.
 -- An IID's history lies in one partition, so the first n rows overall are among the first n of some partition, and the sort above picks them from the union.
--- The scan is left to the unranked narrowing when the matching IIDs exceed max_candidates, or when verification runs past sixteen batches.
+-- The scan is left to the unranked narrowing when the weights fall outside the window bound's domain, the matching IIDs exceed max_candidates, or verification runs past sixteen batches.
 -- SEARCH_SCORE sums documents, tokens and each of its terms' document frequencies over every corpus the query registered; with none, each term's inverse document frequency is 1.
 
 rule CorpusAsOfTheSnapshot {

@@ -352,10 +352,10 @@ impl SearchAccelerator {
         let Ok(limit) = usize::try_from(limit) else { return Ok(None) };
         if limit == 0 { return Ok(Some(BTreeSet::new())); }
         let TrieFiles::Complete(files) = self.trie_files(request, definition).await? else { return Ok(None) };
-        let scoring = Query::parse(&text);
-        let corpus = rtdb_expr::CorpusLookup::corpus(request.corpora, &text);
+        let scoring = rtdb_expr::CorpusLookup::scorer(request.corpora, &text);
+        let Some(rank_scorer) = scoring.for_ranking() else { return Ok(None) };
         let ranked = by_file(&files).map(|selected| {
-            Ok((selected.members, selected.file.ranked(column, matching, &scoring, corpus.as_ref(), request.bounds)?))
+            Ok((selected.members, selected.file.ranked(column, matching, &rank_scorer, request.bounds)?))
         }).collect::<Result<Vec<_>>>()?;
         let mut candidates = Candidates { files: ranked, cutter: Cutter::new(&files, request, &self.runtime), pending: std::collections::BinaryHeap::new(), seen: BTreeSet::new(), scored: 0 };
         for segment in request.snapshot.iter_segments(&request.scan.table.name.table) {
@@ -365,7 +365,7 @@ impl SearchAccelerator {
                 let StoredOperation::Put(document) = &event.operation else { continue };
                 let Some(Value::Utf8(value)) = document.get(column) else { continue };
                 let tokens = rtdb_text::tokens(value);
-                if matching.matches(&tokens) { candidates.push(event.iid, rtdb_text::bm25(&scoring, &tokens, corpus.as_ref())); }
+                if matching.matches(&tokens) { candidates.push(event.iid, scoring.bm25(&tokens)); }
             }
         }
         let mut verified: Vec<(f64, Iid)> = Vec::new();
@@ -390,7 +390,7 @@ impl SearchAccelerator {
             if rounds > 16 { return Ok(None); }
             for (iid, value) in request.verifier.visible(iids, top_k.column).await? {
                 let Value::Utf8(value) = value else { continue };
-                verified.push((rtdb_text::bm25(&scoring, &rtdb_text::tokens(&value), corpus.as_ref()), iid));
+                verified.push((scoring.bm25(&rtdb_text::tokens(&value)), iid));
             }
         }
         verified.sort_by(descending);
@@ -448,7 +448,8 @@ mod tests {
         assert_eq!(iids, BTreeSet::from([Iid([64; 16])]));
         assert_eq!(by_file(&[trie(0), trie(1)]).count(), 1);
 
-        let ranked = file.ranked("body", &query, &query, None, bounds).unwrap();
+        let rank_scorer = Arc::new(rtdb_text::Scorer::new(query.clone(), None)).for_ranking().unwrap();
+        let ranked = file.ranked("body", &query, &rank_scorer, bounds).unwrap();
         let mut candidates = Candidates {
             files: vec![(BTreeMap::from([(1, 0)]), ranked)], cutter,
             pending: Default::default(), seen: BTreeSet::new(), scored: 0,
