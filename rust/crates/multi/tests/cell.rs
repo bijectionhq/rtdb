@@ -22,6 +22,23 @@ use rtdb_multi::keys::LocalKeyService;
 use rtdb_types::{Anomaly, AnomalyCategory, Result};
 use tokio_postgres::NoTls;
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn stopping_a_node_releases_its_agent_and_its_standby_storage_witness() {
+    let mut cell = Cell::start(1, None).await;
+    let agent = Arc::downgrade(&cell.node(0).agent);
+    let keys = cell.data.path().join("keys");
+    let has_storage_witness = || {
+        keys.read_dir().unwrap().any(|entry| entry.unwrap().path().extension().is_some_and(|extension| extension == "storage-region"))
+    };
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !has_storage_witness() { tokio::time::sleep(Duration::from_millis(10)).await; }
+    }).await.unwrap();
+    cell.nodes[0].take().unwrap().kill().await.unwrap();
+    assert!(agent.upgrade().is_none());
+    assert!(!has_storage_witness());
+    cell.stop().await;
+}
+
 #[tokio::test]
 async fn the_local_directory_reopens_the_same_installation_and_fence() {
     let state = tempfile::tempdir().unwrap();

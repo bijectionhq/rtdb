@@ -133,7 +133,7 @@ pub async fn start_node(directory: Arc<dyn Directory>, mut settings: NodeSetting
     if let Some(writes) = scoped_writes { writes.set_member(lease.id()); }
     fragmenter.set_member(lease.id());
     let agent = NodeAgent::new(directory, server.node().clone(), Arc::clone(&lease), pgwire_endpoint, settings.agent, storage_namespaces, writers, settings.capabilities.clone());
-    let _ = fence.0.set(Arc::clone(&agent));
+    let _ = fence.0.set(Arc::downgrade(&agent));
     let cancellation = CancellationToken::new();
     let lease_cancellation = CancellationToken::new();
     let mut tasks = JoinSet::new();
@@ -184,20 +184,25 @@ impl RunningNode {
 
 /// The read fence, filled once the agent that answers it exists.
 #[derive(Default)]
-struct FenceSlot(std::sync::OnceLock<Arc<NodeAgent>>);
+struct FenceSlot(std::sync::OnceLock<std::sync::Weak<NodeAgent>>);
 
 #[async_trait::async_trait]
 impl rtdb_node::ReadFence for FenceSlot {
     async fn confirm(&self, database: &str) -> Result<()> {
-        match self.0.get() { Some(agent) => agent.confirm_read(database).await, None => Ok(()) }
+        match self.0.get() {
+            Some(agent) => agent.upgrade().ok_or_else(stopped_agent)?.confirm_read(database).await,
+            None => Ok(()),
+        }
     }
 
     async fn confirm_hosted(&self, database: &rtdb_node::Database) -> Result<String> {
-        let agent = self.0.get().ok_or_else(|| Anomaly::new(
-            AnomalyCategory::Unavailable, rtdb_node::NOT_HELD, "This node is not holding a hosted database",
-        ))?;
+        let agent = self.0.get().and_then(std::sync::Weak::upgrade).ok_or_else(stopped_agent)?;
         agent.confirm_hosted_read(database).await
     }
+}
+
+fn stopped_agent() -> Anomaly {
+    Anomaly::new(AnomalyCategory::Unavailable, rtdb_node::NOT_HELD, "The placement agent is unavailable")
 }
 
 pub struct LogkeeperSettings {
