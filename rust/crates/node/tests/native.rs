@@ -1793,6 +1793,60 @@ async fn concurrent_transactions_with_one_idempotency_key_commit_once_and_both_r
 }
 
 #[tokio::test]
+async fn duplicate_transaction_outcomes_are_deployment_local_and_repeatable() {
+    let mut config = options();
+    config.membership = Membership::Placed;
+    let clock = Arc::new(TickClock(AtomicI64::new(1_000_000)));
+    let services = NodeServices {
+        resources: Arc::new(NativeResources::default().with_local_log_clock(clock.clone(), false)),
+        clock: clock.clone(),
+        ..services()
+    };
+    let (node, driver) = running(config, services).await;
+    for name in ["shop", "blog"] {
+        node.database_or_attach(name.into(), DatabaseConfig::default()).await.unwrap().unwrap();
+    }
+    let metadata = |key: &str| AutonomousTxOptions {
+        user_metadata: Some(rtdb_tx::UserMetadata::new(
+            Value::Struct(StructFields::from([("idempotency_key".into(), Value::Utf8(key.into()))])),
+            node.memory(),
+        ).unwrap()),
+        ..AutonomousTxOptions::default()
+    };
+    let mut shop = node.session("shop", Arc::new(Authority)).unwrap();
+    let mut blog = node.session("blog", Arc::new(Authority)).unwrap();
+    let shop_original = shop.state_mut().execute_tx(vec![put(&node, 1, 10)], metadata("order-1")).await.unwrap();
+    let blog_original = blog.state_mut().execute_tx(vec![put(&node, 1, 20)], metadata("article-1")).await.unwrap();
+    assert!(shop_original.committed() && blog_original.committed());
+
+    let shop_retry = shop.state_mut().submit_tx(vec![put(&node, 2, 11)], metadata("order-1")).await.unwrap();
+    let blog_retry = blog.state_mut().submit_tx(vec![put(&node, 2, 21)], metadata("article-1")).await.unwrap();
+    assert_eq!(shop_retry.tx_id, blog_retry.tx_id);
+    let cancellation = CancellationToken::new();
+    for (name, retry, original) in [
+        ("shop", shop_retry.tx_id, &shop_original),
+        ("blog", blog_retry.tx_id, &blog_original),
+        ("shop", shop_retry.tx_id, &shop_original),
+    ] {
+        let result = node.await_transaction(name, retry, &Authority, &cancellation).await.unwrap();
+        assert!(result.committed(), "{name}: {result:?}");
+        assert_eq!(result.tx_key(), original.tx_key());
+    }
+    for (session, value) in [(&mut shop, 10), (&mut blog, 20)] {
+        assert_eq!(rows(session.query_sql("SELECT value FROM docs", vec![]).await.unwrap()).await, [vec![Value::I64(value)]]);
+    }
+    clock.0.fetch_add(Duration::from_secs(3601).as_micros() as i64, Ordering::Relaxed);
+    let reused = shop.state_mut().execute_tx(vec![put(&node, 3, 30)], metadata("order-1")).await.unwrap();
+    assert!(reused.committed());
+    assert!(reused.tx_key().tx_id > shop_retry.tx_id);
+    let delayed = node.await_transaction("shop", shop_retry.tx_id, &Authority, &cancellation).await.unwrap();
+    assert!(delayed.committed());
+    assert_eq!(delayed.tx_key(), shop_original.tx_key());
+    drop((shop, blog));
+    stop(&node, driver).await;
+}
+
+#[tokio::test]
 async fn a_command_resent_under_its_session_key_on_a_new_session_writes_nothing_again() {
     let (node, driver) = running(options(), services()).await;
     let command = |key: &'static str, ids: [i64; 2]| {

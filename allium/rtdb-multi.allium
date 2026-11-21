@@ -1100,6 +1100,7 @@ rule SubmitThroughGateway {
 }
 
 rule AnswerRetryFromWindow {
+    -- A stored retry identifies its original by key in its own deployment, as of the retry's system time.
     when: TxArrived(holding, tx, key)
 
     requires: holding.state = serving

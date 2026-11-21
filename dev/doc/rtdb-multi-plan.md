@@ -406,6 +406,8 @@ This stage changes the log's shape; stage 4 changes where it lives.
 3. **Routed submission.**
    `Node::submit` (`node/src/node.rs`) in multi mode sends a transaction to the holder (in process when the holder is local, by RPC otherwise) instead of appending to a source log.
    The resolved-transaction proto gains the idempotency key, and the holder keeps the `recent_keys` window (spec rules `AnswerRetryFromWindow`, `ResolveAndAppend`, `ApplyOnCommit`).
+   An aborted submission reads its idempotency key from that deployment's durable transaction metadata and finds the committed result as of the submission's system time.
+   Repeated outcome lookups return the original result after its key expires and is reused.
 4. **System time across epochs.**
    The holder assigns `max(now, last_system_time + 1µs)`, seeded from the checkpoint and tail, and refuses to open on excessive skew (spec rule `RefuseToLeadWithSkewedClock`).
 5. **No idle heartbeat.**
