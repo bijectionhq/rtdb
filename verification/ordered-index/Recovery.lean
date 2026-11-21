@@ -103,6 +103,34 @@ theorem count_alone_loses_a_retraction :
       tableAt [put, put] 2 0 ≠ tableAt [put, del] 2 0 := by
   decide
 
+/-- Replay can exclude every event strictly before the latest erase. Events
+at the erase's system time keep their original operation order. -/
+theorem scrubbed_replay_preserves_points (front sameRevision tail : List (Event K))
+    (cut : Nat) (valid : Interval) (systemAt : Nat) (validAt : Int)
+    (earlier : ∀ event ∈ front, event.system < cut)
+    (same : ∀ event ∈ sameRevision, event.system = cut)
+    (later : ∀ event ∈ tail, cut ≤ event.system) :
+    let events := (front ++ sameRevision) ++ ⟨cut, valid, .erase⟩ :: tail
+    tableAt (events.filter (fun event => decide (cut ≤ event.system))) systemAt validAt =
+      tableAt events systemAt validAt := by
+  have oldEmpty : front.filter (fun event => decide (cut ≤ event.system)) = [] := by
+    induction front with
+    | nil => rfl
+    | cons event rest ih =>
+      have old := Nat.not_le_of_gt (earlier event (by simp))
+      simp [old, ih (fun row hr => earlier row (by simp [hr]))]
+  have tailKept : tail.filter (fun event => decide (cut ≤ event.system)) = tail := by
+    induction tail with
+    | nil => rfl
+    | cons event rest ih =>
+      simp [later event (by simp), ih (fun row hr => later row (by simp [hr]))]
+  have sameKept : sameRevision.filter (fun event => decide (cut ≤ event.system)) = sameRevision := by
+    induction sameRevision with
+    | nil => rfl
+    | cons event rest ih =>
+      simp [same event (by simp), ih (fun row hr => same row (by simp [hr]))]
+  simp [List.filter_append, oldEmpty, sameKept, tailKept, -List.append_assoc, erase_cuts_history]
+
 structure AdoptedInput (File : Type) where
   block : Nat
   file : File

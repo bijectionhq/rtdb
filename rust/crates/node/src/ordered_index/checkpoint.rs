@@ -17,6 +17,8 @@ use super::{
     tree::{Item, Key, Link, Pointer, Root, Tree},
 };
 
+const MANIFESTS: &str = "manifests/scrubbed";
+
 #[derive(Serialize, Deserialize)]
 pub(super) struct Checkpoint {
     pub through: i64,
@@ -121,11 +123,14 @@ impl Checkpoint {
         cancellation: &CancellationToken,
     ) -> Result<()> {
         let store = tree.storage.object_store();
+        let published = key(tree, MANIFESTS)?;
         for object in store.list(Some(&key(tree, "manifests")?)).await? {
             if cancellation.is_cancelled() {
                 return Err(cancelled());
             }
-            if frontier(&object.key).is_some_and(|block| block < self.through) {
+            if frontier(&object.key).is_some_and(|block| {
+                block < self.through || (block == self.through && !object.key.is_under(&published))
+            }) {
                 store.delete(&object.key).await?;
                 tree.storage.invalidate(&object.key).await?;
             }
@@ -157,11 +162,11 @@ pub(super) async fn latest(tree: &Tree<'_>, through: i64) -> Result<Option<Check
         return Ok(None);
     }
     let store = tree.storage.object_store();
-    let head = key(tree, format_args!("manifests/{through:016x}"))?;
+    let head = key(tree, format_args!("{MANIFESTS}/{through:016x}"))?;
     let object = match store.head_fresh(&head).await {
         Ok(object) => Some(object),
         Err(Error::MissingObject(_)) => store
-            .list(Some(&key(tree, "manifests")?))
+            .list(Some(&key(tree, MANIFESTS)?))
             .await?
             .into_iter()
             .filter(|object| frontier(&object.key).is_some_and(|block| block <= through))
@@ -274,8 +279,11 @@ pub(super) async fn publish(
     if cancellation.is_cancelled() {
         return Err(cancelled());
     }
-    let manifest = key(tree, format_args!("manifests/{through:016x}"))?;
-    tree.storage.object_store().put(&manifest, encoded.into()).await?;
+    let manifest = key(tree, format_args!("{MANIFESTS}/{through:016x}"))?;
+    tree.storage
+        .object_store()
+        .put(&manifest, encoded.into())
+        .await?;
     latest(tree, through)
         .await?
         .ok_or_else(|| format_error("Published checkpoint is unavailable"))

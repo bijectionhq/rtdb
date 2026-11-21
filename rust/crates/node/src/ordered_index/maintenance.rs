@@ -1,6 +1,10 @@
-use std::{collections::BTreeSet, io, sync::Arc};
+use std::{
+    collections::{BTreeMap, BTreeSet, btree_map::Entry},
+    io::Cursor,
+    sync::Arc,
+};
 
-use rtdb_columnar::MemoryBudget;
+use rtdb_columnar::{MemoryBudget, MemoryReservation};
 use rtdb_format::data::EventBatch;
 use rtdb_index::Snapshot;
 use rtdb_maintenance::{
@@ -8,15 +12,11 @@ use rtdb_maintenance::{
     input::{open_input, read_page},
 };
 use rtdb_storage::{ObjectKey, cache::BufferPool};
-use rtdb_types::{
-    Anomaly, AnomalyCategory, BlockIndex, Result, TableRef, Timestamp,
-};
+use rtdb_types::{Anomaly, AnomalyCategory, BlockIndex, EventOp, Iid, Result, TableRef, Timestamp};
 use tokio_util::sync::CancellationToken;
 
 use super::{
-    Definition, INDEX_ROOT,
-    checkpoint,
-    definitions, format_error,
+    Definition, INDEX_ROOT, checkpoint, definitions, format_error,
     projection::{Changes, EventOrder, RevisionRoots},
     tree::{Root, Tree},
 };
@@ -103,49 +103,40 @@ impl OrderedIndexMaintenance {
                     Err(_) => (),
                 }
             } else {
-                let mut roots = checkpoint.roots();
-                let advanced = replay_flushed(
-                    tree,
-                    definition,
-                    snapshot,
-                    checkpoint.through,
-                    through,
-                    &mut roots,
-                    cancellation,
-                )
-                .await;
-                match advanced {
-                    Ok(rows) if checkpoint.source_rows.checked_add(rows) == Some(expected) => {
-                        let next = checkpoint::publish(
-                            tree,
-                            through,
-                            expected,
-                            roots.archived,
-                            cancellation,
-                        )
-                        .await?;
-                        return next.finish(tree, cancellation).await;
+                let sources =
+                    source_files(snapshot, &definition.table, checkpoint.through, through)?;
+                let cuts = erase_cuts(tree, &sources, cancellation).await?;
+                if cuts.is_empty() {
+                    let mut roots = checkpoint.roots();
+                    let advanced =
+                        replay_flushed(tree, definition, &sources, &cuts, &mut roots, cancellation)
+                            .await;
+                    match advanced {
+                        Ok(rows) if checkpoint.source_rows.checked_add(rows) == Some(expected) => {
+                            let next = checkpoint::publish(
+                                tree,
+                                through,
+                                expected,
+                                roots.archived,
+                                cancellation,
+                            )
+                            .await?;
+                            return next.finish(tree, cancellation).await;
+                        }
+                        Err(error) if error.category == AnomalyCategory::Interrupted => {
+                            return Err(error);
+                        }
+                        Ok(_) | Err(_) => (),
                     }
-                    Err(error) if error.category == AnomalyCategory::Interrupted => {
-                        return Err(error);
-                    }
-                    Ok(_) | Err(_) => (),
                 }
             }
         }
-        // A repair can recreate old pages before it reaches the erasure that removed them.
+        let sources = source_files(snapshot, &definition.table, -1, through)?;
+        let cuts = erase_cuts(tree, &sources, cancellation).await?;
         checkpoint::request_collection(tree, through).await?;
         let mut roots = RevisionRoots::default();
-        let rows = replay_flushed(
-            tree,
-            definition,
-            snapshot,
-            -1,
-            through,
-            &mut roots,
-            cancellation,
-        )
-        .await?;
+        let rows =
+            replay_flushed(tree, definition, &sources, &cuts, &mut roots, cancellation).await?;
         if rows != expected {
             return Err(incomplete_source());
         }
@@ -163,12 +154,12 @@ impl CycleWorker for OrderedIndexMaintenance {
     }
 }
 
-async fn flushed_changes(
+async fn read_flushed(
     tree: &Tree<'_>,
-    definition: &Definition,
     source: &SourceFile,
     cancellation: &CancellationToken,
-) -> Result<(i64, Changes)> {
+    mut visit: impl FnMut(&EventBatch) -> Result<()> + Send,
+) -> Result<i64> {
     if cancellation.is_cancelled() {
         return Err(cancelled());
     }
@@ -181,41 +172,97 @@ async fn flushed_changes(
     if bytes.len() != source.size {
         return Err(format_error("An ordered index source file changed length"));
     }
-    let (mut input, _footer) = open_input(io::Cursor::new(bytes), tree.memory)?;
-    let mut changes = Changes::default();
+    let (mut input, _footer) = open_input(Cursor::new(bytes), tree.memory)?;
     let mut rows = 0_i64;
     for page in 0..input.page_count() {
+        if cancellation.is_cancelled() {
+            return Err(cancelled());
+        }
         let page = read_page(&mut input, page, tree.memory)?;
         let batch = EventBatch::new(page.batch().clone())?;
         rows = rows
             .checked_add(i64::try_from(batch.len()).map_err(format_error)?)
             .ok_or_else(incomplete_source)?;
-        changes.add_batch(&batch, 0, &definition.columns, tree.memory, cancellation)?;
+        visit(&batch)?;
     }
+    Ok(rows)
+}
+
+type ErasureCuts = BTreeMap<Iid, (Timestamp, Arc<MemoryReservation>)>;
+
+async fn erase_cuts(
+    tree: &Tree<'_>,
+    sources: &[SourceFile],
+    cancellation: &CancellationToken,
+) -> Result<ErasureCuts> {
+    let mut cuts = ErasureCuts::new();
+    for source in sources {
+        read_flushed(tree, source, cancellation, |batch| {
+            for row in 0..batch.len() {
+                if cancellation.is_cancelled() {
+                    return Err(cancelled());
+                }
+                let header = batch.header(row)?;
+                if header.op == EventOp::Erase {
+                    match cuts.entry(header.iid) {
+                        Entry::Occupied(mut entry) => {
+                            let cut = &mut entry.get_mut().0;
+                            *cut = (*cut).max(header.system_from);
+                        }
+                        Entry::Vacant(entry) => {
+                            entry.insert((header.system_from, tree.memory.reserve(128)?));
+                        }
+                    }
+                }
+            }
+            Ok(())
+        })
+        .await?;
+    }
+    Ok(cuts)
+}
+
+async fn flushed_changes(
+    tree: &Tree<'_>,
+    definition: &Definition,
+    source: &SourceFile,
+    cancellation: &CancellationToken,
+    retain: impl Fn(rtdb_types::EventHeader) -> bool + Send + Sync,
+) -> Result<(i64, Changes)> {
+    let mut changes = Changes::default();
+    let rows = read_flushed(tree, source, cancellation, |batch| {
+        changes.add_batch(
+            batch,
+            0,
+            &definition.columns,
+            tree.memory,
+            cancellation,
+            &retain,
+        )
+    })
+    .await?;
     Ok((rows, changes))
 }
 
 async fn replay_flushed(
     tree: &Tree<'_>,
     definition: &Definition,
-    snapshot: &Snapshot,
-    after: i64,
-    through: i64,
+    sources: &[SourceFile],
+    cuts: &ErasureCuts,
     roots: &mut RevisionRoots,
     cancellation: &CancellationToken,
 ) -> Result<i64> {
-    let mut pending_collection = false;
     let mut rows = 0_i64;
-    for source in source_files(snapshot, &definition.table, after, through)? {
-        let (count, changes) = flushed_changes(tree, definition, &source, cancellation).await?;
+    for source in sources {
+        let (count, changes) = flushed_changes(tree, definition, source, cancellation, |header| {
+            cuts.get(&header.iid)
+                .is_none_or(|(cut, _)| header.system_from >= *cut)
+        })
+        .await?;
         rows = rows.checked_add(count).ok_or_else(incomplete_source)?;
-        let erased = roots
+        roots
             .apply(tree, changes, EventOrder::NewestFirst, cancellation)
             .await?;
-        if erased && !pending_collection {
-            checkpoint::request_collection(tree, through).await?;
-            pending_collection = true;
-        }
         // A rebuild and incremental replay must write identical addresses for the same block.
         roots.archived = checkpoint::store_roots(tree, source.block, roots, cancellation).await?;
         roots.changes.clear();
@@ -245,6 +292,7 @@ pub(super) async fn read_root(
                 &definition.columns,
                 tree.memory,
                 cancellation,
+                |_| true,
             )?;
         }
     }
@@ -280,7 +328,8 @@ async fn read_flushed_root(
         return Ok(None);
     }
     for source in files {
-        let (count, changes) = flushed_changes(tree, definition, &source, cancellation).await?;
+        let (count, changes) =
+            flushed_changes(tree, definition, &source, cancellation, |_| true).await?;
         rows = rows.checked_add(count).ok_or_else(incomplete_source)?;
         root = changes
             .read(tree, root, system_at, EventOrder::NewestFirst, cancellation)

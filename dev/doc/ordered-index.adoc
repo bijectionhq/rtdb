@@ -46,6 +46,8 @@ Each flushed input comes from the captured catalog's adopted L0 inventory and mu
 Queries can use a complete checkpoint plus replay from the captured table events, and a reopened node can use the same files.
 Table compaction changes neither the logical roots nor the index's publication schedule.
 A damaged checkpoint can be rebuilt from retained level-zero events.
+A rebuild determines the latest captured erase for each IID before it writes pages.
+It projects events from the erase onward, preserving the operation order at the erase revision.
 A maintenance cycle that incorporates an erase removes the affected IID from older roots and collects unreachable pages and manifests.
 A durable cleanup marker survives a crash after publication or during a rebuild and is cleared after collection.
 A drop makes its generation eligible for collection.

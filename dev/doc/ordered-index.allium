@@ -28,4 +28,5 @@ entity Checkpoint {
 -- A point read merges bucket prefixes in key order and fetches payload at the same basis.
 -- An ordered distinct page filters eligible rows before counting each distinct key once.
 -- An erasure removes the IID's old membership from every affected root and makes unreachable pages collectible.
+-- Replay discovers captured erase cuts before it writes pages, and projects each IID from its latest erase onward.
 -- Data compaction preserves input events and changes no ordered-index checkpoint.
