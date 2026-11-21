@@ -466,6 +466,29 @@ async fn a_checkpoint_capture_keeps_its_cut_and_archives_only_sealed_objects() {
     assert!(rtdb_multi::archive::restore(cell.directory.as_ref(), &cell.storage(), &archive, &cell.keys(), id, operation, 4 << 20).await.is_err());
     drop(client);
     admin::delete_deployment(cell.directory.as_ref(), &cell.storage(), &cell.keys(), &id.to_string(), 4 << 20).await.unwrap();
+    let stage = rtdb_directory::CheckpointStageIntent {
+        operation: uuid::Uuid::new_v4(),
+        source: id,
+        capture: operation,
+        source_manifest_sha256: capture.manifest_sha256().unwrap(),
+        destination: uuid::Uuid::new_v4(),
+        name: "restored-shop".into(),
+        org: "acme".into(),
+    };
+    let staged = rtdb_multi::archive::stage_checkpoint(
+        cell.directory.clone(), &archive, &cell.storage(), &cell.keys(), stage.clone(), None,
+    ).await.unwrap();
+    assert_eq!(staged.checkpoint, first);
+    assert!(staged.staged_manifest_sha256.is_some());
+    let held = cell.directory.deployment(&stage.destination.to_string()).await.unwrap().unwrap();
+    assert_eq!(held.lifecycle, Lifecycle::Restoring);
+    assert!(held.checkpoint.is_none() && held.holder.is_none() && held.ensemble.is_empty());
+    assert_eq!(held.checkpoint_stage, Some(staged.clone()));
+    let mut different = stage.clone();
+    different.operation = uuid::Uuid::new_v4();
+    assert!(rtdb_multi::archive::stage_checkpoint(
+        cell.directory.clone(), &archive, &cell.storage(), &cell.keys(), different, None,
+    ).await.is_err());
     let scheduled = rtdb_multi::archive::begin_retirement(cell.directory.as_ref(), id).await.unwrap();
     assert!(scheduled.observed_empty_at_ms.is_none());
     let retired = rtdb_multi::archive::finish_retirement(cell.directory.as_ref(), &cell.keys(), id)
@@ -475,6 +498,12 @@ async fn a_checkpoint_capture_keeps_its_cut_and_archives_only_sealed_objects() {
     assert_eq!(retired.authorized_at_ms, scheduled.authorized_at_ms);
     assert!(files_under(&destination.path().join(format!("checkpoint-captures/{id}/{operation}"))).is_empty());
     assert_eq!(rtdb_multi::archive::begin_retirement(cell.directory.as_ref(), id).await.unwrap(), retired);
+    assert_eq!(rtdb_multi::archive::stage_checkpoint(
+        cell.directory.clone(), &archive, &cell.storage(), &cell.keys(), stage.clone(), None,
+    ).await.unwrap(), staged);
+    admin::delete_deployment(
+        cell.directory.as_ref(), &cell.storage(), &cell.keys(), &stage.destination.to_string(), 4 << 20,
+    ).await.unwrap();
     cell.stop().await;
 }
 

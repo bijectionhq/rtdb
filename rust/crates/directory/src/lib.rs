@@ -180,6 +180,8 @@ pub struct DeploymentRecord {
     /// Serving and archive receipts for earlier stays in this same cell.
     pub retired_residences: BTreeMap<u64, RetiredResidence>,
     pub checkpoint_recovery: Option<CheckpointRecovery>,
+    /// A historical checkpoint staged under this fresh, held installation.
+    pub checkpoint_stage: Option<CheckpointStage>,
     /// Terminal same-history repair receipts survive later repairs and moves.
     pub checkpoint_repair_receipts: BTreeMap<uuid::Uuid, CheckpointRecovery>,
     /// Every independent archive admitted before a checkpoint copy started.
@@ -353,6 +355,30 @@ pub struct Checkpoint {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CheckpointStageIntent {
+    pub operation: uuid::Uuid,
+    pub source: uuid::Uuid,
+    pub capture: uuid::Uuid,
+    pub source_manifest_sha256: String,
+    pub destination: uuid::Uuid,
+    pub name: String,
+    pub org: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CheckpointStage {
+    pub intent: CheckpointStageIntent,
+    pub source_incarnation: u64,
+    pub source_log_epoch: i32,
+    pub checkpoint: Checkpoint,
+    pub media: CellMedia,
+    /// Digest of the exact target object inventory under the destination key.
+    pub staged_manifest_sha256: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CheckpointRecovery {
     pub operation: uuid::Uuid,
     pub checkpoint: Checkpoint,
@@ -367,7 +393,7 @@ impl DeploymentRecord {
     pub fn new(name: impl Into<String>, org: impl Into<String>, ensemble: Vec<MemberId>, now_ms: i64) -> Self {
         let id = uuid::Uuid::new_v4().to_string();
         Self { lineage: id.clone(), id, name: name.into(), org: org.into(), incarnation: 1, lifecycle: Lifecycle::Live, epoch: 0, holder: None,
-            ensemble, replica_journals: BTreeSet::new(), storage_regions: BTreeMap::new(), read_width: 1, activation_crashes: 0, created_at_ms: now_ms, move_intent: None, log_epoch: 0, parent: None, move_from: None, linearizable_reads: false, checkpoint: None, moved_at_ms: None, cell_transfer: None, disposal: None, retired_residences: BTreeMap::new(), checkpoint_recovery: None, checkpoint_repair_receipts: BTreeMap::new(), checkpoint_captures: BTreeMap::new(), archive_retirement: None, version: 0 }
+            ensemble, replica_journals: BTreeSet::new(), storage_regions: BTreeMap::new(), read_width: 1, activation_crashes: 0, created_at_ms: now_ms, move_intent: None, log_epoch: 0, parent: None, move_from: None, linearizable_reads: false, checkpoint: None, moved_at_ms: None, cell_transfer: None, disposal: None, retired_residences: BTreeMap::new(), checkpoint_recovery: None, checkpoint_stage: None, checkpoint_repair_receipts: BTreeMap::new(), checkpoint_captures: BTreeMap::new(), archive_retirement: None, version: 0 }
     }
 
     pub fn can_fork(&self) -> bool {

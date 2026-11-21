@@ -166,6 +166,14 @@ provider proves that versions and unfinished uploads are absent. Before
 issuing its retirement receipt, the reaper withdraws every registered
 capture's media key.
 
+`rtdb-multi stage-checkpoint` materializes exactly one retained capture under
+a fresh, held installation in the original cell. It verifies the selected
+manifest, re-encrypts the objects with a fresh serving key, and retains the
+ordered destination manifest and its digest. The staged record has no
+placement, logkeeper ensemble or published checkpoint. The application
+restore owner must admit its historical state before the target can serve.
+Backing out uses ordinary exact-residence disposal.
+
 `rtdb-multi restore` accepts the live directory's current checkpoint with
 the original archive manifest and current key. It records a restore intent,
 fences the old writer at the logkeepers, and verifies the objects. The

@@ -69,6 +69,9 @@ use crate::{
     },
 };
 
+mod stage;
+pub use stage::stage_checkpoint;
+
 const MAXIMUM_BYTES: u64 = 1 << 30;
 const MAXIMUM_MANIFEST_BYTES: u64 = 16 << 20;
 

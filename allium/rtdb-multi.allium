@@ -1771,6 +1771,19 @@ rule HostedCheckpointRecovery {
             RetainAndReturnRecoveryReceipt(authority, capture_id, manifest_digest)
 }
 
+rule StageHistoricalCheckpoint {
+    when: HistoricalCheckpointStageRequested(capture, target, operation)
+
+    requires: ExactRetainedCapture(capture)
+              and FreshHeldInstallation(target, operation)
+
+    ensures:
+        ReadArchiveUnderOriginalCustody(capture)
+        MaterializeVerifiedClosureWithFreshKey(capture, target)
+        RetainStageInventory(target, operation)
+        KeepPlacementAndLogsClosed(target)
+}
+
 rule RetireCheckpointArchives {
     when: RecoveryRetirementAuthorized(record)
 

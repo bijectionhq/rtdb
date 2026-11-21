@@ -539,7 +539,7 @@ fn same_cell_move(record: &DeploymentRecord, expected: &DeploymentRecord) -> boo
         && record.incarnation == expected.incarnation && record.cell_transfer == expected.cell_transfer
 }
 
-fn cell_media(storage: &CellStorage, keys: &dyn KeyService) -> Result<CellMedia> {
+pub(crate) fn cell_media(storage: &CellStorage, keys: &dyn KeyService) -> Result<CellMedia> {
     Ok(CellMedia {
         objects: storage.custody_namespace()?,
         keys: keys.custody_namespace()?,
@@ -823,7 +823,10 @@ async fn begin_disposal_at(directory: &dyn Directory, id: &str, incarnation: Opt
         match record.lifecycle {
             Lifecycle::Deleted if record.disposal.is_some() => Ok(()),
             Lifecycle::Deleting => Ok(()),
-            Lifecycle::Live | Lifecycle::Quarantined if record.move_from.is_none() => {
+            Lifecycle::Live | Lifecycle::Quarantined | Lifecycle::Restoring
+                if record.move_from.is_none()
+                    && (record.lifecycle != Lifecycle::Restoring || record.checkpoint_stage.is_some()) =>
+            {
                 record.lifecycle = Lifecycle::Deleting;
                 record.epoch = record.epoch.checked_add(1).ok_or_else(|| {
                     Anomaly::fault("rtdb.multi/epoch-exhausted", format!("Installation {id} has no remaining writer epochs"))
@@ -897,6 +900,11 @@ pub(crate) async fn finish_disposal_at(
     };
     if fenced.incarnation != expected {
         return earlier(&fenced);
+    }
+    if let Some(stage) = &fenced.checkpoint_stage {
+        if cell_media(storage, keys)? != stage.media {
+            return Err(Anomaly::incorrect("rtdb.multi/stage-storage-custody", "The staged checkpoint belongs to different storage or keys"));
+        }
     }
     if fenced.lifecycle == Lifecycle::Deleting && !fenced.storage_regions.is_empty() {
         crate::store::reconcile_storage_regions(directory, storage, keys, &fenced).await?;

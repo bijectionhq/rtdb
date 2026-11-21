@@ -46,6 +46,7 @@ Usage: rtdb-multi --build-info\n\
        rtdb-multi schedule-recovery-disposal --directory DIR --id UUID\n\
        rtdb-multi recovery-disposal --directory DIR --id UUID\n\
        rtdb-multi capture --directory DIR --storage-root PATH --archive-root PATH --keys PATH --id UUID --operation UUID\n\
+       rtdb-multi stage-checkpoint --directory DIR --archive-root PATH --storage-root PATH --keys PATH --stage-request FILE [--ecs-cluster ARN]\n\
        rtdb-multi restore --directory DIR --storage-root PATH --archive-root PATH --keys PATH --id UUID --operation UUID\n\n\
 DIR is HOST:PORT of a directory server, or dynamodb:PREFIX for the deployments, deployment-names, members and stopped-tasks tables\n\
 (RTDB_DYNAMODB_ENDPOINT points at DynamoDB Local; requires the `dynamodb` feature).\n\
@@ -573,6 +574,27 @@ async fn run(arguments: Vec<String>) -> Result<()> {
             ).await?;
             println!("{}", serde_json::to_string_pretty(&capture).expect("a capture serializes"));
             Ok(())
+        }
+        "stage-checkpoint" => {
+            if std::env::var_os("RTDB_TRANSFER_BINDING").is_some() {
+                return Err(usage("Checkpoint staging requires the original archive operator".into()));
+            }
+            let file = std::fs::File::open(arguments.required("stage-request")?).map_err(io)?;
+            let mut body = Vec::new();
+            file.take(TRANSFER_DOCUMENT_BYTES + 1).read_to_end(&mut body).map_err(io)?;
+            if body.len() as u64 > TRANSFER_DOCUMENT_BYTES {
+                return Err(usage("The checkpoint stage request exceeds its size limit".into()));
+            }
+            let intent = serde_json::from_slice(&body)
+                .map_err(|_| usage("Invalid checkpoint stage request".into()))?;
+            let directory = directory(arguments.required("directory")?).await?;
+            let archive = CellStorage::parse(arguments.required("archive-root")?)?;
+            let storage = CellStorage::parse(arguments.required("storage-root")?)?;
+            let keys = key_service(arguments.required("keys")?).await?;
+            let receipt = rtdb_multi::archive::stage_checkpoint(
+                directory, &archive, &storage, keys.as_ref(), intent, hosted_task(&arguments)?,
+            ).await?;
+            println!("{}", serde_json::to_string(&receipt).expect("a stage receipt serializes"));
         }
         "restore" => {
             let directory = directory(arguments.required("directory")?).await?;

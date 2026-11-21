@@ -198,7 +198,7 @@ pub(crate) fn track_publications(
     writer_epoch: Option<u64>,
 ) {
     Arc::get_mut(io).expect("the region has not been exposed").track_publications(Arc::new(
-        DirectoryPublications { directory, deployment, region, writer_epoch, transfer: false },
+        DirectoryPublications { directory, deployment, region, writer_epoch, owner: PublicationOwner::Serving },
     ));
 }
 
@@ -210,8 +210,27 @@ pub(crate) fn track_transfer_publications(
     epoch: u64,
 ) {
     Arc::get_mut(io).expect("the region has not been exposed").track_publications(Arc::new(
-        DirectoryPublications { directory, deployment, region, writer_epoch: Some(epoch), transfer: true },
+        DirectoryPublications { directory, deployment, region, writer_epoch: Some(epoch), owner: PublicationOwner::Transfer },
     ));
+}
+
+pub(crate) fn track_checkpoint_stage_publications(
+    io: &mut Arc<IoRegion>,
+    directory: Arc<dyn Directory>,
+    deployment: String,
+    region: Uuid,
+    operation: Uuid,
+) {
+    Arc::get_mut(io).expect("the region has not been exposed").track_publications(Arc::new(
+        DirectoryPublications { directory, deployment, region, writer_epoch: None, owner: PublicationOwner::CheckpointStage(operation) },
+    ));
+}
+
+#[derive(Clone, Copy)]
+enum PublicationOwner {
+    Serving,
+    Transfer,
+    CheckpointStage(Uuid),
 }
 
 struct DirectoryPublications {
@@ -219,7 +238,7 @@ struct DirectoryPublications {
     deployment: String,
     region: Uuid,
     writer_epoch: Option<u64>,
-    transfer: bool,
+    owner: PublicationOwner,
 }
 
 #[async_trait]
@@ -230,10 +249,13 @@ impl PublicationJournal for DirectoryPublications {
         }
         let publication = StoragePublication { key: key.to_string(), upload_id: upload.to_owned() };
         crate::admin::update_installation(self.directory.as_ref(), &self.deployment, |record| {
-            let accepts_writes = if self.transfer {
-                record.lifecycle == Lifecycle::Moving && record.move_from.is_some()
-            } else {
-                matches!(record.lifecycle, Lifecycle::Live | Lifecycle::Quarantined)
+            let accepts_writes = match self.owner {
+                PublicationOwner::Serving => matches!(record.lifecycle, Lifecycle::Live | Lifecycle::Quarantined),
+                PublicationOwner::Transfer => record.lifecycle == Lifecycle::Moving && record.move_from.is_some(),
+                PublicationOwner::CheckpointStage(operation) => record.lifecycle == Lifecycle::Restoring
+                    && record.checkpoint_stage.as_ref().is_some_and(|stage| {
+                        stage.intent.operation == operation && stage.staged_manifest_sha256.is_none()
+                    }),
             };
             if !accepts_writes || self.writer_epoch.is_some_and(|epoch| record.epoch != epoch)
             {
@@ -317,6 +339,11 @@ pub(crate) async fn reconcile_storage_regions(
     keys: &dyn KeyService,
     record: &DeploymentRecord,
 ) -> Result<()> {
+    if let Some(stage) = &record.checkpoint_stage {
+        if crate::admin::cell_media(storage, keys)? != stage.media {
+            return Err(storage_region_error("Checkpoint staging uses different provider custody"));
+        }
+    }
     for (&region, state) in &record.storage_regions {
         match state {
             StorageRegion::Local if matches!(storage, CellStorage::Local { .. }) && keys.local_storage_region_drained(region)? => {
@@ -605,7 +632,7 @@ impl ObjectStore for GarbageStore {
 pub const ROOT_MARKER: &str = "~root";
 
 /// Only a writer can create the ownership marker for a new store.
-async fn confirm_root(store: &dyn ObjectStore, deployment: &str, writer: bool) -> Result<()> {
+pub(crate) async fn confirm_root(store: &dyn ObjectStore, deployment: &str, writer: bool) -> Result<()> {
     let marker = ObjectKey::new(ROOT_MARKER)?;
     let owner = match store.get(&marker).await {
         Ok(owner) => owner,
@@ -754,6 +781,16 @@ pub async fn run_reaper(
                             .is_some_and(|retirement| retirement.observed_empty_at_ms.is_none()))
                         {
                             let Ok(id) = record.id.parse::<Uuid>() else { continue; };
+                            if !record.storage_regions.is_empty() {
+                                match cancellation.run_until_cancelled(reconcile_storage_regions(directory.as_ref(), &storage, keys, record)).await {
+                                    None => return,
+                                    Some(Err(error)) => {
+                                        eprintln!("Archive readers for {id} are pending: {}", error.code);
+                                        continue;
+                                    }
+                                    Some(Ok(())) => {}
+                                }
+                            }
                             match cancellation.run_until_cancelled(crate::archive::finish_retirement(directory.as_ref(), keys, id)).await {
                                 None => return,
                                 Some(Err(error)) => eprintln!("Archive retirement of {id} is pending: {}", error.code),
