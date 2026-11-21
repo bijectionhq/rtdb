@@ -330,6 +330,55 @@ async fn bulk_ingest_preserves_nested_arrow_lists_with_signed_execution_values()
 }
 
 #[tokio::test]
+async fn mixed_nested_ingest_returns_arrow_unions_from_cold_persisted_pages() {
+    use arrow_array::UnionArray;
+    use rtdb_types::{LogicalType, StructFields, Value};
+
+    let running = Running::start(None, FlightConfig::default()).await;
+    let mut client = Client::connect(&running.server, None).await;
+    let record = Value::Struct(StructFields::from([("a".into(), Value::I64(7))]));
+    let list = Value::List(vec![Value::Utf8("list".into())]);
+    let upload = |ids: Vec<i64>, logical: LogicalType, values: &[Value]| {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("_id", DataType::Int64, false),
+            rtdb_columnar::to_field("v", &logical).unwrap(),
+        ]));
+        RecordBatch::try_new(schema, vec![
+            Arc::new(Int64Array::from(ids)),
+            rtdb_columnar::build_array(&logical, values).unwrap(),
+        ]).unwrap()
+    };
+    let tx = client.begin().await;
+    let command = CommandStatementIngest { table: "docs".into(), transaction_id: Some(tx.clone()), ..Default::default() };
+    client.upload(command.clone(), vec![upload(vec![1, 2], record.logical_type().maybe(), &[record.clone(), Value::Null])]).await;
+    client.upload(command, vec![upload(vec![3], list.logical_type(), std::slice::from_ref(&list))]).await;
+    client.end(tx, true).await.unwrap();
+
+    let database = running.node.catalog().database("xtdb").unwrap();
+    database.flush().await.unwrap();
+    running.node.sync_all(Duration::from_secs(10), &tokio_util::sync::CancellationToken::new()).await.unwrap();
+    let snapshot = database.snapshot();
+    let table = TableRef::new("public", "docs");
+    let entry = snapshot.table_entry(&table).unwrap();
+    let trie = rtdb_format::keys::TrieKey::l0(snapshot.trie_catalog().l0_max_block_index(&table)).unwrap();
+    let key = entry.slug.data_key(&trie);
+    let persisted = database.object_store().list(None).await.unwrap().into_iter()
+        .find(|object| object.key.as_str() == key).unwrap();
+    database.storage().invalidate(&persisted.key).await.unwrap();
+
+    let mut rows: Vec<_> = client.query("SELECT _id, v FROM docs").await.iter().flat_map(|batch| {
+        let schema = batch.schema();
+        let field = schema.field(1);
+        assert!(matches!(rtdb_columnar::from_field(field).unwrap(), LogicalType::Union(_)));
+        let array = batch.column(1).as_any().downcast_ref::<UnionArray>().unwrap();
+        (0..batch.num_rows()).map(|row| (integer(batch, 0, row), rtdb_columnar::read_value(field, array, row).unwrap())).collect::<Vec<_>>()
+    }).collect();
+    rows.sort_by_key(|(id, _)| *id);
+    assert_eq!(rows, [(1, record), (2, Value::Null), (3, list)]);
+    running.stop().await;
+}
+
+#[tokio::test]
 async fn arrow_ingest_batches_and_sql_deletes_keep_transaction_order() {
     let running = Running::start(None, FlightConfig::default()).await;
     let mut client = Client::connect(&running.server, None).await;
