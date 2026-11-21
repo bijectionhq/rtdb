@@ -813,3 +813,29 @@ It checked 111 Verus obligations and rejected 59 Verus mutation cases at their d
 TLC completed 20 baselines and found 55 expected counterexamples or reachability witnesses.
 The other formal models, compiler controls, and native replays passed.
 The input manifest SHA-256 is `e89fb0d25f7ecaea1a10f349f80a0c21391fd55c333ab78e586193b62450b5f9`.
+
+== Compaction planner row coverage
+
+The model in link:../lean/CompactionPlanner.lean[CompactionPlanner.lean] compares one overlay task with independently routing each input segment and filtering its flat rows.
+The first theorem proves that the overlay task carries exactly the routed input pages for any finite admitted outline.
+The second proves that its list of matching row occurrences equals filtering all input leaves when every leaf's rows agree with the IID edges above it.
+The third extends the equality to clipping by the job prefix.
+The argument permits coarser leaves beside deeper IID branches and concatenates recency children at the same IID depth.
+Each result quantifies over the full row value and preserves multiplicities.
+
+The pinned Lean runner checks all three theorems and audits their axioms.
+It rejects dropping a coarse leaf when another segment splits, selecting the wrong scheduled branch, and disabling clipping.
+
+The native compactor replay writes one legacy historical leaf and one historical trie with mixed IID depths and a recency branch to the in-memory object store.
+It compares the decoded compaction output to raw input rows filtered and ordered by an independent oracle.
+Six partitions cover the whole input, paths above, at, and below the task depth, and an empty partition.
+The output schema drops the input recency annotation in this case, consistent with the preserve-mode contract for inputs with mixed schemas.
+The replay catches dropping the coarse page, omitting recency expansion, and clipping only to the task path when the job prefix goes deeper.
+The complete selected Rust maintenance suites passed 38 tests after adding this replay.
+Run the baseline with `BIJECTION_LOCAL_EXECUTION=owner-authorized cargo test --manifest-path rust/Cargo.toml --locked -p rtdb-maintenance --test merge mixed_trie_depths_preserve_every_row_in_the_requested_partition -- --exact`.
+The combined runner's `--native-replay` option runs the baseline and all three controls from an isolated Git archive.
+
+The row-placement premise connects the model to a logical metadata tree in which every physical row is represented once.
+The Rust metadata decoder and task builder still need a source-level refinement argument.
+The finite native witness selects histories with disjoint valid intervals and checks their encoded rows.
+Full bitemporal preservation, including same-time conflicts and erasures, remains open.

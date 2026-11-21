@@ -132,6 +132,9 @@ It also exercises the Azure adapter against a loopback provider and separately m
   `lean/CatalogRecovery.lean` checks that rebuilding the pending historical-trie index gives the same promotion as scanning the durable catalog.
   `lean/CheckpointDiscovery.lean` proves that any chain of metadata retries advances strictly and fits within the remaining index range.
   `lean/SystemTime.lean` proves strict system-time order over arbitrary mixed resolver histories and proves that a completed prefix's last assigned time suffices to resume its clock trace.
+  `lean/CompactionPlanner.lean` compares simultaneous traversal with independently routing each input segment and filtering its flat rows.
+  For a finite admitted overlay and correctly placed input rows, it preserves the list of qualifying row occurrences even when one input's leaf crosses another input's branch or a job selects a strict prefix.
+  This model takes the outline and row placement as premises. The Rust traversal and Arrow metadata decoder do not use the Lean definitions.
   `lean/CompactionMerge.lean` proves that taking minimum heads from ordered input pages emits all occurrences in key order.
   Every finite input admits a complete execution, and equal keys can preserve different payload orders across input pages.
   The merge replay checks the native heap and page adapter on finite batches. Temporal resolution and compaction output layout have separate refinement obligations.

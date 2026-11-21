@@ -349,6 +349,25 @@ def verify_compaction_merge(args, scratch):
     verify_lean_model(args, scratch, path, "compaction-merge", controls, 5)
 
 
+def verify_compaction_planner(args, scratch):
+    path = Path("verification/lean/CompactionPlanner.lean")
+    controls = {
+        "drop-coarse-leaf": (
+            "| .leaf rows => .leaf rows", "| .leaf _ => .empty",
+            ["expose_preserves_route"],
+        ),
+        "route-bucket-one-to-zero": (
+            "then readTask iid (depth + 1) remaining one", "then readTask iid (depth + 1) remaining zero",
+            ["read_task_agrees_with_per_segment_route"],
+        ),
+        "ignore-job-partition": (
+            "if admitsPrefix iid 0 part then", "if true || admitsPrefix iid 0 part then",
+            ["read_part_preserves_matching_occurrences"],
+        ),
+    }
+    verify_lean_model(args, scratch, path, "compaction-planner", controls, 3)
+
+
 def verify_system_time(args, scratch):
     path = Path("verification/lean/SystemTime.lean")
     controls = {
@@ -444,6 +463,7 @@ def verify_lean(args, scratch):
             verify_system_time(args, scratch)
             verify_reader_retention(args, scratch)
             verify_compaction_projection(args, scratch, directory)
+            verify_compaction_planner(args, scratch)
             verify_compaction_merge(args, scratch)
             verify_search_windows(args, scratch)
             verify_partitioned_top_k(args, scratch)
@@ -1091,6 +1111,45 @@ def verify_merge_replay(args, source):
     print("rust-merge-replay: production heap agrees with flatten-and-sort, all four mutations rejected")
 
 
+def verify_planner_replay(args, source):
+    env = os.environ | {
+        "CARGO_TARGET_DIR": str(ROOT / "target"),
+        "CARGO_PROFILE_DEV_DEBUG": "0",
+        "CARGO_PROFILE_TEST_DEBUG": "0",
+        "CARGO_INCREMENTAL": "0",
+    }
+    test = "mixed_trie_depths_preserve_every_row_in_the_requested_partition"
+    command = ["cargo", "test", "--locked", "-p", "rtdb-maintenance", "--test", "merge", test, "--", "--exact"]
+    checked = run_case(command, source / "rust", args.evidence, "rust-planner-baseline", env)
+    if checked.returncode or f"{test} ... ok" not in checked.stdout:
+        raise ValueError("native compaction did not preserve the requested row occurrences")
+
+    maintenance = source / "rust/crates/maintenance/src"
+    controls = (
+        ("drop-coarse-page", "merge/planner.rs", "_ => children.push((segment, index)),", "_ => (),", "[]"),
+        ("skip-recency-branch", "merge/planner.rs",
+         "MetadataNode::RecencyBranch(children) => for (_, child) in children { expand(segment, *child, inputs, output); },",
+         "MetadataNode::RecencyBranch(_) => (),", "[]"),
+        ("skip-job-clip", "merge.rs", "if job.part.len() > task.path.len() { &job.part } else { &task.path }",
+         "&task.path", "[1, 0]"),
+    )
+    for name, file, find, replacement, partition in controls:
+        source_file = maintenance / file
+        original = source_file.read_bytes()
+        try:
+            replace_once(source_file, find, replacement)
+            checked = run_case(command, source / "rust", args.evidence, f"rust-planner-{name}", env)
+            if (
+                checked.returncode != 101 or f"{test} ... FAILED" not in checked.stdout
+                or f"compaction changed row occurrences for partition {partition}" not in checked.stdout
+                or "0 passed; 1 failed" not in checked.stdout
+            ):
+                raise ValueError(f"{name}: expected the row oracle to reject partition {partition}")
+        finally:
+            source_file.write_bytes(original)
+    print("rust-planner-replay: six partitions matched the row oracle, all three mutations rejected")
+
+
 def verify_azure_replay(args, source):
     env = os.environ | {
         "CARGO_TARGET_DIR": str(ROOT / "target"),
@@ -1253,6 +1312,7 @@ def main():
         "rust/crates/maintenance/tests/gc.rs",
         "rust/crates/maintenance/src/merge.rs",
         "rust/crates/maintenance/src/merge/planner.rs",
+        "rust/crates/maintenance/tests/merge.rs",
         "rust/crates/trie/src/bucketer.rs",
         "rust/crates/conformance/src/faults.rs",
         "rust/crates/conformance/tests/node_faults.rs",
@@ -1304,6 +1364,7 @@ def main():
             verify_catalog_replay(args, source)
             verify_system_time_replay(args, source)
             verify_merge_replay(args, source)
+            verify_planner_replay(args, source)
             verify_azure_replay(args, source)
 
 
