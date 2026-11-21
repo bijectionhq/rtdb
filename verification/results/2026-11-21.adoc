@@ -2143,6 +2143,14 @@ Two read-only node tests timed out while waiting for source progress.
 The source-progress failures were observed with the reused native library.
 The log is `/private/tmp/rtdb-formal.QMjPSJsX/hosted-retirement-release-5f41-jvm-test-and-property.log`.
 
+The local FFI library was rebuilt from `818a6dfd5`. Its SHA-256 is `1e9c14a9f944260fd10cd1f4edb76240e92921e412b0c9c4f2d16822f2c3f004`.
+All six read-only node tests passed in a focused rerun with that library, including the two cases that timed out in the combined invocation.
+The build and test logs are `hosted-retirement-release-dadb-ffi-build.log` and `hosted-release-fresh-ffi-read-only.log` under `/private/tmp/rtdb-formal.QMjPSJsX/`.
+With Docker Desktop available, the focused fixture run passed eight authentication tests, 27 root property tests and all six PostgreSQL source properties and simulations.
+The fixture run used the same rebuilt library and recorded no skips.
+The log is `hosted-release-fresh-ffi-docker-fixtures.log` in the same directory.
+The combined invocation remains recorded with its original failure status.
+
 The handoff controls new release markers from the hosted trie collector.
 The downstream reaper still acts on logical keys and its grace period.
 An exact deletion certificate still needs recovery and fork dependency coverage and enforcement at the provider effect.
