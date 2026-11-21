@@ -1642,3 +1642,42 @@ BIJECTION_LOCAL_EXECUTION=owner-authorized cargo test --offline --locked \
 The machine-local command logs and controls are under
 `/private/tmp/rtdb-formal.QMjPSJsX/leaf-refinement-cc77b3550-native.log`
 and `/private/tmp/rtdb-formal.QMjPSJsX/leaf-refinement-cc77b3550-verus/`.
+
+=== Persisted trie leaf order, Java merge, and Arrow slices
+
+The verification branch is integrated through `09fecb74a`.
+At merge `dfbeb7e0d`, the nine audited Lean run-end theorems checked the position of the first exclusive end for covered rows, the preservation of a nonzero slice origin, and the signed cast under its range premise.
+The five negative controls failed at the declared theorems.
+This argument assumes the hit and miss contract of Arrow's binary search.
+
+The persisted-leaf validator is the source called by native import after per-row path validation.
+With stable IID reads, successful validation establishes the all-pairs rank order and a reported inversion follows an ordered prefix.
+The read error result remains tied to one of the supplied row lookups.
+The separate Verus area at `4bcc56278` checked three functions on the pinned release and rejected all four controls at the declared sites. link:../verus/trie_leaf_load/area.json[Persisted-leaf proof]
+
+The focused JVM trie suite at `dfbeb7e0d` passed 15 tests.
+They cover repeated ordinals across runs and retry after an IID lookup error.
+OpenJML 21.0.29 with Z3 5.1.0 checked the production Java merge with the control-flow split annotations in `77027b899`.
+For the solver proof, the ordered inputs and Kotlin comparator contract are premises.
+The local full mutation rerun hit its time limit, so the Java control results documented on the incoming branch do not establish reproducibility on this combined checkout.
+The release archive used in the local check was `openjml-macos-arm64-21.0.29.zip`, SHA-256 `9378a3abb3bb81e0e59edd1241b47da101cb3a14751c38cbcbc86c12b465950d`. https://github.com/OpenJML/OpenJML/releases/tag/21.0.29[OpenJML release]
+
+The native trie, format, index, query and columnar run at `dfbeb7e0d` recorded 590 passes and one failure.
+The failing columnar case measured 88.07 seconds against its 60-second limit while round-tripping nested unions.
+No assertion about a row value or a trie result failed in that run.
+The overall suite therefore did not pass.
+
+Run the formal cases with the pinned tools described in link:../README.adoc#run-the-studies[the verification runner instructions], and the runtime cases with the commands below.
+
+[source,shell]
+----
+BIJECTION_LOCAL_EXECUTION=owner-authorized ./gradlew :xtdb-core:test --tests 'xtdb.trie.MemoryHashTrieTest'
+BIJECTION_LOCAL_EXECUTION=owner-authorized CARGO_PROFILE_TEST_DEBUG=0 cargo test \
+  --manifest-path rust/Cargo.toml --offline --locked -p rtdb-trie -p rtdb-format \
+  -p rtdb-index -p rtdb-query -p rtdb-columnar --no-fail-fast
+----
+
+Raw formal output is under `/private/tmp/rtdb-formal.QMjPSJsX/leaf-dfbeb7e0d-proofs/`,
+`/private/tmp/rtdb-formal.QMjPSJsX/leaf-load-separated-verus/`,
+and `/private/tmp/rtdb-formal.QMjPSJsX/leaf-dfbeb7e0d-openjml/`.
+The native log is `/private/tmp/rtdb-formal.QMjPSJsX/leaf-dfbeb7e0d-native.log`.
