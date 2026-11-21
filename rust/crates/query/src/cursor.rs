@@ -214,7 +214,7 @@ impl PreparedQuery {
         &self, context: Arc<QueryContext>, arguments: &OwnedBatch, types: &[LogicalType], text: Option<&str>,
     ) -> Result<Option<QueryCursor>> {
         let batch = arguments.batch();
-        if batch.num_rows() != 1 || batch.num_columns() != types.len() || self.required_parameter_count != types.len()
+        if batch.num_rows() == 0 || batch.num_columns() != types.len() || self.required_parameter_count != types.len()
             || !self.is_parameter_projection() || !types.iter().all(direct_parameter_type) {
             return Ok(None);
         }
@@ -223,7 +223,7 @@ impl PreparedQuery {
         let mut metadata = context.memory.reserve(crate::runtime_schema::allocation_bound(&self.relation)?)?;
         let mut fields = Vec::with_capacity(runtime_schema.schema().len());
         let mut arrays = Vec::with_capacity(runtime_schema.schema().len());
-        let mut canonicalize = false;
+        let mut copy_cells = batch.num_rows() > 1;
         for (position, result) in runtime_schema.schema().fields().iter().enumerate() {
             let Some(index) = projected_parameter(&self.relation, position) else { return Ok(None); };
             let field = to_field(&result.name, &result.data_type)?;
@@ -231,11 +231,11 @@ impl PreparedQuery {
             if field.data_type() != array.data_type() || field.metadata() != batch.schema_ref().field(index).metadata() {
                 return Ok(None);
             }
-            canonicalize |= array.nulls().is_some() || array.data_type() == &DataType::Boolean;
+            copy_cells |= array.nulls().is_some() || array.data_type() == &DataType::Boolean;
             fields.push(field);
             arrays.push(Arc::clone(array));
         }
-        let reservation = if canonicalize {
+        let reservation = if copy_cells {
             let bound = fields.iter().zip(&arrays).try_fold(metadata.bytes(), |bytes, (field, array)| {
                 bytes.checked_add(estimate_copy_cell_bytes(field, array.as_ref(), 0)?)
                     .ok_or_else(|| invalid("parameter-size", "Projected parameters exceed addressable memory"))
