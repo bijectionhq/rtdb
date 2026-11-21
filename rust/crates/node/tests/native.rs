@@ -1965,7 +1965,7 @@ async fn ordered_index_serves_later_pages_after_independent_data_compaction() {
 
 
 #[tokio::test]
-async fn an_unreadable_ordered_root_falls_back_and_maintenance_rebuilds_it() {
+async fn rebuilding_a_missing_ordered_root_preserves_the_incremental_manifest() {
     let directory = tempfile::tempdir().unwrap();
     let mut config = options();
     config.automatic_artefacts = false;
@@ -1978,15 +1978,23 @@ async fn an_unreadable_ordered_root_falls_back_and_maintenance_rebuilds_it() {
     let mut session = node.session("xtdb", Arc::new(Authority)).unwrap();
     let database = node.catalog().database("xtdb").unwrap();
     index_sql(&mut session, "CREATE INDEX orders_key ON orders (priority, _id)").await;
-    index_sql(&mut session, "INSERT INTO orders RECORDS {_id: 1, priority: 2}, {_id: 2, priority: 1}").await;
+    index_sql(&mut session, "INSERT INTO orders RECORDS {_id: 1, priority: 2}").await;
+    index_flush(&node, &database).await;
+    database.build_artefacts().await.unwrap();
+    index_sql(&mut session, "INSERT INTO orders RECORDS {_id: 2, priority: 1}").await;
     index_flush(&node, &database).await;
     database.build_artefacts().await.unwrap();
     let prefix = rtdb_storage::ObjectKey::new("ordered-index/v2").unwrap();
     let objects = database.object_store().list(Some(&prefix)).await.unwrap();
     let manifest = objects.iter().find(|entry| entry.key.as_str().contains("/manifests/")).unwrap();
-    let checkpoint: serde_json::Value = serde_json::from_slice(&database.object_store().get(&manifest.key).await.unwrap()).unwrap();
-    let digest = checkpoint["layout"]["revisions"]["digest"].as_str().unwrap();
-    let page = objects.iter().find(|object| object.key.as_str().ends_with(digest)).unwrap();
+    let manifest_key = manifest.key.clone();
+    let manifest_bytes = database.object_store().get(&manifest_key).await.unwrap();
+    let checkpoint: serde_json::Value = serde_json::from_slice(&manifest_bytes).unwrap();
+    let root = &checkpoint["layout"]["revisions"];
+    let generation = root["generation"].as_i64().unwrap();
+    let digest = root["digest"].as_str().unwrap();
+    let page_suffix = format!("/pages/{generation:016x}/{digest}");
+    let page = objects.iter().find(|object| object.key.as_str().ends_with(&page_suffix)).unwrap();
     database.object_store().delete(&page.key).await.unwrap();
     drop(session);
     drop(database);
@@ -2003,6 +2011,8 @@ async fn an_unreadable_ordered_root_falls_back_and_maintenance_rebuilds_it() {
     assert_eq!(observer.take(), [None]);
 
     database.build_artefacts().await.unwrap();
+    assert_eq!(database.object_store().get(&manifest_key).await.unwrap(), manifest_bytes);
+    assert!(database.object_store().head(&page.key).await.is_ok());
     assert_eq!(rows(session.query_sql(query, vec![]).await.unwrap()).await, [vec![Value::I64(2)]]);
     assert!(observer.take().is_empty());
     stop(&node, driver).await;

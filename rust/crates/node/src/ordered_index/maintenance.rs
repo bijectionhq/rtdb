@@ -218,7 +218,7 @@ async fn replay_flushed(
 ) -> Result<(i64, bool)> {
     let mut erased = false;
     let mut rows = 0_i64;
-    for (_, object) in source_files(
+    for (block, object) in source_files(
         snapshot,
         &definition.table,
         tree.storage.object_store().as_ref(),
@@ -232,7 +232,8 @@ async fn replay_flushed(
         erased |= roots
             .apply(tree, changes, EventOrder::NewestFirst, cancellation)
             .await?;
-        roots.archived = checkpoint::store_roots(tree, through, roots, cancellation).await?;
+        // A rebuild and incremental replay must write identical addresses for the same block.
+        roots.archived = checkpoint::store_roots(tree, block, roots, cancellation).await?;
         roots.changes.clear();
     }
     Ok((rows, erased))

@@ -141,6 +141,10 @@ pub(super) async fn latest(tree: &Tree<'_>, through: i64) -> Result<Option<Check
         )
         || frontier(&object.key) != Some(checkpoint.through)
         || checkpoint.source_rows < 0
+        || checkpoint
+            .revisions
+            .as_ref()
+            .is_some_and(|root| !root.exists_by(checkpoint.through))
     {
         return Err(format_error("Invalid ordered index checkpoint"));
     }
@@ -150,7 +154,7 @@ pub(super) async fn latest(tree: &Tree<'_>, through: i64) -> Result<Option<Check
 
 pub(super) async fn store_roots(
     tree: &Tree<'_>,
-    through: i64,
+    block: i64,
     roots: &RevisionRoots,
     cancellation: &CancellationToken,
 ) -> Result<Root> {
@@ -162,7 +166,7 @@ pub(super) async fn store_roots(
         }
         let pointer = match root {
             Some(root) => Some(
-                tree.persist(root, through, &mut written, cancellation)
+                tree.persist(root, block, &mut written, cancellation)
                     .await?,
             ),
             None => None,
@@ -175,7 +179,7 @@ pub(super) async fn store_roots(
             // This directory has a different lifetime from pages held in roots.changes.
             let mut directory = BTreeMap::new();
             Some(
-                tree.persist(&root, through, &mut directory, cancellation)
+                tree.persist(&root, block, &mut directory, cancellation)
                     .await?,
             )
         }
@@ -192,7 +196,12 @@ pub(super) async fn publish(
     cancellation: &CancellationToken,
 ) -> Result<Checkpoint> {
     let revisions = match archive {
-        Some(Link::Stored(pointer)) => Some(pointer),
+        Some(Link::Stored(pointer)) if pointer.exists_by(through) => Some(pointer),
+        Some(Link::Stored(_)) => {
+            return Err(format_error(
+                "Ordered index checkpoint refers to a later block",
+            ));
+        }
         Some(Link::New(_)) => {
             return Err(format_error(
                 "An ordered index checkpoint references unpublished pages",

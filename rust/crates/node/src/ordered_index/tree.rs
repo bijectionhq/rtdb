@@ -85,6 +85,13 @@ impl Entry {
             }
     }
 
+    fn references_at_or_before(&self, generation: i64) -> bool {
+        match &self.item {
+            Item::Revision(Some(root)) => root.exists_by(generation),
+            Item::Revision(None) | Item::Posting | Item::Row(_) => true,
+        }
+    }
+
     fn is_typed(&self) -> bool {
         matches!(
             (&self.key, &self.item),
@@ -102,6 +109,12 @@ pub(super) struct Pointer {
     size: usize,
     first: Key,
     last: Key,
+}
+
+impl Pointer {
+    pub(super) fn exists_by(&self, block: i64) -> bool {
+        (0..=block).contains(&self.generation)
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -190,8 +203,11 @@ pub(super) struct Tree<'a> {
 
 impl Tree<'_> {
     fn page_key(&self, generation: i64, digest: &str) -> Result<ObjectKey> {
-        if digest.len() != 64 || !digest.bytes().all(|byte| byte.is_ascii_hexdigit()) {
-            return Err(format_error("Invalid ordered index page digest"));
+        if generation < 0
+            || digest.len() != 64
+            || !digest.bytes().all(|byte| byte.is_ascii_hexdigit())
+        {
+            return Err(format_error("Invalid ordered index page address"));
         }
         Ok(ObjectKey::new(format!(
             "{}/pages/{generation:016x}/{digest}",
@@ -247,7 +263,9 @@ impl Tree<'_> {
             StoredPage::Leaf(entries)
                 if !entries.is_empty()
                     && entries.len() <= FANOUT
-                    && entries.iter().all(Entry::is_typed)
+                    && entries.iter().all(|entry| {
+                        entry.is_typed() && entry.references_at_or_before(pointer.generation)
+                    })
                     && entries.windows(2).all(|pair| pair[0].key < pair[1].key) =>
             {
                 Page::Leaf(entries)
@@ -255,7 +273,9 @@ impl Tree<'_> {
             StoredPage::Branch(children)
                 if !children.is_empty()
                     && children.len() <= FANOUT
-                    && children.iter().all(|child| child.first <= child.last)
+                    && children.iter().all(|child| {
+                        child.exists_by(pointer.generation) && child.first <= child.last
+                    })
                     && children.windows(2).all(|pair| pair[0].last < pair[1].first) =>
             {
                 Page::Branch(children.into_iter().map(Link::Stored).collect())
@@ -450,7 +470,12 @@ impl Tree<'_> {
                 return Err(cancelled());
             }
             let node = match link {
-                Link::Stored(pointer) => return Ok(Arc::clone(pointer)),
+                Link::Stored(pointer) if pointer.exists_by(generation) => {
+                    return Ok(Arc::clone(pointer));
+                }
+                Link::Stored(_) => {
+                    return Err(format_error("Ordered index page references a later block"));
+                }
                 Link::New(node) => node,
             };
             let identity = Arc::as_ptr(node) as usize;
@@ -461,7 +486,17 @@ impl Tree<'_> {
                 .memory
                 .reserve(node.page.bytes().saturating_mul(8).saturating_add(4096))?;
             let encoded = match &node.page {
-                Page::Leaf(entries) => serde_json::to_vec(&StoredPage::Leaf(entries.clone())),
+                Page::Leaf(entries) => {
+                    if !entries
+                        .iter()
+                        .all(|entry| entry.references_at_or_before(generation))
+                    {
+                        return Err(format_error(
+                            "Ordered index revision refers to a later block",
+                        ));
+                    }
+                    serde_json::to_vec(&StoredPage::Leaf(entries.clone()))
+                }
                 Page::Branch(children) => {
                     let mut pointers = Vec::with_capacity(children.len());
                     for child in children {
