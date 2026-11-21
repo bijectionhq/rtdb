@@ -648,6 +648,10 @@ Moves are invisible to clients only if the gateway owns connections and session 
    When the overall limit is exhausted, the gateway closes new sockets before startup.
    A deployment at its limit rejects new sessions with SQLSTATE `53300`.
    Closing a session releases both its connection slots.
+   Each gateway charges queued PostgreSQL frame bytes and their wire copies to a 1 GiB memory budget.
+   Set the budget with `--max-buffered-bytes`.
+   The receiver reserves memory using the declared frame size before reading the body.
+   With this default, one frame and its encoded copy must fit within 1 GiB of available gateway memory.
 4. **Redirects**: `NotHolder`, `Moved`, `Behind`, followed by the gateway without the client noticing.
    The gateway renews a deployment's idle protection at the backend connected to the session, including after a move.
    Sessions on one gateway share a heartbeat for each deployment and backend address until the last connection to that backend closes.

@@ -2399,6 +2399,7 @@ surface ClientAccess {
         -- Each gateway bounds its accepted sockets and the sessions routed to any deployment.
         -- A saturated deployment can refuse a new session while another deployment still has a slot.
         -- Closing a session frees its reserved capacity.
+        -- A gateway admits buffered frame bytes before reading the body and releases the charge when their last owner drops them.
 
     @guarantee ReadYourWrites
         -- Within a session, every read sees every transaction the session was acknowledged.

@@ -7,7 +7,7 @@ use std::sync::{Arc, Weak};
 use std::time::Duration;
 
 use rtdb_directory::{DeploymentRecord, Directory, Lifecycle, MemberId, MemberRecord, MemberRole, effective_holder, now_ms};
-use rtdb_types::{Anomaly, AnomalyCategory, Result};
+use rtdb_types::{Anomaly, AnomalyCategory, MemoryBudget, Result};
 use bytes::Bytes;
 use parking_lot::Mutex;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -47,6 +47,7 @@ pub struct GatewayOptions {
     pub startup_timeout: Duration,
     pub maximum_connections: usize,
     pub maximum_connections_per_deployment: usize,
+    pub maximum_buffered_bytes: usize,
     /// How often an open connection tells its holder it is in use.
     pub touch_interval: Duration,
     /// The cell's secret, with which the gateway mints a capability for each reconnection of an authenticated session.
@@ -58,7 +59,8 @@ impl Default for GatewayOptions {
         Self {
             cells: None, tls: None, startup_timeout: crate::session::STARTUP_WITHIN,
             control_timeout: Duration::from_secs(35), touch_interval: Duration::from_secs(10),
-            maximum_connections: 4096, maximum_connections_per_deployment: 256, capabilities: None,
+            maximum_connections: 4096, maximum_connections_per_deployment: 256,
+            maximum_buffered_bytes: crate::session::DEFAULT_GATEWAY_FRAME_BYTES, capabilities: None,
         }
     }
 }
@@ -96,6 +98,10 @@ pub async fn serve(listener: TcpListener, directory: Arc<dyn Directory>, options
     if !(1..=Semaphore::MAX_PERMITS).contains(&options.maximum_connections) || options.maximum_connections_per_deployment == 0 {
         return Err(Anomaly::incorrect("rtdb.multi/gateway-connections", "Gateway connection limits must be positive and supported by the runtime"));
     }
+    if options.maximum_buffered_bytes == 0 {
+        return Err(Anomaly::incorrect("rtdb.multi/gateway-buffer", "The gateway's frame memory budget must be positive"));
+    }
+    let frame_memory = MemoryBudget::new(options.maximum_buffered_bytes);
     let connections = Arc::new(Semaphore::new(options.maximum_connections));
     let deployments = Arc::new(DeploymentConnections { limit: options.maximum_connections_per_deployment, counts: Mutex::default() });
     let heartbeats = Arc::new(Heartbeats::default());
@@ -107,6 +113,7 @@ pub async fn serve(listener: TcpListener, directory: Arc<dyn Directory>, options
         };
         let Ok(permit) = Arc::clone(&connections).try_acquire_owned() else { continue; };
         let deployments = Arc::clone(&deployments);
+        let frame_memory = Arc::clone(&frame_memory);
         let directory = Arc::clone(&directory);
         let options = options.clone();
         let heartbeats = Arc::clone(&heartbeats);
@@ -117,7 +124,7 @@ pub async fn serve(listener: TcpListener, directory: Arc<dyn Directory>, options
             let _permit = permit;
             tokio::select! {
                 _ = cancellation.cancelled() => {}
-                _ = connection(client, directory, options, cancellation.clone(), heartbeats, deployments, index) => {}
+                _ = connection(client, directory, options, cancellation.clone(), heartbeats, deployments, frame_memory, index) => {}
             }
         });
     }
@@ -149,7 +156,7 @@ impl<T: AsyncRead + AsyncWrite + Unpin + Send> Transport for T {}
 type Client = Box<dyn Transport>;
 
 async fn connection(client: TcpStream, directory: Arc<dyn Directory>, options: GatewayOptions, cancellation: CancellationToken,
-                    heartbeats: Arc<Heartbeats>, deployments: Arc<DeploymentConnections>, connection_index: usize) -> Result<()> {
+                    heartbeats: Arc<Heartbeats>, deployments: Arc<DeploymentConnections>, frame_memory: Arc<MemoryBudget>, connection_index: usize) -> Result<()> {
     let startup_deadline = tokio::time::Instant::now() + options.startup_timeout;
     let startup = tokio::time::timeout_at(startup_deadline, read_startup(Box::new(client), options.tls.as_ref()));
     let Some(result) = cancellation.run_until_cancelled(startup).await else { return Ok(()); };
@@ -204,6 +211,7 @@ async fn connection(client: TcpStream, directory: Arc<dyn Directory>, options: G
     let grants = options.capabilities.clone().map(|secret| crate::session::Grants { secret, parameters: startup.parameters.clone(), read_only: startup.read_only() });
     let keyed = !startup.read_only();
     let session = crate::session::Session::new(Bytes::from(startup.bytes), router, directory, deployment, grants, keyed)
+        .with_frame_memory(frame_memory)
         .with_installation(expected);
     tokio::select! {
         _ = cancellation.cancelled() => Ok(()),

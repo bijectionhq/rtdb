@@ -12,7 +12,7 @@ use std::time::Duration;
 
 use bytes::{BufMut, Bytes, BytesMut};
 use rtdb_directory::{DeploymentRecord, Directory, Lifecycle};
-use rtdb_types::{Anomaly, AnomalyCategory, Result};
+use rtdb_types::{Anomaly, AnomalyCategory, MemoryBudget, MemoryReservation, Result};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::net::tcp::OwnedWriteHalf;
@@ -20,6 +20,8 @@ use tokio::sync::{mpsc, watch};
 use tokio_util::task::AbortOnDropHandle;
 
 const MAXIMUM_FRAME_BYTES: usize = 1 << 30;
+pub(crate) const DEFAULT_GATEWAY_FRAME_BYTES: usize = 1 << 30;
+const FRAME_MEMORY: &str = "rtdb.multi/gateway-frame-memory";
 pub(crate) const STARTUP_WITHIN: Duration = Duration::from_secs(35);
 const STARTUP_TIMEOUT: &str = "rtdb.multi/startup-timeout";
 const RECONNECT_WITHIN: Duration = Duration::from_secs(30);
@@ -41,7 +43,16 @@ impl Frame {
     }
 }
 
-async fn read_frame(reader: &mut (impl AsyncRead + Unpin)) -> std::io::Result<Option<Frame>> {
+struct BufferedBody {
+    bytes: Vec<u8>,
+    _reservation: Arc<MemoryReservation>,
+}
+
+impl AsRef<[u8]> for BufferedBody {
+    fn as_ref(&self) -> &[u8] { &self.bytes }
+}
+
+async fn read_frame(reader: &mut (impl AsyncRead + Unpin), memory: &Arc<MemoryBudget>) -> std::io::Result<Option<Frame>> {
     let tag = match reader.read_u8().await {
         Ok(tag) => tag,
         Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
@@ -50,17 +61,21 @@ async fn read_frame(reader: &mut (impl AsyncRead + Unpin)) -> std::io::Result<Op
     let length = reader.read_i32().await?;
     let length = usize::try_from(length).ok().filter(|length| (4..=MAXIMUM_FRAME_BYTES).contains(length))
         .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "frame length out of range"))?;
-    let mut body = vec![0; length - 4];
-    reader.read_exact(&mut body).await?;
-    Ok(Some(Frame { tag, body: Bytes::from(body) }))
+    let reservation = memory.reserve(length * 2 + 128)
+        .map_err(|cause| std::io::Error::new(std::io::ErrorKind::OutOfMemory, cause.to_string()))?;
+    let mut bytes = Vec::new();
+    bytes.try_reserve_exact(length - 4).map_err(|cause| std::io::Error::new(std::io::ErrorKind::OutOfMemory, cause))?;
+    bytes.resize(length - 4, 0);
+    reader.read_exact(&mut bytes).await?;
+    Ok(Some(Frame { tag, body: Bytes::from_owner(BufferedBody { bytes, _reservation: reservation }) }))
 }
 
 /// Reads frames off `reader` into a channel, so the session can wait on both directions without losing a partly read frame.
-fn pump(mut reader: impl AsyncRead + Unpin + Send + 'static) -> (mpsc::Receiver<std::io::Result<Frame>>, AbortOnDropHandle<()>) {
+fn pump(mut reader: impl AsyncRead + Unpin + Send + 'static, memory: Arc<MemoryBudget>) -> (mpsc::Receiver<std::io::Result<Frame>>, AbortOnDropHandle<()>) {
     let (sender, receiver) = mpsc::channel(64);
     let task = tokio::spawn(async move {
         loop {
-            match read_frame(&mut reader).await {
+            match read_frame(&mut reader, &memory).await {
                 Ok(Some(frame)) => if sender.send(Ok(frame)).await.is_err() { return },
                 Ok(None) => return,
                 Err(error) => { let _ = sender.send(Err(error)).await; return; }
@@ -89,9 +104,9 @@ struct Backend {
 }
 
 impl Backend {
-    fn new(stream: TcpStream, epoch: u64) -> Self {
+    fn new(stream: TcpStream, epoch: u64, memory: Arc<MemoryBudget>) -> Self {
         let (read, writer) = stream.into_split();
-        let (frames, reader) = pump(read);
+        let (frames, reader) = pump(read, memory);
         Self { writer, frames, _reader: reader, heartbeat: None, epoch, drain_deadline: None }
     }
 
@@ -113,6 +128,7 @@ pub struct Grants { pub secret: Arc<crate::capability::CellSecret>, pub paramete
 
 pub struct Session {
     startup: Bytes,
+    frame_memory: Arc<MemoryBudget>,
     installation_status: Option<Frame>,
     grants: Option<Grants>,
     /// The principal the first backend authenticated and reported it may be vouched for, for whom the gateway mints its reconnections' capabilities.
@@ -143,7 +159,12 @@ pub struct Session {
 impl Session {
     pub fn new(startup: Bytes, router: Arc<dyn Router>, directory: Arc<dyn Directory>, deployment: String, grants: Option<Grants>, keyed: bool) -> Self {
         let record = rtdb_directory::watch_deployment(directory, deployment, RECONNECT_RETRY_DELAY);
-        Self { startup, installation_status: None, grants, authenticated: None, greeting: Greeting::default(), router, record, prepared: BTreeMap::new(), status: Status::Busy, pending: Vec::new(), prepared_responses: 0, answered: false, lost_unanswered: false, discarding: false, keyed, key: None, swallowing: 0 }
+        Self { startup, frame_memory: MemoryBudget::new(DEFAULT_GATEWAY_FRAME_BYTES), installation_status: None, grants, authenticated: None, greeting: Greeting::default(), router, record, prepared: BTreeMap::new(), status: Status::Busy, pending: Vec::new(), prepared_responses: 0, answered: false, lost_unanswered: false, discarding: false, keyed, key: None, swallowing: 0 }
+    }
+
+    pub(crate) fn with_frame_memory(mut self, memory: Arc<MemoryBudget>) -> Self {
+        self.frame_memory = memory;
+        self
     }
 
     pub(crate) fn with_installation(mut self, installation: Option<uuid::Uuid>) -> Self {
@@ -180,7 +201,7 @@ impl Session {
     async fn connect_once(&mut self) -> Result<Backend> {
         let (mut stream, control, epoch) = self.router.route().await?;
         stream.write_all(&self.reconnection_startup()).await.map_err(io)?;
-        let mut backend = Backend::new(stream, epoch);
+        let mut backend = Backend::new(stream, epoch, Arc::clone(&self.frame_memory));
         let mut replay = BytesMut::new();
         for frame in self.prepared.values() { replay.extend_from_slice(&frame.encode()); }
         if !replay.is_empty() { replay.extend_from_slice(&Frame { tag: b'S', body: Bytes::new() }.encode()); }
@@ -225,9 +246,9 @@ impl Session {
     pub(crate) async fn run_before(mut self, client: impl AsyncRead + AsyncWrite + Unpin + Send + 'static, first: TcpStream, first_control: Option<String>, first_epoch: u64,
                                    startup_deadline: tokio::time::Instant) -> Result<()> {
         let (client_read, mut client_write) = tokio::io::split(client);
-        let (mut requests, mut client_reader) = pump(client_read);
+        let (mut requests, mut client_reader) = pump(client_read, Arc::clone(&self.frame_memory));
         let mut copying_in = false;
-        let mut first = Backend::new(first, first_epoch);
+        let mut first = Backend::new(first, first_epoch, Arc::clone(&self.frame_memory));
         first.heartbeat = first_control.and_then(|address| self.router.start_touching(address));
         let mut backend = Some(first);
         enum Event {
@@ -374,6 +395,12 @@ impl Session {
                         client_write.write_all(&frame.encode()).await.map_err(io)?;
                         client_write.flush().await.map_err(io)?;
                     }
+                    Event::Reply(Some(Err(error))) if error.kind() == std::io::ErrorKind::OutOfMemory => {
+                        if self.status != Status::Idle && self.greeting.done {
+                            break Err(lost("the holder's answer exceeded the gateway's frame memory budget and the command's outcome is unknown"));
+                        }
+                        break Err(io(error));
+                    }
                     Event::Reply(Some(Err(_)) | None) => {
                         if !self.greeting.done { break Err(lost("the holder closed during session startup")); }
                         backend = None;
@@ -394,7 +421,11 @@ impl Session {
             }
         }.await;
         if let Err(error) = &outcome {
-            let code = if error.code == STARTUP_TIMEOUT { "57P03" } else { "08006" };
+            let code = match error.code.as_ref() {
+                STARTUP_TIMEOUT => "57P03",
+                FRAME_MEMORY => "53200",
+                _ => "08006",
+            };
             let reply = error_frame(code, error.message.as_deref().unwrap_or(error.code.as_ref())).encode();
             if error.code == STARTUP_TIMEOUT {
                 let _ = tokio::time::timeout(Duration::from_millis(100), client_write.write_all(&reply)).await;
@@ -513,7 +544,12 @@ pub fn error_frame(sqlstate: &str, message: &str) -> Frame {
 
 fn lost(message: &str) -> Anomaly { Anomaly::new(AnomalyCategory::Unavailable, "rtdb.multi/holder-lost", message) }
 fn startup_timeout() -> Anomaly { Anomaly::new(AnomalyCategory::Busy, STARTUP_TIMEOUT, "The holder did not finish session startup before the deadline") }
-fn io(error: std::io::Error) -> Anomaly { Anomaly::new(AnomalyCategory::Unavailable, "rtdb.multi/session-io", error.to_string()) }
+fn io(error: std::io::Error) -> Anomaly {
+    if error.kind() == std::io::ErrorKind::OutOfMemory {
+        return Anomaly::new(AnomalyCategory::Busy, FRAME_MEMORY, "The gateway's frame memory budget is exhausted");
+    }
+    Anomaly::new(AnomalyCategory::Unavailable, "rtdb.multi/session-io", error.to_string())
+}
 
 #[cfg(test)]
 mod tests {
@@ -556,6 +592,32 @@ mod tests {
     async fn pair(listener: &TcpListener) -> (TcpStream, TcpStream) {
         let near = TcpStream::connect(listener.local_addr().unwrap()).await.unwrap();
         (near, listener.accept().await.unwrap().0)
+    }
+
+    #[tokio::test]
+    async fn a_gateway_refuses_a_frame_from_its_header_when_its_budget_cannot_hold_the_body() {
+        let directory = rtdb_directory::MemoryDirectory::new();
+        let record = directory.create_deployment(DeploymentRecord::new("shop", "acme", vec![], 0)).await.unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let (mut client, gateway) = pair(&listener).await;
+        let (first, mut backend) = pair(&listener).await;
+        let router = Arc::new(Next(tokio::sync::Mutex::new(None)));
+        let memory = MemoryBudget::new(1024);
+        let session = Session::new(Bytes::from_static(b"\0\0\0\x08\0\x03\0\0"), router, directory, record.id, None, true)
+            .with_frame_memory(Arc::clone(&memory));
+        let running = tokio::spawn(session.run(gateway, first, None, 0));
+
+        greet(&mut backend).await;
+        assert_eq!(receive(&mut client).await.0, b'R');
+        assert_eq!(receive(&mut client).await.0, b'Z');
+        client.write_u8(b'Q').await.unwrap();
+        client.write_i32(32_768).await.unwrap();
+        let (tag, body) = tokio::time::timeout(Duration::from_secs(5), receive(&mut client)).await.unwrap();
+        assert_eq!(tag, b'E');
+        assert!(body.split(|byte| *byte == 0).any(|field| field == b"C53200"));
+        assert_eq!(running.await.unwrap().unwrap_err().code, FRAME_MEMORY);
+        assert_eq!(backend.read_u8().await.unwrap_err().kind(), std::io::ErrorKind::UnexpectedEof);
+        assert!(memory.peak_bytes() < 1024);
     }
 
     #[tokio::test]
@@ -694,7 +756,7 @@ mod tests {
         let mut record = directory.create_deployment(DeploymentRecord::new("shop", "acme", vec![], 0)).await.unwrap();
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let (stream, _peer) = pair(&listener).await;
-        let backend = Backend::new(stream, 1);
+        let backend = Backend::new(stream, 1, MemoryBudget::new(DEFAULT_GATEWAY_FRAME_BYTES));
         let router = Arc::new(Next(tokio::sync::Mutex::new(None)));
         let mut session = Session::new(Bytes::new(), router, directory.clone(), record.id.clone(), None, false);
         drop(session.record.wait_for(|snapshot| snapshot.is_some()).await.unwrap());
