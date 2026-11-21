@@ -3053,6 +3053,8 @@ def main():
         "rust/crates/azure/tests/copy_completion.rs",
         "rust/crates/storage/src/remote.rs",
         "rust/crates/storage/tests/remote_lifetime.rs",
+        "rust/crates/search/src/file.rs",
+        "rust/crates/search/src/lane.rs",
         "rust/crates/format/src/lib.rs",
         "core/src/main/proto/xtdb/log/proto/log.proto",
         "rust/crates/storage/src/object_store.rs",

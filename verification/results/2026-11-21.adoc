@@ -2085,3 +2085,22 @@ The Lean evidence is under `group-publication-lean-evidence-b8nfzkav/` in the sa
 The selected native replay ran the two trie publication checks and the shared artefact fixture against an isolated source copy, then rejected all three controls at their named assertions.
 The shared-file control trusts the first member despite conflicting retained records.
 The command records are under `native-group-publication-controls-qy2o5ni5/` in the same evidence directory.
+
+=== Combined model and production-decision run
+
+The combined local runner exited zero on the pinned main revision `90e8a2401`.
+The run includes Lean, TLC, Verus, OpenJML, Z3, Alloy, Apalache, Maude, mCRL2 and AutoHyper.
+It retained 632 command records, the exact revision and tool hashes in `run.json`, and input hashes in `inputs.json`.
+Its evidence directory is `/private/tmp/rtdb-formal.QMjPSJsX/merged-main-90e8a2401-models/`.
+This invocation covers the formal and model lanes.
+The separate native and JVM results above cover their stated paths and revisions.
+
+The subsequent `3409d499d` stage adds shared-artefact publication evidence.
+Its Lean, native and JVM schema results are recorded in the preceding section.
+Six files in the combined run's recorded inputs changed in that stage, including the schema, collector, fixtures and runner.
+The runner now also hashes the search file reader and search artefact builder.
+The final product-wide refinement and native qualification remain open.
+
+The optional versioned-provider fixture remains pending.
+The Docker image pulls and the direct attempt to obtain the published MinIO checksums failed.
+The official checksum requests returned HTTP 410. link:https://dl.min.io/server/minio/release/darwin-arm64/archive/[MinIO archive]
