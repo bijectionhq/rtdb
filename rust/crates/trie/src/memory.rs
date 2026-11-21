@@ -1,4 +1,3 @@
-use std::cmp::Ordering;
 use std::convert::Infallible;
 use std::sync::{Arc, OnceLock};
 
@@ -7,7 +6,7 @@ use rtdb_types::{Anomaly, Iid, Result};
 use serde::{Deserialize, Serialize};
 
 use crate::bucketer::invalid_bucket_depth;
-use crate::leaf_merge_step::compare_row_keys;
+use crate::leaf_load_step::validate_persisted_order;
 use crate::leaf_sort_step::{merge_overflow_rows, merge_pending_rows};
 use crate::partition_step::group_base4_rows;
 use crate::{Bucketer, Path};
@@ -176,12 +175,6 @@ impl MemoryHashTrie {
 
 impl Default for MemoryHashTrie { fn default() -> Self { Self::new(TrieConfig::default()) } }
 
-fn compare<R: IidReader + ?Sized>(reader: &R, left: u32, right: u32) -> Result<Ordering> {
-    let left_iid = reader.iid(left)?;
-    let right_iid = reader.iid(right)?;
-    Ok(compare_row_keys(&left_iid.0, left, &right_iid.0, right))
-}
-
 fn insert_rows<R: IidReader + ?Sized>(
     node: &Arc<TrieNode>, reader: &R, rows: impl ExactSizeIterator<Item = u32>, config: TrieConfig,
 ) -> Result<Arc<TrieNode>> {
@@ -275,11 +268,9 @@ fn import<R: IidReader + ?Sized>(node: PersistedNode, path: Path, reader: &R) ->
                     return Err(Anomaly::incorrect("rtdb/trie-row-path", "Persisted row lies outside its trie path"));
                 }
             }
-            for pair in rows.windows(2) {
-                if compare(reader, pair[0], pair[1])? == Ordering::Greater {
-                    return Err(Anomaly::incorrect("rtdb/trie-row-order", "Persisted trie rows are out of IID/newest-first order"));
-                }
-            }
+            validate_persisted_order(&rows, |row| reader.iid(row).map(|iid| iid.0), || {
+                Anomaly::incorrect("rtdb/trie-row-order", "Persisted trie rows are out of IID/newest-first order")
+            })?;
             Ok(Arc::new(TrieNode::Leaf(Leaf::new(path, rows.into(), Arc::from([])))))
         }
         PersistedNode::Branch(children) => {

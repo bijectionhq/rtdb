@@ -441,6 +441,7 @@ rule Compare {
 -- An absent root path decodes as the empty path.
 -- A decoded child's path is its parent's path extended by the child's bucket position.
 -- Decoding preserves each leaf's row indices in their stored order.
+-- The native importer admits a leaf only when every stored row belongs to its decoded path and the stored run is ordered.
 -- Log entries would be lost if not compacted before serialization.
 ------------------------------------------------------------
 

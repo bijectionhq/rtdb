@@ -358,6 +358,50 @@ fn persisted_rows_outside_their_path_or_order_are_rejected() {
     assert!(MemoryHashTrie::from_persisted(bad_path, &iids).is_err());
 }
 
+#[test]
+fn persisted_leaf_preserves_duplicates_and_rejects_an_inverted_final_pair() {
+    let iids = vec![iid(1); 4];
+    let persisted = |rows| PersistedTrie {
+        log_limit: 4,
+        page_limit: 4,
+        root_path: vec![],
+        root: PersistedNode::Leaf(rows),
+    };
+    let restored = MemoryHashTrie::from_persisted(persisted(vec![3, 3, 2]), &iids).unwrap();
+    assert_eq!(restored.sorted_rows(&iids).unwrap(), [3, 3, 2]);
+    let error = MemoryHashTrie::from_persisted(persisted(vec![3, 3, 2, 3]), &iids).unwrap_err();
+    assert_eq!(error.code, "rtdb/trie-row-order");
+}
+
+#[test]
+fn persisted_leaf_stops_on_an_iid_error_during_order_validation() {
+    struct Reader {
+        visited: RefCell<Vec<u32>>,
+    }
+
+    impl IidReader for Reader {
+        fn iid(&self, row: u32) -> Result<Iid> {
+            let mut visited = self.visited.borrow_mut();
+            visited.push(row);
+            if visited.len() == 5 {
+                return Err(rtdb_types::Anomaly::incorrect("test/iid-read", "IID lookup failed"));
+            }
+            Ok(iid(row))
+        }
+    }
+
+    let reader = Reader { visited: RefCell::new(Vec::new()) };
+    let persisted = PersistedTrie {
+        log_limit: 4,
+        page_limit: 4,
+        root_path: vec![],
+        root: PersistedNode::Leaf(vec![0, 1, 2]),
+    };
+    let error = MemoryHashTrie::from_persisted(persisted, &reader).unwrap_err();
+    assert_eq!(error.code, "test/iid-read");
+    assert_eq!(reader.visited.into_inner(), [0, 1, 2, 0, 1]);
+}
+
 fn event(entity: u32, system: i64, source: &'static str) -> EventRow<&'static str> {
     EventRow { header: EventHeader { iid: iid(entity), system_from: Timestamp(system), valid_time: Interval::ALL, op: EventOp::Put }, source }
 }
