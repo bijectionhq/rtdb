@@ -142,7 +142,7 @@ impl IndexPageLifecycle for HostedIndexPages {
         update_installation(self.directory.as_ref(), &self.deployment, |record| {
             require_owner(record, self.owner, &scope.index, Some(epoch))?;
             let index = record.ordered_indexes.entry(scope.index.clone()).or_default();
-            index.oldest_generation = index.oldest_generation.max(scope.generation);
+            index.retire_earlier(scope.generation);
             retire_legacy(index);
             Ok(())
         }).await.map_err(storage_error)?;

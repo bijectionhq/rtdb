@@ -24,3 +24,5 @@ import SeekRange
 #print axioms RTDB.OrderedIndex.global_prefix_survives_local_limit
 #print axioms RTDB.OrderedIndex.compact_primary_preserves_index_inputs
 #print axioms RTDB.OrderedIndex.scrubbed_replay_preserves_points
+#print axioms RTDB.OrderedIndex.distinct_runs_refine_membership
+#print axioms RTDB.OrderedIndex.ordered_route_preserves_page_and_witness

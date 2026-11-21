@@ -17,7 +17,8 @@ use serde::{Deserialize, Serialize};
 mod state_file;
 pub mod feed;
 pub mod policy;
-pub mod watch;
+pub mod ordered_index;
+mod watch;
 #[cfg(feature = "network")]
 pub mod network;
 #[cfg(feature = "dynamodb")]
@@ -418,7 +419,11 @@ pub enum LegacyIndexPages {
 
 impl OrderedIndexStorage {
     pub fn admits(&self, generation: u64) -> bool {
-        !self.dropped && generation >= self.oldest_generation
+        ordered_index::admits(self.dropped, self.oldest_generation, generation)
+    }
+
+    pub fn retire_earlier(&mut self, generation: u64) {
+        self.oldest_generation = ordered_index::advance(self.oldest_generation, generation);
     }
 }
 

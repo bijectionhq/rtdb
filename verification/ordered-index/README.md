@@ -101,7 +101,7 @@ The local Bijection PgWire fixture `registered_pages_agree_with_and_without_orde
 The `scan_ordered_seek` attribute was present on both labelled ascending and descending reads before the index was dropped, and absent from the corresponding scans after the drop.
 At one basis and observation, both paths returned the expected rows, continuation and authenticated consumed predicate, and both registrations revalidated.
 On the published Bijection source `96b534c7c49ed01d57a307ebee42fadb083ae601`, the paired fixture and the full RTDB WorldStore conformance fixture both passed against the local hosted engine.
-Hosted provider upload settlement and reader eviction remain production proof obligations.
+The hosted generation-retirement evidence below covers the later storage implementation.
 
 On the hosted integration source `671274af9f8e92b912a2958f1b8ea75a8a602a75`,
 Lean 4.35.0 checked seven law modules and audited 18 theorems through Rex on the M1.
@@ -146,6 +146,13 @@ before closing the earlier scope.
 replacement is published, acknowledgement eventually occurs under weak
 fairness for closing, settlement, reader release, deletion, and acknowledgement.
 
+Verus 0.2026.11.20.9da409b checked six obligations in `scope.rs`, which
+includes the production directory's generation decisions. The checks prove
+that the closure floor cannot move backward, a stale retirement preserves the
+open suffix, and the replacement remains admissible at the exact boundary.
+Changing the production admission from inclusive to strict failed its
+postcondition.
+
 Replay on consolidated RTDB discovers erase cuts from adopted L0 files before
 writing any replacement page. `Recovery.lean` checks
 `scrubbed_replay_preserves_points`: for one IID, filtering out strictly
@@ -183,10 +190,28 @@ implementation and the selected failure schedules. The model assumes the
 provider's confirmed abort and inventory contracts. Primary L0 files are a
 separate custody boundary.
 
+## Page and read witness composition
+
+Lean 4.35.0 checked `distinct_runs_refine_membership` and
+`ordered_route_preserves_page_and_witness` with warnings promoted to errors.
+Given the same authorized candidate membership and the exact captured source,
+the ordered index and scan agree on the distinct stream, resolved rows,
+lookahead, and keys inspected for registration. The axiom audit reported
+only `propext`, `Classical.choice`, and `Quot.sound` across these laws.
+
+The paired test reran the published RTDB engine at `1a6eceb63` with the
+published Bijection integration at `96b534c7c49ed01d57a307ebee42fadb083ae601`.
+The trace recorded both native seek directions for labelled pages, then
+authoritative scans with the ordered index dropped. The fixture required equal
+rows, continuation, the authenticated consumed predicate, and successful
+revalidation at the same observation. It runs against a dedicated local
+RTDB endpoint. The theorem assumes exact candidate membership and replay
+coverage, whose production bindings are exercised by these runtime tests.
+
 ## Execution
 
 Use Lean 4.35.0, Bijection's pinned Verus toolchain, and TLC from the authorized proof environment.
 Write generated proof products and TLC state under an ignored task target directory.
-Run each Lean module and compile `Temporal.lean` into the module search path before checking `Recovery.lean`, then run `Axioms.lean` against the compiled modules.
-Run Verus on `domain.rs` and `seek.rs` in this directory so the included paths resolve to the source used by RTDB.
+Compile `Temporal.lean`, `DistinctPage.lean`, and `OrderedRead.lean` into the module search path before checking `Recovery.lean`, then run `Axioms.lean` against the compiled modules.
+Run Verus on `domain.rs`, `seek.rs`, and `scope.rs` so the included paths resolve to the production sources used by RTDB.
 Run TLC against each configuration, retaining the source identity, tool version, and each diagnostic trace.

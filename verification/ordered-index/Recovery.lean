@@ -1,4 +1,6 @@
 import Temporal
+import DistinctPage
+import OrderedRead
 
 set_option autoImplicit false
 
@@ -62,6 +64,32 @@ theorem serving_independent (capture : List (Event K)) (left right : Coverage ca
     serve capture left systemAt validAt = serve capture right systemAt validAt := by
   rw [serve_exact, serve_exact]
 
+
+/-- An ordered route and an authoritative scan may traverse different duplicate
+runs. Once their authorized candidate sets agree, exact replay preserves the
+page, its lookahead, and the ordered keys inspected to register the read. -/
+theorem ordered_route_preserves_page_and_witness
+    {V : Type} (capture : Nat → List (Event K))
+    (coverage : (key : Nat) → Coverage (capture key))
+    (project : Nat → K → Option V) (native scanned : List Nat)
+    (nativeSorted : native.Pairwise (· ≤ ·)) (scannedSorted : scanned.Pairwise (· ≤ ·))
+    (sameKeys : ∀ key, key ∈ native ↔ key ∈ scanned)
+    (systemAt : Nat) (validAt : Int) (limit : Nat) :
+    let nativeKeys := distinctRuns none native
+    let scanKeys := distinctRuns none scanned
+    let index key := (serve (capture key) (coverage key) systemAt validAt).bind (project key)
+    let scan key := (tableAt (capture key) systemAt validAt).bind (project key)
+    observation (nativeKeys.filterMap index) limit =
+      observation (scanKeys.filterMap scan) limit
+      ∧ inspected index (limit + 1) nativeKeys = inspected scan (limit + 1) scanKeys := by
+  dsimp
+  have keys := distinct_runs_refine_membership native scanned nativeSorted scannedSorted sameKeys
+  have rows : (fun key => (serve (capture key) (coverage key) systemAt validAt).bind (project key)) =
+      (fun key => (tableAt (capture key) systemAt validAt).bind (project key)) := by
+    funext key
+    rw [serve_exact]
+  rw [keys, rows]
+  exact ⟨rfl, rfl⟩
 
 def weight {A : Type} (rows : A → Nat) : List A → Nat
   | [] => 0
