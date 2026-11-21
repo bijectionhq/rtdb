@@ -11,7 +11,7 @@ use rtdb_maintenance::CollectionObserver;
 use rtdb_node::*;
 use rtdb_plan::{CatalogMetric, CatalogMetrics, CatalogRows, CatalogUser, CatalogUsers};
 use rtdb_query::QueryCursor;
-use rtdb_tx::{Documents, SqlArguments, TransactionAuthorization, TxOp};
+use rtdb_tx::{Documents, EntityIds, SqlArguments, TransactionAuthorization, TxOp};
 use rtdb_types::{Anomaly, Result, TableRef, Timestamp, TxBasis, TxId, Value};
 use tokio::sync::Semaphore;
 use tokio_util::sync::CancellationToken;
@@ -506,6 +506,119 @@ async fn local_recovery_reads_flushed_and_unflushed_transactions_and_retained_ba
         assert_eq!(rows(session.query_sql("SELECT _id, value FROM docs ORDER BY _id", vec![]).await.unwrap()).await, vec![vec![Value::I64(1), Value::I64(10)], vec![Value::I64(2), Value::I64(20)]]);
         stop(&reopened, driver).await;
     }).await.unwrap();
+}
+
+#[tokio::test]
+async fn bitemporal_sql_matches_ordered_history_through_flush_compaction_and_restart() {
+    #[derive(Clone, Copy)]
+    enum Mutation { Put(i64), Delete, Erase }
+
+    struct Event { id: i64, system: i64, from: i64, to: i64, mutation: Mutation }
+
+    impl Event {
+        fn operation(&self, node: &Node) -> TxOp {
+            let table = TableRef::new("public", "docs");
+            let valid_from = Some(Timestamp(self.from));
+            let valid_to = Some(Timestamp(self.to));
+            let ids = || EntityIds::new(vec![Value::I64(self.id).entity_id().unwrap()], node.memory()).unwrap();
+            match self.mutation {
+                Mutation::Put(value) => {
+                    let document = StructFields::from([("_id".into(), Value::I64(self.id)), ("value".into(), Value::I64(value))]);
+                    let documents = Documents::new(vec![document], node.memory()).unwrap();
+                    TxOp::PutDocs { table, documents, valid_from, valid_to }
+                }
+                Mutation::Delete => TxOp::DeleteDocs { table, ids: ids(), valid_from, valid_to },
+                Mutation::Erase => TxOp::EraseDocs { table, ids: ids() },
+            }
+        }
+    }
+
+    async fn check(session: &mut NativeSession, history: &[Event], phase: &str) {
+        for system in [99_999, 100_000, 200_000, 300_000, 400_000, 500_000, 600_000] {
+            for valid in [0, 100_000, 199_999, 200_000, 399_999, 400_000, 500_000, 600_000] {
+                let mut visible = BTreeMap::new();
+                for event in history {
+                    let covers = event.system <= system && event.from <= valid && valid < event.to;
+                    match event.mutation {
+                        Mutation::Erase => { visible.remove(&event.id); }
+                        Mutation::Put(value) if covers => { visible.insert(event.id, value); }
+                        Mutation::Delete if covers => { visible.remove(&event.id); }
+                        _ => {}
+                    }
+                }
+                for minimum in [None, Some(10)] {
+                    let predicate = minimum.map_or("", |_| " WHERE value >= 10");
+                    let sql = format!(
+                        "SELECT _id, value FROM docs FOR VALID_TIME AS OF TIMESTAMP '1970-01-01 00:00:00.{valid:06}+00:00' \
+                         FOR SYSTEM_TIME AS OF TIMESTAMP '1970-01-01 00:00:00.{system:06}+00:00'{predicate} ORDER BY _id"
+                    );
+                    let expected: Vec<_> = visible.iter()
+                        .filter(|(_, value)| minimum.is_none_or(|lower| **value >= lower))
+                        .map(|(&id, &value)| vec![Value::I64(id), Value::I64(value)])
+                        .collect();
+                    let cursor = session.query_sql(&sql, vec![]).await.unwrap();
+                    assert_eq!(rows(cursor).await, expected, "{phase}: {sql}");
+                }
+            }
+        }
+    }
+
+    let events = [
+        Event { id: 1, system: 100_000, from: 0, to: 600_000, mutation: Mutation::Put(12) },
+        Event { id: 1, system: 200_000, from: 200_000, to: 400_000, mutation: Mutation::Put(9) },
+        Event { id: 1, system: 300_000, from: 400_000, to: 500_000, mutation: Mutation::Delete },
+        Event { id: 2, system: 400_000, from: 0, to: 600_000, mutation: Mutation::Put(20) },
+        Event { id: 2, system: 500_000, from: 0, to: 600_000, mutation: Mutation::Erase },
+        Event { id: 3, system: 600_000, from: 150_000, to: 650_000, mutation: Mutation::Put(30) },
+    ];
+
+    for bypass in [false, true] {
+        let directory = tempfile::tempdir().unwrap();
+        let store = directory.path().join("store");
+        let configuration = DatabaseConfig {
+            log: Some(database_config::Log::LocalLog(LocalLog { path: Some(directory.path().join("log").to_string_lossy().into_owned()), epoch: Some(0) })),
+            storage: Some(database_config::Storage::LocalStorage(LocalStorage { path: Some(store.to_string_lossy().into_owned()), epoch: Some(0) })),
+            ..Default::default()
+        };
+        let mut settings = options();
+        settings.membership = Membership::Durable { primary: configuration, skipped: BTreeSet::new() };
+        settings.query.bypass_temporal_pruning = bypass;
+        let runtime = services();
+        let (node, driver) = running(settings.clone(), fresh_local_services(&runtime)).await;
+        let mut session = node.session("xtdb", Arc::new(Authority)).unwrap();
+        let database = node.catalog().database("xtdb").unwrap();
+        for (index, event) in events.iter().enumerate() {
+            let options = AutonomousTxOptions { system_time: Some(Timestamp(event.system)), ..Default::default() };
+            let outcome = session.state_mut().execute_tx(vec![event.operation(&node)], options).await.unwrap();
+            assert!(outcome.committed(), "{:?}", outcome.error());
+            assert_eq!(outcome.tx_key().system_time, Timestamp(event.system));
+            let prefix = &events[..=index];
+            if index == 2 { check(&mut session, prefix, "live").await; }
+            if index == 2 || index == 4 {
+                database.flush().await.unwrap();
+                node.sync_all(Duration::from_secs(10), &CancellationToken::new()).await.unwrap();
+            }
+            if index == 4 {
+                check(&mut session, prefix, "flushed").await;
+                database.compaction().unwrap().compact_all().await.unwrap();
+                node.sync_all(Duration::from_secs(10), &CancellationToken::new()).await.unwrap();
+                let data = std::fs::read_dir(store.join("v06/tables/public$docs/data")).unwrap();
+                assert!(data.map(|entry| entry.unwrap()).any(|entry| entry.file_name().to_string_lossy().starts_with("l01")));
+                check(&mut session, prefix, "compacted").await;
+            }
+        }
+        check(&mut session, &events, "compacted with live tail").await;
+        drop(session);
+        drop(database);
+        stop(&node, driver).await;
+        drop(node);
+
+        let (reopened, driver) = running(settings, fresh_local_services(&runtime)).await;
+        reopened.sync_all(Duration::from_secs(10), &CancellationToken::new()).await.unwrap();
+        let mut session = reopened.session("xtdb", Arc::new(Authority)).unwrap();
+        check(&mut session, &events, "restarted").await;
+        stop(&reopened, driver).await;
+    }
 }
 
 #[tokio::test]

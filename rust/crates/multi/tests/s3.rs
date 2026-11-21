@@ -14,6 +14,65 @@ fn storage() -> Option<CellStorage> {
     Some(CellStorage::parse(&format!("s3://{bucket}/run-{}?endpoint={endpoint}&path_style=true&region=us-east-1", uuid::Uuid::new_v4().simple())).unwrap())
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+async fn checkpoint_and_durable_tail_survive_loss_of_one_two_or_all_workers() {
+    let Some(storage) = storage() else { eprintln!("RTDB_S3_ENDPOINT is not set: skipped"); return };
+    tokio::time::timeout(Duration::from_secs(60), async {
+        let mut cell = Cell::start_on(Some(storage), vec![MemberPool::General; 3], None, None, None).await;
+        let deployment = admin::create_deployment(cell.directory.as_ref(), "shop", "acme", 3).await.unwrap();
+        let client = cell.connect("shop").await;
+        client.simple_query("INSERT INTO orders (_id, total) VALUES (1, 10), (2, 20), (3, 30)").await.unwrap();
+        let holder = cell.holder("shop").await.unwrap();
+        cell.node(holder).agent.flush("shop").await.unwrap();
+        let checkpoint = cell.directory.deployment(&deployment.id).await.unwrap().unwrap().checkpoint.unwrap();
+        client.simple_query("UPDATE orders SET total = 11 WHERE _id = 1").await.unwrap();
+        client.simple_query("DELETE FROM orders WHERE _id = 2").await.unwrap();
+        drop(client);
+
+        let mut expected = vec!["11".to_owned(), "30".to_owned()];
+        for losses in 1..=3 {
+            let before = cell.directory.deployment(&deployment.id).await.unwrap().unwrap();
+            assert_eq!(before.checkpoint, Some(checkpoint));
+            let holder = cell.holder("shop").await.unwrap();
+            let victims: Vec<_> = std::iter::once(holder)
+                .chain(cell.nodes.iter().enumerate().filter_map(|(index, node)| {
+                    (index != holder && node.is_some()).then_some(index)
+                }))
+                .take(losses)
+                .collect();
+            assert_eq!(victims.len(), losses);
+            let started = std::time::Instant::now();
+            let departing = victims.iter().map(|&index| cell.nodes[index].take().unwrap());
+            for result in futures::future::join_all(departing.map(|node| node.kill())).await {
+                result.unwrap();
+            }
+            if losses == 3 {
+                assert!(cell.nodes.iter().all(Option::is_none));
+                cell.add_node().await;
+            }
+
+            let recovered = connect_eventually(&cell, "shop").await;
+            let after = cell.directory.deployment(&deployment.id).await.unwrap().unwrap();
+            assert!(after.epoch > before.epoch);
+            assert_eq!(after.checkpoint, Some(checkpoint));
+            assert_eq!(values(&recovered, "SELECT total FROM orders").await, expected);
+            eprintln!("loss of {losses} worker(s): recovered and verified results in {:?}", started.elapsed());
+            let id = losses + 3;
+            let total = 30 + losses;
+            recovered.simple_query(&format!("INSERT INTO orders (_id, total) VALUES ({id}, {total})")).await.unwrap();
+            expected.push(total.to_string());
+            assert_eq!(values(&recovered, "SELECT total FROM orders").await, expected);
+            drop(recovered);
+            if losses < 3 {
+                for _ in 0..losses {
+                    cell.add_node().await;
+                }
+            }
+        }
+        cell.stop().await;
+    }).await.expect("the worker-loss scenarios stalled");
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_cell_keeps_its_deployments_forks_and_deletions_in_s3() {
     let Some(storage) = storage() else { eprintln!("RTDB_S3_ENDPOINT is not set: skipped"); return };
