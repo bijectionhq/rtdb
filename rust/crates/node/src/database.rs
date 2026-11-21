@@ -175,9 +175,10 @@ impl DatabaseFactory {
         let cancellation = parent.child_token();
         let log_cancellation = CancellationToken::new();
         let access = if read_only { crate::LogAccess::ReadOnly } else if self.options.replication.may_lead { crate::LogAccess::ReadWrite } else { crate::LogAccess::SourceWriter };
-        let resources = self.resources.open_storage(&name, &configuration).await?;
+        let mut resources = self.resources.open_storage(&name, &configuration).await?;
         let io = Arc::clone(&resources.io);
-        let opened = async {
+        let checkpoint_metadata = resources.checkpoint_metadata.take();
+        let assembly = async {
             let storage = Arc::new(BufferPool::with_metadata_budget(Arc::clone(&resources.store), Arc::clone(&self.cache), Arc::clone(&self.memory)));
             let blocks = BlockStore::new(Arc::clone(&resources.store), Arc::clone(&storage), Arc::clone(&self.memory), self.options.file_size_target)?;
             let recovered = blocks.recover(self.options.trie, SourcePosition(-1), self.clock.now(), resources.blocks).await?;
@@ -244,7 +245,11 @@ impl DatabaseFactory {
             let database = Arc::new(Database { name, configuration, read_only, partition, storage, logs, replication, transaction_admission: RwLock::default(), compaction, artefacts, ordered_cycle, cancellation: cancellation.clone(), io: Arc::clone(&io) });
             let driver = DatabaseDriver { database: Arc::clone(&database), replication: replica_driver, compactor, artefacts: artefact_drivers, supervisor, logs: opened_logs.drivers, log_cancellation };
             Ok(OpenedDatabase { database, driver, secondaries })
-        }.await;
+        };
+        let opened = match checkpoint_metadata {
+            Some(hold) => IoRegion::retaining(hold, assembly).await,
+            None => assembly.await,
+        };
         if opened.is_err() { io.close_and_wait().await; }
         opened
     }

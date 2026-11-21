@@ -356,14 +356,17 @@ async fn block_production_is_repeatable_and_adoption_folds_rows_once() {
     fixture.driver.consume(raw(1, 1, 1, ReplicaBody::BlockUploaded(uploaded))).await.unwrap();
     assert_eq!(fixture.driver.partition.value().table_catalog().metadata(&table).unwrap().row_count, 8);
     assert_eq!(fixture.driver.partition.value().live().block_row_count(), 0);
-    use crate::BlockDiscovery::{From, List};
-    for discovery in [List, From(BlockIndex(0)), From(BlockIndex(5)), crate::BlockDiscovery::At(BlockIndex(0))] {
+    use crate::BlockDiscovery::{At, From, FromPublished, List};
+    for discovery in [List, From(BlockIndex(0)), From(BlockIndex(5)), FromPublished(BlockIndex(0)), At(BlockIndex(0))] {
         let recovered = fixture.blocks.recover(TrieConfig::default(), SourcePosition(-1), Timestamp(1000), discovery).await.unwrap();
         assert_eq!(recovered.block.as_ref().map(|block| block.block_index()), Some(BlockIndex(0)), "{discovery:?} finds the latest block");
         assert_eq!(recovered.progress.tx_key, Some(key));
         assert_eq!(recovered.fence.position(), TermPosition::Expecting(TermSequence(1)));
         assert_eq!(recovered.partition.value().table_catalog().metadata(&table).unwrap().row_count, 8);
     }
+    let missing = fixture.blocks.recover(TrieConfig::default(), SourcePosition(-1), Timestamp(1000), FromPublished(BlockIndex(5)))
+        .await.err().expect("an admitted published bound cannot fall back to an older block");
+    assert_eq!(missing.code, "rtdb.replication/block-gone");
 }
 
 #[tokio::test]

@@ -952,6 +952,7 @@ async fn follower_compactor_publishes_results_through_the_writer_without_claimin
         fn validate(&self, _: &str, _: &DatabaseConfig) -> Result<()> { Ok(()) }
         async fn open_storage(&self, _: &str, _: &DatabaseConfig) -> Result<DatabaseStorage> {
             Ok(DatabaseStorage {
+                checkpoint_metadata: None,
                 store: self.store.clone(), blocks: Default::default(), storage_epoch: rtdb_types::StorageEpoch(0), storage_version: rtdb_format::keys::CURRENT_STORAGE_VERSION,
                 io: rtdb_storage::IoRegion::new(),
             })
@@ -1039,6 +1040,7 @@ async fn startup_selects_a_newer_checkpoint_when_its_initial_replica_prefix_was_
 
         async fn open_storage(&self, _: &str, _: &DatabaseConfig) -> Result<DatabaseStorage> {
             Ok(DatabaseStorage {
+                checkpoint_metadata: None,
                 store: self.shared.store.clone(),
                 blocks: Default::default(),
                 storage_epoch: rtdb_types::StorageEpoch(0),

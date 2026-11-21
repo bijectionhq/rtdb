@@ -167,6 +167,10 @@ It also exercises the Azure adapter against a loopback provider and separately m
   TLC explores its finite state space, and Apalache cross-checks retention through ten transitions.
 * `tla/RecoveryDiscovery.tla` models a separate fallback for missing checkpoint metadata during startup.
   The fallback requires a newer checkpoint in a refreshed listing and has no effect on replica-log retention.
+* `tla/CheckpointMetadataRetention.tla` models the held block lower bound, monotone publication and delayed metadata removal across independent authorities.
+  `lean/CheckpointMetadataRetention.lean` proves that a reaper plan remains valid as the head moves forward and new holds are granted.
+  Verus checks the exact metadata comparison in the Multi reaper.
+  The native cell storage test checks a named block pack, a spilled table block, and loose metadata under the same hold and verifies that physical cleanup resumes after provider drain.
 * `tla/ReplicaTrimAdmission.tla` models shared recovery admission and trim authorization separately from physical deletion.
   `lean/ReplicaTrimAdmission.lean` proves safety for an arbitrary number of readers and finite histories.
   Multi startup checks the directory's certified trim boundary and registers a hold for a nonempty catch-up window before admitting the provider cursor.

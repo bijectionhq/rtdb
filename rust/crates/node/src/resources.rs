@@ -43,6 +43,7 @@ pub struct DatabaseStorage {
     pub store: Arc<dyn ObjectStore>,
     /// How recovery finds the latest block: listing, unless the provider knows where to start.
     pub blocks: rtdb_replication::BlockDiscovery,
+    pub checkpoint_metadata: Option<Arc<dyn Send + Sync>>,
     pub storage_epoch: StorageEpoch,
     pub storage_version: StorageVersion,
     /// The caller drains this region if later database assembly fails.
@@ -56,11 +57,24 @@ pub trait LogFactory: Send + Sync {
     async fn open(&self, configuration: &Any, access: LogAccess, cancellation: CancellationToken) -> Result<OpenedLogs>;
 }
 
+pub struct OpenedRecoveryStore {
+    pub store: Arc<dyn ObjectStore>,
+    pub blocks: rtdb_replication::BlockDiscovery,
+    /// Held through disk-cache and provider I/O for checkpoint discovery and load.
+    pub checkpoint_metadata: Option<Arc<dyn Send + Sync>>,
+}
+
 #[async_trait]
 pub trait RemoteStorageFactory: Send + Sync {
     /// The returned store is scoped to `storage_root`, under the provider's configured prefix.
     /// Retained provider operations belong to the supplied database region, including after caller cancellation.
     async fn open(&self, configuration: &Any, storage_root: &ObjectKey, io: Arc<IoRegion>) -> Result<Arc<dyn ObjectStore>>;
+    /// Opens the store and chooses checkpoint discovery under the provider's admission rules.
+    async fn open_for_recovery(&self, configuration: &Any, storage_root: &ObjectKey, io: Arc<IoRegion>) -> Result<OpenedRecoveryStore> {
+        let store = self.open(configuration, storage_root, io).await?;
+        let blocks = self.block_discovery(configuration).await?;
+        Ok(OpenedRecoveryStore { store, blocks, checkpoint_metadata: None })
+    }
     /// A remote store normally uses a disk cache. An isolated read-only
     /// factory may opt out to avoid retaining an extra physical copy.
     fn use_disk_cache(&self) -> bool { true }
@@ -244,14 +258,17 @@ impl ResourceFactory for NativeResources {
             let storage_epoch = StorageEpoch(epoch);
             let root = ObjectKey::new(StorageRoot::new(CURRENT_STORAGE_VERSION, storage_epoch)?.key())?;
             let mut blocks = rtdb_replication::BlockDiscovery::List;
+            let mut checkpoint_metadata = None;
             let store: Arc<dyn ObjectStore> = match &configuration.storage {
                 None | Some(database_config::Storage::InMemoryStorage(_)) => Arc::new(MemoryStore::default()),
                 Some(database_config::Storage::LocalStorage(storage)) => Arc::new(LocalStore::open_in(PathBuf::from(storage.path.as_deref().ok_or_else(|| invalid("Local storage has no path"))?).join(root.as_str()), Arc::clone(&io))?),
                 Some(database_config::Storage::RemoteStorage(storage)) => {
                     let configuration = storage.object_store.as_ref().ok_or_else(|| invalid("Remote storage has no provider configuration"))?;
                     let factory = self.storage_factories.get(type_name(configuration)?).ok_or_else(|| invalid("Native storage factory is unavailable"))?;
-                    let remote = factory.open(configuration, &root, Arc::clone(&io)).await?;
-                    blocks = factory.block_discovery(configuration).await?;
+                    let opened = factory.open_for_recovery(configuration, &root, Arc::clone(&io)).await?;
+                    let remote = opened.store;
+                    blocks = opened.blocks;
+                    checkpoint_metadata = opened.checkpoint_metadata;
                     let storage = if factory.use_disk_cache() {
                         let cache = self.disk_cache.as_ref().ok_or_else(|| invalid("Remote storage requires a disk cache"))?;
                         let identity = factory.cache_identity(configuration)?;
@@ -263,7 +280,7 @@ impl ResourceFactory for NativeResources {
                     factory.wrap_cached(configuration, storage).await?
                 }
             };
-            Ok(DatabaseStorage { store, blocks, storage_epoch, storage_version: CURRENT_STORAGE_VERSION, io: Arc::clone(&io) })
+            Ok(DatabaseStorage { store, blocks, checkpoint_metadata, storage_epoch, storage_version: CURRENT_STORAGE_VERSION, io: Arc::clone(&io) })
         }.await;
         if opened.is_err() { io.close_and_wait().await; }
         opened

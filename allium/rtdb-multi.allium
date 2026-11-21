@@ -181,6 +181,11 @@ value Checkpoint {
     format_version: Integer
 }
 
+value CheckpointMetadataRead {
+    id: String
+    first_block: Integer
+}
+
 value ReplicaReplayHold {
     id: String
     first_required: Lsn
@@ -606,6 +611,7 @@ entity DeploymentRecord {
     checkpoint: Checkpoint?
     replica_anchor: CertifiedReplicaPrefix?
     replica_replays: Set<ReplicaReplayHold>
+    checkpoint_metadata_reads: Set<CheckpointMetadataRead>
     -- A holder confirms its epoch with a quorum for reads.
     linearizable_reads: Boolean
     -- How many ranks of the affinity order may serve reads.
@@ -1484,6 +1490,31 @@ rule NoteReleased {
             GarbageCandidate.created(object: object, lineage: holding.deployment.lineage, released_at: now)
 }
 
+rule AdmitCheckpointMetadata {
+    when: StartupStoreRequested(deployment, requested_checkpoint)
+
+    ensures:
+        let record = Directory.read(deployment.id)
+        if requested_checkpoint != null and requested_checkpoint != record.checkpoint:
+            RefreshCheckpointRequest(deployment)
+        else:
+            let read = CheckpointMetadataRead.created(id: FreshIdentity(), first_block: PublishedBlockOrOrigin(record))
+            Directory.cas(deployment.id, record.version, change: {
+                checkpoint_metadata_reads: record.checkpoint_metadata_reads + {read}
+            })
+            StartupMayReadCheckpointMetadataAtOrAbove(read.first_block)
+}
+
+rule ReleaseCheckpointMetadata {
+    when: StartupCheckpointReadsDrained(deployment, read)
+
+    ensures:
+        let record = Directory.read(deployment.id)
+        Directory.cas(deployment.id, record.version, change: {
+            checkpoint_metadata_reads: record.checkpoint_metadata_reads - {read}
+        })
+}
+
 rule ReapUnreachable {
     -- An object is deleted only when no published manifest of any live deployment in its lineage references it, and reaper_grace has passed since it was released.
     -- The reaper's deletions are conditional on the lineage's version, which every fork and every deletion bumps, so a fork created mid-sweep keeps what it references.
@@ -1491,6 +1522,9 @@ rule ReapUnreachable {
     when: candidate: GarbageCandidate.released_at + config.reaper_grace <= now
 
     requires: not exists d in LiveDeploymentsOf(candidate.lineage): candidate.object in ReferencedBy(d.checkpoint.manifest)
+    requires: for block in CheckpointMetadataIn(candidate.object):
+        block < PublishedBlockOrOrigin(OwnerOf(candidate.object))
+        and not exists read in OwnerOf(candidate.object).checkpoint_metadata_reads: read.first_block <= block
 
     ensures:
         ObjectStorage.delete_all_versions(candidate.object.key)

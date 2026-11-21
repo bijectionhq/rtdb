@@ -1,0 +1,37 @@
+{
+  "summary": "Checkpoint metadata is collectible only below the published block and every active metadata hold.",
+  "flags": ["--no-external-by-default", "--verify-module", "production", "--verify-module", "laws"],
+  "min_verified_functions": 5,
+  "controls": {
+    "ignore_active_holds": {
+      "mutate": [{
+        "file": "rust/crates/multi/src/checkpoint_retention.rs",
+        "find": "Some(oldest) => block < published && block < oldest,",
+        "replace": "Some(_) => block < published,"
+      }],
+      "expect": [{
+        "file": "rust/crates/multi/src/checkpoint_retention.rs",
+        "function": "checkpoint_metadata_collectable",
+        "category": "postcondition not satisfied"
+      }],
+      "min_verified_functions": 4
+    },
+    "ignore_active_holds_and_weaken_contract": {
+      "mutate": [{
+        "file": "rust/crates/multi/src/checkpoint_retention.rs",
+        "find": "Some(oldest) => block < published && block < oldest,",
+        "replace": "Some(_) => block < published,"
+      }, {
+        "file": "rust/crates/multi/src/checkpoint_retention.rs",
+        "find": "\n            && (oldest.is_none() || block < oldest.unwrap()),",
+        "replace": ","
+      }],
+      "expect": [{
+        "file": "verification/verus/checkpoint_metadata/laws.rs",
+        "function": "held_checkpoint_metadata_is_never_collectable",
+        "category": "assertion failed"
+      }],
+      "min_verified_functions": 4
+    }
+  }
+}

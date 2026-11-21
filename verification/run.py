@@ -1528,6 +1528,37 @@ def verify_multi_trim_admission(args, source):
     print(f"{label}: directory floor enforced before physical trim, missing check rejected")
 
 
+def verify_checkpoint_metadata_replay(args, source):
+    env = os.environ | {
+        "CARGO_TARGET_DIR": str(ROOT / "target"),
+        "CARGO_PROFILE_DEV_DEBUG": "0",
+        "CARGO_PROFILE_TEST_DEBUG": "0",
+        "CARGO_INCREMENTAL": "0",
+    }
+    test = "store::tests::an_admitted_checkpoint_keeps_packed_and_loose_metadata_until_provider_reads_drain"
+    command = ["cargo", "test", "--locked", "-p", "rtdb-multi", "--lib", test, "--", "--exact"]
+    label = "rust-multi-checkpoint-metadata"
+    baseline = run_case(command, source / "rust", args.evidence, f"{label}-baseline", env)
+    if baseline.returncode or f"{test} ... ok" not in baseline.stdout or "1 passed; 0 failed" not in baseline.stdout:
+        raise ValueError("Multi reaper failed the checkpoint metadata lifetime contract")
+
+    store = source / "rust/crates/multi/src/store.rs"
+    original = store.read_bytes()
+    try:
+        replace_once(store, "let oldest = record.storage_regions.values().filter_map(StorageRegion::checkpoint_metadata_from).min();",
+                     "let oldest = None;")
+        control = run_case(command, source / "rust", args.evidence, f"{label}-ignore-holds", env)
+        if (
+            control.returncode != 101 or f"{test} ... FAILED" not in control.stdout
+            or "an admitted checkpoint root must survive collection" not in control.stdout
+            or "0 passed; 1 failed" not in control.stdout
+        ):
+            raise ValueError("ignoring checkpoint holds did not fail at the packed root assertion")
+    finally:
+        store.write_bytes(original)
+    print(f"{label}: startup metadata survived collection until provider drain, ignoring the hold failed")
+
+
 def verify_recovery_hold_replay(args, source):
     env = os.environ | {
         "CARGO_TARGET_DIR": str(ROOT / "target"),
@@ -1957,6 +1988,10 @@ def main():
         "rust/crates/logkeeper/src/client/mod.rs",
         "rust/crates/multi/src/logs.rs",
         "rust/crates/multi/src/recovery_holds.rs",
+        "rust/crates/multi/src/store.rs",
+        "rust/crates/multi/src/packing.rs",
+        "rust/crates/directory/src/lib.rs",
+        "rust/crates/node/src/resources.rs",
         "rust/crates/multi/src/agent.rs",
         "rust/crates/multi/tests/cell.rs",
     ))
@@ -1996,6 +2031,7 @@ def main():
             verify_replay_prefix(args, source)
             verify_multi_trim_admission(args, source)
             verify_recovery_hold_replay(args, source)
+            verify_checkpoint_metadata_replay(args, source)
             verify_catalog_replay(args, source)
             verify_system_time_replay(args, source)
             verify_merge_replay(args, source)

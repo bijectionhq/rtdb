@@ -8,6 +8,7 @@ pub mod agent;
 pub mod archive;
 pub mod capability;
 pub mod cells;
+mod checkpoint_retention;
 pub mod cipher;
 pub mod control;
 pub mod deployment;

@@ -750,6 +750,35 @@ The bounded model distinguishes a delayed CAS, locally observed cancellation, dr
 Lean proves that closing one modeled hold leaves the others alone and that the resulting monotone revision fences older requests.
 The local cell regression pauses a real subscriber after registration, publishes a newer checkpoint, verifies that the physical trim retains the required record, and observes the subscriber's SQL state and trim progress after release. link:../../verification/tla/ReplicaHoldLifecycle.tla[Hold lifecycle] · link:../../verification/lean/ReplicaHoldClose.lean[Close and fencing laws]
 
+=== Multi startup checkpoint metadata
+
+A packed store derives its discovery hint and startup metadata hold from the same successful storage admission CAS.
+The startup can then read root catalogs, their per-table block catalogs, and block-pack indices at or above that admitted block.
+If no block has been published, the hold begins at block zero.
+A frozen snapshot request is accepted at the directory's current checkpoint.
+If that checkpoint changes before admission, the node can retry the request at a strictly newer one.
+Ordinary startup can discover a later root and may refresh its listing, keeping the stored lower bound.
+
+A reaper plan may authorize released metadata only below the published block and every open metadata hold.
+A new hold begins at the observed published block or higher, so it cannot overlap metadata an earlier plan authorized when publication only moves forward within the residence.
+This applies to the checkpoint metadata objects in loose storage, named block packs, and spill packs.
+In the packed case, the pack remains if any of its entries has an outstanding metadata obligation.
+Completion still requires the usual release records, grace and reference handling for ordinary collection.
+
+The node carries the startup hold through checkpoint selection, metadata reads, and any ordinary recovery retry while assembling the database.
+Its I/O region propagates the hold into admitted provider and cache operations when the calling future is cancelled.
+Dropping the final reference clears the metadata field independently of the broader serving region.
+A crashed reader's metadata hold belongs to the serving region that the reaper reconciles after definitive evidence of owner loss.
+The protocol assumes every active reader and reaper uses the same metadata-hold rules.
+It also assumes monotone publication within an immutable physical residence and no resurrection of a released metadata identity.
+
+Lean proves that an authorized metadata deletion remains safe through subsequent admissions, forward publication, and hold releases, including when the actual provider deletion starts later.
+TLC checks independent authorization and deletion with overlapping readers.
+Verus checks the native comparison against both bounds.
+The native adapter replay exercises packed and loose metadata while a provider read outlives its cancelled caller.
+The protection is for startup metadata in one Multi residence.
+Serving trie pages, artefacts, shared lineage inventories, and the complete snapshot lifetime need their own refinement against the reaper and compaction transitions. link:../../verification/tla/CheckpointMetadataRetention.tla[Metadata retention model] · link:../../verification/lean/CheckpointMetadataRetention.lean[Interleaving proof]
+
 == Production boundary and responsibilities
 
 Use the existing database and maintenance owners.

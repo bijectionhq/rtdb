@@ -132,6 +132,8 @@ pub enum BlockDiscovery {
     /// Probes forward from a known block, one head per block.
     /// Listing handles a missing hint or refreshes discovery after a missing metadata read.
     From(BlockIndex),
+    /// A published and admitted lower bound. A refreshed listing must also respect it.
+    FromPublished(BlockIndex),
     /// A restored serving generation requires its archived checkpoint and suppresses
     /// physical compaction effects from the sealed history preceding restoration.
     FromRestored { checkpoint: BlockIndex, compaction_cutoff: ReplicaPosition },
@@ -202,7 +204,7 @@ impl BlockStore {
             external_token: block.as_ref().and_then(BlockCatalog::external_source_token).map(Arc::from),
         };
         let fence = match &block { Some(block) => TermFence::from_catalog(block)?, None => TermFence::from_boundary(rtdb_types::Term(0), None)? };
-        let refresh_allowed = matches!(discovery, BlockDiscovery::List | BlockDiscovery::From(_));
+        let refresh_allowed = matches!(discovery, BlockDiscovery::List | BlockDiscovery::From(_) | BlockDiscovery::FromPublished(_));
         Ok(RecoveredPartition { partition, block, progress, fence, table_blocks, compaction_replay_cutoff, refresh_allowed, replay_tail: None }.with_source_floor(source_floor))
     }
     async fn load_selected_checkpoint(&self, discovery: BlockDiscovery, previous: Option<BlockIndex>) -> Result<Option<(BlockCatalog, BTreeMap<rtdb_types::TableRef, TableBlock>)>> {
@@ -212,7 +214,7 @@ impl BlockStore {
             None => latest,
         };
         let Some(mut index) = selected else { return Ok(None); };
-        let refresh = matches!(discovery, BlockDiscovery::List | BlockDiscovery::From(_));
+        let refresh = matches!(discovery, BlockDiscovery::List | BlockDiscovery::From(_) | BlockDiscovery::FromPublished(_));
         loop {
             match self.load(index).await {
                 Err(error) if refresh && error.code == "rtdb.storage/missing-object" => {
@@ -238,22 +240,29 @@ impl BlockStore {
         let mut latest = match discovery {
             BlockDiscovery::At(block) if exists(block).await? => return Ok(Some(block)),
             BlockDiscovery::At(block) => return Err(rtdb_types::Anomaly::new(rtdb_types::AnomalyCategory::Unavailable, "rtdb.replication/block-gone", format!("Block {} is no longer stored", block.0))),
-            BlockDiscovery::From(hint) if exists(hint).await? => hint,
+            BlockDiscovery::From(hint) | BlockDiscovery::FromPublished(hint) if exists(hint).await? => hint,
+            BlockDiscovery::FromPublished(hint) => return self.latest_listed_block().await?
+                .filter(|index| *index >= hint).map(Some).ok_or_else(|| rtdb_types::Anomaly::new(
+                    rtdb_types::AnomalyCategory::Unavailable, "rtdb.replication/block-gone",
+                    format!("Published checkpoint {} and its successors could not be found", hint.0),
+                )),
             BlockDiscovery::FromRestored { checkpoint, .. } if exists(checkpoint).await? => checkpoint,
             BlockDiscovery::FromRestored { checkpoint, .. } => return Err(rtdb_types::Anomaly::new(
                 rtdb_types::AnomalyCategory::Unavailable, "rtdb.replication/block-gone",
                 format!("Restored checkpoint {} is no longer stored", checkpoint.0),
             )),
-            _ => {
-                let directory = ObjectKey::new("blocks")?;
-                return Ok(self.store.list(Some(&directory)).await?.into_iter().filter_map(|entry| block_index_from_key(entry.key.as_str()).ok()).max());
-            }
+            _ => return self.latest_listed_block().await,
         };
         while let Some(next) = latest.0.checked_add(1).map(BlockIndex) {
             if !exists(next).await? { break; }
             latest = next;
         }
         Ok(Some(latest))
+    }
+
+    async fn latest_listed_block(&self) -> Result<Option<BlockIndex>> {
+        let directory = ObjectKey::new("blocks")?;
+        Ok(self.store.list(Some(&directory)).await?.into_iter().filter_map(|entry| block_index_from_key(entry.key.as_str()).ok()).max())
     }
 
     async fn load_catalog(&self, index: BlockIndex) -> Result<BlockCatalog> {
