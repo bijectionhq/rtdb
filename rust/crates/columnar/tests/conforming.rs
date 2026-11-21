@@ -103,15 +103,19 @@ fn adapting_struct_order_preserves_declared_metadata_and_values() {
     let memory = MemoryBudget::new(1 << 22);
     let fields = vec![Field::new("z", DataType::Int64, false), Field::new("a", DataType::Utf8, false)].into();
     let target = Schema::new(vec![Field::new("v", DataType::Struct(fields), false).with_metadata(std::collections::HashMap::from([("caller".into(), "retained".into())]))]);
-    let value = Value::Struct(StructFields::from([("z".into(), Value::I64(7)), ("a".into(), Value::Utf8("text".into()))]));
+    let value = Value::Struct(StructFields::from([("a".into(), Value::Utf8("text".into())), ("z".into(), Value::I64(7))]));
     let logical = value.logical_type();
     let source = RecordBatch::try_new(Arc::new(Schema::new(vec![to_field("v", &logical).unwrap()])), vec![copy_array(&logical, &[value.clone()]).unwrap()]).unwrap();
+    let structure = source.column(0).as_any().downcast_ref::<StructArray>().unwrap();
+    assert_eq!(structure.fields()[0].name(), "a");
+    let address = structure.column(0).as_any().downcast_ref::<StringArray>().unwrap().value_data().as_ptr();
     let page = conform_batch(OwnedBatch::new(source, &memory).unwrap(), &target, &memory).unwrap();
     assert_eq!(page.batch().schema().as_ref(), &target);
     assert_eq!(page.declared_schema().as_ref(), &target);
     assert_eq!(read_value(target.field(0), page.batch().column(0).as_ref(), 0).unwrap(), value);
     let structure = page.batch().column(0).as_any().downcast_ref::<StructArray>().unwrap();
     assert_eq!(structure.fields().iter().map(|field| field.name().as_str()).collect::<Vec<_>>(), ["z", "a"]);
+    assert_eq!(structure.column(1).as_any().downcast_ref::<StringArray>().unwrap().value_data().as_ptr(), address);
     drop(page);
     assert_eq!(memory.used_bytes(), 0);
 }

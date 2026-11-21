@@ -19,6 +19,7 @@
 -- The embedded logical relation entry point captures the same connection read basis as a SQL query.
 -- Logical relation cursors expose the root operator's pages as separate batches.
 -- Flight SQL result batches retain the Arrow buffers of columns that already match the declared field, even when other columns require conformance.
+-- Compatible nested fields and union legs retain their value buffers when encoding changes their declared layout.
 -- The embedded logical relation entry point runs plan reporting and measured execution on that read basis.
 --
 -- == Frontend parity (the point of this spec) ==
