@@ -2567,7 +2567,8 @@ surface ClientAccess {
 
     @guarantee MovesAreInvisible
         -- A planned handoff stalls writes for one log round plus a redirect, and touches no client connection.
-        -- A failover stalls writes until detection and claim complete, and a retried commit returns the outcome the first attempt had.
+        -- A failover stalls writes until detection and claim complete.
+        -- A successful replay of a previously committed permitted write recovers the original committed outcome.
         -- A dispatch failure preserves any complete command response the gateway has received.
         -- A writable pgwire pipeline waits for ReadyForQuery between command cycles so each autocommit cycle has its own retry key.
         -- A copy-in transfer can send its input frames before ReadyForQuery.
@@ -2581,7 +2582,8 @@ surface ClientAccess {
         -- The gateway waits for the replacement writer to acknowledge the original permit before replaying the command.
         -- The dispatch and replay share an exclusive submission cutoff issued when the command starts, within replay_permit_age.
         -- Both writers refuse a permitted submission at or after that cutoff before appending it.
-        -- Every admitted permitted write records its command key with its effects, and retains the marker through the cutoff.
+        -- Every committed permitted write records its command key with its effects, and retains the marker through the cutoff.
+        -- An aborted attempt leaves the existing marker state intact, and another admitted attempt can still commit if that state has no marker.
         -- Closed storage before the first command reply allows a keyed retry on a newer writer epoch.
         -- A holder's driver shutdown during a command leaves the outcome unknown until a keyed retry returns it.
         -- An authenticated idle session retains its acknowledged named prepared statements across holder changes.
@@ -2611,9 +2613,10 @@ surface ClientAccess {
     @guarantee ReadYourWrites
         -- Within a session, every read sees every transaction the session was acknowledged.
 
-    @guarantee OneOutcomePerKey
-        -- A transaction retried with the same idempotency key within idempotency_window has exactly one outcome, whichever member answers.
+    @guarantee AtMostOneCommitPerKey
+        -- Retries sharing one private permit produce at most one committed effect.
         -- A permitted write uses its one private command key, whose marker belongs to the engine.
+        -- An ordinary keyed retry deduplicates a previous commit while the marker for its key remains active.
         -- An ordinary keyed transaction uses a string application key when one is supplied, with a stable value required for deduplication.
         -- An ordinary gateway transaction without a usable application key uses the gateway key and its transaction ordinal.
 }
