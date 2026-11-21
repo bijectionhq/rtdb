@@ -224,3 +224,35 @@ Filtering physical notices through the cutoff preserves the logical fold for eve
 The model keeps a compaction strictly after the cutoff.
 Dropping old transactions fails the first theorem, and suppressing every compaction fails the second.
 These theorems depend on the abstract event classification. The cell test exercises the implementation with local storage and durable loopback journals.
+
+## Transfer protocol study
+
+[RTDBCellTransfer.tla](../tla/RTDBCellTransfer.tla) distinguishes fencing, the durable object and journal copies, the prepared receipt, route publication, activation, and source disposal.
+The model treats each of these as an atomic observation.
+It assumes an available source until authorized disposal and a destination with an independent physical identity.
+Its progress check assumes weak fairness for the steps that prepare and activate the destination.
+It covers one move. Repeated moves and exact earlier-residence receipts are exercised by the native move-and-return regression.
+
+TLC 2026.11.19.180144 explored all 10 states of the baseline and checked the safety invariants and conditional progress.
+Run the baseline from `dev/tla` with the pinned classes:
+
+```sh
+BIJECTION_LOCAL_EXECUTION=owner-authorized java -Xmx512m -cp "$TLA2TOOLS_JAR" \
+  tlc2.TLC -workers 1 -noGenerateSpecTE -config RTDBCellTransfer.cfg RTDBCellTransfer.tla
+```
+
+Run a copy of the configuration for each independent control, using the same command with its configuration file.
+
+| Change to baseline | Checked failure |
+| --- | --- |
+| `Mode = "early_route"` | The route points to a destination before both copies complete. |
+| `Mode = "ignore_journal"` | Objects alone can produce a ready receipt and the route lacks a durable journal. |
+| `Mode = "early_disposal"` | The fenced source disappears before the destination is selected. |
+| `Mode = "reuse_identity"` | Disposal of the old physical identity removes the routed destination's objects. |
+| `Mode = "allow_two_writers"` | The destination opens while the source writer is still active. |
+| `SPECIFICATION Spec` | A behavior can stutter before the destination becomes active. |
+
+On the integrated source, 79 multi library tests and 53 loopback cell tests passed.
+The separate Logkeeper run passed 27 unit tests and 11 contract tests.
+The transfer test moves a restored checkpoint and ordered tail, returns to an earlier cell after the old serving residence is disposed, and checks the retained custody and query result.
+These runs used local stores and journals. S3 permissions and remote task-stop evidence still require provider qualification.
