@@ -396,6 +396,7 @@ contract LogService {
     @invariant SealIsAPromise
         -- A seal at epoch e durably raises the server's promised epoch for the deployment to at least e, and returns the epoch it is synced at, its last lsn, and the epoch of every record above the deployment's trim point.
         -- Once write_quorum servers of a loglet have answered a seal at e, no append below e reaches a quorum of that loglet.
+        -- The promise applies to appends already in flight when the seal was made durable.
         --   Any commit quorum and any seal quorum of one ensemble intersect.
 
     @invariant NothingCommittedIsLost
