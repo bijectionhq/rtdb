@@ -146,10 +146,15 @@ impl Service {
             yield wire::schema_data(&schema, service.memory())?;
             let mut encoder = match wire::Encoder::new(&schema, service.memory()) { Ok(encoder) => encoder, Err(error) => { cursor.record_consumer_error(); Err(error)?; unreachable!() } };
             loop {
-                let batch = _call.cancellation.run_until_cancelled(cursor.next_batch()).await.ok_or_else(cancelled)?.map_err(status)?;
-                let Some(batch) = batch else { break; };
-                let batch = match rtdb_columnar::conform_batch(batch, &schema, service.memory()).map_err(status) { Ok(batch) => batch, Err(error) => { cursor.record_consumer_error(); Err(error)?; unreachable!() } };
-                let encoded = match encoder.declared_batch(&batch, service.memory()) { Ok(encoded) => encoded, Err(error) => { cursor.record_consumer_error(); Err(error)?; unreachable!() } };
+                let encoded = _call.cancellation.run_until_cancelled(cursor.encode_next_batch(|batch| {
+                    let batch = rtdb_columnar::conform_batch(batch.clone(), &schema, service.memory()).map_err(status)?;
+                    encoder.declared_batch(&batch, service.memory())
+                })).await.ok_or_else(cancelled)?.map_err(status)?;
+                let encoded = match encoded.transpose() {
+                    Ok(Some(encoded)) => encoded,
+                    Ok(None) => break,
+                    Err(error) => { cursor.record_consumer_error(); Err(error)?; unreachable!() },
+                };
                 for data in encoded { yield data; }
             }
         });

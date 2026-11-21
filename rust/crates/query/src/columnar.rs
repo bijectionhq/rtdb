@@ -74,16 +74,16 @@ impl ColumnBatch {
 
     /// Gathers nonempty positions in already resolved batches without building row objects.
     pub fn take_rows(
-        sources: &[Self], rows: &[(usize, usize)], width: usize, memory: &Arc<MemoryBudget>,
+        sources: &[Self], rows: &[(usize, usize)], positions: &[usize], memory: &Arc<MemoryBudget>,
     ) -> Result<Self> {
-        if rows.is_empty() || sources.iter().any(|source| source.columns.len() < width)
+        if rows.is_empty() || sources.iter().any(|source| positions.iter().any(|&position| position >= source.columns.len()))
             || rows.iter().any(|&(batch, row)| sources.get(batch).is_none_or(|source| row >= source.len))
         {
             return Err(invalid("column-gather", "Ordered row position is outside its batch"));
         }
-        let mut reservation = memory.reserve(width.saturating_mul(256).saturating_add(256))?;
-        let mut columns = Vec::with_capacity(width);
-        for position in 0..width {
+        let mut reservation = memory.reserve(positions.len().saturating_mul(256).saturating_add(256))?;
+        let mut columns = Vec::with_capacity(positions.len());
+        for &position in positions {
             let scratch = rows.iter().try_fold(
                 sources.len().saturating_mul(256).saturating_add(4096),
                 |bound, &(batch, row)| {
@@ -665,29 +665,41 @@ impl BatchCursor for BatchFilter {
     async fn next_batch(&mut self) -> Result<Option<ColumnBatch>> {
         while let Some(batch) = self.input.next_batch().await? {
             self.execution.context.check_cancelled()?;
-            let truth = kernel::truth(&self.predicate, &self.schema, &batch, self.execution.parameters.values())
-                .or_else(|| crate::vector::truth(&self.predicate, &self.schema, &batch, self.execution.parameters.values()));
-            let mask = match truth {
-                Some(truth) => truth.into_iter().map(|value| value == Some(true)).collect::<Vec<_>>(),
-                None => {
-                    let metadata = self.execution.scope()?;
-                    let invocation = self.execution.prepare_expression(&self.predicate, &self.schema, &metadata)?;
-                    let scope = self.execution.scope()?;
-                    let mut page = batch.rows(&self.execution.context.memory)?;
-                    let mut mask = Vec::with_capacity(batch.len);
-                    while let Some(row) = page.next() {
-                        mask.push(rtdb_expr::is_true(&self.execution.evaluate_invocation(&scope, &invocation, &row.values).await?)?);
-                        scope.reset()?;
-                    }
-                    mask
-                }
-            };
+            let mask = predicate_mask(&batch, &self.predicate, &self.schema, &self.execution).await?;
             if mask.iter().any(|keep| *keep) { return batch.select(&mask, &self.execution.context.memory).map(Some); }
         }
         Ok(None)
     }
     fn trace_attributes(&self, span: &mut dyn rtdb_plan::TraceSpan) { self.input.trace_attributes(span) }
     fn scan_counts(&self) -> Option<crate::analysis::ScanCounts> { self.input.scan_counts() }
+}
+
+/// Computes selection in place so an ordered seek can keep row offsets into the original batch.
+pub(crate) async fn predicate_mask(
+    batch: &ColumnBatch, predicate: &Expr, schema: &rtdb_plan::Schema, execution: &crate::context::Execution,
+) -> Result<Vec<bool>> {
+    execution.context.check_cancelled()?;
+    let truth = kernel::truth(predicate, schema, batch, execution.parameters.values())
+        .or_else(|| crate::vector::truth(predicate, schema, batch, execution.parameters.values()));
+    if let Some(truth) = truth {
+        return Ok(truth.into_iter().map(|value| value == Some(true)).collect());
+    }
+    let metadata = execution.scope()?;
+    let invocation = execution.prepare_expression(predicate, schema, &metadata)?;
+    let scope = execution.scope()?;
+    let mut mask = Vec::with_capacity(batch.len);
+    let mut values = Vec::with_capacity(batch.columns.len());
+    for row in 0..batch.len {
+        let bound = batch.columns.iter().try_fold(256usize, |bound, column| {
+            bound.checked_add(column.bound(row)?).ok_or_else(size_error)
+        })?;
+        let _row = execution.context.memory.reserve(bound)?;
+        for column in &batch.columns { values.push(column.value(row)?); }
+        mask.push(rtdb_expr::is_true(&execution.evaluate_invocation(&scope, &invocation, &values).await?)?);
+        values.clear();
+        scope.reset()?;
+    }
+    Ok(mask)
 }
 
 /// Three-valued predicate evaluation over a batch's columns, for the predicate shapes and cell types whose
@@ -957,7 +969,7 @@ mod tests {
                 arrow(Arc::new(StringArray::from(vec!["first", "second"])), ScalarType::Utf8),
             ]),
         ];
-        let result = ColumnBatch::take_rows(&sources, &[(1, 1), (0, 0), (1, 0)], 2, &memory).unwrap();
+        let result = ColumnBatch::take_rows(&sources, &[(1, 1), (0, 0), (1, 0)], &[0, 1], &memory).unwrap();
         assert!(result.columns.iter().all(|column| matches!(column, Column::Arrow { .. })));
         assert_eq!(result.columns[0].value(0).unwrap(), Value::I64(40));
         assert_eq!(result.columns[0].value(1).unwrap(), Value::I64(10));

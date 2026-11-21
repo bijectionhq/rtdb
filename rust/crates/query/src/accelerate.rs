@@ -41,7 +41,6 @@ pub struct ScanRequest<'a> {
 pub trait CandidateVerifier: Send + Sync {
     /// Each visible row's IID with its value of `column`.
     async fn visible(&self, iids: BTreeSet<Iid>, column: rtdb_plan::ColumnId) -> Result<Vec<(Iid, Value)>>;
-    async fn visible_columns(&self, iids: BTreeSet<Iid>, columns: &[rtdb_plan::ColumnId], residuals: &[Expr]) -> Result<Vec<(Iid, Vec<Value>)>>;
 
     /// Counts the corpus from authoritative rows when an optional index cannot supply it.
     async fn snapshot_corpus(
@@ -95,8 +94,14 @@ impl rtdb_expr::CorpusLookup for CorpusRegistry {
 
 /// Exact ordered output for a point scan in its requested order.
 pub enum OrderedScan {
-    Iids(Vec<Iid>),
+    Payload { candidates: Box<dyn OrderedCandidates>, verify: bool },
     Covered(Box<dyn OrderedBatches>),
+}
+
+#[async_trait]
+pub trait OrderedCandidates: Send {
+    /// A bounded prefix of the remaining IIDs in index order. An empty batch ends the seek.
+    async fn next_iids(&mut self, maximum: usize) -> Result<Vec<Iid>>;
 }
 
 #[async_trait]
@@ -112,9 +117,9 @@ pub trait OrderedBatches: Send {
 pub trait ScanAccelerator: Send + Sync {
     async fn candidate_iids(&self, request: &ScanRequest<'_>) -> Result<Option<BTreeSet<Iid>>>;
     /// The first matching rows of a point read, in the requested SQL order.
-    /// The returned identities already account for the scan predicates and annotated residual predicates.
-    /// A distinct plan returns at most one representative of each SQL key before applying the limit.
-    /// A covered result projects the requested scan positions.
+    /// A covered result applies the window and projects the requested scan positions.
+    /// A payload seek leaves windowing to the scan after any table predicates are checked.
+    /// A distinct seek emits one representative of each qualifying SQL key.
     async fn ordered(&self, _request: &ScanRequest<'_>, _window: std::ops::Range<usize>, _projection: &[usize]) -> Result<Option<OrderedScan>> { Ok(None) }
     /// The values of `match(column, query)` on the rows of whichever of the scan's data files the accelerator can answer for, so the scan reads no text there.
     /// Each answer must equal MATCH evaluated on the row.

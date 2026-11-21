@@ -73,6 +73,7 @@ pub enum ControlStatement<E = Expr> {
     Prepare { name: String, source: String },
     Execute { name: String, arguments: Vec<E> },
     CopyIn { table: Vec<Identifier>, format: Option<CopyFormat> },
+    CopyOut { query: String },
     AttachDatabase { name: String, configuration_yaml: Option<String>, source: String },
     DetachDatabase { name: String },
 }
@@ -97,6 +98,7 @@ impl<E> ControlStatement<E> {
             Self::Prepare { name, source } => ControlStatement::Prepare { name, source },
             Self::Execute { name, arguments } => ControlStatement::Execute { name, arguments: arguments.into_iter().map(map).collect::<Result<_>>()? },
             Self::CopyIn { table, format } => ControlStatement::CopyIn { table, format },
+            Self::CopyOut { query } => ControlStatement::CopyOut { query },
             Self::AttachDatabase { name, configuration_yaml, source } => ControlStatement::AttachDatabase { name, configuration_yaml, source },
             Self::DetachDatabase { name } => ControlStatement::DetachDatabase { name },
         })

@@ -1,5 +1,5 @@
 use std::cmp::Ordering;
-use std::collections::{BTreeMap, BinaryHeap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, BinaryHeap, VecDeque};
 use std::io::Cursor;
 use std::sync::Arc;
 
@@ -468,21 +468,30 @@ pub(crate) async fn ordered_input(scan: &Scan, execution: &Execution, limit: usi
         crate::OrderedScan::Covered(batches) => {
             OrderedInput::Batches(Box::new(CoveredBatches { batches, context: Arc::clone(&execution.context) }))
         }
-        crate::OrderedScan::Iids(iids) => {
-            let memory = execution.context.memory.reserve(
-                iids.capacity().saturating_mul(size_of::<Iid>() + 32).saturating_add(positions.len().saturating_mul(256)),
-            )?;
-            let mut scan = scan.clone();
-            scan.columns = positions.iter().map(|&position| scan.columns.get(position).cloned()
-                .ok_or_else(|| invalid("ordered-column", "Ordered projection is outside the scan schema")))
-                .collect::<Result<_>>()?;
-            let width = scan.columns.len();
-            let iid_at = include_iid(&mut scan)?;
-            scan.ordered_top_k = None;
-            scan.top_k = None;
-            scan.predicates.clear();
+        crate::OrderedScan::Payload { candidates, verify } => {
+            let mut payload = scan.clone();
+            let predicate = verify.then(|| {
+                scan.predicates.iter().chain(scan.ordered_top_k.iter().flat_map(|top| &top.residuals))
+                    .cloned().reduce(|left, right| Expr::binary(rtdb_plan::BinaryOp::And, left, right))
+            }).flatten();
+            let mut needed = predicate.as_ref().map_or_else(BTreeSet::new, Expr::referenced_columns);
+            let output = positions.iter().map(|&position| scan.columns.get(position)
+                .map(|field| field.id).ok_or_else(|| invalid("ordered-column", "Ordered projection is outside the scan schema")))
+                .collect::<Result<Vec<_>>>()?;
+            needed.extend(output.iter().copied());
+            payload.columns.retain(|field| needed.contains(&field.id));
+            let iid_at = include_iid(&mut payload)?;
+            let schema = Schema::new(payload.columns.clone())?;
+            let projection = output.into_iter().map(|id| schema.position(id)
+                .ok_or_else(|| invalid("ordered-column", "Ordered output column is missing")))
+                .collect::<Result<Vec<_>>>()?;
+            let memory = execution.context.memory.reserve(4096 + payload.columns.len().saturating_mul(512))?;
+            payload.ordered_top_k = None;
+            payload.top_k = None;
+            payload.predicates.clear();
             OrderedInput::Batches(Box::new(OrderedPayload {
-                scan, execution: execution.clone(), selected: iids.into_iter(), width, iid_at, _memory: memory,
+                scan: payload, schema, execution: execution.clone(), candidates: Some(candidates), predicate, verify,
+                projection, iid_at, skip: offset, remaining: limit.saturating_sub(offset), _memory: memory,
             }))
         }
     }))
@@ -522,43 +531,75 @@ fn include_iid(scan: &mut Scan) -> Result<usize> {
 struct OrderedPayload {
     scan: Scan,
     execution: Execution,
-    selected: std::vec::IntoIter<Iid>,
-    width: usize,
+    schema: Schema,
+    candidates: Option<Box<dyn crate::OrderedCandidates>>,
+    predicate: Option<Expr>,
+    verify: bool,
+    projection: Vec<usize>,
     iid_at: usize,
+    skip: usize,
+    remaining: usize,
     _memory: Arc<MemoryReservation>,
 }
 
 #[async_trait]
 impl crate::columnar::BatchCursor for OrderedPayload {
     async fn next_batch(&mut self) -> Result<Option<crate::columnar::ColumnBatch>> {
-        self.execution.context.check_cancelled()?;
-        let ids: Vec<_> = self.selected.by_ref().take(128).collect();
-        if ids.is_empty() { return Ok(None); }
+        use crate::columnar::{Column, ColumnBatch, predicate_mask};
+
         let memory = &self.execution.context.memory;
-        let _scratch = memory.reserve(ids.len() * 256)?;
-        let mut scan = self.scan.clone();
-        scan.iids = Some(ids.iter().copied().collect());
-        let mut source = ScanCursor::new(scan, self.execution.clone(), None).await?;
-        let mut found = BTreeMap::new();
-        let mut batches = Vec::new();
-        while let Some(batch) = source.next_batch().await? {
-            let crate::columnar::Column::Arrow { array, .. } = &batch.columns[self.iid_at] else {
-                return Err(invalid("ordered-row-iid", "Ordered scan returned no IID array"));
-            };
-            let iids = rtdb_columnar::IidView::new(array.as_ref())?;
-            for row in 0..batch.len {
-                let iid = iids.get(row)?;
-                let position = (batches.len(), row);
-                if found.insert(iid, position).is_some() {
-                    return Err(invalid("ordered-row-duplicate", "Ordered point scan returned more than one row for an IID"));
+        while self.remaining != 0 {
+            self.execution.context.check_cancelled()?;
+            let Some(candidates) = self.candidates.as_mut() else { return Ok(None) };
+            let ids = candidates.next_iids(self.remaining.saturating_add(self.skip)).await?;
+            if ids.is_empty() {
+                self.candidates = None;
+                return Ok(None);
+            }
+            let _scratch = memory.reserve(ids.len().saturating_mul(256))?;
+            let mut scan = self.scan.clone();
+            scan.iids = Some(ids.iter().copied().collect());
+            let mut source = ScanCursor::new(scan, self.execution.clone(), None).await?;
+            let mut found = BTreeMap::new();
+            let mut batches = Vec::new();
+            while let Some(batch) = source.next_batch().await? {
+                let Column::Arrow { array, .. } = &batch.columns[self.iid_at] else {
+                    return Err(invalid("ordered-row-iid", "Ordered scan returned no IID array"));
+                };
+                let iids = rtdb_columnar::IidView::new(array.as_ref())?;
+                let mask = match &self.predicate {
+                    Some(predicate) => Some(predicate_mask(&batch, predicate, &self.schema, &self.execution).await?),
+                    None => None,
+                };
+                for row in 0..batch.len {
+                    let iid = iids.get(row)?;
+                    let selected = mask.as_ref().is_none_or(|mask| mask[row]);
+                    let position = selected.then_some((batches.len(), row));
+                    if found.insert(iid, position).is_some() {
+                        return Err(invalid("ordered-row-duplicate", "Ordered point scan returned more than one row for an IID"));
+                    }
+                }
+                batches.push(batch);
+            }
+            let mut order = Vec::with_capacity(ids.len().min(self.remaining));
+            for iid in ids {
+                match found.remove(&iid) {
+                    None if !self.verify => return Err(invalid("ordered-row-missing", "A row in the ordered index is absent at the read basis")),
+                    None | Some(None) => continue,
+                    Some(Some(_)) if self.skip != 0 => self.skip -= 1,
+                    Some(Some(position)) => {
+                        order.push(position);
+                        if order.len() == self.remaining { break; }
+                    }
                 }
             }
-            batches.push(batch);
+            if !order.is_empty() {
+                self.remaining -= order.len();
+                if self.remaining == 0 { self.candidates = None; }
+                return ColumnBatch::take_rows(&batches, &order, &self.projection, memory).map(Some);
+            }
         }
-        let order = ids.into_iter().map(|iid| found.remove(&iid)
-            .ok_or_else(|| invalid("ordered-row-missing", "A row in the ordered index is absent at the read basis")))
-            .collect::<Result<Vec<_>>>()?;
-        crate::columnar::ColumnBatch::take_rows(&batches, &order, self.width, memory).map(Some)
+        Ok(None)
     }
 
     fn trace_attributes(&self, span: &mut dyn rtdb_plan::TraceSpan) {
@@ -572,13 +613,7 @@ struct ScanVerifier<'a> { scan: &'a Scan, execution: &'a Execution, pushdowns: O
 
 #[async_trait]
 impl crate::CandidateVerifier for ScanVerifier<'_> {
-    async fn visible(&self, iids: std::collections::BTreeSet<Iid>, column: rtdb_plan::ColumnId) -> Result<Vec<(Iid, Value)>> {
-        self.visible_columns(iids, &[column], &[]).await?.into_iter().map(|(iid, mut values)| {
-            Ok((iid, values.pop().ok_or_else(|| invalid("verifier-column", "Verified column is missing"))?))
-        }).collect()
-    }
-
-    async fn visible_columns(&self, mut iids: std::collections::BTreeSet<Iid>, columns: &[rtdb_plan::ColumnId], residuals: &[Expr]) -> Result<Vec<(Iid, Vec<Value>)>> {
+    async fn visible(&self, mut iids: BTreeSet<Iid>, column: rtdb_plan::ColumnId) -> Result<Vec<(Iid, Value)>> {
         if let Some(pushdowns) = &self.pushdowns {
             iids.retain(|iid| pushdowns.iid_matches(&self.scan.columns, *iid, self.canonical_entity_iids));
         }
@@ -588,22 +623,25 @@ impl crate::CandidateVerifier for ScanVerifier<'_> {
         scan.ordered_top_k = None;
         scan.iids = Some(iids);
         let iid_at = include_iid(&mut scan)?;
-        let position = |found: &dyn Fn(&rtdb_plan::Field) -> bool| scan.columns.iter().position(|field| found(field)).ok_or_else(|| invalid("verifier-column", "Verified column is not projected by the scan"));
-        let projected = columns.iter().map(|id| position(&|field| field.id == *id)).collect::<Result<Vec<_>>>()?;
+        let position = scan.columns.iter().position(|field| field.id == column)
+            .ok_or_else(|| invalid("verifier-column", "Verified column is not projected by the scan"))?;
         let schema = Schema::new(scan.columns.clone())?;
-        let predicate = scan.predicates.iter().chain(residuals).cloned().reduce(|left, right| Expr::binary(rtdb_plan::BinaryOp::And, left, right));
+        let predicate = scan.predicates.iter().cloned().reduce(|left, right| Expr::binary(rtdb_plan::BinaryOp::And, left, right));
         let mut cursor = ScanCursor::over(scan, self.execution.clone(), self.pushdowns.clone(), std::slice::from_ref(self.partition), self.storage, false).await?;
-        let metadata = self.execution.scope()?;
-        let invocation = predicate.as_ref().map(|predicate| self.execution.prepare_expression(predicate, &schema, &metadata)).transpose()?;
         let mut visible = Vec::new();
-        while let Some(mut page) = cursor.next_page().await? {
-            while let Some(row) = page.next() {
-                if let Some(invocation) = &invocation {
-                    let scope = self.execution.scope()?;
-                    if !rtdb_expr::is_true(&self.execution.evaluate_invocation(&scope, invocation, &row.values).await?)? { continue; }
+        while let Some(batch) = cursor.next_batch().await? {
+            let crate::columnar::Column::Arrow { array, .. } = &batch.columns[iid_at] else {
+                return Err(invalid("verifier-iid", "Verified scan returned no IID array"));
+            };
+            let iids = rtdb_columnar::IidView::new(array.as_ref())?;
+            let mask = match &predicate {
+                Some(predicate) => Some(crate::columnar::predicate_mask(&batch, predicate, &schema, self.execution).await?),
+                None => None,
+            };
+            for row in 0..batch.len {
+                if mask.as_ref().is_none_or(|mask| mask[row]) {
+                    visible.push((iids.get(row)?, batch.columns[position].value(row)?));
                 }
-                let Value::FixedSizeBinary(iid) = &row.values[iid_at] else { return Err(invalid("verifier-iid", "Verified row has no IID")) };
-                visible.push((Iid::from_slice(iid)?, projected.iter().map(|column| row.values[*column].clone()).collect()));
             }
         }
         Ok(visible)

@@ -15,10 +15,10 @@ use arrow_buffer::{NullBuffer, OffsetBuffer};
 use arrow_schema::Schema;
 use async_trait::async_trait;
 use rtdb_columnar::{
-    BatchBuilder, MemoryBudget, MemoryReservation, OwnedBatch, retain_buffer, to_field,
+    BatchBuilder, MemoryReservation, OwnedBatch, retain_buffer_with_owner, to_field,
 };
 use rtdb_plan::{BinaryOp, ColumnId, Expr, Field};
-use rtdb_query::{OrderedBatches, OrderedScan, ScanAccelerator, ScanRequest};
+use rtdb_query::{OrderedBatches, OrderedCandidates, OrderedScan, ScanAccelerator, ScanRequest};
 use rtdb_types::{AnomalyCategory, Iid, LogicalType, Result, ScalarType};
 use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
@@ -39,10 +39,24 @@ pub(crate) struct OrderedIndexAccelerator;
 #[async_trait]
 impl ScanAccelerator for OrderedIndexAccelerator {
     async fn candidate_iids(&self, request: &ScanRequest<'_>) -> Result<Option<BTreeSet<Iid>>> {
-        Ok(match exact(request, None, &[]).await? {
-            Some(OrderedScan::Iids(ids)) => Some(ids.into_iter().collect()),
-            _ => None,
-        })
+        let Some(OrderedScan::Payload { mut candidates, .. }) = exact(request, None, &[]).await?
+        else {
+            return Ok(None);
+        };
+        let mut selected = BTreeSet::new();
+        loop {
+            match candidates.next_iids(BATCH_ROWS).await {
+                Ok(batch) if batch.is_empty() => return Ok(Some(selected)),
+                Ok(batch) => {
+                    selected.extend(batch);
+                    if selected.len() > MAX_CANDIDATES {
+                        return Ok(None);
+                    }
+                }
+                Err(error) if error.category == AnomalyCategory::Interrupted => return Err(error),
+                Err(_) => return Ok(None),
+            }
+        }
     }
 
     async fn ordered(
@@ -601,7 +615,10 @@ async fn use_index(
         return Ok(Some(if projection.is_some() {
             OrderedScan::Covered(Box::new(CoveredSeek::empty()))
         } else {
-            OrderedScan::Iids(Vec::new())
+            OrderedScan::Payload {
+                candidates: Box::new(PostingCandidates(None)),
+                verify: false,
+            }
         }));
     }
 
@@ -655,68 +672,84 @@ async fn use_index(
         scan.advance(slot).await?;
     }
 
+    let postings = MatchingPostings {
+        scan,
+        predicates,
+        distinct_slot,
+        last: None,
+    };
     if let (Some(projection), Some(top)) = (projection, top) {
-        let mut seek = CoveredSeek {
+        let seek = CoveredSeek {
             state: Some(CoveredState {
                 projection,
-                scan,
-                predicates,
-                distinct_slot,
-                last: None,
+                postings,
                 skip: top.offset,
                 remaining: top.limit - top.offset,
             }),
-            first: None,
             sliced_rows: 0,
             gathered_rows: 0,
         };
-        seek.first = seek.next_batch().await?;
         return Ok(Some(OrderedScan::Covered(Box::new(seek))));
     }
 
-    let mut selected = Vec::new();
-    let mut pending = Vec::new();
-    let mut last_distinct = None::<Head>;
-    while let Some(head) = scan.next().await? {
-        if predicates
-            .iter()
-            .all(|predicate| predicate.matches(head.tuple()))
-        {
-            if covered {
-                let emit = distinct_slot.is_none_or(|key| {
-                    last_distinct
-                        .as_ref()
-                        .is_none_or(|prior| prior.tuple().cell(key) != head.tuple().cell(key))
-                });
-                if emit {
-                    selected.push(head.iid);
-                    if distinct_slot.is_some() {
-                        last_distinct = Some(head);
-                    }
-                }
-            } else {
-                pending.push(head.iid);
-                if pending.len()
-                    >= BATCH_ROWS.min(top.map_or(BATCH_ROWS, |top| {
-                        top.limit.saturating_sub(selected.len()).max(1)
-                    }))
+    Ok(Some(OrderedScan::Payload {
+        candidates: Box::new(PostingCandidates(Some(postings))),
+        verify: !covered,
+    }))
+}
+
+struct MatchingPostings {
+    scan: PostingScan,
+    predicates: Vec<Predicate>,
+    distinct_slot: Option<usize>,
+    last: Option<Head>,
+}
+
+impl MatchingPostings {
+    async fn next(&mut self) -> Result<Option<Head>> {
+        while let Some(head) = self.scan.next().await? {
+            if !self
+                .predicates
+                .iter()
+                .all(|predicate| predicate.matches(head.tuple()))
+            {
+                continue;
+            }
+            if let Some(slot) = self.distinct_slot {
+                if self
+                    .last
+                    .as_ref()
+                    .is_some_and(|last| last.tuple().cell(slot) == head.tuple().cell(slot))
                 {
-                    filter_payload(request, residuals, &mut pending, &mut selected).await?;
+                    continue;
                 }
+                self.last = Some(head.clone());
             }
-            if top.is_some_and(|top| selected.len() >= top.limit) {
-                break;
-            }
-            if selected.len() > MAX_CANDIDATES {
-                return Ok(None);
-            }
+            return Ok(Some(head));
         }
+        Ok(None)
     }
-    filter_payload(request, residuals, &mut pending, &mut selected).await?;
-    if let Some(top) = top {
-        drop(selected.drain(..top.offset.min(selected.len())));
+}
+
+struct PostingCandidates(Option<MatchingPostings>);
+
+#[async_trait]
+impl OrderedCandidates for PostingCandidates {
+    async fn next_iids(&mut self, maximum: usize) -> Result<Vec<Iid>> {
+        let Some(postings) = &mut self.0 else {
+            return Ok(Vec::new());
+        };
+        let capacity = maximum.min(BATCH_ROWS);
+        let mut ids = Vec::with_capacity(capacity);
+        while ids.len() < capacity {
+            let Some(head) = postings.next().await? else {
+                self.0 = None;
+                break;
+            };
+            ids.push(head.iid);
+        }
+        Ok(ids)
     }
-    Ok(Some(OrderedScan::Iids(selected)))
 }
 
 struct PostingScan {
@@ -771,17 +804,13 @@ impl PostingScan {
 
 struct CoveredState {
     projection: Covered,
-    predicates: Vec<Predicate>,
-    distinct_slot: Option<usize>,
-    last: Option<Head>,
+    postings: MatchingPostings,
     skip: usize,
     remaining: usize,
-    scan: PostingScan,
 }
 
 struct CoveredSeek {
     state: Option<CoveredState>,
-    first: Option<OwnedBatch>,
     sliced_rows: u64,
     gathered_rows: u64,
 }
@@ -790,7 +819,6 @@ impl CoveredSeek {
     fn empty() -> Self {
         Self {
             state: None,
-            first: None,
             sliced_rows: 0,
             gathered_rows: 0,
         }
@@ -800,35 +828,15 @@ impl CoveredSeek {
 #[async_trait]
 impl OrderedBatches for CoveredSeek {
     async fn next_batch(&mut self) -> Result<Option<OwnedBatch>> {
-        if let Some(first) = self.first.take() {
-            return Ok(Some(first));
-        }
         let Some(state) = &mut self.state else {
             return Ok(None);
         };
         let capacity = BATCH_ROWS.min(state.remaining);
         let mut rows = Vec::with_capacity(capacity);
         while rows.len() < capacity {
-            let Some(head) = state.scan.next().await? else {
+            let Some(head) = state.postings.next().await? else {
                 break;
             };
-            if !state
-                .predicates
-                .iter()
-                .all(|predicate| predicate.matches(head.tuple()))
-            {
-                continue;
-            }
-            if let Some(slot) = state.distinct_slot {
-                if state
-                    .last
-                    .as_ref()
-                    .is_some_and(|last| last.tuple().cell(slot) == head.tuple().cell(slot))
-                {
-                    continue;
-                }
-                state.last = Some(head.clone());
-            }
             if state.skip != 0 {
                 state.skip -= 1;
                 continue;
@@ -837,14 +845,14 @@ impl OrderedBatches for CoveredSeek {
         }
         let batch = if rows.is_empty() {
             None
-        } else if state.scan.tree.shares_result_buffers()
-            && let Some(slice) = state.projection.slice(&state.scan.tree.memory, &rows)?
-        {
-            self.sliced_rows += rows.len() as u64;
-            Some(slice)
         } else {
-            self.gathered_rows += rows.len() as u64;
-            Some(state.projection.batch(&state.scan.tree.memory, &rows)?)
+            let (batch, shared) = state.projection.batch(&state.postings.scan.tree, &rows)?;
+            if shared {
+                self.sliced_rows += rows.len() as u64;
+            } else {
+                self.gathered_rows += rows.len() as u64;
+            }
+            Some(batch)
         };
         state.remaining -= rows.len();
         let done = rows.len() < capacity || state.remaining == 0;
@@ -962,56 +970,49 @@ impl Covered {
         }))
     }
 
-    fn slice(&self, memory: &Arc<MemoryBudget>, rows: &[Head]) -> Result<Option<OwnedBatch>> {
-        let Some(first) = rows.first() else {
-            return Ok(None);
-        };
-        if self.columns.is_empty()
-            || rows
+    fn batch(&self, tree: &Tree, rows: &[Head]) -> Result<(OwnedBatch, bool)> {
+        let first = &rows[0].hit;
+        let contiguous = tree.shares_result_buffers()
+            && rows
                 .iter()
                 .enumerate()
-                .any(|(offset, row)| !row.hit.follows(&first.hit, offset))
-        {
-            return Ok(None);
-        }
-        let columns = self
-            .columns
-            .iter()
-            .map(|(slot, scalar)| {
-                let (array, start, reservation) = first.hit.plain_column(*slot, rows.len())?;
-                match scalar {
-                    ScalarType::Utf8 if array.as_any().is::<StringArray>() => {
-                        Some((array, start, reservation))
-                    }
-                    ScalarType::Binary if array.as_any().is::<BinaryArray>() => {
-                        Some((array, start, reservation))
-                    }
-                    _ => None,
-                }
-            })
-            .collect::<Option<Vec<_>>>();
-        let Some(columns) = columns else {
-            return Ok(None);
-        };
-        let mut builder = BatchBuilder::new(4096 + columns.len().saturating_mul(256), memory)?;
-        let mut arrays = Vec::with_capacity(columns.len());
-        for (array, start, reservation) in columns {
-            let range = start..start + rows.len();
-            if let Some(array) = array.as_any().downcast_ref::<StringArray>() {
-                arrays.push(slice_bytes(&mut builder, array, range, reservation)?);
-            } else if let Some(array) = array.as_any().downcast_ref::<BinaryArray>() {
-                arrays.push(slice_bytes(&mut builder, array, range, reservation)?);
-            }
-        }
-        let batch =
-            RecordBatch::try_new(self.schema.clone(), arrays).map_err(super::format_error)?;
-        builder.finish(batch).map(Some)
-    }
-
-    fn batch(&self, memory: &Arc<MemoryBudget>, rows: &[Head]) -> Result<OwnedBatch> {
-        let mut builder = BatchBuilder::new(4096 + self.columns.len().saturating_mul(256), memory)?;
+                .all(|(offset, row)| row.hit.follows(first, offset));
+        let mut shared = false;
+        let mut builder =
+            BatchBuilder::new(4096 + self.columns.len().saturating_mul(256), &tree.memory)?;
         let mut arrays = Vec::with_capacity(self.columns.len());
         for (slot, scalar) in &self.columns {
+            if contiguous
+                && let Some((array, start, reservation)) = first.plain_column(*slot, rows.len())
+            {
+                let range = start..start + rows.len();
+                let sliced = match scalar {
+                    ScalarType::Utf8 => array.as_any().downcast_ref::<StringArray>().map(|array| {
+                        slice_bytes(
+                            &mut builder,
+                            array,
+                            range,
+                            tree.retain_result_buffers(reservation),
+                        )
+                    }),
+                    ScalarType::Binary => {
+                        array.as_any().downcast_ref::<BinaryArray>().map(|array| {
+                            slice_bytes(
+                                &mut builder,
+                                array,
+                                range,
+                                tree.retain_result_buffers(reservation),
+                            )
+                        })
+                    }
+                    _ => None,
+                };
+                if let Some(array) = sliced {
+                    arrays.push(array?);
+                    shared = true;
+                    continue;
+                }
+            }
             let cells = || rows.iter().map(|head| head.tuple().cell(*slot));
             let retained = cells()
                 .map(|cell| cell.retained_bytes())
@@ -1027,7 +1028,7 @@ impl Covered {
         let options = arrow_array::RecordBatchOptions::new().with_row_count(Some(rows.len()));
         let batch = RecordBatch::try_new_with_options(Arc::clone(&self.schema), arrays, &options)
             .map_err(super::format_error)?;
-        builder.finish(batch)
+        builder.finish(batch).map(|batch| (batch, shared))
     }
 }
 
@@ -1035,7 +1036,7 @@ fn slice_bytes<T: ByteArrayType<Offset = i32>>(
     builder: &mut BatchBuilder,
     array: &GenericByteArray<T>,
     rows: std::ops::Range<usize>,
-    reservation: &Arc<MemoryReservation>,
+    owner: Arc<dyn Send + Sync>,
 ) -> Result<ArrayRef> {
     // Expose only the selected byte window, including at the Arrow C data boundary.
     let offsets = &array.value_offsets()[rows.start..=rows.end];
@@ -1045,9 +1046,9 @@ fn slice_bytes<T: ByteArrayType<Offset = i32>>(
         .saturating_add(offsets.len().saturating_mul(16))
         .saturating_add(1024);
     builder.column(bound, || {
-        let values = retain_buffer(
+        let values = retain_buffer_with_owner(
             &array.values().slice_with_length(base as usize, length),
-            reservation,
+            owner,
         );
         let offsets = OffsetBuffer::new(
             offsets
@@ -1133,26 +1134,6 @@ fn covered_array<'a>(
     })
 }
 
-async fn filter_payload(
-    request: &ScanRequest<'_>,
-    residuals: &[Expr],
-    pending: &mut Vec<Iid>,
-    output: &mut Vec<Iid>,
-) -> Result<()> {
-    if pending.is_empty() {
-        return Ok(());
-    }
-    let matching: BTreeSet<_> = request
-        .verifier
-        .visible_columns(pending.iter().copied().collect(), &[], residuals)
-        .await?
-        .into_iter()
-        .map(|(iid, _)| iid)
-        .collect();
-    output.extend(pending.drain(..).filter(|iid| matching.contains(iid)));
-    Ok(())
-}
-
 #[derive(Clone)]
 struct Head {
     hit: Hit,
@@ -1196,11 +1177,15 @@ impl PartialOrd for Head {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rtdb_columnar::MemoryBudget;
 
     #[test]
     fn contiguous_values_share_only_the_selected_byte_window() {
         let memory = MemoryBudget::new(1 << 20);
         let reservation = memory.reserve(64 * 1024).unwrap();
+        let permit = Arc::new(());
+        let live = Arc::downgrade(&permit);
+        let custody = Arc::new((reservation.clone(), permit));
         let source = StringArray::from(vec![
             Some("before"),
             Some("alpha"),
@@ -1210,7 +1195,7 @@ mod tests {
         ]);
         let start = source.values().as_ptr().wrapping_add("before".len());
         let mut builder = BatchBuilder::new(4096, &memory).unwrap();
-        let result = slice_bytes(&mut builder, &source, 1..4, &reservation).unwrap();
+        let result = slice_bytes(&mut builder, &source, 1..4, custody).unwrap();
         let result_values = result.as_any().downcast_ref::<StringArray>().unwrap();
         assert_eq!(result_values.values().as_slice(), b"alphaomega");
         assert_eq!(result_values.values().as_ptr(), start);
@@ -1221,7 +1206,9 @@ mod tests {
         drop(reservation);
         drop(builder);
         assert_eq!(memory.used_bytes(), 64 * 1024);
+        assert!(live.upgrade().is_some());
         drop(result);
         assert_eq!(memory.used_bytes(), 0);
+        assert!(live.upgrade().is_none());
     }
 }

@@ -2592,6 +2592,12 @@ async fn ordered_index_gathers_projected_table_columns_at_the_original_basis() {
         vec![Value::Null, Value::I64(4)],
     ]);
     assert!(observer.take().is_empty(), "the index selected IIDs before reading table payload");
+    let query = "SELECT payload, _id FROM orders FOR SYSTEM_TIME AS OF ? WHERE customer = 'a'
+                 AND payload <> 'second' ORDER BY priority, _id LIMIT 1 OFFSET 1";
+    let at = Value::Timestamp { value: past.0, unit: rtdb_types::TimeUnit::Microsecond, timezone: Some("UTC".into()) };
+    assert_eq!(rows(session.query_sql(query, vec![at]).await.unwrap()).await,
+        [vec![Value::Utf8("third".into()), Value::I64(1)]]);
+    assert!(observer.take().is_empty(), "the index feeds the columnar residual filter");
     stop(&node, driver).await;
 }
 

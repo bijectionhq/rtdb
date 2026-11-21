@@ -257,7 +257,7 @@ impl PreparedQuery {
                     Arc::clone(&operators), execution.clone(), (0..operators.schema().len()).collect(),
                 ).await?
             {
-                return Ok(QueryInput::Columns(batches));
+                return Ok(QueryInput::Ordered(batches));
             }
             match batching {
                 Batching::Pages if analysis.is_none() => crate::operators::build_pages(operators, execution).await.map(QueryInput::Pages),
@@ -276,7 +276,7 @@ impl PreparedQuery {
                         context.check_cancelled()?;
                     }
                 }
-                QueryInput::Columns(mut input) => {
+                QueryInput::Columns(mut input) | QueryInput::Ordered(mut input) => {
                     while owner.run_until_cancelled(cancellation.run_until_cancelled(input.next_batch())).await.flatten().ok_or_else(cancelled)??.is_some() {
                         context.check_cancelled()?;
                     }
@@ -303,7 +303,17 @@ fn reserve_plan(relation: &Relation, settings: &rtdb_plan::QuerySettings, memory
     memory.reserve(bytes)
 }
 
-enum QueryInput { Rows(BoxCursor), Pages(crate::pages::BoxPageCursor), Columns(crate::columnar::BoxBatchCursor) }
+enum QueryInput {
+    Rows(BoxCursor),
+    Pages(crate::pages::BoxPageCursor),
+    Columns(crate::columnar::BoxBatchCursor),
+    Ordered(crate::columnar::BoxBatchCursor),
+}
+
+tokio::task_local! { static ENCODING_ORDERED_BATCH: (); }
+
+/// An ordered scan can borrow its hosted page buffers during synchronous wire encoding.
+pub fn encoding_ordered_batch() -> bool { ENCODING_ORDERED_BATCH.try_with(|_| ()).is_ok() }
 #[derive(Clone, Copy)]
 enum Batching { Rows, Pages, Columns }
 
@@ -329,6 +339,17 @@ impl QueryCursor {
     /// The advertised result fields remain available through `schema`.
     pub fn runtime_schema(&self) -> &Schema { self.runtime_schema.schema() }
     pub fn cancel(&mut self) { self.context.cancellation.cancel(); self.finish_trace(); self.sample = None; }
+    /// Encodes one batch before returning to the transport. The encoder must
+    /// return detached wire data and must not retain the borrowed Arrow buffers.
+    pub async fn encode_next_batch<T>(&mut self, encode: impl FnOnce(&OwnedBatch) -> T) -> Result<Option<T>> {
+        if matches!(self.input, Some(QueryInput::Ordered(_))) {
+            return ENCODING_ORDERED_BATCH.scope((), async {
+                self.next_batch().await.map(|batch| batch.as_ref().map(encode))
+            }).await;
+        }
+        self.next_batch().await.map(|batch| batch.as_ref().map(encode))
+    }
+
     pub async fn next_batch(&mut self) -> Result<Option<OwnedBatch>> {
         if let Err(error) = self.context.check_cancelled() { self.input = None; self.record_error(); return Err(error); }
         let token = self.context.cancellation.clone();
@@ -363,7 +384,7 @@ impl QueryCursor {
     async fn pull_batch(&mut self) -> Result<Option<OwnedBatch>> {
         let Some(input) = &mut self.input else { return Ok(None); };
         let page = match input {
-            QueryInput::Columns(input) => loop {
+            QueryInput::Columns(input) | QueryInput::Ordered(input) => loop {
                 let Some(batch) = input.next_batch().await? else { return Ok(None); };
                 if batch.len != 0 { return column_batch(self.runtime_schema.schema(), &self.context.memory, batch).map(Some); }
             },

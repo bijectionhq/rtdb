@@ -29,9 +29,11 @@ entity Checkpoint {
 -- A read or maintenance cycle owns index page buffers for its own lifetime.
 -- A point read merges bucket prefixes in key order.
 -- A covered point read streams typed batches of the requested columns from those postings after applying every predicate.
--- Queries requiring table payload fetch it at the same basis and gather columns in index order by batch and row offset.
--- A contiguous forward run of plain text or binary cells may share its value bytes if no erase permit governs the page.
--- Covered results governed by an erase permit use independent result buffers.
+-- A payload seek applies remaining predicates to batches resolved at the captured basis, then gathers the qualifying batch and row offsets in index order.
+-- Filtering and output use the same resolved payload batches.
+-- A contiguous forward run of plain text or binary cells may share its selected value bytes.
+-- Hosted shared buffers retain the page permit through synchronous wire encoding and drop before transport waits.
+-- Hosted APIs returning Arrow arrays to callers use independent result buffers.
 -- An ordered distinct page filters eligible rows before counting each distinct key once.
 -- An erasure removes the IID's old membership from every affected root and makes unreachable pages collectible.
 -- Replay discovers captured erase cuts before it writes pages, and projects each IID from its latest erase onward.

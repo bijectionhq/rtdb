@@ -238,6 +238,9 @@ impl NativeSession {
                 allocation.reserve(name.len())?;
                 Ok(ControlResult::Execute { name: name.clone(), arguments, reservation, allocation })
             }
+            ControlStatement::CopyOut { .. } => Err(Anomaly::unsupported(
+                "xtdb/copy-out-frontend", "COPY TO STDOUT uses the PgWire protocol",
+            )),
             ControlStatement::CopyIn { table, format } => {
                 allocation.reserve(table.iter().try_fold(256usize, |bytes, identifier| size(bytes, size(identifier.text.len(), 128)?))?)?;
                 Ok(ControlResult::CopyIn { table: table.clone(), format: *format, allocation })

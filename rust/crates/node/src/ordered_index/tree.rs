@@ -416,7 +416,14 @@ impl Tree {
     }
 
     pub fn shares_result_buffers(&self) -> bool {
-        self.permit.is_none()
+        self.permit.is_none() || rtdb_query::encoding_ordered_batch()
+    }
+
+    pub fn retain_result_buffers(&self, reservation: &Arc<MemoryReservation>) -> Arc<dyn Send + Sync> {
+        match &self.permit {
+            Some(permit) => Arc::new((reservation.clone(), permit.clone())),
+            None => reservation.clone(),
+        }
     }
 
     pub fn page_scope(&self) -> IndexPageScope<'_> {
