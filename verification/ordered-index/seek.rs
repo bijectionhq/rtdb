@@ -34,7 +34,7 @@ pub fn given_boundary(length: usize, boundary: usize) -> (out: usize)
 
 pub proof fn reversed_slots_do_not_repeat(length: usize, a: usize, b: usize)
     requires a < b < length,
-    ensures length as int - 1 - b as int < length as int - 1 - a as int,
+    ensures (length as int - 1 - b as int) < (length as int - 1 - a as int),
 {}
 
 fn main() {}

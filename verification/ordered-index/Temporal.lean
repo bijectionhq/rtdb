@@ -72,12 +72,20 @@ theorem seekSpan_append (validAt : Int) (left right : List (Span K)) :
     · simp [seekSpan, h]
     · simp [seekSpan, h, ih, Option.orElse]
 
+private theorem selectFragments {A : Type} (left right cut old : Prop)
+    [Decidable left] [Decidable right] [Decidable cut] [Decidable old] (key : A)
+    (covers : (left ∨ right) ↔ old ∧ ¬cut) :
+    (if left then some key else if right then some key else none) =
+      (if cut then none else if old then some key else none) := by
+  by_cases hl : left <;> by_cases hr : right <;> by_cases hc : cut <;> by_cases ho : old <;>
+    simp_all
+
 theorem subtract_hits (cut : Interval) (span : Span K) (validAt : Int) :
     seekSpan validAt (subtract cut span) =
       if cut.contains validAt then none else seekSpan validAt [span] := by
-  unfold subtract
-  simp only [seekSpan, Interval.contains]
-  split <;> split <;> try split <;> try split <;> try rfl <;> exfalso <;> omega
+  apply selectFragments
+  simp only [Interval.contains, Int.lt_min, Int.max_le]
+  omega
 
 theorem retract_hits (cut : Interval) (before : List (Span K)) (validAt : Int) :
     seekSpan validAt (retract cut before) =
@@ -88,7 +96,7 @@ theorem retract_hits (cut : Interval) (before : List (Span K)) (validAt : Int) :
     by_cases h : cut.contains validAt
     · simp [retract, List.flatMap_cons, seekSpan_append, subtract_hits, h,
         show seekSpan validAt (List.flatMap (subtract cut) rest) = none by simpa [retract, h] using ih]
-    · rw [retract, List.flatMap_cons, seekSpan_append, subtract_hits, if_neg h]
+    · rw [retract, List.flatMap_cons, seekSpan_append, subtract_hits, ite_eq_right h]
       have hrest : seekSpan validAt (List.flatMap (subtract cut) rest) = seekSpan validAt rest := by
         simpa [retract, h] using ih
       rw [hrest]
@@ -134,20 +142,31 @@ theorem erase_cuts_history (front tail : List (Event K)) (committed : Nat)
   simp [tableAt, List.foldl_append, step]
 
 
-def hitsSpans (validAt : Int) (spans : List (Span K)) : Nat :=
-  (spans.filter (fun span => decide (span.valid.contains validAt))).length
+def hitsSpans (validAt : Int) : List (Span K) → Nat
+  | [] => 0
+  | span :: rest =>
+    (if span.valid.contains validAt then 1 else 0) + hitsSpans validAt rest
 
 theorem hitsSpans_append (validAt : Int) (left right : List (Span K)) :
     hitsSpans validAt (left ++ right) = hitsSpans validAt left + hitsSpans validAt right := by
-  simp [hitsSpans, List.filter_append]
+  induction left with
+  | nil => simp [hitsSpans]
+  | cons span rest ih => simp [hitsSpans, ih, Nat.add_assoc]
+
+private theorem countFragments (left right cut old : Prop)
+    [Decidable left] [Decidable right] [Decidable cut] [Decidable old]
+    (covers : (left ∨ right) ↔ old ∧ ¬cut) (disjoint : ¬(left ∧ right)) :
+    (if left then 1 else 0) + (if right then 1 else 0) =
+      (if cut then 0 else if old then 1 else 0) := by
+  by_cases hl : left <;> by_cases hr : right <;> by_cases hc : cut <;> by_cases ho : old <;>
+    simp_all
 
 theorem subtract_count (cut : Interval) (span : Span K) (validAt : Int)
     (ordered : cut.lower ≤ cut.upper) :
     hitsSpans validAt (subtract cut span) =
       if cut.contains validAt then 0 else hitsSpans validAt [span] := by
-  simp only [subtract, hitsSpans, List.filter_cons, decide_eq_true_eq,
-    Interval.contains, List.filter_nil]
-  split <;> split <;> try split <;> try split <;> try rfl <;> omega
+  simp only [subtract, hitsSpans, Nat.add_zero]
+  apply countFragments <;> simp only [Interval.contains, Int.lt_min, Int.max_le] <;> omega
 
 theorem retract_count (cut : Interval) (spans : List (Span K)) (validAt : Int)
     (ordered : cut.lower ≤ cut.upper) :
@@ -179,7 +198,7 @@ theorem edits_keep_one (systemAt : Nat) (validAt : Int) (spans : List (Span K))
       by_cases hs : system ≤ systemAt
       · change hitsSpans validAt (if system ≤ systemAt then
             [⟨valid, key⟩] ++ retract valid spans else spans) ≤ 1
-        rw [if_pos hs, hitsSpans_append, retract_count valid spans validAt ordered]
+        rw [ite_eq_left hs, hitsSpans_append, retract_count valid spans validAt ordered]
         by_cases hv : valid.contains validAt <;> simp [hitsSpans, hv] at unique ⊢ <;>
           assumption <;> done
       · simpa [edits, hs] using unique

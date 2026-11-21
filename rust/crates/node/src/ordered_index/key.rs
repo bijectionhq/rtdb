@@ -1,7 +1,7 @@
 use rtdb_types::{Interval, LogicalType, ScalarType, Timestamp, Value};
 use serde::{Deserialize, Serialize};
 
-use super::domain::{offset, upper_bound};
+use super::domain::{bucket_start, offset, upper_bound};
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub(super) enum Atom {
@@ -105,7 +105,7 @@ impl Bucket {
         let point = offset(time.0);
         (0..=64).map(move |level| Self {
             level,
-            start: (point >> level << level) as u64,
+            start: bucket_start(point, level),
         })
     }
 

@@ -24,8 +24,8 @@ theorem mergeStreams_perm (order : Order A) (streams : List (List A)) :
     exact (List.merge_perm_append order.le).trans (List.Perm.append (.refl stream) ih)
 
 theorem mergeStreams_sorted (order : Order A) (streams : List (List A))
-    (sorted : ∀ stream ∈ streams, stream.Pairwise order.le) :
-    (mergeStreams order streams).Pairwise order.le := by
+    (sorted : ∀ stream ∈ streams, stream.Pairwise (fun a b => order.le a b = true)) :
+    (mergeStreams order streams).Pairwise (fun a b => order.le a b = true) := by
   induction streams with
   | nil => exact .nil
   | cons stream rest ih =>
@@ -34,9 +34,9 @@ theorem mergeStreams_sorted (order : Order A) (streams : List (List A))
 
 /-- A complete tie-break makes the list with these contents and this order unique. -/
 theorem mergeStreams_refines_sort (order : Order A) (streams : List (List A))
-    (sorted : ∀ stream ∈ streams, stream.Pairwise order.le) :
+    (sorted : ∀ stream ∈ streams, stream.Pairwise (fun a b => order.le a b = true)) :
     mergeStreams order streams = streams.flatten.mergeSort order.le := by
-  apply List.Perm.eq_of_pairwise (le := order.le)
+  apply List.Perm.eq_of_pairwise (le := fun a b => order.le a b = true)
   · exact fun a b _ _ => order.antisymm a b
   · exact mergeStreams_sorted order streams sorted
   · exact List.pairwise_mergeSort order.trans order.total streams.flatten
@@ -62,7 +62,7 @@ theorem firstMatches_eq_take (keep : A → Bool) (limit : Nat) (rows : List A) :
     | succ n => cases h : keep row <;> simp [firstMatches, h, ih]
 
 theorem ordered_page (order : Order A) (streams : List (List A))
-    (sorted : ∀ stream ∈ streams, stream.Pairwise order.le)
+    (sorted : ∀ stream ∈ streams, stream.Pairwise (fun a b => order.le a b = true))
     (keep : A → Bool) (limit : Nat) :
     firstMatches keep limit (mergeStreams order streams) =
       ((streams.flatten.mergeSort order.le).filter keep).take limit := by
