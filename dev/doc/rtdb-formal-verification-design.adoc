@@ -1053,9 +1053,11 @@ Relate the native postings iterator and persisted sidecar to the modeled complet
 |Recovery and Azure
 |Five native recovery tests and the root-first control, and two loopback Azure tests and their two source controls, cover selected production failure paths.
 A durable-node test verifies current and system-history SQL results before, during and after tiered publication, then recovers the partial checkpoint and replays the last notice.
+Production discovery now advances to a newer advertised root when collection removes the selected root or a table block during startup.
+Native runs verify both cases using the block collector, and Verus checks the strict progress decision.
 TLC and Apalache check two overlapping checkpoint generations, one recovery reference, protected objects, and its required log suffix under delayed collection.
 Lean checks the pending historical promotion reconstructed from a checkpoint. Verus checks the exact four-member guard in the tiered catalog.
-|Generalize object closure, recovery selection and log retirement to production compaction and collection.
+|Generalize recovery from decoded metadata to the full trie dependency closure and a usable log suffix while compaction and collection are active.
 Establish supported remote configurations and any eventual retry and staging cleanup guarantees.
 
 |Retention

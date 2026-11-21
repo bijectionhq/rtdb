@@ -630,7 +630,10 @@ config {
 -- Those files remain required until follower adoption.
 -- A failed historical check or older candidate preparation discards the remaining older confirmations.
 -- The writer continues recovery of the selected checkpoint.
--- A follower that reopens loads the latest persisted checkpoint and applies its retained suffix.
+-- A follower that reopens loads the latest reported checkpoint and applies its retained suffix.
+-- If the root or a table block is missing while loading that checkpoint, recovery lists again.
+-- A newer reported block replaces the failed candidate. An unchanged, older or empty listing
+-- propagates the missing-object error. Every other read or decode error returns without refreshing.
 --
 -- A new leader can always reconstruct correct state from the last persisted block and the follower's in-memory state, which has been built by processing replica messages.
 --

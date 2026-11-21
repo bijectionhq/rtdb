@@ -595,3 +595,31 @@ The input manifest SHA-256 is `44e515d3760196453298918fe79047f5812db67d997f6d09e
 The same revision passed all 139 library and integration tests in the native index, maintenance and replication packages.
 Run those suites from the checkout root with
 `BIJECTION_LOCAL_EXECUTION=owner-authorized cargo test --manifest-path rust/Cargo.toml --locked -p rtdb-index -p rtdb-maintenance -p rtdb-replication --lib --tests`.
+
+== Checkpoint discovery during block collection
+
+Two durable-node tests failed on `94d8dfa9e` with a missing-object result even though a newer complete checkpoint existed.
+One test holds a listing result while the writer advances and the block collector retires the listed root.
+The other holds a table-block read after recovery has read the root.
+The tests use the production block collector, local object store and replica log.
+On the repaired implementation, both startup paths select the newer checkpoint and serve the two expected SQL rows.
+
+The Rust loader refreshes discovery after a missing root or table block.
+It retries only on a strictly greater reported block index.
+An unchanged, older or empty listing returns the missing-object error.
+The existing native test still fails closed on a malformed catalog or a missing table block with no replacement, before opening the log.
+
+Link:../verus/checkpoint_discovery/proof.rs[The Verus area] checks four obligations, including strict decrease of the distance to the largest representable index.
+The single and joint controls reject retrying the same index and refusing a newer one.
+Link:../lean/CheckpointDiscovery.lean[Lean] proves that attempts form a strictly increasing sequence for any list of observations and that its retry count is bounded by the remaining index range.
+The same-index mutation fails both general theorems and a concrete witness.
+
+TLC explored all 519 states of link:../tla/RecoveryDiscovery.tla[the metadata-discovery model].
+The model checks that failure caused by missing metadata refreshes discovery, only a newer index can be attempted, and neither an empty refresh nor invalid content can become a successful replacement.
+Five mutations break named invariants and a reachability case recovers after a refresh.
+Apalache checked the same safety conditions through ten transitions and independently found the fail-fast counterexample.
+
+The model bounds the number of published generations to three and allows stale or incomplete listings.
+This recovery path advances once a refreshed listing reveals a newer checkpoint and the needed metadata can be read.
+The production change covers checkpoint metadata discovery.
+It leaves full trie closure, replica-log suffix protection, and storage-provider availability as separate proof obligations.

@@ -321,6 +321,19 @@ def verify_catalog_recovery(args, scratch):
     verify_lean_model(args, scratch, path, "catalog-recovery", controls, 4)
 
 
+def verify_checkpoint_discovery(args, scratch):
+    path = Path("verification/lean/CheckpointDiscovery.lean")
+    controls = {
+        "allow-same": (
+            "if attempted < index", "if attempted ≤ index",
+            ["attempts_strictly_increase", "attempts_strictly_increase", "attempts_strictly_increase",
+             "retries_fit_in_the_remaining_indices", "retries_fit_in_the_remaining_indices",
+             "same_index_cannot_be_repeated"],
+        ),
+    }
+    verify_lean_model(args, scratch, path, "checkpoint-discovery", controls, 3)
+
+
 def verify_reader_retention(args, scratch):
     path = Path("verification/lean/ReaderRetention.lean")
     controls = {
@@ -406,6 +419,7 @@ def verify_lean(args, scratch):
             verify_search_windows(args, scratch)
             verify_partitioned_top_k(args, scratch)
             verify_catalog_recovery(args, scratch)
+            verify_checkpoint_discovery(args, scratch)
             independence = Path("verification/lean/Minimality.lean")
             clone_file(independence, directory)
             checked = run_case(
@@ -543,6 +557,16 @@ TLA_CASES = (
      ("INVARIANTS TypeOK AdvertisedRootsReadable RecoveryReadSetAvailable RecoverySuffixAvailable UsableHead",
       "INVARIANT NoReplacementOpenAfterCollection"),
      "NoReplacementOpenAfterCollection"),
+    ("RecoveryDiscovery", "checkpoint-discovery", None, None),
+    ("RecoveryDiscovery", "checkpoint-discovery-fail-fast", ('Mutation = "none"', 'Mutation = "fail_fast"'), "MissingFailureHasRefreshed"),
+    ("RecoveryDiscovery", "checkpoint-discovery-allow-same", ('Mutation = "none"', 'Mutation = "allow_same"'), "AttemptsAdvance"),
+    ("RecoveryDiscovery", "checkpoint-discovery-ignore-newer", ('Mutation = "none"', 'Mutation = "ignore_newer"'), "UsesNewerListing"),
+    ("RecoveryDiscovery", "checkpoint-discovery-empty-after-missing", ('Mutation = "none"', 'Mutation = "empty_after_missing"'), "NoEmptyAfterMissing"),
+    ("RecoveryDiscovery", "checkpoint-discovery-retry-corrupt", ('Mutation = "none"', 'Mutation = "retry_corrupt"'), "CorruptionIsTerminal"),
+    ("RecoveryDiscovery", "checkpoint-discovery-reachable",
+     ("INVARIANTS TypeOK AttemptsAdvance NoEmptyAfterMissing UsesNewerListing CorruptionIsTerminal MissingFailureHasRefreshed",
+      "INVARIANT NeverRecoveredAfterRefresh"),
+     "NeverRecoveredAfterRefresh"),
 )
 
 
@@ -627,6 +651,12 @@ def verify_apalache(args, scratch):
         ('Mutation = "none"', 'Mutation = "trim_for_head_only"'), "missing recovery suffix",
     )
 
+    check_apalache(args, scratch, "RecoveryDiscovery", "checkpoint-discovery", "DiscoverySafe", 10)
+    check_apalache(
+        args, scratch, "RecoveryDiscovery", "checkpoint-discovery-fail-fast", "MissingFailureHasRefreshed", 10,
+        ('Mutation = "none"', 'Mutation = "fail_fast"'), "missing checkpoint without refreshed discovery",
+    )
+
 
 def verify_maude(args, scratch):
     model = clone_file(Path("verification/maude/Resolution.maude"), scratch)
@@ -703,9 +733,16 @@ def verify_checkpoint_replay(args, source):
     baseline = run_case(
         [*command, "--test", "recovery"], source / "rust", args.evidence, "rust-checkpoint-baseline", env,
     )
-    if baseline.returncode or not all(
-        f"{count} passed; 0 failed" in baseline.stdout for count in (1, 4)
-    ) or "recovery_preserves_queries_through_tiered_publication ... ok" not in baseline.stdout:
+    overlapping_collection = (
+        "recovery_advances_after_collection_of_the_listed_checkpoint",
+        "recovery_advances_after_collection_of_a_selected_table_block",
+    )
+    if (
+        baseline.returncode
+        or not all(f"{count} passed; 0 failed" in baseline.stdout for count in (1, 6))
+        or not all(f"{test} ... ok" in baseline.stdout for test in
+                   ("recovery_preserves_queries_through_tiered_publication", *overlapping_collection))
+    ):
         raise ValueError("checkpoint replay baseline failed")
     blocks = source / "rust/crates/replication/src/blocks.rs"
     original = blocks.read_bytes()
@@ -730,7 +767,24 @@ def verify_checkpoint_replay(args, source):
     ):
         raise ValueError("root-first mutation did not fail at checkpoint startup")
     blocks.write_bytes(original)
-    print("rust-checkpoint-replay: five tests passed, root-first production mutation rejected")
+
+    missing = 'Err(error) if error.code == "rtdb.storage/missing-object" => {'
+    try:
+        replace_once(blocks, missing, missing.replace("if ", "if false && ", 1))
+        collected = run_case(
+            [*command, "recovery_advances_after_collection"], source / "rust",
+            args.evidence, "rust-checkpoint-no-discovery-refresh", env,
+        )
+        if (
+            collected.returncode != 101
+            or not all(f"{test} ... FAILED" in collected.stdout for test in overlapping_collection)
+            or collected.stdout.count("recovery could not use the newer checkpoint: rtdb.storage/missing-object") != 2
+            or "0 passed; 2 failed" not in collected.stdout
+        ):
+            raise ValueError("disabling refresh did not fail both collection replay cases")
+    finally:
+        blocks.write_bytes(original)
+    print("rust-checkpoint-replay: seven tests passed, root-first and fail-fast mutations rejected")
 
 
 def verify_catalog_replay(args, source):

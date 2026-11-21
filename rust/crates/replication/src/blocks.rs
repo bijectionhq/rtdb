@@ -115,12 +115,8 @@ impl BlockStore {
         Ok(Arc::new(Self { store, cache, memory, file_size_target }))
     }
     pub async fn recover(&self, config: TrieConfig, source_floor: SourcePosition, now: Timestamp) -> Result<RecoveredPartition> {
-        let directory = ObjectKey::new("blocks")?;
-        let latest = self.store.list(Some(&directory)).await?.into_iter()
-            .filter_map(|entry| block_index_from_key(entry.key.as_str()).ok().map(|index| (index, entry.key)))
-            .max_by_key(|(index, _)| *index);
-        let (block, table_blocks) = match latest {
-            Some((index, _)) => { let loaded = self.load(index).await?; (Some(loaded.0), loaded.1) }
+        let (block, table_blocks) = match self.load_latest_checkpoint().await? {
+            Some((catalog, tables)) => (Some(catalog), tables),
             None => (None, BTreeMap::new()),
         };
         let tables = TableCatalog::load(block.clone(), &table_blocks)?.with_system_tables()?;
@@ -134,6 +130,30 @@ impl BlockStore {
         let fence = match &block { Some(block) => TermFence::from_catalog(block)?, None => TermFence::from_boundary(rtdb_types::Term(0), None)? };
         Ok(RecoveredPartition { partition, block, progress, fence, table_blocks }.with_source_floor(source_floor))
     }
+    async fn latest_checkpoint(&self, directory: &ObjectKey) -> Result<Option<BlockIndex>> {
+        Ok(self.store.list(Some(directory)).await?.into_iter()
+            .filter_map(|entry| block_index_from_key(entry.key.as_str()).ok())
+            .max())
+    }
+
+    async fn load_latest_checkpoint(&self) -> Result<Option<(BlockCatalog, BTreeMap<rtdb_types::TableRef, TableBlock>)>> {
+        let directory = ObjectKey::new("blocks")?;
+        let Some(mut index) = self.latest_checkpoint(&directory).await? else { return Ok(None); };
+        loop {
+            match self.load(index).await {
+                Err(error) if error.code == "rtdb.storage/missing-object" => {
+                    // Collection can overtake a listing or a read of one of the table blocks.
+                    let listed = self.latest_checkpoint(&directory).await?.map(|index| index.0);
+                    let Some(next) = crate::checkpoint_discovery::newer_checkpoint(index.0, listed) else {
+                        return Err(error);
+                    };
+                    index = BlockIndex(next);
+                }
+                result => return result.map(Some),
+            }
+        }
+    }
+
     async fn load_catalog(&self, index: BlockIndex) -> Result<BlockCatalog> {
         let lease = self.cache.get(&ObjectKey::new(block_key(index)?)?).await?;
         let reservation = self.reserve_decode(lease.as_slice().len())?;

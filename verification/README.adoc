@@ -96,7 +96,8 @@ The pinned Verus release replaces the earlier proposed source build of 31e44e6.
 The optional Rust boundary check compiles an unchanged copy and two mutated copies of the replica driver imported from the current Git commit.
 The optional native replay reads the same seeded 4,096-observation trace that the Lean evaluator checks, exercising both temporal resolvers and the unbounded visibility rectangles.
 It also compiles the unmodified and unpadded text scorer to replay the binary64 boundary witness.
-The same option runs the local checkpoint interruption, partial compaction and manifest-recovery tests and replays a root-first mutation of the checkpoint writer.
+The same option runs the local checkpoint interruption, partial compaction, overlapping collection and manifest-recovery tests.
+The production controls publish the root too early and stop on a missing checkpoint without refreshing discovery.
 It also tests catalog promotion after a binary checkpoint round trip.
 The production controls omit the pending historical index and let a tiered replacement publish without its fourth bucket.
 It also exercises the Azure adapter against a loopback provider and separately mutates premature copy acknowledgement and cleanup on an unknown outcome.
@@ -110,6 +111,7 @@ It also exercises the Azure adapter against a loopback provider and separately m
   `lean/SearchWindows.lean` checks coverage of conjunctive matches by complete window summaries, the extrema of each summary, and the assignment to half-open window ranges.
   `lean/PartitionedTopK.lean` proves that conservative partition pruning preserves the ordered global prefix and the SQL page for any offset and fetch.
   `lean/CatalogRecovery.lean` checks that rebuilding the pending historical-trie index gives the same promotion as scanning the durable catalog.
+  `lean/CheckpointDiscovery.lean` proves that any chain of metadata retries advances strictly and fits within the remaining index range.
 * `tla/Kernel.tla` explores a bounded protocol with one durable log and two terms and requests, plus the pinned and copied read variants.
   It assumes durable append is atomic and does not implement a consensus provider.
 * `tla/Resolution.tla` compares serialized, validated and blind optimistic resolution under the same increment program.
@@ -121,6 +123,8 @@ It also exercises the Azure adapter against a loopback provider and separately m
   It compares an acknowledged pending copy with a copy whose completion is checked.
 * `tla/RecoveryCollection.tla` checks overlapping checkpoint generations, an active recovery reference, the required log suffix, and delayed object deletion.
   TLC explores its finite state space and Apalache independently checks the same safety conditions up to ten transitions.
+* `tla/RecoveryDiscovery.tla` models a separate fallback for missing checkpoint metadata during startup.
+  The fallback requires a newer checkpoint in a refreshed listing and has no effect on replica-log retention.
 * `tla/LeaseAdmission.tla` compares validated expiring leases and coordinated pins against age-only collection and stale-follower admission.
 * `tla/ReaderIO.tla` separates admission and in-flight I/O, with controls for clock error, expiry, overrun, release, and authority change.
   `lean/ReaderRetention.lean` proves strict lease timing and preservation of an abstract counted pin, with matching expiry and close controls.
@@ -136,6 +140,7 @@ It also exercises the Azure adapter against a loopback provider and separately m
   The ceiling area checks the in-place vector transitions and window clipping while the interval area checks per-fragment admission.
   The catalog reclamation area checks the latest-block rule and the last-held-sibling predicate.
   The tiered publication area checks that all four serving siblings for the same block exist before the catalog retires the parent.
+  The checkpoint discovery area checks the production retry decision and its decreasing distance from the maximum index.
   The IID partition area checks the base-four digit computation shared by trie and compaction code.
   The rank cutoff area checks the production decision given the two maximum frontier bounds.
   The search window area checks the native functions that assign postings, set the scan endpoints, and combine frequency and length extrema.
