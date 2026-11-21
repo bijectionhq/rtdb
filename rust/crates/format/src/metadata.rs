@@ -211,9 +211,14 @@ pub struct MetadataBuilder {
 fn page_metadata_reservation(page: &RecordBatch) -> Result<usize> {
     let mut bytes = page.get_array_memory_size().checked_mul(4).and_then(|size| size.checked_add(65_536)).ok_or_else(|| invalid("Page metadata reservation overflow"))?;
     let mut arrays: Vec<_> = page.columns().iter().map(|array| array.to_data()).collect();
-    // Each array node yields one statistics entry and at most one Bloom bitmap; cells are read in place, not cloned per row.
+    // Byte-backed arrays also use a buffer for sorting the positions that build a Bloom bitmap.
     while let Some(array) = arrays.pop() {
-        bytes = bytes.checked_add(array.len().checked_mul(32).ok_or_else(|| invalid("Page metadata reservation overflow"))?)
+        let sort_bytes = match array.data_type() {
+            arrow_schema::DataType::Utf8 | arrow_schema::DataType::Binary | arrow_schema::DataType::FixedSizeBinary(_) =>
+                crate::bloom::BLOOM_K as usize * std::mem::size_of::<u32>(),
+            _ => 0,
+        };
+        bytes = bytes.checked_add(array.len().checked_mul(32 + sort_bytes).ok_or_else(|| invalid("Page metadata reservation overflow"))?)
             .and_then(|size| size.checked_add(4096)).ok_or_else(|| invalid("Page metadata reservation overflow"))?;
         arrays.extend(array.child_data().iter().cloned());
     }

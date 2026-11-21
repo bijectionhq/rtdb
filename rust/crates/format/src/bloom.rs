@@ -8,6 +8,7 @@ use rtdb_types::{Anomaly, LogicalType, Result, ScalarType, Value};
 
 pub const BLOOM_BITS: u32 = 22;
 pub const BLOOM_K: u32 = 5;
+const RADIX_DIGIT_BITS: u32 = BLOOM_BITS.div_ceil(2);
 
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct BloomFilter {
@@ -81,7 +82,15 @@ impl BloomFilter {
             };
             positions.extend(hashes(first, second));
         }
-        self.insert_positions(&mut positions);
+        if positions.len() >= 1024 {
+            let mut scratch = vec![0; positions.len()];
+            radix_pass(&positions, &mut scratch, 0);
+            radix_pass(&scratch, &mut positions, RADIX_DIGIT_BITS);
+        } else {
+            positions.sort_unstable();
+        }
+        positions.dedup();
+        self.insert_sorted_positions(positions);
         true
     }
 
@@ -149,6 +158,26 @@ fn cell_hashes(field: &Field, array: &dyn Array, row: usize) -> Result<Option<(i
 
 fn hash_bytes(bytes: &[u8]) -> (i32, i32) {
     (rtdb_columnar::xxhash32(bytes, 0) as i32, rtdb_columnar::murmur3_32(bytes, 0) as i32)
+}
+
+fn radix_pass(source: &[u32], target: &mut [u32], shift: u32) {
+    const BUCKETS: usize = 1 << RADIX_DIGIT_BITS;
+    let bucket = |position: u32| (position >> shift) as usize & (BUCKETS - 1);
+    let mut offsets = [0usize; BUCKETS];
+    for &position in source {
+        offsets[bucket(position)] += 1;
+    }
+    let mut start = 0;
+    for count in &mut offsets {
+        let next = start + *count;
+        *count = start;
+        start = next;
+    }
+    for &position in source {
+        let offset = &mut offsets[bucket(position)];
+        target[*offset] = position;
+        *offset += 1;
+    }
 }
 
 fn byte_hashes(value: &Value) -> Result<(i32, i32)> {
@@ -223,6 +252,24 @@ mod bulk_tests {
         let expected = rtdb_columnar::read_value(&field, &array, 0).unwrap_err();
         let actual = BloomFilter::default().insert_cell(&field, &array, 0).unwrap_err();
         assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn selected_byte_cells_produce_the_same_bloom_bytes_as_individual_inserts() {
+        let field = Field::new("sku", arrow_schema::DataType::Utf8, true);
+        for len in [128, 1024] {
+            let array = arrow_array::StringArray::from_iter(
+                (0..len).map(|row| (row % 7 != 0).then(|| format!("sku-{}", row % 500))),
+            );
+            let rows = (0..len).filter(|row| row % 4 != 0);
+            let mut expected = BloomFilter::default();
+            for row in rows.clone() {
+                expected.insert_cell(&field, &array, row).unwrap();
+            }
+            let mut bulk = BloomFilter::default();
+            assert!(bulk.insert_byte_cells(&array, rows));
+            assert_eq!(bulk.to_bytes().unwrap(), expected.to_bytes().unwrap());
+        }
     }
 
     #[test]
