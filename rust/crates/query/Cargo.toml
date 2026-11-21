@@ -31,6 +31,9 @@ tempfile.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true
 
+[target.'cfg(any(target_os = "linux", target_os = "macos"))'.dependencies]
+libc = "0.2"
+
 [dev-dependencies]
 rtdb-metrics.workspace = true
 

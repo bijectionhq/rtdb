@@ -1752,6 +1752,7 @@ pub async fn confirm_suspicions(directory: &dyn Directory, failures: &mut BTreeM
 
 pub async fn run_controller(directory: Arc<dyn Directory>, options: ControllerOptions, cancellation: CancellationToken) {
     let mut failures = BTreeMap::new();
+    let mut samples = crate::load::LoadSamples::default();
     loop {
         tokio::select! {
             _ = cancellation.cancelled() => return,
@@ -1760,7 +1761,7 @@ pub async fn run_controller(directory: Arc<dyn Directory>, options: ControllerOp
                 if options.suspicion_probes > 0 { let _ = confirm_suspicions(directory.as_ref(), &mut failures, &options).await; }
                 if options.rebalance_moves > 0 {
                     if options.load_limits.enabled() {
-                        let _ = crate::load::rebalance(directory.as_ref(), options.rebalance_moves, options.load_limits, &options.control).await;
+                        let _ = crate::load::rebalance(directory.as_ref(), options.rebalance_moves, options.load_limits, &options.control, &mut samples).await;
                     } else {
                         let _ = rebalance(directory.as_ref(), options.rebalance_moves, &options.control).await;
                     }

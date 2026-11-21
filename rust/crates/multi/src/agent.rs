@@ -225,14 +225,16 @@ impl NodeAgent {
     pub fn member(&self) -> MemberId { self.lease.id() }
     pub fn held(&self) -> BTreeMap<String, u64> { self.holdings.lock().iter().map(|(name, holding)| (name.clone(), holding.epoch)).collect() }
 
-    fn holding_loads(&self) -> Vec<crate::load::HoldingLoad> {
+    fn holding_loads(&self, measure_query_cpu: bool) -> Vec<crate::load::HoldingLoad> {
         self.holdings.lock().iter().filter_map(|(name, holding)| {
             let database = holding.database.upgrade()?;
             Some(crate::load::HoldingLoad {
                 name: name.clone(),
                 deployment: holding.id.clone(),
                 epoch: holding.epoch,
-                load: crate::load::LoadVector { tail_bytes: database.live_batch_bytes(), cache_bytes: database.cache_bytes() },
+                load: crate::load::LoadVector { tail_bytes: database.live_batch_bytes(), cache_bytes: database.cache_bytes(), ..Default::default() },
+                submitted_bytes: Some(database.submitted_bytes()),
+                query_cpu_nanos: if measure_query_cpu { database.observe_query_cpu() } else { None },
             })
         }).collect()
     }
@@ -1106,7 +1108,7 @@ impl Handler for NodeAgent {
             Request::ParkForMove { name, epoch, ticket } => self.park_holding(&name, Some((epoch, &ticket))).await,
             Request::Touch { name } => { self.touch(&name); Ok(Response::Done) }
             Request::Ping => Ok(Response::Done),
-            Request::HoldingLoads => Ok(Response::HoldingLoads { holdings: self.holding_loads() }),
+            Request::HoldingLoads { measure_query_cpu } => Ok(Response::HoldingLoads { holdings: self.holding_loads(measure_query_cpu) }),
             Request::FlightEndpoint => self.flight_endpoint.clone().map(|address| Response::FlightEndpoint { address })
                 .ok_or_else(|| Anomaly::incorrect("rtdb.multi/no-flight-endpoint", "The holder does not have a Flight SQL endpoint")),
             Request::Subscribe { name } => self.subscribe(&name).await,

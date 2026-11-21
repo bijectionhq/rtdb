@@ -298,6 +298,7 @@ impl Node {
             if !Arc::ptr_eq(previous, &current) { return Err(lost_placement(database)); }
         }
 
+        let query_cpu = held.as_ref().and_then(|database| database.query_cpu_tracker());
         let mut snapshots = BTreeMap::new();
         let classic = if placed { BTreeMap::new() } else { self.catalog.open_databases() };
         for (name, database) in held.into_iter().map(|held| (database.to_owned(), held)).chain(classic) {
@@ -316,6 +317,7 @@ impl Node {
             .with_fragmenter(self.scan_fragmenter.clone());
         QueryContext::with_owner(catalog, Arc::clone(&self.factory.memory), basis.current_time, basis.timezone.clone(), self.factory.options.query.clone(), cancellation, &self.cancellation)?
             .with_read_options(&basis.snapshot, basis.snapshot_time, self.query_instant())
+            .map(|context| context.with_query_cpu(query_cpu))
     }
 
     /// Reads a fragment another node's scan dispatched here, once this node's copy of its database has applied the fragment's basis.
@@ -370,8 +372,10 @@ impl Node {
         let sql_options = rtdb_sql::PrepareOptions { generate_series_end_exclusive: self.factory.options.query.generate_series_end_exclusive, ..Default::default() };
         let source = prepare_submission_with_sql_options(operations, options, database.name(), &self.factory.memory, &sql_options)?;
         let payload = source.encode()?.into_bytes();
+        let submitted_bytes = payload.len() as u64;
         let position = cancellation.run_until_cancelled(database.replication.submit_source_encoded(payload, self.now())).await.ok_or_else(cancelled)??;
         if let Some(admission) = &admission {
+            database.record_submission(submitted_bytes);
             let mut latest = admission.lock();
             *latest = (*latest).max(Some(position));
         }

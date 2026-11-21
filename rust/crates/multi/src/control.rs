@@ -45,7 +45,7 @@ pub enum Request {
     /// Answers Done while the agent is serving: the controller's liveness probe.
     Ping,
     FlightEndpoint,
-    HoldingLoads,
+    HoldingLoads { #[serde(default)] measure_query_cpu: bool },
     /// A client is using the deployment through a gateway.
     Touch { name: String },
     /// Serve the deployment's reads from a log-fed replica on this node.

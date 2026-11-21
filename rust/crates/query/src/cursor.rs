@@ -174,7 +174,16 @@ impl PreparedQuery {
         self.open(context, parameters, None, true).await
     }
 
-    async fn open(&self, context: Arc<QueryContext>, mut parameters: Vec<Value>, text: Option<&str>, preserve_pages: bool) -> Result<QueryCursor> {
+    async fn open(&self, context: Arc<QueryContext>, parameters: Vec<Value>, text: Option<&str>, preserve_pages: bool) -> Result<QueryCursor> {
+        let counter = context.query_cpu.clone();
+        let mut plan = std::pin::pin!(self.open_plan(context, parameters, text, preserve_pages));
+        match counter {
+            Some(counter) => crate::query_cpu::measure(counter, plan.as_mut()).await,
+            None => plan.await,
+        }
+    }
+
+    async fn open_plan(&self, context: Arc<QueryContext>, mut parameters: Vec<Value>, text: Option<&str>, preserve_pages: bool) -> Result<QueryCursor> {
         if parameters.len() < self.required_parameter_count { return Err(invalid("missing-parameter", "Query has fewer parameters than its prepared plan")); }
         for dependency in self.relation.dependencies() {
             let Some(current) = context.catalog.table(&dependency.name)? else {
@@ -272,7 +281,14 @@ impl QueryCursor {
         let owner = self.context.owner_cancellation.clone();
         if let Some(trace) = &mut self.trace { trace.start(); }
         let started = std::time::Instant::now();
-        let result = owner.run_until_cancelled(token.run_until_cancelled(self.pull_batch())).await.flatten().ok_or_else(cancelled);
+        let counter = self.context.query_cpu.clone();
+        let result = {
+            let mut pull = std::pin::pin!(self.pull_batch());
+            match counter {
+                Some(counter) => owner.run_until_cancelled(token.run_until_cancelled(crate::query_cpu::measure(counter, pull.as_mut()))).await,
+                None => owner.run_until_cancelled(token.run_until_cancelled(pull)).await,
+            }
+        }.flatten().ok_or_else(cancelled);
         match result {
             Ok(Ok(batch)) => { if let Some(trace) = &mut self.trace { trace.completed(started.elapsed(), batch.as_ref().map(|batch| batch.batch().num_rows())); } if batch.is_none() { self.input = None; } Ok(batch) }
             Ok(Err(error)) | Err(error) => { self.input = None; self.record_error(); Err(error) }

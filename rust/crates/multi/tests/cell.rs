@@ -214,21 +214,34 @@ async fn resource_rebalancing_moves_the_largest_tail_toward_an_eligible_node() {
         let client = connect_eventually(&cell, name).await;
         client.simple_query(&format!("INSERT INTO docs (_id, payload) VALUES (1, '{}')", "x".repeat(bytes))).await.unwrap();
     }
-    let snapshot = rtdb_multi::control::call(&cell.node(0).control_address.to_string(), &Request::HoldingLoads, Duration::from_secs(2), &control()).await.unwrap();
+    let snapshot = rtdb_multi::control::call(&cell.node(0).control_address.to_string(), &Request::HoldingLoads { measure_query_cpu: true }, Duration::from_secs(2), &control()).await.unwrap();
     let Response::HoldingLoads { holdings } = snapshot else { panic!("expected the writer's active loads") };
     assert_eq!(holdings.len(), 2);
+    let reader = connect_eventually(&cell, "heavy").await;
+    assert_eq!(values(&reader, "SELECT CHAR_LENGTH(payload) FROM docs").await, ["8192"]);
+    drop(reader);
+    let profile = rtdb_multi::control::call(&cell.node(0).control_address.to_string(), &Request::HoldingLoads { measure_query_cpu: true }, Duration::from_secs(2), &control()).await.unwrap();
+    let Response::HoldingLoads { holdings: after_probe } = profile else { panic!("expected the writer's CPU sample") };
+    if cfg!(any(target_os = "linux", target_os = "macos")) {
+        let selected = |name: &str| after_probe.iter().find(|holding| holding.name == name).unwrap().query_cpu_nanos;
+        assert!(selected("heavy").unwrap() > 0);
+        assert_eq!(selected("light"), Some(0));
+    }
+    let submitted: BTreeMap<_, _> = holdings.iter().map(|holding| (holding.name.as_str(), holding.submitted_bytes.unwrap())).collect();
+    assert!(submitted["heavy"] > 8192 && submitted["heavy"] > submitted["light"] && submitted["light"] > 0);
     let by_name: BTreeMap<_, _> = holdings.into_iter().map(|holding| (holding.name, holding.load.tail_bytes)).collect();
     assert!(by_name["heavy"] > by_name["light"] && by_name["light"] > 0);
     let limit = std::num::NonZeroU64::new(by_name["heavy"] + by_name["light"] / 2).unwrap();
-    let limits = rtdb_multi::load::LoadLimits { tail_bytes: Some(limit), cache_bytes: None };
+    let limits = rtdb_multi::load::LoadLimits { tail_bytes: Some(limit), ..Default::default() };
+    let mut samples = rtdb_multi::load::LoadSamples::default();
 
-    assert_eq!(rtdb_multi::load::rebalance(directory, 4, limits, &control()).await.unwrap(), 1);
+    assert_eq!(rtdb_multi::load::rebalance(directory, 4, limits, &control(), &mut samples).await.unwrap(), 1);
     assert_eq!(cell.holder("heavy").await, Some(1));
     assert_eq!(cell.holder("light").await, Some(0));
     let client = connect_eventually(&cell, "heavy").await;
     assert_eq!(values(&client, "SELECT CHAR_LENGTH(payload) FROM docs").await, ["8192"]);
     drop(client);
-    assert_eq!(rtdb_multi::load::rebalance(directory, 4, limits, &control()).await.unwrap(), 0);
+    assert_eq!(rtdb_multi::load::rebalance(directory, 4, limits, &control(), &mut samples).await.unwrap(), 0);
     cell.stop().await;
 }
 
