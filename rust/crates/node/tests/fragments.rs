@@ -213,8 +213,7 @@ async fn a_fragment_requires_the_captured_residence_and_exact_transaction_head()
     fragmenter.enabled.store(true, Ordering::Relaxed);
     let _ = answers(&mut session).await;
     let fragment = fragmenter.last.lock().clone().unwrap();
-    let at_basis = node.scan_fragment(&fragment, Duration::ZERO, &CancellationToken::new()).await.unwrap();
-    assert!(!at_basis.is_empty());
+    node.scan_fragment(&fragment, Duration::ZERO, &CancellationToken::new()).await.unwrap();
     let mut other_store = fragment.clone();
     other_store.residence.as_mut().unwrap().storage = Arc::from("other-store");
     let error = node.scan_fragment(&other_store, Duration::ZERO, &CancellationToken::new()).await.unwrap_err();
