@@ -60,28 +60,7 @@ fn optional_build_refused(error: &Anomaly) -> bool {
 #[async_trait]
 impl ScanAccelerator for SearchAccelerator {
     async fn candidate_iids(&self, request: &ScanRequest<'_>) -> Result<Option<BTreeSet<Iid>>> {
-        let scan = request.scan;
-        let mut conjuncts = Vec::new();
-        for predicate in &scan.predicates { match_conjuncts(scan, predicate, &mut conjuncts); }
-        let mut chosen = None;
-        for (column, query) in conjuncts {
-            let Some(Value::Utf8(text)) = request.constants.constant(query).await? else { continue };
-            if let Some(definition) = self.definition(request, column).await? { chosen = Some((column, Query::parse(&text), definition)); break; }
-        }
-        let Some((column, query, definition)) = chosen else { return Ok(None) };
-        if query.terms().is_empty() { return Ok(Some(BTreeSet::new())); }
-        if request.corpora.scores_requested() {
-            self.register_corpora(request, column, &definition).await?;
-        }
-        if let Some(top_k) = &scan.top_k {
-            let ranked = scan.columns.iter().find(|field| field.id == top_k.column).is_some_and(|field| field.name == column);
-            if ranked { if let Some(candidates) = self.top_k(request, top_k, column, &query, &definition).await? { return Ok(Some(candidates)); } }
-        }
-        let TrieFiles::Complete(Found { files, skipped }) = self.trie_files(request, &definition).await? else { return Ok(None) };
-        let cutter = Cutter::new(&files, &skipped, request, &self.runtime);
-        let Some(mut candidates) = file_candidates(&cutter, column, &query, self.max_candidates)? else { return Ok(None) };
-        candidates.extend(self.live_candidates(request, column, &query)?);
-        Ok((candidates.len() <= self.max_candidates).then_some(candidates))
+        self.narrow(request, Narrowing::default(), &mut NarrowingWork::default()).await
     }
 
     async fn match_answers(&self, request: &ScanRequest<'_>, column: &str, query: &str) -> Result<Option<MatchAnswers>> {
@@ -100,6 +79,81 @@ impl ScanAccelerator for SearchAccelerator {
             answers.insert(&trie.data, Arc::new(set.member(trie.member)?));
         }
         Ok((!answers.is_empty()).then_some(answers))
+    }
+}
+
+#[derive(Clone, Copy, Default)]
+struct Narrowing<'a> {
+    is_oracle: bool,
+    skip_retry: bool,
+    estimate_first: bool,
+    scope: Option<&'a BTreeSet<Iid>>,
+}
+
+#[derive(Default)]
+struct NarrowingWork {
+    tried_ranking: bool,
+    ranked: bool,
+    decline: Option<&'static str>,
+    plain_decline: Option<&'static str>,
+    score_evaluations: usize,
+    postings_visited: usize,
+    verifier_rows: usize,
+    verification_rounds: usize,
+    plain_events: usize,
+    estimated_postings: Option<usize>,
+}
+
+impl NarrowingWork {
+    fn budget_exceeded(&self) -> bool {
+        matches!(self.decline, Some("candidate-budget" | "verification-budget"))
+    }
+}
+
+impl SearchAccelerator {
+    async fn narrow(&self, request: &ScanRequest<'_>, options: Narrowing<'_>, work: &mut NarrowingWork) -> Result<Option<BTreeSet<Iid>>> {
+        let scan = request.scan;
+        let mut conjuncts = Vec::new();
+        for predicate in &scan.predicates { match_conjuncts(scan, predicate, &mut conjuncts); }
+        let mut chosen = None;
+        for (column, query) in conjuncts {
+            let Some(Value::Utf8(text)) = request.constants.constant(query).await? else { continue };
+            if let Some(definition) = self.definition(request, column).await? { chosen = Some((column, Query::parse(&text), definition)); break; }
+        }
+        let Some((column, query, definition)) = chosen else { return Ok(None) };
+        if query.terms().is_empty() { return Ok(Some(BTreeSet::new())); }
+        if request.corpora.scores_requested() {
+            self.register_corpora(request, column, &definition).await?;
+        }
+        if options.is_oracle { return Ok(None); }
+        if let Some(top_k) = &scan.top_k {
+            let ranked = scan.columns.iter().find(|field| field.id == top_k.column).is_some_and(|field| field.name == column);
+            if ranked {
+                work.tried_ranking = true;
+                if let Some(candidates) = self.top_k(request, top_k, column, &query, &definition, options, work).await? {
+                    work.ranked = true;
+                    return Ok(Some(candidates));
+                }
+                if work.decline == Some("posting-estimate") || (options.skip_retry && work.budget_exceeded()) {
+                    return Ok(None);
+                }
+            }
+        }
+        if let Some(scope) = options.scope {
+            return Ok(Some(scope.clone()));
+        }
+        let TrieFiles::Complete(Found { files, skipped }) = self.trie_files(request, &definition).await? else {
+            work.plain_decline = Some("coverage");
+            return Ok(None);
+        };
+        let cutter = Cutter::new(&files, &skipped, request, &self.runtime);
+        let Some(mut candidates) = file_candidates(&cutter, column, &query, self.max_candidates, &mut work.plain_events)? else {
+            work.plain_decline = Some("candidate-budget");
+            return Ok(None);
+        };
+        candidates.extend(self.live_candidates(request, column, &query)?);
+        if candidates.len() > self.max_candidates { work.plain_decline = Some("candidate-budget"); return Ok(None); }
+        Ok(Some(candidates))
     }
 }
 
@@ -306,10 +360,12 @@ fn by_file(files: &[TrieFile]) -> impl Iterator<Item = FileMembers<'_>> {
     grouped.into_values()
 }
 
-fn file_candidates(cutter: &Cutter<'_>, column: &str, query: &Query, max_candidates: usize) -> Result<Option<BTreeSet<Iid>>> {
+fn file_candidates(cutter: &Cutter<'_>, column: &str, query: &Query, max_candidates: usize, events: &mut usize) -> Result<Option<BTreeSet<Iid>>> {
     let mut candidates = BTreeSet::new();
     for selected in by_file(cutter.files) {
-        for doc in selected.file.matches(column, query, cutter.bounds)? {
+        let docs = selected.file.matches(column, query, cutter.bounds)?;
+        if cfg!(feature = "experiments") { *events = events.saturating_add(docs.len()); }
+        for doc in docs {
             let Some(&own) = selected.members.get(&doc.member) else { continue };
             if !matches!(cutter.judge(own, doc)?, Judged::Hidden) { candidates.insert(Iid(doc.iid)); }
         }
@@ -347,12 +403,14 @@ impl Candidates<'_> {
         crate::rank_cutoff::can_stop(kth.to_bits(), pending, unread)
     }
     /// The next IID, best first, with its best event's score and whether that event is exactly visible.
-    fn next(&mut self) -> Result<Option<(f64, Iid, bool)>> {
+    fn next(&mut self, scope: Option<&BTreeSet<Iid>>, work: &mut NarrowingWork) -> Result<Option<(f64, Iid, bool)>> {
         loop {
             self.drop_seen();
             match (self.pending.peek().map(|top| top.0), self.best_file()) {
                 (pending, Some((index, bound))) if pending.is_none_or(|score| bound > score) => {
-                    for (doc, score) in self.files[index].1.expand()? {
+                    let scored = self.files[index].1.expand_in(scope, &mut work.postings_visited)?;
+                    if cfg!(feature = "experiments") { work.score_evaluations += scored.len(); }
+                    for (doc, score) in scored {
                         let Some(&own) = self.files[index].0.get(&doc.member) else { continue };
                         match self.cutter.judge(own, doc)? { Judged::Hidden => {}, Judged::Visible { exact } => self.push(Iid(doc.iid), score, exact) }
                     }
@@ -371,16 +429,34 @@ impl SearchAccelerator {
     /// The IIDs that can hold one of the `limit` best-scoring visible rows, or `None` to narrow as an unranked MATCH does.
     /// Every matching event is scored exactly, and an IID's best event bounds every row it can resolve to.
     /// IIDs are verified best bound first, in batches, until `limit` verified rows outscore every bound still unverified; a search file's events are scored only as far as that takes.
-    async fn top_k(&self, request: &ScanRequest<'_>, top_k: &rtdb_plan::ScanTopK, column: &str, matching: &Query, definition: &SearchDefinition) -> Result<Option<BTreeSet<Iid>>> {
-        let Some(Value::Utf8(text)) = request.constants.constant(&top_k.query).await? else { return Ok(None) };
+    async fn top_k(&self, request: &ScanRequest<'_>, top_k: &rtdb_plan::ScanTopK, column: &str, matching: &Query, definition: &SearchDefinition, options: Narrowing<'_>, work: &mut NarrowingWork) -> Result<Option<BTreeSet<Iid>>> {
+        let Some(Value::Utf8(text)) = request.constants.constant(&top_k.query).await? else { work.decline = Some("unsupported-order"); return Ok(None) };
         let limit = match request.constants.constant(&top_k.limit).await.ok().flatten() {
-            Some(Value::I64(limit)) => limit, Some(Value::I32(limit)) => i64::from(limit), Some(Value::I16(limit)) => i64::from(limit), _ => return Ok(None),
+            Some(Value::I64(limit)) => limit, Some(Value::I32(limit)) => i64::from(limit), Some(Value::I16(limit)) => i64::from(limit), _ => { work.decline = Some("unsupported-limit"); return Ok(None); },
         };
-        let Ok(limit) = usize::try_from(limit) else { return Ok(None) };
+        let Ok(limit) = usize::try_from(limit) else { work.decline = Some("unsupported-limit"); return Ok(None) };
         if limit == 0 { return Ok(Some(BTreeSet::new())); }
-        let TrieFiles::Complete(Found { files, skipped }) = self.trie_files(request, definition).await? else { return Ok(None) };
+        let TrieFiles::Complete(Found { files, skipped }) = self.trie_files(request, definition).await? else {
+            work.decline = Some("coverage");
+            return Ok(None);
+        };
+        if options.estimate_first && options.scope.is_none() && request.scan.iids.is_none() && matching.terms().len() == 1 {
+            let term = &matching.terms()[0];
+            let mut estimate = 0usize;
+            for group in by_file(&files) {
+                estimate = estimate.saturating_add(group.file.document_frequency(column, term)? as usize);
+            }
+            for segment in request.snapshot.iter_segments(&request.scan.table.name.table) {
+                estimate = estimate.saturating_add(segment.row_count() as usize);
+            }
+            work.estimated_postings = Some(estimate);
+            if estimate > self.max_candidates {
+                work.decline = Some("posting-estimate");
+                return Ok(None);
+            }
+        }
         let scoring = rtdb_expr::CorpusLookup::scorer(request.corpora, &text);
-        let Some(rank_scorer) = scoring.for_ranking() else { return Ok(None); };
+        let Some(rank_scorer) = scoring.for_ranking() else { work.decline = Some("score-domain"); return Ok(None); };
         let ranked = by_file(&files).map(|selected| {
             Ok((selected.members, selected.file.ranked(column, matching, &rank_scorer, request.bounds)?))
         }).collect::<Result<Vec<_>>>()?;
@@ -392,17 +468,22 @@ impl SearchAccelerator {
         };
         for segment in request.snapshot.iter_segments(&request.scan.table.name.table) {
             for row in self.runtime.live_rows(request.database, segment, column, matching)? {
+                if cfg!(feature = "experiments") { work.postings_visited += 1; }
                 let event = segment.row(row)?.event()?;
+                if options.scope.is_some_and(|scope| !scope.contains(&event.iid)) { continue; }
                 if !may_be_visible(event.valid_time.lower().0, event.valid_time.upper().0, event.system_from.0, Timestamp::MAX.0, request.bounds) { continue; }
                 let StoredOperation::Put(document) = &event.operation else { continue };
                 let Some(Value::Utf8(value)) = document.get(column) else { continue };
                 let tokens = rtdb_text::tokens(value);
-                if matching.matches(&tokens) { candidates.push(event.iid, scoring.bm25(&tokens), false); }
+                if matching.matches(&tokens) {
+                    if cfg!(feature = "experiments") { work.score_evaluations += 1; }
+                    candidates.push(event.iid, scoring.bm25(&tokens), false);
+                }
             }
         }
         let mut verified: Vec<(f64, Iid)> = Vec::new();
         let batch = limit.saturating_mul(2).max(64);
-        let mut rounds = 0;
+
         loop {
             if verified.len() >= limit {
                 verified.sort_by(descending);
@@ -411,17 +492,18 @@ impl SearchAccelerator {
             let mut iids = BTreeSet::new();
             let mut handed = 0;
             while handed < batch {
-                let Some((score, iid, exact)) = candidates.next()? else { break };
+                let Some((score, iid, exact)) = candidates.next(options.scope, work)? else { break };
                 handed += 1;
                 if request.scan.iids.as_ref().is_some_and(|scope| !scope.contains(&iid)) { continue; }
                 // An exactly visible event's row is in the scan's output with its score, so it needs no verifying.
                 if exact && trusted { verified.push((score, iid)); } else { iids.insert(iid); }
             }
-            if candidates.scored > self.max_candidates { return Ok(None); }
+            if candidates.scored > self.max_candidates { work.decline = Some("candidate-budget"); return Ok(None); }
             if handed == 0 { break; }
             if iids.is_empty() { continue; }
-            rounds += 1;
-            if rounds > 16 { return Ok(None); }
+            if work.verification_rounds == 16 { work.decline = Some("verification-budget"); return Ok(None); }
+            work.verification_rounds += 1;
+            if cfg!(feature = "experiments") { work.verifier_rows += iids.len(); }
             for (iid, value) in request.verifier.visible(iids, top_k.column).await? {
                 let Value::Utf8(value) = value else { continue };
                 verified.push((scoring.bm25(&rtdb_text::tokens(&value)), iid));
@@ -477,7 +559,7 @@ mod tests {
         let query = Query::parse("overdue");
         let files = [trie(1)];
         let cutter = Cutter { files: &files, skipped: &[], segments: Vec::new(), runtime: &runtime, database: "xtdb", bounds };
-        let iids = file_candidates(&cutter, "body", &query, 1).unwrap().unwrap();
+        let iids = file_candidates(&cutter, "body", &query, 1, &mut 0).unwrap().unwrap();
         assert_eq!(iids, BTreeSet::from([Iid([64; 16])]));
         assert_eq!(by_file(&[trie(0), trie(1)]).count(), 1);
 
@@ -487,8 +569,8 @@ mod tests {
             files: vec![(BTreeMap::from([(1, 0)]), ranked)], cutter,
             pending: Default::default(), seen: BTreeSet::new(), scored: 0,
         };
-        assert_eq!(candidates.next().unwrap().map(|(_, iid, exact)| (iid, exact)), Some((Iid([64; 16]), true)));
-        assert!(candidates.next().unwrap().is_none());
+        assert_eq!(candidates.next(None, &mut NarrowingWork::default()).unwrap().map(|(_, iid, exact)| (iid, exact)), Some((Iid([64; 16]), true)));
+        assert!(candidates.next(None, &mut NarrowingWork::default()).unwrap().is_none());
 
         let terms = Query::parse("overdue invoice");
         let corpus = |member| runtime.snapshot_corpus("xtdb", vec![trie(member)], &[], "body", 0)
@@ -542,7 +624,7 @@ mod tests {
                 files: &files, skipped: &[], segments: Vec::new(), runtime: &runtime,
                 database: "xtdb", bounds: at(5, system),
             };
-            let candidates = file_candidates(&cutter, "body", &query, 1).unwrap().unwrap();
+            let candidates = file_candidates(&cutter, "body", &query, 1, &mut 0).unwrap().unwrap();
             assert_eq!(candidates.contains(&Iid(iid)), expected, "at system time {system}");
         }
     }
