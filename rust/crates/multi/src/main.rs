@@ -19,6 +19,7 @@ Usage: rtdb-multi initialize-directory --state PATH\n\
        rtdb-multi node --directory DIR --storage-root PATH --keys PATH --cache PATH [--config FILE] [--control ADDR] [--advertise-host HOST] [--zone ZONE] [--park-after SECONDS] [--max-active N] [--max-tail-rows N] [--isolation | --compaction-worker] [--no-local-compaction] [--memory-limit BYTES] [--cell-secret FILE]\n\
        rtdb-multi gateway --directory DIR --listen ADDR [--config FILE] [--cell NAME --cell-map ADDR] [--cell-secret FILE]\n\
                           [--install-listen ADDR --install-token-file FILE --install-org ORG --install-replicas N]\n\
+                          [--disposal-token-file FILE]\n\
        rtdb-multi cell-map --listen ADDR\n\
        rtdb-multi move-cell --cell-map ADDR --name NAME --from CELL --from-directory DIR --from-storage-root PATH --from-keys PATH --to CELL --to-directory DIR --to-storage-root PATH --to-keys PATH\n\
        rtdb-multi controller --directory DIR [--rebalance MOVES] [--cell-secret FILE]\n\
@@ -155,6 +156,7 @@ async fn run(arguments: Vec<String>) -> Result<()> {
                 let tls = tls.ok_or_else(|| usage("The installation listener requires a TLS configuration".into()))?;
                 let installer = rtdb_multi::install::Installer::from_file(
                     std::path::Path::new(arguments.required("install-token-file")?),
+                    arguments.optional("disposal-token-file").map(std::path::Path::new),
                     arguments.required("install-org")?.to_owned(),
                     arguments.number("install-replicas", 3usize)?,
                 )?;

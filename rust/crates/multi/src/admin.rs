@@ -32,11 +32,7 @@ pub async fn install_deployment(
     org: &str,
     replicas: usize,
 ) -> Result<DeploymentRecord> {
-    let safe_name = |part: &str| {
-        !part.is_empty() && part.len() <= 128 && part != "." && part != ".."
-            && part.bytes().all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
-    };
-    if id.is_nil() || !safe_name(name) || !safe_name(org) || replicas == 0 {
+    if id.is_nil() || !valid_installation_name(name) || !valid_installation_name(org) || replicas == 0 {
         return Err(Anomaly::incorrect("rtdb.multi/install-identity", "Invalid deployment installation identity or ensemble size"));
     }
     let id = id.to_string();
@@ -65,6 +61,11 @@ pub async fn install_deployment(
             Ok(None) | Err(_) => Err(error),
         },
     }
+}
+
+fn valid_installation_name(part: &str) -> bool {
+    !part.is_empty() && part.len() <= 128 && part != "." && part != ".."
+        && part.bytes().all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
 }
 
 async fn choose_ensemble(directory: &dyn Directory, record: &DeploymentRecord, replicas: usize) -> Result<Vec<MemberId>> {
@@ -432,6 +433,33 @@ pub async fn begin_disposal(directory: &dyn Directory, id: &str) -> Result<Deplo
     }).await
 }
 
+/// The hosting catalog can accept retirement before provisioning reaches the directory.
+/// Reserve that exact identity as retiring so a late install cannot open it.
+pub(crate) async fn begin_hosted_disposal(directory: &dyn Directory, id: uuid::Uuid, name: &str, org: &str) -> Result<DeploymentRecord> {
+    if id.is_nil() || !valid_installation_name(name) || !valid_installation_name(org) {
+        return Err(Anomaly::incorrect("rtdb.multi/disposal-identity", "Invalid hosted retirement scope"));
+    }
+    let id = id.to_string();
+    let installed = match directory.deployment_by_name(name).await? {
+        Some(installed) => installed,
+        None => {
+            let mut record = DeploymentRecord::new(name, org, Vec::new(), now_ms());
+            record.id = id.clone();
+            record.lineage = id.clone();
+            record.lifecycle = Lifecycle::Deleting;
+            record.epoch = 1;
+            match directory.create_deployment(record).await {
+                Ok(accepted) => return Ok(accepted),
+                Err(error) => directory.deployment_by_name(name).await?.ok_or(error)?,
+            }
+        }
+    };
+    if installed.id != id || installed.parent.is_some() {
+        return Err(Anomaly::incorrect("rtdb.multi/disposal-identity", "The requested name belongs to another installation"));
+    }
+    begin_disposal(directory, &id).await
+}
+
 /// Fences and removes an installation's serving storage. The tombstone retains its receipt.
 pub async fn delete_deployment(directory: &dyn Directory, storage: &CellStorage, keys: &dyn KeyService, id: &str, maximum_message_bytes: usize) -> Result<DisposalReceipt> {
     begin_disposal(directory, id).await?;
@@ -452,7 +480,9 @@ pub async fn finish_disposal(directory: &dyn Directory, storage: &CellStorage, k
     stream.servers.extend(fenced.replica_journals.iter().cloned());
     stream.servers.sort();
     stream.servers.dedup();
-    rtdb_logkeeper::retire(&stream, fenced.epoch).await?;
+    if !stream.servers.is_empty() {
+        rtdb_logkeeper::retire(&stream, fenced.epoch).await?;
+    }
     let journals_retired_at_ms = now_ms();
     keys.destroy(&fenced.id).await?;
     let key_withdrawn_at_ms = now_ms();
