@@ -5,7 +5,7 @@ use std::cmp::Ordering;
 use crate::leaf_merge_step::compare_row_keys;
 
 #[cfg(verus_keep_ghost)]
-use crate::laws::{consistent_comparison, ordered_by, row_rank};
+use crate::laws::{ordered_by, row_rank};
 #[cfg(verus_keep_ghost)]
 use crate::leaf_merge_step::{
     declined_row, iid_rank, iid_rank_exposes_the_row_key, ordered, record_iid_error, widen_iid_error,
@@ -15,13 +15,67 @@ use crate::leaf_merge_step::{
 use vstd::prelude::*;
 #[cfg(verus_keep_ghost)]
 use vstd::std_specs::iter::{ExactSizeIteratorSpec, IteratorSpec};
+#[cfg(verus_keep_ghost)]
+use vstd::std_specs::cmp::{OrdSpec, OrdSpecImpl, PartialOrdSpecImpl, PartialEqSpecImpl};
 
-type KeyedRow = ([u8; 16], u32);
+#[derive(Clone, Copy)]
+pub struct KeyedRow(pub [u8; 16], pub u32);
+
+impl PartialEq for KeyedRow {
+    fn eq(&self, other: &Self) -> bool {
+        matches!(compare_keyed_rows(self, other), Ordering::Equal)
+    }
+}
+
+impl Eq for KeyedRow {}
+
+impl PartialOrd for KeyedRow {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for KeyedRow {
+    fn cmp(&self, other: &Self) -> Ordering {
+        compare_keyed_rows(self, other)
+    }
+}
 
 #[cfg(verus_keep_ghost)]
 verus! {
-spec fn key_rank(row: KeyedRow) -> int {
+pub open spec fn key_rank(row: KeyedRow) -> int {
     row_rank(row.0@, row.1)
+}
+
+pub open spec fn rank_cmp(left: KeyedRow, right: KeyedRow) -> Ordering {
+    if key_rank(left) < key_rank(right) {
+        Ordering::Less
+    } else if key_rank(left) == key_rank(right) {
+        Ordering::Equal
+    } else {
+        Ordering::Greater
+    }
+}
+
+impl PartialEqSpecImpl for KeyedRow {
+    open spec fn obeys_eq_spec() -> bool { true }
+    open spec fn eq_spec(&self, other: &Self) -> bool {
+        key_rank(*self) == key_rank(*other)
+    }
+}
+
+impl PartialOrdSpecImpl for KeyedRow {
+    open spec fn obeys_partial_cmp_spec() -> bool { true }
+    open spec fn partial_cmp_spec(&self, other: &Self) -> Option<Ordering> {
+        Some(rank_cmp(*self, *other))
+    }
+}
+
+impl OrdSpecImpl for KeyedRow {
+    open spec fn obeys_cmp_spec() -> bool { true }
+    open spec fn cmp_spec(&self, other: &Self) -> Ordering {
+        rank_cmp(*self, *other)
+    }
 }
 
 broadcast use {vstd::seq_lib::group_seq_properties, vstd::multiset::group_multiset_properties};
@@ -154,14 +208,27 @@ fn compare_keyed_rows(left: &KeyedRow, right: &KeyedRow) -> Ordering {
         final(rows)@.to_multiset() == old(rows)@.to_multiset(),
 ))]
 fn order_keyed_run(rows: &mut [KeyedRow]) {
-    let compare = compare_keyed_rows;
     #[cfg(verus_keep_ghost)]
     proof! {
-        assert(consistent_comparison(compare, |row: KeyedRow| key_rank(row))) by {
-            reveal(consistent_comparison);
+        use vstd::laws_cmp::*;
+        use vstd::laws_eq::*;
+        assert(obeys_cmp::<KeyedRow>()) by {
+            reveal(obeys_eq_spec_properties);
+            reveal(obeys_partial_cmp_spec_properties);
+            reveal(obeys_cmp_partial_ord);
+            reveal(obeys_cmp_ord);
         }
     }
-    rows.sort_unstable_by(compare);
+    rows.sort_unstable();
+    #[cfg(verus_keep_ghost)]
+    proof! {
+        let run = rows@;
+        assert forall |i: int, j: int| #![trigger run[i], run[j]]
+            0 <= i < j < run.len() implies key_rank(run[i]) <= key_rank(run[j]) by {
+            assert(OrdSpec::cmp_spec(&run[i], &run[j]) != Ordering::Greater);
+        }
+    }
+
 }
 
 #[cfg_attr(verus_keep_ghost, verus_spec(row => ensures row == key.1))]
@@ -228,7 +295,7 @@ where
             assert(read_iid.ensures((row,), observed));
         }
         let key = match observed {
-            Ok(bytes) => (bytes, row),
+            Ok(bytes) => KeyedRow(bytes, row),
             Err(error) => {
                 #[cfg(verus_keep_ghost)]
                 proof! {
