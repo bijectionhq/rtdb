@@ -44,6 +44,7 @@ pub struct DatabaseStorage {
     /// How recovery finds the latest block: listing, unless the provider knows where to start.
     pub blocks: rtdb_replication::BlockDiscovery,
     pub checkpoint_metadata: Option<Arc<dyn Send + Sync>>,
+    pub fragment_storage: Option<Arc<str>>,
     pub storage_epoch: StorageEpoch,
     pub storage_version: StorageVersion,
     /// The caller drains this region if later database assembly fails.
@@ -62,6 +63,8 @@ pub struct OpenedRecoveryStore {
     pub blocks: rtdb_replication::BlockDiscovery,
     /// Held through disk-cache and provider I/O for checkpoint discovery and load.
     pub checkpoint_metadata: Option<Arc<dyn Send + Sync>>,
+    /// Identity of the actual opened storage for delegated scans.
+    pub fragment_storage: Option<Arc<str>>,
 }
 
 #[async_trait]
@@ -73,7 +76,7 @@ pub trait RemoteStorageFactory: Send + Sync {
     async fn open_for_recovery(&self, configuration: &Any, storage_root: &ObjectKey, io: Arc<IoRegion>) -> Result<OpenedRecoveryStore> {
         let store = self.open(configuration, storage_root, io).await?;
         let blocks = self.block_discovery(configuration).await?;
-        Ok(OpenedRecoveryStore { store, blocks, checkpoint_metadata: None })
+        Ok(OpenedRecoveryStore { store, blocks, checkpoint_metadata: None, fragment_storage: None })
     }
     /// A remote store normally uses a disk cache. An isolated read-only
     /// factory may opt out to avoid retaining an extra physical copy.
@@ -259,6 +262,7 @@ impl ResourceFactory for NativeResources {
             let root = ObjectKey::new(StorageRoot::new(CURRENT_STORAGE_VERSION, storage_epoch)?.key())?;
             let mut blocks = rtdb_replication::BlockDiscovery::List;
             let mut checkpoint_metadata = None;
+            let mut fragment_storage = None;
             let store: Arc<dyn ObjectStore> = match &configuration.storage {
                 None | Some(database_config::Storage::InMemoryStorage(_)) => Arc::new(MemoryStore::default()),
                 Some(database_config::Storage::LocalStorage(storage)) => Arc::new(LocalStore::open_in(PathBuf::from(storage.path.as_deref().ok_or_else(|| invalid("Local storage has no path"))?).join(root.as_str()), Arc::clone(&io))?),
@@ -269,6 +273,7 @@ impl ResourceFactory for NativeResources {
                     let remote = opened.store;
                     blocks = opened.blocks;
                     checkpoint_metadata = opened.checkpoint_metadata;
+                    fragment_storage = opened.fragment_storage;
                     let storage = if factory.use_disk_cache() {
                         let cache = self.disk_cache.as_ref().ok_or_else(|| invalid("Remote storage requires a disk cache"))?;
                         let identity = factory.cache_identity(configuration)?;
@@ -280,7 +285,7 @@ impl ResourceFactory for NativeResources {
                     factory.wrap_cached(configuration, storage).await?
                 }
             };
-            Ok(DatabaseStorage { store, blocks, checkpoint_metadata, storage_epoch, storage_version: CURRENT_STORAGE_VERSION, io: Arc::clone(&io) })
+            Ok(DatabaseStorage { store, blocks, checkpoint_metadata, fragment_storage, storage_epoch, storage_version: CURRENT_STORAGE_VERSION, io: Arc::clone(&io) })
         }.await;
         if opened.is_err() { io.close_and_wait().await; }
         opened

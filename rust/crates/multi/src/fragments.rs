@@ -31,6 +31,10 @@ impl Default for FragmentOptions {
     }
 }
 
+pub(crate) fn storage_identity(namespace: uuid::Uuid, record: &rtdb_directory::DeploymentRecord) -> Arc<str> {
+    format!("{namespace}/{}", record.storage_prefix()).into()
+}
+
 /// The affinity key a fragment is placed by.
 pub fn fragment_key(storage_identity: &str, table: &TableRef, prefix: &TriePrefix) -> String {
     format!("{storage_identity}/{}.{}/{prefix}", table.schema, table.table)
@@ -45,6 +49,7 @@ pub fn readers(members: &[MemberRecord]) -> Vec<&MemberRecord> {
 /// A node's fragmenter: places each fragment of its sessions' scans on the reader it ranks first on.
 pub struct CellFragmenter {
     directory: Arc<dyn Directory>,
+    object_namespace: uuid::Uuid,
     secret: Option<Arc<crate::capability::CellSecret>>,
     member: OnceLock<MemberId>,
     above_bytes: AtomicU64,
@@ -54,8 +59,8 @@ pub struct CellFragmenter {
 }
 
 impl CellFragmenter {
-    pub fn new(directory: Arc<dyn Directory>, options: &FragmentOptions, cache_bytes: u64, secret: Option<Arc<crate::capability::CellSecret>>) -> Arc<Self> {
-        Arc::new(Self { directory, secret, member: OnceLock::new(), above_bytes: AtomicU64::new(options.above_bytes.unwrap_or(cache_bytes)), depth: options.depth, timeout: options.timeout, failures: AtomicU64::new(0) })
+    pub fn new(directory: Arc<dyn Directory>, object_namespace: uuid::Uuid, options: &FragmentOptions, cache_bytes: u64, secret: Option<Arc<crate::capability::CellSecret>>) -> Arc<Self> {
+        Arc::new(Self { directory, object_namespace, secret, member: OnceLock::new(), above_bytes: AtomicU64::new(options.above_bytes.unwrap_or(cache_bytes)), depth: options.depth, timeout: options.timeout, failures: AtomicU64::new(0) })
     }
 
     /// Names this node once its lease is registered; until then, every fragment is read here.
@@ -71,6 +76,9 @@ impl CellFragmenter {
         let Some(me) = self.member.get() else { return Ok(None) };
         let record = self.directory.deployment_by_name(fragment.database()).await?
             .ok_or_else(|| Anomaly::incorrect("rtdb.multi/unknown-deployment", format!("No deployment is named {}", fragment.database())))?;
+        let namespace = record.storage_namespaces.map_or(self.object_namespace, |storage| storage.objects);
+        let current = rtdb_query::FragmentResidence { storage: storage_identity(namespace, &record), replica_epoch: record.log_epoch };
+        if fragment.residence.as_ref() != Some(&current) { return Ok(None); }
         let members = self.directory.members().await?;
         let readers = readers(&members);
         let key = fragment_key(&record.storage_identity(), fragment.table(), &fragment.prefix);

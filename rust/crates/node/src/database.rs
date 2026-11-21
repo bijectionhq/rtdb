@@ -30,6 +30,7 @@ pub struct Database {
     transaction_admission: RwLock<parking_lot::Mutex<Option<SourcePosition>>>,
     submitted_bytes: AtomicU64,
     query_cpu: Option<Arc<rtdb_query::QueryCpu>>,
+    fragment_residence: Option<rtdb_query::FragmentResidence>,
     compaction: Option<CompactionHandle>,
     artefacts: Vec<ArtefactHandle>,
     ordered_cycle: Option<OrderedIndexCycle>,
@@ -41,6 +42,7 @@ impl Database {
     pub fn name(&self) -> &str { &self.name }
     pub fn configuration(&self) -> &DatabaseConfig { &self.configuration }
     pub fn read_only(&self) -> bool { self.read_only }
+    pub fn fragment_residence(&self) -> Option<&rtdb_query::FragmentResidence> { self.fragment_residence.as_ref() }
     pub fn is_critical(&self) -> bool { self.name == "xtdb" || self.configuration.critical.unwrap_or(false) }
     pub fn startup_replica_target(&self) -> Result<Option<ReplicaPosition>> { self.logs.startup_replica_target() }
     pub fn latest_submitted_position(&self) -> Result<SourcePosition> { self.logs.latest_source_position() }
@@ -253,7 +255,10 @@ impl DatabaseFactory {
             let ordered_cycle = ordered_worker.as_ref().map(|_| watch::channel(None).0);
             let supervisor = MaintenanceSupervisor { store: resources.store, partition: Arc::clone(&partition), replication: replication.clone(), compaction: compaction.clone(), artefacts: artefacts.clone(),
                 observer: Arc::clone(&self.observer), options: self.options.clone(), source, ordered_worker, ordered_cycle: ordered_cycle.clone() };
-            let database = Arc::new(Database { name, configuration, read_only, partition, storage, logs, replication, transaction_admission: RwLock::default(), submitted_bytes: AtomicU64::new(0), query_cpu, compaction, artefacts, ordered_cycle, cancellation: cancellation.clone(), io: Arc::clone(&io) });
+            let fragment_residence = resources.fragment_storage.map(|storage| rtdb_query::FragmentResidence {
+                storage, replica_epoch: logs.replica_epoch.0,
+            });
+            let database = Arc::new(Database { name, configuration, read_only, partition, storage, logs, replication, transaction_admission: RwLock::default(), submitted_bytes: AtomicU64::new(0), query_cpu, fragment_residence, compaction, artefacts, ordered_cycle, cancellation: cancellation.clone(), io: Arc::clone(&io) });
             let driver = DatabaseDriver { database: Arc::clone(&database), replication: replica_driver, compactor, artefacts: artefact_drivers, supervisor, logs: opened_logs.drivers, log_cancellation };
             Ok(OpenedDatabase { database, driver, secondaries })
         };

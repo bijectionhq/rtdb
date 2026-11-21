@@ -63,7 +63,7 @@ async fn delegated_scan_refuses_a_later_erase_horizon_and_falls_back() {
 
     let database = DatabaseSnapshot { partitions: vec![captured], storage: Arc::new(BufferPool::new(store, 1 << 26)) };
     let catalog = CatalogSnapshot::new("xtdb", BTreeMap::from([("xtdb".into(), database)]), false).unwrap()
-        .with_fragmenter(Some(replica.clone()));
+        .with_fragmenter(Some(replica.clone()), None);
     let coordinator = QueryContext::new(catalog, memory, Timestamp(50), "UTC", QueryOptions::default(), &CancellationToken::new()).unwrap();
     let relation = scan(&coordinator, &["v"], TemporalFilter::All, at(10), None);
     assert_eq!(collect(relation, coordinator).await.unwrap(), vec![vec![Value::Utf8("captured".into())]],
@@ -126,6 +126,7 @@ async fn delegated_scan_keeps_its_snapshot_until_cancelled_provider_reads_drain(
         scan: scan.clone(),
         prefix: TriePrefix::new(Vec::new()).unwrap(),
         basis,
+        residence: None,
         bounds: rtdb_types::TemporalBounds { valid_time: Interval::ALL, system_time: Interval::from_micros(10, 11).unwrap() },
         timezone: "UTC".into(),
     };

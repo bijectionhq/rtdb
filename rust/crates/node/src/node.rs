@@ -319,6 +319,7 @@ impl Node {
         }
 
         let query_cpu = held.as_ref().and_then(|database| database.query_cpu_tracker());
+        let fragment_residence = held.as_ref().and_then(|database| database.fragment_residence().cloned());
         let mut snapshots = BTreeMap::new();
         let classic = if placed { BTreeMap::new() } else { self.catalog.open_databases() };
         for (name, database) in held.into_iter().map(|held| (database.to_owned(), held)).chain(classic) {
@@ -334,7 +335,7 @@ impl Node {
             snapshots.insert(name, DatabaseSnapshot { partitions: vec![snapshot.with_system_time_cap(cap)?], storage: Arc::clone(&database.storage) });
         }
         let catalog = CatalogSnapshot::new(database, snapshots, false)?.with_runtime(Arc::new(crate::runtime::NodeCatalogRuntime::new(self.clone(), cancellation.clone())))
-            .with_fragmenter(self.scan_fragmenter.clone());
+            .with_fragmenter(self.scan_fragmenter.clone(), fragment_residence);
         QueryContext::with_owner(catalog, self.factory.options.query.query_memory(&self.factory.memory), basis.current_time, basis.timezone.clone(), self.factory.options.query.clone(), cancellation, &self.cancellation)?
             .with_accelerators(Arc::clone(&self.factory.accelerators))
             .with_read_options(&basis.snapshot, basis.snapshot_time, self.query_instant())
@@ -346,6 +347,9 @@ impl Node {
     pub async fn scan_fragment(&self, fragment: &rtdb_query::ScanFragment, catch_up: Duration, cancellation: &CancellationToken) -> Result<Vec<u8>> {
         self.ensure_open()?;
         let database = self.catalog.database(fragment.database())?;
+        if !fragment.residence.as_ref().is_some_and(|expected| database.fragment_residence() == Some(expected)) {
+            return Err(Anomaly::new(AnomalyCategory::Unavailable, "rtdb.node/fragment-residence", "The node's captured database is in another storage residence or replica epoch"));
+        }
         let deadline = tokio::time::Instant::now() + catch_up;
         while database.partition.value().live().latest_completed_tx().is_none_or(|head| head.tx_id < fragment.basis.tx_id) {
             if tokio::time::Instant::now() >= deadline {

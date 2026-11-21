@@ -4856,6 +4856,7 @@ dependencies = [
  "rtdb-logkeeper",
  "rtdb-node",
  "rtdb-pgwire",
+ "rtdb-plan",
  "rtdb-query",
  "rtdb-replication",
  "rtdb-s3",

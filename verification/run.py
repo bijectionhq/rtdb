@@ -1025,6 +1025,17 @@ TLA_CASES = (
      ("INVARIANTS TypeOK AttemptsAdvance NoEmptyAfterMissing UsesNewerListing CorruptionIsTerminal MissingFailureHasRefreshed",
       "INVARIANT NeverRecoveredAfterRefresh"),
      "NeverRecoveredAfterRefresh"),
+    ("FragmentResidence", "fragment-residence-rebind",
+     ('Mutation = "none"', 'Mutation = "rebind_to_route"'), "SameHistory"),
+    ("FragmentResidence", "fragment-residence-trust-plan",
+     ('Mutation = "none"', 'Mutation = "trust_plan"'), "SameHistory"),
+    ("FragmentResidence", "fragment-residence-ignore-epoch",
+     ('Mutation = "none"', 'Mutation = "ignore_epoch"'), "SameHistory"),
+    ("FragmentResidence", "fragment-residence", None, None),
+    ("FragmentResidence", "fragment-residence-matching-witness",
+     ("INVARIANT SameHistory", "INVARIANT NoMatchingResponse"), "NoMatchingResponse"),
+    ("FragmentResidence", "fragment-residence-receiver-refusal-witness",
+     ("INVARIANT SameHistory", "INVARIANT NoReceiverFallback"), "NoReceiverFallback"),
     ("DelegatedScan", "delegated-scan-ahead",
      ('Mutation = "none"', 'Mutation = "admit_ahead"'), "ExactAnswer"),
     ("DelegatedScan", "delegated-scan-trust-probe",
@@ -1599,6 +1610,46 @@ def verify_multi_trim_admission(args, source):
     print(f"{label}: directory floor enforced before physical trim, missing check rejected")
 
 
+def verify_fragment_residence_replay(args, source):
+    env = os.environ | {
+        "CARGO_TARGET_DIR": str(ROOT / "target"),
+        "CARGO_PROFILE_DEV_DEBUG": "0",
+        "CARGO_PROFILE_TEST_DEBUG": "0",
+        "CARGO_INCREMENTAL": "0",
+    }
+    test = "fragment_requires_the_opened_residence_and_replica_epoch"
+    command = ["cargo", "test", "--locked", "-p", "rtdb-query", "-p", "rtdb-multi",
+               "-p", "rtdb-node", "-p", "rtdb-replication", "--test", "cell", test, "--", "--exact"]
+    label = "rust-fragment-residence"
+    node = source / "rust/crates/node/src/node.rs"
+    original = node.read_bytes()
+    baseline = run_case(command, source / "rust", args.evidence, f"{label}-baseline", env)
+    if baseline.returncode or f"{test} ... ok" not in baseline.stdout or "1 passed; 0 failed" not in baseline.stdout:
+        raise ValueError("fragment residence baseline did not pass")
+    anchor = "fragment.residence.as_ref().is_some_and(|expected| database.fragment_residence() == Some(expected))"
+    controls = {
+        "ignore-storage": (
+            "fragment.residence.as_ref().is_some_and(|expected| database.fragment_residence().is_some_and(|actual| actual.replica_epoch == expected.replica_epoch))",
+            "the worker must refuse another storage residence",
+        ),
+        "ignore-epoch": (
+            "fragment.residence.as_ref().is_some_and(|expected| database.fragment_residence().is_some_and(|actual| actual.storage == expected.storage))",
+            "the worker must refuse another replica epoch",
+        ),
+    }
+    try:
+        for name, (replacement, assertion) in controls.items():
+            node.write_bytes(original)
+            replace_once(node, anchor, replacement)
+            control = run_case(command, source / "rust", args.evidence, f"{label}-{name}", env)
+            if (control.returncode != 101 or f"{test} ... FAILED" not in control.stdout
+                or assertion not in control.stdout or "0 passed; 1 failed" not in control.stdout):
+                raise ValueError(f"{label}-{name}: expected the named residence assertion")
+    finally:
+        node.write_bytes(original)
+    print(f"{label}: exact opened scope matched, both narrowed comparisons failed their assertions")
+
+
 def verify_delegated_scan_replay(args, source):
     env = os.environ | {
         "CARGO_TARGET_DIR": str(ROOT / "target"),
@@ -2111,6 +2162,10 @@ def main():
         "rust/crates/directory/src/lib.rs",
         "rust/crates/node/src/resources.rs",
         "rust/crates/multi/src/agent.rs",
+        "rust/crates/multi/src/control.rs",
+        "rust/crates/multi/src/fragments.rs",
+        "rust/crates/multi/src/process.rs",
+        "rust/crates/query/src/context.rs",
         "rust/crates/multi/tests/cell.rs",
     ))
     for path in list(source_paths):
@@ -2151,6 +2206,7 @@ def main():
             verify_recovery_hold_replay(args, source)
             verify_checkpoint_metadata_replay(args, source)
             verify_delegated_scan_replay(args, source)
+            verify_fragment_residence_replay(args, source)
             verify_catalog_replay(args, source)
             verify_system_time_replay(args, source)
             verify_merge_replay(args, source)

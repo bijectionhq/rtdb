@@ -2586,6 +2586,64 @@ fn fragments_read(cell: &Cell) -> Vec<std::collections::BTreeMap<(String, String
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn fragment_requires_the_opened_residence_and_replica_epoch() {
+    use rtdb_plan::{ColumnId, Field, QualifiedTable, Scan, TableBinding, TemporalFilter};
+    use rtdb_query::{ScanFragment, TriePrefix};
+    use rtdb_types::{Interval, LogicalType, ScalarType, TableRef, TemporalBounds};
+
+    let cell = Cell::start(2, None).await;
+    admin::create_deployment(cell.directory.as_ref(), "shop", "acme", 3).await.unwrap();
+    let client = cell.connect("shop").await;
+    client.simple_query("INSERT INTO docs (_id, v) VALUES (1, 17)").await.unwrap();
+    assert_eq!(values(&client, "SELECT v FROM docs").await, ["17"]);
+    let holder = cell.holder("shop").await.unwrap();
+    let running = cell.node(holder);
+    let (residence, basis) = {
+        let database = running.server.node().catalog().database("shop").unwrap();
+        (database.fragment_residence().unwrap().clone(), database.progress().current().tx_key.unwrap())
+    };
+    let data_type = LogicalType::Scalar(ScalarType::I64);
+    let mut fragment = ScanFragment {
+        scan: Scan {
+            table: TableBinding { name: QualifiedTable { database: "shop".into(), table: TableRef::new("public", "docs") },
+                oid: None, columns: rtdb_types::StructFields::from([("v".into(), data_type.clone())]) },
+            columns: vec![Field { id: ColumnId(0), name: "v".into(), qualifier: None, qualified_only: false, unnamed: false, data_type }],
+            valid_time: TemporalFilter::All, system_time: TemporalFilter::All, clamp_valid_time: false,
+            iids: None, predicates: Vec::new(), top_k: None, ordered_top_k: None, matches: Vec::new(),
+        },
+        prefix: TriePrefix::new(Vec::new()).unwrap(),
+        basis,
+        residence: Some(residence.clone()),
+        bounds: TemporalBounds { valid_time: Interval::ALL,
+            system_time: Interval::from_micros(i64::MIN, basis.system_time.0 + 1).unwrap() },
+        timezone: "UTC".into(),
+    };
+    let matching = running.agent.scan_fragment("shop", &fragment).await.unwrap();
+    assert!(matches!(matching, Response::Fragment { batches } if !batches.is_empty()));
+
+    let mut different_storage = residence.clone();
+    different_storage.storage = Arc::from("another physical residence");
+    let mut different_epoch = residence.clone();
+    different_epoch.replica_epoch += 1;
+    for (scope, assertion) in [
+        (Some(different_storage), "the worker must refuse another storage residence"),
+        (Some(different_epoch), "the worker must refuse another replica epoch"),
+        (None, "the worker must refuse an unscoped fragment"),
+    ] {
+        fragment.residence = scope;
+        let result = running.agent.scan_fragment("shop", &fragment).await;
+        assert_eq!(result.err().map(|error| error.code).as_deref(), Some("rtdb.node/fragment-residence"), "{assertion}");
+    }
+    fragment.residence = Some(residence);
+    let mut wire = serde_json::to_value(Request::ScanFragment { name: "shop".into(), fragment, grant: String::new() }).unwrap();
+    assert_eq!(wire["op"], "scan_scoped_fragment");
+    wire["op"] = "scan_fragment".into();
+    assert!(serde_json::from_value::<Request>(wire).is_err());
+    drop(client);
+    cell.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_large_deployments_scans_read_as_fragments_on_the_nodes_their_slices_rank_first_on() {
     let cell = Cell::start(3, None).await;
     let client = large_deployment(&cell, "big").await;

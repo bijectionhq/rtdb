@@ -188,6 +188,7 @@ impl RemoteStorageFactory for CellStoreFactory {
             .map_err(|error| Anomaly::incorrect("rtdb.multi/storage-config", format!("Cell storage configuration is malformed: {error}")))?;
         let (record, region, owner, release, checkpoint_metadata) = self.admit_region(&config, io).await?;
         let blocks = discovery_from_admitted_record(&config, &record);
+        let fragment_storage = crate::fragments::storage_identity(self.storage_namespaces.objects, &record);
         let checkpoint_metadata: Arc<dyn Send + Sync> = Arc::new(checkpoint_metadata);
         let opened = IoRegion::retaining(Arc::clone(&checkpoint_metadata), async {
             let recovery = if storage_root.as_str() == crate::archive::checkpoint_storage_root()? {
@@ -229,7 +230,7 @@ impl RemoteStorageFactory for CellStoreFactory {
             Arc::get_mut(&mut opened).expect("the new store has one owner").index_pages = Some(pages);
             Ok::<_, Anomaly>(opened)
         }).await?;
-        Ok(OpenedRecoveryStore { store: opened, blocks, checkpoint_metadata: Some(checkpoint_metadata) })
+        Ok(OpenedRecoveryStore { store: opened, blocks, checkpoint_metadata: Some(checkpoint_metadata), fragment_storage: Some(fragment_storage) })
     }
 
     fn cache_identity<'a>(&self, configuration: &'a Any) -> Result<std::borrow::Cow<'a, [u8]>> {

@@ -21,6 +21,7 @@ pub struct CatalogSnapshot {
     transaction_scoped: bool,
     pub(crate) runtime: Option<Arc<dyn CatalogRuntime>>,
     pub(crate) fragmenter: Option<Arc<dyn crate::fragment::ScanFragmenter>>,
+    pub(crate) fragment_residence: Option<crate::FragmentResidence>,
 }
 
 impl CatalogSnapshot {
@@ -31,11 +32,15 @@ impl CatalogSnapshot {
         if transaction_scoped && databases.get(&default_database).is_none_or(|database| database.partitions.len() != 1) {
             return Err(invalid("transaction-partition-scope", "An index-time query must contain exactly its resolving partition"));
         }
-        Ok(Self { default_database, databases, transaction_scoped, runtime: None, fragmenter: None })
+        Ok(Self { default_database, databases, transaction_scoped, runtime: None, fragmenter: None, fragment_residence: None })
     }
     pub fn with_runtime(mut self, runtime: Arc<dyn CatalogRuntime>) -> Self { self.runtime = Some(runtime); self }
     /// Splits this catalog's scans into fragments wherever `fragmenter` asks.
-    pub fn with_fragmenter(mut self, fragmenter: Option<Arc<dyn crate::fragment::ScanFragmenter>>) -> Self { self.fragmenter = fragmenter; self }
+    pub fn with_fragmenter(mut self, fragmenter: Option<Arc<dyn crate::fragment::ScanFragmenter>>, residence: Option<crate::FragmentResidence>) -> Self {
+        self.fragmenter = fragmenter;
+        self.fragment_residence = residence;
+        self
+    }
     pub fn database_names(&self) -> impl Iterator<Item = &str> { self.databases.keys().map(String::as_str) }
     /// Reserves schema enumeration and joins before creating the returned table bindings.
     /// Clones of the result share its retained allocation charge.

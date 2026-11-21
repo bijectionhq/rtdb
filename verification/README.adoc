@@ -198,6 +198,8 @@ It also exercises the Azure adapter against a loopback provider and separately m
 * `tla/DelegatedScan.tla` separates a worker's preliminary progress observation, actual snapshot capture, provider drain and the coordinator's fallback.
   `lean/DelegatedScan.lean` checks the point-observation law over the shared committed history model.
   The native scan replay checks the exact worker admission and I/O lifetime against separately weakened production source.
+* `tla/FragmentResidence.tla` checks routing and recipient admission when a database moves or opens a new replica journal.
+  Its controls bind the request to the latest route, trust placement at read time, and ignore the journal epoch.
   `lean/ReaderRetention.lean` proves strict lease timing and preservation of an abstract counted pin, with matching expiry and close controls.
   `lean/GenerationRetention.lean` proves that a coordinated registry keeps every object required by the current generation, open readers, and in-flight operations available across arbitrary finite histories.
   Each read completion releases exactly one reference, and an unreferenced object admits authorization followed by collection.

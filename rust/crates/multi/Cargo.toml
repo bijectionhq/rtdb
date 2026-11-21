@@ -54,5 +54,6 @@ tokio-rustls = "=0.26.6"
 tokio-util.workspace = true
 
 [dev-dependencies]
+rtdb-plan.workspace = true
 arrow-flight = { version = "=58.4.1", features = ["flight-sql"] }
 tokio-postgres = "0.7"

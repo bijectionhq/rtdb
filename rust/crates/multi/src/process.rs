@@ -94,7 +94,7 @@ pub async fn start_node(directory: Arc<dyn Directory>, mut settings: NodeSetting
     let writers: crate::logs::Writers = Default::default();
     let fence = Arc::new(FenceSlot::default());
     let cache_bytes = settings.configuration.disk_cache.as_ref().and_then(|cache| cache.maximum_bytes).unwrap_or(u64::MAX);
-    let fragmenter = crate::fragments::CellFragmenter::new(Arc::clone(&directory), &settings.agent.fragments, cache_bytes, settings.capabilities.clone());
+    let fragmenter = crate::fragments::CellFragmenter::new(Arc::clone(&directory), storage_namespaces.objects, &settings.agent.fragments, cache_bytes, settings.capabilities.clone());
     let storage_regions = TaskTracker::new();
     let local_witnesses = matches!(&settings.agent.storage, crate::deployment::CellStorage::Local { .. })
         .then(|| crate::store::LocalWitnessPool::new(Arc::clone(&settings.keys), &storage_regions));

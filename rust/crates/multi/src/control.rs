@@ -57,6 +57,7 @@ pub enum Request {
     /// Publish a compaction a worker produced, as the deployment's holder; the notification is an encoded TriesAdded.
     PublishCompaction { name: String, notification: Vec<u8>, grant: String },
     /// Read a fragment of another node's scan of the deployment, at the fragment's basis (`RefineKeyForLargeDeployments`).
+    #[serde(rename = "scan_scoped_fragment")]
     ScanFragment { name: String, fragment: rtdb_query::ScanFragment, grant: String },
 }
 

@@ -754,6 +754,11 @@ A delegated prefix scan is an optimization of a query the coordinator already ad
 The worker must answer from a capture of the same transaction head, including the system timestamp, within the same database history.
 It checks the snapshot it actually captured after any catch-up wait.
 The coordinator evaluates the fragment against its own held snapshot if the worker cannot supply that capture.
+The request carries the storage namespace and deployment prefix from the coordinator's opened store, plus the epoch of its opened replica journal.
+The router consults the directory to place this capture and falls back if the directory now names a different residence or epoch.
+A worker validates the same receipt against the opened database handle it will query, independently of the routing observation.
+The scoped wire operation has its own tag so a worker without the scope check refuses the request and the coordinator can fall back.
+The namespace and journal epochs identify their storage histories under the directory and storage-provider identity contracts.
 A scan with private transaction overlays uses local execution.
 
 An earlier upper bound on system time does not recreate an earlier admission horizon.
@@ -767,7 +772,8 @@ Physical collection by other nodes still needs the shared residence authority de
 
 Lean proves that delegation plus local fallback preserves the reference point observation for a common committed history.
 TLC checks the timing between catching up, capturing, cancelling and draining.
-Native replays exercise the actual coordinator fallback and a cancelled read at the delegated storage boundary. link:../../verification/lean/DelegatedScan.lean[Observation laws] · link:../../verification/tla/DelegatedScan.tla[Interleaving model]
+Native replays exercise the actual coordinator fallback and a cancelled read at the delegated storage boundary.
+A separate finite model checks scope identity while placement and worker opening change independently. link:../../verification/lean/DelegatedScan.lean[Observation laws] · link:../../verification/tla/DelegatedScan.tla[Interleaving model]
 
 === Multi replica recovery holds
 

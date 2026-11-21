@@ -73,6 +73,13 @@ impl FragmentDepth {
     }
 }
 
+/// The physical storage and replica journal used by the captured view.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FragmentResidence {
+    pub storage: Arc<str>,
+    pub replica_epoch: i32,
+}
+
 /// One slice of a scan, as a node other than the coordinator evaluates it: the table's rows under `prefix`, resolved within
 /// `bounds` over the snapshot whose latest transaction is `basis`, projected to the scan's columns and filtered by those of its predicates any node evaluates alike.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -80,6 +87,7 @@ pub struct ScanFragment {
     pub scan: Scan,
     pub prefix: TriePrefix,
     pub basis: TransactionKey,
+    pub residence: Option<FragmentResidence>,
     pub bounds: TemporalBounds,
     /// The coordinator's time zone, under which the predicates' casts read.
     pub timezone: String,
@@ -103,7 +111,7 @@ impl ScanFragment {
 
     /// The fragment of `scan` under `prefix`: its predicates and temporal filters stay with the coordinator, which filters
     /// the rows that come back, so the fragment carries only the projection and the bounds already evaluated.
-    pub(crate) fn of(scan: &Scan, prefix: TriePrefix, basis: TransactionKey, mut bounds: TemporalBounds, timezone: &str) -> Self {
+    pub(crate) fn of(scan: &Scan, prefix: TriePrefix, basis: TransactionKey, residence: Option<FragmentResidence>, mut bounds: TemporalBounds, timezone: &str) -> Self {
         // The reader filters by the predicates it would evaluate as the coordinator does; the coordinator filters its rows by all of them again.
         let predicates = scan.predicates.iter().filter(|predicate| portable(predicate)).cloned().collect();
         let scan = Scan { predicates, iids: None, valid_time: TemporalFilter::Default, system_time: TemporalFilter::Default, ..scan.clone() };
@@ -112,7 +120,7 @@ impl ScanFragment {
         if bounds.system_time.upper() > upper {
             bounds.system_time = Interval::new(bounds.system_time.lower().min(basis.system_time), upper).expect("a nonempty interval up to the basis");
         }
-        Self { scan, prefix, basis, bounds, timezone: timezone.to_owned() }
+        Self { scan, prefix, basis, residence, bounds, timezone: timezone.to_owned() }
     }
 }
 
