@@ -240,7 +240,6 @@ fn prune(relation: Arc<Relation>, required: &BTreeSet<ColumnId>, ids: &mut Ids) 
                 columns.extend(aggregate.argument.iter().chain(&aggregate.filter).flat_map(Expr::referenced_columns));
                 columns.extend(aggregate.order_by.iter().flat_map(|order| order.expr.referenced_columns()));
             }
-            if columns.is_empty() { columns.extend(input.schema().fields().first().map(|field| field.id)); }
             let input = annotate_top_k(prune(Arc::clone(input), &columns, ids)?)?;
             Ok(Arc::new(Relation::new(relation.schema().clone(), RelationNode::Aggregate { input, groups: groups.clone(), aggregates: aggregates.clone() })?))
         }
