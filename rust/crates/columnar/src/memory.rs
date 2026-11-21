@@ -15,6 +15,10 @@ impl BatchBuilder {
         Ok(Self { reservation: memory.reserve(metadata)? })
     }
 
+    pub fn reserve_scratch(&self, bytes: usize) -> Result<Arc<MemoryReservation>> {
+        self.reservation.budget().reserve(bytes)
+    }
+
     pub fn column(&mut self, temporary: usize, build: impl FnOnce() -> Result<ArrayRef>) -> Result<ArrayRef> {
         let reservation = Arc::get_mut(&mut self.reservation).expect("batch construction owns its reservation");
         let retained = reservation.bytes();

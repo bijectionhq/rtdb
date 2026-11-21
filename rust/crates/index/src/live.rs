@@ -473,35 +473,59 @@ impl PendingTable {
                 return IndexBatch::from_owned(OwnedBatch::with_reservation(combined, reservation)?);
             }
         }
-        let mut rows = Vec::new();
-        let mut next_event = written.events;
-        let mut charge = budget.reserve(0)?;
-        let positions = batches.iter().map(|(offset, batch)| (*offset, Some(batch)))
+        let size_error = || invalid("Write batch size overflow");
+        let positions = || batches.iter().map(|(offset, batch)| (*offset, Some(batch)))
             .chain(std::iter::once((self.events.len(), None)));
-        for (upto, batch) in positions {
+        let event_count = batches.iter().try_fold(events.len(), |count, (_, batch)| {
+            count.checked_add(batch.len()).ok_or_else(size_error)
+        })?;
+        let scratch = event_count.checked_mul(512).and_then(|bytes| bytes.checked_add(4096)).ok_or_else(size_error)?;
+        let scratch = events.iter().try_fold(scratch, |bytes, event| match &event.operation {
+            StoredOperation::Put(document) => Value::document_retained_bytes(document)?.checked_mul(4)
+                .and_then(|size| bytes.checked_add(size)).ok_or_else(size_error),
+            _ => Ok(bytes),
+        })?;
+        let scratch = batches.iter().try_fold(scratch, |bytes, (_, batch)| {
+            batch.put_types.iter().try_fold(bytes, |bytes, (name, ty)| {
+                ty.retained_bytes()?.checked_add(name.len()).and_then(|size| size.checked_mul(4))
+                    .and_then(|size| bytes.checked_add(size)).ok_or_else(size_error)
+            })
+        })?;
+        let _scratch = budget.reserve(scratch)?;
+        let mut document_types = Vec::new();
+        let mut next_event = written.events;
+        for (upto, batch) in positions() {
             for event in &self.events[next_event..upto] {
-                let bytes = match &event.operation { StoredOperation::Put(doc) => Value::document_retained_bytes(doc)?, _ => 0 };
-                charge_event(&mut charge, bytes)?;
-                rows.push(event.clone());
-            }
-            if let Some(batch) = batch {
-                let schema = batch.arrow().schema();
-                let field = schema.field_with_name("op").map_err(invalid)?;
-                let operations = batch.events.operations()?;
-                for row in 0..batch.len() {
-                    charge_event(&mut charge, estimate_read_value_bytes(field, operations, row)?)?;
-                    rows.push(batch.events.read_event(row)?);
+                if let StoredOperation::Put(document) = &event.operation {
+                    document_types.push(document.iter().map(|(name, value)| (name.clone(), value.logical_type())).collect());
                 }
+            }
+            if let Some(batch) = batch
+                && batch.headers.0.iter().any(|header| header.op == EventOp::Put) {
+                document_types.push(batch.put_types.clone());
             }
             next_event = upto;
         }
-        IndexBatch::copy_events(&rows, &self.declared, budget)
-    }
-}
+        let fields = row_column_types(&document_types).map_or_else(|| self.declared.clone(), |types| {
+            declare_column_types(&types, &self.declared)
+        });
+        let has_put = !document_types.is_empty() || !self.declared.is_empty();
 
-fn charge_event(charge: &mut Arc<MemoryReservation>, document: usize) -> Result<()> {
-    let added = document.checked_add(4096).and_then(|bytes| bytes.checked_add(charge.bytes())).ok_or_else(|| invalid("Write batch size overflow"))?;
-    Arc::get_mut(charge).expect("write copying owns its reservation").grow_to(added)
+        let mut next_event = written.events;
+        let mut ordered = Vec::with_capacity(event_count);
+        for (upto, batch) in positions() {
+            if next_event != upto {
+                let rows = &self.events[next_event..upto];
+                let batch = owned_event_batch(rows, has_put.then(|| fields.clone()), true, budget)?;
+                ordered.extend(EventBatch::new(batch.batch().clone())?.page_events()?);
+            }
+            if let Some(batch) = batch {
+                ordered.extend(batch.events.page_events()?);
+            }
+            next_event = upto;
+        }
+        IndexBatch::from_owned(owned_event_batch(&ordered, has_put.then_some(fields), true, budget)?)
+    }
 }
 
 #[derive(Clone, Copy, Default, PartialEq, Eq)]

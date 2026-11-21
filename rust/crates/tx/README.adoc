@@ -20,6 +20,7 @@ The source encoder builds each operation body column independently before assemb
 The transaction result table declares its nullable Transit error column even when every written result is successful.
 Document batches retain their column order in either representation.
 Compatible Arrow puts retain their arrays through replay and staging, with transaction headers prepared independently.
+Staging can gather compatible columns directly from their arrays when a table combines Arrow puts and individual row operations.
 When replay constructs document values, it bounds scratch to one row and shares the ordered Arrow layout across puts.
 The resolver carries declared column types to the staged write, including columns whose cells are all null.
 The source encoder carries document columns in first encounter order in each table and mutation leg, and the decoder recovers that order from the Arrow field layout.
