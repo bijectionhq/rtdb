@@ -296,17 +296,22 @@ impl Context<'_> {
             Syntax::Standard(statement) => self.standard(statement),
             Syntax::Erase(delete) => self.delete(delete, true),
             Syntax::CreateTable { table, columns } => {
-                let columns: Vec<_> = columns.iter().map(Identifier::normalized).collect();
-                if columns.iter().collect::<BTreeSet<_>>().len() != columns.len() { return Err(error("CREATE TABLE repeats a column")); }
-                if columns.iter().any(|name| name.starts_with('_') && name != "_id") { return Err(error("CREATE TABLE cannot declare internal columns")); }
+                let mut seen = BTreeSet::new();
+                let columns = columns.iter().map(|(name, ty)| {
+                    let name = name.normalized();
+                    if !seen.insert(name.clone()) { return Err(error("CREATE TABLE repeats a column")); }
+                    if name.starts_with('_') && name != "_id" { return Err(error("CREATE TABLE cannot declare internal columns")); }
+                    let ty = ty.as_ref().map(crate::types::data_type).transpose()?.map_or(LogicalType::Nothing, LogicalType::maybe);
+                    Ok((name, ty))
+                }).collect::<Result<_>>()?;
                 Ok(Statement::Dml(Dml::CreateTable { table: self.target(table)?, columns }))
             }
             Syntax::GrantRole { user, role, revoke } => Ok(Statement::Dml(Dml::GrantRole { user: user.normalized(), role: role.normalized(), revoke: *revoke })),
-            Syntax::CreateSearchIndex { name, table, columns, history } => {
+            Syntax::CreateSearchIndex { name, table, columns, history, if_not_exists } => {
                 let columns: Vec<_> = columns.iter().map(Identifier::normalized).collect();
                 if columns.iter().collect::<BTreeSet<_>>().len() != columns.len() { return Err(error("CREATE SEARCH INDEX repeats a column")); }
                 if columns.iter().any(|name| name.starts_with('_')) { return Err(error("CREATE SEARCH INDEX cannot index internal columns")); }
-                Ok(Statement::Dml(Dml::CreateSearchIndex { name: name.normalized(), table: self.target(table)?, columns, history: *history }))
+                Ok(Statement::Dml(Dml::CreateSearchIndex { name: name.normalized(), table: self.target(table)?, columns, history: *history, if_not_exists: *if_not_exists }))
             }
             Syntax::DropSearchIndex { name } => Ok(Statement::Dml(Dml::DropSearchIndex { name: name.normalized() })),
             Syntax::CreateOrderedIndex { name, table, columns, if_not_exists } => {

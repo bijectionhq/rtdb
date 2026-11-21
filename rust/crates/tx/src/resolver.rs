@@ -329,9 +329,10 @@ impl<'a> OpenTransaction<'a> {
         self.execute_mutation(mutation, context, arguments, Some(syntax)).await.map_err(with_sql)
     }
 
-    async fn ordered_index_exists(&self, name: &str) -> Result<bool> {
-        if !self.snapshot()?.contains_table(&TableRef::new("xt", "ordered_indexes")) { return Ok(false); }
-        let mut query = self.open_query("SELECT _id FROM xt.ordered_indexes WHERE _id = ?", vec![Value::Utf8(name.into())]).await?;
+    async fn index_exists(&self, catalog: &str, name: &str) -> Result<bool> {
+        if !self.snapshot()?.contains_table(&TableRef::new("xt", catalog)) { return Ok(false); }
+        let sql = format!("SELECT _id FROM xt.{catalog} WHERE _id = ?");
+        let mut query = self.open_query(&sql, vec![Value::Utf8(name.into())]).await?;
         Ok(query.next_batch().await?.is_some())
     }
 
@@ -346,10 +347,15 @@ impl<'a> OpenTransaction<'a> {
                 if cursor.next_batch().await?.is_none() { return Err(Anomaly::new(AnomalyCategory::Conflict, "xtdb/assert-failed", message.unwrap_or_else(|| "Assert failed".into()))); }
                 return Ok(());
             }
-            Mutation::CreateTable { table, columns } => return self.declare_table(table.table, columns),
-            Mutation::CreateSearchIndex { name, table, columns, history } => {
+            Mutation::CreateTable { table, columns } => {
+                let table = table.table;
+                self.declare_table(table.clone(), columns.iter().map(|(name, _)| name.clone()))?;
+                return self.buffer.declare_document_types(&table, columns.iter().map(|(name, ty)| (name, ty)));
+            },
+            Mutation::CreateSearchIndex { name, table, columns, history, if_not_exists } => {
                 if table.database != self.context.database { return Err(Anomaly::incorrect("xtdb/table-not-found", "A search index cannot cover another database's table")); }
                 check_search_index_name(&name)?;
+                if if_not_exists && self.index_exists("search_indexes", &name).await? { return Ok(()); }
                 let document = rtdb_types::StructFields::from([
                     ("_id".into(), Value::Utf8(name)), ("schema_name".into(), Value::Utf8(table.table.schema.clone())), ("table_name".into(), Value::Utf8(table.table.table.clone())),
                     ("columns".into(), Value::List(columns.into_iter().map(Value::Utf8).collect())), ("analyzer".into(), Value::Utf8(rtdb_text::SIMPLE_ANALYZER.into())),
@@ -370,7 +376,7 @@ impl<'a> OpenTransaction<'a> {
                 {
                     return Err(Anomaly::incorrect("xtdb/invalid-index-columns", "An ordered index requires distinct stored columns"));
                 }
-                if self.ordered_index_exists(&name).await? {
+                if self.index_exists("ordered_indexes", &name).await? {
                     if if_not_exists { return Ok(()); }
                     return Err(Anomaly::incorrect("xtdb/index-already-exists", format!("Index {name} already exists")));
                 }
@@ -385,7 +391,7 @@ impl<'a> OpenTransaction<'a> {
             }
             Mutation::DropOrderedIndex { name } => {
                 check_ordered_index_name(&name)?;
-                if !self.ordered_index_exists(&name).await? {
+                if !self.index_exists("ordered_indexes", &name).await? {
                     return Err(Anomaly::incorrect("xtdb/index-not-found", format!("Index {name} does not exist")));
                 }
                 return self.buffer.delete(TableRef::new("xt", "ordered_indexes"), &rtdb_types::EntityId::String(name), interval(self.tx_key().system_time, Timestamp::MAX)?);

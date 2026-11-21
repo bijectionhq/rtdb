@@ -10,6 +10,7 @@ The behaviour is specified in link:../../../dev/doc/fts.allium[fts.allium]; link
 Use `SEARCH_SCORE(column, query, documents, tokens, frequencies)` when the ranking corpus is a filtered relation.
 Supply the count of non-null documents, the sum of `SEARCH_LENGTH(column)`, and a list of per-term document counts in `SEARCH_TERMS(query)` order over the same rows.
 This score uses only those statistics and the value being scored.
+When `CREATE SEARCH INDEX IF NOT EXISTS` finds an existing definition at its ordered position, the original definition and its version are retained.
 `MATCH` can still narrow candidates if a search file covers its column.
 The node configuration's `search: {enabled, threads}` switches the lane and the scan accelerator together.
 

@@ -79,6 +79,9 @@ The SQL LEADS predicates retain the endpoint comparisons in `sql.clj`; quoted sc
 Exact diagnostic wording remains outstanding; these source assertions have not been executed.
 
 Implemented source paths include SELECT, VALUES, non-recursive CTEs, joins with ON, grouping and aggregate filters, set operators, ordering, limits, array and object expressions, prepared parameters, INSERT, UPDATE, DELETE, ERASE, ASSERT, PATCH RECORDS, INSERT RECORDS, standalone RECORDS queries, CREATE TABLE declarations, GRANT/REVOKE role membership, and basic transaction and session controls.
+`CREATE TABLE` and `CREATE OR ALTER TABLE` accept optional column types, such as `CREATE TABLE invoices (_id TEXT, effective TIMESTAMPTZ, amount BIGINT, extra)`.
+Typed columns contribute their nullable native shape to the catalog even before a row is written.
+Declarations contribute types to the existing row-derived union and do not coerce or constrain writes.
 GROUP BY accepts and ignores an ALL or DISTINCT set quantifier before its grouping elements, as the pinned visitor does.
 A RECORDS query's columns are the union of its record keys in first-appearance order, with null where a record omits a key; the pinned planner orders them by hash-set iteration instead.
 Canonical mutation lowering preserves unassigned document fields, derives valid-time windows, and builds PATCH gap filling and shallow merge plans.

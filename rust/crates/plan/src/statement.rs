@@ -15,10 +15,10 @@ pub enum Dml {
     Erase { table: QualifiedTable, input: Arc<Relation> },
     Patch { table: QualifiedTable, input: Arc<Relation>, valid_time: TemporalFilter },
     Assert { input: Arc<Relation>, message: Option<String> },
-    CreateTable { table: QualifiedTable, columns: Vec<String> },
+    CreateTable { table: QualifiedTable, columns: Vec<(String, LogicalType)> },
     GrantRole { user: String, role: String, revoke: bool },
     /// `history` is false when the index covers only the current side (fts.allium: SearchIndexDefinition).
-    CreateSearchIndex { name: String, table: QualifiedTable, columns: Vec<String>, history: bool },
+    CreateSearchIndex { name: String, table: QualifiedTable, columns: Vec<String>, history: bool, if_not_exists: bool },
     DropSearchIndex { name: String },
     CreateOrderedIndex { name: String, table: QualifiedTable, columns: Vec<String>, if_not_exists: bool },
     DropOrderedIndex { name: String },

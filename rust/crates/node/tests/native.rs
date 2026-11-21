@@ -306,6 +306,37 @@ async fn log_tables_test_source_log_msgs_basic_and_tx_ops_decoded() {
 }
 
 #[tokio::test]
+async fn typed_table_declarations_survive_a_block_without_application_rows() {
+    let (node, driver) = running(options(), services()).await;
+    let mut session = node.session("xtdb", Arc::new(Authority)).unwrap();
+    let declare = TxOp::Sql {
+        sql: "CREATE TABLE invoices (_id TEXT, body TEXT, effective TIMESTAMPTZ, amount BIGINT, extra)".into(),
+        args: None,
+    };
+    let committed = session.state_mut().execute_tx(vec![declare], AutonomousTxOptions::default()).await.unwrap();
+    assert!(committed.committed());
+
+    let table = TableRef::new("public", "invoices");
+    let database = node.catalog().database("xtdb").unwrap();
+    let original = database.snapshot().column_types(&table);
+    use rtdb_types::{LogicalType, ScalarType, TimeUnit};
+    let expected = [
+        ("body", LogicalType::Scalar(ScalarType::Utf8)),
+        ("effective", LogicalType::Scalar(ScalarType::Timestamp { timezone: Some("UTC".into()), unit: TimeUnit::Microsecond })),
+        ("amount", LogicalType::Scalar(ScalarType::I64)),
+    ];
+    for (name, ty) in expected {
+        assert!(original[name].legs().contains(&ty));
+    }
+    assert_eq!(original["extra"], LogicalType::Nothing);
+    assert!(rows(session.query_sql("SELECT body, effective, amount FROM invoices", vec![]).await.unwrap()).await.is_empty());
+
+    node.flush_all(Duration::from_secs(10)).await.unwrap();
+    assert_eq!(database.snapshot().column_types(&table), original);
+    stop(&node, driver).await;
+}
+
+#[tokio::test]
 async fn flush_all_observes_successive_durable_blocks_before_returning() {
     let (node, driver) = running(options(), services()).await;
     let mut session = node.session("xtdb", Arc::new(Authority)).unwrap();
