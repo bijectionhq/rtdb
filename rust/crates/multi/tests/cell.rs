@@ -484,7 +484,18 @@ async fn restoring_the_current_archive_preserves_the_ordered_tail_and_authority(
     let archive = CellStorage::Local { root: archive_dir.path().to_owned() };
     let operation = uuid::Uuid::new_v4();
     let storage = cell.storage();
-    rtdb_multi::archive::capture(cell.directory.as_ref(), &storage, &archive, &cell.keys(), id, operation).await.unwrap();
+    let capture = rtdb_multi::archive::capture(cell.directory.as_ref(), &storage, &archive, &cell.keys(), id, operation).await.unwrap();
+    let object = capture.objects.iter().find(|object| object.name.ends_with(".arrow")).unwrap();
+    let path = archive_dir.path().join(format!("checkpoint-captures/{id}/{operation}/objects/{}", object.name));
+    let ciphertext = std::fs::read(&path).unwrap();
+    let mut corrupt = ciphertext.clone();
+    corrupt[0] ^= 1;
+    std::fs::write(&path, corrupt).unwrap();
+    assert!(rtdb_multi::archive::restore(cell.directory.as_ref(), &storage, &archive, &cell.keys(), id, operation, 4 << 20).await.is_err());
+    let still_live = cell.directory.deployment(&id.to_string()).await.unwrap().unwrap();
+    assert_eq!(still_live.lifecycle, Lifecycle::Live);
+    assert_eq!(still_live.epoch, record.epoch);
+    std::fs::write(path, ciphertext).unwrap();
     client.simple_query("INSERT INTO orders (_id, total) VALUES (2, 20)").await.unwrap();
     drop(client);
     cell.nodes[holder].take().unwrap().kill().await.unwrap();
@@ -499,6 +510,9 @@ async fn restoring_the_current_archive_preserves_the_ordered_tail_and_authority(
     assert_eq!(values(&reopened, "SELECT total FROM orders ORDER BY _id").await, ["10", "20"]);
     let retried = rtdb_multi::archive::restore(cell.directory.as_ref(), &storage, &archive, &cell.keys(), id, operation, 4 << 20).await.unwrap();
     assert_eq!(retried, restored);
+    let other_dir = tempfile::tempdir().unwrap();
+    let other_archive = CellStorage::Local { root: other_dir.path().to_owned() };
+    assert!(rtdb_multi::archive::restore(cell.directory.as_ref(), &storage, &other_archive, &cell.keys(), id, operation, 4 << 20).await.is_err());
     drop(reopened);
     cell.stop().await;
 }

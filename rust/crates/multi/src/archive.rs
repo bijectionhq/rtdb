@@ -570,12 +570,17 @@ pub async fn restore(
         ));
     }
     let id = deployment.to_string();
+    let archive_binding = serde_json::to_string(archive)
+        .map_err(|_| inconsistent("Cannot retain the archive binding"))?;
     let current = directory
         .deployment(&id)
         .await?
         .ok_or_else(|| unavailable("The selected installation is unavailable"))?;
     if let Some(recovery) = &current.checkpoint_recovery {
         if recovery.operation == operation && recovery.completed_at_ms.is_some() {
+            if recovery.archive != archive_binding {
+                return Err(inconsistent("The restore operation has another archive"));
+            }
             return Ok(recovery.clone());
         }
     }
@@ -587,8 +592,6 @@ pub async fn restore(
         .await?
         .ok_or_else(|| unavailable("The checkpoint capture is incomplete"))?;
     let manifest_sha256 = digest(&encode(&capture)?);
-    let archive_binding = serde_json::to_string(archive)
-        .map_err(|_| inconsistent("Cannot retain the archive binding"))?;
     let point = capture.point;
     let intent = read::<CapturePoint>(&metadata, &key("intent.json")?).await?;
     if intent.as_ref() != Some(&point)
@@ -628,6 +631,11 @@ pub async fn restore(
         return Err(inconsistent(
             "The archive object list differs from the checkpoint closure",
         ));
+    }
+    let cipher = Cipher::new(&material)?;
+    for (name, object) in objects {
+        let ciphertext = read_object(files.as_ref(), &name, object).await?;
+        cipher.open(name.as_str(), &ciphertext)?;
     }
 
     let fenced = update_installation(directory, &id, |record| {
@@ -684,11 +692,6 @@ pub async fn restore(
     let source = administration_stream(directory, &fenced, maximum_message_bytes).await?;
     rtdb_logkeeper::seal(&source, pending.epoch).await?;
 
-    let cipher = Cipher::new(&material)?;
-    for (name, object) in objects {
-        let ciphertext = read_object(files.as_ref(), &name, object).await?;
-        cipher.open(name.as_str(), &ciphertext)?;
-    }
     let completed = update_installation(directory, &id, |record| {
         let recovery = record
             .checkpoint_recovery
