@@ -226,7 +226,7 @@ mod tests {
     #[tokio::test]
     async fn a_full_journal_queue_delays_the_decision_until_capacity_is_available() {
         let directory = tempfile::tempdir().unwrap();
-        let (journal, recovered) = Journal::open(directory.path(), false, 0).unwrap();
+        let (journal, recovered, _) = Journal::open(directory.path(), false, 0, None).unwrap();
         let (queue, mut work) = mpsc::unbounded_channel();
         let store = Store::new(Arc::new(journal), recovered, queue);
         let overwrite = |stream: &str| RequestBody::Overwrite(Overwrite {

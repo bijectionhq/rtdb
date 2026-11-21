@@ -7,7 +7,7 @@ use std::{
 };
 
 use ring::hmac;
-use rtdb_directory::{DeploymentRecord, Directory, Lifecycle};
+use rtdb_directory::{DeploymentRecord, Directory, DisposalReceipt, Lifecycle};
 use rtdb_types::{
     Anomaly,
     AnomalyCategory,
@@ -50,6 +50,7 @@ struct Request {
     token: String,
     name: String,
     authority: Uuid,
+    incarnation: u64,
     observation: Option<ArchiveObservation>,
 }
 
@@ -201,42 +202,63 @@ impl Installer {
         if !token.is_some_and(|token| token.accepts(&request.token)) {
             return Ok(Reply::Refused);
         }
-        if request.observation.is_some()
-            != matches!(request.operation, Operation::ConfirmRecoveryArchive)
+        if request.incarnation == 0 || request.authority.is_nil()
+            || request.observation.is_some() != matches!(request.operation, Operation::ConfirmRecoveryArchive)
         {
             return Ok(Reply::Refused);
         }
+        let existing = directory.deployment_by_name(&request.name).await?;
+        if let Some(installation) = existing.as_ref() {
+            if installation.id != request.authority.to_string() || installation.org != self.org
+                || installation.parent.is_some()
+            {
+                return Ok(Reply::Refused);
+            }
+            if installation.incarnation != request.incarnation {
+                let Some(prior) = installation.retired_residences.get(&request.incarnation) else {
+                    return Ok(Reply::Refused);
+                };
+                return match request.operation {
+                    Operation::ScheduleDisposal | Operation::InspectDisposal => {
+                        disposed_reply(installation.name.clone(), request.authority, &prior.serving)
+                    },
+                    Operation::ScheduleRecoveryDisposal => match &prior.archives {
+                        Some(receipt) => Ok(Reply::RecoveryDisposed {
+                            name: installation.name.clone(),
+                            authority: request.authority,
+                            epoch: receipt.epoch,
+                            evidence: receipt_evidence(receipt)?,
+                        }),
+                        None => Ok(Reply::Deferred),
+                    },
+                    _ => Ok(Reply::Refused),
+                };
+            }
+        }
         match request.operation {
             Operation::Install => {
-                let record = admin::install_deployment(
-                    directory,
-                    request.authority,
-                    &request.name,
-                    &self.org,
-                    self.replicas,
-                )
-                .await?;
-                Ok(Reply::Installed {
-                    name: record.name,
-                    authority: request.authority,
-                })
+                let record = if request.incarnation == 1 {
+                    admin::install_deployment(directory, request.authority, &request.name, &self.org, self.replicas).await?
+                } else {
+                    let Some(existing) = existing.filter(|record| record.linearizable_reads
+                        && record.ensemble.len() == self.replicas
+                        && matches!(record.lifecycle, Lifecycle::Live | Lifecycle::Quarantined))
+                    else { return Ok(Reply::Deferred); };
+                    existing
+                };
+                if record.incarnation != request.incarnation {
+                    return Ok(Reply::Refused);
+                }
+                Ok(Reply::Installed { name: record.name, authority: request.authority })
             }
             Operation::ScheduleDisposal => {
-                let installation =
-                    admin::begin_hosted_disposal(directory, request.authority, &request.name, &self.org)
-                        .await?;
+                let installation = admin::begin_hosted_disposal(
+                    directory, request.authority, &request.name, &self.org, request.incarnation,
+                ).await?;
                 disposal_reply(installation, request.authority)
             }
             Operation::InspectDisposal | Operation::ScheduleRecoveryDisposal | Operation::ConfirmRecoveryArchive => {
-                let Some(installation) = directory.deployment_by_name(&request.name).await? else {
-                    return Ok(Reply::Deferred);
-                };
-                if installation.id != request.authority.to_string()
-                    || installation.org != self.org
-                    || installation.parent.is_some()
-                {
-                    return Ok(Reply::Refused);
-                }
+                let Some(installation) = existing else { return Ok(Reply::Deferred); };
                 if let Some(observation) = request.observation {
                     crate::archive::confirm_remote_archive(
                         directory,
@@ -250,7 +272,9 @@ impl Installer {
                     });
                 }
                 if matches!(request.operation, Operation::ScheduleRecoveryDisposal) {
-                    let receipt = crate::archive::begin_retirement(directory, request.authority).await?;
+                    let receipt = crate::archive::begin_retirement_at(
+                        directory, request.authority, Some(request.incarnation),
+                    ).await?;
                     if receipt.observed_empty_at_ms.is_some() {
                         return Ok(Reply::RecoveryDisposed {
                             name: installation.name,
@@ -282,13 +306,7 @@ impl Installer {
 
 fn disposal_reply(installation: DeploymentRecord, authority: Uuid) -> Result<Reply> {
     match (installation.lifecycle, installation.disposal) {
-        (Lifecycle::Deleted, Some(receipt)) => Ok(Reply::Disposed {
-            name: installation.name,
-            authority,
-            epoch: receipt.epoch,
-            serving_inventory: receipt.serving_inventory,
-            evidence: receipt_evidence(&receipt)?,
-        }),
+        (Lifecycle::Deleted, Some(receipt)) => disposed_reply(installation.name, authority, &receipt),
         (Lifecycle::Deleting, None) => Ok(Reply::Scheduled {
             name: installation.name,
             authority,
@@ -296,6 +314,16 @@ fn disposal_reply(installation: DeploymentRecord, authority: Uuid) -> Result<Rep
         }),
         _ => Ok(Reply::Deferred),
     }
+}
+
+fn disposed_reply(name: String, authority: Uuid, receipt: &DisposalReceipt) -> Result<Reply> {
+    Ok(Reply::Disposed {
+        name,
+        authority,
+        epoch: receipt.epoch,
+        serving_inventory: receipt.serving_inventory,
+        evidence: receipt_evidence(receipt)?,
+    })
 }
 
 fn receipt_evidence(receipt: &impl Serialize) -> Result<[u8; 32]> {
@@ -380,7 +408,7 @@ mod tests {
         let authority = Uuid::new_v4();
         let request = |operation: &str, token: &str, authority: Uuid| {
             serde_json::json!({
-                "operation": operation, "token": token, "name": "tenant", "authority": authority
+                "operation": operation, "token": token, "name": "tenant", "authority": authority, "incarnation": 1
             })
             .to_string()
         };
@@ -412,5 +440,17 @@ mod tests {
             installer.handle(directory.as_ref(), &request("install", &install, authority)).await,
             Reply::Refused
         ));
+
+        let first = directory.deployment_by_name("tenant").await.unwrap().unwrap();
+        let mut returned = first.clone();
+        returned.incarnation = 3;
+        returned.epoch = 7;
+        returned.lifecycle = Lifecycle::Live;
+        let returned = directory.replace_deployment(returned, first.version).await.unwrap().applied().unwrap();
+        assert!(matches!(
+            installer.handle(directory.as_ref(), &request("schedule_disposal", &disposal, authority)).await,
+            Reply::Refused
+        ));
+        assert_eq!(directory.deployment_by_name("tenant").await.unwrap(), Some(returned));
     }
 }

@@ -229,7 +229,8 @@ pub struct DeploymentRecord {
     pub org: String,
     /// The id of the lineage's root; the deployment's own id for a root.
     pub lineage: String,
-    /// Bumped when a deployment is recreated under the same name, so the new one's objects and logs never meet the old one's.
+    /// The physical residence. Each transfer gives the destination a new
+    /// incarnation while clients keep the deployment ID.
     pub incarnation: u64,
     pub lifecycle: Lifecycle,
     /// The writer fence. 0 means never held.
@@ -295,6 +296,9 @@ pub struct DeploymentRecord {
     pub deletion_record: Option<DeletionRecord>,
     pub cell_transfer: Option<CellTransfer>,
     pub disposal: Option<DisposalReceipt>,
+    /// Serving and archive receipts for earlier stays in this same cell.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub retired_residences: BTreeMap<u64, RetiredResidence>,
     pub checkpoint_recovery: Option<CheckpointRecovery>,
     /// Replay retains logical transactions through this position, but the restored checkpoint
     /// replaces the former serving storage and its compaction effects through the same position.
@@ -384,6 +388,8 @@ pub struct ArchiveRetirement {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CellTransfer {
     pub intent: CellTransferIntent,
+    pub source_incarnation: u64,
+    pub destination_incarnation: u64,
     pub epoch: u64,
     pub source_media: CellMedia,
     pub destination_media: CellMedia,
@@ -414,7 +420,8 @@ pub struct CellResidence {
 #[serde(deny_unknown_fields)]
 pub struct PreparedCellTransfer {
     pub intent: CellTransferIntent,
-    pub incarnation: u64,
+    pub source_incarnation: u64,
+    pub destination_incarnation: u64,
     pub epoch: u64,
 }
 
@@ -446,6 +453,15 @@ pub struct DisposalReceipt {
     pub serving_inventory: ServingInventory,
 }
 
+/// The retained evidence of an earlier stay after this cell reserved the
+/// name again. Pending checkpoint captures stay in the local capture inventory.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RetiredResidence {
+    pub transfer: CellTransfer,
+    pub serving: DisposalReceipt,
+    pub archives: Option<ArchiveRetirement>,
+}
+
 /// The directory's record of a deployment's last published block (value `Checkpoint`): its index, the replica offset of its boundary record, and the last source offset it covers.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Checkpoint {
@@ -473,7 +489,7 @@ impl DeploymentRecord {
         let id = uuid::Uuid::new_v4().to_string();
         Self { lineage: id.clone(), id, name: name.into(), org: org.into(), incarnation: 1, lifecycle: Lifecycle::Live, epoch: 0, holder: None,
             ensemble, replica_journals: BTreeSet::new(), storage_regions: BTreeMap::new(), read_width: 1, activation_crashes: 0, created_at_ms: now_ms, move_intent: None, placement_move: None, log_epoch: 0, parent: None, move_from: None, log_copy_servers: Vec::new(), linearizable_reads: false, checkpoint: None, moved_at_ms: None, source_cleanup: None, cell_move: None, storage_generation: None, storage_namespaces: None, deletion_record: None, s3_write_lease_until_ms: None, engine_pin: None, deletion_observation: None,
-            cell_transfer: None, disposal: None, checkpoint_recovery: None, compaction_replay_cutoff: None, checkpoint_captures: BTreeMap::new(), archive_retirement: None, version: 0 }
+            cell_transfer: None, disposal: None, retired_residences: BTreeMap::new(), checkpoint_recovery: None, compaction_replay_cutoff: None, checkpoint_captures: BTreeMap::new(), archive_retirement: None, version: 0 }
     }
 
     pub fn writer_pool(&self) -> Option<MemberPool> {
@@ -508,7 +524,7 @@ impl DeploymentRecord {
         self.s3_write_lease_until_ms.filter(|deadline| *deadline > now_ms)
     }
 
-    /// The affinity key: stable across epochs and residency, distinct across incarnations.
+    /// The affinity key of a residence, stable across writer epochs.
     pub fn storage_identity(&self) -> String { format!("{}/{}", self.id, self.incarnation) }
 
     /// The only prefix this deployment's objects may live under.
@@ -521,8 +537,18 @@ impl DeploymentRecord {
         format!("{:04x}/{}/{}/{}/{store}", fnv16(self.id.as_bytes()), self.org, self.lineage, self.id)
     }
 
-    /// The name of one of this deployment's log streams on its ensemble.
+    /// The key custody record for one residence. Withdrawing an old
+    /// residence's key cannot withdraw the current residence's key record.
+    pub fn key_id(&self) -> String {
+        if self.incarnation == 1 { self.id.clone() } else { format!("{}-{}", self.id, self.incarnation) }
+    }
+
+    /// The name of a physical log stream on this residence's ensemble.
     pub fn stream(&self, kind: &str) -> String { format!("{}/{}/{kind}", self.id, self.incarnation) }
+
+    /// The ciphertext binds to the logical deployment. A transfer copies
+    /// the records into the destination journal at their original offsets.
+    pub fn replica_seal_scope(&self) -> String { format!("{}/1/replica", self.id) }
 }
 
 /// FNV-1a folded to 16 bits, as Bijection's `tenant_prefix`.

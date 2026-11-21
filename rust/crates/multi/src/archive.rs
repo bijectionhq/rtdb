@@ -637,7 +637,7 @@ async fn capture_registered(
     let receipt = key("capture.json")?;
     archive.put(&spec, encode(&point)?).await?;
     let material = keys
-        .existing_key(&record.id)
+        .existing_key(&record.key_id())
         .await?
         .ok_or_else(|| unavailable("The source key is unavailable"))?;
     if let Some(completed) = read::<Capture>(&archive, &receipt).await? {
@@ -789,7 +789,7 @@ pub(crate) async fn restore_checkpoint(
         ));
     }
     let material = keys
-        .existing_key(&id)
+        .existing_key(&current.key_id())
         .await?
         .ok_or_else(|| unavailable("The current installation key is unavailable"))?;
     capture.verify(archive_bucket, &prefix, &material).await?;
@@ -879,7 +879,18 @@ pub(crate) async fn restore_checkpoint(
 /// The recovery owner authorizes withdrawal only after the serving
 /// installation has been disposed and its independent retention holds end.
 pub async fn begin_retirement(directory: &dyn Directory, deployment: Uuid) -> Result<ArchiveRetirement> {
+    begin_retirement_at(directory, deployment, None).await
+}
+
+pub(crate) async fn begin_retirement_at(
+    directory: &dyn Directory,
+    deployment: Uuid,
+    incarnation: Option<u64>,
+) -> Result<ArchiveRetirement> {
     let record = update_installation(directory, &deployment.to_string(), |record| {
+        if incarnation.is_some_and(|expected| expected != record.incarnation) {
+            return Err(inconsistent("The archive retirement names another residence"));
+        }
         if record.lifecycle != Lifecycle::Deleted || record.disposal.is_none() {
             return Err(inconsistent("Recovery retirement requires a serving disposal receipt"));
         }

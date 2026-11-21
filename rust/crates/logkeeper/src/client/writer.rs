@@ -210,10 +210,9 @@ impl Writer {
         Self::establish(Arc::clone(&ensemble), epoch, &replies, recovered).await
     }
 
-    /// Seals `previous`, the loglet that held the stream from `previous_start`, at `epoch`, recovers its committed tail, copies it onto `ensemble` from the lsn `from` names, and only then opens the pipeline on `ensemble`.
-    /// Returns the writer and that lsn, where `ensemble`'s loglet starts.
-    /// The recovered history is first synced onto a write quorum of `previous` and committed there below that lsn, so readers of the earlier loglet find every lsn it keeps committed whichever of its servers they reach.
-    pub async fn open_moved(previous: &Ensemble, previous_start: i64, ensemble: Arc<Ensemble>, epoch: u64, from: CopyFrom) -> Result<(Arc<Self>, i64)> {
+    /// Recovers the same history used by a local ensemble move and by a
+    /// copy to a different physical stream.
+    async fn recover_moved(previous: &Ensemble, previous_start: i64, epoch: u64, from: CopyFrom) -> Result<Recovered<'_>> {
         let previous_replies = seal_quorum(previous, epoch).await?;
         let sealed: Vec<Sealed> = previous_replies.iter().map(|(_, sealed)| sealed.clone()).collect();
         let (source, winning) = &previous_replies[winner(&sealed)];
@@ -221,9 +220,23 @@ impl Writer {
         let start = match from { CopyFrom::Retained => previous_start, CopyFrom::Lsn(lsn) => lsn }.clamp(history.trim + 1, history.last + 1);
         let in_place = Recovered { source: (previous, *source), start: history.trim + 1, history: history.clone() };
         sync_quorum(previous, epoch, &previous_replies, &in_place, start - 1).await?;
+        Ok(Recovered { source: (previous, *source), history, start })
+    }
+
+    /// Copies the recovered suffix into another ensemble and opens its writer.
+    pub async fn open_moved(previous: &Ensemble, previous_start: i64, ensemble: Arc<Ensemble>, epoch: u64, from: CopyFrom) -> Result<(Arc<Self>, i64)> {
+        let recovered = Self::recover_moved(previous, previous_start, epoch, from).await?;
+        let start = recovered.start;
         let replies = seal_quorum(&ensemble, epoch).await?;
-        let recovered = Recovered { source: (previous, *source), history, start };
         Ok((Self::establish(ensemble, epoch, &replies, recovered).await?, start))
+    }
+
+    /// Commits the retained history in its new journal without opening a writer.
+    pub(super) async fn copy_retained(previous: &Ensemble, destination: &Ensemble, epoch: u64) -> Result<()> {
+        let recovered = Self::recover_moved(previous, 0, epoch, CopyFrom::Retained).await?;
+        let replies = seal_quorum(destination, epoch).await?;
+        sync_quorum(destination, epoch, &replies, &recovered, recovered.history.last).await?;
+        Ok(())
     }
 
     /// Syncs every sealed server of `ensemble` to the recovered history, commits it on a write quorum, and opens the pipeline after it.
