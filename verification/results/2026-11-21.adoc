@@ -1208,3 +1208,26 @@ The model takes final retirement as a premise and leaves reference transfers, ex
 The focused run used `lean -j 1` and the registered TLC cases.
 The full runner can replay both configurations and their controls.
 The completed input SHA-256 values are `2c319c0f45ffaeb5655deb8fe1f8c266e2379042ca52e321be4bc64febcfa6a7` for the TLA+ model and `3b7275266258436aaff94d6a7d95dd05efe74e38358c17ffdf9b85130956243f` for the Lean model. link:../README.adoc#_run_the_studies[Runner and pinned tools] · link:../tla/ResidenceReaderRetention.tla[TLA+ model] · link:../lean/ResidenceReaderRetention.lean[Lean laws]
+
+=== Independent and shared-reference fork publication
+
+TLC 2026.11.19 compared a fork with a durable independent checkpoint and a fork with coordinated shared references.
+The model has one source and one child, a two-object checkpoint, one captured reaper inventory, and one outstanding physical deletion.
+It separates preparation from publication and includes a refusal after source collection removes the remaining prerequisites.
+The reference policy explored 27 reachable states and the copy policy explored 38.
+Every published child remained readable.
+
+Four controls violated `PublishedChildReadable`.
+They omit validation of the captured referrers, allow a new shared dependency during a pending deletion, delete before transferring the shared objects, or publish a partial independent copy.
+The stale-inventory control has a five-transition counterexample.
+Both baseline policies admit a child that stays readable after source collection and allow refusal after an incomplete preparation loses its inputs.
+
+The shared-reference baseline assumes that authorization and publication use common lineage authority.
+The ordinary Rust reference reaper captures a deployment inventory and later copies for observed referrers before the delete.
+The local maintenance lock serializes those operations on local storage.
+The hosted case needs separate evidence that its inventory and provider operation refine the modeled authority.
+The independent checkpoint case abstracts physical copy completion, decryption, tail replay, ambiguous outcomes and multiple ancestors.
+This study establishes finite model properties only.
+
+The registered TLC runner executes both policies, all four controls, and four reachability witnesses.
+The checked model SHA-256 is `29a3d6d5f5d5160470418f4f577fb60df7be030c02ee9324639c9d8eb00f7bf6`. link:../tla/ForkPublication.tla[Fork model] · link:../README.adoc#_run_the_studies[Runner]

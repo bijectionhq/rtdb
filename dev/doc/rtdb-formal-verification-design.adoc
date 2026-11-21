@@ -664,6 +664,36 @@ The trie collector snapshots that registry with the current state and excludes d
 I/O regions keep those references through provider completion, and an in-progress collection prevents a compactor reset from reopening its key allocation.
 Runtime coordination for query snapshots and object reclamation across separate partition owners remains open. link:../../verification/tla/LeaseAdmission.tla[Bounded comparison] · link:gc.allium[Trie collection contract]
 
+=== Fork publication while the source is being collected
+
+A fork becomes available when the directory publishes the child.
+At that boundary the child must have a complete, readable checkpoint and the committed tail selected for the fork.
+A refused preparation may clean up its private state once it knows that publication did not take effect.
+An ambiguous publication must preserve that state until its outcome is known.
+
+The copy policy publishes an independent checkpoint only after all required children of its root are durable in the destination's physical residence.
+The directory still checks that the source may authorize the fork.
+Source data read before publication can become unavailable, in which case an incomplete copy yields a refusal.
+Once a complete copy is published, its liveness depends on its own data and provider authority.
+Tail durability, byte-level equivalence and the independent key under which a cross-organisation copy is sealed have separate evidence obligations.
+
+A shared-reference policy uses a common authority to make fork publication and reaper deletion authorization mutually consistent.
+A reaper snapshots the published referrers and validates that inventory at authorization.
+After authorization a new fork cannot depend on a location that the existing operation can remove.
+Before removal the reaper must copy the object into every referrer admitted by the authority and wait for completion.
+This can be implemented with a lineage-scoped fence, because a child's manifest can name an ancestor as the physical owner.
+
+The Rust reference reaper scans the deployment inventory before reaching the provider delete.
+The existing local maintenance lock serializes local fork preparation with that sweep.
+On S3 the local lock helper returns without acquiring a distributed fence.
+A source revision check at child publication alone does not establish that a later provider deletion used a complete inventory.
+The shared-reference model therefore states the additional authorization premise explicitly.
+Its counterexamples concern the model, with hosted integration and provider-level evidence still open.
+
+The finite comparison models a root and one payload.
+Both policies admit a child that stays readable after source collection.
+Both allow refusal when collection removes inputs before the fork can establish its dependency contract. link:../../verification/tla/ForkPublication.tla[Fork publication model]
+
 === Cross-node retention of serving snapshots
 
 The local partition can capture a query catalog consistently with its own collection decisions.

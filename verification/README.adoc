@@ -156,6 +156,9 @@ It also exercises the Azure adapter against a loopback provider and separately m
 * `tla/Checkpoint.tla` separates durable object publication, lost replies, listing, and log replay across a restart.
   It checks one root and three dependencies with finite failures, including early publication, loss of an acknowledged dependency, and log trimming followed by a listing omission.
   It compares an acknowledged pending copy with a copy whose completion is checked.
+* `tla/ForkPublication.tla` compares a complete independent checkpoint copy and a coordinated publication of shared references.
+  Both variants separate child publication, reaper inventory, deletion authorization and the provider effect.
+  The controls check stale inventory, missed admission fencing, early source deletion and incomplete destination publication.
 * `tla/ResidenceReaderRetention.tla` compares a generation cutoff and exact dependency holds across independent readers and a reaper.
   Both models separate catalog publication, release certification, a captured sweep and later deletion, and keep closed readers' provider work protected until drain.
   `lean/ResidenceReaderRetention.lean` proves safety conditional on the retirement certificate and the captured-reader premise.
