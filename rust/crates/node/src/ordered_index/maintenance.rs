@@ -15,7 +15,7 @@ use tokio_util::sync::CancellationToken;
 
 use super::{
     Definition, INDEX_ROOT,
-    checkpoint::{self, Checkpoint},
+    checkpoint,
     definitions, format_error,
     projection::{Changes, EventOrder, RevisionRoots},
     tree::{Root, Tree},

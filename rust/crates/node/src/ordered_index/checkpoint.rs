@@ -274,13 +274,8 @@ pub(super) async fn publish(
     if cancellation.is_cancelled() {
         return Err(cancelled());
     }
-    tree.storage
-        .object_store()
-        .put(
-            &key(tree, format_args!("manifests/{through:016x}"))?,
-            encoded.into(),
-        )
-        .await?;
+    let manifest = key(tree, format_args!("manifests/{through:016x}"))?;
+    tree.storage.object_store().put(&manifest, encoded.into()).await?;
     latest(tree, through)
         .await?
         .ok_or_else(|| format_error("Published checkpoint is unavailable"))

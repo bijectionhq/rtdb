@@ -313,7 +313,7 @@ impl Context<'_> {
                 let columns: Vec<_> = columns.iter().map(Identifier::normalized).collect();
                 if columns.iter().collect::<BTreeSet<_>>().len() != columns.len() { return Err(error("CREATE INDEX repeats a column")); }
                 if columns.iter().any(|name| name.starts_with('_') && name != "_id") { return Err(error("CREATE INDEX cannot index internal columns")); }
-                Ok(Statement::Dml(Dml::CreateOrderedIndex { name: name.normalized(), table: self.target(table)?, columns, if_not_exists }))
+                Ok(Statement::Dml(Dml::CreateOrderedIndex { name: name.normalized(), table: self.target(table)?, columns, if_not_exists: *if_not_exists }))
             }
             Syntax::DropOrderedIndex { name } => Ok(Statement::Dml(Dml::DropOrderedIndex { name: name.normalized() })),
             Syntax::Records { patch, table, records } => {

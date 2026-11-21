@@ -251,12 +251,12 @@ impl<'scope> Tree<'scope> {
             return Err(format_error("Ordered index page has the wrong length"));
         }
         let bytes = store.get_fresh(&object).await?;
-        if bytes.as_slice().len() != pointer.size
-            || format!("{:x}", Sha256::digest(bytes.as_slice())) != pointer.digest
+        if bytes.len() != pointer.size
+            || format!("{:x}", Sha256::digest(bytes.as_ref())) != pointer.digest
         {
             return Err(format_error("Ordered index page checksum mismatch"));
         }
-        let page = match serde_json::from_slice(bytes.as_slice()).map_err(format_error)? {
+        let page = match serde_json::from_slice(bytes.as_ref()).map_err(format_error)? {
             StoredPage::Leaf(entries)
                 if !entries.is_empty()
                     && entries.len() <= FANOUT

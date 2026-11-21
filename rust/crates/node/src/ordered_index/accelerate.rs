@@ -6,7 +6,7 @@ use std::{
 use async_trait::async_trait;
 use rtdb_plan::{BinaryOp, ColumnId, Expr, Field};
 use rtdb_query::{ScanAccelerator, ScanRequest};
-use rtdb_types::{AnomalyCategory, Iid, LogicalType, Result, ScalarType, Value};
+use rtdb_types::{AnomalyCategory, Iid, LogicalType, Result, ScalarType};
 use std::sync::Arc;
 
 use super::{
