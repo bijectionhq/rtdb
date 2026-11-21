@@ -1485,3 +1485,48 @@ The JVM core suite passed 742 cases and the Gradle property-test tasks passed 3,
 The JVM binding suite passed 398 cases with a separately built `rtdb-ffi` library supplied through `xtdb.native.library`.
 The 20-case compactor class passed when rerun after the workspace run hit the one-second recency case timeout.
 The final workspace `test` run succeeded with the native library configured and one Gradle worker, with 3,195 passing cases across the reported test suites.
+
+=== Hosted catalog readers and installed lease progress
+
+The Rust query context, delegated scan, membership scan and transaction resolver register captures through the serving store.
+The directory admission binds the capture to an open storage region, residence and journal epoch.
+An opaque registration represents a captured catalog whose installed cut is unavailable.
+The same registration stays live through admitted provider work after its waiter is cancelled.
+The directory reaper still uses the existing collection policy for ordinary tries and their artefacts.
+
+The follower lease confirms a journal tip from installed progress.
+Native driver tests distinguish that progress from received progress while a block or transaction resolution holds effects.
+The integrated run includes both follower cursor lease cases and the hosted tests for advancing the live catalog while holding an older capture, rejecting an obsolete owner or journal, and keeping provider work registered through cancellation.
+
+Verus verifies six functions in `catalog_reader_admission` against the production predicate.
+The eight controls remove each guard separately or also weaken its contract, and fail at the expected postcondition or law.
+This evidence covers the pure directory admission decision under its inputs.
+The async update, cancellation handling and storage handoff have native test evidence.
+
+TLC explores 21 states in `RetirementPublication` over one reader, three cuts and two incarnations.
+It rejects the three weakened variants and reaches collection followed by a readable replacement.
+The production collector still needs a durable retirement-intent and certificate protocol, and provider deletion must target the certified physical identity. link:../../dev/doc/rtdb-formal-verification-design.adoc[Protocol and scope]
+
+At `b82dd238c`, 476 scoped Rust tests passed and the credentialed DynamoDB test was ignored.
+The run also includes the merged leaf-order contracts and the bounded object-read integration tests.
+The focused JVM `xtdb.trie.MemoryHashTrieTest` suite at that revision passed all 13 cases.
+The preceding run at `da662a25a` passed 334 scoped tests.
+
+[source,shell]
+----
+cd rust
+BIJECTION_LOCAL_EXECUTION=owner-authorized cargo test --offline --locked \
+  -p rtdb-multi --features dynamodb --lib --test cell \
+  -p rtdb-node --test fragments --test native -p rtdb-replication \
+  -p rtdb-maintenance --test gc -p rtdb-conformance --test node_faults \
+  -p rtdb-trie --test contracts -p rtdb-storage --test remote --no-fail-fast
+----
+
+The machine-local command logs and proof artifacts are under
+`/private/tmp/rtdb-formal.QMjPSJsX/catalog-reader-and-leaf-b82dd238c-native.log` and
+`/private/tmp/rtdb-formal.QMjPSJsX/combined-b82dd238c/`.
+The combined run records the checked revision, tool hashes, input hashes and command outputs.
+The combined run at `b82dd238c` finished successfully with 452 recorded commands, including 134 Lean cases, 147 TLC cases and 125 Verus cases.
+Z3, Alloy, Apalache, Maude, mCRL2 and AutoHyper also met their declared baseline and control outcomes.
+The combined run used the formal tools only.
+The separate scoped native and JVM runs above supply the runtime observations for this change.
