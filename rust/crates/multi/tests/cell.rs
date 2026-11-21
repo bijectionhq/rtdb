@@ -1815,6 +1815,31 @@ async fn pipelined_prepared_writes_commit_individually_before_and_after_a_move()
     cell.stop().await;
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn extended_copy_keeps_the_same_gateway_session_available_for_later_writes() {
+    use bytes::Bytes;
+    use futures::SinkExt;
+
+    let cell = Cell::start(2, None).await;
+    admin::create_deployment(cell.directory.as_ref(), "shop", "acme", 3).await.unwrap();
+    let client = cell.connect("shop").await;
+    tokio::time::timeout(Duration::from_secs(5), async {
+        let input = client.copy_in("COPY counters FROM STDIN WITH (FORMAT 'transit-json')").await.unwrap();
+        let mut input = std::pin::pin!(input);
+        input.as_mut().send(Bytes::from_static(br#"["^ ","_id",1,"n",10]"#)).await.unwrap();
+        assert_eq!(input.as_mut().finish().await.unwrap(), 1);
+        {
+            let abandoned = client.copy_in("COPY counters FROM STDIN WITH (FORMAT 'transit-json')").await.unwrap();
+            let mut abandoned = std::pin::pin!(abandoned);
+            abandoned.as_mut().send(Bytes::from_static(br#"["^ ","_id",2,"n",80]"#)).await.unwrap();
+        }
+        client.simple_query("UPDATE counters SET n = n + 2 WHERE _id = 1").await.unwrap();
+        assert_eq!(values(&client, "SELECT n FROM counters").await, ["12"]);
+    }).await.expect("the extended copy and its next write finish");
+    drop(client);
+    cell.stop().await;
+}
+
 /// Every column of every row `sql` returns, sorted.
 async fn rows(client: &tokio_postgres::Client, sql: &str) -> Vec<String> {
     let mut rows: Vec<String> = client.simple_query(sql).await.unwrap().into_iter().filter_map(|message| match message {

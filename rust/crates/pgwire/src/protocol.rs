@@ -93,6 +93,7 @@ impl ProtocolSession {
 
     pub async fn handle<W: AsyncWrite + Unpin>(&mut self, frame: Frame, writer: &mut Writer<W>) -> Result<()> {
         if self.skip_until_sync && frame.tag != b'S' { return Ok(()); }
+        if self.copy.is_some() && matches!(frame.tag, b'S' | b'H') { return Ok(()); }
         let result = self.message(&frame, writer).await;
         if let Err(error) = result {
             if error.code == "xtdb.pgwire/connection-error" { return Err(error); }
@@ -172,8 +173,24 @@ impl ProtocolSession {
             b'S' => { input.end()?; if self.implicit { let result = if self.session.state().status() == TransactionStatus::Failed { self.rollback() } else { self.commit().await }; if let Err(error) = result { writer.error(&error, self.environment()?.fallback(), false).await?; } } self.skip_until_sync = false; self.extended = false; writer.ready(self.ready()).await?; }
             b'H' => { input.end()?; writer.flush().await?; }
             b'd' => { self.copy.as_mut().ok_or_else(|| protocol("COPY IN not in progress, cannot write data"))?.append(input.remaining()).await?; }
-            b'c' => { input.end()?; let copy = self.copy.take().ok_or_else(|| protocol("COPY IN not in progress"))?; let token = self.token(); let result = copy.finish(&mut self.session, &self.node, &token).await; if self.session.state().status() == TransactionStatus::Idle { self.end_transaction(); } match result { Ok(rows) => writer.string(b'C', &format!("COPY {rows}")).await?, Err(error) => writer.error(&error, self.environment()?.fallback(), false).await? } writer.ready(self.ready()).await?; }
-            b'f' => { self.copy = None; writer.ready(self.ready()).await?; }
+            b'c' => {
+                input.end()?;
+                let copy = self.copy.take().ok_or_else(|| protocol("COPY IN not in progress"))?;
+                let token = self.token();
+                let result = copy.finish(&mut self.session, &self.node, &token).await;
+                if self.session.state().status() == TransactionStatus::Idle { self.end_transaction(); }
+                match result {
+                    Ok(rows) => writer.string(b'C', &format!("COPY {rows}")).await?,
+                    Err(error) if self.extended => return Err(error),
+                    Err(error) => writer.error(&error, self.environment()?.fallback(), false).await?,
+                }
+                if !self.extended { writer.ready(self.ready()).await?; }
+            }
+            b'f' => {
+                self.copy = None;
+                if self.extended { return Err(protocol("COPY input was cancelled")); }
+                writer.ready(self.ready()).await?;
+            }
             b'p' => (),
             _ => return Err(Anomaly::unsupported("xtdb.pgwire/unknown-client-msg", format!("unknown client message: {}", frame.tag))),
         }
@@ -344,7 +361,14 @@ impl ProtocolSession {
                         if matches!(statement, ControlStatement::SetRole) { return Ok(()); }
                         writer.string(b'C', &tag).await
                     }
-                    ControlResult::CopyIn { table, format, allocation: _allocation } => { self.copy = Some(crate::copy::CopyInput::new(table, format, self.node.memory(), self.config.maximum_copy_bytes)?); let format = self.copy.as_ref().ok_or_else(|| protocol("COPY state missing"))?.wire_format(); writer.send(b'G', &[format.code() as u8, 0, 1, 0, format.code() as u8]).await?; writer.flush().await },
+                    ControlResult::CopyIn { table, format, allocation: _allocation } => {
+                        if self.config.read_only { return Err(Anomaly::incorrect("xtdb/dml-in-read-only-server", "COPY is not allowed on the READ ONLY server")); }
+                        let copy = crate::copy::CopyInput::new(table, format, self.node.memory(), self.config.maximum_copy_bytes)?;
+                        let format = copy.wire_format().code() as u8;
+                        self.copy = Some(copy);
+                        writer.send(b'G', &[format, 0, 1, 0, format]).await?;
+                        writer.flush().await
+                    }
                     _ => Err(protocol("Unexpected control execution result")),
                 }
             }

@@ -652,6 +652,8 @@ Moves are invisible to clients only if the gateway owns connections and session 
    Each autocommit cycle gets its own key after the previous cycle's ReadyForQuery.
    In an explicit transaction, the cycles retain the transaction's key through commit or rollback.
    COPY input continues to stream before ReadyForQuery. [PostgreSQL protocol flow](https://www.postgresql.org/docs/current/protocol-flow.html)
+   Extended COPY ignores Sync while consuming input and reports readiness on the Sync that follows completion or cancellation.
+   A read-only pgwire listener rejects COPY input before accepting payload bytes.
    A single pgwire autocommit write sends `CommandComplete` after the commit succeeds.
    PGwire carries stable placement interruption codes independently of the configured error detail format. [PostgreSQL ErrorResponse format](https://www.postgresql.org/docs/current/protocol-message-formats.html#PROTOCOL-MESSAGE-FORMATS-ERRORRESPONSE)
 5. **Suspicion reports** to the controller on connection failure.

@@ -241,7 +241,7 @@ impl Session {
             loop {
                 let event = {
                     let Some(current) = backend.as_mut() else { break Ok(()) };
-                    let waiting_for_ready = self.keyed && !copying_in && self.pending.last().is_some_and(|frame| command_boundary(frame.tag));
+                    let waiting_for_ready = self.keyed && !copying_in && self.pending.last().is_some_and(|frame| matches!(frame.tag, b'Q' | b'S'));
                     tokio::select! {
                         biased;
                         _ = self.record.wait_for(|record| record.as_ref().is_some_and(|record| {
@@ -281,14 +281,10 @@ impl Session {
                                 .await.map_err(|_| startup_timeout())?.map_err(io)?;
                             continue;
                         }
-                        if copying_in && matches!(request.tag, b'd' | b'c' | b'f') {
-                            backend.as_mut().expect("copy backend").dispatch(&request).await;
-                            if request.tag != b'd' {
-                                copying_in = false;
-                                if self.pending.last().is_none_or(|frame| !command_boundary(frame.tag)) {
-                                    self.pending.push(request);
-                                    self.status = Status::Busy;
-                                }
+                        if copying_in && matches!(request.tag, b'd' | b'c' | b'f' | b'S' | b'H') {
+                            if matches!(request.tag, b'd' | b'c' | b'f') {
+                                backend.as_mut().expect("copy backend").dispatch(&request).await;
+                                copying_in = request.tag == b'd';
                             }
                             continue;
                         }
@@ -354,10 +350,15 @@ impl Session {
                         self.answered = true;
                         match frame.tag {
                             b'1' | b'3' => self.confirm_prepared_change(frame.tag),
-                            b'G' => copying_in = true,
+                            b'G' => {
+                                copying_in = true;
+                                if self.pending.last().is_some_and(|frame| frame.tag == b'S') {
+                                    self.pending.pop();
+                                }
+                            }
                             b'E' => copying_in = false,
                             b'Z' => {
-                                if let Some(end) = self.pending.iter().position(|request| command_boundary(request.tag)) {
+                                if let Some(end) = self.pending.iter().position(|request| matches!(request.tag, b'Q' | b'S')) {
                                     self.pending.drain(..=end);
                                 }
                                 self.prepared_responses = 0;
@@ -437,8 +438,6 @@ impl Session {
         }
     }
 }
-
-fn command_boundary(tag: u8) -> bool { matches!(tag, b'Q' | b'S' | b'c' | b'f') }
 
 fn placement(record: &Option<DeploymentRecord>) -> Option<(u64, Lifecycle)> {
     record.as_ref().map(|record| (record.epoch, record.lifecycle))
