@@ -1242,24 +1242,25 @@ The cells used AWS S3 for data and a separate AWS S3 key vault.
 The gateway and controller ran in separate zones.
 The release builds used the `s3-key-vault` feature and disabled link-time optimization.
 
-Both default-block runs allocated 89 deployments, seeded 25, ran 2,048 acknowledged updates over 16 persistent sessions, and checked the final total.
+Each default-block run allocated 89 deployments, seeded 25, ran 2,048 acknowledged updates over 16 persistent sessions, and checked the final total.
 The recovery run explicitly checkpointed 24 installations and acknowledged another update on each immediately before it killed the writer.
 A burst admitted up to 24 clients at a time across 24 recovered installations and 64 previously unopened ones.
 Each recovered installation returned the checkpoint and acknowledged tail, then accepted another write.
 
-| Phase | Serial preparation `572d72d81f` | Parallel preparation `27590505d0` |
-| --- | ---: | ---: |
-| Warm update p99 | 320 ms | 320 ms |
-| Gateway-only partition startup p99, 24 sessions | 1.14 s | 1.14 s |
-| Recovered startup and verification query p99, 24 sessions | 8.53 s | 3.57 s |
-| Cold startup and verification query p99, 64 sessions | 7.43 s | 1.30 s |
-| End of the combined recovery and cold-start burst | 22.51 s | 5.37 s |
+| Phase | Serial preparation `572d72d81f` | Parallel preparation `27590505d0` | Parallel preparation with gateway TCP_NODELAY |
+| --- | ---: | ---: | ---: |
+| Warm update p99 | 320 ms | 320 ms | 311 ms |
+| Gateway-only partition startup p99, 24 sessions | 1.14 s | 1.14 s | 1.04 s |
+| Recovered startup and verification query p99, 24 sessions | 8.53 s | 3.57 s | 2.90 s |
+| Cold startup and verification query p99, 64 sessions | 7.43 s | 1.30 s | 1.33 s |
+| End of the combined recovery and cold-start burst | 22.51 s | 5.37 s | 5.17 s |
 
 Per-client measurements start when the benchmark admits the request.
 Burst duration includes time waiting for admission.
 The parallel build also includes the upstream checkpoint table manifest change.
-Both partition trials blocked the gateway's direct Pgwire port to the only writer and allowed the controller's path.
-All 24 clients reached that writer through its control relay.
+The last column repeats that build with TCP_NODELAY on accepted gateway client sockets.
+The partition trials blocked the gateway's direct Pgwire port to the only writer and allowed the controller's path.
+All 24 clients in each trial reached that writer through its control relay.
 
 A second workload forced a checkpoint after 64 rows or six seconds.
 The serial build hit the startup deadline during the combined burst.

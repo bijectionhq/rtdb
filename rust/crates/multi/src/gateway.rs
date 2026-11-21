@@ -114,6 +114,7 @@ pub async fn serve(listener: TcpListener, directory: Arc<dyn Directory>, options
             accepted = listener.accept() => accepted.map_err(io)?,
         };
         let Ok(permit) = Arc::clone(&connections).try_acquire_owned() else { continue; };
+        let _ = client.set_nodelay(true);
         let deployments = Arc::clone(&deployments);
         let frame_memory = Arc::clone(&frame_memory);
         let directory = Arc::clone(&directory);
