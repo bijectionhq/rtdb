@@ -77,9 +77,10 @@ The proof run checked the models and included Rust decision functions.
 
 ## Runtime integration
 
-The native `ordered_index` filter passed six cases on the merged engine with ordered distinct scans enabled.
-The cases cover idempotent declaration, ordered distinct limits, both scan directions, exact temporal reads, reopen, and primary compaction.
-Lean 4.35.0 checked seven law modules and audited 17 theorems.
+The native `ordered` filter passed eight cases on the merged engine with ordered distinct scans enabled.
+The cases cover idempotent declaration, ordered distinct limits, both scan directions, exact temporal reads, reopen, rebuilding a damaged root, and use of the adopted L0 inventory across primary compaction.
+All 18 trie catalog cases passed, as did the fresh-read disk-cache regression.
+Lean 4.35.0 checked seven law modules and audited 18 theorems.
 Verus 0.2026.11.05.31e44e6 on the MacBook Pro M1 checked ten domain functions and six seek functions using the included production sources.
 Verus 0.2026.11.20.9da409b checked 20 obligations after adding the production bucket step.
 Changing that step to choose a smaller bucket failed its maximal-width assertion.
@@ -88,6 +89,7 @@ TLC reran the erasure models and reproduced the three expected failures in their
 The local Bijection PgWire fixture `registered_pages_agree_with_and_without_ordered_index` exercised hosted WorldStore authority and fixture custody against a local RTDB build using the traced query implementation recorded at `49bd0c804845235ab0721c95dda596b5ee4c68b6`.
 The `scan_ordered_seek` attribute was present on both labelled ascending and descending reads before the index was dropped, and absent from the corresponding scans after the drop.
 At one basis and observation, both paths returned the expected rows, continuation and authenticated consumed predicate, and both registrations revalidated.
+On the published Bijection source `96b534c7c49ed01d57a307ebee42fadb083ae601`, the paired fixture and the full RTDB WorldStore conformance fixture both passed against the local hosted engine.
 Hosted provider upload settlement and reader eviction remain production proof obligations.
 
 ## Generation retirement model
