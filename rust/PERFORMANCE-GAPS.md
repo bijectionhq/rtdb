@@ -67,6 +67,49 @@ This quantifies the client materialization cost in the full-scan benchmark.
 The full-run reports and phase samples are in `mini2-packaged-55277dbf3`, and the ingest-only repeats are in `mini2-pgwire-on-55277dbf3` and `mini2-pgwire-off-55277dbf3`.
 These directories are under `~/.cache/rtdb-parity-ff72d7394/build/bench-followup` on Mac mini 2.
 
+## Architecture parity
+
+The architecture changes below postdate the measured package `55277dbf3`.
+The performance tables above apply to that exact package.
+
+| Area | Work in this branch | Remaining difference |
+| --- | --- | --- |
+| DataFusion execution | Native DataFusion filtering, projection and limiting for eligible Arrow batches, with additional physical-expression coverage | RTDB still owns other physical operators and the scalar evaluator for expressions with different semantics. [Operator coverage](crates/query/README.adoc) |
+| Plan reuse | Bounded node-level caches for bound queries and static mutations serve pgwire, Flight SQL and embedded ADBC | Query execution still emits its operators against the current snapshot, and data-dependent mutation planning remains in the transaction resolver |
+| Storage reads | Range reads for the Arrow footer, dictionaries and requested pages on a cold scan, with immutable local and disk-cache mappings | Compressed IPC and legacy null metadata can require a decoded allocation or copy |
+| Live index | Readers retain the published partition state while a writer prepares the next value, staged predecessor segments are reused, and eligible same-schema chunks merge once | XTDB appends into a shared growable Arrow relation, while RTDB publishes immutable Arrow chunks |
+| Runtime and memory | Recomputed protocol and operation peaks from the archived cgroup and process samples, and fixed quantized admission rollback on overflow | RTDB has separate execution and cache budgets, explicit reservations for non-Arrow objects, and native allocator retention that requires its own measurement |
+
+### Runtime and memory audit
+
+The numbers below are medians of the separate per-run peaks for the million-row package comparison on Mac mini 2.
+Each value is in MiB.
+Peaks in different columns can occur in different samples.
+The working set subtracts `inactive_file` from the cgroup charge, and process RSS describes only the server process.
+
+| Phase | Cgroup charge RTDB / XTDB | Cgroup anonymous RTDB / XTDB | File cache RTDB / XTDB | Process RSS RTDB / XTDB | Working set RTDB / XTDB |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Before ingest | 19 / 477 | 17 / 453 | 0 / 29 | 45 / 480 | 19 / 456 |
+| pgwire suite | 1,459 / 1,828 | 627 / 854 | 943 / 955 | 665 / 882 | 655 / 885 |
+| pgwire ingest | 909 / 1,411 | 235 / 713 | 651 / 674 | 272 / 742 | 259 / 737 |
+| pgwire set-based UPDATE | 1,459 / 1,524 | 627 / 676 | 840 / 821 | 665 / 704 | 655 / 704 |
+| Flight SQL suite | 2,132 / 2,472 | 527 / 815 | 1,598 / 1,637 | 567 / 844 | 583 / 868 |
+| Flight SQL ingest | 2,077 / 2,369 | 502 / 794 | 1,566 / 1,571 | 542 / 822 | 552 / 836 |
+
+The file-cache peaks for the two full protocol phases are similar between engines, while RTDB's anonymous-memory peak is 227 MiB lower during pgwire and 288 MiB lower during Flight SQL.
+RTDB's closest anonymous-memory result is the set-based UPDATE at 627 MiB versus 676 MiB.
+The earlier allocator swap isolated glibc arena retention as a major cause of the original footprint gap. [Early allocator comparison](#early-million-row-allocator-comparison)
+
+RTDB reserves Rust execution allocations through a hierarchy of byte budgets, and holds cached data under a separate cache budget.
+XTDB uses an Arrow root allocator and child allocators alongside its JVM heap, with file-backed reads mapped separately.
+RTDB uses reference-counted allocation leases for buffers shared across readers and can reserve for each produced row or value on scalar paths.
+Shared query plans keep one execution lease across cache hits and use a 512 KiB per-entry limit within the node's bounded plan cache.
+Preparing a cache entry under its own budget keeps parser-owned expression storage out of the original query budget.
+The static-mutation cache retains plans under a separate bounded child of the execution budget and evaluates fresh parameters for every submission.
+The earlier UPDATE profile found allocation estimation and document construction in the hot path.
+The cgroup series quantifies residency, and the engine's reservation counters quantify bytes admitted by its budget.
+Measuring both makes allocator retention, cache residency and application-owned allocations distinguishable. [RTDB memory accounting](crates/types/src/memory.rs) · [XTDB allocator](../core/src/main/kotlin/xtdb/NodeBase.kt) · [UPDATE profile](#flight-and-update-cpu-samples)
+
 ## Original benchmark gaps
 
 The recovered full benchmark used RTDB `f97d4877f` and XTDB `c84f9334e`, local storage and logs, 4 CPUs and a 4 GiB container limit.
