@@ -97,6 +97,7 @@ The optional Rust boundary check compiles an unchanged copy and two mutated copi
 The optional native replay reads the same seeded 4,096-observation trace that the Lean evaluator checks, exercising both temporal resolvers and the unbounded visibility rectangles.
 It also compiles the unmodified and unpadded text scorer to replay the binary64 boundary witness.
 The same option runs the local checkpoint interruption and manifest-recovery tests and replays a root-first mutation of the checkpoint writer.
+It also tests historical trie promotion after a binary checkpoint round trip and checks a mutation that skips rebuilding the pending index.
 It also exercises the Azure adapter against a loopback provider and separately mutates premature copy acknowledgement and cleanup on an unknown outcome.
 
 == Evidence boundaries
@@ -107,6 +108,7 @@ It also exercises the Azure adapter against a loopback provider and separately m
   `lean/Ceiling.lean` proves that the system-time ceiling at a valid coordinate emits the reference answer exactly once, including after ordinary out-of-range events are dropped.
   `lean/SearchWindows.lean` checks coverage of conjunctive matches by complete window summaries, the extrema of each summary, and the assignment to half-open window ranges.
   `lean/PartitionedTopK.lean` proves that conservative partition pruning preserves the ordered global prefix and the SQL page for any offset and fetch.
+  `lean/CatalogRecovery.lean` checks that rebuilding the pending historical-trie index gives the same promotion as scanning the durable catalog.
 * `tla/Kernel.tla` explores a bounded protocol with one durable log and two terms and requests, plus the pinned and copied read variants.
   It assumes durable append is atomic and does not implement a consensus provider.
 * `tla/Resolution.tla` compares serialized, validated and blind optimistic resolution under the same increment program.

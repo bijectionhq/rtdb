@@ -528,3 +528,20 @@ TLC completed 17 bounded baselines and found the expected counterexamples or rea
 Lean, Z3, Alloy, Apalache, and Maude also passed their recorded checks.
 The same run checked replica compile failures, the binary64 witness and its mutation, the 4,096-observation native temporal replay, all four checkpoint tests and the root-first mutation, and the two loopback Azure cases with their two source mutations.
 The input manifest SHA-256 is `3bd0140877aef40ef8be727633318d2f33609db813eddabfda4e4b521d0824f7`.
+
+== Pending historical trie promotion after checkpoint restore
+
+A catalog-level regression failed at `4077e49b2`.
+After L1H notices at distinct recencies and blocks, the persisted catalog held the nascent entries but restoration left their pending promotion index empty.
+The same L1C notice then dropped its covered L0 entries in both executions and promoted the historical entries in the uninterrupted execution only.
+
+The Rust loader now rebuilds the index from the final decoded nascent L1H entries.
+The regression round-trips the binary table block and checks the live trie set after each of two L1C notices.
+The fixed catalog suite passed all seventeen tests.
+
+Lean checked four theorems in link:../lean/CatalogRecovery.lean[the catalog recovery model].
+For any list of root-level historical entries, the rebuilt index names exactly the nascent block and recency pairs.
+Using that index gives the same promotion as scanning the catalog, for any sequence of current block notices.
+The controls check loss of the pending index and lookup at the next block.
+The proof abstracts decoding and the rest of catalog mutation.
+The Rust regression covers the catalog interface with split notices. It does not establish that the native L0 compactor emits those notices separately.

@@ -305,6 +305,22 @@ def verify_partitioned_top_k(args, scratch):
     verify_lean_model(args, scratch, path, "partitioned-top-k", controls, 5)
 
 
+def verify_catalog_recovery(args, scratch):
+    path = Path("verification/lean/CatalogRecovery.lean")
+    controls = {
+        "forget-pending": (
+            "catalog.filterMap pendingEntry", "[]",
+            ["restored_pending_is_exact", "an_exact_block_promotes_both_recencies"],
+        ),
+        "query-next-block": (
+            "if (atBlock, trie.recency) ∈ pending", "if (atBlock + 1, trie.recency) ∈ pending",
+            ["current_after_restore_matches_catalog_scan", "current_after_restore_matches_catalog_scan",
+             "an_exact_block_promotes_both_recencies"],
+        ),
+    }
+    verify_lean_model(args, scratch, path, "catalog-recovery", controls, 4)
+
+
 def verify_reader_retention(args, scratch):
     path = Path("verification/lean/ReaderRetention.lean")
     controls = {
@@ -389,6 +405,7 @@ def verify_lean(args, scratch):
             verify_compaction_projection(args, scratch, directory)
             verify_search_windows(args, scratch)
             verify_partitioned_top_k(args, scratch)
+            verify_catalog_recovery(args, scratch)
             independence = Path("verification/lean/Minimality.lean")
             clone_file(independence, directory)
             checked = run_case(
@@ -716,6 +733,44 @@ def verify_checkpoint_replay(args, source):
     print("rust-checkpoint-replay: four tests passed, root-first production mutation rejected")
 
 
+def verify_catalog_recovery_replay(args, source):
+    env = os.environ | {
+        "CARGO_TARGET_DIR": str(ROOT / "target"),
+        "CARGO_PROFILE_DEV_DEBUG": "0",
+        "CARGO_PROFILE_TEST_DEBUG": "0",
+        "CARGO_INCREMENTAL": "0",
+    }
+    test = "a_checkpoint_preserves_pending_historical_promotion_for_each_block"
+    command = ["cargo", "test", "--locked", "-p", "rtdb-index", "--test", "catalogs", test, "--", "--exact"]
+    baseline = run_case(command, source / "rust", args.evidence, "rust-catalog-recovery-baseline", env)
+    if baseline.returncode or f"{test} ... ok" not in baseline.stdout or "1 passed; 0 failed" not in baseline.stdout:
+        raise ValueError("checkpoint catalog promotion baseline failed")
+
+    catalog = source / "rust/crates/index/src/trie_catalog.rs"
+    original = catalog.read_bytes()
+    restore = """            for (shard, value) in &state.shards {
+                let (1, Some(recency), []) = (shard.level, shard.recency, shard.part.as_slice()) else { continue; };
+                for (block, trie) in &value.tries {
+                    if trie.state == TrieState::Nascent {
+                        state.l1h_recencies.entry(*block).or_default().insert(recency);
+                    }
+                }
+            }
+"""
+    try:
+        replace_once(catalog, restore, "")
+        mutation = run_case(command, source / "rust", args.evidence, "rust-catalog-recovery-forget-pending", env)
+        if (
+            mutation.returncode != 101 or f"{test} ... FAILED" not in mutation.stdout
+            or 'left: {"l00-rc-b01", "l01-rc-b00"}' not in mutation.stdout
+            or "0 passed; 1 failed" not in mutation.stdout
+        ):
+            raise ValueError("dropping the pending index did not fail at historical promotion")
+    finally:
+        catalog.write_bytes(original)
+    print("rust-catalog-recovery-replay: persisted promotion passed, forgetting pending history rejected")
+
+
 def verify_azure_replay(args, source):
     env = os.environ | {
         "CARGO_TARGET_DIR": str(ROOT / "target"),
@@ -851,6 +906,7 @@ def main():
         "rust/crates/replication/src/blocks.rs",
         "rust/crates/format/src/keys.rs",
         "rust/crates/index/src/trie_catalog.rs",
+        "rust/crates/index/tests/catalogs.rs",
         "rust/crates/maintenance/src/gc.rs",
         "rust/crates/maintenance/tests/gc.rs",
         "rust/crates/maintenance/src/merge/planner.rs",
@@ -891,6 +947,7 @@ def main():
             replay_rank_witness(args, directory)
             replay_rust_trace(args)
             verify_checkpoint_replay(args, source)
+            verify_catalog_recovery_replay(args, source)
             verify_azure_replay(args, source)
 
 

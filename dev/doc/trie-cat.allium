@@ -254,8 +254,8 @@ rule InsertTrie_L0 {
 }
 
 rule InsertTrie_L1H {
-    -- L1H files are nascent until the corresponding L1C file arrives.
-    -- When the L1C with the same (or later) block_index appears, it marks them live.
+    -- L1H waits for an L1C notice of the same block unless a serving L1C
+    -- already covers its block when L1H arrives.
     -- See: trie_catalog.clj (insert-trie, level 1 with recency)
     when: InsertTrie(trie, as_of)
     requires: trie.level = 1 and trie.recency != null
@@ -271,8 +271,10 @@ rule InsertTrie_L1H {
 
     ensures:
         add trie as state to shard [1, trie.recency, trie.part]
-        -- Track recency so that when L1C arrives, it can find these L1H files.
-        record l1h_recency(trie.block_index, trie.recency)
+        -- The pending index contains the recencies of nascent L1H entries
+        -- at the root part. Checkpoint recovery derives it from the loaded catalog.
+        if state = :nascent and trie.part = []:
+            record l1h_recency(trie.block_index, trie.recency)
 }
 
 rule InsertTrie_L1C {
