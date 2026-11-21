@@ -1,6 +1,6 @@
 //! Column-at-a-time pages: a scan gathers the cells its visible rows resolve to into one column per output field,
 //! so filters and aggregates can read whole columns, and rows are materialised only for operators that need them.
-use std::sync::Arc;
+use std::{collections::HashMap, ops::Range, sync::Arc};
 
 use arrow_array::{Array, ArrayRef, FixedSizeListArray, ListArray, MapArray, StructArray, UnionArray};
 use arrow_schema::{DataType, Field as ArrowField};
@@ -21,7 +21,7 @@ pub(crate) enum Column {
     Values(Vec<Value>),
 }
 
-type StoredVector = (ArrayRef, Arc<ArrowField>, Option<LogicalType>);
+pub(crate) type StoredVector = (ArrayRef, Arc<ArrowField>, Option<LogicalType>);
 
 #[derive(Clone)]
 pub(crate) struct SelectedColumn {
@@ -39,6 +39,56 @@ impl SelectedColumn {
         let mut cells = Vec::with_capacity(selected);
         cells.extend(self.cells.iter().zip(mask).filter_map(|(&cell, &keep)| keep.then_some(cell)));
         Self { sources: self.sources, cells: Arc::new(cells) }
+    }
+
+    pub(crate) fn fragment_boundaries(&self, boundaries: &mut [bool]) {
+        let layout = |source: usize| self.sources[source].as_ref().map(|(_, field, logical)| (field, logical));
+        for (boundary, cells) in boundaries.iter_mut().skip(1).zip(self.cells.windows(2)) {
+            let (left, right) = (cells[0].0, cells[1].0);
+            if !*boundary && left != right && layout(left) != layout(right) {
+                *boundary = true;
+            }
+        }
+    }
+
+    pub(crate) fn fragment_vector(&self, rows: Range<usize>, memory: &Arc<MemoryBudget>)
+        -> Result<(StoredVector, Arc<MemoryReservation>)> {
+        let first = self.cells.get(rows.start).and_then(|&(source, _)| self.sources[source].as_ref());
+        let Some((_, field, logical)) = first else {
+            let name = self.sources.iter().flatten().next().map_or("", |(_, field, _)| field.name());
+            let array = Arc::new(arrow_array::NullArray::new(rows.len())) as ArrayRef;
+            let field = Arc::new(ArrowField::new(name, DataType::Null, true));
+            let reservation = memory.reserve(array.get_array_memory_size())?;
+            return Ok(((array, field, Some(LogicalType::Null)), reservation));
+        };
+
+        let cells = &self.cells[rows];
+        let sources = self.sources.len().min(cells.len());
+        let base = sources.checked_mul(64)
+            .and_then(|bytes| field.size().checked_mul(8).and_then(|schema| bytes.checked_add(schema)))
+            .and_then(|bytes| bytes.checked_add(4096)).ok_or_else(size_error)?;
+        let bound = cells.iter().try_fold(base, |bytes, &(source, row)| {
+            let (array, field, _) = self.sources[source].as_ref().ok_or_else(|| invalid("fragment-layout", "Fragment rows differ in layout"))?;
+            rtdb_columnar::estimate_copy_cell_bytes(field, array.as_ref(), row)?.checked_mul(4)
+                .and_then(|size| bytes.checked_add(size)).ok_or_else(size_error)
+        })?;
+        let mut reservation = memory.reserve(bound)?;
+        let mut inputs = Vec::with_capacity(sources);
+        let mut positions = HashMap::with_capacity(sources);
+        let mut picks = Vec::with_capacity(cells.len());
+        for &(source, row) in cells {
+            let position = *positions.entry(source).or_insert_with(|| {
+                let (array, _, _) = self.sources[source].as_ref().expect("The selection was checked");
+                let position = inputs.len();
+                inputs.push(array.as_ref());
+                position
+            });
+            picks.push((position, row));
+        }
+        let output = copy_selected_cells(&inputs, &picks)?;
+        let lease = Arc::get_mut(&mut reservation).expect("A fragment vector owns its reservation");
+        lease.shrink_to(output.get_array_memory_size())?;
+        Ok(((output, Arc::clone(field), logical.clone()), reservation))
     }
 
     fn null_test(&self, is_null: bool) -> Option<Vec<Option<bool>>> {
@@ -439,6 +489,133 @@ fn interleaving_a_contiguous_range_keeps_its_input_buffer() {
 }
 
 #[test]
+fn fragment_frames_keep_source_layouts_and_selection_order() {
+    use rtdb_types::StructFields;
+
+    let memory = MemoryBudget::new(1 << 22);
+    let first = Value::Struct(StructFields::from([("a".into(), Value::U64(u64::MAX))]));
+    let second = Value::Struct(StructFields::from([("b".into(), Value::Utf8("two".into()))]));
+    let source = |value: &Value| {
+        let ty = value.logical_type();
+        let field = Arc::new(rtdb_columnar::to_field("doc", &ty).unwrap());
+        let data = rtdb_columnar::build_array(&ty, std::slice::from_ref(value)).unwrap();
+        Some((data, field, Some(ty)))
+    };
+    let sources = vec![source(&first), source(&second), source(&first), None];
+    let cells = Arc::new(vec![(2, 0), (0, 0), (1, 0), (3, 0), (2, 0)]);
+    let selected = gather_cells(sources, &cells, "doc").unwrap();
+    assert!(matches!(selected, Column::Selected(_)));
+    let ids = Column::Arrow {
+        array: Arc::new(arrow_array::Int64Array::from(vec![0, 1, 2, 3, 4])),
+        field: Arc::new(ArrowField::new("_id", DataType::Int64, false)),
+        logical: None,
+    };
+    let width = 1 << 16;
+    let wide = Value::FixedSizeBinary(vec![31; width]);
+    let union_values = [Value::I64(11), Value::I64(22), Value::I64(33), wide.clone(), Value::I64(44)];
+    let union_type = union_values[0].logical_type().join(&wide.logical_type());
+    let union = Column::Arrow {
+        array: rtdb_columnar::build_array(&union_type, &union_values).unwrap(),
+        field: Arc::new(rtdb_columnar::to_field("union", &union_type).unwrap()),
+        logical: Some(union_type),
+    };
+    let batch = ColumnBatch::settled(vec![ids, selected, union], cells.len(), memory.reserve(256).unwrap()).unwrap();
+    let mut wire = crate::fragment::FragmentBytes::new(&memory).unwrap();
+
+    crate::fragment::encode_batch(&batch, &memory, &mut wire).unwrap();
+    let wire = wire.into_bytes();
+    assert!(wire.len() < width * 2);
+    let frames = crate::fragment::decode_batches(&wire, &memory).unwrap();
+
+    assert_eq!(frames.iter().map(|frame| frame.len).collect::<Vec<_>>(), [2, 1, 1, 1]);
+    for frame in &frames {
+        let field = match &frame.columns[1] {
+            Column::Selected(column) => &column.source(0).unwrap().unwrap().0.1,
+            Column::Arrow { field, .. } => field,
+            Column::Values(_) => panic!("A selected field must remain Arrow"),
+        };
+        assert_eq!(field.name(), "doc");
+    }
+    let Column::Selected(column) = &frames[0].columns[1] else { unreachable!() };
+    let ((array, _, _), _) = column.source(0).unwrap().unwrap();
+    let structure = array.as_any().downcast_ref::<StructArray>().unwrap();
+    assert_eq!(structure.column(0).data_type(), &DataType::UInt64);
+    let actual = frames.iter().flat_map(|frame| {
+        (0..frame.len).map(|row| {
+            [frame.columns[0].value(row).unwrap(), frame.columns[1].value(row).unwrap(), frame.columns[2].value(row).unwrap()]
+        })
+    }).collect::<Vec<_>>();
+    let expected = (0..batch.len).map(|row| {
+        [batch.columns[0].value(row).unwrap(), batch.columns[1].value(row).unwrap(), batch.columns[2].value(row).unwrap()]
+    }).collect::<Vec<_>>();
+    assert_eq!(actual, expected);
+}
+
+#[test]
+fn a_fragment_splits_repeated_positions_at_the_run_end_width() {
+    use arrow_array::{RunArray, types::Int16Type};
+    use rtdb_types::{RunEndWidth, ScalarType};
+
+    let memory = MemoryBudget::new(1 << 28);
+    let ty = LogicalType::RunEndEncoded { width: RunEndWidth::I16, value: Box::new(LogicalType::Scalar(ScalarType::I64)) };
+    let field = Arc::new(rtdb_columnar::to_field("run", &ty).unwrap());
+    let array = rtdb_columnar::build_array(&ty, &[Value::I64(7)]).unwrap();
+    let len = (i16::MAX as usize) + 1;
+    let selected = Column::Selected(SelectedColumn {
+        sources: Arc::new(vec![Some((array, field, Some(ty)))]),
+        cells: Arc::new(vec![(0, 0); len]),
+    });
+    let batch = ColumnBatch::settled(vec![selected], len, memory.reserve(256).unwrap()).unwrap();
+    let mut wire = crate::fragment::FragmentBytes::new(&memory).unwrap();
+
+    crate::fragment::encode_batch(&batch, &memory, &mut wire).unwrap();
+    let frames = crate::fragment::decode_batches(&wire.into_bytes(), &memory).unwrap();
+
+    assert_eq!(frames.len(), 2);
+    assert_eq!(frames.iter().map(|frame| frame.len).sum::<usize>(), len);
+    for frame in frames {
+        let Column::Selected(column) = &frame.columns[0] else { panic!("Run-end encoding must survive a fragment") };
+        let ((array, _, _), _) = column.source(0).unwrap().unwrap();
+        let run = array.as_any().downcast_ref::<RunArray<Int16Type>>().unwrap();
+        assert_eq!(run.run_ends().values(), &[frame.len as i16]);
+        assert_eq!(frame.columns[0].value(frame.len - 1).unwrap(), Value::I64(7));
+    }
+}
+
+#[test]
+fn fragment_refiltering_retains_the_decoded_arrow_array() {
+    use rtdb_types::ScalarType;
+
+    let memory = MemoryBudget::new(128 * 1024);
+    let width = 1 << 20;
+    let ty = LogicalType::List { kind: ListKind::FixedSizeList(1), element: Box::new(LogicalType::from_legs([
+        LogicalType::Scalar(ScalarType::I64), LogicalType::Scalar(ScalarType::FixedSizeBinary(width)),
+    ])) };
+    let field = Arc::new(rtdb_columnar::to_field("v", &ty).unwrap());
+    let values = [Value::FixedSizeList(vec![Value::I64(2)]), Value::FixedSizeList(vec![Value::I64(3)])];
+    let array = rtdb_columnar::build_array(&ty, &values).unwrap();
+    let column = Column::Arrow { array, field, logical: Some(ty) };
+    let page = ColumnBatch::settled(vec![column], 2, memory.reserve(256).unwrap()).unwrap();
+    let mut wire = crate::fragment::FragmentBytes::new(&memory).unwrap();
+    crate::fragment::encode_batch(&page, &memory, &mut wire).unwrap();
+    let mut decoded = crate::fragment::decode_batches(wire.as_slice(), &memory).unwrap();
+    let page = decoded.pop().unwrap();
+    let Column::Selected(column) = &page.columns[0] else { panic!("Expected a selection over the decoded array") };
+    let source = Arc::as_ptr(&column.source(0).unwrap().unwrap().0.0);
+
+    let filtered = page.select(&[false, true], &memory).unwrap();
+
+    let Column::Selected(column) = &filtered.columns[0] else { panic!("Filtering should preserve the Arrow selection") };
+    let ((array, _, _), row) = column.source(0).unwrap().unwrap();
+    assert!(std::ptr::addr_eq(Arc::as_ptr(array), source));
+    assert_eq!(row, 1);
+    let fixed = array.as_any().downcast_ref::<FixedSizeListArray>().unwrap();
+    let union = fixed.values().as_any().downcast_ref::<UnionArray>().unwrap();
+    assert!(union.child(1).is_empty());
+    assert_eq!(filtered.columns[0].value(0).unwrap(), values[1]);
+}
+
+#[test]
 fn sparse_fixed_lists_copy_only_the_active_union_children() {
     use rtdb_types::ScalarType;
 
@@ -736,6 +913,45 @@ fn scalar_layout(data_type: &DataType) -> bool {
 }
 
 fn size_error() -> rtdb_types::Anomaly { invalid("column-size", "Column page exceeds addressable memory") }
+
+pub(crate) fn fragment_column(array: ArrayRef, field: Arc<ArrowField>, logical: Option<LogicalType>,
+    memory: &Arc<MemoryBudget>, metadata: &mut MemoryReservation) -> Result<Column> {
+    if !nested_layout(array.data_type()) {
+        metadata.grow_to(metadata.bytes().checked_add(array.get_array_memory_size()).ok_or_else(size_error)?)?;
+        return Ok(Column::Arrow { array, field, logical });
+    }
+    let bytes = array.len().checked_mul(std::mem::size_of::<(usize, usize)>()).and_then(|bytes| bytes.checked_add(512))
+        .and_then(|bytes| bytes.checked_add(field.size())).ok_or_else(size_error)?;
+    metadata.grow_to(metadata.bytes().checked_add(bytes).ok_or_else(size_error)?)?;
+    let size = array.get_array_memory_size().checked_add(field.size()).ok_or_else(size_error)?;
+    let reservation = memory.reserve(size)?;
+    let array = rtdb_columnar::retain_array(array, &reservation)?;
+    let cells = (0..array.len()).map(|row| (0, row)).collect();
+    Ok(Column::Selected(SelectedColumn {
+        sources: Arc::new(vec![Some((array, field, logical))]),
+        cells: Arc::new(cells),
+    }))
+}
+
+pub(crate) fn nested_layout(data_type: &DataType) -> bool {
+    matches!(data_type, DataType::Struct(_) | DataType::List(_) | DataType::FixedSizeList(_, _)
+        | DataType::Map(_, _) | DataType::Union(_, _) | DataType::RunEndEncoded(_, _))
+}
+
+pub(crate) fn compact_arrow_rows(array: &dyn Array, field: &ArrowField, rows: impl Iterator<Item = usize> + Clone,
+    memory: &Arc<MemoryBudget>) -> Result<(ArrayRef, Arc<MemoryReservation>)> {
+    let base = field.size().checked_mul(8).and_then(|size| size.checked_add(4096)).ok_or_else(size_error)?;
+    let bound = rows.clone().try_fold(base, |bytes, row| {
+        rtdb_columnar::estimate_copy_cell_bytes(field, array, row)?.checked_mul(4)
+            .and_then(|size| bytes.checked_add(size)).ok_or_else(size_error)
+    })?;
+    let mut reservation = memory.reserve(bound)?;
+    let picks = rows.map(|row| (0, row)).collect::<Vec<_>>();
+    let output = copy_selected_cells(&[array], &picks)?;
+    let lease = Arc::get_mut(&mut reservation).expect("A compact column owns its reservation");
+    lease.shrink_to(output.get_array_memory_size())?;
+    Ok((output, reservation))
+}
 
 /// The scalar a column's cells read as, where its logical type is one scalar, nullable or not: a nullable column's
 /// cells read as its scalar's or as null, so the kernels treat the two alike.
@@ -1137,6 +1353,17 @@ mod kernel {
     }
 
     enum Operand<'a> { Cells(Cells<'a>), Constant(Option<Cell<'a>>) }
+    fn can_read_owned_cell(data_type: &DataType) -> bool {
+        match data_type {
+            DataType::Union(fields, arrow_schema::UnionMode::Dense) => fields.iter().all(|(_, field)| can_read_owned_cell(field.data_type())),
+            DataType::RunEndEncoded(_, field) => can_read_owned_cell(field.data_type()),
+            DataType::Null | DataType::Boolean | DataType::Int8 | DataType::Int16 | DataType::Int32 | DataType::Int64
+            | DataType::UInt8 | DataType::UInt16 | DataType::UInt32 | DataType::UInt64 | DataType::Float32 | DataType::Float64
+            | DataType::Timestamp(arrow_schema::TimeUnit::Microsecond, _) => true,
+            _ => false,
+        }
+    }
+
     impl<'a> Operand<'a> {
         fn of(expr: &'a Expr, schema: &Schema, batch: &'a ColumnBatch, parameters: &'a [Value]) -> Option<Self> {
             match expr {
@@ -1145,6 +1372,7 @@ mod kernel {
                     match Cells::of(column) {
                         Some(cells) => Some(Self::Cells(cells)),
                         None if matches!(column, Column::Selected(_)) => None,
+                        None if matches!(column, Column::Arrow { array, .. } if !can_read_owned_cell(array.data_type())) => None,
                         // A column without a direct cell reader, a union of integer legs say, is read once into owned cells.
                         None => (0..batch.len).map(|row| {
                             let value = column.value(row).ok()?;

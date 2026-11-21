@@ -846,6 +846,9 @@ Read-your-writes across tiers; a zombie holder cannot serve a linearizable read;
 Nodes use the same eligible affinity ranks as the gateway when opening a log-fed read replica.
 A narrower width retires out-of-rank replicas that serve only Pgwire reads, and their gateway sessions reconnect within the remaining width.
 A replica serving scan fragments can remain attached.
+
+Each fragment returns selected storage columns as Arrow vectors, preserving their row order and field layout.
+A fragment can send more than one IPC frame when selected rows use different layouts.
 Enable automatic width with `rtdb-multi controller --read-sessions-per-node N`.
 With this policy enabled, the controller manages the width of live writer placements and manual width changes are subject to later adjustment.
 The default maximum width is eight, including the writer, and `--max-read-width N` can set a different ceiling.

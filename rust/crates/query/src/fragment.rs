@@ -1,17 +1,17 @@
 //! Scan fragments: a scan of one table split by trie prefix, so that another node can read a slice of the table at the
 //! query's basis and send back the rows it resolves, in place of this node reading those tries itself.
-use std::io::Cursor;
+use std::{io::{self, Cursor, Write}, ops::Range};
 use std::sync::Arc;
 
 use arrow_array::{RecordBatch, RecordBatchOptions};
-use arrow_schema::{Field as ArrowField, Schema as ArrowSchema};
-use rtdb_columnar::{MemoryBudget, build_array, read_value, to_field};
+use arrow_schema::{ArrowError, Field as ArrowField, Schema as ArrowSchema};
+use rtdb_columnar::{MemoryBudget, MemoryReservation, build_array, read_value, to_field};
 use rtdb_plan::{Scan, TemporalFilter};
 use rtdb_storage::IoRegion;
 use rtdb_types::{Anomaly, AnomalyCategory, Iid, Interval, LogicalType, Result, TableRef, TemporalBounds, Timestamp, TransactionKey, Value};
 use serde::{Deserialize, Serialize};
 
-use crate::columnar::{Column, ColumnBatch};
+use crate::columnar::{Column, ColumnBatch, compact_arrow_rows, fragment_column, nested_layout};
 use crate::context::{Execution, OuterRows, QueryContext, cancelled};
 use crate::invalid;
 
@@ -136,13 +136,18 @@ pub trait ScanFragmenter: Send + Sync {
 
 /// Evaluates a delegated scan at the coordinator's exact captured transaction head.
 pub async fn evaluate_fragment(context: Arc<QueryContext>, fragment: &ScanFragment) -> Result<Vec<u8>> {
+    Ok(evaluate_fragment_retained(context, fragment).await?.into_bytes())
+}
+
+/// Evaluates a fragment and keeps the wire allocation charged while the caller sends it.
+pub async fn evaluate_fragment_retained(context: Arc<QueryContext>, fragment: &ScanFragment) -> Result<FragmentBytes> {
     let cancellation = context.cancellation.clone();
     let owner = context.owner_cancellation.clone();
     let work = owner.run_until_cancelled(cancellation.run_until_cancelled(evaluate_retained_fragment(Arc::clone(&context), fragment)));
     IoRegion::retaining(context, work).await.flatten().ok_or_else(cancelled)?
 }
 
-async fn evaluate_retained_fragment(context: Arc<QueryContext>, fragment: &ScanFragment) -> Result<Vec<u8>> {
+async fn evaluate_retained_fragment(context: Arc<QueryContext>, fragment: &ScanFragment) -> Result<FragmentBytes> {
     let database = context.catalog.database(fragment.database())?.clone();
     let [snapshot] = database.partitions.as_slice() else { return Err(invalid("fragment-partitions", "A fragment reads a database of one partition")) };
     if snapshot.tx_basis() != Some(fragment.basis) || snapshot.has_overlays() {
@@ -155,8 +160,8 @@ async fn evaluate_retained_fragment(context: Arc<QueryContext>, fragment: &ScanF
     if let Some(predicate) = fragment.scan.predicates.iter().cloned().reduce(|left, right| rtdb_plan::Expr::binary(rtdb_plan::BinaryOp::And, left, right)) {
         batches = Box::new(crate::columnar::BatchFilter::new(batches, rtdb_plan::Schema::new(fragment.scan.columns.clone())?, predicate, execution));
     }
-    let mut encoded = Vec::new();
-    while let Some(batch) = batches.next_batch().await? { encode_batch(&batch, &mut encoded)?; }
+    let mut encoded = FragmentBytes::new(&memory)?;
+    while let Some(batch) = batches.next_batch().await? { encode_batch(&batch, &memory, &mut encoded)?; }
     Ok(encoded)
 }
 
@@ -171,24 +176,113 @@ const COLUMN_KEY: &str = "rtdb.fragment.column";
 const NAME_KEY: &str = "rtdb.fragment.name";
 const LOGICAL_KEY: &str = "rtdb.fragment.logical";
 
-/// Appends `batch` as one length-prefixed Arrow IPC stream: an Arrow column keeps its array and field, and a column of
-/// values travels as the array the storage codec builds for them, read back as the same values.
-pub(crate) fn encode_batch(batch: &ColumnBatch, out: &mut Vec<u8>) -> Result<()> {
+/// Fragment IPC and the reservation for the bytes it retains.
+#[derive(Debug)]
+pub struct FragmentBytes { bytes: Vec<u8>, reservation: Arc<MemoryReservation> }
+
+impl FragmentBytes {
+    pub(crate) fn new(memory: &Arc<MemoryBudget>) -> Result<Self> {
+        Ok(Self { bytes: Vec::new(), reservation: memory.reserve(0)? })
+    }
+
+    pub fn as_slice(&self) -> &[u8] { &self.bytes }
+    pub fn into_bytes(self) -> Vec<u8> { self.bytes }
+}
+
+impl Write for FragmentBytes {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        let required = self.bytes.len().checked_add(bytes.len()).ok_or_else(|| io::Error::other("Fragment byte length overflow"))?;
+        if required > self.bytes.capacity() {
+            let lease = Arc::get_mut(&mut self.reservation).expect("The fragment writer owns its reservation");
+            let capacity = required.max(self.bytes.capacity().saturating_mul(2));
+            let admitted = match lease.grow_to(capacity) {
+                Ok(()) => capacity,
+                Err(_) => {
+                    lease.grow_to(required).map_err(io::Error::other)?;
+                    required
+                }
+            };
+            self.bytes.try_reserve_exact(admitted - self.bytes.len()).map_err(io::Error::other)?;
+        }
+        self.bytes.extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> { Ok(()) }
+}
+
+/// Appends length-prefixed Arrow IPC streams in scan order, splitting where selected vectors require different schemas.
+pub(crate) fn encode_batch(batch: &ColumnBatch, memory: &Arc<MemoryBudget>, out: &mut FragmentBytes) -> Result<()> {
+    if !batch.columns.iter().any(|column| matches!(column, Column::Selected(_))) {
+        return append_frame(batch, 0..batch.len, memory, out);
+    }
+    let _reservation = memory.reserve(batch.len)?;
+    let mut boundaries = vec![false; batch.len];
+    for column in &batch.columns {
+        if let Column::Selected(selected) = column { selected.fragment_boundaries(&mut boundaries); }
+    }
+    let ends = boundaries.into_iter().enumerate().filter_map(|(index, boundary)| boundary.then_some(index))
+        .chain(std::iter::once(batch.len));
+    let mut start = 0;
+    for end in ends {
+        append_frame(batch, start..end, memory, out)?;
+        start = end;
+    }
+    Ok(())
+}
+
+fn append_frame(batch: &ColumnBatch, rows: Range<usize>, memory: &Arc<MemoryBudget>, out: &mut FragmentBytes) -> Result<()> {
+    let prefix = out.bytes.len();
+    let result = encode_frame(batch, rows.clone(), memory, out);
+    if result.is_err() { out.bytes.truncate(prefix); }
+    if rows.len() > 1 && result.as_ref().is_err_and(|error| {
+        matches!(error.code.as_ref(), "rtdb/run-end-selection-width" | "rtdb/memory-budget-exceeded")
+    }) {
+        let middle = rows.start + rows.len() / 2;
+        append_frame(batch, rows.start..middle, memory, out)?;
+        return append_frame(batch, middle..rows.end, memory, out);
+    }
+    result
+}
+
+fn fragment_io(error: io::Error) -> Anomaly {
+    error.get_ref().and_then(|cause| cause.downcast_ref::<Anomaly>()).cloned()
+        .unwrap_or_else(|| invalid("fragment-encode", error))
+}
+
+fn fragment_arrow_error(error: ArrowError) -> Anomaly {
+    match error {
+        ArrowError::IoError(_, error) => fragment_io(error),
+        error => invalid("fragment-encode", error),
+    }
+}
+
+fn encode_frame(batch: &ColumnBatch, rows: Range<usize>, memory: &Arc<MemoryBudget>, out: &mut FragmentBytes) -> Result<()> {
     let mut fields = Vec::with_capacity(batch.columns.len());
     let mut arrays = Vec::with_capacity(batch.columns.len());
+    let mut reservations = Vec::new();
     for (position, column) in batch.columns.iter().enumerate() {
         let wire_name = format!("c{position}");
-        match column {
+        let (array, field, logical) = match column {
             Column::Arrow { array, field, logical } if array.len() == batch.len => {
-                let mut metadata = field.metadata().clone();
-                metadata.insert(COLUMN_KEY.into(), "arrow".into());
-                metadata.insert(NAME_KEY.into(), field.name().clone());
-                if let Some(logical) = logical { metadata.insert(LOGICAL_KEY.into(), serde_json::to_string(logical).map_err(|error| invalid("fragment-encode", error))?); }
-                fields.push(field.as_ref().clone().with_name(wire_name).with_metadata(metadata));
-                arrays.push(Arc::clone(array));
+                let array = if rows.len() == batch.len {
+                    Arc::clone(array)
+                } else if nested_layout(array.data_type()) {
+                    let (compact, reservation) = compact_arrow_rows(array.as_ref(), field, rows.clone(), memory)?;
+                    reservations.push(reservation);
+                    compact
+                } else {
+                    array.slice(rows.start, rows.len())
+                };
+                (array, Arc::clone(field), logical.clone())
+            }
+            Column::Selected(selected) => {
+                let (vector, reservation) = selected.fragment_vector(rows.clone(), memory)?;
+                reservations.push(reservation);
+                vector
             }
             column => {
-                let values = (0..batch.len).map(|row| column.value(row)).collect::<Result<Vec<_>>>()?;
+                let values = rows.clone().map(|row| column.value(row)).collect::<Result<Vec<_>>>()?;
                 let logical = LogicalType::join_all(values.iter().map(Value::logical_type).collect::<Vec<_>>().iter());
                 let mut field = to_field(wire_name, &logical)?;
                 let mut metadata = field.metadata().clone();
@@ -196,19 +290,37 @@ pub(crate) fn encode_batch(batch: &ColumnBatch, out: &mut Vec<u8>) -> Result<()>
                 field = field.with_metadata(metadata);
                 arrays.push(build_array(&logical, &values)?);
                 fields.push(field);
+                continue;
             }
+        };
+        let mut metadata = field.metadata().clone();
+        metadata.insert(COLUMN_KEY.into(), "arrow".into());
+        metadata.insert(NAME_KEY.into(), field.name().clone());
+        if let Some(logical) = logical {
+            metadata.insert(LOGICAL_KEY.into(), serde_json::to_string(&logical).map_err(|error| invalid("fragment-encode", error))?);
         }
+        fields.push(field.as_ref().clone().with_name(wire_name).with_metadata(metadata));
+        arrays.push(array);
     }
     let schema = Arc::new(ArrowSchema::new(fields));
-    let record = RecordBatch::try_new_with_options(Arc::clone(&schema), arrays, &RecordBatchOptions::new().with_row_count(Some(batch.len))).map_err(|error| invalid("fragment-encode", error))?;
-    let mut stream = Vec::new();
+    let record = RecordBatch::try_new_with_options(Arc::clone(&schema), arrays, &RecordBatchOptions::new().with_row_count(Some(rows.len()))).map_err(|error| invalid("fragment-encode", error))?;
+    let schema_bound = rtdb_format::ipc::schema_translation_bound(&schema)?;
+    let scratch = record.columns().iter().try_fold(schema_bound, |bound, array| {
+        let bytes = array.to_data().get_slice_memory_size().map_err(|error| invalid("fragment-encode", error))?;
+        bytes.checked_mul(4).and_then(|bytes| bound.checked_add(bytes))
+            .ok_or_else(|| invalid("fragment-encode", "IPC allocation bound overflow"))
+    })?;
+    let _encoding = memory.reserve(scratch)?;
+    let prefix = out.bytes.len();
+    out.write_all(&[0; 8]).map_err(fragment_io)?;
     {
-        let mut writer = arrow_ipc::writer::StreamWriter::try_new(&mut stream, &schema).map_err(|error| invalid("fragment-encode", error))?;
-        writer.write(&record).map_err(|error| invalid("fragment-encode", error))?;
-        writer.finish().map_err(|error| invalid("fragment-encode", error))?;
+        let mut writer = arrow_ipc::writer::StreamWriter::try_new(&mut *out, &schema).map_err(fragment_arrow_error)?;
+        writer.write(&record).map_err(fragment_arrow_error)?;
+        writer.finish().map_err(fragment_arrow_error)?;
     }
-    out.extend_from_slice(&u64::try_from(stream.len()).map_err(|error| invalid("fragment-encode", error))?.to_be_bytes());
-    out.extend_from_slice(&stream);
+    let start = prefix + 8;
+    let bytes = u64::try_from(out.bytes.len() - start).map_err(|error| invalid("fragment-encode", error))?;
+    out.bytes[prefix..start].copy_from_slice(&bytes.to_be_bytes());
     Ok(())
 }
 
@@ -226,6 +338,8 @@ pub(crate) fn decode_batches(bytes: &[u8], memory: &Arc<MemoryBudget>) -> Result
         let reader = arrow_ipc::reader::StreamReader::try_new(Cursor::new(frame), None).map_err(|error| invalid("fragment-decode", error))?;
         for record in reader {
             let record = record.map_err(|error| invalid("fragment-decode", error))?;
+            let mut reservation = memory.reserve(256)?;
+            let metadata_charge = Arc::get_mut(&mut reservation).expect("A fragment batch owns its reservation");
             let mut columns = Vec::with_capacity(record.num_columns());
             for (field, array) in record.schema().fields().iter().zip(record.columns()) {
                 let mut metadata = field.metadata().clone();
@@ -235,13 +349,13 @@ pub(crate) fn decode_batches(bytes: &[u8], memory: &Arc<MemoryBudget>) -> Result
                         let name = metadata.remove(NAME_KEY).ok_or_else(|| malformed("A fragment column has no name"))?;
                         let logical = metadata.remove(LOGICAL_KEY).map(|logical| serde_json::from_str::<LogicalType>(&logical)).transpose().map_err(|error| invalid("fragment-decode", error))?;
                         let field: Arc<ArrowField> = Arc::new(field.as_ref().clone().with_name(name).with_metadata(metadata));
-                        Column::Arrow { array: Arc::clone(array), field, logical }
+                        fragment_column(Arc::clone(array), field, logical, memory, metadata_charge)?
                     }
                     Some("values") => Column::Values((0..record.num_rows()).map(|row| read_value(field, array.as_ref(), row)).collect::<Result<_>>()?),
                     _ => return Err(malformed("A fragment column has no encoding")),
                 });
             }
-            batches.push(ColumnBatch::settled(columns, record.num_rows(), memory.reserve(256)?)?);
+            batches.push(ColumnBatch::settled(columns, record.num_rows(), reservation)?);
         }
     }
     Ok(batches)
@@ -265,6 +379,44 @@ mod tests {
     }
 
     #[test]
+    fn fragment_bytes_admit_the_accumulated_response() {
+        let memory = MemoryBudget::new(64);
+        let mut out = FragmentBytes::new(&memory).unwrap();
+        out.write_all(&[1; 32]).unwrap();
+        out.write_all(&[2; 16]).unwrap();
+
+        assert!(out.write_all(&[3; 17]).is_err());
+        assert_eq!(out.bytes.len(), 48);
+        assert!(memory.used_bytes() >= out.bytes.capacity());
+        assert_eq!(&out.as_slice()[32..], &[2; 16]);
+        drop(out);
+        assert_eq!(memory.used_bytes(), 0);
+    }
+
+    #[test]
+    fn fragment_splits_after_a_partial_write_fails_admission() {
+        let source_memory = MemoryBudget::new(32 << 20);
+        let memory = MemoryBudget::new(9 << 20);
+        let data = vec![9u8; 1 << 20];
+        let array = arrow_array::BinaryArray::from_iter_values([data.as_slice(), data.as_slice()]);
+        let column = Column::Arrow {
+            array: Arc::new(array),
+            field: Arc::new(ArrowField::new("data", arrow_schema::DataType::Binary, false)),
+            logical: None,
+        };
+        let batch = ColumnBatch::settled(vec![column], 2, source_memory.reserve(256).unwrap()).unwrap();
+        let mut out = FragmentBytes::new(&memory).unwrap();
+
+        encode_batch(&batch, &memory, &mut out).unwrap();
+
+        let frames = decode_batches(out.as_slice(), &source_memory).unwrap();
+        assert_eq!(frames.iter().map(|frame| frame.len).collect::<Vec<_>>(), [1, 1]);
+        for frame in frames {
+            assert_eq!(frame.columns[0].value(0).unwrap(), Value::Binary(data.clone()));
+        }
+    }
+
+    #[test]
     fn a_batch_of_arrow_and_value_columns_decodes_to_the_same_cells() {
         let memory = MemoryBudget::new(64 << 20);
         let ints: arrow_array::ArrayRef = Arc::new(arrow_array::Int64Array::from(vec![Some(1), None, Some(3)]));
@@ -279,10 +431,10 @@ mod tests {
             Column::Values(vec![Value::Null; 3]),
         ];
         let batch = ColumnBatch::settled(columns, 3, memory.reserve(256).unwrap()).unwrap();
-        let mut bytes = Vec::new();
-        encode_batch(&batch, &mut bytes).unwrap();
-        encode_batch(&ColumnBatch::settled(Vec::new(), 2, memory.reserve(256).unwrap()).unwrap(), &mut bytes).unwrap();
-        let decoded = decode_batches(&bytes, &memory).unwrap();
+        let mut bytes = FragmentBytes::new(&memory).unwrap();
+        encode_batch(&batch, &memory, &mut bytes).unwrap();
+        encode_batch(&ColumnBatch::settled(Vec::new(), 2, memory.reserve(256).unwrap()).unwrap(), &memory, &mut bytes).unwrap();
+        let decoded = decode_batches(&bytes.into_bytes(), &memory).unwrap();
         assert_eq!(decoded.len(), 2);
         assert_eq!((decoded[1].len, decoded[1].columns.len()), (2, 0), "a batch of no columns keeps its row count");
         let cells = |batch: &ColumnBatch| -> Vec<Vec<String>> { (0..batch.len).map(|row| batch.columns.iter().map(|column| format!("{:?}", column.value(row).unwrap())).collect()).collect() };

@@ -90,6 +90,7 @@ fn masked_copy_bytes(field: &Field) -> Result<usize> {
         DataType::Struct(fields) => fields.iter().try_fold(0, |bytes, field| add(bytes, masked_copy_bytes(field)?))?,
         DataType::FixedSizeList(child, count) => mul(usize::try_from(*count).map_err(|_| layout())?, masked_copy_bytes(child)?)?,
         DataType::FixedSizeBinary(width) => mul(usize::try_from(*width).map_err(|_| layout())?, 2)?,
+        DataType::RunEndEncoded(_, values) => masked_copy_bytes(values)?,
         DataType::Union(fields, UnionMode::Dense) => {
             let (_, field) = crate::interleave::masked_union_leg(fields).ok_or_else(layout)?;
             masked_copy_bytes(field)?

@@ -1,6 +1,6 @@
 use std::{fmt::Display, sync::Arc};
-use arrow_array::{Array, ArrayRef, MapArray, UnionArray, make_array, new_null_array};
-use arrow_buffer::{NullBuffer, NullBufferBuilder, OffsetBuffer, ScalarBuffer};
+use arrow_array::{Array, ArrayRef, MapArray, PrimitiveArray, RunArray, UnionArray, make_array, new_null_array, types::{Int16Type, Int32Type, Int64Type, RunEndIndexType}};
+use arrow_buffer::{ArrowNativeType, NullBuffer, NullBufferBuilder, OffsetBuffer, ScalarBuffer};
 use arrow_data::ArrayData;
 use arrow_schema::{DataType, Field, UnionFields};
 use rtdb_types::{Anomaly, Result};
@@ -20,7 +20,7 @@ pub fn interleave(arrays: &[&dyn Array], cells: &[(usize, usize)]) -> Result<Arr
     }
 }
 
-/// Copies selected cells from plain Arrow layouts, allocating dense-union children according to their selected positions.
+/// Copies selected Arrow cells, allocating dense-union and run-end children according to their selected positions.
 /// Sources have the same layout, and every selection names a row within its source.
 pub fn copy_selected_cells(arrays: &[&dyn Array], cells: &[(usize, usize)]) -> Result<ArrayRef> {
     let layout = arrays.first().map(|array| array.data_type()).ok_or_else(|| invalid("Nothing to interleave"))?;
@@ -84,7 +84,12 @@ fn copy_nested_cells(arrays: &[&dyn Array], cells: &[Cell]) -> Result<ArrayRef> 
             if entries.column(0).logical_null_count() != 0 { return Err(invalid("Arrow map keys cannot be null")); }
             Ok(Arc::new(MapArray::try_new(Arc::clone(field), offsets, entries.clone(), interleave_validity(&visible), *sorted).map_err(invalid)?))
         }
-        DataType::RunEndEncoded(_, _) if !cells.is_empty() => Err(invalid("Compact selection requires plain Arrow layouts")),
+        DataType::RunEndEncoded(ends, _) => match ends.data_type() {
+            DataType::Int16 => copy_runs::<Int16Type>(arrays, cells),
+            DataType::Int32 => copy_runs::<Int32Type>(arrays, cells),
+            DataType::Int64 => copy_runs::<Int64Type>(arrays, cells),
+            _ => Err(invalid("A run-end array requires signed 16-, 32- or 64-bit run ends")),
+        },
         _ => {
             let mut null_cell = None;
             let picks = cells.iter().map(|cell| {
@@ -101,6 +106,32 @@ fn copy_nested_cells(arrays: &[&dyn Array], cells: &[Cell]) -> Result<ArrayRef> 
             arrow_select::interleave::interleave(&inputs, &picks).map_err(invalid)
         }
     }
+}
+
+fn copy_runs<R: RunEndIndexType>(arrays: &[&dyn Array], cells: &[Cell]) -> Result<ArrayRef> {
+    let end = |value| R::Native::from_usize(value).ok_or_else(|| {
+        Anomaly::incorrect("rtdb/run-end-selection-width", "Selected rows exceed the run-end width")
+    });
+    end(cells.len())?;
+    let runs = arrays.iter().map(|array| {
+        array.as_any().downcast_ref::<RunArray<R>>().ok_or_else(|| invalid("A run-end source is not a run array"))
+    }).collect::<Result<Vec<_>>>()?;
+    let inputs = runs.iter().map(|array| array.values().as_ref()).collect::<Vec<_>>();
+    let mut picks = Vec::new();
+    let mut ends = Vec::new();
+    for (index, cell) in cells.iter().enumerate() {
+        let physical = cell.map(|(source, row)| (source, runs[source].get_physical_index(row)));
+        if picks.last() != Some(&physical) {
+            if !picks.is_empty() { ends.push(end(index)?); }
+            picks.push(physical);
+        }
+    }
+    if !picks.is_empty() { ends.push(end(cells.len())?); }
+    let values = copy_nested_cells(&inputs, &picks)?;
+    let ends = PrimitiveArray::<R>::new(ScalarBuffer::from(ends), None);
+    let data = ArrayData::builder(arrays[0].data_type().clone()).len(cells.len())
+        .add_child_data(ends.to_data()).add_child_data(values.to_data()).build().map_err(invalid)?;
+    Ok(make_array(data))
 }
 
 fn interleave_union<C>(fields: &UnionFields, arrays: &[&dyn Array], cells: &[C],
@@ -189,11 +220,18 @@ fn copying_fixed_width_cells_clears_invalid_payloads() {
 }
 
 #[test]
-fn compact_selection_declines_run_end_encoded_children() {
-    use arrow_array::{Int16Array, Int64Array, RunArray, types::Int16Type};
+fn compact_selection_keeps_sliced_run_end_values_encoded() {
+    use arrow_array::{Int16Array, Int64Array};
 
-    let values = RunArray::<Int16Type>::try_new(&Int16Array::from(vec![2]), &Int64Array::from(vec![42])).unwrap();
-    let error = copy_selected_cells(&[&values], &[(0, 0)]).unwrap_err();
+    let values = RunArray::<Int16Type>::try_new(
+        &Int16Array::from(vec![3, 6, 10]), &Int64Array::from(vec![Some(11), None, Some(42)]),
+    ).unwrap().slice(2, 7);
+    let other = RunArray::<Int16Type>::try_new(&Int16Array::from(vec![2]), &Int64Array::from(vec![7])).unwrap();
 
-    assert_eq!(error.code, "rtdb/column-selection");
+    let selected = copy_selected_cells(&[&values, &other], &[(0, 0), (0, 3), (0, 2), (1, 1), (0, 6), (0, 4)]).unwrap();
+    let selected = selected.as_any().downcast_ref::<RunArray<Int16Type>>().unwrap();
+
+    assert_eq!(selected.run_ends().values(), &[1, 3, 4, 6]);
+    let actual = selected.values().as_any().downcast_ref::<Int64Array>().unwrap().iter().collect::<Vec<_>>();
+    assert_eq!(actual, [Some(11), None, Some(7), Some(42)]);
 }

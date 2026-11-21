@@ -1769,6 +1769,8 @@ surface QueryAccess {
         -- Reading a selected struct during evaluation preserves which keys its source has.
         -- Compatible fixed-size lists stay in Arrow through sparse selection and output.
         -- A sparse selection of compatible in-memory maps also stays in Arrow.
+        -- A delegated scan sends selected source vectors in Arrow IPC in their scan order.
+        -- Each fragment frame preserves its source fields and the coordinator can filter its Arrow vectors by position.
 }
 
 ---- Deferred Specifications
