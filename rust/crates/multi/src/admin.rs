@@ -751,6 +751,10 @@ async fn stage_cell_storage(
     let uncertain = admitted.as_ref().is_err_and(|error| error.code != "rtdb.multi/cell-transfer");
     let result = async {
         admitted?;
+        let material = from.keys.existing_key(&source.key_id()).await?;
+        if source.checkpoint.is_some() && material.is_none() {
+            return Err(Anomaly::fault("rtdb.multi/transfer-key", "The source checkpoint has no key in its original vault"));
+        }
         let source_bucket = from.storage.bucket(IoRegion::new()).await?;
         let target_bucket = to.storage.bucket(io.clone()).await?;
         crate::reference::materialize(
@@ -759,7 +763,12 @@ async fn stage_cell_storage(
         if let Some(archive) = crate::archive::ArchivedCheckpoint::load(source, IoRegion::new()).await? {
             archive.materialize(staged, target_bucket).await?;
         }
-        to.keys.install(&staged.key_id(), from.keys.key(&source.key_id()).await?).await
+        // A never-opened source need not provision a key merely to move.
+        // The source vault is read-only for the transfer operator.
+        if let Some(material) = material {
+            to.keys.install(&staged.key_id(), material).await?;
+        }
+        Ok(())
     }.await;
     io.close_and_wait().await;
     drop(io);

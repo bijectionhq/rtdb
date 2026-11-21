@@ -26,8 +26,8 @@ Usage: rtdb-multi --build-info\n\
                           [--disposal-token-file FILE]\n\
        rtdb-multi cell-map --listen ADDR\n\
        rtdb-multi move-cell --cell-map ADDR --name NAME --from CELL --from-directory DIR --from-storage-root PATH --from-keys PATH --to CELL --to-directory DIR --to-storage-root PATH --to-keys PATH [--ecs-cluster ARN]\n\
-       rtdb-multi prepare-cell-transfer --transfer FILE --from CELL --from-directory DIR --from-storage-root PATH --from-keys PATH --to CELL --to-directory DIR --to-storage-root PATH --to-keys PATH [--ecs-cluster ARN]\n\
-       rtdb-multi activate-cell-transfer --transfer FILE --from CELL --from-directory DIR --from-storage-root PATH --from-keys PATH --to CELL --to-directory DIR --to-storage-root PATH --to-keys PATH\n\
+       rtdb-multi prepare-cell-transfer [--transfer FILE | --transfer-bucket BUCKET --transfer-digest SHA256] --from CELL --from-directory DIR --from-storage-root PATH --from-keys PATH --to CELL --to-directory DIR --to-storage-root PATH --to-keys PATH [--ecs-cluster ARN]\n\
+       rtdb-multi activate-cell-transfer [--transfer FILE | --transfer-bucket BUCKET --transfer-digest SHA256] --from CELL --from-directory DIR --from-storage-root PATH --from-keys PATH --to CELL --to-directory DIR --to-storage-root PATH --to-keys PATH\n\
        rtdb-multi controller --directory DIR [--rebalance MOVES] [--cell-secret FILE]\n\
        rtdb-multi reaper --directory DIR --storage-root PATH [--keys PATH] [--ecs-cluster ARN] [--grace SECONDS] [--recovery-listen ADDR --recovery-config FILE --recovery-token-file FILE --recovery-org ORG --archive-root PATH]\n\
        rtdb-multi create --directory DIR --name NAME [--org ORG] [--replicas N]\n\
@@ -94,15 +94,144 @@ fn hosted_task(arguments: &Arguments) -> Result<Option<rtdb_directory::HostedTas
     Ok(Some(rtdb_directory::HostedTask::new(cluster, &task)?))
 }
 
-fn read_transfer<T: serde::de::DeserializeOwned>(arguments: &Arguments) -> Result<T> {
-    const MAXIMUM_BYTES: u64 = 8192;
-    let mut encoded = Vec::new();
-    let file = std::fs::File::open(arguments.required("transfer")?).map_err(io)?;
-    file.take(MAXIMUM_BYTES + 1).read_to_end(&mut encoded).map_err(io)?;
-    if encoded.len() > MAXIMUM_BYTES as usize {
-        return Err(usage("The cell transfer document exceeds its size limit".into()));
+const TRANSFER_DOCUMENT_BYTES: u64 = 8192;
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct HostedTransferBinding {
+    cell: String,
+    cluster: String,
+    directory: String,
+    storage: String,
+    keys: String,
+    exchange: String,
+}
+
+fn check_hosted_transfer(command: &str, arguments: &Arguments) -> Result<()> {
+    let encoded = match std::env::var("RTDB_TRANSFER_BINDING") {
+        Ok(encoded) => encoded,
+        Err(std::env::VarError::NotPresent) => return Ok(()),
+        Err(_) => return Err(usage("Invalid installed RTDB transfer binding".into())),
+    };
+    let binding: HostedTransferBinding = serde_json::from_str(&encoded)
+        .map_err(|_| usage("Invalid installed RTDB transfer binding".into()))?;
+    for (flag, installed) in [
+        ("to", binding.cell),
+        ("ecs-cluster", binding.cluster),
+        ("to-directory", binding.directory),
+        ("to-storage-root", binding.storage),
+        ("to-keys", binding.keys),
+        ("transfer-bucket", binding.exchange),
+    ] {
+        if arguments.optional(flag) != Some(installed.as_str()) {
+            return Err(usage(format!("Hosted transfer --{flag} differs from its installed destination")));
+        }
     }
-    serde_json::from_slice(&encoded).map_err(|_| usage("Invalid cell transfer document".into()))
+    if command == "move-cell" || arguments.present("transfer") {
+        return Err(usage("The hosted task requires a catalog-managed transfer exchange".into()));
+    }
+    Ok(())
+}
+
+struct TransferExchange {
+    store: Arc<dyn rtdb_storage::ObjectStore>,
+    io: Arc<rtdb_storage::IoRegion>,
+    digest: String,
+}
+
+impl TransferExchange {
+    async fn open(arguments: &Arguments) -> Result<Option<Self>> {
+        let remote = arguments.present("transfer-bucket") || arguments.present("transfer-digest");
+        if remote == arguments.present("transfer") {
+            return Err(usage("A transfer needs one local file or a private bucket and request digest".into()));
+        }
+        if !remote {
+            return Ok(None);
+        }
+        let bucket = arguments.required("transfer-bucket")?;
+        let valid_bucket = (3..=63).contains(&bucket.len())
+            && bucket.bytes().all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'-' | b'.'))
+            && bucket.as_bytes()[0].is_ascii_alphanumeric()
+            && bucket.as_bytes()[bucket.len() - 1].is_ascii_alphanumeric();
+        let digest = arguments.required("transfer-digest")?;
+        if !valid_bucket || digest.len() != 64 || !digest.bytes().all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)) {
+            return Err(usage("Invalid transfer exchange namespace or request digest".into()));
+        }
+        let io = rtdb_storage::IoRegion::new();
+        let root = rtdb_storage::ObjectKey::new(format!("rtdb-transfers/{digest}"))?;
+        let store = rtdb_s3::S3Config::new(bucket).open(&root, &BTreeMap::new(), io.clone()).await?;
+        Ok(Some(Self { store, io, digest: digest.to_owned() }))
+    }
+
+    async fn read_request(&self) -> Result<Vec<u8>> {
+        let key = rtdb_storage::ObjectKey::new("request.json")?;
+        let size = self.store.head(&key).await?.size;
+        if size == 0 || size > TRANSFER_DOCUMENT_BYTES {
+            return Err(usage("The exchanged transfer request exceeds its size bound".into()));
+        }
+        let bytes = self.store.get_range(&key, 0..size).await?;
+        let digest = ring::digest::digest(&ring::digest::SHA256, &bytes);
+        let actual: String = digest.as_ref().iter().map(|byte| format!("{byte:02x}")).collect();
+        if bytes.len() as u64 != size || actual != self.digest {
+            return Err(usage("The exchanged transfer request has another digest".into()));
+        }
+        Ok(bytes.to_vec())
+    }
+
+    async fn write_receipt(&self, receipt: &rtdb_directory::PreparedCellTransfer) -> Result<()> {
+        let key = rtdb_storage::ObjectKey::new("receipt.json")?;
+        let encoded = serde_json::to_vec(receipt).expect("a transfer receipt serializes");
+        self.store.put(&key, encoded.into()).await?;
+        Ok(())
+    }
+}
+
+async fn transfer_document<T: serde::de::DeserializeOwned>(
+    arguments: &Arguments,
+    exchange: Option<&TransferExchange>,
+) -> Result<T> {
+    let bytes = match exchange {
+        Some(exchange) => exchange.read_request().await?,
+        None => {
+            let file = std::fs::File::open(arguments.required("transfer")?).map_err(io)?;
+            let mut bytes = Vec::new();
+            file.take(TRANSFER_DOCUMENT_BYTES + 1).read_to_end(&mut bytes).map_err(io)?;
+            if bytes.len() as u64 > TRANSFER_DOCUMENT_BYTES {
+                return Err(usage("The cell transfer document exceeds its size limit".into()));
+            }
+            bytes
+        },
+    };
+    serde_json::from_slice(&bytes).map_err(|_| usage("Invalid cell transfer document".into()))
+}
+
+async fn execute_managed_transfer(
+    command: &str,
+    arguments: &Arguments,
+    from: &admin::CellHandle<'_>,
+    to: &admin::CellHandle<'_>,
+) -> Result<()> {
+    let exchange = TransferExchange::open(arguments).await?;
+    let result = async {
+        let receipt = if command == "prepare-cell-transfer" {
+            let intent = transfer_document(arguments, exchange.as_ref()).await?;
+            admin::prepare_managed_cell_transfer(from, to, &intent, 4 << 20, hosted_task(arguments)?).await?
+        } else {
+            let prepared = transfer_document(arguments, exchange.as_ref()).await?;
+            admin::activate_managed_cell_transfer(from, to, &prepared).await?;
+            prepared
+        };
+        if let Some(exchange) = &exchange {
+            exchange.write_receipt(&receipt).await?;
+        } else {
+            println!("{}", serde_json::to_string(&receipt).expect("a transfer receipt serializes"));
+        }
+        Ok(())
+    }.await;
+    if let Some(exchange) = exchange {
+        exchange.io.close_and_wait().await;
+    }
+    result
 }
 
 fn installation_id(arguments: &Arguments) -> Result<uuid::Uuid> {
@@ -251,6 +380,7 @@ async fn run(arguments: Vec<String>) -> Result<()> {
             rtdb_multi::cells::serve(listener, rtdb_multi::cells::MemoryCellMap::new(), cancellation).await
         }
         "move-cell" | "prepare-cell-transfer" | "activate-cell-transfer" => {
+            check_hosted_transfer(&command, &arguments)?;
             let (from_directory, to_directory) = (directory(arguments.required("from-directory")?).await?, directory(arguments.required("to-directory")?).await?);
             let from_storage = CellStorage::parse(arguments.required("from-storage-root")?)?;
             let to_storage = CellStorage::parse(arguments.required("to-storage-root")?)?;
@@ -264,15 +394,8 @@ async fn run(arguments: Vec<String>) -> Result<()> {
                     let record = admin::move_cell(map.as_ref(), &from, &to, arguments.required("name")?, 4 << 20, hosted_task(&arguments)?).await?;
                     println!("{}", serde_json::to_string_pretty(&record).expect("a record serializes"));
                 },
-                "prepare-cell-transfer" => {
-                    let intent = read_transfer(&arguments)?;
-                    let prepared = admin::prepare_managed_cell_transfer(&from, &to, &intent, 4 << 20, hosted_task(&arguments)?).await?;
-                    println!("{}", serde_json::to_string(&prepared).expect("a transfer receipt serializes"));
-                },
-                "activate-cell-transfer" => {
-                    let prepared = read_transfer(&arguments)?;
-                    admin::activate_managed_cell_transfer(&from, &to, &prepared).await?;
-                    println!("{}", serde_json::to_string(&prepared).expect("a transfer receipt serializes"));
+                "prepare-cell-transfer" | "activate-cell-transfer" => {
+                    execute_managed_transfer(&command, &arguments, &from, &to).await?;
                 },
                 _ => unreachable!(),
             }

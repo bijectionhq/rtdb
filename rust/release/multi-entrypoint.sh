@@ -58,6 +58,10 @@ case "${1:-}" in
         unset RTDB_CONFIGURATION RTDB_TLS_KEYSTORE RTDB_RECOVERY_TOKEN
         exec /usr/local/bin/rtdb-multi reaper "$@"
         ;;
+    prepare-cell-transfer | activate-cell-transfer)
+        bind_hosted_task "$@"
+        exec /usr/local/bin/rtdb-multi "$@"
+        ;;
     *)
         exec /usr/local/bin/rtdb-multi "$@"
         ;;
