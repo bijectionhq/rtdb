@@ -196,7 +196,10 @@ impl Installer {
                 let Some(installation) = directory.deployment_by_name(&request.name).await? else {
                     return Ok(Reply::Deferred);
                 };
-                if installation.id != request.authority.to_string() || installation.parent.is_some() {
+                if installation.id != request.authority.to_string()
+                    || installation.org != self.org
+                    || installation.parent.is_some()
+                {
                     return Ok(Reply::Refused);
                 }
                 disposal_reply(installation, request.authority)
