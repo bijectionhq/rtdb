@@ -283,7 +283,7 @@ impl StorageRegion {
         match self {
             Self::Local { checkpoint_metadata_from, .. } |
             Self::Remote { checkpoint_metadata_from, closed: false, .. } => *checkpoint_metadata_from,
-            Self::Remote { closed: true, .. } => None,
+            Self::Remote { closed: true, .. } | Self::ReplicaReplay { .. } => None,
         }
     }
 
