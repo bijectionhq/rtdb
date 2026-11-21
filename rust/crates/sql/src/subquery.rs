@@ -336,6 +336,14 @@ impl Context<'_> {
             return Ok(values.into_iter().map(|value| Expr::binary(BinaryOp::Eq, needle.clone(), value))
                 .reduce(|left, right| Expr::binary(BinaryOp::Or, left, right)).unwrap());
         }
+        if let Some(domain) = self.id_list_domain(&needle, values, input) {
+            let mut scalar = ExpressionInput::Scalar(input.scope());
+            let values = values.iter().map(|value| self.expr_bound(value, &mut scalar, &Replacements::new())).collect::<Result<Vec<_>>>()?;
+            if values.iter().all(|value| id_domain(&value.data_type()) == Some(domain)) {
+                let mut equalities = values.into_iter().map(|value| Expr::binary(BinaryOp::Eq, needle.clone(), value)).collect::<Vec<_>>();
+                return Ok(disjunction(&mut equalities));
+            }
+        }
         let needle = self.materialize(needle, input)?;
         self.outer_scopes.push(CorrelationScope::new(input.relational_schema()?.clone()));
         let rows = values.iter().zip(constructors).map(|(value, constructor)| {
@@ -351,6 +359,16 @@ impl Context<'_> {
         let expression = output.expression();
         input.attach(ExpressionAttachment::Mark { dependent, arguments, comparison, output })?;
         Ok(expression)
+    }
+
+    /// The ID kind of `needle` where it is an `_id` column of a single kind and `values` is a list of literals and
+    /// parameters short enough to bind as equalities; the values' own kinds are known once they are bound.
+    fn id_list_domain(&self, needle: &Expr, values: &[ast::Expr], input: &ExpressionInput<'_>) -> Option<IdDomain> {
+        if values.len() > ID_LIST_LIMIT || !values.iter().all(|value| matches!(value, ast::Expr::Value(_) | ast::Expr::TypedString(_))) { return None; }
+        let Expr::Column { id, data_type } = needle else { return None; };
+        let field = input.relational_schema().ok()?.get(*id)?;
+        if field.name != "_id" { return None; }
+        id_domain(data_type)
     }
 
     pub(crate) fn quantified_subquery(&mut self, needle: &ast::Expr, query: &ast::Query, op: BinaryOp, negate: bool, input: &mut ExpressionInput<'_>, replacements: &Replacements) -> Result<Expr> {
@@ -415,6 +433,36 @@ impl Context<'_> {
         let result = self.apply_expression(input, dependent, arguments, ApplyKind::Scalar)?;
         Ok(if negate { Expr::unary(UnaryOp::Not, result) } else { result })
     }
+}
+
+/// The longest `_id IN (...)` list of constants bound as equalities, which a scan narrows to those IIDs.
+/// A longer list is compared through a candidate relation, whose cost per row does not grow with the list.
+const ID_LIST_LIMIT: usize = 4096;
+
+/// The kinds of value an entity ID takes. Equality within one kind needs no coercion, so comparing a column of that
+/// kind with constants of it gives the same answers as comparing it with a candidate relation of them.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum IdDomain { Integer, String, Keyword, Uuid }
+
+fn id_domain(data_type: &LogicalType) -> Option<IdDomain> {
+    match data_type {
+        LogicalType::Scalar(ScalarType::I8 | ScalarType::I16 | ScalarType::I32 | ScalarType::I64) => Some(IdDomain::Integer),
+        LogicalType::Scalar(ScalarType::Utf8) => Some(IdDomain::String),
+        LogicalType::Scalar(ScalarType::Keyword) => Some(IdDomain::Keyword),
+        LogicalType::Scalar(ScalarType::Uuid) => Some(IdDomain::Uuid),
+        _ => None,
+    }
+}
+
+/// An OR of `clauses` in their order, nested evenly so that its depth grows with the logarithm of their count.
+fn disjunction(clauses: &mut Vec<Expr>) -> Expr {
+    fn build(clauses: &mut std::vec::Drain<'_, Expr>, count: usize) -> Expr {
+        if count == 1 { return clauses.next().expect("the count was taken from the clauses"); }
+        let left = build(clauses, count / 2);
+        Expr::binary(BinaryOp::Or, left, build(clauses, count - count / 2))
+    }
+    let count = clauses.len();
+    build(&mut clauses.drain(..), count)
 }
 
 fn in_row(value: &ast::Expr) -> Result<Option<&ast::Expr>> {
