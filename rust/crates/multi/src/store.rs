@@ -188,44 +188,48 @@ impl RemoteStorageFactory for CellStoreFactory {
             .map_err(|error| Anomaly::incorrect("rtdb.multi/storage-config", format!("Cell storage configuration is malformed: {error}")))?;
         let (record, region, owner, release, checkpoint_metadata) = self.admit_region(&config, io).await?;
         let blocks = discovery_from_admitted_record(&config, &record);
-        let recovery = if storage_root.as_str() == crate::archive::checkpoint_storage_root()? {
-            crate::archive::ArchivedCheckpoint::load(&record, self.keys.as_ref(), region.clone()).await?
-        } else {
-            None
-        };
-        if record.storage_namespaces.is_some() {
-            crate::deployment::require_storage_namespaces(&record, self.storage_namespaces)?;
-        }
-        let bucket = config.storage.bucket(Arc::clone(&region)).await?;
-        let store = format!("{}/{}", config.prefix, storage_root.as_str());
-        let writer = match (&self.scoped_writes, &config.storage) {
-            (Some(scoped), crate::deployment::CellStorage::S3 { config: storage }) if config.writer_epoch.is_some() || config.compactor => {
-                let cell_root = ObjectKey::new(crate::deployment::S3_CELL_ROOT)?;
-                let root = ObjectKey::new(format!("{cell_root}/{store}"))?;
-                let member = scoped.member.get().cloned()
-                    .ok_or_else(|| Anomaly::fault("rtdb.multi/write-member-missing", "The node has no registered identity for scoped writes"))?;
-                let authorization = Arc::new(ScopedWriter { directory: Arc::clone(&self.directory), deployment: config.deployment.clone(),
-                    prefix: config.prefix.clone(), epoch: config.writer_epoch, member });
-                Some(scoped.issuer.open(storage, &cell_root, &root, authorization, region)?)
+        let checkpoint_metadata: Arc<dyn Send + Sync> = Arc::new(checkpoint_metadata);
+        let opened = IoRegion::retaining(Arc::clone(&checkpoint_metadata), async {
+            let recovery = if storage_root.as_str() == crate::archive::checkpoint_storage_root()? {
+                crate::archive::ArchivedCheckpoint::load(&record, self.keys.as_ref(), region.clone()).await?
+            } else {
+                None
+            };
+            if record.storage_namespaces.is_some() {
+                crate::deployment::require_storage_namespaces(&record, self.storage_namespaces)?;
             }
-            _ => None,
-        };
-        let local = Arc::new(crate::reference::PrefixedStore::new(Arc::clone(&bucket), store.clone()).with_writer(writer));
-        let root: Arc<dyn ObjectStore> = Arc::new(FencedStore {
-            inner: local,
-            directory: self.directory.clone(),
-            deployment: config.deployment.clone(),
-            prefix: config.prefix.clone(),
-            fence: Fence::from(&config),
-            _release: Some(release),
-        });
-        check_root(root.as_ref(), &config.deployment, config.writer_epoch.is_some()).await?;
-        let pages = HostedIndexPages::new(
-            self.directory.clone(), config.deployment, store.clone(), owner, config.writer_epoch, self.storage_regions.clone(),
-        );
-        let mut opened = open_cell_store(bucket, &store, root, &record, wall_clock(), recovery).await?;
-        Arc::get_mut(&mut opened).expect("the new store has one owner").index_pages = Some(pages);
-        Ok(OpenedRecoveryStore { store: opened, blocks, checkpoint_metadata: Some(Arc::new(checkpoint_metadata)) })
+            let bucket = config.storage.bucket(Arc::clone(&region)).await?;
+            let store = format!("{}/{}", config.prefix, storage_root.as_str());
+            let writer = match (&self.scoped_writes, &config.storage) {
+                (Some(scoped), crate::deployment::CellStorage::S3 { config: storage }) if config.writer_epoch.is_some() || config.compactor => {
+                    let cell_root = ObjectKey::new(crate::deployment::S3_CELL_ROOT)?;
+                    let root = ObjectKey::new(format!("{cell_root}/{store}"))?;
+                    let member = scoped.member.get().cloned()
+                        .ok_or_else(|| Anomaly::fault("rtdb.multi/write-member-missing", "The node has no registered identity for scoped writes"))?;
+                    let authorization = Arc::new(ScopedWriter { directory: Arc::clone(&self.directory), deployment: config.deployment.clone(),
+                        prefix: config.prefix.clone(), epoch: config.writer_epoch, member });
+                    Some(scoped.issuer.open(storage, &cell_root, &root, authorization, region)?)
+                }
+                _ => None,
+            };
+            let local = Arc::new(crate::reference::PrefixedStore::new(Arc::clone(&bucket), store.clone()).with_writer(writer));
+            let root: Arc<dyn ObjectStore> = Arc::new(FencedStore {
+                inner: local,
+                directory: self.directory.clone(),
+                deployment: config.deployment.clone(),
+                prefix: config.prefix.clone(),
+                fence: Fence::from(&config),
+                _release: Some(release),
+            });
+            check_root(root.as_ref(), &config.deployment, config.writer_epoch.is_some()).await?;
+            let pages = HostedIndexPages::new(
+                self.directory.clone(), config.deployment, store.clone(), owner, config.writer_epoch, self.storage_regions.clone(),
+            );
+            let mut opened = open_cell_store(bucket, &store, root, &record, wall_clock(), recovery).await?;
+            Arc::get_mut(&mut opened).expect("the new store has one owner").index_pages = Some(pages);
+            Ok::<_, Anomaly>(opened)
+        }).await?;
+        Ok(OpenedRecoveryStore { store: opened, blocks, checkpoint_metadata: Some(checkpoint_metadata) })
     }
 
     fn cache_identity<'a>(&self, configuration: &'a Any) -> Result<std::borrow::Cow<'a, [u8]>> {
