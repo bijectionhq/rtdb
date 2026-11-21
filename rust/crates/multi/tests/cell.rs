@@ -357,7 +357,7 @@ async fn a_fork_starts_from_its_parents_data_and_diverges_and_a_deletion_leaves_
     assert_eq!(deletion.deployment, parent.id);
     assert!(files_under(&root.join(parent.storage_prefix())).is_empty(), "the parent's objects are erased");
     assert!(own(&child.storage_prefix()) > written, "after the fork's shared objects were copied into it");
-    assert!(rtdb_multi::keys::KeyService::key(&cell.keys(), &parent.id).await.is_err(), "its key is withdrawn");
+    assert!(rtdb_multi::keys::KeyService::key(&cell.keys(), &parent.key_id()).await.is_err(), "its key is withdrawn");
     let tombstone = cell.directory.deployment_by_name("shop").await.unwrap().unwrap();
     assert_eq!(tombstone.lifecycle, rtdb_directory::Lifecycle::Deleted);
     assert_eq!(tombstone.disposal, Some(deletion.clone()));
@@ -556,6 +556,11 @@ async fn restoring_the_current_archive_preserves_the_ordered_tail_and_authority(
     let pending = destination.directory.deployment(&id.to_string()).await.unwrap().unwrap();
     assert_eq!(pending.lifecycle, Lifecycle::Moving);
     assert_eq!(pending.org, intent.destination.org);
+    assert_eq!(prepared.source_incarnation, record.incarnation);
+    assert_eq!(prepared.destination_incarnation, pending.incarnation);
+    assert_ne!(record.storage_prefix(), pending.storage_prefix());
+    assert_ne!(record.stream("replica"), pending.stream("replica"));
+    assert_ne!(record.key_id(), pending.key_id());
     assert!(pending.move_from.is_none());
     let mut foreign = prepared.clone();
     foreign.intent.operation = Some(uuid::Uuid::new_v4());
@@ -565,11 +570,41 @@ async fn restoring_the_current_archive_preserves_the_ordered_tail_and_authority(
     assert_eq!(admin::prepare_managed_cell_transfer(&from, &to, &intent, 4 << 20, None).await.unwrap(), prepared);
     assert_eq!(admin::activate_managed_cell_transfer(&from, &to, &prepared).await.unwrap(), arrived);
     assert!(arrived.checkpoint_recovery.is_none());
-    archive_dir.close().unwrap();
     let moved = connect_eventually(&destination, "shop").await;
     assert_eq!(values(&moved, "SHOW rtdb_hosted_source_barrier").await, [id.to_string()]);
     assert_eq!(values(&moved, "SELECT total FROM orders ORDER BY _id").await, ["10", "20"]);
     drop(moved);
+
+    let back = rtdb_directory::CellTransferIntent {
+        operation: Some(uuid::Uuid::new_v4()),
+        source: intent.destination.clone(),
+        destination: intent.source.clone(),
+        ..intent
+    };
+    let waiting = admin::prepare_managed_cell_transfer(&to, &from, &back, 4 << 20, None).await.unwrap_err();
+    assert_eq!(waiting.code, "rtdb.multi/previous-residence");
+    assert_eq!(destination.directory.deployment(&id.to_string()).await.unwrap().unwrap().lifecycle, Lifecycle::Live);
+
+    let retired = admin::finish_disposal(from.directory.as_ref(), from.storage, from.keys, &id.to_string(), 4 << 20).await.unwrap();
+    let returned = admin::prepare_managed_cell_transfer(&to, &from, &back, 4 << 20, None).await.unwrap();
+    assert_eq!(returned.destination_incarnation, returned.source_incarnation + 1);
+    let active = admin::activate_managed_cell_transfer(&to, &from, &returned).await.unwrap();
+    assert_eq!(active.retired_residences[&record.incarnation].serving, retired);
+    assert_eq!(active.checkpoint_captures[&operation].incarnation, record.incarnation);
+    assert!(from.keys.existing_key(&record.key_id()).await.is_err());
+    assert_eq!(from.keys.existing_key(&active.key_id()).await.unwrap(), to.keys.existing_key(&arrived.key_id()).await.unwrap());
+    assert!(rtdb_multi::archive::begin_retirement(from.directory.as_ref(), id).await.is_err());
+
+    let moved = connect_eventually(&cell, "shop").await;
+    assert_eq!(values(&moved, "SHOW rtdb_hosted_source_barrier").await, [id.to_string()]);
+    assert_eq!(values(&moved, "SELECT total FROM orders ORDER BY _id").await, ["10", "20"]);
+    drop(moved);
+    admin::delete_deployment(from.directory.as_ref(), from.storage, from.keys, &id.to_string(), 4 << 20).await.unwrap();
+    rtdb_multi::archive::begin_retirement(from.directory.as_ref(), id).await.unwrap();
+    let retired_archives = rtdb_multi::archive::finish_retirement(from.directory.as_ref(), id).await.unwrap();
+    assert!(retired_archives.observed_empty_at_ms.is_some());
+    assert!(files_under(&archive_dir.path().join(format!("checkpoint-captures/{id}/{operation}"))).is_empty());
+    archive_dir.close().unwrap();
     destination.stop().await;
     cell.stop().await;
 }
@@ -789,7 +824,7 @@ async fn a_deployment_moves_cells_with_its_unflushed_tail_and_its_old_gateway_fo
     let receipt = admin::finish_disposal(east.directory.as_ref(), &east_storage, &keys, &tombstone.id, 4 << 20).await.unwrap();
     assert_eq!(receipt.journals, tombstone.replica_journals);
     assert_eq!(left_behind().await, 0, "the source disposal receipt follows removal of its serving objects");
-    assert!(rtdb_multi::keys::KeyService::key(&keys, &tombstone.id).await.is_err(), "the source key stays withdrawn");
+    assert!(rtdb_multi::keys::KeyService::key(&keys, &tombstone.key_id()).await.is_err(), "the source key stays withdrawn");
     let recovered = admin::move_cell(map.as_ref(), &source, &destination, "shop", 4 << 20, None).await.unwrap();
     assert_eq!(recovered.id, arrived.id);
     assert_eq!(recovered.cell_transfer, arrived.cell_transfer);

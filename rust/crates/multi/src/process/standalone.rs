@@ -74,7 +74,7 @@ pub async fn initialize_standalone(root: &Path, name: &str, id: Uuid) -> Result<
     MemoryDirectory::initialize(&directory_path)?;
     let directory = MemoryDirectory::open(&directory_path)?;
     let keys = LocalKeyService::new(root.join(KEYS))?;
-    let key = keys.key(&record.id).await?;
+    let key = keys.key(&record.key_id()).await?;
     let authority = Authority {
         format: STANDALONE_PROTOCOL,
         database: record.name.clone(),
@@ -134,7 +134,7 @@ pub async fn serve_standalone(
 
     let keys: Arc<dyn KeyService> = Arc::new(LocalKeyService::new(settings.root.join(KEYS))?);
     let key = keys
-        .existing_key(&record.id)
+        .existing_key(&record.key_id())
         .await?
         .ok_or_else(|| invalid("The original standalone RTDB key is missing"))?;
     if authority.key_digest != digest(&key) {
@@ -397,7 +397,7 @@ mod tests {
         assert!(record.linearizable_reads);
         let key = LocalKeyService::new(root.join(KEYS))
             .unwrap()
-            .existing_key(&record.id)
+            .existing_key(&record.key_id())
             .await
             .unwrap()
             .unwrap();

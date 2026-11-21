@@ -9,7 +9,7 @@ mod protocol;
 mod local;
 mod server;
 
-pub use client::{CopyFrom, Loglet, QuorumLog, StreamConfig, open_reader, open_reader_on, open_writer, open_writer_on, retire, seal, trim};
+pub use client::{CopyFrom, Loglet, QuorumLog, StreamConfig, copy_retained, open_reader, open_reader_on, open_writer, open_writer_on, retire, seal, trim};
 pub use local::LocalListener;
 pub use server::{PreparedJournal, ServerOptions, serve};
 

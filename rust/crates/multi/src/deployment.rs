@@ -134,10 +134,10 @@ pub enum Role {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LogkeeperLogConfig {
     pub servers: Vec<String>,
-    /// The deployment whose key seals the stream's payloads.
-    #[serde(default)]
     pub deployment: String,
+    pub key_id: String,
     pub replica_stream: String,
+    pub replica_seal_scope: String,
     /// The ensemble the stream moves from, when the holder opening it moves it to `servers`.
     #[serde(default)]
     pub previous_servers: Option<Vec<String>>,
@@ -164,7 +164,19 @@ pub fn database_config(record: &DeploymentRecord, servers: Vec<String>, storage:
 
 /// The configuration a holder opens `record` with when it moves the stream from `previous` to `servers`, the ensemble `ensemble`.
 pub fn moving_config(record: &DeploymentRecord, servers: Vec<String>, moving: Option<(Vec<String>, Vec<rtdb_directory::MemberId>)>, storage: &CellStorage, role: Role) -> DatabaseConfig {
-    let mut log = LogkeeperLogConfig { write_quorum: write_quorum(servers.len()), servers, deployment: record.id.clone(), replica_stream: record.stream("replica"), epoch: record.epoch, log_epoch: record.log_epoch, frozen_at: match role { Role::Snapshot(checkpoint) => Some(checkpoint), _ => None }, previous_servers: None, ensemble: record.ensemble.iter().map(|id| id.0.clone()).collect() };
+    let mut log = LogkeeperLogConfig {
+        write_quorum: write_quorum(servers.len()),
+        servers,
+        deployment: record.id.clone(),
+        key_id: record.key_id(),
+        replica_stream: record.stream("replica"),
+        replica_seal_scope: record.replica_seal_scope(),
+        epoch: record.epoch,
+        log_epoch: record.log_epoch,
+        frozen_at: match role { Role::Snapshot(checkpoint) => Some(checkpoint), _ => None },
+        previous_servers: None,
+        ensemble: record.ensemble.iter().map(|id| id.0.clone()).collect(),
+    };
     if let Some((previous, ensemble)) = moving { log.previous_servers = Some(previous); log.ensemble = ensemble.into_iter().map(|id| id.0).collect(); }
     let store = crate::store::CellStoreConfig { storage: storage.clone(), prefix: record.storage_prefix(), deployment: record.id.clone(),
         writer_epoch: (role == Role::Holder).then_some(record.epoch), compactor: role == Role::Compactor,

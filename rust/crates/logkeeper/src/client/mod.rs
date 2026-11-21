@@ -139,6 +139,18 @@ pub async fn open_writer_on(chain: Vec<Loglet>, new: StreamConfig, epoch: u64, f
     Ok(Arc::new(QuorumLog { shared: Arc::new(Shared { ensemble, start, earlier, role: Role::Writer(writer), cancellation }) }))
 }
 
+/// Copy a fenced stream into a fresh physical stream without changing its
+/// offsets. Success requires a destination quorum to commit the copied tail.
+pub async fn copy_retained(source: StreamConfig, destination: StreamConfig, epoch: u64) -> rtdb_types::Result<()> {
+    validate(&source)?;
+    validate(&destination)?;
+    if epoch == 0 || source.stream == destination.stream {
+        return Err(Anomaly::incorrect("rtdb.logkeeper/copy-identity", "A copy requires a new stream and nonzero fence"));
+    }
+    Writer::copy_retained(&Ensemble::new(source), &Ensemble::new(destination), epoch).await?;
+    Ok(())
+}
+
 /// Reads committed entries from whichever reachable server has the highest commit lsn, failing over on error.
 pub async fn open_reader(config: StreamConfig, cancellation: CancellationToken) -> rtdb_types::Result<Arc<QuorumLog>> {
     validate(&config)?;

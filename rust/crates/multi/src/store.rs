@@ -89,7 +89,10 @@ impl RemoteStorageFactory for CellStoreFactory {
     async fn wrap_cached(&self, configuration: &Any, cached: Arc<dyn ObjectStore>) -> Result<Arc<dyn ObjectStore>> {
         let config: CellStoreConfig = serde_json::from_slice(&configuration.value)
             .map_err(|error| Anomaly::incorrect("rtdb.multi/storage-config", format!("Cell storage configuration is malformed: {error}")))?;
-        Ok(Arc::new(EncryptingStore::new(cached, &self.keys.key(&config.deployment).await?)?))
+        let record = self.directory.deployment(&config.deployment).await?
+            .filter(|record| record.storage_prefix() == config.prefix)
+            .ok_or_else(|| storage_region_error("The cached store belongs to another residence"))?;
+        Ok(Arc::new(EncryptingStore::new(cached, &self.keys.key(&record.key_id()).await?)?))
     }
 }
 
@@ -734,8 +737,8 @@ pub async fn run_reaper(
                         for record in deployments.iter().filter(|record| {
                             record.lifecycle == Lifecycle::Deleting || move_cleanup_due(record, now, grace)
                         }) {
-                            let disposal = crate::admin::finish_disposal(
-                                directory.as_ref(), &storage, keys, &record.id, 4 << 20,
+                            let disposal = crate::admin::finish_disposal_at(
+                                directory.as_ref(), &storage, keys, &record.id, Some(record.incarnation), 4 << 20,
                             );
                             match cancellation.run_until_cancelled(disposal).await {
                                 None => return,
@@ -952,7 +955,7 @@ mod tests {
         let storage = crate::deployment::CellStorage::Local { root: files.path().join("objects") };
         let directory = rtdb_directory::MemoryDirectory::new();
         let record = directory.create_deployment(DeploymentRecord::new("shop", "acme", vec![], 0)).await.unwrap();
-        let key = keys.key(&record.id).await.unwrap();
+        let key = keys.key(&record.key_id()).await.unwrap();
         let factory = CellStoreFactory {
             directory: directory.clone(),
             keys: keys.clone(),
@@ -987,7 +990,7 @@ mod tests {
         let pending = crate::admin::finish_disposal(directory.as_ref(), &storage, keys.as_ref(), &record.id, 4 << 20)
             .await.unwrap_err();
         assert_eq!(pending.code, "rtdb.multi/storage-not-drained");
-        assert_eq!(keys.key(&record.id).await.unwrap(), key);
+        assert_eq!(keys.key(&record.key_id()).await.unwrap(), key);
         assert!(factory.admit_region(&config, IoRegion::new()).await.is_err());
 
         complete.send(()).unwrap();
@@ -996,7 +999,7 @@ mod tests {
         let receipt = crate::admin::finish_disposal(directory.as_ref(), &storage, keys.as_ref(), &record.id, 4 << 20)
             .await.unwrap();
         assert_eq!(receipt.deployment, record.id);
-        assert!(keys.key(&record.id).await.is_err());
+        assert!(keys.key(&record.key_id()).await.is_err());
     }
 
     #[tokio::test]

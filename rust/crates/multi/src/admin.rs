@@ -7,7 +7,7 @@ use std::time::Duration;
 use rtdb_directory::{
     Cas, CellMedia, CellResidence, CellTransfer, CellTransferIntent, DeploymentRecord, Directory,
     DisposalReceipt, Lifecycle, MemberId, MemberRecord, MemberRole, MemberState, PreparedCellTransfer,
-    effective_holder, now_ms,
+    RetiredResidence, effective_holder, now_ms,
 };
 use rtdb_logkeeper::StreamConfig;
 use rtdb_types::{Anomaly, AnomalyCategory, Result};
@@ -240,13 +240,13 @@ pub async fn fork_at_time(directory: &dyn Directory, storage: &CellStorage, keys
     let servers: Vec<String> = source.ensemble.iter().filter_map(|id| members.get(id).map(|member| member.address.clone())).collect();
     let stream = StreamConfig { write_quorum: write_quorum(servers.len()), servers, stream: source.stream("replica"), maximum_message_bytes };
     let material = fork_key(keys, &source).await?;
-    let reader = crate::logs::SealedLog::new(rtdb_logkeeper::open_reader(stream.clone(), CancellationToken::new()).await?, &material, &stream.stream)?;
+    let reader = crate::logs::SealedLog::new(rtdb_logkeeper::open_reader(stream.clone(), CancellationToken::new()).await?, &material, &source.replica_seal_scope())?;
     let tail = crate::logs::transactions_until(&reader, checkpoint.boundary, system_time).await?;
     fork_with_tail(directory, storage, keys, &source, name, Some(checkpoint.block), tail, maximum_message_bytes).await
 }
 
 async fn fork_key(keys: &dyn KeyService, source: &DeploymentRecord) -> Result<[u8; crate::keys::KEY_BYTES]> {
-    keys.existing_key(&source.id).await?.ok_or_else(|| fork_unavailable(&source.name))
+    keys.existing_key(&source.key_id()).await?.ok_or_else(|| fork_unavailable(&source.name))
 }
 
 async fn fork_with_tail(directory: &dyn Directory, storage: &CellStorage, keys: &dyn KeyService, source: &DeploymentRecord, name: &str, at_block: Option<i64>, mut tail: Vec<rtdb_format::envelope::ReplicaEnvelope>, maximum_message_bytes: usize) -> Result<DeploymentRecord> {
@@ -270,11 +270,11 @@ async fn fork_with_tail(directory: &dyn Directory, storage: &CellStorage, keys: 
     let bucket = storage.bucket(io.clone()).await?;
     let prepared = async {
         crate::reference::fork(bucket.as_ref(), &source.storage_prefix(), &child.storage_prefix(), at_block).await?;
-        keys.install(&child.id, material).await?;
+        keys.install(&child.key_id(), material).await?;
         if let Some(stream) = &stream {
             use rtdb_storage::log::Log;
             let writer = rtdb_logkeeper::open_writer(stream.clone(), child.epoch, CancellationToken::new()).await?;
-            let writer = crate::logs::SealedLog::new(writer, &material, &stream.stream)?;
+            let writer = crate::logs::SealedLog::new(writer, &material, &child.replica_seal_scope())?;
             for envelope in tail {
                 writer.enqueue(bytes::Bytes::from(envelope.encode()), rtdb_types::Timestamp(now_ms() * 1000)).await?.durable().await?;
             }
@@ -326,7 +326,7 @@ async fn publish_fork(directory: &dyn Directory, source: &DeploymentRecord, chil
 }
 
 async fn discard_fork(storage: &CellStorage, keys: &dyn KeyService, child: &DeploymentRecord, stream: Option<&StreamConfig>) -> Result<()> {
-    keys.destroy(&child.id).await?;
+    keys.destroy(&child.key_id()).await?;
     if let Some(stream) = stream {
         rtdb_logkeeper::retire(stream, child.epoch + 1).await?;
     }
@@ -412,8 +412,13 @@ pub async fn prepare_managed_cell_transfer(
     hosted_task: Option<rtdb_directory::HostedTask>,
 ) -> Result<PreparedCellTransfer> {
     validate_managed_cell_move(from, to, intent)?;
-    let (source, _) = prepare_cell_move(from, to, intent, maximum_message_bytes, hosted_task).await?;
-    Ok(PreparedCellTransfer { intent: intent.clone(), incarnation: source.incarnation, epoch: source.epoch })
+    let (source, target) = prepare_cell_move(from, to, intent, maximum_message_bytes, hosted_task).await?;
+    Ok(PreparedCellTransfer {
+        intent: intent.clone(),
+        source_incarnation: source.incarnation,
+        destination_incarnation: target.incarnation,
+        epoch: source.epoch,
+    })
 }
 
 /// Called by the authenticated placement owner after it has retained this
@@ -426,7 +431,9 @@ pub async fn activate_managed_cell_transfer(
     let intent = &prepared.intent;
     validate_managed_cell_move(from, to, intent)?;
     let (source, target) = prepared_cell_move(from, to, intent).await?;
-    if source.incarnation != prepared.incarnation || source.epoch != prepared.epoch {
+    if source.incarnation != prepared.source_incarnation || target.incarnation != prepared.destination_incarnation
+        || source.epoch != prepared.epoch
+    {
         return Err(cell_move_conflict(from, to, &intent.name));
     }
     settle_cell_move(from, to, &source, &target).await
@@ -451,7 +458,9 @@ fn same_residence(record: &DeploymentRecord, intent: &CellTransferIntent, reside
 }
 
 fn intent_matches(record: &DeploymentRecord, intent: &CellTransferIntent) -> bool {
-    record.cell_transfer.as_ref().is_some_and(|transfer| &transfer.intent == intent && transfer.epoch == record.epoch)
+    record.cell_transfer.as_ref().is_some_and(|transfer| {
+        &transfer.intent == intent && transfer.epoch == record.epoch && transfer.source_incarnation == record.incarnation
+    })
 }
 
 async fn prepared_cell_move(
@@ -475,7 +484,7 @@ async fn prepared_cell_move(
     }
     let target = to.directory.deployment(&source.id).await?.filter(|target| {
         same_residence(target, intent, &intent.destination)
-            && target.incarnation == source.incarnation && target.cell_transfer == source.cell_transfer
+            && target.incarnation == transfer.destination_incarnation && target.cell_transfer == source.cell_transfer
             && target.move_from.is_none()
             && matches!(target.lifecycle, Lifecycle::Moving | Lifecycle::Live | Lifecycle::Quarantined)
     }).ok_or_else(conflict)?;
@@ -553,9 +562,6 @@ async fn prepare_cell_move(
         return prepared_cell_move(from, to, intent).await;
     }
     let target = to.directory.deployment_by_name(&intent.name).await?;
-    if current.lifecycle == Lifecycle::Live && target.is_some() {
-        return Err(conflict());
-    }
     let source_media = cell_media(from.storage, from.keys)?;
     let destination_media = cell_media(to.storage, to.keys)?;
     if from.storage.overlaps(to.storage)? || source_media.keys == destination_media.keys {
@@ -573,18 +579,49 @@ async fn prepare_cell_move(
     }
     let mut arrival = current.clone();
     arrival.org = intent.destination.org.clone();
-    if let Some(staged) = target {
-        if !same_residence(&staged, intent, &intent.destination)
-            || staged.incarnation != current.incarnation || staged.cell_transfer != current.cell_transfer
-            || !intent_matches(&current, intent) || staged.lifecycle != Lifecycle::Moving
-        {
+    arrival.incarnation = current.incarnation.checked_add(1).ok_or_else(|| {
+        Anomaly::fault("rtdb.multi/incarnation-exhausted", format!("Installation {} has no remaining residences", current.id))
+    })?;
+    let mut pending = None;
+    let mut prior_residence = None;
+    if let Some(previous) = target {
+        if !same_residence(&previous, intent, &intent.destination) {
             return Err(conflict());
         }
-        if staged.move_from.is_none() {
-            return Ok((current, staged));
+        match previous.lifecycle {
+            Lifecycle::Moving if previous.incarnation == arrival.incarnation
+                && intent_matches(&current, intent) && previous.cell_transfer == current.cell_transfer =>
+            {
+                if previous.move_from.is_none() {
+                    return Ok((current, previous));
+                }
+                arrival.ensemble.clone_from(&previous.ensemble);
+                pending = Some(previous);
+            }
+            Lifecycle::Deleted if previous.incarnation < current.incarnation && previous.epoch <= current.epoch => {
+                let transfer = previous.cell_transfer.as_ref()
+                    .filter(|transfer| {
+                        previous.moved_at_ms.is_some()
+                            && transfer.intent.source == intent.destination
+                            && transfer.source_incarnation == previous.incarnation
+                            && transfer.source_media == destination_media
+                            && transfer.epoch == previous.epoch
+                    })
+                    .ok_or_else(&conflict)?;
+                let ready = previous.disposal.as_ref().is_some_and(|receipt| {
+                    receipt.deployment == previous.id && receipt.incarnation == previous.incarnation
+                        && receipt.epoch == transfer.epoch && receipt.journals == previous.replica_journals
+                }) && previous.storage_regions.is_empty() && previous.archive_retirement.as_ref()
+                    .is_none_or(|retirement| retirement.observed_empty_at_ms.is_some());
+                if !ready {
+                    return Err(Anomaly::new(AnomalyCategory::Unavailable, "rtdb.multi/previous-residence", "The destination is still settling its previous residence"));
+                }
+                prior_residence = Some(previous);
+            }
+            _ => return Err(conflict()),
         }
-        arrival = staged;
-    } else {
+    }
+    if pending.is_none() {
         arrival.ensemble = choose_ensemble(to.directory.as_ref(), &arrival, current.ensemble.len()).await?;
     }
     let source_stream = administration_stream(from.directory.as_ref(), &current, maximum_message_bytes).await?;
@@ -609,46 +646,68 @@ async fn prepare_cell_move(
         record.replica_journals.extend(source_stream.servers.iter().cloned());
         record.cell_transfer = Some(CellTransfer {
             intent: intent.clone(),
+            source_incarnation: record.incarnation,
+            destination_incarnation: arrival.incarnation,
             epoch: record.epoch,
             source_media: source_media.clone(),
             destination_media: destination_media.clone(),
         });
         Ok(())
     }).await?;
-    let mut staged = source.clone();
-    staged.org = arrival.org;
-    staged.ensemble = arrival.ensemble;
-    staged.replica_journals = target_stream.servers.iter().cloned().collect();
-    staged.move_from = Some(source_stream.servers.clone());
-    staged.storage_regions.clear();
-    staged.checkpoint_recovery = None;
-    staged.checkpoint_captures.clear();
-    staged.archive_retirement = None;
-    staged.activation_crashes = 0;
-    let confirm_arrival = |record: &DeploymentRecord| same_cell_move(record, &staged)
-        && record.epoch == staged.epoch && record.ensemble == staged.ensemble
-        && record.replica_journals == staged.replica_journals
-        && record.lifecycle == Lifecycle::Moving;
-    let staged = match to.directory.create_deployment(staged.clone()).await {
-        Ok(created) => created,
-        Err(error) => to.directory.deployment(&staged.id).await?.filter(confirm_arrival).ok_or(error)?,
+    let staged = if let Some(pending) = pending {
+        pending
+    } else {
+        let mut staged = source.clone();
+        staged.org = arrival.org;
+        staged.incarnation = arrival.incarnation;
+        staged.ensemble = arrival.ensemble;
+        staged.replica_journals = target_stream.servers.iter().cloned().collect();
+        staged.move_from = Some(source_stream.servers.clone());
+        staged.storage_regions.clear();
+        staged.checkpoint_recovery = None;
+        staged.checkpoint_captures.clear();
+        staged.archive_retirement = None;
+        staged.retired_residences.clear();
+        staged.activation_crashes = 0;
+        if let Some(prior) = &prior_residence {
+            staged.retired_residences.clone_from(&prior.retired_residences);
+            staged.retired_residences.insert(prior.incarnation, RetiredResidence {
+                transfer: prior.cell_transfer.clone().ok_or_else(&conflict)?,
+                serving: prior.disposal.clone().ok_or_else(&conflict)?,
+                archives: prior.archive_retirement.clone(),
+            });
+            if prior.archive_retirement.is_none() {
+                staged.checkpoint_captures.clone_from(&prior.checkpoint_captures);
+            }
+        }
+        let result = if let Some(prior) = prior_residence {
+            to.directory.replace_deployment(staged.clone(), prior.version).await
+                .and_then(|result| result.applied().ok_or_else(&conflict))
+        } else {
+            to.directory.create_deployment(staged.clone()).await
+        };
+        match result {
+            Ok(created) => created,
+            Err(error) => to.directory.deployment(&staged.id).await?.filter(|record| {
+                same_cell_move(record, &staged) && record.epoch == staged.epoch
+                    && record.ensemble == staged.ensemble && record.replica_journals == staged.replica_journals
+                    && record.lifecycle == Lifecycle::Moving
+            }).ok_or(error)?,
+        }
     };
     if staged.move_from.is_none() {
         return Ok((source, staged));
     }
 
+    if staged.move_from.as_ref() != Some(&source_stream.servers) {
+        return Err(conflict());
+    }
     rtdb_logkeeper::seal(&source_stream, source.epoch).await?;
     await_storage_drain(from.directory.as_ref(), from.storage, from.keys, &source).await?;
     crate::store::reconcile_storage_regions(to.directory.as_ref(), to.storage, to.keys, &staged).await?;
     stage_cell_storage(from, to, &source, &staged, hosted_task).await?;
 
-    let previous = rtdb_logkeeper::Loglet {
-        servers: staged.move_from.clone().ok_or_else(&conflict)?,
-        start_lsn: 0,
-    };
-    rtdb_logkeeper::open_writer_on(
-        vec![previous], target_stream, source.epoch, rtdb_logkeeper::CopyFrom::Retained, CancellationToken::new(),
-    ).await?;
+    rtdb_logkeeper::copy_retained(source_stream, target_stream, source.epoch).await?;
     let prepared = update_installation(to.directory.as_ref(), &staged.id, |record| {
         if !same_cell_move(record, &staged) || record.lifecycle != Lifecycle::Moving || record.epoch != staged.epoch {
             return Err(conflict());
@@ -700,7 +759,7 @@ async fn stage_cell_storage(
         if let Some(archive) = crate::archive::ArchivedCheckpoint::load(source, IoRegion::new()).await? {
             archive.materialize(staged, target_bucket).await?;
         }
-        to.keys.install(&source.id, from.keys.key(&source.id).await?).await
+        to.keys.install(&staged.key_id(), from.keys.key(&source.key_id()).await?).await
     }.await;
     io.close_and_wait().await;
     drop(io);
@@ -744,7 +803,14 @@ pub(crate) async fn administration_stream(directory: &dyn Directory, record: &De
 
 /// Accepts serving disposal by fencing this installation in the directory.
 pub async fn begin_disposal(directory: &dyn Directory, id: &str) -> Result<DeploymentRecord> {
+    begin_disposal_at(directory, id, None).await
+}
+
+async fn begin_disposal_at(directory: &dyn Directory, id: &str, incarnation: Option<u64>) -> Result<DeploymentRecord> {
     update_installation(directory, id, |record| {
+        if incarnation.is_some_and(|expected| expected != record.incarnation) {
+            return Err(Anomaly::incorrect("rtdb.multi/disposal-identity", "The request names another residence"));
+        }
         match record.lifecycle {
             Lifecycle::Deleted if record.disposal.is_some() => Ok(()),
             Lifecycle::Deleting => Ok(()),
@@ -764,14 +830,17 @@ pub async fn begin_disposal(directory: &dyn Directory, id: &str) -> Result<Deplo
 
 /// The hosting catalog can accept retirement before provisioning reaches the directory.
 /// Reserve that exact identity as retiring so a late install cannot open it.
-pub(crate) async fn begin_hosted_disposal(directory: &dyn Directory, id: uuid::Uuid, name: &str, org: &str) -> Result<DeploymentRecord> {
-    if id.is_nil() || !valid_installation_name(name) || !valid_installation_name(org) {
+pub(crate) async fn begin_hosted_disposal(directory: &dyn Directory, id: uuid::Uuid, name: &str, org: &str, incarnation: u64) -> Result<DeploymentRecord> {
+    if id.is_nil() || incarnation == 0 || !valid_installation_name(name) || !valid_installation_name(org) {
         return Err(Anomaly::incorrect("rtdb.multi/disposal-identity", "Invalid hosted retirement scope"));
     }
     let id = id.to_string();
     let installed = match directory.deployment_by_name(name).await? {
         Some(installed) => installed,
         None => {
+            if incarnation != 1 {
+                return Err(Anomaly::incorrect("rtdb.multi/disposal-identity", "A transferred residence must already exist"));
+            }
             let mut record = DeploymentRecord::new(name, org, Vec::new(), now_ms());
             record.id = id.clone();
             record.lineage = id.clone();
@@ -786,26 +855,48 @@ pub(crate) async fn begin_hosted_disposal(directory: &dyn Directory, id: uuid::U
     if installed.id != id || installed.org != org || installed.parent.is_some() {
         return Err(Anomaly::incorrect("rtdb.multi/disposal-identity", "The requested name belongs to another installation"));
     }
-    begin_disposal(directory, &id).await
+    begin_disposal_at(directory, &id, Some(incarnation)).await
 }
 
 /// Fences and removes an installation's serving storage. The tombstone retains its receipt.
 pub async fn delete_deployment(directory: &dyn Directory, storage: &CellStorage, keys: &dyn KeyService, id: &str, maximum_message_bytes: usize) -> Result<DisposalReceipt> {
     let fence = begin_disposal(directory, id).await?;
     await_storage_drain(directory, storage, keys, &fence).await?;
-    finish_disposal(directory, storage, keys, id, maximum_message_bytes).await
+    finish_disposal_at(directory, storage, keys, id, Some(fence.incarnation), maximum_message_bytes).await
 }
 
 /// Settles a disposal previously accepted by the directory.
 pub async fn finish_disposal(directory: &dyn Directory, storage: &CellStorage, keys: &dyn KeyService, id: &str, maximum_message_bytes: usize) -> Result<DisposalReceipt> {
+    finish_disposal_at(directory, storage, keys, id, None, maximum_message_bytes).await
+}
+
+pub(crate) async fn finish_disposal_at(
+    directory: &dyn Directory,
+    storage: &CellStorage,
+    keys: &dyn KeyService,
+    id: &str,
+    incarnation: Option<u64>,
+    maximum_message_bytes: usize,
+) -> Result<DisposalReceipt> {
     let mut fenced = directory.deployment(id).await?.ok_or_else(|| {
         Anomaly::incorrect("rtdb.multi/unknown-installation", format!("No installation has ID {id}"))
     })?;
+    let expected = incarnation.unwrap_or(fenced.incarnation);
+    let earlier = |record: &DeploymentRecord| {
+        record.retired_residences.get(&expected).map(|residence| residence.serving.clone())
+            .ok_or_else(|| Anomaly::incorrect("rtdb.multi/disposal-identity", "The request names another residence"))
+    };
+    if fenced.incarnation != expected {
+        return earlier(&fenced);
+    }
     if fenced.lifecycle == Lifecycle::Deleting && !fenced.storage_regions.is_empty() {
         crate::store::reconcile_storage_regions(directory, storage, keys, &fenced).await?;
         fenced = directory.deployment(id).await?.ok_or_else(|| {
             Anomaly::incorrect("rtdb.multi/unknown-installation", format!("No installation has ID {id}"))
         })?;
+    }
+    if fenced.incarnation != expected {
+        return earlier(&fenced);
     }
     match (fenced.lifecycle, fenced.disposal.as_ref()) {
         (Lifecycle::Deleted, Some(receipt)) => return Ok(receipt.clone()),
@@ -841,7 +932,7 @@ pub async fn finish_disposal(directory: &dyn Directory, storage: &CellStorage, k
         rtdb_logkeeper::retire(&stream, fenced.epoch).await?;
     }
     let journals_retired_at_ms = now_ms();
-    keys.destroy(&fenced.id).await?;
+    keys.destroy(&fenced.key_id()).await?;
     let key_withdrawn_at_ms = now_ms().max(journals_retired_at_ms);
     let bucket = storage.bucket(rtdb_storage::IoRegion::new()).await?;
     // Its forks keep what they share with it: those objects are copied into them before it goes.
@@ -926,7 +1017,7 @@ pub async fn audit(directory: &dyn Directory, keys: &dyn KeyService, name: &str,
     let servers: Vec<String> = current.ensemble.iter().filter_map(|id| members.get(id).map(|member| member.address.clone())).collect();
     let stream = StreamConfig { write_quorum: write_quorum(servers.len()), servers, stream: current.stream("replica"), maximum_message_bytes };
     let reader = rtdb_logkeeper::open_reader(stream, CancellationToken::new()).await?;
-    let log = crate::logs::SealedLog::new(reader, &keys.key(&current.id).await?, &current.stream("replica"))?;
+    let log = crate::logs::SealedLog::new(reader, &keys.key(&current.key_id()).await?, &current.replica_seal_scope())?;
     let latest = log.latest()?.0;
     let mut report = AuditReport::default();
     let (mut next, mut last_tx, mut last_time, mut last_source) = (0i64, i64::MIN, i64::MIN, i64::MIN);
