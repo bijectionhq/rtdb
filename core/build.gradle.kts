@@ -78,6 +78,7 @@ dependencies {
 
     api(kotlin("stdlib"))
     api(libs.kotlinx.coroutines)
+    testImplementation(kotlin("reflect"))
     testImplementation(libs.kotlinx.coroutines.test)
     api(libs.kaml)
 
