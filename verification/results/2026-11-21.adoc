@@ -1332,3 +1332,19 @@ The proofs model the same database history on both nodes.
 Physical collection by another authority and transport checks that bind both captures to the same residence remain separate obligations.
 From `rust/`, the selected command is `BIJECTION_LOCAL_EXECUTION=owner-authorized cargo test --offline --locked -p rtdb-query -p rtdb-multi -p rtdb-node -p rtdb-replication --lib --test scan --test cell --test resources --test native`.
 The combined runner executes the registered Lean and TLC cases and adds both source controls with `--native-replay`. link:../lean/DelegatedScan.lean[Lean laws] · link:../tla/DelegatedScan.tla[TLA+ protocol] · link:../README.adoc#_run_the_studies[Runner]
+
+=== Catalog cut at cross-node reader admission
+
+TLC explored 126 reachable states of a replica, a snapshot and an independently advancing retirement floor.
+Using the installed cut captured with its catalog preserved the dependencies of every admitted reader in this configuration.
+Three controls used the received replica position, a later sample of the installed position and the logical transaction head.
+Each violated `Readable`.
+The received-position counterexample takes six transitions from initialization to deletion.
+The two witnesses reach a refusal for an older capture and a replacement reader after physical collection.
+
+Apalache 0.63.0 independently checked the baseline through eight transitions and rejected the received-position control.
+The checked model SHA-256 is `e8a9bc8601faff7c96713c0e208872f4fe3dcbf21863a24f2a6a5068889d6a2d`.
+Both tools run these cases through the combined runner.
+The finite study assumes the directory's retirement floor already has a valid producer.
+The Rust driver facts used in the refinement brief are its separate receive and apply boundaries and its independently published status watch.
+The storage receipt and reader admission adapter still need an installed catalog cut in production. link:../tla/CatalogCutPublication.tla[Comparison and controls]

@@ -748,6 +748,24 @@ These results concern candidate protocols in one residence.
 For production, identify the authoritative cut and receipt producers, connect storage admission and I/O draining for all query paths, and verify the garbage adapter and physical delete's identity.
 Exact historical admission, recovery dependencies, mixed-version deployments, and forks that share physical files require composition with their respective authorities. link:../../verification/tla/ResidenceReaderRetention.tla[Comparable model] · link:../../verification/lean/ResidenceReaderRetention.lean[General safety and comparison laws]
 
+=== The catalog cut used at reader admission
+
+The admitted cut must be a lower bound on the physical effects installed in the exact catalog captured by the reader.
+Store that relationship in the same immutable partition value as the catalog, or derive it from a witness that the partition publishes with that value.
+Signing a higher cut can admit a snapshot that still depends on an object the cell may collect.
+
+Replica delivery and application are separate in the Rust driver.
+The driver can retain admitted records while resolution is in flight or while a block awaits its matching upload.
+It can advance its transport position with those records still pending application.
+The status watch also publishes independently of query catalog capture, so a later status read can describe a different catalog from the one the query holds.
+The transaction head is a logical observation and a physical catalog publication can change dependencies while leaving that head unchanged.
+
+TLC compares those three observations with an atomic capture of the installed catalog and its revision.
+Using the received position, reading the installed position after capture, or reusing the transaction basis each admits a view with a dependency still needed at an older cut.
+The model's successful variant refuses the stale capture and admits a replacement after collection.
+That result assumes a monotone retirement floor certified at publication by the collector's authority.
+Mapping pending and skipped control records, recovery's checkpoint boundary, and direct maintenance operations into the same cut requires a production refinement. link:../../verification/tla/CatalogCutPublication.tla[Capture and publication model] · link:../../rust/crates/replication/src/driver.rs[Driver transitions]
+
 === Delegated scans keep the coordinator's captured view
 
 A delegated prefix scan is an optimization of a query the coordinator already admitted.

@@ -1025,6 +1025,17 @@ TLA_CASES = (
      ("INVARIANTS TypeOK AttemptsAdvance NoEmptyAfterMissing UsesNewerListing CorruptionIsTerminal MissingFailureHasRefreshed",
       "INVARIANT NeverRecoveredAfterRefresh"),
      "NeverRecoveredAfterRefresh"),
+    ("CatalogCutPublication", "catalog-cut-read-status",
+     ('Mutation = "none"', 'Mutation = "remote_status"'), "Readable"),
+    ("CatalogCutPublication", "catalog-cut-sample-late",
+     ('Mutation = "none"', 'Mutation = "sample_late"'), "Readable"),
+    ("CatalogCutPublication", "catalog-cut-transaction-basis",
+     ('Mutation = "none"', 'Mutation = "transaction_basis"'), "Readable"),
+    ("CatalogCutPublication", "catalog-cut", None, None),
+    ("CatalogCutPublication", "catalog-cut-refusal-witness",
+     ("INVARIANT Readable", "INVARIANT NoRefusedStale"), "NoRefusedStale"),
+    ("CatalogCutPublication", "catalog-cut-post-collection-witness",
+     ("INVARIANT Readable", "INVARIANT NoNewReaderAfterDeletion"), "NoNewReaderAfterDeletion"),
     ("FragmentResidence", "fragment-residence-rebind",
      ('Mutation = "none"', 'Mutation = "rebind_to_route"'), "SameHistory"),
     ("FragmentResidence", "fragment-residence-trust-plan",
@@ -1258,6 +1269,11 @@ def verify_apalache(args, scratch):
     check_apalache(
         args, scratch, "ForkPublication", "fork-copy", "PublishedChildReadable", 8,
         ('Policy = "reference"', 'Policy = "copy"'),
+    )
+    check_apalache(args, scratch, "CatalogCutPublication", "catalog-cut", "Readable", 8)
+    check_apalache(
+        args, scratch, "CatalogCutPublication", "catalog-cut-read-status", "Readable", 8,
+        ('Mutation = "none"', 'Mutation = "remote_status"'), "replica receipt ahead of catalog",
     )
     check_apalache(args, scratch, "RecoveryCollection", "recovery-collection", "RecoverySafe", 10)
     check_apalache(
