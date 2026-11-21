@@ -1164,6 +1164,12 @@ async fn a_deployment_whose_activations_crash_is_quarantined_to_the_isolation_po
     let released = admin::unquarantine(cell.directory.as_ref(), "shop").await.unwrap();
     assert!(released.holder.is_none());
     assert_eq!(released.activation_crashes, 0);
+    let isolation_catalog = cell.node(1).server.node().catalog();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while isolation_catalog.database("shop").is_ok() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }).await.expect("the isolation holder stopped serving");
     assert_eq!(values(&isolated, "SELECT total FROM orders").await, ["10"]);
     assert_eq!(cell.holder("shop").await, Some(0));
     drop(isolated);
@@ -1299,13 +1305,13 @@ async fn nothing_a_deployment_stores_is_readable_at_rest() {
     client.simple_query("INSERT INTO orders (_id, note) VALUES (1, 'plaintext-marker-zq81')").await.unwrap();
     drop(client);
     cell.node(0).agent.park("shop").await.unwrap();
-    let files = files_under(cell.data.path());
+    let data = cell.stop().await;
+    let files = files_under(data.path());
     assert!(files.iter().any(|file| file.to_string_lossy().contains("/blocks/")), "the park flushed a block");
     for file in files {
         let bytes = std::fs::read(&file).unwrap();
         assert!(!bytes.windows(21).any(|window| window == b"plaintext-marker-zq81"), "{} holds the row in the clear", file.display());
     }
-    cell.stop().await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
