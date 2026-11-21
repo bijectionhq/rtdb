@@ -6,7 +6,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use rtdb_columnar::MemoryBudget;
-use rtdb_directory::{Directory, MemberRole};
+use rtdb_directory::{Directory, MemberId, MemberRole};
 use rtdb_server::{PlacedOptions, ServerDriver, ServerHandle, config::NodeConfiguration};
 use rtdb_types::{Anomaly, AnomalyCategory, Result};
 use tokio::net::TcpListener;
@@ -187,12 +187,18 @@ pub async fn start_logkeeper(directory: Arc<dyn Directory>, settings: LogkeeperS
     let listener = TcpListener::bind(settings.listen).await.map_err(io)?;
     let address = listener.local_addr().map_err(io)?;
     let endpoint = advertised(address, settings.advertise_host.as_deref())?;
-    let journal = rtdb_logkeeper::PreparedJournal::open(rtdb_logkeeper::ServerOptions {
+    let (journal, identity) = rtdb_logkeeper::PreparedJournal::open_for_member(rtdb_logkeeper::ServerOptions {
         data_dir: settings.data_dir,
         fsync: settings.fsync,
         cache_bytes: settings.cache_bytes,
-    }).await?;
-    let lease = MemberLease::register(directory, Registration { role: MemberRole::Logkeeper, address: endpoint, control_address: None, availability_zone: settings.availability_zone, pool: Default::default() }, settings.lease).await?;
+    }, MemberId::fresh().0).await?;
+    if !uuid::Uuid::parse_str(&identity).is_ok_and(|id| !id.is_nil() && id.to_string() == identity) {
+        return Err(Anomaly::incorrect("rtdb.multi/logkeeper-identity", "The retained journal member ID is invalid"));
+    }
+    let lease = MemberLease::reclaim_logkeeper(directory, Registration {
+        role: MemberRole::Logkeeper, address: endpoint, control_address: None,
+        availability_zone: settings.availability_zone, pool: Default::default(),
+    }, MemberId(identity), settings.advertise_host.is_some(), settings.lease).await?;
     let cancellation = CancellationToken::new();
     let mut tasks = JoinSet::new();
     tasks.spawn(journal.serve(listener, cancellation.clone()));
@@ -264,12 +270,45 @@ mod tests {
             lease: LeaseOptions::default(),
         };
         let original = start_logkeeper(directory.clone(), settings()).await.unwrap();
+        let id = original.lease.id();
+        let installed = crate::admin::install_deployment(directory.as_ref(), uuid::Uuid::new_v4(), "test", "local", 1).await.unwrap();
+        assert_eq!(installed.ensemble, vec![id.clone()]);
         assert!(start_logkeeper(directory.clone(), settings()).await.is_err());
         assert_eq!(directory.members().await.unwrap().len(), 1);
         original.stop().await.unwrap();
         let replacement = start_logkeeper(directory.clone(), settings()).await.unwrap();
-        assert_eq!(directory.members().await.unwrap().iter().filter(|member| member.is_live(rtdb_directory::now_ms())).count(), 1);
+        assert_eq!(replacement.lease.id(), id);
+        let record = directory.member(&id).await.unwrap().unwrap();
+        assert!(record.is_live(rtdb_directory::now_ms()));
+        assert_eq!(record.address, replacement.address.to_string());
+        assert_eq!(directory.members().await.unwrap().len(), 1);
         replacement.stop().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_different_journal_cannot_take_an_existing_logkeeper_address() {
+        let directory = rtdb_directory::MemoryDirectory::new();
+        let data = tempfile::tempdir().unwrap();
+        let empty = tempfile::tempdir().unwrap();
+        let settings = |path: &std::path::Path, listen| LogkeeperSettings {
+            listen,
+            advertise_host: Some("keeper.test.internal".into()),
+            data_dir: path.to_owned(),
+            fsync: true,
+            cache_bytes: 1 << 20,
+            availability_zone: "test".into(),
+            lease: LeaseOptions::default(),
+        };
+        let running = start_logkeeper(directory.clone(), settings(data.path(), "127.0.0.1:0".parse().unwrap())).await.unwrap();
+        let listen = running.address;
+        let id = running.lease.id();
+        running.stop().await.unwrap();
+
+        assert!(start_logkeeper(directory.clone(), settings(empty.path(), listen)).await.is_err());
+        assert_eq!(directory.members().await.unwrap().len(), 1);
+        let restarted = start_logkeeper(directory.clone(), settings(data.path(), listen)).await.unwrap();
+        assert_eq!(restarted.lease.id(), id);
+        restarted.stop().await.unwrap();
     }
 
     #[test]

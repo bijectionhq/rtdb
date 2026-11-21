@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use parking_lot::Mutex;
 use rtdb_directory::{Cas, Directory, MemberId, MemberRecord, MemberRole, MemberState, now_ms};
-use rtdb_types::Result;
+use rtdb_types::{Anomaly, AnomalyCategory, Result};
 use tokio_util::sync::CancellationToken;
 
 #[derive(Clone, Debug)]
@@ -26,13 +26,70 @@ pub struct MemberLease {
 
 pub struct Registration { pub role: MemberRole, pub address: String, pub control_address: Option<String>, pub availability_zone: String, pub pool: rtdb_directory::MemberPool }
 
+impl Registration {
+    fn record(self, id: MemberId) -> MemberRecord {
+        MemberRecord {
+            id, role: self.role, address: self.address, control_address: self.control_address,
+            availability_zone: self.availability_zone, engine_version: env!("CARGO_PKG_VERSION").into(),
+            lease_expires_at_ms: 0, state: MemberState::Eligible, pool: self.pool, version: 0,
+        }
+    }
+}
+
 impl MemberLease {
     pub async fn register(directory: Arc<dyn Directory>, registration: Registration, options: LeaseOptions) -> Result<Arc<Self>> {
-        let record = directory.register_member(MemberRecord {
-            id: MemberId::fresh(), role: registration.role, address: registration.address, control_address: registration.control_address,
-            availability_zone: registration.availability_zone, engine_version: env!("CARGO_PKG_VERSION").into(),
-            lease_expires_at_ms: now_ms() + options.lease.as_millis() as i64, state: MemberState::Eligible, pool: registration.pool, version: 0,
-        }).await?;
+        let mut candidate = registration.record(MemberId::fresh());
+        candidate.lease_expires_at_ms = now_ms() + options.lease.as_millis() as i64;
+        let record = directory.register_member(candidate).await?;
+        Ok(Arc::new(Self { directory, record: Mutex::new(record), options, lost: CancellationToken::new() }))
+    }
+
+    // This caller retains the exclusive journal lock while reclaiming the
+    // directory entry and serving. Only the original journal can recover it.
+    pub(crate) async fn reclaim_logkeeper(
+        directory: Arc<dyn Directory>,
+        registration: Registration,
+        id: MemberId,
+        stable_address: bool,
+        options: LeaseOptions,
+    ) -> Result<Arc<Self>> {
+        let mut candidate = registration.record(id);
+        let conflict = || Anomaly::new(AnomalyCategory::Conflict, "rtdb.multi/logkeeper-identity",
+            "The durable logkeeper identity or address is already installed for another journal");
+        let address_in_use = |record: &MemberRecord, other: &MemberRecord| {
+            other.role == MemberRole::Logkeeper && other.id != record.id && other.address == record.address
+        };
+        if stable_address && directory.members().await?.iter().any(|other| address_in_use(&candidate, other)) {
+            return Err(conflict());
+        }
+        candidate.state = MemberState::Joining;
+        let mut record = tokio::time::timeout(options.lease + options.heartbeat, async {
+            loop {
+                let previous = directory.member(&candidate.id).await?;
+                let now = now_ms();
+                candidate.lease_expires_at_ms = now + options.lease.as_millis() as i64;
+                let Some(previous) = previous else { return directory.register_member(candidate.clone()).await; };
+                if previous.role != MemberRole::Logkeeper || (stable_address && previous.address != candidate.address) {
+                    return Err(conflict());
+                }
+                if !previous.is_live(now) {
+                    if let Cas::Applied(record) = directory.replace_member(candidate.clone(), previous.version).await? {
+                        return Ok(record);
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        }).await.map_err(|_| Anomaly::new(AnomalyCategory::Unavailable, "rtdb.multi/logkeeper-lease",
+            "The logkeeper's previous membership has not expired"))??;
+        if stable_address && directory.members().await?.iter().any(|other| address_in_use(&record, other)) {
+            return Err(conflict());
+        }
+        let version = record.version;
+        record.state = MemberState::Eligible;
+        record.lease_expires_at_ms = now_ms() + options.lease.as_millis() as i64;
+        let Cas::Applied(record) = directory.replace_member(record, version).await? else {
+            return Err(conflict());
+        };
         Ok(Arc::new(Self { directory, record: Mutex::new(record), options, lost: CancellationToken::new() }))
     }
 
@@ -68,6 +125,7 @@ impl MemberLease {
         next.lease_expires_at_ms = now_ms() + self.options.lease.as_millis() as i64;
         match self.directory.replace_member(next, current.version).await? {
             Cas::Applied(stored) => { *self.record.lock() = stored; Ok(true) }
+            Cas::Conflict(_) if current.role == MemberRole::Logkeeper => Ok(false),
             Cas::Conflict(Some(stored)) if stored.state == MemberState::Dead || stored.state == MemberState::Retired => Ok(false),
             Cas::Conflict(Some(stored)) => {
                 // The controller moved this member's state (draining, say); keep its state and renew on top of it.

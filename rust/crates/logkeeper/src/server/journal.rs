@@ -215,16 +215,64 @@ fn remove_before(segments: &Path, sequence: u64) -> Result<()> {
     Ok(())
 }
 
+fn read_member_id(path: &Path, length: usize) -> Result<Option<String>> {
+    use std::io::Read as _;
+
+    let input = match File::open(path) {
+        Ok(input) => input,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(io_error(path, error)),
+    };
+    let mut identity = String::new();
+    input.take((length + 1) as u64).read_to_string(&mut identity)
+        .map_err(|error| io_error(path, error))?;
+    if identity.len() != length { return Err(corrupt(path, "invalid journal member identity")); }
+    Ok(Some(identity))
+}
+
+fn write_member_id(data_dir: &Path, path: &Path, identity: &str, fsync: bool) -> Result<()> {
+    let temporary = data_dir.join("MEMBER.tmp");
+    let mut file = OpenOptions::new().create(true).truncate(true).write(true)
+        .open(&temporary).map_err(|error| io_error(&temporary, error))?;
+    file.write_all(identity.as_bytes()).map_err(|error| io_error(&temporary, error))?;
+    if fsync { rtdb_storage::sync_file(&file).map_err(|error| io_error(&temporary, error))?; }
+    fs::rename(&temporary, path).map_err(|error| io_error(path, error))?;
+    sync_directory(data_dir, fsync)
+}
+
 impl Journal {
     /// Replays the segments from the last base on, deleting any earlier ones a crash left behind, and opens the last for appending.
-    pub fn open(data_dir: &Path, fsync: bool, cache_bytes: usize) -> Result<(Self, Vec<Recovered>)> {
+    pub fn open(
+        data_dir: &Path,
+        fsync: bool,
+        cache_bytes: usize,
+        new_member_id: Option<&str>,
+    ) -> Result<(Self, Vec<Recovered>, Option<String>)> {
         let segments = data_dir.join("segments");
         fs::create_dir_all(&segments).map_err(|error| io_error(&segments, error))?;
         let lock_path = data_dir.join("LOCK");
         let lock = OpenOptions::new().create(true).truncate(false).write(true).open(&lock_path).map_err(|error| io_error(&lock_path, error))?;
         lock.try_lock_exclusive().map_err(|error| io_error(&lock_path, error))?;
+        let files = list_segments(&segments)?;
+        let member_path = data_dir.join("MEMBER");
+        let mut identity = None;
+        if let Some(candidate) = new_member_id {
+            identity = read_member_id(&member_path, candidate.len())?;
+            if identity.is_some() && files.is_empty() {
+                return Err(corrupt(&member_path, "the installed journal has lost its segments"));
+            }
+            if identity.is_none() {
+                // A crash can leave the initial empty segment without its
+                // member file. It cannot leave acknowledged records there.
+                let empty_first_segment = files.len() == 1 && files.get(&0).is_some_and(|path|
+                    fs::metadata(path).is_ok_and(|metadata| metadata.len() == 0));
+                if !files.is_empty() && !empty_first_segment {
+                    return Err(corrupt(&member_path, "the journal has no installed member identity"));
+                }
+            }
+        }
         let mut chain = Vec::new();
-        for (sequence, path) in list_segments(&segments)?.into_iter().rev() {
+        for (sequence, path) in files.into_iter().rev() {
             let base = is_base(&path)?;
             chain.push((sequence, path));
             if base { break; }
@@ -256,6 +304,12 @@ impl Journal {
         let declared = replay.names.keys().copied().collect();
         let next_id = replay.names.keys().max().map_or(0, |id| id + 1);
         let recovered = replay.names.into_iter().map(|(id, name)| Recovered { id, name, state: replay.states.remove(&id).unwrap_or_default() }).collect();
+        if let Some(candidate) = new_member_id.filter(|_| identity.is_none()) {
+            if fsync { rtdb_storage::sync_file(&file).map_err(|error| io_error(&path, error))?; }
+            sync_directory(&segments, fsync)?;
+            write_member_id(data_dir, &member_path, candidate, fsync)?;
+            identity = Some(candidate.to_owned());
+        }
         let journal = Self {
             segments,
             fsync,
@@ -269,7 +323,7 @@ impl Journal {
             files: Mutex::new(files),
             cache: Mutex::new(Cache::new(cache_bytes)),
         };
-        Ok((journal, recovered))
+        Ok((journal, recovered, identity))
     }
 
     pub fn allocate_id(&self) -> u64 { self.next_id.fetch_add(1, Ordering::Relaxed) }
@@ -623,9 +677,21 @@ mod tests {
     fn segment_files(directory: &Path) -> usize { fs::read_dir(directory.join("segments")).unwrap().count() }
 
     #[test]
+    fn an_installed_member_rejects_missing_segments() {
+        let directory = tempfile::tempdir().unwrap();
+        let first = "c2a4eba6-83a7-455d-a1c1-b80c5cf5f2ba";
+        let next = "33c40ad8-37ef-45dc-ab8b-5a9198b4a7aa";
+        let (journal, _, identity) = Journal::open(directory.path(), true, 0, Some(first)).unwrap();
+        assert_eq!(identity.as_deref(), Some(first));
+        drop(journal);
+        fs::remove_dir_all(directory.path().join("segments")).unwrap();
+        assert!(Journal::open(directory.path(), true, 0, Some(next)).is_err());
+    }
+
+    #[test]
     fn streams_sharing_segments_replay_to_their_decided_states_across_a_compaction() {
         let directory = tempfile::tempdir().unwrap();
-        let (journal, _) = Journal::open(directory.path(), true, UNBOUNDED).unwrap();
+        let (journal, _, _) = Journal::open(directory.path(), true, UNBOUNDED, None).unwrap();
         let (first, second) = (slot(&journal, "deployment/1/replica"), slot(&journal, "deployment/2/replica"));
         let events = {
             let mut one = first.state.lock();
@@ -644,7 +710,7 @@ mod tests {
         let expected = retained(&journal, &first);
         assert_eq!(expected, (2..5).map(entry).collect::<Vec<_>>());
         drop(journal);
-        let (journal, recovered) = Journal::open(directory.path(), true, UNBOUNDED).unwrap();
+        let (journal, recovered, _) = Journal::open(directory.path(), true, UNBOUNDED, None).unwrap();
         let slots = recovered_slots(recovered);
         let (one, two) = (&slots[&first.name], &slots[&second.name]);
         assert_eq!(*one.state.lock(), *first.state.lock(), "entries are recovered at the locations they were left at");
@@ -658,7 +724,7 @@ mod tests {
     fn entries_evicted_from_the_cache_are_read_from_their_segments_and_the_cache_keeps_its_budget() {
         let directory = tempfile::tempdir().unwrap();
         let budget = 8 * 1024;
-        let (journal, _) = Journal::open(directory.path(), true, budget).unwrap();
+        let (journal, _, _) = Journal::open(directory.path(), true, budget, None).unwrap();
         let stream = slot(&journal, "a/b");
         synced(&journal, &stream, 1);
         let entries: Vec<Entry> = (0..400).map(|lsn| sized(lsn, 1, 1000)).collect();
@@ -670,7 +736,7 @@ mod tests {
         assert_eq!(retained(&journal, &stream), entries, "every entry is served, most from disk");
         assert!(journal.cache_bytes() <= budget);
         drop(journal);
-        let (journal, recovered) = Journal::open(directory.path(), true, budget).unwrap();
+        let (journal, recovered, _) = Journal::open(directory.path(), true, budget, None).unwrap();
         assert_eq!(journal.cache_bytes(), 0, "recovery reads no payload into memory");
         let slots = recovered_slots(recovered);
         assert!(written(&slots["a/b"]));
@@ -681,7 +747,7 @@ mod tests {
     #[test]
     fn a_truncation_and_a_trim_of_evicted_entries_read_correctly_and_a_compaction_retires_their_segments() {
         let directory = tempfile::tempdir().unwrap();
-        let (journal, _) = Journal::open(directory.path(), true, 0).unwrap();
+        let (journal, _, _) = Journal::open(directory.path(), true, 0, None).unwrap();
         let stream = slot(&journal, "a/b");
         synced(&journal, &stream, 1);
         let mut expected: Vec<Entry> = (0..100).map(|lsn| sized(lsn, 1, 100)).collect();
@@ -703,14 +769,14 @@ mod tests {
         decide(&journal, &stream, |state| state.append(2, 120, vec![sized(120, 2, 10)], 120));
         expected.push(sized(120, 2, 10));
         drop(journal);
-        let (journal, recovered) = Journal::open(directory.path(), true, 0).unwrap();
+        let (journal, recovered, _) = Journal::open(directory.path(), true, 0, None).unwrap();
         assert_eq!(retained(&journal, &recovered_slots(recovered)["a/b"]), expected);
     }
 
     #[test]
     fn a_replacement_decided_before_the_replaced_entry_is_written_keeps_its_own_payload() {
         let directory = tempfile::tempdir().unwrap();
-        let (journal, _) = Journal::open(directory.path(), true, 0).unwrap();
+        let (journal, _, _) = Journal::open(directory.path(), true, 0, None).unwrap();
         let stream = slot(&journal, "a/b");
         synced(&journal, &stream, 1);
         let first = stream.state.lock().append(1, 0, vec![sized(0, 1, 10)], -1).events;
@@ -725,7 +791,7 @@ mod tests {
     #[test]
     fn a_base_segment_supersedes_segments_a_crash_left_behind() {
         let directory = tempfile::tempdir().unwrap();
-        let (journal, _) = Journal::open(directory.path(), true, UNBOUNDED).unwrap();
+        let (journal, _, _) = Journal::open(directory.path(), true, UNBOUNDED, None).unwrap();
         let stream = slot(&journal, "a/b");
         decide(&journal, &stream, |state| state.seal(2));
         let stale = fs::read(segment_path(&journal.segments, 0)).unwrap();
@@ -733,7 +799,7 @@ mod tests {
         decide(&journal, &stream, |state| state.seal(5));
         fs::write(segment_path(&journal.segments, 0), stale).unwrap();
         drop(journal);
-        let (_, recovered) = Journal::open(directory.path(), true, UNBOUNDED).unwrap();
+        let (_, recovered, _) = Journal::open(directory.path(), true, UNBOUNDED, None).unwrap();
         assert_eq!(recovered_slots(recovered)["a/b"].state.lock().promised, 5);
         assert_eq!(segment_files(directory.path()), 1);
     }
@@ -750,7 +816,7 @@ mod tests {
         let good = buffer.len();
         frame(7, Kind::Append(Entry { lsn: 0, epoch: 4, timestamp: 1, payload: Bytes::from_static(b"torn") }), &mut buffer);
         fs::write(&path, &buffer[..buffer.len() - 3]).unwrap();
-        let (journal, recovered) = Journal::open(directory.path(), true, UNBOUNDED).unwrap();
+        let (journal, recovered, _) = Journal::open(directory.path(), true, UNBOUNDED, None).unwrap();
         assert_eq!((recovered.len(), recovered[0].name.as_str(), recovered[0].state.promised, recovered[0].state.last()), (1, "a/b", 4, -1));
         assert_eq!(fs::metadata(&path).unwrap().len(), good as u64);
         assert_eq!(journal.allocate_id(), 8);

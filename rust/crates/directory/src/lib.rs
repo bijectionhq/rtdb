@@ -65,8 +65,9 @@ pub enum MemberState {
     Dead,
 }
 
-/// One process lifetime.
-/// A restarted process registers a new member.
+/// A process assignment.
+/// Compute members are scoped to one process lifetime. A logkeeper ID
+/// belongs to its original journal and can regain a lease after restart.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MemberRecord {
     pub id: MemberId,

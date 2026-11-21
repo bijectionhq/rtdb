@@ -36,9 +36,9 @@
 -- - CELL -- one independent unit of infrastructure: its own directory, log servers, nodes, gateways, workers and buckets, sized to a bounded envelope.
 --   An unbounded number of deployments is reached by adding cells.
 --
--- - MEMBER -- one process lifetime of a node, gateway, log server or worker in a cell.
---   A restart is a new member.
---   A member's identity is also the lifetime of its caches, which is what affinity ranks.
+-- - MEMBER -- a node, gateway, logkeeper or worker registered with a cell.
+--   A restart creates a new compute member and a new cache lifetime for affinity.
+--   A logkeeper retains its identity with the journal.
 --
 -- - HOLDER -- the member that is a deployment's writer for one epoch.
 --   At most one member's writes take effect per epoch, and epochs only rise.
@@ -383,6 +383,12 @@ contract LogService {
         -- A server refuses an overwrite at e that would drop anything e's writer has already placed on it.
         --   A deposed writer's append is refused at the server, so no window exists in which two writers both commit.
 
+    @invariant ReplicaIdentityFollowsTheJournal
+        -- An ensemble continues to name the same durable journals when their processes restart.
+        -- A logkeeper serves only while it holds the journal's exclusive lock and its member lease.
+        -- A replacement must reacquire the journal and obtain a new lease after the prior lease ends.
+        -- A stable advertised address remains reserved for that journal.
+
     @invariant CommitIsAWriteQuorum
         -- A record is committed when write_quorum of its loglet's ensemble have made it durable.
         -- Only committed records are acknowledged to a writer, applied visibly, or served to a reader.
@@ -496,7 +502,8 @@ entity MemberRecord {
         eligible -> dead         -- lease expired, or suspicion confirmed
         draining -> retired      -- holds nothing and serves nothing
         draining -> dead         -- lease expired while draining
-        -- retired and dead are terminal: a restarted process is a new member.
+        -- Retired and dead are terminal for compute members.
+        -- A locked logkeeper journal may reacquire its member record and become eligible again.
     }
 
     -- Derived: what it may hold or serve.

@@ -64,7 +64,10 @@ The directory and acknowledged quorum stream must survive this restore, and the 
 Recovery from a replacement directory or a rolled-back quorum requires a new deployment identity.
 
 Nodes and logkeepers bound to a wildcard address require `--advertise-host` with their reachable DNS name or IP.
-A durable logkeeper uses the same advertised address and data directory after restart.
+Each durable logkeeper stores its member ID in the journal directory.
+A restart locks the original directory, waits for the previous lease to end, and reclaims the same member ID.
+A named logkeeper keeps its advertised address for the lifetime of the journal.
+To replace missing journal data, recover the journal or reconfigure the ensemble through its log authority.
 Ensemble selection counts each advertised log endpoint once.
 
 In AWS, the cell installs its directory tables independently of the runtime roles.

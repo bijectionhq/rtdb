@@ -39,9 +39,21 @@ pub struct PreparedJournal {
 
 impl PreparedJournal {
     pub async fn open(options: ServerOptions) -> Result<Self> {
-        let (journal, recovered) = tokio::task::spawn_blocking(move || Journal::open(&options.data_dir, options.fsync, options.cache_bytes))
+        Ok(Self::open_with_identity(options, None).await?.0)
+    }
+
+    /// Opens a member journal and recovers its ID before it can be advertised.
+    pub async fn open_for_member(options: ServerOptions, candidate: String) -> Result<(Self, String)> {
+        let (journal, identity) = Self::open_with_identity(options, Some(candidate)).await?;
+        let identity = identity.ok_or_else(|| Anomaly::fault("rtdb.logkeeper/identity", "The opened journal did not retain a member ID"))?;
+        Ok((journal, identity))
+    }
+
+    async fn open_with_identity(options: ServerOptions, candidate: Option<String>) -> Result<(Self, Option<String>)> {
+        let (journal, recovered, identity) = tokio::task::spawn_blocking(move ||
+            Journal::open(&options.data_dir, options.fsync, options.cache_bytes, candidate.as_deref()))
             .await.map_err(|error| Anomaly::fault("rtdb.logkeeper/recovery", error.to_string()))??;
-        Ok(Self { journal, recovered })
+        Ok((Self { journal, recovered }, identity))
     }
 
     pub async fn serve(self, listener: TcpListener, cancellation: CancellationToken) -> Result<()> {
