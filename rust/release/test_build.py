@@ -62,6 +62,15 @@ class ExtractionCommands:
 
 
 class ReleaseSelectionTests(unittest.TestCase):
+    def test_multi_image_hosted_protocol_matches_compiled_protocol(self):
+        image = {"Config": {"Labels": {"io.rtdb.hosted-protocol": "8"}}}
+        release.verify_hosted_protocol(image, {"hosted_protocol": 8})
+        for invalid in [{}, {"hosted_protocol": 7}, {"hosted_protocol": True}]:
+            with self.assertRaises(ValueError):
+                release.verify_hosted_protocol(image, invalid)
+        with self.assertRaises(ValueError):
+            release.verify_hosted_protocol({}, {"hosted_protocol": 8})
+
     def test_base_images_require_content_digests(self):
         pinned = "registry.example/runtime:bookworm@sha256:" + "a" * 64
         self.assertEqual(immutable_image(pinned), pinned)
