@@ -108,13 +108,13 @@ async fn auditing_a_pristine_deployment_does_not_allocate_its_encryption_key() {
     let cell = Cell::start(0, None).await;
     let deployment = admin::create_deployment(cell.directory.as_ref(), "pristine", "acme", 3).await.unwrap();
     let keys = cell.keys();
-    assert!(keys.existing(&deployment.id).is_err());
+    assert!(keys.existing(&deployment.id).await.is_err());
     let report = admin::audit(cell.directory.as_ref(), &keys, "pristine", 4 << 20).await.unwrap();
     assert!(report.violations.is_empty());
     assert!(report.replica_digests.is_empty());
     assert_eq!(report.required_replica_quorum, 2);
     assert_eq!(report.replica_windows.len(), 3);
-    assert!(keys.existing(&deployment.id).is_err());
+    assert!(keys.existing(&deployment.id).await.is_err());
     cell.stop().await;
 }
 
