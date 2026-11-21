@@ -1,4 +1,5 @@
 use rtdb_types::StructFields;
+use std::borrow::Cow;
 use std::collections::BTreeSet;
 use std::sync::Arc;
 
@@ -72,8 +73,17 @@ fn expand(sql: &str, args: Option<&SqlArguments>, options: &SubmitOptions, datab
         // Literal values come from the statement text, so their copies scale with its length; only parameters can be copied per expression.
         let bound = parameter_bytes.checked_mul(expression_count.checked_add(8).ok_or_else(overflow)?).and_then(|bytes| bytes.checked_add(sql.len().checked_mul(128)?)).ok_or_else(overflow)?;
         let _evaluation = memory.reserve(bound)?;
-        let mut parameters = parameters.to_vec();
-        parameters.iter_mut().for_each(rtdb_columnar::admit_execution_value);
+        let parameters = if parameters.iter().all(|value| matches!(value,
+            Value::Null | Value::Undefined | Value::Bool(_) |
+            Value::I8(_) | Value::I16(_) | Value::I32(_) | Value::I64(_) |
+            Value::F16(_) | Value::F32(_) | Value::F64(_) | Value::Utf8(_)
+        )) {
+            Cow::Borrowed(parameters)
+        } else {
+            let mut owned = parameters.to_vec();
+            owned.iter_mut().for_each(rtdb_columnar::admit_execution_value);
+            Cow::Owned(owned)
+        };
         let context = EvalContext { parameters: &parameters, parameter_types: None, current_time: Timestamp(0).into(), timezone: &options.default_tz, outer_rows: &[], snapshot_token: None, allocation: Some(&row_scope), catalog: None, corpora: None };
         let temporal = match valid_time {
             TemporalFilter::Default => (None, None),
@@ -167,6 +177,15 @@ mod tests {
         let replay = SourceTransaction::decode(&message, &memory).unwrap();
         let crate::source::Operation::PutIids { documents, .. } = &replay.operations[0] else { panic!("Expected decoded static documents") };
         assert_eq!(documents.rows()[0]["v"], Value::I64(-1));
+    }
+
+    #[test]
+    fn static_arguments_preserve_plain_text_and_admit_nested_unsigned_values() {
+        let memory = MemoryBudget::new(1 << 24);
+        let source = expanded(Value::Utf8("value".into()), &memory);
+        assert_eq!(document(&source)["v"], Value::Utf8("value".into()));
+        let source = expanded(Value::List(vec![Value::U64(u64::MAX)]), &memory);
+        assert_eq!(document(&source)["v"], Value::List(vec![Value::I64(-1)]));
     }
 
     #[test]

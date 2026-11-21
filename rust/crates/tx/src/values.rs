@@ -124,14 +124,15 @@ impl Documents {
             let children = || array.fields().iter().zip(array.columns()).zip(&readers).filter(|((field, column), _)| {
                 preserve_null(field) || bottom(field) || (field.data_type() != &DataType::Null && column.is_valid(row))
             });
-            let temporary = children().try_fold(4096usize, |bytes, ((field, column), _)| {
+            let (temporary, fields) = children().try_fold((4096usize, 0usize), |(bytes, fields), ((field, column), _)| {
                 let value = if bottom(field) { 0 } else { rtdb_columnar::estimate_read_cell_bytes(field, column.as_ref(), row)? };
-                bytes.checked_add(value).and_then(|bytes| bytes.checked_add(field.name().len()))
-                    .and_then(|bytes| bytes.checked_add(entry)).ok_or_else(overflow)
+                let bytes = bytes.checked_add(value).and_then(|bytes| bytes.checked_add(field.name().len()))
+                    .and_then(|bytes| bytes.checked_add(entry)).ok_or_else(overflow)?;
+                Ok::<_, Anomaly>((bytes, fields + 1))
             })?;
             let reservation = Arc::get_mut(&mut reservation).expect("document decoding owns its reservation");
             reservation.grow_to(retained.checked_add(temporary).ok_or_else(overflow)?)?;
-            let mut document = StructFields::new();
+            let mut document = StructFields::with_capacity(fields);
             for ((field, column), reader) in children() {
                 let mut value = if bottom(field) { Value::Undefined } else { reader.read(column.as_ref(), row)? };
                 if preserve_null(field) || !matches!(value, Value::Null) {

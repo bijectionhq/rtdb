@@ -795,6 +795,7 @@ rule ClientSubmitsTransaction {
     -- A static SQL mutation with an invalid temporal literal proceeds to transaction resolution as SQL.
     -- The resolved abort records the literal planning diagnostic and consumes a transaction position.
     -- Static expansion reads the referenced argument positions and can expand an operation that supplies additional arguments.
+    -- Static expansion can read signed numeric, text, boolean and null arguments from their existing values.
     -- An operation missing a referenced argument proceeds to transaction resolution as SQL, where the argument failure aborts the transaction.
     -- A document write aimed at a system schema is rejected at submission.
     -- Before append, the source writer validates the entity ID of each concrete document, including documents produced by static SQL expansion.
