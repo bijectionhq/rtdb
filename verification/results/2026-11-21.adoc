@@ -2286,3 +2286,40 @@ The JVM log is `/private/tmp/rtdb-formal.QMjPSJsX/checkpoint-table-manifest-8158
 
 The manifest validates table metadata relative to trusted root bytes.
 The root's exact provider identity, payload and artefact publication bindings, and joint root-and-suffix retention still need evidence and enforcement.
+
+=== Fresh storage evidence for packed recovery
+
+A fresh metadata or byte read through Multi resolves a packed entry through its backing storage object.
+The metadata read checks that the observed containing object can cover the requested entry.
+Index admission checks every entry against the payload boundary, and an encrypted retry of an interrupted pack write must reach storage before returning success.
+A new confirmation of the recovered current checkpoint checks the root, registered table metadata and newly written level-zero objects, matching the preparation already used for historical candidates.
+
+Verus checked the production extent predicate and three laws for all representable offsets, lengths and payload limits.
+Four single and joint controls failed at their declared diagnostics.
+The records are under `/private/tmp/rtdb-formal.QMjPSJsX/pack-extent-verus-b749266v/`. link:../verus/pack_extent/proof.rs[Production inclusion]
+TLC explored 16 reachable states for one checkpoint pack and verified storage presence at observation.
+The staged-data and cached-index controls violated this property.
+The separate requirement for presence at submission failed when collection could occur between a valid observation and submission.
+With a hold through submission, TLC checked all 12 reachable states and reached a successful submission.
+Apalache independently checked both passing invariants through seven transitions and found the submission counterexample in the comparison without a hold.
+The model records are under `/private/tmp/rtdb-formal.QMjPSJsX/checkpoint-pack-evidence-models-8h89mb9v/`. link:../tla/CheckpointPackEvidence.tla[Model and controls]
+The combined Verus rerun checked all 36 area baselines and 181 controls after rebasing onto `5f4843201`.
+The packed-checkpoint and active-loglet TLC cases and all three packed-checkpoint Apalache cases also completed on this tree.
+The records are under `/private/tmp/rtdb-formal.QMjPSJsX/checkpoint-pack-evidence-current-verus-uxjzx6rt/` and `/private/tmp/rtdb-formal.QMjPSJsX/checkpoint-pack-evidence-current-models-y4zsqpe7/`.
+
+The Multi and replication selections passed 273 native cases on parent `385264ff6` with this change, including 85 cell integration cases.
+One optional case was ignored.
+The log is `/private/tmp/rtdb-formal.QMjPSJsX/durable-packed-checkpoint-385-rust-final.log`.
+Four exact Rust replays passed after the retry test's assertion order was finalized.
+Five mutations failed at their declared assertions for staged evidence, cached evidence, index bounds, freshness forwarding and missing-root confirmation.
+The per-case records are under `/private/tmp/rtdb-formal.QMjPSJsX/checkpoint-pack-evidence-native-p21jyckl/`.
+All 273 affected Rust cases passed again after rebasing onto `5f4843201`, with one optional case ignored.
+The log is `/private/tmp/rtdb-formal.QMjPSJsX/checkpoint-pack-evidence-5f484-rust.log`.
+After rebasing onto `eab2ad468`, the seven packing tests and the exact promotion replay passed again.
+Their logs are `checkpoint-pack-evidence-eab-packing.log` and `checkpoint-pack-evidence-eab-promotion.log` in the same evidence directory.
+The standard JVM suite on the `eab2ad468` tree with this change ran nine test tasks and passed all 3,198 cases.
+It used the FFI library built with the checkpoint change on parent `5f4843201`, SHA-256 `693454cc67b75c923d33b0f63cf1b9243eeda61ac7e97bd7b2be4dd567ed68d1`.
+The log is `/private/tmp/rtdb-formal.QMjPSJsX/checkpoint-pack-evidence-eab-jvm.log`.
+
+The checked production behaviour establishes backing-object presence at the read under the store's immutable-object contract.
+Exact provider publication identity, complete transitive checkpoint coverage and a joint hold through confirmation and replay remain open.

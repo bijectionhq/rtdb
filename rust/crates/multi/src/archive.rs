@@ -260,6 +260,13 @@ impl ObjectStore for CheckpointStore {
         }
     }
 
+    async fn get_fresh(&self, key: &ObjectKey) -> rtdb_storage::Result<Bytes> {
+        match self.archive.objects.get(key) {
+            Some(object) => self.archive.seal_for_serving(key, object).await,
+            None => self.serving.get_fresh(key).await,
+        }
+    }
+
     async fn get_range(&self, key: &ObjectKey, range: Range<u64>) -> rtdb_storage::Result<Bytes> {
         let Some(object) = self.archive.objects.get(key) else {
             return self.serving.get_range(key, range).await;

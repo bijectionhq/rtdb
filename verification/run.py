@@ -1865,6 +1865,17 @@ TLA_CASES = (
      ('Mutation = "none"', 'Mutation = "trust_path"'), "AcceptedMetadataMatches"),
     ("CheckpointTableManifest", "checkpoint-table-manifest-open-witness",
      ("INVARIANTS CompletePublication AcceptedMetadataMatches", "INVARIANT NeverOpensPublishedRoot"), "NeverOpensPublishedRoot"),
+    ("CheckpointPackEvidence", "checkpoint-pack-evidence", None, None),
+    ("CheckpointPackEvidence", "checkpoint-pack-evidence-trust-staged",
+     ('Mode = "fresh"', 'Mode = "trust_staged"'), "CheckRequiresStoredPack"),
+    ("CheckpointPackEvidence", "checkpoint-pack-evidence-trust-cached",
+     ('Mode = "fresh"', 'Mode = "trust_cached"'), "CheckRequiresStoredPack"),
+    ("CheckpointPackEvidence", "checkpoint-pack-evidence-collection-between-check-and-submit",
+     ("INVARIANT CheckRequiresStoredPack", "INVARIANT SubmitRequiresStoredPack"), "SubmitRequiresStoredPack"),
+    ("CheckpointPackEvidence", "checkpoint-pack-evidence-with-hold",
+     ('Mode = "fresh"\nINVARIANT CheckRequiresStoredPack', 'Mode = "hold"\nINVARIANTS CheckRequiresStoredPack SubmitRequiresStoredPack'), None),
+    ("CheckpointPackEvidence", "checkpoint-pack-evidence-submit-witness",
+     ("INVARIANT CheckRequiresStoredPack", "INVARIANT NeverSubmitsStoredPack"), "NeverSubmitsStoredPack"),
     ("RecoveryDiscovery", "checkpoint-discovery-fail-fast", ('Mutation = "none"', 'Mutation = "fail_fast"'), "MissingFailureHasRefreshed"),
     ("RecoveryDiscovery", "checkpoint-discovery-allow-same", ('Mutation = "none"', 'Mutation = "allow_same"'), "AttemptsAdvance"),
     ("RecoveryDiscovery", "checkpoint-discovery-ignore-newer", ('Mutation = "none"', 'Mutation = "ignore_newer"'), "UsesNewerListing"),
@@ -2257,6 +2268,11 @@ def verify_apalache(args, scratch):
     check_apalache(args, scratch, "CheckpointTableManifest", "checkpoint-table-manifest-trust-path",
                    "AcceptedMetadataMatches", 8, ('Mutation = "none"', 'Mutation = "trust_path"'),
                    "a valid table block appears under a different registered path")
+    check_apalache(args, scratch, "CheckpointPackEvidence", "checkpoint-pack-evidence", "CheckRequiresStoredPack", 7)
+    check_apalache(args, scratch, "CheckpointPackEvidence", "checkpoint-pack-evidence-collection-between-check-and-submit",
+                   "SubmitRequiresStoredPack", 7, counterexample="collection follows the fresh check before submission")
+    check_apalache(args, scratch, "CheckpointPackEvidence", "checkpoint-pack-evidence-with-hold",
+                   "SubmitRequiresStoredPack", 7, ('Mode = "fresh"', 'Mode = "hold"'))
     check_apalache(
         args, scratch, "RecoveryDiscovery", "checkpoint-discovery-fail-fast", "MissingFailureHasRefreshed", 10,
         ('Mutation = "none"', 'Mutation = "fail_fast"'), "missing checkpoint without refreshed discovery",
@@ -2500,6 +2516,83 @@ def verify_checkpoint_replay(args, source):
     finally:
         blocks.write_bytes(original)
     print("rust-checkpoint-replay: nine tests passed, root-first and fail-fast mutations rejected")
+
+
+def verify_checkpoint_pack_evidence(args, source):
+    env = os.environ | {
+        "CARGO_TARGET_DIR": os.environ.get("CARGO_TARGET_DIR", str(ROOT / "target")),
+        "CARGO_PROFILE_TEST_DEBUG": "0",
+    }
+    cargo = ["cargo", "test", "--locked"]
+    multi = [*cargo, "-p", "rtdb-multi", "--features", "dynamodb", "--lib"]
+    replica = [*cargo, "-p", "rtdb-replication", "--lib"]
+    pack = "rust/crates/multi/src/packing.rs"
+    store = "rust/crates/multi/src/store.rs"
+    driver = "rust/crates/replication/src/driver.rs"
+    fresh = "packing::tests::fresh_metadata_requires_the_containing_pack_in_storage"
+    retry = "packing::tests::an_encrypted_pack_retry_requires_durable_bytes_before_reporting_success"
+    admission = "packing::tests::pack_index_admission_requires_entries_within_the_payload"
+    promote = "driver::tests::promotion_requires_the_recovered_checkpoint_to_still_be_stored"
+    header = "    async fn head_fresh(&self, object: &ObjectKey) -> rtdb_storage::Result<StoredObject> {"
+    cached = """        let Some((pack, entry)) = self.locate(object).await? else {
+            return self.inner.head_fresh(object).await;
+        };
+        let physical = self.inner.head_fresh(&pack).await?;
+        if !entry_fits(entry.offset, entry.length, physical.size) {
+            return Err(Error::Task(format!("The stored pack {pack} does not cover {object}")));
+        }"""
+    forwarding = """    async fn get_fresh(&self, key: &ObjectKey) -> rtdb_storage::Result<Bytes> { self.inner.get_fresh(key).await }
+    async fn get_fresh_exact(&self, key: &ObjectKey, length: usize) -> rtdb_storage::Result<Bytes> { self.inner.get_fresh_exact(key, length).await }
+    async fn get_range(&self, key: &ObjectKey, range: Range<u64>) -> rtdb_storage::Result<Bytes> { self.inner.get_range(key, range).await }
+    fn supports_scan_ranges(&self, key: &ObjectKey) -> bool { self.inner.supports_scan_ranges(key) }"""
+    cases = (
+        ("metadata", multi, fresh, None),
+        ("encrypted-retry", multi, retry, None),
+        ("index-admission", multi, admission, None),
+        ("promotion", replica, promote, None),
+        ("trust-staged", multi, fresh, (
+            pack, header, header + "\n        if let Some(bytes) = self.held(object) { return Ok(StoredObject { key: object.clone(), size: bytes.len() as u64 }); }",
+            "staged bytes cannot supply fresh storage evidence",
+        )),
+        ("trust-cached", multi, fresh, (
+            pack, cached,
+            "        let Some((_, entry)) = self.locate(object).await? else { return self.inner.head_fresh(object).await; };",
+            "a cached pack entry cannot supply fresh storage evidence",
+        )),
+        ("ignore-index-extents", multi, admission, (
+            pack, "if index.entries.values().any(|entry| !entry_fits(entry.offset, entry.length, payload_end)) {",
+            "if false && index.entries.values().any(|entry| !entry_fits(entry.offset, entry.length, payload_end)) {",
+            "called `Result::unwrap_err()` on an `Ok` value",
+        )),
+        ("drop-fresh-forwarding", multi, retry, (
+            store, forwarding, forwarding.split("\n", 1)[1],
+            "an encrypted retry must publish the pack before returning",
+        )),
+        ("confirm-missing-root", replica, promote, (
+            driver, "        self.blocks.require_confirmation_files(checkpoint, &self.cancellation).await?;", "",
+            "a missing recovered root cannot be submitted for confirmation",
+        )),
+    )
+    for name, command, test, control in cases:
+        command = [*command, test, "--", "--exact"]
+        case = f"rust-checkpoint-pack-evidence-{name}"
+        if not control:
+            baseline = run_case(command, source / "rust", args.evidence, case, env)
+            if baseline.returncode or f"{test} ... ok" not in baseline.stdout or "1 passed; 0 failed" not in baseline.stdout:
+                raise ValueError(f"checkpoint pack baseline {name} failed")
+            continue
+        relative, before, after, failure = control
+        path = source / relative
+        original = path.read_bytes()
+        try:
+            replace_once(path, before, after)
+            checked = run_case(command, source / "rust", args.evidence, case, env)
+        finally:
+            path.write_bytes(original)
+        if (checked.returncode != 101 or f"{test} ... FAILED" not in checked.stdout
+            or failure not in checked.stdout or "0 passed; 1 failed" not in checked.stdout):
+            raise ValueError(f"checkpoint pack control {name} missed its declared assertion")
+    print("rust-checkpoint-pack-evidence: four replays passed and five controls failed")
 
 
 def verify_checkpoint_table_manifest_replay(args, source):
@@ -3538,6 +3631,7 @@ def main():
             verify_checkpoint_replay(args, source)
             verify_published_checkpoint_replay(args, source)
             verify_checkpoint_table_manifest_replay(args, source)
+            verify_checkpoint_pack_evidence(args, source)
             verify_checkpoint_trie_retention(args, source)
             verify_trie_removal_readback(args, source)
             verify_durable_trie_retirement(args, source)

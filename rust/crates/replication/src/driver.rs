@@ -764,9 +764,9 @@ impl ReplicationDriver {
             }
             self.historical_confirmations.clear();
         }
-        self.recovered_confirmation.as_ref().map(|checkpoint| {
-            PendingWrite::clone_message(&checkpoint.body, block, &self.resolve.memory)
-        }).transpose()
+        let Some(checkpoint) = &self.recovered_confirmation else { return Ok(None); };
+        self.blocks.require_confirmation_files(checkpoint, &self.cancellation).await?;
+        PendingWrite::clone_message(&checkpoint.body, block, &self.resolve.memory).map(Some)
     }
 
     async fn confirm_recovered_block(&mut self, record: &ReplicaRecord) -> Result<bool> {

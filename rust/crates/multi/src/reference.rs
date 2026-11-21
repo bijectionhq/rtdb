@@ -92,6 +92,7 @@ impl ObjectStore for PrefixedStore {
     fn supports_scan_ranges(&self, key: &ObjectKey) -> bool { self.full(key).is_ok_and(|key| self.bucket.supports_scan_ranges(&key)) }
     async fn head(&self, key: &ObjectKey) -> rtdb_storage::Result<StoredObject> { Ok(StoredObject { key: key.clone(), size: self.bucket.head(&self.full(key)?).await?.size }) }
     async fn head_fresh(&self, key: &ObjectKey) -> rtdb_storage::Result<StoredObject> { Ok(StoredObject { key: key.clone(), size: self.bucket.head_fresh(&self.full(key)?).await?.size }) }
+    async fn get_fresh(&self, key: &ObjectKey) -> rtdb_storage::Result<Bytes> { self.bucket.get_fresh(&self.full(key)?).await }
     async fn retirement_version(&self, key: &ObjectKey) -> rtdb_storage::Result<Option<rtdb_types::PhysicalObjectVersion>> {
         self.bucket.retirement_version(&self.full(key)?).await
     }
@@ -167,6 +168,9 @@ impl ObjectStore for ReferencingStore {
     }
     async fn get(&self, key: &ObjectKey) -> rtdb_storage::Result<Bytes> {
         self.read(key, |store, key| store.get(key)).await
+    }
+    async fn get_fresh(&self, key: &ObjectKey) -> rtdb_storage::Result<Bytes> {
+        self.read(key, |store, key| store.get_fresh(key)).await
     }
     async fn get_fresh_exact(&self, key: &ObjectKey, length: usize) -> rtdb_storage::Result<Bytes> { self.read(key, |store, key| store.get_fresh_exact(key, length)).await }
     async fn get_range(&self, key: &ObjectKey, range: Range<u64>) -> rtdb_storage::Result<Bytes> {

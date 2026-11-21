@@ -655,6 +655,9 @@ config {
 -- A replica that already installed the checkpoint skips its upload before the hold for a later pending block.
 -- If producing that later block fails during promotion, the replica follows with the checkpoint confirmed and the later block still pending.
 -- The writer checks shared storage for the catalog, table and L0 files before appending an older confirmation.
+-- The same fresh storage check applies before submitting a new confirmation of the recovered current checkpoint.
+-- A packed file's check requires the containing pack to be present in storage.
+-- The pack index confines entries to the payload before the trailer.
 -- Those files remain required until follower adoption.
 -- A failed historical check or older candidate preparation discards the remaining older confirmations.
 -- The writer continues recovery of the selected checkpoint.

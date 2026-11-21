@@ -406,7 +406,7 @@ impl BlockStore {
         let index = BlockIndex(message.block_index.unwrap_or_default());
         if index != prepared.block_index() { return Err(invalid("Boundary does not match the current live block")); }
         let key = ObjectKey::new(block_key(index)?)?;
-        let exists = match self.store.head(&key).await {
+        let exists = match self.store.head_fresh(&key).await {
             Ok(_) => true,
             Err(rtdb_storage::Error::MissingObject(_)) => false,
             Err(error) => return Err(error.into()),

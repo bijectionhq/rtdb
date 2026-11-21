@@ -1068,6 +1068,26 @@ async fn reopen_memory_checkpoint_with_config(fixture: &Fixture, config: Replica
 }
 
 #[tokio::test]
+async fn promotion_requires_the_recovered_checkpoint_to_still_be_stored() {
+    let fixture = produced_memory_checkpoint(true).await;
+    let (handle, mut restarted) = reopen_memory_checkpoint(&fixture).await;
+    let key = rtdb_storage::ObjectKey::new(rtdb_format::keys::block_key(BlockIndex(0)).unwrap()).unwrap();
+    let root = fixture.store.get(&key).await.unwrap();
+    fixture.store.delete(&key).await.unwrap();
+    restarted.fence.admit(Term(2), Some(TermSequence(0))).unwrap();
+    restarted.try_promote().await.unwrap();
+    assert!(restarted.leader.is_none(), "a missing recovered root cannot be submitted for confirmation");
+    assert_eq!(handle.status().promotion_failure.unwrap().code, "rtdb.storage/missing-object");
+    assert_eq!(fixture.replica.latest().unwrap(), LogOffset(1));
+
+    fixture.store.put(&key, root).await.unwrap();
+    restarted.fence.admit(Term(3), Some(TermSequence(0))).unwrap();
+    restarted.try_promote().await.unwrap();
+    assert!(restarted.leader.as_ref().unwrap().recovery_write.is_some(), "the restored root can be confirmed");
+    restarted.demote().await.unwrap();
+}
+
+#[tokio::test]
 async fn a_recovered_checkpoint_uses_only_matching_admitted_confirmation_and_accepts_legacy_epoch_zero() {
     for sequenced in [false, true] {
         let fixture = produced_memory_checkpoint(sequenced).await;

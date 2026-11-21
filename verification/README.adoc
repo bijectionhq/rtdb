@@ -210,6 +210,10 @@ It also exercises the Azure adapter against a loopback provider and separately m
 * `tla/CheckpointTableManifest.tla` checks publication after table writes and acceptance only when the observed bytes match the checkpoint bindings.
   `lean/CheckpointTableManifest.lean` proves registry coverage and preservation of derived dependencies under the stated digest premise.
   The Rust replays check exact OID coverage and refusal when valid bytes for a different table appear under the expected path.
+* `tla/CheckpointPackEvidence.tla` compares a fresh storage observation with trusting staged bytes or a cached index.
+  It also checks the difference between observing the pack and holding it through confirmation submission.
+  `verus/pack_extent` verifies the packing adapter's byte-range guard over all representable offsets and lengths.
+  The native replays cover pack observations, encrypted retries, index admission and recovered-checkpoint confirmation.
 * `mcrl2/CheckpointDiscovery.mcrl2` compares the staged metadata discovery with an atomic observation contract after hiding the selection and individual reads.
   It checks divergence-preserving branching bisimilarity on three indices and generates a distinguishing formula for each weakened model.
 * `hyperltl/CheckpointRecovery.hltl` compares every pair of modeled startup schedules with the same stable, readable replacement.

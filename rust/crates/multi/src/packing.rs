@@ -17,6 +17,9 @@ use parking_lot::Mutex;
 use rtdb_storage::{Error, ObjectKey, ObjectStore, object_store::StoredObject};
 use serde::{Deserialize, Serialize};
 
+mod extent;
+use extent::entry_fits;
+
 pub const PACK_DIRECTORY: &str = "~packs";
 /// Held-back bytes beyond which a pack is written without waiting for the catalog.
 const MAXIMUM_HELD_BYTES: usize = 64 * 1024 * 1024;
@@ -84,9 +87,13 @@ pub async fn read_index(store: &dyn ObjectStore, pack: &ObjectKey) -> rtdb_stora
     let size = store.head(pack).await?.size;
     if size < 8 { return Err(Error::Task(format!("{pack} is too short to be a pack"))); }
     let length = u64::from_be_bytes(store.get_range(pack, size - 8..size).await?.as_ref().try_into().expect("eight bytes"));
-    if length + 8 > size { return Err(Error::Task(format!("{pack} has a malformed trailer"))); }
-    let encoded = store.get_range(pack, size - 8 - length..size - 8).await?;
-    serde_json::from_slice(&encoded).map_err(|error| Error::Task(format!("{pack} has a malformed index: {error}")))
+    let payload_end = (size - 8).checked_sub(length).ok_or_else(|| Error::Task(format!("{pack} has a malformed trailer")))?;
+    let encoded = store.get_range(pack, payload_end..size - 8).await?;
+    let index: PackIndex = serde_json::from_slice(&encoded).map_err(|error| Error::Task(format!("{pack} has a malformed index: {error}")))?;
+    if index.entries.values().any(|entry| !entry_fits(entry.offset, entry.length, payload_end)) {
+        return Err(Error::Task(format!("{pack} has an entry outside its payload")));
+    }
+    Ok(index)
 }
 
 struct State {
@@ -98,6 +105,22 @@ struct State {
     discovery: PackDiscovery,
     /// The latest block whose pack this store has read.
     latest_block: Option<i64>,
+}
+
+impl State {
+    fn hold(&mut self, object: &ObjectKey, bytes: Bytes) -> rtdb_storage::Result<()> {
+        match self.held.entry(object.to_string()) {
+            std::collections::btree_map::Entry::Occupied(entry) if entry.get() != &bytes => {
+                Err(Error::ConflictingObject(object.to_string()))
+            }
+            std::collections::btree_map::Entry::Occupied(_) => Ok(()),
+            std::collections::btree_map::Entry::Vacant(entry) => {
+                self.held_bytes += bytes.len();
+                entry.insert(bytes);
+                Ok(())
+            }
+        }
+    }
 }
 
 pub struct PackingStore { inner: Arc<dyn ObjectStore>, state: Mutex<State>, writing: tokio::sync::Mutex<()>, clock: crate::store::Clock }
@@ -152,7 +175,11 @@ impl PackingStore {
         let _writing = self.writing.lock().await;
         // A block's pack names every earlier one, so the store must know them all first.
         if catalog.is_some() { self.refresh().await?; }
-        let held = std::mem::take(&mut self.state.lock().held);
+        let held = {
+            let mut state = self.state.lock();
+            state.held_bytes = 0;
+            std::mem::take(&mut state.held)
+        };
         if held.is_empty() && catalog.is_none() { return Ok(()); }
         let (name, previous) = match catalog {
             Some(catalog) => (key(&block_pack(catalog.as_str()))?, self.state.lock().packs.iter().map(|pack| pack.as_str().to_owned()).collect()),
@@ -167,10 +194,10 @@ impl PackingStore {
             }
             let mut state = self.state.lock();
             for (object, bytes) in held { state.held.entry(object).or_insert(bytes); }
+            state.held_bytes = state.held.values().map(Bytes::len).sum();
             return Err(error);
         }
         let mut state = self.state.lock();
-        state.held_bytes = state.held.values().map(Bytes::len).sum();
         for (object, entry) in index.entries { state.located.insert(object, (name.clone(), entry)); }
         state.packs.push(name);
         Ok(())
@@ -218,6 +245,16 @@ impl ObjectStore for PackingStore {
             other => other,
         }
     }
+    async fn head_fresh(&self, object: &ObjectKey) -> rtdb_storage::Result<StoredObject> {
+        let Some((pack, entry)) = self.locate(object).await? else {
+            return self.inner.head_fresh(object).await;
+        };
+        let physical = self.inner.head_fresh(&pack).await?;
+        if !entry_fits(entry.offset, entry.length, physical.size) {
+            return Err(Error::Task(format!("The stored pack {pack} does not cover {object}")));
+        }
+        Ok(StoredObject { key: object.clone(), size: entry.length })
+    }
     async fn retirement_version(&self, key: &ObjectKey) -> rtdb_storage::Result<Option<rtdb_types::PhysicalObjectVersion>> {
         if packed(key.as_str()) { return Ok(None); }
         self.inner.retirement_version(key).await
@@ -227,11 +264,14 @@ impl ObjectStore for PackingStore {
         if let Some((pack, entry)) = self.locate(object).await? { return self.inner.get_range(&pack, entry.offset..entry.offset + entry.length).await; }
         self.inner.get(object).await
     }
+    async fn get_fresh(&self, object: &ObjectKey) -> rtdb_storage::Result<Bytes> {
+        if let Some((pack, entry)) = self.locate(object).await? {
+            return self.inner.get_range(&pack, entry.offset..entry.offset + entry.length).await;
+        }
+        self.inner.get_fresh(object).await
+    }
     async fn get_fresh_exact(&self, key: &ObjectKey, length: usize) -> rtdb_storage::Result<Bytes> {
         let wrong_size = || Error::Task(format!("Immutable object {key} has the wrong length"));
-        if let Some(bytes) = self.held(key) {
-            return if bytes.len() == length { Ok(bytes) } else { Err(wrong_size()) };
-        }
         if let Some((pack, entry)) = self.locate(key).await? {
             if entry.length != length as u64 { return Err(wrong_size()); }
             return self.inner.get_range(&pack, entry.offset..entry.offset + entry.length).await;
@@ -253,8 +293,7 @@ impl ObjectStore for PackingStore {
         if held_back(object.as_str()) {
             let full = {
                 let mut state = self.state.lock();
-                state.held_bytes += bytes.len();
-                state.held.insert(object.as_str().to_owned(), bytes);
+                state.hold(object, bytes)?;
                 state.held_bytes > MAXIMUM_HELD_BYTES
             };
             return if full { self.write_pack(None).await } else { Ok(()) };
@@ -270,7 +309,7 @@ impl ObjectStore for PackingStore {
                 state.held_bytes = state.held.values().map(Bytes::len).sum();
                 return Ok(());
             }
-            self.state.lock().held.insert(object.as_str().to_owned(), bytes);
+            self.state.lock().hold(object, bytes)?;
             return self.write_pack(Some(object)).await;
         }
         self.inner.put(object, bytes).await
@@ -343,6 +382,49 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn pack_index_admission_requires_entries_within_the_payload() {
+        let raw = MemoryStore::default();
+        let pack = pack_key(0).unwrap();
+        let mut bytes = BytesMut::from(&b"rows"[..]);
+        let index = br#"{"entries":{"row":{"offset":3,"length":2}},"previous":[]}"#;
+        bytes.extend_from_slice(index);
+        bytes.put_u64(index.len() as u64);
+        raw.put(&pack, bytes.freeze()).await.unwrap();
+        let error = read_index(&raw, &pack).await.unwrap_err();
+        assert!(error.to_string().contains("outside its payload"));
+
+        raw.delete(&pack).await.unwrap();
+        raw.put(&pack, Bytes::copy_from_slice(&u64::MAX.to_be_bytes())).await.unwrap();
+        let error = read_index(&raw, &pack).await.unwrap_err();
+        assert!(error.to_string().contains("malformed trailer"));
+    }
+
+    #[tokio::test]
+    async fn fresh_metadata_requires_the_containing_pack_in_storage() {
+        let raw = Arc::new(MemoryStore::default());
+        let store = PackingStore::open(raw.clone(), PackDiscovery::List).await.unwrap();
+        let rows = object("tables/t/data/l00-rc-b00.arrow");
+        let root = catalog_key(0).unwrap();
+        store.put(&rows, Bytes::from_static(b"rows")).await.unwrap();
+        assert!(store.head(&rows).await.is_ok());
+        assert!(matches!(store.head_fresh(&rows).await, Err(Error::MissingObject(_))),
+            "staged bytes cannot supply fresh storage evidence");
+
+        store.put(&root, Bytes::from_static(b"catalog")).await.unwrap();
+        assert_eq!(store.head_fresh(&rows).await.unwrap().size, 4);
+        assert_eq!(store.head_fresh(&root).await.unwrap().size, 7);
+
+        let pack = pack_key(0).unwrap();
+        raw.delete(&pack).await.unwrap();
+        assert!(store.head(&root).await.is_ok(), "the cached location survives removal");
+        assert!(matches!(store.head_fresh(&root).await, Err(Error::MissingObject(_))),
+            "a cached pack entry cannot supply fresh storage evidence");
+
+        raw.put(&pack, Bytes::from_static(b"short")).await.unwrap();
+        assert!(store.head_fresh(&root).await.is_err(), "a short pack cannot cover the entry");
+    }
+
+    #[tokio::test]
     async fn a_reader_finds_packs_published_after_it_opened() {
         let raw = Arc::new(MemoryStore::default());
         let reader = PackingStore::open(raw.clone(), PackDiscovery::List).await.unwrap();
@@ -353,14 +435,23 @@ mod tests {
     }
 
     /// A store that counts the listings made of it.
-    struct Counting { inner: MemoryStore, lists: std::sync::atomic::AtomicUsize }
+    struct Counting {
+        inner: MemoryStore,
+        lists: std::sync::atomic::AtomicUsize,
+        fail_next_put: std::sync::atomic::AtomicBool,
+    }
 
     #[async_trait]
     impl ObjectStore for Counting {
         async fn head(&self, key: &ObjectKey) -> rtdb_storage::Result<StoredObject> { self.inner.head(key).await }
         async fn get(&self, key: &ObjectKey) -> rtdb_storage::Result<Bytes> { self.inner.get(key).await }
         async fn get_range(&self, key: &ObjectKey, range: Range<u64>) -> rtdb_storage::Result<Bytes> { self.inner.get_range(key, range).await }
-        async fn put(&self, key: &ObjectKey, bytes: Bytes) -> rtdb_storage::Result<()> { self.inner.put(key, bytes).await }
+        async fn put(&self, key: &ObjectKey, bytes: Bytes) -> rtdb_storage::Result<()> {
+            if self.fail_next_put.swap(false, std::sync::atomic::Ordering::SeqCst) {
+                return Err(Error::Task("pack write was interrupted".into()));
+            }
+            self.inner.put(key, bytes).await
+        }
         async fn put_file(&self, key: &ObjectKey, source: &Path) -> rtdb_storage::Result<()> { self.inner.put_file(key, source).await }
         async fn list(&self, directory: Option<&ObjectKey>) -> rtdb_storage::Result<Vec<StoredObject>> {
             self.lists.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -371,7 +462,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_store_opened_from_a_published_block_finds_every_pack_without_listing() {
-        let raw = Arc::new(Counting { inner: MemoryStore::default(), lists: Default::default() });
+        let raw = Arc::new(Counting { inner: MemoryStore::default(), lists: Default::default(), fail_next_put: false.into() });
         let writer = PackingStore::open(raw.clone(), PackDiscovery::List).await.unwrap();
         for block in 0..3i64 {
             writer.put(&object(&format!("tables/t/data/l00-rc-b{block:02}.arrow")), Bytes::from(format!("rows {block}"))).await.unwrap();
@@ -385,6 +476,26 @@ mod tests {
         assert_eq!(raw.lists.load(std::sync::atomic::Ordering::SeqCst), lists, "from a published block, nothing is listed");
         let reader = PackingStore::open(raw.clone(), PackDiscovery::From(9)).await.unwrap();
         assert_eq!(reader.get(&object("tables/t/data/l00-rc-b01.arrow")).await.unwrap().as_ref(), b"rows 1", "a hint that is gone falls back to listing");
+    }
+
+    #[tokio::test]
+    async fn an_encrypted_pack_retry_requires_durable_bytes_before_reporting_success() {
+        let raw = Arc::new(Counting { inner: MemoryStore::default(), lists: Default::default(), fail_next_put: true.into() });
+        let serving = crate::store::open_deployment_store(raw.clone(), "db/v06", PackDiscovery::List, crate::store::wall_clock()).await.unwrap();
+        let store = crate::store::EncryptingStore::new(serving, &[7; 32]).unwrap();
+        let rows = object("tables/t/data/l00-rc-b00.arrow");
+        let root = catalog_key(0).unwrap();
+        store.put(&rows, Bytes::from_static(b"rows")).await.unwrap();
+        assert!(store.put(&root, Bytes::from_static(b"catalog")).await.is_err());
+        assert_eq!(store.get(&root).await.unwrap().as_ref(), b"catalog");
+        assert!(matches!(store.head_fresh(&root).await, Err(Error::MissingObject(_))));
+        assert!(matches!(store.get_fresh_exact(&root, 7).await, Err(Error::MissingObject(_))));
+        let conflicting_retry = store.put(&rows, Bytes::from_static(b"other")).await;
+        store.put(&root, Bytes::from_static(b"catalog")).await.unwrap();
+        assert!(raw.head(&object("db/v06/~packs/b00.pack")).await.is_ok(), "an encrypted retry must publish the pack before returning");
+        assert!(matches!(conflicting_retry, Err(Error::ConflictingObject(_))));
+        assert_eq!(store.get_fresh(&root).await.unwrap().as_ref(), b"catalog");
+        assert_eq!(store.get_fresh_exact(&rows, 4).await.unwrap().as_ref(), b"rows");
     }
 
     #[tokio::test]

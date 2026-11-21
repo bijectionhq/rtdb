@@ -1431,6 +1431,9 @@ A retry following prefix collection checks the successor against the last accept
 Verus checks the coordinate decision. Lean proves preservation across successive replacements, and native replays exercise refusal and successful recovery.
 New Rust roots commit to every table block by OID and SHA-256 of its stored bytes.
 The Rust loader checks those bindings before decoding. Lean proves preservation of metadata-derived dependencies under the digest premise.
+For packed Multi checkpoints, a fresh presence check reaches the containing storage object.
+The writer checks the recovered current checkpoint before submitting its confirmation.
+Verus verifies checked pack extents. The bounded model distinguishes evidence at the probe from a hold that keeps the pack through submission.
 Verus checks the exact first-required-offset rule.
 The native memory-provider run selects a later checkpoint and replays its retained suffix with the cursor admitted during startup.
 TLC checks cursor admission, reuse and strict progress before refusal and reaches a state with later trimming after admission.

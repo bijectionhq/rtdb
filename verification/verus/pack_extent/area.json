@@ -1,0 +1,100 @@
+{
+  "summary": "An admitted pack entry fits in the half-open payload range without overflowing.",
+  "flags": [
+    "--no-external-by-default",
+    "--verify-module",
+    "production",
+    "--verify-module",
+    "laws"
+  ],
+  "min_verified_functions": 4,
+  "controls": {
+    "ignore_offset": {
+      "defect": "A size check ignores where the entry begins.",
+      "mutate": [
+        {
+          "file": "rust/crates/multi/src/packing/extent.rs",
+          "find": "offset <= limit && length <= limit - offset",
+          "replace": "length <= limit"
+        }
+      ],
+      "expect": [
+        {
+          "file": "rust/crates/multi/src/packing/extent.rs",
+          "function": "entry_fits",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 3
+    },
+    "ignore_offset_with_weakened_contract": {
+      "defect": "A size check ignores where the entry begins.",
+      "mutate": [
+        {
+          "file": "rust/crates/multi/src/packing/extent.rs",
+          "find": "offset <= limit && length <= limit - offset",
+          "replace": "length <= limit"
+        },
+        {
+          "file": "rust/crates/multi/src/packing/extent.rs",
+          "find": "(offset as int) + (length as int) <= (limit as int)",
+          "replace": "length <= limit"
+        }
+      ],
+      "expect": [
+        {
+          "file": "verification/verus/pack_extent/laws.rs",
+          "function": "an_extent_past_the_payload_is_refused",
+          "category": "assertion failed"
+        },
+        {
+          "file": "verification/verus/pack_extent/laws.rs",
+          "function": "an_extent_that_overflows_u64_is_refused",
+          "category": "assertion failed"
+        }
+      ],
+      "min_verified_functions": 2
+    },
+    "refuse_payload_end": {
+      "defect": "An entry ending at the exact payload boundary is refused.",
+      "mutate": [
+        {
+          "file": "rust/crates/multi/src/packing/extent.rs",
+          "find": "offset <= limit && length <= limit - offset",
+          "replace": "offset <= limit && length < limit - offset"
+        }
+      ],
+      "expect": [
+        {
+          "file": "rust/crates/multi/src/packing/extent.rs",
+          "function": "entry_fits",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 3
+    },
+    "refuse_payload_end_with_weakened_contract": {
+      "defect": "An entry ending at the exact payload boundary is refused.",
+      "mutate": [
+        {
+          "file": "rust/crates/multi/src/packing/extent.rs",
+          "find": "offset <= limit && length <= limit - offset",
+          "replace": "offset <= limit && length < limit - offset"
+        },
+        {
+          "file": "rust/crates/multi/src/packing/extent.rs",
+          "find": "(offset as int) + (length as int) <= (limit as int)",
+          "replace": "(offset as int) + (length as int) < (limit as int)"
+        }
+      ],
+      "expect": [
+        {
+          "file": "verification/verus/pack_extent/laws.rs",
+          "function": "an_entry_can_end_at_the_payload_boundary",
+          "category": "assertion failed"
+        }
+      ],
+      "min_verified_functions": 3
+    }
+  }
+}
