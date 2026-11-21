@@ -73,7 +73,15 @@ Deleting a key clears its material and keeps a tombstone that prevents recreatin
 
 The source directory records the fence epoch and destination before copying a cell transfer. Once the destination has its serving objects and key, it records the arrival and waits for routing to move and for the source to become a tombstone. Its first holder copies the sealed tail onto its logkeepers before accepting writes. Retrying a lost routing response continues that same transfer.
 
-`rtdb-multi delete --id UUID` fences an installation once. Its directory retains the serving disposal receipt once the key has been withdrawn and the serving prefix observed empty. `rtdb-multi disposal --id UUID` reads that receipt. Gateway sessions close when they observe retirement. Retained journals, versioned objects, backups and key copies in other cells require separate evidence for physical erasure.
+`rtdb-multi delete --id UUID` fences an installation once. A holder records
+its journal endpoints before it can copy or append a replica record.
+Disposal retires the stream on each recorded journal and waits for its
+obsolete segments to be replaced and removed. An unavailable journal keeps
+disposal pending. The directory retains the receipt after that step, key
+withdrawal and an empty serving prefix. `rtdb-multi disposal --id UUID` reads
+the receipt. Gateway sessions close when they observe retirement. Object
+versions, external backups and key copies in other cells have separate
+physical custody.
 
 **Fixed on the way.**
 

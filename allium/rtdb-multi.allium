@@ -1714,6 +1714,7 @@ rule EraseAndProve {
     when: SharedObjectsTransferred(record)
 
     ensures:
+        RetireReplicaJournals(record.id, record.epoch, AllRecordedJournals(record))
         DeleteAllVersionsUnder(record.storage_root.prefix, except: TransferredObjects(record))
         AwaitEmptyInventory(record.storage_root.prefix, twice_separated_by: config.credential_ttl)
         KeyService.destroy(record.key_id)

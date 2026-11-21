@@ -8,7 +8,7 @@ mod client;
 mod protocol;
 mod server;
 
-pub use client::{CopyFrom, Loglet, QuorumLog, StreamConfig, open_reader, open_reader_on, open_writer, open_writer_on, seal, trim};
+pub use client::{CopyFrom, Loglet, QuorumLog, StreamConfig, open_reader, open_reader_on, open_writer, open_writer_on, retire, seal, trim};
 pub use server::{PreparedJournal, ServerOptions, serve};
 
 /// The pure pieces `rtdb-simulation` drives directly: one stream's server state machine, the recovery planning rules, and the messages they exchange.

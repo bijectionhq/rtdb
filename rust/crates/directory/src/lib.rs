@@ -4,7 +4,7 @@
 //! Every change is a replace conditional on the record's version, so a writer that has been superseded can change nothing.
 //! It is never on the commit path: a placed holder commits and serves reads while the directory is unavailable.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -138,6 +138,9 @@ pub struct DeploymentRecord {
     pub holder: Option<MemberId>,
     /// The logkeepers holding this deployment's streams.
     pub ensemble: Vec<MemberId>,
+    /// Every journal endpoint authorized to receive this installation's
+    /// replica stream, retained before a new ensemble receives a copy.
+    pub replica_journals: BTreeSet<String>,
     /// How many ranks of the affinity order may serve reads.
     pub read_width: u32,
     pub activation_crashes: u32,
@@ -182,6 +185,8 @@ pub struct DisposalReceipt {
     pub deployment: String,
     pub incarnation: u64,
     pub epoch: u64,
+    pub journals: BTreeSet<String>,
+    pub journals_retired_at_ms: i64,
     pub key_withdrawn_at_ms: i64,
     pub serving_prefix_observed_empty_at_ms: i64,
 }
@@ -201,7 +206,7 @@ impl DeploymentRecord {
     pub fn new(name: impl Into<String>, org: impl Into<String>, ensemble: Vec<MemberId>, now_ms: i64) -> Self {
         let id = uuid::Uuid::new_v4().to_string();
         Self { lineage: id.clone(), id, name: name.into(), org: org.into(), incarnation: 1, lifecycle: Lifecycle::Live, epoch: 0, holder: None,
-            ensemble, read_width: 1, activation_crashes: 0, created_at_ms: now_ms, move_intent: None, log_epoch: 0, parent: None, move_from: None, linearizable_reads: false, checkpoint: None, moved_at_ms: None, cell_transfer: None, disposal: None, version: 0 }
+            ensemble, replica_journals: BTreeSet::new(), read_width: 1, activation_crashes: 0, created_at_ms: now_ms, move_intent: None, log_epoch: 0, parent: None, move_from: None, linearizable_reads: false, checkpoint: None, moved_at_ms: None, cell_transfer: None, disposal: None, version: 0 }
     }
 
     /// The affinity key: stable across epochs and residency, distinct across incarnations.

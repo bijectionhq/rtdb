@@ -35,6 +35,8 @@ pub(crate) enum Outcome {
     Durable(oneshot::Receiver<Result<(), String>>, ResponseBody),
 }
 
+type Compaction = oneshot::Receiver<Result<(), String>>;
+
 impl Store {
     pub fn new(journal: Arc<Journal>, recovered: Vec<Recovered>, queue: mpsc::UnboundedSender<Work>) -> Self {
         let streams = recovered.into_iter().map(|stream| {
@@ -62,6 +64,7 @@ impl Store {
             RequestBody::Commit(commit) => (commit.stream, Box::new(move |state| state.commit(commit.epoch, commit.commit_lsn))),
             RequestBody::Seal(seal) => (seal.stream, Box::new(move |state| state.seal(seal.epoch))),
             RequestBody::Trim(trim) => (trim.stream, Box::new(move |state| state.trim(trim.through_lsn))),
+            RequestBody::Retire(retire) => (retire.stream, Box::new(move |state| state.retire(retire.epoch))),
             RequestBody::Read(_) | RequestBody::Fetch(_) | RequestBody::Check(_) => return Outcome::Now(failed("not a mutation")),
         };
         let slot = self.slot(&stream);
@@ -88,11 +91,51 @@ impl Store {
         if disk <= COMPACTION_SLACK_BYTES { return; }
         let slots: Vec<Arc<Slot>> = self.streams.lock().values().cloned().collect();
         let live: u64 = slots.iter().map(|slot| slot.state.lock().retained_bytes() as u64).sum();
-        if disk <= 2 * live + COMPACTION_SLACK_BYTES || !self.journal.claim_compaction() { return; }
+        if disk <= 2 * live + COMPACTION_SLACK_BYTES { return; }
+        let _ = self.queue_compaction();
+    }
+
+    fn queue_compaction(&self) -> Result<Option<Compaction>, String> {
+        if !self.journal.claim_compaction() { return Ok(None); }
         let streams = self.streams.lock();
         let locked: Vec<_> = streams.values().map(|slot| (slot, slot.state.lock())).collect();
         let captured = locked.iter().map(|(slot, state)| Captured { slot: Arc::clone(slot), state: (**state).clone() }).collect();
-        if self.queue.send(Work { write: Write::Compact(captured), done: oneshot::channel().0 }).is_err() { self.journal.release_compaction(); }
+        let (done, finished) = oneshot::channel();
+        if self.queue.send(Work { write: Write::Compact(captured), done }).is_err() {
+            self.journal.release_compaction();
+            return Err("the journal has stopped".into());
+        }
+        Ok(Some(finished))
+    }
+
+    /// After the fence and trim are durable, wait for a base that contains
+    /// neither acknowledged nor uncommitted payloads of the retired stream.
+    pub async fn retire(&self, body: crate::protocol::Retire) -> ResponseBody {
+        if !self.journal.is_durable() { return failed("retirement requires a durable journal"); }
+        let slot = self.slot(&body.stream);
+        let epoch = body.epoch;
+        let accepted = match self.mutate(RequestBody::Retire(body)) {
+            Outcome::Now(reply) => return reply,
+            Outcome::Durable(durable, reply) => match durable.await {
+                Ok(Ok(())) => reply,
+                Ok(Err(error)) => return failed(error),
+                Err(_) => return failed("the journal has stopped"),
+            },
+        };
+        let ResponseBody::Accepted(position) = &accepted else { return failed("unexpected retirement decision"); };
+        loop {
+            let released = self.journal.compaction_finished();
+            if self.journal.compacted(slot.id, epoch, position.last_lsn) { return accepted; }
+            match self.queue_compaction() {
+                Ok(Some(finished)) => return match finished.await {
+                    Ok(Ok(())) => accepted,
+                    Ok(Err(error)) => failed(error),
+                    Err(_) => failed("the journal has stopped"),
+                },
+                Ok(None) => released.await,
+                Err(error) => return failed(error),
+            }
+        }
     }
 
     pub fn check(&self, stream: &str, epoch: u64) -> ResponseBody {
