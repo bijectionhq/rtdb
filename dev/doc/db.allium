@@ -372,6 +372,7 @@ variant TxMessage : SourceMessage {
     -- A static INSERT from compatible positional scalar batches projects Arrow arguments into source document vectors in upload order.
     -- Source encoding retains compatible Arrow document vectors and admits reconstructed columns one at a time.
     -- Compatible Arrow document vectors include nested lists, fixed-size lists and structs.
+    -- Compatible document vectors retain the UUID extension for their UUID values through source encoding and replay.
     -- When an upload adds fields inside a fixed-size list, layout alignment copies only the selected entries and required null padding.
     -- Struct fields added across compatible uploads join in Arrow with typed nulls for earlier documents, including structs inside lists.
     -- Batches with compatible column types retain first-seen column order and represent missing columns as nulls without converting the documents to rows.

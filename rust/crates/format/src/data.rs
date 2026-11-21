@@ -297,14 +297,44 @@ fn event_builder(rows: usize, put_fields: Option<&StructFields<LogicalType>>, me
     Ok((builder, metadata))
 }
 
-pub fn owned_put_batch(documents: ArrayRef, headers: &[EventHeader], memory: &Arc<MemoryBudget>) -> Result<OwnedBatch> {
+/// `source_bytes` is the shared source allocation held by the document buffers.
+pub fn owned_put_batch(documents: ArrayRef, headers: &[EventHeader], source_bytes: Option<usize>, memory: &Arc<MemoryBudget>) -> Result<OwnedBatch> {
     if documents.len() != headers.len() || documents.null_count() != 0
         || !matches!(documents.data_type(), DataType::Struct(_)) || headers.iter().any(|header| header.op != EventOp::Put) {
         return Err(invalid("Put headers and their Arrow documents disagree"));
     }
+    let retained = documents.get_array_memory_size().max(source_bytes.unwrap_or_default());
+    let field = Field::new("put", documents.data_type().clone(), false);
+    let mut selected = documents.len().checked_mul(64).and_then(|bytes| bytes.checked_add(4096)).ok_or_else(event_size)?;
+    if selected < retained {
+        for row in 0..documents.len() {
+            selected = selected.checked_add(rtdb_columnar::estimate_event_copy_cell_bytes(&field, documents.as_ref(), row)?).ok_or_else(event_size)?;
+            if selected >= retained { break; }
+        }
+    }
+    // A source record can share one large document buffer across thousands of small puts.
+    let (documents, copy) = if selected < retained {
+        let layout = crate::ipc::schema_translation_bound(&Schema::new(vec![field]))?;
+        let scratch = selected.checked_add(layout).ok_or_else(event_size)?;
+        match memory.reserve(scratch) {
+            Ok(scratch) => {
+                let cells = (0..documents.len()).map(|row| Some((0, row))).collect::<Vec<_>>();
+                let compact = rtdb_columnar::copy_event_cells(&[documents.as_ref()], &cells)?;
+                (compact, Some(scratch))
+            }
+            Err(error) if error.code == "rtdb/memory-budget-exceeded" => (documents, None),
+            Err(error) => return Err(error),
+        }
+    } else {
+        (documents, None)
+    };
     let bound = headers.len().checked_mul(128).and_then(|bytes| bytes.checked_add(documents.get_array_memory_size()))
         .and_then(|bytes| bytes.checked_add(4096)).ok_or_else(event_size)?;
-    let mut reservation = memory.reserve(bound)?;
+    let mut reservation = if let Some(mut reservation) = copy {
+        let lease = Arc::get_mut(&mut reservation).expect("put copy owns its reservation");
+        if bound > lease.bytes() { lease.grow_to(bound)?; } else { lease.shrink_to(bound)?; }
+        reservation
+    } else { memory.reserve(bound)? };
     let fields = UnionFields::new(0..3, [
         Field::new("delete", DataType::Null, true),
         Field::new("erase", DataType::Null, true),
@@ -471,6 +501,48 @@ fn event_size() -> Anomaly { invalid("Event batch allocation exceeds addressable
 mod tests {
     use super::*;
     use rtdb_types::{EntityId, ScalarType};
+
+    #[test]
+    fn a_staged_put_charges_only_the_selected_part_of_its_large_source_buffer() {
+        use arrow_array::{StringArray, StructArray};
+
+        let other = "x".repeat(1 << 20);
+        let strings = Arc::new(StringArray::from(vec!["selected", other.as_str()]));
+        let documents = StructArray::try_new(vec![Field::new("v", DataType::Utf8, false)].into(), vec![strings], None).unwrap();
+        let selected = Arc::new(documents.slice(0, 1));
+        let memory = MemoryBudget::new(1 << 17);
+        let header = EventHeader { iid: EntityId::Integer(1).iid(), system_from: Timestamp(1), valid_time: Interval::ALL, op: EventOp::Put };
+        assert!(selected.get_array_memory_size() > memory.limit_bytes());
+
+        let batch = owned_put_batch(selected, &[header], None, &memory).unwrap();
+        let event = EventBatch::new(batch.batch().clone()).unwrap().read_event(0).unwrap();
+
+        assert_eq!(event.operation, StoredOperation::Put(StructFields::from([("v".into(), Value::Utf8("selected".into()))])));
+        assert!(memory.used_bytes() < 4096);
+        drop(batch);
+        assert_eq!(memory.used_bytes(), 0);
+    }
+
+    #[test]
+    fn a_small_staged_put_releases_its_shared_source_record() {
+        use arrow_array::{StringArray, StructArray};
+
+        let content = StructArray::try_new(vec![Field::new("v", DataType::Utf8, false)].into(), vec![Arc::new(StringArray::from(vec!["kept"]))], None).unwrap();
+        let schema = Arc::new(Schema::new(vec![Field::new("doc", content.data_type().clone(), false), Field::new("other-op", DataType::Utf8, false)]));
+        let other = "x".repeat(1 << 20);
+        let source = RecordBatch::try_new(schema, vec![Arc::new(content), Arc::new(StringArray::from(vec![other.as_str()]))]).unwrap();
+        let source_memory = MemoryBudget::new(1 << 22);
+        let source = OwnedBatch::new(source, &source_memory).unwrap();
+        let memory = MemoryBudget::new(1 << 17);
+        let header = EventHeader { iid: EntityId::Integer(1).iid(), system_from: Timestamp(1), valid_time: Interval::ALL, op: EventOp::Put };
+
+        let batch = owned_put_batch(Arc::clone(source.batch().column(0)), &[header], Some(source.reservation().bytes()), &memory).unwrap();
+        drop(source);
+
+        assert_eq!(source_memory.used_bytes(), 0);
+        let event = EventBatch::new(batch.batch().clone()).unwrap().read_event(0).unwrap();
+        assert_eq!(event.operation, StoredOperation::Put(StructFields::from([("v".into(), Value::Utf8("kept".into()))])));
+    }
 
     fn page(value: Value) -> Vec<PageEvent> {
         let document = StructFields::from([("v".into(), value.clone())]);
