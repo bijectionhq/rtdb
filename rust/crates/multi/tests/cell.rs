@@ -505,6 +505,7 @@ async fn restoring_the_current_archive_preserves_the_ordered_tail_and_authority(
     let mut corrupt = ciphertext.clone();
     corrupt[0] ^= 1;
     std::fs::write(&path, corrupt).unwrap();
+    assert!(rtdb_multi::archive::capture(cell.directory.as_ref(), &storage, &archive, &cell.keys(), id, operation).await.is_err());
     assert!(rtdb_multi::archive::restore(cell.directory.as_ref(), &storage, &archive, &cell.keys(), id, operation, 4 << 20).await.is_err());
     let still_live = cell.directory.deployment(&id.to_string()).await.unwrap().unwrap();
     assert_eq!(still_live.lifecycle, Lifecycle::Live);
