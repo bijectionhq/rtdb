@@ -1,6 +1,6 @@
 //! A deployment's object store as a node sees it (contract `ObjectStorage`): fenced by the holder's epoch, encrypted under the deployment's key, and unable to delete.
 //!
-//! - `FencedStore` refuses every write once the directory has moved the deployment past the epoch the store was opened at (`ZombiesCannotDamageStorage`).
+//! - `FencedStore` checks current directory authority before admitting each write (`ZombiesCannotDamageStorage`).
 //! - `EncryptingStore` seals objects with AES-256-GCM under the deployment's key, bound to the object name.
 //! - `GarbageStore` turns a delete into a garbage record; only the reaper erases an object, once it has been garbage for the grace period (`OnlyTheReaperDeletes`, `ReapUnreachable`).
 
@@ -19,7 +19,6 @@ use rtdb_node::RemoteStorageFactory;
 use rtdb_storage::{Error, IoRegion, ObjectKey, ObjectStore, object_store::StoredObject};
 use rtdb_types::{Anomaly, Result};
 use serde::{Deserialize, Serialize};
-use tokio::sync::watch;
 
 use crate::cipher::{Cipher, SEALED_OVERHEAD as OVERHEAD};
 use crate::keys::KeyService;
@@ -49,7 +48,6 @@ pub struct CellStoreConfig {
 pub struct CellStoreFactory {
     pub directory: Arc<dyn Directory>,
     pub keys: Arc<dyn KeyService>,
-    pub fence_interval: Duration,
 }
 
 #[async_trait]
@@ -68,11 +66,13 @@ impl RemoteStorageFactory for CellStoreFactory {
         }
         let bucket = config.storage.bucket(io).await?;
         let store = format!("{}/{}", config.prefix, storage_root.as_str());
-        confirm_root(
-            &crate::reference::PrefixedStore::new(Arc::clone(&bucket), store.clone()),
-            &config.deployment,
-            config.writer_epoch.is_some(),
-        ).await?;
+        let root = FencedStore {
+            inner: Arc::new(crate::reference::PrefixedStore::new(Arc::clone(&bucket), store.clone())),
+            directory: self.directory.clone(),
+            deployment: config.deployment.clone(),
+            fence: Fence::from(&config),
+        };
+        confirm_root(&root, &config.deployment, config.writer_epoch.is_some()).await?;
         let discovery = match record.checkpoint { Some(checkpoint) => crate::packing::PackDiscovery::From(checkpoint.block), None => crate::packing::PackDiscovery::List };
         Ok(open_deployment_store(bucket, &store, discovery, wall_clock()).await?)
     }
@@ -90,13 +90,13 @@ impl RemoteStorageFactory for CellStoreFactory {
         let config: CellStoreConfig = serde_json::from_slice(&configuration.value)
             .map_err(|error| Anomaly::incorrect("rtdb.multi/storage-config", format!("Cell storage configuration is malformed: {error}")))?;
         let encrypted = EncryptingStore::new(cached, &self.keys.key(&config.deployment).await?)?;
-        let watch = || rtdb_directory::watch_deployment(Arc::clone(&self.directory), config.deployment.clone(), self.fence_interval);
-        let fence = match (config.writer_epoch, config.compactor) {
-            (Some(epoch), _) => Fence::Writer { epoch, record: watch() },
-            (None, true) => Fence::Compactor { record: watch() },
-            (None, false) => Fence::Reader,
-        };
-        Ok(Arc::new(FencedStore { inner: Arc::new(encrypted), fence }))
+        let fence = Fence::from(&config);
+        Ok(Arc::new(FencedStore {
+            inner: Arc::new(encrypted),
+            directory: self.directory.clone(),
+            deployment: config.deployment,
+            fence,
+        }))
     }
 }
 
@@ -106,11 +106,22 @@ impl CellStoreFactory {
     }
 }
 
+#[derive(Clone, Copy)]
 enum Fence {
-    Writer { epoch: u64, record: watch::Receiver<Option<DeploymentRecord>> },
+    Writer { epoch: u64 },
     /// May write a compaction output, whose name its job fixes and whose effect waits on the holder's adoption.
-    Compactor { record: watch::Receiver<Option<DeploymentRecord>> },
+    Compactor,
     Reader,
+}
+
+impl From<&CellStoreConfig> for Fence {
+    fn from(config: &CellStoreConfig) -> Self {
+        match (config.writer_epoch, config.compactor) {
+            (Some(epoch), _) => Self::Writer { epoch },
+            (None, true) => Self::Compactor,
+            (None, false) => Self::Reader,
+        }
+    }
 }
 
 /// Whether `key` is a compaction output: a trie data or metadata file above level 0.
@@ -147,21 +158,30 @@ pub async fn open_deployment_store(bucket: crate::reference::Bucket, store: &str
     GarbageStore::open_with_clock(packed, clock).await
 }
 
-pub struct FencedStore { inner: Arc<dyn ObjectStore>, fence: Fence }
+struct FencedStore {
+    inner: Arc<dyn ObjectStore>,
+    directory: Arc<dyn Directory>,
+    deployment: String,
+    fence: Fence,
+}
 
 impl FencedStore {
-    fn check(&self, key: &ObjectKey) -> rtdb_storage::Result<()> {
-        match &self.fence {
-            Fence::Reader => Err(Error::ReadOnlyLog(PathBuf::from(key.as_str()))),
-            Fence::Compactor { record } if compaction_output(key.as_str())
-                && record.borrow().as_ref().is_none_or(|current| current.lifecycle == Lifecycle::Live)
-                => Ok(()),
-            Fence::Compactor { .. } => Err(Error::ReadOnlyLog(PathBuf::from(key.as_str()))),
-            Fence::Writer { epoch, record } => match &*record.borrow() {
-                Some(current) if current.epoch != *epoch || current.lifecycle != Lifecycle::Live && current.lifecycle != Lifecycle::Quarantined =>
-                    Err(Error::Deposed { epoch: *epoch, promised: current.epoch }),
-                _ => Ok(()),
-            },
+    async fn check(&self, key: &ObjectKey) -> rtdb_storage::Result<()> {
+        let read_only = || Error::ReadOnlyLog(PathBuf::from(key.as_str()));
+        if matches!(self.fence, Fence::Reader)
+            || matches!(self.fence, Fence::Compactor) && !compaction_output(key.as_str())
+        {
+            return Err(read_only());
+        }
+        let current = self.directory.deployment(&self.deployment).await
+            .map_err(|error| Error::Remote { key: key.to_string(), message: error.code.into() })?
+            .ok_or_else(|| Error::Remote { key: key.to_string(), message: "Deployment authority is missing".into() })?;
+        match self.fence {
+            Fence::Writer { epoch } if current.epoch == epoch
+                && matches!(current.lifecycle, Lifecycle::Live | Lifecycle::Quarantined) => Ok(()),
+            Fence::Writer { epoch } => Err(Error::Deposed { epoch, promised: current.epoch }),
+            Fence::Compactor if current.lifecycle == Lifecycle::Live => Ok(()),
+            Fence::Reader | Fence::Compactor => Err(read_only()),
         }
     }
 }
@@ -172,12 +192,12 @@ impl ObjectStore for FencedStore {
     async fn head_fresh(&self, key: &ObjectKey) -> rtdb_storage::Result<StoredObject> { self.inner.head_fresh(key).await }
     async fn get(&self, key: &ObjectKey) -> rtdb_storage::Result<Bytes> { self.inner.get(key).await }
     async fn get_range(&self, key: &ObjectKey, range: Range<u64>) -> rtdb_storage::Result<Bytes> { self.inner.get_range(key, range).await }
-    async fn put(&self, key: &ObjectKey, bytes: Bytes) -> rtdb_storage::Result<()> { self.check(key)?; self.inner.put(key, bytes).await }
-    async fn put_file(&self, key: &ObjectKey, source: &Path) -> rtdb_storage::Result<()> { self.check(key)?; self.inner.put_file(key, source).await }
+    async fn put(&self, key: &ObjectKey, bytes: Bytes) -> rtdb_storage::Result<()> { self.check(key).await?; self.inner.put(key, bytes).await }
+    async fn put_file(&self, key: &ObjectKey, source: &Path) -> rtdb_storage::Result<()> { self.check(key).await?; self.inner.put_file(key, source).await }
     async fn list(&self, directory: Option<&ObjectKey>) -> rtdb_storage::Result<Vec<StoredObject>> { self.inner.list(directory).await }
     async fn delete(&self, key: &ObjectKey) -> rtdb_storage::Result<()> {
-        if matches!(self.fence, Fence::Compactor { .. }) { return Err(Error::ReadOnlyLog(PathBuf::from(key.as_str()))); }
-        self.check(key)?;
+        if matches!(self.fence, Fence::Compactor) { return Err(Error::ReadOnlyLog(PathBuf::from(key.as_str()))); }
+        self.check(key).await?;
         self.inner.delete(key).await
     }
 }
@@ -568,30 +588,34 @@ mod tests {
     async fn a_holders_store_refuses_writes_once_the_directory_moves_past_its_epoch() {
         let directory = rtdb_directory::MemoryDirectory::new();
         let mut record = directory.create_deployment(DeploymentRecord::new("shop", "acme", vec![], 0)).await.unwrap();
-        let watched = rtdb_directory::watch_deployment(directory.clone(), record.id.clone(), Duration::from_millis(5));
-        let store = FencedStore { inner: Arc::new(MemoryStore::default()), fence: Fence::Writer { epoch: 0, record: watched } };
+        let store = FencedStore {
+            inner: Arc::new(MemoryStore::default()),
+            directory: directory.clone(),
+            deployment: record.id.clone(),
+            fence: Fence::Writer { epoch: 0 },
+        };
         store.put(&key("blocks/a"), Bytes::from_static(b"a")).await.unwrap();
         record.epoch = 1;
         directory.replace_deployment(record.clone(), record.version).await.unwrap();
-        tokio::time::sleep(Duration::from_millis(100)).await;
         assert!(matches!(store.put(&key("blocks/b"), Bytes::from_static(b"b")).await, Err(Error::Deposed { epoch: 0, promised: 1 })), "a deposed holder writes nothing");
         assert!(store.delete(&key("blocks/a")).await.is_err(), "and releases nothing");
         assert_eq!(store.get(&key("blocks/a")).await.unwrap().as_ref(), b"a", "reads still serve its snapshots");
     }
 
     #[tokio::test]
-    async fn a_compactors_store_refuses_outputs_after_observing_disposal() {
-        let mut installation = DeploymentRecord::new("shop", "acme", vec![], 0);
-        let (current, record) = watch::channel(Some(installation.clone()));
+    async fn a_compactors_store_refuses_outputs_after_disposal_is_ordered() {
+        let directory = rtdb_directory::MemoryDirectory::new();
+        let installation = directory.create_deployment(DeploymentRecord::new("shop", "acme", vec![], 0)).await.unwrap();
         let store = FencedStore {
             inner: Arc::new(MemoryStore::default()),
-            fence: Fence::Compactor { record },
+            directory: directory.clone(),
+            deployment: installation.id.clone(),
+            fence: Fence::Compactor,
         };
         let output = key("tables/t/data/l01-first.arrow");
         store.put(&output, Bytes::from_static(b"first")).await.unwrap();
 
-        installation.lifecycle = Lifecycle::Deleting;
-        current.send_replace(Some(installation));
+        crate::admin::begin_disposal(directory.as_ref(), &installation.id).await.unwrap();
         let late_output = key("tables/t/data/l01-late.arrow");
         assert!(matches!(
             store.put(&late_output, Bytes::from_static(b"late")).await,
