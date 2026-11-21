@@ -334,6 +334,21 @@ def verify_checkpoint_discovery(args, scratch):
     verify_lean_model(args, scratch, path, "checkpoint-discovery", controls, 3)
 
 
+def verify_compaction_merge(args, scratch):
+    path = Path("verification/lean/CompactionMerge.lean")
+    controls = {
+        "admit-larger-head": (
+            "key row ≤ key candidate\n", "key row ≤ key candidate + 1\n",
+            ["any_eligible_head_lower_bounds_the_input"],
+        ),
+        "stop-before-last": (
+            "pages.flatten.length ≤ 0", "pages.flatten.length ≤ 1",
+            ["drain_preserves_all_occurrences"],
+        ),
+    }
+    verify_lean_model(args, scratch, path, "compaction-merge", controls, 5)
+
+
 def verify_reader_retention(args, scratch):
     path = Path("verification/lean/ReaderRetention.lean")
     controls = {
@@ -416,6 +431,7 @@ def verify_lean(args, scratch):
             verify_ceiling(args, scratch, directory)
             verify_reader_retention(args, scratch)
             verify_compaction_projection(args, scratch, directory)
+            verify_compaction_merge(args, scratch)
             verify_search_windows(args, scratch)
             verify_partitioned_top_k(args, scratch)
             verify_catalog_recovery(args, scratch)
@@ -933,6 +949,41 @@ def verify_catalog_replay(args, source):
     print("rust-catalog-replay: checkpoint and promotion tests passed, both production mutations rejected")
 
 
+def verify_merge_replay(args, source):
+    env = os.environ | {
+        "CARGO_TARGET_DIR": str(ROOT / "target"),
+        "CARGO_PROFILE_DEV_DEBUG": "0",
+        "CARGO_PROFILE_TEST_DEBUG": "0",
+        "CARGO_INCREMENTAL": "0",
+    }
+    test = "merge::tests::row_heap_matches_flatten_and_sort_without_losing_occurrences"
+    command = ["cargo", "test", "--locked", "-p", "rtdb-maintenance", "--lib", test, "--", "--exact"]
+    checked = run_case(command, source / "rust", args.evidence, "rust-merge-baseline", env)
+    if checked.returncode or f"{test} ... ok" not in checked.stdout:
+        raise ValueError("production merge did not agree with flatten-and-sort")
+
+    planner = source / "rust/crates/maintenance/src/merge/planner.rs"
+    original = planner.read_bytes()
+    controls = (
+        ("reverse-system-time", "left.system_from > right.system_from", "left.system_from < right.system_from",
+         "merge order differs from sorting the input"),
+        ("drop-final-row", "if result.1 + 1 == streams[result.0].len()", "if result.1 + 2 >= streams[result.0].len()",
+         "merge did not consume every input occurrence"),
+    )
+    for name, find, replacement, expected in controls:
+        try:
+            replace_once(planner, find, replacement)
+            checked = run_case(command, source / "rust", args.evidence, f"rust-merge-{name}", env)
+            if (
+                checked.returncode != 101 or f"{test} ... FAILED" not in checked.stdout
+                or expected not in checked.stdout or "0 passed; 1 failed" not in checked.stdout
+            ):
+                raise ValueError(f"{name}: expected a single failure at {test}")
+        finally:
+            planner.write_bytes(original)
+    print("rust-merge-replay: production heap agrees with flatten-and-sort, both mutations rejected")
+
+
 def verify_azure_replay(args, source):
     env = os.environ | {
         "CARGO_TARGET_DIR": str(ROOT / "target"),
@@ -1091,6 +1142,7 @@ def main():
         "rust/crates/index/tests/catalogs.rs",
         "rust/crates/maintenance/src/gc.rs",
         "rust/crates/maintenance/tests/gc.rs",
+        "rust/crates/maintenance/src/merge.rs",
         "rust/crates/maintenance/src/merge/planner.rs",
         "rust/crates/trie/src/bucketer.rs",
         "rust/crates/conformance/src/faults.rs",
@@ -1134,6 +1186,7 @@ def main():
             replay_rust_trace(args)
             verify_checkpoint_replay(args, source)
             verify_catalog_replay(args, source)
+            verify_merge_replay(args, source)
             verify_azure_replay(args, source)
 
 

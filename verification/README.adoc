@@ -113,6 +113,8 @@ The same option runs the local checkpoint interruption, partial compaction, over
 The production controls publish the root too early and stop on a missing checkpoint without refreshing discovery.
 It also tests catalog promotion after a binary checkpoint round trip.
 The production controls omit the pending historical index and let a tiered replacement publish without its fourth bucket.
+The merge replay compares the native page heap with a flatten-and-sort reference and checks that each page is consumed in order.
+Its controls reverse the system-time ordering and omit a final row.
 It also exercises the Azure adapter against a loopback provider and separately mutates premature copy acknowledgement and cleanup on an unknown outcome.
 
 == Evidence boundaries
@@ -125,6 +127,9 @@ It also exercises the Azure adapter against a loopback provider and separately m
   `lean/PartitionedTopK.lean` proves that conservative partition pruning preserves the ordered global prefix and the SQL page for any offset and fetch.
   `lean/CatalogRecovery.lean` checks that rebuilding the pending historical-trie index gives the same promotion as scanning the durable catalog.
   `lean/CheckpointDiscovery.lean` proves that any chain of metadata retries advances strictly and fits within the remaining index range.
+  `lean/CompactionMerge.lean` proves that taking minimum heads from ordered input pages emits all occurrences in key order.
+  Every finite input admits a complete execution, and equal keys can preserve different payload orders across input pages.
+  The merge replay checks the native heap on finite batches. Individual heap updates, temporal resolution and compaction layout have separate refinement obligations.
 * `tla/Kernel.tla` explores a bounded protocol with one durable log and two terms and requests, plus the pinned and copied read variants.
   It assumes durable append is atomic and does not implement a consensus provider.
 * `tla/Resolution.tla` compares serialized, validated and blind optimistic resolution under the same increment program.
