@@ -34,6 +34,7 @@ pub(crate) struct Call {
     pub cancellation: CancellationToken,
     _admission: Admission,
     _lease: Option<AcquiredSession>,
+    _active_call: Option<Box<dyn Send + Sync>>,
     _reservation: Arc<MemoryReservation>,
 }
 struct Admission { service: Service, permit: Option<OwnedSemaphorePermit> }
@@ -135,8 +136,10 @@ impl Service {
             let lease = AcquiredSession { service: self.clone(), session: Arc::clone(&session) };
             (session, true, lease)
         };
-        let database = session.database(requested_database, &self.0.node)?;
-        let call = Call { service: self.clone(), session, minted, database, cancellation: self.0.cancellation.child_token(), _admission: admission, _lease: Some(lease), _reservation: reservation };
+        let (database, attachment) = session.resolve_database(requested_database, &self.0.node)?;
+        let active_call = attachment.as_deref().and_then(|attachment| self.0.node.hold_active_call(attachment));
+        let call = Call { service: self.clone(), session, minted, database, cancellation: self.0.cancellation.child_token(),
+            _admission: admission, _lease: Some(lease), _active_call: active_call, _reservation: reservation };
         self.publish(); Ok(call)
     }
     pub async fn admit_database(&self, database: &str) -> Result<bool, Status> {

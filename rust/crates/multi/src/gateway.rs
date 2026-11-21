@@ -191,7 +191,10 @@ async fn connection(client: TcpStream, directory: Arc<dyn Directory>, options: G
         };
         return tokio::io::copy_bidirectional(&mut client, &mut forward).await.map(|_| ()).map_err(io);
     }
-    if expected.is_some() { startup.parameters.insert("database".into(), name.clone()); }
+    if let Some(installation) = expected {
+        startup.parameters.insert("database".into(), name.clone());
+        startup.parameters.insert(rtdb_pgwire::REQUIRED_INSTALLATION_PARAMETER.into(), installation.to_string());
+    }
     startup.parameters.insert(rtdb_pgwire::GATEWAY_AWAIT_TOKEN_PARAMETER.into(), "on".into());
     startup.parameters.insert(rtdb_pgwire::GATEWAY_SETTINGS_PARAMETER.into(), "on".into());
     startup.bytes = encode_startup(&startup.parameters);
@@ -326,6 +329,17 @@ async fn route(router: &GatewayRouter) -> Result<(TcpStream, Option<String>, u64
         Lifecycle::Restoring => return Err(Anomaly::new(AnomalyCategory::Unavailable, "rtdb.multi/restoring", format!("{name}'s checkpoint is being restored; retry shortly"))),
         Lifecycle::Deleting | Lifecycle::Deleted => return Err(Anomaly::incorrect("rtdb.multi/deleted", format!("{name} has been deleted"))),
     }
+    let key = control::ControlKey(options.capabilities.clone());
+    let activation = Request::Activate { name: name.into() };
+    if !router.snapshot && (!router.read_only || record.read_width <= 1)
+        && let Some(holder) = &record.holder
+        && let Some(member) = directory.member(holder).await.ok().flatten()
+        && record.may_hold_on(&member, now_ms())
+        && let Some(control_address) = member.control_address
+        && let Ok(Response::Held { address, epoch }) = control::call(&control_address, &activation, options.control_timeout, &key).await
+    {
+        return Ok((connect(&address).await?, Some(control_address), epoch, record.id));
+    }
     let members: BTreeMap<MemberId, MemberRecord> = directory.members().await?.into_iter().map(|member| (member.id.clone(), member)).collect();
     if router.snapshot && record.checkpoint.is_some() && record.lifecycle == Lifecycle::Live {
         for reader in snapshot_readers(&record, &members) {
@@ -354,7 +368,7 @@ async fn route(router: &GatewayRouter) -> Result<(TcpStream, Option<String>, u64
     let mut refused = None;
     for candidate in candidates(&record, &members) {
         let Some(control_address) = &candidate.control_address else { continue; };
-        match control::call(control_address, &Request::Activate { name: name.to_owned() }, options.control_timeout, &control::ControlKey(options.capabilities.clone())).await {
+        match control::call(control_address, &activation, options.control_timeout, &key).await {
             Ok(Response::Held { address, epoch }) => return Ok((connect(&address).await?, Some(control_address.clone()), epoch, record.id.clone())),
             Ok(Response::Redirect { holder, address }) => {
                 let control = members.get(&MemberId(holder)).and_then(|member| member.control_address.clone());
@@ -452,6 +466,8 @@ async fn read_startup(mut client: Client, tls: Option<&Arc<rustls::ServerConfig>
                 }
                 // Only a gateway grants capabilities: one a client sends is dropped.
                 parameters.remove(rtdb_pgwire::CAPABILITY_PARAMETER);
+                parameters.retain(|key, _| !key.eq_ignore_ascii_case(rtdb_pgwire::REQUIRED_INSTALLATION_PARAMETER)
+                    && !key.eq_ignore_ascii_case(rtdb_pgwire::VERIFIED_INSTALLATION_PARAMETER));
                 return Ok(Some((client, Startup { bytes: encode_startup(&parameters), parameters })));
             }
             _ => return Err(Anomaly::incorrect("rtdb.multi/startup", format!("Unsupported startup code {code}"))),

@@ -71,6 +71,11 @@ impl CapabilityVerifier for CellSecret {
         if claims.deployment != database { return Err(refused("The capability names another deployment")); }
         Ok(VerifiedCapability { principal: claims.principal, read_only: claims.read_only })
     }
+
+    fn require_installation(&self, installation: &str, database: &rtdb_node::Database) -> Result<()> {
+        if attachment_storage(database)?.deployment == installation { Ok(()) }
+        else { Err(refused("The attachment belongs to another installation")) }
+    }
 }
 
 impl std::fmt::Debug for CellSecret {
@@ -79,17 +84,20 @@ impl std::fmt::Debug for CellSecret {
 
 impl rtdb_flight_sql::FlightPeerVerifier for CellSecret {
     fn verify(&self, proof: &str, attachment: &rtdb_node::Database) -> Result<IpAddr> {
-        let Some(database_config::Storage::RemoteStorage(remote)) = &attachment.configuration().storage else {
-            return Err(refused("The Flight SQL attachment has no cell storage identity"));
-        };
-        let config = remote.object_store.as_ref().filter(|config| config.type_url.rsplit('/').next() == Some(crate::store::CELL_STORAGE_TYPE))
-            .ok_or_else(|| refused("The Flight SQL attachment has no cell storage identity"))?;
-        let config: crate::store::CellStoreConfig = serde_json::from_slice(&config.value)
-            .map_err(|_| refused("The Flight SQL attachment has an invalid cell storage identity"))?;
+        let config = attachment_storage(attachment)?;
         let epoch = config.writer_epoch.ok_or_else(|| refused("The Flight SQL route requires a writer attachment"))?;
         let peer = <Self as CapabilityVerifier>::verify(self, proof, &flight_peer_scope(&config.deployment, epoch))?;
         peer.principal.parse().map_err(|_| refused("The Flight SQL peer address is invalid"))
     }
+}
+
+fn attachment_storage(attachment: &rtdb_node::Database) -> Result<crate::store::CellStoreConfig> {
+    let Some(database_config::Storage::RemoteStorage(remote)) = &attachment.configuration().storage else {
+        return Err(refused("The attachment has no cell storage identity"));
+    };
+    let config = remote.object_store.as_ref().filter(|config| config.type_url.rsplit('/').next() == Some(crate::store::CELL_STORAGE_TYPE))
+        .ok_or_else(|| refused("The attachment has no cell storage identity"))?;
+    serde_json::from_slice(&config.value).map_err(|_| refused("The attachment has an invalid cell storage identity"))
 }
 
 fn flight_peer_scope(deployment: &str, epoch: u64) -> String { format!("~flight/peer/{deployment}/{epoch}") }

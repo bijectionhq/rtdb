@@ -4,7 +4,7 @@
 
 use std::collections::BTreeMap;
 
-use crate::{DeploymentRecord, MemberId, MemberRecord};
+use crate::{DeploymentRecord, MemberId, MemberRecord, ResidentIdle};
 
 /// The holder that counts: the recorded holder, only while its member may hold.
 pub fn effective_holder<'a>(record: &'a DeploymentRecord, members: &BTreeMap<MemberId, MemberRecord>, now_ms: i64) -> Option<&'a MemberId> {
@@ -25,6 +25,7 @@ pub fn claim(record: &DeploymentRecord, claimant: &MemberId, members: &BTreeMap<
     let mut next = record.clone();
     next.epoch += 1;
     next.holder = Some(claimant.clone());
+    next.resident_idle = None;
     next.move_intent = None;
     next.placement_move = None;
     Some(next)
@@ -36,7 +37,19 @@ pub fn park(record: &DeploymentRecord, holder: &MemberId, epoch: u64) -> Option<
     let mut next = record.clone();
     next.epoch += 1;
     next.holder = None;
+    next.resident_idle = None;
     Some(next)
+}
+
+/// Fences an idle writer while retaining this member's placement and published checkpoint.
+pub fn suspend_holding(record: &DeploymentRecord, holder: &MemberId, epoch: u64, now_ms: i64, last_activity_at_ms: i64) -> Option<DeploymentRecord> {
+    if record.is_resident_idle() || record.active_move(now_ms).is_some() || record.writer_pool().is_none() {
+        return None;
+    }
+    let mut idle = park(record, holder, epoch)?;
+    idle.holder = Some(holder.clone());
+    idle.resident_idle = Some(ResidentIdle { epoch: idle.epoch, last_activity_at_ms });
+    Some(idle)
 }
 
 #[cfg(test)]
@@ -89,6 +102,27 @@ mod tests {
         record.placement_move = None;
         record.move_intent = Some(serde_json::from_str(r#""b""#).unwrap());
         assert!(claim(&record, &MemberId("a".into()), &members, 10).is_some());
+    }
+
+    #[test]
+    fn resident_idle_fences_the_writer_and_keeps_its_placement_until_a_new_claim() {
+        let members = members(&[node("a", MemberState::Eligible, 100), node("b", MemberState::Eligible, 100)]);
+        let a = MemberId("a".into());
+        let b = MemberId("b".into());
+        let record = DeploymentRecord::new("shop", "acme", vec![], 0);
+        let held = claim(&record, &a, &members, 10).unwrap();
+        let idle = suspend_holding(&held, &a, held.epoch, 10, 5).unwrap();
+        assert!(idle.is_resident_idle());
+        assert_eq!(idle.epoch, held.epoch + 1);
+        assert_eq!(effective_holder(&idle, &members, 10), Some(&a));
+        assert!(claim(&idle, &b, &members, 10).is_none());
+        assert!(park(&idle, &a, held.epoch).is_none());
+        let awake = claim(&idle, &a, &members, 10).unwrap();
+        assert_eq!(awake.epoch, idle.epoch + 1);
+        assert!(!awake.is_resident_idle());
+        let parked = park(&idle, &a, idle.epoch).unwrap();
+        assert!(!parked.is_resident_idle());
+        assert_eq!(parked.holder, None);
     }
 
     #[test]

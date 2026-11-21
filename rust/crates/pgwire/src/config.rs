@@ -34,6 +34,8 @@ pub const GATEWAY_SETTINGS_KIND: u8 = 2;
 pub const GATEWAY_SQL_PREPARE_KIND: u8 = 3;
 pub const GATEWAY_NAMED_PARSE_KIND: u8 = 4;
 pub const GATEWAY_SETTINGS_PARAMETER: &str = "rtdb.gateway_settings";
+pub const REQUIRED_INSTALLATION_PARAMETER: &str = "rtdb.require_installation";
+pub const VERIFIED_INSTALLATION_PARAMETER: &str = "rtdb.verified_installation";
 
 /// The startup parameter a capability travels in.
 pub const CAPABILITY_PARAMETER: &str = "rtdb.capability";
@@ -49,6 +51,9 @@ pub struct VerifiedCapability { pub principal: String, pub read_only: bool }
 pub trait CapabilityVerifier: Send + Sync {
     /// The grant `token` carries for `database`, refused unless it is genuine, unexpired and names `database`.
     fn verify(&self, token: &str, database: &str) -> rtdb_types::Result<VerifiedCapability>;
+    fn require_installation(&self, _installation: &str, _database: &rtdb_node::Database) -> rtdb_types::Result<()> {
+        Err(rtdb_types::Anomaly::incorrect("rtdb.pgwire/installation", "This listener cannot verify deployment installations"))
+    }
 }
 impl Default for ServerConfig {
     fn default() -> Self {

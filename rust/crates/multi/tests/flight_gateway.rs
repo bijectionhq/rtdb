@@ -85,3 +85,48 @@ async fn flight_gateway_routes_authenticated_streams_and_refuses_a_displaced_ses
     tokio::time::timeout(Duration::from_secs(5), driver).await.unwrap().unwrap().unwrap();
     cell.stop().await;
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_streaming_flight_call_keeps_the_attachment_active_until_cancelled() {
+    let idle_after = Duration::from_secs(1);
+    let cell = Cell::start_with_resident_idle(1, idle_after, None).await;
+    admin::create_deployment(cell.directory.as_ref(), "shop", "acme", 3).await.unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let cancellation = CancellationToken::new();
+    let options = GatewayOptions { capabilities: Some(secret()), ..Default::default() };
+    let driver = tokio::spawn(flight_gateway::serve(listener, Arc::clone(&cell.directory), options, cancellation.clone()));
+    let mut flight = FlightSqlServiceClient::new(channel(address).await);
+    flight.set_header("x-xtdb-database", "shop");
+    flight.handshake("xtdb", "cell-test").await.unwrap();
+    let before = cell.directory.deployment_by_name("shop").await.unwrap().unwrap();
+
+    let (started, sent) = tokio::sync::oneshot::channel();
+    let mut started = Some(started);
+    let stream = futures::stream::poll_fn(move |_| {
+        if let Some(started) = started.take() { let _ = started.send(()); }
+        std::task::Poll::<Option<arrow_flight::FlightData>>::Pending
+    });
+    let mut request = Request::new(stream);
+    request.metadata_mut().insert("authorization", format!("Bearer {}", flight.token().unwrap()).parse().unwrap());
+    let mut client = FlightServiceClient::new(channel(address).await);
+    let upload = tokio::spawn(async move { client.do_put(request).await });
+    tokio::time::timeout(Duration::from_secs(2), sent).await.unwrap().unwrap();
+    tokio::time::sleep(idle_after + Duration::from_millis(600)).await;
+    assert!(!upload.is_finished());
+    let still_serving = cell.directory.deployment_by_name("shop").await.unwrap().unwrap();
+    assert_eq!(still_serving.epoch, before.epoch);
+    assert!(!still_serving.is_resident_idle());
+    upload.abort();
+    assert!(upload.await.unwrap_err().is_cancelled());
+
+    tokio::time::timeout(Duration::from_secs(6), async {
+        loop {
+            if cell.directory.deployment_by_name("shop").await.unwrap().unwrap().is_resident_idle() { break; }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }).await.expect("cancelled Flight streaming released the activity lease");
+    cancellation.cancel();
+    tokio::time::timeout(Duration::from_secs(5), driver).await.unwrap().unwrap().unwrap();
+    cell.stop().await;
+}
