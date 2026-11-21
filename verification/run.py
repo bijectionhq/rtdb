@@ -52,7 +52,7 @@ def run_case(command, directory, evidence, case, env=None):
 
 
 def rust_function_at(source, line):
-    signature = re.compile(r"^\s*(?:pub(?:\([^)]*\))?\s+)?fn (\w+)\(")
+    signature = re.compile(r"^\s*(?:pub(?:\([^)]*\))?\s+)?(?:proof\s+)?fn (\w+)\s*[<(]")
     function = None
     contract = False
     for index, text in enumerate(source.read_text().splitlines(), 1):
@@ -1064,17 +1064,22 @@ def verify_merge_replay(args, source):
     if checked.returncode or f"{test} ... ok" not in checked.stdout:
         raise ValueError("production merge did not agree with flatten-and-sort")
 
-    planner = source / "rust/crates/maintenance/src/merge/planner.rs"
-    original = planner.read_bytes()
+    merge_dir = source / "rust/crates/maintenance/src/merge"
     controls = (
-        ("reverse-system-time", "left.system_from > right.system_from", "left.system_from < right.system_from",
+        ("choose-later-child", "row_heap.rs", "precedes(right_key, child_key)", "precedes(child_key, right_key)",
          "merge order differs from sorting the input"),
-        ("drop-final-row", "if result.1 + 1 == streams[result.0].len()", "if result.1 + 2 >= streams[result.0].len()",
+        ("drop-final-row", "row_heap.rs", "if row == page_length {\n        let last", "if row.saturating_add(1) >= page_length {\n        let last",
          "merge did not consume every input occurrence"),
+        ("return-first-coordinate", "row_heap.rs", "\n    result\n}", "\n    (result.0, 0)\n}",
+         "merge skipped or repeated a row in a stream"),
+        ("reverse-iid-bytes", "planner.rs", "u128::from_be_bytes", "u128::from_le_bytes",
+         "Compaction page is not IID ascending and system-time descending"),
     )
-    for name, find, replacement, expected in controls:
+    for name, file, find, replacement, expected in controls:
+        source_file = merge_dir / file
+        original = source_file.read_bytes()
         try:
-            replace_once(planner, find, replacement)
+            replace_once(source_file, find, replacement)
             checked = run_case(command, source / "rust", args.evidence, f"rust-merge-{name}", env)
             if (
                 checked.returncode != 101 or f"{test} ... FAILED" not in checked.stdout
@@ -1082,8 +1087,8 @@ def verify_merge_replay(args, source):
             ):
                 raise ValueError(f"{name}: expected a single failure at {test}")
         finally:
-            planner.write_bytes(original)
-    print("rust-merge-replay: production heap agrees with flatten-and-sort, both mutations rejected")
+            source_file.write_bytes(original)
+    print("rust-merge-replay: production heap agrees with flatten-and-sort, all four mutations rejected")
 
 
 def verify_azure_replay(args, source):

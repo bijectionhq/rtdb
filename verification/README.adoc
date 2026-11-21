@@ -118,7 +118,7 @@ The production controls omit the pending historical index and let a tiered repla
 The catalog clock test commits a transaction at an explicit system time, issues an attach and a refused detach, and reopens the same local log.
 Its control feeds raw log time into the catalog resolver and must fail at attach.
 The merge replay compares the native page heap with a flatten-and-sort reference and checks that each page is consumed in order.
-Its controls reverse the system-time ordering and omit a final row.
+Its controls choose the later child, omit a final row, repeat the first coordinate, or reverse the IID byte order.
 It also exercises the Azure adapter against a loopback provider and separately mutates premature copy acknowledgement and cleanup on an unknown outcome.
 
 == Evidence boundaries
@@ -134,7 +134,7 @@ It also exercises the Azure adapter against a loopback provider and separately m
   `lean/SystemTime.lean` proves strict system-time order over arbitrary mixed resolver histories and proves that a completed prefix's last assigned time suffices to resume its clock trace.
   `lean/CompactionMerge.lean` proves that taking minimum heads from ordered input pages emits all occurrences in key order.
   Every finite input admits a complete execution, and equal keys can preserve different payload orders across input pages.
-  The merge replay checks the native heap on finite batches. Individual heap updates, temporal resolution and compaction layout have separate refinement obligations.
+  The merge replay checks the native heap and page adapter on finite batches. Temporal resolution and compaction output layout have separate refinement obligations.
 * `tla/Kernel.tla` explores a bounded protocol with one durable log and two terms and requests, plus the pinned and copied read variants.
   It assumes durable append is atomic and does not implement a consensus provider.
 * `tla/Resolution.tla` compares serialized, validated and blind optimistic resolution under the same increment program.
@@ -175,6 +175,8 @@ It also exercises the Azure adapter against a loopback provider and separately m
   The replay floor area checks the exact signed-offset rule for a required replica record below a provider's reported floor.
   The system time area checks the production assignment and admission decisions, including exhaustion and rejection of equal or earlier timestamps.
   The IID partition area checks the base-four digit computation shared by trie and compaction code.
+  The compaction heap area checks exact Rust page validation, construction, minimum extraction, cursor advancement and sift permutation.
+  Its contracts refer to an immutable table of page keys and lengths supplied by the compaction adapter.
   The rank cutoff area checks the production decision given the two maximum frontier bounds.
   The search window area checks the native functions that assign postings, set the scan endpoints, and combine frequency and length extrema.
   The temporal event and allocation shell, storage adapters, the reader protection protocol, and full search equivalence need separate refinement and replay evidence.

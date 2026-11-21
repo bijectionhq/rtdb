@@ -1085,6 +1085,9 @@ Verus proved the latest-block and shared-sibling catalog decisions.
 |Compaction
 |The exact-generation catalog guard addresses a Rust regression found by the two-generation TLC model.
 Verus checks the base-four bucket selection shared by default trie reads and compaction output partitioning.
+Verus also checks the production merge heap over arbitrary representable ordered pages, under the adapter's length and key contracts.
+The heap emits a minimum coordinate, advances exactly one cursor, and preserves every other occurrence.
+The native adapter binds one immutable set of Arrow pages to the heap for its lifetime and is replayed against independent sorting.
 |Prove that each accepted piece represents precisely the input coverage and that the merged bitemporal events refine the original history.
 Include retry, restart, overlapping jobs, metadata depth and clipping, and every route to publication.
 |===

@@ -1,5 +1,6 @@
 mod layout;
 mod planner;
+mod row_heap;
 
 use rtdb_types::StructFields;
 use std::collections::BTreeMap;
@@ -284,7 +285,7 @@ impl CompactionExecutor for SegmentCompactor {
             let mut calculator = AdmittedPolygonCalculator::new(None, Arc::clone(&self.memory));
             let mut buckets: BTreeMap<usize, Vec<PageEvent>> = BTreeMap::new();
             let mut bucket_charges = Vec::new();
-            while let Some((stream, row)) = heap.next(&rows) {
+            while let Some((stream, row)) = heap.next() {
                 let event = &rows[stream][row];
                 let Some(recency) = calculator.visit(&event.header(), |polygon| Ok(polygon.recency()))? else { continue; };
                 let target = if job.recency_mode == RecencyMode::Partition && recency != Timestamp::MAX {
@@ -371,7 +372,11 @@ mod tests {
     fn row_heap_matches_flatten_and_sort_without_losing_occurrences() {
         use std::cmp::Reverse;
 
-        let events: Vec<_> = [Iid([0; 16]), Iid([255; 16])].into_iter().flat_map(|iid| {
+        let iids = [
+            Iid([0, 255, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 255]),
+            Iid([128, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]),
+        ];
+        let events: Vec<_> = iids.into_iter().flat_map(|iid| {
             [i64::MAX - 1, i64::MIN + 1].map(|system_from| StoredEvent {
                 iid,
                 system_from: Timestamp(system_from),
@@ -404,7 +409,7 @@ mod tests {
                 let mut heap = planner::RowHeap::new(&streams).unwrap();
                 let mut positions = vec![0; streams.len()];
                 let mut observed = Vec::with_capacity(expected.len());
-                while let Some((stream, row)) = heap.next(&streams) {
+                while let Some((stream, row)) = heap.next() {
                     assert_eq!(row, positions[stream], "merge skipped or repeated a row in a stream");
                     positions[stream] += 1;
                     observed.push(key(&streams[stream][row]));
@@ -412,6 +417,12 @@ mod tests {
                 assert_eq!(positions, lengths, "merge did not consume every input occurrence");
                 assert_eq!(observed, expected, "merge order differs from sorting the input");
             }
+        }
+
+        for [later, earlier] in [[&events[1], &events[0]], [&events[2], &events[0]]] {
+            let unsorted = [page(&[later.clone(), earlier.clone()])];
+            let error = planner::RowHeap::new(&unsorted).err().unwrap();
+            assert_eq!(error.message.as_deref(), Some("Compaction page is not IID ascending and system-time descending"));
         }
     }
 

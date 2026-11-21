@@ -1,6 +1,6 @@
 use rtdb_format::{data::PageEvent, metadata::MetadataNode};
 use rtdb_types::{Iid, Result};
-use super::InputSegment;
+use super::{InputSegment, row_heap};
 
 #[derive(Clone, Copy)]
 pub(super) struct Page { pub segment: usize, pub page: usize }
@@ -55,49 +55,26 @@ pub(super) fn plan(inputs: &[InputSegment], part: &[u8]) -> Result<Vec<Task>> {
     Ok(tasks)
 }
 
-pub(super) struct RowHeap { heads: Vec<(usize, usize)> }
+pub(super) struct RowHeap<'a> {
+    streams: &'a [Vec<PageEvent>],
+    heads: Vec<row_heap::Head>,
+}
 
-impl RowHeap {
-    pub fn new(streams: &[Vec<PageEvent>]) -> Result<Self> {
-        let mut heads = Vec::new();
-        for (index, rows) in streams.iter().enumerate() {
-            for pair in rows.windows(2) {
-                if pair[0].iid > pair[1].iid || (pair[0].iid == pair[1].iid && pair[0].system_from < pair[1].system_from) {
-                    return Err(crate::invalid("Compaction page is not IID ascending and system-time descending"));
-                }
-            }
-            if !rows.is_empty() { heads.push((index, 0)); }
-        }
-        let mut heap = Self { heads };
-        for index in (0..heap.heads.len() / 2).rev() { heap.sift(index, streams); }
-        Ok(heap)
+impl<'a> RowHeap<'a> {
+    pub fn new(streams: &'a [Vec<PageEvent>]) -> Result<Self> {
+        let heads = row_heap::from_pages(streams.len(), |stream| streams[stream].len(), |head| Self::key(streams, head))
+            .ok_or_else(|| crate::invalid("Compaction page is not IID ascending and system-time descending"))?;
+        Ok(Self { streams, heads })
     }
 
-    fn precedes(left: (usize, usize), right: (usize, usize), streams: &[Vec<PageEvent>]) -> bool {
-        let (left, right) = (&streams[left.0][left.1], &streams[right.0][right.1]);
-        left.iid < right.iid || (left.iid == right.iid && left.system_from > right.system_from)
+    fn key(streams: &[Vec<PageEvent>], (stream, row): row_heap::Head) -> row_heap::Key {
+        let event = &streams[stream][row];
+        (u128::from_be_bytes(event.iid.0), event.system_from.0)
     }
 
-    fn sift(&mut self, mut index: usize, streams: &[Vec<PageEvent>]) {
-        let node = self.heads[index];
-        loop {
-            let mut child = 2 * index + 1;
-            if child >= self.heads.len() { break; }
-            if child + 1 < self.heads.len() && Self::precedes(self.heads[child + 1], self.heads[child], streams) { child += 1; }
-            if !Self::precedes(self.heads[child], node, streams) { break; }
-            self.heads[index] = self.heads[child];
-            index = child;
-        }
-        self.heads[index] = node;
-    }
-
-    pub fn next(&mut self, streams: &[Vec<PageEvent>]) -> Option<(usize, usize)> {
-        let result = *self.heads.first()?;
-        if result.1 + 1 == streams[result.0].len() {
-            let last = self.heads.pop()?;
-            if !self.heads.is_empty() { self.heads[0] = last; }
-        } else { self.heads[0].1 += 1; }
-        if !self.heads.is_empty() { self.sift(0, streams); }
-        Some(result)
+    pub fn next(&mut self) -> Option<row_heap::Head> {
+        let streams = self.streams;
+        let (stream, _) = *self.heads.first()?;
+        Some(row_heap::take_minimum(&mut self.heads, streams[stream].len(), |head| Self::key(streams, head)))
     }
 }

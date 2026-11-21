@@ -134,6 +134,8 @@ config {
 -- An input page from an unresolved segment (an L0 file, or the live index) first has its same-system-time events resolved against each other.
 -- Their order holds only within their page, and the recency split separates them into different files.
 -- For each merge task, we merge-sort the input pages by IID and system-time, applying bitemporal resolution.
+-- The merge heap admits pages ordered by ascending IID and descending system time.
+-- It holds one cursor per nonempty page and advances the page that supplied the minimum key.
 --
 -- The behaviour differs depending on the compaction type:
 --   L0 → L1C/L1H: recency is calculated for each event through bitemporal resolution.
