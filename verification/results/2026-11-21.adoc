@@ -1530,3 +1530,36 @@ The combined run at `b82dd238c` finished successfully with 452 recorded commands
 Z3, Alloy, Apalache, Maude, mCRL2 and AutoHyper also met their declared baseline and control outcomes.
 The combined run used the formal tools only.
 The separate scoped native and JVM runs above supply the runtime observations for this change.
+
+=== Hosted S3 key vault and ordered cursor integration
+
+The S3 key vault carries the conditional custody path from the hosted Protocol 15 branch into the consolidated runtime.
+It keeps the configured local and DynamoDB providers and stores the S3 namespace and deletion signer separately from deployment keys.
+The hosted binary and image inputs identify the vault-enabled artifact as Protocol 14.
+This increment does not publish an image or change any cell configuration.
+
+At `1b8bab5af`, the scoped Rust run passed 387 tests across Multi, node, Flight SQL and conformance.
+One credentialed DynamoDB test was ignored.
+The six S3 vault tests include native AWS SDK requests against a mock endpoint.
+The covered ordered-cursor regression checks the first batch comes from the index and a later provider read surfaces the missing-page error.
+The native role-membership query passed with a lease from the primary database.
+All 16 release-selection tests passed, and the compiled Multi binary reported hosted protocol 14.
+
+TLC explored 18 states in the one-key custody model.
+It found the expected counterexamples for all three controls and reached confirmed withdrawal of an installed key.
+The provider's atomic conditional write and never-versioned storage are premises.
+Native mock-S3 evidence covers the adapter's requests and responses.
+Hosted AWS, complete deployment erasure and the remaining Protocol 15 branch changes are outside this increment's evidence.
+
+[source,shell]
+----
+cd rust
+BIJECTION_LOCAL_EXECUTION=owner-authorized cargo test --offline --locked \
+  -p rtdb-multi --features dynamodb,s3-key-vault --lib --test cell \
+  -p rtdb-node --test native --test fragments -p rtdb-flight-sql \
+  -p rtdb-conformance --test node_faults --no-fail-fast
+----
+
+The command logs are under
+`/private/tmp/rtdb-formal.QMjPSJsX/protocol15-vault-1b8bab5af-native.log`
+and `/private/tmp/rtdb-formal.QMjPSJsX/s3-key-custody-focused/`.
