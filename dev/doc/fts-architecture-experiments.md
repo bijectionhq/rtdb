@@ -338,3 +338,98 @@ The first Gradle run had one JVM cache eviction assertion failure, which passed 
 
 The merged Rust experiment uses the prepared BM25 scorer and the shared posting-window index.
 The search, node, and text suites passed 227 tests with `rtdb-node/fts-experiments` enabled, including the exact bound regression, and Cargo compiled the benchmark example.
+
+## Query replay, filter order, and fallback
+
+The workload harness uses the native SQL planner and executor from `621022aad`.
+It generates tickets with skewed document lengths, recurring phrases, a mix of common and rare terms, and structured status and cohort fields.
+The workload is synthetic and approximates ticket search shapes.
+Each measured query and its oracle use the same captured query context, trie files, and BM25 corpus.
+The oracle evaluates MATCH from resolved row values and disables both ranked and unranked candidate narrowing.
+Each comparison checks the ordered IDs, floating-point scores, projected values, and valid and system interval boundaries.
+
+The replay starts six SQL readers and a writer for every wave.
+Readers share a captured basis for that wave and run broad, previously unused term, phrase, multiple-predicate, historical-point, and valid-range queries.
+The writer commits a batch of backdated replacements, including a document that carried a rare high-scoring term.
+The oracle runs after the timed queries against the retained reader context.
+The harness records actual overlap with the write, candidate decisions, scoring work, and verification and fallback reasons.
+
+Filter-first ranking takes an exact set of IIDs from a structured SQL filter at the requested valid and system points.
+It intersects those IIDs with matching index documents before scoring and runs the ordinary scan predicates on the resolved rows.
+The benchmark measures the prebuilt set and a separate variant that includes the SQL time to build it.
+The corpus is registered before applying either scope.
+A temporal regression places a matching term and the required status on different versions of one entity and verifies that the entity stays out of the result before and after compaction.
+
+The first fallback alternative goes straight to the SQL scan once ranking exhausts its candidate or verification budget.
+The second uses the document frequency of a single required term across the opened bundles, plus live event counts, to predict when to avoid both ranking and unranked narrowing.
+This estimates posting work before applying phrase, version, score, or structured constraints.
+The fallback alternatives retain the same corpus registration, MATCH semantics, and final SQL sort.
+One query has rare high-scoring winners behind a broad MATCH to test where a posting-count heuristic mispredicts.
+
+```sh
+cargo run --manifest-path rust/Cargo.toml --locked --release -p rtdb-node --features fts-experiments --example fts_architecture_bench -- workload 80000 20
+cargo run --manifest-path rust/Cargo.toml --locked --release -p rtdb-node --features fts-experiments --example fts_architecture_bench -- workload 120000 20
+```
+
+### Workload results
+
+The 80,000- and 120,000-document runs used 20 samples per filter and fallback variant.
+Each also ran 20 waves of six concurrent readers, with 64 backdated puts per wave.
+All 1,704 comparisons matched the exhaustive SQL oracle, including the temporal canaries.
+The writer overlapped 104 of 120 timed queries at 80,000 documents and 100 of 120 at 120,000 documents.
+
+| Replay documents | p50 | p95 | p99 | Ranked queries | Candidate-limit scan fallbacks |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 80,000 | 18.91 ms | 31.93 ms | 35.35 ms | 120 / 120 | 0 |
+| 120,000 | 30.11 ms | 390.10 ms | 399.58 ms | 100 / 120 | 20 |
+
+The broad query accounted for all 20 fallbacks at 120,000 documents.
+Its p50 was 383.08 ms under replay.
+Fresh-term, phrase, multiple-predicate, historical-point, and valid-range queries all completed ranked narrowing at that size, with p95 between 15.47 and 45.79 ms.
+These percentiles describe the synthetic replay and its mix of query shapes.
+
+| Documents | Eligible IIDs | Rank-first p50 | Prepared filter p50 | Build filter and rank p50 | Score evaluations, rank-first → filter-first |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 80,000 | 82 | 35.77 ms | 3.09 ms | 7.93 ms | 80,000 → 80 |
+| 80,000 | 816 | 48.32 ms | 3.99 ms | 12.19 ms | 80,000 → 814 |
+| 80,000 | 7,942 | 13.25 ms | 5.34 ms | 15.96 ms | 80,000 → 7,940 |
+| 80,000 | 40,080 | 12.06 ms | 11.01 ms | 32.19 ms | 80,000 → 40,078 |
+| 120,000 | 113 | 92.44 ms | 5.47 ms | 14.73 ms | 120,000 → 111 |
+| 120,000 | 1,196 | 102.33 ms | 8.10 ms | 22.52 ms | 120,000 → 1,194 |
+| 120,000 | 11,949 | 127.58 ms | 13.89 ms | 32.34 ms | 120,000 → 11,947 |
+| 120,000 | 60,009 | 230.43 ms | 33.53 ms | 67.61 ms | 120,000 → 60,007 |
+
+At 80,000 documents, building the scope on demand paid for itself at approximately 0.1% and 1% selectivity.
+At 10% and 50%, the scope could be useful when already available and took the longer route when built by scanning the table.
+Above the candidate cap, all four filter-first variants beat rank-first even with scope construction included.
+Filter-first still visited the postings, so its savings came from scoring and validating fewer candidates.
+The canary checked the filter on live and compacted state at three valid and system point pairs, including the old version after its correction expired.
+
+| Workload, 120,000 documents | Current p50 / p95 | Skip retry p50 / p95 | Posting estimate p50 / p95 |
+| --- | ---: | ---: | ---: |
+| Uniform scoring | 428.17 / 432.06 ms | 385.37 / 389.97 ms | 269.67 / 272.01 ms |
+| Rare high-scoring winners | 4.97 / 5.21 ms | 4.68 / 5.08 ms | 268.44 / 271.14 ms |
+| Highly selective structured filter | 91.14 / 91.84 ms | 48.24 / 48.82 ms | 12.32 / 12.64 ms |
+| Uniform scoring after corrections | 346.22 / 359.23 ms | 289.02 / 295.60 ms | 278.04 / 284.28 ms |
+| Rare high-scoring winners after corrections | 7.31 / 7.51 ms | 7.21 / 7.47 ms | 277.41 / 279.79 ms |
+| Structured filter after corrections | 122.21 / 126.33 ms | 65.43 / 69.63 ms | 14.40 / 14.97 ms |
+
+Skipping the retry avoided another 120,000 unranked events when the native path had already spent its budget.
+After corrections, the uniform-score query hit the verification budget after scoring 1,280 live candidates and then visited 120,000 unranked events on the current route.
+Skipping that retry saved 57 ms at p50.
+The posting estimate took the same early-scan decision for the two broad MATCH queries, even though the rare-winner query needed only 10,752 scores before corrections.
+The phrase control kept its ranked path under all policies.
+
+### Workload decision
+
+Prioritize filter-first ranking when a cheap structured scope is available at the captured basis.
+The benefit depends on filter selectivity, the cost of acquiring the scope, and whether rank-first would hit a budget.
+Preserve the resolved-row predicate check and use the full snapshot corpus for scoring.
+
+Test a direct-to-scan fallback after a candidate-budget miss when the unranked pass is also expected to cover most of the table.
+The measured verification-budget cases were broad, so a production policy also needs coverage of narrow MATCH queries that can still benefit from unranked narrowing after verification gives up.
+A posting-count threshold alone misclassifies broad MATCH queries with rare high-scoring winners.
+Use the observed scoring frontier and verification work when evaluating any early decision for those shapes.
+
+The focused release run passed all 56 Rust cases.
+That run includes the end-to-end workload regression with a reduced candidate limit so it exercises both fallback decisions on a small fixture.
