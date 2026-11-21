@@ -795,7 +795,8 @@ This applies to the checkpoint metadata objects in loose storage, named block pa
 In the packed case, the pack remains if any of its entries has an outstanding metadata obligation.
 Completion still requires the usual release records, grace and reference handling for ordinary collection.
 
-The node carries the startup hold through checkpoint selection, metadata reads, and any ordinary recovery retry while assembling the database.
+The storage factory carries the startup hold through the opening reads and transfers it to the node.
+The node keeps it through checkpoint selection, metadata reads, and any ordinary recovery retry while assembling the database.
 Its I/O region propagates the hold into admitted provider and cache operations when the calling future is cancelled.
 Dropping the final reference clears the metadata field independently of the broader serving region.
 A crashed reader's metadata hold belongs to the serving region that the reaper reconciles after definitive evidence of owner loss.

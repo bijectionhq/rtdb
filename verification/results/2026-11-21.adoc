@@ -1232,3 +1232,27 @@ This study establishes finite model properties only.
 
 The registered TLC runner executes both policies, all four controls, and four reachability witnesses.
 The checked model SHA-256 is `d43053e0b4f22e095d3ae1d3c7a544d80077023a0ae950ae8e53d1925f6e4eb7`. link:../tla/ForkPublication.tla[Fork model] · link:../README.adoc#_run_the_studies[Runner]
+
+=== Production checkpoint metadata admission and collection
+
+The storage factory uses one versioned directory update to admit the recovery store, choose its metadata floor and record the hold.
+The storage-opening reads and database assembly run with that hold attached to admitted I/O.
+Ordinary discovery may advance or refresh from a published floor.
+An exact serving snapshot retries admission at a newer published checkpoint when its requested one has advanced.
+The reaper requires every released metadata block to be below both the published block and every active hold.
+
+The Verus checkpoint metadata area checked five obligations in the predicate included from production source.
+The ordinary control and the matching weakened contract each have one expected diagnostic.
+The direct Rust replay used the memory directory and local object provider on the merged candidate at `31ff21299`.
+It preserved a root pack, a spilled table block, a loose table block and the hold through cancellation of an admitted provider read.
+The reaper later collected the old metadata once that read drained.
+Removing the earliest hold failed exactly the packed-root assertion.
+The clean `store.rs` SHA-256 was `8a1adf7b37ec84c2995915fe127509b35ed6abbfc5b2f3247d3edaaad9354254`.
+The runner includes both cases when invoked with `--native-replay`. link:../verus/checkpoint_metadata/proof.rs[Exact production predicate] · link:../README.adoc#_run_the_studies[Runner]
+
+The combined formal run on the earlier integrated candidate `da7367925` completed Lean, TLC, Verus, Z3, Apalache, Alloy, Maude, mCRL2 and AutoHyper.
+It covered 126 baseline Verus obligations in 17 areas, 70 Verus controls, and 28 TLC baseline cases with the registered controls and reachability witnesses.
+Lean ran with one worker and its default proof budgets.
+This invocation omitted both Rust options.
+The disposition of the later fork study is recorded separately above.
+Its input manifest SHA-256 is `d4bb2ef583c091d331b37828437534901076516771a6e024fa737567c425f0d4`.
