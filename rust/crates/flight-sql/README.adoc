@@ -4,7 +4,9 @@
 ADBC Flight SQL drivers use the same `rtdb-node` sessions, SQL preparation, query cursors, transaction resolver, and authentication as the PostgreSQL frontend.
 The source and regression cases remain uncompiled and unexecuted during Phase 1.
 Schema descriptions retain the supplied physical parameter fields, while query execution opens their signed vector view.
-Retained parameter IPC remains lossless, and bulk ingestion admits cells before constructing logical documents.
+Retained parameter IPC remains lossless.
+Bulk ingestion retains compatible Arrow document columns during source-log encoding, replay and transaction staging.
+The typed document writer handles layouts that require cell conversion.
 
 == Composition and ownership
 

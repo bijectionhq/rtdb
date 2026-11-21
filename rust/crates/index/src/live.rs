@@ -439,7 +439,74 @@ impl LiveIndex {
 }
 
 #[derive(Default)]
-struct PendingTable { declared: StructFields<LogicalType>, events: Vec<StoredEvent>, reservations: Vec<Arc<MemoryReservation>> }
+struct PendingTable {
+    declared: StructFields<LogicalType>,
+    events: Vec<StoredEvent>,
+    batches: Vec<(usize, Arc<IndexBatch>)>,
+    reservations: Vec<Arc<MemoryReservation>>,
+}
+
+impl PendingTable {
+    fn position(&self) -> WritePosition {
+        WritePosition { events: self.events.len(), batches: self.batches.len() }
+    }
+
+    fn copy_since(&self, written: WritePosition, budget: &Arc<MemoryBudget>) -> Result<Arc<IndexBatch>> {
+        let events = &self.events[written.events..];
+        let batches = &self.batches[written.batches..];
+        if batches.is_empty() {
+            return IndexBatch::copy_events(events, &self.declared, budget);
+        }
+        if let [(_, batch)] = batches && events.is_empty() && batch.put_types == self.declared {
+            return Ok(Arc::clone(batch));
+        }
+        if events.is_empty() && let Some((_, first)) = batches.first() && first.put_types == self.declared {
+            let schema = first.arrow().schema();
+            if batches.iter().all(|(_, batch)| batch.arrow().schema() == schema) {
+                let bytes = batches.iter().try_fold(4096usize, |bytes, (_, batch)| {
+                    batch.arrow().get_array_memory_size().checked_mul(4)
+                        .and_then(|size| bytes.checked_add(size)).ok_or_else(|| invalid("Write batch size overflow"))
+                })?;
+                let mut reservation = budget.reserve(bytes)?;
+                let combined = arrow_select::concat::concat_batches(&schema, batches.iter().map(|(_, batch)| batch.arrow())).map_err(invalid)?;
+                Arc::get_mut(&mut reservation).expect("write concatenation owns its reservation").shrink_to(combined.get_array_memory_size())?;
+                return IndexBatch::from_owned(OwnedBatch::with_reservation(combined, reservation)?);
+            }
+        }
+        let mut rows = Vec::new();
+        let mut next_event = written.events;
+        let mut charge = budget.reserve(0)?;
+        let positions = batches.iter().map(|(offset, batch)| (*offset, Some(batch)))
+            .chain(std::iter::once((self.events.len(), None)));
+        for (upto, batch) in positions {
+            for event in &self.events[next_event..upto] {
+                let bytes = match &event.operation { StoredOperation::Put(doc) => Value::document_retained_bytes(doc)?, _ => 0 };
+                charge_event(&mut charge, bytes)?;
+                rows.push(event.clone());
+            }
+            if let Some(batch) = batch {
+                let schema = batch.arrow().schema();
+                let field = schema.field_with_name("op").map_err(invalid)?;
+                let operations = batch.events.operations()?;
+                for row in 0..batch.len() {
+                    charge_event(&mut charge, estimate_read_value_bytes(field, operations, row)?)?;
+                    rows.push(batch.events.read_event(row)?);
+                }
+            }
+            next_event = upto;
+        }
+        IndexBatch::copy_events(&rows, &self.declared, budget)
+    }
+}
+
+fn charge_event(charge: &mut Arc<MemoryReservation>, document: usize) -> Result<()> {
+    let added = document.checked_add(4096).and_then(|bytes| bytes.checked_add(charge.bytes())).ok_or_else(|| invalid("Write batch size overflow"))?;
+    Arc::get_mut(charge).expect("write copying owns its reservation").grow_to(added)
+}
+
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+struct WritePosition { events: usize, batches: usize }
+
 
 pub struct TransactionBuffer {
     base: Snapshot,
@@ -447,7 +514,7 @@ pub struct TransactionBuffer {
     budget: Arc<MemoryBudget>,
     tables: BTreeMap<TableRef, PendingTable>,
     /// Each table's transaction segment as last read, with the events and declarations it holds; a read appends only what was written since.
-    segments: std::sync::Mutex<BTreeMap<TableRef, (Arc<LiveTable>, usize, StructFields<LogicalType>)>>,
+    segments: std::sync::Mutex<BTreeMap<TableRef, (Arc<LiveTable>, WritePosition, StructFields<LogicalType>)>>,
 }
 
 impl TransactionBuffer {
@@ -506,6 +573,21 @@ impl TransactionBuffer {
         pending.reservations.push(reservation);
         Ok(())
     }
+    pub fn append_batch(&mut self, table: &TableRef, batch: OwnedBatch) -> Result<()> {
+        let batch = IndexBatch::from_owned(batch)?;
+        if batch.is_empty() { return Ok(()); }
+        if !batch.has_system_time(self.tx_key.system_time) {
+            return Err(invalid("Transaction batch has another system time"));
+        }
+        let reservation = self.budget.reserve(table.schema.len() + table.table.len() + 4096)?;
+        if !self.tables.contains_key(table) { self.tables.insert(table.clone(), PendingTable::default()); }
+        self.declare_document_types(table, batch.put_types.iter())?;
+        let pending = self.tables.get_mut(table).ok_or_else(|| invalid("Transaction table write disappeared"))?;
+        pending.batches.push((pending.events.len(), batch));
+        pending.reservations.push(reservation);
+        Ok(())
+    }
+
     /// The snapshot the transaction started from, without its own writes, for a statement that reads no table.
     pub fn base_snapshot(&self) -> Snapshot { self.base.clone() }
     pub fn snapshot(&self) -> Result<Snapshot> {
@@ -513,12 +595,13 @@ impl TransactionBuffer {
         for (table, pending) in &self.tables {
             let (segment, done, declared) = match segments.get(table) {
                 Some((segment, done, declared)) => (Arc::clone(segment), *done, Some(declared)),
-                None => (Arc::new(LiveTable::new(table.clone(), self.base.block_index(), TrieConfig::default())), 0, None),
+                None => (Arc::new(LiveTable::new(table.clone(), self.base.block_index(), TrieConfig::default())), WritePosition::default(), None),
             };
-            if done == pending.events.len() && declared == Some(&pending.declared) { continue; }
-            let batch = (done < pending.events.len()).then(|| IndexBatch::copy_events(&pending.events[done..], &pending.declared, &self.budget)).transpose()?;
+            let position = pending.position();
+            if done == position && declared == Some(&pending.declared) { continue; }
+            let batch = (done != position).then(|| pending.copy_since(done, &self.budget)).transpose()?;
             let segment = Arc::new(segment.append(&TableWrite::new(pending.declared.clone(), batch), self.tx_key.system_time)?);
-            segments.insert(table.clone(), (segment, pending.events.len(), pending.declared.clone()));
+            segments.insert(table.clone(), (segment, position, pending.declared.clone()));
         }
         let current = segments.iter().map(|(table, (segment, ..))| (table.clone(), Arc::clone(segment))).collect();
         self.base.with_transaction_segments(self.tx_key, &current)
@@ -530,7 +613,7 @@ impl TransactionBuffer {
     }
     fn materialize(&self) -> Result<StagedWrite> {
         let tables = self.tables.iter().map(|(table, pending)| {
-            let batch = Some(IndexBatch::copy_events(&pending.events, &pending.declared, &self.budget)?);
+            let batch = Some(pending.copy_since(WritePosition::default(), &self.budget)?);
             Ok((table.clone(), TableWrite::new(pending.declared.clone(), batch)))
         }).collect::<Result<_>>()?;
         StagedWrite::new(self.tx_key, self.base.tx_basis(), self.base.block_index(), tables)

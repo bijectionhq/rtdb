@@ -2,9 +2,9 @@ use rtdb_types::StructFields;
 use std::collections::BTreeSet;
 use std::sync::Arc;
 
-use arrow_array::{Array, StructArray};
+use arrow_array::{Array, ArrayRef, ArrowPrimitiveType, PrimitiveArray, StructArray, cast::AsArray, types::{Int8Type, Int16Type, Int32Type, Int64Type, UInt8Type, UInt16Type, UInt32Type, UInt64Type}};
 use arrow_schema::{DataType, Fields, Schema};
-use rtdb_columnar::{MemoryBudget, MemoryReservation, from_field};
+use rtdb_columnar::{ColumnReader, MemoryBudget, MemoryReservation, OwnedBatch, from_field};
 use rtdb_types::{Anomaly, EntityId, LogicalType, Result, TableRef, Timestamp, TransactionKey, TxId, Value};
 
 #[derive(Clone, Debug)]
@@ -148,6 +148,89 @@ impl Documents {
 }
 
 #[derive(Clone, Debug)]
+pub struct ArrowDocuments {
+    array: StructArray,
+    layout: Arc<DecodedDocumentLayout>,
+}
+
+impl ArrowDocuments {
+    pub fn from_batch(batch: &OwnedBatch, memory: &Arc<MemoryBudget>) -> Result<Option<Self>> {
+        let batch = batch.batch();
+        let schema = batch.schema();
+        if batch.num_rows() == 0 || schema.fields().iter().zip(batch.columns()).any(|(field, _)| !Self::compatible(field)) {
+            return Ok(None);
+        }
+        let _schema = memory.reserve(rtdb_format::ipc::schema_translation_bound(&schema)?)?;
+        let names = schema.fields().iter().map(|field| field.name()).collect::<BTreeSet<_>>();
+        if names.len() != schema.fields().len() { return Ok(None); }
+        let (fields, columns): (Vec<_>, Vec<_>) = schema.fields().iter().zip(batch.columns()).map(|(field, array)| {
+            let nulls = array.logical_null_count();
+            let array = if nulls == array.len() {
+                Arc::new(arrow_array::NullArray::new(array.len())) as ArrayRef
+            } else {
+                match array.data_type() {
+                    DataType::UInt8 => signed_column::<UInt8Type, Int8Type>(array.as_ref()),
+                    DataType::UInt16 => signed_column::<UInt16Type, Int16Type>(array.as_ref()),
+                    DataType::UInt32 => signed_column::<UInt32Type, Int32Type>(array.as_ref()),
+                    DataType::UInt64 => signed_column::<UInt64Type, Int64Type>(array.as_ref()),
+                    _ => Arc::clone(array),
+                }
+            };
+            (arrow_schema::Field::new(field.name(), array.data_type().clone(), nulls != 0), array)
+        }).unzip();
+        let fields = Fields::from(fields);
+        let layout = DecodedDocumentLayout::new(&fields, memory)?;
+        let array = StructArray::try_new_with_length(fields, columns, None, batch.num_rows())
+            .map_err(|error| Anomaly::incorrect("rtdb.tx/document-schema", error.to_string()))?;
+        Ok(Some(Self { array, layout }))
+    }
+
+    fn compatible(field: &arrow_schema::Field) -> bool {
+        field.metadata().is_empty() && matches!(field.data_type(),
+            DataType::Null | DataType::Boolean | DataType::Int8 | DataType::Int16 | DataType::Int32 | DataType::Int64 |
+            DataType::UInt8 | DataType::UInt16 | DataType::UInt32 | DataType::UInt64 |
+            DataType::Float32 | DataType::Float64 | DataType::Utf8 | DataType::Binary | DataType::FixedSizeBinary(_) |
+            DataType::Timestamp(arrow_schema::TimeUnit::Microsecond, Some(_)))
+    }
+
+    pub(crate) fn from_source(array: &StructArray, layout: Arc<DecodedDocumentLayout>) -> Option<Self> {
+        (!array.is_empty() && array.null_count() == 0 && array.fields().iter().all(|field| Self::compatible(field)))
+            .then(|| Self { array: array.clone(), layout })
+    }
+
+    pub(crate) fn array(&self) -> &StructArray { &self.array }
+    pub(crate) fn columns(&self) -> &[String] { &self.layout.columns }
+
+    pub(crate) fn to_rows(&self, omit_nulls: bool, memory: &Arc<MemoryBudget>) -> Result<Documents> {
+        Documents::read_arrow(&self.array, Arc::clone(&self.layout), omit_nulls, memory)
+    }
+
+    pub(crate) fn iid(&self, row: usize, reader: Option<&(usize, ColumnReader)>, memory: &Arc<MemoryBudget>) -> Result<rtdb_types::Iid> {
+        if let Some((index, reader)) = reader {
+            let column = self.array.column(*index);
+            if column.is_valid(row) {
+                let _scratch = memory.reserve(rtdb_columnar::estimate_read_cell_bytes(&self.array.fields()[*index], column.as_ref(), row)?)?;
+                return Ok(reader.read(column.as_ref(), row)?.entity_id()?.iid());
+            }
+        }
+        let slice = self.array.slice(row, 1);
+        let rows = Documents::read_arrow(&slice, Arc::clone(&self.layout), false, memory)?;
+        crate::source::document_id(&rows.rows()[0], memory).map(|id| id.iid())
+    }
+
+    pub(crate) fn id_reader(&self) -> Result<Option<(usize, ColumnReader)>> {
+        self.array.fields().iter().enumerate().find(|(_, field)| field.name() == "_id")
+            .map(|(index, field)| Ok((index, ColumnReader::new(field)?))).transpose()
+    }
+}
+
+fn signed_column<From: ArrowPrimitiveType, To: ArrowPrimitiveType>(array: &dyn Array) -> ArrayRef {
+    let source = array.as_primitive::<From>();
+    let values = arrow_buffer::ScalarBuffer::from(source.values().inner().clone());
+    Arc::new(PrimitiveArray::<To>::new(values, source.nulls().cloned()))
+}
+
+#[derive(Clone, Debug)]
 pub struct EntityIds { ids: Arc<Vec<EntityId>>, _reservation: Arc<MemoryReservation> }
 impl EntityIds {
     pub fn new(ids: Vec<EntityId>, memory: &Arc<MemoryBudget>) -> Result<Self> {
@@ -252,6 +335,7 @@ pub enum TxOp {
     Sql { sql: String, args: Option<SqlArguments> },
     SqlBytes { sql: String, arg_bytes: RetainedBytes },
     PutDocs { table: TableRef, documents: Documents, valid_from: Option<Timestamp>, valid_to: Option<Timestamp> },
+    PutArrowDocs { table: TableRef, documents: ArrowDocuments },
     PatchDocs { table: TableRef, documents: Documents, valid_from: Option<Timestamp>, valid_to: Option<Timestamp> },
     DeleteDocs { table: TableRef, ids: EntityIds, valid_from: Option<Timestamp>, valid_to: Option<Timestamp> },
     EraseDocs { table: TableRef, ids: EntityIds },

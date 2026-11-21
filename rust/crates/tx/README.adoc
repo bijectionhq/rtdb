@@ -16,9 +16,9 @@ INSERT, UPDATE, and DELETE RETURNING clauses are syntax-checked and ignored by s
 Source replay decodes its recorded operations without repeating submit-time expansion.
 The source encoder builds each operation body column independently before assembling the operation union.
 The transaction result table declares its nullable Transit error column even when every written result is successful.
-Document batches own their ordered columns along with their row values.
-Source replay bounds document value construction by one row of scratch and the rows already decoded.
-Replayed puts share their ordered Arrow layout and retain present cells separately.
+Document batches retain their column order in either representation.
+Compatible Arrow puts retain their arrays through replay and staging, with transaction headers prepared independently.
+When replay constructs document values, it bounds scratch to one row and shares the ordered Arrow layout across puts.
 The resolver carries declared column types to the staged write, including columns whose cells are all null.
 The source encoder carries document columns in first encounter order in each table and mutation leg, and the decoder recovers that order from the Arrow field layout.
 The encoder builds one document column at a time, retains its measured Arrow buffers and releases the builder scratch before building the next column.
