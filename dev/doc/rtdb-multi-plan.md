@@ -153,6 +153,11 @@ missing objects. A successor recovers the same ordered tail before serving.
 The directory keeps the accepted manifest and completion for retries.
 Retain the archive while an installation uses it.
 
+Hosted operators can run `rtdb-multi recovery` as a private TLS service with its own credential, configured serving storage, independent archive, and current keys.
+It admits an operation only for the exact name and authority in its configured organization.
+A capture returns the pinned checkpoint and canonical archive digest.
+A recovery request supplies that digest and capture ID, and repeats the completion receipt if the operation already finished.
+
 **Fixed on the way.**
 
 - A newly activated fork could publish its parent's boundary and trim its own log before its first flush completed.

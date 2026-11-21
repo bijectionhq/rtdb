@@ -43,6 +43,7 @@ Usage: rtdb-multi --build-info\n\
        rtdb-multi disposal --directory DIR --id UUID\n\
        rtdb-multi schedule-recovery-disposal --directory DIR --id UUID\n\
        rtdb-multi recovery-disposal --directory DIR --id UUID\n\
+       rtdb-multi recovery --directory DIR --listen ADDR --config FILE --token-file FILE --org ORG --storage-root PATH --archive-root PATH --keys PATH\n\
        rtdb-multi capture --directory DIR --storage-root PATH --archive-root PATH --keys PATH --id UUID --operation UUID\n\
        rtdb-multi restore --directory DIR --storage-root PATH --archive-root PATH --keys PATH --id UUID --operation UUID\n\n\
 DIR is HOST:PORT of a directory server, or dynamodb:PREFIX for DynamoDB tables named PREFIX-deployments, PREFIX-deployment-names and PREFIX-members\n\
@@ -326,6 +327,26 @@ async fn run(arguments: Vec<String>) -> Result<()> {
             let receipt = directory.deployment(&id.to_string()).await?.and_then(|record| record.archive_retirement);
             println!("{}", serde_json::to_string_pretty(&receipt).expect("archive retirement serializes"));
             Ok(())
+        }
+        "recovery" => {
+            let directory = directory(arguments.required("directory")?).await?;
+            let configuration = NodeConfiguration::from_yaml(
+                &std::fs::read_to_string(arguments.required("config")?).map_err(io)?,
+            )?;
+            let tls_settings = configuration.server.and_then(|server| server.ssl)
+                .ok_or_else(|| usage("The recovery configuration must provide server.ssl".into()))?;
+            let tls = rtdb_server::tls::load(&tls_settings, &rtdb_columnar::MemoryBudget::new(16 << 20))?;
+            let service = rtdb_multi::recovery::RecoveryService::from_file(
+                std::path::Path::new(arguments.required("token-file")?),
+                arguments.required("org")?.to_owned(),
+                CellStorage::parse(arguments.required("storage-root")?)?,
+                CellStorage::parse(arguments.required("archive-root")?)?,
+                key_service(arguments.required("keys")?).await?,
+            )?;
+            let listener = tokio::net::TcpListener::bind(
+                arguments.address("listen", "127.0.0.1:0")?,
+            ).await.map_err(io)?;
+            rtdb_multi::recovery::serve(listener, tls, directory, Arc::new(service), cancellation).await
         }
         "capture" => {
             let directory = directory(arguments.required("directory")?).await?;
