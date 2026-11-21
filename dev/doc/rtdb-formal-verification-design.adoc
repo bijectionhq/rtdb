@@ -839,6 +839,8 @@ Certification still needs evidence that the selected catalog named that publicat
 The Lean identity model checks that an accepted observation names the selected physical identity and that an exact erase preserves every other publication.
 A replacement can have the same logical key and content digest, and two provider namespaces can have the same local key and version.
 The model also checks the alternative of names qualified by epoch and input digest.
+The native trie catalog uses an epoch-qualified physical name after compactor reset.
+It admits replica compaction notices in the current naming epoch, adopts a changed epoch together with its persisted checkpoint catalog, and uses full trie identity to remove garbage.
 Those checks assume correct encoding and a provider that enforces immutable publication and erasure by exact identity. link:../../verification/lean/RetirementIdentity.lean[Physical identity model]
 The native driver now defers the trie-removal reply until the installed prefix covers its read-back position.
 It checks the requested trie keys against the current catalog and the installed checkpoint in one immutable partition value before returning a position.

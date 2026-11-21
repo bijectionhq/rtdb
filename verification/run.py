@@ -2059,6 +2059,40 @@ def verify_catalog_admission_floor(args, source):
     print("rust-catalog-floor: directory replay passed, both missing-admission controls failed")
 
 
+def verify_trie_naming_epoch(args, source):
+    env = os.environ | {
+        "CARGO_TARGET_DIR": os.environ.get("CARGO_TARGET_DIR", str(ROOT / "target")),
+        "CARGO_PROFILE_TEST_DEBUG": "0",
+    }
+    test = "a_delayed_notice_removes_or_adopts_only_its_named_incarnation"
+    command = ["cargo", "test", "--locked", "-p", "rtdb-index", "--test", "catalogs", test, "--", "--exact"]
+    baseline = run_case(command, source / "rust", args.evidence, "rust-naming-epoch-baseline", env)
+    if baseline.returncode or f"{test} ... ok" not in baseline.stdout or "1 passed; 0 failed" not in baseline.stdout:
+        raise ValueError("the trie catalog did not preserve its naming epoch under delayed notices")
+
+    controls = {
+        "old-publication": ("partition.rs",
+                            "tries.iter().filter(|trie| trie.key.level() == 0 || trie.key.epoch() == epoch)",
+                            "tries.iter()",
+                            "a delayed publication from before reset must not be adopted"),
+        "old-removal": ("trie_catalog.rs", "trie.key == *key && matches!(trie.state, TrieState::Garbage { .. })",
+                        "matches!(trie.state, TrieState::Garbage { .. })",
+                        "a delayed retirement must preserve the replacement"),
+    }
+    for name, (file, before, after, failure) in controls.items():
+        path = source / "rust/crates/index/src" / file
+        original = path.read_bytes()
+        try:
+            replace_once(path, before, after)
+            checked = run_case(command, source / "rust", args.evidence, f"rust-naming-epoch-{name}", env)
+            if (checked.returncode != 101 or f"{test} ... FAILED" not in checked.stdout
+                or failure not in checked.stdout or "0 passed; 1 failed" not in checked.stdout):
+                raise ValueError(f"naming epoch control {name} did not fail at its declared assertion")
+        finally:
+            path.write_bytes(original)
+    print("rust-naming-epoch: delayed notices passed, both controls failed")
+
+
 def verify_s3_object_version(args, source):
     env = os.environ | {
         "CARGO_TARGET_DIR": os.environ.get("CARGO_TARGET_DIR", str(ROOT / "target")),
@@ -2775,6 +2809,7 @@ def main():
             verify_trie_removal_readback(args, source)
             verify_durable_trie_retirement(args, source)
             verify_catalog_admission_floor(args, source)
+            verify_trie_naming_epoch(args, source)
             verify_s3_object_version(args, source)
             verify_replay_prefix(args, source)
             verify_multi_trim_admission(args, source)
