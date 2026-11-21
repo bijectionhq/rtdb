@@ -558,6 +558,23 @@ def verify_jvm_trie_pending_logs(args, scratch):
     verify_lean_model(args, scratch, path, "jvm-trie-pending-logs", controls, 6)
 
 
+def verify_trie_wire_paths(args, scratch):
+    path = Path("verification/lean/TrieWirePaths.lean")
+    controls = {
+        "drop-nonempty-root": (
+            "if rootPath.isEmpty then none else some rootPath, encode root",
+            "none, encode root",
+            ["restored_wire_recovers_the_root_and_every_bucket"],
+        ),
+        "derive-wrong-child-path": (
+            "(decode (path ++ [.one]) one)",
+            "(decode (path ++ [.two]) one)",
+            ["decoded_nodes_recover_every_path_and_row", "decoding_reconstructs_a_well_placed_tree"],
+        ),
+    }
+    verify_lean_model(args, scratch, path, "trie-wire-paths", controls, 6)
+
+
 def verify_outer_join(args, scratch):
     path = Path("verification/lean/OuterJoin.lean")
     controls = {
@@ -838,6 +855,7 @@ def verify_lean(args, scratch):
             verify_memory_trie(args, scratch)
             verify_live_row_address(args, scratch)
             verify_jvm_trie_pending_logs(args, scratch)
+            verify_trie_wire_paths(args, scratch)
             verify_outer_join(args, scratch)
             verify_table_slugs(args, scratch)
             verify_explicit_session(args, scratch)

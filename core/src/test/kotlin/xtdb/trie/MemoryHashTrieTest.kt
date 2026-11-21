@@ -7,7 +7,12 @@ import org.junit.jupiter.api.Assertions.assertEquals
 import org.junit.jupiter.api.Assertions.assertSame
 import org.junit.jupiter.api.BeforeEach
 import org.junit.jupiter.api.Test
+import xtdb.arrow.FixedSizeBinaryVector
 import xtdb.arrow.IntVector
+import xtdb.trie.proto.branch
+import xtdb.trie.proto.hashTrie
+import xtdb.trie.proto.hashTrieNode
+import xtdb.trie.proto.leaf
 import kotlin.random.Random
 
 class MemoryHashTrieTest {
@@ -134,6 +139,64 @@ class MemoryHashTrieTest {
         assertEquals(setOf(0), base.indexSet())
         assertEquals(setOf(0, 1), first.indexSet())
         assertEquals(setOf(0, 2, 3), second.indexSet())
+    }
+
+    @Test
+    fun `protobuf restores root and bucket paths for lookup and later inserts`() {
+        FixedSizeBinaryVector(allocator, "_iid", false, 16).use { iids ->
+            val root = byteArrayOf(2)
+            val first = byteArrayOf(2, 1)
+            val second = byteArrayOf(2, 3)
+            val later = byteArrayOf(2, 2)
+            for (path in listOf(first, second, first, later)) {
+                iids.writeBytes(Bucketer.DEFAULT.startIid(path))
+            }
+
+            val original = MemoryHashTrie.builder(iids)
+                .setRootPath(root)
+                .setPageLimit(2)
+                .setLogLimit(2)
+                .build()
+                .addRange(0, 3)
+
+            val restored = MemoryHashTrie.fromProto(original.asProto, iids)
+            assertEquals(root.toList(), restored.rootNode.path.toList())
+            assertEquals(listOf(first.toList(), second.toList()), restored.leaves.map { it.path.toList() })
+            assertEquals(listOf(listOf(2, 0), listOf(1)), restored.leaves.map { it.data.toList() })
+            val iid = Bucketer.DEFAULT.startIid(first)
+            val candidates = restored.leaves.filter { Bucketer.DEFAULT.compareToPath(iid, it.path) == 0 }
+            assertEquals(listOf(2, 0), candidates.flatMap { it.data.toList() })
+
+            val extended = restored.addRange(3, 1).compactLogs()
+            assertEquals(
+                listOf(first.toList(), later.toList(), second.toList()),
+                extended.leaves.map { it.path.toList() }
+            )
+            assertEquals(listOf(listOf(2, 0), listOf(3), listOf(1)), extended.leaves.map { it.data.toList() })
+        }
+    }
+
+    @Test
+    fun `protobuf derives paths from bucket positions in legacy rootless messages`() {
+        val encoded = hashTrie {
+            logLimit = 8
+            pageLimit = 32
+            rootNode = hashTrieNode {
+                branch = branch {
+                    children.addAll(listOf(
+                        hashTrieNode {},
+                        hashTrieNode { leaf = leaf { data.add(0) } },
+                        hashTrieNode {},
+                        hashTrieNode {},
+                    ))
+                }
+            }
+        }.toByteArray()
+
+        val restored = MemoryHashTrie.fromProto(encoded, iidReader)
+        assertEquals(0, restored.rootNode.path.size)
+        assertEquals(byteArrayOf(1).toList(), restored.leaves.single().path.toList())
+        assertEquals(listOf(0), restored.leaves.single().data.toList())
     }
 
     @Test

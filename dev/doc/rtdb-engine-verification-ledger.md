@@ -141,13 +141,13 @@ A proof of a candidate is conditional on the explicitly stated contract and work
 | IDX06 · Bulk insertion equivalence | Partial | [Lean batch regrouping and Rust range, batch, and single insertion checks](rtdb-engine-proof-evidence.md#memory-trie-lookup-and-coverage) · [Verified branch insertion grouping](rtdb-engine-proof-evidence.md#production-live-trie-bucket-grouping) |
 | IDX07 · Structural rewrite equivalence | Partial | [Verified stable row partition for a leaf split](rtdb-engine-proof-evidence.md#production-live-trie-bucket-grouping) · [Verified merge order and multiplicity](rtdb-engine-proof-evidence.md#production-leaf-merge) |
 | IDX08 · Snapshot lifetime | Partial | [Verified row addressing, layout preservation, and native snapshot regression](rtdb-engine-proof-evidence.md#live-row-addresses-across-chunk-layouts) |
-| IDX09 · Serialized correspondence | Open | — |
+| IDX09 · Serialized correspondence | Partial | [Protobuf path round trip and ordered IID candidates](rtdb-engine-proof-evidence.md#protobuf-trie-paths-and-ordered-iid-candidates) |
 
 ## Persistent formats and compatibility
 
 | Target | Status | Recorded evidence |
 | --- | --- | --- |
-| FMT01 · Codec round trips | Partial | [Signed position bounds and production codec checks](rtdb-engine-proof-evidence.md#main-evidence) · [Rust position packing and resume](rtdb-engine-proof-evidence.md#multi-evidence) |
+| FMT01 · Codec round trips | Partial | [Signed position bounds and production codec checks](rtdb-engine-proof-evidence.md#main-evidence) · [Rust position packing and resume](rtdb-engine-proof-evidence.md#multi-evidence) · [Protobuf trie paths](rtdb-engine-proof-evidence.md#protobuf-trie-paths-and-ordered-iid-candidates) |
 | FMT02 · Optional field presence | Open | — |
 | FMT03 · Arrow event fidelity | Open | — |
 | FMT04 · Version dispatch | Open | — |
