@@ -1285,3 +1285,22 @@ The separate `verification/multi/check.sh` run checked 15 Lean modules and 14 TL
 Each TLC case now keeps its copied source, generated trace and state database in its own ignored run directory.
 The clean-checkout pass replayed every Multi configuration with that layout.
 Use `BIJECTION_LOCAL_EXECUTION=owner-authorized TLA2TOOLS_JAR=/path/to/tla2tools.jar LEAN=/path/to/lean bash verification/multi/check.sh` with the pinned Java on the path. link:../multi/check.sh[Multi runner] · link:../README.adoc#_run_the_studies[Combined runner]
+
+=== Ordered index, replica boundary and hosted feature checks
+
+The ordered-index rerun checked eight Lean files on Lean 4.35.0, including the audit of 23 theorem declarations.
+The domain, seek and scope harnesses checked 32 Verus obligations from the included production sources.
+TLC completed all 12 configured cases, including five expected counterexamples and both retirement liveness cases.
+Its largest checkpoint baseline reached 8,812,741 distinct states through depth 21.
+All of this is evidence for the checked laws, production functions and finite models at their stated boundaries.
+The input manifest SHA-256 is `6d18b661012e0d8075e62bd3aba5fa7934dc5c3011dc15a511f9214cbf7f1d84`. link:../ordered-index/README.md#execution[Ordered-index runner instructions]
+
+The production replica admission boundary compiled on `9137e04f2`.
+The compiler rejected a caller forging the admission token with `E0423` and a caller passing an unadmitted record with `E0308`, both in the expected driver source.
+The clean driver SHA-256 is `5c41bafacc1f05e14cd6c053041d95ad3f0e5e2ae1c901937a2983bc1711f273`.
+This is the same boundary case as the combined runner's `--rust-boundary` option.
+
+The 21 supplemental query scan tests passed.
+The consolidated code also passed a local compile check of the Multi binary with its DynamoDB feature enabled.
+From `rust/`, run `BIJECTION_LOCAL_EXECUTION=owner-authorized cargo check --offline --locked -p rtdb-multi --features dynamodb --bin rtdb-multi`.
+S3 provider behavior, full query-snapshot retention across serving nodes and hosted reference publication retain their separate evidence obligations.
