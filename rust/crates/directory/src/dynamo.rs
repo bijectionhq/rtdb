@@ -13,7 +13,7 @@ use async_trait::async_trait;
 use aws_sdk_dynamodb::Client;
 use aws_sdk_dynamodb::error::{DisplayErrorContext, ProvideErrorMetadata, SdkError};
 use aws_sdk_dynamodb::types::{
-    AttributeDefinition, AttributeValue, BillingMode, GlobalSecondaryIndex, IndexStatus, KeySchemaElement, KeyType, Projection, ProjectionType, Put,
+    AttributeDefinition, AttributeValue, BillingMode, ConditionCheck, GlobalSecondaryIndex, IndexStatus, KeySchemaElement, KeyType, Projection, ProjectionType, Put,
     ReturnValuesOnConditionCheckFailure, ScalarAttributeType, StreamSpecification, StreamViewType, TableStatus, TransactWriteItem,
 };
 use aws_sdk_dynamodbstreams::Client as StreamsClient;
@@ -22,7 +22,7 @@ use rtdb_types::{Anomaly, AnomalyCategory, Result};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 
-use crate::{exists, Cas, ChangeFeed, DeploymentRecord, Directory, MemberId, MemberRecord, Version};
+use crate::{check_fork_parent, exists, fork_conflict, fork_parent_id, Cas, ChangeFeed, DeploymentRecord, Directory, MemberId, MemberRecord, Version};
 
 mod streams;
 
@@ -281,20 +281,22 @@ fn member_item(record: &MemberRecord) -> Result<Item> {
     ]))
 }
 
-#[async_trait]
-impl Directory for DynamoDirectory {
-    async fn create_deployment(&self, mut record: DeploymentRecord) -> Result<DeploymentRecord> {
+impl DynamoDirectory {
+    async fn insert_deployment(&self, mut record: DeploymentRecord, parent: Option<ConditionCheck>) -> Result<DeploymentRecord> {
         record.version = 1;
         let deployment = Put::builder().table_name(&self.tables.deployments).set_item(Some(deployment_item(&record)?))
             .condition_expression("attribute_not_exists(#id)").expression_attribute_names("#id", ID).build().map_err(build_fault)?;
         let name_item = Item::from([(NAME.to_owned(), AttributeValue::S(record.name.clone())), (ID.to_owned(), AttributeValue::S(record.id.clone()))]);
         let name = Put::builder().table_name(&self.tables.deployment_names).set_item(Some(name_item))
             .condition_expression("attribute_not_exists(#n)").expression_attribute_names("#n", NAME).build().map_err(build_fault)?;
-        let written = self.client.transact_write_items()
+        let transaction = self.client.transact_write_items()
             .transact_items(TransactWriteItem::builder().put(deployment).build())
-            .transact_items(TransactWriteItem::builder().put(name).build())
-            .send().await;
-        match written {
+            .transact_items(TransactWriteItem::builder().put(name).build());
+        let transaction = match parent {
+            Some(parent) => transaction.transact_items(TransactWriteItem::builder().condition_check(parent).build()),
+            None => transaction,
+        };
+        match transaction.send().await {
             Ok(_) => Ok(record),
             Err(error) => {
                 let refused = |index: usize, reasons: &[aws_sdk_dynamodb::types::CancellationReason]| reasons.get(index).and_then(|reason| reason.code()) == Some("ConditionalCheckFailed");
@@ -302,10 +304,31 @@ impl Directory for DynamoDirectory {
                     let reasons = cancelled.cancellation_reasons();
                     if refused(0, reasons) { return Err(exists("Deployment", &record.id)); }
                     if refused(1, reasons) { return Err(exists("Deployment name", &record.name)); }
+                    if refused(2, reasons) { return Err(fork_conflict()); }
                 }
                 Err(sdk_anomaly("TransactWriteItems", error))
             }
         }
+    }
+}
+
+#[async_trait]
+impl Directory for DynamoDirectory {
+    async fn create_deployment(&self, record: DeploymentRecord) -> Result<DeploymentRecord> {
+        self.insert_deployment(record, None).await
+    }
+
+    async fn create_fork(&self, child: DeploymentRecord, expected_parent: Version) -> Result<DeploymentRecord> {
+        let id = fork_parent_id(&child)?;
+        let parent = self.deployment(id).await?;
+        check_fork_parent(&child, parent.as_ref(), expected_parent)?;
+        let condition = ConditionCheck::builder().table_name(&self.tables.deployments)
+            .key(ID, AttributeValue::S(id.to_owned()))
+            .condition_expression("#v = :expected")
+            .expression_attribute_names("#v", VERSION)
+            .expression_attribute_values(":expected", number(expected_parent))
+            .build().map_err(build_fault)?;
+        self.insert_deployment(child, Some(condition)).await
     }
 
     async fn deployment(&self, id: &str) -> Result<Option<DeploymentRecord>> {

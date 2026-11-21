@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use rtdb_directory::{Cas, DeploymentRecord, Directory, Lifecycle, MemberId, MemberRecord, MemberRole, MemberState, effective_holder, now_ms};
 use rtdb_logkeeper::StreamConfig;
-use rtdb_storage::log::LogOffset;
+use rtdb_storage::log::{Log, LogOffset};
 use rtdb_types::{Anomaly, AnomalyCategory, Result};
 use tokio_util::sync::CancellationToken;
 
@@ -133,28 +133,38 @@ pub async fn unquarantine(directory: &dyn Directory, name: &str) -> Result<Deplo
     update(directory, name, |record| { if record.lifecycle == Lifecycle::Quarantined { record.lifecycle = Lifecycle::Live; } record.activation_crashes = 0; Ok(()) }).await
 }
 
-/// Forks `parent` into a new deployment `name` of the same lineage: the parent is flushed so its whole state is in blocks, its objects are copied under the child's prefix, and the child starts on fresh logs in the next log epoch.
+async fn fork_source(directory: &dyn Directory, parent: &str) -> Result<DeploymentRecord> {
+    let source = record(directory, parent).await?;
+    if !source.can_fork() {
+        return Err(Anomaly::new(AnomalyCategory::Conflict, "rtdb.multi/fork-unavailable", format!("{parent} cannot be forked in its current state")));
+    }
+    Ok(source)
+}
+
+/// Forks `parent` into a new deployment in its lineage.
+/// The parent is flushed, and the child references its objects and starts on fresh logs.
 pub async fn fork(directory: &dyn Directory, storage: &CellStorage, keys: &dyn KeyService, parent: &str, name: &str, control: &ControlKey) -> Result<DeploymentRecord> {
     let holder = ensure_held(directory, parent, control).await?;
     let members = members(directory).await?;
     expect(&control_address(&members, &holder)?, Request::Flush { name: parent.to_owned() }, control).await?;
-    fork_from(directory, storage, keys, parent, name, None).await
+    let source = fork_source(directory, parent).await?;
+    fork_with_tail(directory, storage, keys, &source, name, None, Vec::new(), 4 << 20).await
 }
 
 /// Forks `parent` as of one of its past blocks: the fork's state is that block's, and what the parent wrote after it is not the fork's.
 /// Only a block younger than the reaper's `grace` can be forked from: an object it needs that the parent released since is erased only once the grace has passed.
 pub async fn fork_at_block(directory: &dyn Directory, storage: &CellStorage, keys: &dyn KeyService, parent: &str, name: &str, block: i64, grace: std::time::Duration) -> Result<DeploymentRecord> {
-    let source = record(directory, parent).await?;
+    let source = fork_source(directory, parent).await?;
     let bucket = storage.bucket(rtdb_storage::IoRegion::new()).await?;
     let age = now_ms() - crate::reference::written_at_ms(bucket.as_ref(), &source.storage_prefix(), block).await?;
     if age >= grace.as_millis() as i64 { return Err(Anomaly::incorrect("rtdb.multi/block-too-old", format!("Block {block} was written {}s ago, beyond the reaper's grace of {}s", age / 1000, grace.as_secs()))); }
-    fork_from(directory, storage, keys, parent, name, Some(block)).await
+    fork_with_tail(directory, storage, keys, &source, name, Some(block), Vec::new(), 4 << 20).await
 }
 
 /// Forks `parent` as of a system time at or after its checkpoint: the fork starts from the checkpoint's block, with the parent's transactions after it up to `system_time` copied into its own stream.
 /// A time before the checkpoint is a past block's, which `fork_at_block` forks from.
 pub async fn fork_at_time(directory: &dyn Directory, storage: &CellStorage, keys: &dyn KeyService, parent: &str, name: &str, system_time: rtdb_types::Timestamp, grace: std::time::Duration, maximum_message_bytes: usize) -> Result<DeploymentRecord> {
-    let source = record(directory, parent).await?;
+    let source = fork_source(directory, parent).await?;
     let checkpoint = source.checkpoint.ok_or_else(|| Anomaly::incorrect("rtdb.multi/no-checkpoint", format!("{parent} has published no block to fork from")))?;
     if system_time.0 < checkpoint.system_time { return Err(Anomaly::incorrect("rtdb.multi/before-checkpoint", format!("{parent}'s last published block is after that time: fork at a past block instead"))); }
     let bucket = storage.bucket(rtdb_storage::IoRegion::new()).await?;
@@ -164,40 +174,103 @@ pub async fn fork_at_time(directory: &dyn Directory, storage: &CellStorage, keys
     let members = members(directory).await?;
     let servers: Vec<String> = source.ensemble.iter().filter_map(|id| members.get(id).map(|member| member.address.clone())).collect();
     let stream = StreamConfig { write_quorum: write_quorum(servers.len()), servers, stream: source.stream("replica"), maximum_message_bytes };
-    let reader = crate::logs::SealedLog::new(rtdb_logkeeper::open_reader(stream.clone(), tokio_util::sync::CancellationToken::new()).await?, &keys.key(&source.id)?, &stream.stream)?;
+    let reader = crate::logs::SealedLog::new(rtdb_logkeeper::open_reader(stream.clone(), CancellationToken::new()).await?, &keys.existing(&source.id)?, &stream.stream)?;
     let tail = crate::logs::transactions_until(&reader, checkpoint.boundary, system_time).await?;
-    fork_with_tail(directory, storage, keys, parent, name, Some(checkpoint.block), tail, maximum_message_bytes).await
+    fork_with_tail(directory, storage, keys, &source, name, Some(checkpoint.block), tail, maximum_message_bytes).await
 }
 
-async fn fork_from(directory: &dyn Directory, storage: &CellStorage, keys: &dyn KeyService, parent: &str, name: &str, at_block: Option<i64>) -> Result<DeploymentRecord> {
-    fork_with_tail(directory, storage, keys, parent, name, at_block, Vec::new(), 4 << 20).await
-}
-
-async fn fork_with_tail(directory: &dyn Directory, storage: &CellStorage, keys: &dyn KeyService, parent: &str, name: &str, at_block: Option<i64>, mut tail: Vec<rtdb_format::envelope::ReplicaEnvelope>, maximum_message_bytes: usize) -> Result<DeploymentRecord> {
-    let source = record(directory, parent).await?;
+async fn fork_with_tail(directory: &dyn Directory, storage: &CellStorage, keys: &dyn KeyService, source: &DeploymentRecord, name: &str, at_block: Option<i64>, mut tail: Vec<rtdb_format::envelope::ReplicaEnvelope>, maximum_message_bytes: usize) -> Result<DeploymentRecord> {
     let mut child = DeploymentRecord::new(name, source.org.clone(), Vec::new(), now_ms());
     child.lineage = source.lineage.clone();
     child.parent = Some(source.id.clone());
     child.log_epoch = source.log_epoch + 1;
     // The parent's checkpoint names positions in the parent's logs, not the fork's: the fork's first holder finds its block by listing, and publishes the fork's own.
     child.ensemble = choose_ensemble(directory, &child, source.ensemble.len()).await?;
-    crate::reference::fork(storage.bucket(rtdb_storage::IoRegion::new()).await?.as_ref(), &source.storage_prefix(), &child.storage_prefix(), at_block).await?;
-    keys.copy(&source.id, &child.id)?;
-    if !tail.is_empty() {
-        // The tail is written at the first writer epoch, so the fork's first holder claims the next and seals it.
+    let key = keys.existing(&source.id)?;
+    let child_stream = if tail.is_empty() {
+        None
+    } else {
+        // The first holder claims the next epoch and seals the fork's tail.
         child.epoch = 1;
         crate::logs::renumber_into(&mut tail, rtdb_types::StorageEpoch(child.log_epoch))?;
-        // Written before the fork is recorded, so no holder can open it until its stream holds the tail.
         let members = members(directory).await?;
-        let servers: Vec<String> = child.ensemble.iter().filter_map(|id| members.get(id).map(|member| member.address.clone())).collect();
-        let stream = StreamConfig { write_quorum: write_quorum(servers.len()), servers, stream: child.stream("replica"), maximum_message_bytes };
-        let writer = crate::logs::SealedLog::new(rtdb_logkeeper::open_writer(stream.clone(), child.epoch, tokio_util::sync::CancellationToken::new()).await?, &keys.key(&child.id)?, &stream.stream)?;
-        use rtdb_storage::log::Log;
-        for envelope in tail { writer.enqueue(bytes::Bytes::from(envelope.encode()), rtdb_types::Timestamp(now_ms() * 1000)).await?.durable().await?; }
+        let servers: Vec<String> = child.ensemble.iter().map(|id| {
+            members.get(id).map(|member| member.address.clone())
+                .ok_or_else(|| Anomaly::fault("rtdb.multi/unknown-logkeeper", format!("Logkeeper {id} is not a member")))
+        }).collect::<Result<_>>()?;
+        Some(StreamConfig { write_quorum: write_quorum(servers.len()), servers, stream: child.stream("replica"), maximum_message_bytes })
+    };
+    let bucket = storage.bucket(rtdb_storage::IoRegion::new()).await?;
+    let prepared = async {
+        crate::reference::fork(bucket.as_ref(), &source.storage_prefix(), &child.storage_prefix(), at_block).await?;
+        keys.install(&child.id, key)?;
+        if let Some(stream) = &child_stream {
+            let writer = rtdb_logkeeper::open_writer(stream.clone(), child.epoch, CancellationToken::new()).await?;
+            let writer = crate::logs::SealedLog::new(writer, &key, &stream.stream)?;
+            for envelope in tail {
+                writer.enqueue(bytes::Bytes::from(envelope.encode()), rtdb_types::Timestamp(now_ms() * 1000)).await?.durable().await?;
+            }
+        }
+        Ok(())
+    }.await;
+    let published = match prepared {
+        Ok(()) => publish_fork(directory, source, &child).await,
+        Err(error) => Err(ForkPublicationError::Rejected(error)),
+    };
+    match published {
+        Ok(stored) => Ok(stored),
+        Err(ForkPublicationError::Uncertain(error)) => Err(error),
+        Err(ForkPublicationError::Rejected(error)) => {
+            if let Err(cleanup) = discard_fork(bucket.as_ref(), keys, &child, child_stream.as_ref()).await {
+                eprintln!("RTDB fork cleanup failed for {}: {cleanup}", child.id);
+            }
+            Err(error)
+        }
     }
-    directory.create_deployment(child).await
 }
 
+enum ForkPublicationError { Rejected(Anomaly), Uncertain(Anomaly) }
+
+async fn publish_fork(directory: &dyn Directory, source: &DeploymentRecord, child: &DeploymentRecord) -> std::result::Result<DeploymentRecord, ForkPublicationError> {
+    for _ in 0..8 {
+        let current = directory.deployment(&source.id).await.map_err(ForkPublicationError::Rejected)?
+            .filter(|current| current.can_fork() && current.epoch == source.epoch
+                && current.log_epoch == source.log_epoch && current.storage_prefix() == source.storage_prefix())
+            .ok_or_else(|| ForkPublicationError::Rejected(Anomaly::new(AnomalyCategory::Conflict, "rtdb.multi/fork-unavailable", format!("{} changed while the fork was prepared", source.name))))?;
+        match directory.create_fork(child.clone(), current.version).await {
+            Ok(stored) => return Ok(stored),
+            Err(error) if error.code == "rtdb.directory/fork-parent-changed" => continue,
+            Err(error) => {
+                // Once the write is sent, a transport failure can hide successful publication.
+                match directory.deployment(&child.id).await {
+                    Ok(Some(stored)) if stored.parent == child.parent && stored.name == child.name => return Ok(stored),
+                    Ok(None) if error.code == "rtdb.directory/exists" => return Err(ForkPublicationError::Rejected(error)),
+                    _ => return Err(ForkPublicationError::Uncertain(error)),
+                }
+            }
+        }
+    }
+    Err(ForkPublicationError::Rejected(Anomaly::new(AnomalyCategory::Conflict, "rtdb.multi/update-contended", format!("{} kept changing while its fork was published", source.name))))
+}
+
+async fn discard_fork(bucket: &dyn rtdb_storage::ObjectStore, keys: &dyn KeyService, child: &DeploymentRecord, stream: Option<&StreamConfig>) -> Result<()> {
+    let key_removed = keys.destroy(&child.id);
+    let erase_objects = async {
+        if !crate::reference::erase_deployment(bucket, &child.storage_prefix(), &[]).await? {
+            return Err(Anomaly::fault("rtdb.multi/fork-cleanup", format!("Storage still contains staged objects for {}", child.id)));
+        }
+        Ok(())
+    };
+    let erase_tail = async {
+        if let Some(stream) = stream {
+            let last = rtdb_logkeeper::seal(stream, child.epoch + 1).await?;
+            if last.0 >= 0 { rtdb_logkeeper::trim(stream, last).await?; }
+        }
+        Ok(())
+    };
+    let (objects_removed, tail_removed) = tokio::join!(erase_objects, erase_tail);
+    key_removed.and(objects_removed).and(tail_removed)
+}
 
 /// One cell, as cell administration reaches it.
 pub struct CellHandle<'a> { pub name: &'a str, pub directory: &'a dyn Directory, pub storage: &'a CellStorage, pub keys: &'a dyn KeyService, pub maximum_deployments: usize }
@@ -282,29 +355,52 @@ pub async fn move_cell(map: &dyn crate::cells::CellMap, from: &CellHandle<'_>, t
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct DeletionRecord { pub deployment: String, pub name: String, pub key_destroyed_at_ms: i64, pub objects_erased_at_ms: i64, pub verified_empty: bool }
 
-/// Fences every writer, seals and trims the deployment's stream, destroys its key, erases its objects and proves its prefix empty.
+/// Fences every writer, seals and trims the deployment's stream, erases its objects, and removes its key after verifying the prefix is empty.
 pub async fn delete_deployment(directory: &dyn Directory, storage: &CellStorage, keys: &dyn KeyService, name: &str, maximum_message_bytes: usize) -> Result<DeletionRecord> {
     let fenced = update(directory, name, |record| {
-        if matches!(record.lifecycle, Lifecycle::Deleted) { return Err(Anomaly::incorrect("rtdb.multi/deleted", format!("{name} is already deleted"))); }
-        record.lifecycle = Lifecycle::Deleting;
-        record.epoch += 1;
-        record.holder = None;
-        Ok(())
+        match record.lifecycle {
+            Lifecycle::Live | Lifecycle::Quarantined => {
+                record.lifecycle = Lifecycle::Deleting;
+                record.epoch += 1;
+                record.holder = None;
+                Ok(())
+            }
+            Lifecycle::Deleting => Ok(()),
+            Lifecycle::Moving => Err(Anomaly::new(AnomalyCategory::Conflict, "rtdb.multi/move-in-progress", format!("{name} is moving between cells"))),
+            Lifecycle::Deleted => Err(Anomaly::incorrect("rtdb.multi/deleted", format!("{name} is already deleted"))),
+        }
     }).await?;
     let members = members(directory).await?;
     let servers: Vec<String> = fenced.ensemble.iter().filter_map(|id| members.get(id).map(|member| member.address.clone())).collect();
     let stream = StreamConfig { write_quorum: write_quorum(servers.len()), servers, stream: fenced.stream("replica"), maximum_message_bytes };
     let last = rtdb_logkeeper::seal(&stream, fenced.epoch).await?;
     if last.0 >= 0 { rtdb_logkeeper::trim(&stream, LogOffset(last.0)).await?; }
-    keys.destroy(&fenced.id)?;
-    let key_destroyed_at_ms = now_ms();
     let bucket = storage.bucket(rtdb_storage::IoRegion::new()).await?;
-    // Its forks keep what they share with it: those objects are copied into them before it goes.
     let others: Vec<DeploymentRecord> = directory.deployments().await?.into_iter().filter(|record| record.id != fenced.id).collect();
-    let verified_empty = crate::reference::erase_deployment(bucket.as_ref(), &fenced.storage_prefix(), &others).await?;
-    let deletion = DeletionRecord { deployment: fenced.id.clone(), name: name.to_owned(), key_destroyed_at_ms, objects_erased_at_ms: now_ms(), verified_empty };
-    update(directory, name, |record| { record.lifecycle = Lifecycle::Deleted; Ok(()) }).await?;
+    let deletion = finish_deletion(bucket.as_ref(), &fenced, &others, keys).await?;
+    update(directory, name, |record| {
+        if record.id != fenced.id || record.epoch != fenced.epoch || record.lifecycle != Lifecycle::Deleting {
+            return Err(Anomaly::new(AnomalyCategory::Conflict, "rtdb.multi/deletion-changed", format!("The deletion of {name} changed before it could be recorded")));
+        }
+        record.lifecycle = Lifecycle::Deleted;
+        Ok(())
+    }).await?;
     Ok(deletion)
+}
+
+async fn finish_deletion(bucket: &dyn rtdb_storage::ObjectStore, deployment: &DeploymentRecord, others: &[DeploymentRecord], keys: &dyn KeyService) -> Result<DeletionRecord> {
+    if !crate::reference::erase_deployment(bucket, &deployment.storage_prefix(), others).await? {
+        return Err(Anomaly::new(AnomalyCategory::Unavailable, "rtdb.multi/deletion-incomplete", format!("Storage still contains objects for {}", deployment.name)));
+    }
+    let objects_erased_at_ms = now_ms();
+    keys.destroy(&deployment.id)?;
+    Ok(DeletionRecord {
+        deployment: deployment.id.clone(),
+        name: deployment.name.clone(),
+        key_destroyed_at_ms: now_ms(),
+        objects_erased_at_ms,
+        verified_empty: true,
+    })
 }
 
 /// What auditing a deployment's history found (`NoTwoWritersHaveEffect`, `SystemTimeRises`).
@@ -314,7 +410,6 @@ pub struct AuditReport { pub records: usize, pub transactions: usize, pub highes
 /// Reads a deployment's whole replica stream through its logkeepers, decrypts it, and checks that it is one history: dense positions, terms that never go back, transaction ids, system times and source positions that strictly rise.
 pub async fn audit(directory: &dyn Directory, keys: &dyn KeyService, name: &str, maximum_message_bytes: usize) -> Result<AuditReport> {
     use rtdb_format::envelope::{ReplicaBody, ReplicaEnvelope};
-    use rtdb_storage::log::Log;
     let current = record(directory, name).await?;
     let members = members(directory).await?;
     let servers: Vec<String> = current.ensemble.iter().filter_map(|id| members.get(id).map(|member| member.address.clone())).collect();
@@ -470,3 +565,100 @@ pub async fn cell_status(directory: &dyn Directory, target_per_node: usize) -> R
     })
 }
 
+#[cfg(test)]
+mod tests {
+    use std::ops::Range;
+    use std::path::Path;
+
+    use async_trait::async_trait;
+    use bytes::Bytes;
+    use rtdb_directory::MemoryDirectory;
+    use rtdb_storage::{MemoryStore, ObjectKey, ObjectStore, object_store::StoredObject};
+
+    use super::{CellStorage, DeploymentRecord, Directory, KeyService, Lifecycle, delete_deployment, finish_deletion};
+    use crate::keys::LocalKeyService;
+
+    struct RetainingStore<'a>(&'a MemoryStore);
+
+    #[async_trait]
+    impl ObjectStore for RetainingStore<'_> {
+        async fn head(&self, key: &ObjectKey) -> rtdb_storage::Result<StoredObject> { self.0.head(key).await }
+        async fn get(&self, key: &ObjectKey) -> rtdb_storage::Result<Bytes> { self.0.get(key).await }
+        async fn get_range(&self, key: &ObjectKey, range: Range<u64>) -> rtdb_storage::Result<Bytes> { self.0.get_range(key, range).await }
+        async fn put(&self, key: &ObjectKey, bytes: Bytes) -> rtdb_storage::Result<()> { self.0.put(key, bytes).await }
+        async fn put_file(&self, key: &ObjectKey, source: &Path) -> rtdb_storage::Result<()> { self.0.put_file(key, source).await }
+        async fn list(&self, directory: Option<&ObjectKey>) -> rtdb_storage::Result<Vec<StoredObject>> { self.0.list(directory).await }
+        async fn delete(&self, _: &ObjectKey) -> rtdb_storage::Result<()> { Ok(()) }
+    }
+
+    #[tokio::test]
+    async fn deletion_can_retry_and_keeps_the_key_if_the_prefix_is_still_populated() {
+        let data = tempfile::tempdir().unwrap();
+        let keys = LocalKeyService::new(data.path()).unwrap();
+        let mut deployment = DeploymentRecord::new("shop", "acme", vec![], 0);
+        deployment.lifecycle = Lifecycle::Deleting;
+        let key = keys.key(&deployment.id).unwrap();
+        let bucket = MemoryStore::default();
+        let object = ObjectKey::new(format!("{}/v06/rows", deployment.storage_prefix())).unwrap();
+        bucket.put(&object, Bytes::from_static(b"data")).await.unwrap();
+
+        let error = finish_deletion(&RetainingStore(&bucket), &deployment, &[], &keys).await.unwrap_err();
+        assert_eq!(error.code, "rtdb.multi/deletion-incomplete");
+        assert_eq!(keys.key(&deployment.id).unwrap(), key);
+
+        let proof = finish_deletion(&bucket, &deployment, &[], &keys).await.unwrap();
+        assert!(proof.verified_empty);
+        assert!(bucket.list(None).await.unwrap().is_empty());
+        assert!(!data.path().join(format!("{}.key", deployment.id)).exists());
+    }
+
+    #[tokio::test]
+    async fn a_fork_survives_a_parent_record_update_but_discards_its_prepared_state_after_a_fence() {
+        let directory = MemoryDirectory::new();
+        let data = tempfile::tempdir().unwrap();
+        let key_dir = data.path().join("keys");
+        let keys = LocalKeyService::new(&key_dir).unwrap();
+        let storage = CellStorage::Local { root: data.path().join("objects") };
+        let bucket = storage.bucket(rtdb_storage::IoRegion::new()).await.unwrap();
+        let source = directory.create_deployment(DeploymentRecord::new("shop", "acme", vec![], 0)).await.unwrap();
+        let key = keys.key(&source.id).unwrap();
+        let object = ObjectKey::new(format!("{}/v06/rows", source.storage_prefix())).unwrap();
+        bucket.put(&object, Bytes::from_static(b"data")).await.unwrap();
+
+        let mut updated = source.clone();
+        updated.read_width = 2;
+        let updated = directory.replace_deployment(updated, source.version).await.unwrap().applied().unwrap();
+        let child = super::fork_with_tail(directory.as_ref(), &storage, &keys, &source, "child", None, Vec::new(), 4 << 20).await.unwrap();
+        assert_eq!(keys.existing(&child.id).unwrap(), key);
+        let before = bucket.list(None).await.unwrap().into_iter().map(|item| item.key).collect::<Vec<_>>();
+
+        let mut deleting = updated.clone();
+        deleting.lifecycle = Lifecycle::Deleting;
+        deleting.epoch += 1;
+        directory.replace_deployment(deleting, updated.version).await.unwrap().applied().unwrap();
+        let error = super::fork_with_tail(directory.as_ref(), &storage, &keys, &updated, "refused", None, Vec::new(), 4 << 20).await.unwrap_err();
+        assert_eq!(error.code, "rtdb.multi/fork-unavailable");
+        assert!(directory.deployment_by_name("refused").await.unwrap().is_none());
+        let after = bucket.list(None).await.unwrap().into_iter().map(|item| item.key).collect::<Vec<_>>();
+        assert_eq!(after, before);
+        assert_eq!(std::fs::read_dir(key_dir).unwrap().count(), 2);
+    }
+
+    #[tokio::test]
+    async fn deletion_cannot_claim_a_deployment_while_a_cell_move_owns_it() {
+        let directory = MemoryDirectory::new();
+        let data = tempfile::tempdir().unwrap();
+        let keys = LocalKeyService::new(data.path().join("keys")).unwrap();
+        let mut deployment = DeploymentRecord::new("shop", "acme", vec![], 0);
+        deployment.lifecycle = Lifecycle::Moving;
+        deployment.epoch = 2;
+        let deployment = directory.create_deployment(deployment).await.unwrap();
+        let key = keys.key(&deployment.id).unwrap();
+        let storage = CellStorage::Local { root: data.path().join("objects") };
+
+        let error = delete_deployment(directory.as_ref(), &storage, &keys, "shop", 4 << 20).await.unwrap_err();
+        assert_eq!(error.code, "rtdb.multi/move-in-progress");
+        assert_eq!(directory.deployment(&deployment.id).await.unwrap().as_ref(), Some(&deployment));
+        assert_eq!(keys.key(&deployment.id).unwrap(), key);
+    }
+}

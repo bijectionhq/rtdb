@@ -13,8 +13,8 @@ pub trait KeyService: Send + Sync {
     fn namespace_id(&self) -> Result<[u8; KEY_BYTES]>;
     /// The deployment's key, created on first use.
     fn key(&self, deployment: &str) -> Result<[u8; KEY_BYTES]>;
-    /// Gives `to` the key `from` has, for a fork whose objects are copies of its parent's.
-    fn copy(&self, from: &str, to: &str) -> Result<()>;
+    /// Reads the deployment's existing key without allocating one.
+    fn existing(&self, deployment: &str) -> Result<[u8; KEY_BYTES]>;
     /// Removes this service's copy of the deployment key.
     fn destroy(&self, deployment: &str) -> Result<()>;
     /// Checks whether an incoming key could be installed without replacing a different key.
@@ -70,7 +70,10 @@ impl KeyService for LocalKeyService {
 
     fn key(&self, deployment: &str) -> Result<[u8; KEY_BYTES]> { self.get_or_create(&self.path(deployment)) }
 
-    fn copy(&self, from: &str, to: &str) -> Result<()> { self.install(to, self.key(from)?) }
+    fn existing(&self, deployment: &str) -> Result<[u8; KEY_BYTES]> {
+        let path = self.path(deployment);
+        read_key(&path, std::fs::read(&path).map_err(io)?)
+    }
 
     fn validate_install(&self, deployment: &str, key: &[u8; KEY_BYTES]) -> Result<()> {
         let path = self.path(deployment);
@@ -122,8 +125,10 @@ mod tests {
         let keys = LocalKeyService::new(directory.path()).unwrap();
         let key = keys.key("a").unwrap();
         assert_eq!(keys.key("a").unwrap(), key);
-        keys.copy("a", "b").unwrap();
+        keys.install("b", keys.existing("a").unwrap()).unwrap();
         keys.destroy("a").unwrap();
+        assert!(keys.existing("a").is_err());
+        assert!(!keys.path("a").exists());
         assert_ne!(keys.key("a").unwrap(), key, "a destroyed key is never recovered");
         assert_eq!(keys.key("b").unwrap(), key, "a fork's copy survives its parent's deletion");
     }

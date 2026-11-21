@@ -3,7 +3,7 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use crate::{claim, now_ms, park, Cas, DeploymentRecord, Directory, MemberId, MemberRecord, MemberRole, MemberState};
+use crate::{claim, now_ms, park, Cas, DeploymentRecord, Directory, Lifecycle, MemberId, MemberRecord, MemberRole, MemberState};
 
 /// Panics on the first violation.
 /// Uses fresh ids and names, so it can run against a shared, non-empty directory.
@@ -32,6 +32,30 @@ pub async fn run(directory: &dyn Directory) {
     let mut renamed = applied.clone();
     renamed.name = format!("{name}-renamed");
     assert!(directory.replace_deployment(renamed, applied.version).await.is_err(), "a deployment's name never changes");
+
+    let mut child = DeploymentRecord::new(format!("{name}-child"), &applied.org, vec![], 0);
+    child.parent = Some(applied.id.clone());
+    child.lineage = applied.lineage.clone();
+    let error = directory.create_fork(child.clone(), created.version).await.unwrap_err();
+    assert_eq!(error.code, "rtdb.directory/fork-parent-changed");
+    assert!(directory.deployment(&child.id).await.unwrap().is_none());
+    assert!(directory.deployment_by_name(&child.name).await.unwrap().is_none());
+    let child = directory.create_fork(child, applied.version).await.unwrap();
+    assert_eq!(directory.deployment_by_name(&child.name).await.unwrap().as_ref(), Some(&child));
+
+    let mut deleting = applied.clone();
+    deleting.lifecycle = Lifecycle::Deleting;
+    deleting.holder = None;
+    deleting.epoch += 1;
+    let deleting = directory.replace_deployment(deleting, applied.version).await.unwrap().applied().unwrap();
+    let mut refused = DeploymentRecord::new(format!("{name}-refused"), &deleting.org, vec![], 0);
+    refused.parent = Some(deleting.id.clone());
+    refused.lineage = deleting.lineage.clone();
+    for version in [applied.version, deleting.version] {
+        assert_eq!(directory.create_fork(refused.clone(), version).await.unwrap_err().code, "rtdb.directory/fork-parent-changed");
+        assert!(directory.deployment(&refused.id).await.unwrap().is_none());
+        assert!(directory.deployment_by_name(&refused.name).await.unwrap().is_none());
+    }
 
     let member = MemberRecord { id: MemberId(format!("member-{suffix}")), role: MemberRole::Node, address: "127.0.0.1:1".into(), control_address: Some("127.0.0.1:2".into()),
         availability_zone: "a".into(), engine_version: "0".into(), lease_expires_at_ms: 10, state: MemberState::Joining, pool: Default::default(), version: 0 };

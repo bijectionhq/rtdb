@@ -1607,9 +1607,11 @@ rule RefineKeyForLargeDeployments {
 rule Fork {
     -- A fork within an organisation is a new deployment in the parent's lineage.
     -- Its first manifest references the parent's objects at the fork basis, plus one pack holding the parent's tail up to that basis.
+    -- Child publication checks that the parent is still eligible for forks in the writer epoch and storage generation used to prepare the child.
     when: ForkRequested(parent, basis, org)
 
     requires: org = parent.org
+              and parent.lifecycle in {live, quarantined}
 
     ensures:
         let child = DeploymentId.created()
@@ -1686,6 +1688,7 @@ rule TransferSharedObjects {
 }
 
 rule EraseAndProve {
+    -- If the inventory still contains objects, the deployment remains deleting and can retry with the same epoch.
     when: SharedObjectsTransferred(record)
 
     ensures:
