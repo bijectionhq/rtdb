@@ -210,3 +210,12 @@ The final test accepts that exact injected error as an interruption and still ch
 
 These are local provider observations and a bounded model of checkpoint publication under the stated retention and durability assumptions.
 The referenced-trie closure across concurrent compaction and GC, and behavior on remote storage, remain separate obligations.
+
+== Azure pending copy counterexample
+
+The checkpoint model that waits for copy completion holds in all 155 reachable states.
+Treating copy acceptance as completion publishes a root without its data object in six transitions.
+The offline Azure diagnostic passed through the production adapter at `6f0094f47`, with a provider returning `202 Accepted` and `x-ms-copy-status: pending`.
+The adapter returned success from file publication and deleted the copy source.
+The fixture observed the premature success on loopback.
+Live Azure behavior under load, completion handling and cleanup of interrupted remote copies remain open.

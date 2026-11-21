@@ -110,6 +110,7 @@ The same option runs the local checkpoint interruption and manifest-recovery tes
 * `tla/ReadBack.tla` separates append, record delivery, apply, and acknowledgement across a crash and restart.
 * `tla/Checkpoint.tla` separates durable object publication, lost replies, listing, and log replay across a restart.
   It checks one root and three dependencies with finite failures, including early publication, loss of an acknowledged dependency, and log trimming followed by a listing omission.
+  It compares an acknowledged pending copy with a copy whose completion is checked.
 * `tla/LeaseAdmission.tla` compares validated expiring leases and coordinated pins against age-only collection and stale-follower admission.
 * `alloy/Reclamation.als` independently checks the structural last-reference rule over a finite scope, including one deliberately faulty collector.
 * `smt/rank-bound.smt2` checks the exact-real inequalities behind the binary64 score bound under the normal-rounding model and its two negative controls.
@@ -120,3 +121,8 @@ The same option runs the local checkpoint interruption and manifest-recovery tes
   The call sites, complete temporal resolver, storage adapters and full search equivalence need separate refinement and replay evidence.
 
 The run ledger identifies tool identities, positive cases, bounded negative traces and unresolved obligations.
+
+The Azure diagnostic in `traces/azure_copy_completion_diagnostic.rs` reproduces the early acknowledgement on unmodified production sources through `6f0094f47`.
+Copy it into `rust/crates/azure/tests/` in an isolated checkout of that revision, then run `BIJECTION_LOCAL_EXECUTION=owner-authorized cargo test --locked -p rtdb-azure --test azure_copy_completion_diagnostic` in its `rust/` directory.
+The fixture speaks Azure's HTTP protocol on loopback and exercises the real Azure and remote-storage adapters.
+A passing diagnostic observes the defect described in the ledger.

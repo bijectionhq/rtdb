@@ -27,6 +27,14 @@ Receive(child) ==
     /\ received' = received \cup {child}
     /\ UNCHANGED <<durable, online, logRetained, recovered>>
 
+AcceptCopy ==
+    /\ Mutation \in {"check_copy_completion", "trust_copy_acceptance"}
+    /\ online
+    /\ "data" \notin durable
+    /\ received \cap {"data", "pending-copy"} = {}
+    /\ received' = received \cup {IF Mutation = "trust_copy_acceptance" THEN "data" ELSE "pending-copy"}
+    /\ UNCHANGED <<durable, online, logRetained, recovered>>
+
 PutRoot ==
     /\ online
     /\ Root \notin durable
@@ -65,7 +73,7 @@ TrimLog ==
 Next ==
     \/ \E child \in Children : PutChild(child) \/ LoseChild(child)
     \/ \E object \in Children \cup {Root} : Receive(object)
-    \/ PutRoot \/ Crash \/ TrimLog
+    \/ AcceptCopy \/ PutRoot \/ Crash \/ TrimLog
     \/ \E listedRoot \in BOOLEAN : Recover(listedRoot)
 
 Spec == Init /\ [][Next]_Vars

@@ -190,3 +190,22 @@ A production mutation moves the root ahead of its table blocks and the after-put
 The manifest case also reopens a closed multi-transaction history and checks that a wrong manifest digest is refused.
 The local provider observations and bounded model apply to a single root without concurrent reclamation.
 Remote listing, provider failover and coordinated retention require separate evidence.
+
+=== Provider contracts
+
+The S3 adapter uses conditional creation and conditional multipart completion.
+AWS documents strong read and list consistency for completed operations in the same region.
+The checkpoint protocol composes those single-object operations, and recovery still needs a retained log suffix after the root it selects.
+See link:https://docs.aws.amazon.com/AmazonS3/latest/userguide/Welcome.html#ConsistencyModel[the S3 consistency model] and link:https://docs.aws.amazon.com/AmazonS3/latest/API/API_PutObject.html[conditional PutObject].
+
+The Kafka adapter forces `acks=all` and reads committed records.
+It warns about observed low minimum ISR and unclean election settings.
+Recovery also depends on the broker retaining the required log records and on survival of the acknowledged in-sync state through failover.
+See link:https://kafka.apache.org/44/configuration/topic-configs/[Kafka topic configuration] and link:https://kafka.apache.org/40/design/design/[Kafka's replication design].
+
+The Azure checkpoint path uploads a staged blob and conditionally copies it to its immutable name.
+The pinned `object_store` Azure client returns success from `copy_request` on a successful HTTP response without interpreting `x-ms-copy-status`.
+The protocol allows a successful acceptance response with status `pending`.
+An offline HTTP fixture sent that response to the real adapter and observed a successful file publication and staging deletion before a completed destination existed.
+Accepting the response as proof of a durable child also violates the checkpoint model.
+See link:https://learn.microsoft.com/en-us/rest/api/storageservices/copy-blob[Azure Copy Blob response semantics].
