@@ -531,28 +531,39 @@ async fn restoring_the_current_archive_preserves_the_ordered_tail_and_authority(
     drop(reopened);
 
     let destination = Cell::start(1, None).await;
-    let map = MemoryCellMap::new();
-    assert!(map.assign("shop", "source", None).await.unwrap());
-    let arrived = admin::move_cell(
-        map.as_ref(),
-        &admin::CellHandle {
-            name: "source",
-            directory: &cell.directory,
-            storage: &storage,
-            keys: &cell.keys(),
-            maximum_deployments: 1,
-        },
-        &admin::CellHandle {
-            name: "destination",
-            directory: &destination.directory,
-            storage: &destination.storage(),
-            keys: &destination.keys(),
-            maximum_deployments: 1,
-        },
-        "shop",
-        4 << 20,
-        None,
-    ).await.unwrap();
+    let from = admin::CellHandle {
+        name: "source",
+        directory: &cell.directory,
+        storage: &storage,
+        keys: &cell.keys(),
+        maximum_deployments: 1,
+    };
+    let to = admin::CellHandle {
+        name: "destination",
+        directory: &destination.directory,
+        storage: &destination.storage(),
+        keys: &destination.keys(),
+        maximum_deployments: 1,
+    };
+    let intent = rtdb_directory::CellTransferIntent {
+        operation: Some(uuid::Uuid::new_v4()),
+        authority: id,
+        name: "shop".into(),
+        source: rtdb_directory::CellResidence { cell: "source".into(), org: "acme".into() },
+        destination: rtdb_directory::CellResidence { cell: "destination".into(), org: "acme-destination".into() },
+    };
+    let prepared = admin::prepare_managed_cell_transfer(&from, &to, &intent, 4 << 20, None).await.unwrap();
+    let pending = destination.directory.deployment(&id.to_string()).await.unwrap().unwrap();
+    assert_eq!(pending.lifecycle, Lifecycle::Moving);
+    assert_eq!(pending.org, intent.destination.org);
+    assert!(pending.move_from.is_none());
+    let mut foreign = prepared.clone();
+    foreign.intent.operation = Some(uuid::Uuid::new_v4());
+    assert!(admin::activate_managed_cell_transfer(&from, &to, &foreign).await.is_err());
+    let arrived = admin::activate_managed_cell_transfer(&from, &to, &prepared).await.unwrap();
+    assert_eq!(arrived.lifecycle, Lifecycle::Live);
+    assert_eq!(admin::prepare_managed_cell_transfer(&from, &to, &intent, 4 << 20, None).await.unwrap(), prepared);
+    assert_eq!(admin::activate_managed_cell_transfer(&from, &to, &prepared).await.unwrap(), arrived);
     assert!(arrived.checkpoint_recovery.is_none());
     archive_dir.close().unwrap();
     let moved = connect_eventually(&destination, "shop").await;

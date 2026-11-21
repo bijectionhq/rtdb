@@ -1,7 +1,7 @@
 //! The RTDB multi cell processes.
 
 use std::collections::BTreeMap;
-use std::io::Write;
+use std::io::{Read, Write};
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -26,6 +26,8 @@ Usage: rtdb-multi --build-info\n\
                           [--disposal-token-file FILE]\n\
        rtdb-multi cell-map --listen ADDR\n\
        rtdb-multi move-cell --cell-map ADDR --name NAME --from CELL --from-directory DIR --from-storage-root PATH --from-keys PATH --to CELL --to-directory DIR --to-storage-root PATH --to-keys PATH [--ecs-cluster ARN]\n\
+       rtdb-multi prepare-cell-transfer --transfer FILE --from CELL --from-directory DIR --from-storage-root PATH --from-keys PATH --to CELL --to-directory DIR --to-storage-root PATH --to-keys PATH [--ecs-cluster ARN]\n\
+       rtdb-multi activate-cell-transfer --transfer FILE --from CELL --from-directory DIR --from-storage-root PATH --from-keys PATH --to CELL --to-directory DIR --to-storage-root PATH --to-keys PATH\n\
        rtdb-multi controller --directory DIR [--rebalance MOVES] [--cell-secret FILE]\n\
        rtdb-multi reaper --directory DIR --storage-root PATH [--keys PATH] [--ecs-cluster ARN] [--grace SECONDS] [--recovery-listen ADDR --recovery-config FILE --recovery-token-file FILE --recovery-org ORG --archive-root PATH]\n\
        rtdb-multi create --directory DIR --name NAME [--org ORG] [--replicas N]\n\
@@ -90,6 +92,17 @@ fn hosted_task(arguments: &Arguments) -> Result<Option<rtdb_directory::HostedTas
     let task = std::env::var("RTDB_ECS_TASK_ARN")
         .map_err(|_| usage("The hosted entrypoint must supply the current ECS task ARN".into()))?;
     Ok(Some(rtdb_directory::HostedTask::new(cluster, &task)?))
+}
+
+fn read_transfer<T: serde::de::DeserializeOwned>(arguments: &Arguments) -> Result<T> {
+    const MAXIMUM_BYTES: u64 = 8192;
+    let mut encoded = Vec::new();
+    let file = std::fs::File::open(arguments.required("transfer")?).map_err(io)?;
+    file.take(MAXIMUM_BYTES + 1).read_to_end(&mut encoded).map_err(io)?;
+    if encoded.len() > MAXIMUM_BYTES as usize {
+        return Err(usage("The cell transfer document exceeds its size limit".into()));
+    }
+    serde_json::from_slice(&encoded).map_err(|_| usage("Invalid cell transfer document".into()))
 }
 
 fn installation_id(arguments: &Arguments) -> Result<uuid::Uuid> {
@@ -237,8 +250,7 @@ async fn run(arguments: Vec<String>) -> Result<()> {
             eprintln!("cell map listening on {}", listener.local_addr().map_err(io)?);
             rtdb_multi::cells::serve(listener, rtdb_multi::cells::MemoryCellMap::new(), cancellation).await
         }
-        "move-cell" => {
-            let map = rtdb_multi::cells::RemoteCellMap::new(arguments.required("cell-map")?);
+        "move-cell" | "prepare-cell-transfer" | "activate-cell-transfer" => {
             let (from_directory, to_directory) = (directory(arguments.required("from-directory")?).await?, directory(arguments.required("to-directory")?).await?);
             let from_storage = CellStorage::parse(arguments.required("from-storage-root")?)?;
             let to_storage = CellStorage::parse(arguments.required("to-storage-root")?)?;
@@ -246,8 +258,24 @@ async fn run(arguments: Vec<String>) -> Result<()> {
             let to_keys = key_service(arguments.required("to-keys")?).await?;
             let from = admin::CellHandle { name: arguments.required("from")?, directory: &from_directory, storage: &from_storage, keys: from_keys.as_ref(), maximum_deployments: usize::MAX };
             let to = admin::CellHandle { name: arguments.required("to")?, directory: &to_directory, storage: &to_storage, keys: to_keys.as_ref(), maximum_deployments: usize::MAX };
-            let record = admin::move_cell(map.as_ref(), &from, &to, arguments.required("name")?, 4 << 20, hosted_task(&arguments)?).await?;
-            println!("{}", serde_json::to_string_pretty(&record).expect("a record serializes"));
+            match command.as_str() {
+                "move-cell" => {
+                    let map = rtdb_multi::cells::RemoteCellMap::new(arguments.required("cell-map")?);
+                    let record = admin::move_cell(map.as_ref(), &from, &to, arguments.required("name")?, 4 << 20, hosted_task(&arguments)?).await?;
+                    println!("{}", serde_json::to_string_pretty(&record).expect("a record serializes"));
+                },
+                "prepare-cell-transfer" => {
+                    let intent = read_transfer(&arguments)?;
+                    let prepared = admin::prepare_managed_cell_transfer(&from, &to, &intent, 4 << 20, hosted_task(&arguments)?).await?;
+                    println!("{}", serde_json::to_string(&prepared).expect("a transfer receipt serializes"));
+                },
+                "activate-cell-transfer" => {
+                    let prepared = read_transfer(&arguments)?;
+                    admin::activate_managed_cell_transfer(&from, &to, &prepared).await?;
+                    println!("{}", serde_json::to_string(&prepared).expect("a transfer receipt serializes"));
+                },
+                _ => unreachable!(),
+            }
             Ok(())
         }
         "reaper" => {

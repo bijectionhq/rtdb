@@ -4,7 +4,11 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 use std::time::Duration;
 
-use rtdb_directory::{Cas, CellMedia, CellTransfer, DeploymentRecord, Directory, DisposalReceipt, Lifecycle, MemberId, MemberRecord, MemberRole, MemberState, effective_holder, now_ms};
+use rtdb_directory::{
+    Cas, CellMedia, CellResidence, CellTransfer, CellTransferIntent, DeploymentRecord, Directory,
+    DisposalReceipt, Lifecycle, MemberId, MemberRecord, MemberRole, MemberState, PreparedCellTransfer,
+    effective_holder, now_ms,
+};
 use rtdb_logkeeper::StreamConfig;
 use rtdb_types::{Anomaly, AnomalyCategory, Result};
 use tokio_util::sync::CancellationToken;
@@ -375,17 +379,120 @@ pub async fn move_cell(
     if from.name == to.name || !at_source && routed.as_deref() != Some(to.name) {
         return Err(conflict());
     }
-    let (source, target) = prepare_cell_move(from, to, name, at_source, maximum_message_bytes, hosted_task).await?;
+    let current = record(from.directory.as_ref(), name).await?;
+    let authority = current.id.parse().map_err(|_| conflict())?;
+    let intent = CellTransferIntent {
+        operation: None,
+        authority,
+        name: name.to_owned(),
+        source: CellResidence { cell: from.name.to_owned(), org: current.org.clone() },
+        destination: CellResidence { cell: to.name.to_owned(), org: current.org.clone() },
+    };
+    let (source, target) = if at_source {
+        prepare_cell_move(from, to, &intent, maximum_message_bytes, hosted_task).await?
+    } else {
+        prepared_cell_move(from, to, &intent).await?
+    };
     if at_source
         && !map.assign(name, to.name, Some(from.name)).await?
         && map.cell_of(name).await?.as_deref() != Some(to.name)
     {
         return Err(conflict());
     }
+    settle_cell_move(from, to, &source, &target).await
+}
+
+/// Stages the exact move reserved by an external placement catalog. Effect
+/// callers bind both cell handles to the catalog's immutable placements.
+pub async fn prepare_managed_cell_transfer(
+    from: &CellHandle<'_>,
+    to: &CellHandle<'_>,
+    intent: &CellTransferIntent,
+    maximum_message_bytes: usize,
+    hosted_task: Option<rtdb_directory::HostedTask>,
+) -> Result<PreparedCellTransfer> {
+    validate_managed_cell_move(from, to, intent)?;
+    let (source, _) = prepare_cell_move(from, to, intent, maximum_message_bytes, hosted_task).await?;
+    Ok(PreparedCellTransfer { intent: intent.clone(), incarnation: source.incarnation, epoch: source.epoch })
+}
+
+/// Called by the authenticated placement owner after it has retained this
+/// receipt and selected the destination in its own catalog.
+pub async fn activate_managed_cell_transfer(
+    from: &CellHandle<'_>,
+    to: &CellHandle<'_>,
+    prepared: &PreparedCellTransfer,
+) -> Result<DeploymentRecord> {
+    let intent = &prepared.intent;
+    validate_managed_cell_move(from, to, intent)?;
+    let (source, target) = prepared_cell_move(from, to, intent).await?;
+    if source.incarnation != prepared.incarnation || source.epoch != prepared.epoch {
+        return Err(cell_move_conflict(from, to, &intent.name));
+    }
+    settle_cell_move(from, to, &source, &target).await
+}
+
+fn validate_managed_cell_move(from: &CellHandle<'_>, to: &CellHandle<'_>, intent: &CellTransferIntent) -> Result<()> {
+    if !intent.operation.is_some_and(|operation| !operation.is_nil())
+        || intent.authority.is_nil()
+        || from.name != intent.source.cell || to.name != intent.destination.cell
+        || from.name == to.name
+        || ![&intent.name, &intent.source.org, &intent.destination.org].into_iter()
+            .all(|name| valid_installation_name(name))
+    {
+        return Err(cell_move_conflict(from, to, &intent.name));
+    }
+    Ok(())
+}
+
+fn same_residence(record: &DeploymentRecord, intent: &CellTransferIntent, residence: &CellResidence) -> bool {
+    record.id == intent.authority.to_string() && record.name == intent.name && record.org == residence.org
+        && (intent.operation.is_none() || record.linearizable_reads && record.parent.is_none())
+}
+
+fn intent_matches(record: &DeploymentRecord, intent: &CellTransferIntent) -> bool {
+    record.cell_transfer.as_ref().is_some_and(|transfer| &transfer.intent == intent && transfer.epoch == record.epoch)
+}
+
+async fn prepared_cell_move(
+    from: &CellHandle<'_>,
+    to: &CellHandle<'_>,
+    intent: &CellTransferIntent,
+) -> Result<(DeploymentRecord, DeploymentRecord)> {
+    let conflict = || cell_move_conflict(from, to, &intent.name);
+    let source = record(from.directory.as_ref(), &intent.name).await?;
+    if !same_residence(&source, intent, &intent.source) || !intent_matches(&source, intent)
+        || !(source.lifecycle == Lifecycle::Moving
+            || source.lifecycle == Lifecycle::Deleted && source.moved_at_ms.is_some())
+    {
+        return Err(conflict());
+    }
+    let transfer = source.cell_transfer.as_ref().ok_or_else(&conflict)?;
+    if transfer.source_media != cell_media(from.storage, from.keys)?
+        || transfer.destination_media != cell_media(to.storage, to.keys)?
+    {
+        return Err(conflict());
+    }
+    let target = to.directory.deployment(&source.id).await?.filter(|target| {
+        same_residence(target, intent, &intent.destination)
+            && target.incarnation == source.incarnation && target.cell_transfer == source.cell_transfer
+            && target.move_from.is_none()
+            && matches!(target.lifecycle, Lifecycle::Moving | Lifecycle::Live | Lifecycle::Quarantined)
+    }).ok_or_else(conflict)?;
+    Ok((source, target))
+}
+
+async fn settle_cell_move(
+    from: &CellHandle<'_>,
+    to: &CellHandle<'_>,
+    source: &DeploymentRecord,
+    target: &DeploymentRecord,
+) -> Result<DeploymentRecord> {
+    let conflict = || cell_move_conflict(from, to, &source.name);
     // The accepted route points to a destination with an independent
     // replica quorum. Settle the source before the destination can move again.
     update_installation(from.directory.as_ref(), &source.id, |record| {
-        if !same_cell_move(record, &source) || record.epoch != source.epoch {
+        if !same_cell_move(record, source) || record.epoch != source.epoch {
             return Err(conflict());
         }
         match record.lifecycle {
@@ -399,11 +506,11 @@ pub async fn move_cell(
         Ok(())
     }).await?;
     update_installation(to.directory.as_ref(), &target.id, |record| {
-        if !same_cell_move(record, &target) || record.move_from.is_some() {
+        if !same_cell_move(record, target) || record.move_from.is_some() {
             return Err(conflict());
         }
         match record.lifecycle {
-            Lifecycle::Moving if record.epoch == target.epoch => record.lifecycle = Lifecycle::Live,
+            Lifecycle::Moving if record.epoch == source.epoch => record.lifecycle = Lifecycle::Live,
             Lifecycle::Live | Lifecycle::Quarantined => {}
             _ => return Err(conflict()),
         }
@@ -433,25 +540,19 @@ fn cell_media(storage: &CellStorage, keys: &dyn KeyService) -> Result<CellMedia>
 async fn prepare_cell_move(
     from: &CellHandle<'_>,
     to: &CellHandle<'_>,
-    name: &str,
-    at_source: bool,
+    intent: &CellTransferIntent,
     maximum_message_bytes: usize,
     hosted_task: Option<rtdb_directory::HostedTask>,
 ) -> Result<(DeploymentRecord, DeploymentRecord)> {
-    let conflict = || cell_move_conflict(from, to, name);
-    let current = record(from.directory.as_ref(), name).await?;
-    let target = to.directory.deployment_by_name(name).await?;
-    let transfer_matches = |record: &DeploymentRecord| record.cell_transfer.as_ref().is_some_and(|transfer| {
-        transfer.source == from.name && transfer.destination == to.name && transfer.epoch == record.epoch
-    });
-    if !at_source {
-        let prepared = target.filter(|record| same_cell_move(record, &current) && record.move_from.is_none())
-            .ok_or_else(&conflict)?;
-        if !matches!(current.lifecycle, Lifecycle::Moving | Lifecycle::Deleted) || !transfer_matches(&current) {
-            return Err(conflict());
-        }
-        return Ok((current, prepared));
+    let conflict = || cell_move_conflict(from, to, &intent.name);
+    let current = record(from.directory.as_ref(), &intent.name).await?;
+    if !same_residence(&current, intent, &intent.source) {
+        return Err(conflict());
     }
+    if current.lifecycle == Lifecycle::Deleted {
+        return prepared_cell_move(from, to, intent).await;
+    }
+    let target = to.directory.deployment_by_name(&intent.name).await?;
     if current.lifecycle == Lifecycle::Live && target.is_some() {
         return Err(conflict());
     }
@@ -471,8 +572,12 @@ async fn prepare_cell_move(
         return Err(conflict());
     }
     let mut arrival = current.clone();
+    arrival.org = intent.destination.org.clone();
     if let Some(staged) = target {
-        if !same_cell_move(&staged, &current) || !transfer_matches(&current) || staged.lifecycle != Lifecycle::Moving {
+        if !same_residence(&staged, intent, &intent.destination)
+            || staged.incarnation != current.incarnation || staged.cell_transfer != current.cell_transfer
+            || !intent_matches(&current, intent) || staged.lifecycle != Lifecycle::Moving
+        {
             return Err(conflict());
         }
         if staged.move_from.is_none() {
@@ -489,7 +594,7 @@ async fn prepare_cell_move(
     }
 
     let source = update_installation(from.directory.as_ref(), &current.id, |record| {
-        if record.lifecycle == Lifecycle::Moving && transfer_matches(record) && same_media(record) {
+        if record.lifecycle == Lifecycle::Moving && intent_matches(record, intent) && same_media(record) {
             return Ok(());
         }
         if record.lifecycle != Lifecycle::Live || record.version != current.version || record.move_from.is_some() {
@@ -503,8 +608,7 @@ async fn prepare_cell_move(
         record.move_intent = None;
         record.replica_journals.extend(source_stream.servers.iter().cloned());
         record.cell_transfer = Some(CellTransfer {
-            source: from.name.to_owned(),
-            destination: to.name.to_owned(),
+            intent: intent.clone(),
             epoch: record.epoch,
             source_media: source_media.clone(),
             destination_media: destination_media.clone(),
@@ -512,6 +616,7 @@ async fn prepare_cell_move(
         Ok(())
     }).await?;
     let mut staged = source.clone();
+    staged.org = arrival.org;
     staged.ensemble = arrival.ensemble;
     staged.replica_journals = target_stream.servers.iter().cloned().collect();
     staged.move_from = Some(source_stream.servers.clone());

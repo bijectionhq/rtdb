@@ -256,14 +256,42 @@ pub struct ArchiveRetirement {
     pub observed_empty_at_ms: Option<i64>,
 }
 
-/// Both directories retain the same routing decision through a cell transfer.
+/// Both directories retain the same intent through a cell transfer.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CellTransfer {
-    pub source: String,
-    pub destination: String,
+    pub intent: CellTransferIntent,
     pub epoch: u64,
     pub source_media: CellMedia,
     pub destination_media: CellMedia,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CellTransferIntent {
+    /// The external catalog's operation. An RTDB-managed move uses a cell map
+    /// instead and has no external operation.
+    pub operation: Option<uuid::Uuid>,
+    pub authority: uuid::Uuid,
+    pub name: String,
+    pub source: CellResidence,
+    pub destination: CellResidence,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CellResidence {
+    pub cell: String,
+    pub org: String,
+}
+
+/// The destination has an independent copy of the installation's storage and
+/// sealed tail. The selecting catalog retains this receipt before publishing.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PreparedCellTransfer {
+    pub intent: CellTransferIntent,
+    pub incarnation: u64,
+    pub epoch: u64,
 }
 
 /// The cell providers authorized for a transfer, without their credentials.
