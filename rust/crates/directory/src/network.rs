@@ -70,10 +70,6 @@ enum Feed { Deployments }
 #[derive(Serialize, Deserialize)]
 struct Subscribe { id: u64, subscribe: Feed }
 
-#[derive(Deserialize)]
-#[serde(untagged)]
-enum Incoming { Request(Request), Subscribe(Subscribe) }
-
 /// One message of a subscription; an error ends it, and the subscriber resubscribes to start again from a fresh snapshot.
 #[derive(Serialize, Deserialize)]
 struct Changed { id: u64, result: std::result::Result<DeploymentRecord, Anomaly> }
@@ -157,13 +153,14 @@ async fn serve_connection(stream: TcpStream, directory: Arc<dyn Directory>, canc
             more = read_line(&mut reader, &mut line) => more,
         };
         if !matches!(more, Ok(true)) { return; }
-        let request = match serde_json::from_str::<Incoming>(&line) {
-            Ok(Incoming::Request(request)) => request,
-            Ok(Incoming::Subscribe(Subscribe { id, subscribe: Feed::Deployments })) => {
-                tracker.spawn(forward_changes(directory.clone(), id, responses.clone(), connection_closed.clone()));
-                continue;
-            }
+        // Decode requests directly so serde_json can parse object keys as numbers.
+        let request = match serde_json::from_str::<Request>(&line) {
+            Ok(request) => request,
             Err(error) => {
+                if let Ok(Subscribe { id, subscribe: Feed::Deployments }) = serde_json::from_str(&line) {
+                    tracker.spawn(forward_changes(directory.clone(), id, responses.clone(), connection_closed.clone()));
+                    continue;
+                }
                 let Ok(RequestId { id }) = serde_json::from_str(&line) else { return };
                 let refusal = Anomaly::incorrect("rtdb.directory/malformed-request", format!("Malformed directory request: {error}"));
                 let _ = responses.send(encode(&Response { id, result: Err(refusal) }));
@@ -501,6 +498,27 @@ mod tests {
         for _ in 0..4 { clients.push(RemoteDirectory::connect(&served.address).await.unwrap()); }
         contract::concurrent_claims(&clients, 16, 25).await;
         drop(clients);
+        served.stop().await;
+    }
+
+    #[tokio::test]
+    async fn deployment_cas_preserves_ordered_index_generation_keys() {
+        let served = served(MemoryDirectory::new()).await;
+        let remote = RemoteDirectory::connect(&served.address).await.unwrap();
+        let mut record = remote.create_deployment(DeploymentRecord::new("shop", "acme", vec![], 0)).await.unwrap();
+        let version = record.version;
+        let id = record.id.clone();
+        let index = "served/v06/ordered-index/v2/example".to_owned();
+        let permits = std::collections::BTreeMap::from([(uuid::Uuid::new_v4(), uuid::Uuid::new_v4())]);
+        let generation = 7;
+        record.ordered_indexes.entry(index.clone()).or_default().generations.insert(generation, permits.clone());
+
+        let Cas::Applied(stored) = remote.replace_deployment(record, version).await.unwrap() else {
+            panic!("the deployment's original version should still be current");
+        };
+        assert_eq!(stored.ordered_indexes[&index].generations[&generation], permits);
+        assert_eq!(remote.deployment(&id).await.unwrap(), Some(stored));
+        drop(remote);
         served.stop().await;
     }
 
