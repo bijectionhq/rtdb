@@ -140,7 +140,7 @@ A proof of a candidate is conditional on the explicitly stated contract and work
 | IDX05 · Immutable ancestors | Partial | [JVM pending-log ownership proof and sibling-version regressions](rtdb-engine-proof-evidence.md#jvm-trie-pending-log-ownership) |
 | IDX06 · Bulk insertion equivalence | Partial | [Lean batch regrouping and Rust range, batch, and single insertion checks](rtdb-engine-proof-evidence.md#memory-trie-lookup-and-coverage) · [Verified branch insertion grouping](rtdb-engine-proof-evidence.md#production-live-trie-bucket-grouping) |
 | IDX07 · Structural rewrite equivalence | Partial | [Verified stable row partition for a leaf split](rtdb-engine-proof-evidence.md#production-live-trie-bucket-grouping) · [Verified merge order and multiplicity](rtdb-engine-proof-evidence.md#production-leaf-merge) |
-| IDX08 · Snapshot lifetime | Partial | [Verified row addressing, layout preservation, and native snapshot regression](rtdb-engine-proof-evidence.md#live-row-addresses-across-chunk-layouts) |
+| IDX08 · Snapshot lifetime | Partial | [Verified row addressing, layout preservation, and native snapshot regression](rtdb-engine-proof-evidence.md#live-row-addresses-across-chunk-layouts) · [JVM ownership proof and retained-IID race regression](rtdb-engine-proof-evidence.md#jvm-shared-snapshot-ownership) |
 | IDX09 · Serialized correspondence | Partial | [Protobuf path round trip and ordered IID candidates](rtdb-engine-proof-evidence.md#protobuf-trie-paths-and-ordered-iid-candidates) |
 
 ## Persistent formats and compatibility

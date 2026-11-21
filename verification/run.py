@@ -534,6 +534,31 @@ def verify_live_row_address(args, scratch):
     verify_lean_model(args, scratch, path, "live-row-address", controls, 5)
 
 
+def verify_snapshot_ownership(args, scratch):
+    path = Path("verification/lean/SnapshotOwnership.lean")
+    controls = {
+        "retain-retired-owner": (
+            "published := false\n    references := s.references - 1",
+            "published := true\n    references := s.references - 1",
+            ["any_step_preserves_reference_ownership"],
+        ),
+        "release-with-another-reader": (
+            "readers := s.readers - 1\n    references := s.references - 1\n"
+            "    released := s.released || s.references == 1",
+            "readers := s.readers - 1\n    references := s.references - 1\n"
+            "    released := s.released || s.references == 2",
+            ["after_retirement_last_reader_releases_resources", "any_step_preserves_reference_ownership",
+             "any_step_preserves_reference_ownership"],
+        ),
+        "acquire-after-retirement": (
+            "s.published = true → Step s (openReader s)",
+            "s.published = s.published → Step s (openReader s)",
+            ["any_step_preserves_reference_ownership", "released_resources_admit_no_further_operations"],
+        ),
+    }
+    verify_lean_model(args, scratch, path, "snapshot-ownership", controls, 7)
+
+
 def verify_jvm_trie_pending_logs(args, scratch):
     path = Path("verification/lean/JvmTriePendingLogs.lean")
     controls = {
@@ -854,6 +879,7 @@ def verify_lean(args, scratch):
             verify_memory_admission(args, scratch)
             verify_memory_trie(args, scratch)
             verify_live_row_address(args, scratch)
+            verify_snapshot_ownership(args, scratch)
             verify_jvm_trie_pending_logs(args, scratch)
             verify_trie_wire_paths(args, scratch)
             verify_outer_join(args, scratch)

@@ -35,7 +35,7 @@ These results apply to the classic and full-text Rust paths at the particular re
 | CELL09, STORE10 and Multi recovery S2, S5 · Worker loss | A local MinIO and PgWire regression retains the checkpoint and acknowledged suffix, compares current rows and the full bitemporal projection, and verifies new writes after losing one, two, and all three compute workers. | Prove the complete activation and recovery path under the published durable-service and liveness assumptions. |
 | IDX02, IDX04, IDX06, IDX07 | Verus checks the production Rust base-four IID digit, path comparison, and stable partition of an insertion or split batch at every valid depth. The Kani harness also checks all legal depths and the independent bit-extraction rule for width 2, 4, or 8 in the actual bucketer. | Compose grouping, leaf ordering, and recursive replacement at actual Rust and JVM call sites, then connect the resulting trees to traversal and replay. |
 | IDX02, IDX03, IDX07 | Verus checks that the production Rust leaf merge returns every input occurrence in order. An injective logical rank uniquely determines the successful output sequence from those occurrences. | Prove that each leaf supplies correctly ordered runs, that its reader and comparator realize the logical rank, and that the JVM merge satisfies the same contract. |
-| IDX01, IDX08 | Verus checks the production Rust search, append, and adjacent chunk replacement against one contiguous-layout invariant. Lean proves that appending rows and joining adjacent chunks preserve existing ordinal reads. | Prove the Arrow row-content obligation and snapshot ownership across block transitions, and refine the JVM equivalents. |
+| IDX01, IDX08 | Verus checks the production Rust search, append, and adjacent chunk replacement against one contiguous-layout invariant. Lean proves that appending rows and joining adjacent chunks preserve existing ordinal reads. | Prove the Arrow row-content obligation and refine snapshot ownership across block transitions in both engines. |
 | SCAN07, GC01, GC02 | Lean proves the abstract generation retention invariant for arbitrarily many readers, objects, in-flight operations and steps. Verus checks the collector's production selection loop against the visibility observations it receives. | Refine the captured references, provider operations, and authority changes, including the full durable deletion protocol. |
 | GC09, STORE03 · Hosted ordered-index retirement | Lean checks point equivalence after scrubbing known erase cuts. A bounded TLC model checks storage retirement, reader release, scrubbed replay, and conditional completion. Integration tests exercise a held reader and versioned local S3 provider. | Compose the directory and provider contracts with every hosted deployment, reader and primary-file custody path covered by physical disposal. |
 | STORE03 · Read entitlements | Lean proves a lease timing inequality and preservation of read entitlement across arbitrary abstract pin transitions, including close while a read remains active. | Prove clock, I/O completion, decoded page ownership, cache eviction, and provider lifetime assumptions at production call sites. |
@@ -186,6 +186,20 @@ The native tests check chunk boundaries, repeated starts, retained reads after a
 Lean 4.35.0 audited five theorems and rejected both mutations.
 Verus 0.2026.11.05.31e44e6 checked nine functions and rejected five mutations.
 The native run passed 503 tests with `cargo test --manifest-path rust/Cargo.toml --locked -p rtdb-trie -p rtdb-format -p rtdb-index -p rtdb-query`. [Lean model](../../verification/lean/LiveRowAddress.lean) · [Verus study](../../verification/verus/live_row_address/area.json) · [Snapshot regression](../../rust/crates/index/tests/live_index.rs)
+
+### JVM shared snapshot ownership
+
+A published live snapshot owns one reference and each open reader owns one more.
+The Lean model proves over arbitrary interleavings of modeled acquire, retire, and close operations that a reader's reference prevents final release.
+It proves that the last close after retirement triggers release and that a released snapshot admits no further operations.
+The JVM mapping uses the partition's snapshot lock to cover both choosing the cached snapshot and retaining it.
+Refresh and block adoption replace or clear the published snapshot before dropping its reference under the same lock.
+Each reader's close has a one-shot guard and the shared counter performs the final release on the transition to zero.
+This mapping assumes the admitted holder count fits the JVM counter, snapshots are used within their held lifetime, and the Arrow slices retain valid buffers until closed.
+The JVM race test holds an older snapshot while a concurrent block adoption and a demand for a fresher basis replace the cached snapshot.
+It reads the captured row ordinal and IID through the held trie after the adoption finishes.
+Lean 4.35.0 audited seven theorems and rejected controls that leave the publisher installed after retirement, release with a reader outstanding, or admit acquisition after retirement.
+Proof of the runtime lock and allocator semantics remains part of the implementation refinement. [Snapshot contract](../../allium/live-index.allium) · [Cache acquisition and retirement](../../core/src/main/kotlin/xtdb/database/PartitionState.kt) · [Ownership proof](../../verification/lean/SnapshotOwnership.lean) · [JVM block-adoption race](../../core/src/test/kotlin/xtdb/indexer/LiveIndexTest.kt)
 
 ### JVM trie pending-log ownership
 
