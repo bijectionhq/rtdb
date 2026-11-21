@@ -1304,3 +1304,31 @@ The 21 supplemental query scan tests passed.
 The consolidated code also passed a local compile check of the Multi binary with its DynamoDB feature enabled.
 From `rust/`, run `BIJECTION_LOCAL_EXECUTION=owner-authorized cargo check --offline --locked -p rtdb-multi --features dynamodb --bin rtdb-multi`.
 S3 provider behavior, full query-snapshot retention across serving nodes and hosted reference publication retain their separate evidence obligations.
+
+=== Delegated scan admission and provider drain
+
+At `2c89ffb51`, the delegated executor checks that the actual captured transaction key matches the coordinator's and that its view has no private overlays.
+The coordinator retains its own capture and uses it for a refused fragment.
+The executor attaches its query context to admitted provider work so the context survives caller cancellation until the worker and any undelivered result are gone.
+
+Lean 4.36.0 proved that a successful fragment agrees with the captured reference point and that selecting the reply or falling back preserves that observation for an arbitrary shared committed history.
+It checked a concrete later-erase witness.
+The three declarations use `propext` only.
+Allowing a later head, admitting a private overlay and removing the advance in the erase witness each failed at the registered theorem.
+
+TLC explored 59 reachable states of one coordinator and one worker across three transaction heads.
+It rejected admitting a later head, trusting the preliminary worker observation in place of the actual capture, and releasing the worker hold on cancellation.
+The witnesses exercised a matching response, local fallback after a later erase, and collection after drain.
+The model abstracts the worker's provider under one partition authority and uses a separately retained coordinator capture.
+
+The selected Rust suites passed 563 tests, including the 78 local Multi cell tests.
+The first new scan test dispatches to a later snapshot that has erased a row, then observes the earlier coordinator's row through local fallback.
+The second runs the delegated evaluator against a paused provider worker, cancels the caller, and observes the query context held until that worker drains.
+The two Rust source controls independently restore later-head admission and omit I/O retention.
+Each failed its named regression assertion.
+The clean `fragment.rs` SHA-256 was `daa8f4818572d306c8b0ee7e7ef293bff73873479b8def500f19d1a310156a47`.
+
+The proofs model the same database history on both nodes.
+Physical collection by another authority and transport checks that bind both captures to the same residence remain separate obligations.
+From `rust/`, the selected command is `BIJECTION_LOCAL_EXECUTION=owner-authorized cargo test --offline --locked -p rtdb-query -p rtdb-multi -p rtdb-node -p rtdb-replication --lib --test scan --test cell --test resources --test native`.
+The combined runner executes the registered Lean and TLC cases and adds both source controls with `--native-replay`. link:../lean/DelegatedScan.lean[Lean laws] · link:../tla/DelegatedScan.tla[TLA+ protocol] · link:../README.adoc#_run_the_studies[Runner]
