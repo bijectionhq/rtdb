@@ -47,6 +47,125 @@ Update this section as work lands.
 | 13 | persistent cell placement with DynamoDB and a local in-memory cell map, gateway forwarding, creation in the least occupied cell, restartable cell moves that carry the unflushed tail across; the old cell's reaper erases what a move left there once the grace has passed since the move | the copy runs after the source is fenced, so the stall includes copy time; failed copy generations still need orphan collection; supply the old cell's key directory via `reaper --keys` to destroy that cell's copy of the key |
 | 14 | the chaos test and the history audit; `crates/simulation` runs one deployment's single-writer protocol from a seed (members claiming through the directory, three logkeeper state machines, a modelled writer, crashes, partitions, broken connections) and checks the epoch and log invariants after every step; it also runs a cell's storage lifecycle from a seed (deployments writing through their real store stacks, releasing, forking now and at a past block, reaper passes, deletions and cell moves, over in-memory buckets on a simulated clock, with injected pack read failures and move cleanup), checking that each deployment reads exactly what it wrote or inherited and has not released and nothing its parent wrote after the fork point, and gateway sessions (the real session over loopback TCP to stub backends that die during startup, before or after executing, between replies, or after preparing a named statement), checking that every command runs at most once, exactly once if the client was told it succeeded, and that the client sees only its own command's replies | three simulations of parts of a cell rather than one of a whole cell: the storage run has no nodes, directory or logkeepers and its admin sequences are modelled around the real calls, the session backends are stubs, with simple commands and extended-protocol prepared reads; combined directory, provider and runtime failures remain to be simulated |
 
+A gateway started with `--config` uses the node YAML's `server.ssl` key store and requires PostgreSQL TLS from clients.
+It terminates that frontend TLS connection before routing startup.
+The node and cross-cell connections still use the cell's private network transport.
+
+Hosting can install its existing deployment authority with `rtdb-multi install --id UUID --name NAME --org ORG`.
+The directory allocates both name and authority conditionally, and an identical retry returns the same deployment.
+This entry point enables linearizable reads on the holder.
+A PostgreSQL startup database of `NAME@UUID`, with the UUID in lowercase 32-digit hexadecimal, requires that installation before connecting.
+The gateway confirms the matched UUID in the startup parameter `rtdb_installation_id`.
+`SHOW rtdb_hosted_source_barrier` returns the deployment ID after the holder confirms the current directory assignment, confirms its epoch with the logkeeper quorum, and applies the sampled source cut.
+The holder must recover the checkpoint published in the directory or an authenticated successor before answering.
+A gateway reconnect keeps the original deployment ID.
+Restoring an older node or object copy requires a recoverable checkpoint and tail from the live directory and logkeeper ensemble.
+The directory and acknowledged quorum stream must survive this restore, and the production logkeepers must acknowledge durable writes.
+Recovery from a replacement directory or a rolled-back quorum requires a new deployment identity.
+
+Nodes and logkeepers bound to a wildcard address require `--advertise-host` with their reachable DNS name or IP.
+Each durable logkeeper stores its member ID in the journal directory.
+A restart locks the original directory, waits for the previous lease to end, and reclaims the same member ID.
+A named logkeeper keeps its advertised address for the lifetime of the journal.
+To replace missing journal data, recover the journal or reconfigure the ensemble through its log authority.
+Ensemble selection counts each advertised log endpoint once.
+
+In AWS, the cell installs its directory tables independently of the runtime roles.
+Use `--keys dynamodb:TABLE` for deployment keys in a dedicated table with string partition key `id`, separate from payload copies and without point-in-time recovery, streams or backup.
+Deleting a key clears its material and keeps a tombstone that prevents recreating that identity on a later open.
+
+For a local cell, initialize an existing private volume directory with
+`rtdb-multi initialize-directory --state PATH`, then serve that same authority
+with `rtdb-multi directory --state PATH --listen ADDR`. The process locks the
+directory and durably records each change before exposing it. Keep its state
+and the logkeeper journals outside any restored payload image. The directory
+listener belongs on the trusted cell network.
+
+The source directory records the fence epoch and destination before copying a cell transfer. Once the destination has its serving objects and key, it records the arrival and waits for routing to move and for the source to become a tombstone. Its first holder copies the sealed tail onto its logkeepers before accepting writes. Retrying a lost routing response continues that same transfer.
+
+`rtdb-multi schedule-disposal --id UUID` fences an installation once in the
+directory. A reaper configured with the cell's key service completes that
+accepted request after the caller exits. `rtdb-multi delete --id UUID` can
+also settle it synchronously. A holder records
+its journal endpoints before it can copy or append a replica record.
+Disposal retires the stream on each recorded journal and waits for its
+obsolete segments to be replaced and removed. An unavailable journal keeps
+disposal pending. The directory retains the receipt after that step, key
+withdrawal and an empty serving prefix. `rtdb-multi disposal --id UUID` reads
+the receipt. Gateway sessions close when they observe retirement. Object
+versions, external backups and key copies in other cells have separate
+physical custody.
+
+A deployment fork stages its reference manifest and tail before publishing
+the child. The directory checks the parent's eligible version in the same
+transaction that creates the child and its name. Once retirement has fenced
+the parent, a staged child cannot acquire a visible reference to its objects.
+A publication with an uncertain outcome leaves the staged data available for
+the directory to resolve.
+
+On the private hosted lifecycle listener, every request includes its operation.
+The optional disposal credential authorizes `schedule_disposal` and
+`inspect_disposal` for a named root with an exact authority UUID. Scheduling
+also fences an empty identity if retirement arrives before installation.
+Inspection reads the directory without fencing. A settled response identifies
+the retired writer epoch, identifies the provider inventory, and hashes the
+receipt retained by the directory. On S3 the reaper accounts for object
+versions, delete markers and unfinished uploads inside the deployment prefix
+before reporting that inventory as empty.
+
+Nodes register a serving storage region in the deployment record before
+opening objects. Holders and compactors consult the current directory record
+at the provider boundary before issuing a mutation. After an attachment
+closes, its directory admission is removed only after its region's provider
+work has drained, including work whose caller was cancelled. Disposal,
+cross-cell transfer and same-history recovery wait for those admissions to
+clear after fencing. On a standalone local disk, each provider operation
+retains a lock in the independent key directory. After a node exits, the
+reaper can recover its recorded region only by acquiring that same
+persisted lock. A missing lock witness keeps the region pending. For remote
+storage, a producer that exits without acknowledging drain keeps cleanup
+pending until the provider's outstanding work can be accounted for.
+Each remote serving object is published with one conditional PUT of its
+sealed bytes directly to its final key. The PUT carries a unique publication
+identity in its metadata. An ambiguous response settles only if a fresh
+HEAD returns that identity. Missing or unrelated metadata keeps the region's
+admission pending. When I/O joins, its owner records the closed admission
+and exact unresolved publication identities in the directory. A later
+reaper can release it after confirming those objects in the original
+serving or checkpoint namespace. The reaper holds ordinary serving
+collection while the directory retains those publication identities.
+An owner that exits before recording its close still leaves an open
+admission.
+
+`rtdb-multi capture --id UUID --operation UUID` retains the selected
+published checkpoint and copies its catalog, table metadata and referenced
+tries as ciphertext to the independent archive. The receipt fixes the
+location, length and digest of each object. Retrying the operation recovers
+the same checkpoint and destination. The directory registers both and the
+capture's storage region before the first archive write. An archive binds
+its media witness before payload can be copied. The key vault stays outside
+the capture.
+
+The recovery owner calls `rtdb-multi schedule-recovery-disposal --id UUID`
+after the installation's serving receipt exists and recovery holds end.
+The reaper settles each registered local archive after confirming its
+media witness. `rtdb-multi recovery-disposal --id UUID` returns the ordered
+retirement and observed absence. Remote archives stay pending until the
+provider proves that versions and unfinished uploads are absent.
+
+`rtdb-multi restore` accepts the live directory's current checkpoint with
+the original archive manifest and current key. It records a restore intent,
+fences the old writer at the logkeepers, and verifies the objects. The
+directory then admits the checkpoint archive as a read-only source for
+missing objects. A successor recovers the same ordered tail before serving.
+The directory keeps the accepted manifest and completion for retries.
+Retain the archive while an installation uses it.
+
+Hosted operators can give `rtdb-multi reaper` a private TLS recovery listener with its own credential, configured serving storage, independent archive, and current keys.
+It admits an operation only for the exact name and authority in its configured organization.
+A capture returns the pinned checkpoint and canonical archive digest.
+A recovery request supplies that digest and capture ID, and repeats the completion receipt if the operation already finished.
+
 **Fixed on the way.**
 
 - A newly activated fork could publish its parent's boundary and trim its own log before its first flush completed.
@@ -67,6 +186,19 @@ Update this section as work lands.
 - A live table written a row per transaction with long string ids failed at its 256th row with `rtdb/undersized-reservation` and stopped its database (`LiveTable::merge_small_chunks`); it affected classic mode too.
 - Found reviewing the branch: a reconnection's capability named the user the client claimed rather than the principal its holder authenticated, and the control port served a deployment's rows, and published compactions, for anyone who could reach it.
 - Found reviewing the branch: the control protocol authenticated nothing; in a cell with a secret every control request is now signed with it.
+
+Standalone RTDB uses the same ordered journal and authorized PgWire gateway on one machine.
+`initialize-standalone` creates the original directory, journal and key in a private empty directory supplied by the caller.
+A successful initialization records the deployment UUID, journal ID and key digest.
+`standalone` requires those original records and starts a loopback TLS gateway using a supplied certificate, private key and password file.
+The journal accepts connections only inside the standalone process.
+The gateway reports its bound port and installation UUID in the caller's private readiness file.
+`rtdb-multi --build-info` reports the compiled source revision, time-zone data digest and standalone protocol.
+Set `RTDB_REVISION` to the selected full source commit when building a distributable executable.
+A supervisor can start the process with `--parent-stdin` so closing its private pipe requests shutdown.
+The local directory, journal, keys and objects propagate namespace-flush failures to callers.
+On Windows this uses a write-capable directory handle and `FlushFileBuffers`.
+A missing file on a delete retry still requires a directory flush before confirming removal.
 
 ## 1. Ground rules
 
@@ -851,3 +983,18 @@ Indicative, in order; each line is one or a few commits.
 - `test(multi): deterministic cell simulation and the zombie harness`
 
 `feat:` is reserved for what a user can see or do: the gateway, real authorization, the storage root refusal, and the `rtdb multi` roles when they become usable end to end.
+
+### Standalone authority integration
+
+The authority opens and locks its durable logkeeper journal before advertising the member.
+A restarted process reclaims that journal's identity and a replacement journal requires its own identity.
+Standalone persists the directory and the logkeeper journal in its private volume.
+
+The cell-move protocol prepares an isolated destination generation after fencing the source and waiting for its admitted storage operations to drain.
+An accepted archive needed by the selected checkpoint is materialized into that generation before it becomes eligible to serve.
+A retry after a lost placement reply reuses the ready destination.
+
+Hosted disposal by installation ID and classic deletion by name settle through the same fenced disposal operation.
+It waits for admitted storage regions, reconciles remote writes against their recorded provider publication identities, and retires every recorded replica journal.
+The terminal record retains the hosted disposal receipt and signed inventory receipt.
+Deployment-scoped S3 credentials address the same cell-relative publication keys used by reconciliation.

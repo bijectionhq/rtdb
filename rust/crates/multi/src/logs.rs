@@ -52,15 +52,15 @@ impl EnsembleRecorder for DirectoryRecorder {
     async fn reserve_copy(&self, deployment: &str, epoch: u64, servers: &[String]) -> Result<()> {
         for _ in 0..8 {
             let mut record = self.directory.deployment(deployment).await?.ok_or_else(|| Anomaly::incorrect("rtdb.multi/unknown-deployment", format!("No deployment {deployment}")))?;
-            if record.epoch != epoch || record.holder.is_none() {
-                return Err(Anomaly::new(rtdb_types::AnomalyCategory::Conflict, "rtdb.multi/deposed", "The deployment moved on before its log copy was reserved"));
+            if record.epoch != epoch || record.holder.is_none()
+                || !matches!(record.lifecycle, rtdb_directory::Lifecycle::Live | rtdb_directory::Lifecycle::Quarantined) {
+                return Err(Anomaly::new(rtdb_types::AnomalyCategory::Conflict, "rtdb.multi/deposed", "The deployment moved on before its journal inventory was reserved"));
             }
-            let mut endpoints = record.log_copy_servers.clone();
-            endpoints.extend_from_slice(servers);
-            endpoints.sort_unstable();
-            endpoints.dedup();
-            if endpoints == record.log_copy_servers { return Ok(()); }
-            record.log_copy_servers = endpoints;
+            let mut endpoints = record.replica_journals.clone();
+            endpoints.extend(record.log_copy_servers.iter().cloned());
+            endpoints.extend(servers.iter().cloned());
+            if endpoints == record.replica_journals { return Ok(()); }
+            record.replica_journals = endpoints;
             let version = record.version;
             if let rtdb_directory::Cas::Applied(_) = self.directory.replace_deployment(record, version).await? { return Ok(()); }
         }
@@ -96,10 +96,12 @@ impl LogFactory for LogkeeperLogFactory {
         let stream = StreamConfig { servers: config.servers.clone(), stream: config.replica_stream.clone(), write_quorum: config.write_quorum, maximum_message_bytes: self.maximum_message_bytes };
         let quorum: Arc<dyn Log> = match access {
             LogAccess::ReadWrite => {
+                // An interrupted copy can leave records even if the new
+                // ensemble never becomes the reported serving ensemble.
+                self.recorder.reserve_copy(&config.deployment, config.epoch, &stream.servers).await?;
                 let writer = match &config.previous_servers {
                     Some(previous) => {
-                        let endpoints = previous.iter().chain(&config.servers).cloned().collect::<Vec<_>>();
-                        self.recorder.reserve_copy(&config.deployment, config.epoch, &endpoints).await?;
+                        self.recorder.reserve_copy(&config.deployment, config.epoch, previous).await?;
                         let moved = rtdb_logkeeper::open_writer_on(vec![rtdb_logkeeper::Loglet { servers: previous.clone(), start_lsn: 0 }], stream, config.epoch, rtdb_logkeeper::CopyFrom::Retained, cancellation.clone()).await?;
                         // Recorded before the writer appends: until then the old ensemble, sealed and complete, still holds everything.
                         self.recorder.record(&config.deployment, config.epoch, config.ensemble.iter().map(|id| rtdb_directory::MemberId(id.clone())).collect()).await?;
@@ -114,7 +116,7 @@ impl LogFactory for LogkeeperLogFactory {
             LogAccess::SourceWriter => return Err(Anomaly::unsupported("rtdb.multi/source-writer",
                 "A deployment has one writer, its holder; submissions reach it through the gateway")),
         };
-        let replica: Arc<dyn Log> = Arc::new(SealedLog { inner: quorum, cipher: Arc::new(Cipher::new(&self.keys.key(&config.deployment)?)?), stream: Arc::from(config.replica_stream.as_str()) });
+        let replica: Arc<dyn Log> = Arc::new(SealedLog { inner: quorum, cipher: Arc::new(Cipher::new(&self.keys.key(&config.deployment).await?)?), stream: Arc::from(config.replica_stream.as_str()) });
         let next = next_source_offset(replica.as_ref(), epoch).await?;
         let intake = Arc::new(IntakeLog { log: MemoryLog::starting_at(self.maximum_message_bytes, LogOffset(next)), consumed: Arc::new(AtomicI64::new(next - 1)), start: next });
         let trimming = {

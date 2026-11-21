@@ -18,6 +18,7 @@ pub struct RecoveredPartition {
     pub block: Option<BlockCatalog>,
     pub progress: AppliedProgress,
     pub fence: TermFence,
+    pub(crate) compaction_replay_cutoff: Option<ReplicaPosition>,
     table_blocks: BTreeMap<rtdb_types::TableRef, TableBlock>,
 }
 impl RecoveredPartition {
@@ -110,6 +111,9 @@ pub enum BlockDiscovery {
     List,
     /// Probes forward from a block known to have been published, one head per block, never listing; a hint naming a block that is gone falls back to listing.
     From(BlockIndex),
+    /// A restored serving generation requires its archived checkpoint and suppresses
+    /// physical compaction effects from the sealed history preceding restoration.
+    FromRestored { checkpoint: BlockIndex, compaction_cutoff: ReplicaPosition },
     /// Recovers exactly this block, for a reader of the state as of it.
     At(BlockIndex),
 }
@@ -127,6 +131,10 @@ impl BlockStore {
         Ok(Arc::new(Self { store, cache, memory, file_size_target }))
     }
     pub async fn recover(&self, config: TrieConfig, source_floor: SourcePosition, now: Timestamp, discovery: BlockDiscovery) -> Result<RecoveredPartition> {
+        let compaction_replay_cutoff = match discovery {
+            BlockDiscovery::FromRestored { compaction_cutoff, .. } => Some(compaction_cutoff),
+            _ => None,
+        };
         let latest = self.latest_block(discovery).await?;
         let (block, table_blocks) = match latest {
             Some(index) => { let loaded = self.load(index).await?; (Some(loaded.0), loaded.1) }
@@ -141,7 +149,7 @@ impl BlockStore {
             external_token: block.as_ref().and_then(BlockCatalog::external_source_token).map(Arc::from),
         };
         let fence = match &block { Some(block) => TermFence::from_catalog(block)?, None => TermFence::from_boundary(rtdb_types::Term(0), None)? };
-        Ok(RecoveredPartition { partition, block, progress, fence, table_blocks }.with_source_floor(source_floor))
+        Ok(RecoveredPartition { partition, block, progress, fence, table_blocks, compaction_replay_cutoff }.with_source_floor(source_floor))
     }
     async fn latest_block(&self, discovery: BlockDiscovery) -> Result<Option<BlockIndex>> {
         let exists = |index: BlockIndex| async move {
@@ -155,6 +163,11 @@ impl BlockStore {
             BlockDiscovery::At(block) if exists(block).await? => return Ok(Some(block)),
             BlockDiscovery::At(block) => return Err(rtdb_types::Anomaly::new(rtdb_types::AnomalyCategory::Unavailable, "rtdb.replication/block-gone", format!("Block {} is no longer stored", block.0))),
             BlockDiscovery::From(hint) if exists(hint).await? => hint,
+            BlockDiscovery::FromRestored { checkpoint, .. } if exists(checkpoint).await? => checkpoint,
+            BlockDiscovery::FromRestored { checkpoint, .. } => return Err(rtdb_types::Anomaly::new(
+                rtdb_types::AnomalyCategory::Unavailable, "rtdb.replication/block-gone",
+                format!("Restored checkpoint {} is no longer stored", checkpoint.0),
+            )),
             _ => {
                 let directory = ObjectKey::new("blocks")?;
                 return Ok(self.store.list(Some(&directory)).await?.into_iter().filter_map(|entry| block_index_from_key(entry.key.as_str()).ok()).max());

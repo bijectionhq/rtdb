@@ -15,6 +15,7 @@ async fn start_node(directory: &Arc<dyn Directory>, data: &std::path::Path, agen
     let keys: Arc<dyn rtdb_multi::keys::KeyService> = Arc::new(rtdb_multi::keys::LocalKeyService::new(data.join("keys")).unwrap());
     let claim_wait = std::env::var("RTDB_TEST_PLACED_CLAIM_WAIT_MS").ok().map_or(2, |ms| ms.parse().unwrap());
     process::start_node(Arc::clone(directory), process::NodeSettings {
+        advertise_host: None,
         configuration: NodeConfiguration::from_yaml("authn: !SingleRootUser\n  password: cell-test\nserver:\n  port: 0\n").unwrap(), allocation_limit_bytes: 1 << 30,
         control: "127.0.0.1:0".parse().unwrap(), availability_zone: format!("zone-{index}"), agent, lease: lease(), claim_wait: Duration::from_millis(claim_wait), pool,
         keys, cache_dir: data.join(format!("cache-{index}")), local_compaction: !compaction_workers, capabilities: Some(secret()),
@@ -58,7 +59,7 @@ impl Cell {
 
     /// A cell keeping its objects in `objects`, or in a directory of its own.
     pub async fn start_on(objects: Option<CellStorage>, pools: Vec<MemberPool>, park_after: Option<Duration>, watch: Option<Duration>, cells: Option<(Arc<dyn rtdb_multi::cells::CellMap>, String)>) -> Self {
-        Self::start_configured(objects, pools, park_after, watch, cells, false, |_| {}).await
+        Self::start_configured(objects, pools, park_after, watch, cells, true, |_| {}).await
     }
 
     pub async fn start_durable(nodes: usize) -> Self {
@@ -82,6 +83,7 @@ impl Cell {
         let mut logkeepers = Vec::new();
         for index in 0..3 {
             logkeepers.push(process::start_logkeeper(Arc::clone(&directory), process::LogkeeperSettings {
+                advertise_host: None,
                 listen: "127.0.0.1:0".parse().unwrap(), data_dir: data.path().join(format!("logkeeper-{index}")), fsync, cache_bytes: rtdb_logkeeper::ServerOptions::DEFAULT_CACHE_BYTES,
                 availability_zone: format!("zone-{index}"), lease: lease(),
             }).await.unwrap());
@@ -110,7 +112,8 @@ impl Cell {
     pub async fn add_logkeeper(&mut self) {
         let index = self.logkeepers.len() + 10;
         self.logkeepers.push(process::start_logkeeper(Arc::clone(&self.directory), process::LogkeeperSettings {
-            listen: "127.0.0.1:0".parse().unwrap(), data_dir: self.data.path().join(format!("logkeeper-{index}")), fsync: false, cache_bytes: rtdb_logkeeper::ServerOptions::DEFAULT_CACHE_BYTES,
+            advertise_host: None,
+            listen: "127.0.0.1:0".parse().unwrap(), data_dir: self.data.path().join(format!("logkeeper-{index}")), fsync: true, cache_bytes: rtdb_logkeeper::ServerOptions::DEFAULT_CACHE_BYTES,
             availability_zone: format!("zone-{index}"), lease: lease(),
         }).await.unwrap());
     }

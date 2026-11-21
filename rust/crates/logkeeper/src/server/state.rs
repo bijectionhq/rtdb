@@ -114,7 +114,7 @@ impl<P: Payload> StreamState<P> {
                 self.commit = self.commit.max(*through);
             }
             Event::Drop(epoch) => {
-                *self = Self { promised: *epoch, dropped: true, ..Self::default() };
+                *self = Self { promised: self.promised.max(*epoch), dropped: true, ..Self::default() };
             }
         }
     }
@@ -130,7 +130,7 @@ impl<P: Payload> StreamState<P> {
 
     /// Refuses a writer that is not the one this server is synced to.
     fn check_writer(&self, epoch: u64) -> Option<ResponseBody> {
-        (self.promised != epoch || self.synced != Some(epoch)).then(|| self.refused())
+        (self.dropped || self.promised != epoch || self.synced != Some(epoch)).then(|| self.refused())
     }
 
     fn commit_event(&self, commit: i64, last: i64) -> Option<Event> {

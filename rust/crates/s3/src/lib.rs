@@ -9,7 +9,7 @@ pub use versions::VersionedInventory;
 
 use std::sync::Arc;
 use aws_credential_types::provider::SharedCredentialsProvider;
-use object_store::{StaticCredentialProvider, aws::{AmazonS3Builder, AmazonS3ConfigKey, AwsCredential, S3ConditionalPut, S3CopyIfNotExists}};
+use object_store::{RetryConfig, StaticCredentialProvider, aws::{AmazonS3Builder, AmazonS3ConfigKey, AwsCredential, S3ConditionalPut, S3CopyIfNotExists}};
 use rtdb_format::generated::xtdb::aws::proto as pb;
 use rtdb_format::keys::StorageRoot;
 use rtdb_storage::{IoRegion, ObjectKey, ObjectStore, remote::RemoteStore};
@@ -72,6 +72,16 @@ impl S3Config {
     /// Credential aliases are resolved at opening; default credentials refresh during requests.
     /// The owner closes and joins `io` after store consumers finish and before shutting down the runtime.
     pub async fn open(&self, storage_root: &ObjectKey, remotes: &dyn S3CredentialResolver, io: Arc<IoRegion>) -> Result<Arc<dyn ObjectStore>> {
+        Ok(self.open_store(storage_root, remotes, io, false).await?)
+    }
+
+    /// Opens the cell's immutable namespace. Any result that leaves an
+    /// individual write uncertain belongs to the region's retirement owner.
+    pub async fn open_cell(&self, storage_root: &ObjectKey, remotes: &dyn S3CredentialResolver, io: Arc<IoRegion>) -> Result<Arc<RemoteStore>> {
+        self.open_store(storage_root, remotes, io, true).await
+    }
+
+    async fn open_store(&self, storage_root: &ObjectKey, remotes: &dyn S3CredentialResolver, io: Arc<IoRegion>, cell: bool) -> Result<Arc<RemoteStore>> {
         if self.bucket.is_empty() { return Err(Anomaly::incorrect("xtdb.aws/invalid-config", "S3 bucket is empty")); }
         let prefix = self.object_prefix(storage_root)?;
         let authorization = if let Some(credentials) = self.resolve_credentials(remotes)? {
@@ -83,14 +93,19 @@ impl S3Config {
             let provider = configuration.credentials_provider().ok_or_else(|| Anomaly::incorrect("xtdb.aws/credentials", "AWS default credential provider is unavailable"))?;
             S3Authorization::Rotating { provider, region: configuration.region().map(|region| region.as_ref().to_owned()) }
         };
-        self.open_authorized(prefix, authorization, io)
+        self.open_authorized(prefix, authorization, io, cell)
     }
 
-    fn open_authorized(&self, prefix: ObjectKey, authorization: S3Authorization, io: Arc<IoRegion>) -> Result<Arc<dyn ObjectStore>> {
+    fn open_authorized(&self, prefix: ObjectKey, authorization: S3Authorization, io: Arc<IoRegion>, cell: bool) -> Result<Arc<RemoteStore>> {
         let (endpoint, virtual_hosted) = self.endpoint_addressing()?;
         let mut builder = AmazonS3Builder::from_env().with_bucket_name(&self.bucket)
             .with_virtual_hosted_style_request(virtual_hosted)
-            .with_skip_signature(false).with_conditional_put(S3ConditionalPut::ETagMatch).with_copy_if_not_exists(S3CopyIfNotExists::Multipart);
+            .with_skip_signature(false).with_conditional_put(S3ConditionalPut::ETagMatch);
+        builder = if cell {
+            builder.with_retry(RetryConfig { max_retries: 0, ..RetryConfig::default() })
+        } else {
+            builder.with_copy_if_not_exists(S3CopyIfNotExists::Multipart)
+        };
         if let Some(region) = &self.region { builder = builder.with_region(region); }
         if let Some(endpoint) = endpoint { builder = builder.with_config(AmazonS3ConfigKey::S3Endpoint, endpoint.as_str()).with_allow_http(endpoint.scheme() == "http"); }
         builder = match authorization {
@@ -104,7 +119,12 @@ impl S3Config {
             }
         };
         let client = builder.build().map_err(|error| Anomaly::incorrect("xtdb.aws/invalid-config", error.to_string()))?;
-        Ok(Arc::new(RemoteStore::new_in(Arc::new(client), Some(prefix), io)))
+        let client = Arc::new(client);
+        Ok(Arc::new(if cell {
+            RemoteStore::new_single_put(client, prefix, io)
+        } else {
+            RemoteStore::new_in(client, Some(prefix), io)
+        }))
     }
 
     #[cfg(feature = "versioning")]

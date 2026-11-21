@@ -223,6 +223,20 @@ pub async fn drop_stream(config: &StreamConfig, epoch: u64) -> rtdb_types::Resul
     Err(Error::Remote { key: config.stream.clone(), message: format!("stream drop is incomplete: {}", failures.join("; ")) }.into())
 }
 
+/// Retires a whole stream on every named journal. Each acknowledgment
+/// follows the durable fence and deletion of the superseded segments.
+pub async fn retire(config: &StreamConfig, epoch: u64) -> rtdb_types::Result<()> {
+    validate(config)?;
+    if epoch == 0 { return Err(Anomaly::incorrect("rtdb.logkeeper/invalid-epoch", "epochs start at 1")); }
+    let ensemble = Ensemble::new(config.clone());
+    let replies: Vec<_> = (0..ensemble.len()).map(|server| ensemble.retire(server, epoch)).collect::<FuturesUnordered<_>>().collect().await;
+    let retired = replies.iter().filter(|reply| matches!(reply, Ok(Ack::Accepted(_)))).count();
+    if retired != config.servers.len() {
+        return Err(Error::Remote { key: config.stream.clone(), message: format!("retired {retired} of {} journals", config.servers.len()) }.into());
+    }
+    Ok(())
+}
+
 impl QuorumLog {
     /// The stream's chain as this log reads it, oldest first, ending with the loglet it reads or appends to now.
     pub fn loglets(&self) -> Vec<Loglet> {

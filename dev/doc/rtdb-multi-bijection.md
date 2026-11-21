@@ -75,7 +75,7 @@ Convex-style reactivity stays on the holder, which already has the tail.
 
 ### Erasure
 
-Kernel `erase(unit)` becomes RTDB `ERASE`, applied across the lineage, which is the kernel's "every version, in every world".
+RTDB `ERASE` removes visible versions. The kernel also requires every retained copy of erased protected data to become unreadable within its physical erasure bound. Meeting that bound requires per-unit custody for durable bytes and independent erasure evidence through restores.
 
 ### Wake
 
@@ -93,7 +93,7 @@ The contract is `bijection/crates/storage_contracts/src/world.rs`, described in 
 | `Op::Merge` (`AddI64`, `MaxU64`) evaluated at the commit position | The holder resolves serially, so `UPDATE … SET n = n + k` runs at the commit position | Covered, and simpler than the XTDB adapter's merge at read time |
 | `fork(world, rev)` | Lineage fork, constant time | Covered |
 | `pin(world, at, until)` | Not yet in the spec: the reaper protects only snapshots shorter than `max_snapshot_lifetime` | Gap 1 |
-| `erase(unit)` | `ERASE`, lineage-wide | Covered |
+| `erase(unit)` | `ERASE` removes visible versions | Protected custody and physical erasure remain open |
 | `changes(world, after)` | Log `subscribe` above the checkpoint; below it the log has been trimmed | Gap 2 |
 | Receipts and lost-response recovery | The idempotency window covers `idempotency_window`; kernel receipts outlive it | Receipts stay kernel keys, unchanged |
 | `drop_world` | Deployment deletion, or fork deletion with shared objects transferred | Covered |

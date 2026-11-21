@@ -23,10 +23,12 @@ async fn the_resident_cost_of_an_idle_deployment() {
     let mut logkeepers = Vec::new();
     for index in 0..3 {
         logkeepers.push(process::start_logkeeper(Arc::clone(&directory), process::LogkeeperSettings {
+            advertise_host: None,
             listen: "127.0.0.1:0".parse().unwrap(), data_dir: data.path().join(format!("lk{index}")), fsync: false, cache_bytes: rtdb_logkeeper::ServerOptions::DEFAULT_CACHE_BYTES, availability_zone: format!("z{index}"), lease: lease.clone(),
         }).await.unwrap());
     }
     let node = process::start_node(Arc::clone(&directory), process::NodeSettings {
+        advertise_host: None,
         configuration: NodeConfiguration::from_yaml("server:\n  port: 0\n").unwrap(), allocation_limit_bytes: 4 << 30, control: "127.0.0.1:0".parse().unwrap(),
         availability_zone: "z0".into(), agent: AgentOptions::new(CellStorage::Local { root: data.path().join("objects") }), lease, claim_wait: Duration::from_millis(2),
         pool: MemberPool::General, keys: Arc::new(rtdb_multi::keys::LocalKeyService::new(data.path().join("keys")).unwrap()), cache_dir: data.path().join("cache"), local_compaction: true, capabilities: None,

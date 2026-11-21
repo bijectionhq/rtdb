@@ -35,6 +35,8 @@ pub(crate) enum Outcome {
     Durable(oneshot::Receiver<Result<(), String>>, ResponseBody),
 }
 
+type Compaction = oneshot::Receiver<Result<(), String>>;
+
 impl Store {
     pub fn new(journal: Arc<Journal>, recovered: Vec<Recovered>, queue: mpsc::UnboundedSender<Work>) -> Self {
         let streams = recovered.into_iter().map(|stream| {
@@ -63,7 +65,7 @@ impl Store {
             RequestBody::Seal(seal) => (seal.stream, Box::new(move |state| state.seal(seal.epoch))),
             RequestBody::Trim(trim) => (trim.stream, Box::new(move |state| state.trim(trim.through_lsn))),
             RequestBody::DropStream(drop) => (drop.stream, Box::new(move |state| state.drop_stream(drop.epoch))),
-            RequestBody::Read(_) | RequestBody::Fetch(_) | RequestBody::Check(_) => return Outcome::Now(failed("not a mutation")),
+            RequestBody::Read(_) | RequestBody::Fetch(_) | RequestBody::Check(_) | RequestBody::Retire(_) => return Outcome::Now(failed("not a direct mutation")),
         };
         let slot = self.slot(&stream);
         let mut state = slot.state.lock();
@@ -85,11 +87,51 @@ impl Store {
         if disk <= COMPACTION_SLACK_BYTES { return; }
         let slots: Vec<Arc<Slot>> = self.streams.lock().values().cloned().collect();
         let live: u64 = slots.iter().map(|slot| slot.state.lock().retained_bytes() as u64).sum();
-        if disk <= 2 * live + COMPACTION_SLACK_BYTES || !self.journal.claim_compaction() { return; }
+        if disk <= 2 * live + COMPACTION_SLACK_BYTES { return; }
+        let _ = self.queue_compaction();
+    }
+
+    fn queue_compaction(&self) -> Result<Option<Compaction>, String> {
+        if !self.journal.claim_compaction() { return Ok(None); }
         let streams = self.streams.lock();
         let locked: Vec<_> = streams.values().map(|slot| (slot, slot.state.lock())).collect();
         let captured = locked.iter().map(|(slot, state)| Captured { slot: Arc::clone(slot), state: (**state).clone() }).collect();
-        if self.queue.send(Work { write: Write::Compact(captured), done: oneshot::channel().0 }).is_err() { self.journal.release_compaction(); }
+        let (done, finished) = oneshot::channel();
+        if self.queue.send(Work { write: Write::Compact(captured), done }).is_err() {
+            self.journal.release_compaction();
+            return Err("the journal has stopped".into());
+        }
+        Ok(Some(finished))
+    }
+
+    /// After the fence and trim are durable, wait for a base that contains
+    /// neither acknowledged nor uncommitted payloads of the retired stream.
+    pub async fn retire(&self, body: crate::protocol::Retire) -> ResponseBody {
+        if !self.journal.is_durable() { return failed("retirement requires a durable journal"); }
+        let slot = self.slot(&body.stream);
+        let epoch = body.epoch;
+        let accepted = match self.mutate(RequestBody::DropStream(crate::protocol::DropStream { stream: body.stream, epoch })) {
+            Outcome::Now(reply) => return reply,
+            Outcome::Durable(durable, reply) => match durable.await {
+                Ok(Ok(())) => reply,
+                Ok(Err(error)) => return failed(error),
+                Err(_) => return failed("the journal has stopped"),
+            },
+        };
+        if !matches!(accepted, ResponseBody::Accepted(_)) { return accepted; }
+        loop {
+            let released = self.journal.compaction_finished();
+            if self.journal.compacted_retirement(slot.id, epoch) { return accepted; }
+            match self.queue_compaction() {
+                Ok(Some(finished)) => return match finished.await {
+                    Ok(Ok(())) => accepted,
+                    Ok(Err(error)) => failed(error),
+                    Err(_) => failed("the journal has stopped"),
+                },
+                Ok(None) => released.await,
+                Err(error) => return failed(error),
+            }
+        }
     }
 
     pub fn check(&self, stream: &str, epoch: u64) -> ResponseBody {
@@ -175,7 +217,7 @@ mod tests {
     #[tokio::test]
     async fn a_drop_queued_after_an_older_compaction_schedules_reclamation_again() {
         let directory = tempfile::tempdir().unwrap();
-        let (journal, recovered) = Journal::open(directory.path(), true, 0).unwrap();
+        let (journal, recovered, _) = Journal::open(directory.path(), true, 0, None).unwrap();
         let journal = Arc::new(journal);
         let (queue, work) = mpsc::unbounded_channel();
         let store = Arc::new(Store::new(Arc::clone(&journal), recovered, queue));

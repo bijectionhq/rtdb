@@ -1,7 +1,6 @@
 use std::collections::BTreeMap;
-use rtdb_auth::{AuthConfig, Method, MethodRule, OidcConfig, PasswordHash, Secret};
+use rtdb_auth::{AuthConfig, GrantedAccess, Method, MethodRule, OidcConfig, PasswordHash, Secret};
 use rtdb_format::config::{Yaml, YamlFields, scalar_string};
-use rtdb_node::DatabaseAccess;
 use rtdb_types::{Anomaly, Result};
 use super::invalid;
 
@@ -26,7 +25,12 @@ pub(super) fn decode(value: Yaml, environment: &impl Fn(&str) -> Option<String>)
                 for (user, databases) in YamlFields::new(value, "grants")?.into_entries() {
                     let mut granted = BTreeMap::new();
                     for (database, access) in YamlFields::new(databases, "grant")?.into_entries() {
-                        let access = match scalar_string(&access, "access")?.as_str() { "READ" => DatabaseAccess::Read, "READ_WRITE" => DatabaseAccess::Write, _ => return Err(invalid("A grant's access is READ or READ_WRITE")) };
+                        let access = match scalar_string(&access, "access")?.as_str() {
+                            "DENY" => GrantedAccess::Deny,
+                            "READ" => GrantedAccess::Read,
+                            "READ_WRITE" => GrantedAccess::Write,
+                            _ => return Err(invalid("A grant's access is DENY, READ or READ_WRITE")),
+                        };
                         granted.insert(database, access);
                     }
                     grants.insert(user, granted);

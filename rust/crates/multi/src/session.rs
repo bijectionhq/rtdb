@@ -13,9 +13,9 @@ use std::time::Duration;
 use bytes::{BufMut, Bytes, BytesMut};
 use rtdb_directory::{DeploymentRecord, Directory, Lifecycle};
 use rtdb_types::{Anomaly, AnomalyCategory, Result};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
-use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
+use tokio::net::tcp::OwnedWriteHalf;
 use tokio::sync::{mpsc, watch};
 use tokio_util::task::AbortOnDropHandle;
 
@@ -39,7 +39,7 @@ impl Frame {
     }
 }
 
-async fn read_frame(reader: &mut OwnedReadHalf) -> std::io::Result<Option<Frame>> {
+async fn read_frame(reader: &mut (impl AsyncRead + Unpin)) -> std::io::Result<Option<Frame>> {
     let tag = match reader.read_u8().await {
         Ok(tag) => tag,
         Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
@@ -54,7 +54,7 @@ async fn read_frame(reader: &mut OwnedReadHalf) -> std::io::Result<Option<Frame>
 }
 
 /// Reads frames off `reader` into a channel, so the session can wait on both directions without losing a partly read frame.
-fn pump(mut reader: OwnedReadHalf) -> (mpsc::Receiver<std::io::Result<Frame>>, AbortOnDropHandle<()>) {
+fn pump(mut reader: impl AsyncRead + Unpin + Send + 'static) -> (mpsc::Receiver<std::io::Result<Frame>>, AbortOnDropHandle<()>) {
     let (sender, receiver) = mpsc::channel(64);
     let task = tokio::spawn(async move {
         loop {
@@ -111,6 +111,7 @@ pub struct Grants { pub secret: Arc<crate::capability::CellSecret>, pub paramete
 
 pub struct Session {
     startup: Bytes,
+    installation_status: Option<Frame>,
     grants: Option<Grants>,
     /// The principal the first backend authenticated and reported it may be vouched for, for whom the gateway mints its reconnections' capabilities.
     authenticated: Option<String>,
@@ -140,7 +141,17 @@ pub struct Session {
 impl Session {
     pub fn new(startup: Bytes, router: Arc<dyn Router>, directory: Arc<dyn Directory>, deployment: String, grants: Option<Grants>, keyed: bool) -> Self {
         let record = rtdb_directory::watch_deployment(directory, deployment, RECONNECT_RETRY_DELAY);
-        Self { startup, grants, authenticated: None, greeting: Greeting::default(), router, record, prepared: BTreeMap::new(), status: Status::Busy, pending: Vec::new(), prepared_responses: 0, answered: false, lost_unanswered: false, discarding: false, keyed, key: None, swallowing: 0 }
+        Self { startup, installation_status: None, grants, authenticated: None, greeting: Greeting::default(), router, record, prepared: BTreeMap::new(), status: Status::Busy, pending: Vec::new(), prepared_responses: 0, answered: false, lost_unanswered: false, discarding: false, keyed, key: None, swallowing: 0 }
+    }
+
+    pub(crate) fn with_installation(mut self, installation: Option<uuid::Uuid>) -> Self {
+        self.installation_status = installation.map(|id| {
+            let mut body = BytesMut::from(&b"rtdb_installation_id\0"[..]);
+            body.extend_from_slice(id.simple().to_string().as_bytes());
+            body.put_u8(0);
+            Frame { tag: b'S', body: body.freeze() }
+        });
+        self
     }
 
     /// Reconnects to the current holder, retrying through a failover: until the dead holder's lease expires, no other node may claim.
@@ -205,30 +216,50 @@ impl Session {
     }
 
     /// Runs the session over an already-routed first backend whose greeting the client has not yet seen.
-    pub async fn run(mut self, client: TcpStream, first: TcpStream, first_control: Option<String>, first_epoch: u64) -> Result<()> {
-        let (client_read, mut client_write) = client.into_split();
+    pub async fn run(
+        mut self, client: impl AsyncRead + AsyncWrite + Unpin + Send + 'static,
+        first: TcpStream, first_control: Option<String>, first_epoch: u64,
+    ) -> Result<()> {
+        let (client_read, mut client_write) = tokio::io::split(client);
         let (mut requests, _client_reader) = pump(client_read);
         let mut first = Backend::new(first, first_epoch);
         first.heartbeat = first_control.and_then(|address| self.router.start_touching(address)).map(AbortOnDropHandle::new);
         let mut backend = Some(first);
-        enum Event { Request(Option<std::io::Result<Frame>>), Reply(Option<std::io::Result<Frame>>) }
+        enum Event {
+            Request(Option<std::io::Result<Frame>>),
+            Reply(Option<std::io::Result<Frame>>),
+            Retired,
+        }
         let outcome = async {
             backend.as_mut().expect("just set").writer.write_all(&self.startup).await.map_err(io)?;
             loop {
                 let event = {
                     let Some(current) = backend.as_mut() else { break Ok(()) };
-                    if let Some(deadline) = current.drain_deadline {
-                        let reply = tokio::time::timeout_at(deadline, current.frames.recv()).await
-                            .map_err(|_| lost("timed out draining the failed connection; the command's outcome is unknown"))?;
-                        Event::Reply(reply)
-                    } else {
-                        tokio::select! {
-                            request = requests.recv() => Event::Request(request),
-                            reply = current.frames.recv() => Event::Reply(reply),
-                        }
+                    tokio::select! {
+                        biased;
+                        _ = self.record.wait_for(|record| record.as_ref().is_some_and(|record| {
+                            matches!(record.lifecycle, Lifecycle::Deleting | Lifecycle::Restoring)
+                                || record.lifecycle == Lifecycle::Deleted && record.moved_at_ms.is_none()
+                        })) => Event::Retired,
+                        event = async {
+                            if let Some(deadline) = current.drain_deadline {
+                                let reply = tokio::time::timeout_at(deadline, current.frames.recv()).await
+                                    .map_err(|_| lost("timed out draining the failed connection; the command's outcome is unknown"))?;
+                                return Ok::<_, Anomaly>(Event::Reply(reply));
+                            }
+                            tokio::select! {
+                                request = requests.recv() => Ok(Event::Request(request)),
+                                reply = current.frames.recv() => Ok(Event::Reply(reply)),
+                            }
+                        } => event?,
                     }
                 };
                 match event {
+                    Event::Retired => {
+                        client_write.write_all(&error_frame("08006", "The installation has retired").encode()).await.map_err(io)?;
+                        client_write.flush().await.map_err(io)?;
+                        break Ok(());
+                    }
                     Event::Request(None) => break Ok(()),
                     Event::Request(Some(request)) => {
                         let request = request.map_err(io)?;
@@ -260,8 +291,14 @@ impl Session {
                     Event::Reply(Some(Ok(frame))) => {
                         if !self.greeting.done {
                             self.greeting.observe(&frame, &mut self.authenticated);
-                            if self.greeting.done { self.status = Status::Idle; }
+                            if self.greeting.done {
+                                self.status = Status::Idle;
+                                if let Some(installation) = self.installation_status.take() {
+                                    client_write.write_all(&installation.encode()).await.map_err(io)?;
+                                }
+                            }
                             client_write.write_all(&frame.encode()).await.map_err(io)?;
+                            client_write.flush().await.map_err(io)?;
                             if frame.tag == b'E' { break Ok(()); }
                             continue;
                         }
@@ -307,6 +344,7 @@ impl Session {
                             _ => {}
                         }
                         client_write.write_all(&frame.encode()).await.map_err(io)?;
+                        client_write.flush().await.map_err(io)?;
                     }
                     Event::Reply(Some(Err(_)) | None) => {
                         if !self.greeting.done { break Err(lost("the holder closed during session startup")); }
@@ -329,6 +367,7 @@ impl Session {
         }.await;
         if let Err(error) = &outcome {
             let _ = client_write.write_all(&error_frame("08006", error.message.as_deref().unwrap_or(error.code.as_ref())).encode()).await;
+            let _ = client_write.flush().await;
         }
         outcome
     }

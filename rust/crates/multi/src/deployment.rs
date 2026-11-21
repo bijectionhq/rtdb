@@ -55,9 +55,29 @@ impl CellStorage {
     pub async fn bucket(&self, io: std::sync::Arc<rtdb_storage::IoRegion>) -> rtdb_types::Result<crate::reference::Bucket> {
         match self {
             CellStorage::Local { root } => Ok(std::sync::Arc::new(rtdb_storage::LocalStore::open_in(root, io)?)),
-            CellStorage::S3 { config } => {
-                let root = rtdb_storage::ObjectKey::new(S3_CELL_ROOT).map_err(rtdb_types::Anomaly::from)?;
-                config.open(&root, &std::collections::BTreeMap::<String, rtdb_s3::S3Credentials>::new(), io).await
+            CellStorage::S3 { config } => Ok(Self::s3_bucket(config, io).await?),
+        }
+    }
+
+    pub(crate) async fn s3_bucket(
+        config: &rtdb_s3::S3Config,
+        io: std::sync::Arc<rtdb_storage::IoRegion>,
+    ) -> rtdb_types::Result<std::sync::Arc<rtdb_storage::remote::RemoteStore>> {
+        let root = rtdb_storage::ObjectKey::new(S3_CELL_ROOT)?;
+        config.open_cell(&root, &std::collections::BTreeMap::<String, rtdb_s3::S3Credentials>::new(), io).await
+    }
+
+    pub(crate) async fn purge_serving_inventory(
+        &self,
+        deployment: &rtdb_storage::ObjectKey,
+    ) -> rtdb_types::Result<rtdb_directory::ServingInventory> {
+        match self {
+            Self::Local { .. } => Ok(rtdb_directory::ServingInventory::LocalDirectory),
+            Self::S3 { config } => {
+                let root = rtdb_storage::ObjectKey::new(S3_CELL_ROOT)?;
+                let remotes = std::collections::BTreeMap::<String, rtdb_s3::S3Credentials>::new();
+                config.versioned_inventory(&root, &remotes).await?.purge(deployment).await?;
+                Ok(rtdb_directory::ServingInventory::S3VersionsAndUploads)
             }
         }
     }
@@ -140,7 +160,7 @@ fn namespace_id(bytes: &[u8]) -> Result<uuid::Uuid> {
 }
 
 pub(crate) async fn storage_namespaces(bucket: &dyn ObjectStore, keys: &dyn crate::keys::KeyService) -> Result<rtdb_directory::StorageNamespaces> {
-    Ok(rtdb_directory::StorageNamespaces { objects: storage_namespace(bucket).await?, keys: keys.namespace_id()? })
+    Ok(rtdb_directory::StorageNamespaces { objects: storage_namespace(bucket).await?, keys: keys.namespace_id().await? })
 }
 
 pub(crate) fn require_storage_namespaces(record: &DeploymentRecord, namespaces: rtdb_directory::StorageNamespaces) -> Result<()> {

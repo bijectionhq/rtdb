@@ -802,6 +802,8 @@ rule LeaderProcessesTx {
     ensures:
         -- Resolve and stage on the resolver's queue, advancing the RESOLVED head.
         -- An aborted transaction is staged too, and still consumes a tx_id (live-index.allium, AbortTransaction).
+        -- A transaction with rtdb_ordered_system_time enabled in user metadata aborts before evaluating mutations if its requested system time precedes the source message timestamp.
+        -- The refused transaction uses the normally assigned system time, so it still advances the resolved head.
         -- An invalid valid-time interval reports its two bounds as instants in the transaction failure and the durable error.
     -- An UPDATE produces a new version for a row when an assigned value changes under type-sensitive equality.
         -- A SQL mutation that targets a reserved table aborts with the table reference in the error data.

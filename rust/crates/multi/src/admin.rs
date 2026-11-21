@@ -1,11 +1,11 @@
 //! Cell administration: creating, moving, rebalancing, forking and deleting deployments, and confirming dead members (`CreateDeployment`, `IntendMove`, `Rebalance`, `Fork`, `BeginDeletion`, `EraseAndProve`, `ExpireLease`).
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 use std::time::Duration;
 
 pub use rtdb_directory::DeletionRecord;
-use rtdb_directory::{Cas, CellMove, CellMovePhase, DeletionFacts, DeploymentRecord, MoveNamespaces, Directory, Lifecycle, MemberId, MemberPool, MemberRecord, MemberRole, MemberState, PlacementMove, StorageNamespaces, effective_holder, now_ms};
+use rtdb_directory::{Cas, CellMove, CellMovePhase, DeletionFacts, DeploymentRecord, DisposalReceipt, ServingInventory, MoveNamespaces, Directory, Lifecycle, MemberId, MemberPool, MemberRecord, MemberRole, MemberState, PlacementMove, StorageNamespaces, effective_holder, now_ms};
 use rtdb_logkeeper::StreamConfig;
 use rtdb_storage::log::Log;
 use rtdb_types::{Anomaly, AnomalyCategory, Result};
@@ -39,10 +39,63 @@ fn validate_org(org: &str) -> Result<()> {
     Ok(())
 }
 
+/// Installs the root named by a hosting authority. A retry recovers the
+/// original installation even if the first directory response was lost.
+pub async fn install_deployment(
+    directory: &dyn Directory,
+    id: uuid::Uuid,
+    name: &str,
+    org: &str,
+    replicas: usize,
+) -> Result<DeploymentRecord> {
+    if replicas == 0 {
+        return Err(Anomaly::incorrect("rtdb.multi/install-identity", "The installation needs a logkeeper ensemble"));
+    }
+    let mut installation = installation_record(id, name, org)?;
+    let id = installation.id.clone();
+    let confirm = |installed: DeploymentRecord| {
+        if installed.id == id && installed.org == org && installed.parent.is_none()
+            && installed.linearizable_reads && matches!(installed.lifecycle, Lifecycle::Live | Lifecycle::Quarantined)
+            && installed.ensemble.len() == replicas
+        {
+            Ok(installed)
+        } else {
+            Err(Anomaly::new(AnomalyCategory::Conflict, "rtdb.multi/install-conflict", format!("{name} belongs to another installation")))
+        }
+    };
+    if let Some(existing) = directory.deployment_by_name(name).await? {
+        return confirm(existing);
+    }
+    installation.ensemble = choose_ensemble(directory, &installation, replicas).await?;
+    match directory.create_deployment(installation).await {
+        Ok(stored) => Ok(stored),
+        Err(error) => match directory.deployment_by_name(name).await {
+            Ok(Some(existing)) => confirm(existing),
+            Ok(None) | Err(_) => Err(error),
+        },
+    }
+}
+
+pub(crate) fn installation_record(id: uuid::Uuid, name: &str, org: &str) -> Result<DeploymentRecord> {
+    if id.is_nil() || !valid_installation_name(name) || !valid_installation_name(org) {
+        return Err(Anomaly::incorrect("rtdb.multi/install-identity", "Invalid deployment installation identity"));
+    }
+    let mut installation = DeploymentRecord::new(name, org, Vec::new(), now_ms());
+    installation.id = id.to_string();
+    installation.lineage = installation.id.clone();
+    installation.linearizable_reads = true;
+    Ok(installation)
+}
+
+fn valid_installation_name(part: &str) -> bool {
+    !part.is_empty() && part.len() <= 128 && part != "." && part != ".."
+        && part.bytes().all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+}
+
 async fn choose_ensemble(directory: &dyn Directory, record: &DeploymentRecord, replicas: usize) -> Result<Vec<MemberId>> {
     let now = now_ms();
     let members = directory.members().await?;
-    let logkeepers: Vec<_> = members.iter().filter(|member| member.role == MemberRole::Logkeeper && member.is_live(now)).collect();
+    let logkeepers: Vec<_> = members.iter().filter(|member| member.role == MemberRole::Logkeeper && member.state == MemberState::Eligible && member.is_live(now)).collect();
     let selected = select_logkeepers(&record.storage_identity(), replicas, Vec::new(), &logkeepers);
     if selected.len() < replicas {
         return Err(Anomaly::new(AnomalyCategory::Unavailable, "rtdb.multi/too-few-logkeepers", format!("{replicas} logkeeper addresses are needed and {} are live", selected.len())));
@@ -273,7 +326,7 @@ pub async fn fork_at_time(directory: &dyn Directory, storage: &CellStorage, keys
     }
     let servers = replica_servers(directory, &source).await?;
     let stream = StreamConfig { write_quorum: write_quorum(servers.len()), servers, stream: source.stream("replica"), maximum_message_bytes };
-    let reader = crate::logs::SealedLog::new(rtdb_logkeeper::open_reader(stream.clone(), CancellationToken::new()).await?, &keys.existing(&source.id)?, &stream.stream)?;
+    let reader = crate::logs::SealedLog::new(rtdb_logkeeper::open_reader(stream.clone(), CancellationToken::new()).await?, &keys.existing(&source.id).await?, &stream.stream)?;
     let tail = crate::logs::transactions_until(&reader, checkpoint.boundary, system_time).await?;
     fork_with_tail(directory, bucket.as_ref(), keys, &source, name, Some(checkpoint.block), tail, maximum_message_bytes).await
 }
@@ -287,7 +340,7 @@ async fn fork_with_tail(directory: &dyn Directory, bucket: &dyn rtdb_storage::Ob
     child.storage_namespaces = source.storage_namespaces;
     // The parent's checkpoint names positions in the parent's logs, not the fork's: the fork's first holder finds its block by listing, and publishes the fork's own.
     child.ensemble = choose_ensemble(directory, &child, source.ensemble.len()).await?;
-    let key = keys.existing(&source.id)?;
+    let key = keys.existing(&source.id).await?;
     let child_stream = if tail.is_empty() {
         None
     } else {
@@ -295,11 +348,12 @@ async fn fork_with_tail(directory: &dyn Directory, bucket: &dyn rtdb_storage::Ob
         child.epoch = 1;
         crate::logs::renumber_into(&mut tail, rtdb_types::StorageEpoch(child.log_epoch))?;
         let servers = replica_servers(directory, &child).await?;
+        child.replica_journals.extend(servers.iter().cloned());
         Some(StreamConfig { write_quorum: write_quorum(servers.len()), servers, stream: child.stream("replica"), maximum_message_bytes })
     };
     let prepared = async {
         crate::reference::fork(bucket, &source.storage_prefix(), &child.storage_prefix(), at_block).await?;
-        keys.install(&child.id, key)?;
+        keys.install(&child.id, key).await?;
         if let Some(stream) = &child_stream {
             let writer = rtdb_logkeeper::open_writer(stream.clone(), child.epoch, CancellationToken::new()).await?;
             let writer = crate::logs::SealedLog::new(writer, &key, &stream.stream)?;
@@ -351,7 +405,7 @@ async fn publish_fork(directory: &dyn Directory, source: &DeploymentRecord, chil
 }
 
 async fn discard_fork(bucket: &dyn rtdb_storage::ObjectStore, keys: &dyn KeyService, child: &DeploymentRecord, stream: Option<&StreamConfig>) -> Result<()> {
-    let key_removed = keys.destroy(&child.id);
+    let key_removed = keys.destroy(&child.id).await;
     let erase_objects = async {
         if !crate::reference::erase_deployment(bucket, &child.storage_prefix(), &[]).await? {
             return Err(Anomaly::fault("rtdb.multi/fork-cleanup", format!("Storage still contains staged objects for {}", child.id)));
@@ -360,7 +414,7 @@ async fn discard_fork(bucket: &dyn rtdb_storage::ObjectStore, keys: &dyn KeyServ
     };
     let erase_tail = async {
         if let Some(stream) = stream {
-            rtdb_logkeeper::drop_stream(stream, child.epoch + 1).await?;
+            rtdb_logkeeper::retire(stream, child.epoch + 1).await?;
         }
         Ok(())
     };
@@ -439,8 +493,8 @@ pub async fn move_cell(map: &dyn crate::cells::CellMap, from: &CellHandle<'_>, t
     }
 
     let previous_ensemble = replica_servers(from.directory, &current).await?;
-    let key = if existing.is_some() { from.keys.existing(&current.id)? } else { from.keys.key(&current.id)? };
-    to.keys.validate_install(&current.id, &key)?;
+    let key = if existing.is_some() { from.keys.existing(&current.id).await? } else { from.keys.key(&current.id).await? };
+    to.keys.validate_install(&current.id, &key).await?;
 
     if fencing.lifecycle == Lifecycle::Live {
         fencing.lifecycle = Lifecycle::Moving;
@@ -454,12 +508,16 @@ pub async fn move_cell(map: &dyn crate::cells::CellMap, from: &CellHandle<'_>, t
         .ok_or_else(|| move_conflict(name, "the source changed before preparation started"))?;
 
     let stream = StreamConfig { write_quorum: write_quorum(previous_ensemble.len()), servers: previous_ensemble.clone(), stream: fenced.stream("replica"), maximum_message_bytes };
+    await_storage_drain(from.directory, from.storage, from.keys, &fenced).await?;
     rtdb_logkeeper::seal(&stream, fenced.epoch).await?;
     crate::reference::materialize(source.as_ref(), source_prefix.as_str(), target.as_ref(), destination_prefix.as_str()).await?;
+    if let Some(archive) = crate::archive::ArchivedCheckpoint::load(&fenced, rtdb_storage::IoRegion::new()).await? {
+        archive.materialize(&destination, Arc::clone(&target)).await?;
+    }
     if let Some(checkpoint) = fenced.checkpoint {
         crate::reference::verify_block_pack(target.as_ref(), destination_prefix.as_str(), checkpoint.block).await?;
     }
-    to.keys.install(&fenced.id, key)?;
+    to.keys.install(&fenced.id, key).await?;
     let ensemble = choose_ensemble(to.directory, &fenced, fenced.ensemble.len()).await?;
 
     let prepared = update(from.directory, name, |record| {
@@ -481,8 +539,8 @@ async fn move_namespaces(from: &CellHandle<'_>, to: &CellHandle<'_>, source: &dy
     if source_objects == destination_objects {
         return Err(Anomaly::incorrect("rtdb.multi/shared-cell-storage", "Cell moves require distinct source and destination object stores"));
     }
-    let source_keys = from.keys.namespace_id()?;
-    let destination_keys = to.keys.namespace_id()?;
+    let source_keys = from.keys.namespace_id().await?;
+    let destination_keys = to.keys.namespace_id().await?;
     if source_keys == destination_keys {
         return Err(Anomaly::incorrect("rtdb.multi/shared-cell-keys", "Cell moves require distinct source and destination key namespaces"));
     }
@@ -505,6 +563,8 @@ async fn finish_cell_move(map: &dyn crate::cells::CellMap, from: &CellHandle<'_>
     incoming.cell_move = None;
     incoming.moved_at_ms = None;
     incoming.source_cleanup = None;
+    incoming.checkpoint_recovery = None;
+    incoming.storage_regions.clear();
     incoming.move_intent = None;
     incoming.placement_move = None;
     incoming.activation_crashes = 0;
@@ -595,35 +655,14 @@ pub async fn delete_deployment(directory: &dyn Directory, storage: &CellStorage,
                 if record.storage_namespaces.is_none() { record.storage_namespaces = legacy_namespace; }
                 require_storage_namespaces(record, namespaces)
             }
-            Lifecycle::Moving => Err(Anomaly::new(AnomalyCategory::Conflict, "rtdb.multi/move-in-progress", format!("{name} is moving between cells"))),
+            Lifecycle::Moving | Lifecycle::Restoring => Err(Anomaly::new(AnomalyCategory::Conflict, "rtdb.multi/move-in-progress", format!("{name} is moving or restoring"))),
             Lifecycle::Deleted => Ok(()),
         }
     }).await?;
     if fenced.lifecycle == Lifecycle::Deleted { return deletion_receipt(fenced); }
-    let mut servers = ensemble_servers(&fenced, &members(directory).await?)?;
-    if let Some(previous) = &fenced.move_from {
-        for server in previous {
-            if !servers.contains(server) { servers.push(server.clone()); }
-        }
-    }
-    servers.extend(fenced.log_copy_servers.iter().cloned());
-    servers.sort_unstable();
-    servers.dedup();
-    let stream = StreamConfig { write_quorum: write_quorum(servers.len()), servers, stream: fenced.stream("replica"), maximum_message_bytes };
-    rtdb_logkeeper::drop_stream(&stream, fenced.epoch).await?;
-    let others: Vec<DeploymentRecord> = directory.deployments().await?.into_iter().filter(|record| record.id != fenced.id).collect();
-    let receipt = finish_deletion(storage, bucket.as_ref(), &fenced, &others, keys).await?;
-    let deleted = update(directory, name, |record| {
-        if record.id != fenced.id || record.epoch != fenced.epoch || record.storage_prefix() != receipt.facts.storage_prefix {
-            return Err(deletion_changed(name));
-        }
-        require_storage_namespaces(record, namespaces)?;
-        if record.lifecycle == Lifecycle::Deleted { return Ok(()); }
-        if record.lifecycle != Lifecycle::Deleting { return Err(deletion_changed(name)); }
-        record.deletion_record = Some(receipt.clone());
-        record.lifecycle = Lifecycle::Deleted;
-        Ok(())
-    }).await?;
+    await_storage_drain(directory, storage, keys, &fenced).await?;
+    finish_disposal(directory, storage, keys, &fenced.id, maximum_message_bytes).await?;
+    let deleted = directory.deployment(&fenced.id).await?.ok_or_else(|| deletion_changed(name))?;
     deletion_receipt(deleted)
 }
 
@@ -653,28 +692,234 @@ fn deletion_receipt(mut tombstone: DeploymentRecord) -> Result<DeletionRecord> {
     Ok(receipt)
 }
 
-async fn finish_deletion(storage: &CellStorage, bucket: &dyn rtdb_storage::ObjectStore, deployment: &DeploymentRecord, others: &[DeploymentRecord], keys: &dyn KeyService) -> Result<DeletionRecord> {
-    let storage_prefix = deployment.storage_prefix();
-    let namespaces = deployment.storage_namespaces.ok_or_else(|| {
-        Anomaly::fault("rtdb.multi/storage-binding-missing", format!("{} has no storage binding", deployment.name))
-    })?;
-    if !crate::reference::erase_deployment(bucket, &storage_prefix, others).await? {
-        return Err(Anomaly::new(AnomalyCategory::Unavailable, "rtdb.multi/deletion-incomplete", format!("Storage still contains objects for {}", deployment.name)));
+pub(crate) async fn update_installation(
+    directory: &dyn Directory,
+    id: &str,
+    change: impl Fn(&mut DeploymentRecord) -> Result<()>,
+) -> Result<DeploymentRecord> {
+    for _ in 0..8 {
+        let current = directory.deployment(id).await?.ok_or_else(|| {
+            Anomaly::incorrect("rtdb.multi/unknown-installation", format!("No installation has ID {id}"))
+        })?;
+        let mut next = current.clone();
+        change(&mut next)?;
+        if next == current {
+            return Ok(current);
+        }
+        if let Cas::Applied(stored) = directory.replace_deployment(next, current.version).await? {
+            return Ok(stored);
+        }
     }
-    let inventory = storage.purge_inventory(&rtdb_storage::ObjectKey::new(&storage_prefix)?).await?;
-    let objects_erased_at_ms = now_ms();
-    keys.destroy(&deployment.id)?;
-    keys.sign_deletion(DeletionFacts {
-        deployment: deployment.id.clone(),
-        name: deployment.name.clone(),
-        epoch: deployment.epoch,
-        storage_prefix,
-        namespaces,
-        inventory,
-        key_destroyed_at_ms: now_ms(),
-        objects_erased_at_ms,
-        verified_empty: true,
-    })
+    Err(Anomaly::new(AnomalyCategory::Conflict, "rtdb.multi/installation-contended", format!("Installation {id} kept changing")))
+}
+
+pub(crate) async fn administration_stream(directory: &dyn Directory, record: &DeploymentRecord, maximum_message_bytes: usize) -> Result<StreamConfig> {
+    let members = members(directory).await?;
+    let servers: Vec<String> = record.ensemble.iter().map(|id| {
+        members.get(id).map(|member| member.address.clone()).ok_or_else(|| {
+            Anomaly::new(AnomalyCategory::Unavailable, "rtdb.multi/administration-ensemble", format!("Logkeeper {id} is missing from the directory"))
+        })
+    }).collect::<Result<_>>()?;
+    Ok(StreamConfig { write_quorum: write_quorum(record.ensemble.len()), servers, stream: record.stream("replica"), maximum_message_bytes })
+}
+
+/// Accepts serving disposal by fencing this installation in the directory.
+pub async fn begin_disposal(directory: &dyn Directory, id: &str) -> Result<DeploymentRecord> {
+    update_installation(directory, id, |record| {
+        match record.lifecycle {
+            Lifecycle::Deleted if record.disposal.is_some() => Ok(()),
+            Lifecycle::Deleting => Ok(()),
+            Lifecycle::Live | Lifecycle::Quarantined if record.move_from.is_none() => {
+                record.lifecycle = Lifecycle::Deleting;
+                record.epoch = record.epoch.checked_add(1).ok_or_else(|| {
+                    Anomaly::fault("rtdb.multi/epoch-exhausted", format!("Installation {id} has no remaining writer epochs"))
+                })?;
+                record.holder = None;
+                record.move_intent = None;
+                Ok(())
+            }
+            _ => Err(Anomaly::new(AnomalyCategory::Conflict, "rtdb.multi/not-disposable", format!("Installation {id} cannot be disposed in this cell"))),
+        }
+    }).await
+}
+
+/// The hosting catalog can accept retirement before provisioning reaches the directory.
+/// Reserve that exact identity as retiring so a late install cannot open it.
+pub(crate) async fn begin_hosted_disposal(directory: &dyn Directory, id: uuid::Uuid, name: &str, org: &str) -> Result<DeploymentRecord> {
+    if id.is_nil() || !valid_installation_name(name) || !valid_installation_name(org) {
+        return Err(Anomaly::incorrect("rtdb.multi/disposal-identity", "Invalid hosted retirement scope"));
+    }
+    let id = id.to_string();
+    let installed = match directory.deployment_by_name(name).await? {
+        Some(installed) => installed,
+        None => {
+            let mut record = DeploymentRecord::new(name, org, Vec::new(), now_ms());
+            record.id = id.clone();
+            record.lineage = id.clone();
+            record.lifecycle = Lifecycle::Deleting;
+            record.epoch = 1;
+            match directory.create_deployment(record).await {
+                Ok(accepted) => return Ok(accepted),
+                Err(error) => directory.deployment_by_name(name).await?.ok_or(error)?,
+            }
+        }
+    };
+    if installed.id != id || installed.org != org || installed.parent.is_some() {
+        return Err(Anomaly::incorrect("rtdb.multi/disposal-identity", "The requested name belongs to another installation"));
+    }
+    begin_disposal(directory, &id).await
+}
+
+/// Fences and removes an installation's serving storage. The tombstone retains its receipt.
+pub async fn delete_installation(directory: &dyn Directory, storage: &CellStorage, keys: &dyn KeyService, id: &str, maximum_message_bytes: usize) -> Result<DisposalReceipt> {
+    let fence = begin_disposal(directory, id).await?;
+    await_storage_drain(directory, storage, keys, &fence).await?;
+    finish_disposal(directory, storage, keys, id, maximum_message_bytes).await
+}
+
+/// Settles a disposal previously accepted by the directory.
+pub async fn finish_disposal(directory: &dyn Directory, storage: &CellStorage, keys: &dyn KeyService, id: &str, maximum_message_bytes: usize) -> Result<DisposalReceipt> {
+    let mut fenced = directory.deployment(id).await?.ok_or_else(|| {
+        Anomaly::incorrect("rtdb.multi/unknown-installation", format!("No installation has ID {id}"))
+    })?;
+    if fenced.lifecycle == Lifecycle::Deleting && !fenced.storage_regions.is_empty() {
+        crate::store::reconcile_storage_regions(directory, storage, keys, &fenced).await?;
+        fenced = directory.deployment(id).await?.ok_or_else(|| {
+            Anomaly::incorrect("rtdb.multi/unknown-installation", format!("No installation has ID {id}"))
+        })?;
+    }
+    match (fenced.lifecycle, fenced.disposal.as_ref()) {
+        (Lifecycle::Deleted, Some(receipt)) => return Ok(receipt.clone()),
+        (Lifecycle::Deleting, None) => {},
+        _ => return Err(Anomaly::new(AnomalyCategory::Conflict, "rtdb.multi/disposal-unaccepted", format!("The directory has not accepted disposal of {id}"))),
+    }
+    require_storage_drained(&fenced)?;
+    let mut stream = administration_stream(directory, &fenced, maximum_message_bytes).await?;
+    let bucket = storage.bucket(rtdb_storage::IoRegion::new()).await?;
+    let namespaces = storage_namespaces(bucket.as_ref(), keys).await?;
+    if fenced.storage_namespaces.is_none() {
+        let configured = configured_cell_storage(directory, &fenced.name).await?;
+        let epoch = fenced.epoch;
+        fenced = update_installation(directory, id, |record| {
+            if record.lifecycle != Lifecycle::Deleting || record.epoch != epoch {
+                return Err(deletion_changed(&record.name));
+            }
+            if record.storage_namespaces.is_none() {
+                record.storage_namespaces = Some(configured);
+            }
+            require_storage_namespaces(record, namespaces)
+        }).await?;
+        require_storage_drained(&fenced)?;
+    }
+    require_storage_namespaces(&fenced, namespaces)?;
+    let prefix = crate::reference::key(&fenced.storage_prefix())?;
+    let others: Vec<DeploymentRecord> = directory.deployments().await?.into_iter()
+        .filter(|record| record.id != fenced.id).collect();
+    crate::reference::require_disjoint_prefix(&prefix, others.iter())?;
+    stream.servers.extend(fenced.replica_journals.iter().cloned());
+    stream.servers.extend(fenced.log_copy_servers.iter().cloned());
+    if let Some(previous) = &fenced.move_from { stream.servers.extend(previous.iter().cloned()); }
+    stream.servers.sort();
+    stream.servers.dedup();
+    stream.write_quorum = write_quorum(stream.servers.len());
+    if !stream.servers.is_empty() {
+        rtdb_logkeeper::retire(&stream, fenced.epoch).await?;
+    }
+    let journals_retired_at_ms = now_ms();
+    let (signed, serving_inventory) = erase_and_sign_disposal(
+        storage, bucket.as_ref(), keys, &fenced, &prefix, &others, namespaces, journals_retired_at_ms,
+    ).await?;
+    let key_withdrawn_at_ms = signed.facts.key_destroyed_at_ms;
+    let receipt = DisposalReceipt {
+        deployment: fenced.id,
+        incarnation: fenced.incarnation,
+        epoch: fenced.epoch,
+        journals: stream.servers.into_iter().collect(),
+        journals_retired_at_ms,
+        key_withdrawn_at_ms,
+        serving_prefix_observed_empty_at_ms: now_ms().max(key_withdrawn_at_ms),
+        serving_inventory,
+    };
+    let deleted = update_installation(directory, id, |record| {
+        if record.epoch != receipt.epoch || record.incarnation != receipt.incarnation
+            || record.storage_prefix() != prefix.as_str() || record.storage_namespaces != Some(namespaces) {
+            return Err(Anomaly::new(AnomalyCategory::Conflict, "rtdb.multi/disposal-fence", format!("Installation {id} changed during disposal")));
+        }
+        match record.lifecycle {
+            Lifecycle::Deleted if record.disposal.is_some() => Ok(()),
+            Lifecycle::Deleting => {
+                record.disposal = Some(receipt.clone());
+                record.deletion_record = Some(signed.clone());
+                record.lifecycle = Lifecycle::Deleted;
+                Ok(())
+            }
+            _ => Err(Anomaly::new(AnomalyCategory::Conflict, "rtdb.multi/disposal-fence", format!("Installation {id} left disposal"))),
+        }
+    }).await?;
+    deleted.disposal.ok_or_else(|| Anomaly::fault("rtdb.multi/disposal-receipt", format!("Installation {id} lacks a disposal receipt")))
+}
+
+async fn erase_and_sign_disposal(
+    storage: &CellStorage,
+    bucket: &dyn rtdb_storage::ObjectStore,
+    keys: &dyn KeyService,
+    fenced: &DeploymentRecord,
+    prefix: &rtdb_storage::ObjectKey,
+    others: &[DeploymentRecord],
+    namespaces: StorageNamespaces,
+    journals_retired_at_ms: i64,
+) -> Result<(DeletionRecord, ServingInventory)> {
+    // Its forks keep what they share with it: those objects are copied into them before it goes.
+    if !crate::reference::erase_deployment(bucket, prefix.as_str(), others).await? {
+        return Err(Anomaly::new(AnomalyCategory::Unavailable, "rtdb.multi/disposal-prefix", format!("Installation {} still has serving objects", fenced.id)));
+    }
+    let serving_inventory = storage.purge_serving_inventory(prefix).await?;
+    let objects_erased_at_ms = now_ms().max(journals_retired_at_ms);
+    keys.destroy(&fenced.id).await?;
+    let key_withdrawn_at_ms = now_ms().max(objects_erased_at_ms);
+    let signed = keys.sign_deletion(DeletionFacts {
+        deployment: fenced.id.clone(), name: fenced.name.clone(), epoch: fenced.epoch,
+        storage_prefix: prefix.to_string(), namespaces,
+        inventory: match serving_inventory {
+            ServingInventory::LocalDirectory => rtdb_directory::DeletionInventory::CurrentObjects,
+            ServingInventory::S3VersionsAndUploads => rtdb_directory::DeletionInventory::AllVersionsAndMultipartUploads,
+        },
+        key_destroyed_at_ms: key_withdrawn_at_ms, objects_erased_at_ms, verified_empty: true,
+    }).await?;
+    Ok((signed, serving_inventory))
+}
+
+fn require_storage_drained(record: &DeploymentRecord) -> Result<()> {
+    if !record.storage_regions.is_empty() {
+        return Err(Anomaly::new(
+            AnomalyCategory::Unavailable,
+            "rtdb.multi/storage-not-drained",
+            format!("Installation {} still has admitted storage regions", record.id),
+        ));
+    }
+    Ok(())
+}
+
+pub(crate) async fn await_storage_drain(directory: &dyn Directory, storage: &CellStorage, keys: &dyn KeyService, fence: &DeploymentRecord) -> Result<()> {
+    let start = tokio::time::Instant::now();
+    let mut current = fence.clone();
+    loop {
+        let pending = match require_storage_drained(&current) {
+            Ok(()) => return Ok(()),
+            Err(pending) => pending,
+        };
+        if start.elapsed() >= CONTROL_TIMEOUT {
+            return Err(pending);
+        }
+        crate::store::reconcile_storage_regions(directory, storage, keys, &current).await?;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        current = directory.deployment(&fence.id).await?
+            .filter(|current| current.epoch == fence.epoch && (
+                current.lifecycle == fence.lifecycle
+                    || fence.lifecycle == Lifecycle::Deleting && current.lifecycle == Lifecycle::Deleted
+            ))
+            .ok_or_else(|| Anomaly::new(AnomalyCategory::Conflict, "rtdb.multi/storage-drain-fence", "The installation left its storage drain fence"))?;
+    }
 }
 
 /// What auditing a deployment's history found (`NoTwoWritersHaveEffect`, `SystemTimeRises`).
@@ -699,7 +944,7 @@ pub async fn audit(directory: &dyn Directory, keys: &dyn KeyService, name: &str,
     let servers = replica_servers(directory, &current).await?;
     let stream = StreamConfig { write_quorum: write_quorum(servers.len()), servers, stream: current.stream("replica"), maximum_message_bytes };
     let reader = rtdb_logkeeper::open_reader(stream.clone(), CancellationToken::new()).await?;
-    let log = crate::logs::SealedLog::new(reader, &keys.key(&current.id)?, &current.stream("replica"))?;
+    let log = crate::logs::SealedLog::new(reader, &keys.existing(&current.id).await?, &current.stream("replica"))?;
     let latest = log.latest()?.0;
     let mut report = AuditReport::default();
     let (mut next, mut last_tx, mut last_time, mut last_source) = (0i64, i64::MIN, i64::MIN, i64::MIN);
@@ -869,7 +1114,7 @@ mod tests {
     use rtdb_directory::MemoryDirectory;
     use rtdb_storage::{MemoryStore, ObjectKey, ObjectStore, object_store::StoredObject};
 
-    use super::{CellStorage, DeploymentRecord, Directory, KeyService, Lifecycle, create_deployment, delete_deployment, finish_deletion};
+    use super::{CellStorage, DeploymentRecord, Directory, KeyService, Lifecycle, create_deployment, delete_deployment, erase_and_sign_disposal};
     use crate::keys::LocalKeyService;
 
     #[tokio::test]
@@ -900,20 +1145,22 @@ mod tests {
         let storage = CellStorage::Local { root: data.path().join("objects") };
         let mut deployment = DeploymentRecord::new("shop", "acme", vec![], 0);
         deployment.lifecycle = Lifecycle::Deleting;
-        let key = keys.key(&deployment.id).unwrap();
+        let key = keys.key(&deployment.id).await.unwrap();
         let bucket = MemoryStore::default();
-        deployment.storage_namespaces = Some(super::storage_namespaces(&bucket, &keys).await.unwrap());
+        let namespaces = super::storage_namespaces(&bucket, &keys).await.unwrap();
+        deployment.storage_namespaces = Some(namespaces);
+        let prefix = ObjectKey::new(deployment.storage_prefix()).unwrap();
         let object = ObjectKey::new(format!("{}/v06/rows", deployment.storage_prefix())).unwrap();
         bucket.put(&object, Bytes::from_static(b"data")).await.unwrap();
 
-        let error = finish_deletion(&storage, &RetainingStore(&bucket), &deployment, &[], &keys).await.unwrap_err();
-        assert_eq!(error.code, "rtdb.multi/deletion-incomplete");
-        assert_eq!(keys.key(&deployment.id).unwrap(), key);
+        let error = erase_and_sign_disposal(&storage, &RetainingStore(&bucket), &keys, &deployment, &prefix, &[], namespaces, 0).await.unwrap_err();
+        assert_eq!(error.code, "rtdb.multi/disposal-prefix");
+        assert_eq!(keys.key(&deployment.id).await.unwrap(), key);
 
-        let proof = finish_deletion(&storage, &bucket, &deployment, &[], &keys).await.unwrap();
+        let (proof, _) = erase_and_sign_disposal(&storage, &bucket, &keys, &deployment, &prefix, &[], namespaces, 0).await.unwrap();
         assert!(proof.facts.verified_empty);
         assert!(bucket.list(Some(&ObjectKey::new(deployment.storage_prefix()).unwrap())).await.unwrap().is_empty());
-        assert_eq!(keys.existing(&deployment.id).unwrap_err().code, "rtdb.multi/key-destroyed");
+        assert_eq!(keys.existing(&deployment.id).await.unwrap_err().code, "rtdb.multi/key-destroyed");
     }
 
     #[tokio::test]
@@ -927,7 +1174,7 @@ mod tests {
         let mut source = DeploymentRecord::new("shop", "acme", vec![], 0);
         source.storage_namespaces = Some(super::storage_namespaces(bucket.as_ref(), &keys).await.unwrap());
         let source = directory.create_deployment(source).await.unwrap();
-        let key = keys.key(&source.id).unwrap();
+        let key = keys.key(&source.id).await.unwrap();
         let object = ObjectKey::new(format!("{}/v06/rows", source.storage_prefix())).unwrap();
         bucket.put(&object, Bytes::from_static(b"data")).await.unwrap();
 
@@ -935,7 +1182,7 @@ mod tests {
         updated.read_width = 2;
         let updated = directory.replace_deployment(updated, source.version).await.unwrap().applied().unwrap();
         let child = super::fork_with_tail(directory.as_ref(), bucket.as_ref(), &keys, &source, "child", None, Vec::new(), 4 << 20).await.unwrap();
-        assert_eq!(keys.existing(&child.id).unwrap(), key);
+        assert_eq!(keys.existing(&child.id).await.unwrap(), key);
         let before = bucket.list(None).await.unwrap().into_iter().map(|item| item.key).collect::<Vec<_>>();
 
         let mut deleting = updated.clone();
@@ -962,12 +1209,12 @@ mod tests {
         deployment.lifecycle = Lifecycle::Moving;
         deployment.epoch = 2;
         let deployment = directory.create_deployment(deployment).await.unwrap();
-        let key = keys.key(&deployment.id).unwrap();
+        let key = keys.key(&deployment.id).await.unwrap();
         let storage = CellStorage::Local { root: data.path().join("objects") };
 
         let error = delete_deployment(directory.as_ref(), &storage, &keys, "shop", 4 << 20).await.unwrap_err();
         assert_eq!(error.code, "rtdb.multi/move-in-progress");
         assert_eq!(directory.deployment(&deployment.id).await.unwrap().as_ref(), Some(&deployment));
-        assert_eq!(keys.key(&deployment.id).unwrap(), key);
+        assert_eq!(keys.key(&deployment.id).await.unwrap(), key);
     }
 }

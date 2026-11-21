@@ -43,6 +43,9 @@ pub struct NodeServices {
 #[async_trait::async_trait]
 pub trait ReadFence: Send + Sync {
     async fn confirm(&self, database: &str) -> Result<()>;
+    async fn confirm_hosted(&self, _database: &Database) -> Result<String> {
+        Err(hosted_source_unavailable())
+    }
 }
 impl NodeServices {
     pub fn local(authorization: Arc<dyn TransactionAuthorization>, observer: Arc<dyn CollectionObserver>, users: Arc<dyn CatalogUsers>, metrics: Arc<dyn CatalogMetrics>) -> Self {
@@ -205,6 +208,29 @@ impl Node {
     fn ensure_indexing(&self) -> Result<()> {
         if self.factory.options.replication.enabled { Ok(()) } else { Err(Anomaly::fault("xtdb/log-processor-not-initialised", "log processor not initialised")) }
     }
+    pub(crate) async fn await_durable_source(
+        &self, database: &str, identity: &dyn SessionIdentity, hosted: bool, cancellation: &CancellationToken,
+    ) -> Result<Option<String>> {
+        self.admit(database, DatabaseAccess::Read, identity, cancellation).await?;
+        self.ensure_indexing()?;
+        let database = self.catalog.database(database)?;
+        let barrier = cancellation.run_until_cancelled(async {
+            let history = if hosted {
+                let fence = self.read_fence.as_ref().ok_or_else(hosted_source_unavailable)?;
+                Some(fence.confirm_hosted(&database).await?)
+            } else {
+                None
+            };
+            database.await_durable_source(cancellation).await?;
+            if hosted && !Arc::ptr_eq(&database, &self.catalog.database(database.name())?) {
+                return Err(hosted_source_unavailable());
+            }
+            Ok(history)
+        });
+        tokio::time::timeout(Duration::from_secs(60), barrier)
+            .await.map_err(|_| timeout_error())?.ok_or_else(cancelled)?
+    }
+
     pub async fn await_basis(&self, basis: Option<TxBasis>, timeout: Duration, cancellation: &CancellationToken) -> Result<()> {
         self.ensure_open()?;
         let Some(basis) = basis else { return Ok(()); };
@@ -652,4 +678,7 @@ pub const NOT_HELD: &str = "rtdb.node/database-not-held";
 
 fn closed() -> Anomaly { Anomaly::new(AnomalyCategory::Interrupted, "xtdb/node-closed", "Node is closed") }
 fn cancelled() -> Anomaly { Anomaly::new(AnomalyCategory::Interrupted, "xtdb/operation-cancelled", "Operation was cancelled") }
+fn hosted_source_unavailable() -> Anomaly {
+    Anomaly::new(AnomalyCategory::Unavailable, "rtdb.node/hosted-source-unavailable", "The host cannot confirm this database's durable history")
+}
 fn timeout_error() -> Anomaly { Anomaly::new(AnomalyCategory::Unavailable, "xtdb/await-tx-timeout", "Timed out awaiting indexed progress") }

@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 use std::path::Path;
 use prost::Message;
-use rtdb_auth::{AuthConfig, GrantedAccess};
+use rtdb_auth::AuthConfig;
 use rtdb_format::{database::proto::{DatabaseConfig, database_config::{Log, Storage}}, generated::xtdb::{aws, azure, gcp, kafka, postgres}, keys::{CURRENT_STORAGE_VERSION, storage_root}};
 use rtdb_server::config::{ModuleSettings, NodeConfiguration, RemoteConfig};
 use rtdb_storage::ObjectKey;
@@ -12,7 +12,7 @@ use crate::{DatabaseReport, QualificationReport};
 pub(crate) fn describe(config: &NodeConfiguration, report: &mut QualificationReport) {
     report.authentication = Some(match &config.auth {
         AuthConfig::SingleRootUser { password } => json!({"kind":"single-root-user", "password_present": password.is_some()}),
-        AuthConfig::UserList { users, rules, grants } => json!({"kind":"user-list", "users":users.keys().collect::<Vec<_>>(), "rules":rules, "grants":grants.iter().map(|(user, databases)| (user.clone(), databases.iter().map(|(database, access)| (database.clone(), if *access == GrantedAccess::Write { "READ_WRITE" } else { "READ" })).collect::<BTreeMap<_, _>>())).collect::<BTreeMap<_, _>>()}),
+        AuthConfig::UserList { users, rules, grants } => json!({"kind":"user-list", "users":users.keys().collect::<Vec<_>>(), "rules":rules, "grants":grants.iter().map(|(user, databases)| (user.clone(), databases.iter().map(|(database, access)| (database.clone(), access.as_str())).collect::<BTreeMap<_, _>>())).collect::<BTreeMap<_, _>>()}),
         AuthConfig::OpenIdConnect(oidc) => json!({"kind":"openid-connect", "issuer":endpoint(oidc.issuer_url.as_str(), "authn.issuerUrl", report), "client_id":oidc.client_id, "client_secret":"[redacted]", "rules":oidc.rules}),
     });
     for (name, remote) in &config.remotes {

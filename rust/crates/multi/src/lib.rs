@@ -5,6 +5,7 @@
 
 pub mod admin;
 pub mod agent;
+pub mod archive;
 pub mod capability;
 pub mod cells;
 pub mod cipher;
@@ -12,10 +13,12 @@ pub mod control;
 pub mod deployment;
 pub mod fragments;
 pub mod gateway;
+pub mod install;
 pub mod keys;
 pub mod lease;
 pub mod logs;
 pub mod packing;
+pub mod recovery;
 pub mod reference;
 pub mod process;
 pub mod relay;

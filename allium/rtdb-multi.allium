@@ -36,9 +36,9 @@
 -- - CELL -- one independent unit of infrastructure: its own directory, log servers, nodes, gateways, workers and buckets, sized to a bounded envelope.
 --   An unbounded number of deployments is reached by adding cells.
 --
--- - MEMBER -- one process lifetime of a node, gateway, log server or worker in a cell.
---   A restart is a new member.
---   A member's identity is also the lifetime of its caches, which is what affinity ranks.
+-- - MEMBER -- a node, gateway, logkeeper or worker registered with a cell.
+--   A restart creates a new compute member and a new cache lifetime for affinity.
+--   A logkeeper retains its identity with the journal.
 --
 -- - HOLDER -- the member that is a deployment's writer for one epoch.
 --   At most one member's writes take effect per epoch, and epochs only rise.
@@ -76,6 +76,7 @@ external entity ObjectStore {
 external entity KeyService {
     -- A key-management service (KMS).
     -- Wraps and unwraps data keys under a key bound to an encryption context, and destroys keys irreversibly.
+    -- The regional deployment key vault is outside the payload backup and tracks destroyed identities.
 }
 
 external entity Clock {
@@ -401,6 +402,16 @@ contract LogService {
         -- A server refuses an overwrite at e that would drop anything e's writer has already placed on it.
         --   A deposed writer's append is refused at the server, so no window exists in which two writers both commit.
 
+    @invariant ReplicaIdentityFollowsTheJournal
+        -- An ensemble continues to name the same durable journals when their processes restart.
+        -- A logkeeper serves only while it holds the journal's exclusive lock and its member lease.
+        -- A replacement must reacquire the journal and obtain a new lease after the prior lease ends.
+        -- A stable advertised address remains reserved for that journal.
+
+    @invariant LocalJournalHasProcessBoundTransport
+        -- A standalone authority addresses its journal by the retained journal ID.
+        -- Only the process holding the journal can reach that transport.
+
     @invariant CommitIsAWriteQuorum
         -- A record is committed when write_quorum of its loglet's ensemble have made it durable.
         -- Only committed records are acknowledged to a writer, applied visibly, or served to a reader.
@@ -525,7 +536,8 @@ entity MemberRecord {
         eligible -> dead         -- lease expired, or suspicion confirmed
         draining -> retired      -- holds nothing and serves nothing
         draining -> dead         -- lease expired while draining
-        -- retired and dead are terminal: a restarted process is a new member.
+        -- Retired and dead are terminal for compute members.
+        -- A locked logkeeper journal may reacquire its member record and become eligible again.
     }
 
     -- Derived: what it may hold or serve.
@@ -575,6 +587,8 @@ entity DeploymentRecord {
     -- Empty when the tail is sealed and flushed.
     loglets: List<Loglet>
     checkpoint: Checkpoint?
+    -- A holder confirms its epoch with a quorum for reads.
+    linearizable_reads: Boolean
     -- How many ranks of the affinity order may serve reads.
     read_width: Integer
     -- Activations that ended in the holder crashing, within quarantine_window.
@@ -844,6 +858,9 @@ given {
 -- Rules: creation
 ------------------------------------------------------------
 
+-- A hosting installer can supply the root identifier with the deployment name and organisation.
+-- Repeating an installation of the same live authority returns its directory record.
+-- A different identifier or organisation cannot take over an installed name.
 rule CreateDeployment {
     -- Creation allocates identity and nothing else: no objects, no log state, no compute.
     when: CreateRequested(org, cell)
@@ -1629,6 +1646,27 @@ rule ServeLinearizableReadOnWriter {
             Replied(query, moved: Directory.read(holding.deployment.id).holder)
 }
 
+rule ConfirmHostedSource {
+    when: HostedSourceBarrierRequested(holding, session)
+
+    requires: session.deployment = holding.deployment.id
+    requires: holding.state = serving
+    requires: Directory.read(holding.deployment.id).holder = holding.member
+    requires: Directory.read(holding.deployment.id).epoch = holding.epoch
+    requires: Directory.read(holding.deployment.id).linearizable_reads
+    requires: Directory.read(holding.deployment.id).checkpoint = null
+              or holding.applied_lsn >= Directory.read(holding.deployment.id).checkpoint.lsn
+
+    ensures:
+        let round = NextRoundAcknowledged(holding)
+        if not SealedIn(round, holding.deployment):
+            let cut = SampleSource(holding)
+            AwaitApplied(holding, cut)
+            HostedSourceConfirmed(session, history: holding.deployment.id, cut: cut)
+        else:
+            Replied(session, unavailable: true)
+}
+
 rule ServeOnSubscriber {
     when: QueryArrived(subscription, query, session)
 
@@ -1739,6 +1777,8 @@ rule Fork {
     -- Child publication checks that the parent is still eligible for forks in the writer epoch and storage generation used to prepare the child.
     when: ForkRequested(parent, basis, org)
 
+    -- The child and its name publish at a version that still admits forks.
+    -- The writer epoch and storage generation match the staged basis.
     requires: org = parent.org
               and parent.lifecycle in {live, quarantined}
 
@@ -1881,8 +1921,11 @@ rule EraseAndProve {
     when: SharedObjectsTransferred(record)
 
     requires: DeploymentPrefixIsDisjoint(record)
+              and ServingStorageRegionsDrained(record)
+              and ServingPublicationsSettled(record)
 
     ensures:
+        RetireReplicaJournals(record.id, record.epoch, AllRecordedJournals(record))
         AbortMultipartUploadsUnder(record.storage_root.prefix)
         DeleteAllVersionsUnder(record.storage_root.prefix, except: TransferredObjects(record))
         AwaitEmptyInventory(record.storage_root.prefix, twice_separated_by: config.credential_ttl)
@@ -1903,6 +1946,41 @@ rule PublishInventoryReceipt {
         KeyService.destroy(record.key_id)
         let proof = DeletionRecord(deployment: record.id, epoch: record.epoch, namespaces: namespaces, inventory_scope: inventory_scope, signature: SignedByCell())
         Directory.cas(record.id, record.epoch, change: { lifecycle: deleted, deletion_record: proof })
+}
+
+rule HostedCheckpointCapture {
+    when: AuthenticatedRecoveryCapture(authority, name, capture_id)
+
+    requires: ConfiguredOrganizationOwns(authority, name)
+              and RootInstallation(authority)
+              and CaptureEligible(authority)
+
+    ensures:
+        RegisterAndVerifyCheckpointArchive(authority, capture_id, ConfiguredArchive)
+        ReturnExactCheckpointAndManifestDigest(authority, capture_id)
+}
+
+rule HostedCheckpointRecovery {
+    when: AuthenticatedRecoveryRestore(authority, name, capture_id, manifest_digest)
+
+    requires: ConfiguredOrganizationOwns(authority, name)
+              and RootInstallation(authority)
+              and AcceptedArchiveManifest(authority, capture_id, manifest_digest)
+              and ExactCheckpointOrCompletedRecovery(authority, capture_id)
+
+    ensures:
+        RecoverUnderWriterFence(authority, capture_id)
+        ReturnRecoveryReceipt(authority, capture_id, manifest_digest)
+}
+
+rule RetireCheckpointArchives {
+    when: RecoveryRetirementAuthorized(record)
+
+    requires: ServingDisposalRecorded(record)
+              and RecoveryHoldsReleased(record)
+
+    ensures:
+        RetireRegisteredArchiveCopies(record)
 }
 
 ------------------------------------------------------------
@@ -2087,6 +2165,7 @@ invariant ObjectsStayInTheirLineage {
 invariant OneDatabasePerSession {
     -- A session's catalog contains exactly its capability's deployment; the planner cannot name another.
     -- Cross-deployment reads exist only through an explicit grant, served on the snapshot tier.
+    -- For a configured user grant list, an exact database rule takes precedence over the user's default rule, including during gateway reconnection.
     for session in Sessions:
         Catalog(session) = { session.capability.deployment } + GrantedSnapshots(session)
 }
@@ -2108,6 +2187,8 @@ invariant QuarantineIsolates {
 
 actor Gateway {
     -- Terminates client connections, owns sessions, authenticates, mints capabilities and idempotency keys, routes by affinity, reports suspicion.
+    -- A gateway configured with a PostgreSQL TLS key store completes the client's TLS handshake before it routes startup.
+    -- A configured gateway refuses plaintext startup before any holder receives credentials.
     identified_by: MemberRecord where role = gateway
 }
 
@@ -2118,6 +2199,8 @@ actor Node {
 
 actor LogServer {
     -- Holds loglets and enforces the epoch promise.
+    -- A durable log server's advertised endpoint identifies its log storage across process restarts.
+    -- An ensemble counts each storage endpoint once.
     identified_by: MemberRecord where role = log_server
 }
 
@@ -2175,6 +2258,7 @@ surface ClientAccess {
         -- A failed startup ends the client's authentication exchange.
         -- A finite reconnect window bounds the time an established session waits for a replacement holder.
         -- A placement notification can start the next reconnect attempt before its fallback timer elapses.
+        -- A replacement connection must resolve the original deployment identity.
 
     @guarantee ReadYourWrites
         -- Within a session, every read sees every transaction the session was acknowledged.

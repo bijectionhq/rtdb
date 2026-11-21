@@ -53,10 +53,10 @@ impl ScopedS3Writes {
             sts: aws_sdk_sts::Client::new(&sdk), region, require_conditional_put })
     }
 
-    pub fn open(&self, storage: &S3Config, root: &ObjectKey, authorization: Arc<dyn WriteAuthorization>,
+    pub fn open(&self, storage: &S3Config, cell_root: &ObjectKey, root: &ObjectKey, authorization: Arc<dyn WriteAuthorization>,
                 io: Arc<IoRegion>) -> Result<Arc<dyn ObjectStore>> {
         let provider = self.provider(storage, root, authorization)?;
-        storage.open_authorized(storage.object_prefix(root)?, S3Authorization::Rotating { provider, region: self.region.clone() }, io)
+        Ok(storage.open_authorized(storage.object_prefix(cell_root)?, S3Authorization::Rotating { provider, region: self.region.clone() }, io, true)?)
     }
 
     fn provider(&self, storage: &S3Config, root: &ObjectKey, authorization: Arc<dyn WriteAuthorization>) -> Result<SharedCredentialsProvider> {

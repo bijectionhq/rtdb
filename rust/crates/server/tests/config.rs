@@ -56,11 +56,12 @@ fn startup_environment_resolves_inside_provider_properties_and_numeric_fields() 
 
 #[test]
 fn a_user_list_grants_databases_per_user() {
-    let config = decode("authn: !UserList\n  users:\n    alice: !Argon2id encoded\n  grants:\n    alice:\n      shop: READ_WRITE\n      blog: READ").unwrap();
+    let config = decode("authn: !UserList\n  users:\n    alice: !Argon2id encoded\n  grants:\n    alice:\n      '*': READ_WRITE\n      control: DENY\n      blog: READ").unwrap();
     let AuthConfig::UserList { grants, .. } = config.auth else { panic!() };
-    assert_eq!(grants["alice"]["shop"], rtdb_auth::GrantedAccess::Write);
+    assert_eq!(grants["alice"]["*"], rtdb_auth::GrantedAccess::Write);
+    assert_eq!(grants["alice"]["control"], rtdb_auth::GrantedAccess::Deny);
     assert_eq!(grants["alice"]["blog"], rtdb_auth::GrantedAccess::Read);
-    assert!(decode("authn: !UserList\n  users: {}\n  grants:\n    alice:\n      shop: ADMIN").is_err(), "access is READ or READ_WRITE");
+    assert!(decode("authn: !UserList\n  users: {}\n  grants:\n    alice:\n      shop: ADMIN").is_err());
 }
 
 #[test]

@@ -5,6 +5,7 @@
 //! It is never on the commit path: a placed holder commits and serves reads while the directory is unavailable.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::path::Path;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -13,6 +14,7 @@ use parking_lot::Mutex;
 use rtdb_types::{Anomaly, AnomalyCategory, Result};
 use serde::{Deserialize, Serialize};
 
+mod state_file;
 pub mod feed;
 pub mod policy;
 pub mod watch;
@@ -63,8 +65,9 @@ pub enum MemberState {
     Dead,
 }
 
-/// One process lifetime.
-/// A restarted process registers a new member.
+/// A process assignment.
+/// Compute members are scoped to one process lifetime. A logkeeper ID
+/// belongs to its original journal and can regain a lease after restart.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MemberRecord {
     pub id: MemberId,
@@ -116,6 +119,8 @@ pub enum Lifecycle {
     Quarantined,
     /// Being moved to another cell; fenced while the cutover completes.
     Moving,
+    /// The current checkpoint is being repaired from its immutable archive.
+    Restoring,
     /// Fenced; its objects, log and keys are being destroyed.
     Deleting,
     /// A tombstone.
@@ -220,6 +225,14 @@ pub struct DeploymentRecord {
     pub holder: Option<MemberId>,
     /// The logkeepers holding this deployment's streams.
     pub ensemble: Vec<MemberId>,
+    /// Every journal endpoint authorized to receive this installation's
+    /// replica stream, retained before a new ensemble receives a copy.
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub replica_journals: BTreeSet<String>,
+    /// Serving and archival storage admissions, retained until the owner
+    /// drains its I/O and any ambiguous publications are confirmed.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub storage_regions: BTreeMap<uuid::Uuid, StorageRegion>,
     /// How many ranks of the affinity order may serve reads.
     pub read_width: u32,
     pub activation_crashes: u32,
@@ -261,7 +274,80 @@ pub struct DeploymentRecord {
     pub storage_namespaces: Option<StorageNamespaces>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub deletion_record: Option<DeletionRecord>,
+    pub cell_transfer: Option<CellTransfer>,
+    pub disposal: Option<DisposalReceipt>,
+    pub checkpoint_recovery: Option<CheckpointRecovery>,
+    /// Replay retains logical transactions through this position, but the restored checkpoint
+    /// replaces the former serving storage and its compaction effects through the same position.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compaction_replay_cutoff: Option<i64>,
+    /// Every independent archive admitted before a checkpoint copy started.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub checkpoint_captures: BTreeMap<uuid::Uuid, CheckpointCapture>,
+    pub archive_retirement: Option<ArchiveRetirement>,
     pub version: Version,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum StorageRegion {
+    Open,
+    /// The owner joined all I/O and retained each ambiguous write by the
+    /// exact provider publication identity and key. No new I/O can start.
+    ClosedRemote {
+        archive: Option<uuid::Uuid>,
+        publications: BTreeMap<uuid::Uuid, String>,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CheckpointCapture {
+    pub archive: String,
+    pub incarnation: u64,
+    pub log_epoch: i32,
+    pub checkpoint: Checkpoint,
+    /// Payload copying starts only after the archive's witness becomes durable.
+    pub media_bound: bool,
+    /// The bound archive provider confirmed no remaining versions or uploads.
+    pub remote_disposal: Option<[u8; 32]>,
+}
+
+/// The recovery owner releases its hold independently of serving disposal.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ArchiveRetirement {
+    pub deployment: String,
+    pub epoch: u64,
+    pub authorized_at_ms: i64,
+    pub observed_empty_at_ms: Option<i64>,
+}
+
+/// Both directories retain the same routing decision through a cell transfer.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CellTransfer {
+    pub source: String,
+    pub destination: String,
+    pub epoch: u64,
+}
+
+/// The provider inventory shown empty by a serving disposal.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ServingInventory {
+    LocalDirectory,
+    S3VersionsAndUploads,
+}
+
+/// The cell's completed serving disposal, retained on the installation's tombstone.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DisposalReceipt {
+    pub deployment: String,
+    pub incarnation: u64,
+    pub epoch: u64,
+    pub journals: BTreeSet<String>,
+    pub journals_retired_at_ms: i64,
+    pub key_withdrawn_at_ms: i64,
+    pub serving_prefix_observed_empty_at_ms: i64,
+    pub serving_inventory: ServingInventory,
 }
 
 /// The directory's record of a deployment's last published block (value `Checkpoint`): its index, the replica offset of its boundary record, and the last source offset it covers.
@@ -275,11 +361,23 @@ pub struct Checkpoint {
     pub system_time: i64,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CheckpointRecovery {
+    pub operation: uuid::Uuid,
+    pub checkpoint: Checkpoint,
+    pub epoch: u64,
+    pub previous_lifecycle: Lifecycle,
+    pub archive: String,
+    pub manifest_sha256: String,
+    pub completed_at_ms: Option<i64>,
+}
+
 impl DeploymentRecord {
     pub fn new(name: impl Into<String>, org: impl Into<String>, ensemble: Vec<MemberId>, now_ms: i64) -> Self {
         let id = uuid::Uuid::new_v4().to_string();
         Self { lineage: id.clone(), id, name: name.into(), org: org.into(), incarnation: 1, lifecycle: Lifecycle::Live, epoch: 0, holder: None,
-            ensemble, read_width: 1, activation_crashes: 0, created_at_ms: now_ms, move_intent: None, placement_move: None, log_epoch: 0, parent: None, move_from: None, log_copy_servers: Vec::new(), linearizable_reads: false, checkpoint: None, moved_at_ms: None, source_cleanup: None, cell_move: None, storage_generation: None, storage_namespaces: None, deletion_record: None, version: 0 }
+            ensemble, replica_journals: BTreeSet::new(), storage_regions: BTreeMap::new(), read_width: 1, activation_crashes: 0, created_at_ms: now_ms, move_intent: None, placement_move: None, log_epoch: 0, parent: None, move_from: None, log_copy_servers: Vec::new(), linearizable_reads: false, checkpoint: None, moved_at_ms: None, source_cleanup: None, cell_move: None, storage_generation: None, storage_namespaces: None, deletion_record: None,
+            cell_transfer: None, disposal: None, checkpoint_recovery: None, compaction_replay_cutoff: None, checkpoint_captures: BTreeMap::new(), archive_retirement: None, version: 0 }
     }
 
     pub fn writer_pool(&self) -> Option<MemberPool> {
@@ -290,7 +388,9 @@ impl DeploymentRecord {
         }
     }
 
-    pub fn can_fork(&self) -> bool { self.writer_pool().is_some() }
+    pub fn can_fork(&self) -> bool {
+        self.writer_pool().is_some() && self.move_from.is_none() && self.checkpoint_recovery.is_none()
+    }
 
     pub fn may_place_on(&self, member: &MemberRecord, now_ms: i64) -> bool {
         self.writer_pool() == Some(member.pool) && member.may_receive_placements(now_ms)
@@ -386,28 +486,71 @@ fn fork_conflict() -> Anomaly {
 
 fn check_fork_parent(child: &DeploymentRecord, parent: Option<&DeploymentRecord>, expected: Version) -> Result<()> {
     if parent.is_some_and(|parent| parent.version == expected && parent.can_fork()
-        && parent.org == child.org && parent.lineage == child.lineage) {
+        && parent.org == child.org && parent.lineage == child.lineage)
+    {
         Ok(())
     } else {
         Err(fork_conflict())
     }
 }
 
-/// The directory for tests, simulation and single-process cells: one lock, so trivially linearizable.
+/// A single-process directory with an optional durable local state file.
 #[derive(Default)]
-pub struct MemoryDirectory { state: Mutex<MemoryState>, changes: ChangeFeed }
+pub struct MemoryDirectory {
+    state: Mutex<MemoryState>,
+    changes: ChangeFeed,
+    file: Option<state_file::StateFile>,
+}
 
-#[derive(Default)]
+#[derive(Default, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 struct MemoryState {
     deployments: BTreeMap<String, DeploymentRecord>,
     names: BTreeMap<String, String>,
+    #[serde(skip)]
     held: BTreeMap<MemberId, BTreeSet<String>>,
     members: BTreeMap<MemberId, MemberRecord>,
+    #[serde(skip)]
+    failed: bool,
 }
 
 impl MemoryDirectory {
     pub fn new() -> Arc<Self> { Arc::new(Self::default()) }
 
+    pub fn initialize(root: &Path) -> Result<()> {
+        state_file::StateFile::lock(root)?.initialize()
+    }
+
+    pub fn open(root: &Path) -> Result<Arc<Self>> {
+        let file = state_file::StateFile::lock(root)?;
+        let mut state = file.load()?;
+        for deployment in state.deployments.values() {
+            if let Some(holder) = &deployment.holder {
+                state.held.entry(holder.clone()).or_default().insert(deployment.id.clone());
+            }
+        }
+        Ok(Arc::new(Self { state: Mutex::new(state), changes: ChangeFeed::default(), file: Some(file) }))
+    }
+
+    fn state(&self) -> Result<parking_lot::MutexGuard<'_, MemoryState>> {
+        let state = self.state.lock();
+        if state.failed {
+            return Err(Anomaly::new(
+                AnomalyCategory::Unavailable,
+                "rtdb.directory/state-uncertain",
+                "The local directory must be reopened after a state write failed",
+            ));
+        }
+        Ok(state)
+    }
+
+    fn persist(&self, state: &mut MemoryState) -> Result<()> {
+        if let Some(file) = &self.file && let Err(error) = file.save(state) {
+            state.failed = true;
+            return Err(error);
+        }
+        Ok(())
+    }
     fn insert_deployment(&self, state: &mut MemoryState, mut record: DeploymentRecord) -> Result<DeploymentRecord> {
         if state.deployments.contains_key(&record.id) { return Err(exists("Deployment", &record.id)); }
         if state.names.contains_key(&record.name) { return Err(exists("Deployment name", &record.name)); }
@@ -417,6 +560,7 @@ impl MemoryDirectory {
             state.held.entry(holder.clone()).or_default().insert(record.id.clone());
         }
         state.deployments.insert(record.id.clone(), record.clone());
+        self.persist(state)?;
         self.changes.publish(record.clone());
         Ok(record)
     }
@@ -425,25 +569,26 @@ impl MemoryDirectory {
 #[async_trait]
 impl Directory for MemoryDirectory {
     async fn create_deployment(&self, record: DeploymentRecord) -> Result<DeploymentRecord> {
-        self.insert_deployment(&mut self.state.lock(), record)
+        let mut state = self.state()?;
+        self.insert_deployment(&mut state, record)
     }
     async fn create_fork(&self, child: DeploymentRecord, expected_parent: Version) -> Result<DeploymentRecord> {
-        let mut state = self.state.lock();
+        let mut state = self.state()?;
         check_fork_parent(&child, state.deployments.get(fork_parent_id(&child)?), expected_parent)?;
         self.insert_deployment(&mut state, child)
     }
-    async fn deployment(&self, id: &str) -> Result<Option<DeploymentRecord>> { Ok(self.state.lock().deployments.get(id).cloned()) }
+    async fn deployment(&self, id: &str) -> Result<Option<DeploymentRecord>> { Ok(self.state()?.deployments.get(id).cloned()) }
     async fn deployment_by_name(&self, name: &str) -> Result<Option<DeploymentRecord>> {
-        let state = self.state.lock();
+        let state = self.state()?;
         Ok(state.names.get(name).and_then(|id| state.deployments.get(id)).cloned())
     }
-    async fn deployments(&self) -> Result<Vec<DeploymentRecord>> { Ok(self.state.lock().deployments.values().cloned().collect()) }
+    async fn deployments(&self) -> Result<Vec<DeploymentRecord>> { Ok(self.state()?.deployments.values().cloned().collect()) }
     async fn deployments_held_by(&self, member: &MemberId) -> Result<Vec<DeploymentRecord>> {
-        let state = self.state.lock();
+        let state = self.state()?;
         Ok(state.held.get(member).into_iter().flatten().map(|id| state.deployments[id].clone()).collect())
     }
     async fn replace_deployment(&self, mut record: DeploymentRecord, expected: Version) -> Result<Cas<DeploymentRecord>> {
-        let mut state = self.state.lock();
+        let mut state = self.state()?;
         let Some(current) = state.deployments.get(&record.id) else { return Ok(Cas::Conflict(None)); };
         if current.version != expected { return Ok(Cas::Conflict(Some(current.clone()))); }
         if current.name != record.name { return Err(Anomaly::incorrect("rtdb.directory/rename", "A deployment's name never changes")); }
@@ -460,24 +605,27 @@ impl Directory for MemoryDirectory {
         }
         record.version = expected + 1;
         state.deployments.insert(record.id.clone(), record.clone());
+        self.persist(&mut state)?;
         self.changes.publish(record.clone());
         Ok(Cas::Applied(record))
     }
     async fn register_member(&self, mut record: MemberRecord) -> Result<MemberRecord> {
-        let mut state = self.state.lock();
+        let mut state = self.state()?;
         if state.members.contains_key(&record.id) { return Err(exists("Member", record.id.as_str())); }
         record.version = 1;
         state.members.insert(record.id.clone(), record.clone());
+        self.persist(&mut state)?;
         Ok(record)
     }
-    async fn member(&self, id: &MemberId) -> Result<Option<MemberRecord>> { Ok(self.state.lock().members.get(id).cloned()) }
-    async fn members(&self) -> Result<Vec<MemberRecord>> { Ok(self.state.lock().members.values().cloned().collect()) }
+    async fn member(&self, id: &MemberId) -> Result<Option<MemberRecord>> { Ok(self.state()?.members.get(id).cloned()) }
+    async fn members(&self) -> Result<Vec<MemberRecord>> { Ok(self.state()?.members.values().cloned().collect()) }
     async fn replace_member(&self, mut record: MemberRecord, expected: Version) -> Result<Cas<MemberRecord>> {
-        let mut state = self.state.lock();
+        let mut state = self.state()?;
         let Some(current) = state.members.get(&record.id) else { return Ok(Cas::Conflict(None)); };
         if current.version != expected { return Ok(Cas::Conflict(Some(current.clone()))); }
         record.version = expected + 1;
         state.members.insert(record.id.clone(), record.clone());
+        self.persist(&mut state)?;
         Ok(Cas::Applied(record))
     }
     fn change_feed(&self) -> Option<&ChangeFeed> { Some(&self.changes) }

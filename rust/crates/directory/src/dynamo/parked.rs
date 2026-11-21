@@ -36,6 +36,10 @@ struct ParkedDeployment {
     storage_namespaces: Vec<u8>,
     #[prost(bool, tag = "14")]
     quarantined: bool,
+    #[prost(string, repeated, tag = "15")]
+    replica_journals: Vec<String>,
+    #[prost(sint64, optional, tag = "16")]
+    compaction_replay_cutoff: Option<i64>,
 }
 
 #[derive(Clone, Copy, PartialEq, Message)]
@@ -54,11 +58,15 @@ pub(super) fn encode(record: &DeploymentRecord) -> Option<Vec<u8>> {
     let DeploymentRecord {
         id, name: _, org, lineage, incarnation, lifecycle, epoch: _, holder, ensemble, created_at_ms, read_width,
         activation_crashes, log_epoch, parent, linearizable_reads, checkpoint, storage_generation,
-        storage_namespaces, move_intent, placement_move, move_from, log_copy_servers, cell_move, moved_at_ms, source_cleanup, deletion_record, version: _,
+        storage_namespaces, move_intent, placement_move, move_from, log_copy_servers, cell_move, moved_at_ms,
+        source_cleanup, deletion_record, replica_journals, storage_regions, cell_transfer, disposal, checkpoint_recovery,
+        checkpoint_captures, archive_retirement, compaction_replay_cutoff, version: _,
     } = record;
     if holder.is_some() || !matches!(lifecycle, Lifecycle::Live | Lifecycle::Quarantined)
         || move_intent.is_some() || placement_move.is_some() || move_from.is_some() || cell_move.is_some()
         || moved_at_ms.is_some() || source_cleanup.is_some() || deletion_record.is_some() || !log_copy_servers.is_empty()
+        || !storage_regions.is_empty() || cell_transfer.is_some() || disposal.is_some() || checkpoint_recovery.is_some()
+        || !checkpoint_captures.is_empty() || archive_retirement.is_some()
     {
         return None;
     }
@@ -90,6 +98,8 @@ pub(super) fn encode(record: &DeploymentRecord) -> Option<Vec<u8>> {
         storage_generation: storage_generation.map_or_else(Vec::new, |id| id.as_bytes().to_vec()),
         storage_namespaces: namespaces,
         quarantined: *lifecycle == Lifecycle::Quarantined,
+        replica_journals: replica_journals.iter().cloned().collect(),
+        compaction_replay_cutoff: *compaction_replay_cutoff,
     };
     let mut encoded = Vec::with_capacity(1 + packed.encoded_len());
     encoded.push(WIRE_VERSION);
@@ -147,6 +157,14 @@ pub(super) fn decode(bytes: &[u8], id: &str, name: &str, epoch: u64, version: Ve
         storage_generation,
         storage_namespaces,
         deletion_record: None,
+        replica_journals: packed.replica_journals.into_iter().collect(),
+        storage_regions: Default::default(),
+        cell_transfer: None,
+        disposal: None,
+        checkpoint_recovery: None,
+        compaction_replay_cutoff: packed.compaction_replay_cutoff,
+        checkpoint_captures: Default::default(),
+        archive_retirement: None,
         version,
     })
 }

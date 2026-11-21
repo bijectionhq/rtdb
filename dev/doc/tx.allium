@@ -35,6 +35,13 @@
 --
 --      SET TRANSACTION modes is accepted as SQL from every frontend, classified by the SqlParser, so access mode, read basis, commit-opts and the transaction's time zone are all expressible there.
 --
+-- SHOW rtdb_source_barrier waits for the current database to apply the durable source tip it samples during the command.
+-- It is an idle-session operation and does not open or pin a transaction.
+-- A subsequent read on that connection observes at least that applied cut, including submissions from other sessions.
+-- Databases with external transaction sources and nodes without indexing cannot serve this barrier.
+-- SHOW rtdb_hosted_source_barrier is the hosted variant and returns the confirmed deployment identity.
+-- It requires a current holder with linearizable reads, a recovered directory checkpoint, and a fresh quorum confirmation.
+--
 -- == Boundaries ==
 --
 -- Below: db.allium's submitTx / executeTx. A Writing commit drains the buffer and
@@ -166,7 +173,9 @@ value CommitOpts {
     -- grammar). Their very presence implies the transaction is Writing.
     -- The transaction's effective timezone is NOT a commit-opt: it is set by BEGIN or SET TRANSACTION as the tx's tx_default_tz (see Transaction), not deferred to COMMIT.
     --   system_time   — the system-time to record the transaction at.
-    --   user_metadata — opaque per-transaction metadata.
+    --   user_metadata — per-transaction metadata.
+    --                   RTDB recognises the Boolean rtdb_ordered_system_time field as an opt-in to rejecting an explicit system time behind the source log.
+    --                   The PgWire SHOW rtdb_ordered_system_time value is 1 when the server supports this guard.
     --   async         — true: commit submits without awaiting; false: execute-and-await.
     --                    The begin-time default; a COMMIT SYNC / COMMIT ASYNC (see CommitMode)
     --                    overrides it for that one commit.

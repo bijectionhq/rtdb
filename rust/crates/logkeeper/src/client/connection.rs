@@ -10,7 +10,7 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, Weak};
 use std::time::Duration;
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::sync::{mpsc, oneshot};
 
@@ -121,14 +121,36 @@ impl Session {
 }
 
 /// Ends when the connection fails or every sender of the outbox is gone.
-async fn run(address: String, mut requests: mpsc::UnboundedReceiver<Request>, waiters: Arc<Waiters>) {
+async fn run(address: String, requests: mpsc::UnboundedReceiver<Request>, waiters: Arc<Waiters>) {
+    if crate::local::is_local(&address) {
+        match tokio::time::timeout(CONNECT_TIMEOUT, crate::local::connect(&address)).await {
+            Ok(Ok(socket)) => {
+                let (reader, writer) = tokio::io::split(socket);
+                run_session(reader, writer, address, requests, waiters).await;
+            }
+            Ok(Err(error)) => waiters.fail(format!("cannot open local journal {address}: {error}")),
+            Err(_) => waiters.fail(format!("timed out opening local journal {address}")),
+        }
+        return;
+    }
+
     let socket = match tokio::time::timeout(CONNECT_TIMEOUT, TcpStream::connect(&address)).await {
         Ok(Ok(socket)) => socket,
         Ok(Err(error)) => return waiters.fail(format!("cannot connect to {address}: {error}")),
         Err(_) => return waiters.fail(format!("timed out connecting to {address}")),
     };
     let _ = socket.set_nodelay(true);
-    let (mut reader, mut writer) = socket.into_split();
+    let (reader, writer) = socket.into_split();
+    run_session(reader, writer, address, requests, waiters).await;
+}
+
+async fn run_session(
+    mut reader: impl AsyncRead + Unpin,
+    mut writer: impl AsyncWrite + Unpin,
+    address: String,
+    mut requests: mpsc::UnboundedReceiver<Request>,
+    waiters: Arc<Waiters>,
+) {
     let writing = async {
         let mut buffer = BytesMut::new();
         while let Some(request) = requests.recv().await {

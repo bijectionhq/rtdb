@@ -2,22 +2,116 @@
 
 mod common;
 
-use std::time::Duration;
+use std::{
+    collections::BTreeMap,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+    time::Duration,
+};
 
 use common::*;
-use rtdb_directory::MemberPool;
+use rtdb_directory::{DeploymentRecord, Directory, Lifecycle, MemberId, MemberPool, MemoryDirectory};
 use rtdb_multi::admin;
 use rtdb_multi::control::Response;
 use rtdb_multi::keys::KeyService;
+use rtdb_multi::cells::{CellMap, MemoryCellMap};
+use rtdb_multi::deployment::CellStorage;
+use rtdb_multi::keys::LocalKeyService;
+use rtdb_types::{Anomaly, AnomalyCategory, Result};
 use tokio_postgres::NoTls;
+
+#[tokio::test]
+async fn the_local_directory_reopens_the_same_installation_and_fence() {
+    let state = tempfile::tempdir().unwrap();
+    assert!(MemoryDirectory::open(state.path()).is_err());
+    MemoryDirectory::initialize(state.path()).unwrap();
+    let directory = MemoryDirectory::open(state.path()).unwrap();
+    assert!(MemoryDirectory::open(state.path()).is_err());
+    let initial = directory.create_deployment(
+        DeploymentRecord::new("shop", "acme", vec![], 0),
+    ).await.unwrap();
+    let mut fenced = initial.clone();
+    fenced.epoch += 1;
+    fenced.lifecycle = Lifecycle::Deleting;
+    let fenced = directory.replace_deployment(fenced, initial.version).await.unwrap().applied().unwrap();
+    drop(directory);
+
+    assert!(MemoryDirectory::initialize(state.path()).is_err());
+    let directory = MemoryDirectory::open(state.path()).unwrap();
+    assert_eq!(directory.deployment_by_name("shop").await.unwrap(), Some(fenced.clone()));
+    assert_eq!(directory.replace_deployment(initial.clone(), initial.version).await.unwrap(),
+        rtdb_directory::Cas::Conflict(Some(fenced)));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn hosted_install_retries_recover_the_same_authority() {
+    let cell = Cell::start(1, None).await;
+    let id = uuid::Uuid::new_v4();
+    let directory = cell.directory.as_ref();
+    let (first, second) = tokio::join!(
+        admin::install_deployment(directory, id, "shop", "acme", 3),
+        admin::install_deployment(directory, id, "shop", "acme", 3),
+    );
+    let installed = first.unwrap();
+    assert_eq!(second.unwrap(), installed);
+    assert_eq!(installed.id, id.to_string());
+    assert!(installed.linearizable_reads);
+    assert!(admin::install_deployment(directory, uuid::Uuid::new_v4(), "shop", "acme", 3).await.is_err());
+    assert!(admin::install_deployment(directory, id, "other", "acme", 3).await.is_err());
+    let mut client = tokio_postgres::Config::new();
+    client.host("127.0.0.1").port(cell.gateway.port()).user("xtdb").password("cell-test");
+    client.dbname(&format!("shop@{}", uuid::Uuid::new_v4().simple()));
+    assert!(client.connect(NoTls).await.is_err());
+    assert!(cell.holder("shop").await.is_none());
+    let authority = id.simple().to_string();
+    client.dbname(&format!("shop@{authority}"));
+    let (client, connection) = client.connect(NoTls).await.unwrap();
+    assert_eq!(connection.parameter("rtdb_installation_id"), Some(authority.as_str()));
+    tokio::spawn(connection);
+    client.simple_query("INSERT INTO orders (_id, total) VALUES (1, 10)").await.unwrap();
+    assert_eq!(values(&client, "SELECT total FROM orders").await, ["10"]);
+    drop(client);
+    assert_eq!(admin::install_deployment(directory, id, "shop", "acme", 3).await.unwrap().id, installed.id);
+    cell.stop().await;
+}
+
+#[tokio::test]
+async fn failed_disposal_reuses_the_fence_on_retry() {
+    let directory = MemoryDirectory::new();
+    let data = tempfile::tempdir().unwrap();
+    let storage = CellStorage::Local { root: data.path().join("objects") };
+    let keys = LocalKeyService::new(data.path().join("keys")).unwrap();
+    let installation = directory.create_deployment(
+        DeploymentRecord::new("shop", "acme", vec![MemberId::fresh()], 0),
+    ).await.unwrap();
+
+    let error = admin::finish_disposal(directory.as_ref(), &storage, &keys, &installation.id, 4 << 20).await.unwrap_err();
+    assert_eq!(error.code, "rtdb.multi/disposal-unaccepted");
+    let accepted = admin::begin_disposal(directory.as_ref(), &installation.id).await.unwrap();
+    assert_eq!(accepted.epoch, installation.epoch + 1);
+
+    for _ in 0..2 {
+        let error = admin::finish_disposal(directory.as_ref(), &storage, &keys, &installation.id, 4 << 20).await.unwrap_err();
+        assert_eq!(error.code, "rtdb.multi/administration-ensemble");
+        let pending = directory.deployment(&installation.id).await.unwrap().unwrap();
+        assert_eq!(pending.lifecycle, Lifecycle::Deleting);
+        assert_eq!(pending.epoch, installation.epoch + 1);
+        assert_eq!(pending.version, installation.version + 1);
+        assert!(pending.disposal.is_none());
+    }
+}
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_deployment_is_served_through_the_gateway_and_survives_its_holder_dying() {
     let mut cell = Cell::start(2, None).await;
-    admin::create_deployment(cell.directory.as_ref(), "shop", "acme", 3).await.unwrap();
+    let history = uuid::Uuid::new_v4();
+    admin::install_deployment(cell.directory.as_ref(), history, "shop", "acme", 3).await.unwrap();
     let client = cell.connect("shop").await;
     client.simple_query("INSERT INTO orders (_id, total) VALUES (1, 10)").await.unwrap();
-    assert_eq!(values(&client, "SELECT total FROM orders").await, ["10"]);
+    let basis = values(&client, "SELECT _system_from FROM orders WHERE _id = 1").await.remove(0);
+    client.simple_query("INSERT INTO orders (_id, total) VALUES (2, 20)").await.unwrap();
     drop(client);
 
     let first = cell.holder("shop").await.expect("the first connection placed the deployment");
@@ -25,12 +119,35 @@ async fn a_deployment_is_served_through_the_gateway_and_survives_its_holder_dyin
     cell.nodes[first].take().unwrap().kill().await.unwrap();
 
     let client = connect_eventually(&cell, "shop").await;
-    assert_eq!(values(&client, "SELECT total FROM orders").await, ["10"], "nothing acknowledged is lost when the holder dies");
-    client.simple_query("INSERT INTO orders (_id, total) VALUES (2, 20)").await.unwrap();
-    assert_eq!(values(&client, "SELECT total FROM orders").await, ["10", "20"]);
+    assert_eq!(values(&client, "SHOW rtdb_hosted_source_barrier").await, [history.to_string()]);
+    assert_eq!(values(&client, "SELECT total FROM orders").await, ["10", "20"], "nothing acknowledged is lost when the holder dies");
+    let exact = format!("SELECT total FROM orders FOR SYSTEM_TIME AS OF TIMESTAMP '{basis}'");
+    assert_eq!(values(&client, &exact).await, ["10"]);
+    client.simple_query("INSERT INTO orders (_id, total) VALUES (3, 30)").await.unwrap();
+    assert_eq!(values(&client, "SELECT total FROM orders").await, ["10", "20", "30"]);
     let record = cell.directory.deployment_by_name("shop").await.unwrap().unwrap();
     assert!(record.epoch > epoch, "the survivor holds it under a later epoch");
     assert_ne!(cell.holder("shop").await, Some(first));
+    drop(client);
+    cell.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_hosted_source_barrier_refuses_a_missing_directory_checkpoint() {
+    let cell = Cell::start(1, None).await;
+    let history = uuid::Uuid::new_v4();
+    let directory = cell.directory.as_ref();
+    admin::install_deployment(directory, history, "shop", "acme", 3).await.unwrap();
+    let client = cell.connect("shop").await;
+    assert_eq!(values(&client, "SHOW rtdb_hosted_source_barrier").await, [history.to_string()]);
+
+    let mut record = directory.deployment(&history.to_string()).await.unwrap().unwrap();
+    let expected_version = record.version;
+    record.checkpoint = Some(rtdb_directory::Checkpoint { block: 7, boundary: 11, source: 11, system_time: 100 });
+    assert!(matches!(directory.replace_deployment(record, expected_version).await.unwrap(), rtdb_directory::Cas::Applied(_)));
+
+    let refusal = client.simple_query("SHOW rtdb_hosted_source_barrier").await.unwrap_err();
+    assert!(refusal.as_db_error().unwrap().message().contains("has not recovered the directory's durable checkpoint"));
     drop(client);
     cell.stop().await;
 }
@@ -328,7 +445,7 @@ async fn a_fork_starts_from_its_parents_data_and_diverges_and_a_deletion_leaves_
     assert_eq!(values(&shop, "SELECT total FROM orders").await, ["10", "20"], "the fork's writes stay in the fork");
     shop.simple_query("INSERT INTO orders (_id, total) VALUES (4, 40)").await.unwrap();
     assert_eq!(values(&preview, "SELECT total FROM orders").await, ["10", "20", "30"], "and the parent's in the parent");
-    drop((shop, preview));
+    drop(preview);
     let holder = cell.holder("shop-preview").await.unwrap();
     cell.node(holder).agent.park("shop-preview").await.unwrap();
     let written = own(&child.storage_prefix());
@@ -345,23 +462,46 @@ async fn a_fork_starts_from_its_parents_data_and_diverges_and_a_deletion_leaves_
         assert!(current.deletion_record.is_none());
         assert!(!files_under(&root.join(parent.storage_prefix())).is_empty());
     }
-    assert!(keys.existing(&parent.id).is_ok());
-    let deletion = admin::delete_deployment(cell.directory.as_ref(), &cell.storage(), &keys, "shop", 4 << 20).await.unwrap();
-    assert!(deletion.facts.verified_empty);
+    assert!(keys.existing(&parent.id).await.is_ok());
+    let pending = admin::begin_disposal(cell.directory.as_ref(), &parent.id).await.unwrap();
+    assert_eq!(pending.lifecycle, Lifecycle::Deleting);
+    let stop = tokio_util::sync::CancellationToken::new();
+    let reaper = tokio::spawn(rtdb_multi::store::run_reaper(
+        cell.directory.clone(), cell.storage(), Some(Arc::new(cell.keys())),
+        Duration::from_secs(3600), Duration::from_millis(10), stop.clone(),
+    ));
+    let deletion = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            if let Some(receipt) = cell.directory.deployment(&parent.id).await.unwrap().unwrap().disposal {
+                break receipt;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }).await.expect("the reaper recovers the scheduled disposal");
+    stop.cancel();
+    reaper.await.unwrap();
+    assert_eq!(deletion.epoch, pending.epoch);
+    assert_eq!(deletion.deployment, parent.id);
     assert!(files_under(&root.join(parent.storage_prefix())).is_empty(), "the parent's objects are erased");
     assert!(own(&child.storage_prefix()) > written, "after the fork's shared objects were copied into it");
-    assert_eq!(cell.keys().existing(&parent.id).unwrap_err().code, "rtdb.multi/key-destroyed");
+    assert!(rtdb_multi::keys::KeyService::key(&cell.keys(), &parent.id).await.is_err(), "its key is withdrawn");
     let tombstone = cell.directory.deployment_by_name("shop").await.unwrap().unwrap();
     assert_eq!(tombstone.lifecycle, rtdb_directory::Lifecycle::Deleted);
-    assert_eq!(tombstone.deletion_record.as_ref(), Some(&deletion));
-    assert_eq!(deletion.facts.deployment, tombstone.id);
-    assert_eq!(deletion.facts.epoch, tombstone.epoch);
-    assert_eq!(deletion.facts.storage_prefix, parent.storage_prefix());
-    assert_eq!(Some(deletion.facts.namespaces), tombstone.storage_namespaces);
+    assert_eq!(tombstone.disposal, Some(deletion.clone()));
+    let recovered = admin::delete_installation(cell.directory.as_ref(), &cell.storage(), &cell.keys(), &parent.id, 4 << 20).await.unwrap();
+    assert_eq!(recovered, deletion);
+    assert_eq!(cell.directory.deployment(&parent.id).await.unwrap().unwrap().version, tombstone.version);
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !shop.is_closed() { tokio::time::sleep(Duration::from_millis(10)).await; }
+    }).await.expect("the gateway closes an existing session after observing disposal");
+    let signed = tombstone.deletion_record.as_ref().unwrap();
+    assert_eq!(signed.facts.deployment, tombstone.id);
+    assert_eq!(signed.facts.epoch, tombstone.epoch);
+    assert_eq!(signed.facts.storage_prefix, parent.storage_prefix());
+    assert_eq!(Some(signed.facts.namespaces), tombstone.storage_namespaces);
     let retry = admin::delete_deployment(cell.directory.as_ref(), &cell.storage(), &cell.keys(), "shop", 4 << 20).await.unwrap();
-    assert_eq!(retry, deletion);
-    assert_eq!(cell.directory.deployment_by_name("shop").await.unwrap().unwrap(), tombstone);
-    rtdb_multi::keys::verify_deletion(&retry, &cell.keys().deletion_verification_key().unwrap()).unwrap();
+    assert_eq!(&retry, signed);
+    rtdb_multi::keys::verify_deletion(&retry, &cell.keys().deletion_verification_key().await.unwrap()).unwrap();
     assert!(tokio_postgres::connect(&format!("host=127.0.0.1 port={} user=xtdb password=cell-test dbname=shop", cell.gateway.port()), NoTls).await.is_err(), "a deleted deployment is refused");
     let preview = connect_eventually(&cell, "shop-preview").await;
     assert_eq!(values(&preview, "SELECT total FROM orders").await, ["10", "20", "30"], "a fork outlives its parent's deletion");
@@ -511,6 +651,152 @@ async fn paused_admission_holds_new_transactions_outside_the_intake_log() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_checkpoint_capture_keeps_its_cut_and_archives_only_sealed_objects() {
+    let cell = Cell::start(1, None).await;
+    let id = uuid::Uuid::new_v4();
+    admin::install_deployment(cell.directory.as_ref(), id, "shop", "acme", 3).await.unwrap();
+    let client = cell.connect("shop").await;
+    client.simple_query("INSERT INTO orders (_id, detail) VALUES (1, 'sample-payload-for-archive')").await.unwrap();
+    let holder = cell.holder("shop").await.unwrap();
+    let advance = |previous: Option<i64>| {
+        let cell = &cell;
+        async move {
+            cell.node(holder).agent.flush("shop").await.unwrap();
+            tokio::time::timeout(Duration::from_secs(8), async {
+                loop {
+                    if let Some(checkpoint) = cell.directory.deployment(&id.to_string()).await.unwrap().unwrap().checkpoint
+                        && previous.is_none_or(|block| checkpoint.block > block)
+                    {
+                        return checkpoint;
+                    }
+                    tokio::time::sleep(Duration::from_millis(25)).await;
+                }
+            }).await.unwrap()
+        }
+    };
+    let first = advance(None).await;
+    let destination = tempfile::tempdir().unwrap();
+    let archive = CellStorage::Local { root: destination.path().to_owned() };
+    let operation = uuid::Uuid::new_v4();
+    let capture = rtdb_multi::archive::capture(cell.directory.as_ref(), &cell.storage(), &archive, &cell.keys(), id, operation).await.unwrap();
+    assert_eq!(capture.point.checkpoint, first);
+    assert!(capture.objects.iter().any(|object| object.name.ends_with(".arrow")));
+    assert!(capture.objects.iter().any(|object| object.name.starts_with("blocks/")));
+    const SAMPLE: &[u8] = b"sample-payload-for-archive";
+    for object in &capture.objects {
+        let path = destination.path().join(format!("checkpoint-captures/{id}/{operation}/objects/{}", object.name));
+        let bytes = std::fs::read(path).unwrap();
+        assert_eq!(bytes.len() as u64, object.bytes);
+        assert!(!bytes.windows(SAMPLE.len()).any(|window| window == SAMPLE));
+    }
+    client.simple_query("INSERT INTO orders (_id, detail) VALUES (2, 'later')").await.unwrap();
+    assert!(advance(Some(first.block)).await.block > first.block);
+    let replay = rtdb_multi::archive::capture(cell.directory.as_ref(), &cell.storage(), &archive, &cell.keys(), id, operation).await.unwrap();
+    assert_eq!(replay, capture);
+    let other_destination = tempfile::tempdir().unwrap();
+    let other_archive = CellStorage::Local { root: other_destination.path().to_owned() };
+    assert!(rtdb_multi::archive::capture(cell.directory.as_ref(), &cell.storage(), &other_archive, &cell.keys(), id, operation).await.is_err());
+    assert!(rtdb_multi::archive::begin_retirement(cell.directory.as_ref(), id).await.is_err());
+    assert!(rtdb_multi::archive::restore(cell.directory.as_ref(), &cell.storage(), &archive, &cell.keys(), id, operation, 4 << 20).await.is_err());
+    drop(client);
+    admin::delete_installation(cell.directory.as_ref(), &cell.storage(), &cell.keys(), &id.to_string(), 4 << 20).await.unwrap();
+    let scheduled = rtdb_multi::archive::begin_retirement(cell.directory.as_ref(), id).await.unwrap();
+    assert!(scheduled.observed_empty_at_ms.is_none());
+    let retired = rtdb_multi::archive::finish_retirement(cell.directory.as_ref(), id)
+        .await
+        .unwrap();
+    assert!(retired.observed_empty_at_ms.is_some());
+    assert_eq!(retired.authorized_at_ms, scheduled.authorized_at_ms);
+    assert!(files_under(&destination.path().join(format!("checkpoint-captures/{id}/{operation}"))).is_empty());
+    assert_eq!(rtdb_multi::archive::begin_retirement(cell.directory.as_ref(), id).await.unwrap(), retired);
+    cell.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn restoring_the_current_archive_preserves_the_ordered_tail_and_authority() {
+    let mut cell = Cell::start(2, None).await;
+    let id = uuid::Uuid::new_v4();
+    admin::install_deployment(cell.directory.as_ref(), id, "shop", "acme", 3).await.unwrap();
+    let client = cell.connect("shop").await;
+    client.simple_query("INSERT INTO orders (_id, total) VALUES (1, 10)").await.unwrap();
+    let holder = cell.holder("shop").await.unwrap();
+    cell.node(holder).agent.flush("shop").await.unwrap();
+    let record = tokio::time::timeout(Duration::from_secs(8), async {
+        loop {
+            let record = cell.directory.deployment(&id.to_string()).await.unwrap().unwrap();
+            if record.checkpoint.is_some() { return record; }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    }).await.unwrap();
+    let archive_dir = tempfile::tempdir().unwrap();
+    let archive = CellStorage::Local { root: archive_dir.path().to_owned() };
+    let operation = uuid::Uuid::new_v4();
+    let storage = cell.storage();
+    let capture = rtdb_multi::archive::capture(cell.directory.as_ref(), &storage, &archive, &cell.keys(), id, operation).await.unwrap();
+    let object = capture.objects.iter().find(|object| object.name.ends_with(".arrow")).unwrap();
+    let path = archive_dir.path().join(format!("checkpoint-captures/{id}/{operation}/objects/{}", object.name));
+    let ciphertext = std::fs::read(&path).unwrap();
+    let mut corrupt = ciphertext.clone();
+    corrupt[0] ^= 1;
+    std::fs::write(&path, corrupt).unwrap();
+    assert!(rtdb_multi::archive::capture(cell.directory.as_ref(), &storage, &archive, &cell.keys(), id, operation).await.is_err());
+    assert!(rtdb_multi::archive::restore(cell.directory.as_ref(), &storage, &archive, &cell.keys(), id, operation, 4 << 20).await.is_err());
+    let still_live = cell.directory.deployment(&id.to_string()).await.unwrap().unwrap();
+    assert_eq!(still_live.lifecycle, Lifecycle::Live);
+    assert_eq!(still_live.epoch, record.epoch);
+    std::fs::write(path, ciphertext).unwrap();
+    client.simple_query("INSERT INTO orders (_id, total) VALUES (2, 20)").await.unwrap();
+    drop(client);
+    cell.nodes[holder].take().unwrap().kill().await.unwrap();
+    let CellStorage::Local { root } = &storage else { panic!("a disposable local fixture") };
+    std::fs::remove_dir_all(root.join(record.storage_prefix())).unwrap();
+
+    let restored = rtdb_multi::archive::restore(cell.directory.as_ref(), &storage, &archive, &cell.keys(), id, operation, 4 << 20).await.unwrap();
+    assert!(restored.completed_at_ms.is_some());
+    assert_eq!(restored.epoch, record.epoch + 1);
+    let reopened = connect_eventually(&cell, "shop").await;
+    assert_eq!(values(&reopened, "SHOW rtdb_hosted_source_barrier").await, [id.to_string()]);
+    assert_eq!(values(&reopened, "SELECT total FROM orders ORDER BY _id").await, ["10", "20"]);
+    let retried = rtdb_multi::archive::restore(cell.directory.as_ref(), &storage, &archive, &cell.keys(), id, operation, 4 << 20).await.unwrap();
+    assert_eq!(retried, restored);
+    let other_dir = tempfile::tempdir().unwrap();
+    let other_archive = CellStorage::Local { root: other_dir.path().to_owned() };
+    assert!(rtdb_multi::archive::restore(cell.directory.as_ref(), &storage, &other_archive, &cell.keys(), id, operation, 4 << 20).await.is_err());
+    drop(reopened);
+
+    let destination = Cell::start(1, None).await;
+    let map = MemoryCellMap::new();
+    assert!(map.assign("shop", "source", None).await.unwrap());
+    let arrived = admin::move_cell(
+        map.as_ref(),
+        &admin::CellHandle {
+            name: "source",
+            directory: cell.directory.as_ref(),
+            storage: &storage,
+            keys: &cell.keys(),
+            maximum_deployments: 1,
+        },
+        &admin::CellHandle {
+            name: "destination",
+            directory: destination.directory.as_ref(),
+            storage: &destination.storage(),
+            keys: &destination.keys(),
+            maximum_deployments: 1,
+        },
+        "shop",
+        4 << 20,
+    ).await.unwrap();
+    assert!(arrived.checkpoint_recovery.is_none());
+    archive_dir.close().unwrap();
+    let moved = connect_eventually(&destination, "shop").await;
+    assert_eq!(values(&moved, "SHOW rtdb_hosted_source_barrier").await, [id.to_string()]);
+    assert_eq!(values(&moved, "SELECT total FROM orders ORDER BY _id").await, ["10", "20"]);
+    drop(moved);
+    destination.stop().await;
+    cell.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_small_flush_writes_one_pack_and_its_catalog() {
     let cell = Cell::start(1, None).await;
     let record = admin::create_deployment(cell.directory.as_ref(), "shop", "acme", 3).await.unwrap();
@@ -608,7 +894,7 @@ async fn a_new_holder_moves_a_degraded_stream_to_live_logkeepers() {
     let moved = cell.directory.deployment_by_name("shop").await.unwrap().unwrap();
     assert!(!moved.ensemble.contains(&dead_id), "the dead logkeeper left the ensemble: {:?}", moved.ensemble);
     assert_eq!(moved.ensemble.len(), 3);
-    assert!(moved.log_copy_servers.contains(&retired));
+    assert!(moved.replica_journals.contains(&retired));
     client.simple_query("INSERT INTO orders (_id, total) VALUES (2, 20)").await.unwrap();
 
     let second = record.ensemble.iter().skip(1).find_map(|id| position(&cell, id)).unwrap();
@@ -700,20 +986,23 @@ struct InterruptedInstall {
     failed: std::sync::atomic::AtomicBool,
 }
 
+#[async_trait::async_trait]
 impl KeyService for InterruptedInstall {
-    fn namespace_id(&self) -> rtdb_types::Result<[u8; 32]> { self.keys.namespace_id() }
-    fn key(&self, deployment: &str) -> rtdb_types::Result<[u8; 32]> { self.keys.key(deployment) }
-    fn existing(&self, deployment: &str) -> rtdb_types::Result<[u8; 32]> { self.keys.existing(deployment) }
-    fn destroy(&self, deployment: &str) -> rtdb_types::Result<()> { self.keys.destroy(deployment) }
-    fn validate_install(&self, deployment: &str, key: &[u8; 32]) -> rtdb_types::Result<()> { self.keys.validate_install(deployment, key) }
-    fn sign_deletion(&self, facts: rtdb_directory::DeletionFacts) -> rtdb_types::Result<rtdb_directory::DeletionRecord> { self.keys.sign_deletion(facts) }
-    fn deletion_verification_key(&self) -> rtdb_types::Result<String> { self.keys.deletion_verification_key() }
+    async fn namespace_id(&self) -> rtdb_types::Result<[u8; 32]> { self.keys.namespace_id().await }
+    async fn key(&self, deployment: &str) -> rtdb_types::Result<[u8; 32]> { self.keys.key(deployment).await }
+    async fn existing(&self, deployment: &str) -> rtdb_types::Result<[u8; 32]> { self.keys.existing(deployment).await }
+    async fn existing_key(&self, deployment: &str) -> rtdb_types::Result<Option<[u8; 32]>> { self.keys.existing_key(deployment).await }
+    async fn copy(&self, from: &str, to: &str) -> rtdb_types::Result<()> { self.keys.copy(from, to).await }
+    async fn destroy(&self, deployment: &str) -> rtdb_types::Result<()> { self.keys.destroy(deployment).await }
+    async fn validate_install(&self, deployment: &str, key: &[u8; 32]) -> rtdb_types::Result<()> { self.keys.validate_install(deployment, key).await }
+    async fn sign_deletion(&self, facts: rtdb_directory::DeletionFacts) -> rtdb_types::Result<rtdb_directory::DeletionRecord> { self.keys.sign_deletion(facts).await }
+    async fn deletion_verification_key(&self) -> rtdb_types::Result<String> { self.keys.deletion_verification_key().await }
 
-    fn install(&self, deployment: &str, key: [u8; 32]) -> rtdb_types::Result<()> {
+    async fn install(&self, deployment: &str, key: [u8; 32]) -> rtdb_types::Result<()> {
         if !self.failed.swap(true, std::sync::atomic::Ordering::Relaxed) {
             return Err(rtdb_types::Anomaly::new(rtdb_types::AnomalyCategory::Unavailable, "test/key-install-interrupted", "The destination key service was unavailable"));
         }
-        self.keys.install(deployment, key)
+        self.keys.install(deployment, key).await
     }
 }
 
@@ -771,6 +1060,7 @@ async fn a_cell_move_resumes_when_preparation_or_the_placement_switch_is_interru
         west.logkeepers.push(rtdb_multi::process::start_logkeeper(west.directory.clone(), rtdb_multi::process::LogkeeperSettings {
             listen: if index == 0 { reused } else { "127.0.0.1:0".parse().unwrap() },
             data_dir: west.data.path().join(format!("replacement-{index}")),
+            advertise_host: None,
             fsync: false,
             cache_bytes: rtdb_logkeeper::ServerOptions::DEFAULT_CACHE_BYTES,
             availability_zone: format!("zone-{index}"),
@@ -801,9 +1091,41 @@ async fn a_cell_move_resumes_when_preparation_or_the_placement_switch_is_interru
     west.stop().await;
 }
 
+struct LoseTransferReply {
+    inner: Arc<MemoryCellMap>,
+    lost: AtomicBool,
+}
+
+#[async_trait::async_trait]
+impl CellMap for LoseTransferReply {
+    async fn register_cell(&self, cell: &str, gateway: &str) -> Result<()> {
+        self.inner.register_cell(cell, gateway).await
+    }
+
+    async fn gateway(&self, cell: &str) -> Result<Option<String>> {
+        self.inner.gateway(cell).await
+    }
+
+    async fn cells(&self) -> Result<BTreeMap<String, String>> {
+        self.inner.cells().await
+    }
+
+    async fn cell_of(&self, deployment: &str) -> Result<Option<String>> {
+        self.inner.cell_of(deployment).await
+    }
+
+    async fn assign(&self, deployment: &str, cell: &str, expected: Option<&str>) -> Result<bool> {
+        let assigned = self.inner.assign(deployment, cell, expected).await?;
+        if assigned && expected.is_some() && !self.lost.swap(true, Ordering::SeqCst) {
+            return Err(Anomaly::new(AnomalyCategory::Unavailable, "test/lost-transfer-reply", "The assignment reply was lost"));
+        }
+        Ok(assigned)
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
 async fn a_deployment_moves_cells_with_its_unflushed_tail_and_its_old_gateway_forwards() {
-    let map: std::sync::Arc<dyn rtdb_multi::cells::CellMap> = rtdb_multi::cells::MemoryCellMap::new();
+    let map: Arc<dyn CellMap> = Arc::new(LoseTransferReply { inner: MemoryCellMap::new(), lost: AtomicBool::new(false) });
     let east = Cell::start_in("east", map.clone(), 1).await;
     let west = Cell::start_in("west", map.clone(), 1).await;
     let (east_storage, west_storage, east_keys, west_keys) = (east.storage(), west.storage(), east.keys(), west.keys());
@@ -817,7 +1139,17 @@ async fn a_deployment_moves_cells_with_its_unflushed_tail_and_its_old_gateway_fo
     client.simple_query("INSERT INTO orders (_id, total) VALUES (2, 20)").await.unwrap();
     drop(client);
 
-    let arrived = admin::move_cell(map.as_ref(), &handle("east", &east, &east_storage, &east_keys, 10), &handle("west", &west, &west_storage, &west_keys, 10), "shop", 4 << 20).await.unwrap();
+    let source = handle("east", &east, &east_storage, &east_keys, 10);
+    let destination = handle("west", &west, &west_storage, &west_keys, 10);
+    let error = admin::move_cell(map.as_ref(), &source, &destination, "shop", 4 << 20).await.unwrap_err();
+    assert_eq!(error.code, "test/lost-transfer-reply");
+    let fenced = east.directory.deployment_by_name("shop").await.unwrap().unwrap();
+    assert_eq!(fenced.lifecycle, Lifecycle::Moving);
+    let pending = west.directory.deployment(&fenced.id).await.unwrap().unwrap();
+    assert_eq!(pending.lifecycle, Lifecycle::Moving);
+
+    let arrived = admin::move_cell(map.as_ref(), &source, &destination, "shop", 4 << 20).await.unwrap();
+    assert_eq!(arrived.epoch, fenced.epoch);
     assert_eq!(map.cell_of("shop").await.unwrap().as_deref(), Some("west"));
     let through_east = connect_eventually(&east, "shop").await;
     assert_eq!(values(&through_east, "SELECT total FROM orders").await, ["10", "20"], "the unflushed tail moved with it, and the old cell's gateway forwards");
@@ -838,12 +1170,12 @@ async fn a_deployment_moves_cells_with_its_unflushed_tail_and_its_old_gateway_fo
     let now = rtdb_directory::now_ms();
     let due = now + hour.as_millis() as i64;
     let source = east.directory.as_ref();
-    let destination_key = west_keys.existing(&tombstone.id).unwrap();
+    let destination_key = west_keys.existing(&tombstone.id).await.unwrap();
     for (storage, keys) in [(&west_storage, &keys), (&east_storage, &west_keys)] {
         let error = rtdb_multi::store::finish_moves(source, storage, &deployments, due, hour, Some(keys)).await.unwrap_err();
         assert_eq!(error.code, "rtdb.multi/storage-binding-mismatch");
         assert!(left_behind().await > 0);
-        assert_eq!(west_keys.existing(&tombstone.id).unwrap(), destination_key);
+        assert_eq!(west_keys.existing(&tombstone.id).await.unwrap(), destination_key);
     }
     let mut legacy = tombstone.clone();
     legacy.cell_move = None;
@@ -852,20 +1184,20 @@ async fn a_deployment_moves_cells_with_its_unflushed_tail_and_its_old_gateway_fo
     let error = rtdb_multi::store::finish_moves(source, &east_storage, &deployments, due, hour, Some(&keys)).await.unwrap_err();
     assert_eq!(error.code, "rtdb.multi/storage-binding-missing");
     assert!(left_behind().await > 0);
-    assert_eq!(keys.existing(&tombstone.id).unwrap(), destination_key);
+    assert_eq!(keys.existing(&tombstone.id).await.unwrap(), destination_key);
     source.replace_deployment(tombstone.clone(), legacy.version).await.unwrap().applied().unwrap();
 
     assert_eq!(rtdb_multi::store::finish_moves(source, &east_storage, &deployments, now, hour, Some(&keys)).await.unwrap(), 0, "and keeps them within the grace");
     assert_eq!(rtdb_multi::store::finish_moves(source, &east_storage, &deployments, due, hour, None).await.unwrap(), 1);
     assert_eq!(source.deployment(&tombstone.id).await.unwrap().unwrap().source_cleanup, Some(rtdb_directory::SourceCleanup::ObjectsErased));
     assert_eq!(left_behind().await, 0, "after the grace the source erases what the move left");
-    assert_eq!(keys.existing(&tombstone.id).unwrap(), destination_key);
+    assert_eq!(keys.existing(&tombstone.id).await.unwrap(), destination_key);
     assert_eq!(rtdb_multi::store::finish_moves(source, &east_storage, &deployments, due, hour, None).await.unwrap(), 0);
     assert_eq!(rtdb_multi::store::finish_moves(source, &east_storage, &deployments, due, hour, Some(&keys)).await.unwrap(), 1);
     assert_eq!(source.deployment(&tombstone.id).await.unwrap().unwrap().source_cleanup, Some(rtdb_directory::SourceCleanup::ObjectsAndKeyErased));
-    assert_eq!(keys.existing(&tombstone.id).unwrap_err().code, "rtdb.multi/key-destroyed");
+    assert_eq!(keys.existing(&tombstone.id).await.unwrap_err().code, "rtdb.multi/key-destroyed");
     assert_eq!(rtdb_multi::store::finish_moves(source, &east_storage, &deployments, due, hour, Some(&keys)).await.unwrap(), 0);
-    assert_eq!(west_keys.existing(&tombstone.id).unwrap(), destination_key);
+    assert_eq!(west_keys.existing(&tombstone.id).await.unwrap(), destination_key);
     assert_eq!(values(&through_west, "SELECT total FROM orders").await, ["10", "20", "30"], "while the deployment reads on in its new cell");
     drop((through_east, through_west));
     east.stop().await;
@@ -1321,9 +1653,9 @@ async fn an_unsafe_cell_move_leaves_the_source_live() {
     std::os::unix::fs::symlink(east.data.path().join("keys"), &key_alias).unwrap();
     let aliased_keys = LocalKeyService::new(key_alias).unwrap();
 
-    let mut conflicting_key = east_keys.key(&deployment.id).unwrap();
+    let mut conflicting_key = east_keys.key(&deployment.id).await.unwrap();
     conflicting_key[0] ^= 1;
-    west_keys.install(&deployment.id, conflicting_key).unwrap();
+    west_keys.install(&deployment.id, conflicting_key).await.unwrap();
     for (storage, keys, expected) in [
         (&aliased_storage, &west_keys, "rtdb.multi/shared-cell-storage"),
         (&nested_storage, &west_keys, "rtdb.multi/shared-cell-storage"),

@@ -34,12 +34,17 @@ struct Hooks {
     fail_abort: bool,
     fail_delete: bool,
     fail_copy: bool,
+    lose_put_reply: bool,
+    fail_before_put: bool,
+    forget_put_witness: bool,
+    defer_publication_head: bool,
     deny_list: bool,
 }
 
 #[derive(Debug, Default)]
 struct Observed {
     calls: AtomicUsize,
+    heads: AtomicUsize,
     parts: AtomicUsize,
     completed: AtomicUsize,
     abort_calls: AtomicUsize,
@@ -64,9 +69,19 @@ impl fmt::Display for ControlledStore {
 
 #[async_trait]
 impl ProviderStore for ControlledStore {
-    async fn put_opts(&self, location: &Path, payload: PutPayload, options: PutOptions) -> object_store::Result<PutResult> {
+    async fn put_opts(&self, location: &Path, payload: PutPayload, mut options: PutOptions) -> object_store::Result<PutResult> {
         self.called();
-        self.inner.put_opts(location, payload, options).await
+        if self.hooks.fail_before_put {
+            return Err(injected("provider publication is unconfirmed"));
+        }
+        if self.hooks.forget_put_witness {
+            options.attributes = Default::default();
+        }
+        let result = self.inner.put_opts(location, payload, options).await?;
+        if self.hooks.lose_put_reply {
+            return Err(injected("lost publication reply"));
+        }
+        Ok(result)
     }
     async fn put_multipart_opts(&self, location: &Path, options: PutMultipartOptions) -> object_store::Result<Box<dyn MultipartUpload>> {
         self.called();
@@ -76,6 +91,9 @@ impl ProviderStore for ControlledStore {
     }
     async fn get_opts(&self, location: &Path, options: GetOptions) -> object_store::Result<GetResult> {
         self.called();
+        if options.head && self.hooks.defer_publication_head && self.observed.heads.fetch_add(1, Ordering::SeqCst) == 0 {
+            return Err(injected("the first publication observation was unavailable"));
+        }
         if !options.head { if let Some(gate) = &self.hooks.read { gate.enter().await; } }
         self.inner.get_opts(location, options).await
     }
@@ -149,6 +167,68 @@ fn injected(message: &'static str) -> object_store::Error {
 
 async fn bounded<F: Future>(future: F) -> F::Output {
     tokio::time::timeout(Duration::from_secs(10), future).await.expect("controlled I/O did not finish")
+}
+
+#[tokio::test]
+async fn a_drained_single_put_region_recovers_only_its_exact_committed_write() {
+    let key = ObjectKey::new("data.arrow").unwrap();
+    let contents = Bytes::from_static(b"sealed");
+    let prefix = ObjectKey::new("cell").unwrap();
+    let io = IoRegion::new();
+    let store = RemoteStore::new_single_put(ControlledStore::new(Hooks::default()), prefix.clone(), io.clone());
+    store.put(&key, contents.clone()).await.unwrap();
+    assert!(matches!(
+        store.put(&key, Bytes::from_static(b"other")).await,
+        Err(Error::ConflictingObject(_))
+    ));
+    io.close_and_wait().await;
+    assert!(!io.has_unknown_publication());
+
+    let io = IoRegion::new();
+    let provider = ControlledStore::new(Hooks { lose_put_reply: true, ..Default::default() });
+    let store = RemoteStore::new_single_put(provider.clone(), prefix.clone(), io.clone());
+    store.put(&key, contents.clone()).await.unwrap();
+    io.close_and_wait().await;
+    assert!(!io.has_unknown_publication());
+    assert_eq!(paths(&provider.inner).await, ["cell/data.arrow"]);
+
+    for (hooks, objects) in [
+        (Hooks { fail_before_put: true, ..Default::default() }, Vec::<&str>::new()),
+        (Hooks { lose_put_reply: true, forget_put_witness: true, ..Default::default() }, vec!["cell/data.arrow"]),
+    ] {
+        let io = IoRegion::new();
+        let provider = ControlledStore::new(hooks);
+        let store = RemoteStore::new_single_put(provider.clone(), prefix.clone(), io.clone());
+        assert!(matches!(store.put(&key, contents.clone()).await, Err(Error::Remote { .. })));
+        io.close_and_wait().await;
+        assert!(io.has_unknown_publication());
+        assert_eq!(paths(&provider.inner).await, objects);
+    }
+}
+
+#[tokio::test]
+async fn a_replacement_can_observe_a_closed_writers_exact_publication() {
+    let key = ObjectKey::new("data.arrow").unwrap();
+    let prefix = ObjectKey::new("cell").unwrap();
+    let io = IoRegion::new();
+    let provider = ControlledStore::new(Hooks {
+        lose_put_reply: true,
+        defer_publication_head: true,
+        ..Default::default()
+    });
+    let old = RemoteStore::new_single_put(provider.clone(), prefix.clone(), io.clone());
+    assert!(matches!(old.put(&key, Bytes::from_static(b"sealed")).await, Err(Error::Remote { .. })));
+    io.close_and_wait().await;
+    let pending = io.pending_publications();
+    assert_eq!(pending.len(), 1);
+    let (&attempt, retained_key) = pending.first_key_value().unwrap();
+    assert_eq!(retained_key, &key);
+    drop(old);
+    drop(io);
+
+    let reaper = RemoteStore::new_single_put(provider, prefix, IoRegion::new());
+    assert!(reaper.publication_confirmed(retained_key, attempt).await.unwrap());
+    assert!(!reaper.publication_confirmed(retained_key, uuid::Uuid::new_v4()).await.unwrap());
 }
 
 async fn assert_pending<F: Future + ?Sized>(mut future: Pin<&mut F>) {

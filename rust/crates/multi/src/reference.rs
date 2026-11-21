@@ -81,7 +81,7 @@ impl PrefixedStore {
     fn full(&self, key: &ObjectKey) -> rtdb_storage::Result<ObjectKey> { self::key(&format!("{}/{}", self.prefix, key.as_str())) }
     fn mutation(&self, key: &ObjectKey) -> rtdb_storage::Result<(&dyn ObjectStore, ObjectKey)> {
         match &self.scoped_writer {
-            Some(writer) => Ok((writer.as_ref(), key.clone())),
+            Some(writer) => Ok((writer.as_ref(), self.full(key)?)),
             None => Ok((self.bucket.as_ref(), self.full(key)?)),
         }
     }
@@ -272,7 +272,8 @@ impl References {
     /// The references of every deployment in `records` that is not deleted.
     pub async fn scan(bucket: &dyn ObjectStore, records: &[DeploymentRecord]) -> Result<Self> {
         let mut references = Self::default();
-        for record in records.iter().filter(|record| record.lifecycle != Lifecycle::Deleted) {
+        for record in records {
+            if record.lifecycle == Lifecycle::Deleted { continue; }
             for store in stores(bucket, &record.storage_prefix()).await? {
                 // One listing per store, rather than a request per reference, on every reaper pass.
                 let own: BTreeSet<String> = physical_objects(bucket, &store).await?.into_iter().collect();
