@@ -574,6 +574,8 @@ Deletion must be provable and forks must be cheap (spec rules `Fork`, `ForkAcros
 1. Per-deployment data keys from KMS with the deployment as encryption context; per-object data keys wrapped by the owner's key; log payloads encrypted.
 2. `Lineage` records with a version bumped by every fork and deletion.
 3. Fork: a new record in the lineage with a fork checkpoint referencing the parent's objects plus one pack of the parent's tail to the fork basis; inherited reads capped at the fork basis; cross-organisation forks copied and re-encrypted.
+   Fork reads retry their local copy if the reaper transfers an inherited object between the first local read and the read from its original owner.
+   A reference-manifest read repeats the listing if a concurrent revision replaced the listed manifest.
 4. Deletion: fence by epoch bump, seal and drop the stream, wait `credential_ttl`, re-wrap shared objects to a surviving referrer, delete all versions, prove the prefix empty twice, destroy the key, sign the deletion record.
    The delete command durably drops the stream from every member of its current ensemble and any pending source ensemble before proceeding to object erasure.
    A missing replica leaves the deployment fenced in `deleting`.
@@ -581,7 +583,7 @@ Deletion must be provable and forks must be cheap (spec rules `Fork`, `ForkAcros
    A terminal logkeeper record prevents reopening the stream after restart.
    Shared journal segments reclaim dropped payloads during compaction.
    All logkeepers must support the drop operation before using this deletion path, and binaries predating it cannot open a journal containing its record.
-   Retired ensembles and replacement ensembles copied to before their membership CAS still need tracked cleanup.
+   Replica addresses retired before ensemble-transfer tracking was introduced require separate inventory.
    The current deletion path keeps a deployment in `deleting` for retry if objects remain.
    After an empty current inventory and local key destruction, it signs a receipt with the key service's Ed25519 signing key and stores it with the tombstone in one directory CAS.
    Retrying a completed deletion returns the stored receipt.

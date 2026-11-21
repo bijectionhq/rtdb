@@ -12,6 +12,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use bytes::Bytes;
+use futures::future::BoxFuture;
 use rtdb_directory::{DeploymentRecord, Lifecycle};
 use rtdb_storage::{Error, ObjectKey, ObjectStore, object_store::StoredObject};
 use rtdb_types::{Anomaly, Result};
@@ -37,11 +38,16 @@ fn bookkeeping(key: &str) -> bool { key == crate::store::ROOT_MARKER || key.star
 impl Base {
     /// The latest manifest of `store`, or none.
     pub async fn load(bucket: &dyn ObjectStore, store: &str) -> Result<Base> {
-        Ok(match latest_manifest(bucket, store).await? {
-            Some((_, name)) => serde_json::from_slice(&bucket.get(&key(&name)?).await.map_err(storage)?)
-                .map_err(|error| Anomaly::fault("rtdb.multi/base-manifest", format!("{name}: {error}")))?,
-            None => Base::default(),
-        })
+        for _ in 0..4 {
+            let Some((_, name)) = latest_manifest(bucket, store).await? else { return Ok(Base::default()); };
+            match bucket.get(&key(&name)?).await {
+                Ok(bytes) => return serde_json::from_slice(&bytes)
+                    .map_err(|error| Anomaly::fault("rtdb.multi/base-manifest", format!("{name}: {error}"))),
+                Err(Error::MissingObject(_)) => continue,
+                Err(error) => return Err(storage(error)),
+            }
+        }
+        Err(Anomaly::new(rtdb_types::AnomalyCategory::Unavailable, "rtdb.multi/base-manifest-changed", format!("The reference manifest for {store} kept changing")))
     }
 
     /// Writes this as `store`'s manifest, after its latest, and forgets the earlier ones.
@@ -97,27 +103,38 @@ impl ReferencingStore {
     /// Opens `own`, a store in the cell's `bucket` whose manifest is `base`.
     pub fn new(own: Arc<dyn ObjectStore>, bucket: Bucket, base: Base) -> Self { Self { own, bucket, base } }
 
-    /// Where `key` is read from: this store's own object, or the one its manifest references.
-    async fn locate(&self, key: &ObjectKey) -> rtdb_storage::Result<(Arc<dyn ObjectStore>, ObjectKey)> {
-        if let (Err(Error::MissingObject(_)), Some(store)) = (self.own.head(key).await, self.base.objects.get(key.as_str())) {
-            return Ok((Arc::clone(&self.bucket), self::key(&format!("{store}/{}", key.as_str()))?));
+    async fn read<T>(&self, key: &ObjectKey, read: impl for<'a> Fn(&'a dyn ObjectStore, &'a ObjectKey) -> BoxFuture<'a, rtdb_storage::Result<T>>) -> rtdb_storage::Result<T> {
+        let own = read(self.own.as_ref(), key).await;
+        if !matches!(own, Err(Error::MissingObject(_))) { return own; }
+        let Some(owner) = self.base.objects.get(key.as_str()) else { return own; };
+        let inherited = self::key(&format!("{owner}/{key}"))?;
+        match read(self.bucket.as_ref(), &inherited).await {
+            // Erasure can copy the object here and remove it from its owner between the two reads.
+            Err(Error::MissingObject(_)) => read(self.own.as_ref(), key).await,
+            result => result,
         }
-        Ok((Arc::clone(&self.own), key.clone()))
     }
 }
 
 #[async_trait]
 impl ObjectStore for ReferencingStore {
     async fn head(&self, key: &ObjectKey) -> rtdb_storage::Result<StoredObject> {
-        let (store, located) = self.locate(key).await?;
-        Ok(StoredObject { key: key.clone(), size: store.head(&located).await?.size })
+        let object = self.read(key, |store, key| store.head(key)).await?;
+        Ok(StoredObject { key: key.clone(), size: object.size })
     }
-    async fn get(&self, key: &ObjectKey) -> rtdb_storage::Result<Bytes> { let (store, located) = self.locate(key).await?; store.get(&located).await }
-    async fn get_range(&self, key: &ObjectKey, range: Range<u64>) -> rtdb_storage::Result<Bytes> { let (store, located) = self.locate(key).await?; store.get_range(&located, range).await }
+    async fn head_fresh(&self, key: &ObjectKey) -> rtdb_storage::Result<StoredObject> {
+        let object = self.read(key, |store, key| store.head_fresh(key)).await?;
+        Ok(StoredObject { key: key.clone(), size: object.size })
+    }
+    async fn get(&self, key: &ObjectKey) -> rtdb_storage::Result<Bytes> {
+        self.read(key, |store, key| store.get(key)).await
+    }
+    async fn get_range(&self, key: &ObjectKey, range: Range<u64>) -> rtdb_storage::Result<Bytes> {
+        self.read(key, |store, key| store.get_range(key, range.clone())).await
+    }
     async fn put(&self, key: &ObjectKey, bytes: Bytes) -> rtdb_storage::Result<()> {
-        // Put-if-absent holds across the references: a shared object is already present.
-        if let (Err(Error::MissingObject(_)), Some(store)) = (self.own.head(key).await, self.base.objects.get(key.as_str())) {
-            return if self.bucket.get(&self::key(&format!("{store}/{}", key.as_str()))?).await? == bytes { Ok(()) } else { Err(Error::ConflictingObject(key.to_string())) };
+        if self.base.objects.contains_key(key.as_str()) {
+            return if self.get(key).await? == bytes { Ok(()) } else { Err(Error::ConflictingObject(key.to_string())) };
         }
         self.own.put(key, bytes).await
     }
@@ -131,8 +148,11 @@ impl ObjectStore for ReferencingStore {
         for name in self.base.objects.keys() {
             let key = self::key(name)?;
             if listed.contains_key(name) || directory.is_some_and(|directory| !key.is_under(directory)) { continue; }
-            // A reference whose object has since been copied in and erased at its source is listed from the copy.
-            if let Ok(object) = self.head(&key).await { listed.insert(name.clone(), object); }
+            match self.head(&key).await {
+                Ok(object) => { listed.insert(name.clone(), object); }
+                Err(Error::MissingObject(_)) => {}
+                Err(error) => return Err(error),
+            }
         }
         Ok(listed.into_values().collect())
     }
@@ -339,21 +359,79 @@ mod tests {
         transferred: std::sync::atomic::AtomicBool,
     }
 
-    #[async_trait]
-    impl ObjectStore for TransferringStore {
-        async fn head(&self, key: &ObjectKey) -> rtdb_storage::Result<StoredObject> { self.inner.head(key).await }
-        async fn get(&self, key: &ObjectKey) -> rtdb_storage::Result<Bytes> {
+    impl TransferringStore {
+        async fn transfer_if_read(&self, key: &ObjectKey) -> rtdb_storage::Result<()> {
             if key == &self.original && !self.transferred.swap(true, std::sync::atomic::Ordering::Relaxed) {
                 self.inner.copy(&self.original, &self.copy).await?;
                 self.inner.delete(&self.original).await?;
             }
+            Ok(())
+        }
+    }
+
+    #[async_trait]
+    impl ObjectStore for TransferringStore {
+        async fn head(&self, key: &ObjectKey) -> rtdb_storage::Result<StoredObject> {
+            self.transfer_if_read(key).await?;
+            self.inner.head(key).await
+        }
+        async fn get(&self, key: &ObjectKey) -> rtdb_storage::Result<Bytes> {
+            self.transfer_if_read(key).await?;
             self.inner.get(key).await
         }
-        async fn get_range(&self, key: &ObjectKey, range: Range<u64>) -> rtdb_storage::Result<Bytes> { self.inner.get_range(key, range).await }
+        async fn get_range(&self, key: &ObjectKey, range: Range<u64>) -> rtdb_storage::Result<Bytes> {
+            self.transfer_if_read(key).await?;
+            self.inner.get_range(key, range).await
+        }
         async fn put(&self, key: &ObjectKey, bytes: Bytes) -> rtdb_storage::Result<()> { self.inner.put(key, bytes).await }
         async fn put_file(&self, key: &ObjectKey, source: &Path) -> rtdb_storage::Result<()> { self.inner.put_file(key, source).await }
         async fn list(&self, directory: Option<&ObjectKey>) -> rtdb_storage::Result<Vec<StoredObject>> { self.inner.list(directory).await }
         async fn delete(&self, key: &ObjectKey) -> rtdb_storage::Result<()> { self.inner.delete(key).await }
+    }
+
+    #[tokio::test]
+    async fn a_fork_reads_an_object_transferred_during_the_read() {
+        for read in ["get", "get_range", "head", "head_fresh", "list", "put"] {
+            let bucket = bucket();
+            put(&bucket, "parent/v06/row", b"parent").await;
+            fork(bucket.as_ref(), "parent", "child", None).await.unwrap();
+            let base = Base::load(bucket.as_ref(), "child/v06").await.unwrap();
+            let bucket: Bucket = Arc::new(TransferringStore {
+                inner: bucket,
+                original: key("parent/v06/row").unwrap(),
+                copy: key("child/v06/row").unwrap(),
+                transferred: Default::default(),
+            });
+            let store = ReferencingStore::new(Arc::new(PrefixedStore::new(bucket.clone(), "child/v06")), bucket.clone(), base);
+            let row = key("row").unwrap();
+            match read {
+                "get" => assert_eq!(store.get(&row).await.unwrap(), b"parent".as_slice()),
+                "get_range" => assert_eq!(store.get_range(&row, 2..6).await.unwrap(), b"rent".as_slice()),
+                "head" => assert_eq!(store.head(&row).await.unwrap().size, 6),
+                "head_fresh" => assert_eq!(store.head_fresh(&row).await.unwrap().size, 6),
+                "list" => assert_eq!(store.list(None).await.unwrap(), [StoredObject { key: row, size: 6 }]),
+                "put" => {
+                    store.put(&row, Bytes::from_static(b"parent")).await.unwrap();
+                    assert!(matches!(store.put(&row, Bytes::from_static(b"overwrite")).await, Err(Error::ConflictingObject(_))));
+                }
+                _ => unreachable!(),
+            }
+            assert!(!holds(bucket.as_ref(), "parent/v06", "row").await.unwrap());
+        }
+    }
+
+    #[tokio::test]
+    async fn reading_a_manifest_retries_when_its_listed_revision_was_replaced() {
+        let bucket = bucket();
+        let base = Base { objects: BTreeMap::from([("row".into(), "parent/v06".into())]) };
+        base.save(bucket.as_ref(), "child/v06").await.unwrap();
+        let changing = TransferringStore {
+            inner: bucket,
+            original: key(&format!("child/v06/{BASE_MANIFEST}/{:020}", 0)).unwrap(),
+            copy: key(&format!("child/v06/{BASE_MANIFEST}/{:020}", 1)).unwrap(),
+            transferred: Default::default(),
+        };
+        assert_eq!(Base::load(&changing, "child/v06").await.unwrap(), base);
     }
 
     #[tokio::test]

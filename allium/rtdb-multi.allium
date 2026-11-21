@@ -1758,6 +1758,19 @@ rule ForkReadsAreCapped {
         InheritedObjectsCappedAt(session.deployment.fork_basis)
 }
 
+rule ReadTransferredForkObject {
+    when: ForkObjectRead(record, object)
+
+    requires: object in InheritedReferences(record)
+
+    ensures:
+        ReadLocalCopy(record, object)
+        if LocalCopyMissing(record, object):
+            ReadReferencedCopy(record, object)
+            if ReferencedCopyMissing(record, object):
+                ReadLocalCopy(record, object)
+}
+
 ------------------------------------------------------------
 -- Rules: deletion
 ------------------------------------------------------------
