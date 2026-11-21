@@ -333,3 +333,5 @@ A production implementation should build tie metadata with the artifact, carry v
 Measure how often real queries qualify and whether the extra artifact metadata pays for itself on fresh terms.
 
 The focused release run passed all 50 search and node tests, including the exact score and ID bound regression.
+The full Gradle unit rerun passed all 3,187 tests.
+The first Gradle run had one JVM cache eviction assertion failure, which passed in isolation and in the full rerun.
