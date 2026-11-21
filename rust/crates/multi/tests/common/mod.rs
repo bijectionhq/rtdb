@@ -88,10 +88,19 @@ impl Cell {
 
     async fn start_configured(objects: Option<CellStorage>, pools: Vec<MemberPool>, park_after: Option<Duration>,
         watch: Option<Duration>, cells: Option<(Arc<dyn rtdb_multi::cells::CellMap>, String)>, fsync: bool, configure: impl FnOnce(&mut AgentOptions)) -> Self {
+        Self::start_configured_with_directory(MemoryDirectory::new(), objects, pools, park_after, watch, cells, fsync, configure).await
+    }
+
+    pub async fn start_with_directory(directory: Arc<dyn Directory>) -> Self {
+        Self::start_configured_with_directory(directory, None, vec![MemberPool::General], None, None, None, true, |_| {}).await
+    }
+
+    async fn start_configured_with_directory(directory: Arc<dyn Directory>, objects: Option<CellStorage>, pools: Vec<MemberPool>,
+        park_after: Option<Duration>, watch: Option<Duration>, cells: Option<(Arc<dyn rtdb_multi::cells::CellMap>, String)>, fsync: bool,
+        configure: impl FnOnce(&mut AgentOptions)) -> Self {
         let compaction_workers = pools.contains(&MemberPool::Compaction);
         let data = tempfile::tempdir().unwrap();
         let objects = objects.unwrap_or_else(|| CellStorage::Local { root: data.path().join("objects") });
-        let directory: Arc<dyn Directory> = MemoryDirectory::new();
         let mut logkeepers = Vec::new();
         for index in 0..3 {
             logkeepers.push(process::start_logkeeper(Arc::clone(&directory), process::LogkeeperSettings {

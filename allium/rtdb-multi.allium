@@ -363,6 +363,8 @@ contract Directory {
         -- A process consuming only keyed watches retains watch state for the deployments it follows.
         -- When a DynamoDB feed starts or reconnects, keyed watches refresh their own records after the stream is ready.
         -- A watch observation earlier than a confirmed route or holder epoch keeps that route or holding valid.
+        -- A holding follows the shared deployment watch from its claim version onward.
+        -- A newer placement can retire a local holding.
         --   A late change costs a redirect, never a wrong answer, because no watcher authorises anything by what it has seen.
 
     @invariant StaticStability

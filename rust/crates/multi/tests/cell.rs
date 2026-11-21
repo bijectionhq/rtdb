@@ -39,6 +39,50 @@ async fn stopping_a_node_releases_its_agent_and_its_standby_storage_witness() {
     cell.stop().await;
 }
 
+struct ObservedDirectory { inner: Arc<MemoryDirectory>, reads: std::sync::atomic::AtomicUsize }
+
+#[async_trait::async_trait]
+impl Directory for ObservedDirectory {
+    async fn create_deployment(&self, record: DeploymentRecord) -> Result<DeploymentRecord> { self.inner.create_deployment(record).await }
+    async fn create_fork(&self, child: DeploymentRecord, expected: rtdb_directory::Version) -> Result<DeploymentRecord> { self.inner.create_fork(child, expected).await }
+    async fn deployment(&self, id: &str) -> Result<Option<DeploymentRecord>> {
+        self.reads.fetch_add(1, Ordering::Relaxed);
+        self.inner.deployment(id).await
+    }
+    async fn deployment_by_name(&self, name: &str) -> Result<Option<DeploymentRecord>> { self.inner.deployment_by_name(name).await }
+    async fn deployments(&self) -> Result<Vec<DeploymentRecord>> { self.inner.deployments().await }
+    async fn deployments_held_by(&self, id: &MemberId) -> Result<Vec<DeploymentRecord>> { self.inner.deployments_held_by(id).await }
+    async fn replace_deployment(&self, record: DeploymentRecord, expected: rtdb_directory::Version) -> Result<rtdb_directory::Cas<DeploymentRecord>> { self.inner.replace_deployment(record, expected).await }
+    async fn register_member(&self, member: rtdb_directory::MemberRecord) -> Result<rtdb_directory::MemberRecord> { self.inner.register_member(member).await }
+    async fn member(&self, id: &MemberId) -> Result<Option<rtdb_directory::MemberRecord>> { self.inner.member(id).await }
+    async fn members(&self) -> Result<Vec<rtdb_directory::MemberRecord>> { self.inner.members().await }
+    async fn replace_member(&self, member: rtdb_directory::MemberRecord, expected: rtdb_directory::Version) -> Result<rtdb_directory::Cas<rtdb_directory::MemberRecord>> { self.inner.replace_member(member, expected).await }
+    fn change_feed(&self) -> Option<&rtdb_directory::ChangeFeed> { self.inner.change_feed() }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn idle_holdings_follow_the_shared_feed_without_reconcile_point_reads() {
+    let directory = Arc::new(ObservedDirectory { inner: MemoryDirectory::new(), reads: Default::default() });
+    let cell = Cell::start_with_directory(directory.clone()).await;
+    let deployment = admin::create_deployment(directory.as_ref(), "shop", "acme", 3).await.unwrap();
+    assert!(matches!(cell.node(0).agent.activate("shop").await.unwrap(), Response::Held { .. }));
+    let node = cell.node(0);
+    tokio::time::sleep(Duration::from_millis(350)).await;
+    let reads = directory.reads.load(Ordering::Relaxed);
+    for _ in 0..3 { node.agent.reconcile().await; }
+    assert_eq!(directory.reads.load(Ordering::Relaxed), reads);
+
+    let mut record = directory.inner.deployment(&deployment.id).await.unwrap().unwrap();
+    let version = record.version;
+    record.holder = None;
+    record.epoch += 1;
+    directory.inner.replace_deployment(record, version).await.unwrap().applied().unwrap();
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while node.agent.held().contains_key("shop") { tokio::time::sleep(Duration::from_millis(20)).await; }
+    }).await.expect("the holder observes the newer placement through the feed");
+    cell.stop().await;
+}
+
 #[tokio::test]
 async fn the_local_directory_reopens_the_same_installation_and_fence() {
     let state = tempfile::tempdir().unwrap();

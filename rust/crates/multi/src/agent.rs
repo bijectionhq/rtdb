@@ -10,7 +10,7 @@ use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use parking_lot::Mutex;
-use rtdb_directory::{Cas, Checkpoint, DeploymentRecord, Directory, JournalAnchor, Lifecycle, MemberId, MemberRecord, MemberState, claim, effective_holder, now_ms, park};
+use rtdb_directory::{Cas, Checkpoint, DeploymentRecord, Directory, JournalAnchor, Lifecycle, MemberId, MemberRecord, MemberState, Version, claim, effective_holder, now_ms, park};
 use rtdb_format::catalog::BlockCatalog;
 use rtdb_node::{Database, Node};
 use rtdb_replication::Role as DriverRole;
@@ -105,6 +105,8 @@ struct LocalHolding {
     linearizable: bool,
     trimmed_through: Option<i64>,
     database: std::sync::Weak<Database>,
+    claimed_version: Version,
+    placement: tokio::sync::watch::Receiver<Option<DeploymentRecord>>,
 }
 
 type Turns = Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>;
@@ -285,9 +287,11 @@ impl NodeAgent {
         }.await;
         match opened {
             Ok(database) => {
+                let placement = rtdb_directory::watch_deployment(Arc::clone(&self.directory), record.id.clone(), self.options.watch_interval);
                 self.holdings.lock().insert(record.name.clone(), LocalHolding {
                     id: record.id.clone(), epoch: record.epoch, last_touch: Instant::now(),
                     linearizable: record.linearizable_reads, trimmed_through: None, database: Arc::downgrade(&database),
+                    claimed_version: record.version, placement,
                 });
                 Ok(Response::Held { epoch: record.epoch, address: self.address.clone() })
             }
@@ -778,24 +782,27 @@ impl NodeAgent {
         let active_within = self.options.park_after.map_or(ACTIVE_DRAIN_WINDOW, |after| after.min(ACTIVE_DRAIN_WINDOW));
         let mut handoffs = Vec::new();
         let mut idle_flushes = 0;
-        let mut held: Vec<(String, String, u64, Instant)> = self.holdings.lock().iter().map(|(name, holding)| (name.clone(), holding.id.clone(), holding.epoch, holding.last_touch)).collect();
-        held.sort_by_key(|(.., touched)| std::cmp::Reverse(*touched));
-        for (rank, (name, id, epoch, last_touch)) in held.into_iter().enumerate() {
-            let current = match self.directory.deployment(&id).await { Ok(current) => current, Err(_) => continue };
-            let placed_here = current.as_ref().is_some_and(|record| record.epoch == epoch && record.holder.as_ref() == Some(&me));
+        let mut held: Vec<_> = self.holdings.lock().iter().map(|(name, holding)| {
+            (name.clone(), holding.id.clone(), holding.epoch, holding.last_touch, holding.claimed_version, holding.placement.clone())
+        }).collect();
+        held.sort_by_key(|(_, _, _, touched, _, _)| std::cmp::Reverse(*touched));
+        for (rank, (name, id, epoch, last_touch, claimed_version, placement)) in held.into_iter().enumerate() {
+            let current = placement.borrow().as_ref().filter(|record| record.version >= claimed_version).cloned();
+            let placed_here = |record: &DeploymentRecord| record.epoch == epoch && record.holder.as_ref() == Some(&me);
+            let deposed = current.as_ref().is_some_and(|record| !placed_here(record));
             let stopped = self.node.catalog().database(&name).map_or(true, |database| matches!(database.status().role, DriverRole::Stopped));
-            if !placed_here || stopped {
+            if deposed || stopped {
                 let turn = self.turn(&name);
                 let _turn = turn.lock().await;
                 // An activation or park may have replaced the holding while this pass waited for its turn; only the holding it looked at is given up.
                 if !self.holdings.lock().get(&name).is_some_and(|holding| holding.id == id && holding.epoch == epoch) { continue; }
                 let stopped = self.node.catalog().database(&name).map_or(true, |database| matches!(database.status().role, DriverRole::Stopped));
                 self.stop_running(&name).await;
-                if placed_here && stopped { self.release_failed_holding(&id, epoch, true).await; }
+                if !deposed && stopped { self.release_failed_holding(&id, epoch, true).await; }
                 continue;
             }
+            let Some(record) = current.as_ref() else { continue };
             if draining {
-                let Some(record) = current.as_ref() else { continue };
                 if target_engine.is_none() && record.engine_pin.is_none() && last_touch.elapsed() >= active_within {
                     let _ = self.park(&name).await;
                 } else if handoffs.len() < DRAIN_HANDOFFS_PER_PASS
@@ -812,7 +819,7 @@ impl NodeAgent {
                 }
                 continue;
             }
-            if let Some(record) = current.as_ref() { self.publish_and_trim(&name, record).await; }
+            self.publish_and_trim(&name, record).await;
             let over = self.options.max_active.is_some_and(|limit| rank >= limit);
             if over || self.options.park_after.is_some_and(|after| last_touch.elapsed() >= after) {
                 let _ = self.park(&name).await;
