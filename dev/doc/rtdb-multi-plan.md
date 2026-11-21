@@ -183,6 +183,12 @@ exposes only its frozen block, and joins the reader's I/O before releasing its
 storage admission. The reader has no disk cache or access to the source's
 application key vault. A consuming restore owner must apply current
 application custody and erasure authority before releasing protected data.
+For hosted recovery, the reaper accepts `open_checkpoint_stage` on its
+authenticated TLS connection. The request binds the original capture and
+the exact stage receipt. After opening the verified inventory it writes
+the acknowledgement and serves one read-only PgWire session on that same
+connection. It closes the session on loss of the directory fence or when
+the recovery action's lifetime expires.
 
 `rtdb-multi restore` accepts the live directory's current checkpoint with
 the original archive manifest and current key. It records a restore intent,

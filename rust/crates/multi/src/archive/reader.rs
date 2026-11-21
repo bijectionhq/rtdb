@@ -20,6 +20,8 @@ use rtdb_server::{PlacedOptions, ServerDriver, config::NodeConfiguration};
 use rtdb_storage::{Error, IoRegion, ObjectKey, ObjectStore, object_store::StoredObject};
 use rtdb_types::{Anomaly, BlockIndex, Result, StorageEpoch};
 use serde::Serialize;
+use tokio::{io::AsyncWriteExt, net::TcpStream};
+use tokio_rustls::{rustls::ServerConfig, server::TlsStream};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
@@ -67,6 +69,22 @@ struct Ready<'a> {
     port: u16,
 }
 
+pub(crate) struct StageSelector {
+    pub destination: Uuid,
+    pub operation: Uuid,
+    pub manifest_sha256: String,
+    pub source: Option<(Uuid, Uuid, String)>,
+}
+
+enum Transport {
+    Loopback {
+        password: String,
+        tls: Arc<ServerConfig>,
+        ready_file: PathBuf,
+    },
+    Tunnel(TlsStream<TcpStream>),
+}
+
 /// Opens only the held stage on an isolated loopback TLS listener. The reader
 /// presents the capture's original history and has no writer, cell membership,
 /// or application-level decryption keys.
@@ -78,7 +96,67 @@ pub async fn serve_staged_checkpoint(
     hosted_task: Option<HostedTask>,
     stop: CancellationToken,
 ) -> Result<()> {
-    let id = settings.destination.to_string();
+    let password = read_bounded(&settings.password_file, 64)?;
+    if password.len() != 64 || !password.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(inconsistent(
+            "The stage reader password must contain 64 hexadecimal digits",
+        ));
+    }
+    let tls = gateway_tls(&settings.certificate, &settings.private_key)?;
+    let selector = StageSelector {
+        destination: settings.destination,
+        operation: settings.operation,
+        manifest_sha256: settings.manifest_sha256,
+        source: None,
+    };
+    serve_stage(
+        directory,
+        storage,
+        keys,
+        selector,
+        hosted_task,
+        stop,
+        Transport::Loopback {
+            password,
+            tls,
+            ready_file: settings.ready_file,
+        },
+    )
+    .await
+}
+
+/// Transfers the authenticated archive-owner connection to the frozen stage.
+pub(crate) async fn tunnel_staged_checkpoint(
+    directory: Arc<dyn Directory>,
+    storage: &CellStorage,
+    keys: &dyn KeyService,
+    selector: StageSelector,
+    hosted_task: Option<HostedTask>,
+    stop: CancellationToken,
+    stream: TlsStream<TcpStream>,
+) -> Result<()> {
+    serve_stage(
+        directory,
+        storage,
+        keys,
+        selector,
+        hosted_task,
+        stop,
+        Transport::Tunnel(stream),
+    )
+    .await
+}
+
+async fn serve_stage(
+    directory: Arc<dyn Directory>,
+    storage: &CellStorage,
+    keys: &dyn KeyService,
+    selector: StageSelector,
+    hosted_task: Option<HostedTask>,
+    stop: CancellationToken,
+    transport: Transport,
+) -> Result<()> {
+    let id = selector.destination.to_string();
     let record = directory
         .deployment(&id)
         .await?
@@ -88,11 +166,19 @@ pub async fn serve_staged_checkpoint(
         .checkpoint_stage
         .as_ref()
         .filter(|stage| {
-            stage.intent.destination == settings.destination
-                && stage.intent.operation == settings.operation
+            stage.intent.destination == selector.destination
+                && stage.intent.operation == selector.operation
+                && selector
+                    .source
+                    .as_ref()
+                    .is_none_or(|(source, capture, org)| {
+                        stage.intent.source == *source
+                            && stage.intent.capture == *capture
+                            && &stage.intent.org == org
+                    })
                 && stage.media == media
                 && stage.staged_manifest_sha256.as_deref()
-                    == Some(settings.manifest_sha256.as_str())
+                    == Some(selector.manifest_sha256.as_str())
         })
         .ok_or_else(|| inconsistent("The reader requires the exact staged checkpoint receipt"))?;
     let authority = StageReadAuthority {
@@ -100,13 +186,6 @@ pub async fn serve_staged_checkpoint(
         stage: stage.clone(),
         id: id.clone(),
     };
-    let password = read_bounded(&settings.password_file, 64)?;
-    if password.len() != 64 || !password.bytes().all(|byte| byte.is_ascii_hexdigit()) {
-        return Err(inconsistent(
-            "The stage reader password must contain 64 hexadecimal digits",
-        ));
-    }
-    let tls = gateway_tls(&settings.certificate, &settings.private_key)?;
     with_region(
         directory.as_ref(),
         keys,
@@ -119,13 +198,9 @@ pub async fn serve_staged_checkpoint(
         |region| {
             let authority = &authority;
             let record = &record;
-            let settings = &settings;
             async move {
                 let store = open_inventory(storage, keys, record, &authority.stage, region).await?;
-                serve_reader(
-                    authority, record, storage, store, &password, tls, settings, stop,
-                )
-                .await
+                serve_reader(authority, record, storage, store, transport, stop).await
             }
         },
     )
@@ -396,9 +471,7 @@ async fn serve_reader(
     record: &DeploymentRecord,
     storage: &CellStorage,
     store: Arc<dyn ObjectStore>,
-    password: &str,
-    tls: Arc<tokio_rustls::rustls::ServerConfig>,
-    settings: &StagedReaderSettings,
+    transport: Transport,
     stop: CancellationToken,
 ) -> Result<()> {
     let stage = &authority.stage;
@@ -441,8 +514,12 @@ async fn serve_reader(
         claim_wait: Duration::from_secs(1),
         capabilities: None,
     };
+    let auth = match &transport {
+        Transport::Loopback { password, .. } => format!("password: \"{password}\""),
+        Transport::Tunnel(_) => "password: null".into(),
+    };
     let mut options = NodeConfiguration::from_yaml(&format!(
-        "server: null\nflightSql: null\nauthn: !SingleRootUser\n  password: \"{password}\"\n",
+        "server: null\nflightSql: null\nauthn: !SingleRootUser\n  {auth}\n",
     ))?;
     options.compactor.threads = 0;
     options.garbage.enabled = false;
@@ -467,9 +544,44 @@ async fn serve_reader(
             database,
             source: stage.intent.source,
             capture: stage.intent.capture,
-            destination: settings.destination,
-            operation: settings.operation,
-            manifest_sha256: &settings.manifest_sha256,
+            destination: stage.intent.destination,
+            operation: stage.intent.operation,
+            manifest_sha256: stage
+                .staged_manifest_sha256
+                .as_deref()
+                .ok_or_else(|| inconsistent("The stage has no accepted inventory"))?,
+        };
+        let parameter = serde_json::to_string(&identity)
+            .map_err(|_| inconsistent("Cannot encode the checkpoint reader identity"))?;
+        let node = server.node().clone();
+        let auth = Arc::clone(server.authenticator());
+        let (tls, ready_file) = match transport {
+            Transport::Loopback {
+                tls, ready_file, ..
+            } => (tls, ready_file),
+            Transport::Tunnel(mut stream) => {
+                let stop = stop.child_token();
+                tokio::time::timeout(Duration::from_secs(15), async {
+                    stream.write_all(b"RTDB checkpoint PgWire 1\n").await?;
+                    stream.flush().await
+                })
+                .await
+                .map_err(|_| unavailable("Checkpoint reader acknowledgement timed out"))?
+                .map_err(|_| unavailable("The checkpoint reader caller disconnected"))?;
+                let mut wire = std::pin::pin!(rtdb_pgwire::serve_read_only_tls(
+                    stream,
+                    node,
+                    auth,
+                    BTreeMap::from([(rtdb_pgwire::CHECKPOINT_STAGE_PARAMETER.into(), parameter)]),
+                    stop.clone(),
+                ));
+                let fence = tokio::select! {
+                    result = &mut wire => return result,
+                    result = monitor(authority, &stop) => result,
+                };
+                stop.cancel();
+                return fence.and(wire.await);
+            }
         };
         let mut wire_config = rtdb_pgwire::ServerConfig {
             read_only: true,
@@ -477,20 +589,13 @@ async fn serve_reader(
             require_tls: true,
             ..Default::default()
         };
-        wire_config.parameters.insert(
-            rtdb_pgwire::CHECKPOINT_STAGE_PARAMETER.into(),
-            serde_json::to_string(&identity)
-                .map_err(|_| inconsistent("Cannot encode the checkpoint reader identity"))?,
-        );
-        let (wire, driver) = rtdb_pgwire::ServerDriver::bind(
-            wire_config,
-            server.node().clone(),
-            Arc::clone(server.authenticator()),
-        )
-        .await?;
+        wire_config
+            .parameters
+            .insert(rtdb_pgwire::CHECKPOINT_STAGE_PARAMETER.into(), parameter);
+        let (wire, driver) = rtdb_pgwire::ServerDriver::bind(wire_config, node, auth).await?;
         let address = wire.address();
         write_private(
-            &settings.ready_file,
+            &ready_file,
             &Ready {
                 identity,
                 host: address.ip(),
@@ -499,17 +604,9 @@ async fn serve_reader(
             false,
         )?;
         let mut driver = std::pin::pin!(driver.run());
-        let mut poll = tokio::time::interval(Duration::from_secs(1));
-        let result = loop {
-            tokio::select! {
-                result = &mut driver => return result,
-                _ = stop.cancelled() => break Ok(()),
-                _ = poll.tick() => {
-                    if let Err(error) = authority.confirm(database).await {
-                        break Err(error);
-                    }
-                }
-            }
+        let result = tokio::select! {
+            result = &mut driver => return result,
+            result = monitor(authority, &stop) => result,
         };
         wire.shutdown();
         result.and(driver.await)
@@ -520,6 +617,16 @@ async fn serve_reader(
         .await
         .map_err(|error| Anomaly::fault("rtdb.multi/checkpoint-reader", error.to_string()))?;
     result.and(complete)
+}
+
+async fn monitor(authority: &StageReadAuthority, stop: &CancellationToken) -> Result<()> {
+    let mut poll = tokio::time::interval(Duration::from_secs(1));
+    loop {
+        tokio::select! {
+            _ = stop.cancelled() => return Ok(()),
+            _ = poll.tick() => authority.confirm(&authority.stage.intent.name).await?,
+        }
+    }
 }
 
 #[cfg(test)]

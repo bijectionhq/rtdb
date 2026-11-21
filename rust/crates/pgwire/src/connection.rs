@@ -6,7 +6,6 @@ use rtdb_columnar::MemoryReservation;
 use rtdb_node::{DatabaseAccess, NativeSession, Node, SessionIdentity};
 use rtdb_types::{Anomaly, AnomalyCategory, PgType, Result};
 use tokio::io::{AsyncRead, AsyncWrite};
-use tokio::net::TcpStream;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use crate::{CAPABILITY_PARAMETER, DELEGABLE_PARAMETER, ServerConfig, error::{network, protocol}, server::CancellationRegistry, wire::{Input, Reader, Writer, STARTUP_LIMIT}};
@@ -16,15 +15,22 @@ impl<T: AsyncRead + AsyncWrite + Unpin + Send> Socket for T {}
 type Stream = Box<dyn Socket>;
 
 pub(crate) struct Startup { pub parameters: BTreeMap<String, String>, pub _reservation: Arc<MemoryReservation> }
-pub(crate) struct ConnectionDriver { process: i32, stream: TcpStream, address: SocketAddr, node: Node, auth: Arc<Authenticator>, config: Arc<ServerConfig>, registry: Arc<CancellationRegistry>, cancellation: CancellationToken, draining: CancellationToken }
+pub(crate) struct ConnectionDriver { process: i32, stream: Stream, address: SocketAddr, encrypted: bool, node: Node, auth: Arc<Authenticator>, config: Arc<ServerConfig>, registry: Arc<CancellationRegistry>, cancellation: CancellationToken, draining: CancellationToken }
 impl ConnectionDriver {
-    pub fn new(process: i32, stream: TcpStream, address: SocketAddr, node: Node, auth: Arc<Authenticator>, config: Arc<ServerConfig>, registry: Arc<CancellationRegistry>, cancellation: CancellationToken, draining: CancellationToken) -> Self { Self { process, stream, address, node, auth, config, registry, cancellation, draining } }
+    pub fn new(
+        process: i32, stream: impl AsyncRead + AsyncWrite + Unpin + Send + 'static,
+        address: SocketAddr, encrypted: bool, node: Node, auth: Arc<Authenticator>,
+        config: Arc<ServerConfig>, registry: Arc<CancellationRegistry>,
+        cancellation: CancellationToken, draining: CancellationToken,
+    ) -> Self {
+        Self { process, stream: Box::new(stream), address, encrypted, node, auth, config, registry, cancellation, draining }
+    }
     pub async fn run(self) -> Result<()> {
         let memory = Arc::clone(self.node.memory());
         let _region = memory.reserve(32 * 1024)?;
-        let mut stream: Option<Stream> = Some(Box::new(self.stream));
+        let mut stream = Some(self.stream);
         let startup = self.cancellation.run_until_cancelled(tokio::time::timeout(self.config.authentication_timeout,
-            startup(self.process, &mut stream, self.address, &self.node, &self.auth, &self.config, &self.registry, &self.cancellation))).await;
+            startup(self.process, &mut stream, self.address, self.encrypted, &self.node, &self.auth, &self.config, &self.registry, &self.cancellation))).await;
         let (session, settings) = match startup {
             None | Some(Err(_)) | Some(Ok(Ok(None))) => return Ok(()),
             Some(Ok(Err(error))) => { if let Some(stream) = &mut stream { let mut writer = Writer::new(stream, Arc::clone(&memory)); let send = writer.error(&error, PgType::Json, error.context.get("sql-state").and_then(serde_json::Value::as_str) == Some("3D000")); let _ = tokio::time::timeout(std::time::Duration::from_secs(1), self.cancellation.run_until_cancelled(send)).await; } return Err(error); },
@@ -69,8 +75,7 @@ impl ConnectionDriver {
     }
 }
 
-async fn startup(process: i32, transport: &mut Option<Stream>, address: SocketAddr, node: &Node, auth: &Arc<Authenticator>, config: &ServerConfig, registry: &CancellationRegistry, cancellation: &CancellationToken) -> Result<Option<(NativeSession, Startup)>> {
-    let mut encrypted = false;
+async fn startup(process: i32, transport: &mut Option<Stream>, address: SocketAddr, mut encrypted: bool, node: &Node, auth: &Arc<Authenticator>, config: &ServerConfig, registry: &CancellationRegistry, cancellation: &CancellationToken) -> Result<Option<(NativeSession, Startup)>> {
     loop {
         let stream = transport.as_mut().ok_or_else(|| protocol("Missing PostgreSQL transport"))?;
         let frame = Reader::new(&mut **stream, Arc::clone(node.memory())).startup().await?;

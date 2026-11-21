@@ -73,6 +73,7 @@ mod stage;
 mod reader;
 pub use stage::stage_checkpoint;
 pub use reader::{StagedReaderSettings, serve_staged_checkpoint};
+pub(crate) use reader::{StageSelector, tunnel_staged_checkpoint};
 
 const MAXIMUM_BYTES: u64 = 1 << 30;
 const MAXIMUM_MANIFEST_BYTES: u64 = 16 << 20;

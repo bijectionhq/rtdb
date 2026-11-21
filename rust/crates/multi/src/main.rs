@@ -310,8 +310,8 @@ async fn run(arguments: Vec<String>) -> Result<()> {
         let report = MultiBuildInfo {
             provenance: rtdb_types::compiled_build_info(),
             standalone_protocol: process::STANDALONE_PROTOCOL,
-            // The archive owner can stage a checkpoint for the private reader.
-            hosted_protocol: 8,
+            // The archive owner can open a stage on its authenticated connection.
+            hosted_protocol: 9,
         };
         let mut output = std::io::stdout().lock();
         serde_json::to_writer(&mut output, &report).map_err(|error| io(std::io::Error::other(error)))?;
