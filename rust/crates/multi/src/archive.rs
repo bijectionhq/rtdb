@@ -411,7 +411,7 @@ fn capture_point(record: &DeploymentRecord, deployment: Uuid, operation: Uuid, a
 }
 
 fn archive_witness(deployment: Uuid, operation: Uuid) -> Result<ObjectKey> {
-    key(&format!("checkpoint-authorities/{deployment}/{operation}.json"))
+    key(&format!("checkpoint-authorities/{deployment}/{operation}.json")).map_err(Into::into)
 }
 
 fn verify_cut(catalog: &BlockCatalog, point: &CapturePoint) -> Result<()> {
