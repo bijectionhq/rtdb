@@ -471,14 +471,6 @@ impl SqlArguments {
         })
     }
 
-    pub(crate) fn single_arrow_batch(&self) -> Option<&RecordBatch> {
-        let [(_, chunk)] = self.chunks.as_slice() else { return None; };
-        match chunk.as_ref() {
-            ArgumentChunk::Arrow { batch, .. } => Some(batch.batch()),
-            ArgumentChunk::Rows { .. } => None,
-        }
-    }
-
     pub(crate) fn uniform_arrow_pages(&self) -> Option<Vec<&RecordBatch>> {
         let pages = self.chunks.iter().map(|(_, chunk)| match chunk.as_ref() {
             ArgumentChunk::Arrow { batch, .. } => Some(batch.batch()),
