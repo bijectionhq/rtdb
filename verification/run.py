@@ -544,6 +544,68 @@ def verify_live_row_address(args, scratch):
     verify_lean_model(args, scratch, path, "live-row-address", controls, 5)
 
 
+def verify_iid_byte_order(args, scratch):
+    path = Path("verification/lean/IidByteOrder.lean")
+    controls = {
+        "compare-signed-words": (
+            "(left ^^^ 0x8000000000000000#64).slt (right ^^^ 0x8000000000000000#64) = true",
+            "left.slt right = true",
+            ["arrow_word_comparison_matches_eight_bytes"],
+        ),
+        "reverse-head-order": (
+            "arrowWordBefore leftHead rightHead ∨",
+            "arrowWordBefore rightHead leftHead ∨",
+            ["arrow_leaf_comparison_matches_iid_then_descending_row"],
+        ),
+        "older-row-first": (
+            "(leftTail = rightTail ∧ rightRow < leftRow)))",
+            "(leftTail = rightTail ∧ leftRow < rightRow)))",
+            ["arrow_leaf_comparison_matches_iid_then_descending_row"],
+        ),
+        "rank-orders-oldest-first": (
+            "unsignedWord iid * 4294967296 + (4294967295 - row)",
+            "unsignedWord iid * 4294967296 + row",
+            ["iid_row_rank_agrees_with_the_key"],
+        ),
+    }
+    verify_lean_model(args, scratch, path, "iid-byte-order", controls, 7)
+
+
+def verify_leaf_runs(args, scratch):
+    path = Path("verification/lean/LeafRuns.lean")
+    controls = {
+        "reuse-stale-cache": (
+            "⟨leaf.data, leaf.pending ++ added, none⟩",
+            "⟨leaf.data, leaf.pending ++ added, leaf.cached⟩",
+            ["pending_append_preserves_order"],
+        ),
+        "omit-pending-on-overflow": (
+            "settled (mergeRuns rank leaf.data (mergeRuns rank (canonical rank leaf.pending) (canonical rank batch)))",
+            "settled (mergeRuns rank leaf.data (canonical rank batch))",
+            ["bulk_represents_all_old_and_new_occurrences"],
+        ),
+        "skip-bucket-filter": (
+            "settled ((rowsOf rank leaf).filter select)",
+            "settled (rowsOf rank leaf)",
+            ["child_represents_the_matching_occurrences"],
+        ),
+        "skip-adjacent-comparison": (
+            "∀ second, tail.head? = some second → rowLE rank first second = true",
+            "∀ second, tail.head? = some second → rowLE rank second second = true",
+            ["adjacent_validation_implies_leaf_order", "adjacent_validation_implies_leaf_order"],
+        ),
+    }
+    rank = Path("verification/lean/IidByteOrder.lean")
+    dependency = scratch / "lean-leaf-runs-rank"
+    clone_file(rank, dependency)
+    built = run_case([args.lean, "-DwarningAsError=true", "-o", "IidByteOrder.olean", str(rank)],
+                     dependency, args.evidence, "lean-leaf-runs-rank")
+    if built.returncode:
+        raise ValueError("Lean leaf rank dependency did not compile")
+    verify_lean_model(args, scratch, path, "leaf-runs", controls, 7,
+                      os.environ | {"LEAN_PATH": str(dependency)})
+
+
 def verify_snapshot_ownership(args, scratch):
     path = Path("verification/lean/SnapshotOwnership.lean")
     controls = {
@@ -965,6 +1027,8 @@ def verify_lean(args, scratch):
             verify_run_encoding(args, scratch)
             verify_memory_admission(args, scratch)
             verify_memory_trie(args, scratch)
+            verify_iid_byte_order(args, scratch)
+            verify_leaf_runs(args, scratch)
             verify_live_row_address(args, scratch)
             verify_snapshot_ownership(args, scratch)
             verify_jvm_trie_pending_logs(args, scratch)
