@@ -51,13 +51,13 @@ A proof of a candidate is conditional on the explicitly stated contract and work
 | QRY01 · Binding | Open | — |
 | QRY02 · Lowering | Open | — |
 | QRY03 · Plan reuse | Open | — |
-| QRY04 · Rewrite soundness | Open | — |
+| QRY04 · Rewrite soundness | Partial | [Lean left join predicate laws and a native optimizer regression](rtdb-engine-proof-evidence.md#main-evidence) |
 | QRY05 · Predicate placement | Partial | [Lean left join laws and nullable-side counterexample](rtdb-engine-proof-evidence.md#main-evidence) |
 | QRY06 · Correlation | Open | — |
 | QRY07 · Projection | Open | — |
 | QRY08 · Join and set semantics | Open | — |
-| QRY09 · Aggregation | Open | — |
-| QRY10 · Ordering and windows | Open | — |
+| QRY09 · Aggregation | Partial | [Ordered-index distinct runs and bounded query prefixes](rtdb-engine-proof-evidence.md#main-evidence) |
+| QRY10 · Ordering and windows | Partial | [Ordered merge, filtering before limit and keyset continuation](rtdb-engine-proof-evidence.md#main-evidence) |
 | QRY11 · Evaluation context | Open | — |
 | QRY12 · Streaming equivalence | Open | — |
 | QRY13 · Query framing | Open | — |
@@ -72,7 +72,7 @@ A proof of a candidate is conditional on the explicitly stated contract and work
 | SCAN03 · Historical dependency coverage | Partial | [Compaction bucket and mixed-trie models](rtdb-engine-proof-evidence.md#main-evidence) · [Lean pruning premise and native SQL comparisons](rtdb-engine-proof-evidence.md#multi-evidence) |
 | SCAN04 · Optional metadata | Partial | [Lean pruning premise and native SQL comparisons](rtdb-engine-proof-evidence.md#multi-evidence) |
 | SCAN05 · Residual filters | Partial | [Lean pruning premise and native SQL comparisons](rtdb-engine-proof-evidence.md#multi-evidence) |
-| SCAN06 · Scan metadata agreement | Open | — |
+| SCAN06 · Scan metadata agreement | Partial | [Ordered page exclusion under valid fences](rtdb-engine-proof-evidence.md#main-evidence) |
 | SCAN07 · Catalog agreement | Partial | [Retained catalog observations](rtdb-engine-proof-evidence.md#main-evidence) |
 | SCAN08 · Read tier equivalence | Open | — |
 | SCAN09 · Fragment equivalence | Open | — |
@@ -124,7 +124,7 @@ A proof of a candidate is conditional on the explicitly stated contract and work
 | LOG07 · Block ownership | Open | — |
 | LOG08 · Publication and adoption | Partial | [Checkpoint selection and suffix replay](rtdb-engine-proof-evidence.md#main-evidence) · [Rust position packing and resume](rtdb-engine-proof-evidence.md#multi-evidence) |
 | LOG09 · Follower convergence | Partial | [Checkpoint selection and suffix replay](rtdb-engine-proof-evidence.md#main-evidence) |
-| LOG10 · Failure reporting | Open | — |
+| LOG10 · Failure reporting | Partial | [Prepared cursor admission, refresh and refusal](rtdb-engine-proof-evidence.md#main-evidence) |
 | LOG11 · Stream separation | Partial | [Main Logkeeper reply rank](rtdb-engine-proof-evidence.md#main-evidence) · [Lean model of retained journal slot identity](rtdb-engine-proof-evidence.md#multi-evidence) |
 | LOG12 · Retained-history audit | Partial | [Lean page-chain and quorum certification laws, and online and offline native tests](rtdb-engine-proof-evidence.md#main-evidence) |
 | LOG13 · Terminal stream retirement | Partial | [Lean terminal control and all-replica settlement, Kani admission, and journal restart](rtdb-engine-proof-evidence.md#main-evidence) |
@@ -186,8 +186,8 @@ A proof of a candidate is conditional on the explicitly stated contract and work
 | GC06 · Referenced replica payloads | Open | — |
 | GC07 · Snapshot export | Open | — |
 | GC08 · Compactor reset | Open | — |
-| GC09 · Logical erase and physical disposal | Open | — |
-| GC10 · Receipt completeness | Open | — |
+| GC09 · Logical erase and physical disposal | Partial | [Hosted ordered-index scrub and retirement](rtdb-engine-proof-evidence.md#main-evidence) |
+| GC10 · Receipt completeness | Partial | [Bounded S3 inventory and disposal receipt model](rtdb-engine-proof-evidence.md#multi-evidence) |
 
 ## Database membership, multi-cell placement, and lineage
 
@@ -202,7 +202,7 @@ A proof of a candidate is conditional on the explicitly stated contract and work
 | CELL07 · Isolation and engine selection | Open | — |
 | CELL08 · Planned handoff | Open | — |
 | CELL09 · Cold activation | Partial | [Integrated Multi worker-loss and bitemporal replay regression](rtdb-engine-proof-evidence.md#main-evidence) |
-| CELL10 · Cross-cell cutover | Open | — |
+| CELL10 · Cross-cell cutover | Partial | [Bounded cross-cell transfer and fair activation model](rtdb-engine-proof-evidence.md#multi-evidence) |
 | CELL11 · Move retries | Open | — |
 | CELL12 · Fork isolation | Open | — |
 | CELL13 · Lineage reachability | Open | — |
@@ -215,11 +215,11 @@ A proof of a candidate is conditional on the explicitly stated contract and work
 | --- | --- | --- |
 | STORE01 · Provider refinement | Open | — |
 | STORE02 · Range and cache agreement | Open | — |
-| STORE03 · Read lifetime | Open | — |
+| STORE03 · Read lifetime | Partial | [Lean read entitlements and hosted scope retirement](rtdb-engine-proof-evidence.md#main-evidence) |
 | STORE04 · Immutable publication | Partial | [Checkpoint publication and Azure completion replay](rtdb-engine-proof-evidence.md#main-evidence) |
 | STORE05 · Physical identity | Open | — |
 | STORE06 · Writer authorization | Open | — |
-| STORE07 · Publication visibility | Open | — |
+| STORE07 · Publication visibility | Partial | [Ordered-index checkpoint publication model](rtdb-engine-proof-evidence.md#main-evidence) |
 | STORE08 · Multipart confirmation | Partial | [Checkpoint publication and Azure completion replay](rtdb-engine-proof-evidence.md#main-evidence) |
 | STORE09 · Archive completeness | Open | — |
 | STORE10 · Restore equivalence | Partial | [Checkpoint selection, suffix replay, and integrated Multi worker loss](rtdb-engine-proof-evidence.md#main-evidence) |
