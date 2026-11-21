@@ -13,7 +13,7 @@ These results apply to the classic and full-text Rust paths at the particular re
 | --- | --- | --- |
 | TIME01, TIME02, TIME04–TIME11 | Lean relates the descending ceiling scan to the captured-history point query, including the exclusive query upper bound. Verus checks the production interval intersection, ceiling vector split and overwrite, cell selection, clipping, and per-fragment admission. Both native resolvers agreed with the reference for 4,096 observations. | SQL normalization, snapshot assembly, input coverage and operation order, the event and allocation shell, and the full assembly and projection of Rust fragments. |
 | VAL03, VAL04 · Type join and sparse fields | Lean proves associativity, commutativity and idempotence over arbitrary scalar families and flat struct fields. It distinguishes bottom, an explicit null, a field absent from both structs, and a field absent from one contributing struct. | Relate the model to the production type representations and prove nested collections, normalization, and the supported layout contracts. |
-| VAL08 · Run-end layout | Lean proves round-trip expansion, strictly increasing exclusive ends, and equivalence of sliced reads to plain reads for arbitrary lists. Kani verifies Arrow's `RunEndBuffer::get_physical_index` for two runs and all admitted slices in each signed run-end width. | Relate the native encoders, representation equality, Arrow access over arbitrary run counts, and all selection, copy, and union paths to the logical model. |
+| VAL08 · Run-end layout | Lean proves round-trip expansion and connects Arrow's hit and insertion-point cases to the same sliced row for arbitrary run counts. Kani checks Arrow's concrete lookup for two runs in each signed run-end width. | Establish the actual array and buffer contracts, and refine representation equality, selection, copy, and union paths. |
 | QRY04, QRY05 · Left join predicate placement | Lean proves that a preserved-side `WHERE` predicate can filter the left input and an unpreserved-side `ON` conjunct can filter the right input. A `WHERE ... IS NULL` counterexample shows why prefiltering the nullable side can add a row despite reapplying the residual predicate. The native optimizer test checks these placements. | Relate the modeled predicates and rows to Rust plan construction and execution, including error and evaluation-context contracts and the other join kinds and rewrites. |
 | QRY09, QRY10, SCAN06 · Ordered scans and distinct prefixes | The ordered-index models check sorted merge, early predicate application and keyset continuation, distinct runs and local limits, and page exclusion under valid fences. Production Verus checks cover seek decisions, and recorded native tests cover ordered distinct and keyset queries. | Relate SQL comparison, collation, null and other ordering rules, Arrow page metadata, and arbitrary grouping and window plans to their applicable reference semantics. |
 | SESS01–SESS03, SESS06, SESS07 · Explicit transactions | Lean checks read and write phase resolution, preservation of the captured read basis throughout nonterminal commands, ordered buffering, submission at the modeled commit boundary, discard, and terminal closure. Native session tests exercise the same behaviors and a separate native node test retains a null partition entry from the captured basis. | Refine every protocol and runtime session path, including implicit transactions, capture and await, argument batch coalescing, memory failure, cancellation, and submission or replay outcomes. |
@@ -34,7 +34,7 @@ These results apply to the classic and full-text Rust paths at the particular re
 | LOG13 · Journal retirement | Lean proves that replay and compaction preserve the retirement marker, and that completion requires every addressed replica. Kani checks replay of the production `Drop` event and subsequent commit refusal on an empty stream. Native replicas exercise retirement retry, restart, and direct checks for removed payloads. | Prove the runtime journal and fsync transitions, the inventory of all required replicas after copy or move, and the storage and deletion receipt contracts. |
 | CELL09, STORE10 and Multi recovery S2, S5 · Worker loss | A local MinIO and PgWire regression retains the checkpoint and acknowledged suffix, compares current rows and the full bitemporal projection, and verifies new writes after losing one, two, and all three compute workers. | Prove the complete activation and recovery path under the published durable-service and liveness assumptions. |
 | IDX02, IDX04, IDX06, IDX07 | Verus checks the production Rust base-four IID digit, path comparison, and stable partition of an insertion or split batch at every valid depth. The Kani harness also checks all legal depths and the independent bit-extraction rule for width 2, 4, or 8 in the actual bucketer. | Compose grouping, leaf ordering, and recursive replacement at actual Rust and JVM call sites, then connect the resulting trees to traversal and replay. |
-| IDX02, IDX03, IDX07 | Verus checks that the production Rust sort and merge in cache fill, compaction and bulk overflow return every input occurrence in IID order or report a reader error. An injective logical rank uniquely determines the successful output sequence. | Establish the stable-IID premise at each runtime reader, prove that persisted and split runs preserve all stored-run premises in the actual tree, and compose the JVM paths. |
+| IDX02, IDX03, IDX07, IDX09 | Verus checks that the production Rust sort and merge return every input occurrence in IID order or report a reader error, and that native persisted leaf validation establishes run order. OpenJML checks order and multiplicity of the production JVM merge. An injective logical rank uniquely determines the successful output sequence. | Establish IID stability at each runtime reader, prove JVM pending-run sorting, and propagate stored-run order through the actual tree and leaf-state transitions. |
 | IDX01, IDX08 | Verus checks the production Rust search, append, and adjacent chunk replacement against one contiguous-layout invariant. Lean proves that appending rows and joining adjacent chunks preserve existing ordinal reads. | Prove the Arrow row-content obligation and refine snapshot ownership across block transitions in both engines. |
 | SCAN07, GC01, GC02 | Lean proves the abstract generation retention invariant for arbitrarily many readers, objects, in-flight operations and steps. Verus checks the collector's production selection loop against the visibility observations it receives. | Refine the captured references, provider operations, and authority changes, including the full durable deletion protocol. |
 | GC09, STORE03 · Hosted ordered-index retirement | Lean checks point equivalence after scrubbing known erase cuts. A bounded TLC model checks storage retirement, reader release, scrubbed replay, and conditional completion. Integration tests exercise a held reader and versioned local S3 provider. | Compose the directory and provider contracts with every hosted deployment, reader and primary-file custody path covered by physical disposal. |
@@ -126,6 +126,16 @@ cargo build --locked --manifest-path rust/Cargo.toml -p rtdb-server --features k
 RTDB_CLASSIC_BIN="$PWD/rust/target/debug/rtdb" bash verification/classic-kafka-s3.sh
 ```
 
+### Arrow run-end lookup
+
+Lean checks the hit and insertion-point cases in Arrow 58.4.1's `RunEndBuffer::get_physical_index`.
+The binary search is assumed to return a matching position on a hit or partition the run ends around the query on a miss.
+For any strictly increasing covered run list, an exact hit advances to the following run and a miss uses the insertion point, giving the first end strictly greater than the absolute row.
+The resulting run value agrees with the corresponding plain row for an arbitrary encoded slice.
+The signed coordinate cast preserves the slice origin and relative row whenever their sum fits the selected signed width.
+Lean 4.35.0 audited nine theorems and rejected five controls, including staying on the matched exclusive end and reading before the insertion point.
+The concrete Arrow and fixed-width byte readers still need refinement against their buffer and array invariants. [Run encoding and physical position theorems](../../verification/lean/RunEncoding.lean) · [Bounded Arrow harnesses](../../rust/crates/columnar/tests/proofs.rs)
+
 ### Memory trie lookup and coverage
 
 Lean checks that every split and finite sequence of modeled insertions preserves all row occurrences and that a routed lookup agrees with filtering the original insertion history by IID.
@@ -205,7 +215,29 @@ Lean 4.35.0 audited seven theorems and rejected signed-word comparison, reversed
 The Rust and JVM regressions each insert 4,096 rows and check the leaf against an independent order reference across single-byte values at every IID position, including duplicate IIDs.
 The native run passed 504 tests with `cargo test --manifest-path rust/Cargo.toml --locked -p rtdb-trie -p rtdb-format -p rtdb-index -p rtdb-query`.
 Run the JVM case with `./gradlew :xtdb-core:test --tests 'xtdb.trie.MemoryHashTrieTest'`.
-End-to-end refinement of leaf publication through the Rust and JVM entry points remains open. [Comparator study](../../verification/verus/trie_leaf_merge/area.json) · [JVM order proof](../../verification/lean/IidByteOrder.lean) · [Rust regression](../../rust/crates/trie/tests/contracts.rs) · [JVM regression](../../core/src/test/kotlin/xtdb/trie/MemoryHashTrieTest.kt)
+JVM pending-run sorting and end-to-end refinement of leaf publication through the Rust and JVM entry points remain open. [Comparator study](../../verification/verus/trie_leaf_merge/area.json) · [JVM order proof](../../verification/lean/IidByteOrder.lean) · [Rust regression](../../rust/crates/trie/tests/contracts.rs) · [JVM regression](../../core/src/test/kotlin/xtdb/trie/MemoryHashTrieTest.kt)
+
+### Production JVM leaf merge
+
+The Kotlin leaf calls the checked Java merge during a cache fill, log compaction, and bulk overflow.
+On normal completion OpenJML proves the result is ordered by rank, both input arrays retain their contents, and a bijection matches every input position to a result position with the same row index.
+The position correspondence preserves duplicates even when the same ordinal appears in both runs.
+The proof assumes ordered input runs, representable allocation capacity, and a comparator whose results agree with a stable rank and whose writes are confined to its scratch state.
+The Kotlin adapter uses the existing Arrow lookup and comparison, whose rank correspondence is described in the comparator study.
+The regressions exercise duplicate ordinals across stored data, pending logs and a bulk batch, and retry a cache fill after the original IID lookup exception propagates.
+OpenJML 21.0.29 with bundled Z3 5.1.0 checked the merge and rejected three controls that select the larger head, omit an unread suffix, or replace an emitted value.
+Run the production proof with `openjml --esc --timeout=40 --timeout-method=65 --esc-max-warnings=1 --progress core/src/main/java/xtdb/trie/LeafMerge.java`.
+The `--openjml` option of the verification runner checks the baseline and its controls. [Production Java merge](../../core/src/main/java/xtdb/trie/LeafMerge.java) · [Kotlin call sites](../../core/src/main/kotlin/xtdb/trie/MemoryHashTrie.kt) · [JVM regressions](../../core/src/test/kotlin/xtdb/trie/MemoryHashTrieTest.kt)
+
+### Native persisted leaf order
+
+The native importer checks each decoded row's path before calling the verified order validator on the stored run.
+Given stable IID reads, Verus checks that success establishes the leaf rank order across every pair of positions.
+If the validator returns an order error, the first inverted adjacent pair follows an ordered prefix.
+A reader error propagates when either lookup of the current pair fails.
+The regressions check repeated indices, an inversion confined to the final pair and a failed read after the path pass.
+Verus 0.2026.11.05.31e44e6 checked thirty-four functions and rejected eighteen controls, including skipping the final pair, reading the wrong row, accepting an inversion and rejecting an equal pair.
+The native run passed 508 tests with `CARGO_PROFILE_TEST_DEBUG=0 cargo test --manifest-path rust/Cargo.toml --locked -p rtdb-trie -p rtdb-format -p rtdb-index -p rtdb-query`. [Production validator](../../rust/crates/trie/src/leaf_load_step.rs) · [Importer](../../rust/crates/trie/src/memory.rs) · [Verus study](../../verification/verus/trie_leaf_merge/area.json)
 
 ### Leaf runs, compaction and persisted order
 
