@@ -159,17 +159,46 @@ async fn a_drained_node_hands_its_deployments_to_the_rest_of_the_cell() {
     drop(client);
 
     let drained = cell.holder("shop").await.unwrap();
+    let initial = cell.directory.deployment_by_name("shop").await.unwrap().unwrap();
     admin::drain(cell.directory.as_ref(), &cell.nodes[drained].as_ref().unwrap().lease.id()).await.unwrap();
-    for _ in 0..100 {
-        if cell.nodes[drained].as_ref().unwrap().agent.held().is_empty() { break; }
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
-    assert!(cell.nodes[drained].as_ref().unwrap().agent.held().is_empty(), "a draining node parks what it holds");
+    let target = 1 - drained;
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let current = cell.directory.deployment(&initial.id).await.unwrap().unwrap();
+            if current.holder.as_ref() == Some(&cell.node(target).lease.id()) && cell.node(target).agent.held().contains_key("shop") {
+                assert!(current.epoch > initial.epoch);
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }).await.unwrap();
+    assert!(cell.node(drained).agent.held().is_empty());
 
     let client = cell.connect("shop").await;
     assert_eq!(values(&client, "SELECT total FROM orders").await, ["10"]);
     let holder = cell.holder("shop").await.unwrap();
-    assert_ne!(holder, drained, "the next request activates it on a node that may take placements");
+    assert_eq!(holder, target);
+    drop(client);
+    cell.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_draining_node_keeps_a_recently_used_deployment_until_a_target_is_available() {
+    let cell = Cell::start(1, None).await;
+    admin::create_deployment(cell.directory.as_ref(), "shop", "acme", 3).await.unwrap();
+    let client = cell.connect("shop").await;
+    client.simple_query("INSERT INTO orders (_id, total) VALUES (1, 10)").await.unwrap();
+    let node = cell.node(0);
+    admin::drain(cell.directory.as_ref(), &node.lease.id()).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while node.lease.record().state != rtdb_directory::MemberState::Draining {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }).await.unwrap();
+    node.agent.reconcile().await;
+    client.simple_query("UPDATE orders SET total = total + 1 WHERE _id = 1").await.unwrap();
+    assert_eq!(values(&client, "SELECT total FROM orders").await, ["11"]);
+    assert_eq!(cell.holder("shop").await, Some(0));
     drop(client);
     cell.stop().await;
 }

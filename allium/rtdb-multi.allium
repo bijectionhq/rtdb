@@ -1570,13 +1570,15 @@ rule AnswerMoved {
 
 rule DrainMember {
     -- Scale-in, replacement and rollout drain a member by handing off its active deployments and parking its idle ones, at most moves_per_node_per_pass per pass.
+    -- The source's identity and epoch still match when the drain reserves a handoff.
+    -- A recent holding stays on its source while the placement pool has no eligible destination.
     when: member: MemberRecord.state becomes draining
 
     ensures:
         for holding in HoldingsOf(member):
-            if holding.residency = active:
+            if RecentlyUsed(holding) and HasEligibleDestination(holding):
                 MoveChosen(holding.deployment, Affinity.next_rank(holding.deployment, excluding: member))
-            else:
+            if IdleForDrain(holding):
                 ParkStarted(holding)
 }
 

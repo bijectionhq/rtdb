@@ -524,6 +524,9 @@ Placement must follow load and the fleet must scale both ways (spec surface `Con
 **Changes.**
 
 1. Crate `controller`: suspicion confirmation from corroborated gateway reports; admission of prewarmed members; drain (`DrainMember`); rebalancing on `LoadVector` watermarks (`Rebalance`); the drainer for orphaned tails (`DrainOrphanedTails`); quarantine (`CountActivationCrash`); engine rollouts (`RollEngine`).
+   A draining node hands off up to eight recently used deployments per pass and parks its idle deployments.
+   The source's identity and epoch must still match at reservation.
+   A recently used deployment keeps serving on a draining node while its pool has no eligible successor.
 2. Planned handoff (`IntendMove`, `HandOff`): subscription warm-up, hot-range prefetch from the source, admission pause, `Handoff` record, claim by move intent.
    The gateway, claim rule, and rebalancer use the same eligibility check for the general and isolation pools.
    Clearing quarantine fences the isolation holder so the next claim returns the deployment to the general pool.
@@ -775,7 +778,10 @@ Each scale-in drained 10–11 deployments over 275–385 ms while 751–1,328 wr
 Every counter matched, with 1,488–2,965 updates/s and p99 of 27.7–97.7 ms across the trials.
 Three repeats with placement-triggered reconnects and cancellation-aware block collection matched all counters at 1,678–3,290 updates/s.
 The repeats measured p95 of 17.4–19.2 ms and p99 of 21.2–112.0 ms.
+Three warm trials with direct drain handoffs matched all 32,768 writes per run.
+Their p99 was 25.0–151.9 ms during scale-out, 96.6–132.5 ms during scale-in, and 104.1–128.4 ms outside both transitions.
 The continuous workload still has inconsistent tail latency.
+The workload reports latency separately for commands overlapping each transition and for commands outside both transitions.
 
 ```sh
 RTDB_CELL_BENCH_SCALE=1 cargo test --manifest-path rust/Cargo.toml -p rtdb-multi --release --test load \

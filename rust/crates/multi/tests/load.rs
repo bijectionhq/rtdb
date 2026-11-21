@@ -76,7 +76,7 @@ async fn durable_pgwire_updates_under_zipf_activity() {
                 let rank = pick_rank(&mut rng, &ranks);
                 let started = Instant::now();
                 connections[rank].lock().await.simple_query("UPDATE counters SET n = n + 1 WHERE _id = 1").await.unwrap();
-                samples.push(started.elapsed());
+                samples.push((started, started.elapsed()));
                 totals[rank] += 1;
                 if scale && completed.fetch_add(1, Ordering::Relaxed) == 0 { first_write.notify_one(); }
             }
@@ -97,36 +97,53 @@ async fn durable_pgwire_updates_under_zipf_activity() {
         (totals, latencies, started.elapsed())
     };
     let scaling = async {
-        if !scale { return; }
+        if !scale { return None; }
         tokio::time::timeout(Duration::from_secs(10), first_write.notified()).await.unwrap();
         let before = completed.load(Ordering::Relaxed);
-        let start = Instant::now();
+        let scale_out_start = Instant::now();
         let added = cell.add_node().await;
         let moved = admin::rebalance(cell.directory.as_ref(), deployments, &common::control()).await.unwrap();
         assert!(moved > 0 && !cell.node(added).agent.held().is_empty());
-        let scale_out = start.elapsed();
+        let scale_out_end = Instant::now();
         let after_out = completed.load(Ordering::Relaxed);
         assert!(after_out > before, "writes complete during scale-out");
 
         let drained = cell.holder("bench-0").await.unwrap();
         let draining = cell.node(drained);
         let holdings = draining.agent.held().len();
-        let start = Instant::now();
+        let scale_in_start = Instant::now();
         admin::drain(cell.directory.as_ref(), &draining.lease.id()).await.unwrap();
         tokio::time::timeout(Duration::from_secs(30), async {
             while !draining.agent.held().is_empty() { tokio::time::sleep(Duration::from_millis(10)).await; }
         }).await.unwrap();
         cell.nodes[drained].take().unwrap().shutdown().await.unwrap();
+        let scale_in_end = Instant::now();
         let after_in = completed.load(Ordering::Relaxed);
         assert!(after_in > after_out && after_in < workers * commands, "writes continue through the start and end of scale-in");
         println!("scale_out_moved={moved} scale_out_ms={:.3} commits_during_scale_out={} scale_in_drained={holdings} scale_in_ms={:.3} commits_during_scale_in={}",
-            scale_out.as_secs_f64() * 1000.0, after_out - before, start.elapsed().as_secs_f64() * 1000.0, after_in - after_out);
+            (scale_out_end - scale_out_start).as_secs_f64() * 1000.0, after_out - before,
+            (scale_in_end - scale_in_start).as_secs_f64() * 1000.0, after_in - after_out);
+        Some([(scale_out_start, scale_out_end), (scale_in_start, scale_in_end)])
     };
-    let ((totals, mut latencies, elapsed), ()) = tokio::join!(measurements, scaling);
+    let ((totals, samples, elapsed), windows) = tokio::join!(measurements, scaling);
 
     for (client, expected) in connections.iter().zip(&totals) {
         assert_eq!(values(&*client.lock().await, "SELECT n FROM counters").await, [expected.to_string()]);
     }
+    if let Some(windows) = windows {
+        let overlaps = |started: Instant, duration: Duration, (first, last): (Instant, Instant)| started <= last && started + duration >= first;
+        for (name, window) in [("scale_out", Some(windows[0])), ("scale_in", Some(windows[1])), ("outside_moves", None)] {
+            let mut local: Vec<_> = samples.iter().filter(|(started, duration)| match window {
+                Some(window) => overlaps(*started, *duration, window),
+                None => windows.iter().all(|window| !overlaps(*started, *duration, *window)),
+            }).map(|(_, duration)| *duration).collect();
+            local.sort_unstable();
+            if !local.is_empty() {
+                println!("phase={name} commits={} p95_ms={:.3} p99_ms={:.3}", local.len(), percentile(&local, 95), percentile(&local, 99));
+            }
+        }
+    }
+    let mut latencies: Vec<_> = samples.into_iter().map(|(_, duration)| duration).collect();
     assert_eq!(latencies.len(), workers * commands);
     latencies.sort_unstable();
     println!(

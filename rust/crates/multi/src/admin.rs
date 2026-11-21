@@ -120,6 +120,11 @@ pub async fn ensure_held(directory: &dyn Directory, name: &str, control: &Contro
 
 /// Reserves the next claim for `target` during the handoff.
 pub async fn move_deployment(directory: &dyn Directory, name: &str, target: &MemberId, control: &ControlKey) -> Result<()> {
+    move_from_holding(directory, name, target, None, control).await
+}
+
+pub(crate) async fn move_from_holding(directory: &dyn Directory, name: &str, target: &MemberId,
+                                      source: Option<(&MemberId, u64)>, control: &ControlKey) -> Result<()> {
     let members = members(directory).await?;
     let address = control_address(&members, target)?;
     let reservation = PlacementMove {
@@ -129,10 +134,14 @@ pub async fn move_deployment(directory: &dyn Directory, name: &str, target: &Mem
     };
     let intended = update(directory, name, |record| {
         let now = now_ms();
+        let holder = effective_holder(record, &members, now);
+        if source.is_some_and(|(member, epoch)| record.epoch != epoch || holder != Some(member)) {
+            return Err(Anomaly::new(AnomalyCategory::Conflict, "rtdb.multi/move-source-changed", format!("{name} has already changed holders")));
+        }
         if !members.get(target).is_some_and(|member| record.may_place_on(member, now)) {
             return Err(Anomaly::incorrect("rtdb.multi/not-placeable", format!("{target} may not take placements of {name}")));
         }
-        if effective_holder(record, &members, now) == Some(target) { return Ok(()); }
+        if holder == Some(target) { return Ok(()); }
         if record.active_move(now).is_some_and(|intent| members.get(&intent.target).is_some_and(|member| record.may_place_on(member, now))) {
             return Err(Anomaly::new(AnomalyCategory::Conflict, "rtdb.multi/move-in-progress", format!("{name} already has a reserved placement")));
         }
