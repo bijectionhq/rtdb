@@ -242,3 +242,24 @@ The complete Rust ceiling vector and range emitter still need a refinement proof
 Both native resolvers and the unbounded rectangles agreed with the mathematical answer on all 4,096 generated observations.
 There were 240 passing Rust type and temporal tests and 17 passing node search tests at the same revision.
 The combined suite also reran the checkpoint and Azure production controls and the 11 positive and 18 negative TLC configurations.
+
+== Production ceiling layout and fragment admission
+
+The combined local runner passed from `7a1937642` with both Rust options enabled.
+The input manifest SHA-256 was `d904a0fce7bc45577176e8564cb7404b92dd2bcb75b48a1eda57fe65923f57be`.
+Verus reported 43 verified obligations across five areas.
+All 18 Verus negative controls failed at their declared sites.
+The new controls exercise splitting, stale cells after compaction of the vectors, a skipped overwrite, an upper endpoint, a widened fragment, and admission that ignores system time.
+
+The verified production ceiling step preserves alignment of the two vectors and their strictly increasing boundaries.
+Splitting preserves point answers, and an overwrite changes exactly the points in its half-open range.
+The same area verifies which cells a scan visits and their clipping.
+The interval area checks that per-fragment admission tests both query axes, optionally clamps valid time, and preserves system time.
+
+The native run passed 302 tests across types, temporal, maintenance and search, with one ignored benchmark.
+The node search suite passed 17 tests.
+The combined run replayed all 4,096 generated observations against both Rust resolvers and unbounded visibility, four checkpoint tests and their root-first mutation, two Azure tests and their copy-status and staging mutations, and the binary64 score witness and its unpadded mutation.
+TLC reran 11 passing bounded configurations and found counterexamples in all 18 weakened configurations.
+
+The proof covers the actual vector operations under the standard Verus vector specifications.
+The allocation and event shell, production input order and the full resolver's assembly of fragments still rely on source inspection and replay.
