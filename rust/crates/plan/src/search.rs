@@ -4,13 +4,14 @@ pub(crate) fn signature(name: &str, arguments: &[L]) -> Option<Result<L>> {
     let result = match name {
         "match" => L::Scalar(S::Bool),
         "search_score" => L::Scalar(S::F64),
-        "search_length" => L::Scalar(S::I64),
+        "search_length" => L::Scalar(S::I64).maybe(),
+        "search_corpus_fingerprint" => L::Scalar(S::Binary),
         "search_terms" => L::list(L::Scalar(S::Utf8)),
         _ => return None,
     };
     Some((|| {
         let query = match (name, arguments) {
-            ("search_length", [_]) => None,
+            ("search_length", [_]) | ("search_corpus_fingerprint", [_, _]) => None,
             ("search_terms", [query]) => Some(query),
             ("match" | "search_score", [_, query]) => Some(query),
             ("search_score", [_, query, _, _, _]) => Some(query),

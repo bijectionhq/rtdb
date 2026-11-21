@@ -190,7 +190,9 @@ rule RepairUnreadableSearchFile {
 -- SEARCH_SCORE(column, query) sums BM25 term-frequency contributions with unit weights and unit length normalization.
 -- The five-argument form computes BM25 from its document count, total stored length and document frequencies.
 -- The frequency vector follows the distinct term order returned by SEARCH_TERMS.
--- SEARCH_LENGTH gives the stored length of a document for aggregation over the admitted rows.
+-- SEARCH_LENGTH gives the stored length of a UTF-8 document for aggregation over the admitted rows and null for any other input.
+-- SEARCH_CORPUS_FINGERPRINT hashes the ordered text id and body pairs passed as two arrays.
+-- Each id and body is prefixed with its byte length so the input has one spelling.
 -- Ranked pruning applies to the two-argument form.
 --
 -- A scan with a MATCH conjunct on a column that a definition in force covers is narrowed before it opens:

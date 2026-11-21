@@ -40,6 +40,9 @@ Definitions are documents in `xt.search_indexes`, so they can be queried as of a
 `SEARCH_SCORE(body, 'overdue invoice')` ranks a document by its term frequencies, using BM25 term-frequency saturation with unit weights and unit length normalization.
 For corpus-relative BM25, use `SEARCH_SCORE(body, query, document_count, total_stored_length, document_frequencies)`.
 Aggregate `SEARCH_LENGTH` and the document frequencies over the rows eligible for your corpus, at the appropriate time bounds.
+`SEARCH_LENGTH` returns null for values outside the UTF-8 leg of a column.
+`SEARCH_CORPUS_FINGERPRINT(ids, bodies)` returns a SHA-256 digest of the ordered pairs from equally sized text arrays.
+Use a stable array order to bind a continuation to an exact corpus.
 The frequency array follows the term order returned by `SEARCH_TERMS(query)`.
 Queries that used the two-argument form for corpus-relative ranking need to pass those statistics explicitly.
 Both see the version of each row visible at the query's valid and system time, whatever `FOR VALID_TIME` and `FOR SYSTEM_TIME` select.

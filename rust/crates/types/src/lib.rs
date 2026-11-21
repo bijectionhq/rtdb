@@ -6,6 +6,7 @@ mod legacy_zone;
 pub mod java_date;
 mod float_text;
 mod id;
+mod text_fingerprint;
 mod java_map;
 pub mod java_hash_map;
 mod logical;
@@ -37,6 +38,7 @@ pub use calendar::{CalendarDate, CivilDate, CivilDateTime, DateUnit, parse_iso_l
 pub use zone::{FixedOffset, ZoneId, timezone_names, TZDB_VERSION, TZDB_SHA256};
 pub use legacy_zone::LegacyTimeZone;
 pub use float_text::{java_f32_text, java_f64_text};
+pub use text_fingerprint::text_pair_fingerprint;
 pub use id::{EntityId, Iid, Keyword, TableRef};
 pub use java_map::{compute_if_absent_indices as java_hash_map_compute_if_absent_order, indices as java_hash_map_order, put_all_indices as java_hash_map_put_all_order};
 pub use ordered::{OrderedSet, StructFields, StructFieldsIter};

@@ -2,13 +2,13 @@ use crate::EvalContext;
 use crate::compare::nullish;
 use crate::numeric::integer;
 use rtdb_text::{Corpus, Query, Scorer, stored_length, tokens};
-use rtdb_types::{Anomaly, Result, Value};
+use rtdb_types::{Anomaly, Result, Value, text_pair_fingerprint};
 
 /// Only the UTF-8 leg of a column is indexed, so any other value matches nothing and scores nothing.
 pub(crate) fn call(name: &str, args: &[Value], context: &EvalContext<'_>) -> Option<Result<Value>> {
     if !matches!(
         name,
-        "match" | "search_score" | "search_length" | "search_terms"
+        "match" | "search_score" | "search_length" | "search_terms" | "search_corpus_fingerprint"
     ) {
         return None;
     }
@@ -23,9 +23,19 @@ pub(crate) fn call(name: &str, args: &[Value], context: &EvalContext<'_>) -> Opt
                     query.terms().iter().cloned().map(Value::Utf8).collect(),
                 ))
             }
-            ("search_length", [text]) => {
-                let tokens = tokens_of(text, context)?;
+            ("search_length", [Value::Utf8(text)]) => {
+                let tokens = document_tokens(text, context)?;
                 Ok(Value::I64(i64::from(stored_length(tokens.len()))))
+            }
+            ("search_corpus_fingerprint", [Value::List(ids), Value::List(bodies)]) => {
+                if ids.len() != bodies.len() {
+                    return Err(invalid_documents());
+                }
+                let pairs = ids.iter().zip(bodies).map(|(id, body)| match (id, body) {
+                    (Value::Utf8(id), Value::Utf8(body)) => Ok((id.as_str(), body.as_str())),
+                    _ => Err(invalid_documents()),
+                });
+                Ok(Value::Binary(text_pair_fingerprint(pairs)?.into()))
             }
             ("match", [text, Value::Utf8(query)]) => {
                 let tokens = tokens_of(text, context)?;
@@ -44,6 +54,13 @@ pub(crate) fn call(name: &str, args: &[Value], context: &EvalContext<'_>) -> Opt
             _ => Ok(Value::Null),
         }
     })())
+}
+
+fn invalid_documents() -> Anomaly {
+    Anomaly::incorrect(
+        "rtdb.expr/invalid-search-documents",
+        "A search fingerprint requires equally sized arrays of text ids and bodies",
+    )
 }
 
 fn tokens_of(value: &Value, context: &EvalContext<'_>) -> Result<Vec<String>> {

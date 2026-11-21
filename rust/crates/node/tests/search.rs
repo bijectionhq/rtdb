@@ -550,6 +550,16 @@ async fn explicit_search_statistics_rank_the_admitted_corpus() {
         vec![],
     ).await.unwrap()).await;
     assert_eq!(terms, [vec![Value::List(vec![Value::Utf8("invoice".into()), Value::Utf8("paid".into())])]]);
+    let fingerprint = rows(session.query_sql(
+        "SELECT SEARCH_LENGTH(42), SEARCH_LENGTH(''), \
+         SEARCH_CORPUS_FINGERPRINT(ARRAY['1', '2'], ARRAY['a', 'b']) = \
+         SEARCH_CORPUS_FINGERPRINT(ARRAY['1', '2'], ARRAY['a', 'b']), \
+         SEARCH_CORPUS_FINGERPRINT(ARRAY['1', '2'], ARRAY['a', 'b']) = \
+         SEARCH_CORPUS_FINGERPRINT(ARRAY['1', '2'], ARRAY['a', 'c'])",
+        vec![],
+    ).await.unwrap()).await;
+    assert_eq!(fingerprint, [vec![Value::Null, Value::I64(0), Value::Bool(true), Value::Bool(false)]]);
+
 
     let changed = session.state_mut().execute_tx(vec![
         sql("INSERT INTO docs RECORDS {_id: 3, body: 'public list archived', admitted: FALSE}"),
