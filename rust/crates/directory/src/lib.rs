@@ -5,6 +5,7 @@
 //! It is never on the commit path: a placed holder commits and serves reads while the directory is unavailable.
 
 use std::collections::BTreeMap;
+use std::path::Path;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -13,6 +14,7 @@ use parking_lot::Mutex;
 use rtdb_types::{Anomaly, AnomalyCategory, Result};
 use serde::{Deserialize, Serialize};
 
+mod state_file;
 pub mod feed;
 pub mod policy;
 pub mod watch;
@@ -270,67 +272,108 @@ pub fn exists(what: &str, key: &str) -> Anomaly {
     Anomaly::new(AnomalyCategory::Conflict, "rtdb.directory/exists", format!("{what} already exists: {key}")).with_context("key", key.into())
 }
 
-/// The directory for tests, simulation and single-process cells: one lock, so trivially linearizable.
+/// A single-process directory with an optional durable local state file.
 #[derive(Default)]
-pub struct MemoryDirectory { state: Mutex<MemoryState>, changes: ChangeFeed }
+pub struct MemoryDirectory {
+    state: Mutex<MemoryState>,
+    changes: ChangeFeed,
+    file: Option<state_file::StateFile>,
+}
 
-#[derive(Default)]
+#[derive(Default, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 struct MemoryState {
     deployments: BTreeMap<String, DeploymentRecord>,
     names: BTreeMap<String, String>,
     members: BTreeMap<MemberId, MemberRecord>,
+    #[serde(skip)]
+    failed: bool,
 }
 
 impl MemoryDirectory {
     pub fn new() -> Arc<Self> { Arc::new(Self::default()) }
+
+    pub fn initialize(root: &Path) -> Result<()> {
+        state_file::StateFile::lock(root)?.initialize()
+    }
+
+    pub fn open(root: &Path) -> Result<Arc<Self>> {
+        let file = state_file::StateFile::lock(root)?;
+        let state = file.load()?;
+        Ok(Arc::new(Self { state: Mutex::new(state), changes: ChangeFeed::default(), file: Some(file) }))
+    }
+
+    fn state(&self) -> Result<parking_lot::MutexGuard<'_, MemoryState>> {
+        let state = self.state.lock();
+        if state.failed {
+            return Err(Anomaly::new(
+                AnomalyCategory::Unavailable,
+                "rtdb.directory/state-uncertain",
+                "The local directory must be reopened after a state write failed",
+            ));
+        }
+        Ok(state)
+    }
+
+    fn persist(&self, state: &mut MemoryState) -> Result<()> {
+        if let Some(file) = &self.file && let Err(error) = file.save(state) {
+            state.failed = true;
+            return Err(error);
+        }
+        Ok(())
+    }
 }
 
 #[async_trait]
 impl Directory for MemoryDirectory {
     async fn create_deployment(&self, mut record: DeploymentRecord) -> Result<DeploymentRecord> {
-        let mut state = self.state.lock();
+        let mut state = self.state()?;
         if state.deployments.contains_key(&record.id) { return Err(exists("Deployment", &record.id)); }
         if state.names.contains_key(&record.name) { return Err(exists("Deployment name", &record.name)); }
         record.version = 1;
         state.names.insert(record.name.clone(), record.id.clone());
         state.deployments.insert(record.id.clone(), record.clone());
+        self.persist(&mut state)?;
         self.changes.publish(record.clone());
         Ok(record)
     }
-    async fn deployment(&self, id: &str) -> Result<Option<DeploymentRecord>> { Ok(self.state.lock().deployments.get(id).cloned()) }
+    async fn deployment(&self, id: &str) -> Result<Option<DeploymentRecord>> { Ok(self.state()?.deployments.get(id).cloned()) }
     async fn deployment_by_name(&self, name: &str) -> Result<Option<DeploymentRecord>> {
-        let state = self.state.lock();
+        let state = self.state()?;
         Ok(state.names.get(name).and_then(|id| state.deployments.get(id)).cloned())
     }
-    async fn deployments(&self) -> Result<Vec<DeploymentRecord>> { Ok(self.state.lock().deployments.values().cloned().collect()) }
+    async fn deployments(&self) -> Result<Vec<DeploymentRecord>> { Ok(self.state()?.deployments.values().cloned().collect()) }
     async fn deployments_held_by(&self, member: &MemberId) -> Result<Vec<DeploymentRecord>> {
-        Ok(self.state.lock().deployments.values().filter(|record| record.holder.as_ref() == Some(member)).cloned().collect())
+        Ok(self.state()?.deployments.values().filter(|record| record.holder.as_ref() == Some(member)).cloned().collect())
     }
     async fn replace_deployment(&self, mut record: DeploymentRecord, expected: Version) -> Result<Cas<DeploymentRecord>> {
-        let mut state = self.state.lock();
+        let mut state = self.state()?;
         let Some(current) = state.deployments.get(&record.id) else { return Ok(Cas::Conflict(None)); };
         if current.version != expected { return Ok(Cas::Conflict(Some(current.clone()))); }
         if current.name != record.name { return Err(Anomaly::incorrect("rtdb.directory/rename", "A deployment's name never changes")); }
         record.version = expected + 1;
         state.deployments.insert(record.id.clone(), record.clone());
+        self.persist(&mut state)?;
         self.changes.publish(record.clone());
         Ok(Cas::Applied(record))
     }
     async fn register_member(&self, mut record: MemberRecord) -> Result<MemberRecord> {
-        let mut state = self.state.lock();
+        let mut state = self.state()?;
         if state.members.contains_key(&record.id) { return Err(exists("Member", record.id.as_str())); }
         record.version = 1;
         state.members.insert(record.id.clone(), record.clone());
+        self.persist(&mut state)?;
         Ok(record)
     }
-    async fn member(&self, id: &MemberId) -> Result<Option<MemberRecord>> { Ok(self.state.lock().members.get(id).cloned()) }
-    async fn members(&self) -> Result<Vec<MemberRecord>> { Ok(self.state.lock().members.values().cloned().collect()) }
+    async fn member(&self, id: &MemberId) -> Result<Option<MemberRecord>> { Ok(self.state()?.members.get(id).cloned()) }
+    async fn members(&self) -> Result<Vec<MemberRecord>> { Ok(self.state()?.members.values().cloned().collect()) }
     async fn replace_member(&self, mut record: MemberRecord, expected: Version) -> Result<Cas<MemberRecord>> {
-        let mut state = self.state.lock();
+        let mut state = self.state()?;
         let Some(current) = state.members.get(&record.id) else { return Ok(Cas::Conflict(None)); };
         if current.version != expected { return Ok(Cas::Conflict(Some(current.clone()))); }
         record.version = expected + 1;
         state.members.insert(record.id.clone(), record.clone());
+        self.persist(&mut state)?;
         Ok(Cas::Applied(record))
     }
     fn deployment_changes(&self) -> Option<tokio::sync::broadcast::Receiver<DeploymentRecord>> { Some(self.changes.subscribe()) }

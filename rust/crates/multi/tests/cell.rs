@@ -20,6 +20,29 @@ use rtdb_multi::keys::LocalKeyService;
 use rtdb_types::{Anomaly, AnomalyCategory, Result};
 use tokio_postgres::NoTls;
 
+#[tokio::test]
+async fn the_local_directory_reopens_the_same_installation_and_fence() {
+    let state = tempfile::tempdir().unwrap();
+    assert!(MemoryDirectory::open(state.path()).is_err());
+    MemoryDirectory::initialize(state.path()).unwrap();
+    let directory = MemoryDirectory::open(state.path()).unwrap();
+    assert!(MemoryDirectory::open(state.path()).is_err());
+    let initial = directory.create_deployment(
+        DeploymentRecord::new("shop", "acme", vec![], 0),
+    ).await.unwrap();
+    let mut fenced = initial.clone();
+    fenced.epoch += 1;
+    fenced.lifecycle = Lifecycle::Deleting;
+    let fenced = directory.replace_deployment(fenced, initial.version).await.unwrap().applied().unwrap();
+    drop(directory);
+
+    assert!(MemoryDirectory::initialize(state.path()).is_err());
+    let directory = MemoryDirectory::open(state.path()).unwrap();
+    assert_eq!(directory.deployment_by_name("shop").await.unwrap(), Some(fenced.clone()));
+    assert_eq!(directory.replace_deployment(initial.clone(), initial.version).await.unwrap(),
+        rtdb_directory::Cas::Conflict(Some(fenced)));
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn hosted_install_retries_recover_the_same_authority() {
     let cell = Cell::start(1, None).await;

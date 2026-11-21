@@ -13,7 +13,8 @@ use rtdb_types::{Anomaly, Result};
 use tokio_util::sync::CancellationToken;
 
 const HELP: &str = "RTDB multi\n\n\
-Usage: rtdb-multi directory --listen ADDR\n\
+Usage: rtdb-multi initialize-directory --state PATH\n\
+       rtdb-multi directory --state PATH --listen ADDR\n\
        rtdb-multi logkeeper --directory DIR --listen ADDR --data PATH [--advertise-host HOST] [--zone ZONE] [--cache-bytes BYTES] [--no-fsync]\n\
        rtdb-multi node --directory DIR --storage-root PATH --keys PATH --cache PATH [--config FILE] [--control ADDR] [--advertise-host HOST] [--zone ZONE] [--park-after SECONDS] [--max-active N] [--max-tail-rows N] [--isolation | --compaction-worker] [--no-local-compaction] [--memory-limit BYTES] [--cell-secret FILE]\n\
        rtdb-multi gateway --directory DIR --listen ADDR [--config FILE] [--cell NAME --cell-map ADDR] [--cell-secret FILE]\n\
@@ -84,10 +85,12 @@ async fn run(arguments: Vec<String>) -> Result<()> {
     { let cancellation = cancellation.clone(); tokio::spawn(async move { shutdown_signal().await; cancellation.cancel(); }); }
     match command.as_str() {
         "help" | "--help" | "-h" => { print!("{HELP}"); Ok(()) }
+        "initialize-directory" => MemoryDirectory::initialize(std::path::Path::new(arguments.required("state")?)),
         "directory" => {
+            let directory = MemoryDirectory::open(std::path::Path::new(arguments.required("state")?))?;
             let listener = tokio::net::TcpListener::bind(arguments.address("listen", "127.0.0.1:7001")?).await.map_err(io)?;
             eprintln!("directory listening on {}", listener.local_addr().map_err(io)?);
-            rtdb_directory::serve(listener, MemoryDirectory::new(), cancellation).await
+            rtdb_directory::serve(listener, directory, cancellation).await
         }
         "logkeeper" => {
             let directory = directory(arguments.required("directory")?).await?;
