@@ -486,10 +486,10 @@ impl<'scope> Tree<'scope> {
         // Derived index pages are rebuildable, and must never make a durable
         // replica-local copy outside the object owner's erasure inventory.
         let store = self.storage.object_store();
-        if self.admitted(store.head_fresh(&object)).await?.size != pointer.size as u64 {
-            return Err(format_error("Ordered index page has the wrong length"));
-        }
-        let bytes = self.admitted(store.get_fresh(&object)).await?;
+        let bytes = IoRegion::retaining(
+            memory.clone(),
+            self.admitted(store.get_fresh_exact(&object, pointer.size)),
+        ).await?;
         if bytes.len() != pointer.size
             || format!("{:x}", Sha256::digest(bytes.as_ref())) != pointer.digest
         {

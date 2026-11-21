@@ -223,6 +223,17 @@ impl ObjectStore for PackingStore {
         if let Some((pack, entry)) = self.locate(object).await? { return self.inner.get_range(&pack, entry.offset..entry.offset + entry.length).await; }
         self.inner.get(object).await
     }
+    async fn get_fresh_exact(&self, key: &ObjectKey, length: usize) -> rtdb_storage::Result<Bytes> {
+        let wrong_size = || Error::Task(format!("Immutable object {key} has the wrong length"));
+        if let Some(bytes) = self.held(key) {
+            return if bytes.len() == length { Ok(bytes) } else { Err(wrong_size()) };
+        }
+        if let Some((pack, entry)) = self.locate(key).await? {
+            if entry.length != length as u64 { return Err(wrong_size()); }
+            return self.inner.get_range(&pack, entry.offset..entry.offset + entry.length).await;
+        }
+        self.inner.get_fresh_exact(key, length).await
+    }
     async fn get_range(&self, object: &ObjectKey, range: Range<u64>) -> rtdb_storage::Result<Bytes> {
         if let Some(bytes) = self.held(object) {
             if range.start > range.end || range.end > bytes.len() as u64 { return Err(Error::InvalidRange { key: object.to_string(), start: range.start, end: range.end, length: bytes.len() as u64 }); }
