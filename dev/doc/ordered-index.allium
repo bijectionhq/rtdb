@@ -26,4 +26,5 @@ entity Checkpoint {
 -- The read opens a root at its system-time point and applies captured uncovered events, including erasures.
 -- A point read merges bucket prefixes in key order and fetches payload at the same basis.
 -- An erasure removes the IID's old membership from every affected root and makes unreachable pages collectible.
+-- Replay discovers captured erase cuts before it writes pages, and projects each IID from its latest erase onward.
 -- Data compaction preserves input events and changes no ordered-index checkpoint.

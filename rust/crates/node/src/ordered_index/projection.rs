@@ -69,15 +69,14 @@ impl RevisionRoots {
         changes: Changes,
         order: EventOrder,
         cancellation: &CancellationToken,
-    ) -> Result<bool> {
+    ) -> Result<()> {
         if changes.revisions.is_empty() {
-            return Ok(false);
+            return Ok(());
         }
         let (mut last, mut root) = self
             .at(tree, Timestamp::MAX)
             .await?
             .map_or((Timestamp::MIN, None), |(time, root)| (time, root));
-        let mut erased = false;
         for (time, rows) in changes.revisions {
             if last > time {
                 return Err(format_error(
@@ -97,7 +96,6 @@ impl RevisionRoots {
                 let cut = events.iter().any(|event| event.header.op == EventOp::Erase);
                 let after = resolve(iid, time, &before, &events, tree.memory)?;
                 if cut {
-                    erased = true;
                     cut_at_revision = true;
                     self.stage_archived(tree, cancellation).await?;
                     for (_, historical) in self.changes.range_mut(..time) {
@@ -121,7 +119,7 @@ impl RevisionRoots {
             }
             last = time;
         }
-        Ok(erased)
+        Ok(())
     }
 }
 
@@ -275,6 +273,7 @@ impl Changes {
         columns: &[String],
         memory: &Arc<MemoryBudget>,
         cancellation: &CancellationToken,
+        retain: impl Fn(EventHeader) -> bool,
     ) -> Result<()> {
         let _headers = memory.reserve(batch.len().saturating_mul(256))?;
         for event in batch.page_events()?.into_iter().skip(skip) {
@@ -282,6 +281,9 @@ impl Changes {
                 return Err(cancelled());
             }
             let header = event.header();
+            if !retain(header) {
+                continue;
+            }
             let bytes = if header.op == EventOp::Put {
                 columns.iter().try_fold(256usize, |bytes, name| {
                     let cell = match event.put_column(name) {
@@ -355,7 +357,14 @@ mod tests {
         let batch = IndexBatch::from_events(events, &StructFields::new(), memory).unwrap();
         let mut changes = Changes::default();
         changes
-            .add_batch(batch.view(), 0, &["key".into()], memory, cancellation)
+            .add_batch(
+                batch.view(),
+                0,
+                &["key".into()],
+                memory,
+                cancellation,
+                |_| true,
+            )
             .unwrap();
         changes
     }

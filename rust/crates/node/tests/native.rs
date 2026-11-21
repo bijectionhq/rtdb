@@ -2053,22 +2053,63 @@ async fn ordered_index_retires_erased_keys_and_drop_recreate_gets_a_fresh_genera
     let mut session = node.session("xtdb", Arc::new(Authority)).unwrap();
     let database = node.catalog().database("xtdb").unwrap();
     index_sql(&mut session, "CREATE INDEX orders_key ON orders (customer, _id)").await;
-    index_sql(&mut session, "INSERT INTO orders RECORDS {_id: 1, customer: 'erased-index-value'}, {_id: 2, customer: 'retained'}").await;
-    index_flush(&node, &database).await;
-    database.build_artefacts().await.unwrap();
-
-    index_sql(&mut session, "ERASE FROM orders WHERE _id = 1").await;
+    let original = index_sql(&mut session, "INSERT INTO orders RECORDS {_id: 1, customer: 'erased-index-value'}, {_id: 2, customer: 'retained'}").await;
     index_flush(&node, &database).await;
     database.build_artefacts().await.unwrap();
     let prefix = rtdb_storage::ObjectKey::new("ordered-index/v2").unwrap();
+    let store = database.object_store();
+    let mut erased_pages = Vec::new();
+    for entry in store.list(Some(&prefix)).await.unwrap() {
+        if entry.key.as_str().contains("/pages/") && String::from_utf8_lossy(&store.get(&entry.key).await.unwrap()).contains("erased-index-value") {
+            erased_pages.push(entry.key);
+        }
+    }
+    assert!(!erased_pages.is_empty());
+
+    let erasure = session.state_mut().execute_tx(
+        ["INSERT INTO orders RECORDS {_id: 1, customer: 'erased-in-revision'}",
+         "ERASE FROM orders WHERE _id = 1",
+         "INSERT INTO orders RECORDS {_id: 1, customer: 'z-reinserted'}"]
+            .into_iter().map(|sql| TxOp::Sql { sql: sql.into(), args: None }).collect(),
+        AutonomousTxOptions::default(),
+    ).await.unwrap();
+    assert!(erasure.committed());
+    index_flush(&node, &database).await;
+    database.build_artefacts().await.unwrap();
     let objects = database.object_store().list(Some(&prefix)).await.unwrap();
     assert!(objects.iter().any(|entry| entry.key.as_str().contains("/pages/")));
-    for entry in objects {
+    for entry in &objects {
         let bytes = database.object_store().get(&entry.key).await.unwrap();
         assert!(!String::from_utf8_lossy(&bytes).contains("erased-index-value"));
+        assert!(!String::from_utf8_lossy(&bytes).contains("erased-in-revision"));
+    }
+    let manifest = objects.iter().find(|entry| entry.key.as_str().contains("/manifests/")).unwrap();
+    let encoded = store.get(&manifest.key).await.unwrap();
+    let obsolete = rtdb_storage::ObjectKey::new(manifest.key.as_str().replace("/manifests/scrubbed/", "/manifests/")).unwrap();
+    store.put(&obsolete, Vec::from("obsolete replay layout").into()).await.unwrap();
+    let checkpoint: serde_json::Value = serde_json::from_slice(&encoded).unwrap();
+    let root = &checkpoint["layout"]["revisions"];
+    let generation = root["generation"].as_i64().unwrap();
+    let digest = root["digest"].as_str().unwrap();
+    let root_suffix = format!("/pages/{generation:016x}/{digest}");
+    let current_page = objects.iter().find(|entry| entry.key.as_str().ends_with(&root_suffix)).unwrap();
+    store.delete(&current_page.key).await.unwrap();
+    for page in &erased_pages {
+        store.put(page, Vec::from("reserved erased page address").into()).await.unwrap();
+    }
+    database.build_artefacts().await.unwrap();
+    assert_eq!(store.get(&manifest.key).await.unwrap(), encoded);
+    assert!(matches!(store.head(&obsolete).await, Err(rtdb_storage::Error::MissingObject(_))));
+    store.head(&current_page.key).await.unwrap();
+    for page in &erased_pages {
+        assert!(matches!(store.head(page).await, Err(rtdb_storage::Error::MissingObject(_))));
     }
     let query = "SELECT _id FROM orders WHERE customer >= 'a' ORDER BY customer, _id LIMIT 2";
-    assert_eq!(rows(session.query_sql(query, vec![]).await.unwrap()).await, [vec![Value::I64(2)]]);
+    let retained = [vec![Value::I64(2)], vec![Value::I64(1)]];
+    assert_eq!(rows(session.query_sql(query, vec![]).await.unwrap()).await, retained);
+    let history = "SELECT _id FROM orders FOR SYSTEM_TIME AS OF ? WHERE customer >= 'a' ORDER BY customer, _id LIMIT 2";
+    let at = Value::Timestamp { value: original.0, unit: rtdb_types::TimeUnit::Microsecond, timezone: Some("UTC".into()) };
+    assert_eq!(rows(session.query_sql(history, vec![at]).await.unwrap()).await, [vec![Value::I64(2)]]);
 
     index_sql(&mut session, "DROP INDEX orders_key").await;
     database.build_artefacts().await.unwrap();
@@ -2076,7 +2117,7 @@ async fn ordered_index_retires_erased_keys_and_drop_recreate_gets_a_fresh_genera
     index_sql(&mut session, "CREATE INDEX orders_key ON orders (customer, _id)").await;
     index_flush(&node, &database).await;
     database.build_artefacts().await.unwrap();
-    assert_eq!(rows(session.query_sql(query, vec![]).await.unwrap()).await, [vec![Value::I64(2)]]);
+    assert_eq!(rows(session.query_sql(query, vec![]).await.unwrap()).await, retained);
     for entry in database.object_store().list(Some(&prefix)).await.unwrap() {
         let bytes = database.object_store().get(&entry.key).await.unwrap();
         assert!(!String::from_utf8_lossy(&bytes).contains("erased-index-value"));
