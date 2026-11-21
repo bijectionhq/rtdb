@@ -173,7 +173,7 @@ impl Node {
         self.ensure_open()?;
         // A placed node may stop holding a session's database at any moment; the command is refused before anything runs, so the gateway may resend it to the new holder.
         if matches!(self.factory.options.membership, Membership::Placed) && self.catalog.database(database).is_err() {
-            return Err(Anomaly::new(AnomalyCategory::Unavailable, NOT_HELD, format!("This node no longer holds {database}")).with_context("db-name", database.into()));
+            return Err(lost_placement(database));
         }
         identity.authorize_database(database, access)
     }
@@ -273,14 +273,18 @@ impl Node {
 
     pub async fn query_context(&self, database: &str, basis: &QueryBasis, identity: &dyn SessionIdentity, cancellation: &CancellationToken) -> Result<Arc<QueryContext>> {
         self.admit(database, DatabaseAccess::Read, identity, cancellation).await?;
+        let placed = self.catalog.is_placed();
+        let held = placed.then(|| self.catalog.database(database).map_err(|_| lost_placement(database))).transpose()?;
         if let Some(fence) = &self.read_fence { fence.confirm(database).await?; }
+        if let Some(previous) = &held {
+            let current = self.catalog.database(database).map_err(|_| lost_placement(database))?;
+            if !Arc::ptr_eq(previous, &current) { return Err(lost_placement(database)); }
+        }
+
         let mut snapshots = BTreeMap::new();
-        // A placed node's databases belong to different tenants: a session sees its own database and no other.
-        let isolated = matches!(self.factory.options.membership, Membership::Placed);
-        let database_name = database;
-        for (name, database) in self.catalog.open_databases() {
-            if isolated && name != database_name { continue; }
-            if identity.authorize_database(&name, DatabaseAccess::Read).is_err() { continue; }
+        let classic = if placed { BTreeMap::new() } else { self.catalog.open_databases() };
+        for (name, database) in held.into_iter().map(|held| (database.to_owned(), held)).chain(classic) {
+            if !placed && identity.authorize_database(&name, DatabaseAccess::Read).is_err() { continue; }
             let head = database.partition.value().live().latest_completed_tx().map(|key| key.system_time);
             let snapshot = database.partition.open_snapshot(head);
             let requested = basis.snapshot.databases.get(&name).and_then(|partitions| partitions.first()).copied().flatten();
@@ -682,6 +686,10 @@ fn idempotency_guard(key: &str) -> String {
 
 /// The code a placed node refuses a command with when it no longer holds the command's database.
 pub const NOT_HELD: &str = "rtdb.node/database-not-held";
+
+fn lost_placement(database: &str) -> Anomaly {
+    Anomaly::new(AnomalyCategory::Unavailable, NOT_HELD, format!("This node no longer holds {database}")).with_context("db-name", database.into())
+}
 
 fn closed() -> Anomaly { Anomaly::new(AnomalyCategory::Interrupted, "xtdb/node-closed", "Node is closed") }
 fn cancelled() -> Anomaly { Anomaly::new(AnomalyCategory::Interrupted, "xtdb/operation-cancelled", "Operation was cancelled") }

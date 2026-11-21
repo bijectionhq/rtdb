@@ -1715,6 +1715,9 @@ rule SpreadReplicaSessions {
         EligibleReplicaAttempted(gateway, deployment)
 }
 
+-- A placed query keeps its local database owner while checking authority.
+-- If the local owner detached or changed during the check, the node refuses the query before planning.
+
 rule ServeOnWriter {
     when: QueryArrived(holding, query, session)
 

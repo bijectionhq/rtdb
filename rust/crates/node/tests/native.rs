@@ -59,6 +59,53 @@ async fn running(options: NodeOptions, services: NodeServices) -> (Node, tokio::
     (node, tokio::spawn(driver.run()))
 }
 
+#[derive(Default)]
+struct PausedReadFence {
+    entered: tokio::sync::Notify,
+    resume: tokio::sync::Notify,
+}
+
+#[async_trait]
+impl ReadFence for PausedReadFence {
+    async fn confirm(&self, _: &str) -> Result<()> {
+        self.entered.notify_one();
+        self.resume.notified().await;
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn a_placed_query_refuses_a_database_detached_or_replaced_while_checking_its_fence() {
+    for replace in [false, true] {
+        let mut config = options();
+        config.membership = Membership::Placed;
+        let fence = Arc::new(PausedReadFence::default());
+        let mut services = services();
+        services.read_fence = Some(fence.clone());
+        let (node, driver) = running(config, services).await;
+        node.database_or_attach("shop".into(), Default::default()).await.unwrap().unwrap();
+        let basis = QueryBasis {
+            snapshot: node.snapshot_basis().unwrap(), snapshot_time: None, current_time: node.query_instant(), timezone: "UTC".into(),
+        };
+        let request_node = node.clone();
+        let query = tokio::spawn(async move {
+            request_node.query_context("shop", &basis, &Authority, &CancellationToken::new()).await
+        });
+        tokio::time::timeout(Duration::from_secs(5), fence.entered.notified()).await.unwrap();
+        node.detach_local("shop".into()).await.unwrap();
+        if replace {
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while node.catalog().is_draining("shop") { tokio::task::yield_now().await; }
+            }).await.unwrap();
+            node.database_or_attach("shop".into(), Default::default()).await.unwrap().unwrap();
+        }
+        fence.resume.notify_one();
+        let Err(error) = query.await.unwrap() else { panic!("the former holding accepted a query"); };
+        assert_eq!(error.code, NOT_HELD);
+        stop(&node, driver).await;
+    }
+}
+
 #[tokio::test]
 async fn database_metric_provider_uses_current_catalog_without_retaining_node_lifetime() {
     let (node, driver) = Node::open(options(), services()).await.unwrap();

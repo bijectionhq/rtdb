@@ -722,6 +722,7 @@ Moves are invisible to clients only if the gateway owns connections and session 
    Local pgwire startup, including routing and the holder's greeting, has a 35-second deadline.
    If a holder accepts a socket but stalls before `ReadyForQuery`, the gateway closes startup with SQLSTATE `57P03` so the client can retry.
    A retry waits for a placement change or the 100 ms fallback timer, whichever arrives first.
+   If a placed database detaches or changes while a query checks authority, the node refuses before planning so the gateway can retry.
    A driver that stops during execution can leave the outcome unknown.
    The gateway replays the command under its original key when the client has received no answer.
    Writable pgwire sessions accept pipelined frames and dispatch one command cycle at a time.
