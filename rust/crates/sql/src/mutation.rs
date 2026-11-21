@@ -10,7 +10,7 @@ pub enum Mutation {
     Delete { table: QualifiedTable, input: Arc<Relation> },
     Erase { table: QualifiedTable, input: Arc<Relation> },
     Assert { input: Arc<Relation>, message: Option<String> },
-    CreateTable { table: QualifiedTable, columns: Vec<String> },
+    CreateTable { table: QualifiedTable, columns: Vec<(String, LogicalType)> },
     GrantRole { user: String, role: String, revoke: bool },
     CreateSearchIndex { name: String, table: QualifiedTable, columns: Vec<String>, history: bool },
     DropSearchIndex { name: String },

@@ -15,7 +15,7 @@ pub enum Dml {
     Erase { table: QualifiedTable, input: Arc<Relation> },
     Patch { table: QualifiedTable, input: Arc<Relation>, valid_time: TemporalFilter },
     Assert { input: Arc<Relation>, message: Option<String> },
-    CreateTable { table: QualifiedTable, columns: Vec<String> },
+    CreateTable { table: QualifiedTable, columns: Vec<(String, LogicalType)> },
     GrantRole { user: String, role: String, revoke: bool },
     /// `history` is false when the index covers only the current side (fts.allium: SearchIndexDefinition).
     CreateSearchIndex { name: String, table: QualifiedTable, columns: Vec<String>, history: bool },

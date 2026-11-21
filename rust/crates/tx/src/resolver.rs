@@ -403,7 +403,11 @@ impl<'a> OpenTransaction<'a> {
                 if cursor.next_batch().await?.is_none() { return Err(Anomaly::new(AnomalyCategory::Conflict, "xtdb/assert-failed", message.unwrap_or_else(|| "Assert failed".into()))); }
                 return Ok(());
             }
-            Mutation::CreateTable { table, columns } => return self.declare_table(table.table, columns),
+            Mutation::CreateTable { table, columns } => {
+                let table = table.table;
+                self.declare_table(table.clone(), columns.iter().map(|(name, _)| name.clone()))?;
+                return self.buffer.declare_document_types(&table, columns.iter().map(|(name, ty)| (name, ty)));
+            },
             Mutation::CreateSearchIndex { name, table, columns, history } => {
                 if table.database != self.context.database { return Err(Anomaly::incorrect("xtdb/table-not-found", "A search index cannot cover another database's table")); }
                 check_search_index_name(&name)?;

@@ -241,7 +241,7 @@ pub(crate) enum Syntax {
     Erase(ast::Delete),
     Assert(ast::Expr, Option<String>),
     Records { patch: bool, table: ast::ObjectName, records: Vec<ast::Expr> },
-    CreateTable { table: ast::ObjectName, columns: Vec<Identifier> },
+    CreateTable { table: ast::ObjectName, columns: Vec<(Identifier, Option<ast::DataType>)> },
     GrantRole { user: Identifier, role: Identifier, revoke: bool },
     CreateSearchIndex { name: Identifier, table: ast::ObjectName, columns: Vec<Identifier>, history: bool },
     DropSearchIndex { name: Identifier },
@@ -424,7 +424,12 @@ pub(super) fn parse_statement_syntax<'input>(
         let mut columns = Vec::new();
         if parser.consume_token(&Token::LParen) && !parser.consume_token(&Token::RParen) {
             loop {
-                columns.push(identifier_token(&parser.next_token())?);
+                let name = identifier_token(&parser.next_token())?;
+                let ty = match parser.peek_token().token {
+                    Token::Comma | Token::RParen => None,
+                    _ => Some(dialect.checked(parser.parse_data_type()).map_err(|error| parser_error(error, sql, parser.peek_token().span))?),
+                };
+                columns.push((name, ty));
                 if parser.consume_token(&Token::RParen) { break; }
                 parser.expect_token(&Token::Comma).map_err(|error| parser_error(error, sql, parser.peek_token().span))?;
             }

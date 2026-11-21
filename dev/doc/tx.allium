@@ -233,6 +233,7 @@ enum StatementKind {
     -- How the SqlParser classifies an executable statement for access-mode resolution.
     -- A query pins a pending tx's read basis, making it Reading; a DML statement makes
     -- a Pending(Unspecified) tx Writing. (DDL that submits as tx-ops — CREATE TABLE, GRANT — classifies as dml.)
+    -- A CREATE TABLE can contribute nullable native column types to the ordered catalog even with no row writes.
     query | dml
 }
 
