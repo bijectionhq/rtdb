@@ -2,13 +2,15 @@ use rtdb_types::StructFields;
 use std::collections::BTreeSet;
 use std::sync::Arc;
 
+use arrow_array::{ArrayRef, RecordBatch};
+use arrow_schema::DataType;
 use rtdb_columnar::MemoryBudget;
 use rtdb_expr::{EvalContext, evaluate};
-use rtdb_plan::{Catalog, QualifiedTable, Relation, RelationNode, Schema, TableBinding, TemporalFilter};
+use rtdb_plan::{Catalog, Expr, QualifiedTable, Relation, RelationNode, Schema, TableBinding, TemporalFilter};
 use rtdb_types::{Anomaly, Result, Timestamp, Value};
 use rtdb_sql::StaticMutationKind;
 
-use crate::{Documents, SourceTransaction, SqlArguments, SubmitOptions, TxOp};
+use crate::{ArrowDocuments, Documents, SourceTransaction, SqlArguments, SubmitOptions, TxOp};
 
 struct SubmissionCatalog<'a>(&'a str);
 impl Catalog for SubmissionCatalog<'_> {
@@ -59,6 +61,14 @@ fn expand(sql: &str, args: Option<&SqlArguments>, options: &SubmitOptions, datab
         let mut count = 0; expr.visit(&mut |expr| { if let rtdb_plan::Expr::Parameter { index, .. } = expr { count = count.max(index + 1); } }); count
     }).max().unwrap_or(0));
     if args.map_or(0, |args| args.types().len()) < parameter_count { return Ok(None); }
+    if matches!(plan.kind, StaticMutationKind::Put) && let Some(batch) = args.and_then(SqlArguments::single_arrow_batch) {
+        match projected_arrow_documents(&plan.input, batch, memory) {
+            Ok(Some(documents)) => return Ok(Some(vec![TxOp::PutArrowDocs { table: plan.table.table, documents }])),
+            Ok(None) => {}
+            Err(error) if error.code == "rtdb/memory-budget-exceeded" => {}
+            Err(error) => return Err(error),
+        }
+    }
     let parameter_rows: Box<dyn Iterator<Item = Result<crate::values::ArgumentRow<'_>>> + '_> = match args {
         Some(args) => Box::new(args.rows()),
         None => Box::new(std::iter::once(Ok(crate::values::ArgumentRow::borrowed(&[])))),
@@ -118,6 +128,74 @@ fn expand(sql: &str, args: Option<&SqlArguments>, options: &SubmitOptions, datab
     Ok((!operations.is_empty()).then_some(operations))
 }
 
+fn projected_arrow_documents(input: &Relation, batch: &RecordBatch, memory: &Arc<MemoryBudget>) -> Result<Option<ArrowDocuments>> {
+    let RelationNode::Rename { input: values, expressions, .. } = input.node() else { return Ok(None); };
+    let RelationNode::Values { rows } = values.node() else { return Ok(None); };
+    let [row] = rows.as_slice() else { return Ok(None); };
+    if expressions.iter().any(|expr| matches!(expr.field.name.as_str(), "_valid_from" | "_valid_to")) {
+        return Ok(None);
+    }
+
+    let schema = batch.schema_ref();
+    let scalar_arguments = schema.fields().iter().all(|field| field.metadata().is_empty() && match field.data_type() {
+        DataType::Boolean | DataType::Int8 | DataType::Int16 | DataType::Int32 | DataType::Int64 |
+        DataType::UInt8 | DataType::UInt16 | DataType::UInt32 | DataType::UInt64 |
+        DataType::Float32 | DataType::Float64 | DataType::Utf8 | DataType::Binary | DataType::FixedSizeBinary(_) => true,
+        DataType::Null => field.is_nullable(),
+        _ => false,
+    });
+    if !scalar_arguments {
+        return Ok(None);
+    }
+
+    let projection = || expressions.iter().map(|expr| {
+        let Expr::Column { id, .. } = expr.expr else { return None; };
+        let Expr::Parameter { index, .. } = row.get(values.schema().position(id)?)? else { return None; };
+        let field = schema.fields().get(*index)?;
+        Some((expr.field.name.as_str(), field, batch.column(*index)))
+    });
+    let mut bound = 4096usize;
+    let mut has_id = false;
+    for column in projection() {
+        let Some((name, field, array)) = column else { return Ok(None); };
+        if name == "_id" {
+            if array.logical_null_count() != 0 { return Ok(None); }
+            has_id = true;
+        }
+        bound = field.size().checked_add(name.len()).and_then(|bytes| bytes.checked_add(256))
+            .and_then(|bytes| bytes.checked_mul(4)).and_then(|bytes| bytes.checked_add(bound)).ok_or_else(overflow)?;
+    }
+    if !has_id { return Ok(None); }
+    let _schema = memory.reserve(bound)?;
+    let mut fields = Vec::with_capacity(expressions.len());
+    let mut columns = Vec::with_capacity(expressions.len());
+    for (name, field, array) in projection().flatten() {
+        fields.push(field.as_ref().clone().with_name(name));
+        columns.push(canonical_argument_column(array, memory)?);
+    }
+    let projection = RecordBatch::try_new(Arc::new(arrow_schema::Schema::new(fields)), columns)
+        .map_err(|error| Anomaly::fault("rtdb.tx/static-plan", error.to_string()))?;
+    ArrowDocuments::from_record_batch(&projection, memory)
+}
+
+fn canonical_argument_column(array: &ArrayRef, memory: &Arc<MemoryBudget>) -> Result<ArrayRef> {
+    let nulls = array.logical_null_count();
+    if nulls == array.len() || (nulls == 0 && array.data_type() != &DataType::Boolean) {
+        return Ok(Arc::clone(array));
+    }
+
+    // The source body digest includes the payload beneath null slots and the padding on a Boolean vector.
+    let bound = array.get_array_memory_size().checked_mul(4)
+        .and_then(|bytes| bytes.checked_add(array.len().checked_mul(64)?))
+        .and_then(|bytes| bytes.checked_add(4096)).ok_or_else(overflow)?;
+    let mut reservation = memory.reserve(bound)?;
+    let cells = (0..array.len()).map(|index| Some((0, index))).collect::<Vec<_>>();
+    let column = rtdb_columnar::copy_nullable_cells(&[array.as_ref()], &cells)?;
+    drop(cells);
+    Arc::get_mut(&mut reservation).expect("argument selection owns its reservation").shrink_to(column.get_array_memory_size())?;
+    rtdb_columnar::retain_array(column, &reservation)
+}
+
 fn infer_document_decimals(value: &mut Value) -> Result<()> {
     match value {
         Value::Decimal(decimal) => *decimal = rtdb_expr::infer_decimal(decimal)?,
@@ -147,6 +225,73 @@ fn overflow() -> Anomaly { Anomaly::incorrect("rtdb.tx/allocation-overflow", "St
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn static_insert_projects_arrow_arguments_with_the_same_source_encoding_as_rows() {
+        use arrow_array::{StringArray, UInt64Array};
+        use arrow_schema::Field;
+        use rtdb_columnar::OwnedBatch;
+
+        let memory = MemoryBudget::new(1 << 24);
+        let labels = Arc::new(StringArray::from(vec!["label", "other"]));
+        let schema = Arc::new(arrow_schema::Schema::new(vec![
+            Field::new("bound_label", DataType::Utf8, true),
+            Field::new("bound_id", DataType::UInt64, false),
+        ]));
+        let batch = RecordBatch::try_new(schema, vec![labels, Arc::new(UInt64Array::from(vec![1, u64::MAX]))]).unwrap();
+        let args = SqlArguments::from_arrow(OwnedBatch::new(batch, &memory).unwrap(), &memory).unwrap();
+        let submit = |arguments| prepare_submission(vec![TxOp::Sql {
+            sql: "INSERT INTO docs (_id, label) VALUES ($2, $1)".into(), args: Some(arguments),
+        }], SubmitOptions::default(), "xtdb", &memory).unwrap();
+        let rows = args.rows().map(|row| row.unwrap().to_vec()).collect();
+        let boxed = submit(SqlArguments::new(args.types().to_vec(), rows, &memory).unwrap());
+        let shared = args.single_arrow_batch().unwrap().column(0).clone();
+
+        let projected = submit(args);
+
+        let crate::source::Operation::Public(TxOp::PutArrowDocs { documents, .. }) = &projected.operations[0]
+            else { panic!("Expected Arrow documents") };
+        assert!(Arc::ptr_eq(documents.array().column(1), &shared));
+        assert_eq!(projected.encode().unwrap().as_slice(), boxed.encode().unwrap().as_slice());
+    }
+
+    #[test]
+    fn static_insert_canonicalizes_arrow_padding_and_preserves_missing_id_errors() {
+        use arrow_array::{BooleanArray, Int64Array};
+        use arrow_buffer::{BooleanBuffer, Buffer, NullBuffer, ScalarBuffer};
+        use arrow_schema::Field;
+        use rtdb_columnar::OwnedBatch;
+
+        let memory = MemoryBudget::new(1 << 24);
+        let schema = Arc::new(arrow_schema::Schema::new(vec![
+            Field::new("id", DataType::Int64, true),
+            Field::new("flag", DataType::Boolean, false),
+            Field::new("number", DataType::Int64, true),
+        ]));
+        let flags = Arc::new(BooleanArray::new(BooleanBuffer::new(Buffer::from_vec(vec![0xff_u8]), 0, 2), None));
+        let validity = NullBuffer::new(BooleanBuffer::new(Buffer::from_vec(vec![0xfd_u8]), 0, 2));
+        let numbers = Arc::new(Int64Array::new(ScalarBuffer::from(vec![17, 999]), Some(validity)));
+        let submit = |id: Int64Array| {
+            let columns: Vec<ArrayRef> = vec![Arc::new(id), flags.clone(), numbers.clone()];
+            let batch = RecordBatch::try_new(Arc::clone(&schema), columns).unwrap();
+            let args = SqlArguments::from_arrow(OwnedBatch::new(batch, &memory).unwrap(), &memory).unwrap();
+            let rows = args.rows().map(|row| row.unwrap().to_vec()).collect();
+            let submit = |arguments| prepare_submission(vec![TxOp::Sql {
+                sql: "INSERT INTO docs (_id, flag, n) VALUES (?, ?, ?)".into(), args: Some(arguments),
+            }], SubmitOptions::default(), "xtdb", &memory).unwrap();
+            let boxed = submit(SqlArguments::new(args.types().to_vec(), rows, &memory).unwrap());
+            (submit(args), boxed)
+        };
+        let (projected, boxed) = submit(Int64Array::from(vec![1, 2]));
+        assert!(matches!(projected.operations[0], crate::source::Operation::Public(TxOp::PutArrowDocs { .. })));
+        assert_eq!(projected.encode().unwrap().as_slice(), boxed.encode().unwrap().as_slice());
+
+        let (projected, boxed) = submit(Int64Array::from(vec![None::<i64>, None]));
+        let error = projected.encode().unwrap_err();
+        let expected = boxed.encode().unwrap_err();
+        assert_eq!(error.code, "missing-id");
+        assert_eq!(error.context, expected.context);
+    }
 
     fn decimal(coefficient: i128, precision: i32, scale: i32) -> Value {
         Value::Decimal(rtdb_types::DecimalValue::new(coefficient.to_be_bytes().to_vec(), precision, scale, 128).unwrap())
