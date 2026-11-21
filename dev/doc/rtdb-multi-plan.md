@@ -54,6 +54,12 @@ The node and cross-cell connections still use the cell's private network transpo
 Hosting can install its existing deployment authority with `rtdb-multi install --id UUID --name NAME --org ORG`.
 The directory allocates both name and authority conditionally, and an identical retry returns the same deployment.
 This entry point enables linearizable reads on the holder.
+The hosted PgWire client selects `NAME@UUID` with the UUID written as 32 lowercase hexadecimal digits.
+The gateway verifies the installation before initial routing and reconnection. Its startup response confirms the matched identity in `rtdb_installation_id`.
+
+The source directory records the fence epoch and destination before copying a cell transfer. Once the destination has its serving objects and key, it records the arrival and waits for routing to move and for the source to become a tombstone. Its first holder copies the sealed tail onto its logkeepers before accepting writes. Retrying a lost routing response continues that same transfer.
+
+`rtdb-multi delete --id UUID` fences an installation once. Its directory retains the serving disposal receipt once the key has been withdrawn and the serving prefix observed empty. `rtdb-multi disposal --id UUID` reads that receipt. Gateway sessions close when they observe retirement. Retained journals, versioned objects, backups and key copies in other cells require separate evidence for physical erasure.
 
 **Fixed on the way.**
 
