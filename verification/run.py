@@ -661,6 +661,36 @@ def verify_leaf_runs(args, scratch):
         raise ValueError("Lean leaf rank dependency did not compile")
     verify_lean_model(args, scratch, path, "leaf-runs", controls, 7,
                       os.environ | {"LEAN_PATH": str(dependency)})
+    return dependency
+
+
+def verify_trie_sibling_order(args, scratch, dependency):
+    path = Path("verification/lean/TrieSiblingOrder.lean")
+    controls = {
+        "wrong-byte-at-depth": (
+            "(bytes[depth / 4]?).bind",
+            "(bytes[depth / 2]?).bind",
+            ["bucket_at_depth_uses_the_corresponding_byte_lane"],
+        ),
+        "reverse-siblings": (
+            "(bucketOrder : buckets.Pairwise fun first second => first.val < second.val)",
+            "(bucketOrder : buckets.Pairwise fun first second => second.val < first.val)",
+            ["sibling_order_recovers_the_source_run"],
+        ),
+        "drop-first-visited-row": (
+            "    buckets.flatMap rows = source := by",
+            "    (buckets.flatMap rows).tail = source := by",
+            ["sibling_order_recovers_the_source_run"],
+        ),
+    }
+    leaf_runs = Path("verification/lean/LeafRuns.lean")
+    clone_file(leaf_runs, dependency)
+    env = os.environ | {"LEAN_PATH": str(dependency)}
+    built = run_case([args.lean, "-DwarningAsError=true", "-o", "LeafRuns.olean", str(leaf_runs)],
+                     dependency, args.evidence, "lean-trie-sibling-order-leaf-runs", env)
+    if built.returncode:
+        raise ValueError("Lean leaf-run dependency did not compile")
+    verify_lean_model(args, scratch, path, "trie-sibling-order", controls, 7, env)
 
 
 def verify_snapshot_ownership(args, scratch):
@@ -1008,7 +1038,8 @@ def verify_lean(args, scratch):
             verify_memory_admission(args, scratch)
             verify_memory_trie(args, scratch)
             verify_iid_byte_order(args, scratch)
-            verify_leaf_runs(args, scratch)
+            leaf_models = verify_leaf_runs(args, scratch)
+            verify_trie_sibling_order(args, scratch, leaf_models)
             verify_live_row_address(args, scratch)
             verify_snapshot_ownership(args, scratch)
             verify_jvm_trie_pending_logs(args, scratch)

@@ -183,6 +183,17 @@ The native regressions compare one-level and maximum-depth recursive splits of a
 Verus 0.2026.11.05.31e44e6 checked twenty-five functions and rejected thirteen controls, including dropping a child, swapping child slots, appending an incorrect path digit, splitting past maximum depth, and ignoring one-level mode.
 The native run passed 510 tests with `CARGO_PROFILE_TEST_DEBUG=0 cargo test --manifest-path rust/Cargo.toml --locked -p rtdb-trie -p rtdb-format -p rtdb-index -p rtdb-query`. [Production split](../../rust/crates/trie/src/leaf_split_step.rs) · [Native node construction](../../rust/crates/trie/src/memory.rs) · [Verus study](../../verification/verus/iid_partition/area.json)
 
+### Trie sibling traversal order
+
+Lean proves that the base-four path orders IIDs by unsigned byte order and that depth `d` selects byte `d / 4` and lane `d % 4`.
+Verus separately checks that formula in the production Rust selector.
+Under a stable 16-byte IID for every ordinal, rows from an earlier child slot precede all rows from a later child slot in the leaf rank.
+For an ordered source run, if the visited child runs match their prefixes, are individually ordered and preserve each ordinal's count, concatenating them in slot order gives the exact original sequence.
+The count premise includes repeated ordinals.
+This composes at each branch given the ordered child runs, occurrence counts, and common IID interpretation.
+The production traversal and node adapter still need a refinement proof against those premises.
+Lean 4.35.0 audited seven theorems and rejected controls that select the wrong byte at depth, reverse sibling order, or drop the first visited row. [Sibling order proof](../../verification/lean/TrieSiblingOrder.lean) · [Checked Rust digit selector](../../rust/crates/trie/src/partition_step.rs) · [Checked subtree construction](#production-leaf-split)
+
 ### Production leaf merge
 
 The production Rust merge reads both input heads through the IID reader and passes their keys and ordinals to the checked comparator.
