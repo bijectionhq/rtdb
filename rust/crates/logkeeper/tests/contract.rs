@@ -10,6 +10,28 @@ use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_audit_distinguishes_equal_committed_positions_with_different_payloads() {
+    let ensemble = Ensemble::start(2).await;
+    for (server, payload) in [(0, "first"), (1, "different")] {
+        let config = ensemble.config_of(&[server], "split-history");
+        let log = open_writer(config, 1, CancellationToken::new()).await.unwrap();
+        assert_eq!(append(log.as_ref(), payload, 42).await.offset, LogOffset(0));
+    }
+    let stream = ensemble.config("split-history");
+    let report = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let report = rtdb_logkeeper::audit_retained(&stream).await.unwrap();
+            if report.interval.is_some() { break report; }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }).await.unwrap();
+    assert_eq!(report.interval, Some([0, 0]));
+    assert_eq!(report.digests.len(), 2);
+    assert_ne!(report.digests[&stream.servers[0]], report.digests[&stream.servers[1]]);
+    assert!(report.unavailable.is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn offsets_start_at_zero_and_tails_ranges_and_latest_follow_the_committed_tip() {
     let ensemble = Ensemble::start(3).await;
     let log = open_writer(ensemble.config("contract"), 1, CancellationToken::new()).await.unwrap();

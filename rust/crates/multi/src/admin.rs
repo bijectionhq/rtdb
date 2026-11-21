@@ -673,21 +673,33 @@ async fn finish_deletion(storage: &CellStorage, bucket: &dyn rtdb_storage::Objec
 
 /// What auditing a deployment's history found (`NoTwoWritersHaveEffect`, `SystemTimeRises`).
 #[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
-pub struct AuditReport { pub records: usize, pub transactions: usize, pub highest_term: i64, pub violations: Vec<String> }
+pub struct AuditReport {
+    pub records: usize,
+    pub transactions: usize,
+    pub highest_term: i64,
+    pub violations: Vec<String>,
+    #[serde(default)]
+    pub replica_interval: Option<[i64; 2]>,
+    #[serde(default)]
+    pub replica_digests: BTreeMap<String, String>,
+    #[serde(default)]
+    pub unavailable_replicas: BTreeMap<String, String>,
+}
 
-/// Reads a deployment's whole replica stream through its logkeepers, decrypts it, and checks that it is one history: dense positions, terms that never go back, transaction ids, system times and source positions that strictly rise.
+/// Audits the retained replica stream and compares the common committed range on its reachable replicas.
 pub async fn audit(directory: &dyn Directory, keys: &dyn KeyService, name: &str, maximum_message_bytes: usize) -> Result<AuditReport> {
     use rtdb_format::envelope::{ReplicaBody, ReplicaEnvelope};
     let current = record(directory, name).await?;
     let servers = replica_servers(directory, &current).await?;
     let stream = StreamConfig { write_quorum: write_quorum(servers.len()), servers, stream: current.stream("replica"), maximum_message_bytes };
-    let reader = rtdb_logkeeper::open_reader(stream, CancellationToken::new()).await?;
+    let reader = rtdb_logkeeper::open_reader(stream.clone(), CancellationToken::new()).await?;
     let log = crate::logs::SealedLog::new(reader, &keys.key(&current.id)?, &current.stream("replica"))?;
     let latest = log.latest()?.0;
     let mut report = AuditReport::default();
     let (mut next, mut last_tx, mut last_time, mut last_source) = (0i64, i64::MIN, i64::MIN, i64::MIN);
+    let entries_per_batch = ((16 << 20) / maximum_message_bytes.max(1)).clamp(1, 1024) as i64;
     while next <= latest {
-        let records = match log.read_range(rtdb_storage::log::LogOffset(next), rtdb_storage::log::LogOffset((next + 1024).min(latest + 1))).await {
+        let records = match log.read_range(rtdb_storage::log::LogOffset(next), rtdb_storage::log::LogOffset((next + entries_per_batch).min(latest + 1))).await {
             // The stream is trimmed below the last published block: the audit covers what remains.
             Err(rtdb_storage::Error::UnavailableLogRange { first_retained, .. }) if first_retained > next => { next = first_retained; continue; }
             records => records?,
@@ -711,6 +723,15 @@ pub async fn audit(directory: &dyn Directory, keys: &dyn KeyService, name: &str,
             }
         }
     }
+    let retained = rtdb_logkeeper::audit_retained(&stream).await?;
+    let mut digests = retained.digests.values();
+    if let Some(first) = digests.next() && digests.any(|digest| digest != first) {
+        let [from, through] = retained.interval.expect("digests describe an interval");
+        report.violations.push(format!("replicas disagree on committed positions {from} through {through}"));
+    }
+    report.replica_interval = retained.interval;
+    report.replica_digests = retained.digests;
+    report.unavailable_replicas = retained.unavailable;
     Ok(report)
 }
 

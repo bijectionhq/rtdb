@@ -661,6 +661,12 @@ Running alongside every stage from stage 2 onwards, and concluding the branch:
    The successor seals those same servers, recovers the committed entry, and the servers refuse the delayed append before the successor writes at that position.
    This test drives the logkeepers directly.
 3. A hash-chain auditor verifies, offline, that every deployment's history is one chain across epochs.
+   The `audit` command compares a SHA-256 chain over the common committed, retained interval read independently from responding logkeepers.
+   Each link covers the record position, epoch, timestamp and on-disk payload.
+   The report includes the inclusive interval, each replica's digest and unavailable endpoints.
+   It reports a divergence if the digests differ.
+   The retained interval starts above the highest trim point among the responding servers.
+   A durable anchor and offline verification of the discarded prefix remain open.
 4. A staging cell holds ten million deployments (300 bytes each when parked) under Zipf activity.
 
 **Local parked-density measurement**

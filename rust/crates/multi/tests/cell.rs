@@ -917,8 +917,15 @@ async fn a_stream_is_trimmed_below_its_last_published_block_and_still_recovers()
     let client = connect_eventually(&cell, "shop").await;
     assert_eq!(values(&client, "SELECT COUNT(*) FROM orders").await, ["16"], "a new holder recovers from the block and the trimmed tail");
     client.simple_query("INSERT INTO orders (_id, total) VALUES (100, 1)").await.unwrap();
-    let report = admin::audit(cell.directory.as_ref(), &cell.keys(), "shop", 4 << 20).await.unwrap();
+    let report = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let report = admin::audit(cell.directory.as_ref(), &cell.keys(), "shop", 4 << 20).await.unwrap();
+            if report.replica_digests.len() >= 2 { break report; }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }).await.unwrap();
     assert!(report.violations.is_empty(), "{:?}", report.violations);
+    assert!(report.replica_interval.unwrap()[0] > 0);
     drop(client);
     cell.add_node().await;
     cell.stop().await;

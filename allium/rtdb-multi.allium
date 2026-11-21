@@ -1126,6 +1126,19 @@ rule RejectOverQuota {
         Replied(tx, outcome: throttled)
 }
 
+rule AuditRetainedReplicaHistory {
+    when: RetainedHistoryAuditRequested(deployment)
+
+    ensures:
+        let samples = RespondingReplicas(deployment)
+        let interval = CommonCommittedRetainedInterval(samples)
+        if WriteQuorum(samples) and interval != null:
+            let chains = Sha256ChainsForInterval(samples, interval)
+            ReplicaDigestsReported(chains, interval)
+            if DistinctDigests(chains):
+                ReplicaDivergenceReported(deployment, interval)
+}
+
 ------------------------------------------------------------
 -- Rules: optional intake
 --

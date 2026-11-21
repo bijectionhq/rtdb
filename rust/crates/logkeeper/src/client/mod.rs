@@ -1,5 +1,6 @@
 //! The quorum client: a `Log` over a stream replicated on an ensemble of logkeepers.
 
+mod audit;
 mod connection;
 mod ensemble;
 pub(crate) mod recovery;
@@ -20,6 +21,8 @@ use std::sync::atomic::{AtomicI64, AtomicUsize, Ordering};
 use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 use writer::{Tip, Writer};
+
+pub use audit::{RetainedAudit, audit_retained};
 
 /// Matches the read-side charge `LogRecord::retain` requires beyond the payload.
 const RECORD_OVERHEAD_BYTES: usize = 256;
