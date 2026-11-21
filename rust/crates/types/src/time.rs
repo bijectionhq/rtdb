@@ -1,4 +1,4 @@
-use crate::{Anomaly, Iid, Result};
+use crate::{Anomaly, Iid, Result, interval_step};
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -89,12 +89,11 @@ impl Interval {
     pub fn contains(self, time: Timestamp) -> bool { self.lower <= time && time < self.upper }
     pub fn is_point(self) -> bool { self.lower.0.checked_add(1) == Some(self.upper.0) }
     pub fn intersects(self, other: Self) -> bool {
-        !self.is_empty() && !other.is_empty() && self.lower < other.upper && other.lower < self.upper
+        self.intersection(other).is_some()
     }
     pub fn intersection(self, other: Self) -> Option<Self> {
-        let lower = self.lower.max(other.lower);
-        let upper = self.upper.min(other.upper);
-        (lower < upper).then_some(Self { lower, upper })
+        interval_step::intersect((self.lower.0, self.upper.0), (other.lower.0, other.upper.0))
+            .map(|(lower, upper)| Self { lower: Timestamp(lower), upper: Timestamp(upper) })
     }
 }
 

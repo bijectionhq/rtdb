@@ -1,0 +1,61 @@
+{
+  "summary": "Half-open rectangle selection uses a shared interval decision that admits exactly the points held by both input ranges.",
+  "flags": ["--no-external-by-default", "--verify-module", "production", "--verify-module", "laws"],
+  "min_verified_functions": 3,
+  "controls": {
+    "admit_touching_ranges": {
+      "defect": "A zero-width overlap is returned as an intersection.",
+      "mutate": [{
+        "file": "rust/crates/types/src/interval_step.rs",
+        "find": "if upper > lower",
+        "replace": "if upper >= lower"
+      }],
+      "expect": [{
+        "file": "rust/crates/types/src/interval_step.rs",
+        "function": "intersect",
+        "category": "postcondition not satisfied"
+      }],
+      "min_verified_functions": 2
+    },
+    "admit_touching_ranges_with_weakened_contract": {
+      "defect": "Both the implementation and local contract admit an empty overlap.",
+      "mutate": [{
+        "file": "rust/crates/types/src/interval_step.rs",
+        "find": "if upper > lower",
+        "replace": "if upper >= lower"
+      }, {
+        "file": "rust/crates/types/src/interval_step.rs",
+        "find": "if lower < upper",
+        "replace": "if lower <= upper"
+      }],
+      "expect": [{
+        "file": "verification/verus/interval_intersection/laws.rs",
+        "function": "adjacent_validity_ranges_never_intersect",
+        "category": "postcondition not satisfied"
+      }],
+      "min_verified_functions": 2
+    },
+    "use_lesser_lower_endpoint": {
+      "defect": "A result can include points from just one input interval.",
+      "mutate": [{
+        "file": "rust/crates/types/src/interval_step.rs",
+        "find": "let lower = if left.0 > right.0 ",
+        "replace": "let lower = if left.0 < right.0 "
+      }, {
+        "file": "rust/crates/types/src/interval_step.rs",
+        "find": "let lower = if left.0 >= right.0 ",
+        "replace": "let lower = if left.0 <= right.0 "
+      }],
+      "expect": [{
+        "file": "verification/verus/interval_intersection/laws.rs",
+        "function": "adjacent_validity_ranges_never_intersect",
+        "category": "postcondition not satisfied"
+      }, {
+        "file": "verification/verus/interval_intersection/laws.rs",
+        "function": "intersection_preserves_point_membership",
+        "category": "postcondition not satisfied"
+      }],
+      "min_verified_functions": 1
+    }
+  }
+}

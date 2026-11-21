@@ -238,3 +238,6 @@ Controls remove the ceiling update and make its upper edge inclusive.
 The native replay compares the same fixture with the ordinary resolver, its memory-admitted version and the unbounded visibility rectangles.
 The formal argument works with the projected ceiling for one coordinate.
 The correspondence between that projected ceiling and the complete Rust vector split, replacement, and rectangle emission remains open.
+Verus checks the shared interval intersection used by the Rust rectangle selection.
+Its laws preserve point membership on both inputs and exclude zero-width overlaps.
+A pair of controls also weakens the local contract, so accepting empty intersections or choosing the lesser lower endpoint fails the independent law.

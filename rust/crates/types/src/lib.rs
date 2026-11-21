@@ -13,6 +13,7 @@ mod position;
 mod pg;
 mod type_edn;
 mod time;
+mod interval_step;
 mod instant_text;
 mod value;
 mod uri;
