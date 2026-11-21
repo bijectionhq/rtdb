@@ -50,6 +50,13 @@ pub struct CellStoreConfig {
     pub snapshot_block: Option<i64>,
 }
 
+impl CellStoreConfig {
+    fn cache_identity(&self) -> Result<Vec<u8>> {
+        serde_json::to_vec(&(&self.storage, &self.prefix, &self.deployment))
+            .map_err(|error| Anomaly::fault("rtdb.multi/cache-identity", error.to_string()))
+    }
+}
+
 pub struct CellStoreFactory {
     pub directory: Arc<dyn Directory>,
     pub keys: Arc<dyn KeyService>,
@@ -199,6 +206,12 @@ impl RemoteStorageFactory for CellStoreFactory {
         });
         check_root(root.as_ref(), &config.deployment, config.writer_epoch.is_some()).await?;
         Ok(open_cell_store(bucket, &store, root, &record, wall_clock(), recovery).await?)
+    }
+
+    fn cache_identity<'a>(&self, configuration: &'a Any) -> Result<std::borrow::Cow<'a, [u8]>> {
+        let store: CellStoreConfig = serde_json::from_slice(&configuration.value)
+            .map_err(|error| Anomaly::incorrect("rtdb.multi/storage-config", format!("Cell storage configuration is malformed: {error}")))?;
+        Ok(std::borrow::Cow::Owned(store.cache_identity()?))
     }
 
     /// A deployment with a published checkpoint recovers from it without listing its store.
@@ -1007,6 +1020,29 @@ pub async fn reaper_pass(bucket: &dyn ObjectStore, deployments: &[DeploymentReco
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_new_storage_generation_uses_an_independent_cache_identity() {
+        let mut config = CellStoreConfig {
+            storage: crate::deployment::CellStorage::Local { root: PathBuf::from("/cell/objects") },
+            prefix: "acme/deployments/installation/1".into(),
+            deployment: "installation".into(),
+            writer_epoch: Some(8),
+            compactor: false,
+            snapshot_block: None,
+        };
+        let original = config.cache_identity().unwrap();
+        config.writer_epoch = Some(9);
+        assert_eq!(config.cache_identity().unwrap(), original);
+        config.writer_epoch = None;
+        config.compactor = true;
+        assert_eq!(config.cache_identity().unwrap(), original);
+        config.compactor = false;
+        config.snapshot_block = Some(7);
+        assert_eq!(config.cache_identity().unwrap(), original);
+        config.prefix.push_str("/generation-2");
+        assert_ne!(config.cache_identity().unwrap(), original);
+    }
 
     #[tokio::test]
     async fn a_prepared_local_witness_keeps_its_lock_through_admission_and_only_unused_witnesses_are_discarded() {

@@ -1884,6 +1884,34 @@ async fn a_gateway_session_keeps_its_await_token_across_moves_and_replays_a_clea
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_snapshot_and_a_later_holder_reuse_the_same_deployment_disk_cache() {
+    let cell = Cell::start(1, None).await;
+    admin::create_deployment(cell.directory.as_ref(), "shop", "acme", 3).await.unwrap();
+    let node = cell.node(0);
+    let first = cell.connect("shop").await;
+    first.simple_query("INSERT INTO orders (_id, total) VALUES (1, 10)").await.unwrap();
+    node.agent.flush("shop").await.unwrap();
+    assert_eq!(values(&first, "SELECT total FROM orders").await, ["10"]);
+    drop(first);
+
+    let cache = cell.data.path().join("cache-0");
+    let namespaces = || {
+        files_under(&cache).iter().map(|path| path.strip_prefix(&cache).unwrap().components().next().unwrap().as_os_str().to_owned())
+            .filter(|component| component.to_string_lossy().starts_with("~rtdb-store-")).collect::<std::collections::BTreeSet<_>>()
+    };
+    let original = namespaces();
+    assert_eq!(original.len(), 1);
+    node.agent.park("shop").await.unwrap();
+    assert!(matches!(node.agent.snapshot("shop").await.unwrap(), Response::Subscribed { .. }));
+    assert_eq!(namespaces(), original);
+    let next = cell.connect("shop").await;
+    assert_eq!(values(&next, "SELECT total FROM orders").await, ["10"]);
+    assert_eq!(namespaces(), original);
+    drop(next);
+    cell.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_command_that_parses_a_statement_is_resent_whole_after_a_move() {
     let cell = Cell::start(2, None).await;
     admin::create_deployment(cell.directory.as_ref(), "shop", "acme", 3).await.unwrap();

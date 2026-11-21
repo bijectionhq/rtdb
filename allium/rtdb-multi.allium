@@ -2261,7 +2261,9 @@ rule ChargeQuery {
 }
 
 rule EvictFairly {
-    -- One node-wide cache, keyed by object key and byte range.
+    -- One node-wide cache, keyed by storage identity, object key and byte range.
+    -- A writer, replica and snapshot of the same physical deployment reuse its immutable cached data.
+    -- A new storage generation has an independent cache identity.
     -- Each deployment keeps a small reserved floor; above it, eviction takes from the deployment furthest over its weighted share, least recently used first within it.
     when: CacheFull(member)
 
