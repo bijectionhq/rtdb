@@ -4,6 +4,9 @@ The goal is parity or better across the matched pgwire and Flight SQL workloads 
 Track throughput, p50 and p95 latency, and peak memory under matched conditions.
 The results below describe specific builds and workloads.
 
+The packaged RTDB `55277dbf3` met or exceeded XTDB `c84f9334e` on all 110 evaluated throughput, latency and memory medians on Mac mini 2.
+The million-row pgwire ingest median uses four runs per engine, since the two full-run results differed by run order.
+
 ## Baseline
 
 The recovered full benchmark used RTDB `f97d4877f` and XTDB `c84f9334e`, local storage and logs, 4 CPUs and a 4 GiB container limit.
@@ -12,7 +15,7 @@ Flight SQL ran on the same node after the pgwire suite, while the reported memor
 The parity branch starts from RTDB `c67d7a04f`.
 The follow-up runs below use that revision or an explicitly named candidate.
 
-| Workload | 100k, RTDB relative to XTDB | 1M, RTDB relative to XTDB | 1M values, RTDB / XTDB | Status |
+| Workload | 100k, RTDB relative to XTDB | 1M, RTDB relative to XTDB | 1M values, RTDB / XTDB | Status at baseline |
 | --- | ---: | ---: | --- | --- |
 | Flight prepared INSERT | 0.75× | 0.45× | 77.2k / 170.5k rows/s | Open |
 | pgwire batched INSERT | 1.19× | 0.86× | 46.8k / 54.4k rows/s | Open at 1M |
@@ -269,7 +272,38 @@ RTDB led on every reported metric in this cohort.
 | Peak working set during pgwire | 126 [125, 127] MiB | 737 [673, 800] MiB |
 | Peak working set during Flight | 185 [184, 185] MiB | 667 [646, 687] MiB |
 
-The complete million-row pairs are in progress.
+The same build led on all reported million-row metrics except pgwire ingest across the two full pairs.
+Their starting 1-minute host loads were 7.25–12.17.
+
+| Metric | RTDB median [range] | XTDB median [range] |
+| --- | ---: | ---: |
+| pgwire ingest in the full runs | 46.5k [44.5k, 48.5k] rows/s | 56.0k [45.0k, 67.0k] rows/s |
+| Flight prepared INSERT | 125.0k [117.3k, 132.7k] rows/s | 77.7k [42.7k, 112.6k] rows/s |
+| pgwire concurrent INSERT | 1,825 [1,757, 1,893] tx/s | 1,473 [1,289, 1,656] tx/s |
+| Flight concurrent INSERT | 1,429 [1,149, 1,708] tx/s | 922 [867, 977] tx/s |
+| pgwire UPDATE of 10% of orders | 631 [599, 662] ms | 780 [699, 862] ms |
+| Flight full-scan fetch p50 | 2,379 [1,994, 2,764] ms | 3,006 [2,892, 3,120] ms |
+| Flight full-scan fetch p95 | 2,383 [1,998, 2,768] ms | 3,155 [2,982, 3,328] ms |
+| Peak working set during pgwire | 655 [602, 708] MiB | 885 [882, 888] MiB |
+| Peak working set during Flight | 583 [580, 586] MiB | 868 [811, 924] MiB |
+
+Two additional pgwire ingest pairs used the same packaged images, fresh containers, data, batch size, limits and two compaction workers.
+These runs ended after the row-count check, since pgwire ingest was the first operation in the full benchmark.
+RTDB measured 40.7k and 51.1k rows/s, and XTDB measured 34.2k and 42.7k rows/s.
+Pooling the four successful compaction-enabled runs per engine gives **46.5k [40.7k, 51.1k] rows/s for RTDB and 43.9k [34.2k, 67.0k] rows/s for XTDB**.
+RTDB won three of the four pairs, and XTDB recorded the highest individual throughput.
+
+With compaction disabled in a separate diagnostic, median pgwire ingest was 54.2k rows/s for RTDB and 50.3k rows/s for XTDB.
+The server CPU range rose from 15.4–16.7 seconds to 21.2–26.4 seconds for RTDB with compaction enabled, and from 28.9–29.1 to 41.6–48.9 seconds for XTDB.
+Measured cgroup I/O pressure was below 0.13 seconds during ingest in these eight focused runs.
+The parity calculation uses the compaction-enabled runs.
+
+In one fresh million-row Flight diagnostic per engine, both clients checked the row count after ingest and after each scan.
+Over three alternating scans of each kind, median Arrow-table delivery was 497 ms for RTDB and 506 ms for XTDB.
+RTDB returned 977 Arrow batches and XTDB returned 2,048–3,072.
+Fetching Python rows took 2,943 ms for RTDB and 2,985 ms for XTDB, including about three seconds of client CPU time in both cases.
+This quantifies the client materialization cost in the full-scan benchmark.
+Raw run reports and phase samples are under `~/.cache/rtdb-parity-ff72d7394/build/bench-followup` on Mac mini 2.
 
 ### Flight and UPDATE CPU samples
 
