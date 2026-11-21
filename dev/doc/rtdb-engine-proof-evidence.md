@@ -235,4 +235,5 @@ The weakened variants mask data endpoint failure with a healthy control response
 The native cell regression keeps the control endpoint responsive, breaks pgwire, and verifies the same client startup reaches the replacement and reads the committed data.
 A separate native test changes the pgwire address between the probe and publication.
 The TCP probe measures reachability without competing for a pgwire session slot.
+The capacity regression fills the writer's configured session slots and verifies that the controller keeps the writer live.
 Post-connect stalls and gateway-only network splits invisible to the controller fall outside this recovery claim. [Lean proof](../../verification/multi/lean/ServingFailure.lean) · [TLA+ model](../../verification/multi/tla/RTDBServingFailure.tla) · [Verus checks](../../verification/verus/member_probe/area.json) · [Cell tests](../../rust/crates/multi/tests/cell.rs)

@@ -1865,6 +1865,30 @@ async fn the_controller_confirms_a_silent_node_dead_before_its_lease_runs_out() 
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn saturated_pgwire_sessions_do_not_make_the_controller_depose_a_writer() {
+    let cell = Cell::start(1, None).await;
+    admin::create_deployment(cell.directory.as_ref(), "shop", "acme", 3).await.unwrap();
+    let client = cell.connect("shop").await;
+    client.simple_query("INSERT INTO orders (_id, total) VALUES (1, 10)").await.unwrap();
+
+    let address = cell.node(0).pgwire_address.to_string();
+    let mut sessions = vec![client];
+    tokio::time::timeout(Duration::from_secs(15), async {
+        for _ in 1..common::pgwire_connections() { sessions.push(common::connect(&address, "shop").await); }
+    }).await.unwrap();
+
+    let options = admin::ControllerOptions { control: common::control(), ..Default::default() };
+    let mut failures = BTreeMap::new();
+    for _ in 0..options.suspicion_probes {
+        assert_eq!(admin::confirm_suspicions(cell.directory.as_ref(), &mut failures, &options).await.unwrap(), 0);
+    }
+    assert!(failures.is_empty());
+    assert_eq!(values(&sessions[0], "SELECT total FROM orders").await, ["10"]);
+    drop(sessions);
+    cell.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn pgwire_only_failure_promotes_a_writer_and_unblocks_gateway_startup() {
     use rtdb_directory::{Cas, MemberState};
     use rtdb_multi::control::{self, Handler, Request, Response};
