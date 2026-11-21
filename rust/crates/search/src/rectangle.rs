@@ -19,3 +19,10 @@ pub(crate) fn merge_adjacent_valid_time(left: [i64; 4], right: [i64; 4]) -> Opti
         None
     }
 }
+
+#[cfg_attr(verus_keep_ghost, verus_spec(out =>
+    ensures out == (system_start < event_system && (erase || event_system < system_end)),
+))]
+pub(crate) fn can_shadow(system_start: i64, system_end: i64, event_system: i64, erase: bool) -> bool {
+    system_start < event_system && (erase || event_system < system_end)
+}

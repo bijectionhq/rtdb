@@ -1,7 +1,7 @@
 {
   "summary": "RTDB's production valid-time rectangle merge retains the system-time origin and preserves pointwise membership under the declared one-event cut.",
   "flags": ["--no-external-by-default", "--verify-module", "production", "--verify-module", "laws"],
-  "min_verified_functions": 3,
+  "min_verified_functions": 5,
   "controls": {
     "merge_across_system_origins": {
       "defect": "The merge accepts a right rectangle with a different system-time origin.",
@@ -15,7 +15,7 @@
         "function": "merge_adjacent_valid_time",
         "category": "postcondition not satisfied"
       }],
-      "min_verified_functions": 2
+      "min_verified_functions": 4
     },
     "merge_across_system_origins_with_weakened_contract": {
       "defect": "Both the implementation and the local contract allow merging different system-time origins.",
@@ -37,7 +37,21 @@
         "function": "merge_preserves_visibility_after_a_cut",
         "category": "postcondition not satisfied"
       }],
-      "min_verified_functions": 1
+      "min_verified_functions": 3
+    },
+    "expire_erasure_at_rectangle_end": {
+      "defect": "ERASE only affects rectangles that were still open when it ran.",
+      "mutate": [{
+        "file": "rust/crates/search/src/rectangle.rs",
+        "find": "system_start < event_system && (erase || event_system < system_end)\n}",
+        "replace": "system_start < event_system && event_system < system_end\n}"
+      }],
+      "expect": [{
+        "file": "rust/crates/search/src/rectangle.rs",
+        "function": "can_shadow",
+        "category": "postcondition not satisfied"
+      }],
+      "min_verified_functions": 4
     }
   }
 }

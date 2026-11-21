@@ -67,8 +67,8 @@ impl ScanAccelerator for SearchAccelerator {
             let ranked = scan.columns.iter().find(|field| field.id == top_k.column).is_some_and(|field| field.name == column);
             if ranked { if let Some(candidates) = self.top_k(request, top_k, column, &query, &definition).await? { return Ok(Some(candidates)); } }
         }
-        let TrieFiles::Complete(Found { files, skipped }) = self.trie_files(request, &definition).await? else { return Ok(None) };
-        let cutter = Cutter::new(&files, &skipped, request, &self.runtime);
+        let TrieFiles::Complete(files) = self.trie_files(request, &definition).await? else { return Ok(None) };
+        let cutter = Cutter::new(&files, request, &self.runtime);
         let Some(mut candidates) = file_candidates(&cutter, column, &query, self.max_candidates)? else { return Ok(None) };
         candidates.extend(self.live_candidates(request, column, &query)?);
         Ok((candidates.len() <= self.max_candidates).then_some(candidates))
@@ -76,7 +76,7 @@ impl ScanAccelerator for SearchAccelerator {
 
     async fn match_answers(&self, request: &ScanRequest<'_>, column: &str, query: &str) -> Result<Option<MatchAnswers>> {
         let Some(definition) = self.definition(request, column).await? else { return Ok(None) };
-        let files = match self.trie_files(request, &definition).await? { TrieFiles::Complete(found) | TrieFiles::Recorded(found) => found.files };
+        let files = match self.trie_files(request, &definition).await? { TrieFiles::Complete(files) | TrieFiles::Recorded(files) => files };
         let query = Query::parse(query);
         let mut answers = MatchAnswers::default();
         for trie in files { answers.insert(&trie.data, Arc::new(self.runtime.match_set(request.database, &trie, column, &query)?.member(trie.member)?)); }
@@ -85,34 +85,25 @@ impl ScanAccelerator for SearchAccelerator {
 }
 
 /// A partition's search files: one for every live trie, or only the recorded ones where building the rest would exceed max_unindexed_bytes.
-enum TrieFiles { Complete(Found), Recorded(Found) }
-
-/// A partition's search files, and the recorded tries left unopened because no lifespan section of theirs meets the bounds.
-struct Found { files: Vec<TrieFile>, skipped: Vec<rtdb_format::keys::TrieKey> }
-
-/// Whether the scan's other sources leave a file's document visible in the query's bounds, and whether that is exact.
-enum Judged { Hidden, Visible { exact: bool } }
+enum TrieFiles { Complete(Vec<TrieFile>), Recorded(Vec<TrieFile>) }
 
 /// Cuts a file's documents by the events of the same entity in the partition's other tries and its live segments (fts.allium: CutByLaterEvents).
-/// A trie left unopened may still hold an event that cuts, a delete say, so a document whose entity it covers is no longer exact.
-struct Cutter<'a> { files: &'a [TrieFile], skipped: &'a [rtdb_format::keys::TrieKey], segments: Vec<&'a Arc<rtdb_index::LiveTable>>, runtime: &'a crate::SearchRuntime, database: &'a str, bounds: TemporalBounds }
+struct Cutter<'a> { files: &'a [TrieFile], segments: Vec<&'a Arc<rtdb_index::LiveTable>>, runtime: &'a crate::SearchRuntime, database: &'a str, bounds: TemporalBounds }
 
 impl<'a> Cutter<'a> {
-    fn new(files: &'a [TrieFile], skipped: &'a [rtdb_format::keys::TrieKey], request: &'a ScanRequest<'_>, runtime: &'a crate::SearchRuntime) -> Self {
-        Self { files, skipped, segments: request.snapshot.iter_segments(&request.scan.table.name.table).collect(), runtime, database: request.database, bounds: request.bounds }
+    fn new(files: &'a [TrieFile], request: &'a ScanRequest<'_>, runtime: &'a crate::SearchRuntime) -> Self {
+        Self { files, segments: request.snapshot.iter_segments(&request.scan.table.name.table).collect(), runtime, database: request.database, bounds: request.bounds }
     }
 
-    fn judge(&self, own: usize, doc: crate::DocMatch) -> Result<Judged> {
+    fn may_match(&self, own: usize, doc: crate::DocMatch) -> Result<bool> {
         let own = &self.files[own];
         let mut rectangles: Vec<[i64; 4]> = own.file.rectangles(doc.doc).collect();
-        let mut tied = false;
         for other in self.files {
             if other.identity == own.identity || !covers(other.trie.part(), &doc.iid) { continue; }
-            tied |= cut(&mut rectangles, other.file.events(&doc.iid)?);
+            cut(&mut rectangles, other.file.events(&doc.iid)?);
         }
-        for segment in &self.segments { tied |= cut(&mut rectangles, self.runtime.live_events(self.database, segment, &doc.iid)?); }
-        if !rectangles.iter().any(|rectangle| crate::file::meets(*rectangle, self.bounds)) { return Ok(Judged::Hidden); }
-        Ok(Judged::Visible { exact: !tied && !self.skipped.iter().any(|trie| covers(trie.part(), &doc.iid)) })
+        for segment in &self.segments { cut(&mut rectangles, self.runtime.live_events(self.database, segment, &doc.iid)?); }
+        Ok(rectangles.iter().any(|rectangle| crate::file::meets(*rectangle, self.bounds)))
     }
 }
 
@@ -121,18 +112,20 @@ fn covers(part: &[u8], iid: &[u8; 16]) -> bool {
     part.iter().enumerate().all(|(depth, digit)| (iid[depth / 4] >> (6 - 2 * (depth % 4))) & 3 == *digit)
 }
 
-/// Removes from rectangles what another source's events of the entity take from them, and returns whether any event shared a rectangle's system-from.
+/// Removes from rectangles what another source's events of the entity take from them.
 /// A later put or delete over a valid interval takes that interval from its system time on; a later erase takes everything; an earlier event takes nothing.
-/// An event at the same instant takes nothing either: the scan orders such events itself, so the document is left, and marked inexact.
-fn cut(rectangles: &mut Vec<[i64; 4]>, events: Vec<crate::file::KeyedEvent>) -> bool {
-    let mut tied = false;
+/// The scan decides the precedence of same-time events.
+fn cut(rectangles: &mut Vec<[i64; 4]>, events: Vec<crate::file::KeyedEvent>) {
     for event in events {
         let mut kept = Vec::with_capacity(rectangles.len());
         for rectangle in rectangles.drain(..) {
             let [valid_from, valid_to, system_from, system_to] = rectangle;
-            tied |= event.system_from == system_from;
-            if event.system_from <= system_from || event.system_from >= system_to { kept.push(rectangle); continue; }
-            if event.op == rtdb_types::EventOp::Erase { continue; }
+            let erase = event.op == rtdb_types::EventOp::Erase;
+            if !crate::rectangle::can_shadow(system_from, system_to, event.system_from, erase) {
+                kept.push(rectangle);
+                continue;
+            }
+            if erase { continue; }
             let (cut_from, cut_to) = (event.valid_from.max(valid_from), event.valid_to.min(valid_to));
             if cut_from >= cut_to { kept.push(rectangle); continue; }
             if valid_from < cut_from { kept.push([valid_from, cut_from, system_from, system_to]); }
@@ -141,7 +134,6 @@ fn cut(rectangles: &mut Vec<[i64; 4]>, events: Vec<crate::file::KeyedEvent>) -> 
         }
         *rectangles = kept;
     }
-    tied
 }
 
 impl SearchAccelerator {
@@ -182,9 +174,8 @@ impl SearchAccelerator {
     /// With `prune`, a recorded trie whose record's lifespan sections all miss the bounds is left unopened.
     async fn trie_files_in(&self, request: &ScanRequest<'_>, snapshot: &Snapshot, definition: &SearchDefinition, bounds: TemporalBounds, limit: Option<i64>, prune: bool) -> Result<TrieFiles> {
         let table = &request.scan.table.name.table;
-        let Some(entry) = snapshot.table_entry(table) else { return Ok(TrieFiles::Complete(Found { files: Vec::new(), skipped: Vec::new() })) };
+        let Some(entry) = snapshot.table_entry(table) else { return Ok(TrieFiles::Complete(Vec::new())) };
         let artefact_id = definition.artefact_id();
-        let mut skipped = Vec::new();
         let mut files = Vec::new();
         let mut opened: BTreeMap<ObjectKey, Option<Arc<SearchFile>>> = BTreeMap::new();
         let mut unbuilt = Vec::new();
@@ -194,7 +185,7 @@ impl SearchAccelerator {
         let visible = |trie: &&rtdb_index::CatalogTrie| trie.key.recency().is_none_or(|date| date.epoch_day().saturating_mul(86_400_000_000) > earliest);
         for trie in snapshot.trie_catalog().current_tries(table).into_iter().filter(|trie| trie.state == TrieState::Live).filter(visible) {
             let sections = trie.artefact(KIND, &artefact_id, definition.version).and_then(|record| record.stats.as_deref()).and_then(crate::file::decode_sections);
-            if prune && sections.is_some_and(|sections| !sections.iter().any(|section| section.meets(bounds))) { skipped.push(trie.key.clone()); continue; }
+            if prune && sections.is_some_and(|sections| !sections.iter().any(|section| section.meets(bounds))) { continue; }
             let data = ObjectKey::new(entry.slug.data_key(&trie.key))?;
             if let Some(recorded) = Self::recorded_key(snapshot, table, trie, definition)? {
                 let file = match opened.get(&recorded.key) {
@@ -215,9 +206,9 @@ impl SearchAccelerator {
             if !by_policy { unindexed = unindexed.saturating_add(trie.data_file_size); }
             unbuilt.push((trie.key.clone(), data));
         }
-        if limit.is_some_and(|limit| unindexed > limit) { return Ok(TrieFiles::Recorded(Found { files, skipped })); }
+        if limit.is_some_and(|limit| unindexed > limit) { return Ok(TrieFiles::Recorded(files)); }
         for (trie, data) in unbuilt { files.push(self.runtime.built(request.database, request.storage, &trie, &data, &definition.columns, request.memory, request.cancellation).await?); }
-        Ok(TrieFiles::Complete(Found { files, skipped }))
+        Ok(TrieFiles::Complete(files))
     }
 
     /// Registers the column's corpus at the snapshot's instant, from every partition's search files for the tries visible then and its live segments, once a query.
@@ -233,7 +224,7 @@ impl SearchAccelerator {
         let mut segments = Vec::new();
         for snapshot in request.partitions {
             // A corpus resolves entities across every source, so no trie is left out by its sections.
-            match self.trie_files_in(request, snapshot, definition, point, None, false).await? { TrieFiles::Complete(found) | TrieFiles::Recorded(found) => files.extend(found.files) }
+            match self.trie_files_in(request, snapshot, definition, point, None, false).await? { TrieFiles::Complete(found) | TrieFiles::Recorded(found) => files.extend(found) }
             segments.extend(snapshot.iter_segments(table).cloned());
         }
         request.corpora.register(name, Arc::new(TableCorpus { runtime: Arc::clone(&self.runtime), database: request.database.to_string(), files: parking_lot::Mutex::new(Some(files)), computed: std::sync::OnceLock::new(), segments, column: column.to_string(), at }));
@@ -279,7 +270,7 @@ fn file_candidates(cutter: &Cutter<'_>, column: &str, query: &Query, max_candida
     for selected in by_file(cutter.files) {
         for doc in selected.file.matches(column, query, cutter.bounds)? {
             let Some(&own) = selected.members.get(&doc.member) else { continue };
-            if !matches!(cutter.judge(own, doc)?, Judged::Hidden) { candidates.insert(Iid(doc.iid)); }
+            if cutter.may_match(own, doc)? { candidates.insert(Iid(doc.iid)); }
         }
         if candidates.len() > max_candidates { return Ok(None); }
     }
@@ -289,8 +280,8 @@ fn file_candidates(cutter: &Cutter<'_>, column: &str, query: &Query, max_candida
 /// A row's ranking key: its score, then its IID, so that ties sort deterministically.
 fn descending(left: &(f64, Iid), right: &(f64, Iid)) -> std::cmp::Ordering { right.0.total_cmp(&left.0).then_with(|| left.1.cmp(&right.1)) }
 
-/// A scored event waiting to be handed out, best score first, and whether its visibility is exact.
-struct Pending(f64, Iid, bool);
+/// A scored event waiting to be handed out, best score first.
+struct Pending(f64, Iid);
 impl PartialEq for Pending { fn eq(&self, other: &Self) -> bool { self.cmp(other).is_eq() } }
 impl Eq for Pending {}
 impl PartialOrd for Pending { fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> { Some(self.cmp(other)) } }
@@ -301,7 +292,7 @@ impl Ord for Pending { fn cmp(&self, other: &Self) -> std::cmp::Ordering { desce
 struct Candidates<'a> { files: Vec<(BTreeMap<u32, usize>, crate::file::Ranked)>, cutter: Cutter<'a>, pending: std::collections::BinaryHeap<Pending>, seen: BTreeSet<Iid>, scored: usize }
 
 impl Candidates<'_> {
-    fn push(&mut self, iid: Iid, score: f64, exact: bool) { self.scored += 1; self.pending.push(Pending(score, iid, exact)); }
+    fn push(&mut self, iid: Iid, score: f64) { self.scored += 1; self.pending.push(Pending(score, iid)); }
     fn drop_seen(&mut self) { while self.pending.peek().is_some_and(|top| self.seen.contains(&top.1)) { self.pending.pop(); } }
     /// The file whose next windows may hold the best event not yet scored.
     fn best_file(&self) -> Option<(usize, f64)> {
@@ -313,21 +304,21 @@ impl Candidates<'_> {
         let pending = self.pending.peek().map_or(f64::NEG_INFINITY, |top| top.0);
         self.best_file().map_or(pending, |(_, bound)| bound.max(pending))
     }
-    /// The next IID, best first, with its best event's score and whether that event is exactly visible.
-    fn next(&mut self) -> Result<Option<(f64, Iid, bool)>> {
+    /// The next IID, ordered by its best event's score.
+    fn next(&mut self) -> Result<Option<Iid>> {
         loop {
             self.drop_seen();
             match (self.pending.peek().map(|top| top.0), self.best_file()) {
                 (pending, Some((index, bound))) if pending.is_none_or(|score| bound > score) => {
                     for (doc, score) in self.files[index].1.expand()? {
                         let Some(&own) = self.files[index].0.get(&doc.member) else { continue };
-                        match self.cutter.judge(own, doc)? { Judged::Hidden => {}, Judged::Visible { exact } => self.push(Iid(doc.iid), score, exact) }
+                        if self.cutter.may_match(own, doc)? { self.push(Iid(doc.iid), score); }
                     }
                 }
                 _ => {
-                    let Some(Pending(score, iid, exact)) = self.pending.pop() else { return Ok(None) };
+                    let Some(Pending(_, iid)) = self.pending.pop() else { return Ok(None) };
                     self.seen.insert(iid);
-                    return Ok(Some((score, iid, exact)));
+                    return Ok(Some(iid));
                 }
             }
         }
@@ -345,19 +336,13 @@ impl SearchAccelerator {
         };
         let Ok(limit) = usize::try_from(limit) else { return Ok(None) };
         if limit == 0 { return Ok(Some(BTreeSet::new())); }
-        let TrieFiles::Complete(Found { files, skipped }) = self.trie_files(request, definition).await? else { return Ok(None) };
+        let TrieFiles::Complete(files) = self.trie_files(request, definition).await? else { return Ok(None) };
         let scoring = Query::parse(&text);
         let corpus = rtdb_expr::CorpusLookup::corpus(request.corpora, &text);
         let ranked = by_file(&files).map(|selected| {
             Ok((selected.members, selected.file.ranked(column, matching, &scoring, corpus.as_ref(), request.bounds)?))
         }).collect::<Result<Vec<_>>>()?;
-        let mut candidates = Candidates { files: ranked, cutter: Cutter::new(&files, &skipped, request, &self.runtime), pending: std::collections::BinaryHeap::new(), seen: BTreeSet::new(), scored: 0 };
-        // The scan resolves exactly what the index decides only when MATCH is all it filters by; any other predicate is the verifier's to apply.
-        let trusted = request.scan.predicates.iter().all(|predicate| match predicate {
-            Expr::Column { id, .. } => request.scan.matches.iter().any(|evaluated| evaluated.id == *id),
-            Expr::Call { name, .. } => name.eq_ignore_ascii_case("match"),
-            _ => false,
-        });
+        let mut candidates = Candidates { files: ranked, cutter: Cutter::new(&files, request, &self.runtime), pending: std::collections::BinaryHeap::new(), seen: BTreeSet::new(), scored: 0 };
         for segment in request.snapshot.iter_segments(&request.scan.table.name.table) {
             for row in self.runtime.live_rows(request.database, segment, column, matching)? {
                 let event = segment.row(row)?.event()?;
@@ -365,7 +350,7 @@ impl SearchAccelerator {
                 let StoredOperation::Put(document) = &event.operation else { continue };
                 let Some(Value::Utf8(value)) = document.get(column) else { continue };
                 let tokens = rtdb_text::tokens(value);
-                if matching.matches(&tokens) { candidates.push(event.iid, rtdb_text::bm25(&scoring, &tokens, corpus.as_ref()), false); }
+                if matching.matches(&tokens) { candidates.push(event.iid, rtdb_text::bm25(&scoring, &tokens, corpus.as_ref())); }
             }
         }
         let mut verified: Vec<(f64, Iid)> = Vec::new();
@@ -379,10 +364,9 @@ impl SearchAccelerator {
             let mut iids = BTreeSet::new();
             let mut handed = 0;
             while handed < batch {
-                let Some((score, iid, exact)) = candidates.next()? else { break };
+                let Some(iid) = candidates.next()? else { break };
                 handed += 1;
-                // An exactly visible event's row is in the scan's output with its score, so it needs no verifying.
-                if exact && trusted { verified.push((score, iid)); } else { iids.insert(iid); }
+                if request.scan.iids.as_ref().is_none_or(|scope| scope.contains(&iid)) { iids.insert(iid); }
             }
             if candidates.scored > self.max_candidates { return Ok(None); }
             if handed == 0 { break; }
@@ -444,7 +428,7 @@ mod tests {
         let bounds = at(0, 0);
         let query = Query::parse("overdue");
         let files = [trie(1)];
-        let cutter = Cutter { files: &files, skipped: &[], segments: Vec::new(), runtime: &runtime, database: "xtdb", bounds };
+        let cutter = Cutter { files: &files, segments: Vec::new(), runtime: &runtime, database: "xtdb", bounds };
         let iids = file_candidates(&cutter, "body", &query, 1).unwrap().unwrap();
         assert_eq!(iids, BTreeSet::from([Iid([64; 16])]));
         assert_eq!(by_file(&[trie(0), trie(1)]).count(), 1);
@@ -454,7 +438,7 @@ mod tests {
             files: vec![(BTreeMap::from([(1, 0)]), ranked)], cutter,
             pending: Default::default(), seen: BTreeSet::new(), scored: 0,
         };
-        assert_eq!(candidates.next().unwrap().map(|(_, iid, exact)| (iid, exact)), Some((Iid([64; 16]), true)));
+        assert_eq!(candidates.next().unwrap(), Some(Iid([64; 16])));
         assert!(candidates.next().unwrap().is_none());
 
         let terms = Query::parse("overdue invoice");
@@ -506,7 +490,7 @@ mod tests {
         let query = Query::parse("apple");
         for (system, expected) in [(15, true), (25, false), (35, true)] {
             let cutter = Cutter {
-                files: &files, skipped: &[], segments: Vec::new(), runtime: &runtime,
+                files: &files, segments: Vec::new(), runtime: &runtime,
                 database: "xtdb", bounds: at(5, system),
             };
             let candidates = file_candidates(&cutter, "body", &query, 1).unwrap().unwrap();
@@ -519,19 +503,18 @@ mod tests {
         use rtdb_types::EventOp::{Delete, Erase, Put};
         let whole = [0, 100, 10, i64::MAX];
         let mut rectangles = vec![whole];
-        assert!(!cut(&mut rectangles, vec![event(20, 30, 60, Put)]));
+        cut(&mut rectangles, vec![event(20, 30, 60, Put)]);
         rectangles.sort_unstable();
         assert_eq!(rectangles, [[0, 30, 10, i64::MAX], [30, 60, 10, 20], [60, 100, 10, i64::MAX]]);
         let mut rectangles = vec![whole];
         cut(&mut rectangles, vec![event(5, 0, 100, Put), event(10, 0, 100, Delete)]);
         assert_eq!(rectangles, [whole], "an earlier event, or one at the same instant, takes nothing");
-        assert!(cut(&mut vec![whole], vec![event(10, 0, 100, Put)]), "the same instant is a tie the scan breaks");
         let mut rectangles = vec![whole];
         cut(&mut rectangles, vec![event(40, 50, 50, Delete)]);
         assert_eq!(rectangles, [whole], "an empty valid interval takes nothing");
         let mut rectangles = vec![whole, [0, 5, 1, 3]];
         cut(&mut rectangles, vec![event(30, 0, 1, Erase)]);
-        assert_eq!(rectangles, [[0, 5, 1, 3]], "an erase takes every rectangle it is later than");
+        assert!(rectangles.is_empty());
     }
 
     #[test]

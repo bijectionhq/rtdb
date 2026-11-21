@@ -221,8 +221,7 @@ rule RepairUnreadableSearchFile {
 --      Events in live segments are scored from their rows.
 --      A search file's documents are scored a batch of windows at a time, best window bound first, and a window is scored only once its bound may exceed every event already scored.
 --   2. IIDs are taken best bound first, in batches.
---      A document left exactly visible by CutByLaterEvents is a row of the scan's output with its score, so where MATCH is all the scan filters by it counts as verified.
---      The rest, live rows, documents a tie left inexact, and every IID where the scan has other predicates, are verified by running the scan itself over the partition restricted to them, with its own predicates.
+--      Every IID counted toward the cutoff is verified by running the scan itself over the partition restricted to those IIDs, using the scan's own predicates and restrictions and evaluating MATCH on the resolved values.
 --   3. Verification stops once n verified rows score strictly above every bound not yet taken, every unscored window's included.
 --   4. The scan is restricted to the IIDs of verified rows scoring at least the n-th, ties included, and the sort above keeps the first n as it would have.
 --
@@ -249,9 +248,10 @@ rule CorpusAsOfTheSnapshot {
 rule CutByLaterEvents {
     -- A document's rectangles come from its own file's events; an event of the same entity elsewhere in the partition, in a selected trie or live segment, cuts them.
     -- A put or delete whose system-from is later than a rectangle's takes the event's valid interval from that system time on; an erase later than it takes the whole rectangle; an earlier event takes nothing.
-    -- An event at the same instant takes nothing: the scan orders such events itself, so the document stays a candidate and is no longer exact.
-    -- The tries cut by are those step 1 keeps, each found for the entity by its IID path and its file's key table, and the live segments by their kept keys; a trie step 1 leaves out holds no cut the query can see.
-    -- A document is exactly visible where a rectangle it keeps meets the bounds, no tie touched it, and no trie left unopened by its sections covers its entity: such a trie may hold a cut, a delete say.
+    -- A strictly later erase takes a rectangle even when the rectangle's system interval has already ended.
+    -- An event at the same instant takes nothing because the scan applies same-time precedence.
+    -- The cuts use the selected files and live segments, using each file's IID path and key table.
+    -- The resulting documents nominate candidates for the scan to resolve.
     when: ScanWithMatch(scan, predicate)
 
     ensures:

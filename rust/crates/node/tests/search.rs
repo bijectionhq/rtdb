@@ -373,6 +373,36 @@ async fn live_rows_written_between_queries_are_found_as_the_live_index_grows() {
 }
 
 #[tokio::test]
+async fn a_ranked_cutoff_counts_only_rows_that_pass_every_match() {
+    let mut options = options();
+    options.file_size_target = 1;
+    options.automatic_artefacts = false;
+    let (node, driver) = Node::open(options, services()).await.unwrap();
+    let driver = tokio::spawn(driver.run());
+    let mut session = node.session("xtdb", Arc::new(Authority)).unwrap();
+    let operations = vec![
+        sql("CREATE SEARCH INDEX docs_headline ON docs (headline)"),
+        sql("INSERT INTO docs RECORDS {_id: 1, headline: 'invoice priority', status: 'unpaid'}"),
+        sql("INSERT INTO docs RECORDS {_id: 2, headline: 'invoice standard', status: 'paid'}"),
+    ];
+    for operation in operations {
+        assert!(session.state_mut().execute_tx(vec![operation], AutonomousTxOptions::default()).await.unwrap().committed());
+    }
+    let database = node.catalog().database("xtdb").unwrap();
+    database.flush().await.unwrap();
+    node.sync_all(Duration::from_secs(10), &tokio_util::sync::CancellationToken::new()).await.unwrap();
+    database.compaction().unwrap().compact_all().await.unwrap();
+    database.build_artefacts().await.unwrap();
+    let sql = "SELECT _id FROM docs WHERE MATCH(headline, 'invoice') AND MATCH(status, 'paid') ORDER BY SEARCH_SCORE(headline, 'priority') DESC, _id";
+    let all = ids(rows(session.query_sql(sql, vec![]).await.unwrap()).await);
+    let top = ids(rows(session.query_sql(&format!("{sql} LIMIT 1"), vec![]).await.unwrap()).await);
+    assert_eq!(all, [2]);
+    assert_eq!(top, all);
+    node.shutdown();
+    tokio::time::timeout(Duration::from_secs(10), driver).await.unwrap().unwrap().unwrap();
+}
+
+#[tokio::test]
 async fn a_ranked_limit_returns_the_same_rows_as_ranking_everything_and_keeping_the_first() {
     let mut options = options();
     options.file_size_target = 1;
