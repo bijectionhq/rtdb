@@ -117,13 +117,18 @@ It also exercises the Azure adapter against a loopback provider and separately m
 * `tla/LeaseAdmission.tla` compares validated expiring leases and coordinated pins against age-only collection and stale-follower admission.
 * `tla/ReaderIO.tla` separates admission and in-flight I/O, with controls for clock error, expiry, overrun, release, and authority change.
   `lean/ReaderRetention.lean` proves strict lease timing and preservation of an abstract counted pin, with matching expiry and close controls.
+* `tla/CompactionGroup.tla` checks durable, complete sibling publication for one replacement.
+  `tla/CompactionOverlap.tla` compares exact sibling membership with a high-water mark across two interleaved generations.
+  The Rust catalog regression checks the corresponding admission behavior.
 * `alloy/Reclamation.als` independently checks the structural last-reference rule over a finite scope, including one deliberately faulty collector.
 * `smt/rank-bound.smt2` checks the exact-real inequalities behind the binary64 score bound under the normal-rounding model and its two negative controls.
   `smt/rank-witness.smt2` checks the concrete counterexample with exact binary64 operations.
   The Lean frontier proof assumes coverage by pending scores or unread windows.
 * `verus/` checks the exact Rust functions called by the search builder, temporal resolvers, half-open interval operations and replica fence.
   The ceiling area checks the in-place vector transitions and window clipping while the interval area checks per-fragment admission.
-  The temporal event and allocation shell, storage adapters and full search equivalence need separate refinement and replay evidence.
+  The catalog reclamation area checks the latest-block rule and the last-held-sibling predicate.
+  The IID partition area checks the base-four digit computation shared by trie and compaction code.
+  The temporal event and allocation shell, storage adapters, the reader protection protocol, and full search equivalence need separate refinement and replay evidence.
 
 The run ledger identifies tool identities, positive cases, bounded negative traces and unresolved obligations.
 

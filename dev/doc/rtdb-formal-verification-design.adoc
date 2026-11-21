@@ -1029,14 +1029,15 @@ The seeded trace agreed with both native resolvers and unbounded visibility on 4
 |Complete end-to-end contracts for event order, resource and visitor shells, and observable range decomposition.
 
 |Exact Rust decisions
-|At source revision `7a1937642`, the combined runner reported 43 verified Verus obligations across five areas and rejected all 18 associated controls.
-Compiler checks rejected forging and raw use of the replica admission witness.
-|Extend coverage from the included functions to their effect paths and remaining compaction, retention and ranked pipeline decisions.
+|The runner checks temporal and interval decisions, replica admission, one-event search visibility, catalog reclamation, and base-four IID bucketing in exact production source.
+Compiler controls reject forging and raw use of the replica admission witness.
+Each of the two new storage and compaction areas includes production-only and joint contract mutations.
+|Extend coverage from these functions to their effect paths, concurrent publication, reader protection, and ranked pipeline decisions.
 
 |Concurrent design models
-|The combined run at that revision passed 11 bounded TLC configurations and observed counterexamples in all 18 weakened configurations.
+|TLC covers bounded writer admission, query capture, resolution, recovery, cache, reader I/O, and compaction publication variants.
 The ledger gives per-model state counts and scopes, plus bounded Apalache, Alloy, and Maude results.
-|Account for multi-generation reader and recovery overlap, admitted I/O, production synchronization, and the chosen liveness assumptions.
+|Connect multi-generation reader and recovery overlap and the modeled in-flight I/O transitions to production synchronization and the chosen liveness assumptions.
 
 |Ranking
 |Lean covers the abstract frontier condition.
@@ -1053,7 +1054,14 @@ Establish supported remote configurations and any eventual retry and staging cle
 |The bounded lease and pin designs pass their recorded finite instances.
 The weakened alternatives yield model counterexamples.
 The native diagnostic reproduced the failure under explicit eligible collection.
+Verus proved the latest-block and shared-sibling catalog decisions.
 |Choose the user-facing policy, establish its production storage boundary, and replay the resulting protection and collection paths.
+
+|Compaction
+|The exact-generation catalog guard addresses a Rust regression found by the two-generation TLC model.
+Verus checks the base-four bucket selection shared by default trie reads and compaction output partitioning.
+|Prove that each accepted piece represents precisely the input coverage and that the merged bitemporal events refine the original history.
+Include retry, restart, overlapping jobs, metadata depth and clipping, and every route to publication.
 |===
 
 The verification effort is active.
