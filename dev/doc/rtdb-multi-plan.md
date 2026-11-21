@@ -781,6 +781,9 @@ Deletion must be provable and forks must be cheap (spec rules `Fork`, `ForkAcros
    S3 deletion also waits 15 minutes and one second from fencing to cover credentials issued before lease tracking was enabled.
    Source-cell cleanup on S3 waits until the same interval has passed since cutover as well as for the configured reaper grace and any recorded write lease.
    Ordinary garbage collection skips a deployment once its lifecycle reaches `deleting`.
+   On a shared local volume, forks, cell moves, deletion and a reaper pass take the same advisory file lock before reading the inventory and mutating it.
+   A conflicting administrative command returns a retryable busy error, and the reaper retries on its next pass.
+   Use the same configured local volume and upgraded processes for every administrative writer in the cell.
    After verifying the inventory and destroying the local key, it signs a receipt with the key service's Ed25519 signing key and stores it with the tombstone in one directory CAS.
    Retrying a completed deletion returns the stored receipt.
    Export the trusted public key with `rtdb-multi deletion-key --keys PATH` and verify the JSON from `delete` with `rtdb-multi verify-deletion --record PATH --public-key KEY`.

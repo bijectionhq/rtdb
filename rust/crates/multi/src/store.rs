@@ -814,6 +814,7 @@ pub async fn run_reaper(
         tokio::select! {
             _ = cancellation.cancelled() => return,
             _ = tokio::time::sleep(interval) => {
+                let Ok(maintenance) = storage.try_local_maintenance() else { continue; };
                 if let Ok(deployments) = directory.deployments().await {
                     if let Some(keys) = keys.as_deref() {
                         for record in &deployments {
@@ -828,6 +829,7 @@ pub async fn run_reaper(
                     }
                     let now = wall_clock()();
                     let _ = reaper_pass(bucket.as_ref(), &deployments, now, grace).await;
+                    drop(maintenance);
                     if let Some(keys) = keys.as_deref() {
                         for record in &deployments {
                             if record.lifecycle != Lifecycle::Deleting && !move_cleanup_due(record, now, grace) { continue; }

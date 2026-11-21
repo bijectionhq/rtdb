@@ -347,6 +347,7 @@ pub async fn fork(directory: &dyn Directory, storage: &CellStorage, keys: &dyn K
     let holder = ensure_held(directory, parent, control).await?;
     let members = members(directory).await?;
     expect(&control_address(&members, &holder)?, Request::Flush { name: parent.to_owned() }, control).await?;
+    let _maintenance = storage.try_local_maintenance()?;
     let source = fork_source(directory, parent).await?;
     let bucket = fork_bucket(storage, keys, &source).await?;
     fork_with_tail(directory, bucket.as_ref(), keys, &source, name, None, Vec::new(), 4 << 20).await
@@ -355,6 +356,7 @@ pub async fn fork(directory: &dyn Directory, storage: &CellStorage, keys: &dyn K
 /// Forks `parent` as of one of its past blocks: the fork's state is that block's, and what the parent wrote after it is not the fork's.
 /// Only a block younger than the reaper's `grace` can be forked from: an object it needs that the parent released since is erased only once the grace has passed.
 pub async fn fork_at_block(directory: &dyn Directory, storage: &CellStorage, keys: &dyn KeyService, parent: &str, name: &str, block: i64, grace: std::time::Duration) -> Result<DeploymentRecord> {
+    let _maintenance = storage.try_local_maintenance()?;
     let source = fork_source(directory, parent).await?;
     let bucket = fork_bucket(storage, keys, &source).await?;
     let age = now_ms() - crate::reference::written_at_ms(bucket.as_ref(), &source.storage_prefix(), block).await?;
@@ -365,6 +367,7 @@ pub async fn fork_at_block(directory: &dyn Directory, storage: &CellStorage, key
 /// Forks `parent` as of a system time at or after its checkpoint: the fork starts from the checkpoint's block, with the parent's transactions after it up to `system_time` copied into its own stream.
 /// A time before the checkpoint is a past block's, which `fork_at_block` forks from.
 pub async fn fork_at_time(directory: &dyn Directory, storage: &CellStorage, keys: &dyn KeyService, parent: &str, name: &str, system_time: rtdb_types::Timestamp, grace: std::time::Duration, maximum_message_bytes: usize) -> Result<DeploymentRecord> {
+    let _maintenance = storage.try_local_maintenance()?;
     let source = fork_source(directory, parent).await?;
     let checkpoint = source.checkpoint.ok_or_else(|| Anomaly::incorrect("rtdb.multi/no-checkpoint", format!("{parent} has published no block to fork from")))?;
     if system_time.0 < checkpoint.system_time { return Err(Anomaly::incorrect("rtdb.multi/before-checkpoint", format!("{parent}'s last published block is after that time: fork at a past block instead"))); }
@@ -676,6 +679,7 @@ async fn settle_cell_move(
 pub async fn delete_deployment(directory: &dyn Directory, storage: &CellStorage, keys: &dyn KeyService, name: &str, maximum_message_bytes: usize) -> Result<DeletionRecord> {
     let current = record(directory, name).await?;
     if current.lifecycle == Lifecycle::Deleted { return deletion_receipt(current); }
+    let _maintenance = storage.try_local_maintenance()?;
     let bucket = storage.bucket(rtdb_storage::IoRegion::new()).await?;
     let namespaces = storage_namespaces(bucket.as_ref(), keys).await?;
     let legacy_namespace = if current.lifecycle == Lifecycle::Deleting && current.storage_namespaces.is_none() {
@@ -704,7 +708,7 @@ pub async fn delete_deployment(directory: &dyn Directory, storage: &CellStorage,
     }).await?;
     if fenced.lifecycle == Lifecycle::Deleted { return deletion_receipt(fenced); }
     await_storage_drain(directory, storage, keys, &fenced).await?;
-    finish_disposal(directory, storage, keys, &fenced.id, maximum_message_bytes).await?;
+    finish_disposal_with_lock(directory, storage, keys, &fenced.id, Some(fenced.incarnation), maximum_message_bytes).await?;
     let deleted = directory.deployment(&fenced.id).await?.ok_or_else(|| deletion_changed(name))?;
     deletion_receipt(deleted)
 }
@@ -789,6 +793,8 @@ async fn prepare_cell_move(
     if matches!(to.storage, CellStorage::S3 { .. }) && hosted_task.is_none() {
         return Err(Anomaly::incorrect("rtdb.multi/transfer-task", "A remote transfer needs a recoverable task identity"));
     }
+    let _source_maintenance = from.storage.try_local_maintenance()?;
+    let _target_maintenance = to.storage.try_local_maintenance()?;
 
     let same_media = |record: &DeploymentRecord| record.cell_transfer.as_ref().is_some_and(|transfer| {
         transfer.source_media == source_media && transfer.destination_media == destination_media
@@ -1155,6 +1161,18 @@ pub async fn finish_disposal(directory: &dyn Directory, storage: &CellStorage, k
 }
 
 pub(crate) async fn finish_disposal_at(
+    directory: &dyn Directory,
+    storage: &CellStorage,
+    keys: &dyn KeyService,
+    id: &str,
+    incarnation: Option<u64>,
+    maximum_message_bytes: usize,
+) -> Result<DisposalReceipt> {
+    let _maintenance = storage.try_local_maintenance()?;
+    finish_disposal_with_lock(directory, storage, keys, id, incarnation, maximum_message_bytes).await
+}
+
+async fn finish_disposal_with_lock(
     directory: &dyn Directory,
     storage: &CellStorage,
     keys: &dyn KeyService,
@@ -1680,6 +1698,28 @@ mod tests {
         let error = create_deployment(directory.as_ref(), "shop", "acme/orders", 0).await.unwrap_err();
         assert_eq!(error.code, "rtdb.multi/invalid-organisation");
         assert!(directory.deployments().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn local_deletion_and_fork_retry_before_mutating_storage_when_maintenance_is_active() {
+        let directory = MemoryDirectory::new();
+        let data = tempfile::tempdir().unwrap();
+        let storage = CellStorage::Local { root: data.path().join("objects") };
+        let keys = LocalKeyService::new(data.path().join("keys")).unwrap();
+        let deployment = create_deployment(directory.as_ref(), "shop", "acme", 0).await.unwrap();
+        let key = keys.key(&deployment.key_id()).await.unwrap();
+        let maintenance = storage.try_local_maintenance().unwrap().unwrap();
+
+        let deletion = delete_deployment(directory.as_ref(), &storage, &keys, "shop", 4 << 20).await.unwrap_err();
+        assert_eq!(deletion.code, "rtdb.multi/storage-maintenance-busy");
+        let fork = super::fork_at_block(directory.as_ref(), &storage, &keys, "shop", "fork", 0, std::time::Duration::from_secs(60)).await.unwrap_err();
+        assert_eq!(fork.code, "rtdb.multi/storage-maintenance-busy");
+        assert_eq!(directory.deployment(&deployment.id).await.unwrap(), Some(deployment.clone()));
+        assert!(directory.deployment_by_name("fork").await.unwrap().is_none());
+        assert_eq!(keys.existing(&deployment.key_id()).await.unwrap(), key);
+
+        drop(maintenance);
+        assert!(storage.try_local_maintenance().unwrap().is_some());
     }
 
     struct RetainingStore<'a>(&'a MemoryStore);

@@ -101,6 +101,21 @@ impl CellStorage {
         Ok(digest.as_ref().try_into().expect("SHA-256 has 32 bytes"))
     }
 
+    /// Serializes administrative object mutations on a shared local volume.
+    pub(crate) fn try_local_maintenance(&self) -> Result<Option<std::fs::File>> {
+        let Self::Local { root } = self else { return Ok(None); };
+        let path = Self::local_root(root)?.join("~cell-maintenance-lock");
+        let unavailable = |error: std::io::Error| Anomaly::new(
+            rtdb_types::AnomalyCategory::Unavailable, "rtdb.multi/storage-maintenance", format!("{}: {error}", path.display()));
+        let lock = std::fs::OpenOptions::new().write(true).create(true).truncate(false).open(&path).map_err(&unavailable)?;
+        match lock.try_lock() {
+            Ok(()) => Ok(Some(lock)),
+            Err(std::fs::TryLockError::WouldBlock) => Err(Anomaly::new(rtdb_types::AnomalyCategory::Busy,
+                "rtdb.multi/storage-maintenance-busy", "A cell operation is changing the local object inventory")),
+            Err(std::fs::TryLockError::Error(error)) => Err(unavailable(error)),
+        }
+    }
+
     /// The cell's objects as one store, keyed relative to the cell's storage root.
     pub async fn bucket(&self, io: std::sync::Arc<rtdb_storage::IoRegion>) -> rtdb_types::Result<crate::reference::Bucket> {
         match self {

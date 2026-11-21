@@ -1888,6 +1888,16 @@ rule ReadTransferredForkObject {
 -- Rules: deletion
 ------------------------------------------------------------
 
+rule LocalStorageMaintenance {
+    when: AdministrativeObjectMutationRequested(cell, operation)
+
+    requires: LocalStorage(cell)
+    requires: NoOtherLocalMaintenanceHoldsLock(cell)
+
+    ensures:
+        LocalMaintenanceLockHeldThroughMutation(cell, operation)
+}
+
 rule BeginDeletion {
     -- The epoch bump fences every writer before anything is destroyed.
     -- The holder's claim binds the object and key namespaces before it writes.
