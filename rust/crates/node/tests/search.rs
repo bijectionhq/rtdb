@@ -95,6 +95,8 @@ async fn search_index_definitions_are_documents_as_of_their_transaction() {
     ]]);
     let version = rows(session.query_sql("SELECT version FROM xt.search_indexes", vec![]).await.unwrap()).await;
     assert_eq!(version, [vec![Value::I64(created.tx_key().tx_id.0)]], "the version is the defining transaction");
+    assert!(session.state_mut().execute_tx(vec![sql("CREATE SEARCH INDEX IF NOT EXISTS docs_text ON docs (body) WITH (history = false)")], AutonomousTxOptions::default()).await.unwrap().committed());
+    assert_eq!(rows(session.query_sql("SELECT version FROM xt.search_indexes", vec![]).await.unwrap()).await, version);
     assert!(session.state_mut().execute_tx(vec![sql("DROP SEARCH INDEX docs_text")], AutonomousTxOptions::default()).await.unwrap().committed());
     assert!(rows(session.query_sql(definitions, vec![]).await.unwrap()).await.is_empty());
     let created_at = Value::Timestamp { value: created.tx_key().system_time.0, unit: rtdb_types::TimeUnit::Microsecond, timezone: Some("UTC".into()) };
