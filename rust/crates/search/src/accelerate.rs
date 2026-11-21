@@ -237,7 +237,7 @@ impl SearchAccelerator {
             match self.trie_files_in(request, snapshot, definition, point, None, false).await? { TrieFiles::Complete(found) | TrieFiles::Recorded(found) => files.extend(found.files) }
             segments.extend(snapshot.iter_segments(table).cloned());
         }
-        request.corpora.register(name, Arc::new(TableCorpus { runtime: Arc::clone(&self.runtime), database: request.database.to_string(), files: parking_lot::Mutex::new(Some(files)), computed: std::sync::OnceLock::new(), segments, column: column.to_string(), at }));
+        request.corpora.register(name, Arc::new(TableCorpus { runtime: Arc::clone(&self.runtime), database: request.database.to_string(), files: parking_lot::Mutex::new(files), computed: std::sync::OnceLock::new(), segments, column: column.to_string(), at }));
         Ok(())
     }
     fn live_candidates(&self, request: &ScanRequest<'_>, column: &str, query: &Query) -> Result<BTreeSet<Iid>> {
@@ -401,15 +401,14 @@ impl SearchAccelerator {
 }
 
 /// A column's corpus at the snapshot's instant, computed when a score first asks for it.
-struct TableCorpus { runtime: Arc<crate::SearchRuntime>, database: String, files: parking_lot::Mutex<Option<Vec<TrieFile>>>, computed: std::sync::OnceLock<Arc<crate::corpus::SnapshotCorpus>>, segments: Vec<Arc<rtdb_index::LiveTable>>, column: String, at: i64 }
+struct TableCorpus { runtime: Arc<crate::SearchRuntime>, database: String, files: parking_lot::Mutex<Vec<TrieFile>>, computed: std::sync::OnceLock<Result<Arc<crate::corpus::SnapshotCorpus>>>, segments: Vec<Arc<rtdb_index::LiveTable>>, column: String, at: i64 }
 
 impl rtdb_query::CorpusSource for TableCorpus {
     fn corpus(&self, query: &Query) -> Result<rtdb_text::Corpus> {
-        if let Some(computed) = self.computed.get() { return computed.corpus(query); }
-        let files = self.files.lock().take().unwrap_or_default();
-        let computed = self.runtime.snapshot_corpus(&self.database, files, &self.segments, &self.column, self.at)?;
-        computed.corpus(query)?;
-        self.computed.get_or_init(|| computed).corpus(query)
+        self.computed.get_or_init(|| {
+            let files = std::mem::take(&mut *self.files.lock());
+            self.runtime.snapshot_corpus(&self.database, files, &self.segments, &self.column, self.at)
+        }).as_ref().map_err(Clone::clone)?.corpus(query)
     }
 }
 

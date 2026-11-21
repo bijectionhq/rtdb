@@ -12,6 +12,7 @@ use rtdb_types::{Anomaly, EventHeader, EventOp, Iid, Interval, Result, TemporalB
 use tantivy::collector::DocSetCollector;
 use tantivy::directory::error::{DeleteError, OpenReadError, OpenWriteError};
 use tantivy::directory::{FileHandle, FileSlice, OwnedBytes, RamDirectory, WatchCallback, WatchHandle, WritePtr};
+use tantivy::postings::SegmentPostings;
 use tantivy::query::{BooleanQuery, Occur, TermQuery};
 use tantivy::schema::{Field, IndexRecordOption, Schema, TextFieldIndexing, TextOptions};
 use tantivy::store::Compressor;
@@ -660,12 +661,18 @@ impl SearchFile {
     /// The documents holding a term in a column, in order.
     pub fn holding(&self, column: &str, term: &str) -> Result<Vec<u32>> {
         use tantivy::DocSet;
-        let (Some(field), Some(segment)) = (self.field(column), self.searcher.segment_readers().first()) else { return Ok(Vec::new()) };
-        let Some(mut postings) = segment.inverted_index(field).map_err(fault)?.read_postings(&Term::from_field_text(field, term), IndexRecordOption::Basic).map_err(fault)? else { return Ok(Vec::new()) };
+        let Some(mut postings) = self.postings(column, term)? else { return Ok(Vec::new()) };
         let mut docs = Vec::new();
-        let mut doc = postings.doc();
-        while doc != tantivy::TERMINATED { docs.push(doc); doc = postings.advance(); }
+        while postings.doc() != tantivy::TERMINATED {
+            docs.push(postings.doc());
+            postings.advance();
+        }
         Ok(docs)
+    }
+
+    pub(crate) fn postings(&self, column: &str, term: &str) -> Result<Option<SegmentPostings>> {
+        let (Some(field), Some(segment)) = (self.field(column), self.searcher.segment_readers().first()) else { return Ok(None) };
+        segment.inverted_index(field).map_err(fault)?.read_postings(&Term::from_field_text(field, term), IndexRecordOption::Basic).map_err(fault)
     }
 
     /// Every query term and phrase as one conjunction over the column.
