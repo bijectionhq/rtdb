@@ -58,7 +58,10 @@ async fn poll_shared(directory: Arc<dyn Directory>, id: String, period: Duration
                 }) { return; }
                 None
             }
-            record = watcher.next() => Some(record),
+            record = watcher.next() => match record {
+                Some(record) => Some(record),
+                None => directory.deployment(&id).await.ok().flatten(),
+            },
             _ = ticker.tick() => {
                 if let Some(feed) = feed { feed.discard_unused_history(); }
                 directory.deployment(&id).await.ok().flatten()

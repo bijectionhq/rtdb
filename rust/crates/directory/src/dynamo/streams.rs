@@ -1,8 +1,9 @@
 //! Following the deployments table's stream of new images into a `ChangeFeed`.
 //!
 //! A stream is ordered per item within a shard's lineage, so a child shard is read only once its parent has been read through.
-//! Following starts at the latest position of every open shard, then publishes a scan of the table, so a change made before the stream was reached is not missed.
-//! Whenever a position is lost — an expired iterator with nothing read yet, data trimmed from under it — it rescans for the same reason.
+//! Following starts at the latest position of every open shard.
+//! Whole-feed consumers get a rescan on startup and when a position is lost.
+//! Keyed watches read their own records when they join, when the follower opens its iterators, and on their safety-net polls.
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Weak;
@@ -13,7 +14,7 @@ use aws_sdk_dynamodbstreams::Client as StreamsClient;
 use aws_sdk_dynamodbstreams::types::{AttributeValue, ShardIteratorType};
 use rtdb_types::{Anomaly, Result};
 
-use super::{decode_deployment, scan_items, sdk_anomaly, RECORD, VERSION};
+use super::{decode_deployment, sdk_anomaly, RECORD, VERSION};
 use crate::{ChangeFeed, DeploymentRecord};
 
 /// How long an idle follower waits before reading its shards again; a shard allows five reads a second.
@@ -92,8 +93,13 @@ impl Follower {
     }
 
     async fn rescan(&self) -> Result<()> {
-        for item in scan_items(&self.client, &self.table).await? {
-            if let Ok(record) = decode_deployment(&item) { self.publish(record); }
+        if let Some(feed) = self.changes.upgrade() { feed.refresh_watches(); }
+        let mut pages = self.client.scan().table_name(&self.table).consistent_read(true).into_paginator().send();
+        while self.changes.upgrade().is_some_and(|feed| feed.has_broadcast_receivers()) {
+            let Some(page) = pages.next().await else { break };
+            for item in page.map_err(|error| sdk_anomaly("Scan", error))?.items() {
+                if let Ok(record) = decode_deployment(item) { self.publish(record); }
+            }
         }
         Ok(())
     }

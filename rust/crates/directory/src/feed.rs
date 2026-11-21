@@ -1,6 +1,7 @@
 //! The deployment change feed a directory backend may offer (`Directory::deployment_changes`).
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Weak};
 use std::time::Duration;
 
@@ -15,6 +16,7 @@ type WatchReceiver = watch::Receiver<Option<DeploymentRecord>>;
 pub(crate) struct DeploymentWatch {
     pub(crate) sender: WatchSender,
     pending: Mutex<Option<DeploymentRecord>>,
+    refresh: AtomicBool,
     changed: Notify,
 }
 
@@ -27,10 +29,12 @@ impl DeploymentWatch {
         }
     }
 
-    pub(crate) async fn next(&self) -> DeploymentRecord {
+    /// A record from the feed, or a request to read the current record after the feed starts or reconnects.
+    pub(crate) async fn next(&self) -> Option<DeploymentRecord> {
         loop {
             let notified = self.changed.notified();
-            if let Some(record) = self.pending.lock().take() { return record; }
+            if let Some(record) = self.pending.lock().take() { return Some(record); }
+            if self.refresh.swap(false, Ordering::Relaxed) { return None; }
             notified.await;
         }
     }
@@ -62,6 +66,19 @@ impl ChangeFeed {
         self.sender.subscribe()
     }
 
+    #[cfg(feature = "dynamodb")]
+    pub(crate) fn has_broadcast_receivers(&self) -> bool { self.sender.receiver_count() != 0 }
+
+    #[cfg(feature = "dynamodb")]
+    pub(crate) fn refresh_watches(&self) {
+        let watches: Vec<_> = self.state.lock().watches.values()
+            .flat_map(|by_interval| by_interval.values().filter_map(Weak::upgrade)).collect();
+        for watch in watches {
+            watch.refresh.store(true, Ordering::Relaxed);
+            watch.changed.notify_one();
+        }
+    }
+
     pub(crate) fn discard_unused_history(&self) {
         let mut state = self.state.lock();
         if self.sender.receiver_count() == 0 && !state.published.is_empty() {
@@ -76,7 +93,7 @@ impl ChangeFeed {
             return (sender.sender.subscribe(), None);
         }
         let (sender, receiver) = watch::channel(None);
-        let sender = Arc::new(DeploymentWatch { sender, pending: Mutex::new(None), changed: Notify::new() });
+        let sender = Arc::new(DeploymentWatch { sender, pending: Mutex::new(None), refresh: AtomicBool::new(false), changed: Notify::new() });
         by_interval.insert(interval, Arc::downgrade(&sender));
         (receiver, Some(sender))
     }
@@ -212,7 +229,7 @@ pub(crate) mod tests {
             feed.publish(DeploymentRecord::new("parked", "acme", vec![], 0));
         }
 
-        let watched = watch.unwrap().next().await;
+        let watched = watch.unwrap().next().await.unwrap();
         assert_eq!(watched, active);
         let state = feed.state.lock();
         assert_eq!(state.watches.len(), 1);

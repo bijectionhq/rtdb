@@ -404,6 +404,12 @@ impl Directory for DynamoDirectory {
     }
 
     /// Outside a Tokio runtime there is nothing to follow the stream on, so there is no feed.
+    fn deployment_changes(&self) -> Option<tokio::sync::broadcast::Receiver<DeploymentRecord>> {
+        let receiver = self.changes.subscribe();
+        self.change_feed()?;
+        Some(receiver)
+    }
+
     fn change_feed(&self) -> Option<&ChangeFeed> {
         let mut following = self.following.lock();
         if !*following {
@@ -493,6 +499,66 @@ mod tests {
 
         let created = directory.create_deployment(DeploymentRecord::new("shop-late", "acme", vec![], 0)).await.unwrap();
         await_versions(&mut receiver, std::slice::from_ref(&created)).await;
+    }
+
+    #[derive(Debug)]
+    struct CountScans(Arc<std::sync::atomic::AtomicUsize>);
+
+    impl aws_sdk_dynamodb::config::Intercept for CountScans {
+        fn name(&self) -> &'static str { "CountScans" }
+        fn read_before_transmit(
+            &self,
+            context: &aws_sdk_dynamodb::config::interceptors::BeforeTransmitInterceptorContextRef<'_>,
+            _: &aws_sdk_dynamodb::config::RuntimeComponents,
+            _: &mut aws_sdk_dynamodb::config::ConfigBag,
+        ) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> {
+            if context.request().headers().get("x-amz-target").is_some_and(|target| target.ends_with(".Scan")) {
+                self.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+            Ok(())
+        }
+    }
+
+    #[derive(Debug)]
+    struct HoldIterator(Arc<std::sync::atomic::AtomicBool>);
+
+    impl aws_sdk_dynamodbstreams::config::Intercept for HoldIterator {
+        fn name(&self) -> &'static str { "HoldIterator" }
+        fn read_before_transmit(
+            &self,
+            context: &aws_sdk_dynamodbstreams::config::interceptors::BeforeTransmitInterceptorContextRef<'_>,
+            _: &aws_sdk_dynamodbstreams::config::RuntimeComponents,
+            _: &mut aws_sdk_dynamodbstreams::config::ConfigBag,
+        ) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> {
+            if context.request().headers().get("x-amz-target").is_some_and(|target| target.ends_with(".GetShardIterator"))
+                && !self.0.load(std::sync::atomic::Ordering::Relaxed)
+            {
+                return Err("the stream iterator is held until the first update commits".into());
+            }
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn a_keyed_dynamodb_watch_recovers_an_update_during_startup_without_scanning_the_table() {
+        let Some(writer) = local().await else { return };
+        let mut record = writer.create_deployment(DeploymentRecord::new("shop", "acme", vec![], 0)).await.unwrap();
+        let scans = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let ready = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let client = Client::from_conf(writer.client.config().to_builder().interceptor(CountScans(scans.clone())).build());
+        let streams = StreamsClient::from_conf(writer.streams.config().to_builder().interceptor(HoldIterator(ready.clone())).build());
+        let reader = Arc::new(DynamoDirectory::new(client, streams, writer.tables.clone()));
+        let mut watched = crate::watch_deployment(reader, record.id.clone(), Duration::from_secs(60));
+        drop(watched.wait_for(|current| current.is_some()).await.unwrap());
+
+        record.epoch = 1;
+        let version = record.version;
+        writer.replace_deployment(record, version).await.unwrap().applied().unwrap();
+        ready.store(true, std::sync::atomic::Ordering::Relaxed);
+        drop(tokio::time::timeout(Duration::from_secs(10), watched.wait_for(|record| {
+            record.as_ref().is_some_and(|record| record.epoch == 1)
+        })).await.unwrap().unwrap());
+        assert_eq!(scans.load(std::sync::atomic::Ordering::Relaxed), 0);
     }
 
     #[tokio::test]
