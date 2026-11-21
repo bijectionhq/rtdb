@@ -2065,6 +2065,7 @@ async fn ordered_index_retires_erased_keys_and_drop_recreate_gets_a_fresh_genera
         }
     }
     assert!(!erased_pages.is_empty());
+    assert!(erased_pages.iter().all(|page| page.as_str().contains("/generations/0000000000000000/")));
 
     let erasure = session.state_mut().execute_tx(
         ["INSERT INTO orders RECORDS {_id: 1, customer: 'erased-in-revision'}",
@@ -2085,9 +2086,13 @@ async fn ordered_index_retires_erased_keys_and_drop_recreate_gets_a_fresh_genera
     }
     let manifest = objects.iter().find(|entry| entry.key.as_str().contains("/manifests/")).unwrap();
     let encoded = store.get(&manifest.key).await.unwrap();
-    let obsolete = rtdb_storage::ObjectKey::new(manifest.key.as_str().replace("/manifests/scrubbed/", "/manifests/")).unwrap();
+    let obsolete = rtdb_storage::ObjectKey::new(manifest.key.as_str().replace("/manifests/scoped/", "/manifests/scrubbed/")).unwrap();
     store.put(&obsolete, Vec::from("obsolete replay layout").into()).await.unwrap();
     let checkpoint: serde_json::Value = serde_json::from_slice(&encoded).unwrap();
+    let scope = checkpoint["layout"]["scope"].as_u64().unwrap();
+    assert!(scope > 0);
+    let generation_dir = format!("/generations/{scope:016x}/pages/");
+    assert!(objects.iter().filter(|entry| entry.key.as_str().contains("/pages/")).all(|entry| entry.key.as_str().contains(&generation_dir)));
     let root = &checkpoint["layout"]["revisions"];
     let generation = root["generation"].as_i64().unwrap();
     let digest = root["digest"].as_str().unwrap();

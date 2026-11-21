@@ -104,10 +104,17 @@ ingress functions. The joint controls failed
 included Bijection decision sources are unchanged in the companion clearance
 update at `aa7c7fd086423689a772ccd8fd6b75a1674a6cb7`.
 
-The integration branches still need a native run against the paired RTDB
-and Bijection builds. Physical erasure of the remaining provider objects must
-bind garbage release, superseded publication settlement, and active read
-scopes to the provider's completion evidence.
+Physical erasure of the remaining provider objects must bind garbage release,
+superseded publication settlement, and active read scopes to the provider's
+completion evidence.
+
+Replay discovers erase cuts from adopted L0 files before writing replacement pages.
+Each checkpoint records the page scope determined by the last source block containing an erase.
+Collection releases earlier scopes after the replacement checkpoint is durable and preserves pages staged in later scopes.
+
+The erasure replay and page scope regression histories were exercised on consolidated RTDB.
+The protocol 15 release backport has source review only.
+The hosted directory still needs to fence old admissions and record physical provider completion.
 
 ## Execution
 

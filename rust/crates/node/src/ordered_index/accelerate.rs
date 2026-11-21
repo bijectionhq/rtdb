@@ -10,9 +10,9 @@ use rtdb_types::{AnomalyCategory, Iid, LogicalType, Result, ScalarType};
 use std::sync::Arc;
 
 use super::{
-    Definition, definitions,
+    Definition, checkpoint, definitions,
     key::{Atom, Bucket, Family, family},
-    maintenance::{cancelled, read_root},
+    maintenance::{cancelled, read_root, source_frontier},
     tree::{Cursor, Key, Tree},
 };
 
@@ -544,12 +544,16 @@ async fn use_index(
         return Ok(Some(Vec::new()));
     }
     let directory = definition.directory()?;
-    let tree = Tree::new(request.storage, &directory, request.memory);
+    let through = source_frontier(request.snapshot, &definition.table);
+    let checkpoint = checkpoint::latest(request.storage, &directory, request.memory, through).await?;
+    let scope = checkpoint.as_ref().map_or(0, |checkpoint| checkpoint.scope);
+    let tree = Tree::new(request.storage, &directory, request.memory, scope);
     let system_at = request.bounds.system_time.lower();
     let Some(root) = read_root(
         &tree,
         definition,
         request.snapshot,
+        checkpoint,
         system_at,
         request.cancellation,
     )
