@@ -12,7 +12,7 @@ use std::time::Duration;
 
 use bytes::{BufMut, Bytes, BytesMut};
 use rtdb_directory::{DeploymentRecord, Directory, Lifecycle};
-use rtdb_pgwire::{GATEWAY_KEY_CONFIRM_KIND, GATEWAY_KEY_KIND, GATEWAY_NAMED_PARSE_KIND, GATEWAY_SESSION_STATE_TAG, GATEWAY_SETTINGS_KIND, GATEWAY_SETTINGS_PARAMETER, GATEWAY_SQL_PREPARE_KIND};
+use rtdb_pgwire::{GATEWAY_KEY_CONFIRM_KIND, GATEWAY_KEY_KIND, GATEWAY_NAMED_PARSE_KIND, GATEWAY_REPLAY_PERMIT_KIND, GATEWAY_SESSION_STATE_TAG, GATEWAY_SETTINGS_KIND, GATEWAY_SETTINGS_PARAMETER, GATEWAY_SQL_PREPARE_KIND, GatewayReplayMode, GatewayReplayPermit};
 use rtdb_types::{Anomaly, AnomalyCategory, MemoryBudget, MemoryReservation, Result};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -26,6 +26,7 @@ const FRAME_MEMORY: &str = "rtdb.multi/gateway-frame-memory";
 pub(crate) const STARTUP_WITHIN: Duration = Duration::from_secs(35);
 const STARTUP_TIMEOUT: &str = "rtdb.multi/startup-timeout";
 const RECONNECT_WITHIN: Duration = Duration::from_secs(30);
+const COMMAND_KEY_AGE: Duration = Duration::from_secs(30 * 60);
 const RECONNECT_RETRY_DELAY: Duration = Duration::from_millis(100);
 const REPLAY_TIMEOUT: &str = "rtdb.multi/replay-timeout";
 /// A capability serves one reconnection, so it only has to outlive the startup it is sent in.
@@ -97,13 +98,14 @@ pub trait Router: Send + Sync {
 }
 
 #[derive(Clone, Copy, Default)]
-struct KeyProtocol { guarded: bool, confirmed: bool }
+struct KeyProtocol { guarded: bool, confirmed: bool, replay_permit: bool }
 
 impl KeyProtocol {
     fn observe(&mut self, body: &[u8]) {
         match body {
             [GATEWAY_KEY_KIND] => self.guarded = true,
             [GATEWAY_KEY_CONFIRM_KIND] => self.confirmed = true,
+            [GATEWAY_REPLAY_PERMIT_KIND] => self.replay_permit = true,
             _ => {}
         }
     }
@@ -111,6 +113,46 @@ impl KeyProtocol {
 
 #[derive(Clone, Copy)]
 enum RestoreKey { None, BeforeDispatch, Replay }
+
+impl RestoreKey {
+    fn mode(self) -> GatewayReplayMode {
+        match self {
+            Self::None => GatewayReplayMode::Dispatch,
+            Self::BeforeDispatch => GatewayReplayMode::ConfirmDispatch,
+            Self::Replay => GatewayReplayMode::Replay,
+        }
+    }
+}
+
+struct CommandKey {
+    nonce: uuid::Uuid,
+    permit: Option<ReplayCutoff>,
+}
+
+struct ReplayCutoff {
+    local: tokio::time::Instant,
+    writer: rtdb_types::Timestamp,
+}
+
+impl CommandKey {
+    fn new(first_tag: u8, age: Duration) -> Self {
+        let permit = if first_tag == b'Q' {
+            let now = rtdb_directory::now_ms().checked_mul(1_000);
+            let micros = i64::try_from(age.as_micros()).ok();
+            now.zip(micros).and_then(|(now, micros)| crate::replay_admission::cutoff_micros(now, micros)).map(|until| ReplayCutoff {
+                local: tokio::time::Instant::now() + age,
+                writer: rtdb_types::Timestamp(until),
+            })
+        } else { None };
+        Self { nonce: uuid::Uuid::new_v4(), permit }
+    }
+
+    fn replay_frame(&self, mode: GatewayReplayMode) -> Option<Frame> {
+        let permit = self.permit.as_ref()?;
+        let body = GatewayReplayPermit { nonce: self.nonce, not_after: permit.writer, mode }.encode();
+        Some(Frame { tag: GATEWAY_SESSION_STATE_TAG, body: Bytes::copy_from_slice(&body) })
+    }
+}
 
 fn key_frame(kind: u8, key: &str) -> Frame {
     let body = [&[kind], key.as_bytes()].concat();
@@ -134,11 +176,14 @@ impl Backend {
         Self { writer, frames, _reader: reader, heartbeat: None, epoch, keys: KeyProtocol::default(), drain_deadline: None }
     }
 
-    async fn prepare_key(&mut self, key: &str) -> bool {
+    async fn prepare_key(&mut self, key: &CommandKey) -> bool {
         if self.keys.guarded {
-            return self.dispatch(&key_frame(GATEWAY_KEY_KIND, key)).await;
+            let frame = if self.keys.replay_permit && let Some(frame) = key.replay_frame(GatewayReplayMode::Dispatch) {
+                frame
+            } else { key_frame(GATEWAY_KEY_KIND, &key.nonce.simple().to_string()) };
+            return self.dispatch(&frame).await;
         }
-        matches!(tokio::time::timeout(RECONNECT_WITHIN, install_key(self, key)).await, Ok(Ok(())))
+        matches!(tokio::time::timeout(RECONNECT_WITHIN, install_key(self, key, RestoreKey::BeforeDispatch)).await, Ok(Ok(())))
     }
 
     async fn forward(&mut self, frame: &Frame, deadline: Option<tokio::time::Instant>) -> Result<()> {
@@ -172,6 +217,7 @@ pub struct Session {
     startup: Bytes,
     frame_memory: Arc<MemoryBudget>,
     replay_window: Duration,
+    command_key_age: Duration,
     expected_installation: Option<uuid::Uuid>,
     grants: Option<Grants>,
     /// The principal the first backend authenticated and reported it may be vouched for, for whom the gateway mints its reconnections' capabilities.
@@ -197,13 +243,13 @@ pub struct Session {
     /// Whether the gateway assigns a command key on this route.
     keyed: bool,
     /// The key of the pending command, which began while the session was idle.
-    key: Option<String>,
+    key: Option<CommandKey>,
 }
 
 impl Session {
     pub fn new(startup: Bytes, router: Arc<dyn Router>, directory: Arc<dyn Directory>, deployment: String, grants: Option<Grants>, keyed: bool) -> Self {
         let record = rtdb_directory::watch_deployment(directory, deployment, RECONNECT_RETRY_DELAY);
-        Self { startup, frame_memory: MemoryBudget::new(DEFAULT_GATEWAY_FRAME_BYTES), replay_window: RECONNECT_WITHIN, expected_installation: None, grants, authenticated: None, greeting: Greeting::default(), router, record, prepared: BTreeMap::new(), next_statement_order: 0, await_token: None, settings: None, status: Status::Busy, pending: Vec::new(), prepared_responses: 0, answered: false, lost_unanswered: false, discarding: false, keyed, key: None }
+        Self { startup, frame_memory: MemoryBudget::new(DEFAULT_GATEWAY_FRAME_BYTES), replay_window: RECONNECT_WITHIN, command_key_age: COMMAND_KEY_AGE, expected_installation: None, grants, authenticated: None, greeting: Greeting::default(), router, record, prepared: BTreeMap::new(), next_statement_order: 0, await_token: None, settings: None, status: Status::Busy, pending: Vec::new(), prepared_responses: 0, answered: false, lost_unanswered: false, discarding: false, keyed, key: None }
     }
 
     pub(crate) fn with_frame_memory(mut self, memory: Arc<MemoryBudget>) -> Self {
@@ -224,10 +270,10 @@ impl Session {
                 let attempt = async {
                     let mut backend = self.connect_once(supersede).await?;
                     if !matches!(restore_key, RestoreKey::None) && let Some(key) = &self.key {
-                        if matches!(restore_key, RestoreKey::Replay) && !backend.keys.confirmed {
+                        if matches!(restore_key, RestoreKey::Replay) && (!backend.keys.confirmed || key.permit.is_some() && !backend.keys.replay_permit) {
                             return Err(Anomaly::unsupported("rtdb.multi/replay-key-unsupported", "The replacement writer cannot protect a replay key"));
                         }
-                        install_key(&mut backend, key).await?;
+                        install_key(&mut backend, key, restore_key).await?;
                     }
                     Ok::<_, Anomaly>(backend)
                 }.await;
@@ -386,7 +432,7 @@ impl Session {
                             continue;
                         }
                         let starts = self.status == Status::Idle;
-                        if starts { self.answered = false; self.lost_unanswered = false; self.key = self.keyed.then(|| uuid::Uuid::new_v4().simple().to_string()); }
+                        if starts { self.answered = false; self.lost_unanswered = false; self.key = self.keyed.then(|| CommandKey::new(request.tag, self.command_key_age)); }
                         if starts && backend.as_ref().is_some_and(|current| self.stale(current)) { backend = None; }
                         if backend.is_none() { backend = Some(self.connect(None, RestoreKey::None).await?); }
                         if starts && let Some(key) = &self.key
@@ -453,7 +499,7 @@ impl Session {
                         if !self.pending.is_empty() && !self.discarding && frame.tag == b'E' {
                             let code = backend_error_code(&frame);
                             if matches!(code, Some("xtdb/ingestion-stopped" | "rtdb.storage/closed")) {
-                                if self.answered || self.key.is_none() || !backend.as_ref().is_some_and(|current| current.keys.confirmed) {
+                                if self.answered || !backend.as_ref().is_some_and(|current| self.replayable(current.keys)) {
                                     break Err(lost("the holder stopped during the command, whose outcome is unknown"));
                                 }
                                 self.lost_unanswered = true;
@@ -467,14 +513,18 @@ impl Session {
                             }
                         }
                         if !self.pending.is_empty() && !self.answered && !self.discarding && frame.tag == b'E' && not_held(&frame) {
-                            if self.keyed && !backend.as_ref().is_some_and(|current| current.keys.confirmed) {
-                                break Err(lost("the holder cannot protect a replay key; the command's outcome is unknown"));
+                            if self.keyed && !backend.as_ref().is_some_and(|current| self.replayable(current.keys)) {
+                                break Err(lost("the command cannot be safely replayed; its outcome is unknown"));
                             }
+                            self.lost_unanswered = self.keyed;
                             self.start_replay(&mut replay_deadline);
                             self.discarding = true;
                         }
                         if self.discarding {
                             if frame.tag == b'Z' {
+                                if self.keyed && !backend.as_ref().is_some_and(|current| self.replayable(current.keys)) {
+                                    break Err(lost("the command cannot be safely replayed; its outcome is unknown"));
+                                }
                                 self.discarding = false;
                                 backend = Some(self.replay(None, replay_deadline.expect("discarding has a deadline")).await?);
                             }
@@ -519,11 +569,11 @@ impl Session {
                     }
                     Event::Reply(Some(Err(_)) | None) => {
                         if !self.greeting.done { break Err(lost("the holder closed during session startup")); }
-                        let protected = backend.take().is_some_and(|current| current.keys.confirmed);
+                        let protected = backend.take().is_some_and(|current| self.replayable(current.keys));
                         // A refusal whose ReadyForQuery never came is over with its backend: the resent command's replies are the client's.
                         self.discarding = false;
                         if self.status != Status::Idle {
-                            if !protected || self.key.is_none() || self.answered {
+                            if !protected || self.answered {
                                 break Err(lost("the holder went away during a command, whose outcome is unknown"));
                             }
                             self.lost_unanswered = true;
@@ -556,8 +606,21 @@ impl Session {
         outcome
     }
 
+    fn replayable(&self, keys: KeyProtocol) -> bool {
+        let Some(key) = &self.key else { return false };
+        if !keys.confirmed || self.pending.is_empty() { return false; }
+        if matches!(self.pending.as_slice(), [frame] if frame.tag == b'Q') {
+            let before_cutoff = key.permit.as_ref().is_some_and(|permit| tokio::time::Instant::now() < permit.local);
+            crate::replay_admission::may_send_simple_replay(keys.replay_permit, before_cutoff)
+        } else {
+            self.pending.iter().all(|frame| crate::replay_admission::is_setup_frame(frame.tag))
+        }
+    }
+
     fn start_replay(&self, deadline: &mut Option<tokio::time::Instant>) -> tokio::time::Instant {
-        let cutoff = crate::replay_deadline::replay_cutoff(*deadline, tokio::time::Instant::now() + self.replay_window);
+        let proposed = tokio::time::Instant::now() + self.replay_window;
+        let proposed = self.key.as_ref().and_then(|key| key.permit.as_ref()).map_or(proposed, |permit| proposed.min(permit.local));
+        let cutoff = crate::replay_deadline::replay_cutoff(*deadline, proposed);
         *deadline = Some(cutoff);
         cutoff
     }
@@ -611,7 +674,7 @@ async fn replay_ready(frames: &mut mpsc::Receiver<std::io::Result<Frame>>) -> Re
                 Some(GATEWAY_SETTINGS_KIND) => features.settings = true,
                 Some(GATEWAY_SQL_PREPARE_KIND) => features.sql_prepare = true,
                 Some(GATEWAY_NAMED_PARSE_KIND) => features.named_parse = true,
-                Some(GATEWAY_KEY_KIND | GATEWAY_KEY_CONFIRM_KIND) => features.keys.observe(&frame.body),
+                Some(GATEWAY_KEY_KIND | GATEWAY_KEY_CONFIRM_KIND | GATEWAY_REPLAY_PERMIT_KIND) => features.keys.observe(&frame.body),
                 _ => {}
             },
             b'S' => {
@@ -625,10 +688,13 @@ async fn replay_ready(frames: &mut mpsc::Receiver<std::io::Result<Frame>>) -> Re
     }
 }
 
-async fn install_key(backend: &mut Backend, key: &str) -> Result<()> {
-    let frame = if backend.keys.confirmed {
-        key_frame(GATEWAY_KEY_CONFIRM_KIND, key)
+async fn install_key(backend: &mut Backend, key: &CommandKey, restore: RestoreKey) -> Result<()> {
+    let frame = if backend.keys.replay_permit && let Some(frame) = key.replay_frame(restore.mode()) {
+        frame
+    } else if backend.keys.confirmed {
+        key_frame(GATEWAY_KEY_CONFIRM_KIND, &key.nonce.simple().to_string())
     } else {
+        let key = key.nonce.simple();
         let mut body = format!("SET {} = '{key}'", rtdb_node::IDEMPOTENCY_KEY_PARAMETER).into_bytes();
         body.push(0);
         Frame { tag: b'Q', body: Bytes::from(body) }
@@ -663,7 +729,7 @@ async fn wait_for_placement(record: &mut watch::Receiver<Option<DeploymentRecord
     if watch_closed { tokio::time::sleep_until(retry_at).await; }
 }
 
-/// Whether an ErrorResponse is a placed node's refusal of a database it no longer holds, raised before the command ran.
+/// Whether an ErrorResponse reports that the node no longer holds the placement.
 fn not_held(frame: &Frame) -> bool {
     backend_anomaly_code(frame).map_or_else(
         || frame.body.windows(rtdb_node::NOT_HELD.len()).any(|window| window == rtdb_node::NOT_HELD.as_bytes()),
@@ -762,13 +828,16 @@ mod tests {
         stream.read_exact(&mut startup).await.unwrap();
         send(stream, b'R', &[0, 0, 0, 0]).await;
         send(stream, GATEWAY_SESSION_STATE_TAG, &[GATEWAY_KEY_CONFIRM_KIND]).await;
+        send(stream, GATEWAY_SESSION_STATE_TAG, &[GATEWAY_REPLAY_PERMIT_KIND]).await;
         send(stream, b'Z', b"I").await;
     }
 
-    /// Reads a query, answering a keying statement and returning its key, or returning the query's text.
     async fn query(stream: &mut TcpStream) -> String {
         let (tag, body) = receive(stream).await;
         if tag == GATEWAY_SESSION_STATE_TAG {
+            if let Some(permit) = GatewayReplayPermit::decode(&body) {
+                return format!("SET {} = '{}@{}'", rtdb_node::IDEMPOTENCY_KEY_PARAMETER, permit.nonce.simple(), permit.not_after.0);
+            }
             assert_eq!(body[0], GATEWAY_KEY_CONFIRM_KIND);
             let key = std::str::from_utf8(&body[1..]).unwrap();
             return format!("SET {} = '{key}'", rtdb_node::IDEMPOTENCY_KEY_PARAMETER);
@@ -1137,6 +1206,39 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn an_execute_received_while_draining_a_refusal_is_never_replayed_as_setup() {
+        let directory = rtdb_directory::MemoryDirectory::new();
+        let record = directory.create_deployment(DeploymentRecord::new("shop", "acme", vec![], 0)).await.unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let (mut client, gateway) = pair(&listener).await;
+        let (first, mut refusing) = pair(&listener).await;
+        let router = Arc::new(Next(tokio::sync::Mutex::new(None)));
+        let startup = Bytes::from_static(b"\0\0\0\x08\0\x03\0\0");
+        let session = Session::new(startup, router, directory, record.id, None, true);
+        let running = tokio::spawn(session.run(gateway, first, None, 0));
+
+        tokio::time::timeout(Duration::from_secs(5), async {
+            greet(&mut refusing).await;
+            assert_eq!(receive(&mut client).await.0, b'R');
+            assert_eq!(receive(&mut client).await.0, b'Z');
+            let parse = b"stmt\0UPDATE counters SET n = n + 1\0\0\0";
+            send(&mut client, b'P', parse).await;
+            assert!(query(&mut refusing).await.starts_with("SET rtdb_idempotency_key"));
+            send(&mut refusing, b'Z', b"I").await;
+            assert_eq!(receive(&mut refusing).await, (b'P', parse.to_vec()));
+            send(&mut refusing, b'E', b"SERROR\0C57P03\0yrtdb.node/database-not-held\0\0").await;
+            send(&mut client, b'E', b"\0\0\0\0\0").await;
+            assert_eq!(receive(&mut refusing).await.0, b'E');
+            send(&mut refusing, b'Z', b"I").await;
+
+            let (tag, body) = receive(&mut client).await;
+            assert_eq!(tag, b'E');
+            assert!(String::from_utf8_lossy(&body).contains("outcome is unknown"));
+            assert!(running.await.unwrap().is_err());
+        }).await.unwrap();
+    }
+
+    #[tokio::test]
     async fn a_writer_that_advertises_guarded_keys_gets_the_key_and_command_without_an_acknowledgement() {
         let directory = rtdb_directory::MemoryDirectory::new();
         let record = directory.create_deployment(DeploymentRecord::new("shop", "acme", vec![], 0)).await.unwrap();
@@ -1174,7 +1276,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_command_refused_by_a_backend_lost_before_its_ready_for_query_is_answered_by_the_next() {
-        assert_retry_after_backend_error(BackendFailure::NotHeld).await;
+        assert_retry_after_backend_error(BackendFailure::NotHeld { replacement: ReplacementKey::Accept }).await;
     }
 
     #[tokio::test]
@@ -1237,7 +1339,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_command_sent_to_a_legacy_writer_is_not_replayed_after_its_socket_closes() {
+    async fn a_writer_with_confirmation_but_without_a_permit_cannot_originate_a_replay() {
         let directory = rtdb_directory::MemoryDirectory::new();
         let record = directory.create_deployment(DeploymentRecord::new("shop", "acme", vec![], 0)).await.unwrap();
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1251,6 +1353,7 @@ mod tests {
         tokio::time::timeout(Duration::from_secs(5), async {
             legacy.read_exact(&mut [0; 8]).await.unwrap();
             send(&mut legacy, b'R', &[0; 4]).await;
+            send(&mut legacy, GATEWAY_SESSION_STATE_TAG, &[GATEWAY_KEY_CONFIRM_KIND]).await;
             send(&mut legacy, b'Z', b"I").await;
             assert_eq!(receive(&mut client).await.0, b'R');
             assert_eq!(receive(&mut client).await.0, b'Z');
@@ -1275,8 +1378,19 @@ mod tests {
         assert_retry_after_backend_error(BackendFailure::StorageClosed { replacement: ReplacementKey::Unsupported }).await;
     }
 
-    enum BackendFailure { NotHeld, StorageClosed { replacement: ReplacementKey } }
-    enum ReplacementKey { Accept, Refuse, Unsupported }
+    #[tokio::test]
+    async fn a_replacement_that_only_confirms_legacy_keys_never_receives_the_write() {
+        assert_retry_after_backend_error(BackendFailure::StorageClosed { replacement: ReplacementKey::WithoutPermit }).await;
+    }
+
+    #[tokio::test]
+    async fn a_not_held_reply_followed_by_an_expired_permit_has_an_unknown_outcome() {
+        assert_retry_after_backend_error(BackendFailure::NotHeld { replacement: ReplacementKey::Expired }).await;
+    }
+
+    enum BackendFailure { NotHeld { replacement: ReplacementKey }, StorageClosed { replacement: ReplacementKey } }
+    #[derive(Clone, Copy)]
+    enum ReplacementKey { Accept, Refuse, Unsupported, WithoutPermit, Expired }
 
     struct Routes(tokio::sync::Mutex<std::collections::VecDeque<(TcpStream, u64)>>);
 
@@ -1289,6 +1403,9 @@ mod tests {
     }
 
     async fn assert_retry_after_backend_error(failure: BackendFailure) {
+        let replacement = match &failure {
+            BackendFailure::NotHeld { replacement } | BackendFailure::StorageClosed { replacement } => *replacement,
+        };
         let directory = rtdb_directory::MemoryDirectory::new();
         let record = directory.create_deployment(DeploymentRecord::new("shop", "acme", vec![], 0)).await.unwrap();
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1327,13 +1444,17 @@ mod tests {
             directory.replace_deployment(next, record.version).await.unwrap();
         } else {
             send(&mut refusing, b'E', format!("SERROR\0C57P03\0M{}\0\0", rtdb_node::NOT_HELD).as_bytes()).await;
+            if matches!(replacement, ReplacementKey::Expired) { send(&mut refusing, b'Z', b"I").await; }
         }
         drop(refusing);
 
-        if matches!(failure, BackendFailure::StorageClosed { replacement: ReplacementKey::Unsupported }) {
+        if matches!(replacement, ReplacementKey::Unsupported | ReplacementKey::WithoutPermit) {
             let mut startup = vec![0; successor.read_i32().await.unwrap() as usize - 4];
             successor.read_exact(&mut startup).await.unwrap();
             send(&mut successor, b'R', &[0; 4]).await;
+            if matches!(replacement, ReplacementKey::WithoutPermit) {
+                send(&mut successor, GATEWAY_SESSION_STATE_TAG, &[GATEWAY_KEY_CONFIRM_KIND]).await;
+            }
             send(&mut successor, b'Z', b"I").await;
             let (tag, body) = receive(&mut client).await;
             assert_eq!(tag, b'E');
@@ -1344,7 +1465,7 @@ mod tests {
         }
         greet(&mut successor).await;
         assert_eq!(query(&mut successor).await, key);
-        if matches!(failure, BackendFailure::StorageClosed { replacement: ReplacementKey::Refuse }) {
+        if matches!(replacement, ReplacementKey::Refuse) {
             send(&mut successor, b'E', b"SERROR\0C53200\0MOut of memory\0\0").await;
             let (tag, body) = receive(&mut client).await;
             assert_eq!(tag, b'E');
@@ -1356,6 +1477,14 @@ mod tests {
         send(&mut successor, b'C', b"SET\0").await;
         send(&mut successor, b'Z', b"I").await;
         assert_eq!(query(&mut successor).await, "UPDATE counters SET n = n + 1");
+        if matches!(replacement, ReplacementKey::Expired) {
+            send(&mut successor, b'E', b"SERROR\0C57014\0MReplay permit elapsed\0yrtdb.node/replay-window-elapsed\0\0").await;
+            let (tag, body) = receive(&mut client).await;
+            assert_eq!(tag, b'E');
+            assert!(String::from_utf8_lossy(&body).contains("outcome is unknown"));
+            assert!(running.await.unwrap().is_err());
+            return;
+        }
         send(&mut successor, b'C', b"UPDATE 1\0").await;
         send(&mut successor, b'Z', b"I").await;
         let answer = tokio::time::timeout(std::time::Duration::from_secs(5), receive(&mut client)).await.expect("the successor's answer reaches the client");
@@ -1365,7 +1494,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_resent_command_refused_part_way_has_an_unknown_outcome_for_the_lost_attempt_may_have_committed() {
+    async fn a_replacement_that_refuses_the_command_shape_leaves_the_original_outcome_unknown() {
         let directory = rtdb_directory::MemoryDirectory::new();
         let record = directory.create_deployment(DeploymentRecord::new("shop", "acme", vec![], 0)).await.unwrap();
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1387,7 +1516,6 @@ mod tests {
         send(&mut crashing, b'C', b"SET\0").await;
         send(&mut crashing, b'Z', b"I").await;
         assert_eq!(query(&mut crashing).await, command);
-        // It commits, and its replies are lost with it.
         drop(crashing);
 
         greet(&mut successor).await;
@@ -1395,16 +1523,43 @@ mod tests {
         send(&mut successor, b'C', b"SET\0").await;
         send(&mut successor, b'Z', b"I").await;
         assert_eq!(query(&mut successor).await, command);
-        send(&mut successor, b'C', b"BEGIN\0").await;
-        send(&mut successor, b'C', b"UPDATE 1\0").await;
-        send(&mut successor, b'E', format!("SERROR\0C57P03\0M{}\0\0", rtdb_node::NOT_HELD).as_bytes()).await;
-        send(&mut successor, b'Z', b"E").await;
-        assert_eq!(receive(&mut client).await.1, b"BEGIN\0");
-        assert_eq!(receive(&mut client).await.1, b"UPDATE 1\0");
+        send(&mut successor, b'E', b"SERROR\0C0A000\0MUnsupported replay command\0\0").await;
         let (tag, body) = receive(&mut client).await;
         assert_eq!(tag, b'E');
         assert!(String::from_utf8_lossy(&body).contains("outcome is unknown"), "the client is not told the command failed: {}", String::from_utf8_lossy(&body));
         let _ = running.await;
+    }
+
+    #[tokio::test]
+    async fn an_unanswered_write_that_outlives_its_original_permit_is_not_replayed() {
+        let directory = rtdb_directory::MemoryDirectory::new();
+        let record = directory.create_deployment(DeploymentRecord::new("shop", "acme", vec![], 0)).await.unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let (mut client, gateway) = pair(&listener).await;
+        let (first, mut dying) = pair(&listener).await;
+        let router = Arc::new(Next(tokio::sync::Mutex::new(None)));
+        let startup = Bytes::from_static(b"\0\0\0\x08\0\x03\0\0");
+        let mut session = Session::new(startup, router, directory, record.id, None, true);
+        session.command_key_age = Duration::from_millis(50);
+        let running = tokio::spawn(session.run(gateway, first, None, 0));
+
+        tokio::time::timeout(Duration::from_secs(5), async {
+            greet(&mut dying).await;
+            assert_eq!(receive(&mut client).await.0, b'R');
+            assert_eq!(receive(&mut client).await.0, b'Z');
+            send(&mut client, b'Q', b"UPDATE counters SET n = n + 1\0").await;
+            let (tag, bytes) = receive(&mut dying).await;
+            assert_eq!(tag, GATEWAY_SESSION_STATE_TAG);
+            assert_eq!(GatewayReplayPermit::decode(&bytes).unwrap().mode, GatewayReplayMode::ConfirmDispatch);
+            send(&mut dying, b'Z', b"I").await;
+            assert_eq!(query(&mut dying).await, "UPDATE counters SET n = n + 1");
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            drop(dying);
+            let (tag, body) = receive(&mut client).await;
+            assert_eq!(tag, b'E');
+            assert!(String::from_utf8_lossy(&body).contains("outcome is unknown"));
+            assert!(running.await.unwrap().is_err());
+        }).await.unwrap();
     }
 
     fn status(key: &str, value: &str) -> Frame { Frame { tag: b'S', body: Bytes::from(format!("{key}\0{value}\0")) } }

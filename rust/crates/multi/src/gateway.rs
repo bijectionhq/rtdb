@@ -21,6 +21,7 @@ use tokio_util::task::AbortOnDropHandle;
 use crate::control::{self, Request, Response};
 
 const SSL_REQUEST: i32 = 80877103;
+const WRITER_DIAL_TIMEOUT: Duration = Duration::from_secs(1);
 const GSSENC_REQUEST: i32 = 80877104;
 const CANCEL_REQUEST: i32 = 80877102;
 const PROTOCOL_3: i32 = 196608;
@@ -341,7 +342,7 @@ async fn route(router: &GatewayRouter) -> Result<(TcpStream, Option<String>, u64
         && let Some(control_address) = member.control_address
         && let Ok((Response::Held { address, epoch }, confirmed)) = confirm_writer(directory.as_ref(), &record, &control_address, options).await
     {
-        return Ok((connect(&address).await?, Some(confirmed), epoch, record.id));
+        return Ok((connect_writer(&address, options).await?, Some(confirmed), epoch, record.id));
     }
     let members: BTreeMap<MemberId, MemberRecord> = directory.members().await?.into_iter().map(|member| (member.id.clone(), member)).collect();
     if router.snapshot && record.checkpoint.is_some() && record.lifecycle == Lifecycle::Live {
@@ -372,7 +373,7 @@ async fn route(router: &GatewayRouter) -> Result<(TcpStream, Option<String>, u64
     for candidate in candidates(&record, &members) {
         let Some(control_address) = &candidate.control_address else { continue; };
         match confirm_writer(directory.as_ref(), &record, control_address, options).await {
-            Ok((Response::Held { address, epoch }, confirmed)) => return Ok((connect(&address).await?, Some(confirmed), epoch, record.id.clone())),
+            Ok((Response::Held { address, epoch }, confirmed)) => return Ok((connect_writer(&address, options).await?, Some(confirmed), epoch, record.id.clone())),
             Ok((Response::Refused { code, message }, _)) if control::retryable_activation(&code) => {
                 retryable = Some(Anomaly::new(AnomalyCategory::Unavailable, code, message));
             }
@@ -430,6 +431,16 @@ async fn connect(address: &str) -> Result<TcpStream> {
     let stream = TcpStream::connect(address).await.map_err(io)?;
     stream.set_nodelay(true).map_err(io)?;
     Ok(stream)
+}
+
+async fn connect_writer(address: &str, options: &GatewayOptions) -> Result<TcpStream> {
+    let failed = || Anomaly::new(AnomalyCategory::Unavailable, control::WRITER_PGWIRE_UNREACHABLE, "The writer's pgwire endpoint is unreachable");
+    tokio::time::timeout(options.control_timeout.min(WRITER_DIAL_TIMEOUT), connect(address))
+        .await.map_err(|_| failed())?.map_err(|_| failed())
+}
+
+pub(crate) async fn probe_pgwire(address: &str, timeout: Duration) -> bool {
+    matches!(tokio::time::timeout(timeout, TcpStream::connect(address)).await, Ok(Ok(_)))
 }
 
 /// Returns None for a cancel request, which this gateway does not forward.

@@ -189,15 +189,12 @@ Full refinement still needs the async opener, the expression evaluator and optim
 
 ### Submission clock and durable retry attribution
 
-Native submissions with an application idempotency key use a finite one-hour marker interval measured from submission.
-The resolver identifies the generated duplicate guard by its recorded position in the source transaction.
-An assertion failure elsewhere in the same operation sequence keeps its own aborted result.
-The outcome lookup uses the retry's historical system-time view of the key marker.
-The new reader still recognizes earlier source records and looks up their duplicate outcomes using the older guard convention.
-Verus checks the exact expiration boundary and operation-position helpers, with four mutation controls.
-Native regressions cover a system-time jump, a user assertion at the next position, concurrent submissions, and old and new outcome lookup after local restart.
-The application marker table remains writable through ordinary DML.
-This evidence covers the checked helpers and the tested recovery trace. [Native tests](../../rust/crates/node/tests/native.rs) · [Verus study](../../verification/verus/idempotency_window/area.json) · [Source transaction contract](db.allium)
+Ordinary keyed submissions on main use engine-owned receipts that bind the authenticated principal and request body to a committed outcome.
+An older source format records the submission sample and position of its generated assertion.
+The reader preserves that format and attributes a historical retry only when the resolver identifies that assertion at the encoded position.
+It finds the original marker in the historical system-time snapshot using the encoded submission sample.
+Verus checks the finite clock arithmetic and attribution by operation index.
+A native regression reads an older source record, resolves a typed duplicate, and recovers its outcome after restart. [Native tests](../../rust/crates/node/tests/native.rs) · [Verus study](../../verification/verus/idempotency_window/area.json) · [Source transaction contract](db.allium)
 
 ### Private replay admission and marker authority
 
@@ -413,6 +410,7 @@ The model starts with a well-placed four-bucket tree whose leaf rows have alread
 Lean 4.35.0 audited six theorems and rejected mutations that omit the root or assign one child its neighbour's path.
 The JVM regressions check a rootless legacy message, a nonempty root with sparse children and equal-IID rows, actual IID-path selection, and insertion after reopening.
 Full refinement of the persistence and Arrow-backed lookup paths remains open. [Wire proof](../../verification/lean/TrieWirePaths.lean) · [JVM codec regressions](../../core/src/test/kotlin/xtdb/trie/MemoryHashTrieTest.kt)
+Stable replay of aborted outcomes remains open in the Multi target. [Lean model](../../verification/lean/PrivateReplay.lean) · [Verus study](../../verification/verus/idempotency_window/area.json) · [Node tests](../../rust/crates/node/tests/native.rs) · [Wire tests](../../rust/crates/tx/tests/submission.rs) · [Transaction contract](db.allium)
 
 ## Multi evidence
 
@@ -466,4 +464,31 @@ TLC checks a single unexpired command, a bounded clock, and an atomic duplicate 
 The model finds duplicate mutations when SQL settings own the key or malformed application metadata suppresses the fallback, and finds deadline renewal when writer loss resets the cutoff.
 Verus checks the exact Rust cutoff selector and rejects a mutation that replaces an existing cutoff.
 The native Pgwire regression runs both duplicate cases against a real engine, and the gateway tests check repeated replacement and legacy refusal.
-Durable idempotency-table refinement, time and expiration assumptions, volatile client-supplied application keys, and general multi-statement replay remain separate obligations. [Lean proof](../../verification/multi/lean/GatewayReplay.lean) · [TLA+ model](../../verification/multi/tla/RTDBGatewayReplay.tla) · [Verus checks](../../verification/verus/replay_deadline/area.json) · [Pgwire tests](../../rust/crates/pgwire/src/protocol.rs) · [Gateway tests](../../rust/crates/multi/src/session.rs)
+This earlier model abstracts marker retention and command eligibility. [Lean proof](../../verification/multi/lean/GatewayReplay.lean) · [TLA+ model](../../verification/multi/tla/RTDBGatewayReplay.tla) · [Verus checks](../../verification/verus/replay_deadline/area.json) · [Pgwire tests](../../rust/crates/pgwire/src/protocol.rs) · [Gateway tests](../../rust/crates/multi/src/session.rs)
+
+### Replay permit and protected marker
+
+The protected permit assigns one stable marker key and one exclusive cutoff to both the original submission and every replacement.
+An admitted submission compares its own clock with the cutoff before append.
+The marker is retained at least until that cutoff and cannot be written or deleted by ordinary SQL.
+Lean proves at most one mutation for an arbitrary finite sequence of attempts and arbitrary clock samples, assuming ordered atomic guard and marker publication.
+TLC covers either writer reaching submission first and checks five counterexamples where a delayed original, older writer, changing application key, early expiry or marker deletion defeats the corresponding safeguard.
+The setup replay checker also exhibits an Execute arriving between an earlier eligibility decision and the end of the refusal drain.
+The gateway rechecks the final pending frames before resending them.
+Verus checks the production gateway's finite cutoff arithmetic, feature and age requirements, and the setup frame classification.
+The Rust wire fixture checks the exact nonce and cutoff encoding, while the Pgwire regression checks refusal before executing any replayed batch.
+The live-cell test withholds a committed reply, completes a holder move, and checks that the same client gets a reply and observes one mutation.
+The proof assumes the acknowledged journal prefix, single ordered resolver, and authentic writer capabilities. [Lean proof](../../verification/multi/lean/ReplayPermit.lean) · [TLA+ model](../../verification/multi/tla/RTDBReplayPermit.tla) · [Verus checks](../../verification/verus/replay_admission/area.json) · [Cell tests](../../rust/crates/multi/tests/cell.rs)
+
+### Multi serving endpoint failure
+
+Lean proves that repeated pgwire failures reach any finite threshold when the address pair stays fixed, even while control answers.
+Verus checks the production failure count, including reset after success or address replacement and saturation at the machine bound.
+TLC checks that failed observations can confirm only the corresponding address pair and that a waiting startup eventually connects under fair probe, placement, and retry steps.
+The model treats a reachable replacement and available directory and quorum as premises, with a startup budget sufficient for those steps.
+The weakened variants mask data endpoint failure with a healthy control response, confirm death from stale observations, or abandon the first failed dial.
+The native cell regression keeps the control endpoint responsive, breaks pgwire, and verifies the same client startup reaches the replacement and reads the committed data.
+A separate native test changes the pgwire address between the probe and publication.
+The TCP probe measures reachability without competing for a pgwire session slot.
+The capacity regression fills the writer's configured session slots and verifies that the controller keeps the writer live.
+Post-connect stalls and gateway-only network splits invisible to the controller fall outside this recovery claim. [Lean proof](../../verification/multi/lean/ServingFailure.lean) · [TLA+ model](../../verification/multi/tla/RTDBServingFailure.tla) · [Verus checks](../../verification/verus/member_probe/area.json) · [Cell tests](../../rust/crates/multi/tests/cell.rs)

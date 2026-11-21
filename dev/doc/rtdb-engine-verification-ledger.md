@@ -200,7 +200,7 @@ A proof of a candidate is conditional on the explicitly stated contract and work
 | CELL05 · Watch consistency | Open | — |
 | CELL06 · Fault detection independence | Open | — |
 | CELL07 · Isolation and engine selection | Open | — |
-| CELL08 · Planned handoff | Partial | [Protected write replay and mixed-version refusal](rtdb-engine-proof-evidence.md#gateway-write-replay) |
+| CELL08 · Planned handoff | Partial | [Protected permit replay through a real holder move](rtdb-engine-proof-evidence.md#replay-permit-and-protected-marker) |
 | CELL09 · Cold activation | Partial | [Integrated Multi worker-loss and bitemporal replay regression](rtdb-engine-proof-evidence.md#main-evidence) |
 | CELL10 · Cross-cell cutover | Partial | [Bounded cross-cell transfer and fair activation model](rtdb-engine-proof-evidence.md#multi-evidence) |
 | CELL11 · Move retries | Open | — |
@@ -254,13 +254,13 @@ A proof of a candidate is conditional on the explicitly stated contract and work
 | API05 · Pgwire state machine | Open | — |
 | API06 · Parameters and results | Open | — |
 | API07 · Prepared handles and portals | Open | — |
-| API08 · Reply attribution | Partial | [Acknowledged key and replay regression tests](rtdb-engine-proof-evidence.md#gateway-write-replay) |
+| API08 · Reply attribution | Partial | [Acknowledged permit and reply-loss regressions](rtdb-engine-proof-evidence.md#replay-permit-and-protected-marker) |
 | API09 · Streaming ingestion | Open | — |
 | API10 · Handle lifetime | Open | — |
 | API11 · Cancellation isolation | Open | — |
 | API12 · Authentication refresh | Open | — |
 | API13 · Cross-deployment noninterference (Candidate) | Open | — |
-| API14 · Bounded gateway replay | Partial | [Lean, TLC, Verus and native replay tests](rtdb-engine-proof-evidence.md#gateway-write-replay) |
+| API14 · Bounded gateway replay | Partial | [Recovery cutoff inheritance](rtdb-engine-proof-evidence.md#gateway-write-replay) · [Protected submission cutoff](rtdb-engine-proof-evidence.md#replay-permit-and-protected-marker) |
 
 ## Resource accounting and operational progress
 
@@ -271,7 +271,7 @@ A proof of a candidate is conditional on the explicitly stated contract and work
 | RES03 · Error and cancel cleanup | Open | — |
 | RES04 · Queue and frame admission | Open | — |
 | RES05 · Scoped shutdown | Open | — |
-| RES06 · Health and readiness | Open | — |
+| RES06 · Health and readiness | Partial | [Multi serving endpoint probes and recovery](rtdb-engine-proof-evidence.md#multi-serving-endpoint-failure) |
 | RES07 · Placement demand | Open | — |
 | RES08 · Physical memory envelope (Candidate) | Open | — |
 | RES09 · Cancellation work bound (Candidate) | Open | — |

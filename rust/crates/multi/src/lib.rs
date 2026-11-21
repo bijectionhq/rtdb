@@ -25,6 +25,8 @@ mod ordered_index_storage;
 pub mod packing;
 pub mod read_width;
 mod replay_deadline;
+mod member_probe;
+mod replay_admission;
 pub mod recovery;
 mod recovery_holds;
 pub mod reference;

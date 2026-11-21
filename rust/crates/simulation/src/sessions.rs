@@ -11,7 +11,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use bytes::{BufMut, Bytes, BytesMut};
-use rtdb_pgwire::{GATEWAY_KEY_CONFIRM_KIND, GATEWAY_SESSION_STATE_TAG};
+use rtdb_pgwire::{GATEWAY_KEY_CONFIRM_KIND, GATEWAY_REPLAY_PERMIT_KIND, GATEWAY_SESSION_STATE_TAG, GatewayReplayMode, GatewayReplayPermit};
 use rtdb_directory::{DeploymentRecord, Directory, MemoryDirectory};
 use rtdb_multi::session::{Frame, Router, Session};
 use rtdb_node::NOT_HELD;
@@ -241,13 +241,15 @@ impl Backend {
         }
         self.note("greets".to_owned());
         if !Self::send(&mut stream, &[
-            frame(b'R', &[0, 0, 0, 0]), frame(GATEWAY_SESSION_STATE_TAG, &[GATEWAY_KEY_CONFIRM_KIND]), ready(b'I'),
+            frame(b'R', &[0, 0, 0, 0]), frame(GATEWAY_SESSION_STATE_TAG, &[GATEWAY_KEY_CONFIRM_KIND]),
+            frame(GATEWAY_SESSION_STATE_TAG, &[GATEWAY_REPLAY_PERMIT_KIND]), ready(b'I'),
         ]).await { return; }
         self.world.lock().expect("unpoisoned").greeted += 1;
         reconnected.notify_one();
         let mut prepared = false;
         let mut prepared_now = false;
         let mut bound = None;
+        let mut replay_simple = false;
         loop {
             let Some(request) = read_frame(&mut stream).await else { return };
             match request.tag {
@@ -281,16 +283,22 @@ impl Backend {
                     if dies_idle { return self.die(&mut stream, "after preparing a statement").await; }
                     continue;
                 }
-                GATEWAY_SESSION_STATE_TAG if request.body.first() == Some(&GATEWAY_KEY_CONFIRM_KIND) => {
-                    let Ok(key) = std::str::from_utf8(&request.body[1..]) else { return };
+                GATEWAY_SESSION_STATE_TAG if matches!(request.body.first().copied(), Some(GATEWAY_KEY_CONFIRM_KIND | GATEWAY_REPLAY_PERMIT_KIND)) => {
+                    let (key, acknowledge) = if let Some(permit) = GatewayReplayPermit::decode(&request.body) {
+                        replay_simple = permit.mode == GatewayReplayMode::Replay;
+                        (permit.nonce.simple().to_string(), permit.mode != GatewayReplayMode::Dispatch)
+                    } else {
+                        let Ok(key) = std::str::from_utf8(&request.body[1..]) else { return };
+                        (key.to_owned(), true)
+                    };
                     if self.rng.chance(4) { return self.die(&mut stream, "on being keyed").await; }
                     {
                         let mut shared = self.world.lock().expect("unpoisoned");
                         let ordinal = shared.keys.len();
                         shared.keys.entry(key.to_owned()).or_insert((ordinal, 0)).1 += 1;
                     }
-                    if self.key.as_ref().is_none_or(|(current, _)| current != key) { self.key = Some((key.to_owned(), 0)); }
-                    if !Self::send(&mut stream, &[ready(self.status())]).await { return; }
+                    if self.key.as_ref().is_none_or(|(current, _)| current != &key) { self.key = Some((key, 0)); }
+                    if acknowledge && !Self::send(&mut stream, &[ready(self.status())]).await { return; }
                     continue;
                 }
                 b'Q' => {}
@@ -298,6 +306,10 @@ impl Backend {
             }
             let query = String::from_utf8_lossy(request.body.strip_suffix(b"\0").unwrap_or(&request.body)).into_owned();
             let statements: Vec<&str> = query.split("; ").collect();
+            if std::mem::take(&mut replay_simple) && (statements.len() != 1 || !query.starts_with(UPDATE) && !query.starts_with(SELECT)) {
+                let _ = Self::send(&mut stream, &[frame(b'E', b"SERROR\0C0A000\0MUnsupported replay command\0\0")]).await;
+                return;
+            }
             // A rollback ends the session's transaction on the node, whether it still holds the deployment or not.
             let fault = match self.draw(statements.len()) {
                 Fault::Refuse { .. } | Fault::None { .. } if statements[0] == "ROLLBACK" => Fault::None { idle_death: false },

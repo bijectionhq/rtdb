@@ -294,8 +294,7 @@ config {
     -- Liveness.
     member_heartbeat: Duration = 500.milliseconds
     member_lease: Duration = 3.seconds
-    -- Independent gateway reports that corroborate a suspicion before the controller confirms it.
-    suspicion_reporters: Integer = 2
+    failed_serving_probe_rounds: Integer = 2
 
     -- The log.
     ensemble_size: Integer = 3
@@ -324,6 +323,7 @@ config {
     -- Transactions.
     idempotency_window: Duration = 1.hours
     command_replay_window: Duration = 30.seconds
+    replay_permit_age: Duration = 30.minutes
     system_time_skew_bound: Duration = 500.milliseconds
 
     -- Reads.
@@ -975,21 +975,20 @@ rule ExpireLease {
 }
 
 rule ConfirmSuspicion {
-    -- Gateways report connection failures to the controller.
-    -- Safety never depends on this verdict, so it can be quick: a wrong one costs one seal and a cache move.
-    when: SuspicionReported(member, reporters)
+    when: ServingProbeFailureObserved(member, endpoints, consecutive_failures)
 
-    requires: member.state in {eligible, draining}
-    requires: count(reporters) >= config.suspicion_reporters
-    requires: not LeaseRenewedSince(member, earliest(reporters.reported_at))
+    requires: member.state in {joining, eligible, draining}
+    requires: consecutive_failures >= config.failed_serving_probe_rounds
+    requires: endpoints = CurrentServingEndpoints(member)
 
     ensures:
         member.state = dead
 }
 
 rule ProbeMemberLiveness {
-    -- A controller pass issues up to sixteen member probes at a time.
-    -- Missing replies count against the endpoint that was probed.
+    -- A controller pass probes up to sixteen members at a time.
+    -- A round succeeds when the control endpoint answers and the pgwire TCP endpoint accepts a connection.
+    -- A successful round or a change to either endpoint clears preceding failures.
     when: ControllerProbeDue(cell)
 
     ensures:
@@ -2540,7 +2539,7 @@ invariant QuarantineIsolates {
 ------------------------------------------------------------
 
 actor Gateway {
-    -- Terminates client connections, owns sessions, authenticates, mints capabilities and idempotency keys, routes by affinity, reports suspicion.
+    -- Terminates client connections, owns sessions, authenticates, mints capabilities and idempotency keys, and routes by affinity.
     -- A gateway configured with a PostgreSQL TLS key store completes the client's TLS handshake before it routes startup.
     -- A configured gateway refuses plaintext startup before any holder receives credentials.
     -- A Flight SQL gateway forwards the authenticated transport peer using a proof for the deployment and writer epoch.
@@ -2607,16 +2606,23 @@ surface ClientAccess {
 
     @guarantee MovesAreInvisible
         -- A planned handoff stalls writes for one log round plus a redirect, and touches no client connection.
-        -- A failover stalls writes until detection and claim complete, and a retried commit returns the outcome the first attempt had.
+        -- A failover stalls writes until detection and claim complete.
+        -- A successful replay of a previously committed permitted write recovers the original committed outcome.
         -- A dispatch failure preserves any complete command response the gateway has received.
         -- A writable pgwire pipeline waits for ReadyForQuery between command cycles so each autocommit cycle has its own retry key.
         -- A copy-in transfer can send its input frames before ReadyForQuery.
-        -- The gateway can resend an unanswered keyed command under its original key, including an extended-protocol exchange flushed before Sync.
-        -- Deduplication on resend requires each submitted transaction to use the same key within idempotency_window.
+        -- The gateway can resend unanswered extended-protocol setup frames before execution.
+        -- The gateway can ask a replacement to replay an unanswered simple query under its original command permit.
+        -- A replacement admits replay of a single autocommit statement before executing any part of it.
+        -- Transaction control and batches return an unknown outcome after an ambiguous failure.
         -- A writer installs a key before executing the command it guards.
         -- The writer preserves the gateway key through changes to SQL session state.
-        -- The gateway retries an unanswered write only when both writers support this protection.
-        -- The gateway waits for the replacement writer to acknowledge the original key before replaying the command.
+        -- An unanswered write can be replayed only when both writers support the same private permit contract.
+        -- The gateway waits for the replacement writer to acknowledge the original permit before replaying the command.
+        -- The dispatch and replay share an exclusive submission cutoff issued when the command starts, within replay_permit_age.
+        -- Both writers refuse a permitted submission at or after that cutoff before appending it.
+        -- Every committed permitted write records its command key with its effects, and retains the marker through the cutoff.
+        -- An aborted attempt leaves the existing marker state intact, and another admitted attempt can still commit if that state has no marker.
         -- Closed storage before the first command reply allows a keyed retry on a newer writer epoch.
         -- A holder's driver shutdown during a command leaves the outcome unknown until a keyed retry returns it.
         -- An authenticated idle session retains its acknowledged named prepared statements across holder changes.
@@ -2639,12 +2645,21 @@ surface ClientAccess {
         -- Closing a session frees its reserved capacity.
         -- A gateway admits buffered frame bytes before reading the body and releases the charge when their last owner drops them.
 
+    @guarantee WriterDialRecovery
+        -- A failed dial to a confirmed writer is retryable within the enclosing startup or replay window.
+        -- A gateway attempt follows placement changes while that window remains open.
+
     @guarantee ReadYourWrites
         -- Within a session, every read sees every transaction the session was acknowledged.
 
-    @guarantee OneOutcomePerKey
-        -- A transaction retried with the same idempotency key within idempotency_window has exactly one outcome, whichever member answers.
-        -- The identity is the database, the authenticated principal and the key; its receipt records a digest of the transaction's operations and effect-bearing options.
+    @guarantee AtMostOneCommitPerPermit
+        -- Retries sharing one private permit produce at most one committed effect.
+        -- A permitted write uses its own engine-owned marker under the command key.
+        -- The writer refuses a permit if the transaction supplies a different application key.
+
+    @guarantee OrdinaryRetryReceipts
+        -- The ordinary retry identity is the database, the authenticated principal and the key.
+        -- Its receipt records a digest of the transaction's operations and effect-bearing options.
         -- A retry with the same body is answered with the original's outcome; a different body under the identity aborts with rtdb/idempotency-conflict.
         -- The resolver decides from engine-owned receipts in xt.idempotency_receipts, which SQL cannot write, valid for idempotency_window of system time.
         -- A string application key takes precedence over the gateway key and must be stable across attempts for deduplication.
@@ -2676,7 +2691,6 @@ surface ControlPlane {
     context cell: Cell
 
     provides:
-        SuspicionReported(controller, member, reporters)
         MoveChosen(controller, record, target)
         NodeOverWatermark(controller, member, dimension)
         EngineRolloutStarted(controller, cell, version)

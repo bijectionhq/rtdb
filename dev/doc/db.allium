@@ -374,7 +374,7 @@ variant TxMessage : SourceMessage {
     -- Differently typed scalar columns can share a dense union in the source message and retain their Arrow representation on replay.
     -- Null and missing values use that union's null leg.
     -- A historical native keyed submission can carry an optional guard envelope with a submission clock sample and guard position.
-    -- Older and unkeyed records can omit the envelope.
+    -- Current ordinary keyed submissions carry the key in metadata and omit the historical guard envelope.
     -- The key marker is valid from its submission sample, inclusive, until one hour later, exclusive.
     -- For a record carrying the envelope, the failed assertion must have the recorded position to identify a duplicate.
     -- Typed outcome lookup selects the latest marker visible at the retry's system time whose validity extends past the retry's submission sample.
