@@ -1932,10 +1932,13 @@ rule Fork {
 }
 
 rule ForkAcrossOrganisations {
-    -- A fork into another organisation is a server-side copy, re-encrypted under the child's key, into a new lineage.
+    -- A fork into another organisation creates its own lineage and key.
+    -- Its checkpoint closure and its selected tail are copied under the child's key before the directory publishes the child.
+    -- Publication checks the parent in the writer epoch and storage generation used to prepare the copy.
     when: ForkRequested(parent, basis, org)
 
     requires: org != parent.org
+              and parent.lifecycle in {live, quarantined}
 
     ensures:
         let child = CreateDeployment(org)

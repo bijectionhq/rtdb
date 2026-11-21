@@ -561,9 +561,7 @@ fn archive_witness(deployment: Uuid, operation: Uuid) -> Result<ObjectKey> {
     key(&format!("checkpoint-authorities/{deployment}/{operation}.json")).map_err(Into::into)
 }
 
-fn verify_cut(catalog: &BlockCatalog, point: &CapturePoint) -> Result<()> {
-    let checkpoint = point.checkpoint;
-    let epoch = StorageEpoch(point.log_epoch);
+fn verify_cut(catalog: &BlockCatalog, checkpoint: Checkpoint, epoch: StorageEpoch) -> Result<()> {
     if catalog.block_index().0 != checkpoint.block
         || catalog
             .boundary_replica_position()
@@ -593,8 +591,12 @@ async fn checkpoint_objects(
     let block = BlockIndex(point.checkpoint.block);
     let catalog_key = key(&block_key(block)?)?;
     let catalog = BlockCatalog::decode(&plaintext.get(&catalog_key).await?)?;
-    verify_cut(&catalog, point)?;
-    let mut closure = BTreeSet::from([catalog_key]);
+    verify_cut(&catalog, point.checkpoint, StorageEpoch(point.log_epoch))?;
+    catalog_objects(plaintext, block, &catalog).await
+}
+
+async fn catalog_objects(plaintext: &dyn ObjectStore, block: BlockIndex, catalog: &BlockCatalog) -> Result<BTreeSet<ObjectKey>> {
+    let mut closure = BTreeSet::from([key(&block_key(block)?)?]);
     for table in catalog.table_entries()? {
         let path = key(&table.slug.block_key(block)?)?;
         let metadata = TableBlock::decode(&plaintext.get(&path).await?)?;
@@ -619,6 +621,52 @@ async fn checkpoint_objects(
         }
     }
     Ok(closure)
+}
+
+pub(crate) async fn copy_fork_checkpoint(
+    bucket: Arc<dyn ObjectStore>,
+    keys: &dyn KeyService,
+    source: &DeploymentRecord,
+    source_key: &[u8],
+    child: &DeploymentRecord,
+    child_key: &[u8],
+    at_block: Option<i64>,
+) -> Result<()> {
+    let selected = at_block.or_else(|| source.checkpoint.map(|checkpoint| checkpoint.block))
+        .ok_or_else(|| unavailable("The source has no checkpoint to copy"))?;
+    let recovery = ArchivedCheckpoint::load(source, keys, IoRegion::new()).await?;
+    let version = checkpoint_storage_root()?;
+    let source_root = format!("{}/{version}", source.storage_prefix());
+    let destination_root = format!("{}/{version}", child.storage_prefix());
+    let owner = bucket.get(&key(&format!("{source_root}/{ROOT_MARKER}"))?).await?;
+    if owner.as_ref() != source.id.as_bytes() {
+        return Err(inconsistent("The checkpoint belongs to another source"));
+    }
+    let source_store = open_deployment_store_with_archive(
+        bucket.clone(), &source_root, PackDiscovery::From(selected), wall_clock(), recovery,
+    ).await?;
+    let plaintext = EncryptingStore::new(source_store, source_key)?;
+    let block = BlockIndex(selected);
+    let catalog_key = key(&block_key(block)?)?;
+    let catalog_bytes = plaintext.get(&catalog_key).await?;
+    let catalog = BlockCatalog::decode(&catalog_bytes)?;
+    if catalog.block_index() != block || !catalog.secondary_databases().is_empty() {
+        return Err(inconsistent("The selected fork checkpoint has a different block or owns secondary databases"));
+    }
+    if let Some(checkpoint) = source.checkpoint.filter(|checkpoint| checkpoint.block == selected) {
+        verify_cut(&catalog, checkpoint, StorageEpoch(source.log_epoch))?;
+    }
+    let closure = catalog_objects(&plaintext, block, &catalog).await?;
+    let physical = Arc::new(PrefixedStore::new(bucket, destination_root));
+    crate::store::check_root(physical.as_ref(), &child.id, true).await?;
+    let packed = crate::packing::PackingStore::open(physical, PackDiscovery::List).await?;
+    let cipher = Cipher::new(child_key)?;
+    for object in closure.into_iter().filter(|object| object != &catalog_key) {
+        let content = plaintext.get(&object).await?;
+        packed.put(&object, cipher.seal_deterministic(object.as_str(), &content)?).await?;
+    }
+    packed.put(&catalog_key, cipher.seal_deterministic(catalog_key.as_str(), &catalog_bytes)?).await?;
+    Ok(())
 }
 
 /// Copies the closure of one already published checkpoint. A capture ID

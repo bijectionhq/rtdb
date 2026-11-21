@@ -43,6 +43,15 @@ pub async fn run(directory: &dyn Directory) {
     let child = directory.create_fork(child, applied.version).await.unwrap();
     assert_eq!(directory.deployment_by_name(&child.name).await.unwrap().as_ref(), Some(&child));
 
+    let mut external = DeploymentRecord::new(format!("{name}-external"), "other-org", vec![], 0);
+    external.parent = Some(applied.id.clone());
+    let mut foreign_lineage = external.clone();
+    foreign_lineage.lineage.clone_from(&applied.lineage);
+    assert_eq!(directory.create_fork(foreign_lineage, applied.version).await.unwrap_err().code, "rtdb.directory/fork-parent-changed");
+    let external = directory.create_fork(external, applied.version).await.unwrap();
+    assert_eq!(external.lineage, external.id);
+    assert_eq!(directory.deployment_by_name(&external.name).await.unwrap().as_ref(), Some(&external));
+
     let mut deleting = applied.clone();
     deleting.lifecycle = Lifecycle::Deleting;
     deleting.holder = None;
