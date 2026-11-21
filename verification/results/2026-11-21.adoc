@@ -937,6 +937,49 @@ All five tests in the maintenance `gc` suite passed with that follow-up.
 This deployment boundary covers one installed partition authority and its trie collector.
 Coordination between nodes, other physical deletion paths, and checkpoint and log retention during recovery remain open.
 
+== Reader leases across nodes
+
+The previous boundary left readers on other nodes unprotected, because their catalogs never reach the writer's collector.
+Every node now gives each query snapshot a bounded read lease.
+A node reads its clock, then the replica log tip, and anchors the lease once its catalog has applied that tip.
+A snapshot captured afterwards may begin provider requests strictly before the anchor plus `reader_lease` minus `reader_lease_margin`, one hour and one minute by default.
+The storage I/O region checks the lease as it admits each provider request and refuses a late one with `rtdb.storage/read-lease-expired`.
+A node that cannot confirm its catalog waits up to the margin for its log processor and then holds an expired lease.
+The trie collector deletes an eligible trie only after a whole lease has passed on its own clock since it first observed the trie as eligible.
+A collector starts with no observations after restart or failover.
+A node that reads a scan fragment for another node's query captures its own snapshot and holds its own lease.
+
+The link:../verus/read_lease/laws.rs[read lease area] verifies the three production decisions and two laws.
+The composed law assumes the reader's clock stays within `skew` of the collector's, the anchor precedes publication of the retirement, and a request takes at most `io_bound`.
+Under `2 * skew + io_bound <= margin`, an admitted request finishes before any deletion the collector permits.
+Admitting a request at the deadline fails the original contract, and fails both laws when the contract is weakened with it.
+Dropping the margin or the collector's wait, together with its contract, fails the composed law.
+The runner reported 5 verified functions for the baseline and the expected diagnostics for all four controls.
+
+Two conformance tests run a writer and a read-only follower over one shared log and store.
+The follower opens a cursor on a trie that compaction then supersedes.
+Within the lease, the writer's automatic collector keeps both files through three further blocks and the follower reads its admitted row.
+After the clock passes the lease, the writer deletes the data and metadata, and the follower cursor fails with `rtdb.storage/read-lease-expired` before its first provider request.
+Removing the request-time lease check makes the same cursor fail with `rtdb.storage/missing-object` on the trie's metadata, which reproduces the cross-node stranding.
+Removing the collector's wait makes the writer delete the data file while the follower lease is valid.
+An earlier version of the replay warmed the follower's buffer pool with a full query, and its cursor then succeeded from memory after deletion; the tests now open the cursor cold.
+The maintenance suite adds a collector test for the lease boundary and a configuration test for the lease and margin.
+Run them with `BIJECTION_LOCAL_EXECUTION=owner-authorized cargo test --manifest-path rust/Cargo.toml --locked -p rtdb-storage -p rtdb-maintenance -p rtdb-node -p rtdb-conformance`.
+The storage, maintenance, index, query, node, replication and conformance suites ran 851 tests, of which 850 passed.
+The failing `sorted_and_unsorted_limits_open_their_inputs_before_resolving_bounds` statement test also fails on the base commit `e05aac74f` without this change.
+The first suite run found that a database whose log worker had failed before its first query could no longer read its adopted state.
+The maintenance supervisor now confirms the lease anchor on each status change, so a node that was current keeps its lease after its worker stops.
+After rebasing onto `17ad591d6`, the same suites plus `rtdb-multi` ran 991 tests.
+The Multi idempotency test overflowed a worker stack because the lease scope stored a second copy of each cursor future; the scope now returns the work or its scoped future directly, and that test passes.
+Two node search tests timed out awaiting indexed progress under machine load and passed on rerun.
+The maintenance `two_databases_share_a_slot_until_cancelled_uploads_finish` test also hangs on the base commit.
+
+The lease bounds rest on the stated clock-skew and request-duration assumptions, which no runtime check enforces.
+A provider request that outlives `io_bound` can still observe a deletion.
+Nodes with log processing disabled hold no lease, because they have no confirmed catalog; the native follower path always processes the log.
+The lease and margin are node options without server configuration keys.
+Transaction resolution on the leader remains protected by the partition registry and holds no lease.
+
 == Trie dependencies of the installed checkpoint
 
 Commit `2f1019b68` records the exact live and nascent trie identities of the installed checkpoint.

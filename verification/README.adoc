@@ -208,6 +208,7 @@ It also exercises the Azure adapter against a loopback provider and separately m
   The model treats reference accounting and collection authorization as atomic and requires a conclusive provider completion for the deletion step.
   Verus checks the native reader selection decision over the locally captured catalog list.
   The selected Rust maintenance and storage tests exercise the single-partition authority and the transfer of its lifetime into provider I/O.
+  `verus/read_lease` verifies the production lease deadline, admission and collection-wait decisions, and the law that an admitted request finishes before collection under bounded skew and request duration.
 * `tla/CompactionGroup.tla` checks durable, complete sibling publication for one replacement.
   `tla/CompactionOverlap.tla` compares exact sibling membership with a high-water mark across two interleaved generations.
   The Rust catalog regression checks the corresponding admission behavior.

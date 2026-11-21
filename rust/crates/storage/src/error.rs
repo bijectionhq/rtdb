@@ -36,6 +36,8 @@ pub enum Error {
     PermissionDenied { key: String, message: String },
     #[error("log writer at epoch {epoch} was deposed by a seal at epoch {promised}")]
     Deposed { epoch: u64, promised: u64 },
+    #[error("read lease expired at {deadline:?}; now {now}")]
+    ReadLeaseExpired { deadline: Option<i64>, now: i64 },
     #[error("{upload}; multipart abort also failed: {abort}")]
     MultipartAbort { #[source] upload: Box<Error>, abort: Box<Error> },
 }
@@ -68,6 +70,7 @@ impl From<Error> for rtdb_types::Anomaly {
             Error::Remote { key, .. } => (Category::Unavailable, "rtdb.storage/remote", serde_json::json!({"key": key})),
             Error::Deposed { epoch, promised } => (Category::Conflict, "rtdb.storage/deposed", serde_json::json!({"epoch": epoch, "promised": promised})),
             Error::PermissionDenied { key, .. } => (Category::Forbidden, "rtdb.storage/permission-denied", serde_json::json!({"key": key})),
+            Error::ReadLeaseExpired { deadline, now } => (Category::Unavailable, "rtdb.storage/read-lease-expired", serde_json::json!({"deadline": deadline, "now": now})),
             Error::MultipartAbort { upload, abort } => {
                 let mut anomaly = Anomaly::from(*upload);
                 anomaly.message = Some(message);

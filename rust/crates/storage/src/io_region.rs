@@ -1,10 +1,11 @@
 use std::sync::Arc;
 use parking_lot::Mutex;
 use tokio_util::task::{TaskTracker, task_tracker::TaskTrackerToken};
-use crate::{Error, Result};
+use crate::{Error, ReadLease, Result};
 
 tokio::task_local! {
     static RETAINED_OWNER: Arc<dyn Send + Sync>;
+    static READ_LEASE: Arc<ReadLease>;
 }
 
 pub struct IoRegion {
@@ -41,6 +42,19 @@ impl IoRegion {
         };
         RETAINED_OWNER.scope(owner, work).await
     }
+    /// Checks the lease when each provider operation is admitted while polling the work.
+    /// A nested lease narrows the enclosing one.
+    /// Returns the work itself or its scoped future, so a lease adds no copy of the work to the caller's future.
+    pub fn leased<F: std::future::Future>(lease: Option<Arc<ReadLease>>, work: F) -> impl std::future::Future<Output = F::Output> {
+        use tokio_util::either::Either;
+        let lease = match (lease, READ_LEASE.try_with(Arc::clone).ok()) {
+            (Some(lease), Some(parent)) => lease.earlier(parent),
+            (Some(lease), None) => lease,
+            (None, Some(parent)) => parent,
+            (None, None) => return Either::Right(work),
+        };
+        Either::Left(READ_LEASE.scope(lease, work))
+    }
     /// Operations admitted through this child also belong to every ancestor's drain.
     /// Closing a child leaves siblings open; closing an ancestor rejects subsequent admissions through the child.
     /// Idle child handles do not delay any drain.
@@ -72,6 +86,7 @@ impl IoRegion {
     pub(crate) fn admit(&self) -> Result<IoAdmission> {
         let closed = self.closed.lock();
         if *closed { return Err(Error::Closed("I/O region is closed".into())); }
+        if self.parent.is_none() { if let Ok(lease) = READ_LEASE.try_with(Arc::clone) { lease.check()?; } }
         let mut admission = self.parent.as_ref().map(|parent| parent.admit()).transpose()?
             .unwrap_or_else(|| IoAdmission { tokens: Vec::new(), lifetimes: RETAINED_OWNER.try_with(Arc::clone).into_iter().collect() });
         admission.tokens.push(self.tasks.token());

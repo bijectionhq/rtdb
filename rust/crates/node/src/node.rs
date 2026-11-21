@@ -321,9 +321,15 @@ impl Node {
         let query_cpu = held.as_ref().and_then(|database| database.query_cpu_tracker());
         let fragment_residence = held.as_ref().and_then(|database| database.fragment_residence().cloned());
         let mut snapshots = BTreeMap::new();
+        let mut lease: Option<Arc<rtdb_storage::ReadLease>> = None;
         let classic = if placed { BTreeMap::new() } else { self.catalog.open_databases() };
         for (name, database) in held.into_iter().map(|held| (database.to_owned(), held)).chain(classic) {
             if !placed && identity.authorize_database(&name, DatabaseAccess::Read).is_err() { continue; }
+            // Another node may collect what this catalog references; without log processing there is no confirmed catalog to lease.
+            if self.factory.options.replication.enabled {
+                let database_lease = database.read_lease(&self.factory.clock, &self.factory.options.garbage).await?;
+                lease = Some(match lease { Some(lease) => lease.earlier(database_lease), None => database_lease });
+            }
             let head = database.partition.value().live().latest_completed_tx().map(|key| key.system_time);
             let snapshot = database.partition.open_snapshot(head);
             let requested = basis.snapshot.databases.get(&name).and_then(|partitions| partitions.first()).copied().flatten();
@@ -334,8 +340,9 @@ impl Node {
             let cap = match (cap, basis.snapshot_time) { (Some(time), Some(upper)) => Some(time.min(upper)), (time, _) => time };
             snapshots.insert(name, DatabaseSnapshot { partitions: vec![snapshot.with_system_time_cap(cap)?], storage: Arc::clone(&database.storage) });
         }
-        let catalog = CatalogSnapshot::new(database, snapshots, false)?.with_runtime(Arc::new(crate::runtime::NodeCatalogRuntime::new(self.clone(), cancellation.clone())))
+        let mut catalog = CatalogSnapshot::new(database, snapshots, false)?.with_runtime(Arc::new(crate::runtime::NodeCatalogRuntime::new(self.clone(), cancellation.clone())))
             .with_fragmenter(self.scan_fragmenter.clone(), fragment_residence);
+        if let Some(lease) = lease { catalog = catalog.with_read_lease(lease); }
         QueryContext::with_owner(catalog, self.factory.options.query.query_memory(&self.factory.memory), basis.current_time, basis.timezone.clone(), self.factory.options.query.clone(), cancellation, &self.cancellation)?
             .with_accelerators(Arc::clone(&self.factory.accelerators))
             .with_read_options(&basis.snapshot, basis.snapshot_time, self.query_instant())
@@ -357,11 +364,13 @@ impl Node {
             }
             cancellation.run_until_cancelled(tokio::time::sleep(Duration::from_millis(5))).await.ok_or_else(cancelled)?;
         }
+        let lease = if self.factory.options.replication.enabled { Some(database.read_lease(&self.factory.clock, &self.factory.options.garbage).await?) } else { None };
         let snapshot = database.partition.open_snapshot(Some(fragment.basis.system_time));
         let snapshots = BTreeMap::from([(database.name().to_owned(), DatabaseSnapshot { partitions: vec![snapshot], storage: Arc::clone(&database.storage) })]);
-        let catalog = CatalogSnapshot::new(database.name(), snapshots, false)?;
+        let mut catalog = CatalogSnapshot::new(database.name(), snapshots, false)?;
+        if let Some(lease) = &lease { catalog = catalog.with_read_lease(Arc::clone(lease)); }
         let context = QueryContext::with_owner(catalog, Arc::clone(&self.factory.memory), self.query_instant(), fragment.timezone.clone(), self.factory.options.query.clone(), cancellation, &self.cancellation)?;
-        rtdb_query::evaluate_fragment(context, fragment).await
+        rtdb_storage::IoRegion::leased(lease, rtdb_query::evaluate_fragment(context, fragment)).await
     }
 
     async fn submit(&self, database: &str, mut operations: Vec<TxOp>, mut options: SubmitOptions, identity: &dyn SessionIdentity, placement: Option<&Weak<Database>>, cancellation: &CancellationToken) -> Result<SubmittedTx> {

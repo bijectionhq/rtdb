@@ -22,6 +22,7 @@ pub struct CatalogSnapshot {
     pub(crate) runtime: Option<Arc<dyn CatalogRuntime>>,
     pub(crate) fragmenter: Option<Arc<dyn crate::fragment::ScanFragmenter>>,
     pub(crate) fragment_residence: Option<crate::FragmentResidence>,
+    read_lease: Option<Arc<rtdb_storage::ReadLease>>,
 }
 
 impl CatalogSnapshot {
@@ -32,7 +33,7 @@ impl CatalogSnapshot {
         if transaction_scoped && databases.get(&default_database).is_none_or(|database| database.partitions.len() != 1) {
             return Err(invalid("transaction-partition-scope", "An index-time query must contain exactly its resolving partition"));
         }
-        Ok(Self { default_database, databases, transaction_scoped, runtime: None, fragmenter: None, fragment_residence: None })
+        Ok(Self { default_database, databases, transaction_scoped, runtime: None, fragmenter: None, fragment_residence: None, read_lease: None })
     }
     pub fn with_runtime(mut self, runtime: Arc<dyn CatalogRuntime>) -> Self { self.runtime = Some(runtime); self }
     /// Splits this catalog's scans into fragments wherever `fragmenter` asks.
@@ -41,6 +42,9 @@ impl CatalogSnapshot {
         self.fragment_residence = residence;
         self
     }
+    /// Provider requests for this catalog's files begin only while the lease admits them.
+    pub fn with_read_lease(mut self, lease: Arc<rtdb_storage::ReadLease>) -> Self { self.read_lease = Some(lease); self }
+    pub fn read_lease(&self) -> Option<Arc<rtdb_storage::ReadLease>> { self.read_lease.clone() }
     pub fn database_names(&self) -> impl Iterator<Item = &str> { self.databases.keys().map(String::as_str) }
     /// Reserves schema enumeration and joins before creating the returned table bindings.
     /// Clones of the result share its retained allocation charge.
