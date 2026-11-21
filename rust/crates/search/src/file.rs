@@ -654,20 +654,6 @@ impl SearchFile {
         match self.column(column).map(|index| self.sidecar.row_doc(index, row)) { Some(RowDoc::Run(doc)) => Some(Some(doc)), Some(RowDoc::Null) => Some(None), _ => None }
     }
 
-    pub(crate) fn member_rows(&self, member: u32) -> Result<Range<u32>> {
-        let pages = self.sidecar.member_pages(member)?;
-        let start_row = |page| self.sidecar.page_starts.get(page).copied().unwrap_or(self.sidecar.rows);
-        Ok(start_row(pages.start)..start_row(pages.end))
-    }
-
-    pub(crate) fn member_iids(&self, rows: Range<u32>) -> impl Iterator<Item = [u8; 16]> + '_ {
-        rows.map(|row| <[u8; 16]>::try_from(self.sidecar.row_iid(row)).unwrap_or_default()).scan(None, |last, iid| { let fresh = *last != Some(iid); *last = Some(iid); Some(fresh.then_some(iid)) }).flatten()
-    }
-
-    pub(crate) fn latest_system_from(&self, rows: Range<u32>) -> Result<i64> {
-        rows.map(|row| self.sidecar.key(row).map(|key| key.system_from)).try_fold(i64::MIN, |latest, system| system.map(|system| latest.max(system)))
-    }
-
     /// A document's length as the index stores it.
     pub fn stored_length(&self, column: &str, doc: u32) -> Result<u32> {
         let Some(field) = self.field(column) else { return Ok(0) };

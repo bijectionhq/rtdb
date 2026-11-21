@@ -110,18 +110,6 @@ pub struct PreparedQuery { relation: Arc<Relation>, settings: Arc<rtdb_plan::Que
 #[derive(Clone)]
 enum QueryOutput { Rows, Plan(Arc<crate::explain::ExplainPlan>), Analyze(Schema) }
 
-fn uses_search_score(relation: &Relation) -> bool {
-    for expression in relation.expressions() {
-        let mut found = false;
-        expression.visit(&mut |expr| {
-            found |= matches!(expr, rtdb_plan::Expr::Call { name, args, .. }
-                if name.eq_ignore_ascii_case("search_score") && args.len() == 2);
-        });
-        if found { return true; }
-    }
-    relation.children().into_iter().any(|child| uses_search_score(child))
-}
-
 impl PreparedQuery {
     /// The same plan, its retained bytes charged to `memory` instead: a plan kept beyond one query moves its charge to its keeper.
     pub fn recharged(&self, memory: &Arc<MemoryBudget>) -> Result<Self> {
@@ -241,8 +229,6 @@ impl PreparedQuery {
             cursor.plan_reservation = self._plan_reservation.clone();
             return Ok(cursor);
         }
-        let scores_requested = !context.accelerators.is_empty() && uses_search_score(&self.relation);
-        let context = context.with_score_corpus(scores_requested);
         let types = parameter_types(&self.relation, &parameters, EmissionMode::Execution);
         let parameters = Arc::new(crate::parameters::BoundParameters::new(parameters, types, &context.memory)?);
         drop(temporary);

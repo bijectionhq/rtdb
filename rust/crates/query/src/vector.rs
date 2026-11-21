@@ -323,7 +323,7 @@ mod tests {
             let expr = if round % 2 == 0 { number(&mut random, 3) } else { predicate(&mut random, 3) };
             let scope = rtdb_expr::EvaluationScope::new(&memory).unwrap();
             let context = rtdb_expr::EvalContext { parameters: &[], parameter_types: None, current_time: rtdb_types::Instant::from(Timestamp(0)), timezone: "UTC",
-                outer_rows: &[], snapshot_token: None, allocation: Some(&scope), catalog: None, corpora: None };
+                outer_rows: &[], snapshot_token: None, allocation: Some(&scope), catalog: None };
             let expected: Vec<rtdb_types::Result<Value>> = (0..batch.len).map(|row| {
                 let values: Vec<Value> = batch.columns.iter().map(|column| column.value(row).unwrap()).collect();
                 rtdb_expr::evaluate(&expr, &schema, &values, &context)

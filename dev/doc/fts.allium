@@ -187,9 +187,11 @@ rule RepairUnreadableSearchFile {
 
 -- MATCH(column, query) holds when the column's UTF-8 value holds every term of the query, tokenised by the analyzer, and every phrase of it (terms between double quotes) as consecutive tokens.
 -- The analyzer splits a word longer than the index's longest token (rtdb_text::MAX_TOKEN_BYTES) into tokens of at most that length, so the index holds every token the analyzer makes.
--- SEARCH_SCORE(column, query) is the BM25 of that value for the query's terms.
--- The five-argument form reads only the document count, total stored length and document frequencies supplied by the caller. The planner does not apply the snapshot corpus's ranked cutoff to it.
--- SEARCH_TERMS returns the distinct terms in frequency-vector order. SEARCH_LENGTH gives the stored length of a document for aggregation over the same admitted rows.
+-- SEARCH_SCORE(column, query) sums BM25 term-frequency contributions with unit weights and unit length normalization.
+-- The five-argument form computes BM25 from its document count, total stored length and document frequencies.
+-- The frequency vector follows the distinct term order returned by SEARCH_TERMS.
+-- SEARCH_LENGTH gives the stored length of a document for aggregation over the admitted rows.
+-- Ranked pruning applies to the two-argument form.
 --
 -- A scan with a MATCH conjunct on a column that a definition in force covers is narrowed before it opens:
 --
@@ -210,21 +212,16 @@ rule RepairUnreadableSearchFile {
 -- Past max_candidates candidates, the scan runs unnarrowed instead.
 -- Past max_unindexed_bytes of tries the lane should have indexed but has not, the node builds none of them: the scan is neither narrowed nor ranked, and only rows of tries with a recorded file take MATCH from it.
 --
--- A query that evaluates SEARCH_SCORE registers CorpusAsOfTheSnapshot once per table and column a MATCH narrows, from every partition the query reads.
 -- When optional search construction cannot fit the query budget or the source page order is unsupported by the search format, the scan evaluates those rows from their data files.
--- A query text's score parameters are fixed at its first use, so pruning and every score in one query use the same binary64 weights and average length.
---
--- A score from the index equals SEARCH_SCORE on the resolved row: both take each term's frequency and the document's length rounded to the index's stored lengths.
+-- The two-argument score uses the same term contributions and binary64 addition order in each partition and in SQL evaluation.
 --
 -- A scan whose rows feed only projections and then `ORDER BY SEARCH_SCORE(column, query) DESC ... LIMIT n`, with a MATCH on the same column, is ranked before it opens, in each partition it reads:
---
---   0. The column's corpus is registered before any partition is ranked, so a score is the same whichever partition fixes it first.
 --
 --   1. Every matching event that may be visible bounds its IID above by its score, an IID's best event bounding it.
 --      Events in live segments are scored from their rows.
 --      A search file's documents are scored a batch of windows at a time, best window bound first, and a window is scored only once its bound may exceed every event already scored.
 --      Where an earlier selection supplies an IID scope, file and live events outside that scope are discarded before scoring.
---      The scope does not change the corpus or restrict the history used to resolve any selected IID.
+--      Resolution reads the full history of each selected IID.
 --      A window adds the upper bounds for each term in scoring order. Each term uses the window's maximum frequency and minimum stored length with binary64 roundoff covered before addition.
 --   2. IIDs in the scan's selected IID scope are taken best bound first, in batches.
 --      A document left exactly visible by CutByLaterEvents counts as verified when the scan's only predicate is the MATCH used to narrow candidates.
@@ -239,24 +236,6 @@ rule RepairUnreadableSearchFile {
 -- A candidate-budget miss without an IID scope skips unranked narrowing if the ranked candidate union already contains more distinct IIDs than its limit.
 -- This union is a lower bound for the unranked candidate union and counts each IID once across its pending and handed-out events.
 -- Other declines use unranked narrowing, including an exhausted verification budget or a candidate-budget miss where there is no distinct-IID proof.
--- SEARCH_SCORE sums documents, tokens and each of its terms' document frequencies over every corpus the query registered; with none, each term's inverse document frequency is 1.
-
-rule CorpusAsOfTheSnapshot {
-    -- A column's corpus at a snapshot is its values in the rows a scan of the table sees at the snapshot's own instant, its latest transaction's system time, taken as valid time and system time both, across every partition and the live index.
-    -- A row whose column is null or absent is not in it; a value that is not text is, with no tokens.
-    -- Documents counts those rows, tokens sums their stored lengths, and a term's frequency counts the rows holding it.
-    -- The corpus is a function of the snapshot's data.
-    -- A node can build search files for any trie visible at the snapshot instant, or count the same corpus by scanning the resolved values when a build is refused.
-    -- Each file's runs that its own events leave visible at every instant from its latest event on are counted once per file and kept; those visible over a bounded valid interval are checked at the instant.
-    -- An entity with events in more than one file, or in the live index, is resolved across all of them as the scan resolves, live rows first at one instant, and its one visible row replaces what its runs counted file by file.
-    -- Within one live segment, a later appended event takes precedence over earlier rows at the same system time.
-    -- A shared file contributes only the runs and row keys of the members the snapshot selects.
-    -- A node keeps the corpus for those files, member selections and live segments.
-    when: ScoreAsked(column, snapshot)
-
-    ensures:
-        CorpusOfVisibleRows(column, snapshot)
-}
 
 rule CutByLaterEvents {
     -- A document's rectangles come from its own file's events; an event of the same entity elsewhere in the partition, in a selected trie or live segment, cuts them.
@@ -349,7 +328,7 @@ contract SearchCorrectness {
 
     @invariant ResultIndependentOfSearchFiles
         -- A query's rows are the same whichever search files exist, are readable, or are missing, including none.
-        -- SEARCH_SCORE's values are the same too, a function of the snapshot (ScoresFromTheSnapshot).
+        -- SEARCH_SCORE's value is a function of its arguments (ScoresFromArguments).
 
     @invariant CandidatesAreASuperset
         -- Every IID with a visible row satisfying MATCH at the query's valid and system time is in the candidate set.
@@ -385,17 +364,15 @@ surface FullTextSearch {
     @guarantee MatchAtAnyTime
         -- MATCH answers at any valid time and system time the scan accepts, the default as-of-now included.
 
-    @guarantee ScoresFromTheSnapshot
-        -- A score is BM25 against CorpusAsOfTheSnapshot: the same snapshot scores the same whatever compaction and the lane have done.
-        -- A query at a past time is scored against its snapshot's corpus, not the past one.
-        -- A query narrowing several columns or tables sums their corpora.
+    @guarantee ScoresFromArguments
+        -- The same document, query text and optional statistics produce the same score across scan plans, joins, time coordinates and artefact states.
+        -- A caller may derive statistics by aggregating the rows of an explicitly selected corpus.
 }
 
 -- Black box helpers used in rule expressions:
 --   search_entries(job)                — the file's record on its trie or on every member of its group
 --   search_candidates(scan, predicate)  — steps 1–4 of the query plan
 --   BuildAndUploadSearchFile(job)       — tokenise the data file's rows and upload the bundled index under the owner's artefact key
---   CorpusOfVisibleRows(column, snapshot) — CorpusAsOfTheSnapshot's counts (search/src/corpus.rs)
 --   EachCandidateCutByItsEntitysLaterEvents(scan) — CutByLaterEvents' subtraction, before narrowing and ranking
 --   EachResolvedRowMatchedFromItsSearchFileOrValue(scan, predicate) — MatchEvaluatedByTheScan's evaluation, in the scan, before its filter
 --   retired_records(table)               — the records RetireSearchFiles retires (maintenance/src/artefact.rs: retired_artefacts)

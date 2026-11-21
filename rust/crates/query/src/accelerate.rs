@@ -28,8 +28,6 @@ pub struct ScanRequest<'a> {
     pub current_time: rtdb_types::Instant,
     pub cancellation: &'a CancellationToken,
     pub constants: &'a dyn ConstantEvaluator,
-    /// Where an accelerator records the corpus statistics `search_score` ranks against in this query.
-    pub corpora: &'a CorpusRegistry,
     /// Every partition the database's scan reads, this request's `snapshot` among them.
     pub partitions: &'a [Snapshot],
     /// Resolves candidates within this partition exactly as the scan will, for an accelerator that must know which are visible before it can narrow.
@@ -41,55 +39,6 @@ pub struct ScanRequest<'a> {
 pub trait CandidateVerifier: Send + Sync {
     /// Each visible row's IID with its value of `column`.
     async fn visible(&self, iids: BTreeSet<Iid>, column: rtdb_plan::ColumnId) -> Result<Vec<(Iid, Value)>>;
-
-    /// Counts the corpus from authoritative rows when an optional index cannot supply it.
-    async fn snapshot_corpus(
-        &self, _column: &str, _at: rtdb_types::Timestamp, _partitions: &[Snapshot],
-    ) -> Result<Arc<dyn CorpusSource>> {
-        Err(rtdb_types::Anomaly::unsupported("rtdb.query/scan-corpus-unavailable", "This verifier cannot scan the corpus"))
-    }
-}
-
-/// Something that can count, for any terms, the documents and tokens of the corpus a score is relative to.
-pub trait CorpusSource: Send + Sync {
-    fn corpus(&self, query: &rtdb_text::Query) -> Result<rtdb_text::Corpus>;
-}
-
-/// The corpus sources the scans of one query opened, once each however often a scan reopens; a score sums them all, whatever column or table each came from.
-/// The score parameters for a query text are fixed at its first use and shared by pruning and expression evaluation.
-#[derive(Default)]
-pub struct CorpusRegistry {
-    requested: bool,
-    state: parking_lot::Mutex<Corpora>,
-}
-
-#[derive(Default)]
-pub struct Corpora { sources: std::collections::BTreeMap<String, Arc<dyn CorpusSource>>, computed: std::collections::BTreeMap<String, Arc<rtdb_text::Scorer>> }
-
-impl CorpusRegistry {
-    pub(crate) fn for_query(requested: bool) -> Self { Self { requested, state: Default::default() } }
-    pub fn scores_requested(&self) -> bool { self.requested }
-
-    /// `key` names the source, such as its object key; a source already registered under it is kept.
-    pub fn register(&self, key: String, source: Arc<dyn CorpusSource>) {
-        let mut corpora = self.state.lock();
-        corpora.sources.entry(key).or_insert(source);
-    }
-    pub fn holds(&self, key: &str) -> bool { self.state.lock().sources.contains_key(key) }
-}
-
-impl rtdb_expr::CorpusLookup for CorpusRegistry {
-    fn scorer(&self, query: &str) -> Arc<rtdb_text::Scorer> {
-        let mut corpora = self.state.lock();
-        if let Some(computed) = corpora.computed.get(query) { return Arc::clone(computed); }
-        let terms = rtdb_text::Query::parse(query);
-        let mut total = rtdb_text::Corpus::default();
-        let summed = corpora.sources.values().try_for_each(|source| { total.add(&source.corpus(&terms).ok()?); Some(()) });
-        let corpus = summed.filter(|_| total.documents > 0).map(|_| &total);
-        let scorer = Arc::new(rtdb_text::Scorer::new(terms, corpus));
-        corpora.computed.insert(query.to_string(), Arc::clone(&scorer));
-        scorer
-    }
 }
 
 /// Exact ordered output for a point scan in its requested order.

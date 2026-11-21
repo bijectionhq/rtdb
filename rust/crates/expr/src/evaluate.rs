@@ -41,22 +41,16 @@ pub struct EvalContext<'a> {
     pub snapshot_token: Option<&'a str>,
     pub allocation: Option<&'a crate::EvaluationScope>,
     pub catalog: Option<&'a dyn crate::PgCatalogLookup>,
-    /// Corpus statistics `search_score` ranks against, keyed by query text; without them a term's inverse document frequency is 1.
-    pub corpora: Option<&'a dyn CorpusLookup>,
-}
-
-pub trait CorpusLookup: Send + Sync {
-    fn scorer(&self, query: &str) -> Arc<rtdb_text::Scorer>;
 }
 
 impl Default for EvalContext<'_> {
-    fn default() -> Self { Self { parameters: &[], parameter_types: None, current_time: Instant::default(), timezone: "UTC", outer_rows: &[], snapshot_token: None, allocation: None, catalog: None, corpora: None } }
+    fn default() -> Self { Self { parameters: &[], parameter_types: None, current_time: Instant::default(), timezone: "UTC", outer_rows: &[], snapshot_token: None, allocation: None, catalog: None } }
 }
 
 impl EvalContext<'_> {
     fn with_allocation<'a>(&'a self, allocation: &'a crate::EvaluationScope) -> EvalContext<'a> {
         EvalContext { parameters: self.parameters, parameter_types: self.parameter_types, current_time: self.current_time, timezone: self.timezone,
-            outer_rows: self.outer_rows, snapshot_token: self.snapshot_token, allocation: Some(allocation), catalog: self.catalog, corpora: self.corpora }
+            outer_rows: self.outer_rows, snapshot_token: self.snapshot_token, allocation: Some(allocation), catalog: self.catalog }
     }
     pub(crate) fn reserve(&self, bytes: usize) -> Result<()> { crate::admission::Admission::for_context(self.allocation).reserve(bytes) }
 }
@@ -486,13 +480,13 @@ pub fn evaluate_batch(expr: &CompiledExpr, batch: &RecordBatch, context: &EvalCo
     let mut parameters = context.parameters.to_vec();
     parameters.iter_mut().for_each(rtdb_columnar::admit_execution_value);
     let preparation = crate::EvaluationScope::new(budget)?;
-    let preparation_context = EvalContext { parameters: &parameters,parameter_types: context.parameter_types,current_time: context.current_time,timezone: context.timezone,outer_rows: context.outer_rows,snapshot_token: context.snapshot_token,allocation: Some(&preparation),catalog: context.catalog,corpora: context.corpora };
+    let preparation_context = EvalContext { parameters: &parameters,parameter_types: context.parameter_types,current_time: context.current_time,timezone: context.timezone,outer_rows: context.outer_rows,snapshot_token: context.snapshot_token,allocation: Some(&preparation),catalog: context.catalog };
     let invocation = ExpressionInvocation::prepare(&expr.expr,&expr.schema,&preparation_context)?;
     let mut values = Vec::with_capacity(batch.num_rows());
     let mut scratch = Vec::with_capacity(batch.num_rows());
     for index in 0..batch.num_rows() {
         let scope = crate::EvaluationScope::new(budget)?;
-        let context = EvalContext { parameters: &parameters, parameter_types: context.parameter_types, current_time: context.current_time, timezone: context.timezone, outer_rows: context.outer_rows, snapshot_token: context.snapshot_token, allocation: Some(&scope), catalog: context.catalog, corpora: context.corpora };
+        let context = EvalContext { parameters: &parameters, parameter_types: context.parameter_types, current_time: context.current_time, timezone: context.timezone, outer_rows: context.outer_rows, snapshot_token: context.snapshot_token, allocation: Some(&scope), catalog: context.catalog };
         let _decimal_validation = budget.reserve(4096)?;
         scope.reserve(batch.columns().iter().zip(batch.schema().fields()).try_fold(0usize, |bytes, (array, field)| bytes.checked_add(rtdb_columnar::estimate_read_value_bytes(field, array.as_ref(), index)?).ok_or_else(overflow))?)?;
         let row = batch.columns().iter().zip(batch.schema().fields()).map(|(array, field)| rtdb_columnar::read_execution_value(field, array.as_ref(), index)).collect::<Result<Vec<_>>>()?;

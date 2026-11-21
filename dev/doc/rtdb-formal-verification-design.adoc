@@ -114,7 +114,7 @@ Treat sentinel encodings as explicit conventions in the refinement map.
 
 Two snapshots of the same history may choose different admissible physical representations.
 Equivalent representations must agree on every observable read within their shared entitlement.
-For successful accelerated search, normalize the query arguments, analyzer and corpus at the same admitted basis before comparing outputs.
+Compare accelerated and exhaustive search with the same query arguments, analyzer and admitted basis.
 Correctness of cancellation and resource refusal is a separate observation from the rows of a successful result.
 
 === Abstraction and simulation relations
@@ -260,11 +260,11 @@ After interruption between physical deletion and its notice, retry converges on 
 |FTS-1
 |Accelerated MATCH yields the reference scan's qualifying rows at the same basis.
 Every narrowing decision retains every qualifying visible row.
-Required fallback preserves the predicate and score corpus when the underlying data is readable.
+Required fallback preserves the predicate and the scores computed from SQL arguments when the underlying data is readable.
 |Compare result bags and exposed temporal columns across indexed and scan-only runs, including shared files, erasures, history modes, missing files, and admission-budget fallback.
 
 |FTS-2
-|Ranked early termination preserves SQL's top results under the chosen corpus, numerical evaluation order, residual predicates, and tie rules.
+|Ranked early termination preserves SQL's top results under the two-argument scoring function, numerical evaluation order, residual predicates, and tie rules.
 |Compare top K with a fully evaluated sort for exact ties, floating-point boundaries, and multiple MATCH predicates.
 If SQL defines a total tie-break order, compare the exact ordered rows.
 Otherwise compare results using the orderings SQL permits.
@@ -1066,7 +1066,7 @@ Prove identity-specific finalization if extracted and replay paused old loads wi
 |The builder and candidate decisions operate on derived evidence.
 The scan owns resolved row visibility and residual evaluation.
 |Audit group member selection, artefact version and fallback, row origins, page eligibility, score corpus and ranked candidate admission.
-Ensure each path to early termination consumes the same score and tie conditions. link:../../rust/crates/search/src/file.rs[Search file] · link:../../rust/crates/query/src/scan.rs[Scan] · link:fts.allium[Search contracts]
+Ensure each path to early termination uses the same document-local formula and tie conditions. link:../../rust/crates/search/src/file.rs[Search file] · link:../../rust/crates/query/src/scan.rs[Scan] · link:fts.allium[Search contracts]
 |===
 
 For each effect, record the production entry point, the checked decision, and what keeps the decision valid until the effect.

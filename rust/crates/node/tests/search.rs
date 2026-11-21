@@ -248,28 +248,41 @@ async fn accelerated_match_returns_what_the_unaccelerated_predicate_returns_at_e
 }
 
 #[tokio::test]
-async fn search_score_ranks_rarer_terms_above_common_ones_once_the_corpus_is_indexed() {
+async fn search_scores_agree_across_plans_and_ignore_unselected_documents() {
     let mut options = options();
     options.file_size_target = 1;
     options.automatic_artefacts = false;
     let (node, driver) = Node::open(options, services()).await.unwrap();
     let driver = tokio::spawn(driver.run());
     let mut session = node.session("xtdb", Arc::new(Authority)).unwrap();
-    assert!(session.state_mut().execute_tx(vec![sql("CREATE SEARCH INDEX docs_body ON docs (body)")], AutonomousTxOptions::default()).await.unwrap().committed());
-    let mut operations = Vec::new();
-    for id in 0..40 { operations.push(sql(&format!("INSERT INTO docs RECORDS {{_id: {id}, body: 'common words here'}}"))); }
-    operations.push(sql("INSERT INTO docs RECORDS {_id: 100, body: 'common rare words'}"));
-    operations.push(sql("INSERT INTO docs RECORDS {_id: 101, body: 'common common words'}"));
-    assert!(session.state_mut().execute_tx(operations, AutonomousTxOptions::default()).await.unwrap().committed());
+    let writes = vec![
+        sql("CREATE SEARCH INDEX docs_body ON docs (body)"),
+        sql("INSERT INTO docs RECORDS {_id: 100, body: 'common rare words'}"),
+        sql("INSERT INTO docs RECORDS {_id: 101, body: 'common common words'}"),
+    ];
+    assert!(session.state_mut().execute_tx(writes, AutonomousTxOptions::default()).await.unwrap().committed());
+    let statement = |predicate: &str| format!("SELECT _id, SEARCH_SCORE(body, 'common rare') AS score FROM docs WHERE {predicate} ORDER BY score DESC, _id LIMIT 2");
+    let indexed = statement("MATCH(body, 'common')");
+    let expected = rows(session.query_sql(&indexed, vec![]).await.unwrap()).await;
+    let scoring = rtdb_text::Query::parse("common rare");
+    assert_eq!(expected, [(100, "common rare words"), (101, "common common words")].map(|(id, body)| {
+        vec![Value::I64(id), Value::F64(rtdb_text::bm25(&scoring, &rtdb_text::tokens(body), None))]
+    }));
+
+    let unselected = (0..40).map(|id| sql(&format!("INSERT INTO docs RECORDS {{_id: {id}, body: 'rare words'}}"))).collect();
+    assert!(session.state_mut().execute_tx(unselected, AutonomousTxOptions::default()).await.unwrap().committed());
     let database = node.catalog().database("xtdb").unwrap();
     database.flush().await.unwrap();
     node.sync_all(Duration::from_secs(10), &tokio_util::sync::CancellationToken::new()).await.unwrap();
     database.compaction().unwrap().compact_all().await.unwrap();
     database.build_artefacts().await.unwrap();
-    let ranked = rows(session.query_sql("SELECT _id, SEARCH_SCORE(body, 'common rare') AS score FROM docs WHERE MATCH(body, 'common') ORDER BY score DESC, _id LIMIT 3", vec![]).await.unwrap()).await;
-    assert_eq!(ranked.iter().map(|row| row[0].clone()).collect::<Vec<_>>(), [Value::I64(100), Value::I64(101), Value::I64(0)], "{ranked:?}");
-    let scores: Vec<f64> = ranked.iter().map(|row| match row[1] { Value::F64(score) => score, ref other => panic!("{other:?}") }).collect();
-    assert!(scores[0] > 2.0 * scores[1], "the rare term carries more weight than a repeated common one: {scores:?}");
+    let residual = statement("MATCH(body, 'common') OR _id = -1");
+    assert_eq!(rows(session.query_sql(&indexed, vec![]).await.unwrap()).await, expected);
+    assert_eq!(rows(session.query_sql(&residual, vec![]).await.unwrap()).await, expected);
+    assert!(session.state_mut().execute_tx(
+        vec![sql("DROP SEARCH INDEX docs_body")], AutonomousTxOptions::default(),
+    ).await.unwrap().committed());
+    assert_eq!(rows(session.query_sql(&indexed, vec![]).await.unwrap()).await, expected);
     node.shutdown();
     tokio::time::timeout(Duration::from_secs(10), driver).await.unwrap().unwrap().unwrap();
 }
@@ -416,8 +429,7 @@ async fn plain_match_scans_when_the_index_build_cannot_fit() {
     node.sync_all(Duration::from_secs(10), &tokio_util::sync::CancellationToken::new()).await.unwrap();
     let actual = ids(rows(session.query_sql("SELECT _id FROM docs WHERE MATCH(body, 'invoice')", vec![]).await.unwrap()).await);
     assert_eq!(actual, [1]);
-    let corpus = rtdb_text::Corpus { documents: 2, tokens: 3, frequencies: [("invoice".into(), 1)].into() };
-    let score = rtdb_text::bm25(&rtdb_text::Query::parse("invoice"), &rtdb_text::tokens("invoice overdue"), Some(&corpus));
+    let score = rtdb_text::bm25(&rtdb_text::Query::parse("invoice"), &rtdb_text::tokens("invoice overdue"), None);
     let scored = rows(session.query_sql("SELECT _id, SEARCH_SCORE(body, 'invoice') FROM docs WHERE MATCH(body, 'invoice')", vec![]).await.unwrap()).await;
     assert_eq!(scored, [vec![Value::I64(1), Value::F64(score)]]);
     node.shutdown();
@@ -464,8 +476,7 @@ async fn plain_match_scans_historical_pages_with_independent_recency_order() {
     let query = "SELECT _id FROM docs FOR VALID_TIME AS OF TIMESTAMP '1970-01-05T00:00:00Z' WHERE MATCH(body, 'invoice')";
     assert_eq!(ids(rows(session.query_sql(query, vec![]).await.unwrap()).await), (0..24).collect::<Vec<_>>());
     let scored = "SELECT _id, SEARCH_SCORE(body, 'invoice') AS score FROM docs FOR VALID_TIME AS OF TIMESTAMP '1970-01-05T00:00:00Z' WHERE MATCH(body, 'invoice') ORDER BY score DESC, _id LIMIT 1";
-    let corpus = rtdb_text::Corpus { documents: 24, tokens: 24, frequencies: [("invoice".into(), 24)].into() };
-    let score = rtdb_text::bm25(&rtdb_text::Query::parse("invoice"), &rtdb_text::tokens("invoice"), Some(&corpus));
+    let score = rtdb_text::bm25(&rtdb_text::Query::parse("invoice"), &rtdb_text::tokens("invoice"), None);
     assert_eq!(rows(session.query_sql(scored, vec![]).await.unwrap()).await, [vec![Value::I64(0), Value::F64(score)]]);
     node.shutdown();
     tokio::time::timeout(Duration::from_secs(10), driver).await.unwrap().unwrap().unwrap();
@@ -794,7 +805,7 @@ async fn an_index_without_history_answers_past_queries_as_scanning_does_with_no_
 }
 
 #[tokio::test]
-async fn scores_are_relative_to_the_rows_visible_at_the_snapshot_and_unmoved_by_compaction() {
+async fn resolved_document_scores_are_unmoved_by_compaction() {
     let mut options = options();
     options.file_size_target = 1;
     options.automatic_artefacts = false;
@@ -806,7 +817,6 @@ async fn scores_are_relative_to_the_rows_visible_at_the_snapshot_and_unmoved_by_
     let words = ["invoice", "overdue", "paid", "book", "late", "red"];
     let mut seed = 41u64;
     let mut next = || { seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407); (seed >> 33) as usize };
-    let mut last = None;
     for round in 0..3 {
         for id in 0..60 {
             let body: Vec<_> = (0..1 + next() % 5).map(|_| words[next() % words.len()]).collect();
@@ -816,7 +826,7 @@ async fn scores_are_relative_to_the_rows_visible_at_the_snapshot_and_unmoved_by_
                 2 => format!("INSERT INTO docs RECORDS {{_id: {id}, title: 'untitled'}}"),
                 _ => format!("INSERT INTO docs RECORDS {{_id: {id}, body: '{}'}}", body.join(" ")),
             };
-            last = Some(session.state_mut().execute_tx(vec![sql(&statement)], AutonomousTxOptions::default()).await.unwrap().tx_key().system_time);
+            assert!(session.state_mut().execute_tx(vec![sql(&statement)], AutonomousTxOptions::default()).await.unwrap().committed());
         }
         if round < 2 {
             database.flush().await.unwrap();
@@ -824,23 +834,13 @@ async fn scores_are_relative_to_the_rows_visible_at_the_snapshot_and_unmoved_by_
             if round == 0 { database.compaction().unwrap().compact_all().await.unwrap(); }
         }
     }
-    let basis = chrono::DateTime::from_timestamp_micros(last.unwrap().0).unwrap().to_rfc3339();
-    let visible = rows(session.query_sql(&format!("SELECT body FROM docs FOR VALID_TIME AS OF TIMESTAMP '{basis}' FOR SYSTEM_TIME AS OF TIMESTAMP '{basis}'"), vec![]).await.unwrap()).await;
     let scoring = rtdb_text::Query::parse("invoice overdue");
-    let mut corpus = rtdb_text::Corpus::default();
-    for row in &visible {
-        let tokens = match &row[0] { Value::Null => continue, Value::Utf8(text) => rtdb_text::tokens(text), _ => Vec::new() };
-        corpus.documents += 1;
-        corpus.tokens += u64::from(rtdb_text::stored_length(tokens.len()));
-        for term in scoring.terms() { if tokens.contains(term) { *corpus.frequencies.entry(term.clone()).or_default() += 1; } }
-    }
-    for term in scoring.terms() { corpus.frequencies.entry(term.clone()).or_default(); }
     let query = "SELECT _id, body, SEARCH_SCORE(body, 'invoice overdue') AS score FROM docs WHERE MATCH(body, 'invoice') ORDER BY _id";
     let scored = rows(session.query_sql(query, vec![]).await.unwrap()).await;
     assert!(scored.len() > 5, "{scored:?}");
     for row in &scored {
         let Value::Utf8(body) = &row[1] else { panic!("{row:?}") };
-        assert_eq!(row[2], Value::F64(rtdb_text::bm25(&scoring, &rtdb_text::tokens(body), Some(&corpus))), "{row:?} against {corpus:?}");
+        assert_eq!(row[2], Value::F64(rtdb_text::bm25(&scoring, &rtdb_text::tokens(body), None)), "{row:?}");
     }
     database.flush().await.unwrap();
     node.sync_all(Duration::from_secs(10), &tokio_util::sync::CancellationToken::new()).await.unwrap();
@@ -852,7 +852,7 @@ async fn scores_are_relative_to_the_rows_visible_at_the_snapshot_and_unmoved_by_
 }
 
 #[tokio::test]
-async fn same_transaction_writes_count_only_the_visible_terms_in_bm25() {
+async fn same_transaction_writes_score_only_the_visible_document() {
     let mut options = options();
     options.automatic_artefacts = false;
     let (node, driver) = Node::open(options, services()).await.unwrap();
@@ -870,15 +870,10 @@ async fn same_transaction_writes_count_only_the_visible_terms_in_bm25() {
     assert!(result.committed(), "{result:?}");
 
     let scoring = rtdb_text::Query::parse("beta");
-    let corpus = rtdb_text::Corpus {
-        documents: 2,
-        tokens: 5,
-        frequencies: std::collections::BTreeMap::from([("beta".into(), 1)]),
-    };
     let statement = "SELECT _id, SEARCH_SCORE(body, 'beta') AS score FROM docs WHERE MATCH(body, 'visible') ORDER BY score DESC LIMIT 1";
     let expected = vec![vec![
         Value::I64(1),
-        Value::F64(rtdb_text::bm25(&scoring, &rtdb_text::tokens("visible beta beta"), Some(&corpus))),
+        Value::F64(rtdb_text::bm25(&scoring, &rtdb_text::tokens("visible beta beta"), None)),
     ]];
 
     assert_eq!(rows(session.query_sql(statement, vec![]).await.unwrap()).await, expected);

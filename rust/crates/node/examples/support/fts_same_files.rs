@@ -7,7 +7,7 @@ use rtdb_columnar::read_value;
 use rtdb_index::Snapshot;
 use rtdb_node::{Database, NativeSession, Node};
 use rtdb_plan::{Scan, TableBinding, QualifiedTable, Expr, TemporalFilter};
-use rtdb_query::{CandidateVerifier, ConstantEvaluator, CorpusRegistry, MatchAnswers, ScanAccelerator, ScanRequest};
+use rtdb_query::{CandidateVerifier, ConstantEvaluator, MatchAnswers, ScanAccelerator, ScanRequest};
 use rtdb_search::{SearchAccelerator, SearchRuntime, accelerate::experiment::{Fallback, PointRanking, Ranking, Work}};
 use rtdb_text::Query;
 use rtdb_tx::{Documents, TxOp};
@@ -142,11 +142,10 @@ impl Fixture<'_> {
         let (valid, system) = points;
         let bounds = TemporalBounds { valid_time: Interval::at(valid).unwrap(), system_time: Interval::at(system).unwrap() };
         let scan = self.scan(snapshot);
-        let corpora = CorpusRegistry::default();
         let memory = self.node.query_memory();
         let request = ScanRequest { database: "xtdb", scan: &scan, snapshot, storage: self.database.storage(), bounds,
             memory: &memory, current_time: self.node.query_instant(), cancellation: self.node.cancellation(),
-            constants: &LiteralOnly, corpora: &corpora, partitions: std::slice::from_ref(snapshot), verifier: &LiteralOnly };
+            constants: &LiteralOnly, partitions: std::slice::from_ref(snapshot), verifier: &LiteralOnly };
         let (hits, work) = ranker.rank(&self.inspection.search, &request, "body", &Query::parse(case.matching),
             case.scoring, case.limit, ranking).await.unwrap();
         let hits = match hits {

@@ -1789,7 +1789,7 @@ mod tests {
             computed += 1;
             let scope = rtdb_expr::EvaluationScope::new(&memory).unwrap();
             let context = rtdb_expr::EvalContext { parameters: &[], parameter_types: None, current_time: rtdb_types::Instant::from(Timestamp(0)), timezone: "UTC",
-                outer_rows: &[], snapshot_token: None, allocation: Some(&scope), catalog: None, corpora: None };
+                outer_rows: &[], snapshot_token: None, allocation: Some(&scope), catalog: None };
             for row in 0..batch.len {
                 let values: Vec<Value> = batch.columns.iter().map(|column| column.value(row).unwrap()).collect();
                 let expected = rtdb_expr::evaluate_projection(&expression, &schema, &values, &context).unwrap();
@@ -1848,7 +1848,7 @@ mod tests {
             let truth = kernel::truth(&predicate, &schema, &batch, &parameters).unwrap_or_else(|| panic!("the kernel evaluates {predicate:?}"));
             let scope = rtdb_expr::EvaluationScope::new(&memory).unwrap();
             let context = rtdb_expr::EvalContext { parameters: &parameters, parameter_types: None, current_time: rtdb_types::Instant::from(Timestamp(0)), timezone: "UTC",
-                outer_rows: &[], snapshot_token: None, allocation: Some(&scope), catalog: None, corpora: None };
+                outer_rows: &[], snapshot_token: None, allocation: Some(&scope), catalog: None };
             for (row, expected) in truth.iter().enumerate() {
                 let values: Vec<Value> = batch.columns.iter().map(|column| column.value(row).unwrap()).collect();
                 let actual = match rtdb_expr::evaluate(&predicate, &schema, &values, &context).unwrap() { Value::Bool(value) => Some(value), Value::Null => None, other => panic!("{other:?}") };
@@ -1870,7 +1870,7 @@ mod tests {
             evaluated += 1;
             let scope = rtdb_expr::EvaluationScope::new(&memory).unwrap();
             let context = rtdb_expr::EvalContext { parameters: &[], parameter_types: None, current_time: rtdb_types::Instant::from(Timestamp(0)), timezone: "UTC",
-                outer_rows: &[], snapshot_token: None, allocation: Some(&scope), catalog: None, corpora: None };
+                outer_rows: &[], snapshot_token: None, allocation: Some(&scope), catalog: None };
             for (row, expected) in truth.iter().enumerate() {
                 let values: Vec<Value> = batch.columns.iter().map(|column| column.value(row).unwrap()).collect();
                 let actual = match rtdb_expr::evaluate(&predicate, &schema, &values, &context).unwrap() { Value::Bool(value) => Some(value), Value::Null => None, other => panic!("{other:?}") };
@@ -1996,7 +1996,7 @@ mod tests {
                 let batch = batch(&mut random, 32, &memory);
                 let scope = rtdb_expr::EvaluationScope::new(&memory).unwrap();
                 let context = rtdb_expr::EvalContext { parameters: &[], parameter_types: None, current_time: rtdb_types::Instant::from(Timestamp(0)), timezone: "UTC",
-                    outer_rows: &[], snapshot_token: None, allocation: Some(&scope), catalog: None, corpora: None };
+                    outer_rows: &[], snapshot_token: None, allocation: Some(&scope), catalog: None };
                 let rows: Vec<Vec<Value>> = (0..batch.len).map(|row| batch.columns.iter().map(|column| column.value(row).unwrap()).collect()).collect();
                 if round % 2 == 0 {
                     let predicate = predicate(&mut random, &schema);

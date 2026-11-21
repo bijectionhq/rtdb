@@ -440,7 +440,7 @@ impl ScanCursor {
             for accelerator in execution.context.accelerators.iter().filter(|_| accelerate && !fixed_iids) {
                 let request = crate::ScanRequest { database: &name, scan: &narrowed, snapshot, storage, bounds, memory: &execution.context.memory,
                     current_time: execution.context.current_time, cancellation: &execution.context.cancellation, constants: &crate::accelerate::ExecutionConstants(&execution),
-                    corpora: execution.context.corpora.as_ref(), verifier: &verifier, partitions: database_partitions };
+                    verifier: &verifier, partitions: database_partitions };
                 if let Some(mut candidates) = accelerator.candidate_iids(&request).await? {
                     // `path_matches` stops consulting pushdowns once `iids` is set, so they are applied to the candidates here.
                     if let Some(filters) = &pushdowns { candidates.retain(|iid| filters.iid_matches(&scan.columns, *iid, canonical_entity_iids)); }
@@ -454,7 +454,7 @@ impl ScanCursor {
                 if let Some(query) = query {
                     let request = crate::ScanRequest { database: &name, scan: &narrowed, snapshot, storage, bounds, memory: &execution.context.memory,
                         current_time: execution.context.current_time, cancellation: &execution.context.cancellation, constants: &crate::accelerate::ExecutionConstants(&execution),
-                        corpora: execution.context.corpora.as_ref(), verifier: &verifier, partitions: database_partitions };
+                        verifier: &verifier, partitions: database_partitions };
                     for accelerator in execution.context.accelerators.iter().filter(|_| accelerate) {
                         if let Some(found) = accelerator.match_answers(&request, &evaluated.column, query).await? { answers = Some(found); break; }
                     }
@@ -549,7 +549,7 @@ async fn ordered(scan: &Scan, execution: &Execution, window: std::ops::Range<usi
     let request = crate::ScanRequest {
         database: &scan.table.name.database, scan, snapshot, storage, bounds, memory: &context.memory,
         current_time: context.current_time, cancellation: &context.cancellation,
-        constants: &crate::accelerate::ExecutionConstants(execution), corpora: context.corpora.as_ref(),
+        constants: &crate::accelerate::ExecutionConstants(execution),
         verifier: &verifier, partitions: &database.partitions,
     };
     for accelerator in context.accelerators.iter() {
@@ -808,68 +808,6 @@ impl crate::CandidateVerifier for ScanVerifier<'_> {
             }
         }
         Ok(visible)
-    }
-
-    async fn snapshot_corpus(
-        &self, column: &str, at: Timestamp, partitions: &[Snapshot],
-    ) -> Result<Arc<dyn crate::CorpusSource>> {
-        let point = TemporalFilter::At(Expr::Literal(Value::Timestamp {
-            value: at.0, unit: rtdb_types::TimeUnit::Microsecond, timezone: Some("UTC".into()),
-        }));
-        let scan = Scan {
-            table: self.scan.table.clone(),
-            columns: vec![rtdb_plan::Field {
-                id: rtdb_plan::ColumnId(0), name: column.into(), qualifier: None,
-                qualified_only: false, unnamed: false,
-                data_type: self.scan.table.columns.get(column).cloned().unwrap_or(rtdb_types::LogicalType::Null),
-            }],
-            valid_time: point.clone(), system_time: point, clamp_valid_time: false,
-            iids: None, predicates: Vec::new(), top_k: None, ordered_top_k: None, matches: Vec::new(),
-        };
-        let memory = &self.execution.context.memory;
-        let mut cursor = ScanCursor::over(scan, self.execution.clone(), None, partitions, self.storage, false, None).await?;
-        let mut corpus = rtdb_text::Corpus::default();
-        let mut retained = Vec::new();
-        while let Some(mut page) = cursor.next_page().await? {
-            while let Some(row) = page.next() {
-                let value = &row.values[0];
-                if matches!(value, Value::Null | Value::Undefined) { continue; }
-                corpus.documents += 1;
-                if let Value::Utf8(text) = value {
-                    let bytes = text.len().checked_mul(128).and_then(|bytes| bytes.checked_add(256))
-                        .ok_or_else(|| invalid("corpus-size", "Corpus tokenization exceeds addressable memory"))?;
-                    let _tokens = memory.reserve(bytes)?;
-                    let mut tokens = rtdb_text::tokens(text);
-                    corpus.tokens += u64::from(rtdb_text::stored_length(tokens.len()));
-                    tokens.sort_unstable();
-                    tokens.dedup();
-                    for term in tokens {
-                        if let Some(frequency) = corpus.frequencies.get_mut(&term) {
-                            *frequency += 1;
-                        } else {
-                            retained.push(memory.reserve(term.capacity().checked_add(128)
-                                .ok_or_else(|| invalid("corpus-size", "Corpus term exceeds addressable memory"))?)?);
-                            corpus.frequencies.insert(term, 1);
-                        }
-                    }
-                }
-            }
-        }
-        Ok(Arc::new(ScannedCorpus { corpus, _retained: retained }))
-    }
-}
-
-struct ScannedCorpus { corpus: rtdb_text::Corpus, _retained: Vec<Arc<MemoryReservation>> }
-
-impl crate::CorpusSource for ScannedCorpus {
-    fn corpus(&self, query: &rtdb_text::Query) -> Result<rtdb_text::Corpus> {
-        Ok(rtdb_text::Corpus {
-            documents: self.corpus.documents,
-            tokens: self.corpus.tokens,
-            frequencies: query.terms().iter().map(|term| {
-                (term.clone(), self.corpus.frequencies.get(term).copied().unwrap_or_default())
-            }).collect(),
-        })
     }
 }
 

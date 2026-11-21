@@ -11,7 +11,7 @@ use rtdb_plan::{BinaryOp, Expr};
 use rtdb_query::{MatchAnswers, ScanAccelerator, ScanRequest};
 use rtdb_storage::ObjectKey;
 use rtdb_text::Query;
-use rtdb_types::{Anomaly, Iid, Interval, Result, TemporalBounds, Timestamp, Value};
+use rtdb_types::{Anomaly, Iid, Result, TemporalBounds, Timestamp, Value};
 
 use crate::{KIND, SearchDefinition, SearchFile, runtime::{Suspect, TrieFile}};
 
@@ -125,9 +125,6 @@ impl SearchAccelerator {
         }
         let Some((column, query, definition)) = chosen else { return Ok(None) };
         if query.terms().is_empty() { return Ok(Some(BTreeSet::new())); }
-        if request.corpora.scores_requested() {
-            self.register_corpora(request, column, &definition).await?;
-        }
         if options.is_oracle { return Ok(None); }
         if let Some(top_k) = &scan.top_k {
             let ranked = scan.columns.iter().find(|field| field.id == top_k.column).is_some_and(|field| field.name == column);
@@ -256,12 +253,8 @@ impl SearchAccelerator {
     /// The search files of the partition's live tries that can hold a visible event: every such trie's, its recorded one or one this node builds from its data file, unless the tries the lane should have indexed but has not exceed max_unindexed_bytes.
     /// The lane never indexes level 0, the partial level-1 current trie, or history for a definition that excludes it, so those do not count.
     async fn trie_files(&self, request: &ScanRequest<'_>, definition: &SearchDefinition) -> Result<TrieFiles> {
-        self.trie_files_in(request, request.snapshot, definition, request.bounds, Some(self.max_unindexed_bytes), true).await
-    }
-
-    /// The search files of a partition's live tries that can hold an event visible in `bounds`; with a `limit`, only the recorded ones once the tries the lane should have indexed but has not exceed it.
-    /// With `prune`, a recorded trie whose record's lifespan sections all miss the bounds is left unopened.
-    async fn trie_files_in(&self, request: &ScanRequest<'_>, snapshot: &Snapshot, definition: &SearchDefinition, bounds: TemporalBounds, limit: Option<i64>, prune: bool) -> Result<TrieFiles> {
+        let snapshot = request.snapshot;
+        let bounds = request.bounds;
         let table = &request.scan.table.name.table;
         let Some(entry) = snapshot.table_entry(table) else { return Ok(TrieFiles::Complete(Found { files: Vec::new(), skipped: Vec::new() })) };
         let artefact_id = definition.artefact_id();
@@ -275,7 +268,7 @@ impl SearchAccelerator {
         let visible = |trie: &&rtdb_index::CatalogTrie| trie.key.recency().is_none_or(|date| date.epoch_day().saturating_mul(86_400_000_000) > earliest);
         for trie in snapshot.trie_catalog().current_tries(table).into_iter().filter(|trie| trie.state == TrieState::Live).filter(visible) {
             let sections = trie.artefact(KIND, &artefact_id, definition.version).and_then(|record| record.stats.as_deref()).and_then(crate::file::decode_sections);
-            if prune && sections.is_some_and(|sections| !sections.iter().any(|section| section.meets(bounds))) { skipped.push(trie.key.clone()); continue; }
+            if sections.is_some_and(|sections| !sections.iter().any(|section| section.meets(bounds))) { skipped.push(trie.key.clone()); continue; }
             let data = ObjectKey::new(entry.slug.data_key(&trie.key))?;
             if let Some(recorded) = Self::recorded_key(snapshot, table, trie, definition)? {
                 let file = match opened.get(&recorded.key) {
@@ -296,11 +289,11 @@ impl SearchAccelerator {
             if !by_policy { unindexed = unindexed.saturating_add(trie.data_file_size); }
             unbuilt.push((trie.key.clone(), data));
         }
-        if limit.is_some_and(|limit| unindexed > limit) { return Ok(TrieFiles::Partial(Found { files, skipped })); }
+        if unindexed > self.max_unindexed_bytes { return Ok(TrieFiles::Partial(Found { files, skipped })); }
         for (trie, data) in unbuilt {
             match self.runtime.built(request.database, request.storage, &trie, &data, &definition.columns, request.memory, request.cancellation).await {
                 Ok(file) => files.push(file),
-                Err(error) if limit.is_some() && optional_build_refused(&error) => {
+                Err(error) if optional_build_refused(&error) => {
                     return Ok(TrieFiles::Partial(Found { files, skipped }));
                 }
                 Err(error) => return Err(error),
@@ -309,34 +302,6 @@ impl SearchAccelerator {
         Ok(TrieFiles::Complete(Found { files, skipped }))
     }
 
-    /// Registers the column's corpus at the snapshot's instant, from every partition's search files for the tries visible then and its live segments, once a query.
-    /// A score needs every such trie's file, so the node builds those the lane has not, whatever max_unindexed_bytes allows narrowing.
-    async fn register_corpora(&self, request: &ScanRequest<'_>, column: &str, definition: &SearchDefinition) -> Result<()> {
-        let table = &request.scan.table.name.table;
-        let name = format!("{}.{}#{column}", table.schema, table.table);
-        if request.corpora.holds(&name) { return Ok(()); }
-        let Some(at) = request.partitions.iter().filter_map(|snapshot| snapshot.tx_basis()).map(|basis| basis.system_time.0).max() else { return Ok(()) };
-        let instant = Interval::from_micros(at, at.saturating_add(1))?;
-        let point = TemporalBounds { valid_time: instant, system_time: instant };
-        let mut files = Vec::new();
-        let mut segments = Vec::new();
-        for snapshot in request.partitions {
-            // A corpus resolves entities across every source, so no trie is left out by its sections.
-            match self.trie_files_in(request, snapshot, definition, point, None, false).await {
-                Ok(TrieFiles::Complete(found) | TrieFiles::Partial(found)) => files.extend(found.files),
-                Err(error) if optional_build_refused(&error) => {
-                    drop(files);
-                    let source = request.verifier.snapshot_corpus(column, Timestamp(at), request.partitions).await?;
-                    request.corpora.register(name, source);
-                    return Ok(());
-                }
-                Err(error) => return Err(error),
-            }
-            segments.extend(snapshot.iter_segments(table).cloned());
-        }
-        request.corpora.register(name, Arc::new(TableCorpus { runtime: Arc::clone(&self.runtime), database: request.database.to_string(), files: parking_lot::Mutex::new(files), computed: std::sync::OnceLock::new(), segments, column: column.to_string(), at }));
-        Ok(())
-    }
     fn live_candidates(&self, request: &ScanRequest<'_>, column: &str, query: &Query) -> Result<BTreeSet<Iid>> {
         let mut candidates = BTreeSet::new();
         for segment in request.snapshot.iter_segments(&request.scan.table.name.table) {
@@ -485,7 +450,7 @@ impl SearchAccelerator {
                 return Ok(None);
             }
         }
-        let scoring = rtdb_expr::CorpusLookup::scorer(request.corpora, &text);
+        let scoring = Arc::new(rtdb_text::Scorer::new(Query::parse(&text), None));
         let Some(rank_scorer) = scoring.for_ranking() else { work.decline = Some("score-domain"); return Ok(None); };
         let ranked = by_file(&files).map(|selected| {
             Ok((selected.members, selected.file.ranked(column, matching, &rank_scorer, request.bounds)?))
@@ -552,18 +517,6 @@ impl SearchAccelerator {
     }
 }
 
-/// A column's corpus at the snapshot's instant, computed when a score first asks for it.
-struct TableCorpus { runtime: Arc<crate::SearchRuntime>, database: String, files: parking_lot::Mutex<Vec<TrieFile>>, computed: std::sync::OnceLock<Result<Arc<crate::corpus::SnapshotCorpus>>>, segments: Vec<Arc<rtdb_index::LiveTable>>, column: String, at: i64 }
-
-impl rtdb_query::CorpusSource for TableCorpus {
-    fn corpus(&self, query: &Query) -> Result<rtdb_text::Corpus> {
-        self.computed.get_or_init(|| {
-            let files = std::mem::take(&mut *self.files.lock());
-            self.runtime.snapshot_corpus(&self.database, files, &self.segments, &self.column, self.at)
-        }).as_ref().map_err(Clone::clone)?.corpus(query)
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -590,7 +543,7 @@ mod tests {
     }
 
     #[test]
-    fn shared_search_uses_only_the_selected_members_for_candidates_ranking_and_corpus() {
+    fn shared_search_uses_only_the_selected_members_for_candidates_and_ranking() {
         use crate::file::write_group_search_file;
 
         let columns = vec!["body".to_string()];
@@ -624,14 +577,6 @@ mod tests {
         };
         assert_eq!(candidates.next(None, &mut NarrowingWork::default()).unwrap().map(|(_, iid, exact)| (iid, exact)), Some((Iid([64; 16]), true)));
         assert!(candidates.next(None, &mut NarrowingWork::default()).unwrap().is_none());
-
-        let terms = Query::parse("overdue invoice");
-        let corpus = |member| runtime.snapshot_corpus("xtdb", vec![trie(member)], &[], "body", 0)
-            .unwrap().corpus(&terms).unwrap();
-        let first = corpus(0);
-        let second = corpus(1);
-        assert_eq!((first.documents, first.tokens, first.frequencies["invoice"]), (1, 2, 1));
-        assert_eq!((second.documents, second.tokens, second.frequencies["invoice"]), (1, 1, 0));
     }
 
     #[test]

@@ -33,10 +33,7 @@ pub(crate) fn call(name: &str, args: &[Value], context: &EvalContext<'_>) -> Opt
             }
             ("search_score", [text, Value::Utf8(query)]) => {
                 let tokens = tokens_of(text, context)?;
-                Ok(Value::F64(match context.corpora {
-                    Some(corpora) => corpora.scorer(query).bm25(&tokens),
-                    None => Scorer::new(Query::parse(query), None).bm25(&tokens),
-                }))
+                Ok(Value::F64(Scorer::new(Query::parse(query), None).bm25(&tokens)))
             }
             ("search_score", [text, Value::Utf8(query), documents, total, frequencies]) => {
                 let query = parse_query(query, context)?;

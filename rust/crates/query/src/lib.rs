@@ -41,7 +41,7 @@ mod query_cpu;
 mod join_storage;
 mod mark;
 
-pub use accelerate::{CandidateVerifier, ConstantEvaluator, CorpusRegistry, CorpusSource, FileMatches, MatchAnswers, OrderedBatches, OrderedCandidates, OrderedScan, ScanAccelerator, ScanRequest};
+pub use accelerate::{CandidateVerifier, ConstantEvaluator, FileMatches, MatchAnswers, OrderedBatches, OrderedCandidates, OrderedScan, ScanAccelerator, ScanRequest};
 pub use context::{CatalogSnapshot, DatabaseSnapshot, OrderedIndexInventory, OrderedIndexStorage, QueryContext, QueryOptions, retain_catalog_snapshot};
 pub use fragment::{FragmentBytes, FragmentDepth, FragmentResidence, ScanFragment, ScanFragmenter, TriePrefix, evaluate_fragment, evaluate_fragment_retained};
 pub use cursor::{PreparedQuery, QueryCursor, encoding_ordered_batch};
