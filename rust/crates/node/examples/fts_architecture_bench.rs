@@ -190,8 +190,9 @@ async fn main() {
         return;
     }
     #[cfg(feature = "fts-experiments")]
-    if workload == "workload" {
-        workload::run(args.next().unwrap().parse().unwrap(), args.next().unwrap().parse().unwrap()).await;
+    if workload == "workload" || workload == "ranked-filter" {
+        workload::run(args.next().unwrap().parse().unwrap(), args.next().unwrap().parse().unwrap(),
+            workload == "ranked-filter").await;
         return;
     }
     let document_count: i64 = workload.parse().unwrap();

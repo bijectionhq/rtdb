@@ -18,7 +18,7 @@ use super::{Identity, TickClock, bench_options, bench_services, commit, flush, s
 use super::corpus_checkpoint::{as_of, id};
 
 #[derive(Clone, Debug)]
-enum Mode { Current, Exhaustive, FilterFirst(Arc<BTreeSet<Iid>>), SkipRetry, Estimate }
+enum Mode { Current, Baseline, Exhaustive, FilterFirst(Arc<BTreeSet<Iid>>), SkipRetry, Estimate }
 
 struct Observation {
     mode: Mode,
@@ -42,6 +42,7 @@ impl ScanAccelerator for ObservedSearch {
         };
         let policy = match &mode {
             Mode::Current => Policy::Current,
+            Mode::Baseline => Policy::Baseline,
             Mode::Exhaustive => Policy::Exhaustive,
             Mode::FilterFirst(scope) => Policy::FilterFirst(scope),
             Mode::SkipRetry => Policy::SkipRetry,
@@ -177,7 +178,7 @@ async fn filter_first(context: &Arc<QueryContext>, current: Timestamp, iteration
                     measured["ms"] = json!(millis(start));
                     samples[index].push(measured);
                 } else {
-                    let mode = if index == 0 { Mode::Current } else { Mode::FilterFirst(Arc::clone(&scope)) };
+                    let mode = if index == 0 { Mode::Baseline } else { Mode::FilterFirst(Arc::clone(&scope)) };
                     samples[index].push(sample(context, &statement, mode, &expected).await);
                 }
             }
@@ -204,7 +205,7 @@ async fn fallback(context: &Arc<QueryContext>, basis: Timestamp, iterations: usi
         for iteration in 0..iterations {
             for order in 0..3 {
                 let index = (order + iteration) % 3;
-                let mode = [Mode::Current, Mode::SkipRetry, Mode::Estimate][index].clone();
+                let mode = [Mode::Baseline, Mode::SkipRetry, Mode::Estimate][index].clone();
                 samples[index].push(sample(context, &statement, mode, &expected).await);
             }
         }
@@ -214,7 +215,14 @@ async fn fallback(context: &Arc<QueryContext>, basis: Timestamp, iterations: usi
     out
 }
 
-async fn version_canary(node: &Node, write: &mut NativeSession, read: &mut NativeSession) -> Timestamp {
+fn exhaustive_context(context: &Arc<QueryContext>, search: &Arc<dyn ScanAccelerator>) -> Arc<QueryContext> {
+    Arc::clone(context).with_accelerators(Arc::from([Arc::clone(search)]))
+}
+
+async fn version_canary(
+    node: &Node, write: &mut NativeSession, read: &mut NativeSession,
+    search: &Arc<dyn ScanAccelerator>, ordered: bool,
+) -> Timestamp {
     let old = commit(write, vec![
         sql("INSERT INTO docs RECORDS {_id: -1, body: 'forensiconly', status: 'closed', cohort: 0, _valid_from: TIMESTAMP '1970-01-01T00:00:00Z'}"),
         sql("INSERT INTO docs RECORDS {_id: -2, body: 'forensiconly', status: 'open', cohort: 0, _valid_from: TIMESTAMP '1970-01-01T00:00:00Z'}"),
@@ -227,14 +235,18 @@ async fn version_canary(node: &Node, write: &mut NativeSession, read: &mut Nativ
     for compacted in [false, true] {
         if compacted { flush_and_index(node).await; }
         let context = read.query_context().await.unwrap();
+        let exhaustive = exhaustive_context(&context, search);
         for (valid, system) in [(old, old), (old, after), (Timestamp(3_000_000), after)] {
             let at = as_of(valid, system);
-            let structured = "status = 'open'";
-            let scope = mask(&context, &at, structured).await;
-            let statement = ranked(&at, "MATCH(body, 'forensiconly') AND status = 'open'", "forensiconly", 20);
-            let expected = query(&context, &statement, Mode::Exhaustive).await.0;
+            let structured = "status = 'open' AND cohort = 0";
+            let scope = mask(&exhaustive, &at, structured).await;
+            let statement = ranked(&at, &format!("MATCH(body, 'forensiconly') AND {structured}"), "forensiconly", 20);
+            let expected = query(&exhaustive, &statement, Mode::Exhaustive).await.0;
             assert_eq!(expected.iter().map(|row| id(row)).collect::<Vec<_>>(), [-2]);
-            sample(&context, &statement, Mode::Current, &expected).await;
+            let current = sample(&context, &statement, Mode::Current, &expected).await;
+            if ordered && compacted {
+                assert!(current["plans"][0]["filter_scope"].as_u64().is_some(), "{statement}");
+            }
             sample(&context, &statement, Mode::FilterFirst(scope), &expected).await;
         }
     }
@@ -266,7 +278,7 @@ async fn replay(node: &Node, read: &mut NativeSession, old: Timestamp, waves: us
             readers.push(tokio::spawn(async move {
                 start.wait().await;
                 let began = Instant::now();
-                let (rows, plans) = query(&context, &statement, Mode::Current).await;
+                let (rows, plans) = query(&context, &statement, Mode::Baseline).await;
                 let ended = Instant::now();
                 (name, statement, rows, plans, began, ended)
             }));
@@ -295,7 +307,36 @@ async fn replay(node: &Node, read: &mut NativeSession, old: Timestamp, waves: us
     out
 }
 
-async fn run_fixture(documents: i64, iterations: usize, candidate_limit: usize) -> Json {
+async fn production(context: &Arc<QueryContext>, oracle: &Arc<QueryContext>, basis: Timestamp, iterations: usize) -> Vec<Json> {
+    let at = points(basis);
+    let mut out = Vec::new();
+    let mut cases = vec![
+        ("uniform".to_string(), "MATCH(body, 'incident')".to_string(), "noindexedscore"),
+        ("rare-winners".to_string(), "MATCH(body, 'incident')".to_string(), "criticalsignal"),
+    ];
+    cases.extend([2, 20, 200, 1000].map(|ceiling| (
+        format!("status-and-cohort-{ceiling}"),
+        format!("MATCH(body, 'incident') AND status = 'open' AND cohort < {ceiling}"),
+        "audit",
+    )));
+    for (name, predicate, score) in cases {
+        let statement = ranked(&at, &predicate, score, 20);
+        let expected = query(oracle, &statement, Mode::Exhaustive).await.0;
+        let mut runs = [Vec::new(), Vec::new()];
+        for iteration in 0..iterations {
+            for order in 0..2 {
+                let index = (iteration + order) % 2;
+                let mode = [Mode::Baseline, Mode::Current][index].clone();
+                runs[index].push(sample(context, &statement, mode, &expected).await);
+            }
+        }
+        let [baseline, current] = runs;
+        out.push(json!({"case": name, "baseline": baseline, "current": current}));
+    }
+    out
+}
+
+async fn run_fixture(documents: i64, iterations: usize, candidate_limit: usize, ordered: bool) -> Json {
     assert!(documents >= 4000 && iterations > 0);
     let clock = Arc::new(TickClock(AtomicI64::new(1_000_000)));
     let runtime = SearchRuntime::new(512 << 20);
@@ -303,7 +344,8 @@ async fn run_fixture(documents: i64, iterations: usize, candidate_limit: usize) 
     services.artefact_kinds = vec![runtime.artefacts()];
     let mut accelerator = SearchAccelerator::with_runtime(runtime);
     accelerator.max_candidates = candidate_limit;
-    services.scan_accelerators = vec![Arc::new(ObservedSearch(Arc::new(accelerator)))];
+    let search: Arc<dyn ScanAccelerator> = Arc::new(ObservedSearch(Arc::new(accelerator)));
+    services.scan_accelerators = vec![Arc::clone(&search)];
     let mut options = bench_options();
     options.cache_bytes = 512 << 20;
     let (node, driver) = Node::open(options, services).await.unwrap();
@@ -311,33 +353,39 @@ async fn run_fixture(documents: i64, iterations: usize, candidate_limit: usize) 
     let mut write = node.session("xtdb", Arc::new(Identity)).unwrap();
     let mut read = node.session("xtdb", Arc::new(Identity)).unwrap();
     commit(&mut write, vec![sql("CREATE SEARCH INDEX docs_body ON docs (body)")]).await;
+    if ordered { commit(&mut write, vec![sql("CREATE INDEX docs_status ON docs (status, cohort)")]).await; }
     for offset in (0..documents).step_by(4000) {
         put(&node, &mut write, offset..(offset + 4000).min(documents), 0, None).await;
         if (offset + 4000) % 20_000 == 0 { flush(&node).await; }
     }
     flush_and_index(&node).await;
-    let basis = version_canary(&node, &mut write, &mut read).await;
+    let basis = version_canary(&node, &mut write, &mut read, &search, ordered).await;
     let context = read.query_context().await.unwrap();
-    let filters = filter_first(&context, basis, iterations).await;
-    let fallbacks = fallback(&context, basis, iterations).await;
-    drop(context);
-    let observations = replay(&node, &mut read, basis, iterations, documents).await;
-    let after = node.catalog().database("xtdb").unwrap().snapshot().tx_basis().unwrap().system_time;
-    let changed = read.query_context().await.unwrap();
-    let corrected_fallbacks = fallback(&changed, after, iterations).await;
-    let tries = node.catalog().database("xtdb").unwrap().snapshot().trie_entries(&TableRef::new("public", "docs")).len();
-    let result = json!({"documents": documents, "iterations": iterations, "tries": tries,
-        "candidate_limit": candidate_limit, "temporal_canary_comparisons": 12,
-        "filter_first": filters, "fallback": fallbacks, "replay": observations,
-        "fallback_after_corrections": corrected_fallbacks});
-    drop(changed);
+    let result = if ordered {
+        let oracle = exhaustive_context(&context, &search);
+        let cases = production(&context, &oracle, basis, iterations).await;
+        json!({"documents": documents, "candidate_limit": candidate_limit, "iterations": iterations,
+            "temporal_canary_comparisons": 12, "cases": cases})
+    } else {
+        let filters = filter_first(&context, basis, iterations).await;
+        let fallbacks = fallback(&context, basis, iterations).await;
+        drop(context);
+        let observations = replay(&node, &mut read, basis, iterations, documents).await;
+        let after = node.catalog().database("xtdb").unwrap().snapshot().tx_basis().unwrap().system_time;
+        let changed = read.query_context().await.unwrap();
+        let corrected_fallbacks = fallback(&changed, after, iterations).await;
+        let tries = node.catalog().database("xtdb").unwrap().snapshot().trie_entries(&TableRef::new("public", "docs")).len();
+        json!({"documents": documents, "iterations": iterations, "tries": tries, "candidate_limit": candidate_limit,
+            "temporal_canary_comparisons": 12, "filter_first": filters, "fallback": fallbacks,
+            "replay": observations, "fallback_after_corrections": corrected_fallbacks})
+    };
     node.shutdown();
     tokio::time::timeout(Duration::from_secs(30), driver).await.unwrap().unwrap().unwrap();
     result
 }
 
-pub(super) async fn run(documents: i64, iterations: usize) {
-    println!("{}", run_fixture(documents, iterations, 100_000).await);
+pub(super) async fn run(documents: i64, iterations: usize, ordered: bool) {
+    println!("{}", run_fixture(documents, iterations, 100_000, ordered).await);
 }
 
 #[cfg(test)]
@@ -346,7 +394,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn workload_preserves_exact_results_with_filter_and_fallback_policies() {
-        let result = run_fixture(4000, 1, 1000).await;
+        let result = run_fixture(4000, 1, 1000, false).await;
         let uniform = &result["fallback"][0];
         let current = &uniform["current"][0]["plans"][0];
         let skip_retry = &uniform["skip_retry"][0]["plans"][0];
@@ -362,5 +410,22 @@ mod tests {
         assert!(filtered["filter_scope"].as_u64().unwrap() < 1000);
         assert_eq!(result["replay"].as_array().unwrap().len(), 6);
         assert_eq!(result["temporal_canary_comparisons"], 12);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn production_ranking_reuses_ordered_iids_and_skips_a_provably_oversize_retry() {
+        let result = run_fixture(4000, 1, 1000, true).await;
+        let cases = result["cases"].as_array().unwrap();
+        let baseline = &cases[0]["baseline"][0]["plans"][0];
+        let current = &cases[0]["current"][0]["plans"][0];
+        assert!(baseline["unranked_events"].as_u64().unwrap() > 1000);
+        assert_eq!(current["rank_decline"], "candidate-budget");
+        assert_eq!(current["retry_redundant"], true);
+        assert_eq!(current["unranked_events"], 0);
+        let baseline = &cases[2]["baseline"][0]["plans"][0];
+        let current = &cases[2]["current"][0]["plans"][0];
+        assert_eq!(current["route"], "ranked");
+        assert!(current["filter_scope"].as_u64().is_some_and(|count| count > 0 && count < 1000));
+        assert!(current["score_evaluations"].as_u64().unwrap() < baseline["score_evaluations"].as_u64().unwrap());
     }
 }

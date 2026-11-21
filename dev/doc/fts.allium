@@ -221,6 +221,8 @@ rule RepairUnreadableSearchFile {
 --   1. Every matching event that may be visible bounds its IID above by its score, an IID's best event bounding it.
 --      Events in live segments are scored from their rows.
 --      A search file's documents are scored a batch of windows at a time, best window bound first, and a window is scored only once its bound may exceed every event already scored.
+--      Where an earlier selection supplies an IID scope, file and live events outside that scope are discarded before scoring.
+--      The scope does not change the corpus or restrict the history used to resolve any selected IID.
 --      A window adds the upper bounds for each term in scoring order. Each term uses the window's maximum frequency and minimum stored length with binary64 roundoff covered before addition.
 --   2. IIDs in the scan's selected IID scope are taken best bound first, in batches.
 --      A document left exactly visible by CutByLaterEvents counts as verified when the scan's only predicate is the MATCH used to narrow candidates.
@@ -232,7 +234,9 @@ rule RepairUnreadableSearchFile {
 --
 -- The visible row of an IID is one of its matching events, so its bound is never below its score, and no IID left out can hold one of the first n rows.
 -- An IID's history lies in one partition, so the first n rows overall are among the first n of some partition, and the sort above picks them from the union.
--- The scan is left to the unranked narrowing when the weights fall outside the window bound's domain, the matching IIDs exceed max_candidates, or verification runs past sixteen batches.
+-- A candidate-budget miss without an IID scope skips unranked narrowing if the ranked candidate union already contains more distinct IIDs than its limit.
+-- This union is a lower bound for the unranked candidate union and counts each IID once across its pending and handed-out events.
+-- Other declines use unranked narrowing, including an exhausted verification budget or a candidate-budget miss where there is no distinct-IID proof.
 -- SEARCH_SCORE sums documents, tokens and each of its terms' document frequencies over every corpus the query registered; with none, each term's inverse document frequency is 1.
 
 rule CorpusAsOfTheSnapshot {
