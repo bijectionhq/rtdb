@@ -410,6 +410,11 @@ impl Node {
 
     async fn submit(&self, database: &str, operations: Vec<TxOp>, mut options: SubmitOptions, permit: Option<crate::ReplaySubmissionPermit>, identity: &dyn SessionIdentity, placement: Option<&Weak<Database>>, cancellation: &CancellationToken) -> Result<SubmittedTx> {
         self.admit(database, DatabaseAccess::Write, identity, cancellation).await?;
+        if !self.factory.options.owned_relations
+            && operations.iter().any(|operation| matches!(operation, TxOp::OwnedInsertDocs { .. }))
+        {
+            return Err(owned_relations_disabled());
+        }
         let database = self.attached_database(database, placement)?;
         let admission = if self.catalog.is_placed() {
             Some(cancellation.run_until_cancelled(database.admit_transaction()).await.ok_or_else(cancelled)??)
@@ -861,6 +866,22 @@ impl NativeSession {
     pub async fn reserve_ordered_present(&mut self) -> Result<TransactionKey> {
         self.state.reserve_ordered_present().await
     }
+    /// Reads one IID in the authenticated principal's owned relation at a store-reserved present.
+    pub async fn open_owned_point(&mut self, relation: &rtdb_types::OwnedRelation, id: &rtdb_types::EntityId) -> Result<Option<QueryCursor>> {
+        if !self.service.node.factory.options.owned_relations { return Err(owned_relations_disabled()); }
+        let owner = self.state.user().filter(|owner| !owner.is_empty()).map(str::to_owned)
+            .ok_or_else(|| Anomaly::new(AnomalyCategory::Forbidden, "rtdb.owned/no-owner", "Owned relations require an authenticated principal"))?;
+        let present = self.reserve_ordered_present().await?;
+        let database = self.state.database();
+        let basis = QueryBasis {
+            snapshot: TimeBasis { databases: BTreeMap::from([(database.to_owned(), vec![Some(present.system_time.into())])]) },
+            snapshot_time: Some(present.system_time),
+            current_time: present.system_time.into(),
+            timezone: self.state.session_timezone().to_owned(),
+        };
+        let context = self.service.query_context(database, &basis, self.state.cancellation()).await?;
+        rtdb_query::open_owned_point(context, &owner, relation, id.iid(), None, None).await
+    }
     pub async fn query_context(&mut self) -> Result<Arc<QueryContext>> {
         let basis = self.state.read_basis().await?;
         Ok(self.service.query_context(self.state.database(), &basis, self.state.cancellation()).await?.with_observer(self.service.execution_observer()).with_tracer(self.service.node.tracer(), None))
@@ -1095,6 +1116,10 @@ pub const REPLICA_BEHIND: &str = "rtdb.node/replica-behind";
 
 fn lost_placement(database: &str) -> Anomaly {
     Anomaly::new(AnomalyCategory::Unavailable, NOT_HELD, format!("This node no longer holds {database}")).with_context("db-name", database.into())
+}
+
+fn owned_relations_disabled() -> Anomaly {
+    Anomaly::unsupported("rtdb.owned/disabled", "Native owned relations are disabled on this node")
 }
 
 fn closed() -> Anomaly { Anomaly::new(AnomalyCategory::Interrupted, "xtdb/node-closed", "Node is closed") }

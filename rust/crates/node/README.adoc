@@ -16,6 +16,13 @@ Transactions in the same database history that resolve after the reservation tak
 Each call can append a fresh reservation, including a retry after an unknown outcome.
 The reservation changes transaction bookkeeping only and marks its `xt.txs` metadata with `rtdb_present_reservation`.
 
+`NodeOptions::owned_relations` enables the native owner-scoped relation API.
+Enable this mode only on an installation where every serving and replay member supports the owned relation format.
+`TxOp::OwnedInsertDocs` resolves create-only writes in the authenticated principal's namespace.
+`NativeSession::open_owned_point` reads a single entity in that namespace at a store-reserved present.
+Normal SQL and ordinary native writes cannot access the reserved scope.
+Owned write transactions contain only owned operations.
+
 Session parameter entries, database and timezone strings, await/snapshot tokens, pinned transaction bases and buffered SQL carry execution-budget reservations for their retained lifetime.
 Rejected parameter updates retain the previous value.
 The failed-transaction marker stores only the state needed to reject subsequent commands; it does not retain the command's diagnostic payload.

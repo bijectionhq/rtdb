@@ -407,6 +407,9 @@ impl ScanCursor {
     /// A scan of the given partitions of its database, which share `storage`.
     /// With an `order`, each partition's rows leave in that order of their IIDs, and the partition is read here rather than split into fragments.
     async fn over(mut scan: Scan, execution: Execution, pushdowns: Option<Arc<crate::pushdown::Pushdowns>>, database_partitions: &[Snapshot], storage: &Arc<BufferPool>, accelerate: bool, order: Option<IidOrder>) -> Result<Self> {
+        if !execution.context.catalog.permits_table(&scan.table.name) {
+            return Err(Anomaly::incorrect("rtdb.owned/scan-scope", "The relation is outside the admitted scan scope"));
+        }
         let fixed_iids = scan.iids.is_some();
         if !fixed_iids { scan.iids = id_selection(&scan, execution.parameters.values()); }
         let interval = if !stores_uuid_ids(&scan.table.name.table, database_partitions) { None } else {
@@ -620,6 +623,9 @@ impl OrderedWindow {
 }
 
 pub(crate) async fn ordered_input(scan: &Scan, execution: &Execution, limit: usize, offset: usize, projection: Option<&[usize]>) -> Result<Option<crate::operators::OrderedInput>> {
+    if !execution.context.catalog.permits_table(&scan.table.name) {
+        return Err(Anomaly::incorrect("rtdb.owned/scan-scope", "The relation is outside the admitted scan scope"));
+    }
     use crate::operators::OrderedInput;
     let full;
     let positions = match projection {

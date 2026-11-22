@@ -56,3 +56,6 @@ fn invalid(code: &str, message: impl std::fmt::Display) -> rtdb_types::Anomaly {
 fn cardinality_violation() -> rtdb_types::Anomaly {
     rtdb_types::Anomaly::incorrect("xtdb.single-join/cardinality-violation", "cardinality violation")
 }
+
+mod owned_relation;
+pub use owned_relation::open_owned_point;

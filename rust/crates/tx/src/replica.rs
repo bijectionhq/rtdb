@@ -35,13 +35,31 @@ pub fn decode_replica(message: &ResolvedTx, predecessor: Option<TransactionKey>,
         TransactionResult::Aborted { tx_key: key, error }
     };
     let mut tables = BTreeMap::new();
+    let mut owned_namespace = None;
     for (name, bytes) in &message.table_data {
-        let (schema, table) = name.split_once('/').ok_or_else(|| invalid("Replica table must use schema/table"))?;
-        if schema.is_empty() || table.is_empty() || table.contains('/') { return Err(invalid("Invalid replica table name")); }
+        let (schema, physical_name) = name.split_once('/').ok_or_else(|| invalid("Replica table must use schema/table"))?;
+        if schema.is_empty() || physical_name.is_empty() || physical_name.contains('/') { return Err(invalid("Invalid replica table name")); }
+        let table = TableRef::new(schema, physical_name);
+        if TableRef::owned_schema(schema) {
+            if !table.supported_owned_name() {
+                return Err(invalid("Unknown owned relation policy or invalid owned relation name"));
+            }
+            let namespace = &physical_name[..64];
+            if owned_namespace.is_some_and(|seen| seen != namespace) {
+                return Err(invalid("Resolved transaction writes more than one owner namespace"));
+            }
+            owned_namespace = Some(namespace);
+        }
         let pages = crate::ipc::decode(bytes, memory)?;
         if pages.len() != 1 { return Err(invalid("Resolved transaction table must contain exactly one record batch")); }
         let batch = IndexBatch::from_owned(pages.into_iter().next().ok_or_else(|| invalid("Replica table has no batch"))?)?;
-        tables.insert(TableRef::new(schema, table), TableWrite::new(StructFields::new(), Some(batch)));
+        tables.insert(table, TableWrite::new(StructFields::new(), Some(batch)));
+    }
+    if owned_namespace.is_some() && (!result.committed() || message.db_op.is_some() || tables.keys().any(|table| {
+        !TableRef::owned_schema(&table.schema)
+            && !(table.schema == "xt" && matches!(table.table.as_str(), "txs" | "idempotency_receipts" | PLACED_ATTEMPT_OUTCOME_TABLE))
+    })) {
+        return Err(invalid("Resolved owned transaction mixes storage scopes"));
     }
     Ok(ReplayedTransaction { writes: StagedWrite::new(key, predecessor, block, tables)?, result, placed_attempt })
 }

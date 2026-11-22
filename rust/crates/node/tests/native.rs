@@ -258,6 +258,63 @@ fn put(node: &Node, id: i64, value: i64) -> TxOp {
 }
 
 #[tokio::test]
+async fn owned_native_relations_are_scoped_to_the_durable_principal() {
+    use rtdb_types::{EntityId, OwnedRelation};
+
+    struct OtherOwner;
+    #[async_trait]
+    impl SessionIdentity for OtherOwner {
+        fn user(&self) -> Option<&str> { Some("another-owner") }
+        async fn revalidate(&self, _: Timestamp) -> Result<()> { Ok(()) }
+        fn authorize_database(&self, _: &str, _: DatabaseAccess) -> Result<()> { Ok(()) }
+    }
+
+    let mut settings = options();
+    settings.owned_relations = true;
+    let (node, driver) = running(settings, services()).await;
+    let mut owner = node.session("xtdb", Arc::new(Authority)).unwrap();
+    let mut other = node.session("xtdb", Arc::new(OtherOwner)).unwrap();
+    let relation = OwnedRelation::new("orders").unwrap();
+    let insert = |value| TxOp::OwnedInsertDocs {
+        relation: relation.clone(),
+        documents: Documents::new(vec![StructFields::from([
+            ("_id".into(), Value::I64(1)), ("value".into(), Value::I64(value)),
+        ])], node.memory()).unwrap(),
+        valid_from: None, valid_to: None,
+    };
+    let options = AutonomousTxOptions::default();
+    let first = owner.state_mut().execute_tx(vec![insert(10)], options.clone()).await.unwrap();
+    assert!(first.committed(), "{:?}", first.error());
+    let id = EntityId::Integer(1);
+    assert_eq!(rows(owner.open_owned_point(&relation, &id).await.unwrap().unwrap()).await, [vec![Value::I64(1), Value::I64(10)]]);
+    assert!(other.open_owned_point(&relation, &id).await.unwrap().is_none());
+
+    let physical = relation.table("xtdb");
+    let raw = TxOp::PutDocs {
+        table: physical.clone(),
+        documents: Documents::new(vec![StructFields::from([("_id".into(), Value::I64(2))])], node.memory()).unwrap(),
+        valid_from: None, valid_to: None,
+    };
+    assert_eq!(owner.state_mut().execute_tx(vec![raw], options.clone()).await.unwrap_err().code, "xtdb/forbidden-table");
+    let name = format!(r#""{}"."{}""#, physical.schema, physical.table);
+    assert_eq!(owner.query_sql(&format!("SELECT * FROM {name}"), vec![]).await.err().unwrap().code, "xtdb/table-not-found");
+    assert!(rows(owner.query_sql("SELECT table_name FROM information_schema.tables WHERE table_schema = 'rtdb_owned_v1'", vec![]).await.unwrap()).await.is_empty());
+    let ddl = TxOp::Sql { sql: format!("CREATE TABLE {name} (value BIGINT)"), args: None };
+    let rejected = owner.state_mut().execute_tx(vec![ddl], options.clone()).await.unwrap();
+    assert_eq!(rejected.error().unwrap().code, "xtdb/forbidden-table");
+
+    let mixed = owner.state_mut().execute_tx(vec![put(&node, 1, 7), insert(11)], options.clone()).await.unwrap();
+    assert_eq!(mixed.error().unwrap().code, "rtdb.owned/mixed-transaction");
+    assert!(owner.query_sql("SELECT * FROM docs", vec![]).await.is_err());
+    let second = other.state_mut().execute_tx(vec![insert(12)], options).await.unwrap();
+    assert!(second.committed(), "{:?}", second.error());
+    assert_eq!(rows(other.open_owned_point(&relation, &id).await.unwrap().unwrap()).await, [vec![Value::I64(1), Value::I64(12)]]);
+    drop(other);
+    drop(owner);
+    stop(&node, driver).await;
+}
+
+#[tokio::test]
 async fn source_barrier_waits_for_submitted_transactions_before_the_next_read() {
     let (node, driver) = Node::open(options(), services()).await.unwrap();
     let mut writer = node.session("xtdb", Arc::new(Authority)).unwrap();

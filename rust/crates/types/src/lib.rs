@@ -41,7 +41,7 @@ pub use zone::{FixedOffset, ZoneId, timezone_names, TZDB_VERSION, TZDB_SHA256};
 pub use legacy_zone::LegacyTimeZone;
 pub use float_text::{java_f32_text, java_f64_text};
 pub use text_fingerprint::text_pair_fingerprint;
-pub use id::{EntityId, Iid, Keyword, TableRef};
+pub use id::{EntityId, Iid, Keyword, OwnedRelation, TableRef};
 pub use java_map::{compute_if_absent_indices as java_hash_map_compute_if_absent_order, indices as java_hash_map_order, put_all_indices as java_hash_map_put_all_order};
 pub use ordered::{OrderedSet, StructFields, StructFieldsIter};
 pub use logical::{IntervalUnit, ListKind, LogicalType, RunEndWidth, ScalarType, TimeUnit};
