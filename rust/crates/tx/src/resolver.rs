@@ -30,6 +30,7 @@ pub trait TransactionAuthorization: Send + Sync {
 }
 
 pub struct ResolveContext {
+    pub owned_witness_scope: Option<rtdb_types::PlacedAttemptScope>,
     pub database: String,
     pub storage: Arc<BufferPool>,
     pub memory: Arc<MemoryBudget>,
@@ -195,6 +196,7 @@ impl TxResolver {
                 request.options.system_time.unwrap_or(default_time)
             },
         };
+        let attempt = request.placed_attempt(position)?;
         let mut tx = OpenTransaction::new(base.clone(), key, &request.options, context)?;
         tx.trace_parent = span.as_ref().map(|span| span.context());
         let replay = match &request.guard {
@@ -234,7 +236,7 @@ impl TxResolver {
                 }
             } else { (None, Ok(())) };
             if has_owned_operations && outcome.is_ok() {
-                outcome = tx.check_owned_preconditions(&request.operations).await;
+                outcome = tx.check_owned_preconditions(&request.operations, attempt.map(PlacedAttempt::scope)).await;
             }
             for (index, operation) in request.operations.iter().enumerate().take_while(|_| outcome.is_ok()) {
                 context.check_cancelled()?;
@@ -281,7 +283,6 @@ impl TxResolver {
             Err(error) => return Err(error),
         };
         tx.write_result(&result, request.options.user_metadata.as_ref())?;
-        let attempt = request.placed_attempt(position)?;
         if let Some(attempt) = attempt { tx.write_attempt_outcome(attempt, log_time)?; }
         context.check_cancelled()?;
         self.stage(tx.buffer.stage()?, result, attempt.map_or(ResolvedInput::Position(position), ResolvedInput::Placed), None, None, context)
@@ -631,7 +632,7 @@ impl<'a> OpenTransaction<'a> {
                 self.declare_owned_path(relation, name, columns, false).await,
             Operation::Public(TxOp::OwnedDeclareSearchPath { relation, name, column }) =>
                 self.declare_owned_path(relation, name, std::slice::from_ref(column), true).await,
-            Operation::Public(TxOp::OwnedDeadline { .. } | TxOp::OwnedCheck { .. }) => Ok(()),
+            Operation::Public(TxOp::OwnedDeadline { .. } | TxOp::OwnedCheckRange { .. } | TxOp::OwnedCheck { .. }) => Ok(()),
             Operation::Public(TxOp::OwnedDelete { relation, id, valid_from, valid_to }) =>
                 self.delete_owned(relation, id, *valid_from, *valid_to).await,
             Operation::Public(TxOp::OwnedInsertDocs { relation, documents, valid_from, valid_to }) =>
@@ -779,7 +780,7 @@ impl<'a> OpenTransaction<'a> {
         self.buffer.put(catalog, document, Interval::ALL)
     }
 
-    async fn check_owned_preconditions(&mut self, operations: &[Operation]) -> Result<()> {
+    async fn check_owned_preconditions(&mut self, operations: &[Operation], source_scope: Option<rtdb_types::PlacedAttemptScope>) -> Result<()> {
         let owner = self.options.user.as_deref().filter(|owner| !owner.is_empty()).ok_or_else(no_owned_principal)?;
         let mut deadline = None;
         for operation in operations {
@@ -809,6 +810,24 @@ impl<'a> OpenTransaction<'a> {
             return Err(Anomaly::new(AnomalyCategory::Conflict, "rtdb.owned/expired", "Owned transaction reached its deadline before ordering"));
         }
         for operation in operations {
+            if let Operation::Public(TxOp::OwnedCheckRange { relation, basis, scope, frontier, until }) = operation {
+                let base = self.buffer.base_snapshot();
+                let unavailable = || Anomaly::new(AnomalyCategory::Conflict, "rtdb.owned/range-witness-unavailable",
+                    "Owned range witness is no longer admissible");
+                if Some(*scope) != source_scope || Some(*scope) != self.context.owned_witness_scope
+                    || self.tx_key().system_time >= *until || *frontier < 0 || basis.tx_id.0 < 0
+                    || relation.world().is_some() || relation.is_world_catalog()
+                    || base.tx_basis().is_none_or(|head| basis.tx_id > head.tx_id || basis.system_time > head.system_time
+                        || ((basis.tx_id == head.tx_id) != (basis.system_time == head.system_time)))
+                {
+                    return Err(unavailable());
+                }
+                if base.relation_event_frontier(&relation.table(owner))? != *frontier {
+                    return Err(Anomaly::new(AnomalyCategory::Conflict, "rtdb.owned/stale-range",
+                        "The observed owned relation changed before ordering"));
+                }
+                continue;
+            }
             let Operation::Public(TxOp::OwnedCheck { relation, id, valid_at, expected }) = operation else { continue; };
             let upper = valid_at.0.checked_add(1).map(Timestamp)
                 .ok_or_else(|| Anomaly::incorrect("rtdb.owned/invalid-read-instant", "The observation's valid instant has no following microsecond"))?;
@@ -1342,6 +1361,7 @@ mod tests {
     async fn mutation_syntax_is_charged_until_the_plan_takes_ownership() {
         let memory = MemoryBudget::new(1 << 24);
         let resolve = ResolveContext {
+            owned_witness_scope: None,
             database: "xtdb".into(), storage: Arc::new(BufferPool::new(Arc::new(rtdb_storage::MemoryStore::default()), 1 << 20)),
             memory: Arc::clone(&memory), query_options: QueryOptions { batch_rows: 1, ..Default::default() },
             scan_accelerators: Default::default(),
@@ -1542,6 +1562,7 @@ mod tests {
     async fn a_mutation_read_a_column_at_a_time_writes_the_events_a_row_by_row_read_does() {
         let memory = MemoryBudget::new(1 << 26);
         let resolve = ResolveContext {
+            owned_witness_scope: None,
             database: "xtdb".into(), storage: Arc::new(BufferPool::new(Arc::new(rtdb_storage::MemoryStore::default()), 1 << 20)),
             memory: Arc::clone(&memory), query_options: QueryOptions::default(),
             scan_accelerators: Default::default(),

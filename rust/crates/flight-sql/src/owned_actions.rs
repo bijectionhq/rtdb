@@ -1,4 +1,4 @@
-use std::{collections::BTreeSet, sync::Arc, time::Duration};
+use std::{collections::{BTreeMap, BTreeSet}, sync::{Arc, Mutex}, time::Duration};
 
 use arrow_array::{Array, Float64Array, Int64Array, RecordBatch, UInt64Array};
 use arrow_flight::Result as ActionResult;
@@ -8,7 +8,7 @@ use bytes::Bytes;
 use prost::Message;
 use rtdb_columnar::{MemoryReservation, OwnedBatch};
 use rtdb_format::ipc::{OwnedStream, write_arrow_stream};
-use rtdb_node::{NativeSession, OwnedCountRequest, OwnedRangeRequest, OwnedReadSession, TransactionStatus};
+use rtdb_node::{NativeSession, OwnedCountRequest, OwnedRangeRequest, OwnedRangeWitness, OwnedReadSession, TransactionStatus};
 use rtdb_query::QueryCursor;
 use rtdb_tx::{Documents, TxOp};
 use rtdb_types::{EntityId, LogicalType, OwnedRelation, ScalarType, StructFields, TimeUnit, Timestamp, Value};
@@ -31,6 +31,9 @@ pub(crate) const DECLARE_OWNED_PATH_V1: &str = "rtdb.owned.DeclarePath.v1";
 pub(crate) const CREATE_OWNED_V1: &str = "rtdb.owned.Create.v1";
 pub(crate) const COMMIT_OWNED_V1: &str = "rtdb.owned.Commit.v1";
 pub(crate) const COMMIT_OWNED_V2: &str = "rtdb.owned.Commit.v2";
+pub(crate) const COMMIT_OWNED_V3: &str = "rtdb.owned.Commit.v3";
+const MAX_RANGE_WITNESSES: usize = 32;
+const OWNED_RANGE_WITNESS: &str = "rtdb.owned.range_witness";
 const MAX_COMMIT_GROUPS: usize = 32;
 const MAX_GROUPED_COMMIT_ROWS: usize = 4096;
 
@@ -105,8 +108,38 @@ pub(crate) struct OwnedReadResource {
     owner: ResourceOwner,
     session: String,
     database: String,
+    witnesses: Mutex<BTreeMap<String, RetainedRangeWitness>>,
     _permit: OwnedSemaphorePermit,
     _reservation: Arc<MemoryReservation>,
+}
+
+struct RetainedRangeWitness {
+    nonce: Uuid,
+    evidence: OwnedRangeWitness,
+    _reservation: Arc<MemoryReservation>,
+}
+
+type Witnesses = Vec<(Arc<OwnedReadResource>, OwnedRangeWitness)>;
+
+impl OwnedReadResource {
+    fn remember(&self, call: &Call, relation: &OwnedRelation, evidence: OwnedRangeWitness) -> Result<Uuid, Status> {
+        let mut witnesses = self.witnesses.lock().map_err(|_| Status::internal("Owned range witness storage is unavailable"))?;
+        if let Some(witness) = witnesses.get(relation.name()) {
+            return Ok(witness.nonce);
+        }
+        if witnesses.len() >= MAX_RANGE_WITNESSES {
+            return Err(Status::resource_exhausted("The held read has too many witnessed relations"));
+        }
+        let nonce = Uuid::new_v4();
+        if witnesses.values().any(|witness| witness.nonce == nonce) {
+            return Err(Status::unavailable("Could not issue an owned range witness"));
+        }
+        let reservation = call.reserve(wire::add(512, relation.name().len() * 2)?)?;
+        witnesses.insert(relation.name().to_owned(), RetainedRangeWitness {
+            nonce, evidence, _reservation: reservation,
+        });
+        Ok(nonce)
+    }
 }
 
 impl Leased for OwnedReadResource {
@@ -224,6 +257,34 @@ impl Service {
     }
 
     pub(crate) async fn commit_owned_action(&self, call: &Call, body: &[u8], format: CommitFormat) -> Result<ActionResult, Status> {
+        self.commit_owned(call, body, format, Vec::new()).await
+    }
+
+    pub(crate) async fn commit_owned_witnessed_action(&self, call: &Call, body: &[u8]) -> Result<ActionResult, Status> {
+        if !self.0.config.owned_native_actions { return Err(unsupported()); }
+        let (length, mut body) = body.split_first_chunk::<2>().ok_or_else(|| invalid("Owned commit has no witness count"))?;
+        let count = usize::from(u16::from_be_bytes(*length));
+        if !(1..=MAX_RANGE_WITNESSES).contains(&count) {
+            return Err(invalid("Owned commit requires one to 32 range witnesses"));
+        }
+        let _framing = call.reserve(count * 512)?;
+        let mut witnesses = Vec::with_capacity(count);
+        for _ in 0..count {
+            let (handle, tail) = body.split_first_chunk::<16>().ok_or_else(|| invalid("Owned range witness has no held handle"))?;
+            let (nonce, tail) = tail.split_first_chunk::<16>().ok_or_else(|| invalid("Owned range witness has no nonce"))?;
+            body = tail;
+            let held = self.owned_read(call, &Bytes::copy_from_slice(handle))?;
+            held.snapshot.check().map_err(status)?;
+            let nonce = Uuid::from_bytes(*nonce);
+            let witness = held.witnesses.lock().map_err(|_| Status::internal("Owned range witness storage is unavailable"))?
+                .values().find(|witness| witness.nonce == nonce)
+                .map(|witness| witness.evidence.clone()).ok_or_else(|| Status::not_found("Unknown owned range witness"))?;
+            witnesses.push((held, witness));
+        }
+        self.commit_owned(call, body, CommitFormat::Grouped, witnesses).await
+    }
+
+    async fn commit_owned(&self, call: &Call, body: &[u8], format: CommitFormat, witnesses: Witnesses) -> Result<ActionResult, Status> {
         if !self.0.config.owned_native_actions { return Err(unsupported()); }
         let group_limit = match format {
             CommitFormat::Single => 1,
@@ -250,7 +311,7 @@ impl Service {
             self.append_owned_commit_group(&mut writes, &relation, rows)?;
             retained.push((operations_charge, documents_charge));
         }
-        self.owned_write_reply(call, writes).await
+        self.owned_write_reply_with_witnesses(call, writes, witnesses).await
     }
 
     fn append_owned_commit_group(
@@ -299,9 +360,27 @@ impl Service {
     }
 
     async fn owned_write_reply(&self, call: &Call, operations: Vec<TxOp>) -> Result<ActionResult, Status> {
+        self.owned_write_reply_with_witnesses(call, operations, Vec::new()).await
+    }
+
+    async fn owned_write_reply_with_witnesses(
+        &self, call: &Call, mut operations: Vec<TxOp>, witnesses: Witnesses,
+    ) -> Result<ActionResult, Status> {
         let connection = self.connection(call, &call.database).await?;
         let mut native = connection.borrow().await?;
         require_idle(&native)?;
+        if !witnesses.is_empty() {
+            let scope = native.placed_history().map_err(status)?;
+            operations.try_reserve_exact(witnesses.len())
+                .map_err(|_| Status::resource_exhausted("Owned witness allocation failed"))?;
+            for (held, evidence) in &witnesses {
+                held.snapshot.check().map_err(status)?;
+                if !evidence.matches_scope(scope) {
+                    return Err(Status::failed_precondition("Owned range witness belongs to another placement"));
+                }
+                operations.push(evidence.clone().operation());
+            }
+        }
         let outcome = native.state_mut().execute_tx(operations, Default::default()).await.map_err(status)?;
         if let Some(error) = outcome.error() { return Err(status(error.clone())); }
         if !outcome.committed() { return Err(Status::aborted("Owned write did not commit")); }
@@ -334,7 +413,7 @@ impl Service {
         reply.extend_from_slice(&snapshot.present().system_time.0.to_be_bytes());
         let held = Arc::new(OwnedReadResource {
             snapshot, owner: call.session.owner(), session: call.session.id.clone(), database: call.database.clone(),
-            _permit: permit, _reservation: reservation,
+            witnesses: Mutex::default(), _permit: permit, _reservation: reservation,
         });
         self.0.owned_reads.insert(Bytes::copy_from_slice(handle.as_bytes()), held, READ_IDLE, READ_IDLE, false, 16).map_err(status)?;
         Ok(ActionResult { body: wire::retain(reply, reply_charge) })
@@ -383,7 +462,7 @@ impl Service {
         else { return Err(invalid("Owned range fields have invalid types")); };
         let path = OwnedRelation::new(path.as_str()).map_err(status)?;
         let limit = usize::try_from(*limit).map_err(|_| invalid("Owned range limit is out of range"))?;
-        let page = if full_key {
+        let (page, evidence) = if full_key {
             let Some(Value::Bool(descending)) = row.get("descending") else {
                 return Err(invalid("Owned range requires a boolean descending field"));
             };
@@ -394,14 +473,21 @@ impl Service {
                 descending: *descending,
                 limit,
             };
-            held.snapshot.range_page_by_key(&relation, &path, request).await
+            held.snapshot.range_page_by_key_observed(&relation, &path, request).await
         } else {
             let lower = (!matches!(lower, Value::Null | Value::Undefined)).then_some(lower);
             let upper = (!matches!(upper, Value::Null | Value::Undefined)).then_some(upper);
-            held.snapshot.range(&relation, &path, lower, upper, limit).await
+            held.snapshot.range(&relation, &path, lower, upper, limit).await.map(|page| (page, None))
         }.map_err(status)?;
         let present = held.snapshot.present().system_time;
-        let reply = self.owned_point_reply(&page.schema, page.batch.as_ref().map(OwnedBatch::batch), present, present, None)?;
+        let _metadata = evidence.as_ref().map(|_| call.reserve(wire::add(wire::schema_bound(&page.schema)?, 256)?)).transpose()?;
+        let schema = if let Some(evidence) = evidence {
+            let nonce = held.remember(call, &relation, evidence)?;
+            let mut metadata = page.schema.metadata().clone();
+            metadata.insert(OWNED_RANGE_WITNESS.into(), nonce.simple().to_string());
+            Some(page.schema.as_ref().clone().with_metadata(metadata))
+        } else { None };
+        let reply = self.owned_point_reply(schema.as_ref().unwrap_or(page.schema.as_ref()), page.batch.as_ref().map(OwnedBatch::batch), present, present, None)?;
         held.snapshot.check().map_err(status)?;
         Ok(reply)
     }

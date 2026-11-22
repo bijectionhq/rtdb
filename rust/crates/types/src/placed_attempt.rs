@@ -28,14 +28,14 @@ impl PlacedAttemptScope {
         Ok(Self { history: digest.finalize().into(), writer_epoch })
     }
 
-    fn encode(self) -> [u8; SCOPE_BYTES] {
+    pub fn encode(self) -> [u8; SCOPE_BYTES] {
         let mut bytes = [0; SCOPE_BYTES];
         bytes[..32].copy_from_slice(&self.history);
         bytes[32..].copy_from_slice(&self.writer_epoch.get().to_be_bytes());
         bytes
     }
 
-    fn decode(bytes: &[u8]) -> Result<Self> {
+    pub fn decode(bytes: &[u8]) -> Result<Self> {
         let bytes: &[u8; SCOPE_BYTES] = bytes.try_into().map_err(|_| invalid())?;
         let mut history = [0; 32];
         let mut epoch = [0; 8];

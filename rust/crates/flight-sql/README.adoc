@@ -294,6 +294,18 @@ The exclusive `after` endpoint advances in the requested direction.
 For the next page, use the last returned row as `after` with the same held handle, path, bounds, and direction.
 The response uses the same covering schema and held time metadata as v1, with no record batch when the page is empty.
 
+A covered v2 page on a placed attachment with a live catalogue lease also returns `rtdb.owned.range_witness`, an opaque 32-digit hexadecimal nonce in the response schema.
+A covered empty page can carry a witness.
+Each held handle issues one nonce per observed relation, up to 32 relations.
+`rtdb.owned.Commit.v3` prefixes an unchanged Commit.v2 body with an unsigned 16-bit big-endian witness count (1–32), then that many pairs of 16 raw held-handle bytes and 16 raw nonce bytes.
+The commit reply is unchanged.
+Both values belong to the same authenticated session, database, and placed writer epoch.
+The handle must still admit reads when submitted, and the witness's exclusive ordering deadline may be earlier than the request deadline.
+The resolver compares the witnessed relation's complete event frontier at ordering before applying any mutations.
+Any intervening event on that owner relation invalidates the witness, including events outside the observed key span or valid instant.
+Events on other relations or owners do not invalidate it.
+Count replies carry no range witness.
+
 `rtdb.owned.CountHeldRange.v1` uses the same handle and relation framing with one terminated Arrow IPC batch containing one row.
 Its fields are `path: Utf8`, `lower: Struct?`, `upper: Struct?`, and `valid_micros: Int64`.
 Bounds are complete path keys with an inclusive lower endpoint, an exclusive upper endpoint and null for an open side.

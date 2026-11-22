@@ -109,6 +109,18 @@ impl Snapshot {
         overlays.chain(applied)
     }
 
+    /// Counts all events admitted for this relation, including live and staged
+    /// events. A flush transfers those events into the catalog's cumulative count.
+    pub fn relation_event_frontier(&self, table: &TableRef) -> Result<i64> {
+        let durable = self.table_catalog.metadata(table).map_or(0, |metadata| metadata.row_count);
+        if durable < 0 { return Err(Anomaly::fault("rtdb.index/relation-frontier", "Invalid durable relation event frontier")); }
+        self.iter_segments(table).try_fold(durable, |count, segment| {
+            count.checked_add(i64::from(segment.row_count())).ok_or_else(|| {
+                Anomaly::fault("rtdb.index/relation-frontier", "Relation event frontier overflow")
+            })
+        })
+    }
+
     /// Newer delta segments precede older ones, preserving operation order at equal system times.
     pub fn segments(&self, table: &TableRef) -> Vec<Arc<LiveTable>> { self.iter_segments(table).cloned().collect() }
 
