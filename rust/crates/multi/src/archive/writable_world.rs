@@ -462,10 +462,9 @@ impl OpenWorld {
         let Some(fact) = decode_point(read.row.into_iter().collect(), id, memory)? else {
             return Ok((None, read.witness));
         };
-        let reservation = memory.reserve(WorldShadow::decode_bound(&fact.row)?)?;
-        let visible = match WorldShadow::from_record(&fact.row)? {
+        let visible = match WorldShadow::from_record(fact.row)? {
             WorldShadow::Deleted => None,
-            WorldShadow::Present(row) => Some(WorldFact { row, revision: fact.revision, _reservation: reservation }),
+            WorldShadow::Present(row) => Some(WorldFact { row, revision: fact.revision, _reservation: fact._reservation }),
         };
         Ok((Some(visible), read.witness))
     }

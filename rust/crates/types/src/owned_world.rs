@@ -230,6 +230,8 @@ pub enum WorldShadow {
 }
 
 impl WorldShadow {
+    pub const FIELDS: &'static str = "_world_fields";
+
     pub fn allocation_bound(&self) -> Result<usize> {
         match self {
             Self::Present(row) => Value::document_retained_bytes(row)?
@@ -241,58 +243,51 @@ impl WorldShadow {
     }
 
     pub fn record(self, id: &EntityId) -> Result<StructFields<Value>> {
-        let fact = match self {
-            Self::Present(mut row) => {
-                row.values_mut().for_each(Value::admit_object_dates);
-                Value::Binary(serde_json::to_vec(&row).map_err(|_| OwnedWorld::unavailable())?)
-            }
-            Self::Deleted => Value::Null,
-        };
-        Ok(StructFields::from([
-            ("_id".into(), id.as_value()),
-            ("world_fact".into(), fact),
-        ]))
-    }
-
-    pub fn decode_bound(row: &StructFields<Value>) -> Result<usize> {
-        let bytes = match row.get("world_fact") {
-            Some(Value::Binary(bytes)) => bytes.len(),
-            Some(Value::Null) => 0,
-            _ => return Err(OwnedWorld::unavailable()),
-        };
-        bytes
-            .checked_mul(32)
-            .and_then(|bytes| bytes.checked_add(4096))
-            .ok_or_else(OwnedWorld::unavailable)
-    }
-
-    pub fn from_record(row: &StructFields<Value>) -> Result<Self> {
-        if row.len() != 2 {
-            return Err(OwnedWorld::unavailable());
-        }
-        let id = row
-            .get("_id")
-            .ok_or_else(OwnedWorld::unavailable)?
-            .entity_id()?;
-        match row.get("world_fact") {
-            Some(Value::Null) => Ok(Self::Deleted),
-            Some(Value::Binary(bytes)) => {
-                let fact: StructFields<Value> =
-                    serde_json::from_slice(bytes).map_err(|_| OwnedWorld::unavailable())?;
-                if fact
-                    .get("_id")
-                    .and_then(|value| value.entity_id().ok())
-                    .as_ref()
-                    != Some(&id)
-                    || fact
-                        .keys()
-                        .any(|name| name != "_id" && name.starts_with('_'))
+        let (mut row, fields) = match self {
+            Self::Present(row) => {
+                if row.get("_id").map(Value::entity_id).transpose()?.as_ref() != Some(id)
+                    || row.keys().any(|name| name != "_id" && name.starts_with('_'))
                 {
                     return Err(OwnedWorld::unavailable());
                 }
-                Ok(Self::Present(fact))
+                let fields = row.keys().filter(|name| *name != "_id")
+                    .cloned().map(Value::Utf8).collect();
+                (row, Value::List(fields))
             }
-            _ => Err(OwnedWorld::unavailable()),
+            Self::Deleted => (StructFields::from([("_id".into(), id.as_value())]), Value::Null),
+        };
+        row.insert(Self::FIELDS.into(), fields);
+        Ok(row)
+    }
+
+    pub fn is_tombstone(row: &StructFields<Value>) -> bool {
+        matches!(row.get(Self::FIELDS), Some(Value::Null))
+    }
+
+    pub fn from_record(mut row: StructFields<Value>) -> Result<Self> {
+        let unavailable = OwnedWorld::unavailable;
+        let identity = row.remove("_id").ok_or_else(unavailable)?;
+        identity.entity_id()?;
+        let fields = row.remove(Self::FIELDS).ok_or_else(unavailable)?;
+        let fact = match fields {
+            Value::Null => Self::Deleted,
+            Value::List(fields) => {
+                let mut fact = StructFields::from([("_id".into(), identity)]);
+                for field in fields {
+                    let Value::Utf8(name) = field else { return Err(unavailable()); };
+                    if name.starts_with('_') { return Err(unavailable()); }
+                    let value = row.remove(&name).ok_or_else(unavailable)?;
+                    if matches!(value, Value::Undefined) || fact.insert(name, value).is_some() {
+                        return Err(unavailable());
+                    }
+                }
+                Self::Present(fact)
+            }
+            _ => return Err(unavailable()),
+        };
+        if row.values().any(|value| !matches!(value, Value::Null | Value::Undefined)) {
+            return Err(unavailable());
         }
+        Ok(fact)
     }
 }
