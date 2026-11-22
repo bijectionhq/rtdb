@@ -74,6 +74,8 @@ mod reader;
 pub use stage::stage_checkpoint;
 pub(crate) use stage::discard_checkpoint_stage;
 mod retirement;
+mod read_world;
+pub use read_world::{CheckpointPoint, CheckpointReadResources, CheckpointReadWorld, read_checkpoint_owned_point};
 pub(crate) use retirement::{finish_capture_retirement, require_capture_open, retire_capture};
 pub use reader::{StagedReaderSettings, serve_staged_checkpoint};
 pub(crate) use reader::{StageSelector, tunnel_staged_checkpoint};
