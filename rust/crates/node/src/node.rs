@@ -1261,8 +1261,8 @@ impl OwnedReadSession {
         Ok((hits, witnesses))
     }
 
-    /// Observe the entire immutable corpus by its retained pin and exact purge frontiers.
-    pub async fn retained_world_search_witnesses<'a>(
+    /// Observe immutable relations by their retained pin and exact purge frontiers.
+    pub async fn retained_world_relation_witnesses<'a>(
         &self, world: rtdb_types::Iid, relations: impl IntoIterator<Item = &'a rtdb_types::OwnedRelation>,
     ) -> Result<Vec<OwnedWorldWitness>> {
         let unavailable = rtdb_types::OwnedWorld::unavailable;
