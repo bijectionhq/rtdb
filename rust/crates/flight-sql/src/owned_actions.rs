@@ -115,7 +115,7 @@ pub(crate) const COMMIT_WORLD_V1: &str = "rtdb.owned.CommitWorld.v1";
 pub(crate) const COMMIT_WORLD_V2: &str = "rtdb.owned.CommitWorld.v2";
 const MAX_WORLD_WITNESSES: usize = 128;
 const WORLD_POINT_WITNESS: &str = "rtdb.owned.world_point_witness";
-pub(crate) const SEARCH_HELD_OWNED_V1: &str = "rtdb.owned.SearchHeld.v1";
+pub(crate) const SEARCH_HELD_OWNED_V2: &str = "rtdb.owned.SearchHeld.v2";
 pub(crate) const HELD_OWNED_RANGE_V1: &str = "rtdb.owned.ReadHeldRange.v1";
 #[derive(Clone, Copy)]
 pub(crate) enum HeldRangeFormat { Leading, Full, FixedValid }
@@ -926,23 +926,27 @@ impl Service {
             if let Lookup::Found(entry) = self.0.owned_reads.take(&handle) { entry.close(); }
             return Err(status(error));
         }
-        let (relation, arrow_bytes) = split_relation(request)?;
-        let batch = decode_batch(call, arrow_bytes)?;
-        if batch.batch().num_rows() != 1 || batch.batch().num_columns() != 3 {
-            return Err(invalid("Owned held search requires one row with path, query, and limit"));
+        let (count, mut request) = request.split_first_chunk::<2>().ok_or_else(|| invalid("Owned held search has no partition count"))?;
+        let count = usize::from(u16::from_be_bytes(*count));
+        if !(1..=32).contains(&count) { return Err(invalid("Owned held search partition count is out of range")); }
+        let _partitions = call.reserve(count * 512)?;
+        let mut partitions = Vec::with_capacity(count);
+        for _ in 0..count {
+            let (relation, rest) = split_relation(request)?;
+            let (path, rest) = split_relation(rest)?;
+            partitions.push((relation, path));
+            request = rest;
         }
-        let (rows, _decode) = upload::domain_documents(batch.batch(), self)?;
-        let row = &rows[0];
-        let (Some(Value::Utf8(path)), Some(Value::Utf8(query)), Some(Value::I64(limit))) =
-            (row.get("path"), row.get("query"), row.get("limit"))
-        else { return Err(invalid("Owned held search fields have invalid types")); };
-        let path = OwnedRelation::new(path.as_str()).map_err(status)?;
-        let limit = usize::try_from(*limit).map_err(|_| invalid("Owned held search limit is out of range"))?;
-        let hits = held.snapshot.ranked_search(&relation, &path, query, limit).await.map_err(status)?;
+        let (limit, query) = request.split_first_chunk::<2>().ok_or_else(|| invalid("Owned held search has no limit"))?;
+        if query.len() > 4096 { return Err(invalid("Owned held search query exceeds its size bound")); }
+        let query = std::str::from_utf8(query).map_err(arrow)?;
+        let limit = usize::from(u16::from_be_bytes(*limit));
+        let hits = held.snapshot.ranked_search(&partitions, query, limit).await.map_err(status)?;
         let id_type = LogicalType::from_legs([ScalarType::Utf8, ScalarType::Keyword, ScalarType::I64, ScalarType::Uuid].map(LogicalType::Scalar));
         let schema = Arc::new(Schema::new(vec![
             rtdb_columnar::to_field("_id", &id_type).map_err(status)?,
             Field::new("score", DataType::Float64, false),
+            Field::new("partition", DataType::UInt64, false),
         ]));
         let mut charge = call.reserve(4096)?;
         let output = if hits.is_empty() {
@@ -957,7 +961,8 @@ impl Service {
             }
             let ids = rtdb_columnar::build_array(&id_type, &ids).map_err(status)?;
             let scores = Arc::new(Float64Array::from_iter_values(hits.iter().map(|hit| hit.score)));
-            Some(RecordBatch::try_new(Arc::clone(&schema), vec![ids, scores]).map_err(arrow)?)
+            let ordinals = Arc::new(UInt64Array::from_iter_values(hits.iter().map(|hit| hit.partition as u64)));
+            Some(RecordBatch::try_new(Arc::clone(&schema), vec![ids, scores, ordinals]).map_err(arrow)?)
         };
         let present = held.snapshot.present().system_time;
         let reply = self.owned_point_reply(&schema, output.as_ref(), present, present, None)?;

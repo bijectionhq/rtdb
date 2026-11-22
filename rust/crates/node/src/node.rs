@@ -1120,10 +1120,10 @@ impl OwnedReadSession {
     /// Ranks a covered clear-text query at this read's cut and validates its full identities.
     #[cfg(feature = "search")]
     pub async fn ranked_search(
-        &self, relation: &rtdb_types::OwnedRelation, path: &rtdb_types::OwnedRelation, query: &str, limit: usize,
+        &self, partitions: &[(rtdb_types::OwnedRelation, rtdb_types::OwnedRelation)], query: &str, limit: usize,
     ) -> Result<Vec<rtdb_search::OwnedSearchHit>> {
         self.admit_read().await?;
-        let work = rtdb_search::owned_ranked(Arc::clone(&self.context), &self.owner, relation, path, query, limit);
+        let work = rtdb_search::owned_ranked(Arc::clone(&self.context), &self.owner, partitions, query, limit);
         let hits = rtdb_storage::IoRegion::leased(self.context.catalog.read_lease(), work).await?;
         self.check()?;
         Ok(hits)
