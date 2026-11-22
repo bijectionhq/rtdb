@@ -151,6 +151,9 @@ pub async fn stage_checkpoint(
         .filter(|(_, manifest)| manifest == &request.source_manifest_sha256)
         .ok_or_else(|| inconsistent("The source capture has another manifest"))?;
     require_capture_open(&source, request.capture)?;
+    super::admit_lifetime_restore(
+        directory.as_ref(), archive, keys, &point, &manifest, hosted_task.as_ref(), false,
+    ).await?;
     let intent = CheckpointStage {
         intent: request,
         source_incarnation: point.incarnation,
