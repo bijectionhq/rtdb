@@ -991,6 +991,12 @@ impl<'a> OpenTransaction<'a> {
             use crate::OwnedForkRoot;
             let publish_root = root == OwnedForkRoot::Writes;
             let with_root = root != OwnedForkRoot::None;
+            let proposal_controls = root == OwnedForkRoot::ProposalControls;
+            let required_mode = if proposal_controls {
+                rtdb_types::WorldClockMode::Proposal
+            } else {
+                rtdb_types::WorldClockMode::Retained
+            };
             let mut forks = 0;
             let mut checks = 0;
             let mut root_rows = 0usize;
@@ -1025,7 +1031,8 @@ impl<'a> OpenTransaction<'a> {
                         if world.dropped || world.basis.system_time >= self.tx_key().system_time
                             || deadline.is_none_or(|until| until > world.until)
                             || (with_root && (previous.is_some()
-                                || world.mode != rtdb_types::WorldClockMode::Retained
+                                || world.mode != required_mode
+                                || (proposal_controls && world.parent_publication != Some(world.basis.system_time))
                                 || world.basis.tx_id >= self.tx_key().tx_id))
                         {
                             return Err(unavailable());
@@ -1052,7 +1059,7 @@ impl<'a> OpenTransaction<'a> {
             }
             if forks != 1 || checks == 0 || expected_tip != checked_tip || effects > 4096
                 || (publish_root && root_rows == 0)
-                || (root == OwnedForkRoot::Controls && control_writes == 0)
+                || (matches!(root, OwnedForkRoot::Controls | OwnedForkRoot::ProposalControls) && control_writes == 0)
             {
                 return Err(unavailable());
             }

@@ -178,7 +178,9 @@ pub(crate) async fn fork_checkpoint_world_selected(
     admit_session(session, &source, &owner)?;
     let (capture, suffix) = if capture.is_nil() {
         if suffix.is_some() || fork.root.is_none() || fork.previous.is_some()
-            || !matches!(fork.requested, rtdb_node::WorldClockRequest::Retained)
+            || !(matches!(fork.requested, rtdb_node::WorldClockRequest::Retained)
+                || (matches!(fork.requested, rtdb_node::WorldClockRequest::Proposal)
+                    && fork.root.as_ref().is_some_and(|root| root.publication.is_none())))
         {
             return Err(OwnedWorld::unavailable());
         }
@@ -249,7 +251,9 @@ pub(crate) async fn fork_checkpoint_world_selected(
     let inherited = parent_publication.unwrap_or(basis.system_time);
     let mode = match fork.requested {
         rtdb_node::WorldClockRequest::Retained => WorldClockMode::Retained,
-        rtdb_node::WorldClockRequest::Proposal if fork.cut.live().is_some() => WorldClockMode::Proposal,
+        rtdb_node::WorldClockRequest::Proposal if fork.cut.live().is_some()
+            || (fork.cut.is_publication() && fork.previous.is_none()
+                && fork.root.as_ref().is_some_and(|root| root.publication.is_none())) => WorldClockMode::Proposal,
         rtdb_node::WorldClockRequest::Proposal => return Err(OwnedWorld::unavailable()),
         rtdb_node::WorldClockRequest::Held { start } => {
             let start = start.unwrap_or(inherited);

@@ -1353,6 +1353,8 @@ rule ConsumeIntake {
 -- While a world is retained the archive retirement fence cannot close its capture.
 -- An initial retained fork at the original live Root key may share one ordered publication with checked Root writes and checked hosted controls.
 -- A live hold may select its accepted application publication as the initial retained basis.
+-- An initial Proposal may inherit that same application basis when its creation and the checked hosted settlement share one ordered attempt.
+-- That Proposal has no initial local overlay, and its creation leaves the accepted Root clock unchanged.
 -- The placed owner may select the existing certified archive from its Directory and reopens it to compare the held transaction or its exact application publication before ordering.
 -- A fork of the held application publication compares the same Root head in the ordered source transaction.
 -- Archive admission precedes ordering, and the registration, Root head, writes, control replacements and one immutable attempt marker become visible at one transaction key.
