@@ -1239,6 +1239,66 @@ pub async fn restore(
     restore_checkpoint(directory, storage, archive, keys, deployment, operation, maximum_message_bytes, None, hosted_task).await
 }
 
+/// Inspect the original authenticated archive root, before copying it to
+/// another store. Current cold repair will also replay its authorized tail.
+/// Reopen the authenticated source root before authorizing any destination writes.
+async fn admit_lifetime_restore(
+    directory: &dyn Directory, archive: &CellStorage, keys: &dyn KeyService,
+    point: &CapturePoint, manifest: &str, hosted_task: Option<&rtdb_directory::HostedTask>,
+    same_installation: bool,
+) -> Result<()> {
+    use rtdb_plan::Catalog;
+
+    let mut node = rtdb_node::NodeOptions::default();
+    node.owned_relations = true;
+    let memory = rtdb_columnar::MemoryBudget::new(node.execution_memory_bytes);
+    let cache = rtdb_storage::cache::CacheBudget::new(node.cache_bytes);
+    let cancellation = tokio_util::sync::CancellationToken::new();
+    read_world::with_registered_capture_context(
+        directory, archive, keys, hosted_task,
+        read_world::CaptureSelection { deployment: point.deployment, capture: point.operation,
+            manifest, suffix: None, expected_basis: None },
+        CheckpointReadResources { node: &node, memory: &memory, cache, cancellation: &cancellation },
+        |context, basis| async move {
+            if basis.system_time.0 != point.checkpoint.system_time {
+                return Err(inconsistent("The authenticated source has another restore cut"));
+            }
+            let database = context.catalog.database(context.catalog.default_database())?;
+            let [snapshot] = database.partitions.as_slice() else {
+                return Err(inconsistent("The original checkpoint has no exact lifetime inventory"));
+            };
+            let _inventory = context.memory.reserve(snapshot.schema_allocation_bound(context.catalog.default_database())?)?;
+            let tables = snapshot.tables();
+            let mut floors = BTreeMap::new();
+            for table in &tables {
+                let Some(relation) = table.owned_lifetime_relation() else { continue; };
+                let catalog = table.owned_lifetime_schema_catalog()
+                    .ok_or_else(|| inconsistent("The checkpoint has no original lifetime declaration catalog"))?;
+                if !same_installation || floors.len() >= 4096 {
+                    return Err(unavailable("The restore cannot retain the original lifetime floors"));
+                }
+                floors.insert((catalog, relation.to_owned()), table);
+            }
+            for catalog in tables.iter().filter(|table| table.is_owned_relation_catalog()) {
+                context.check_cancelled()?;
+                let (schemas, _charge) =
+                    rtdb_query::read_owned_schema_catalog(Arc::clone(&context), catalog.clone()).await?;
+                for (relation, schema) in schemas.relations() {
+                    let Some(duration) = schema.lifetime_micros() else { continue; };
+                    let table = floors.remove(&(catalog.clone(), relation.to_owned()))
+                        .ok_or_else(|| inconsistent("The checkpoint lifetime declaration has no trusted floor"))?;
+                    let floor = rtdb_query::read_owned_lifetime_floor_table(Arc::clone(&context), table.clone()).await?;
+                    floor.check(duration, basis.system_time)?;
+                }
+            }
+            if !floors.is_empty() {
+                return Err(inconsistent("The checkpoint lifetime floor has no original declaration"));
+            }
+            Ok(())
+        },
+    ).await
+}
+
 pub(crate) async fn restore_checkpoint(
     directory: &dyn Directory,
     storage: &CellStorage,
@@ -1294,9 +1354,9 @@ pub(crate) async fn restore_checkpoint(
     }
     keys.existing_key(&current.key_id()).await?
         .ok_or_else(|| unavailable("The current installation key is unavailable"))?;
-    verify_checkpoint_capture(
-        directory, &current, archive, keys, deployment, operation, &manifest_sha256, hosted_task,
-    ).await?;
+    // The Directory CAS below still requires this same current checkpoint after
+    // validating its authenticated source root. Recovery retains its ordered tail.
+    admit_lifetime_restore(directory, archive, keys, &point, &manifest_sha256, hosted_task, true).await?;
 
     let fenced = update_installation(directory, &id, |record| {
         if read_receipt(record)?.is_some() {

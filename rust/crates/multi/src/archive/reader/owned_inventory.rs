@@ -111,6 +111,9 @@ async fn write_event_files(
     let database = &stage.intent.name;
     let (recovered, transaction, storage, memory, _) = open_owned_snapshot(authority, store).await?;
     let snapshot = recovered.partition.snapshot();
+    if snapshot.tables().iter().any(|table| table.owned_lifetime_relation().is_some()) {
+        return Err(unavailable("Fresh checkpoint replay has no original lifetime-floor transfer authority"));
+    }
     let _catalog_charge = memory.reserve(snapshot.schema_allocation_bound(database)?)?;
     let selected = select_namespace(snapshot.tables())?
         .ok_or_else(|| inconsistent("The staged checkpoint has no owned namespace"))?;
@@ -183,6 +186,9 @@ async fn inspect(
     let database = &stage.intent.name;
     let (recovered, transaction, storage, memory, options) = open_owned_snapshot(authority, store).await?;
     let snapshot = recovered.partition.snapshot();
+    if snapshot.tables().iter().any(|table| table.owned_lifetime_relation().is_some()) {
+        return Err(unavailable("Fresh checkpoint replay has no original lifetime-floor transfer authority"));
+    }
     let _catalog_charge = memory.reserve(snapshot.schema_allocation_bound(database)?)?;
     let selected = select_namespace(snapshot.tables())?;
     let (owner_namespace, relations, declarations) = if let Some(selected) = selected {

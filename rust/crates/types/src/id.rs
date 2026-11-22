@@ -331,6 +331,12 @@ impl TableRef {
         self.owned_storage_name()?.strip_prefix(OWNED_LIFETIME_PREFIX)
     }
 
+    pub fn owned_lifetime_schema_catalog(&self) -> Option<Self> {
+        self.owned_lifetime_relation()?;
+        let (namespace, _) = self.table.split_once('-')?;
+        Some(Self::new(OWNED_SCHEMA_V1, format!("{namespace}-{OWNED_RELATION_CATALOG}")))
+    }
+
     /// Maps logical data and its journal to the exact original relation.
     pub fn owned_effect_relation_name(&self) -> Option<&str> {
         let name = self.owned_storage_name()?;

@@ -58,6 +58,10 @@ impl WorldSchemas {
         self.encoded
     }
 
+    pub fn relations(&self) -> impl Iterator<Item = (&str, &OwnedSchema)> {
+        self.fields.iter().map(|(name, schema)| (name.as_str(), schema))
+    }
+
     pub fn relation(&self, relation: &OwnedRelation) -> Option<&OwnedSchema> {
         self.fields.get(relation.name())
     }

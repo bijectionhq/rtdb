@@ -254,13 +254,20 @@ pub async fn open_owned_capacity_point(
 pub async fn read_owned_lifetime_floor(
     context: Arc<QueryContext>, owner: &str, relation: &OwnedRelation,
 ) -> Result<rtdb_types::OwnedLifetimeFloor> {
+    if owner.is_empty() || !relation.is_root_data() { return Err(rtdb_types::OwnedWorld::unavailable()); }
+    read_owned_lifetime_floor_table(context, relation.lifetime_table(owner)).await
+}
+
+pub async fn read_owned_lifetime_floor_table(
+    context: Arc<QueryContext>, table: TableRef,
+) -> Result<rtdb_types::OwnedLifetimeFloor> {
     let malformed = || Anomaly::fault("rtdb.owned/lifetime-floor", "The declared lifetime has no usable expiry floor");
-    if owner.is_empty() || !relation.is_root_data() { return Err(malformed()); }
+    let relation = OwnedRelation::new(table.owned_lifetime_relation().ok_or_else(malformed)?)?;
     let id = EntityId::String(relation.name().into());
     let memory = Arc::clone(&context.memory);
     let columns = ["_id", "duration", "expired_created_through", "swept_present_through"];
     let Some(mut cursor) = open_owned_table_point(
-        context, relation.lifetime_table(owner), id.iid(), Some(&id), None, Some(&columns), false,
+        context, table, id.iid(), Some(&id), None, Some(&columns), false,
     ).await? else { return Err(malformed()); };
     let mut floor = None;
     while let Some(batch) = cursor.next_batch().await? {
@@ -276,7 +283,7 @@ pub async fn read_owned_lifetime_floor(
             charges.push(memory.reserve(bytes.saturating_add(4096))?);
             document.insert(name.into(), rtdb_columnar::read_value(field, array, 0)?);
         }
-        floor = Some(rtdb_types::OwnedLifetimeFloor::decode(&document, relation)?);
+        floor = Some(rtdb_types::OwnedLifetimeFloor::decode(&document, &relation)?);
     }
     floor.ok_or_else(malformed)
 }
