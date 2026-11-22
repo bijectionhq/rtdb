@@ -61,8 +61,8 @@ impl<'a> CommitRequest<'a> {
         }
         let (count, mut rest) = body.split_first_chunk::<2>().ok_or_else(|| invalid("Owned commit has no group count"))?;
         let count = usize::from(u16::from_be_bytes(*count));
-        if !(1..=MAX_COMMIT_GROUPS).contains(&count) {
-            return Err(invalid("Owned commit requires one to 32 relation groups"));
+        if count > MAX_COMMIT_GROUPS {
+            return Err(invalid("Owned commit supports up to 32 relation groups"));
         }
         let mut groups = Vec::with_capacity(count);
         for _ in 0..count {

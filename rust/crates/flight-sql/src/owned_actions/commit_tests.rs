@@ -24,10 +24,17 @@ fn grouped_commit_frames_each_ipc_stream_in_mutation_order() {
 }
 
 #[test]
-fn grouped_commit_refuses_empty_duplicate_truncated_and_trailing_groups() {
+fn grouped_commit_accepts_a_deadline_without_relation_groups() {
+    let body = grouped(17, &[]);
+    let request = CommitRequest::parse(&body, CommitFormat::Grouped).unwrap();
+    assert_eq!(request.deadline, Timestamp(17));
+    assert!(request.groups.is_empty());
+}
+
+#[test]
+fn grouped_commit_refuses_duplicate_truncated_and_trailing_groups() {
     for groups in [
-        &[][..],
-        &[("items", &b"first"[..]), ("items", &b"second"[..])],
+        &[("items", &b"first"[..]), ("items", &b"second"[..])][..],
         &[("items", &b""[..])],
     ] {
         assert!(CommitRequest::parse(&grouped(1, groups), CommitFormat::Grouped).is_err());
