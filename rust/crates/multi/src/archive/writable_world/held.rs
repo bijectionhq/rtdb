@@ -1,12 +1,13 @@
 use std::time::Duration;
 
 use rtdb_node::{NodeOptions, OwnedCountRequest, OwnedRangePage, OwnedRangeRequest};
+use rtdb_plan::Catalog;
 use rtdb_storage::cache::CacheBudget;
 use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 
 use super::*;
-use crate::archive::read_world::{read_checkpoint_point_in_context, require_relation_purge_history, with_checkpoint_context};
+use crate::archive::read_world::{CheckpointPoint, read_checkpoint_point_in_context, require_relation_purge_history, with_checkpoint_context};
 
 #[derive(Clone)]
 pub(crate) struct WorldArchive {
