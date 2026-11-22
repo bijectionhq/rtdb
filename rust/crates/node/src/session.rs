@@ -7,7 +7,7 @@ use rtdb_columnar::{MemoryBudget, MemoryReservation};
 use rtdb_format::basis::{decode_time_basis, decode_tx_basis, encode_time_basis, encode_tx_basis};
 use rtdb_plan::AccessMode;
 use rtdb_tx::{SubmitOptions, SubmittedTx, TransactionResult, TxOp, UserMetadata};
-use rtdb_types::{Anomaly, Result, TimeBasis, Instant, Timestamp, TxBasis, TxId};
+use rtdb_types::{Anomaly, Instant, Result, TimeBasis, Timestamp, TransactionKey, TxBasis, TxId, Value};
 use tokio_util::sync::CancellationToken;
 
 use crate::placed_receipts::is_placed_token;
@@ -94,6 +94,12 @@ pub struct ReplaySubmissionPermit {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CommitMode { Sync, Async }
+
+enum Submission {
+    Ordinary,
+    Replay(ReplaySubmissionPermit),
+    PresentReservation,
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TransactionStatus { Idle, Pending, Reading, Writing, Failed, Closed }
@@ -555,9 +561,9 @@ impl Session {
         Ok(None)
     }
     async fn submit_operations(&mut self, operations: Vec<TxOp>, options: SubmitOptions, mode: CommitMode) -> Result<CommitResult> {
-        self.submit_to(self.database.to_string(), operations, options, mode, None).await
+        self.submit_to(self.database.to_string(), operations, options, mode, Submission::Ordinary).await
     }
-    async fn submit_to(&mut self, database: String, operations: Vec<TxOp>, mut options: SubmitOptions, mode: CommitMode, replay: Option<ReplaySubmissionPermit>) -> Result<CommitResult> {
+    async fn submit_to(&mut self, database: String, operations: Vec<TxOp>, mut options: SubmitOptions, mode: CommitMode, submission: Submission) -> Result<CommitResult> {
         let observer = self.service.execution_observer();
         let _sample = rtdb_plan::ExecutionSample::new(observer.clone(), match mode { CommitMode::Async => rtdb_plan::ExecutionTimer::TxSubmit, CommitMode::Sync => rtdb_plan::ExecutionTimer::TxExecute });
         self.revalidate().await?;
@@ -565,16 +571,18 @@ impl Session {
         self.service.check_submission_basis(&database, self.await_token.as_deref(), &self.cancellation).await?;
         options.user = self.service.user().map(str::to_owned);
         if options.default_tz.is_empty() { options.default_tz = self.timezone.to_string(); }
-        if replay.is_none() && let Some((key, sequence)) = &mut self.gateway_key {
+        let ordinary = matches!(&submission, Submission::Ordinary);
+        let reserve_present = matches!(&submission, Submission::PresentReservation);
+        if ordinary && let Some((key, sequence)) = &mut self.gateway_key {
             options.user_metadata = Some(crate::node::with_idempotency_key(options.user_metadata.take(), &format!("{}/{sequence}", &**key), self.service.memory())?);
             *sequence += 1;
-        } else if replay.is_none() && let Some(key) = self.parameter(crate::node::IDEMPOTENCY_KEY_PARAMETER).filter(|key| !key.is_empty()).map(str::to_owned) {
+        } else if ordinary && let Some(key) = self.parameter(crate::node::IDEMPOTENCY_KEY_PARAMETER).filter(|key| !key.is_empty()).map(str::to_owned) {
             let sequence = match &mut self.idempotency_sequence { Some((current, next)) if *current == key => { *next += 1; *next - 1 } sequence => { *sequence = Some((key.clone(), 1)); 0 } };
             options.user_metadata = Some(crate::node::with_idempotency_key(options.user_metadata.take(), &format!("{key}/{sequence}"), self.service.memory())?);
         }
-        let submitted = match replay {
-            Some(permit) => self.service.submit_replay(&database, operations, options, permit, &self.cancellation).await,
-            None => self.service.submit(&database, operations, options, &self.cancellation).await,
+        let submitted = match submission {
+            Submission::Replay(permit) => self.service.submit_replay(&database, operations, options, permit, &self.cancellation).await,
+            Submission::Ordinary | Submission::PresentReservation => self.service.submit(&database, operations, options, &self.cancellation).await,
         }.inspect_err(|_| {
             if let Some(observer) = &observer { observer.record_error(rtdb_plan::ExecutionError::Transaction); }
         })?;
@@ -596,6 +604,9 @@ impl Session {
                     let _await = rtdb_plan::ExecutionSample::new(observer.clone(), rtdb_plan::ExecutionTimer::TxAwait);
                     self.service.await_submission(&database, &submitted, &self.cancellation).await?
                 };
+                if reserve_present && result.tx_key().tx_id != submitted.tx_id {
+                    return Err(Anomaly::fault("rtdb.node/present-reservation", "The ordered present resolved at a different source position"));
+                }
                 if matches!(result, TransactionResult::Aborted { .. }) { if let Some(observer) = &observer { observer.record_error(rtdb_plan::ExecutionError::Transaction); } }
                 self.set_await_token(Some(applied.unwrap_or(token)))?;
                 self.last_submitted = Some(LastSubmittedTx::Executed(result.clone()));
@@ -608,7 +619,7 @@ impl Session {
         if self.transaction().is_some() { return Err(Anomaly::incorrect("xtdb/tx-already-in-progress", "Cannot submit a transaction while another is in progress on this connection - commit or roll back first")); }
         let timezone = rtdb_expr::normalize_timezone(options.default_timezone.as_deref().unwrap_or(&self.timezone))?;
         self.submit_to(options.database.unwrap_or_else(|| self.database.to_string()), operations,
-            SubmitOptions { default_tz: timezone, system_time: options.system_time, user: None, user_metadata: options.user_metadata }, mode, None).await
+            SubmitOptions { default_tz: timezone, system_time: options.system_time, user: None, user_metadata: options.user_metadata }, mode, Submission::Ordinary).await
     }
     pub async fn submit_tx(&mut self, operations: Vec<TxOp>, options: AutonomousTxOptions) -> Result<SubmittedTx> {
         match self.autonomous(operations, options, CommitMode::Async).await? {
@@ -622,6 +633,29 @@ impl Session {
             _ => Err(Anomaly::fault("rtdb.node/execute-result", "Synchronous execution returned no transaction result")),
         }
     }
+    pub(crate) async fn reserve_ordered_present(&mut self) -> Result<TransactionKey> {
+        self.ensure_open()?;
+        if self.default_access_mode == Some(AccessMode::ReadOnly) || self.is_read_only() {
+            return Err(Anomaly::incorrect("xtdb/read-only-tx", "Cannot reserve an ordered present in a read-only session or transaction"));
+        }
+        if !self.auto_commit || self.transaction().is_some() {
+            return Err(Anomaly::incorrect("xtdb/tx-already-in-progress", "Ordered present reservation requires an idle session in autocommit mode"));
+        }
+        let metadata = UserMetadata::new(
+            Value::Struct(rtdb_types::StructFields::from([("rtdb_present_reservation".into(), Value::Bool(true))])),
+            self.service.memory(),
+        )?;
+        let options = SubmitOptions { user_metadata: Some(metadata), default_tz: self.timezone.to_string(), ..SubmitOptions::default() };
+        let result = self.submit_to(
+            self.database.to_string(), Vec::new(), options, CommitMode::Sync, Submission::PresentReservation,
+        ).await?;
+        match result {
+            CommitResult::Executed(TransactionResult::Committed { tx_key }) => Ok(tx_key),
+            CommitResult::Executed(TransactionResult::Aborted { error: Some(error), .. }) => Err((*error).clone()),
+            _ => Err(Anomaly::fault("rtdb.node/present-reservation", "The ordered present transaction did not commit")),
+        }
+    }
+
     pub async fn commit_tx(&mut self, mode: Option<CommitMode>) -> Result<CommitResult> {
         self.commit_tx_inner(mode, None).await
     }
@@ -650,7 +684,7 @@ impl Session {
         let result = self.submit_to(self.database.to_string(), operations, SubmitOptions {
             default_tz: tx.timezone.to_string(), system_time: options.system_time,
             user: None, user_metadata: options.user_metadata,
-        }, mode, replay).await;
+        }, mode, replay.map_or(Submission::Ordinary, Submission::Replay)).await;
         drop(reservations);
         result
     }

@@ -856,6 +856,11 @@ impl NativeSession {
     }
     pub fn state(&self) -> &Session { &self.state }
     pub fn state_mut(&mut self) -> &mut Session { &mut self.state }
+    /// Reserves a fresh system time by awaiting an ordered, fact-free source transaction.
+    /// The key is durable in this database's history. Later transactions in that history have strictly greater system times.
+    pub async fn reserve_ordered_present(&mut self) -> Result<TransactionKey> {
+        self.state.reserve_ordered_present().await
+    }
     pub async fn query_context(&mut self) -> Result<Arc<QueryContext>> {
         let basis = self.state.read_basis().await?;
         Ok(self.service.query_context(self.state.database(), &basis, self.state.cancellation()).await?.with_observer(self.service.execution_observer()).with_tracer(self.service.node.tracer(), None))

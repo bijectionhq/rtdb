@@ -10,6 +10,12 @@ Prepared query execution admits unsigned arguments at their signed vector width.
 `PreparedSql::open_query_typed` retains supplied vector field types for typed nulls and empty containers; `open_query` infers fields from its values.
 Result-schema description preserves supplied physical parameter fields, while opening a query binds against the signed execution field view.
 
+`NativeSession::reserve_ordered_present` requires a database write grant and an idle native session in autocommit mode with read-write access.
+It submits an empty transaction without caller-supplied system time or an idempotency key and returns the transaction key after apply, advancing the connection's await token.
+Transactions in the same database history that resolve after the reservation take strictly greater system times.
+Each call can append a fresh reservation, including a retry after an unknown outcome.
+The reservation changes transaction bookkeeping only and marks its `xt.txs` metadata with `rtdb_present_reservation`.
+
 Session parameter entries, database and timezone strings, await/snapshot tokens, pinned transaction bases and buffered SQL carry execution-budget reservations for their retained lifetime.
 Rejected parameter updates retain the previous value.
 The failed-transaction marker stores only the state needed to reject subsequent commands; it does not retain the command's diagnostic payload.
