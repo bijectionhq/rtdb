@@ -969,6 +969,8 @@ impl<'a> OpenTransaction<'a> {
                 admitted.extend(world);
             }
         }
+        let retained_release = crate::hosted_control::retained_release_world(operations);
+        admitted.extend(retained_release);
         if !admitted.is_empty() {
             let context = self.context.query_context(self.snapshot()?, self.tx_key().system_time, &self.options.default_tz, self.trace_parent)?;
             for world in admitted {
@@ -1055,7 +1057,16 @@ impl<'a> OpenTransaction<'a> {
                 return Err(unavailable());
             }
         }
-        if !publications.is_empty() {
+        if let Some(world) = retained_release {
+            if deadline.is_none()
+                || self.owned_worlds.get(&world).is_none_or(|(record, _)| {
+                    record.mode != rtdb_types::WorldClockMode::Retained
+                })
+                || operations.iter().filter(|op| matches!(op, Operation::Public(TxOp::OwnedCheckWorldScope { .. }))).count() != 1
+            {
+                return Err(unavailable());
+            }
+        } else if !publications.is_empty() {
             // One immutable attempt per world and one Root attempt and head when writing Root.
             let mut effects = publications.len() + 2 * usize::from(root_publication.is_some());
             let mut root_rows = 0usize;

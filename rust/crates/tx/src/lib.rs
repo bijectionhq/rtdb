@@ -21,4 +21,4 @@ pub use idempotency_window::expiration as idempotency_expiration;
 pub use replay_submission::{ReplaySubmission, private_replay_original};
 
 mod hosted_control;
-pub use hosted_control::HostedControlWrite;
+pub use hosted_control::{HostedControlWrite, retained_release_controls};

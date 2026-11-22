@@ -9,6 +9,41 @@ pub(crate) fn admits_name(name: &str) -> bool {
     name.starts_with("bj_") && !name.contains('-') && OwnedRelation::new(name).is_ok()
 }
 
+/// A retained drop can settle a bounded set of existing owner rows.
+pub fn retained_release_controls<'a>(
+    controls: impl IntoIterator<Item = &'a HostedControlWrite>,
+) -> bool {
+    let mut checks = 0;
+    let mut replacements = 0;
+    for control in controls {
+        if control.is_check() {
+            checks += 1;
+        } else if control.expected().is_some() {
+            replacements += 1;
+        } else {
+            return false;
+        }
+    }
+    checks != 0 && (1..=2).contains(&replacements)
+}
+
+pub(crate) fn retained_release_world(operations: &[crate::source::Operation]) -> Option<rtdb_types::Iid> {
+    use crate::{TxOp, source::Operation};
+    let mut world = None;
+    let mut controls = Vec::new();
+    for op in operations {
+        match op {
+            Operation::Public(TxOp::HostedControl(control)) => controls.push(control),
+            Operation::Public(TxOp::OwnedDeadline { .. } | TxOp::OwnedCheckWorldScope { .. }) => (),
+            Operation::Public(TxOp::OwnedPublishWorld {
+                world: next, expected: None, advance_to: None, drop_world: true, ..
+            }) if world.is_none() => world = Some(*next),
+            _ => return None,
+        }
+    }
+    world.filter(|_| retained_release_controls(controls))
+}
+
 /// An assertion or checked replacement of one installed hosted control row.
 #[derive(Clone, Debug)]
 pub struct HostedControlWrite {
@@ -116,4 +151,43 @@ impl HostedControlWrite {
 
 fn invalid() -> Anomaly {
     Anomaly::incorrect("rtdb.hosted/control", "Invalid hosted control replacement")
+}
+
+#[cfg(test)]
+mod retained_release_tests {
+    use super::*;
+    use crate::{TxOp, source::Operation};
+    use rtdb_types::Iid;
+
+    #[test]
+    fn retained_release_requires_existing_replacements_and_one_terminal_world() -> Result<()> {
+        let scope = PlacedAttemptScope::new("root-release", 1)?;
+        let relation = OwnedRelation::new("bj_owner")?;
+        let control = |id: &str| StructFields::from([("_id".into(), Value::Utf8(id.into()))]);
+        let check = HostedControlWrite::check(relation.clone(), scope, Some(Timestamp(1)), control("installed"))?;
+        let replacement = |expected| HostedControlWrite::new(relation.clone(), scope, expected, control("holder"));
+        let drop = |world| TxOp::OwnedPublishWorld {
+            world,
+            attempt: "0000000000000000000000".into(),
+            fingerprint: [1; 32],
+            expected: None,
+            advance_to: None,
+            drop_world: true,
+        };
+        let world = Iid([1; 16]);
+        let mut operations = [
+            TxOp::OwnedDeadline { until: Timestamp(8) },
+            TxOp::OwnedCheckWorldScope { scope },
+            TxOp::HostedControl(check),
+            TxOp::HostedControl(replacement(Some(Timestamp(2)))?),
+            drop(world),
+        ].into_iter().map(Operation::Public).collect::<Vec<_>>();
+        assert_eq!(retained_release_world(&operations), Some(world));
+        operations.push(Operation::Public(drop(Iid([2; 16]))));
+        assert_eq!(retained_release_world(&operations), None);
+        operations.pop();
+        operations[3] = Operation::Public(TxOp::HostedControl(replacement(None)?));
+        assert_eq!(retained_release_world(&operations), None);
+        Ok(())
+    }
 }
