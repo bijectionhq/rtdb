@@ -1,0 +1,130 @@
+{
+  "summary": "Reset retirement requires adoption at or after the planned block and trie naming epoch with no catalog reference to a released name.",
+  "flags": [
+    "--no-external-by-default",
+    "--verify-module",
+    "production",
+    "--verify-module",
+    "laws"
+  ],
+  "min_verified_functions": 5,
+  "controls": {
+    "use_pre_reset_checkpoint": {
+      "mutate": [
+        {
+          "file": "rust/crates/format/src/reset_retirement_step.rs",
+          "find": "adopted_block >= required_block && adopted_epoch >= required_epoch && !still_retained\n}",
+          "replace": "adopted_block >= required_block && !still_retained\n}"
+        }
+      ],
+      "expect": [
+        {
+          "file": "rust/crates/format/src/reset_retirement_step.rs",
+          "function": "reset_allows_retirement",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 4
+    },
+    "use_pre_reset_checkpoint_with_weakened_contract": {
+      "mutate": [
+        {
+          "file": "rust/crates/format/src/reset_retirement_step.rs",
+          "find": "adopted_block >= required_block && adopted_epoch >= required_epoch && !still_retained\n}",
+          "replace": "adopted_block >= required_block && !still_retained\n}"
+        },
+        {
+          "file": "rust/crates/format/src/reset_retirement_step.rs",
+          "find": "adopted_block >= required_block && adopted_epoch >= required_epoch && !still_retained),",
+          "replace": "adopted_block >= required_block && !still_retained),"
+        }
+      ],
+      "expect": [
+        {
+          "file": "verification/verus/reset_retirement/laws.rs",
+          "function": "a_checkpoint_from_the_pre_reset_epoch_cannot_authorize_release",
+          "category": "assertion failed"
+        }
+      ],
+      "min_verified_functions": 4
+    },
+    "use_earlier_block": {
+      "mutate": [
+        {
+          "file": "rust/crates/format/src/reset_retirement_step.rs",
+          "find": "adopted_block >= required_block && adopted_epoch >= required_epoch && !still_retained\n}",
+          "replace": "adopted_epoch >= required_epoch && !still_retained\n}"
+        }
+      ],
+      "expect": [
+        {
+          "file": "rust/crates/format/src/reset_retirement_step.rs",
+          "function": "reset_allows_retirement",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 4
+    },
+    "use_earlier_block_with_weakened_contract": {
+      "mutate": [
+        {
+          "file": "rust/crates/format/src/reset_retirement_step.rs",
+          "find": "adopted_block >= required_block && adopted_epoch >= required_epoch && !still_retained\n}",
+          "replace": "adopted_epoch >= required_epoch && !still_retained\n}"
+        },
+        {
+          "file": "rust/crates/format/src/reset_retirement_step.rs",
+          "find": "adopted_block >= required_block && adopted_epoch >= required_epoch && !still_retained),",
+          "replace": "adopted_epoch >= required_epoch && !still_retained),"
+        }
+      ],
+      "expect": [
+        {
+          "file": "verification/verus/reset_retirement/laws.rs",
+          "function": "a_block_before_the_planned_reset_cannot_authorize_release",
+          "category": "assertion failed"
+        }
+      ],
+      "min_verified_functions": 4
+    },
+    "release_retained_name": {
+      "mutate": [
+        {
+          "file": "rust/crates/format/src/reset_retirement_step.rs",
+          "find": "adopted_block >= required_block && adopted_epoch >= required_epoch && !still_retained\n}",
+          "replace": "adopted_block >= required_block && adopted_epoch >= required_epoch\n}"
+        }
+      ],
+      "expect": [
+        {
+          "file": "rust/crates/format/src/reset_retirement_step.rs",
+          "function": "reset_allows_retirement",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 4
+    },
+    "release_retained_name_with_weakened_contract": {
+      "mutate": [
+        {
+          "file": "rust/crates/format/src/reset_retirement_step.rs",
+          "find": "adopted_block >= required_block && adopted_epoch >= required_epoch && !still_retained\n}",
+          "replace": "adopted_block >= required_block && adopted_epoch >= required_epoch\n}"
+        },
+        {
+          "file": "rust/crates/format/src/reset_retirement_step.rs",
+          "find": "adopted_block >= required_block && adopted_epoch >= required_epoch && !still_retained),",
+          "replace": "adopted_block >= required_block && adopted_epoch >= required_epoch),"
+        }
+      ],
+      "expect": [
+        {
+          "file": "verification/verus/reset_retirement/laws.rs",
+          "function": "a_retained_name_cannot_be_released",
+          "category": "assertion failed"
+        }
+      ],
+      "min_verified_functions": 4
+    }
+  }
+}

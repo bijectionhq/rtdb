@@ -347,7 +347,7 @@ impl ReplicationDriver {
             logs.validate_source_boundary(&resolve.database, boundary)?;
         }
         let read_position = recovered.replica_start(&logs)?;
-        let track_catalog_cut = config.enabled && recovered.can_track_catalog_cut(&logs);
+        let track_catalog_cut = config.enabled && recovered.allows_catalog_cut_tracking();
         let initial = DriverStatus { role: Role::Following, highest_term: recovered.fence.highest_term(), replica_position: read_position,
             installed: None,
             open_block: recovered.partition.value().live().block_index(), adopted_block: recovered.block.clone().map(Arc::new), promotion_failure: None, last_block_upload_epoch_seconds: 0 };
@@ -659,7 +659,12 @@ impl ReplicationDriver {
             self.read_position.0, self.recognized_prefix, self.pending_block.is_some(), apply_deferred,
         ) {
             let through = ReplicaPosition(through);
-            if self.track_catalog_cut {
+            let checkpoint = self.partition.value();
+            if self.track_catalog_cut && checkpoint.table_catalog().block().is_none_or(|block| {
+                block.boundary_replica_position().is_some_and(|boundary| {
+                    boundary.after_offset(self.logs.replica_epoch) >= 0 && boundary <= through
+                })
+            }) {
                 self.partition.publish_catalog_cut(CatalogCut {
                     storage_version: self.logs.storage_version,
                     storage_epoch: self.logs.storage_epoch,

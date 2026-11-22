@@ -450,7 +450,7 @@ impl ArtefactPublisher for PublishArtefacts {
     async fn publish(&self, message: ArtefactsAdded) -> Result<SourcePosition> { self.replication.publish_artefacts(message, &self.cancellation).await }
     async fn remove(&self, message: ArtefactsRemoved) -> Result<SourcePosition> { self.replication.remove_artefacts(message, &self.cancellation).await }
 }
-struct PublishDeletions(TermHandle);
+pub(crate) struct PublishDeletions(pub(crate) TermHandle);
 #[async_trait]
 impl TrieDeletionPublisher for PublishDeletions {
     async fn publish(&self, table: TableRef, keys: Vec<TrieKey>) -> Result<ReplicaPosition> { self.0.publish_deletions(table, keys).await }

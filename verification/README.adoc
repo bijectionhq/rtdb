@@ -329,6 +329,9 @@ It also exercises the Azure adapter against a loopback provider and separately m
   The checkpoint discovery area checks the production retry decision and its decreasing distance from the maximum index.
   The local repair area checks same-journal anchor advancement, protection and synchronization before collection, all digest bytes, the retained boundary match, and the exact exclusive replay endpoint in the Rust decision functions.
   The native case repairs from the reopened anchor and rejects a build that omits the persisted boundary check.
+  The reset retirement area verifies the Rust decision that checks the adopted block, naming epoch and withdrawal of every retired trie.
+  The ResetRetirement TLC model checks restart, an installed retirement receipt and the catalog floor before release, with controls for bypassing adoption, reader drain and the floor.
+  The native reset replay rejects a build that deletes the superseded files directly while the old catalog is held.
   The replay floor area checks the exact signed-offset rule for a required replica record below a provider's reported floor.
   The system time area checks the production assignment and admission decisions, including exhaustion and rejection of equal or earlier timestamps.
   The IID partition area checks the base-four digit computation shared by trie and compaction code.

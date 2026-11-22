@@ -47,6 +47,9 @@
 -- Installing the successor floor fences earlier journals.
 -- An exclusive compactor reset resumes cut publication after it adopts its new naming epoch.
 -- The installed prefix covers the new catalog before the reset completes.
+-- A coordinated reset stages the compacted file identities with the successor block and naming epoch before adoption.
+-- Reset intents can publish retirement only after the adopted checkpoint covers those coordinates and the selected trie names have been withdrawn.
+-- Collection resumes pending reset and ordinary retirements before selecting new age-eligible garbage.
 -- The native leader acknowledges a trie removal after its known installed replica prefix covers the removal record.
 -- The immutable partition value at acknowledgement contains neither a requested key nor a checkpoint dependency on that key.
 -- A skipped replay record or an unrecognized prefix cannot supply this acknowledgement.

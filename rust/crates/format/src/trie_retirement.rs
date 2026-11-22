@@ -1,4 +1,4 @@
-use rtdb_types::{Anomaly, CatalogCut, PhysicalObjectVersion, ReplicaPosition, Result, TableRef, TerminalObjectPublication};
+use rtdb_types::{Anomaly, BlockIndex, CatalogCut, PhysicalObjectVersion, ReplicaPosition, Result, TableRef, TerminalObjectPublication};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -35,6 +35,20 @@ pub struct RetirementIntent {
     pub tries: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub files: Vec<RetirementFile>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub after_reset: Option<ResetRetirementCut>,
+}
+
+#[derive(Clone, Copy, Serialize, Deserialize)]
+pub struct ResetRetirementCut {
+    pub block: BlockIndex,
+    pub naming_epoch: u64,
+}
+
+impl ResetRetirementCut {
+    pub fn admits(self, block: &crate::catalog::BlockCatalog, still_retained: bool) -> bool {
+        reset::reset_allows_retirement(self.block.0, self.naming_epoch, block.block_index().0, block.naming_epoch(), still_retained)
+    }
 }
 
 pub fn journal_directory(cut: CatalogCut) -> String {
@@ -86,6 +100,8 @@ impl InstalledRetirement {
 
 #[path = "trie_retirement_step.rs"]
 mod step;
+#[path = "reset_retirement_step.rs"]
+mod reset;
 
 #[cfg(test)]
 mod tests {
@@ -105,6 +121,7 @@ mod tests {
             files: vec![RetirementFile {
                 key: "tables/docs/data/l01-rc-b00.arrow".into(), version: None, terminal_publication: None, matches_publication: false,
             }],
+            after_reset: None,
         };
         let contents = serde_json::to_vec(&intent).unwrap();
         let path = format!("{}/installed/{}", journal_directory(selected), intent_digest(&contents));

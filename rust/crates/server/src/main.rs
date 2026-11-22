@@ -128,13 +128,13 @@ async fn reset_compactor(options: cli::StartOptions, database: String, dry_run: 
         let plan = handle.node().prepare_compactor_reset(&database, &cancellation).await?;
         write_report(std::io::stdout().lock(), |output| {
             for (table, tries) in plan.replacement_tries() { writeln!(output, "{}: {} verified L0 tries", table.schema_and_table(), tries.len())?; }
-            for key in plan.files_to_delete() { writeln!(output, "{} {key}", if dry_run { "WOULD DELETE" } else { "DELETE AFTER PUBLICATION" })?; }
+            for key in plan.files_to_delete() { writeln!(output, "{} {key}", if dry_run { "WOULD RETIRE" } else { "RETIRE AFTER PUBLICATION" })?; }
             Ok(())
         })?;
         if dry_run { return Ok(()); }
         let block = tokio::time::timeout(Duration::from_secs(300), plan.apply(&cancellation)).await
             .map_err(|_| Anomaly::fault("rtdb.compactor-reset/timeout", "Compactor reset did not complete within five minutes"))??;
-        write_report(std::io::stderr().lock(), |output| writeln!(output, "Compactor reset completed at block {}; compacted files deleted.", block.0))
+        write_report(std::io::stderr().lock(), |output| writeln!(output, "Compactor reset completed at block {}. Compacted files submitted for retirement.", block.0))
     }).await
 }
 

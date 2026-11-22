@@ -2662,6 +2662,15 @@ TLA_CASES = (
      ('Mutation = "none"', 'Mutation = "miss_deadline"'), "Safe"),
     ("RecoveryCustodyHandoff", "recovery-custody-completed-erasure-witness",
      ("INVARIANT Safe", "INVARIANT NeverFinishesWithIndependentCopy"), "NeverFinishesWithIndependentCopy"),
+    ("ResetRetirement", "reset-retirement", None, None),
+    ("ResetRetirement", "reset-retirement-early-receipt",
+     ('Mutation = "none"', 'Mutation = "skip_adoption"'), "Safe"),
+    ("ResetRetirement", "reset-retirement-held-reader",
+     ('Mutation = "none"', 'Mutation = "ignore_reader"'), "Safe"),
+    ("ResetRetirement", "reset-retirement-unpersisted-floor",
+     ('Mutation = "none"', 'Mutation = "skip_floor"'), "Safe"),
+    ("ResetRetirement", "reset-retirement-resumed-release-witness",
+     ("INVARIANT Safe", "INVARIANT NeverSettlesAfterRestart"), "NeverSettlesAfterRestart"),
     ("RepairAnchorRetention", "repair-anchor-retention", None, None),
     ("RepairAnchorRetention", "repair-anchor-stale-pin",
      ('Mutation = "none"', 'Mutation = "stale_pin"'), "Safe"),
@@ -3601,6 +3610,29 @@ def verify_retained_repair(args, source):
         or "a retained base must bind the boundary of the detached export" not in weakened.stdout):
         raise ValueError("the retained repair replay accepted the weakened boundary check")
     print("rust-retained-repair: replay passed and bypassing the boundary check failed")
+
+
+def verify_reset_retirement(args, source):
+    env = os.environ | {
+        "CARGO_TARGET_DIR": os.environ.get("CARGO_TARGET_DIR", str(ROOT / "target")),
+        "CARGO_PROFILE_TEST_DEBUG": "0",
+    }
+    test = "compactor_reset_preserves_l0_history_and_resumes_retirement_after_reader_drain"
+    command = ["cargo", "test", "--locked", "-p", "rtdb-node", "--test", "native", test, "--", "--exact"]
+    baseline = run_case(command, source / "rust", args.evidence, "rust-reset-retirement-baseline", env)
+    if baseline.returncode or f"{test} ... ok" not in baseline.stdout or "1 passed; 0 failed" not in baseline.stdout:
+        raise ValueError("the reset retirement replay did not pass")
+    path = source / "rust/crates/node/src/operations.rs"
+    original = path.read_bytes()
+    try:
+        replace_once(path, "if store.defers_trie_releases() {", "if false && store.defers_trie_releases() {")
+        weakened = run_case(command, source / "rust", args.evidence, "rust-reset-retirement-bypass-ledger", env)
+    finally:
+        path.write_bytes(original)
+    if (weakened.returncode != 101 or f"{test} ... FAILED" not in weakened.stdout
+        or "assertion failed: storage_root.join(key.as_str()).is_file()" not in weakened.stdout):
+        raise ValueError("the reset retirement replay did not detect direct deletion under a held catalog")
+    print("rust-reset-retirement: replay passed and direct deletion under a held catalog failed")
 
 
 def verify_checkpoint_replay_closure(args, source):
@@ -5493,6 +5525,7 @@ def main():
             replay_rust_trace(args)
             verify_checkpoint_replay(args, source)
             verify_retained_repair(args, source)
+            verify_reset_retirement(args, source)
             verify_published_checkpoint_replay(args, source)
             verify_checkpoint_table_manifest_replay(args, source)
             verify_checkpoint_replay_closure(args, source)

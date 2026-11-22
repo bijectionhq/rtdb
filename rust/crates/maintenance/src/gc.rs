@@ -109,6 +109,10 @@ impl TrieCollector {
     }
 
     pub async fn collect_as_of(&self, as_of: Timestamp, cancellation: &CancellationToken) -> Result<()> {
+        self.collect_cycle(Some(as_of), cancellation).await
+    }
+
+    async fn collect_cycle(&self, as_of: Option<Timestamp>, cancellation: &CancellationToken) -> Result<()> {
         if cancellation.is_cancelled() { return Err(crate::closed()); }
         let collection = Arc::new(self.partition.trie_collection());
         let cut = collection.current().snapshot().catalog_cut();
@@ -126,6 +130,7 @@ impl TrieCollector {
             self.observer.table_failed(None, &error);
             return Ok(());
         }
+        let Some(as_of) = as_of else { return Ok(()); };
         let tables: Vec<_> = collection.current().table_catalog().entries().cloned().collect();
         let tasks = stream::iter(tables).map(|entry| {
             let release = release.clone();
@@ -262,8 +267,7 @@ fn finished_groups(catalog: &TrieCatalog, table: &TableRef, keys: &[TrieKey]) ->
 impl CycleWorker for TrieCollector {
     async fn collect(&self, cancellation: &CancellationToken) -> Result<()> {
         if cancellation.is_cancelled() { return Err(crate::closed()); }
-        if let Some(as_of) = self.default_garbage_as_of().await? { self.collect_as_of(as_of, cancellation).await?; }
-        Ok(())
+        self.collect_cycle(self.default_garbage_as_of().await?, cancellation).await
     }
 }
 

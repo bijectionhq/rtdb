@@ -66,11 +66,13 @@ The export includes table declarations without data files and derives the primar
 The plan copies through the existing object-store capability, accepts completed immutable copies on retry and publishes the checkpoint root after its dependencies.
 `Node::prepare_compactor_reset` catches up through a block and verifies the L0 data and metadata pairs named by the installed checkpoint.
 An incomplete inventory refuses the reset before installing a replacement catalog.
-The passive `CompactorReset` plan retains its catalog generation, term capability, deletion list and memory reservations.
+The passive `CompactorReset` plan retains its catalog generation, term capability, retirement inventory and memory reservations.
 Its application requires an exclusive maintenance node with indexing enabled and compaction and automatic GC disabled.
 The active replication driver accepts the reset only against that catalog and block, owns the reset completion within its leader term, and acknowledges it after adopting the replacement block.
-The plan then deletes compacted metadata before data; cancellation and failed publication retain the files needed for recovery.
-Planning alone performs the initial catch-up flush but makes no reset or deletion.
+On coordinated stores, the plan stages the compacted pairs before publication and submits them for retirement through the installed replica receipt and catalog floor afterwards.
+Earlier readers can defer release, and collection resumes pending retirements after restart.
+On an uncoordinated store the exclusive plan deletes compacted metadata before data after adoption.
+Planning alone performs the initial catch-up flush and reports the prospective retirements.
 Feature-gated provider factories supply Kafka, S3, Azure, and GCS implementations.
 `PostgresSourceFactory` is a passive immutable registry of node-local remotes and native indexer factories.
 The database source retains its native indexer and metric registration across leader changes; each active assignment driver owns its PostgreSQL sockets and confirmation state until teardown.

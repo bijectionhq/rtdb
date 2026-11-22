@@ -1789,6 +1789,7 @@ mod tests {
         let intent = RetirementIntent {
             selected: cut, table: TableRef::new("public", "orders"), tries: vec!["l01-rc-b00".into()],
             files: vec![RetirementFile { key: file.to_string(), version: None, terminal_publication: None, matches_publication: false }],
+            after_reset: None,
         };
         let installed = ReplicaPosition(1);
         let floor = intent.installed_cut(installed).unwrap();

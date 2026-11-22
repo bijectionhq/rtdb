@@ -587,6 +587,7 @@ mod tests {
             files: vec![RetirementFile {
                 key: relative.to_string(), version: Some(version), matches_publication: true, terminal_publication: None,
             }],
+            after_reset: None,
         };
         let installed = ReplicaPosition(1);
         let floor = plan.installed_cut(installed).unwrap();
@@ -945,7 +946,7 @@ mod tests {
             key: format!("cell/{target}"), version: "original".into() };
         let versions = Provider { version: version.clone(), attempts: AtomicUsize::new(0), markers: AtomicUsize::new(0) };
         let intent = RetirementIntent { selected, table: rtdb_types::TableRef::new("public", "orders"), tries: vec!["l01-rc-b00".into()],
-            files: vec![RetirementFile { key: key.into(), version: Some(version), terminal_publication: None, matches_publication: true }] };
+            files: vec![RetirementFile { key: key.into(), version: Some(version), terminal_publication: None, matches_publication: true }], after_reset: None };
         let encoded = serde_json::to_vec(&intent).unwrap();
         let relative = format!("{}/installed/{}", journal_directory(selected), intent_digest(&encoded));
         let receipt = ObjectKey::new(format!("{store}/{relative}")).unwrap();

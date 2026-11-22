@@ -1772,18 +1772,25 @@ contract CompactorReset {
 
     @invariant PublicationPrecedesDeletion
         -- A reset with a completed transaction publishes the replacement catalog in a new block.
-        -- Compacted files become eligible for deletion after the maintenance node adopts that block in the term that accepted the reset.
-        -- Deletion removes each compacted trie's metadata before its data.
+        -- A coordinated store records the compacted file identities and required block and naming epoch before publication.
+        -- The adopted root must cover the required block and naming epoch in the selected journal, and its catalog and checkpoint must have withdrawn the named tries, before the leader confirms their removal.
+        -- Physical retirement follows the installed removal receipt and coordinated catalog floor.
+        -- An exclusive reset on an uncoordinated store deletes each compacted trie's metadata before its data after adoption.
 
     @invariant CapturedCatalogIdentity
         -- A reset prepared from an earlier catalog or block is rejected if either changes before acceptance.
 
     @invariant InterruptedResetRetainsRecovery
         -- A reset interrupted before its block is adopted retains all compacted files.
-        -- An interruption during deletion retains the published L0 recovery catalog and any remaining compacted files.
+        -- An interruption during retirement leaves the published L0 recovery catalog and a durable retirement intent for each unsettled batch on a coordinated store.
+        -- Collection can finish eligible reset retirements after restart and after earlier reader tickets drain.
+
+    @invariant SuccessorJournalCatalogCut
+        -- A native node that reopens a recovered checkpoint in a fresh journal initially leaves the catalog cut untracked.
+        -- Discoverable recovery can publish a cut after adopting a checkpoint in the current journal whose boundary the installed replica prefix covers.
 
     @invariant DryRunPlan
-        -- A dry run performs the initial catch-up flush and reports the verified L0 catalog and proposed deletions.
+        -- A dry run performs the initial catch-up flush and reports the verified L0 catalog and proposed retirements.
         -- Its plan leaves the catalog and files as they stood after that catch-up.
 }
 

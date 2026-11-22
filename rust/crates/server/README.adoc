@@ -73,8 +73,11 @@ The manifest contains one block catalog, its table blocks and the live/nascent t
 Copies preserve object bytes, and identical retries are accepted.
 `reset-compactor DATABASE` runs an exclusive maintenance node with compaction, automatic GC and listeners disabled.
 Every other node, client and upstream writer must remain stopped until it finishes.
-The command catches up, verifies the L0 pairs named by the installed checkpoint, publishes their replacement catalog and waits for its block adoption before deleting compacted files.
-`--dry-run` reports the replacement tries and deletion list after the catch-up flush.
+The command catches up, verifies the L0 pairs named by the installed checkpoint and publishes their replacement catalog.
+On coordinated stores, it records the superseded compacted pairs before publication and submits them for retirement after adoption.
+Physical removal can wait for readers to release their catalog and resumes during subsequent collection, including after a restart.
+On uncoordinated stores, the command removes the compacted pairs after adoption.
+`--dry-run` reports the replacement tries and prospective retirements after the catch-up flush.
 `rtdb repair-checkpoint STORAGE REPLICA_LOG OUTPUT_PARENT BASE@SHA256 THROUGH@SHA256` rebuilds a stopped single local database in a separate directory.
 Supply the original storage parent containing `v06`, the file named `REPLICA_LOG`, an existing output parent outside `v06`, and decimal block numbers with the SHA-256 digests of their exact published block files.
 Stop the original database and keep its journal and storage stable for the duration of the command.

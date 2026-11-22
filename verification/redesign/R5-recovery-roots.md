@@ -102,6 +102,17 @@ The rebuild can select the persisted anchor directly under the original journal 
 The native replay rejects a persisted boundary that disagrees with the checked base export, and the harness rejects a program that skips that comparison.
 The filesystem lock, synchronization calls, and binding of the receipt to the actual journal media remain runtime premises.
 
+## Retirement after an adopted compactor reset
+
+The coordinated reset stages the exact compacted trie pairs and the required successor block and naming epoch in the retirement journal before publication.
+Once the installed replica prefix covers the replacement checkpoint and the selected trie names have been withdrawn, the leader can acknowledge their removal.
+The same durable catalog floor as ordinary collection keeps the pairs available to readers of the old cut and rejects stale admissions after advancement.
+The collector resumes those intents after restart regardless of the age threshold for new garbage.
+A repaired local store reopened with a fresh journal can publish a catalog cut after it adopts the first checkpoint in that journal.
+The native reset regression keeps the old files with a catalog reader held across restart, then settles the durable intent after that reader has drained without another block adoption.
+[Verus](../verus/reset_retirement/proof.rs) checks the production adoption predicate and [TLC](../tla/ResetRetirement.tla) checks the bounded restart and release protocol.
+Reset preparation and ordered-index replay still depend on the original L0 inputs, and those files stay outside automatic collection.
+
 ## Source retention through copy completion
 
 A verified copy has two independent obligations.

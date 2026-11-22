@@ -1,17 +1,17 @@
 use std::{collections::BTreeMap, sync::Arc, time::Duration};
 use rtdb_columnar::MemoryReservation;
 use rtdb_format::{catalog::CheckpointContents, keys::{CURRENT_STORAGE_VERSION, StorageRoot, TrieKey, block_key, lex_hex}};
-use rtdb_index::{CatalogTrie, TrieCatalog};
+use rtdb_index::{CatalogTrie, PartitionValue};
+use rtdb_maintenance::ResetRetirements;
 use rtdb_storage::{ObjectKey, ObjectStore};
 use rtdb_types::{Anomaly, AnomalyCategory, BlockIndex, Result, StorageEpoch, TableRef, Timestamp};
 use tokio_util::sync::CancellationToken;
-use crate::Node;
+use crate::{Node, database::PublishDeletions};
 
 pub struct CompactorReset {
     database: Arc<crate::Database>,
     term: rtdb_replication::TermHandle,
-    expected: Arc<TrieCatalog>,
-    expected_block: BlockIndex,
+    expected: Arc<PartitionValue>,
     replacements: BTreeMap<TableRef, Vec<CatalogTrie>>,
     files: Vec<ObjectKey>,
     reservations: Arc<[Arc<MemoryReservation>]>,
@@ -20,17 +20,28 @@ impl CompactorReset {
     pub fn files_to_delete(&self) -> &[ObjectKey] { &self.files }
     pub fn replacement_tries(&self) -> &BTreeMap<TableRef, Vec<CatalogTrie>> { &self.replacements }
 
-    /// Publishes the captured L0 catalog in a new block, then removes compacted metadata before data.
-    /// All other nodes, clients and upstream writers must remain stopped until this finishes.
-    /// Cancellation before publication leaves every compacted file; cancellation afterwards leaves a usable L0 catalog.
+    /// Publishes the captured L0 catalog in a new block and submits the superseded files for retirement.
+    /// Every competing writer and maintenance worker must remain stopped until this finishes.
+    /// A coordinated store can defer physical retirement while readers hold the previous catalog.
+    /// An uncoordinated store requires exclusive access for both readers and writers.
     pub async fn apply(self, cancellation: &CancellationToken) -> Result<BlockIndex> {
         if cancellation.is_cancelled() { return Err(reset_cancelled()); }
         self.database.require_writable()?;
+        let store = self.database.storage.object_store();
+        let retirements = if store.defers_trie_releases() {
+            Some(ResetRetirements::stage(store.as_ref(), &self.expected, cancellation).await?)
+        } else { None };
         let retained = self.reservations;
-        let block = cancellation.run_until_cancelled(self.term.reset_compactor(self.expected, self.expected_block, self.replacements, Arc::clone(&retained))).await.ok_or_else(reset_cancelled)??;
+        let block = cancellation.run_until_cancelled(self.term.reset_compactor(
+            Arc::clone(self.expected.trie_catalog()), self.expected.live().block_index(), self.replacements, Arc::clone(&retained),
+        )).await.ok_or_else(reset_cancelled)??;
+        if let Some(retirements) = retirements {
+            retirements.publish(store.as_ref(), &PublishDeletions(self.term), &self.database.partition.value(), block, cancellation).await?;
+            return Ok(block);
+        }
         for key in self.files {
             if cancellation.is_cancelled() { return Err(reset_cancelled()); }
-            match self.database.storage.object_store().delete(&key).await {
+            match store.delete(&key).await {
                 Ok(()) | Err(rtdb_storage::Error::MissingObject(_)) => {},
                 Err(error) => return Err(error.into()),
             }
@@ -152,7 +163,7 @@ impl Node {
                 replacements.insert(entry.table, tries.into_values().collect());
             }
         }
-        Ok(CompactorReset { database, term, expected, expected_block: value.live().block_index(), replacements, files, reservations: reservations.into() })
+        Ok(CompactorReset { database, term, expected: value, replacements, files, reservations: reservations.into() })
     }
     /// Plans an offline export from the loaded block's immutable dependency closure.
     /// Indexing and compaction must be disabled on this node; source files must remain available until copying finishes.

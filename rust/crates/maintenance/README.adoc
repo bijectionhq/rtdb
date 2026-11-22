@@ -52,7 +52,10 @@ Operation context accepts lowercase ASCII identifiers and object-key context pas
 
 `TrieCollector` and `BlockCollector` are passive cycle capabilities.
 Trie collection uses one immutable snapshot, bounded table/delete concurrency, and chunks containing at most 1024 trie keys.
-It removes data before metadata, drains started deletes, then publishes one deletion record per completed chunk.
+An uncoordinated sweep removes data before metadata, drains started deletes, and publishes one deletion record per completed chunk.
+Coordinated sweeps use a durable intent, an installed replica receipt and a catalog floor that waits for earlier readers.
+Compactor reset stages its superseded compacted pairs in the same retirement journal, with a required successor checkpoint block and naming epoch.
+Collection can resume those intents after restart even when the age policy selects no new garbage.
 L0 recovery files are excluded.
 Block collection removes expired catalog, table-block, and oversized-message objects without replica publication.
 Per-table failures are reported through `CollectionObserver` and isolated from other tables.

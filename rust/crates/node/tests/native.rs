@@ -1919,7 +1919,7 @@ async fn offline_export_has_no_manifest_before_a_completed_block() {
 }
 
 #[tokio::test]
-async fn compactor_reset_preserves_l0_history_and_deletes_compacted_files_only_after_publication() {
+async fn compactor_reset_preserves_l0_history_and_resumes_retirement_after_reader_drain() {
     tokio::time::timeout(Duration::from_secs(40), async {
         let directory = tempfile::tempdir().unwrap();
         let store = directory.path().join("store");
@@ -1989,21 +1989,39 @@ async fn compactor_reset_preserves_l0_history_and_deletes_compacted_files_only_a
         for key in &compacted { assert!(store.join("v06").join(key.as_str()).is_file()); }
 
         let plan = node.prepare_compactor_reset("xtdb", &CancellationToken::new()).await.unwrap();
+        let database = node.catalog().database("xtdb").unwrap();
+        let cut = database.snapshot().catalog_cut().unwrap();
+        let old_reader = database.object_store().retain_catalog(Some(cut)).await.unwrap().unwrap();
         let published = plan.apply(&CancellationToken::new()).await.unwrap();
-        assert!(node.catalog().database("xtdb").unwrap().status().adopted_block.as_ref().is_some_and(|block| block.block_index() >= published));
-        for key in &compacted { assert!(!store.join("v06").join(key.as_str()).exists()); }
+        assert!(database.status().adopted_block.as_ref().is_some_and(|block| block.block_index() >= published));
+        for key in &compacted { assert!(storage_root.join(key.as_str()).is_file()); }
+        let pending = rtdb_format::trie_retirement::journal_directory(cut) + "/reset-pending";
+        assert!(std::fs::read_dir(storage_root.join(&pending)).unwrap().next().is_some());
         let mut session = node.session("xtdb", Arc::new(Authority)).unwrap();
         assert_eq!(rows(session.query_sql(sql, vec![]).await.unwrap()).await, before);
-        drop(session);
+        drop((session, database));
         stop(&node, driver).await;
         drop(node);
 
         settings.compaction_threads = 1;
+        settings.automatic_gc = true;
+        settings.garbage.blocks_to_keep = usize::MAX;
+        settings.garbage.reader_lease = Duration::from_secs(1);
+        settings.garbage.reader_lease_margin = Duration::from_millis(200);
         let (node, driver) = running(settings, fresh_local_services(&runtime_services)).await;
         let mut session = node.session("xtdb", Arc::new(Authority)).unwrap();
         assert_eq!(rows(session.query_sql(sql, vec![]).await.unwrap()).await, before);
         let database = node.catalog().database("xtdb").unwrap();
         assert_eq!(database.snapshot().trie_catalog().naming_epoch(), 1, "the reset's block carries the new naming epoch through restart");
+        for key in &compacted { assert!(storage_root.join(key.as_str()).is_file()); }
+        drop(old_reader);
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while compacted.iter().any(|key| storage_root.join(key.as_str()).exists()) {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        }).await.unwrap();
+        assert_eq!(database.status().adopted_block.as_ref().unwrap().block_index(), published);
+        assert_eq!(database.object_store().retain_catalog(Some(cut)).await.err().unwrap().code, "rtdb.storage/catalog-not-current");
         database.compaction().unwrap().compact_all().await.unwrap();
         assert_eq!(rows(session.query_sql(sql, vec![]).await.unwrap()).await, before);
         let mut recompacted = Vec::new();
@@ -2303,6 +2321,13 @@ async fn an_installed_repair_base_keeps_older_targets_and_offloaded_replay_throu
     let (reader, driver) = running(reopened, native()).await;
     let mut reader_session = reader.session("xtdb", Arc::new(Authority)).unwrap();
     assert_eq!(rows(reader_session.query_sql(sql, vec![]).await.unwrap()).await, expected);
+    let repaired_database = reader.catalog().database("xtdb").unwrap();
+    assert!(repaired_database.snapshot().catalog_cut().is_none());
+    let adopted = flush(&repaired_database).await;
+    let catalog_cut = repaired_database.snapshot().catalog_cut().unwrap();
+    assert_eq!(catalog_cut.replica_epoch, rtdb_types::StorageEpoch(1));
+    assert!(catalog_cut.through >= adopted.boundary_replica_position().unwrap());
+    drop(repaired_database);
     drop(reader_session);
     stop(&reader, driver).await;
 

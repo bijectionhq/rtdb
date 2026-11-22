@@ -75,11 +75,7 @@ impl RecoveredPartition {
         Ok(self.block.as_ref().and_then(BlockCatalog::boundary_replica_position).unwrap_or(logs.replica_floor()?))
     }
 
-    pub(crate) fn can_track_catalog_cut(&self, logs: &PartitionLogs) -> bool {
-        self.refresh_allowed && self.block.as_ref().is_none_or(|block| {
-            block.boundary_replica_position().is_some_and(|position| position.after_offset(logs.replica_epoch) >= 0)
-        })
-    }
+    pub(crate) fn allows_catalog_cut_tracking(&self) -> bool { self.refresh_allowed }
 
     pub(crate) fn confirmation(&self, replica_epoch: StorageEpoch, storage_version: StorageVersion, storage_epoch: StorageEpoch, memory: &Arc<MemoryBudget>) -> Result<Option<RecoveredBlockConfirmation>> {
         let Some(catalog) = &self.block else { return Ok(None); };

@@ -19,6 +19,7 @@ async fn a_local_trie_release_waits_for_held_catalogs_and_refuses_stale_reopens(
     let plan = serde_json::to_vec(&RetirementIntent {
         selected, table: TableRef::new("public", "orders"), tries: vec!["l01-rc-b00".into()],
         files: vec![RetirementFile { key: file.to_string(), version: None, matches_publication: false, terminal_publication: None }],
+        after_reset: None,
     }).unwrap();
     let receipt = ObjectKey::new(format!("{}/installed/{}", journal_directory(selected), intent_digest(&plan)))?;
     let bytes = Bytes::from([installed.through.0.to_be_bytes().as_slice(), &plan].concat());
