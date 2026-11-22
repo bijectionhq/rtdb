@@ -228,6 +228,9 @@ It also exercises the Azure adapter against a loopback provider and separately m
   `verus/repair_archive_custody` checks the production membership and closed-region guard.
   Native replays cover recapture, transfer from original repair custody, and local maintenance held across cancellation.
 * `tla/SourceRetirementSettlement.tla` compares exact-version and serialized-path reclamation when work can complete after its submitting task stops.
+* `tla/ExactRetirementRetry.tla` checks settlement with two outstanding requests for one version and up to two replacement versions.
+  `lean/ExactRetirementRetry.lean` proves idempotence and preservation of other versions for arbitrary keys and versions.
+  A loopback S3 replay checks the version-qualified request, verifies continued listing, and requires an exact negative observation before reporting success.
 * `tla/CheckpointCopyEvidence.tla` checks the predicate admitting a body to a checkpoint copy plan.
   `lean/CheckpointCopyEvidence.lean` proves inventory agreement and budget conservation for arbitrary finite lists.
   `verus/checkpoint_copy_budget` checks exact sealed-byte admission and accounting in production.

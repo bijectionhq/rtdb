@@ -139,7 +139,23 @@ Its exact-version design needs a durable authorization naming the provider copy 
 Task termination alone establishes that the task cannot issue another request. A mutation accepted by the provider can still complete.
 The bounded settlement comparison preserves replacement availability for exact-version removal and for path removal that excludes publication and admission until settlement.
 It reaches late completion with the replacement held in the exact variant.
-An integration proof must account for how version deletion affects the current-name view, each inherited reference, and retry after a lost provider reply.
+
+The S3 adapter binds the removal to its configured bucket, endpoint, region and physical key, and requires an immutable provider version.
+Every retry sends that version identifier, then reads the version inventory for evidence of its absence.
+The evidence covers that exact key and version, with pagination checked before absence is accepted.
+This relies on the provider honoring exact deletion, supplying complete version listings and never reusing an immutable version identity.
+The retry model reaches settlement while a redundant exact request remains outstanding. Its later effect preserves other versions.
+An integration proof must account for how deleting the current version affects the current-name view, how inherited references remain protected, and how each physical owner orders authorization and admission.
+
+### Serving and archive removal entry points
+
+| Effect path | Current admission and evidence | Remaining composition obligation |
+| --- | --- | --- |
+| `reap_as_of` and `References::erase` | The reaper uses garbage records, checkpoint floors and a scan of existing manifests. It copies to observed referrers before deleting the path. | Bind the authorized retirement to one physical owner and version, validate the referrer set under that authority, and keep the intent until exact settlement. |
+| `Base::save` | It publishes a higher manifest sequence before deleting older manifest names. `Base::load` retries a missing selected manifest. | Establish the manifest cut and retry contract for every consumer of inherited-object locations. |
+| `erase_deployment` in disposal and old-residence cleanup | The administration path fences the residence, transfers observed shared objects and checks the provider inventory under its prefix. | Prove that no publication of a new reference to that residence can race the referrer scan and transfer. |
+| `ordered_index_storage::reap` | The directory generation floor and reader registry close admission. Remote cleanup aborts journaled uploads and checks the generation prefix inventory. | Preserve the independent generation and residence bindings in any shared retirement API. |
+| `finish_capture_retirement` and whole archive retirement | A capture is closed in the directory. Archive custody and the provider inventory govern physical erasure and final receipts. | Preserve capture identity and the archive's separate namespace when composing with serving retirement. |
 
 
 

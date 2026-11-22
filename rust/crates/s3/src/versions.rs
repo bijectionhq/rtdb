@@ -6,8 +6,8 @@ use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::types::{ChecksumAlgorithm, CompletedMultipartUpload, CompletedPart, Delete, ObjectIdentifier, RequestPayer};
 use bytes::Bytes;
 use object_store::path::Path;
-use rtdb_storage::{Error, ObjectKey, remote::{PublicationResult, PublicationUploads}};
-use rtdb_types::{Anomaly, AnomalyCategory, Result};
+use rtdb_storage::{Error, ObjectKey, remote::{PublicationResult, PublicationUploads, valid_object_version}};
+use rtdb_types::{Anomaly, AnomalyCategory, PhysicalObjectVersion, Result, S3ObjectNamespace};
 
 fn collect_child(parent: &str, key: Option<&str>, children: &mut BTreeSet<String>) {
     if let Some((child, _)) = key.and_then(|key| key.strip_prefix(parent)).and_then(|relative| relative.split_once('/')) {
@@ -17,15 +17,70 @@ fn collect_child(parent: &str, key: Option<&str>, children: &mut BTreeSet<String
 
 pub struct VersionedInventory {
     client: Client,
-    bucket: String,
+    namespace: S3ObjectNamespace,
     root: ObjectKey,
     request_payer: Option<RequestPayer>,
     scope_multipart_listing: bool,
 }
 
 impl VersionedInventory {
-    pub(crate) fn new(client: Client, bucket: String, root: ObjectKey, requester_pays: bool, scope_multipart_listing: bool) -> Self {
-        Self { client, bucket, root, request_payer: requester_pays.then_some(RequestPayer::Requester), scope_multipart_listing }
+    pub(crate) fn new(client: Client, namespace: S3ObjectNamespace, root: ObjectKey, requester_pays: bool, scope_multipart_listing: bool) -> Self {
+        Self { client, namespace, root, request_payer: requester_pays.then_some(RequestPayer::Requester), scope_multipart_listing }
+    }
+
+    /// Executes an already authorized retirement of one immutable physical version.
+    /// Success means a fresh version inventory confirmed absence of that exact object.
+    pub async fn retire_observed_version(&self, key: &ObjectKey, observed: &PhysicalObjectVersion) -> Result<()> {
+        let path = Path::from(format!("{}/{key}", self.root));
+        if observed.namespace != self.namespace || observed.key != path.as_ref() || !valid_object_version(observed.version.as_bytes()) {
+            return Err(unavailable("The retirement does not identify an immutable version of this key"));
+        }
+        match self.client.delete_object().bucket(&self.namespace.bucket).key(path.as_ref()).version_id(&observed.version)
+            .set_request_payer(self.request_payer.clone()).send().await
+        {
+            Ok(_) => {},
+            Err(error) if error.as_service_error().and_then(|error| error.code()) == Some("NoSuchVersion") => {},
+            Err(error) => return Err(unavailable(format!("Removing the observed version failed: {error}"))),
+        }
+        if self.contains_version(path.as_ref(), &observed.version).await? {
+            return Err(unavailable("The retired object version is still present"));
+        }
+        Ok(())
+    }
+
+    async fn contains_version(&self, key: &str, version: &str) -> Result<bool> {
+        let mut marker: (Option<String>, Option<String>) = (None, None);
+        let mut seen = BTreeSet::new();
+        loop {
+            let page = self.client.list_object_versions().bucket(&self.namespace.bucket).prefix(key).max_keys(1000)
+                .set_key_marker(marker.0.clone()).set_version_id_marker(marker.1.clone())
+                .set_request_payer(self.request_payer.clone()).send().await
+                .map_err(|error| unavailable(format!("Checking the retired version failed: {error}")))?;
+            for (listed_key, listed_version) in page.versions().iter().map(|entry| (entry.key(), entry.version_id()))
+                .chain(page.delete_markers().iter().map(|entry| (entry.key(), entry.version_id())))
+            {
+                let listed_key = listed_key.filter(|listed| listed.starts_with(key))
+                    .ok_or_else(|| unavailable("S3 listed a key outside the requested prefix"))?;
+                let listed_version = listed_version.filter(|listed| !listed.is_empty())
+                    .ok_or_else(|| unavailable("S3 listed a key without its version identifier"))?;
+                if listed_key == key && listed_version == version { return Ok(true); }
+            }
+            match page.is_truncated() {
+                Some(false) => return Ok(false),
+                Some(true) => {},
+                None => return Err(unavailable("S3 omitted the version listing's pagination state")),
+            }
+            let next_key = page.next_key_marker().filter(|next| next.starts_with(key))
+                .ok_or_else(|| unavailable("S3 omitted a usable version listing key marker"))?;
+            let next_version = page.next_version_id_marker().filter(|next| !next.is_empty());
+            if (next_key == key && next_version.is_none()) || marker.0.as_deref().is_some_and(|previous| next_key < previous) {
+                return Err(unavailable("S3 returned an incomplete version listing marker"));
+            }
+            marker = (Some(next_key.to_owned()), next_version.map(str::to_owned));
+            if !seen.insert(marker.clone()) {
+                return Err(unavailable("S3 repeated a version listing marker"));
+            }
+        }
     }
 
     /// Retires one exact journaled upload rather than looking for a current
@@ -58,7 +113,7 @@ impl VersionedInventory {
         let mut directories = BTreeSet::new();
         let mut marker = (None, None);
         loop {
-            let page = self.client.list_object_versions().bucket(&self.bucket).prefix(&prefix)
+            let page = self.client.list_object_versions().bucket(&self.namespace.bucket).prefix(&prefix)
                 .delimiter("/").max_keys(1000).set_key_marker(marker.0.clone())
                 .set_version_id_marker(marker.1.clone())
                 .set_request_payer(self.request_payer.clone()).send().await
@@ -75,7 +130,7 @@ impl VersionedInventory {
         }
         let mut marker = (None, None);
         loop {
-            let page = self.client.list_multipart_uploads().bucket(&self.bucket).max_uploads(1000)
+            let page = self.client.list_multipart_uploads().bucket(&self.namespace.bucket).max_uploads(1000)
                 .set_prefix(self.scope_multipart_listing.then(|| prefix.clone()))
                 .set_delimiter(self.scope_multipart_listing.then(|| "/".to_owned()))
                 .set_key_marker(marker.0.clone()).set_upload_id_marker(marker.1.clone())
@@ -115,7 +170,7 @@ impl VersionedInventory {
     async fn multipart_batch(&self, prefix: &str) -> Result<Vec<(String, String)>> {
         let mut marker = (None, None);
         loop {
-            let page = self.client.list_multipart_uploads().bucket(&self.bucket).max_uploads(1000)
+            let page = self.client.list_multipart_uploads().bucket(&self.namespace.bucket).max_uploads(1000)
                 .set_prefix(self.scope_multipart_listing.then(|| prefix.to_owned()))
                 .set_key_marker(marker.0.clone()).set_upload_id_marker(marker.1.clone())
                 .set_request_payer(self.request_payer.clone()).send().await
@@ -142,14 +197,14 @@ impl VersionedInventory {
 
     async fn abort_upload(&self, key: &str, id: &str) -> Result<()> {
         for _ in 0..4 {
-            match self.client.abort_multipart_upload().bucket(&self.bucket).key(key).upload_id(id)
+            match self.client.abort_multipart_upload().bucket(&self.namespace.bucket).key(key).upload_id(id)
                 .set_request_payer(self.request_payer.clone()).send().await
             {
                 Ok(_) => {}
                 Err(error) if error.as_service_error().is_some_and(|error| error.is_no_such_upload()) => {}
                 Err(error) => return Err(unavailable(format!("Aborting a multipart upload failed: {error}"))),
             }
-            match self.client.list_parts().bucket(&self.bucket).key(key).upload_id(id).max_parts(1)
+            match self.client.list_parts().bucket(&self.namespace.bucket).key(key).upload_id(id).max_parts(1)
                 .set_request_payer(self.request_payer.clone()).send().await
             {
                 Ok(_) => {}
@@ -168,7 +223,7 @@ impl VersionedInventory {
             if versions == previous { return Err(unavailable("A batch of deleted versions is still listed")); }
             let delete = Delete::builder().set_objects(Some(versions.clone())).quiet(true).build()
                 .map_err(|error| unavailable(error.to_string()))?;
-            let reply = self.client.delete_objects().bucket(&self.bucket).delete(delete)
+            let reply = self.client.delete_objects().bucket(&self.namespace.bucket).delete(delete)
                 .set_request_payer(self.request_payer.clone()).send().await
                 .map_err(|error| unavailable(format!("Deleting object versions failed: {error}")))?;
             if let Some(error) = reply.errors().first() {
@@ -179,7 +234,7 @@ impl VersionedInventory {
     }
 
     async fn version_batch(&self, prefix: &str) -> Result<Vec<ObjectIdentifier>> {
-        let page = self.client.list_object_versions().bucket(&self.bucket).prefix(prefix).max_keys(1000)
+        let page = self.client.list_object_versions().bucket(&self.namespace.bucket).prefix(prefix).max_keys(1000)
             .set_request_payer(self.request_payer.clone()).send().await
             .map_err(|error| unavailable(format!("Listing object versions failed: {error}")))?;
         let mut versions = Vec::new();
@@ -202,7 +257,7 @@ impl VersionedInventory {
 impl PublicationUploads for VersionedInventory {
     async fn reserve(&self, path: &Path, attempt: uuid::Uuid) -> rtdb_storage::Result<String> {
         let key = path.as_ref();
-        let reserved = self.client.create_multipart_upload().bucket(&self.bucket).key(key)
+        let reserved = self.client.create_multipart_upload().bucket(&self.namespace.bucket).key(key)
             .metadata("rtdb-publication", attempt.to_string()).checksum_algorithm(ChecksumAlgorithm::Sha256)
             .set_request_payer(self.request_payer.clone()).send().await
             .map_err(|error| publication_failure(path, error.to_string()))?;
@@ -212,7 +267,7 @@ impl PublicationUploads for VersionedInventory {
 
     async fn complete(&self, path: &Path, upload: &str, bytes: Bytes) -> rtdb_storage::Result<PublicationResult> {
         let key = path.as_ref();
-        let part = self.client.upload_part().bucket(&self.bucket).key(key).upload_id(upload)
+        let part = self.client.upload_part().bucket(&self.namespace.bucket).key(key).upload_id(upload)
             .part_number(1).checksum_algorithm(ChecksumAlgorithm::Sha256).body(ByteStream::from(bytes))
             .set_request_payer(self.request_payer.clone()).send().await
             .map_err(|error| publication_failure(path, error.to_string()))?;
@@ -221,7 +276,7 @@ impl PublicationUploads for VersionedInventory {
         let parts = CompletedMultipartUpload::builder()
             .parts(CompletedPart::builder().part_number(1).e_tag(tag).checksum_sha256(checksum).build())
             .build();
-        match self.client.complete_multipart_upload().bucket(&self.bucket).key(key).upload_id(upload)
+        match self.client.complete_multipart_upload().bucket(&self.namespace.bucket).key(key).upload_id(upload)
             .if_none_match("*").multipart_upload(parts).set_request_payer(self.request_payer.clone()).send().await
         {
             Ok(output) => Ok(PublicationResult::Published { version: output.version_id().map(str::to_owned) }),
@@ -255,6 +310,82 @@ mod tests {
     use super::*;
     use rtdb_storage::ObjectStore;
     use crate::{S3Config, S3Credentials};
+
+    #[tokio::test]
+    async fn an_exact_version_retires_only_when_the_fresh_inventory_confirms_absence() {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let mut config = S3Config::new("cell");
+        config.endpoint = Some(endpoint.clone());
+        config.region = Some("us-east-1".into());
+        config.credentials = Some(S3Credentials { access_key: "test".into(), secret_key: "test-secret".into() });
+        let inventory = config.versioned_inventory(&ObjectKey::new("encoded root").unwrap(), &BTreeMap::new()).await.unwrap();
+        let key = ObjectKey::new("data/object").unwrap();
+        let observed = PhysicalObjectVersion {
+            namespace: S3ObjectNamespace { bucket: "cell".into(), endpoint: Some(format!("{endpoint}/")), region: config.region },
+            key: "encoded root/data/object".into(),
+            version: "old+/=".into(),
+        };
+        let provider_key = observed.key.clone();
+        let server = tokio::spawn(async move {
+            let present = "<IsTruncated>false</IsTruncated><Version><Key>encoded root/data/object</Key><VersionId>old+/=</VersionId></Version>";
+            let continued = "<IsTruncated>true</IsTruncated><NextKeyMarker>encoded root/data/object</NextKeyMarker><NextVersionIdMarker>new</NextVersionIdMarker><Version><Key>encoded root/data/object</Key><VersionId>new</VersionId></Version>";
+            let absent = "<IsTruncated>false</IsTruncated><Version><Key>encoded root/data/object-neighbor</Key><VersionId>old+/=</VersionId></Version>";
+            let incomplete = "<IsTruncated>true</IsTruncated><NextKeyMarker>encoded root/data/object</NextKeyMarker>";
+            for (method, status, page, cursor) in [
+                ("DELETE", "204 No Content", None, false),
+                ("GET", "200 OK", Some(present), false),
+                ("DELETE", "204 No Content", None, false),
+                ("GET", "200 OK", Some(incomplete), false),
+                ("DELETE", "204 No Content", None, false),
+                ("GET", "200 OK", Some(continued), false),
+                ("GET", "200 OK", Some(absent), true),
+            ] {
+                let (stream, _) = listener.accept().await.unwrap();
+                let mut reader = BufReader::new(stream);
+                let mut line = String::new();
+                reader.read_line(&mut line).await.unwrap();
+                let mut request = line.split_whitespace();
+                assert_eq!(request.next(), Some(method));
+                let url = url::Url::parse(&format!("http://localhost{}", request.next().unwrap())).unwrap();
+                let query: BTreeMap<_, _> = url.query_pairs().collect();
+                if method == "DELETE" {
+                    assert_eq!(url.path(), "/cell/encoded%20root/data/object");
+                    assert_eq!(query.get("versionId").map(|value| value.as_ref()), Some("old+/="));
+                } else {
+                    assert_eq!(query.get("prefix").map(|value| value.as_ref()), Some(provider_key.as_str()));
+                    assert_eq!(query.get("key-marker").map(|value| value.as_ref()), cursor.then_some(provider_key.as_str()));
+                    assert_eq!(query.get("version-id-marker").map(|value| value.as_ref()), cursor.then_some("new"));
+                }
+                while line != "\r\n" {
+                    line.clear();
+                    assert_ne!(reader.read_line(&mut line).await.unwrap(), 0);
+                }
+                let body = page.map(|page| format!("<ListVersionsResult>{page}</ListVersionsResult>")).unwrap_or_default();
+                let reply = format!("HTTP/1.1 {status}\r\nContent-Type: application/xml\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
+                reader.get_mut().write_all(reply.as_bytes()).await.unwrap();
+            }
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            for rejected in [
+                PhysicalObjectVersion { key: "encoded root/data/other".into(), ..observed.clone() },
+                PhysicalObjectVersion { namespace: S3ObjectNamespace { bucket: "other".into(), ..observed.namespace.clone() }, ..observed.clone() },
+                PhysicalObjectVersion { version: "null".into(), ..observed.clone() },
+            ] {
+                let error = inventory.retire_observed_version(&key, &rejected).await.expect_err("unbound retirement reached the provider");
+                assert_eq!(error.message.as_deref(), Some("The retirement does not identify an immutable version of this key"));
+            }
+            let error = inventory.retire_observed_version(&key, &observed).await.expect_err("a delete reply alone must not settle retirement");
+            assert_eq!(error.message.as_deref(), Some("The retired object version is still present"));
+            let error = inventory.retire_observed_version(&key, &observed).await.expect_err("an incomplete inventory must not settle retirement");
+            assert_eq!(error.message.as_deref(), Some("S3 returned an incomplete version listing marker"));
+            inventory.retire_observed_version(&key, &observed).await.expect("pagination must bind the key and version together");
+            server.await.unwrap();
+        }).await.unwrap();
+    }
 
     #[tokio::test]
     async fn versions_delete_markers_and_pending_uploads_are_purged_under_the_encoded_deployment_prefix() {
@@ -291,7 +422,8 @@ mod tests {
         let latest = client.put_object().bucket(&bucket).key(&physical_key)
             .body(ByteStream::from_static(b"new version")).send().await.unwrap();
         assert_ne!(initial.version_id(), latest.version_id());
-        client.delete_object().bucket(&bucket).key(&observed.key).version_id(&observed.version).send().await.unwrap();
+        inventory.retire_observed_version(&observed_key, &observed).await.unwrap();
+        inventory.retire_observed_version(&observed_key, &observed).await.unwrap();
         assert_eq!(cell.get(&observed_key).await.unwrap().as_ref(), b"new version");
         inventory.purge(&ObjectKey::new("observed").unwrap()).await.unwrap();
         cell.close_and_wait().await;

@@ -9,7 +9,7 @@ use tokio::io::{AsyncReadExt, AsyncSeekExt};
 
 #[path = "remote_version_step.rs"]
 mod version_step;
-use version_step::valid_object_version;
+pub use version_step::valid_object_version;
 
 /// A provider may still be copying when its completion can no longer be established.
 #[derive(Debug, thiserror::Error)]

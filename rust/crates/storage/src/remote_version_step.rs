@@ -7,6 +7,6 @@ use vstd::prelude::*;
     ensures accepted <==> version@.len() > 0
         && !(version@.len() == 4 && version@[0] == 110 && version@[1] == 117 && version@[2] == 108 && version@[3] == 108),
 ))]
-pub(super) fn valid_object_version(version: &[u8]) -> bool {
+pub fn valid_object_version(version: &[u8]) -> bool {
     !version.is_empty() && !(version.len() == 4 && version[0] == b'n' && version[1] == b'u' && version[2] == b'l' && version[3] == b'l')
 }

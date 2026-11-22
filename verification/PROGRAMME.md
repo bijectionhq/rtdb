@@ -83,7 +83,8 @@ Archive capture now acquires or inherits a source metadata hold and keeps it unt
 A model compares exact physical and whole-residence source holds and records the extra reclamation possible with exact holds.
 Archive and independent fork preparation now carry each planned provider version through the exact copy read, including for inherited packs and repairs.
 Durable repair archive admission now covers serving, recapture and transfer. Local copies keep the existing maintenance witness through provider completion.
-Durable exact-version admission and coordinated collection for the ordinary remote serving reaper remain open.
+The S3 adapter now executes and settles a removal addressed to an exact immutable object version.
+Durable authorization, admission across physical owners, and use of the adapter by the ordinary remote serving reaper remain open.
 
 **Start from:** `replication/src/{checkpoint_discovery,replay_floor,blocks}.rs`, `multi/src/{archive,recovery_holds,replica_retention}.rs`; models `tla/{RecoveryReplay,InstalledCheckpoint,Checkpoint,ResidenceRetirement}.tla`, `mcrl2/CheckpointDiscovery.mcrl2`.
 

@@ -656,6 +656,13 @@ A capability can carry the outcome of a decision.
 An authority or identity constraint must also preserve the outcome across any delay before effect.
 The collection study must cover trie data, trie metadata, shared artefacts, cached pathnames, checkpoint roots, table blocks, and log payloads with their own reachability rules.
 
+The versioned S3 adapter binds each removal to one immutable version in its configured namespace.
+It confirms absence with a complete fresh inventory for that key before accepting settlement.
+A redundant request can finish after settlement. Its effect is still limited to the original version.
+The retry study checks that interleaving, and the Lean model proves that exact removal preserves every other version.
+These results assume faithful exact removal and complete listing by the provider.
+The ordinary remote reaper still needs the durable authority that closes admission and orders collection across physical owners. link:../../verification/tla/ExactRetirementRetry.tla[Retirement retry model]
+
 The retained bounded study compared a validated lease and coordinated pin and exhibited age-only and stale-follower counterexamples.
 The first native cursor-and-collection diagnostic timed out waiting for a scheduled event.
 A later native diagnostic with an explicitly invoked eligible collector reproduced a missing required object in an open cursor.

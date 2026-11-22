@@ -2303,6 +2303,21 @@ rule PublishInventoryReceipt {
         Directory.cas(record.id, record.epoch, change: { lifecycle: deleted, deletion_record: proof })
 }
 
+rule SettleObservedS3Version {
+    -- Every retry sends the immutable identifier retained by the retirement authority.
+    -- Settlement uses a fresh, complete lookup scoped to the exact key and version.
+    when: ExactVersionRetirementContinued(retirement)
+
+    requires: PhysicalNamespaceMatches(retirement)
+    requires: PhysicalKeyMatches(retirement)
+    requires: ImmutableS3Version(retirement.version)
+
+    ensures:
+        DeleteExactS3Version(retirement.namespace, retirement.key, retirement.version)
+        if FreshVersionInventoryConfirmsAbsence(retirement.namespace, retirement.key, retirement.version):
+            ExactVersionRetirementSettled(retirement)
+}
+
 rule HostedCheckpointCapture {
     -- A new archive receipt covers the verified replay inventory.
     -- Shared group artefacts are recorded once. Required files must be available before the receipt is published.

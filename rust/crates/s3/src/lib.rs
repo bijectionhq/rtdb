@@ -128,7 +128,7 @@ impl S3Config {
         let namespace = S3ObjectNamespace {
             bucket: self.bucket.clone(),
             endpoint: endpoint.map(|endpoint| endpoint.to_string()),
-            region: builder.get_config_value(&AmazonS3ConfigKey::Region),
+            region: Some(builder.get_config_value(&AmazonS3ConfigKey::Region).unwrap_or_else(|| "us-east-1".into())),
         };
         let client = Arc::new(builder.build().map_err(|error| Anomaly::incorrect("xtdb.aws/invalid-config", error.to_string()))?);
         if !cell {
@@ -156,6 +156,7 @@ impl S3Config {
             .unwrap_or_else(|| "us-east-1".into());
         let requester_pays = environment.get_config_value(&AmazonS3ConfigKey::RequestPayer)
             .is_some_and(|value| matches!(value.to_ascii_lowercase().as_str(), "1" | "true" | "on" | "yes" | "y"));
+        let namespace = self.inventory_namespace(&region)?;
         let mut builder = aws_sdk_s3::config::Builder::new()
             .behavior_version(aws_config::BehaviorVersion::latest())
             .region(aws_config::Region::new(region))
@@ -163,7 +164,7 @@ impl S3Config {
             .force_path_style(!self.virtual_hosted(endpoint.as_ref()));
         let scope_multipart_listing = endpoint.is_none();
         builder.set_endpoint_url(endpoint.map(|endpoint| endpoint.to_string()));
-        Ok(VersionedInventory::new(aws_sdk_s3::Client::from_conf(builder.build()), self.bucket.clone(), root, requester_pays, scope_multipart_listing))
+        Ok(VersionedInventory::new(aws_sdk_s3::Client::from_conf(builder.build()), namespace, root, requester_pays, scope_multipart_listing))
     }
 
     #[cfg(feature = "versioning")]
@@ -184,13 +185,24 @@ impl S3Config {
         }
         let config = config.load().await;
         let region = config.region().cloned().unwrap_or_else(|| aws_config::Region::new(default_region()));
+        let namespace = self.inventory_namespace(region.as_ref())?;
         let mut builder = aws_sdk_s3::config::Builder::from(&config)
             .region(region)
             .force_path_style(!self.virtual_hosted(endpoint.as_ref()));
         // MinIO's multipart prefix query only returns exact key matches.
         let scope_multipart_listing = endpoint.is_none();
         builder.set_endpoint_url(endpoint.map(|endpoint| endpoint.to_string()));
-        Ok(VersionedInventory::new(aws_sdk_s3::Client::from_conf(builder.build()), self.bucket.clone(), root, requester_pays, scope_multipart_listing))
+        Ok(VersionedInventory::new(aws_sdk_s3::Client::from_conf(builder.build()), namespace, root, requester_pays, scope_multipart_listing))
+    }
+
+    #[cfg(feature = "versioning")]
+    fn inventory_namespace(&self, region: &str) -> Result<S3ObjectNamespace> {
+        let (endpoint, _) = self.endpoint_addressing()?;
+        Ok(S3ObjectNamespace {
+            bucket: self.bucket.clone(),
+            endpoint: endpoint.map(|endpoint| endpoint.to_string()),
+            region: Some(region.to_owned()),
+        })
     }
 
     fn configured_endpoint(&self) -> Result<Option<url::Url>> {

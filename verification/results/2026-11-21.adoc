@@ -2731,3 +2731,35 @@ The log is `/private/tmp/rtdb-formal.QMjPSJsX/repair-custody-f740-property.log`.
 The archive argument depends on retirement actors honoring both custody slots.
 Local serving-object collection shares the maintenance witness.
 The ordinary remote serving collector still needs durable per-version authorization and a provider settlement rule across all physical owners.
+
+=== Exact S3 retirement and provider settlement
+
+The adapter validates the namespace and the physical key against its own configuration before forming a version-qualified removal.
+Empty or replaceable `null` identifiers cannot authorize this provider operation.
+The adapter reads a fresh inventory for that exact key and version before returning success.
+A listing that still contains the version, has malformed continuation evidence, or fails to establish absence leaves the operation pending for retry.
+The provider premise is that qualified deletion names only the addressed immutable version and that a complete inventory includes the addressed version while present.
+This premise excludes reuse of immutable version identifiers.
+
+TLC revision `bc1b506` explored all 152 states for two removal submissions and up to two replacements.
+The path-only, reply-only, and incomplete-inventory controls violated their declared invariants.
+The reachability check found a redundant removal completing after settlement with a replacement already present.
+Apalache 0.63.0 checked safety through ten transitions and reproduced the partial-inventory counterexample.
+Lean 4.36.0 checked four theorems for arbitrary keys and version identities, including idempotence and preservation of other versions.
+Removing the version clause or weakening the inventory premise broke its declared theorem.
+The records are under `/private/tmp/rtdb-formal.QMjPSJsX/exact-retirement-formal-_0xdtvxt/`. link:../tla/ExactRetirementRetry.tla[Retry model] link:../lean/ExactRetirementRetry.lean[Exact retirement laws]
+
+The native loopback test passed with the SDK request and listing response, and all four removal controls failed at their declared assertions.
+The existing observation replay also passed and rejected its invalid-identifier control.
+Their records are under `/private/tmp/rtdb-formal.QMjPSJsX/s3-exact-retirement-native-4srsf8gd/`.
+The combined Verus run passed all 38 areas and matched all 193 controls, including the shared immutable-version check.
+The records are under `/private/tmp/rtdb-formal.QMjPSJsX/exact-retirement-verus-t82dvaho/`.
+The S3 and storage Rust suites passed 132 exercised cases. Two environment-gated cases returned before their MinIO exchanges because no endpoint was configured.
+The log is `/private/tmp/rtdb-formal.QMjPSJsX/s3-exact-retirement-rust.log`.
+The combined JVM command passed 3,198 standard tests and 3,348 property cases with no failures, errors or skips.
+The property run recorded 100 iterations each for 33 core simulation methods.
+Both suites used the rebuilt FFI library with SHA-256 `70e40dcaa6a140da5215d9d9fc82ca7c6d33d10213ff48c73efa5cb52d4feca2`.
+The log is `/private/tmp/rtdb-formal.QMjPSJsX/s3-exact-retirement-jvm.log`.
+
+The ordinary remote collector still needs durable per-version authorization, physical-owner admission and integration of the provider settlement operation.
+The closed-prefix purge retains its existing authority and settlement rules.

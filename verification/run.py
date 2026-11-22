@@ -1466,6 +1466,21 @@ def verify_checkpoint_copy_evidence(args, scratch):
     verify_lean_model(args, scratch, path, "checkpoint-copy-evidence", controls, 4)
 
 
+def verify_exact_retirement_retry(args, scratch):
+    path = Path("verification/lean/ExactRetirementRetry.lean")
+    controls = {
+        "ignore-version": (
+            "¬ (listedKey = key ∧ listedVersion = version)", "¬ (listedKey = key)",
+            ["an_exact_removal_preserves_other_versions"],
+        ),
+        "trust-incomplete-inventory": (
+            "  actual key version → listed key version", "  listed key version → actual key version",
+            ["a_complete_negative_observation_establishes_absence"],
+        ),
+    }
+    verify_lean_model(args, scratch, path, "exact-retirement-retry", controls, 4)
+
+
 def verify_checkpoint_source_handoff(args, scratch):
     path = Path("verification/lean/CheckpointSourceHandoff.lean")
     controls = {
@@ -1748,6 +1763,7 @@ def verify_lean(args, scratch):
             verify_checkpoint_source_handoff(args, scratch)
             verify_checkpoint_copy_evidence(args, scratch)
             verify_repair_archive_custody(args, scratch)
+            verify_exact_retirement_retry(args, scratch)
             verify_published_checkpoint(args, scratch)
             verify_checkpoint_table_manifest(args, scratch)
             verify_pack_publication_lean(args, scratch)
@@ -2054,6 +2070,15 @@ TLA_CASES = (
      ("INVARIANT Safe", "INVARIANT NeverCompletesAfterStopWithReplacementHeld"), "NeverCompletesAfterStopWithReplacementHeld"),
     ("SourceRetirementSettlement", "source-retirement-replacement-witness",
      ("INVARIANT Safe", "INVARIANT NeverSettlesThenAdmitsReplacement"), "NeverSettlesThenAdmitsReplacement"),
+    ("ExactRetirementRetry", "exact-retirement-retry", None, None),
+    ("ExactRetirementRetry", "exact-retirement-delete-by-path",
+     ('Mutation = "none"\nINVARIANT Safety', 'Mutation = "remove_path"\nINVARIANT ReplacementSurvivesRemoval'), "ReplacementSurvivesRemoval"),
+    ("ExactRetirementRetry", "exact-retirement-trust-reply",
+     ('Mutation = "none"\nINVARIANT Safety', 'Mutation = "accept_mutation_reply"\nINVARIANT SettlementRequiresExactAbsence'), "SettlementRequiresExactAbsence"),
+    ("ExactRetirementRetry", "exact-retirement-trust-partial-inventory",
+     ('Mutation = "none"\nINVARIANT Safety', 'Mutation = "accept_unfinished_inventory"\nINVARIANT SettlementRequiresExactAbsence'), "SettlementRequiresExactAbsence"),
+    ("ExactRetirementRetry", "exact-retirement-late-retry-witness",
+     ("INVARIANT Safety", "INVARIANT NeverCompletesAfterSettlement"), "NeverCompletesAfterSettlement"),
     ("CheckpointCopyEvidence", "checkpoint-copy-evidence", None, None),
     ("CheckpointCopyEvidence", "checkpoint-copy-trust-only-version-token",
      ('Mutation = "none"\nINVARIANT Safe', 'Mutation = "trust_version_token"\nINVARIANT PlanMatchesBody'), "PlanMatchesBody"),
@@ -2561,6 +2586,10 @@ def verify_apalache(args, scratch):
     check_apalache(args, scratch, "SourceRetirementSettlement", "source-retirement-delete-by-current-path",
                    "ReplacementSurvives", 9, ('Mutation = "none"', 'Mutation = "delete_by_current_path"'),
                    "a delayed delete resolves the newly published version by its path")
+    check_apalache(args, scratch, "ExactRetirementRetry", "exact-retirement-retry", "Safety", 10)
+    check_apalache(args, scratch, "ExactRetirementRetry", "exact-retirement-trust-partial-inventory",
+                   "SettlementRequiresExactAbsence", 10, ('Mutation = "none"', 'Mutation = "accept_unfinished_inventory"'),
+                   "an incomplete inventory settles an object version that still exists")
     check_apalache(args, scratch, "CheckpointCopyEvidence", "checkpoint-copy-evidence", "Safe", 5)
     check_apalache(args, scratch, "CheckpointCopyEvidence", "checkpoint-copy-trust-only-version-token",
                    "PlanMatchesBody", 5, ('Mutation = "none"', 'Mutation = "trust_version_token"'),
@@ -3357,6 +3386,50 @@ def verify_s3_object_version(args, source):
     finally:
         adapter.write_bytes(original)
     print("rust-s3-object-version: loopback HEAD passed, bypassing validation failed")
+
+
+def verify_s3_exact_retirement(args, source):
+    env = os.environ | {
+        "CARGO_TARGET_DIR": os.environ.get("CARGO_TARGET_DIR", str(ROOT / "target")),
+        "CARGO_PROFILE_TEST_DEBUG": "0",
+    }
+    test = "versions::tests::an_exact_version_retires_only_when_the_fresh_inventory_confirms_absence"
+    command = ["cargo", "test", "--locked", "-p", "rtdb-s3", "--features", "versioning", "--lib", test, "--", "--exact"]
+    baseline = run_case(command, source / "rust", args.evidence, "rust-s3-exact-retirement-baseline", env)
+    if baseline.returncode or f"{test} ... ok" not in baseline.stdout or "1 passed; 0 failed" not in baseline.stdout:
+        raise ValueError("the exact S3 retirement replay did not pass")
+
+    adapter = source / "rust/crates/s3/src/versions.rs"
+    original = adapter.read_bytes()
+    controls = {
+        "trust-delete-reply": (
+            "if self.contains_version(path.as_ref(), &observed.version).await? {",
+            "if false {", "a delete reply alone must not settle retirement",
+        ),
+        "forget-request-version": (
+            ".key(path.as_ref()).version_id(&observed.version)",
+            ".key(path.as_ref())", 'right: Some("old+/=")',
+        ),
+        "accept-partial-inventory": (
+            "Some(true) => {},\n                None => return Err(unavailable(\"S3 omitted",
+            "Some(true) => return Ok(false),\n                None => return Err(unavailable(\"S3 omitted",
+            "an incomplete inventory must not settle retirement",
+        ),
+        "trust-version-without-key": (
+            "if listed_key == key && listed_version == version {", "if listed_version == version {",
+            "pagination must bind the key and version together",
+        ),
+    }
+    for name, (before, after, expected) in controls.items():
+        try:
+            replace_once(adapter, before, after)
+            checked = run_case(command, source / "rust", args.evidence, f"rust-s3-exact-retirement-{name}", env)
+            if (checked.returncode != 101 or f"{test} ... FAILED" not in checked.stdout
+                or expected not in checked.stdout or "0 passed; 1 failed" not in checked.stdout):
+                raise ValueError(f"{name}: the exact retirement control did not fail at its declared assertion")
+        finally:
+            adapter.write_bytes(original)
+    print("rust-s3-exact-retirement: loopback replay passed and four controls failed as expected")
 
 
 def verify_replay_prefix(args, source):
@@ -4357,6 +4430,7 @@ def main():
             verify_catalog_admission_floor(args, source)
             verify_trie_naming_epoch(args, source)
             verify_s3_object_version(args, source)
+            verify_s3_exact_retirement(args, source)
             verify_compaction_publication_versions(args, source)
             verify_replay_prefix(args, source)
             verify_multi_trim_admission(args, source)
