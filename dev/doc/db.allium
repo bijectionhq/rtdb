@@ -684,6 +684,7 @@ config {
 -- Opening a directory receipt verifies fresh root bytes before loading table metadata.
 -- An ordinary startup admits the root metadata and first required replica offset in one directory update.
 -- The startup grant lasts through cursor admission and the drain of the provider reads it owns.
+-- A delivered record in the admitted replay interval retains the grant while a referenced payload is fetched, including after cancellation of its caller.
 -- Those files remain required until follower adoption.
 -- A failed historical check or older candidate preparation discards the remaining older confirmations.
 -- The writer continues recovery of the selected checkpoint.

@@ -17,7 +17,6 @@ v2.2: replica-log messages over `max.message.bytes` go to object storage
   - **Upgrade every node before a message large enough to be offloaded can occur.**
     A node older than v2.2 does not recognise the reference record and skips it, which leaves that replica silently missing the transaction.
     In a rolling upgrade this matters only if an oversized message lands mid-roll; upgrading all nodes first removes the window.
-  - Offloaded payloads are collected on the same `blocksToKeep` horizon as block files, so a node lagging more than `blocksToKeep` blocks may fail to fetch one. Raise `blocksToKeep` if followers routinely lag that far.
 
 v2.2: `groupId` and `termEpoch` removed
 
@@ -141,9 +140,8 @@ A message like that can exceed `max.message.bytes` on a topic sized for ordinary
 The indexing leader writes such a message to object storage and appends a reference to it on the replica log instead.
 Followers resolve the reference as they apply the record, so indexing is not bounded by the topic's message cap.
 
-These payloads are collected alongside block files, on the [`blocksToKeep`](/ops/config#garbage-collector) horizon.
-A follower lagging more than `blocksToKeep` blocks behind can find a payload already collected; rather than skipping the record, it stops consuming and reports the database as unhealthy until it is restarted.
-Raise `blocksToKeep` where followers routinely lag that far.
+Block collection preserves offloaded payloads, since a follower may still need them to apply retained replica records.
+The [`blocksToKeep`](/ops/config#garbage-collector) setting governs checkpoint metadata.
 
 The source log is not covered: a client transaction larger than the cap is rejected when it is submitted, and the `TriesAdded` records the indexer and compactor post there are subject to the cap in their own right.
 

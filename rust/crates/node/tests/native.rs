@@ -2250,7 +2250,7 @@ async fn a_trusted_checkpoint_and_replica_journal_rebuild_after_l0_is_removed() 
 
 #[tokio::test]
 async fn an_installed_repair_base_keeps_older_targets_and_offloaded_replay_through_collection() {
-    use rtdb_format::{catalog::BlockCatalog, keys::{block_key, oversized_block_index, oversized_key}};
+    use rtdb_format::{catalog::BlockCatalog, keys::{block_key, oversized_block_index}};
 
     let directory = tempfile::tempdir().unwrap();
     let source_storage = directory.path().join("source");
@@ -2333,8 +2333,6 @@ async fn an_installed_repair_base_keeps_older_targets_and_offloaded_replay_throu
     let sql = "SELECT count(*) FROM docs";
     let expected = rows(session.query_sql(sql, vec![]).await.unwrap()).await;
     assert_eq!(expected, vec![vec![Value::I64(3002)]]);
-    let sentinel = objects.join(oversized_key(old.block_index(), "unreferenced").unwrap());
-    std::fs::write(&sentinel, []).unwrap();
     session.state_mut().execute_operation(put(&node, -3, -3)).await.unwrap();
     let replacement = flush(&database).await;
     let await_collection = async |path: &std::path::Path| {
@@ -2342,8 +2340,7 @@ async fn an_installed_repair_base_keeps_older_targets_and_offloaded_replay_throu
             while path.exists() { tokio::time::sleep(Duration::from_millis(5)).await; }
         }).await.unwrap();
     };
-    await_collection(&sentinel).await;
-    assert!(!objects.join(block_key(old.block_index()).unwrap()).exists());
+    await_collection(&objects.join(block_key(old.block_index()).unwrap())).await;
     let root = objects.join(block_key(through.block_index()).unwrap());
     assert!(root.exists());
     for entry in through.table_entries().unwrap() {
@@ -2403,8 +2400,8 @@ async fn an_installed_repair_base_keeps_older_targets_and_offloaded_replay_throu
     let mut session = node.session("xtdb", Arc::new(Authority)).unwrap();
     session.state_mut().execute_operation(put(&node, -4, -4)).await.unwrap();
     assert!(flush(&database).await.block_index() > replacement.block_index());
-    await_collection(&payload).await;
-    assert!(!root.exists());
+    await_collection(&root).await;
+    assert!(payload.exists());
     drop((session, database));
     stop(&node, driver).await;
 }

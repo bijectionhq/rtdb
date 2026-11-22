@@ -1070,6 +1070,7 @@ impl GarbageStore {
             for object in self.inner.list(Some(&ObjectKey::new(GARBAGE_DIRECTORY).map_err(|error| Error::Task(error.to_string()))?)).await? {
                 if let Ok(release) = serde_json::from_slice::<StoredRelease>(&self.inner.get(&object.key).await?) {
                     let (record, version) = release.into_parts();
+                    if record.key.starts_with("oversized/") { continue; }
                     if let Some(readers) = &self.catalog_readers {
                         match &record.trie_floor {
                             Some(floor) if !readers.matches_release(floor) => continue,
@@ -1124,6 +1125,7 @@ fn is_collected_trie_file(key: &str) -> bool {
 }
 
 fn permits_release(record: &DeploymentRecord, store: &str, release: &GarbageRecord) -> bool {
+    if release.key.starts_with("oversized/") { return false; }
     let Some(required) = &release.trie_floor else {
         return record.storage_namespaces.is_none() || !is_collected_trie_file(&release.key);
     };
@@ -1203,6 +1205,9 @@ impl ObjectStore for GarbageStore {
         Ok(objects.into_iter().filter(|object| !object.key.as_str().starts_with(GARBAGE_DIRECTORY) && !released.contains_key(&object.key)).collect())
     }
     async fn delete(&self, key: &ObjectKey) -> rtdb_storage::Result<()> {
+        if key.as_str().starts_with("oversized/") {
+            return Err(Error::Remote { key: key.to_string(), message: "An offloaded replica payload belongs to the retained journal".into() });
+        }
         if self.catalog_readers.is_some() && is_collected_trie_file(key.as_str()) {
             return Err(Error::Remote { key: key.to_string(), message: "A hosted trie file requires an installed retirement receipt".into() });
         }
@@ -2115,6 +2120,26 @@ mod tests {
         assert!(!raw.get(&key("blocks/b00.binpb")).await.unwrap().windows(6).any(|window| window == b"secret"), "nothing is stored in the clear");
         assert!(EncryptingStore::new(Arc::clone(&raw), &[8; 32]).unwrap().get(&key("blocks/b00.binpb")).await.is_err(), "another key cannot read it");
         store.put(&key("blocks/b00.binpb"), Bytes::from_static(b"secret rows")).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn the_reaper_preserves_replica_payloads_named_by_legacy_age_based_releases() {
+        let bucket = Arc::new(MemoryStore::default());
+        let record = DeploymentRecord::new("shop", "acme", vec![], 0);
+        let scope = format!("{}/v06", record.storage_prefix());
+        let store = open_deployment_store(bucket.clone(), &scope, crate::packing::PackDiscovery::List, wall_clock()).await.unwrap();
+        let payload = key("oversized/b00-payload.binpb");
+        store.put(&payload, Bytes::from_static(b"retained replica payload")).await.unwrap();
+        assert!(store.delete(&payload).await.is_err());
+
+        let release = GarbageRecord { key: payload.to_string(), released_at_ms: 0, trie_floor: None };
+        let marker = key(&format!("{scope}/{GARBAGE_DIRECTORY}/{:020}-{}", 0, Uuid::nil().simple()));
+        bucket.put(&marker, serde_json::to_vec(&release).unwrap().into()).await.unwrap();
+
+        let refs = crate::reference::References::default();
+        assert_eq!(reap_as_of(bucket.as_ref(), &record, 1, Duration::ZERO, &refs).await.unwrap().erased, 0);
+        assert_eq!(store.get(&payload).await.unwrap(), Bytes::from_static(b"retained replica payload"));
+        assert!(store.list(Some(&key("oversized"))).await.unwrap().iter().any(|object| object.key == payload));
     }
 
     #[tokio::test]

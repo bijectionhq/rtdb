@@ -3,7 +3,7 @@ use std::sync::Arc;
 use bytes::Bytes;
 use rtdb_columnar::{MemoryBudget, MemoryReservation};
 use rtdb_format::{envelope::{ReplicaBody, ReplicaEnvelope, ReplicaFrame, SourceMessage}, keys::oversized_key, log::proto};
-use rtdb_storage::{Error as StorageError, ObjectKey, ObjectStore, cache::BufferPool, log::{AppendReceipt, Log, LogMetadata, LogOffset, LogRecord, LogTail}};
+use rtdb_storage::{Error as StorageError, IoRegion, ObjectKey, ObjectStore, cache::BufferPool, log::{AppendReceipt, Log, LogMetadata, LogOffset, LogRecord, LogTail}};
 use rtdb_types::{Anomaly, BlockIndex, ReplicaPosition, Result, SourcePosition, StorageEpoch, StorageVersion, Term, TermSequence, Timestamp};
 
 use crate::readback_identity::{ReplicaFingerprint, fingerprint};
@@ -17,6 +17,7 @@ pub struct ReplicaRecord {
     pub envelope: Arc<ReplicaEnvelope>,
     reservation: Arc<MemoryReservation>,
     pub(crate) fingerprint: Option<ReplicaFingerprint>,
+    oversized_delivery: Option<Bytes>,
 }
 impl ReplicaRecord { pub fn retained_bytes(&self) -> usize { self.reservation.bytes() } }
 
@@ -163,16 +164,21 @@ impl PartitionLogs {
         let Some(envelope) = frame.into_envelope() else { return Ok(DecodedReplica::Unrecognized { term, sequence }); };
         let fingerprint = (Some(term) == own_term && matches!(&envelope.message, ReplicaBody::ResolvedTx(_) | ReplicaBody::OversizedMessage(_)))
             .then(|| fingerprint(&record.payload));
-        Ok(DecodedReplica::Known(ReplicaRecord { metadata, envelope: Arc::new(envelope), reservation, fingerprint }))
+        let oversized_delivery = matches!(&envelope.message, ReplicaBody::OversizedMessage(_)).then_some(record.payload);
+        Ok(DecodedReplica::Known(ReplicaRecord { metadata, envelope: Arc::new(envelope), reservation, fingerprint, oversized_delivery }))
     }
     /// Admission runs on the outer envelope before this fetch; a held block receives the resolved body.
-    pub async fn resolve_oversized(&self, record: ReplicaRecord) -> Result<ReplicaRecord> {
+    pub async fn resolve_oversized(&self, mut record: ReplicaRecord) -> Result<ReplicaRecord> {
         let Some(key) = record.envelope.oversized_payload(self.storage_version, self.storage_epoch)? else { return Ok(record); };
-        let lease = self.cache.get(&ObjectKey::new(key)?).await?;
+        let delivery = record.oversized_delivery.take().ok_or_else(|| Anomaly::fault(
+            "rtdb.replication/oversized-delivery", "An offloaded replica record has no admitted delivery",
+        ))?;
+        let key = ObjectKey::new(key)?;
+        let lease = IoRegion::retaining(Arc::new(delivery), self.cache.get(&key)).await?;
         let reservation = self.memory.reserve(replica_decode_bound(lease.as_slice().len())?)?;
         let envelope = record.envelope.unwrap_payload(lease.as_slice())?;
         let fingerprint = record.fingerprint.map(|_| fingerprint(lease.as_slice()));
-        Ok(ReplicaRecord { metadata: record.metadata, envelope: Arc::new(envelope), reservation, fingerprint })
+        Ok(ReplicaRecord { metadata: record.metadata, envelope: Arc::new(envelope), reservation, fingerprint, oversized_delivery: None })
     }
 }
 

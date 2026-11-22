@@ -362,7 +362,7 @@ impl Log for SealedLog {
             None => None,
         };
         Ok(self.inner.recovery_tail(after).await?.map(|inner| {
-            Box::new(SealedTail { inner, cipher: Arc::clone(&self.cipher), stream: Arc::clone(&self.stream), hold }) as Box<dyn LogTail>
+            Box::new(SealedTail { inner, cipher: Arc::clone(&self.cipher), stream: Arc::clone(&self.stream), hold: hold.map(Arc::new) }) as Box<dyn LogTail>
         }))
     }
     async fn tail(&self, after: LogOffset) -> rtdb_storage::Result<Box<dyn LogTail>> {
@@ -380,24 +380,24 @@ struct SealedTail {
     inner: Box<dyn LogTail>,
     cipher: Arc<Cipher>,
     stream: Arc<str>,
-    hold: Option<ReplayHold>,
+    hold: Option<Arc<ReplayHold>>,
 }
 
 impl SealedTail {
-    fn delivered(&mut self, offset: LogOffset) {
-        if self.hold.as_ref().is_some_and(|hold| offset >= hold.through) {
-            self.hold = None;
+    fn open_record(&mut self, record: LogRecord) -> rtdb_storage::Result<LogRecord> {
+        let mut record = opened(&self.cipher, &self.stream, record)?;
+        if let Some(hold) = &self.hold {
+            record.payload = hold.retain_delivery(record.payload);
+            if record.metadata.offset >= hold.through { self.hold = None; }
         }
+        Ok(record)
     }
 }
 
 #[async_trait]
 impl LogTail for SealedTail {
     async fn poll(&mut self, timeout: Duration) -> rtdb_storage::Result<Vec<LogRecord>> {
-        let records = self.inner.poll(timeout).await?.into_iter().map(|record| opened(&self.cipher, &self.stream, record))
-            .collect::<rtdb_storage::Result<Vec<_>>>()?;
-        if let Some(last) = records.last() { self.delivered(last.metadata.offset); }
-        Ok(records)
+        self.inner.poll(timeout).await?.into_iter().map(|record| self.open_record(record)).collect()
     }
     fn replay(&mut self) -> Option<&mut dyn LogReplayTail> { if self.inner.replay().is_some() { Some(self) } else { None } }
 }
@@ -411,9 +411,7 @@ impl LogReplayTail for SealedTail {
     async fn read_head(&mut self, head: ReplayHead, reservation: ReadReservation) -> rtdb_storage::Result<LogRecord> {
         let sealed = ReplayHead { payload_len: head.payload_len + SEALED_OVERHEAD, ..head };
         let record = self.inner.replay().expect("checked when replay was offered").read_head(sealed, reservation).await?;
-        let record = opened(&self.cipher, &self.stream, record)?;
-        self.delivered(record.metadata.offset);
-        Ok(record)
+        self.open_record(record)
     }
 }
 
