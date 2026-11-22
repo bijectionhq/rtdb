@@ -167,3 +167,49 @@ Commands and logs are retained under `/private/tmp/rtdb-formal.QMjPSJsX/`.
 * `exact-marker-custody-rybqv9w3/` has the inherited-read replay and controls.
 * `exact-marker-combined-fd3fsewo/` has the complete formal runs and their tool command records.
 * `exact-marker-jvm.log` and `exact-marker-s3-integration.log` have the Gradle results.
+
+== W2, R5 and R9 · Hosted packs and the local removal boundary
+
+Production changes `9104176e6` and `6a1a4f6ee`. Publication-identity comparison `e22d6956d`.
+Hosted checkpoint metadata packs now stay in storage until a newer same-store checkpoint is published, the owner checks its recovery holds and references, and mature releases cover all members of the same provider version.
+After removing that version, the reaper can settle remaining markers by confirming the original version is absent.
+The local-volume path reaper is private to Multi's maintenance code. The public simulator control takes only an in-memory store.
+
+[cols="1,4",options="header"]
+|===
+|Evidence | Result
+
+|TLC and Apalache
+|The hosted pack model explored 616 states. Seven safety mutations produced counterexamples, and the reachability check found residual marker settlement with a replacement still present. Apalache independently checked eight transitions and found the incomplete-coverage counterexample.
+The publication-identity model explored 6 states for terminal keys and 18 for atomic publication identity. Both preserved the replacement property. The tag-only variant failed, and the reachability checks confirmed fresh-key publication and preservation across a same-key replacement.
+The combined run at `e22d6956d` passed all 406 TLC and 68 Apalache cases.
+
+|Lean and Verus
+|Lean checks the maximum-member bound for arbitrary blocks and holds. Its matching control fails at that theorem.
+Verus checks the production checkpoint retention predicate used at the physical-owner CAS. The area verified 13 functions and laws and rejected all eight controls, including the weakened code and contract together.
+The combined run passed 67 Lean proof cases, all 41 production Verus areas and 225 Verus controls.
+
+|Rust and compile-fail
+|The pack change passed 498 scoped tests with 11 ignored. The production replay exercised incomplete coverage, a held checkpoint, a stale release and an absent exact version with a replacement present. Three pack controls and both existing exact marker controls failed at their declared assertions.
+The local API change passed 272 scoped tests with 10 ignored. Both prohibited calls fail to compile and compile under their corresponding control.
+
+|JVM and adapter integration
+|On the pack change, all 3,198 standard cases, 3,348 property cases and 12 focused S3 proxy integration cases passed.
+The FFI SHA-256 was `0b7f18375ac27e9d12cdd03b163c2e728447bd7fc398176ecbaa39f933a0bac3`.
+
+|Other design checks
+|The combined run also passed the configured Alloy, Maude, mCRL2, AutoHyper, SMT and OpenJML cases.
+|===
+
+The pack replay uses an in-memory provider with immutable publication identities. The S3 adapter replay separately checks versioned request and settlement behavior through loopback HTTP.
+Live S3, mixed-content packs, legacy path-only pack releases, never-versioned serving adapters and the full composed residence contract remain open.
+
+=== Reproduction
+
+The repository runner includes the bounded models, exact Rust predicates, native replay and compile-fail controls.
+Local evidence under `/private/tmp/rtdb-formal.QMjPSJsX/`:
+
+* `publication-tag-combined-e22d6956d/` has the combined proof run, tool hashes and commands.
+* `pack-exact-native-cy326ms7/` has the scoped Rust, DynamoDB Local 3.3.2, native mutations and FFI builds.
+* `reaper-boundary-native-8qk_n5e5/` has the API boundary and scoped Rust results.
+* The Gradle logs are `build/test-run.log` and `build/pack-exact-s3-integration.log` in `/private/tmp/rtdb-publication-version.5mfxM4cf/`.
