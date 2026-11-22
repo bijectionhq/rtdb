@@ -5,7 +5,8 @@ use std::time::{Duration, Instant};
 
 use rtdb_columnar::read_value;
 use rtdb_format::data::StoredOperation;
-use rtdb_node::{NativeSession, Node};
+use rtdb_format::database::proto::{DatabaseConfig, LocalLog, LocalStorage, database_config};
+use rtdb_node::{Membership, NativeSession, NativeResources, Node};
 use rtdb_query::{PreparedQuery, QueryContext};
 use rtdb_storage::cache::BufferPool;
 use rtdb_tx::{Documents, EntityIds, TxOp};
@@ -182,6 +183,7 @@ async fn compare_routes(
                     "returned": warm_rows.len(), "recall": compare(&expected, &warm_rows), "cold": cold, "warm": warm}));
             }
         }
+        eprintln!("completed query {}/{} against the captured basis", number + 1, query_count);
     }
     samples
 }
@@ -244,14 +246,29 @@ async fn churn(node: &Node, session: &mut NativeSession, captured: &CapturedInde
         "all_probes": all_probes, "samples": samples})
 }
 
-async fn fixture(data: Embeddings, query_count: usize, filters: &[Filter], probes: &[usize], churn_only: bool) -> Json {
+async fn fixture(data: Embeddings, query_count: usize, filters: &[Filter], probes: &[usize], workload: &str, file_backed: bool) -> Json {
     let count = data.clusters.len();
     let table = TableRef::new("public", "vectors");
     let clock = Arc::new(TickClock(AtomicI64::new(1_000_000)));
+    let scratch = tempfile::tempdir().unwrap();
     let mut options = bench_options();
     options.cache_bytes = 512 << 20;
     options.execution_memory_bytes = 2 << 30;
-    let (node, driver) = Node::open(options, bench_services(&clock)).await.unwrap();
+    let mut services = bench_services(&clock);
+    if file_backed {
+        let primary = DatabaseConfig {
+            storage: Some(database_config::Storage::LocalStorage(LocalStorage {
+                path: Some(scratch.path().join("table-store").to_str().unwrap().into()), epoch: Some(0),
+            })),
+            log: Some(database_config::Log::LocalLog(LocalLog {
+                path: Some(scratch.path().join("table-log").to_str().unwrap().into()), epoch: Some(0),
+            })),
+            ..Default::default()
+        };
+        options.membership = Membership::Durable { primary, skipped: BTreeSet::new() };
+        services.resources = Arc::new(NativeResources::default().with_local_log_clock(clock, false));
+    }
+    let (node, driver) = Node::open(options, services).await.unwrap();
     let driver = tokio::spawn(driver.run());
     let mut session = node.session("xtdb", Arc::new(Identity)).unwrap();
     commit(&mut session, vec![
@@ -259,29 +276,31 @@ async fn fixture(data: Embeddings, query_count: usize, filters: &[Filter], probe
         sql("CREATE INDEX vectors_cluster ON vectors (cluster_group)"),
     ]).await;
     let load = Instant::now();
-    for offset in (0..count).step_by(2000) {
-        let docs = (offset..(offset + 2000).min(count)).map(|id| {
+    let batch = if file_backed { 5_000 } else { 2_000 };
+    for offset in (0..count).step_by(batch) {
+        let docs = (offset..(offset + batch).min(count)).map(|id| {
             let (random, cluster) = index::groups(id, data.clusters[id]);
             document(id as i64, data.vector(id), random, cluster)
         }).collect();
         put(&node, &mut session, &table, docs, VALID_AT, None).await;
-        if (offset + 2000) % 20_000 == 0 { flush(&node).await; }
+        if (offset + batch) % 20_000 == 0 { flush(&node).await; }
     }
     flush(&node).await;
     let load_ms = load.elapsed().as_secs_f64() * 1000.0;
+    eprintln!("loaded {count} vectors in {load_ms:.0} ms");
     let database = node.catalog().database("xtdb").unwrap();
     let ordered_started = Instant::now();
     database.build_artefacts().await.unwrap();
     let ordered_ms = ordered_started.elapsed().as_secs_f64() * 1000.0;
+    eprintln!("built ordered indexes in {ordered_ms:.0} ms");
     let active = session.query_context().await.unwrap();
     let coverage = Coverage::capture(&active, &table, count);
-    let scratch = tempfile::tempdir().unwrap();
     let build = Instant::now();
     let index = VectorIndex::build(&data, scratch.path()).await;
     let build_ms = build.elapsed().as_secs_f64() * 1000.0;
     let cache = index.warm_cache().await;
     let captured_index = CapturedIndex { table: &table, coverage: &coverage, index: &index, cache: &cache };
-    let samples = if churn_only { Vec::new() } else {
+    let samples = if workload == "vectors-churn" { Vec::new() } else {
         compare_routes(&active, &captured_index, &data, query_count, filters, probes).await
     };
 
@@ -319,10 +338,11 @@ async fn fixture(data: Embeddings, query_count: usize, filters: &[Filter], probe
     assert!(later.iter().any(|row| row[0] == Value::I64(-1)));
     assert!(later.iter().any(|row| row[0] == Value::I64(affected)));
 
-    let churn = if churn_only {
-        churn(&node, &mut session, &captured_index, &data, query_count, filters, probes).await
+    let churn = if workload != "vectors" {
+        eprintln!("running churn replay");
+        churn(&node, &mut session, &captured_index, &data, query_count.min(4), filters, probes).await
     } else { Json::Null };
-    let expected = if churn_only {
+    let expected = if !churn.is_null() {
         let captured = session.query_context().await.unwrap();
         search(&captured, query, VALID_AT, Filter::All, None).await
     } else { expected };
@@ -336,16 +356,18 @@ async fn fixture(data: Embeddings, query_count: usize, filters: &[Filter], probe
     tokio::time::timeout(Duration::from_secs(30), driver).await.unwrap().unwrap().unwrap();
 
     json!({"documents": count, "dimensions": data.dimensions, "queries": query_count,
+        "primary_storage": if file_backed { "local" } else { "memory" },
         "load_ms": load_ms, "ordered_build_ms": ordered_ms, "ann_build_ms": build_ms,
         "index_bytes": index.bytes, "iid_lookup_bytes": index.lookup_bytes(),
         "tail_insert_ms": update_ms, "temporal_canaries": 5, "samples": samples, "churn": churn})
 }
 
-pub(super) async fn run(path: &Path, queries: usize, churn_only: bool) {
+pub(super) async fn run(path: &Path, queries: usize, workload: &str, file_backed: bool) {
     let data = Embeddings::read(path);
     assert!(queries > 0 && queries <= data.queries.len() / data.dimensions);
     let filters = [Filter::All, Filter::RandomBelow(1), Filter::RandomBelow(10), Filter::RandomBelow(100), Filter::ClusterBelow(10)];
-    println!("{}", fixture(data, queries, &filters, &[8, 32], churn_only).await);
+    let file_backed = file_backed || data.clusters.len() >= 1_000_000;
+    println!("{}", fixture(data, queries, &filters, &[8, 32], workload, file_backed).await);
 }
 
 #[cfg(test)]
@@ -361,7 +383,7 @@ mod tests {
             clusters: (0..96).map(|row| row % 2).collect(),
             dimensions: 2,
         };
-        let report = fixture(data, 1, &[Filter::All, Filter::RandomBelow(10)], &[2], true).await;
+        let report = fixture(data, 1, &[Filter::All, Filter::RandomBelow(10)], &[2], "vectors-churn", true).await;
         assert_eq!(report["temporal_canaries"], 5);
         assert_eq!(report["churn"]["result_count_without_shadowing"], 2);
         assert_eq!(report["churn"]["result_count_with_shadowing"], 10);

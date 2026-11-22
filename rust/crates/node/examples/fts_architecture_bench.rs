@@ -178,10 +178,15 @@ fn bench_services(clock: &Arc<TickClock>) -> NodeServices {
 async fn main() {
     let mut args = std::env::args().skip(1);
     let workload = args.next().unwrap();
-    if workload == "vectors" || workload == "vectors-churn" {
+    if matches!(workload.as_str(), "vectors" | "vectors-churn" | "vectors-full") {
         let data = std::path::PathBuf::from(args.next().expect("embedding data directory"));
         let queries = args.next().expect("query count").parse().unwrap();
-        vector_workload::run(&data, queries, workload == "vectors-churn").await;
+        let file_backed = match args.next().as_deref() {
+            None => false,
+            Some("--file-backed") => true,
+            Some(flag) => panic!("Unknown vector benchmark option: {flag}"),
+        };
+        vector_workload::run(&data, queries, &workload, file_backed).await;
         return;
     }
     if workload == "checkpoint" {

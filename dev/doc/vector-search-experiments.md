@@ -70,10 +70,14 @@ for rows in 100000 1000000; do
     uv run --no-project --with numpy==2.5.5 --with h5py==3.16.0 \
     python rust/crates/node/examples/support/vector_benchmark_data.py \
     build/vector-search/glove-100-angular.hdf5 "build/vector-search/glove-$rows" --rows "$rows"
-  cargo run --manifest-path rust/Cargo.toml --locked --release -p rtdb-node \
-    --example fts_architecture_bench -- vectors "build/vector-search/glove-$rows" 12 \
-    > "build/vector-search/result-$rows.json"
 done
+
+cargo run --manifest-path rust/Cargo.toml --locked --release -p rtdb-node \
+  --example fts_architecture_bench -- vectors build/vector-search/glove-100000 12 \
+  > build/vector-search/result-100000.json
+cargo run --manifest-path rust/Cargo.toml --locked --release -p rtdb-node \
+  --example fts_architecture_bench -- vectors-full build/vector-search/glove-1000000 12 \
+  > build/vector-search/result-1000000.json
 ```
 
 The downloaded GloVe data used for the run has SHA-256 `544af1d5e84e112cd4749571dcfd8ca109818a572f850af75a3a09e093a953c4`.
@@ -95,9 +99,12 @@ An erase must eventually retire the vector bytes as well as removing the row fro
 ## Release measurements
 
 The measurements use an Apple M4 Max, a locked Rust release build, and 100-dimensional GloVe vectors.
-Primary table queries ran against the same captured snapshots and local in-memory primary storage.
+Within each size, primary table queries use the same captured snapshot and storage backend.
+The 100,000-row fixture uses the in-memory table store and log.
+The million-row fixture uses local file-backed table storage and logs so historical ordered-index pages and log records stay off the process heap.
+It builds each index once and reuses the table for both the stationary and churn runs.
 The exact paths alternate order for each query.
-The stationary baseline below uses commit `fe910aeb7`.
+The 100,000-row stationary baseline uses commit `fe910aeb7`.
 The churn experiment adds removal of stale versions before the candidate limit is applied.
 Latency cells show p50 / p95 in milliseconds.
 p95 is nearest rank and equals the largest of the twelve per-query samples.
@@ -137,3 +144,42 @@ At 32 probes the unfiltered worst query recalled 40% of its exact top 10.
 The ~1% random filter filled all twelve pages at that probe budget and still recalled only 42.5% on average.
 Result count alone is therefore an inadequate signal that the search has covered a filter.
 The whole-cluster predicate could open every qualifying cluster within eight probes.
+
+## Churn and snapshot coverage
+
+```sh
+cargo run --manifest-path rust/Cargo.toml --locked --release -p rtdb-node \
+  --example fts_architecture_bench -- vectors-churn build/vector-search/glove-100000 4 \
+  > build/vector-search/churn-100000.json
+```
+
+The million-row `vectors-full` command includes the churn run.
+The churn run first tests an unindexed nearest neighbor, a retained snapshot, a bounded backdated correction, a future valid-time boundary, and an exact fallback after flushing.
+For the additional churn workload, a single transaction removes the original shortlist of 64 nearest neighbors using a mixture of deletes and erases.
+It also moves an existing row into the selective filters without changing its vector and inserts a new nearest neighbor.
+A reader with a captured older basis runs concurrently with that transaction and checks its previous result.
+The measurement then runs four held-out queries at both probe budgets across the same five filters.
+
+The 100,000-row run removed 33 rows by delete and 31 by erase.
+Reranking the stale shortlist plus the two puts yielded just two rows.
+Shadowing stale entries before shortlisting restored all ten exact neighbors when all clusters were probed, with 67 changed IIDs.
+All 20 paired exact SQL results matched and ANN warm/cold results also matched.
+The churn transaction took 121.63 ms while the older reader was active and left the immutable ANN object untouched.
+The IID-to-ID lookup added 2,400,000 bytes of resident metadata at this size.
+
+| Filter | Exact p50, ms | Ordered p50, ms | 8 probes recall@10 | 32 probes recall@10 | 32 probes ANN warm / cold p50, ms |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| None | 608.22 | 610.06 | 55.0% | 82.5% | 28.52 / 28.13 |
+| Random, ~0.1% | 120.64 | 16.64 | 15.0% | 30.0% | 11.51 / 12.03 |
+| Random, ~1% | 204.01 | 25.77 | 27.5% | 60.0% | 28.02 / 28.66 |
+| Random, ~10% | 242.62 | 86.87 | 47.5% | 72.5% | 27.73 / 28.13 |
+| Whole clusters, ~1% | 205.19 | 26.61 | 100% | 100% | 28.29 / 28.63 |
+
+The stationary and churn runs occurred at different levels of host load.
+Compare the query paths within each run and use the churn tests and recall results to assess the effect of changed rows.
+
+## Verification
+
+The native suite passed all 83 tests and the SQL array suite passed all six tests.
+The separate release test of the centroid read path passed its full-shortlist removal, retained snapshot, and coverage fallback assertions.
+The full Gradle unit suite passed all 3,190 tests with the native library built from the draft branch.
