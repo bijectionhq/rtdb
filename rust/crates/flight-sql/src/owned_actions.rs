@@ -1,6 +1,6 @@
 use std::{collections::{BTreeMap, BTreeSet}, sync::{Arc, Mutex}, time::Duration};
 
-use arrow_array::{Array, Float64Array, Int64Array, RecordBatch, TimestampMicrosecondArray, UInt64Array};
+use arrow_array::{Array, BooleanArray, Float64Array, Int64Array, RecordBatch, TimestampMicrosecondArray, UInt64Array};
 use arrow_flight::Result as ActionResult;
 use arrow_ipc::writer::IpcWriteOptions;
 use arrow_schema::{DataType, Field, Schema};
@@ -8,7 +8,7 @@ use bytes::Bytes;
 use prost::Message;
 use rtdb_columnar::{MemoryReservation, OwnedBatch};
 use rtdb_format::ipc::{OwnedStream, write_arrow_stream};
-use rtdb_node::{NativeSession, OwnedCountRequest, OwnedRangeRequest, OwnedRangeWitness, OwnedReadSession, OwnedValidHistory, TransactionStatus};
+use rtdb_node::{NativeSession, OwnedCountRequest, OwnedRangeRequest, OwnedRangeWitness, OwnedReadSession, OwnedValidHistory, OwnedVersionOrder, OwnedVersionRequest, TransactionStatus};
 use rtdb_query::QueryCursor;
 use rtdb_tx::{Documents, TxOp};
 use rtdb_types::{EntityId, LogicalType, OwnedRelation, ScalarType, StructFields, TimeUnit, Timestamp, Value};
@@ -102,7 +102,7 @@ pub(crate) const HELD_OWNED_POINT_V1: &str = "rtdb.owned.ReadHeldPoint.v1";
 pub(crate) const HELD_OWNED_POINT_V2: &str = "rtdb.owned.ReadHeldPoint.v2";
 pub(crate) const HELD_OWNED_HISTORICAL_POINT_V1: &str = "rtdb.owned.ReadHeldHistoricalPoint.v1";
 pub(crate) const HELD_OWNED_VALID_DURING_V1: &str = "rtdb.owned.ReadHeldValidDuring.v1";
-pub(crate) const HELD_OWNED_VERSIONS_V1: &str = "rtdb.owned.ReadHeldVersions.v1";
+pub(crate) const HELD_OWNED_VERSIONS_V2: &str = "rtdb.owned.ReadHeldVersions.v2";
 pub(crate) const CLOSE_OWNED_READ_V1: &str = "rtdb.owned.CloseRead.v1";
 pub(crate) const READ_WORLD_POINT_V1: &str = "rtdb.owned.ReadWorldPoint.v1";
 pub(crate) const OPEN_WORLD_READ_V1: &str = "rtdb.owned.OpenWorldRead.v1";
@@ -658,7 +658,7 @@ impl Service {
         let (relation, arrow_bytes) = split_relation(request)?;
         let batch = request_batch(call, arrow_bytes)?;
         let batch = batch.batch();
-        if batch.num_columns() != 5 || batch.num_rows() != 1 {
+        if batch.num_columns() != 7 || batch.num_rows() != 1 {
             return Err(invalid("Owned versions requires one row with identity, system endpoints, and pagination fields"));
         }
         let (id, _identity) = point_identity(call, batch)?;
@@ -667,19 +667,30 @@ impl Service {
         let system = Interval::new(from, to).map_err(status)?;
         let after = u64::try_from(history_request_integer(batch, "after_revision")?)
             .map_err(|_| invalid("Owned version revision must be nonnegative"))?;
-        let limit = usize::try_from(history_request_integer(batch, "limit")?)
-            .map_err(|_| invalid("Owned version limit is out of range"))?;
-        let page = held.snapshot.versions(&relation, &id, system, after, limit).await.map_err(status)?;
+        let scan_limit = usize::try_from(history_request_integer(batch, "scan_limit")?)
+            .map_err(|_| invalid("Owned version scan limit is out of range"))?;
+        let result_limit = usize::try_from(history_request_integer(batch, "result_limit")?)
+            .map_err(|_| invalid("Owned version result limit is out of range"))?;
+        let (column, field) = batch.schema_ref().column_with_name("descending")
+            .ok_or_else(|| invalid("Owned versions requires a descending flag"))?;
+        let descending = batch.column(column).as_any().downcast_ref::<BooleanArray>()
+            .filter(|values| !values.is_null(0) && field.metadata().is_empty())
+            .ok_or_else(|| invalid("Owned versions descending must be a non-null Boolean"))?;
+        let order = if descending.value(0) { OwnedVersionOrder::Descending } else { OwnedVersionOrder::Ascending };
+        let request = OwnedVersionRequest { system, after, scan_limit, result_limit, order };
+        let page = held.snapshot.versions(&relation, &id, request).await.map_err(status)?;
         let present = held.snapshot.present().system_time;
         let _framing = call.reserve(wire::mul(page.versions.len() + 1, 512)?)?;
         let header_charge = call.reserve(64)?;
-        let mut header = Vec::with_capacity(17);
+        let mut header = Vec::with_capacity(35);
         header.extend_from_slice(&page.next_revision.to_be_bytes());
         header.push(u8::from(page.done));
         header.extend_from_slice(&page.floor.0.to_be_bytes());
-        let header = ActionResult { body: wire::retain(header, header_charge) };
-        let mut bytes = header.encoded_len();
-        let mut results = vec![header];
+        let scanned = u16::try_from(page.scanned).map_err(|_| invalid("Owned version scan count is out of range"))?;
+        header.extend_from_slice(&scanned.to_be_bytes());
+
+        let mut bytes = 0;
+        let mut results = Vec::with_capacity(page.versions.len() + 1);
         for version in page.versions {
             let reply = self.history_reply(call, &id, HistoryRead::Version(version.timeline), Interval::ALL, present,
                 Some((version.revision, version.system_time))).await?;
@@ -690,6 +701,16 @@ impl Service {
             results.push(reply);
         }
         held.snapshot.check().map_err(status)?;
+        let header_len = header.len() + if page.witness.is_some() { 16 } else { 0 };
+        let framing = ActionResult { body: Bytes::from_static(&[0; 35]).slice(..header_len) };
+        if wire::add(bytes, framing.encoded_len())? > self.0.config.maximum_message_bytes {
+            return Err(Status::resource_exhausted("Owned version page exceeds the Flight response limit"));
+        }
+        if let Some(witness) = page.witness {
+            let nonce = held.remember(call, &relation, witness)?;
+            header.extend_from_slice(nonce.as_bytes());
+        }
+        results.insert(0, ActionResult { body: wire::retain(header, header_charge) });
         Ok(results)
     }
 

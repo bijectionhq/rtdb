@@ -356,11 +356,14 @@ On placed writer sessions with retained leases, a fully completed held valid win
 A fully covered held count also carries that nonce, including zero counts.
 The nonce depends on the entire relation's frontier at the held cut and retains the original session, placement and expiry.
 
-`rtdb.owned.ReadHeldVersions.v1` uses the held handle and relation prefix followed by one Arrow batch and one row.
-The request fields are `_id`, `system_from_micros: Int64`, `system_to_micros: Int64`, `after_revision: Int64`, and `limit: Int64`.
-Use a nonempty half-open system window within the held covered interval, an exclusive journal revision starting at zero, and a limit from 1 to 128 source groups.
-The first result is 17 bytes containing the next scanned revision as big-endian u64, a completion byte of 0 or 1, and the certified floor in signed big-endian Unix microseconds.
-An incomplete page may have no matching versions. Continue from its next scanned revision with the same handle and window.
+`rtdb.owned.ReadHeldVersions.v2` uses the held handle and relation prefix followed by one Arrow batch and one row.
+The request fields are `_id`, `system_from_micros: Int64`, `system_to_micros: Int64`, `after_revision: Int64`, `scan_limit: Int64`, `result_limit: Int64`, and `descending: Boolean`.
+Use a half-open system window at or before the held cut and zero for the initial journal revision.
+The scan limit is 1–128 source groups. The result limit is 1 to the scan limit.
+The first result contains the last scanned revision as big-endian u64, a completion byte of 0 or 1, the floor in signed big-endian Unix microseconds, and the scanned group count as big-endian u16.
+The floor is the minimum i64 when coverage starts with an empty relation or the requested interval is empty.
+A placed read may append a 16-byte relation witness after the full response renders.
+An incomplete page may have no matching versions. Continue from its last scanned revision with the same handle, window and direction.
 Each additional result is one Arrow stream containing the full winning valid timeline for one source group that touched the complete typed identity.
 A complete deletion still returns a version stream with schema and no record batch. Clients fill gaps from the explicit valid boundaries.
 Schema metadata includes `rtdb.owned.version_revision` and `rtdb.owned.version_micros` alongside the held present and full valid window.

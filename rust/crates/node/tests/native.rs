@@ -399,7 +399,8 @@ async fn held_owned_versions_page_source_groups_and_include_an_empty_deleted_tim
     };
     let first = writer.state_mut().execute_tx(vec![make(1, 10)], AutonomousTxOptions::default()).await.unwrap();
     assert!(first.committed());
-    assert!(writer.state_mut().execute_tx(vec![make(2, 99)], AutonomousTxOptions::default()).await.unwrap().committed());
+    let unrelated = writer.state_mut().execute_tx(vec![make(2, 99)], AutonomousTxOptions::default()).await.unwrap();
+    assert!(unrelated.committed());
     let correction = TxOp::OwnedReplaceDocs {
         relation: relation.clone(), documents: docs(1, 20), valid_from: Some(Timestamp(5)), valid_to: Some(Timestamp(10)),
     };
@@ -414,20 +415,23 @@ async fn held_owned_versions_page_source_groups_and_include_an_empty_deleted_tim
     let held = writer.open_owned_read().await.unwrap();
     let floor = first.tx_key().system_time;
     let through = held.present().system_time.next().unwrap();
-    let window = Interval::new(floor, through).unwrap();
-    let refused = Interval::new(Timestamp::MIN, through).unwrap();
-    assert_eq!(held.versions(&relation, &id, refused, 0, 1).await.err().unwrap().code, "rtdb.owned/version-floor");
-    let mut page = held.versions(&relation, &id, window, 0, 1).await.unwrap();
-    assert_eq!(page.floor, floor);
+    use rtdb_node::{OwnedVersionOrder::{Ascending, Descending}, OwnedVersionRequest};
+
+    let window = Interval::new(Timestamp::MIN, through).unwrap();
+    let request = |after, scan_limit| OwnedVersionRequest {
+        system: window, after, scan_limit, result_limit: scan_limit, order: Ascending,
+    };
+    let mut page = held.versions(&relation, &id, request(0, 1)).await.unwrap();
+    assert_eq!(page.floor, Timestamp::MIN);
     assert_eq!(page.next_revision, 1);
     assert!(!page.done);
     let first_version = page.versions.pop().unwrap();
     assert_eq!(first_version.system_time, floor);
     assert_eq!(rows(first_version.timeline).await.len(), 1);
-    let skipped = held.versions(&relation, &id, window, page.next_revision, 1).await.unwrap();
+    let skipped = held.versions(&relation, &id, request(page.next_revision, 1)).await.unwrap();
     assert_eq!(skipped.next_revision, 2);
     assert!(skipped.versions.is_empty());
-    let mut last = held.versions(&relation, &id, window, skipped.next_revision, 2).await.unwrap();
+    let mut last = held.versions(&relation, &id, request(skipped.next_revision, 2)).await.unwrap();
     assert!(last.done);
     assert_eq!(last.next_revision, 4);
     let tombstoned = last.versions.pop().unwrap();
@@ -436,6 +440,24 @@ async fn held_owned_versions_page_source_groups_and_include_an_empty_deleted_tim
     let corrected = last.versions.pop().unwrap();
     assert_eq!(corrected.system_time, changed.tx_key().system_time);
     assert_eq!(rows(corrected.timeline).await.len(), 3);
+
+    let descending = |after| OwnedVersionRequest {
+        system: Interval::new(unrelated.tx_key().system_time, deleted.tx_key().system_time).unwrap(),
+        after,
+        scan_limit: 2,
+        result_limit: 1,
+        order: Descending,
+    };
+    let recent = held.versions(&relation, &id, descending(0)).await.unwrap();
+    assert_eq!(recent.scanned, 1);
+    assert_eq!(recent.next_revision, 3);
+    assert_eq!(recent.versions[0].system_time, changed.tx_key().system_time);
+    assert!(!recent.done);
+    let older = held.versions(&relation, &id, descending(recent.next_revision)).await.unwrap();
+    assert_eq!(older.scanned, 1);
+    assert_eq!(older.next_revision, 2);
+    assert!(older.versions.is_empty());
+    assert!(older.done);
 
     drop(held);
     drop(writer);

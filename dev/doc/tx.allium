@@ -90,7 +90,9 @@
 -- Held reads require the original session and attachment and refuse after expiry, lease loss, or closure.
 -- A held root valid window returns ordered non-overlapping winning slices clipped at the requested endpoints.
 -- Fully covered range counts and completed valid windows can issue relation-frontier evidence under the same placed lease as range pages.
--- Held system versions derive their timestamps and retained floor from the relation's ordered change journal and verify its event frontier.
+-- Held system versions seek both window edges in the relation's ordered change journal and verify its event frontier.
+-- Both directions advance past every scanned source group, including groups with no change to the requested identity.
+-- A placed read can receive a conservative relation witness after rendering the complete version page.
 -- Each admitted version resolves the complete valid timeline at that revision on the same pinned physical catalog.
 -- An owned path declaration is maintained from the ordered owner's private catalog.
 -- An owned unique declaration starts before any relation data and admits one Binary key per row.
