@@ -216,6 +216,15 @@ These metadata values are signed decimal microseconds.
 A successful commit reply has the same schema as the create reply.
 An expired deadline or stale observation aborts the entire transaction before mutations apply.
 
+`rtdb.owned.Commit.v2` applies the same row schema and reply format to multiple relations in one transaction.
+Its body starts with one exclusive signed 64-bit big-endian microsecond deadline and an unsigned 16-bit big-endian group count.
+Each group is an unsigned 16-bit big-endian relation-name length, the ASCII relation name, an unsigned 32-bit big-endian IPC length, and exactly that many bytes of a terminated IPC stream.
+Each group contains one nonempty batch.
+Use 1–32 distinct relations and at most 4096 rows across the request.
+The final stream ends the body.
+All observations are checked against the same ordered state before any mutation applies.
+Mutations apply in group order and then row order, using the authenticated session's principal and database.
+
 Owned lookups compare the complete stored `_id` before releasing data or accepting a point observation.
 The primary index continues to locate rows by 128-bit IID.
 Different identities occupying the same IID produce an explicit collision refusal when a different visible identity is found.
@@ -236,3 +245,19 @@ A handle expires after at most 60 seconds or if its storage lease or holder is l
 A concurrent commit that prevents capture of the exact reserved head refuses the open with `rtdb.owned/capture-raced`.
 After holder movement or lease loss, open a new authenticated session and start a new attempt.
 The held read uses the serving node's retained catalog and does not survive a process restart.
+
+`rtdb.owned.DeclarePath.v1` uses the relation prefix and a terminated Arrow IPC stream with exactly one row.
+Its two columns are `_id: Utf8` for the path name and `columns: List<Utf8>` for the ordered key columns.
+The key consists of distinct stored columns and ends with `_id`.
+The relation must already exist in the authenticated owner's namespace.
+A successful declaration returns the same transaction-key Arrow row as Create.
+The declaration is immutable and private to the owner's index catalog.
+Index maintenance builds the generation after declaration.
+
+`rtdb.owned.ReadHeldRange.v1` uses the 16-byte held handle, a relation prefix, and a terminated Arrow IPC stream with one row.
+The row contains `path: Utf8`, the nullable typed `lower` and `upper` key cells, and `limit: Int64` between 1 and 128.
+Bounds address the leading path key, with an inclusive lower endpoint and an exclusive upper endpoint.
+A null endpoint leaves that side open.
+Results contain the covered path columns in ascending path order at the held present and valid instant.
+A missing declaration, missing generation, uncovered source frontier, unflushed data, or unsupported covering projection returns an explicit refusal.
+The service does not fall back to a primary or SQL scan.

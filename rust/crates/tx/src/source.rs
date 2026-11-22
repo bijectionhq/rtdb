@@ -60,6 +60,8 @@ impl SourceTransaction {
         let mut bytes = operations.capacity().checked_mul(std::mem::size_of::<Operation>()).and_then(|size| size.checked_add(options.default_tz.capacity())).and_then(|size| size.checked_add(options.user.as_ref().map_or(0, String::capacity))).ok_or_else(overflow)?;
         for operation in &operations {
             let (text, table, ids) = match operation {
+                Operation::Public(TxOp::OwnedDeclarePath { relation, name, columns }) =>
+                    (owned_path_bytes(relation, name, columns)?, None, 0),
                 Operation::Public(TxOp::OwnedDeadline { .. }) => (0, None, 0),
                 Operation::Public(TxOp::OwnedCheck { relation, id, .. } | TxOp::OwnedDelete { relation, id, .. }) =>
                     (relation.name().len().checked_add(id.as_value().retained_bytes()?).ok_or_else(overflow)?, None, 0),
@@ -274,6 +276,8 @@ impl SourceTransaction {
                 }
                 Operation::Public(TxOp::SqlBytes { sql, arg_bytes }) => sql.capacity().checked_add(arg_bytes.as_slice().len()).ok_or_else(overflow)?,
                 Operation::Public(TxOp::DeleteDocs { ids, .. } | TxOp::EraseDocs { ids, .. }) => ids.ids().len().checked_mul(128).ok_or_else(overflow)?,
+                Operation::Public(TxOp::OwnedDeclarePath { relation, name, columns }) =>
+                    owned_path_bytes(relation, name, columns)?,
                 Operation::Public(TxOp::OwnedDeadline { .. }) => 0,
                 Operation::Public(TxOp::OwnedCheck { relation, id, .. } | TxOp::OwnedDelete { relation, id, .. }) =>
                     relation.name().len().checked_add(id.as_value().retained_bytes()?).ok_or_else(overflow)?,
@@ -334,6 +338,12 @@ impl SourceDocuments<'_> {
     }
 }
 
+fn owned_path_bytes(relation: &rtdb_types::OwnedRelation, name: &rtdb_types::OwnedRelation, columns: &[String]) -> Result<usize> {
+    columns.iter().try_fold(relation.name().len() + name.name().len(), |bytes, column| {
+        bytes.checked_add(column.capacity()).and_then(|bytes| bytes.checked_add(64)).ok_or_else(overflow)
+    })
+}
+
 fn operation_value<'a>(operation: &'a Operation, memory: &Arc<MemoryBudget>) -> Result<(String, SourceOperation<'a>)> {
     let mut body = StructFields::new();
     let mut docs = None;
@@ -347,6 +357,12 @@ fn operation_value<'a>(operation: &'a Operation, memory: &Arc<MemoryBudget>) -> 
             body.insert("query".into(), Value::Utf8(sql.clone()));
             body.insert("args".into(), if arg_bytes.as_slice().is_empty() { Value::Null } else { Value::Binary(arg_bytes.as_slice().to_vec()) });
             "sql"
+        }
+        Operation::Public(TxOp::OwnedDeclarePath { relation, name, columns }) => {
+            body.insert("relation".into(), Value::Utf8(relation.name().into()));
+            body.insert("name".into(), Value::Utf8(name.name().into()));
+            body.insert("columns".into(), Value::List(columns.iter().cloned().map(Value::Utf8).collect()));
+            "rtdb-owned-path-v1"
         }
         Operation::Public(TxOp::OwnedDeadline { until }) => {
             body.insert("until".into(), Value::I64(until.0));
@@ -952,6 +968,7 @@ impl SourceOperationReader<'_> {
         let body = array.as_any().downcast_ref::<StructArray>().ok_or_else(|| invalid("Transaction operation leg is not a struct"))?;
         let value_fields: &[&str] = match name.as_str() {
             "sql" => &["query", "args"],
+            "rtdb-owned-path-v1" => &["relation", "name", "columns"],
             "rtdb-owned-deadline-v1" => &["until"],
             "rtdb-owned-check-v1" => &["relation", "id", "valid_at", "expected"],
             "rtdb-owned-delete-v1" => &["relation", "id", "_valid_from", "_valid_to"],
@@ -965,6 +982,16 @@ impl SourceOperationReader<'_> {
         parsed_fields.grow_to(bound)?;
         let value = |name| struct_cell(body, name, offset);
         let operation = match name.as_str() {
+            "rtdb-owned-path-v1" => {
+                let (Value::Utf8(relation), Value::Utf8(name), Value::List(columns)) =
+                    (value("relation")?, value("name")?, value("columns")?)
+                else { return Err(invalid("Owned path declaration has invalid fields")); };
+                let columns = columns.into_iter().map(|column| match column {
+                    Value::Utf8(column) => Ok(column),
+                    _ => Err(invalid("Owned path names a non-text column")),
+                }).collect::<Result<_>>()?;
+                TxOp::OwnedDeclarePath { relation: rtdb_types::OwnedRelation::new(relation)?, name: rtdb_types::OwnedRelation::new(name)?, columns }
+            }
             "rtdb-owned-deadline-v1" => {
                 let Value::I64(until) = value("until")? else { return Err(invalid("Owned deadline is not a microsecond timestamp")); };
                 TxOp::OwnedDeadline { until: Timestamp(until) }

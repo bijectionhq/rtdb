@@ -610,6 +610,8 @@ impl<'a> OpenTransaction<'a> {
             }
             Operation::Public(TxOp::PutArrowDocs { table, documents }) => self.put_arrow_documents(table, documents, None, None, None),
             Operation::PutArrowIids { table, documents, iids, valid_from, valid_to } => self.put_arrow_documents(table, documents, Some(iids), *valid_from, *valid_to),
+            Operation::Public(TxOp::OwnedDeclarePath { relation, name, columns }) =>
+                self.declare_owned_path(relation, name, columns).await,
             Operation::Public(TxOp::OwnedDeadline { .. } | TxOp::OwnedCheck { .. }) => Ok(()),
             Operation::Public(TxOp::OwnedDelete { relation, id, valid_from, valid_to }) =>
                 self.delete_owned(relation, id, *valid_from, *valid_to).await,
@@ -657,6 +659,44 @@ impl<'a> OpenTransaction<'a> {
         let mutation = rtdb_sql::prepare_patch(QualifiedTable { database: self.context.database.clone(), table: table.clone() }, input, TemporalFilter::FromTo { from: Expr::Literal(time_value(interval.lower())), to: Expr::Literal(time_value(interval.upper())) }, &context.catalog)?;
         self.execute_mutation(mutation, context, None, None).await
     }
+    async fn declare_owned_path(
+        &mut self, relation: &rtdb_types::OwnedRelation, name: &rtdb_types::OwnedRelation, columns: &[String],
+    ) -> Result<()> {
+        let owner = self.options.user.as_deref().filter(|owner| !owner.is_empty()).ok_or_else(no_owned_principal)?;
+        let target = relation.table(owner);
+        let catalog = rtdb_types::OwnedRelation::path_catalog(owner);
+        let snapshot = self.snapshot()?;
+        if !snapshot.contains_table(&target) {
+            return Err(Anomaly::incorrect("rtdb.owned/path-relation", "Owned path requires an existing relation"));
+        }
+        let available = snapshot.column_names(&target);
+        if !(2..=16).contains(&columns.len())
+            || columns.last().is_none_or(|column| column != "_id")
+            || columns.iter().collect::<std::collections::BTreeSet<_>>().len() != columns.len()
+            || columns.iter().any(|column| !available.contains(column) || (column.starts_with('_') && column != "_id"))
+        {
+            return Err(Anomaly::incorrect("rtdb.owned/path-columns", "Owned path requires distinct stored columns ending in _id"));
+        }
+        if snapshot.contains_table(&catalog) {
+            let context = self.context.query_context(snapshot, self.tx_key().system_time, &self.options.default_tz, self.trace_parent)?;
+            if let Some(mut existing) = rtdb_query::open_owned_path_catalog(context, &catalog, Some(name.name())).await? {
+                while let Some(batch) = existing.next_batch().await? {
+                    if batch.batch().num_rows() != 0 {
+                        return Err(Anomaly::new(AnomalyCategory::Conflict, "rtdb.owned/path-exists", "Owned path name already exists"));
+                    }
+                }
+            }
+        }
+        let document = StructFields::from([
+            ("_id".into(), Value::Utf8(name.name().into())),
+            ("schema_name".into(), Value::Utf8(target.schema)),
+            ("table_name".into(), Value::Utf8(target.table)),
+            ("columns".into(), Value::List(columns.iter().cloned().map(Value::Utf8).collect())),
+            ("version".into(), Value::I64(self.tx_key().tx_id.0)),
+        ]);
+        self.buffer.put(catalog, document, Interval::ALL)
+    }
+
     async fn check_owned_preconditions(&self, operations: &[Operation]) -> Result<()> {
         let owner = self.options.user.as_deref().filter(|owner| !owner.is_empty()).ok_or_else(no_owned_principal)?;
         let mut deadline = None;

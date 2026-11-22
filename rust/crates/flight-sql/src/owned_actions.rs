@@ -24,12 +24,70 @@ use crate::{
     upload, wire,
 };
 
+pub(crate) const DECLARE_OWNED_PATH_V1: &str = "rtdb.owned.DeclarePath.v1";
 pub(crate) const CREATE_OWNED_V1: &str = "rtdb.owned.Create.v1";
 pub(crate) const COMMIT_OWNED_V1: &str = "rtdb.owned.Commit.v1";
+pub(crate) const COMMIT_OWNED_V2: &str = "rtdb.owned.Commit.v2";
+const MAX_COMMIT_GROUPS: usize = 32;
+const MAX_GROUPED_COMMIT_ROWS: usize = 4096;
+
+#[derive(Clone, Copy)]
+pub(crate) enum CommitFormat {
+    Single,
+    Grouped,
+}
+
+struct CommitRequest<'a> {
+    deadline: Timestamp,
+    groups: Vec<(OwnedRelation, &'a [u8])>,
+}
+
+impl<'a> CommitRequest<'a> {
+    fn parse(body: &'a [u8], format: CommitFormat) -> Result<Self, Status> {
+        let (single, body) = match format {
+            CommitFormat::Single => {
+                let (relation, rest) = split_relation(body)?;
+                (Some(relation), rest)
+            },
+            CommitFormat::Grouped => (None, body),
+        };
+        let (deadline, body) = body.split_first_chunk::<8>().ok_or_else(|| invalid("Owned commit has no deadline"))?;
+        let deadline = Timestamp(i64::from_be_bytes(*deadline));
+        if let Some(relation) = single {
+            return Ok(Self { deadline, groups: vec![(relation, body)] });
+        }
+        let (count, mut rest) = body.split_first_chunk::<2>().ok_or_else(|| invalid("Owned commit has no group count"))?;
+        let count = usize::from(u16::from_be_bytes(*count));
+        if !(1..=MAX_COMMIT_GROUPS).contains(&count) {
+            return Err(invalid("Owned commit requires one to 32 relation groups"));
+        }
+        let mut groups = Vec::with_capacity(count);
+        for _ in 0..count {
+            let (relation, framed) = split_relation(rest)?;
+            if groups.iter().any(|(previous, _)| previous == &relation) {
+                return Err(invalid("Owned commit has a duplicate relation"));
+            }
+            let (length, framed) = framed.split_first_chunk::<4>().ok_or_else(|| invalid("Owned commit group has no Arrow length"))?;
+            let length = u32::from_be_bytes(*length) as usize;
+            let (arrow, tail) = framed.split_at_checked(length).ok_or_else(|| invalid("Owned commit group Arrow stream is truncated"))?;
+            if arrow.is_empty() {
+                return Err(invalid("Owned commit group Arrow stream is empty"));
+            }
+            groups.push((relation, arrow));
+            rest = tail;
+        }
+        if !rest.is_empty() {
+            return Err(invalid("Owned commit has trailing bytes"));
+        }
+        Ok(Self { deadline, groups })
+    }
+}
+
 pub(crate) const READ_OWNED_V1: &str = "rtdb.owned.ReadPoint.v1";
 pub(crate) const OPEN_OWNED_READ_V1: &str = "rtdb.owned.OpenRead.v1";
 pub(crate) const HELD_OWNED_POINT_V1: &str = "rtdb.owned.ReadHeldPoint.v1";
 pub(crate) const CLOSE_OWNED_READ_V1: &str = "rtdb.owned.CloseRead.v1";
+pub(crate) const HELD_OWNED_RANGE_V1: &str = "rtdb.owned.ReadHeldRange.v1";
 const READ_IDLE: Duration = Duration::from_secs(60);
 const OWNED_PRESENT: &str = "rtdb.owned.present_micros";
 const OWNED_VALID: &str = "rtdb.owned.valid_micros";
@@ -57,7 +115,7 @@ fn split_relation(body: &[u8]) -> Result<(OwnedRelation, &[u8]), Status> {
     Ok((OwnedRelation::new(name).map_err(status)?, arrow_bytes))
 }
 
-fn request_batch(call: &Call, arrow: &[u8]) -> Result<OwnedBatch, Status> {
+fn decode_batch(call: &Call, arrow: &[u8]) -> Result<OwnedBatch, Status> {
     let mut stream = OwnedStream::read(arrow, call.service.memory()).map_err(status)?.into_pages();
     let [batch] = stream.as_slice() else {
         return Err(invalid("Owned action requires exactly one Arrow record batch"));
@@ -65,10 +123,18 @@ fn request_batch(call: &Call, arrow: &[u8]) -> Result<OwnedBatch, Status> {
     if batch.batch().num_rows() == 0 { return Err(invalid("Owned action requires a nonempty Arrow record batch")); }
     let schema = batch.batch().schema();
     let names = schema.fields().iter().map(|field| field.name().as_str()).collect::<BTreeSet<_>>();
-    if names.len() != schema.fields().len() || !names.contains("_id") {
-        return Err(invalid("Owned action requires unique document columns and an _id column"));
+    if names.len() != schema.fields().len() {
+        return Err(invalid("Owned action requires unique column names"));
     }
     Ok(stream.pop().expect("validated one batch"))
+}
+
+fn request_batch(call: &Call, arrow: &[u8]) -> Result<OwnedBatch, Status> {
+    let batch = decode_batch(call, arrow)?;
+    if batch.batch().schema_ref().index_of("_id").is_err() {
+        return Err(invalid("Owned action requires an _id column"));
+    }
+    Ok(batch)
 }
 
 fn require_idle(native: &NativeSession) -> Result<(), Status> {
@@ -77,6 +143,26 @@ fn require_idle(native: &NativeSession) -> Result<(), Status> {
 }
 
 impl Service {
+    pub(crate) async fn declare_owned_path_action(&self, call: &Call, body: &[u8]) -> Result<ActionResult, Status> {
+        if !self.0.config.owned_native_actions { return Err(unsupported()); }
+        let (relation, arrow) = split_relation(body)?;
+        let batch = request_batch(call, arrow)?;
+        if batch.batch().num_rows() != 1 || batch.batch().num_columns() != 2 {
+            return Err(invalid("Owned path declaration requires one row with _id and columns"));
+        }
+        let (mut rows, _decoded) = upload::documents(batch.batch(), self)?;
+        let row = rows.pop().expect("validated one row");
+        let (Some(Value::Utf8(name)), Some(Value::List(columns))) = (row.get("_id"), row.get("columns")) else {
+            return Err(invalid("Owned path declaration requires a text name and text column list"));
+        };
+        let columns = columns.iter().map(|column| match column {
+            Value::Utf8(column) => Ok(column.clone()),
+            _ => Err(invalid("Owned path key column is not text")),
+        }).collect::<Result<Vec<_>, _>>()?;
+        let name = OwnedRelation::new(name.as_str()).map_err(status)?;
+        self.owned_write_reply(call, vec![TxOp::OwnedDeclarePath { relation, name, columns }]).await
+    }
+
     pub(crate) async fn create_owned_action(&self, call: &Call, body: &[u8]) -> Result<ActionResult, Status> {
         if !self.0.config.owned_native_actions { return Err(unsupported()); }
         let (relation, arrow) = split_relation(body)?;
@@ -89,18 +175,42 @@ impl Service {
         self.owned_write_reply(call, vec![operation]).await
     }
 
-    pub(crate) async fn commit_owned_action(&self, call: &Call, body: &[u8]) -> Result<ActionResult, Status> {
+    pub(crate) async fn commit_owned_action(&self, call: &Call, body: &[u8], format: CommitFormat) -> Result<ActionResult, Status> {
         if !self.0.config.owned_native_actions { return Err(unsupported()); }
-        let (relation, rest) = split_relation(body)?;
-        let (deadline, arrow) = rest.split_first_chunk::<8>().ok_or_else(|| invalid("Owned commit has no deadline"))?;
-        let deadline = Timestamp(i64::from_be_bytes(*deadline));
-        let batch = request_batch(call, arrow)?;
-        let (rows, _decoded) = upload::documents(batch.batch(), self)?;
-        let operations = rows.len().checked_mul(2).and_then(|count| count.checked_add(1))
-            .ok_or_else(|| invalid("Owned commit has too many operations"))?;
-        let _operations = call.reserve(wire::mul(operations, std::mem::size_of::<TxOp>() + 512)?)?;
-        let mut writes = Vec::with_capacity(operations);
-        writes.push(TxOp::OwnedDeadline { until: deadline });
+        let group_limit = match format {
+            CommitFormat::Single => 1,
+            CommitFormat::Grouped => MAX_COMMIT_GROUPS,
+        };
+        let _framing = call.reserve(group_limit * 512)?;
+        let CommitRequest { deadline, groups } = CommitRequest::parse(body, format)?;
+        let mut rows_left = match format {
+            CommitFormat::Single => usize::MAX,
+            CommitFormat::Grouped => MAX_GROUPED_COMMIT_ROWS,
+        };
+        let mut writes = vec![TxOp::OwnedDeadline { until: deadline }];
+        let mut retained = Vec::with_capacity(groups.len());
+        for (relation, arrow) in groups {
+            let batch = request_batch(call, arrow)?;
+            let rows = batch.batch().num_rows();
+            rows_left = rows_left.checked_sub(rows)
+                .ok_or_else(|| invalid("Owned commit exceeds its total row limit"))?;
+            let operations = wire::mul(rows, 2)?;
+            let operations_charge = call.reserve(wire::mul(operations, std::mem::size_of::<TxOp>() + 512)?)?;
+            writes.try_reserve_exact(operations)
+                .map_err(|_| Status::resource_exhausted("Owned commit operation allocation failed"))?;
+            let (rows, documents_charge) = upload::documents(batch.batch(), self)?;
+            self.append_owned_commit_group(&mut writes, &relation, rows)?;
+            retained.push((operations_charge, documents_charge));
+        }
+        self.owned_write_reply(call, writes).await
+    }
+
+    fn append_owned_commit_group(
+        &self,
+        writes: &mut Vec<TxOp>,
+        relation: &OwnedRelation,
+        rows: Vec<rtdb_types::StructFields<Value>>,
+    ) -> Result<(), Status> {
         for mut row in rows {
             let id = row.get("_id").ok_or_else(|| invalid("Owned commit row has no _id"))?.entity_id().map_err(status)?;
             let Value::Utf8(operation) = row.remove("_op").ok_or_else(|| invalid("Owned commit row has no _op"))? else {
@@ -136,7 +246,7 @@ impl Service {
             };
             writes.push(operation);
         }
-        self.owned_write_reply(call, writes).await
+        Ok(())
     }
 
     async fn owned_write_reply(&self, call: &Call, operations: Vec<TxOp>) -> Result<ActionResult, Status> {
@@ -201,6 +311,37 @@ impl Service {
         let (relation, id, _identity) = point_request(call, request)?;
         let cursor = held.snapshot.open_point(&relation, &id).await.map_err(status)?;
         let reply = self.finish_owned_point(held.snapshot.present().system_time, &id, cursor).await?;
+        held.snapshot.check().map_err(status)?;
+        Ok(reply)
+    }
+
+    pub(crate) async fn held_owned_range_action(&self, call: &Call, body: &[u8]) -> Result<ActionResult, Status> {
+        if !self.0.config.owned_native_actions { return Err(unsupported()); }
+        let (handle, request) = body.split_first_chunk::<16>().ok_or_else(|| invalid("Owned held range has no handle"))?;
+        let handle = Bytes::copy_from_slice(handle);
+        let held = self.owned_read(call, &handle)?;
+        if let Err(error) = held.snapshot.check() {
+            if let Lookup::Found(entry) = self.0.owned_reads.take(&handle) { entry.close(); }
+            return Err(status(error));
+        }
+        let (relation, arrow) = split_relation(request)?;
+        let batch = decode_batch(call, arrow)?;
+        if batch.batch().num_rows() != 1 || batch.batch().num_columns() != 4 {
+            return Err(invalid("Owned range requires one row with path, lower, upper, and limit"));
+        }
+        let (mut rows, _decoded) = upload::documents(batch.batch(), self)?;
+        let row = rows.pop().expect("validated one row");
+        let (Some(Value::Utf8(path)), Some(lower), Some(upper), Some(Value::I64(limit))) =
+            (row.get("path"), row.get("lower"), row.get("upper"), row.get("limit"))
+        else { return Err(invalid("Owned range fields have invalid types")); };
+        let path = OwnedRelation::new(path.as_str()).map_err(status)?;
+        let limit = usize::try_from(*limit).map_err(|_| invalid("Owned range limit is out of range"))?;
+        let lower = (!matches!(lower, Value::Null | Value::Undefined)).then_some(lower);
+        let upper = (!matches!(upper, Value::Null | Value::Undefined)).then_some(upper);
+        let page = held.snapshot.range(&relation, &path, lower, upper, limit).await.map_err(status)?;
+        let reply = self.owned_point_reply(
+            &page.schema, page.batch.as_ref().map(OwnedBatch::batch), held.snapshot.present().system_time, None,
+        )?;
         held.snapshot.check().map_err(status)?;
         Ok(reply)
     }
@@ -311,3 +452,6 @@ fn valid_endpoint(value: Option<Value>) -> Result<Option<Timestamp>, Status> {
 fn has_payload(row: &rtdb_types::StructFields<Value>) -> bool {
     row.iter().any(|(name, value)| name != "_id" && !matches!(value, Value::Null | Value::Undefined))
 }
+
+#[cfg(test)]
+mod commit_tests;

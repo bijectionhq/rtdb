@@ -41,12 +41,16 @@
 -- An overlap aborts the entire transaction.
 -- Owned native inserts resolve in the authenticated principal's versioned namespace.
 -- Owned deadlines and point observations are checked at the ordered cut before owned mutations apply.
+-- One grouped owned Flight commit supplies one deadline and batches for distinct relations.
+-- Observations across those relations share the ordered cut, and their mutations apply atomically in group and row order.
 -- Owned create, replace, and delete operations apply atomically in their listed order.
 -- Owned point reads compare the complete stored identity before yielding any row.
 -- An owned transaction refuses ordinary operations and ordinary SQL catalogs and scans exclude owned tables.
 -- Owned point reads use the principal's namespace at a reserved present.
 -- A held owned read captures the exact applied transaction key and retains that catalog for repeated reads.
 -- Held reads require the original session and attachment and refuse after expiry, lease loss, or closure.
+-- An owned path declaration is maintained from the ordered owner's private catalog.
+-- A held range requires an exact published covering generation for the captured frontier and serves one page directly from that path.
 -- DML evaluates CURRENT_TIMESTAMP at the assigned system time when resolving the ordered transaction.
 -- EPOCH_NANOS_BE(CURRENT_TIMESTAMP) encodes that instant as eight unsigned big-endian bytes without rounding.
 --

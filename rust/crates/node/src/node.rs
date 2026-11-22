@@ -875,13 +875,28 @@ impl OwnedReadSession {
     pub fn check(&self) -> Result<()> { self.context.check_cancelled() }
 
     pub async fn open_point(&self, relation: &rtdb_types::OwnedRelation, id: &rtdb_types::EntityId) -> Result<Option<QueryCursor>> {
-        self.context.check_cancelled()?;
+        self.admit_read().await?;
+        rtdb_query::open_owned_point(Arc::clone(&self.context), &self.owner, relation, id, None, None).await
+    }
+
+    /// Reads one covered page from the named ordered path at this held cut.
+    pub async fn range(
+        &self, relation: &rtdb_types::OwnedRelation, path: &rtdb_types::OwnedRelation,
+        lower: Option<&Value>, upper: Option<&Value>, limit: usize,
+    ) -> Result<crate::OwnedRangePage> {
+        self.admit_read().await?;
+        let result = crate::ordered_index::owned_range(Arc::clone(&self.context), &self.owner, relation, path, lower, upper, limit).await?;
+        self.check()?;
+        Ok(result)
+    }
+
+    async fn admit_read(&self) -> Result<()> {
+        self.check()?;
         self.node.admit(&self.database, DatabaseAccess::Read, self.identity.as_ref(), &self.cancellation).await?;
         if self.identity.user() != Some(self.owner.as_str()) {
             return Err(Anomaly::new(AnomalyCategory::Forbidden, "rtdb.owned/read-owner", "The captured read belongs to another authenticated principal"));
         }
-        self.context.check_cancelled()?;
-        rtdb_query::open_owned_point(Arc::clone(&self.context), &self.owner, relation, id, None, None).await
+        self.check()
     }
 }
 

@@ -350,6 +350,59 @@ async fn held_owned_points_share_one_cut_and_close_refuses_new_reads() {
 }
 
 #[tokio::test]
+async fn held_owned_range_requires_a_covering_generation() {
+    use rtdb_types::OwnedRelation;
+
+    let mut settings = options();
+    settings.owned_relations = true;
+    settings.automatic_artefacts = false;
+    let (node, driver) = running(settings, services()).await;
+    let mut writer = node.session("xtdb", Arc::new(Authority)).unwrap();
+    let relation = OwnedRelation::new("held-range").unwrap();
+    let path = OwnedRelation::new("by-priority").unwrap();
+    let documents = Documents::new(
+        [(3, 20), (2, 10), (1, 10)].into_iter().map(|(id, priority)| StructFields::from([
+            ("_id".into(), Value::I64(id)),
+            ("priority".into(), Value::I64(priority)),
+        ])).collect(),
+        node.memory(),
+    ).unwrap();
+    let insert = TxOp::OwnedInsertDocs {
+        relation: relation.clone(), documents, valid_from: Some(Timestamp(0)), valid_to: None,
+    };
+    let write = writer.state_mut().execute_tx(vec![insert], AutonomousTxOptions::default()).await.unwrap();
+    assert!(write.committed(), "{:?}", write.error());
+    let declaration = TxOp::OwnedDeclarePath {
+        relation: relation.clone(), name: path.clone(), columns: vec!["priority".into(), "_id".into()],
+    };
+    let write = writer.state_mut().execute_tx(vec![declaration], AutonomousTxOptions::default()).await.unwrap();
+    assert!(write.committed(), "{:?}", write.error());
+    let held = writer.open_owned_read().await.unwrap();
+    let failure = held.range(&relation, &path, None, None, 2).await.err().unwrap();
+    assert_eq!(failure.code, "rtdb.owned/path-uncovered");
+    held.close();
+    drop(held);
+
+    let database = node.catalog().database("xtdb").unwrap();
+    index_flush(&node, &database).await;
+    database.build_artefacts().await.unwrap();
+    let held = writer.open_owned_read().await.unwrap();
+    let lower = Value::I64(10);
+    let upper = Value::I64(20);
+    let result = held.range(&relation, &path, Some(&lower), Some(&upper), 8).await.unwrap();
+    let batch = result.batch.unwrap();
+    let batch = batch.batch();
+    assert_eq!(batch.num_rows(), 2);
+    let ids = (0..batch.num_rows()).map(|row| {
+        rtdb_columnar::read_value(result.schema.field(1), batch.column(1).as_ref(), row).unwrap()
+    }).collect::<Vec<_>>();
+    assert_eq!(ids, [Value::I64(1), Value::I64(2)]);
+    drop(held);
+    drop(writer);
+    stop(&node, driver).await;
+}
+
+#[tokio::test]
 async fn source_barrier_waits_for_submitted_transactions_before_the_next_read() {
     let (node, driver) = Node::open(options(), services()).await.unwrap();
     let mut writer = node.session("xtdb", Arc::new(Authority)).unwrap();

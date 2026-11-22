@@ -34,6 +34,7 @@ impl Running {
         let auth = Authenticator::open(AuthConfig::SingleRootUser { password: password.map(Secret::new) }, MemoryBudget::new(64 << 20), node_clock.clone(), Arc::new(NoHttp)).await.unwrap();
         let services = NodeServices { clock: node_clock, ..NodeServices::local(auth.clone(), Arc::new(Observer), auth.clone(), Arc::new(Metrics)) };
         let mut options = NodeOptions::default(); options.automatic_compaction = false; options.automatic_gc = false; options.replication.assertion_interval = Duration::from_millis(1); options.replication.election_seed = 1;
+        options.owned_relations = config.owned_native_actions;
         if !placements.is_empty() { options.membership = Membership::Placed; }
         let (node, driver) = Node::open(options, services).await.unwrap(); let node_task = tokio::spawn(driver.run());
         for &database in placements { node.database_or_attach(database.into(), Default::default()).await.unwrap().unwrap(); }
@@ -752,5 +753,80 @@ async fn transactional_record_inserts_with_many_parameter_rows_release_their_mem
     }
     assert_eq!(integer(&client.query("SELECT COUNT(*) FROM docs").await[0], 0, 0), 2000);
     assert!(running.node.memory().used_bytes() - baseline < 16 << 20);
+    running.stop().await;
+}
+
+#[tokio::test]
+async fn grouped_owned_commit_checks_every_relation_before_writing() {
+    use arrow_ipc::{reader::StreamReader, writer::IpcWriteOptions};
+    use rtdb_format::ipc::write_arrow_stream;
+
+    fn ipc(batch: RecordBatch) -> Vec<u8> {
+        write_arrow_stream(batch.schema_ref(), std::slice::from_ref(&batch), IpcWriteOptions::default()).unwrap()
+    }
+
+    fn row(operation: &str, value: Option<i64>, observed_at: Option<i64>, expected: Option<i64>) -> Vec<u8> {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("_id", DataType::Int64, false),
+            Field::new("_op", DataType::Utf8, false),
+            Field::new("value", DataType::Int64, true),
+            Field::new("_read_valid_micros", DataType::Int64, true),
+            Field::new("_read_system_micros", DataType::Int64, true),
+        ]));
+        ipc(RecordBatch::try_new(schema, vec![
+            Arc::new(Int64Array::from(vec![1])),
+            Arc::new(StringArray::from(vec![operation])),
+            Arc::new(Int64Array::from(vec![value])),
+            Arc::new(Int64Array::from(vec![observed_at])),
+            Arc::new(Int64Array::from(vec![expected])),
+        ]).unwrap())
+    }
+
+    fn grouped(groups: &[(&str, Vec<u8>)]) -> Bytes {
+        let mut body = i64::MAX.to_be_bytes().to_vec();
+        body.extend_from_slice(&(groups.len() as u16).to_be_bytes());
+        for (relation, stream) in groups {
+            body.extend_from_slice(&(relation.len() as u16).to_be_bytes());
+            body.extend_from_slice(relation.as_bytes());
+            body.extend_from_slice(&(stream.len() as u32).to_be_bytes());
+            body.extend_from_slice(stream);
+        }
+        body.into()
+    }
+
+    async fn point(client: &mut Client, relation: &str) -> (i64, i64) {
+        let mut body = (relation.len() as u16).to_be_bytes().to_vec();
+        body.extend_from_slice(relation.as_bytes());
+        body.extend_from_slice(&ipc(RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new("_id", DataType::Int64, false)])),
+            vec![Arc::new(Int64Array::from(vec![1]))],
+        ).unwrap()));
+        let output = client.action("rtdb.owned.ReadPoint.v1", body.into()).await.unwrap();
+        let mut stream = StreamReader::try_new(output[0].body.as_ref(), None).unwrap();
+        let at = stream.schema().metadata()["rtdb.owned.valid_micros"].parse().unwrap();
+        let batch = stream.next().unwrap().unwrap();
+        let value = integer(&batch, batch.schema().index_of("value").unwrap(), 0);
+        (at, value)
+    }
+
+    let running = Running::start(Some("secret"), FlightConfig { owned_native_actions: true, ..FlightConfig::default() }).await;
+    let mut client = Client::connect(&running.server, Some("xtdb:secret")).await;
+    let commit = "rtdb.owned.Commit.v2";
+    let created = client.action(commit, grouped(&[
+        ("items", row("create", Some(10), None, None)),
+        ("orders", row("create", Some(20), None, None)),
+    ])).await.unwrap();
+    assert_eq!(created.len(), 1);
+    assert_eq!(point(&mut client, "items").await.1, 10);
+    let (at, value) = point(&mut client, "orders").await;
+    assert_eq!(value, 20);
+
+    let refused = client.action(commit, grouped(&[
+        ("items", row("replace", Some(11), None, None)),
+        ("orders", row("check", None, Some(at), Some(i64::MIN))),
+    ])).await;
+    assert_eq!(refused.unwrap_err().message(), "The owned point observation changed before ordering");
+    assert_eq!(point(&mut client, "items").await.1, 10);
+    assert_eq!(point(&mut client, "orders").await.1, 20);
     running.stop().await;
 }

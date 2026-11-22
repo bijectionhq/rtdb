@@ -153,6 +153,7 @@ impl TableRef {
 
 const OWNED_SCHEMA_PREFIX: &str = "rtdb_owned_";
 const OWNED_SCHEMA_V1: &str = "rtdb_owned_v1";
+const OWNED_PATH_CATALOG: &str = ".ordered-paths";
 
 /// A native relation provisioned in the authenticated principal's namespace.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -169,27 +170,36 @@ impl OwnedRelation {
 
     pub fn name(&self) -> &str { &self.0 }
 
-    pub fn table(&self, owner: &str) -> TableRef {
-        let owner = Sha256::digest(owner.as_bytes());
-        let mut name = String::with_capacity(65 + self.0.len());
-        for byte in owner {
-            use fmt::Write;
-            write!(&mut name, "{byte:02x}").expect("writing to a string cannot fail");
-        }
-        name.push('-');
-        name.push_str(&self.0);
-        TableRef::new(OWNED_SCHEMA_V1, name)
+    pub fn table(&self, owner: &str) -> TableRef { owned_table(owner, &self.0) }
+
+    pub fn path_catalog(owner: &str) -> TableRef { owned_table(owner, OWNED_PATH_CATALOG) }
+}
+
+fn owned_table(owner: &str, name: &str) -> TableRef {
+    let owner = Sha256::digest(owner.as_bytes());
+    let mut physical = String::with_capacity(65 + name.len());
+    for byte in owner {
+        use fmt::Write;
+        write!(&mut physical, "{byte:02x}").expect("writing to a string cannot fail");
     }
+    physical.push('-');
+    physical.push_str(name);
+    TableRef::new(OWNED_SCHEMA_V1, physical)
 }
 
 impl TableRef {
     pub fn owned_schema(schema: &str) -> bool { schema.starts_with(OWNED_SCHEMA_PREFIX) }
 
+    pub fn is_owned_path_catalog(&self) -> bool {
+        self.table.split_once('-').is_some_and(|(_, name)| name == OWNED_PATH_CATALOG)
+            && self.supported_owned_name()
+    }
+
     pub fn supported_owned_name(&self) -> bool {
         self.schema == OWNED_SCHEMA_V1
             && self.table.split_once('-').is_some_and(|(owner, name)| {
                 owner.len() == 64 && owner.bytes().all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-                    && OwnedRelation::new(name).is_ok()
+                    && (name == OWNED_PATH_CATALOG || OwnedRelation::new(name).is_ok())
             })
     }
 }

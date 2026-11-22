@@ -1,4 +1,5 @@
 mod ordered_index;
+pub use ordered_index::OwnedRangePage;
 mod session;
 mod resources;
 mod catalog;
