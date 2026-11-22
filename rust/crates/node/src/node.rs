@@ -1762,7 +1762,12 @@ impl NativeSession {
         controls: Vec<rtdb_tx::HostedControlWrite>, deadline: Timestamp,
     ) -> Result<TransactionResult> {
         let unavailable = rtdb_types::OwnedWorld::unavailable;
-        if !(1..=8).contains(&sections.len()) || controls.is_empty() || controls.iter().any(|control| !control.is_check())
+        let retained_release = matches!(sections.as_slice(), [(_, section)]
+            if matches!(&section.effect, OwnedWorldEffect::Drop)
+                && section.checks.is_empty() && section.expected_clock.is_none())
+            && root.checks.is_empty() && root.publication.is_none()
+            && rtdb_tx::retained_release_controls(&controls);
+        if !(1..=8).contains(&sections.len()) || controls.is_empty() || (!retained_release && controls.iter().any(|control| !control.is_check()))
             || root.checks.iter().any(|check| match check {
                 TxOp::OwnedCheck { relation, .. } | TxOp::OwnedCheckRange { relation, .. } =>
                     relation.world().is_some() || relation.is_world_catalog(),
@@ -1794,7 +1799,7 @@ impl NativeSession {
                 OwnedWorldEffect::Overlay(_) => return Err(unavailable()),
                 OwnedWorldEffect::Clock(_) | OwnedWorldEffect::Drop => 0,
             };
-            if !worlds.insert(section.world) || !(1..=128).contains(&section.checks.len())
+            if !worlds.insert(section.world) || (!retained_release && !(1..=128).contains(&section.checks.len()))
                 || !attempts.insert(&section.attempt)
             {
                 return Err(unavailable());

@@ -1359,6 +1359,8 @@ rule ConsumeIntake {
 -- A retained registration with checked hosted replacements and no Root fact writes leaves the Root head unchanged.
 -- The placed replay inventory binds the new retained registration and exact Root relation set, and separately identifies the admitted hosted tables receiving replacements.
 -- Early drop orders a terminal owner-scoped marker before the directory releases its capture pin.
+-- An installed owner can order one read-only world drop with existing hosted owner-row replacements checked at the same cut.
+-- The terminal registration and checked hosted replacements are bound to the same signed outcome and leave the Root head unchanged.
 -- The terminal marker refuses later world opens and writes.
 -- A retry may release the original pin after observing the same terminal marker.
 ------------------------------------------------------------

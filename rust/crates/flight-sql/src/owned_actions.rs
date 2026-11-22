@@ -1889,6 +1889,7 @@ impl Service {
         let count = usize::from(u16::from_be_bytes(*count));
         if !(1..=8).contains(&count) { return Err(invalid("A world batch requires one to eight worlds")); }
         let _framing = call.reserve((count + 2) * MAX_COMMIT_GROUPS * 512)?;
+        let mut release_eligible = count == 1;
         let mut worlds = BTreeSet::new();
         let mut attempts = BTreeSet::new();
         let mut sections = Vec::with_capacity(count);
@@ -1902,7 +1903,7 @@ impl Service {
             let (handle, rest) = rest.split_first_chunk::<16>().ok_or_else(|| invalid("Missing world batch held handle"))?;
             let (count, rest) = rest.split_first_chunk::<2>().ok_or_else(|| invalid("Missing world batch witness count"))?;
             let count = usize::from(u16::from_be_bytes(*count));
-            if !(1..=MAX_WORLD_WITNESSES).contains(&count) { return Err(invalid("Invalid world batch witness count")); }
+            if count > MAX_WORLD_WITNESSES { return Err(invalid("Invalid world batch witness count")); }
             let (nonces, rest) = rest.split_at_checked(count * 16).ok_or_else(|| invalid("Incomplete world batch witnesses"))?;
             let (attempt, rest) = rest.split_first_chunk::<22>().ok_or_else(|| invalid("Missing world batch attempt identity"))?;
             let attempt = std::str::from_utf8(attempt).map_err(|_| invalid("Invalid world batch attempt identity"))?;
@@ -1918,6 +1919,11 @@ impl Service {
             let parent_pin = resource.snapshot.parent_pin();
             let expected_clock = resource.snapshot.application_clock();
             let mode = resource.snapshot.clock_mode();
+            release_eligible &= mode == rtdb_types::WorldClockMode::Retained
+                && *kind == 2 && count == 0;
+            if count == 0 && !release_eligible {
+                return Err(invalid("Ordinary world effects require original witnesses"));
+            }
             if (*kind == 0 && !mode.is_writable())
                 || (*kind == 1 && !matches!(mode, rtdb_types::WorldClockMode::Held { .. }))
             {
@@ -1950,7 +1956,7 @@ impl Service {
         let ([root_kind], body) = body.split_first_chunk::<1>().ok_or_else(|| invalid("Missing Root section kind"))?;
         let (root_read, body) = match *root_kind {
             0 => (None, body),
-            1 | 2 => {
+            1 | 2 | 3 => {
                 let (handle, body) = body.split_first_chunk::<16>().ok_or_else(|| invalid("Missing original Root hold"))?;
                 (Some(self.owned_read(call, &Bytes::copy_from_slice(handle))?), body)
             }
@@ -1993,14 +1999,20 @@ impl Service {
             root.publication = Some(rtdb_node::OwnedRootPublication { attempt: attempt.to_owned(), writes: root_writes });
         }
         let observed_root = !root.checks.is_empty() || !root_witnesses.is_empty();
-        if (*root_kind == 0 && observed_root) || (*root_kind == 1 && !observed_root) {
+        let release = *root_kind == 3;
+        if (*root_kind == 0 && observed_root) || (*root_kind == 1 && !observed_root)
+            || release != release_eligible || (release && observed_root)
+        {
             return Err(invalid("The Root section kind disagrees with its observations"));
         }
         rows_left = rows_left.checked_sub(root_witnesses.len()).ok_or_else(|| invalid("World batch exceeds its effect limit"))?;
         let controls = owned_groups(body, true, false)?;
         hosted_control::admit_control_targets(policy, controls.iter().map(|(relation, _)| relation))?;
         let scope = self.hosted_control_scope(call).await?;
-        let (controls, _charges) = self.decode_hosted_control_groups(call, controls, scope, &mut rows_left, true)?;
+        let (controls, _charges) = self.decode_hosted_control_groups(call, controls, scope, &mut rows_left, !release)?;
+        if release && !rtdb_tx::retained_release_controls(&controls) {
+            return Err(invalid("A retained drop needs original checks and existing owner replacements"));
+        }
         let (_, attachment) = call.session.resolve_database(Some(&call.database), &self.0.node)?;
         let attachment = attachment.ok_or_else(unsupported)?;
         let connection = self.connection(call, &call.database).await?;

@@ -51,8 +51,9 @@ impl OpenTransaction<'_> {
         }
         let validating_world = !self.owned_worlds.is_empty();
         let publishing_world = operations.iter().any(|op| matches!(op, Operation::Public(TxOp::OwnedPublishWorld { .. })));
+        let retained_release = crate::hosted_control::retained_release_world(operations).is_some();
         if validating_world && (
-            controls.clone().any(|control| !control.is_check())
+            (!retained_release && controls.clone().any(|control| !control.is_check()))
             || !operations.iter().any(|operation| matches!(operation, Operation::Public(TxOp::OwnedCheckWorldScope { .. })))
         ) {
             return Err(unavailable());
@@ -88,7 +89,7 @@ impl OpenTransaction<'_> {
         let fork_with_controls = operations.iter().any(|operation| matches!(
             operation, Operation::Public(TxOp::OwnedForkWorld { root: crate::OwnedForkRoot::Controls, .. })
         ));
-        if !has_fact_write && !fork_with_controls && controls.clone().any(|control| !control.is_check()) {
+        if !has_fact_write && !fork_with_controls && !retained_release && controls.clone().any(|control| !control.is_check()) {
             return Err(unavailable());
         }
 

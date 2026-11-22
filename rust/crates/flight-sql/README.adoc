@@ -525,6 +525,8 @@ Kinds 1 and 2 carry the original 16-byte Root hold. Kind 2 also carries its 22-b
 Next come a u16 Root range witness count and the original handle/nonce pairs, then the u32 byte length and ordered Root fact groups.
 Kind 1 supplies point checks, range checks, or both. Kind 2 also supplies Root inserts, replacements, or deletes.
 The request ends with the common check-only hosted ownership groups.
+Root kind 3 carries the original live Root handle and selects a single retained world Drop with zero world witnesses and no Root fact operations.
+It requires an original hosted check and one or two replacements with present expectations. The retained terminal registration and checked replacements order together.
 The Root head, local writes, clocks, terminal registrations and immutable attempt markers share one transaction key in the commit reply.
 The placed archive owner retires the exact dropped pins after the ordered result.
 
