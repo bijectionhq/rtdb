@@ -11,17 +11,17 @@ use super::invalid;
 pub(crate) const WORLD_EFFECTS: &str = "owned_world_effects";
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum Kind { Root, Overlay, Clock, Fork, RootRetainedFork, ControlsRetainedFork, ProposalControlsFork, Advance, Drop, ControlsRetainedDrop, RootRetainedDrop }
+enum Kind { Root, Overlay, Clock, Fork, RootRetainedFork, RootRetainedAdvance, ControlsRetainedFork, ProposalControlsFork, Advance, Drop, ControlsRetainedDrop, RootRetainedDrop }
 
 const ROOT: Iid = Iid([0; 16]);
 
 impl Kind {
     fn writes_data(self) -> bool {
-        matches!(self, Self::Root | Self::Overlay | Self::RootRetainedFork | Self::RootRetainedDrop)
+        matches!(self, Self::Root | Self::Overlay | Self::RootRetainedFork | Self::RootRetainedAdvance | Self::RootRetainedDrop)
     }
 
     fn relation_world(self, registered_world: Iid) -> Iid {
-        if matches!(self, Self::RootRetainedFork | Self::RootRetainedDrop) { ROOT } else { registered_world }
+        if matches!(self, Self::RootRetainedFork | Self::RootRetainedAdvance | Self::RootRetainedDrop) { ROOT } else { registered_world }
     }
 
     fn name(self) -> &'static str {
@@ -31,6 +31,7 @@ impl Kind {
             Self::Clock => "clock",
             Self::Fork => "fork",
             Self::RootRetainedFork => "root-retained-fork",
+            Self::RootRetainedAdvance => "root-retained-advance",
             Self::ControlsRetainedFork => "controls-retained-fork",
             Self::ProposalControlsFork => "controls-proposal-fork",
             Self::Advance => "advance",
@@ -47,6 +48,7 @@ impl Kind {
             "clock" => Ok(Self::Clock),
             "fork" => Ok(Self::Fork),
             "root-retained-fork" => Ok(Self::RootRetainedFork),
+            "root-retained-advance" => Ok(Self::RootRetainedAdvance),
             "controls-retained-fork" => Ok(Self::ControlsRetainedFork),
             "controls-proposal-fork" => Ok(Self::ProposalControlsFork),
             "advance" => Ok(Self::Advance),
@@ -79,6 +81,7 @@ pub(crate) fn source_inventory(operations: &[Operation]) -> Result<Vec<Value>> {
                 Some(Value::Uuid(world)) => {
                     let kind = match root {
                         crate::OwnedForkRoot::Writes => Kind::RootRetainedFork,
+                        crate::OwnedForkRoot::WritesAdvance => Kind::RootRetainedAdvance,
                         crate::OwnedForkRoot::Controls => Kind::ControlsRetainedFork,
                         crate::OwnedForkRoot::ProposalControls => Kind::ProposalControlsFork,
                         crate::OwnedForkRoot::None if previous.is_some() => Kind::Advance,
@@ -124,6 +127,7 @@ pub(super) fn verify(
     let mut common_fingerprint: Option<&[u8]> = None;
     let mut hosted = HostedEffects::CheckOnly;
     let mut root_retained_fork = false;
+    let mut authored_advance = false;
     for effect in effects {
         let Value::Struct(fields) = effect else { return Err(mismatch()); };
         let (Some(Value::Uuid(world)), Some(Value::Utf8(kind)), Some(Value::Utf8(attempt)), Some(Value::Binary(fingerprint)), Some(Value::List(relations))) =
@@ -134,8 +138,8 @@ pub(super) fn verify(
         if fields.len() != 5 || relations.is_empty() == kind.writes_data()
             || (world == ROOT) != (kind == Kind::Root) || fingerprint.len() != 32
             || attempt.len() != 22 || !attempt.bytes().all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-            || (effects.len() > 1 && matches!(kind, Kind::Fork | Kind::RootRetainedFork | Kind::ControlsRetainedFork | Kind::ProposalControlsFork | Kind::Advance | Kind::ControlsRetainedDrop | Kind::RootRetainedDrop))
-            || (kind == Kind::RootRetainedDrop && relations.len() != 1)
+            || (effects.len() > 1 && matches!(kind, Kind::Fork | Kind::RootRetainedFork | Kind::RootRetainedAdvance | Kind::ControlsRetainedFork | Kind::ProposalControlsFork | Kind::Advance | Kind::ControlsRetainedDrop | Kind::RootRetainedDrop))
+            || (matches!(kind, Kind::RootRetainedDrop | Kind::RootRetainedAdvance) && relations.len() != 1)
             || common_fingerprint.is_some_and(|first| first != fingerprint.as_slice())
             || worlds.insert(world, kind).is_some()
             || attempts.insert(attempt.as_str(), fingerprint.as_slice()).is_some()
@@ -145,12 +149,16 @@ pub(super) fn verify(
         if kind == Kind::RootRetainedFork {
             root_retained_fork = true;
             hosted = HostedEffects::OptionalReplacements;
+        } else if kind == Kind::RootRetainedAdvance {
+            root_retained_fork = true;
+            authored_advance = true;
+            hosted = HostedEffects::RetainedWrite;
         } else if matches!(kind, Kind::ControlsRetainedFork | Kind::ProposalControlsFork) {
             hosted = HostedEffects::RequiredReplacements;
         } else if kind == Kind::ControlsRetainedDrop {
             hosted = HostedEffects::RetainedRelease;
         } else if kind == Kind::RootRetainedDrop {
-            hosted = HostedEffects::RetainedDelete;
+            hosted = HostedEffects::RetainedWrite;
         }
         for relation in relations {
             let Value::Utf8(name) = relation else { return Err(mismatch()); };
@@ -168,7 +176,7 @@ pub(super) fn verify(
     if separate_root && worlds.len() == 1 || worlds.len() - usize::from(separate_root) > 8 {
         return Err(mismatch());
     }
-    let delete_root = matches!(hosted, HostedEffects::RetainedDelete);
+    let delete_root = worlds.values().any(|kind| *kind == Kind::RootRetainedDrop);
     let has_root = separate_root || root_retained_fork || delete_root;
     if has_root {
         expected_data.insert(OWNED_ROOT_PUBLICATION_RELATION);
@@ -217,6 +225,9 @@ pub(super) fn verify(
                     Some(Kind::ProposalControlsFork) => !record.dropped && record.id == record.pin
                         && record.mode == rtdb_types::WorldClockMode::Proposal
                         && record.parent_publication == Some(record.basis.system_time),
+                    Some(Kind::RootRetainedAdvance) => !record.dropped && record.id != record.pin
+                        && record.mode == rtdb_types::WorldClockMode::Retained
+                        && record.parent_publication == Some(record.basis.system_time),
                     Some(Kind::Advance) => !record.dropped && !record.mode.is_writable() && record.id != record.pin,
                     _ => false,
                 };
@@ -261,7 +272,10 @@ pub(super) fn verify(
             if delete_root && allows_delete && (batch.len() != 1 || batch.header(0)?.op != EventOp::Delete) {
                 return Err(mismatch());
             }
-            event_headers(batch, key, allows_delete)?;
+            if authored_advance && allows_delete && (batch.len() != 1 || batch.header(0)?.op != EventOp::Put) {
+                return Err(mismatch());
+            }
+            event_headers(batch, key, allows_delete && !authored_advance)?;
         }
     }
     if !attempts.is_empty() || root_head != has_root || data != expected_data
@@ -270,7 +284,7 @@ pub(super) fn verify(
             Kind::Root => false,
             Kind::Overlay => !overlays.contains(world) || !clocks.contains(world),
             Kind::Clock => !clocks.contains(world),
-            Kind::Fork | Kind::RootRetainedFork | Kind::ControlsRetainedFork | Kind::ProposalControlsFork | Kind::Advance | Kind::Drop | Kind::ControlsRetainedDrop | Kind::RootRetainedDrop => !registrations.contains(world),
+            Kind::Fork | Kind::RootRetainedFork | Kind::RootRetainedAdvance | Kind::ControlsRetainedFork | Kind::ProposalControlsFork | Kind::Advance | Kind::Drop | Kind::ControlsRetainedDrop | Kind::RootRetainedDrop => !registrations.contains(world),
         })
     {
         return Err(mismatch());
@@ -283,7 +297,7 @@ pub(super) enum HostedEffects {
     OptionalReplacements,
     RequiredReplacements,
     RetainedRelease,
-    RetainedDelete,
+    RetainedWrite,
 }
 
 fn event_headers(batch: &IndexBatch, key: TransactionKey, allows_delete: bool) -> Result<()> {

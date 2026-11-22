@@ -1672,6 +1672,7 @@ impl NativeSession {
             && fork.cut.is_publication()
             && fork.root.as_ref().is_some_and(|root| root.publication.is_none());
         let root = match &fork.root {
+            Some(section) if section.publication.is_some() && fork.previous.is_some() => OwnedForkRoot::WritesAdvance,
             Some(section) if section.publication.is_some() => OwnedForkRoot::Writes,
             Some(_) if proposal_controls => OwnedForkRoot::ProposalControls,
             Some(_) => OwnedForkRoot::Controls,
@@ -1696,7 +1697,8 @@ impl NativeSession {
             || (root == OwnedForkRoot::None && fork.controls.iter().any(|control| !control.is_check()))
             || (matches!(root, OwnedForkRoot::Controls | OwnedForkRoot::ProposalControls)
                 && fork.controls.iter().all(rtdb_tx::HostedControlWrite::is_check))
-            || (root != OwnedForkRoot::None && (fork.previous.is_some()
+            || (root == OwnedForkRoot::WritesAdvance && !fork.cut.is_publication())
+            || (root != OwnedForkRoot::None && ((fork.previous.is_some() && root != OwnedForkRoot::WritesAdvance)
                 || (requested != rtdb_types::WorldClockMode::Retained && !proposal_controls)
                 || (fork.cut.live.is_none() && !fork.cut.is_publication())))
             || fork.root.iter().flat_map(|section| &section.checks).any(|check| match check {

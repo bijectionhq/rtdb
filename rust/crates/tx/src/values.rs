@@ -947,6 +947,7 @@ fn schema_bytes(types: &[LogicalType]) -> Result<usize> {
 pub enum OwnedForkRoot {
     None,
     Writes,
+    WritesAdvance,
     Controls,
     ProposalControls,
 }

@@ -520,6 +520,10 @@ With Root fact writes, the resolver publishes the Root head in the same transact
 Without Root fact writes, at least one hosted replacement is required and the Root head does not advance.
 Mode 5 selects an initial writable Proposal at the exact held application publication; it requires checked hosted replacements and accepts only Root checks.
 The Proposal registration shares the ordered attempt with those replacements and leaves the Root head unchanged.
+Mode 4 also admits an original retained predecessor handle with a fresh expiry and a distinct new pin ID.
+An authored advance carries one acceptance-valid Root replacement with its original positive point check and a checked existing owner row replacement.
+Its current application publication must strictly advance the exact predecessor before the Root replacement, new retained registration and hosted settlement can publish.
+The archive owner retires the previous physical pin after ordering.
 The response has the v1 layout.
 A failed order can leave its preallocated archival pin retained until expiry without a visible registration.
 

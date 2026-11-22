@@ -217,8 +217,11 @@ pub(crate) async fn fork_checkpoint_world_selected(
         .await?
         .ok_or_else(OwnedWorld::unavailable)?;
     admit_session(session, &source, &owner)?;
+    let authored_advance = fork.previous.is_some() && fork.cut.is_publication()
+        && fork.root.as_ref().is_some_and(|root| root.publication.is_some())
+        && matches!(fork.requested, rtdb_node::WorldClockRequest::Retained);
     let (capture, suffix) = if capture.is_nil() {
-        if suffix.is_some() || fork.root.is_none() || fork.previous.is_some()
+        if suffix.is_some() || fork.root.is_none() || (fork.previous.is_some() && !authored_advance)
             || !(matches!(fork.requested, rtdb_node::WorldClockRequest::Retained)
                 || (matches!(fork.requested, rtdb_node::WorldClockRequest::Proposal)
                     && fork.root.as_ref().is_some_and(|root| root.publication.is_none())))
@@ -349,7 +352,8 @@ pub(crate) async fn fork_checkpoint_world_selected(
             .retain(|_, world| world.until > now);
         if let Some(previous) = fork.previous {
             let previous = record.checkpoint_worlds.get(&Uuid::from_bytes(previous.0)).ok_or_else(OwnedWorld::unavailable)?;
-            if previous.world != id || previous.owner != retained.owner || previous.until != retained.until
+            if previous.world != id || previous.owner != retained.owner
+                || (!authored_advance && previous.until != retained.until)
                 || previous.mode != WorldClockMode::Retained || retained.mode != WorldClockMode::Retained
                 || previous.basis.system_time >= retained.basis.system_time || previous.basis.tx_id >= retained.basis.tx_id
             {
