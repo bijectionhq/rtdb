@@ -65,6 +65,9 @@ pub trait OwnedWorldRead: Send + Sync {
     fn count<'a>(
         &'a self, relation: OwnedRelation, path: OwnedRelation, request: OwnedCountRequest<'a>,
     ) -> BoxFuture<'a, Result<(u64, OwnedWorldWitness)>>;
+    fn measure<'a>(
+        &'a self, relation: OwnedRelation, path: OwnedRelation, request: OwnedCountRequest<'a>,
+    ) -> BoxFuture<'a, Result<(u64, i128, OwnedWorldWitness)>>;
     fn overlay_range<'a>(
         &'a self, relation: OwnedRelation, path: OwnedRelation, request: OwnedRangeRequest<'a>, valid: Timestamp,
     ) -> BoxFuture<'a, Result<(OwnedRangePage, OwnedWorldWitness)>>;

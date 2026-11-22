@@ -35,6 +35,7 @@ impl Service {
                 crate::owned_actions::SEARCH_HELD_WORLD_V1 => Ok(vec![Ok(self.search_held_world_action(&call, &action.body).await?)]),
                 crate::owned_actions::HELD_WORLD_RANGE_V1 => Ok(vec![Ok(self.held_world_ordered_action(&call, &action.body, crate::owned_actions::WorldOrder::ParentRange).await?)]),
                 crate::owned_actions::HELD_WORLD_COUNT_V1 => Ok(vec![Ok(self.held_world_ordered_action(&call, &action.body, crate::owned_actions::WorldOrder::ParentCount).await?)]),
+                crate::owned_actions::HELD_WORLD_MEASURE_V1 => Ok(vec![Ok(self.held_world_ordered_action(&call, &action.body, crate::owned_actions::WorldOrder::ParentMeasure).await?)]),
                 crate::owned_actions::HELD_WORLD_OVERLAY_RANGE_V1 => Ok(vec![Ok(self.held_world_ordered_action(&call, &action.body, crate::owned_actions::WorldOrder::OverlayRange).await?)]),
                 crate::owned_actions::HELD_OWNED_RANGE_V1 => Ok(vec![Ok(self.held_owned_range_action(&call, &action.body, crate::owned_actions::HeldRangeFormat::Leading).await?)]),
                 crate::owned_actions::HELD_OWNED_RANGE_V2 => Ok(vec![Ok(self.held_owned_range_action(&call, &action.body, crate::owned_actions::HeldRangeFormat::Full).await?)]),

@@ -267,6 +267,17 @@ pub async fn owned_count(
     owned_count_at(context, owner, relation, path, request, None).await
 }
 
+/// Read the certified ordered measure at an already admitted native cut.
+pub async fn measure_owned_cut(
+    context: Arc<QueryContext>,
+    owner: &str,
+    relation: &rtdb_types::OwnedRelation,
+    path: &rtdb_types::OwnedRelation,
+    request: OwnedCountRequest<'_>,
+) -> Result<OwnedRangeCount> {
+    owned_total_at(context, owner, relation, path, request, None, true).await
+}
+
 pub(crate) async fn owned_count_at(
     context: Arc<QueryContext>,
     owner: &str,
