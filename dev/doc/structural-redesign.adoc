@@ -138,6 +138,7 @@ Placed resolution stages a history-, epoch- and principal-scoped outcome witness
 The checkpoint carries that witness into recovery.
 The SQL connection issues a provisional receipt for asynchronous submission and exchanges it for a causal token after verifying the installed outcome.
 Synchronous commits issue the causal token alongside the verified outcome.
+A frozen attachment can confirm a token from the verified checkpoint it loaded.
 Native logkeepers persist the active ensemble after recovery and supply an on-demand read index from its durable quorum.
 An implicit read on a linearizable subscriber waits for the read-index bound to be applied before it captures its time basis.
 The gateway retries a subscriber refusal on the holder when the command is still unanswered and the backend reports an idle transaction state.

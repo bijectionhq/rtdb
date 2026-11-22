@@ -428,7 +428,10 @@ impl Node {
         options.user = identity.user().map(str::to_owned);
         options.default_tz = rtdb_expr::normalize_timezone(&options.default_tz)?;
         let sql_options = rtdb_sql::PrepareOptions { generate_series_end_exclusive: self.factory.options.query.generate_series_end_exclusive, ..Default::default() };
-        let authority = database.await_authority.placed();
+        let authority = match &database.await_authority {
+            AwaitAuthority::Live { codec, .. } => Some(codec.as_ref()),
+            _ => None,
+        };
         let seed = authority.map(|authority| authority.scope().issue());
         let source = prepare_submission_with_sql_options(operations, options, database.name(), &self.factory.memory, &sql_options)?
             .with_placed_seed(seed);
@@ -510,35 +513,44 @@ impl Node {
     }
 
     async fn redeem_placed_attempt(&self, db: &Database, attempt: PlacedAttempt, submitted_at: Timestamp, identity: &dyn SessionIdentity, placement: Option<&Weak<Database>>, cancellation: &CancellationToken) -> Result<(TransactionResult, String)> {
-        let authority = db.await_authority.placed().ok_or_else(invalid_token)?;
+        let codec = db.await_authority.codec().ok_or_else(invalid_token)?;
         if self.now().0 >= submitted_at.0.saturating_add(rtdb_tx::RECEIPT_WINDOW_MICROS) {
             return Err(Anomaly::incorrect("rtdb/await-token-expired", "The transaction attempt receipt has expired"));
         }
         let epoch = attempt.scope().writer_epoch();
-        let current = authority.scope().writer_epoch();
-        if epoch > current { return Err(receipt_replica_behind(db.name())); }
-        let through = if epoch == current {
-            db.await_installed(|prefix| prefix.source >= attempt.position(), cancellation).await?
-        } else {
-            // Recovery of the closed epoch must settle its chosen tail before absence is authoritative.
-            let offset = cancellation.run_until_cancelled(authority.recovered_through()).await.ok_or_else(cancelled)?
-                .map_err(|error| receipt_replica_behind(db.name()).with_context("cause", error.code.into()))?;
-            let recovered = ReplicaPosition::from_epoch_offset(db.logs.replica_epoch, offset.0)?;
-            db.await_installed(|prefix| prefix.replica >= recovered, cancellation).await?
+        let current = codec.scope().writer_epoch();
+        let through = match &db.await_authority {
+            AwaitAuthority::Checkpoint { through, .. } => {
+                if epoch > current { return Err(receipt_checkpoint_behind(db.name())); }
+                *through
+            }
+            AwaitAuthority::Live { recovery, .. } => {
+                if epoch > current { return Err(receipt_replica_behind(db.name())); }
+                if epoch == current {
+                    db.await_installed(|prefix| prefix.source >= attempt.position(), cancellation).await?
+                } else {
+                    // Only the recovered end of the closed epoch authorizes a negative outcome.
+                    let offset = cancellation.run_until_cancelled(recovery.confirm()).await.ok_or_else(cancelled)?
+                        .map_err(|error| receipt_replica_behind(db.name()).with_context("cause", error.code.into()))?;
+                    let recovered = ReplicaPosition::from_epoch_offset(db.logs.replica_epoch, offset.0)?;
+                    db.await_installed(|prefix| prefix.replica >= recovered, cancellation).await?
+                }
+            }
+            _ => return Err(invalid_token()),
         };
         let key = match db.progress().current().placed_outcome(attempt) {
             Some(key) => Some(key),
             None => self.placed_outcome_key(db.name(), attempt, identity, placement, cancellation).await?,
         };
         let Some(key) = key else {
-            return if epoch < current {
-                Err(Anomaly::incorrect("rtdb/attempt-unresolved", "The closed writer epoch has no outcome for this transaction attempt"))
-            } else {
-                Err(Anomaly::new(AnomalyCategory::Unavailable, "rtdb/attempt-pending", "The transaction attempt has no installed outcome"))
-            };
+            return Err(match db.await_authority {
+                AwaitAuthority::Checkpoint { .. } => receipt_checkpoint_behind(db.name()),
+                _ if epoch < current => Anomaly::incorrect("rtdb/attempt-unresolved", "The closed writer epoch has no outcome for this transaction attempt"),
+                _ => Anomaly::new(AnomalyCategory::Unavailable, "rtdb/attempt-pending", "The transaction attempt has no installed outcome"),
+            });
         };
         let result = self.await_transaction_result(db.name(), key.tx_id, Some(key), identity, placement, cancellation).await?;
-        let token = PlacedToken::Applied { attempt, through }.seal(authority)?;
+        let token = PlacedToken::Applied { attempt, through }.seal(codec)?;
         Ok((result, token))
     }
 
@@ -908,18 +920,27 @@ impl NativeSessionService {
             match token {
                 PlacedToken::Pending { attempt, submitted_at } => self.node.redeem_placed_attempt(db, attempt, submitted_at, self.identity.as_ref(), self.placement.as_ref(), cancellation).await.map(Some),
                 PlacedToken::Applied { attempt, through } => {
-                    let authority = db.await_authority.placed().ok_or_else(invalid_token)?;
-                    if attempt.scope().writer_epoch() > authority.scope().writer_epoch() {
-                        return Err(receipt_replica_behind(db.name()));
+                    let codec = db.await_authority.codec().ok_or_else(invalid_token)?;
+                    let within_history = attempt.scope().writer_epoch() <= codec.scope().writer_epoch()
+                        && through.epoch() == db.logs.replica_epoch;
+                    match &db.await_authority {
+                        AwaitAuthority::Checkpoint { through: checkpoint, .. } => {
+                            if !within_history || through > *checkpoint { return Err(receipt_checkpoint_behind(db.name())); }
+                        }
+                        AwaitAuthority::Live { .. } => {
+                            if !within_history { return Err(receipt_replica_behind(db.name())); }
+                            db.await_installed(|prefix| prefix.replica >= through, cancellation).await?;
+                        }
+                        _ => return Err(invalid_token()),
                     }
-                    db.await_installed(|prefix| prefix.replica >= through, cancellation).await?;
                     Ok(None)
                 }
             }
         };
-        let deadline = if db.read_only() { timeout.min(Duration::from_millis(250)) } else { timeout };
+        let replica = db.read_only() && matches!(db.await_authority, AwaitAuthority::Live { .. });
+        let deadline = if replica { timeout.min(Duration::from_millis(250)) } else { timeout };
         tokio::time::timeout(deadline, work).await.map_err(|_| {
-            if db.read_only() { receipt_replica_behind(db.name()) } else { timeout_error() }
+            if replica { receipt_replica_behind(db.name()) } else { timeout_error() }
         })?
     }
 
@@ -983,7 +1004,7 @@ impl SessionService for NativeSessionService {
             return Ok(None);
         }
         let db = self.database()?;
-        let authority = db.await_authority.placed().ok_or_else(invalid_token)?;
+        let authority = db.await_authority.codec().ok_or_else(invalid_token)?;
         let token = PlacedToken::open(token, authority, self.identity.user())?;
         Ok(self.confirm_placed_token(&db, token, timeout, cancellation).await?.map(|(_, applied)| applied))
     }
@@ -992,7 +1013,8 @@ impl SessionService for NativeSessionService {
         let Some(token) = token else { return Ok(()); };
         let db = self.node.attached_database(database, self.placement.as_ref())?;
         if matches!(db.await_authority, AwaitAuthority::SourcePosition) { return Ok(()); }
-        let authority = db.await_authority.placed().ok_or_else(invalid_token)?;
+        db.require_writable()?;
+        let authority = db.await_authority.codec().ok_or_else(invalid_token)?;
         let token = PlacedToken::open(token, authority, self.identity.user())?;
         if let PlacedToken::Pending { attempt, submitted_at } = token
             && attempt.scope() == authority.scope()
@@ -1016,7 +1038,7 @@ impl SessionService for NativeSessionService {
             return Ok((self.await_transaction(database, submitted.tx_id, cancellation).await?, None));
         };
         let db = self.node.attached_database(database, self.placement.as_ref())?;
-        let authority = db.await_authority.placed().ok_or_else(invalid_token)?;
+        let authority = db.await_authority.codec().ok_or_else(invalid_token)?;
         let token = PlacedToken::open(receipt, authority, self.identity.user())?;
         self.confirm_placed_token(&db, token, Duration::from_secs(60), cancellation).await?
             .map(|(result, applied)| (result, Some(applied))).ok_or_else(invalid_token)
@@ -1080,5 +1102,8 @@ fn bad_attempt_outcome() -> Anomaly {
 }
 fn receipt_replica_behind(database: &str) -> Anomaly {
     Anomaly::new(AnomalyCategory::Unavailable, REPLICA_BEHIND, format!("This replica of {database} could not confirm the await token"))
+}
+fn receipt_checkpoint_behind(database: &str) -> Anomaly {
+    Anomaly::new(AnomalyCategory::Unavailable, "rtdb/checkpoint-behind", format!("This checkpoint of {database} does not cover the await token"))
 }
 fn timeout_error() -> Anomaly { Anomaly::new(AnomalyCategory::Unavailable, "xtdb/await-tx-timeout", "Timed out awaiting indexed progress") }

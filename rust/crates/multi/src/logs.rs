@@ -15,10 +15,10 @@ use futures::FutureExt;
 use prost_types::Any;
 use rtdb_format::envelope::{ReplicaBody, ReplicaEnvelope};
 use rtdb_logkeeper::{QuorumLog, StreamConfig};
-use rtdb_node::{AwaitAuthority, LogAccess, LogFactory, OpenedLogs, PlacedReceiptAuthority, ReplicaReadIndex};
+use rtdb_node::{AwaitAuthority, ClosedEpochRecovery, LogAccess, LogFactory, OpenedLogs, PlacedReceiptCodec, ReplicaReadIndex};
 use rtdb_storage::log::{AppendReceipt, Log, LogOffset, LogRange, LogRecord, LogReplayTail, LogTail, MemoryLog, ReplayHead};
 use rtdb_storage::object_store::ReadReservation;
-use rtdb_types::{Anomaly, PLACED_ATTEMPT_OUTCOME_TABLE, PlacedAttemptScope, Result, SourcePosition, StorageEpoch, Timestamp};
+use rtdb_types::{Anomaly, BlockIndex, PLACED_ATTEMPT_OUTCOME_TABLE, PlacedAttemptScope, ReplicaPosition, Result, SourcePosition, StorageEpoch, Timestamp};
 use tokio_util::sync::CancellationToken;
 
 use crate::cipher::{Cipher, SEALED_OVERHEAD};
@@ -42,17 +42,14 @@ impl ReplicaReadIndex for LogletReadIndex {
     }
 }
 
-struct LogletReceipts {
+struct DeploymentReceipts {
     scope: PlacedAttemptScope,
     cipher: Cipher,
-    index: LogletReadIndex,
-    recovered: Option<LogOffset>,
 }
 
 const RECEIPT_ASSOCIATED: &str = "rtdb.multi/placed-await/v1";
 
-#[async_trait]
-impl PlacedReceiptAuthority for LogletReceipts {
+impl PlacedReceiptCodec for DeploymentReceipts {
     fn scope(&self) -> PlacedAttemptScope { self.scope }
     fn seal(&self, value: &[u8]) -> Result<String> {
         Ok(URL_SAFE_NO_PAD.encode(self.cipher.seal(RECEIPT_ASSOCIATED, value)?))
@@ -62,9 +59,6 @@ impl PlacedReceiptAuthority for LogletReceipts {
         if token.len() > 192 { return Err(invalid()); }
         let sealed = URL_SAFE_NO_PAD.decode(token).map_err(|_| invalid())?;
         self.cipher.open(RECEIPT_ASSOCIATED, &sealed).map(|bytes| bytes.to_vec()).map_err(|_| invalid())
-    }
-    async fn recovered_through(&self) -> Result<LogOffset> {
-        match self.recovered { Some(position) => Ok(position), None => self.index.confirm().await }
     }
 }
 
@@ -127,8 +121,6 @@ impl EnsembleRecorder for DirectoryRecorder {
     }
 }
 
-/// A frozen checkpoint's logs end at its original boundary. They do not
-/// consult a live ensemble and never resolve a new transaction.
 pub(crate) fn frozen_checkpoint(
     checkpoint: rtdb_directory::Checkpoint,
     epoch: StorageEpoch,
@@ -154,7 +146,18 @@ impl LogFactory for LogkeeperLogFactory {
             .map_err(|error| Anomaly::incorrect("rtdb.multi/log-config", format!("Logkeeper log configuration is malformed: {error}")))?;
         let epoch = StorageEpoch(config.log_epoch);
         if let Some(checkpoint) = config.frozen_at {
-            return frozen_checkpoint(checkpoint, epoch, self.maximum_message_bytes);
+            let mut logs = frozen_checkpoint(checkpoint, epoch, self.maximum_message_bytes)?;
+            if let Some(root) = checkpoint.root_sha256 {
+                let key = self.holds.keys.existing(&config.key_id).await?;
+                let scope = PlacedAttemptScope::new(&config.replica_stream, config.epoch)?;
+                logs.await_authority = AwaitAuthority::Checkpoint {
+                    codec: Box::new(DeploymentReceipts { scope, cipher: Cipher::new(&key)? }),
+                    block: BlockIndex(checkpoint.block),
+                    through: ReplicaPosition::from_epoch_offset(epoch, checkpoint.boundary)?,
+                    root,
+                };
+            }
+            return Ok(logs);
         }
         let stream = StreamConfig { servers: config.servers.clone(), stream: config.replica_stream.clone(), write_quorum: config.write_quorum, maximum_message_bytes: self.maximum_message_bytes };
         let scope = (access == LogAccess::ReadWrite || config.epoch != 0).then(|| PlacedAttemptScope::new(&stream.stream, config.epoch)).transpose()?;
@@ -188,9 +191,12 @@ impl LogFactory for LogkeeperLogFactory {
             log: Arc::clone(&quorum), epoch: config.epoch,
         }) as Box<dyn ReplicaReadIndex>);
         let await_authority = if let Some(scope) = scope {
-            let recovered = (access == LogAccess::ReadWrite).then(|| quorum.latest()).transpose()?;
-            AwaitAuthority::Placed(Box::new(LogletReceipts { scope, cipher: Cipher::new(&key)?,
-                index: LogletReadIndex { log: Arc::clone(&quorum), epoch: config.epoch }, recovered }))
+            let recovery = if access == LogAccess::ReadWrite {
+                ClosedEpochRecovery::Opened(quorum.latest()?)
+            } else {
+                ClosedEpochRecovery::ReadIndex(Box::new(LogletReadIndex { log: Arc::clone(&quorum), epoch: config.epoch }))
+            };
+            AwaitAuthority::Live { codec: Box::new(DeploymentReceipts { scope, cipher: Cipher::new(&key)? }), recovery }
         } else { AwaitAuthority::Frozen };
         let replica: Arc<dyn Log> = Arc::new(SealedLog::for_serving(quorum, &key, &config, Arc::clone(&self.holds))?);
         let next = next_source_offset(replica.as_ref(), epoch).await?;

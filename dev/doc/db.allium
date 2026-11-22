@@ -702,6 +702,9 @@ config {
 -- A placed replication driver publishes its installed replica prefix and the source position covered by that same prefix together.
 -- Receipt redemption uses the paired source position to know when to search for the exact attempt within an epoch.
 -- On a later writer epoch, the installed recovered replica prefix establishes when the search for a previous attempt is complete.
+-- A frozen attachment establishes its receipt cut when the loaded block, replica boundary and root digest match the admitted exact checkpoint.
+-- An exact attempt witness in that checkpoint establishes a positive outcome at its cut.
+-- Missing outcomes from a frozen checkpoint remain retryable.
 -- Snapshots captured before the advance retain their original cut.
 -- Exact and restored recovery modes and checkpoints without a matching journal boundary leave the cut unavailable.
 -- An unrecognized replica body stops further advances on that open partition.

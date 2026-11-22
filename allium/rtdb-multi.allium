@@ -1999,7 +1999,10 @@ rule RetrySubscriberRefusalOnHolder {
 }
 
 rule ServeSnapshot {
-    -- A read at a basis at or below the checkpoint needs neither the log nor a live index.
+    -- The snapshot uses the exact root admitted for this attachment.
+    -- The checkpoint confirms a causal token whose history, journal and principal match and whose bound is within the installed cut.
+    -- A matching attempt outcome in the checkpoint can be exchanged for a causal token at that cut.
+    -- A receipt beyond the cut or an attempt whose outcome is absent receives a retryable checkpoint-behind response.
     when: QueryArrived(member, query, session)
 
     requires: query.basis.lsn <= Directory.read(session.deployment).checkpoint.lsn

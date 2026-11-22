@@ -3358,6 +3358,65 @@ async fn a_node_admits_a_capability_only_for_its_deployment_and_the_gateway_neve
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_frozen_checkpoint_confirms_only_await_tokens_it_covers() {
+    let mut cell = Cell::start_durable(3).await;
+    let shop = admin::create_deployment(cell.directory.as_ref(), "shop", "acme", 3).await.unwrap();
+    let writer = cell.connect("shop").await;
+    writer.simple_query("BEGIN READ WRITE; INSERT INTO orders (_id, total) VALUES (1, 10); COMMIT ASYNC").await.unwrap();
+    let (_, retained_receipt) = submitted_attempt(&writer).await;
+    assert_eq!(values(&writer, "SELECT total FROM orders").await, ["10"]);
+    let retained_basis = values(&writer, "SHOW AWAIT_TOKEN").await.pop().unwrap();
+
+    let holder = cell.holder("shop").await.unwrap();
+    cell.node(holder).agent.flush("shop").await.unwrap();
+    let published = cell.directory.deployment(&shop.id).await.unwrap().unwrap();
+    assert!(published.checkpoint.unwrap().root_sha256.is_some());
+
+    writer.simple_query("BEGIN READ WRITE; UPDATE orders SET total = 20 WHERE _id = 1; COMMIT ASYNC").await.unwrap();
+    let (_, later_receipt) = submitted_attempt(&writer).await;
+    assert_eq!(values(&writer, "SELECT total FROM orders").await, ["20"]);
+    let later_basis = values(&writer, "SHOW AWAIT_TOKEN").await.pop().unwrap();
+    drop(writer);
+    cell.nodes[holder].take().unwrap().kill().await.unwrap();
+
+    let successor = connect_eventually(&cell, "shop").await;
+    assert_eq!(values(&successor, "SELECT total FROM orders").await, ["20"]);
+    let current = cell.directory.deployment(&shop.id).await.unwrap().unwrap();
+    assert!(current.epoch > published.epoch);
+    assert_eq!(current.checkpoint, published.checkpoint);
+
+    let (snapshot, connection) = tokio_postgres::Config::new().host("127.0.0.1").port(cell.gateway.port())
+        .user("xtdb").password("cell-test").dbname("shop").options("-c rtdb.read=snapshot")
+        .connect(NoTls).await.unwrap();
+    tokio::spawn(connection);
+    assert_eq!(values(&snapshot, "SELECT total FROM orders").await, ["10"]);
+    let successor_node = cell.holder("shop").await.unwrap();
+    cell.node(successor_node).agent.flush("shop").await.unwrap();
+    let advanced = cell.directory.deployment(&shop.id).await.unwrap().unwrap();
+    assert!(advanced.checkpoint.unwrap().boundary > current.checkpoint.unwrap().boundary);
+    for logkeeper in cell.logkeepers.drain(..) { logkeeper.stop().await.unwrap(); }
+
+    snapshot.simple_query(&format!("SET AWAIT_TOKEN TO '{retained_basis}'")).await.unwrap();
+    assert_eq!(values(&snapshot, "SELECT total FROM orders").await, ["10"]);
+
+    snapshot.simple_query(&format!("SET AWAIT_TOKEN TO '{retained_receipt}'")).await.unwrap();
+    assert_eq!(values(&snapshot, "SELECT total FROM orders").await, ["10"]);
+    assert_ne!(values(&snapshot, "SHOW AWAIT_TOKEN").await, [retained_receipt]);
+    assert_eq!(values(&snapshot, "SELECT total FROM orders").await, ["10"]);
+
+    for token in [later_basis, later_receipt] {
+        snapshot.simple_query(&format!("SET AWAIT_TOKEN TO '{token}'")).await.unwrap();
+        let error = tokio::time::timeout(Duration::from_secs(3), snapshot.simple_query("SELECT total FROM orders"))
+            .await.unwrap().expect_err("A token beyond the frozen checkpoint cannot authorize a read");
+        assert_eq!(error.as_db_error().unwrap().message(), "This checkpoint of shop does not cover the await token");
+    }
+    snapshot.simple_query("SET AWAIT_TOKEN = NULL").await.unwrap();
+    assert_eq!(values(&snapshot, "SELECT total FROM orders").await, ["10"]);
+    drop((snapshot, successor));
+    cell.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_snapshot_session_reads_the_checkpoint_from_object_storage_on_another_node() {
     let mut cell = Cell::start(2, None).await;
     admin::create_deployment(cell.directory.as_ref(), "shop", "acme", 3).await.unwrap();

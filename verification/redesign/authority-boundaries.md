@@ -39,7 +39,11 @@ The active holder owns selection between admission, append and shutdown.
 The progress monitor owns publication of the applied outcome and wakes waiters.
 The immutable receipt is scoped to the authenticated principal, deployment history and attempt.
 The native submission result and SQL session use the same versioned receipt representation.
-Confirmation of a receipt against a frozen checkpoint's own cut remains open.
+A frozen attachment authenticates receipts in the deployment's history and checks them against the exact checkpoint root it admitted and loaded.
+An applied token must name its journal and a position at or below that cut.
+A provisional receipt needs an exact outcome witness in the checkpoint.
+A missing outcome on the frozen attachment yields a retryable refusal.
+The frozen receipt model checks identity, cut coverage and how the attachment classifies absence. [FrozenReceiptCut.tla](../tla/FrozenReceiptCut.tla)
 
 Acceptance starts with a fault replay that pauses an intake after submission, seals the epoch, commits another transaction at the same local position and tries to redeem both receipts and use them as read bases.
 It also covers an append that committed without a reply, an epoch change while awaiting, an outcome restored from a checkpoint, and independent installations serving the same database name.
@@ -91,7 +95,10 @@ An explicit or already pinned basis keeps the history and time selected by the c
 The gateway requests a subscriber that supports fresh reads for a deployment with linearizable reads enabled.
 A subscriber that cannot establish its basis refuses before the read.
 The gateway retries an unanswered command on the holder when the refusal leaves the backend idle.
-Logkeepers' active journal identity must follow the exclusive journal and the fencing protocol.
+The durable on-disk journal identity binds the logkeeper's directory registration.
+The active ensemble fingerprint currently binds the advertised endpoints and write quorum.
+A local conformance replay reproduced duplicate recovery votes when two endpoints addressed the same journal.
+Quorum admission still needs to match each vote to its expected durable journal and count that journal once across endpoint aliases, including during recovery and repair.
 All trim requests require a grant bound to the history, loglet, epoch and protected recovery frontier.
 
 The placement agent is active.

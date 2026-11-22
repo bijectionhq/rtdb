@@ -277,6 +277,16 @@ impl DatabaseFactory {
             let blocks = BlockStore::new(Arc::clone(&resources.store), Arc::clone(&storage), Arc::clone(&self.memory), self.options.file_size_target)?;
             let recovered = blocks.recover(self.options.trie, SourcePosition(-1), self.clock.now(), resources.blocks).await?;
             let opened_logs = self.resources.open_logs(&name, &configuration, access, log_cancellation.clone(), &resources).await?;
+            if let crate::AwaitAuthority::Checkpoint { block, through, root, .. } = &opened_logs.await_authority
+                && (!read_only || through.0 < 0 || through.epoch() != opened_logs.replica_epoch
+                    || resources.blocks != rtdb_replication::BlockDiscovery::AtPublished(rtdb_replication::PublishedCheckpoint {
+                        block: *block, boundary: *through, root_sha256: Some(*root),
+                    })
+                    || !recovered.block.as_ref().is_some_and(|loaded| loaded.block_index() == *block
+                        && loaded.boundary_replica_position() == Some(*through) && loaded.publication_sha256() == Some(*root)))
+            {
+                return Err(Anomaly::fault("rtdb.node/checkpoint-await-cut", "The opened checkpoint does not establish its await-token cut"));
+            }
             let logs = PartitionLogs::new(opened_logs.source, opened_logs.replica, opened_logs.source_epoch, opened_logs.replica_epoch,
                 resources.storage_version, resources.storage_epoch, Arc::clone(&resources.store), Arc::clone(&storage), Arc::clone(&self.memory))?;
             let recovered = if self.options.replication.enabled {

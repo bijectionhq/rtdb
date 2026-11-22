@@ -1843,6 +1843,18 @@ TLA_CASES = (
     ("ActiveLogletReadIndex", "read-index-waits-for-speculative-tail-witness",
      ("INVARIANTS BoundCoversAcknowledgements ServedReadCoversAcknowledgements",
       "INVARIANT NeverSamplesPastPublished"), "NeverSamplesPastPublished"),
+    ("FrozenReceiptCut", "frozen-receipt-cut", None, None),
+    ("FrozenReceiptCut", "frozen-receipt-trusts-matching-position",
+     ('Mutation = "none"', 'Mutation = "trust_same_position"'), "ConfirmedAgainstSelectedRoot"),
+    ("FrozenReceiptCut", "frozen-receipt-ignores-journal",
+     ('Mutation = "none"', 'Mutation = "ignore_journal"'), "ConfirmedWithinCut"),
+    ("FrozenReceiptCut", "frozen-receipt-ignores-bound",
+     ('Mutation = "none"', 'Mutation = "ignore_bound"'), "ConfirmedWithinCut"),
+    ("FrozenReceiptCut", "frozen-receipt-answers-absence",
+     ('Mutation = "none"', 'Mutation = "absence_is_final"'), "FrozenAbsenceIsRetryable"),
+    ("FrozenReceiptCut", "frozen-receipt-confirms-witness",
+     ("INVARIANTS ConfirmedAgainstSelectedRoot ConfirmedWithinCut FrozenAbsenceIsRetryable",
+      "INVARIANT NeverConfirms"), "NeverConfirms"),
     ("PlacedServingAuthority", "placed-serving-authority", None, None),
     ("PlacedServingAuthority", "placed-receipt-reused-intake",
      ('Mutation = "none"', 'Mutation = "reuse_slot"'), "ReceiptNamesTheAttempt"),
@@ -3329,25 +3341,36 @@ def verify_placed_receipt_replay(args, source):
     }
     reused = "a_reused_intake_position_cannot_redeem_the_sealed_writers_receipt"
     restored = "placed_attempt_outcomes_keep_their_exact_identity_through_a_checkpoint"
+    frozen = "a_frozen_checkpoint_confirms_only_await_tokens_it_covers"
     command = ["cargo", "test", "--locked", "-p", "rtdb-multi", "--test", "cell"]
-    for test in (reused, restored):
+    for test in (reused, restored, frozen):
         baseline = run_case([*command, test, "--", "--exact"], source / "rust", args.evidence,
                             f"rust-placed-receipt-{test}", env)
         if baseline.returncode or f"{test} ... ok" not in baseline.stdout:
             raise ValueError(f"{test}: native receipt replay failed")
     path = source / "rust/crates/node/src/node.rs"
     original = path.read_bytes()
-    try:
-        replace_once(path, "db.progress().current().placed_outcome(attempt)",
-                     "db.progress().current().tx_key.filter(|key| key.tx_id.0 == attempt.position().0)")
-        checked = run_case([*command, reused, "--", "--exact"], source / "rust", args.evidence,
-                           "rust-placed-receipt-reused-position-control", env)
-        if (checked.returncode != 101 or f"{reused} ... FAILED" not in checked.stdout
-            or "The sealed writer's receipt cannot return the successor's row" not in checked.stdout):
-            raise ValueError("the reused numeric position did not fail at receipt redemption")
-    finally:
-        path.write_bytes(original)
-    print("rust-placed-receipt: both replays passed, and reusing the source position failed")
+    controls = [
+        (reused, "reused-position", "db.progress().current().placed_outcome(attempt)",
+         "db.progress().current().tx_key.filter(|key| key.tx_id.0 == attempt.position().0)",
+         "The sealed writer's receipt cannot return the successor's row"),
+        (frozen, "frozen-bound", "if !within_history || through > *checkpoint",
+         "if !within_history", "A token beyond the frozen checkpoint cannot authorize a read"),
+        (frozen, "frozen-absence", 'AwaitAuthority::Checkpoint { .. } => receipt_checkpoint_behind(db.name()),',
+         'AwaitAuthority::Checkpoint { .. } => Anomaly::incorrect("rtdb/attempt-unresolved", "The closed writer epoch has no outcome for this transaction attempt"),',
+         "The closed writer epoch has no outcome for this transaction attempt"),
+    ]
+    for test, name, before, after, failure in controls:
+        try:
+            replace_once(path, before, after)
+            checked = run_case([*command, test, "--", "--exact"], source / "rust", args.evidence,
+                               f"rust-placed-receipt-{name}-control", env)
+            if (checked.returncode != 101 or f"{test} ... FAILED" not in checked.stdout
+                or failure not in checked.stdout):
+                raise ValueError(f"{name}: mutation did not fail at its declared assertion")
+        finally:
+            path.write_bytes(original)
+    print("rust-placed-receipt: all three replays passed and three controls failed")
 
 
 def verify_multi_trim_admission(args, source):

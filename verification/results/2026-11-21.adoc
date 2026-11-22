@@ -2647,3 +2647,32 @@ The log is `/private/tmp/rtdb-formal.QMjPSJsX/checkpoint-copy-evidence-c7f-jvm.l
 The plan carries physical evidence when the provider supplies it.
 Unversioned stores rely on immutable object names and the declared integrity checks.
 Holding these identities until I/O drains still requires admission against durable removal authority in every physical custody domain.
+
+=== Await receipts on a frozen checkpoint
+
+A frozen attachment derives its authority from the exact block, journal position and root digest admitted during startup.
+A causal token is usable within that journal and installed cut.
+A provisional receipt requires the exact checkpointed outcome and yields a causal token at the cut.
+Absence on a frozen attachment yields a retryable refusal.
+
+The cell replay obtains two sets of tokens, publishes a checkpoint containing the first outcome and advances the writer epoch.
+It opens a snapshot connection at that checkpoint, publishes a newer directory checkpoint covering the second outcome and stops all logkeepers.
+The snapshot connection confirms both covered token forms from object storage and refuses both forms for the second outcome.
+The native runner passed three receipt replays and rejected three controls, including acceptance beyond the frozen cut and a definitive negative outcome for an absent witness.
+Its records are under `/private/tmp/rtdb-formal.QMjPSJsX/frozen-receipt-pinned-native-2cp9d8uz/`.
+
+TLC checked nine states and exercised four weakened decisions and a positive confirmation witness.
+Its records are under `/private/tmp/rtdb-formal.QMjPSJsX/frozen-receipt-model-u6d7ppsi/`. link:../tla/FrozenReceiptCut.tla[Frozen receipt model and controls]
+The workspace type check and 686 selected native tests passed, including 98 cell tests.
+The logs are `/private/tmp/rtdb-frozen-receipt-workspace.log` and `/private/tmp/rtdb-frozen-receipt-final-cargo.log`.
+The initial standard JVM run passed 3,198 tests using the native library with SHA-256 `034a3c925604ece09bb815ce0048d1b0fa916835e7927b46bec7d7fa40d84ed9`.
+The archive copy change landed on `6e55bc6c5` and changed a native storage dependency.
+TLC reproduced the frozen receipt result together with the checkpoint copy and physical owner models on the rebased tree.
+The records are under `/private/tmp/rtdb-formal.QMjPSJsX/frozen-receipt-rebased-model-18_9jf3_/`.
+The rebased workspace type check and all 722 selected native tests passed, including 98 cell cases and the storage and S3 unit suites.
+The logs are `/private/tmp/rtdb-frozen-receipt-rebased-workspace.log` and `/private/tmp/rtdb-frozen-receipt-rebased-cargo.log`.
+The rebased Gradle run uses the native library with SHA-256 `98eec17478b17b4d4e98e290311bfc329d680b46dd4385a9f51b38141d695be3`.
+The final Gradle run recorded 3,198 standard cases and 5,630 integration cases with zero failures and errors.
+The PostgreSQL slot-recreation case was already disabled in its source.
+No reflection or boxed-math warnings appeared.
+The log is `/private/tmp/rtdb-frozen-receipt-rebased-gradle.log`.

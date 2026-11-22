@@ -23,7 +23,7 @@ pub use kafka_connect::{KafkaConnectSourceFactory, KafkaIndexerFactory};
 pub use session::*;
 pub use resources::*;
 mod placed_receipts;
-pub use placed_receipts::{AwaitAuthority, PlacedReceiptAuthority};
+pub use placed_receipts::{AwaitAuthority, ClosedEpochRecovery, PlacedReceiptCodec};
 pub use catalog::{DatabaseCatalog, Membership};
 pub use config::*;
 pub use database::{CompactionRelay, Database};

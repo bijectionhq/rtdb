@@ -454,6 +454,8 @@ A read waits for the exact attempt's durable outcome before pinning its basis.
 The receipt is valid for one hour from submission.
 If failover closes the attempt's writer epoch before it commits a durable outcome, a later read with that receipt reports `rtdb/attempt-unresolved`.
 After a synchronous commit, the await token identifies an applied replica prefix and remains valid across writer changes in that deployment.
+A connection routed with `rtdb.read=snapshot` uses the directory's verified checkpoint receipt to confirm covered await tokens.
+If the checkpoint is too old to confirm the token, the read returns `rtdb/checkpoint-behind`.
 
 ### SET TRANSACTION (v2.2+)
 

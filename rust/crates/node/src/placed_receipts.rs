@@ -1,27 +1,52 @@
-use async_trait::async_trait;
 use rtdb_storage::log::LogOffset;
-use rtdb_types::{Anomaly, PlacedAttempt, PlacedAttemptScope, ReplicaPosition, Result, Timestamp};
+use rtdb_types::{Anomaly, BlockIndex, PlacedAttempt, PlacedAttemptScope, ReplicaPosition, Result, Timestamp};
+
+use crate::ReplicaReadIndex;
 
 const TOKEN_PREFIX: &str = "rtdb1.";
 
 pub enum AwaitAuthority {
     SourcePosition,
-    Placed(Box<dyn PlacedReceiptAuthority>),
+    Live {
+        codec: Box<dyn PlacedReceiptCodec>,
+        recovery: ClosedEpochRecovery,
+    },
+    Checkpoint {
+        codec: Box<dyn PlacedReceiptCodec>,
+        block: BlockIndex,
+        through: ReplicaPosition,
+        root: [u8; 32],
+    },
     Frozen,
 }
 
 impl AwaitAuthority {
-    pub(crate) fn placed(&self) -> Option<&dyn PlacedReceiptAuthority> {
-        match self { Self::Placed(authority) => Some(authority.as_ref()), _ => None }
+    pub(crate) fn codec(&self) -> Option<&dyn PlacedReceiptCodec> {
+        match self {
+            Self::Live { codec, .. } | Self::Checkpoint { codec, .. } => Some(codec.as_ref()),
+            _ => None,
+        }
     }
 }
 
-#[async_trait]
-pub trait PlacedReceiptAuthority: Send + Sync {
+pub enum ClosedEpochRecovery {
+    Opened(LogOffset),
+    ReadIndex(Box<dyn ReplicaReadIndex>),
+}
+
+impl ClosedEpochRecovery {
+    pub(crate) async fn confirm(&self) -> Result<LogOffset> {
+        match self {
+            Self::Opened(position) => Ok(*position),
+            Self::ReadIndex(index) => index.confirm().await,
+        }
+    }
+}
+
+pub trait PlacedReceiptCodec: Send + Sync {
     fn scope(&self) -> PlacedAttemptScope;
     fn seal(&self, value: &[u8]) -> Result<String>;
     fn open(&self, token: &str) -> Result<Vec<u8>>;
-    async fn recovered_through(&self) -> Result<LogOffset>;
 }
 
 pub(crate) enum PlacedToken {
@@ -36,7 +61,7 @@ pub(crate) fn invalid_token() -> Anomaly {
 }
 
 impl PlacedToken {
-    pub(crate) fn seal(&self, authority: &dyn PlacedReceiptAuthority) -> Result<String> {
+    pub(crate) fn seal(&self, authority: &dyn PlacedReceiptCodec) -> Result<String> {
         let (tag, attempt, coordinate) = match *self {
             Self::Pending { attempt, submitted_at } => (0, attempt, submitted_at.0),
             Self::Applied { attempt, through } => (1, attempt, through.0),
@@ -48,7 +73,7 @@ impl PlacedToken {
         Ok(format!("{TOKEN_PREFIX}{}", authority.seal(&bytes)?))
     }
 
-    pub(crate) fn open(token: &str, authority: &dyn PlacedReceiptAuthority, principal: Option<&str>) -> Result<Self> {
+    pub(crate) fn open(token: &str, authority: &dyn PlacedReceiptCodec, principal: Option<&str>) -> Result<Self> {
         let sealed = token.strip_prefix(TOKEN_PREFIX).ok_or_else(invalid_token)?;
         let bytes = authority.open(sealed)?;
         let (fields, coordinate) = bytes.split_last_chunk::<8>().ok_or_else(invalid_token)?;
