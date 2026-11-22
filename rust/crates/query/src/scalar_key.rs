@@ -1,6 +1,6 @@
 use arrow_array::{
     cast::AsArray,
-    types::{Int8Type, Int16Type, Int32Type, Int64Type},
+    types::{Float32Type, Float64Type, Int8Type, Int16Type, Int32Type, Int64Type},
 };
 use arrow_schema::DataType;
 use rtdb_types::{LogicalType, ScalarType};
@@ -12,6 +12,7 @@ pub(crate) enum ScalarKey<'a> {
     Null,
     Bool(bool),
     Signed(i64),
+    Float(f64),
     Text(&'a str),
     Bytes(&'a [u8]),
 }
@@ -46,6 +47,14 @@ impl<'a> ScalarKey<'a> {
             (DataType::Int64, LogicalType::Scalar(ScalarType::I64)) => {
                 null.unwrap_or_else(|| Self::Signed(array.as_primitive::<Int64Type>().value(row)))
             }
+            (DataType::Float32, LogicalType::Scalar(ScalarType::F32)) => {
+                null.unwrap_or_else(|| {
+                    Self::Float(f64::from(array.as_primitive::<Float32Type>().value(row)))
+                })
+            }
+            (DataType::Float64, LogicalType::Scalar(ScalarType::F64)) => {
+                null.unwrap_or_else(|| Self::Float(array.as_primitive::<Float64Type>().value(row)))
+            }
             (DataType::Utf8, LogicalType::Scalar(ScalarType::Utf8)) => {
                 null.unwrap_or_else(|| Self::Text(array.as_string::<i32>().value(row)))
             }
@@ -70,6 +79,7 @@ impl<'a> ScalarKey<'a> {
             | (_, Self::Null)
             | (Self::Bool(_), Self::Bool(_))
             | (Self::Signed(_), Self::Signed(_))
+            | (Self::Float(_), Self::Float(_))
             | (Self::Text(_), Self::Text(_))
             | (Self::Bytes(_), Self::Bytes(_)) => Some(self == other),
             _ => None,
@@ -87,6 +97,7 @@ impl<'a> ScalarKey<'a> {
                 }
             }
             Self::Signed(value) => hash(&(value as f64).to_bits().to_be_bytes(), 0),
+            Self::Float(value) => hash(&value.to_bits().to_be_bytes(), 0),
             Self::Text(text) => hash(text.as_bytes(), 0),
             Self::Bytes(bytes) => hash(bytes, 0),
         }

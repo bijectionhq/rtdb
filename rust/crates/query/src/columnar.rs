@@ -351,8 +351,16 @@ impl ColumnBatch {
 
     pub(crate) fn append_column(&mut self, column: Column, mut reservation: Arc<MemoryReservation>, memory: &Arc<MemoryBudget>) -> Result<()> {
         use std::mem::size_of;
+        let metadata = match &column {
+            Column::Arrow { field, logical, .. } => field.size().checked_add(
+                logical.as_ref().map_or(Ok(0), LogicalType::retained_bytes)?,
+            ).ok_or_else(size_error)?,
+            _ => 0,
+        };
         let bytes = column.retained_bytes()?
-            .checked_add(size_of::<Column>() + size_of::<Arc<MemoryReservation>>() + 256).ok_or_else(size_error)?;
+            .checked_add(metadata)
+            .and_then(|bytes| bytes.checked_add(size_of::<Column>() + size_of::<Arc<MemoryReservation>>() + 256))
+            .ok_or_else(size_error)?;
         let lease = Arc::get_mut(&mut reservation).expect("An appended column owns its reservation");
         if bytes <= lease.bytes() { lease.shrink_to(bytes)?; } else { lease.grow_to(bytes)?; }
         let old_columns = self.columns.len().checked_mul(size_of::<Column>()).ok_or_else(size_error)?;
@@ -508,7 +516,7 @@ impl ColumnBatch {
         Self::settled(columns, self.len, reservation)
     }
 
-    fn take_rows_with_custody(
+    pub(crate) fn take_rows_with_custody(
         sources: &[impl std::borrow::Borrow<Self>], rows: &[(usize, usize)], positions: &[usize],
         retain_sources: bool, memory: &Arc<MemoryBudget>,
     ) -> Result<Self> {

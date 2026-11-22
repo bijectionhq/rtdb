@@ -2223,6 +2223,38 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn grouped_reductions_keep_first_seen_keys_and_emit_counts_as_arrow() {
+        use rtdb_plan::{AggregateExpr, AggregateFunction, NamedExpr, Relation, RelationNode, Schema};
+
+        let (state, table, _) = live_table_with_values([Value::I64(2), Value::I64(1), Value::I64(2)]);
+        let storage = Arc::new(BufferPool::new(Arc::new(MemoryStore::default()), 1 << 20));
+        let (scan, execution, memory) = descriptor_scan(state.value().snapshot(), table, storage);
+        let group = NamedExpr { field: scan.columns[0].clone(), expr: scan.columns[0].expression() };
+        let mut count = group.field.clone();
+        count.id = ColumnId(3);
+        count.name = "n".into();
+        let schema = Schema::new(vec![group.field.clone(), count.clone()]).unwrap();
+        let scan = Arc::new(Relation::scan(scan).unwrap());
+        let plan = Arc::new(Relation::new(schema, RelationNode::Aggregate {
+            input: scan, groups: vec![group], aggregates: vec![AggregateExpr {
+                field: count, function: AggregateFunction::CountStar, argument: None, distinct: false, filter: None, order_by: vec![],
+            }],
+        }).unwrap());
+        let runtime = crate::runtime_schema::EmittedRelation::derive(plan, &execution.context.catalog, &[], &memory).unwrap();
+        let mut arrow = crate::operators::build_columns(Arc::clone(&runtime), execution.clone()).await.unwrap().expect("Expected Arrow aggregate");
+        let batch = arrow.next_batch().await.unwrap().unwrap();
+        assert_eq!(batch.len, 2);
+        assert!(matches!(batch.columns[0], crate::columnar::Column::Selected(_)));
+        assert!(matches!(batch.columns[1], crate::columnar::Column::Arrow { .. }));
+        let rows: Vec<_> = (0..batch.len).map(|row| batch.columns.iter().map(|column| column.value(row).unwrap()).collect::<Vec<_>>()).collect();
+        assert_eq!(rows, [vec![Value::I64(2), Value::I64(2)], vec![Value::I64(1), Value::I64(1)]]);
+        assert!(arrow.next_batch().await.unwrap().is_none());
+        let mut pages = crate::operators::build_pages(runtime, execution).await.unwrap();
+        let data = pages.next_page().await.unwrap().unwrap();
+        assert_eq!(rows, data.rows().iter().map(|row| row.values.clone()).collect::<Vec<_>>());
+    }
+
+    #[tokio::test]
     async fn a_data_page_outside_its_metadata_path_fails_every_scan_that_reads_it() {
         let (state, table, _, store, _) = persisted_pages(true).await;
         let storage = Arc::new(BufferPool::new(store, 1 << 20));
