@@ -507,12 +507,15 @@ fn operation_value<'a>(operation: &'a Operation, memory: &Arc<MemoryBudget>) -> 
             body.insert("fingerprint".into(), Value::Binary(fingerprint.to_vec()));
             "rtdb-owned-publish-root-v1"
         }
-        Operation::Public(TxOp::OwnedPublishWorld { world, attempt, fingerprint, expected, advance_to, drop_world, delete_root }) => {
+        Operation::Public(TxOp::OwnedPublishWorld { world, attempt, fingerprint, expected, advance_to, drop_world, settlement_pin, delete_root }) => {
             body.insert("world".into(), Value::Uuid(world.0));
             body.insert("attempt".into(), Value::Utf8(attempt.clone()));
             body.insert("fingerprint".into(), Value::Binary(fingerprint.to_vec()));
             body.insert("expected".into(), expected.map_or(Value::Null, |time| Value::I64(time.0)));
-            if let Some(pin) = delete_root {
+            if let Some(pin) = settlement_pin {
+                body.insert("pin".into(), Value::Uuid(pin.0));
+                "rtdb-owned-settle-proposal-v1"
+            } else if let Some(pin) = delete_root {
                 body.insert("pin".into(), Value::Uuid(pin.0));
                 "rtdb-owned-drop-with-root-delete-v1"
             } else if *drop_world {
@@ -1207,7 +1210,7 @@ impl SourceOperationReader<'_> {
             | "rtdb-owned-controls-proposal-fork-v1" | "rtdb-owned-root-proposal-fork-v1" => &["registration", "previous", "attempt", "fingerprint"],
             "rtdb-owned-publish-root-v1" => &["attempt", "fingerprint"],
             "rtdb-owned-publish-world-v1" | "rtdb-owned-drop-world-v1" => &["world", "attempt", "fingerprint", "expected"],
-            "rtdb-owned-drop-with-root-delete-v1" => &["world", "attempt", "fingerprint", "expected", "pin"],
+            "rtdb-owned-settle-proposal-v1" | "rtdb-owned-drop-with-root-delete-v1" => &["world", "attempt", "fingerprint", "expected", "pin"],
             "rtdb-owned-publish-world-v2" => &["world", "attempt", "fingerprint", "expected", "advance_to"],
             "rtdb-owned-check-world-purge-v3" => &["relation", "pin", "frontier", "local_frontier"],
             "rtdb-owned-check-world-scope-v1" => &["scope"],
@@ -1267,7 +1270,7 @@ impl SourceOperationReader<'_> {
                 let fingerprint = fingerprint.try_into().map_err(|_| invalid("Invalid Root publication fingerprint"))?;
                 TxOp::OwnedPublishRoot { attempt, fingerprint }
             }
-            "rtdb-owned-publish-world-v1" | "rtdb-owned-publish-world-v2" | "rtdb-owned-drop-world-v1" | "rtdb-owned-drop-with-root-delete-v1" => {
+            "rtdb-owned-settle-proposal-v1" | "rtdb-owned-publish-world-v1" | "rtdb-owned-publish-world-v2" | "rtdb-owned-drop-world-v1" | "rtdb-owned-drop-with-root-delete-v1" => {
                 let (Value::Uuid(world), Value::Utf8(attempt), Value::Binary(fingerprint)) =
                     (value("world")?, value("attempt")?, value("fingerprint")?) else {
                     return Err(invalid("Owned world publication has invalid fields"));
@@ -1276,6 +1279,10 @@ impl SourceOperationReader<'_> {
                 TxOp::OwnedPublishWorld {
                     world: rtdb_types::Iid(world), attempt, fingerprint,
                     drop_world: matches!(name.as_str(), "rtdb-owned-drop-world-v1" | "rtdb-owned-drop-with-root-delete-v1"),
+                    settlement_pin: if name == "rtdb-owned-settle-proposal-v1" {
+                        let Value::Uuid(pin) = value("pin")? else { return Err(invalid("Proposal settlement has no original pin")); };
+                        Some(Iid(pin))
+                    } else { None },
                     delete_root: if name == "rtdb-owned-drop-with-root-delete-v1" {
                         let Value::Uuid(pin) = value("pin")? else { return Err(invalid("Retained Root delete has no original pin")); };
                         Some(Iid(pin))

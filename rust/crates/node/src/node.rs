@@ -1718,6 +1718,7 @@ pub struct OwnedWorldSection {
 }
 
 pub enum OwnedWorldEffect {
+    SettleProposal,
     Overlay(Vec<OwnedWorldWrite>),
     Clock(Timestamp),
     Drop,
@@ -1878,7 +1879,7 @@ impl NativeSession {
             && rtdb_tx::retained_release_controls(&controls));
         let proposal_overlay = root.proposal_overlay;
         if proposal_overlay && (sections.len() != 1 || root.publication.is_some()
-            || !matches!(&sections[0].1.effect, OwnedWorldEffect::Overlay(_))
+            || !matches!(&sections[0].1.effect, OwnedWorldEffect::Overlay(_) | OwnedWorldEffect::SettleProposal)
             || !rtdb_tx::retained_delete_controls(&controls))
         {
             return Err(unavailable());
@@ -1913,12 +1914,17 @@ impl NativeSession {
             effects = effects.saturating_add(root.writes.len()).saturating_add(if delete_root { 1 } else { 3 });
         }
         for (retained_until, section) in &sections {
+            let terminal_proposal = matches!(&section.effect, OwnedWorldEffect::SettleProposal);
+            if terminal_proposal && !proposal_overlay {
+                return Err(unavailable());
+            }
             let writes = match &section.effect {
                 OwnedWorldEffect::Overlay(writes) if !writes.is_empty() => writes.len(),
                 OwnedWorldEffect::Overlay(_) => return Err(unavailable()),
-                OwnedWorldEffect::Clock(_) | OwnedWorldEffect::Drop => 0,
+                OwnedWorldEffect::Clock(_) | OwnedWorldEffect::Drop | OwnedWorldEffect::SettleProposal => 0,
             };
-            if !worlds.insert(section.world) || (!retained_release && !(1..=128).contains(&section.checks.len()))
+            if !worlds.insert(section.world) || (!retained_release && !terminal_proposal && !(1..=128).contains(&section.checks.len()))
+                || section.checks.len() > 128
                 || !attempts.insert(&section.attempt)
             {
                 return Err(unavailable());
@@ -1950,17 +1956,18 @@ impl NativeSession {
         }
         for (_, section) in sections {
             Self::append_world_checks(&mut ops, section.checks);
-            let (advance_to, drop_world) = match section.effect {
+            let (advance_to, drop_world, settlement_pin) = match section.effect {
                 OwnedWorldEffect::Overlay(writes) => {
                     self.append_world_writes(&mut ops, section.world, writes)?;
-                    (None, false)
+                    (None, false, None)
                 }
-                OwnedWorldEffect::Clock(to) => (Some(to), false),
-                OwnedWorldEffect::Drop => (None, true),
+                OwnedWorldEffect::Clock(to) => (Some(to), false, None),
+                OwnedWorldEffect::Drop => (None, true, None),
+                OwnedWorldEffect::SettleProposal => (None, false, Some(section.parent_pin)),
             };
             ops.push(TxOp::OwnedPublishWorld { world: section.world, attempt: section.attempt,
                 fingerprint, expected: section.expected_clock, advance_to, drop_world,
-                delete_root: delete_root.then_some(section.parent_pin) });
+                settlement_pin, delete_root: delete_root.then_some(section.parent_pin) });
         }
         self.state.execute_tx(ops, Default::default()).await
     }
