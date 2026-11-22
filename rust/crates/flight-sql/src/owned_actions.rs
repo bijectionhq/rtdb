@@ -18,6 +18,7 @@ use rtdb_node::{NativeSession, OwnedCountRequest, OwnedRangeRequest, OwnedRangeW
 use rtdb_query::QueryCursor;
 use rtdb_tx::{Documents, TxOp};
 use rtdb_types::{EntityId, LogicalType, OwnedRelation, ScalarType, StructFields, TimeUnit, Timestamp, Value};
+use sha2::{Digest, Sha256};
 use tokio::sync::OwnedSemaphorePermit;
 use tonic::Status;
 use uuid::Uuid;
@@ -167,15 +168,17 @@ pub(crate) enum WorldCommitFormat {
     Validation,
     Publication,
     Clock,
+    Drop,
 }
 
+pub(crate) const COMMIT_WORLD_DROP_V1: &str = "rtdb.owned.CommitWorldDrop.v1";
 pub(crate) const COMMIT_WORLD_CLOCK_V1: &str = "rtdb.owned.CommitWorldClock.v1";
 pub(crate) const COMMIT_WORLD_V4: &str = "rtdb.owned.CommitWorld.v4";
 pub(crate) const COMMIT_WORLD_V3: &str = "rtdb.owned.CommitWorld.v3";
 pub(crate) const COMMIT_WORLD_V2: &str = "rtdb.owned.CommitWorld.v2";
 const MAX_WORLD_WITNESSES: usize = 128;
 const WORLD_POINT_WITNESS: &str = "rtdb.owned.world_point_witness";
-pub(crate) const SEARCH_HELD_OWNED_V3: &str = "rtdb.owned.SearchHeld.v3";
+pub(crate) const SEARCH_HELD_OWNED_V4: &str = "rtdb.owned.SearchHeld.v4";
 pub(crate) const HELD_OWNED_RANGE_V1: &str = "rtdb.owned.ReadHeldRange.v1";
 #[derive(Clone, Copy)]
 pub(crate) enum HeldRangeFormat { Leading, Full, FixedValid, Historical }
@@ -195,6 +198,8 @@ const OWNED_VALID_FROM: &str = "rtdb.owned.valid_from_micros";
 const OWNED_VALID_TO: &str = "rtdb.owned.valid_to_micros";
 const MAX_HISTORY_SLICES: usize = 4096;
 const OWNED_VERSION_REVISION: &str = "rtdb.owned.version_revision";
+const OWNED_SEARCH_TOTAL: &str = "rtdb.owned.search_total";
+const OWNED_SEARCH_SCOPE: &str = "rtdb.owned.search_scope";
 const OWNED_SEARCH_WITNESSES: &str = "rtdb.owned.search_witnesses";
 const OWNED_VERSION_TIME: &str = "rtdb.owned.version_micros";
 const OWNED_REVISION: &str = "rtdb.owned.revision_micros";
@@ -1173,18 +1178,35 @@ impl Service {
             partitions.push((relation, path));
             request = rest;
         }
-        let (settings, query) = request.split_first_chunk::<3>().ok_or_else(|| invalid("Owned held search requires a limit and evidence flag"))?;
-        let limit = usize::from(u16::from_be_bytes([settings[0], settings[1]]));
-        let observe = match settings[2] {
+        let (settings, query) = request.split_first_chunk::<7>().ok_or_else(|| invalid("Owned held search requires an offset, limit and evidence flag"))?;
+        let offset = u32::from_be_bytes([settings[0], settings[1], settings[2], settings[3]]) as usize;
+        let limit = usize::from(u16::from_be_bytes([settings[4], settings[5]]));
+        let observe = match settings[6] {
             0 => false,
             1 => true,
             _ => return Err(invalid("Invalid owned held search evidence flag")),
         };
         if query.len() > 4096 { return Err(invalid("Owned held search query exceeds its size bound")); }
         let query = std::str::from_utf8(query).map_err(arrow)?;
-        let (hits, witnesses) = held.snapshot.ranked_search(&partitions, query, limit, observe).await.map_err(status)?;
+        let (page, witnesses) = held.snapshot.ranked_search_page(&partitions, query, offset, limit, observe).await.map_err(status)?;
+        let hits = page.hits;
         let id_type = LogicalType::from_legs([ScalarType::Utf8, ScalarType::Keyword, ScalarType::I64, ScalarType::Uuid].map(LogicalType::Scalar));
-        let mut metadata = std::collections::HashMap::new();
+        let mut digest = Sha256::new();
+        digest.update(b"rtdb.owned.search.held.v4\0");
+        // The handle binds the authenticated owner and cut. Keep the exact
+        // ordered partition/path frame and query, omitting delivery settings.
+        digest.update(&body[..body.len() - request.len()]);
+        digest.update(query.as_bytes());
+        let digest: [u8; 32] = digest.finalize().into();
+        let mut scope = String::with_capacity(64);
+        for bytes in digest.chunks_exact(16) {
+            let chunk = Uuid::from_bytes(bytes.try_into().expect("16-byte SHA-256 chunk"));
+            scope.push_str(&chunk.simple().to_string());
+        }
+        let mut metadata = std::collections::HashMap::from([
+            (OWNED_SEARCH_TOTAL.into(), page.total.to_string()),
+            (OWNED_SEARCH_SCOPE.into(), scope),
+        ]);
         if !witnesses.is_empty() {
             if witnesses.len() != partitions.len() { return Err(Status::internal("Incomplete owned search evidence")); }
             let mut nonces = String::with_capacity(32 * witnesses.len());
@@ -1589,7 +1611,7 @@ impl Service {
         let host = self.0.config.owned_world_host.as_ref().ok_or_else(unsupported)?;
         let (world, groups) = body.split_first_chunk::<16>().ok_or_else(|| invalid("Owned world commit has no world UUID"))?;
         let world = Uuid::from_bytes(*world);
-        let (deadline, groups) = if matches!(format, WorldCommitFormat::Validation | WorldCommitFormat::Publication | WorldCommitFormat::Clock) {
+        let (deadline, groups) = if matches!(format, WorldCommitFormat::Validation | WorldCommitFormat::Publication | WorldCommitFormat::Clock | WorldCommitFormat::Drop) {
             let (deadline, groups) = groups.split_first_chunk::<8>().ok_or_else(|| invalid("Owned world validation has no deadline"))?;
             (Some(Timestamp(i64::from_be_bytes(*deadline))), groups)
         } else {
@@ -1610,11 +1632,14 @@ impl Service {
         } else {
             (None, Vec::new(), None, groups)
         };
-        let (publication, overlay, groups) = if matches!(format, WorldCommitFormat::Publication | WorldCommitFormat::Clock) {
+        let (publication, overlay, groups) = if matches!(format, WorldCommitFormat::Publication | WorldCommitFormat::Clock | WorldCommitFormat::Drop) {
             let (attempt, rest) = groups.split_first_chunk::<22>().ok_or_else(|| invalid("Missing world attempt identity"))?;
             let (fingerprint, rest) = rest.split_first_chunk::<32>().ok_or_else(|| invalid("Missing world attempt fingerprint"))?;
             let (clock, rest) = rest.split_first_chunk::<8>().ok_or_else(|| invalid("Missing expected world clock"))?;
-            let (advance_to, overlay, groups) = if matches!(format, WorldCommitFormat::Clock) {
+            let drop_world = matches!(format, WorldCommitFormat::Drop);
+            let (advance_to, overlay, groups) = if drop_world {
+                (None, None, rest)
+            } else if matches!(format, WorldCommitFormat::Clock) {
                 let (target, groups) = rest.split_first_chunk::<8>().ok_or_else(|| invalid("Missing world clock target"))?;
                 (Some(Timestamp(i64::from_be_bytes(*target))), None, groups)
             } else {
@@ -1630,7 +1655,7 @@ impl Service {
             }
             let publication = rtdb_node::OwnedWorldPublication {
                 attempt: attempt.into(), fingerprint: *fingerprint,
-                expected_clock: (clock != Timestamp::MIN).then_some(clock), advance_to,
+                expected_clock: (clock != Timestamp::MIN).then_some(clock), advance_to, drop_world,
             };
             (Some(publication), overlay, groups)
         } else {
@@ -1640,7 +1665,7 @@ impl Service {
         let _framing = call.reserve(MAX_COMMIT_GROUPS * 512)?;
         let mut writes = Vec::new();
         let mut reservations = Vec::new();
-        let (control_checks, _control_charges, groups) = if matches!(format, WorldCommitFormat::Validation | WorldCommitFormat::Publication | WorldCommitFormat::Clock) {
+        let (control_checks, _control_charges, groups) = if matches!(format, WorldCommitFormat::Validation | WorldCommitFormat::Publication | WorldCommitFormat::Clock | WorldCommitFormat::Drop) {
             let policy = self.hosted_control_policy(call)?;
             let groups = owned_groups(groups, true, false)?;
             hosted_control::admit_control_targets(policy, groups.iter().map(|(relation, _)| relation))?;

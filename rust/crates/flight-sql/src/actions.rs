@@ -30,7 +30,7 @@ impl Service {
                 crate::owned_actions::COMMIT_OWNED_V6 => Ok(vec![Ok(self.commit_owned_counted_action(&call, &action.body).await?)]),
                 crate::owned_actions::OPEN_OWNED_READ_AS_OF_V1 => Ok(vec![Ok(self.open_owned_read_as_of_action(&call, &action.body).await?)]),
                 crate::owned_actions::OPEN_OWNED_READ_V2 => Ok(vec![Ok(self.open_owned_read_action(&call, &action.body).await?)]),
-                crate::owned_actions::SEARCH_HELD_OWNED_V3 => Ok(vec![Ok(self.search_held_owned_action(&call, &action.body).await?)]),
+                crate::owned_actions::SEARCH_HELD_OWNED_V4 => Ok(vec![Ok(self.search_held_owned_action(&call, &action.body).await?)]),
                 crate::owned_actions::HELD_OWNED_RANGE_V1 => Ok(vec![Ok(self.held_owned_range_action(&call, &action.body, crate::owned_actions::HeldRangeFormat::Leading).await?)]),
                 crate::owned_actions::HELD_OWNED_RANGE_V2 => Ok(vec![Ok(self.held_owned_range_action(&call, &action.body, crate::owned_actions::HeldRangeFormat::Full).await?)]),
                 crate::owned_actions::HELD_OWNED_RANGE_V3 => Ok(vec![Ok(self.held_owned_range_action(&call, &action.body, crate::owned_actions::HeldRangeFormat::FixedValid).await?)]),
@@ -64,6 +64,7 @@ impl Service {
                 crate::owned_actions::COMMIT_WORLD_V1 => Ok(vec![Ok(self.commit_world_action(&call, &action.body, crate::owned_actions::WorldCommitFormat::Overlay).await?)]),
                 crate::owned_actions::COMMIT_WORLD_V2 => Ok(vec![Ok(self.commit_world_action(&call, &action.body, crate::owned_actions::WorldCommitFormat::ConditionedOverlay).await?)]),
                 crate::owned_actions::COMMIT_WORLD_V3 => Ok(vec![Ok(self.commit_world_action(&call, &action.body, crate::owned_actions::WorldCommitFormat::Validation).await?)]),
+                crate::owned_actions::COMMIT_WORLD_DROP_V1 => Ok(vec![Ok(self.commit_world_action(&call, &action.body, crate::owned_actions::WorldCommitFormat::Drop).await?)]),
                 crate::owned_actions::COMMIT_WORLD_CLOCK_V1 => Ok(vec![Ok(self.commit_world_action(&call, &action.body, crate::owned_actions::WorldCommitFormat::Clock).await?)]),
                 crate::owned_actions::COMMIT_WORLD_V4 => Ok(vec![Ok(self.commit_world_action(&call, &action.body, crate::owned_actions::WorldCommitFormat::Publication).await?)]),
                 crate::owned_actions::DROP_WORLD_V1 => {

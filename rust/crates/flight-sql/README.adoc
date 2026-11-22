@@ -342,11 +342,11 @@ The relation must already exist in the authenticated owner's namespace, and the 
 The FTS maintenance lane uses the private declaration to build the relation's search files.
 A successful declaration returns the same transaction-key Arrow row as Create.
 
-`rtdb.owned.SearchHeld.v3` takes the 16-byte held handle, a big-endian u16 partition count (1 to 32), then a relation prefix and a path prefix per partition.
-A big-endian u16 limit (1 to 128) and an evidence flag byte (0 or 1) follow, then the UTF-8 query (up to 4096 bytes).
+`rtdb.owned.SearchHeld.v4` takes the 16-byte held handle, a big-endian u16 partition count (1 to 32), then a relation prefix and a path prefix per partition.
+A big-endian u32 offset (0 to 4096), u16 limit (1 to 128), and evidence flag byte (0 or 1) follow, then the UTF-8 query (up to 4096 bytes).
 The reply contains `_id` as a typed union of string, keyword, signed Int64 and UUID, `score: Float64`, and `partition: UInt64` as the zero-based request ordinal.
 Results sort by descending BM25 score across the full selected corpus, then by complete typed identity and partition ordinal.
-The held present and valid instant are in schema metadata. An empty result has a schema and no record batch.
+The held present and valid instant are in schema metadata, alongside `rtdb.owned.search_total` (the decimal count of all verified matches before slicing) and `rtdb.owned.search_scope` (the lowercase hex SHA-256 of the held handle, ordered relation/path frame, and query under the v4 domain tag). The scope binds pages only within the same hold. An empty result has a schema and no record batch.
 Every selected partition must have complete search artefacts at the held cut. Each matched posting is verified against the full identity and winning revision.
 A placed read with evidence requested publishes `rtdb.owned.search_witnesses` as the concatenated lowercase hex of one 16-byte range nonce per partition in request order. This also covers a successful empty result.
 
@@ -499,6 +499,9 @@ The ordered transaction checks the world registration, placement, deadline, loca
 `rtdb.owned.CommitWorldClock.v1` publishes a clock alone using the same held conditions, deadline, hosted ownership checks, and immutable attempt marker.
 Its body shares the v4 prefix through the expected clock, followed by the target clock as a big-endian i64 and the check-only hosted control groups.
 The target must strictly exceed the held clock and be at or before the ordered commit time.
+`rtdb.owned.CommitWorldDrop.v1` orders a terminal marker and the immutable attempt marker using the same held conditions, deadline and hosted ownership checks.
+Its body shares the v4 prefix through the expected clock and then contains only the check-only hosted control groups.
+The placed archive owner retires the matching Directory pin after the ordered result; the response identifies the terminal transaction.
 The prefix through the witness list matches v3, followed by 22 lowercase hexadecimal attempt ID bytes, a 32-byte request fingerprint, and the expected application clock as signed Int64 (minimum for no local publication).
 A big-endian u32 length frames the existing overlay relation groups, followed by the check-only hosted control groups.
 The ordered resolver validates the original witnesses and advances the expected clock by one microsecond from the prior local clock or archived parent basis.

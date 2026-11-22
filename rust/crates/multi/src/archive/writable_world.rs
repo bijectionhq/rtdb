@@ -209,6 +209,8 @@ fn matches_retention(world: &OwnedWorld, retained: &CheckpointWorldRetention) ->
 
 struct OpenWorld {
     retained: CheckpointWorldRetention,
+    incarnation: u64,
+    log_epoch: i32,
     snapshot: OwnedReadSession,
     record: OwnedWorld,
     clock: Option<Timestamp>,
@@ -259,6 +261,8 @@ async fn open_world(
     }
     Ok(OpenWorld {
         retained: retained.clone(),
+        incarnation: installation.incarnation,
+        log_epoch: installation.log_epoch,
         snapshot,
         record: world,
         clock,
@@ -315,10 +319,15 @@ pub async fn drop_checkpoint_world(
         }
     }
 
-    update_installation(directory, &deployment, |current| {
-        if current.incarnation != installation.incarnation
-            || current.log_epoch != installation.log_epoch
-        {
+    retire_world_pin(directory, &deployment, id, pin, installation.incarnation, installation.log_epoch).await
+}
+
+async fn retire_world_pin(
+    directory: &dyn Directory, deployment: &str, id: Uuid, pin: &CheckpointWorldRetention,
+    incarnation: u64, log_epoch: i32,
+) -> Result<()> {
+    update_installation(directory, deployment, |current| {
+        if current.incarnation != incarnation || current.log_epoch != log_epoch {
             return Err(OwnedWorld::unavailable());
         }
         if let Some(current_pin) = current.checkpoint_worlds.get(&id) {
@@ -328,8 +337,7 @@ pub async fn drop_checkpoint_world(
             current.checkpoint_worlds.remove(&id);
         }
         Ok(())
-    })
-    .await?;
+    }).await?;
     Ok(())
 }
 
@@ -361,15 +369,24 @@ pub(crate) async fn commit_checkpoint_world_checked(
         snapshot,
         record,
         _schema_charge,
+        retained,
+        incarnation,
+        log_epoch,
         ..
     } = open_world(directory, archive, session, deployment, id).await?;
     drop(snapshot);
+    let dropping = publication.as_ref().is_some_and(|publication| publication.drop_world);
     let outcome = session.commit_owned_world_checked(&record, writes, checks, controls, deadline, publication).await?;
     if !outcome.committed() {
         return Err(outcome
             .error()
             .cloned()
             .unwrap_or_else(OwnedWorld::unavailable));
+    }
+    if dropping {
+        // The ordered terminal marker is authoritative. A failed retirement leaves
+        // the exact pin retained until expiry or a retry via the archive drop owner.
+        let _ = retire_world_pin(directory, &deployment.to_string(), id, &retained, incarnation, log_epoch).await;
     }
     Ok(outcome.tx_key())
 }

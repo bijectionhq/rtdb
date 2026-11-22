@@ -1209,8 +1209,18 @@ impl OwnedReadSession {
     pub async fn ranked_search(
         &self, partitions: &[(rtdb_types::OwnedRelation, rtdb_types::OwnedRelation)], query: &str, limit: usize, observe: bool,
     ) -> Result<(Vec<rtdb_search::OwnedSearchHit>, Vec<OwnedRangeWitness>)> {
+        let (page, witnesses) = self.ranked_search_page(partitions, query, 0, limit, observe).await?;
+        Ok((page.hits, witnesses))
+    }
+
+    /// Ranks an exact bounded window and observes the same held population once.
+    #[cfg(feature = "search")]
+    pub async fn ranked_search_page(
+        &self, partitions: &[(rtdb_types::OwnedRelation, rtdb_types::OwnedRelation)], query: &str,
+        offset: usize, limit: usize, observe: bool,
+    ) -> Result<(rtdb_search::OwnedSearchPage, Vec<OwnedRangeWitness>)> {
         self.admit_read().await?;
-        let work = rtdb_search::owned_ranked(self.guard_context(Arc::clone(&self.context), partitions.iter().map(|(relation, _)| relation))?, &self.owner, partitions, query, limit);
+        let work = rtdb_search::owned_ranked(self.guard_context(Arc::clone(&self.context), partitions.iter().map(|(relation, _)| relation))?, &self.owner, partitions, query, offset, limit);
         let hits = rtdb_storage::IoRegion::leased(self.context.catalog.read_lease(), work).await?;
         let mut witnesses = Vec::with_capacity(partitions.len());
         if observe {
@@ -1436,6 +1446,7 @@ pub struct OwnedWorldPublication {
     pub fingerprint: [u8; 32],
     pub expected_clock: Option<Timestamp>,
     pub advance_to: Option<Timestamp>,
+    pub drop_world: bool,
 }
 
 #[derive(Clone)]
@@ -1517,7 +1528,8 @@ impl NativeSession {
         {
             return Err(rtdb_types::OwnedWorld::unavailable());
         }
-        if publication.as_ref().is_some_and(|publication| (writes.is_empty() != publication.advance_to.is_some())
+        if publication.as_ref().is_some_and(|publication| (writes.is_empty() != (publication.advance_to.is_some() || publication.drop_world))
+            || publication.drop_world && publication.advance_to.is_some()
             || checks.is_empty() || controls.is_empty()
             || deadline.is_none() || writes.len().saturating_add(controls.len())
                 .saturating_add(checks.len().saturating_mul(2)).saturating_add(4) > 4096)
@@ -1555,8 +1567,8 @@ impl NativeSession {
             ops.push(TxOp::OwnedReplaceDocs { relation, documents, valid_from: Some(valid.lower()), valid_to: Some(valid.upper()) });
         }
         ops.extend(controls.into_iter().map(TxOp::HostedControl));
-        if let Some(OwnedWorldPublication { attempt, fingerprint, expected_clock, advance_to }) = publication {
-            ops.push(TxOp::OwnedPublishWorld { world: record.id, attempt, fingerprint, expected: expected_clock, advance_to });
+        if let Some(OwnedWorldPublication { attempt, fingerprint, expected_clock, advance_to, drop_world }) = publication {
+            ops.push(TxOp::OwnedPublishWorld { world: record.id, attempt, fingerprint, expected: expected_clock, advance_to, drop_world });
         }
         self.state.execute_tx(ops, Default::default()).await
     }
