@@ -160,6 +160,7 @@ pub(crate) const OPEN_WORLD_READ_V4: &str = "rtdb.owned.OpenWorldRead.v4";
 pub(crate) const HELD_WORLD_POINT_V2: &str = "rtdb.owned.ReadHeldWorldPoint.v2";
 pub(crate) const CLOSE_WORLD_READ_V1: &str = "rtdb.owned.CloseWorldRead.v1";
 pub(crate) const PUBLISH_WORLD_CUT_V1: &str = "rtdb.owned.PublishWorldCut.v1";
+pub(crate) const PUBLISH_WORLD_CUT_V2: &str = "rtdb.owned.PublishWorldCut.v2";
 pub(crate) const COMMIT_HELD_WORLDS_V4: &str = "rtdb.owned.CommitHeldWorlds.v4";
 pub(crate) const COMMIT_WORLD_V3: &str = "rtdb.owned.CommitWorld.v3";
 const MAX_WORLD_WITNESSES: usize = 128;
@@ -1664,7 +1665,7 @@ impl Service {
         }
     }
 
-    pub(crate) async fn publish_world_cut_action(&self, call: &Call, body: &[u8]) -> Result<ActionResult, Status> {
+    pub(crate) async fn publish_world_cut_action(&self, call: &Call, body: &[u8], publish_root: bool) -> Result<ActionResult, Status> {
         if !self.0.config.owned_native_actions { return Err(unsupported()); }
         let host = self.0.config.owned_world_host.as_ref().ok_or_else(unsupported)?;
         let (handle, rest) = body.split_first_chunk::<16>().ok_or_else(|| invalid("World fork has no held root handle"))?;
@@ -1714,10 +1715,65 @@ impl Service {
             }
             Some(previous)
         };
+        // Deadline, registration, one immutable attempt and a Root head
+        // (or the standalone fork's optional tip check).
+        let mut rows_left = MAX_GROUPED_COMMIT_ROWS - 4;
+        let mut root = rtdb_node::OwnedRootSection::default();
+        let mut root_batches = None;
+        let mut root_witness_charge = None;
+        let mut root_framing = None;
+        let mut root_groups = 0;
+        let groups = if publish_root {
+            if previous.is_some() || !matches!(requested, rtdb_node::WorldClockRequest::Retained) || cut.live().is_none() {
+                return Err(invalid("A Root publication requires an initial retained fork at its original live hold"));
+            }
+            let (witnesses, groups, charge) = self.owned_witness_prefix(call, groups, true)?;
+            root_witness_charge = Some(charge);
+            let (size, body) = groups.split_first_chunk::<4>().ok_or_else(|| invalid("Missing Root section length"))?;
+            let (facts, controls) = body.split_at_checked(u32::from_be_bytes(*size) as usize)
+                .ok_or_else(|| invalid("Incomplete Root groups"))?;
+            root_groups = ordered_group_count(facts)?;
+            root_framing = Some(call.reserve(root_groups * 512)?);
+            let mut operations = Vec::new();
+            let mut fact_rows_left = rows_left;
+            root_batches = Some(self.decode_owned_commit_groups(
+                call, owned_groups(facts, false, true)?, &mut operations, &mut fact_rows_left, false,
+            )?);
+            rows_left = rows_left.checked_sub(operations.len() + witnesses.len())
+                .ok_or_else(|| invalid("Fork exceeds its effect limit"))?;
+            for (original, evidence) in witnesses {
+                if !Arc::ptr_eq(&held, &original) || !evidence.matches_scope(Some(scope)) {
+                    return Err(Status::failed_precondition("Root range witness belongs to another hold or placement"));
+                }
+                root.checks.push(evidence.operation());
+            }
+            let mut writes = Vec::new();
+            for operation in operations {
+                match &operation {
+                    TxOp::OwnedCheck { relation, .. } if relation.is_root_data() =>
+                        root.checks.push(operation),
+                    TxOp::OwnedInsertDocs { relation, .. } | TxOp::OwnedReplaceDocs { relation, .. }
+                    | TxOp::OwnedDelete { relation, .. } if relation.is_root_data() =>
+                        writes.push(operation),
+                    _ => return Err(invalid("Operation is outside the held Root section")),
+                }
+            }
+            if writes.is_empty() { return Err(invalid("A Root publication requires fact writes")); }
+            root.publication = Some(rtdb_node::OwnedRootPublication { attempt: attempt.to_owned(), writes });
+            controls
+        } else {
+            groups
+        };
+        let _root_reservations = (root_batches, root_witness_charge, root_framing);
         let groups = owned_groups(groups, true, false)?;
+        if root_groups + groups.len() > MAX_COMMIT_GROUPS {
+            return Err(invalid("Fork exceeds its grouped effect limit"));
+        }
         hosted_control::admit_control_targets(policy, groups.iter().map(|(relation, _)| relation))?;
-        let mut rows_left = MAX_GROUPED_COMMIT_ROWS - 4; // Deadline, optional tip check, registration and attempt.
-        let (controls, _charges) = self.decode_hosted_control_groups(call, groups, scope, &mut rows_left, true)?;
+        let (controls, _charges) = self.decode_hosted_control_groups(call, groups, scope, &mut rows_left, !publish_root)?;
+        if !controls.iter().any(rtdb_tx::HostedControlWrite::is_check) {
+            return Err(invalid("A retained fork requires a hosted ownership check"));
+        }
         let (_, attachment) = call.session.resolve_database(Some(&call.database), &self.0.node)?;
         let attachment = attachment.ok_or_else(unsupported)?;
         let connection = self.connection(call, &call.database).await?;
@@ -1727,6 +1783,13 @@ impl Service {
         let suffix = Uuid::from_bytes(*suffix);
         let original = previous.as_ref().map(|previous| &previous.snapshot);
         let mut deadline = Timestamp(i64::from_be_bytes(*deadline));
+        if publish_root {
+            held.snapshot.check().map_err(status)?;
+            deadline = deadline.min(held.snapshot.evidence_until());
+            if held.snapshot.present().system_time >= deadline {
+                return Err(Status::failed_precondition("Root hold is outside the fork deadline"));
+            }
+        }
         if let Some(previous) = original {
             previous.check().map_err(status)?;
             deadline = deadline.min(previous.evidence_until());
@@ -1738,7 +1801,7 @@ impl Service {
             rtdb_node::OwnedWorldFork {
                 world: rtdb_types::Iid(*world), pin: rtdb_types::Iid(*pin),
                 previous: original.map(|world| world.parent_pin()), cut, requested, deadline,
-                attempt: attempt.into(), fingerprint: *fingerprint, controls,
+                attempt: attempt.into(), fingerprint: *fingerprint, controls, root,
             },
         ).await.map_err(status)?;
         if registered.as_bytes() != world { return Err(unsupported()); }

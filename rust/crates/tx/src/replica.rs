@@ -93,10 +93,14 @@ pub fn decode_replica(message: &ResolvedTx, predecessor: Option<TransactionKey>,
             .collect();
         match world_effects {
             Some(Value::List(effects)) => {
+                let root_retained_fork = worlds::verify(&tables, effects, key, memory)?;
                 if !controls.is_empty() || proof.is_some_and(|proof| proof.contains_key(crate::hosted_control::CONTROL_TABLES)) {
-                    return Err(invalid("Resolved world effects may only check hosted controls"));
+                    if !root_retained_fork {
+                        return Err(invalid("Resolved world effects may only check hosted controls"));
+                    }
+                    let proof = proof.ok_or_else(|| invalid("Resolved hosted controls require a placed attempt"))?;
+                    verify_hosted_controls(proof, &controls, key)?;
                 }
-                worlds::verify(&tables, effects, key, memory)?;
             }
             Some(Value::Undefined | Value::Null) | None => {
                 if owned_scopes.len() != 1 {

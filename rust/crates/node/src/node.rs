@@ -1576,6 +1576,7 @@ pub struct OwnedWorldFork {
     pub attempt: String,
     pub fingerprint: [u8; 32],
     pub controls: Vec<rtdb_tx::HostedControlWrite>,
+    pub root: OwnedRootSection,
 }
 
 #[derive(Default)]
@@ -1635,18 +1636,42 @@ impl NativeSession {
             WorldClockRequest::Proposal => rtdb_types::WorldClockMode::Proposal,
         };
         let requires_tip = record.initial_clock() > inherited || requested == rtdb_types::WorldClockMode::Proposal;
+        let publish_root = fork.root.publication.is_some();
+        let effects = fork.controls.len().saturating_add(fork.root.checks.len())
+            .saturating_add(fork.root.publication.as_ref().map_or(0, |root| root.writes.len() + 1))
+            .saturating_add(3 + usize::from(requires_tip));
         if record.id != fork.world || record.pin != fork.pin || record.basis.system_time != fork.cut.basis
             || (fork.previous.is_none() != (record.pin == record.id)) || fork.controls.is_empty()
             || fork.previous.is_some_and(|pin| pin == record.pin || record.mode.is_writable())
             || fork.cut.live.is_some_and(|live| live != record.basis) || record.mode != requested
             || (requires_tip && fork.cut.live.is_none())
-            || fork.controls.len() > 4092 || fork.controls.iter().any(|control| !control.is_check())
+            || effects > 4096 || !fork.controls.iter().any(rtdb_tx::HostedControlWrite::is_check)
+            || (!publish_root && (!fork.root.checks.is_empty() || fork.controls.iter().any(|control| !control.is_check())))
+            || (publish_root && (fork.previous.is_some() || requested != rtdb_types::WorldClockMode::Retained
+                || fork.cut.live.is_none()))
+            || fork.root.checks.iter().any(|check| match check {
+                TxOp::OwnedCheck { relation, .. } | TxOp::OwnedCheckRange { relation, .. } =>
+                    !relation.is_root_data(),
+                _ => true,
+            })
+            || fork.root.publication.as_ref().is_some_and(|root| {
+                root.attempt != fork.attempt || root.writes.is_empty() || root.writes.iter().any(|write| match write {
+                    TxOp::OwnedInsertDocs { relation, .. } | TxOp::OwnedReplaceDocs { relation, .. }
+                    | TxOp::OwnedDelete { relation, .. } => !relation.is_root_data(),
+                    _ => true,
+                })
+            })
             || self.placed_history()? != Some(fork.cut.scope)
         {
             return Err(rtdb_types::OwnedWorld::unavailable());
         }
-        let mut ops = Vec::with_capacity(fork.controls.len() + 2 + usize::from(requires_tip));
+        let _operations = self.service.node.memory().reserve(effects * (std::mem::size_of::<TxOp>() + 512))?;
+        let mut ops = Vec::with_capacity(effects);
         ops.push(TxOp::OwnedDeadline { until });
+        if publish_root {
+            ops.extend(fork.root.checks);
+            ops.extend(fork.root.publication.into_iter().flat_map(|root| root.writes));
+        }
         ops.extend(fork.controls.into_iter().map(TxOp::HostedControl));
         if requires_tip {
             ops.push(TxOp::OwnedCheck {
@@ -1657,7 +1682,7 @@ impl NativeSession {
             });
         }
         ops.push(TxOp::OwnedForkWorld { record: record.record(), previous: fork.previous,
-            attempt: fork.attempt, fingerprint: fork.fingerprint });
+            attempt: fork.attempt, fingerprint: fork.fingerprint, publish_root });
         self.state.execute_tx(ops, Default::default()).await
     }
 
