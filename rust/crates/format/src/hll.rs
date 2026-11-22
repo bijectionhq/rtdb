@@ -3,7 +3,8 @@ use std::ops::Range;
 
 use arrow_array::{Array, RecordBatch, StructArray, UnionArray};
 use arrow_schema::{DataType, Field};
-use rtdb_types::{Anomaly, LogicalType, Result, Value};
+use rtdb_columnar::ColumnPresence;
+use rtdb_types::{Anomaly, Result};
 
 pub const DEFAULT_REGISTER_COUNT: usize = 1024;
 
@@ -87,8 +88,8 @@ pub fn combine(left: &[u8], right: &[u8]) -> Result<Vec<u8>> {
 
 pub fn from_column(field: &Field, array: &dyn Array) -> Result<Vec<u8>> {
     let mut hll = Hll::default();
-    let reader = rtdb_columnar::ColumnReader::new(field)?;
-    if reader.logical() != &LogicalType::Nothing {
+    let reader = ColumnPresence::new(field)?;
+    if !reader.is_bottom() {
         for row in 0..array.len() { add_cell(&mut hll, &reader, field, array, row)?; }
     }
     Ok(hll.into_bytes())
@@ -106,8 +107,8 @@ pub fn from_event_batch(batch: &RecordBatch, rows: Range<usize>) -> Result<BTree
     let mut result = BTreeMap::new();
     for (index, field) in fields.iter().enumerate() {
         let mut hll = Hll::default();
-        let reader = rtdb_columnar::ColumnReader::new(field)?;
-        if reader.logical() != &LogicalType::Nothing {
+        let reader = ColumnPresence::new(field)?;
+        if !reader.is_bottom() {
             for row in rows.clone() {
                 if op.type_id(row) == put_id { add_cell(&mut hll, &reader, field, put.column(index).as_ref(), op.value_offset(row))?; }
             }
@@ -117,8 +118,8 @@ pub fn from_event_batch(batch: &RecordBatch, rows: Range<usize>) -> Result<BTree
     Ok(result)
 }
 
-fn add_cell(hll: &mut Hll, reader: &rtdb_columnar::ColumnReader<'_>, field: &Field, array: &dyn Array, row: usize) -> Result<()> {
-    if !matches!(reader.read(array, row)?, Value::Null | Value::Undefined) {
+fn add_cell(hll: &mut Hll, reader: &ColumnPresence<'_>, field: &Field, array: &dyn Array, row: usize) -> Result<()> {
+    if reader.is_present(array, row)? {
         hll.insert_hash(rtdb_columnar::hash_cell(field, array, row, 0)?);
     }
     Ok(())
@@ -126,4 +127,22 @@ fn add_cell(hll: &mut Hll, reader: &rtdb_columnar::ColumnReader<'_>, field: &Fie
 
 fn invalid(error: impl std::fmt::Display) -> Anomaly {
     Anomaly::incorrect("rtdb.format/invalid-hll", error.to_string())
+}
+
+#[test]
+fn union_and_run_end_nulls_do_not_add_hll_registers() {
+    use rtdb_types::{LogicalType, RunEndWidth, Value};
+
+    let values = [Value::Null, Value::Utf8("hello".into()), Value::Utf8("hello".into()), Value::I64(7), Value::Null];
+    let ty = LogicalType::join_all(values.iter().map(Value::logical_type).collect::<Vec<_>>().iter());
+    let mut expected = Hll::default();
+    for value in values.iter().filter(|value| **value != Value::Null) {
+        expected.insert_hash(rtdb_columnar::hash_value(value, 0).unwrap());
+    }
+    let encoded = ty.clone().run_end_encoded(RunEndWidth::I32).unwrap();
+    for ty in [ty, encoded] {
+        let field = rtdb_columnar::to_field("v", &ty).unwrap();
+        let array = rtdb_columnar::build_array(&ty, &values).unwrap();
+        assert_eq!(from_column(&field, array.as_ref()).unwrap(), expected.bytes);
+    }
 }

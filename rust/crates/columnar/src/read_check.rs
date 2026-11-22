@@ -1,9 +1,62 @@
 use std::sync::Arc;
 use arrow_array::{Array, cast::AsArray, types::{Int16Type, Int32Type, Int64Type}};
 use arrow_schema::{DataType, Field, UnionMode};
-use rtdb_types::{Anomaly, LogicalType, Result, UriParts};
+use rtdb_types::{Anomaly, LogicalType, Result, UriParts, Value};
 
 use crate::{EXTENSION_NAME_KEY, MemoryBudget, estimate_read_value_bytes, from_field, leg_name, read_value_as};
+
+pub struct ColumnPresence<'a> {
+    field: &'a Field,
+    logical: LogicalType,
+    ambiguous: bool,
+    check: bool,
+}
+
+impl<'a> ColumnPresence<'a> {
+    pub fn new(field: &'a Field) -> Result<Self> {
+        let logical = from_field(field)?;
+        let ambiguous = ambiguous_union(field, &logical)?;
+        Ok(Self { field, logical, ambiguous, check: needs_check(field, false) })
+    }
+
+    pub fn is_bottom(&self) -> bool { self.logical == LogicalType::Nothing }
+
+    pub fn is_present(&self, array: &dyn Array, row: usize) -> Result<bool> {
+        if row >= array.len() || array.data_type() != self.field.data_type() { return Err(layout()); }
+        if self.ambiguous {
+            return Ok(!matches!(read_value_as(&self.logical, self.field, array, row)?, Value::Null | Value::Undefined));
+        }
+        if self.check { check_cell(self.field, array, row, false)?; }
+        present(self.field, array, row)
+    }
+}
+
+fn present(field: &Field, array: &dyn Array, row: usize) -> Result<bool> {
+    match field.data_type() {
+        DataType::Null => Ok(false),
+        DataType::Union(fields, UnionMode::Dense) => {
+            let union = array.as_union();
+            let id = union.type_id(row);
+            let (_, child) = fields.iter().find(|(tag, _)| *tag == id).ok_or_else(layout)?;
+            present(child, union.child(id).as_ref(), union.value_offset(row))
+        }
+        DataType::RunEndEncoded(ends, child) => {
+            macro_rules! in_run {
+                ($ty:ty) => {{
+                    let runs = array.as_run::<$ty>();
+                    present(child, runs.values().as_ref(), runs.get_physical_index(row))
+                }}
+            }
+            match ends.data_type() {
+                DataType::Int16 => in_run!(Int16Type),
+                DataType::Int32 => in_run!(Int32Type),
+                DataType::Int64 => in_run!(Int64Type),
+                _ => Err(layout()),
+            }
+        }
+        _ => Ok(array.is_valid(row)),
+    }
+}
 
 /// Checks value-dependent reads from a column whose Arrow layout has already been validated.
 pub fn validate_readable_column(field: &Field, array: &dyn Array, logical: &LogicalType, memory: &Arc<MemoryBudget>) -> Result<()> {
