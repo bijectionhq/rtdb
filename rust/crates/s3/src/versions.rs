@@ -25,6 +25,7 @@ pub struct VersionedInventory {
     root: ObjectKey,
     request_payer: Option<RequestPayer>,
     scope_multipart_listing: bool,
+    terminal_allocation: Option<uuid::Uuid>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -36,10 +37,27 @@ enum VersionStatus {
 
 impl VersionedInventory {
     pub(crate) fn new(client: Client, namespace: S3ObjectNamespace, root: ObjectKey, requester_pays: bool, scope_multipart_listing: bool) -> Self {
-        Self { client, namespace, root, request_payer: requester_pays.then_some(RequestPayer::Requester), scope_multipart_listing }
+        Self { client, namespace, root, request_payer: requester_pays.then_some(RequestPayer::Requester), scope_multipart_listing, terminal_allocation: None }
     }
 
     pub(crate) fn namespace(&self) -> &S3ObjectNamespace { &self.namespace }
+
+    pub(crate) fn with_terminal_allocation(mut self, allocation: uuid::Uuid) -> Self {
+        self.terminal_allocation = Some(allocation);
+        self
+    }
+
+    pub async fn terminal_release_targets(&self, key: &ObjectKey, release: &ObjectKey, publication: &rtdb_types::TerminalObjectPublication)
+        -> Result<Option<[rtdb_types::S3TombstoneTarget; 2]>>
+    {
+        if self.terminal_allocation != Some(publication.allocation) || self.namespace != publication.namespace { return Ok(None); }
+        let retirement = self.never_versioned_retirement().await?;
+        let NeverVersionedObject::Open(data) = retirement.observe(key).await? else { return Ok(None); };
+        if data.key != publication.key || data.condition != S3TombstoneCondition::Matches(publication.etag.clone()) { return Ok(None); }
+        let NeverVersionedObject::Open(marker) = retirement.observe(release).await? else { return Ok(None); };
+        if !matches!(marker.condition, S3TombstoneCondition::Matches(_)) { return Ok(None); }
+        Ok(Some([data, marker]))
+    }
 
     pub(crate) async fn enrollment_inventory_is_clean(&self, existing_evidence: Option<&ObjectKey>) -> Result<bool> {
         let root = Path::from(self.root.as_str());
@@ -301,7 +319,9 @@ impl VersionedInventory {
             S3TombstoneCondition::Matches(tag) => request.if_match(tag),
         };
         match request.send().await {
-            Ok(output) => Ok(PublicationResult::Published { version: output.version_id().map(str::to_owned) }),
+            Ok(output) => Ok(PublicationResult::Published {
+                version: output.version_id().map(str::to_owned), etag: output.e_tag().map(str::to_owned),
+            }),
             Err(error) if error.as_service_error().and_then(|error| error.code()) == Some("PreconditionFailed") => Ok(PublicationResult::Conflict),
             Err(error) => Err(publication_failure(path, error.to_string())),
         }
@@ -516,7 +536,7 @@ mod tests {
         let attempt = uuid::Uuid::new_v4();
         let winner = inventory.reserve(&upload_path, attempt).await.unwrap();
         let published = inventory.complete(&upload_path, &winner, Bytes::from_static(b"sealed")).await.unwrap();
-        let PublicationResult::Published { version: Some(published_version) } = published else { panic!("versioned completion lacked its version") };
+        let PublicationResult::Published { version: Some(published_version), .. } = published else { panic!("versioned completion lacked its version") };
         let loser = inventory.reserve(&upload_path, uuid::Uuid::new_v4()).await.unwrap();
         assert_eq!(inventory.complete(&upload_path, &loser, Bytes::from_static(b"other")).await.unwrap(), PublicationResult::Conflict);
         inventory.abort_publication(&upload_key, &loser).await.unwrap();

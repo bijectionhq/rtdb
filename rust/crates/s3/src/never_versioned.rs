@@ -3,7 +3,7 @@ use bytes::Bytes;
 use object_store::path::Path;
 use rtdb_storage::{
     ObjectKey,
-    remote::{PublicationResult, S3_RETIREMENT_ATTRIBUTE},
+    remote::{PublicationResult, S3_RETIREMENT_ATTRIBUTE, strong_entity_tag},
 };
 use rtdb_types::{Anomaly, AnomalyCategory, Result, S3TombstoneCondition, S3TombstoneTarget};
 use uuid::Uuid;
@@ -84,7 +84,7 @@ impl NeverVersionedRetirement<'_> {
                         "The publication does not have a positive content length",
                     ));
                 }
-                let tag = reply.e_tag().filter(|tag| strong_tag(tag)).ok_or_else(|| {
+                let tag = reply.e_tag().filter(|tag| strong_entity_tag(tag)).ok_or_else(|| {
                     unavailable("The publication does not have a strong entity tag")
                 })?;
                 S3TombstoneCondition::Matches(tag.to_owned())
@@ -118,7 +118,7 @@ impl NeverVersionedRetirement<'_> {
         let path = self.path(key);
         if target.namespace != self.inventory.namespace
             || target.key != path.as_ref()
-            || matches!(&target.condition, S3TombstoneCondition::Matches(tag) if !strong_tag(tag))
+            || matches!(&target.condition, S3TombstoneCondition::Matches(tag) if !strong_entity_tag(tag))
         {
             return Err(Anomaly::incorrect(
                 "rtdb.s3/tombstone-target",
@@ -175,8 +175,8 @@ impl NeverVersionedRetirement<'_> {
             .complete_conditional(&path, upload, Bytes::new(), &target.condition)
             .await?
         {
-            PublicationResult::Published { version: None } | PublicationResult::Conflict => Ok(()),
-            PublicationResult::Published { version: Some(_) } => {
+            PublicationResult::Published { version: None, .. } | PublicationResult::Conflict => Ok(()),
+            PublicationResult::Published { version: Some(_), .. } => {
                 Err(unavailable("S3 versioned the retirement tombstone"))
             }
         }
@@ -200,18 +200,6 @@ impl NeverVersionedRetirement<'_> {
         self.require_never_versioned().await?;
         Ok(true)
     }
-}
-
-fn strong_tag(tag: &str) -> bool {
-    tag.strip_prefix('"')
-        .and_then(|tag| tag.strip_suffix('"'))
-        .is_some_and(|value| {
-            !value.is_empty()
-                && value != "*"
-                && value
-                    .bytes()
-                    .all(|byte| byte.is_ascii_graphic() && !matches!(byte, b'"' | b'\\' | b','))
-        })
 }
 
 fn unavailable(message: impl Into<String>) -> Anomaly {

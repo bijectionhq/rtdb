@@ -242,3 +242,26 @@ The loopback emulator does not enforce the MinIO session-policy integration cont
 New tombstone retirement requires a per-publication witness from the serving write path.
 
 The native, fixture and TLC evidence is under `/private/tmp/rtdb-terminal-enroll-native-rebased.log`, `/private/tmp/rtdb-terminal-enrollment-fixture.log` and `/private/tmp/rtdb-terminal-enrollment-3o3k6t8m/`.
+
+== R5 · Witnessed terminal loose-file retirement
+
+The write response supplies the provider identity for the catalog's file or artefact record.
+The hosted collector retains a terminal publication in its installed release, and the reaper compares both targets before authorizing the exact owning residence.
+The receipt survives open, interrupted and resumed retirement, and provider closure precedes settlement.
+
+On `9a304e94eb` the native suite passed 636 cases and five doctests, with eight ignored cases.
+The storage regression exercises a normal publication, lost reply and exact-byte retry.
+The reaper replay blocks on the published recovery cut, an older recovery admission and a physical-owner read.
+It retains and resumes the same release-marker upload after a directory restart.
+The loopback S3 fixture exercises the captured ETag and rejects a different allocation and tag.
+
+TLC explored 36 states for terminal retirement admission.
+Its six safety mutants omit enrollment, the installed release, write evidence, the owner hold, recovery coverage or upload closure.
+The reachability witness settles an eligible retirement.
+The publication identity, disposal and existing composed residence studies matched their controls.
+Allium 3.7.2 added no diagnostics to the edited specs relative to their baseline.
+link:../tla/TerminalRetirementAdmission.tla[Admission model]
+
+The replay abstracts provider policies and mixed packs.
+The runtime provider gate still needs qualification in the hosted environment.
+The native and TLC records are in `/private/tmp/rtdb-terminal-publication-native-final.log` and `/private/tmp/rtdb-terminal-retirement-final-ofwj4jrq/`.

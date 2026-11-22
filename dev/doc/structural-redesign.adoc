@@ -113,7 +113,8 @@ Renewal, recovery-root integration, identity-bound certification and timer remov
 |Recovery roots as holds; collectable L0; reset from a root.
 |Multi binds checkpoint metadata and startup suffix holds.
 Hosted storage collects covered exact versions and supports isolated terminal S3 enrollment.
-Full recovery closures, compactor reset and admission of new unversioned retirements remain open.
+Enrolled terminal storage can retire loose files with a write witness and an installed release.
+Full recovery closures, compactor reset, terminal pack coverage and live provider qualification remain open.
 
 |6
 |Sealing and the key ledger for every durable unit.

@@ -1,4 +1,4 @@
-use rtdb_types::{Anomaly, CatalogCut, PhysicalObjectVersion, ReplicaPosition, Result, TableRef};
+use rtdb_types::{Anomaly, CatalogCut, PhysicalObjectVersion, ReplicaPosition, Result, TableRef, TerminalObjectPublication};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -12,6 +12,8 @@ pub struct RetirementFile {
     pub key: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub version: Option<PhysicalObjectVersion>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub terminal_publication: Option<TerminalObjectPublication>,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub matches_publication: bool,
 }
@@ -101,7 +103,7 @@ mod tests {
             table: TableRef::new("public", "docs"),
             tries: vec!["l01-rc-b00".into()],
             files: vec![RetirementFile {
-                key: "tables/docs/data/l01-rc-b00.arrow".into(), version: None, matches_publication: false,
+                key: "tables/docs/data/l01-rc-b00.arrow".into(), version: None, terminal_publication: None, matches_publication: false,
             }],
         };
         let contents = serde_json::to_vec(&intent).unwrap();

@@ -190,10 +190,17 @@ impl S3Config {
             return Ok(Arc::new(RemoteStore::new_in(client, Some(prefix), io)));
         }
         #[cfg(feature = "versioning")]
-        if let Some(uploads) = uploads {
-            return Ok(Arc::new(RemoteStore::new_managed(client, prefix, io, Arc::new(uploads)).with_s3_versioning(namespace)));
-        }
-        Ok(Arc::new(RemoteStore::new_single_put(client, prefix, io).with_s3_versioning(namespace)))
+        let store = match uploads {
+            Some(uploads) => RemoteStore::new_managed(client, prefix, io, Arc::new(uploads)),
+            None => RemoteStore::new_single_put(client, prefix, io),
+        };
+        #[cfg(not(feature = "versioning"))]
+        let store = RemoteStore::new_single_put(client, prefix, io);
+        let store = store.with_s3_versioning(namespace);
+        Ok(Arc::new(match &self.terminal_scope {
+            Some(scope) => store.with_terminal_allocation(scope.allocation),
+            None => store,
+        }))
     }
 
     #[cfg(feature = "versioning")]
@@ -226,11 +233,12 @@ impl S3Config {
     pub async fn versioned_inventory(&self, storage_root: &ObjectKey, remotes: &dyn S3CredentialResolver) -> Result<VersionedInventory> {
         self.require_cell_root(storage_root)?;
         let inventory = self.open_inventory(storage_root, remotes).await?;
-        if self.terminal_scope.is_some() {
+        if let Some(scope) = &self.terminal_scope {
             let store = self.open_cell(storage_root, remotes, IoRegion::new()).await?;
             if store.s3_namespace() != Some(inventory.namespace()) {
                 return Err(Anomaly::incorrect("xtdb.aws/terminal-scope", "The store and inventory resolve to different S3 namespaces"));
             }
+            return Ok(inventory.with_terminal_allocation(scope.allocation));
         }
         Ok(inventory)
     }

@@ -114,6 +114,12 @@ message PublishedObjectVersion {
     string region = 3;
     string key = 4;
     string version = 5;
+    TerminalPublication terminal = 6;
+}
+
+message TerminalPublication {
+    bytes allocation = 1;
+    string etag = 2;
 }
 
 // A file derived from a trie's data file (e.g. a search index), recorded on the trie's catalog entry and deleted with it.

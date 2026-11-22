@@ -2480,6 +2480,22 @@ rule SettleNeverVersionedRetirement {
             SettleOwnerFenceAndReopenLineage(retirement)
 }
 
+rule AuthorizeTerminalS3Retirement {
+    when: HostedLooseFileReleaseDue(release)
+
+    requires: InstalledCatalogFloorCovers(release)
+    requires: TerminalAllocationMatchesPublication(release)
+    requires: CurrentProviderKeyAndTagMatchInstalledPublication(release)
+    requires: CurrentReleaseMarkerMatchesReservedRetirement(release)
+    requires: PublishedCheckpointAndAdmittedRecoveriesCoverRelease(release)
+    requires: LineageReservedFor(release)
+    requires: NoCurrentManifestReferences(release.physical_key)
+    requires: PhysicalOwnerRevisionMatchesValidatedFence(release)
+
+    ensures:
+        ExactVersionRetirementAuthorized(release)
+}
+
 rule AuthorizeHostedVersionErasure {
     -- The retirement reservation binds the physical version, release marker and source residence together.
     -- The reservation closes fork preparation and publication while the reaper scans the current manifests of the lineage.
@@ -3039,6 +3055,7 @@ surface TerminalStorageMaintenance {
 
     provides:
         TerminalAllocationAccessRequested(reaper, allocation)
+        HostedLooseFileReleaseDue(release)
 
     contracts:
         demands ObjectStorage

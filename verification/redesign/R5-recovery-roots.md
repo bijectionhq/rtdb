@@ -255,8 +255,13 @@ Its early-write counterexample assumes that an ordinary write bypasses the provi
 
 The native S3 adapter validates the exact physical namespace and key, executes a conditional zero-byte replacement, and requires fresh evidence of the same retirement token and never-versioned bucket status.
 Cell-store reads and listings treat these tombstones as absent, and a conditional create conflict refuses to adopt the tombstone as a published object.
-The production reaper can resume an authorized data-and-marker pair from the directory after restart and settles its owner fence and lineage together.
-New retirements remain gated on clean namespace enrollment or independent proof of a historical namespace's publication identities.
+For loose files in an enrolled allocation, the write acknowledgement supplies the physical key and entity tag retained by the trie catalog or artefact record.
+The collector binds that identity to the installed retirement receipt and admission floor before queueing a release.
+The reaper compares the current provider key and tag to the release in its qualified allocation and reserves that data-and-marker pair.
+It rechecks the pair and the fork references under the lineage reservation and validates the physical owner's read fence at directory authorization.
+The owner's published checkpoint must cover the installed removal, and every admitted recovery must start after that cut.
+The production reaper can resume the authorized pair from the directory after restart and settles its owner fence and lineage together.
+Historical namespaces without equivalent publication evidence keep their released files.
 The serving bucket policy must grant conditional replacement to the reaper and keep terminal tombstones outside path collection until residence disposal.
 
 Whole-residence disposal also needs evidence that every retirement write has settled.
@@ -271,7 +276,8 @@ An untracked retry or early settlement can recreate the disposed key in its nega
 TLC explored 33 states and reached purge with a delayed completion whose closed upload could no longer affect storage.
 An initiation that loses its response before admission can leave an empty upload for provider lifecycle cleanup.
 Hosted qualification must establish conditional multipart completion for a zero-byte payload and confirm that a closed upload cannot publish after whole-residence disposal.
-Enabling new retirements still needs per-key publication witnesses recorded during serving writes, a matching reaper policy and live provider qualification.
+Enabling this profile in the hosted fleet still needs a matching reaper policy and live provider qualification.
+Retirement of terminal packs and previously unwitnessed files needs its own publication coverage.
 [Disposal composition model](../tla/TombstoneDisposal.tla)
 
 ### Shared fork publication and referrer inventories

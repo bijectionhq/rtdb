@@ -235,9 +235,19 @@ mod tests {
                 assert_eq!(enrolled.unwrap(), allocation, "{case}");
                 let store = config.open_cell(&root, &remotes, IoRegion::new()).await.unwrap();
                 assert_eq!(store.get(&marker).await.unwrap().as_ref(), allocation.as_bytes());
-                store.put(&object, Bytes::from_static(b"after enrollment")).await.unwrap();
+                let Some(rtdb_types::PhysicalObjectPublication::Terminal(publication)) =
+                    store.put_with_publication(&object, Bytes::from_static(b"after enrollment")).await.unwrap()
+                else { panic!("the terminal provider returned no publication identity"); };
                 assert_eq!(config.enroll_terminal_cell(&remotes, evidence).await.unwrap(), allocation);
-                assert!(config.versioned_inventory(&root, &remotes).await.is_ok());
+                let release = ObjectKey::new("release").unwrap();
+                store.put(&release, Bytes::from_static(b"installed release")).await.unwrap();
+                let inventory = config.versioned_inventory(&root, &remotes).await.unwrap();
+                let matched = inventory.terminal_release_targets(&object, &release, &publication).await.unwrap().unwrap();
+                assert_eq!(matched[0].condition, rtdb_types::S3TombstoneCondition::Matches(publication.etag.clone()));
+                let foreign = rtdb_types::TerminalObjectPublication { allocation: Uuid::new_v4(), ..publication.clone() };
+                assert!(inventory.terminal_release_targets(&object, &release, &foreign).await.unwrap().is_none());
+                let stale = rtdb_types::TerminalObjectPublication { etag: "\"old\"".into(), ..publication };
+                assert!(inventory.terminal_release_targets(&object, &release, &stale).await.unwrap().is_none());
             } else {
                 assert!(enrolled.is_err(), "{case}");
                 assert!(matches!(raw.get(&marker).await, Err(Error::MissingObject(_))));

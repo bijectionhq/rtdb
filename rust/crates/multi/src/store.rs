@@ -884,13 +884,13 @@ impl ObjectStore for FencedStore {
     async fn get_range(&self, key: &ObjectKey, range: Range<u64>) -> rtdb_storage::Result<Bytes> { self.inner.get_range(key, range).await }
     async fn put(&self, key: &ObjectKey, bytes: Bytes) -> rtdb_storage::Result<()> { self.check(key).await?; self.inner.put(key, bytes).await }
     async fn put_file(&self, key: &ObjectKey, source: &Path) -> rtdb_storage::Result<()> { self.check(key).await?; self.inner.put_file(key, source).await }
-    async fn put_with_version(&self, key: &ObjectKey, bytes: Bytes) -> rtdb_storage::Result<Option<rtdb_types::PhysicalObjectVersion>> {
+    async fn put_with_publication(&self, key: &ObjectKey, bytes: Bytes) -> rtdb_storage::Result<Option<rtdb_types::PhysicalObjectPublication>> {
         self.check(key).await?;
-        self.inner.put_with_version(key, bytes).await
+        self.inner.put_with_publication(key, bytes).await
     }
-    async fn put_file_with_version(&self, key: &ObjectKey, source: &Path) -> rtdb_storage::Result<Option<rtdb_types::PhysicalObjectVersion>> {
+    async fn put_file_with_publication(&self, key: &ObjectKey, source: &Path) -> rtdb_storage::Result<Option<rtdb_types::PhysicalObjectPublication>> {
         self.check(key).await?;
-        self.inner.put_file_with_version(key, source).await
+        self.inner.put_file_with_publication(key, source).await
     }
     async fn list(&self, directory: Option<&ObjectKey>) -> rtdb_storage::Result<Vec<StoredObject>> { self.inner.list(directory).await }
     async fn delete(&self, key: &ObjectKey) -> rtdb_storage::Result<()> {
@@ -964,15 +964,15 @@ impl ObjectStore for EncryptingStore {
         let bytes = tokio::fs::read(source).await.map_err(|error| Error::Task(format!("cannot read {}: {error}", source.display())))?;
         self.put(key, Bytes::from(bytes)).await
     }
-    async fn put_with_version(&self, key: &ObjectKey, bytes: Bytes) -> rtdb_storage::Result<Option<rtdb_types::PhysicalObjectVersion>> {
-        match self.inner.put_with_version(key, self.seal(key, &bytes)?).await {
+    async fn put_with_publication(&self, key: &ObjectKey, bytes: Bytes) -> rtdb_storage::Result<Option<rtdb_types::PhysicalObjectPublication>> {
+        match self.inner.put_with_publication(key, self.seal(key, &bytes)?).await {
             Err(Error::ConflictingObject(_)) if self.get_fresh(key).await? == bytes => Ok(None),
             written => written,
         }
     }
-    async fn put_file_with_version(&self, key: &ObjectKey, source: &Path) -> rtdb_storage::Result<Option<rtdb_types::PhysicalObjectVersion>> {
+    async fn put_file_with_publication(&self, key: &ObjectKey, source: &Path) -> rtdb_storage::Result<Option<rtdb_types::PhysicalObjectPublication>> {
         let bytes = tokio::fs::read(source).await.map_err(|error| Error::Task(format!("cannot read {}: {error}", source.display())))?;
-        self.put_with_version(key, Bytes::from(bytes)).await
+        self.put_with_publication(key, Bytes::from(bytes)).await
     }
     async fn list(&self, directory: Option<&ObjectKey>) -> rtdb_storage::Result<Vec<StoredObject>> {
         Ok(self.inner.list(directory).await?.into_iter().map(plain).collect())
@@ -999,6 +999,10 @@ enum StoredRelease {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pack: Option<String>,
     },
+    Terminal {
+        record: GarbageRecord,
+        terminal: rtdb_types::TerminalObjectPublication,
+    },
     Path(GarbageRecord),
 }
 
@@ -1006,6 +1010,7 @@ impl StoredRelease {
     fn into_parts(self) -> (GarbageRecord, Option<PhysicalObjectVersion>) {
         match self {
             Self::Exact { record, version, .. } => (record, Some(version)),
+            Self::Terminal { record, .. } => (record, None),
             Self::Path(record) => (record, None),
         }
     }
@@ -1055,17 +1060,22 @@ impl GarbageStore {
     }
 
     async fn write_release(&self, key: &ObjectKey, trie_floor: Option<CatalogAdmissionFloor>, version: Option<&PhysicalObjectVersion>) -> rtdb_storage::Result<()> {
-        self.write_release_record(key, trie_floor, version, None).await
+        self.write_release_record(key, trie_floor, version, None, None).await
     }
 
-    async fn write_release_record(&self, key: &ObjectKey, trie_floor: Option<CatalogAdmissionFloor>, version: Option<&PhysicalObjectVersion>, pack: Option<&ObjectKey>) -> rtdb_storage::Result<()> {
+    async fn write_release_record(&self, key: &ObjectKey, trie_floor: Option<CatalogAdmissionFloor>, version: Option<&PhysicalObjectVersion>,
+        pack: Option<&ObjectKey>, terminal: Option<&rtdb_types::TerminalObjectPublication>) -> rtdb_storage::Result<()> {
         if self.released.lock().get(key).is_some_and(|known| version.is_none_or(|version| known.contains(version))) { return Ok(()); }
         let record = GarbageRecord { key: key.as_str().to_owned(), released_at_ms: (self.clock)(), trie_floor };
         let suffix = if rtdb_format::keys::is_ordered_index_object(key.as_str()) { ORDERED_INDEX_RELEASE }
-            else if version.is_some() || rtdb_format::keys::is_trie_retirement_object(key.as_str()) { TRIE_RETIREMENT_RELEASE } else { "" };
+            else if version.is_some() || terminal.is_some() || rtdb_format::keys::is_trie_retirement_object(key.as_str()) { TRIE_RETIREMENT_RELEASE } else { "" };
         let name = ObjectKey::new(format!("{GARBAGE_DIRECTORY}/{:020}-{}{suffix}", record.released_at_ms, uuid::Uuid::new_v4().simple()))
             .map_err(|error| Error::Task(error.to_string()))?;
-        let release = match version { Some(version) => StoredRelease::Exact { record, version: version.clone(), pack: pack.map(ObjectKey::to_string) }, None => StoredRelease::Path(record) };
+        let release = match (version, terminal) {
+            (Some(version), _) => StoredRelease::Exact { record, version: version.clone(), pack: pack.map(ObjectKey::to_string) },
+            (None, Some(terminal)) => StoredRelease::Terminal { record, terminal: terminal.clone() },
+            (None, None) => StoredRelease::Path(record),
+        };
         self.inner.put(&name, Bytes::from(serde_json::to_vec(&release).expect("a record serializes"))).await?;
         remember_release(&mut self.released.lock(), key.clone(), version.cloned());
         Ok(())
@@ -1130,7 +1140,7 @@ impl ObjectStore for GarbageStore {
         files.sort_by_key(|file| file.release_order());
         for file in files {
             let version = file.version.as_ref().filter(|_| file.matches_publication);
-            self.write_release(&ObjectKey::new(&file.key)?, Some(floor.clone()), version).await?;
+            self.write_release_record(&ObjectKey::new(&file.key)?, Some(floor.clone()), version, None, file.terminal_publication.as_ref()).await?;
         }
         Ok(())
     }
@@ -1149,11 +1159,11 @@ impl ObjectStore for GarbageStore {
     fn supports_scan_ranges(&self, key: &ObjectKey) -> bool { self.inner.supports_scan_ranges(key) }
     async fn put(&self, key: &ObjectKey, bytes: Bytes) -> rtdb_storage::Result<()> { self.inner.put(key, bytes).await }
     async fn put_file(&self, key: &ObjectKey, source: &Path) -> rtdb_storage::Result<()> { self.inner.put_file(key, source).await }
-    async fn put_with_version(&self, key: &ObjectKey, bytes: Bytes) -> rtdb_storage::Result<Option<rtdb_types::PhysicalObjectVersion>> {
-        self.inner.put_with_version(key, bytes).await
+    async fn put_with_publication(&self, key: &ObjectKey, bytes: Bytes) -> rtdb_storage::Result<Option<rtdb_types::PhysicalObjectPublication>> {
+        self.inner.put_with_publication(key, bytes).await
     }
-    async fn put_file_with_version(&self, key: &ObjectKey, source: &Path) -> rtdb_storage::Result<Option<rtdb_types::PhysicalObjectVersion>> {
-        self.inner.put_file_with_version(key, source).await
+    async fn put_file_with_publication(&self, key: &ObjectKey, source: &Path) -> rtdb_storage::Result<Option<rtdb_types::PhysicalObjectPublication>> {
+        self.inner.put_file_with_publication(key, source).await
     }
     async fn list(&self, directory: Option<&ObjectKey>) -> rtdb_storage::Result<Vec<StoredObject>> {
         self.load_releases().await?;
@@ -1169,7 +1179,7 @@ impl ObjectStore for GarbageStore {
             && let Some(packing) = &self.packing
             && let Some((pack, version)) = packing.retirement_pack(key).await?
         {
-            return self.write_release_record(key, None, Some(&version), Some(&pack)).await;
+            return self.write_release_record(key, None, Some(&version), Some(&pack), None).await;
         }
         self.write_release(key, None, None).await
     }
@@ -1261,7 +1271,7 @@ async fn reap_path_releases(bucket: &dyn ObjectStore, record: &DeploymentRecord,
             let Ok(bytes) = bucket.get(&crate::reference::key(&location)?).await else { continue };
             let Ok(release) = serde_json::from_slice::<StoredRelease>(&bytes) else { continue };
             let released = match release {
-                StoredRelease::Exact { record, .. } => { exact.insert(record.key); reaped.waiting += 1; continue; }
+                StoredRelease::Exact { record, .. } | StoredRelease::Terminal { record, .. } => { exact.insert(record.key); reaped.waiting += 1; continue; }
                 StoredRelease::Path(record) => record,
             };
             if !permits_release(record, &store, &released) || released.released_at_ms > threshold || checkpoint_metadata_block(&released.key)
@@ -1723,7 +1733,7 @@ mod tests {
 
         let intent = RetirementIntent {
             selected: cut, table: TableRef::new("public", "orders"), tries: vec!["l01-rc-b00".into()],
-            files: vec![RetirementFile { key: file.to_string(), version: None, matches_publication: false }],
+            files: vec![RetirementFile { key: file.to_string(), version: None, terminal_publication: None, matches_publication: false }],
         };
         let installed = ReplicaPosition(1);
         let floor = intent.installed_cut(installed).unwrap();

@@ -42,6 +42,29 @@ pub struct PhysicalObjectVersion {
     pub version: String,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TerminalObjectPublication {
+    pub namespace: S3ObjectNamespace,
+    pub key: String,
+    pub allocation: uuid::Uuid,
+    pub etag: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PhysicalObjectPublication {
+    Version(PhysicalObjectVersion),
+    Terminal(TerminalObjectPublication),
+}
+
+impl PhysicalObjectPublication {
+    pub fn into_version(self) -> Option<PhysicalObjectVersion> {
+        match self {
+            Self::Version(version) => Some(version),
+            Self::Terminal(_) => None,
+        }
+    }
+}
+
 /// A conditional write at one physical S3 key in a bucket that has never been versioned.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct S3TombstoneTarget {

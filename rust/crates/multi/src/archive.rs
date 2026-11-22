@@ -400,19 +400,19 @@ impl ObjectStore for CheckpointStore {
         self.serving.put_file(key, source).await
     }
 
-    async fn put_with_version(&self, key: &ObjectKey, bytes: Bytes) -> rtdb_storage::Result<Option<rtdb_types::PhysicalObjectVersion>> {
+    async fn put_with_publication(&self, key: &ObjectKey, bytes: Bytes) -> rtdb_storage::Result<Option<rtdb_types::PhysicalObjectPublication>> {
         if self.archive.objects.contains_key(key) {
             self.put(key, bytes).await?;
             return Ok(None);
         }
-        self.serving.put_with_version(key, bytes).await
+        self.serving.put_with_publication(key, bytes).await
     }
-    async fn put_file_with_version(&self, key: &ObjectKey, source: &Path) -> rtdb_storage::Result<Option<rtdb_types::PhysicalObjectVersion>> {
+    async fn put_file_with_publication(&self, key: &ObjectKey, source: &Path) -> rtdb_storage::Result<Option<rtdb_types::PhysicalObjectPublication>> {
         if self.archive.objects.contains_key(key) {
             self.put_file(key, source).await?;
             return Ok(None);
         }
-        self.serving.put_file_with_version(key, source).await
+        self.serving.put_file_with_publication(key, source).await
     }
     async fn delete(&self, key: &ObjectKey) -> rtdb_storage::Result<()> {
         self.serving.delete(key).await

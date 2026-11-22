@@ -11,11 +11,15 @@ use tokio_util::sync::CancellationToken;
 use crate::TrieDeletionPublisher;
 
 pub(crate) async fn observe_file(store: &dyn ObjectStore, key: &ObjectKey, published: Option<PublishedObjectVersion>) -> Result<RetirementFile> {
+    let terminal_publication = published.as_ref().and_then(PublishedObjectVersion::terminal_publication);
+    if terminal_publication.is_some() {
+        return Ok(RetirementFile { key: key.to_string(), version: None, terminal_publication, matches_publication: false });
+    }
     let version = store.retirement_version(key).await?;
     let matches_publication = version.as_ref().is_some_and(|observed| {
         published.as_ref().is_some_and(|expected| *expected == PublishedObjectVersion::from(observed.clone()))
     });
-    Ok(RetirementFile { key: key.to_string(), version, matches_publication })
+    Ok(RetirementFile { key: key.to_string(), version, terminal_publication: None, matches_publication })
 }
 
 #[derive(Clone)]

@@ -182,7 +182,7 @@ impl ArtefactBuilder for SearchBuilder {
         if cancellation.is_cancelled() { return Err(Anomaly::new(rtdb_types::AnomalyCategory::Interrupted, "rtdb.search/cancelled", "Search build cancelled")); }
         let size = tokio::fs::metadata(&bundle).await.map_err(fault)?.len();
         let mut record = record(&sections, size)?;
-        record.published_version = self.store.put_file_with_version(&key, &bundle).await?.map(Into::into);
+        record.published_version = self.store.put_file_with_publication(&key, &bundle).await?.map(Into::into);
         if repairing { self.runtime.clear(&suspect); }
         Ok(record)
     }

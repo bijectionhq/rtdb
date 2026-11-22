@@ -42,6 +42,9 @@ struct Hooks {
     put_version: Option<&'static str>,
     read_version: Option<&'static str>,
     head_version: Option<&'static str>,
+    put_etag: Option<&'static str>,
+    read_etag: Option<&'static str>,
+    head_etag: Option<&'static str>,
 }
 
 #[derive(Debug, Default)]
@@ -90,6 +93,7 @@ impl ProviderStore for ControlledStore {
         }
         let mut result = self.inner.put_opts(location, payload, options).await?;
         if let Some(version) = self.hooks.put_version { result.version = Some(version.into()); }
+        if let Some(etag) = self.hooks.put_etag { result.e_tag = Some(etag.into()); }
         if self.hooks.lose_put_reply {
             return Err(injected("lost publication reply"));
         }
@@ -105,8 +109,10 @@ impl ProviderStore for ControlledStore {
         self.called();
         if !options.head { if let Some(gate) = &self.hooks.read { gate.enter().await; } }
         let version = if options.head { self.hooks.head_version } else { self.hooks.read_version };
+        let etag = if options.head { self.hooks.head_etag } else { self.hooks.read_etag };
         let mut result = self.inner.get_opts(location, options).await?;
         if let Some(version) = version { result.meta.version = Some(version.into()); }
+        if let Some(etag) = etag { result.meta.e_tag = Some(etag.into()); }
         Ok(result)
     }
     fn delete_stream(&self, locations: BoxStream<'static, object_store::Result<Path>>) -> BoxStream<'static, object_store::Result<Path>> {
@@ -163,7 +169,7 @@ impl PublicationUploads for ControlledStore {
         match self.put_opts(path, bytes.into(), options).await {
             Ok(written) => {
                 self.uploads.lock().unwrap().remove(upload);
-                Ok(PublicationResult::Published { version: written.version })
+                Ok(PublicationResult::Published { version: written.version, etag: written.e_tag })
             }
             Err(object_store::Error::AlreadyExists { .. } | object_store::Error::Precondition { .. }) => Ok(PublicationResult::Conflict),
             Err(error) => Err(Error::Remote { key: path.to_string(), message: error.to_string() }),
@@ -263,14 +269,40 @@ async fn publication_versions_come_from_the_acknowledgement_or_verified_existing
             RemoteStore::new_in(provider, Some(prefix), io.clone())
         }.with_s3_versioning(S3ObjectNamespace { bucket: "objects".into(), endpoint: None, region: None });
 
-        let written = store.put_with_version(&path, contents.clone()).await.unwrap().unwrap();
+        let written = store.put_with_publication(&path, contents.clone()).await.unwrap().unwrap().into_version().unwrap();
         assert_eq!(written.key, "cell/data.arrow");
         assert_eq!(written.version, "write-version", "the provider write acknowledgement supplies the version");
-        let retried = store.put_with_version(&path, contents.clone()).await.unwrap().unwrap();
+        let retried = store.put_with_publication(&path, contents.clone()).await.unwrap().unwrap().into_version().unwrap();
         assert_eq!(retried.version, "retried-version", "the same read must supply the body and version");
         assert_eq!(retried.namespace, written.namespace);
         assert_eq!(store.retirement_version(&path).await.unwrap().unwrap().version, "unbound-current-version");
-        assert!(matches!(store.put_with_version(&path, Bytes::from_static(b"other")).await, Err(Error::ConflictingObject(_))));
+        assert!(matches!(store.put_with_publication(&path, Bytes::from_static(b"other")).await, Err(Error::ConflictingObject(_))));
+        io.close_and_wait().await;
+        assert!(journal.pending.lock().unwrap().is_empty());
+    }
+}
+
+#[tokio::test]
+async fn terminal_publication_carries_the_tag_from_its_acknowledgement_or_confirmed_retry() {
+    let path = ObjectKey::new("data.arrow").unwrap();
+    let prefix = ObjectKey::new("terminal-root").unwrap();
+    let contents = Bytes::from_static(b"sealed");
+    let allocation = uuid::Uuid::new_v4();
+    let namespace = rtdb_types::S3ObjectNamespace { bucket: "objects".into(), endpoint: None, region: None };
+    for lose_put_reply in [false, true] {
+        let (io, journal) = journaled_region();
+        let provider = ControlledStore::new(Hooks {
+            put_etag: Some("\"acknowledged\""), head_etag: Some("\"confirmed\""), read_etag: Some("\"retried\""),
+            lose_put_reply, ..Default::default()
+        });
+        let store = RemoteStore::new_managed(provider.clone(), prefix.clone(), io.clone(), provider)
+            .with_s3_versioning(namespace.clone()).with_terminal_allocation(allocation);
+        let receipt = |etag: &str| Some(rtdb_types::PhysicalObjectPublication::Terminal(rtdb_types::TerminalObjectPublication {
+            namespace: namespace.clone(), key: "terminal-root/data.arrow".into(), allocation, etag: etag.into(),
+        }));
+        let committed = store.put_with_publication(&path, contents.clone()).await.unwrap();
+        assert_eq!(committed, receipt(if lose_put_reply { "\"confirmed\"" } else { "\"acknowledged\"" }));
+        assert_eq!(store.put_with_publication(&path, contents.clone()).await.unwrap(), receipt("\"retried\""));
         io.close_and_wait().await;
         assert!(journal.pending.lock().unwrap().is_empty());
     }
@@ -296,7 +328,7 @@ async fn managed_completion_recovers_exact_bytes_or_retires_the_upload() {
     let provider = ControlledStore::new(Hooks { lose_put_reply: true, head_version: Some("confirmed-attempt-version"), ..Default::default() });
     let store = RemoteStore::new_managed(provider.clone(), prefix.clone(), io.clone(), provider.clone())
         .with_s3_versioning(rtdb_types::S3ObjectNamespace { bucket: "objects".into(), endpoint: None, region: None });
-    let recovered = store.put_with_version(&key, contents.clone()).await.unwrap().unwrap();
+    let recovered = store.put_with_publication(&key, contents.clone()).await.unwrap().unwrap().into_version().unwrap();
     assert_eq!(recovered.version, "confirmed-attempt-version");
     io.close_and_wait().await;
     assert!(journal.pending.lock().unwrap().is_empty());

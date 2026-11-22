@@ -242,8 +242,8 @@ impl PackingStore {
             None => (key(&format!("{PACK_DIRECTORY}/p{:020}-{}.pack", (self.clock)(), uuid::Uuid::new_v4().simple()))?, Vec::new()),
         };
         let (bytes, index) = encode_pack(&held, previous, (self.clock)());
-        let publication = match self.inner.put_with_version(&name, bytes).await {
-            Ok(version) => Ok(ObjectObservation { value: index, version }),
+        let publication = match self.inner.put_with_publication(&name, bytes).await {
+            Ok(publication) => Ok(ObjectObservation { value: index, version: publication.and_then(rtdb_types::PhysicalObjectPublication::into_version) }),
             Err(error @ Error::ConflictingObject(_)) if catalog.is_some() => {
                 self.compare_pack(&name, &held).await.and_then(|same| same.ok_or(error))
             }
@@ -428,19 +428,19 @@ impl ObjectStore for PackingStore {
         }
         self.inner.put_file(object, source).await
     }
-    async fn put_with_version(&self, key: &ObjectKey, bytes: Bytes) -> rtdb_storage::Result<Option<rtdb_types::PhysicalObjectVersion>> {
+    async fn put_with_publication(&self, key: &ObjectKey, bytes: Bytes) -> rtdb_storage::Result<Option<rtdb_types::PhysicalObjectPublication>> {
         if packed(key.as_str()) {
             self.put(key, bytes).await?;
             return Ok(None);
         }
-        self.inner.put_with_version(key, bytes).await
+        self.inner.put_with_publication(key, bytes).await
     }
-    async fn put_file_with_version(&self, key: &ObjectKey, source: &Path) -> rtdb_storage::Result<Option<rtdb_types::PhysicalObjectVersion>> {
+    async fn put_file_with_publication(&self, key: &ObjectKey, source: &Path) -> rtdb_storage::Result<Option<rtdb_types::PhysicalObjectPublication>> {
         if packed(key.as_str()) {
             self.put_file(key, source).await?;
             return Ok(None);
         }
-        self.inner.put_file_with_version(key, source).await
+        self.inner.put_file_with_publication(key, source).await
     }
     async fn list(&self, directory: Option<&ObjectKey>) -> rtdb_storage::Result<Vec<StoredObject>> {
         let prefix = directory.map(|directory| format!("{}/", directory.as_str()));
@@ -508,13 +508,13 @@ pub(crate) mod tests {
             Ok(ObjectObservation { value, version: Some(version) })
         }
         async fn put(&self, key: &ObjectKey, bytes: Bytes) -> rtdb_storage::Result<()> {
-            self.put_with_version(key, bytes).await.map(drop)
+            self.put_with_publication(key, bytes).await.map(drop)
         }
-        async fn put_with_version(&self, key: &ObjectKey, bytes: Bytes) -> rtdb_storage::Result<Option<PhysicalObjectVersion>> {
+        async fn put_with_publication(&self, key: &ObjectKey, bytes: Bytes) -> rtdb_storage::Result<Option<rtdb_types::PhysicalObjectPublication>> {
             let existed = self.inner.head(key).await.is_ok();
             self.inner.put(key, bytes).await?;
             if !existed { *self.versions.lock().entry(key.clone()).or_default() += 1; }
-            Ok(Some(self.version(key)))
+            Ok(Some(rtdb_types::PhysicalObjectPublication::Version(self.version(key))))
         }
         async fn put_file(&self, _: &ObjectKey, _: &Path) -> rtdb_storage::Result<()> { unreachable!("tests publish bytes") }
         async fn list(&self, directory: Option<&ObjectKey>) -> rtdb_storage::Result<Vec<StoredObject>> { self.inner.list(directory).await }

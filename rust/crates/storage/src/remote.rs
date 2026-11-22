@@ -3,7 +3,7 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use futures::TryStreamExt;
 use object_store::{Attribute, GetOptions, GetResult, ObjectMeta, ObjectStore as ProviderStore, ObjectStoreExt, PutMode, PutOptions, path::Path};
-use rtdb_types::{PhysicalObjectVersion, S3ObjectNamespace};
+use rtdb_types::{PhysicalObjectPublication, PhysicalObjectVersion, S3ObjectNamespace, TerminalObjectPublication};
 use std::{ops::Range, sync::Arc};
 use tokio::io::{AsyncReadExt, AsyncSeekExt};
 
@@ -38,7 +38,7 @@ pub trait PublicationJournal: Send + Sync {
 /// The result of this specific conditional publication.
 #[derive(Debug, PartialEq, Eq)]
 pub enum PublicationResult {
-    Published { version: Option<String> },
+    Published { version: Option<String>, etag: Option<String> },
     Conflict,
 }
 
@@ -59,6 +59,7 @@ pub struct RemoteStore {
     io: Arc<IoRegion>,
     cell: bool,
     version_namespace: Option<Arc<S3ObjectNamespace>>,
+    terminal_allocation: Option<uuid::Uuid>,
 }
 
 impl RemoteStore {
@@ -71,13 +72,13 @@ impl RemoteStore {
     /// Uses the owner's I/O region, which must be closed and joined after all store consumers finish.
     /// Every admitted operation remains owned through caller cancellation, including publication cleanup.
     pub fn new_in(client: Arc<dyn ProviderStore>, prefix: Option<ObjectKey>, io: Arc<IoRegion>) -> Self {
-        Self { objects: Arc::new(RemoteObjects { client, prefix, uploads: None, hide_tombstones: false }), io, cell: false, version_namespace: None }
+        Self { objects: Arc::new(RemoteObjects { client, prefix, uploads: None, hide_tombstones: false }), io, cell: false, version_namespace: None, terminal_allocation: None }
     }
 
     /// Cell storage publishes a final object with one conditional provider
     /// write for untracked cell operations.
     pub fn new_single_put(client: Arc<dyn ProviderStore>, prefix: ObjectKey, io: Arc<IoRegion>) -> Self {
-        Self { objects: Arc::new(RemoteObjects { client, prefix: Some(prefix), uploads: None, hide_tombstones: true }), io, cell: true, version_namespace: None }
+        Self { objects: Arc::new(RemoteObjects { client, prefix: Some(prefix), uploads: None, hide_tombstones: true }), io, cell: true, version_namespace: None, terminal_allocation: None }
     }
 
     /// Opens a cell store with abortable, journaled publication.
@@ -88,7 +89,7 @@ impl RemoteStore {
         uploads: Arc<dyn PublicationUploads>,
     ) -> Self {
         let objects = Arc::new(RemoteObjects { client, prefix: Some(prefix), uploads: Some(uploads), hide_tombstones: true });
-        Self { objects, io, cell: true, version_namespace: None }
+        Self { objects, io, cell: true, version_namespace: None, terminal_allocation: None }
     }
 
     /// Enables version observations for a store backed by the specified S3 namespace.
@@ -98,6 +99,11 @@ impl RemoteStore {
     }
 
     pub fn s3_namespace(&self) -> Option<&S3ObjectNamespace> { self.version_namespace.as_deref() }
+
+    pub fn with_terminal_allocation(mut self, allocation: uuid::Uuid) -> Self {
+        self.terminal_allocation = Some(allocation);
+        self
+    }
 
     /// Rejects new requests and waits for admitted operations, including requests whose callers were cancelled.
     /// This closes the complete shared region when the store was opened with `new_in`.
@@ -214,16 +220,30 @@ impl ObjectStore for RemoteStore {
         self.io.run_async(async move { reservation.finish(objects.get_range(&key, range).await?) }).await
     }
     async fn put(&self, key: &ObjectKey, bytes: Bytes) -> Result<()> {
-        self.put_with_version(key, bytes).await.map(drop)
+        self.put_with_publication(key, bytes).await.map(drop)
     }
-    async fn put_with_version(&self, key: &ObjectKey, bytes: Bytes) -> Result<Option<PhysicalObjectVersion>> {
+    async fn put_with_publication(&self, key: &ObjectKey, bytes: Bytes) -> Result<Option<PhysicalObjectPublication>> {
         let (objects, key) = (Arc::clone(&self.objects), key.clone());
         let io = self.io.clone();
         let cell = self.cell;
         let namespace = self.version_namespace.clone();
+        let terminal_allocation = self.terminal_allocation;
         self.io.run_async(async move {
-            let version = objects.put(&key, bytes, cell.then_some(io.as_ref())).await?;
-            Ok(physical_version(namespace.as_deref(), &objects.path(&key), version))
+            let published = objects.put(&key, bytes, cell.then_some(io.as_ref())).await?;
+            let path = objects.path(&key);
+            let Some(namespace) = namespace.as_deref() else { return Ok(None); };
+            if let Some(allocation) = terminal_allocation {
+                if published.version.as_deref().is_some_and(|version| version != "null") {
+                    return Err(Error::Remote { key: key.to_string(), message: "A terminal publication returned a provider version".into() });
+                }
+                let etag = published.etag.filter(|etag| strong_entity_tag(etag)).ok_or_else(|| Error::Remote {
+                    key: key.to_string(), message: "A terminal publication requires a strong entity tag".into(),
+                })?;
+                return Ok(Some(PhysicalObjectPublication::Terminal(TerminalObjectPublication {
+                    namespace: namespace.clone(), key: path.to_string(), allocation, etag,
+                })));
+            }
+            Ok(physical_version(Some(namespace), &path, published.version).map(PhysicalObjectPublication::Version))
         }).await
     }
     async fn put_file(&self, key: &ObjectKey, source: &std::path::Path) -> Result<()> {
@@ -314,6 +334,18 @@ fn physical_version(namespace: Option<&S3ObjectNamespace>, path: &Path, version:
 
 fn publication_attribute() -> Attribute { Attribute::Metadata("rtdb-publication".into()) }
 
+pub fn strong_entity_tag(tag: &str) -> bool {
+    tag.strip_prefix('"').and_then(|tag| tag.strip_suffix('"')).is_some_and(|value| {
+        !value.is_empty() && value != "*"
+            && value.bytes().all(|byte| byte.is_ascii_graphic() && !matches!(byte, b'"' | b'\\' | b','))
+    })
+}
+
+struct ProviderPublication {
+    version: Option<String>,
+    etag: Option<String>,
+}
+
 fn provider_error(key: &ObjectKey, error: object_store::Error) -> Error {
     match error {
         object_store::Error::NotFound { .. } => Error::MissingObject(key.to_string()),
@@ -394,13 +426,13 @@ impl RemoteObjects {
         Ok(bytes)
     }
 
-    async fn put(&self, key: &ObjectKey, bytes: Bytes, authority: Option<&IoRegion>) -> Result<Option<String>> {
+    async fn put(&self, key: &ObjectKey, bytes: Bytes, authority: Option<&IoRegion>) -> Result<ProviderPublication> {
         if let Some(journal) = authority.and_then(IoRegion::publication_journal) {
             return self.put_journaled(key, bytes, journal).await;
         }
         let options = PutOptions { mode: PutMode::Create, ..Default::default() };
         match self.client.put_opts(&self.path(key), bytes.clone().into(), options).await {
-            Ok(written) => Ok(written.version),
+            Ok(written) => Ok(ProviderPublication { version: written.version, etag: written.e_tag }),
             Err(object_store::Error::AlreadyExists { .. } | object_store::Error::Precondition { .. }) => {
                 self.compare_existing(key, bytes).await
             }
@@ -408,7 +440,7 @@ impl RemoteObjects {
         }
     }
 
-    async fn put_journaled(&self, key: &ObjectKey, bytes: Bytes, journal: &dyn PublicationJournal) -> Result<Option<String>> {
+    async fn put_journaled(&self, key: &ObjectKey, bytes: Bytes, journal: &dyn PublicationJournal) -> Result<ProviderPublication> {
         let uploads = self.uploads.as_ref().ok_or_else(|| Error::Remote {
             key: key.to_string(), message: "The cell store has no abortable publication capability".into(),
         })?;
@@ -429,24 +461,25 @@ impl RemoteObjects {
         }
         journal.settle(key, attempt, &upload, true).await?;
         match result {
-            Ok(PublicationResult::Published { version }) => Ok(version),
+            Ok(PublicationResult::Published { version, etag }) => Ok(ProviderPublication { version, etag }),
             Ok(PublicationResult::Conflict) => self.compare_existing(key, bytes).await,
             Err(error) => {
                 match self.publication_confirmed(key, attempt).await {
-                    Ok(PublicationResult::Published { version }) => Ok(version),
+                    Ok(PublicationResult::Published { version, etag }) => Ok(ProviderPublication { version, etag }),
                     _ => Err(error),
                 }
             }
         }
     }
 
-    async fn compare_existing(&self, key: &ObjectKey, bytes: Bytes) -> Result<Option<String>> {
+    async fn compare_existing(&self, key: &ObjectKey, bytes: Bytes) -> Result<ProviderPublication> {
         let object = self.client.get(&self.path(key)).await.map_err(|error| provider_error(key, error))?;
         let version = object.meta.version.clone();
+        let etag = object.meta.e_tag.clone();
         if self.is_tombstone(&object) || object.bytes().await.map_err(|error| provider_error(key, error))? != bytes {
             return Err(Error::ConflictingObject(key.to_string()));
         }
-        Ok(version)
+        Ok(ProviderPublication { version, etag })
     }
 
     async fn publication_confirmed(&self, key: &ObjectKey, attempt: uuid::Uuid) -> Result<PublicationResult> {
@@ -456,7 +489,7 @@ impl RemoteObjects {
                 if object.attributes.get(&publication_attribute())
                     .is_some_and(|receipt| receipt.as_ref() == expected.as_str())
                 {
-                    Ok(PublicationResult::Published { version: object.meta.version })
+                    Ok(PublicationResult::Published { version: object.meta.version, etag: object.meta.e_tag })
                 } else {
                     Ok(PublicationResult::Conflict)
                 }

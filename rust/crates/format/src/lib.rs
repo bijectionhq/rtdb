@@ -27,7 +27,37 @@ impl From<rtdb_types::PhysicalObjectVersion> for log::proto::PublishedObjectVers
     fn from(object: rtdb_types::PhysicalObjectVersion) -> Self {
         let rtdb_types::PhysicalObjectVersion { namespace, key, version } = object;
         Self { bucket: Some(namespace.bucket), endpoint: namespace.endpoint, region: namespace.region,
-            key: Some(key), version: Some(version) }
+            key: Some(key), version: Some(version), terminal: None }
+    }
+}
+
+impl From<rtdb_types::PhysicalObjectPublication> for log::proto::PublishedObjectVersion {
+    fn from(publication: rtdb_types::PhysicalObjectPublication) -> Self {
+        match publication {
+            rtdb_types::PhysicalObjectPublication::Version(version) => version.into(),
+            rtdb_types::PhysicalObjectPublication::Terminal(publication) => {
+                let rtdb_types::TerminalObjectPublication { namespace, key, allocation, etag } = publication;
+                Self { bucket: Some(namespace.bucket), endpoint: namespace.endpoint, region: namespace.region,
+                    key: Some(key), version: None, terminal: Some(log::proto::TerminalPublication {
+                        allocation: Some(allocation.as_bytes().to_vec()), etag: Some(etag),
+                    }) }
+            }
+        }
+    }
+}
+
+impl log::proto::PublishedObjectVersion {
+    pub fn terminal_publication(&self) -> Option<rtdb_types::TerminalObjectPublication> {
+        if self.version.is_some() { return None; }
+        let terminal = self.terminal.as_ref()?;
+        let allocation = uuid::Uuid::from_slice(terminal.allocation.as_deref()?).ok()?;
+        if allocation.is_nil() { return None; }
+        Some(rtdb_types::TerminalObjectPublication {
+            namespace: rtdb_types::S3ObjectNamespace {
+                bucket: self.bucket.clone()?, endpoint: self.endpoint.clone(), region: self.region.clone(),
+            },
+            key: self.key.clone()?, allocation, etag: terminal.etag.clone()?,
+        })
     }
 }
 

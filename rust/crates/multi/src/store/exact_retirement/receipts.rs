@@ -123,7 +123,7 @@ mod tests {
         let version = PhysicalObjectVersion { namespace: S3ObjectNamespace { bucket: "cell".into(), endpoint: None, region: None },
             key: format!("cell/{store}/{}", release.key), version: "original".into() };
         let intent = RetirementIntent { selected, table: TableRef::new("public", "orders"), tries: vec!["l01-rc-b00".into()],
-            files: vec![RetirementFile { key: release.key.clone(), version: Some(version.clone()), matches_publication: true }] };
+            files: vec![RetirementFile { key: release.key.clone(), version: Some(version.clone()), terminal_publication: None, matches_publication: true }] };
         let encoded = serde_json::to_vec(&intent).unwrap();
         let relative = format!("{}/installed/{}", journal_directory(selected), intent_digest(&encoded));
         let source = ObjectKey::new(format!("{store}/{relative}")).unwrap();

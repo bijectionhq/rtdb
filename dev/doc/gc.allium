@@ -356,6 +356,8 @@ rule DeleteAndCommitChunkRule {
     -- This order applies to classic stores, where the collector issues the file deletes itself.
     -- In Multi, the recorded file plan instead releases to the reaper after receipt and floor installation as described above.
     -- An installed plan that matches an immutable S3 publication releases its exact version to the hosted reaper.
+    -- A terminal plan carries the publication identity recorded by the file writer into its installed release.
+    -- The hosted reaper compares that identity inside the enrolled allocation before closing the owner's read admission for the file and release record.
     -- Existing shared manifests and active physical owner reads retain that version until their dependencies are withdrawn or drained.
     -- An older hosted marker can recover its immutable version from the authenticated installed receipt for the same cut and object.
     -- One atomic step in the per-table per-chunk ordering. The DELETEs run

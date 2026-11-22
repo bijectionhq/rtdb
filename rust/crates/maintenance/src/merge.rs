@@ -326,11 +326,11 @@ impl CompactionExecutor for SegmentCompactor {
             let (size, metadata) = layout::normalize(output, &put, &self.config, &self.memory, &data_path, &meta_path, cancellation)?;
             check_disk(directory.path(), self.config.temporary_byte_limit, 0)?;
             let data_key = ObjectKey::new(entry.slug.data_key(&key)).map_err(crate::invalid)?;
-            let data = self.store.put_file_with_version(&data_key, &data_path).await.map_err(|error| rtdb_types::Anomaly::from(error)
+            let data = self.store.put_file_with_publication(&data_key, &data_path).await.map_err(|error| rtdb_types::Anomaly::from(error)
                 .with_context("key", data_key.to_string().into()).with_context("operation", "put_file".into()))?;
             if cancellation.is_cancelled() { return Err(crate::closed()); }
             let metadata_key = ObjectKey::new(entry.slug.metadata_key(&key)).map_err(crate::invalid)?;
-            let meta = self.store.put_file_with_version(&metadata_key, &meta_path).await.map_err(|error| rtdb_types::Anomaly::from(error)
+            let meta = self.store.put_file_with_publication(&metadata_key, &meta_path).await.map_err(|error| rtdb_types::Anomaly::from(error)
                 .with_context("key", metadata_key.to_string().into()).with_context("operation", "put_file".into()))?;
             let artefacts = self.artefacts_of(&snapshot, &job.table, &key, &data_path, size, cancellation).await;
             let published_files = if data.is_some() || meta.is_some() {
