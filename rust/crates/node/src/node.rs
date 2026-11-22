@@ -1668,18 +1668,19 @@ impl NativeSession {
             WorldClockRequest::Proposal => rtdb_types::WorldClockMode::Proposal,
         };
         use rtdb_tx::OwnedForkRoot;
-        let proposal_controls = requested == rtdb_types::WorldClockMode::Proposal
-            && fork.cut.is_publication()
-            && fork.root.as_ref().is_some_and(|root| root.publication.is_none());
+        let proposal_publication = requested == rtdb_types::WorldClockMode::Proposal
+            && fork.cut.is_publication() && fork.root.is_some();
         let root = match &fork.root {
+            Some(section) if section.publication.is_some() && fork.previous.is_some() => OwnedForkRoot::WritesAdvance,
+            Some(section) if proposal_publication && section.publication.is_some() => OwnedForkRoot::ProposalWrites,
             Some(section) if section.publication.is_some() => OwnedForkRoot::Writes,
-            Some(_) if proposal_controls => OwnedForkRoot::ProposalControls,
+            Some(_) if proposal_publication => OwnedForkRoot::ProposalControls,
             Some(_) => OwnedForkRoot::Controls,
             None => OwnedForkRoot::None,
         };
         let requires_live_tip = record.initial_clock() > inherited
-            || (requested == rtdb_types::WorldClockMode::Proposal && !proposal_controls);
-        let requires_tip = requires_live_tip || proposal_controls
+            || (requested == rtdb_types::WorldClockMode::Proposal && !proposal_publication);
+        let requires_tip = requires_live_tip || proposal_publication
             || (root != OwnedForkRoot::None && record.parent_publication == Some(record.basis.system_time));
         let effects = fork.controls.len()
             .saturating_add(fork.root.as_ref().map_or(0, |section| section.checks.len()))
@@ -1694,10 +1695,11 @@ impl NativeSession {
                 || record.parent_publication != Some(fork.cut.basis())))
             || effects > 4096 || !fork.controls.iter().any(rtdb_tx::HostedControlWrite::is_check)
             || (root == OwnedForkRoot::None && fork.controls.iter().any(|control| !control.is_check()))
-            || (matches!(root, OwnedForkRoot::Controls | OwnedForkRoot::ProposalControls)
+            || (matches!(root, OwnedForkRoot::Controls | OwnedForkRoot::ProposalControls | OwnedForkRoot::ProposalWrites)
                 && fork.controls.iter().all(rtdb_tx::HostedControlWrite::is_check))
-            || (root != OwnedForkRoot::None && (fork.previous.is_some()
-                || (requested != rtdb_types::WorldClockMode::Retained && !proposal_controls)
+            || (root == OwnedForkRoot::WritesAdvance && !fork.cut.is_publication())
+            || (root != OwnedForkRoot::None && ((fork.previous.is_some() && root != OwnedForkRoot::WritesAdvance)
+                || (requested != rtdb_types::WorldClockMode::Retained && !proposal_publication)
                 || (fork.cut.live.is_none() && !fork.cut.is_publication())))
             || fork.root.iter().flat_map(|section| &section.checks).any(|check| match check {
                 TxOp::OwnedCheck { relation, .. } | TxOp::OwnedCheckRange { relation, .. } =>

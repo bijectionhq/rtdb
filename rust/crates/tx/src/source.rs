@@ -495,8 +495,10 @@ fn operation_value<'a>(operation: &'a Operation, memory: &Arc<MemoryBudget>) -> 
             match root {
                 crate::OwnedForkRoot::None => "rtdb-owned-fork-world-v2",
                 crate::OwnedForkRoot::Writes => "rtdb-owned-root-retained-fork-v1",
+                crate::OwnedForkRoot::WritesAdvance => "rtdb-owned-root-retained-advance-v1",
                 crate::OwnedForkRoot::Controls => "rtdb-owned-controls-retained-fork-v1",
                 crate::OwnedForkRoot::ProposalControls => "rtdb-owned-controls-proposal-fork-v1",
+                crate::OwnedForkRoot::ProposalWrites => "rtdb-owned-root-proposal-fork-v1",
             }
         }
         Operation::Public(TxOp::OwnedPublishRoot { attempt, fingerprint }) => {
@@ -1200,8 +1202,8 @@ impl SourceOperationReader<'_> {
             "rtdb-hosted-control-v1" | "rtdb-hosted-control-check-v1" => &["relation", "scope", "expected", "document"],
             "rtdb-owned-deadline-v1" => &["until"],
             "rtdb-owned-fixed-range-v1" => &["relation", "rule"],
-            "rtdb-owned-fork-world-v2" | "rtdb-owned-root-retained-fork-v1" | "rtdb-owned-controls-retained-fork-v1"
-            | "rtdb-owned-controls-proposal-fork-v1" => &["registration", "previous", "attempt", "fingerprint"],
+            "rtdb-owned-fork-world-v2" | "rtdb-owned-root-retained-fork-v1" | "rtdb-owned-root-retained-advance-v1" | "rtdb-owned-controls-retained-fork-v1"
+            | "rtdb-owned-controls-proposal-fork-v1" | "rtdb-owned-root-proposal-fork-v1" => &["registration", "previous", "attempt", "fingerprint"],
             "rtdb-owned-publish-root-v1" => &["attempt", "fingerprint"],
             "rtdb-owned-publish-world-v1" | "rtdb-owned-drop-world-v1" => &["world", "attempt", "fingerprint", "expected"],
             "rtdb-owned-drop-with-root-delete-v1" => &["world", "attempt", "fingerprint", "expected", "pin"],
@@ -1231,8 +1233,8 @@ impl SourceOperationReader<'_> {
         parsed_fields.grow_to(bound)?;
         let value = |name| struct_cell(body, name, offset);
         let operation = match name.as_str() {
-            "rtdb-owned-fork-world-v2" | "rtdb-owned-root-retained-fork-v1" | "rtdb-owned-controls-retained-fork-v1"
-            | "rtdb-owned-controls-proposal-fork-v1" => {
+            "rtdb-owned-fork-world-v2" | "rtdb-owned-root-retained-fork-v1" | "rtdb-owned-root-retained-advance-v1" | "rtdb-owned-controls-retained-fork-v1"
+            | "rtdb-owned-controls-proposal-fork-v1" | "rtdb-owned-root-proposal-fork-v1" => {
                 let (Value::Struct(record), Value::Utf8(attempt), Value::Binary(fingerprint)) =
                     (value("registration")?, value("attempt")?, value("fingerprint")?) else {
                     return Err(invalid("Owned world fork has invalid fields"));
@@ -1247,8 +1249,10 @@ impl SourceOperationReader<'_> {
                     record, previous, attempt, fingerprint,
                     root: match name.as_str() {
                         "rtdb-owned-root-retained-fork-v1" => crate::OwnedForkRoot::Writes,
+                        "rtdb-owned-root-retained-advance-v1" => crate::OwnedForkRoot::WritesAdvance,
                         "rtdb-owned-controls-retained-fork-v1" => crate::OwnedForkRoot::Controls,
                         "rtdb-owned-controls-proposal-fork-v1" => crate::OwnedForkRoot::ProposalControls,
+                        "rtdb-owned-root-proposal-fork-v1" => crate::OwnedForkRoot::ProposalWrites,
                         _ => crate::OwnedForkRoot::None,
                     },
                 }

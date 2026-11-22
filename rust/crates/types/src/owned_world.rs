@@ -200,11 +200,14 @@ impl OwnedWorld {
     }
 
     pub fn can_move_to(&self, next: &Self) -> bool {
+        self.until == next.until && self.can_advance_to(next)
+    }
+
+    pub fn can_advance_to(&self, next: &Self) -> bool {
         self.id == next.id
             && self.pin != next.pin
             && !self.dropped && !next.dropped
             && self.mode == WorldClockMode::Retained && next.mode == WorldClockMode::Retained
-            && self.until == next.until
             && self.basis.system_time < next.basis.system_time
             && self.basis.tx_id < next.basis.tx_id
     }
