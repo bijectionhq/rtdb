@@ -364,7 +364,13 @@ impl PreparedQuery {
                 return Ok(QueryInput::Ordered(batches));
             }
             match batching {
-                Batching::Pages if analysis.is_none() => crate::operators::build_pages(operators, execution).await.map(QueryInput::Pages),
+                Batching::Pages if analysis.is_none() => {
+                    if matches!(operators.relation().node(), rtdb_plan::RelationNode::Scan(_))
+                        && let Some(batches) = crate::operators::build_columns(Arc::clone(&operators), execution.clone()).await? {
+                        return Ok(QueryInput::ColumnPages(batches));
+                    }
+                    crate::operators::build_pages(operators, execution).await.map(QueryInput::Pages)
+                }
                 Batching::Columns if analysis.is_none() => match crate::operators::build_columns(Arc::clone(&operators), execution.clone()).await? {
                     Some(batches) => Ok(QueryInput::Columns(batches)),
                     None => crate::operators::build(operators, execution).await.map(QueryInput::Rows),
@@ -385,7 +391,7 @@ impl PreparedQuery {
                         context.check_cancelled()?;
                     }
                 }
-                QueryInput::Pages(_) | QueryInput::Projection(_) => return Err(invalid("analysis-input", "Query analysis requires an execution cursor")),
+                QueryInput::Pages(_) | QueryInput::ColumnPages(_) | QueryInput::Projection(_) => return Err(invalid("analysis-input", "Query analysis requires an execution cursor")),
             }
             let peak = context.memory.peak_bytes();
             let reservation = context.memory.reserve(analysis.output_bound()?)?;
@@ -521,6 +527,7 @@ enum QueryInput {
     Rows(BoxCursor),
     Pages(crate::pages::BoxPageCursor),
     Columns(crate::columnar::BoxBatchCursor),
+    ColumnPages(crate::columnar::BoxBatchCursor),
     Ordered(crate::columnar::BoxBatchCursor),
     Projection(Option<OwnedBatch>),
 }
@@ -611,6 +618,11 @@ impl QueryCursor {
         let Some(input) = &mut self.input else { return Ok(None); };
         let page = match input {
             QueryInput::Projection(batch) => return Ok(batch.take()),
+            QueryInput::ColumnPages(input) => {
+                let Some(batch) = input.next_batch().await? else { return Ok(None); };
+                batch.validate_readable(&self.context)?;
+                return column_batch(self.runtime_schema.schema(), &self.context.memory, batch).map(Some);
+            }
             QueryInput::Columns(input) | QueryInput::Ordered(input) => loop {
                 let Some(batch) = input.next_batch().await? else { return Ok(None); };
                 if batch.len != 0 { return column_batch(self.runtime_schema.schema(), &self.context.memory, batch).map(Some); }

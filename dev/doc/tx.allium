@@ -23,6 +23,7 @@
 -- A prepared embedded ADBC query that only projects compatible bindings uses the Arrow columns of its single argument row.
 -- The embedded logical relation entry point captures the same connection read basis as a SQL query.
 -- Logical relation cursors expose the root operator's pages as separate batches.
+-- A logical relation whose root is a table scan can stream those pages from its Arrow vectors.
 -- Flight SQL result batches retain the Arrow buffers of columns that already match the declared field, even when other columns require conformance.
 -- A prepared Flight SQL query that only projects compatible bindings selects the first row from their Arrow columns.
 -- Compatible list and struct parameters stay in Arrow through that projection.
