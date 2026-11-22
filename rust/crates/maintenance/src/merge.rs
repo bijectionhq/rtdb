@@ -84,18 +84,23 @@ struct MergeFile {
     part: Vec<u8>,
     recency: Option<CivilDate>,
     carries_recency: bool,
+    keyed: bool,
     writer: Option<ArrowFileWriter>,
     leaves: Vec<layout::Leaf>,
 }
 
-struct OutputSchema { put: Option<StructFields<LogicalType>>, iid_encoding: Option<RunEndWidth>, recency: bool }
+struct OutputSchema { put: Option<StructFields<LogicalType>>, iid_encoding: Option<RunEndWidth>, recency: bool, keyed: bool }
 
 impl OutputSchema {
     fn batch(&self, events: &[PageEvent], memory: &Arc<MemoryBudget>) -> Result<OwnedBatch> {
         owned_encoded_batch_with_recency(events, self.put.clone(), self.iid_encoding, self.recency, memory)
     }
     fn schema(&self) -> Result<SchemaRef> {
-        Ok(copy_encoded_batch_with_recency::<PageEvent>(&[], self.put.clone(), self.iid_encoding, self.recency)?.schema())
+        let schema = copy_encoded_batch_with_recency::<PageEvent>(&[], self.put.clone(), self.iid_encoding, self.recency)?.schema();
+        if !self.keyed { return Ok(schema); }
+        let mut fields = schema.fields().to_vec();
+        fields.push(Arc::new(rtdb_format::data::entity_key_field()));
+        Ok(Arc::new(arrow_schema::Schema::new(fields)))
     }
 }
 
@@ -105,7 +110,8 @@ fn create_file(path: &Path) -> Result<File> {
 
 /// What encoding an event may hold at once: its document's decoded cells, and the event itself.
 fn row_bytes(event: &PageEvent) -> Result<usize> {
-    event.document_bytes()?.checked_add(std::mem::size_of::<PageEvent>() + 128).ok_or_else(|| crate::invalid("Compaction row size overflow"))
+    event.document_bytes()?.checked_add(event.entity_key().map_or(0, |key| key.len()))
+        .and_then(|bytes| bytes.checked_add(std::mem::size_of::<PageEvent>() + 128)).ok_or_else(|| crate::invalid("Compaction row size overflow"))
 }
 
 fn event_reservation(memory: &Arc<MemoryBudget>, events: &[PageEvent], multiplier: usize) -> Result<Arc<MemoryReservation>> {
@@ -191,6 +197,19 @@ fn merged_put_schema(inputs: &[InputSegment]) -> Result<Option<StructFields<Logi
     Ok(Some(fields))
 }
 
+/// Until projections and erasure use full keys throughout compaction, an
+/// assigned IID may cover only one full identity. Never coalesce mismatches.
+fn check_compaction_locator<'a>(
+    previous: &mut Option<(rtdb_types::Iid, Option<&'a [u8]>)>, event: &'a PageEvent,
+) -> Result<()> {
+    let key = event.entity_key();
+    if previous.is_some_and(|(iid, old)| iid == event.iid && old != key) {
+        return Err(crate::invalid("Compaction cannot coalesce distinct entity keys at one IID"));
+    }
+    *previous = Some((event.iid, key));
+    Ok(())
+}
+
 fn resolve_same_time(events: &[PageEvent], memory: &Arc<MemoryBudget>) -> Result<(Vec<PageEvent>, Vec<Arc<MemoryReservation>>)> {
     let mut result = Vec::new();
     let mut charges = Vec::new();
@@ -198,7 +217,9 @@ fn resolve_same_time(events: &[PageEvent], memory: &Arc<MemoryBudget>) -> Result
     let mut previous = None;
     let mut seen_erase = false;
     let mut erased_iid = None;
+    let mut locator = None;
     for event in events {
+        check_compaction_locator(&mut locator, event)?;
         let group = (event.iid, event.system_from);
         if previous != Some(group) { calculator.reset(); previous = Some(group); seen_erase = false; }
         let header = event.header();
@@ -261,12 +282,16 @@ impl CompactionExecutor for SegmentCompactor {
             let (reader, reservation) = open_input(data, &self.memory)?;
             inputs.push(InputSegment { key: key.clone(), metadata, reader, _reservations: vec![reservation, metadata_charge] });
         }
+        let keyed = job.table.is_owned_event_data();
+        if inputs.iter().any(|input| input.reader.schema().index_of(rtdb_format::data::ENTITY_KEY_FIELD).is_ok() != keyed) {
+            return Err(crate::invalid("Compaction input does not have the required entity-key layout"));
+        }
         let put = merged_put_schema(&inputs)?;
         let carry = self.config.within_file_recency_branching && job.output.recency().is_some() && inputs.iter().all(|input| input.reader.schema().index_of("_recency").is_ok());
         let tasks = planner::plan(&inputs, &job.part)?;
         let initial_recency = if job.recency_mode == RecencyMode::Partition { None } else { job.output.recency() };
         let initial_carry = job.recency_mode == RecencyMode::Preserve && carry;
-        let mut outputs = vec![MergeFile::new(directory.path().join("merged-0.arrow"), initial_recency, initial_carry, &job.part, &put, &self.config, &self.memory)?];
+        let mut outputs = vec![MergeFile::new(directory.path().join("merged-0.arrow"), initial_recency, initial_carry, &job.part, &put, keyed, &self.config, &self.memory)?];
         for task in tasks {
             if cancellation.is_cancelled() { return Err(crate::closed()); }
             let mut rows = Vec::new();
@@ -290,15 +315,17 @@ impl CompactionExecutor for SegmentCompactor {
             let mut calculator = AdmittedPolygonCalculator::new(None, Arc::clone(&self.memory));
             let mut buckets: BTreeMap<usize, Vec<PageEvent>> = BTreeMap::new();
             let mut bucket_charges = Vec::new();
+            let mut locator = None;
             while let Some((stream, row)) = heap.next() {
                 let event = &rows[stream][row];
+                check_compaction_locator(&mut locator, event)?;
                 let Some(recency) = calculator.visit(&event.header(), |polygon| Ok(polygon.recency()))? else { continue; };
                 let target = if job.recency_mode == RecencyMode::Partition && recency != Timestamp::MAX {
                     let date = recency_partition(recency, self.config.recency_partition)?;
                     if let Some(index) = outputs.iter().position(|output| output.recency == Some(date)) { index }
                     else {
                         let index = outputs.len();
-                        outputs.push(MergeFile::new(directory.path().join(format!("merged-{index}.arrow")), Some(date), self.config.within_file_recency_branching, &job.part, &put, &self.config, &self.memory)?);
+                        outputs.push(MergeFile::new(directory.path().join(format!("merged-{index}.arrow")), Some(date), self.config.within_file_recency_branching, &job.part, &put, keyed, &self.config, &self.memory)?);
                         index
                     }
                 } else { 0 };
@@ -343,16 +370,16 @@ impl CompactionExecutor for SegmentCompactor {
 }
 
 impl MergeFile {
-    fn new(path: PathBuf, recency: Option<CivilDate>, carries_recency: bool, part: &[u8], put: &Option<StructFields<LogicalType>>, config: &MergeConfig, memory: &Arc<MemoryBudget>) -> Result<Self> {
-        let schema = OutputSchema { put: put.clone(), iid_encoding: (config.run_end_encoded_iids && recency.is_some()).then_some(RunEndWidth::I32), recency: carries_recency };
+    fn new(path: PathBuf, recency: Option<CivilDate>, carries_recency: bool, part: &[u8], put: &Option<StructFields<LogicalType>>, keyed: bool, config: &MergeConfig, memory: &Arc<MemoryBudget>) -> Result<Self> {
+        let schema = OutputSchema { put: put.clone(), iid_encoding: (config.run_end_encoded_iids && recency.is_some()).then_some(RunEndWidth::I32), recency: carries_recency, keyed };
         let directory = path.parent().ok_or_else(|| crate::invalid("Merge path has no parent"))?;
         let writer = ArrowFileWriter::new_bounded_reserved(create_file(&path)?, schema.schema()?.as_ref(), disk_remaining(directory, config.temporary_byte_limit)?, memory)?;
-        Ok(Self { path, part: part.to_vec(), recency, carries_recency, writer: Some(writer), leaves: Vec::new() })
+        Ok(Self { path, part: part.to_vec(), recency, carries_recency, keyed, writer: Some(writer), leaves: Vec::new() })
     }
     fn write(&mut self, events: &[PageEvent], path: Vec<u8>, put: &Option<StructFields<LogicalType>>, config: &MergeConfig,
         memory: &Arc<MemoryBudget>) -> Result<()> {
         if events.is_empty() { return Ok(()); }
-        let schema = OutputSchema { put: put.clone(), iid_encoding: (config.run_end_encoded_iids && self.recency.is_some()).then_some(RunEndWidth::I32), recency: self.carries_recency };
+        let schema = OutputSchema { put: put.clone(), iid_encoding: (config.run_end_encoded_iids && self.recency.is_some()).then_some(RunEndWidth::I32), recency: self.carries_recency, keyed: self.keyed };
         let writer = self.writer.as_mut().ok_or_else(|| crate::invalid("Merge file already ended"))?;
         limit_writer(writer, self.path.parent().ok_or_else(|| crate::invalid("Merge path has no parent"))?, config.temporary_byte_limit)?;
         let batch = schema.batch(events, memory)?;
@@ -381,6 +408,7 @@ mod tests {
     fn compaction_reserves_encoding_scratch_before_writing_a_page() {
         let fields = StructFields::from([("payload".into(), LogicalType::Scalar(rtdb_types::ScalarType::Binary))]);
         let input = build_event_batch(&[StoredEvent {
+            entity_key: None,
             iid: Iid([1; 16]), system_from: Timestamp(100), valid_time: Interval::ALL, recency: None,
             operation: StoredOperation::Put(StructFields::from([("payload".into(), rtdb_types::Value::Binary(vec![7; 1 << 20]))])),
         }], Some(fields), None).unwrap();
@@ -406,7 +434,7 @@ mod tests {
             Iid([128, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]),
         ];
         let events: Vec<_> = iids.into_iter().flat_map(|iid| {
-            [i64::MAX - 1, i64::MIN + 1].map(|system_from| StoredEvent {
+            [i64::MAX - 1, i64::MIN + 1].map(|system_from| StoredEvent { entity_key: None,
                 iid,
                 system_from: Timestamp(system_from),
                 valid_time: Interval::from_micros(10, 20).unwrap(),
@@ -476,6 +504,7 @@ mod tests {
                         StoredOperation::Put(StructFields::from([("ordinal".into(), Value::I64(i64::from(ordinal)))]))
                     } else { StoredOperation::Delete };
                     StoredEvent {
+                        entity_key: None,
                         iid: Iid([1; 16]),
                         system_from: Timestamp(100),
                         valid_time: Interval::from_micros(lower, upper).unwrap(),
@@ -512,6 +541,7 @@ mod tests {
     #[test]
     fn same_time_compaction_resolves_a_lone_event_with_only_its_output_row() {
         let input = page(&[StoredEvent {
+            entity_key: None,
             iid: Iid([1; 16]),
             system_from: Timestamp(100),
             valid_time: Interval::from_micros(10, 20).unwrap(),
@@ -536,6 +566,7 @@ mod tests {
     #[test]
     fn same_time_compaction_admits_the_ceiling_before_cloning_a_second_events_row() {
         let event = |lower, upper| StoredEvent {
+            entity_key: None,
             iid: Iid([1; 16]),
             system_from: Timestamp(100),
             valid_time: Interval::from_micros(lower, upper).unwrap(),

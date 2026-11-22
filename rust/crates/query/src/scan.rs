@@ -1113,6 +1113,11 @@ impl PartitionScan {
                 ActiveRows::File(batch)
             }
         };
+        if let ActiveRows::File(batch) = &rows
+            && batch.view().has_entity_keys() != self.scan.table.name.table.is_owned_event_data()
+        {
+            return Err(invalid("owned-entity-key", "Data page has the wrong physical entity-key layout"));
+        }
         let mut previous: Option<EventHeader> = None;
         // A live page is a slice of this process's own trie, ordered as it was built; a file page is checked when first decoded.
         let validated = if matches!(rows, ActiveRows::Live { .. }) || cached { 0 } else { rows.len() };
@@ -1177,6 +1182,12 @@ impl PartitionScan {
             }
         }
         let mut resolver = HistoryResolver::new_in(self.bounds, self.scan.clamp_valid_time, Arc::clone(&self.execution.context.memory));
+        let keyed = self.scan.table.name.table.is_owned_event_data();
+        let requested_key = if keyed { self.execution.context.owned_identity().map(EntityId::handle_bytes) } else { None };
+        // Every equal physical IID stays within one task. A key's events still
+        // arrive in descending system time, independently of its neighbours.
+        let mut bucket = None;
+        let mut identities = BTreeMap::<&[u8], (HistoryResolver, Arc<MemoryReservation>)>::new();
         let mut visited = 0usize;
         let active: Vec<&ActiveRows> = selected.iter().map(|index| &self.loaded[index].rows).collect();
         // Resolved rows name their batch by its place here, so a row costs no handle on its batch.
@@ -1201,6 +1212,28 @@ impl PartitionScan {
             if self.scan.iids.as_ref().is_some_and(|iids| !iids.contains(&head.header.iid)) { continue; }
             if self.scan.iids.is_none() && self.pushdowns.as_ref().is_some_and(|filters| !filters.iid_matches(&self.scan.columns,head.header.iid,self.canonical_entity_iids)) { continue; }
             let (slot, batch, row) = rows.batch(head.ordinal)?;
+            let resolver = if keyed {
+                let key = batch.view().entity_key(row as usize)?.ok_or_else(|| {
+                    invalid("owned-entity-key", "Governed data requires complete physical entity keys")
+                })?;
+                if requested_key.as_deref().is_some_and(|requested| requested != key) { continue; }
+                if bucket != Some(head.header.iid) {
+                    identities.clear();
+                    bucket = Some(head.header.iid);
+                }
+                match identities.entry(key) {
+                    std::collections::btree_map::Entry::Occupied(entry) => &mut entry.into_mut().0,
+                    std::collections::btree_map::Entry::Vacant(entry) => {
+                        let reservation = self.execution.context.memory.reserve(key.len().saturating_add(512))?;
+                        EntityId::from_handle_bytes(key)?;
+                        &mut entry.insert((HistoryResolver::new_in(
+                            self.bounds, self.scan.clamp_valid_time, Arc::clone(&self.execution.context.memory),
+                        ), reservation)).0
+                    }
+                }
+            } else {
+                &mut resolver
+            };
             let page = &mut handles[head.active];
             if page.len() <= slot { page.resize(slot + 1, u32::MAX); }
             if page[slot] == u32::MAX { batches.push(Arc::clone(batch)); page[slot] = u32::try_from(batches.len() - 1).map_err(|_| invalid("scan-row-size", "A task reads more batches than u32 names"))?; }
@@ -1497,6 +1530,7 @@ mod tests {
         let mut write = TransactionBuffer::new(state.value().snapshot(), key, memory).unwrap();
         let events = [0x00, 0x40, 0x80].into_iter().zip(values).enumerate().map(|(index, (prefix, value))| {
             StoredEvent {
+                entity_key: None,
                 iid: Iid([prefix; 16]),
                 system_from: key.system_time,
                 valid_time: Interval::ALL,
@@ -2545,6 +2579,7 @@ mod tests {
         let key = TransactionKey { tx_id: TxId(1), system_time: Timestamp(110) };
         let mut write = TransactionBuffer::new(snapshot, key, MemoryBudget::new(1 << 20)).unwrap();
         write.append(table.clone(), StoredEvent {
+            entity_key: None,
             iid: Iid([0xc0; 16]),
             system_from: key.system_time,
             valid_time: Interval::ALL,

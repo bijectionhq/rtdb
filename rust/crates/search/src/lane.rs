@@ -297,6 +297,7 @@ mod tests {
             StoredOperation::Delete,
             StoredOperation::Erase,
         ].into_iter().enumerate().map(|(index, operation)| StoredEvent {
+            entity_key: None,
             iid: Iid([index as u8; 16]), system_from: Timestamp(10), valid_time: Interval::ALL, recency: None, operation,
         }).collect::<Vec<_>>();
         let batch = EventBatch::new(build_event_batch(&events, Some(fields), None).unwrap()).unwrap();

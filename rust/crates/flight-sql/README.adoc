@@ -256,6 +256,9 @@ Relations without a declaration continue to infer their schema.
 
 Use `rtdb.owned.OpenRead.v2` with an empty body to reserve one present and retain its exact applied catalog.
 The one result body contains 16 opaque handle bytes, the signed big-endian i64 Unix microsecond present, and the signed big-endian i64 ordered transaction id.
+Governed data pages carry a complete typed `_entity_key` on put, delete, and erase events. A native point probes the bounded physical locator family and resolves only its exact key.
+Older governed pages without the key require a reset. The writer still assigns a permanent distinct IID per key because compaction and other projections require that invariant.
+
 Send `rtdb.owned.ReadHeldPoint.v1` with those 16 handle bytes followed by the ordinary ReadPoint action body.
 The Arrow response uses the held present and valid instant on every call, including missing rows.
 `rtdb.owned.ReadHeldPoint.v2` uses the same framing with exactly one Arrow row and two columns, `_id` and `valid_micros: Int64?`.

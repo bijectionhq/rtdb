@@ -607,7 +607,7 @@ impl<'a> OpenTransaction<'a> {
                 let digest = hash.finalize();
                 let iid = Iid::from_slice(&digest[..16])?;
                 let operation = if revoke { StoredOperation::Delete } else { StoredOperation::Put(StructFields::from([("user".into(), Value::Utf8(user)), ("role".into(), Value::Utf8(role))])) };
-                return self.buffer.append(TableRef::new("xt", "role_membership"), StoredEvent { iid, system_from: self.tx_key().system_time, valid_time: interval(self.tx_key().system_time, Timestamp::MAX)?, operation, recency: None });
+                return self.buffer.append(TableRef::new("xt", "role_membership"), StoredEvent { entity_key: None, iid, system_from: self.tx_key().system_time, valid_time: interval(self.tx_key().system_time, Timestamp::MAX)?, operation, recency: None });
             }
         };
         let table = table.ok_or_else(|| Anomaly::fault("rtdb.tx/mutation-table", "Mutation has no target"))?;
@@ -1190,7 +1190,11 @@ impl<'a> OpenTransaction<'a> {
         self.read_owned_revision(owner, relation, id, Interval::ALL).await?;
         let first_erase = !self.owned_changes.get(relation.name()).is_some_and(|group| group.erased);
         self.record_owned_change(relation, id.clone(), OwnedChangeKind::Erase, Interval::ALL)?;
-        self.buffer.erase(table, &EntityId::Uuid(locator.0))?;
+        self.buffer.append(table, StoredEvent {
+            entity_key: Some(id.handle_bytes().into()), iid: locator,
+            system_from: self.tx_key().system_time, valid_time: Interval::ALL,
+            operation: StoredOperation::Erase, recency: None,
+        })?;
         let floors = relation.purge_floor_table(owner);
         self.buffer.put(floors.clone(), bucket.advance(id, ordered.system_time)?, Interval::ALL)?;
         if first_erase {
@@ -1223,7 +1227,7 @@ impl<'a> OpenTransaction<'a> {
         self.track_unique_mutation(owner, relation, id, valid).await?;
         self.track_capacity_mutation(owner, relation, id, valid).await?;
         let system_from = self.tx_key().system_time;
-        self.buffer.append(relation.table(owner), StoredEvent {
+        self.buffer.append(relation.table(owner), StoredEvent { entity_key: Some(id.handle_bytes().into()),
             iid: locator, system_from, valid_time: valid, operation: StoredOperation::Delete, recency: None,
         })?;
         self.record_owned_change(relation, id.clone(), rtdb_types::OwnedChangeKind::Delete, valid)
@@ -1348,12 +1352,14 @@ impl<'a> OpenTransaction<'a> {
             let row_from = document.get("_valid_from").map(|value| timestamp(value, default_from)).transpose()?.unwrap_or(default_from);
             let row_to = document.get("_valid_to").map(|value| timestamp(value, default_to)).transpose()?.unwrap_or(default_to);
             let valid_time = interval(row_from, row_to)?;
+            let mut entity_key = None;
             match write {
                 DocumentWrite::Put => (),
                 DocumentWrite::Insert => self.require_absent(table, iid, valid_time).await?,
                 DocumentWrite::Owned { relation, owner, create_only } => {
                     let id = crate::source::document_id(document, &self.context.memory)?;
                     if !relation.is_world_catalog() {
+                        entity_key = Some(id.handle_bytes().into());
                         iid = self.assign_owned_address(owner, relation, &id).await?;
                         self.track_unique_mutation(owner, relation, &id, valid_time).await?;
                         self.track_capacity_mutation(owner, relation, &id, valid_time).await?;
@@ -1379,7 +1385,7 @@ impl<'a> OpenTransaction<'a> {
                 }
             }
             let document = document.iter().filter(|(name, _)| is_content(name)).map(|(name, value)| (name.clone(), value.clone())).collect();
-            self.buffer.append_to(table, StoredEvent { iid, system_from: self.tx_key().system_time, valid_time, operation: StoredOperation::Put(document), recency: None })?;
+            self.buffer.append_to(table, StoredEvent { entity_key, iid, system_from: self.tx_key().system_time, valid_time, operation: StoredOperation::Put(document), recency: None })?;
         }
         if let Some(types) = documents.declared_types().filter(|_| !documents.rows().is_empty()) {
             self.buffer.declare_document_types(table, types.iter().filter(|(name, _)| is_content(name)))?;
@@ -1754,7 +1760,7 @@ fn mutation_events(batch: &RecordBatch, kind: MutationKind, system_time: Timesta
             (None, MutationKind::Delete) => StoredOperation::Delete,
             (None, _) => StoredOperation::Erase,
         };
-        append(StoredEvent { iid, system_from: system_time, valid_time, operation, recency: None })?;
+        append(StoredEvent { entity_key: None, iid, system_from: system_time, valid_time, operation, recency: None })?;
     }
     Ok(())
 }
@@ -1944,7 +1950,7 @@ mod tests {
                 let Value::FixedSizeBinary(iid) = cell("_iid", row) else { panic!("an IID") };
                 let valid_time = match kind { MutationKind::Erase => Interval::ALL, _ => interval(timestamp(&cell("_valid_from", row), system_time).unwrap(), timestamp(&cell("_valid_to", row), Timestamp::MAX).unwrap()).unwrap() };
                 let operation = match kind { MutationKind::Put => { let Value::Struct(document) = cell("doc", row) else { panic!("a document") }; StoredOperation::Put(document) }, MutationKind::Delete => StoredOperation::Delete, MutationKind::Erase => StoredOperation::Erase };
-                events.push(StoredEvent { iid: Iid::from_slice(&iid).unwrap(), system_from: system_time, valid_time, operation, recency: None });
+                events.push(StoredEvent { entity_key: None, iid: Iid::from_slice(&iid).unwrap(), system_from: system_time, valid_time, operation, recency: None });
             }
         }
         events

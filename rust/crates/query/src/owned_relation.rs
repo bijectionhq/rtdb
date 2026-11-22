@@ -21,10 +21,9 @@ pub async fn open_owned_point(
         if !matches!(id, EntityId::Uuid(_)) { return Err(rtdb_types::OwnedWorld::unavailable()); }
         return open_owned_table_point(context, relation.table(owner), id.iid(), Some(id), valid, columns, false).await;
     }
-    match owned_address(Arc::clone(&context), owner, relation, id).await? {
-        OwnedAddress::Assigned(locator) => open_owned_table_point(context, relation.table(owner), locator, Some(id), valid, columns, false).await,
-        OwnedAddress::Vacant(_) => Ok(None),
-    }
+    open_owned_table_candidates(
+        context, relation.table(owner), id.owned_locator_candidates().collect(), Some(id), valid, columns, false,
+    ).await
 }
 
 /// Revalidates an immutable artefact's nominated row with its complete key.
@@ -262,6 +261,13 @@ pub(crate) async fn open_owned_table_point(
     context: Arc<QueryContext>, table: TableRef, locator: Iid, id: Option<&EntityId>,
     valid: Option<Interval>, columns: Option<&[&str]>, history: bool,
 ) -> Result<Option<QueryCursor>> {
+    open_owned_table_candidates(context, table, [locator].into(), id, valid, columns, history).await
+}
+
+async fn open_owned_table_candidates(
+    context: Arc<QueryContext>, table: TableRef, candidates: std::collections::BTreeSet<Iid>,
+    id: Option<&EntityId>, valid: Option<Interval>, columns: Option<&[&str]>, history: bool,
+) -> Result<Option<QueryCursor>> {
     let name = QualifiedTable {
         database: context.catalog.default_database().to_owned(),
         table,
@@ -290,7 +296,7 @@ pub(crate) async fn open_owned_table_point(
     });
     let scan = Arc::new(Relation::scan(Scan {
         table, columns, valid_time, system_time: TemporalFilter::Default, clamp_valid_time: history,
-        iids: Some([locator].into()), predicates: Vec::new(), matches: Vec::new(), top_k: None, ordered_top_k: None,
+        iids: Some(candidates), predicates: Vec::new(), matches: Vec::new(), top_k: None, ordered_top_k: None,
     })?);
     let plan = if history {
         let expr = order.ok_or_else(|| Anomaly::fault("rtdb.owned/history-schema", "Owned history omitted its valid start"))?;
