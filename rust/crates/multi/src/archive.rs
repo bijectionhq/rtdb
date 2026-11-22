@@ -2,7 +2,6 @@
 use std::{
     collections::{
         BTreeMap,
-        BTreeSet,
     },
     ops::Range,
     path::Path,
@@ -26,15 +25,15 @@ use rtdb_directory::{
 use rtdb_format::{
     catalog::{
         BlockCatalog,
+        CheckpointContents,
         TableBlock,
+        publication_digest,
     },
     keys::{
         block_key,
         StorageRoot,
-        TrieKey,
         CURRENT_STORAGE_VERSION,
     },
-    log::proto::TrieState,
 };
 use rtdb_storage::{
     object_store::StoredObject,
@@ -365,11 +364,15 @@ pub struct ArchivedObject {
     pub sha256: String,
 }
 
+fn primary_contents(contents: &CheckpointContents) -> bool { *contents == CheckpointContents::Primary }
+
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Capture {
     pub point: CapturePoint,
     pub objects: Vec<ArchivedObject>,
+    #[serde(default, skip_serializing_if = "primary_contents")]
+    format: CheckpointContents,
 }
 
 impl Capture {
@@ -386,7 +389,7 @@ impl Capture {
     ) -> Result<()> {
         let files = Arc::new(PrefixedStore::new(bucket, format!("{prefix}/objects")));
         let plaintext = EncryptingStore::new(files.clone(), material)?;
-        let closure = checkpoint_objects(&plaintext, &self.point).await?;
+        let closure = checkpoint_objects(&plaintext, &self.point, self.format).await?;
         let mut bytes = 0u64;
         let objects = self.objects.iter()
             .map(|object| {
@@ -396,7 +399,7 @@ impl Capture {
                 Ok((key(&object.name)?, object))
             })
             .collect::<Result<std::collections::BTreeMap<_, _>>>()?;
-        if objects.len() != self.objects.len() || objects.keys().ne(closure.iter()) {
+        if objects.len() != self.objects.len() || objects.keys().ne(closure.keys()) {
             return Err(inconsistent(
                 "The archive object list differs from the checkpoint closure",
             ));
@@ -404,7 +407,8 @@ impl Capture {
         let cipher = Cipher::new(material)?;
         for (name, object) in objects {
             let ciphertext = read_object(files.as_ref(), &name, object).await?;
-            cipher.open(name.as_str(), &ciphertext)?;
+            let bytes = cipher.open(name.as_str(), &ciphertext)?;
+            require_bound_metadata(closure[&name], &bytes)?;
         }
         Ok(())
     }
@@ -612,40 +616,39 @@ fn verify_cut(catalog: &BlockCatalog, checkpoint: Checkpoint, epoch: StorageEpoc
     Ok(())
 }
 
-async fn checkpoint_objects(
-    plaintext: &dyn ObjectStore,
-    point: &CapturePoint,
-) -> Result<BTreeSet<ObjectKey>> {
-    let block = BlockIndex(point.checkpoint.block);
-    let catalog_key = key(&block_key(block)?)?;
-    let catalog = BlockCatalog::decode(&plaintext.get(&catalog_key).await?)?;
-    verify_cut(&catalog, point.checkpoint, StorageEpoch(point.log_epoch))?;
-    catalog_objects(plaintext, block, &catalog).await
+type CheckpointObjects = BTreeMap<ObjectKey, Option<[u8; 32]>>;
+
+fn require_bound_metadata(expected: Option<[u8; 32]>, bytes: &[u8]) -> Result<()> {
+    if expected.is_some_and(|expected| publication_digest(bytes) != expected) {
+        return Err(inconsistent("Checkpoint metadata changed after dependency discovery"));
+    }
+    Ok(())
 }
 
-async fn catalog_objects(plaintext: &dyn ObjectStore, block: BlockIndex, catalog: &BlockCatalog) -> Result<BTreeSet<ObjectKey>> {
-    let mut closure = BTreeSet::from([key(&block_key(block)?)?]);
+async fn checkpoint_objects(plaintext: &dyn ObjectStore, point: &CapturePoint, contents: CheckpointContents) -> Result<CheckpointObjects> {
+    let catalog_key = key(&block_key(BlockIndex(point.checkpoint.block))?)?;
+    let catalog = BlockCatalog::decode(&plaintext.get_fresh(&catalog_key).await?)?;
+    verify_cut(&catalog, point.checkpoint, StorageEpoch(point.log_epoch))?;
+    catalog_objects(plaintext, &catalog, contents).await
+}
+
+async fn catalog_objects(plaintext: &dyn ObjectStore, catalog: &BlockCatalog, contents: CheckpointContents) -> Result<CheckpointObjects> {
+    let block = catalog.block_index();
+    let root_digest = catalog.publication_sha256().ok_or_else(|| inconsistent("Checkpoint root bytes were not observed"))?;
+    let mut closure = BTreeMap::from([(key(&block_key(block)?)?, Some(root_digest))]);
     for table in catalog.table_entries()? {
         let path = key(&table.slug.block_key(block)?)?;
-        let metadata = TableBlock::decode(&plaintext.get(&path).await?)?;
-        closure.insert(path);
-        let legacy = if metadata.partitions().is_empty() {
-            metadata.as_proto().tries.as_slice()
-        } else {
-            &[]
-        };
-        for detail in metadata
-            .partitions()
-            .iter()
-            .flat_map(|partition| &partition.tries)
-            .chain(legacy)
-        {
-            if detail.trie_state == Some(TrieState::Garbage as i32) {
-                continue;
-            }
-            let trie: TrieKey = detail.trie_key.as_deref().unwrap_or_default().parse()?;
-            closure.insert(key(&table.slug.data_key(&trie))?);
-            closure.insert(key(&table.slug.metadata_key(&trie))?);
+        let bytes = plaintext.get_fresh(&path).await?;
+        let observed = publication_digest(&bytes);
+        if !catalog.matches_table_block(table.oid, &observed) {
+            return Err(inconsistent("Checkpoint table bytes do not match the root manifest"));
+        }
+        let metadata = TableBlock::decode(&bytes)?;
+        if closure.insert(path, Some(observed)).is_some() {
+            return Err(inconsistent("Two checkpoint tables use the same storage path"));
+        }
+        for object in metadata.checkpoint_trie_files(&table.slug, contents)? {
+            closure.entry(key(&object)?).or_insert(None);
         }
     }
     Ok(closure)
@@ -676,7 +679,7 @@ pub(crate) async fn copy_fork_checkpoint(
     let plaintext = EncryptingStore::new(source_store, source_key)?;
     let block = BlockIndex(selected);
     let catalog_key = key(&block_key(block)?)?;
-    let catalog_bytes = plaintext.get(&catalog_key).await?;
+    let catalog_bytes = plaintext.get_fresh(&catalog_key).await?;
     let catalog = BlockCatalog::decode(&catalog_bytes)?;
     if catalog.block_index() != block || !catalog.secondary_databases().is_empty() {
         return Err(inconsistent("The selected fork checkpoint has a different block or owns secondary databases"));
@@ -684,13 +687,14 @@ pub(crate) async fn copy_fork_checkpoint(
     if let Some(checkpoint) = source.checkpoint.filter(|checkpoint| checkpoint.block == selected) {
         verify_cut(&catalog, checkpoint, StorageEpoch(source.log_epoch))?;
     }
-    let closure = catalog_objects(&plaintext, block, &catalog).await?;
+    let closure = catalog_objects(&plaintext, &catalog, CheckpointContents::Replay).await?;
     let physical = Arc::new(PrefixedStore::new(bucket, destination_root));
     crate::store::check_root(physical.as_ref(), &child.id, true).await?;
     let packed = crate::packing::PackingStore::open(physical, PackDiscovery::List).await?;
     let cipher = Cipher::new(child_key)?;
-    for object in closure.into_iter().filter(|object| object != &catalog_key) {
-        let content = plaintext.get(&object).await?;
+    for (object, expected) in closure.into_iter().filter(|(object, _)| object != &catalog_key) {
+        let content = plaintext.get_fresh(&object).await?;
+        require_bound_metadata(expected, &content)?;
         packed.put(&object, cipher.seal_deterministic(object.as_str(), &content)?).await?;
     }
     packed.put(&catalog_key, cipher.seal_deterministic(catalog_key.as_str(), &catalog_bytes)?).await?;
@@ -888,13 +892,13 @@ async fn capture_registered(
     )
     .await?;
     let plaintext = EncryptingStore::new(sealed as Arc<dyn ObjectStore>, &serving_material)?;
-    let closure = checkpoint_objects(&plaintext, &point).await?;
-    let root_object = key(&block_key(BlockIndex(point.checkpoint.block))?)?;
+    let format = CheckpointContents::Replay;
+    let closure = checkpoint_objects(&plaintext, &point, format).await?;
 
     let mut bytes = 0u64;
     let mut objects = Vec::with_capacity(closure.len());
-    for object in closure {
-        let metadata = plaintext.head(&object).await?;
+    for (object, expected) in closure {
+        let metadata = plaintext.head_fresh(&object).await?;
         let ciphertext_size = metadata.size
             .checked_add(crate::cipher::SEALED_OVERHEAD as u64)
             .ok_or_else(|| unavailable("Checkpoint object exceeds the archive byte budget"))?;
@@ -902,12 +906,9 @@ async fn capture_registered(
             .checked_add(ciphertext_size)
             .filter(|total| *total <= MAXIMUM_BYTES)
             .ok_or_else(|| unavailable("Checkpoint exceeds the archive byte budget"))?;
-        let content = plaintext.get(&object).await?;
-        if content.len() as u64 != metadata.size
-            || object == root_object && point.checkpoint.root_sha256.is_some_and(|expected| rtdb_format::catalog::publication_digest(&content) != expected)
-        {
-            return Err(inconsistent("Checkpoint object changed during capture"));
-        }
+        let size = usize::try_from(metadata.size).map_err(|_| unavailable("Checkpoint object exceeds the archive byte budget"))?;
+        let content = plaintext.get_fresh_exact(&object, size).await?;
+        require_bound_metadata(expected, &content)?;
         let ciphertext = archive_cipher.seal_deterministic(object.as_str(), &content)?;
         let digest = digest(&ciphertext);
         archive
@@ -919,7 +920,7 @@ async fn capture_registered(
             sha256: digest,
         });
     }
-    let capture = Capture { point, objects };
+    let capture = Capture { point, objects, format };
     let encoded = encode(&capture)?;
     if encoded.len() as u64 > MAXIMUM_MANIFEST_BYTES {
         return Err(unavailable(
@@ -1350,6 +1351,141 @@ mod tests {
     use super::*;
     use rtdb_directory::{DisposalReceipt, MemoryDirectory};
 
+    struct ReplayFixture {
+        point: CapturePoint,
+        root: ObjectKey,
+        table: ObjectKey,
+        artefact: ObjectKey,
+        retained: [ObjectKey; 2],
+        files: BTreeMap<ObjectKey, Bytes>,
+    }
+
+    fn replay_fixture() -> Result<ReplayFixture> {
+        use prost::Message;
+        use rtdb_format::{block::proto, catalog::TableEntry, keys::TrieKey, log::proto::{ArtefactRecord, ArtefactScope, TrieDetails, TrieState}};
+        let selected = BlockIndex(2);
+        let entry = TableEntry::new(16_384, rtdb_types::TableRef::new("public", "docs"))?;
+        let l0 = TrieKey::l0(BlockIndex(0))?;
+        let member = TrieKey::new(2, None, vec![0], selected)?;
+        let shared = ArtefactRecord { kind: Some("search".into()), definition_id: Some("body".into()), definition_version: Some(1),
+            scope: Some(ArtefactScope::PartGroup as i32), ..Default::default() };
+        let table_bytes = proto::TableBlock {
+            row_count: Some(1),
+            tries: vec![
+                TrieDetails { trie_key: Some(l0.to_string()), trie_state: Some(TrieState::Garbage as i32), ..Default::default() },
+                TrieDetails { trie_key: Some(member.to_string()), trie_state: Some(TrieState::Live as i32), artefacts: vec![shared.clone()], ..Default::default() },
+            ],
+            ..Default::default()
+        }.encode_to_vec();
+        let root_bytes = proto::Block {
+            block_index: Some(selected.0), boundary_replica_msg_id: Some(8), latest_processed_msg_id: Some(5),
+            tables: vec![entry.to_proto()],
+            table_block_manifest: Some(proto::TableBlockManifest { sha256_by_oid: BTreeMap::from([(entry.oid, publication_digest(&table_bytes).to_vec())]) }),
+            ..Default::default()
+        }.encode_to_vec();
+        let point = CapturePoint { deployment: Uuid::new_v4(), operation: Uuid::new_v4(), incarnation: 1, log_epoch: 0,
+            checkpoint: Checkpoint { block: selected.0, boundary: 8, source: 5, system_time: i64::MIN, root_sha256: Some(publication_digest(&root_bytes)) } };
+        let root = key(&block_key(selected)?)?;
+        let table = key(&entry.slug.block_key(selected)?)?;
+        let artefact = key(&entry.slug.recorded_artefact_key(&member, &shared)?)?;
+        let retained = [key(&entry.slug.data_key(&l0))?, key(&entry.slug.metadata_key(&l0))?];
+        let files = BTreeMap::from([
+            (root.clone(), Bytes::from(root_bytes)), (table.clone(), Bytes::from(table_bytes)),
+            (artefact.clone(), Bytes::from_static(b"shared search file")),
+            (retained[0].clone(), Bytes::from_static(b"retained rows")), (retained[1].clone(), Bytes::from_static(b"retained metadata")),
+            (key(&entry.slug.data_key(&member))?, Bytes::from_static(b"current rows")),
+            (key(&entry.slug.metadata_key(&member))?, Bytes::from_static(b"current metadata")),
+        ]);
+        Ok(ReplayFixture { point, root, table, artefact, retained, files })
+    }
+
+    #[tokio::test]
+    async fn replay_archives_require_all_dependencies_and_open_old_primary_manifests() -> Result<()> {
+        let fixture = replay_fixture()?;
+        let bucket: Arc<dyn ObjectStore> = Arc::new(rtdb_storage::MemoryStore::default());
+        let files = PrefixedStore::new(bucket.clone(), "capture/objects");
+        let material = [3; crate::keys::KEY_BYTES];
+        let cipher = Cipher::new(&material)?;
+        let mut objects = Vec::new();
+        for (name, bytes) in &fixture.files {
+            let ciphertext = cipher.seal_deterministic(name.as_str(), bytes)?;
+            objects.push(ArchivedObject { name: name.to_string(), bytes: ciphertext.len() as u64, sha256: digest(&ciphertext) });
+            files.put(name, ciphertext).await?;
+        }
+        let capture = Capture { point: fixture.point, format: CheckpointContents::Replay, objects };
+        capture.verify(bucket.clone(), "capture", &material).await?;
+        let mut omitted = capture.clone();
+        omitted.objects.retain(|object| object.name != fixture.artefact.as_str());
+        let error = omitted.verify(bucket.clone(), "capture", &material).await.err();
+        assert_eq!(error.and_then(|error| error.message).as_deref(), Some("The archive object list differs from the checkpoint closure"),
+            "a replay manifest must name the shared artefact");
+        files.delete(&fixture.artefact).await?;
+        let error = capture.verify(bucket.clone(), "capture", &material).await.unwrap_err();
+        assert_eq!(error.code, "rtdb.storage/missing-object");
+
+        let mut primary = omitted;
+        primary.objects.retain(|object| fixture.retained.iter().all(|name| name.as_str() != object.name));
+        primary.format = CheckpointContents::Primary;
+        let legacy = encode(&primary)?;
+        assert!(serde_json::from_slice::<serde_json::Value>(&legacy).unwrap().get("format").is_none());
+        let reopened: Capture = serde_json::from_slice(&legacy).unwrap();
+        assert_eq!(encode(&reopened)?, legacy);
+        reopened.verify(bucket, "capture", &material).await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn archive_discovery_refuses_substituted_table_bytes() -> Result<()> {
+        let fixture = replay_fixture()?;
+        let store = rtdb_storage::MemoryStore::default();
+        store.put(&fixture.root, fixture.files[&fixture.root].clone()).await?;
+        let different = Bytes::new();
+        assert_eq!(TableBlock::decode(&different)?.row_count(), 0);
+        store.put(&fixture.table, different).await?;
+        let error = checkpoint_objects(&store, &fixture.point, CheckpointContents::Replay).await.err();
+        assert_eq!(error.and_then(|error| error.message).as_deref(), Some("Checkpoint table bytes do not match the root manifest"),
+            "archive discovery must authenticate a decodable table block before using its dependencies");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn an_independent_fork_copies_the_replay_closure_before_its_root() -> Result<()> {
+        let fixture = replay_fixture()?;
+        let bucket: Arc<dyn ObjectStore> = Arc::new(rtdb_storage::MemoryStore::default());
+        let path = tempfile::tempdir().unwrap();
+        let keys = crate::keys::LocalKeyService::new(path.path())?;
+        let mut source = DeploymentRecord::new("source", "org", Vec::new(), 0);
+        source.checkpoint = Some(fixture.point.checkpoint);
+        let child = DeploymentRecord::new("child", "other", Vec::new(), 0);
+        let incomplete = DeploymentRecord::new("incomplete", "other", Vec::new(), 0);
+        let version = checkpoint_storage_root()?;
+        let scope = |record: &DeploymentRecord| format!("{}/{version}", record.storage_prefix());
+        let source_physical = PrefixedStore::new(bucket.clone(), scope(&source));
+        crate::store::check_root(&source_physical, &source.id, true).await?;
+        let source_material = [3; crate::keys::KEY_BYTES];
+        let child_material = [7; crate::keys::KEY_BYTES];
+        let serving = open_deployment_store(bucket.clone(), &scope(&source), PackDiscovery::List, wall_clock()).await?;
+        let source_store = EncryptingStore::new(serving, &source_material)?;
+        for (name, bytes) in fixture.files.iter().filter(|(name, _)| *name != &fixture.root) {
+            source_store.put(name, bytes.clone()).await?;
+        }
+        source_store.put(&fixture.root, fixture.files[&fixture.root].clone()).await?;
+        copy_fork_checkpoint(bucket.clone(), &keys, &source, &source_material, &child, &child_material, None).await?;
+        let serving = open_deployment_store(bucket.clone(), &scope(&child), PackDiscovery::List, wall_clock()).await?;
+        let copied = EncryptingStore::new(serving, &child_material)?;
+        for (name, bytes) in &fixture.files {
+            assert_eq!(&copied.get_fresh(name).await.expect("the fork must contain every replay dependency"), bytes);
+        }
+
+        source_physical.delete(&fixture.artefact).await?;
+        let failure = copy_fork_checkpoint(bucket.clone(), &keys, &source, &source_material, &incomplete, &child_material, None).await;
+        assert_eq!(failure.unwrap_err().code, "rtdb.storage/missing-object");
+        let serving = open_deployment_store(bucket, &scope(&incomplete), PackDiscovery::List, wall_clock()).await?;
+        assert!(matches!(serving.head_fresh(&fixture.root).await, Err(Error::MissingObject(_))),
+            "a fork with an unavailable dependency must have no root");
+        Ok(())
+    }
+
     #[tokio::test]
     async fn repaired_reads_verify_and_reseal_the_accepted_archive() -> Result<()> {
         let archive_bucket = Arc::new(rtdb_storage::MemoryStore::default());
@@ -1400,7 +1536,7 @@ mod tests {
             deployment: record.id.clone(),
             incarnation: record.incarnation,
             epoch: record.epoch,
-            journals: BTreeSet::new(),
+            journals: Default::default(),
             journals_retired_at_ms: 1,
             key_withdrawn_at_ms: 1,
             serving_prefix_observed_empty_at_ms: 1,

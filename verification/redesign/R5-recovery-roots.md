@@ -48,6 +48,10 @@ After R5, L0 files are ordinary garbage once compaction supersedes them (as in X
   Ordinary cold recovery verifies that receipt before table metadata, admits metadata and the replay floor together, and hands suffix protection over to its cursor.
   A successor must be admitted separately by the directory.
   Recorded physical provider versions and complete transitive dependencies are still needed for release certification.
+- New archive and independent fork copies require the replay inventory derived from the checked table blocks.
+  It contains live and nascent payload files, retained L0 payload files and the usable artefacts named by the catalog.
+  The destination publishes after copying every required path. Older receipt and stage formats retain their original inventory scope.
+  This evidence covers copy-time completeness. A separate release authority must keep the exact source publications available through the copy.
 - The trie collector protects the installed checkpoint's live and nascent tries within one partition authority.
 - Multi has recovery holds for the replica suffix (`rust/crates/multi/src/recovery_holds.rs`, peer commit `e298879a0`) and checkpoint-metadata holds (`rust/crates/multi/src/checkpoint_retention.rs`).
 - Models: `verification/tla/{InstalledCheckpoint,RecoveryReplay,Checkpoint,ResidenceRetirement}.tla`, `verification/mcrl2/CheckpointDiscovery.mcrl2`, the AutoHyper two-run check, and the Lean checkpoint-metadata laws.
@@ -66,6 +70,32 @@ After R5, L0 files are ordinary garbage once compaction supersedes them (as in X
 - **Native:** crash during compaction and during reset, then recover from a root plus the log suffix; collect superseded L0 files and recover again; trim the log below the root and recover.
 - **TLA+ / Apalache:** extend `InstalledCheckpoint.tla` and `ResidenceRetirement.tla` with roots as holds and L0 collection.
 - **Mutations that must fail:** releasing a root before its successor is complete; collecting an L0 file still in a live root's closure; trimming the log above a live root's first required record.
+
+## Source retention through copy completion
+
+A verified copy has two independent obligations.
+The destination must contain the complete inventory of the admitted cut before it can be published.
+The source must keep the publications needed by the copy available until the admitted provider work has drained.
+The current copy tests check the first obligation and exercise refusal when a required source object is absent.
+
+Use the same state model to compare two retention rules under concurrent checkpoint adoption and retirement.
+A residence-wide hold prevents source collection for the whole attempt and can delay reclamation of unrelated publications.
+An exact hold protects the admitted root and its dependency publications, including the complete physical pack for a member that still depends on it.
+It requires an authenticated observation that binds the selected cut, directory custody and storage identities.
+In both designs the copied destination takes its own custody before the source hold is released.
+
+The next model needs at least two roots, one shared object, one source-only object, a delayed collector and a provider read completing after cancellation.
+Check these independent properties:
+
+- **Admission safety.** An accepted hold names the exact root and source residence that its requests use.
+- **Retirement safety.** Collection cannot authorize removal of any publication required by an outstanding hold.
+- **Handoff safety.** Only the durable complete destination may replace the source obligation for a successful copy.
+- **Conditional progress.** Under a stable source and fair delivery, an admitted copy can complete. A canceled or finished attempt releases after its provider work drains.
+- **Reclamation progress.** With no remaining references and fair collection, an unrelated retired publication can be reclaimed while exact holds are in flight.
+
+Start with controls that skip the admission floor, ignore an inherited pack, release on cancellation before the provider drains, and treat a staged destination as durable.
+Run the same traces through the model and the native copy and collection paths.
+A production proof should cover the hold and retirement decisions, with the directory compare-and-replace and provider version contract stated as premises.
 
 ## Open questions
 

@@ -2128,6 +2128,8 @@ rule Fork {
 rule ForkAcrossOrganisations {
     -- A fork into another organisation creates its own lineage and key.
     -- Its checkpoint closure and its selected tail are copied under the child's key before the directory publishes the child.
+    -- The destination root follows the required data, metadata, retained level-zero sources and recorded usable artefacts.
+    -- The copy checks the table bytes used to discover those dependencies against the root manifest when present.
     -- This copy has independent key custody and its own erasure authority.
     -- Publication checks the parent in the writer epoch and storage generation used to prepare the copy.
     when: ForkRequested(parent, basis, org)
@@ -2292,6 +2294,9 @@ rule PublishInventoryReceipt {
 }
 
 rule HostedCheckpointCapture {
+    -- A new archive receipt covers the verified replay inventory.
+    -- Shared group artefacts are recorded once. Required files must be available before the receipt is published.
+    -- A historical stage carries the inventory format of its source archive.
     when: AuthenticatedRecoveryCapture(authority, name, capture_id)
 
     requires: ConfiguredOrganizationOwns(authority, name)

@@ -8,7 +8,8 @@ use rtdb_columnar::MemoryReservation;
 use rtdb_types::{Anomaly, BlockIndex, LogicalType, ReplicaPosition, Result, SourcePosition, TableRef, Term, TermSequence, Timestamp, TransactionKey, TxId};
 
 use crate::generated::xtdb::{block::proto as pb, cols::proto as cpb, database::proto::DatabaseConfig};
-use crate::keys::TableSlug;
+use crate::keys::{TableSlug, TrieKey};
+use crate::log::proto::{TrieDetails, TrieState};
 
 pub const FIRST_TABLE_OID: u32 = 16_384;
 
@@ -96,6 +97,9 @@ impl BlockCatalog {
     pub fn table_block_digest(&self, oid: u32) -> Option<&[u8]> {
         self.wire.table_block_manifest.as_ref()?.sha256_by_oid.get(&oid).map(Vec::as_slice)
     }
+    pub fn matches_table_block(&self, oid: u32, digest: &[u8; 32]) -> bool {
+        self.wire.table_block_manifest.is_none() || self.table_block_digest(oid) == Some(digest.as_slice())
+    }
 
     pub fn latest_completed_tx(&self) -> Option<TransactionKey> {
         self.wire.latest_completed_tx.as_ref().map(|tx| TransactionKey {
@@ -146,6 +150,17 @@ pub fn legacy_table_ref(name: &str) -> Result<TableRef> {
     Ok(TableRef::new(schema, table))
 }
 
+/// The dependency set to preserve when copying a checkpoint.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CheckpointContents {
+    /// The primary objects retained by the original archive encoding.
+    #[default]
+    Primary,
+    /// Primary objects, retained L0 inputs, and the artefacts named by usable tries.
+    Replay,
+}
+
 #[derive(Clone, Debug)]
 pub struct TableBlock {
     wire: Arc<pb::TableBlock>,
@@ -187,6 +202,29 @@ impl TableBlock {
     pub fn as_proto(&self) -> &pb::TableBlock { &self.wire }
     pub fn row_count(&self) -> i64 { self.wire.row_count.unwrap_or_default() }
     pub fn partitions(&self) -> &[pb::Partition] { &self.wire.partitions }
+
+    pub fn trie_details(&self) -> impl Iterator<Item = &TrieDetails> {
+        self.wire.partitions.iter().flat_map(|partition| &partition.tries)
+            .chain(self.wire.tries.iter().filter(|_| self.wire.partitions.is_empty()))
+    }
+
+    pub fn checkpoint_trie_files(&self, slug: &TableSlug, contents: CheckpointContents) -> Result<BTreeSet<String>> {
+        let mut files = BTreeSet::new();
+        for detail in self.trie_details() {
+            let state = TrieState::try_from(detail.trie_state.unwrap_or_default())
+                .map_err(|_| invalid("Unknown trie state in checkpoint"))?;
+            let trie: TrieKey = detail.trie_key.as_deref().unwrap_or_default().parse()?;
+            if state == TrieState::Garbage && (contents == CheckpointContents::Primary || trie.level() != 0) { continue; }
+            files.insert(slug.data_key(&trie));
+            files.insert(slug.metadata_key(&trie));
+            if contents == CheckpointContents::Replay && state != TrieState::Garbage {
+                for record in &detail.artefacts {
+                    files.insert(slug.recorded_artefact_key(&trie, record)?);
+                }
+            }
+        }
+        Ok(files)
+    }
 
     pub fn column_types(&self) -> Result<StructFields<LogicalType>> {
         if !self.wire.columns.is_empty() {

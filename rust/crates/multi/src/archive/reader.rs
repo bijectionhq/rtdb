@@ -28,7 +28,7 @@ use uuid::Uuid;
 use super::{
     ArchivedObject, CapturePoint, checkpoint_objects, checkpoint_storage_root, digest, encode,
     inconsistent, read, read_object,
-    stage::{STAGED_MANIFEST, with_region},
+    stage::{STAGED_MANIFEST, StageInventory, with_region},
     unavailable,
 };
 use crate::{
@@ -273,7 +273,7 @@ async fn open_inventory(
         ));
     }
     let manifest_path = key(STAGED_MANIFEST)?;
-    let manifest = read::<Vec<ArchivedObject>>(&files, &manifest_path)
+    let manifest = read::<StageInventory>(&files, &manifest_path)
         .await?
         .ok_or_else(|| unavailable("The staged checkpoint inventory is missing"))?;
     let observed_digest = digest(&encode(&manifest)?);
@@ -282,6 +282,7 @@ async fn open_inventory(
             "The staged inventory differs from its accepted digest",
         ));
     }
+    let (contents, manifest) = manifest.into_contents();
     let root_marker = key(ROOT_MARKER)?;
     let mut objects = BTreeMap::new();
     let mut bytes = 0u64;
@@ -329,10 +330,10 @@ async fn open_inventory(
         log_epoch: stage.source_log_epoch,
         checkpoint: stage.checkpoint,
     };
-    let closure = checkpoint_objects(plaintext.as_ref(), &point).await?;
+    let closure = checkpoint_objects(plaintext.as_ref(), &point, contents).await?;
     expected.remove(&root_marker);
     expected.remove(&manifest_path);
-    if closure != expected {
+    if closure.keys().ne(expected.iter()) {
         return Err(inconsistent(
             "The staged object inventory differs from the checkpoint closure",
         ));

@@ -742,6 +742,22 @@ def verify_receipted_checkpoint_lean(args, scratch):
                       "receipted-checkpoint-startup", controls, 2)
 
 
+def verify_checkpoint_replay_closure_lean(args, scratch):
+    controls = {
+        "omit-retained-input": (
+            "if payloadRequired trie then [trie.data, trie.metadata] else []",
+            "if trie.state ≠ .garbage then [trie.data, trie.metadata] else []",
+            ["a_required_payload_keeps_both_files", "a_required_payload_keeps_both_files"],
+        ),
+        "omit-artefact": (
+            "if trie.state ≠ .garbage then trie.artefacts else []", "[]",
+            ["a_usable_member_keeps_its_artefact"],
+        ),
+    }
+    verify_lean_model(args, scratch, Path("verification/lean/CheckpointReplayClosure.lean"),
+                      "checkpoint-replay-closure", controls, 4)
+
+
 def verify_reader_reclamation_minimality(args, scratch):
     path = Path("verification/lean/ReaderReclamationMinimality.lean")
     controls = {
@@ -1667,6 +1683,7 @@ def verify_lean(args, scratch):
             verify_checkpoint_table_manifest(args, scratch)
             verify_pack_publication_lean(args, scratch)
             verify_receipted_checkpoint_lean(args, scratch)
+            verify_checkpoint_replay_closure_lean(args, scratch)
             verify_residence_reader_retention(args, scratch)
             verify_delegated_scan(args, scratch, directory)
             verify_compaction_projection(args, scratch, directory)
@@ -1908,6 +1925,19 @@ TLA_CASES = (
      ('Mutation = "none"', 'Mutation = "trust_path"'), "AcceptedMetadataMatches"),
     ("CheckpointTableManifest", "checkpoint-table-manifest-open-witness",
      ("INVARIANTS CompletePublication AcceptedMetadataMatches", "INVARIANT NeverOpensPublishedRoot"), "NeverOpensPublishedRoot"),
+    ("CheckpointReplayClosure", "checkpoint-replay-closure", None, None),
+    ("CheckpointReplayClosure", "checkpoint-replay-closure-trust-root-path",
+     ('Mutation = "none"', 'Mutation = "ignore_root_digest"'), "Safe"),
+    ("CheckpointReplayClosure", "checkpoint-replay-closure-trust-copy-path",
+     ('Mutation = "none"', 'Mutation = "ignore_copy_digest"'), "Safe"),
+    ("CheckpointReplayClosure", "checkpoint-replay-closure-omit-retained-source",
+     ('Mutation = "none"', 'Mutation = "omit_retained_source"'), "Safe"),
+    ("CheckpointReplayClosure", "checkpoint-replay-closure-omit-artefact",
+     ('Mutation = "none"', 'Mutation = "omit_artefact"'), "Safe"),
+    ("CheckpointReplayClosure", "checkpoint-replay-closure-publish-early",
+     ('Mutation = "none"', 'Mutation = "publish_early"'), "Safe"),
+    ("CheckpointReplayClosure", "checkpoint-replay-closure-copied-file-witness",
+     ("INVARIANT Safe", "INVARIANT NeverPublishesAfterSourceLoss"), "NeverPublishesAfterSourceLoss"),
     ("PackPublicationObservation", "pack-publication-observation", None, None),
     ("PackPublicationObservation", "pack-publication-trust-trailer",
      ('Mutation = "none"', 'Mutation = "ignore_trailer_version"'), "Safe"),
@@ -2339,6 +2369,13 @@ def verify_apalache(args, scratch):
     check_apalache(args, scratch, "CheckpointTableManifest", "checkpoint-table-manifest-trust-path",
                    "AcceptedMetadataMatches", 8, ('Mutation = "none"', 'Mutation = "trust_path"'),
                    "a valid table block appears under a different registered path")
+    check_apalache(args, scratch, "CheckpointReplayClosure", "checkpoint-replay-closure", "Safe", 10)
+    check_apalache(args, scratch, "CheckpointReplayClosure", "checkpoint-replay-closure-trust-copy-path",
+                   "CopyIsBound", 10, ('Mutation = "none"', 'Mutation = "ignore_copy_digest"'),
+                   "a copied table differs from the one used to discover dependencies")
+    check_apalache(args, scratch, "CheckpointReplayClosure", "checkpoint-replay-closure-omit-artefact",
+                   "PublicationIsComplete", 10, ('Mutation = "none"', 'Mutation = "omit_artefact"'),
+                   "a replay copy is published without the required shared artefact")
     check_apalache(args, scratch, "PackPublicationObservation", "pack-publication-observation", "Safe", 6)
     check_apalache(args, scratch, "PackPublicationObservation", "pack-publication-trust-member", "MemberCoherent", 6,
                    ('Mutation = "none"', 'Mutation = "ignore_member_version"'),
@@ -2732,7 +2769,8 @@ def verify_checkpoint_table_manifest_replay(args, source):
             "a newly published root commits to the bytes written for each table OID",
         )),
         "accept-substituted-table": (read_command, table, (
-            read_path, "if expected != observed {", "if false && expected != observed {",
+            read_path, "if !block.matches_table_block(entry.oid, &rtdb_format::catalog::publication_digest(lease.as_slice())) {",
+            "if false && !block.matches_table_block(entry.oid, &rtdb_format::catalog::publication_digest(lease.as_slice())) {",
             "recovery must refuse mismatched table metadata even when it decodes",
         )),
     }
@@ -2754,6 +2792,77 @@ def verify_checkpoint_table_manifest_replay(args, source):
             if checked.returncode or f"{test} ... ok" not in checked.stdout or "1 passed; 0 failed" not in checked.stdout:
                 raise ValueError(f"table manifest baseline {name} failed")
     print("rust-table-manifest: both replays passed and three manifest controls failed")
+
+
+def verify_checkpoint_replay_closure(args, source):
+    env = os.environ | {
+        "CARGO_TARGET_DIR": os.environ.get("CARGO_TARGET_DIR", str(ROOT / "target")),
+        "CARGO_PROFILE_TEST_DEBUG": "0",
+    }
+    cargo = ["cargo", "test", "--locked", "-p"]
+    archive = [*cargo, "rtdb-multi", "--features", "dynamodb", "--lib"]
+    catalog = [*cargo, "rtdb-format", "--test", "catalog_retention"]
+    manifest = "archive::tests::replay_archives_require_all_dependencies_and_open_old_primary_manifests"
+    discovery = "archive::tests::archive_discovery_refuses_substituted_table_bytes"
+    fork = "archive::tests::an_independent_fork_copies_the_replay_closure_before_its_root"
+    inventory = "replay_closure_preserves_l0_inputs_and_usable_artefacts"
+    archive_path = "rust/crates/multi/src/archive.rs"
+    catalog_path = "rust/crates/format/src/catalog.rs"
+    inventory_failure = "replay closure must include retained L0 and one copy per usable artefact"
+    publish_root = "    packed.put(&catalog_key, cipher.seal_deterministic(catalog_key.as_str(), &catalog_bytes)?).await?;"
+    copy_loop = """    for (object, expected) in closure.into_iter().filter(|(object, _)| object != &catalog_key) {
+        let content = plaintext.get_fresh(&object).await?;
+        require_bound_metadata(expected, &content)?;
+        packed.put(&object, cipher.seal_deterministic(object.as_str(), &content)?).await?;
+    }"""
+    cases = (
+        ("manifest", archive, manifest, None),
+        ("discovery", archive, discovery, None),
+        ("fork", archive, fork, None),
+        ("inventory", catalog, inventory, None),
+        ("omit-retained-source", catalog, inventory, (
+            catalog_path, "if state == TrieState::Garbage && (contents == CheckpointContents::Primary || trie.level() != 0) { continue; }",
+            "if state == TrieState::Garbage { continue; }", inventory_failure,
+        )),
+        ("omit-artefact", catalog, inventory, (
+            catalog_path, "files.insert(slug.recorded_artefact_key(&trie, record)?);", "",
+            inventory_failure,
+        )),
+        ("trust-table-path", archive, discovery, (
+            archive_path, "if !catalog.matches_table_block(table.oid, &observed) {",
+            "if false && !catalog.matches_table_block(table.oid, &observed) {",
+            "archive discovery must authenticate a decodable table block before using its dependencies",
+        )),
+        ("skip-inventory-check", archive, manifest, (
+            archive_path, "if objects.len() != self.objects.len() || objects.keys().ne(closure.keys()) {",
+            "if false && (objects.len() != self.objects.len() || objects.keys().ne(closure.keys())) {",
+            "a replay manifest must name the shared artefact",
+        )),
+        ("publish-fork-root-first", archive, fork, (
+            archive_path, f"{copy_loop}\n{publish_root}", f"{publish_root}\n{copy_loop}",
+            "the fork must contain every replay dependency",
+        )),
+    )
+    for name, command, test, control in cases:
+        invocation = [*command, test, "--", "--exact"]
+        label = f"rust-checkpoint-replay-closure-{name}"
+        if not control:
+            checked = run_case(invocation, source / "rust", args.evidence, label, env)
+            if checked.returncode or f"{test} ... ok" not in checked.stdout or "1 passed; 0 failed" not in checked.stdout:
+                raise ValueError(f"checkpoint replay closure baseline {name} failed")
+            continue
+        relative, before, after, failure = control
+        path = source / relative
+        original = path.read_bytes()
+        try:
+            replace_once(path, before, after)
+            checked = run_case(invocation, source / "rust", args.evidence, label, env)
+        finally:
+            path.write_bytes(original)
+        if (checked.returncode != 101 or f"{test} ... FAILED" not in checked.stdout
+            or failure not in checked.stdout or "0 passed; 1 failed" not in checked.stdout):
+            raise ValueError(f"checkpoint replay closure control {name} missed its declared assertion")
+    print("rust-checkpoint-replay-closure: four replays passed and five controls failed")
 
 
 def verify_published_checkpoint_replay(args, source):
@@ -3826,6 +3935,7 @@ def main():
             verify_checkpoint_replay(args, source)
             verify_published_checkpoint_replay(args, source)
             verify_checkpoint_table_manifest_replay(args, source)
+            verify_checkpoint_replay_closure(args, source)
             verify_checkpoint_pack_evidence(args, source)
             verify_checkpoint_trie_retention(args, source)
             verify_trie_removal_readback(args, source)

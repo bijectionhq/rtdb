@@ -418,11 +418,8 @@ impl BlockStore {
         let mut tables = BTreeMap::new();
         for entry in block.table_entries()? {
             let lease = self.cache.get(&ObjectKey::new(entry.slug.block_key(index)?)?).await?;
-            if let Some(expected) = block.table_block_digest(entry.oid) {
-                let observed: [u8; 32] = Sha256::digest(lease.as_slice()).into();
-                if expected != observed {
-                    return Err(invalid(format!("The stored table block for {} does not match its checkpoint manifest", entry.table.schema_and_table())));
-                }
+            if !block.matches_table_block(entry.oid, &rtdb_format::catalog::publication_digest(lease.as_slice())) {
+                return Err(invalid(format!("The stored table block for {} does not match its checkpoint manifest", entry.table.schema_and_table())));
             }
             let reservation = self.reserve_decode(lease.as_slice().len())?;
             tables.insert(entry.table, TableBlock::decode_reserved(lease.as_slice(), reservation)?);
@@ -529,14 +526,8 @@ fn write_node<'a>(node: &'a TrieNode, pages: &'a BlockPages<'a>, memory: &'a Arc
     })
 }
 
-fn block_tries(block: &TableBlock) -> impl Iterator<Item = &proto::TrieDetails> {
-    let wire = block.as_proto();
-    wire.partitions.iter().flat_map(|partition| &partition.tries)
-        .chain(wire.tries.iter().filter(|_| wire.partitions.is_empty()))
-}
-
 fn l0_details<'a>(block: &'a TableBlock, key: &'a str) -> impl Iterator<Item = &'a proto::TrieDetails> {
-    block_tries(block).filter(move |detail| detail.trie_key.as_deref().is_some_and(|recorded| recorded.eq_ignore_ascii_case(key)))
+    block.trie_details().filter(move |detail| detail.trie_key.as_deref().is_some_and(|recorded| recorded.eq_ignore_ascii_case(key)))
 }
 
 pub(crate) fn l0_tries(index: BlockIndex, tables: &BTreeMap<rtdb_types::TableRef, TableBlock>) -> Result<BTreeMap<rtdb_types::TableRef, Vec<CatalogTrie>>> {

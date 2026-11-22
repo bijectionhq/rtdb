@@ -7,8 +7,10 @@ use rtdb_directory::{
     CellMedia, CheckpointStage, CheckpointStageIntent, DeploymentRecord, Directory,
     DisposalReceipt, HostedTask, Lifecycle,
 };
+use rtdb_format::catalog::CheckpointContents;
 use rtdb_storage::{Error, IoRegion, ObjectStore};
 use rtdb_types::Result;
+use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use super::{
@@ -28,6 +30,22 @@ use crate::{
 };
 
 pub(super) const STAGED_MANIFEST: &str = "~checkpoint-stage";
+
+#[derive(Deserialize, Serialize)]
+#[serde(untagged, deny_unknown_fields)]
+pub(super) enum StageInventory {
+    Primary(Vec<ArchivedObject>),
+    Replay { objects: Vec<ArchivedObject> },
+}
+
+impl StageInventory {
+    pub(super) fn into_contents(self) -> (CheckpointContents, Vec<ArchivedObject>) {
+        match self {
+            Self::Primary(objects) => (CheckpointContents::Primary, objects),
+            Self::Replay { objects } => (CheckpointContents::Replay, objects),
+        }
+    }
+}
 
 /// Close the exact scratch identity, even when cancellation wins the race
 /// with staging. Physical disposal stays with the cell's ordinary reaper.
@@ -384,7 +402,11 @@ async fn copy_checkpoint(
         objects.push(staged);
     }
     // The final stage receipt binds the exact inventory under this root.
-    let inventory = encode(&objects)?;
+    let inventory = match capture.format {
+        CheckpointContents::Primary => StageInventory::Primary(objects),
+        CheckpointContents::Replay => StageInventory::Replay { objects },
+    };
+    let inventory = encode(&inventory)?;
     let digest = digest(&inventory);
     put_exact(&destination, &manifest_name, inventory).await?;
     let observed = destination

@@ -2470,3 +2470,39 @@ The fixture with journal custody is 306 bytes with its receipt.
 The receipt authenticates logical bytes under the SHA-256 premise and assumes directory writers preserve the receipt and startup hold fields.
 The startup guarantee covers the metadata root and existing replay suffix for ordinary receipt-bearing opens.
 Complete physical dependency closure, exact provider deletion authorization and the corresponding holds for legacy and archived recovery remain open.
+
+=== Replay dependency closure for archives and independent forks
+
+The copy path derives its inventory from the decoded checkpoint root and its registered table blocks.
+When the root carries table digests, the copy verifies them before interpreting any table dependency.
+It also checks that the fresh root and table bytes it copies are the bytes it used during discovery.
+The independent fork keeps the verified root bytes it already read.
+New receipts include live and nascent trie payloads, retained level-zero payloads and recorded usable artefacts.
+The inventory coalesces paths, so a search file shared by group members is copied once.
+Archive and stage readers retain the original primary inventory semantics for older receipts.
+The archive verifies the copied contents before publishing its receipt, and an independent fork writes its root after the members.
+
+TLC revision `bc1b506` explored all 264 states for one root, two possible table observations, five payload paths and one source artefact disappearance.
+Five weakened transitions violated the declared invariant.
+The reachability witness copied the artefact before its disappearance and still published a complete destination.
+Apalache 0.63.0 confirmed the bounded baseline through ten transitions and found counterexamples for changed copied metadata and an omitted artefact.
+The records are under `/private/tmp/rtdb-formal.QMjPSJsX/checkpoint-replay-closure-models-fdmx96rb/`. link:../tla/CheckpointReplayClosure.tla[State machine]
+Lean 4.36.0 checked four theorems about the required inventory over arbitrary finite lists of normalized trie entries.
+Removing retained input or artefact inclusion failed at the corresponding membership law.
+The records are under `/private/tmp/rtdb-formal.QMjPSJsX/checkpoint-replay-closure-lean-vcxsi_kl/`. link:../lean/CheckpointReplayClosure.lean[Membership theorems]
+
+On parent `4ff84793f` with these changes, the affected Rust selections passed 317 cases, including 96 hosted cell cases.
+One optional test was ignored.
+The log is `/private/tmp/rtdb-formal.QMjPSJsX/checkpoint-replay-closure-4ff-rust-retry.log`.
+Four focused Rust replays passed. Five controls failed at the named assertions for retained input, shared artefact inclusion, table binding, archive inventory and fork publication order.
+Both existing table-manifest replays also passed after sharing the matching predicate, with three controls failing at their named assertions.
+The per-case records are under `/private/tmp/rtdb-formal.QMjPSJsX/checkpoint-replay-closure-native-gl2av9h8/`.
+The combined run passed all 36 existing Verus area baselines and matched all 181 controls.
+The records are under `/private/tmp/rtdb-formal.QMjPSJsX/checkpoint-replay-closure-verus-z7szj0bt/`.
+The standard JVM suite passed 3,198 cases across nine tasks on the same tree, with no failures or skips.
+It used the rebuilt FFI library, SHA-256 `b96405a211f4ec36097ae0ef6d517da721697db110884a45b9e5323353bdad84`.
+The log is `/private/tmp/rtdb-formal.QMjPSJsX/checkpoint-replay-closure-4ff-jvm.log`.
+
+This checks completeness of a successful copy against the logical catalog.
+Payload bytes rely on the immutable-object contract. Source availability through retries still needs the exact publication holds in R5.
+The existing archive byte limit now applies to the larger replay inventory, so a checkpoint can exceed the limit when retained inputs accumulate.

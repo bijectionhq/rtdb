@@ -1453,6 +1453,13 @@ Cold startup uses the admitted receipt for its root selection and validates a fr
 The same startup registration protects the catalog metadata and first required replica offset until the prepared cursor takes over.
 Lean checks preservation through finite schedules under the abstract effect guards, and the bounded model checks the joint admission and handoff.
 Verus checks the exact first-required-offset rule.
+New hosted archives and independent forks derive a replay inventory from the root's checked table metadata.
+It includes data and metadata for usable tries and retained level-zero replay inputs, plus the artefacts recorded by usable members.
+A shared artefact appears once under its group key.
+A copy checks the metadata again against the bytes used for discovery and publishes only after copying the required files.
+Archive receipts and staged inventories carry the scope used to derive them. Existing receipts preserve their original primary scope.
+Lean checks inventory membership over arbitrary finite catalogues. TLC and Apalache cover copy ordering, replaced metadata and source availability in the bounded model.
+The running-system cases check archive and independent-fork copies with retained level-zero files and a shared group artefact.
 The native memory-provider run selects a later checkpoint and replays its retained suffix with the cursor admitted during startup.
 TLC checks cursor admission, reuse and strict progress before refusal and reaches a state with later trimming after admission.
 mCRL2 checks the observable results of the staged discovery model against the atomic contract for three reported indices.
