@@ -236,3 +236,11 @@ A handle expires after at most 60 seconds or if its storage lease or holder is l
 A concurrent commit that prevents capture of the exact reserved head refuses the open with `rtdb.owned/capture-raced`.
 After holder movement or lease loss, open a new authenticated session and start a new attempt.
 The held read uses the serving node's retained catalog and does not survive a process restart.
+
+`rtdb.owned.DeclarePath.v1` uses the relation prefix and a terminated Arrow IPC stream with exactly one row.
+Its two columns are `_id: Utf8` for the path name and `columns: List<Utf8>` for the ordered key columns.
+The key consists of distinct stored columns and ends with `_id`.
+The relation must already exist in the authenticated owner's namespace.
+A successful declaration returns the same transaction-key Arrow row as Create.
+The declaration is immutable and private to the owner's index catalog.
+Index maintenance builds the generation after declaration.

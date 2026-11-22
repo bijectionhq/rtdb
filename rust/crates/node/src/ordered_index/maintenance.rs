@@ -53,7 +53,7 @@ impl OrderedIndexMaintenance {
         let now = snapshot
             .tx_basis()
             .map_or_else(|| self.clock.now(), |basis| basis.system_time);
-        let active = definitions(
+        let mut active = definitions(
             &self.database,
             snapshot,
             &self.storage,
@@ -62,6 +62,9 @@ impl OrderedIndexMaintenance {
             cancellation,
         )
         .await?;
+        active.extend(super::owned_definitions(
+            &self.database, snapshot, &self.storage, &self.memory, now.into(), cancellation,
+        ).await?);
         let directories = active
             .iter()
             .map(Definition::directory)

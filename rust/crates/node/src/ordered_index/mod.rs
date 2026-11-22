@@ -106,8 +106,40 @@ async fn definitions(
         clamp_valid_time: false, iids: None, predicates: Vec::new(),
         top_k: None, ordered_top_k: None, matches: Vec::new(),
     })?;
-    let mut cursor = PreparedQuery::new_in(Arc::new(scan), memory)?
+    let cursor = PreparedQuery::new_in(Arc::new(scan), memory)?
         .execute_columns(context, Vec::new()).await?;
+    read_definitions(cursor).await
+}
+
+async fn owned_definitions(
+    database: &str, snapshot: &Snapshot, storage: &Arc<BufferPool>, memory: &Arc<MemoryBudget>,
+    now: Instant, cancellation: &CancellationToken,
+) -> Result<Vec<Definition>> {
+    let owned_catalogs: Vec<_> = snapshot.tables().into_iter().filter(TableRef::is_owned_path_catalog).collect();
+    if owned_catalogs.is_empty() { return Ok(Vec::new()); }
+    let catalog = CatalogSnapshot::new(database, BTreeMap::from([(
+        database.to_owned(), DatabaseSnapshot { partitions: vec![snapshot.clone()], storage: Arc::clone(storage) },
+    )]), false)?;
+    let context = QueryContext::new(catalog, Arc::clone(memory), now, "UTC", QueryOptions::default(), cancellation)?;
+    let mut definitions = Vec::new();
+    for table in owned_catalogs {
+        if let Some(cursor) = rtdb_query::open_owned_path_catalog(Arc::clone(&context), &table, None).await? {
+            let owner = &table.table[..64];
+            for definition in read_definitions(cursor).await? {
+                if !definition.table.supported_owned_name() || definition.table.is_owned_path_catalog()
+                    || !definition.table.table.starts_with(owner)
+                {
+                    return Err(format_error("Owned path definition refers to another owner or an internal catalog"));
+                }
+                definitions.push(definition);
+            }
+        }
+    }
+    definitions.sort();
+    Ok(definitions)
+}
+
+async fn read_definitions(mut cursor: rtdb_query::QueryCursor) -> Result<Vec<Definition>> {
     let mut definitions = Vec::new();
     while let Some(batch) = cursor.next_batch().await? {
         let batch = batch.batch();

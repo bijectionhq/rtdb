@@ -42,7 +42,7 @@ pub struct CatalogSnapshot {
     pub(crate) default_database: String,
     pub(crate) databases: BTreeMap<String, DatabaseSnapshot>,
     transaction_scoped: bool,
-    owned_relation: Option<(QualifiedTable, rtdb_types::EntityId)>,
+    owned_relation: Option<(QualifiedTable, Option<rtdb_types::EntityId>)>,
     owned_read_guard: Option<Arc<dyn Fn() -> Result<()> + Send + Sync>>,
     pub(crate) runtime: Option<Arc<dyn CatalogRuntime>>,
     pub(crate) ordered_indexes: Option<Arc<dyn OrderedIndexInventory>>,
@@ -93,7 +93,7 @@ impl CatalogSnapshot {
         else { rtdb_columnar::execution_type(&field.data_type) }
     }
     pub(crate) fn owned_identity(&self) -> Option<&rtdb_types::EntityId> {
-        self.owned_relation.as_ref().map(|(_, id)| id)
+        self.owned_relation.as_ref().and_then(|(_, id)| id.as_ref())
     }
     pub(crate) fn permits_table(&self, name: &QualifiedTable) -> bool {
         match &self.owned_relation {
@@ -232,7 +232,7 @@ impl QueryContext {
         self
     }
 
-    pub(crate) fn for_owned_relation(mut self: Arc<Self>, table: QualifiedTable, id: rtdb_types::EntityId) -> Arc<Self> {
+    pub(crate) fn for_owned_relation(mut self: Arc<Self>, table: QualifiedTable, id: Option<rtdb_types::EntityId>) -> Arc<Self> {
         let context = Arc::make_mut(&mut self);
         context.catalog.owned_relation = Some((table, id));
         context.catalog.runtime = None;

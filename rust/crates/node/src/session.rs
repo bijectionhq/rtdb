@@ -156,6 +156,9 @@ impl DmlBuffer {
             TxOp::OwnedInsertDocs { relation, .. } | TxOp::OwnedReplaceDocs { relation, .. } => relation.name().len(),
             TxOp::OwnedCheck { relation, id, .. } | TxOp::OwnedDelete { relation, id, .. } => relation.name().len()
                 .checked_add(id.as_value().retained_bytes()?).ok_or_else(allocation_overflow)?,
+            TxOp::OwnedDeclarePath { relation, name, columns } => columns.iter().try_fold(
+                relation.name().len() + name.name().len(), |bytes, column| bytes.checked_add(column.capacity() + 64).ok_or_else(allocation_overflow),
+            )?,
             TxOp::OwnedDeadline { .. } => 0,
             TxOp::Sql { sql, .. } | TxOp::SqlBytes { sql, .. } => sql.capacity(),
             TxOp::InsertDocs { table, .. } | TxOp::PutDocs { table, .. } | TxOp::PutArrowDocs { table, .. } | TxOp::PatchDocs { table, .. } | TxOp::DeleteDocs { table, .. } | TxOp::EraseDocs { table, .. } => table.schema.capacity().checked_add(table.table.capacity()).ok_or_else(allocation_overflow)?,

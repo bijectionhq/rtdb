@@ -24,6 +24,7 @@ use crate::{
     upload, wire,
 };
 
+pub(crate) const DECLARE_OWNED_PATH_V1: &str = "rtdb.owned.DeclarePath.v1";
 pub(crate) const CREATE_OWNED_V1: &str = "rtdb.owned.Create.v1";
 pub(crate) const COMMIT_OWNED_V1: &str = "rtdb.owned.Commit.v1";
 pub(crate) const READ_OWNED_V1: &str = "rtdb.owned.ReadPoint.v1";
@@ -77,6 +78,26 @@ fn require_idle(native: &NativeSession) -> Result<(), Status> {
 }
 
 impl Service {
+    pub(crate) async fn declare_owned_path_action(&self, call: &Call, body: &[u8]) -> Result<ActionResult, Status> {
+        if !self.0.config.owned_native_actions { return Err(unsupported()); }
+        let (relation, arrow) = split_relation(body)?;
+        let batch = request_batch(call, arrow)?;
+        if batch.batch().num_rows() != 1 || batch.batch().num_columns() != 2 {
+            return Err(invalid("Owned path declaration requires one row with _id and columns"));
+        }
+        let (mut rows, _decoded) = upload::documents(batch.batch(), self)?;
+        let row = rows.pop().expect("validated one row");
+        let (Some(Value::Utf8(name)), Some(Value::List(columns))) = (row.get("_id"), row.get("columns")) else {
+            return Err(invalid("Owned path declaration requires a text name and text column list"));
+        };
+        let columns = columns.iter().map(|column| match column {
+            Value::Utf8(column) => Ok(column.clone()),
+            _ => Err(invalid("Owned path key column is not text")),
+        }).collect::<Result<Vec<_>, _>>()?;
+        let name = OwnedRelation::new(name.as_str()).map_err(status)?;
+        self.owned_write_reply(call, vec![TxOp::OwnedDeclarePath { relation, name, columns }]).await
+    }
+
     pub(crate) async fn create_owned_action(&self, call: &Call, body: &[u8]) -> Result<ActionResult, Status> {
         if !self.0.config.owned_native_actions { return Err(unsupported()); }
         let (relation, arrow) = split_relation(body)?;
