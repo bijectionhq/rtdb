@@ -364,10 +364,14 @@ impl HeldCheckpointWorld {
         &self, relation: &OwnedRelation, valid: Timestamp, after: Option<&str>, limit: usize,
     ) -> Result<WorldIdentityPage> {
         self.check_relation(relation)?;
-        if !(1..=128).contains(&limit) || !self.clock_mode().is_writable() { return Err(OwnedWorld::unavailable()); }
+        if !(1..=128).contains(&limit) { return Err(OwnedWorld::unavailable()); }
         let witness = self.open.snapshot.world_relation_witnesses(self.open.record.id, [relation])
             .await?.pop().ok_or_else(OwnedWorld::unavailable)?;
         self.require_overlay_coverage(relation, &witness).await?;
+        if !self.clock_mode().is_writable() {
+            self.check_relation(relation)?;
+            return Ok(WorldIdentityPage { keys: Vec::new(), more: false, reservations: Vec::new() });
+        }
         let candidates = self.open.snapshot.world_identity_candidates(
             self.open.record.id, relation, valid, after, limit + 1,
         ).await?;
