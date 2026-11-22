@@ -34,6 +34,7 @@ pub struct WorldPoint<'a> {
 pub struct WorldPointResult {
     pub present: Timestamp,
     pub row: Option<WorldPointRow>,
+    pub shadowed: bool,
     pub witness: Option<OwnedWorldPointWitness>,
 }
 
@@ -53,6 +54,7 @@ pub struct WorldIdentityPage {
 /// A verified live cut and its already admitted archived parent.
 pub trait OwnedWorldRead: Send + Sync {
     fn present(&self) -> Timestamp;
+    fn parent_basis(&self) -> TransactionKey;
     fn check_relation(&self, relation: &OwnedRelation) -> Result<()>;
     fn check(&self) -> Result<()>;
     fn close(&self);

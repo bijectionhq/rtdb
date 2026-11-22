@@ -368,6 +368,7 @@ pub(crate) async fn commit_checkpoint_world_checked(
 pub struct WorldPoint {
     pub present: TransactionKey,
     pub fact: Option<WorldFact>,
+    pub(crate) shadowed: bool,
     pub(crate) witness: Option<OwnedWorldPointWitness>,
 }
 
@@ -495,7 +496,7 @@ pub async fn read_checkpoint_world_point(
     if let Some(fact) = local {
         open.check()?;
         open.snapshot.check_relation(relation)?;
-        return Ok(WorldPoint { present, fact, witness: None });
+        return Ok(WorldPoint { present, fact, shadowed: true, witness: None });
     }
     open.snapshot.check_point_purge_floor(relation, id, open.retained.basis.system_time).await?;
     let guard = open.snapshot.relation_release_guard([relation])?;
@@ -509,5 +510,5 @@ pub async fn read_checkpoint_world_point(
     let fact = decode_point(batches.unwrap_or_default(), id, memory)?;
     open.check()?;
     open.snapshot.check_relation(relation)?;
-    Ok(WorldPoint { present, fact, witness: None })
+    Ok(WorldPoint { present, fact, shadowed: false, witness: None })
 }
