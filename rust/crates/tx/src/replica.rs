@@ -44,9 +44,9 @@ pub fn decode_replica(message: &ResolvedTx, predecessor: Option<TransactionKey>,
             if !table.supported_owned_name() {
                 return Err(invalid("Unknown owned relation policy or invalid owned relation name"));
             }
-            let namespace = &physical_name[..64];
+            let namespace = (&physical_name[..64], table.owned_world_scope());
             if owned_namespace.is_some_and(|seen| seen != namespace) {
-                return Err(invalid("Resolved transaction writes more than one owner namespace"));
+                return Err(invalid("Resolved transaction writes more than one owner or world scope"));
             }
             owned_namespace = Some(namespace);
         }

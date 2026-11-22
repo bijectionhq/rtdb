@@ -805,3 +805,50 @@ async fn declared_owned_schema_distinguishes_omission_and_null_after_source_deco
     assert_eq!(refused.result().error().unwrap().code, "rtdb.owned/nonconforming");
     assert!(!refused.writes().tables().contains_key(&relation.table("owner")));
 }
+
+#[tokio::test]
+async fn owned_world_rows_require_the_ordered_registration_and_cannot_mix_with_root() {
+    use rtdb_format::envelope::SourceMessage;
+    use rtdb_types::{EntityId, Iid, OwnedRelation, OwnedWorld, TransactionKey, TxId, WorldShadow};
+    let context = context();
+    let state = PartitionState::empty(Default::default()).unwrap();
+    let world = OwnedWorld {
+        id: Iid([8; 16]), capture: Iid([9; 16]), manifest: "a".repeat(43),
+        basis: TransactionKey { tx_id: TxId(0), system_time: Timestamp(10) }, until: Timestamp(104),
+    };
+    let root = OwnedRelation::new("orders").unwrap();
+    let local = root.in_world(world.id).unwrap();
+    assert_ne!(local.table("owner"), root.table("owner"));
+    assert!(OwnedRelation::new(local.name()).is_err());
+    let source = |operations| {
+        let request = SourceTransaction::new(
+            operations, SubmitOptions { user: Some("owner".into()), ..SubmitOptions::default() }, &context.memory,
+        ).unwrap();
+        let encoded = request.encode().unwrap();
+        let message = SourceMessage::decode(encoded.as_slice()).unwrap().unwrap();
+        SourceTransaction::decode(&message, &context.memory).unwrap()
+    };
+    let replace = |relation| TxOp::OwnedReplaceDocs {
+        relation, documents: Documents::new(vec![WorldShadow::Deleted.record(&EntityId::Integer(1))], &context.memory).unwrap(),
+        valid_from: None, valid_to: None,
+    };
+    let mut resolver = TxResolver::new(None, SourcePosition(-1), None, &context.memory).unwrap();
+    let missing = resolver.resolve_source(state.snapshot(), SourcePosition(0), Timestamp(100),
+        source(vec![replace(local.clone())]), &context).await.unwrap();
+    assert_eq!(missing.result().error().unwrap().code, "rtdb.world/unavailable");
+    let declared = resolver.resolve_source(state.snapshot(), SourcePosition(1), Timestamp(101),
+        source(vec![TxOp::OwnedInsertDocs { relation: OwnedRelation::world_catalog(),
+            documents: Documents::new(vec![world.record()], &context.memory).unwrap(), valid_from: None, valid_to: None }]), &context).await.unwrap();
+    assert!(declared.result().committed());
+    let mixed = resolver.resolve_source(state.snapshot(), SourcePosition(2), Timestamp(102),
+        source(vec![replace(local.clone()), replace(root.clone())]), &context).await.unwrap();
+    assert_eq!(mixed.result().error().unwrap().code, "rtdb.world/unavailable");
+    let accepted = resolver.resolve_source(state.snapshot(), SourcePosition(3), Timestamp(103),
+        source(vec![replace(local.clone())]), &context).await.unwrap();
+    assert!(accepted.result().committed());
+    assert!(accepted.writes().tables().contains_key(&local.table("owner")));
+    assert!(!accepted.writes().tables().contains_key(&root.table("owner")));
+    let expired = resolver.resolve_source(state.snapshot(), SourcePosition(4), Timestamp(104),
+        source(vec![replace(local)]), &context).await.unwrap();
+    assert_eq!(expired.result().error().unwrap().code, "rtdb.world/unavailable");
+}

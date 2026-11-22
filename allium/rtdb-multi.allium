@@ -1332,6 +1332,12 @@ rule ConsumeIntake {
 -- Opening a point read requires a published root digest and an admission in the capture's original retention inventory.
 -- The admission holds until the query cursor and its archive I/O drain.
 -- The read loads only the checkpoint closure, with no replay of the serving tail.
+-- A writable checkpoint world durably pins that capture before ordering its owner-scoped registration.
+-- A world opens against an authenticated attachment when the durable pin and ordered registration name the same cut and remain live.
+-- Child writes are confined to one world, and the ordered resolver checks that world's expiry before applying any writes.
+-- A world point checks the complete local identity, returns a local replacement, or obeys a local tombstone.
+-- If no local version exists the point reads its archived parent cut.
+-- While a world is retained the archive retirement fence cannot close its capture.
 ------------------------------------------------------------
 
 rule FlushOnTailBudget {

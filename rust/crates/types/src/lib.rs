@@ -29,6 +29,8 @@ mod utf8;
 mod version;
 mod object_sort;
 mod owned_schema;
+mod owned_world;
+pub use owned_world::{OwnedWorld, WorldShadow};
 pub use owned_schema::OwnedSchema;
 mod memory;
 mod allocation;

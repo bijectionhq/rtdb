@@ -27,6 +27,16 @@ pub(crate) enum Operation {
 }
 
 impl Operation {
+    pub(crate) fn owned_relation(&self) -> Option<&rtdb_types::OwnedRelation> {
+        match self {
+            Self::Public(TxOp::OwnedDeclareRelation { relation, .. } | TxOp::OwnedDeclarePath { relation, .. }
+                | TxOp::OwnedDeclareSearchPath { relation, .. } | TxOp::OwnedCheck { relation, .. }
+                | TxOp::OwnedDelete { relation, .. } | TxOp::OwnedInsertDocs { relation, .. }
+                | TxOp::OwnedReplaceDocs { relation, .. }) | Self::OwnedWriteIids { relation, .. } => Some(relation),
+            _ => None,
+        }
+    }
+
     pub(crate) fn is_owned(&self) -> bool {
         match self { Self::Public(operation) => operation.is_owned(), Self::OwnedWriteIids { .. } => true, _ => false }
     }
@@ -1065,7 +1075,7 @@ impl SourceOperationReader<'_> {
             }
             "rtdb-owned-check-v1" | "rtdb-owned-delete-v1" => {
                 let Value::Utf8(relation) = value("relation")? else { return Err(invalid("Owned operation has no relation")); };
-                let relation = rtdb_types::OwnedRelation::new(relation)?;
+                let relation = rtdb_types::OwnedRelation::from_source(relation)?;
                 let id = value("id")?.entity_id()?;
                 if name == "rtdb-owned-check-v1" {
                     let Value::I64(valid_at) = value("valid_at")? else { return Err(invalid("Owned observation has no valid instant")); };
@@ -1088,7 +1098,7 @@ impl SourceOperationReader<'_> {
                 let docs_array = body.column_by_name("documents").ok_or_else(|| invalid("Document operation has no documents"))?;
                 let docs_union = docs_array.as_any().downcast_ref::<UnionArray>().ok_or_else(|| invalid("Document tables are not a union"))?;
                 let (table, docs_array, docs_offset) = union_leg(docs_union, offset)?;
-                let owned = matches!(name.as_str(), "rtdb-owned-insert-v1" | "rtdb-owned-replace-v1").then(|| rtdb_types::OwnedRelation::new(table.clone())).transpose()?;
+                let owned = matches!(name.as_str(), "rtdb-owned-insert-v1" | "rtdb-owned-replace-v1").then(|| rtdb_types::OwnedRelation::from_source(table.clone())).transpose()?;
                 let table = if owned.is_none() { Some(parse_table(&table)?) } else { None };
                 let lists = docs_array.as_any().downcast_ref::<ListArray>().ok_or_else(|| invalid("Documents are not a list"))?;
                 if lists.is_null(docs_offset) { return Err(invalid("Documents are not a list")); }

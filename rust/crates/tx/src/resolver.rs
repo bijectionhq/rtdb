@@ -668,6 +668,7 @@ impl<'a> OpenTransaction<'a> {
     }
     async fn declare_owned_relation(&mut self, relation: &rtdb_types::OwnedRelation, schema: &rtdb_types::OwnedSchema) -> Result<()> {
         let owner = self.options.user.as_deref().filter(|owner| !owner.is_empty()).ok_or_else(no_owned_principal)?;
+        if relation.world().is_some() || relation.is_world_catalog() { return Err(rtdb_types::OwnedWorld::unavailable()); }
         if self.snapshot()?.contains_table(&relation.table(owner))
             || self.read_owned_schema(owner, relation).await?.is_some()
         {
@@ -712,6 +713,7 @@ impl<'a> OpenTransaction<'a> {
         columns: &[String], search: bool,
     ) -> Result<()> {
         let owner = self.options.user.as_deref().filter(|owner| !owner.is_empty()).ok_or_else(no_owned_principal)?;
+        if relation.world().is_some() || relation.is_world_catalog() { return Err(rtdb_types::OwnedWorld::unavailable()); }
         let target = relation.table(owner);
         let catalog = if search { rtdb_types::OwnedRelation::search_catalog(owner) } else { rtdb_types::OwnedRelation::path_catalog(owner) };
         let declaration = self.read_owned_schema(owner, relation).await?;
@@ -775,6 +777,21 @@ impl<'a> OpenTransaction<'a> {
                 }
             }
         }
+        let unavailable = rtdb_types::OwnedWorld::unavailable;
+        let mut scoped = operations.iter().filter_map(Operation::owned_relation);
+        if let Some(first) = scoped.next() {
+            let world = first.world();
+            if scoped.any(|relation| relation.world() != world || relation.is_world_catalog() != first.is_world_catalog()) {
+                return Err(unavailable());
+            }
+            if let Some(world) = world {
+                let context = self.context.query_context(self.snapshot()?, self.tx_key().system_time, &self.options.default_tz, self.trace_parent)?;
+                let record = rtdb_query::read_owned_world(context, owner, world).await?.ok_or_else(unavailable)?;
+                if self.tx_key().system_time >= record.until {
+                    return Err(unavailable());
+                }
+            }
+        }
         if deadline.is_some_and(|until| self.tx_key().system_time >= until) {
             return Err(Anomaly::new(AnomalyCategory::Conflict, "rtdb.owned/expired", "Owned transaction reached its deadline before ordering"));
         }
@@ -809,6 +826,7 @@ impl<'a> OpenTransaction<'a> {
     async fn delete_owned(&mut self, relation: &rtdb_types::OwnedRelation, id: &rtdb_types::EntityId, from: Option<Timestamp>, to: Option<Timestamp>) -> Result<()> {
         let options = self.options;
         let owner = options.user.as_deref().filter(|owner| !owner.is_empty()).ok_or_else(no_owned_principal)?;
+        if relation.world().is_some() || relation.is_world_catalog() { return Err(rtdb_types::OwnedWorld::unavailable()); }
         let valid = interval(from.unwrap_or(self.tx_key().system_time), to.unwrap_or(Timestamp::MAX))?;
         self.read_owned_revision(owner, relation, id, Interval::ALL).await?;
         self.buffer.delete(relation.table(owner), id, valid)
@@ -827,6 +845,30 @@ impl<'a> OpenTransaction<'a> {
                     return Err(Anomaly::incorrect("xtdb/invalid-iids", "Owned document IID does not match its identity"));
                 }
             }
+        }
+        if relation.is_world_catalog() {
+            if !create_only || from.is_some() || to.is_some() || documents.rows().len() != 1
+                || !documents.has_exact_presence()
+            {
+                return Err(rtdb_types::OwnedWorld::unavailable());
+            }
+            let record = rtdb_types::OwnedWorld::from_record(&documents.rows()[0])?;
+            let ordered = self.tx_key().system_time;
+            if record.basis.system_time >= ordered || record.until <= ordered {
+                return Err(rtdb_types::OwnedWorld::unavailable());
+            }
+            return self.put_documents(&table, documents, iids, Some(Timestamp::MIN), Some(Timestamp::MAX),
+                DocumentWrite::Owned { relation, owner, create_only }).await;
+        }
+        if let Some(root) = relation.root_relation() {
+            if create_only || from.is_some() || to.is_some() || !documents.has_exact_presence()
+                || self.read_owned_schema(owner, &root).await?.is_some()
+            {
+                return Err(rtdb_types::OwnedWorld::unavailable());
+            }
+            for row in documents.rows() { rtdb_types::WorldShadow::validate_record(row)?; }
+            return self.put_documents(&table, documents, iids, Some(Timestamp::MIN), Some(Timestamp::MAX),
+                DocumentWrite::Owned { relation, owner, create_only }).await;
         }
         if let Some((schema, _retained)) = self.read_owned_schema(owner, relation).await? {
             if !documents.has_exact_presence() {

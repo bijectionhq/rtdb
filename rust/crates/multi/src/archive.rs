@@ -75,6 +75,8 @@ pub use stage::stage_checkpoint;
 pub(crate) use stage::discard_checkpoint_stage;
 mod retirement;
 mod read_world;
+mod writable_world;
+pub use writable_world::{WorldFact, commit_checkpoint_world, fork_checkpoint_world, read_checkpoint_world_point};
 pub use read_world::{CheckpointPoint, CheckpointReadResources, CheckpointReadWorld, read_checkpoint_owned_point};
 pub(crate) use retirement::{finish_capture_retirement, require_capture_open, retire_capture};
 pub use reader::{StagedReaderSettings, serve_staged_checkpoint};
@@ -1294,6 +1296,9 @@ pub(crate) async fn begin_retirement_at(
         }
         if record.lifecycle != Lifecycle::Deleted || record.disposal.is_none() {
             return Err(inconsistent("Recovery retirement requires a serving disposal receipt"));
+        }
+        if record.checkpoint_worlds.values().any(|world| world.until.0 > rtdb_directory::now_ms().saturating_mul(1000)) {
+            return Err(unavailable("A live world still retains an archived checkpoint"));
         }
         if record.checkpoint_capture_retirements.values().any(|release| release.observed_empty_at_ms.is_none()) {
             return Err(unavailable("An individual checkpoint release is still pending"));

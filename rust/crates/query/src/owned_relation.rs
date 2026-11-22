@@ -114,3 +114,36 @@ pub async fn open_owned_path_catalog(
     let query = PreparedQuery::new_in(scan, &context.memory)?;
     query.execute(context, Vec::new()).await.map(Some)
 }
+
+pub async fn read_owned_world(
+    context: Arc<QueryContext>, owner: &str, world: rtdb_types::Iid,
+) -> Result<Option<rtdb_types::OwnedWorld>> {
+    use rtdb_types::{OwnedWorld, StructFields};
+
+    let memory = Arc::clone(&context.memory);
+    let id = EntityId::Uuid(world.0);
+    let names = ["_id", "capture", "manifest", "basis_id", "basis_time", "until"];
+    let Some(mut cursor) = open_owned_point(
+        context, owner, &OwnedRelation::world_catalog(), &id, None, Some(&names),
+    ).await? else { return Ok(None); };
+    let mut record = None;
+    while let Some(batch) = cursor.next_batch().await? {
+        let batch = batch.batch();
+        for row in 0..batch.num_rows() {
+            if record.is_some() { return Err(OwnedWorld::unavailable()); }
+            let mut fields = StructFields::new();
+            let mut reservations = Vec::new();
+            for name in names {
+                let (index, field) = batch.schema_ref().column_with_name(name).ok_or_else(OwnedWorld::unavailable)?;
+                let values = batch.column(index).as_ref();
+                let size = rtdb_columnar::estimate_read_value_bytes(field, values, row)?;
+                reservations.push(memory.reserve(size)?);
+                fields.insert(name.into(), rtdb_columnar::read_value(field, values, row)?);
+            }
+            let decoded = OwnedWorld::from_record(&fields)?;
+            if decoded.id != world { return Err(OwnedWorld::unavailable()); }
+            record = Some(decoded);
+        }
+    }
+    Ok(record)
+}
