@@ -708,6 +708,18 @@ fn verify_cut(catalog: &BlockCatalog, checkpoint: Checkpoint, epoch: StorageEpoc
 }
 
 type CheckpointObjects = BTreeMap<ObjectKey, Option<[u8; 32]>>;
+const OBSERVATION_BATCH_MEMBERS: usize = 256;
+
+async fn observe_checkpoint_batch(
+    store: &dyn ObjectStore, batch: Vec<(ObjectKey, Option<[u8; 32]>)>,
+) -> Result<Vec<CheckpointCopySource>> {
+    let names = batch.iter().map(|(name, _)| name.clone()).collect::<Vec<_>>();
+    let mut heads = store.observe_heads(&names).await?;
+    batch.into_iter().map(|(name, digest)| {
+        let head = heads.remove(&name).ok_or_else(|| inconsistent("A checkpoint inventory member has no storage observation"))?;
+        CheckpointCopySource::from_head(name, digest, head)
+    }).collect()
+}
 
 fn require_bound_metadata(expected: Option<[u8; 32]>, bytes: &[u8]) -> Result<()> {
     if expected.is_some_and(|expected| publication_digest(bytes) != expected) {
@@ -761,18 +773,12 @@ pub(crate) async fn recovery_manifest_sha256(
     manifest.update(b"rtdb/recovery-manifest/v1\0");
     manifest.update(&encode(&(root, epoch.0, first_required))?);
     loop {
-        let batch = closure.by_ref().take(256).collect::<Vec<_>>();
+        let batch = closure.by_ref().take(OBSERVATION_BATCH_MEMBERS).collect::<Vec<_>>();
         if batch.is_empty() { break; }
-        let names = batch.iter().map(|(name, _)| name.clone()).collect::<Vec<_>>();
-        let mut heads = store.observe_heads(&names).await?;
-        let observations = futures::stream::iter(batch.into_iter().map(|(name, digest)| {
-            let head = heads.remove(&name);
-            async move {
-                let head = head.ok_or_else(|| inconsistent("A recovery inventory member has no storage observation"))?;
-                let source = CheckpointCopySource::from_head(name, digest, head)?;
-                if digest.is_some() { source.read(store).await?; }
-                encode(&(source.name.as_str(), source.logical_bytes as u64, source.version, digest))
-            }
+        let members = observe_checkpoint_batch(store, batch).await?;
+        let observations = futures::stream::iter(members.into_iter().map(|source| async move {
+            if source.metadata_digest.is_some() { source.read(store).await?; }
+            encode(&(source.name.as_str(), source.logical_bytes as u64, source.version, source.metadata_digest))
         })).buffered(16);
         futures::pin_mut!(observations);
         while let Some(member) = observations.try_next().await? { manifest.update(&member); }
@@ -826,14 +832,18 @@ async fn plan_checkpoint_copy(
     mut archive_budget: Option<u64>,
 ) -> Result<Vec<CheckpointCopySource>> {
     let mut sources = Vec::with_capacity(closure.len());
-    for (name, digest) in closure {
-        let source = CheckpointCopySource::observe(store, name, digest).await?;
-        if let Some(remaining) = &mut archive_budget {
-            *remaining = crate::checkpoint_copy_budget::remaining_after_sealing(
-                *remaining, source.logical_bytes as u64, crate::cipher::SEALED_OVERHEAD as u64,
-            ).ok_or_else(|| unavailable("Checkpoint exceeds the archive byte budget"))?;
+    let mut closure = closure.into_iter();
+    loop {
+        let batch = closure.by_ref().take(OBSERVATION_BATCH_MEMBERS).collect::<Vec<_>>();
+        if batch.is_empty() { break; }
+        for source in observe_checkpoint_batch(store, batch).await? {
+            if let Some(remaining) = &mut archive_budget {
+                *remaining = crate::checkpoint_copy_budget::remaining_after_sealing(
+                    *remaining, source.logical_bytes as u64, crate::cipher::SEALED_OVERHEAD as u64,
+                ).ok_or_else(|| unavailable("Checkpoint exceeds the archive byte budget"))?;
+            }
+            sources.push(source);
         }
-        sources.push(source);
     }
     Ok(sources)
 }
@@ -1704,6 +1714,22 @@ mod tests {
             store.put(&required, fixture.files[&required].clone()).await?;
         }
         assert_ne!(recovery_manifest_sha256(&store, checkpoint, epoch).await?, published);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_checkpoint_copy_plan_shares_a_pack_observation() -> Result<()> {
+        let raw = Arc::new(crate::packing::tests::VersionedPacks::default());
+        let store = crate::packing::PackingStore::open(raw.clone(), PackDiscovery::List).await?;
+        let root = key(&block_key(BlockIndex(0))?)?;
+        let table = key("tables/t/blocks/b00.binpb")?;
+        store.put(&table, Bytes::from_static(b"table")).await?;
+        store.put(&root, Bytes::from_static(b"root")).await?;
+        let before = raw.head_observations();
+        let plan = plan_checkpoint_copy(store.as_ref(), BTreeMap::from([(root, None), (table, None)]), None).await?;
+        assert_eq!(raw.head_observations() - before, 1);
+        assert!(plan[0].version.is_some());
+        assert_eq!(plan[0].version, plan[1].version);
         Ok(())
     }
 

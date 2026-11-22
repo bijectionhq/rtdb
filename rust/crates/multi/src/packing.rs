@@ -534,6 +534,10 @@ pub(crate) mod tests {
     }
 
     impl VersionedPacks {
+        pub(crate) fn head_observations(&self) -> usize {
+            self.heads.load(std::sync::atomic::Ordering::Relaxed)
+        }
+
         fn version(&self, key: &ObjectKey) -> PhysicalObjectVersion {
             let version = self.versions.lock()[key];
             PhysicalObjectVersion {
