@@ -31,7 +31,7 @@ impl Operation {
         match self {
             Self::Public(TxOp::OwnedDeclareRelation { relation, .. } | TxOp::OwnedDeclarePath { relation, .. }
                 | TxOp::OwnedDeclareSearchPath { relation, .. } | TxOp::OwnedDeclareUniquePath { relation, .. }
-                | TxOp::OwnedDeclareCapacity { relation, .. } | TxOp::OwnedCheckRange { relation, .. } | TxOp::OwnedCheck { relation, .. }
+                | TxOp::OwnedDeclareFixedRange { relation, .. } | TxOp::OwnedDeclareCapacity { relation, .. } | TxOp::OwnedCheckRange { relation, .. } | TxOp::OwnedCheck { relation, .. }
                 | TxOp::OwnedDelete { relation, .. } | TxOp::OwnedInsertDocs { relation, .. }
                 | TxOp::OwnedReplaceDocs { relation, .. }) | Self::OwnedWriteIids { relation, .. } => Some(relation),
             _ => None,
@@ -80,7 +80,10 @@ impl SourceTransaction {
                 Operation::Public(TxOp::OwnedDeclarePath { relation, name, columns }) =>
                     (owned_path_bytes(relation, name, columns)?, None, 0),
                 Operation::Public(TxOp::OwnedDeadline { .. }) => (0, None, 0),
-                Operation::Public(TxOp::OwnedCheckRange { relation, .. }) => (relation.name().len(), None, 0),
+                Operation::Public(TxOp::OwnedDeclareFixedRange { relation, rule }) =>
+                    (relation.name().len() + rule.path.capacity() + rule.column.capacity(), None, 0),
+                Operation::Public(TxOp::OwnedCheckRange { relation, fixed, .. }) =>
+                    (range_evidence_bytes(relation, fixed), None, 0),
                 Operation::Public(TxOp::OwnedCheck { relation, id, .. } | TxOp::OwnedDelete { relation, id, .. }) =>
                     (relation.name().len().checked_add(id.as_value().retained_bytes()?).ok_or_else(overflow)?, None, 0),
                 Operation::Public(TxOp::OwnedInsertDocs { relation, .. } | TxOp::OwnedReplaceDocs { relation, .. }) => (relation.name().len(), None, 0),
@@ -303,7 +306,9 @@ impl SourceTransaction {
                 Operation::Public(TxOp::OwnedDeclarePath { relation, name, columns }) =>
                     owned_path_bytes(relation, name, columns)?,
                 Operation::Public(TxOp::OwnedDeadline { .. }) => 0,
-                Operation::Public(TxOp::OwnedCheckRange { relation, .. }) => relation.name().len(),
+                Operation::Public(TxOp::OwnedDeclareFixedRange { relation, rule }) =>
+                    relation.name().len() + rule.path.capacity() + rule.column.capacity(),
+                Operation::Public(TxOp::OwnedCheckRange { relation, fixed, .. }) => range_evidence_bytes(relation, fixed),
                 Operation::Public(TxOp::OwnedCheck { relation, id, .. } | TxOp::OwnedDelete { relation, id, .. }) =>
                     relation.name().len().checked_add(id.as_value().retained_bytes()?).ok_or_else(overflow)?,
                 Operation::Removed(name) => name.capacity(),
@@ -440,14 +445,24 @@ fn operation_value<'a>(operation: &'a Operation, memory: &Arc<MemoryBudget>) -> 
             body.insert("columns".into(), Value::List(columns.iter().cloned().map(Value::Utf8).collect()));
             "rtdb-owned-path-v1"
         }
-        Operation::Public(TxOp::OwnedCheckRange { relation, basis, scope, frontier, until }) => {
+        Operation::Public(TxOp::OwnedDeclareFixedRange { relation, rule }) => {
+            body.insert("relation".into(), Value::Utf8(relation.name().into()));
+            body.insert("rule".into(), rule.to_value());
+            "rtdb-owned-fixed-range-v1"
+        }
+        Operation::Public(TxOp::OwnedCheckRange { relation, basis, scope, frontier, until, fixed }) => {
             body.insert("relation".into(), Value::Utf8(relation.name().into()));
             body.insert("basis_id".into(), Value::I64(basis.tx_id.0));
             body.insert("basis_time".into(), Value::I64(basis.system_time.0));
             body.insert("scope".into(), Value::Binary(scope.encode().to_vec()));
             body.insert("frontier".into(), Value::I64(*frontier));
             body.insert("until".into(), Value::I64(until.0));
-            "rtdb-owned-check-range-v1"
+            if let Some(fixed) = fixed {
+                body.insert("fixed".into(), fixed.to_value());
+                "rtdb-owned-check-range-v2"
+            } else {
+                "rtdb-owned-check-range-v1"
+            }
         }
         Operation::Public(TxOp::OwnedDeadline { until }) => {
             body.insert("until".into(), Value::I64(until.0));
@@ -1062,7 +1077,9 @@ impl SourceOperationReader<'_> {
             "rtdb-owned-capacity-v1" => &["relation", "column", "prefix_bytes", "cap"],
             "rtdb-owned-path-v1" => &["relation", "name", "columns"],
             "rtdb-owned-deadline-v1" => &["until"],
+            "rtdb-owned-fixed-range-v1" => &["relation", "rule"],
             "rtdb-owned-check-range-v1" => &["relation", "basis_id", "basis_time", "scope", "frontier", "until"],
+            "rtdb-owned-check-range-v2" => &["relation", "basis_id", "basis_time", "scope", "frontier", "until", "fixed"],
             "rtdb-owned-check-v1" => &["relation", "id", "valid_at", "expected"],
             "rtdb-owned-delete-v1" => &["relation", "id", "_valid_from", "_valid_to"],
             "rtdb-owned-insert-v1" | "rtdb-owned-replace-v1" => &["iids", "_valid_from", "_valid_to", "field_presence"],
@@ -1112,7 +1129,14 @@ impl SourceOperationReader<'_> {
                 }).collect::<Result<_>>()?;
                 TxOp::OwnedDeclarePath { relation: rtdb_types::OwnedRelation::new(relation)?, name: rtdb_types::OwnedRelation::new(name)?, columns }
             }
-            "rtdb-owned-check-range-v1" => {
+            "rtdb-owned-fixed-range-v1" => {
+                let Value::Utf8(relation) = value("relation")? else { return Err(invalid("Fixed range declaration has no relation")); };
+                TxOp::OwnedDeclareFixedRange {
+                    relation: rtdb_types::OwnedRelation::new(relation)?,
+                    rule: rtdb_types::FixedRangeRule::from_value(&value("rule")?)?,
+                }
+            }
+            "rtdb-owned-check-range-v1" | "rtdb-owned-check-range-v2" => {
                 let (Value::Utf8(relation), Value::I64(basis_id), Value::I64(basis_time),
                     Value::Binary(scope), Value::I64(frontier), Value::I64(until)) =
                     (value("relation")?, value("basis_id")?, value("basis_time")?, value("scope")?, value("frontier")?, value("until")?)
@@ -1122,6 +1146,9 @@ impl SourceOperationReader<'_> {
                     basis: rtdb_types::TransactionKey { tx_id: rtdb_types::TxId(basis_id), system_time: Timestamp(basis_time) },
                     scope: rtdb_types::PlacedAttemptScope::decode(&scope)?,
                     frontier, until: Timestamp(until),
+                    fixed: if name == "rtdb-owned-check-range-v2" {
+                        Some(Arc::new(rtdb_types::FixedRangeEvidence::from_value(&value("fixed")?)?))
+                    } else { None },
                 }
             }
             "rtdb-owned-deadline-v1" => {
@@ -2387,4 +2414,9 @@ mod tests {
         tx.user_metadata = Some(vec![]);
         assert!(SourceTransaction::decode(&message, &memory).unwrap().options.user_metadata.is_none());
     }
+}
+
+
+fn range_evidence_bytes(relation: &rtdb_types::OwnedRelation, fixed: &Option<Arc<rtdb_types::FixedRangeEvidence>>) -> usize {
+    relation.name().len() + fixed.as_ref().map_or(0, |fixed| fixed.retained_bytes())
 }

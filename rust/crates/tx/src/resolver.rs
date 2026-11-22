@@ -19,6 +19,7 @@ use crate::replay_submission::{ReplaySubmission, duplicate_replay, is_replay_tab
 use crate::values::{BoundArgumentRow, IngestMode, plain_scalar_field};
 use crate::{ArrowDocuments, SourceTransaction, SubmitOptions, TransactionResult, TxOp, UserMetadata, source::{Operation, SourceGuard, decode_arguments, is_reserved_write_schema, table_name}};
 
+mod fixed_range;
 mod owned_capacity;
 use owned_capacity::OwnedCapacityChanges;
 mod owned_unique;
@@ -643,6 +644,7 @@ impl<'a> OpenTransaction<'a> {
             Operation::PutArrowIids { table, documents, iids, valid_from, valid_to } => self.put_arrow_documents(table, documents, Some(iids), *valid_from, *valid_to),
             Operation::Public(TxOp::OwnedDeclareRelation { relation, schema }) =>
                 self.declare_owned_relation(relation, schema).await,
+            Operation::Public(TxOp::OwnedDeclareFixedRange { relation, rule }) => self.declare_fixed_range(relation, rule).await,
             Operation::Public(TxOp::OwnedDeclareCapacity { relation, column, prefix_bytes, cap }) =>
                 self.declare_owned_capacity(relation, column, *prefix_bytes, *cap).await,
             Operation::Public(TxOp::OwnedDeclareUniquePath { relation, name, column }) =>
@@ -833,7 +835,7 @@ impl<'a> OpenTransaction<'a> {
             return Err(Anomaly::new(AnomalyCategory::Conflict, "rtdb.owned/expired", "Owned transaction reached its deadline before ordering"));
         }
         for operation in operations {
-            if let Operation::Public(TxOp::OwnedCheckRange { relation, basis, scope, frontier, until }) = operation {
+            if let Operation::Public(TxOp::OwnedCheckRange { relation, basis, scope, frontier, until, fixed }) = operation {
                 let base = self.buffer.base_snapshot();
                 let unavailable = || Anomaly::new(AnomalyCategory::Conflict, "rtdb.owned/range-witness-unavailable",
                     "Owned range witness is no longer admissible");
@@ -845,9 +847,15 @@ impl<'a> OpenTransaction<'a> {
                 {
                     return Err(unavailable());
                 }
-                if base.relation_event_frontier(&relation.table(owner))? != *frontier {
-                    return Err(Anomaly::new(AnomalyCategory::Conflict, "rtdb.owned/stale-range",
-                        "The observed owned relation changed before ordering"));
+                let head = base.relation_event_frontier(&relation.table(owner))?;
+                if head != *frontier {
+                    let exact = if let Some(evidence) = fixed {
+                        self.verify_fixed_range(&base, owner, relation, basis.system_time, *frontier, head, evidence).await.unwrap_or(false)
+                    } else { false };
+                    if !exact {
+                        return Err(Anomaly::new(AnomalyCategory::Conflict, "rtdb.owned/stale-range",
+                            "The observed owned relation changed before ordering"));
+                    }
                 }
                 continue;
             }
@@ -1064,6 +1072,7 @@ impl<'a> OpenTransaction<'a> {
         if self.owned_changes.is_empty() { return Ok(()); }
         let owner = self.options.user.as_deref().filter(|owner| !owner.is_empty()).ok_or_else(no_owned_principal)?;
         let base = self.buffer.base_snapshot();
+        let mut next = None;
         for (name, group) in std::mem::take(&mut self.owned_changes) {
             self.context.check_cancelled()?;
             let relation = OwnedRelation::new(name)?;
@@ -1092,10 +1101,21 @@ impl<'a> OpenTransaction<'a> {
             if revision == i64::MAX {
                 return Err(Anomaly::incorrect("rtdb.owned/change-feed-exhausted", "The owned change feed revision space is exhausted"));
             }
-            let entry = StructFields::from([
+            let rule_table = relation.fixed_range_table(owner);
+            let keys = if base.contains_table(&rule_table) || self.buffer.has_pending_table(&rule_table) {
+                if next.is_none() { next = Some(self.snapshot()?); }
+                self.fixed_range_keys(&base, next.as_ref().expect("captured buffered snapshot"), owner, &relation, &group.touches)
+                    .await.unwrap_or(None)
+            } else { None };
+            self.context.check_cancelled()?;
+            let mut entry = StructFields::from([
                 ("_id".into(), Value::I64(revision)), ("entry".into(), Value::List(group.touches)),
                 ("through_events".into(), Value::I64(through)),
             ]);
+            let _keys_charge = if let Some((keys, charge)) = keys {
+                entry.insert("fixed_keys".into(), keys);
+                Some(charge)
+            } else { None };
             self.buffer.put(journal, entry, Interval::ALL)?;
         }
         Ok(())

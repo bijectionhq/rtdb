@@ -186,6 +186,7 @@ const OWNED_WORLD_PREFIX: &str = ".world-";
 const OWNED_UNIQUE_PREFIX: &str = ".unique-";
 const OWNED_ADDRESS_PREFIX: &str = ".addresses-";
 const OWNED_CAPACITY_PREFIX: &str = ".capacity-";
+const OWNED_FIXED_RANGE_PREFIX: &str = ".fixed-range-";
 const OWNED_CHANGE_PREFIX: &str = ".changes-";
 
 /// A native relation provisioned in the authenticated principal's namespace.
@@ -206,6 +207,8 @@ impl OwnedRelation {
     pub fn table(&self, owner: &str) -> TableRef { owned_table(owner, &self.0) }
 
     pub fn address_table(&self, owner: &str) -> TableRef { owned_table(owner, &format!("{OWNED_ADDRESS_PREFIX}{}", self.0)) }
+
+    pub fn fixed_range_table(&self, owner: &str) -> TableRef { owned_table(owner, &format!("{OWNED_FIXED_RANGE_PREFIX}{}", self.0)) }
 
     pub fn capacity_table(&self, owner: &str) -> TableRef { owned_table(owner, &format!("{OWNED_CAPACITY_PREFIX}{}", self.0)) }
 
@@ -314,6 +317,7 @@ impl TableRef {
                             OwnedRelation::from_source(relation.into()).is_ok_and(|relation| !relation.is_world_catalog())
                         })
                         || name.strip_prefix(OWNED_CAPACITY_PREFIX).is_some_and(|logical| OwnedRelation::new(logical).is_ok())
+                        || name.strip_prefix(OWNED_FIXED_RANGE_PREFIX).is_some_and(|logical| OwnedRelation::new(logical).is_ok())
                         || name.strip_prefix(OWNED_CHANGE_PREFIX).is_some_and(|logical| OwnedRelation::new(logical).is_ok())
                         || OwnedRelation::from_source(name.into()).is_ok())
             })

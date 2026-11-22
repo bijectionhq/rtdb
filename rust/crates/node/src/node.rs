@@ -868,14 +868,21 @@ pub struct OwnedRangeWitness {
     scope: rtdb_types::PlacedAttemptScope,
     frontier: i64,
     until: Timestamp,
+    fixed: Option<Arc<rtdb_types::FixedRangeEvidence>>,
 }
 
 impl OwnedRangeWitness {
     pub fn operation(self) -> TxOp {
         TxOp::OwnedCheckRange {
-            relation: self.relation, basis: self.basis, scope: self.scope, frontier: self.frontier, until: self.until,
+            relation: self.relation, basis: self.basis, scope: self.scope, frontier: self.frontier, until: self.until, fixed: self.fixed,
         }
     }
+
+    pub fn retained_bytes(&self) -> usize {
+        self.fixed.as_ref().map_or(0, |fixed| fixed.retained_bytes())
+    }
+
+    pub fn same_range(&self, other: &Self) -> bool { self.fixed == other.fixed }
 
     pub fn matches_scope(&self, scope: Option<rtdb_types::PlacedAttemptScope>) -> bool {
         Some(self.scope) == scope
@@ -1135,7 +1142,7 @@ impl OwnedReadSession {
         &self, relation: &rtdb_types::OwnedRelation, path: &rtdb_types::OwnedRelation,
         lower: Option<&Value>, upper: Option<&Value>, limit: usize,
     ) -> Result<crate::OwnedRangePage> {
-        self.range_page(relation, path, crate::ordered_index::RowBounds::Leading { lower, upper, limit }).await
+        self.range_page(relation, path, crate::ordered_index::RowBounds::Leading { lower, upper, limit }, None).await
     }
 
     /// Reads in either direction with exclusive full-key continuation at this held cut.
@@ -1143,7 +1150,7 @@ impl OwnedReadSession {
         &self, relation: &rtdb_types::OwnedRelation, path: &rtdb_types::OwnedRelation,
         request: crate::OwnedRangeRequest<'_>,
     ) -> Result<crate::OwnedRangePage> {
-        self.range_page(relation, path, crate::ordered_index::RowBounds::Compound(request)).await
+        self.range_page(relation, path, crate::ordered_index::RowBounds::Compound(request), None).await
     }
 
     /// Issues evidence only after the covering query completed, including a covered empty page.
@@ -1151,8 +1158,21 @@ impl OwnedReadSession {
         &self, relation: &rtdb_types::OwnedRelation, path: &rtdb_types::OwnedRelation,
         request: crate::OwnedRangeRequest<'_>,
     ) -> Result<(crate::OwnedRangePage, Option<OwnedRangeWitness>)> {
-        let page = self.range_page_by_key(relation, path, request).await?;
-        let evidence = self.relation_witness(relation)?;
+        self.range_page_by_key_at_observed(relation, path, request, None).await
+    }
+
+    pub async fn range_page_by_key_at_observed(
+        &self, relation: &rtdb_types::OwnedRelation, path: &rtdb_types::OwnedRelation,
+        request: crate::OwnedRangeRequest<'_>, valid_at: Option<Timestamp>,
+    ) -> Result<(crate::OwnedRangePage, Option<OwnedRangeWitness>)> {
+        let (lower, upper, after) = (request.lower, request.upper, request.after);
+        let page = self.range_page(relation, path, crate::ordered_index::RowBounds::Compound(request), valid_at).await?;
+        let mut evidence = self.relation_witness(relation)?;
+        if let (Some(evidence), Some(valid_at)) = (evidence.as_mut(), valid_at.filter(|_| after.is_none())) {
+            evidence.fixed = self.fixed_range_evidence(relation, path, evidence.frontier, valid_at, lower, upper)
+                .await.unwrap_or(None).map(Arc::new);
+        }
+        self.check()?;
         Ok((page, evidence))
     }
 
@@ -1169,8 +1189,22 @@ impl OwnedReadSession {
         }
         self.check()?;
         Ok(Some(OwnedRangeWitness {
-            relation: relation.clone(), basis: self.present, scope, frontier, until: self.witness_until,
+            relation: relation.clone(), basis: self.present, scope, frontier, until: self.witness_until, fixed: None,
         }))
+    }
+
+    async fn fixed_range_evidence(
+        &self, relation: &rtdb_types::OwnedRelation, path: &rtdb_types::OwnedRelation,
+        frontier: i64, valid_at: Timestamp,
+        lower: Option<&rtdb_types::StructFields<Value>>, upper: Option<&rtdb_types::StructFields<Value>>,
+    ) -> Result<Option<rtdb_types::FixedRangeEvidence>> {
+        use rtdb_types::{FixedRangeEvidence, FixedRangeKey};
+        let rule = rtdb_query::read_owned_fixed_range_rule(Arc::clone(&self.context), &self.owner, relation).await?;
+        let Some(rule) = rule.filter(|rule| rule.valid_at == valid_at && rule.path == path.name()) else { return Ok(None); };
+        let revision = self.covered_range_anchor(relation, frontier).await?;
+        let lower = lower.map(|bound| FixedRangeKey::from_bound(bound, &rule.column)).transpose()?;
+        let upper = upper.map(|bound| FixedRangeKey::from_bound(bound, &rule.column)).transpose()?;
+        Ok(Some(FixedRangeEvidence { rule, revision, lower, upper }))
     }
 
     /// Counts a covered full-key range at this held system cut and an explicit valid instant.
@@ -1195,10 +1229,10 @@ impl OwnedReadSession {
 
     async fn range_page(
         &self, relation: &rtdb_types::OwnedRelation, path: &rtdb_types::OwnedRelation,
-        bounds: crate::ordered_index::RowBounds<'_>,
+        bounds: crate::ordered_index::RowBounds<'_>, valid_at: Option<Timestamp>,
     ) -> Result<crate::OwnedRangePage> {
         self.admit_read().await?;
-        let result = crate::ordered_index::owned_range(Arc::clone(&self.context), &self.owner, relation, path, bounds).await?;
+        let result = crate::ordered_index::owned_range(Arc::clone(&self.context), &self.owner, relation, path, bounds, valid_at).await?;
         self.check()?;
         Ok(result)
     }

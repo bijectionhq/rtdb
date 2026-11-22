@@ -466,3 +466,18 @@ Use the handle with ReadHeldPoint.v1 or ReadHeldPoint.v2 for points in the decla
 The default business-valid time is the selected marker time.
 The derived handle shares the original generation, lease and expiry and may serve requests after the fresh handle is closed.
 It carries no commit evidence.
+
+=== Fixed-valid range observations
+
+`rtdb.owned.DeclareFixedRange.v1` takes the relation prefix and one terminated Arrow IPC batch with one row.
+The fields are `path: Utf8`, `column: Utf8`, and `valid_micros: Int64`.
+Declare the relation's schema first and the fixed range before its first fact event.
+This declares one immutable path on the authored Binary column followed by the full native Utf8 `_id`, and returns the usual transaction-key row.
+The maximum timestamp cannot be used as a valid instant.
+
+`rtdb.owned.ReadHeldRange.v3` adds a seventh `valid_micros: Int64` field to v2.
+It traverses the covered path at that valid instant on the held system cut and uses the same handle and witness nonce in Commit.v3.
+When the declaration and valid instant match and `after` is absent, the exact witness protects the full requested half-open span, including a covered empty result and the unreturned part of a capped page.
+The ordered resolver validates both old and new full keys through at most 64 intervening dense journal groups.
+A group omits exact sides when its relevant IDs or keys fall outside the supported type or byte limits, or when its evidence could not be captured.
+The relation-frontier check still applies to moving-valid reads, continuation reads, and reads whose exact witness or intervening coverage is unavailable.
