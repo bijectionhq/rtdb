@@ -286,8 +286,8 @@ async fn owned_native_relations_are_scoped_to_the_durable_principal() {
     let first = owner.state_mut().execute_tx(vec![insert(10)], options.clone()).await.unwrap();
     assert!(first.committed(), "{:?}", first.error());
     let id = EntityId::Integer(1);
-    assert_eq!(rows(owner.open_owned_point(&relation, &id).await.unwrap().1.unwrap()).await[0][..2], [Value::I64(1), Value::I64(10)]);
-    assert!(other.open_owned_point(&relation, &id).await.unwrap().1.is_none());
+    assert_eq!(rows(owner.open_owned_read().await.unwrap().open_point(&relation, &id).await.unwrap().unwrap()).await[0][..2], [Value::I64(1), Value::I64(10)]);
+    assert!(other.open_owned_read().await.unwrap().open_point(&relation, &id).await.unwrap().is_none());
 
     let physical = relation.table("xtdb");
     let raw = TxOp::PutDocs {
@@ -308,9 +308,44 @@ async fn owned_native_relations_are_scoped_to_the_durable_principal() {
     assert!(owner.query_sql("SELECT * FROM docs", vec![]).await.is_err());
     let second = other.state_mut().execute_tx(vec![insert(12)], options).await.unwrap();
     assert!(second.committed(), "{:?}", second.error());
-    assert_eq!(rows(other.open_owned_point(&relation, &id).await.unwrap().1.unwrap()).await[0][..2], [Value::I64(1), Value::I64(12)]);
+    assert_eq!(rows(other.open_owned_read().await.unwrap().open_point(&relation, &id).await.unwrap().unwrap()).await[0][..2], [Value::I64(1), Value::I64(12)]);
     drop(other);
     drop(owner);
+    stop(&node, driver).await;
+}
+
+#[tokio::test]
+async fn held_owned_points_share_one_cut_and_close_refuses_new_reads() {
+    use rtdb_types::{EntityId, OwnedRelation};
+
+    let mut settings = options();
+    settings.owned_relations = true;
+    let (node, driver) = running(settings, services()).await;
+    let mut writer = node.session("xtdb", Arc::new(Authority)).unwrap();
+    let relation = OwnedRelation::new("held-orders").unwrap();
+    let documents = |value| Documents::new(vec![StructFields::from([
+        ("_id".into(), Value::I64(1)), ("value".into(), Value::I64(value)),
+    ])], node.memory()).unwrap();
+    let options = AutonomousTxOptions::default();
+    let initial = TxOp::OwnedInsertDocs {
+        relation: relation.clone(), documents: documents(10), valid_from: Some(Timestamp(0)), valid_to: None,
+    };
+    assert!(writer.state_mut().execute_tx(vec![initial], options.clone()).await.unwrap().committed());
+
+    let held = writer.open_owned_read().await.unwrap();
+    let id = EntityId::Integer(1);
+    let first = rows(held.open_point(&relation, &id).await.unwrap().unwrap()).await;
+    let updated = TxOp::OwnedReplaceDocs {
+        relation: relation.clone(), documents: documents(20), valid_from: Some(Timestamp(0)), valid_to: None,
+    };
+    let write = writer.state_mut().execute_tx(vec![updated], options).await.unwrap();
+    assert!(write.committed());
+    assert!(write.tx_key().system_time > held.present().system_time);
+    assert_eq!(rows(held.open_point(&relation, &id).await.unwrap().unwrap()).await, first);
+    held.close();
+    assert!(held.open_point(&relation, &id).await.is_err());
+    drop(held);
+    drop(writer);
     stop(&node, driver).await;
 }
 

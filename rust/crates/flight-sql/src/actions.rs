@@ -14,6 +14,12 @@ impl Service {
             match action.r#type.as_str() {
                 crate::owned_actions::CREATE_OWNED_V1 => Ok(vec![Ok(self.create_owned_action(&call, &action.body).await?)]),
                 crate::owned_actions::COMMIT_OWNED_V1 => Ok(vec![Ok(self.commit_owned_action(&call, &action.body).await?)]),
+                crate::owned_actions::OPEN_OWNED_READ_V1 => Ok(vec![Ok(self.open_owned_read_action(&call, &action.body).await?)]),
+                crate::owned_actions::HELD_OWNED_POINT_V1 => Ok(vec![Ok(self.held_owned_point_action(&call, &action.body).await?)]),
+                crate::owned_actions::CLOSE_OWNED_READ_V1 => {
+                    self.close_owned_read_action(&call, &action.body)?;
+                    Ok(Vec::new())
+                }
                 crate::owned_actions::READ_OWNED_V1 => Ok(vec![Ok(self.read_owned_action(&call, &action.body).await?)]),
                 "BeginTransaction" => {
                     let _: ActionBeginTransactionRequest = unpack(&action.body)?;
