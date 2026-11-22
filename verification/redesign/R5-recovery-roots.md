@@ -217,6 +217,20 @@ TLC explored 62 states, rejected six unsafe changes, and reached settlement with
 Claiming full release coverage, qualifying the bucket policy and adapter, and handling historical keys that may already have been physically reused are still runtime obligations.
 [Never-versioned retirement model](../tla/UnversionedRetirement.tla)
 
+A tag identifies the observed contents under S3's conditional write contract.
+For some S3 uploads, identical bytes at the same key can have the same tag across two publications.
+An outstanding retirement must respect the second publication's retention rights even when the bytes are identical.
+[Amazon S3 object metadata](https://docs.aws.amazon.com/AmazonS3/latest/API/API_Object.html) · [Conditional writes](https://docs.aws.amazon.com/AmazonS3/latest/userguide/conditional-writes.html)
+
+The comparison keeps the same retirement and reset requirements across three designs.
+With a terminal physical key, the successor publishes under a fresh key, and a tombstone preserves the old key's terminal status.
+A provider that compares immutable publication identity atomically can instead allow a second publication at the same physical key.
+A tag-only comparison combined with physical key reuse admits a counterexample even when the source checked the original publication before sending the request.
+The supported never-versioned design therefore needs end-to-end evidence that physical keys cannot be reused once admitted, including outstanding uploads and old writers.
+A clean enrollment can establish that contract for its fresh namespace. Historical keys need independent evidence of the same contract before they can be enrolled.
+[Publication identity comparison](../tla/PublicationTagIdentity.tla)
+
+
 ### Shared fork publication and referrer inventories
 
 Shared forks publish their child record, name and an advanced lineage revision in one directory transaction.
