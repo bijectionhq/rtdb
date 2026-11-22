@@ -1309,6 +1309,77 @@ async fn read_archive_lifetime_floors(
     Ok(floors)
 }
 
+/// Complete an already ordered source transfer fence. The result is a
+/// retained source receipt, and does not activate or release either residence.
+pub(crate) async fn seal_checkpoint_transfer(
+    directory: &dyn Directory, storage: &CellStorage, archive: &CellStorage, keys: &dyn KeyService,
+    hosted_task: Option<&rtdb_directory::HostedTask>,
+    fence: &rtdb_directory::CheckpointTransferFence,
+) -> Result<rtdb_directory::CheckpointTransferTerminal> {
+    let stage = &fence.destination;
+    let intent = &stage.intent;
+    let source = directory.deployment(&intent.source.to_string()).await?
+        .filter(|record| record.checkpoint_transfer_fence.as_deref() == Some(fence)
+            && record.lifecycle == Lifecycle::Restoring && record.epoch == fence.fenced_writer_epoch)
+        .ok_or_else(|| inconsistent("The source no longer owns this transfer fence"))?;
+    let destination = directory.deployment(&intent.destination.to_string()).await?
+        .filter(|record| record.checkpoint_transfer_fence.as_deref() == Some(fence)
+            && record.lifecycle == Lifecycle::Restoring && record.checkpoint_stage.as_deref() == Some(stage))
+        .ok_or_else(|| inconsistent("The original destination stage no longer owns this transfer fence"))?;
+    if destination.holder.is_some() { return Err(inconsistent("A transfer destination already has a writer")); }
+    if let Some(terminal) = source.checkpoint_transfer_terminal.as_deref() {
+        return Ok(terminal.clone());
+    }
+    await_storage_drain(directory, storage, keys, &source).await?;
+    let stream = administration_stream(directory, &source, 4 << 20).await?;
+    let sealed = rtdb_logkeeper::seal(&stream, fence.fenced_writer_epoch).await?.0;
+    let entries_count = sealed.checked_sub(stage.checkpoint.boundary)
+        .filter(|count| (0..=replica_suffix::MAX_SUFFIX_ENTRIES as i64).contains(count))
+        .ok_or_else(|| unavailable("The sealed source tail exceeds the transfer replay bound"))?;
+    let (replica_sha256, entries) = if entries_count == 0 {
+        (None, Vec::new())
+    } else {
+        let first = stage.checkpoint.boundary.checked_add(1)
+            .ok_or_else(|| inconsistent("The checkpoint has no replica successor"))?;
+        let certificate = rtdb_logkeeper::certify_committed_range(&stream, first, sealed).await?;
+        let entries = rtdb_logkeeper::copy_certified_range(
+            &stream, &certificate, replica_suffix::MAX_SUFFIX_BYTES, replica_suffix::MAX_SUFFIX_ENTRIES,
+        ).await?;
+        rtdb_logkeeper::verify_certified_range(&certificate, &entries)?;
+        let digest = certificate.digest_bytes()
+            .ok_or_else(|| inconsistent("The terminal replica interval has no canonical digest"))?;
+        (Some(digest), entries)
+    };
+    let source_through = replica_suffix::terminal_source_through(&entries, fence)?;
+
+    let mut node = rtdb_node::NodeOptions::default();
+    node.owned_relations = true;
+    let memory = rtdb_columnar::MemoryBudget::new(node.execution_memory_bytes);
+    let cache = rtdb_storage::cache::CacheBudget::new(node.cache_bytes);
+    let cancellation = tokio_util::sync::CancellationToken::new();
+    let (basis, lifetime_floors_sha256) = read_world::with_registered_capture_replay(
+        directory, archive, keys, hosted_task,
+        read_world::CaptureSelection {
+            deployment: intent.source, capture: intent.capture,
+            manifest: &intent.source_manifest_sha256, suffix: None, expected_basis: None,
+        },
+        CheckpointReadResources { node: &node, memory: &memory, cache, cancellation: &cancellation },
+        Some(read_world::TerminalReplay { fence, entries: &entries }),
+        |context, basis| async move {
+            let floors = read_archive_lifetime_floors(context, basis).await?;
+            let records: Vec<_> = floors.into_iter().map(|(table, floor)|
+                (table, floor.duration, floor.expired_created_through, floor.swept_present_through)
+            ).collect();
+            let bytes = encode(&records)?;
+            Ok((basis, sha256(&bytes)))
+        },
+    ).await?;
+    directory.record_checkpoint_transfer_terminal(&rtdb_directory::CheckpointTransferTerminal {
+        fence: fence.clone(), replica_through: sealed, source_through, basis,
+        replica_sha256, lifetime_floors_sha256,
+    }).await
+}
+
 pub(crate) async fn restore_checkpoint(
     directory: &dyn Directory,
     storage: &CellStorage,

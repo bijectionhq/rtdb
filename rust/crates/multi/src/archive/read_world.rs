@@ -167,6 +167,28 @@ where
     F: FnOnce(Arc<QueryContext>, TransactionKey) -> Fut,
     Fut: std::future::Future<Output = Result<T>>,
 {
+    with_registered_capture_replay(directory, archive, keys, hosted_task, selected, resources, None, run).await
+}
+
+pub(super) struct TerminalReplay<'a> {
+    pub fence: &'a rtdb_directory::CheckpointTransferFence,
+    pub entries: &'a [rtdb_logkeeper::ArchivedReplicaEntry],
+}
+
+pub(super) async fn with_registered_capture_replay<T, F, Fut>(
+    directory: &dyn Directory,
+    archive: &CellStorage,
+    keys: &dyn KeyService,
+    hosted_task: Option<&HostedTask>,
+    selected: CaptureSelection<'_>,
+    resources: CheckpointReadResources<'_>,
+    terminal: Option<TerminalReplay<'_>>,
+    run: F,
+) -> Result<T>
+where
+    F: FnOnce(Arc<QueryContext>, TransactionKey) -> Fut,
+    Fut: std::future::Future<Output = Result<T>>,
+{
     if !resources.node.owned_relations {
         return Err(unavailable(
             "Owned checkpoint reads require the owned-relation capability",
@@ -178,6 +200,13 @@ where
             return Err(unavailable("The retained checkpoint read was cancelled"));
         }
         require_capture_open(record, selected.capture)?;
+        if let Some(terminal) = &terminal
+            && (selected.suffix.is_some() || record.checkpoint_transfer_fence.as_deref() != Some(terminal.fence)
+                || record.lifecycle != rtdb_directory::Lifecycle::Restoring
+                || record.epoch != terminal.fence.fenced_writer_epoch)
+        {
+            return Err(inconsistent("The terminal replica replay has no current source fence"));
+        }
         let (capture, manifest) =
             capture_receipt(record, archive, selected.deployment, selected.capture)?
                 .ok_or_else(|| unavailable("The read world has no retained checkpoint receipt"))?;
@@ -187,7 +216,7 @@ where
         if manifest != selected.manifest
             || selected.expected_basis.is_some_and(|basis| match &suffix {
                 Some(pin) => pin.basis != basis,
-                None => capture.checkpoint.system_time != basis.system_time.0,
+                None => terminal.is_none() && capture.checkpoint.system_time != basis.system_time.0,
             })
             || capture.checkpoint.boundary < 0
             || capture.checkpoint.root_sha256.is_none()
@@ -286,7 +315,7 @@ where
                         resources.node.query.clone(), resources.cancellation,
                     )
                 };
-                let base_floors = if suffix.is_some() {
+                let base_floors = if suffix.is_some() || terminal.is_some() {
                     let base_snapshot = base_snapshot.with_system_time_cap(Some(base_basis.system_time))?;
                     let context = query_context(vec![base_snapshot], base_basis)?;
                     Some(read_archive_lifetime_floors(context, base_basis).await?)
@@ -303,6 +332,11 @@ where
                     }
                     (None, None) => (),
                     _ => return Err(inconsistent("The selected archived suffix is unavailable")),
+                }
+                if let Some(terminal) = &terminal {
+                    replica_suffix::apply_terminal(
+                        terminal.entries, terminal.fence, &mut recovered, &memory,
+                    )?;
                 }
                 let snapshot = recovered.partition.snapshot();
                 let basis = snapshot.tx_basis().ok_or_else(|| inconsistent("The retained checkpoint has no transaction basis"))?;

@@ -334,6 +334,8 @@ pub struct DeploymentRecord {
     pub checkpoint_stage: Option<Box<CheckpointStage>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub checkpoint_transfer_fence: Option<Box<CheckpointTransferFence>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub checkpoint_transfer_terminal: Option<Box<CheckpointTransferTerminal>>,
 
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hosted_fork_stage: Option<HostedForkStage>,
@@ -764,6 +766,17 @@ pub struct CheckpointTransferFence {
     pub fenced_writer_epoch: u64,
 }
 
+/// Source owner's terminal receipt. The source log retains the certified interval.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CheckpointTransferTerminal {
+    pub fence: CheckpointTransferFence,
+    pub replica_through: i64,
+    pub source_through: i64,
+    pub basis: rtdb_types::TransactionKey,
+    pub replica_sha256: Option<[u8; 32]>,
+    pub lifetime_floors_sha256: [u8; 32],
+}
+
 pub struct CheckpointTransferSelection {
     pub stage: CheckpointStage,
     pub source_version: Version,
@@ -792,7 +805,7 @@ impl DeploymentRecord {
         let id = uuid::Uuid::new_v4().to_string();
         Self { lineage: id.clone(), id, name: name.into(), org: org.into(), incarnation: 1, lifecycle: Lifecycle::Live, epoch: 0, holder: None, resident_idle: None,
             ensemble, replica_journals: BTreeSet::new(), storage_regions: BTreeMap::new(), catalog_readers: BTreeMap::new(), catalog_admission_floors: BTreeMap::new(), ordered_indexes: BTreeMap::new(), ordered_index_catalogs: BTreeMap::new(), read_width: 1, activation_crashes: 0, created_at_ms: now_ms, move_intent: None, placement_move: None, log_epoch: 0, parent: None, move_from: None, log_copy_servers: Vec::new(), linearizable_reads: false, checkpoint: None, replica_anchor: None, moved_at_ms: None, source_cleanup: None, cell_move: None, storage_generation: None, storage_namespaces: None, deletion_record: None, s3_write_lease_until_ms: None, engine_pin: None, deletion_observation: None,
-            cell_transfer: None, disposal: None, retired_residences: BTreeMap::new(), checkpoint_recovery: None, compaction_replay_cutoff: None, checkpoint_stage: None, checkpoint_transfer_fence: None, hosted_fork_stage: None, checkpoint_repair_receipts: BTreeMap::new(), recovery_manifest_sha256: None,
+            cell_transfer: None, disposal: None, retired_residences: BTreeMap::new(), checkpoint_recovery: None, compaction_replay_cutoff: None, checkpoint_stage: None, checkpoint_transfer_fence: None, checkpoint_transfer_terminal: None, hosted_fork_stage: None, checkpoint_repair_receipts: BTreeMap::new(), recovery_manifest_sha256: None,
             checkpoint_captures: BTreeMap::new(), checkpoint_worlds: BTreeMap::new(), checkpoint_suffix_pins: BTreeMap::new(), checkpoint_capture_retirements: BTreeMap::new(), archive_retirement: None, version: 0 }
     }
 
@@ -942,6 +955,11 @@ pub trait Directory: Send + Sync {
     /// The caller must still drain and seal the original source log at the returned epoch.
     async fn fence_checkpoint_transfer(&self, _selection: &CheckpointTransferSelection) -> Result<CheckpointTransferFence> {
         Err(Anomaly::fault("rtdb.directory/unsupported-checkpoint-transfer", "This Directory cannot fence a checkpoint transfer"))
+    }
+
+    /// Records a terminal receipt minted by the installed source recovery owner.
+    async fn record_checkpoint_transfer_terminal(&self, _terminal: &CheckpointTransferTerminal) -> Result<CheckpointTransferTerminal> {
+        Err(Anomaly::fault("rtdb.directory/unsupported-checkpoint-transfer", "This Directory cannot record a checkpoint transfer"))
     }
 
     /// Stores a new member; refuses if its id is taken.
@@ -1104,8 +1122,33 @@ fn prepare_checkpoint_transfer(
     Ok((source, destination, fence))
 }
 
+fn prepare_checkpoint_transfer_terminal(
+    source: &DeploymentRecord, terminal: &CheckpointTransferTerminal,
+) -> Result<DeploymentRecord> {
+    let stage = &terminal.fence.destination;
+    if source.id != stage.intent.source.to_string() || source.lifecycle != Lifecycle::Restoring
+        || source.checkpoint_transfer_fence.as_deref() != Some(&terminal.fence)
+        || source.epoch != terminal.fence.fenced_writer_epoch
+        || terminal.replica_through < stage.checkpoint.boundary
+        || terminal.source_through < stage.checkpoint.source
+        || terminal.basis.system_time.0 < stage.checkpoint.system_time
+        || terminal.replica_sha256.is_some() != (terminal.replica_through > stage.checkpoint.boundary)
+    {
+        return Err(transfer_changed());
+    }
+    if let Some(existing) = source.checkpoint_transfer_terminal.as_deref() {
+        return if existing == terminal { Ok(source.clone()) } else { Err(transfer_changed()) };
+    }
+    let mut next = source.clone();
+    next.version = next.version.checked_add(1).ok_or_else(transfer_changed)?;
+    next.checkpoint_transfer_terminal = Some(Box::new(terminal.clone()));
+    Ok(next)
+}
+
 fn require_transfer_update(current: &DeploymentRecord, next: &DeploymentRecord) -> Result<()> {
-    if current.checkpoint_transfer_fence != next.checkpoint_transfer_fence {
+    if current.checkpoint_transfer_fence != next.checkpoint_transfer_fence
+        || current.checkpoint_transfer_terminal != next.checkpoint_transfer_terminal
+    {
         return Err(transfer_changed());
     }
     let Some(fence) = current.checkpoint_transfer_fence.as_deref() else { return Ok(()); };
@@ -1242,7 +1285,7 @@ impl MemoryDirectory {
     fn insert_deployment(&self, state: &mut MemoryState, mut record: DeploymentRecord,
         lineage: Option<(String, LineageState)>, stage_version: Option<Version>) -> Result<DeploymentRecord> {
         require_deployment_name(&record.name)?;
-        if record.checkpoint_transfer_fence.is_some() { return Err(transfer_changed()); }
+        if record.checkpoint_transfer_fence.is_some() || record.checkpoint_transfer_terminal.is_some() { return Err(transfer_changed()); }
         if stage_version.is_none() && state.deployments.contains_key(&record.id) { return Err(exists("Deployment", &record.id)); }
         if record.hosted_fork_stage.is_none() && state.names.contains_key(&record.name) { return Err(exists("Deployment name", &record.name)); }
         if let Some((lineage, next)) = lineage {
@@ -1372,6 +1415,19 @@ impl Directory for MemoryDirectory {
         self.changes.publish(fenced);
         self.changes.publish(held);
         Ok(fence)
+    }
+
+    async fn record_checkpoint_transfer_terminal(&self, terminal: &CheckpointTransferTerminal) -> Result<CheckpointTransferTerminal> {
+        let mut state = self.state()?;
+        let id = terminal.fence.destination.intent.source.to_string();
+        let source = state.deployments.get(&id).ok_or_else(transfer_changed)?;
+        let next = prepare_checkpoint_transfer_terminal(source, terminal)?;
+        if next.version != source.version {
+            state.deployments.insert(id, Box::new(next.clone()));
+            self.persist(&mut state)?;
+            self.changes.publish(next);
+        }
+        Ok(terminal.clone())
     }
 
     async fn replace_deployment(&self, record: DeploymentRecord, expected: Version) -> Result<Cas<DeploymentRecord>> {
