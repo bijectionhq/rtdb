@@ -334,6 +334,17 @@ impl ColumnBatch {
         Self::settled(columns, rows, reservation).map(Some)
     }
 
+    pub(crate) fn append_column(mut self, column: Column, memory: &Arc<MemoryBudget>) -> Result<Self> {
+        let extra = column.retained_bytes()?.checked_add(256).ok_or_else(size_error)?;
+        let bound = self.charged().checked_add(extra).ok_or_else(size_error)?;
+        let reservation = if let Some(lease) = Arc::get_mut(&mut self._reservation) {
+            lease.grow_to(bound)?;
+            self._reservation
+        } else { memory.reserve(bound)? };
+        self.columns.push(column);
+        Self::settled(self.columns, self.len, reservation)
+    }
+
     /// A page of columns allocated under `reservation`, whose charge becomes exactly what they retain.
     pub fn settled(columns: Vec<Column>, len: usize, mut reservation: Arc<MemoryReservation>) -> Result<Self> {
         let bytes = columns.iter().try_fold(256usize, |bytes, column| bytes.checked_add(column.retained_bytes()?).ok_or_else(size_error))?;
@@ -439,33 +450,80 @@ impl ColumnBatch {
     }
 }
 
+pub(crate) fn ordinal_column(len: usize, start: i64, name: &str, context: &crate::QueryContext)
+    -> Result<(Column, Arc<MemoryReservation>)> {
+    let bound = len.checked_mul(std::mem::size_of::<i64>())
+        .and_then(|bytes| bytes.checked_add(name.len())).and_then(|bytes| bytes.checked_add(512)).ok_or_else(size_error)?;
+    let reservation = context.memory.reserve(bound)?;
+    let mut values = Vec::with_capacity(len);
+    for index in 0..len {
+        context.check_cancelled_at(index)?;
+        values.push(start + index as i64);
+    }
+    let array = Arc::new(arrow_array::Int64Array::from(values));
+    let field = Arc::new(ArrowField::new(name, DataType::Int64, false));
+    let logical = Some(LogicalType::Scalar(rtdb_types::ScalarType::I64));
+    Ok((Column::Arrow { array, field, logical }, reservation))
+}
+
 pub(crate) fn gather_column_rows<'a>(
     source: impl Fn(usize) -> &'a ColumnBatch, rows: &[(usize, usize)], position: usize, memory: &Arc<MemoryBudget>,
 ) -> Result<(Column, Arc<MemoryReservation>)> {
-    if rows.iter().any(|&(batch, _)| matches!(source(batch).columns[position], Column::Values(_))) {
-        let bytes = rows.iter().try_fold(4096usize, |bound, &(batch, row)| {
-            bound.checked_add(source(batch).columns[position].bound(row)?.saturating_mul(4)).ok_or_else(size_error)
+    gather_column_cells(source, rows.iter().copied().map(Some), rows.len(), position, memory)
+}
+
+pub(crate) fn gather_nullable_column<'a>(
+    source: impl Fn(usize) -> &'a ColumnBatch, rows: &[Option<(usize, usize)>], position: usize, memory: &Arc<MemoryBudget>,
+) -> Result<(Column, Arc<MemoryReservation>)> {
+    gather_column_cells(source, rows.iter().copied(), rows.len(), position, memory)
+}
+
+fn gather_column_cells<'a>(
+    source: impl Fn(usize) -> &'a ColumnBatch, rows: impl Iterator<Item = Option<(usize, usize)>> + Clone, count: usize,
+    position: usize, memory: &Arc<MemoryBudget>,
+) -> Result<(Column, Arc<MemoryReservation>)> {
+    if rows.clone().flatten().any(|(batch, _)| matches!(source(batch).columns[position], Column::Values(_))) {
+        let bytes = rows.clone().try_fold(4096usize, |bound, cell| {
+            let bytes = match cell {
+                Some((batch, row)) => source(batch).columns[position].bound(row)?.saturating_mul(4),
+                None => std::mem::size_of::<Value>(),
+            };
+            bound.checked_add(bytes).ok_or_else(size_error)
         })?;
         let scratch = memory.reserve(bytes)?;
-        let values = rows.iter().map(|&(batch, row)| source(batch).columns[position].value(row)).collect::<Result<_>>()?;
+        let values = rows.map(|cell| match cell {
+            Some((batch, row)) => source(batch).columns[position].value(row),
+            None => Ok(Value::Null),
+        }).collect::<Result<_>>()?;
         return Ok((Column::Values(values), scratch));
     }
-    take_arrow_rows(source, rows, position, memory)
+    take_arrow_rows(source, rows, count, position, memory)
 }
 
 fn take_arrow_rows<'a>(
-    batch: impl Fn(usize) -> &'a ColumnBatch, rows: &[(usize, usize)], position: usize, memory: &Arc<MemoryBudget>,
+    batch: impl Fn(usize) -> &'a ColumnBatch, rows: impl Iterator<Item = Option<(usize, usize)>>, count: usize,
+    position: usize, memory: &Arc<MemoryBudget>,
 ) -> Result<(Column, Arc<MemoryReservation>)> {
-    let base = rows.len().checked_mul(std::mem::size_of::<(usize, usize)>())
+    let base = count.checked_mul(std::mem::size_of::<(usize, usize)>())
         .and_then(|bytes| bytes.checked_add(4096)).ok_or_else(size_error)?;
     let mut scratch = memory.reserve(base)?;
     let lease = Arc::get_mut(&mut scratch).expect("An Arrow gather owns its reservation");
     let mut sources = Vec::new();
     let mut positions = HashMap::new();
-    let mut cells = Vec::with_capacity(rows.len());
+    let mut cells = Vec::with_capacity(count);
     let mut keep_selection = false;
     let mut name = "";
-    for &(batch_index, row) in rows {
+    let mut missing = None;
+    for cell in rows {
+        let Some((batch_index, row)) = cell else {
+            let index = *missing.get_or_insert_with(|| {
+                let index = sources.len();
+                sources.push(None);
+                index
+            });
+            cells.push((index, 0));
+            continue;
+        };
         let batch = batch(batch_index);
         let (source, offset, vector, custody) = match &batch.columns[position] {
             Column::Arrow { array, field, logical } => {

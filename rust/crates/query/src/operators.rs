@@ -152,6 +152,19 @@ async fn build_batches_at(
                 ordinality: ordinality.as_ref().map(|field| field.name.clone()), outer: *outer, execution };
             Ok(Some((Box::new(unnest), projected)))
         }
+        RelationNode::Ordinality { scope: rtdb_plan::OrdinalityScope::Relation, field, .. } if output == BatchOutput::Arrow => {
+            let Some((input, projected)) = build_batch_input(runtime.child(0)?, execution.child(0), None, output).await? else { return Ok(None); };
+            let ordinal = crate::list::BatchOrdinality::new(input, field.name.clone(), execution.context);
+            Ok(Some((Box::new(ordinal), projected)))
+        }
+        RelationNode::Window { partition_by, order_by, expressions, .. } if output == BatchOutput::Arrow => {
+            let child = runtime.child(0)?;
+            let schema = child.schema().clone();
+            if !crate::window::BatchWindow::supports(&schema, partition_by, order_by, expressions) { return Ok(None); }
+            let Some((input, projected)) = build_batch_input(child, execution.child(0), None, output).await? else { return Ok(None); };
+            let window = crate::window::BatchWindow::new(input, schema, order_by.clone(), expressions, projected, execution)?;
+            Ok(Some((Box::new(window), projected)))
+        }
         RelationNode::Distinct { .. } if output == BatchOutput::Arrow => {
             let Some((input, projected)) = build_batch_input(runtime.child(0)?, execution.child(0), pushdowns, output).await? else { return Ok(None); };
             let seen = SeenRows::new(&execution.context, runtime.output())?;
@@ -377,6 +390,12 @@ fn batch_shape_at(runtime: &Arc<EmittedRelation>, output: BatchOutput) -> Result
         }
         RelationNode::Limit { .. } if output == BatchOutput::Arrow => batch_shape(&runtime.child(0)?, output)?,
         RelationNode::Unnest { expr: Expr::Column { .. }, .. } if output == BatchOutput::Arrow => batch_shape(&runtime.child(0)?, output)?,
+        RelationNode::Ordinality { scope: rtdb_plan::OrdinalityScope::Relation, .. } if output == BatchOutput::Arrow => batch_shape(&runtime.child(0)?, output)?,
+        RelationNode::Window { partition_by, order_by, expressions, .. } if output == BatchOutput::Arrow => {
+            let child = runtime.child(0)?;
+            if !crate::window::BatchWindow::supports(child.schema(), partition_by, order_by, expressions) { return Ok(None); }
+            batch_shape(&child, output)?
+        }
         RelationNode::Sort { order_by, .. } | RelationNode::SortLimit { order_by, .. } if output == BatchOutput::Arrow => {
             let child = runtime.child(0)?;
             let computed = !crate::sort::batches::BatchSort::supports(child.schema(), order_by);

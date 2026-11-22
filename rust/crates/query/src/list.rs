@@ -95,3 +95,31 @@ impl PageCursor for Ordinality {
 }
 
 fn ordinality_overflow() -> rtdb_types::Anomaly { invalid("ordinality-overflow", "Row ordinality exceeds the signed 64-bit range") }
+
+pub(crate) struct BatchOrdinality {
+    input: crate::columnar::BoxBatchCursor,
+    context: Arc<QueryContext>,
+    name: String,
+    rows: i64,
+}
+
+impl BatchOrdinality {
+    pub fn new(input: crate::columnar::BoxBatchCursor, name: String, context: Arc<QueryContext>) -> Self {
+        Self { input, context, name, rows: 0 }
+    }
+}
+
+#[async_trait]
+impl crate::columnar::BatchCursor for BatchOrdinality {
+    async fn next_batch(&mut self) -> Result<Option<crate::columnar::ColumnBatch>> {
+        self.context.check_cancelled()?;
+        let Some(batch) = crate::columnar::poll_nested_batch(self.input.as_mut()).await? else { return Ok(None); };
+        let length = i64::try_from(batch.len).map_err(|_| ordinality_overflow())?;
+        let end = self.rows.checked_add(length).ok_or_else(ordinality_overflow)?;
+        let start = if length == 0 { end } else { self.rows + 1 };
+        let (column, _scratch) = crate::columnar::ordinal_column(batch.len, start, &self.name, &self.context)?;
+        let batch = batch.append_column(column, &self.context.memory)?;
+        self.rows = end;
+        Ok(Some(batch))
+    }
+}

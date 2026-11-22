@@ -1,8 +1,106 @@
-use std::sync::Arc;
+use std::{collections::VecDeque, sync::Arc};
 use async_trait::async_trait;
 use rtdb_plan::{Binder, ColumnId, Schema, SortExpr, WindowExpr, WindowFunction};
 use rtdb_types::{LogicalType, Result, ScalarType, Value};
 use crate::{context::Execution, cursor::OwnedRow, invalid, operators::rows_equal, pages::{BoxPageCursor,OwnedPage,PageBuilder,PageCursor}, sort::SortCursor};
+use crate::columnar::{BatchCursor, BoxBatchCursor, ColumnBatch, gather_nullable_column, ordinal_column, poll_nested_batch};
+
+pub(crate) struct BatchWindow {
+    input: Option<BoxBatchCursor>,
+    schema: Schema,
+    expressions: Vec<WindowExpr>,
+    ready: Option<(VecDeque<ColumnBatch>, Arc<rtdb_columnar::MemoryReservation>)>,
+    execution: Execution,
+}
+
+impl BatchWindow {
+    pub fn supports(schema: &Schema, partition_by: &[ColumnId], order_by: &[SortExpr], expressions: &[WindowExpr]) -> bool {
+        partition_by.is_empty() && !expressions.is_empty()
+            && (order_by.is_empty() || crate::sort::batches::BatchSort::supports(schema, order_by))
+    }
+
+    pub fn new(input: BoxBatchCursor, schema: Schema, order_by: Vec<SortExpr>, expressions: &[WindowExpr],
+        projected: bool, execution: Execution) -> Result<Self> {
+        let input = if order_by.is_empty() { input } else {
+            Box::new(crate::sort::batches::BatchSort::new(input, schema.clone(), order_by, execution.clone(), projected, 0, i64::MAX as u64)?)
+        };
+        Ok(Self { input: Some(input), schema, expressions: expressions.to_vec(), ready: None, execution })
+    }
+
+    async fn evaluate(&mut self, mut input: BoxBatchCursor) -> Result<(VecDeque<ColumnBatch>, Arc<rtdb_columnar::MemoryReservation>)> {
+        use std::mem::size_of;
+        let context = &self.execution.context;
+        let memory = &context.memory;
+        let mut batches = Vec::new();
+        let mut offsets = Vec::new();
+        let mut total = 0usize;
+        let mut inventory = memory.reserve(256)?;
+        while let Some(batch) = poll_nested_batch(input.as_mut()).await? {
+            if batch.len == 0 { continue; }
+            let entry = 3 * size_of::<ColumnBatch>() + 2 * size_of::<usize>();
+            let storage = batches.len().checked_add(1usize).and_then(|count| count.checked_mul(entry))
+                .and_then(|bytes| bytes.checked_add(256)).ok_or_else(window_size)?;
+            Arc::get_mut(&mut inventory).expect("Window owns the batch inventory reservation").grow_to(storage)?;
+            offsets.push(total);
+            total = total.checked_add(batch.len).filter(|total| i64::try_from(*total).is_ok())
+                .ok_or_else(|| invalid("window-count", "Window row number overflow"))?;
+            batches.push(batch);
+        }
+
+        for expression in &self.expressions {
+            let _suffixes = memory.reserve(batches.len().checked_mul(size_of::<(crate::columnar::Column, Arc<rtdb_columnar::MemoryReservation>)>())
+                .ok_or_else(window_size)?)?;
+            let mut suffixes = Vec::with_capacity(batches.len());
+            for (batch, &start) in batches.iter().zip(&offsets) {
+                let suffix = match expression.function {
+                    WindowFunction::RowNumber => ordinal_column(batch.len, start as i64 + 1, &expression.field.name, context)?,
+                    WindowFunction::Lead { column, offset } | WindowFunction::Lag { column, offset } => {
+                        let position = self.schema.position(column).ok_or_else(|| invalid("window-column", "Window value column is absent"))?;
+                        let _picks = memory.reserve(batch.len.checked_mul(size_of::<Option<(usize, usize)>>()).ok_or_else(window_size)?)?;
+                        let mut cells = Vec::with_capacity(batch.len);
+                        for row in 0..batch.len {
+                            context.check_cancelled_at(row)?;
+                            let index = (start + row) as u64;
+                            let target = shifted_index(expression.function, index, offset)?;
+                            let cell = target.and_then(|target| usize::try_from(target).ok()).filter(|&target| target < total).map(|target| {
+                                let batch = offsets.partition_point(|&start| start <= target) - 1;
+                                (batch, target - offsets[batch])
+                            });
+                            cells.push(cell);
+                        }
+                        gather_nullable_column(|index| &batches[index], &cells, position, memory)?
+                    }
+                };
+                suffixes.push(suffix);
+            }
+            batches = batches.into_iter().zip(suffixes).map(|(batch, (suffix, _scratch))| batch.append_column(suffix, memory))
+                .collect::<Result<_>>()?;
+        }
+        Ok((batches.into(), inventory))
+    }
+}
+
+fn window_size() -> rtdb_types::Anomaly { invalid("window-size", "Window batch inventory exceeds addressable memory") }
+
+fn shifted_index(function: WindowFunction, index: u64, offset: u64) -> Result<Option<u64>> {
+    if matches!(function, WindowFunction::Lead { .. }) {
+        index.checked_add(offset).filter(|&index| index <= i64::MAX as u64).map(Some)
+            .ok_or_else(|| invalid("window-offset", "Window row offset overflow"))
+    } else { Ok(index.checked_sub(offset)) }
+}
+
+#[async_trait]
+impl BatchCursor for BatchWindow {
+    async fn next_batch(&mut self) -> Result<Option<ColumnBatch>> {
+        self.execution.context.check_cancelled()?;
+        if let Some(input) = self.input.take() {
+            self.ready = Some(self.evaluate(input).await?);
+        }
+        let batch = self.ready.as_mut().and_then(|(ready, _)| ready.pop_front());
+        if batch.is_none() { self.ready = None; }
+        Ok(batch)
+    }
+}
 
 pub(crate) struct WindowCursor {
     input: Option<BoxPageCursor>, runtime: Arc<crate::runtime_schema::EmittedRelation>, schema: Schema, partition_by: Vec<ColumnId>, order_by: Vec<SortExpr>, expressions: Vec<WindowExpr>, execution: Execution,
@@ -57,9 +155,7 @@ impl PageCursor for WindowCursor {
                     WindowFunction::RowNumber => &counter,
                     WindowFunction::Lead { column,offset } | WindowFunction::Lag { column,offset } => {
                         let index = u64::try_from(index).map_err(|_|invalid("window-count","Window row index exceeds signed64 bits"))?;
-                        let target = if matches!(expression.function,WindowFunction::Lead {..}) {
-                            Some(index.checked_add(offset).filter(|index|*index <= i64::MAX as u64).ok_or_else(||invalid("window-offset","Window row offset overflow"))?)
-                        } else { index.checked_sub(offset) };
+                        let target = shifted_index(expression.function, index, offset)?;
                         let column = self.schema.position(column).ok_or_else(||invalid("window-column","Window value column is absent"))?;
                         match target.and_then(|target|usize::try_from(target).ok()).and_then(|target|input.rows().get(target)) {
                             Some(target) if partition_id(&target.values)? == group => target.values.get(column).ok_or_else(||invalid("window-width","Shifted window row lacks its value"))?,
