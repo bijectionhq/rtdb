@@ -374,12 +374,18 @@ async fn covered_owned_corpus(
         return Err(uncovered_owned_search());
     }
     let [column] = definition.columns.as_slice() else { return Err(uncovered_owned_search()); };
+    let point = Interval::new(present, present.next()?)?;
+    let bounds = TemporalBounds { valid_time: point, system_time: point };
+    if !snapshot.contains_table(&definition.table) {
+        return Ok(CoveredCorpus {
+            column: column.clone(), bounds, corpus: rtdb_text::Corpus::default(), visible_runs: Vec::new(),
+            _scratch: context.memory.reserve(4096)?,
+        });
+    }
     let types = snapshot.column_types_for(&definition.table, [column.clone()]);
     if !types.get(column).is_some_and(rtdb_types::LogicalType::is_clear_search_text) {
         return Err(Anomaly::incorrect("rtdb.owned/search-column", "Owned search path no longer describes only clear text"));
     }
-    let point = Interval::new(present, present.next()?)?;
-    let bounds = TemporalBounds { valid_time: point, system_time: point };
     let runtime = crate::SearchRuntime::new(0);
     let mut files = Vec::new();
     let mut opened = BTreeMap::<ObjectKey, Arc<SearchFile>>::new();
@@ -459,78 +465,94 @@ async fn covered_owned_corpus(
 /// One exact match on a held owned search path, identified by its full typed key.
 #[derive(Clone, Debug, PartialEq)]
 pub struct OwnedSearchHit {
+    pub partition: usize,
     pub id: EntityId,
     pub score: f64,
 }
 
-/// Ranks only the admitted visible corpus and verifies each nominated run at the held point.
+/// Ranks nominated runs at one cut using statistics from all selected partitions.
 pub async fn owned_ranked(
-    context: Arc<QueryContext>, owner: &str, relation: &OwnedRelation, path: &OwnedRelation, text: &str, limit: usize,
+    context: Arc<QueryContext>, owner: &str, partitions: &[(OwnedRelation, OwnedRelation)], text: &str, limit: usize,
 ) -> Result<Vec<OwnedSearchHit>> {
-    if !(1..=128).contains(&limit) {
-        return Err(Anomaly::incorrect("rtdb.owned/search-limit", "Owned search limit must be between 1 and 128"));
+    if !(1..=128).contains(&limit) || !(1..=32).contains(&partitions.len()) || text.len() > 4096 {
+        return Err(Anomaly::incorrect("rtdb.owned/search-limit", "Owned search exceeds its result, partition, or query bound"));
+    }
+    let distinct: BTreeSet<_> = partitions.iter().map(|(relation, _)| relation).collect();
+    if distinct.len() != partitions.len() {
+        return Err(Anomaly::incorrect("rtdb.owned/search-relations", "An owned search relation must be selected once"));
     }
     let query = Query::parse(text);
-    let covered = covered_owned_corpus(Arc::clone(&context), owner, relation, path, &query, true).await?;
-    let scorer = rtdb_text::Scorer::new(query.clone(), Some(&covered.corpus));
+    let mut corpus = rtdb_text::Corpus::default();
+    let mut covered = Vec::with_capacity(partitions.len());
+    for (relation, path) in partitions {
+        let part = covered_owned_corpus(Arc::clone(&context), owner, relation, path, &query, true).await?;
+        corpus.add(&part.corpus);
+        covered.push((relation, part));
+    }
+    let scorer = rtdb_text::Scorer::new(query.clone(), Some(&corpus));
     let mut hits = Vec::<OwnedSearchHit>::with_capacity(limit + 1);
     let mut memory = context.memory.reserve(4096)?;
     let mut candidates = 0;
-    for (file, visible) in &covered.visible_runs {
-        context.check_cancelled()?;
-        for run in file.matches(&covered.column, &query, covered.bounds)? {
-            if !visible.contains(&run.doc) { continue; }
-            candidates += 1;
-            if candidates > 100_000 {
-                return Err(Anomaly::new(AnomalyCategory::Unavailable, "rtdb.owned/search-candidate-limit", "Covered search exceeded its candidate budget"));
-            }
-            let id = file.run_identity(run)?;
-            let address = rtdb_query::owned_address(Arc::clone(&context), owner, relation, &id).await?;
-            if !matches!(address, rtdb_query::OwnedAddress::Assigned(locator) if locator.0 == run.iid) {
-                return Err(uncovered_owned_search());
-            }
-            let columns = ["_id", covered.column.as_str()];
-            let Some(mut rows) = rtdb_query::open_owned_point(
-                Arc::clone(&context), owner, relation, &id, Some(covered.bounds.valid_time), Some(&columns),
-            ).await? else { return Err(uncovered_owned_search()); };
-            let mut resolved_score = None;
-            while let Some(batch) = rows.next_batch().await? {
-                let batch = batch.batch();
-                if batch.num_rows() == 0 { continue; }
-                if resolved_score.is_some() || batch.num_rows() != 1 { return Err(uncovered_owned_search()); }
-                let revision = rtdb_query::owned_row_revision(batch, 0, &id, &context.memory)?;
-                let at = covered.bounds.valid_time.lower().0;
-                let same_run = file.rows_of(&run.iid)?.into_iter().any(|(row, event)| {
-                    event.op == EventOp::Put && event.system_from == revision.0 && event.valid_from <= at
-                        && at < event.valid_to && file.run_of(&covered.column, row) == Some(Some(run.doc))
-                });
-                if !same_run { return Err(uncovered_owned_search()); }
-                let (column, field) = batch.schema_ref().column_with_name(&covered.column).ok_or_else(uncovered_owned_search)?;
-                let values = batch.column(column).as_ref();
-                let bytes = rtdb_columnar::estimate_read_value_bytes(field, values, 0)?;
-                let _decode = context.memory.reserve(bytes.saturating_mul(64).saturating_add(4096))?;
-                let Value::Utf8(text) = rtdb_columnar::read_value(field, values, 0)? else { return Err(uncovered_owned_search()); };
-                let tokens = rtdb_text::tokens(&text);
-                if !query.matches(&tokens) || tokens.len() != file.token_length(run.doc)? as usize {
+    for (partition, (relation, covered)) in covered.iter().enumerate() {
+        for (file, visible) in &covered.visible_runs {
+            context.check_cancelled()?;
+            for run in file.matches(&covered.column, &query, covered.bounds)? {
+                if !visible.contains(&run.doc) { continue; }
+                candidates += 1;
+                if candidates > 100_000 {
+                    return Err(Anomaly::new(AnomalyCategory::Unavailable, "rtdb.owned/search-candidate-limit", "Covered search exceeded its candidate budget"));
+                }
+                let id = file.run_identity(run)?;
+                let address = rtdb_query::owned_address(Arc::clone(&context), owner, relation, &id).await?;
+                if !matches!(address, rtdb_query::OwnedAddress::Assigned(locator) if locator.0 == run.iid) {
                     return Err(uncovered_owned_search());
                 }
-                let score = scorer.bm25(&tokens);
-                if !score.is_finite() { return Err(uncovered_owned_search()); }
-                resolved_score = Some(score);
-            }
+                let columns = ["_id", covered.column.as_str()];
+                let Some(mut rows) = rtdb_query::open_owned_point(
+                    Arc::clone(&context), owner, relation, &id, Some(covered.bounds.valid_time), Some(&columns),
+                ).await? else { return Err(uncovered_owned_search()); };
+                let mut resolved_score = None;
+                while let Some(batch) = rows.next_batch().await? {
+                    let batch = batch.batch();
+                    if batch.num_rows() == 0 { continue; }
+                    if resolved_score.is_some() || batch.num_rows() != 1 { return Err(uncovered_owned_search()); }
+                    let revision = rtdb_query::owned_row_revision(batch, 0, &id, &context.memory)?;
+                    let at = covered.bounds.valid_time.lower().0;
+                    let same_run = file.rows_of(&run.iid)?.into_iter().any(|(row, event)| {
+                        event.op == EventOp::Put && event.system_from == revision.0 && event.valid_from <= at
+                            && at < event.valid_to && file.run_of(&covered.column, row) == Some(Some(run.doc))
+                    });
+                    if !same_run { return Err(uncovered_owned_search()); }
+                    let (column, field) = batch.schema_ref().column_with_name(&covered.column).ok_or_else(uncovered_owned_search)?;
+                    let values = batch.column(column).as_ref();
+                    let bytes = rtdb_columnar::estimate_read_value_bytes(field, values, 0)?;
+                    let _decode = context.memory.reserve(bytes.saturating_mul(64).saturating_add(4096))?;
+                    let Value::Utf8(text) = rtdb_columnar::read_value(field, values, 0)? else { return Err(uncovered_owned_search()); };
+                    let tokens = rtdb_text::tokens(&text);
+                    if !query.matches(&tokens) || tokens.len() != file.token_length(run.doc)? as usize {
+                        return Err(uncovered_owned_search());
+                    }
+                    let score = scorer.bm25(&tokens);
+                    if !score.is_finite() { return Err(uncovered_owned_search()); }
+                    resolved_score = Some(score);
+                }
 
-            let hit = OwnedSearchHit { id, score: resolved_score.ok_or_else(uncovered_owned_search)? };
-            let at = hits.partition_point(|previous| {
-                previous.score.total_cmp(&hit.score).reverse().then_with(|| previous.id.cmp(&hit.id)).is_lt()
-            });
-            if at < limit {
-                hits.insert(at, hit);
-                hits.truncate(limit);
-                let bytes = hits.iter().try_fold(4096usize, |bytes, hit| {
-                    Ok::<_, Anomaly>(bytes.saturating_add(hit.id.as_value().retained_bytes()?).saturating_add(128))
-                })?;
-                let reservation = Arc::get_mut(&mut memory).expect("ranking owns its reservation");
-                reservation.grow_to(bytes.max(reservation.bytes()))?;
+                let hit = OwnedSearchHit { partition, id, score: resolved_score.ok_or_else(uncovered_owned_search)? };
+                let at = hits.partition_point(|previous| {
+                    previous.score.total_cmp(&hit.score).reverse()
+                        .then_with(|| previous.id.cmp(&hit.id))
+                        .then_with(|| previous.partition.cmp(&hit.partition))
+                        .is_lt()
+                });
+                if at < limit {
+                    hits.insert(at, hit);
+                    hits.truncate(limit);
+                    let bytes = hits.iter().try_fold(4096usize, |bytes, hit| {
+                        Ok::<_, Anomaly>(bytes.saturating_add(hit.id.as_value().retained_bytes()?).saturating_add(128))
+                    })?;
+                    let reservation = Arc::get_mut(&mut memory).expect("ranking owns its reservation");
+                    reservation.grow_to(bytes.max(reservation.bytes()))?;
+                }
             }
         }
     }

@@ -333,12 +333,12 @@ The relation must already exist in the authenticated owner's namespace, and the 
 The FTS maintenance lane uses the private declaration to build the relation's search files.
 A successful declaration returns the same transaction-key Arrow row as Create.
 
-`rtdb.owned.SearchHeld.v1` takes the 16-byte held handle, the relation prefix, and a terminated Arrow IPC stream with one batch and one row.
-Its fields are `path: Utf8`, `query: Utf8`, and `limit: Int64` between 1 and 128.
-The reply contains `_id` as a typed union of string, keyword, signed Int64 and UUID, and `score: Float64`.
-Results sort by descending BM25 score, then by complete identity in string, keyword, integer, UUID order.
+`rtdb.owned.SearchHeld.v2` takes the 16-byte held handle, a big-endian u16 partition count (1 to 32), then a relation prefix and a path prefix per partition.
+A big-endian u16 limit (1 to 128) follows, then the UTF-8 query (up to 4096 bytes).
+The reply contains `_id` as a typed union of string, keyword, signed Int64 and UUID, `score: Float64`, and `partition: UInt64` as the zero-based request ordinal.
+Results sort by descending BM25 score across the full selected corpus, then by complete typed identity and partition ordinal.
 The held present and valid instant are in schema metadata. An empty result has a schema and no record batch.
-The action requires all search artefacts to cover the held cut, and verifies each matched posting against its full identity and winning revision.
+Every selected partition must have complete search artefacts at the held cut. Each matched posting is verified against the full identity and winning revision.
 
 `rtdb.owned.DeclareUniquePath.v1` uses the relation prefix and a terminated Arrow IPC stream with one batch and one row.
 Its fields are `_id: Utf8` for the path name and `column: Utf8` for the canonical Binary key column.
