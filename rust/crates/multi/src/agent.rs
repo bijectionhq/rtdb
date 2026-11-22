@@ -621,7 +621,11 @@ impl NodeAgent {
         let log_epoch = StorageEpoch(record.log_epoch);
         let replica_through = installed.replica.after_offset(log_epoch);
         let source_through = installed.source.after_offset(log_epoch);
-        if replica_through <= checkpoint.boundary || source_through <= checkpoint.source { return Err(unavailable()); }
+        if replica_through <= checkpoint.boundary || source_through <= checkpoint.source
+            || replica_through.saturating_sub(checkpoint.boundary) > crate::archive::MAX_SUFFIX_ENTRIES as i64
+        {
+            return Err(unavailable());
+        }
 
         let members = self.members().await?;
         let servers = ensemble_servers(&record, &members)?;
@@ -629,21 +633,17 @@ impl NodeAgent {
             write_quorum: crate::deployment::write_quorum(servers.len()), servers,
             stream: record.stream("replica"), maximum_message_bytes: 4 << 20,
         };
-        let prefix = record.replica_anchor.as_ref().map(|anchor|
-            rtdb_logkeeper::JournalDigest::from_digest_bytes(stream.stream.clone(), anchor.interval, anchor.digest));
+        let first_replica = checkpoint.boundary.checked_add(1).ok_or_else(unavailable)?;
         let remaining = expires_at_ms.saturating_sub(now_ms()).max(0) as u64;
         let proof = tokio::time::timeout(Duration::from_millis(remaining),
-            rtdb_logkeeper::certify_committed_prefix(&stream, replica_through, prefix.as_ref())
+            rtdb_logkeeper::certify_committed_range(&stream, first_replica, replica_through)
         ).await.map_err(|_| unavailable())??;
-        let first_replica = checkpoint.boundary.checked_add(1).ok_or_else(unavailable)?;
-        if proof.interval[0] > first_replica || proof.interval[1] != replica_through {
-            return Err(unavailable());
-        }
+        if proof.interval != [first_replica, replica_through] { return Err(unavailable()); }
         let pin = CheckpointSuffixPin {
             capture, manifest_sha256, checkpoint, incarnation: record.incarnation,
             log_epoch: record.log_epoch, writer_epoch: epoch, basis, replica_through,
             source_through, journal_interval: proof.interval, journal_sha256: proof.digest_bytes().ok_or_else(unavailable)?,
-            expires_at_ms,
+            expires_at_ms, archive_sha256: None,
         };
         crate::admin::update_installation(self.directory.as_ref(), &id, |current| {
             let (selected, manifest) = validate(current)?;
@@ -658,7 +658,7 @@ impl NodeAgent {
             }
             let now = now_ms();
             if expires_at_ms <= now { return Err(unavailable()); }
-            current.checkpoint_suffix_pins.retain(|_, hold| hold.expires_at_ms > now);
+            current.checkpoint_suffix_pins.retain(|_, hold| hold.expires_at_ms > now || hold.archive_sha256.is_some());
             if current.checkpoint_suffix_pins.len() >= MAX_PINS { return Err(unavailable()); }
             current.checkpoint_suffix_pins.insert(lease, pin.clone());
             Ok(())

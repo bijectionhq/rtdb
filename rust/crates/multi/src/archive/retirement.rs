@@ -177,6 +177,7 @@ pub(crate) async fn finish_capture_retirement(
                 "The closed capture admitted another archive region",
             ));
         }
+        current.checkpoint_suffix_pins.retain(|_, pin| pin.capture != capture);
         let retirement = current
             .checkpoint_capture_retirements
             .get_mut(&capture)

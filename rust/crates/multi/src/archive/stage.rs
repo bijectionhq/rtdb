@@ -25,7 +25,7 @@ use crate::{
     reference::{PrefixedStore, key},
     store::{
         ROOT_MARKER, reconcile_storage_regions, release_region, remote_storage_region,
-        track_checkpoint_stage_publications,
+        track_checkpoint_stage_publications, track_publications,
     },
 };
 
@@ -215,7 +215,7 @@ pub async fn stage_checkpoint(
                     storage,
                     hosted_task,
                     None,
-                    Some((Arc::clone(directory), intent.intent.operation)),
+                    Some(RegionPublication::Stage(Arc::clone(directory), intent.intent.operation)),
                     |current| {
                         if current.lifecycle != Lifecycle::Restoring
                             || current.checkpoint_stage.as_deref() != Some(intent)
@@ -292,6 +292,11 @@ fn staged(
 
 /// Keep the archive key or target upload under its original directory
 /// inventory until all asynchronous storage operations have drained.
+pub(super) enum RegionPublication {
+    Stage(Arc<dyn Directory>, Uuid),
+    Capture(Arc<dyn Directory>),
+}
+
 pub(super) async fn with_region<T, F, Fut>(
     directory: &dyn Directory,
     keys: &dyn KeyService,
@@ -299,7 +304,7 @@ pub(super) async fn with_region<T, F, Fut>(
     media: &CellStorage,
     hosted_task: Option<&HostedTask>,
     capture: Option<Uuid>,
-    publication: Option<(Arc<dyn Directory>, Uuid)>,
+    publication: Option<RegionPublication>,
     admit: impl Fn(&DeploymentRecord) -> Result<()>,
     run: F,
 ) -> Result<T>
@@ -324,14 +329,14 @@ where
     let mut io =
         IoRegion::new().child_holding(witness.map(|lock| Arc::new(lock) as Arc<dyn Send + Sync>));
     if matches!(media, CellStorage::S3 { .. }) {
-        if let Some((owner, operation)) = publication {
-            track_checkpoint_stage_publications(
-                &mut io,
-                owner,
-                deployment.to_owned(),
-                region,
-                operation,
-            );
+        match publication {
+            Some(RegionPublication::Stage(owner, operation)) => {
+                track_checkpoint_stage_publications(&mut io, owner, deployment.to_owned(), region, operation);
+            }
+            Some(RegionPublication::Capture(owner)) => {
+                track_publications(&mut io, owner, deployment.to_owned(), region, None);
+            }
+            None => (),
         }
     }
     let admitted = update_installation(directory, deployment, |record| {

@@ -19,7 +19,7 @@ use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use crate::{
-    admin::flush_checkpoint,
+    admin::{flush_checkpoint, pin_checkpoint_suffix},
     archive::{self, CapturePoint},
     control::ControlKey,
     deployment::CellStorage,
@@ -44,6 +44,11 @@ struct Request {
 #[serde(tag = "operation", rename_all = "snake_case", deny_unknown_fields)]
 enum Action {
     CaptureCheckpoint,
+    CaptureCheckpointSuffix {
+        lease: Uuid,
+        basis: rtdb_types::TransactionKey,
+        expires_at_ms: i64,
+    },
     VerifyCheckpointCapture {
         manifest_sha256: String,
         observation: Uuid,
@@ -79,6 +84,14 @@ enum Reply {
         authority: Uuid,
         point: CapturePoint,
         manifest_sha256: String,
+    },
+    SuffixCaptured {
+        name: String,
+        authority: Uuid,
+        capture: Uuid,
+        lease: Uuid,
+        basis: rtdb_types::TransactionKey,
+        archive_sha256: String,
     },
     Verified {
         name: String,
@@ -238,6 +251,27 @@ impl RecoveryService {
                     authority: request.authority,
                     point,
                     manifest_sha256,
+                })
+            }
+            Action::CaptureCheckpointSuffix { lease, basis, expires_at_ms } => {
+                if lease.is_nil() { return Ok(Reply::Refused); }
+                if !installation.checkpoint_suffix_pins.contains_key(&lease) {
+                    pin_checkpoint_suffix(directory.as_ref(), &installation, &self.control,
+                        request.capture, lease, basis, expires_at_ms).await?;
+                }
+                let retained = directory.deployment(&installation.id).await?
+                    .and_then(|current| current.checkpoint_suffix_pins.get(&lease).cloned())
+                    .filter(|pin| pin.capture == request.capture && pin.basis == basis
+                        && pin.expires_at_ms == expires_at_ms)
+                    .ok_or_else(|| Anomaly::new(AnomalyCategory::Unavailable, "rtdb.multi/checkpoint-suffix-unavailable",
+                        "The checkpoint suffix pin changed before archive admission"))?;
+                let archive_sha256 = archive::capture_replica_suffix(
+                    directory, &self.archive, self.keys.as_ref(), self.hosted_task.as_ref(),
+                    request.authority, lease, retained,
+                ).await?;
+                Ok(Reply::SuffixCaptured {
+                    name: installation.name, authority: request.authority,
+                    capture: request.capture, lease, basis, archive_sha256,
                 })
             }
             Action::VerifyCheckpointCapture {
