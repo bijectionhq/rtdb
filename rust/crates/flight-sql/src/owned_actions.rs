@@ -161,6 +161,9 @@ pub(crate) const COMMIT_HELD_WORLDS_V4: &str = "rtdb.owned.CommitHeldWorlds.v4";
 pub(crate) const COMMIT_WORLD_V3: &str = "rtdb.owned.CommitWorld.v3";
 const MAX_WORLD_WITNESSES: usize = 128;
 const WORLD_POINT_WITNESS: &str = "rtdb.owned.world_point_witness";
+const WORLD_RANGE_WITNESS: &str = "rtdb.owned.world_range_witness";
+pub(crate) const HELD_WORLD_RANGE_V1: &str = "rtdb.owned.ReadHeldWorldRange.v1";
+pub(crate) const HELD_WORLD_COUNT_V1: &str = "rtdb.owned.CountHeldWorldRange.v1";
 pub(crate) const SEARCH_HELD_WORLD_V1: &str = "rtdb.owned.SearchHeldWorld.v1";
 pub(crate) const SEARCH_HELD_OWNED_V4: &str = "rtdb.owned.SearchHeld.v4";
 pub(crate) const HELD_OWNED_RANGE_V1: &str = "rtdb.owned.ReadHeldRange.v1";
@@ -270,6 +273,11 @@ fn witnessed_schema(
     let mut metadata = schema.metadata().clone();
     metadata.insert(OWNED_RANGE_WITNESS.into(), nonce.simple().to_string());
     Ok(Some((schema.clone().with_metadata(metadata), charge)))
+}
+
+fn count_batch(count: u64) -> Result<RecordBatch, Status> {
+    let schema = Arc::new(Schema::new(vec![Field::new("count", DataType::UInt64, false)]));
+    RecordBatch::try_new(schema, vec![Arc::new(UInt64Array::from(vec![count]))]).map_err(arrow)
 }
 
 impl Leased for OwnedReadResource {
@@ -1184,11 +1192,57 @@ impl Service {
         } else {
             held.snapshot.count_range_observed(&relation, &path, request).await
         }.map_err(status)?;
-        let schema = Arc::new(Schema::new(vec![Field::new("count", DataType::UInt64, false)]));
-        let batch = RecordBatch::try_new(Arc::clone(&schema), vec![Arc::new(UInt64Array::from(vec![counted.count]))]).map_err(arrow)?;
+        let batch = count_batch(counted.count)?;
+        let schema = batch.schema();
         let observed = witnessed_schema(call, &held, &relation, &schema, evidence)?;
         let output_schema = observed.as_ref().map_or(schema.as_ref(), |(schema, _)| schema);
         let reply = self.owned_point_reply(output_schema, Some(&batch), counted.present, counted.valid_at, None)?;
+        held.snapshot.check_relation(&relation).map_err(status)?;
+        Ok(reply)
+    }
+
+    pub(crate) async fn held_world_ordered_action(&self, call: &Call, body: &[u8], count: bool) -> Result<ActionResult, Status> {
+        if !self.0.config.owned_native_actions { return Err(unsupported()); }
+        let (handle, request) = body.split_first_chunk::<16>().ok_or_else(|| invalid("Missing held world range handle"))?;
+        let held = self.owned_world_read(call, &Bytes::copy_from_slice(handle))?;
+        let (relation, arrow) = split_relation(request)?;
+        let batch = decode_batch(call, arrow)?;
+        let fields = if count { 4 } else { 7 };
+        if batch.batch().num_rows() != 1 || batch.batch().num_columns() != fields {
+            return Err(invalid("Invalid held world range arguments"));
+        }
+        let (mut rows, _decoded) = upload::domain_documents(batch.batch(), self)?;
+        let row = rows.pop().expect("validated one row");
+        let (Some(Value::Utf8(path)), Some(lower), Some(upper), Some(Value::I64(valid_at))) =
+            (row.get("path"), row.get("lower"), row.get("upper"), row.get("valid_micros"))
+        else { return Err(invalid("Invalid held world range fields")); };
+        let path = OwnedRelation::new(path.as_str()).map_err(status)?;
+        let valid_at = Timestamp(*valid_at);
+        let lower = compound_bound(Some(lower))?;
+        let upper = compound_bound(Some(upper))?;
+        let (schema, page, witness, count_rows) = if count {
+            let request = OwnedCountRequest { lower, upper, valid_at };
+            let (count, witness) = held.snapshot.count(relation.clone(), path, request).await.map_err(status)?;
+            let rows = count_batch(count)?;
+            (rows.schema(), None, witness, Some(rows))
+        } else {
+            let (Some(after), Some(Value::Bool(descending)), Some(Value::I64(limit))) =
+                (row.get("after"), row.get("descending"), row.get("limit"))
+            else { return Err(invalid("Invalid held world range page")); };
+            let request = OwnedRangeRequest {
+                lower, upper, after: compound_bound(Some(after))?, descending: *descending,
+                limit: usize::try_from(*limit).map_err(|_| invalid("Invalid held world range limit"))?,
+            };
+            let (page, witness) = held.snapshot.range(relation.clone(), path, request, valid_at).await.map_err(status)?;
+            (page.schema, page.batch, witness, None)
+        };
+        let _charge = call.reserve(wire::add(wire::schema_bound(&schema)?, 256)?)?;
+        let nonce = held.remember(call, witness)?;
+        let mut metadata = schema.metadata().clone();
+        metadata.insert(WORLD_RANGE_WITNESS.into(), nonce.simple().to_string());
+        let schema = schema.as_ref().clone().with_metadata(metadata);
+        let rows = count_rows.as_ref().or_else(|| page.as_ref().map(OwnedBatch::batch));
+        let reply = self.owned_point_reply(&schema, rows, held.snapshot.present(), valid_at, None)?;
         held.snapshot.check_relation(&relation).map_err(status)?;
         Ok(reply)
     }

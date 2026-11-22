@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use futures::future::BoxFuture;
 use rtdb_columnar::MemoryReservation;
-use rtdb_node::{Database, NativeSession, Node, OwnedWorldWitness};
+use rtdb_node::{Database, NativeSession, Node, OwnedCountRequest, OwnedRangePage, OwnedRangeRequest, OwnedWorldWitness};
 use rtdb_types::{EntityId, Interval, OwnedRelation, Result, StructFields, Timestamp, TransactionKey, Value};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
@@ -58,6 +58,12 @@ pub trait OwnedWorldRead: Send + Sync {
         &'a self, partitions: Vec<(OwnedRelation, OwnedRelation)>, query: String, offset: usize, limit: usize,
         valid: Timestamp,
     ) -> BoxFuture<'a, Result<(rtdb_node::OwnedSearchPage, Vec<OwnedWorldWitness>)>>;
+    fn range<'a>(
+        &'a self, relation: OwnedRelation, path: OwnedRelation, request: OwnedRangeRequest<'a>, valid: Timestamp,
+    ) -> BoxFuture<'a, Result<(OwnedRangePage, OwnedWorldWitness)>>;
+    fn count<'a>(
+        &'a self, relation: OwnedRelation, path: OwnedRelation, request: OwnedCountRequest<'a>,
+    ) -> BoxFuture<'a, Result<(u64, OwnedWorldWitness)>>;
     fn parent_pin(&self) -> rtdb_types::Iid;
     fn until(&self) -> Timestamp;
     fn evidence_until(&self) -> Timestamp;

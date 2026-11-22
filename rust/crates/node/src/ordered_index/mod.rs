@@ -192,6 +192,13 @@ pub struct OwnedRangeCount {
     pub valid_at: rtdb_types::Timestamp,
 }
 
+pub async fn range_owned_cut(
+    context: Arc<QueryContext>, owner: &str, relation: &rtdb_types::OwnedRelation,
+    path: &rtdb_types::OwnedRelation, request: OwnedRangeRequest<'_>, valid: rtdb_types::Timestamp,
+) -> Result<OwnedRangePage> {
+    owned_range(context, owner, relation, path, RowBounds::Compound(request), Some(valid)).await
+}
+
 struct OwnedProjection {
     fields: Vec<Field>,
     empty: bool,
@@ -235,7 +242,7 @@ pub(crate) async fn owned_range(
     rtdb_storage::IoRegion::leased(context.catalog.read_lease(), work).await
 }
 
-pub(crate) async fn owned_count(
+pub async fn owned_count(
     context: Arc<QueryContext>,
     owner: &str,
     relation: &rtdb_types::OwnedRelation,

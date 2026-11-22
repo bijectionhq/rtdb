@@ -1,6 +1,6 @@
 use std::time::Duration;
 
-use rtdb_node::NodeOptions;
+use rtdb_node::{NodeOptions, OwnedCountRequest, OwnedRangePage, OwnedRangeRequest};
 use rtdb_storage::cache::CacheBudget;
 use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
@@ -48,6 +48,17 @@ enum ArchiveRead {
         guard: Arc<dyn Fn() -> Result<()> + Send + Sync>,
         reply: oneshot::Sender<Result<rtdb_node::OwnedSearchPage>>,
     },
+    Ordered {
+        relation: OwnedRelation,
+        path: OwnedRelation,
+        frontier: i64,
+        lower: Option<StructFields<Value>>,
+        upper: Option<StructFields<Value>>,
+        valid: Timestamp,
+        read: OrderedRead,
+        guard: Arc<dyn Fn() -> Result<()> + Send + Sync>,
+        reply: oneshot::Sender<Result<OrderedResult>>,
+    },
     Boundaries {
         relation: OwnedRelation,
         id: EntityId,
@@ -63,6 +74,16 @@ enum ArchiveRead {
         guard: Arc<dyn Fn() -> Result<()> + Send + Sync>,
         reply: oneshot::Sender<Result<rtdb_query::OwnedIdentityCandidates>>,
     },
+}
+
+enum OrderedRead {
+    Page { after: Option<StructFields<Value>>, descending: bool, limit: usize },
+    Count,
+}
+
+enum OrderedResult {
+    Page(OwnedRangePage),
+    Count(u64),
 }
 
 pub(crate) struct WorldIdentityPage {
@@ -143,7 +164,7 @@ impl HeldCheckpointWorld {
     ) -> Result<(rtdb_node::OwnedSearchPage, Vec<OwnedWorldWitness>)> {
         self.check()?;
         let guard = self.open.snapshot.relation_release_guard(partitions.iter().map(|(relation, _)| relation))?;
-        let witnesses = self.open.snapshot.retained_world_search_witnesses(
+        let witnesses = self.open.snapshot.retained_world_relation_witnesses(
             self.open.record.id, partitions.iter().map(|(relation, _)| relation),
         ).await?;
         let frontiers = witnesses.iter().map(OwnedWorldWitness::purge_frontier).collect();
@@ -156,6 +177,47 @@ impl HeldCheckpointWorld {
         self.check()?;
         guard()?;
         Ok((page, witnesses))
+    }
+
+    pub async fn range(
+        &self, relation: OwnedRelation, path: OwnedRelation, request: OwnedRangeRequest<'_>, valid: Timestamp,
+    ) -> Result<(OwnedRangePage, OwnedWorldWitness)> {
+        let read = OrderedRead::Page {
+            after: request.after.cloned(), descending: request.descending, limit: request.limit,
+        };
+        let (result, witness) = self.ordered(relation, path, request.lower, request.upper, valid, read).await?;
+        let OrderedResult::Page(page) = result else { return Err(OwnedWorld::unavailable()); };
+        Ok((page, witness))
+    }
+
+    pub async fn count(
+        &self, relation: OwnedRelation, path: OwnedRelation, request: OwnedCountRequest<'_>,
+    ) -> Result<(u64, OwnedWorldWitness)> {
+        let (result, witness) = self.ordered(relation, path, request.lower, request.upper, request.valid_at, OrderedRead::Count).await?;
+        let OrderedResult::Count(count) = result else { return Err(OwnedWorld::unavailable()); };
+        Ok((count, witness))
+    }
+
+    async fn ordered(
+        &self, relation: OwnedRelation, path: OwnedRelation, lower: Option<&StructFields<Value>>,
+        upper: Option<&StructFields<Value>>, valid: Timestamp, read: OrderedRead,
+    ) -> Result<(OrderedResult, OwnedWorldWitness)> {
+        self.check_relation(&relation)?;
+        Interval::at(valid)?;
+        let guard = self.open.snapshot.relation_release_guard([&relation])?;
+        let witness = self.open.snapshot.retained_world_relation_witnesses(
+            self.open.record.id, [&relation],
+        ).await?.pop().ok_or_else(OwnedWorld::unavailable)?;
+        let (reply, result) = oneshot::channel();
+        self.cancellation.run_until_cancelled(self.requests.send(ArchiveRead::Ordered {
+            relation, path, frontier: witness.purge_frontier(), lower: lower.cloned(), upper: upper.cloned(),
+            valid, read, guard: Arc::clone(&guard), reply,
+        })).await.ok_or_else(OwnedWorld::unavailable)?.map_err(|_| OwnedWorld::unavailable())?;
+        let result = self.cancellation.run_until_cancelled(result).await
+            .ok_or_else(OwnedWorld::unavailable)?.map_err(|_| OwnedWorld::unavailable())??;
+        self.check()?;
+        guard()?;
+        Ok((result, witness))
     }
 
     pub async fn valid_during(
@@ -381,6 +443,38 @@ pub(crate) async fn open_held_checkpoint_world(
                                         let page = rtdb_node::rank_owned_cut(scoped, &owner, &partitions, &query, offset, limit, Some(valid)).await?;
                                         guard()?;
                                         Ok(page)
+                                    };
+                                    let response = tokio::select! {
+                                        _ = scope.cancelled() => break,
+                                        _ = reply.closed() => continue,
+                                        result = read => result,
+                                    };
+                                    let _ = reply.send(response);
+                                }
+                                ArchiveRead::Ordered { relation, path, frontier, lower, upper, valid, read, guard, mut reply } => {
+                                    let read = async {
+                                        guard()?;
+                                        require_relation_purge_history(&context, &owner)?;
+                                        let database = context.catalog.database(context.catalog.default_database())?;
+                                        let [snapshot] = database.partitions.as_slice() else { return Err(OwnedWorld::unavailable()); };
+                                        if snapshot.relation_event_frontier(&relation.purge_table(&owner))? != frontier {
+                                            return Err(OwnedWorld::unavailable());
+                                        }
+                                        let context = Arc::clone(&context).with_owned_read_guard(Arc::clone(&guard));
+                                        let (lower, upper) = (lower.as_ref(), upper.as_ref());
+                                        let result = match read {
+                                            OrderedRead::Page { after, descending, limit } => {
+                                                let request = OwnedRangeRequest { lower, upper, after: after.as_ref(), descending, limit };
+                                                OrderedResult::Page(rtdb_node::range_owned_cut(context, &owner, &relation, &path, request, valid).await?)
+                                            }
+                                            OrderedRead::Count => {
+                                                let request = OwnedCountRequest { lower, upper, valid_at: valid };
+                                                let counted = rtdb_node::count_owned_cut(context, &owner, &relation, &path, request).await?;
+                                                OrderedResult::Count(counted.count)
+                                            }
+                                        };
+                                        guard()?;
+                                        Ok(result)
                                     };
                                     let response = tokio::select! {
                                         _ = scope.cancelled() => break,

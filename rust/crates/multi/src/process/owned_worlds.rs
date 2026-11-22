@@ -3,7 +3,7 @@ use std::{fmt, sync::Arc};
 use futures::future::BoxFuture;
 use rtdb_directory::{Directory, HostedTask};
 use rtdb_flight_sql::{OwnedWorldHost, OwnedWorldRead, WorldCall, WorldIdentityPage, WorldPointResult, WorldPointRow};
-use rtdb_node::{NodeOptions, OwnedWorldWitness};
+use rtdb_node::{NodeOptions, OwnedCountRequest, OwnedRangePage, OwnedRangeRequest, OwnedWorldWitness};
 use rtdb_types::{EntityId, Interval, OwnedRelation, OwnedWorld, Result, Timestamp, TransactionKey};
 use uuid::Uuid;
 
@@ -107,6 +107,16 @@ impl OwnedWorldRead for HeldCheckpointWorld {
         limit: usize, valid: Timestamp,
     ) -> BoxFuture<'a, Result<(rtdb_node::OwnedSearchPage, Vec<OwnedWorldWitness>)>> {
         Box::pin(HeldCheckpointWorld::ranked_search(self, partitions, query, offset, limit, valid))
+    }
+    fn range<'a>(
+        &'a self, relation: OwnedRelation, path: OwnedRelation, request: OwnedRangeRequest<'a>, valid: Timestamp,
+    ) -> BoxFuture<'a, Result<(OwnedRangePage, OwnedWorldWitness)>> {
+        Box::pin(HeldCheckpointWorld::range(self, relation, path, request, valid))
+    }
+    fn count<'a>(
+        &'a self, relation: OwnedRelation, path: OwnedRelation, request: OwnedCountRequest<'a>,
+    ) -> BoxFuture<'a, Result<(u64, OwnedWorldWitness)>> {
+        Box::pin(HeldCheckpointWorld::count(self, relation, path, request))
     }
     fn parent_pin(&self) -> rtdb_types::Iid { HeldCheckpointWorld::parent_pin(self) }
     fn until(&self) -> Timestamp { HeldCheckpointWorld::until(self) }
