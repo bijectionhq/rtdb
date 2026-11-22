@@ -201,6 +201,14 @@ pub(super) fn exhaustive_corpus(rows: &[Vec<Value>]) -> Corpus {
     corpus
 }
 
+pub(super) fn corpus_score_sql(query: &str, corpus: &Corpus) -> String {
+    let frequencies = Query::parse(query).terms().iter()
+        .map(|term| corpus.frequencies.get(term).copied().unwrap_or(0).to_string())
+        .collect::<Vec<_>>().join(", ");
+    let query = query.replace('\'', "''");
+    format!("SEARCH_SCORE(body, '{query}', {}, {}, ARRAY[{frequencies}])", corpus.documents, corpus.tokens)
+}
+
 async fn verify_ranking(
     session: &mut NativeSession, checkpoint: &CorpusCheckpoint, valid: Timestamp, system: Timestamp,
 ) {
@@ -216,10 +224,8 @@ async fn verify_ranking(
     });
     let expected: Vec<_> = expected.into_iter().take(20)
         .map(|(id, score)| vec![Value::I64(id), Value::F64(score)]).collect();
-    let ranked = format!(
-        "SELECT _id, SEARCH_SCORE(body, 'alpha beta') AS score FROM docs {} WHERE MATCH(body, 'invoice') ORDER BY score DESC, _id LIMIT 20",
-        as_of(valid, system),
-    );
+    let score = corpus_score_sql("alpha beta", &checkpoint.totals);
+    let ranked = format!("SELECT _id, {score} AS score FROM docs {} WHERE MATCH(body, 'invoice') ORDER BY score DESC, _id LIMIT 20", as_of(valid, system));
     assert_eq!(query(session, &ranked).await, expected, "{ranked} at checkpoint {:?}", checkpoint.basis);
 }
 

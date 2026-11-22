@@ -256,19 +256,20 @@ const FILTERS: [(&str, &str); 3] = [
     ("phrase", "\"report approved\" needle"),
 ];
 
-fn ranking_sql(filter: &str, valid: Timestamp, basis: Timestamp, limited: bool) -> String {
+fn ranking_sql(filter: &str, valid: Timestamp, basis: Timestamp, corpus: &Corpus, limited: bool) -> String {
     let limit = if limited { " LIMIT 20" } else { "" };
-    format!("SELECT _id, SEARCH_SCORE(body, 'audit') AS score, department, _system_from FROM docs {} \
+    let score = super::corpus_checkpoint::corpus_score_sql("audit", corpus);
+    format!("SELECT _id, {score} AS score, department, _system_from FROM docs {} \
              WHERE MATCH(body, '{filter}') ORDER BY score DESC, _id{limit}", as_of(valid, basis))
 }
 
-async fn baseline(session: &mut NativeSession, valid: Timestamp, basis: Timestamp, iterations: usize) -> (Vec<Vec<Row>>, Vec<Json>) {
+async fn baseline(session: &mut NativeSession, valid: Timestamp, basis: Timestamp, corpus: &Corpus, iterations: usize) -> (Vec<Vec<Row>>, Vec<Json>) {
     let mut expected = Vec::new();
     let mut timings = Vec::new();
     for (name, filter) in FILTERS {
-        let all = query(session, &ranking_sql(filter, valid, basis, false)).await;
+        let all = query(session, &ranking_sql(filter, valid, basis, corpus, false)).await;
         let top: Vec<_> = all.into_iter().take(LIMIT).collect();
-        let statement = ranking_sql(filter, valid, basis, true);
+        let statement = ranking_sql(filter, valid, basis, corpus, true);
         let mut samples = Vec::with_capacity(iterations);
         for _ in 0..iterations {
             let start = Instant::now();
@@ -422,7 +423,7 @@ pub(super) async fn run(documents: i64, iterations: usize) {
     assert_eq!(rows.len(), documents as usize);
     let corpus = exhaustive_corpus(&rows);
     let rows = Arc::new(by_iid(rows));
-    let (expected, sql_baseline) = baseline(&mut session, valid, basis, iterations).await;
+    let (expected, sql_baseline) = baseline(&mut session, valid, basis, &corpus, iterations).await;
 
     let mut generations = Vec::new();
     for files in [5, 25, 100] {
@@ -442,8 +443,8 @@ pub(super) async fn run(documents: i64, iterations: usize) {
         sql("INSERT INTO docs RECORDS {_id: 305, body: NULL, department: -3, _valid_from: TIMESTAMP '1970-01-01T00:00:00Z'}"),
     ]).await;
     let touched = [0, 101, 202, 305];
-    let (after_expected, _) = baseline(&mut session, valid, after, 1).await;
-    let after_corpus = exhaustive_corpus(&snapshot_rows(&mut session, after, after, "").await);
+    let after_corpus = exhaustive_corpus(&snapshot_rows(&mut session, valid, after, "").await);
+    let (after_expected, _) = baseline(&mut session, valid, after, &after_corpus, 1).await;
     let base = &generations[0].0;
     assert!(Overlay::resolve(directory, &mut session, base, after, &touched, false).await.is_none());
     let start = Instant::now();
@@ -464,7 +465,7 @@ pub(super) async fn run(documents: i64, iterations: usize) {
     node.sync_all(Duration::from_secs(30), &CancellationToken::new()).await.unwrap();
     database.build_artefacts().await.unwrap();
     let churn_storage = write_sizes(listing(database.object_store().as_ref(), &table).await, &old_keys);
-    let (after_compaction, _) = baseline(&mut session, valid, after, 1).await;
+    let (after_compaction, _) = baseline(&mut session, valid, after, &after_corpus, 1).await;
     assert_eq!(after_compaction, after_expected);
     let mut layouts = Vec::new();
     for (generation, build_us, measurements) in &generations {

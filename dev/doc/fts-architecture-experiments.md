@@ -118,6 +118,7 @@ The search regression checks the sparse path directly with phrase positions and 
 
 The reported checkpoint and delta sizes are from the JSON prototype.
 The current benchmark writes both checkpoints and deltas as Arrow IPC.
+The SQL reference scores with the same explicit corpus as checkpoint replay at each cut.
 
 The checkpoint harness builds an IID-to-contribution map from a real SQL snapshot at `(basis, basis)`.
 Each transition retracts the old contributions for changed IIDs and valid-time boundaries crossed, then reads authoritative point values for those IDs and adds their contributions.
