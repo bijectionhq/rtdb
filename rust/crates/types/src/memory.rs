@@ -125,6 +125,18 @@ impl MemoryBudget {
     pub fn used_bytes(&self) -> usize { self.used_bytes.load(Ordering::Acquire) }
     pub fn peak_bytes(&self) -> usize { self.peak_bytes.load(Ordering::Relaxed) }
     pub fn limit_bytes(&self) -> usize { self.limit_bytes }
+
+    /// Estimates the bytes available under this limit and all ancestor limits.
+    /// A subsequent reservation still checks the shared limits.
+    pub fn available_bytes(&self) -> usize {
+        let mut available = self.limit_bytes.saturating_sub(self.used_bytes());
+        let mut budget = self;
+        while let Some(parent) = &budget.parent {
+            available = available.min(parent.limit_bytes.saturating_sub(parent.used_bytes()));
+            budget = parent;
+        }
+        available
+    }
 }
 
 impl Drop for MemoryBudget {

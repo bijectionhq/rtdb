@@ -50,16 +50,16 @@ fn cursor(execution: &Execution,schema: Schema,pages: Vec<Vec<Vec<Value>>>,group
 }
 fn row(group: i64,value: i64) -> Vec<Value> { vec![Value::I64(group),Value::I64(value)] }
 
+struct Batches(Option<ColumnBatch>);
+#[async_trait]
+impl BatchCursor for Batches {
+    async fn next_batch(&mut self) -> Result<Option<ColumnBatch>> { Ok(self.0.take()) }
+}
+
 #[tokio::test]
 async fn global_reductions_emit_arrow_vectors_for_nullable_and_empty_inputs() {
     use arrow_array::{Float64Array, RecordBatch};
     use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
-
-    struct Batches(Option<ColumnBatch>);
-    #[async_trait]
-    impl BatchCursor for Batches {
-        async fn next_batch(&mut self) -> Result<Option<ColumnBatch>> { Ok(self.0.take()) }
-    }
 
     let execution = execution(1);
     let memory = &execution.context.memory;
@@ -93,6 +93,66 @@ async fn global_reductions_emit_arrow_vectors_for_nullable_and_empty_inputs() {
         }
         assert!(cursor.next_batch().await.unwrap().is_none());
     }
+}
+
+#[tokio::test]
+async fn grouped_count_excludes_null_runs() {
+    use arrow_array::{Float64Array, Int16Array, Int64Array, RecordBatch, RunArray, types::Int16Type};
+    use arrow_schema::Schema as ArrowSchema;
+    use rtdb_types::RunEndWidth;
+
+    let execution = execution(1);
+    let memory = &execution.context.memory;
+    let key = LogicalType::Scalar(ScalarType::F64);
+    let runs = LogicalType::RunEndEncoded {
+        width: RunEndWidth::I16,
+        value: Box::new(LogicalType::Scalar(ScalarType::I64).maybe()),
+    };
+    let schema = Schema::new(vec![field(0, key.clone()), field(1, runs.clone())]).unwrap();
+    let input = Arc::new(Relation::new(schema.clone(), RelationNode::Values { rows: vec![] }).unwrap());
+    let groups = vec![NamedExpr { field: field(2, key.clone()), expr: schema.fields()[0].expression() }];
+    let aggregates = vec![AggregateExpr {
+        function: AggregateFunction::Count,
+        argument: Some(schema.fields()[1].expression()),
+        ..count(3, None)
+    }];
+    let output = Schema::new(vec![groups[0].field.clone(), aggregates[0].field.clone()]).unwrap();
+    let relation = Arc::new(Relation::new(output, RelationNode::Aggregate { input, groups: groups.clone(), aggregates: aggregates.clone() }).unwrap());
+    let runtime = EmittedRelation::derive(relation, &execution.context.catalog, &[], memory).unwrap();
+    let physical = Arc::new(ArrowSchema::new(vec![
+        rtdb_columnar::to_field("c0", &key).unwrap(),
+        rtdb_columnar::to_field("c1", &runs).unwrap(),
+    ]));
+    let values = RunArray::<Int16Type>::try_new(
+        &Int16Array::from(vec![1, 3]), &Int64Array::from(vec![Some(7), None]),
+    ).unwrap();
+    let batch = RecordBatch::try_new(physical, vec![Arc::new(Float64Array::from(vec![1.0; 3])), Arc::new(values)]).unwrap();
+    let batch = ColumnBatch::from_owned(rtdb_columnar::OwnedBatch::new(batch, memory).unwrap()).unwrap();
+    let mut cursor = AggregateCursor::from_batches(
+        Box::new(Batches(Some(batch))), false, schema, groups, aggregates, runtime, execution.clone(),
+    ).unwrap();
+    let result = cursor.next_batch().await.unwrap().unwrap();
+    assert_eq!(result.len, 1);
+    assert_eq!(result.columns[0].value(0).unwrap(), Value::F64(1.0));
+    assert_eq!(result.columns[1].value(0).unwrap(), Value::I64(1));
+}
+
+#[test]
+fn count_does_not_use_the_parent_bitmap_for_nested_cells_that_can_fail_to_read() {
+    use arrow_array::{ListArray, StringArray};
+    use arrow_buffer::OffsetBuffer;
+    use arrow_schema::DataType;
+
+    let logical = LogicalType::list(LogicalType::Scalar(ScalarType::Uri));
+    let field = Arc::new(rtdb_columnar::to_field("c0", &logical).unwrap());
+    let DataType::List(child) = field.data_type() else { panic!("Expected list"); };
+    let array = Arc::new(ListArray::new(
+        Arc::clone(child), OffsetBuffer::new(vec![0, 1].into()),
+        Arc::new(StringArray::from(vec!["%"])), None,
+    ));
+    let column = Column::Arrow { array, field, logical: Some(logical) };
+    assert!(column.value(0).is_err());
+    assert!(marked_nulls(&column).is_none());
 }
 
 struct PercentileInput { next: usize,count: usize,fail_after: bool,memory: Arc<MemoryBudget> }

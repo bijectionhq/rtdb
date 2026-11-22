@@ -1846,8 +1846,15 @@ surface QueryAccess {
         -- DISTINCT and set operations with columnar inputs select their output positions from those Arrow batches.
         -- Their key index retains Arrow batches and compares compatible nulls, booleans, signed integers, text and binary cells at their indexed positions.
         -- Compatible global counts and floating-point sums and averages reduce Arrow columns and emit scalar result vectors.
+        -- Compatible grouping columns can use the first Arrow position of each key and emit scalar aggregates in that first-seen order.
+        -- Grouped output keeps the configured transport row limit.
         -- UNNEST over compatible Arrow list columns expands the selected child positions and gathers their parent payloads by position.
+        -- A column table over a compatible Arrow list parameter reads the bound row's child slice as one semantic page.
+        -- Its columnar result is split to the transport row limit after the operators have processed the complete page.
         -- Scalar evaluation within a columnar projection reads the cells referenced by the expression.
+        -- A projection over a direct scan retains its compatible input columns when other expressions use scalar evaluation.
+        -- Its output is split to the transport row limit after each semantic page is evaluated.
+        -- A list expression over inputs with a shared scalar layout interleaves the child values in Arrow.
         -- A projected field missing from some pages uses Arrow nulls when the available columns share a layout or form a scalar dense union.
         -- A projected dense union with compatible children retains its Arrow array when it already matches the result layout.
         -- A compatible projected array can be aligned to the result's nested fields and union legs in Arrow.
