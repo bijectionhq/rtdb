@@ -1891,6 +1891,58 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn columnar_sort_limit_opens_aggregate_input_before_evaluating_fetch() {
+        use rtdb_plan::{AggregateExpr, AggregateFunction, Relation, RelationNode, Schema, SortExpr};
+
+        let (state, table, _, store, _) = persisted_page_fixture().await;
+        let storage = Arc::new(BufferPool::new(store, 1 << 20));
+        let (mut scan, mut execution, memory) = descriptor_scan(state.value().snapshot(), table, storage);
+        scan.valid_time = TemporalFilter::At(Expr::Literal(Value::Utf8("invalid instant".into())));
+        execution.parameters = Arc::new(BoundParameters::infer(vec![Value::Utf8("invalid fetch".into())], &memory).unwrap());
+        let field = Field { id: ColumnId(10), name: "n".into(), qualifier: None, qualified_only: false, unnamed: false,
+            data_type: LogicalType::Scalar(ScalarType::I64) };
+        let key = field.expression();
+        let schema = Schema::new(vec![field.clone()]).unwrap();
+        let input = Arc::new(Relation::scan(scan).unwrap());
+        let input = Arc::new(Relation::new(schema.clone(), RelationNode::Aggregate {
+            input, groups: vec![], aggregates: vec![AggregateExpr {
+                field, function: AggregateFunction::CountStar, argument: None, distinct: false, filter: None, order_by: vec![],
+            }],
+        }).unwrap());
+        let relation = Arc::new(Relation::new(schema, RelationNode::SortLimit {
+            input, order_by: vec![SortExpr { expr: key, descending: false, nulls_first: false }],
+            offset: None, fetch: Some(Expr::Parameter { index: 0, data_type: LogicalType::Scalar(ScalarType::I64) }),
+        }).unwrap());
+        let runtime = crate::runtime_schema::EmittedRelation::derive(relation, &execution.context.catalog, execution.parameters.types(), &memory).unwrap();
+        let row = crate::operators::build_pages(Arc::clone(&runtime), execution.clone()).await.err().unwrap();
+        let columnar = crate::operators::build_columns(runtime, execution).await.err().unwrap();
+        assert_ne!(row.code, "xtdb/expected-number");
+        assert_eq!(columnar.code, row.code);
+    }
+
+    #[tokio::test]
+    async fn columnar_zero_fetch_with_offset_still_evaluates_the_order_key() {
+        use rtdb_plan::{BinaryOp, Relation, RelationNode, SortExpr};
+
+        let (state, table, _, store, _) = persisted_page_fixture().await;
+        let storage = Arc::new(BufferPool::new(store, 1 << 20));
+        let (scan, execution, memory) = descriptor_scan(state.value().snapshot(), table, storage);
+        let column = scan.columns[0].expression();
+        let zero = Expr::binary(BinaryOp::Subtract, column.clone(), column);
+        let key = Expr::binary(BinaryOp::Divide, Expr::Literal(Value::I64(1)), zero);
+        let input = Arc::new(Relation::scan(scan).unwrap());
+        let root = Arc::new(Relation::new(input.schema().clone(), RelationNode::SortLimit {
+            input, order_by: vec![SortExpr { expr: key, descending: false, nulls_first: false }],
+            offset: Some(Expr::Literal(Value::I64(1))), fetch: Some(Expr::Literal(Value::I64(0))),
+        }).unwrap());
+        let runtime = crate::runtime_schema::EmittedRelation::derive(root, &execution.context.catalog, &[], &memory).unwrap();
+        let mut row = crate::operators::build_pages(Arc::clone(&runtime), execution.clone()).await.unwrap();
+        let mut columnar = crate::operators::build_columns(runtime, execution).await.unwrap().unwrap();
+        let error = row.next_page().await.err().unwrap();
+        assert_eq!(columnar.next_batch().await.err().unwrap().code, error.code);
+    }
+
+    #[tokio::test]
     async fn multi_column_distinct_and_set_operations_select_arrow_rows() {
         use rtdb_plan::{BinaryOp, NamedExpr, Relation, RelationNode, SetOperator};
 
@@ -2010,6 +2062,35 @@ mod tests {
             assert_eq!(values, expected);
             assert_eq!(ordinals, [1, 2, 3]);
         }
+    }
+
+    #[tokio::test]
+    async fn materialized_cold_scan_replays_arrow_batches_for_both_references() {
+        use rtdb_plan::{MaterializedBinding, Relation, RelationNode, SetOperator};
+
+        let (state, table, _, store, _) = persisted_page_fixture().await;
+        let storage = Arc::new(BufferPool::new(store, 1 << 20));
+        let (scan, execution, memory) = descriptor_scan(state.value().snapshot(), table, storage);
+        let scan = Arc::new(Relation::scan(scan).unwrap());
+        let schema = scan.schema().clone();
+        let binding = Arc::new(MaterializedBinding { name: "cte".into(), relation: scan });
+        let reference = Arc::new(Relation::new(schema.clone(), RelationNode::Reference { binding: Arc::clone(&binding) }).unwrap());
+        let body = Arc::new(Relation::new(schema.clone(), RelationNode::Set {
+            left: Arc::clone(&reference), right: reference, operator: SetOperator::Union, all: true,
+        }).unwrap());
+        let relation = Arc::new(Relation::new(schema, RelationNode::Let { binding, body }).unwrap());
+        let runtime = crate::runtime_schema::EmittedRelation::derive(relation, &execution.context.catalog, &[], &memory).unwrap();
+        let mut cursor = crate::operators::build_columns(runtime, execution.clone()).await.unwrap().expect("Expected Arrow CTE execution");
+        assert!(execution.context.spill_bytes() > 0);
+        let mut values = Vec::new();
+        while let Some(batch) = cursor.next_batch().await.unwrap() {
+            let [crate::columnar::Column::Arrow { array, .. }] = batch.columns.as_slice() else { panic!("Expected Arrow IPC output"); };
+            let array = array.as_any().downcast_ref::<arrow_array::Int64Array>().unwrap();
+            values.extend(array.values().iter().copied());
+        }
+        assert_eq!(values, [1, 2, 3, 1, 2, 3]);
+        drop(cursor);
+        assert_eq!(execution.context.spill_bytes(), 0);
     }
 
     #[tokio::test]

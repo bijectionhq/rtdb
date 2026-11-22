@@ -50,6 +50,51 @@ fn cursor(execution: &Execution,schema: Schema,pages: Vec<Vec<Vec<Value>>>,group
 }
 fn row(group: i64,value: i64) -> Vec<Value> { vec![Value::I64(group),Value::I64(value)] }
 
+#[tokio::test]
+async fn global_reductions_emit_arrow_vectors_for_nullable_and_empty_inputs() {
+    use arrow_array::{Float64Array, RecordBatch};
+    use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
+
+    struct Batches(Option<ColumnBatch>);
+    #[async_trait]
+    impl BatchCursor for Batches {
+        async fn next_batch(&mut self) -> Result<Option<ColumnBatch>> { Ok(self.0.take()) }
+    }
+
+    let execution = execution(1);
+    let memory = &execution.context.memory;
+    let float = LogicalType::Scalar(ScalarType::F64).maybe();
+    let schema = Schema::new(vec![field(0, float.clone())]).unwrap();
+    let input = Arc::new(Relation::new(schema.clone(), RelationNode::Values { rows: vec![] }).unwrap());
+    let argument = schema.fields()[0].expression();
+    let aggregates = vec![count(1, None),
+        AggregateExpr { function: AggregateFunction::Count, argument: Some(argument.clone()), ..count(2, None) },
+        AggregateExpr { field: field(3, float.clone()), function: AggregateFunction::Sum, argument: Some(argument.clone()), ..count(3, None) },
+        AggregateExpr { field: field(4, float), function: AggregateFunction::Average, argument: Some(argument), ..count(4, None) },
+    ];
+    let output = Schema::new(aggregates.iter().map(|aggregate| aggregate.field.clone()).collect()).unwrap();
+    let relation = Arc::new(Relation::new(output, RelationNode::Aggregate { input, groups: vec![], aggregates: aggregates.clone() }).unwrap());
+    let runtime = EmittedRelation::derive(relation, &execution.context.catalog, &[], memory).unwrap();
+    assert!(AggregateCursor::writes_scalar_vectors(&runtime, &[], &aggregates).unwrap());
+    for (values, expected) in [
+        (vec![Some(2.0), None, Some(3.0)], [Value::I64(3), Value::I64(2), Value::F64(5.0), Value::F64(2.5)]),
+        (vec![], [Value::I64(0), Value::I64(0), Value::Null, Value::Null]),
+    ] {
+        let physical = Arc::new(ArrowSchema::new(vec![ArrowField::new("c0", DataType::Float64, true)]));
+        let batch = RecordBatch::try_new(physical, vec![Arc::new(Float64Array::from(values))]).unwrap();
+        let batch = ColumnBatch::from_owned(rtdb_columnar::OwnedBatch::new(batch, memory).unwrap()).unwrap();
+        let mut cursor = AggregateCursor::from_batches(Box::new(Batches(Some(batch))), false, schema.clone(), vec![],
+            aggregates.clone(), Arc::clone(&runtime), execution.clone()).unwrap();
+        let result = cursor.next_batch().await.unwrap().unwrap();
+        assert_eq!(result.len, 1);
+        for (column, value) in result.columns.iter().zip(expected) {
+            assert!(matches!(column, Column::Arrow { .. }));
+            assert_eq!(column.value(0).unwrap(), value);
+        }
+        assert!(cursor.next_batch().await.unwrap().is_none());
+    }
+}
+
 struct PercentileInput { next: usize,count: usize,fail_after: bool,memory: Arc<MemoryBudget> }
 #[async_trait]
 impl RowCursor for PercentileInput {

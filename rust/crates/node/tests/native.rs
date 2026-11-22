@@ -854,6 +854,34 @@ async fn native_logical_queries_execute_bound_relations_with_named_arguments() {
 }
 
 #[tokio::test]
+async fn native_logical_table_scan_and_sort_preserve_their_root_pages() {
+    let mut config = options();
+    config.query.batch_rows = 1;
+    let (node, driver) = running(config, services()).await;
+    let mut session = node.session("xtdb", Arc::new(Authority)).unwrap();
+    let token = session.state().cancellation().child_token();
+    let tx = session.state_mut().execute_tx(vec![put(&node, 1, 10), put(&node, 2, 20)],
+        AutonomousTxOptions::default()).await.unwrap();
+    assert!(tx.committed());
+    let scan = "[:scan {:db-name \"xtdb\" :table #xt/table docs :columns [value]}]";
+    let mut cursor = session.query_ra(scan, StructFields::new(), &token).await.unwrap();
+    let batch = cursor.next_batch().await.unwrap().unwrap();
+    let column = batch.batch().column(0).as_any().downcast_ref::<arrow_array::Int64Array>().unwrap();
+    let mut values = column.values().to_vec();
+    values.sort_unstable();
+    assert_eq!(values, [10, 20]);
+    assert!(cursor.next_batch().await.unwrap().is_none());
+
+    let order = format!("[:sort {{:order-specs [[value {{:direction :desc}}]]}} {scan}]");
+    let mut cursor = session.query_ra(&order, StructFields::new(), &token).await.unwrap();
+    let batch = cursor.next_batch().await.unwrap().unwrap();
+    let column = batch.batch().column(0).as_any().downcast_ref::<arrow_array::Int64Array>().unwrap();
+    assert_eq!(column.values().as_ref(), &[20, 10]);
+    assert!(cursor.next_batch().await.unwrap().is_none());
+    stop(&node, driver).await;
+}
+
+#[tokio::test]
 async fn native_logical_query_checks_named_argument_admission_before_binding() {
     let mut config = options();
     config.replication.enabled = false;

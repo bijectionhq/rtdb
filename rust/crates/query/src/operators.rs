@@ -128,10 +128,10 @@ async fn build_batches_at(
                 let projected = left_projected || right_projected;
                 let input: BoxBatchCursor = Box::new(BatchUnion { left: Some(left), right });
                 if *all { return Ok(Some((input, projected))); }
-                let seen = SeenRows::new(&execution.context, runtime.output())?;
-                return Ok(Some((Box::new(BatchDistinct { input, seen, execution, projected }), projected)));
+                let input = BatchDistinct::new(input, runtime.output(), execution, projected)?;
+                return Ok(Some((Box::new(input), projected)));
             }
-            let seen = SeenRows::new(&execution.context, runtime.child(0)?.output())?;
+            let seen = crate::set_keys::BatchKeyIndex::new(&execution.context)?;
             let input = BatchSet { left, right: Some((right, right_projected)), left_projected, operator: *operator,
                 all: *all, seen, built: None, runtime, execution };
             Ok(Some((Box::new(input), left_projected)))
@@ -167,8 +167,21 @@ async fn build_batches_at(
         }
         RelationNode::Distinct { .. } if output == BatchOutput::Arrow => {
             let Some((input, projected)) = build_batch_input(runtime.child(0)?, execution.child(0), pushdowns, output).await? else { return Ok(None); };
-            let seen = SeenRows::new(&execution.context, runtime.output())?;
-            Ok(Some((Box::new(BatchDistinct { input, seen, execution, projected }), projected)))
+            let input = BatchDistinct::new(input, runtime.output(), execution, projected)?;
+            Ok(Some((Box::new(input), projected)))
+        }
+        RelationNode::Aggregate { groups, aggregates, .. } if output == BatchOutput::Arrow && execution.context.tracer.is_none() => {
+            if !crate::aggregate::AggregateCursor::writes_scalar_vectors(&runtime, groups, aggregates)? { return Ok(None); }
+            let child = runtime.child(0)?;
+            let schema = child.schema().clone();
+            let Some((input, projected)) = build_batches(child, execution.child(0), pushdowns).await? else { return Ok(None); };
+            let aggregate = crate::aggregate::AggregateCursor::from_batches(input, projected, schema,
+                groups.clone(), aggregates.clone(), runtime, execution)?;
+            Ok(Some((Box::new(aggregate), false)))
+        }
+        RelationNode::Reference { binding } if output == BatchOutput::Arrow => {
+            let scope = execution.bindings.as_ref().ok_or_else(|| invalid("missing-relation", "Reference has no lexical binding"))?;
+            Ok(Some((scope.open_columns(binding).await?, false)))
         }
         RelationNode::Sort { order_by, .. } | RelationNode::SortLimit { order_by, .. } if output == BatchOutput::Arrow => {
             if matches!(relation.node(), RelationNode::SortLimit { fetch: Some(_), .. }) && !execution.context.accelerators.is_empty()
@@ -180,23 +193,29 @@ async fn build_batches_at(
             let schema = child.schema().clone();
             let computed = !BatchSort::supports(&schema, order_by);
             if computed && !computed_batch_sort(order_by) { return Ok(None); }
+            let pushdowns = match relation.node() {
+                RelationNode::SortLimit { offset, fetch, .. } if offset.is_some() || fetch.is_some() => None,
+                _ => pushdowns,
+            };
+            let Some((batches, projected)) = build_batch_input(child, execution.child(0), pushdowns, output).await? else { return Ok(None); };
+            let (offset, limit) = match relation.node() {
+                RelationNode::SortLimit { offset, fetch, .. } => {
+                    let offset = row_limit(offset.as_ref(), &execution).await?.unwrap_or(0);
+                    let count = row_limit(fetch.as_ref(), &execution).await?.unwrap_or(i64::MAX as u64);
+                    if count == 0 && offset == 0 {
+                        let empty = BatchLimit { input: Some(batches), offset, remaining: Some(0), context: execution.context };
+                        return Ok(Some((Box::new(empty), projected || computed)));
+                    }
+                    (offset, offset.saturating_add(count).min(i64::MAX as u64))
+                }
+                _ => (0, i64::MAX as u64),
+            };
             let computed_type = if computed {
                 let scope = execution.scope()?;
                 let ty = execution.expression_type(&scope, &order_by[0].expr, &schema)?;
                 if !batch_ordered_type(&ty) { return Ok(None); }
                 Some(ty)
             } else { None };
-            let (offset, limit, pushdowns) = match relation.node() {
-                RelationNode::SortLimit { offset, fetch, .. } => {
-                    let offset_rows = row_limit(offset.as_ref(), &execution).await?.unwrap_or(0);
-                    let count = row_limit(fetch.as_ref(), &execution).await?.unwrap_or(i64::MAX as u64);
-                    if count == 0 { return Ok(None); }
-                    let pushdowns = if offset.is_some() || fetch.is_some() { None } else { pushdowns };
-                    (offset_rows, offset_rows.saturating_add(count).min(i64::MAX as u64), pushdowns)
-                }
-                _ => (0, i64::MAX as u64, pushdowns),
-            };
-            let Some((batches, projected)) = build_batch_input(child, execution.child(0), pushdowns, output).await? else { return Ok(None); };
             if let Some(ty) = computed_type {
                 let key = &order_by[0];
                 let next = schema.fields().iter().map(|field| field.id.0).max().unwrap_or(0)
@@ -253,10 +272,46 @@ async fn build_batches_at(
 /// `build_pages` does; `None` where the plan runs as pages.
 pub(crate) async fn build_columns(runtime: Arc<EmittedRelation>, execution: Execution) -> Result<Option<crate::columnar::BoxBatchCursor>> {
     execution.context.check_cancelled()?;
-    if execution.analysis.is_some() || batch_shape(&runtime, BatchOutput::Arrow)?.is_none() { return Ok(None); }
+    if execution.analysis.is_some() { return Ok(None); }
+    if let RelationNode::Let { binding, .. } = runtime.relation().node() {
+        return build_materialized_columns(&runtime, binding, execution).await;
+    }
+    if batch_shape(&runtime, BatchOutput::Arrow)?.is_none() { return Ok(None); }
     let reservation = state_reservation(&runtime, &execution)?;
     let Some((batches, _)) = build_batch_input(runtime, execution, None, BatchOutput::Arrow).await? else { return Ok(None) };
     Ok(Some(crate::columnar::retain_batch_state(batches, reservation)))
+}
+
+async fn build_materialized_columns(runtime: &Arc<EmittedRelation>, binding: &Arc<rtdb_plan::MaterializedBinding>,
+    execution: Execution) -> Result<Option<crate::columnar::BoxBatchCursor>> {
+    let body = runtime.child(1)?;
+    let bound = runtime.child(0)?;
+    if !matches!(bound.relation().node(), RelationNode::Scan(_)) || !columnar_binding_body(&body, binding)?
+        || !bound.schema().fields().iter().all(|field| materialized_arrow_type(&field.data_type))
+        || batch_shape(&bound, BatchOutput::Arrow)?.is_none() {
+        return Ok(None);
+    }
+    let reservation = state_reservation(runtime, &execution)?;
+    let schema = bound.schema().clone();
+    let Some((input, _)) = build_batch_input(bound, execution.child(0), None, BatchOutput::Arrow).await? else { return Ok(None); };
+    let context = &execution.context;
+    let scope = crate::materialized::BindingScope::columns(Arc::clone(binding), input, schema, execution.bindings.clone(), Arc::clone(context))?;
+    let mut body_execution = execution.child(1);
+    body_execution.bindings = Some(Arc::clone(&scope));
+    let (body, _) = build_batch_input(body, body_execution, None, BatchOutput::Arrow).await?
+        .ok_or_else(|| invalid("materialized-binding", "A checked Arrow reference body did not open"))?;
+    let cursor = Box::new(crate::materialized::ColumnLetCursor { body, _binding: scope });
+    let cursor = crate::columnar::retain_batch_state(cursor, reservation);
+    Ok(Some(crate::trace::wrap_batches(cursor, runtime.relation(), context)))
+}
+
+fn materialized_arrow_type(ty: &LogicalType) -> bool {
+    use rtdb_types::ScalarType::{Bool, F32, F64, I8, I16, I32, I64};
+    match ty {
+        LogicalType::Null | LogicalType::Scalar(Bool | F32 | F64 | I8 | I16 | I32 | I64) => true,
+        LogicalType::Maybe(ty) => materialized_arrow_type(ty),
+        _ => false,
+    }
 }
 
 pub(crate) enum OrderedInput {
@@ -345,6 +400,21 @@ fn batch_shape(runtime: &Arc<EmittedRelation>, output: BatchOutput) -> Result<Op
     stacker::maybe_grow(512 * 1024, 2 * 1024 * 1024, || batch_shape_at(runtime, output))
 }
 
+fn columnar_binding_body(runtime: &Arc<EmittedRelation>, binding: &rtdb_plan::MaterializedBinding) -> Result<bool> {
+    stacker::maybe_grow(512 * 1024, 2 * 1024 * 1024, || Ok(match runtime.relation().node() {
+        RelationNode::Reference { binding: reference } => reference.name == binding.name && reference.relation == binding.relation,
+        RelationNode::Project { expressions, .. } | RelationNode::Rename { expressions, .. } => {
+            let child = runtime.child(0)?;
+            expressions.iter().all(|named| matches!(&named.expr, Expr::Column { id, .. } if child.schema().position(*id).is_some()))
+                && columnar_binding_body(&child, binding)?
+        }
+        RelationNode::Set { operator: SetOperator::Union, all: true, .. } => {
+            columnar_binding_body(&runtime.child(0)?, binding)? && columnar_binding_body(&runtime.child(1)?, binding)?
+        }
+        _ => false,
+    }))
+}
+
 fn computed_batch_sort(order_by: &[rtdb_plan::SortExpr]) -> bool {
     matches!(order_by, [key] if crate::columnar::projection::shaped(&key.expr)
         && !matches!(key.expr, Expr::Column { .. }) && batch_ordered_type(&key.expr.data_type()))
@@ -385,6 +455,10 @@ fn batch_shape_at(runtime: &Arc<EmittedRelation>, output: BatchOutput) -> Result
                 .map(|(left, right)| left || (*operator == SetOperator::Union && right))
         }
         RelationNode::Distinct { .. } if output == BatchOutput::Arrow => batch_shape(&runtime.child(0)?, output)?,
+        RelationNode::Aggregate { groups, aggregates, .. } if output == BatchOutput::Arrow => {
+            if !crate::aggregate::AggregateCursor::writes_scalar_vectors(runtime, groups, aggregates)? { return Ok(None); }
+            batch_shape(&runtime.child(0)?, BatchOutput::Pages)?.map(|_| false)
+        }
         RelationNode::Join { kind: rtdb_plan::JoinKind::Cross, .. } if output == BatchOutput::Arrow => {
             batch_shape(&runtime.child(0)?, output)?.zip(batch_shape(&runtime.child(1)?, output)?).map(|(left, right)| left || right)
         }
@@ -940,41 +1014,33 @@ impl crate::columnar::BatchCursor for BatchUnion {
 
 struct BatchDistinct {
     input: crate::columnar::BoxBatchCursor,
-    seen: SeenRows,
+    seen: crate::set_keys::BatchKeyIndex,
+    schema: Arc<RuntimeSchema>,
     execution: Execution,
     projected: bool,
 }
+
+impl BatchDistinct {
+    fn new(input: crate::columnar::BoxBatchCursor, schema: Arc<RuntimeSchema>, execution: Execution, projected: bool) -> Result<Self> {
+        let seen = crate::set_keys::BatchKeyIndex::new(&execution.context)?;
+        Ok(Self { input, seen, schema, execution, projected })
+    }
+}
+
 #[async_trait]
 impl crate::columnar::BatchCursor for BatchDistinct {
     async fn next_batch(&mut self) -> Result<Option<crate::columnar::ColumnBatch>> {
         while let Some(batch) = crate::columnar::poll_nested_batch(self.input.as_mut()).await? {
-            let memory = &self.execution.context.memory;
+            if batch.len == 0 { continue; }
+            let context = &self.execution.context;
+            let memory = &context.memory;
             let _mask = memory.reserve(batch.len.saturating_add(256))?;
             let mut mask = Vec::with_capacity(batch.len);
-            for row in 0..batch.len {
-                self.execution.context.check_cancelled_at(row)?;
-                let key = read_batch_key(&batch, row, self.projected, memory)?;
-                mask.push(self.seen.insert(&key.values)?);
-            }
+            self.seen.distinct(&batch, self.projected, &mut mask, context, self.schema.schema(), |_| Ok(true))?;
             if mask.iter().any(|keep| *keep) { return batch.select(&mask, memory).map(Some); }
         }
         Ok(None)
     }
-}
-
-fn read_batch_key(batch: &crate::columnar::ColumnBatch, row: usize, projected: bool,
-    memory: &Arc<rtdb_columnar::MemoryBudget>) -> Result<OwnedRow> {
-    let bound = batch.columns.iter().try_fold(256usize, |bytes, column| {
-        bytes.checked_add(column.bound(row)?).ok_or_else(|| invalid("set-size", "Set key exceeds addressable memory"))
-    })?;
-    let _scratch = memory.reserve(bound)?;
-    let mut values = Vec::with_capacity(batch.columns.len());
-    for column in &batch.columns {
-        let mut value = column.value(row)?;
-        if projected { value.admit_expression_dates()?; }
-        values.push(value);
-    }
-    OwnedRow::new(values, memory)
 }
 
 pub(crate) fn uri_hashes_match(left: &[Value], right: &[Value], memory: &Arc<rtdb_columnar::MemoryBudget>) -> Result<bool> {
@@ -1011,7 +1077,7 @@ pub(crate) fn rows_equal(left: &[Value], right: &[Value], timezone: &str, memory
 /// A hash that rows equal under `rows_equal` share.
 /// A date or timestamp equals one of another unit or zone once the session zone localizes it, so it hashes as the
 /// wall-clock time it reads as there; date-times nested in a container hash alike, and `rows_equal` tells them apart.
-fn equality_hash(values: &[Value], timezone: &str) -> u32 {
+pub(crate) fn equality_hash(values: &[Value], timezone: &str) -> u32 {
     fn temporal(value: &Value) -> bool {
         match value {
             Value::Timestamp { .. } | Value::DateDay(_) | Value::DateMilli(_) | Value::Date(_) | Value::TimestampTzRange { .. } => true,
@@ -1028,8 +1094,17 @@ fn equality_hash(values: &[Value], timezone: &str) -> u32 {
             value if temporal(value) => 0x7e3a_11c5,
             value => rtdb_columnar::hash_value(value, 0).map_or(0x5bd1_e995, |cell| cell as u32),
         };
-        (hash ^ cell.wrapping_mul(0xcc9e_2d51).rotate_left(15)).rotate_left(13).wrapping_mul(5).wrapping_add(0xe654_6b64)
+        combine_equality_hash(hash, cell)
     })
+}
+
+pub(crate) fn combine_equality_hash(hash: u32, cell: u32) -> u32 {
+    (hash ^ cell.wrapping_mul(0xcc9e_2d51).rotate_left(15)).rotate_left(13).wrapping_mul(5).wrapping_add(0xe654_6b64)
+}
+
+pub(crate) fn validate_distinct_types(schema: &Schema) -> Result<()> {
+    for field in schema.fields() { rtdb_plan::validate_equality_types(&field.data_type, &field.data_type)?; }
+    Ok(())
 }
 /// The distinct rows seen so far, found through an index from their hash to the rows that share it.
 pub(crate) struct SeenRows { rows: Vec<OwnedRow>, index: std::collections::HashMap<u32, Vec<usize>>, validated: bool, runtime: Arc<RuntimeSchema>, context: Arc<QueryContext>, _reservation: Option<Arc<rtdb_columnar::MemoryReservation>> }
@@ -1037,7 +1112,7 @@ impl SeenRows {
     pub fn new(context: &Arc<QueryContext>, runtime: Arc<RuntimeSchema>) -> Result<Self> { Ok(Self { rows: Vec::new(), index: Default::default(), validated: false, runtime, context: Arc::clone(context), _reservation: None }) }
     pub fn insert(&mut self, values: &[Value]) -> Result<bool> {
         if !self.validated {
-            for field in self.runtime.schema().fields() { rtdb_plan::validate_equality_types(&field.data_type, &field.data_type)?; }
+            validate_distinct_types(self.runtime.schema())?;
             self.validated = true;
         }
         let hash = equality_hash(values, &self.context.timezone);
@@ -1121,8 +1196,8 @@ struct BatchSet {
     left_projected: bool,
     operator: SetOperator,
     all: bool,
-    seen: SeenRows,
-    built: Option<RightRows>,
+    seen: crate::set_keys::BatchKeyIndex,
+    built: Option<crate::set_keys::BatchKeyIndex>,
     runtime: Arc<EmittedRelation>,
     execution: Execution,
 }
@@ -1133,34 +1208,30 @@ impl crate::columnar::BatchCursor for BatchSet {
         let context = &self.execution.context;
         let memory = &context.memory;
         if let Some((mut right, projected)) = self.right.take() {
-            let mut rows = Vec::new();
-            let mut storage = memory.reserve(0)?;
+            let mut built = crate::set_keys::BatchKeyIndex::new(context)?;
             while let Some(batch) = crate::columnar::poll_nested_batch(right.as_mut()).await? {
-                let count = rows.len().checked_add(batch.len).ok_or_else(|| invalid("set-size", "Set row count exceeds addressable memory"))?;
-                let bytes = count.checked_mul(std::mem::size_of::<OwnedRow>()).ok_or_else(|| invalid("set-size", "Set row index exceeds addressable memory"))?;
-                Arc::get_mut(&mut storage).expect("Set build owns its reservation").grow_to(bytes)?;
-                rows.reserve_exact(batch.len);
-                for row in 0..batch.len {
-                    context.check_cancelled_at(row)?;
-                    rows.push(read_batch_key(&batch, row, projected, memory)?);
-                }
+                built.build(batch, projected, context)?;
             }
-            self.built = Some(RightRows::new(rows, context)?);
+            self.built = Some(built);
         }
         while let Some(batch) = crate::columnar::poll_nested_batch(self.left.as_mut()).await? {
+            if batch.len == 0 { continue; }
+            validate_set_types(&self.runtime)?;
             let _mask = memory.reserve(batch.len.saturating_add(256))?;
             let mut mask = Vec::with_capacity(batch.len);
             let built = self.built.as_mut().ok_or_else(|| invalid("set-state", "Set input was not built"))?;
-            for row in 0..batch.len {
-                context.check_cancelled_at(row)?;
-                validate_set_types(&self.runtime)?;
-                let key = read_batch_key(&batch, row, self.left_projected, memory)?;
-                if !self.all && !self.seen.insert(&key.values)? {
-                    mask.push(false);
-                    continue;
+            let left_projected = self.left_projected;
+            let mut retain = |row| {
+                let matched = built.matches(&batch, row, left_projected, self.all, context)?;
+                Ok(matched == (self.operator == SetOperator::Intersect))
+            };
+            if self.all {
+                for row in 0..batch.len {
+                    context.check_cancelled_at(row)?;
+                    mask.push(retain(row)?);
                 }
-                let matched = built.matches(&key.values, self.all, context)?;
-                mask.push(matched == (self.operator == SetOperator::Intersect));
+            } else {
+                self.seen.distinct(&batch, left_projected, &mut mask, context, self.runtime.child(0)?.schema(), retain)?;
             }
             if mask.iter().any(|keep| *keep) { return batch.select(&mask, memory).map(Some); }
         }
