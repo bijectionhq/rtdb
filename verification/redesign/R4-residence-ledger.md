@@ -92,6 +92,7 @@ An offline journal replacement starts a newer epoch from the latest durable chec
 The successor can admit that checkpoint before it has applied a known cut in its new journal.
 Any opaque or earlier held catalog delays retirement under the new journal.
 An installed successor floor closes new admission from earlier journals.
+An exclusive compactor reset resumes admission at the installed cut of its newly adopted naming epoch.
 Classic remote storage and independent maintenance paths still require their own custody and settlement integration.
 
 ### Hosted trie release records

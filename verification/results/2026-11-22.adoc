@@ -315,3 +315,30 @@ link:../recovery_trace.py[Recovery trace validator]
 The combined JVM suites passed 3,198 standard, 3,348 property and 5,629 integration cases, with one PostgreSQL slot-recreation skip.
 The PostgreSQL failover test passed in its focused retry and in the full integration run.
 No reflection or boxed-math warnings were recorded.
+
+== R4 · Local catalog admission and installed retirement
+
+The native trie collector installed a removal and left its intent pending while a second local store held the earlier cut.
+After that hold closed, a reopened collector deleted the receipt's files without another publication and rejected admission at the earlier cut.
+The storage tests also cover an offline journal replacement with an outstanding older hold and an opaque checkpoint reader.
+The native node suite passed 116 cases, including journal replacement and compactor reset over an existing floor.
+The reset waits for the prefix covering its new naming epoch before returning.
+
+== R5 · Hosted suffix pins and shared pack observations
+
+Startup, live replay and suffix preparation read the same persisted journal anchor.
+The trim plan includes pending archive suffixes until publication or expiry, and the verified archive retains the archived copy independently.
+TLC explored 14 states and rejected dropping a pending pin and publishing an unverified archive.
+The reachability case removed the live suffix while the archive still held its capture.
+The existing trim admission model explored 404 states.
+
+The native recovery trace retained the subscriber's first required record at offset 3 and advanced the physical floor to offset 10 after drain.
+Its 26 directory revisions passed the trace validator, and five corrupted traces failed their expected checks.
+A provider-counting regression verifies two pack members with one pack observation and refuses a replacement of that physical key.
+The replay commitment keeps its existing encoding.
+link:../tla/ReplicaTrimArchive.tla[Archive handoff model] · link:../recovery_trace.py[Native trace validator]
+
+The combined Gradle rerun with the rebuilt native library passed 3,198 standard, 3,348 property and 5,629 integration cases.
+The PostgreSQL slot-recreation fixture was skipped.
+No reflection or boxed-math warnings were recorded.
+Allium check and analysis reported the original diagnostics for all three changed specifications.
