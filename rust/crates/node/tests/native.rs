@@ -12,7 +12,7 @@ use rtdb_node::*;
 use rtdb_plan::{CatalogMetric, CatalogMetrics, CatalogRows, CatalogUser, CatalogUsers};
 use rtdb_query::QueryCursor;
 use rtdb_tx::{Documents, EntityIds, SqlArguments, TransactionAuthorization, TxOp};
-use rtdb_types::{Anomaly, Result, TableRef, Timestamp, TxBasis, TxId, Value};
+use rtdb_types::{Anomaly, EntityId, Result, TableRef, Timestamp, TxBasis, TxId, Value};
 use tokio::sync::Semaphore;
 use tokio_util::sync::CancellationToken;
 
