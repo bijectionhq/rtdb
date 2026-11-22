@@ -174,6 +174,7 @@ pub(crate) enum WorldCommitFormat {
 
 pub(crate) const COMMIT_WORLD_DROP_V1: &str = "rtdb.owned.CommitWorldDrop.v1";
 pub(crate) const COMMIT_WORLD_CLOCK_V1: &str = "rtdb.owned.CommitWorldClock.v1";
+pub(crate) const COMMIT_HELD_WORLDS_V1: &str = "rtdb.owned.CommitHeldWorlds.v1";
 pub(crate) const COMMIT_WORLD_V4: &str = "rtdb.owned.CommitWorld.v4";
 pub(crate) const COMMIT_WORLD_V3: &str = "rtdb.owned.CommitWorld.v3";
 pub(crate) const COMMIT_WORLD_V2: &str = "rtdb.owned.CommitWorld.v2";
@@ -1669,10 +1670,78 @@ impl Service {
         Ok(ActionResult { body: wire::retain(Bytes::copy_from_slice(world.as_bytes()), reply_charge) })
     }
 
-    pub(crate) async fn commit_world_action(&self, call: &Call, body: &[u8], format: WorldCommitFormat) -> Result<ActionResult, Status> {
-        use rtdb_node::OwnedWorldWrite;
-        use rtdb_types::{Interval, WorldShadow};
+    pub(crate) async fn commit_world_batch_action(&self, call: &Call, body: &[u8]) -> Result<ActionResult, Status> {
+        if !self.0.config.owned_native_actions { return Err(unsupported()); }
+        let host = self.0.config.owned_world_host.as_ref().ok_or_else(unsupported)?;
+        let policy = self.hosted_control_policy(call)?;
+        let (deadline, body) = body.split_first_chunk::<8>().ok_or_else(|| invalid("Missing world batch deadline"))?;
+        let deadline = Timestamp(i64::from_be_bytes(*deadline));
+        let (fingerprint, body) = body.split_first_chunk::<32>().ok_or_else(|| invalid("Missing world batch fingerprint"))?;
+        let (count, mut body) = body.split_first_chunk::<2>().ok_or_else(|| invalid("Missing world batch count"))?;
+        let count = usize::from(u16::from_be_bytes(*count));
+        if !(2..=8).contains(&count) { return Err(invalid("A world batch requires two to eight worlds")); }
+        let _framing = call.reserve((count + 1) * MAX_COMMIT_GROUPS * 512)?;
+        let mut worlds = BTreeSet::new();
+        let mut attempts = BTreeSet::new();
+        let mut sections = Vec::with_capacity(count);
+        let mut held = Vec::with_capacity(count);
+        let mut reservations = Vec::new();
+        let mut rows_left = MAX_GROUPED_COMMIT_ROWS - 2; // Global deadline and placed scope.
+        for _ in 0..count {
+            let (world, rest) = body.split_first_chunk::<16>().ok_or_else(|| invalid("Missing world batch identity"))?;
+            let world = Uuid::from_bytes(*world);
+            if world.is_nil() || !worlds.insert(world) { return Err(invalid("Invalid or repeated world batch identity")); }
+            let (handle, rest) = rest.split_first_chunk::<16>().ok_or_else(|| invalid("Missing world batch held handle"))?;
+            let (count, rest) = rest.split_first_chunk::<2>().ok_or_else(|| invalid("Missing world batch witness count"))?;
+            let count = usize::from(u16::from_be_bytes(*count));
+            if !(1..=MAX_WORLD_WITNESSES).contains(&count) { return Err(invalid("Invalid world batch witness count")); }
+            let (nonces, rest) = rest.split_at_checked(count * 16).ok_or_else(|| invalid("Incomplete world batch witnesses"))?;
+            let (attempt, rest) = rest.split_first_chunk::<22>().ok_or_else(|| invalid("Missing world batch attempt identity"))?;
+            let attempt = std::str::from_utf8(attempt).map_err(|_| invalid("Invalid world batch attempt identity"))?;
+            if !attempt.bytes().all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)) || !attempts.insert(attempt) {
+                return Err(invalid("Invalid or repeated world batch attempt identity"));
+            }
+            let (clock, rest) = rest.split_first_chunk::<8>().ok_or_else(|| invalid("Missing expected world batch clock"))?;
+            let clock = Timestamp(i64::from_be_bytes(*clock));
+            let (length, rest) = rest.split_first_chunk::<4>().ok_or_else(|| invalid("Missing world batch overlay length"))?;
+            let (overlay, rest) = rest.split_at_checked(u32::from_be_bytes(*length) as usize)
+                .ok_or_else(|| invalid("Incomplete world batch overlay"))?;
+            body = rest;
+            rows_left = rows_left.checked_sub(count * 2 + 2).ok_or_else(|| invalid("World batch exceeds its effect limit"))?;
+            let resource = self.owned_world_read(call, &Bytes::copy_from_slice(handle))?;
+            let (checks, charge) = resource.conditions(call, world, nonces)?;
+            reservations.push(charge);
+            let parent_basis = resource.snapshot.parent_basis();
+            held.push(resource);
+            let mut writes = Vec::new();
+            self.decode_world_writes(call, owned_groups(overlay, true, false)?, &mut rows_left, &mut writes, &mut reservations)?;
+            if writes.is_empty() { return Err(invalid("A world batch requires writes in each world")); }
+            sections.push(rtdb_node::OwnedWorldSection {
+                world: rtdb_types::Iid(*world.as_bytes()), parent_basis, writes, checks,
+                publication: rtdb_node::OwnedWorldPublication {
+                    attempt: attempt.to_owned(), fingerprint: *fingerprint,
+                    expected_clock: (clock != Timestamp::MIN).then_some(clock), advance_to: None, drop_world: false,
+                },
+            });
+        }
+        let controls = owned_groups(body, true, false)?;
+        hosted_control::admit_control_targets(policy, controls.iter().map(|(relation, _)| relation))?;
+        let scope = self.hosted_control_scope(call).await?;
+        let (controls, _charges) = self.decode_hosted_control_groups(call, controls, scope, &mut rows_left, true)?;
+        let (_, attachment) = call.session.resolve_database(Some(&call.database), &self.0.node)?;
+        let attachment = attachment.ok_or_else(unsupported)?;
+        let connection = self.connection(call, &call.database).await?;
+        let mut session = connection.borrow().await?;
+        require_idle(&session)?;
+        for resource in &held { resource.snapshot.check().map_err(status)?; }
+        let committed = host.commit_world_batch(
+            crate::WorldCall { node: &self.0.node, attachment: &attachment, session: &mut session, cancellation: &call.cancellation },
+            sections, controls, deadline,
+        ).await.map_err(status)?;
+        self.owned_tx_reply(committed)
+    }
 
+    pub(crate) async fn commit_world_action(&self, call: &Call, body: &[u8], format: WorldCommitFormat) -> Result<ActionResult, Status> {
         if !self.0.config.owned_native_actions { return Err(unsupported()); }
         let host = self.0.config.owned_world_host.as_ref().ok_or_else(unsupported)?;
         let (world, groups) = body.split_first_chunk::<16>().ok_or_else(|| invalid("Owned world commit has no world UUID"))?;
@@ -1748,6 +1817,28 @@ impl Service {
         } else {
             (Vec::new(), Vec::new(), owned_groups(groups, true, false)?)
         };
+        let mut rows_left = MAX_GROUPED_COMMIT_ROWS - checked_effects - control_checks.len();
+        self.decode_world_writes(call, groups, &mut rows_left, &mut writes, &mut reservations)?;
+        let (_, attachment) = call.session.resolve_database(Some(&call.database), &self.0.node)?;
+        let attachment = attachment.ok_or_else(unsupported)?;
+        let connection = self.connection(call, &call.database).await?;
+        let mut session = connection.borrow().await?;
+        require_idle(&session)?;
+        if let Some(held) = held.as_ref() { held.snapshot.check().map_err(status)?; }
+        let committed = host.commit_world(
+            crate::WorldCall { node: &self.0.node, attachment: &attachment, session: &mut session, cancellation: &call.cancellation },
+            world, writes, checks, control_checks, deadline, publication,
+        ).await.map_err(status)?;
+        self.owned_tx_reply(committed)
+    }
+
+    fn decode_world_writes(
+        &self, call: &Call, groups: Vec<(OwnedRelation, &[u8])>, rows_left: &mut usize,
+        writes: &mut Vec<rtdb_node::OwnedWorldWrite>, reservations: &mut Vec<Arc<MemoryReservation>>,
+    ) -> Result<(), Status> {
+        use rtdb_node::OwnedWorldWrite;
+        use rtdb_types::{Interval, WorldShadow};
+
         for (relation, arrow) in groups {
             let batch = request_batch(call, arrow)?;
             let batch = batch.batch();
@@ -1760,13 +1851,12 @@ impl Service {
             {
                 return Err(invalid("Owned world commit requires _id, _op, two Int64 valid endpoints, and a fact struct"));
             }
-            if batch.num_rows() > MAX_GROUPED_COMMIT_ROWS - writes.len() - checked_effects - control_checks.len() {
-                return Err(invalid("Owned world commit exceeds its total row limit"));
-            }
+            *rows_left = rows_left.checked_sub(batch.num_rows())
+                .ok_or_else(|| invalid("Owned world commit exceeds its total row limit"))?;
             let charge = call.reserve(wire::mul(batch.num_rows(), std::mem::size_of::<OwnedWorldWrite>() + 512)?)?;
             writes.try_reserve_exact(batch.num_rows()).map_err(|_| Status::resource_exhausted("Owned world commit allocation failed"))?;
             let (rows, decoded) = upload::owned_documents(batch, self)?;
-            reservations.push((charge, decoded));
+            reservations.extend([charge, decoded]);
             for mut row in rows {
                 let id = row.remove("_id").ok_or_else(|| invalid("Owned world write has no _id"))?.entity_id().map_err(status)?;
                 let (Some(Value::Utf8(operation)), Some(Value::I64(from)), Some(Value::I64(to)), Some(payload)) = (
@@ -1790,17 +1880,7 @@ impl Service {
                 writes.push(OwnedWorldWrite { relation: relation.clone(), id, shadow, valid });
             }
         }
-        let (_, attachment) = call.session.resolve_database(Some(&call.database), &self.0.node)?;
-        let attachment = attachment.ok_or_else(unsupported)?;
-        let connection = self.connection(call, &call.database).await?;
-        let mut session = connection.borrow().await?;
-        require_idle(&session)?;
-        if let Some(held) = held.as_ref() { held.snapshot.check().map_err(status)?; }
-        let committed = host.commit_world(
-            crate::WorldCall { node: &self.0.node, attachment: &attachment, session: &mut session, cancellation: &call.cancellation },
-            world, writes, checks, control_checks, deadline, publication,
-        ).await.map_err(status)?;
-        self.owned_tx_reply(committed)
+        Ok(())
     }
 
     pub(crate) async fn read_owned_action(&self, call: &Call, body: &[u8]) -> Result<ActionResult, Status> {

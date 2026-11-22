@@ -504,6 +504,12 @@ The body carries the 16-byte hold, minted world, capture and optional suffix (ni
 The placed owner derives the archived cut before pinning and orders the registration with the attempt marker.
 The response carries the minted 16-byte world followed by the transaction ID and system time as big-endian i64.
 
+`rtdb.owned.CommitHeldWorlds.v1` orders fixed-valid replacements and tombstones in two to eight distinct hosted checkpoint worlds as one source transaction.
+Its request starts with a big-endian i64 deadline, a common 32-byte fingerprint, and a big-endian u16 world count.
+Each world supplies the 16-byte world and original held handle, a u16 witness count and its 16-byte nonces, a 22-byte attempt ID, an i64 expected local clock (MIN for absent), then the overlay groups prefixed by their u32 byte length.
+The request ends with the common check-only hosted ownership groups. Every integer is big-endian.
+The placed owner checks all parent pins and orders all overlay effects, local application clocks and distinct immutable attempt markers at the transaction key in the usual commit reply.
+
 `rtdb.owned.CommitWorld.v4` publishes an admitted single-world overlay and application clock atomically.
 `rtdb.owned.CommitWorldClock.v1` publishes a clock alone using the same held conditions, deadline, hosted ownership checks, and immutable attempt marker.
 Its body shares the v4 prefix through the expected clock, followed by the target clock as a big-endian i64 and the check-only hosted control groups.

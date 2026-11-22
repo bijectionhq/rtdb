@@ -1498,6 +1498,14 @@ pub struct OwnedWorldFork {
     pub controls: Vec<rtdb_tx::HostedControlWrite>,
 }
 
+pub struct OwnedWorldSection {
+    pub world: rtdb_types::Iid,
+    pub parent_basis: TransactionKey,
+    pub writes: Vec<OwnedWorldWrite>,
+    pub checks: Vec<OwnedWorldPointWitness>,
+    pub publication: OwnedWorldPublication,
+}
+
 pub struct OwnedWorldWrite {
     pub relation: rtdb_types::OwnedRelation,
     pub id: rtdb_types::EntityId,
@@ -1596,6 +1604,66 @@ impl NativeSession {
         if let Some(check) = checks.first() {
             ops.push(TxOp::OwnedCheckWorldScope { scope: check.scope });
         }
+        self.append_world_effects(&mut ops, record.id, writes, checks)?;
+        ops.extend(controls.into_iter().map(TxOp::HostedControl));
+        if let Some(OwnedWorldPublication { attempt, fingerprint, expected_clock, advance_to, drop_world }) = publication {
+            ops.push(TxOp::OwnedPublishWorld { world: record.id, attempt, fingerprint, expected: expected_clock, advance_to, drop_world });
+        }
+        self.state.execute_tx(ops, Default::default()).await
+    }
+    pub async fn commit_owned_world_batch(
+        &mut self, sections: Vec<(Timestamp, OwnedWorldSection)>,
+        controls: Vec<rtdb_tx::HostedControlWrite>, deadline: Timestamp,
+    ) -> Result<TransactionResult> {
+        let unavailable = rtdb_types::OwnedWorld::unavailable;
+        if !(2..=8).contains(&sections.len()) || controls.is_empty() || controls.iter().any(|control| !control.is_check()) {
+            return Err(unavailable());
+        }
+        let scope = self.placed_history()?.ok_or_else(unavailable)?;
+        let now = self.service.node.now();
+        let mut until = deadline;
+        let mut worlds = std::collections::BTreeSet::new();
+        let mut attempts = std::collections::BTreeSet::new();
+        let fingerprint = sections[0].1.publication.fingerprint;
+        let mut effects = controls.len().saturating_add(2);
+        for (retained_until, section) in &sections {
+            if !worlds.insert(section.world) || section.writes.is_empty()
+                || !(1..=128).contains(&section.checks.len()) || section.publication.drop_world
+                || section.publication.advance_to.is_some() || section.publication.fingerprint != fingerprint
+                || !attempts.insert(&section.publication.attempt)
+            {
+                return Err(unavailable());
+            }
+            effects = effects.saturating_add(section.writes.len())
+                .saturating_add(section.checks.len().saturating_mul(2)).saturating_add(2);
+            until = until.min(*retained_until);
+            for check in &section.checks {
+                if check.world != section.world || check.relation.world() != Some(section.world)
+                    || check.scope != scope || now >= check.until
+                {
+                    return Err(unavailable());
+                }
+                until = until.min(check.until);
+            }
+        }
+        if effects > 4096 || now >= until { return Err(unavailable()); }
+        let _operations = self.service.node.memory().reserve(effects * (std::mem::size_of::<TxOp>() + 512))?;
+        let mut ops = Vec::with_capacity(effects);
+        ops.push(TxOp::OwnedDeadline { until });
+        ops.push(TxOp::OwnedCheckWorldScope { scope });
+        ops.extend(controls.into_iter().map(TxOp::HostedControl));
+        for (_, section) in sections {
+            self.append_world_effects(&mut ops, section.world, section.writes, section.checks)?;
+            let OwnedWorldPublication { attempt, fingerprint, expected_clock, advance_to, drop_world } = section.publication;
+            ops.push(TxOp::OwnedPublishWorld { world: section.world, attempt, fingerprint, expected: expected_clock, advance_to, drop_world });
+        }
+        self.state.execute_tx(ops, Default::default()).await
+    }
+
+    fn append_world_effects(
+        &self, ops: &mut Vec<TxOp>, world: rtdb_types::Iid, writes: Vec<OwnedWorldWrite>,
+        checks: Vec<OwnedWorldPointWitness>,
+    ) -> Result<()> {
         for check in checks {
             ops.push(TxOp::OwnedCheckWorldPurge { relation: check.relation.clone(), frontier: check.purge_frontier });
             ops.push(TxOp::OwnedCheck {
@@ -1603,16 +1671,12 @@ impl NativeSession {
             });
         }
         for OwnedWorldWrite { relation, id, shadow, valid } in writes {
-            let relation = relation.in_world(record.id)?;
+            let relation = relation.in_world(world)?;
             let _encode = self.service.node.memory().reserve(shadow.allocation_bound()?)?;
             let documents = rtdb_tx::Documents::new(vec![shadow.record(&id)?], self.service.node.memory())?;
             ops.push(TxOp::OwnedReplaceDocs { relation, documents, valid_from: Some(valid.lower()), valid_to: Some(valid.upper()) });
         }
-        ops.extend(controls.into_iter().map(TxOp::HostedControl));
-        if let Some(OwnedWorldPublication { attempt, fingerprint, expected_clock, advance_to, drop_world }) = publication {
-            ops.push(TxOp::OwnedPublishWorld { world: record.id, attempt, fingerprint, expected: expected_clock, advance_to, drop_world });
-        }
-        self.state.execute_tx(ops, Default::default()).await
+        Ok(())
     }
     /// Reserves a fresh system time by awaiting an ordered, fact-free source transaction.
     /// The key is durable in this database's history. Later transactions in that history have strictly greater system times.

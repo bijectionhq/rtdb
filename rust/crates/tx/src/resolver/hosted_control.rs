@@ -49,7 +49,7 @@ impl OpenTransaction<'_> {
         {
             return Err(unavailable());
         }
-        let validating_world = self.owned_world.is_some();
+        let validating_world = !self.owned_worlds.is_empty();
         let publishing_world = operations.iter().any(|op| matches!(op, Operation::Public(TxOp::OwnedPublishWorld { .. })));
         if validating_world && (
             controls.clone().any(|control| !control.is_check())

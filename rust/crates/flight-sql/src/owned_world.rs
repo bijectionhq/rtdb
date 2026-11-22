@@ -15,6 +15,10 @@ pub trait OwnedWorldHost: std::fmt::Debug + Send + Sync {
     fn fork_world<'a>(&'a self, call: WorldCall<'a>, capture: Uuid, suffix: Option<Uuid>, until: Timestamp) -> BoxFuture<'a, Result<Uuid>>;
     fn fork_world_checked<'a>(&'a self, call: WorldCall<'a>, capture: Uuid, suffix: Option<Uuid>, until: Timestamp, fork: rtdb_node::OwnedWorldFork) -> BoxFuture<'a, Result<(Uuid, TransactionKey)>>;
     fn commit_world<'a>(&'a self, call: WorldCall<'a>, world: Uuid, writes: Vec<OwnedWorldWrite>, checks: Vec<OwnedWorldPointWitness>, controls: Vec<rtdb_node::HostedControlWrite>, deadline: Option<Timestamp>, publication: Option<rtdb_node::OwnedWorldPublication>) -> BoxFuture<'a, Result<TransactionKey>>;
+    fn commit_world_batch<'a>(
+        &'a self, call: WorldCall<'a>, sections: Vec<rtdb_node::OwnedWorldSection>,
+        controls: Vec<rtdb_node::HostedControlWrite>, deadline: Timestamp,
+    ) -> BoxFuture<'a, Result<TransactionKey>>;
     fn drop_world<'a>(&'a self, call: WorldCall<'a>, world: Uuid) -> BoxFuture<'a, Result<()>>;
 }
 

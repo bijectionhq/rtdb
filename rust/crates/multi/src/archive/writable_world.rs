@@ -416,6 +416,31 @@ pub(crate) async fn commit_checkpoint_world_checked(
     Ok(outcome.tx_key())
 }
 
+pub(crate) async fn commit_checkpoint_world_batch(
+    directory: &dyn Directory, archive: &CellStorage, session: &mut NativeSession, deployment: Uuid,
+    sections: Vec<rtdb_node::OwnedWorldSection>, controls: Vec<rtdb_node::HostedControlWrite>, deadline: Timestamp,
+) -> Result<TransactionKey> {
+    if !(2..=8).contains(&sections.len()) { return Err(OwnedWorld::unavailable()); }
+    let installation = directory.deployment(&deployment.to_string()).await?.ok_or_else(OwnedWorld::unavailable)?;
+    let mut admitted = Vec::with_capacity(sections.len());
+    for section in sections {
+        let id = Uuid::from_bytes(section.world.0);
+        let retained = installation.checkpoint_worlds.get(&id).ok_or_else(OwnedWorld::unavailable)?;
+        admit_session(session, &installation, &retained.owner)?;
+        if retained.basis != section.parent_basis || now() >= retained.until { return Err(OwnedWorld::unavailable()); }
+        admit_capture(&installation, archive, &CheckpointReadWorld {
+            deployment, capture: retained.capture, manifest_sha256: retained.manifest_sha256.clone(),
+            suffix: retained.suffix, basis: retained.basis,
+        })?;
+        admitted.push((retained.until, section));
+    }
+    let outcome = session.commit_owned_world_batch(admitted, controls, deadline).await?;
+    if !outcome.committed() {
+        return Err(outcome.error().cloned().unwrap_or_else(OwnedWorld::unavailable));
+    }
+    Ok(outcome.tx_key())
+}
+
 pub struct WorldPoint {
     pub present: TransactionKey,
     pub fact: Option<WorldFact>,
