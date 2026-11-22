@@ -1759,10 +1759,11 @@ contract CompactorReset {
         -- The operator keeps every other node, client and upstream writer stopped throughout the reset.
         -- The maintenance node catches up through a completed block with indexing enabled and compaction and automatic garbage collection disabled.
 
-    @invariant SurvivingL0Files
-        -- The replacement catalog contains the L0 files found in object storage with both metadata and data present.
-        -- A metadata file whose paired data is absent contributes no trie.
-        -- L0 file sizes come from the data objects, and temporal metadata is recovered when those files are read.
+    @invariant InstalledL0Inventory
+        -- The replacement catalog uses the L0 identities bound by the installed checkpoint and its table inventories.
+        -- Every recorded pair has data and metadata present before the maintenance node accepts the plan.
+        -- The observed data length matches the checkpoint's recorded length where present.
+        -- An incomplete inventory refuses preparation.
 
     @invariant PublicationPrecedesDeletion
         -- A reset with a completed transaction publishes the replacement catalog in a new block.
@@ -1777,7 +1778,7 @@ contract CompactorReset {
         -- An interruption during deletion retains the published L0 recovery catalog and any remaining compacted files.
 
     @invariant DryRunPlan
-        -- A dry run performs the initial catch-up flush and reports the replacement L0 catalog and proposed deletions.
+        -- A dry run performs the initial catch-up flush and reports the verified L0 catalog and proposed deletions.
         -- Its plan leaves the catalog and files as they stood after that catch-up.
 }
 

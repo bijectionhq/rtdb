@@ -40,6 +40,10 @@ impl CompactorReset {
     }
 }
 
+fn reset_inventory(reason: impl Into<String>) -> Anomaly {
+    Anomaly::new(AnomalyCategory::Unavailable, "rtdb.compactor-reset/incomplete-inventory", reason)
+}
+
 fn reset_cancelled() -> Anomaly { Anomaly::new(AnomalyCategory::Interrupted, "rtdb.compactor-reset/cancelled", "Compactor reset was cancelled") }
 
 pub struct SnapshotExport {
@@ -74,7 +78,7 @@ impl SnapshotExport {
 }
 
 impl Node {
-    /// Flushes pending input and captures surviving L0 files and compacted files for an exclusive maintenance reset.
+    /// Flushes pending input and verifies the installed checkpoint's L0 inventory for an exclusive maintenance reset.
     /// Indexing must be enabled, with compaction and automatic GC disabled; all other users of the database must be stopped.
     /// A plan alone performs no reset or deletion; its initial catch-up flush is durable even for a dry run.
     pub async fn prepare_compactor_reset(&self, database: &str, cancellation: &CancellationToken) -> Result<CompactorReset> {
@@ -87,6 +91,7 @@ impl Node {
         let value = database.partition.value();
         let term = database.replication.term().ok_or_else(|| Anomaly::new(AnomalyCategory::Conflict, "rtdb.compactor-reset/not-leader", "Compactor reset requires exclusive leadership"))?;
         let expected = Arc::clone(value.trie_catalog());
+        let store = database.storage.object_store();
         let mut bound = 8192usize;
         for table in expected.tables() {
             let entry = value.table_catalog().entry(table).ok_or_else(|| invalid("Trie table has no registered slug"))?;
@@ -96,7 +101,6 @@ impl Node {
         }
         let mut reservations = vec![self.memory().reserve(bound)?];
         let mut files = Vec::new();
-        let mut replacements = BTreeMap::new();
         for table in expected.tables() {
             if cancellation.is_cancelled() { return Err(reset_cancelled()); }
             let entry = value.table_catalog().entry(table).ok_or_else(|| invalid("Trie table has no registered slug"))?;
@@ -104,25 +108,49 @@ impl Node {
                 files.push(ObjectKey::new(entry.slug.metadata_key(&trie.key))?);
                 files.push(ObjectKey::new(entry.slug.data_key(&trie.key))?);
             }
-            let prefix = ObjectKey::new(format!("{}/meta", entry.slug.table_prefix()))?;
-            let listed = cancellation.run_until_cancelled(database.storage.object_store().list(Some(&prefix))).await.ok_or_else(reset_cancelled)??;
-            let bound = listed.iter().try_fold(4096usize, |bound, object| bound.checked_add(object.key.as_str().len().checked_mul(8)?.checked_add(2048)?)).ok_or_else(overflow)?;
-            reservations.push(self.memory().reserve(bound)?);
-            let mut tries = Vec::new();
-            for metadata in listed {
-                if cancellation.is_cancelled() { return Err(reset_cancelled()); }
-                let Some(name) = metadata.key.as_str().rsplit('/').next().and_then(|name| name.strip_suffix(".arrow")) else { continue; };
-                let Ok(key) = name.parse::<TrieKey>() else { continue; };
-                if key.level() != 0 { continue; }
-                let data = ObjectKey::new(entry.slug.data_key(&key))?;
-                match cancellation.run_until_cancelled(database.storage.object_store().head(&data)).await.ok_or_else(reset_cancelled)? {
-                    Ok(data) => tries.push(CatalogTrie::notification(key, i64::try_from(data.size).map_err(invalid)?, None)?),
-                    Err(rtdb_storage::Error::MissingObject(_)) => {},
-                    Err(error) => return Err(error.into()),
-                }
+        }
+        let mut replacements = BTreeMap::new();
+        if let Some(installed) = value.table_catalog().block() {
+            let blocks = rtdb_replication::BlockStore::new(
+                Arc::clone(store), Arc::clone(&database.storage), Arc::clone(self.memory()), expected.file_size_target(),
+            )?;
+            let (root, tables) = cancellation.run_until_cancelled(blocks.load(installed.block_index())).await.ok_or_else(reset_cancelled)??;
+            if installed.publication_sha256().is_none() || root.publication_sha256() != installed.publication_sha256() {
+                return Err(reset_inventory("The checkpoint root differs from the installed publication"));
             }
-            tries.sort_by(|left, right| left.key.cmp(&right.key));
-            replacements.insert(table.clone(), tries);
+            for entry in root.table_entries()? {
+                if root.table_block_digest(entry.oid).is_none() {
+                    return Err(reset_inventory("The checkpoint has no bound table inventory"));
+                }
+                let table = tables.get(&entry.table).ok_or_else(|| reset_inventory("The checkpoint has no table block"))?;
+                let bound = table.trie_details().try_fold(4096usize, |bound, detail| {
+                    bound.checked_add(detail.trie_key.as_ref()?.len().checked_add(512)?.checked_mul(4)?)
+                }).ok_or_else(overflow)?;
+                reservations.push(self.memory().reserve(bound)?);
+                let mut tries = BTreeMap::new();
+                for detail in table.trie_details() {
+                    let key: TrieKey = detail.trie_key.as_deref().ok_or_else(|| reset_inventory("The checkpoint has an unnamed trie"))?.parse()?;
+                    if key.level() != 0 { continue; }
+                    let keys = [ObjectKey::new(entry.slug.data_key(&key))?, ObjectKey::new(entry.slug.metadata_key(&key))?];
+                    let heads = cancellation.run_until_cancelled(store.observe_heads(&keys)).await.ok_or_else(reset_cancelled)?
+                        .map_err(|error| match error {
+                            rtdb_storage::Error::MissingObject(name) => reset_inventory(format!("Required L0 object is missing: {name}")),
+                            error => error.into(),
+                        })?;
+                    let size = heads.get(&keys[0]).map(|head| head.value.size).filter(|size| *size > 0)
+                        .ok_or_else(|| reset_inventory(format!("The required L0 data file is empty: {}", keys[0])))?;
+                    if heads.get(&keys[1]).is_none_or(|head| head.value.size == 0) {
+                        return Err(reset_inventory(format!("The required L0 metadata file is empty: {}", keys[1])));
+                    }
+                    let size = i64::try_from(size).map_err(|_| overflow())?;
+                    if detail.data_file_size.is_some_and(|expected| expected != size) {
+                        return Err(reset_inventory(format!("The required L0 data file has the wrong length: {}", keys[0])));
+                    }
+                    let trie = CatalogTrie::notification(key.clone(), size, None)?;
+                    if tries.insert(key, trie).is_some() { return Err(reset_inventory("The checkpoint repeats an L0 trie")); }
+                }
+                replacements.insert(entry.table, tries.into_values().collect());
+            }
         }
         Ok(CompactorReset { database, term, expected, expected_block: value.live().block_index(), replacements, files, reservations: reservations.into() })
     }

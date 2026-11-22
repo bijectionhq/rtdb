@@ -59,6 +59,8 @@ After R5, L0 files are ordinary garbage once compaction supersedes them (as in X
 - Multi has recovery holds for the replica suffix (`rust/crates/multi/src/recovery_holds.rs`, peer commit `e298879a0`) and checkpoint-metadata holds (`rust/crates/multi/src/checkpoint_retention.rs`).
 - Models: `verification/tla/{InstalledCheckpoint,RecoveryReplay,Checkpoint,ResidenceRetirement}.tla`, `verification/mcrl2/CheckpointDiscovery.mcrl2`, the AutoHyper two-run check, and the Lean checkpoint-metadata laws.
 - Compactor reset names outputs in a new epoch (R3, `ae7b66e10`), so rebuilding from a root cannot collide with pre-reset names.
+  Reset loads the installed checkpoint's bound table inventories and checks each named L0 pair before preparing publication.
+  Rebuilding from retained journal input after L0 retirement remains open.
 
 ## Handoff notes
 

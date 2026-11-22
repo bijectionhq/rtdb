@@ -1921,7 +1921,27 @@ async fn compactor_reset_preserves_l0_history_and_deletes_compacted_files_only_a
         settings.compaction_threads = 0;
         let (node, driver) = running(settings.clone(), fresh_local_services(&runtime_services)).await;
         let cancellation = CancellationToken::new();
+        let initial = node.prepare_compactor_reset("xtdb", &cancellation).await.unwrap();
+        let table = TableRef::new("public", "docs");
+        let snapshot = node.catalog().database("xtdb").unwrap().snapshot();
+        let slug = snapshot.table_catalog().entry(&table).unwrap().slug.clone();
+        drop(snapshot);
+        let key = &initial.replacement_tries()[&table][0].key;
+        let storage_root = store.join("v06");
+        let required = storage_root.join(slug.data_key(key));
+        let saved = required.with_extension("backup");
+        std::fs::rename(&required, &saved).unwrap();
+        let refused = node.prepare_compactor_reset("xtdb", &cancellation).await.err().unwrap();
+        assert_eq!(refused.code, "rtdb.compactor-reset/incomplete-inventory");
+        for compacted in initial.files_to_delete() { assert!(storage_root.join(compacted.as_str()).is_file()); }
+        std::fs::rename(saved, required).unwrap();
+        drop(initial);
+
+        let orphan = rtdb_format::keys::TrieKey::l0(rtdb_types::BlockIndex(256)).unwrap();
+        std::fs::write(storage_root.join(slug.data_key(&orphan)), b"unpublished").unwrap();
+        std::fs::write(storage_root.join(slug.metadata_key(&orphan)), b"unpublished").unwrap();
         let plan = node.prepare_compactor_reset("xtdb", &cancellation).await.unwrap();
+        assert!(!plan.replacement_tries()[&table].iter().any(|try_| try_.key == orphan));
         let compacted = plan.files_to_delete().to_vec();
         assert!(!compacted.is_empty());
         assert!(plan.replacement_tries().values().flatten().all(|trie| trie.key.level() == 0));

@@ -87,7 +87,7 @@ async fn reset_compactor(options: cli::StartOptions, database: String, dry_run: 
     run_operation(&handle, driver, &cancellation, async {
         let plan = handle.node().prepare_compactor_reset(&database, &cancellation).await?;
         write_report(std::io::stdout().lock(), |output| {
-            for (table, tries) in plan.replacement_tries() { writeln!(output, "{}: {} surviving L0 tries", table.schema_and_table(), tries.len())?; }
+            for (table, tries) in plan.replacement_tries() { writeln!(output, "{}: {} verified L0 tries", table.schema_and_table(), tries.len())?; }
             for key in plan.files_to_delete() { writeln!(output, "{} {key}", if dry_run { "WOULD DELETE" } else { "DELETE AFTER PUBLICATION" })?; }
             Ok(())
         })?;
