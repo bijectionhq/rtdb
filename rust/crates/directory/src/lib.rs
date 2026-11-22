@@ -338,6 +338,8 @@ pub struct DeploymentRecord {
     pub checkpoint_transfer_terminal: Option<Box<CheckpointTransferTerminal>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub checkpoint_transfer_bootstrap: Option<Box<CheckpointTransferBootstrap>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub checkpoint_transfer_replica: Option<Box<CheckpointTransferReplica>>,
 
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hosted_fork_stage: Option<HostedForkStage>,
@@ -786,6 +788,14 @@ pub struct CheckpointTransferBootstrap {
     pub ciphertext_sha256: [u8; 32],
 }
 
+/// The target's reserved genesis writer and exact physical journal ensemble.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CheckpointTransferReplica {
+    pub bootstrap: CheckpointTransferBootstrap,
+    pub ensemble: Vec<MemberId>,
+    pub journals: Vec<JournalEndpoint>,
+}
+
 pub struct CheckpointTransferSelection {
     pub stage: CheckpointStage,
     pub source_version: Version,
@@ -814,7 +824,7 @@ impl DeploymentRecord {
         let id = uuid::Uuid::new_v4().to_string();
         Self { lineage: id.clone(), id, name: name.into(), org: org.into(), incarnation: 1, lifecycle: Lifecycle::Live, epoch: 0, holder: None, resident_idle: None,
             ensemble, replica_journals: BTreeSet::new(), storage_regions: BTreeMap::new(), catalog_readers: BTreeMap::new(), catalog_admission_floors: BTreeMap::new(), ordered_indexes: BTreeMap::new(), ordered_index_catalogs: BTreeMap::new(), read_width: 1, activation_crashes: 0, created_at_ms: now_ms, move_intent: None, placement_move: None, log_epoch: 0, parent: None, move_from: None, log_copy_servers: Vec::new(), linearizable_reads: false, checkpoint: None, replica_anchor: None, moved_at_ms: None, source_cleanup: None, cell_move: None, storage_generation: None, storage_namespaces: None, deletion_record: None, s3_write_lease_until_ms: None, engine_pin: None, deletion_observation: None,
-            cell_transfer: None, disposal: None, retired_residences: BTreeMap::new(), checkpoint_recovery: None, compaction_replay_cutoff: None, checkpoint_stage: None, checkpoint_transfer_fence: None, checkpoint_transfer_terminal: None, checkpoint_transfer_bootstrap: None, hosted_fork_stage: None, checkpoint_repair_receipts: BTreeMap::new(), recovery_manifest_sha256: None,
+            cell_transfer: None, disposal: None, retired_residences: BTreeMap::new(), checkpoint_recovery: None, compaction_replay_cutoff: None, checkpoint_stage: None, checkpoint_transfer_fence: None, checkpoint_transfer_terminal: None, checkpoint_transfer_bootstrap: None, checkpoint_transfer_replica: None, hosted_fork_stage: None, checkpoint_repair_receipts: BTreeMap::new(), recovery_manifest_sha256: None,
             checkpoint_captures: BTreeMap::new(), checkpoint_worlds: BTreeMap::new(), checkpoint_suffix_pins: BTreeMap::new(), checkpoint_capture_retirements: BTreeMap::new(), archive_retirement: None, version: 0 }
     }
 
@@ -974,6 +984,11 @@ pub trait Directory: Send + Sync {
     /// Orders the staged replay artifact against the original durable source receipt.
     async fn record_checkpoint_transfer_bootstrap(&self, _bootstrap: &CheckpointTransferBootstrap) -> Result<CheckpointTransferBootstrap> {
         Err(Anomaly::fault("rtdb.directory/unsupported-checkpoint-transfer", "This Directory cannot order a transfer bootstrap"))
+    }
+
+    /// Binds the target replica journals before a genesis can write to them.
+    async fn reserve_checkpoint_transfer_replica(&self, _replica: &CheckpointTransferReplica) -> Result<CheckpointTransferReplica> {
+        Err(Anomaly::fault("rtdb.directory/unsupported-checkpoint-transfer", "This Directory cannot reserve a transfer replica genesis"))
     }
 
     /// Stores a new member; refuses if its id is taken.
@@ -1184,10 +1199,30 @@ fn prepare_checkpoint_transfer_bootstrap(
     Ok(next)
 }
 
+fn prepare_checkpoint_transfer_replica(
+    source: &DeploymentRecord, destination: &DeploymentRecord, replica: &CheckpointTransferReplica,
+) -> Result<DeploymentRecord> {
+    if destination.checkpoint_transfer_bootstrap.as_deref() != Some(&replica.bootstrap)
+        || prepare_checkpoint_transfer_bootstrap(source, destination, &replica.bootstrap)?.version != destination.version
+        || replica.ensemble.is_empty() || replica.ensemble.len() != replica.journals.len()
+        || replica.ensemble.iter().collect::<BTreeSet<_>>().len() != replica.ensemble.len()
+        || replica.journals.iter().collect::<BTreeSet<_>>().len() != replica.journals.len()
+        || replica.journals.iter().any(|endpoint| endpoint.journal().is_none())
+    {
+        return Err(transfer_changed());
+    }
+    if destination.checkpoint_transfer_replica.is_some() { return Ok(destination.clone()); }
+    let mut next = destination.clone();
+    next.version = next.version.checked_add(1).ok_or_else(transfer_changed)?;
+    next.checkpoint_transfer_replica = Some(Box::new(replica.clone()));
+    Ok(next)
+}
+
 fn require_transfer_update(current: &DeploymentRecord, next: &DeploymentRecord) -> Result<()> {
     if current.checkpoint_transfer_fence != next.checkpoint_transfer_fence
         || current.checkpoint_transfer_terminal != next.checkpoint_transfer_terminal
         || current.checkpoint_transfer_bootstrap != next.checkpoint_transfer_bootstrap
+        || current.checkpoint_transfer_replica != next.checkpoint_transfer_replica
     {
         return Err(transfer_changed());
     }
@@ -1325,7 +1360,7 @@ impl MemoryDirectory {
     fn insert_deployment(&self, state: &mut MemoryState, mut record: DeploymentRecord,
         lineage: Option<(String, LineageState)>, stage_version: Option<Version>) -> Result<DeploymentRecord> {
         require_deployment_name(&record.name)?;
-        if record.checkpoint_transfer_fence.is_some() || record.checkpoint_transfer_terminal.is_some() || record.checkpoint_transfer_bootstrap.is_some() { return Err(transfer_changed()); }
+        if record.checkpoint_transfer_fence.is_some() || record.checkpoint_transfer_terminal.is_some() || record.checkpoint_transfer_bootstrap.is_some() || record.checkpoint_transfer_replica.is_some() { return Err(transfer_changed()); }
         if stage_version.is_none() && state.deployments.contains_key(&record.id) { return Err(exists("Deployment", &record.id)); }
         if record.hosted_fork_stage.is_none() && state.names.contains_key(&record.name) { return Err(exists("Deployment name", &record.name)); }
         if let Some((lineage, next)) = lineage {
@@ -1483,6 +1518,22 @@ impl Directory for MemoryDirectory {
             self.changes.publish(next);
         }
         Ok(bootstrap.clone())
+    }
+
+    async fn reserve_checkpoint_transfer_replica(&self, replica: &CheckpointTransferReplica) -> Result<CheckpointTransferReplica> {
+        let mut state = self.state()?;
+        let intent = &replica.bootstrap.terminal.fence.destination.intent;
+        let source = state.deployments.get(&intent.source.to_string()).ok_or_else(transfer_changed)?;
+        let id = intent.destination.to_string();
+        let destination = state.deployments.get(&id).ok_or_else(transfer_changed)?;
+        let next = prepare_checkpoint_transfer_replica(source, destination, replica)?;
+        let reserved = next.checkpoint_transfer_replica.as_deref().ok_or_else(transfer_changed)?.clone();
+        if next.version != destination.version {
+            state.deployments.insert(id, Box::new(next.clone()));
+            self.persist(&mut state)?;
+            self.changes.publish(next);
+        }
+        Ok(reserved)
     }
 
     async fn replace_deployment(&self, record: DeploymentRecord, expected: Version) -> Result<Cas<DeploymentRecord>> {

@@ -270,6 +270,58 @@ impl Writer {
         Ok(())
     }
 
+    pub(super) async fn bootstrap_committed(
+        ensemble: &Ensemble, epoch: u64, checkpoint: i64, entries: &[Entry],
+    ) -> Result<()> {
+        let replies = seal_quorum(ensemble, epoch).await?;
+        let last = checkpoint + entries.len() as i64;
+        let failure = |message| Error::Remote { key: ensemble.config.stream.clone(), message };
+        let mut seeds = replies.into_iter().map(|(server, sealed)| async move {
+            if sealed.last_lsn > last
+                || (sealed.trim_lsn != checkpoint && (sealed.trim_lsn != -1 || sealed.last_lsn != -1))
+            {
+                return Err(Error::ConflictingObject(ensemble.config.stream.clone()));
+            }
+            if sealed.trim_lsn != checkpoint {
+                deposed_by(epoch, ensemble.trim(server, checkpoint).await?)?;
+            }
+            let mut offset = checkpoint + 1;
+            while offset <= sealed.last_lsn {
+                let prefix = ensemble.fetch(server, offset, sealed.last_lsn + 1, MAXIMUM_BATCH_ENTRIES).await?;
+                let index = usize::try_from(offset - checkpoint - 1).unwrap_or(usize::MAX);
+                let end = index.saturating_add(prefix.entries.len());
+                if prefix.entries.is_empty() || entries.get(index..end) != Some(prefix.entries.as_slice()) {
+                    return Err(Error::ConflictingObject(ensemble.config.stream.clone()));
+                }
+                offset += prefix.entries.len() as i64;
+            }
+            for entry in &entries[(offset - checkpoint - 1) as usize..] {
+                let complete = entry.lsn == last;
+                deposed_by(epoch, ensemble.overwrite(server, epoch, entry.lsn, vec![entry.clone()], complete).await?)?;
+            }
+            if offset > last && sealed.synced != epoch {
+                deposed_by(epoch, ensemble.overwrite(server, epoch, last + 1, Vec::new(), true).await?)?;
+            }
+            let accepted = deposed_by(epoch, ensemble.commit(server, epoch, last).await?)?;
+            if accepted.commit_lsn != last {
+                return Err(failure("the seeded replica did not commit its exact terminal offset".into()));
+            }
+            Ok(())
+        }).collect::<FuturesUnordered<_>>();
+        let mut committed = 0;
+        while let Some(reply) = seeds.next().await {
+            match reply {
+                Ok(()) => committed += 1,
+                Err(error @ (Error::Deposed { .. } | Error::ConflictingObject(_))) => return Err(error),
+                Err(_) => (),
+            }
+        }
+        if committed < ensemble.config.write_quorum {
+            return Err(failure("a quorum did not commit the reserved replica genesis".into()));
+        }
+        Ok(())
+    }
+
     /// Recovers a durable write quorum of `ensemble` before opening the pipeline.
     async fn establish(ensemble: Arc<Ensemble>, epoch: u64, replies: &[(usize, Sealed)], recovered: Recovered<'_>) -> Result<Arc<Self>> {
         let last = recovered.history.last;

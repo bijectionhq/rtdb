@@ -103,7 +103,7 @@ fn valid_installation_name(part: &str) -> bool {
         && part.bytes().all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
 }
 
-async fn choose_ensemble(directory: &dyn Directory, record: &DeploymentRecord, replicas: usize) -> Result<Vec<MemberId>> {
+pub(crate) async fn choose_ensemble(directory: &dyn Directory, record: &DeploymentRecord, replicas: usize) -> Result<Vec<MemberId>> {
     let now = now_ms();
     let members = directory.members().await?;
     let logkeepers: Vec<_> = members.iter().filter(|member| member.role == MemberRole::Logkeeper && member.state == MemberState::Eligible && member.is_live(now)).collect();
@@ -134,7 +134,7 @@ async fn update(directory: &dyn Directory, name: &str, change: impl Fn(&mut Depl
     Err(Anomaly::new(AnomalyCategory::Conflict, "rtdb.multi/update-contended", format!("{name} kept changing while being updated")))
 }
 
-async fn replica_servers(directory: &dyn Directory, record: &DeploymentRecord) -> Result<Vec<JournalEndpoint>> {
+pub(crate) async fn replica_servers(directory: &dyn Directory, record: &DeploymentRecord) -> Result<Vec<JournalEndpoint>> {
     match &record.move_from {
         Some(previous) if previous.iter().all(|endpoint| endpoint.journal().is_some()) => Ok(previous.clone()),
         Some(_) => Err(Anomaly::new(AnomalyCategory::Unavailable, "rtdb.multi/journal-identity-missing",
