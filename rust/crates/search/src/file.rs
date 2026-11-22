@@ -28,7 +28,7 @@ pub(crate) mod experiment;
 
 const MAGIC: &[u8; 8] = b"RTSRCH03";
 /// Identifies the bundle bytes produced by the builder, including visibility encoding.
-pub const FORMAT_VERSION: i32 = 9;
+pub const FORMAT_VERSION: i32 = 10;
 const WRITER_MEMORY: usize = 32 << 20;
 /// The bundle entry holding what tantivy's segment does not: rows, runs, rectangles, nulls, every row's key, and term impacts.
 const SIDECAR: &str = "rtdb.sidecar";
@@ -298,36 +298,13 @@ fn runs(writer: &mut tantivy::SingleSegmentIndexWriter, fields: &[Field], sideca
             sidecar.rectangles.extend(rectangles);
             sidecar.rectangle_starts.push(u32::try_from(sidecar.rectangles.len()).map_err(fault)?);
             sidecar.doc_iids.push(iid);
-            if let Some(id) = &entity.identity { encode_identity(id, &mut sidecar.identities); }
+            if let Some(id) = &entity.identity { sidecar.identities.extend_from_slice(&id.handle_bytes()); }
             sidecar.identity_starts.push(u32::try_from(sidecar.identities.len()).map_err(fault)?);
             sidecar.column_docs[column] += 1;
             for index in members { sidecar.row_docs[column][entity.rows[index].0 as usize] = doc; }
         }
     }
     Ok(())
-}
-
-fn encode_identity(id: &EntityId, bytes: &mut Vec<u8>) {
-    let (tag, value): (u8, &[u8]) = match id {
-        EntityId::String(value) => (1, value.as_bytes()),
-        EntityId::Keyword(value) => (2, value.as_str().as_bytes()),
-        EntityId::Integer(value) => { bytes.push(3); bytes.extend_from_slice(&value.to_le_bytes()); return; }
-        EntityId::Uuid(value) => (4, value),
-    };
-    bytes.push(tag);
-    bytes.extend_from_slice(value);
-}
-
-fn decode_identity(bytes: &[u8]) -> Result<Option<EntityId>> {
-    let Some((&tag, value)) = bytes.split_first() else { return Ok(None); };
-    let text = || std::str::from_utf8(value).map(str::to_owned).map_err(fault);
-    Ok(Some(match tag {
-        1 => EntityId::String(text()?),
-        2 => EntityId::Keyword(rtdb_types::Keyword::from_name(text()?)),
-        3 => EntityId::Integer(i64::from_le_bytes(value.try_into().map_err(fault)?)),
-        4 => EntityId::Uuid(value.try_into().map_err(fault)?),
-        _ => return Err(corrupt("Search file has an invalid identity tag")),
-    }))
 }
 
 /// A term's documents within one window: the highest frequency among them, and the shortest stored length.
@@ -776,9 +753,8 @@ impl SearchFile {
     }
 
     pub(crate) fn run_identity(&self, run: DocMatch) -> Result<EntityId> {
-        let id = decode_identity(self.run_identity_bytes(run)?)?.ok_or_else(|| corrupt("Search run omitted its full identity"))?;
-        if !id.owned_locator_candidates().any(|candidate| candidate.0 == run.iid) { return Err(corrupt("Search run identity disagrees with its IID")); }
-        Ok(id)
+        EntityId::from_handle_bytes(self.run_identity_bytes(run)?)
+            .map_err(|_| corrupt("Search run has an invalid complete identity key"))
     }
 
     /// Counts analyzer tokens before the ranker's field-norm quantization.

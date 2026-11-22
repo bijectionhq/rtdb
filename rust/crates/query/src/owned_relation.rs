@@ -27,6 +27,20 @@ pub async fn open_owned_point(
     }
 }
 
+/// Revalidates an immutable artefact's nominated row with its complete key.
+/// The caller supplies the locator from a covered artefact, and still has to
+/// compare the returned row's full identity and source revision before use.
+#[doc(hidden)]
+pub async fn open_owned_artefact_candidate(
+    context: Arc<QueryContext>, owner: &str, relation: &OwnedRelation, key: &EntityId, locator: Iid,
+    valid: Interval, columns: &[&str],
+) -> Result<Option<QueryCursor>> {
+    if owner.is_empty() || relation.world().is_some() || relation.is_world_catalog() || valid.is_empty() {
+        return Err(address_unavailable());
+    }
+    open_owned_table_point(context, relation.table(owner), locator, Some(key), Some(valid), Some(columns), false).await
+}
+
 /// Opens a point at a caller-certified system cut within this retained catalog.
 pub async fn open_owned_point_at_system(
     context: Arc<QueryContext>, owner: &str, relation: &OwnedRelation, id: &EntityId,
