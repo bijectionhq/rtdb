@@ -21,6 +21,7 @@ impl BatchWindow {
 
     pub fn new(input: BoxBatchCursor, schema: Schema, order_by: Vec<SortExpr>, expressions: &[WindowExpr],
         projected: bool, execution: Execution) -> Result<Self> {
+        let input: BoxBatchCursor = Box::new(WindowInput { input, context: Arc::clone(&execution.context) });
         let input = if order_by.is_empty() { input } else {
             Box::new(crate::sort::batches::BatchSort::new(input, schema.clone(), order_by, execution.clone(), projected, 0, i64::MAX as u64)?)
         };
@@ -73,10 +74,22 @@ impl BatchWindow {
                 };
                 suffixes.push(suffix);
             }
-            batches = batches.into_iter().zip(suffixes).map(|(batch, (suffix, _scratch))| batch.append_column(suffix, memory))
-                .collect::<Result<_>>()?;
+            for (batch, (suffix, reservation)) in batches.iter_mut().zip(suffixes) {
+                batch.append_column(suffix, reservation, memory)?;
+            }
         }
         Ok((batches.into(), inventory))
+    }
+}
+
+struct WindowInput { input: BoxBatchCursor, context: Arc<crate::QueryContext> }
+
+#[async_trait]
+impl BatchCursor for WindowInput {
+    async fn next_batch(&mut self) -> Result<Option<ColumnBatch>> {
+        let batch = poll_nested_batch(self.input.as_mut()).await?;
+        if let Some(batch) = &batch { batch.validate_readable(&self.context)?; }
+        Ok(batch)
     }
 }
 

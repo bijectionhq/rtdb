@@ -2050,7 +2050,8 @@ mod tests {
             let mut rows = Vec::new();
             while let Some(page) = cursor.next_batch().await.unwrap() {
                 assert_eq!(page.len, 1);
-                assert!(page.columns.iter().all(|column| matches!(column, crate::columnar::Column::Arrow { .. })));
+                assert!(matches!(page.columns[0], crate::columnar::Column::Arrow { .. }));
+                assert!(page.columns[1..].iter().all(|column| matches!(column, crate::columnar::Column::Selected(_))));
                 rows.push(page.columns.iter().map(|column| column.value(0).unwrap()).collect::<Vec<_>>());
             }
             assert_eq!(rows, [
