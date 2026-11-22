@@ -8,6 +8,7 @@ use super::{
 };
 
 const RULE: &str = "!rule";
+const MAX_RULES: usize = 16;
 
 #[derive(Default)]
 pub(super) struct OwnedCapacityChanges {
@@ -16,53 +17,43 @@ pub(super) struct OwnedCapacityChanges {
 }
 
 struct TouchedRule {
-    rule: CapacityRule,
+    policy: CapacityPolicy,
     ids: BTreeSet<EntityId>,
     writes: i64,
 }
 
+#[derive(PartialEq, Eq)]
 struct CapacityRule {
     column: String,
     prefix_bytes: Option<NonZeroUsize>,
     cap: i64,
-    through_events: i64,
 }
 
 impl CapacityRule {
-    fn new(column: String, prefix_bytes: i64, cap: i64, through_events: i64) -> Result<Self> {
+    fn new(column: String, prefix_bytes: i64, cap: i64) -> Result<Self> {
         let prefix_bytes = usize::try_from(prefix_bytes)
             .ok()
             .filter(|n| *n <= MAX_KEY_BYTES)
             .ok_or_else(invalid_rule)?;
-        if column.is_empty()
-            || column.len() > 96
-            || column.starts_with('_')
-            || cap <= 0
-            || through_events < 0
-        {
+        if column.is_empty() || column.len() > 96 || column.starts_with('_') || cap <= 0 {
             return Err(invalid_rule());
         }
         Ok(Self {
             column,
             prefix_bytes: NonZeroUsize::new(prefix_bytes),
             cap,
-            through_events,
         })
     }
 
-    fn document(&self) -> StructFields<Value> {
-        StructFields::from([
-            ("_id".into(), Value::Utf8(RULE.into())),
+    fn value(&self) -> Value {
+        Value::Struct(StructFields::from([
+            ("column".into(), Value::Utf8(self.column.clone())),
             (
-                "policy".into(),
-                Value::Struct(StructFields::from([
-                    ("column".into(), Value::Utf8(self.column.clone())),
-                    ("prefix_bytes".into(), Value::I64(self.prefix_bytes.map_or(0, NonZeroUsize::get) as i64)),
-                    ("cap".into(), Value::I64(self.cap)),
-                    ("through_events".into(), Value::I64(self.through_events)),
-                ])),
+                "prefix_bytes".into(),
+                Value::I64(self.prefix_bytes.map_or(0, NonZeroUsize::get) as i64),
             ),
-        ])
+            ("cap".into(), Value::I64(self.cap)),
+        ]))
     }
 
     fn bucket<'a>(&self, key: &'a [u8]) -> Option<&'a [u8]> {
@@ -72,25 +63,81 @@ impl CapacityRule {
         key.get(..self.prefix_bytes.map_or(key.len(), NonZeroUsize::get))
     }
 
+    fn bucket_id(&self, key: &[u8]) -> EntityId {
+        let mut bytes = Vec::with_capacity(1 + self.column.len() + key.len());
+        bytes.push(self.column.len() as u8);
+        bytes.extend_from_slice(self.column.as_bytes());
+        bytes.extend_from_slice(key);
+        unique_id(&bytes)
+    }
+
+    fn decode(value: &Value) -> Result<Self> {
+        let Value::Struct(rule) = value else {
+            return Err(uncovered());
+        };
+        let (Some(Value::Utf8(column)), Some(Value::I64(prefix_bytes)), Some(Value::I64(cap))) = (
+            rule.get("column"),
+            rule.get("prefix_bytes"),
+            rule.get("cap"),
+        ) else {
+            return Err(uncovered());
+        };
+        if rule.len() != 3 {
+            return Err(uncovered());
+        }
+        Self::new(column.clone(), *prefix_bytes, *cap).map_err(|_| uncovered())
+    }
+}
+
+#[derive(Default)]
+struct CapacityPolicy {
+    rules: Vec<CapacityRule>,
+    through_events: i64,
+}
+
+impl CapacityPolicy {
+    fn document(&self) -> StructFields<Value> {
+        StructFields::from([
+            ("_id".into(), Value::Utf8(RULE.into())),
+            (
+                "policy".into(),
+                Value::Struct(StructFields::from([
+                    (
+                        "rules".into(),
+                        Value::List(self.rules.iter().map(CapacityRule::value).collect()),
+                    ),
+                    ("through_events".into(), Value::I64(self.through_events)),
+                ])),
+            ),
+        ])
+    }
+
     fn decode(value: Value) -> Result<Self> {
         let Value::Struct(policy) = value else {
             return Err(uncovered());
         };
-        let (
-            Some(Value::Utf8(column)),
-            Some(Value::I64(prefix_bytes)),
-            Some(Value::I64(cap)),
-            Some(Value::I64(through_events)),
-        ) = (
-            policy.get("column"),
-            policy.get("prefix_bytes"),
-            policy.get("cap"),
-            policy.get("through_events"),
-        )
+        let (Some(Value::List(rules)), Some(Value::I64(through_events))) =
+            (policy.get("rules"), policy.get("through_events"))
         else {
             return Err(uncovered());
         };
-        Self::new(column.clone(), *prefix_bytes, *cap, *through_events).map_err(|_| uncovered())
+        if policy.len() != 2 || !(1..=MAX_RULES).contains(&rules.len()) || *through_events < 0 {
+            return Err(uncovered());
+        }
+        let rules = rules
+            .iter()
+            .map(CapacityRule::decode)
+            .collect::<Result<Vec<_>>>()?;
+        if rules
+            .windows(2)
+            .any(|pair| pair[0].column >= pair[1].column)
+        {
+            return Err(uncovered());
+        }
+        Ok(Self {
+            rules,
+            through_events: *through_events,
+        })
     }
 }
 
@@ -200,26 +247,26 @@ impl OpenTransaction<'_> {
                 "The count bound requires a previously declared capacity rule",
             ));
         }
-        let policy_id = EntityId::String(RULE.into());
-        let rule = self
-            .capacity_cell(snapshot.clone(), owner, relation, &policy_id, "policy")
+        let policy = self
+            .capacity_policy(snapshot.clone(), owner, relation)
             .await
-            .map_err(count_uncovered)?
-            .ok_or_else(uncovered)
-            .and_then(CapacityRule::decode)
             .map_err(count_uncovered)?;
-        if rule.column != column || rule.bucket(prefix) != Some(prefix) {
+        let rule = policy
+            .rules
+            .iter()
+            .find(|rule| rule.column == column && rule.bucket(prefix) == Some(prefix));
+        let Some(rule) = rule else {
             return Err(Anomaly::incorrect(
                 "rtdb.owned/count-bound",
                 "The count interval must identify one declared Binary partition",
             ));
-        }
-        if snapshot.relation_event_frontier(&relation.table(owner))? != rule.through_events {
+        };
+        if snapshot.relation_event_frontier(&relation.table(owner))? != policy.through_events {
             return Err(count_uncovered(uncovered()));
         }
         let _key = self.context.memory.reserve(prefix.len() * 4 + 512)?;
         match self
-            .capacity_cell(snapshot, owner, relation, &unique_id(prefix), "count")
+            .capacity_cell(snapshot, owner, relation, &rule.bucket_id(prefix), "count")
             .await
             .map_err(count_uncovered)?
         {
@@ -243,28 +290,34 @@ impl OpenTransaction<'_> {
             .as_deref()
             .filter(|owner| !owner.is_empty())
             .ok_or_else(no_owned_principal)?;
-        let rule = CapacityRule::new(column.into(), prefix_bytes, cap, 0)?;
+        let rule = CapacityRule::new(column.into(), prefix_bytes, cap)?;
         let storage = relation.capacity_table(owner);
         let target = relation.table(owner);
         let snapshot = self.snapshot()?;
-        if snapshot.contains_table(&storage) {
-            let prior = self.capacity_cell(snapshot.clone(), owner, relation,
-                &EntityId::String(RULE.into()), "policy").await?
-                .ok_or_else(uncovered).and_then(CapacityRule::decode)?;
-            if prior.column == rule.column && prior.prefix_bytes == rule.prefix_bytes
-                && prior.cap == rule.cap && prior.through_events == snapshot.relation_event_frontier(&target)?
-            {
+        let frontier = snapshot.relation_event_frontier(&target)?;
+        let mut policy = self
+            .capacity_policy(snapshot.clone(), owner, relation)
+            .await?;
+        if !policy.rules.is_empty() && policy.through_events != frontier {
+            return Err(uncovered());
+        }
+        let index = match policy
+            .rules
+            .binary_search_by(|prior| prior.column.cmp(&rule.column))
+        {
+            Ok(index) if policy.rules[index] == rule => {
                 return Ok(());
             }
-            return Err(Anomaly::new(
-                AnomalyCategory::Conflict,
-                "rtdb.owned/capacity-exists",
-                "The owned relation already has a capacity rule",
-            ));
-        }
-        if snapshot.relation_event_frontier(&target)? != 0
-            || !snapshot.trie_entries(&target).is_empty()
-        {
+            Ok(_) => {
+                return Err(Anomaly::new(
+                    AnomalyCategory::Conflict,
+                    "rtdb.owned/capacity-exists",
+                    "The owned projection already has a different capacity rule",
+                ));
+            }
+            Err(index) => index,
+        };
+        if frontier != 0 || !snapshot.trie_entries(&target).is_empty() {
             return Err(Anomaly::incorrect(
                 "rtdb.owned/capacity-bootstrap",
                 "A capacity rule requires a relation with no prior events",
@@ -275,14 +328,20 @@ impl OpenTransaction<'_> {
         {
             return Err(invalid_rule());
         }
-        self.capacity_changes
-            .reservations
-            .push(self.context.memory.reserve(1024)?);
-        self.buffer.put(storage, rule.document(), Interval::ALL)?;
+        if policy.rules.len() >= MAX_RULES {
+            return Err(invalid_rule());
+        }
+        policy.rules.insert(index, rule);
+        self.capacity_changes.reservations.push(
+            self.context
+                .memory
+                .reserve(1024 + policy.rules.len() * 256)?,
+        );
+        self.buffer.put(storage, policy.document(), Interval::ALL)?;
         self.capacity_changes.relations.insert(
             relation.clone(),
             Some(TouchedRule {
-                rule,
+                policy,
                 ids: BTreeSet::new(),
                 writes: 0,
             }),
@@ -302,23 +361,17 @@ impl OpenTransaction<'_> {
         }
         if !self.capacity_changes.relations.contains_key(relation) {
             let snapshot = self.buffer.base_snapshot();
-            let rule = if snapshot.contains_table(&relation.capacity_table(owner)) {
-                let id = EntityId::String(RULE.into());
-                let value = self
-                    .capacity_cell(snapshot, owner, relation, &id, "policy")
-                    .await?
-                    .ok_or_else(uncovered)?;
-                Some(TouchedRule {
-                    rule: CapacityRule::decode(value)?,
-                    ids: BTreeSet::new(),
-                    writes: 0,
-                })
-            } else {
-                None
-            };
-            self.capacity_changes
-                .reservations
-                .push(self.context.memory.reserve(1024)?);
+            let policy = self.capacity_policy(snapshot, owner, relation).await?;
+            self.capacity_changes.reservations.push(
+                self.context
+                    .memory
+                    .reserve(1024 + policy.rules.len() * 256)?,
+            );
+            let rule = (!policy.rules.is_empty()).then_some(TouchedRule {
+                policy,
+                ids: BTreeSet::new(),
+                writes: 0,
+            });
             self.capacity_changes
                 .relations
                 .insert(relation.clone(), rule);
@@ -367,12 +420,13 @@ impl OpenTransaction<'_> {
             .user
             .as_deref()
             .filter(|owner| !owner.is_empty())
-            .ok_or_else(no_owned_principal)?;
+            .ok_or_else(no_owned_principal)?
+            .to_owned();
         let base = self.buffer.base_snapshot();
         let next = self.snapshot()?;
         for (relation, touched) in changes.relations {
             let Some(TouchedRule {
-                mut rule,
+                mut policy,
                 ids,
                 writes,
             }) = touched
@@ -382,101 +436,138 @@ impl OpenTransaction<'_> {
             if writes == 0 {
                 continue;
             }
-            let target = relation.table(owner);
-            let through = rule
+            let target = relation.table(&owner);
+            let through = policy
                 .through_events
                 .checked_add(writes)
                 .ok_or_else(overflow)?;
-            if base.relation_event_frontier(&target)? != rule.through_events
+            if base.relation_event_frontier(&target)? != policy.through_events
                 || next.relation_event_frontier(&target)? != through
             {
                 return Err(uncovered());
             }
-            let mut deltas = BTreeMap::<EntityId, Delta>::new();
-            let mut allocations = Vec::new();
-            for id in ids {
-                for (snapshot, final_state) in [(&base, false), (&next, true)] {
-                    let context = self.context.query_context(
-                        snapshot.clone(),
-                        self.tx_key().system_time,
-                        &self.options.default_tz,
-                        self.trace_parent,
-                    )?;
-                    let cursor = rtdb_query::open_owned_point(
-                        context,
-                        owner,
-                        &relation,
-                        &id,
-                        None,
-                        Some(&[rule.column.as_str()]),
-                    )
-                    .await?;
-                    let Some(key) = self
-                        .read_occupancy_cell(cursor, &id, &rule.column, uncovered)
-                        .await?
-                    else {
-                        continue;
-                    };
-                    let Value::Binary(key) = key else {
-                        return Err(invalid_key());
-                    };
-                    let prefix = rule.bucket(&key).ok_or_else(invalid_key)?;
-                    allocations.push(self.context.memory.reserve(prefix.len() * 4 + 512)?);
-                    let delta = deltas.entry(unique_id(prefix)).or_default();
-                    let count = if final_state {
-                        &mut delta.claims
-                    } else {
-                        &mut delta.releases
-                    };
-                    *count = count.checked_add(1).ok_or_else(overflow)?;
-                }
-            }
-            let storage = relation.capacity_table(owner);
+            let _locators = self
+                .context
+                .memory
+                .reserve(64 + ids.len() * policy.rules.len() * 128)?;
             let mut locators = BTreeSet::from([EntityId::String(RULE.into()).iid()]);
-            for (id, delta) in deltas {
-                self.context.check_cancelled()?;
-                if !locators.insert(id.iid()) {
-                    return Err(uncovered());
-                }
-                let count = match self
-                    .capacity_cell(base.clone(), owner, &relation, &id, "count")
-                    .await?
-                {
-                    None => 0,
-                    Some(Value::I64(count)) if (1..=rule.cap).contains(&count) => count,
-                    Some(_) => return Err(uncovered()),
-                };
-                if delta.releases > count {
-                    return Err(uncovered());
-                }
-                let final_count = (count - delta.releases)
-                    .checked_add(delta.claims)
-                    .ok_or_else(overflow)?;
-                if final_count > rule.cap {
-                    return Err(Anomaly::new(
-                        AnomalyCategory::Conflict,
-                        "rtdb.owned/capacity-exceeded",
-                        "An owned prefix exceeds its capacity",
-                    ));
-                }
-                if final_count == count {
-                    continue;
-                }
-                if final_count == 0 {
-                    self.buffer.delete(storage.clone(), &id, Interval::ALL)?;
-                } else {
-                    self.buffer.put(
-                        storage.clone(),
-                        StructFields::from([
-                            ("_id".into(), id.as_value()),
-                            ("count".into(), Value::I64(final_count)),
-                        ]),
-                        Interval::ALL,
-                    )?;
-                }
+            for rule in &policy.rules {
+                self.apply_capacity_rule(
+                    &owner,
+                    &relation,
+                    rule,
+                    &ids,
+                    &base,
+                    &next,
+                    &mut locators,
+                )
+                .await?;
             }
-            rule.through_events = through;
-            self.buffer.put(storage, rule.document(), Interval::ALL)?;
+            policy.through_events = through;
+            self.buffer.put(
+                relation.capacity_table(&owner),
+                policy.document(),
+                Interval::ALL,
+            )?;
+        }
+        Ok(())
+    }
+
+    async fn apply_capacity_rule(
+        &mut self,
+        owner: &str,
+        relation: &OwnedRelation,
+        rule: &CapacityRule,
+        ids: &BTreeSet<EntityId>,
+        base: &Snapshot,
+        next: &Snapshot,
+        locators: &mut BTreeSet<rtdb_types::Iid>,
+    ) -> Result<()> {
+        let mut deltas = BTreeMap::<EntityId, Delta>::new();
+        let mut allocations = Vec::new();
+        for id in ids {
+            for (snapshot, final_state) in [(base, false), (next, true)] {
+                let context = self.context.query_context(
+                    snapshot.clone(),
+                    self.tx_key().system_time,
+                    &self.options.default_tz,
+                    self.trace_parent,
+                )?;
+                let cursor = rtdb_query::open_owned_point(
+                    context,
+                    owner,
+                    relation,
+                    id,
+                    None,
+                    Some(&[rule.column.as_str()]),
+                )
+                .await?;
+                let Some(key) = self
+                    .read_occupancy_cell(cursor, id, &rule.column, uncovered)
+                    .await?
+                else {
+                    continue;
+                };
+                let Value::Binary(key) = key else {
+                    return Err(invalid_key());
+                };
+                let prefix = rule.bucket(&key).ok_or_else(invalid_key)?;
+                allocations.push(
+                    self.context
+                        .memory
+                        .reserve((prefix.len() + rule.column.len()) * 4 + 512)?,
+                );
+                let delta = deltas.entry(rule.bucket_id(prefix)).or_default();
+                let count = if final_state {
+                    &mut delta.claims
+                } else {
+                    &mut delta.releases
+                };
+                *count = count.checked_add(1).ok_or_else(overflow)?;
+            }
+        }
+        let storage = relation.capacity_table(owner);
+        for (id, delta) in deltas {
+            self.context.check_cancelled()?;
+            if !locators.insert(id.iid()) {
+                return Err(uncovered());
+            }
+            let count = match self
+                .capacity_cell(base.clone(), owner, relation, &id, "count")
+                .await?
+            {
+                None => 0,
+                Some(Value::I64(count)) if (1..=rule.cap).contains(&count) => count,
+                Some(_) => return Err(uncovered()),
+            };
+            if delta.releases > count {
+                return Err(uncovered());
+            }
+            let final_count = (count - delta.releases)
+                .checked_add(delta.claims)
+                .ok_or_else(overflow)?;
+            if final_count > rule.cap {
+                return Err(Anomaly::new(
+                    AnomalyCategory::Conflict,
+                    "rtdb.owned/capacity-exceeded",
+                    "An owned prefix exceeds its capacity",
+                ));
+            }
+            if final_count == count {
+                continue;
+            }
+            if final_count == 0 {
+                self.buffer.delete(storage.clone(), &id, Interval::ALL)?;
+            } else {
+                self.buffer.put(
+                    storage.clone(),
+                    StructFields::from([
+                        ("_id".into(), id.as_value()),
+                        ("count".into(), Value::I64(final_count)),
+                    ]),
+                    Interval::ALL,
+                )?;
+            }
         }
         Ok(())
     }
@@ -488,18 +579,36 @@ impl OpenTransaction<'_> {
         relation: &OwnedRelation,
         schema: &rtdb_types::OwnedSchema,
     ) -> Result<()> {
-        if snapshot.contains_table(&relation.capacity_table(owner)) {
-            let id = EntityId::String(RULE.into());
-            let policy = self
-                .capacity_cell(snapshot, owner, relation, &id, "policy")
-                .await?
-                .ok_or_else(uncovered)?;
-            let rule = CapacityRule::decode(policy)?;
-            if schema.column_type(&rule.column) != Some(ScalarType::Binary) {
-                return Err(invalid_rule());
-            }
+        let policy = self.capacity_policy(snapshot, owner, relation).await?;
+        if policy
+            .rules
+            .iter()
+            .any(|rule| schema.column_type(&rule.column) != Some(ScalarType::Binary))
+        {
+            return Err(invalid_rule());
         }
         Ok(())
+    }
+
+    async fn capacity_policy(
+        &self,
+        snapshot: Snapshot,
+        owner: &str,
+        relation: &OwnedRelation,
+    ) -> Result<CapacityPolicy> {
+        if !snapshot.contains_table(&relation.capacity_table(owner)) {
+            return Ok(CapacityPolicy::default());
+        }
+        self.capacity_cell(
+            snapshot,
+            owner,
+            relation,
+            &EntityId::String(RULE.into()),
+            "policy",
+        )
+        .await?
+        .ok_or_else(uncovered)
+        .and_then(CapacityPolicy::decode)
     }
 
     async fn capacity_cell(
