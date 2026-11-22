@@ -283,17 +283,21 @@ pub(crate) struct Indices { pub(crate) values: Vec<usize>, _reservation: Arc<Mem
 /// Sorts record indices by `compare` over each record's first `key_width` values.
 /// A disk-backed store's keys are read in one sequential pass and held for the sort, so a comparison never reads the spill.
 pub(crate) fn sort_records(store: &RecordStore,context: &Arc<crate::QueryContext>,key_width: usize,mut compare: impl FnMut(&[Value],&[Value]) -> Result<Ordering>) -> Result<Indices> {
-    let scratch = match context.options.object_sort {
-        rtdb_types::ObjectSort::TimSort => timsort::scratch_bytes(store.len())?,
-        rtdb_types::ObjectSort::LegacyMergeSort => legacy::scratch_bytes(store.len())?,
-    };
-    let bytes = store.len().checked_mul(std::mem::size_of::<usize>()).and_then(|size|size.checked_add(scratch)).and_then(|size|size.checked_add(256)).ok_or_else(size_error)?;
-    let reservation = context.memory.reserve(bytes)?;
-    let mut indices: Vec<_> = (0..store.len()).collect();
     let keys = store.key_prefixes(key_width)?;
+    sort_ordinals(store.len(), context, |left, right| compare(keys.get(left)?, keys.get(right)?))
+}
+
+pub(crate) fn sort_ordinals(len: usize, context: &crate::QueryContext, mut compare: impl FnMut(usize, usize) -> Result<Ordering>) -> Result<Indices> {
+    let scratch = match context.options.object_sort {
+        rtdb_types::ObjectSort::TimSort => timsort::scratch_bytes(len)?,
+        rtdb_types::ObjectSort::LegacyMergeSort => legacy::scratch_bytes(len)?,
+    };
+    let bytes = len.checked_mul(std::mem::size_of::<usize>()).and_then(|size|size.checked_add(scratch)).and_then(|size|size.checked_add(256)).ok_or_else(size_error)?;
+    let reservation = context.memory.reserve(bytes)?;
+    let mut indices: Vec<_> = (0..len).collect();
     let compare = |left: usize,right: usize| {
         context.check_cancelled()?;
-        compare(keys.get(left)?,keys.get(right)?)
+        compare(left,right)
     };
     match context.options.object_sort {
         rtdb_types::ObjectSort::TimSort => timsort::sort(&mut indices,compare)?,

@@ -204,7 +204,7 @@ impl SearchRuntime {
             let bytes = tokio::task::spawn_blocking(move || -> Result<Vec<u8>> {
                 let _indexing = indexing;
                 let mut bytes = Vec::new();
-                let pages = crate::lane::search_pages_with_budget(lease.as_slice(), &indexed, &token, memory)?;
+                let pages = crate::lane::search_pages_with_budget(lease, &indexed, &token, memory)?;
                 crate::file::write_search_file(&indexed, pages, "built", ceiling, tantivy::directory::RamDirectory::create(), &mut bytes)?;
                 Ok(bytes)
             }).await.map_err(|error| rtdb_types::Anomaly::fault("rtdb.search/build", error.to_string()))??;

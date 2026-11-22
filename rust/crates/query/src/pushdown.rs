@@ -153,12 +153,12 @@ impl Pushdowns {
             self.columns.iter().find(|(id, _)| *id == field.id)?.1.iids.as_ref()?.entries_for(field, canonical_entity_iids)
         })
     }
-    pub fn page_matches(&self, schema: &[Field], columns: &[Value], memory: &Arc<MemoryBudget>) -> Result<bool> {
+    pub fn page_matches(&self, schema: &[Field], columns: &rtdb_format::metadata::LeafStatistics<'_>, memory: &Arc<MemoryBudget>) -> Result<bool> {
         for field in schema {
             let Some((_, filter)) = self.columns.iter().find(|(id, _)| *id == field.id) else { continue; };
             let Some(bloom) = &filter.bloom else { continue; };
-            let Some(column) = columns.iter().find(|column| matches!(column.field("col-name"), Some(Value::Utf8(name)) if name == &field.name) && column.field("root-col?") == Some(&Value::Bool(true))) else { return Ok(false); };
-            if let Some(Value::Binary(bytes)) = column.field("bytes").and_then(|value| value.field("bloom")) {
+            let Some(column) = columns.root_column(&field.name) else { return Ok(false); };
+            if let Some(bytes) = column.bloom() {
                 let _reservation = memory.reserve(bytes.len().checked_mul(8).and_then(|bytes| bytes.checked_add(1 << 20)).ok_or_else(size_error)?)?;
                 if !bloom.intersects(&BloomFilter::from_bytes(bytes)?) { return Ok(false); }
             }

@@ -1847,13 +1847,13 @@ impl NativeSession {
     pub async fn query_sql(&mut self, sql: &str, arguments: Vec<Value>) -> Result<QueryCursor> {
         let context = self.query_context().await?;
         let options = rtdb_sql::PrepareOptions { parameter_types: arguments.iter().enumerate().map(|(index, value)| (index, rtdb_columnar::execution_type(&value.logical_type()))).collect(), default_timezone: context.timezone.clone(), generate_series_end_exclusive: context.options.generate_series_end_exclusive, ..Default::default() };
-        prepare_query(sql, &context, &options)?.execute(context, arguments).await
+        prepare_query(sql, &context, &options)?.execute_column_rows(context, arguments, None).await
     }
     pub async fn query_xtql(&mut self, source: &str, arguments: Vec<Value>) -> Result<QueryCursor> {
         let context = self.query_context().await?;
         let options = rtdb_xtql::CompileOptions { parameter_types: arguments.iter().map(|value| rtdb_columnar::execution_type(&value.logical_type())).collect(), default_timezone: context.timezone.clone(), ..Default::default() };
         let prepared = rtdb_xtql::compile_in(source, &context.catalog, &options, &context.memory)?;
-        PreparedQuery::from_prepared(prepared, &context.memory)?.execute(context, arguments).await
+        PreparedQuery::from_prepared(prepared, &context.memory)?.execute_column_rows(context, arguments, None).await
     }
 
     /// Opens a logical relation against the same transaction read basis as SQL and XTQL.

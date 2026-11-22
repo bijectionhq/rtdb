@@ -1027,7 +1027,7 @@ impl PartitionScan {
                     MetadataNode::Leaf { data_page_index, columns } => {
                         // An ordered scan may stop after its first tasks, so it reads a leaf's statistics when it reaches the leaf's task.
                         let (content_matches, temporal, unread) = if self.order.is_some() { (true, None, Some(visit.node)) } else {
-                            let columns = &*columns.values()?;
+                            let columns = &columns.statistics()?;
                             (self.leaf_matches(columns, &page_test)?, page_temporal(columns), None)
                         };
                         pages.push(Page { lower, upper, priority: live_segment_count + index, content_matches, unread,
@@ -1049,7 +1049,7 @@ impl PartitionScan {
         Ok(())
     }
     /// Whether a leaf's statistics leave it possible that a put of its page satisfies the scan's pushdowns and predicates.
-    fn leaf_matches(&self, columns: &[Value], page_test: &crate::page_metadata::PageTest) -> Result<bool> {
+    fn leaf_matches(&self, columns: &rtdb_format::metadata::LeafStatistics<'_>, page_test: &crate::page_metadata::PageTest) -> Result<bool> {
         Ok(self.pushdowns.as_ref().map(|filters| filters.page_matches(&self.scan.columns, columns, &self.execution.context.memory)).transpose()?.unwrap_or(true)
             && may_satisfy_not_null(&self.scan, columns) && page_test.matches(columns)?)
     }
@@ -1066,7 +1066,7 @@ impl PartitionScan {
                 Some(cached) => {
                     let _charge = self.execution.context.memory.reserve(cached.bound)?;
                     let Some(MetadataNode::Leaf { columns, .. }) = cached.metadata.nodes().get(node) else { return Err(invalid("metadata-node", "A page's metadata node is not a leaf")) };
-                    let columns = &*columns.values()?;
+                    let columns = &columns.statistics()?;
                     Some((self.leaf_matches(columns, page_test)?, page_temporal(columns)))
                 }
                 None => None,
@@ -1183,7 +1183,7 @@ impl PartitionScan {
         }
         let mut resolver = HistoryResolver::new_in(self.bounds, self.scan.clamp_valid_time, Arc::clone(&self.execution.context.memory));
         let keyed = self.scan.table.name.table.is_owned_event_data();
-        let requested_key = if keyed { self.execution.context.owned_identity().map(EntityId::handle_bytes) } else { None };
+        let requested_key = if keyed { self.execution.context.catalog.owned_identity().map(EntityId::handle_bytes) } else { None };
         // Every equal physical IID stays within one task. A key's events still
         // arrive in descending system time, independently of its neighbours.
         let mut bucket = None;
@@ -1385,7 +1385,7 @@ fn summarize_headers(headers: impl IntoIterator<Item = EventHeader>) -> Option<T
     }
     result
 }
-fn may_satisfy_not_null(scan: &Scan, columns: &[Value]) -> bool {
+fn may_satisfy_not_null(scan: &Scan, columns: &rtdb_format::metadata::LeafStatistics<'_>) -> bool {
     let [Expr::Unary { op: UnaryOp::IsNotNull, expr }] = scan.predicates.as_slice() else {
         return true;
     };
@@ -1403,23 +1403,16 @@ fn may_satisfy_not_null(scan: &Scan, columns: &[Value]) -> bool {
     ) {
         return true;
     }
-    let mut matching = columns.iter().filter(|column| {
-        matches!(column.field("col-name"), Some(Value::Utf8(name)) if name == &field.name)
-            && !matches!(column.field("root-col?"), Some(Value::Bool(false)))
-    });
+    let mut matching = columns.named(&field.name).filter(|column| column.flag("root-col?") != Some(false));
     let (Some(column), None) = (matching.next(), matching.next()) else {
         return true;
     };
-    !matches!(
-        (column.field("root-col?"), column.field("count")),
-        (Some(Value::Bool(true)), Some(Value::I64(0)))
-    )
+    (column.flag("root-col?"), column.count()) != (Some(true), Some(0))
 }
 
-fn page_temporal(columns: &[Value]) -> Option<TemporalSummary> {
+fn page_temporal(columns: &rtdb_format::metadata::LeafStatistics<'_>) -> Option<TemporalSummary> {
     let bound = |name: &str, key: &str, lower: bool| -> Option<Timestamp> {
-        let column = columns.iter().find(|column| column.field("col-name") == Some(&Value::Utf8(name.to_owned())) && column.field("root-col?") == Some(&Value::Bool(true)))?;
-        let Value::F64(seconds) = column.field("date-times")?.field(key)? else { return None; };
+        let seconds = columns.root_column(name)?.bound("date-times", key)?;
         if !seconds.is_finite() { return None; }
         let epsilon = seconds.abs() * f64::EPSILON * 4.0 + 0.000001;
         let micros = (seconds + if lower { -epsilon } else { epsilon }) * 1_000_000.0;
@@ -2054,6 +2047,79 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn equijoin_spill_replays_arrow_partitions_in_the_original_order() {
+        use rtdb_plan::{BinaryOp, JoinKind, Relation};
+
+        let (state, table, _, store, _) = persisted_page_fixture().await;
+        for (spill_limit, arrow) in [(8192, true), (900, false)] {
+            let storage = Arc::new(BufferPool::new(store.clone(), 1 << 20));
+            let (left, mut execution, memory) = descriptor_scan(state.value().snapshot(), table.clone(), storage);
+            let context = Arc::get_mut(&mut execution.context).unwrap();
+            context.options.join_build_rows = 1;
+            context.spill = Arc::new(crate::spill::SpillRegion::new(spill_limit).unwrap());
+            let mut right = left.clone();
+            right.columns[0].id = ColumnId(10);
+            let condition = Expr::binary(BinaryOp::Eq, left.columns[0].expression(), right.columns[0].expression());
+            let relation = Arc::new(Relation::join(
+                Arc::new(Relation::scan(left).unwrap()), Arc::new(Relation::scan(right).unwrap()),
+                JoinKind::Inner, Some(condition),
+            ).unwrap());
+            let runtime = crate::runtime_schema::EmittedRelation::derive(relation, &execution.context.catalog, &[], &memory).unwrap();
+            let mut baseline = crate::operators::build_pages(Arc::clone(&runtime), execution.clone()).await.unwrap();
+            let mut expected = Vec::new();
+            while let Some(page) = baseline.next_page().await.unwrap() {
+                expected.extend(page.rows().iter().map(|row| row.values.clone()));
+            }
+            drop(baseline);
+            assert_eq!(execution.context.spill_bytes(), 0);
+            let mut cursor = crate::operators::build_columns(runtime, execution.clone()).await.unwrap().expect("Expected columnar join");
+            let mut actual = Vec::new();
+            while let Some(batch) = cursor.next_batch().await.unwrap() {
+                assert_eq!(batch.columns.iter().all(|column| matches!(column, crate::columnar::Column::Arrow { .. })), arrow);
+                actual.extend((0..batch.len).map(|row| batch.columns.iter().map(|column| column.value(row).unwrap()).collect::<Vec<_>>()));
+            }
+            assert_eq!(actual, expected);
+            assert_eq!(actual.len(), 3);
+            assert!(execution.context.spill_peak_bytes() > 0);
+            assert_eq!(execution.context.spill_bytes(), 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn spilled_full_and_right_joins_keep_unmatched_arrow_positions() {
+        use rtdb_plan::{BinaryOp, JoinKind, Relation};
+        let (state, table, _, store, _) = persisted_page_fixture().await;
+        for kind in [JoinKind::Full, JoinKind::Right] {
+            let storage = Arc::new(BufferPool::new(store.clone(), 1 << 20));
+            let (left, mut execution, memory) = descriptor_scan(state.value().snapshot(), table.clone(), storage);
+            let context = Arc::get_mut(&mut execution.context).unwrap();
+            context.options.join_build_rows = 1;
+            let mut right = left.clone();
+            right.columns[0].id = ColumnId(10);
+            let key = Expr::binary(BinaryOp::Add, left.columns[0].expression(), Expr::Literal(Value::I64(1)));
+            let condition = Expr::binary(BinaryOp::Eq, key, right.columns[0].expression());
+            let relation = Arc::new(Relation::join(
+                Arc::new(Relation::scan(left).unwrap()), Arc::new(Relation::scan(right).unwrap()), kind, Some(condition),
+            ).unwrap());
+            let runtime = crate::runtime_schema::EmittedRelation::derive(relation, &execution.context.catalog, &[], &memory).unwrap();
+            let mut baseline = crate::operators::build_pages(Arc::clone(&runtime), execution.clone()).await.unwrap();
+            let mut expected = Vec::new();
+            while let Some(page) = baseline.next_page().await.unwrap() { expected.extend(page.rows().iter().map(|row| row.values.clone())); }
+            drop(baseline);
+            let mut columns = crate::operators::build_columns(runtime, execution.clone()).await.unwrap().expect("Expected Arrow spill");
+            let mut actual = Vec::new();
+            while let Some(batch) = columns.next_batch().await.unwrap() {
+                assert!(execution.context.spill_bytes() > 0);
+                assert!(batch.columns.iter().any(|column| !matches!(column, crate::columnar::Column::Values(_))));
+                actual.extend((0..batch.len).map(|row| batch.columns.iter().map(|column| column.value(row).unwrap()).collect::<Vec<_>>()));
+            }
+            assert_eq!(actual, expected);
+            assert_eq!(actual.len(), if kind == JoinKind::Full { 4 } else { 3 });
+            assert_eq!(execution.context.spill_bytes(), 0);
+        }
+    }
+
+    #[tokio::test]
     async fn computed_projection_keeps_cold_scan_payloads_and_list_children_in_arrow() {
         use rtdb_plan::{NamedExpr, Relation};
 
@@ -2136,6 +2202,265 @@ mod tests {
             assert_eq!(actual, baseline);
             let values = match kind { JoinKind::Semi => vec![Value::I64(1); 2], _ => vec![Value::Null] };
             assert_eq!(actual, values);
+        }
+    }
+
+    #[tokio::test]
+    async fn computed_join_with_a_residual_expression_keeps_arrow_payloads() {
+        use rtdb_plan::{BinaryOp, JoinKind, Relation};
+
+        let (state, table, _) = live_table_with_values([Value::I64(1), Value::I64(2), Value::I64(3), Value::Null]);
+        let storage = Arc::new(BufferPool::new(Arc::new(MemoryStore::default()), 1 << 20));
+        let (left, execution, memory) = descriptor_scan(state.value().snapshot(), table, storage);
+        let mut right = left.clone();
+        right.columns[0].id = ColumnId(10);
+        let left_value = left.columns[0].expression();
+        let right_value = right.columns[0].expression();
+        let key = Expr::binary(BinaryOp::Add, left_value.clone(), Expr::Literal(Value::I64(1)));
+        let equality = Expr::binary(BinaryOp::Eq, key, right_value.clone());
+        let residual = Expr::binary(BinaryOp::Lt,
+            Expr::binary(BinaryOp::Add, left_value, Expr::Literal(Value::I64(0))), right_value);
+        let relation = Arc::new(Relation::join(
+            Arc::new(Relation::scan(left).unwrap()), Arc::new(Relation::scan(right).unwrap()),
+            JoinKind::Inner, Some(Expr::binary(BinaryOp::And, equality, residual)),
+        ).unwrap());
+        let runtime = crate::runtime_schema::EmittedRelation::derive(relation, &execution.context.catalog, &[], &memory).unwrap();
+        let mut rows = crate::operators::build_pages(Arc::clone(&runtime), execution.clone()).await.unwrap();
+        let mut columns = crate::operators::build_columns(runtime, execution).await.unwrap().expect("Expected Arrow join");
+        let mut expected = Vec::new();
+        let mut actual = Vec::new();
+        while let Some(page) = rows.next_page().await.unwrap() {
+            expected.extend(page.rows().iter().map(|row| row.values.clone()));
+        }
+        while let Some(page) = columns.next_batch().await.unwrap() {
+            assert_eq!(page.columns.len(), 2);
+            assert!(page.columns.iter().all(|column| !matches!(column, crate::columnar::Column::Values(_))));
+            actual.extend((0..page.len).map(|row| page.columns.iter().map(|column| column.value(row).unwrap()).collect::<Vec<_>>()));
+        }
+        assert_eq!(actual, expected);
+        assert_eq!(actual.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn ordered_list_and_percentile_aggregates_select_arrow_positions() {
+        use rtdb_plan::{AggregateExpr, AggregateFunction, BinaryOp, NamedExpr, PercentileFraction, PercentileKind, Relation, RelationNode, Schema, SetOperator, SortExpr};
+        let (state, table, _) = live_table_with_values([Value::I64(1), Value::I64(3), Value::I64(2)]);
+        let storage = Arc::new(BufferPool::new(Arc::new(MemoryStore::default()), 1 << 20));
+        let (scan, execution, memory) = descriptor_scan(state.value().snapshot(), table, storage);
+        let expression = scan.columns[0].expression();
+        let value_field = scan.columns[0].clone();
+        let mut order = value_field.clone();
+        order.id = ColumnId(8);
+        order.name = "order_key".into();
+        order.data_type = LogicalType::Scalar(ScalarType::I64).maybe();
+        let scan = Arc::new(Relation::scan(scan).unwrap());
+        let schema = scan.schema().clone();
+        let tail = Arc::new(Relation::new(schema.clone(), RelationNode::Values {
+            rows: vec![vec![Expr::Literal(Value::I64(2))], vec![Expr::Literal(Value::Null)]],
+        }).unwrap());
+        let joined = Arc::new(Relation::new(schema, RelationNode::Set { left: scan, right: tail, operator: SetOperator::Union, all: true }).unwrap());
+        let input = Arc::new(joined.project(vec![
+            NamedExpr { field: value_field.clone(), expr: expression.clone() },
+            NamedExpr { field: order.clone(), expr: Expr::binary(BinaryOp::Subtract, Expr::Literal(Value::I64(0)), expression.clone()) },
+        ]).unwrap());
+        let mut field = value_field;
+        field.id = ColumnId(9);
+        field.name = "collected".into();
+        field.data_type = LogicalType::list(expression.data_type()).maybe();
+        let mut discrete = field.clone();
+        discrete.id = ColumnId(10);
+        discrete.name = "discrete".into();
+        discrete.data_type = expression.data_type().maybe();
+        let mut continuous = discrete.clone();
+        continuous.id = ColumnId(11);
+        continuous.name = "continuous".into();
+        continuous.data_type = LogicalType::Scalar(ScalarType::F64).maybe();
+        let percentile = |field: rtdb_plan::Field, kind| AggregateExpr { field, function: AggregateFunction::Percentile {
+            kind, fraction: PercentileFraction::Literal(0.75), descending: false,
+        }, argument: Some(expression.clone()), distinct: false, filter: None, order_by: vec![] };
+        let relation = Arc::new(Relation::new(Schema::new(vec![field.clone(), discrete.clone(), continuous.clone()]).unwrap(), RelationNode::Aggregate {
+            input, groups: vec![],
+            aggregates: vec![AggregateExpr {
+                field, function: AggregateFunction::ArrayAgg, argument: Some(expression.clone()),
+                distinct: true, filter: Some(Expr::binary(BinaryOp::Gt, expression.clone(), Expr::Literal(Value::I64(1)))),
+                order_by: vec![SortExpr { expr: order.expression(), descending: false, nulls_first: false }],
+            }, percentile(discrete, PercentileKind::Discrete), percentile(continuous, PercentileKind::Continuous)],
+        }).unwrap());
+        let runtime = crate::runtime_schema::EmittedRelation::derive(relation, &execution.context.catalog, &[], &memory).unwrap();
+        let mut rows = crate::operators::build_pages(Arc::clone(&runtime), execution.clone()).await.unwrap();
+        let mut columns = crate::operators::build_columns(runtime, execution).await.unwrap().expect("Expected Arrow aggregate");
+        let page = columns.next_batch().await.unwrap().unwrap();
+        assert!(page.columns.iter().all(|column| !matches!(column, crate::columnar::Column::Values(_))));
+        let actual = page.columns.iter().map(|column| column.value(0).unwrap()).collect::<Vec<_>>();
+        assert_eq!(actual, [Value::List(vec![Value::I64(3), Value::I64(2)]), Value::I64(2), Value::F64(2.25)]);
+        assert_eq!(actual, rows.next_page().await.unwrap().unwrap().rows()[0].values);
+        assert!(columns.next_batch().await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn limit_zero_leaves_the_arrow_membership_build_unopened() {
+        use rtdb_plan::{BinaryOp, Relation, RelationNode, Schema, TemporalFilter};
+        let (state, table, _) = live_table_with_values([Value::I64(1)]);
+        let storage = Arc::new(BufferPool::new(Arc::new(MemoryStore::default()), 1 << 20));
+        let (probe, execution, memory) = descriptor_scan(state.value().snapshot(), table, storage);
+        let mut build = probe.clone();
+        build.columns[0].id = ColumnId(10);
+        build.valid_time = TemporalFilter::At(Expr::Literal(Value::Bool(true)));
+        let comparison = Expr::binary(BinaryOp::Eq, probe.columns[0].expression(), build.columns[0].expression());
+        let input = Arc::new(Relation::scan(probe).unwrap());
+        let dependent = Arc::new(Relation::scan(build).unwrap());
+        let output = rtdb_plan::Field { id: ColumnId(11), name: "member".into(), qualifier: None,
+            qualified_only: false, unnamed: false, data_type: LogicalType::Scalar(ScalarType::Bool).maybe() };
+        let schema = input.schema().concat(&Schema::new(vec![output.clone()]).unwrap()).unwrap();
+        let mark = Arc::new(Relation::new(schema, RelationNode::Mark { input, dependent, arguments: vec![],
+            condition: None, comparison, output }).unwrap());
+        let relation = Arc::new(mark.limit(None, Some(Expr::Literal(Value::I64(0)))).unwrap());
+        let runtime = crate::runtime_schema::EmittedRelation::derive(relation, &execution.context.catalog, &[], &memory).unwrap();
+        let mut rows = crate::operators::build_pages(Arc::clone(&runtime), execution.clone()).await.unwrap();
+        let mut columns = crate::operators::build_columns(runtime, execution).await.unwrap().expect("Expected Arrow membership");
+        assert!(rows.next_page().await.unwrap().is_none());
+        assert!(columns.next_batch().await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn uuid_groups_keep_their_first_arrow_key_positions() {
+        use rtdb_plan::{AggregateExpr, AggregateFunction, NamedExpr, Relation, RelationNode, Schema};
+        let one = Value::Uuid([1; 16]);
+        let two = Value::Uuid([2; 16]);
+        let (state, table, _) = live_table_with_values([two.clone(), one.clone(), two.clone()]);
+        let storage = Arc::new(BufferPool::new(Arc::new(MemoryStore::default()), 1 << 20));
+        let (scan, execution, memory) = descriptor_scan(state.value().snapshot(), table, storage);
+        let key = scan.columns[0].clone();
+        let count = rtdb_plan::Field { id: ColumnId(8), name: "count".into(), qualifier: None,
+            qualified_only: false, unnamed: false, data_type: LogicalType::Scalar(ScalarType::I64) };
+        let relation = Arc::new(Relation::new(Schema::new(vec![key.clone(), count.clone()]).unwrap(), RelationNode::Aggregate {
+            input: Arc::new(Relation::scan(scan).unwrap()), groups: vec![NamedExpr { field: key.clone(), expr: key.expression() }],
+            aggregates: vec![AggregateExpr { field: count, function: AggregateFunction::CountStar, argument: None, distinct: false, filter: None, order_by: vec![] }],
+        }).unwrap());
+        let runtime = crate::runtime_schema::EmittedRelation::derive(relation, &execution.context.catalog, &[], &memory).unwrap();
+        let mut pages = crate::operators::build_pages(Arc::clone(&runtime), execution.clone()).await.unwrap();
+        let mut columns = crate::operators::build_columns(runtime, execution).await.unwrap().expect("Expected Arrow grouping");
+        let batch = columns.next_batch().await.unwrap().unwrap();
+        assert!(batch.columns.iter().all(|column| !matches!(column, crate::columnar::Column::Values(_))));
+        let actual = (0..batch.len).map(|row| batch.columns.iter().map(|column| column.value(row).unwrap()).collect::<Vec<_>>()).collect::<Vec<_>>();
+        assert_eq!(actual, [vec![two, Value::I64(2)], vec![one, Value::I64(1)]]);
+        assert_eq!(actual, pages.next_page().await.unwrap().unwrap().rows().iter().map(|row| row.values.clone()).collect::<Vec<_>>());
+    }
+
+    #[tokio::test]
+    async fn a_projected_arrow_join_fills_flight_transport_batches() {
+        use rtdb_plan::{BinaryOp, JoinKind, NamedExpr, Relation};
+
+        let (state, table, _) = live_table_with_values([Value::I64(1), Value::I64(1), Value::I64(1)]);
+        let storage = Arc::new(BufferPool::new(Arc::new(MemoryStore::default()), 1 << 20));
+        let (left, mut execution, memory) = descriptor_scan(state.value().snapshot(), table, storage);
+        Arc::get_mut(&mut execution.context).unwrap().options.batch_rows = 2;
+        let mut right = left.clone();
+        right.columns[0].id = ColumnId(10);
+        let field = left.columns[0].clone();
+        let equality = Expr::binary(BinaryOp::Eq, field.expression(), right.columns[0].expression());
+        let join = Arc::new(Relation::join(Arc::new(Relation::scan(left).unwrap()), Arc::new(Relation::scan(right).unwrap()),
+            JoinKind::Inner, Some(equality)).unwrap());
+        let relation = Arc::new(join.project(vec![NamedExpr { expr: field.expression(), field }]).unwrap());
+        let runtime = crate::runtime_schema::EmittedRelation::derive(Arc::clone(&relation), &execution.context.catalog, &[], &memory).unwrap();
+        assert!(crate::operators::build_columns(runtime, execution.clone()).await.unwrap().is_some());
+        let prepared = crate::PreparedQuery::new(relation).unwrap();
+        let mut cursor = prepared.execute_columns(execution.context, vec![]).await.unwrap();
+        let mut batches = Vec::new();
+        while let Some(batch) = cursor.next_batch().await.unwrap() { batches.push(batch.batch().num_rows()); }
+        assert_eq!(batches, [2, 2, 2, 2, 1]);
+    }
+
+    #[tokio::test]
+    async fn columnar_literal_unions_fill_the_transport_batch_before_publishing_rows() {
+        use rtdb_plan::{NamedExpr, Relation, RelationNode, Schema, SetOperator};
+
+        let (state, table, _) = live_table_with_values([Value::I64(1)]);
+        let storage = Arc::new(BufferPool::new(Arc::new(MemoryStore::default()), 1 << 20));
+        let (scan, mut execution, memory) = descriptor_scan(state.value().snapshot(), table, storage);
+        Arc::get_mut(&mut execution.context).unwrap().options.batch_rows = 2;
+        let field = scan.columns[0].clone();
+        let schema = Schema::new(vec![field.clone()]).unwrap();
+        let values = |value| Arc::new(Relation::new(schema.clone(), RelationNode::Values {
+            rows: vec![vec![Expr::Literal(Value::I64(value))]],
+        }).unwrap());
+        let union = |right| Arc::new(Relation::new(schema.clone(), RelationNode::Set {
+            left: values(7), right, operator: SetOperator::Union, all: true,
+        }).unwrap());
+        let success = crate::PreparedQuery::new(union(values(8))).unwrap();
+        let mut batches = success.execute_columns(Arc::clone(&execution.context), vec![]).await.unwrap();
+        let batch = batches.next_batch().await.unwrap().unwrap();
+        let values_out = batch.batch().column(0).as_any().downcast_ref::<arrow_array::Int64Array>().unwrap();
+        assert_eq!(values_out.values().as_ref(), &[7, 8]);
+        assert!(batches.next_batch().await.unwrap().is_none());
+
+        let projection = Arc::new(values(0).project(vec![NamedExpr {
+            field: field.clone(), expr: Expr::Call {
+                name: "mod".into(), args: vec![Expr::Literal(Value::I64(5)), field.expression()],
+                return_type: field.data_type.clone(),
+            },
+        }]).unwrap());
+        let relation = union(projection);
+        let runtime = crate::runtime_schema::EmittedRelation::derive(Arc::clone(&relation), &execution.context.catalog, &[], &memory).unwrap();
+        assert!(crate::operators::build_columns(runtime, execution.clone()).await.unwrap().is_some());
+        let prepared = crate::PreparedQuery::new(relation).unwrap();
+        let mut rows = prepared.execute(Arc::clone(&execution.context), vec![]).await.unwrap();
+        let mut batches = prepared.execute_columns(execution.context, vec![]).await.unwrap();
+        let expected = rows.next_batch().await.err().expect("The second row fails before the first batch is published");
+        let actual = batches.next_batch().await.err().expect("The second row fails before the first batch is published");
+        assert_eq!(actual.code, expected.code);
+        assert!(batches.next_batch().await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn computed_scan_and_literal_rows_feed_a_struct_mutation_projection_as_vectors() {
+        use rtdb_plan::{NamedExpr, Relation, RelationNode, Schema};
+
+        let (state, table, _, store, _) = persisted_page_fixture().await;
+        let storage = Arc::new(BufferPool::new(store, 1 << 20));
+        let (scan, execution, memory) = descriptor_scan(state.value().snapshot(), table, storage);
+        let source = scan.columns[0].clone();
+        let named = |id, name: &str, expr: Expr| NamedExpr {
+            field: Field { id: ColumnId(id), name: name.into(), data_type: expr.data_type(), ..source.clone() },
+            expr,
+        };
+        let remainder = Expr::Call {
+            name: "mod".into(), args: vec![source.expression(), Expr::Literal(Value::I64(2))],
+            return_type: LogicalType::Scalar(ScalarType::I64),
+        };
+        let literal = Relation::new(Schema::new(vec![source.clone()]).unwrap(), RelationNode::Values {
+            rows: (1..=3).map(|value| vec![Expr::Literal(Value::I64(value))]).collect(),
+        }).unwrap();
+        for input in [Relation::scan(scan).unwrap(), literal] {
+            let projected = Arc::new(Arc::new(input).project(vec![
+                named(1, "source", source.expression()), named(2, "remainder", remainder.clone()),
+            ]).unwrap());
+            let iid = Expr::Call {
+                name: "_iid".into(), args: vec![projected.schema().fields()[0].expression()],
+                return_type: LogicalType::Scalar(ScalarType::FixedSizeBinary(16)),
+            };
+            let document = Expr::RowCopy(projected.schema().fields().to_vec());
+            let relation = Arc::new(projected.project(vec![named(3, "_iid", iid), named(4, "doc", document)]).unwrap());
+            let runtime = crate::runtime_schema::EmittedRelation::derive(relation, &execution.context.catalog, &[], &memory).unwrap();
+            let mut baseline = crate::operators::build_pages(Arc::clone(&runtime), execution.clone()).await.unwrap();
+            let mut cursor = crate::operators::build_columns(runtime, execution.clone()).await.unwrap().expect("Expected a columnar document projection");
+            let mut seen = 0;
+            while let Some(batch) = cursor.next_batch().await.unwrap() {
+                assert!(matches!(batch.columns[0], crate::columnar::Column::Arrow { .. }));
+                let crate::columnar::Column::Arrow { array, .. } = &batch.columns[1] else { panic!("Expected an Arrow document"); };
+                let document = array.as_any().downcast_ref::<arrow_array::StructArray>().unwrap();
+                assert_eq!(document.num_columns(), 2);
+                assert!(document.columns().iter().all(|column| column.as_any().is::<arrow_array::Int64Array>()));
+                let page = baseline.next_page().await.unwrap().unwrap();
+                assert_eq!(page.len(), batch.len);
+                for (row, expected) in page.rows().iter().enumerate() {
+                    let actual = batch.columns.iter().map(|column| column.value(row).unwrap()).collect::<Vec<_>>();
+                    assert_eq!(actual, expected.values);
+                    seen += 1;
+                }
+            }
+            assert_eq!(seen, 3);
+            assert!(baseline.next_page().await.unwrap().is_none());
         }
     }
 
@@ -2281,7 +2606,7 @@ mod tests {
 
     #[tokio::test]
     async fn materialized_cold_scan_replays_arrow_batches_for_both_references() {
-        use rtdb_plan::{MaterializedBinding, Relation, RelationNode, SetOperator};
+        use rtdb_plan::{BinaryOp, MaterializedBinding, NamedExpr, Relation, RelationNode, SetOperator};
 
         let (state, table, _, store, _) = persisted_page_fixture().await;
         let storage = Arc::new(BufferPool::new(store, 1 << 20));
@@ -2294,7 +2619,7 @@ mod tests {
             left: Arc::clone(&reference), right: reference, operator: SetOperator::Union, all: true,
         }).unwrap());
         let relation = Arc::new(Relation::new(schema, RelationNode::Let { binding, body }).unwrap());
-        let runtime = crate::runtime_schema::EmittedRelation::derive(relation, &execution.context.catalog, &[], &memory).unwrap();
+        let runtime = crate::runtime_schema::EmittedRelation::derive(Arc::clone(&relation), &execution.context.catalog, &[], &memory).unwrap();
         let mut cursor = crate::operators::build_columns(runtime, execution.clone()).await.unwrap().expect("Expected Arrow CTE execution");
         assert!(execution.context.spill_bytes() > 0);
         let mut values = Vec::new();
@@ -2306,6 +2631,25 @@ mod tests {
         assert_eq!(values, [1, 2, 3, 1, 2, 3]);
         drop(cursor);
         assert_eq!(execution.context.spill_bytes(), 0);
+
+        let mut field = relation.schema().fields()[0].clone();
+        let expr = Expr::binary(BinaryOp::Add, field.expression(), Expr::Literal(Value::I64(1)));
+        field.id = ColumnId(10);
+        let projected = Arc::new(relation.project(vec![NamedExpr { field, expr }]).unwrap());
+        let runtime = crate::runtime_schema::EmittedRelation::derive(Arc::clone(&projected), &execution.context.catalog, &[], &memory).unwrap();
+        let mut cursor = crate::operators::build_columns(runtime, execution.clone()).await.unwrap().expect("Expected a nested Arrow CTE");
+        let mut values = Vec::new();
+        while let Some(batch) = cursor.next_batch().await.unwrap() {
+            assert!(matches!(batch.columns[0], crate::columnar::Column::Arrow { .. }));
+            values.extend((0..batch.len).map(|row| batch.columns[0].value(row).unwrap()));
+        }
+        assert_eq!(values, [2, 3, 4, 2, 3, 4].map(Value::I64));
+        drop(cursor);
+        assert_eq!(execution.context.spill_bytes(), 0);
+        let prepared = crate::PreparedQuery::new(projected).unwrap();
+        let mut cursor = prepared.execute_columns(execution.context, vec![]).await.unwrap();
+        assert_eq!(cursor.next_batch().await.unwrap().unwrap().batch().num_rows(), 6);
+        assert!(cursor.next_batch().await.unwrap().is_none());
     }
 
     #[tokio::test]

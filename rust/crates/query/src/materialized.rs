@@ -7,10 +7,9 @@ use tokio::sync::Mutex;
 use crate::{
     QueryContext,
     columnar::{BatchCursor, BatchRows, BoxBatchCursor, ColumnBatch, poll_nested_batch},
-    cursor::column_batch,
     invalid,
     pages::{BoxPageCursor, OwnedPage, PageBuilder, PageCursor},
-    spill::{SpillFile, SpillReader},
+    spill::{SpillFile, SpillReader, SpillWriter},
 };
 
 pub(crate) struct BindingScope {
@@ -36,7 +35,7 @@ impl BindingScope {
         match binding.replay().await? {
             Replay::Rows(file) => Ok(Box::new(Reference { reader: file.reader(Arc::clone(&context.memory))?, context: Arc::clone(context) })),
             Replay::Columns(file) => {
-                let batches = Box::new(ColumnReference::new(&file, context)?);
+                let batches = Box::new(ColumnReference::new(&file, context, definition.relation.schema().len())?);
                 Ok(Box::new(BatchRows::new(batches, Arc::clone(&context.memory))))
             }
         }
@@ -44,10 +43,14 @@ impl BindingScope {
 
     pub async fn open_columns(&self, definition: &MaterializedBinding) -> Result<BoxBatchCursor> {
         let binding = self.find(definition)?;
-        let Replay::Columns(file) = binding.replay().await? else {
-            return Err(invalid("materialized-binding", "Columnar reference requires a columnar binding"));
-        };
-        Ok(Box::new(ColumnReference::new(&file, &binding.context)?))
+        let context = &binding.context;
+        match binding.replay().await? {
+            Replay::Columns(file) => Ok(Box::new(ColumnReference::new(&file, context, definition.relation.schema().len())?)),
+            Replay::Rows(file) => {
+                let pages = Box::new(Reference { reader: file.reader(Arc::clone(&context.memory))?, context: Arc::clone(context) });
+                Ok(crate::columnar::batches_from_pages(pages, definition.relation.schema().len(), Arc::clone(&context.memory)))
+            }
+        }
     }
 
     fn find(&self, definition: &MaterializedBinding) -> Result<&ReplayBinding> {
@@ -96,14 +99,8 @@ impl ReplayBinding {
         let mut writer = self.context.spill.create()?;
         match input {
             Input::Rows(mut input) => {
-                while let Some(mut page) = input.next_page().await? {
-                    self.context.check_cancelled()?;
-                    let count = i64::try_from(page.len()).map_err(|_| invalid("materialized-page", "Materialized page exceeds signed row count"))?;
-                    writer.write(&[Value::I64(count)], memory)?;
-                    while let Some(row) = page.next() {
-                        self.context.check_cancelled()?;
-                        writer.write(&row.values, memory)?;
-                    }
+                while let Some(page) = input.next_page().await? {
+                    write_rows(&mut writer, page, &self.context)?;
                 }
                 writer.finish().map(Replay::Rows)
             }
@@ -112,37 +109,71 @@ impl ReplayBinding {
                 while let Some(batch) = poll_nested_batch(input.as_mut()).await? {
                     self.context.check_cancelled()?;
                     batch.validate_readable(&self.context)?;
-                    let batch = column_batch(&schema, memory, batch)?;
-                    writer.write_arrow(&batch, schema_bytes, memory, "materialized-spill-arrow")?;
+                    match batch.spill_record(&schema, memory) {
+                        Ok(Some(record)) => {
+                            let start = writer.position()?;
+                            let written = writer.write(&[Value::I64(-1)], memory)
+                                .and_then(|()| writer.write_arrow(&record, schema_bytes, memory, "materialized-spill-arrow"));
+                            match written {
+                                Ok(()) => continue,
+                                Err(error) if matches!(error.code.as_str(), "rtdb/memory-budget-exceeded" | "rtdb.query/spill-limit") => {
+                                    writer.discard_from(start)?;
+                                }
+                                Err(error) => return Err(error),
+                            }
+                        }
+                        Ok(None) => {},
+                        Err(error) if error.code == "rtdb/memory-budget-exceeded" => {},
+                        Err(error) => return Err(error),
+                    }
+                    write_rows(&mut writer, batch.rows(memory)?, &self.context)?;
                 }
                 writer.finish().map(Replay::Columns)
             }
         }
     }
 }
+fn write_rows(writer: &mut SpillWriter, mut page: OwnedPage, context: &QueryContext) -> Result<()> {
+    context.check_cancelled()?;
+    let count = i64::try_from(page.len()).map_err(|_| invalid("materialized-page", "Materialized page exceeds signed row count"))?;
+    writer.write(&[Value::I64(count)], &context.memory)?;
+    while let Some(row) = page.next() {
+        context.check_cancelled()?;
+        writer.write(&row.values, &context.memory)?;
+    }
+    Ok(())
+}
+
+fn read_rows(reader: &mut SpillReader, count: i64, context: &QueryContext) -> Result<OwnedPage> {
+    let count = usize::try_from(count).map_err(|_| invalid("materialized-page", "Invalid materialized page row count"))?;
+    let mut page = PageBuilder::new(count, &context.memory)?;
+    for _ in 0..count {
+        context.check_cancelled()?;
+        page.push(reader.next()?.ok_or_else(|| invalid("materialized-page", "Materialized page ended before its declared row count"))?)?;
+    }
+    Ok(page.finish())
+}
+
+fn page_header(reader: &mut SpillReader) -> Result<Option<i64>> {
+    let Some(header) = reader.next()? else { return Ok(None); };
+    let [Value::I64(count)] = header.values.as_slice() else { return Err(invalid("materialized-page", "Invalid materialized page header")); };
+    Ok(Some(*count))
+}
+
 struct Reference { reader: SpillReader, context: Arc<QueryContext> }
 #[async_trait]
 impl PageCursor for Reference {
     async fn next_page(&mut self) -> Result<Option<OwnedPage>> {
         self.context.check_cancelled()?;
-        let Some(header) = self.reader.next()? else { return Ok(None); };
-        let [Value::I64(count)] = header.values.as_slice() else { return Err(invalid("materialized-page", "Invalid materialized page header")); };
-        let count = usize::try_from(*count).map_err(|_|invalid("materialized-page", "Invalid materialized page row count"))?;
-        drop(header);
-        let mut page = PageBuilder::new(count, &self.context.memory)?;
-        for _ in 0..count {
-            self.context.check_cancelled()?;
-            page.push(self.reader.next()?.ok_or_else(||invalid("materialized-page", "Materialized page ended before its declared row count"))?)?;
-        }
-        Ok(Some(page.finish()))
+        page_header(&mut self.reader)?.map(|count| read_rows(&mut self.reader, count, &self.context)).transpose()
     }
 }
 
-struct ColumnReference { reader: SpillReader, context: Arc<QueryContext> }
+struct ColumnReference { reader: SpillReader, context: Arc<QueryContext>, width: usize }
 
 impl ColumnReference {
-    fn new(file: &Arc<SpillFile>, context: &Arc<QueryContext>) -> Result<Self> {
-        Ok(Self { reader: file.reader(Arc::clone(&context.memory))?, context: Arc::clone(context) })
+    fn new(file: &Arc<SpillFile>, context: &Arc<QueryContext>, width: usize) -> Result<Self> {
+        Ok(Self { reader: file.reader(Arc::clone(&context.memory))?, context: Arc::clone(context), width })
     }
 }
 
@@ -150,7 +181,21 @@ impl ColumnReference {
 impl BatchCursor for ColumnReference {
     async fn next_batch(&mut self) -> Result<Option<ColumnBatch>> {
         self.context.check_cancelled()?;
-        self.reader.read_arrow(true, "materialized-spill-arrow")?.map(ColumnBatch::from_owned).transpose()
+        match page_header(&mut self.reader)? {
+            Some(-1) => {
+                let batch = self.reader.read_arrow(true, "materialized-spill-arrow")?
+                    .ok_or_else(|| invalid("materialized-page", "Materialized Arrow page is absent"))?;
+                ColumnBatch::from_owned(batch).map(Some)
+            }
+            Some(0) => {
+                ColumnBatch::empty_with_width(self.width, &self.context.memory).map(Some)
+            }
+            Some(count) => {
+                let page = read_rows(&mut self.reader, count, &self.context)?;
+                ColumnBatch::from_page(&page, &self.context.memory).map(Some)
+            }
+            None => Ok(None),
+        }
     }
 }
 
@@ -172,6 +217,7 @@ impl BatchCursor for ColumnLetCursor {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::columnar::Column;
     use std::{collections::{BTreeMap, VecDeque}, sync::atomic::{AtomicBool, AtomicUsize, Ordering}};
     use rtdb_columnar::MemoryBudget;
     use rtdb_plan::{ColumnId, Expr, Field, Relation, RelationNode, Schema};
@@ -210,8 +256,11 @@ mod tests {
         }
     }
     fn context(batch_rows: usize) -> Arc<QueryContext> {
+        context_with_options(QueryOptions { batch_rows, ..Default::default() })
+    }
+    fn context_with_options(options: QueryOptions) -> Arc<QueryContext> {
         let catalog = CatalogSnapshot::new("xtdb",BTreeMap::from([("xtdb".into(),DatabaseSnapshot { partitions: vec![],storage: Arc::new(BufferPool::new(Arc::new(MemoryStore::default()),1 << 20)) })]),false).unwrap();
-        QueryContext::new(catalog,MemoryBudget::new(1 << 24),Timestamp(0),"UTC",QueryOptions { batch_rows,..Default::default() },&CancellationToken::new()).unwrap()
+        QueryContext::new(catalog,MemoryBudget::new(1 << 24),Timestamp(0),"UTC",options,&CancellationToken::new()).unwrap()
     }
     fn definition() -> Arc<MaterializedBinding> {
         let field = Field { id: ColumnId(0),name: "n".into(),qualifier: None,qualified_only: false,unnamed: false,data_type: LogicalType::Scalar(ScalarType::I64) };
@@ -226,6 +275,13 @@ mod tests {
             let scope = BindingScope::new(Arc::clone(&definition),input,None,Arc::clone(&context)).unwrap();
             let mut first = scope.open(&definition).await.unwrap();assert_eq!(polls.load(Ordering::SeqCst),4);
             let mut second = scope.open(&definition).await.unwrap();assert_eq!(polls.load(Ordering::SeqCst),4);
+            let mut columns = scope.open_columns(&definition).await.unwrap();
+            assert_eq!(columns.next_batch().await.unwrap().unwrap().len, 2);
+            let empty = columns.next_batch().await.unwrap().unwrap();
+            assert_eq!((empty.len, empty.columns.len()), (0, 1));
+            assert_eq!(columns.next_batch().await.unwrap().unwrap().columns[0].value(0).unwrap(), Value::I64(3));
+            assert!(columns.next_batch().await.unwrap().is_none());
+            drop((columns, empty));
             drop(scope);
             for cursor in [&mut first,&mut second] {
                 let mut page = cursor.next_page().await.unwrap().unwrap();assert_eq!(page.len(),2);
@@ -236,6 +292,51 @@ mod tests {
             }
             drop(first);drop(second);assert_eq!(context.spill_bytes(),0);assert_eq!(context.memory.used_bytes(),0);
         }
+    }
+
+    #[tokio::test]
+    async fn materialized_arrow_replay_keeps_the_record_fields_present_in_each_page() {
+        use arrow_array::RecordBatch;
+        use rtdb_columnar::{OwnedBatch, copy_array, to_field};
+        use rtdb_types::StructFields;
+
+        let context = context(1);
+        let value = Value::Struct(StructFields::from([("a".into(), Value::I64(3))]));
+        let actual = value.logical_type();
+        let declared = LogicalType::Struct(StructFields::from([
+            ("a".into(), LogicalType::Scalar(ScalarType::I64)),
+            ("b".into(), LogicalType::Scalar(ScalarType::Utf8).maybe()),
+        ]));
+        let schema = Schema::new(vec![Field { id: ColumnId(0), name: "doc".into(), qualifier: None,
+            qualified_only: false, unnamed: false, data_type: declared }]).unwrap();
+        let definition = Arc::new(MaterializedBinding { name: "nested".into(),
+            relation: Arc::new(Relation::new(schema.clone(), RelationNode::Values { rows: vec![] }).unwrap()) });
+        let array = copy_array(&actual, std::slice::from_ref(&value)).unwrap();
+        let input = RecordBatch::try_new(Arc::new(arrow_schema::Schema::new(vec![to_field("doc", &actual).unwrap()])), vec![array]).unwrap();
+        let input = ColumnBatch::from_owned(OwnedBatch::new(input, &context.memory).unwrap()).unwrap();
+        let input = crate::columnar::single_batch(Some(input), Arc::clone(&context));
+        let scope = BindingScope::columns(Arc::clone(&definition), input, schema, None, Arc::clone(&context)).unwrap();
+        let mut cursor = scope.open_columns(&definition).await.unwrap();
+        let page = cursor.next_batch().await.unwrap().unwrap();
+        assert!(matches!(page.columns[0], crate::columnar::Column::Arrow { .. }));
+        assert_eq!(page.columns[0].value(0).unwrap(), value);
+        assert!(cursor.next_batch().await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn a_materialized_empty_page_keeps_its_columns_under_a_tight_spill_limit() {
+        let context = context_with_options(QueryOptions { spill_limit_bytes: 96, ..Default::default() });
+        let definition = definition();
+        let schema = definition.relation.schema().clone();
+        let memory = &context.memory;
+        let batch = ColumnBatch::settled(vec![Column::Values(Vec::new())], 0, memory.reserve(256).unwrap()).unwrap();
+        let input = crate::columnar::single_batch(Some(batch), Arc::clone(&context));
+        let scope = BindingScope::columns(Arc::clone(&definition), input, schema, None, Arc::clone(&context)).unwrap();
+        let mut reader = scope.open_columns(&definition).await.unwrap();
+        let page = reader.next_batch().await.unwrap().unwrap();
+        assert!(matches!(page.columns.as_slice(), [Column::Values(values)] if values.is_empty()));
+        assert_eq!(page.len, 0);
+        assert!(reader.next_batch().await.unwrap().is_none());
     }
 
     #[tokio::test]

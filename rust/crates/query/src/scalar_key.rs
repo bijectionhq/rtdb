@@ -1,3 +1,4 @@
+use std::cmp::Ordering;
 use arrow_array::{
     cast::AsArray,
     types::{Float32Type, Float64Type, Int8Type, Int16Type, Int32Type, Int64Type},
@@ -84,6 +85,27 @@ impl<'a> ScalarKey<'a> {
             | (Self::Bytes(_), Self::Bytes(_)) => Some(self == other),
             _ => None,
         }
+    }
+
+    pub fn ordered_compare(self, other: Self) -> Option<Ordering> {
+        fn floats(left: f64, right: f64) -> Ordering {
+            match (left.is_nan(), right.is_nan()) {
+                (true, true) => Ordering::Equal,
+                (true, false) => Ordering::Greater,
+                (false, true) => Ordering::Less,
+                (false, false) => left.total_cmp(&right),
+            }
+        }
+        Some(match (self, other) {
+            (Self::Signed(left), Self::Signed(right)) => left.cmp(&right),
+            (Self::Signed(left), Self::Float(right)) => floats(left as f64, right),
+            (Self::Float(left), Self::Signed(right)) => floats(left, right as f64),
+            (Self::Float(left), Self::Float(right)) => floats(left, right),
+            (Self::Bool(left), Self::Bool(right)) => left.cmp(&right),
+            (Self::Text(left), Self::Text(right)) => left.as_bytes().cmp(right.as_bytes()),
+            (Self::Bytes(left), Self::Bytes(right)) => left.cmp(right),
+            _ => return None,
+        })
     }
 
     fn hash_with(self, hash: fn(&[u8], u32) -> u32) -> u32 {

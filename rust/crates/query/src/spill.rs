@@ -2,7 +2,10 @@ use std::fs::File;
 use std::io::{BufReader, BufWriter, Cursor, Read, Seek, SeekFrom, Write};
 use std::sync::{Arc, atomic::{AtomicU64, Ordering}};
 
-use arrow_ipc::{reader::StreamReader, writer::StreamWriter};
+use arrow_array::RecordBatch;
+use arrow_buffer::Buffer;
+use arrow_ipc::{reader::{StreamReader, read_record_batch}, writer::{CompressionContext, DictionaryTracker, IpcDataGenerator, IpcWriteOptions, StreamWriter}};
+use arrow_schema::SchemaRef;
 use rtdb_columnar::{MemoryBudget, MemoryReservation, OwnedBatch};
 use rtdb_types::{Result, Value};
 use tempfile::{NamedTempFile, TempDir, TempPath};
@@ -58,13 +61,36 @@ impl SpillWriter {
     }
 
     pub fn write_frame(&mut self, bytes: &[u8]) -> Result<()> {
-        let count = (bytes.len() as u64).checked_add(8).ok_or_else(|| invalid("row-size", "Spill row size overflow"))?;
+        self.write_frame_parts(&[bytes])
+    }
+
+    fn write_frame_parts(&mut self, parts: &[&[u8]]) -> Result<()> {
+        let overflow = || invalid("row-size", "Spill row size overflow");
+        let length = parts.iter().try_fold(0u64, |bytes, part| bytes.checked_add(part.len() as u64).ok_or_else(overflow))?;
+        let count = length.checked_add(8).ok_or_else(overflow)?;
         self.retained.region.reserve(count)?;
         self.retained.bytes.fetch_add(count, Ordering::Relaxed);
-        self.file.write_all(&(bytes.len() as u64).to_le_bytes()).map_err(io_error)?;
-        self.file.write_all(bytes).map_err(io_error)?;
+        self.file.write_all(&length.to_le_bytes()).map_err(io_error)?;
+        for part in parts { self.file.write_all(part).map_err(io_error)?; }
         self.position += count;
         Ok(())
+    }
+
+    /// Writes a batch whose fixed schema the caller retains through spill and replay.
+    pub fn write_record(&mut self, batch: &RecordBatch, memory: &Arc<MemoryBudget>) -> Result<()> {
+        let overflow = || invalid("join-spill", "Arrow spill encoding exceeds addressable memory");
+        let bytes = batch.schema_ref().fields().iter().try_fold(8192usize, |bytes, field| {
+            field.size().checked_mul(8).and_then(|size| bytes.checked_add(size)).ok_or_else(overflow)
+        })?;
+        let bound = rtdb_columnar::shared_allocation_size(batch)?.checked_mul(6)
+            .and_then(|body| body.checked_add(bytes)).ok_or_else(overflow)?;
+        let _scratch = memory.reserve(bound)?;
+        let (dictionaries, data) = IpcDataGenerator::default().encode(
+            batch, &mut DictionaryTracker::new(false), &IpcWriteOptions::default(), &mut CompressionContext::default(),
+        ).map_err(ipc_error)?;
+        if !dictionaries.is_empty() { return Err(invalid("join-spill", "Spilled records require a dictionary-free schema")); }
+        let header = (data.ipc_message.len() as u64).to_le_bytes();
+        self.write_frame_parts(&[&header, &data.ipc_message, &data.arrow_data])
     }
 
     pub fn write_arrow(&mut self, batch: &OwnedBatch, schema_bytes: usize, memory: &Arc<MemoryBudget>, error: &str) -> Result<()> {
@@ -78,6 +104,18 @@ impl SpillWriter {
         let mut ipc = StreamWriter::try_new(Vec::new(), batch.schema().as_ref()).map_err(ipc_error)?;
         ipc.write(batch).map_err(ipc_error)?;
         self.write_frame(&ipc.into_inner().map_err(ipc_error)?)
+    }
+
+    /// Drops unpublished frames written after the supplied frame boundary.
+    pub fn discard_from(&mut self, offset: u64) -> Result<()> {
+        let bytes = self.position.checked_sub(offset).ok_or_else(|| invalid("invalid-spill", "Spill rollback exceeds its file"))?;
+        self.file.flush().map_err(io_error)?;
+        self.file.get_ref().set_len(offset).map_err(io_error)?;
+        self.file.seek(SeekFrom::Start(offset)).map_err(io_error)?;
+        self.position = offset;
+        self.retained.bytes.fetch_sub(bytes, Ordering::Relaxed);
+        self.retained.region.retained.fetch_sub(bytes, Ordering::AcqRel);
+        Ok(())
     }
 
     pub fn finish(mut self) -> Result<Arc<SpillFile>> {
@@ -125,12 +163,78 @@ impl SpillReader {
             return Err(invalid("invalid-spill", "Arrow spill frame must contain exactly one admissible batch"));
         }
         drop(ipc);
-        let bytes = batch.get_array_memory_size().checked_add(256)
-            .ok_or_else(|| invalid(error, "Arrow spill size overflow"))?;
+        let overflow = || invalid(error, "Arrow spill size overflow");
+        let schema = batch.schema_ref().fields().iter().try_fold(256usize, |bytes, field| {
+            field.size().checked_mul(4).and_then(|size| bytes.checked_add(size))
+                .and_then(|bytes| bytes.checked_add(std::mem::size_of::<crate::columnar::Column>())).ok_or_else(overflow)
+        })?;
+        let bytes = batch.get_array_memory_size().checked_add(schema).ok_or_else(overflow)?;
         let lease = Arc::get_mut(&mut reservation).expect("The spill decoder owns its reservation");
         if bytes > lease.bytes() { lease.grow_to(bytes)?; } else { lease.shrink_to(bytes)?; }
         OwnedBatch::with_reservation(batch, reservation).map(Some)
     }
+
+    pub fn read_record(&mut self, schema: &SchemaRef, retained_metadata: usize) -> Result<Option<OwnedBatch>> {
+        let Some((frame, mut reservation)) = self.read_frame(8)? else { return Ok(None); };
+        let bytes = Buffer::from_vec(frame);
+        let type_error = || invalid("join-spill", "Malformed Arrow record frame");
+        let size = bytes.get(..8).and_then(|prefix| prefix.try_into().ok())
+            .map(u64::from_le_bytes).and_then(|size| usize::try_from(size).ok()).ok_or_else(type_error)?;
+        let offset = size.checked_add(8).filter(|size| *size <= bytes.len()).ok_or_else(type_error)?;
+        let message = arrow_ipc::root_as_message(&bytes[8..offset]).map_err(ipc_error)?;
+        let metadata = message.header_as_record_batch().ok_or_else(type_error)?;
+        let body = bytes.slice(offset);
+        if message.bodyLength() as u64 != body.len() as u64 { return Err(type_error()); }
+        if metadata.compression().is_some() {
+            return Err(type_error());
+        }
+        let buffers = metadata.buffers().ok_or_else(type_error)?;
+        for buffer in buffers {
+            let start = usize::try_from(buffer.offset()).map_err(|_| type_error())?;
+            let length = usize::try_from(buffer.length()).map_err(|_| type_error())?;
+            if start.checked_add(length).is_none_or(|end| end > body.len()) { return Err(type_error()); }
+        }
+        let batch = read_record_batch(&body, metadata, Arc::clone(schema), &Default::default(), None, &message.version()).map_err(ipc_error)?;
+        let retained = rtdb_columnar::shared_allocation_size(&batch)?.checked_add(512)
+            .and_then(|bytes| bytes.checked_add(retained_metadata))
+            .ok_or_else(|| invalid("join-spill", "Decoded spill size exceeds addressable memory"))?;
+        let lease = Arc::get_mut(&mut reservation).expect("The spill decoder owns its reservation");
+        if retained > lease.bytes() { lease.grow_to(retained)?; } else { lease.shrink_to(retained)?; }
+        OwnedBatch::with_reservation(batch, reservation).map(Some)
+    }
 }
 
+fn ipc_error(error: impl std::fmt::Display) -> rtdb_types::Anomaly { invalid("join-spill", error) }
+
 fn io_error(error: impl std::fmt::Display) -> rtdb_types::Anomaly { rtdb_types::Anomaly::fault("rtdb.query/spill-io", error.to_string()) }
+
+#[test]
+fn arrow_records_share_one_schema_across_spill_offsets() {
+    use arrow_array::{Int64Array, StringArray};
+    use arrow_schema::{DataType, Field, Schema};
+
+    let memory = MemoryBudget::new(1 << 20);
+    let spill = Arc::new(SpillRegion::new(1536).unwrap());
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("key", DataType::Int64, false),
+        Field::new("value", DataType::Utf8, true),
+    ]));
+    let batch = |key, value| RecordBatch::try_new(Arc::clone(&schema), vec![
+        Arc::new(Int64Array::from(vec![key])), Arc::new(StringArray::from(vec![value])),
+    ]).unwrap();
+    let first = batch(1, Some("first"));
+    let second = batch(2, None);
+    let mut writer = spill.create().unwrap();
+    writer.write_record(&first, &memory).unwrap();
+    let offset = writer.position().unwrap();
+    writer.write_record(&second, &memory).unwrap();
+    let mut reader = writer.finish().unwrap().reader(Arc::clone(&memory)).unwrap();
+    reader.seek(offset).unwrap();
+    assert_eq!(reader.read_record(&schema, 0).unwrap().unwrap().batch(), &second);
+    assert!(reader.read_record(&schema, 0).unwrap().is_none());
+    reader.rewind().unwrap();
+    assert_eq!(reader.read_record(&schema, 0).unwrap().unwrap().batch(), &first);
+    drop(reader);
+    assert_eq!(memory.used_bytes(), 0);
+    assert_eq!(spill.retained_bytes(), 0);
+}

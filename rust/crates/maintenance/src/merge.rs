@@ -201,12 +201,13 @@ fn merged_put_schema(inputs: &[InputSegment]) -> Result<Option<StructFields<Logi
 /// key within the current physical bucket owns its temporal state.
 struct EntityStates<'a, State> {
     bucket: Option<Iid>,
-    states: BTreeMap<Option<&'a [u8]>, (State, Arc<MemoryReservation>)>,
+    plain: Option<State>,
+    keyed: BTreeMap<&'a [u8], (State, Arc<MemoryReservation>)>,
 }
 
 impl<'a, State> EntityStates<'a, State> {
     fn new() -> Self {
-        Self { bucket: None, states: BTreeMap::new() }
+        Self { bucket: None, plain: None, keyed: BTreeMap::new() }
     }
 
     fn get(
@@ -214,10 +215,12 @@ impl<'a, State> EntityStates<'a, State> {
         init: impl FnOnce() -> State,
     ) -> Result<&mut State> {
         if self.bucket != Some(event.iid) {
-            self.states.clear();
+            self.plain = None;
+            self.keyed.clear();
             self.bucket = Some(event.iid);
         }
-        match self.states.entry(event.entity_key()) {
+        let Some(key) = event.entity_key() else { return Ok(self.plain.get_or_insert_with(init)); };
+        match self.keyed.entry(key) {
             std::collections::btree_map::Entry::Occupied(entry) => Ok(&mut entry.into_mut().0),
             std::collections::btree_map::Entry::Vacant(entry) => {
                 let charge = memory.reserve(std::mem::size_of::<State>() + 512)?;
@@ -428,6 +431,42 @@ mod tests {
     use rtdb_types::Iid;
 
     fn page(events: &[StoredEvent]) -> Vec<PageEvent> { EventBatch::new(build_event_batch(events, None, None).unwrap()).unwrap().page_events().unwrap() }
+
+    #[test]
+    fn normalization_retains_governed_event_keys_in_the_output_file() {
+        let directory = tempfile::tempdir().unwrap();
+        let spill = directory.path().join("merge.arrow");
+        let data = directory.path().join("data.arrow");
+        let metadata = directory.path().join("meta.arrow");
+        let memory = MemoryBudget::new(1 << 22);
+        let config = MergeConfig::default();
+        let events = [b"world-a".as_slice(), b"world-b".as_slice()].map(|key| StoredEvent {
+            entity_key: Some(Arc::from(key)), iid: Iid([1; 16]), system_from: Timestamp(100),
+            valid_time: Interval::ALL, operation: StoredOperation::Delete, recency: None,
+        });
+        let mut spill = MergeFile::new(spill, None, false, &[], &None, true, &config, &memory).unwrap();
+        spill.write(&page(&events), vec![], &None, &config, &memory).unwrap();
+        spill.finish(&config).unwrap();
+        layout::normalize(&spill, &None, &config, &memory, &data, &metadata, &CancellationToken::new()).unwrap();
+        let (mut reader, _reservation) = open_input(File::open(data).unwrap(), &memory).unwrap();
+        let batch = EventBatch::new(read_page(&mut reader, 0, &memory).unwrap().batch().clone()).unwrap();
+        assert_eq!(batch.entity_key(0).unwrap(), Some(b"world-a".as_slice()));
+        assert_eq!(batch.entity_key(1).unwrap(), Some(b"world-b".as_slice()));
+    }
+
+    #[test]
+    fn same_time_compaction_keeps_temporal_state_separate_for_colliding_keys() {
+        let memory = MemoryBudget::new(1 << 20);
+        let events = [b"world-a".as_slice(), b"world-b".as_slice()].map(|key| StoredEvent {
+            entity_key: Some(Arc::from(key)), iid: Iid([1; 16]), system_from: Timestamp(100),
+            valid_time: Interval::ALL, operation: StoredOperation::Delete, recency: None,
+        });
+        let input = page(&events);
+        let (rows, charges) = resolve_same_time(&input, &memory).unwrap();
+        assert_eq!(rows.iter().map(PageEvent::entity_key).collect::<Vec<_>>(), [Some(b"world-a".as_slice()), Some(b"world-b".as_slice())]);
+        drop((rows, charges));
+        assert_eq!(memory.used_bytes(), 0);
+    }
 
     #[test]
     fn compaction_reserves_encoding_scratch_before_writing_a_page() {

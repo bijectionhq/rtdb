@@ -302,6 +302,47 @@ impl ArrowDocuments {
         Ok(Some(Self { array: array.clone(), layout, source_bytes: Some(source_bytes) }))
     }
 
+    pub(crate) fn from_patch_source(array: &StructArray, layout: Arc<DecodedDocumentLayout>, source_bytes: usize, memory: &Arc<MemoryBudget>) -> Result<Option<Self>> {
+        fn supported(ty: &LogicalType) -> bool {
+            match ty {
+                LogicalType::Struct(fields) => fields.values().all(supported),
+                LogicalType::List { kind: ListKind::List | ListKind::FixedSizeList(_), element } => supported(element),
+                LogicalType::Maybe(inner) => supported(inner),
+                LogicalType::Null | LogicalType::Scalar(_) => true,
+                _ => false,
+            }
+        }
+        if !layout.types.values().all(|ty| supported(ty) && rtdb_columnar::execution_type(ty) == *ty) {
+            return Ok(None);
+        }
+        Self::from_source(array, layout, source_bytes, memory)
+    }
+
+    pub(crate) fn patch_parameter(&self, iids: &[rtdb_types::Iid], memory: &Arc<MemoryBudget>) -> Result<OwnedBatch> {
+        use arrow_schema::Field;
+        if iids.len() != self.array.len() {
+            return Err(Anomaly::incorrect("xtdb/invalid-iids", "Document and IID counts differ"));
+        }
+        let bound = self.array.get_array_memory_size().checked_add(iids.len().checked_mul(32).ok_or_else(overflow)?)
+            .and_then(|bytes| bytes.checked_add(8192)).ok_or_else(overflow)?;
+        let reservation = memory.reserve(bound)?;
+        let iid_array = arrow_array::FixedSizeBinaryArray::try_from_iter(iids.iter().map(|iid| iid.0.as_slice()))
+            .map_err(|error| Anomaly::incorrect("rtdb.tx/document-schema", error.to_string()))?;
+        let fields = vec![
+            Field::new("_iid", DataType::FixedSizeBinary(16), false),
+            Field::new("doc", self.array.data_type().clone(), false),
+        ].into();
+        let document = StructArray::new(fields, vec![Arc::new(iid_array), Arc::new(self.array.clone())], None);
+        let item = Arc::new(Field::new("item", document.data_type().clone(), false));
+        let count = i32::try_from(iids.len()).map_err(|_| overflow())?;
+        let offsets = arrow_buffer::OffsetBuffer::new(vec![0, count].into());
+        let list = ListArray::new(item, offsets, Arc::new(document), None);
+        let schema = Arc::new(Schema::new(vec![Field::new("?_0", list.data_type().clone(), false)]));
+        let parameter = RecordBatch::try_new(schema, vec![Arc::new(list)])
+            .map_err(|error| Anomaly::incorrect("rtdb.tx/document-schema", error.to_string()))?;
+        OwnedBatch::with_reservation(parameter, reservation)
+    }
+
     pub(crate) fn array(&self) -> &StructArray { &self.array }
     pub(crate) fn columns(&self) -> &[String] { &self.layout.columns }
     pub(crate) fn source_bytes(&self) -> Option<usize> { self.source_bytes }

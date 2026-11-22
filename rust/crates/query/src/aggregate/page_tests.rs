@@ -57,6 +57,61 @@ impl BatchCursor for Batches {
 }
 
 #[tokio::test]
+async fn empty_arrow_groups_validate_aggregate_order_types() {
+    let execution = execution(8);
+    let mut fields = schema().fields().to_vec();
+    let document = field(2, LogicalType::Struct(Default::default()));
+    fields.push(document.clone());
+    let schema = Schema::new(fields).unwrap();
+    let group = NamedExpr { field: field(3, LogicalType::Scalar(ScalarType::I64)), expr: schema.fields()[0].expression() };
+    let argument = schema.fields()[1].expression();
+    let aggregate = AggregateExpr {
+        field: field(4, LogicalType::list(argument.data_type())), function: AggregateFunction::ArrayAgg,
+        argument: Some(argument), distinct: false, filter: None,
+        order_by: vec![SortExpr { expr: document.expression(), descending: false, nulls_first: false }],
+    };
+    let child = Arc::new(Relation::new(schema.clone(), RelationNode::Values { rows: vec![] }).unwrap());
+    let output = Schema::new(vec![group.field.clone(), aggregate.field.clone()]).unwrap();
+    let relation = Arc::new(Relation::new(output, RelationNode::Aggregate {
+        input: child, groups: vec![group.clone()], aggregates: vec![aggregate.clone()],
+    }).unwrap());
+    let runtime = EmittedRelation::derive(relation, &execution.context.catalog, &[], &execution.context.memory).unwrap();
+    let mut cursor = AggregateCursor::from_batches(Box::new(Batches(None)), false, schema, vec![group], vec![aggregate], runtime, execution).unwrap();
+    assert_eq!(cursor.next_batch().await.err().unwrap().code, "xtdb.expression/function-type-mismatch");
+}
+
+#[tokio::test]
+async fn grouping_wide_arrow_lists_reuses_the_input_reservation() {
+    use arrow_array::RecordBatch;
+    use rtdb_columnar::{OwnedBatch, copy_array, to_field};
+    let execution = execution(64);
+    let memory = &execution.context.memory;
+    let key = Value::List(vec![Value::Utf8("x".repeat(1 << 14))]);
+    let ty = key.logical_type();
+    let input_field = field(0, ty.clone());
+    let schema = Schema::new(vec![input_field.clone()]).unwrap();
+    let input = Arc::new(Relation::new(schema.clone(), RelationNode::Values { rows: vec![] }).unwrap());
+    let group = NamedExpr { field: field(1, ty.clone()), expr: input_field.expression() };
+    let aggregate = count(2, None);
+    let output = Schema::new(vec![group.field.clone(), aggregate.field.clone()]).unwrap();
+    let relation = Arc::new(Relation::new(output, RelationNode::Aggregate {
+        input, groups: vec![group.clone()], aggregates: vec![aggregate.clone()],
+    }).unwrap());
+    let runtime = EmittedRelation::derive(relation, &execution.context.catalog, &[], memory).unwrap();
+    let keys = copy_array(&ty, &vec![key.clone(); 64]).unwrap();
+    let arrow_schema = Arc::new(arrow_schema::Schema::new(vec![to_field(&input_field.name, &ty).unwrap()]));
+    let batch = RecordBatch::try_new(arrow_schema, vec![keys]).unwrap();
+    let batch = ColumnBatch::from_owned(OwnedBatch::new(batch, memory).unwrap()).unwrap();
+    let mut cursor = AggregateCursor::from_batches(Box::new(Batches(Some(batch))), false, schema,
+        vec![group], vec![aggregate], runtime, execution.clone()).unwrap();
+    let _pressure = memory.reserve(memory.limit_bytes() - memory.used_bytes() - (1 << 19)).unwrap();
+    let result = cursor.next_batch().await.unwrap().unwrap();
+    assert_eq!(result.len, 1);
+    assert_eq!(result.columns[0].value(0).unwrap(), key);
+    assert_eq!(result.columns[1].value(0).unwrap(), Value::I64(64));
+}
+
+#[tokio::test]
 async fn global_reductions_emit_arrow_vectors_for_nullable_and_empty_inputs() {
     use arrow_array::{Float64Array, RecordBatch};
     use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
@@ -75,7 +130,7 @@ async fn global_reductions_emit_arrow_vectors_for_nullable_and_empty_inputs() {
     let output = Schema::new(aggregates.iter().map(|aggregate| aggregate.field.clone()).collect()).unwrap();
     let relation = Arc::new(Relation::new(output, RelationNode::Aggregate { input, groups: vec![], aggregates: aggregates.clone() }).unwrap());
     let runtime = EmittedRelation::derive(relation, &execution.context.catalog, &[], memory).unwrap();
-    assert!(AggregateCursor::writes_scalar_vectors(&runtime, &[], &aggregates).unwrap());
+    assert!(AggregateCursor::supports_columnar(&runtime, &[], &aggregates).unwrap());
     for (values, expected) in [
         (vec![Some(2.0), None, Some(3.0)], [Value::I64(3), Value::I64(2), Value::F64(5.0), Value::F64(2.5)]),
         (vec![], [Value::I64(0), Value::I64(0), Value::Null, Value::Null]),

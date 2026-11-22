@@ -203,6 +203,15 @@ fn a_read_metadata_file_retains_its_stored_nodes_rather_than_their_decoded_stati
     let read = MetadataFile::read(bytes.into()).unwrap();
     assert!(read.stored_bytes() * 2 < bound, "a read file retains {} of the {bound} its decoding is bounded by", read.stored_bytes());
     let decoded = read.nodes().iter().filter_map(|node| match node { MetadataNode::Leaf { columns, .. } => Some(columns.values().unwrap().into_owned()), _ => None }).collect::<Vec<_>>();
+    for (page, node) in read.nodes().iter().enumerate() {
+        let MetadataNode::Leaf { columns, .. } = node else { continue; };
+        let statistics = columns.statistics().unwrap();
+        assert_eq!(statistics.root_column("_id").unwrap().bound("numbers", "min"), Some((page * 1024) as f64));
+        let sku = statistics.root_column("sku").unwrap();
+        assert_eq!(sku.count(), Some(1024));
+        let bloom = rtdb_format::bloom::BloomFilter::from_bytes(sku.bloom().unwrap()).unwrap();
+        assert!(bloom.contains_value(&Value::Utf8(format!("sku-{}", page * 1024))).unwrap());
+    }
     let present = |columns: &[Value]| columns.iter().map(|column| match column {
         Value::Struct(fields) => Value::Struct(fields.iter().filter(|(_, value)| !matches!(value, Value::Null)).map(|(key, value)| (key.clone(), value.clone())).collect()),
         other => other.clone(),

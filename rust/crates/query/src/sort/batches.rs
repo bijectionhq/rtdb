@@ -30,6 +30,8 @@ pub(crate) struct BatchSort {
     input: Option<BoxBatchCursor>,
     output: Option<Sorted>,
     spilled: bool,
+    semantic_page_rows: Option<usize>,
+    spill_pending: Option<(Arc<ColumnBatch>, usize)>,
 }
 
 impl BatchSort {
@@ -74,7 +76,14 @@ impl BatchSort {
             input: Some(input),
             output: None,
             spilled: false,
+            semantic_page_rows: None,
+            spill_pending: None,
         })
+    }
+
+    pub fn preserving_pages(mut self) -> Self {
+        self.semantic_page_rows = Some(0);
+        self
     }
 
     async fn sort(&mut self, mut input: BoxBatchCursor) -> Result<Sorted> {
@@ -82,10 +91,21 @@ impl BatchSort {
         let mut block = Block::new(&context.memory, self.native.is_some())?;
         let mut runs = Runs::new(&context.memory)?;
         let mut key_types = KeyTypes::declared(&self.plan)?;
+        let mut logical_runs = 0;
+        let mut logical_run_rows = 0;
+        let mut total_rows = 0usize;
         while let Some(batch) = input.next_batch().await? {
             context.check_cancelled()?;
             if batch.len == 0 {
                 continue;
+            }
+            if self.semantic_page_rows.is_some() {
+                total_rows = total_rows.checked_add(batch.len).ok_or_else(size_error)?;
+                logical_run_rows += batch.len;
+                if logical_run_rows > BLOCK_ROWS {
+                    logical_runs += 1;
+                    logical_run_rows = 0;
+                }
             }
             let payload_bytes = batch.working_set_bytes(&context.memory)?;
             if !block.positions.is_empty()
@@ -120,6 +140,10 @@ impl BatchSort {
             tokio::task::consume_budget().await;
         }
         drop(input);
+        if let Some(page_rows) = &mut self.semantic_page_rows {
+            logical_runs += usize::from(logical_run_rows != 0);
+            *page_rows = if logical_runs > 1 { BLOCK_ROWS + 1 } else { total_rows };
+        }
         if !block.positions.is_empty() || !runs.files.is_empty() {
             key_types.validate()?;
         }
@@ -175,7 +199,7 @@ impl BatchSort {
         mut run: MemoryRun,
     ) -> Result<Arc<SpillFile>> {
         let mut writer = plan.execution.context.spill.create()?;
-        while let Some(batch) = run.next(plan, projection)? {
+        while let Some(batch) = run.next(plan, projection, plan.execution.context.options.batch_rows)? {
             write_batch(&mut writer, batch, plan)?;
             tokio::task::consume_budget().await;
         }
@@ -276,8 +300,11 @@ impl BatchCursor for BatchSort {
         while let Some(output) = &mut self.output {
             context.check_cancelled()?;
             let batch = match output {
-                Sorted::Memory(run) => run.next(&self.plan, &self.projection)?,
-                Sorted::Spill(reader) => read_batch(reader)?,
+                Sorted::Memory(run) => run.next(&self.plan, &self.projection, self.semantic_page_rows.unwrap_or(context.options.batch_rows))?,
+                Sorted::Spill(reader) => match self.semantic_page_rows {
+                    Some(rows) => read_semantic_page(reader, &mut self.spill_pending, rows, context)?,
+                    None => read_batch(reader)?,
+                },
             };
             let Some(batch) = batch else {
                 self.output = None;
@@ -486,12 +513,12 @@ struct MemoryRun {
 }
 
 impl MemoryRun {
-    fn next(&mut self, plan: &SortPlan, columns: &[usize]) -> Result<Option<ColumnBatch>> {
+    fn next(&mut self, plan: &SortPlan, columns: &[usize], maximum: usize) -> Result<Option<ColumnBatch>> {
         if self.order.len() == 0 {
             return Ok(None);
         }
         let context = &plan.execution.context;
-        let count = self.order.len().min(context.options.batch_rows);
+        let count = self.order.len().min(maximum);
         let _scratch = context.memory.reserve(256 + count.saturating_mul(128))?;
         let positions: Vec<_> = self
             .order
@@ -680,9 +707,47 @@ fn scalar_key(batch: &ColumnBatch, row: usize, plan: &SortPlan, columns: &[usize
 
 fn write_batch(writer: &mut SpillWriter, batch: ColumnBatch, plan: &SortPlan) -> Result<()> {
     let memory = &plan.execution.context.memory;
-    let owned = column_batch(&plan.schema, memory, batch)?;
     let schema = crate::runtime_schema::schema_bound(&plan.schema)?;
+    match batch.spill_record(&plan.schema, memory) {
+        Ok(Some(raw)) => match writer.write_arrow(&raw, schema, memory, "sort-spill-arrow") {
+            Ok(()) => return Ok(()),
+            Err(error) if matches!(error.code.as_str(), "rtdb/memory-budget-exceeded" | "rtdb.query/spill-limit") => {},
+            Err(error) => return Err(error),
+        },
+        Ok(None) => {},
+        Err(error) if error.code == "rtdb/memory-budget-exceeded" => {},
+        Err(error) => return Err(error),
+    }
+    let owned = column_batch(&plan.schema, memory, batch)?;
     writer.write_arrow(&owned, schema, memory, "sort-spill-arrow")
+}
+
+fn read_semantic_page(
+    reader: &mut SpillReader, pending: &mut Option<(Arc<ColumnBatch>, usize)>, limit: usize, context: &crate::QueryContext,
+) -> Result<Option<ColumnBatch>> {
+    let mut sources = Vec::new();
+    let mut spans = Vec::new();
+    let mut rows = 0;
+    let mut reservation = context.memory.reserve(256)?;
+    while rows < limit {
+        context.check_cancelled()?;
+        let (batch, offset) = match pending.take() {
+            Some(next) => next,
+            None => {
+                let Some(batch) = read_batch(reader)? else { break; };
+                if rows == 0 && batch.len == limit { return Ok(Some(batch)); }
+                (Arc::new(batch), 0)
+            }
+        };
+        let count = (batch.len - offset).min(limit - rows);
+        if offset + count < batch.len { *pending = Some((Arc::clone(&batch), offset + count)); }
+        let bytes = (sources.len() + 1).checked_mul(256).and_then(|bytes| bytes.checked_add(256)).ok_or_else(size_error)?;
+        Arc::get_mut(&mut reservation).expect("The sort owns its spill page inventory").grow_to(bytes)?;
+        sources.push(batch);
+        spans.push(offset..offset + count);
+        rows += count;
+    }
+    ColumnBatch::take_ranges(sources, &spans, rows, &context.memory)
 }
 
 fn read_batch(reader: &mut SpillReader) -> Result<Option<ColumnBatch>> {

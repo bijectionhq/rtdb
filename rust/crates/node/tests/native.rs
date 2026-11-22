@@ -3121,6 +3121,38 @@ async fn a_put_error_names_its_table_and_a_patch_error_does_not() {
 }
 
 #[tokio::test]
+async fn a_replayed_patch_preserves_a_null_override_and_fills_both_valid_time_gaps() {
+    use rtdb_types::Timestamp;
+
+    let (node, driver) = running(options(), services()).await;
+    let mut session = node.session("xtdb", Arc::new(Authority)).unwrap();
+    let table = TableRef::new("public", "patch_segments");
+    let documents = Documents::new(vec![StructFields::from([
+        ("_id".into(), Value::I64(1)), ("retained".into(), Value::I64(11)),
+    ])], node.memory()).unwrap();
+    let put = TxOp::PutDocs {
+        table: table.clone(), documents, valid_from: Some(Timestamp(10)), valid_to: Some(Timestamp(20)),
+    };
+    assert!(session.state_mut().execute_tx(vec![put], AutonomousTxOptions::default()).await.unwrap().committed());
+    let documents = Documents::new(vec![StructFields::from([
+        ("_id".into(), Value::I64(1)), ("retained".into(), Value::Null), ("revised".into(), Value::I64(42)),
+    ])], node.memory()).unwrap();
+    let patch = TxOp::PatchDocs {
+        table, documents, valid_from: Some(Timestamp(5)), valid_to: Some(Timestamp(25)),
+    };
+    let result = session.state_mut().execute_tx(vec![patch], AutonomousTxOptions::default()).await.unwrap();
+    assert!(result.committed(), "{:?}", result.error());
+    let cursor = session.query_sql("SELECT retained, revised FROM patch_segments FOR ALL VALID_TIME ORDER BY _valid_from", vec![]).await.unwrap();
+    assert_eq!(rows(cursor).await, [
+        vec![Value::Null, Value::I64(42)],
+        vec![Value::I64(11), Value::I64(42)],
+        vec![Value::Null, Value::I64(42)],
+    ]);
+    drop(session);
+    stop(&node, driver).await;
+}
+
+#[tokio::test]
 async fn a_stored_struct_reads_back_with_its_fields_in_written_order() {
     let (node, driver) = running(options(), services()).await;
     let mut session = node.session("xtdb", Arc::new(Authority)).unwrap();
