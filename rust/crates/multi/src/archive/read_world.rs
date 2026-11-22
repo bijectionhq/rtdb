@@ -110,19 +110,46 @@ where
     F: FnOnce(Arc<QueryContext>) -> Fut,
     Fut: std::future::Future<Output = Result<T>>,
 {
+    with_registered_capture_context(
+        directory, archive, keys, hosted_task,
+        CaptureSelection { deployment: world.deployment, capture: world.capture, manifest: &world.manifest_sha256, expected_basis: Some(world.basis) },
+        resources, |context, _| run(context),
+    ).await
+}
+
+pub(super) struct CaptureSelection<'a> {
+    pub deployment: Uuid,
+    pub capture: Uuid,
+    pub manifest: &'a str,
+    pub expected_basis: Option<TransactionKey>,
+}
+
+pub(super) async fn with_registered_capture_context<T, F, Fut>(
+    directory: &dyn Directory,
+    archive: &CellStorage,
+    keys: &dyn KeyService,
+    hosted_task: Option<&HostedTask>,
+    selected: CaptureSelection<'_>,
+    resources: CheckpointReadResources<'_>,
+    run: F,
+) -> Result<T>
+where
+    F: FnOnce(Arc<QueryContext>, TransactionKey) -> Fut,
+    Fut: std::future::Future<Output = Result<T>>,
+{
     if !resources.node.owned_relations {
         return Err(unavailable(
             "Owned checkpoint reads require the owned-relation capability",
         ));
     }
-    let deployment = world.deployment.to_string();
+    let deployment = selected.deployment.to_string();
     let admit = |record: &rtdb_directory::DeploymentRecord| {
-        require_capture_open(record, world.capture)?;
+        require_capture_open(record, selected.capture)?;
         let (capture, manifest) =
-            capture_receipt(record, archive, world.deployment, world.capture)?
+            capture_receipt(record, archive, selected.deployment, selected.capture)?
                 .ok_or_else(|| unavailable("The read world has no retained checkpoint receipt"))?;
-        if manifest != world.manifest_sha256
-            || capture.checkpoint.system_time != world.basis.system_time.0
+        if manifest != selected.manifest
+            || selected.expected_basis.is_some_and(|basis| capture.checkpoint.system_time != basis.system_time.0)
             || capture.checkpoint.boundary < 0
             || capture.checkpoint.root_sha256.is_none()
         {
@@ -138,7 +165,7 @@ where
         &deployment,
         archive,
         hosted_task,
-        Some(world.capture),
+        Some(selected.capture),
         None,
         |record| admit(record).map(|_| ()),
         |record, _, region| async {
@@ -146,7 +173,7 @@ where
             let bucket = archive.bucket(region).await?;
             if read(
                 bucket.as_ref(),
-                &archive_witness(world.deployment, world.capture)?,
+                &archive_witness(selected.deployment, selected.capture)?,
             )
             .await?
             .as_ref()
@@ -157,13 +184,13 @@ where
                 ));
             }
             let (manifest, material) =
-                verified_archive(bucket.clone(), &capture, &world.manifest_sha256, keys).await?;
+                verified_archive(bucket.clone(), &capture, selected.manifest, keys).await?;
             let store: Arc<dyn ObjectStore> = Arc::new(CapturedObjects {
                 files: PrefixedStore::new(
                     bucket,
                     format!(
                         "checkpoint-captures/{}/{}/objects",
-                        world.deployment, world.capture
+                        selected.deployment, selected.capture
                     ),
                 ),
                 objects: manifest
@@ -196,15 +223,16 @@ where
                 .recover(
                     resources.node.trie,
                     source_floor,
-                    world.basis.system_time,
+                    rtdb_types::Timestamp(capture.checkpoint.system_time),
                     BlockDiscovery::AtPublished(checkpoint),
                 )
                 .await?;
             let snapshot = recovered.partition.snapshot();
-            if snapshot.tx_basis() != Some(world.basis) {
-                return Err(inconsistent(
-                    "The retained checkpoint has a different transaction key",
-                ));
+            let basis = snapshot.tx_basis().ok_or_else(|| inconsistent("The retained checkpoint has no transaction basis"))?;
+            if basis.system_time.0 != capture.checkpoint.system_time
+                || selected.expected_basis.is_some_and(|expected| basis != expected)
+            {
+                return Err(inconsistent("The retained checkpoint has a different transaction key"));
             }
             let name = record.name;
             let catalog = CatalogSnapshot::new(
@@ -221,12 +249,12 @@ where
             let context = QueryContext::new(
                 catalog,
                 memory,
-                world.basis.system_time,
+                basis.system_time,
                 "UTC",
                 resources.node.query.clone(),
                 resources.cancellation,
             )?;
-            run(context).await
+            run(context, basis).await
         },
     )
     .await

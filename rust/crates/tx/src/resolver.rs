@@ -929,11 +929,11 @@ impl<'a> OpenTransaction<'a> {
             }
             let (record, _) = self.owned_world.as_ref().ok_or_else(unavailable)?;
             if Some(record.id) != relation.world() { return Err(unavailable()); }
+            let schema = record.schemas.relation(&root)
+                .ok_or_else(|| Anomaly::incorrect("rtdb.owned/world-undeclared", "World writes require a schema retained from the parent cut"))?;
             for row in documents.rows() {
                 let _scratch = self.context.memory.reserve(rtdb_types::WorldShadow::decode_bound(row)?)?;
-                if let rtdb_types::WorldShadow::Present(fact) = rtdb_types::WorldShadow::from_record(row)?
-                    && let Some(schema) = record.schemas.relation(&root)
-                {
+                if let rtdb_types::WorldShadow::Present(fact) = rtdb_types::WorldShadow::from_record(row)? {
                     validate_owned_schema(schema, &fact)?;
                 }
             }

@@ -11,7 +11,7 @@ use uuid::Uuid;
 
 use super::{
     CellStorage, CheckpointPoint, CheckpointReadResources, CheckpointReadWorld, KeyService,
-    capture_receipt, read_checkpoint_owned_point, read_world::with_checkpoint_context,
+    capture_receipt, read_checkpoint_owned_point, read_world::{CaptureSelection, with_registered_capture_context},
     require_capture_open, same_lifetime,
 };
 use crate::admin::update_installation;
@@ -79,7 +79,8 @@ pub async fn fork_checkpoint_world(
     keys: &dyn KeyService,
     hosted_task: Option<&HostedTask>,
     session: &mut NativeSession,
-    parent: &CheckpointReadWorld,
+    deployment_id: Uuid,
+    capture: Uuid,
     until: Timestamp,
     resources: CheckpointReadResources<'_>,
 ) -> Result<Uuid> {
@@ -89,26 +90,34 @@ pub async fn fork_checkpoint_world(
         .filter(|owner| !owner.is_empty() && owner.len() <= 512)
         .ok_or_else(OwnedWorld::unavailable)?
         .to_owned();
-    let deployment = parent.deployment.to_string();
+    let deployment = deployment_id.to_string();
     let source = directory
         .deployment(&deployment)
         .await?
         .ok_or_else(OwnedWorld::unavailable)?;
     admit_session(session, &source, &owner)?;
-    admit_capture(&source, archive, parent)?;
-    if until <= now() || until <= parent.basis.system_time {
+    require_capture_open(&source, capture)?;
+    let (point, manifest) = capture_receipt(&source, archive, deployment_id, capture)?
+        .ok_or_else(OwnedWorld::unavailable)?;
+    if !same_lifetime(&source, &point) || until <= now() || until.0 <= point.checkpoint.system_time {
         return Err(OwnedWorld::unavailable());
     }
-    let (schemas, _schema_charge) = with_checkpoint_context(
-        directory,
-        archive,
-        keys,
-        hosted_task,
-        parent,
+    let live = session.open_owned_read().await?;
+    let ((schemas, _schema_charge), basis) = with_registered_capture_context(
+        directory, archive, keys, hosted_task,
+        CaptureSelection { deployment: deployment_id, capture, manifest: &manifest, expected_basis: None },
         resources,
-        |context| rtdb_query::read_owned_parent_schemas(context, &owner),
-    )
-    .await?;
+        |context, basis| {
+            let owner = &owner;
+            async move { Ok((rtdb_query::read_owned_parent_schemas(context, owner).await?, basis)) }
+        },
+    ).await?;
+    live.check()?;
+    if basis.system_time >= live.present().system_time {
+        return Err(OwnedWorld::unavailable());
+    }
+    drop(live);
+    let parent = CheckpointReadWorld { deployment: deployment_id, capture, manifest_sha256: manifest, basis };
 
     let id = Uuid::new_v4();
     let retained = CheckpointWorldRetention {
@@ -127,7 +136,7 @@ pub async fn fork_checkpoint_world(
         if record.name != database || scope != Some(eligible) {
             return Err(OwnedWorld::unavailable());
         }
-        admit_capture(record, archive, parent)?;
+        admit_capture(record, archive, &parent)?;
         let now = now();
         if until <= now {
             return Err(OwnedWorld::unavailable());

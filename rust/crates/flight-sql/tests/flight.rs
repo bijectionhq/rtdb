@@ -836,7 +836,10 @@ async fn grouped_owned_commit_checks_every_relation_before_writing() {
 async fn world_flight_actions_require_a_placed_world_host() {
     let running = Running::start(Some("secret"), FlightConfig { owned_native_actions: true, ..FlightConfig::default() }).await;
     let mut client = Client::connect(&running.server, Some("xtdb:secret")).await;
-    for action in ["rtdb.owned.ReadWorldPoint.v1", "rtdb.owned.DropWorld.v1"] {
+    for action in [
+        "rtdb.owned.ReadWorldPoint.v1", "rtdb.owned.DropWorld.v1",
+        "rtdb.owned.ForkWorld.v1", "rtdb.owned.CommitWorld.v1",
+    ] {
         let refused = client.action(action, Bytes::from_static(&[0; 16])).await.unwrap_err();
         assert_eq!(refused.code(), tonic::Code::Unimplemented);
     }
