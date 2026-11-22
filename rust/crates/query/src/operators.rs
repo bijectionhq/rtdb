@@ -512,7 +512,7 @@ fn computed_batch_sort(schema: &Schema, order_by: &[rtdb_plan::SortExpr]) -> boo
     })
 }
 
-pub(crate) fn project_sort_keys(
+fn project_sort_keys(
     input: crate::columnar::BoxBatchCursor, schema: Schema, order_by: &[rtdb_plan::SortExpr], execution: &Execution,
 ) -> Result<Option<(crate::columnar::BoxBatchCursor, Schema, Vec<rtdb_plan::SortExpr>)>> {
     let scope = execution.scope()?;

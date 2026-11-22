@@ -203,7 +203,7 @@ impl AggregateCursor {
             if !aggregate.order_by.is_empty() {
                 if !collect_vectors || aggregate.function.canonical() != AggregateFunction::ArrayAgg { return None; }
                 for order in &aggregate.order_by {
-                    for id in order.expr.referenced_columns() { positions.push(schema.position(id)?); }
+                    positions.push(argument_position(&order.expr, schema).ok()?);
                 }
             }
             match aggregate.function.canonical() {
@@ -935,9 +935,8 @@ impl CollectionOrder {
         let argument = argument_position(argument, input)?;
         let mut positions = vec![argument];
         for order in &aggregate.order_by {
-            for position in crate::columnar::expression_columns(&order.expr, input)? {
-                if !positions.contains(&position) { positions.push(position); }
-            }
+            let position = argument_position(&order.expr, input)?;
+            if !positions.contains(&position) { positions.push(position); }
         }
         let group = Binder::after(input)?.field("_aggregate_group", None, LogicalType::Scalar(ScalarType::I64).maybe())?;
         let schema = Schema::new(positions.iter().map(|&position| input.fields()[position].clone())
@@ -962,22 +961,14 @@ impl CollectionOrder {
     }
 
     async fn sort(self, input: CollectionVectors, groups: usize, order: &[rtdb_plan::SortExpr], execution: &Execution) -> Result<CollectionVectors> {
-        use crate::{operators::project_sort_keys, scalar_key::ScalarKey, sort::batches::BatchSort};
+        use crate::{scalar_key::ScalarKey, sort::batches::BatchSort};
         let context = &execution.context;
         let memory = &context.memory;
         let group = self.positions.len();
         let mut output = CollectionVectors::new(memory, None)?;
         output.present = input.present;
-        let mut projected = input.projected;
         let source = Box::new(CollectionInput { batches: input.batches.into_iter(), _reservation: input.reservation });
-        let (source, schema, order) = if BatchSort::supports(&self.schema, order) {
-            (source as crate::columnar::BoxBatchCursor, self.schema, order.to_vec())
-        } else {
-            projected = true;
-            project_sort_keys(source, self.schema, order, execution)?
-                .ok_or_else(|| invalid("aggregate-order", "An aggregate ordering key cannot be projected"))?
-        };
-        let mut sorted = BatchSort::new(source, schema, order, execution.clone(), projected, 0, i64::MAX as u64)?;
+        let mut sorted = BatchSort::new(source, self.schema, order.to_vec(), execution.clone(), input.projected, 0, i64::MAX as u64)?;
         while let Some(batch) = sorted.next_batch().await? {
             let _positions = memory.reserve(batch.len.checked_mul(2 * std::mem::size_of::<(usize, usize)>())
                 .ok_or_else(|| invalid("aggregate-size", "Ordered list positions overflow"))?)?;

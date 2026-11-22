@@ -59,13 +59,16 @@ impl BatchCursor for Batches {
 #[tokio::test]
 async fn empty_arrow_groups_validate_aggregate_order_types() {
     let execution = execution(8);
-    let schema = schema();
-    let group = NamedExpr { field: field(2, LogicalType::Scalar(ScalarType::I64)), expr: schema.fields()[0].expression() };
+    let mut fields = schema().fields().to_vec();
+    let document = field(2, LogicalType::Struct(Default::default()));
+    fields.push(document.clone());
+    let schema = Schema::new(fields).unwrap();
+    let group = NamedExpr { field: field(3, LogicalType::Scalar(ScalarType::I64)), expr: schema.fields()[0].expression() };
     let argument = schema.fields()[1].expression();
     let aggregate = AggregateExpr {
-        field: field(3, LogicalType::list(argument.data_type())), function: AggregateFunction::ArrayAgg,
+        field: field(4, LogicalType::list(argument.data_type())), function: AggregateFunction::ArrayAgg,
         argument: Some(argument), distinct: false, filter: None,
-        order_by: vec![SortExpr { expr: Expr::Literal(Value::Struct(Default::default())), descending: false, nulls_first: false }],
+        order_by: vec![SortExpr { expr: document.expression(), descending: false, nulls_first: false }],
     };
     let child = Arc::new(Relation::new(schema.clone(), RelationNode::Values { rows: vec![] }).unwrap());
     let output = Schema::new(vec![group.field.clone(), aggregate.field.clone()]).unwrap();

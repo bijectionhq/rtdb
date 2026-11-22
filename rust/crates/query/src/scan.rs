@@ -2209,12 +2209,21 @@ mod tests {
 
     #[tokio::test]
     async fn ordered_list_and_percentile_aggregates_select_arrow_positions() {
-        use rtdb_plan::{AggregateExpr, AggregateFunction, BinaryOp, PercentileFraction, PercentileKind, Relation, RelationNode, Schema, SortExpr};
+        use rtdb_plan::{AggregateExpr, AggregateFunction, BinaryOp, NamedExpr, PercentileFraction, PercentileKind, Relation, RelationNode, Schema, SortExpr};
         let (state, table, _) = live_table_with_values([Value::I64(1), Value::I64(3), Value::I64(2), Value::I64(2), Value::Null]);
         let storage = Arc::new(BufferPool::new(Arc::new(MemoryStore::default()), 1 << 20));
         let (scan, execution, memory) = descriptor_scan(state.value().snapshot(), table, storage);
         let expression = scan.columns[0].expression();
-        let mut field = scan.columns[0].clone();
+        let value_field = scan.columns[0].clone();
+        let mut order = value_field.clone();
+        order.id = ColumnId(8);
+        order.name = "order_key".into();
+        order.data_type = LogicalType::Scalar(ScalarType::I64).maybe();
+        let input = Arc::new(Arc::new(Relation::scan(scan).unwrap()).project(vec![
+            NamedExpr { field: value_field.clone(), expr: expression.clone() },
+            NamedExpr { field: order.clone(), expr: Expr::binary(BinaryOp::Subtract, Expr::Literal(Value::I64(0)), expression.clone()) },
+        ]).unwrap());
+        let mut field = value_field;
         field.id = ColumnId(9);
         field.name = "collected".into();
         field.data_type = LogicalType::list(expression.data_type()).maybe();
@@ -2230,12 +2239,11 @@ mod tests {
             kind, fraction: PercentileFraction::Literal(0.75), descending: false,
         }, argument: Some(expression.clone()), distinct: false, filter: None, order_by: vec![] };
         let relation = Arc::new(Relation::new(Schema::new(vec![field.clone(), discrete.clone(), continuous.clone()]).unwrap(), RelationNode::Aggregate {
-            input: Arc::new(Relation::scan(scan).unwrap()), groups: vec![],
+            input, groups: vec![],
             aggregates: vec![AggregateExpr {
                 field, function: AggregateFunction::ArrayAgg, argument: Some(expression.clone()),
                 distinct: true, filter: Some(Expr::binary(BinaryOp::Gt, expression.clone(), Expr::Literal(Value::I64(1)))),
-                order_by: vec![SortExpr { expr: Expr::binary(BinaryOp::Subtract, Expr::Literal(Value::I64(0)), expression.clone()),
-                    descending: false, nulls_first: false }],
+                order_by: vec![SortExpr { expr: order.expression(), descending: false, nulls_first: false }],
             }, percentile(discrete, PercentileKind::Discrete), percentile(continuous, PercentileKind::Continuous)],
         }).unwrap());
         let runtime = crate::runtime_schema::EmittedRelation::derive(relation, &execution.context.catalog, &[], &memory).unwrap();
