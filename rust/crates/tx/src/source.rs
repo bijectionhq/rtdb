@@ -483,7 +483,7 @@ fn operation_value<'a>(operation: &'a Operation, memory: &Arc<MemoryBudget>) -> 
         }
         Operation::Public(TxOp::HostedControl(control)) => {
             body = control.body();
-            "rtdb-hosted-control-v1"
+            if control.is_check() { "rtdb-hosted-control-check-v1" } else { "rtdb-hosted-control-v1" }
         }
         Operation::Public(TxOp::OwnedDeadline { until }) => {
             body.insert("until".into(), Value::I64(until.0));
@@ -1103,7 +1103,7 @@ impl SourceOperationReader<'_> {
             "rtdb-owned-capacity-v1" => &["relation", "column", "prefix_bytes", "cap"],
             "rtdb-owned-check-capacity-v1" => &["relation", "column", "prefix", "at_most"],
             "rtdb-owned-path-v1" => &["relation", "name", "columns"],
-            "rtdb-hosted-control-v1" => &["relation", "scope", "expected", "document"],
+            "rtdb-hosted-control-v1" | "rtdb-hosted-control-check-v1" => &["relation", "scope", "expected", "document"],
             "rtdb-owned-deadline-v1" => &["until"],
             "rtdb-owned-fixed-range-v1" => &["relation", "rule"],
             "rtdb-owned-check-world-scope-v1" => &["scope"],
@@ -1191,7 +1191,7 @@ impl SourceOperationReader<'_> {
                 let Value::Binary(scope) = value("scope")? else { return Err(invalid("Owned world witness has no placement scope")); };
                 TxOp::OwnedCheckWorldScope { scope: rtdb_types::PlacedAttemptScope::decode(&scope)? }
             }
-            "rtdb-hosted-control-v1" => {
+            "rtdb-hosted-control-v1" | "rtdb-hosted-control-check-v1" => {
                 let (Value::Utf8(relation), Value::Binary(scope), expected, Value::Struct(document)) =
                     (value("relation")?, value("scope")?, value("expected")?, value("document")?)
                 else { return Err(invalid("Hosted control has invalid fields")); };
@@ -1200,9 +1200,13 @@ impl SourceOperationReader<'_> {
                     Value::Null => None,
                     _ => return Err(invalid("Hosted control has an invalid expectation")),
                 };
-                TxOp::HostedControl(crate::HostedControlWrite::new(
-                    rtdb_types::OwnedRelation::new(relation)?, rtdb_types::PlacedAttemptScope::decode(&scope)?, expected, document,
-                )?)
+                let relation = rtdb_types::OwnedRelation::new(relation)?;
+                let scope = rtdb_types::PlacedAttemptScope::decode(&scope)?;
+                TxOp::HostedControl(if name == "rtdb-hosted-control-check-v1" {
+                    crate::HostedControlWrite::check(relation, scope, expected, document)?
+                } else {
+                    crate::HostedControlWrite::new(relation, scope, expected, document)?
+                })
             }
             "rtdb-owned-deadline-v1" => {
                 let Value::I64(until) = value("until")? else { return Err(invalid("Owned deadline is not a microsecond timestamp")); };

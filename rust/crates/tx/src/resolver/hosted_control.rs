@@ -34,6 +34,7 @@ impl OpenTransaction<'_> {
                     TxOp::OwnedDeadline { .. }
                         | TxOp::OwnedCheck { .. }
                         | TxOp::OwnedCheckRange { .. }
+                        | TxOp::OwnedCheckCapacity { .. }
                         | TxOp::OwnedInsertDocs { .. }
                         | TxOp::OwnedReplaceDocs { .. }
                         | TxOp::OwnedDelete { .. }
@@ -66,7 +67,7 @@ impl OpenTransaction<'_> {
                 _ => false,
             };
         }
-        if !has_fact_write {
+        if !has_fact_write && controls.clone().any(|control| !control.is_check()) {
             return Err(unavailable());
         }
 
@@ -92,19 +93,21 @@ impl OpenTransaction<'_> {
             if control.scope() != scope || !base.contains_table(&table) {
                 return Err(unavailable());
             }
-            let fields = control.document().keys().cloned();
-            let existing = base.column_types_for(&table, fields);
-            if control.document().iter().any(|(name, value)| {
-                existing.get(name).is_none_or(|kind| {
-                    matches!(kind, LogicalType::Nothing | LogicalType::Null)
-                        || matches!(value, Value::Undefined)
-                        || kind.join(&value.logical_type()) != *kind
-                })
-            }) {
-                return Err(Anomaly::incorrect(
-                    "rtdb.hosted/control-shape",
-                    "Hosted control fields must match the installed ordinary column types",
-                ));
+            if let Some(document) = control.replacement() {
+                let fields = document.keys().cloned();
+                let existing = base.column_types_for(&table, fields);
+                if document.iter().any(|(name, value)| {
+                    existing.get(name).is_none_or(|kind| {
+                        matches!(kind, LogicalType::Nothing | LogicalType::Null)
+                            || matches!(value, Value::Undefined)
+                            || kind.join(&value.logical_type()) != *kind
+                    })
+                }) {
+                    return Err(Anomaly::incorrect(
+                        "rtdb.hosted/control-shape",
+                        "Hosted control fields must match the installed ordinary column types",
+                    ));
+                }
             }
             charges.push(self.context.memory.reserve(table.table.len() + 512)?);
             if !locators.insert((table.clone(), control.id().iid())) {

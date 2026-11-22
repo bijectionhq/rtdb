@@ -531,17 +531,20 @@ The relation-frontier check still applies to moving-valid reads, continuation re
 The operator's `flightSql.hostedControls.relations` sequence names the admitted ordinary `public.bj_*` tables.
 The body begins with the Commit.v3 unsigned Int16 big-endian witness count (zero to 32) and its 16-byte held handle plus 16-byte nonce pairs.
 Then come the signed Int64 big-endian exclusive deadline, an unsigned Int32 big-endian byte length, that many bytes of ordered fact groups, then the hosted control groups.
-Each section uses the Commit.v2 relation-group sequence framing and both must contain at least one group.
+Both sections use the Commit.v2 relation-group sequence framing. The control section has at least one group. A check-only transaction may omit fact groups.
 Fact groups may repeat a relation to preserve run order. The combined sections admit at most 32 distinct fact and control groups and 4096 total rows.
 
 Each control group contains one terminated Arrow batch with distinct field names.
-Every row has `_id: Utf8`, `_expected_micros: Int64?`, and a complete replacement image in the already installed ordinary column types.
+Every row has `_id: Utf8` and `_expected_micros: Int64?`. Replacement rows supply a complete image in the already installed ordinary column types. A row with `_check_only: Boolean` set to true carries only the ID and expectation and leaves the table unchanged.
 A null expectation requires exact absence.
 An existing row must contribute one exact valid slice from epoch to infinity at the ordered base.
 Control replacements use the same epoch-to-infinity interval.
 The resolver checks all control and fact observations before any mutation and aborts both sets of effects on failure.
 Use an absent-checked unique receipt key as one of the writes when the host needs to recover an indeterminate response.
 The response is the ordinary committed transaction-key row.
+
+`rtdb.owned.CommitHostedCounted.v1` prefixes this action with the ordered-present count condition from Commit.v6.
+The resolver checks both the ordinary control observations and the final owned count in the same transaction.
 
 This action supports checked replacement and exact absence insertion for hosted controls.
 Other control effects, including arbitrary SQL, computed values, deletes, relabeling and temporal splits, are outside this action.

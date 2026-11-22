@@ -31,6 +31,7 @@ pub(crate) const DECLARE_OWNED_SEARCH_PATH_V1: &str = "rtdb.owned.DeclareSearchP
 pub(crate) const DECLARE_OWNED_RELATION_V1: &str = "rtdb.owned.DeclareRelation.v1";
 pub(crate) const DECLARE_OWNED_PATH_V1: &str = "rtdb.owned.DeclarePath.v1";
 pub(crate) const CREATE_OWNED_V1: &str = "rtdb.owned.Create.v1";
+pub(crate) const COMMIT_HOSTED_COUNTED_V1: &str = "rtdb.owned.CommitHostedCounted.v1";
 pub(crate) const COMMIT_HOSTED_V1: &str = "rtdb.owned.CommitHosted.v1";
 pub(crate) const COMMIT_OWNED_V1: &str = "rtdb.owned.Commit.v1";
 pub(crate) const COMMIT_OWNED_V2: &str = "rtdb.owned.Commit.v2";
@@ -71,6 +72,24 @@ impl<'a> CommitRequest<'a> {
         }
         Ok(Self { deadline, groups: owned_groups(body, false, matches!(format, CommitFormat::Ordered))? })
     }
+}
+
+fn owned_count_condition<'a>(call: &Call, body: &'a [u8]) -> Result<(TxOp, &'a [u8], Arc<MemoryReservation>), Status> {
+    let (relation, body) = split_relation(body)?;
+    let Some((&0, body)) = body.split_first() else {
+        return Err(invalid("Owned count bound requires the ordered-present valid clock"));
+    };
+    let (column, body) = count_component(body, 96)?;
+    let column = std::str::from_utf8(column).map_err(|_| invalid("Owned count column must be UTF-8"))?;
+    let (prefix, body) = count_component(body, 4096)?;
+    let (maximum, body) = body.split_first_chunk::<8>().ok_or_else(|| invalid("Missing owned count maximum"))?;
+    let at_most = i64::from_be_bytes(*maximum);
+    if at_most < 0 || column.starts_with('_') {
+        return Err(invalid("Invalid owned count maximum or column"));
+    }
+    let reservation = call.reserve(prefix.len() + column.len() + 1024)?;
+    let condition = TxOp::OwnedCheckCapacity { relation, column: column.into(), prefix: prefix.to_vec(), at_most };
+    Ok((condition, body, reservation))
 }
 
 fn ordered_group_count(body: &[u8]) -> Result<usize, Status> {
@@ -458,20 +477,7 @@ impl Service {
 
     pub(crate) async fn commit_owned_counted_action(&self, call: &Call, body: &[u8]) -> Result<ActionResult, Status> {
         if !self.0.config.owned_native_actions { return Err(unsupported()); }
-        let (relation, body) = split_relation(body)?;
-        let Some((&0, body)) = body.split_first() else {
-            return Err(invalid("Owned count bound requires the ordered-present valid clock"));
-        };
-        let (column, body) = count_component(body, 96)?;
-        let column = std::str::from_utf8(column).map_err(|_| invalid("Owned count column must be UTF-8"))?;
-        let (prefix, body) = count_component(body, 4096)?;
-        let (maximum, body) = body.split_first_chunk::<8>().ok_or_else(|| invalid("Missing owned count maximum"))?;
-        let at_most = i64::from_be_bytes(*maximum);
-        if at_most < 0 || column.starts_with('_') {
-            return Err(invalid("Invalid owned count maximum or column"));
-        }
-        let _condition = call.reserve(prefix.len() + column.len() + 1024)?;
-        let condition = TxOp::OwnedCheckCapacity { relation, column: column.into(), prefix: prefix.to_vec(), at_most };
+        let (condition, body, _condition) = owned_count_condition(call, body)?;
         let (witnesses, body, _framing) = self.owned_witness_prefix(call, body, true)?;
         self.commit_owned(call, body, CommitFormat::Ordered, witnesses, false, Some(condition)).await
     }
@@ -508,7 +514,7 @@ impl Service {
         Ok((witnesses, body, framing))
     }
 
-    pub(crate) async fn commit_hosted_controls_action(&self, call: &Call, body: &[u8]) -> Result<ActionResult, Status> {
+    pub(crate) async fn commit_hosted_controls_action(&self, call: &Call, body: &[u8], counted: bool) -> Result<ActionResult, Status> {
         let policy = self.0.config.hosted_controls.as_ref().ok_or_else(unsupported)?;
         if !self.0.config.owned_native_actions || call.session.placed_database() != Some(call.database.as_str())
             || call.session.caller.principal.user_id() != Some(policy.owner.as_str())
@@ -516,6 +522,12 @@ impl Service {
         {
             return Err(Status::permission_denied("Hosted controls require the installed placed writer"));
         }
+        let (condition, body, _condition_charge) = if counted {
+            let (condition, body, reservation) = owned_count_condition(call, body)?;
+            (Some(condition), body, Some(reservation))
+        } else {
+            (None, body, None)
+        };
         let (witnesses, body, _witness_charge) = self.owned_witness_prefix(call, body, true)?;
         let (deadline, body) = body.split_first_chunk::<8>().ok_or_else(|| invalid("Hosted commit has no deadline"))?;
         let deadline = Timestamp(i64::from_be_bytes(*deadline));
@@ -524,7 +536,7 @@ impl Service {
             .ok_or_else(|| invalid("Hosted fact group stream is truncated"))?;
         let fact_groups = ordered_group_count(facts)?;
         let _framing = call.reserve((fact_groups + MAX_COMMIT_GROUPS) * 512)?;
-        let facts = owned_groups(facts, true, true)?;
+        let facts = owned_groups(facts, false, true)?;
         let controls = owned_groups(controls, true, false)?;
         let fact_relations = facts.iter().map(|(relation, _)| relation).collect::<BTreeSet<_>>();
         if fact_relations.len() + controls.len() > MAX_COMMIT_GROUPS
@@ -541,6 +553,7 @@ impl Service {
 
         let mut rows_left = MAX_GROUPED_COMMIT_ROWS;
         let mut writes = vec![TxOp::OwnedDeadline { until: deadline }];
+        writes.extend(condition);
         let _facts = self.decode_owned_commit_groups(call, facts, &mut writes, &mut rows_left, false)?;
         let mut held = Vec::with_capacity(controls.len());
         for (relation, arrow) in controls {
@@ -549,7 +562,8 @@ impl Service {
             let schema = batch.batch().schema_ref();
             let exact_type = |name, kind| schema.field_with_name(name).is_ok_and(|field| field.data_type() == &kind);
             let unique = schema.fields().iter().map(|field| field.name()).collect::<BTreeSet<_>>();
-            if rows == 0 || unique.len() != schema.fields().len() || schema.fields().len() > 130
+            if rows == 0 || unique.len() != schema.fields().len() || schema.fields().len() > 131
+                || (schema.index_of("_check_only").is_ok() && !exact_type("_check_only", DataType::Boolean))
                 || !exact_type("_id", DataType::Utf8) || !exact_type("_expected_micros", DataType::Int64)
             {
                 return Err(invalid("Hosted controls require distinct fields, Utf8 IDs and explicit Int64 expectations"));
@@ -565,7 +579,16 @@ impl Service {
                     Some(Value::Null) => None,
                     _ => return Err(invalid("Hosted control expectation must be Int64 or null")),
                 };
-                let control = rtdb_tx::HostedControlWrite::new(relation.clone(), scope, expected, row).map_err(status)?;
+                let check_only = match row.remove("_check_only") {
+                    Some(Value::Bool(check_only)) => check_only,
+                    None => false,
+                    _ => return Err(invalid("Hosted control check flag must be Boolean")),
+                };
+                let control = if check_only {
+                    rtdb_tx::HostedControlWrite::check(relation.clone(), scope, expected, row)
+                } else {
+                    rtdb_tx::HostedControlWrite::new(relation.clone(), scope, expected, row)
+                }.map_err(status)?;
                 writes.push(TxOp::HostedControl(control));
             }
             held.push((reservation, documents));

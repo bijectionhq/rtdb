@@ -9,7 +9,7 @@ pub(crate) fn admits_name(name: &str) -> bool {
     name.starts_with("bj_") && !name.contains('-') && OwnedRelation::new(name).is_ok()
 }
 
-/// A checked replacement of one installed hosted control row.
+/// An assertion or checked replacement of one installed hosted control row.
 #[derive(Clone, Debug)]
 pub struct HostedControlWrite {
     relation: OwnedRelation,
@@ -17,6 +17,7 @@ pub struct HostedControlWrite {
     id: EntityId,
     expected: Option<Timestamp>,
     document: StructFields<Value>,
+    check_only: bool,
 }
 
 impl HostedControlWrite {
@@ -47,11 +48,30 @@ impl HostedControlWrite {
             id,
             expected,
             document,
+            check_only: false,
         };
         if result.retained_bytes()? > 1024 * 1024 {
             return Err(invalid());
         }
         Ok(result)
+    }
+
+    pub fn check(
+        relation: OwnedRelation,
+        scope: PlacedAttemptScope,
+        expected: Option<Timestamp>,
+        document: StructFields<Value>,
+    ) -> Result<Self> {
+        if document.len() != 1 {
+            return Err(invalid());
+        }
+        let mut result = Self::new(relation, scope, expected, document)?;
+        result.check_only = true;
+        Ok(result)
+    }
+
+    pub(crate) fn is_check(&self) -> bool {
+        self.check_only
     }
 
     pub(crate) fn name(&self) -> &str {
@@ -70,8 +90,8 @@ impl HostedControlWrite {
     pub fn expected(&self) -> Option<Timestamp> {
         self.expected
     }
-    pub fn document(&self) -> &StructFields<Value> {
-        &self.document
+    pub fn replacement(&self) -> Option<&StructFields<Value>> {
+        (!self.check_only).then_some(&self.document)
     }
 
     pub fn retained_bytes(&self) -> Result<usize> {

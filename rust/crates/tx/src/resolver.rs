@@ -298,7 +298,7 @@ impl TxResolver {
         tx.write_result(&result, request.options.user_metadata.as_ref())?;
         if let Some(attempt) = attempt {
             let controls = request.operations.iter().filter_map(|operation| match operation {
-                Operation::Public(TxOp::HostedControl(control)) if result.committed() => Some(control.name()),
+                Operation::Public(TxOp::HostedControl(control)) if result.committed() && !control.is_check() => Some(control.name()),
                 _ => None,
             }).collect();
             tx.write_attempt_outcome(attempt, log_time, controls)?;
@@ -670,8 +670,11 @@ impl<'a> OpenTransaction<'a> {
             Operation::Public(TxOp::OwnedDeclareSearchPath { relation, name, column }) =>
                 self.declare_owned_path(relation, name, std::slice::from_ref(column), true).await,
             Operation::Public(TxOp::HostedControl(control)) => {
-                let valid = interval(Timestamp(0), Timestamp::MAX)?;
-                self.buffer.put(control.table(), control.document().clone(), valid)
+                if let Some(replacement) = control.replacement() {
+                    let valid = interval(Timestamp(0), Timestamp::MAX)?;
+                    self.buffer.put(control.table(), replacement.clone(), valid)?;
+                }
+                Ok(())
             }
             Operation::Public(TxOp::OwnedDeadline { .. } | TxOp::OwnedCheckWorldScope { .. } | TxOp::OwnedCheckRange { .. } | TxOp::OwnedCheckCapacity { .. } | TxOp::OwnedCheck { .. }) => Ok(()),
             Operation::Public(TxOp::OwnedErase { relation, id }) =>

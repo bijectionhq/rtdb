@@ -1206,18 +1206,31 @@ async fn hosted_control_replacement_and_owned_facts_abort_together() {
     assert_eq!(stale.result().error().unwrap().code, "rtdb.hosted/stale-control");
     assert!(!stale.writes().tables().contains_key(&facts.table("owner")));
 
-    let accepted = resolver.resolve_source(state.snapshot(), SourcePosition(2), Timestamp(102),
+    let check = |expected| TxOp::HostedControl(rtdb_tx::HostedControlWrite::check(
+        control.clone(), scope, Some(Timestamp(expected)),
+        StructFields::from([("_id".into(), Value::Utf8("head".into()))]),
+    ).unwrap());
+    let verified = resolver.resolve_source(state.snapshot(), SourcePosition(2), Timestamp(102),
+        source(vec![deadline(), check(100)]), &context).await.unwrap();
+    assert!(verified.result().committed(), "{:?}", verified.result().error());
+    assert!(!verified.writes().tables().contains_key(&table));
+    let changed = resolver.resolve_source(state.snapshot(), SourcePosition(3), Timestamp(103),
+        source(vec![deadline(), check(101), native_fact()]), &context).await.unwrap();
+    assert_eq!(changed.result().error().unwrap().code, "rtdb.hosted/stale-control");
+    assert!(!changed.writes().tables().contains_key(&facts.table("owner")));
+
+    let accepted = resolver.resolve_source(state.snapshot(), SourcePosition(4), Timestamp(104),
         source(vec![deadline(), replacement(100, 2), native_fact()]), &context).await.unwrap();
     assert!(accepted.result().committed(), "{:?}", accepted.result().error());
     assert!(accepted.writes().tables().contains_key(&table));
     assert!(accepted.writes().tables().contains_key(&facts.table("owner")));
     let replica = accepted.to_replica_body(&context.memory).unwrap();
     let rtdb_format::envelope::ReplicaBody::ResolvedTx(message) = replica.body() else { panic!("expected a resolved replica transaction"); };
-    let replayed = rtdb_tx::decode_replica(message, Some(stale.result().tx_key()), accepted.writes().block_index(), &context.memory).unwrap();
+    let replayed = rtdb_tx::decode_replica(message, Some(changed.result().tx_key()), accepted.writes().block_index(), &context.memory).unwrap();
     assert!(replayed.writes.tables().contains_key(&table));
     assert!(replayed.writes.tables().contains_key(&facts.table("owner")));
-    let refused = resolver.resolve_source(state.snapshot(), SourcePosition(3), Timestamp(103),
-        source(vec![deadline(), replacement(102, 3), native_fact()]), &context).await.unwrap();
+    let refused = resolver.resolve_source(state.snapshot(), SourcePosition(5), Timestamp(105),
+        source(vec![deadline(), replacement(104, 3), native_fact()]), &context).await.unwrap();
     assert!(!refused.result().committed());
     assert!(!refused.writes().tables().contains_key(&table));
 }
