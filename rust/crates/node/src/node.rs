@@ -983,6 +983,7 @@ pub struct OwnedReadSession {
     present: TransactionKey,
     witness_scope: Option<rtdb_types::PlacedAttemptScope>,
     witness_until: Timestamp,
+    fork_until: Timestamp,
     cancellation: CancellationToken,
     session_cancellation: CancellationToken,
     historical: Option<historical_owned_read::Scope>,
@@ -992,6 +993,19 @@ pub struct OwnedReadSession {
 
 impl OwnedReadSession {
     pub fn present(&self) -> TransactionKey { self.present }
+
+    pub async fn fork_cut(&self, scope: rtdb_types::PlacedAttemptScope) -> Result<(Timestamp, Timestamp)> {
+        self.admit_access().await?;
+        let attached_scope = self.attachment.upgrade()
+            .and_then(|database| database.await_authority.codec().map(|codec| codec.scope()));
+        if attached_scope != Some(scope) || self.node.now() >= self.fork_until {
+            return Err(rtdb_types::OwnedWorld::unavailable());
+        }
+        if let Some(historical) = &self.historical {
+            self.check_relations(&historical.relations)?;
+        }
+        Ok((self.system_time(), self.fork_until))
+    }
 
     pub fn system_time(&self) -> Timestamp {
         self.historical.as_ref().map_or(self.present.system_time, |scope| scope.system_time)
@@ -1473,6 +1487,16 @@ impl OwnedWorldPointWitness {
     }
 }
 
+pub struct OwnedWorldFork {
+    pub world: rtdb_types::Iid,
+    pub basis: Timestamp,
+    pub deadline: Timestamp,
+    pub scope: rtdb_types::PlacedAttemptScope,
+    pub attempt: String,
+    pub fingerprint: [u8; 32],
+    pub controls: Vec<rtdb_tx::HostedControlWrite>,
+}
+
 pub struct OwnedWorldWrite {
     pub relation: rtdb_types::OwnedRelation,
     pub id: rtdb_types::EntityId,
@@ -1490,6 +1514,23 @@ impl NativeSession {
     /// Identifies the placed replica history of this authenticated attachment.
     pub fn placed_history(&self) -> Result<Option<rtdb_types::PlacedAttemptScope>> {
         Ok(self.service.database()?.await_authority.codec().map(|codec| codec.scope()))
+    }
+
+    pub async fn register_owned_world_checked(
+        &mut self, record: &rtdb_types::OwnedWorld, fork: OwnedWorldFork,
+    ) -> Result<TransactionResult> {
+        let until = fork.deadline.min(record.until);
+        if record.id != fork.world || record.basis.system_time != fork.basis || fork.controls.is_empty()
+            || fork.controls.len() > 4093 || fork.controls.iter().any(|control| !control.is_check())
+            || self.placed_history()? != Some(fork.scope)
+        {
+            return Err(rtdb_types::OwnedWorld::unavailable());
+        }
+        let mut ops = Vec::with_capacity(fork.controls.len() + 2);
+        ops.push(TxOp::OwnedDeadline { until });
+        ops.extend(fork.controls.into_iter().map(TxOp::HostedControl));
+        ops.push(TxOp::OwnedForkWorld { record: record.record(), attempt: fork.attempt, fingerprint: fork.fingerprint });
+        self.state.execute_tx(ops, Default::default()).await
     }
 
     pub async fn register_owned_world(&mut self, record: &rtdb_types::OwnedWorld) -> Result<TransactionResult> {
@@ -1630,7 +1671,7 @@ impl NativeSession {
         }));
         context.check_cancelled()?;
         Ok(OwnedReadSession {
-            context, node, identity, database, owner, present, witness_scope, witness_until,
+            context, node, identity, database, owner, present, witness_scope, witness_until, fork_until: witness_until,
             cancellation, session_cancellation, historical: None, attachment: placement, _reservation: charge,
         })
     }

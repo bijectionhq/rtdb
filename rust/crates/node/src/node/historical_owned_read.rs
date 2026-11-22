@@ -96,6 +96,7 @@ impl OwnedReadSession {
             present: self.present,
             witness_scope: None,
             witness_until: selected,
+            fork_until: self.fork_until,
             cancellation,
             session_cancellation: self.session_cancellation.clone(),
             attachment: self.attachment.clone(),

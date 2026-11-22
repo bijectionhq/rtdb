@@ -59,6 +59,7 @@ impl Service {
                     Ok(Vec::new())
                 }
                 crate::owned_actions::READ_WORLD_POINT_V1 => Ok(vec![Ok(self.read_world_point_action(&call, &action.body).await?)]),
+                crate::owned_actions::FORK_HELD_WORLD_V1 => Ok(vec![Ok(self.fork_held_world_action(&call, &action.body).await?)]),
                 crate::owned_actions::FORK_WORLD_V1 => Ok(vec![Ok(self.fork_world_action(&call, &action.body, false).await?)]),
                 crate::owned_actions::FORK_WORLD_V2 => Ok(vec![Ok(self.fork_world_action(&call, &action.body, true).await?)]),
                 crate::owned_actions::COMMIT_WORLD_V1 => Ok(vec![Ok(self.commit_world_action(&call, &action.body, crate::owned_actions::WorldCommitFormat::Overlay).await?)]),

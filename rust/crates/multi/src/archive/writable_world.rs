@@ -109,6 +109,17 @@ pub(crate) async fn fork_checkpoint_world_at(
     until: Timestamp,
     resources: CheckpointReadResources<'_>,
 ) -> Result<Uuid> {
+    let (world, _) = fork_checkpoint_world_selected(
+        directory, archive, keys, hosted_task, session, deployment_id, capture, suffix, until, resources, None,
+    ).await?;
+    Ok(world)
+}
+
+pub(crate) async fn fork_checkpoint_world_selected(
+    directory: &dyn Directory, archive: &CellStorage, keys: &dyn KeyService, hosted_task: Option<&HostedTask>,
+    session: &mut NativeSession, deployment_id: Uuid, capture: Uuid, suffix: Option<Uuid>,
+    until: Timestamp, resources: CheckpointReadResources<'_>, fork: Option<rtdb_node::OwnedWorldFork>,
+) -> Result<(Uuid, TransactionKey)> {
     let owner = session
         .state()
         .user()
@@ -150,7 +161,11 @@ pub(crate) async fn fork_checkpoint_world_at(
     drop(live);
     let parent = CheckpointReadWorld { deployment: deployment_id, capture, manifest_sha256: manifest, suffix, basis };
 
-    let id = Uuid::new_v4();
+    if fork.as_ref().is_some_and(|fork| fork.basis != basis.system_time) {
+        return Err(OwnedWorld::unavailable());
+    }
+    let id = fork.as_ref().map_or_else(Uuid::new_v4, |fork| Uuid::from_bytes(fork.world.0));
+    if id.is_nil() { return Err(OwnedWorld::unavailable()); }
     let retained = CheckpointWorldRetention {
         owner,
         capture: parent.capture,
@@ -170,15 +185,16 @@ pub(crate) async fn fork_checkpoint_world_at(
         }
         admit_capture(record, archive, &parent)?;
         let now = now();
-        if until <= now {
+        if until <= now || fork.as_ref().is_some_and(|fork| fork.deadline <= now || Some(fork.scope) != scope) {
             return Err(OwnedWorld::unavailable());
         }
         record
             .checkpoint_worlds
             .retain(|_, world| world.until > now);
-        if record.checkpoint_worlds.len() >= MAX_RETAINED_WORLDS
-            || record.checkpoint_worlds.contains_key(&id)
-        {
+        if let Some(existing) = record.checkpoint_worlds.get(&id) {
+            return if fork.is_some() && existing == &retained { Ok(()) } else { Err(OwnedWorld::unavailable()) };
+        }
+        if record.checkpoint_worlds.len() >= MAX_RETAINED_WORLDS {
             return Err(OwnedWorld::unavailable());
         }
         record.checkpoint_worlds.insert(id, retained.clone());
@@ -186,16 +202,25 @@ pub(crate) async fn fork_checkpoint_world_at(
     })
     .await?;
     admit_session(session, &installed, &retained.owner)?;
-    let outcome = session
-        .register_owned_world(&world_record(id, &retained, schemas))
-        .await?;
+    let registration = world_record(id, &retained, schemas);
+    let checked = fork.is_some();
+    let outcome = if let Some(fork) = fork {
+        session.register_owned_world_checked(&registration, fork).await?
+    } else {
+        session.register_owned_world(&registration).await?
+    };
     if !outcome.committed() {
+        // A competing retry can already have published this checked world.
+        // Keep its exact pin available for recovery until drop or expiry.
+        if !checked {
+            let _ = retire_world_pin(directory, &deployment, id, &retained, installed.incarnation, installed.log_epoch).await;
+        }
         return Err(outcome
             .error()
             .cloned()
             .unwrap_or_else(OwnedWorld::unavailable));
     }
-    Ok(id)
+    Ok((id, outcome.tx_key()))
 }
 
 fn matches_retention(world: &OwnedWorld, retained: &CheckpointWorldRetention) -> bool {

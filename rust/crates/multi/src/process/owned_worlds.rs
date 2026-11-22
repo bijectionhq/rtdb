@@ -8,7 +8,7 @@ use rtdb_types::{EntityId, Interval, OwnedRelation, OwnedWorld, Result, Timestam
 use uuid::Uuid;
 
 use crate::{
-    archive::{CheckpointReadResources, HeldCheckpointWorld, WorldArchive, open_held_checkpoint_world, commit_checkpoint_world_checked, drop_checkpoint_world, fork_checkpoint_world_at, read_checkpoint_world_point},
+    archive::{CheckpointReadResources, HeldCheckpointWorld, WorldArchive, open_held_checkpoint_world, commit_checkpoint_world_checked, drop_checkpoint_world, fork_checkpoint_world_at, fork_checkpoint_world_selected, read_checkpoint_world_point},
     capability::attachment_storage,
     deployment::CellStorage,
     keys::KeyService,
@@ -86,6 +86,20 @@ impl OwnedWorldHost for PlacedWorldHost {
             };
             fork_checkpoint_world_at(self.directory.as_ref(), &self.storage, self.keys.as_ref(), self.hosted_task.as_ref(),
                 call.session, deployment, capture, suffix, until, resources).await
+        })
+    }
+
+    fn fork_world_checked<'a>(
+        &'a self, call: WorldCall<'a>, capture: Uuid, suffix: Option<Uuid>, until: Timestamp, fork: rtdb_node::OwnedWorldFork,
+    ) -> BoxFuture<'a, Result<(Uuid, TransactionKey)>> {
+        Box::pin(async move {
+            let deployment = self.deployment(&call)?;
+            let resources = CheckpointReadResources {
+                node: &self.options, memory: call.node.memory(),
+                cache: Arc::clone(call.node.cache_budget()), cancellation: call.cancellation,
+            };
+            fork_checkpoint_world_selected(self.directory.as_ref(), &self.storage, self.keys.as_ref(),
+                self.hosted_task.as_ref(), call.session, deployment, capture, suffix, until, resources, Some(fork)).await
         })
     }
 

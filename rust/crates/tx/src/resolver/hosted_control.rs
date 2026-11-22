@@ -33,6 +33,7 @@ impl OpenTransaction<'_> {
                 Operation::Public(
                     TxOp::OwnedDeadline { .. }
                         | TxOp::OwnedCheck { .. }
+                        | TxOp::OwnedForkWorld { .. }
                         | TxOp::OwnedCheckRange { .. }
                         | TxOp::OwnedCheckCapacity { .. }
                         | TxOp::OwnedInsertDocs { .. }
