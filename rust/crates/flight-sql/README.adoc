@@ -511,3 +511,25 @@ When the declaration and valid instant match and `after` is absent, the exact wi
 The ordered resolver validates both old and new full keys through at most 64 intervening dense journal groups.
 A group omits exact sides when its relevant IDs or keys fall outside the supported type or byte limits, or when its evidence could not be captured.
 The relation-frontier check still applies to moving-valid reads, continuation reads, and reads whose exact witness or intervening coverage is unavailable.
+
+=== Committing checked hosted control rows with owned facts
+
+`rtdb.owned.CommitHosted.v1` is enabled only for a live placed connection authenticated as `flightSql.hostedControls.owner` with `flightSql.ownedNativeActions` enabled.
+The operator's `flightSql.hostedControls.relations` sequence names the admitted ordinary `public.bj_*` tables.
+The body begins with the Commit.v3 unsigned Int16 big-endian witness count (zero to 32) and its 16-byte held handle plus 16-byte nonce pairs.
+Then come the signed Int64 big-endian exclusive deadline, an unsigned Int32 big-endian byte length, that many bytes of Commit.v2 fact groups, then the hosted control groups.
+Each section uses the Commit.v2 relation-group sequence framing and both must contain at least one group.
+At most 32 total groups and 4096 total rows are accepted.
+
+Each control group contains one terminated Arrow batch with distinct field names.
+Every row has `_id: Utf8`, `_expected_micros: Int64?`, and a complete replacement image in the already installed ordinary column types.
+A null expectation requires exact absence.
+An existing row must contribute one exact valid slice from epoch to infinity at the ordered base.
+Control replacements use the same epoch-to-infinity interval.
+The resolver checks all control and fact observations before any mutation and aborts both sets of effects on failure.
+Use an absent-checked unique receipt key as one of the writes when the host needs to recover an indeterminate response.
+The response is the ordinary committed transaction-key row.
+
+This action supports checked replacement and exact absence insertion for hosted controls.
+Other control effects, including arbitrary SQL, computed values, deletes, relabeling and temporal splits, are outside this action.
+Generic SQL keeps the existing private relation boundary.

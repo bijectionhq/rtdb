@@ -19,6 +19,7 @@ use crate::replay_submission::{ReplaySubmission, duplicate_replay, is_replay_tab
 use crate::values::{BoundArgumentRow, IngestMode, plain_scalar_field};
 use crate::{ArrowDocuments, SourceTransaction, SubmitOptions, TransactionResult, TxOp, UserMetadata, source::{Operation, SourceGuard, decode_arguments, is_reserved_write_schema, table_name}};
 
+mod hosted_control;
 mod fixed_range;
 mod owned_capacity;
 use owned_capacity::OwnedCapacityChanges;
@@ -171,7 +172,7 @@ impl TxResolver {
         let error = crate::RetainedAnomaly::new(Anomaly::fault("xtdb/skipped-tx", "Transaction was skipped"), &context.memory)?;
         let result = TransactionResult::Aborted { tx_key: key, error: Some(error) };
         tx.write_result(&result, None)?;
-        if let Some(attempt) = attempt { tx.write_attempt_outcome(attempt, log_time)?; }
+        if let Some(attempt) = attempt { tx.write_attempt_outcome(attempt, log_time, Default::default())?; }
         self.stage(tx.buffer.stage()?, result, attempt.map_or(ResolvedInput::Position(position), ResolvedInput::Placed), None, None, context)
     }
 
@@ -292,7 +293,13 @@ impl TxResolver {
             Err(error) => return Err(error),
         };
         tx.write_result(&result, request.options.user_metadata.as_ref())?;
-        if let Some(attempt) = attempt { tx.write_attempt_outcome(attempt, log_time)?; }
+        if let Some(attempt) = attempt {
+            let controls = request.operations.iter().filter_map(|operation| match operation {
+                Operation::Public(TxOp::HostedControl(control)) if result.committed() => Some(control.name()),
+                _ => None,
+            }).collect();
+            tx.write_attempt_outcome(attempt, log_time, controls)?;
+        }
         context.check_cancelled()?;
         self.stage(tx.buffer.stage()?, result, attempt.map_or(ResolvedInput::Position(position), ResolvedInput::Placed), None, None, context)
     }
@@ -489,13 +496,17 @@ impl<'a> OpenTransaction<'a> {
         self.buffer.put(receipts_table(), document, interval(key.system_time, expires)?)
     }
 
-    fn write_attempt_outcome(&mut self, attempt: PlacedAttempt, log_time: Timestamp) -> Result<()> {
+    fn write_attempt_outcome(&mut self, attempt: PlacedAttempt, log_time: Timestamp, controls: std::collections::BTreeSet<&str>) -> Result<()> {
         let key = self.tx_key();
-        let document = StructFields::from([
+        let mut document = StructFields::from([
             ("_id".into(), Value::Utf8(attempt.outcome_key())),
             ("tx_id".into(), Value::I64(key.tx_id.0)),
             ("tx_system_time".into(), time_value(key.system_time)),
         ]);
+        if !controls.is_empty() {
+            document.insert(crate::hosted_control::CONTROL_TABLES.into(),
+                Value::List(controls.into_iter().map(|name| Value::Utf8(name.into())).collect()));
+        }
         let expires = Timestamp(log_time.0.saturating_add(RECEIPT_WINDOW_MICROS));
         self.buffer.put(TableRef::new("xt", PLACED_ATTEMPT_OUTCOME_TABLE), document, interval(log_time, expires)?)
     }
@@ -655,6 +666,10 @@ impl<'a> OpenTransaction<'a> {
                 self.declare_owned_path(relation, name, columns, false).await,
             Operation::Public(TxOp::OwnedDeclareSearchPath { relation, name, column }) =>
                 self.declare_owned_path(relation, name, std::slice::from_ref(column), true).await,
+            Operation::Public(TxOp::HostedControl(control)) => {
+                let valid = interval(Timestamp(0), Timestamp::MAX)?;
+                self.buffer.put(control.table(), control.document().clone(), valid)
+            }
             Operation::Public(TxOp::OwnedDeadline { .. } | TxOp::OwnedCheckWorldScope { .. } | TxOp::OwnedCheckRange { .. } | TxOp::OwnedCheck { .. }) => Ok(()),
             Operation::Public(TxOp::OwnedErase { relation, id }) =>
                 self.erase_owned(relation, id).await,
@@ -864,6 +879,7 @@ impl<'a> OpenTransaction<'a> {
         if deadline.is_some_and(|until| self.tx_key().system_time >= until) {
             return Err(Anomaly::new(AnomalyCategory::Conflict, "rtdb.owned/expired", "Owned transaction reached its deadline before ordering"));
         }
+        self.check_hosted_controls(operations, source_scope).await?;
         for operation in operations {
             if let Operation::Public(TxOp::OwnedCheckWorldScope { scope }) = operation {
                 if self.owned_world.is_none() || deadline.is_none()

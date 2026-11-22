@@ -93,6 +93,9 @@
 -- A declared fixed-valid Binary and Utf8 identity path journals both old and new covered keys at the authored instant.
 -- A held full-span fixed witness permits intervening relation writes only when every covered journal side lies outside its bounds.
 -- Missing exact evidence leaves relation-frontier validation in force.
+-- An admitted placed hosted writer may replace checked ordinary control rows with owned root facts in one ordered transaction.
+-- Exact control identities and expected revisions are checked at the ordered base before either set of writes.
+-- A failed control or fact operation publishes neither set of effects.
 -- Held reads require the original session and attachment and refuse after expiry, lease loss, or closure.
 -- At the admitted system cut, a held root valid window returns ordered non-overlapping winning slices clipped at the requested endpoints.
 -- Fully covered range counts and completed head valid windows can issue relation-frontier evidence under the same placed lease as range pages.

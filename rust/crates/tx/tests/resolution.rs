@@ -1162,3 +1162,62 @@ async fn owned_world_conditions_distinguish_local_absence_from_a_tombstone_revis
         source(commands(scope, 150, condition(revision), write(present()))), &context).await.unwrap();
     assert!(changed.result().committed());
 }
+
+#[tokio::test]
+async fn hosted_control_replacement_and_owned_facts_abort_together() {
+    use rtdb_format::envelope::SourceMessage;
+    use rtdb_types::{OwnedRelation, PlacedAttemptScope};
+
+    let mut context = context();
+    let scope = PlacedAttemptScope::new("installed-replica", 1).unwrap();
+    context.owned_witness_scope = Some(scope);
+    let state = PartitionState::empty(Default::default()).unwrap();
+    let facts = OwnedRelation::new("facts").unwrap();
+    let control = OwnedRelation::new("bj_control").unwrap();
+    let table = rtdb_types::TableRef::new("public", control.name());
+    let control_row = |n| StructFields::from([
+        ("_id".into(), Value::Utf8("head".into())), ("n".into(), Value::I64(n)),
+    ]);
+    let native_fact = || TxOp::OwnedInsertDocs {
+        relation: facts.clone(), documents: Documents::new(vec![document(7)], &context.memory).unwrap(),
+        valid_from: None, valid_to: None,
+    };
+    let replacement = |expected, n| TxOp::HostedControl(rtdb_tx::HostedControlWrite::new(
+        control.clone(), scope, Some(Timestamp(expected)), control_row(n),
+    ).unwrap());
+    let source = |operations| {
+        let request = SourceTransaction::new(
+            operations, SubmitOptions { user: Some("owner".into()), ..SubmitOptions::default() }, &context.memory,
+        ).unwrap().with_placed_seed(Some(scope.issue()));
+        let encoded = request.encode().unwrap();
+        let message = SourceMessage::decode(encoded.as_slice()).unwrap().unwrap();
+        SourceTransaction::decode(&message, &context.memory).unwrap()
+    };
+    let mut resolver = TxResolver::new(None, SourcePosition(-1), None, &context.memory).unwrap();
+    let initial = resolver.resolve_source(state.snapshot(), SourcePosition(0), Timestamp(100),
+        source(vec![TxOp::PutDocs {
+            table: table.clone(), documents: Documents::new(vec![control_row(1)], &context.memory).unwrap(),
+            valid_from: Some(Timestamp(0)), valid_to: None,
+        }]), &context).await.unwrap();
+    assert!(initial.result().committed());
+    let deadline = || TxOp::OwnedDeadline { until: Timestamp(200) };
+    let stale = resolver.resolve_source(state.snapshot(), SourcePosition(1), Timestamp(101),
+        source(vec![deadline(), replacement(99, 2), native_fact()]), &context).await.unwrap();
+    assert_eq!(stale.result().error().unwrap().code, "rtdb.hosted/stale-control");
+    assert!(!stale.writes().tables().contains_key(&facts.table("owner")));
+
+    let accepted = resolver.resolve_source(state.snapshot(), SourcePosition(2), Timestamp(102),
+        source(vec![deadline(), replacement(100, 2), native_fact()]), &context).await.unwrap();
+    assert!(accepted.result().committed(), "{:?}", accepted.result().error());
+    assert!(accepted.writes().tables().contains_key(&table));
+    assert!(accepted.writes().tables().contains_key(&facts.table("owner")));
+    let replica = accepted.to_replica_body(&context.memory).unwrap();
+    let rtdb_format::envelope::ReplicaBody::ResolvedTx(message) = replica.body() else { panic!("expected a resolved replica transaction"); };
+    let replayed = rtdb_tx::decode_replica(message, Some(stale.result().tx_key()), accepted.writes().block_index(), &context.memory).unwrap();
+    assert!(replayed.writes.tables().contains_key(&table));
+    assert!(replayed.writes.tables().contains_key(&facts.table("owner")));
+    let refused = resolver.resolve_source(state.snapshot(), SourcePosition(3), Timestamp(103),
+        source(vec![deadline(), replacement(102, 3), native_fact()]), &context).await.unwrap();
+    assert!(!refused.result().committed());
+    assert!(!refused.writes().tables().contains_key(&table));
+}
