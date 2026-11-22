@@ -283,6 +283,8 @@ It also exercises the Azure adapter against a loopback provider and separately m
 * `tla/HostedTrieRelease.tla` checks the ordering from installed receipt through admission floor to queued release, with one older reader and a restart during handoff.
   Apalache independently checks the safety conjunction and loss of the pending plan.
   `lean/HostedTrieRelease.lean` checks release authority and complete accounting for arbitrary file plans over finite histories.
+* `tla/ResidenceComposition.tla` models snapshot admission, log trimming, exact-version retirement and whole-residence disposal in a common state.
+  Its controls test cross-domain dependencies, including a canceled query's provider read, an older recovery cursor, fork publication and transfer before erasure.
 * `tla/ResidenceRetirement.tla` composes durable intent and exact-identity deletion with a serving view, an in-flight provider request, a recovery cursor, a checkpoint, and a fork.
   It includes three generations, one shared file, one pair of physical versions of a logical key, and one delayed deletion grant per file.
   Its controls drop each hold or fence independently and include loss of a durable intent both before and after installation.

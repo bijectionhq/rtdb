@@ -27,7 +27,26 @@ Every recent real defect was compositional: cross-node reader stranding with eve
 - Storage reads already pass through one admission point (`IoRegion::admit` in `rust/crates/storage/src/io_region.rs`), where today's read lease is checked; that is the natural place for the held-view capability.
 - Peers recently reserved stack for nested page cursors and recursive column pruning (`4ffa2cf02`, `ea739f696`).
 - The bounded placed serving, custody and key enrollment models cover target transitions.
-- A composed authority model and production trace checker remain open.
+- The first composed authority model covers snapshot, checkpoint, replay, fork and storage retirement. Production trace validation and the remaining authority domains are open.
+
+## Composed storage and recovery
+
+[ResidenceComposition](../tla/ResidenceComposition.tla) uses one state for the serving catalog, installed checkpoint, admitted query, provider read, recovery cursor, shared fork and directory phase.
+A provider read retains its own dependency after the query closes.
+An installed successor updates the trim bound, while an admitted recovery keeps the older suffix and publications readable.
+The retirement transition needs the floor and all applicable dependencies before it can remove one immutable publication.
+Whole-residence disposal requires the provider read to drain, excludes fork publication, preserves the published fork's dependencies in its own store, and confirms source absence before settlement.
+
+The bounded model has two catalog cuts, three publications, one query, one in-flight provider read, one recovery cursor and one fork.
+TLC explored 845 distinct states. Eight weakened rules violate the corresponding composed invariant.
+The reachability cases cover exact reclamation while a current query is open and whole-residence settlement after a trim and fork copy.
+Apalache independently checks the conjunction and the trim control.
+See the [runner](../README.adoc#_run_the_studies) for reproduction.
+
+In this slice, directory changes are atomic and publication identity remains stable across retries.
+The model abstracts the network, staging retries, multiple simultaneous holds per kind, bitemporal resolution, key revocation and application-level receipt publication.
+A native event trace must supply the actual cut, provider identity and directory permit used at each decision.
+A model counterexample to a weakened rule shows why the rule matters for the modeled system.
 
 ## Handoff notes
 

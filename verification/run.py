@@ -2525,6 +2525,27 @@ TLA_CASES = (
     ("CatalogAdmissionFloor", "catalog-floor-failover-witness", (
         "INVARIANTS CoveredByReceipt HeldViewAdmissible",
         "INVARIANT FreshReadAfterFailoverWitness"), "FreshReadAfterFailoverWitness"),
+    ("ResidenceComposition", "residence-composition", None, None),
+    ("ResidenceComposition", "residence-composition-admit-below-floor",
+     ('Mutation = "none"\nINVARIANT Safe', 'Mutation = "admit_below_floor"\nINVARIANT RetainedCutsReadable'), "RetainedCutsReadable"),
+    ("ResidenceComposition", "residence-composition-ignore-recovery",
+     ('Mutation = "none"\nINVARIANT Safe', 'Mutation = "ignore_recovery"\nINVARIANT RetainedCutsReadable'), "RetainedCutsReadable"),
+    ("ResidenceComposition", "residence-composition-trim-ignores-recovery",
+     ('Mutation = "none"\nINVARIANT Safe', 'Mutation = "trim_ignores_recovery"\nINVARIANT ReplaySurvivesTrim'), "ReplaySurvivesTrim"),
+    ("ResidenceComposition", "residence-composition-publish-after-close",
+     ('Mutation = "none"\nINVARIANT Safe', 'Mutation = "publish_after_close"\nINVARIANT PublicationRespectsClose'), "PublicationRespectsClose"),
+    ("ResidenceComposition", "residence-composition-remove-by-path",
+     ('Mutation = "none"\nINVARIANT Safe', 'Mutation = "remove_by_path"\nINVARIANT RetainedCutsReadable'), "RetainedCutsReadable"),
+    ("ResidenceComposition", "residence-composition-dispose-before-drain",
+     ('Mutation = "none"\nINVARIANT Safe', 'Mutation = "dispose_before_drain"\nINVARIANT ClosedAfterDrain'), "ClosedAfterDrain"),
+    ("ResidenceComposition", "residence-composition-erase-before-copy",
+     ('Mutation = "none"\nINVARIANT Safe', 'Mutation = "erase_before_copy"\nINVARIANT ForkReadable'), "ForkReadable"),
+    ("ResidenceComposition", "residence-composition-settle-before-absence",
+     ('Mutation = "none"\nINVARIANT Safe', 'Mutation = "settle_before_absence"\nINVARIANT ReceiptConfirmsAbsence'), "ReceiptConfirmsAbsence"),
+    ("ResidenceComposition", "residence-composition-retirement-witness",
+     ("INVARIANT Safe", "INVARIANT NeverReclaimsWhileCurrentQueryOpen"), "NeverReclaimsWhileCurrentQueryOpen"),
+    ("ResidenceComposition", "residence-composition-disposal-witness",
+     ("INVARIANT Safe", "INVARIANT NeverDisposesAfterTrimAndForkCopy"), "NeverDisposesAfterTrimAndForkCopy"),
     ("ResidenceRetirement", "residence-retirement", None, None),
     ("ResidenceRetirement", "residence-early-reply",
      ('Mutation = "none"', 'Mutation = "reply_before_install"'), "ReceiptCoversInstalled"),
@@ -2801,6 +2822,10 @@ def verify_apalache(args, scratch):
         args, scratch, "CatalogAdmissionFloor", "catalog-floor-without-cas", "HeldViewAdmissible", 8,
         ('Mutation = "none"', 'Mutation = "floor_without_cas"'), "a stale floor write crosses a reader admission",
     )
+    check_apalache(args, scratch, "ResidenceComposition", "residence-composition", "Safe", 11)
+    check_apalache(args, scratch, "ResidenceComposition", "residence-composition-trim-ignores-recovery", "ReplaySurvivesTrim", 8,
+                   ('Mutation = "none"', 'Mutation = "trim_ignores_recovery"'),
+                   "the replica suffix of an admitted recovery is missing")
     check_apalache(args, scratch, "ResidenceRetirement", "residence-retirement", "Safety", 10)
     check_apalache(
         args, scratch, "ResidenceRetirement", "residence-retirement-forget-checkpoint", "RetainedRootsReadable", 10,
