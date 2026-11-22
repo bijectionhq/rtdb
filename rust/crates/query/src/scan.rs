@@ -2013,6 +2013,35 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn materialized_cold_scan_replays_arrow_batches_for_both_references() {
+        use rtdb_plan::{MaterializedBinding, Relation, RelationNode, SetOperator};
+
+        let (state, table, _, store, _) = persisted_page_fixture().await;
+        let storage = Arc::new(BufferPool::new(store, 1 << 20));
+        let (scan, execution, memory) = descriptor_scan(state.value().snapshot(), table, storage);
+        let scan = Arc::new(Relation::scan(scan).unwrap());
+        let schema = scan.schema().clone();
+        let binding = Arc::new(MaterializedBinding { name: "cte".into(), relation: scan });
+        let reference = Arc::new(Relation::new(schema.clone(), RelationNode::Reference { binding: Arc::clone(&binding) }).unwrap());
+        let body = Arc::new(Relation::new(schema.clone(), RelationNode::Set {
+            left: Arc::clone(&reference), right: reference, operator: SetOperator::Union, all: true,
+        }).unwrap());
+        let relation = Arc::new(Relation::new(schema, RelationNode::Let { binding, body }).unwrap());
+        let runtime = crate::runtime_schema::EmittedRelation::derive(relation, &execution.context.catalog, &[], &memory).unwrap();
+        let mut cursor = crate::operators::build_columns(runtime, execution.clone()).await.unwrap().expect("Expected Arrow CTE execution");
+        assert!(execution.context.spill_bytes() > 0);
+        let mut values = Vec::new();
+        while let Some(batch) = cursor.next_batch().await.unwrap() {
+            let [crate::columnar::Column::Arrow { array, .. }] = batch.columns.as_slice() else { panic!("Expected Arrow IPC output"); };
+            let array = array.as_any().downcast_ref::<arrow_array::Int64Array>().unwrap();
+            values.extend(array.values().iter().copied());
+        }
+        assert_eq!(values, [1, 2, 3, 1, 2, 3]);
+        drop(cursor);
+        assert_eq!(execution.context.spill_bytes(), 0);
+    }
+
+    #[tokio::test]
     async fn window_shifts_gather_arrow_cells_across_sorted_batches() {
         use rtdb_plan::{Relation, RelationNode, Schema, SortExpr, WindowExpr, WindowFunction};
 

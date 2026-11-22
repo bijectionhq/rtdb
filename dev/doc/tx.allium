@@ -37,6 +37,7 @@
 -- A sort can compare supported key types directly at selected Arrow positions.
 -- A sort can compute a supported key expression in its Arrow input batches and keep its payloads columnar through ordering and spill.
 -- Its spill threshold accounts for Arrow buffers held by selected payloads.
+-- A top-level materialized relation over a scan with compatible fixed-width Arrow fields and simple reference operations writes its batches once as Arrow IPC and opens an independent reader for each reference.
 -- A batch join can gather matching payload positions from selected Arrow vectors.
 -- A columnar cross join gathers pairs of positions from its two inputs in left-major order within each batch pair.
 -- Relation ordinality and unpartitioned ROW_NUMBER with supported ordering append a signed 64-bit ordinal vector to Arrow batch inputs.

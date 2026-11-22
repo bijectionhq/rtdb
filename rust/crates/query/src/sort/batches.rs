@@ -1,9 +1,8 @@
 //! Stable sorting of batch positions, with Arrow spill runs.
-use std::{io::Cursor, mem::size_of, sync::Arc};
+use std::{mem::size_of, sync::Arc};
 
-use arrow_ipc::{reader::StreamReader, writer::StreamWriter};
 use async_trait::async_trait;
-use rtdb_columnar::{MemoryBudget, MemoryReservation, OwnedBatch};
+use rtdb_columnar::{MemoryBudget, MemoryReservation};
 use rtdb_plan::{Expr, Schema, SortExpr};
 use rtdb_types::{ObjectSort, Result, Value};
 
@@ -683,49 +682,9 @@ fn write_batch(writer: &mut SpillWriter, batch: ColumnBatch, plan: &SortPlan) ->
     let memory = &plan.execution.context.memory;
     let owned = column_batch(&plan.schema, memory, batch)?;
     let schema = crate::runtime_schema::schema_bound(&plan.schema)?;
-    let bound = owned
-        .batch()
-        .get_array_memory_size()
-        .checked_mul(6)
-        .and_then(|bytes| bytes.checked_add(schema.checked_mul(8)?))
-        .and_then(|bytes| bytes.checked_add(8192))
-        .ok_or_else(size_error)?;
-    let _scratch = memory.reserve(bound)?;
-    let mut ipc =
-        StreamWriter::try_new(Vec::new(), owned.batch().schema().as_ref()).map_err(ipc_error)?;
-    ipc.write(owned.batch()).map_err(ipc_error)?;
-    writer.write_frame(&ipc.into_inner().map_err(ipc_error)?)
+    writer.write_arrow(&owned, schema, memory, "sort-spill-arrow")
 }
 
 fn read_batch(reader: &mut SpillReader) -> Result<Option<ColumnBatch>> {
-    let Some((bytes, mut reservation)) = reader.read_frame(6)? else {
-        return Ok(None);
-    };
-    let mut ipc = StreamReader::try_new(Cursor::new(bytes), None).map_err(ipc_error)?;
-    let batch = ipc
-        .next()
-        .ok_or_else(|| invalid("invalid-spill", "Sort spill frame contains no batch"))?
-        .map_err(ipc_error)?;
-    if batch.num_rows() == 0 || ipc.next().transpose().map_err(ipc_error)?.is_some() {
-        return Err(invalid(
-            "invalid-spill",
-            "Sort spill frame must contain one nonempty batch",
-        ));
-    }
-    drop(ipc);
-    let bytes = batch
-        .get_array_memory_size()
-        .checked_add(256)
-        .ok_or_else(size_error)?;
-    let held = Arc::get_mut(&mut reservation).expect("spill decoder owns its reservation");
-    if bytes > held.bytes() {
-        held.grow_to(bytes)?;
-    } else {
-        held.shrink_to(bytes)?;
-    }
-    ColumnBatch::from_owned(OwnedBatch::with_reservation(batch, reservation)?).map(Some)
-}
-
-fn ipc_error(error: arrow_schema::ArrowError) -> rtdb_types::Anomaly {
-    invalid("sort-spill-arrow", error)
+    reader.read_arrow(false, "sort-spill-arrow")?.map(ColumnBatch::from_owned).transpose()
 }

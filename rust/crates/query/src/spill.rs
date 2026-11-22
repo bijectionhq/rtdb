@@ -1,8 +1,9 @@
 use std::fs::File;
-use std::io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write};
+use std::io::{BufReader, BufWriter, Cursor, Read, Seek, SeekFrom, Write};
 use std::sync::{Arc, atomic::{AtomicU64, Ordering}};
 
-use rtdb_columnar::{MemoryBudget, MemoryReservation};
+use arrow_ipc::{reader::StreamReader, writer::StreamWriter};
+use rtdb_columnar::{MemoryBudget, MemoryReservation, OwnedBatch};
 use rtdb_types::{Result, Value};
 use tempfile::{NamedTempFile, TempDir, TempPath};
 
@@ -65,6 +66,20 @@ impl SpillWriter {
         self.position += count;
         Ok(())
     }
+
+    pub fn write_arrow(&mut self, batch: &OwnedBatch, schema_bytes: usize, memory: &Arc<MemoryBudget>, error: &str) -> Result<()> {
+        let batch = batch.batch();
+        let bound = batch.get_array_memory_size().checked_mul(6)
+            .and_then(|bytes| bytes.checked_add(schema_bytes.checked_mul(8)?))
+            .and_then(|bytes| bytes.checked_add(8192))
+            .ok_or_else(|| invalid(error, "Arrow spill allocation bound overflow"))?;
+        let _scratch = memory.reserve(bound)?;
+        let ipc_error = |cause: arrow_schema::ArrowError| invalid(error, cause);
+        let mut ipc = StreamWriter::try_new(Vec::new(), batch.schema().as_ref()).map_err(ipc_error)?;
+        ipc.write(batch).map_err(ipc_error)?;
+        self.write_frame(&ipc.into_inner().map_err(ipc_error)?)
+    }
+
     pub fn finish(mut self) -> Result<Arc<SpillFile>> {
         self.file.flush().map_err(io_error)?;
         Ok(self.retained)
@@ -99,6 +114,22 @@ impl SpillReader {
         let mut bytes = vec![0; length];
         self.file.read_exact(&mut bytes).map_err(io_error)?;
         Ok(Some((bytes, reservation)))
+    }
+
+    pub fn read_arrow(&mut self, allow_empty: bool, error: &str) -> Result<Option<OwnedBatch>> {
+        let Some((bytes, mut reservation)) = self.read_frame(6)? else { return Ok(None); };
+        let ipc_error = |cause: arrow_schema::ArrowError| invalid(error, cause);
+        let mut ipc = StreamReader::try_new(Cursor::new(bytes), None).map_err(ipc_error)?;
+        let batch = ipc.next().ok_or_else(|| invalid("invalid-spill", "Arrow spill frame contains no batch"))?.map_err(ipc_error)?;
+        if (!allow_empty && batch.num_rows() == 0) || ipc.next().transpose().map_err(ipc_error)?.is_some() {
+            return Err(invalid("invalid-spill", "Arrow spill frame must contain exactly one admissible batch"));
+        }
+        drop(ipc);
+        let bytes = batch.get_array_memory_size().checked_add(256)
+            .ok_or_else(|| invalid(error, "Arrow spill size overflow"))?;
+        let lease = Arc::get_mut(&mut reservation).expect("The spill decoder owns its reservation");
+        if bytes > lease.bytes() { lease.grow_to(bytes)?; } else { lease.shrink_to(bytes)?; }
+        OwnedBatch::with_reservation(batch, reservation).map(Some)
     }
 }
 

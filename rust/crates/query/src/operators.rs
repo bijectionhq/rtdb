@@ -179,6 +179,10 @@ async fn build_batches_at(
                 groups.clone(), aggregates.clone(), runtime, execution)?;
             Ok(Some((Box::new(aggregate), false)))
         }
+        RelationNode::Reference { binding } if output == BatchOutput::Arrow => {
+            let scope = execution.bindings.as_ref().ok_or_else(|| invalid("missing-relation", "Reference has no lexical binding"))?;
+            Ok(Some((scope.open_columns(binding).await?, false)))
+        }
         RelationNode::Sort { order_by, .. } | RelationNode::SortLimit { order_by, .. } if output == BatchOutput::Arrow => {
             if matches!(relation.node(), RelationNode::SortLimit { fetch: Some(_), .. }) && !execution.context.accelerators.is_empty()
                 && let Some(batches) = build_ordered_columns(Arc::clone(&runtime), execution.clone(), (0..runtime.schema().len()).collect()).await?
@@ -262,10 +266,46 @@ async fn build_batches_at(
 /// `build_pages` does; `None` where the plan runs as pages.
 pub(crate) async fn build_columns(runtime: Arc<EmittedRelation>, execution: Execution) -> Result<Option<crate::columnar::BoxBatchCursor>> {
     execution.context.check_cancelled()?;
-    if execution.analysis.is_some() || batch_shape(&runtime, BatchOutput::Arrow)?.is_none() { return Ok(None); }
+    if execution.analysis.is_some() { return Ok(None); }
+    if let RelationNode::Let { binding, .. } = runtime.relation().node() {
+        return build_materialized_columns(&runtime, binding, execution).await;
+    }
+    if batch_shape(&runtime, BatchOutput::Arrow)?.is_none() { return Ok(None); }
     let reservation = state_reservation(&runtime, &execution)?;
     let Some((batches, _)) = build_batch_input(runtime, execution, None, BatchOutput::Arrow).await? else { return Ok(None) };
     Ok(Some(crate::columnar::retain_batch_state(batches, reservation)))
+}
+
+async fn build_materialized_columns(runtime: &Arc<EmittedRelation>, binding: &Arc<rtdb_plan::MaterializedBinding>,
+    execution: Execution) -> Result<Option<crate::columnar::BoxBatchCursor>> {
+    let body = runtime.child(1)?;
+    let bound = runtime.child(0)?;
+    if !matches!(bound.relation().node(), RelationNode::Scan(_)) || !columnar_binding_body(&body, binding)?
+        || !bound.schema().fields().iter().all(|field| materialized_arrow_type(&field.data_type))
+        || batch_shape(&bound, BatchOutput::Arrow)?.is_none() {
+        return Ok(None);
+    }
+    let reservation = state_reservation(runtime, &execution)?;
+    let schema = bound.schema().clone();
+    let Some((input, _)) = build_batch_input(bound, execution.child(0), None, BatchOutput::Arrow).await? else { return Ok(None); };
+    let context = &execution.context;
+    let scope = crate::materialized::BindingScope::columns(Arc::clone(binding), input, schema, execution.bindings.clone(), Arc::clone(context))?;
+    let mut body_execution = execution.child(1);
+    body_execution.bindings = Some(Arc::clone(&scope));
+    let (body, _) = build_batch_input(body, body_execution, None, BatchOutput::Arrow).await?
+        .ok_or_else(|| invalid("materialized-binding", "A checked Arrow reference body did not open"))?;
+    let cursor = Box::new(crate::materialized::ColumnLetCursor { body, _binding: scope });
+    let cursor = crate::columnar::retain_batch_state(cursor, reservation);
+    Ok(Some(crate::trace::wrap_batches(cursor, runtime.relation(), context)))
+}
+
+fn materialized_arrow_type(ty: &LogicalType) -> bool {
+    use rtdb_types::ScalarType::{Bool, F32, F64, I8, I16, I32, I64};
+    match ty {
+        LogicalType::Null | LogicalType::Scalar(Bool | F32 | F64 | I8 | I16 | I32 | I64) => true,
+        LogicalType::Maybe(ty) => materialized_arrow_type(ty),
+        _ => false,
+    }
 }
 
 pub(crate) enum OrderedInput {
@@ -352,6 +392,21 @@ fn state_reservation(runtime: &Arc<EmittedRelation>, execution: &Execution) -> R
 /// Whether `build_batches` opens this subtree as batches, and if so whether they pass through a projection.
 fn batch_shape(runtime: &Arc<EmittedRelation>, output: BatchOutput) -> Result<Option<bool>> {
     stacker::maybe_grow(512 * 1024, 2 * 1024 * 1024, || batch_shape_at(runtime, output))
+}
+
+fn columnar_binding_body(runtime: &Arc<EmittedRelation>, binding: &rtdb_plan::MaterializedBinding) -> Result<bool> {
+    stacker::maybe_grow(512 * 1024, 2 * 1024 * 1024, || Ok(match runtime.relation().node() {
+        RelationNode::Reference { binding: reference } => reference.name == binding.name && reference.relation == binding.relation,
+        RelationNode::Project { expressions, .. } | RelationNode::Rename { expressions, .. } => {
+            let child = runtime.child(0)?;
+            expressions.iter().all(|named| matches!(&named.expr, Expr::Column { id, .. } if child.schema().position(*id).is_some()))
+                && columnar_binding_body(&child, binding)?
+        }
+        RelationNode::Set { operator: SetOperator::Union, all: true, .. } => {
+            columnar_binding_body(&runtime.child(0)?, binding)? && columnar_binding_body(&runtime.child(1)?, binding)?
+        }
+        _ => false,
+    }))
 }
 
 fn computed_batch_sort(order_by: &[rtdb_plan::SortExpr]) -> bool {
