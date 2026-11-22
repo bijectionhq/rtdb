@@ -423,6 +423,10 @@ pub enum StorageRegion {
         first_required: i64,
         custody: ReplayCustody,
     },
+    /// A fork has admitted provider I/O against this physical residence.
+    ReferenceRead {
+        custody: ReplayCustody,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -440,7 +444,7 @@ impl StorageRegion {
         let (destination, repair) = match self {
             Self::Local { archive, repair_archive, .. } |
             Self::Remote { archive, repair_archive, .. } => (*archive, *repair_archive),
-            Self::ReplicaReplay { .. } => return false,
+            Self::ReplicaReplay { .. } | Self::ReferenceRead { .. } => return false,
         };
         archive_custody::covers_archive(destination.map(|id| id.as_u128()), repair.map(|id| id.as_u128()), capture.as_u128())
     }
@@ -457,7 +461,7 @@ impl StorageRegion {
         match self {
             Self::Local { checkpoint_metadata_from, .. } |
             Self::Remote { checkpoint_metadata_from, closed: false, .. } => *checkpoint_metadata_from,
-            Self::Remote { closed: true, .. } | Self::ReplicaReplay { .. } => None,
+            Self::Remote { closed: true, .. } | Self::ReplicaReplay { .. } | Self::ReferenceRead { .. } => None,
         }
     }
 
@@ -474,7 +478,7 @@ impl StorageRegion {
         match self {
             Self::Local { checkpoint_replay_from, .. }
             | Self::Remote { checkpoint_replay_from, closed: false, .. } => *checkpoint_replay_from,
-            Self::Remote { closed: true, .. } => None,
+            Self::Remote { closed: true, .. } | Self::ReferenceRead { .. } => None,
             Self::ReplicaReplay { first_required, .. } => Some(*first_required),
         }
     }
@@ -483,7 +487,7 @@ impl StorageRegion {
         match self {
             Self::Local { tracks_ordered_index_pages, .. } |
             Self::Remote { tracks_ordered_index_pages, .. } => *tracks_ordered_index_pages,
-            Self::ReplicaReplay { .. } => false,
+            Self::ReplicaReplay { .. } | Self::ReferenceRead { .. } => false,
         }
     }
 }

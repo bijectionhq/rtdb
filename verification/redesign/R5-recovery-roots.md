@@ -163,16 +163,20 @@ The read path confirms the current head after loading its bytes, and the withdra
 Cleanup removes only slots strictly below a confirmed head.
 The reaper drops a shadowed fallback before deleting the local object and retains the release record until its physical work succeeds.
 This reasoning assumes authoritative listings, immutable conditional writes and monotone heads in open residence prefixes.
-Already open readers retain their selected manifest and still need the physical-owner read and retirement contract.
-`CatalogReaders` registers a cut under the logical deployment and storage root, while `ReferencingStore` can issue I/O at an ancestor's physical location.
-That fallback and its provider retry need custody from the physical owner before collection may erase the original. [Manifest model](../tla/MonotoneReferenceManifest.tla)
+Already open readers retain their selected manifest. `CatalogReaders` registers a cut under the logical deployment and storage root.
+For a serving fork's fallback, `ReferencingStore` now registers a `ReferenceRead` on the ancestor's directory record before reading from its provider path.
+The registration compares the exact residence, the fork's organization and lineage, the storage root and both storage namespaces. The directory CAS orders this admission against the whole-residence fence. The provider task owns the registration until it completes, even if its caller cancels.
+If the owner refuses admission, the reader checks its own copy again and propagates the admission error while the copy is unavailable. Disposal can resume once admitted operations drain. A successful transfer leaves the bytes readable from the fork's own prefix.
+The local witness and the persisted hosted task identity let the existing reconciler recover abandoned admissions. An admission without usable process-death evidence is retained until the issuing worker releases it.
+Per-read registration adds directory work on inherited misses. Its latency and throughput are unmeasured.
+[Manifest model](../tla/MonotoneReferenceManifest.tla) · [Disposal interleavings](../tla/ReferenceReadDisposal.tla) · [General reader-set model](../lean/ReferenceReadDisposal.lean)
 
 The revision covers publication. A shared fork must also carry a retirement generation from before it starts reading providers through the directory transaction that publishes its prepared manifest.
 Checking that the lineage currently admits publication cannot distinguish a preparation that preceded an intervening retirement.
 The candidate model admits retirement after active readers drain, advances the preparation generation, and closes admission to further readers.
 It transfers existing references and confirms provider removal before reopening.
 It covers one source version, one direct reader, and one shared fork.
-The production authority, resumable intent, and per-owner read handoff remain to be implemented. [Retirement admission model](../tla/LineageRetirementAdmission.tla)
+Ordinary remote collection still needs a durable retirement intent, and its authority must order physical-owner admission, reference publication and provider settlement. Archive capture, fork preparation, and transfer still have their own physical read paths. [Retirement admission model](../tla/LineageRetirementAdmission.tla)
 
 ### Serving and archive removal entry points
 
@@ -180,7 +184,7 @@ The production authority, resumable intent, and per-owner read handoff remain to
 | --- | --- | --- |
 | `reap_as_of` and `References::erase` | The reaper uses garbage records, checkpoint floors and a scan of existing manifests. It copies to observed referrers before deleting the path. | Bind the authorized retirement to one physical owner and version, validate the referrer set under that authority, and keep the intent until exact settlement. |
 | `Base::initialize`, `Base::forget` and `Base::load` | Initialization adds references. Confirmed withdrawals only remove matching entries and require a current head before effect. | Connect the current-manifest contract to consumers that retain older manifests and to the authority closing and disposing a residence. |
-| `erase_deployment` in disposal and old-residence cleanup | The administration path fences the residence, transfers observed shared objects and checks the provider inventory under its prefix. | Prove that no publication of a new reference to that residence can race the referrer scan and transfer. |
+| `erase_deployment` in disposal and old-residence cleanup | The administration path fences the residence, drains serving references admitted at that owner, transfers observed shared objects and checks the provider inventory under its prefix. | Order shared fork publication and administrative reads against the physical retirement authority. |
 | `ordered_index_storage::reap` | The directory generation floor and reader registry close admission. Remote cleanup aborts journaled uploads and checks the generation prefix inventory. | Preserve the independent generation and residence bindings in any shared retirement API. |
 | `finish_capture_retirement` and whole archive retirement | A capture is closed in the directory. Archive custody and the provider inventory govern physical erasure and final receipts. | Preserve capture identity and the archive's separate namespace when composing with serving retirement. |
 

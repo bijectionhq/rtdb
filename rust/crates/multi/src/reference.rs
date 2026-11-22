@@ -96,6 +96,7 @@ impl Base {
     }
 }
 
+pub(crate) mod custody;
 mod manifest_step;
 
 fn manifest_changed(store: &str) -> Anomaly {
@@ -190,18 +191,45 @@ impl ObjectStore for PrefixedStore {
 }
 
 /// A store's own objects and the objects its manifest references, read own-first.
-pub struct ReferencingStore { own: Arc<dyn ObjectStore>, bucket: Bucket, base: Base }
+pub struct ReferencingStore {
+    own: Arc<dyn ObjectStore>,
+    bucket: Bucket,
+    base: Base,
+    custody: Option<custody::ReferenceReads>,
+}
 
 impl ReferencingStore {
     /// Opens `own`, a store in the cell's `bucket` whose manifest is `base`.
-    pub fn new(own: Arc<dyn ObjectStore>, bucket: Bucket, base: Base) -> Self { Self { own, bucket, base } }
+    pub fn new(own: Arc<dyn ObjectStore>, bucket: Bucket, base: Base) -> Self {
+        Self { own, bucket, base, custody: None }
+    }
+
+    pub(crate) fn with_custody(mut self, custody: custody::ReferenceReads) -> Self {
+        self.custody = Some(custody);
+        self
+    }
 
     async fn read<T>(&self, key: &ObjectKey, read: impl for<'a> Fn(&'a dyn ObjectStore, &'a ObjectKey) -> BoxFuture<'a, rtdb_storage::Result<T>>) -> rtdb_storage::Result<T> {
         let own = read(self.own.as_ref(), key).await;
         if !matches!(own, Err(Error::MissingObject(_))) { return own; }
         let Some(owner) = self.base.objects.get(key.as_str()) else { return own; };
         let inherited = self::key(&format!("{owner}/{key}"))?;
-        match read(self.bucket.as_ref(), &inherited).await {
+        let result = if let Some(custody) = &self.custody {
+            match custody.retain(owner).await {
+                Ok(hold) => rtdb_storage::IoRegion::retaining(hold, read(self.bucket.as_ref(), &inherited)).await,
+                Err(error) => {
+                    // The owner can close before the first own read observes the transferred copy.
+                    // Until the copy exists, return the admission failure so the reader can retry.
+                    return match read(self.own.as_ref(), key).await {
+                        Err(Error::MissingObject(_)) => Err(error),
+                        own => own,
+                    };
+                }
+            }
+        } else {
+            read(self.bucket.as_ref(), &inherited).await
+        };
+        match result {
             // Erasure can copy the object here and remove it from its owner between the two reads.
             Err(Error::MissingObject(_)) => read(self.own.as_ref(), key).await,
             result => result,

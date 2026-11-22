@@ -1496,6 +1496,26 @@ def verify_shared_reference_revision(args, scratch):
     verify_lean_model(args, scratch, path, "shared-reference-revision", controls, 4)
 
 
+
+def verify_reference_read_disposal(args, scratch):
+    path = Path("verification/lean/ReferenceReadDisposal.lean")
+    controls = {
+        "release-pending": (
+            "      ¬ s.pending r →", "      True →",
+            ["every_step_keeps_reads_and_the_fork"],
+        ),
+        "ignore-held-reads": (
+            "(∀ r, ¬ s.held r) →", "True →",
+            ["every_step_keeps_reads_and_the_fork"],
+        ),
+        "skip-copy": (
+            "s.closed = true → s.copy = true →", "s.closed = true → True →",
+            ["every_step_keeps_reads_and_the_fork"],
+        ),
+    }
+    verify_lean_model(args, scratch, path, "reference-read-disposal", controls, 3)
+
+
 def verify_monotone_reference_manifest(args, scratch):
     path = Path("verification/lean/MonotoneReferenceManifest.lean")
     controls = {
@@ -1797,6 +1817,7 @@ def verify_lean(args, scratch):
             verify_exact_retirement_retry(args, scratch)
             verify_shared_reference_revision(args, scratch)
             verify_monotone_reference_manifest(args, scratch)
+            verify_reference_read_disposal(args, scratch)
             verify_published_checkpoint(args, scratch)
             verify_checkpoint_table_manifest(args, scratch)
             verify_pack_publication_lean(args, scratch)
@@ -2156,6 +2177,19 @@ TLA_CASES = (
      ("INVARIANT Safe", "INVARIANT NeverRefusesOldPreparationAfterSettlement"), "NeverRefusesOldPreparationAfterSettlement"),
     ("LineageRetirementAdmission", "lineage-retirement-transfers-and-settles-witness",
      ("INVARIANT Safe", "INVARIANT NeverTransfersAndSettles"), "NeverTransfersAndSettles"),
+    ("ReferenceReadDisposal", "reference-read-disposal", None, None),
+    ("ReferenceReadDisposal", "reference-read-wrong-owner",
+     ('Mutation = "none"\nINVARIANT Safe', 'Mutation = "wrong_owner"\nINVARIANT PendingIsOwned'), "PendingIsOwned"),
+    ("ReferenceReadDisposal", "reference-read-drop-on-cancel",
+     ('Mutation = "none"\nINVARIANT Safe', 'Mutation = "drop_on_cancel"\nINVARIANT PendingIsOwned'), "PendingIsOwned"),
+    ("ReferenceReadDisposal", "reference-read-late-admission",
+     ('Mutation = "none"\nINVARIANT Safe', 'Mutation = "late_admission"\nINVARIANT ClosedDoesNotAdmit'), "ClosedDoesNotAdmit"),
+    ("ReferenceReadDisposal", "reference-read-skip-drain",
+     ('Mutation = "none"\nINVARIANT Safe', 'Mutation = "skip_drain"\nINVARIANT EraseAfterDrain'), "EraseAfterDrain"),
+    ("ReferenceReadDisposal", "reference-read-skip-transfer",
+     ('Mutation = "none"\nINVARIANT Safe', 'Mutation = "skip_transfer"\nINVARIANT ForkStillHasBytes'), "ForkStillHasBytes"),
+    ("ReferenceReadDisposal", "reference-read-disposal-witness",
+     ("INVARIANT Safe", "INVARIANT NeverDisposesAfterCancelledRead"), "NeverDisposesAfterCancelledRead"),
     ("MonotoneReferenceManifest", "monotone-reference-manifest", None, None),
     ("MonotoneReferenceManifest", "reference-manifest-stale-overwrite",
      ('Mutation = "none"\nINVARIANT Safe', 'Mutation = "append_stale_whole_manifest"\nINVARIANT NoWithdrawnReferenceReturns'), "NoWithdrawnReferenceReturns"),
@@ -2600,6 +2634,7 @@ def check_apalache(args, scratch, module, name, invariant, length, mutation=None
 
 
 def verify_apalache(args, scratch):
+    check_apalache(args, scratch, "ReferenceReadDisposal", "reference-read-disposal", "Safe", 10)
     for mode in ("validated", "serialized", "blind"):
         mutation = None if mode == "validated" else ('Mode = "validated"', f'Mode = "{mode}"')
         counterexample = "lost-update" if mode == "blind" else None
@@ -3574,6 +3609,43 @@ def verify_native_reference_revision(args, source):
         finally:
             path.write_bytes(original)
         print(f"rust-lineage-reference-{name}: atomic publication passed and its control failed as expected")
+
+
+
+def verify_native_reference_read(args, source):
+    env = os.environ | {
+        "CARGO_TARGET_DIR": os.environ.get("CARGO_TARGET_DIR", str(ROOT / "target")),
+        "CARGO_PROFILE_TEST_DEBUG": "0",
+    }
+    test = "reference::custody::tests::inherited_io_holds_its_physical_residence_through_cancellation_and_disposal"
+    command = ["cargo", "test", "--locked", "-p", "rtdb-multi", "--features", "dynamodb", "--lib", test, "--", "--exact"]
+    baseline = run_case(command, source / "rust", args.evidence, "rust-reference-read-baseline", env)
+    if baseline.returncode or f"{test} ... ok" not in baseline.stdout:
+        raise ValueError("the inherited I/O disposal replay did not pass")
+    root = source / "rust/crates/multi/src"
+    cases = {
+        "ignore-owner": (
+            "reference.rs", "if let Some(custody) = &self.custody",
+            "if let Some(custody) = self.custody.as_ref().filter(|_| false)",
+            "cancelled provider work still needs its physical owner",
+        ),
+        "admit-after-fence": (
+            "reference/custody.rs", "matches!(owner.lifecycle, Lifecycle::Live | Lifecycle::Quarantined),",
+            "true,", "a closed physical owner refuses a new provider read",
+        ),
+    }
+    for name, (file, before, after, expected) in cases.items():
+        path = root / file
+        original = path.read_bytes()
+        try:
+            replace_once(path, before, after)
+            result = run_case(command, source / "rust", args.evidence, f"rust-reference-read-{name}-control", env)
+            if (result.returncode != 101 or f"{test} ... FAILED" not in result.stdout
+                or expected not in (result.stdout + result.stderr) or "0 passed; 1 failed" not in result.stdout):
+                raise ValueError(f"{name}: inherited I/O control failed outside its declared assertion")
+        finally:
+            path.write_bytes(original)
+        print(f"rust-reference-read-{name}: control rejected at its declared assertion")
 
 
 def verify_native_reference_manifest(args, source):
@@ -4623,6 +4695,7 @@ def main():
             verify_s3_exact_retirement(args, source)
             verify_native_reference_revision(args, source)
             verify_native_reference_manifest(args, source)
+            verify_native_reference_read(args, source)
             verify_compaction_publication_versions(args, source)
             verify_replay_prefix(args, source)
             verify_multi_trim_admission(args, source)

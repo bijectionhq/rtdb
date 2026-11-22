@@ -15,7 +15,7 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use parking_lot::Mutex;
 use prost_types::Any;
-use rtdb_directory::{Cas, CatalogAdmissionFloor, DeploymentRecord, Directory, Lifecycle, MemberId, MemberPool, MemberRole, MemberState, HostedTask, StoragePublication, StorageRegion, now_ms};
+use rtdb_directory::{Cas, CatalogAdmissionFloor, DeploymentRecord, Directory, Lifecycle, MemberId, MemberPool, MemberRole, MemberState, HostedTask, ReplayCustody, StoragePublication, StorageRegion, now_ms};
 use rtdb_format::{keys::{StorageRoot, TrieKey}, trie_retirement::{InstalledRetirement, MAXIMUM_RECEIPT_BYTES}};
 use rtdb_node::{OpenedRecoveryStore, RemoteStorageFactory};
 use rtdb_storage::{Error, IoRegion, ObjectKey, ObjectObservation, ObjectStore, object_store::{IndexPageLifecycle, StoredObject}, remote::PublicationJournal};
@@ -31,6 +31,7 @@ use crate::deployment::CellStorage;
 use crate::keys::KeyService;
 use crate::checkpoint_retention::checkpoint_metadata_collectable;
 use crate::ordered_index_storage::{self, HostedIndexPages};
+use crate::reference::custody::ReferenceReads;
 
 #[path = "key_enrollment.rs"]
 mod key_enrollment;
@@ -238,7 +239,13 @@ impl RemoteStorageFactory for CellStoreFactory {
             let pages = HostedIndexPages::new(
                 self.directory.clone(), config.deployment, store.clone(), owner, config.writer_epoch, self.storage_regions.clone(),
             );
-            let mut opened = open_cell_store(bucket, &store, root, &record, wall_clock(), recovery).await?;
+            let custody = ReferenceReads::new(
+                self.directory.clone(), self.keys.clone(), self.storage_regions.clone(), &record,
+                storage_root.as_str(), self.storage_namespaces,
+                if matches!(config.storage, CellStorage::Local { .. }) { ReplayCustody::Local }
+                else { ReplayCustody::Hosted { owner: self.hosted_task.clone() } },
+            );
+            let mut opened = open_cell_store(bucket, &store, root, &record, wall_clock(), recovery, custody).await?;
             let serving = Arc::get_mut(&mut opened).expect("the new store has one owner");
             serving.index_pages = Some(pages);
             serving.catalog_readers = Some(CatalogReaders::new(
@@ -610,14 +617,17 @@ pub(crate) async fn reconcile_storage_regions(
     }
     for (&region, state) in &record.storage_regions {
         match state {
-            StorageRegion::Local { .. } | StorageRegion::ReplicaReplay { custody: rtdb_directory::ReplayCustody::Local, .. }
+            StorageRegion::Local { .. }
+            | StorageRegion::ReplicaReplay { custody: ReplayCustody::Local, .. }
+            | StorageRegion::ReferenceRead { custody: ReplayCustody::Local }
                 if (matches!(storage, CellStorage::Local { .. })
                     || matches!(state, StorageRegion::Local { archive: Some(_), .. } | StorageRegion::Local { repair_archive: Some(_), .. }))
                     && keys.local_storage_region_drained(region)? => {
                 release_region(directory, &record.id, region, false).await?;
                 keys.forget_local_storage_region(region)?;
             }
-            StorageRegion::ReplicaReplay { custody: rtdb_directory::ReplayCustody::Hosted { owner: Some(owner) }, .. }
+            StorageRegion::ReplicaReplay { custody: ReplayCustody::Hosted { owner: Some(owner) }, .. }
+            | StorageRegion::ReferenceRead { custody: ReplayCustody::Hosted { owner: Some(owner) } }
                 if directory.hosted_task_stopped(owner).await? => {
                 release_region(directory, &record.id, region, false).await?;
             }
@@ -745,7 +755,7 @@ pub(crate) async fn open_deployment_store_with_archive(
 ) -> Result<Arc<GarbageStore>> {
     let local: Arc<dyn ObjectStore> = Arc::new(crate::reference::PrefixedStore::new(Arc::clone(&bucket), store.to_owned()));
     let base = crate::reference::Base::load(bucket.as_ref(), store).await?;
-    open_with_base(bucket, local, base, discovery, clock, archive).await
+    open_with_base(bucket, local, base, discovery, clock, archive, None).await
 }
 
 async fn open_cell_store(
@@ -755,6 +765,7 @@ async fn open_cell_store(
     record: &DeploymentRecord,
     clock: Clock,
     recovery: Option<crate::archive::ArchivedCheckpoint>,
+    custody: ReferenceReads,
 ) -> Result<Arc<GarbageStore>> {
     let discovery = record.checkpoint.map_or(crate::packing::PackDiscovery::List, |checkpoint| {
         crate::packing::PackDiscovery::From(checkpoint.block)
@@ -764,7 +775,7 @@ async fn open_cell_store(
     } else {
         crate::reference::Base::load(bucket.as_ref(), store).await?
     };
-    open_with_base(bucket, local, base, discovery, clock, recovery).await
+    open_with_base(bucket, local, base, discovery, clock, recovery, Some(custody)).await
 }
 
 async fn open_with_base(
@@ -774,8 +785,17 @@ async fn open_with_base(
     discovery: crate::packing::PackDiscovery,
     clock: Clock,
     archive: Option<crate::archive::ArchivedCheckpoint>,
+    custody: Option<ReferenceReads>,
 ) -> Result<Arc<GarbageStore>> {
-    let own: Arc<dyn ObjectStore> = if base.objects.is_empty() { local } else { Arc::new(crate::reference::ReferencingStore::new(local, bucket, base)) };
+    let own: Arc<dyn ObjectStore> = if base.objects.is_empty() {
+        local
+    } else {
+        let references = crate::reference::ReferencingStore::new(local, bucket, base);
+        Arc::new(match custody {
+            Some(custody) => references.with_custody(custody),
+            None => references,
+        })
+    };
     let packed = crate::packing::PackingStore::open_with_clock(own, discovery, Arc::clone(&clock)).await?;
     let store = match archive {
         Some(archive) => archive.with_serving(packed),
@@ -2185,7 +2205,11 @@ mod tests {
         reap(bucket.as_ref(), &record, Duration::ZERO, &Default::default()).await.unwrap();
         raw.deny_list.store(true, std::sync::atomic::Ordering::Relaxed);
         let local = Arc::new(crate::reference::PrefixedStore::new(Arc::clone(&bucket), &store));
-        let cold = open_cell_store(bucket, &store, local, &record, wall_clock(), None).await.unwrap();
+        let files = tempfile::tempdir().unwrap();
+        let keys = Arc::new(crate::keys::LocalKeyService::new(files.path().join("keys")).unwrap());
+        let custody = ReferenceReads::new(rtdb_directory::MemoryDirectory::new(), keys, TaskTracker::new(), &record,
+            "v06", rtdb_directory::StorageNamespaces { objects: Uuid::new_v4(), keys: [0; 32] }, ReplayCustody::Local);
+        let cold = open_cell_store(bucket, &store, local, &record, wall_clock(), None, custody).await.unwrap();
         assert_eq!(cold.get(&key("tables/t/data/l00-rc-b02.arrow")).await.unwrap().as_ref(), b"rows 2", "a block after a fully released one is found from the checkpoint");
     }
 
