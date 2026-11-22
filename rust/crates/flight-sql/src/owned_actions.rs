@@ -865,7 +865,10 @@ impl Service {
         let schema = Schema::new(vec![
             Field::new("revision", DataType::Int64, false),
             rtdb_columnar::to_field("changes", &changes_type).map_err(status)?,
-        ]).with_metadata(std::collections::HashMap::from([(OWNED_PRESENT.into(), present.0.to_string())]));
+        ]).with_metadata(std::collections::HashMap::from([
+            (OWNED_PRESENT.into(), present.0.to_string()),
+            (OWNED_CHANGE_COVERAGE.into(), page.covered_through(present).map_err(status)?.0.to_string()),
+        ]));
         if page.commits.is_empty() {
             return self.owned_action_reply(&schema, None);
         }
