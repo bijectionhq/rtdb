@@ -105,6 +105,18 @@ theorem another_owner_can_inherit_the_same_floor (reader : Reader) (floor : Nat)
     (held : state.held reader = some floor) : MayAdmit state floor :=
   Or.inr ⟨reader, floor, held, Nat.le_refl floor⟩
 
+def MayCollectPack (state : State Reader) (pack youngest : Nat) : Prop :=
+  MayAuthorize state pack ∧ MayAuthorize state youngest
+
+theorem pack_member_is_below_every_hold (pack member youngest : Nat)
+    (covered : member ≤ youngest) (allowed : MayCollectPack state pack youngest) :
+    MayAuthorize state member := by
+  have bound : MayAuthorize state youngest := allowed.2
+  obtain ⟨before, holds⟩ := bound
+  exact ⟨Nat.lt_of_le_of_lt covered before,
+    fun reader first held => Nat.lt_of_le_of_lt covered (holds reader first held)⟩
+
+#print axioms pack_member_is_below_every_hold
 #print axioms another_owner_can_inherit_the_same_floor
 #print axioms plans_survive_interleavings
 #print axioms reachable_plans_are_safe

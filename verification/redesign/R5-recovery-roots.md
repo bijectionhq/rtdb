@@ -168,6 +168,23 @@ The authorized reservation can finish from its persisted versions if the histori
 The retained receipt model explored 16 states, rejected four unsafe changes and reached settlement after losing the original receipt.
 Releases without a matching immutable publication witness still need a separately settled protocol for unversioned providers.
 [Retained receipt model](../tla/RetainedReleaseReceipt.tla)
+
+### Hosted checkpoint pack collection
+
+A release of a packed checkpoint metadata file records its logical key, the owned pack path and the provider version that supplied the member index.
+The provider's HEAD, trailer and index must agree on that publication.
+The collector accepts a block pack only when the index contains the pack's own catalog, every member is checkpoint metadata, and a mature marker for the exact same pack version covers each member.
+A newer published checkpoint pack must be visible under the same storage root.
+The physical owner's CAS compares the observed checkpoint with its current one and bounds both the pack's block and the greatest member block below every applicable metadata hold.
+The lineage reservation and owner fence order this decision against published references and inherited readers.
+Ordinary hosted path collection cannot erase an owned pack.
+After exact retirement settles the pack, later passes may settle the associated markers against confirmed absence of that same version.
+This also works while a replacement is visible at the original pack path.
+Pack collection keeps mixed L0 packs, spill packs, unversioned packs and packs with only legacy path releases.
+The model assumes immutable version identities, monotone checkpoint publication and authoritative provider inventory.
+It abstracts the index decoder, directory transactions and snapshot execution.
+[Bounded pack model](../tla/HostedPackRetirement.tla) · [Retention arithmetic proof](../verus/checkpoint_metadata/proof.rs)
+
 Live provider qualification still needs rolling deployment evidence and the exact provider's listing, deletion and credential behavior.
 The hosted reaper role needs transactional puts confined to the cell's `~reference-revision/` rows in `deployment-names` and a deployment-table condition check for whole-residence disposal.
 
@@ -219,7 +236,7 @@ The per-key owner fence covers inherited serving misses, including provider work
 
 | Effect path | Current admission and evidence | Remaining composition obligation |
 | --- | --- | --- |
-| `reap_as_of` and `References::erase` | The local sweep reserves its lineage, reloads referrers and copies retained data before deleting the path. The hosted exact collector keeps witnessed loose files while their source is still referenced, and confirms provider settlement before reopening admission. | Retain and settle pack-level, unwitnessed legacy and unversioned releases under their physical owner. |
+| `reap_as_of` and `References::erase` | The local sweep reserves its lineage, reloads referrers and copies retained data before deleting the path. The hosted exact collector keeps witnessed loose files while their source is still referenced, and confirms provider settlement before reopening admission. | Extend exact settlement to pack contents beyond checkpoint metadata and to remaining unwitnessed legacy and unversioned releases. |
 | `Base::initialize`, `Base::forget` and `Base::load` | Initialization adds references. Confirmed withdrawals only remove matching entries and require a current head before effect. | Connect the current-manifest contract to consumers that retain older manifests and to the authority closing and disposing a residence. |
 | `erase_deployment` in disposal and old-residence cleanup | The administration path fences the residence, drains serving references, closes the lineage, scans and transfers published references and checks the provider inventory. Settlement atomically publishes the receipt and reopens the lineage. | Extend physical-owner read custody to administrative copies and qualify provider settlement under failure on hosted storage. |
 | `ordered_index_storage::reap` | The directory generation floor and reader registry close admission. Remote cleanup aborts journaled uploads and checks the generation prefix inventory. | Preserve the independent generation and residence bindings in any shared retirement API. |

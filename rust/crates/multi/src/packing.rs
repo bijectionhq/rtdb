@@ -54,6 +54,10 @@ pub fn block_pack(catalog: &str) -> String {
     format!("{PACK_DIRECTORY}/{stem}.pack")
 }
 
+pub(crate) fn is_pack_key(key: &str) -> bool {
+    key.strip_prefix(PACK_DIRECTORY).is_some_and(|suffix| suffix.starts_with('/'))
+}
+
 /// The block whose pack `pack` is, if it is a block's: `~packs/b0a.pack` is block 10's.
 pub fn pack_block(pack: &str) -> Option<i64> {
     let stem = pack.strip_prefix(&format!("{PACK_DIRECTORY}/"))?.strip_suffix(".pack")?;
@@ -85,7 +89,11 @@ pub fn encode_pack(objects: &BTreeMap<String, Bytes>, previous: Vec<String>, wri
 }
 
 pub async fn read_index(store: &dyn ObjectStore, pack: &ObjectKey) -> rtdb_storage::Result<PackIndex> {
-    Ok(read_pack_index(store, pack, store.observe_head(pack).await?).await?.value)
+    Ok(observe_pack_index(store, pack).await?.value)
+}
+
+pub(crate) async fn observe_pack_index(store: &dyn ObjectStore, pack: &ObjectKey) -> rtdb_storage::Result<ObjectObservation<PackIndex>> {
+    read_pack_index(store, pack, store.observe_head(pack).await?).await
 }
 
 async fn read_pack_index(store: &dyn ObjectStore, pack: &ObjectKey, head: ObjectObservation<StoredObject>) -> rtdb_storage::Result<ObjectObservation<PackIndex>> {
@@ -256,7 +264,7 @@ impl PackingStore {
     }
 
     async fn observe_index(&self, pack: &ObjectKey) -> rtdb_storage::Result<ObjectObservation<PackIndex>> {
-        read_pack_index(self.inner.as_ref(), pack, self.inner.observe_head(pack).await?).await
+        observe_pack_index(self.inner.as_ref(), pack).await
     }
 
     /// Verifies an existing publication against all the bytes prepared for the block.
@@ -290,6 +298,20 @@ impl PackingStore {
         let mut publication = read_pack_index(self.inner.as_ref(), &location.pack, head).await?;
         let entry = publication.value.entries.remove(object.as_str()).ok_or_else(|| Error::MissingObject(object.to_string()))?;
         Ok(LocatedEntry { pack: location.pack.clone(), entry, version: publication.version.map(Arc::new) })
+    }
+
+    /// Observes the owned publication named by this member's admitted index.
+    pub(crate) async fn retirement_pack(&self, member: &ObjectKey) -> rtdb_storage::Result<Option<(ObjectKey, PhysicalObjectVersion)>> {
+        let Some(location) = self.locate(member).await? else { return Ok(None); };
+        if pack_block(location.pack.as_str()).is_none() { return Ok(None); }
+        let location = match self.observe_location(member, location).await {
+            Ok(location) => location,
+            Err(Error::MissingObject(_)) => return Ok(None),
+            Err(error) => return Err(error),
+        };
+        let Some(version) = location.version else { return Ok(None); };
+        let owned = self.inner.retirement_version(&location.pack).await?;
+        Ok((owned.as_ref() == Some(version.as_ref())).then(|| (location.pack, (*version).clone())))
     }
 
     async fn read_packed(&self, object: &ObjectKey, location: LocatedEntry, read: PackRead) -> rtdb_storage::Result<ObjectObservation<Bytes>> {

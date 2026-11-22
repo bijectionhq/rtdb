@@ -1417,7 +1417,12 @@ def verify_checkpoint_metadata_retention(args, scratch):
             ["plans_survive_interleavings"],
         ),
     }
-    verify_lean_model(args, scratch, path, "checkpoint-metadata-retention", controls, 4)
+    controls["ignore-pack-member-bound"] = (
+        "MayAuthorize state pack ∧ MayAuthorize state youngest",
+        "MayAuthorize state pack ∧ MayAuthorize state pack",
+        ["pack_member_is_below_every_hold"],
+    )
+    verify_lean_model(args, scratch, path, "checkpoint-metadata-retention", controls, 5)
 
 
 def verify_repair_archive_custody(args, scratch):
@@ -2175,6 +2180,30 @@ TLA_CASES = (
      ('Mutation = "none"\nINVARIANT Safe', 'Mutation = "leave_owner_closed"\nINVARIANT AtomicReopen'), "AtomicReopen"),
     ("ExactMarkerSettlement", "exact-marker-late-effect-witness",
      ("INVARIANT Safe", "INVARIANT NeverSettlesWithLateMarkerEffect"), "NeverSettlesWithLateMarkerEffect"),
+    ("HostedPackRetirement", "hosted-pack-retirement", None, None),
+    ("HostedPackRetirement", "hosted-pack-retirement-allow-partial-coverage",
+     ('Mutation = "none"\nCONSTANT Members = {1, 2}\nINVARIANT Safe',
+      'Mutation = "allow_partial_coverage"\nCONSTANT Members = {1, 2}\nINVARIANT CompleteCoverage'), "CompleteCoverage"),
+    ("HostedPackRetirement", "hosted-pack-retirement-count-stale-evidence",
+     ('Mutation = "none"\nCONSTANT Members = {1, 2}\nINVARIANT Safe',
+      'Mutation = "count_stale_evidence"\nCONSTANT Members = {1, 2}\nINVARIANT CompleteCoverage'), "CompleteCoverage"),
+    ("HostedPackRetirement", "hosted-pack-retirement-ignore-grace",
+     ('Mutation = "none"\nCONSTANT Members = {1, 2}\nINVARIANT Safe',
+      'Mutation = "ignore_grace"\nCONSTANT Members = {1, 2}\nINVARIANT CompleteCoverage'), "CompleteCoverage"),
+    ("HostedPackRetirement", "hosted-pack-retirement-ignore-current-root",
+     ('Mutation = "none"\nCONSTANT Members = {1, 2}\nINVARIANT Safe',
+      'Mutation = "ignore_current_root"\nCONSTANT Members = {1, 2}\nINVARIANT SuccessorAvailable'), "SuccessorAvailable"),
+    ("HostedPackRetirement", "hosted-pack-retirement-ignore-hold",
+     ('Mutation = "none"\nCONSTANT Members = {1, 2}\nINVARIANT Safe',
+      'Mutation = "ignore_hold"\nCONSTANT Members = {1, 2}\nINVARIANT HoldsRespected'), "HoldsRespected"),
+    ("HostedPackRetirement", "hosted-pack-retirement-ignore-reference",
+     ('Mutation = "none"\nCONSTANT Members = {1, 2}\nINVARIANT Safe',
+      'Mutation = "ignore_reference"\nCONSTANT Members = {1, 2}\nINVARIANT HoldsRespected'), "HoldsRespected"),
+    ("HostedPackRetirement", "hosted-pack-retirement-erase-path",
+     ('Mutation = "none"\nCONSTANT Members = {1, 2}\nINVARIANT Safe',
+      'Mutation = "erase_path"\nCONSTANT Members = {1, 2}\nINVARIANT ReplacementSurvives'), "ReplacementSurvives"),
+    ("HostedPackRetirement", "hosted-pack-retirement-completion-witness",
+     ("INVARIANT Safe", "INVARIANT NeverSettlesAllMarkersAfterReplacement"), "NeverSettlesAllMarkersAfterReplacement"),
     ("HostedExactRetirement", "hosted-exact-retirement", None, None),
     ("RetainedReleaseReceipt", "retained-release-receipt", None, None),
     ("RetainedReleaseReceipt", "retained-release-discard-hidden-marker",
@@ -2816,6 +2845,10 @@ def verify_apalache(args, scratch):
     check_apalache(args, scratch, "CheckpointSourceHandoff", "source-handoff-publish-staged",
                    "PublicationIsDurable", 11, ('Mutation = "none"', 'Mutation = "publish_staged"'),
                    "the archive is visible before its destination is accepted")
+    check_apalache(args, scratch, "HostedPackRetirement", "hosted-pack-retirement", "Safe", 8)
+    check_apalache(args, scratch, "HostedPackRetirement", "hosted-pack-retirement-partial-coverage", "CompleteCoverage", 8,
+                   ('Mutation = "none"', 'Mutation = "allow_partial_coverage"'),
+                   counterexample="incomplete pack release coverage")
     check_apalache(args, scratch, "PackPublicationObservation", "pack-publication-observation", "Safe", 6)
     check_apalache(args, scratch, "PackPublicationObservation", "pack-publication-trust-member", "MemberCoherent", 6,
                    ('Mutation = "none"', 'Mutation = "ignore_member_version"'),
@@ -4225,6 +4258,41 @@ def verify_repair_archive_replay(args, source):
     print("rust-repair-archive-custody: four replays passed and six controls failed as expected")
 
 
+def verify_native_pack_retirement(args, source):
+    env = os.environ | {
+        "CARGO_TARGET_DIR": os.environ.get("CARGO_TARGET_DIR", str(ROOT / "target")),
+        "CARGO_PROFILE_TEST_DEBUG": "0",
+    }
+    test = "store::exact_retirement::tests::a_hosted_metadata_pack_requires_complete_version_bound_releases_and_no_checkpoint_hold"
+    command = ["cargo", "test", "--locked", "-p", "rtdb-multi", "--lib", test, "--", "--exact"]
+    baseline = run_case(command, source / "rust", args.evidence, "rust-hosted-pack-retirement-baseline", env)
+    if baseline.returncode or f"{test} ... ok" not in baseline.stdout:
+        raise ValueError("hosted pack retirement replay failed")
+    exact = "rust/crates/multi/src/store/exact_retirement.rs"
+    controls = {
+        "path-reaping": ("rust/crates/multi/src/store.rs",
+                         "(local || !own.contains(&pack)) && Some(&pack)",
+                         "Some(&pack)", "hosted packs require exact reaping"),
+        "partial-coverage": (exact, "    if !uncovered.is_empty() { return Ok(None); }\n",
+                             "", "every pack member needs a release for the same version"),
+        "ignore-hold": (exact, "record.checkpoint.map(|checkpoint| checkpoint.block), oldest)",
+                        "record.checkpoint.map(|checkpoint| checkpoint.block), None)",
+                        "a checkpoint metadata hold protects its pack"),
+    }
+    for name, (relative, before, after, failure) in controls.items():
+        path = source / relative
+        original = path.read_bytes()
+        try:
+            replace_once(path, before, after)
+            checked = run_case(command, source / "rust", args.evidence, f"rust-hosted-pack-retirement-{name}", env)
+        finally:
+            path.write_bytes(original)
+        if (checked.returncode != 101 or f"{test} ... FAILED" not in checked.stdout
+            or failure not in checked.stdout or "0 passed; 1 failed" not in checked.stdout):
+            raise ValueError(f"hosted pack retirement control {name} missed its declared assertion")
+    print("rust-hosted-pack-retirement: baseline passed and three controls failed as expected")
+
+
 def verify_checkpoint_copy_publications(args, source):
     env = os.environ | {
         "CARGO_TARGET_DIR": os.environ.get("CARGO_TARGET_DIR", str(ROOT / "target")),
@@ -4862,6 +4930,7 @@ def main():
             verify_checkpoint_metadata_replay(args, source)
             verify_checkpoint_capture_metadata(args, source)
             verify_checkpoint_copy_publications(args, source)
+            verify_native_pack_retirement(args, source)
             verify_repair_archive_replay(args, source)
             verify_delegated_scan_replay(args, source)
             verify_fragment_residence_replay(args, source)

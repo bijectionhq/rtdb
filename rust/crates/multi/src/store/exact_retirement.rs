@@ -1,11 +1,16 @@
+use std::collections::BTreeSet;
+
 use async_trait::async_trait;
 use rtdb_directory::{DeploymentRecord, Directory, Lifecycle, LineageChange, LineageRetirement, LineageState, RetirementWork, StorageRegion};
+use rtdb_format::keys::block_key;
 use rtdb_storage::{Error, ObjectKey, ObjectStore};
-use rtdb_types::{Anomaly, AnomalyCategory, PhysicalObjectVersion, Result};
+use rtdb_types::{Anomaly, AnomalyCategory, BlockIndex, PhysicalObjectVersion, Result};
 use uuid::Uuid;
 
-use super::{GARBAGE_DIRECTORY, StoredRelease, can_reap, permits_release};
+use super::{GARBAGE_DIRECTORY, StoredRelease, can_reap, checkpoint_metadata_block, permits_release};
+use crate::checkpoint_retention::checkpoint_pack_collectable;
 use crate::keys::KeyService;
+use crate::packing::{block_pack, observe_pack_index, pack_block};
 use crate::reference::{Base, References, stores};
 
 mod receipts;
@@ -15,7 +20,20 @@ const MAXIMUM_RELEASE_BYTES: u64 = 32 << 10;
 struct ReleaseWitness {
     record: super::GarbageRecord,
     version: Option<PhysicalObjectVersion>,
+    pack: Option<String>,
     release_version: Option<PhysicalObjectVersion>,
+}
+
+impl ReleaseWitness {
+    fn target_name(&self) -> Option<&str> {
+        match self.pack.as_deref() {
+            Some(pack) if self.version.is_some() && self.record.trie_floor.is_none()
+                && pack_block(pack).is_some()
+                && checkpoint_metadata_block(&self.record.key).is_some() => Some(pack),
+            None if self.record.trie_floor.is_some() => Some(&self.record.key),
+            _ => None,
+        }
+    }
 }
 
 async fn read_release(bucket: &dyn ObjectStore, key: &ObjectKey) -> Result<Option<ReleaseWitness>> {
@@ -29,14 +47,18 @@ async fn read_release(bucket: &dyn ObjectStore, key: &ObjectKey) -> Result<Optio
         result => result?,
     };
     let Ok(stored) = serde_json::from_slice::<StoredRelease>(&observed.value) else { return Ok(None); };
-    let (record, version) = stored.into_parts();
-    Ok(Some(ReleaseWitness { record, version, release_version: observed.version }))
+    let (record, version, pack) = match stored {
+        StoredRelease::Exact { record, version, pack } => (record, Some(version), pack),
+        StoredRelease::Path(record) => (record, None, None),
+    };
+    Ok(Some(ReleaseWitness { record, version, pack, release_version: observed.version }))
 }
 
 
 #[async_trait]
 pub(super) trait ExactVersions: Send + Sync {
     async fn available(&self, key: &ObjectKey, version: &PhysicalObjectVersion) -> Result<bool>;
+    async fn absent(&self, key: &ObjectKey, version: &PhysicalObjectVersion) -> Result<bool>;
     async fn erase(&self, key: &ObjectKey, version: &PhysicalObjectVersion) -> Result<()>;
 }
 
@@ -44,6 +66,10 @@ pub(super) trait ExactVersions: Send + Sync {
 impl ExactVersions for rtdb_s3::VersionedInventory {
     async fn available(&self, key: &ObjectKey, version: &PhysicalObjectVersion) -> Result<bool> {
         self.exact_retirement_available(key, version).await
+    }
+
+    async fn absent(&self, key: &ObjectKey, version: &PhysicalObjectVersion) -> Result<bool> {
+        self.exact_retirement_absent(key, version).await
     }
 
     async fn erase(&self, key: &ObjectKey, version: &PhysicalObjectVersion) -> Result<()> {
@@ -57,7 +83,7 @@ pub(super) async fn reap(directory: &dyn Directory, bucket: &dyn ObjectStore, pr
     let mut state = super::recover_hosted_lineage(directory, lineage).await?;
     if let Some(retirement) = state.retirement() {
         if let RetirementWork::S3 { deployment, .. } = &retirement.work && *deployment == candidate.id {
-            finish(directory, bucket, provider, lineage, &state, retirement, keys).await?;
+            finish(directory, bucket, provider, lineage, &state, retirement, keys, threshold).await?;
         }
         return Ok(());
     }
@@ -69,13 +95,14 @@ pub(super) async fn reap(directory: &dyn Directory, bucket: &dyn ObjectStore, pr
         let mut eligible = Vec::new();
         for marker in bucket.list(Some(&markers)).await? {
             let Some(witness) = read_release(bucket, &marker.key).await? else { continue; };
-            if witness.release_version.is_none() || witness.record.trie_floor.is_none()
-                || !permits_release(candidate, &store, &witness.record) || witness.record.released_at_ms > threshold { continue; }
-            let target = ObjectKey::new(format!("{store}/{}", witness.record.key))?;
+            let Some(relative) = witness.target_name().filter(|_| witness.release_version.is_some()) else { continue; };
+            if witness.record.released_at_ms > threshold || !permits_release(candidate, &store, &witness.record) { continue; }
+            let target = ObjectKey::new(format!("{store}/{relative}"))?;
             if advisory.is_some_and(|observed| observed.has_declared_reference(&target) || observed.has_declared_reference(&marker.key)) { continue; }
             eligible.push((marker.key, target, witness));
         }
         let mut receipts = None;
+        let mut checked = BTreeSet::new();
         for (marker, target, witness) in &eligible {
             let (version, legacy_receipt) = match (&witness.version, keys) {
                 (Some(version), _) => (version.clone(), None),
@@ -90,6 +117,11 @@ pub(super) async fn reap(directory: &dyn Directory, bucket: &dyn ObjectStore, pr
                 (None, None) => continue,
             };
             let Some(release_version) = &witness.release_version else { continue; };
+            if witness.pack.is_some() {
+                if !checked.insert((target.clone(), version.version.clone())) { continue; }
+                // Keep an incomplete pack from repeatedly closing its lineage.
+                if pack_release_bound(bucket, provider, target, witness, &markers, threshold).await?.is_none() { continue; }
+            }
             if !provider.available(target, &version).await? || !provider.available(marker, release_version).await? { continue; }
             let retirement = LineageRetirement {
                 token: Uuid::new_v4(), source: source.clone(),
@@ -99,7 +131,7 @@ pub(super) async fn reap(directory: &dyn Directory, bucket: &dyn ObjectStore, pr
             let reserved = directory.change_lineage(lineage, LineageChange::ReserveRetirement {
                 retirement: retirement.clone(), observed_references: state.reference_revision(), generation: state.retirement_generation(),
             }).await?;
-            if finish(directory, bucket, provider, lineage, &reserved, &retirement, keys).await? { return Ok(()); }
+            if finish(directory, bucket, provider, lineage, &reserved, &retirement, keys, threshold).await? { return Ok(()); }
             state = directory.lineage_state(lineage).await?;
             if state.preparations().next().is_some() || state.open_generation().is_none() { return Ok(()); }
         }
@@ -108,12 +140,12 @@ pub(super) async fn reap(directory: &dyn Directory, bucket: &dyn ObjectStore, pr
 }
 
 async fn finish(directory: &dyn Directory, bucket: &dyn ObjectStore, provider: &dyn ExactVersions,
-    lineage: &str, state: &LineageState, retirement: &LineageRetirement, keys: Option<&dyn KeyService>) -> Result<bool> {
+    lineage: &str, state: &LineageState, retirement: &LineageRetirement, keys: Option<&dyn KeyService>, threshold: i64) -> Result<bool> {
     let RetirementWork::S3 { deployment, target, release, version, release_version, .. } = &retirement.work else { return Err(changed()); };
     let target = ObjectKey::new(target)?;
     let release = ObjectKey::new(release)?;
     if !state.exact_erasure_authorized() {
-        let ready = prepare(directory, bucket, lineage, retirement, &target, &release, keys).await;
+        let ready = prepare(directory, bucket, provider, lineage, retirement, &target, &release, keys, threshold).await;
         match ready {
             Ok(true) => {
                 if let Err(error) = directory.change_lineage(lineage, LineageChange::AuthorizeExactErasure { retirement: retirement.clone() }).await {
@@ -160,8 +192,51 @@ async fn settle(directory: &dyn Directory, lineage: &str, deployment: &str, reti
     Err(changed())
 }
 
-async fn prepare(directory: &dyn Directory, bucket: &dyn ObjectStore, lineage: &str, retirement: &LineageRetirement,
-    target: &ObjectKey, release: &ObjectKey, keys: Option<&dyn KeyService>) -> Result<bool> {
+// The pack index fixes the set of members. Only evidence for the same immutable
+// publication can cover a member, and each member must be checkpoint metadata.
+async fn pack_release_bound(bucket: &dyn ObjectStore, provider: &dyn ExactVersions,
+    target: &ObjectKey, witness: &ReleaseWitness, markers: &ObjectKey, threshold: i64) -> Result<Option<PackReadiness>> {
+    let Some(version) = witness.version.as_ref() else { return Err(changed()); };
+    let index = match observe_pack_index(bucket, target).await {
+        Ok(index) if index.version.as_ref() == Some(version) => index.value,
+        Ok(_) | Err(Error::MissingObject(_)) => return Ok(provider.absent(target, version).await?.then_some(PackReadiness::AlreadyAbsent)),
+        Err(error) => return Err(error.into()),
+    };
+    if !index.entries.contains_key(&witness.record.key) { return Ok(None); }
+    let mut uncovered = BTreeSet::new();
+    let Some(pack) = witness.pack.as_deref() else { return Err(changed()); };
+    let Some(block) = pack_block(pack) else { return Err(changed()); };
+    let catalog = block_key(BlockIndex(block))?;
+    if !index.entries.contains_key(&catalog) { return Ok(None); }
+    let mut youngest = block;
+    for name in index.entries.into_keys() {
+        let Some(member) = checkpoint_metadata_block(&name) else { return Ok(None); };
+        youngest = youngest.max(member);
+        if name != witness.record.key { uncovered.insert(name); }
+    }
+    if !uncovered.is_empty() {
+        for marker in bucket.list(Some(markers)).await? {
+            let Some(member) = read_release(bucket, &marker.key).await? else { continue; };
+            if member.target_name() == Some(pack) && member.version == witness.version
+                && member.release_version.is_some() && member.record.released_at_ms <= threshold
+            {
+                uncovered.remove(&member.record.key);
+                if uncovered.is_empty() { break; }
+            }
+        }
+    }
+    if !uncovered.is_empty() { return Ok(None); }
+    Ok(Some(PackReadiness::Covered { block, youngest }))
+}
+
+#[derive(Clone, Copy)]
+enum PackReadiness {
+    AlreadyAbsent,
+    Covered { block: i64, youngest: i64 },
+}
+
+async fn prepare(directory: &dyn Directory, bucket: &dyn ObjectStore, provider: &dyn ExactVersions, lineage: &str, retirement: &LineageRetirement,
+    target: &ObjectKey, release: &ObjectKey, keys: Option<&dyn KeyService>, threshold: i64) -> Result<bool> {
     let RetirementWork::S3 { deployment, version, release_version, legacy_receipt, .. } = &retirement.work else { return Err(changed()); };
     let root = ObjectKey::new(&retirement.source)?;
     let Some((store, relative)) = target.as_str().strip_prefix(&format!("{root}/")).and_then(|suffix| suffix.split_once('/'))
@@ -169,23 +244,30 @@ async fn prepare(directory: &dyn Directory, bucket: &dyn ObjectStore, lineage: &
     let store = format!("{root}/{store}");
     let markers = ObjectKey::new(format!("{store}/{GARBAGE_DIRECTORY}"))?;
     if !release.is_under(&markers) { return Err(changed()); }
-    let Some(ReleaseWitness { record: witness, version: observed, release_version: observed_release }) =
-        read_release(bucket, release).await? else { return Ok(false); };
-    if witness.key != relative || witness.trie_floor.is_none()
-        || release_version.as_ref().is_some_and(|expected| observed_release.as_ref() != Some(expected))
+    let Some(witness) = read_release(bucket, release).await? else { return Ok(false); };
+    if witness.target_name() != Some(relative)
+        || release_version.as_ref().is_some_and(|expected| witness.release_version.as_ref() != Some(expected))
     {
         return Err(changed());
     }
-    match (observed, legacy_receipt.as_deref(), keys) {
-        (Some(observed), None, _) if observed == *version => {},
+    if witness.record.released_at_ms > threshold { return Ok(false); }
+    match (witness.version.as_ref(), legacy_receipt.as_deref(), keys) {
+        (Some(observed), None, _) if observed == version => {},
         (None, Some(receipt), Some(keys)) if release_version.is_some() => {
             let owner = directory.deployment(deployment).await?.ok_or_else(changed)?;
             if owner.storage_prefix() != retirement.source
-                || !receipts::verify(bucket, keys, &owner, &store, &witness, receipt, version).await?
+                || !receipts::verify(bucket, keys, &owner, &store, &witness.record, receipt, version).await?
             { return Ok(false); }
         }
         _ => return Ok(false),
     }
+    let pack = if witness.pack.is_some() {
+        if release_version.is_none() { return Err(changed()); }
+        let Some(ready) = pack_release_bound(bucket, provider, target, &witness, &markers, threshold).await? else { return Ok(false); };
+        Some(ready)
+    } else {
+        None
+    };
     let release_name = release.as_str().strip_prefix(&format!("{store}/")).ok_or_else(changed)?;
 
     let deployments = directory.deployments().await?;
@@ -198,9 +280,29 @@ async fn prepare(directory: &dyn Directory, bucket: &dyn ObjectStore, lineage: &
         }
     }
 
+    if pack.is_some() {
+        let base = Base::load(bucket, &store).await?;
+        if base.objects.contains_key(release_name) { return Ok(false); }
+        if matches!(pack, Some(PackReadiness::Covered { .. })) && base.objects.contains_key(relative) { return Ok(false); }
+    }
+    let mut observed_successor = None;
+    if let Some(PackReadiness::Covered { block, youngest }) = pack {
+        let Some(owner) = deployments.iter().find(|record| record.id == *deployment) else { return Ok(false); };
+        let Some(checkpoint) = owner.checkpoint else { return Ok(false); };
+        if !checkpoint_pack_collectable(block, youngest, Some(checkpoint.block), None) { return Ok(false); }
+        let catalog = block_key(BlockIndex(checkpoint.block))?;
+        let successor = ObjectKey::new(format!("{store}/{}", block_pack(&catalog)))?;
+        match observe_pack_index(bucket, &successor).await {
+            Ok(index) if index.version.is_some() && index.value.entries.contains_key(&catalog) => {},
+            Ok(_) | Err(Error::MissingObject(_)) => return Ok(false),
+            Err(error) => return Err(error.into()),
+        }
+        observed_successor = Some(checkpoint);
+    }
+
     crate::admin::update_installation(directory, deployment, |record| {
         if record.lineage != lineage || record.storage_prefix() != retirement.source || !can_reap(record)
-            || !permits_release(record, &store, &witness)
+            || !permits_release(record, &store, &witness.record)
         {
             return Err(changed());
         }
@@ -209,6 +311,14 @@ async fn prepare(directory: &dyn Directory, bucket: &dyn ObjectStore, lineage: &
             StorageRegion::Remote { archive: Some(_), .. } | StorageRegion::Local { archive: Some(_), .. } => true,
             _ => false,
         }) { return Err(changed()); }
+        if let Some(PackReadiness::Covered { block, youngest }) = pack {
+            let oldest = record.storage_regions.values().filter_map(StorageRegion::checkpoint_metadata_from).min();
+            if record.checkpoint != observed_successor
+                || !checkpoint_pack_collectable(block, youngest, record.checkpoint.map(|checkpoint| checkpoint.block), oldest)
+            {
+                return Err(changed());
+            }
+        }
         let fence = StorageRegion::ExactRetirement { object: target.to_string(), release: release_version.as_ref().map(|_| release.to_string()) };
         if let Some(previous) = record.storage_regions.insert(retirement.token, fence.clone()) && previous != fence {
             return Err(changed());
@@ -216,10 +326,12 @@ async fn prepare(directory: &dyn Directory, bucket: &dyn ObjectStore, lineage: &
         Ok(())
     }).await?;
 
-    let base = Base::load(bucket, &store).await?;
-    let mut released = std::collections::BTreeSet::from([relative.to_owned()]);
-    if release_version.is_some() { released.insert(release_name.to_owned()); }
-    base.forget(bucket, &store, &released).await?;
+    if pack.is_none() {
+        let base = Base::load(bucket, &store).await?;
+        let mut released = BTreeSet::from([relative.to_owned()]);
+        if release_version.is_some() { released.insert(release_name.to_owned()); }
+        base.forget(bucket, &store, &released).await?;
+    }
     Ok(true)
 }
 
@@ -244,34 +356,61 @@ mod tests {
 
     use super::*;
 
-    struct VersionedReleaseStore(MemoryStore);
+    #[derive(Default)]
+    struct VersionedReleaseStore {
+        objects: MemoryStore,
+        versions: parking_lot::Mutex<BTreeMap<ObjectKey, String>>,
+    }
+
+    impl VersionedReleaseStore {
+        fn version(&self, key: &ObjectKey) -> PhysicalObjectVersion {
+            PhysicalObjectVersion {
+                namespace: S3ObjectNamespace { bucket: "cell".into(), endpoint: None, region: None },
+                key: format!("cell/{}", key.as_str().replace('~', "%7E")),
+                version: self.versions.lock().get(key).cloned().unwrap_or_else(|| "marker".into()),
+            }
+        }
+    }
 
     #[async_trait]
     impl ObjectStore for VersionedReleaseStore {
         async fn head(&self, key: &ObjectKey) -> rtdb_storage::Result<rtdb_storage::object_store::StoredObject> {
-            self.0.head(key).await
+            self.objects.head(key).await
         }
-        async fn get(&self, key: &ObjectKey) -> rtdb_storage::Result<Bytes> { self.0.get(key).await }
+        async fn observe_head(&self, key: &ObjectKey) -> rtdb_storage::Result<rtdb_storage::ObjectObservation<rtdb_storage::object_store::StoredObject>> {
+            Ok(rtdb_storage::ObjectObservation { value: self.head(key).await?, version: Some(self.version(key)) })
+        }
+        async fn observe_range(&self, key: &ObjectKey, range: std::ops::Range<u64>) -> rtdb_storage::Result<rtdb_storage::ObjectObservation<Bytes>> {
+            Ok(rtdb_storage::ObjectObservation { value: self.get_range(key, range).await?, version: Some(self.version(key)) })
+        }
+        async fn retirement_version(&self, key: &ObjectKey) -> rtdb_storage::Result<Option<PhysicalObjectVersion>> {
+            match self.head(key).await {
+                Ok(_) => Ok(Some(self.version(key))),
+                Err(Error::MissingObject(_)) => Ok(None),
+                Err(error) => Err(error),
+            }
+        }
+        async fn get(&self, key: &ObjectKey) -> rtdb_storage::Result<Bytes> { self.objects.get(key).await }
         async fn get_range(&self, key: &ObjectKey, range: std::ops::Range<u64>) -> rtdb_storage::Result<Bytes> {
-            self.0.get_range(key, range).await
+            self.objects.get_range(key, range).await
         }
         async fn put(&self, key: &ObjectKey, bytes: Bytes) -> rtdb_storage::Result<()> {
-            self.0.put(key, bytes).await
+            self.objects.put(key, bytes).await
+        }
+        async fn put_with_version(&self, key: &ObjectKey, bytes: Bytes) -> rtdb_storage::Result<Option<PhysicalObjectVersion>> {
+            self.put(key, bytes).await?;
+            Ok(Some(self.version(key)))
         }
         async fn put_file(&self, key: &ObjectKey, path: &std::path::Path) -> rtdb_storage::Result<()> {
-            self.0.put_file(key, path).await
+            self.objects.put_file(key, path).await
         }
         async fn list(&self, key: Option<&ObjectKey>) -> rtdb_storage::Result<Vec<rtdb_storage::object_store::StoredObject>> {
-            self.0.list(key).await
+            self.objects.list(key).await
         }
-        async fn delete(&self, key: &ObjectKey) -> rtdb_storage::Result<()> { self.0.delete(key).await }
+        async fn delete(&self, key: &ObjectKey) -> rtdb_storage::Result<()> { self.objects.delete(key).await }
         async fn observe_fresh_exact(&self, key: &ObjectKey, length: usize) -> rtdb_storage::Result<rtdb_storage::ObjectObservation<Bytes>> {
-            let value = self.0.get_fresh_exact(key, length).await?;
-            let version = PhysicalObjectVersion {
-                namespace: S3ObjectNamespace { bucket: "cell".into(), endpoint: None, region: None },
-                key: format!("cell/{}", key.as_str().replace('~', "%7E")), version: "marker".into(),
-            };
-            Ok(rtdb_storage::ObjectObservation { value, version: Some(version) })
+            let value = self.objects.get_fresh_exact(key, length).await?;
+            Ok(rtdb_storage::ObjectObservation { value, version: Some(self.version(key)) })
         }
     }
 
@@ -287,6 +426,8 @@ mod tests {
             assert_eq!(version.key, format!("cell/{}", key.as_str().replace('~', "%7E")));
             Ok(true)
         }
+
+        async fn absent(&self, _key: &ObjectKey, _version: &PhysicalObjectVersion) -> Result<bool> { Ok(false) }
 
         async fn erase(&self, key: &ObjectKey, version: &PhysicalObjectVersion) -> Result<()> {
             assert_eq!(version.key, format!("cell/{}", key.as_str().replace('~', "%7E")));
@@ -306,7 +447,7 @@ mod tests {
     #[tokio::test]
     async fn exact_retirement_waits_for_forks_and_reads_and_resumes_the_same_version() {
         let directory = MemoryDirectory::new();
-        let bucket: crate::reference::Bucket = std::sync::Arc::new(VersionedReleaseStore(MemoryStore::default()));
+        let bucket: crate::reference::Bucket = std::sync::Arc::new(VersionedReleaseStore::default());
         let mut parent = DeploymentRecord::new("shop", "acme", vec![], 0);
         let namespace = Uuid::new_v4();
         parent.storage_namespaces = Some(StorageNamespaces { objects: namespace, keys: [0; 32] });
@@ -373,6 +514,90 @@ mod tests {
         }
         assert_eq!(bucket.get(&target).await.unwrap(), Bytes::from_static(b"replacement"));
     }
+    #[async_trait]
+    impl ExactVersions for VersionedReleaseStore {
+        async fn available(&self, _key: &ObjectKey, _version: &PhysicalObjectVersion) -> Result<bool> { Ok(true) }
+
+        async fn absent(&self, key: &ObjectKey, version: &PhysicalObjectVersion) -> Result<bool> {
+            Ok(self.retirement_version(key).await?.as_ref() != Some(version))
+        }
+
+        async fn erase(&self, key: &ObjectKey, version: &PhysicalObjectVersion) -> Result<()> {
+            if !self.absent(key, version).await? { self.delete(key).await?; }
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn a_hosted_metadata_pack_requires_complete_version_bound_releases_and_no_checkpoint_hold() {
+        use super::super::{GarbageStore, reaper_pass};
+        use crate::{packing::{PACK_DIRECTORY, PackDiscovery, PackingStore}, reference::PrefixedStore};
+        use rtdb_directory::Checkpoint;
+        use std::sync::Arc;
+
+        let directory = MemoryDirectory::new();
+        let bucket = Arc::new(VersionedReleaseStore::default());
+        let mut owner = DeploymentRecord::new("shop", "acme", vec![], 0);
+        owner.checkpoint = Some(Checkpoint { block: 1, boundary: 2, source: 1, system_time: 0, root_sha256: None });
+        let region = Uuid::new_v4();
+        let owner = directory.create_deployment(owner).await.unwrap();
+        let root = StorageRoot::new(CURRENT_STORAGE_VERSION, StorageEpoch(0)).unwrap().key();
+        let store = format!("{}/{root}", owner.storage_prefix());
+        let prefixed = Arc::new(PrefixedStore::new(bucket.clone(), &store));
+        let clock: super::super::Clock = Arc::new(|| 0);
+        let packing = PackingStore::open_with_clock(prefixed.clone(), PackDiscovery::List, clock.clone()).await.unwrap();
+        let garbage = GarbageStore::new(packing.clone(), clock, Some(packing));
+        let target = ObjectKey::new(format!("{store}/{PACK_DIRECTORY}/b00.pack")).unwrap();
+        let successor = ObjectKey::new(format!("{store}/{PACK_DIRECTORY}/b01.pack")).unwrap();
+        let catalog = ObjectKey::new("blocks/b00.binpb").unwrap();
+        let table = ObjectKey::new("tables/t/blocks/b00.binpb").unwrap();
+        let relative_pack = ObjectKey::new(format!("{PACK_DIRECTORY}/b00.pack")).unwrap();
+        let markers = ObjectKey::new(GARBAGE_DIRECTORY).unwrap();
+        for key in [&table, &catalog] { garbage.put(key, Bytes::from_static(b"old")).await.unwrap(); }
+        garbage.put(&ObjectKey::new("blocks/b01.binpb").unwrap(), Bytes::from_static(b"new")).await.unwrap();
+        let target_contents = bucket.get(&target).await.unwrap();
+        let original = bucket.version(&target);
+        let pass = || reap(directory.as_ref(), bucket.as_ref(), bucket.as_ref(), &owner, 0, None, None);
+
+        // Path-only and another version's member release cannot authorize this pack.
+        garbage.write_release(&table, None, None).await.unwrap();
+        garbage.write_release(&catalog, None, None).await.unwrap();
+        for result in reaper_pass(bucket.as_ref(), std::slice::from_ref(&owner), 0, Duration::ZERO).await.unwrap() {
+            result.unwrap();
+        }
+        assert!(bucket.head(&target).await.is_ok(), "hosted packs require exact reaping");
+        let different = PhysicalObjectVersion { version: "different".into(), ..original.clone() };
+        garbage.write_release_record(&table, None, Some(&different), Some(&relative_pack)).await.unwrap();
+        garbage.delete(&catalog).await.unwrap();
+        for _ in 0..2 { pass().await.unwrap(); }
+        assert!(bucket.head(&target).await.is_ok(), "every pack member needs a release for the same version");
+
+        garbage.delete(&table).await.unwrap();
+        crate::admin::update_installation(directory.as_ref(), &owner.id, |current| {
+            current.storage_regions.insert(region, StorageRegion::Local {
+                archive: None, repair_archive: None, tracks_ordered_index_pages: false,
+                checkpoint_metadata_from: Some(0), checkpoint_replay_from: None,
+            });
+            Ok(())
+        }).await.unwrap();
+        assert_eq!(pass().await.expect_err("a checkpoint metadata hold protects its pack").code, "rtdb.multi/exact-retirement");
+        assert_eq!(bucket.get(&target).await.unwrap(), target_contents);
+        super::super::release_region(directory.as_ref(), &owner.id, region, false).await.unwrap();
+        pass().await.unwrap();
+        assert!(matches!(bucket.head(&target).await, Err(Error::MissingObject(_))));
+        assert!(bucket.head(&successor).await.is_ok());
+
+        // The remaining markers can settle the absent old version even after a
+        // later version is visible at the same physical path.
+        bucket.put(&target, target_contents.clone()).await.unwrap();
+        bucket.versions.lock().insert(target.clone(), "replacement".into());
+        for _ in 0..4 { pass().await.unwrap(); }
+        assert_eq!(bucket.get(&target).await.unwrap(), target_contents);
+        assert_eq!(bucket.version(&target).version, "replacement");
+        assert_eq!(prefixed.list(Some(&markers)).await.unwrap().len(), 2, "only the legacy path records remain");
+        assert!(directory.lineage_state(&owner.lineage).await.unwrap().retirement().is_none());
+    }
+
     #[tokio::test]
     async fn the_remote_reaper_keeps_its_exact_reservation_until_both_versions_settle() {
         let data = tempfile::tempdir().unwrap();
@@ -463,7 +688,7 @@ mod tests {
             }
         });
         let bucket = MemoryStore::default();
-        let first = finish(directory.as_ref(), &bucket, &inventory, &owner.lineage, &erasing, &retirement, None).await.unwrap_err();
+        let first = finish(directory.as_ref(), &bucket, &inventory, &owner.lineage, &erasing, &retirement, None, 0).await.unwrap_err();
         assert_eq!(first.message.as_deref(), Some("The retired object version is still present"),
             "a deletion reply without absence cannot settle the retirement");
         assert_eq!(directory.deployment(&owner.id).await.unwrap().unwrap(), fenced);
@@ -472,13 +697,13 @@ mod tests {
 
         let directory = MemoryDirectory::open(data.path()).unwrap();
         let state = directory.lineage_state(&owner.lineage).await.unwrap();
-        let absent = finish(directory.as_ref(), &bucket, &inventory, &owner.lineage, &state, &retirement, None).await
+        let absent = finish(directory.as_ref(), &bucket, &inventory, &owner.lineage, &state, &retirement, None, 0).await
             .expect_err("the release marker needs its own absence evidence");
         assert_eq!(absent.message.as_deref(), Some("The retired object version is still present"));
         assert_eq!(directory.deployment(&owner.id).await.unwrap().unwrap(), fenced);
         assert_eq!(directory.lineage_state(&owner.lineage).await.unwrap().open_generation(), None);
 
-        finish(directory.as_ref(), &bucket, &inventory, &owner.lineage, &state, &retirement, None).await.unwrap();
+        finish(directory.as_ref(), &bucket, &inventory, &owner.lineage, &state, &retirement, None, 0).await.unwrap();
         tokio::time::timeout(Duration::from_secs(5), server).await.unwrap().unwrap();
         assert!(!directory.deployment(&owner.id).await.unwrap().unwrap().storage_regions.contains_key(&retirement.token),
             "settlement removes the physical owner's fence");
@@ -489,7 +714,7 @@ mod tests {
         use rtdb_format::trie_retirement::{RetirementFile, RetirementIntent, intent_digest, journal_directory};
 
         let directory = MemoryDirectory::new();
-        let bucket = VersionedReleaseStore(MemoryStore::default());
+        let bucket = VersionedReleaseStore::default();
         let files = tempfile::tempdir().unwrap();
         let keys = crate::keys::LocalKeyService::new(files.path().join("keys")).unwrap();
         let mut owner = DeploymentRecord::new("shop", "acme", vec![], 0);

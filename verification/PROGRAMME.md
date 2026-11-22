@@ -88,7 +88,11 @@ Same-lineage fork publication now advances a cell-local shared-reference revisio
 Manifest withdrawals apply to the latest confirmed manifest and preserve other committed removals. The reaper withdraws shadowed fallbacks before removing local objects or pending-release records.
 Multi serving-store fallback reads now register against the exact physical owner's residence and retain the registration through provider completion, including cancelled callers. Whole-residence disposal drains those registrations before copying the referrers and erasing the source.
 Local reclamation reserves the same lineage used by fork preparation. Whole-residence disposal retains its own reservation across retries, advanced in the same directory transaction that checks the drained residence. It scans published referrers after closing the lineage and reopens publication atomically with the disposal receipt. A remote fork carries the generation observed before its first storage read, so it must reprepare after any intervening retirement.
-Witnessed hosted trie releases now retain their exact data and marker versions through effect authorization and settlement. The physical owner and lineage reopen together. Administrative paths still need verification across old snapshots, overlapping provider effects and live hosted dependencies. Legacy, unversioned and other path-based remote collection still needs a complete retirement contract.
+Witnessed hosted trie releases retain their exact data and marker versions through effect authorization and settlement. The physical owner and lineage reopen together.
+Hosted block packs that contain only checkpoint metadata now need complete, mature release coverage for one immutable provider version, a newer published pack in the same store, and no prohibiting recovery hold or reference.
+Their remaining markers settle from exact absence of the retired version.
+L0-bearing and spill packs remain outside this path. Old path-only pack releases and unversioned stores still need a retirement contract.
+Administrative paths still need verification across old snapshots, overlapping provider effects and live hosted dependencies.
 
 **Start from:** `replication/src/{checkpoint_discovery,replay_floor,blocks}.rs`, `multi/src/{archive,recovery_holds,replica_retention}.rs`; models `tla/{RecoveryReplay,InstalledCheckpoint,Checkpoint,ResidenceRetirement}.tla`, `mcrl2/CheckpointDiscovery.mcrl2`.
 

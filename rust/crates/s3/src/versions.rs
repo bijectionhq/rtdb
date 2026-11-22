@@ -40,6 +40,12 @@ impl VersionedInventory {
         Ok(self.version_status(path.as_ref(), &observed.version).await? != VersionStatus::WouldExposeOlderData)
     }
 
+    /// Checks for durable absence of one version, even if the path has a newer publication.
+    pub async fn exact_retirement_absent(&self, key: &ObjectKey, observed: &PhysicalObjectVersion) -> Result<bool> {
+        let path = self.observed_path(key, observed)?;
+        Ok(self.version_status(path.as_ref(), &observed.version).await? == VersionStatus::Absent)
+    }
+
     /// Executes an already authorized retirement of one immutable physical version.
     /// Success means a fresh version inventory confirmed absence of that exact object.
     pub async fn retire_observed_version(&self, key: &ObjectKey, observed: &PhysicalObjectVersion) -> Result<()> {

@@ -802,11 +802,11 @@ async fn open_with_base(
         })
     };
     let packed = crate::packing::PackingStore::open_with_clock(own, discovery, Arc::clone(&clock)).await?;
-    let store = match archive {
-        Some(archive) => archive.with_serving(packed),
-        None => packed,
+    let store: Arc<dyn ObjectStore> = match archive {
+        Some(archive) => archive.with_serving(packed.clone()),
+        None => packed.clone(),
     };
-    GarbageStore::open_with_clock(store, clock).await
+    Ok(Arc::new(GarbageStore::new(store, clock, Some(packed))))
 }
 
 struct FencedStore {
@@ -972,14 +972,19 @@ pub struct GarbageRecord {
 #[derive(Serialize, Deserialize)]
 #[serde(untagged)]
 enum StoredRelease {
-    Exact { record: GarbageRecord, version: PhysicalObjectVersion },
+    Exact {
+        record: GarbageRecord,
+        version: PhysicalObjectVersion,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pack: Option<String>,
+    },
     Path(GarbageRecord),
 }
 
 impl StoredRelease {
     fn into_parts(self) -> (GarbageRecord, Option<PhysicalObjectVersion>) {
         match self {
-            Self::Exact { record, version } => (record, Some(version)),
+            Self::Exact { record, version, .. } => (record, Some(version)),
             Self::Path(record) => (record, None),
         }
     }
@@ -988,6 +993,7 @@ impl StoredRelease {
 /// Only a listing needs to know what has been released, so the released set is read on the first one, not on open.
 pub struct GarbageStore {
     inner: Arc<dyn ObjectStore>,
+    packing: Option<Arc<crate::packing::PackingStore>>,
     index_pages: Option<HostedIndexPages>,
     catalog_readers: Option<CatalogReaders>,
     loaded_releases: tokio::sync::OnceCell<()>,
@@ -998,7 +1004,11 @@ pub struct GarbageStore {
 impl GarbageStore {
     pub async fn open(inner: Arc<dyn ObjectStore>) -> Result<Arc<Self>> { Self::open_with_clock(inner, wall_clock()).await }
 
-    pub async fn open_with_clock(inner: Arc<dyn ObjectStore>, clock: Clock) -> Result<Arc<Self>> { Ok(Arc::new(Self { inner, index_pages: None, catalog_readers: None, loaded_releases: tokio::sync::OnceCell::new(), released: Mutex::new(BTreeMap::new()), clock })) }
+    pub async fn open_with_clock(inner: Arc<dyn ObjectStore>, clock: Clock) -> Result<Arc<Self>> { Ok(Arc::new(Self::new(inner, clock, None))) }
+
+    fn new(inner: Arc<dyn ObjectStore>, clock: Clock, packing: Option<Arc<crate::packing::PackingStore>>) -> Self {
+        Self { inner, packing, index_pages: None, catalog_readers: None, loaded_releases: tokio::sync::OnceCell::new(), released: Mutex::new(BTreeMap::new()), clock }
+    }
 
     async fn load_releases(&self) -> rtdb_storage::Result<()> {
         self.loaded_releases.get_or_try_init(|| async {
@@ -1024,13 +1034,17 @@ impl GarbageStore {
     }
 
     async fn write_release(&self, key: &ObjectKey, trie_floor: Option<CatalogAdmissionFloor>, version: Option<&PhysicalObjectVersion>) -> rtdb_storage::Result<()> {
+        self.write_release_record(key, trie_floor, version, None).await
+    }
+
+    async fn write_release_record(&self, key: &ObjectKey, trie_floor: Option<CatalogAdmissionFloor>, version: Option<&PhysicalObjectVersion>, pack: Option<&ObjectKey>) -> rtdb_storage::Result<()> {
         if self.released.lock().get(key).is_some_and(|known| version.is_none_or(|version| known.contains(version))) { return Ok(()); }
         let record = GarbageRecord { key: key.as_str().to_owned(), released_at_ms: (self.clock)(), trie_floor };
         let suffix = if rtdb_format::keys::is_ordered_index_object(key.as_str()) { ORDERED_INDEX_RELEASE }
             else if version.is_some() || rtdb_format::keys::is_trie_retirement_object(key.as_str()) { TRIE_RETIREMENT_RELEASE } else { "" };
         let name = ObjectKey::new(format!("{GARBAGE_DIRECTORY}/{:020}-{}{suffix}", record.released_at_ms, uuid::Uuid::new_v4().simple()))
             .map_err(|error| Error::Task(error.to_string()))?;
-        let release = match version { Some(version) => StoredRelease::Exact { record, version: version.clone() }, None => StoredRelease::Path(record) };
+        let release = match version { Some(version) => StoredRelease::Exact { record, version: version.clone(), pack: pack.map(ObjectKey::to_string) }, None => StoredRelease::Path(record) };
         self.inner.put(&name, Bytes::from(serde_json::to_vec(&release).expect("a record serializes"))).await?;
         remember_release(&mut self.released.lock(), key.clone(), version.cloned());
         Ok(())
@@ -1051,7 +1065,7 @@ fn is_collected_trie_file(key: &str) -> bool {
 }
 
 fn needs_exact_hosted_retirement(key: &str) -> bool {
-    is_collected_trie_file(key) || key.strip_prefix("tables/").and_then(|tail| tail.split_once('/'))
+    crate::packing::is_pack_key(key) || is_collected_trie_file(key) || key.strip_prefix("tables/").and_then(|tail| tail.split_once('/'))
         .is_some_and(|(_, relative)| relative.starts_with("artefacts/"))
 }
 
@@ -1134,6 +1148,12 @@ impl ObjectStore for GarbageStore {
     async fn delete(&self, key: &ObjectKey) -> rtdb_storage::Result<()> {
         if self.catalog_readers.is_some() && is_collected_trie_file(key.as_str()) {
             return Err(Error::Remote { key: key.to_string(), message: "A hosted trie file requires an installed retirement receipt".into() });
+        }
+        if checkpoint_metadata_block(key.as_str()).is_some()
+            && let Some(packing) = &self.packing
+            && let Some((pack, version)) = packing.retirement_pack(key).await?
+        {
+            return self.write_release_record(key, None, Some(&version), Some(&pack)).await;
         }
         self.write_release(key, None, None).await
     }
@@ -1242,7 +1262,9 @@ async fn reap_path_releases(bucket: &dyn ObjectStore, record: &DeploymentRecord,
                 }
                 result => result?,
             };
-            if Some(&pack) != latest.as_ref() && !walked(&pack) && index.entries.keys().all(|name| due.contains_key(name)) {
+            if (local || !own.contains(&pack)) && Some(&pack) != latest.as_ref()
+                && !walked(&pack) && index.entries.keys().all(|name| due.contains_key(name))
+            {
                 obsolete_packs.push(pack);
             } else {
                 packed.extend(index.entries.into_keys());

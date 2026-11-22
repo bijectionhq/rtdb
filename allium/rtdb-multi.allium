@@ -1582,6 +1582,10 @@ rule ReapUnreachable {
     -- The reservation advances the preparation generation and holds until the sweep's provider work drains.
     -- The sweep scans published referrers after reserving the lineage and copies retained objects before removing the source copies.
     -- An S3 loose-file release with an installed publication witness records the exact provider version.
+    -- A hosted pack is erased by exact version after the indexed members of that same version each have a mature release.
+    -- Only checkpoint metadata may be covered by this pack collector. A newer published pack must be present in the same store.
+    -- The owner CAS checks the pack's block and the greatest covered metadata block against its current checkpoint and holds.
+    -- An exact absence observation permits residual member release markers to settle while a replacement pack remains available.
     -- Hosted preparation for a fork, checkpoint capture or cell transfer holds its source lineage until provider work drains.
     when: candidate: GarbageCandidate.released_at + config.reaper_grace <= now
 
