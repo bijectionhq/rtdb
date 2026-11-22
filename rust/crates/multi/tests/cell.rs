@@ -2101,7 +2101,8 @@ async fn a_small_flush_writes_one_pack_and_its_catalog() {
     let root = cell.data.path().join("objects");
     let objects: Vec<String> = files_under(&root.join(record.storage_prefix())).into_iter().map(|path| path.to_string_lossy().into_owned()).collect();
     assert_eq!(objects.iter().filter(|path| path.contains("/~packs/")).count(), 1, "{objects:#?}");
-    assert_eq!(objects.iter().filter(|path| path.contains("/tables/")).count(), 0, "no table file is its own object: {objects:#?}");
+    assert!(!objects.iter().any(|path| path.contains("/blocks/") || path.contains("/l00-")),
+        "block metadata and L0 files belong to the pack: {objects:#?}");
     let client = cell.connect("shop").await;
     assert_eq!(values(&client, "SELECT v FROM items").await, ["1"], "a packed block reads back after the park");
     drop(client);
