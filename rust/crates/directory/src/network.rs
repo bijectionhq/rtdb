@@ -19,7 +19,7 @@ use tokio::sync::{broadcast, mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
 
-use crate::{Cas, ChangeFeed, DeploymentRecord, Directory, MemberId, MemberRecord, Version};
+use crate::{Cas, ChangeFeed, DeploymentRecord, Directory, ForkPreparation, LineageChange, LineageState, MemberId, MemberRecord, Version};
 
 /// A longer line closes the connection rather than growing the buffer without bound.
 const MAX_LINE: u64 = 64 << 20;
@@ -28,8 +28,10 @@ const MAX_LINE: u64 = 64 << 20;
 #[serde(rename_all = "snake_case")]
 enum Op {
     CreateDeployment { record: DeploymentRecord },
-    CreateFork { child: DeploymentRecord, expected_parent: Version },
+    CreateFork { child: DeploymentRecord, expected_parent: Version, #[serde(default)] preparation: Option<ForkPreparation> },
     SharedReferenceRevision { lineage: String },
+    LineageState { lineage: String },
+    ChangeLineage { lineage: String, change: LineageChange },
     Deployment { id: String },
     DeploymentByName { name: String },
     Deployments,
@@ -44,7 +46,7 @@ enum Op {
 impl Op {
     /// A read may be resent after a lost connection; a write may already have applied.
     fn is_read(&self) -> bool {
-        matches!(self, Self::Deployment { .. } | Self::DeploymentByName { .. } | Self::Deployments | Self::DeploymentsHeldBy { .. } | Self::Member { .. } | Self::Members | Self::SharedReferenceRevision { .. })
+        matches!(self, Self::Deployment { .. } | Self::DeploymentByName { .. } | Self::Deployments | Self::DeploymentsHeldBy { .. } | Self::Member { .. } | Self::Members | Self::SharedReferenceRevision { .. } | Self::LineageState { .. })
     }
 }
 
@@ -56,6 +58,7 @@ enum Reply {
     Deployments(Vec<DeploymentRecord>),
     DeploymentCas(Cas<DeploymentRecord>),
     SharedReferenceRevision(Version),
+    LineageState(LineageState),
     Member(MemberRecord),
     OptionalMember(Option<MemberRecord>),
     Members(Vec<MemberRecord>),
@@ -93,8 +96,10 @@ struct Response { id: u64, result: std::result::Result<Reply, Anomaly> }
 async fn dispatch(directory: &dyn Directory, op: Op) -> Result<Reply> {
     Ok(match op {
         Op::CreateDeployment { record } => Reply::Deployment(directory.create_deployment(record).await?),
-        Op::CreateFork { child, expected_parent } => Reply::Deployment(directory.create_fork(child, expected_parent).await?),
+        Op::CreateFork { child, expected_parent, preparation } => Reply::Deployment(directory.publish_fork(child, expected_parent, preparation).await?),
         Op::SharedReferenceRevision { lineage } => Reply::SharedReferenceRevision(directory.shared_reference_revision(&lineage).await?),
+        Op::LineageState { lineage } => Reply::LineageState(directory.lineage_state(&lineage).await?),
+        Op::ChangeLineage { lineage, change } => Reply::LineageState(directory.change_lineage(&lineage, change).await?),
         Op::Deployment { id } => Reply::OptionalDeployment(directory.deployment(&id).await?),
         Op::DeploymentByName { name } => Reply::OptionalDeployment(directory.deployment_by_name(&name).await?),
         Op::Deployments => Reply::Deployments(directory.deployments().await?),
@@ -423,11 +428,17 @@ impl Directory for RemoteDirectory {
     async fn create_deployment(&self, record: DeploymentRecord) -> Result<DeploymentRecord> {
         match self.call(Op::CreateDeployment { record }).await? { Reply::Deployment(record) => Ok(record), other => Err(protocol(other)) }
     }
-    async fn create_fork(&self, child: DeploymentRecord, expected_parent: Version) -> Result<DeploymentRecord> {
-        match self.call(Op::CreateFork { child, expected_parent }).await? { Reply::Deployment(record) => Ok(record), other => Err(protocol(other)) }
+    async fn publish_fork(&self, child: DeploymentRecord, expected_parent: Version, preparation: Option<ForkPreparation>) -> Result<DeploymentRecord> {
+        match self.call(Op::CreateFork { child, expected_parent, preparation }).await? { Reply::Deployment(record) => Ok(record), other => Err(protocol(other)) }
     }
     async fn shared_reference_revision(&self, lineage: &str) -> Result<Version> {
         match self.call(Op::SharedReferenceRevision { lineage: lineage.to_owned() }).await? { Reply::SharedReferenceRevision(version) => Ok(version), other => Err(protocol(other)) }
+    }
+    async fn lineage_state(&self, lineage: &str) -> Result<LineageState> {
+        match self.call(Op::LineageState { lineage: lineage.to_owned() }).await? { Reply::LineageState(state) => Ok(state), other => Err(protocol(other)) }
+    }
+    async fn change_lineage(&self, lineage: &str, change: LineageChange) -> Result<LineageState> {
+        match self.call(Op::ChangeLineage { lineage: lineage.to_owned(), change }).await? { Reply::LineageState(state) => Ok(state), other => Err(protocol(other)) }
     }
     async fn deployment(&self, id: &str) -> Result<Option<DeploymentRecord>> {
         match self.call(Op::Deployment { id: id.to_owned() }).await? { Reply::OptionalDeployment(record) => Ok(record), other => Err(protocol(other)) }

@@ -808,9 +808,16 @@ pub trait Directory: Send + Sync {
     /// Stores a new deployment; refuses if its id or name is taken.
     async fn create_deployment(&self, record: DeploymentRecord) -> Result<DeploymentRecord>;
     /// Creates the child and its name with the parent version check and, for a shared fork, advances the lineage's reference revision in the same transaction.
-    async fn create_fork(&self, child: DeploymentRecord, expected_parent: Version) -> Result<DeploymentRecord>;
+    async fn create_fork(&self, child: DeploymentRecord, expected_parent: Version) -> Result<DeploymentRecord> {
+        self.publish_fork(child, expected_parent, None).await
+    }
+    async fn publish_fork(&self, child: DeploymentRecord, expected_parent: Version, preparation: Option<ForkPreparation>) -> Result<DeploymentRecord>;
     /// Monotone revision of shared fork publications in this cell. An untouched lineage starts at zero.
-    async fn shared_reference_revision(&self, lineage: &str) -> Result<Version>;
+    async fn shared_reference_revision(&self, lineage: &str) -> Result<Version> {
+        Ok(self.lineage_state(lineage).await?.reference_revision())
+    }
+    async fn lineage_state(&self, lineage: &str) -> Result<LineageState>;
+    async fn change_lineage(&self, lineage: &str, change: LineageChange) -> Result<LineageState>;
     async fn deployment(&self, id: &str) -> Result<Option<DeploymentRecord>>;
     async fn deployment_by_name(&self, name: &str) -> Result<Option<DeploymentRecord>>;
     async fn deployments(&self) -> Result<Vec<DeploymentRecord>>;
@@ -855,6 +862,9 @@ fn fork_conflict() -> Anomaly {
 }
 
 mod reference_revision;
+mod lineage;
+pub use lineage::{ForkPreparation, LineageChange, LineageRetirement, LineageState};
+use lineage::StoredLineage;
 
 const REFERENCE_REVISION_PREFIX: &str = "~reference-revision/";
 
@@ -895,7 +905,7 @@ struct MemoryState {
     deployments: BTreeMap<String, Box<DeploymentRecord>>,
     names: BTreeMap<String, String>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    reference_revisions: BTreeMap<String, Version>,
+    reference_revisions: BTreeMap<String, StoredLineage>,
     #[serde(skip)]
     held: BTreeMap<MemberId, BTreeSet<String>>,
     members: BTreeMap<MemberId, MemberRecord>,
@@ -940,13 +950,13 @@ impl MemoryDirectory {
         }
         Ok(())
     }
-    fn insert_deployment(&self, state: &mut MemoryState, mut record: DeploymentRecord, shared_lineage: Option<String>) -> Result<DeploymentRecord> {
+    fn insert_deployment(&self, state: &mut MemoryState, mut record: DeploymentRecord, lineage: Option<(String, LineageState)>) -> Result<DeploymentRecord> {
         require_deployment_name(&record.name)?;
         if state.deployments.contains_key(&record.id) { return Err(exists("Deployment", &record.id)); }
         if state.names.contains_key(&record.name) { return Err(exists("Deployment name", &record.name)); }
-        if let Some(lineage) = shared_lineage {
-            let revision = state.reference_revisions.entry(lineage).or_default();
-            *revision = next_reference_revision(*revision)?;
+        if let Some((lineage, next)) = lineage {
+            let stored = next.legacy_revision().map_or_else(|| StoredLineage::Current(next), StoredLineage::Legacy);
+            state.reference_revisions.insert(lineage, stored);
         }
         record.version = 1;
         state.names.insert(record.name.clone(), record.id.clone());
@@ -966,14 +976,29 @@ impl Directory for MemoryDirectory {
         let mut state = self.state()?;
         self.insert_deployment(&mut state, record, None)
     }
-    async fn create_fork(&self, child: DeploymentRecord, expected_parent: Version) -> Result<DeploymentRecord> {
+    async fn publish_fork(&self, child: DeploymentRecord, expected_parent: Version, preparation: Option<ForkPreparation>) -> Result<DeploymentRecord> {
         let mut state = self.state()?;
-        let lineage = shared_fork_lineage(&child, state.deployments.get(fork_parent_id(&child)?).map(Box::as_ref), expected_parent)?;
-        let lineage = lineage.map(str::to_owned);
-        self.insert_deployment(&mut state, child, lineage)
+        let parent = state.deployments.get(fork_parent_id(&child)?).map(Box::as_ref).ok_or_else(fork_conflict)?;
+        let shared = shared_fork_lineage(&child, Some(parent), expected_parent)?.is_some();
+        let update = if shared || preparation.is_some() {
+            let lineage = parent.lineage.clone();
+            let current = state.reference_revisions.get(&lineage).map(StoredLineage::state).unwrap_or_default();
+            Some((lineage, current.published(preparation, shared)?))
+        } else { None };
+        self.insert_deployment(&mut state, child, update)
     }
-    async fn shared_reference_revision(&self, lineage: &str) -> Result<Version> {
-        Ok(self.state()?.reference_revisions.get(lineage).copied().unwrap_or_default())
+    async fn lineage_state(&self, lineage: &str) -> Result<LineageState> {
+        Ok(self.state()?.reference_revisions.get(lineage).map(StoredLineage::state).unwrap_or_default())
+    }
+    async fn change_lineage(&self, lineage: &str, change: LineageChange) -> Result<LineageState> {
+        let mut state = self.state()?;
+        let current = state.reference_revisions.get(lineage).map(StoredLineage::state).unwrap_or_default();
+        let next = current.changed(change)?;
+        if next != current {
+            state.reference_revisions.insert(lineage.to_owned(), StoredLineage::Current(next.clone()));
+            self.persist(&mut state)?;
+        }
+        Ok(next)
     }
     async fn deployment(&self, id: &str) -> Result<Option<DeploymentRecord>> { Ok(self.state()?.deployments.get(id).map(Box::as_ref).cloned()) }
     async fn deployment_by_name(&self, name: &str) -> Result<Option<DeploymentRecord>> {
@@ -1040,6 +1065,34 @@ mod tests {
     #[tokio::test]
     async fn memory_directory_meets_the_contract() {
         contract::run(MemoryDirectory::new().as_ref()).await;
+    }
+
+    #[tokio::test]
+    async fn a_local_lineage_reservation_survives_reopening_a_revision_only_directory() {
+        let root = std::env::temp_dir().join(format!("rtdb-lineage-{}", uuid::Uuid::new_v4()));
+        let lineage = "retained-lineage";
+        std::fs::create_dir(&root).unwrap();
+        MemoryDirectory::initialize(&root).unwrap();
+        let directory = MemoryDirectory::open(&root).unwrap();
+        {
+            let mut state = directory.state().unwrap();
+            state.reference_revisions.insert(lineage.into(), StoredLineage::Legacy(2));
+            directory.persist(&mut state).unwrap();
+        }
+        drop(directory);
+        let directory = MemoryDirectory::open(&root).unwrap();
+        let retirement = LineageRetirement { token: uuid::Uuid::new_v4(), source: "retained-residence".into(), local_volume: [1; 32] };
+        directory.change_lineage(lineage, LineageChange::ReserveRetirement {
+            retirement: retirement.clone(), observed_references: 2, generation: 0,
+        }).await.unwrap();
+        drop(directory);
+        let directory = MemoryDirectory::open(&root).unwrap();
+        let state = directory.lineage_state(lineage).await.unwrap();
+        assert_eq!(state.retirement(), Some(&retirement));
+        assert_eq!(state.reference_revision(), 2);
+        assert_eq!(state.retirement_generation(), 1);
+        drop(directory);
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

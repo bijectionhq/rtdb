@@ -23,6 +23,13 @@ pub struct VersionedInventory {
     scope_multipart_listing: bool,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum VersionStatus {
+    Absent,
+    WouldExposeOlderData,
+    SafeToRemove,
+}
+
 impl VersionedInventory {
     pub(crate) fn new(client: Client, namespace: S3ObjectNamespace, root: ObjectKey, requester_pays: bool, scope_multipart_listing: bool) -> Self {
         Self { client, namespace, root, request_payer: requester_pays.then_some(RequestPayer::Requester), scope_multipart_listing }
@@ -31,9 +38,11 @@ impl VersionedInventory {
     /// Executes an already authorized retirement of one immutable physical version.
     /// Success means a fresh version inventory confirmed absence of that exact object.
     pub async fn retire_observed_version(&self, key: &ObjectKey, observed: &PhysicalObjectVersion) -> Result<()> {
-        let path = Path::from(format!("{}/{key}", self.root));
-        if observed.namespace != self.namespace || observed.key != path.as_ref() || !valid_object_version(observed.version.as_bytes()) {
-            return Err(unavailable("The retirement does not identify an immutable version of this key"));
+        let path = self.observed_path(key, observed)?;
+        match self.version_status(path.as_ref(), &observed.version).await? {
+            VersionStatus::Absent => return Ok(()),
+            VersionStatus::WouldExposeOlderData => return Err(unavailable("Retiring the current version would expose older data")),
+            VersionStatus::SafeToRemove => {},
         }
         match self.client.delete_object().bucket(&self.namespace.bucket).key(path.as_ref()).version_id(&observed.version)
             .set_request_payer(self.request_payer.clone()).send().await
@@ -42,31 +51,51 @@ impl VersionedInventory {
             Err(error) if error.as_service_error().and_then(|error| error.code()) == Some("NoSuchVersion") => {},
             Err(error) => return Err(unavailable(format!("Removing the observed version failed: {error}"))),
         }
-        if self.contains_version(path.as_ref(), &observed.version).await? {
+        if self.version_status(path.as_ref(), &observed.version).await? != VersionStatus::Absent {
             return Err(unavailable("The retired object version is still present"));
         }
         Ok(())
     }
 
-    async fn contains_version(&self, key: &str, version: &str) -> Result<bool> {
+    fn observed_path(&self, key: &ObjectKey, observed: &PhysicalObjectVersion) -> Result<Path> {
+        let path = Path::from(format!("{}/{key}", self.root));
+        if observed.namespace != self.namespace || observed.key != path.as_ref() || !valid_object_version(observed.version.as_bytes()) {
+            return Err(unavailable("The retirement does not identify an immutable version of this key"));
+        }
+        Ok(path)
+    }
+
+    async fn version_status(&self, key: &str, version: &str) -> Result<VersionStatus> {
         let mut marker: (Option<String>, Option<String>) = (None, None);
         let mut seen = BTreeSet::new();
+        let mut target_latest = None;
+        let mut other_data = false;
         loop {
             let page = self.client.list_object_versions().bucket(&self.namespace.bucket).prefix(key).max_keys(1000)
                 .set_key_marker(marker.0.clone()).set_version_id_marker(marker.1.clone())
                 .set_request_payer(self.request_payer.clone()).send().await
                 .map_err(|error| unavailable(format!("Checking the retired version failed: {error}")))?;
-            for (listed_key, listed_version) in page.versions().iter().map(|entry| (entry.key(), entry.version_id()))
-                .chain(page.delete_markers().iter().map(|entry| (entry.key(), entry.version_id())))
+            for (listed_key, listed_version, latest, data) in page.versions().iter().map(|entry| (entry.key(), entry.version_id(), entry.is_latest(), true))
+                .chain(page.delete_markers().iter().map(|entry| (entry.key(), entry.version_id(), entry.is_latest(), false)))
             {
                 let listed_key = listed_key.filter(|listed| listed.starts_with(key))
                     .ok_or_else(|| unavailable("S3 listed a key outside the requested prefix"))?;
                 let listed_version = listed_version.filter(|listed| !listed.is_empty())
                     .ok_or_else(|| unavailable("S3 listed a key without its version identifier"))?;
-                if listed_key == key && listed_version == version { return Ok(true); }
+                if listed_key != key { continue; }
+                if listed_version == version {
+                    if !data || target_latest.is_some() { return Err(unavailable("S3 returned an inconsistent data version")); }
+                    target_latest = Some(latest.ok_or_else(|| unavailable("S3 omitted whether the data version is current"))?);
+                } else if data {
+                    other_data = true;
+                }
             }
             match page.is_truncated() {
-                Some(false) => return Ok(false),
+                Some(false) => return Ok(match target_latest {
+                    None => VersionStatus::Absent,
+                    Some(true) if other_data => VersionStatus::WouldExposeOlderData,
+                    Some(_) => VersionStatus::SafeToRemove,
+                }),
                 Some(true) => {},
                 None => return Err(unavailable("S3 omitted the version listing's pagination state")),
             }
@@ -331,15 +360,20 @@ mod tests {
         };
         let provider_key = observed.key.clone();
         let server = tokio::spawn(async move {
-            let present = "<IsTruncated>false</IsTruncated><Version><Key>encoded root/data/object</Key><VersionId>old+/=</VersionId></Version>";
+            let present = "<IsTruncated>false</IsTruncated><Version><Key>encoded root/data/object</Key><VersionId>old+/=</VersionId><IsLatest>false</IsLatest></Version>";
+            let exposes_older = "<IsTruncated>false</IsTruncated><Version><Key>encoded root/data/object</Key><VersionId>old+/=</VersionId><IsLatest>true</IsLatest></Version><Version><Key>encoded root/data/object</Key><VersionId>older</VersionId><IsLatest>false</IsLatest></Version>";
             let continued = "<IsTruncated>true</IsTruncated><NextKeyMarker>encoded root/data/object</NextKeyMarker><NextVersionIdMarker>new</NextVersionIdMarker><Version><Key>encoded root/data/object</Key><VersionId>new</VersionId></Version>";
             let absent = "<IsTruncated>false</IsTruncated><Version><Key>encoded root/data/object-neighbor</Key><VersionId>old+/=</VersionId></Version>";
             let incomplete = "<IsTruncated>true</IsTruncated><NextKeyMarker>encoded root/data/object</NextKeyMarker>";
             for (method, status, page, cursor) in [
+                ("GET", "200 OK", Some(exposes_older), false),
+                ("GET", "200 OK", Some(present), false),
                 ("DELETE", "204 No Content", None, false),
+                ("GET", "200 OK", Some(present), false),
                 ("GET", "200 OK", Some(present), false),
                 ("DELETE", "204 No Content", None, false),
                 ("GET", "200 OK", Some(incomplete), false),
+                ("GET", "200 OK", Some(present), false),
                 ("DELETE", "204 No Content", None, false),
                 ("GET", "200 OK", Some(continued), false),
                 ("GET", "200 OK", Some(absent), true),
@@ -378,6 +412,8 @@ mod tests {
                 let error = inventory.retire_observed_version(&key, &rejected).await.expect_err("unbound retirement reached the provider");
                 assert_eq!(error.message.as_deref(), Some("The retirement does not identify an immutable version of this key"));
             }
+            let error = inventory.retire_observed_version(&key, &observed).await.expect_err("the current version must keep any older data hidden");
+            assert_eq!(error.message.as_deref(), Some("Retiring the current version would expose older data"));
             let error = inventory.retire_observed_version(&key, &observed).await.expect_err("a delete reply alone must not settle retirement");
             assert_eq!(error.message.as_deref(), Some("The retired object version is still present"));
             let error = inventory.retire_observed_version(&key, &observed).await.expect_err("an incomplete inventory must not settle retirement");

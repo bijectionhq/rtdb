@@ -2149,6 +2149,8 @@ TLA_CASES = (
      ('Mutation = "none"\nINVARIANT Safety', 'Mutation = "accept_mutation_reply"\nINVARIANT SettlementRequiresExactAbsence'), "SettlementRequiresExactAbsence"),
     ("ExactRetirementRetry", "exact-retirement-trust-partial-inventory",
      ('Mutation = "none"\nINVARIANT Safety', 'Mutation = "accept_unfinished_inventory"\nINVARIANT SettlementRequiresExactAbsence'), "SettlementRequiresExactAbsence"),
+    ("ExactRetirementRetry", "exact-retirement-expose-older-data",
+     ('Mutation = "none"\nINVARIANT Safety', 'Mutation = "skip_current_version_guard"\nINVARIANT OlderDataStaysHidden'), "OlderDataStaysHidden"),
     ("ExactRetirementRetry", "exact-retirement-late-retry-witness",
      ("INVARIANT Safety", "INVARIANT NeverCompletesAfterSettlement"), "NeverCompletesAfterSettlement"),
     ("SharedReferenceRevision", "shared-reference-revision", None, None),

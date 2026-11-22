@@ -98,8 +98,9 @@ mod tests {
     #[async_trait]
     impl Directory for Scripted {
         async fn create_deployment(&self, record: DeploymentRecord) -> Result<DeploymentRecord> { self.inner.create_deployment(record).await }
-        async fn create_fork(&self, child: DeploymentRecord, expected_parent: Version) -> Result<DeploymentRecord> { self.inner.create_fork(child, expected_parent).await }
-        async fn shared_reference_revision(&self, lineage: &str) -> Result<Version> { self.inner.shared_reference_revision(lineage).await }
+        async fn publish_fork(&self, child: DeploymentRecord, expected_parent: Version, preparation: Option<crate::ForkPreparation>) -> Result<DeploymentRecord> { self.inner.publish_fork(child, expected_parent, preparation).await }
+        async fn lineage_state(&self, lineage: &str) -> Result<crate::LineageState> { self.inner.lineage_state(lineage).await }
+        async fn change_lineage(&self, lineage: &str, change: crate::LineageChange) -> Result<crate::LineageState> { self.inner.change_lineage(lineage, change).await }
         async fn deployment(&self, id: &str) -> Result<Option<DeploymentRecord>> {
             let next = { let mut replies = self.replies.lock(); (!replies.is_empty()).then(|| replies.remove(0)) };
             match next { Some(record) => Ok(Some(record)), None => self.inner.deployment(id).await }

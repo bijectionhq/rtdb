@@ -3,7 +3,7 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use crate::{claim, now_ms, park, Cas, DeploymentRecord, Directory, Lifecycle, MemberId, MemberRecord, MemberRole, MemberState};
+use crate::{claim, now_ms, park, Cas, DeploymentRecord, Directory, ForkPreparation, Lifecycle, LineageChange, LineageRetirement, MemberId, MemberRecord, MemberRole, MemberState};
 
 /// Panics on the first violation.
 /// Uses fresh ids and names, so it can run against a shared, non-empty directory.
@@ -64,6 +64,7 @@ pub async fn run(directory: &dyn Directory) {
     assert_eq!(directory.deployment_by_name(&external.name).await.unwrap().as_ref(), Some(&external));
     assert_eq!(directory.shared_reference_revision(&applied.lineage).await.unwrap(), 2, "an independent fork does not change the source's reference inventory");
     assert_eq!(directory.shared_reference_revision(&external.lineage).await.unwrap(), 0);
+    local_retirement(directory, &applied, &name).await;
 
     let reserved = format!("{}{id}", super::REFERENCE_REVISION_PREFIX, id = applied.lineage);
     let fake = DeploymentRecord::new(&reserved, &applied.org, vec![], 0);
@@ -111,6 +112,46 @@ pub async fn run(directory: &dyn Directory) {
 
     let missing = DeploymentRecord::new(format!("missing-{suffix}"), "acme", vec![], 0);
     assert!(matches!(directory.replace_deployment(missing, 1).await.unwrap(), Cas::Conflict(None)), "replacing an absent record conflicts");
+}
+
+async fn local_retirement(directory: &dyn Directory, parent: &DeploymentRecord, name: &str) {
+    let lineage = &parent.lineage;
+    let local_volume = [3; 32];
+    let initial = directory.lineage_state(lineage).await.unwrap();
+    let generation = initial.retirement_generation();
+    let preparation = ForkPreparation { token: uuid::Uuid::new_v4(), generation };
+    let prepare = LineageChange::PrepareFork { preparation, local_volume };
+    let retirement = LineageRetirement { token: uuid::Uuid::new_v4(), source: parent.storage_prefix(), local_volume };
+    let reserve = LineageChange::ReserveRetirement {
+        retirement: retirement.clone(), observed_references: initial.reference_revision(), generation,
+    };
+    directory.change_lineage(lineage, prepare.clone()).await.unwrap();
+    assert_eq!(directory.change_lineage(lineage, reserve.clone()).await.unwrap_err().code, "rtdb.directory/lineage-changed");
+
+    let mut child = DeploymentRecord::new(format!("{name}-prepared"), &parent.org, vec![], 0);
+    child.parent = Some(parent.id.clone());
+    child.lineage.clone_from(lineage);
+    directory.publish_fork(child, parent.version, Some(preparation)).await.unwrap();
+    assert_eq!(directory.change_lineage(lineage, reserve).await.unwrap_err().code, "rtdb.directory/lineage-changed");
+
+    let published = directory.lineage_state(lineage).await.unwrap();
+    assert!(published.local_preparations(local_volume).next().is_none());
+    assert_eq!(published.reference_revision(), initial.reference_revision() + 1);
+    directory.change_lineage(lineage, LineageChange::ReserveRetirement {
+        retirement: retirement.clone(), observed_references: published.reference_revision(), generation,
+    }).await.unwrap();
+    let mut late = DeploymentRecord::new(format!("{name}-later"), &parent.org, vec![], 0);
+    late.parent = Some(parent.id.clone());
+    late.lineage.clone_from(lineage);
+    assert_eq!(directory.create_fork(late.clone(), parent.version).await.unwrap_err().code, "rtdb.directory/lineage-changed");
+    directory.change_lineage(lineage, LineageChange::SettleRetirement { retirement }).await.unwrap();
+    assert_eq!(directory.change_lineage(lineage, prepare).await.unwrap_err().code, "rtdb.directory/lineage-changed");
+    assert_eq!(directory.publish_fork(late.clone(), parent.version, Some(preparation)).await.unwrap_err().code, "rtdb.directory/lineage-changed");
+    assert!(directory.deployment(&late.id).await.unwrap().is_none());
+
+    let current = ForkPreparation { token: uuid::Uuid::new_v4(), generation: generation + 1 };
+    directory.change_lineage(lineage, LineageChange::PrepareFork { preparation: current, local_volume }).await.unwrap();
+    directory.publish_fork(late, parent.version, Some(current)).await.unwrap();
 }
 
 /// `EveryEpochHasOneClaimant` under contention: in each round, every claimant reads the deployment and races its claim through one of `directories`, and exactly one wins.

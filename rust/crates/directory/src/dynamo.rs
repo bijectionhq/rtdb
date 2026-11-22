@@ -23,7 +23,8 @@ use rtdb_types::{Anomaly, AnomalyCategory, Result};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 
-use crate::{Cas, ChangeFeed, DeploymentRecord, Directory, HostedTask, MemberId, MemberRecord, REFERENCE_REVISION_PREFIX, Version, exists, fork_conflict, fork_parent_id, next_reference_revision, require_deployment_name, shared_fork_lineage};
+use crate::{Cas, ChangeFeed, DeploymentRecord, Directory, ForkPreparation, HostedTask, LineageChange, LineageState, MemberId, MemberRecord, REFERENCE_REVISION_PREFIX, Version, exists, fork_conflict, fork_parent_id, require_deployment_name, shared_fork_lineage};
+use crate::lineage::lineage_busy;
 
 mod parked;
 mod streams;
@@ -37,6 +38,7 @@ const VERSION: &str = "version";
 const EPOCH: &str = "epoch";
 const HOLDER: &str = "holder";
 const RECORD: &str = "record";
+const LINEAGE_VERSION: &str = "lineage_version";
 /// The index on the deployments table answering `deployments_held_by`; it projects only keys, since every hit is re-read strongly.
 pub const HOLDER_INDEX: &str = "holder";
 
@@ -337,17 +339,37 @@ impl DynamoDirectory {
         }
     }
 
-    fn advance_shared_reference(&self, lineage: &str, expected: Version) -> Result<TransactWriteItem> {
-        // A separate item survives cell-local forks of a moved deployment even when its original ancestor lives elsewhere.
-        let item = Item::from([
-            (NAME.to_owned(), AttributeValue::S(format!("{REFERENCE_REVISION_PREFIX}{lineage}"))),
-            (VERSION.to_owned(), number(next_reference_revision(expected)?)),
-        ]);
+    async fn read_lineage(&self, lineage: &str) -> Result<(LineageState, bool)> {
+        let key = format!("{REFERENCE_REVISION_PREFIX}{lineage}");
+        let Some(item) = self.get(&self.tables.deployment_names, NAME, &key).await? else {
+            return Ok((LineageState::default(), true));
+        };
+        if !item.contains_key(RECORD) {
+            return Ok((LineageState::legacy(number_attribute(&item, VERSION)?), true));
+        }
+        let version = number_attribute(&item, LINEAGE_VERSION)?;
+        let state: LineageState = decode(&item, |_, _| {})?;
+        if state.version() != version || number_attribute(&item, VERSION)? != Version::MAX {
+            return Err(Anomaly::fault("rtdb.directory/lineage-state", "The stored lineage state has inconsistent versions"));
+        }
+        Ok((state, false))
+    }
+
+    fn write_lineage(&self, lineage: &str, next: &LineageState, expected: Version, legacy: bool) -> Result<TransactWriteItem> {
+        let mut item = Item::from([(NAME.to_owned(), AttributeValue::S(format!("{REFERENCE_REVISION_PREFIX}{lineage}")))]);
+        if legacy && let Some(revision) = next.legacy_revision() {
+            item.insert(VERSION.to_owned(), number(revision));
+        } else {
+            // Revision-only clients cannot advance the old counter past this value.
+            item.insert(VERSION.to_owned(), number(Version::MAX));
+            item.insert(LINEAGE_VERSION.to_owned(), number(next.version()));
+            item.insert(RECORD.to_owned(), blob(next)?);
+        }
         let put = Put::builder().table_name(&self.tables.deployment_names).set_item(Some(item));
         let put = if expected == 0 {
             put.condition_expression("attribute_not_exists(#n)").expression_attribute_names("#n", NAME)
         } else {
-            put.condition_expression("#v = :expected").expression_attribute_names("#v", VERSION)
+            put.condition_expression("#v = :expected").expression_attribute_names("#v", if legacy { VERSION } else { LINEAGE_VERSION })
                 .expression_attribute_values(":expected", number(expected))
         };
         Ok(TransactWriteItem::builder().put(put.build().map_err(build_fault)?).build())
@@ -360,10 +382,10 @@ impl Directory for DynamoDirectory {
         self.insert_deployment(record, Vec::new()).await
     }
 
-    async fn create_fork(&self, child: DeploymentRecord, expected_parent: Version) -> Result<DeploymentRecord> {
+    async fn publish_fork(&self, child: DeploymentRecord, expected_parent: Version, preparation: Option<ForkPreparation>) -> Result<DeploymentRecord> {
         let id = fork_parent_id(&child)?;
-        let parent = self.deployment(id).await?;
-        let lineage = shared_fork_lineage(&child, parent.as_ref(), expected_parent)?;
+        let parent = self.deployment(id).await?.ok_or_else(fork_conflict)?;
+        let shared = shared_fork_lineage(&child, Some(&parent), expected_parent)?.is_some();
         let condition = ConditionCheck::builder().table_name(&self.tables.deployments)
             .key(ID, AttributeValue::S(id.to_owned()))
             .condition_expression("#v = :expected")
@@ -371,16 +393,37 @@ impl Directory for DynamoDirectory {
             .expression_attribute_values(":expected", number(expected_parent))
             .build().map_err(build_fault)?;
         let mut checks = vec![TransactWriteItem::builder().condition_check(condition).build()];
-        if let Some(lineage) = lineage {
-            checks.push(self.advance_shared_reference(lineage, self.shared_reference_revision(lineage).await?)?);
+        if shared || preparation.is_some() {
+            let (state, legacy) = self.read_lineage(&parent.lineage).await?;
+            checks.push(self.write_lineage(&parent.lineage, &state.published(preparation, shared)?, state.version(), legacy)?);
         }
         self.insert_deployment(child, checks).await
     }
 
-    async fn shared_reference_revision(&self, lineage: &str) -> Result<Version> {
-        let key = format!("{REFERENCE_REVISION_PREFIX}{lineage}");
-        self.get(&self.tables.deployment_names, NAME, &key).await?
-            .map_or(Ok(0), |item| number_attribute(&item, VERSION))
+    async fn lineage_state(&self, lineage: &str) -> Result<LineageState> {
+        Ok(self.read_lineage(lineage).await?.0)
+    }
+
+    async fn change_lineage(&self, lineage: &str, change: LineageChange) -> Result<LineageState> {
+        for _ in 0..8 {
+            let (state, legacy) = self.read_lineage(lineage).await?;
+            let next = state.changed(change.clone())?;
+            if next == state { return Ok(state); }
+            let item = self.write_lineage(lineage, &next, state.version(), legacy)?;
+            match self.client.transact_write_items().transact_items(item).send().await {
+                Ok(_) => return Ok(next),
+                Err(error) => {
+                    if let Some(aws_sdk_dynamodb::operation::transact_write_items::TransactWriteItemsError::TransactionCanceledException(cancelled)) = error.as_service_error()
+                        && cancelled.cancellation_reasons().iter().any(|reason|
+                            matches!(reason.code(), Some("ConditionalCheckFailed" | "TransactionConflict")))
+                    {
+                        continue;
+                    }
+                    return Err(sdk_anomaly("TransactWriteItems", error));
+                }
+            }
+        }
+        Err(lineage_busy())
     }
 
     async fn hosted_task_stopped(&self, task: &HostedTask) -> Result<bool> {
@@ -527,7 +570,7 @@ mod tests {
             child.lineage.clone_from(&parent.lineage);
             child
         };
-        let stale = directory.advance_shared_reference(&parent.lineage, 0).unwrap();
+        let stale = directory.write_lineage(&parent.lineage, &LineageState::default().published(None, true).unwrap(), 0, true).unwrap();
         directory.create_fork(child("first"), parent.version).await.unwrap();
 
         let second = child("second");

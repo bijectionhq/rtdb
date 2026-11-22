@@ -141,11 +141,14 @@ The bounded settlement comparison preserves replacement availability for exact-v
 It reaches late completion with the replacement held in the exact variant.
 
 The S3 adapter binds the removal to its configured bucket, endpoint, region and physical key, and requires an immutable provider version.
-Every retry sends that version identifier, then reads the version inventory for evidence of its absence.
+Every attempt starts with a complete version inventory and refuses to remove the current data version when another data version exists behind it.
+If the target is present and eligible, the request sends its immutable version identifier and then reads a fresh inventory for evidence of its absence.
 The evidence covers that exact key and version, with pagination checked before absence is accepted.
 This relies on the provider honoring exact deletion, supplying complete version listings and never reusing an immutable version identity.
 The retry model reaches settlement while a redundant exact request remains outstanding. Its later effect preserves other versions.
-An integration proof must account for how deleting the current version affects the current-name view, how inherited references remain protected, and how each physical owner orders authorization and admission.
+TLC explored 268 states in the bounded retry model and found a counterexample when the current-version guard was removed.
+The model assumes concurrent publication adds a newer version.
+The integration proof still needs to connect inherited references and physical-owner admissions to that provider action.
 
 ### Shared fork publication and referrer inventories
 
@@ -155,7 +158,10 @@ A separately copied fork or a refused publication leaves that revision unchanged
 The revision has its own directory entry so a materialized residence can support local forks when its original ancestor lives in another cell.
 Existing shared deployments are part of the initial manifest inventory. The revision witnesses subsequent publications.
 Readers that compare revisions must read the directory strongly and include every actual manifest that predates their scan.
-The reaper still needs to bind this observed revision to a durable effect authorization that preserves the referrer inventory until the action settles.
+The local-volume reaper reserves the lineage using the current publication revision and preparation generation, then builds the actual referrer inventory inside that reservation.
+The active sweep is tied to the volume and residence in the directory.
+It closes its I/O region before releasing the reservation, and a later worker can recover abandoned local work only after it acquires the same volume maintenance lock.
+The remote reaper still needs to bind the observed revision to a durable effect authorization.
 The only operation that adds references initializes an unpublished fork's manifest under its fresh prefix.
 Later edits withdraw exact name-owner pairs from the latest confirmed manifest and publish only at that snapshot's successor.
 An immutable write can succeed in a lower slot that was already pruned while the request was in flight.
@@ -176,13 +182,15 @@ Checking that the lineage currently admits publication cannot distinguish a prep
 The candidate model admits retirement after active readers drain, advances the preparation generation, and closes admission to further readers.
 It transfers existing references and confirms provider removal before reopening.
 It covers one source version, one direct reader, and one shared fork.
-Ordinary remote collection still needs a durable retirement intent, and its authority must order physical-owner admission, reference publication and provider settlement. Archive capture, fork preparation, and transfer still have their own physical read paths. [Retirement admission model](../tla/LineageRetirementAdmission.tla)
+Local fork preparation and local collection use the same persistent admission state across memory, network and DynamoDB directory clients.
+Ordinary remote collection needs a durable retirement intent that orders physical-owner admission, reference publication and provider settlement.
+Archive capture, fork preparation and transfer still have separate physical read paths. [Retirement admission model](../tla/LineageRetirementAdmission.tla)
 
 ### Serving and archive removal entry points
 
 | Effect path | Current admission and evidence | Remaining composition obligation |
 | --- | --- | --- |
-| `reap_as_of` and `References::erase` | The reaper uses garbage records, checkpoint floors and a scan of existing manifests. It copies to observed referrers before deleting the path. | Bind the authorized retirement to one physical owner and version, validate the referrer set under that authority, and keep the intent until exact settlement. |
+| `reap_as_of` and `References::erase` | The reaper uses garbage records, checkpoint floors and existing manifests. The local sweep acquires a lineage reservation before reloading referrers and copies retained data before deleting the path. | Bind each remote retirement to one physical owner and version, validate referrers under that authority, and keep the intent until exact settlement. |
 | `Base::initialize`, `Base::forget` and `Base::load` | Initialization adds references. Confirmed withdrawals only remove matching entries and require a current head before effect. | Connect the current-manifest contract to consumers that retain older manifests and to the authority closing and disposing a residence. |
 | `erase_deployment` in disposal and old-residence cleanup | The administration path fences the residence, drains serving references admitted at that owner, transfers observed shared objects and checks the provider inventory under its prefix. | Order shared fork publication and administrative reads against the physical retirement authority. |
 | `ordered_index_storage::reap` | The directory generation floor and reader registry close admission. Remote cleanup aborts journaled uploads and checks the generation prefix inventory. | Preserve the independent generation and residence bindings in any shared retirement API. |

@@ -26,15 +26,17 @@ VARIABLES
 \* @type: <<Set(Int), Set(Int), Set(Int), Set(Int), Bool, Bool, Bool, Bool>>;
 Vars == <<versions, published, issued, pending, acknowledged, observedAbsent, settled, completedAfterSettlement>>
 
+\* Version 0 is older data and can never be published again.
 \* The durable authority already closed admission to version 1. Versions 2 and 3
 \* can still be published at its key. Each request has the same durable intent.
 Init ==
-    /\ versions = {1} /\ published = {} /\ issued = {} /\ pending = {}
+    /\ versions \in {{1}, {0, 1}} /\ published = {} /\ issued = {} /\ pending = {}
     /\ acknowledged = FALSE /\ observedAbsent = FALSE /\ settled = FALSE
     /\ completedAfterSettlement = FALSE
 
 Submit ==
     /\ ~settled
+    /\ (0 \notin versions \/ published # {} \/ Mutation = "skip_current_version_guard")
     /\ \E request \in {1, 2} \ issued:
         /\ issued' = issued \cup {request}
         /\ pending' = pending \cup {request}
@@ -73,6 +75,7 @@ Spec == Init /\ [][Next]_Vars
 
 SettlementRequiresExactAbsence == settled => 1 \notin versions
 ReplacementSurvivesRemoval == published \subseteq versions
-Safety == SettlementRequiresExactAbsence /\ ReplacementSurvivesRemoval
+OlderDataStaysHidden == versions # {0}
+Safety == SettlementRequiresExactAbsence /\ ReplacementSurvivesRemoval /\ OlderDataStaysHidden
 NeverCompletesAfterSettlement == ~completedAfterSettlement
 =============================================================================

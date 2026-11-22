@@ -1573,11 +1573,14 @@ rule ReleaseCheckpointMetadata {
 
 rule ReapUnreachable {
     -- An object is deleted only when no published manifest of any live deployment in its lineage references it, and reaper_grace has passed since it was released.
-    -- The reaper's deletions are conditional on the lineage's version, which every fork and every deletion bumps, so a fork created mid-sweep keeps what it references.
+    -- Shared publications advance the lineage's reference revision.
     -- When the reaper cannot determine reachability, it keeps the affected release records for a later pass.
     -- Withdrawing an inherited reference removes only the selected name and owner from the latest manifest.
     -- The reaper confirms that withdrawal before deleting a local copy that shadows the reference.
     -- A failed physical removal keeps its release record for the next pass.
+    -- A local sweep reserves the lineage against its current shared-reference revision after draining local preparation.
+    -- The reservation advances the preparation generation and holds until the sweep's provider work drains.
+    -- The sweep scans published referrers after reserving the lineage and copies retained objects before removing the source copies.
     when: candidate: GarbageCandidate.released_at + config.reaper_grace <= now
 
     requires: not exists d in LiveDeploymentsOf(candidate.lineage): candidate.object in ReferencedBy(d.checkpoint.manifest)
@@ -2131,6 +2134,8 @@ rule Fork {
     -- Child publication checks that the parent is still eligible for forks in the writer epoch and storage generation used to prepare the child.
     -- The child, its name and the cell-local shared-reference revision publish atomically.
     -- A fork of a fork advances the same revision as the original lineage.
+    -- A local fork acquires a preparation in the current lineage generation before reading storage and consumes it when the child publishes.
+    -- Local preparation, publication and reclamation hold the same volume maintenance lock through their admitted provider work.
     when: ForkRequested(parent, basis, org)
 
     -- The child and its name publish at a version that still admits forks.
@@ -2340,9 +2345,12 @@ rule SettleObservedS3Version {
     requires: ImmutableS3Version(retirement.version)
 
     ensures:
-        DeleteExactS3Version(retirement.namespace, retirement.key, retirement.version)
         if FreshVersionInventoryConfirmsAbsence(retirement.namespace, retirement.key, retirement.version):
             ExactVersionRetirementSettled(retirement)
+        else if FreshVersionInventoryAllowsRemovalWithoutExposingOlderData(retirement):
+            DeleteExactS3Version(retirement.namespace, retirement.key, retirement.version)
+            if FreshVersionInventoryConfirmsAbsence(retirement.namespace, retirement.key, retirement.version):
+                ExactVersionRetirementSettled(retirement)
 }
 
 rule HostedCheckpointCapture {
