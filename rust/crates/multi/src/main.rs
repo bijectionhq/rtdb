@@ -633,7 +633,8 @@ async fn run(arguments: Vec<String>) -> Result<()> {
             let storage = CellStorage::parse(arguments.required("storage-root")?)?;
             let from = arguments.required("from")?;
             let org = if arguments.present("org") { Some(arguments.required("org")?) } else { None };
-            let destination = admin::ForkDestination { name: arguments.required("name")?, org };
+            let task = hosted_task(&arguments)?;
+            let destination = admin::ForkDestination { name: arguments.required("name")?, org, hosted_task: task.as_ref() };
             let record = match (arguments.optional("at-block"), arguments.optional("at-time")) {
                 (None, Some(time)) => {
                     let time = time.parse::<chrono::DateTime<chrono::Utc>>().map_err(|_| usage("--at-time must be an RFC 3339 timestamp".into()))?;

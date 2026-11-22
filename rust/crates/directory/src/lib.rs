@@ -426,7 +426,10 @@ pub enum StorageRegion {
     /// A fork has admitted provider I/O against this physical residence.
     ReferenceRead {
         custody: ReplayCustody,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        object: Option<String>,
     },
+    ExactRetirement { object: String },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -444,7 +447,7 @@ impl StorageRegion {
         let (destination, repair) = match self {
             Self::Local { archive, repair_archive, .. } |
             Self::Remote { archive, repair_archive, .. } => (*archive, *repair_archive),
-            Self::ReplicaReplay { .. } | Self::ReferenceRead { .. } => return false,
+            Self::ReplicaReplay { .. } | Self::ReferenceRead { .. } | Self::ExactRetirement { .. } => return false,
         };
         archive_custody::covers_archive(destination.map(|id| id.as_u128()), repair.map(|id| id.as_u128()), capture.as_u128())
     }
@@ -461,7 +464,8 @@ impl StorageRegion {
         match self {
             Self::Local { checkpoint_metadata_from, .. } |
             Self::Remote { checkpoint_metadata_from, closed: false, .. } => *checkpoint_metadata_from,
-            Self::Remote { closed: true, .. } | Self::ReplicaReplay { .. } | Self::ReferenceRead { .. } => None,
+            Self::Remote { closed: true, .. } | Self::ReplicaReplay { .. } | Self::ReferenceRead { .. }
+            | Self::ExactRetirement { .. } => None,
         }
     }
 
@@ -478,7 +482,7 @@ impl StorageRegion {
         match self {
             Self::Local { checkpoint_replay_from, .. }
             | Self::Remote { checkpoint_replay_from, closed: false, .. } => *checkpoint_replay_from,
-            Self::Remote { closed: true, .. } | Self::ReferenceRead { .. } => None,
+            Self::Remote { closed: true, .. } | Self::ReferenceRead { .. } | Self::ExactRetirement { .. } => None,
             Self::ReplicaReplay { first_required, .. } => Some(*first_required),
         }
     }
@@ -487,7 +491,7 @@ impl StorageRegion {
         match self {
             Self::Local { tracks_ordered_index_pages, .. } |
             Self::Remote { tracks_ordered_index_pages, .. } => *tracks_ordered_index_pages,
-            Self::ReplicaReplay { .. } | Self::ReferenceRead { .. } => false,
+            Self::ReplicaReplay { .. } | Self::ReferenceRead { .. } | Self::ExactRetirement { .. } => false,
         }
     }
 }
@@ -865,7 +869,7 @@ fn fork_conflict() -> Anomaly {
 
 mod reference_revision;
 mod lineage;
-pub use lineage::{ForkPreparation, ForkPublication, LineageChange, LineageRetirement, LineageState, ReferenceDisposal};
+pub use lineage::{ForkPreparation, ForkPublication, LineageChange, LineageRetirement, LineageState, PreparationOwner, ReferenceDisposal, RetirementWork};
 use lineage::StoredLineage;
 
 const REFERENCE_REVISION_PREFIX: &str = "~reference-revision/";
@@ -1107,7 +1111,7 @@ mod tests {
         }
         drop(directory);
         let directory = MemoryDirectory::open(&root).unwrap();
-        let retirement = LineageRetirement { token: uuid::Uuid::new_v4(), source: "retained-residence".into(), local_volume: [1; 32] };
+        let retirement = LineageRetirement { token: uuid::Uuid::new_v4(), source: "retained-residence".into(), work: RetirementWork::Local { local_volume: [1; 32] } };
         directory.change_lineage(lineage, LineageChange::ReserveRetirement {
             retirement: retirement.clone(), observed_references: 2, generation: 0,
         }).await.unwrap();

@@ -65,6 +65,7 @@ pub async fn run(directory: &dyn Directory) {
     assert_eq!(directory.shared_reference_revision(&applied.lineage).await.unwrap(), 2, "an independent fork does not change the source's reference inventory");
     assert_eq!(directory.shared_reference_revision(&external.lineage).await.unwrap(), 0);
     local_retirement(directory, &applied, &name).await;
+    exact_retirement(directory, &applied).await;
 
     let reserved = format!("{}{id}", super::REFERENCE_REVISION_PREFIX, id = applied.lineage);
     let fake = DeploymentRecord::new(&reserved, &applied.org, vec![], 0);
@@ -152,7 +153,7 @@ async fn local_retirement(directory: &dyn Directory, parent: &DeploymentRecord, 
     let generation = initial.retirement_generation();
     let preparation = ForkPreparation { token: uuid::Uuid::new_v4(), generation };
     let prepare = LineageChange::PrepareFork { preparation, local_volume };
-    let retirement = LineageRetirement { token: uuid::Uuid::new_v4(), source: parent.storage_prefix(), local_volume };
+    let retirement = LineageRetirement { token: uuid::Uuid::new_v4(), source: parent.storage_prefix(), work: crate::RetirementWork::Local { local_volume } };
     let reserve = LineageChange::ReserveRetirement {
         retirement: retirement.clone(), observed_references: initial.reference_revision(), generation,
     };
@@ -183,6 +184,39 @@ async fn local_retirement(directory: &dyn Directory, parent: &DeploymentRecord, 
     let current = ForkPreparation { token: uuid::Uuid::new_v4(), generation: generation + 1 };
     directory.change_lineage(lineage, LineageChange::PrepareFork { preparation: current, local_volume }).await.unwrap();
     directory.publish_fork(late, parent.version, Some(crate::ForkPublication::Local(current))).await.unwrap();
+}
+
+async fn exact_retirement(directory: &dyn Directory, parent: &DeploymentRecord) {
+    use rtdb_types::{PhysicalObjectVersion, S3ObjectNamespace};
+
+    let lineage = &parent.lineage;
+    let state = directory.lineage_state(lineage).await.unwrap();
+    let scope = parent.storage_prefix();
+    let target = format!("{scope}/v06/payload");
+    let retirement = LineageRetirement { token: uuid::Uuid::new_v4(), source: scope.clone(), work: crate::RetirementWork::S3 {
+        deployment: parent.id.clone(), target: target.clone(), release: format!("{scope}/v06/~garbage/release"),
+        version: PhysicalObjectVersion { namespace: S3ObjectNamespace { bucket: "cell".into(), endpoint: None, region: None },
+            key: format!("cell/{target}"), version: "original".into() },
+    } };
+    let reserve = LineageChange::ReserveRetirement {
+        retirement: retirement.clone(), observed_references: state.reference_revision(), generation: state.retirement_generation(),
+    };
+    let reserved = directory.change_lineage(lineage, reserve).await.unwrap();
+    let settle = LineageChange::SettleRetirement { retirement: retirement.clone() };
+    assert_eq!(directory.change_lineage(lineage, settle.clone()).await.unwrap_err().code, "rtdb.directory/lineage-changed");
+    let attempted = ForkPreparation { token: uuid::Uuid::new_v4(), generation: reserved.retirement_generation() };
+    assert_eq!(directory.change_lineage(lineage, LineageChange::PrepareHostedFork { preparation: attempted, task: None }).await.unwrap_err().code,
+        "rtdb.directory/lineage-changed");
+
+    directory.change_lineage(lineage, LineageChange::AuthorizeExactErasure { retirement: retirement.clone() }).await.unwrap();
+    assert_eq!(directory.change_lineage(lineage, LineageChange::AbandonExactRetirement { retirement: retirement.clone() }).await.unwrap_err().code,
+        "rtdb.directory/lineage-changed");
+    let current = directory.lineage_state(lineage).await.unwrap();
+    assert!(current.exact_erasure_authorized());
+    assert_eq!(current.retirement(), Some(&retirement));
+    directory.change_lineage(lineage, settle).await.unwrap();
+    directory.change_lineage(lineage, LineageChange::PrepareHostedFork { preparation: attempted, task: None }).await.unwrap();
+    directory.change_lineage(lineage, LineageChange::ReleaseFork { preparation: attempted }).await.unwrap();
 }
 
 /// `EveryEpochHasOneClaimant` under contention: in each round, every claimant reads the deployment and races its claim through one of `directories`, and exactly one wins.

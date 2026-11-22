@@ -1581,6 +1581,8 @@ rule ReapUnreachable {
     -- A local sweep reserves the lineage against its current shared-reference revision after draining local preparation.
     -- The reservation advances the preparation generation and holds until the sweep's provider work drains.
     -- The sweep scans published referrers after reserving the lineage and copies retained objects before removing the source copies.
+    -- An S3 loose-file release with an installed publication witness records the exact provider version.
+    -- Hosted preparation for a fork, checkpoint capture or cell transfer holds its source lineage until provider work drains.
     when: candidate: GarbageCandidate.released_at + config.reaper_grace <= now
 
     requires: not exists d in LiveDeploymentsOf(candidate.lineage): candidate.object in ReferencedBy(d.checkpoint.manifest)
@@ -2349,6 +2351,7 @@ rule SettleObservedS3Version {
     -- Settlement uses a fresh, complete lookup scoped to the exact key and version.
     when: ExactVersionRetirementContinued(retirement)
 
+    requires: ExactVersionRetirementAuthorized(retirement)
     requires: PhysicalNamespaceMatches(retirement)
     requires: PhysicalKeyMatches(retirement)
     requires: ImmutableS3Version(retirement.version)
@@ -2360,6 +2363,22 @@ rule SettleObservedS3Version {
             DeleteExactS3Version(retirement.namespace, retirement.key, retirement.version)
             if FreshVersionInventoryConfirmsAbsence(retirement.namespace, retirement.key, retirement.version):
                 ExactVersionRetirementSettled(retirement)
+}
+
+rule AuthorizeHostedVersionErasure {
+    -- The retirement reservation binds the physical version, release marker and source residence together.
+    -- The reservation closes fork preparation and publication while the reaper scans the current manifests of the lineage.
+    -- The physical owner's storage region orders new inherited reads of this key against the reservation.
+    -- Settlement reopens admission after a complete provider inventory confirms absence of the selected version.
+    when: HostedLooseFileReleaseDue(release)
+
+    requires: InstalledCatalogFloorCovers(release)
+    requires: LineageReservedFor(release)
+    requires: NoCurrentManifestReferences(release.physical_key)
+    requires: PhysicalOwnerFencedForObject(release.physical_key)
+
+    ensures:
+        ExactVersionRetirementAuthorized(release)
 }
 
 rule HostedCheckpointCapture {

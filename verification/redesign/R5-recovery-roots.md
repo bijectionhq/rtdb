@@ -134,8 +134,8 @@ A transfer takes a read hold from the original archive owner before materializin
 Provider-backed repair transfer uses the worker's hosted task witness for recovery of abandoned admissions.
 On local serving storage the existing maintenance lock orders ordinary collection against copies and is retained by the admitted provider work.
 
-The ordinary remote collector still works from a residence list and releases the visible object name.
-Its exact-version design needs a durable authorization naming the provider copy before submitting a physical effect.
+The ordinary remote collector accepts loose-file releases that carry a matching installed publication and immutable S3 version.
+The lineage reservation retains the provider identity, source residence and original release record through effect authorization and settlement.
 Task termination alone establishes that the task cannot issue another request. A mutation accepted by the provider can still complete.
 The bounded settlement comparison preserves replacement availability for exact-version removal and for path removal that excludes publication and admission until settlement.
 It reaches late completion with the replacement held in the exact variant.
@@ -148,7 +148,16 @@ This relies on the provider honoring exact deletion, supplying complete version 
 The retry model reaches settlement while a redundant exact request remains outstanding. Its later effect preserves other versions.
 TLC explored 268 states in the bounded retry model and found a counterexample when the current-version guard was removed.
 The model assumes concurrent publication adds a newer version.
-The integration proof still needs to connect inherited references and physical-owner admissions to that provider action.
+The integrated hosted path keeps the old version while a current manifest points to its source location.
+Its reservation closes fork, capture and transfer preparation, and its per-object source fence orders inherited reads against provider removal.
+The reaper checks the fresh installed floor, provider identity and current manifests before authorizing erasure.
+Only a reservation that has issued no provider effect may be abandoned.
+After authorization, retries use the same stored provider version until a fresh inventory confirms it absent.
+The hosted retirement model explored 47 states and rejected four unsafe protocol mutations.
+It also reached a redundant provider effect after settlement while the replacement remained available.
+The legacy collector leaves owned loose trie files and derived artefacts in place when their release records lack a matching immutable publication witness.
+Those records need conversion from retained receipts or a separately settled path-based protocol for unversioned providers.
+Live provider qualification still needs rolling deployment evidence and the exact provider's listing, deletion and credential behavior.
 
 ### Shared fork publication and referrer inventories
 
@@ -161,7 +170,7 @@ Readers that compare revisions must read the directory strongly and include ever
 The local-volume reaper reserves the lineage using the current publication revision and preparation generation, then builds the actual referrer inventory inside that reservation.
 The active sweep is tied to the volume and residence in the directory.
 It closes its I/O region before releasing the reservation, and a later worker can recover abandoned local work only after it acquires the same volume maintenance lock.
-The remote reaper still needs to bind the observed revision to a durable effect authorization.
+The hosted reaper also binds the publication revision to retirement admission and retains existing physical references in place.
 The only operation that adds references initializes an unpublished fork's manifest under its fresh prefix.
 Later edits withdraw exact name-owner pairs from the latest confirmed manifest and publish only at that snapshot's successor.
 An immutable write can succeed in a lower slot that was already pruned while the request was in flight.
@@ -183,21 +192,22 @@ The candidate model admits retirement after active readers drain, advances the p
 It transfers existing references and confirms provider removal before reopening.
 It covers one source version, one direct reader, and one shared fork.
 Local fork preparation and local collection use the same persistent admission state across memory, network and DynamoDB directory clients.
-Whole-residence disposal uses a distinct phase of that state. The directory closes the lineage under the version of the fenced, drained physical owner and advances the generation before the administration path loads the referrer inventory.
-An interrupted disposal can resume against the same residence and generation. Local sweep recovery cannot settle this phase.
-The terminal directory transaction checks the current owner version and the exact disposal permit, installs the receipt and reopens the lineage together.
+Whole-residence disposal uses a distinct phase of the lineage authority.
+The directory closes the lineage under the version of the fenced, drained physical owner and advances the generation before the administration path loads the referrer inventory.
+An interrupted disposal can resume against the same residence and generation.
+The terminal directory transaction checks the exact disposal permit, installs the receipt and reopens the lineage together.
 The local disposal bucket retains the maintenance witness through provider I/O.
-Remote preparation reads the open generation before it accesses storage and carries that generation to publication. Preparation may still fail if a remote source changes during provider work. A stale preparation cannot publish after the lineage reopens.
-Only local preparation currently holds a physical preparation entitlement for this protocol.
-[Production interleaving model](../tla/ReferenceDisposalPublication.tla) · [Generation and residence model](../lean/ReferenceDisposalPublication.lean)
-Ordinary remote collection needs a durable retirement intent that orders physical-owner admission, reference publication and provider settlement.
-Archive capture, fork preparation and transfer still have separate physical read paths. [Retirement admission model](../tla/LineageRetirementAdmission.tla)
+Hosted fork preparation, capture and the source side of transfer take a shared lineage hold before provider work begins.
+An exact stopped-task observation can recover that hold after process death.
+An unattested worker's abandoned hold remains pending until its issuer releases it.
+The per-key owner fence covers inherited serving misses, including provider work that outlives cancellation.
+[Production disposal model](../tla/ReferenceDisposalPublication.tla) · [Generation and residence model](../lean/ReferenceDisposalPublication.lean) · [Hosted exact retirement model](../tla/HostedExactRetirement.tla)
 
 ### Serving and archive removal entry points
 
 | Effect path | Current admission and evidence | Remaining composition obligation |
 | --- | --- | --- |
-| `reap_as_of` and `References::erase` | The reaper uses garbage records, checkpoint floors and existing manifests. The local sweep acquires a lineage reservation before reloading referrers and copies retained data before deleting the path. | Bind each remote retirement to one physical owner and version, validate referrers under that authority, and keep the intent until exact settlement. |
+| `reap_as_of` and `References::erase` | The local sweep reserves its lineage, reloads referrers and copies retained data before deleting the path. The hosted exact collector keeps witnessed loose files while their source is still referenced, and confirms provider settlement before reopening admission. | Retain and settle pack-level, unwitnessed legacy and unversioned releases under their physical owner. |
 | `Base::initialize`, `Base::forget` and `Base::load` | Initialization adds references. Confirmed withdrawals only remove matching entries and require a current head before effect. | Connect the current-manifest contract to consumers that retain older manifests and to the authority closing and disposing a residence. |
 | `erase_deployment` in disposal and old-residence cleanup | The administration path fences the residence, drains serving references, closes the lineage, scans and transfers published references and checks the provider inventory. Settlement atomically publishes the receipt and reopens the lineage. | Extend physical-owner read custody to administrative copies and qualify provider settlement under failure on hosted storage. |
 | `ordered_index_storage::reap` | The directory generation floor and reader registry close admission. Remote cleanup aborts journaled uploads and checks the generation prefix inventory. | Preserve the independent generation and residence bindings in any shared retirement API. |

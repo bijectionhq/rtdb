@@ -842,6 +842,23 @@ pub async fn capture(
     hosted_task: Option<rtdb_directory::HostedTask>,
     flushed: Option<&DeploymentRecord>,
 ) -> Result<Capture> {
+    let lineage = if matches!(storage, CellStorage::S3 { .. }) {
+        Some(directory.deployment(&deployment.to_string()).await?.ok_or_else(|| unavailable("The source installation no longer exists"))?.lineage)
+    } else { None };
+    crate::store::with_source_lineage(directory.as_ref(), lineage.as_deref(), hosted_task.as_ref(),
+        Box::pin(capture_checkpoint(directory.clone(), storage, destination, keys, deployment, operation, hosted_task.clone(), flushed))).await
+}
+
+async fn capture_checkpoint(
+    directory: Arc<dyn Directory>,
+    storage: &CellStorage,
+    destination: &CellStorage,
+    keys: &dyn KeyService,
+    deployment: Uuid,
+    operation: Uuid,
+    hosted_task: Option<rtdb_directory::HostedTask>,
+    flushed: Option<&DeploymentRecord>,
+) -> Result<Capture> {
     if deployment.is_nil() || operation.is_nil() || same_storage(storage, destination) {
         return Err(inconsistent(
             "Capture requires one deployment, operation and independent archive",

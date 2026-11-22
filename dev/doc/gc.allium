@@ -355,6 +355,8 @@ rule GarbageCollectTable {
 rule DeleteAndCommitChunkRule {
     -- This order applies to classic stores, where the collector issues the file deletes itself.
     -- In Multi, the recorded file plan instead releases to the reaper after receipt and floor installation as described above.
+    -- An installed plan that matches an immutable S3 publication releases its exact version to the hosted reaper.
+    -- Existing shared manifests and active physical owner reads retain that version until their dependencies are withdrawn or drained.
     -- One atomic step in the per-table per-chunk ordering. The DELETEs run
     -- first, in parallel; only after every DELETE in the chunk has succeeded
     -- do we publish + commit.

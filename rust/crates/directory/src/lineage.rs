@@ -1,16 +1,31 @@
 use std::collections::BTreeMap;
 
-use rtdb_types::{Anomaly, AnomalyCategory, Result};
+use rtdb_types::{Anomaly, AnomalyCategory, PhysicalObjectVersion, Result};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::{DeploymentRecord, Lifecycle, Version, next_reference_revision, reference_revision};
+use crate::{DeploymentRecord, HostedTask, Lifecycle, Version, next_reference_revision, reference_revision};
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LineageRetirement {
     pub token: Uuid,
     pub source: String,
-    pub local_volume: [u8; 32],
+    #[serde(flatten)]
+    pub work: RetirementWork,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum RetirementWork {
+    Local { local_volume: [u8; 32] },
+    S3 { deployment: String, target: String, release: String, version: PhysicalObjectVersion },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum PreparationOwner {
+    Local([u8; 32]),
+    Hosted { task: Option<HostedTask> },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -19,11 +34,11 @@ pub struct ForkPreparation {
     pub generation: Version,
 }
 
-/// A local preparation owns a durable hold. A remote preparation carries the
-/// generation it observed before reading storage.
+/// A fork publishes with the lineage authority it acquired before preparing storage.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ForkPublication {
     Local(ForkPreparation),
+    Hosted(ForkPreparation),
     Remote { generation: Version },
 }
 
@@ -40,8 +55,11 @@ pub struct ReferenceDisposal {
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum LineageChange {
     PrepareFork { preparation: ForkPreparation, local_volume: [u8; 32] },
+    PrepareHostedFork { preparation: ForkPreparation, task: Option<HostedTask> },
     ReleaseFork { preparation: ForkPreparation },
     ReserveRetirement { retirement: LineageRetirement, observed_references: Version, generation: Version },
+    AuthorizeExactErasure { retirement: LineageRetirement },
+    AbandonExactRetirement { retirement: LineageRetirement },
     SettleRetirement { retirement: LineageRetirement },
 }
 
@@ -55,9 +73,10 @@ pub struct LineageState {
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 enum Admission {
-    Open(BTreeMap<Uuid, [u8; 32]>),
+    Open(BTreeMap<Uuid, PreparationOwner>),
     Retiring(LineageRetirement),
     Disposing(String),
+    Erasing(LineageRetirement),
 }
 
 impl Default for Admission {
@@ -90,14 +109,14 @@ impl LineageState {
     }
     pub fn reference_revision(&self) -> Version { self.references }
     pub fn retirement_generation(&self) -> Version { self.retirement_generation }
-    pub fn local_preparations(&self, volume: [u8; 32]) -> impl Iterator<Item = ForkPreparation> + '_ {
-        let preparations = match &self.admission { Admission::Open(preparations) => Some(preparations), Admission::Retiring(_) | Admission::Disposing(_) => None };
-        preparations.into_iter().flatten().filter_map(move |(&token, &owner)| {
-            (owner == volume).then_some(ForkPreparation { token, generation: self.retirement_generation })
+    pub fn preparations(&self) -> impl Iterator<Item = (ForkPreparation, &PreparationOwner)> {
+        let preparations = match &self.admission { Admission::Open(preparations) => Some(preparations), _ => None };
+        preparations.into_iter().flatten().map(|(&token, owner)| {
+            (ForkPreparation { token, generation: self.retirement_generation }, owner)
         })
     }
-    pub fn retirement(&self) -> Option<&LineageRetirement> {
-        match &self.admission { Admission::Retiring(retirement) => Some(retirement), Admission::Open(_) | Admission::Disposing(_) => None }
+    pub fn local_preparations(&self, volume: [u8; 32]) -> impl Iterator<Item = ForkPreparation> + '_ {
+        self.preparations().filter_map(move |(preparation, owner)| (*owner == PreparationOwner::Local(volume)).then_some(preparation))
     }
 
     pub fn open_generation(&self) -> Option<Version> {
@@ -141,23 +160,37 @@ impl LineageState {
         next.advance_version()?;
         Ok(next)
     }
+    pub fn retirement(&self) -> Option<&LineageRetirement> {
+        match &self.admission {
+            Admission::Retiring(retirement) | Admission::Erasing(retirement) => Some(retirement),
+            Admission::Open(_) | Admission::Disposing(_) => None,
+        }
+    }
+    pub fn exact_erasure_authorized(&self) -> bool { matches!(self.admission, Admission::Erasing(_)) }
 
     fn advance_version(&mut self) -> Result<()> {
         self.version = next_reference_revision(self.version)?;
         Ok(())
     }
 
+    fn prepare(&mut self, preparation: ForkPreparation, owner: PreparationOwner) -> Result<bool> {
+        let Admission::Open(preparations) = &mut self.admission else { return Err(lineage_busy()); };
+        if preparation.token.is_nil() || preparation.generation != self.retirement_generation { return Err(lineage_busy()); }
+        if let Some(held) = preparations.get(&preparation.token) {
+            return if *held == owner { Ok(false) } else { Err(lineage_busy()) };
+        }
+        preparations.insert(preparation.token, owner);
+        Ok(true)
+    }
+
     pub(crate) fn changed(&self, change: LineageChange) -> Result<Self> {
         let mut next = self.clone();
         match change {
             LineageChange::PrepareFork { preparation, local_volume } => {
-                let Admission::Open(preparations) = &mut next.admission else { return Err(lineage_busy()); };
-                if preparation.token.is_nil() || preparation.generation != self.retirement_generation { return Err(lineage_busy()); }
-                if let Some(held) = preparations.get(&preparation.token) {
-                    if *held == local_volume { return Ok(next); }
-                    return Err(lineage_busy());
-                }
-                preparations.insert(preparation.token, local_volume);
+                if !next.prepare(preparation, PreparationOwner::Local(local_volume))? { return Ok(next); }
+            }
+            LineageChange::PrepareHostedFork { preparation, task } => {
+                if !next.prepare(preparation, PreparationOwner::Hosted { task })? { return Ok(next); }
             }
             LineageChange::ReleaseFork { preparation } => {
                 let Admission::Open(preparations) = &mut next.admission else { return Ok(next); };
@@ -176,8 +209,27 @@ impl LineageState {
                 next.retirement_generation = next_reference_revision(self.retirement_generation)?;
                 next.admission = Admission::Retiring(retirement);
             }
+            LineageChange::AuthorizeExactErasure { retirement } => {
+                if self.retirement() != Some(&retirement) || !matches!(retirement.work, RetirementWork::S3 { .. }) {
+                    return Err(lineage_busy());
+                }
+                if self.exact_erasure_authorized() { return Ok(next); }
+                next.admission = Admission::Erasing(retirement);
+            }
+            LineageChange::AbandonExactRetirement { retirement } => {
+                if !matches!(retirement.work, RetirementWork::S3 { .. })
+                    || !matches!(&self.admission, Admission::Retiring(current) if *current == retirement)
+                {
+                    return Err(lineage_busy());
+                }
+                next.admission = Admission::default();
+            }
             LineageChange::SettleRetirement { retirement } => {
-                if self.retirement() != Some(&retirement) { return Err(lineage_busy()); }
+                if self.retirement() != Some(&retirement)
+                    || (matches!(retirement.work, RetirementWork::S3 { .. }) && !self.exact_erasure_authorized())
+                {
+                    return Err(lineage_busy());
+                }
                 next.admission = Admission::default();
             }
         }
@@ -188,12 +240,16 @@ impl LineageState {
     pub(crate) fn published(&self, preparation: Option<ForkPublication>, shared: bool) -> Result<Self> {
         let mut next = self.clone();
         let open = matches!(self.admission, Admission::Open(_));
+        let preparation_kind = preparation;
         match preparation {
-            Some(ForkPublication::Local(preparation)) => {
+            Some(ForkPublication::Local(preparation) | ForkPublication::Hosted(preparation)) => {
                 let Admission::Open(preparations) = &mut next.admission else { return Err(lineage_busy()); };
-                if preparation.generation != self.retirement_generation || preparations.remove(&preparation.token).is_none() {
-                    return Err(lineage_busy());
-                }
+                let owner = preparations.get(&preparation.token);
+                let matches_owner = matches!((preparation_kind, owner),
+                    (Some(ForkPublication::Local(_)), Some(PreparationOwner::Local(_)))
+                    | (Some(ForkPublication::Hosted(_)), Some(PreparationOwner::Hosted { .. })));
+                if preparation.generation != self.retirement_generation || !matches_owner { return Err(lineage_busy()); }
+                preparations.remove(&preparation.token);
             }
             Some(ForkPublication::Remote { generation }) => {
                 if !reference_revision::may_publish_reference(self.retirement_generation, open, Some(generation)) {

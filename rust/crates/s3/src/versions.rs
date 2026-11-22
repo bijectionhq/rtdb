@@ -35,6 +35,11 @@ impl VersionedInventory {
         Self { client, namespace, root, request_payer: requester_pays.then_some(RequestPayer::Requester), scope_multipart_listing }
     }
 
+    pub async fn exact_retirement_available(&self, key: &ObjectKey, observed: &PhysicalObjectVersion) -> Result<bool> {
+        let path = self.observed_path(key, observed)?;
+        Ok(self.version_status(path.as_ref(), &observed.version).await? != VersionStatus::WouldExposeOlderData)
+    }
+
     /// Executes an already authorized retirement of one immutable physical version.
     /// Success means a fresh version inventory confirmed absence of that exact object.
     pub async fn retire_observed_version(&self, key: &ObjectKey, observed: &PhysicalObjectVersion) -> Result<()> {

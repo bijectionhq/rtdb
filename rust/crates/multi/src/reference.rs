@@ -215,7 +215,7 @@ impl ReferencingStore {
         let Some(owner) = self.base.objects.get(key.as_str()) else { return own; };
         let inherited = self::key(&format!("{owner}/{key}"))?;
         let result = if let Some(custody) = &self.custody {
-            match custody.retain(owner).await {
+            match custody.retain(owner, &inherited).await {
                 Ok(hold) => rtdb_storage::IoRegion::retaining(hold, read(self.bucket.as_ref(), &inherited)).await,
                 Err(error) => {
                     // The owner can close before the first own read observes the transferred copy.
@@ -420,12 +420,16 @@ impl References {
                 // One listing per store, rather than a request per reference, on every reaper pass.
                 let own: BTreeSet<String> = physical_objects(bucket, &store).await?.into_iter().collect();
                 for (name, owner) in Base::load(bucket, &store).await?.objects {
-                    if own.contains(&name) { continue; }
-                    references.by_object.entry(format!("{owner}/{name}")).or_default().insert(store.clone());
+                    let referrers = references.by_object.entry(format!("{owner}/{name}")).or_default();
+                    if !own.contains(&name) { referrers.insert(store.clone()); }
                 }
             }
         }
         Ok(references)
+    }
+
+    pub(crate) fn has_declared_reference(&self, physical: &ObjectKey) -> bool {
+        self.by_object.contains_key(physical.as_str())
     }
 
     /// Erases `name` from `store`, first copying it into every store that still references it there.

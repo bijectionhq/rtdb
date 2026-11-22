@@ -38,17 +38,20 @@ impl ReferenceReads {
 
     /// The returned owner is retained by each admitted provider task, even if
     /// the async caller goes away. The worker owns registration and cleanup.
-    pub(super) async fn retain(&self, source: &str) -> rtdb_storage::Result<Arc<dyn Send + Sync>> {
+    pub(super) async fn retain(&self, source: &str, object: &rtdb_storage::ObjectKey) -> rtdb_storage::Result<Arc<dyn Send + Sync>> {
         let closed = || Error::Closed(format!("reference source {source} is closed"));
         let (residence, root) = source.rsplit_once('/').ok_or_else(closed)?;
         let (owner, generation) = residence.rsplit_once('/').ok_or_else(closed)?;
         let (_, deployment) = owner.rsplit_once('/').ok_or_else(closed)?;
-        if deployment.is_empty() || generation.is_empty() || root != self.root {
+        if deployment.is_empty() || generation.is_empty() || root != self.root
+            || !object.is_under(&rtdb_storage::ObjectKey::new(source)?) || object.as_str() == source
+        {
             return Err(closed());
         }
         let worker = self.clone();
         let deployment = deployment.to_owned();
         let residence = residence.to_owned();
+        let object = object.to_string();
         let (ready, admitted) = oneshot::channel();
         let (release, drained) = oneshot::channel::<()>();
         self.tasks.spawn(async move {
@@ -64,10 +67,12 @@ impl ReferenceReads {
                     matches!(owner.lifecycle, Lifecycle::Live | Lifecycle::Quarantined),
                     owner.storage_prefix() == residence && owner.org == worker.org && owner.lineage == worker.lineage,
                     owner.storage_namespaces == Some(worker.namespaces),
-                ) {
+                ) || owner.storage_regions.values().any(|region| {
+                    matches!(region, StorageRegion::ExactRetirement { object: retiring } if *retiring == object)
+                }) {
                     return Err(Anomaly::new(AnomalyCategory::Unavailable, CLOSED, "The reference's physical residence no longer admits reads"));
                 }
-                owner.storage_regions.insert(id, StorageRegion::ReferenceRead { custody: worker.custody.clone() });
+                owner.storage_regions.insert(id, StorageRegion::ReferenceRead { custody: worker.custody.clone(), object: Some(object.clone()) });
                 Ok(())
             }).await;
             let opened = accepted.is_ok();
@@ -146,8 +151,16 @@ mod tests {
 
         let unrelated = DeploymentRecord::new("unrelated", "org", Vec::new(), 0);
         let other_custody = ReferenceReads::new(directory.clone(), keys.clone(), tasks.clone(), &unrelated, "v06", namespaces, ReplayCustody::Local);
-        assert!(matches!(other_custody.retain(&parent_store).await, Err(Error::Closed(_))));
-        assert!(matches!(custody.retain(&format!("{}/v05", parent.storage_prefix())).await, Err(Error::Closed(_))));
+        assert!(matches!(other_custody.retain(&parent_store, &parent_object).await, Err(Error::Closed(_))));
+        assert!(matches!(custody.retain(&format!("{}/v05", parent.storage_prefix()), &parent_object).await, Err(Error::Closed(_))));
+
+        let retirement = Uuid::new_v4();
+        crate::admin::update_installation(directory.as_ref(), &parent.id, |owner| {
+            owner.storage_regions.insert(retirement, StorageRegion::ExactRetirement { object: parent_object.to_string() });
+            Ok(())
+        }).await.unwrap();
+        assert!(matches!(store.get(&object).await, Err(Error::Closed(_))));
+        crate::store::release_region(directory.as_ref(), &parent.id, retirement, false).await.unwrap();
 
         let (entered, running) = oneshot::channel();
         let (release, finish) = std::sync::mpsc::channel();
