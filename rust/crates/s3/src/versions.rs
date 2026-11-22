@@ -7,7 +7,7 @@ use aws_sdk_s3::types::{ChecksumAlgorithm, CompletedMultipartUpload, CompletedPa
 use bytes::Bytes;
 use object_store::path::Path;
 use rtdb_storage::{Error, ObjectKey, remote::{PublicationResult, PublicationUploads, valid_object_version}};
-use rtdb_types::{Anomaly, AnomalyCategory, PhysicalObjectVersion, Result, S3ObjectNamespace};
+use rtdb_types::{Anomaly, AnomalyCategory, PhysicalObjectVersion, Result, S3ObjectNamespace, S3TombstoneCondition};
 
 #[path = "never_versioned.rs"]
 mod never_versioned;
@@ -259,6 +259,30 @@ impl VersionedInventory {
         Err(unavailable("The aborted multipart upload is still addressable"))
     }
 
+    async fn complete_conditional(&self, path: &Path, upload: &str, bytes: Bytes, condition: &S3TombstoneCondition) -> rtdb_storage::Result<PublicationResult> {
+        let key = path.as_ref();
+        let part = self.client.upload_part().bucket(&self.namespace.bucket).key(key).upload_id(upload)
+            .part_number(1).checksum_algorithm(ChecksumAlgorithm::Sha256).body(ByteStream::from(bytes))
+            .set_request_payer(self.request_payer.clone()).send().await
+            .map_err(|error| publication_failure(path, error.to_string()))?;
+        let tag = part.e_tag().ok_or_else(|| publication_failure(path, "S3 returned an uploaded part without an ETag"))?;
+        let checksum = part.checksum_sha256().ok_or_else(|| publication_failure(path, "S3 returned an uploaded part without its checksum"))?;
+        let parts = CompletedMultipartUpload::builder()
+            .parts(CompletedPart::builder().part_number(1).e_tag(tag).checksum_sha256(checksum).build())
+            .build();
+        let request = self.client.complete_multipart_upload().bucket(&self.namespace.bucket).key(key).upload_id(upload)
+            .multipart_upload(parts).set_request_payer(self.request_payer.clone());
+        let request = match condition {
+            S3TombstoneCondition::Absent => request.if_none_match("*"),
+            S3TombstoneCondition::Matches(tag) => request.if_match(tag),
+        };
+        match request.send().await {
+            Ok(output) => Ok(PublicationResult::Published { version: output.version_id().map(str::to_owned) }),
+            Err(error) if error.as_service_error().and_then(|error| error.code()) == Some("PreconditionFailed") => Ok(PublicationResult::Conflict),
+            Err(error) => Err(publication_failure(path, error.to_string())),
+        }
+    }
+
     async fn purge_versions(&self, prefix: &str) -> Result<()> {
         let mut previous = Vec::new();
         loop {
@@ -310,23 +334,7 @@ impl PublicationUploads for VersionedInventory {
     }
 
     async fn complete(&self, path: &Path, upload: &str, bytes: Bytes) -> rtdb_storage::Result<PublicationResult> {
-        let key = path.as_ref();
-        let part = self.client.upload_part().bucket(&self.namespace.bucket).key(key).upload_id(upload)
-            .part_number(1).checksum_algorithm(ChecksumAlgorithm::Sha256).body(ByteStream::from(bytes))
-            .set_request_payer(self.request_payer.clone()).send().await
-            .map_err(|error| publication_failure(path, error.to_string()))?;
-        let tag = part.e_tag().ok_or_else(|| publication_failure(path, "S3 returned an uploaded part without an ETag"))?;
-        let checksum = part.checksum_sha256().ok_or_else(|| publication_failure(path, "S3 returned an uploaded part without its checksum"))?;
-        let parts = CompletedMultipartUpload::builder()
-            .parts(CompletedPart::builder().part_number(1).e_tag(tag).checksum_sha256(checksum).build())
-            .build();
-        match self.client.complete_multipart_upload().bucket(&self.namespace.bucket).key(key).upload_id(upload)
-            .if_none_match("*").multipart_upload(parts).set_request_payer(self.request_payer.clone()).send().await
-        {
-            Ok(output) => Ok(PublicationResult::Published { version: output.version_id().map(str::to_owned) }),
-            Err(error) if error.as_service_error().and_then(|error| error.code()) == Some("PreconditionFailed") => Ok(PublicationResult::Conflict),
-            Err(error) => Err(publication_failure(path, error.to_string())),
-        }
+        self.complete_conditional(path, upload, bytes, &S3TombstoneCondition::Absent).await
     }
 
     async fn abort(&self, path: &Path, upload: &str) -> rtdb_storage::Result<()> {

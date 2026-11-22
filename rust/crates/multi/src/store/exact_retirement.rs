@@ -14,6 +14,8 @@ use crate::packing::{block_pack, observe_pack_index, pack_block};
 use crate::reference::{Base, References, stores};
 
 mod receipts;
+mod tombstones;
+use tombstones::TombstoneJournal;
 
 const MAXIMUM_RELEASE_BYTES: u64 = 32 << 10;
 
@@ -61,7 +63,7 @@ pub(super) trait RetirementProvider: Send + Sync {
     async fn absent(&self, key: &ObjectKey, version: &PhysicalObjectVersion) -> Result<bool>;
     async fn erase(&self, key: &ObjectKey, version: &PhysicalObjectVersion) -> Result<()>;
 
-    async fn retire_tombstones(&self, _: Uuid, _: [(&ObjectKey, &S3TombstoneTarget); 2]) -> Result<()> {
+    async fn retire_tombstones(&self, _: &TombstoneJournal<'_>, _: [(&ObjectKey, &S3TombstoneTarget); 2]) -> Result<()> {
         Err(Anomaly::unsupported("rtdb.multi/tombstone-provider", "The provider cannot retire never-versioned objects"))
     }
 }
@@ -80,9 +82,9 @@ impl RetirementProvider for rtdb_s3::VersionedInventory {
         self.retire_observed_version(key, version).await
     }
 
-    async fn retire_tombstones(&self, token: Uuid, objects: [(&ObjectKey, &S3TombstoneTarget); 2]) -> Result<()> {
+    async fn retire_tombstones(&self, journal: &TombstoneJournal<'_>, objects: [(&ObjectKey, &S3TombstoneTarget); 2]) -> Result<()> {
         let provider = self.never_versioned_retirement().await?;
-        for (key, target) in objects { provider.retire(key, target, token).await?; }
+        for (key, target) in objects { tombstones::retire(&provider, journal, key, target).await?; }
         Ok(())
     }
 }
@@ -101,7 +103,8 @@ pub(super) async fn reap(directory: &dyn Directory, bucket: &dyn ObjectStore, pr
             {
                 let target = ObjectKey::new(target)?;
                 let release = ObjectKey::new(release)?;
-                provider.retire_tombstones(retirement.token, [(&target, data_tombstone), (&release, release_tombstone)]).await?;
+                let journal = TombstoneJournal::new(directory, lineage, retirement.token);
+                provider.retire_tombstones(&journal, [(&target, data_tombstone), (&release, release_tombstone)]).await?;
                 settle(directory, lineage, deployment, retirement).await?;
             }
             _ => {},
@@ -815,13 +818,21 @@ mod tests {
             async fn available(&self, _: &ObjectKey, _: &PhysicalObjectVersion) -> Result<bool> { unreachable!() }
             async fn absent(&self, _: &ObjectKey, _: &PhysicalObjectVersion) -> Result<bool> { unreachable!() }
             async fn erase(&self, _: &ObjectKey, _: &PhysicalObjectVersion) -> Result<()> { unreachable!() }
-            async fn retire_tombstones(&self, token: Uuid, objects: [(&ObjectKey, &S3TombstoneTarget); 2]) -> Result<()> {
-                assert_eq!(token, self.token);
-                let mut calls = self.calls.lock();
-                let first = calls.is_empty();
-                calls.extend(objects.map(|(key, target)| (key.clone(), target.clone())));
-                if first { return Err(Anomaly::fault("fixture/lost-marker-reply", "The release marker is still pending")); }
-                Ok(())
+            async fn retire_tombstones(&self, journal: &TombstoneJournal<'_>, objects: [(&ObjectKey, &S3TombstoneTarget); 2]) -> Result<()> {
+                assert_eq!(journal.token(), self.token);
+                let first = {
+                    let mut calls = self.calls.lock();
+                    let first = calls.is_empty();
+                    calls.extend(objects.map(|(key, target)| (key.clone(), target.clone())));
+                    first
+                };
+                let marker = objects[1].0;
+                if first {
+                    journal.admit(marker, "marker-upload").await?;
+                    return Err(Anomaly::fault("fixture/lost-marker-reply", "The release marker is still pending"));
+                }
+                assert_eq!(journal.upload(marker).await?.as_deref(), Some("marker-upload"));
+                journal.settle(marker, "marker-upload").await
             }
         }
 
@@ -861,6 +872,8 @@ mod tests {
         let state = directory.lineage_state(&owner.lineage).await.unwrap();
         assert!(state.exact_erasure_authorized());
         assert_eq!(state.retirement(), Some(&retirement));
+        assert_eq!(state.tombstone_upload(retirement.token, marker.as_str()).unwrap(), Some("marker-upload"));
+        assert!(directory.settle_owned_version(&owner.id, owner_fenced.version, retirement.clone()).await.is_err());
         drop(directory);
 
         let directory = MemoryDirectory::open(data_path.path()).unwrap();

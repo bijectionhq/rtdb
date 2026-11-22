@@ -246,6 +246,24 @@ async fn exact_retirement(directory: &dyn Directory, parent: &DeploymentRecord, 
     assert_eq!(directory.change_lineage(lineage, LineageChange::AbandonExactRetirement { retirement: retirement.clone() }).await.unwrap_err().code,
         "rtdb.directory/lineage-changed");
     assert!(directory.change_lineage(lineage, settle).await.is_err());
+    if tombstones {
+        let target = format!("{}/v06/payload", retirement.source);
+        let change = |key: &str, upload: &str| LineageChange::AdmitTombstoneUpload {
+            retirement: retirement.token, key: key.to_owned(), upload: upload.to_owned(),
+        };
+        assert!(directory.change_lineage(lineage, change("outside", "one")).await.is_err());
+        let uploaded = directory.change_lineage(lineage, change(&target, "one")).await.unwrap();
+        assert_eq!(uploaded.tombstone_upload(retirement.token, &target).unwrap(), Some("one"));
+        assert_eq!(directory.change_lineage(lineage, change(&target, "one")).await.unwrap(), uploaded);
+        assert!(directory.change_lineage(lineage, change(&target, "two")).await.is_err());
+        assert!(directory.settle_owned_version(&owner.id, fenced.version, retirement.clone()).await.is_err());
+        let drained = |upload: &str| LineageChange::SettleTombstoneUpload {
+            retirement: retirement.token, key: target.clone(), upload: upload.to_owned(),
+        };
+        assert!(directory.change_lineage(lineage, drained("two")).await.is_err());
+        let state = directory.change_lineage(lineage, drained("one")).await.unwrap();
+        assert_eq!(state.tombstone_upload(retirement.token, &target).unwrap(), None);
+    }
     let wrong = directory.settle_owned_version(&owner.id, partial.version, retirement.clone()).await.unwrap();
     assert!(matches!(wrong, Cas::Conflict(Some(_))));
     let settled = directory.settle_owned_version(&owner.id, fenced.version, retirement.clone()).await.unwrap().applied().unwrap();

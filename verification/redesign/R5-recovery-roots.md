@@ -245,11 +245,17 @@ The serving bucket policy must grant conditional replacement to the reaper and k
 
 Whole-residence disposal also needs evidence that every retirement write has settled.
 A redundant create-if-absent tombstone request can be harmless while the first tombstone remains visible and recreate the key if the whole residence is purged before that request completes.
-The abortable-upload design records each provider upload before it can apply and closes its identity before settling the retirement.
+The reaper records at most one multipart upload ID per authorized key in the lineage before it submits a part or a conditional completion.
+A restart reuses the recorded upload, including when a previous completion reply was lost.
+A fresh provider `NoSuchUpload` observation after abort closes that specific identity before the reaper forgets it.
+The owner-and-lineage settlement transaction observes an empty upload journal in addition to the matching fences.
+The runtime exercises the protocol against an S3 HTTP fixture and persists its journal across directory restart.
 A bounded model exercises a redundant request arriving after purge with the upload already closed.
 An untracked retry or early settlement can recreate the disposed key in its negative controls.
 TLC explored 33 states and reached purge with a delayed completion whose closed upload could no longer affect storage.
-The running reaper still needs to connect tombstone writes to that durable drain before admitting new retirements.
+An initiation that loses its response before admission can leave an empty upload for provider lifecycle cleanup.
+Hosted qualification must establish conditional multipart completion for a zero-byte payload and confirm that a closed upload cannot publish after whole-residence disposal.
+Enabling new retirements still needs terminal namespace enrollment and the matching reaper policy.
 [Disposal composition model](../tla/TombstoneDisposal.tla)
 
 ### Shared fork publication and referrer inventories

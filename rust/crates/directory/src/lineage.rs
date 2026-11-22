@@ -102,6 +102,8 @@ pub enum LineageChange {
     PrepareHostedFork { preparation: ForkPreparation, task: Option<HostedTask> },
     ReleaseFork { preparation: ForkPreparation },
     ReserveRetirement { retirement: LineageRetirement, observed_references: Version, generation: Version },
+    AdmitTombstoneUpload { retirement: Uuid, key: String, upload: String },
+    SettleTombstoneUpload { retirement: Uuid, key: String, upload: String },
     AbandonExactRetirement { retirement: LineageRetirement },
     SettleRetirement { retirement: LineageRetirement },
 }
@@ -120,6 +122,7 @@ enum Admission {
     Retiring(LineageRetirement),
     Disposing(String),
     Erasing(LineageRetirement),
+    ErasingTombstones { retirement: LineageRetirement, uploads: BTreeMap<String, String> },
 }
 
 impl Default for Admission {
@@ -205,11 +208,22 @@ impl LineageState {
     }
     pub fn retirement(&self) -> Option<&LineageRetirement> {
         match &self.admission {
-            Admission::Retiring(retirement) | Admission::Erasing(retirement) => Some(retirement),
+            Admission::Retiring(retirement) | Admission::Erasing(retirement) | Admission::ErasingTombstones { retirement, .. } => Some(retirement),
             Admission::Open(_) | Admission::Disposing(_) => None,
         }
     }
-    pub fn exact_erasure_authorized(&self) -> bool { matches!(self.admission, Admission::Erasing(_)) }
+    pub fn exact_erasure_authorized(&self) -> bool { matches!(self.admission, Admission::Erasing(_) | Admission::ErasingTombstones { .. }) }
+
+    pub fn tombstone_upload(&self, token: Uuid, key: &str) -> Result<Option<&str>> {
+        Ok(self.tombstone_uploads(token, key)?.get(key).map(String::as_str))
+    }
+
+    fn tombstone_uploads(&self, token: Uuid, key: &str) -> Result<&BTreeMap<String, String>> {
+        let Admission::ErasingTombstones { retirement, uploads } = &self.admission else { return Err(lineage_busy()); };
+        let RetirementWork::Tombstones { target, release, .. } = &retirement.work else { return Err(lineage_busy()); };
+        if retirement.token != token || (key != target && key != release) { return Err(lineage_busy()); }
+        Ok(uploads)
+    }
 
     pub(crate) fn authorize_exact_owned(&self, owner: &DeploymentRecord, retirement: &LineageRetirement) -> Result<Self> {
         if self.retirement() != Some(retirement) || !retirement.matches_owner(owner) || !retirement.matches_fence(owner)
@@ -219,7 +233,10 @@ impl LineageState {
         }
         let mut next = self.clone();
         if !self.exact_erasure_authorized() {
-            next.admission = Admission::Erasing(retirement.clone());
+            next.admission = match retirement.work {
+                RetirementWork::Tombstones { .. } => Admission::ErasingTombstones { retirement: retirement.clone(), uploads: BTreeMap::new() },
+                _ => Admission::Erasing(retirement.clone()),
+            };
             next.advance_version()?;
         }
         Ok(next)
@@ -230,8 +247,13 @@ impl LineageState {
         let matching_fence = retirement.matches_fence(owner)
             || matches!(retirement.work, RetirementWork::S3 { release_version: None, .. })
                 && !owner.storage_regions.contains_key(&retirement.token);
+        let ready = match &self.admission {
+            Admission::Erasing(current) => current == retirement && !matches!(current.work, RetirementWork::Tombstones { .. }),
+            Admission::ErasingTombstones { retirement: current, uploads } => current == retirement && uploads.is_empty(),
+            _ => false,
+        };
         if !reference_revision::may_settle_exact_owned(
-            matches!(&self.admission, Admission::Erasing(current) if current == retirement),
+            ready,
             retirement.matches_owner(owner),
             matching_fence,
         ) { return Err(lineage_busy()); }
@@ -285,6 +307,25 @@ impl LineageState {
                 }
                 next.retirement_generation = next_reference_revision(self.retirement_generation)?;
                 next.admission = Admission::Retiring(retirement);
+            }
+            LineageChange::AdmitTombstoneUpload { retirement, key, upload } => {
+                if upload.is_empty() { return Err(lineage_busy()); }
+                match self.tombstone_upload(retirement, &key)? {
+                    Some(existing) if existing == upload => return Ok(next),
+                    Some(_) => return Err(lineage_busy()),
+                    None => {},
+                }
+                let Admission::ErasingTombstones { uploads, .. } = &mut next.admission else { unreachable!() };
+                uploads.insert(key, upload);
+            }
+            LineageChange::SettleTombstoneUpload { retirement, key, upload } => {
+                match self.tombstone_upload(retirement, &key)? {
+                    Some(existing) if existing == upload => {},
+                    Some(_) => return Err(lineage_busy()),
+                    None => return Ok(next),
+                }
+                let Admission::ErasingTombstones { uploads, .. } = &mut next.admission else { unreachable!() };
+                uploads.remove(&key);
             }
             LineageChange::AbandonExactRetirement { retirement } => {
                 if matches!(retirement.work, RetirementWork::Local { .. })

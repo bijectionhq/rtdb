@@ -2376,9 +2376,21 @@ rule SettleObservedS3Version {
                 ExactVersionRetirementSettled(retirement)
 }
 
+rule AdmitNeverVersionedTombstoneUpload {
+    -- An empty provider upload acquires one slot in the authorized retirement before payload submission.
+    when: NeverVersionedTombstoneUploadReserved(retirement, key, upload)
+
+    requires: ExactVersionRetirementAuthorized(retirement)
+    requires: RetirementKeyMatches(retirement, key)
+    requires: NoRetainedTombstoneUpload(retirement, key)
+
+    ensures:
+        RecordTombstoneUpload(retirement, key, upload)
+        AllowConditionalTombstoneCompletion(retirement, key, upload)
+}
+
 rule SettleNeverVersionedRetirement {
-    -- A prepared retirement carries the conditional write and physical namespace for each key.
-    -- The reaper resumes the same data and release marker operations after interruption.
+    -- The reaper can resume both exact upload identities after interruption.
     -- Serving reads treat a tombstone as an absent object, and the provider retains the key against create-if-absent writes.
     when: NeverVersionedRetirementContinued(retirement)
 
@@ -2388,9 +2400,11 @@ rule SettleNeverVersionedRetirement {
     requires: PhysicalOwnerFencedForObject(retirement.release_key)
 
     ensures:
-        ApplyConditionalRetirementTombstone(retirement.data_key, retirement.data_condition, retirement.token)
-        ApplyConditionalRetirementTombstone(retirement.release_key, retirement.release_condition, retirement.token)
-        if FreshTombstoneObservationsMatch(retirement) and ServingBucketNeverVersioned(retirement.namespace):
+        for upload in RetainedTombstoneUploads(retirement):
+            DrainExactTombstoneUpload(upload)
+            if FreshProviderObservationConfirmsUploadClosed(upload):
+                ForgetTombstoneUpload(retirement, upload)
+        if NoRetainedTombstoneUploads(retirement) and FreshTombstoneObservationsMatch(retirement) and ServingBucketNeverVersioned(retirement.namespace):
             SettleOwnerFenceAndReopenLineage(retirement)
 }
 

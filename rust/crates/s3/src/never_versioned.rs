@@ -1,6 +1,10 @@
-use aws_sdk_s3::primitives::ByteStream;
+use aws_sdk_s3::types::ChecksumAlgorithm;
+use bytes::Bytes;
 use object_store::path::Path;
-use rtdb_storage::{ObjectKey, remote::S3_RETIREMENT_ATTRIBUTE};
+use rtdb_storage::{
+    ObjectKey,
+    remote::{PublicationResult, S3_RETIREMENT_ATTRIBUTE},
+};
 use rtdb_types::{Anomaly, AnomalyCategory, Result, S3TombstoneCondition, S3TombstoneTarget};
 use uuid::Uuid;
 
@@ -110,64 +114,91 @@ impl NeverVersionedRetirement<'_> {
         }))
     }
 
-    pub async fn retire(
-        &self,
-        key: &ObjectKey,
-        target: &S3TombstoneTarget,
-        token: Uuid,
-    ) -> Result<()> {
+    fn checked_path(&self, key: &ObjectKey, target: &S3TombstoneTarget) -> Result<Path> {
         let path = self.path(key);
-        if token.is_nil()
-            || target.namespace != self.inventory.namespace
+        if target.namespace != self.inventory.namespace
             || target.key != path.as_ref()
             || matches!(&target.condition, S3TombstoneCondition::Matches(tag) if !strong_tag(tag))
         {
             return Err(Anomaly::incorrect(
                 "rtdb.s3/tombstone-target",
-                "The retirement is not bound to this physical object",
+                "The retirement is bound to another physical object",
             ));
         }
-        self.require_never_versioned().await?;
-        match self.observe(key).await? {
-            NeverVersionedObject::Retired(current) if current == token => {
-                return self.require_never_versioned().await;
-            }
-            NeverVersionedObject::Open(current) if current == *target => {}
-            _ => return Err(changed()),
+        Ok(path)
+    }
+
+    pub async fn reserve(
+        &self,
+        key: &ObjectKey,
+        target: &S3TombstoneTarget,
+        token: Uuid,
+    ) -> Result<String> {
+        let path = self.checked_path(key, target)?;
+        if token.is_nil() {
+            return Err(Anomaly::incorrect(
+                "rtdb.s3/tombstone-target",
+                "The retirement needs an identity",
+            ));
         }
-        let request = self
+        let reply = self
             .inventory
             .client
-            .put_object()
+            .create_multipart_upload()
             .bucket(&self.inventory.namespace.bucket)
             .key(path.as_ref())
+            .metadata(S3_RETIREMENT_ATTRIBUTE, token.simple().to_string())
+            .checksum_algorithm(ChecksumAlgorithm::Sha256)
             .set_request_payer(self.inventory.request_payer.clone())
-            .body(ByteStream::from_static(b""))
-            .metadata(S3_RETIREMENT_ATTRIBUTE, token.simple().to_string());
-        let request = match &target.condition {
-            S3TombstoneCondition::Absent => request.if_none_match("*"),
-            S3TombstoneCondition::Matches(tag) => request.if_match(tag),
-        };
-        let reply = request.send().await;
-        if reply
-            .as_ref()
-            .is_ok_and(|reply| reply.version_id().is_some())
+            .send()
+            .await
+            .map_err(|error| {
+                unavailable(format!("Reserving the retirement upload failed: {error}"))
+            })?;
+        reply
+            .upload_id()
+            .filter(|id| !id.is_empty())
+            .map(str::to_owned)
+            .ok_or_else(|| unavailable("S3 did not identify the retirement upload"))
+    }
+
+    pub async fn complete(
+        &self,
+        key: &ObjectKey,
+        target: &S3TombstoneTarget,
+        upload: &str,
+    ) -> Result<()> {
+        let path = self.checked_path(key, target)?;
+        self.require_never_versioned().await?;
+        match self
+            .inventory
+            .complete_conditional(&path, upload, Bytes::new(), &target.condition)
+            .await?
         {
-            return Err(unavailable("S3 versioned the retirement tombstone"));
-        }
-        match self.observe(key).await? {
-            NeverVersionedObject::Retired(current) if current == token => {
-                self.require_never_versioned().await
+            PublicationResult::Published { version: None } | PublicationResult::Conflict => Ok(()),
+            PublicationResult::Published { version: Some(_) } => {
+                Err(unavailable("S3 versioned the retirement tombstone"))
             }
-            NeverVersionedObject::Open(current) if current == *target => {
-                let message = reply.err().map_or_else(
-                    || "S3 has not exposed the retirement tombstone".to_owned(),
-                    |error| format!("Writing the retirement tombstone did not settle: {error}"),
-                );
-                Err(unavailable(message))
-            }
-            _ => Err(changed()),
         }
+    }
+
+    pub async fn drain(
+        &self,
+        key: &ObjectKey,
+        target: &S3TombstoneTarget,
+        upload: &str,
+    ) -> Result<()> {
+        let path = self.checked_path(key, target)?;
+        self.inventory.abort_upload(path.as_ref(), upload).await
+    }
+
+    pub async fn confirms(&self, key: &ObjectKey, token: Uuid) -> Result<bool> {
+        if !matches!(self.observe(key).await?, NeverVersionedObject::Retired(current) if current == token)
+        {
+            return Ok(false);
+        }
+        self.require_never_versioned().await?;
+        Ok(true)
     }
 }
 
@@ -191,20 +222,12 @@ fn unavailable(message: impl Into<String>) -> Anomaly {
     )
 }
 
-fn changed() -> Anomaly {
-    Anomaly::new(
-        AnomalyCategory::Conflict,
-        "rtdb.s3/tombstone-target-changed",
-        "The current object differs from the retired publication",
-    )
-}
-
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
     use std::time::Duration;
 
-    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
     use tokio::net::TcpListener;
 
     use super::*;
@@ -247,8 +270,15 @@ mod tests {
                 reader.read_line(&mut line).await.unwrap();
                 let mut request = line.split_whitespace();
                 assert_eq!(request.next(), Some(expected.method));
-                let path = request.next().unwrap().trim_end_matches('=');
-                assert_eq!(path, expected.path);
+                let address =
+                    url::Url::parse(&format!("http://fixture{}", request.next().unwrap())).unwrap();
+                let wanted = url::Url::parse(&format!("http://fixture{}", expected.path)).unwrap();
+                assert_eq!(address.path(), wanted.path());
+                let query = address
+                    .query_pairs()
+                    .filter(|(key, _)| key != "x-id")
+                    .collect::<BTreeMap<_, _>>();
+                assert_eq!(query, wanted.query_pairs().collect::<BTreeMap<_, _>>());
                 let mut headers = BTreeMap::new();
                 loop {
                     line.clear();
@@ -262,12 +292,12 @@ mod tests {
                 for (name, value) in expected.conditions {
                     assert_eq!(headers.get(*name).map(String::as_str), Some(*value));
                 }
-                if expected.method == "PUT" {
-                    assert_eq!(headers.get("content-length").map(String::as_str), Some("0"));
-                    assert_ne!(
-                        headers.contains_key("if-match"),
-                        headers.contains_key("if-none-match")
-                    );
+                if let Some(length) = headers.get("content-length") {
+                    let mut body = vec![0; length.parse().unwrap()];
+                    reader.read_exact(&mut body).await.unwrap();
+                    if expected.method == "PUT" {
+                        assert!(body.is_empty());
+                    }
                 }
                 let size = if expected.method == "HEAD" {
                     String::new()
@@ -310,22 +340,70 @@ mod tests {
         }
     }
 
-    fn put(
-        status: &'static str,
-        conditions: &'static [(&'static str, &'static str)],
-    ) -> Exchange<'static> {
+    fn reserve() -> Exchange<'static> {
+        Exchange {
+            method: "POST",
+            path: "/cell/cell/owner/data?uploads",
+            status: "200 OK",
+            headers: "",
+            conditions: &[(
+                "x-amz-meta-rtdb-retirement",
+                "00000000000000000000000000000001",
+            )],
+            body: "<InitiateMultipartUploadResult><UploadId>one</UploadId></InitiateMultipartUploadResult>",
+        }
+    }
+
+    fn part() -> Exchange<'static> {
         Exchange {
             method: "PUT",
-            path: "/cell/cell/owner/data?x-id=PutObject",
-            conditions,
-            status,
-            headers: "",
+            path: "/cell/cell/owner/data?partNumber=1&uploadId=one",
+            status: "200 OK",
+            conditions: &[],
+            headers: "ETag: \"part\"\r\nx-amz-checksum-sha256: 47DEQpj8HBSa+/TImW+5JCeuQeRkm5NMpJWZG3hSuFU=\r\n",
             body: "",
         }
     }
 
+    fn complete(
+        status: &'static str,
+        header: &'static [(&'static str, &'static str)],
+        body: &'static str,
+    ) -> Exchange<'static> {
+        Exchange {
+            method: "POST",
+            path: "/cell/cell/owner/data?uploadId=one",
+            status,
+            conditions: header,
+            headers: "",
+            body,
+        }
+    }
+
+    fn drain() -> [Exchange<'static>; 2] {
+        [
+            Exchange {
+                method: "DELETE",
+                path: "/cell/cell/owner/data?uploadId=one",
+                conditions: &[],
+                status: "204 No Content",
+                headers: "",
+                body: "",
+            },
+            Exchange {
+                method: "GET",
+                path: "/cell/cell/owner/data?uploadId=one&max-parts=1",
+                conditions: &[],
+                status: "404 Not Found",
+                headers: "",
+                body: "<Error><Code>NoSuchUpload</Code></Error>",
+            },
+        ]
+    }
+
     #[tokio::test]
-    async fn a_tombstone_reply_requires_a_fresh_observation_and_the_exact_retirement_token() {
+    async fn conditional_completion_is_scoped_to_the_reserved_upload_and_requires_a_token_observation()
+     {
         let token = Uuid::from_u128(1);
         let live = || head("200 OK", "Content-Length: 7\r\nETag: \"original\"\r\n");
         let tombstone = || {
@@ -334,37 +412,12 @@ mod tests {
                 "Content-Length: 0\r\nx-amz-meta-rtdb-retirement: 00000000000000000000000000000001\r\n",
             )
         };
-        let write = |status| {
-            put(
-                status,
-                &[
-                    ("if-match", "\"original\""),
-                    (
-                        "x-amz-meta-rtdb-retirement",
-                        "00000000000000000000000000000001",
-                    ),
-                ],
-            )
-        };
-        let (inventory, server) = fixture(vec![
-            profile(BUCKET_CHECK),
-            live(),
-            profile(BUCKET_CHECK),
-            live(),
-            write("200 OK"),
-            live(),
-            profile(BUCKET_CHECK),
-            live(),
-            write("412 Precondition Failed"),
-            tombstone(),
-            profile(BUCKET_CHECK),
-            profile(BUCKET_CHECK),
-            tombstone(),
-            profile(BUCKET_CHECK),
-            profile(BUCKET_CHECK),
-            tombstone(),
-        ])
-        .await;
+        let (inventory, server) = fixture(Vec::from([
+            profile(BUCKET_CHECK), live(), reserve(), profile(BUCKET_CHECK), part(),
+            complete("200 OK", &[("if-match", "\"original\"")], "<CompleteMultipartUploadResult><ETag>new</ETag></CompleteMultipartUploadResult>"),
+        ]).into_iter().chain(drain()).chain([
+            live(), tombstone(), profile(BUCKET_CHECK), tombstone(),
+        ]).collect()).await;
         let key = ObjectKey::new("owner/data").unwrap();
         tokio::time::timeout(Duration::from_secs(10), async {
             let retirement = inventory.never_versioned_retirement().await.unwrap();
@@ -378,30 +431,19 @@ mod tests {
             let wrong_key = ObjectKey::new("owner/other").unwrap();
             assert_eq!(
                 retirement
-                    .retire(&wrong_key, &target, token)
+                    .reserve(&wrong_key, &target, token)
                     .await
                     .unwrap_err()
                     .code,
                 "rtdb.s3/tombstone-target"
             );
-            assert_eq!(
-                retirement
-                    .retire(&key, &target, token)
-                    .await
-                    .unwrap_err()
-                    .code,
-                "rtdb.s3/tombstone-pending"
-            );
-            retirement.retire(&key, &target, token).await.unwrap();
-            retirement.retire(&key, &target, token).await.unwrap();
-            assert_eq!(
-                retirement
-                    .retire(&key, &target, Uuid::from_u128(2))
-                    .await
-                    .unwrap_err()
-                    .code,
-                "rtdb.s3/tombstone-target-changed"
-            );
+            let upload = retirement.reserve(&key, &target, token).await.unwrap();
+            assert_eq!(upload, "one");
+            retirement.complete(&key, &target, &upload).await.unwrap();
+            retirement.drain(&key, &target, &upload).await.unwrap();
+            assert!(!retirement.confirms(&key, token).await.unwrap());
+            assert!(retirement.confirms(&key, token).await.unwrap());
+            assert!(!retirement.confirms(&key, Uuid::from_u128(2)).await.unwrap());
             server.await.unwrap();
         })
         .await
@@ -409,26 +451,29 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_missing_key_needs_a_conditional_tombstone_and_preserves_a_competing_create() {
+    async fn a_missing_key_completion_preserves_a_competing_create() {
         let token = Uuid::from_u128(1);
-        let missing = || head("404 Not Found", "Content-Length: 0\r\n");
-        let (inventory, server) = fixture(vec![
-            profile(BUCKET_CHECK),
-            missing(),
-            profile(BUCKET_CHECK),
-            missing(),
-            put(
-                "412 Precondition Failed",
-                &[
-                    ("if-none-match", "*"),
-                    (
-                        "x-amz-meta-rtdb-retirement",
-                        "00000000000000000000000000000001",
-                    ),
-                ],
-            ),
-            head("200 OK", "Content-Length: 11\r\nETag: \"replacement\"\r\n"),
-        ])
+        let (inventory, server) = fixture(
+            Vec::from([
+                profile(BUCKET_CHECK),
+                head("404 Not Found", "Content-Length: 0\r\n"),
+                reserve(),
+                profile(BUCKET_CHECK),
+                part(),
+                complete(
+                    "412 Precondition Failed",
+                    &[("if-none-match", "*")],
+                    "<Error><Code>PreconditionFailed</Code></Error>",
+                ),
+            ])
+            .into_iter()
+            .chain(drain())
+            .chain([head(
+                "200 OK",
+                "Content-Length: 11\r\nETag: \"replacement\"\r\n",
+            )])
+            .collect(),
+        )
         .await;
         let key = ObjectKey::new("owner/data").unwrap();
         tokio::time::timeout(Duration::from_secs(10), async {
@@ -437,14 +482,10 @@ mod tests {
                 panic!("expected a missing key")
             };
             assert_eq!(target.condition, S3TombstoneCondition::Absent);
-            assert_eq!(
-                retirement
-                    .retire(&key, &target, token)
-                    .await
-                    .unwrap_err()
-                    .code,
-                "rtdb.s3/tombstone-target-changed"
-            );
+            let upload = retirement.reserve(&key, &target, token).await.unwrap();
+            retirement.complete(&key, &target, &upload).await.unwrap();
+            retirement.drain(&key, &target, &upload).await.unwrap();
+            assert!(!retirement.confirms(&key, token).await.unwrap());
             server.await.unwrap();
         })
         .await
@@ -454,9 +495,7 @@ mod tests {
     #[tokio::test]
     async fn a_tombstone_cannot_settle_if_bucket_versioning_changes() {
         let (inventory, server) = fixture(vec![
-            profile(BUCKET_CHECK), head("200 OK", "Content-Length: 7\r\nETag: \"original\"\r\n"),
-            profile(BUCKET_CHECK), head("200 OK", "Content-Length: 7\r\nETag: \"original\"\r\n"),
-            put("200 OK", &[("if-match", "\"original\"")]),
+            profile(BUCKET_CHECK),
             head("200 OK", "Content-Length: 0\r\nx-amz-meta-rtdb-retirement: 00000000000000000000000000000001\r\n"),
             profile("<VersioningConfiguration><Status>Suspended</Status></VersioningConfiguration>"),
             profile("<VersioningConfiguration><Status>Enabled</Status></VersioningConfiguration>"),
@@ -464,12 +503,9 @@ mod tests {
         let key = ObjectKey::new("owner/data").unwrap();
         tokio::time::timeout(Duration::from_secs(10), async {
             let retirement = inventory.never_versioned_retirement().await.unwrap();
-            let NeverVersionedObject::Open(target) = retirement.observe(&key).await.unwrap() else {
-                panic!("expected a publication")
-            };
             assert_eq!(
                 retirement
-                    .retire(&key, &target, Uuid::from_u128(1))
+                    .confirms(&key, Uuid::from_u128(1))
                     .await
                     .unwrap_err()
                     .code,
