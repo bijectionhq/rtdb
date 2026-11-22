@@ -119,3 +119,51 @@ Commands and logs are retained under `/private/tmp/rtdb-formal.QMjPSJsX/`.
 * `reference-disposal-combined-h_5pk4lw/` has the TLC, Apalache, Verus, Alloy, Maude, mCRL2 and AutoHyper runs.
 * `reference-disposal-lean-final-dy6zlwij/` has the full Lean run and its controls.
 * `reference-disposal-jvm.log` and `reference-disposal-s3-integration.log` have the Gradle results.
+
+== W2 and R5 · Hosted release-marker settlement
+
+Production change `c0ff58899`, tree `bbe7886fd08cfa94dcaa66a00750525b66ca36d2`.
+This increment extends the hosted exact data retirement and preparation holds introduced by `84effc8e5`.
+A new loose-file retirement records the version returned with the release marker's body. Before authorizing erasure the reaper verifies that marker again and fences both physical keys.
+The provider confirms absence of the retired data and marker versions separately. The directory then clears the owner fence and reopens the lineage in one transaction.
+
+[cols="1,4",options="header"]
+|===
+|Evidence | Result
+
+|TLC and Apalache
+|TLC explored 20 states of the marker settlement model. Four safety mutations failed as expected, and the reachability check found a delayed marker effect after settlement with a replacement present. All 377 configured repository cases matched.
+Apalache checked the marker model through 11 transitions. The other configured symbolic checks matched.
+
+|Verus and Lean
+|The shared-reference area verified 13 functions and laws, including the new owner-settlement predicate. Four added code and code-and-contract controls matched.
+All 41 Verus areas and 223 controls matched. The full existing Lean suite passed.
+
+|Native
+|495 cases passed and 11 were ignored across Directory, storage, S3, maintenance, Multi and simulation.
+The directory contract ran in memory, over TCP and against DynamoDB Local 3.3.2.
+The application replay uses the S3 version adapter against a loopback HTTP fixture. The fixture keeps the data and marker visible after separate removal acknowledgements, and a durable directory restart retains the authorization. An eventual retry sends each original version identifier and confirms absence while the provider reports newer versions.
+Two source controls fail at their declared assertions when the marker is skipped or settlement leaves the owner fence behind.
+A separate inherited-read replay and its three controls check data admission, residence closure and the marker fence.
+
+|JVM
+|3,198 standard cases, 3,348 property cases and 12 focused S3 proxy adapter integration cases passed with zero failures, errors or skips. FFI SHA-256 `0b7f18375ac27e9d12cdd03b163c2e728447bd7fc398176ecbaa39f933a0bac3`.
+
+|Other design checks
+|The existing Alloy, Maude, mCRL2 and AutoHyper suites matched.
+|===
+
+The proofs cover the model and the synchronous predicate. The execution evidence covers the named local providers and fixture exchanges.
+Live S3 and mixed-version rollout remain unverified.
+An older authorized reservation without a marker version can settle its data and leave its marker for a later version-aware pass.
+Pack-level collection, unwitnessed legacy releases and unversioned providers still need a complete retirement protocol.
+
+=== Reproduction
+
+The repository runner includes the marker model, production predicate checks and native controls.
+Commands and logs are retained under `/private/tmp/rtdb-formal.QMjPSJsX/`.
+
+* `exact-marker-native-32oftwkr/` has the scoped Rust suite and versioned provider replay.
+* `exact-marker-custody-rybqv9w3/` has the inherited-read replay and controls.
+* `exact-marker-combined-fd3fsewo/` has the complete formal runs and their tool command records.
+* `exact-marker-jvm.log` and `exact-marker-s3-integration.log` have the Gradle results.
