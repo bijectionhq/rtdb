@@ -925,6 +925,14 @@ impl OwnedReadSession {
         rtdb_query::open_owned_point(Arc::clone(&self.context), &self.owner, relation, id, valid, None).await
     }
 
+    /// Returns the typed identity's winning valid slices at this held system cut.
+    pub async fn open_valid_during(
+        &self, relation: &rtdb_types::OwnedRelation, id: &rtdb_types::EntityId, valid: rtdb_types::Interval,
+    ) -> Result<Option<QueryCursor>> {
+        self.admit_read().await?;
+        rtdb_query::open_owned_valid_during(Arc::clone(&self.context), &self.owner, relation, id, valid).await
+    }
+
     /// Computes the visible corpus of one covered clear-text path at this read's cut.
     #[cfg(feature = "search")]
     pub async fn search_corpus(
