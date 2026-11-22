@@ -703,7 +703,8 @@ pub(crate) async fn copy_fork_checkpoint(
 
 /// Copies the closure of one already published checkpoint. A capture ID
 /// fixes the checkpoint before any payload copy. An interrupted copy can
-/// resume while its original inputs remain available.
+/// resume from its accepted archive or while a source admission still
+/// protects its original checkpoint metadata.
 pub async fn capture(
     directory: Arc<dyn Directory>,
     storage: &CellStorage,
@@ -770,11 +771,23 @@ pub async fn capture(
                 remote_disposal: None,
             });
         }
-        record.storage_regions.insert(region, if local {
-            rtdb_directory::StorageRegion::Local { archive: Some(operation), tracks_ordered_index_pages: true, checkpoint_metadata_from: None, checkpoint_replay_from: None, }
+        let checkpoint = record.checkpoint_captures[&operation].checkpoint;
+        let checkpoint_metadata_from = capture_metadata_floor(record, checkpoint);
+        let admission = if local {
+            rtdb_directory::StorageRegion::Local {
+                archive: Some(operation),
+                tracks_ordered_index_pages: true,
+                checkpoint_metadata_from,
+                checkpoint_replay_from: None,
+            }
         } else {
-            crate::store::remote_storage_region(Some(operation), hosted_task.clone())
-        });
+            let mut admission = crate::store::remote_storage_region(Some(operation), hosted_task.clone());
+            if let rtdb_directory::StorageRegion::Remote { checkpoint_metadata_from: floor, .. } = &mut admission {
+                *floor = checkpoint_metadata_from;
+            }
+            admission
+        };
+        record.storage_regions.insert(region, admission);
         Ok(())
     }).await;
     let record = match admitted {
@@ -795,7 +808,7 @@ pub async fn capture(
     let result = async {
         let point = capture_point(&record, deployment, operation, &binding)?;
         let capture = capture_registered(
-            directory.as_ref(), storage, destination, keys, &record, point, io.clone(),
+            directory.as_ref(), storage, destination, keys, &record, point, region, io.clone(),
         ).await?;
         let manifest = capture.manifest_sha256()?;
         update_installation(directory.as_ref(), &id, |current| {
@@ -829,6 +842,16 @@ pub async fn capture(
     result
 }
 
+fn capture_metadata_floor(record: &DeploymentRecord, checkpoint: Checkpoint) -> Option<i64> {
+    let published = record.checkpoint?;
+    if published.block == checkpoint.block && published != checkpoint { return None; }
+    let oldest = record.storage_regions.values()
+        .filter_map(rtdb_directory::StorageRegion::checkpoint_metadata_from)
+        .min();
+    crate::checkpoint_retention::checkpoint_metadata_admissible(checkpoint.block, Some(published.block), oldest)
+        .then_some(checkpoint.block)
+}
+
 async fn capture_registered(
     directory: &dyn Directory,
     storage: &CellStorage,
@@ -836,6 +859,7 @@ async fn capture_registered(
     keys: &dyn KeyService,
     record: &DeploymentRecord,
     point: CapturePoint,
+    region: Uuid,
     io: Arc<IoRegion>,
 ) -> Result<Capture> {
     let CapturePoint { deployment, operation, .. } = point;
@@ -865,10 +889,11 @@ async fn capture_registered(
         completed.verify(archive_bucket, &prefix, &archive_key(keys, &point).await?).await?;
         return Ok(completed);
     }
-    if !same_lifetime(record, &point) {
-        return Err(unavailable(
-            "The source is no longer available for the capture",
-        ));
+    if !same_lifetime(record, &point)
+        || record.storage_regions.get(&region)
+            .and_then(rtdb_directory::StorageRegion::checkpoint_metadata_from) != Some(point.checkpoint.block)
+    {
+        return Err(unavailable("The capture's original checkpoint metadata is no longer retained"));
     }
 
     let serving_material = keys.existing_key(&record.key_id()).await?
@@ -1483,6 +1508,78 @@ mod tests {
         let serving = open_deployment_store(bucket, &scope(&incomplete), PackDiscovery::List, wall_clock()).await?;
         assert!(matches!(serving.head_fresh(&fixture.root).await, Err(Error::MissingObject(_))),
             "a fork with an unavailable dependency must have no root");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_capture_can_inherit_only_continuously_retained_source_metadata() -> Result<()> {
+        let fixture = replay_fixture()?;
+        let serving = tempfile::tempdir().unwrap();
+        let archived = tempfile::tempdir().unwrap();
+        let key_root = tempfile::tempdir().unwrap();
+        let storage = CellStorage::Local { root: serving.path().to_owned() };
+        let archive = CellStorage::Local { root: archived.path().to_owned() };
+        let keys = crate::keys::LocalKeyService::new(key_root.path())?;
+        let directory = rtdb_directory::MemoryDirectory::new();
+        let mut record = DeploymentRecord::new("captured", "acme", Vec::new(), 0);
+        let deployment = record.id.parse::<Uuid>().unwrap();
+        let checkpoint = fixture.point.checkpoint;
+        record.checkpoint = Some(Checkpoint {
+            block: checkpoint.block + 1,
+            boundary: checkpoint.boundary + 1,
+            root_sha256: None,
+            ..checkpoint
+        });
+        let operation = Uuid::new_v4();
+        record.checkpoint_captures.insert(operation, CheckpointCapture {
+            archive: archive_binding(&archive)?,
+            incarnation: record.incarnation,
+            log_epoch: record.log_epoch,
+            checkpoint,
+            media_bound: false,
+            manifest_sha256: None,
+            remote_disposal: None,
+        });
+        let bucket = storage.bucket(IoRegion::new()).await?;
+        let root = format!("{}/{}", record.storage_prefix(), checkpoint_storage_root()?);
+        let physical = PrefixedStore::new(bucket.clone(), &root);
+        crate::store::check_root(&physical, &record.id, true).await?;
+        let packed = open_deployment_store(bucket, &root, PackDiscovery::List, wall_clock()).await?;
+        let material = keys.key(&record.key_id()).await?;
+        let source = EncryptingStore::new(packed, &material)?;
+        for (name, bytes) in fixture.files.iter().filter(|(name, _)| *name != &fixture.root) {
+            source.put(name, bytes.clone()).await?;
+        }
+        source.put(&fixture.root, fixture.files[&fixture.root].clone()).await?;
+        directory.create_deployment(record).await?;
+        let attempt = || capture(directory.clone(), &storage, &archive, &keys, deployment, operation, None, None);
+
+        let refusal = attempt().await.err().and_then(|err| err.message);
+        assert_eq!(refusal.as_deref(), Some("The capture's original checkpoint metadata is no longer retained"),
+            "a capture must acquire source metadata custody before opening an older root");
+
+        let predecessor = Uuid::new_v4();
+        let id = deployment.to_string();
+        update_installation(directory.as_ref(), &id, |record| {
+            record.storage_regions.insert(predecessor, rtdb_directory::StorageRegion::Local {
+                archive: None,
+                tracks_ordered_index_pages: false,
+                checkpoint_metadata_from: Some(checkpoint.block),
+                checkpoint_replay_from: None,
+            });
+            Ok(())
+        }).await?;
+        let completed = attempt().await.expect("a live predecessor may hand off source metadata custody");
+        assert_eq!(completed.point.checkpoint, checkpoint);
+        let current = directory.deployment(&id).await?.unwrap();
+        assert!(current.storage_regions.keys().eq([&predecessor]),
+            "the capture releases only its own protection after the copy completes");
+        update_installation(directory.as_ref(), &id, |record| {
+            record.storage_regions.remove(&predecessor);
+            Ok(())
+        }).await?;
+        assert_eq!(attempt().await?, completed, "a durable receipt can be reopened after the source hold ends");
+        assert!(directory.deployment(&id).await?.unwrap().storage_regions.is_empty());
         Ok(())
     }
 

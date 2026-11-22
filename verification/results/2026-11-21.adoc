@@ -2506,3 +2506,43 @@ The log is `/private/tmp/rtdb-formal.QMjPSJsX/checkpoint-replay-closure-4ff-jvm.
 This checks completeness of a successful copy against the logical catalog.
 Payload bytes rely on the immutable-object contract. Source availability through retries still needs the exact publication holds in R5.
 The existing archive byte limit now applies to the larger replay inventory, so a checkpoint can exceed the limit when retained inputs accumulate.
+
+=== Source metadata admission and physical handoff
+
+Archive capture registers source metadata protection in the same directory compare-and-replace that selects or reopens its capture point.
+The current checkpoint is protected by the published head.
+An older checkpoint can inherit protection from a still-open region that covers its block.
+A retry can also reopen a completed archive in independent custody without using the serving store.
+The source admission remains registered through its provider effects. Closed or independently reconciled regions release their own obligation.
+
+The production guard was verified in the existing Verus checkpoint-metadata area with ten verified functions and six source and contract controls.
+The full 36-area run matched all 185 controls.
+The records are under `/private/tmp/rtdb-formal.QMjPSJsX/checkpoint-source-handoff-verus-z9v7apwk/`. link:../verus/checkpoint_metadata/proof.rs[Exact production guard]
+Lean 4.36.0 checked four theorems about metadata admission, overlap, plan preservation and deletion over arbitrary finite histories.
+Three controls fail when admission accepts an unheld past root, the collector ignores existing holds, or publication moves backwards.
+The records are under `/private/tmp/rtdb-formal.QMjPSJsX/checkpoint-source-handoff-lean-hij5fje6/`. link:../lean/CheckpointMetadataRetention.lean[Metadata proof]
+A second Lean model checked four theorems for arbitrary exact physical dependency sets and finite schedules.
+It establishes that an outstanding read retains its required publications and that an unrelated publication can be authorized.
+Three controls remove the check for pending removal, the protection of held dependencies or the drain witness.
+The records are under `/private/tmp/rtdb-formal.QMjPSJsX/checkpoint-physical-handoff-lean-8731pdzz/`. link:../lean/CheckpointSourceHandoff.lean[Exact dependency model]
+
+TLC revision `bc1b506` explored 765 exact-hold and 423 residence-hold states for two checkpoint roots, one copy and six physical publications.
+Both preserved the safety invariant. Only the exact design reached collection of the unrelated publication during an admitted provider read.
+The exact run also reached a published copy and a canceled read that drained before release.
+The six safety controls fail, and under weak fairness for the five copy and drain steps the completion property holds.
+Disabling handoff violates that temporal property.
+Apalache 0.63.0 cross-checked safety through eleven transitions and found both the inherited-pack and staged-publication counterexamples.
+The records are under `/private/tmp/rtdb-formal.QMjPSJsX/checkpoint-source-handoff-models-6_4r60ue/`. link:../tla/CheckpointSourceHandoff.tla[Comparison and progress model]
+
+On parent `3c0868e23` with these changes, the affected Rust selections passed 227 cases, including all 96 cell cases, with one optional case ignored.
+The log is `/private/tmp/rtdb-formal.QMjPSJsX/checkpoint-source-handoff-3c-rust.log`.
+The focused capture replay passed and four mutations failed at their declared assertions for prior protection, transfer, directory registration and release.
+It also reopened the completed archive after the last source hold ended.
+The per-case records are under `/private/tmp/rtdb-formal.QMjPSJsX/checkpoint-source-handoff-native-rj9jvxwf/`.
+The standard JVM run passed 3,198 tests across nine tasks with no failures or skips.
+It reused the verified FFI library from the parent because this change only touches the hosted Multi crate and verification files.
+The log is `/private/tmp/rtdb-formal.QMjPSJsX/checkpoint-source-handoff-3c-jvm.log`.
+
+The native guard covers checkpoint roots and table metadata in hosted archive capture.
+Its proof assumes monotone publication within a residence, a directory observation for each authorization, and region release only after provider drain.
+The exact physical model still needs production publication identities and joint authorization across the collectors that can erase them, including inherited objects used by forks.

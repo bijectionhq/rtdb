@@ -79,7 +79,11 @@ Goal: a recovery always finds a complete, readable root and the replica suffix i
 
 **Already in place:** discovery advances past a collected root or table block; recovery cursors are admitted before checkpoint install; the trie collector protects the installed checkpoint's live and nascent tries; Multi replica recovery holds and checkpoint metadata holds exist, with TLC, Apalache, mCRL2, AutoHyper and Lean evidence.
 
-**Start from:** `replication/src/{checkpoint_discovery,replay_floor,blocks}.rs`, `multi/src/{recovery_holds,replica_retention}.rs`; models `tla/{RecoveryReplay,InstalledCheckpoint,Checkpoint,ResidenceRetirement}.tla`, `mcrl2/CheckpointDiscovery.mcrl2`.
+Archive capture now acquires or inherits a source metadata hold and keeps it until the provider work drains.
+A model compares exact physical and whole-residence source holds and records the extra reclamation possible with exact holds.
+The physical mapping and coordinated collection path remain open.
+
+**Start from:** `replication/src/{checkpoint_discovery,replay_floor,blocks}.rs`, `multi/src/{archive,recovery_holds,replica_retention}.rs`; models `tla/{RecoveryReplay,InstalledCheckpoint,Checkpoint,ResidenceRetirement}.tla`, `mcrl2/CheckpointDiscovery.mcrl2`.
 
 **Open obligations:**
 

@@ -1403,8 +1403,7 @@ def verify_checkpoint_metadata_retention(args, scratch):
     path = Path("verification/lean/CheckpointMetadataRetention.lean")
     controls = {
         "allow-stale-admission": (
-            "(floor : Nat) : Prop := state.published ≤ floor",
-            "(floor : Nat) : Prop := floor = floor",
+            "  state.published ≤ floor ∨", "  True ∨",
             ["plans_survive_interleavings"],
         ),
         "ignore-existing-holds": (
@@ -1418,7 +1417,28 @@ def verify_checkpoint_metadata_retention(args, scratch):
             ["plans_survive_interleavings"],
         ),
     }
-    verify_lean_model(args, scratch, path, "checkpoint-metadata-retention", controls, 3)
+    verify_lean_model(args, scratch, path, "checkpoint-metadata-retention", controls, 4)
+
+
+def verify_checkpoint_source_handoff(args, scratch):
+    path = Path("verification/lean/CheckpointSourceHandoff.lean")
+    controls = {
+        "admit-after-removal-authorized": (
+            "Covered needs state root →\n      Step needs state (setHold",
+            "(∀ publication, needs root publication → state.present publication) →\n      Step needs state (setHold",
+            ["exchanges_preserve_exact_dependencies"],
+        ),
+        "ignore-held-dependencies": (
+            "Unheld needs state publication →", "True →",
+            ["exchanges_preserve_exact_dependencies", "an_unrelated_publication_can_be_authorized"],
+        ),
+        "release-before-drain": (
+            "¬ state.reading owner → Step needs state (setHold state owner none)",
+            "True → Step needs state (setHold state owner none)",
+            ["exchanges_preserve_exact_dependencies"],
+        ),
+    }
+    verify_lean_model(args, scratch, path, "checkpoint-source-handoff", controls, 4)
 
 
 def verify_replica_trim_admission(args, scratch):
@@ -1679,6 +1699,7 @@ def verify_lean(args, scratch):
             verify_replica_trim_admission(args, scratch)
             verify_replica_hold_close(args, scratch)
             verify_checkpoint_metadata_retention(args, scratch)
+            verify_checkpoint_source_handoff(args, scratch)
             verify_published_checkpoint(args, scratch)
             verify_checkpoint_table_manifest(args, scratch)
             verify_pack_publication_lean(args, scratch)
@@ -1938,6 +1959,33 @@ TLA_CASES = (
      ('Mutation = "none"', 'Mutation = "publish_early"'), "Safe"),
     ("CheckpointReplayClosure", "checkpoint-replay-closure-copied-file-witness",
      ("INVARIANT Safe", "INVARIANT NeverPublishesAfterSourceLoss"), "NeverPublishesAfterSourceLoss"),
+    ("CheckpointSourceHandoff", "source-handoff-exact", None, None),
+    ("CheckpointSourceHandoff", "source-handoff-residence",
+     ('Design = "exact"\n    Mutation = "none"\nINVARIANT Safe', 'Design = "residence"\n    Mutation = "none"\nINVARIANTS Safe NeverReclaimsWhileHeld'), None),
+    ("CheckpointSourceHandoff", "source-handoff-hold-wrong-cut",
+     ('Mutation = "none"', 'Mutation = "hold_wrong_cut"'), "Safe"),
+    ("CheckpointSourceHandoff", "source-handoff-authorize-current-root",
+     ('Mutation = "none"', 'Mutation = "authorize_current_root"'), "Safe"),
+    ("CheckpointSourceHandoff", "source-handoff-ignore-authorized-removal",
+     ('Mutation = "none"', 'Mutation = "ignore_authorized_removal"'), "Safe"),
+    ("CheckpointSourceHandoff", "source-handoff-ignore-inherited-pack",
+     ('Mutation = "none"', 'Mutation = "ignore_inherited_pack"'), "Safe"),
+    ("CheckpointSourceHandoff", "source-handoff-release-before-drain",
+     ('Mutation = "none"', 'Mutation = "release_before_drain"'), "Safe"),
+    ("CheckpointSourceHandoff", "source-handoff-publish-staged",
+     ('Mutation = "none"', 'Mutation = "publish_staged"'), "Safe"),
+    ("CheckpointSourceHandoff", "source-handoff-startup-witness",
+     ("INVARIANT Safe", "INVARIANT NeverPublishes"), "NeverPublishes"),
+    ("CheckpointSourceHandoff", "source-handoff-reclaim-while-held-witness",
+     ("INVARIANT Safe", "INVARIANT NeverReclaimsWhileHeld"), "NeverReclaimsWhileHeld"),
+    ("CheckpointSourceHandoff", "source-handoff-cancel-drain-witness",
+     ("INVARIANT Safe", "INVARIANT NeverDrainsCancelledRead"), "NeverDrainsCancelledRead"),
+    ("CheckpointSourceHandoff", "source-handoff-fair-completion",
+     ('SPECIFICATION Spec\nCONSTANTS\n    Design = "exact"\n    Mutation = "none"\nINVARIANT Safe',
+      'SPECIFICATION FairSpec\nCONSTANTS\n    Design = "exact"\n    Mutation = "none"\nINVARIANT Safe\nPROPERTY CopyEventuallyFinishes'), None),
+    ("CheckpointSourceHandoff", "source-handoff-stuck-copy",
+     ('SPECIFICATION Spec\nCONSTANTS\n    Design = "exact"\n    Mutation = "none"\nINVARIANT Safe',
+      'SPECIFICATION FairSpec\nCONSTANTS\n    Design = "exact"\n    Mutation = "omit_handoff"\nINVARIANT Safe\nPROPERTY CopyEventuallyFinishes'), "temporal:CopyEventuallyFinishes"),
     ("PackPublicationObservation", "pack-publication-observation", None, None),
     ("PackPublicationObservation", "pack-publication-trust-trailer",
      ('Mutation = "none"', 'Mutation = "ignore_trailer_version"'), "Safe"),
@@ -2376,6 +2424,13 @@ def verify_apalache(args, scratch):
     check_apalache(args, scratch, "CheckpointReplayClosure", "checkpoint-replay-closure-omit-artefact",
                    "PublicationIsComplete", 10, ('Mutation = "none"', 'Mutation = "omit_artefact"'),
                    "a replay copy is published without the required shared artefact")
+    check_apalache(args, scratch, "CheckpointSourceHandoff", "source-handoff-exact", "Safe", 11)
+    check_apalache(args, scratch, "CheckpointSourceHandoff", "source-handoff-ignore-inherited-pack",
+                   "SourceIsRetained", 11, ('Mutation = "none"', 'Mutation = "ignore_inherited_pack"'),
+                   "the selected source still depends on an inherited pack")
+    check_apalache(args, scratch, "CheckpointSourceHandoff", "source-handoff-publish-staged",
+                   "PublicationIsDurable", 11, ('Mutation = "none"', 'Mutation = "publish_staged"'),
+                   "the archive is visible before its destination is accepted")
     check_apalache(args, scratch, "PackPublicationObservation", "pack-publication-observation", "Safe", 6)
     check_apalache(args, scratch, "PackPublicationObservation", "pack-publication-trust-member", "MemberCoherent", 6,
                    ('Mutation = "none"', 'Mutation = "ignore_member_version"'),
@@ -3427,6 +3482,45 @@ def verify_checkpoint_metadata_replay(args, source):
     print(f"{label}: startup metadata survived collection until provider drain, ignoring the hold failed")
 
 
+def verify_checkpoint_capture_metadata(args, source):
+    env = os.environ | {
+        "CARGO_TARGET_DIR": os.environ.get("CARGO_TARGET_DIR", str(ROOT / "target")),
+        "CARGO_PROFILE_TEST_DEBUG": "0",
+    }
+    test = "archive::tests::a_capture_can_inherit_only_continuously_retained_source_metadata"
+    command = ["cargo", "test", "--locked", "-p", "rtdb-multi", "--features", "dynamodb",
+               "--lib", test, "--", "--exact"]
+    label = "rust-checkpoint-capture-metadata"
+    baseline = run_case(command, source / "rust", args.evidence, f"{label}-baseline", env)
+    if baseline.returncode or f"{test} ... ok" not in baseline.stdout or "1 passed; 0 failed" not in baseline.stdout:
+        raise ValueError("checkpoint capture did not preserve or transfer metadata custody")
+    retention = "rust/crates/multi/src/checkpoint_retention.rs"
+    archive = "rust/crates/multi/src/archive.rs"
+    hold = "Some(first) => first <= block,\n        None => false,"
+    controls = {
+        "allow-unheld-source": (retention, hold, "Some(first) => first <= block,\n        None => true,",
+                               "a capture must acquire source metadata custody before opening an older root"),
+        "refuse-covered-source": (retention, hold, "Some(_) => false,\n        None => false,",
+                                 "a live predecessor may hand off source metadata custody"),
+        "omit-registration": (archive, "let checkpoint_metadata_from = capture_metadata_floor(record, checkpoint);",
+                              "let checkpoint_metadata_from = None;", "a live predecessor may hand off source metadata custody"),
+        "keep-region": (archive, "    crate::store::release_region(directory.as_ref(), &id, region, false).await?;",
+                        "", "the capture releases only its own protection after the copy completes"),
+    }
+    for name, (relative, before, after, failure) in controls.items():
+        path = source / relative
+        original = path.read_bytes()
+        try:
+            replace_once(path, before, after)
+            checked = run_case(command, source / "rust", args.evidence, f"{label}-{name}", env)
+        finally:
+            path.write_bytes(original)
+        if (checked.returncode != 101 or f"{test} ... FAILED" not in checked.stdout
+            or failure not in checked.stdout or "0 passed; 1 failed" not in checked.stdout):
+            raise ValueError(f"checkpoint capture control {name} missed its declared assertion")
+    print(f"{label}: metadata acquisition, transfer and release passed; all four controls failed")
+
+
 def verify_recovery_hold_replay(args, source):
     env = os.environ | {
         "CARGO_TARGET_DIR": os.environ.get("CARGO_TARGET_DIR", str(ROOT / "target")),
@@ -3949,6 +4043,7 @@ def main():
             verify_recovery_hold_replay(args, source)
             verify_checkpoint_receipts(args, source)
             verify_checkpoint_metadata_replay(args, source)
+            verify_checkpoint_capture_metadata(args, source)
             verify_delegated_scan_replay(args, source)
             verify_fragment_residence_replay(args, source)
             verify_catalog_replay(args, source)

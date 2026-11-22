@@ -223,6 +223,11 @@ It also exercises the Azure adapter against a loopback provider and separately m
 * `tla/CheckpointReplayClosure.tla` checks bound table discovery, repeat observations and publication only after the replay inventory is copied.
   `lean/CheckpointReplayClosure.lean` proves membership for retained inputs and usable artefacts over arbitrary lists of decoded trie entries.
   The Rust cases cover shared paths, retained level-zero files, rejected table substitution, older archive manifests and independent-fork publication.
+* `tla/CheckpointSourceHandoff.tla` compares exact physical and residence-wide source holds for two roots with shared and inherited dependencies.
+  It checks delayed collection, cancellation before the provider drains and a separate durable destination handoff under declared fairness.
+  `lean/CheckpointSourceHandoff.lean` proves preservation for arbitrary exact physical dependency sets and finite schedules.
+  `lean/CheckpointMetadataRetention.lean` checks archival metadata handoff for arbitrary finite histories, and `verus/checkpoint_metadata` checks the production admission guard.
+  Native capture checks a refused old root, successful transfer from a predecessor, release after copy, and reuse of a completed archive.
 * `mcrl2/CheckpointDiscovery.mcrl2` compares the staged metadata discovery with an atomic observation contract after hiding the selection and individual reads.
   It checks divergence-preserving branching bisimilarity on three indices and generates a distinguishing formula for each weakened model.
 * `hyperltl/CheckpointRecovery.hltl` compares every pair of modeled startup schedules with the same stable, readable replacement.

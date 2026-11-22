@@ -15,7 +15,8 @@ def initial : State Reader := ⟨0, fun _ => none, fun _ => False, fun _ => Fals
 def setHold (state : State Reader) (reader : Reader) (floor : Option Nat) : State Reader :=
   { state with held := fun current => if current = reader then floor else state.held current }
 
-def MayAdmit (state : State Reader) (floor : Nat) : Prop := state.published ≤ floor
+def MayAdmit (state : State Reader) (floor : Nat) : Prop :=
+  state.published ≤ floor ∨ ∃ reader first, state.held reader = some first ∧ first ≤ floor
 
 def MayAuthorize (state : State Reader) (block : Nat) : Prop :=
   block < state.published ∧
@@ -60,7 +61,9 @@ theorem plans_survive_interleavings (transition : Step state updated) (safe : Sa
     · subst current
       have sameFloor : floor = first := by simpa [setHold] using held
       subst first
-      exact Nat.lt_of_lt_of_le before admission
+      rcases admission with currentHead | ⟨predecessor, boundary, held, covered⟩
+      · exact Nat.lt_of_lt_of_le before currentHead
+      · exact Nat.lt_of_lt_of_le (bounds predecessor boundary held) covered
     · exact bounds current first (by simpa [setHold, same] using held)
   | release reader =>
     refine ⟨?_, deletions⟩
@@ -97,6 +100,12 @@ theorem admitted_metadata_cannot_be_deleted (reach : Reachable state) (reader : 
   let safe := reachable_plans_are_safe reach
   exact (Nat.not_lt_of_ge inScope) ((safe.1 block (safe.2 block erased)).2 reader first held)
 
+omit [DecidableEq Reader] in
+theorem another_owner_can_inherit_the_same_floor (reader : Reader) (floor : Nat)
+    (held : state.held reader = some floor) : MayAdmit state floor :=
+  Or.inr ⟨reader, floor, held, Nat.le_refl floor⟩
+
+#print axioms another_owner_can_inherit_the_same_floor
 #print axioms plans_survive_interleavings
 #print axioms reachable_plans_are_safe
 #print axioms admitted_metadata_cannot_be_deleted

@@ -688,6 +688,9 @@ config {
 -- A copy uses its verified root bytes or rechecks them on a fresh read.
 -- It also rechecks table bytes read for copying against those used to derive the inventory.
 -- Existing archive receipts retain their original primary inventory. A stage verifies the inventory format recorded by its capture.
+-- An archive capture registers its source metadata hold with its selected checkpoint in the same directory update.
+-- A retry at an older checkpoint inherits the hold only if an open region still protects that metadata.
+-- A completed archive can be verified and returned without opening serving storage.
 -- Other admission failures end startup with the provider error.
 -- The replication driver consumes the admitted cursor for that same log and boundary.
 -- In the Rust partition owner, a query captures the catalog and its installed replica cut in the same partition value.

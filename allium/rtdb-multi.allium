@@ -2297,6 +2297,9 @@ rule HostedCheckpointCapture {
     -- A new archive receipt covers the verified replay inventory.
     -- Shared group artefacts are recorded once. Required files must be available before the receipt is published.
     -- A historical stage carries the inventory format of its source archive.
+    -- An archive copy from serving storage registers a metadata hold on the selected checkpoint.
+    -- A new hold may cover the published checkpoint or inherit uninterrupted coverage from an older admission.
+    -- The hold persists until its provider work drains. A verified existing archive can be returned after the source hold ends.
     when: AuthenticatedRecoveryCapture(authority, name, capture_id)
 
     requires: ConfiguredOrganizationOwns(authority, name)

@@ -1,4 +1,4 @@
-use crate::production::checkpoint_metadata_collectable;
+use crate::production::{checkpoint_metadata_admissible, checkpoint_metadata_collectable};
 use vstd::prelude::*;
 
 verus! {
@@ -29,6 +29,36 @@ pub fn metadata_below_both_bounds_can_be_collected(block: i64, oldest: i64, publ
 pub fn no_checkpoint_allows_no_metadata_collection(block: i64) {
     let collect = checkpoint_metadata_collectable(block, None, None);
     assert(!collect);
+}
+
+// LAW DUR-2-CAPTURE-CURRENT.
+pub fn current_checkpoint_can_be_admitted(block: i64) {
+    let admit = checkpoint_metadata_admissible(block, Some(block), None);
+    assert(admit);
+}
+
+// LAW DUR-2-CAPTURE-HANDOFF.
+pub fn a_protected_older_checkpoint_can_be_admitted(block: i64, published: i64, first: i64)
+    requires first <= block < published,
+{
+    let admit = checkpoint_metadata_admissible(block, Some(published), Some(first));
+    assert(admit);
+}
+
+// LAW DUR-2-CAPTURE-PAST.
+pub fn an_unheld_older_checkpoint_is_refused(block: i64, published: i64)
+    requires block < published,
+{
+    let admit = checkpoint_metadata_admissible(block, Some(published), None);
+    assert(!admit);
+}
+
+// LAW DUR-2-CAPTURE-FUTURE.
+pub fn a_future_checkpoint_cannot_inherit_protection(block: i64, published: i64, first: i64)
+    requires first <= published < block,
+{
+    let admit = checkpoint_metadata_admissible(block, Some(published), Some(first));
+    assert(!admit);
 }
 
 }

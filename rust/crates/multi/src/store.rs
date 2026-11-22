@@ -1147,7 +1147,10 @@ pub async fn run_reaper(
                     if let Some(keys) = keys.as_deref() {
                         for record in &deployments {
                             if record.ordered_indexes.is_empty() && record.ordered_index_catalogs.is_empty()
-                                && !record.storage_regions.values().any(|region| matches!(region, StorageRegion::Remote { .. } | StorageRegion::ReplicaReplay { .. }))
+                                && !record.storage_regions.values().any(|region| {
+                                    matches!(region, StorageRegion::Remote { .. } | StorageRegion::ReplicaReplay { .. })
+                                        || region.checkpoint_metadata_from().is_some()
+                                })
                             {
                                 continue;
                             }

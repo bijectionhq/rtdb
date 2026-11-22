@@ -1460,6 +1460,14 @@ A copy checks the metadata again against the bytes used for discovery and publis
 Archive receipts and staged inventories carry the scope used to derive them. Existing receipts preserve their original primary scope.
 Lean checks inventory membership over arbitrary finite catalogues. TLC and Apalache cover copy ordering, replaced metadata and source availability in the bounded model.
 The running-system cases check archive and independent-fork copies with retained level-zero files and a shared group artefact.
+Archive registration admits its source metadata hold with the selected checkpoint and keeps that hold through provider drain.
+A retry can inherit continuous protection for an older checkpoint or verify an already completed archive in its own storage.
+Verus checks admission at the current checkpoint and overlap with a predecessor's metadata floor.
+Lean proves safety for arbitrary finite histories of metadata authorization, handoff and collection, under monotone publication.
+The source-handoff model compares whole-residence and exact physical holds, including an inherited pack, cancellation with a read pending, and a durable destination.
+Both designs preserve the bounded safety invariant. The exact design admits collection of unrelated data while a copy is active.
+Lean proves source retention during an admitted read for arbitrary finite schedules over exact dependency sets.
+That result assumes the published dependency mapping is complete and collection authorization has a single order with admission.
 The native memory-provider run selects a later checkpoint and replays its retained suffix with the cursor admitted during startup.
 TLC checks cursor admission, reuse and strict progress before refusal and reaches a state with later trimming after admission.
 mCRL2 checks the observable results of the staged discovery model against the atomic contract for three reported indices.

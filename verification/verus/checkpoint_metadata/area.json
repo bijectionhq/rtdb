@@ -1,7 +1,7 @@
 {
   "summary": "Checkpoint metadata is collectible only below the published block and every active metadata hold.",
   "flags": ["--no-external-by-default", "--verify-module", "production", "--verify-module", "laws"],
-  "min_verified_functions": 5,
+  "min_verified_functions": 10,
   "controls": {
     "ignore_active_holds": {
       "mutate": [{
@@ -14,7 +14,7 @@
         "function": "checkpoint_metadata_collectable",
         "category": "postcondition not satisfied"
       }],
-      "min_verified_functions": 4
+      "min_verified_functions": 9
     },
     "ignore_active_holds_and_weaken_contract": {
       "mutate": [{
@@ -31,7 +31,89 @@
         "function": "held_checkpoint_metadata_is_never_collectable",
         "category": "assertion failed"
       }],
-      "min_verified_functions": 4
+      "min_verified_functions": 9
+    },
+    "ignore_retirement_authority": {
+      "defect": "Admit a past checkpoint even though no hold closed off its retirement.",
+      "mutate": [
+        {
+          "file": "rust/crates/multi/src/checkpoint_retention.rs",
+          "find": "Some(first) => first <= block,\n        None => false,",
+          "replace": "Some(first) => first <= block,\n        None => true,"
+        }
+      ],
+      "expect": [
+        {
+          "file": "rust/crates/multi/src/checkpoint_retention.rs",
+          "function": "checkpoint_metadata_admissible",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 9
+    },
+    "ignore_retirement_authority_and_weaken_contract": {
+      "defect": "Admit a past checkpoint even though no hold closed off its retirement.",
+      "mutate": [
+        {
+          "file": "rust/crates/multi/src/checkpoint_retention.rs",
+          "find": "Some(first) => first <= block,\n        None => false,",
+          "replace": "Some(first) => first <= block,\n        None => true,"
+        },
+        {
+          "file": "rust/crates/multi/src/checkpoint_retention.rs",
+          "find": " || (oldest.is_some() && oldest.unwrap() <= block)",
+          "replace": " || (oldest.is_none() || oldest.unwrap() <= block)"
+        }
+      ],
+      "expect": [
+        {
+          "file": "verification/verus/checkpoint_metadata/laws.rs",
+          "function": "an_unheld_older_checkpoint_is_refused",
+          "category": "assertion failed"
+        }
+      ],
+      "min_verified_functions": 9
+    },
+    "refuse_predecessor_handoff": {
+      "defect": "Refuse to share a past checkpoint already protected by a live source hold.",
+      "mutate": [
+        {
+          "file": "rust/crates/multi/src/checkpoint_retention.rs",
+          "find": "Some(first) => first <= block,\n        None => false,",
+          "replace": "Some(_) => false,\n        None => false,"
+        }
+      ],
+      "expect": [
+        {
+          "file": "rust/crates/multi/src/checkpoint_retention.rs",
+          "function": "checkpoint_metadata_admissible",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 9
+    },
+    "refuse_predecessor_handoff_and_weaken_contract": {
+      "defect": "Refuse to share a past checkpoint already protected by a live source hold.",
+      "mutate": [
+        {
+          "file": "rust/crates/multi/src/checkpoint_retention.rs",
+          "find": "Some(first) => first <= block,\n        None => false,",
+          "replace": "Some(_) => false,\n        None => false,"
+        },
+        {
+          "file": "rust/crates/multi/src/checkpoint_retention.rs",
+          "find": " || (oldest.is_some() && oldest.unwrap() <= block)",
+          "replace": ""
+        }
+      ],
+      "expect": [
+        {
+          "file": "verification/verus/checkpoint_metadata/laws.rs",
+          "function": "a_protected_older_checkpoint_can_be_admitted",
+          "category": "assertion failed"
+        }
+      ],
+      "min_verified_functions": 9
     }
   }
 }
