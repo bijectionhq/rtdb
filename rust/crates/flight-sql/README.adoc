@@ -226,10 +226,8 @@ The body ends immediately after the declared groups, or after the count when it 
 All observations are checked against the same ordered state before any mutation applies.
 Mutations apply in group order and then row order, using the authenticated session's principal and database.
 
-Owned lookups compare the complete stored `_id` before releasing data or accepting a point observation.
-A private registry assigns each identity a permanent primary-index locator at transaction ordering.
-Colliding identities probe alternate locators and stay independently addressable over time.
-A legacy nonempty relation without a complete registry refuses owned reads and writes.
+Owned events carry their complete typed key. Its IID identifies the physical locality bucket.
+The complete key separates identities within a shared bucket and governs lookups, writes and erasure.
 
 === Declaring a private relation schema
 
@@ -256,8 +254,8 @@ Relations without a declaration continue to infer their schema.
 
 Use `rtdb.owned.OpenRead.v2` with an empty body to reserve one present and retain its exact applied catalog.
 The one result body contains 16 opaque handle bytes, the signed big-endian i64 Unix microsecond present, and the signed big-endian i64 ordered transaction id.
-Governed data pages carry a complete typed `_entity_key` on put, delete, and erase events. A native point probes the bounded physical locator family and resolves only its exact key.
-Older governed pages without the key require a reset. Compaction resolves each complete key independently inside an IID bucket. The writer still assigns a permanent distinct IID per key because ordered projections require that invariant.
+Governed data pages carry a complete typed `_entity_key` on put, delete, and erase events. A native point seeks the canonical IID bucket and resolves only its exact key.
+Older governed pages without the key require a reset. Compaction resolves each complete key independently inside an IID bucket. Covered search and ordered paths use complete identities.
 
 Send `rtdb.owned.ReadHeldPoint.v1` with those 16 handle bytes followed by the ordinary ReadPoint action body.
 The Arrow response uses the held present and valid instant on every call, including missing rows.
@@ -286,6 +284,8 @@ The key consists of distinct stored columns and ends with `_id`.
 The relation must already exist in the authenticated owner's namespace.
 A successful declaration returns the same transaction-key Arrow row as Create.
 Ordered and search path declarations can be repeated with the same complete name, owner relation and columns.
+Ordered index layout 7 stores complete typed handles in postings, correction rows and their fences.
+Rebuild older ordered index artefacts before using covered paths under this layout.
 The declaration is immutable and private to the owner's index catalog.
 Index maintenance builds the generation after declaration.
 
@@ -311,7 +311,7 @@ Each held handle issues one nonce per observed relation, up to 32 relations.
 `rtdb.owned.Commit.v3` prefixes an unchanged Commit.v2 body with an unsigned 16-bit big-endian witness count (1–32), then that many pairs of 16 raw held-handle bytes and 16 raw nonce bytes.
 The commit reply is unchanged.
 `rtdb.owned.Commit.v4` uses the same framing and accepts zero through 32 witnesses.
-It adds the `erase` mutation for a permanently assigned root identity.
+It adds the `erase` mutation for an exact root identity.
 An erase row accepts the typed `_id` and an optional point observation, with no validity endpoints or non-null payload values.
 The resolver refuses erase on a relation with a governed ordered, search, or unique path or a prefix-capacity rule and refuses any other mutation of the same identity in the same commit.
 Erase adds an all-history event and a distinct `erase` change entry at the ordered cut.

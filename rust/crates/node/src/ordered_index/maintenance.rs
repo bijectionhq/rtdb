@@ -12,13 +12,13 @@ use rtdb_maintenance::{
     input::{open_input, read_page},
 };
 use rtdb_storage::{ObjectKey, cache::BufferPool};
-use rtdb_types::{Anomaly, AnomalyCategory, BlockIndex, EventOp, Iid, Result, TableRef, Timestamp};
+use rtdb_types::{Anomaly, AnomalyCategory, BlockIndex, EventOp, Result, TableRef, Timestamp};
 use tokio_util::sync::CancellationToken;
 
 use super::{
     Definition, INDEX_ROOT, checkpoint, definitions, format_error,
     projection::{Changes, EventOrder, RevisionRoots},
-    tree::{Root, Tree},
+    tree::{Address, AddressRef, Root, Tree},
 };
 
 pub(crate) struct OrderedIndexMaintenance {
@@ -198,7 +198,7 @@ async fn read_flushed(
 #[derive(Default)]
 struct ErasureCuts {
     scope: u64,
-    by_iid: BTreeMap<Iid, (Timestamp, Arc<MemoryReservation>)>,
+    by_address: BTreeMap<Address, (Timestamp, Arc<MemoryReservation>)>,
 }
 
 async fn erase_cuts(
@@ -217,13 +217,17 @@ async fn erase_cuts(
                 let header = batch.header(row)?;
                 if header.op == EventOp::Erase {
                     cuts.scope = (source.block as u64 + 1).max(cuts.scope);
-                    match cuts.by_iid.entry(header.iid) {
+                    let key = batch.entity_key(row)?.unwrap_or_default();
+                    let _scratch = memory.reserve(key.len().saturating_add(128))?;
+                    if !key.is_empty() { rtdb_types::EntityId::from_handle_bytes(key)?; }
+                    let address = AddressRef { iid: header.iid, key };
+                    match cuts.by_address.entry(address.owned()) {
                         Entry::Occupied(mut entry) => {
                             let cut = &mut entry.get_mut().0;
                             *cut = (*cut).max(header.system_from);
                         }
                         Entry::Vacant(entry) => {
-                            entry.insert((header.system_from, memory.reserve(128)?));
+                            entry.insert((header.system_from, memory.reserve(key.len().saturating_add(128))?));
                         }
                     }
                 }
@@ -240,7 +244,7 @@ async fn flushed_changes(
     definition: &Definition,
     source: &SourceFile,
     cancellation: &CancellationToken,
-    retain: impl Fn(rtdb_types::EventHeader) -> bool + Send + Sync,
+    retain: impl Fn(rtdb_types::EventHeader, AddressRef<'_>) -> bool + Send + Sync,
 ) -> Result<(i64, Changes)> {
     let mut changes = Changes::default();
     let rows = read_flushed(&tree.storage, &tree.memory, source, cancellation, |batch| {
@@ -250,6 +254,7 @@ async fn flushed_changes(
             &definition.columns,
             &tree.memory,
             cancellation,
+            definition.table.is_owned_event_data(),
             &retain,
         )
     })
@@ -267,8 +272,8 @@ async fn replay_flushed(
 ) -> Result<i64> {
     let mut rows = 0_i64;
     for source in sources {
-        let (count, changes) = flushed_changes(tree, definition, source, cancellation, |header| {
-            cuts.by_iid.get(&header.iid)
+        let (count, changes) = flushed_changes(tree, definition, source, cancellation, |header, address| {
+            cuts.by_address.get(&address.owned())
                 .is_none_or(|(cut, _)| header.system_from >= *cut)
         })
         .await?;
@@ -307,7 +312,8 @@ pub(super) async fn read_root(
                 &definition.columns,
                 &tree.memory,
                 cancellation,
-                |_| true,
+                definition.table.is_owned_event_data(),
+                |_, _| true,
             )?;
         }
     }
@@ -346,7 +352,7 @@ async fn read_flushed_root(
     let files = source_files(snapshot, &definition.table, after, through)?;
     for source in files {
         let (count, changes) =
-            flushed_changes(tree, definition, &source, cancellation, |_| true).await?;
+            flushed_changes(tree, definition, &source, cancellation, |_, _| true).await?;
         rows = rows.checked_add(count).ok_or_else(incomplete_source)?;
         root = changes
             .read(tree, root, system_at, EventOrder::NewestFirst, cancellation)

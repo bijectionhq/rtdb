@@ -21,6 +21,7 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer, ser::SerializeSeq}
 use super::{
     format_error,
     key::{Atom, AtomRef, Bucket, arrow},
+    tree::AddressRef,
 };
 
 const INTEGER_PRECISION: u8 = 20;
@@ -279,7 +280,7 @@ impl Layout {
 pub(super) struct Postings(KeyBatch);
 
 impl Postings {
-    pub fn build(keys: &[(Bucket, Tuple<'_>, Iid)]) -> Result<Self> {
+    pub fn build(keys: &[(Bucket, Tuple<'_>, AddressRef<'_>)]) -> Result<Self> {
         let levels = UInt8Array::from(
             keys.iter()
                 .map(|(bucket, _, _)| bucket.level as u8)
@@ -291,14 +292,19 @@ impl Postings {
                 .collect::<Vec<_>>(),
         );
         let iids = rtdb_columnar::build_iids(
-            &keys.iter().map(|(_, _, iid)| *iid).collect::<Vec<_>>(),
+            &keys.iter().map(|(_, _, address)| address.iid).collect::<Vec<_>>(),
             None,
         )?;
+        let bytes = keys.iter().try_fold(0usize, |sum, (_, _, address)|
+            sum.checked_add(address.key.len()).ok_or_else(invalid))?;
+        i32::try_from(bytes).map_err(format_error)?;
+        let mut identities = BinaryBuilder::with_capacity(keys.len(), bytes);
+        for (_, _, address) in keys { identities.append_value(address.key); }
         let tuples = keys.iter().map(|(_, tuple, _)| *tuple).collect::<Vec<_>>();
         KeyBatch::build(
             &tuples,
             BatchKind::Posting,
-            vec![Arc::new(levels), Arc::new(starts), iids],
+            vec![Arc::new(levels), Arc::new(starts), iids, Arc::new(identities.finish())],
         )
         .map(Self)
     }
@@ -310,7 +316,7 @@ impl Postings {
         self.0.bytes
     }
 
-    pub fn at(&self, row: usize) -> (Bucket, Tuple<'_>, Iid) {
+    pub fn at(&self, row: usize) -> (Bucket, Tuple<'_>, AddressRef<'_>) {
         let level =
             arrow::<UInt8Array>(self.0.batch.column(0).as_ref()).expect("validated bucket level");
         let start =
@@ -321,7 +327,10 @@ impl Postings {
                 start: start.value(row),
             },
             Tuple::Arrow(&self.0, row),
-            Iid(fixed(self.0.batch.column(2).as_ref(), row)),
+            AddressRef {
+                iid: Iid(fixed(self.0.batch.column(2).as_ref(), row)),
+                key: arrow::<BinaryArray>(self.0.batch.column(3).as_ref()).expect("validated entity key").value(row),
+            },
         )
     }
 
@@ -338,8 +347,9 @@ impl Postings {
         let (batch, suffix) = KeyBatch::decode(bytes, max_rows, BatchKind::Posting)?;
         let postings = Self(batch);
         for row in 0..postings.len() {
-            let (bucket, _, _) = postings.at(row);
-            if bucket.level > 64
+            let (bucket, _, address) = postings.at(row);
+            if (!address.key.is_empty() && rtdb_types::EntityId::from_handle_bytes(address.key).is_err())
+                || bucket.level > 64
                 || super::domain::bucket_start(bucket.start.into(), bucket.level) != bucket.start
             {
                 return Err(invalid());
@@ -364,6 +374,7 @@ impl BatchKind {
                 Field::new("bucket_level", DataType::UInt8, false),
                 Field::new("bucket_start", DataType::UInt64, false),
                 Field::new("iid", DataType::FixedSizeBinary(16), false),
+                Field::new("entity_key", DataType::Binary, false),
             ],
             Self::Correction => vec![
                 Field::new("valid_from", DataType::Int64, false),
@@ -375,7 +386,7 @@ impl BatchKind {
     fn prefix(self) -> usize {
         match self {
             Self::Keys => 0,
-            Self::Posting => 3,
+            Self::Posting => 4,
             Self::Correction => 2,
         }
     }
@@ -528,17 +539,16 @@ impl KeyBatch {
         }
         let mut nodes = nodes.iter();
         let mut buffers = buffers.iter();
-        for layout in
-            std::iter::repeat_n(None, kind.prefix()).chain(layouts.iter().copied().map(Some))
+        for (index, layout) in std::iter::repeat_n(None, kind.prefix())
+            .chain(layouts.iter().copied().map(Some)).enumerate()
         {
             let node = nodes.next().ok_or_else(invalid)?;
             if node.length() != record.length() {
                 return Err(invalid());
             }
             let Some(layout) = layout else {
-                for _ in 0..2 {
-                    buffers.next().ok_or_else(invalid)?;
-                }
+                let count = if matches!(kind, BatchKind::Posting) && index == 3 { 3 } else { 2 };
+                for _ in 0..count { buffers.next().ok_or_else(invalid)?; }
                 continue;
             };
             if let Some(kind) = layout.plain() {
@@ -777,7 +787,7 @@ mod tests {
         let keys: Vec<_> = rows
             .iter()
             .enumerate()
-            .map(|(row, cells)| (bucket, Tuple::Owned(cells), Iid([row as u8; 16])))
+            .map(|(row, cells)| (bucket, Tuple::Owned(cells), AddressRef { iid: Iid([row as u8; 16]), key: &[] }))
             .collect();
         let encoded = Postings::build(&keys)
             .unwrap()
@@ -791,7 +801,7 @@ mod tests {
         for (row, &(bucket, tuple, iid)) in keys.iter().enumerate() {
             let (actual_bucket, actual, actual_iid) = postings.at(row);
             assert_eq!(actual_bucket, bucket);
-            assert_eq!(actual_iid, iid);
+            assert_eq!(actual_iid.iid, iid.iid);
             assert_eq!(actual.compare(tuple), Ordering::Equal);
             if row > 0 {
                 assert_eq!(postings.at(row - 1).1.compare(actual), Ordering::Less);
@@ -809,7 +819,7 @@ mod tests {
                 start: 0,
             },
             Tuple::Owned(&cells),
-            Iid::MIN,
+            AddressRef { iid: Iid::MIN, key: &[] },
         )];
         let encoded = Postings::build(&keys).unwrap().encode(&[], &[]).unwrap();
         let aligned = Buffer::from_slice_ref(&encoded);

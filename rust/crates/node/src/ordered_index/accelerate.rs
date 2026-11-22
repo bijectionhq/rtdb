@@ -699,6 +699,7 @@ async fn use_index(
         predicates,
         distinct,
         last: None,
+        identity_slot: None,
     };
     if let (Some(projection), Some(top)) = (projection, top) {
         let seek = CoveredSeek {
@@ -813,6 +814,8 @@ pub(super) async fn owned_page(
                 predicates: Vec::new(),
                 distinct: None,
                 last: None,
+                identity_slot: Some(definition.columns.iter().position(|name| name == "_id")
+                    .ok_or_else(super::uncovered_owned_range)?),
             },
             skip: 0,
             remaining: limit,
@@ -982,11 +985,13 @@ struct MatchingPostings {
     predicates: Vec<Predicate>,
     distinct: Option<DistinctPrefix>,
     last: Option<Head>,
+    identity_slot: Option<usize>,
 }
 
 impl MatchingPostings {
     async fn next(&mut self) -> Result<Option<Head>> {
         while let Some(head) = self.scan.next().await? {
+            if let Some(slot) = self.identity_slot { head.require_identity(slot, &self.scan.tree.memory)?; }
             if !self
                 .predicates
                 .iter()
@@ -1025,7 +1030,7 @@ impl OrderedCandidates for PostingCandidates {
                 self.0 = None;
                 break;
             };
-            ids.push(head.iid);
+            ids.push(head.address().iid);
         }
         Ok(ids)
     }
@@ -1173,14 +1178,13 @@ async fn next(
     let Some(hit) = hit else {
         return Ok(None);
     };
-    let KeyRef::Posting(_, _, iid) = hit.key() else {
+    if !matches!(hit.key(), KeyRef::Posting(..)) {
         return Err(super::format_error(
             "Ordered index seek escaped its posting prefix",
         ));
-    };
+    }
     Ok(Some(Head {
         hit,
-        iid,
         slot,
         reverse,
     }))
@@ -1438,12 +1442,32 @@ fn covered_array<'a>(
 #[derive(Clone)]
 struct Head {
     hit: Hit,
-    iid: Iid,
     slot: usize,
     reverse: bool,
 }
 
 impl Head {
+    fn address(&self) -> super::tree::AddressRef<'_> {
+        let KeyRef::Posting(_, _, address) = self.hit.key() else {
+            unreachable!("head is a posting")
+        };
+        address
+    }
+
+    fn require_identity(&self, slot: usize, memory: &Arc<rtdb_columnar::MemoryBudget>) -> Result<()> {
+        use rtdb_types::EntityId;
+        let key = self.address().key;
+        let _decode = memory.reserve(key.len().saturating_add(256))?;
+        let matches = match (EntityId::from_handle_bytes(key)?, self.tuple().cell(slot)) {
+            (EntityId::String(id), AtomRef::Text(value)) => id == value,
+            (EntityId::Integer(id), AtomRef::Integer(value)) => i128::from(id) == value,
+            (EntityId::Uuid(id), AtomRef::Uuid(value)) => id == value,
+            _ => false,
+        };
+        if !matches { return Err(super::uncovered_owned_range()); }
+        Ok(())
+    }
+
     fn tuple(&self) -> Tuple<'_> {
         let KeyRef::Posting(_, tuple, _) = self.hit.key() else {
             unreachable!("head is a posting")
@@ -1464,7 +1488,8 @@ impl Ord for Head {
         let order = self
             .tuple()
             .compare(other.tuple())
-            .then_with(|| (self.iid, self.slot).cmp(&(other.iid, other.slot)));
+            .then_with(|| self.address().compare(other.address()))
+            .then_with(|| self.slot.cmp(&other.slot));
         if self.reverse { order } else { order.reverse() }
     }
 }

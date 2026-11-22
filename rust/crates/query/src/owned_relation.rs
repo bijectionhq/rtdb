@@ -17,13 +17,10 @@ pub async fn open_owned_point(
     if owner.is_empty() {
         return Err(Anomaly::incorrect("rtdb.owned/no-owner", "Owned relations require an authenticated principal"));
     }
-    if relation.is_world_catalog() {
-        if !matches!(id, EntityId::Uuid(_)) { return Err(rtdb_types::OwnedWorld::unavailable()); }
-        return open_owned_table_point(context, relation.table(owner), id.iid(), Some(id), valid, columns, false).await;
+    if relation.is_world_catalog() && !matches!(id, EntityId::Uuid(_)) {
+        return Err(rtdb_types::OwnedWorld::unavailable());
     }
-    open_owned_table_candidates(
-        context, relation.table(owner), id.owned_locator_candidates().collect(), Some(id), valid, columns, false,
-    ).await
+    open_owned_table_point(context, relation.table(owner), id.iid(), Some(id), valid, columns, false).await
 }
 
 /// Revalidates an immutable artefact's nominated row with its complete key.
@@ -75,10 +72,8 @@ pub async fn open_owned_valid_during_at(
         return Err(Anomaly::incorrect("rtdb.owned/history-window", "Owned history requires a nonempty valid window on a root relation"));
     }
     let context = owned_context_at_system(context, system)?;
-    let OwnedAddress::Assigned(locator) = owned_address(Arc::clone(&context), owner, relation, id).await? else {
-        return Ok(None);
-    };
-    open_owned_table_point(context, relation.table(owner), locator, Some(id), Some(valid), None, true).await
+    if owner.is_empty() { return Err(address_unavailable()); }
+    open_owned_table_point(context, relation.table(owner), id.iid(), Some(id), Some(valid), None, true).await
 }
 
 /// Opens the winning valid boundaries, including local world tombstones.
@@ -90,10 +85,8 @@ pub async fn open_owned_valid_boundaries(
         return Err(Anomaly::incorrect("rtdb.owned/history-window", "Invalid owned valid window"));
     }
     let context = owned_context_at_system(context, system)?;
-    let OwnedAddress::Assigned(locator) = owned_address(Arc::clone(&context), owner, relation, id).await? else {
-        return Ok(None);
-    };
-    open_owned_table_point(context, relation.table(owner), locator, Some(id), Some(valid), Some(&["_id"]), true).await
+    if owner.is_empty() { return Err(address_unavailable()); }
+    open_owned_table_point(context, relation.table(owner), id.iid(), Some(id), Some(valid), Some(&["_id"]), true).await
 }
 
 /// Opens a bounded page of visible identities in complete UTF-8 key order.
@@ -112,9 +105,7 @@ async fn open_owned_identity_candidates(
     valid: Timestamp, after: Option<&str>, fetch: i64,
 ) -> Result<Option<QueryCursor>> {
     let context = owned_context_at_system(context, system)?;
-    if !require_owned_address_coverage(&context, owner, relation)? {
-        return Ok(None);
-    }
+    if owner.is_empty() { return Err(address_unavailable()); }
     let name = QualifiedTable {
         database: context.catalog.default_database().to_owned(),
         table: relation.table(owner),
@@ -261,13 +252,6 @@ pub(crate) async fn open_owned_table_point(
     context: Arc<QueryContext>, table: TableRef, locator: Iid, id: Option<&EntityId>,
     valid: Option<Interval>, columns: Option<&[&str]>, history: bool,
 ) -> Result<Option<QueryCursor>> {
-    open_owned_table_candidates(context, table, [locator].into(), id, valid, columns, history).await
-}
-
-async fn open_owned_table_candidates(
-    context: Arc<QueryContext>, table: TableRef, candidates: std::collections::BTreeSet<Iid>,
-    id: Option<&EntityId>, valid: Option<Interval>, columns: Option<&[&str]>, history: bool,
-) -> Result<Option<QueryCursor>> {
     let name = QualifiedTable {
         database: context.catalog.default_database().to_owned(),
         table,
@@ -296,7 +280,7 @@ async fn open_owned_table_candidates(
     });
     let scan = Arc::new(Relation::scan(Scan {
         table, columns, valid_time, system_time: TemporalFilter::Default, clamp_valid_time: history,
-        iids: Some(candidates), predicates: Vec::new(), matches: Vec::new(), top_k: None, ordered_top_k: None,
+        iids: Some([locator].into()), predicates: Vec::new(), matches: Vec::new(), top_k: None, ordered_top_k: None,
     })?);
     let plan = if history {
         let expr = order.ok_or_else(|| Anomaly::fault("rtdb.owned/history-schema", "Owned history omitted its valid start"))?;
@@ -308,83 +292,8 @@ async fn open_owned_table_candidates(
     query.execute(context, Vec::new()).await.map(Some)
 }
 
-/// The found permanent assignment, or a slot the ordered resolver can reserve.
-pub enum OwnedAddress {
-    Assigned(Iid),
-    Vacant(Iid),
-}
-
-/// Rejects old owned storage if its complete address registry was never established.
-pub fn require_owned_address_coverage(context: &QueryContext, owner: &str, relation: &OwnedRelation) -> Result<bool> {
-    if owner.is_empty() || relation.is_world_catalog() { return Err(address_unavailable()); }
-    let database = context.catalog.database(context.catalog.default_database())?;
-    let [snapshot] = database.partitions.as_slice() else { return Err(address_unavailable()); };
-    if snapshot.contains_table(&relation.address_table(owner)) { return Ok(true); }
-    let table = relation.table(owner);
-    if snapshot.iter_segments(&table).any(|segment| segment.row_count() != 0)
-        || !snapshot.trie_entries(&table).is_empty()
-        || snapshot.table_catalog().metadata(&table).is_some_and(|metadata| metadata.row_count != 0)
-    {
-        return Err(address_unavailable());
-    }
-    Ok(false)
-}
-
-/// Probes only the held snapshot's protected registry, using the complete typed key.
-pub async fn owned_address(
-    context: Arc<QueryContext>, owner: &str, relation: &OwnedRelation, id: &EntityId,
-) -> Result<OwnedAddress> {
-    if !require_owned_address_coverage(&context, owner, relation)? {
-        return Ok(OwnedAddress::Vacant(id.iid()));
-    }
-    let registry = relation.address_table(owner);
-    let table = relation.table(owner);
-    for locator in id.owned_locator_candidates() {
-        context.check_cancelled()?;
-        let slot = EntityId::Uuid(locator.0);
-        let columns = ["address"];
-        let cursor = open_owned_table_point(Arc::clone(&context), registry.clone(), locator, Some(&slot), None, Some(&columns), false).await?;
-        let Some(occupant) = address_row(cursor, &slot, &context).await? else {
-            // A vacant registry slot may never cover an unregistered data row.
-            let cursor = open_owned_table_point(Arc::clone(&context), table, locator, None, Some(Interval::ALL), Some(&["_id"]), false).await?;
-            if let Some(mut cursor) = cursor {
-                while let Some(batch) = cursor.next_batch().await? {
-                    if batch.batch().num_rows() != 0 { return Err(address_unavailable()); }
-                }
-            }
-            return Ok(OwnedAddress::Vacant(locator));
-        };
-        if &occupant == id {
-            return Ok(OwnedAddress::Assigned(locator));
-        }
-        if !occupant.owned_locator_candidates().any(|candidate| candidate == locator) {
-            return Err(address_unavailable());
-        }
-    }
-    Err(Anomaly::new(AnomalyCategory::Unavailable, "rtdb.owned/address-exhausted", "No owned address locator is available"))
-}
-
-async fn address_row(
-    cursor: Option<QueryCursor>, slot: &EntityId, context: &QueryContext,
-) -> Result<Option<EntityId>> {
-    let Some(mut cursor) = cursor else { return Ok(None); };
-    let mut occupant = None;
-    while let Some(batch) = cursor.next_batch().await? {
-        let batch = batch.batch();
-        if batch.num_rows() == 0 { continue; }
-        if occupant.is_some() || batch.num_rows() != 1 { return Err(address_unavailable()); }
-        owned_row_revision(batch, 0, slot, &context.memory)?;
-        let (position, field) = batch.schema_ref().column_with_name("address").ok_or_else(address_unavailable)?;
-        let column = batch.column(position).as_ref();
-        let bytes = rtdb_columnar::estimate_read_value_bytes(field, column, 0)?;
-        let _scratch = context.memory.reserve(bytes.saturating_add(4096))?;
-        occupant = Some(rtdb_columnar::read_value(field, column, 0)?.entity_id().map_err(|_| address_unavailable())?);
-    }
-    Ok(occupant)
-}
-
 fn address_unavailable() -> Anomaly {
-    Anomaly::new(AnomalyCategory::Unavailable, "rtdb.owned/address-uncovered", "The owned relation has no complete address registry for this cut")
+    Anomaly::new(AnomalyCategory::Unavailable, "rtdb.owned/address-unavailable", "No exact owned key is available in this scope")
 }
 
 /// Interprets the winning revision only after checking the complete stored identity.

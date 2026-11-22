@@ -109,7 +109,6 @@ pub(super) fn verify(
         common_fingerprint = Some(fingerprint);
     }
     let mut data = BTreeSet::new();
-    let mut companions = BTreeSet::new();
     let mut journals = BTreeSet::new();
     let mut overlays = BTreeSet::new();
     let mut clocks = BTreeSet::new();
@@ -159,9 +158,8 @@ pub(super) fn verify(
             }
             if name == relation {
                 data.insert(relation);
-            } else {
-                companions.insert(relation);
-                if table.is_owned_change_journal() { journals.insert(relation); }
+            } else if table.is_owned_change_journal() {
+                journals.insert(relation);
             }
             for index in 0..batch.len() {
                 let header = batch.header(index)?;
@@ -171,7 +169,6 @@ pub(super) fn verify(
     }
     if !attempts.is_empty() || data != expected_data
         || !journals.remove(OWNED_ATTEMPT_RELATION) || journals != expected_data
-        || companions.iter().any(|relation| *relation != OWNED_ATTEMPT_RELATION && !data.contains(relation))
         || worlds.iter().any(|(world, kind)| match kind {
             Kind::Overlay => !overlays.contains(world) || !clocks.contains(world),
             Kind::Clock => !clocks.contains(world),

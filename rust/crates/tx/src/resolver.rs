@@ -1069,20 +1069,6 @@ impl<'a> OpenTransaction<'a> {
         Ok(latest)
     }
 
-    async fn assign_owned_address(&mut self, owner: &str, relation: &rtdb_types::OwnedRelation, id: &rtdb_types::EntityId) -> Result<Iid> {
-        let context = self.context.query_context(self.snapshot()?, self.tx_key().system_time, &self.options.default_tz, self.trace_parent)?;
-        match rtdb_query::owned_address(context, owner, relation, id).await? {
-            rtdb_query::OwnedAddress::Assigned(locator) => Ok(locator),
-            rtdb_query::OwnedAddress::Vacant(locator) => {
-                self.buffer.put(relation.address_table(owner), StructFields::from([
-                    ("_id".into(), Value::Uuid(locator.0)),
-                    ("address".into(), id.as_value()),
-                ]), Interval::ALL)?;
-                Ok(locator)
-            }
-        }
-    }
-
     async fn publish_owned_world(
         &mut self, world: Iid, attempt: &str, fingerprint: [u8; 32], expected: Option<Timestamp>,
         advance_to: Option<Timestamp>, drop_world: bool,
@@ -1180,18 +1166,12 @@ impl<'a> OpenTransaction<'a> {
             }
         }
         let mut bucket = rtdb_query::read_owned_purge_bucket(Arc::clone(&context), owner, relation, id).await?;
-        let locator = match rtdb_query::owned_address(context, owner, relation, id).await? {
-            rtdb_query::OwnedAddress::Assigned(locator) => locator,
-            rtdb_query::OwnedAddress::Vacant(_) => return Err(Anomaly::incorrect(
-                "rtdb.owned/purge-unassigned", "Owned erase requires a permanently assigned identity",
-            )),
-        };
-        // Verify any current valid slice belongs to this exact typed identity before erasing its locator.
-        self.read_owned_revision(owner, relation, id, Interval::ALL).await?;
+        // The full handle, including its type, is the erasure target even
+        // when the locality prefix is shared or the key has no live winner.
         let first_erase = !self.owned_changes.get(relation.name()).is_some_and(|group| group.erased);
         self.record_owned_change(relation, id.clone(), OwnedChangeKind::Erase, Interval::ALL)?;
         self.buffer.append(table, StoredEvent {
-            entity_key: Some(id.handle_bytes().into()), iid: locator,
+            entity_key: Some(id.handle_bytes().into()), iid: id.iid(),
             system_from: self.tx_key().system_time, valid_time: Interval::ALL,
             operation: StoredOperation::Erase, recency: None,
         })?;
@@ -1222,13 +1202,12 @@ impl<'a> OpenTransaction<'a> {
             schema.require_write_validity(true)?;
         }
         let valid = interval(from.unwrap_or(self.tx_key().system_time), to.unwrap_or(Timestamp::MAX))?;
-        let locator = self.assign_owned_address(owner, relation, id).await?;
         self.read_owned_revision(owner, relation, id, Interval::ALL).await?;
         self.track_unique_mutation(owner, relation, id, valid).await?;
         self.track_capacity_mutation(owner, relation, id, valid).await?;
         let system_from = self.tx_key().system_time;
         self.buffer.append(relation.table(owner), StoredEvent { entity_key: Some(id.handle_bytes().into()),
-            iid: locator, system_from, valid_time: valid, operation: StoredOperation::Delete, recency: None,
+            iid: id.iid(), system_from, valid_time: valid, operation: StoredOperation::Delete, recency: None,
         })?;
         self.record_owned_change(relation, id.clone(), rtdb_types::OwnedChangeKind::Delete, valid)
     }
@@ -1346,7 +1325,7 @@ impl<'a> OpenTransaction<'a> {
         if iids.is_some_and(|iids| iids.len() != documents.rows().len()) { return Err(Anomaly::incorrect("xtdb/invalid-iids", "Document and IID counts differ")); }
         let is_content = |name: &str| !matches!(name, "_valid_from" | "_valid_to");
         for (index, document) in documents.rows().iter().enumerate() {
-            let mut iid = match iids { Some(iids) => iids[index], None => crate::source::document_id(document, &self.context.memory)?.iid() };
+            let iid = match iids { Some(iids) => iids[index], None => crate::source::document_id(document, &self.context.memory)?.iid() };
             let default_from = from.unwrap_or(self.tx_key().system_time);
             let default_to = to.unwrap_or(Timestamp::MAX);
             let row_from = document.get("_valid_from").map(|value| timestamp(value, default_from)).transpose()?.unwrap_or(default_from);
@@ -1360,7 +1339,9 @@ impl<'a> OpenTransaction<'a> {
                     let id = crate::source::document_id(document, &self.context.memory)?;
                     if !relation.is_world_catalog() {
                         entity_key = Some(id.handle_bytes().into());
-                        iid = self.assign_owned_address(owner, relation, &id).await?;
+                        if iid != id.iid() {
+                            return Err(Anomaly::incorrect("rtdb.owned/invalid-locality", "Owned row locality differs from the canonical key"));
+                        }
                         self.track_unique_mutation(owner, relation, &id, valid_time).await?;
                         self.track_capacity_mutation(owner, relation, &id, valid_time).await?;
                     }

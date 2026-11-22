@@ -475,10 +475,19 @@ async fn owned_commit_checks_deadline_and_exact_point_before_mutation() {
     assert!(!stale.writes().tables().contains_key(&relation.table("owner")));
 
     let alias = EntityId::Uuid(id.iid().0);
+    let mut alias_document = document(8);
+    alias_document.insert("_id".into(), alias.as_value());
+    let insert_alias = TxOp::OwnedInsertDocs {
+        relation: relation.clone(),
+        documents: Documents::new(vec![alias_document], &context.memory).unwrap(),
+        valid_from: Some(Timestamp(0)), valid_to: None,
+    };
     let collision = resolver.resolve_source(
-        state.snapshot(), SourcePosition(4), Timestamp(104), source(vec![check(alias, None)]), &context,
+        state.snapshot(), SourcePosition(4), Timestamp(104),
+        source(vec![check(alias.clone(), None), insert_alias]), &context,
     ).await.unwrap();
-    assert!(collision.result().committed(), "a colliding but unassigned full identity is absent");
+    assert!(collision.result().committed(), "the exact absence admits a distinct key at the same IID");
+    let alias_revision = collision.result().tx_key().system_time;
 
     let deleted = resolver.resolve_source(
         state.snapshot(), SourcePosition(5), Timestamp(105),
@@ -486,7 +495,8 @@ async fn owned_commit_checks_deadline_and_exact_point_before_mutation() {
     ).await.unwrap();
     assert!(deleted.result().committed());
     let absent = resolver.resolve_source(
-        state.snapshot(), SourcePosition(6), Timestamp(106), source(vec![check(id, None)]), &context,
+        state.snapshot(), SourcePosition(6), Timestamp(106),
+        source(vec![check(id, None), check(alias, Some(alias_revision))]), &context,
     ).await.unwrap();
     assert!(absent.result().committed());
 }
@@ -817,104 +827,7 @@ async fn declared_owned_schema_distinguishes_omission_and_null_after_source_deco
 }
 
 #[tokio::test]
-async fn owned_world_rows_require_the_ordered_registration_and_cannot_mix_with_root() {
-    use rtdb_format::envelope::SourceMessage;
-    use rtdb_types::{EntityId, Iid, OwnedRelation, OwnedWorld, TransactionKey, TxId, WorldShadow};
-    let context = context();
-    let state = PartitionState::empty(Default::default()).unwrap();
-    let world = OwnedWorld {
-        id: Iid([8; 16]), capture: Iid([9; 16]), suffix: None, manifest: "a".repeat(43),
-        basis: TransactionKey { tx_id: TxId(0), system_time: Timestamp(10) }, until: Timestamp(108), dropped: false,
-        schemas: rtdb_types::WorldSchemas::new(std::collections::BTreeMap::from([(
-            "orders".into(),
-            rtdb_types::OwnedSchema::from_json(br#"{"fields":[{"name":"amount","type":{"kind":"i64"},"optional":true,"nullable":false}]}"#).unwrap(),
-        )])).unwrap(),
-    };
-    let root = OwnedRelation::new("orders").unwrap();
-    let local = root.in_world(world.id).unwrap();
-    assert_ne!(local.table("owner"), root.table("owner"));
-    assert!(OwnedRelation::new(local.name()).is_err());
-    let source = |operations| {
-        let request = SourceTransaction::new(
-            operations, SubmitOptions { user: Some("owner".into()), ..SubmitOptions::default() }, &context.memory,
-        ).unwrap();
-        let encoded = request.encode().unwrap();
-        let message = SourceMessage::decode(encoded.as_slice()).unwrap().unwrap();
-        SourceTransaction::decode(&message, &context.memory).unwrap()
-    };
-    let replace = |relation| TxOp::OwnedReplaceDocs {
-        relation, documents: Documents::new(vec![WorldShadow::Deleted.record(&EntityId::Integer(1)).unwrap()], &context.memory).unwrap(),
-        valid_from: Some(Timestamp(50)), valid_to: Some(Timestamp(100)),
-    };
-    let mut resolver = TxResolver::new(None, SourcePosition(-1), None, &context.memory).unwrap();
-    let missing = resolver.resolve_source(state.snapshot(), SourcePosition(0), Timestamp(100),
-        source(vec![replace(local.clone())]), &context).await.unwrap();
-    assert_eq!(missing.result().error().unwrap().code, "rtdb.world/unavailable");
-    let declared = resolver.resolve_source(state.snapshot(), SourcePosition(1), Timestamp(101),
-        source(vec![TxOp::OwnedInsertDocs { relation: OwnedRelation::world_catalog(),
-            documents: Documents::new(vec![world.record()], &context.memory).unwrap(), valid_from: None, valid_to: None }]), &context).await.unwrap();
-    assert!(declared.result().committed());
-    assert!(!declared.writes().tables().contains_key(&OwnedRelation::world_catalog().address_table("owner")));
-    let mixed = resolver.resolve_source(state.snapshot(), SourcePosition(2), Timestamp(102),
-        source(vec![replace(local.clone()), replace(root.clone())]), &context).await.unwrap();
-    assert_eq!(mixed.result().error().unwrap().code, "rtdb.world/unavailable");
-    let canonical = EntityId::Integer(1);
-    let alias = EntityId::Uuid(canonical.iid().0);
-    let fact = StructFields::from([("_id".into(), alias.as_value()), ("amount".into(), Value::I64(2))]);
-    let alias_write = TxOp::OwnedReplaceDocs {
-        relation: local.clone(),
-        documents: Documents::new(vec![WorldShadow::Present(fact).record(&alias).unwrap()], &context.memory).unwrap(),
-        valid_from: Some(Timestamp(50)), valid_to: Some(Timestamp(100)),
-    };
-    let accepted = resolver.resolve_source(state.snapshot(), SourcePosition(3), Timestamp(103),
-        source(vec![replace(local.clone()), alias_write]), &context).await.unwrap();
-    assert!(accepted.result().committed());
-    assert!(accepted.writes().tables().contains_key(&local.table("owner")));
-    let addresses = local.address_table("owner");
-    assert_eq!(addresses.owned_world_scope(), (false, Some(world.id)));
-    assert!(accepted.writes().tables().contains_key(&addresses));
-    assert!(!accepted.writes().tables().contains_key(&root.address_table("owner")));
-    let payload = accepted.to_replica_body(&context.memory).unwrap();
-    let rtdb_format::envelope::ReplicaBody::ResolvedTx(body) = payload.body() else { panic!("expected resolved payload"); };
-    let replica = decode_replica(body, Some(mixed.result().tx_key()), state.snapshot().block_index(), &context.memory).unwrap();
-    assert!(replica.writes.tables().contains_key(&addresses));
-    assert!(!accepted.writes().tables().contains_key(&root.table("owner")));
-    let revision = accepted.result().tx_key().system_time;
-    let check = |at, expected| TxOp::OwnedCheck {
-        relation: local.clone(), id: EntityId::Integer(1), valid_at: Timestamp(at), expected,
-    };
-    let alias_check = TxOp::OwnedCheck { relation: local.clone(), id: alias, valid_at: Timestamp(70), expected: Some(revision) };
-    let observed = resolver.resolve_source(state.snapshot(), SourcePosition(4), Timestamp(104),
-        source(vec![check(49, None), check(50, Some(revision)), check(99, Some(revision)), check(100, None), alias_check]), &context).await.unwrap();
-    assert!(observed.result().committed());
-    let present = |value| {
-        let mut fact = StructFields::from([("_id".into(), Value::I64(1))]);
-        if let Some(value) = value { fact.insert("amount".into(), value); }
-        TxOp::OwnedReplaceDocs {
-            relation: local.clone(),
-            documents: Documents::new(vec![WorldShadow::Present(fact).record(&EntityId::Integer(1)).unwrap()], &context.memory).unwrap(),
-            valid_from: Some(Timestamp(100)), valid_to: Some(Timestamp(150)),
-        }
-    };
-    let undeclared = OwnedRelation::new("undeclared").unwrap().in_world(world.id).unwrap();
-    let refused = resolver.resolve_source(state.snapshot(), SourcePosition(5), Timestamp(105),
-        source(vec![replace(undeclared.clone())]), &context).await.unwrap();
-    assert_eq!(refused.result().error().unwrap().code, "rtdb.owned/world-undeclared");
-    assert!(!refused.writes().tables().contains_key(&undeclared.address_table("owner")));
-    let invalid = resolver.resolve_source(state.snapshot(), SourcePosition(6), Timestamp(106),
-        source(vec![present(Some(Value::Null))]), &context).await.unwrap();
-    assert_eq!(invalid.result().error().unwrap().code, "rtdb.owned/nonconforming");
-    let absent = resolver.resolve_source(state.snapshot(), SourcePosition(7), Timestamp(107),
-        source(vec![present(None)]), &context).await.unwrap();
-    assert!(absent.result().committed());
-    let expired = resolver.resolve_source(state.snapshot(), SourcePosition(8), Timestamp(108),
-        source(vec![replace(local.clone())]), &context).await.unwrap();
-    assert_eq!(expired.result().error().unwrap().code, "rtdb.world/unavailable");
-}
-
-#[tokio::test]
-async fn ordered_world_drop_is_terminal_and_refuses_a_different_fork() {
-    use rtdb_format::envelope::SourceMessage;
+async fn world_mutations_refuse_source_operations_without_held_admission() {
     use rtdb_types::{EntityId, Iid, OwnedRelation, OwnedWorld, TransactionKey, TxId, WorldSchemas, WorldShadow};
 
     let context = context();
@@ -924,59 +837,28 @@ async fn ordered_world_drop_is_terminal_and_refuses_a_different_fork() {
         basis: TransactionKey { tx_id: TxId(0), system_time: Timestamp(10) },
         until: Timestamp(200), schemas: WorldSchemas::new(Default::default()).unwrap(), dropped: false,
     };
-    let scope = OwnedRelation::world_catalog();
-    let source = |operation| {
-        let request = SourceTransaction::new(
-            vec![operation], SubmitOptions { user: Some("owner".into()), ..SubmitOptions::default() }, &context.memory,
-        ).unwrap();
-        let encoded = request.encode().unwrap();
-        let message = SourceMessage::decode(encoded.as_slice()).unwrap().unwrap();
-        SourceTransaction::decode(&message, &context.memory).unwrap()
-    };
-    let register = || TxOp::OwnedInsertDocs {
-        relation: scope.clone(), documents: Documents::new(vec![world.record()], &context.memory).unwrap(),
+    let catalog = OwnedRelation::world_catalog();
+    let overlay = OwnedRelation::new("orders").unwrap().in_world(world.id).unwrap();
+    let root = TxOp::OwnedInsertDocs {
+        relation: catalog, documents: Documents::new(vec![world.record()], &context.memory).unwrap(),
         valid_from: None, valid_to: None,
     };
-    let drop_world = |capture| {
-        let marker = OwnedWorld { capture, dropped: true, ..world.clone() };
-        TxOp::OwnedReplaceDocs {
-            relation: scope.clone(), documents: Documents::new(vec![marker.record()], &context.memory).unwrap(),
-            valid_from: None, valid_to: None,
-        }
-    };
-    let mut resolver = TxResolver::new(None, SourcePosition(-1), None, &context.memory).unwrap();
-    let registered = resolver.resolve_source(state.snapshot(), SourcePosition(0), Timestamp(100),
-        source(register()), &context).await.unwrap();
-    assert!(registered.result().committed());
-
-    let unrelated = resolver.resolve_source(state.snapshot(), SourcePosition(1), Timestamp(101),
-        source(drop_world(Iid([7; 16]))), &context).await.unwrap();
-    assert_eq!(unrelated.result().error().unwrap().code, "rtdb.world/unavailable");
-
-    let dropped = resolver.resolve_source(state.snapshot(), SourcePosition(2), Timestamp(102),
-        source(drop_world(world.capture)), &context).await.unwrap();
-    assert!(dropped.result().committed());
-    assert!(dropped.writes().tables().contains_key(&scope.table("owner")));
-
-    let repeated = resolver.resolve_source(state.snapshot(), SourcePosition(3), Timestamp(103),
-        source(drop_world(world.capture)), &context).await.unwrap();
-    assert!(repeated.result().committed());
-    assert!(!repeated.writes().tables().contains_key(&scope.table("owner")));
-
-    let resurrected = resolver.resolve_source(state.snapshot(), SourcePosition(4), Timestamp(104),
-        source(register()), &context).await.unwrap();
-    assert!(!resurrected.result().committed());
-
-    let child = OwnedRelation::new("orders").unwrap().in_world(world.id).unwrap();
-    let pending = TxOp::OwnedReplaceDocs {
-        relation: child.clone(),
-        documents: Documents::new(vec![WorldShadow::Deleted.record(&EntityId::Integer(1)).unwrap()], &context.memory).unwrap(),
+    let write = TxOp::OwnedReplaceDocs {
+        relation: overlay, documents: Documents::new(
+            vec![WorldShadow::Deleted.record(&EntityId::Integer(1)).unwrap()], &context.memory,
+        ).unwrap(),
         valid_from: Some(Timestamp(50)), valid_to: Some(Timestamp(100)),
     };
-    let refused = resolver.resolve_source(state.snapshot(), SourcePosition(5), Timestamp(105),
-        source(pending), &context).await.unwrap();
-    assert_eq!(refused.result().error().unwrap().code, "rtdb.world/unavailable");
-    assert!(!refused.writes().tables().contains_key(&child.table("owner")));
+    let mut resolver = TxResolver::new(None, SourcePosition(-1), None, &context.memory).unwrap();
+    for (position, operation) in [root, write].into_iter().enumerate() {
+        let source = SourceTransaction::new(
+            vec![operation], SubmitOptions { user: Some("owner".into()), ..SubmitOptions::default() }, &context.memory,
+        ).unwrap();
+        let refused = resolver.resolve_source(
+            state.snapshot(), SourcePosition(position as i64), Timestamp(100 + position as i64), source, &context,
+        ).await.unwrap();
+        assert_eq!(refused.result().error().unwrap().code, "rtdb.world/unavailable");
+    }
 }
 
 #[tokio::test]
@@ -1102,75 +984,6 @@ async fn fixed_range_checks_full_old_and_new_keys_at_the_pinned_valid_instant() 
     let stale_empty = resolver.resolve_source(state.snapshot(), SourcePosition(6), Timestamp(106),
         source(vec![check(leave.result().tx_key(), 4, 3)]), &context).await.unwrap();
     assert_eq!(stale_empty.result().error().unwrap().code, "rtdb.owned/stale-range");
-}
-
-#[tokio::test]
-async fn owned_world_conditions_distinguish_local_absence_from_a_tombstone_revision() {
-    use rtdb_format::envelope::SourceMessage;
-    use rtdb_types::{EntityId, Iid, OwnedRelation, OwnedWorld, PlacedAttemptScope, TransactionKey, TxId, WorldSchemas, WorldShadow};
-
-    let mut context = context();
-    let scope = PlacedAttemptScope::new("installed-world", 1).unwrap();
-    context.owned_witness_scope = Some(scope);
-    let state = PartitionState::empty(Default::default()).unwrap();
-    let world = OwnedWorld {
-        id: Iid([8; 16]), capture: Iid([9; 16]), suffix: None, manifest: "a".repeat(43),
-        basis: TransactionKey { tx_id: TxId(0), system_time: Timestamp(10) }, until: Timestamp(200), dropped: false,
-        schemas: WorldSchemas::new(std::collections::BTreeMap::from([(
-            "orders".into(), rtdb_types::OwnedSchema::from_json(br#"{"fields":[]}"#).unwrap(),
-        )])).unwrap(),
-    };
-    let local = OwnedRelation::new("orders").unwrap().in_world(world.id).unwrap();
-    let id = EntityId::Integer(1);
-    let source = |operations| {
-        let request = SourceTransaction::new(
-            operations, SubmitOptions { user: Some("owner".into()), ..SubmitOptions::default() }, &context.memory,
-        ).unwrap().with_placed_seed(Some(scope.issue()));
-        let encoded = request.encode().unwrap();
-        let message = SourceMessage::decode(encoded.as_slice()).unwrap().unwrap();
-        SourceTransaction::decode(&message, &context.memory).unwrap()
-    };
-    let register = TxOp::OwnedInsertDocs {
-        relation: OwnedRelation::world_catalog(),
-        documents: Documents::new(vec![world.record()], &context.memory).unwrap(), valid_from: None, valid_to: None,
-    };
-    let write = |shadow: WorldShadow| TxOp::OwnedReplaceDocs {
-        relation: local.clone(), documents: Documents::new(vec![shadow.record(&id).unwrap()], &context.memory).unwrap(),
-        valid_from: Some(Timestamp(50)), valid_to: Some(Timestamp(100)),
-    };
-    let condition = |expected| TxOp::OwnedCheck {
-        relation: local.clone(), id: id.clone(), valid_at: Timestamp(75), expected,
-    };
-    let commands = |scope, deadline, check, write| vec![
-        TxOp::OwnedDeadline { until: Timestamp(deadline) },
-        TxOp::OwnedCheckWorldScope { scope },
-        check, write,
-    ];
-    let mut resolver = TxResolver::new(None, SourcePosition(-1), None, &context.memory).unwrap();
-    let opened = resolver.resolve_source(state.snapshot(), SourcePosition(0), Timestamp(100),
-        source(vec![register]), &context).await.unwrap();
-    assert!(opened.result().committed());
-    let tombstone = resolver.resolve_source(state.snapshot(), SourcePosition(1), Timestamp(101),
-        source(commands(scope, 150, condition(None), write(WorldShadow::Deleted))), &context).await.unwrap();
-    assert!(tombstone.result().committed());
-
-    let present = || WorldShadow::Present(StructFields::from([("_id".into(), id.as_value())]));
-    let stale = resolver.resolve_source(state.snapshot(), SourcePosition(2), Timestamp(102),
-        source(commands(scope, 150, condition(None), write(present()))), &context).await.unwrap();
-    assert_eq!(stale.result().error().unwrap().code, "rtdb.owned/stale-point");
-    assert!(!stale.writes().tables().contains_key(&local.table("owner")));
-
-    let revision = Some(tombstone.result().tx_key().system_time);
-    let moved = PlacedAttemptScope::new("installed-world", 2).unwrap();
-    let refused = resolver.resolve_source(state.snapshot(), SourcePosition(3), Timestamp(103),
-        source(commands(moved, 150, condition(revision), write(present()))), &context).await.unwrap();
-    assert_eq!(refused.result().error().unwrap().code, "rtdb.owned/world-witness-unavailable");
-    let expired = resolver.resolve_source(state.snapshot(), SourcePosition(4), Timestamp(104),
-        source(commands(scope, 104, condition(revision), write(present()))), &context).await.unwrap();
-    assert_eq!(expired.result().error().unwrap().code, "rtdb.owned/expired");
-    let changed = resolver.resolve_source(state.snapshot(), SourcePosition(5), Timestamp(105),
-        source(commands(scope, 150, condition(revision), write(present()))), &context).await.unwrap();
-    assert!(changed.result().committed());
 }
 
 #[tokio::test]
