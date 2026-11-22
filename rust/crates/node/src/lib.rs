@@ -28,7 +28,7 @@ pub use placed_receipts::{AwaitAuthority, ClosedEpochRecovery, PlacedReceiptCode
 pub use catalog::{DatabaseCatalog, Membership};
 pub use config::*;
 pub use database::{CompactionRelay, Database};
-pub use node::{IDEMPOTENCY_KEY_PARAMETER, NOT_HELD, REPLICA_BEHIND, NativeSession, Node, NodeDriver, NodeServices, OwnedReadSession, OwnedWorldWrite, ReadFence};
+pub use node::{IDEMPOTENCY_KEY_PARAMETER, NOT_HELD, REPLICA_BEHIND, NativeSession, Node, NodeDriver, NodeServices, OwnedRangeWitness, OwnedReadSession, OwnedWorldWrite, ReadFence};
 
 mod statement;
 pub use statement::{PreparedSql, ResultSignaturePolicy};

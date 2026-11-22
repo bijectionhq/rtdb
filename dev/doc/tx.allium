@@ -54,6 +54,9 @@
 -- An owned transaction refuses ordinary operations and ordinary SQL catalogs and scans exclude owned tables.
 -- Owned point reads use the principal's namespace at a reserved present.
 -- A held owned read captures the exact applied transaction key and retains that catalog for repeated reads.
+-- A covered held range may mint a witness of its owner relation's cumulative event frontier and placed writer epoch.
+-- Ordered validation refuses a witnessed write when that relation's frontier changed or the witness expired or belongs to another placed epoch.
+-- Events in other owner relations leave the witness valid.
 -- Held reads require the original session and attachment and refuse after expiry, lease loss, or closure.
 -- An owned path declaration is maintained from the ordered owner's private catalog.
 -- An owned unique declaration starts before any relation data and admits one Binary key per row.

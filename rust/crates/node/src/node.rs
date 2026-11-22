@@ -857,6 +857,28 @@ impl NodeDriver {
     }
 }
 
+/// Relation-local evidence from a successfully covered held page.
+#[derive(Clone)]
+pub struct OwnedRangeWitness {
+    relation: rtdb_types::OwnedRelation,
+    basis: TransactionKey,
+    scope: rtdb_types::PlacedAttemptScope,
+    frontier: i64,
+    until: Timestamp,
+}
+
+impl OwnedRangeWitness {
+    pub fn operation(self) -> TxOp {
+        TxOp::OwnedCheckRange {
+            relation: self.relation, basis: self.basis, scope: self.scope, frontier: self.frontier, until: self.until,
+        }
+    }
+
+    pub fn matches_scope(&self, scope: Option<rtdb_types::PlacedAttemptScope>) -> bool {
+        Some(self.scope) == scope
+    }
+}
+
 /// A database-scoped capture held by the same authenticated native session.
 pub struct OwnedReadSession {
     context: Arc<QueryContext>,
@@ -865,6 +887,8 @@ pub struct OwnedReadSession {
     database: String,
     owner: String,
     present: TransactionKey,
+    witness_scope: Option<rtdb_types::PlacedAttemptScope>,
+    witness_until: Timestamp,
     cancellation: CancellationToken,
     _reservation: Arc<rtdb_columnar::MemoryReservation>,
 }
@@ -933,6 +957,27 @@ impl OwnedReadSession {
         request: crate::OwnedRangeRequest<'_>,
     ) -> Result<crate::OwnedRangePage> {
         self.range_page(relation, path, crate::ordered_index::RowBounds::Compound(request)).await
+    }
+
+    /// Issues evidence only after the covering query completed, including a covered empty page.
+    pub async fn range_page_by_key_observed(
+        &self, relation: &rtdb_types::OwnedRelation, path: &rtdb_types::OwnedRelation,
+        request: crate::OwnedRangeRequest<'_>,
+    ) -> Result<(crate::OwnedRangePage, Option<OwnedRangeWitness>)> {
+        let page = self.range_page_by_key(relation, path, request).await?;
+        let Some(scope) = self.witness_scope else { return Ok((page, None)); };
+        let database = self.context.catalog.database(&self.database)?;
+        let [snapshot] = database.partitions.as_slice() else {
+            return Err(Anomaly::incorrect("rtdb.owned/range-witness", "An owned range witness requires one held partition"));
+        };
+        let frontier = snapshot.relation_event_frontier(&relation.table(&self.owner))?;
+        if snapshot.tx_basis() != Some(self.present) {
+            return Err(Anomaly::incorrect("rtdb.owned/range-witness", "The exact owned range basis is unavailable"));
+        }
+        self.check()?;
+        Ok((page, Some(OwnedRangeWitness {
+            relation: relation.clone(), basis: self.present, scope, frontier, until: self.witness_until,
+        })))
     }
 
     /// Counts a covered full-key range at this held system cut and an explicit valid instant.
@@ -1035,7 +1080,12 @@ impl NativeSession {
             .ok_or_else(|| Anomaly::new(AnomalyCategory::Forbidden, "rtdb.owned/no-owner", "Owned relations require an authenticated principal"))?;
         let charge = node.memory().reserve(database.capacity().checked_add(owner.capacity()).and_then(|bytes| bytes.checked_add(2048))
             .ok_or_else(|| Anomaly::incorrect("rtdb.owned/read-size", "Retained read allocation overflow"))?)?;
-        let attached = Arc::downgrade(&node.attached_database(&database, self.service.placement.as_ref())?);
+        let attached = node.attached_database(&database, self.service.placement.as_ref())?;
+        let witness_scope = match &attached.await_authority {
+            AwaitAuthority::Live { codec, .. } => Some(codec.scope()),
+            _ => None,
+        };
+        let attached = Arc::downgrade(&attached);
         let present = self.reserve_ordered_present().await?;
         let basis = QueryBasis {
             snapshot: TimeBasis { databases: BTreeMap::from([(database.clone(), vec![Some(present.system_time.into())])]) },
@@ -1048,8 +1098,17 @@ impl NativeSession {
             &database, &basis, identity.as_ref(), Some(&attached), Some(present), &cancellation,
         ).await?;
         let lease = context.catalog.read_lease();
+        let witness_scope = witness_scope.filter(|_| lease.as_ref().and_then(|lease| lease.deadline()).is_some());
         let clock = Arc::clone(&node.factory.clock);
-        let deadline = clock.monotonic_micros().saturating_add(60_000_000);
+        let now = clock.monotonic_micros();
+        let deadline = now.saturating_add(60_000_000);
+        let lease_deadline = lease.as_ref().map_or(deadline, |lease| lease.deadline().unwrap_or(now).min(deadline));
+        let witness_until = if witness_scope.is_some() {
+            Timestamp(clock.now().0.saturating_add(lease_deadline.saturating_sub(now))
+                .min(present.system_time.0.saturating_add(60_000_000)))
+        } else {
+            present.system_time
+        };
         let guarded_node = node.clone();
         let guarded_database = database.clone();
         let context = context.with_owned_read_guard(Arc::new(move || {
@@ -1061,7 +1120,7 @@ impl NativeSession {
             Ok(())
         }));
         context.check_cancelled()?;
-        Ok(OwnedReadSession { context, node, identity, database, owner, present, cancellation, _reservation: charge })
+        Ok(OwnedReadSession { context, node, identity, database, owner, present, witness_scope, witness_until, cancellation, _reservation: charge })
     }
     pub async fn query_context(&mut self) -> Result<Arc<QueryContext>> {
         let basis = self.state.read_basis().await?;

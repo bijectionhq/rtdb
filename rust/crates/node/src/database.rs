@@ -295,7 +295,12 @@ impl DatabaseFactory {
             let secondaries = recovered.block.as_ref().map(|block| block.secondary_databases().clone()).unwrap_or_default();
             let partition = Arc::clone(&recovered.partition);
             let progress = ProgressMonitor::new(recovered.progress.clone());
-            let resolve = Arc::new(ResolveContext { database: name.clone(), storage: Arc::clone(&storage), memory: Arc::clone(&self.memory),
+            let resolve = Arc::new(ResolveContext {
+                owned_witness_scope: match &opened_logs.await_authority {
+                    crate::AwaitAuthority::Live { codec, .. } => Some(codec.scope()),
+                    _ => None,
+                },
+                database: name.clone(), storage: Arc::clone(&storage), memory: Arc::clone(&self.memory),
                 query_options: self.options.query.clone(),
                 scan_accelerators: Arc::clone(&self.accelerators),
                 cancellation: cancellation.clone(), default_tz: self.options.default_timezone.clone(), authorization: Arc::clone(&self.authorization),

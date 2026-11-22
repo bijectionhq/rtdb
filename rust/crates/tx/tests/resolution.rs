@@ -15,7 +15,7 @@ impl TransactionAuthorization for Denied {
     fn check_role_membership(&self, _: &str, _: Option<&str>) -> Result<()> { Err(Anomaly::new(rtdb_types::AnomalyCategory::Forbidden, "xtdb/forbidden", "Not authorized")) }
 }
 fn context() -> ResolveContext {
-    ResolveContext { database: "xtdb".into(), storage: Arc::new(BufferPool::new(Arc::new(MemoryStore::default()), 1 << 20)), memory: MemoryBudget::new(1 << 29), query_options: QueryOptions { batch_rows: 1, ..Default::default() }, scan_accelerators: Default::default(), cancellation: CancellationToken::new(), default_tz: "UTC".into(), authorization: Arc::new(Denied), execution_observer: None, tracer: None }
+    ResolveContext { owned_witness_scope: None, database: "xtdb".into(), storage: Arc::new(BufferPool::new(Arc::new(MemoryStore::default()), 1 << 20)), memory: MemoryBudget::new(1 << 29), query_options: QueryOptions { batch_rows: 1, ..Default::default() }, scan_accelerators: Default::default(), cancellation: CancellationToken::new(), default_tz: "UTC".into(), authorization: Arc::new(Denied), execution_observer: None, tracer: None }
 }
 fn table() -> TableRef { TableRef::new("public", "docs") }
 fn document(value: i64) -> StructFields<Value> { StructFields::from([("_id".into(), Value::I64(1)), ("v".into(), Value::I64(value)), ("keep".into(), Value::Utf8("retained".into()))]) }
@@ -944,4 +944,58 @@ async fn ordered_world_drop_is_terminal_and_refuses_a_different_fork() {
         source(pending), &context).await.unwrap();
     assert_eq!(refused.result().error().unwrap().code, "rtdb.world/unavailable");
     assert!(!refused.writes().tables().contains_key(&child.table("owner")));
+}
+
+#[tokio::test]
+async fn owned_range_witness_checks_only_its_relation_before_mutation() {
+    use rtdb_format::envelope::SourceMessage;
+    use rtdb_types::{OwnedRelation, PlacedAttemptScope};
+
+    let mut context = context();
+    let scope = PlacedAttemptScope::new("installed-replica", 1).unwrap();
+    context.owned_witness_scope = Some(scope);
+    let state = PartitionState::empty(Default::default()).unwrap();
+    let watched = OwnedRelation::new("watched").unwrap();
+    let other = OwnedRelation::new("other").unwrap();
+    let put = |relation: &OwnedRelation| TxOp::OwnedReplaceDocs {
+        relation: relation.clone(), documents: Documents::new(vec![document(7)], &context.memory).unwrap(),
+        valid_from: Some(Timestamp(400)), valid_to: Some(Timestamp(500)),
+    };
+    let source = |operations| {
+        let request = SourceTransaction::new(
+            operations, SubmitOptions { user: Some("owner".into()), ..SubmitOptions::default() }, &context.memory,
+        ).unwrap().with_placed_seed(Some(scope.issue()));
+        let encoded = request.encode().unwrap();
+        let message = SourceMessage::decode(encoded.as_slice()).unwrap().unwrap();
+        SourceTransaction::decode(&message, &context.memory).unwrap()
+    };
+    let mut resolver = TxResolver::new(None, SourcePosition(-1), None, &context.memory).unwrap();
+    let initial = resolver.resolve_source(state.snapshot(), SourcePosition(0), Timestamp(100),
+        source(vec![put(&watched)]), &context).await.unwrap();
+    assert!(initial.result().committed());
+    let check = |witness_scope, until| TxOp::OwnedCheckRange {
+        relation: watched.clone(), basis: initial.result().tx_key(), scope: witness_scope, frontier: 1, until: Timestamp(until),
+    };
+    let unrelated = resolver.resolve_source(state.snapshot(), SourcePosition(1), Timestamp(101),
+        source(vec![put(&other)]), &context).await.unwrap();
+    assert!(unrelated.result().committed());
+    let accepted = resolver.resolve_source(state.snapshot(), SourcePosition(2), Timestamp(102),
+        source(vec![put(&other), check(scope, 200)]), &context).await.unwrap();
+    assert!(accepted.result().committed());
+
+    let wrong_scope = PlacedAttemptScope::new("another-replica", 1).unwrap();
+    let moved = resolver.resolve_source(state.snapshot(), SourcePosition(3), Timestamp(103),
+        source(vec![check(wrong_scope, 200)]), &context).await.unwrap();
+    assert_eq!(moved.result().error().unwrap().code, "rtdb.owned/range-witness-unavailable");
+    let expired = resolver.resolve_source(state.snapshot(), SourcePosition(4), Timestamp(104),
+        source(vec![check(scope, 104)]), &context).await.unwrap();
+    assert_eq!(expired.result().error().unwrap().code, "rtdb.owned/range-witness-unavailable");
+
+    let correction = resolver.resolve_source(state.snapshot(), SourcePosition(5), Timestamp(105),
+        source(vec![put(&watched)]), &context).await.unwrap();
+    assert!(correction.result().committed());
+    let stale = resolver.resolve_source(state.snapshot(), SourcePosition(6), Timestamp(106),
+        source(vec![put(&other), check(scope, 200)]), &context).await.unwrap();
+    assert_eq!(stale.result().error().unwrap().code, "rtdb.owned/stale-range");
+    assert!(!stale.writes().tables().contains_key(&other.table("owner")));
 }
