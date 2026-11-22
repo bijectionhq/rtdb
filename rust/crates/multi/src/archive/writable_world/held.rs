@@ -97,7 +97,7 @@ impl HeldCheckpointWorld {
 
     pub fn application_clock(&self) -> Option<Timestamp> { self.open.clock }
     pub fn initial_clock(&self) -> Timestamp { self.open.record.initial_clock() }
-    pub fn is_held(&self) -> bool { self.open.record.is_held() }
+    pub fn clock_mode(&self) -> WorldClockMode { self.open.record.mode }
 
     pub fn parent_basis(&self) -> TransactionKey { self.open.retained.basis }
     pub fn parent_pin(&self) -> Iid { self.open.record.pin }
@@ -174,7 +174,7 @@ impl HeldCheckpointWorld {
         valid: Timestamp,
     ) -> Result<(rtdb_node::OwnedSearchPage, Vec<OwnedWorldWitness>)> {
         self.check()?;
-        if self.is_held() { return Err(OwnedWorld::unavailable()); }
+        if self.clock_mode().is_writable() { return Err(OwnedWorld::unavailable()); }
         let guard = self.open.snapshot.relation_release_guard(partitions.iter().map(|(relation, _)| relation))?;
         let witnesses = self.open.snapshot.world_relation_witnesses(
             self.open.record.id, partitions.iter().map(|(relation, _)| relation),
@@ -206,7 +206,7 @@ impl HeldCheckpointWorld {
         &self, relation: OwnedRelation, path: OwnedRelation, request: OwnedRangeRequest<'_>, valid: Timestamp,
     ) -> Result<(OwnedRangePage, OwnedWorldWitness)> {
         self.check_relation(&relation)?;
-        if !self.is_held() { return Err(OwnedWorld::unavailable()); }
+        if !self.clock_mode().is_writable() { return Err(OwnedWorld::unavailable()); }
         let world = self.open.record.id;
         let witness = self.open.snapshot.world_relation_witnesses(world, [&relation])
             .await?.pop().ok_or_else(OwnedWorld::unavailable)?;
@@ -351,7 +351,7 @@ impl HeldCheckpointWorld {
         &self, relation: &OwnedRelation, valid: Timestamp, after: Option<&str>, limit: usize,
     ) -> Result<WorldIdentityPage> {
         self.check_relation(relation)?;
-        if !(1..=128).contains(&limit) || !self.is_held() { return Err(OwnedWorld::unavailable()); }
+        if !(1..=128).contains(&limit) || !self.clock_mode().is_writable() { return Err(OwnedWorld::unavailable()); }
         let candidates = self.open.snapshot.world_identity_candidates(
             self.open.record.id, relation, valid, after, limit + 1,
         ).await?;

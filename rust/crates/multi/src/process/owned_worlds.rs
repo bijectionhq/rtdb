@@ -4,7 +4,7 @@ use futures::future::BoxFuture;
 use rtdb_directory::{Directory, HostedTask};
 use rtdb_flight_sql::{OwnedWorldHost, OwnedWorldRead, WorldCall, WorldIdentityPage, WorldPointResult, WorldPointRow};
 use rtdb_node::{NodeOptions, OwnedCountRequest, OwnedRangePage, OwnedRangeRequest, OwnedWorldWitness};
-use rtdb_types::{EntityId, Interval, OwnedRelation, OwnedWorld, Result, Timestamp, TransactionKey};
+use rtdb_types::{EntityId, Interval, OwnedRelation, OwnedWorld, Result, Timestamp, TransactionKey, WorldClockMode};
 use uuid::Uuid;
 
 use crate::{
@@ -98,7 +98,7 @@ impl OwnedWorldRead for HeldCheckpointWorld {
 
     fn application_clock(&self) -> Option<Timestamp> { HeldCheckpointWorld::application_clock(self) }
     fn initial_clock(&self) -> Timestamp { HeldCheckpointWorld::initial_clock(self) }
-    fn is_held(&self) -> bool { HeldCheckpointWorld::is_held(self) }
+    fn clock_mode(&self) -> WorldClockMode { HeldCheckpointWorld::clock_mode(self) }
 
     fn parent_basis(&self) -> TransactionKey { HeldCheckpointWorld::parent_basis(self) }
 

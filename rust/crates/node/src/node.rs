@@ -1280,7 +1280,8 @@ impl OwnedReadSession {
             self.check_relation(relation)?;
             if selected.len() == 32 { return Err(unavailable()); }
             let local = relation.in_world(world)?;
-            let local_frontier = registered.is_held().then(|| snapshot.relation_event_frontier(&local.table(&self.owner))).transpose()?;
+            let local_frontier = registered.mode.is_writable()
+                .then(|| snapshot.relation_event_frontier(&local.table(&self.owner))).transpose()?;
             selected.push(OwnedWorldWitness {
                 world, pin: registered.pin, relation: local, scope,
                 observation: OwnedWorldObservation::Relation { local_frontier },
@@ -1558,6 +1559,7 @@ impl OwnedForkCut {
 pub enum WorldClockRequest {
     Retained,
     Held { start: Option<Timestamp> },
+    Proposal,
 }
 
 pub struct OwnedWorldFork {
@@ -1603,7 +1605,7 @@ pub struct OwnedWorldWrite {
     pub relation: rtdb_types::OwnedRelation,
     pub id: rtdb_types::EntityId,
     pub shadow: rtdb_types::WorldShadow,
-    pub valid: rtdb_types::Interval,
+    pub valid: Option<rtdb_types::Interval>,
 }
 
 pub struct NativeSession { pub(crate) state: Session, pub(crate) service: Arc<NativeSessionService> }
@@ -1626,22 +1628,23 @@ impl NativeSession {
         let requested = match fork.requested {
             WorldClockRequest::Retained => rtdb_types::WorldClockMode::Retained,
             WorldClockRequest::Held { start } => rtdb_types::WorldClockMode::Held { start: start.unwrap_or(inherited) },
+            WorldClockRequest::Proposal => rtdb_types::WorldClockMode::Proposal,
         };
-        let advances = record.initial_clock() > inherited;
+        let requires_tip = record.initial_clock() > inherited || requested == rtdb_types::WorldClockMode::Proposal;
         if record.id != fork.world || record.pin != fork.pin || record.basis.system_time != fork.cut.basis
             || (fork.previous.is_none() != (record.pin == record.id)) || fork.controls.is_empty()
-            || fork.previous.is_some_and(|pin| pin == record.pin || record.is_held())
+            || fork.previous.is_some_and(|pin| pin == record.pin || record.mode.is_writable())
             || fork.cut.live.is_some_and(|live| live != record.basis) || record.mode != requested
-            || (advances && fork.cut.live.is_none())
+            || (requires_tip && fork.cut.live.is_none())
             || fork.controls.len() > 4092 || fork.controls.iter().any(|control| !control.is_check())
             || self.placed_history()? != Some(fork.cut.scope)
         {
             return Err(rtdb_types::OwnedWorld::unavailable());
         }
-        let mut ops = Vec::with_capacity(fork.controls.len() + 2 + usize::from(advances));
+        let mut ops = Vec::with_capacity(fork.controls.len() + 2 + usize::from(requires_tip));
         ops.push(TxOp::OwnedDeadline { until });
         ops.extend(fork.controls.into_iter().map(TxOp::HostedControl));
-        if advances {
+        if requires_tip {
             ops.push(TxOp::OwnedCheck {
                 relation: rtdb_types::OwnedRelation::new(rtdb_types::OWNED_ROOT_PUBLICATION_RELATION)?,
                 id: rtdb_types::EntityId::String("head".into()),
@@ -1792,7 +1795,8 @@ impl NativeSession {
             let relation = relation.in_world(world)?;
             let _encode = self.service.node.memory().reserve(shadow.allocation_bound()?)?;
             let documents = rtdb_tx::Documents::new(vec![shadow.record(&id)?], self.service.node.memory())?;
-            ops.push(TxOp::OwnedReplaceDocs { relation, documents, valid_from: Some(valid.lower()), valid_to: Some(valid.upper()) });
+            ops.push(TxOp::OwnedReplaceDocs { relation, documents, valid_from: valid.map(|valid| valid.lower()),
+                valid_to: valid.map(|valid| valid.upper()) });
         }
         Ok(())
     }

@@ -1508,7 +1508,11 @@ impl Service {
         reply.extend_from_slice(&parent.system_time.0.to_be_bytes());
         reply.extend_from_slice(&snapshot.application_clock().unwrap_or(Timestamp::MIN).0.to_be_bytes());
         reply.extend_from_slice(&snapshot.initial_clock().0.to_be_bytes());
-        reply.push(u8::from(snapshot.is_held()));
+        reply.push(match snapshot.clock_mode() {
+            rtdb_types::WorldClockMode::Retained => 0,
+            rtdb_types::WorldClockMode::Held { .. } => 1,
+            rtdb_types::WorldClockMode::Proposal => 2,
+        });
         let held = Arc::new(OwnedWorldReadResource {
             snapshot, world, conditions: Mutex::new(BTreeMap::new()),
             owner: call.session.owner(), session: call.session.id.clone(), database: call.database.clone(),
@@ -1677,6 +1681,7 @@ impl Service {
                 let (start, rest) = rest.split_first_chunk::<8>().ok_or_else(|| invalid("World fork has no explicit clock start"))?;
                 (rtdb_node::WorldClockRequest::Held { start: Some(Timestamp(i64::from_be_bytes(*start))) }, rest)
             }
+            3 => (rtdb_node::WorldClockRequest::Proposal, rest),
             _ => return Err(invalid("Invalid world fork clock mode")),
         };
         let (attempt, rest) = rest.split_first_chunk::<22>().ok_or_else(|| invalid("World fork has no attempt identity"))?;
@@ -1699,7 +1704,7 @@ impl Service {
             }
             let previous = self.owned_world_read(call, &Bytes::copy_from_slice(previous_handle))?;
             previous.snapshot.check().map_err(status)?;
-            if previous.world.as_bytes() != world || previous.snapshot.is_held()
+            if previous.world.as_bytes() != world || previous.snapshot.clock_mode().is_writable()
                 || previous.snapshot.parent_basis().system_time >= cut.basis()
                 || previous.snapshot.parent_pin().0 == *pin
             {
@@ -1781,8 +1786,11 @@ impl Service {
             let parent_basis = resource.snapshot.parent_basis();
             let parent_pin = resource.snapshot.parent_pin();
             let expected_clock = resource.snapshot.application_clock();
-            if *kind != 2 && !resource.snapshot.is_held() {
-                return Err(Status::failed_precondition("The original world is read-only"));
+            let mode = resource.snapshot.clock_mode();
+            if (*kind == 0 && !mode.is_writable())
+                || (*kind == 1 && !matches!(mode, rtdb_types::WorldClockMode::Held { .. }))
+            {
+                return Err(Status::failed_precondition("The world clock mode does not admit this effect"));
             }
             held.push(resource);
             let (effect, rest) = match *kind {
@@ -1956,11 +1964,18 @@ impl Service {
             reservations.extend([charge, decoded]);
             for mut row in rows {
                 let id = row.remove("_id").ok_or_else(|| invalid("Owned world write has no _id"))?.entity_id().map_err(status)?;
-                let (Some(Value::Utf8(operation)), Some(Value::I64(from)), Some(Value::I64(to)), Some(payload)) = (
+                let (Some(Value::Utf8(operation)), Some(from), Some(to), Some(payload)) = (
                     row.remove("_op"), row.remove("_valid_from_micros"), row.remove("_valid_to_micros"), row.remove("fact"),
                 ) else { return Err(invalid("Owned world write requires a typed operation and explicit valid endpoints")); };
-                let valid = Interval::from_micros(from, to).map_err(status)?;
-                if valid.is_empty() { return Err(invalid("Owned world write needs a nonempty valid interval")); }
+                let valid = match (optional_micros(Some(from))?, optional_micros(Some(to))?) {
+                    (None, None) => None,
+                    (Some(from), Some(to)) => {
+                        let valid = Interval::new(from, to).map_err(status)?;
+                        if valid.is_empty() { return Err(invalid("Owned world write needs a nonempty valid interval")); }
+                        Some(valid)
+                    }
+                    _ => return Err(invalid("Owned world write has only one valid endpoint")),
+                };
                 let shadow = match (operation.as_str(), payload) {
                     ("delete", Value::Null) => WorldShadow::Deleted,
                     ("replace", Value::Struct(mut fields)) => {
