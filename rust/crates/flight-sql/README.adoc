@@ -320,6 +320,11 @@ Any intervening event on that owner relation invalidates the witness, including 
 Events on other relations or owners do not invalidate it.
 Count replies carry no range witness.
 
+`rtdb.owned.Commit.v5` uses the same witness prefix with zero through 32 witnesses and the same deadline and Arrow entry framing.
+It preserves the order of relation runs, and the same relation may appear in multiple runs.
+The commit admits up to 4096 entries across at most 32 distinct relations.
+A check-only request can have zero groups, and this action accepts point and range checks with the ordinary root mutations.
+
 `rtdb.owned.CountHeldRange.v1` uses the same handle and relation framing with one terminated Arrow IPC batch containing one row.
 Its fields are `path: Utf8`, `lower: Struct?`, `upper: Struct?`, and `valid_micros: Int64`.
 Bounds are complete path keys with an inclusive lower endpoint, an exclusive upper endpoint and null for an open side.
@@ -518,9 +523,9 @@ The relation-frontier check still applies to moving-valid reads, continuation re
 `rtdb.owned.CommitHosted.v1` is enabled only for a live placed connection authenticated as `flightSql.hostedControls.owner` with `flightSql.ownedNativeActions` enabled.
 The operator's `flightSql.hostedControls.relations` sequence names the admitted ordinary `public.bj_*` tables.
 The body begins with the Commit.v3 unsigned Int16 big-endian witness count (zero to 32) and its 16-byte held handle plus 16-byte nonce pairs.
-Then come the signed Int64 big-endian exclusive deadline, an unsigned Int32 big-endian byte length, that many bytes of Commit.v2 fact groups, then the hosted control groups.
+Then come the signed Int64 big-endian exclusive deadline, an unsigned Int32 big-endian byte length, that many bytes of ordered fact groups, then the hosted control groups.
 Each section uses the Commit.v2 relation-group sequence framing and both must contain at least one group.
-At most 32 total groups and 4096 total rows are accepted.
+Fact groups may repeat a relation to preserve run order. The combined sections admit at most 32 distinct fact and control groups and 4096 total rows.
 
 Each control group contains one terminated Arrow batch with distinct field names.
 Every row has `_id: Utf8`, `_expected_micros: Int64?`, and a complete replacement image in the already installed ordinary column types.
