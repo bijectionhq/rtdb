@@ -4,6 +4,48 @@ use serde::{Deserialize, Serialize};
 
 use crate::{Anomaly, LogicalType, Result, ScalarType, StructFields, TimeUnit, Value};
 
+/// Durable expiry frontier for one immutable creation-lifetime relation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct OwnedLifetimeFloor {
+    pub duration: i64,
+    pub expired_created_through: crate::Timestamp,
+}
+
+impl OwnedLifetimeFloor {
+    pub fn at(duration: i64, present: crate::Timestamp) -> Result<Self> {
+        if !(1..=3_155_760_000_000_000).contains(&duration) {
+            return Err(invalid("Invalid owned creation lifetime"));
+        }
+        Ok(Self { duration, expired_created_through: crate::Timestamp(present.0.saturating_sub(duration)) })
+    }
+
+    pub fn record(self, relation: &crate::OwnedRelation) -> StructFields<Value> {
+        StructFields::from([
+            ("_id".into(), Value::Utf8(relation.name().into())),
+            ("duration".into(), Value::I64(self.duration)),
+            ("expired_created_through".into(), Value::I64(self.expired_created_through.0)),
+        ])
+    }
+
+    pub fn decode(record: &StructFields<Value>, relation: &crate::OwnedRelation) -> Result<Self> {
+        let (Some(Value::Utf8(id)), Some(Value::I64(duration)), Some(Value::I64(floor))) =
+            (record.get("_id"), record.get("duration"), record.get("expired_created_through"))
+        else { return Err(invalid("Owned creation lifetime has no exact expiry floor")); };
+        if record.len() != 3 || id != relation.name() || !(1..=3_155_760_000_000_000).contains(duration) {
+            return Err(invalid("Invalid owned creation-lifetime floor"));
+        }
+        Ok(Self { duration: *duration, expired_created_through: crate::Timestamp(*floor) })
+    }
+
+    pub fn check(self, duration: i64, present: crate::Timestamp) -> Result<()> {
+        let allowed = Self::at(duration, present)?;
+        if self.duration != duration || self.expired_created_through > allowed.expired_created_through {
+            return Err(invalid("Owned creation-lifetime floor differs from the declared policy and present"));
+        }
+        Ok(())
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct OwnedSchema(OwnedSchemaWire);
 

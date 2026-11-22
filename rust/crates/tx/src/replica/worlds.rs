@@ -293,6 +293,17 @@ pub(super) fn verify(
                 }
                 Ok(())
             })?;
+        } else if let Some(relation) = table.owned_lifetime_relation() {
+            if !has_root || !expected_data.contains(relation) { return Err(mismatch()); }
+            let relation = OwnedRelation::new(relation).map_err(|_| mismatch())?;
+            if batch.len() != 1 { return Err(mismatch()); }
+            records(batch, key, memory, |row| {
+                let floor = rtdb_types::OwnedLifetimeFloor::decode(row, &relation).map_err(|_| mismatch())?;
+                if floor != rtdb_types::OwnedLifetimeFloor::at(floor.duration, key.system_time).map_err(|_| mismatch())? {
+                    return Err(mismatch());
+                }
+                Ok(())
+            })?;
         } else if let Some(relation) = table.owned_root_constraint_relation() {
             if !has_root || !expected_data.contains(relation) || relation == OWNED_ROOT_PUBLICATION_RELATION
                 || OwnedRelation::new(relation).is_err()

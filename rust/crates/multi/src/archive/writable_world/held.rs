@@ -170,14 +170,18 @@ impl HeldCheckpointWorld {
 
     pub async fn parent_point(&self, relation: &OwnedRelation, id: &EntityId, valid_at: Timestamp) -> Result<WorldPoint> {
         self.check()?;
-        let lifetime = self.open.snapshot.lifetime_point_duration(relation).await?;
+        let policy = self.open.snapshot.lifetime_point_policy(relation).await?;
+        let lifetime = policy.map(|floor| floor.duration);
         let basis = self.parent_basis().system_time;
         if lifetime.is_some() && (self.clock_mode() != WorldClockMode::Retained || valid_at != basis) {
             return Err(OwnedWorld::unavailable());
         }
         let fact = self.archive_point(relation, id, valid_at, lifetime).await?;
-        let until = fact.as_ref().zip(lifetime).map(|(fact, lifetime)| {
-            let expiry = fact.revision.0.checked_add(lifetime).map(Timestamp)
+        let until = fact.as_ref().zip(policy).map(|(fact, policy)| {
+            if fact.revision <= policy.expired_created_through {
+                return Err(expired_lifetime());
+            }
+            let expiry = fact.revision.0.checked_add(policy.duration).map(Timestamp)
                 .filter(|expiry| fact.revision <= basis && basis < *expiry)
                 .ok_or_else(OwnedWorld::unavailable)?;
             if expiry <= self.present().system_time {

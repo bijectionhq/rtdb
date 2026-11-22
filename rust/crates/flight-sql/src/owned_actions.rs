@@ -2338,14 +2338,14 @@ impl Service {
         &self, snapshot: &OwnedReadSession, relation: &OwnedRelation, id: &EntityId, valid: Option<Timestamp>,
     ) -> Result<ActionResult, Status> {
         let present = snapshot.system_time();
-        let lifetime = snapshot.lifetime_point_duration(relation).await.map_err(status)?;
+        let lifetime = snapshot.lifetime_point_policy(relation).await.map_err(status)?;
         let cursor = snapshot.open_point_at(relation, id, valid).await.map_err(status)?;
         let reply = self.finish_owned_point(present, valid.unwrap_or(present), id, cursor, lifetime).await?;
         snapshot.check_live_point_relation(relation).map_err(status)?;
         Ok(reply)
     }
 
-    async fn finish_owned_point(&self, present: Timestamp, valid: Timestamp, id: &EntityId, result: Option<QueryCursor>, lifetime: Option<i64>) -> Result<ActionResult, Status> {
+    async fn finish_owned_point(&self, present: Timestamp, valid: Timestamp, id: &EntityId, result: Option<QueryCursor>, lifetime: Option<rtdb_types::OwnedLifetimeFloor>) -> Result<ActionResult, Status> {
         let Some(mut cursor) = result else {
             return self.owned_point_reply(&Schema::empty(), None, present, valid, None);
         };
@@ -2359,11 +2359,16 @@ impl Service {
         }
         if let Some(batch) = result {
             let revision = rtdb_query::owned_row_revision(batch.batch(), 0, id, self.memory()).map_err(status)?;
-            let until = lifetime.map(|lifetime| revision.0.checked_add(lifetime)
-                .map(Timestamp).filter(|until| revision <= present && present < *until)
+            let until = lifetime.map(|lifetime| revision.0.checked_add(lifetime.duration)
+                .map(Timestamp).filter(|until| revision > lifetime.expired_created_through
+                    && revision <= present && present < *until)
                 .ok_or_else(|| Status::failed_precondition("The retained point is outside its creation lifetime"))
             ).transpose()?;
-            self.owned_point_reply_until(batch.batch().schema_ref(), Some(batch.batch()), present, valid, Some(revision), until)
+            let reply = self.owned_point_reply_until(batch.batch().schema_ref(), Some(batch.batch()), present, valid, Some(revision), until)?;
+            if until.is_some_and(|until| until <= self.0.node.now()) {
+                return Err(Status::failed_precondition("The held point reached its creation lifetime"));
+            }
+            Ok(reply)
         } else {
             let schema = wire::plan_schema(cursor.runtime_schema(), self.memory())?;
             self.owned_point_reply(&schema, None, present, valid, None)

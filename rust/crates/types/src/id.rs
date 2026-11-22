@@ -327,6 +327,10 @@ impl TableRef {
         self.supported_owned_name().then(|| self.table.split_once('-').map(|(_, name)| name)).flatten()
     }
 
+    pub fn owned_lifetime_relation(&self) -> Option<&str> {
+        self.owned_storage_name()?.strip_prefix(OWNED_LIFETIME_PREFIX)
+    }
+
     /// Maps logical data and its journal to the exact original relation.
     pub fn owned_effect_relation_name(&self) -> Option<&str> {
         let name = self.owned_storage_name()?;

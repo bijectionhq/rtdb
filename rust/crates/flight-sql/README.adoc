@@ -517,6 +517,10 @@ The placed witness expires by that time, and range encoding refuses a page whose
 Live full-key count uses the same frozen root and held present.
 For a nonempty lifetime count, bounded rank probes on that root find the first valid instant where its cardinality decreases.
 The count's metadata and original witness include this exclusive cutoff.
+The private lifetime declaration stores the immutable duration and an ordered monotone floor of creation times already expired.
+Native writes advance that floor together with accepted data. Live and archived reads require the exact floor format and declaration.
+An existing lifetime marker without the floor requires a reset.
+This floor describes expiry and does not certify physical collection or a replay-present sweep boundary.
 Leading-key, historical, and world ranges and historical or world counts remain unavailable for these relations.
 Other read coordinates and paths refuse this declaration.
 
