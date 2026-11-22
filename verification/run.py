@@ -3781,11 +3781,11 @@ def verify_durable_trie_retirement(args, source):
         "early-release": (collector, "if !deferred {\n                let results = stream::iter(trie_files)",
                           "if true {\n                let results = stream::iter(trie_files)",
                           "a hosted file cannot be released before its receipt"),
-        "abandon-partial-release": (journal, ".buffer_unordered(release.parallelism).try_collect::<()>().await?;",
-                                    ".buffer_unordered(release.parallelism).try_collect::<()>().await.ok();",
+        "abandon-partial-release": (journal, "release.queue(store, &self.receipt, self.receipt_bytes(installed)).await?;",
+                                    "let _ = release.queue(store, &self.receipt, self.receipt_bytes(installed)).await;",
                                     "a failed hosted release keeps the file plan durable"),
-        "release-metadata-first": (journal, "[ReleasePhase::Artefacts, ReleasePhase::Data, ReleasePhase::Metadata]",
-                                   "[ReleasePhase::Metadata, ReleasePhase::Artefacts, ReleasePhase::Data]",
+        "release-metadata-first": ("rust/crates/format/src/trie_retirement.rs", 'Some("meta") => 2,',
+                                   'Some("meta") => 0,',
                                    "artefact and data releases precede metadata"),
     }
     for name, (relative, before, after, failure) in controls.items():
@@ -5311,6 +5311,7 @@ def main():
         "rust/crates/index/tests/catalogs.rs",
         "rust/crates/maintenance/src/gc.rs",
         "rust/crates/maintenance/src/retirement_intent.rs",
+        "rust/crates/format/src/trie_retirement.rs",
         "rust/crates/maintenance/tests/gc.rs",
         "rust/crates/index/src/partition.rs",
         "rust/crates/index/src/snapshot.rs",

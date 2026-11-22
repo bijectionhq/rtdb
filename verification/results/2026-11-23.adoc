@@ -57,3 +57,18 @@ Exact commands and output are under transaction-catalog-hold-pzn3x9vi/ in the ev
 The fixture exercises production transaction resolution, query capture and the local directory lock protocol.
 It uses a row in the transaction overlay and no remote provider work.
 Shared admission on stores without a catalog ledger, scheduling across real elections, and transaction-cursor cancellation while a provider call drains remain open.
+
+== W1 · Resuming a pending local retirement
+
+The local collector fixture now reopens the collector while the earlier filesystem reader ticket is still held.
+The successor retains both files and the one pending intent.
+After the ticket is released, the same collector removes both files and clears the intent without another removal publication.
+Admission at the earlier cut is then refused by the persisted floor.
+
+The retirement replay's failure-propagation control now targets the collector's call to the deferred release adapter.
+Its ordering control now targets the release ranking function used by the local and hosted adapters.
+All seven controls were rejected at their declared assertions.
+The ordering control tests the shared function with the deterministic fixture's store.
+Hosted provider settlement remains a separate check.
+
+The complete maintenance suite and the retirement mutation commands and outputs are retained under retirement-native-controls-tc3pkp0w/ in the evidence directory above.

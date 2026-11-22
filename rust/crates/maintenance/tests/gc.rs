@@ -337,8 +337,15 @@ async fn local_trie_collection_resumes_an_installed_batch_after_the_last_reader_
     assert_eq!(writer.list(Some(&pending)).await.unwrap().len(), 1);
     for key in [&data, &metadata] { assert!(reader.get(key).await.is_ok()); }
 
+    let successor = collect(open());
+    successor.collect_as_of(Timestamp(100), &cancellation).await.unwrap();
+    assert_eq!(writer.list(Some(&pending)).await.unwrap().len(), 1);
+    assert_eq!(writer.list(Some(&installed)).await.unwrap().len(), 1);
+    assert_eq!(publisher.requests.lock().unwrap().len(), 1);
+    for key in [&data, &metadata] { assert!(reader.get(key).await.is_ok()); }
+
     drop(hold);
-    collect(open()).collect_as_of(Timestamp(100), &cancellation).await.unwrap();
+    successor.collect_as_of(Timestamp(100), &cancellation).await.unwrap();
     assert_eq!(*publisher.requests.lock().unwrap(), [vec![obsolete]]);
     assert!(writer.list(Some(&pending)).await.unwrap().is_empty());
     for key in [&data, &metadata] {
