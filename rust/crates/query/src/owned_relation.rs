@@ -339,7 +339,7 @@ pub async fn read_owned_change_entry(
     let id = EntityId::Integer(revision);
     let memory = Arc::clone(&context.memory);
     let journal = relation.change_journal(owner)?;
-    let Some(mut cursor) = open_owned_table_point(context, journal, id.iid(), Some(&id), None, Some(&["entry", "through_events"])).await? else {
+    let Some(mut cursor) = open_owned_table_point(context, journal, id.iid(), Some(&id), None, Some(&["entry", "through_events"]), false).await? else {
         return Err(change_feed_uncovered());
     };
     let mut entry = None;
