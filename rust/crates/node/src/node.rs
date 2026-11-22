@@ -1,5 +1,6 @@
 mod historical_owned_read;
 mod hosted_control;
+mod hosted_observation;
 mod owned_changes;
 mod owned_identities;
 mod owned_unique;

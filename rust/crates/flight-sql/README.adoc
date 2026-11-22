@@ -509,6 +509,14 @@ The request ends with the common check-only hosted ownership groups.
 The Root head, local writes, clocks, terminal registrations and immutable attempt markers share one transaction key in the commit reply.
 The placed archive owner retires the exact dropped pins after the ordered result.
 
+=== Polling hosted held dependencies
+
+`rtdb.owned.ObserveHeldHosted.v1` takes a live 16-byte held handle, the usual nonempty owned witness prefix, an exclusive signed 64-bit big-endian microsecond deadline, and a nonempty CommitHosted control group stream containing only explicit check-only entries.
+All whole-relation witnesses must belong to the same original handle.
+The action uses the existing placed hosted-control caller and allowlist. It compares fact witness touch frontiers and exact hosted control keys on one attached current snapshot. An unrelated control key does not invalidate coverage. Original control expectations and purge standing are checked before returning coverage.
+The response is one zero byte if a dependency was touched, or a signed 64-bit big-endian system microsecond through which the original dependencies are covered.
+The action submits no transaction and returns no fact or control rows. Expired, detached, fixed-valid or uncovered evidence is refused.
+
 === Reading a merged held change feed
 
 `rtdb.owned.ReadHeldMergedChanges.v1` takes the 16-byte held handle, an exclusive signed Int64 ordered system time in big-endian microseconds, a big-endian unsigned 16-bit commit limit, and a big-endian unsigned 16-bit relation count followed by that many relation prefixes.
