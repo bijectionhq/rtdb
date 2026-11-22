@@ -178,6 +178,10 @@ impl OwnedSchema {
                 .sum::<usize>()
     }
 
+    pub fn column_type(&self, name: &str) -> Option<ScalarType> {
+        self.0.fields.iter().find(|field| field.name == name).map(|field| field.kind.scalar())
+    }
+
     pub fn validate_row(&self, row: &StructFields<Value>) -> Result<()> {
         for field in &self.0.fields {
             let accepts = match row.get(field.name.as_str()) {
