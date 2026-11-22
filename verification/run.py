@@ -2685,6 +2685,18 @@ TLA_CASES = (
     ("ReadCurrencyAnchor", "read-currency-anchor-concurrent-progress-witness",
      ("INVARIANT AnchorCoversPrefix", "INVARIANT NeverConfirmsWhileAnotherObservationIsPending"),
      "NeverConfirmsWhileAnotherObservationIsPending"),
+    ("CollectorTurnover", "collector-turnover-reuse-observation",
+     ('Mutation = "none"\nINVARIANTS WaitsForOwnObservation RetainsAdmittedIO',
+      'Mutation = "reuse_observation"\nINVARIANT WaitsForOwnObservation'), "WaitsForOwnObservation"),
+    ("CollectorTurnover", "collector-turnover-reader-retention",
+     ('Mutation = "none"\nINVARIANTS WaitsForOwnObservation RetainsAdmittedIO',
+      'Mutation = "reuse_observation"\nINVARIANT RetainsAdmittedIO'), "RetainsAdmittedIO"),
+    ("CollectorTurnover", "collector-turnover-restart-window",
+     ('Mutation = "none"', 'Mutation = "restart_window"'), "temporal:ExpiryProgress"),
+    ("CollectorTurnover", "collector-turnover", None, None),
+    ("CollectorTurnover", "collector-turnover-reclaim-witness",
+     ("INVARIANTS WaitsForOwnObservation RetainsAdmittedIO",
+      "INVARIANT NeverReclaimsWithChangedClockOrigin"), "NeverReclaimsWithChangedClockOrigin"),
     ("ResidenceComposition", "residence-composition", None, None),
     ("ResidenceComposition", "residence-composition-admit-below-floor",
      ('Mutation = "none"\nINVARIANT Safe', 'Mutation = "admit_below_floor"\nINVARIANT RetainedCutsReadable'), "RetainedCutsReadable"),
@@ -3560,6 +3572,30 @@ def verify_checkpoint_table_manifest_replay(args, source):
     print("rust-table-manifest: both replays passed and three manifest controls failed")
 
 
+def verify_retained_repair(args, source):
+    env = os.environ | {
+        "CARGO_TARGET_DIR": os.environ.get("CARGO_TARGET_DIR", str(ROOT / "target")),
+        "CARGO_PROFILE_TEST_DEBUG": "0",
+    }
+    test = "an_installed_repair_base_keeps_older_targets_and_offloaded_replay_through_collection"
+    command = ["cargo", "test", "--locked", "-p", "rtdb-node", "--test", "native", test, "--", "--exact"]
+    baseline = run_case(command, source / "rust", args.evidence, "rust-retained-repair-baseline", env)
+    if baseline.returncode or f"{test} ... ok" not in baseline.stdout or "1 passed; 0 failed" not in baseline.stdout:
+        raise ValueError("the retained repair replay did not pass")
+    guard = source / "rust/crates/replication/src/repair.rs"
+    original = guard.read_bytes()
+    try:
+        replace_once(guard, "if !repair_decision::matches_retained_boundary(retained_boundary, after.0) {",
+                     "if false && !repair_decision::matches_retained_boundary(retained_boundary, after.0) {")
+        weakened = run_case(command, source / "rust", args.evidence, "rust-retained-repair-ignore-boundary", env)
+    finally:
+        guard.write_bytes(original)
+    if (weakened.returncode != 101 or f"{test} ... FAILED" not in weakened.stdout
+        or "a retained base must bind the boundary of the detached export" not in weakened.stdout):
+        raise ValueError("the retained repair replay accepted the weakened boundary check")
+    print("rust-retained-repair: replay passed and bypassing the boundary check failed")
+
+
 def verify_checkpoint_replay_closure(args, source):
     env = os.environ | {
         "CARGO_TARGET_DIR": os.environ.get("CARGO_TARGET_DIR", str(ROOT / "target")),
@@ -3769,11 +3805,11 @@ def verify_durable_trie_retirement(args, source):
         "early-release": (collector, "if !deferred {\n                let results = stream::iter(trie_files)",
                           "if true {\n                let results = stream::iter(trie_files)",
                           "a hosted file cannot be released before its receipt"),
-        "abandon-partial-release": (journal, ".buffer_unordered(release.parallelism).try_collect::<()>().await?;",
-                                    ".buffer_unordered(release.parallelism).try_collect::<()>().await.ok();",
+        "abandon-partial-release": (journal, "release.queue(store, &self.receipt, self.receipt_bytes(installed)).await?;",
+                                    "let _ = release.queue(store, &self.receipt, self.receipt_bytes(installed)).await;",
                                     "a failed hosted release keeps the file plan durable"),
-        "release-metadata-first": (journal, "[ReleasePhase::Artefacts, ReleasePhase::Data, ReleasePhase::Metadata]",
-                                   "[ReleasePhase::Metadata, ReleasePhase::Artefacts, ReleasePhase::Data]",
+        "release-metadata-first": ("rust/crates/format/src/trie_retirement.rs", 'Some("meta") => 2,',
+                                   'Some("meta") => 0,',
                                    "artefact and data releases precede metadata"),
     }
     for name, (relative, before, after, failure) in controls.items():
@@ -4282,6 +4318,77 @@ def verify_multi_trim_admission(args, source):
     finally:
         holds.write_bytes(original)
     print(f"{label}: directory floor enforced before physical trim, missing check rejected")
+
+
+def verify_native_current_catalog(args, source):
+    env = os.environ | {
+        "CARGO_TARGET_DIR": os.environ.get("CARGO_TARGET_DIR", str(ROOT / "target")),
+        "CARGO_PROFILE_TEST_DEBUG": "0",
+    }
+    test = "a_replicated_query_without_a_current_catalog_lease_is_refused_before_evaluation"
+    command = ["cargo", "test", "--locked", "-p", "rtdb-node", "--test", "native", test, "--", "--exact"]
+    baseline = run_case(command, source / "rust", args.evidence, "rust-current-catalog-admission", env)
+    if baseline.returncode or f"{test} ... ok" not in baseline.stdout:
+        raise ValueError("the replicated query must refuse a snapshot without a current catalog lease")
+    path = source / "rust/crates/node/src/node.rs"
+    original = path.read_bytes()
+    try:
+        replace_once(path, "        crate::read_currency::require_current(database, lease.as_deref())?;\n", "")
+        control = run_case(command, source / "rust", args.evidence, "rust-current-catalog-admission-without-check", env)
+    finally:
+        path.write_bytes(original)
+    if (control.returncode != 101 or f"{test} ... FAILED" not in control.stdout
+        or "a replicated query exposed a snapshot without a current lease" not in control.stdout):
+        raise ValueError("the admission replay did not catch removal of the currency gate")
+    print("rust-current-catalog-admission: baseline passed and the omitted gate was rejected")
+
+
+def verify_native_collector_turnover(args, source):
+    env = os.environ | {
+        "CARGO_TARGET_DIR": os.environ.get("CARGO_TARGET_DIR", str(ROOT / "target")),
+        "CARGO_PROFILE_TEST_DEBUG": "0",
+    }
+    test = "a_replacement_collector_waits_a_whole_lease_on_its_own_clock"
+    command = ["cargo", "test", "--locked", "-p", "rtdb-maintenance", "--test", "gc", test, "--", "--exact"]
+    baseline = run_case(command, source / "rust", args.evidence, "rust-collector-turnover", env)
+    if baseline.returncode or f"{test} ... ok" not in baseline.stdout:
+        raise ValueError("the replacement collector must wait a full reader lease and then reclaim")
+    path = source / "rust/crates/maintenance/src/gc.rs"
+    original = path.read_bytes()
+    try:
+        replace_once(path, ".or_insert(now);", ".and_modify(|first| *first = now).or_insert(now);")
+        control = run_case(command, source / "rust", args.evidence, "rust-collector-turnover-restart-window", env)
+    finally:
+        path.write_bytes(original)
+    if (control.returncode != 101 or f"{test} ... FAILED" not in control.stdout
+        or "the replacement collector must reclaim at the elapsed lease boundary" not in control.stdout):
+        raise ValueError("the collection replay did not catch a lease window restarted at every observation")
+    print("rust-collector-turnover: successor waited a full lease, and restarting the window was rejected")
+
+
+def verify_native_transaction_catalog_hold(args, source):
+    env = os.environ | {
+        "CARGO_TARGET_DIR": os.environ.get("CARGO_TARGET_DIR", str(ROOT / "target")),
+        "CARGO_PROFILE_TEST_DEBUG": "0",
+    }
+    test = "resolver::tests::a_transaction_cursor_retains_its_catalog_until_dropped"
+    command = ["cargo", "test", "--locked", "-p", "rtdb-tx", "--lib", test, "--", "--exact"]
+    baseline = run_case(command, source / "rust", args.evidence, "rust-transaction-catalog-hold", env)
+    if baseline.returncode or f"{test} ... ok" not in baseline.stdout:
+        raise ValueError("a transaction cursor must keep its catalog until drop")
+
+    path = source / "rust/crates/index/src/snapshot.rs"
+    original = path.read_bytes()
+    try:
+        marker = "        for (table, segment) in segments { next.layered"
+        replace_once(path, marker, "        next.catalog_read = None;\n" + marker)
+        control = run_case(command, source / "rust", args.evidence, "rust-transaction-cursor-without-hold", env)
+    finally:
+        path.write_bytes(original)
+    if (control.returncode != 101 or f"{test} ... FAILED" not in control.stdout
+        or "the transaction cursor must retain its catalog after resolution" not in control.stdout):
+        raise ValueError("the transaction replay did not catch loss of the catalog hold in the transaction overlay")
+    print("rust-transaction-catalog-hold: the active transaction and its cursor held the floor, and drop unblocked it")
 
 
 def verify_native_residence_trace(args, source, scratch):
@@ -5228,8 +5335,10 @@ def main():
         "rust/crates/index/tests/catalogs.rs",
         "rust/crates/maintenance/src/gc.rs",
         "rust/crates/maintenance/src/retirement_intent.rs",
+        "rust/crates/format/src/trie_retirement.rs",
         "rust/crates/maintenance/tests/gc.rs",
         "rust/crates/index/src/partition.rs",
+        "rust/crates/index/src/snapshot.rs",
         "rust/crates/query/src/cursor.rs",
         "rust/crates/query/src/fragment.rs",
         "rust/crates/query/src/scan.rs",
@@ -5332,6 +5441,7 @@ def main():
             replay_rank_witness(args, directory)
             replay_rust_trace(args)
             verify_checkpoint_replay(args, source)
+            verify_retained_repair(args, source)
             verify_published_checkpoint_replay(args, source)
             verify_checkpoint_table_manifest_replay(args, source)
             verify_checkpoint_replay_closure(args, source)
@@ -5348,6 +5458,9 @@ def main():
             verify_native_reference_read(args, source)
             verify_native_reference_disposal(args, source)
             verify_native_residence_trace(args, source, directory)
+            verify_native_current_catalog(args, source)
+            verify_native_collector_turnover(args, source)
+            verify_native_transaction_catalog_hold(args, source)
             verify_native_exact_marker(args, source)
             verify_compaction_publication_versions(args, source)
             verify_replay_prefix(args, source)

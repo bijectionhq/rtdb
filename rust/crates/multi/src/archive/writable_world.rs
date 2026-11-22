@@ -568,6 +568,7 @@ pub struct WorldPoint {
 pub struct WorldFact {
     row: StructFields<Value>,
     revision: Timestamp,
+    lifetime: Option<Interval>,
     _reservation: Arc<MemoryReservation>,
 }
 
@@ -585,6 +586,7 @@ fn decode_point(
     batches: Vec<OwnedBatch>,
     id: &EntityId,
     memory: &Arc<MemoryBudget>,
+    lifetime: Option<i64>,
 ) -> Result<Option<WorldFact>> {
     let mut found = None;
     for batch in batches {
@@ -594,13 +596,18 @@ fn decode_point(
                 return Err(OwnedWorld::unavailable());
             }
             let revision = rtdb_query::owned_row_revision(batch, row, id, memory)?;
+            let lifetime = lifetime.map(|duration| {
+                let (created, expires) = rtdb_query::owned_row_lifetime(batch, row, revision, duration)?;
+                Interval::new(created, expires)
+            }).transpose()?;
             let columns = || {
                 batch
                     .schema_ref()
                     .fields()
                     .iter()
                     .zip(batch.columns())
-                    .filter(|(field, _)| field.name() != "_system_from")
+                    .filter(|(field, _)| field.name() != "_system_from"
+                        && !(lifetime.is_some() && matches!(field.name().as_str(), "_valid_from" | "_valid_to")))
             };
             let charge = columns().try_fold(4096usize, |bound, (field, column)| {
                 bound
@@ -625,6 +632,7 @@ fn decode_point(
             found = Some(WorldFact {
                 row: fields,
                 revision,
+                lifetime,
                 _reservation: reservation,
             });
         }
@@ -655,12 +663,12 @@ impl OpenWorld {
         observed: bool,
     ) -> Result<(Option<Option<WorldFact>>, Option<OwnedWorldWitness>)> {
         let read = self.snapshot.read_world_shadow(self.record.id, relation, id, valid_at, observed).await?;
-        let Some(fact) = decode_point(read.row.into_iter().collect(), id, memory)? else {
+        let Some(fact) = decode_point(read.row.into_iter().collect(), id, memory, None)? else {
             return Ok((None, read.witness));
         };
         let visible = match WorldShadow::from_record(fact.row)? {
             WorldShadow::Deleted => None,
-            WorldShadow::Present(row) => Some(WorldFact { row, revision: fact.revision, _reservation: fact._reservation }),
+            WorldShadow::Present(row) => Some(WorldFact { row, revision: fact.revision, lifetime: None, _reservation: fact._reservation }),
         };
         Ok((Some(visible), read.witness))
     }

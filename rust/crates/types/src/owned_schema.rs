@@ -4,6 +4,50 @@ use serde::{Deserialize, Serialize};
 
 use crate::{Anomaly, LogicalType, Result, ScalarType, StructFields, TimeUnit, Value};
 
+/// Durable expiry frontier for one immutable creation-lifetime relation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct OwnedLifetimeFloor {
+    pub duration: i64,
+    pub expired_created_through: crate::Timestamp,
+    pub swept_present_through: crate::Timestamp,
+}
+
+impl OwnedLifetimeFloor {
+    pub fn at(duration: i64, present: crate::Timestamp) -> Result<Self> {
+        if !(1..=3_155_760_000_000_000).contains(&duration) {
+            return Err(invalid("Invalid owned creation lifetime"));
+        }
+        Ok(Self { duration, expired_created_through: crate::Timestamp(present.0.saturating_sub(duration)), swept_present_through: crate::Timestamp::MIN })
+    }
+
+    pub fn record(self, relation: &crate::OwnedRelation) -> StructFields<Value> {
+        StructFields::from([
+            ("_id".into(), Value::Utf8(relation.name().into())),
+            ("duration".into(), Value::I64(self.duration)),
+            ("expired_created_through".into(), Value::I64(self.expired_created_through.0)),
+            ("swept_present_through".into(), Value::I64(self.swept_present_through.0)),
+        ])
+    }
+
+    pub fn decode(record: &StructFields<Value>, relation: &crate::OwnedRelation) -> Result<Self> {
+        let (Some(Value::Utf8(id)), Some(Value::I64(duration)), Some(Value::I64(floor)), Some(Value::I64(swept))) =
+            (record.get("_id"), record.get("duration"), record.get("expired_created_through"), record.get("swept_present_through"))
+        else { return Err(invalid("Owned creation lifetime has no exact expiry floor")); };
+        if record.len() != 4 || id != relation.name() || !(1..=3_155_760_000_000_000).contains(duration) {
+            return Err(invalid("Invalid owned creation-lifetime floor"));
+        }
+        Ok(Self { duration: *duration, expired_created_through: crate::Timestamp(*floor), swept_present_through: crate::Timestamp(*swept) })
+    }
+
+    pub fn check(self, duration: i64, present: crate::Timestamp) -> Result<()> {
+        let allowed = Self::at(duration, present)?;
+        if self.duration != duration || self.expired_created_through > allowed.expired_created_through || self.swept_present_through > present {
+            return Err(invalid("Owned creation-lifetime floor differs from the declared policy and present"));
+        }
+        Ok(())
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct OwnedSchema(OwnedSchemaWire);
 
@@ -251,6 +295,29 @@ impl OwnedSchema {
         Ok(())
     }
 
+    /// Validate an interval already accepted by the original held installation.
+    /// The destination ordering time does not extend the original lifetime.
+    pub fn require_replayed_period(
+        &self, valid: crate::Interval, source: crate::Timestamp, operation: crate::EventOp,
+    ) -> Result<()> {
+        use crate::{EventOp, Timestamp};
+        let from = valid.lower();
+        let to = valid.upper();
+        let accepted = !valid.is_empty() && match (self.0.validity, self.0.lifetime_micros, operation) {
+            (_, _, EventOp::Erase) => false,
+            (Validity::Explicit, _, _) => true,
+            (Validity::BoundedPeriod, _, _) => from > Timestamp::MIN && to < Timestamp::MAX,
+            (Validity::Acceptance, None, _) => from > Timestamp::MIN && from <= source && to == Timestamp::MAX,
+            (Validity::Acceptance, Some(duration), EventOp::Put) => from.0 > 0 && from <= source
+                && from.0.checked_add(duration) == Some(to.0),
+            (Validity::Acceptance, Some(_), EventOp::Delete) => false,
+        };
+        if !accepted {
+            return Err(Anomaly::incorrect("rtdb.owned/restore-validity", "The copied fact interval disagrees with its original declaration"));
+        }
+        Ok(())
+    }
+
     fn field(&self, name: &str) -> Option<&Field> {
         self.0.fields.iter().find(|field| field.name == name)
     }
@@ -293,6 +360,18 @@ fn nonconforming(field: &str) -> Anomaly {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn replay_keeps_the_first_creation_and_its_original_expiry() -> Result<()> {
+        use crate::{EventOp, Interval, Timestamp};
+        let schema = OwnedSchema::from_json(br#"{"fields":[],"validity":"acceptance","lifetime_micros":10}"#)?;
+        let original = Interval::from_micros(20, 30)?;
+        assert!(schema.require_replayed_period(original, Timestamp(40), EventOp::Put).is_ok());
+        assert!(schema.require_replayed_period(Interval::from_micros(40, 50)?, Timestamp(20), EventOp::Put).is_err());
+        assert!(schema.require_replayed_period(Interval::from_micros(20, 50)?, Timestamp(40), EventOp::Put).is_err());
+        assert!(schema.require_replayed_period(original, Timestamp(40), EventOp::Delete).is_err());
+        Ok(())
+    }
 
     #[test]
     fn declarations_are_closed_over_names_and_types() {

@@ -1801,6 +1801,8 @@ contract LocalCheckpointRepair {
         -- The store preserves block catalogs, per-table block files and offloaded replica payloads at and beyond that block across restarts.
         -- An operator advances protection by installing a newer verified base in the same replica journal.
         -- The collector synchronizes the replacement anchor before removing files covered by the previous anchor.
+        -- A repair can reopen the persisted anchor under the original journal lock and select it as its base.
+        -- The detached checkpoint must match the anchor's block, digest and replica boundary.
 
     @invariant ReplayThroughSelectedCut
         -- The rebuild copies the base primary inventory and replays admitted resolved transactions through the exact target boundary.

@@ -5,7 +5,7 @@ mod owned_changes;
 mod owned_identities;
 mod owned_unique;
 pub use owned_identities::OwnedIdentityPage;
-pub use owned_changes::{OwnedChangeCommit, OwnedMergedChanges, OwnedRelationChanges, OWNED_MERGED_CHANGE_RELATIONS};
+pub use owned_changes::{ExpiryCandidate, ExpiryCandidatePage, OwnedChangeCommit, OwnedMergedChanges, OwnedRelationChanges, OWNED_MERGED_CHANGE_RELATIONS};
 
 use rtdb_types::StructFields;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
@@ -374,6 +374,7 @@ impl Node {
             let snapshot = rtdb_query::retain_catalog_snapshot(snapshot.with_system_time_cap(cap)?, &database.storage).await?;
             snapshots.insert(name, DatabaseSnapshot { partitions: vec![snapshot], storage: Arc::clone(&database.storage) });
         }
+        crate::read_currency::require_current(database, lease.as_deref())?;
         let mut catalog = CatalogSnapshot::new(database, snapshots, false)?.with_runtime(Arc::new(crate::runtime::NodeCatalogRuntime::new(self.clone(), cancellation.clone())))
             .with_ordered_indexes(Arc::new(crate::ordered_index::Inventory))
             .with_fragmenter(self.scan_fragmenter.clone(), fragment_residence);
@@ -413,6 +414,7 @@ impl Node {
         let lease = self.catalog_read_lease(&database).await?;
         let snapshot = database.partition.open_snapshot(Some(fragment.basis.system_time));
         let snapshot = rtdb_query::retain_catalog_snapshot(snapshot, &database.storage).await?;
+        crate::read_currency::require_current(database.name(), lease.as_deref())?;
         let snapshots = BTreeMap::from([(database.name().to_owned(), DatabaseSnapshot { partitions: vec![snapshot], storage: Arc::clone(&database.storage) })]);
         let mut catalog = CatalogSnapshot::new(database.name(), snapshots, false)?;
         if let Some(lease) = &lease { catalog = catalog.with_read_lease(Arc::clone(lease)); }
@@ -1233,12 +1235,21 @@ impl OwnedReadSession {
         let guard = self.relation_release_guard_for([relation], true)?;
         let context = Arc::clone(&self.context).with_owned_read_guard(guard);
         context.check_cancelled()?;
-        rtdb_query::open_owned_point(context, &self.owner, relation, id, valid, None).await
+        match (lifetime, valid) {
+            (Some(_), Some(valid)) => rtdb_query::open_owned_lifetime_point(context, &self.owner, relation, id, valid).await,
+            _ => rtdb_query::open_owned_point(context, &self.owner, relation, id, valid, None).await,
+        }
     }
 
     /// The declaration is immutable and present on the same held cut as
     /// its private relation fence.
     pub async fn lifetime_point_duration(&self, relation: &rtdb_types::OwnedRelation) -> Result<Option<i64>> {
+        Ok(self.lifetime_point_policy(relation).await?.map(|floor| floor.duration))
+    }
+
+    pub async fn lifetime_point_policy(
+        &self, relation: &rtdb_types::OwnedRelation,
+    ) -> Result<Option<rtdb_types::OwnedLifetimeFloor>> {
         self.admit_access().await?;
         let database = self.retained_root_context().catalog.database(&self.database)?;
         let [snapshot] = database.partitions.as_slice() else { return Err(lifetime_read_unavailable()); };
@@ -1253,7 +1264,63 @@ impl OwnedReadSession {
         let schema = rtdb_query::read_owned_relation_schema(Arc::clone(&self.context), &self.owner, relation)
             .await?.and_then(|(schema, _)| schema.lifetime_micros())
             .ok_or_else(lifetime_read_unavailable)?;
-        Ok(Some(schema))
+        let floor = rtdb_query::read_owned_lifetime_floor(Arc::clone(&self.context), &self.owner, relation).await?;
+        floor.check(schema, self.present.system_time)?;
+        Ok(Some(floor))
+    }
+
+    /// Nominate one exact, already expired identity from a placed live hold.
+    /// This authenticates discovery only. Replay retention authorizes removal.
+    pub async fn nominate_expired_identity(
+        &self, relation: &rtdb_types::OwnedRelation, id: &rtdb_types::EntityId,
+        scope: rtdb_types::PlacedAttemptScope,
+    ) -> Result<(String, Timestamp, Timestamp)> {
+        use sha2::{Digest, Sha256};
+        self.admit_read().await?;
+        if self.witness_scope != Some(scope) || !relation.is_root_data() || self.node.now() >= self.witness_until {
+            return Err(lifetime_read_unavailable());
+        }
+        let database = self.node.attached_database(&self.database, Some(&self.attachment))?;
+        let AwaitAuthority::Live { codec, .. } = &database.await_authority else {
+            return Err(lifetime_read_unavailable());
+        };
+        if codec.scope() != scope { return Err(lifetime_read_unavailable()); }
+
+        let floor = self.lifetime_point_policy(relation).await?.ok_or_else(lifetime_read_unavailable)?;
+        let guard = self.relation_release_guard_for([relation], true)?;
+        let context = Arc::clone(&self.context).with_owned_read_guard(guard);
+        let mut cursor = rtdb_query::open_owned_point(
+            Arc::clone(&context), &self.owner, relation, id,
+            Some(rtdb_types::Interval::ALL), Some(&["_id", "_system_from"]),
+        ).await?.ok_or_else(lifetime_read_unavailable)?;
+        let mut created = None;
+        while let Some(batch) = cursor.next_batch().await? {
+            for row in 0..batch.batch().num_rows() {
+                if created.is_some() { return Err(lifetime_read_unavailable()); }
+                created = Some(rtdb_query::owned_row_revision(batch.batch(), row, id, &context.memory)?);
+            }
+        }
+        let created = created.ok_or_else(lifetime_read_unavailable)?;
+        let expiry = Timestamp(created.0.checked_add(floor.duration).ok_or_else(lifetime_read_unavailable)?);
+        if expiry > self.present.system_time { return Err(lifetime_read_unavailable()); }
+
+        let handle = id.handle_bytes();
+        let mut digest = Sha256::new();
+        digest.update(b"rtdb.expiry-nomination.v1\0");
+        digest.update(scope.encode());
+        for input in [self.owner.as_bytes(), relation.name().as_bytes(), handle.as_slice()] {
+            digest.update((input.len() as u64).to_be_bytes());
+            digest.update(input);
+        }
+        let mut nomination = Vec::with_capacity(73);
+        nomination.push(0xe1);
+        nomination.extend_from_slice(&digest.finalize());
+        for coordinate in [created.0, expiry.0, self.present.tx_id.0, self.present.system_time.0, self.witness_until.0] {
+            nomination.extend_from_slice(&coordinate.to_be_bytes());
+        }
+        context.check_cancelled()?;
+        if self.node.now() >= self.witness_until { return Err(lifetime_read_unavailable()); }
+        Ok((format!("rtdblife1.{}", codec.seal(&nomination)?), created, expiry))
     }
 
     pub fn check_live_point_relation(&self, relation: &rtdb_types::OwnedRelation) -> Result<()> {
@@ -1483,15 +1550,15 @@ impl OwnedReadSession {
                 let _identity = context.memory.reserve(size.saturating_add(4096))?;
                 let id = read_value(field, ids, row)?.entity_id()?;
                 let mut point = rtdb_query::open_owned_point(
-                    Arc::clone(&context), &self.owner, relation, &id, Some(valid), Some(&["_id", "_system_from"]),
+                    Arc::clone(&context), &self.owner, relation, &id, Some(valid), Some(&["_id", "_system_from", "_valid_from", "_valid_to"]),
                 ).await?.ok_or_else(lifetime_read_unavailable)?;
                 let mut until = None;
                 while let Some(part) = point.next_batch().await? {
                     for index in 0..part.batch().num_rows() {
                         if until.is_some() { return Err(lifetime_read_unavailable()); }
-                        let created = rtdb_query::owned_row_revision(part.batch(), index, &id, &context.memory)?;
-                        let cutoff = Timestamp(created.0.checked_add(duration).ok_or_else(lifetime_read_unavailable)?);
-                        if created > present || cutoff <= present { return Err(lifetime_read_unavailable()); }
+                        let revision = rtdb_query::owned_row_revision(part.batch(), index, &id, &context.memory)?;
+                        let (_, cutoff) = rtdb_query::owned_row_lifetime(part.batch(), index, revision, duration)?;
+                        if revision > present || cutoff <= present { return Err(lifetime_read_unavailable()); }
                         until = Some(cutoff);
                     }
                 }
@@ -1560,8 +1627,17 @@ impl OwnedReadSession {
         request: crate::OwnedCountRequest<'_>,
     ) -> Result<crate::OwnedRangeCount> {
         self.admit_read().await?;
-        let result = crate::ordered_index::owned_count(self.relation_context(relation)?, &self.owner, relation, path, request).await?;
-        self.check_relation(relation)?;
+        let lifetime = self.lifetime_point_duration(relation).await?;
+        let context = if lifetime.is_some() {
+            if request.valid_at != self.present.system_time {
+                return Err(lifetime_read_unavailable());
+            }
+            Arc::clone(&self.context).with_owned_read_guard(self.relation_release_guard_for([relation], true)?)
+        } else {
+            self.relation_context(relation)?
+        };
+        let result = crate::ordered_index::owned_count_at(context, &self.owner, relation, path, request, lifetime).await?;
+        self.check_lifetime_range_release(relation, result.expiry)?;
         Ok(result)
     }
 
@@ -1570,7 +1646,7 @@ impl OwnedReadSession {
         request: crate::OwnedCountRequest<'_>,
     ) -> Result<(crate::OwnedRangeCount, Option<OwnedRangeWitness>)> {
         let counted = self.count_range(relation, path, request).await?;
-        let evidence = self.relation_witness(relation)?;
+        let evidence = self.relation_witness_for(relation, true, counted.expiry)?;
         Ok((counted, evidence))
     }
 
@@ -1834,6 +1910,18 @@ impl NativeSession {
     /// Identifies the placed replica history of this authenticated attachment.
     pub fn placed_history(&self) -> Result<Option<rtdb_types::PlacedAttemptScope>> {
         Ok(self.service.database()?.await_authority.codec().map(|codec| codec.scope()))
+    }
+
+    /// Trusted maintenance entry. The maintenance owner supplies a replay
+    /// floor certified by its retention authority, never a guest coordinate.
+    pub async fn sweep_owned_expired(
+        &mut self, relation: rtdb_types::OwnedRelation, id: rtdb_types::EntityId,
+        created: Timestamp, replay_floor: Timestamp, deadline: Timestamp,
+    ) -> Result<TransactionResult> {
+        self.state.execute_tx(vec![
+            TxOp::OwnedDeadline { until: deadline },
+            TxOp::OwnedSweepExpired { relation, id, created, replay_floor },
+        ], Default::default()).await
     }
 
     pub async fn register_owned_world_checked(

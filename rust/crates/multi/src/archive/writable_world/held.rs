@@ -170,16 +170,20 @@ impl HeldCheckpointWorld {
 
     pub async fn parent_point(&self, relation: &OwnedRelation, id: &EntityId, valid_at: Timestamp) -> Result<WorldPoint> {
         self.check()?;
-        let lifetime = self.open.snapshot.lifetime_point_duration(relation).await?;
+        let policy = self.open.snapshot.lifetime_point_policy(relation).await?;
+        let lifetime = policy.map(|floor| floor.duration);
         let basis = self.parent_basis().system_time;
         if lifetime.is_some() && (self.clock_mode() != WorldClockMode::Retained || valid_at != basis) {
             return Err(OwnedWorld::unavailable());
         }
         let fact = self.archive_point(relation, id, valid_at, lifetime).await?;
-        let until = fact.as_ref().zip(lifetime).map(|(fact, lifetime)| {
-            let expiry = fact.revision.0.checked_add(lifetime).map(Timestamp)
-                .filter(|expiry| fact.revision <= basis && basis < *expiry)
+        let until = fact.as_ref().zip(policy).map(|(fact, policy)| {
+            let validity = fact.lifetime.filter(|valid| fact.revision <= basis && valid.contains(basis))
                 .ok_or_else(OwnedWorld::unavailable)?;
+            if validity.lower() <= policy.expired_created_through {
+                return Err(expired_lifetime());
+            }
+            let expiry = validity.upper();
             if expiry <= self.present().system_time {
                 return Err(expired_lifetime());
             }
@@ -645,7 +649,7 @@ pub(crate) async fn open_held_checkpoint_world(
                                         let batches = read_checkpoint_point_in_context(Arc::clone(&context).with_owned_read_guard(guard), CheckpointPoint {
                                             owner: &owner, relation: &relation, id: &id, valid: Some(valid),
                                         }, lifetime).await?;
-                                        decode_point(batches.unwrap_or_default(), &id, memory)
+                                        decode_point(batches.unwrap_or_default(), &id, memory, lifetime)
                                     };
                                     let response = tokio::select! {
                                         _ = scope.cancelled() => break,

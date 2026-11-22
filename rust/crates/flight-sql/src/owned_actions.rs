@@ -186,6 +186,8 @@ pub(crate) const HELD_OWNED_COUNT_V1: &str = "rtdb.owned.CountHeldRange.v1";
 pub(crate) const HELD_OWNED_COUNT_V2: &str = "rtdb.owned.CountHeldRange.v2";
 pub(crate) const READ_HELD_WORLD_CHANGES_V1: &str = "rtdb.owned.ReadHeldWorldChanges.v1";
 pub(crate) const HELD_OWNED_MERGED_CHANGES_V1: &str = "rtdb.owned.ReadHeldMergedChanges.v1";
+pub(crate) const READ_HELD_EXPIRY_CANDIDATES_V1: &str = "rtdb.owned.ReadHeldExpiryCandidates.v1";
+pub(crate) const NOMINATE_HELD_EXPIRY_V1: &str = "rtdb.owned.NominateHeldExpiry.v1";
 pub(crate) const HELD_OWNED_CHANGES_V2: &str = "rtdb.owned.ReadHeldChanges.v2";
 const READ_IDLE: Duration = Duration::from_secs(60);
 const OWNED_IDENTITY_MORE: &str = "rtdb.owned.identity_more";
@@ -620,8 +622,10 @@ impl Service {
         let mut rows_left = MAX_GROUPED_COMMIT_ROWS;
         let mut writes = vec![TxOp::OwnedDeadline { until: deadline }];
         writes.extend(condition);
-        let _facts = self.decode_owned_commit_groups(call, facts, &mut writes, &mut rows_left, false)?;
         let (controls, _held) = self.decode_hosted_control_groups(call, controls, scope, &mut rows_left, false)?;
+        let replay = rtdb_tx::hosted_replay_controls(controls.iter()).map_err(status)?.is_some();
+        if replay && counted { return Err(invalid("Native replay admits an original effect batch")); }
+        let _facts = self.decode_owned_commit_groups(call, facts, &mut writes, &mut rows_left, replay)?;
         writes.extend(controls.into_iter().map(TxOp::HostedControl));
         self.owned_write_reply_with_witnesses(call, writes, witnesses).await
     }
@@ -1283,8 +1287,13 @@ impl Service {
         let schema = batch.schema();
         let observed = witnessed_schema(call, &held, &relation, &schema, evidence)?;
         let output_schema = observed.as_ref().map_or(schema.as_ref(), |(schema, _)| schema);
-        let reply = self.owned_point_reply(output_schema, Some(&batch), counted.present, counted.valid_at, None)?;
-        held.snapshot.check_relation(&relation).map_err(status)?;
+        let reply = self.owned_point_reply_until(output_schema, Some(&batch),
+            counted.present, counted.valid_at, None, counted.expiry)?;
+        if historical {
+            held.snapshot.check_relation(&relation).map_err(status)?;
+        } else {
+            held.snapshot.check_lifetime_range_release(&relation, counted.expiry).map_err(status)?;
+        }
         Ok(reply)
     }
 
@@ -1477,6 +1486,53 @@ impl Service {
         self.owned_point_reply(&schema, output.as_ref(), present, valid, None)
     }
 
+    pub(crate) async fn held_expiry_candidates_action(&self, call: &Call, body: &[u8]) -> Result<ActionResult, Status> {
+        self.hosted_control_policy(call)?;
+        let scope = self.hosted_control_scope(call).await?;
+        let (handle, request) = body.split_first_chunk::<16>().ok_or_else(|| invalid("Expiry candidates need the original held handle"))?;
+        let held = self.owned_read(call, &Bytes::copy_from_slice(handle))?;
+        let (relation, page) = split_relation(request)?;
+        let (after, rest) = page.split_first_chunk::<8>().ok_or_else(|| invalid("Expiry candidates need an exclusive journal position"))?;
+        let groups: &[u8; 2] = rest.try_into().map_err(|_| invalid("Expiry candidates need one group limit"))?;
+        let page = held.snapshot.expired_candidate_page(
+            &relation, Timestamp(i64::from_be_bytes(*after)), usize::from(u16::from_be_bytes(*groups)), scope,
+        ).await.map_err(status)?;
+        let _charge = call.reserve(4096 + page.candidates.iter().map(|row| row.identity.len() + row.nomination.len() + 64).sum::<usize>())?;
+        let fields = [
+            ("identity", Arc::new(BinaryArray::from_iter_values(page.candidates.iter().map(|row| row.identity.as_slice()))) as ArrayRef),
+            ("nomination", Arc::new(StringArray::from_iter_values(page.candidates.iter().map(|row| row.nomination.as_str()))) as ArrayRef),
+            ("created_micros", Arc::new(Int64Array::from_iter_values(page.candidates.iter().map(|row| row.created.0))) as ArrayRef),
+            ("expiry_micros", Arc::new(Int64Array::from_iter_values(page.candidates.iter().map(|row| row.expiry.0))) as ArrayRef),
+        ];
+        let batch = RecordBatch::try_from_iter(fields).map_err(arrow)?;
+        let mut metadata = batch.schema().metadata().clone();
+        metadata.insert("rtdb.owned.expiry_candidate_through".into(), page.through.0.to_string());
+        metadata.insert("rtdb.owned.expiry_diagnostic_cutoff".into(), page.diagnostic_cutoff.0.to_string());
+        let schema = batch.schema().as_ref().clone().with_metadata(metadata);
+        let present = held.snapshot.present().system_time;
+        let reply = self.owned_point_reply(&schema, Some(&batch), present, present, None)?;
+        held.snapshot.check_live_change_relations(std::slice::from_ref(&relation)).map_err(status)?;
+        Ok(reply)
+    }
+
+    pub(crate) async fn nominate_held_expiry_action(&self, call: &Call, body: &[u8]) -> Result<ActionResult, Status> {
+        self.hosted_control_policy(call)?;
+        let scope = self.hosted_control_scope(call).await?;
+        let (handle, request) = body.split_first_chunk::<16>().ok_or_else(|| invalid("Expiry nomination needs the original held handle"))?;
+        let held = self.owned_read(call, &Bytes::copy_from_slice(handle))?;
+        let (relation, id, _, _identity) = point_request(call, request, PointTime::Default)?;
+        let (nomination, created, expiry) = held.snapshot.nominate_expired_identity(&relation, &id, scope).await.map_err(status)?;
+        let batch = RecordBatch::try_from_iter([
+            ("nomination", Arc::new(StringArray::from(vec![nomination])) as ArrayRef),
+            ("created_micros", Arc::new(Int64Array::from(vec![created.0])) as ArrayRef),
+            ("expiry_micros", Arc::new(Int64Array::from(vec![expiry.0])) as ArrayRef),
+        ]).map_err(arrow)?;
+        let present = held.snapshot.present().system_time;
+        let reply = self.owned_point_reply(batch.schema_ref(), Some(&batch), present, present, None)?;
+        held.snapshot.check_live_point_relation(&relation).map_err(status)?;
+        Ok(reply)
+    }
+
     pub(crate) async fn held_owned_changes_action(&self, call: &Call, body: &[u8]) -> Result<ActionResult, Status> {
         if !self.0.config.owned_native_actions { return Err(unsupported()); }
         let (handle, request) = body.split_first_chunk::<16>().ok_or_else(|| invalid("Owned change read has no held handle"))?;
@@ -1493,7 +1549,7 @@ impl Service {
         let page = held.snapshot.changes(&relation, Timestamp(i64::from_be_bytes(*after)), usize::from(u16::from_be_bytes(*limit)))
             .await.map_err(status)?;
         let reply = self.owned_changes_reply(&page, held.snapshot.present().system_time)?;
-        held.snapshot.check_relation(&relation).map_err(status)?;
+        held.snapshot.check_live_change_relations(std::slice::from_ref(&relation)).map_err(status)?;
         Ok(reply)
     }
 
@@ -1510,7 +1566,7 @@ impl Service {
         let page = held.snapshot.merged_changes(&relations, after, limit)
             .await.map_err(status)?;
         let reply = self.owned_merged_changes_reply(&page, held.snapshot.present().system_time)?;
-        held.snapshot.check_relations(&relations).map_err(status)?;
+        held.snapshot.check_live_change_relations(&relations).map_err(status)?;
         Ok(reply)
     }
 
@@ -2333,14 +2389,14 @@ impl Service {
         &self, snapshot: &OwnedReadSession, relation: &OwnedRelation, id: &EntityId, valid: Option<Timestamp>,
     ) -> Result<ActionResult, Status> {
         let present = snapshot.system_time();
-        let lifetime = snapshot.lifetime_point_duration(relation).await.map_err(status)?;
+        let lifetime = snapshot.lifetime_point_policy(relation).await.map_err(status)?;
         let cursor = snapshot.open_point_at(relation, id, valid).await.map_err(status)?;
         let reply = self.finish_owned_point(present, valid.unwrap_or(present), id, cursor, lifetime).await?;
         snapshot.check_live_point_relation(relation).map_err(status)?;
         Ok(reply)
     }
 
-    async fn finish_owned_point(&self, present: Timestamp, valid: Timestamp, id: &EntityId, result: Option<QueryCursor>, lifetime: Option<i64>) -> Result<ActionResult, Status> {
+    async fn finish_owned_point(&self, present: Timestamp, valid: Timestamp, id: &EntityId, result: Option<QueryCursor>, lifetime: Option<rtdb_types::OwnedLifetimeFloor>) -> Result<ActionResult, Status> {
         let Some(mut cursor) = result else {
             return self.owned_point_reply(&Schema::empty(), None, present, valid, None);
         };
@@ -2354,11 +2410,25 @@ impl Service {
         }
         if let Some(batch) = result {
             let revision = rtdb_query::owned_row_revision(batch.batch(), 0, id, self.memory()).map_err(status)?;
-            let until = lifetime.map(|lifetime| revision.0.checked_add(lifetime)
-                .map(Timestamp).filter(|until| revision <= present && present < *until)
-                .ok_or_else(|| Status::failed_precondition("The retained point is outside its creation lifetime"))
-            ).transpose()?;
-            self.owned_point_reply_until(batch.batch().schema_ref(), Some(batch.batch()), present, valid, Some(revision), until)
+            let until = lifetime.map(|lifetime| {
+                let (created, expires) = rtdb_query::owned_row_lifetime(batch.batch(), 0, revision, lifetime.duration).map_err(status)?;
+                if created <= lifetime.expired_created_through || revision > present || present >= expires {
+                    return Err(Status::failed_precondition("The retained point is outside its creation lifetime"));
+                }
+                Ok(expires)
+            }).transpose()?;
+            let projected = if until.is_some() {
+                let fields = batch.batch().schema_ref().fields().iter().enumerate()
+                    .filter(|(_, field)| !matches!(field.name().as_str(), "_valid_from" | "_valid_to"))
+                    .map(|(index, _)| index).collect::<Vec<_>>();
+                Some(batch.batch().project(&fields).map_err(arrow)?)
+            } else { None };
+            let rows = projected.as_ref().unwrap_or_else(|| batch.batch());
+            let reply = self.owned_point_reply_until(rows.schema_ref(), Some(rows), present, valid, Some(revision), until)?;
+            if until.is_some_and(|until| until <= self.0.node.now()) {
+                return Err(Status::failed_precondition("The held point reached its creation lifetime"));
+            }
+            Ok(reply)
         } else {
             let schema = wire::plan_schema(cursor.runtime_schema(), self.memory())?;
             self.owned_point_reply(&schema, None, present, valid, None)

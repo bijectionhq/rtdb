@@ -1409,6 +1409,13 @@ Compiler controls reject forging and raw use of the replica admission witness.
 Each of the two new storage and compaction areas includes production-only and joint contract mutations.
 |Extend coverage from these functions to their effect paths, concurrent publication, reader protection, and ranked pipeline decisions.
 
+|Reader lease and collector turnover
+|Verus checks the interval arithmetic against clock drift and bounded I/O.
+TLC checks that two collector terms with independent clock origins preserve admitted I/O and eventually collect once the successor's lease has elapsed, under weak fairness of collection.
+The native fixture replaces one collector with another sharing the catalog and observes both trie files retained before expiry and reclaimed at expiry.
+link:../../verification/results/2026-11-23.adoc[Collector turnover evidence]
+|Exercise a scheduled term handoff through the node with in-flight readers, establish the provider drain premise and cover staged and deferred releases.
+
 |Hosted catalog admission
 |The same directory CAS coordinates reader registration and an installed retirement floor.
 TLC explores stale reads and writes, opaque captures and writer replacement.

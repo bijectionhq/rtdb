@@ -58,18 +58,24 @@ W1, W2, W4 and W6 can start now and in parallel; W7 runs alongside all of them, 
 Goal: no entitled reader on any node, and no admitted in-flight request, ever loses a file it depends on, whichever path deletes it.
 
 **Already in place:** query cursors and served scan fragments hold bounded leases on monotonic clocks, checked when each provider request is admitted. The trie collector waits a full lease after first observing a trie, and in-process readers are also registered with it. Multi deletes become releases that the cell reaper erases after its grace. Verus area `read_lease` and two conformance replays cover this.
+Query capture, delegated fragments and membership queries refuse unconfirmed or expired leases at admission with the retryable `rtdb.node/catalog-not-current` error.
+The native query fixture also checks that offline admission needs no replica lease.
+The [collector turnover study](tla/CollectorTurnover.tla) checks fresh observation and conditional reclamation in a successor term.
+The corresponding native fixture replaces the trie collector with another clock origin and observes reclamation after the fresh lease interval.
+The local receipt fixture reopens the collector before the earlier filesystem hold drains and observes that the installed retirement remains pending until that hold ends.
+Source and external transaction resolution request a store catalog hold before evaluation.
+The local ledger fixture verifies that the transaction and its cursor retain the hold, then observes the floor advance after cursor drop and a subsequent stale capture refused.
 
 **Start from:** `storage/src/{read_lease,lease_decision,io_region}.rs`, `node/src/{read_currency,database,node}.rs`, `maintenance/src/gc.rs`, `index/src/partition.rs`; models `tla/{LeaseAdmission,ReaderIO,ResidenceReaderRetention}.tla`.
 
 **Open obligations:**
 
-1. Audit every other read path: leader transaction snapshots (registry only, no lease), spill and materialization, export, administrative collection, compactor reset, and ordered-index reads.
+1. Audit every other read path: leader transaction snapshots on stores without a catalog ledger, spill and materialization, export, administrative collection, compactor reset, and ordered-index reads.
 2. Audit every other deletion path against the same contract: block GC, artefact removal and repair, ordered-index storage reaping, and Multi region release, deployment removal and forks.
-3. Leadership turnover: a deposed leader's in-flight snapshots against the new leader's collector.
+3. Leadership turnover: replay a real term handoff with in-flight snapshots and extend receipt resumption to deferred physical deletion in Multi.
 4. Compose the currency, caller admission and provider drain with the collector under the model's clock and I/O premises. The [currency model](tla/ReadCurrencyAnchor.tla) checks competing tip samples, and [Verus](verus/read_currency/proof.rs) proves the production observation and confirmation steps.
 5. Connect the peer study `ResidenceReaderRetention` (generation cutoff vs exact dependencies) to the Multi reaper's actual release records.
-6. LIVE-2: a witness that an expired lease lets reclamation proceed, plus a mutation that blocks it.
-7. Refuse a query at admission, with a retryable `rtdb.node/catalog-not-current`, when its node cannot confirm catalog currency; today it is refused only at its first provider request.
+6. LIVE-2: extend the fresh-selection expiry witness and its progress control to actual term scheduling, renewed residence holds and deferred reaper settlement.
 
 **Done when:** each path above has either a native replay that fails under the matching mutation or a recorded reason it cannot strand a reader.
 

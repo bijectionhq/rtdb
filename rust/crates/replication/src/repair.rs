@@ -9,7 +9,7 @@ use bytes::Bytes;
 use fs2::FileExt;
 use rtdb_columnar::MemoryBudget;
 use rtdb_format::{
-    catalog::{BlockCatalog, CheckpointContents, publication_digest},
+    catalog::{BlockCatalog, CheckpointContents, publication_digest, same_publication_digest},
     envelope::ReplicaBody,
     keys::{CURRENT_STORAGE_VERSION, StorageRoot, block_key},
 };
@@ -22,7 +22,7 @@ use rtdb_storage::{
 use rtdb_types::{Anomaly, AnomalyCategory, BlockIndex, ReplicaPosition, Result, SourcePosition, StorageEpoch, Timestamp, TransactionKey};
 use tokio_util::sync::CancellationToken;
 
-use crate::{BlockDiscovery, BlockStore, PartitionLogs, RecoveredPartition, ReplicaRecord, blocks::matches_catalog_boundary};
+use crate::{BlockDiscovery, BlockStore, PartitionLogs, RecoveredPartition, ReplicaRecord, blocks::matches_catalog_boundary, repair_decision};
 
 const CACHE_BYTES: usize = 32 << 20;
 
@@ -41,6 +41,16 @@ pub struct LocalRepair {
     pub replica_log: PathBuf,
     pub output_parent: PathBuf,
     pub base: RepairCheckpoint,
+    pub through: RepairCheckpoint,
+}
+
+/// Rebuilds from the latest anchor retained by the original local storage root.
+#[derive(Clone, Debug)]
+pub struct RetainedLocalRepair {
+    pub source_storage: PathBuf,
+    pub base_storage: PathBuf,
+    pub replica_log: PathBuf,
+    pub output_parent: PathBuf,
     pub through: RepairCheckpoint,
 }
 
@@ -68,9 +78,7 @@ impl RetainRepairBase {
         let root = StorageRoot::new(CURRENT_STORAGE_VERSION, StorageEpoch(0))?.key();
         let source_root = fs::canonicalize(self.source_storage.join(&root)).map_err(io)?;
         let base_root = fs::canonicalize(self.base_storage.join(&root)).map_err(io)?;
-        if base_root.starts_with(&source_root) || source_root.starts_with(&base_root) {
-            return Err(invalid("The repair base must be detached from the serving storage root"));
-        }
+        require_detached_base(&source_root, &base_root)?;
         let (journal, region) = exclusive_journal(&self.replica_log)?;
         let result = self.install_locked(source_root, base_root, &journal, &region, &memory, cancellation).await;
         region.close_and_wait().await;
@@ -135,33 +143,87 @@ impl LocalRepair {
     pub async fn rebuild(
         &self, memory: Arc<MemoryBudget>, cancellation: &CancellationToken,
     ) -> Result<RepairedStore> {
-        if self.base.block >= self.through.block {
-            return Err(invalid("The target checkpoint must advance the trusted base"));
-        }
+        require_advancing_cut(self.base, self.through)?;
         cancelled(cancellation)?;
+        let paths = RepairPaths::resolve(&self.source_storage, self.base_storage.as_deref(), &self.output_parent)?;
+        RepairRange { base: BaseSelection::Explicit(self.base), through: self.through }
+            .rebuild(paths, &self.replica_log, &memory, cancellation).await
+    }
+}
+
+impl RetainedLocalRepair {
+    /// Reads the anchor under the original journal lock and checks it against the detached export.
+    pub async fn rebuild(
+        &self, memory: Arc<MemoryBudget>, cancellation: &CancellationToken,
+    ) -> Result<RepairedStore> {
+        cancelled(cancellation)?;
+        let paths = RepairPaths::resolve(&self.source_storage, Some(&self.base_storage), &self.output_parent)?;
+        require_detached_base(&paths.source_root, &paths.base_root)?;
+        RepairRange { base: BaseSelection::Retained, through: self.through }
+            .rebuild(paths, &self.replica_log, &memory, cancellation).await
+    }
+}
+
+struct RepairPaths {
+    source_root: PathBuf,
+    base_root: PathBuf,
+    output_parent: PathBuf,
+    root: String,
+}
+
+impl RepairPaths {
+    fn resolve(source: &Path, base: Option<&Path>, output_parent: &Path) -> Result<Self> {
         let root = StorageRoot::new(CURRENT_STORAGE_VERSION, StorageEpoch(0))?.key();
-        let source_root = fs::canonicalize(self.source_storage.join(&root)).map_err(io)?;
-        let base_root = match &self.base_storage {
+        let source_root = fs::canonicalize(source.join(&root)).map_err(io)?;
+        let base_root = match base {
             Some(storage) => fs::canonicalize(storage.join(&root)).map_err(io)?,
             None => source_root.clone(),
         };
-        let output_parent = fs::canonicalize(&self.output_parent).map_err(io)?;
+        let output_parent = fs::canonicalize(output_parent).map_err(io)?;
         if output_parent.starts_with(&source_root) || output_parent.starts_with(&base_root) || !output_parent.is_dir() {
             return Err(invalid("The output parent must be a directory outside both input storage roots"));
         }
-        let (journal, region) = exclusive_journal(&self.replica_log)?;
-        let built = self.build((&source_root, &base_root), &journal, &output_parent, &root, &memory, &region, cancellation).await;
+        Ok(Self { source_root, base_root, output_parent, root })
+    }
+}
+
+enum BaseSelection {
+    Explicit(RepairCheckpoint),
+    Retained,
+}
+
+struct RepairRange {
+    base: BaseSelection,
+    through: RepairCheckpoint,
+}
+
+impl RepairRange {
+    async fn rebuild(
+        &self, paths: RepairPaths, replica_log: &Path, memory: &Arc<MemoryBudget>, cancellation: &CancellationToken,
+    ) -> Result<RepairedStore> {
+        let (journal, region) = exclusive_journal(replica_log)?;
+        let built = self.build(&paths, &journal, memory, &region, cancellation).await;
         region.close_and_wait().await;
         built
     }
 
     async fn build(
-        &self, (source_root, base_root): (&Path, &Path), journal: &Path, output_parent: &Path, root: &str,
+        &self, paths: &RepairPaths, journal: &Path,
         memory: &Arc<MemoryBudget>, io_region: &Arc<IoRegion>, cancellation: &CancellationToken,
     ) -> Result<RepairedStore> {
+        let RepairPaths { source_root, base_root, output_parent, root } = paths;
         let _cache_charge = memory.reserve(CACHE_BYTES)?;
         let cache = CacheBudget::new(CACHE_BYTES);
         let source = Arc::new(LocalStore::open_in(source_root, Arc::clone(io_region))?);
+        let (base_receipt, retained_boundary) = match self.base {
+            BaseSelection::Explicit(base) => (base, None),
+            BaseSelection::Retained => {
+                let anchor = source.retained_repair_anchor().await?
+                    .ok_or_else(|| invalid("The source storage has no retained repair base"))?;
+                (RepairCheckpoint { block: anchor.block, sha256: anchor.sha256 }, Some(anchor.boundary.0))
+            }
+        };
+        require_advancing_cut(base_receipt, self.through)?;
         let source_pool = pool(source.clone(), &cache, memory);
         let file_size_target = rtdb_index::TrieCatalog::default().file_size_target();
         let source_blocks = BlockStore::new(source.clone(), source_pool.clone(), Arc::clone(memory), file_size_target)?;
@@ -172,14 +234,17 @@ impl LocalRepair {
             let blocks = BlockStore::new(store.clone(), pool(store.clone(), &cache, memory), Arc::clone(memory), file_size_target)?;
             (store, blocks)
         };
-        let (base, tables) = base_blocks.load(self.base.block).await?;
-        require_root(&base, self.base)?;
+        let (base, tables) = base_blocks.load(base_receipt.block).await?;
+        require_root(&base, base_receipt)?;
         let target = source_blocks.load_fresh_catalog(self.through.block).await?;
         require_root(&target, self.through)?;
         let after = base.boundary_replica_position().ok_or_else(|| invalid("The base has no replica boundary"))?;
+        if !repair_decision::matches_retained_boundary(retained_boundary, after.0) {
+            return Err(invalid("The retained repair boundary differs from its exported checkpoint"));
+        }
         let through = target.boundary_replica_position().ok_or_else(|| invalid("The target has no replica boundary"))?;
         let epoch = after.epoch();
-        if after.0 < 0 || through.epoch() != epoch || through <= after {
+        if !repair_decision::admits_repair_interval(after.0, through.0) {
             return Err(invalid("Repair requires a strictly advancing interval in one replica journal"));
         }
         let latest_transaction = target.latest_completed_tx().ok_or_else(|| invalid("The target has no completed transaction"))?;
@@ -206,15 +271,15 @@ impl LocalRepair {
             let primary = table.for_primary_repair();
             let bytes = Bytes::from(primary.encode());
             digests.insert(entry.oid, publication_digest(&bytes).to_vec());
-            destination.put(&ObjectKey::new(entry.slug.block_key(self.base.block)?)?, bytes).await?;
+            destination.put(&ObjectKey::new(entry.slug.block_key(base_receipt.block)?)?, bytes).await?;
         }
         drop(tables);
         base_wire.table_block_manifest = Some(rtdb_format::block::proto::TableBlockManifest { sha256_by_oid: digests });
         let mut staged_base = BlockCatalog::from_proto(base_wire)?;
-        destination.put(&ObjectKey::new(block_key(self.base.block)?)?, Bytes::from(staged_base.encode_for_publication())).await?;
+        destination.put(&ObjectKey::new(block_key(base_receipt.block)?)?, Bytes::from(staged_base.encode_for_publication())).await?;
 
         let stage_blocks = BlockStore::new(destination.clone(), pool(destination.clone(), &cache, memory), Arc::clone(memory), file_size_target)?;
-        let mut repaired = stage_blocks.recover(Default::default(), logs.source_floor()?, Timestamp(0), BlockDiscovery::At(self.base.block)).await?;
+        let mut repaired = stage_blocks.recover(Default::default(), logs.source_floor()?, Timestamp(0), BlockDiscovery::At(base_receipt.block)).await?;
         let sha256 = replay(&logs, &stage_blocks, &destination, &mut repaired, &base, &target, memory, cancellation).await?;
         let checkpoint = RepairCheckpoint { block: self.through.block, sha256 };
         drop(stage_blocks);
@@ -317,11 +382,26 @@ fn require_boundary(record: &ReplicaRecord, catalog: &BlockCatalog) -> Result<()
 }
 
 fn require_root(root: &BlockCatalog, checkpoint: RepairCheckpoint) -> Result<()> {
-    if root.block_index() != checkpoint.block || root.publication_sha256() != Some(checkpoint.sha256) {
+    let digest_matches = root.publication_sha256().is_some_and(|digest| same_publication_digest(digest, checkpoint.sha256));
+    if !repair_decision::matches_root(checkpoint.block.0, root.block_index().0, digest_matches) {
         return Err(invalid("The source checkpoint does not match the selected publication"));
     }
     if root.external_source_token().is_some() || !root.secondary_databases().is_empty() {
         return Err(invalid("Local repair requires one database without an external source"));
+    }
+    Ok(())
+}
+
+fn require_detached_base(source: &Path, base: &Path) -> Result<()> {
+    if base.starts_with(source) || source.starts_with(base) {
+        return Err(invalid("The repair base must be detached from the serving storage root"));
+    }
+    Ok(())
+}
+
+fn require_advancing_cut(base: RepairCheckpoint, through: RepairCheckpoint) -> Result<()> {
+    if base.block >= through.block {
+        return Err(invalid("The target checkpoint must advance the trusted base"));
     }
     Ok(())
 }
@@ -345,7 +425,7 @@ fn open_repair_logs(
 }
 
 fn next_replica_byte(position: ReplicaPosition) -> Result<ReplicaPosition> {
-    position.0.checked_add(1).map(ReplicaPosition).ok_or_else(|| invalid("Replica interval overflows"))
+    repair_decision::exclusive_replay_end(position.0).map(ReplicaPosition).ok_or_else(|| invalid("Replica interval overflows"))
 }
 
 fn table_manifest_reservation(encoded: usize) -> Result<usize> {

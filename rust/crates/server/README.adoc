@@ -95,6 +95,9 @@ Keep the detached export and original local journal available.
 The native block collector preserves root catalogs, per-table block metadata, and offloaded replica payloads from the retained block onward, including after restart.
 Export and retain a newer current block in the same journal to advance the bound and allow collection of older files.
 An old target remains usable for `repair-checkpoint` while the active retention bound covers its interval.
+`rtdb repair-checkpoint STORAGE REPLICA_LOG OUTPUT_PARENT THROUGH@SHA256 --retained-base --base-storage EXPORTED_STORAGE` selects the durable anchor from the original serving store.
+The command checks the detached export against the stored block, digest and replica boundary while holding the journal lock.
+The target remains explicit, so an operator can repair to any later retained cut in the same journal.
 `compactor` opens the database catalog, follows replica progress, performs deterministic compaction and publishes results through the source log.
 It opens no pgwire or Flight listeners and never claims leadership; the configured health listener remains available.
 A separate writer must apply its source-log notifications before jobs are acknowledged.

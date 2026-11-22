@@ -337,8 +337,15 @@ async fn local_trie_collection_resumes_an_installed_batch_after_the_last_reader_
     assert_eq!(writer.list(Some(&pending)).await.unwrap().len(), 1);
     for key in [&data, &metadata] { assert!(reader.get(key).await.is_ok()); }
 
+    let successor = collect(open());
+    successor.collect_as_of(Timestamp(100), &cancellation).await.unwrap();
+    assert_eq!(writer.list(Some(&pending)).await.unwrap().len(), 1);
+    assert_eq!(writer.list(Some(&installed)).await.unwrap().len(), 1);
+    assert_eq!(publisher.requests.lock().unwrap().len(), 1);
+    for key in [&data, &metadata] { assert!(reader.get(key).await.is_ok()); }
+
     drop(hold);
-    collect(open()).collect_as_of(Timestamp(100), &cancellation).await.unwrap();
+    successor.collect_as_of(Timestamp(100), &cancellation).await.unwrap();
     assert_eq!(*publisher.requests.lock().unwrap(), [vec![obsolete]]);
     assert!(writer.list(Some(&pending)).await.unwrap().is_empty());
     for key in [&data, &metadata] {
@@ -638,7 +645,7 @@ async fn a_groups_artefacts_go_only_with_the_last_member_the_catalog_holds() {
 }
 
 #[tokio::test]
-async fn collection_waits_a_whole_reader_lease_after_first_observing_garbage() {
+async fn a_replacement_collector_waits_a_whole_lease_on_its_own_clock() {
     let table = TableRef::new("public", "docs");
     let tables = TableCatalog::default().with_seeded_table(table.clone(), Vec::new()).unwrap();
     let entry = tables.entry(&table).unwrap().clone();
@@ -648,26 +655,36 @@ async fn collection_waits_a_whole_reader_lease_after_first_observing_garbage() {
     }
     let store = Arc::new(MemoryStore::default());
     let garbage: TrieKey = "l01-rc-b00".parse().unwrap();
-    store.put(&ObjectKey::new(entry.slug.data_key(&garbage)).unwrap(), Bytes::from_static(b"data")).await.unwrap();
-    store.put(&ObjectKey::new(entry.slug.metadata_key(&garbage)).unwrap(), Bytes::from_static(b"metadata")).await.unwrap();
+    let data = ObjectKey::new(entry.slug.data_key(&garbage)).unwrap();
+    let metadata = ObjectKey::new(entry.slug.metadata_key(&garbage)).unwrap();
+    store.put(&data, Bytes::from_static(b"data")).await.unwrap();
+    store.put(&metadata, Bytes::from_static(b"metadata")).await.unwrap();
     let publisher = Arc::new(DeletedPublisher { store: store.clone(), table: entry.clone(), commits: Mutex::new(Vec::new()) });
     let state = Arc::new(PartitionState::new(PartitionValue::loaded(catalog, tables, TrieConfig::default()).unwrap()));
-    let now = Arc::new(AtomicI64::new(1_000));
-    let clock = { let now = Arc::clone(&now); Arc::new(move || now.load(Ordering::Relaxed)) };
     let config = GarbageConfig { reader_lease: Duration::from_micros(500), reader_lease_margin: Duration::from_micros(100), ..GarbageConfig::default() };
-    let collector = TrieCollector::new(store.clone(), state, publisher.clone(), Arc::new(Observer::default()), config, clock).unwrap();
     let cancellation = CancellationToken::new();
-
-    collector.collect_as_of(Timestamp(100), &cancellation).await.unwrap();
-    now.store(1_499, Ordering::Relaxed);
-    collector.collect_as_of(Timestamp(100), &cancellation).await.unwrap();
+    let predecessor = TrieCollector::new(store.clone(), state.clone(), publisher.clone(), Arc::new(Observer::default()), config.clone(), Arc::new(|| 1_000)).unwrap();
+    predecessor.collect_as_of(Timestamp(100), &cancellation).await.unwrap();
     assert!(publisher.commits.lock().unwrap().is_empty());
-    assert!(store.head(&ObjectKey::new(entry.slug.data_key(&garbage)).unwrap()).await.is_ok());
+    drop(predecessor);
 
-    now.store(1_500, Ordering::Relaxed);
-    collector.collect_as_of(Timestamp(100), &cancellation).await.unwrap();
-    assert_eq!(*publisher.commits.lock().unwrap(), vec![vec![garbage.clone()]]);
-    assert!(store.head(&ObjectKey::new(entry.slug.data_key(&garbage)).unwrap()).await.is_err());
+    let now = Arc::new(AtomicI64::new(9_000));
+    let clock = { let now = Arc::clone(&now); Arc::new(move || now.load(Ordering::Relaxed)) };
+    let successor = TrieCollector::new(store.clone(), state, publisher.clone(), Arc::new(Observer::default()), config, clock).unwrap();
+    for elapsed in [0, 499] {
+        now.store(9_000 + elapsed, Ordering::Relaxed);
+        successor.collect_as_of(Timestamp(100), &cancellation).await.unwrap();
+        assert!(publisher.commits.lock().unwrap().is_empty());
+        assert!(store.head(&data).await.is_ok());
+        assert!(store.head(&metadata).await.is_ok());
+    }
+
+    now.store(9_500, Ordering::Relaxed);
+    successor.collect_as_of(Timestamp(100), &cancellation).await.unwrap();
+    assert_eq!(*publisher.commits.lock().unwrap(), vec![vec![garbage]],
+        "the replacement collector must reclaim at the elapsed lease boundary");
+    assert!(store.head(&data).await.is_err());
+    assert!(store.head(&metadata).await.is_err());
 }
 
 #[test]

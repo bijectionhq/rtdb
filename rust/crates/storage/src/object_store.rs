@@ -348,6 +348,14 @@ impl LocalStore {
         self.io.run(move || Ok(ledger.install_repair_anchor(anchor))).await?
     }
 
+    /// Loads the durable repair anchor at this local storage root.
+    pub async fn retained_repair_anchor(&self) -> rtdb_types::Result<Option<crate::LocalRepairAnchor>> {
+        let ledger = self.catalog.clone().unwrap_or_else(|| {
+            Arc::new(crate::local_catalog::LocalCatalogLedger::new(self.root.clone(), rtdb_types::StorageEpoch(0)))
+        });
+        self.io.run(move || Ok(ledger.retained_repair_anchor())).await?
+    }
+
     /// Rejects new work and joins this store's I/O region, including cancelled callers' blocking work.
     pub async fn close_and_wait(&self) { self.io.close_and_wait().await; }
 

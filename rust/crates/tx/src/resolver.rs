@@ -409,10 +409,11 @@ pub struct OpenTransaction<'a> {
     owned_worlds: BTreeMap<Iid, (rtdb_types::OwnedWorld, Arc<MemoryReservation>)>,
     owned_changes: BTreeMap<String, PendingOwnedChanges>,
     bounded_period_writes: BTreeMap<(rtdb_types::OwnedRelation, rtdb_types::EntityId), Arc<MemoryReservation>>,
+    hosted_replay: Option<crate::hosted_control::HostedReplay>,
 }
 impl<'a> OpenTransaction<'a> {
     fn new(base: Snapshot, key: TransactionKey, options: &'a SubmitOptions, context: &'a ResolveContext) -> Result<Self> {
-        Ok(Self { buffer: TransactionBuffer::new(base, key, Arc::clone(&context.memory))?, options, context, trace_parent: None, unique_changes: OwnedUniqueChanges::default(), capacity_changes: OwnedCapacityChanges::default(), owned_worlds: BTreeMap::new(), owned_changes: BTreeMap::new(), bounded_period_writes: BTreeMap::new() })
+        Ok(Self { buffer: TransactionBuffer::new(base, key, Arc::clone(&context.memory))?, options, context, trace_parent: None, unique_changes: OwnedUniqueChanges::default(), capacity_changes: OwnedCapacityChanges::default(), owned_worlds: BTreeMap::new(), owned_changes: BTreeMap::new(), bounded_period_writes: BTreeMap::new(), hosted_replay: None })
     }
     pub fn tx_key(&self) -> TransactionKey { self.buffer.tx_key() }
     pub fn snapshot(&self) -> Result<Snapshot> { self.buffer.snapshot() }
@@ -719,7 +720,9 @@ impl<'a> OpenTransaction<'a> {
             },
             Operation::Public(TxOp::OwnedDeadline { .. } | TxOp::OwnedCheckWorldScope { .. } | TxOp::OwnedCheckWorldPurge { .. } | TxOp::OwnedCheckRange { .. } | TxOp::OwnedCheckCapacity { .. } | TxOp::OwnedCheck { .. }) => Ok(()),
             Operation::Public(TxOp::OwnedErase { relation, id }) =>
-                self.erase_owned(relation, id).await,
+                self.erase_owned(relation, id, rtdb_types::OwnedChangeKind::Erase).await,
+            Operation::Public(TxOp::OwnedSweepExpired { relation, id, created, replay_floor }) =>
+                self.sweep_owned_expiry(relation, id, *created, *replay_floor).await,
             Operation::Public(TxOp::OwnedDelete { relation, id, valid_from, valid_to }) =>
                 self.delete_owned(relation, id, *valid_from, *valid_to).await,
             Operation::Public(TxOp::OwnedInsertDocs { relation, documents, valid_from, valid_to }) =>
@@ -819,14 +822,14 @@ impl<'a> OpenTransaction<'a> {
         if snapshot.contains_table(&relation.table(owner)) {
             return Err(conflict());
         }
-        if schema.lifetime_micros().is_some() {
+        if let Some(duration) = schema.lifetime_micros() {
             if !relation.is_root_data() || snapshot.contains_table(&relation.unique_table(owner))
                 || snapshot.contains_table(&relation.capacity_table(owner))
             {
                 return Err(lifetime_uncovered());
             }
-            let document = StructFields::from([("_id".into(), Value::Utf8(relation.name().into()))]);
-            self.buffer.put(relation.lifetime_table(owner), document, Interval::ALL)?;
+            let floor = rtdb_types::OwnedLifetimeFloor::at(duration, self.tx_key().system_time)?;
+            self.buffer.put(relation.lifetime_table(owner), floor.record(relation), Interval::ALL)?;
         }
         self.check_capacity_schema(snapshot.clone(), owner, relation, schema).await?;
         self.check_unique_schema(snapshot, owner, relation, schema).await?;
@@ -935,12 +938,22 @@ impl<'a> OpenTransaction<'a> {
 
     async fn check_owned_preconditions(&mut self, operations: &[Operation], source_scope: Option<rtdb_types::PlacedAttemptScope>) -> Result<()> {
         let owner = self.options.user.as_deref().filter(|owner| !owner.is_empty()).ok_or_else(no_owned_principal)?;
+        let replay = crate::hosted_control::hosted_replay_controls(operations.iter().filter_map(|op| match op {
+            Operation::Public(TxOp::HostedControl(control)) => Some(control),
+            _ => None,
+        }))?;
         let mut deadline = None;
         for operation in operations {
             if let Operation::Public(TxOp::OwnedDeadline { until }) = operation {
                 if deadline.replace(*until).is_some() {
                     return Err(Anomaly::incorrect("rtdb.owned/duplicate-deadline", "An owned transaction may supply at most one deadline"));
                 }
+            }
+        }
+        if operations.iter().any(|operation| matches!(operation, Operation::Public(TxOp::OwnedSweepExpired { .. }))) {
+            self.context.authorization.check_role_membership(&self.context.database, self.options.user.as_deref())?;
+            if operations.len() != 2 || deadline.is_none() {
+                return Err(lifetime_uncovered());
             }
         }
         let base = self.buffer.base_snapshot();
@@ -954,8 +967,10 @@ impl<'a> OpenTransaction<'a> {
             let target = root.as_ref().unwrap_or(relation);
             if new_lifetimes.contains(target) || base.contains_table(&target.lifetime_table(owner)) {
                 match operation {
-                    Operation::Public(TxOp::OwnedDeclareRelation { .. } | TxOp::OwnedInsertDocs { .. }
-                        | TxOp::OwnedCheck { .. })
+                    Operation::Public(TxOp::OwnedErase { .. }) if replay.is_some() && root.is_none() => (),
+                    Operation::Public(TxOp::OwnedDeclareRelation { .. } | TxOp::OwnedDeclarePath { .. }
+                        | TxOp::OwnedInsertDocs { .. } | TxOp::OwnedCheck { .. } | TxOp::OwnedCheckRange { .. }
+                        | TxOp::OwnedSweepExpired { .. })
                     | Operation::OwnedWriteIids { create_only: true, .. } if root.is_none() => (),
                     _ => return Err(lifetime_uncovered()),
                 }
@@ -1312,7 +1327,7 @@ impl<'a> OpenTransaction<'a> {
                 }
             }
         }
-        self.check_hosted_controls(operations, source_scope).await?;
+        self.check_hosted_controls(operations, source_scope, replay).await?;
         self.check_capacity_source(operations).await?;
         for operation in operations {
             if let Operation::Public(TxOp::OwnedCheckWorldScope { scope }) = operation {
@@ -1482,8 +1497,51 @@ impl<'a> OpenTransaction<'a> {
         self.write_owned(&relation, &docs, None, Some(Timestamp::MIN), Some(Timestamp::MAX), true).await
     }
 
-    async fn erase_owned(&mut self, relation: &rtdb_types::OwnedRelation, id: &rtdb_types::EntityId) -> Result<()> {
-        use rtdb_types::{EntityId, OwnedChangeKind, OwnedRelation};
+    async fn sweep_owned_expiry(
+        &mut self, relation: &rtdb_types::OwnedRelation, id: &rtdb_types::EntityId,
+        created: Timestamp, replay_floor: Timestamp,
+    ) -> Result<()> {
+        use rtdb_types::OwnedChangeKind;
+        let owner = self.options.user.as_deref().filter(|owner| !owner.is_empty()).ok_or_else(no_owned_principal)?;
+        let ordered = self.tx_key().system_time;
+        if !relation.is_root_data() || replay_floor >= ordered { return Err(lifetime_uncovered()); }
+        let lifetime = self.read_owned_schema(owner, relation).await?
+            .and_then(|(schema, _)| schema.lifetime_micros()).ok_or_else(lifetime_uncovered)?;
+        let expires = Timestamp(created.0.checked_add(lifetime).ok_or_else(overflow)?);
+        if expires > replay_floor { return Err(lifetime_uncovered()); }
+        let context = self.context.query_context(self.snapshot()?, ordered, &self.options.default_tz, self.trace_parent)?;
+        let mut floor = rtdb_query::read_owned_lifetime_floor(Arc::clone(&context), owner, relation).await?;
+        floor.check(lifetime, ordered)?;
+        if rtdb_query::owned_purge_floor(Arc::clone(&context), owner, relation, id).await?.is_some() {
+            return Ok(());
+        }
+        let columns = ["_id", "_system_from", "_valid_from", "_valid_to"];
+        let mut point = rtdb_query::open_owned_point(context, owner, relation, id, Some(Interval::ALL), Some(&columns))
+            .await?.ok_or_else(lifetime_uncovered)?;
+        let mut observed = None;
+        while let Some(batch) = point.next_batch().await? {
+            for row in 0..batch.batch().num_rows() {
+                if observed.is_some() { return Err(lifetime_uncovered()); }
+                let revision = rtdb_query::owned_row_revision(batch.batch(), row, id, &self.context.memory)?;
+                let (original, _) = rtdb_query::owned_row_lifetime(batch.batch(), row, revision, lifetime)?;
+                observed = Some(original);
+            }
+        }
+        if observed != Some(created) {
+            return Err(lifetime_uncovered());
+        }
+        floor.expired_created_through = rtdb_types::OwnedLifetimeFloor::at(lifetime, ordered)?.expired_created_through;
+        floor.swept_present_through = floor.swept_present_through.max(replay_floor);
+        self.erase_owned(relation, id, OwnedChangeKind::Expired).await?;
+        self.buffer.put(relation.lifetime_table(owner), floor.record(relation), Interval::ALL)?;
+        Ok(())
+    }
+
+    async fn erase_owned(
+        &mut self, relation: &rtdb_types::OwnedRelation, id: &rtdb_types::EntityId,
+        kind: rtdb_types::OwnedChangeKind,
+    ) -> Result<()> {
+        use rtdb_types::{EntityId, OwnedRelation};
         if relation.name() == rtdb_types::OWNED_ATTEMPT_RELATION {
             return Err(Anomaly::incorrect("rtdb.owned/immutable-attempt", "Attempt reservations are immutable"));
         }
@@ -1491,6 +1549,9 @@ impl<'a> OpenTransaction<'a> {
         let owner = options.user.as_deref().filter(|owner| !owner.is_empty()).ok_or_else(no_owned_principal)?;
         if relation.world().is_some() || relation.is_world_catalog() {
             return Err(rtdb_types::OwnedWorld::unavailable());
+        }
+        if self.hosted_replay.is_some() && self.read_owned_schema(owner, relation).await?.is_none() {
+            return Err(replay_period_unavailable());
         }
         let snapshot = self.snapshot()?;
         if snapshot.contains_table(&OwnedRelation::obsolete_purge_table(owner)) {
@@ -1525,7 +1586,7 @@ impl<'a> OpenTransaction<'a> {
         // The full handle, including its type, is the erasure target even
         // when the locality prefix is shared or the key has no live winner.
         let first_erase = !self.owned_changes.get(relation.name()).is_some_and(|group| group.erased);
-        self.record_owned_change(relation, id.clone(), OwnedChangeKind::Erase, Interval::ALL)?;
+        self.record_owned_change(relation, id.clone(), kind, Interval::ALL)?;
         self.buffer.append(table, StoredEvent {
             entity_key: Some(id.handle_bytes().into()), iid: id.iid(),
             system_from: self.tx_key().system_time, valid_time: Interval::ALL,
@@ -1570,13 +1631,24 @@ impl<'a> OpenTransaction<'a> {
         let options = self.options;
         let owner = options.user.as_deref().filter(|owner| !owner.is_empty()).ok_or_else(no_owned_principal)?;
         if relation.world().is_some() || relation.is_world_catalog() { return Err(rtdb_types::OwnedWorld::unavailable()); }
-        if let Some((schema, _retained)) = self.read_owned_schema(owner, relation).await? {
-            schema.require_root_write_period(from, to)?;
+        let selected_valid = if let Some(source) = self.hosted_replay.as_ref().map(|replay| replay.source_time()) {
+            let (schema, _retained) = self.read_owned_schema(owner, relation).await?.ok_or_else(replay_period_unavailable)?;
+            let valid = replay_period(from, to)?;
+            schema.require_replayed_period(valid, source, EventOp::Delete)?;
             if schema.requires_bounded_period() {
                 self.reserve_bounded_period_write(relation, id.clone())?;
             }
-        }
-        let valid = interval(from.unwrap_or(self.tx_key().system_time), to.unwrap_or(Timestamp::MAX))?;
+            valid
+        } else {
+            if let Some((schema, _retained)) = self.read_owned_schema(owner, relation).await? {
+                schema.require_root_write_period(from, to)?;
+                if schema.requires_bounded_period() {
+                    self.reserve_bounded_period_write(relation, id.clone())?;
+                }
+            }
+            interval(from.unwrap_or(self.tx_key().system_time), to.unwrap_or(Timestamp::MAX))?
+        };
+        let valid = selected_valid;
         self.read_owned_revision(owner, relation, id, Interval::ALL).await?;
         self.track_unique_mutation(owner, relation, id, valid).await?;
         self.track_capacity_mutation(owner, relation, id, valid).await?;
@@ -1674,7 +1746,41 @@ impl<'a> OpenTransaction<'a> {
             return self.put_documents(&table, documents, iids, Some(from), Some(to),
                 DocumentWrite::Owned { relation, owner, create_only }).await;
         }
-        if let Some((schema, _retained)) = self.read_owned_schema(owner, relation).await? {
+        let declaration = self.read_owned_schema(owner, relation).await?;
+        if let Some(source) = self.hosted_replay.as_ref().map(|replay| replay.source_time()) {
+            let (schema, _retained) = declaration.as_ref().ok_or_else(replay_period_unavailable)?;
+            let valid = replay_period(from, to)?;
+            schema.require_replayed_period(valid, source, EventOp::Put)?;
+            let lifetime = schema.lifetime_micros().is_some();
+            if !documents.has_exact_presence() || (lifetime && !create_only) {
+                return Err(replay_period_unavailable());
+            }
+            let context = if lifetime {
+                Some(self.context.query_context(self.snapshot()?, self.tx_key().system_time,
+                    &self.options.default_tz, self.trace_parent)?.with_accelerators(Arc::from([])))
+            } else { None };
+            let mut identities = BTreeSet::new();
+            for row in documents.rows() {
+                if row.contains_key("_valid_from") || row.contains_key("_valid_to") {
+                    return Err(replay_period_unavailable());
+                }
+                validate_owned_schema(schema, row)?;
+                if let Some(context) = &context {
+                    let id = crate::source::document_id(row, &self.context.memory)?;
+                    if !identities.insert(id.clone())
+                        || rtdb_query::owned_purge_floor(Arc::clone(context), owner, relation, &id).await?.is_some()
+                        || self.read_owned_revision(owner, relation, &id, Interval::ALL).await?.is_some()
+                    { return Err(insert_exists()); }
+                }
+                if schema.requires_bounded_period() {
+                    let id = crate::source::document_id(row, &self.context.memory)?;
+                    self.reserve_bounded_period_write(relation, id)?;
+                }
+            }
+            return self.put_documents(&table, documents, iids, Some(valid.lower()), Some(valid.upper()),
+                DocumentWrite::Owned { relation, owner, create_only }).await;
+        }
+        if let Some((schema, _retained)) = declaration {
             schema.require_root_write_period(from, to)?;
             if !documents.has_exact_presence() {
                 return Err(Anomaly::incorrect("rtdb.owned/field-presence", "Declared owned writes require exact field presence"));
@@ -1698,11 +1804,21 @@ impl<'a> OpenTransaction<'a> {
                 if !create_only { return Err(lifetime_uncovered()); }
                 let created = self.tx_key().system_time;
                 let expires = Timestamp(created.0.checked_add(lifetime).ok_or_else(overflow)?);
+                let context = self.context.query_context(self.snapshot()?, created, &self.options.default_tz, self.trace_parent)?
+                    .with_accelerators(Arc::from([]));
+                let floor = rtdb_query::read_owned_lifetime_floor(Arc::clone(&context), owner, relation).await?;
+                floor.check(lifetime, created)?;
+                let mut next = rtdb_types::OwnedLifetimeFloor::at(lifetime, created)?;
+                next.swept_present_through = floor.swept_present_through;
                 for row in documents.rows() {
                     let id = crate::source::document_id(row, &self.context.memory)?;
-                    if self.read_owned_revision(owner, relation, &id, Interval::ALL).await?.is_some() {
+                    if rtdb_query::owned_purge_floor(Arc::clone(&context), owner, relation, &id).await?.is_some()
+                        || self.read_owned_revision(owner, relation, &id, Interval::ALL).await?.is_some() {
                         return Err(insert_exists());
                     }
+                }
+                if next.expired_created_through > floor.expired_created_through {
+                    self.buffer.put(relation.lifetime_table(owner), next.record(relation), Interval::ALL)?;
                 }
                 return self.put_documents(&table, documents, iids, Some(created), Some(expires),
                     DocumentWrite::Owned { relation, owner, create_only }).await;
@@ -1794,10 +1910,10 @@ impl<'a> OpenTransaction<'a> {
         let too_large = || Anomaly::incorrect("rtdb.owned/change-group-too-large", "An owned relation's change group exceeds its byte limit");
         use rtdb_types::{OwnedChange, OwnedChangeKind};
         let group = self.owned_changes.entry(relation.name().to_owned()).or_default();
-        if group.erased || kind == OwnedChangeKind::Erase {
+        if group.erased || matches!(kind, OwnedChangeKind::Erase | OwnedChangeKind::Expired) {
             for previous in &group.touches {
                 let previous = OwnedChange::from_value(previous)?;
-                if previous.id == id && (kind == OwnedChangeKind::Erase || previous.kind == OwnedChangeKind::Erase) {
+                if previous.id == id && (matches!(kind, OwnedChangeKind::Erase | OwnedChangeKind::Expired) || matches!(previous.kind, OwnedChangeKind::Erase | OwnedChangeKind::Expired)) {
                     return Err(Anomaly::incorrect("rtdb.owned/purge-overlap", "Owned erase cannot share its identity with another mutation in the same commit"));
                 }
             }
@@ -1810,7 +1926,7 @@ impl<'a> OpenTransaction<'a> {
         group.touches.push(entry);
         group.reservations.push(charge);
         group.bytes = group_bytes;
-        group.erased |= kind == OwnedChangeKind::Erase;
+        group.erased |= matches!(kind, OwnedChangeKind::Erase | OwnedChangeKind::Expired);
         Ok(())
     }
 
@@ -2004,6 +2120,15 @@ fn insert_exists() -> Anomaly {
 
 fn invalid_search_path_column() -> Anomaly {
     Anomaly::incorrect("rtdb.owned/search-column", "Owned search requires one stored clear-text UTF-8 column")
+}
+
+fn replay_period(from: Option<Timestamp>, to: Option<Timestamp>) -> Result<Interval> {
+    let (Some(from), Some(to)) = (from, to) else { return Err(replay_period_unavailable()); };
+    interval(from, to)
+}
+
+fn replay_period_unavailable() -> Anomaly {
+    Anomaly::incorrect("rtdb.owned/restore-validity", "Native replay requires explicit original intervals and an exact declared effect")
 }
 
 fn validate_owned_schema(schema: &rtdb_types::OwnedSchema, row: &StructFields<Value>) -> Result<()> {
@@ -2252,6 +2377,77 @@ mod tests {
     struct NoRoleChecks;
     impl TransactionAuthorization for NoRoleChecks {
         fn check_role_membership(&self, _: &str, _: Option<&str>) -> Result<()> { panic!("unexpected role check") }
+    }
+
+    struct CapturingWriter {
+        store: Arc<rtdb_storage::LocalStore>,
+        proposed_floor: rtdb_types::CatalogCut,
+        cursor: Option<QueryCursor>,
+    }
+
+    #[async_trait]
+    impl TransactionWriter for CapturingWriter {
+        async fn write(&mut self, tx: &mut OpenTransaction<'_>) -> Result<WriterResult> {
+            use rtdb_storage::ObjectStore;
+
+            assert!(!self.store.advance_catalog_floor(self.proposed_floor).await?,
+                "an active transaction must retain its durable catalog");
+            tx.execute_sql("INSERT INTO docs RECORDS {_id: 42}", None).await?;
+            self.cursor = Some(tx.open_query("SELECT _id FROM docs", Vec::new()).await?);
+            Ok(WriterResult::Committed { user_metadata: None })
+        }
+    }
+
+    #[tokio::test]
+    async fn a_transaction_cursor_retains_its_catalog_until_dropped() {
+        use rtdb_storage::{LocalStore, ObjectStore};
+        use rtdb_types::{CatalogCut, ReplicaPosition, StorageEpoch, StorageVersion};
+
+        let directory = tempfile::tempdir().unwrap();
+        let open = || Arc::new(LocalStore::open(directory.path()).unwrap().with_catalog_ledger(StorageEpoch(0)));
+        let store = open();
+        let mut writer = CapturingWriter {
+            store: open(),
+            proposed_floor: CatalogCut {
+                storage_version: StorageVersion(6),
+                storage_epoch: StorageEpoch(0),
+                replica_epoch: StorageEpoch(0),
+                through: ReplicaPosition(1),
+            },
+            cursor: None,
+        };
+        let state = rtdb_index::PartitionState::empty(Default::default()).unwrap();
+        state.publish_catalog_cut(CatalogCut { through: ReplicaPosition(0), ..writer.proposed_floor }).unwrap();
+        let memory = MemoryBudget::new(1 << 24);
+        let context = ResolveContext {
+            owned_witness_scope: None,
+            database: "xtdb".into(),
+            storage: Arc::new(BufferPool::new(store, 1 << 20)),
+            memory: Arc::clone(&memory),
+            query_options: QueryOptions::default(),
+            scan_accelerators: Default::default(),
+            cancellation: CancellationToken::new(),
+            default_tz: "UTC".into(),
+            authorization: Arc::new(NoRoleChecks),
+            execution_observer: None,
+            tracer: None,
+        };
+
+        let mut resolver = TxResolver::new(None, SourcePosition(0), None, &memory).unwrap();
+        let outcome = resolver.resolve_external(state.snapshot(), Timestamp(100), None, None, &mut writer, &context).await.unwrap();
+        assert!(outcome.result().committed());
+        assert!(!writer.store.advance_catalog_floor(writer.proposed_floor).await.unwrap(),
+            "the transaction cursor must retain its catalog after resolution");
+        let mut cursor = writer.cursor.take().unwrap();
+        assert_eq!(cursor.next_batch().await.unwrap().unwrap().batch().num_rows(), 1);
+        assert!(cursor.next_batch().await.unwrap().is_none());
+        drop(cursor);
+        assert!(writer.store.advance_catalog_floor(writer.proposed_floor).await.unwrap());
+
+        let request = SourceTransaction::new(Vec::new(), SubmitOptions::default(), &memory).unwrap();
+        let error = resolver.resolve_source(state.snapshot(), SourcePosition(1), Timestamp(101), request, &context).await
+            .err().expect("source resolution must check catalog admission");
+        assert_eq!(error.code, "rtdb.storage/catalog-not-current");
     }
 
     #[tokio::test]

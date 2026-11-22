@@ -111,7 +111,7 @@ impl Database {
     }
 
     /// The lease for a snapshot of this database captured after this returns.
-    /// A node whose catalog cannot be confirmed current waits up to the lease margin for it, then holds an expired lease.
+    /// A node whose catalog cannot be confirmed current waits up to the lease margin for it, then returns an expired lease for admission to refuse.
     pub(crate) async fn read_lease(&self, clock: &Arc<dyn Clock>, garbage: &rtdb_maintenance::GarbageConfig) -> Result<Arc<rtdb_storage::ReadLease>> {
         use rtdb_storage::read_lease::{lease_admits, lease_deadline};
         let (lease, margin) = (garbage.reader_lease_micros()?, garbage.reader_lease_margin_micros()?);

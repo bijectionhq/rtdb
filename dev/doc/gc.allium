@@ -30,7 +30,9 @@
 -- Objects are immutable, so a request that overruns the deadline can only fail; a missing object it then reports is classified as the expired lease.
 -- A node reading a scan fragment for another node's query captures its own snapshot and holds its own lease.
 -- A later request fails with `rtdb.storage/read-lease-expired` rather than reading a file that may be gone.
--- A node whose catalog cannot be confirmed current waits up to the margin for its log processor, then holds an expired lease.
+-- A node whose catalog cannot be confirmed current waits up to the margin for its log processor.
+-- A replicated query or delegated fragment without a current lease is refused at snapshot admission.
+-- An admitted snapshot still checks the lease before beginning each provider request.
 -- The native collector deletes an eligible trie only once `reader_lease` has passed on its own monotonic clock since it first observed that trie as eligible.
 -- In Multi, that deletion records a release, which the cell reaper erases only after its grace.
 -- Native nodes with a local journal and local storage share a catalog floor at the storage root.

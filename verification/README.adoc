@@ -290,6 +290,7 @@ It also exercises the Azure adapter against a loopback provider and separately m
 * `tla/ReadCurrencyAnchor.tla` checks competing clock and tip observations and the replica prefix needed to confirm them.
   `verus/read_currency` checks the two Rust decisions shared by foreground and maintenance observers.
   `lean/ReadCurrencyAnchor.lean` proves prefix coverage and monotonicity for arbitrary finite histories in the reference model.
+  The native replay verifies early refusal of a replicated query without a current lease, with a matching omission control.
 * `tla/ResidenceComposition.tla` models snapshot admission, log trimming, exact-version retirement and whole-residence disposal in a common state.
   Its controls test cross-domain dependencies, including a canceled query's provider read, an older recovery cursor, fork publication and transfer before erasure.
   `tla/ResidenceCompositionReplay.tla` checks an authored event trace against the same transitions and refuses five invalid variants at their first unmatched step.
@@ -326,6 +327,8 @@ It also exercises the Azure adapter against a loopback provider and separately m
   The catalog reclamation area checks the latest-block rule and the last-held-sibling predicate.
   The tiered publication area checks that all four serving siblings for the same block exist before the catalog retires the parent.
   The checkpoint discovery area checks the production retry decision and its decreasing distance from the maximum index.
+  The local repair area checks same-journal anchor advancement, protection and synchronization before collection, all digest bytes, the retained boundary match, and the exact exclusive replay endpoint in the Rust decision functions.
+  The native case repairs from the reopened anchor and rejects a build that omits the persisted boundary check.
   The replay floor area checks the exact signed-offset rule for a required replica record below a provider's reported floor.
   The system time area checks the production assignment and admission decisions, including exhaustion and rejection of equal or earlier timestamps.
   The IID partition area checks the base-four digit computation shared by trie and compaction code.

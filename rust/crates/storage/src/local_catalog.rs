@@ -4,9 +4,10 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use fs2::FileExt;
+use rtdb_format::catalog::same_publication_digest;
 use rtdb_types::{Anomaly, AnomalyCategory, BlockIndex, CatalogCut, ReplicaPosition, Result, StorageEpoch};
 
-use crate::Error;
+use crate::{Error, repair_anchor_decision::{self, AnchorInstallation, RecoveryCollection}};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct LocalRepairAnchor {
@@ -16,7 +17,7 @@ pub struct LocalRepairAnchor {
 }
 
 impl LocalRepairAnchor {
-    fn well_formed(self) -> bool { self.block.0 >= 0 && self.boundary.0 >= 0 }
+    fn well_formed(self) -> bool { repair_anchor_decision::valid_anchor(self.block.0, self.boundary.0) }
 }
 
 pub(crate) struct LocalCatalogLedger {
@@ -104,13 +105,15 @@ impl LocalCatalogLedger {
         if !next.well_formed() {
             return Err(invalid("Invalid local repair anchor"));
         }
-        if let Some(prior) = self.repair_anchor()? {
-            if prior == next { return self.sync_ledger(); }
-            if next.block <= prior.block || next.boundary <= prior.boundary
-                || next.boundary.epoch() != prior.boundary.epoch()
-            {
-                return Err(invalid("The repair anchor must advance in the same replica journal"));
-            }
+        let prior = self.repair_anchor()?;
+        let decision = repair_anchor_decision::install_anchor(
+            prior.map(|anchor| (anchor.block.0, anchor.boundary.0)), next.block.0, next.boundary.0,
+            prior.is_some_and(|anchor| same_publication_digest(anchor.sha256, next.sha256)),
+        );
+        match decision {
+            AnchorInstallation::Replace => (),
+            AnchorInstallation::Confirm => return self.sync_ledger(),
+            AnchorInstallation::Refuse => return Err(invalid("The repair anchor must advance in the same replica journal")),
         }
 
         let mut staged = tempfile::NamedTempFile::new_in(&self.directory)
@@ -125,11 +128,20 @@ impl LocalCatalogLedger {
 
     pub(crate) fn collect_recovery_file(&self, block: BlockIndex, remove: impl FnOnce() -> crate::Result<()>) -> Result<()> {
         let _gate = self.lock()?;
-        if let Some(anchor) = self.repair_anchor()? {
-            if block >= anchor.block { return Ok(()); }
-            self.sync_ledger()?;
+        let first = self.repair_anchor()?.map(|anchor| anchor.block.0);
+        match repair_anchor_decision::collect_recovery_file(first, block.0) {
+            RecoveryCollection::Keep => return Ok(()),
+            RecoveryCollection::SynchronizeAndRemove => self.sync_ledger()?,
+            RecoveryCollection::Remove => (),
         }
         Ok(remove()?)
+    }
+
+    pub(crate) fn retained_repair_anchor(&self) -> Result<Option<LocalRepairAnchor>> {
+        let _gate = self.lock()?;
+        let anchor = self.repair_anchor()?;
+        if anchor.is_some() { self.sync_ledger()?; }
+        Ok(anchor)
     }
 
     fn repair_anchor(&self) -> Result<Option<LocalRepairAnchor>> {

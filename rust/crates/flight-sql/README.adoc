@@ -514,7 +514,27 @@ It returns the same cutoff for a live fact, `rtdb.owned/lifetime-expired` for a 
 Live full-key range pages on a covered acceptance-lifetime path use the held present on the valid axis.
 A nonempty page carries `rtdb.owned.until_micros` set to its earliest exclusive row expiry.
 The placed witness expires by that time, and range encoding refuses a page whose expiry has already passed.
-Leading-key, historical, world, and count ranges remain unavailable for these relations.
+Live full-key count uses the same frozen root and held present.
+For a nonempty lifetime count, bounded rank probes on that root find the first valid instant where its cardinality decreases.
+The count's metadata and original witness include this exclusive cutoff.
+The private lifetime declaration stores the immutable duration and an ordered monotone floor of creation times already expired.
+Native writes advance that floor together with accepted data. Live and archived reads require the exact floor format and declaration.
+An existing lifetime marker without the floor requires a reset.
+The protected marker also stores the replay-present sweep floor.
+Trusted native maintenance may nominate one exact created identity and a cutoff granted by its replay-retention authority.
+The ordered source requires superuser maintenance authority, a deadline, the original creation revision and expiry at or before the permitted cutoff.
+It orders an all-history retirement event, the monotone sweep floor and an `expired` journal touch together.
+Retries of retired identities publish no duplicate touch.
+`rtdb.owned.NominateHeldExpiry.v1` is a placed hosted-control read over the original 16-byte hold and the ordinary typed point request.
+It seals one exact expired identity from the installed lifetime at held present and returns one Arrow row containing `nomination`, `created_micros`, and `expiry_micros`.
+The sealed token expires with the hold and binds the complete identity, owning principal, relation, placement epoch, and original transaction key.
+The action carries no removal authority, replay cutoff, or document payload.
+`rtdb.owned.ReadHeldExpiryCandidates.v1` reads exact creation groups from the same live held journal.
+The request carries the original hold, relation, exclusive journal system time, and a group limit from one to eight.
+The result contains at most 64 signed candidates and a covered journal coordinate. An oversized group is never split or skipped.
+It uses the design's 24-hour window to diagnose eligible candidates on the held clock. The diagnostic cutoff does not authorize removal.
+Hosted sweep dispatch still requires the logical replay-retention owner. Archive-media collection remains separate.
+Leading-key, historical, and world ranges and historical or world counts remain unavailable for these relations.
 Other read coordinates and paths refuse this declaration.
 
 `rtdb.owned.PublishWorldCut.v2` orders one initial retained fork alongside a Root publication at the same source position.
@@ -700,6 +720,11 @@ The resolver checks both the ordinary control observations and the final owned c
 
 This action supports checked replacement and exact absence insertion for hosted controls.
 Other control effects, including arbitrary SQL, computed values, deletes, relabeling and temporal splits, are outside this action.
+
+An installed held restore may combine its exact writer, archive, hold, unsealed state, and predecessor checks with an absent-checked original transaction receipt.
+The native effects and the restore frontier replace in the same commit as that receipt.
+Copied native Root assertions retain their source valid intervals, including the original creation and expiry of a lifetime row.
+The destination system order still gives every applied transaction a fresh position above the archived cut.
 Generic SQL keeps the existing private relation boundary.
 
 === Final-state prefix count

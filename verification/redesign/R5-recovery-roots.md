@@ -97,6 +97,10 @@ It distinguishes the visible anchor from its last durable value.
 The check explores 5,766 states and rejects late admission of an older cut, removal without the anchor check, an acknowledged anchor lost on restart, and removal based on an unsynchronized successor.
 It reaches physical removal of an older offload after advancing the anchor and restarting.
 The native regression runs the automatic collector, repairs to an older target using its real offloaded transaction, and observes removal after anchoring a newer export.
+The rebuild can select the persisted anchor directly under the original journal lock.
+[Verus](../verus/local_repair/proof.rs) checks the Rust decisions for monotone anchor replacement, exact receipt comparison, collection ordering, and the bounded replay interval.
+The native replay rejects a persisted boundary that disagrees with the checked base export, and the harness rejects a program that skips that comparison.
+The filesystem lock, synchronization calls, and binding of the receipt to the actual journal media remain runtime premises.
 
 ## Source retention through copy completion
 

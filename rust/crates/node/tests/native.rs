@@ -59,6 +59,37 @@ async fn running(options: NodeOptions, services: NodeServices) -> (Node, tokio::
     (node, tokio::spawn(driver.run()))
 }
 
+#[tokio::test]
+async fn a_replicated_query_without_a_current_catalog_lease_is_refused_before_evaluation() {
+    struct ClockAtLimit(TickClock);
+    impl Clock for ClockAtLimit {
+        fn now(&self) -> Timestamp { self.0.now() }
+        fn monotonic_micros(&self) -> i64 { i64::MAX }
+    }
+
+    for replicated in [true, false] {
+        let mut config = options();
+        config.replication.enabled = replicated;
+        let clock = Arc::new(ClockAtLimit(TickClock(AtomicI64::new(1_000_000))));
+        let (node, owner) = running(config, NodeServices { clock, ..services() }).await;
+        let basis = QueryBasis {
+            snapshot: node.snapshot_basis().unwrap(),
+            snapshot_time: None,
+            current_time: node.query_instant(),
+            timezone: "UTC".into(),
+        };
+        let context = node.query_context("xtdb", &basis, &Authority, node.cancellation()).await;
+        if replicated {
+            let Err(error) = context else { panic!("a replicated query exposed a snapshot without a current lease") };
+            assert_eq!(error.code, "rtdb.node/catalog-not-current");
+        } else {
+            assert!(context.is_ok(), "offline snapshots do not need a replica lease");
+        }
+        node.shutdown();
+        owner.await.unwrap().unwrap();
+    }
+}
+
 #[derive(Default)]
 struct PausedReadFence {
     entered: tokio::sync::Notify,
@@ -2244,10 +2275,18 @@ async fn an_installed_repair_base_keeps_older_targets_and_offloaded_replay_throu
     stop(&node, driver).await;
     drop(node);
 
-    let repair = LocalRepair {
-        source_storage: source_storage.clone(), base_storage: Some(trusted_base),
-        replica_log, output_parent: directory.path().to_owned(), base: receipt(&base), through: receipt(&through),
+    let repair = RetainedLocalRepair {
+        source_storage: source_storage.clone(), base_storage: trusted_base,
+        replica_log, output_parent: directory.path().to_owned(), through: receipt(&through),
     };
+    let anchor_path = objects.join(".tmp/catalog-ledger/repair-anchor");
+    let anchor = std::fs::read(&anchor_path).unwrap();
+    let (block, boundary, digest): (i64, i64, [u8; 32]) = serde_json::from_slice(&anchor).unwrap();
+    std::fs::write(&anchor_path, serde_json::to_vec(&(block, boundary + 1, digest)).unwrap()).unwrap();
+    let refusal = repair.rebuild(memory.clone(), &cancellation).await
+        .expect_err("a retained base must bind the boundary of the detached export");
+    assert_eq!(refusal.message.as_deref(), Some("The retained repair boundary differs from its exported checkpoint"));
+    std::fs::write(&anchor_path, &anchor).unwrap();
     let rebuilt = repair.rebuild(memory.clone(), &cancellation).await.unwrap();
     assert_eq!(rebuilt.latest_transaction, through.latest_completed_tx().unwrap());
     let mut reopened = settings.clone();

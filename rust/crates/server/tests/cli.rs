@@ -130,6 +130,22 @@ fn retain_repair_base_requires_a_detached_store_and_checkpoint_receipt() {
 }
 
 #[test]
+fn a_retained_base_requires_the_detached_export_and_one_target_receipt() {
+    let through = format!("23@{}", "C4".repeat(32));
+    let Command::RepairRetainedCheckpoint { request, .. } = parse(&[
+        "repair-checkpoint", "source", "logs/REPLICA_LOG", "repairs", &through,
+        "--retained-base", "--base-storage", "export",
+    ]) else { panic!("expected repair from retained base") };
+    assert_eq!(request.base_storage.to_str(), Some("export"));
+    assert_eq!(request.through.block.0, 23);
+    let detached_required = ["repair-checkpoint", "source", "logs/REPLICA_LOG", "repairs", &through, "--retained-base"];
+    assert!(cli::parse(detached_required.map(str::to_owned), &|_| None).is_err());
+    let only_one_receipt = ["repair-checkpoint", "source", "logs/REPLICA_LOG", "repairs", &through, &through,
+        "--retained-base", "--base-storage", "export"];
+    assert!(cli::parse(only_one_receipt.map(str::to_owned), &|_| None).is_err());
+}
+
+#[test]
 fn checkpoint_repair_requires_exact_publication_receipts() {
     let base = format!("9@{}", "a1".repeat(32));
     let through = format!("23@{}", "C4".repeat(32));

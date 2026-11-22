@@ -1,0 +1,209 @@
+{
+  "summary": "The local repair code verifies monotone anchors, protected collection, exact roots, single-journal intervals, and the exclusive replay end.",
+  "flags": [
+    "--no-external-by-default",
+    "--verify-module",
+    "anchor",
+    "--verify-module",
+    "replay",
+    "--verify-module",
+    "laws",
+    "--verify-module",
+    "digest"
+  ],
+  "min_verified_functions": 18,
+  "controls": {
+    "cross_journal_replacement": {
+      "defect": "A later block can replace an anchor in another journal.",
+      "mutate": [
+        {
+          "file": "rust/crates/storage/src/repair_anchor_decision.rs",
+          "find": "else if old_block < block && old_boundary < boundary && old_boundary >> 48 == boundary >> 48 {",
+          "replace": "else if old_block < block && old_boundary < boundary {"
+        }
+      ],
+      "expect": [
+        {
+          "file": "rust/crates/storage/src/repair_anchor_decision.rs",
+          "function": "install_anchor",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 17
+    },
+    "cross_journal_replacement_with_weakened_contract": {
+      "defect": "The implementation and contract both permit a different journal.",
+      "mutate": [
+        {
+          "file": "rust/crates/storage/src/repair_anchor_decision.rs",
+          "find": "else if old_block < block && old_boundary < boundary && old_boundary >> 48 == boundary >> 48 {",
+          "replace": "else if old_block < block && old_boundary < boundary {"
+        },
+        {
+          "file": "rust/crates/storage/src/repair_anchor_decision.rs",
+          "find": "old_block < block && old_boundary < boundary\n                        && old_boundary >> 48 == boundary >> 48,",
+          "replace": "old_block < block && old_boundary < boundary,"
+        }
+      ],
+      "expect": [
+        {
+          "file": "verification/verus/local_repair/laws.rs",
+          "function": "only_a_same_journal_successor_replaces_an_anchor",
+          "category": "assertion failed"
+        }
+      ],
+      "min_verified_functions": 17
+    },
+    "confirm_changed_digest": {
+      "defect": "A different digest confirms an existing anchor in place.",
+      "mutate": [
+        {
+          "file": "rust/crates/storage/src/repair_anchor_decision.rs",
+          "find": "if old_block == block && old_boundary == boundary && same_digest {",
+          "replace": "if old_block == block && old_boundary == boundary {"
+        }
+      ],
+      "expect": [
+        {
+          "file": "rust/crates/storage/src/repair_anchor_decision.rs",
+          "function": "install_anchor",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 17
+    },
+    "collect_the_anchor_with_weakened_contract": {
+      "defect": "The anchor block itself is eligible for collection.",
+      "mutate": [
+        {
+          "file": "rust/crates/storage/src/repair_anchor_decision.rs",
+          "find": "Some(first) if block >= first =>",
+          "replace": "Some(first) if block > first =>"
+        },
+        {
+          "file": "rust/crates/storage/src/repair_anchor_decision.rs",
+          "find": "anchor.is_some() && block >= anchor.unwrap()",
+          "replace": "anchor.is_some() && block > anchor.unwrap()"
+        },
+        {
+          "file": "rust/crates/storage/src/repair_anchor_decision.rs",
+          "find": "anchor.is_some() && block < anchor.unwrap()",
+          "replace": "anchor.is_some() && block <= anchor.unwrap()"
+        }
+      ],
+      "expect": [
+        {
+          "file": "verification/verus/local_repair/laws.rs",
+          "function": "files_at_and_after_an_anchor_stay",
+          "category": "assertion failed"
+        }
+      ],
+      "min_verified_functions": 17
+    },
+    "trust_block_number_alone": {
+      "defect": "A changed root is accepted when its block is unchanged.",
+      "mutate": [
+        {
+          "file": "rust/crates/replication/src/repair_decision.rs",
+          "find": "    expected == observed && digest_matches\n",
+          "replace": "    expected == observed\n"
+        }
+      ],
+      "expect": [
+        {
+          "file": "rust/crates/replication/src/repair_decision.rs",
+          "function": "matches_root",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 17
+    },
+    "read_more_than_the_target": {
+      "defect": "The byte range includes another possible record after the exact target.",
+      "mutate": [
+        {
+          "file": "rust/crates/replication/src/repair_decision.rs",
+          "find": "    position.checked_add(1)",
+          "replace": "    position.checked_add(2)"
+        }
+      ],
+      "expect": [
+        {
+          "file": "rust/crates/replication/src/repair_decision.rs",
+          "function": "exclusive_replay_end",
+          "category": "postcondition not satisfied"
+        },
+        {
+          "file": "rust/crates/replication/src/repair_decision.rs",
+          "function": "exclusive_replay_end",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 17
+    },
+    "collect_without_sync_with_weakened_contract": {
+      "defect": "A superseded anchor can authorize immediate unlink without confirming durability.",
+      "mutate": [
+        {
+          "file": "rust/crates/storage/src/repair_anchor_decision.rs",
+          "find": "Some(_) => RecoveryCollection::SynchronizeAndRemove,",
+          "replace": "Some(_) => RecoveryCollection::Remove,"
+        },
+        {
+          "file": "rust/crates/storage/src/repair_anchor_decision.rs",
+          "find": "(matches!(out, RecoveryCollection::Remove)) == anchor.is_none(),",
+          "replace": "(matches!(out, RecoveryCollection::Remove)) == (anchor.is_none() || block < anchor.unwrap()),"
+        },
+        {
+          "file": "rust/crates/storage/src/repair_anchor_decision.rs",
+          "find": "anchor.is_some() && block < anchor.unwrap()",
+          "replace": "false"
+        }
+      ],
+      "expect": [
+        {
+          "file": "verification/verus/local_repair/laws.rs",
+          "function": "an_anchored_removal_requires_synchronization",
+          "category": "assertion failed"
+        }
+      ],
+      "min_verified_functions": 17
+    },
+    "ignore_retained_boundary": {
+      "defect": "An export with a different replica position substitutes for the persisted anchor.",
+      "mutate": [
+        {
+          "file": "rust/crates/replication/src/repair_decision.rs",
+          "find": "Some(boundary) => boundary == observed,",
+          "replace": "Some(_) => true,"
+        }
+      ],
+      "expect": [
+        {
+          "file": "rust/crates/replication/src/repair_decision.rs",
+          "function": "matches_retained_boundary",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 17
+    },
+    "skip_last_digest_byte": {
+      "defect": "Receipts that differ only in their final byte compare equal.",
+      "mutate": [
+        {
+          "file": "rust/crates/format/src/publication_identity.rs",
+          "find": "while index < 32 {",
+          "replace": "while index < 31 {"
+        }
+      ],
+      "expect": [
+        {
+          "file": "rust/crates/format/src/publication_identity.rs",
+          "function": "same_publication_digest",
+          "category": "assertion failed"
+        }
+      ],
+      "min_verified_functions": 17
+    }
+  }
+}

@@ -834,6 +834,7 @@ pub(super) async fn owned_count(
     definition: &Definition,
     projection: OwnedProjection,
     request: super::OwnedCountRequest<'_>,
+    lifetime: Option<i64>,
 ) -> Result<super::OwnedRangeCount> {
     let OwnedProjection { fields, empty } = projection;
     let positions: Vec<_> = (0..fields.len()).collect();
@@ -843,12 +844,42 @@ pub(super) async fn owned_count(
     compound_bound(&mut range, &fields, request.upper, false, true)?;
     request.valid_at.next()?;
     let present = context.current_time.as_micros()?;
+    if lifetime.is_some() && request.valid_at != present {
+        return Err(super::uncovered_owned_range());
+    }
     if empty {
-        return Ok(super::OwnedRangeCount { count: 0, present, valid_at: request.valid_at });
+        return Ok(super::OwnedRangeCount { count: 0, present, valid_at: request.valid_at, expiry: None });
     }
     let (tree, root) = covered_root(context, snapshot, storage, definition, present).await?;
+    let count = rank_owned_range(&tree, &root, &range, request.valid_at, &context.cancellation).await?;
+    let expiry = if let Some(duration) = lifetime.filter(|_| count != 0) {
+        let mut live = present.0;
+        let mut expired = live.checked_add(duration).filter(|until| *until > live && *until < i64::MAX)
+            .ok_or_else(super::uncovered_owned_range)?;
+        // Every posting in this system root started at its immutable
+        // acceptance, no later than present. At present + duration all
+        // of them have expired. Probe only this root's valid-time ranks.
+        while expired - live > 1 {
+            context.check_cancelled()?;
+            let middle = live + (expired - live) / 2;
+            match rank_owned_range(&tree, &root, &range, Timestamp(middle), &context.cancellation).await? {
+                current if current == count => live = middle,
+                current if current < count => expired = middle,
+                _ => return Err(super::uncovered_owned_range()),
+            }
+        }
+        Some(Timestamp(expired))
+    } else {
+        None
+    };
+    Ok(super::OwnedRangeCount { count, present, valid_at: request.valid_at, expiry })
+}
+
+async fn rank_owned_range(
+    tree: &Tree, root: &Root, range: &Range, valid_at: Timestamp, cancellation: &CancellationToken,
+) -> Result<u64> {
     let mut count = 0u64;
-    for bucket in Bucket::at(request.valid_at) {
+    for bucket in Bucket::at(valid_at) {
         let compare = |key: KeyRef<'_>| match key {
             KeyRef::Posting(found, tuple, _) => {
                 found.cmp(&bucket).then_with(|| range.position(tuple))
@@ -857,16 +888,16 @@ pub(super) async fn owned_count(
         };
         let lower = tree
             .rank(
-                &root,
+                root,
                 |key| compare(key) == Ordering::Less,
-                &context.cancellation,
+                cancellation,
             )
             .await?;
         let upper = tree
             .rank(
-                &root,
+                root,
                 |key| compare(key) != Ordering::Greater,
-                &context.cancellation,
+                cancellation,
             )
             .await?;
         let bucket_count = upper
@@ -876,11 +907,7 @@ pub(super) async fn owned_count(
             .checked_add(bucket_count)
             .ok_or_else(cardinality_overflow)?;
     }
-    Ok(super::OwnedRangeCount {
-        count,
-        present,
-        valid_at: request.valid_at,
-    })
+    Ok(count)
 }
 
 pub(crate) enum RowBounds<'a> {

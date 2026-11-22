@@ -4,6 +4,105 @@ use rtdb_types::{
 };
 
 pub(crate) const CONTROL_TABLES: &str = "hosted_control_tables";
+const RESTORE: &str = "bj_rtdb_restore_hold";
+const NATIVE_FRONTIER: &str = "native-frontier.v1";
+
+#[derive(Debug, PartialEq, Eq, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HostedReplay {
+    binding: [u8; 32],
+    archive: [u8; 32],
+    through: u64,
+    previous: Option<rtdb_types::TransactionKey>,
+    source: rtdb_types::TransactionKey,
+    fingerprint: [u8; 32],
+}
+
+/// The only admitted hosted write shape for the held native restore ledger.
+/// The resolver checks each observation and its contents in the ordered base.
+pub fn hosted_replay_controls<'a>(
+    controls: impl Iterator<Item = &'a HostedControlWrite> + Clone,
+) -> Result<Option<HostedReplay>> {
+    if !controls.clone().any(|control| control.name() == RESTORE && !control.is_check()) {
+        return Ok(None);
+    }
+    let selected = |relation: &str, id: &str| controls.clone().find(|control| {
+        control.name() == relation && matches!(control.id(), EntityId::String(key) if key == id)
+    });
+    let check = |relation: &str, id: &str, exists: bool| {
+        selected(relation, id).is_some_and(|control| control.is_check() && control.expected().is_some() == exists)
+    };
+    let head = selected(RESTORE, NATIVE_FRONTIER).ok_or_else(replay_invalid)?;
+    let encoded = replay_body(head).ok_or_else(replay_invalid)?;
+    let replay: HostedReplay = serde_json::from_slice(encoded).map_err(|_| replay_invalid())?;
+    let source = replay.source;
+    let receipt_id = format!("native-transaction/{}", source.tx_id.0);
+    let receipt = selected(RESTORE, &receipt_id).ok_or_else(replay_invalid)?;
+    if controls.clone().filter(|control| control.name() == RESTORE).count() != 5
+        || controls.clone().filter(|control| control.name() == "bj_installation").count() != 1
+        || !check("bj_installation", "authority", true)
+        || !check(RESTORE, "restore", true) || !check(RESTORE, "archive", true)
+        || !check(RESTORE, "replayed", false)
+        || head.expected().is_some() != replay.previous.is_some()
+        || receipt.expected().is_some() || replay_body(receipt) != Some(encoded)
+        || source.tx_id.0 < 0 || source.system_time.0 <= 0
+        || u64::try_from(source.system_time.0).ok().and_then(|time| time.checked_mul(1_000)).is_none_or(|time| time > replay.through)
+        || replay.previous.is_some_and(|previous| previous.tx_id.0 < 0 || previous.tx_id >= source.tx_id
+            || previous.system_time.0 <= 0 || previous.system_time >= source.system_time)
+    {
+        return Err(replay_invalid());
+    }
+    Ok(Some(replay))
+}
+
+fn replay_body(control: &HostedControlWrite) -> Option<&[u8]> {
+    let document = control.replacement()?;
+    let Value::Binary(body) = document.get("binding")? else { return None; };
+    (document.len() == 2 && body.len() <= 4096).then_some(body.as_slice())
+}
+
+impl HostedReplay {
+    pub(crate) fn check_order(&self, ordered: Timestamp) -> Result<()> {
+        if u64::try_from(ordered.0).ok().and_then(|time| time.checked_mul(1_000)).is_none_or(|time| time <= self.through) {
+            return Err(replay_invalid());
+        }
+        Ok(())
+    }
+
+    pub(crate) fn check_base(&self, control: &HostedControlWrite, row: Option<&arrow_array::RecordBatch>) -> Result<()> {
+        use arrow_array::{Array, BinaryArray};
+        if control.name() != RESTORE { return Ok(()); }
+        let EntityId::String(id) = control.id() else { return Err(replay_invalid()); };
+        let binding = || -> Result<&[u8]> {
+            let row = row.filter(|row| row.num_rows() == 1).ok_or_else(replay_invalid)?;
+            let bytes = row.column_by_name("binding").and_then(|array| array.as_any().downcast_ref::<BinaryArray>())
+                .filter(|bytes| bytes.is_valid(0)).ok_or_else(replay_invalid)?;
+            Ok(bytes.value(0))
+        };
+        let matches = match id.as_str() {
+            "restore" => binding()? == self.binding.as_slice(),
+            "archive" => binding()?.split_first_chunk::<32>().is_some_and(|(archive, cut)| {
+                archive == &self.archive && cut == self.through.to_be_bytes().as_slice()
+            }),
+            NATIVE_FRONTIER if self.previous.is_some() => {
+                let bytes = binding()?;
+                if bytes.len() > 4096 { return Err(replay_invalid()); }
+                let previous: Self = serde_json::from_slice(bytes).map_err(|_| replay_invalid())?;
+                previous.binding == self.binding && previous.archive == self.archive && previous.through == self.through
+                    && Some(previous.source) == self.previous
+            }
+            _ => true,
+        };
+        if !matches { return Err(replay_invalid()); }
+        Ok(())
+    }
+
+    pub(crate) fn source_time(&self) -> Timestamp { self.source.system_time }
+}
+
+fn replay_invalid() -> Anomaly {
+    Anomaly::new(rtdb_types::AnomalyCategory::Conflict, "rtdb.hosted/restore", "Native replay requires its exact original transaction and held archive controls")
+}
 
 pub(crate) fn admits_name(name: &str) -> bool {
     name.starts_with("bj_") && !name.contains('-') && OwnedRelation::new(name).is_ok()
@@ -187,6 +286,44 @@ impl HostedControlWrite {
 
 fn invalid() -> Anomaly {
     Anomaly::incorrect("rtdb.hosted/control", "Invalid hosted control replacement")
+}
+
+#[cfg(test)]
+mod replay_tests {
+    use super::*;
+
+    #[test]
+    fn replay_requires_the_hold_and_identical_create_only_receipt() -> Result<()> {
+        let scope = PlacedAttemptScope::new("native-restore", 1)?;
+        let hold = OwnedRelation::new(RESTORE)?;
+        let fields = |id: &str| StructFields::from([("_id".into(), Value::Utf8(id.into()))]);
+        let (binding, archive, fingerprint) = ([1u8; 32], [2u8; 32], [3u8; 32]);
+        let body = serde_json::json!({"binding": binding, "archive": archive, "through": 4000,
+            "previous": null, "source": {"tx_id": 3, "system_time": 4}, "fingerprint": fingerprint}).to_string().into_bytes();
+        let replace = |id: &str, expected, body: &[u8]| {
+            let mut document = fields(id);
+            document.insert("binding".into(), Value::Binary(body.to_vec()));
+            HostedControlWrite::new(hold.clone(), scope, expected, document)
+        };
+        let mut controls = vec![
+            HostedControlWrite::check(OwnedRelation::new("bj_installation")?, scope, Some(Timestamp(9)), fields("authority"))?,
+            HostedControlWrite::check(hold.clone(), scope, Some(Timestamp(9)), fields("archive"))?,
+            HostedControlWrite::check(hold.clone(), scope, None, fields("replayed"))?,
+            replace(NATIVE_FRONTIER, None, &body)?,
+            replace("native-transaction/3", None, &body)?,
+            HostedControlWrite::check(hold.clone(), scope, Some(Timestamp(9)), fields("restore"))?,
+        ];
+        let replay = hosted_replay_controls(controls.iter())?.unwrap();
+        assert_eq!(replay.source_time(), Timestamp(4));
+        assert!(replay.check_order(Timestamp(4)).is_err());
+        assert!(replay.check_order(Timestamp(5)).is_ok());
+        controls[4] = replace("native-transaction/3", Some(Timestamp(9)), &body)?;
+        assert!(hosted_replay_controls(controls.iter()).is_err());
+        controls[4] = replace("native-transaction/3", None, &body)?;
+        controls.pop();
+        assert!(hosted_replay_controls(controls.iter()).is_err());
+        Ok(())
+    }
 }
 
 #[cfg(test)]

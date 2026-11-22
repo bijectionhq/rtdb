@@ -136,6 +136,8 @@ impl BlockCatalog {
     }
 }
 
+pub use crate::publication_identity::same_publication_digest;
+
 /// Digest of the encoded checkpoint root, before encryption or packing.
 pub fn publication_digest(bytes: &[u8]) -> [u8; 32] {
     use sha2::{Digest, Sha256};
