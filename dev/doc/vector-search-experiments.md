@@ -209,3 +209,22 @@ The rebuild and generation-retirement costs still need to be measured over susta
 The native suite passed all 83 tests and the SQL array suite passed all six tests.
 The separate release test of the centroid read path passed its full-shortlist removal, retained snapshot, and coverage fallback assertions.
 The full Gradle unit suite passed all 3,190 tests with the native library built from the draft branch.
+
+## Arrow path inventory
+
+The vector workload uses fixed-size float lists in the primary table.
+Here are the representation boundaries on that path and the work each one currently does.
+
+| Stage | Current representation and extra work | Arrow path |
+| --- | --- | --- |
+| Benchmark preparation | The HDF5 reader and centroid trainer use NumPy arrays, then write separate raw floats and cluster IDs. The Rust loader parses the floats one at a time. | Write Arrow IPC record batches with fixed-size float lists and the cluster IDs beside them. |
+| SQL and ADBC ingest | Native document operations carry a map per row and one `Value` per component. The ADBC ingest path turns Arrow rows back into those maps. The source transaction then builds Arrow columns for logging. | Keep typed input columns from ADBC and the benchmark loader. Validate row IDs and temporal bounds alongside the arrays. |
+| Source replay and staging | The source log uses Arrow IPC. Replay materializes each document, transaction staging clones it, and the event builder recreates the arrays before the replica log. | Retain the input Arrow arrays through transaction resolution and event construction. Share the existing event layout and temporal operation order. |
+| Flush, compaction, and scans | Event pages use Arrow. The direct gather for primitive columns excludes fixed-size lists, so embeddings decode into per-component values and are rebuilt when needed. | Gather compatible typed list children directly and preserve validity at both the list and component levels. |
+| SQL distance | Scalar projection rebuilds row values and walks the query vector again for each embedding. The result may be converted back to Arrow before top-k. | Prepare one query vector per invocation and compute an Arrow double distance column directly from the selected embedding buffers. |
+| Centroid index | The prototype writes a custom little-endian record per vector and decodes every component from bytes while scoring. | Store one range-addressable Arrow record batch per cluster and borrow buffers during probing. |
+| ANN handoff | Reranking turns candidate IDs into SQL text with one disjunct per ID, reparses it, and then scores resolved rows. | Pass an internal typed IID scope and reuse the same Arrow distance kernel after resolving those rows. |
+| Output | ADBC and Flight SQL use Arrow; PostgreSQL clients receive PostgreSQL protocol values. | Keep Arrow through execution and convert at the wire boundary selected by the client. |
+
+The relevant implementation boundaries are `ffi/src/statement.rs`, `tx/src/source.rs`, `tx/src/values.rs`, `tx/src/resolver.rs`, `index/src/live.rs`, `format/src/data.rs`, `query/src/columnar.rs`, and the native vector benchmark.
+A typed route must preserve missing and null values, invalid-component errors, numeric distance and tie behavior, and the table snapshot's visibility.
