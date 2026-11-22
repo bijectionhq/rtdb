@@ -345,13 +345,15 @@ The relation must already exist in the authenticated owner's namespace, and the 
 The FTS maintenance lane uses the private declaration to build the relation's search files.
 A successful declaration returns the same transaction-key Arrow row as Create.
 
-`rtdb.owned.SearchHeld.v4` takes the 16-byte held handle, a big-endian u16 partition count (1 to 32), then a relation prefix and a path prefix per partition.
+`rtdb.owned.SearchHeld.v5` takes the 16-byte held handle, a signed big-endian i64 valid instant or `i64::MIN` for the held present, then a big-endian u32 overlay byte length and the optional Arrow overlay bytes.
+Next comes a big-endian u16 partition count (1 to 32), then a relation prefix and a path prefix per partition.
 A big-endian u32 offset (0 to 4096), u16 limit (1 to 128), and evidence flag byte (0 or 1) follow, then the UTF-8 query (up to 4096 bytes).
 The reply contains `_id` as a typed union of string, keyword, signed Int64 and UUID, `score: Float64`, and `partition: UInt64` as the zero-based request ordinal.
 Results sort by descending BM25 score across the full selected corpus, then by complete typed identity and partition ordinal.
-The held present and valid instant are in schema metadata, alongside `rtdb.owned.search_total` (the decimal count of all verified matches before slicing) and `rtdb.owned.search_scope` (the lowercase hex SHA-256 of the held handle, ordered relation/path frame, and query under the v4 domain tag). The scope binds pages only within the same hold. An empty result has a schema and no record batch.
+The held present and valid instant are in schema metadata, alongside `rtdb.owned.search_total` (the decimal count of all verified matches before slicing) and `rtdb.owned.search_scope` (the lowercase hex SHA-256 of the held handle, valid coordinate, overlay, ordered relation/path frame, and query under the v5 domain tag). The scope binds pages only within the same hold. An empty result has a schema and no record batch.
 Every selected partition must have complete format 11 search artefacts at the held cut. Corpus membership and cross-file temporal cuts use the complete canonical typed identity. Each matched posting nominates a physical row, which must have that same identity and winning revision at the held cut.
 A placed read with evidence requested publishes `rtdb.owned.search_witnesses` as the concatenated lowercase hex of one 16-byte range nonce per partition in request order. This also covers a successful empty result.
+An overlay requires the configured placed hosted-control owner, the live Root validity and requested evidence. One Arrow batch carries `partition: UInt64`, `_id: Utf8`, and nullable `text: Utf8` for one to 64 exact staged shadows. Null text masks the old run. The whole-relation witnesses still describe the original source.
 
 `rtdb.owned.DeclareUniquePath.v1` uses the relation prefix and a terminated Arrow IPC stream with one batch and one row.
 Its fields are `_id: Utf8` for the path name and `column: Utf8` for the canonical Binary key column.
@@ -478,12 +480,7 @@ It takes the world UUID, one signed big-endian 64-bit exclusive deadline in Unix
 The remaining bytes are the existing hosted control groups. Only check rows from the placed allowlist are admitted.
 The ordered transaction checks the world registration, placement, deadline, local point revisions, root erasure frontiers, and hosted ownership before issuing the transaction-key receipt.
 
-`rtdb.owned.SearchHeldStaged.v1` requires the configured placed hosted-control owner and original live Root hold.
-Following the 16-byte hold, it takes a big-endian u32 length and one Arrow batch with `partition: UInt64`, `_id: Utf8`, and nullable `text: Utf8`. The remainder uses the SearchHeld.v4 argument framing with evidence required.
-The batch contains one to 64 complete staged shadows in selected partition order. Null text masks the old run and contributes no text, covering deletion and absent/null fields.
-Ranking uses one complete corpus, and the reply binds the entire shadow frame into the usual rank scope. The whole-relation witnesses still describe the original source. The action cannot commit the supplied shadows.
-
-`rtdb.owned.SearchHeldWorld.v1` takes the original 16-byte world handle and a signed big-endian i64 valid instant, then the same partition, offset, limit, evidence flag and query framing as SearchHeld.v4.
+`rtdb.owned.SearchHeldWorld.v1` takes the original 16-byte world handle and a signed big-endian i64 valid instant, then the same partition, offset, limit, evidence flag and query framing as SearchHeld.v5.
 The evidence flag must be one, and every partition must have unchanged Root purge frontiers since the archive cut. Retained worlds require complete clear-text artefacts.
 Writable held and proposal worlds require a declared clear-text column in the archived relation and installed world schema. They exhaust the exact held local UTF-8 shadow keys, including tombstones and replacements without text. Matching typed archived runs are excluded before collecting token lengths or term frequencies. The local text and unshadowed archive contribute to one corpus and one rank window.
 The indexed branch limits the overlay to 4,096 shadow keys and 8 MiB of text, and uses the existing 100,000 matching-candidate limit across both sources. Only unavailable archive artefact coverage permits the bounded exact row path (4,096 visible identities and 8 MiB of text). Incomplete identity pages or unavailable purge coverage refuse the operation.

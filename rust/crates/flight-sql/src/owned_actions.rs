@@ -172,8 +172,7 @@ pub(crate) const HELD_WORLD_OVERLAY_RANGE_V1: &str = "rtdb.owned.ReadHeldWorldOv
 #[derive(Clone, Copy)]
 pub(crate) enum WorldOrder { ParentRange, ParentCount, OverlayRange }
 pub(crate) const SEARCH_HELD_WORLD_V1: &str = "rtdb.owned.SearchHeldWorld.v1";
-pub(crate) const SEARCH_HELD_OWNED_STAGED_V1: &str = "rtdb.owned.SearchHeldStaged.v1";
-pub(crate) const SEARCH_HELD_OWNED_V4: &str = "rtdb.owned.SearchHeld.v4";
+pub(crate) const SEARCH_HELD_OWNED_V5: &str = "rtdb.owned.SearchHeld.v5";
 pub(crate) const HELD_OWNED_RANGE_V1: &str = "rtdb.owned.ReadHeldRange.v1";
 #[derive(Clone, Copy)]
 pub(crate) enum HeldRangeFormat { Leading, Full, FixedValid, Historical }
@@ -1260,7 +1259,7 @@ impl Service {
         Ok(reply)
     }
 
-    pub(crate) async fn search_held_owned_action(&self, call: &Call, body: &[u8], staged: bool) -> Result<ActionResult, Status> {
+    pub(crate) async fn search_held_owned_action(&self, call: &Call, body: &[u8]) -> Result<ActionResult, Status> {
         if !self.0.config.owned_native_actions { return Err(unsupported()); }
         let (handle, request) = body.split_first_chunk::<16>().ok_or_else(|| invalid("Owned held search has no handle"))?;
         let handle = Bytes::copy_from_slice(handle);
@@ -1269,16 +1268,22 @@ impl Service {
             if let Lookup::Found(entry) = self.0.owned_reads.take(&handle) { entry.close(); }
             return Err(status(error));
         }
-        let (overlay, request, staged_scope) = if staged {
+        let (valid, request) = request.split_first_chunk::<8>()
+            .ok_or_else(|| invalid("Held search has no valid instant"))?;
+        let valid = i64::from_be_bytes(*valid);
+        let valid = (valid != i64::MIN).then_some(Timestamp(valid));
+        if let Some(valid) = valid { rtdb_types::Interval::at(valid).map_err(status)?; }
+        let (length, request) = request.split_first_chunk::<4>()
+            .ok_or_else(|| invalid("Held search has no overlay length"))?;
+        let (ipc, request) = request.split_at_checked(u32::from_be_bytes(*length) as usize)
+            .ok_or_else(|| invalid("Held search has a truncated overlay"))?;
+        let (overlay, staged_scope) = if ipc.is_empty() {
+            (None, None)
+        } else {
+            if valid.is_some() { return Err(invalid("A staged search requires current validity")); }
             self.hosted_control_policy(call)?;
             let scope = self.hosted_control_scope(call).await?;
-            let (length, request) = request.split_first_chunk::<4>()
-                .ok_or_else(|| invalid("Staged search has no overlay length"))?;
-            let (ipc, request) = request.split_at_checked(u32::from_be_bytes(*length) as usize)
-                .ok_or_else(|| invalid("Staged search has a truncated overlay"))?;
-            (Some(request_batch(call, ipc)?), request, Some(scope))
-        } else {
-            (None, request, None)
+            (Some(request_batch(call, ipc)?), Some(scope))
         };
         let prefix_len = body.len() - request.len();
         let rank = owned_rank_request(call, request)?;
@@ -1309,7 +1314,7 @@ impl Service {
             Ok(corpus)
         }).transpose()?;
         let (page, witnesses) = held.snapshot.ranked_search_with_overlay(
-            &rank.partitions, rank.query, rank.offset, rank.limit, rank.observe, overlay,
+            &rank.partitions, rank.query, rank.offset, rank.limit, rank.observe, valid, overlay,
         ).await.map_err(status)?;
         if let Some(scope) = staged_scope {
             if witnesses.len() != rank.partitions.len()
@@ -1326,9 +1331,8 @@ impl Service {
             }
         }
         let present = held.snapshot.present().system_time;
-        let domain = if staged { b"rtdb.owned.search.staged.v1\0".as_slice() } else { b"rtdb.owned.search.held.v4\0".as_slice() };
-        let scope = owned_rank_scope(domain, &body[..prefix_len + rank.frame_len], rank.query);
-        let reply = self.owned_rank_reply(call, page, scope, nonces, present, present)?;
+        let scope = owned_rank_scope(b"rtdb.owned.search.held.v5\0", &body[..prefix_len + rank.frame_len], rank.query);
+        let reply = self.owned_rank_reply(call, page, scope, nonces, present, valid.unwrap_or(present))?;
         held.snapshot.check_relations(rank.partitions.iter().map(|(relation, _)| relation)).map_err(status)?;
         Ok(reply)
     }
