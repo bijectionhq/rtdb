@@ -100,6 +100,9 @@ pub(crate) const HELD_OWNED_POINT_V2: &str = "rtdb.owned.ReadHeldPoint.v2";
 pub(crate) const HELD_OWNED_VALID_DURING_V1: &str = "rtdb.owned.ReadHeldValidDuring.v1";
 pub(crate) const CLOSE_OWNED_READ_V1: &str = "rtdb.owned.CloseRead.v1";
 pub(crate) const READ_WORLD_POINT_V1: &str = "rtdb.owned.ReadWorldPoint.v1";
+pub(crate) const OPEN_WORLD_READ_V1: &str = "rtdb.owned.OpenWorldRead.v1";
+pub(crate) const HELD_WORLD_POINT_V1: &str = "rtdb.owned.ReadHeldWorldPoint.v1";
+pub(crate) const CLOSE_WORLD_READ_V1: &str = "rtdb.owned.CloseWorldRead.v1";
 pub(crate) const DROP_WORLD_V1: &str = "rtdb.owned.DropWorld.v1";
 pub(crate) const FORK_WORLD_V1: &str = "rtdb.owned.ForkWorld.v1";
 pub(crate) const COMMIT_WORLD_V1: &str = "rtdb.owned.CommitWorld.v1";
@@ -156,6 +159,19 @@ impl OwnedReadResource {
 }
 
 impl Leased for OwnedReadResource {
+    fn close(&self) { self.snapshot.close(); }
+}
+
+pub(crate) struct OwnedWorldReadResource {
+    snapshot: Box<dyn crate::OwnedWorldRead>,
+    owner: ResourceOwner,
+    session: String,
+    database: String,
+    _permit: OwnedSemaphorePermit,
+    _reservation: Arc<MemoryReservation>,
+}
+
+impl Leased for OwnedWorldReadResource {
     fn close(&self) { self.snapshot.close(); }
 }
 
@@ -734,6 +750,72 @@ impl Service {
             crate::WorldCall { node: &self.0.node, attachment: &attachment, session: &mut session, cancellation: &call.cancellation },
             crate::WorldPoint { world: Uuid::from_bytes(*world), relation: &relation, id: &id, valid_at },
         ).await.map_err(status)?;
+        self.world_point_reply(call, result, valid_at)
+    }
+
+    pub(crate) async fn open_world_read_action(&self, call: &Call, body: &[u8]) -> Result<ActionResult, Status> {
+        if !self.0.config.owned_native_actions { return Err(unsupported()); }
+        let host = self.0.config.owned_world_host.as_ref().ok_or_else(unsupported)?;
+        let world: [u8; 16] = body.try_into().map_err(|_| invalid("Owned world read open requires a world UUID"))?;
+        let (_, attachment) = call.session.resolve_database(Some(&call.database), &self.0.node)?;
+        let attachment = attachment.ok_or_else(unsupported)?;
+        let permit = Arc::clone(&self.0.owned_read_slots).try_acquire_owned()
+            .map_err(|_| Status::resource_exhausted("The node has too many retained owned reads"))?;
+        let reservation = call.reserve(wire::add(2048, wire::add(call.session.id.len(), call.database.len())?)?)?;
+        let reply_charge = call.reserve(64)?;
+        let connection = self.connection(call, &call.database).await?;
+        let mut session = connection.borrow().await?;
+        require_idle(&session)?;
+        let snapshot = host.open_world_read(
+            crate::WorldCall { node: &self.0.node, attachment: &attachment, session: &mut session, cancellation: &call.cancellation },
+            Uuid::from_bytes(world),
+        ).await.map_err(status)?;
+        let handle = Uuid::new_v4();
+        let mut reply = Vec::with_capacity(24);
+        reply.extend_from_slice(handle.as_bytes());
+        reply.extend_from_slice(&snapshot.present().0.to_be_bytes());
+        let held = Arc::new(OwnedWorldReadResource {
+            snapshot, owner: call.session.owner(), session: call.session.id.clone(), database: call.database.clone(),
+            _permit: permit, _reservation: reservation,
+        });
+        self.0.owned_world_reads.insert(Bytes::copy_from_slice(handle.as_bytes()), held, READ_IDLE, READ_IDLE, false, 16).map_err(status)?;
+        Ok(ActionResult { body: wire::retain(reply, reply_charge) })
+    }
+
+    fn owned_world_read(&self, call: &Call, handle: &Bytes) -> Result<Arc<OwnedWorldReadResource>, Status> {
+        let entry = found(self.0.owned_world_reads.lookup(handle, false), "owned world read")?;
+        if entry.session != call.session.id || entry.database != call.database || !call.session.owns(&entry.owner) {
+            return Err(Status::not_found("unknown owned world read"));
+        }
+        Ok(entry)
+    }
+
+    pub(crate) async fn held_world_point_action(&self, call: &Call, body: &[u8]) -> Result<ActionResult, Status> {
+        if !self.0.config.owned_native_actions || self.0.config.owned_world_host.is_none() { return Err(unsupported()); }
+        let (handle, body) = body.split_first_chunk::<16>().ok_or_else(|| invalid("Owned world point has no held handle"))?;
+        let held = self.owned_world_read(call, &Bytes::copy_from_slice(handle))?;
+        let (relation, id, valid, _identity) = point_request(call, body, PointTime::Required)?;
+        let valid_at = valid.ok_or_else(|| invalid("Owned world point requires a valid_micros instant"))?;
+        let result = held.snapshot.read_point(&relation, &id, valid_at).await.map_err(status)?;
+        if result.present != held.snapshot.present() {
+            return Err(Status::internal("Owned world point changed its held present"));
+        }
+        let reply = self.world_point_reply(call, result, valid_at)?;
+        held.snapshot.check().map_err(status)?;
+        Ok(reply)
+    }
+
+    pub(crate) fn close_world_read_action(&self, call: &Call, body: &[u8]) -> Result<(), Status> {
+        if !self.0.config.owned_native_actions || self.0.config.owned_world_host.is_none() { return Err(unsupported()); }
+        if body.len() != 16 { return Err(invalid("Owned world read close requires one held handle")); }
+        let handle = Bytes::copy_from_slice(body);
+        self.owned_world_read(call, &handle)?;
+        let entry = found(self.0.owned_world_reads.take(&handle), "owned world read")?;
+        entry.close();
+        Ok(())
+    }
+
+    fn world_point_reply(&self, call: &Call, result: crate::WorldPointResult, valid_at: Timestamp) -> Result<ActionResult, Status> {
         if let Some(row) = result.row {
             let crate::WorldPointRow { fields: row, revision, reservation: _retained } = row;
             let bytes = Value::document_retained_bytes(&row).map_err(status)?;

@@ -63,38 +63,27 @@ pub async fn read_checkpoint_owned_point(
     point: CheckpointPoint<'_>,
     resources: CheckpointReadResources<'_>,
 ) -> Result<Option<Vec<OwnedBatch>>> {
-    let memory = resources.memory;
     with_checkpoint_context(
-        directory,
-        archive,
-        keys,
-        hosted_task,
-        world,
-        resources,
-        |context| async move {
-            let Some(mut cursor) = open_owned_point(
-                context,
-                point.owner,
-                point.relation,
-                point.id,
-                point.valid,
-                None,
-            )
-            .await?
-            else {
-                return Ok(None);
-            };
-            let mut batches = Vec::new();
-            while let Some(batch) = cursor.next_batch().await? {
-                for row in 0..batch.batch().num_rows() {
-                    owned_row_revision(batch.batch(), row, point.id, memory)?;
-                }
-                batches.push(batch);
-            }
-            Ok(Some(batches))
-        },
-    )
-    .await
+        directory, archive, keys, hosted_task, world, resources,
+        |context| read_checkpoint_point_in_context(context, point),
+    ).await
+}
+
+pub(super) async fn read_checkpoint_point_in_context(
+    context: Arc<QueryContext>, point: CheckpointPoint<'_>,
+) -> Result<Option<Vec<OwnedBatch>>> {
+    let memory = Arc::clone(&context.memory);
+    let Some(mut cursor) = open_owned_point(
+        context, point.owner, point.relation, point.id, point.valid, None,
+    ).await? else { return Ok(None); };
+    let mut batches = Vec::new();
+    while let Some(batch) = cursor.next_batch().await? {
+        for row in 0..batch.batch().num_rows() {
+            owned_row_revision(batch.batch(), row, point.id, &memory)?;
+        }
+        batches.push(batch);
+    }
+    Ok(Some(batches))
 }
 
 pub(super) async fn with_checkpoint_context<T, F, Fut>(
@@ -144,6 +133,9 @@ where
     }
     let deployment = selected.deployment.to_string();
     let admit = |record: &rtdb_directory::DeploymentRecord| {
+        if resources.cancellation.is_cancelled() {
+            return Err(unavailable("The retained checkpoint read was cancelled"));
+        }
         require_capture_open(record, selected.capture)?;
         let (capture, manifest) =
             capture_receipt(record, archive, selected.deployment, selected.capture)?
@@ -169,92 +161,94 @@ where
         None,
         |record| admit(record).map(|_| ()),
         |record, _, region| async {
-            let capture = admit(&record)?;
-            let bucket = archive.bucket(region).await?;
-            if read(
-                bucket.as_ref(),
-                &archive_witness(selected.deployment, selected.capture)?,
-            )
-            .await?
-            .as_ref()
-                != Some(&capture)
-            {
-                return Err(inconsistent(
-                    "The archive belongs to another captured checkpoint",
-                ));
-            }
-            let (manifest, material) =
-                verified_archive(bucket.clone(), &capture, selected.manifest, keys).await?;
-            let store: Arc<dyn ObjectStore> = Arc::new(CapturedObjects {
-                files: PrefixedStore::new(
-                    bucket,
-                    format!(
-                        "checkpoint-captures/{}/{}/objects",
-                        selected.deployment, selected.capture
-                    ),
-                ),
-                objects: manifest
-                    .objects
-                    .into_iter()
-                    .map(|object| Ok((key(&object.name)?, object)))
-                    .collect::<Result<_>>()?,
-                cipher: Cipher::new(&material)?,
-            });
-            let memory = resources.node.query.query_memory(resources.memory);
-            let storage = Arc::new(BufferPool::with_metadata_budget(
-                store.clone(),
-                resources.cache,
-                memory.clone(),
-            ));
-            let blocks = BlockStore::new(
-                store,
-                storage.clone(),
-                memory.clone(),
-                resources.node.file_size_target,
-            )?;
-            let epoch = StorageEpoch(capture.log_epoch);
-            let checkpoint = PublishedCheckpoint {
-                block: BlockIndex(capture.checkpoint.block),
-                boundary: ReplicaPosition::from_epoch_offset(epoch, capture.checkpoint.boundary)?,
-                root_sha256: capture.checkpoint.root_sha256,
-            };
-            let source_floor = SourcePosition::from_epoch_offset(epoch, capture.checkpoint.source)?;
-            let recovered = blocks
-                .recover(
-                    resources.node.trie,
-                    source_floor,
-                    rtdb_types::Timestamp(capture.checkpoint.system_time),
-                    BlockDiscovery::AtPublished(checkpoint),
+            resources.cancellation.run_until_cancelled(async {
+                let capture = admit(&record)?;
+                let bucket = archive.bucket(region).await?;
+                if read(
+                    bucket.as_ref(),
+                    &archive_witness(selected.deployment, selected.capture)?,
                 )
-                .await?;
-            let snapshot = recovered.partition.snapshot();
-            let basis = snapshot.tx_basis().ok_or_else(|| inconsistent("The retained checkpoint has no transaction basis"))?;
-            if basis.system_time.0 != capture.checkpoint.system_time
-                || selected.expected_basis.is_some_and(|expected| basis != expected)
-            {
-                return Err(inconsistent("The retained checkpoint has a different transaction key"));
-            }
-            let name = record.name;
-            let catalog = CatalogSnapshot::new(
-                &name,
-                BTreeMap::from([(
-                    name.clone(),
-                    DatabaseSnapshot {
-                        partitions: vec![snapshot],
-                        storage,
-                    },
-                )]),
-                true,
-            )?;
-            let context = QueryContext::new(
-                catalog,
-                memory,
-                basis.system_time,
-                "UTC",
-                resources.node.query.clone(),
-                resources.cancellation,
-            )?;
-            run(context, basis).await
+                .await?
+                .as_ref()
+                    != Some(&capture)
+                {
+                    return Err(inconsistent(
+                        "The archive belongs to another captured checkpoint",
+                    ));
+                }
+                let (manifest, material) =
+                    verified_archive(bucket.clone(), &capture, selected.manifest, keys).await?;
+                let store: Arc<dyn ObjectStore> = Arc::new(CapturedObjects {
+                    files: PrefixedStore::new(
+                        bucket,
+                        format!(
+                            "checkpoint-captures/{}/{}/objects",
+                            selected.deployment, selected.capture
+                        ),
+                    ),
+                    objects: manifest
+                        .objects
+                        .into_iter()
+                        .map(|object| Ok((key(&object.name)?, object)))
+                        .collect::<Result<_>>()?,
+                    cipher: Cipher::new(&material)?,
+                });
+                let memory = resources.node.query.query_memory(resources.memory);
+                let storage = Arc::new(BufferPool::with_metadata_budget(
+                    store.clone(),
+                    resources.cache,
+                    memory.clone(),
+                ));
+                let blocks = BlockStore::new(
+                    store,
+                    storage.clone(),
+                    memory.clone(),
+                    resources.node.file_size_target,
+                )?;
+                let epoch = StorageEpoch(capture.log_epoch);
+                let checkpoint = PublishedCheckpoint {
+                    block: BlockIndex(capture.checkpoint.block),
+                    boundary: ReplicaPosition::from_epoch_offset(epoch, capture.checkpoint.boundary)?,
+                    root_sha256: capture.checkpoint.root_sha256,
+                };
+                let source_floor = SourcePosition::from_epoch_offset(epoch, capture.checkpoint.source)?;
+                let recovered = blocks
+                    .recover(
+                        resources.node.trie,
+                        source_floor,
+                        rtdb_types::Timestamp(capture.checkpoint.system_time),
+                        BlockDiscovery::AtPublished(checkpoint),
+                    )
+                    .await?;
+                let snapshot = recovered.partition.snapshot();
+                let basis = snapshot.tx_basis().ok_or_else(|| inconsistent("The retained checkpoint has no transaction basis"))?;
+                if basis.system_time.0 != capture.checkpoint.system_time
+                    || selected.expected_basis.is_some_and(|expected| basis != expected)
+                {
+                    return Err(inconsistent("The retained checkpoint has a different transaction key"));
+                }
+                let name = record.name;
+                let catalog = CatalogSnapshot::new(
+                    &name,
+                    BTreeMap::from([(
+                        name.clone(),
+                        DatabaseSnapshot {
+                            partitions: vec![snapshot],
+                            storage,
+                        },
+                    )]),
+                    true,
+                )?;
+                let context = QueryContext::new(
+                    catalog,
+                    memory,
+                    basis.system_time,
+                    "UTC",
+                    resources.node.query.clone(),
+                    resources.cancellation,
+                )?;
+                run(context, basis).await
+            }).await.ok_or_else(|| unavailable("The retained checkpoint read was cancelled"))?
         },
     )
     .await

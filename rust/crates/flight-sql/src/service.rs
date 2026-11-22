@@ -23,6 +23,7 @@ pub(crate) struct Inner {
     pub transactions: Registry<Bytes, Transaction>,
     pub prepared: Registry<Bytes, Prepared>,
     pub owned_reads: Registry<Bytes, crate::owned_actions::OwnedReadResource>,
+    pub owned_world_reads: Registry<Bytes, crate::owned_actions::OwnedWorldReadResource>,
     pub owned_read_slots: Arc<Semaphore>,
     auth: Authentication,
     permits: Arc<Semaphore>,
@@ -69,11 +70,11 @@ impl Call {
 impl Service {
     pub fn new(node: Node, auth: Arc<Authenticator>, config: FlightConfig, clock: Arc<dyn Clock>, cancellation: CancellationToken, status: watch::Sender<ServerStatus>) -> Self {
         let memory = Arc::clone(node.memory());
-        Self(Arc::new(Inner { sessions: Registry::new(clock.clone(), memory.clone()), transactions: Registry::new(clock.clone(), memory.clone()), prepared: Registry::new(clock.clone(), memory.clone()), owned_reads: Registry::new(clock, memory), owned_read_slots: Arc::new(Semaphore::new(64)), auth: Authentication::new(auth), permits: Arc::new(Semaphore::new(config.maximum_concurrent_calls)), node, config, cancellation, status }))
+        Self(Arc::new(Inner { sessions: Registry::new(clock.clone(), memory.clone()), transactions: Registry::new(clock.clone(), memory.clone()), prepared: Registry::new(clock.clone(), memory.clone()), owned_reads: Registry::new(clock.clone(), memory.clone()), owned_world_reads: Registry::new(clock, memory), owned_read_slots: Arc::new(Semaphore::new(64)), auth: Authentication::new(auth), permits: Arc::new(Semaphore::new(config.maximum_concurrent_calls)), node, config, cancellation, status }))
     }
     pub fn memory(&self) -> &Arc<MemoryBudget> { self.0.node.memory() }
-    pub fn sweep(&self) { self.0.sessions.sweep(); self.0.transactions.sweep(); self.0.prepared.sweep(); self.0.owned_reads.sweep(); self.publish(); }
-    pub fn close(&self) { self.0.owned_reads.close(); self.0.prepared.close(); self.0.transactions.close(); self.0.sessions.close(); self.publish(); }
+    pub fn sweep(&self) { self.0.sessions.sweep(); self.0.transactions.sweep(); self.0.prepared.sweep(); self.0.owned_reads.sweep(); self.0.owned_world_reads.sweep(); self.publish(); }
+    pub fn close(&self) { self.0.owned_world_reads.close(); self.0.owned_reads.close(); self.0.prepared.close(); self.0.transactions.close(); self.0.sessions.close(); self.publish(); }
     pub fn publish(&self) {
         let counts = (self.0.sessions.len(), self.0.transactions.len(), self.0.prepared.len());
         self.0.status.send_if_modified(|status| {

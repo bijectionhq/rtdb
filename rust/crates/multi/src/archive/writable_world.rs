@@ -16,6 +16,9 @@ use super::{
 };
 use crate::admin::update_installation;
 
+mod held;
+pub(crate) use held::{HeldCheckpointWorld, WorldArchive, open_held_checkpoint_world};
+
 const MAX_RETAINED_WORLDS: usize = 64;
 
 fn now() -> Timestamp {
@@ -391,6 +394,44 @@ fn decode_point(
     Ok(found)
 }
 
+impl OpenWorld {
+    fn check(&self) -> Result<()> {
+        self.snapshot.check()?;
+        if self.retained.until <= now() { return Err(OwnedWorld::unavailable()); }
+        Ok(())
+    }
+
+    fn parent(&self, deployment: Uuid) -> CheckpointReadWorld {
+        CheckpointReadWorld {
+            deployment,
+            capture: self.retained.capture,
+            manifest_sha256: self.retained.manifest_sha256.clone(),
+            basis: self.retained.basis,
+        }
+    }
+
+    /// Outer absence allows archive fallback. A local tombstone answers absence.
+    async fn read_local(
+        &self, relation: &OwnedRelation, id: &EntityId, valid_at: Timestamp, memory: &Arc<MemoryBudget>,
+    ) -> Result<Option<Option<WorldFact>>> {
+        let local = relation.in_world(self.record.id)?;
+        let Some(mut cursor) = self.snapshot.open_point_at(&local, id, Some(valid_at)).await? else {
+            return Ok(None);
+        };
+        let mut batches = Vec::new();
+        while let Some(batch) = cursor.next_batch().await? {
+            if batch.batch().num_rows() != 0 { batches.push(batch); }
+        }
+        let Some(fact) = decode_point(batches, id, memory)? else { return Ok(None); };
+        let reservation = memory.reserve(WorldShadow::decode_bound(&fact.row)?)?;
+        let visible = match WorldShadow::from_record(&fact.row)? {
+            WorldShadow::Deleted => None,
+            WorldShadow::Present(row) => Some(WorldFact { row, revision: fact.revision, _reservation: reservation }),
+        };
+        Ok(Some(visible))
+    }
+}
+
 /// A local tombstone suppresses the pinned parent's row for this full identity.
 pub async fn read_checkpoint_world_point(
     directory: &dyn Directory,
@@ -406,61 +447,19 @@ pub async fn read_checkpoint_world_point(
     resources: CheckpointReadResources<'_>,
 ) -> Result<WorldPoint> {
     let valid = Interval::at(valid_at)?;
-    let OpenWorld {
-        retained, snapshot, ..
-    } = open_world(directory, archive, session, deployment, world).await?;
-    let present = snapshot.present();
-    let local = relation.in_world(Iid(*world.as_bytes()))?;
+    let open = open_world(directory, archive, session, deployment, world).await?;
+    let present = open.snapshot.present();
     let memory = resources.memory;
-    if let Some(mut cursor) = snapshot.open_point_at(&local, id, Some(valid_at)).await? {
-        let mut batches = Vec::new();
-        while let Some(batch) = cursor.next_batch().await? {
-            if batch.batch().num_rows() != 0 {
-                batches.push(batch);
-            }
-        }
-        if let Some(fact) = decode_point(batches, id, memory)? {
-            snapshot.check()?;
-            if retained.until <= now() {
-                return Err(OwnedWorld::unavailable());
-            }
-            let reservation = memory.reserve(WorldShadow::decode_bound(&fact.row)?)?;
-            let visible = match WorldShadow::from_record(&fact.row)? {
-                WorldShadow::Deleted => None,
-                WorldShadow::Present(row) => Some(WorldFact {
-                    row,
-                    revision: fact.revision,
-                    _reservation: reservation,
-                }),
-            };
-            return Ok(WorldPoint { present, fact: visible });
-        }
+    if let Some(fact) = open.read_local(relation, id, valid_at, memory).await? {
+        open.check()?;
+        return Ok(WorldPoint { present, fact });
     }
-    let parent = CheckpointReadWorld {
-        deployment,
-        capture: retained.capture,
-        manifest_sha256: retained.manifest_sha256,
-        basis: retained.basis,
-    };
     let batches = read_checkpoint_owned_point(
-        directory,
-        archive,
-        keys,
-        hosted_task,
-        &parent,
-        CheckpointPoint {
-            owner: &retained.owner,
-            relation,
-            id,
-            valid: Some(valid),
-        },
+        directory, archive, keys, hosted_task, &open.parent(deployment),
+        CheckpointPoint { owner: &open.retained.owner, relation, id, valid: Some(valid) },
         resources,
-    )
-    .await?;
-    snapshot.check()?;
-    if retained.until <= now() {
-        return Err(OwnedWorld::unavailable());
-    }
+    ).await?;
+    open.check()?;
     let fact = decode_point(batches.unwrap_or_default(), id, memory)?;
     Ok(WorldPoint { present, fact })
 }
