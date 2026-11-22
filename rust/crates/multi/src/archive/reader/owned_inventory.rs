@@ -1,7 +1,7 @@
 use std::{collections::BTreeMap, sync::Arc, time::Duration};
 
 use rtdb_columnar::MemoryBudget;
-use rtdb_directory::{Directory, HostedTask};
+use rtdb_directory::{CheckpointTransferTerminal, Directory, HostedTask, Lifecycle};
 use rtdb_format::catalog::CheckpointContents;
 use rtdb_node::{NodeOptions, ReadFence};
 use rtdb_query::{CatalogSnapshot, DatabaseSnapshot, QueryContext, read_owned_schema_catalog};
@@ -51,6 +51,88 @@ pub(crate) async fn inspect_staged_owned_relations(
         let result = tokio::time::timeout(Duration::from_secs(25), inspect(&authority, verified.store, &stop)).await;
         stop.cancel();
         result.map_err(|_| unavailable("The staged owned relation inventory timed out"))?
+    }).await
+}
+
+/// Verify the source-owned terminal receipt against the actual destination
+/// inventory without exposing the replay overlay to serving traffic.
+pub(crate) async fn verify_checkpoint_transfer_target(
+    directory: Arc<dyn Directory>,
+    storage: &CellStorage,
+    keys: &dyn KeyService,
+    selector: StageSelector,
+    hosted_task: Option<HostedTask>,
+) -> Result<CheckpointTransferTerminal> {
+    use crate::{admin::administration_stream, archive::{archive_lifetime_floors_digest, replica_suffix}};
+
+    let (source, capture, org) = selector.source.as_ref()
+        .ok_or_else(|| inconsistent("Transfer replay requires the authenticated original source"))?;
+    let source = directory.deployment(&source.to_string()).await?
+        .filter(|record| record.org == *org && record.lifecycle == Lifecycle::Restoring && record.holder.is_none())
+        .ok_or_else(|| unavailable("The fenced source installation is unavailable"))?;
+    let terminal = source.checkpoint_transfer_terminal.as_deref()
+        .filter(|terminal| source.checkpoint_transfer_fence.as_deref() == Some(&terminal.fence)
+            && source.epoch == terminal.fence.fenced_writer_epoch
+            && terminal.fence.destination.intent.capture == *capture
+            && terminal.fence.destination.intent.destination == selector.destination
+            && terminal.fence.destination.intent.operation == selector.operation
+            && terminal.fence.destination.staged_manifest_sha256.as_deref() == Some(selector.manifest_sha256.as_str()))
+        .ok_or_else(|| inconsistent("The source has no terminal receipt for the exact target attempt"))?
+        .clone();
+    let replay_directory = Arc::clone(&directory);
+    with_stage(directory, storage, keys, selector, hosted_task, |authority, record, verified| async move {
+        if verified.contents != CheckpointContents::Replay
+            || record.checkpoint_transfer_fence.as_deref() != Some(&terminal.fence)
+            || authority.stage != terminal.fence.destination
+        {
+            return Err(inconsistent("The destination inventory has another transfer fence"));
+        }
+        let stop = CancellationToken::new();
+        let result = tokio::time::timeout(Duration::from_secs(25), async {
+            let entries = if let Some(digest) = terminal.replica_sha256 {
+                let stream = administration_stream(replay_directory.as_ref(), &source, 4 << 20).await?;
+                let first = authority.stage.checkpoint.boundary.checked_add(1)
+                    .ok_or_else(|| inconsistent("The checkpoint has no terminal replica successor"))?;
+                let certificate = rtdb_logkeeper::JournalDigest::from_digest_bytes(
+                    source.stream("replica"), [first, terminal.replica_through], digest,
+                );
+                let entries = rtdb_logkeeper::copy_certified_range(
+                    &stream, &certificate, replica_suffix::MAX_SUFFIX_BYTES, replica_suffix::MAX_SUFFIX_ENTRIES,
+                ).await?;
+                rtdb_logkeeper::verify_certified_range(&certificate, &entries)?;
+                entries
+            } else {
+                if terminal.replica_through != authority.stage.checkpoint.boundary {
+                    return Err(inconsistent("The terminal replica interval has no certificate"));
+                }
+                Vec::new()
+            };
+
+            let (mut recovered, _, storage, memory, options) =
+                open_owned_snapshot(&authority, verified.store).await?;
+            replica_suffix::apply_terminal(&entries, &terminal.fence, &mut recovered, &memory)?;
+            let snapshot = recovered.partition.snapshot();
+            if snapshot.tx_basis() != Some(terminal.basis)
+                || recovered.progress.tx_key != Some(terminal.basis)
+                || recovered.progress.source_position.after_offset(StorageEpoch(authority.stage.source_log_epoch))
+                    != terminal.source_through
+            {
+                return Err(inconsistent("Destination replay has another terminal transaction or source position"));
+            }
+            let snapshot = snapshot.with_system_time_cap(Some(terminal.basis.system_time))?;
+            let name = &authority.stage.intent.name;
+            let catalog = CatalogSnapshot::new(
+                name, BTreeMap::from([(name.clone(), DatabaseSnapshot { partitions: vec![snapshot], storage })]), true,
+            )?;
+            let context = QueryContext::new(catalog, memory, terminal.basis.system_time, "UTC", options.query, &stop)?;
+            if archive_lifetime_floors_digest(context, terminal.basis).await? != terminal.lifetime_floors_sha256 {
+                return Err(inconsistent("Destination replay changed the authenticated lifetime floors"));
+            }
+            authority.confirm(name).await?;
+            Ok(terminal)
+        }).await;
+        stop.cancel();
+        result.map_err(|_| unavailable("Destination terminal replay timed out"))?
     }).await
 }
 

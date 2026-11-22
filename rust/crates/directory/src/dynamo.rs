@@ -25,7 +25,11 @@ use serde::de::DeserializeOwned;
 
 use crate::{Cas, ChangeFeed, DeploymentRecord, Directory, ForkPublication, ReferenceDisposal, HostedTask, LineageChange, LineageRetirement, LineageState, MemberId, MemberRecord, REFERENCE_REVISION_PREFIX, Version, exists, fork_conflict, fork_parent_id, require_deployment_name, shared_fork_lineage};
 use crate::lineage::{disposal_changed, lineage_busy};
-use crate::{ForkPreparation, fork_stage_changed, fork_stage_version, require_fork_stage_update, stage_hosted_fork_record};
+use crate::{
+    CheckpointTransferFence, CheckpointTransferSelection, CheckpointTransferTerminal, ForkPreparation, fork_stage_changed,
+    fork_stage_version, prepare_checkpoint_transfer, prepare_checkpoint_transfer_terminal, require_fork_stage_update,
+    require_transfer_update, stage_hosted_fork_record, transfer_changed,
+};
 
 mod parked;
 mod streams;
@@ -40,6 +44,7 @@ const EPOCH: &str = "epoch";
 const HOLDER: &str = "holder";
 const RECORD: &str = "record";
 const LINEAGE_VERSION: &str = "lineage_version";
+const CHECKPOINT_TRANSFER_FENCE: &str = "checkpoint_transfer_fence";
 const HOSTED_FORK_STAGE: &str = "hosted_fork_stage";
 /// The index on the deployments table answering `deployments_held_by`; it projects only keys, since every hit is re-read strongly.
 pub const HOLDER_INDEX: &str = "holder";
@@ -181,16 +186,19 @@ impl DynamoDirectory {
     async fn put_conditional(&self, table: &str, item: Item, expected: Version, name: Option<&str>) -> Result<std::result::Result<(), Option<Item>>> {
         let key = item.get(ID).cloned().ok_or_else(|| Anomaly::fault("rtdb.directory/item", "A directory item has no id"))?;
         let staged = item.contains_key(HOSTED_FORK_STAGE);
+        let transfer = item.contains_key(CHECKPOINT_TRANSFER_FENCE);
         let mut request = self.client.put_item().table_name(table).set_item(Some(item))
             .expression_attribute_names("#v", VERSION)
             .expression_attribute_values(":expected", number(expected))
             .return_values_on_condition_check_failure(ReturnValuesOnConditionCheckFailure::AllOld);
         request = match name {
-            Some(name) => request.condition_expression(if staged {
-                "#v = :expected AND #n = :name AND attribute_exists(#stage)"
-            } else {
-                "#v = :expected AND #n = :name AND attribute_not_exists(#stage)"
+            Some(name) => request.condition_expression(match (staged, transfer) {
+                (false, false) => "#v = :expected AND #n = :name AND attribute_not_exists(#stage) AND attribute_not_exists(#transfer)",
+                (true, false) => "#v = :expected AND #n = :name AND attribute_exists(#stage) AND attribute_not_exists(#transfer)",
+                (false, true) => "#v = :expected AND #n = :name AND attribute_not_exists(#stage) AND attribute_exists(#transfer)",
+                (true, true) => return Err(transfer_changed()),
             }).expression_attribute_names("#n", NAME).expression_attribute_names("#stage", HOSTED_FORK_STAGE)
+                .expression_attribute_names("#transfer", CHECKPOINT_TRANSFER_FENCE)
                 .expression_attribute_values(":name", AttributeValue::S(name.to_owned())),
             None => request.condition_expression("#v = :expected"),
         };
@@ -304,6 +312,9 @@ fn deployment_item(record: &DeploymentRecord, pack_parked: bool) -> Result<Item>
     // Absent rather than null, so an unheld deployment is not in the sparse holder index at all.
     if let Some(holder) = &record.holder { item.insert(HOLDER.to_owned(), AttributeValue::S(holder.0.clone())); }
     if record.hosted_fork_stage.is_some() { item.insert(HOSTED_FORK_STAGE.to_owned(), AttributeValue::Bool(true)); }
+    if record.checkpoint_transfer_fence.is_some() {
+        item.insert(CHECKPOINT_TRANSFER_FENCE.to_owned(), AttributeValue::Bool(true));
+    }
     Ok(item)
 }
 
@@ -319,6 +330,7 @@ impl DynamoDirectory {
     async fn insert_deployment(&self, mut record: DeploymentRecord, fork: Vec<TransactWriteItem>,
         stage_version: Option<Version>) -> Result<DeploymentRecord> {
         require_deployment_name(&record.name)?;
+        if record.checkpoint_transfer_fence.is_some() || record.checkpoint_transfer_terminal.is_some() { return Err(transfer_changed()); }
         record.version = stage_version.unwrap_or(0) + 1;
         let deployment = Put::builder().table_name(&self.tables.deployments).set_item(Some(deployment_item(&record, self.pack_parked_records)?));
         let deployment = match stage_version {
@@ -512,6 +524,7 @@ impl Directory for DynamoDirectory {
         if owner.version != expected { return Ok(Cas::Conflict(Some(owner))); }
         let (current, legacy) = self.read_lineage(&owner.lineage).await?;
         let (next, next_lineage) = current.settle_exact_owned(&owner, &retirement)?;
+        require_transfer_update(&owner, &next)?;
         self.write_owner_and_lineage(next, expected, &current, &next_lineage, legacy).await
     }
 
@@ -538,6 +551,7 @@ impl Directory for DynamoDirectory {
             return Ok(Cas::Conflict(Some(owner)));
         }
         require_fork_stage_update(&owner, &record)?;
+        require_transfer_update(&owner, &record)?;
         let (current, legacy) = self.read_lineage(&permit.lineage).await?;
         let next = current.finish_disposal(permit, &owner, &record)?;
         record.version = expected + 1;
@@ -595,11 +609,50 @@ impl Directory for DynamoDirectory {
         Ok(held)
     }
 
+    async fn fence_checkpoint_transfer(&self, selection: &CheckpointTransferSelection) -> Result<CheckpointTransferFence> {
+        let source = self.deployment(&selection.stage.intent.source.to_string()).await?
+            .ok_or_else(transfer_changed)?;
+        let destination = self.deployment(&selection.stage.intent.destination.to_string()).await?
+            .ok_or_else(transfer_changed)?;
+        let (fenced, held, fence) = prepare_checkpoint_transfer(&source, &destination, selection)?;
+        if fenced.version == source.version { return Ok(fence); }
+        let mut items = Vec::with_capacity(2);
+        for (record, expected) in [(&fenced, source.version), (&held, destination.version)] {
+            let put = Put::builder().table_name(&self.tables.deployments)
+                .set_item(Some(deployment_item(record, self.pack_parked_records)?))
+                .condition_expression("#v = :expected")
+                .expression_attribute_names("#v", VERSION)
+                .expression_attribute_values(":expected", number(expected))
+                .build().map_err(build_fault)?;
+            items.push(TransactWriteItem::builder().put(put).build());
+        }
+        if !self.write_retirement(items).await? { return Err(transfer_changed()); }
+        Ok(fence)
+    }
+
+    async fn record_checkpoint_transfer_terminal(&self, terminal: &CheckpointTransferTerminal) -> Result<CheckpointTransferTerminal> {
+        let id = terminal.fence.destination.intent.source.to_string();
+        let source = self.deployment(&id).await?.ok_or_else(transfer_changed)?;
+        let next = prepare_checkpoint_transfer_terminal(&source, terminal)?;
+        if next.version == source.version { return Ok(terminal.clone()); }
+        let put = Put::builder().table_name(&self.tables.deployments)
+            .set_item(Some(deployment_item(&next, self.pack_parked_records)?))
+            .condition_expression("#v = :expected")
+            .expression_attribute_names("#v", VERSION)
+            .expression_attribute_values(":expected", number(source.version))
+            .build().map_err(build_fault)?;
+        if !self.write_retirement(vec![TransactWriteItem::builder().put(put).build()]).await? {
+            return Err(transfer_changed());
+        }
+        Ok(terminal.clone())
+    }
+
     async fn replace_deployment(&self, mut record: DeploymentRecord, expected: Version) -> Result<Cas<DeploymentRecord>> {
-        if record.hosted_fork_stage.is_some() {
+        if record.hosted_fork_stage.is_some() || record.checkpoint_transfer_fence.is_some() || record.checkpoint_transfer_terminal.is_some() {
             let Some(current) = self.deployment(&record.id).await? else { return Ok(Cas::Conflict(None)); };
             if current.version != expected { return Ok(Cas::Conflict(Some(current))); }
             require_fork_stage_update(&current, &record)?;
+            require_transfer_update(&current, &record)?;
         }
         record.version = expected + 1;
         let name = record.name.clone();
@@ -609,7 +662,10 @@ impl Directory for DynamoDirectory {
             Err(Some(current)) => {
                 let current = decode_deployment(&current)?;
                 if current.version == expected && current.name != name { return Err(Anomaly::incorrect("rtdb.directory/rename", "A deployment's name never changes")); }
-                if current.version == expected { require_fork_stage_update(&current, &record)?; }
+                if current.version == expected {
+                    require_fork_stage_update(&current, &record)?;
+                    require_transfer_update(&current, &record)?;
+                }
                 Ok(Cas::Conflict(Some(current)))
             }
         }

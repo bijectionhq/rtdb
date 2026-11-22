@@ -177,6 +177,64 @@ pub(super) async fn apply_archived(
     Ok(())
 }
 
+pub(super) fn terminal_source_through(
+    entries: &[ArchivedReplicaEntry], fence: &rtdb_directory::CheckpointTransferFence,
+) -> Result<i64> {
+    for entry in entries.iter().rev() {
+        if let Some(ReplicaBody::ResolvedTx(message)) = ReplicaFrame::decode(&entry.payload)?.message {
+            return message.src_msg_id.map(SourcePosition)
+                .map(|position| position.after_offset(StorageEpoch(fence.destination.source_log_epoch)))
+                .filter(|offset| *offset > fence.destination.checkpoint.source)
+                .ok_or_else(suffix_unavailable);
+        }
+    }
+    Ok(fence.destination.checkpoint.source)
+}
+
+/// Replay the entire certified terminal interval without applying external effects.
+pub(super) fn apply_terminal(
+    entries: &[ArchivedReplicaEntry],
+    fence: &rtdb_directory::CheckpointTransferFence,
+    recovered: &mut rtdb_replication::RecoveredPartition,
+    memory: &Arc<rtdb_columnar::MemoryBudget>,
+) -> Result<()> {
+    let checkpoint = fence.destination.checkpoint;
+    let mut position = None;
+    let log_epoch = StorageEpoch(fence.destination.source_log_epoch);
+    let mut source = checkpoint.source;
+    let mut last_offset = checkpoint.boundary;
+    for entry in entries {
+        let body = ReplicaFrame::decode(&entry.payload)?;
+        let sequence = body.term_sequence.filter(|sequence| sequence.0 >= 0).ok_or_else(suffix_unavailable)?;
+        if last_offset.checked_add(1) != Some(entry.lsn) || entry.epoch != fence.source_writer_epoch
+            || body.term.0 <= 0 || position.is_some_and(|(term, prior): (_, i64)|
+                body.term != term || prior.checked_add(1) != Some(sequence.0))
+        {
+            return Err(suffix_unavailable());
+        }
+        position = Some((body.term, sequence.0));
+        last_offset = entry.lsn;
+        match body.message {
+            Some(ReplicaBody::ResolvedTx(message)) => {
+                let next = message.src_msg_id.map(SourcePosition)
+                    .map(|position| position.after_offset(log_epoch))
+                    .filter(|offset| *offset > source)
+                    .ok_or_else(suffix_unavailable)?;
+                recovered.apply_archived_transaction(&message, memory)?;
+                source = next;
+            }
+            Some(ReplicaBody::BlockUploaded(upload)) if upload.block_index == Some(checkpoint.block)
+                && upload.storage_epoch == Some(fence.destination.source_log_epoch)
+                && upload.latest_processed_msg_id.map(SourcePosition)
+                    .map(|pos| pos.after_offset(StorageEpoch(fence.destination.source_log_epoch))) == Some(checkpoint.source)
+                && upload.external_source_token.is_none() => (),
+            Some(ReplicaBody::NoOp(noop)) if noop.src_msg_id.is_none() => (),
+            _ => return Err(suffix_unavailable()),
+        }
+    }
+    Ok(())
+}
+
 fn admit_copy(
     record: &DeploymentRecord, archive: &CellStorage, deployment: Uuid,
     pin_id: Uuid, selected: &CheckpointSuffixPin,
