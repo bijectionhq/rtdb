@@ -114,6 +114,7 @@ impl OwnedReadSession {
             ));
         }
         self.admit_read().await?;
+        let guarded = self.guard_context(Arc::clone(&self.context), relations)?;
         let database = self.context.catalog.database(&self.database)?;
         let [snapshot] = database.partitions.as_slice() else {
             return Err(change_feed_uncovered());
@@ -133,7 +134,7 @@ impl OwnedReadSession {
         }
         let mut journals = Vec::with_capacity(relations.len());
         for relation in names {
-            self.check()?;
+            guarded.check_cancelled()?;
             if let Some(journal) = self.seek_changes(snapshot, relation, after).await? {
                 journals.push(journal);
             }
@@ -146,7 +147,7 @@ impl OwnedReadSession {
             complete: false,
         };
         while page.commits.len() < limit {
-            self.check()?;
+            guarded.check_cancelled()?;
             let Some(revision) = journals
                 .iter()
                 .filter(|journal| journal.active())
@@ -163,7 +164,7 @@ impl OwnedReadSession {
                 .filter(|journal| journal.active() && journal.next.committed_at == revision)
             {
                 let entry = read_owned_change_entry(
-                    Arc::clone(&self.context),
+                    Arc::clone(&guarded),
                     &self.owner,
                     journal.relation,
                     journal.revision,
@@ -199,7 +200,7 @@ impl OwnedReadSession {
                             "A visible commit exceeds the merged change page budget",
                         ));
                     }
-                    self.check()?;
+                    guarded.check_cancelled()?;
                     return Ok(page);
                 }
 
@@ -222,7 +223,7 @@ impl OwnedReadSession {
             page._reservations.extend(charges);
             page.commits.push(OwnedChangeCommit { revision, changes });
         }
-        self.check()?;
+        guarded.check_cancelled()?;
         page.complete = journals.iter().all(|journal| !journal.active());
         Ok(page)
     }
@@ -232,6 +233,7 @@ impl OwnedReadSession {
         relation: &OwnedRelation,
         at: Timestamp,
     ) -> Result<Option<Timestamp>> {
+        self.check_relation(relation)?;
         if at > self.present.system_time {
             return Err(change_feed_uncovered());
         }
@@ -240,6 +242,7 @@ impl OwnedReadSession {
             return Err(change_feed_uncovered());
         };
         let Some(covered) = self.covered_journal(snapshot, relation, self.present.system_time).await? else {
+            self.check_relation(relation)?;
             return Ok(None);
         };
         let floor = (covered.floor.through_events != 0).then_some(covered.floor.committed_at);
@@ -248,6 +251,7 @@ impl OwnedReadSession {
         }
         self.require_journal_head(relation, covered.head_revision, covered.head)
             .await?;
+        self.check_relation(relation)?;
         Ok(floor)
     }
 
@@ -305,7 +309,7 @@ impl OwnedReadSession {
         }
         self.admit_access().await?;
         self.require_scoped_relation(relation)?;
-        let journal_context = self.retained_root_context();
+        let journal_context = self.guard_context(Arc::clone(self.retained_root_context()), [relation])?;
         let database = journal_context.catalog.database(&self.database)?;
         let [snapshot] = database.partitions.as_slice() else {
             return Err(change_feed_uncovered());
@@ -328,7 +332,7 @@ impl OwnedReadSession {
         }
 
         let purge_floor = rtdb_query::owned_purge_floor(
-            Arc::clone(journal_context), &self.owner, relation, id,
+            Arc::clone(&journal_context), &self.owner, relation, id,
         ).await?;
         let journal = self.covered_journal(snapshot, relation, self.present.system_time).await?;
         let history_floor = journal.as_ref()
@@ -369,7 +373,7 @@ impl OwnedReadSession {
             {
                 self.check()?;
                 let entry = read_owned_change_entry(
-                    Arc::clone(journal_context),
+                    Arc::clone(&journal_context),
                     &self.owner,
                     relation,
                     current,
@@ -404,7 +408,7 @@ impl OwnedReadSession {
                 let revision = u64::try_from(current).map_err(|_| change_feed_uncovered())?;
                 if touched {
                     let timeline = rtdb_query::open_owned_valid_during_at(
-                        Arc::clone(&self.context),
+                        self.relation_context(relation)?,
                         &self.owner,
                         relation,
                         id,
@@ -507,7 +511,7 @@ impl OwnedReadSession {
             return Err(change_feed_uncovered());
         }
         let entry =
-            read_owned_change_entry(Arc::clone(self.retained_root_context()), &self.owner, relation, 0).await?;
+            read_owned_change_entry(self.guard_context(Arc::clone(self.retained_root_context()), [relation])?, &self.owner, relation, 0).await?;
         if entry.value != Value::Null
             || entry.system_time != floor.committed_at
             || entry.through_events != floor.through_events
@@ -590,7 +594,7 @@ impl OwnedReadSession {
         head: OwnedJournalHeader,
     ) -> Result<()> {
         let entry =
-            read_owned_change_entry(Arc::clone(self.retained_root_context()), &self.owner, relation, revision)
+            read_owned_change_entry(self.guard_context(Arc::clone(self.retained_root_context()), [relation])?, &self.owner, relation, revision)
                 .await?;
         if entry.system_time != head.committed_at
             || entry.through_events != head.through_events
@@ -606,7 +610,7 @@ impl OwnedReadSession {
         relation: &OwnedRelation,
         revision: i64,
     ) -> Result<OwnedJournalHeader> {
-        read_owned_journal_header(Arc::clone(self.retained_root_context()), &self.owner, relation, revision).await
+        read_owned_journal_header(self.guard_context(Arc::clone(self.retained_root_context()), [relation])?, &self.owner, relation, revision).await
     }
 }
 

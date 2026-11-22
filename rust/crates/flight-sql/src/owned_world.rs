@@ -53,6 +53,7 @@ pub struct WorldIdentityPage {
 /// A verified live cut and its already admitted archived parent.
 pub trait OwnedWorldRead: Send + Sync {
     fn present(&self) -> Timestamp;
+    fn check_relation(&self, relation: &OwnedRelation) -> Result<()>;
     fn check(&self) -> Result<()>;
     fn close(&self);
     fn identity_page<'a>(

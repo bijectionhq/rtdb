@@ -107,6 +107,10 @@ impl OwnedWorldHost for PlacedWorldHost {
 impl OwnedWorldRead for HeldCheckpointWorld {
     fn present(&self) -> Timestamp { HeldCheckpointWorld::present(self).system_time }
 
+    fn check_relation(&self, relation: &OwnedRelation) -> Result<()> {
+        HeldCheckpointWorld::check_relation(self, relation)
+    }
+
     fn check(&self) -> Result<()> { HeldCheckpointWorld::check(self) }
 
     fn close(&self) { HeldCheckpointWorld::close(self); }

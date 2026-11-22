@@ -187,7 +187,7 @@ const OWNED_UNIQUE_PREFIX: &str = ".unique-";
 const OWNED_ADDRESS_PREFIX: &str = ".addresses-";
 const OWNED_CAPACITY_PREFIX: &str = ".capacity-";
 const OWNED_FIXED_RANGE_PREFIX: &str = ".fixed-range-";
-const OWNED_PURGE_CATALOG: &str = ".purges";
+const OWNED_PURGE_PREFIX: &str = ".purges-";
 const OWNED_CHANGE_PREFIX: &str = ".changes-";
 
 /// A native relation provisioned in the authenticated principal's namespace.
@@ -207,7 +207,10 @@ impl OwnedRelation {
 
     pub fn table(&self, owner: &str) -> TableRef { owned_table(owner, &self.0) }
 
-    pub fn purge_catalog(owner: &str) -> TableRef { owned_table(owner, OWNED_PURGE_CATALOG) }
+    /// Names the obsolete owner-wide marker only to reject pre-cutover history.
+    pub fn obsolete_purge_table(owner: &str) -> TableRef { owned_table(owner, ".purges") }
+
+    pub fn purge_table(&self, owner: &str) -> TableRef { owned_table(owner, &format!("{OWNED_PURGE_PREFIX}{}", self.0)) }
 
     pub fn address_table(&self, owner: &str) -> TableRef { owned_table(owner, &format!("{OWNED_ADDRESS_PREFIX}{}", self.0)) }
 
@@ -314,7 +317,8 @@ impl TableRef {
         self.schema == OWNED_SCHEMA_V1
             && self.table.split_once('-').is_some_and(|(owner, name)| {
                 owner.len() == 64 && owner.bytes().all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-                    && (matches!(name, OWNED_PATH_CATALOG | OWNED_SEARCH_CATALOG | OWNED_RELATION_CATALOG | OWNED_PURGE_CATALOG)
+                    && (matches!(name, OWNED_PATH_CATALOG | OWNED_SEARCH_CATALOG | OWNED_RELATION_CATALOG)
+                        || name.strip_prefix(OWNED_PURGE_PREFIX).is_some_and(|relation| OwnedRelation::new(relation).is_ok())
                         || name.strip_prefix(OWNED_UNIQUE_PREFIX).is_some_and(|relation| OwnedRelation::new(relation).is_ok())
                         || name.strip_prefix(OWNED_ADDRESS_PREFIX).is_some_and(|relation| {
                             OwnedRelation::from_source(relation.into()).is_ok_and(|relation| !relation.is_world_catalog())

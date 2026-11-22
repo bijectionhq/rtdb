@@ -24,11 +24,12 @@ impl OwnedReadSession {
         let (admitted, _charge) = self.world_registration(world).await?
             .filter(|(world, _)| !world.dropped && world.until > self.present.system_time)
             .ok_or_else(rtdb_types::OwnedWorld::unavailable)?;
+        let context = self.relation_context(relation)?;
         let relation = relation.in_world(admitted.id)?;
         let page = rtdb_query::owned_identity_candidates(
-            Arc::clone(&self.context), &self.owner, &relation, self.present.system_time, valid, after, fetch,
+            Arc::clone(&context), &self.owner, &relation, self.present.system_time, valid, after, fetch,
         ).await?;
-        self.check()?;
+        context.check_cancelled()?;
         Ok(page)
     }
 
@@ -47,13 +48,14 @@ impl OwnedReadSession {
             ));
         }
         let at_head = self.admit_root_system(relation, system).await?;
+        let context = self.relation_context(relation)?;
         let count = limit + 1;
         let mut charges = vec![self.context.memory.reserve(count * 128)?];
         let mut keys: Vec<String> = Vec::with_capacity(count);
         let mut remaining = MAX_PAGE_BYTES;
         let mut more = false;
         if let Some(mut cursor) = rtdb_query::open_owned_identity_page(
-            Arc::clone(&self.context),
+            Arc::clone(&context),
             &self.owner,
             relation,
             system,
@@ -108,7 +110,7 @@ impl OwnedReadSession {
                 }
             }
         }
-        self.check()?;
+        context.check_cancelled()?;
         Ok(OwnedIdentityPage {
             keys,
             more,

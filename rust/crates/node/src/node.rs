@@ -918,6 +918,7 @@ impl OwnedValidHistory<'_> {
         if self.failed {
             return Err(Anomaly::fault("rtdb.owned/history-read", "An owned history cursor failed"));
         }
+        self.held.check_relation(self.relation)?;
         let result = match &mut self.cursor {
             Some(cursor) => cursor.next_batch().await,
             None => Ok(None),
@@ -934,7 +935,7 @@ impl OwnedValidHistory<'_> {
         if self.at_head {
             self.held.relation_witness(self.relation)
         } else {
-            self.held.check()?;
+            self.held.check_relation(self.relation)?;
             Ok(None)
         }
     }
@@ -983,6 +984,7 @@ pub struct OwnedReadSession {
     cancellation: CancellationToken,
     session_cancellation: CancellationToken,
     historical: Option<historical_owned_read::Scope>,
+    attachment: std::sync::Weak<Database>,
     _reservation: Arc<rtdb_columnar::MemoryReservation>,
 }
 
@@ -1006,12 +1008,13 @@ impl OwnedReadSession {
         valid_at: Timestamp, observed: bool,
     ) -> Result<OwnedWorldShadowRead> {
         let valid = rtdb_types::Interval::at(valid_at)?;
-        let relation = relation.in_world(world)?;
         self.admit_read().await?;
+        let context = self.relation_context(relation)?;
+        let relation = relation.in_world(world)?;
         let mut row = None;
         let mut local_revision = None;
         if let Some(mut cursor) = rtdb_query::open_owned_point(
-            Arc::clone(&self.context), &self.owner, &relation, id, Some(valid), None,
+            Arc::clone(&context), &self.owner, &relation, id, Some(valid), None,
         ).await? {
             while let Some(batch) = cursor.next_batch().await? {
                 if batch.batch().num_rows() == 0 { continue; }
@@ -1024,7 +1027,7 @@ impl OwnedReadSession {
                 row = Some(batch);
             }
         }
-        self.check()?;
+        context.check_cancelled()?;
         let witness = self.witness_scope.filter(|_| observed).map(|scope| OwnedWorldPointWitness {
             world, relation, id: id.clone(), valid_at, local_revision, scope, until: self.witness_until,
         });
@@ -1033,6 +1036,66 @@ impl OwnedReadSession {
 
     pub fn close(&self) { self.cancellation.cancel(); }
     pub fn check(&self) -> Result<()> { self.context.check_cancelled() }
+
+    /// A release fence for the selected logical relations at this hold.
+    pub fn relation_release_guard<'a>(
+        &self, relations: impl IntoIterator<Item = &'a rtdb_types::OwnedRelation>,
+    ) -> Result<Arc<dyn Fn() -> Result<()> + Send + Sync>> {
+        let database = self.retained_root_context().catalog.database(&self.database)?;
+        let [snapshot] = database.partitions.as_slice() else {
+            return Err(Anomaly::new(AnomalyCategory::Unavailable, "rtdb.owned/read-purged", "The held cut has no single purge frontier"));
+        };
+        let obsolete = rtdb_types::OwnedRelation::obsolete_purge_table(&self.owner);
+        if snapshot.contains_table(&obsolete) {
+            return Err(Anomaly::new(AnomalyCategory::Unavailable, "rtdb.owned/purge-history-reset", "Owner-wide purge history requires a reset before native held reads"));
+        }
+        let frontiers = relations.into_iter().map(|relation| {
+            let table = relation.purge_table(&self.owner);
+            let expected = snapshot.relation_event_frontier(&table)?;
+            Ok((table, expected))
+        }).collect::<Result<Vec<_>>>()?;
+        let charge = self.context.memory.reserve(frontiers.len() * 512)?;
+        let node = self.node.clone();
+        let database = self.database.clone();
+        let placement = self.attachment.clone();
+        let context = Arc::clone(&self.context);
+        Ok(Arc::new(move || {
+            let _charge = &charge;
+            context.check_cancelled()?;
+            let current = node.attached_database(&database, Some(&placement))?.snapshot();
+            if current.contains_table(&obsolete) {
+                return Err(Anomaly::new(AnomalyCategory::Unavailable, "rtdb.owned/purge-history-reset", "Owner-wide purge history requires a reset before native held reads"));
+            }
+            for (table, expected) in &frontiers {
+                if current.relation_event_frontier(table)? != *expected {
+                    return Err(Anomaly::new(AnomalyCategory::Unavailable, "rtdb.owned/read-purged", "The held relation was revoked by an ordered erase"));
+                }
+            }
+            Ok(())
+        }))
+    }
+
+    pub fn check_relation(&self, relation: &rtdb_types::OwnedRelation) -> Result<()> {
+        self.check_relations([relation])
+    }
+
+    pub fn check_relations<'a>(&self, relations: impl IntoIterator<Item = &'a rtdb_types::OwnedRelation>) -> Result<()> {
+        let guard = self.relation_release_guard(relations)?;
+        guard()
+    }
+
+    fn guard_context<'a>(
+        &self, context: Arc<QueryContext>, relations: impl IntoIterator<Item = &'a rtdb_types::OwnedRelation>,
+    ) -> Result<Arc<QueryContext>> {
+        let guard = self.relation_release_guard(relations)?;
+        let context = context.with_owned_read_guard(guard);
+        context.check_cancelled()?;
+        Ok(context)
+    }
+
+    fn relation_context(&self, relation: &rtdb_types::OwnedRelation) -> Result<Arc<QueryContext>> {
+        self.guard_context(Arc::clone(&self.context), [relation])
+    }
 
     pub async fn open_point(&self, relation: &rtdb_types::OwnedRelation, id: &rtdb_types::EntityId) -> Result<Option<QueryCursor>> {
         self.open_point_at(relation, id, None).await
@@ -1048,7 +1111,7 @@ impl OwnedReadSession {
             self.check_point_purge_floor(relation, id, scope.system_time).await?;
         }
         let valid = valid_at.map(|at| rtdb_types::Interval::new(at, at.next()?)).transpose()?;
-        rtdb_query::open_owned_point(Arc::clone(&self.context), &self.owner, relation, id, valid, None).await
+        rtdb_query::open_owned_point(self.relation_context(relation)?, &self.owner, relation, id, valid, None).await
     }
 
     /// Reads a business-valid point at an earlier system time certified by its journal.
@@ -1061,7 +1124,7 @@ impl OwnedReadSession {
         self.check_point_purge_floor(relation, id, system).await?;
         self.check()?;
         let valid = rtdb_types::Interval::new(valid, valid.next()?)?;
-        rtdb_query::open_owned_point_at_system(Arc::clone(&self.context), &self.owner, relation, id, valid, system).await
+        rtdb_query::open_owned_point_at_system(self.relation_context(relation)?, &self.owner, relation, id, valid, system).await
     }
 
     /// Prevents returning bytes from an older archive or historical cut after an ordered erase.
@@ -1069,13 +1132,13 @@ impl OwnedReadSession {
         &self, relation: &rtdb_types::OwnedRelation, id: &rtdb_types::EntityId, system: Timestamp,
     ) -> Result<()> {
         self.admit_access().await?;
-        let context = self.retained_root_context();
-        if rtdb_query::owned_purge_floor(Arc::clone(context), &self.owner, relation, id)
+        let context = self.guard_context(Arc::clone(self.retained_root_context()), [relation])?;
+        if rtdb_query::owned_purge_floor(Arc::clone(&context), &self.owner, relation, id)
             .await?.is_some_and(|floor| system < floor)
         {
             return Err(Anomaly::new(AnomalyCategory::Unavailable, "rtdb.owned/read-purged", "The requested cut precedes its ordered erase"));
         }
-        self.check()
+        context.check_cancelled()
     }
 
     /// Reads the winning valid slices at an admitted system cut of this root hold.
@@ -1091,9 +1154,9 @@ impl OwnedReadSession {
             self.check_point_purge_floor(relation, id, system).await?;
         }
         let cursor = rtdb_query::open_owned_valid_during_at(
-            Arc::clone(&self.context), &self.owner, relation, id, valid, system,
+            self.relation_context(relation)?, &self.owner, relation, id, valid, system,
         ).await?;
-        self.check()?;
+        self.check_relation(relation)?;
         Ok(OwnedValidHistory {
             held: self, relation, cursor, at_head, complete: false, failed: false,
         })
@@ -1105,9 +1168,9 @@ impl OwnedReadSession {
         &self, relation: &rtdb_types::OwnedRelation, path: &rtdb_types::OwnedRelation, query: &str,
     ) -> Result<rtdb_text::Corpus> {
         self.admit_read().await?;
-        let work = rtdb_search::owned_corpus(Arc::clone(&self.context), &self.owner, relation, path, query);
+        let work = rtdb_search::owned_corpus(self.relation_context(relation)?, &self.owner, relation, path, query);
         let corpus = rtdb_storage::IoRegion::leased(self.context.catalog.read_lease(), work).await?;
-        self.check()?;
+        self.check_relation(relation)?;
         Ok(corpus)
     }
 
@@ -1117,7 +1180,7 @@ impl OwnedReadSession {
         &self, partitions: &[(rtdb_types::OwnedRelation, rtdb_types::OwnedRelation)], query: &str, limit: usize, observe: bool,
     ) -> Result<(Vec<rtdb_search::OwnedSearchHit>, Vec<OwnedRangeWitness>)> {
         self.admit_read().await?;
-        let work = rtdb_search::owned_ranked(Arc::clone(&self.context), &self.owner, partitions, query, limit);
+        let work = rtdb_search::owned_ranked(self.guard_context(Arc::clone(&self.context), partitions.iter().map(|(relation, _)| relation))?, &self.owner, partitions, query, limit);
         let hits = rtdb_storage::IoRegion::leased(self.context.catalog.read_lease(), work).await?;
         let mut witnesses = Vec::with_capacity(partitions.len());
         if observe {
@@ -1127,7 +1190,7 @@ impl OwnedReadSession {
                 }
             }
         }
-        self.check()?;
+        self.check_relations(partitions.iter().map(|(relation, _)| relation))?;
         Ok((hits, witnesses))
     }
 
@@ -1166,12 +1229,12 @@ impl OwnedReadSession {
             evidence.fixed = self.fixed_range_evidence(relation, path, evidence.frontier, valid_at, lower, upper)
                 .await.unwrap_or(None).map(Arc::new);
         }
-        self.check()?;
+        self.check_relation(relation)?;
         Ok((page, evidence))
     }
 
     fn relation_witness(&self, relation: &rtdb_types::OwnedRelation) -> Result<Option<OwnedRangeWitness>> {
-        self.check()?;
+        self.check_relation(relation)?;
         let Some(scope) = self.witness_scope else { return Ok(None); };
         let database = self.context.catalog.database(&self.database)?;
         let [snapshot] = database.partitions.as_slice() else {
@@ -1181,7 +1244,7 @@ impl OwnedReadSession {
         if snapshot.tx_basis() != Some(self.present) {
             return Err(Anomaly::incorrect("rtdb.owned/range-witness", "The exact owned range basis is unavailable"));
         }
-        self.check()?;
+        self.check_relation(relation)?;
         Ok(Some(OwnedRangeWitness {
             relation: relation.clone(), basis: self.present, scope, frontier, until: self.witness_until, fixed: None,
         }))
@@ -1207,8 +1270,8 @@ impl OwnedReadSession {
         request: crate::OwnedCountRequest<'_>,
     ) -> Result<crate::OwnedRangeCount> {
         self.admit_read().await?;
-        let result = crate::ordered_index::owned_count(Arc::clone(&self.context), &self.owner, relation, path, request).await?;
-        self.check()?;
+        let result = crate::ordered_index::owned_count(self.relation_context(relation)?, &self.owner, relation, path, request).await?;
+        self.check_relation(relation)?;
         Ok(result)
     }
 
@@ -1226,8 +1289,8 @@ impl OwnedReadSession {
         bounds: crate::ordered_index::RowBounds<'_>, valid_at: Option<Timestamp>,
     ) -> Result<crate::OwnedRangePage> {
         self.admit_read().await?;
-        let result = crate::ordered_index::owned_range(Arc::clone(&self.context), &self.owner, relation, path, bounds, valid_at).await?;
-        self.check()?;
+        let result = crate::ordered_index::owned_range(self.relation_context(relation)?, &self.owner, relation, path, bounds, valid_at).await?;
+        self.check_relation(relation)?;
         Ok(result)
     }
 
@@ -1425,28 +1488,21 @@ impl NativeSession {
         } else {
             present.system_time
         };
-        let purge_table = rtdb_types::OwnedRelation::purge_catalog(&owner);
-        let [snapshot] = context.catalog.database(&database)?.partitions.as_slice() else {
-            return Err(Anomaly::new(AnomalyCategory::Unavailable, "rtdb.owned/read-purged", "The owned read has no single purge frontier"));
-        };
-        let purge_frontier = snapshot.relation_event_frontier(&purge_table)?;
+        let placement = attached.clone();
         let guarded_node = node.clone();
         let guarded_database = database.clone();
         let context = context.with_owned_read_guard(Arc::new(move || {
             if clock.monotonic_micros() >= deadline {
                 return Err(Anomaly::new(AnomalyCategory::Unavailable, "rtdb.owned/read-expired", "The retained owned read expired"));
             }
-            let database = guarded_node.attached_database(&guarded_database, Some(&attached))?;
-            if database.snapshot().relation_event_frontier(&purge_table)? != purge_frontier {
-                return Err(Anomaly::new(AnomalyCategory::Unavailable, "rtdb.owned/read-purged", "The retained owned read was revoked by an ordered erase"));
-            }
+            guarded_node.attached_database(&guarded_database, Some(&attached))?;
             if let Some(lease) = &lease { lease.check()?; }
             Ok(())
         }));
         context.check_cancelled()?;
         Ok(OwnedReadSession {
             context, node, identity, database, owner, present, witness_scope, witness_until,
-            cancellation, session_cancellation, historical: None, _reservation: charge,
+            cancellation, session_cancellation, historical: None, attachment: placement, _reservation: charge,
         })
     }
     pub async fn query_context(&mut self) -> Result<Arc<QueryContext>> {

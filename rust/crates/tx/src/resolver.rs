@@ -403,11 +403,10 @@ pub struct OpenTransaction<'a> {
     capacity_changes: OwnedCapacityChanges,
     owned_world: Option<(rtdb_types::OwnedWorld, Arc<MemoryReservation>)>,
     owned_changes: BTreeMap<String, PendingOwnedChanges>,
-    purge_recorded: bool,
 }
 impl<'a> OpenTransaction<'a> {
     fn new(base: Snapshot, key: TransactionKey, options: &'a SubmitOptions, context: &'a ResolveContext) -> Result<Self> {
-        Ok(Self { buffer: TransactionBuffer::new(base, key, Arc::clone(&context.memory))?, options, context, trace_parent: None, unique_changes: OwnedUniqueChanges::default(), capacity_changes: OwnedCapacityChanges::default(), owned_world: None, owned_changes: BTreeMap::new(), purge_recorded: false })
+        Ok(Self { buffer: TransactionBuffer::new(base, key, Arc::clone(&context.memory))?, options, context, trace_parent: None, unique_changes: OwnedUniqueChanges::default(), capacity_changes: OwnedCapacityChanges::default(), owned_world: None, owned_changes: BTreeMap::new() })
     }
     pub fn tx_key(&self) -> TransactionKey { self.buffer.tx_key() }
     pub fn snapshot(&self) -> Result<Snapshot> { self.buffer.snapshot() }
@@ -970,6 +969,9 @@ impl<'a> OpenTransaction<'a> {
             return Err(rtdb_types::OwnedWorld::unavailable());
         }
         let snapshot = self.snapshot()?;
+        if snapshot.contains_table(&OwnedRelation::obsolete_purge_table(owner)) {
+            return Err(Anomaly::new(AnomalyCategory::Unavailable, "rtdb.owned/purge-history-reset", "Owner-wide purge history requires a reset before native erasure"));
+        }
         if snapshot.contains_table(&relation.unique_table(owner)) || snapshot.contains_table(&relation.capacity_table(owner)) {
             return Err(purge_path_uncovered());
         }
@@ -1003,6 +1005,7 @@ impl<'a> OpenTransaction<'a> {
         };
         // Verify any current valid slice belongs to this exact typed identity before erasing its locator.
         self.read_owned_revision(owner, relation, id, Interval::ALL).await?;
+        let first_erase = !self.owned_changes.get(relation.name()).is_some_and(|group| group.erased);
         self.record_owned_change(relation, id.clone(), OwnedChangeKind::Erase, Interval::ALL)?;
         self.buffer.erase(table, &EntityId::Uuid(locator.0))?;
         self.buffer.put(relation.address_table(owner), StructFields::from([
@@ -1010,11 +1013,10 @@ impl<'a> OpenTransaction<'a> {
             ("address".into(), id.as_value()),
             ("purged_at".into(), Value::I64(ordered.system_time.0)),
         ]), Interval::ALL)?;
-        if !self.purge_recorded {
-            self.buffer.put(OwnedRelation::purge_catalog(owner), StructFields::from([
+        if first_erase {
+            self.buffer.put(relation.purge_table(owner), StructFields::from([
                 ("_id".into(), Value::I64(ordered.tx_id.0)),
             ]), Interval::ALL)?;
-            self.purge_recorded = true;
         }
         Ok(())
     }

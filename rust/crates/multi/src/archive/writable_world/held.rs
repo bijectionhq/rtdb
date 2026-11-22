@@ -6,7 +6,7 @@ use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 
 use super::*;
-use crate::archive::read_world::{read_checkpoint_point_in_context, with_checkpoint_context};
+use crate::archive::read_world::{read_checkpoint_point_in_context, require_relation_purge_history, with_checkpoint_context};
 
 #[derive(Clone)]
 pub(crate) struct WorldArchive {
@@ -28,6 +28,7 @@ struct ArchivePoint {
     relation: OwnedRelation,
     id: EntityId,
     valid: Interval,
+    guard: Arc<dyn Fn() -> Result<()> + Send + Sync>,
     reply: oneshot::Sender<Result<Option<WorldFact>>>,
 }
 
@@ -38,6 +39,7 @@ enum ArchiveRead {
         at: Timestamp,
         after: Option<String>,
         fetch: usize,
+        guard: Arc<dyn Fn() -> Result<()> + Send + Sync>,
         reply: oneshot::Sender<Result<rtdb_query::OwnedIdentityCandidates>>,
     },
 }
@@ -59,13 +61,18 @@ impl HeldCheckpointWorld {
         Ok(())
     }
 
+    pub fn check_relation(&self, relation: &OwnedRelation) -> Result<()> {
+        self.check()?;
+        self.open.snapshot.check_relation(relation)
+    }
+
     pub fn close(&self) {
         self.cancellation.cancel();
         self.open.snapshot.close();
     }
 
     pub async fn point(&self, relation: &OwnedRelation, id: &EntityId, valid_at: Timestamp, observed: bool) -> Result<WorldPoint> {
-        self.check()?;
+        self.check_relation(relation)?;
         let valid = Interval::at(valid_at)?;
         let (local, witness) = self.open.read_local(relation, id, valid_at, &self.memory, observed).await?;
         let fact = if let Some(fact) = local {
@@ -74,18 +81,18 @@ impl HeldCheckpointWorld {
             self.open.snapshot.check_point_purge_floor(relation, id, self.open.retained.basis.system_time).await?;
             let (reply, result) = oneshot::channel();
             self.cancellation.run_until_cancelled(self.requests.send(ArchiveRead::Point(ArchivePoint {
-                relation: relation.clone(), id: id.clone(), valid, reply,
+                relation: relation.clone(), id: id.clone(), valid, guard: self.open.snapshot.relation_release_guard([relation])?, reply,
             }))).await.ok_or_else(OwnedWorld::unavailable)?.map_err(|_| OwnedWorld::unavailable())?;
             self.cancellation.run_until_cancelled(result).await
                 .ok_or_else(OwnedWorld::unavailable)?.map_err(|_| OwnedWorld::unavailable())??
         };
-        self.check()?;
+        self.check_relation(relation)?;
         Ok(WorldPoint { present: self.present(), fact, witness })
     }
     pub async fn identity_page(
         &self, relation: &OwnedRelation, valid: Timestamp, after: Option<&str>, limit: usize,
     ) -> Result<WorldIdentityPage> {
-        self.check()?;
+        self.check_relation(relation)?;
         Interval::at(valid)?;
         if !(1..=128).contains(&limit) { return Err(OwnedWorld::unavailable()); }
         const FETCH: usize = 129;
@@ -101,7 +108,8 @@ impl HeldCheckpointWorld {
             ).await?;
             let (reply, result) = oneshot::channel();
             self.cancellation.run_until_cancelled(self.requests.send(ArchiveRead::Identities {
-                relation: relation.clone(), at: valid, after: cursor.as_ref().map(|(key, _)| key.clone()), fetch: FETCH, reply,
+                relation: relation.clone(), at: valid, after: cursor.as_ref().map(|(key, _)| key.clone()), fetch: FETCH,
+                guard: self.open.snapshot.relation_release_guard([relation])?, reply,
             })).await.ok_or_else(OwnedWorld::unavailable)?.map_err(|_| OwnedWorld::unavailable())?;
             let parent = self.cancellation.run_until_cancelled(result).await
                 .ok_or_else(OwnedWorld::unavailable)?.map_err(|_| OwnedWorld::unavailable())??;
@@ -145,7 +153,7 @@ impl HeldCheckpointWorld {
             }
         }
         if !complete { return Err(OwnedWorld::unavailable()); }
-        self.check()?;
+        self.check_relation(relation)?;
         Ok(WorldIdentityPage { keys, more, reservations })
     }
 
@@ -202,9 +210,9 @@ pub(crate) async fn open_held_checkpoint_world(
                                 point = pending.recv() => match point { Some(point) => point, None => break },
                             };
                             match request {
-                                ArchiveRead::Point(ArchivePoint { relation, id, valid, mut reply }) => {
+                                ArchiveRead::Point(ArchivePoint { relation, id, valid, guard, mut reply }) => {
                                     let read = async {
-                                        let batches = read_checkpoint_point_in_context(Arc::clone(&context), CheckpointPoint {
+                                        let batches = read_checkpoint_point_in_context(Arc::clone(&context).with_owned_read_guard(guard), CheckpointPoint {
                                             owner: &owner, relation: &relation, id: &id, valid: Some(valid),
                                         }).await?;
                                         decode_point(batches.unwrap_or_default(), &id, memory)
@@ -216,14 +224,18 @@ pub(crate) async fn open_held_checkpoint_world(
                                     };
                                     let _ = reply.send(response);
                                 }
-                                ArchiveRead::Identities { relation, at, after, fetch, mut reply } => {
+                                ArchiveRead::Identities { relation, at, after, fetch, guard, mut reply } => {
+                                    let read = async {
+                                        require_relation_purge_history(&context, &owner)?;
+                                        rtdb_query::owned_identity_candidates(
+                                            Arc::clone(&context).with_owned_read_guard(guard), &owner, &relation, parent_time,
+                                            at, after.as_deref(), fetch,
+                                        ).await
+                                    };
                                     let response = tokio::select! {
                                         _ = scope.cancelled() => break,
                                         _ = reply.closed() => continue,
-                                        result = rtdb_query::owned_identity_candidates(
-                                            Arc::clone(&context), &owner, &relation, parent_time,
-                                            at, after.as_deref(), fetch,
-                                        ) => result,
+                                        result = read => result,
                                     };
                                     let _ = reply.send(response);
                                 }

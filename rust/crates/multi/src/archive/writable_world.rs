@@ -11,7 +11,7 @@ use uuid::Uuid;
 
 use super::{
     CellStorage, CheckpointPoint, CheckpointReadResources, CheckpointReadWorld, KeyService,
-    capture_receipt, read_checkpoint_owned_point, read_world::{CaptureSelection, with_registered_capture_context},
+    capture_receipt, read_world::{CaptureSelection, read_checkpoint_point_in_context, with_checkpoint_context, with_registered_capture_context},
     replica_suffix, require_capture_open, same_lifetime,
 };
 use crate::admin::update_installation;
@@ -494,15 +494,20 @@ pub async fn read_checkpoint_world_point(
     let (local, _) = open.read_local(relation, id, valid_at, memory, false).await?;
     if let Some(fact) = local {
         open.check()?;
+        open.snapshot.check_relation(relation)?;
         return Ok(WorldPoint { present, fact, witness: None });
     }
     open.snapshot.check_point_purge_floor(relation, id, open.retained.basis.system_time).await?;
-    let batches = read_checkpoint_owned_point(
-        directory, archive, keys, hosted_task, &open.parent(deployment),
-        CheckpointPoint { owner: &open.retained.owner, relation, id, valid: Some(valid) },
-        resources,
+    let guard = open.snapshot.relation_release_guard([relation])?;
+    let batches = with_checkpoint_context(
+        directory, archive, keys, hosted_task, &open.parent(deployment), resources,
+        |context| read_checkpoint_point_in_context(
+            context.with_owned_read_guard(guard),
+            CheckpointPoint { owner: &open.retained.owner, relation, id, valid: Some(valid) },
+        ),
     ).await?;
-    open.check()?;
     let fact = decode_point(batches.unwrap_or_default(), id, memory)?;
+    open.check()?;
+    open.snapshot.check_relation(relation)?;
     Ok(WorldPoint { present, fact, witness: None })
 }

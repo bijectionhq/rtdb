@@ -242,8 +242,17 @@ impl QueryContext {
     }
 
     pub fn with_owned_read_guard(mut self: Arc<Self>, guard: Arc<dyn Fn() -> Result<()> + Send + Sync>) -> Arc<Self> {
-        Arc::make_mut(&mut self).catalog.owned_read_guard = Some(guard);
+        let slot = &mut Arc::make_mut(&mut self).catalog.owned_read_guard;
+        *slot = Some(if let Some(base) = slot.take() {
+            Arc::new(move || { base()?; guard() })
+        } else {
+            guard
+        });
         self
+    }
+
+    pub(crate) fn has_owned_read_guard(&self) -> bool {
+        self.catalog.owned_read_guard.is_some()
     }
 
     pub fn check_cancelled(&self) -> Result<()> {

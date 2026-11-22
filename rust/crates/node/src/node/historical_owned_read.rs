@@ -58,14 +58,15 @@ impl OwnedReadSession {
         }
 
         let cancellation = self.session_cancellation.child_token();
-        let requested_cut = self
-            .context
-            .with_owned_system_cut(requested, &cancellation)?;
+        let requested_cut = self.guard_context(
+            self.context.with_owned_system_cut(requested, &cancellation)?,
+            &relations,
+        )?;
         let Some(selected) = self
             .publication_at(requested_cut, publication, marker)
             .await?
         else {
-            self.check()?;
+            self.check_relations(&relations)?;
             return Ok(None);
         };
         if selected > requested {
@@ -84,7 +85,7 @@ impl OwnedReadSession {
             self.context
                 .with_owned_system_cut(self.present.system_time, &cancellation)?
         };
-        self.check()?;
+        self.check_relations(&relations)?;
         context.check_cancelled()?;
         Ok(Some(Self {
             context,
@@ -97,6 +98,7 @@ impl OwnedReadSession {
             witness_until: selected,
             cancellation,
             session_cancellation: self.session_cancellation.clone(),
+            attachment: self.attachment.clone(),
             historical: Some(Scope {
                 system_time: selected,
                 relations,
