@@ -114,7 +114,7 @@ pub(super) fn encode(record: &DeploymentRecord) -> Option<Vec<u8>> {
         storage_namespaces, s3_write_lease_until_ms, engine_pin, deletion_observation, move_intent, placement_move, move_from, log_copy_servers, cell_move, moved_at_ms,
         source_cleanup, deletion_record, replica_journals, storage_regions, catalog_readers, catalog_admission_floors, ordered_indexes, ordered_index_catalogs,
         cell_transfer, disposal, checkpoint_recovery,
-        checkpoint_stage, hosted_fork_stage, checkpoint_repair_receipts, checkpoint_captures, checkpoint_worlds, checkpoint_suffix_pins, checkpoint_capture_retirements,
+        checkpoint_stage, checkpoint_transfer_fence, hosted_fork_stage, checkpoint_repair_receipts, checkpoint_captures, checkpoint_worlds, checkpoint_suffix_pins, checkpoint_capture_retirements,
         archive_retirement, compaction_replay_cutoff, retired_residences, version: _,
     } = record;
     if holder.is_some() || !matches!(lifecycle, Lifecycle::Live | Lifecycle::Quarantined)
@@ -122,7 +122,7 @@ pub(super) fn encode(record: &DeploymentRecord) -> Option<Vec<u8>> {
         || moved_at_ms.is_some() || source_cleanup.is_some() || deletion_observation.is_some() || deletion_record.is_some() || !log_copy_servers.is_empty()
         || !storage_regions.is_empty() || !catalog_readers.is_empty() || cell_transfer.is_some() || disposal.is_some() || checkpoint_recovery.is_some()
         || !ordered_indexes.is_empty() || !ordered_index_catalogs.is_empty()
-        || checkpoint_stage.is_some() || hosted_fork_stage.is_some() || !checkpoint_repair_receipts.is_empty() || !checkpoint_capture_retirements.is_empty()
+        || checkpoint_stage.is_some() || checkpoint_transfer_fence.is_some() || hosted_fork_stage.is_some() || !checkpoint_repair_receipts.is_empty() || !checkpoint_capture_retirements.is_empty()
         || !retired_residences.is_empty() || !checkpoint_captures.is_empty() || !checkpoint_worlds.is_empty() || !checkpoint_suffix_pins.is_empty() || archive_retirement.is_some()
     {
         return None;
@@ -304,6 +304,7 @@ pub(super) fn decode(bytes: &[u8], id: &str, name: &str, epoch: u64, version: Ve
         checkpoint_recovery: None,
         compaction_replay_cutoff: packed.compaction_replay_cutoff,
         checkpoint_stage: None,
+        checkpoint_transfer_fence: None,
         hosted_fork_stage: None,
         checkpoint_repair_receipts: Default::default(),
         checkpoint_captures: Default::default(),
