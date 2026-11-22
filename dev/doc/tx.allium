@@ -56,6 +56,9 @@
 -- A held owned read captures the exact applied transaction key and retains that catalog for repeated reads.
 -- Held reads require the original session and attachment and refuse after expiry, lease loss, or closure.
 -- An owned path declaration is maintained from the ordered owner's private catalog.
+-- An owned unique declaration starts before any relation data and admits one Binary key per row.
+-- The ordered resolver validates the final staged key set with typed holders and commits occupancy and rows together.
+-- Key conflicts expose neither the occupied key nor its holder.
 -- A held range requires an exact published covering generation for the captured frontier and serves one page directly from that path.
 -- DML evaluates CURRENT_TIMESTAMP at the assigned system time when resolving the ordered transaction.
 -- EPOCH_NANOS_BE(CURRENT_TIMESTAMP) encodes that instant as eight unsigned big-endian bytes without rounding.

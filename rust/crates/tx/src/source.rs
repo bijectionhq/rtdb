@@ -70,7 +70,7 @@ impl SourceTransaction {
         let mut bytes = operations.capacity().checked_mul(std::mem::size_of::<Operation>()).and_then(|size| size.checked_add(options.default_tz.capacity())).and_then(|size| size.checked_add(options.user.as_ref().map_or(0, String::capacity))).ok_or_else(overflow)?;
         for operation in &operations {
             let (text, table, ids) = match operation {
-                Operation::Public(TxOp::OwnedDeclareSearchPath { relation, name, column }) =>
+                Operation::Public(TxOp::OwnedDeclareSearchPath { relation, name, column } | TxOp::OwnedDeclareUniquePath { relation, name, column }) =>
                     (owned_path_bytes(relation, name, std::slice::from_ref(column))?, None, 0),
                 Operation::Public(TxOp::OwnedDeclareRelation { relation, schema }) =>
                     (relation.name().len().checked_add(schema.retained_bytes()).ok_or_else(overflow)?, None, 0),
@@ -290,7 +290,7 @@ impl SourceTransaction {
                 }
                 Operation::Public(TxOp::SqlBytes { sql, arg_bytes }) => sql.capacity().checked_add(arg_bytes.as_slice().len()).ok_or_else(overflow)?,
                 Operation::Public(TxOp::DeleteDocs { ids, .. } | TxOp::EraseDocs { ids, .. }) => ids.ids().len().checked_mul(128).ok_or_else(overflow)?,
-                Operation::Public(TxOp::OwnedDeclareSearchPath { relation, name, column }) =>
+                Operation::Public(TxOp::OwnedDeclareSearchPath { relation, name, column } | TxOp::OwnedDeclareUniquePath { relation, name, column }) =>
                     owned_path_bytes(relation, name, std::slice::from_ref(column))?,
                 Operation::Public(TxOp::OwnedDeclareRelation { relation, schema }) =>
                     relation.name().len().checked_add(schema.retained_bytes()).ok_or_else(overflow)?,
@@ -402,6 +402,12 @@ fn operation_value<'a>(operation: &'a Operation, memory: &Arc<MemoryBudget>) -> 
             body.insert("query".into(), Value::Utf8(sql.clone()));
             body.insert("args".into(), if arg_bytes.as_slice().is_empty() { Value::Null } else { Value::Binary(arg_bytes.as_slice().to_vec()) });
             "sql"
+        }
+        Operation::Public(TxOp::OwnedDeclareUniquePath { relation, name, column }) => {
+            body.insert("relation".into(), Value::Utf8(relation.name().into()));
+            body.insert("name".into(), Value::Utf8(name.name().into()));
+            body.insert("column".into(), Value::Utf8(column.clone()));
+            "rtdb-owned-unique-path-v1"
         }
         Operation::Public(TxOp::OwnedDeclareSearchPath { relation, name, column }) => {
             body.insert("relation".into(), Value::Utf8(relation.name().into()));
@@ -1028,7 +1034,7 @@ impl SourceOperationReader<'_> {
         let body = array.as_any().downcast_ref::<StructArray>().ok_or_else(|| invalid("Transaction operation leg is not a struct"))?;
         let value_fields: &[&str] = match name.as_str() {
             "sql" => &["query", "args"],
-            "rtdb-owned-search-path-v1" => &["relation", "name", "column"],
+            "rtdb-owned-search-path-v1" | "rtdb-owned-unique-path-v1" => &["relation", "name", "column"],
             "rtdb-owned-relation-v1" => &["relation", "schema"],
             "rtdb-owned-path-v1" => &["relation", "name", "columns"],
             "rtdb-owned-deadline-v1" => &["until"],
@@ -1045,6 +1051,12 @@ impl SourceOperationReader<'_> {
         parsed_fields.grow_to(bound)?;
         let value = |name| struct_cell(body, name, offset);
         let operation = match name.as_str() {
+            "rtdb-owned-unique-path-v1" => {
+                let (Value::Utf8(relation), Value::Utf8(name), Value::Utf8(column)) =
+                    (value("relation")?, value("name")?, value("column")?)
+                else { return Err(invalid("Owned unique path declaration has invalid fields")); };
+                TxOp::OwnedDeclareUniquePath { relation: rtdb_types::OwnedRelation::new(relation)?, name: rtdb_types::OwnedRelation::new(name)?, column }
+            }
             "rtdb-owned-search-path-v1" => {
                 let (Value::Utf8(relation), Value::Utf8(name), Value::Utf8(column)) =
                     (value("relation")?, value("name")?, value("column")?)

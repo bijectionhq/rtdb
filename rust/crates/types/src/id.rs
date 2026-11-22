@@ -166,9 +166,10 @@ const OWNED_SEARCH_CATALOG: &str = ".search-paths";
 const OWNED_RELATION_CATALOG: &str = ".relation-schemas";
 const OWNED_WORLD_CATALOG: &str = ".worlds";
 const OWNED_WORLD_PREFIX: &str = ".world-";
+const OWNED_UNIQUE_PREFIX: &str = ".unique-";
 
 /// A native relation provisioned in the authenticated principal's namespace.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct OwnedRelation(String);
 
 impl OwnedRelation {
@@ -183,6 +184,8 @@ impl OwnedRelation {
     pub fn name(&self) -> &str { &self.0 }
 
     pub fn table(&self, owner: &str) -> TableRef { owned_table(owner, &self.0) }
+
+    pub fn unique_table(&self, owner: &str) -> TableRef { owned_table(owner, &format!("{OWNED_UNIQUE_PREFIX}{}", self.0)) }
 
     pub fn path_catalog(owner: &str) -> TableRef { owned_table(owner, OWNED_PATH_CATALOG) }
 
@@ -254,11 +257,15 @@ impl TableRef {
             && self.supported_owned_name()
     }
 
+    pub fn is_owned_unique_table(&self) -> bool {
+        self.table.split_once('-').is_some_and(|(_, name)| name.starts_with(OWNED_UNIQUE_PREFIX)) && self.supported_owned_name()
+    }
+
     /// True only for ordinary owned relations within this protected catalog's namespace.
     pub fn owns_path_target(&self, target: &Self) -> bool {
         (self.is_owned_path_catalog() || self.is_owned_search_catalog())
             && target.supported_owned_name()
-            && !target.is_owned_path_catalog() && !target.is_owned_search_catalog()
+            && !target.is_owned_path_catalog() && !target.is_owned_search_catalog() && !target.is_owned_unique_table()
             && target.table[..64] == self.table[..64]
     }
 
@@ -266,7 +273,8 @@ impl TableRef {
         self.schema == OWNED_SCHEMA_V1
             && self.table.split_once('-').is_some_and(|(owner, name)| {
                 owner.len() == 64 && owner.bytes().all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-                    && (matches!(name, OWNED_PATH_CATALOG | OWNED_SEARCH_CATALOG | OWNED_RELATION_CATALOG) || OwnedRelation::from_source(name.into()).is_ok())
+                    && (matches!(name, OWNED_PATH_CATALOG | OWNED_SEARCH_CATALOG | OWNED_RELATION_CATALOG) || name.strip_prefix(OWNED_UNIQUE_PREFIX).is_some_and(|relation| OwnedRelation::new(relation).is_ok())
+                        || OwnedRelation::from_source(name.into()).is_ok())
             })
     }
 }

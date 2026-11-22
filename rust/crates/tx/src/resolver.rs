@@ -19,6 +19,9 @@ use crate::replay_submission::{ReplaySubmission, duplicate_replay, is_replay_tab
 use crate::values::{BoundArgumentRow, IngestMode, plain_scalar_field};
 use crate::{ArrowDocuments, SourceTransaction, SubmitOptions, TransactionResult, TxOp, UserMetadata, source::{Operation, SourceGuard, decode_arguments, is_reserved_write_schema, table_name}};
 
+mod owned_unique;
+use owned_unique::OwnedUniqueChanges;
+
 pub const IDEMPOTENCY_GUARD_RESULT: &str = "rtdb/idempotency-guard";
 
 pub trait TransactionAuthorization: Send + Sync {
@@ -258,6 +261,9 @@ impl TxResolver {
                     break;
                 }
             }
+            if has_owned_operations && outcome.is_ok() {
+                outcome = tx.finish_owned_unique().await;
+            }
             outcome.and_then(|()| match (replay, receipt) {
                 (Some(replay), _) => tx.write_replay_marker(replay),
                 (None, Some((id, digest))) => tx.put_receipt(&id, &digest),
@@ -365,17 +371,18 @@ pub enum WriterResult { Committed { user_metadata: Option<UserMetadata> }, Abort
 
 pub struct OpenTransaction<'a> {
     buffer: TransactionBuffer, options: &'a SubmitOptions, context: &'a ResolveContext, trace_parent: Option<rtdb_plan::SpanContext>,
+    unique_changes: OwnedUniqueChanges,
     owned_world: Option<(rtdb_types::OwnedWorld, Arc<MemoryReservation>)>,
 }
 impl<'a> OpenTransaction<'a> {
     fn new(base: Snapshot, key: TransactionKey, options: &'a SubmitOptions, context: &'a ResolveContext) -> Result<Self> {
-        Ok(Self { buffer: TransactionBuffer::new(base, key, Arc::clone(&context.memory))?, options, context, trace_parent: None, owned_world: None })
+        Ok(Self { buffer: TransactionBuffer::new(base, key, Arc::clone(&context.memory))?, options, context, trace_parent: None, unique_changes: OwnedUniqueChanges::default(), owned_world: None })
     }
     pub fn tx_key(&self) -> TransactionKey { self.buffer.tx_key() }
     pub fn snapshot(&self) -> Result<Snapshot> { self.buffer.snapshot() }
     pub fn append(&mut self, table: TableRef, event: StoredEvent) -> Result<()> {
         self.context.check_cancelled()?;
-        if is_replay_table(&table) || table == receipts_table() { check_table(&table)?; }
+        if is_replay_table(&table) || table == receipts_table() || TableRef::owned_schema(&table.schema) { check_table(&table)?; }
         self.buffer.append(table, event)
     }
     pub fn declare_table(&mut self, table: TableRef, columns: impl IntoIterator<Item = String>) -> Result<()> { check_table(&table)?; self.buffer.declare_table(table, columns) }
@@ -618,6 +625,8 @@ impl<'a> OpenTransaction<'a> {
             Operation::PutArrowIids { table, documents, iids, valid_from, valid_to } => self.put_arrow_documents(table, documents, Some(iids), *valid_from, *valid_to),
             Operation::Public(TxOp::OwnedDeclareRelation { relation, schema }) =>
                 self.declare_owned_relation(relation, schema).await,
+            Operation::Public(TxOp::OwnedDeclareUniquePath { relation, name, column }) =>
+                self.declare_owned_unique_path(relation, name, column).await,
             Operation::Public(TxOp::OwnedDeclarePath { relation, name, columns }) =>
                 self.declare_owned_path(relation, name, columns, false).await,
             Operation::Public(TxOp::OwnedDeclareSearchPath { relation, name, column }) =>
@@ -833,6 +842,7 @@ impl<'a> OpenTransaction<'a> {
         if relation.world().is_some() || relation.is_world_catalog() { return Err(rtdb_types::OwnedWorld::unavailable()); }
         let valid = interval(from.unwrap_or(self.tx_key().system_time), to.unwrap_or(Timestamp::MAX))?;
         self.read_owned_revision(owner, relation, id, Interval::ALL).await?;
+        self.track_unique_mutation(owner, relation, id, valid).await?;
         self.buffer.delete(relation.table(owner), id, valid)
     }
 
@@ -872,6 +882,9 @@ impl<'a> OpenTransaction<'a> {
                 DocumentWrite::Owned { relation, owner, create_only }).await;
         }
         if let Some(root) = relation.root_relation() {
+            if self.snapshot()?.contains_table(&root.unique_table(owner)) {
+                return Err(Anomaly::incorrect("rtdb.owned/world-unique-uncovered", "World writes require inherited unique occupancy"));
+            }
             let unavailable = rtdb_types::OwnedWorld::unavailable;
             let (Some(from), Some(to)) = (from, to) else { return Err(unavailable()); };
             if create_only || from >= to || !documents.has_exact_presence() {
@@ -938,6 +951,7 @@ impl<'a> OpenTransaction<'a> {
                 DocumentWrite::Insert => self.require_absent(table, iid, valid_time).await?,
                 DocumentWrite::Owned { relation, owner, create_only } => {
                     let id = crate::source::document_id(document, &self.context.memory)?;
+                    self.track_unique_mutation(owner, relation, &id, valid_time).await?;
                     if self.snapshot()?.contains_table(table) {
                         let _ = self.read_owned_revision(owner, relation, &id, Interval::ALL).await?;
                         if create_only && self.read_owned_revision(owner, relation, &id, valid_time).await?.is_some() {
