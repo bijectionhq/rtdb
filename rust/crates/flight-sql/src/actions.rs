@@ -12,6 +12,7 @@ impl Service {
     pub async fn action(&self, call: Call, action: Action) -> Result<Response<Output<ActionResult>>, Status> {
         let work = async {
             match action.r#type.as_str() {
+                crate::owned_actions::DECLARE_OWNED_CAPACITY_V1 => Ok(vec![Ok(self.declare_owned_capacity_action(&call, &action.body).await?)]),
                 crate::owned_actions::DECLARE_OWNED_UNIQUE_PATH_V1 => Ok(vec![Ok(self.declare_owned_single_column_path_action(&call, &action.body, true).await?)]),
                 crate::owned_actions::DECLARE_OWNED_SEARCH_PATH_V1 => Ok(vec![Ok(self.declare_owned_single_column_path_action(&call, &action.body, false).await?)]),
                 crate::owned_actions::DECLARE_OWNED_RELATION_V1 => Ok(vec![Ok(self.declare_owned_relation_action(&call, &action.body).await?)]),

@@ -19,6 +19,8 @@ use crate::replay_submission::{ReplaySubmission, duplicate_replay, is_replay_tab
 use crate::values::{BoundArgumentRow, IngestMode, plain_scalar_field};
 use crate::{ArrowDocuments, SourceTransaction, SubmitOptions, TransactionResult, TxOp, UserMetadata, source::{Operation, SourceGuard, decode_arguments, is_reserved_write_schema, table_name}};
 
+mod owned_capacity;
+use owned_capacity::OwnedCapacityChanges;
 mod owned_unique;
 use owned_unique::OwnedUniqueChanges;
 
@@ -266,6 +268,9 @@ impl TxResolver {
             if has_owned_operations && outcome.is_ok() {
                 outcome = tx.finish_owned_unique().await;
             }
+            if has_owned_operations && outcome.is_ok() {
+                outcome = tx.finish_owned_capacity().await;
+            }
             if outcome.is_ok() {
                 outcome = tx.write_owned_changes().await;
             }
@@ -383,12 +388,13 @@ struct PendingOwnedChanges {
 pub struct OpenTransaction<'a> {
     buffer: TransactionBuffer, options: &'a SubmitOptions, context: &'a ResolveContext, trace_parent: Option<rtdb_plan::SpanContext>,
     unique_changes: OwnedUniqueChanges,
+    capacity_changes: OwnedCapacityChanges,
     owned_world: Option<(rtdb_types::OwnedWorld, Arc<MemoryReservation>)>,
     owned_changes: BTreeMap<String, PendingOwnedChanges>,
 }
 impl<'a> OpenTransaction<'a> {
     fn new(base: Snapshot, key: TransactionKey, options: &'a SubmitOptions, context: &'a ResolveContext) -> Result<Self> {
-        Ok(Self { buffer: TransactionBuffer::new(base, key, Arc::clone(&context.memory))?, options, context, trace_parent: None, unique_changes: OwnedUniqueChanges::default(), owned_world: None, owned_changes: BTreeMap::new() })
+        Ok(Self { buffer: TransactionBuffer::new(base, key, Arc::clone(&context.memory))?, options, context, trace_parent: None, unique_changes: OwnedUniqueChanges::default(), capacity_changes: OwnedCapacityChanges::default(), owned_world: None, owned_changes: BTreeMap::new() })
     }
     pub fn tx_key(&self) -> TransactionKey { self.buffer.tx_key() }
     pub fn snapshot(&self) -> Result<Snapshot> { self.buffer.snapshot() }
@@ -637,6 +643,8 @@ impl<'a> OpenTransaction<'a> {
             Operation::PutArrowIids { table, documents, iids, valid_from, valid_to } => self.put_arrow_documents(table, documents, Some(iids), *valid_from, *valid_to),
             Operation::Public(TxOp::OwnedDeclareRelation { relation, schema }) =>
                 self.declare_owned_relation(relation, schema).await,
+            Operation::Public(TxOp::OwnedDeclareCapacity { relation, column, prefix_bytes, cap }) =>
+                self.declare_owned_capacity(relation, column, *prefix_bytes, *cap).await,
             Operation::Public(TxOp::OwnedDeclareUniquePath { relation, name, column }) =>
                 self.declare_owned_unique_path(relation, name, column).await,
             Operation::Public(TxOp::OwnedDeclarePath { relation, name, columns }) =>
@@ -698,9 +706,11 @@ impl<'a> OpenTransaction<'a> {
         if let Some((existing, _)) = self.read_owned_schema(owner, relation).await? {
             return if &existing == schema { Ok(()) } else { Err(conflict()) };
         }
-        if self.snapshot()?.contains_table(&relation.table(owner)) {
+        let snapshot = self.snapshot()?;
+        if snapshot.contains_table(&relation.table(owner)) {
             return Err(conflict());
         }
+        self.check_capacity_schema(snapshot, owner, relation, schema).await?;
         let _encoded = self.context.memory.reserve(schema.retained_bytes() * 8 + 4096)?;
         let document = StructFields::from([
             ("_id".into(), Value::Utf8(relation.name().into())),
@@ -890,6 +900,7 @@ impl<'a> OpenTransaction<'a> {
         let locator = self.assign_owned_address(owner, relation, id).await?;
         self.read_owned_revision(owner, relation, id, Interval::ALL).await?;
         self.track_unique_mutation(owner, relation, id, valid).await?;
+        self.track_capacity_mutation(owner, relation, id, valid).await?;
         let system_from = self.tx_key().system_time;
         self.buffer.append(relation.table(owner), StoredEvent {
             iid: locator, system_from, valid_time: valid, operation: StoredOperation::Delete, recency: None,
@@ -933,7 +944,11 @@ impl<'a> OpenTransaction<'a> {
                 DocumentWrite::Owned { relation, owner, create_only }).await;
         }
         if let Some(root) = relation.root_relation() {
-            if self.snapshot()?.contains_table(&root.unique_table(owner)) {
+            let snapshot = self.snapshot()?;
+            if snapshot.contains_table(&root.capacity_table(owner)) {
+                return Err(Anomaly::incorrect("rtdb.owned/world-capacity-uncovered", "World writes require inherited capacity accounting"));
+            }
+            if snapshot.contains_table(&root.unique_table(owner)) {
                 return Err(Anomaly::incorrect("rtdb.owned/world-unique-uncovered", "World writes require inherited unique occupancy"));
             }
             let unavailable = rtdb_types::OwnedWorld::unavailable;
@@ -1005,6 +1020,7 @@ impl<'a> OpenTransaction<'a> {
                     if !relation.is_world_catalog() {
                         iid = self.assign_owned_address(owner, relation, &id).await?;
                         self.track_unique_mutation(owner, relation, &id, valid_time).await?;
+                        self.track_capacity_mutation(owner, relation, &id, valid_time).await?;
                     }
                     if self.snapshot()?.contains_table(table) {
                         let _ = self.read_owned_revision(owner, relation, &id, Interval::ALL).await?;

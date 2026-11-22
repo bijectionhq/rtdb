@@ -90,6 +90,16 @@ pub async fn open_owned_unique_point(
     open_owned_table_point(context, relation.unique_table(owner), id.iid(), Some(id), None, Some(columns), false).await
 }
 
+/// Reads one complete key from a protected capacity counter table.
+pub async fn open_owned_capacity_point(
+    context: Arc<QueryContext>, owner: &str, relation: &OwnedRelation, id: &EntityId, columns: &[&str],
+) -> Result<Option<QueryCursor>> {
+    if owner.is_empty() {
+        return Err(Anomaly::incorrect("rtdb.owned/no-owner", "Owned relations require an authenticated principal"));
+    }
+    open_owned_table_point(context, relation.capacity_table(owner), id.iid(), Some(id), None, Some(columns)).await
+}
+
 pub async fn open_owned_relation_schema(
     context: Arc<QueryContext>, owner: &str, relation: &OwnedRelation,
 ) -> Result<Option<QueryCursor>> {

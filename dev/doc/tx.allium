@@ -77,6 +77,9 @@
 -- An empty relation is covered through the reserved present, and a request crossing untracked events or a missing group is refused.
 -- A held merged feed seeks the selected owner relations at one cut and groups their visible touches by ordered system time.
 -- A capped page publishes only whole visible commits, and a nonempty page resumes at its last visible commit.
+-- An empty owned root relation may declare an immutable cap for each distinct fixed-length prefix of its binary fact key.
+-- The ordered resolver validates the final prefix memberships and commits covered counter deltas with the current-valid fact changes.
+-- World writes to a governed root refuse without inherited capacity accounting.
 -- Held reads require the original session and attachment and refuse after expiry, lease loss, or closure.
 -- A held root valid window returns ordered non-overlapping winning slices clipped at the requested endpoints.
 -- Fully covered range counts and completed valid windows can issue relation-frontier evidence under the same placed lease as range pages.

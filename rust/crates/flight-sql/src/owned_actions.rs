@@ -24,6 +24,7 @@ use crate::{
     upload, wire,
 };
 
+pub(crate) const DECLARE_OWNED_CAPACITY_V1: &str = "rtdb.owned.DeclareCapacity.v1";
 pub(crate) const DECLARE_OWNED_UNIQUE_PATH_V1: &str = "rtdb.owned.DeclareUniquePath.v1";
 pub(crate) const DECLARE_OWNED_SEARCH_PATH_V1: &str = "rtdb.owned.DeclareSearchPath.v1";
 pub(crate) const DECLARE_OWNED_RELATION_V1: &str = "rtdb.owned.DeclareRelation.v1";
@@ -298,6 +299,23 @@ impl Service {
         }).collect::<Result<Vec<_>, _>>()?;
         let name = OwnedRelation::new(name.as_str()).map_err(status)?;
         self.owned_write_reply(call, vec![TxOp::OwnedDeclarePath { relation, name, columns }]).await
+    }
+
+    pub(crate) async fn declare_owned_capacity_action(&self, call: &Call, body: &[u8]) -> Result<ActionResult, Status> {
+        if !self.0.config.owned_native_actions { return Err(unsupported()); }
+        let (relation, arrow) = split_relation(body)?;
+        let batch = request_batch(call, arrow)?;
+        if batch.batch().num_rows() != 1 || batch.batch().num_columns() != 3 {
+            return Err(invalid("Owned capacity declaration requires one row with column, prefix_bytes and cap"));
+        }
+        let (rows, _decoded) = upload::domain_documents(batch.batch(), self)?;
+        let row = &rows[0];
+        let (Some(Value::Utf8(column)), Some(Value::I64(prefix_bytes)), Some(Value::I64(cap))) =
+            (row.get("column"), row.get("prefix_bytes"), row.get("cap"))
+        else { return Err(invalid("Owned capacity declaration has invalid field types")); };
+        self.owned_write_reply(call, vec![TxOp::OwnedDeclareCapacity {
+            relation, column: column.clone(), prefix_bytes: *prefix_bytes, cap: *cap,
+        }]).await
     }
 
     pub(crate) async fn declare_owned_single_column_path_action(&self, call: &Call, body: &[u8], unique: bool) -> Result<ActionResult, Status> {

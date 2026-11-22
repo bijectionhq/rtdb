@@ -906,6 +906,7 @@ fn schema_bytes(types: &[LogicalType]) -> Result<usize> {
 pub enum TxOp {
     Sql { sql: String, args: Option<SqlArguments> },
     SqlBytes { sql: String, arg_bytes: RetainedBytes },
+    OwnedDeclareCapacity { relation: rtdb_types::OwnedRelation, column: String, prefix_bytes: i64, cap: i64 },
     OwnedDeclareUniquePath { relation: rtdb_types::OwnedRelation, name: rtdb_types::OwnedRelation, column: String },
     OwnedDeclareSearchPath { relation: rtdb_types::OwnedRelation, name: rtdb_types::OwnedRelation, column: String },
     OwnedDeclareRelation { relation: rtdb_types::OwnedRelation, schema: rtdb_types::OwnedSchema },
@@ -929,7 +930,7 @@ pub enum TxOp {
 
 impl TxOp {
     pub fn is_owned(&self) -> bool {
-        matches!(self, Self::OwnedDeclareUniquePath { .. } | Self::OwnedDeclareRelation { .. } | Self::OwnedDeclareSearchPath { .. } | Self::OwnedDeclarePath { .. } | Self::OwnedDeadline { .. } | Self::OwnedCheckRange { .. } | Self::OwnedCheck { .. } | Self::OwnedDelete { .. } | Self::OwnedReplaceDocs { .. } | Self::OwnedInsertDocs { .. })
+        matches!(self, Self::OwnedDeclareCapacity { .. } | Self::OwnedDeclareUniquePath { .. } | Self::OwnedDeclareRelation { .. } | Self::OwnedDeclareSearchPath { .. } | Self::OwnedDeclarePath { .. } | Self::OwnedDeadline { .. } | Self::OwnedCheckRange { .. } | Self::OwnedCheck { .. } | Self::OwnedDelete { .. } | Self::OwnedReplaceDocs { .. } | Self::OwnedInsertDocs { .. })
     }
 }
 

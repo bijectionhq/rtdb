@@ -4,7 +4,7 @@ use rtdb_types::{EntityId, OwnedRelation};
 
 use super::*;
 
-const MAX_KEY_BYTES: usize = 4096;
+pub(super) const MAX_KEY_BYTES: usize = 4096;
 const DECLARATION_ID: &str = "!path";
 
 #[derive(Default)]
@@ -151,7 +151,7 @@ impl OpenTransaction<'_> {
     ) -> Result<Option<Vec<u8>>> {
         let context = self.context.query_context(snapshot, self.tx_key().system_time, &self.options.default_tz, self.trace_parent)?;
         let cursor = rtdb_query::open_owned_point(context, owner, relation, id, None, Some(&[column])).await?;
-        match self.unique_cell(cursor, id, column).await? {
+        match self.read_occupancy_cell(cursor, id, column, unique_uncovered).await? {
             None => Ok(None),
             Some(Value::Binary(key)) if !key.is_empty() && key.len() <= MAX_KEY_BYTES => Ok(Some(key)),
             Some(_) => Err(invalid_key()),
@@ -163,18 +163,18 @@ impl OpenTransaction<'_> {
     ) -> Result<Option<Value>> {
         let context = self.context.query_context(snapshot, self.tx_key().system_time, &self.options.default_tz, self.trace_parent)?;
         let cursor = rtdb_query::open_owned_unique_point(context, owner, relation, id, &[column]).await?;
-        self.unique_cell(cursor, id, column).await
+        self.read_occupancy_cell(cursor, id, column, unique_uncovered).await
     }
 
-    async fn unique_cell(&self, cursor: Option<QueryCursor>, id: &EntityId, column: &str) -> Result<Option<Value>> {
+    pub(super) async fn read_occupancy_cell(&self, cursor: Option<QueryCursor>, id: &EntityId, column: &str, uncovered: fn() -> Anomaly) -> Result<Option<Value>> {
         let Some(mut cursor) = cursor else { return Ok(None); };
         let mut value = None;
         while let Some(batch) = cursor.next_batch().await? {
             let batch = batch.batch();
             if batch.num_rows() == 0 { continue; }
-            if value.is_some() || batch.num_rows() != 1 { return Err(unique_uncovered()); }
+            if value.is_some() || batch.num_rows() != 1 { return Err(uncovered()); }
             rtdb_query::owned_row_revision(batch, 0, id, &self.context.memory)?;
-            let (slot, field) = batch.schema_ref().column_with_name(column).ok_or_else(unique_uncovered)?;
+            let (slot, field) = batch.schema_ref().column_with_name(column).ok_or_else(uncovered)?;
             let column = batch.column(slot).as_ref();
             let bytes = rtdb_columnar::estimate_read_value_bytes(field, column, 0)?;
             let _read = self.context.memory.reserve(bytes.saturating_add(4096))?;
@@ -184,7 +184,7 @@ impl OpenTransaction<'_> {
     }
 }
 
-fn unique_id(key: &[u8]) -> EntityId {
+pub(super) fn unique_id(key: &[u8]) -> EntityId {
     let mut name = String::with_capacity(1 + key.len() * 2);
     name.push('k');
     for byte in key { write!(&mut name, "{byte:02x}").expect("writing to a string cannot fail"); }
