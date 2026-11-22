@@ -1,3 +1,6 @@
+mod unique;
+pub(crate) use unique::READ_HELD_UNIQUE_V1;
+
 use std::{collections::{BTreeMap, BTreeSet}, sync::{Arc, Mutex}, time::Duration};
 
 use arrow_array::{Array, BooleanArray, Float64Array, Int64Array, RecordBatch, StringArray, TimestampMicrosecondArray, UInt64Array};
