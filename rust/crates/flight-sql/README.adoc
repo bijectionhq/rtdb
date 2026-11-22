@@ -333,3 +333,19 @@ On this relation the final state of each owned commit must give each live row a 
 Mutations use validity from their ordered present to infinity.
 The ordered resolver applies releases and claims as a group, so a commit may swap keys. Conflicts do not return the occupant or the key.
 A successful declaration returns the same transaction-key Arrow row as Create.
+
+=== Reading and dropping a hosted checkpoint world
+
+The placed Multi host enables world actions on a listener configured for owned native actions.
+An authenticated, idle autocommit session must remain bound to its writer placement and epoch.
+The host resolves deployment and archive authority from the authenticated placement and the world record.
+
+`rtdb.owned.ReadWorldPoint.v1` takes a 16-byte world UUID, the relation prefix, and a terminated Arrow IPC stream containing one batch and one row.
+The row has `_id` of a supported identity type and a non-null `valid_micros: Int64`.
+The read resolves the local world shadow at one reserved present, including tombstones, then uses the retained archived cut if there is no shadow.
+The IPC metadata reports the live world present as `rtdb.owned.present_micros` and the selected instant as `rtdb.owned.valid_micros`.
+A found row includes the winning local or archived `rtdb.owned.revision_micros`. An absent row has no record batch.
+
+`rtdb.owned.DropWorld.v1` takes exactly the 16-byte world UUID.
+The ordered terminal record fences subsequent world operations before the host releases its archive pin.
+Success has zero Flight results.
