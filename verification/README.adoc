@@ -262,6 +262,7 @@ It also exercises the Azure adapter against a loopback provider and separately m
   Apalache independently checks the bounded model and the incomplete-coverage control.
   Lean proves that the greatest covered block bounds each member, and `verus/checkpoint_metadata` checks the Rust guard used inside the owner's CAS.
   The native replay exercises hosted path fallback, incomplete coverage, an active startup hold and settlement alongside a replacement.
+  Native compile-fail cases check the local eraser's visibility and keep the simulation control restricted to in-memory stores.
   Native capture checks a refused old root, successful transfer from a predecessor, release after copy, and reuse of a completed archive.
 * `mcrl2/CheckpointDiscovery.mcrl2` compares the staged metadata discovery with an atomic observation contract after hiding the selection and individual reads.
   It checks divergence-preserving branching bisimilarity on three indices and generates a distinguishing formula for each weakened model.

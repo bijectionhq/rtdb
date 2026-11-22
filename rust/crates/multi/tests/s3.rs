@@ -140,9 +140,8 @@ async fn exercise_cell(storage: CellStorage) {
 
     eprintln!("S3 phase: reap");
     let deployments = cell.directory.deployments().await.unwrap();
-    let references = rtdb_multi::reference::References::scan(bucket.as_ref(), &deployments).await.unwrap();
-    for record in deployments.iter().filter(|record| record.lifecycle != rtdb_directory::Lifecycle::Deleted) {
-        rtdb_multi::store::reap(bucket.as_ref(), record, Duration::from_secs(3600), &references).await.unwrap();
+    for outcome in rtdb_multi::store::reaper_pass(bucket.as_ref(), &deployments, rtdb_directory::now_ms(), Duration::from_secs(3600)).await.unwrap() {
+        outcome.unwrap();
     }
     eprintln!("S3 phase: stop cell");
     cell.stop().await;

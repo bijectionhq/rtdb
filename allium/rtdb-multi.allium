@@ -1579,6 +1579,7 @@ rule ReapUnreachable {
     -- The reaper confirms that withdrawal before deleting a local copy that shadows the reference.
     -- A failed physical removal keeps its release record for the next pass.
     -- A local sweep reserves the lineage against its current shared-reference revision after draining local preparation.
+    -- Local path erasure is internal to the admitted maintenance task.
     -- The reservation advances the preparation generation and holds until the sweep's provider work drains.
     -- The sweep scans published referrers after reserving the lineage and copies retained objects before removing the source copies.
     -- An S3 loose-file release with an installed publication witness records the exact provider version.

@@ -1184,15 +1184,21 @@ pub(crate) async fn check_root(store: &dyn ObjectStore, deployment: &str, claim:
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Reaped { pub erased: usize, pub waiting: usize }
 
-/// Erases every object a deployment released more than `grace` ago from the cell's bucket.
-/// An object other deployments still reference is copied into them first; an object this deployment only references is dropped from its manifest.
-pub async fn reap(bucket: &dyn ObjectStore, record: &DeploymentRecord, grace: Duration, references: &crate::reference::References) -> Result<Reaped> {
+#[cfg(test)]
+async fn reap(bucket: &dyn ObjectStore, record: &DeploymentRecord, grace: Duration, references: &crate::reference::References) -> Result<Reaped> {
     reap_as_of(bucket, record, wall_clock()(), grace, references).await
 }
 
-/// `reap` as of `now_ms`, in milliseconds since the epoch.
-pub async fn reap_as_of(bucket: &dyn ObjectStore, record: &DeploymentRecord, now_ms: i64, grace: Duration, references: &crate::reference::References) -> Result<Reaped> {
+#[cfg(test)]
+pub(crate) async fn reap_as_of(bucket: &dyn ObjectStore, record: &DeploymentRecord, now_ms: i64, grace: Duration, references: &crate::reference::References) -> Result<Reaped> {
     reap_path_releases(bucket, record, now_ms, grace, references, true).await
+}
+
+/// Runs the missing-reference control against an in-memory cell.
+#[doc(hidden)]
+pub async fn simulate_reap_without_references(bucket: &rtdb_storage::MemoryStore, record: &DeploymentRecord, now_ms: i64,
+    grace: Duration) -> Result<Reaped> {
+    reap_path_releases(bucket, record, now_ms, grace, &crate::reference::References::default(), true).await
 }
 
 async fn reap_path_releases(bucket: &dyn ObjectStore, record: &DeploymentRecord, now_ms: i64, grace: Duration,
@@ -1523,7 +1529,7 @@ async fn reap_local(directory: &dyn Directory, storage: &CellStorage, maintenanc
         let Some(record) = deployments.iter().find(|record| record.id == candidate.id && record.storage_prefix() == retirement.source && can_reap(record))
             else { return Ok(Reaped::default()); };
         let references = crate::reference::References::scan(bucket.as_ref(), &deployments).await?;
-        reap_as_of(bucket.as_ref(), record, now_ms, grace, &references).await
+        reap_path_releases(bucket.as_ref(), record, now_ms, grace, &references, true).await
     }.await;
     io.close_and_wait().await;
     directory.change_lineage(lineage, LineageChange::SettleRetirement { retirement }).await?;
@@ -1541,9 +1547,23 @@ pub(crate) async fn with_source_lineage<T>(directory: &dyn Directory, lineage: O
     result.and_then(|value| released.map(|_| value))
 }
 
-/// Reaps live and quarantined deployments against the references of the cell.
-/// Transfer and disposal fences keep their inventories stable.
-/// A deployment that fails to reap does not stop the others'.
+/// Reaps ordinary remote releases for live and quarantined deployments against the cell's references.
+/// The local eraser requires the local-volume and lineage admission used by the maintenance task.
+///
+/// ```compile_fail
+/// use rtdb_multi::store::reap_as_of;
+/// ```
+///
+/// ```compile_fail
+/// use std::time::Duration;
+/// use rtdb_directory::DeploymentRecord;
+/// use rtdb_multi::store::simulate_reap_without_references;
+/// use rtdb_storage::ObjectStore;
+///
+/// fn run(bucket: &dyn ObjectStore, record: &DeploymentRecord) {
+///     let _ = simulate_reap_without_references(bucket, record, 0, Duration::ZERO);
+/// }
+/// ```
 pub async fn reaper_pass(bucket: &dyn ObjectStore, deployments: &[DeploymentRecord], now_ms: i64, grace: Duration) -> Result<Vec<Result<Reaped>>> {
     let references = crate::reference::References::scan(bucket, deployments).await?;
     Ok(reap_remote_paths(bucket, deployments, now_ms, grace, &references).await)

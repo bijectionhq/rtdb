@@ -16,7 +16,7 @@ use bytes::Bytes;
 use rtdb_directory::{Checkpoint, DeploymentRecord, Lifecycle};
 use rtdb_format::keys::{TrieKey, block_key, lex_hex};
 use rtdb_multi::packing::PackDiscovery;
-use rtdb_multi::reference::{self, Bucket, References};
+use rtdb_multi::reference;
 use rtdb_multi::store::{self, Clock, GarbageStore};
 use rtdb_storage::{Error as StoreError, MemoryStore, ObjectKey, ObjectStore, object_store::StoredObject};
 use rtdb_types::BlockIndex;
@@ -162,7 +162,7 @@ struct World {
     step: usize,
     now: Arc<AtomicI64>,
     clock: Clock,
-    cells: Vec<Bucket>,
+    cells: Vec<Arc<MemoryStore>>,
     deployments: Vec<Deployment>,
     trace: VecDeque<String>,
     summary: Summary,
@@ -175,7 +175,7 @@ impl World {
         let now = Arc::new(AtomicI64::new(1_000));
         let ticks = Arc::clone(&now);
         let clock: Clock = store::stamps(move || ticks.load(Ordering::SeqCst));
-        let cells = (0..CELLS).map(|_| Arc::new(MemoryStore::default()) as Bucket).collect();
+        let cells = (0..CELLS).map(|_| Arc::new(MemoryStore::default())).collect();
         let summary = Summary { seed: config.seed, ..Summary::default() };
         Self { rng: Rng::new(config.seed), config, step: 0, now, clock, cells, deployments: Vec::new(), trace: VecDeque::new(), summary, dirty: BTreeSet::new() }
     }
@@ -260,7 +260,7 @@ impl World {
     async fn open(&self, index: usize) -> Result<Arc<GarbageStore>, String> {
         let deployment = &self.deployments[index];
         let discovery = match deployment.record.checkpoint { Some(checkpoint) => PackDiscovery::From(checkpoint.block), None => PackDiscovery::List };
-        store::open_deployment_store(Arc::clone(&self.cells[deployment.cell]), &deployment.store(), discovery, Arc::clone(&self.clock)).await
+        store::open_deployment_store(self.cells[deployment.cell].clone(), &deployment.store(), discovery, Arc::clone(&self.clock)).await
             .map_err(|error| format!("d{index}'s store does not open: {error}"))
     }
 
@@ -466,7 +466,9 @@ impl World {
         let outcomes = match self.config.bug {
             Some(Bug::ReaperSkipsCopy) => {
                 let mut outcomes = Vec::new();
-                for record in records.iter().filter(|record| record.lifecycle != Lifecycle::Deleted) { outcomes.push(store::reap_as_of(bucket.as_ref(), record, self.now(), grace, &References::default()).await); }
+                for record in records.iter().filter(|record| record.lifecycle != Lifecycle::Deleted) {
+                    outcomes.push(store::simulate_reap_without_references(bucket.as_ref(), record, self.now(), grace).await);
+                }
                 outcomes
             }
             _ => {
