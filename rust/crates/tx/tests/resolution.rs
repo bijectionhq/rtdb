@@ -1233,4 +1233,15 @@ async fn hosted_control_replacement_and_owned_facts_abort_together() {
         source(vec![deadline(), replacement(104, 3), native_fact()]), &context).await.unwrap();
     assert!(!refused.result().committed());
     assert!(!refused.writes().tables().contains_key(&table));
+
+    let malformed = resolver.resolve_source(state.snapshot(), SourcePosition(6), Timestamp(106),
+        source(vec![TxOp::PutDocs {
+            table: table.clone(), documents: Documents::new(vec![control_row(4)], &context.memory).unwrap(),
+            valid_from: Some(Timestamp(12)), valid_to: None,
+        }]), &context).await.unwrap();
+    assert!(malformed.result().committed());
+    let refused_slice = resolver.resolve_source(state.snapshot(), SourcePosition(7), Timestamp(107),
+        source(vec![deadline(), check(106)]), &context).await.unwrap();
+    assert_eq!(refused_slice.result().error().unwrap().code, "rtdb.hosted/control-scope");
+    assert!(!refused_slice.writes().tables().contains_key(&table));
 }

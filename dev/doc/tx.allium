@@ -57,6 +57,8 @@
 -- The owner can declare a closed scalar schema before an owned relation has stored data.
 -- An owned create or replacement enforces that schema at the ordering cut.
 -- Source encoding preserves whether an owned field was omitted or explicitly null.
+-- A live placed held read can resolve one installed ordinary control point under the hosted writer's allowlist.
+-- The control lookup proves an epoch-to-infinity slice or covered absence and returns its originally held revision for a checked commit.
 -- Owned deadlines and point observations are checked at the ordered cut before owned mutations apply.
 -- One grouped owned Flight commit supplies one deadline and batches for distinct relations.
 -- With no relation batches, the commit validates the deadline at its ordered position and changes no owned relation.
