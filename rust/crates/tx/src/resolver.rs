@@ -1016,12 +1016,15 @@ impl<'a> OpenTransaction<'a> {
                     Operation::Public(TxOp::OwnedCheck { relation, .. } | TxOp::OwnedCheckRange { relation, .. })
                         if relation.world().is_none() && !relation.is_world_catalog() => 1,
                     Operation::Public(TxOp::OwnedCheck { relation, .. }) => {
-                        let world = relation.world().ok_or_else(unavailable)?;
                         if !index.checked_sub(1).is_some_and(|previous|
                             matches!(&operations[previous], Operation::Public(TxOp::OwnedCheckWorldPurge { relation: guarded, .. }) if guarded == relation))
                         {
                             return Err(unavailable());
                         }
+                        1
+                    }
+                    Operation::Public(TxOp::OwnedCheckWorldPurge { relation, .. }) => {
+                        let world = relation.world().ok_or_else(unavailable)?;
                         counts.entry(world).or_default().1 += 1;
                         1
                     }
@@ -1033,7 +1036,7 @@ impl<'a> OpenTransaction<'a> {
                         scoped_checks += 1;
                         1
                     }
-                    Operation::Public(TxOp::OwnedDeadline { .. } | TxOp::OwnedCheckWorldPurge { .. }
+                    Operation::Public(TxOp::OwnedDeadline { .. }
                         | TxOp::OwnedPublishWorld { .. } | TxOp::OwnedPublishRoot { .. }) => 1,
                     _ => return Err(unavailable()),
                 };

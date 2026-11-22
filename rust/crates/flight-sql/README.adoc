@@ -478,6 +478,11 @@ It takes the world UUID, one signed big-endian 64-bit exclusive deadline in Unix
 The remaining bytes are the existing hosted control groups. Only check rows from the placed allowlist are admitted.
 The ordered transaction checks the world registration, placement, deadline, local point revisions, root erasure frontiers, and hosted ownership before issuing the transaction-key receipt.
 
+`rtdb.owned.SearchHeldWorld.v1` takes the original 16-byte world handle and a signed big-endian i64 valid instant, then the same partition, offset, limit, evidence flag and query framing as SearchHeld.v4.
+The selected world must be retained, the evidence flag must be one, and every partition must have complete clear-text artefacts with unchanged Root purge frontiers since the archive cut.
+The ranked reply carries the world present, requested valid instant, exact total and one held condition per partition, including for an empty result.
+Conditions validate the original archive pin and whole-corpus purge frontiers.
+
 `rtdb.owned.ReadHeldWorldChanges.v1` uses the merged changes framing and reply with a held world handle.
 It returns ordered local overlay groups after the supplied revision at or above the archived parent basis. The archived parent is fixed.
 The scope must retain journal coverage and certified purge history. A local tombstone emits a delete.

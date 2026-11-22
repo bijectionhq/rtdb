@@ -357,7 +357,7 @@ fn uncovered_owned_search() -> Anomaly {
 pub async fn owned_corpus(
     context: Arc<QueryContext>, owner: &str, relation: &OwnedRelation, path: &OwnedRelation, text: &str,
 ) -> Result<rtdb_text::Corpus> {
-    Ok(covered_owned_corpus(context, owner, relation, path, &Query::parse(text), false).await?.corpus)
+    Ok(covered_owned_corpus(context, owner, relation, path, &Query::parse(text), None, false).await?.corpus)
 }
 
 struct CoveredCorpus {
@@ -369,7 +369,8 @@ struct CoveredCorpus {
 }
 
 async fn covered_owned_corpus(
-    context: Arc<QueryContext>, owner: &str, relation: &OwnedRelation, path: &OwnedRelation, query: &Query, retain_runs: bool,
+    context: Arc<QueryContext>, owner: &str, relation: &OwnedRelation, path: &OwnedRelation, query: &Query,
+    valid_at: Option<Timestamp>, retain_runs: bool,
 ) -> Result<CoveredCorpus> {
     let definition = crate::definitions::owned_definition(Arc::clone(&context), owner, relation, path).await?
         .ok_or_else(|| Anomaly::incorrect("rtdb.owned/search-path", "Owned relation has no declared clear-text search path with this name"))?;
@@ -383,8 +384,10 @@ async fn covered_owned_corpus(
         return Err(uncovered_owned_search());
     }
     let [column] = definition.columns.as_slice() else { return Err(uncovered_owned_search()); };
-    let point = Interval::new(present, present.next()?)?;
-    let bounds = TemporalBounds { valid_time: point, system_time: point };
+    let bounds = TemporalBounds {
+        valid_time: Interval::at(valid_at.unwrap_or(present))?,
+        system_time: Interval::at(present)?,
+    };
     if !snapshot.contains_table(&definition.table) {
         return Ok(CoveredCorpus {
             column: column.clone(), bounds, corpus: rtdb_text::Corpus::default(), visible_runs: Vec::new(),
@@ -484,11 +487,13 @@ pub struct OwnedSearchHit {
 pub struct OwnedSearchPage {
     pub hits: Vec<OwnedSearchHit>,
     pub total: usize,
+    _reservation: Arc<rtdb_columnar::MemoryReservation>,
 }
 
 /// Ranks nominated runs at one cut using statistics from all selected partitions.
 pub async fn owned_ranked(
-    context: Arc<QueryContext>, owner: &str, partitions: &[(OwnedRelation, OwnedRelation)], text: &str, offset: usize, limit: usize,
+    context: Arc<QueryContext>, owner: &str, partitions: &[(OwnedRelation, OwnedRelation)], text: &str,
+    offset: usize, limit: usize, valid_at: Option<Timestamp>,
 ) -> Result<OwnedSearchPage> {
     if offset > 4096 || !(1..=128).contains(&limit) || !(1..=32).contains(&partitions.len()) || text.len() > 4096 {
         return Err(Anomaly::incorrect("rtdb.owned/search-limit", "Owned search exceeds its result, partition, or query bound"));
@@ -501,7 +506,7 @@ pub async fn owned_ranked(
     let mut corpus = rtdb_text::Corpus::default();
     let mut covered = Vec::with_capacity(partitions.len());
     for (relation, path) in partitions {
-        let part = covered_owned_corpus(Arc::clone(&context), owner, relation, path, &query, true).await?;
+        let part = covered_owned_corpus(Arc::clone(&context), owner, relation, path, &query, valid_at, true).await?;
         corpus.add(&part.corpus);
         covered.push((relation, part));
     }
@@ -579,7 +584,7 @@ pub async fn owned_ranked(
     }
     context.check_cancelled()?;
     hits.drain(..offset.min(hits.len()));
-    Ok(OwnedSearchPage { hits, total: candidates })
+    Ok(OwnedSearchPage { hits, total: candidates, _reservation: memory })
 }
 
 fn file_candidates(cutter: &Cutter<'_>, column: &str, query: &Query, max_candidates: usize, events: &mut usize) -> Result<Option<BTreeSet<Iid>>> {

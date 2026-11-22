@@ -38,6 +38,16 @@ enum ArchiveRead {
         reply: oneshot::Sender<Result<()>>,
     },
     Point(ArchivePoint),
+    Search {
+        partitions: Vec<(OwnedRelation, OwnedRelation)>,
+        frontiers: Vec<i64>,
+        query: String,
+        offset: usize,
+        limit: usize,
+        valid: Timestamp,
+        guard: Arc<dyn Fn() -> Result<()> + Send + Sync>,
+        reply: oneshot::Sender<Result<rtdb_node::OwnedSearchPage>>,
+    },
     Boundaries {
         relation: OwnedRelation,
         id: EntityId,
@@ -127,6 +137,27 @@ impl HeldCheckpointWorld {
         self.check_relation(relation)?;
         Ok(WorldPoint { present: self.present(), fact, shadowed, witness })
     }
+    pub async fn ranked_search(
+        &self, partitions: Vec<(OwnedRelation, OwnedRelation)>, query: String, offset: usize, limit: usize,
+        valid: Timestamp,
+    ) -> Result<(rtdb_node::OwnedSearchPage, Vec<OwnedWorldWitness>)> {
+        self.check()?;
+        let guard = self.open.snapshot.relation_release_guard(partitions.iter().map(|(relation, _)| relation))?;
+        let witnesses = self.open.snapshot.retained_world_search_witnesses(
+            self.open.record.id, partitions.iter().map(|(relation, _)| relation),
+        ).await?;
+        let frontiers = witnesses.iter().map(OwnedWorldWitness::purge_frontier).collect();
+        let (reply, result) = oneshot::channel();
+        self.cancellation.run_until_cancelled(self.requests.send(ArchiveRead::Search {
+            partitions, frontiers, query, offset, limit, valid, guard: Arc::clone(&guard), reply,
+        })).await.ok_or_else(OwnedWorld::unavailable)?.map_err(|_| OwnedWorld::unavailable())?;
+        let page = self.cancellation.run_until_cancelled(result).await
+            .ok_or_else(OwnedWorld::unavailable)?.map_err(|_| OwnedWorld::unavailable())??;
+        self.check()?;
+        guard()?;
+        Ok((page, witnesses))
+    }
+
     pub async fn valid_during(
         &self, relation: &OwnedRelation, id: &EntityId, valid: Interval,
     ) -> Result<Vec<(Interval, Timestamp)>> {
@@ -327,6 +358,29 @@ pub(crate) async fn open_held_checkpoint_world(
                                             owner: &owner, relation: &relation, id: &id, valid: Some(valid),
                                         }).await?;
                                         decode_point(batches.unwrap_or_default(), &id, memory)
+                                    };
+                                    let response = tokio::select! {
+                                        _ = scope.cancelled() => break,
+                                        _ = reply.closed() => continue,
+                                        result = read => result,
+                                    };
+                                    let _ = reply.send(response);
+                                }
+                                ArchiveRead::Search { partitions, frontiers, query, offset, limit, valid, guard, mut reply } => {
+                                    let read = async {
+                                        guard()?;
+                                        require_relation_purge_history(&context, &owner)?;
+                                        let database = context.catalog.database(context.catalog.default_database())?;
+                                        let [snapshot] = database.partitions.as_slice() else { return Err(OwnedWorld::unavailable()); };
+                                        for ((relation, _), frontier) in partitions.iter().zip(frontiers) {
+                                            if snapshot.relation_event_frontier(&relation.purge_table(&owner))? != frontier {
+                                                return Err(OwnedWorld::unavailable());
+                                            }
+                                        }
+                                        let scoped = Arc::clone(&context).with_owned_read_guard(Arc::clone(&guard));
+                                        let page = rtdb_node::rank_owned_cut(scoped, &owner, &partitions, &query, offset, limit, Some(valid)).await?;
+                                        guard()?;
+                                        Ok(page)
                                     };
                                     let response = tokio::select! {
                                         _ = scope.cancelled() => break,

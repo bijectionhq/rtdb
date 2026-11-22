@@ -3,7 +3,7 @@ use std::{fmt, sync::Arc};
 use futures::future::BoxFuture;
 use rtdb_directory::{Directory, HostedTask};
 use rtdb_flight_sql::{OwnedWorldHost, OwnedWorldRead, WorldCall, WorldIdentityPage, WorldPointResult, WorldPointRow};
-use rtdb_node::{NodeOptions, OwnedWorldPointWitness};
+use rtdb_node::{NodeOptions, OwnedWorldWitness};
 use rtdb_types::{EntityId, Interval, OwnedRelation, OwnedWorld, Result, Timestamp, TransactionKey};
 use uuid::Uuid;
 
@@ -72,7 +72,7 @@ impl OwnedWorldHost for PlacedWorldHost {
         })
     }
 
-    fn validate_world<'a>(&'a self, call: WorldCall<'a>, world: Uuid, checks: Vec<OwnedWorldPointWitness>, controls: Vec<rtdb_node::HostedControlWrite>, deadline: Timestamp) -> BoxFuture<'a, Result<TransactionKey>> {
+    fn validate_world<'a>(&'a self, call: WorldCall<'a>, world: Uuid, checks: Vec<OwnedWorldWitness>, controls: Vec<rtdb_node::HostedControlWrite>, deadline: Timestamp) -> BoxFuture<'a, Result<TransactionKey>> {
         Box::pin(async move {
             let deployment = self.deployment(&call)?;
             validate_checkpoint_world(self.directory.as_ref(), &self.storage, call.session, deployment, world, checks, controls, deadline).await
@@ -101,6 +101,13 @@ impl OwnedWorldRead for HeldCheckpointWorld {
     fn is_held(&self) -> bool { HeldCheckpointWorld::is_held(self) }
 
     fn parent_basis(&self) -> TransactionKey { HeldCheckpointWorld::parent_basis(self) }
+
+    fn ranked_search<'a>(
+        &'a self, partitions: Vec<(OwnedRelation, OwnedRelation)>, query: String, offset: usize,
+        limit: usize, valid: Timestamp,
+    ) -> BoxFuture<'a, Result<(rtdb_node::OwnedSearchPage, Vec<OwnedWorldWitness>)>> {
+        Box::pin(HeldCheckpointWorld::ranked_search(self, partitions, query, offset, limit, valid))
+    }
     fn parent_pin(&self) -> rtdb_types::Iid { HeldCheckpointWorld::parent_pin(self) }
     fn until(&self) -> Timestamp { HeldCheckpointWorld::until(self) }
     fn evidence_until(&self) -> Timestamp { HeldCheckpointWorld::evidence_until(self) }
