@@ -60,6 +60,6 @@ fn cardinality_violation() -> rtdb_types::Anomaly {
 mod owned_relation;
 pub use owned_relation::{
     OwnedAddress, OwnedChangeEntry, open_owned_path_catalog, open_owned_point, open_owned_relation_schema,
-    open_owned_unique_point, open_owned_valid_during, owned_address, owned_row_revision, read_owned_parent_schemas,
+    open_owned_unique_point, open_owned_valid_during, open_owned_valid_during_at, owned_address, owned_row_revision, read_owned_parent_schemas,
     read_owned_change_entry, read_owned_world, require_owned_address_coverage,
 };

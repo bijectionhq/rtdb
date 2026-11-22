@@ -28,6 +28,7 @@ pub use placed_receipts::{AwaitAuthority, ClosedEpochRecovery, PlacedReceiptCode
 pub use catalog::{DatabaseCatalog, Membership};
 pub use config::*;
 pub use database::{CompactionRelay, Database};
+pub use node::{OwnedVersion, OwnedVersionPage};
 pub use node::{IDEMPOTENCY_KEY_PARAMETER, NOT_HELD, REPLICA_BEHIND, NativeSession, Node, NodeDriver, NodeServices, OwnedChangePage, OwnedRangeWitness, OwnedReadSession, OwnedWorldWrite, ReadFence};
 
 mod statement;

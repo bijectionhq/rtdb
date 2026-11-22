@@ -345,6 +345,17 @@ Each row includes `_system_from`, the winning revision. Gaps and tombstones have
 Schema metadata reports `rtdb.owned.present_micros`, `rtdb.owned.valid_from_micros`, and `rtdb.owned.valid_to_micros`.
 A read requires the original held root cut and refuses more than 4096 slices or an oversized Flight result.
 
+`rtdb.owned.ReadHeldVersions.v1` uses the held handle and relation prefix followed by one Arrow batch and one row.
+The request fields are `_id`, `system_from_micros: Int64`, `system_to_micros: Int64`, `after_revision: Int64`, and `limit: Int64`.
+Use a nonempty half-open system window within the held covered interval, an exclusive journal revision starting at zero, and a limit from 1 to 128 source groups.
+The first result is 17 bytes containing the next scanned revision as big-endian u64, a completion byte of 0 or 1, and the certified floor in signed big-endian Unix microseconds.
+An incomplete page may have no matching versions. Continue from its next scanned revision with the same handle and window.
+Each additional result is one Arrow stream containing the full winning valid timeline for one source group that touched the complete typed identity.
+A complete deletion still returns a version stream with schema and no record batch. Clients fill gaps from the explicit valid boundaries.
+Schema metadata includes `rtdb.owned.version_revision` and `rtdb.owned.version_micros` alongside the held present and full valid window.
+Requests before the certified floor refuse and report `history-floor-micros` in the anomaly context.
+Coverage or response-size failures refuse the page.
+
 === Working in a hosted checkpoint world
 
 The placed Multi host enables world actions on a listener configured for owned native actions.

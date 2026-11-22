@@ -73,6 +73,8 @@
 -- An empty relation is covered through the reserved present, and a request crossing untracked events or a missing group is refused.
 -- Held reads require the original session and attachment and refuse after expiry, lease loss, or closure.
 -- A held root valid window returns ordered non-overlapping winning slices clipped at the requested endpoints.
+-- Held system versions derive their timestamps and retained floor from the relation's ordered change journal and verify its event frontier.
+-- Each admitted version resolves the complete valid timeline at that revision on the same pinned physical catalog.
 -- An owned path declaration is maintained from the ordered owner's private catalog.
 -- An owned unique declaration starts before any relation data and admits one Binary key per row.
 -- The ordered resolver validates the final staged key set with typed holders and commits occupancy and rows together.

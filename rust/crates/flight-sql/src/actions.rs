@@ -28,6 +28,7 @@ impl Service {
                 crate::owned_actions::HELD_OWNED_CHANGES_V2 => Ok(vec![Ok(self.held_owned_changes_action(&call, &action.body).await?)]),
                 crate::owned_actions::HELD_OWNED_POINT_V1 => Ok(vec![Ok(self.held_owned_point_action(&call, &action.body, false).await?)]),
                 crate::owned_actions::HELD_OWNED_POINT_V2 => Ok(vec![Ok(self.held_owned_point_action(&call, &action.body, true).await?)]),
+                crate::owned_actions::HELD_OWNED_VERSIONS_V1 => Ok(self.held_owned_versions_action(&call, &action.body).await?.into_iter().map(Ok).collect()),
                 crate::owned_actions::HELD_OWNED_VALID_DURING_V1 => Ok(vec![Ok(self.held_owned_valid_during_action(&call, &action.body).await?)]),
                 crate::owned_actions::CLOSE_OWNED_READ_V1 => {
                     self.close_owned_read_action(&call, &action.body)?;
