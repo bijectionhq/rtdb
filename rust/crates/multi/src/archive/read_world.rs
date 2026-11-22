@@ -5,14 +5,16 @@ use bytes::Bytes;
 use rtdb_columnar::{MemoryBudget, OwnedBatch};
 use rtdb_directory::{Directory, HostedTask};
 use rtdb_node::NodeOptions;
-use rtdb_query::{CatalogSnapshot, DatabaseSnapshot, QueryContext, open_owned_point};
+use rtdb_query::{
+    CatalogSnapshot, DatabaseSnapshot, QueryContext, open_owned_point, owned_row_revision,
+};
 use rtdb_replication::{BlockDiscovery, BlockStore, PublishedCheckpoint};
 use rtdb_storage::{
     Error, ObjectKey, ObjectStore, StoredObject,
     cache::{BufferPool, CacheBudget},
 };
 use rtdb_types::{
-    BlockIndex, Iid, Interval, OwnedRelation, ReplicaPosition, Result, SourcePosition,
+    BlockIndex, EntityId, Interval, OwnedRelation, ReplicaPosition, Result, SourcePosition,
     StorageEpoch, TransactionKey,
 };
 use serde::{Deserialize, Serialize};
@@ -39,9 +41,8 @@ pub struct CheckpointPoint<'a> {
     /// The authenticated owner supplied by the calling host.
     pub owner: &'a str,
     pub relation: &'a OwnedRelation,
-    pub iid: Iid,
+    pub id: &'a EntityId,
     pub valid: Option<Interval>,
-    pub columns: Option<&'a [&'a str]>,
 }
 
 pub struct CheckpointReadResources<'a> {
@@ -62,6 +63,11 @@ pub async fn read_checkpoint_owned_point(
     point: CheckpointPoint<'_>,
     resources: CheckpointReadResources<'_>,
 ) -> Result<Option<Vec<OwnedBatch>>> {
+    if !resources.node.owned_relations {
+        return Err(unavailable(
+            "Owned checkpoint reads require the owned-relation capability",
+        ));
+    }
     let deployment = world.deployment.to_string();
     let admit = |record: &rtdb_directory::DeploymentRecord| {
         require_capture_open(record, world.capture)?;
@@ -177,9 +183,9 @@ pub async fn read_checkpoint_owned_point(
                 context,
                 point.owner,
                 point.relation,
-                point.iid,
+                point.id,
                 point.valid,
-                point.columns,
+                None,
             )
             .await?
             else {
@@ -187,6 +193,9 @@ pub async fn read_checkpoint_owned_point(
             };
             let mut batches = Vec::new();
             while let Some(batch) = cursor.next_batch().await? {
+                for row in 0..batch.batch().num_rows() {
+                    owned_row_revision(batch.batch(), row, point.id, resources.memory)?;
+                }
                 batches.push(batch);
             }
             Ok(Some(batches))

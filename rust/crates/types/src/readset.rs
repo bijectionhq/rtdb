@@ -17,9 +17,9 @@ pub enum Part {
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-pub struct Cell<R = RelationId> {
+pub struct Cell<R = RelationId, I = Iid> {
     pub relation: R,
-    pub id: Iid,
+    pub id: I,
     pub part: Part,
 }
 
@@ -92,9 +92,9 @@ pub struct PathRead<L, R = RelationId> {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub enum ReadTarget<L, W, R = RelationId> {
+pub enum ReadTarget<L, W, R = RelationId, I = Iid> {
     Point {
-        cell: Cell<R>,
+        cell: Cell<R, I>,
         partitions: Arc<[L]>,
         valid_at: Option<Instant>,
     },
@@ -113,7 +113,7 @@ pub enum ReadTarget<L, W, R = RelationId> {
         partitions: Arc<[L]>,
     },
     Versions {
-        cell: Cell<R>,
+        cell: Cell<R, I>,
         from: Timestamp,
         through: Timestamp,
         valid_at: Option<Instant>,
@@ -127,8 +127,8 @@ pub enum ReadTarget<L, W, R = RelationId> {
 pub struct Deadline(pub Timestamp);
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ReadEntry<L, W, E, R = RelationId> {
-    pub target: ReadTarget<L, W, R>,
+pub struct ReadEntry<L, W, E, R = RelationId, I = Iid> {
+    pub target: ReadTarget<L, W, R, I>,
     pub label: L,
     pub until: Option<Deadline>,
     pub exclusions: Arc<[E]>,
@@ -149,9 +149,9 @@ impl Period {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub enum Touch<L, W, E, R = RelationId> {
+pub enum Touch<L, W, E, R = RelationId, I = Iid> {
     Cell {
-        cell: Cell<R>,
+        cell: Cell<R, I>,
         old: Option<L>,
         new: Option<L>,
         period: Option<Period>,
@@ -188,9 +188,9 @@ fn holds(period: Option<Period>, valid_at: Option<Instant>) -> bool {
 
 /// Counts and bounds use this predicate for invalidation. Their validation
 /// verdict requires re-evaluating the count at the ordering position.
-pub fn intersects<L: Eq, W: Eq, E: Eq, R: Eq>(
-    entry: &ReadEntry<L, W, E, R>,
-    touch: &Touch<L, W, E, R>,
+pub fn intersects<L: Eq, W: Eq, E: Eq, R: Eq, I: Eq>(
+    entry: &ReadEntry<L, W, E, R, I>,
+    touch: &Touch<L, W, E, R, I>,
     order: &(impl LabelOrder<L> + ?Sized),
 ) -> bool {
     let flows = |label: &L| order.flows(label, &entry.label);
