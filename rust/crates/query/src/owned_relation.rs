@@ -27,25 +27,22 @@ pub async fn open_owned_point(
     }
 }
 
-/// Returns the held system point's winning rows across a clipped business-valid window.
-pub async fn open_owned_valid_during(
-    context: Arc<QueryContext>, owner: &str, relation: &OwnedRelation, id: &EntityId, valid: Interval,
-) -> Result<Option<QueryCursor>> {
-    let system = context.current_time.as_micros()?;
-    open_owned_valid_during_at(context, owner, relation, id, valid, system).await
-}
-
-/// Reads a certified earlier system point without replacing the retained physical catalog.
-pub async fn open_owned_valid_during_at(
-    mut context: Arc<QueryContext>, owner: &str, relation: &OwnedRelation, id: &EntityId,
+/// Opens a point at a caller-certified system cut within this retained catalog.
+pub async fn open_owned_point_at_system(
+    context: Arc<QueryContext>, owner: &str, relation: &OwnedRelation, id: &EntityId,
     valid: Interval, system: Timestamp,
 ) -> Result<Option<QueryCursor>> {
-    if relation.world().is_some() || relation.is_world_catalog() || valid.is_empty() {
-        return Err(Anomaly::incorrect("rtdb.owned/history-window", "Owned history requires a nonempty valid window on a root relation"));
+    if relation.world().is_some() || relation.is_world_catalog() {
+        return Err(address_unavailable());
     }
+    let context = owned_context_at_system(context, system)?;
+    open_owned_point(context, owner, relation, id, Some(valid), None).await
+}
+
+fn owned_context_at_system(mut context: Arc<QueryContext>, system: Timestamp) -> Result<Arc<QueryContext>> {
+    let held = context.current_time.as_micros()?;
     let database = context.catalog.database(context.catalog.default_database())?;
     let [snapshot] = database.partitions.as_slice() else { return Err(address_unavailable()); };
-    let held = context.current_time.as_micros()?;
     if snapshot.system_time_cap() != Some(held) || system > held {
         return Err(Anomaly::new(AnomalyCategory::Unavailable, "rtdb.owned/history-cut", "Owned history requires an exact retained system cut"));
     }
@@ -57,6 +54,26 @@ pub async fn open_owned_valid_during_at(
         database.partitions[0] = historical;
         changed.current_time = system.into();
     }
+    Ok(context)
+}
+
+/// Returns the held system point's winning rows across a clipped business-valid window.
+pub async fn open_owned_valid_during(
+    context: Arc<QueryContext>, owner: &str, relation: &OwnedRelation, id: &EntityId, valid: Interval,
+) -> Result<Option<QueryCursor>> {
+    let system = context.current_time.as_micros()?;
+    open_owned_valid_during_at(context, owner, relation, id, valid, system).await
+}
+
+/// Reads a certified earlier system point without replacing the retained physical catalog.
+pub async fn open_owned_valid_during_at(
+    context: Arc<QueryContext>, owner: &str, relation: &OwnedRelation, id: &EntityId,
+    valid: Interval, system: Timestamp,
+) -> Result<Option<QueryCursor>> {
+    if relation.world().is_some() || relation.is_world_catalog() || valid.is_empty() {
+        return Err(Anomaly::incorrect("rtdb.owned/history-window", "Owned history requires a nonempty valid window on a root relation"));
+    }
+    let context = owned_context_at_system(context, system)?;
     let OwnedAddress::Assigned(locator) = owned_address(Arc::clone(&context), owner, relation, id).await? else {
         return Ok(None);
     };

@@ -30,6 +30,13 @@ pub struct OwnedRelationChanges {
     pub touches: Vec<OwnedChange>,
 }
 
+struct CoveredJournal {
+    floor: OwnedJournalHeader,
+    first: OwnedJournalHeader,
+    head: OwnedJournalHeader,
+    head_revision: i64,
+}
+
 struct Journal<'a> {
     relation: &'a OwnedRelation,
     revision: i64,
@@ -211,12 +218,31 @@ impl OwnedReadSession {
         Ok(page)
     }
 
-    async fn seek_changes<'a>(
+    pub(super) async fn certify_historical_cut(
+        &self,
+        relation: &OwnedRelation,
+        at: Timestamp,
+    ) -> Result<()> {
+        let database = self.context.catalog.database(&self.database)?;
+        let [snapshot] = database.partitions.as_slice() else {
+            return Err(change_feed_uncovered());
+        };
+        if let Some(covered) = self.covered_journal(snapshot, relation, at).await? {
+            self.require_journal_head(relation, covered.head_revision, covered.head)
+                .await?;
+        }
+        Ok(())
+    }
+
+    async fn covered_journal(
         &self,
         snapshot: &Snapshot,
-        relation: &'a OwnedRelation,
+        relation: &OwnedRelation,
         after: Timestamp,
-    ) -> Result<Option<Journal<'a>>> {
+    ) -> Result<Option<CoveredJournal>> {
+        if snapshot.tx_basis() != Some(self.present) || after > self.present.system_time {
+            return Err(change_feed_uncovered());
+        }
         let journal = relation.change_journal(&self.owner)?;
         let table = relation.table(&self.owner);
         let root_frontier = snapshot.relation_event_frontier(&table)?;
@@ -253,20 +279,32 @@ impl OwnedReadSession {
         {
             return Err(change_feed_uncovered());
         }
+        Ok(Some(CoveredJournal {
+            floor,
+            first,
+            head,
+            head_revision,
+        }))
+    }
+
+    async fn seek_changes<'a>(
+        &self,
+        snapshot: &Snapshot,
+        relation: &'a OwnedRelation,
+        after: Timestamp,
+    ) -> Result<Option<Journal<'a>>> {
+        let Some(CoveredJournal {
+            floor,
+            first,
+            head,
+            head_revision,
+        }) = self.covered_journal(snapshot, relation, after).await?
+        else {
+            return Ok(None);
+        };
         if after >= head.committed_at {
-            let entry = read_owned_change_entry(
-                Arc::clone(&self.context),
-                &self.owner,
-                relation,
-                head_revision,
-            )
-            .await?;
-            if entry.system_time != head.committed_at
-                || entry.through_events != head.through_events
-                || !matches!(entry.value, Value::List(touches) if !touches.is_empty())
-            {
-                return Err(change_feed_uncovered());
-            }
+            self.require_journal_head(relation, head_revision, head)
+                .await?;
             return Ok(None);
         }
 
@@ -308,6 +346,24 @@ impl OwnedReadSession {
             previous_through: previous.through_events,
             next,
         }))
+    }
+
+    async fn require_journal_head(
+        &self,
+        relation: &OwnedRelation,
+        revision: i64,
+        head: OwnedJournalHeader,
+    ) -> Result<()> {
+        let entry =
+            read_owned_change_entry(Arc::clone(&self.context), &self.owner, relation, revision)
+                .await?;
+        if entry.system_time != head.committed_at
+            || entry.through_events != head.through_events
+            || !matches!(entry.value, Value::List(touches) if !touches.is_empty())
+        {
+            return Err(change_feed_uncovered());
+        }
+        Ok(())
     }
 
     async fn journal_header(

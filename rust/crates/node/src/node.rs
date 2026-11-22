@@ -978,6 +978,18 @@ impl OwnedReadSession {
         rtdb_query::open_owned_point(Arc::clone(&self.context), &self.owner, relation, id, valid, None).await
     }
 
+    /// Reads a business-valid point at an earlier system time certified by its journal.
+    pub async fn open_historical_point(
+        &self, relation: &rtdb_types::OwnedRelation, id: &rtdb_types::EntityId,
+        system: Timestamp, valid: Timestamp,
+    ) -> Result<Option<QueryCursor>> {
+        self.admit_read().await?;
+        self.certify_historical_cut(relation, system).await?;
+        self.check()?;
+        let valid = rtdb_types::Interval::new(valid, valid.next()?)?;
+        rtdb_query::open_owned_point_at_system(Arc::clone(&self.context), &self.owner, relation, id, valid, system).await
+    }
+
     /// Returns the typed identity's winning valid slices at this held system cut.
     pub async fn open_valid_during(
         &self, relation: &rtdb_types::OwnedRelation, id: &rtdb_types::EntityId, valid: rtdb_types::Interval,

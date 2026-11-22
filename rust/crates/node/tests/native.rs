@@ -4367,6 +4367,12 @@ async fn held_owned_changes_preserve_whole_groups_and_cover_the_ordered_cut() {
     assert_eq!(next.groups[0].touches[0].kind, OwnedChangeKind::Delete);
     assert_eq!(next.groups[0].touches[0].valid, rtdb_types::Interval::from_micros(15, 18).unwrap());
     assert!(reopened.changes(&other, first_time, 1).await.unwrap().groups.is_empty());
+    let id = EntityId::Integer(1);
+    let mut old = reopened.open_historical_point(&relation, &id, first_time, Timestamp(15)).await.unwrap().unwrap();
+    let batch = old.next_batch().await.unwrap().unwrap();
+    assert_eq!(batch.batch().num_rows(), 1);
+    assert!(reopened.open_historical_point(&relation, &id, reopened.present().system_time.next().unwrap(), Timestamp(15)).await.is_err());
+    drop(old);
     drop(reopened);
     drop(writer);
     stop(&node, driver).await;
