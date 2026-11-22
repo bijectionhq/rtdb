@@ -48,7 +48,7 @@ impl SourceTransaction {
         let operations = ops.into_iter().map(Operation::Public).collect();
         Self::from_operations(operations, options, memory)
     }
-    fn from_operations(operations: Vec<Operation>, options: SubmitOptions, memory: &Arc<MemoryBudget>) -> Result<Self> {
+    pub(crate) fn from_operations(operations: Vec<Operation>, options: SubmitOptions, memory: &Arc<MemoryBudget>) -> Result<Self> {
         let mut bytes = operations.capacity().checked_mul(std::mem::size_of::<Operation>()).and_then(|size| size.checked_add(options.default_tz.capacity())).and_then(|size| size.checked_add(options.user.as_ref().map_or(0, String::capacity))).ok_or_else(overflow)?;
         for operation in &operations {
             let (text, table, ids) = match operation {
