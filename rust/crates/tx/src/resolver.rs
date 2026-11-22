@@ -1395,10 +1395,14 @@ impl<'a> OpenTransaction<'a> {
                 .ok_or_else(|| Anomaly::incorrect("rtdb.owned/world-undeclared", "World writes require a schema retained from the parent cut"))?;
             schema.require_write_validity(true)?;
             for row in documents.rows() {
-                let _scratch = self.context.memory.reserve(rtdb_types::WorldShadow::decode_bound(row)?)?;
-                if let rtdb_types::WorldShadow::Present(fact) = rtdb_types::WorldShadow::from_record(row)? {
-                    validate_owned_schema(schema, &fact)?;
+                let _scratch = self.context.memory.reserve(Value::document_retained_bytes(row)?
+                    .checked_mul(2).and_then(|bytes| bytes.checked_add(4096)).ok_or_else(overflow)?)?;
+                let id = crate::source::document_id(row, &self.context.memory)?;
+                let shadow = rtdb_types::WorldShadow::from_record(row.clone())?;
+                if let rtdb_types::WorldShadow::Present(fact) = &shadow {
+                    validate_owned_schema(schema, fact)?;
                 }
+                if &shadow.record(&id)? != row { return Err(unavailable()); }
             }
             return self.put_documents(&table, documents, iids, Some(from), Some(to),
                 DocumentWrite::Owned { relation, owner, create_only }).await;
@@ -1476,7 +1480,7 @@ impl<'a> OpenTransaction<'a> {
                         use rtdb_types::OwnedChangeKind;
                         // The world write path already validates the shadow carrier.
                         let kind = if relation.world().is_some()
-                            && matches!(document.get("world_fact"), Some(Value::Null))
+                            && rtdb_types::WorldShadow::is_tombstone(document)
                         {
                             OwnedChangeKind::Delete
                         } else {
