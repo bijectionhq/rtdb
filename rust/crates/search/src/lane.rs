@@ -276,10 +276,11 @@ pub(crate) fn search_pages_with_budget<'a>(
 mod tests {
     use super::*;
     use rtdb_format::data::{StoredEvent, StoredOperation, build_event_batch};
-    use rtdb_types::{Iid, Interval, RunEndWidth, ScalarType, StructFields, Timestamp, Value};
+    use rtdb_types::{EntityId, Iid, Interval, RunEndWidth, ScalarType, StructFields, Timestamp, Value};
 
     #[test]
     fn arrow_search_rows_keep_token_presence_and_owned_identity() {
+        let identities = ["a", "b", "c", "d"].map(|id| EntityId::String(id.into()));
         let integer = LogicalType::Scalar(ScalarType::I64);
         let text = LogicalType::Scalar(ScalarType::Utf8);
         let fields = StructFields::from([
@@ -305,7 +306,7 @@ mod tests {
             StoredOperation::Delete,
             StoredOperation::Erase,
         ].into_iter().enumerate().map(|(index, operation)| StoredEvent {
-            entity_key: None,
+            entity_key: Some(Arc::from(identities[index].handle_bytes())),
             iid: Iid([index as u8; 16]), system_from: Timestamp(10), valid_time: Interval::ALL, recency: None, operation,
         }).collect::<Vec<_>>();
         let batch = EventBatch::new(build_event_batch(&events, Some(fields), None).unwrap()).unwrap();
@@ -327,7 +328,7 @@ mod tests {
                 Some(_) => Some(vec![]),
             }).collect();
             SearchRow {
-                identity: document.map(|document| document["_id"].entity_id().unwrap()),
+                identity: Some(identities[row].clone()),
                 iid: header.iid.0, system_from: header.system_from.0, valid_from: header.valid_time.lower().0,
                 valid_to: header.valid_time.upper().0, op: header.op, values,
             }
