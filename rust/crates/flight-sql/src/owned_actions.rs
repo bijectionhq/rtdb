@@ -34,6 +34,7 @@ pub(crate) const CREATE_OWNED_V1: &str = "rtdb.owned.Create.v1";
 pub(crate) const COMMIT_HOSTED_V1: &str = "rtdb.owned.CommitHosted.v1";
 pub(crate) const COMMIT_OWNED_V1: &str = "rtdb.owned.Commit.v1";
 pub(crate) const COMMIT_OWNED_V2: &str = "rtdb.owned.Commit.v2";
+pub(crate) const COMMIT_OWNED_V5: &str = "rtdb.owned.Commit.v5";
 pub(crate) const COMMIT_OWNED_V4: &str = "rtdb.owned.Commit.v4";
 pub(crate) const COMMIT_OWNED_V3: &str = "rtdb.owned.Commit.v3";
 const MAX_RANGE_WITNESSES: usize = 32;
@@ -281,6 +282,15 @@ impl OwnedWorldReadResource {
     }
 }
 
+fn count_component(body: &[u8], maximum: usize) -> Result<(&[u8], &[u8]), Status> {
+    let (length, body) = body.split_first_chunk::<2>().ok_or_else(|| invalid("Missing owned count component length"))?;
+    let length = usize::from(u16::from_be_bytes(*length));
+    if !(1..=maximum).contains(&length) {
+        return Err(invalid("Owned count component exceeds its bound"));
+    }
+    body.split_at_checked(length).ok_or_else(|| invalid("Incomplete owned count component"))
+}
+
 fn split_relation(body: &[u8]) -> Result<(OwnedRelation, &[u8]), Status> {
     let (length, rest) = body.split_first_chunk::<2>().ok_or_else(|| invalid("Owned action has no relation length"))?;
     let length = usize::from(u16::from_be_bytes(*length));
@@ -425,13 +435,36 @@ impl Service {
     }
 
     pub(crate) async fn commit_owned_action(&self, call: &Call, body: &[u8], format: CommitFormat) -> Result<ActionResult, Status> {
-        self.commit_owned(call, body, format, Vec::new(), false).await
+        self.commit_owned(call, body, format, Vec::new(), false, None).await
     }
 
     pub(crate) async fn commit_owned_witnessed_action(&self, call: &Call, body: &[u8], erase_allowed: bool) -> Result<ActionResult, Status> {
+        self.commit_owned_witnessed(call, body, erase_allowed, None).await
+    }
+
+    pub(crate) async fn commit_owned_counted_action(&self, call: &Call, body: &[u8]) -> Result<ActionResult, Status> {
         if !self.0.config.owned_native_actions { return Err(unsupported()); }
-        let (witnesses, body, _framing) = self.owned_witness_prefix(call, body, erase_allowed)?;
-        self.commit_owned(call, body, CommitFormat::Grouped, witnesses, erase_allowed).await
+        let (relation, body) = split_relation(body)?;
+        let Some((&0, body)) = body.split_first() else {
+            return Err(invalid("Owned count bound requires the ordered-present valid clock"));
+        };
+        let (column, body) = count_component(body, 96)?;
+        let column = std::str::from_utf8(column).map_err(|_| invalid("Owned count column must be UTF-8"))?;
+        let (prefix, body) = count_component(body, 4096)?;
+        let (maximum, body) = body.split_first_chunk::<8>().ok_or_else(|| invalid("Missing owned count maximum"))?;
+        let at_most = i64::from_be_bytes(*maximum);
+        if at_most < 0 || column.starts_with('_') {
+            return Err(invalid("Invalid owned count maximum or column"));
+        }
+        let _condition = call.reserve(prefix.len() + column.len() + 1024)?;
+        let condition = TxOp::OwnedCheckCapacity { relation, column: column.into(), prefix: prefix.to_vec(), at_most };
+        self.commit_owned_witnessed(call, body, false, Some(condition)).await
+    }
+
+    async fn commit_owned_witnessed(&self, call: &Call, body: &[u8], erase_allowed: bool, condition: Option<TxOp>) -> Result<ActionResult, Status> {
+        if !self.0.config.owned_native_actions { return Err(unsupported()); }
+        let (witnesses, body, _framing) = self.owned_witness_prefix(call, body, erase_allowed || condition.is_some())?;
+        self.commit_owned(call, body, CommitFormat::Grouped, witnesses, erase_allowed, condition).await
     }
 
     fn owned_witness_prefix<'a>(
@@ -522,7 +555,7 @@ impl Service {
         self.owned_write_reply_with_witnesses(call, writes, witnesses).await
     }
 
-    async fn commit_owned(&self, call: &Call, body: &[u8], format: CommitFormat, witnesses: Witnesses, erase_allowed: bool) -> Result<ActionResult, Status> {
+    async fn commit_owned(&self, call: &Call, body: &[u8], format: CommitFormat, witnesses: Witnesses, erase_allowed: bool, condition: Option<TxOp>) -> Result<ActionResult, Status> {
         if !self.0.config.owned_native_actions { return Err(unsupported()); }
         let group_limit = match format {
             CommitFormat::Single => 1,
@@ -535,6 +568,7 @@ impl Service {
             CommitFormat::Grouped => MAX_GROUPED_COMMIT_ROWS,
         };
         let mut writes = vec![TxOp::OwnedDeadline { until: deadline }];
+        writes.extend(condition);
         let _rows = self.decode_owned_commit_groups(call, groups, &mut writes, &mut rows_left, erase_allowed)?;
         self.owned_write_reply_with_witnesses(call, writes, witnesses).await
     }

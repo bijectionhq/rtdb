@@ -93,7 +93,135 @@ struct Delta {
     claims: i64,
 }
 
+struct CapacityCondition<'a> {
+    relation: &'a OwnedRelation,
+    column: &'a str,
+    prefix: &'a [u8],
+    at_most: i64,
+}
+
+fn capacity_condition(operations: &[Operation]) -> Result<Option<CapacityCondition<'_>>> {
+    let mut conditions = operations.iter().filter_map(|operation| match operation {
+        Operation::Public(TxOp::OwnedCheckCapacity {
+            relation,
+            column,
+            prefix,
+            at_most,
+        }) => Some(CapacityCondition {
+            relation,
+            column,
+            prefix,
+            at_most: *at_most,
+        }),
+        _ => None,
+    });
+    let condition = conditions.next();
+    if conditions.next().is_some() {
+        return Err(Anomaly::incorrect(
+            "rtdb.owned/duplicate-count-bound",
+            "Only one owned count bound is supported per commit",
+        ));
+    }
+    Ok(condition)
+}
+
 impl OpenTransaction<'_> {
+    pub(super) async fn check_capacity_source(&self, operations: &[Operation]) -> Result<()> {
+        if let Some(CapacityCondition {
+            relation,
+            column,
+            prefix,
+            at_most,
+        }) = capacity_condition(operations)?
+        {
+            if at_most < 0
+                || relation.world().is_some()
+                || relation.is_world_catalog()
+                || !operations
+                    .iter()
+                    .any(|op| matches!(op, Operation::Public(TxOp::OwnedDeadline { .. })))
+            {
+                return Err(Anomaly::incorrect(
+                    "rtdb.owned/count-bound",
+                    "Expected a nonnegative count bound on one owned root prefix with a deadline",
+                ));
+            }
+            self.declared_prefix_count(self.buffer.base_snapshot(), relation, column, prefix)
+                .await?;
+        }
+        Ok(())
+    }
+
+    pub(super) async fn check_final_capacity(&self, operations: &[Operation]) -> Result<()> {
+        if let Some(CapacityCondition {
+            relation,
+            column,
+            prefix,
+            at_most,
+        }) = capacity_condition(operations)?
+        {
+            let count = self
+                .declared_prefix_count(self.snapshot()?, relation, column, prefix)
+                .await?;
+            if count > at_most {
+                return Err(Anomaly::new(
+                    AnomalyCategory::Conflict,
+                    "rtdb.owned/count-bound-exceeded",
+                    "The final owned prefix count exceeds its transaction bound",
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    async fn declared_prefix_count(
+        &self,
+        snapshot: Snapshot,
+        relation: &OwnedRelation,
+        column: &str,
+        prefix: &[u8],
+    ) -> Result<i64> {
+        let owner = self
+            .options
+            .user
+            .as_deref()
+            .filter(|owner| !owner.is_empty())
+            .ok_or_else(no_owned_principal)?;
+        if !snapshot.contains_table(&relation.capacity_table(owner)) {
+            return Err(Anomaly::incorrect(
+                "rtdb.owned/count-bound",
+                "The count bound requires a previously declared capacity rule",
+            ));
+        }
+        let policy_id = EntityId::String(RULE.into());
+        let rule = self
+            .capacity_cell(snapshot.clone(), owner, relation, &policy_id, "policy")
+            .await
+            .map_err(count_uncovered)?
+            .ok_or_else(uncovered)
+            .and_then(CapacityRule::decode)
+            .map_err(count_uncovered)?;
+        if rule.column != column || rule.prefix_bytes != prefix.len() {
+            return Err(Anomaly::incorrect(
+                "rtdb.owned/count-bound",
+                "The count interval must equal a complete declared Binary prefix",
+            ));
+        }
+        if snapshot.relation_event_frontier(&relation.table(owner))? != rule.through_events {
+            return Err(count_uncovered(uncovered()));
+        }
+        let _key = self.context.memory.reserve(prefix.len() * 4 + 512)?;
+        match self
+            .capacity_cell(snapshot, owner, relation, &unique_id(prefix), "count")
+            .await
+            .map_err(count_uncovered)?
+        {
+            None => Ok(0),
+            Some(Value::I64(count)) if (1..=rule.cap).contains(&count) => Ok(count),
+            Some(_) => Err(count_uncovered(uncovered())),
+        }
+    }
+
     pub(super) async fn declare_owned_capacity(
         &mut self,
         relation: &OwnedRelation,
@@ -403,4 +531,16 @@ fn uncovered() -> Anomaly {
         "rtdb.owned/capacity-uncovered",
         "The owned relation cannot verify its capacity accounting",
     )
+}
+
+fn count_uncovered(error: Anomaly) -> Anomaly {
+    if error.code == "rtdb.owned/capacity-uncovered" {
+        Anomaly::new(
+            AnomalyCategory::Conflict,
+            "rtdb.owned/count-bound-uncovered",
+            "The declared prefix cannot prove its exact count at the ordered cut",
+        )
+    } else {
+        error
+    }
 }

@@ -23,6 +23,7 @@ impl Service {
                 crate::owned_actions::COMMIT_OWNED_V1 => Ok(vec![Ok(self.commit_owned_action(&call, &action.body, crate::owned_actions::CommitFormat::Single).await?)]),
                 crate::owned_actions::COMMIT_OWNED_V2 => Ok(vec![Ok(self.commit_owned_action(&call, &action.body, crate::owned_actions::CommitFormat::Grouped).await?)]),
                 crate::owned_actions::COMMIT_OWNED_V3 => Ok(vec![Ok(self.commit_owned_witnessed_action(&call, &action.body, false).await?)]),
+                crate::owned_actions::COMMIT_OWNED_V5 => Ok(vec![Ok(self.commit_owned_counted_action(&call, &action.body).await?)]),
                 crate::owned_actions::COMMIT_OWNED_V4 => Ok(vec![Ok(self.commit_owned_witnessed_action(&call, &action.body, true).await?)]),
                 crate::owned_actions::OPEN_OWNED_READ_AS_OF_V1 => Ok(vec![Ok(self.open_owned_read_as_of_action(&call, &action.body).await?)]),
                 crate::owned_actions::OPEN_OWNED_READ_V1 => Ok(vec![Ok(self.open_owned_read_action(&call, &action.body).await?)]),

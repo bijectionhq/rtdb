@@ -31,7 +31,7 @@ impl Operation {
         match self {
             Self::Public(TxOp::OwnedDeclareRelation { relation, .. } | TxOp::OwnedDeclarePath { relation, .. }
                 | TxOp::OwnedDeclareSearchPath { relation, .. } | TxOp::OwnedDeclareUniquePath { relation, .. }
-                | TxOp::OwnedDeclareFixedRange { relation, .. } | TxOp::OwnedDeclareCapacity { relation, .. } | TxOp::OwnedCheckRange { relation, .. } | TxOp::OwnedCheck { relation, .. }
+                | TxOp::OwnedDeclareFixedRange { relation, .. } | TxOp::OwnedDeclareCapacity { relation, .. } | TxOp::OwnedCheckCapacity { relation, .. } | TxOp::OwnedCheckRange { relation, .. } | TxOp::OwnedCheck { relation, .. }
                 | TxOp::OwnedErase { relation, .. } | TxOp::OwnedDelete { relation, .. } | TxOp::OwnedInsertDocs { relation, .. }
                 | TxOp::OwnedReplaceDocs { relation, .. }) | Self::OwnedWriteIids { relation, .. } => Some(relation),
             _ => None,
@@ -73,6 +73,8 @@ impl SourceTransaction {
             let (text, table, ids) = match operation {
                 Operation::Public(TxOp::OwnedDeclareSearchPath { relation, name, column } | TxOp::OwnedDeclareUniquePath { relation, name, column }) =>
                     (owned_path_bytes(relation, name, std::slice::from_ref(column))?, None, 0),
+                Operation::Public(TxOp::OwnedCheckCapacity { relation, column, prefix, .. }) =>
+                    (capacity_condition_bytes(relation, column.capacity(), prefix.capacity())?, None, 0),
                 Operation::Public(TxOp::OwnedDeclareCapacity { relation, column, .. }) =>
                     (relation.name().len().checked_add(column.capacity()).ok_or_else(overflow)?, None, 0),
                 Operation::Public(TxOp::OwnedDeclareRelation { relation, schema }) =>
@@ -300,6 +302,8 @@ impl SourceTransaction {
                 Operation::Public(TxOp::DeleteDocs { ids, .. } | TxOp::EraseDocs { ids, .. }) => ids.ids().len().checked_mul(128).ok_or_else(overflow)?,
                 Operation::Public(TxOp::OwnedDeclareSearchPath { relation, name, column } | TxOp::OwnedDeclareUniquePath { relation, name, column }) =>
                     owned_path_bytes(relation, name, std::slice::from_ref(column))?,
+                Operation::Public(TxOp::OwnedCheckCapacity { relation, column, prefix, .. }) =>
+                    capacity_condition_bytes(relation, column.capacity(), prefix.capacity())?,
                 Operation::Public(TxOp::OwnedDeclareCapacity { relation, column, .. }) =>
                     relation.name().len().checked_add(column.capacity()).ok_or_else(overflow)?,
                 Operation::Public(TxOp::OwnedDeclareRelation { relation, schema }) =>
@@ -416,6 +420,13 @@ fn operation_value<'a>(operation: &'a Operation, memory: &Arc<MemoryBudget>) -> 
             body.insert("query".into(), Value::Utf8(sql.clone()));
             body.insert("args".into(), if arg_bytes.as_slice().is_empty() { Value::Null } else { Value::Binary(arg_bytes.as_slice().to_vec()) });
             "sql"
+        }
+        Operation::Public(TxOp::OwnedCheckCapacity { relation, column, prefix, at_most }) => {
+            body.insert("relation".into(), Value::Utf8(relation.name().into()));
+            body.insert("column".into(), Value::Utf8(column.clone()));
+            body.insert("prefix".into(), Value::Binary(prefix.clone()));
+            body.insert("at_most".into(), Value::I64(*at_most));
+            "rtdb-owned-check-capacity-v1"
         }
         Operation::Public(TxOp::OwnedDeclareCapacity { relation, column, prefix_bytes, cap }) => {
             body.insert("relation".into(), Value::Utf8(relation.name().into()));
@@ -1090,6 +1101,7 @@ impl SourceOperationReader<'_> {
             "rtdb-owned-search-path-v1" | "rtdb-owned-unique-path-v1" => &["relation", "name", "column"],
             "rtdb-owned-relation-v1" => &["relation", "schema"],
             "rtdb-owned-capacity-v1" => &["relation", "column", "prefix_bytes", "cap"],
+            "rtdb-owned-check-capacity-v1" => &["relation", "column", "prefix", "at_most"],
             "rtdb-owned-path-v1" => &["relation", "name", "columns"],
             "rtdb-hosted-control-v1" => &["relation", "scope", "expected", "document"],
             "rtdb-owned-deadline-v1" => &["until"],
@@ -1111,6 +1123,12 @@ impl SourceOperationReader<'_> {
         parsed_fields.grow_to(bound)?;
         let value = |name| struct_cell(body, name, offset);
         let operation = match name.as_str() {
+            "rtdb-owned-check-capacity-v1" => {
+                let (Value::Utf8(relation), Value::Utf8(column), Value::Binary(prefix), Value::I64(at_most)) =
+                    (value("relation")?, value("column")?, value("prefix")?, value("at_most")?)
+                else { return Err(invalid("Owned capacity condition has invalid fields")); };
+                TxOp::OwnedCheckCapacity { relation: rtdb_types::OwnedRelation::new(relation)?, column, prefix, at_most }
+            }
             "rtdb-owned-capacity-v1" => {
                 let (Value::Utf8(relation), Value::Utf8(column), Value::I64(prefix_bytes), Value::I64(cap)) =
                     (value("relation")?, value("column")?, value("prefix_bytes")?, value("cap")?)
@@ -2455,6 +2473,11 @@ mod tests {
     }
 }
 
+
+fn capacity_condition_bytes(relation: &rtdb_types::OwnedRelation, column_bytes: usize, prefix_bytes: usize) -> Result<usize> {
+    relation.name().len().checked_add(column_bytes)
+        .and_then(|size| size.checked_add(prefix_bytes)).ok_or_else(overflow)
+}
 
 fn range_evidence_bytes(relation: &rtdb_types::OwnedRelation, fixed: &Option<Arc<rtdb_types::FixedRangeEvidence>>) -> usize {
     relation.name().len() + fixed.as_ref().map_or(0, |fixed| fixed.retained_bytes())

@@ -273,6 +273,9 @@ impl TxResolver {
             if has_owned_operations && outcome.is_ok() {
                 outcome = tx.finish_owned_capacity().await;
             }
+            if has_owned_operations && outcome.is_ok() {
+                outcome = tx.check_final_capacity(&request.operations).await;
+            }
             if outcome.is_ok() {
                 outcome = tx.write_owned_changes().await;
             }
@@ -670,7 +673,7 @@ impl<'a> OpenTransaction<'a> {
                 let valid = interval(Timestamp(0), Timestamp::MAX)?;
                 self.buffer.put(control.table(), control.document().clone(), valid)
             }
-            Operation::Public(TxOp::OwnedDeadline { .. } | TxOp::OwnedCheckWorldScope { .. } | TxOp::OwnedCheckRange { .. } | TxOp::OwnedCheck { .. }) => Ok(()),
+            Operation::Public(TxOp::OwnedDeadline { .. } | TxOp::OwnedCheckWorldScope { .. } | TxOp::OwnedCheckRange { .. } | TxOp::OwnedCheckCapacity { .. } | TxOp::OwnedCheck { .. }) => Ok(()),
             Operation::Public(TxOp::OwnedErase { relation, id }) =>
                 self.erase_owned(relation, id).await,
             Operation::Public(TxOp::OwnedDelete { relation, id, valid_from, valid_to }) =>
@@ -880,6 +883,7 @@ impl<'a> OpenTransaction<'a> {
             return Err(Anomaly::new(AnomalyCategory::Conflict, "rtdb.owned/expired", "Owned transaction reached its deadline before ordering"));
         }
         self.check_hosted_controls(operations, source_scope).await?;
+        self.check_capacity_source(operations).await?;
         for operation in operations {
             if let Operation::Public(TxOp::OwnedCheckWorldScope { scope }) = operation {
                 if self.owned_world.is_none() || deadline.is_none()
