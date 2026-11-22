@@ -100,7 +100,11 @@ impl OpenTransaction<'_> {
         let fork_with_controls = operations.iter().any(|operation| matches!(
             operation, Operation::Public(TxOp::OwnedForkWorld { root: crate::OwnedForkRoot::Controls | crate::OwnedForkRoot::ProposalControls, .. })
         ));
-        if !has_fact_write && !fork_with_controls && !retained_release && !proposal_overlay && controls.clone().any(|control| !control.is_check()) {
+        // An exact native replay transaction can consist entirely of source
+        // effects whose Original key was withdrawn. Its clock still advances.
+        if !has_fact_write && replay.is_none() && !fork_with_controls && !retained_release && !proposal_overlay
+            && controls.clone().any(|control| !control.is_check())
+        {
             return Err(unavailable());
         }
 
