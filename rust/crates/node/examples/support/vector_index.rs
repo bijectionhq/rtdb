@@ -1,11 +1,16 @@
 use std::cmp::Ordering;
 use std::collections::{BTreeSet, BinaryHeap};
 use std::fs::File;
-use std::io::{BufWriter, Write};
+use std::io::{BufWriter, Seek, Write};
 use std::ops::Range;
 use std::path::Path;
 use std::sync::Arc;
 
+use arrow_array::{FixedSizeListArray, Float32Array, RecordBatch, UInt32Array};
+use arrow_buffer::Buffer;
+use arrow_ipc::{reader::StreamDecoder, writer::StreamWriter};
+use arrow_schema::{DataType, Field, Schema};
+use bytes::Bytes;
 use futures::{StreamExt, TryStreamExt};
 use rtdb_storage::{LocalStore, ObjectKey, ObjectStore, cache::BufferPool};
 use rtdb_types::{Iid, Value};
@@ -106,19 +111,32 @@ impl VectorIndex {
         }
         let stage = scratch.join("vectors.bin");
         let mut out = BufWriter::new(File::create(&stage).unwrap());
+        let item = Arc::new(Field::new("item", DataType::Float32, false));
+        let width = i32::try_from(data.dimensions).unwrap();
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::UInt32, false),
+            Field::new("embedding", DataType::FixedSizeList(Arc::clone(&item), width), false),
+        ]));
         let mut ranges = Vec::with_capacity(members.len());
         let mut offset = 0u64;
-        let stride = (4 + data.dimensions * 4) as u64;
         for members in members {
-            let end = offset + stride * members.len() as u64;
-            ranges.push(offset..end);
-            offset = end;
-            for id in members {
-                out.write_all(&u32::try_from(id).unwrap().to_le_bytes()).unwrap();
-                for value in data.vector(id) {
-                    out.write_all(&value.to_le_bytes()).unwrap();
-                }
+            if members.is_empty() {
+                ranges.push(offset..offset);
+                continue;
             }
+            let padding = ((64 - offset % 64) % 64) as usize;
+            out.write_all(&[0; 64][..padding]).unwrap();
+            let start = offset + padding as u64;
+            let ids = UInt32Array::from_iter_values(members.iter().map(|id| u32::try_from(*id).unwrap()));
+            let child = Float32Array::from_iter_values(members.iter().flat_map(|id| data.vector(*id).iter().copied()));
+            let vectors = FixedSizeListArray::try_new(Arc::clone(&item), width, Arc::new(child), None).unwrap();
+            let batch = RecordBatch::try_new(Arc::clone(&schema), vec![Arc::new(ids), Arc::new(vectors)]).unwrap();
+            let mut writer = StreamWriter::try_new(&mut out, &schema).unwrap();
+            writer.write(&batch).unwrap();
+            writer.finish().unwrap();
+            drop(writer);
+            offset = out.stream_position().unwrap();
+            ranges.push(start..offset);
         }
         out.flush().unwrap();
         drop(out);
@@ -172,14 +190,21 @@ impl VectorIndex {
             cache.get_range(&self.object, self.ranges[id].clone()).await.map(|bytes| (id, bytes))
         })).buffer_unordered(8);
         while let Some((cluster, bytes)) = reads.try_next().await.unwrap() {
-            for row in bytes.as_slice().chunks_exact(4 + self.dimensions * 4) {
-                let id = u32::from_le_bytes(row[..4].try_into().unwrap()) as usize;
+            let mut stream = Buffer::from(Bytes::from_owner(bytes));
+            let mut decoder = StreamDecoder::new().with_require_alignment(true);
+            let batch = decoder.decode(&mut stream).unwrap().expect("cluster record batch");
+            assert!(decoder.decode(&mut stream).unwrap().is_none());
+            decoder.finish().unwrap();
+            let ids = batch.column(0).as_any().downcast_ref::<UInt32Array>().unwrap();
+            let list = batch.column(1).as_any().downcast_ref::<FixedSizeListArray>().unwrap();
+            let vectors = list.values().as_any().downcast_ref::<Float32Array>().unwrap();
+            for (&id, vector) in ids.values().iter().zip(vectors.values().chunks_exact(self.dimensions)) {
+                let id = id as usize;
                 if !changed.is_empty() && changed.contains(&(id as i64)) { continue; }
                 let (random, group) = self::groups(id, cluster);
                 if !filter.accepts(random, group) { continue; }
                 let (mut dot, mut norm) = (0.0, 0.0);
-                for (bytes, query) in row[4..].chunks_exact(4).zip(query) {
-                    let value = f32::from_le_bytes(bytes.try_into().unwrap());
+                for (&value, query) in vector.iter().zip(query) {
                     dot += value * query;
                     norm += value * value;
                 }

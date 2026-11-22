@@ -4877,7 +4877,12 @@ dependencies = [
 name = "rtdb-node"
 version = "0.1.0"
 dependencies = [
+ "arrow-array",
+ "arrow-buffer",
+ "arrow-ipc",
+ "arrow-schema",
  "async-trait",
+ "bytes",
  "chrono",
  "chrono-tz",
  "futures",
