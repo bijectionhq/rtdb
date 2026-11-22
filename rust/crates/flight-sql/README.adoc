@@ -430,7 +430,9 @@ A held read expires no later than 60 seconds or the world's own expiration. A dr
 
 `rtdb.owned.ReadHeldWorldValidDuring.v1` takes the 16-byte held world handle, a relation prefix and one Arrow row with `_id`, `valid_from_micros: Int64` and `valid_to_micros: Int64`.
 The reply carries the held present and resolved window in schema metadata. Each row carries `valid_from_micros`, `valid_to_micros` and the winning `system_from_micros` as signed Int64 values.
-Local tombstones leave gaps. Gaps carry no rows, and the response issues no write condition.
+Local tombstones leave gaps, which carry no rows.
+An authenticated placed hold with a live evidence lease returns one opaque `rtdb.owned.world_range_witness` even if the entire window is absent.
+Ordering checks the original parent pin, Root purge frontier and the complete local relation frontier for a writable world.
 History refuses a cut lacking custody coverage or requiring more than 128 candidate slices.
 
 `rtdb.owned.ReadHeldWorldIdentityPage.v1` takes the 16-byte held world handle, a relation prefix and one Arrow request row.

@@ -79,7 +79,7 @@ pub trait OwnedWorldRead: Send + Sync {
         -> BoxFuture<'a, Result<rtdb_node::OwnedMergedChanges>>;
     fn valid_during<'a>(
         &'a self, relation: &'a OwnedRelation, id: &'a EntityId, valid: Interval,
-    ) -> BoxFuture<'a, Result<Vec<(Interval, Timestamp)>>>;
+    ) -> BoxFuture<'a, Result<(Vec<(Interval, Timestamp)>, Option<OwnedWorldWitness>)>>;
     fn identity_page<'a>(
         &'a self, relation: &'a OwnedRelation, valid: Timestamp, after: Option<&'a str>, limit: usize,
     ) -> BoxFuture<'a, Result<WorldIdentityPage>>;

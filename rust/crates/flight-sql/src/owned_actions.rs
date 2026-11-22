@@ -1627,17 +1627,21 @@ impl Service {
         let to = history_request_endpoint(batch, "valid_to_micros")?;
         let valid = Interval::new(from, to).map_err(status)?;
         if valid.is_empty() { return Err(invalid("Owned world history requires a nonempty valid window")); }
-        let slices = held.snapshot.valid_during(&relation, &id, valid).await.map_err(status)?;
+        let (slices, witness) = held.snapshot.valid_during(&relation, &id, valid).await.map_err(status)?;
         let _rows = call.reserve(4096 + slices.len() * 128)?;
+        let mut metadata = std::collections::HashMap::from([
+            (OWNED_PRESENT.into(), held.snapshot.present().0.to_string()),
+            (OWNED_VALID_FROM.into(), from.0.to_string()),
+            (OWNED_VALID_TO.into(), to.0.to_string()),
+        ]);
+        if let Some(witness) = witness {
+            metadata.insert(WORLD_RANGE_WITNESS.into(), held.remember(call, witness)?.simple().to_string());
+        }
         let schema = Arc::new(Schema::new(vec![
             Field::new("valid_from_micros", DataType::Int64, false),
             Field::new("valid_to_micros", DataType::Int64, false),
             Field::new("system_from_micros", DataType::Int64, false),
-        ]).with_metadata([
-            (OWNED_PRESENT.into(), held.snapshot.present().0.to_string()),
-            (OWNED_VALID_FROM.into(), from.0.to_string()),
-            (OWNED_VALID_TO.into(), to.0.to_string()),
-        ].into()));
+        ]).with_metadata(metadata));
         let rows = RecordBatch::try_new(Arc::clone(&schema), vec![
             Arc::new(Int64Array::from_iter_values(slices.iter().map(|(valid, _)| valid.lower().0))),
             Arc::new(Int64Array::from_iter_values(slices.iter().map(|(valid, _)| valid.upper().0))),

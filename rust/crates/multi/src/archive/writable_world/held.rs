@@ -389,7 +389,7 @@ impl HeldCheckpointWorld {
 
     pub async fn valid_during(
         &self, relation: &OwnedRelation, id: &EntityId, valid: Interval,
-    ) -> Result<Vec<(Interval, Timestamp)>> {
+    ) -> Result<(Vec<(Interval, Timestamp)>, Option<OwnedWorldWitness>)> {
         self.check_relation(relation)?;
         if valid.is_empty() { return Err(OwnedWorld::unavailable()); }
         self.open.snapshot.check_point_purge_floor(relation, id, self.open.retained.basis.system_time).await?;
@@ -417,8 +417,14 @@ impl HeldCheckpointWorld {
                 visible.push((Interval::new(window[0], window[1])?, fact.revision));
             }
         }
+        let witness = if self.evidence_until() > self.present().system_time {
+            Some(self.open.snapshot.world_relation_witnesses(self.open.record.id, [relation])
+                .await?.pop().ok_or_else(OwnedWorld::unavailable)?)
+        } else {
+            None
+        };
         self.check_relation(relation)?;
-        Ok(visible)
+        Ok((visible, witness))
     }
 
     pub async fn identity_page(
