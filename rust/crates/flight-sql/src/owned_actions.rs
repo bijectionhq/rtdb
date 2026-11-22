@@ -606,8 +606,8 @@ impl Service {
             if let Lookup::Found(entry) = self.0.owned_reads.take(&handle) { entry.close(); }
             return Err(status(error));
         }
-        let (relation, arrow) = split_relation(request)?;
-        let batch = decode_batch(call, arrow)?;
+        let (relation, arrow_bytes) = split_relation(request)?;
+        let batch = decode_batch(call, arrow_bytes)?;
         if batch.batch().num_rows() != 1 || batch.batch().num_columns() != 4 {
             return Err(invalid("Owned count requires one row with path, lower, upper and valid_micros"));
         }
