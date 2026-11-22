@@ -397,7 +397,7 @@ pub async fn owned_corpus(
         ..rtdb_text::Corpus::default()
     };
     let mut seen = BTreeSet::new();
-    let scratch = context.memory.reserve(4096)?;
+    let mut scratch = context.memory.reserve(4096)?;
     for selected in by_file(&files) {
         let mut visible = BTreeSet::new();
         for (&member, &own) in &selected.members {
@@ -408,7 +408,8 @@ pub async fn owned_corpus(
                     Judged::Hidden => (),
                     Judged::Visible { exact: false } => return Err(uncovered_owned_search()),
                     Judged::Visible { exact: true } => {
-                        scratch.grow_to(4096usize.saturating_add(seen.len().saturating_add(1).saturating_mul(128)))?;
+                        Arc::get_mut(&mut scratch).expect("corpus owns its reservation")
+                            .grow_to(4096usize.saturating_add(seen.len().saturating_add(1).saturating_mul(128)))?;
                         if !seen.insert(doc.iid) { return Err(uncovered_owned_search()); }
                         visible.insert(doc.doc);
                         corpus.documents += 1;

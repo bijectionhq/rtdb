@@ -714,23 +714,34 @@ impl<'a> OpenTransaction<'a> {
         let owner = self.options.user.as_deref().filter(|owner| !owner.is_empty()).ok_or_else(no_owned_principal)?;
         let target = relation.table(owner);
         let catalog = if search { rtdb_types::OwnedRelation::search_catalog(owner) } else { rtdb_types::OwnedRelation::path_catalog(owner) };
+        let declaration = self.read_owned_schema(owner, relation).await?;
         let snapshot = self.snapshot()?;
-        if !snapshot.contains_table(&target) {
-            return Err(Anomaly::incorrect("rtdb.owned/path-relation", "Owned path requires an existing relation"));
+        if declaration.is_none() && !snapshot.contains_table(&target) {
+            return Err(Anomaly::incorrect("rtdb.owned/path-relation", "Owned path requires a declared or stored relation"));
         }
+        let declared_type = |name: &str| declaration.as_ref().and_then(|(schema, _)| schema.column_type(name));
         let available = snapshot.column_names(&target);
         if search {
             let [column] = columns else { return Err(invalid_search_path_column()); };
-            let types = snapshot.column_types_for(&target, columns.iter().cloned());
-            if column.starts_with('_') || !available.contains(column)
-                || !types.get(column).is_some_and(rtdb_types::LogicalType::is_clear_search_text)
-            {
+            let clear = if declaration.is_some() {
+                declared_type(column) == Some(rtdb_types::ScalarType::Utf8)
+            } else {
+                let types = snapshot.column_types_for(&target, columns.iter().cloned());
+                types.get(column).is_some_and(rtdb_types::LogicalType::is_clear_search_text)
+            };
+            if column.starts_with('_') || !clear {
                 return Err(invalid_search_path_column());
             }
         } else if !(2..=16).contains(&columns.len())
             || columns.last().is_none_or(|column| column != "_id")
             || columns.iter().collect::<std::collections::BTreeSet<_>>().len() != columns.len()
-            || columns.iter().any(|column| !available.contains(column) || (column.starts_with('_') && column != "_id"))
+            || columns[..columns.len() - 1].iter().any(|column| {
+                column.starts_with('_') || if declaration.is_some() {
+                    declared_type(column).is_none()
+                } else {
+                    !available.contains(column)
+                }
+            })
         {
             return Err(Anomaly::incorrect("rtdb.owned/path-columns", "Owned path requires distinct stored columns ending in _id"));
         }
