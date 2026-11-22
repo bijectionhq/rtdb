@@ -1315,8 +1315,17 @@ impl<'a> OpenTransaction<'a> {
                             return Err(insert_exists());
                         }
                     }
-                    if relation.world().is_none() && !relation.is_world_catalog() {
-                        self.record_owned_change(relation, id, rtdb_types::OwnedChangeKind::Put, valid_time)?;
+                    if !relation.is_world_catalog() {
+                        use rtdb_types::OwnedChangeKind;
+                        // The world write path already validates the shadow carrier.
+                        let kind = if relation.world().is_some()
+                            && matches!(document.get("world_fact"), Some(Value::Null))
+                        {
+                            OwnedChangeKind::Delete
+                        } else {
+                            OwnedChangeKind::Put
+                        };
+                        self.record_owned_change(relation, id, kind, valid_time)?;
                     }
                 }
             }
@@ -1364,7 +1373,7 @@ impl<'a> OpenTransaction<'a> {
         let mut next = None;
         for (name, group) in std::mem::take(&mut self.owned_changes) {
             self.context.check_cancelled()?;
-            let relation = OwnedRelation::new(name)?;
+            let relation = OwnedRelation::from_source(name)?;
             let journal = relation.change_journal(owner)?;
             let frontier = base.relation_event_frontier(&journal)?;
             let previous = base.relation_event_frontier(&relation.table(owner))?;

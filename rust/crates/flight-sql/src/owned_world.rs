@@ -60,6 +60,8 @@ pub trait OwnedWorldRead: Send + Sync {
     fn check_relation(&self, relation: &OwnedRelation) -> Result<()>;
     fn check(&self) -> Result<()>;
     fn close(&self);
+    fn changes<'a>(&'a self, relations: &'a [OwnedRelation], after: Timestamp, limit: usize)
+        -> BoxFuture<'a, Result<rtdb_node::OwnedMergedChanges>>;
     fn valid_during<'a>(
         &'a self, relation: &'a OwnedRelation, id: &'a EntityId, valid: Interval,
     ) -> BoxFuture<'a, Result<Vec<(Interval, Timestamp)>>>;

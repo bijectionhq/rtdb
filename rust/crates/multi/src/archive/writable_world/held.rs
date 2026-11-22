@@ -33,6 +33,10 @@ struct ArchivePoint {
 }
 
 enum ArchiveRead {
+    ChangeCoverage {
+        guard: Arc<dyn Fn() -> Result<()> + Send + Sync>,
+        reply: oneshot::Sender<Result<()>>,
+    },
     Point(ArchivePoint),
     Boundaries {
         relation: OwnedRelation,
@@ -75,6 +79,23 @@ impl HeldCheckpointWorld {
     pub fn check_relation(&self, relation: &OwnedRelation) -> Result<()> {
         self.check()?;
         self.open.snapshot.check_relation(relation)
+    }
+
+    pub async fn changes(
+        &self, relations: &[OwnedRelation], after: Timestamp, limit: usize,
+    ) -> Result<rtdb_node::OwnedMergedChanges> {
+        self.check()?;
+        let guard = self.open.snapshot.relation_release_guard(relations)?;
+        let (reply, result) = oneshot::channel();
+        self.cancellation.run_until_cancelled(self.requests.send(ArchiveRead::ChangeCoverage {
+            guard: Arc::clone(&guard), reply,
+        })).await.ok_or_else(OwnedWorld::unavailable)?.map_err(|_| OwnedWorld::unavailable())?;
+        self.cancellation.run_until_cancelled(result).await
+            .ok_or_else(OwnedWorld::unavailable)?.map_err(|_| OwnedWorld::unavailable())??;
+        let page = self.open.snapshot.world_merged_changes(self.open.record.id, relations, after, limit).await?;
+        guard()?;
+        self.check()?;
+        Ok(page)
     }
 
     pub fn close(&self) {
@@ -291,6 +312,10 @@ pub(crate) async fn open_held_checkpoint_world(
                                 point = pending.recv() => match point { Some(point) => point, None => break },
                             };
                             match request {
+                                ArchiveRead::ChangeCoverage { guard, reply } => {
+                                    let coverage = guard().and_then(|()| require_relation_purge_history(&context, &owner));
+                                    let _ = reply.send(coverage);
+                                }
                                 ArchiveRead::Point(ArchivePoint { relation, id, valid, guard, mut reply }) => {
                                     let read = async {
                                         let batches = read_checkpoint_point_in_context(Arc::clone(&context).with_owned_read_guard(guard), CheckpointPoint {

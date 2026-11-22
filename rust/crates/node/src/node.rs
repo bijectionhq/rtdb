@@ -1094,7 +1094,8 @@ impl OwnedReadSession {
             return Err(Anomaly::new(AnomalyCategory::Unavailable, "rtdb.owned/purge-history-reset", "Owner-wide purge history requires a reset before native held reads"));
         }
         let frontiers = relations.into_iter().map(|relation| {
-            let table = relation.purge_table(&self.owner);
+            let root = relation.root_relation();
+            let table = root.as_ref().unwrap_or(relation).purge_table(&self.owner);
             let expected = snapshot.relation_event_frontier(&table)?;
             Ok((table, expected))
         }).collect::<Result<Vec<_>>>()?;

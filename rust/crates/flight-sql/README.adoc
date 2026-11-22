@@ -495,6 +495,10 @@ It takes the world UUID, one signed big-endian 64-bit exclusive deadline in Unix
 The remaining bytes are the existing hosted control groups. Only check rows from the placed allowlist are admitted.
 The ordered transaction checks the world registration, placement, deadline, local point revisions, root erasure frontiers, and hosted ownership before issuing the transaction-key receipt.
 
+`rtdb.owned.ReadHeldWorldChanges.v1` uses the merged changes framing and reply with a held world handle.
+It returns ordered local overlay groups after the supplied revision at or above the archived parent basis. The archived parent is fixed.
+The scope must retain journal coverage and certified purge history. A local tombstone emits a delete.
+
 `rtdb.owned.ForkHeldWorld.v1` creates one retained world from an authenticated Root hold at the exact authorized capture or accepted suffix.
 The body carries the 16-byte hold, minted world, capture and optional suffix (nil selects the base capture), followed by expiry and deadline as big-endian i64, the 22-byte attempt ID, its 32-byte fingerprint, and check-only hosted controls.
 The placed owner derives the archived cut before pinning and orders the registration with the attempt marker.
