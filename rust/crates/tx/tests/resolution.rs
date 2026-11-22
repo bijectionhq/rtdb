@@ -814,7 +814,7 @@ async fn owned_world_rows_require_the_ordered_registration_and_cannot_mix_with_r
     let state = PartitionState::empty(Default::default()).unwrap();
     let world = OwnedWorld {
         id: Iid([8; 16]), capture: Iid([9; 16]), manifest: "a".repeat(43),
-        basis: TransactionKey { tx_id: TxId(0), system_time: Timestamp(10) }, until: Timestamp(107),
+        basis: TransactionKey { tx_id: TxId(0), system_time: Timestamp(10) }, until: Timestamp(107), dropped: false,
         schemas: rtdb_types::WorldSchemas::new(std::collections::BTreeMap::from([(
             "orders".into(),
             rtdb_types::OwnedSchema::from_json(br#"{"fields":[{"name":"amount","type":{"kind":"i64"},"optional":true,"nullable":false}]}"#).unwrap(),
@@ -877,4 +877,71 @@ async fn owned_world_rows_require_the_ordered_registration_and_cannot_mix_with_r
     let expired = resolver.resolve_source(state.snapshot(), SourcePosition(7), Timestamp(107),
         source(vec![replace(local.clone())]), &context).await.unwrap();
     assert_eq!(expired.result().error().unwrap().code, "rtdb.world/unavailable");
+}
+
+#[tokio::test]
+async fn ordered_world_drop_is_terminal_and_refuses_a_different_fork() {
+    use rtdb_format::envelope::SourceMessage;
+    use rtdb_types::{EntityId, Iid, OwnedRelation, OwnedWorld, TransactionKey, TxId, WorldSchemas, WorldShadow};
+
+    let context = context();
+    let state = PartitionState::empty(Default::default()).unwrap();
+    let world = OwnedWorld {
+        id: Iid([8; 16]), capture: Iid([9; 16]), manifest: "a".repeat(43),
+        basis: TransactionKey { tx_id: TxId(0), system_time: Timestamp(10) },
+        until: Timestamp(200), schemas: WorldSchemas::new(Default::default()).unwrap(), dropped: false,
+    };
+    let scope = OwnedRelation::world_catalog();
+    let source = |operation| {
+        let request = SourceTransaction::new(
+            vec![operation], SubmitOptions { user: Some("owner".into()), ..SubmitOptions::default() }, &context.memory,
+        ).unwrap();
+        let encoded = request.encode().unwrap();
+        let message = SourceMessage::decode(encoded.as_slice()).unwrap().unwrap();
+        SourceTransaction::decode(&message, &context.memory).unwrap()
+    };
+    let register = || TxOp::OwnedInsertDocs {
+        relation: scope.clone(), documents: Documents::new(vec![world.record()], &context.memory).unwrap(),
+        valid_from: None, valid_to: None,
+    };
+    let drop_world = |capture| {
+        let marker = OwnedWorld { capture, dropped: true, ..world.clone() };
+        TxOp::OwnedReplaceDocs {
+            relation: scope.clone(), documents: Documents::new(vec![marker.record()], &context.memory).unwrap(),
+            valid_from: None, valid_to: None,
+        }
+    };
+    let mut resolver = TxResolver::new(None, SourcePosition(-1), None, &context.memory).unwrap();
+    let registered = resolver.resolve_source(state.snapshot(), SourcePosition(0), Timestamp(100),
+        source(register()), &context).await.unwrap();
+    assert!(registered.result().committed());
+
+    let unrelated = resolver.resolve_source(state.snapshot(), SourcePosition(1), Timestamp(101),
+        source(drop_world(Iid([7; 16]))), &context).await.unwrap();
+    assert_eq!(unrelated.result().error().unwrap().code, "rtdb.world/unavailable");
+
+    let dropped = resolver.resolve_source(state.snapshot(), SourcePosition(2), Timestamp(102),
+        source(drop_world(world.capture)), &context).await.unwrap();
+    assert!(dropped.result().committed());
+    assert!(dropped.writes().tables().contains_key(&scope.table("owner")));
+
+    let repeated = resolver.resolve_source(state.snapshot(), SourcePosition(3), Timestamp(103),
+        source(drop_world(world.capture)), &context).await.unwrap();
+    assert!(repeated.result().committed());
+    assert!(!repeated.writes().tables().contains_key(&scope.table("owner")));
+
+    let resurrected = resolver.resolve_source(state.snapshot(), SourcePosition(4), Timestamp(104),
+        source(register()), &context).await.unwrap();
+    assert!(!resurrected.result().committed());
+
+    let child = OwnedRelation::new("orders").unwrap().in_world(world.id).unwrap();
+    let pending = TxOp::OwnedReplaceDocs {
+        relation: child.clone(),
+        documents: Documents::new(vec![WorldShadow::Deleted.record(&EntityId::Integer(1)).unwrap()], &context.memory).unwrap(),
+        valid_from: Some(Timestamp(50)), valid_to: Some(Timestamp(100)),
+    };
+    let refused = resolver.resolve_source(state.snapshot(), SourcePosition(5), Timestamp(105),
+        source(pending), &context).await.unwrap();
+    assert_eq!(refused.result().error().unwrap().code, "rtdb.world/unavailable");
+    assert!(!refused.writes().tables().contains_key(&child.table("owner")));
 }

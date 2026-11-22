@@ -67,6 +67,7 @@ fn world_record(
         basis: retained.basis,
         until: retained.until,
         schemas,
+        dropped: false,
     }
 }
 
@@ -156,6 +157,14 @@ pub async fn fork_checkpoint_world(
     Ok(id)
 }
 
+fn matches_retention(world: &OwnedWorld, retained: &CheckpointWorldRetention) -> bool {
+    world.capture.0 == *retained.capture.as_bytes()
+        && world.manifest == retained.manifest_sha256
+        && world.basis == retained.basis
+        && world.until == retained.until
+        && world.schemas.digest() == retained.schema_digest
+}
+
 struct OpenWorld {
     retained: CheckpointWorldRetention,
     snapshot: OwnedReadSession,
@@ -194,12 +203,9 @@ async fn open_world(
         .world_registration(Iid(*id.as_bytes()))
         .await?
         .ok_or_else(OwnedWorld::unavailable)?;
-    if snapshot.present().system_time >= retained.until
-        || world.capture.0 != *retained.capture.as_bytes()
-        || world.manifest != retained.manifest_sha256
-        || world.basis != retained.basis
-        || world.until != retained.until
-        || world.schemas.digest() != retained.schema_digest
+    if world.dropped
+        || snapshot.present().system_time >= retained.until
+        || !matches_retention(&world, retained)
     {
         return Err(OwnedWorld::unavailable());
     }
@@ -209,6 +215,73 @@ async fn open_world(
         record: world,
         _schema_charge: charge,
     })
+}
+
+/// Orders a terminal world marker before allowing archive retirement.
+pub async fn drop_checkpoint_world(
+    directory: &dyn Directory,
+    session: &mut NativeSession,
+    deployment: Uuid,
+    id: Uuid,
+) -> Result<()> {
+    let deployment = deployment.to_string();
+    let owner = session
+        .state()
+        .user()
+        .filter(|owner| !owner.is_empty())
+        .ok_or_else(OwnedWorld::unavailable)?;
+    let installation = directory
+        .deployment(&deployment)
+        .await?
+        .ok_or_else(OwnedWorld::unavailable)?;
+    admit_session(session, &installation, owner)?;
+    let retained = installation.checkpoint_worlds.get(&id);
+    if retained.is_some_and(|retained| retained.owner != owner) {
+        return Err(OwnedWorld::unavailable());
+    }
+    let snapshot = session.open_owned_read().await?;
+    let (world, _retained) = snapshot
+        .world_registration(Iid(*id.as_bytes()))
+        .await?
+        .ok_or_else(OwnedWorld::unavailable)?;
+    drop(snapshot);
+
+    let Some(pin) = retained else {
+        return if world.dropped {
+            Ok(())
+        } else {
+            Err(OwnedWorld::unavailable())
+        };
+    };
+    if !matches_retention(&world, pin) {
+        return Err(OwnedWorld::unavailable());
+    }
+    if !world.dropped {
+        let outcome = session.drop_owned_world(world).await?;
+        if !outcome.committed() {
+            return Err(outcome
+                .error()
+                .cloned()
+                .unwrap_or_else(OwnedWorld::unavailable));
+        }
+    }
+
+    update_installation(directory, &deployment, |current| {
+        if current.incarnation != installation.incarnation
+            || current.log_epoch != installation.log_epoch
+        {
+            return Err(OwnedWorld::unavailable());
+        }
+        if let Some(current_pin) = current.checkpoint_worlds.get(&id) {
+            if current_pin != pin {
+                return Err(OwnedWorld::unavailable());
+            }
+            current.checkpoint_worlds.remove(&id);
+        }
+        Ok(())
+    })
+    .await?;
+    Ok(())
 }
 
 /// Applies complete local replacements and tombstones in one ordered write.
