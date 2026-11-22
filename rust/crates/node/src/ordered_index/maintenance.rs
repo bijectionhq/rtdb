@@ -357,7 +357,7 @@ async fn read_flushed_root(
     Ok(Some(root))
 }
 
-fn source_rows(snapshot: &Snapshot, table: &TableRef) -> i64 {
+pub(super) fn source_rows(snapshot: &Snapshot, table: &TableRef) -> i64 {
     snapshot
         .table_catalog()
         .metadata(table)

@@ -31,6 +31,7 @@ pub(crate) const READ_OWNED_V1: &str = "rtdb.owned.ReadPoint.v1";
 pub(crate) const OPEN_OWNED_READ_V1: &str = "rtdb.owned.OpenRead.v1";
 pub(crate) const HELD_OWNED_POINT_V1: &str = "rtdb.owned.ReadHeldPoint.v1";
 pub(crate) const CLOSE_OWNED_READ_V1: &str = "rtdb.owned.CloseRead.v1";
+pub(crate) const HELD_OWNED_RANGE_V1: &str = "rtdb.owned.ReadHeldRange.v1";
 const READ_IDLE: Duration = Duration::from_secs(60);
 const OWNED_PRESENT: &str = "rtdb.owned.present_micros";
 const OWNED_VALID: &str = "rtdb.owned.valid_micros";
@@ -58,7 +59,7 @@ fn split_relation(body: &[u8]) -> Result<(OwnedRelation, &[u8]), Status> {
     Ok((OwnedRelation::new(name).map_err(status)?, arrow_bytes))
 }
 
-fn request_batch(call: &Call, arrow: &[u8]) -> Result<OwnedBatch, Status> {
+fn decode_batch(call: &Call, arrow: &[u8]) -> Result<OwnedBatch, Status> {
     let mut stream = OwnedStream::read(arrow, call.service.memory()).map_err(status)?.into_pages();
     let [batch] = stream.as_slice() else {
         return Err(invalid("Owned action requires exactly one Arrow record batch"));
@@ -66,10 +67,18 @@ fn request_batch(call: &Call, arrow: &[u8]) -> Result<OwnedBatch, Status> {
     if batch.batch().num_rows() == 0 { return Err(invalid("Owned action requires a nonempty Arrow record batch")); }
     let schema = batch.batch().schema();
     let names = schema.fields().iter().map(|field| field.name().as_str()).collect::<BTreeSet<_>>();
-    if names.len() != schema.fields().len() || !names.contains("_id") {
-        return Err(invalid("Owned action requires unique document columns and an _id column"));
+    if names.len() != schema.fields().len() {
+        return Err(invalid("Owned action requires unique column names"));
     }
     Ok(stream.pop().expect("validated one batch"))
+}
+
+fn request_batch(call: &Call, arrow: &[u8]) -> Result<OwnedBatch, Status> {
+    let batch = decode_batch(call, arrow)?;
+    if batch.batch().schema_ref().index_of("_id").is_err() {
+        return Err(invalid("Owned action requires an _id column"));
+    }
+    Ok(batch)
 }
 
 fn require_idle(native: &NativeSession) -> Result<(), Status> {
@@ -222,6 +231,37 @@ impl Service {
         let (relation, id, _identity) = point_request(call, request)?;
         let cursor = held.snapshot.open_point(&relation, &id).await.map_err(status)?;
         let reply = self.finish_owned_point(held.snapshot.present().system_time, &id, cursor).await?;
+        held.snapshot.check().map_err(status)?;
+        Ok(reply)
+    }
+
+    pub(crate) async fn held_owned_range_action(&self, call: &Call, body: &[u8]) -> Result<ActionResult, Status> {
+        if !self.0.config.owned_native_actions { return Err(unsupported()); }
+        let (handle, request) = body.split_first_chunk::<16>().ok_or_else(|| invalid("Owned held range has no handle"))?;
+        let handle = Bytes::copy_from_slice(handle);
+        let held = self.owned_read(call, &handle)?;
+        if let Err(error) = held.snapshot.check() {
+            if let Lookup::Found(entry) = self.0.owned_reads.take(&handle) { entry.close(); }
+            return Err(status(error));
+        }
+        let (relation, arrow) = split_relation(request)?;
+        let batch = decode_batch(call, arrow)?;
+        if batch.batch().num_rows() != 1 || batch.batch().num_columns() != 4 {
+            return Err(invalid("Owned range requires one row with path, lower, upper, and limit"));
+        }
+        let (mut rows, _decoded) = upload::documents(batch.batch(), self)?;
+        let row = rows.pop().expect("validated one row");
+        let (Some(Value::Utf8(path)), Some(lower), Some(upper), Some(Value::I64(limit))) =
+            (row.get("path"), row.get("lower"), row.get("upper"), row.get("limit"))
+        else { return Err(invalid("Owned range fields have invalid types")); };
+        let path = OwnedRelation::new(path.as_str()).map_err(status)?;
+        let limit = usize::try_from(*limit).map_err(|_| invalid("Owned range limit is out of range"))?;
+        let lower = (!matches!(lower, Value::Null | Value::Undefined)).then_some(lower);
+        let upper = (!matches!(upper, Value::Null | Value::Undefined)).then_some(upper);
+        let page = held.snapshot.range(&relation, &path, lower, upper, limit).await.map_err(status)?;
+        let reply = self.owned_point_reply(
+            &page.schema, page.batch.as_ref().map(OwnedBatch::batch), held.snapshot.present().system_time, None,
+        )?;
         held.snapshot.check().map_err(status)?;
         Ok(reply)
     }

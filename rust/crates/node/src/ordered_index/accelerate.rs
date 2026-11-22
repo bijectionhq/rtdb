@@ -26,7 +26,7 @@ use tokio_util::sync::CancellationToken;
 use super::{
     Definition, checkpoint, definitions,
     key::{Atom, AtomRef, Bucket, Family, family},
-    maintenance::{cancelled, read_root, source_frontier},
+    maintenance::{cancelled, read_root, source_frontier, source_rows},
     postings::Tuple,
     tree::{Cursor, Hit, KeyRef, Tree},
 };
@@ -625,7 +625,7 @@ async fn use_index(
         return Ok(None);
     }
     let projection = if top.is_some() && covered {
-        Covered::bind(request, definition, projection)?
+        Covered::bind(&request.scan.columns, definition, projection)?
     } else {
         None
     };
@@ -717,6 +717,74 @@ async fn use_index(
         candidates: Box::new(PostingCandidates(Some(postings))),
         verify: !covered,
     }))
+}
+
+pub(super) async fn owned_page(
+    context: &rtdb_query::QueryContext,
+    snapshot: &rtdb_index::Snapshot,
+    storage: &Arc<rtdb_storage::cache::BufferPool>,
+    definition: &Definition,
+    bounds: RowBounds<'_>,
+) -> Result<super::OwnedRangePage> {
+    if !(1..=BATCH_ROWS).contains(&bounds.limit) {
+        return Err(rtdb_types::Anomaly::incorrect("rtdb.owned/range-limit", "Owned range limit must be between 1 and 128"));
+    }
+    let types = snapshot.column_types_for(&definition.table, definition.columns.clone());
+    let fields: Vec<_> = definition.columns.iter().enumerate().map(|(id, name)| Field {
+        id: ColumnId(id as u32), name: name.clone(), qualifier: None, qualified_only: false,
+        unnamed: false, data_type: types.get(name.as_str()).cloned().unwrap_or(LogicalType::Null),
+    }).collect();
+    let positions: Vec<_> = (0..fields.len()).collect();
+    let covered = Covered::bind(&fields, definition, &positions)?.ok_or_else(super::uncovered_owned_range)?;
+    let family = fields.first().and_then(|field| family(&field.data_type)).ok_or_else(super::uncovered_owned_range)?;
+    let bound = |value: &rtdb_types::Value| {
+        Atom::of(value).filter(|atom| atom.family() == Some(family))
+            .ok_or_else(|| rtdb_types::Anomaly::incorrect("rtdb.owned/range-bound", "Owned range bound does not match its leading key"))
+    };
+    let range = Range {
+        lower: bounds.lower.map(bound).transpose()?.map(|atom| (atom, false)),
+        upper: bounds.upper.map(bound).transpose()?.map(|atom| (atom, true)),
+        ..Range::default()
+    };
+
+    let through = source_frontier(snapshot, &definition.table);
+    if through < 0 || snapshot.iter_segments(&definition.table).any(|segment| segment.row_count() != 0) {
+        return Err(super::uncovered_owned_range());
+    }
+    let directory = definition.directory()?;
+    let checkpoint = checkpoint::latest(storage, &directory, &context.memory, through).await?
+        .filter(|checkpoint| checkpoint.through == through && checkpoint.source_rows == source_rows(snapshot, &definition.table))
+        .ok_or_else(super::uncovered_owned_range)?;
+    let tree = Tree::new(storage, &directory, &context.memory, checkpoint.scope).await?;
+    let present = context.current_time.as_micros()?;
+    let root = checkpoint.roots().at(&tree, present).await?
+        .ok_or_else(super::uncovered_owned_range)?.1;
+    let buckets: Vec<_> = Bucket::at(present).collect();
+    let scratch = context.memory.reserve(bounds.limit.saturating_mul(64).saturating_add(16_384))?;
+    let cursors = buckets.iter().map(|_| Cursor::new(root.clone(), false)).collect();
+    let mut scan = PostingScan {
+        heap: BinaryHeap::new(), cursors, buckets, advanced: None, range, reverse: false,
+        width: definition.columns.len(), cancellation: context.cancellation.clone(), _scratch: scratch, tree,
+    };
+    for slot in 0..scan.cursors.len() { scan.advance(slot).await?; }
+    let schema = Arc::clone(&covered.schema);
+    let mut seek = CoveredSeek {
+        state: Some(CoveredState {
+            projection: covered,
+            postings: MatchingPostings { scan, predicates: Vec::new(), distinct: None, last: None },
+            skip: 0, remaining: bounds.limit,
+        }),
+        sliced_rows: 0,
+        gathered_rows: 0,
+    };
+    let batch = seek.next_batch().await?;
+    Ok(super::OwnedRangePage { schema, batch })
+}
+
+pub(super) struct RowBounds<'a> {
+    pub(super) lower: Option<&'a rtdb_types::Value>,
+    pub(super) upper: Option<&'a rtdb_types::Value>,
+    pub(super) limit: usize,
 }
 
 struct MatchingPostings {
@@ -935,13 +1003,13 @@ struct Covered {
 
 impl Covered {
     fn bind(
-        request: &ScanRequest<'_>,
+        scan_fields: &[Field],
         definition: &Definition,
         projection: &[usize],
     ) -> Result<Option<Self>> {
         let fields = projection
             .iter()
-            .map(|&position| request.scan.columns.get(position))
+            .map(|&position| scan_fields.get(position))
             .collect::<Option<Vec<_>>>()
             .ok_or_else(|| super::format_error("Covered scan position exceeds its schema"))?;
         let mut columns = Vec::new();

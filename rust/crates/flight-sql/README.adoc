@@ -244,3 +244,11 @@ The relation must already exist in the authenticated owner's namespace.
 A successful declaration returns the same transaction-key Arrow row as Create.
 The declaration is immutable and private to the owner's index catalog.
 Index maintenance builds the generation after declaration.
+
+`rtdb.owned.ReadHeldRange.v1` uses the 16-byte held handle, a relation prefix, and a terminated Arrow IPC stream with one row.
+The row contains `path: Utf8`, the nullable typed `lower` and `upper` key cells, and `limit: Int64` between 1 and 128.
+Bounds address the leading path key, with an inclusive lower endpoint and an exclusive upper endpoint.
+A null endpoint leaves that side open.
+Results contain the covered path columns in ascending path order at the held present and valid instant.
+A missing declaration, missing generation, uncovered source frontier, unflushed data, or unsupported covering projection returns an explicit refusal.
+The service does not fall back to a primary or SQL scan.

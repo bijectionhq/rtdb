@@ -169,6 +169,38 @@ async fn read_definitions(mut cursor: rtdb_query::QueryCursor) -> Result<Vec<Def
     Ok(definitions)
 }
 
+pub struct OwnedRangePage {
+    pub schema: Arc<arrow_schema::Schema>,
+    pub batch: Option<rtdb_columnar::OwnedBatch>,
+}
+
+fn uncovered_owned_range() -> Anomaly {
+    Anomaly::new(rtdb_types::AnomalyCategory::Unavailable, "rtdb.owned/path-uncovered", "The held basis has no fully covered generation of this owned path")
+}
+
+pub(crate) async fn owned_range(
+    context: Arc<QueryContext>,
+    owner: &str,
+    relation: &rtdb_types::OwnedRelation,
+    path: &rtdb_types::OwnedRelation,
+    lower: Option<&Value>,
+    upper: Option<&Value>,
+    limit: usize,
+) -> Result<OwnedRangePage> {
+    let catalog = rtdb_types::OwnedRelation::path_catalog(owner);
+    let target = relation.table(owner);
+    let cursor = rtdb_query::open_owned_path_catalog(Arc::clone(&context), &catalog, Some(path.name())).await?
+        .ok_or_else(uncovered_owned_range)?;
+    let mut definitions = read_definitions(cursor).await?.into_iter();
+    let definition = definitions.next()
+        .filter(|definition| definition.name == path.name() && definition.table == target && definitions.next().is_none())
+        .ok_or_else(uncovered_owned_range)?;
+    let database = context.catalog.database(context.catalog.default_database())?;
+    let [snapshot] = database.partitions.as_slice() else { return Err(uncovered_owned_range()); };
+    let work = accelerate::owned_page(&context, snapshot, &database.storage, &definition, accelerate::RowBounds { lower, upper, limit });
+    rtdb_storage::IoRegion::leased(context.catalog.read_lease(), work).await
+}
+
 fn format_error(error: impl std::fmt::Display) -> Anomaly {
     Anomaly::fault("rtdb.ordered-index/format", error.to_string())
 }
