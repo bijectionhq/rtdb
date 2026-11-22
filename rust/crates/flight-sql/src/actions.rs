@@ -13,6 +13,7 @@ impl Service {
         let work = async {
             match action.r#type.as_str() {
                 crate::owned_actions::CREATE_OWNED_V1 => Ok(vec![Ok(self.create_owned_action(&call, &action.body).await?)]),
+                crate::owned_actions::COMMIT_OWNED_V1 => Ok(vec![Ok(self.commit_owned_action(&call, &action.body).await?)]),
                 crate::owned_actions::READ_OWNED_V1 => Ok(vec![Ok(self.read_owned_action(&call, &action.body).await?)]),
                 "BeginTransaction" => {
                     let _: ActionBeginTransactionRequest = unpack(&action.body)?;

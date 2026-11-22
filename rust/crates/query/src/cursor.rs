@@ -546,6 +546,14 @@ impl QueryCursor {
             }
         };
         let result = rtdb_storage::IoRegion::retaining(retention, rtdb_storage::IoRegion::leased(lease, pull)).await.flatten().ok_or_else(cancelled);
+        let result = result.and_then(|batch| {
+            if let (Some(id), Ok(Some(page))) = (self.context.catalog.owned_identity(), &batch) {
+                for row in 0..page.batch().num_rows() {
+                    crate::owned_row_revision(page.batch(), row, id, &self.context.memory)?;
+                }
+            }
+            Ok(batch)
+        });
         match result {
             Ok(Ok(batch)) => { if let Some(trace) = &mut self.trace { trace.completed(started.elapsed(), batch.as_ref().map(|batch| batch.batch().num_rows())); } if batch.is_none() { self.input = None; } Ok(batch) }
             Ok(Err(error)) | Err(error) => { self.input = None; self.record_error(); Err(error) }

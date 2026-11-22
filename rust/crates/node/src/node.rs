@@ -411,7 +411,7 @@ impl Node {
     async fn submit(&self, database: &str, operations: Vec<TxOp>, mut options: SubmitOptions, permit: Option<crate::ReplaySubmissionPermit>, identity: &dyn SessionIdentity, placement: Option<&Weak<Database>>, cancellation: &CancellationToken) -> Result<SubmittedTx> {
         self.admit(database, DatabaseAccess::Write, identity, cancellation).await?;
         if !self.factory.options.owned_relations
-            && operations.iter().any(|operation| matches!(operation, TxOp::OwnedInsertDocs { .. }))
+            && operations.iter().any(TxOp::is_owned)
         {
             return Err(owned_relations_disabled());
         }
@@ -880,7 +880,7 @@ impl NativeSession {
             timezone: self.state.session_timezone().to_owned(),
         };
         let context = self.service.query_context(database, &basis, self.state.cancellation()).await?;
-        let cursor = rtdb_query::open_owned_point(context, &owner, relation, id.iid(), None, None).await?;
+        let cursor = rtdb_query::open_owned_point(context, &owner, relation, id, None, None).await?;
         Ok((present.system_time, cursor))
     }
     pub async fn query_context(&mut self) -> Result<Arc<QueryContext>> {

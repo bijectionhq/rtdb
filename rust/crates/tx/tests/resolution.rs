@@ -363,6 +363,70 @@ async fn owned_insert_owner_and_policy_survive_source_and_replica_decoding() {
 }
 
 #[tokio::test]
+async fn owned_commit_checks_deadline_and_exact_point_before_mutation() {
+    use rtdb_format::envelope::SourceMessage;
+    use rtdb_types::{EntityId, OwnedRelation};
+
+    let state = PartitionState::empty(Default::default()).unwrap();
+    let context = context();
+    let relation = OwnedRelation::new("commits").unwrap();
+    let id = EntityId::Integer(1);
+    let documents = || Documents::new(vec![document(7)], &context.memory).unwrap();
+    let source = |operations| {
+        let source = SourceTransaction::new(
+            operations, SubmitOptions { user: Some("owner".into()), ..SubmitOptions::default() }, &context.memory,
+        ).unwrap();
+        let bytes = source.encode().unwrap();
+        let message = SourceMessage::decode(bytes.as_slice()).unwrap().unwrap();
+        SourceTransaction::decode(&message, &context.memory).unwrap()
+    };
+    let mut resolver = TxResolver::new(None, SourcePosition(-1), None, &context.memory).unwrap();
+    let create = TxOp::OwnedInsertDocs { relation: relation.clone(), documents: documents(), valid_from: Some(Timestamp(0)), valid_to: None };
+    let replace = || TxOp::OwnedReplaceDocs { relation: relation.clone(), documents: documents(), valid_from: Some(Timestamp(0)), valid_to: None };
+    let delete = || TxOp::OwnedDelete { relation: relation.clone(), id: id.clone(), valid_from: Some(Timestamp(0)), valid_to: None };
+    let check = |id, expected| TxOp::OwnedCheck { relation: relation.clone(), id, valid_at: Timestamp(10), expected };
+    let first = resolver.resolve_source(state.snapshot(), SourcePosition(0), Timestamp(100), source(vec![create]), &context).await.unwrap();
+    assert!(first.result().committed());
+    let first_revision = first.result().tx_key().system_time;
+
+    let expired = resolver.resolve_source(
+        state.snapshot(), SourcePosition(1), Timestamp(101),
+        source(vec![replace(), TxOp::OwnedDeadline { until: Timestamp(101) }]), &context,
+    ).await.unwrap();
+    assert_eq!(expired.result().error().unwrap().code, "rtdb.owned/expired");
+
+    let replaced = resolver.resolve_source(
+        state.snapshot(), SourcePosition(2), Timestamp(102),
+        source(vec![replace(), check(id.clone(), Some(first_revision)), TxOp::OwnedDeadline { until: Timestamp(110) }]), &context,
+    ).await.unwrap();
+    assert!(replaced.result().committed());
+    let replacement_revision = replaced.result().tx_key().system_time;
+
+    let stale = resolver.resolve_source(
+        state.snapshot(), SourcePosition(3), Timestamp(103),
+        source(vec![delete(), check(id.clone(), Some(first_revision))]), &context,
+    ).await.unwrap();
+    assert_eq!(stale.result().error().unwrap().code, "rtdb.owned/stale-point");
+    assert!(!stale.writes().tables().contains_key(&relation.table("owner")));
+
+    let alias = EntityId::Uuid(id.iid().0);
+    let collision = resolver.resolve_source(
+        state.snapshot(), SourcePosition(4), Timestamp(104), source(vec![check(alias, None)]), &context,
+    ).await.unwrap();
+    assert_eq!(collision.result().error().unwrap().code, "rtdb.owned/iid-collision");
+
+    let deleted = resolver.resolve_source(
+        state.snapshot(), SourcePosition(5), Timestamp(105),
+        source(vec![delete(), check(id.clone(), Some(replacement_revision))]), &context,
+    ).await.unwrap();
+    assert!(deleted.result().committed());
+    let absent = resolver.resolve_source(
+        state.snapshot(), SourcePosition(6), Timestamp(106), source(vec![check(id, None)]), &context,
+    ).await.unwrap();
+    assert!(absent.result().committed());
+}
+
+#[tokio::test]
 async fn staged_snapshot_requires_the_predecessor_and_block_of_each_overlay() {
     let state = PartitionState::empty(Default::default()).unwrap();
     let captured = state.value().snapshot();

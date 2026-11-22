@@ -42,7 +42,7 @@ pub struct CatalogSnapshot {
     pub(crate) default_database: String,
     pub(crate) databases: BTreeMap<String, DatabaseSnapshot>,
     transaction_scoped: bool,
-    owned_relation: Option<QualifiedTable>,
+    owned_relation: Option<(QualifiedTable, rtdb_types::EntityId)>,
     pub(crate) runtime: Option<Arc<dyn CatalogRuntime>>,
     pub(crate) ordered_indexes: Option<Arc<dyn OrderedIndexInventory>>,
     pub(crate) fragmenter: Option<Arc<dyn crate::fragment::ScanFragmenter>>,
@@ -91,9 +91,12 @@ impl CatalogSnapshot {
         if crate::system_schema::definition(&table.name.table).is_some() && !table.columns.contains_key(&field.name) { LogicalType::Null }
         else { rtdb_columnar::execution_type(&field.data_type) }
     }
+    pub(crate) fn owned_identity(&self) -> Option<&rtdb_types::EntityId> {
+        self.owned_relation.as_ref().map(|(_, id)| id)
+    }
     pub(crate) fn permits_table(&self, name: &QualifiedTable) -> bool {
         match &self.owned_relation {
-            Some(admitted) => admitted == name,
+            Some((admitted, _)) => admitted == name,
             None => !TableRef::owned_schema(&name.table.schema),
         }
     }
@@ -124,7 +127,7 @@ impl Catalog for CatalogSnapshot {
     fn databases(&self) -> BTreeSet<String> { self.databases.keys().cloned().collect() }
     fn table(&self, name: &QualifiedTable) -> Result<Option<TableBinding>> { self.binding(&name.database, &name.table) }
     fn tables(&self, database: &str) -> Result<Vec<TableBinding>> {
-        if let Some(admitted) = &self.owned_relation {
+        if let Some((admitted, _)) = &self.owned_relation {
             return if admitted.database == database {
                 Ok(self.table(admitted)?.into_iter().collect())
             } else {
@@ -228,9 +231,9 @@ impl QueryContext {
         self
     }
 
-    pub(crate) fn for_owned_relation(mut self: Arc<Self>, table: QualifiedTable) -> Arc<Self> {
+    pub(crate) fn for_owned_relation(mut self: Arc<Self>, table: QualifiedTable, id: rtdb_types::EntityId) -> Arc<Self> {
         let context = Arc::make_mut(&mut self);
-        context.catalog.owned_relation = Some(table);
+        context.catalog.owned_relation = Some((table, id));
         context.catalog.runtime = None;
         context.catalog.fragmenter = None;
         context.accelerators = Default::default();

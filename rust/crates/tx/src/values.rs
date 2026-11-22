@@ -696,6 +696,10 @@ fn schema_bytes(types: &[LogicalType]) -> Result<usize> {
 pub enum TxOp {
     Sql { sql: String, args: Option<SqlArguments> },
     SqlBytes { sql: String, arg_bytes: RetainedBytes },
+    OwnedDeadline { until: Timestamp },
+    OwnedCheck { relation: rtdb_types::OwnedRelation, id: EntityId, valid_at: Timestamp, expected: Option<Timestamp> },
+    OwnedDelete { relation: rtdb_types::OwnedRelation, id: EntityId, valid_from: Option<Timestamp>, valid_to: Option<Timestamp> },
+    OwnedReplaceDocs { relation: rtdb_types::OwnedRelation, documents: Documents, valid_from: Option<Timestamp>, valid_to: Option<Timestamp> },
     OwnedInsertDocs { relation: rtdb_types::OwnedRelation, documents: Documents, valid_from: Option<Timestamp>, valid_to: Option<Timestamp> },
     InsertDocs { table: TableRef, documents: Documents, valid_from: Option<Timestamp>, valid_to: Option<Timestamp> },
     PutDocs { table: TableRef, documents: Documents, valid_from: Option<Timestamp>, valid_to: Option<Timestamp> },
@@ -703,6 +707,12 @@ pub enum TxOp {
     PatchDocs { table: TableRef, documents: Documents, valid_from: Option<Timestamp>, valid_to: Option<Timestamp> },
     DeleteDocs { table: TableRef, ids: EntityIds, valid_from: Option<Timestamp>, valid_to: Option<Timestamp> },
     EraseDocs { table: TableRef, ids: EntityIds },
+}
+
+impl TxOp {
+    pub fn is_owned(&self) -> bool {
+        matches!(self, Self::OwnedDeadline { .. } | Self::OwnedCheck { .. } | Self::OwnedDelete { .. } | Self::OwnedReplaceDocs { .. } | Self::OwnedInsertDocs { .. })
+    }
 }
 
 #[derive(Clone, Debug)]

@@ -40,6 +40,9 @@
 -- Typed create-only document inserts check absence over their valid-time intervals in the ordered transaction view.
 -- An overlap aborts the entire transaction.
 -- Owned native inserts resolve in the authenticated principal's versioned namespace.
+-- Owned deadlines and point observations are checked at the ordered cut before owned mutations apply.
+-- Owned create, replace, and delete operations apply atomically in their listed order.
+-- Owned point reads compare the complete stored identity before yielding any row.
 -- An owned transaction refuses ordinary operations and ordinary SQL catalogs and scans exclude owned tables.
 -- Owned point reads use the principal's namespace at a reserved present.
 -- DML evaluates CURRENT_TIMESTAMP at the assigned system time when resolving the ordered transaction.
