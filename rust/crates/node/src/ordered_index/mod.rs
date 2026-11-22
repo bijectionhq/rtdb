@@ -288,6 +288,19 @@ pub(crate) async fn owned_total_at(
     measured: bool,
 ) -> Result<OwnedRangeCount> {
     let definition = owned_definition(&context, owner, relation, path).await?;
+    if measured {
+        let [.., measure, identity] = definition.columns.as_slice() else {
+            return Err(uncovered_owned_range());
+        };
+        let (schema, _charge) =
+            rtdb_query::read_owned_relation_schema(Arc::clone(&context), owner, relation)
+                .await?.ok_or_else(uncovered_owned_range)?;
+        if identity != "_id"
+            || schema.column_logical_type(measure) != Some(LogicalType::Scalar(ScalarType::I64))
+        {
+            return Err(uncovered_owned_range());
+        }
+    }
     let database = context
         .catalog
         .database(context.catalog.default_database())?;

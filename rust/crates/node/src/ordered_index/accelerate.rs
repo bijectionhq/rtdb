@@ -840,13 +840,6 @@ pub(super) async fn owned_count(
     let OwnedProjection { fields, empty } = projection;
     let positions: Vec<_> = (0..fields.len()).collect();
     Covered::bind(&fields, definition, &positions)?.ok_or_else(super::uncovered_owned_range)?;
-    if measured {
-        match fields.as_slice() {
-            [.., measure, identity]
-                if identity.name == "_id" && measure.data_type == LogicalType::Scalar(ScalarType::I64) => {}
-            _ => return Err(super::uncovered_owned_range()),
-        }
-    }
     let mut range = Range::default();
     compound_bound(&mut range, &fields, request.lower, true, false)?;
     compound_bound(&mut range, &fields, request.upper, false, true)?;
