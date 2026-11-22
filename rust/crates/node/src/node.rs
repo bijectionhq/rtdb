@@ -1131,6 +1131,12 @@ impl OwnedReadSession {
     pub fn relation_release_guard<'a>(
         &self, relations: impl IntoIterator<Item = &'a rtdb_types::OwnedRelation>,
     ) -> Result<Arc<dyn Fn() -> Result<()> + Send + Sync>> {
+        self.relation_release_guard_for(relations, false)
+    }
+
+    fn relation_release_guard_for<'a>(
+        &self, relations: impl IntoIterator<Item = &'a rtdb_types::OwnedRelation>, present_point: bool,
+    ) -> Result<Arc<dyn Fn() -> Result<()> + Send + Sync>> {
         let database = self.retained_root_context().catalog.database(&self.database)?;
         let [snapshot] = database.partitions.as_slice() else {
             return Err(Anomaly::new(AnomalyCategory::Unavailable, "rtdb.owned/read-purged", "The held cut has no single purge frontier"));
@@ -1141,9 +1147,15 @@ impl OwnedReadSession {
         }
         let frontiers = relations.into_iter().map(|relation| {
             let root = relation.root_relation();
-            let table = root.as_ref().unwrap_or(relation).purge_table(&self.owner);
+            let logical = root.as_ref().unwrap_or(relation);
+            let lifetime = logical.lifetime_table(&self.owner);
+            let governed = snapshot.contains_table(&lifetime);
+            if governed && (!present_point || root.is_some() || self.historical.is_some()) {
+                return Err(lifetime_read_unavailable());
+            }
+            let table = logical.purge_table(&self.owner);
             let expected = snapshot.relation_event_frontier(&table)?;
-            Ok((table, expected))
+            Ok((table, expected, lifetime, governed))
         }).collect::<Result<Vec<_>>>()?;
         let charge = self.context.memory.reserve(frontiers.len() * 512)?;
         let node = self.node.clone();
@@ -1157,7 +1169,10 @@ impl OwnedReadSession {
             if current.contains_table(&obsolete) {
                 return Err(Anomaly::new(AnomalyCategory::Unavailable, "rtdb.owned/purge-history-reset", "Owner-wide purge history requires a reset before native held reads"));
             }
-            for (table, expected) in &frontiers {
+            for (table, expected, lifetime, governed) in &frontiers {
+                if current.contains_table(lifetime) != *governed {
+                    return Err(lifetime_read_unavailable());
+                }
                 if current.relation_event_frontier(table)? != *expected {
                     return Err(Anomaly::new(AnomalyCategory::Unavailable, "rtdb.owned/read-purged", "The held relation was revoked by an ordered erase"));
                 }
@@ -1201,8 +1216,40 @@ impl OwnedReadSession {
         if let Some(scope) = &self.historical {
             self.check_point_purge_floor(relation, id, scope.system_time).await?;
         }
-        let valid = valid_at.map(|at| rtdb_types::Interval::new(at, at.next()?)).transpose()?;
-        rtdb_query::open_owned_point(self.relation_context(relation)?, &self.owner, relation, id, valid, None).await
+        let lifetime = self.lifetime_point_duration(relation).await?;
+        if lifetime.is_some() && valid_at.is_some_and(|valid| valid != self.present.system_time) {
+            return Err(lifetime_read_unavailable());
+        }
+        let valid_at = if lifetime.is_some() { Some(self.present.system_time) } else { valid_at };
+        let valid = valid_at.map(rtdb_types::Interval::at).transpose()?;
+        let guard = self.relation_release_guard_for([relation], true)?;
+        let context = Arc::clone(&self.context).with_owned_read_guard(guard);
+        context.check_cancelled()?;
+        rtdb_query::open_owned_point(context, &self.owner, relation, id, valid, None).await
+    }
+
+    /// The declaration is immutable and present on the same held cut as
+    /// its private relation fence.
+    pub async fn lifetime_point_duration(&self, relation: &rtdb_types::OwnedRelation) -> Result<Option<i64>> {
+        self.admit_access().await?;
+        let database = self.retained_root_context().catalog.database(&self.database)?;
+        let [snapshot] = database.partitions.as_slice() else { return Err(lifetime_read_unavailable()); };
+        let root = relation.root_relation();
+        let marker = root.as_ref().unwrap_or(relation).lifetime_table(&self.owner);
+        if !snapshot.contains_table(&marker) {
+            return Ok(None);
+        }
+        if self.historical.is_some() || root.is_some() {
+            return Err(lifetime_read_unavailable());
+        }
+        let schema = rtdb_query::read_owned_relation_schema(Arc::clone(&self.context), &self.owner, relation)
+            .await?.and_then(|(schema, _)| schema.lifetime_micros())
+            .ok_or_else(lifetime_read_unavailable)?;
+        Ok(Some(schema))
+    }
+
+    pub fn check_live_point_relation(&self, relation: &rtdb_types::OwnedRelation) -> Result<()> {
+        self.relation_release_guard_for([relation], true)?()
     }
 
     /// Reads a business-valid point at an earlier system time certified by its journal.
@@ -1537,6 +1584,11 @@ impl OwnedReadSession {
         }
         self.check()
     }
+}
+
+fn lifetime_read_unavailable() -> Anomaly {
+    Anomaly::new(AnomalyCategory::Unavailable, "rtdb.owned/lifetime-uncovered",
+        "The owned lifetime requires a point at the original store-issued present")
 }
 
 impl Drop for OwnedReadSession {

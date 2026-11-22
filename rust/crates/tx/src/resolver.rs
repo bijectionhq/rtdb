@@ -818,6 +818,15 @@ impl<'a> OpenTransaction<'a> {
         if snapshot.contains_table(&relation.table(owner)) {
             return Err(conflict());
         }
+        if schema.lifetime_micros().is_some() {
+            if !relation.is_root_data() || snapshot.contains_table(&relation.unique_table(owner))
+                || snapshot.contains_table(&relation.capacity_table(owner))
+            {
+                return Err(lifetime_uncovered());
+            }
+            let document = StructFields::from([("_id".into(), Value::Utf8(relation.name().into()))]);
+            self.buffer.put(relation.lifetime_table(owner), document, Interval::ALL)?;
+        }
         self.check_capacity_schema(snapshot.clone(), owner, relation, schema).await?;
         self.check_unique_schema(snapshot, owner, relation, schema).await?;
         let _encoded = self.context.memory.reserve(schema.retained_bytes() * 8 + 4096)?;
@@ -930,6 +939,24 @@ impl<'a> OpenTransaction<'a> {
             if let Operation::Public(TxOp::OwnedDeadline { until }) = operation {
                 if deadline.replace(*until).is_some() {
                     return Err(Anomaly::incorrect("rtdb.owned/duplicate-deadline", "An owned transaction may supply at most one deadline"));
+                }
+            }
+        }
+        let base = self.buffer.base_snapshot();
+        let new_lifetimes: BTreeSet<_> = operations.iter().filter_map(|operation| match operation {
+            Operation::Public(TxOp::OwnedDeclareRelation { relation, schema }) if schema.lifetime_micros().is_some() => Some(relation),
+            _ => None,
+        }).collect();
+        for operation in operations {
+            let Some(relation) = operation.owned_relation() else { continue; };
+            let root = relation.root_relation();
+            let target = root.as_ref().unwrap_or(relation);
+            if new_lifetimes.contains(target) || base.contains_table(&target.lifetime_table(owner)) {
+                match operation {
+                    Operation::Public(TxOp::OwnedDeclareRelation { .. } | TxOp::OwnedInsertDocs { .. }
+                        | TxOp::OwnedCheck { .. })
+                    | Operation::OwnedWriteIids { create_only: true, .. } if root.is_none() => (),
+                    _ => return Err(lifetime_uncovered()),
                 }
             }
         }
@@ -1274,9 +1301,20 @@ impl<'a> OpenTransaction<'a> {
                 continue;
             }
             let Operation::Public(TxOp::OwnedCheck { relation, id, valid_at, expected }) = operation else { continue; };
-            let upper = valid_at.0.checked_add(1).map(Timestamp)
+            let observed = if self.buffer.base_snapshot().contains_table(&relation.lifetime_table(owner)) {
+                let accepted = self.tx_key().system_time;
+                if *valid_at >= accepted {
+                    return Err(lifetime_uncovered());
+                }
+                // Expiration does not publish a new row revision. Certify
+                // visibility again at acceptance, not at the old valid instant.
+                accepted
+            } else {
+                *valid_at
+            };
+            let upper = observed.0.checked_add(1).map(Timestamp)
                 .ok_or_else(|| Anomaly::incorrect("rtdb.owned/invalid-read-instant", "The observation's valid instant has no following microsecond"))?;
-            let actual = self.read_owned_revision(owner, relation, id, Interval::new(*valid_at, upper)?).await?;
+            let actual = self.read_owned_revision(owner, relation, id, Interval::new(observed, upper)?).await?;
             if actual != *expected {
                 return Err(Anomaly::new(AnomalyCategory::Conflict, "rtdb.owned/stale-point", "The owned point observation changed before ordering"));
             }
@@ -1523,6 +1561,7 @@ impl<'a> OpenTransaction<'a> {
             }
             let schema = record.schemas.relation(&root)
                 .ok_or_else(|| Anomaly::incorrect("rtdb.owned/world-undeclared", "World writes require a schema retained from the parent cut"))?;
+            if schema.lifetime_micros().is_some() { return Err(lifetime_uncovered()); }
             schema.require_write_validity(explicit)?;
             for row in documents.rows() {
                 let _scratch = self.context.memory.reserve(Value::document_retained_bytes(row)?
@@ -1547,6 +1586,19 @@ impl<'a> OpenTransaction<'a> {
                     row.get("_valid_from").is_some() || row.get("_valid_to").is_some(),
                 )?;
                 validate_owned_schema(&schema, row)?;
+            }
+            if let Some(lifetime) = schema.lifetime_micros() {
+                if !create_only { return Err(lifetime_uncovered()); }
+                let created = self.tx_key().system_time;
+                let expires = Timestamp(created.0.checked_add(lifetime).ok_or_else(overflow)?);
+                for row in documents.rows() {
+                    let id = crate::source::document_id(row, &self.context.memory)?;
+                    if self.read_owned_revision(owner, relation, &id, Interval::ALL).await?.is_some() {
+                        return Err(insert_exists());
+                    }
+                }
+                return self.put_documents(&table, documents, iids, Some(created), Some(expires),
+                    DocumentWrite::Owned { relation, owner, create_only }).await;
             }
         }
         self.put_documents(&table, documents, iids, from, to, DocumentWrite::Owned { relation, owner, create_only }).await
@@ -1925,6 +1977,10 @@ fn interval(from: Timestamp, to: Timestamp) -> Result<Interval> {
     }
     Interval::new(from, to)
 }
+fn lifetime_uncovered() -> Anomaly {
+    Anomaly::incorrect("rtdb.owned/lifetime-uncovered", "Acceptance-lifetime relations admit only immutable creation and present point reads")
+}
+
 #[derive(Clone, Copy)]
 enum DocumentWrite<'a> { Insert, Put, Owned { relation: &'a rtdb_types::OwnedRelation, owner: &'a str, create_only: bool } }
 

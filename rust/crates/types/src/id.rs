@@ -206,6 +206,7 @@ const OWNED_UNIQUE_PREFIX: &str = ".unique-";
 const OWNED_CAPACITY_PREFIX: &str = ".capacity-";
 const OWNED_FIXED_RANGE_PREFIX: &str = ".fixed-range-";
 const OWNED_PURGE_PREFIX: &str = ".purges-";
+const OWNED_LIFETIME_PREFIX: &str = ".lifetime-";
 const OWNED_PURGE_FLOOR_PREFIX: &str = ".purge-floors-";
 const OWNED_CHANGE_PREFIX: &str = ".changes-";
 
@@ -233,6 +234,10 @@ impl OwnedRelation {
 
     /// Names the obsolete owner-wide marker only to reject pre-cutover history.
     pub fn obsolete_purge_table(owner: &str) -> TableRef { owned_table(owner, ".purges") }
+
+    pub fn lifetime_table(&self, owner: &str) -> TableRef {
+        owned_table(owner, &format!("{OWNED_LIFETIME_PREFIX}{}", self.0))
+    }
 
     pub fn purge_table(&self, owner: &str) -> TableRef { owned_table(owner, &format!("{OWNED_PURGE_PREFIX}{}", self.0)) }
 
@@ -389,6 +394,7 @@ impl TableRef {
             && self.table.split_once('-').is_some_and(|(owner, name)| {
                 owner.len() == 64 && owner.bytes().all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
                     && (matches!(name, OWNED_PATH_CATALOG | OWNED_SEARCH_CATALOG | OWNED_RELATION_CATALOG | OWNED_WORLD_CLOCKS)
+                        || name.strip_prefix(OWNED_LIFETIME_PREFIX).is_some_and(|relation| OwnedRelation::new(relation).is_ok())
                         || name.strip_prefix(OWNED_PURGE_FLOOR_PREFIX).is_some_and(|relation| OwnedRelation::new(relation).is_ok())
                         || name.strip_prefix(OWNED_PURGE_PREFIX).is_some_and(|relation| OwnedRelation::new(relation).is_ok())
                         || name.strip_prefix(OWNED_UNIQUE_PREFIX).is_some_and(|relation| OwnedRelation::new(relation).is_ok())

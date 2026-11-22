@@ -67,6 +67,10 @@
 -- Owned native inserts resolve in the authenticated principal's versioned namespace.
 -- The owner can declare a closed scalar schema before an owned relation has stored data.
 -- An owned create or replacement enforces that schema at the ordering cut.
+-- A creation-lifetime relation declares its immutable acceptance extent before any fact exists.
+-- Its original ordered creation fixes the exclusive expiry and reserves the full identity across that expiry.
+-- A live point uses the store-issued present and reports the fact's exclusive expiry.
+-- Retained, archived and other read routes without lifetime coverage refuse the affected relation.
 -- An acceptance-valid root declaration requires every create, replacement and deletion to begin at its ordered system time and have no valid end.
 -- The declaration is immutable and must precede the first fact.
 -- Source encoding preserves whether an owned field was omitted or explicitly null.

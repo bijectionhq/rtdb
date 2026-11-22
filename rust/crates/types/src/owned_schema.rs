@@ -13,6 +13,8 @@ struct OwnedSchemaWire {
     fields: Vec<Field>,
     #[serde(default, skip_serializing_if = "Validity::is_explicit")]
     validity: Validity,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    lifetime_micros: Option<i64>,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
@@ -155,6 +157,11 @@ impl OwnedSchema {
         }
         let schema: OwnedSchemaWire = serde_json::from_slice(bytes)
             .map_err(|_| invalid("Invalid owned declaration fields or type tags"))?;
+        if schema.lifetime_micros.is_some_and(|lifetime|
+            !(1..=3_155_760_000_000_000).contains(&lifetime) || schema.validity != Validity::Acceptance)
+        {
+            return Err(invalid("Owned creation lifetime requires acceptance validity and a positive bounded duration"));
+        }
         if schema.fields.len() > 128 {
             return Err(invalid("An owned declaration accepts at most 128 fields"));
         }
@@ -208,6 +215,8 @@ impl OwnedSchema {
             }
         })
     }
+
+    pub fn lifetime_micros(&self) -> Option<i64> { self.0.lifetime_micros }
 
     pub fn require_write_validity(&self, explicit: bool) -> Result<()> {
         if explicit && self.0.validity == Validity::Acceptance {

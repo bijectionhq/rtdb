@@ -500,6 +500,11 @@ The final fields are the 22-byte attempt ID, its 32-byte fingerprint, and check-
 The archive owner retains the new cut before ordering. The resolver compares the exact predecessor pin before moving a retained world and checks the original Root head for an explicit forward clock start.
 The response carries the unchanged world ID followed by the transaction ID and system time as big-endian i64.
 
+An owned relation with acceptance validity may additionally declare a positive `lifetime_micros` before its first fact.
+Its source accepts immutable creation only, preserving complete identities after expiry so an old identity cannot be re-created.
+One-shot and held live point reads use the server's ordered present and report a returned row's exclusive expiry as `rtdb.owned.until_micros` in Arrow metadata.
+Other read coordinates and paths refuse this declaration until they can apply its lifetime.
+
 `rtdb.owned.PublishWorldCut.v2` orders one initial retained fork alongside a Root publication at the same source position.
 It takes the v1 fields through the fingerprint and requires an all-zero predecessor handle.
 Mode 0 selects an independently archived cut at the exact original live Root transaction key.
