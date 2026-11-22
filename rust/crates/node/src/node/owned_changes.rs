@@ -146,6 +146,10 @@ impl OwnedReadSession {
         self.merged_change_journals(relations, after, limit).await
     }
 
+    pub fn check_live_change_relations(&self, relations: &[OwnedRelation]) -> Result<()> {
+        self.relation_release_guard_for(relations, true)?()
+    }
+
     async fn merged_change_journals(
         &self, relations: &[OwnedRelation], after: Timestamp, limit: usize,
     ) -> Result<OwnedMergedChanges> {
@@ -158,7 +162,8 @@ impl OwnedReadSession {
             ));
         }
         self.admit_read().await?;
-        let guarded = self.guard_context(Arc::clone(&self.context), relations)?;
+        let guard = self.relation_release_guard_for(relations, true)?;
+        let guarded = Arc::clone(&self.context).with_owned_read_guard(guard);
         let database = self.context.catalog.database(&self.database)?;
         let [snapshot] = database.partitions.as_slice() else {
             return Err(change_feed_uncovered());

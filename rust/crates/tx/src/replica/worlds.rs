@@ -299,7 +299,9 @@ pub(super) fn verify(
             if batch.len() != 1 { return Err(mismatch()); }
             records(batch, key, memory, |row| {
                 let floor = rtdb_types::OwnedLifetimeFloor::decode(row, &relation).map_err(|_| mismatch())?;
-                if floor != rtdb_types::OwnedLifetimeFloor::at(floor.duration, key.system_time).map_err(|_| mismatch())? {
+                floor.check(floor.duration, key.system_time).map_err(|_| mismatch())?;
+                if floor.expired_created_through != rtdb_types::OwnedLifetimeFloor::at(floor.duration, key.system_time)
+                    .map_err(|_| mismatch())?.expired_created_through {
                     return Err(mismatch());
                 }
                 Ok(())

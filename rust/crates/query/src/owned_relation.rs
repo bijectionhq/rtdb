@@ -250,7 +250,7 @@ pub async fn read_owned_lifetime_floor(
     if owner.is_empty() || !relation.is_root_data() { return Err(malformed()); }
     let id = EntityId::String(relation.name().into());
     let memory = Arc::clone(&context.memory);
-    let columns = ["_id", "duration", "expired_created_through"];
+    let columns = ["_id", "duration", "expired_created_through", "swept_present_through"];
     let Some(mut cursor) = open_owned_table_point(
         context, relation.lifetime_table(owner), id.iid(), Some(&id), None, Some(&columns), false,
     ).await? else { return Err(malformed()); };

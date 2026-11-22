@@ -1855,6 +1855,18 @@ impl NativeSession {
         Ok(self.service.database()?.await_authority.codec().map(|codec| codec.scope()))
     }
 
+    /// Trusted maintenance entry. The maintenance owner supplies a replay
+    /// floor certified by its retention authority, never a guest coordinate.
+    pub async fn sweep_owned_expired(
+        &mut self, relation: rtdb_types::OwnedRelation, id: rtdb_types::EntityId,
+        created: Timestamp, replay_floor: Timestamp, deadline: Timestamp,
+    ) -> Result<TransactionResult> {
+        self.state.execute_tx(vec![
+            TxOp::OwnedDeadline { until: deadline },
+            TxOp::OwnedSweepExpired { relation, id, created, replay_floor },
+        ], Default::default()).await
+    }
+
     pub async fn register_owned_world_checked(
         &mut self, record: &rtdb_types::OwnedWorld, fork: OwnedWorldFork,
     ) -> Result<TransactionResult> {

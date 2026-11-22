@@ -1498,7 +1498,7 @@ impl Service {
         let page = held.snapshot.changes(&relation, Timestamp(i64::from_be_bytes(*after)), usize::from(u16::from_be_bytes(*limit)))
             .await.map_err(status)?;
         let reply = self.owned_changes_reply(&page, held.snapshot.present().system_time)?;
-        held.snapshot.check_relation(&relation).map_err(status)?;
+        held.snapshot.check_live_change_relations(std::slice::from_ref(&relation)).map_err(status)?;
         Ok(reply)
     }
 
@@ -1515,7 +1515,7 @@ impl Service {
         let page = held.snapshot.merged_changes(&relations, after, limit)
             .await.map_err(status)?;
         let reply = self.owned_merged_changes_reply(&page, held.snapshot.present().system_time)?;
-        held.snapshot.check_relations(&relations).map_err(status)?;
+        held.snapshot.check_live_change_relations(&relations).map_err(status)?;
         Ok(reply)
     }
 
