@@ -1010,6 +1010,7 @@ impl OwnedReadSession {
         Ok(OwnedForkCut {
             basis: self.system_time(),
             live: self.historical.is_none().then_some(self.present),
+            issued_on: self.present,
             publication: false,
             until: self.fork_until,
             scope,
@@ -1571,6 +1572,7 @@ impl OwnedWorldWitness {
 pub struct OwnedForkCut {
     basis: Timestamp,
     live: Option<TransactionKey>,
+    issued_on: TransactionKey,
     publication: bool,
     until: Timestamp,
     scope: rtdb_types::PlacedAttemptScope,
@@ -1582,6 +1584,8 @@ impl OwnedForkCut {
     pub fn is_publication(&self) -> bool { self.publication }
     pub fn matches_basis(&self, basis: TransactionKey) -> bool {
         self.basis == basis.system_time && self.live.is_none_or(|live| live == basis)
+            && basis.tx_id <= self.issued_on.tx_id
+            && ((basis.tx_id == self.issued_on.tx_id) == (basis.system_time == self.issued_on.system_time))
     }
     pub fn until(&self) -> Timestamp { self.until }
     pub fn scope(&self) -> rtdb_types::PlacedAttemptScope { self.scope }

@@ -22,6 +22,27 @@ use crate::deployment::{CellStorage, Role, database_config, ensemble_servers, jo
 use crate::lease::MemberLease;
 use crate::hosted_recovery::{ReplicaTrimPlan, replay_start};
 
+enum SuffixCut<'a> {
+    Tip(TransactionKey),
+    HeldPublication(&'a rtdb_node::OwnedForkCut),
+}
+
+impl SuffixCut<'_> {
+    fn time(&self) -> rtdb_types::Timestamp {
+        match self {
+            Self::Tip(key) => key.system_time,
+            Self::HeldPublication(cut) => cut.basis(),
+        }
+    }
+
+    fn matches(&self, key: TransactionKey) -> bool {
+        match self {
+            Self::Tip(expected) => *expected == key,
+            Self::HeldPublication(cut) => cut.matches_basis(key),
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct AgentOptions {
     pub storage: CellStorage,
@@ -563,6 +584,22 @@ impl NodeAgent {
         &self, name: &str, deployment: uuid::Uuid, lease: uuid::Uuid,
         capture: uuid::Uuid, basis: TransactionKey, expires_at_ms: i64,
     ) -> Result<Response> {
+        self.pin_suffix_at(name, deployment, lease, capture, SuffixCut::Tip(basis), expires_at_ms)
+            .await.map(|pin| Response::CheckpointSuffixPinned { pin })
+    }
+
+    pub(crate) async fn pin_held_fork_suffix(
+        &self, name: &str, deployment: uuid::Uuid, lease: uuid::Uuid,
+        capture: uuid::Uuid, cut: &rtdb_node::OwnedForkCut, expires_at_ms: i64,
+    ) -> Result<CheckpointSuffixPin> {
+        self.pin_suffix_at(name, deployment, lease, capture, SuffixCut::HeldPublication(cut), expires_at_ms)
+            .await
+    }
+
+    async fn pin_suffix_at(
+        &self, name: &str, deployment: uuid::Uuid, lease: uuid::Uuid,
+        capture: uuid::Uuid, cutoff: SuffixCut<'_>, expires_at_ms: i64,
+    ) -> Result<CheckpointSuffixPin> {
         const MAX_PIN_MS: i64 = 60_000;
         const MAX_PINS: usize = 32;
         let unavailable = || Anomaly::new(
@@ -584,13 +621,21 @@ impl NodeAgent {
             {
                 return Err(unavailable());
             }
+            if let SuffixCut::HeldPublication(cut) = &cutoff {
+                let expected = rtdb_types::PlacedAttemptScope::new(&record.stream("replica"), record.epoch)?;
+                if !cut.is_publication() || cut.scope() != expected
+                    || expires_at_ms > cut.until().0.div_euclid(1000)
+                {
+                    return Err(unavailable());
+                }
+            }
             crate::archive::require_capture_open(record, capture)?;
             let archived = record.checkpoint_captures.get(&capture).filter(|archived|
                 archived.media_bound && archived.incarnation == record.incarnation
                 && archived.log_epoch == record.log_epoch && archived.checkpoint.root_sha256.is_some()
             ).ok_or_else(unavailable)?;
             let checkpoint = archived.checkpoint;
-            if checkpoint.boundary < 0 || basis.system_time.0 <= checkpoint.system_time
+            if checkpoint.boundary < 0 || cutoff.time().0 <= checkpoint.system_time
                 || record.replica_anchor.as_ref().is_some_and(|anchor| anchor.root_incarnation != record.incarnation)
                 || replay_start(record, checkpoint.boundary).is_err()
             {
@@ -602,12 +647,18 @@ impl NodeAgent {
         let (checkpoint, manifest_sha256) = validate(&record)?;
         if let Some(prior) = record.checkpoint_suffix_pins.get(&lease) {
             if prior.capture == capture && prior.manifest_sha256 == manifest_sha256
-                && prior.checkpoint == checkpoint && prior.basis == basis && prior.expires_at_ms == expires_at_ms
+                && prior.checkpoint == checkpoint && cutoff.matches(prior.basis)
+                && (match &cutoff {
+                    SuffixCut::Tip(_) => prior.expires_at_ms == expires_at_ms,
+                    SuffixCut::HeldPublication(_) => prior.expires_at_ms > now_ms() && prior.expires_at_ms <= expires_at_ms,
+                })
                 && prior.incarnation == record.incarnation && prior.log_epoch == record.log_epoch && prior.writer_epoch == epoch
             {
-                return Ok(Response::CheckpointSuffixPinned { pin: prior.clone() });
+                return Ok(prior.clone());
             }
-            return Err(unavailable());
+            if matches!(&cutoff, SuffixCut::Tip(_)) || prior.archive_sha256.is_some() || prior.expires_at_ms > now_ms() {
+                return Err(unavailable());
+            }
         }
         let database = self.node.catalog().database(name)?;
         let before = database.status();
@@ -616,7 +667,12 @@ impl NodeAgent {
         let installed = after.installed.filter(|installed|
             matches!(after.role, DriverRole::Leading(_)) && before.role == after.role
             && before.installed == Some(*installed) && installed.source == applied.source_position
-            && applied.tx_key == Some(basis)
+            && applied.tx_key.is_some_and(|head| {
+                match &cutoff {
+                    SuffixCut::Tip(basis) => head == *basis,
+                    SuffixCut::HeldPublication(_) => head.system_time >= cutoff.time(),
+                }
+            })
         ).ok_or_else(unavailable)?;
         let log_epoch = StorageEpoch(record.log_epoch);
         let replica_through = installed.replica.after_offset(log_epoch);
@@ -635,8 +691,32 @@ impl NodeAgent {
         };
         let first_replica = checkpoint.boundary.checked_add(1).ok_or_else(unavailable)?;
         let remaining = expires_at_ms.saturating_sub(now_ms()).max(0) as u64;
-        let proof = tokio::time::timeout(Duration::from_millis(remaining),
-            rtdb_logkeeper::certify_committed_range(&stream, first_replica, replica_through)
+        let certify = async {
+            let proof = rtdb_logkeeper::certify_committed_range(&stream, first_replica, replica_through).await?;
+            if let SuffixCut::Tip(basis) = &cutoff {
+                return Ok::<_, Anomaly>((*basis, replica_through, source_through, proof));
+            }
+            // Discovery reads a bounded quorum-certified applied interval. Its
+            // target is the original held publication, not the driver tip.
+            let _charge = self.node.memory().reserve(crate::archive::MAX_SUFFIX_BYTES * 2)?;
+            let entries = rtdb_logkeeper::copy_certified_range(
+                &stream, &proof, crate::archive::MAX_SUFFIX_BYTES, crate::archive::MAX_SUFFIX_ENTRIES,
+            ).await?;
+            let SuffixCut::HeldPublication(cut) = &cutoff else { return Err(unavailable()); };
+            let (basis, replica, source) = crate::archive::find_held_publication(
+                &entries, cut, epoch, log_epoch,
+            )?;
+            if source <= checkpoint.source || source > source_through || replica > replica_through {
+                return Err(unavailable());
+            }
+            let prefix = rtdb_logkeeper::certify_committed_range(&stream, first_replica, replica).await?;
+            let count = usize::try_from(replica - first_replica + 1).map_err(|_| unavailable())?;
+            let prefix_entries = entries.get(..count).ok_or_else(unavailable)?;
+            rtdb_logkeeper::verify_certified_range(&prefix, prefix_entries)?;
+            Ok((basis, replica, source, prefix))
+        };
+        let (basis, replica_through, source_through, proof) = tokio::time::timeout(
+            Duration::from_millis(remaining), certify,
         ).await.map_err(|_| unavailable())??;
         if proof.interval != [first_replica, replica_through] { return Err(unavailable()); }
         let pin = CheckpointSuffixPin {
@@ -654,7 +734,12 @@ impl NodeAgent {
                 return Err(unavailable());
             }
             if let Some(prior) = current.checkpoint_suffix_pins.get(&lease) {
-                return if prior == &pin { Ok(()) } else { Err(unavailable()) };
+                if prior == &pin { return Ok(()); }
+                if matches!(&cutoff, SuffixCut::Tip(_)) || prior.archive_sha256.is_some()
+                    || prior.expires_at_ms > now_ms()
+                {
+                    return Err(unavailable());
+                }
             }
             let now = now_ms();
             if expires_at_ms <= now { return Err(unavailable()); }
@@ -663,7 +748,7 @@ impl NodeAgent {
             current.checkpoint_suffix_pins.insert(lease, pin.clone());
             Ok(())
         }).await?;
-        Ok(Response::CheckpointSuffixPinned { pin })
+        Ok(pin)
     }
 
     pub async fn park(&self, name: &str) -> Result<Response> { self.park_holding(name, None).await }

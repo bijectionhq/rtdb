@@ -27,9 +27,35 @@ use crate::{
 };
 use rtdb_storage::ObjectStore;
 
-const MAX_BYTES: usize = 8 << 20;
+pub(crate) const MAX_SUFFIX_BYTES: usize = 8 << 20;
 pub(crate) const MAX_SUFFIX_ENTRIES: usize = 4096;
 const FORMAT: &[u8] = b"rtdb.replica-suffix.v1\0";
+
+/// Resolve the original accepted publication to its complete transaction and
+/// journal cut inside a previously quorum-certified applied interval.
+pub(crate) fn find_held_publication(
+    entries: &[ArchivedReplicaEntry], cut: &rtdb_node::OwnedForkCut,
+    writer_epoch: u64, log_epoch: StorageEpoch,
+) -> Result<(TransactionKey, i64, i64)> {
+    let mut selected = None;
+    for entry in entries {
+        let Some(ReplicaBody::ResolvedTx(row)) = ReplicaFrame::decode(&entry.payload)?.message
+        else { continue; };
+        if row.system_time_micros != Some(cut.basis().0) { continue; }
+        let basis = TransactionKey {
+            tx_id: TxId(row.tx_id.ok_or_else(suffix_unavailable)?),
+            system_time: cut.basis(),
+        };
+        let source = SourcePosition(row.src_msg_id.ok_or_else(suffix_unavailable)?).after_offset(log_epoch);
+        if entry.epoch != writer_epoch || !row.committed.unwrap_or(false)
+            || !cut.matches_basis(basis) || row.db_op.is_some() || row.external_source_token.is_some()
+            || source < 0 || selected.replace((basis, entry.lsn, source)).is_some()
+        {
+            return Err(suffix_unavailable());
+        }
+    }
+    selected.ok_or_else(suffix_unavailable)
+}
 
 pub(crate) async fn capture(
     directory: Arc<dyn Directory>, archive: &CellStorage, keys: &dyn KeyService,
@@ -72,7 +98,7 @@ pub(crate) async fn capture(
                     let stream = administration_stream(directory.as_ref(), &record, 4 << 20).await?;
                     let remaining = pin.expires_at_ms.saturating_sub(now_ms()).max(0) as u64;
                     let entries = tokio::time::timeout(Duration::from_millis(remaining),
-                        rtdb_logkeeper::copy_certified_range(&stream, &certificate, MAX_BYTES, MAX_SUFFIX_ENTRIES),
+                        rtdb_logkeeper::copy_certified_range(&stream, &certificate, MAX_SUFFIX_BYTES, MAX_SUFFIX_ENTRIES),
                     ).await.map_err(|_| suffix_unavailable())??;
                     validate_records(&entries, pin, &certificate, &catalog)?;
                     let sealed = cipher.seal_deterministic(object.as_str(), &encode_records(&entries)?)?;
@@ -125,7 +151,7 @@ pub(super) async fn apply_archived(
     let object = key(&format!("checkpoint-captures/{deployment}/{}/replica-suffix/{suffix}.v1", pin.capture))?;
     let expected = pin.archive_sha256.as_deref().ok_or_else(suffix_unavailable)?;
     let bytes = bucket.head_fresh(&object).await?.size;
-    if bytes > MAX_BYTES as u64 + 1024 { return Err(suffix_unavailable()); }
+    if bytes > MAX_SUFFIX_BYTES as u64 + 1024 { return Err(suffix_unavailable()); }
     let charge = usize::try_from(bytes).ok().and_then(|size| size.checked_mul(4))
         .and_then(|size| size.checked_add(4096 + MAX_SUFFIX_ENTRIES * 128)).ok_or_else(suffix_unavailable)?;
     let _charge = memory.reserve(charge)?;
@@ -189,7 +215,7 @@ fn admit<'a>(
 
 async fn read_sealed(bucket: &dyn ObjectStore, object: &rtdb_storage::ObjectKey, expected: &str) -> Result<Bytes> {
     let size = bucket.head_fresh(object).await?.size;
-    if size > MAX_BYTES as u64 + 1024 { return Err(suffix_unavailable()); }
+    if size > MAX_SUFFIX_BYTES as u64 + 1024 { return Err(suffix_unavailable()); }
     let sealed = bucket.get_range(object, 0..size).await?;
     if sealed.len() as u64 != size || digest(&sealed) != expected { return Err(suffix_unavailable()); }
     Ok(sealed)
@@ -203,13 +229,13 @@ fn encode_records(entries: &[ArchivedReplicaEntry]) -> Result<Vec<u8>> {
     let mut out = FORMAT.to_vec();
     for entry in entries {
         entry.encode_length_delimited(&mut out).map_err(|_| suffix_unavailable())?;
-        if out.len() > MAX_BYTES { return Err(suffix_unavailable()); }
+        if out.len() > MAX_SUFFIX_BYTES { return Err(suffix_unavailable()); }
     }
     Ok(out)
 }
 
 fn decode(mut bytes: Bytes) -> Result<Vec<ArchivedReplicaEntry>> {
-    if bytes.len() > MAX_BYTES || !bytes.starts_with(FORMAT) { return Err(suffix_unavailable()); }
+    if bytes.len() > MAX_SUFFIX_BYTES || !bytes.starts_with(FORMAT) { return Err(suffix_unavailable()); }
     bytes = bytes.slice(FORMAT.len()..);
     let mut entries = Vec::new();
     while !bytes.is_empty() {

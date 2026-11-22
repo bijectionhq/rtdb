@@ -137,6 +137,47 @@ async fn copy_published_fork_input(
     Ok(operation)
 }
 
+async fn copy_fork_suffix(
+    directory: Arc<dyn Directory>,
+    archive: &CellStorage,
+    keys: &dyn KeyService,
+    hosted_task: Option<&HostedTask>,
+    agent: &crate::agent::NodeAgent,
+    deployment: Uuid,
+    source: &DeploymentRecord,
+    cut: &rtdb_node::OwnedForkCut,
+    deadline: Timestamp,
+) -> Result<(Uuid, Option<Uuid>)> {
+    if !cut.is_publication() || deadline <= now() {
+        return Err(OwnedWorld::unavailable());
+    }
+    let binding = archive_binding(archive)?;
+    let capture = source.checkpoint_captures.iter().filter(|(capture, base)| {
+        base.archive == binding && base.media_bound && base.manifest_sha256.is_some()
+            && base.checkpoint.root_sha256.is_some() && base.incarnation == source.incarnation
+            && base.log_epoch == source.log_epoch && base.checkpoint.system_time < cut.basis().0
+            && require_capture_open(source, **capture).is_ok()
+            && crate::hosted_recovery::replay_start(source, base.checkpoint.boundary).is_ok()
+    }).max_by_key(|(_, base)| base.checkpoint.boundary)
+        .map(|(capture, _)| *capture).ok_or_else(OwnedWorld::unavailable)?;
+
+    let mut digest = ring::digest::Context::new(&ring::digest::SHA256);
+    digest.update(b"rtdb.world-fork-suffix.v1\0");
+    digest.update(deployment.as_bytes());
+    digest.update(capture.as_bytes());
+    digest.update(&source.incarnation.to_be_bytes());
+    digest.update(&source.log_epoch.to_be_bytes());
+    digest.update(&cut.basis().0.to_be_bytes());
+    let mut id = [0; 16];
+    id.copy_from_slice(&digest.finish().as_ref()[..16]);
+    let suffix = Uuid::from_bytes(id);
+    let expires_at_ms = deadline.0.div_euclid(1000)
+        .min(rtdb_directory::now_ms().saturating_add(60_000));
+    let pin = agent.pin_held_fork_suffix(&source.name, deployment, suffix, capture, cut, expires_at_ms).await?;
+    replica_suffix::capture(directory, archive, keys, hosted_task, deployment, suffix, pin).await?;
+    Ok((capture, Some(suffix)))
+}
+
 fn world_record(
     pin: Uuid,
     retained: &CheckpointWorldRetention,
@@ -160,7 +201,7 @@ fn world_record(
 /// Forks an independently archived, exact parent cut. The directory pin
 /// precedes the ordered assertion, so a partial fork can only retain media.
 pub(crate) async fn fork_checkpoint_world_selected(
-    directory: Arc<dyn Directory>, archive: &CellStorage, capture_source: Option<&CellStorage>, keys: &dyn KeyService, hosted_task: Option<&HostedTask>,
+    directory: Arc<dyn Directory>, archive: &CellStorage, capture_source: Option<&CellStorage>, agent: Option<&crate::agent::NodeAgent>, keys: &dyn KeyService, hosted_task: Option<&HostedTask>,
     session: &mut NativeSession, deployment_id: Uuid, capture: Uuid, suffix: Option<Uuid>,
     until: Timestamp, resources: CheckpointReadResources<'_>, fork: rtdb_node::OwnedWorldFork,
 ) -> Result<(Uuid, TransactionKey)> {
@@ -192,13 +233,23 @@ pub(crate) async fn fork_checkpoint_world_selected(
         } else {
             let storage = capture_source.ok_or_else(OwnedWorld::unavailable)?;
             let deadline = until.min(fork.deadline).min(fork.cut.until());
-            let capture = copy_published_fork_input(
-                Arc::clone(&directory), storage, archive, keys, hosted_task, deployment_id,
-                &source, &fork.cut, deadline,
-            ).await?;
+            let selected = if source.checkpoint.is_some_and(|checkpoint|
+                checkpoint.system_time == fork.cut.basis().0 && checkpoint.root_sha256.is_some()
+            ) {
+                let capture = copy_published_fork_input(
+                    Arc::clone(&directory), storage, archive, keys, hosted_task, deployment_id,
+                    &source, &fork.cut, deadline,
+                ).await?;
+                (capture, None)
+            } else {
+                copy_fork_suffix(
+                    Arc::clone(&directory), archive, keys, hosted_task,
+                    agent.ok_or_else(OwnedWorld::unavailable)?, deployment_id, &source, &fork.cut, deadline,
+                ).await?
+            };
             source = directory.deployment(&deployment).await?.ok_or_else(OwnedWorld::unavailable)?;
             admit_session(session, &source, &owner)?;
-            (capture, None)
+            selected
         }
     } else {
         (capture, suffix)

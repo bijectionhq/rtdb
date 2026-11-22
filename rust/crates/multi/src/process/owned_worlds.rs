@@ -16,6 +16,7 @@ use crate::{
 
 pub(super) struct PlacedWorldHost {
     pub(super) directory: Arc<dyn Directory>,
+    pub(super) agent: Arc<super::FenceSlot>,
     pub(super) capture_source: Option<CellStorage>,
     pub(super) archive: CellStorage,
     pub(super) keys: Arc<dyn KeyService>,
@@ -68,8 +69,9 @@ impl OwnedWorldHost for PlacedWorldHost {
                 node: &self.options, memory: call.node.memory(),
                 cache: Arc::clone(call.node.cache_budget()), cancellation: call.cancellation,
             };
+            let agent = self.agent.0.get().and_then(std::sync::Weak::upgrade);
             fork_checkpoint_world_selected(Arc::clone(&self.directory), &self.archive,
-                self.capture_source.as_ref(), self.keys.as_ref(),
+                self.capture_source.as_ref(), agent.as_deref(), self.keys.as_ref(),
                 self.hosted_task.as_ref(), call.session, deployment, capture, suffix, until, resources, fork).await
         })
     }

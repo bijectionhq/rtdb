@@ -116,6 +116,7 @@ pub async fn start_node(directory: Arc<dyn Directory>, mut settings: NodeSetting
             options.owned_relations = true;
             Arc::new(owned_worlds::PlacedWorldHost {
                 directory: Arc::clone(&directory),
+                agent: Arc::clone(&fence),
                 capture_source: settings.agent.world_archive.as_ref().map(|_| settings.agent.storage.clone()),
                 archive: settings.agent.world_archive.clone().unwrap_or_else(|| settings.agent.storage.clone()),
                 keys: Arc::clone(&settings.keys),
