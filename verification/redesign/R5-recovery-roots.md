@@ -108,6 +108,17 @@ An unversioned member relies on the immutable-object contract.
 This observation is local to preparation. Holding it across reclaim requires a durable admission against the physical owner and a shared ordering with authorization at every corresponding collection entry point.
 A production proof should cover the hold and retirement decisions, with directory compare-and-replace and provider version semantics stated as premises.
 
+### Serving recovery inventory
+
+Hosted publication derives the complete replay inventory from the authenticated root and table blocks.
+It observes each member's length and physical version where the provider exposes one.
+The directory commits to that ordered inventory together with the root digest, replica epoch and first required replica offset.
+An unversioned member relies on the immutable-object contract.
+Startup verifies the same commitment under its existing metadata and replay admission.
+Flush, park and idle suspension share the writer's publication path.
+Prefix trim requires the commitment, and a holder can certify a previously published cut in place.
+A transfer or repair verifies its own copy and clears the commitment made against the previous storage view.
+
 ### Admission across physical owners
 
 An inherited pack belongs to the authority responsible for the physical object reported in the body response.

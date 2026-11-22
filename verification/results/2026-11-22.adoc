@@ -277,3 +277,19 @@ The reconciled native build on `54fd1569d5` passed 241 targeted tests, with one 
 The JVM suite on the terminal publication tree recorded 3,198 standard, 3,348 property and 5,629 integration passes, with one PostgreSQL slot-recreation skip.
 The root suite ran separately after a discovery failure, and the property and integration results came from the preceding full execution.
 The final combined Gradle invocation accepted all task results as current.
+
+== R5 · Serving recovery inventory and prefix authorization
+
+Hosted flush, park and idle suspension publish the replay inventory commitment with the checkpoint cut.
+The reaper requires that commitment before redeeming a trie release.
+A cold snapshot refuses a mismatched commitment before opening the block.
+The native copy fixture detects an absent retained L0 member, an absent shared artefact and a replacement provider version.
+The scoped native run passed 294 cases and five doctests, with six ignored cases.
+DynamoDB Local passed all 35 directory cases with the binary parked format enabled.
+The versioned loopback S3 tests recovered across worker loss and across an interrupted checkpoint restore.
+
+TLC explored 404 distinct states for the trim protocol.
+The controls reject publishing an incomplete inventory, authorizing a trim from a legacy checkpoint, ignoring older recovery holds and admitting against the physical floor after a stronger trim authorization.
+The reachability case opens a recovery after a trim.
+Allium check and analysis added no diagnostics to the edited specifications.
+link:../tla/ReplicaTrimAdmission.tla[Trim admission model]

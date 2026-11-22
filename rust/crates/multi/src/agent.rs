@@ -547,9 +547,8 @@ impl NodeAgent {
         let deadline = tokio::time::Instant::now() + self.options.activation_timeout;
         let block = self.flush_and_adopt(&database, &id, epoch, self.options.activation_timeout).await?;
         let missing = || Anomaly::fault("rtdb.multi/flush-checkpoint", format!("{name} did not adopt a block in its current log epoch"));
-        tokio::time::timeout_at(deadline, self.publish_checkpoint(&id, epoch, &block)).await.map_err(|_| {
-            Anomaly::new(AnomalyCategory::Unavailable, "rtdb.multi/checkpoint-timeout", format!("The checkpoint for {name} was not published in time"))
-        })??.ok_or_else(missing)?;
+        tokio::time::timeout_at(deadline, self.publish_checkpoint(&id, epoch, &database, &block)).await
+            .map_err(|_| checkpoint_timeout(name))??.ok_or_else(missing)?;
         Ok(Response::Flushed { block: block.block_index().0 })
     }
 
@@ -592,16 +591,16 @@ impl NodeAgent {
             }
             Some(pause)
         } else { None };
-        let adopted = database.as_ref().and_then(|database| database.status().adopted_block);
+        if let Some(database) = &database
+            && let Some(block) = database.status().adopted_block
+        {
+            tokio::time::timeout_at(deadline, self.publish_checkpoint(&id, epoch, database, &block)).await
+                .map_err(|_| checkpoint_timeout(name))??;
+        }
         for _ in 0..8 {
             let Some(record) = self.directory.deployment(&id).await? else { break };
             if !is_requested(&record) { return Err(stale_handoff(name)); }
-            let Some(mut parked) = park(&record, &self.member(), epoch) else { break };
-            if let Some(checkpoint) = adopted.as_deref().and_then(|block| checkpoint_for_block(block, StorageEpoch(record.log_epoch)))
-                && record.checkpoint.is_none_or(|previous| previous.block < checkpoint.block)
-            {
-                parked.checkpoint = Some(checkpoint);
-            }
+            let Some(parked) = park(&record, &self.member(), epoch) else { break };
             if let Cas::Applied(_) = self.directory.replace_deployment(parked, record.version).await? {
                 self.stop_serving(name).await;
                 drop(write_pause);
@@ -696,17 +695,14 @@ impl NodeAgent {
             .map_err(|_| Anomaly::new(AnomalyCategory::Unavailable, "rtdb.multi/suspend-drain-timeout", "The holder could not drain its admitted writes in time"))??;
         let block = self.flush_and_adopt(&database, &expected.id, expected.epoch,
             deadline.saturating_duration_since(tokio::time::Instant::now())).await?;
+        tokio::time::timeout_at(deadline, self.publish_checkpoint(&expected.id, expected.epoch, &database, &block)).await
+            .map_err(|_| checkpoint_timeout(name))??;
         for _ in 0..8 {
             if !unchanged() { return Ok(()); }
             let Some(record) = self.directory.deployment(&expected.id).await? else { return Ok(()) };
             let now = now_ms();
             let last_activity = now.saturating_sub(last_touch.elapsed().as_millis().min(i64::MAX as u128) as i64);
-            let Some(mut suspended) = suspend_holding(&record, &member, expected.epoch, now, last_activity) else { return Ok(()) };
-            if let Some(checkpoint) = checkpoint_for_block(&block, StorageEpoch(record.log_epoch))
-                && record.checkpoint.is_none_or(|previous| previous.block < checkpoint.block)
-            {
-                suspended.checkpoint = Some(checkpoint);
-            }
+            let Some(suspended) = suspend_holding(&record, &member, expected.epoch, now, last_activity) else { return Ok(()) };
             if !unchanged() { return Ok(()); }
             if let Cas::Applied(suspended) = self.directory.replace_deployment(suspended, record.version).await? {
                 if let Some(deadline) = self.resident_deadline(&suspended) {
@@ -875,21 +871,36 @@ impl NodeAgent {
         Ok(Response::Published { position: position.0 })
     }
 
-    async fn publish_checkpoint(&self, id: &str, epoch: u64, block: &BlockCatalog) -> Result<Option<(DeploymentRecord, Checkpoint)>> {
+    async fn publish_checkpoint(&self, id: &str, epoch: u64, database: &Database, block: &BlockCatalog) -> Result<Option<(DeploymentRecord, Checkpoint)>> {
         let member = self.member();
         let deposed = || Anomaly::new(AnomalyCategory::Unavailable, rtdb_node::NOT_HELD, "The holder changed before publishing its checkpoint");
         let mut record = self.directory.deployment(id).await?.ok_or_else(&deposed)?;
+        let log_epoch = StorageEpoch(record.log_epoch);
+        let Some(checkpoint) = checkpoint_for_block(block, log_epoch) else { return Ok(None); };
+        let mut manifest = None;
         for _ in 0..8 {
-            if record.epoch != epoch || record.holder.as_ref() != Some(&member) { return Err(deposed()); }
-            let Some(checkpoint) = checkpoint_for_block(block, StorageEpoch(record.log_epoch)) else { return Ok(None); };
+            if record.epoch != epoch || record.holder.as_ref() != Some(&member) || record.log_epoch != log_epoch.0 {
+                return Err(deposed());
+            }
             if let Some(published) = record.checkpoint {
                 if published.block == checkpoint.block && published.root_sha256.is_some() && published != checkpoint {
                     return Err(Anomaly::fault("rtdb.multi/checkpoint-receipt", "The adopted checkpoint disagrees with the directory receipt"));
                 }
-                if published.block >= checkpoint.block { return Ok(Some((record, checkpoint))); }
+                if published.block > checkpoint.block || (published.block == checkpoint.block && record.recovery_manifest_sha256.is_some()) {
+                    return Ok(Some((record, checkpoint)));
+                }
             }
+            let digest = match manifest {
+                Some(digest) => digest,
+                None => {
+                    let digest = crate::archive::recovery_manifest_sha256(database.object_store().as_ref(), checkpoint, log_epoch).await?;
+                    manifest = Some(digest);
+                    digest
+                }
+            };
             let mut next = record.clone();
             next.checkpoint = Some(checkpoint);
+            next.recovery_manifest_sha256 = Some(digest);
             match self.directory.replace_deployment(next, record.version).await? {
                 Cas::Applied(stored) => return Ok(Some((stored, checkpoint))),
                 Cas::Conflict(Some(current)) => record = current,
@@ -910,10 +921,11 @@ impl NodeAgent {
             .map(|holding| holding.trimmed_through.unwrap_or(-1));
         let Some(trimmed_through) = trimmed_through else { return; };
         let needs_trim = trimmed_through < checkpoint.boundary - 1;
-        let needs_publication = current.checkpoint.is_none_or(|published| published.block < checkpoint.block);
+        let needs_publication = current.checkpoint.is_none_or(|published| published.block < checkpoint.block
+            || (published.block == checkpoint.block && current.recovery_manifest_sha256.is_none()));
         if !needs_publication && !needs_trim { return; }
-        let Ok(Some((mut record, _))) = self.publish_checkpoint(&current.id, epoch, &block).await else { return; };
-        if !needs_trim { return; }
+        let Ok(Some((mut record, _))) = self.publish_checkpoint(&current.id, epoch, &database, &block).await else { return; };
+        if !needs_trim || record.recovery_manifest_sha256.is_none() { return; }
         let Some(published) = record.checkpoint else { return; };
         let boundary = published.boundary.min(checkpoint.boundary);
         let oldest_replay = record.storage_regions.values().filter_map(StorageRegion::first_required_replica).min().unwrap_or(boundary);
@@ -1172,6 +1184,10 @@ fn short_handoff_tail(database: &Database, log_epoch: StorageEpoch) -> bool {
 
 fn stale_handoff(name: &str) -> Anomaly {
     Anomaly::new(AnomalyCategory::Conflict, "rtdb.multi/stale-handoff", format!("The requested holding of {name} has changed"))
+}
+
+fn checkpoint_timeout(name: &str) -> Anomaly {
+    Anomaly::new(AnomalyCategory::Unavailable, "rtdb.multi/checkpoint-timeout", format!("The checkpoint for {name} was not published in time"))
 }
 
 #[async_trait]

@@ -719,6 +719,7 @@ mod tests {
         reopened.epoch = 17;
         reopened.version = 65;
         reopened.checkpoint = Some(crate::Checkpoint { block: 87, boundary: 34_567, source: 31_234, system_time: 1_795_224_375_000_000, root_sha256: Some([42; 32]) });
+        reopened.recovery_manifest_sha256 = Some([43; 32]);
         reopened.storage_namespaces = Some(crate::StorageNamespaces { objects: uuid::Uuid::new_v4(), keys: [42; 32] });
         let mut hosted = reopened.clone();
         hosted.replica_journals.extend(["10.42.0.10:7654", "10.42.1.10:7654", "10.42.2.10:7654"].map(rtdb_types::JournalEndpoint::from));
@@ -737,11 +738,13 @@ mod tests {
             println!("{name}: packed item {} bytes, JSON item {} bytes", item_size(&compact), item_size(&json));
             let mut unreceipted = record.clone();
             if let Some(checkpoint) = &mut unreceipted.checkpoint { checkpoint.root_sha256 = None; }
+            unreceipted.recovery_manifest_sha256 = None;
             let unreceipted = deployment_item(&unreceipted, true).unwrap();
             let legacy_size = item_size(&unreceipted);
             assert!(legacy_size < 300);
             let digest_bytes = if record.checkpoint.is_some_and(|checkpoint| checkpoint.root_sha256.is_some()) { 34 } else { 0 };
-            assert_eq!(item_size(&compact), legacy_size + digest_bytes);
+            let manifest_bytes = if record.recovery_manifest_sha256.is_some() { 34 } else { 0 };
+            assert_eq!(item_size(&compact), legacy_size + digest_bytes + manifest_bytes);
         }
 
         reopened.org = "other".into();

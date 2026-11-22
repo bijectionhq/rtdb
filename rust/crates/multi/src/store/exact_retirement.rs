@@ -7,7 +7,7 @@ use rtdb_storage::{Error, ObjectKey, ObjectStore};
 use rtdb_types::{Anomaly, AnomalyCategory, BlockIndex, PhysicalObjectVersion, Result, S3TombstoneTarget, TerminalObjectPublication};
 use uuid::Uuid;
 
-use super::{GARBAGE_DIRECTORY, StoredRelease, can_reap, checkpoint_metadata_block, permits_release};
+use super::{GARBAGE_DIRECTORY, StoredRelease, can_reap, checkpoint_metadata_block, permits_release, recovery_covers_release};
 use crate::checkpoint_retention::checkpoint_pack_collectable;
 use crate::keys::KeyService;
 use crate::packing::{block_pack, observe_pack_index, pack_block};
@@ -390,13 +390,6 @@ async fn prepare(directory: &dyn Directory, bucket: &dyn ObjectStore, provider: 
     Ok(Some(owner.version))
 }
 
-fn recovery_covers_release(owner: &DeploymentRecord, release: &super::GarbageRecord) -> bool {
-    let Some(floor) = &release.trie_floor else { return true; };
-    let through = floor.cut.through.after_offset(floor.cut.replica_epoch);
-    through >= 0 && owner.checkpoint.is_some_and(|checkpoint| checkpoint.root_sha256.is_some() && checkpoint.boundary >= through)
-        && owner.storage_regions.values().filter_map(StorageRegion::first_required_replica).all(|first| first > through)
-}
-
 fn changed() -> Anomaly {
     Anomaly::new(AnomalyCategory::Conflict, "rtdb.multi/exact-retirement", "The source residence has an incompatible storage admission")
 }
@@ -520,6 +513,7 @@ mod tests {
         } };
         parent.catalog_admission_floors.insert(root.clone(), floor.clone());
         parent.checkpoint = Some(rtdb_directory::Checkpoint { block: 0, boundary: 1, source: 0, system_time: 0, root_sha256: Some([1; 32]) });
+        parent.recovery_manifest_sha256 = Some([1; 32]);
         let parent = directory.create_deployment(parent).await.unwrap();
         let store = format!("{}/{root}", parent.storage_prefix());
         let relative = ObjectKey::new("tables/orders/data/l01-rc-b00.arrow").unwrap();
@@ -539,6 +533,13 @@ mod tests {
         let recovery = Uuid::new_v4();
         let parent = crate::admin::update_installation(directory.as_ref(), &parent.id, |record| {
             record.checkpoint = Some(rtdb_directory::Checkpoint { block: 1, boundary: 2, source: 1, system_time: 0, root_sha256: Some([2; 32]) });
+            record.recovery_manifest_sha256 = None;
+            Ok(())
+        }).await.unwrap();
+        reap(directory.as_ref(), bucket.as_ref(), &versions, &parent, 0, None, None).await.unwrap();
+        assert_eq!(versions.attempts.load(Ordering::Relaxed), 0);
+        let parent = crate::admin::update_installation(directory.as_ref(), &parent.id, |record| {
+            record.recovery_manifest_sha256 = Some([2; 32]);
             record.storage_regions.insert(recovery, StorageRegion::ReplicaReplay { first_required: 2, custody: ReplayCustody::Local });
             Ok(())
         }).await.unwrap();
@@ -805,6 +806,7 @@ mod tests {
             cut: CatalogCut { through: ReplicaPosition(2), ..selected } };
         owner.catalog_admission_floors.insert(root.clone(), floor.clone());
         owner.checkpoint = Some(rtdb_directory::Checkpoint { block: 1, boundary: 2, source: 1, system_time: 0, root_sha256: Some([2; 32]) });
+        owner.recovery_manifest_sha256 = Some([2; 32]);
         let owner = directory.create_deployment(owner).await.unwrap();
         let store = format!("{}/{root}", owner.storage_prefix());
         let key = "tables/orders/data/l01-rc-b00.arrow";
@@ -938,6 +940,7 @@ mod tests {
         assert!(provider.calls.lock().is_empty());
         let mut current = directory.deployment(&held.id).await.unwrap().unwrap();
         current.checkpoint = Some(rtdb_directory::Checkpoint { block: 1, boundary: 1, source: 0, system_time: 0, root_sha256: Some([1; 32]) });
+        current.recovery_manifest_sha256 = Some([1; 32]);
         let hold = Uuid::new_v4();
         current.storage_regions.insert(hold, StorageRegion::ReplicaReplay { first_required: 1, custody: ReplayCustody::Local });
         let version = current.version;

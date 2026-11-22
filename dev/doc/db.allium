@@ -668,6 +668,10 @@ config {
 -- The pack index confines entries to the payload before the trailer.
 -- With provider versions, the pack metadata, trailer, index and each returned member range must name the same physical publication.
 -- Hosted publication records the digest of the adopted catalog bytes next to its checkpoint coordinate.
+-- A hosted serving receipt also commits to the exact replay inventory, including each logical length and any observed physical version.
+-- Its digest covers the root, replica epoch and first required replica offset.
+-- The admitted store recomputes the inventory commitment from fresh storage observations before opening the cut.
+-- A hosted prefix trim requires a checkpoint with this commitment.
 -- Opening a directory receipt verifies fresh root bytes before loading table metadata.
 -- An ordinary startup admits the root metadata and first required replica offset in one directory update.
 -- The startup grant lasts through cursor admission and the drain of the provider reads it owns.

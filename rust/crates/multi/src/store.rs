@@ -252,6 +252,15 @@ impl RemoteStorageFactory for CellStoreFactory {
                 else { ReplayCustody::Hosted { owner: self.hosted_task.clone() } },
             );
             let mut opened = open_cell_store(bucket, &store, root, &record, wall_clock(), recovery, custody).await?;
+            if let Some(expected) = record.recovery_manifest_sha256 {
+                let checkpoint = record.checkpoint.ok_or_else(|| storage_region_error("A recovery manifest has no checkpoint"))?;
+                let material = self.keys.existing_key(&record.key_id()).await?
+                    .ok_or_else(|| storage_region_error("The recovery manifest's serving key is unavailable"))?;
+                let plaintext = EncryptingStore::new(opened.clone(), &material)?;
+                if crate::archive::recovery_manifest_sha256(&plaintext, checkpoint, rtdb_types::StorageEpoch(record.log_epoch)).await? != expected {
+                    return Err(storage_region_error("The recovery inventory does not match the directory receipt"));
+                }
+            }
             let serving = Arc::get_mut(&mut opened).expect("the new store has one owner");
             serving.index_pages = Some(pages);
             serving.catalog_readers = Some(CatalogReaders::new(
@@ -1244,6 +1253,17 @@ enum ReleaseSweep<'a> {
     Hosted,
 }
 
+fn recovery_covers_release(owner: &DeploymentRecord, release: &GarbageRecord) -> bool {
+    let Some(floor) = &release.trie_floor else { return true; };
+    let through = floor.cut.through.after_offset(floor.cut.replica_epoch);
+    through >= 0 && owner.log_epoch == floor.cut.replica_epoch.0 && owner.recovery_manifest_sha256.is_some()
+        && owner.checkpoint.is_some_and(|checkpoint| checkpoint.root_sha256.is_some() && checkpoint.boundary >= through)
+        && owner.storage_regions.values().all(|region| match region.first_required_replica() {
+            Some(first) => first > through,
+            None => region.checkpoint_metadata_from().is_none(),
+        })
+}
+
 async fn reap_path_releases(bucket: &dyn ObjectStore, record: &DeploymentRecord, now_ms: i64, grace: Duration,
     sweep: ReleaseSweep<'_>) -> Result<Reaped> {
     use crate::reference::{Base, physical_objects};
@@ -1274,7 +1294,8 @@ async fn reap_path_releases(bucket: &dyn ObjectStore, record: &DeploymentRecord,
                 StoredRelease::Exact { record, .. } | StoredRelease::Terminal { record, .. } => { exact.insert(record.key); reaped.waiting += 1; continue; }
                 StoredRelease::Path(record) => record,
             };
-            if !permits_release(record, &store, &released) || released.released_at_ms > threshold || checkpoint_metadata_block(&released.key)
+            if !permits_release(record, &store, &released) || !recovery_covers_release(record, &released)
+                || released.released_at_ms > threshold || checkpoint_metadata_block(&released.key)
                 .is_some_and(|block| !checkpoint_metadata_collectable(block, published, oldest))
             {
                 reaped.waiting += 1;
@@ -1759,7 +1780,13 @@ mod tests {
         store.release_trie_files(&receipt, receipt_bytes).await.unwrap();
         reap_as_of(bucket.as_ref(), &held, i64::MAX, Duration::ZERO, &refs).await.unwrap();
         assert!(bucket.head(&physical).await.is_ok());
-        let current = directory.deployment(&record.id).await.unwrap().unwrap();
+        let mut current = directory.deployment(&record.id).await.unwrap().unwrap();
+        current.checkpoint = Some(rtdb_directory::Checkpoint {
+            block: 1, boundary: 1, source: 0, system_time: 0, root_sha256: Some([1; 32]),
+        });
+        current.recovery_manifest_sha256 = Some([1; 32]);
+        let version = current.version;
+        let current = directory.replace_deployment(current, version).await.unwrap().applied().unwrap();
         let mut foreign = current.clone();
         foreign.storage_namespaces.as_mut().unwrap().objects = Uuid::new_v4();
         reap_as_of(bucket.as_ref(), &foreign, i64::MAX, Duration::ZERO, &refs).await.unwrap();

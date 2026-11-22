@@ -1980,7 +1980,8 @@ async fn s3_a_checkpoint_restore_resumes_after_fencing_and_sealing() {
         assert!(fenced.holder.is_none());
         assert_eq!(fenced.checkpoint, checkpoint);
 
-        let bucket = storage.bucket(IoRegion::new()).await.unwrap();
+        let CellStorage::S3 { config } = &storage else { unreachable!() };
+        let bucket = config.open(&config.cell_root().unwrap(), &BTreeMap::new(), IoRegion::new()).await.unwrap();
         let prefix = ObjectKey::new(fenced.storage_prefix()).unwrap();
         let objects = bucket.list(Some(&prefix)).await.unwrap();
         assert!(!objects.is_empty());
@@ -2024,9 +2025,37 @@ async fn explicit_flush_publishes_a_checkpoint_before_replying() {
     let root = database.storage().get(&key).await.unwrap();
     assert_eq!(checkpoint.root_sha256, Some(rtdb_format::catalog::publication_digest(root.as_slice())),
         "a reported flush must publish a receipt for its stored root");
+    assert!(held.recovery_manifest_sha256.is_some());
     assert_eq!(held.holder, Some(cell.node(0).lease.id()));
     assert!(checkpoint.source >= position.after_offset(rtdb_types::StorageEpoch(held.log_epoch)));
     drop((database, client));
+    cell.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn cold_snapshot_refuses_a_mismatched_recovery_manifest() {
+    let cell = Cell::start_durable(1).await;
+    let deployment = admin::create_deployment(cell.directory.as_ref(), "shop", "acme", 3).await.unwrap();
+    let client = cell.connect("shop").await;
+    client.simple_query("INSERT INTO orders (_id, total) VALUES (1, 9)").await.unwrap();
+    drop(client);
+    let agent = &cell.node(0).agent;
+    agent.park("shop").await.unwrap();
+    let mut parked = cell.directory.deployment(&deployment.id).await.unwrap().unwrap();
+    let expected = parked.recovery_manifest_sha256.unwrap();
+    let mut wrong = expected;
+    wrong[0] ^= 1;
+    parked.recovery_manifest_sha256 = Some(wrong);
+    let version = parked.version;
+    let mut parked = cell.directory.replace_deployment(parked, version).await.unwrap().applied().unwrap();
+    let error = agent.snapshot("shop").await.unwrap_err();
+    assert_eq!(error.code, "rtdb.multi/storage-region");
+
+    parked = cell.directory.deployment(&parked.id).await.unwrap().unwrap();
+    parked.recovery_manifest_sha256 = Some(expected);
+    let version = parked.version;
+    assert!(cell.directory.replace_deployment(parked, version).await.unwrap().applied().is_some());
+    agent.snapshot("shop").await.unwrap();
     cell.stop().await;
 }
 
@@ -2051,6 +2080,7 @@ async fn park_drains_admission_before_flushing_and_publishes_its_checkpoint() {
 
     let parked = cell.directory.deployment_by_name("shop").await.unwrap().unwrap();
     assert!(parked.holder.is_none());
+    assert!(parked.recovery_manifest_sha256.is_some());
     let checkpoint = parked.checkpoint.expect("a parked deployment publishes its final checkpoint");
     assert!(checkpoint.source >= position.after_offset(rtdb_types::StorageEpoch(parked.log_epoch)));
     drop(database);

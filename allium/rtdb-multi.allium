@@ -195,6 +195,7 @@ value Checkpoint {
     -- The hash of the log record at lsn, so recovery verifies the tail it replays continues this history.
     chain_hash: String
     format_version: Integer
+    recovery_manifest_digest: String?
 }
 
 value CheckpointMetadataRead {
@@ -1434,8 +1435,17 @@ rule PublishCheckpoint {
     -- Publication is a cas conditional on the epoch, batched per node.
     -- A checkpointed store with an independent object inventory can recover its packs by name.
     -- The directory receipt binds the adopted logical root bytes to the published coordinate.
+    -- A serving checkpoint commits to its replay inventory in the same directory update as its log boundary.
+    -- The inventory is derived from the root and the verified table blocks.
+    -- Each entry binds its logical path and length to the provider version where available.
+    -- An unversioned entry uses the immutable-object contract.
+    -- The receipt binds the journal epoch and the first replica record required after the checkpoint.
+    -- Fresh storage observations must cover every member before the holder can publish.
+    -- Park and idle suspension use the same publication rule.
     -- Ordinary startup of a receipted cut protects its root metadata and replay suffix in a single compare-and-replace.
     -- Startup verifies the root bytes against the receipt before following its table pointers.
+    -- Startup verifies the inventory commitment under that admission before installing the cut.
+    -- A transfer or repair that changes storage custody starts with its separately verified copy.
     -- Opening a replacement after a gap requires a fresh directory admission.
     when: AppendCommitted(holding, record: BlockUploaded)
 
@@ -1446,7 +1456,8 @@ rule PublishCheckpoint {
                 boot: record.boot,
                 lsn: record.through_lsn,
                 chain_hash: record.hash,
-                format_version: holding.deployment.format_version
+                format_version: holding.deployment.format_version,
+                recovery_manifest_digest: RecoveryInventoryDigest(holding, record)
             ),
             loglets: LogletsAbove(holding.deployment.loglets, record.through_lsn)
         })
@@ -1458,6 +1469,7 @@ rule TrimCertifiedReplicaPrefix {
     -- The checkpoint's boundary record supplies the intake position on reopen.
     when: ReplicaPrefixCertified(holding, through, digest)
 
+    requires: Directory.read(holding.deployment.id).checkpoint.recovery_manifest_digest != null
     requires: through < Directory.read(holding.deployment.id).checkpoint.lsn
     requires: not exists replay in Directory.read(holding.deployment.id).replica_replays: replay.first_required <= through
 
@@ -2520,6 +2532,9 @@ rule AuthorizeHostedVersionErasure {
     -- The reservation closes fork preparation and publication while the reaper scans the current manifests of the lineage.
     -- The physical owner's storage region orders new inherited reads of the affected keys against the reservation.
     -- Authorization compares the same owner revision and fence that passed the retention checks.
+    -- The source's committed recovery inventory covers the installed removal.
+    -- A startup or replay hold may retain an older cut.
+    -- An admitted metadata reader without a replay bound retains the removal until its provider work drains.
     -- Settlement reopens admission after a complete provider inventory confirms absence of the selected version.
     when: HostedLooseFileReleaseDue(release)
 

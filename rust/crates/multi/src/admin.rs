@@ -1193,6 +1193,7 @@ async fn prepare_cell_move(
         staged.incarnation = arrival.incarnation;
         staged.ensemble = arrival.ensemble;
         staged.storage_generation = Some(uuid::Uuid::new_v4());
+        staged.recovery_manifest_sha256 = None;
         staged.storage_namespaces = Some(target_binding);
         staged.disposal = None;
         staged.moved_at_ms = None;

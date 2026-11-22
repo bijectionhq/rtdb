@@ -11,6 +11,7 @@ use base64::{
     Engine,
 };
 use bytes::Bytes;
+use futures::{StreamExt, TryStreamExt};
 use rtdb_directory::{
     ArchiveRetirement,
     Checkpoint,
@@ -730,6 +731,35 @@ async fn catalog_objects(plaintext: &dyn ObjectStore, catalog: &BlockCatalog, co
     Ok(closure)
 }
 
+pub(crate) async fn recovery_manifest_sha256(
+    store: &dyn ObjectStore, checkpoint: Checkpoint, epoch: StorageEpoch,
+) -> Result<[u8; 32]> {
+    let root = checkpoint.root_sha256.ok_or_else(|| inconsistent("A recovery manifest requires a checkpoint root digest"))?;
+    let first_required = checkpoint.boundary.checked_add(1)
+        .filter(|first| *first > 0)
+        .ok_or_else(|| inconsistent("A recovery manifest requires a replica boundary"))?;
+    let path = key(&block_key(BlockIndex(checkpoint.block))?)?;
+    let catalog = BlockCatalog::decode(&store.get_fresh(&path).await?)?;
+    verify_cut(&catalog, checkpoint, epoch)?;
+    let closure = catalog_objects(store, &catalog, CheckpointContents::Replay).await?;
+
+    let mut manifest = ring::digest::Context::new(&ring::digest::SHA256);
+    manifest.update(b"rtdb/recovery-manifest/v1\0");
+    manifest.update(&encode(&(root, epoch.0, first_required))?);
+    let observations = futures::stream::iter(closure.into_iter().map(|(name, digest)| async move {
+        let source = CheckpointCopySource::observe(store, name, digest).await?;
+        if digest.is_some() {
+            source.read(store).await?;
+        }
+        encode(&(source.name.as_str(), source.logical_bytes as u64, source.version, digest))
+    })).buffered(16);
+    futures::pin_mut!(observations);
+    while let Some(member) = observations.try_next().await? {
+        manifest.update(&member);
+    }
+    Ok(manifest.finish().as_ref().try_into().expect("SHA-256 has 32 bytes"))
+}
+
 /// The exact body observation expected for a logical source member. A packed
 /// member names its containing publication, and a repaired member names its
 /// archived ciphertext. The observation does not confer retirement authority.
@@ -1272,6 +1302,7 @@ pub(crate) async fn restore_checkpoint(
         recovery.completed_at_ms = Some(rtdb_directory::now_ms());
         record.lifecycle = recovery.previous_lifecycle;
         record.compaction_replay_cutoff = Some(cutoff.0);
+        record.recovery_manifest_sha256 = None;
         record.checkpoint_repair_receipts.insert(operation, recovery.clone());
         Ok(())
     })
@@ -1607,6 +1638,28 @@ mod tests {
         let reopened: Capture = serde_json::from_slice(&legacy).unwrap();
         assert_eq!(encode(&reopened)?, legacy);
         reopened.verify(bucket, "capture", &material).await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn serving_recovery_manifest_requires_the_complete_inventory_and_stable_versions() -> Result<()> {
+        let fixture = replay_fixture()?;
+        let store = crate::packing::tests::VersionedPacks::default();
+        let checkpoint = fixture.point.checkpoint;
+        let epoch = StorageEpoch(fixture.point.log_epoch);
+        for (object, bytes) in &fixture.files {
+            store.put(object, bytes.clone()).await?;
+        }
+        let published = recovery_manifest_sha256(&store, checkpoint, epoch).await?;
+        assert_eq!(recovery_manifest_sha256(&store, checkpoint, epoch).await?, published);
+
+        for required in [fixture.artefact, fixture.retained[0].clone()] {
+            store.delete(&required).await?;
+            assert_eq!(recovery_manifest_sha256(&store, checkpoint, epoch).await.unwrap_err().code,
+                "rtdb.storage/missing-object");
+            store.put(&required, fixture.files[&required].clone()).await?;
+        }
+        assert_ne!(recovery_manifest_sha256(&store, checkpoint, epoch).await?, published);
         Ok(())
     }
 
