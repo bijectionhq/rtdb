@@ -153,6 +153,7 @@ pub(crate) const HELD_OWNED_VALID_DURING_V2: &str = "rtdb.owned.ReadHeldValidDur
 pub(crate) const HELD_WORLD_VALID_V1: &str = "rtdb.owned.ReadHeldWorldValidDuring.v1";
 pub(crate) const HELD_WORLD_IDENTITIES_V1: &str = "rtdb.owned.ReadHeldWorldIdentityPage.v1";
 pub(crate) const HELD_WORLD_OVERLAY_IDENTITIES_V1: &str = "rtdb.owned.ReadHeldWorldOverlayIdentityPage.v1";
+pub(crate) const HELD_PROTECTED_COVERAGE_V1: &str = "rtdb.owned.ReadHeldProtectedCarrierCoverage.v1";
 pub(crate) const HELD_PROTECTED_CARRIERS_V1: &str = "rtdb.owned.ReadHeldProtectedCarrierPage.v1";
 pub(crate) const HELD_OWNED_IDENTITIES_V1: &str = "rtdb.owned.ReadHeldIdentityPage.v1";
 pub(crate) const HELD_OWNED_VERSIONS_V2: &str = "rtdb.owned.ReadHeldVersions.v2";
@@ -964,6 +965,35 @@ impl Service {
             [(OWNED_IDENTITY_MORE.into(), u8::from(page.more).to_string())].into()
         );
         let reply = self.owned_point_reply(&schema, Some(&rows), system, valid, None)?;
+        held.snapshot.check_relation(&relation).map_err(status)?;
+        Ok(reply)
+    }
+
+    pub(crate) async fn held_protected_coverage_action(&self, call: &Call, body: &[u8]) -> Result<ActionResult, Status> {
+        use base64::{Engine, engine::general_purpose::STANDARD};
+        if !self.0.config.owned_native_actions { return Err(unsupported()); }
+        self.hosted_control_policy(call)?;
+        let scope = self.hosted_control_scope(call).await?;
+        let (handle, request) = body.split_first_chunk::<16>()
+            .ok_or_else(|| invalid("Protected carrier coverage has no held handle"))?;
+        let held = self.owned_read(call, &Bytes::copy_from_slice(handle))?;
+        let (relation, arrow_bytes) = split_relation(request)?;
+        let batch = decode_batch(call, arrow_bytes)?;
+        let batch = batch.batch();
+        if batch.num_columns() != 1 || batch.num_rows() != 1 {
+            return Err(invalid("Protected carrier coverage needs one prefix"));
+        }
+        let prefix = batch.column_by_name("prefix").and_then(|array| array.as_any().downcast_ref::<StringArray>())
+            .filter(|column| !column.is_null(0)).ok_or_else(|| invalid("Protected carrier prefix must be Utf8"))?;
+        let (coverage, witness) = held.snapshot.protected_carrier_coverage(&relation, prefix.value(0), scope)
+            .await.map_err(status)?;
+        let nonce = held.remember(call, &relation, witness)?;
+        let schema = Schema::empty().with_metadata([
+            ("rtdb.owned.protected_carrier_coverage".into(), STANDARD.encode(coverage)),
+            (OWNED_RANGE_WITNESS.into(), nonce.simple().to_string()),
+        ].into());
+        let at = held.snapshot.present().system_time;
+        let reply = self.owned_point_reply(&schema, None, at, at, None)?;
         held.snapshot.check_relation(&relation).map_err(status)?;
         Ok(reply)
     }
