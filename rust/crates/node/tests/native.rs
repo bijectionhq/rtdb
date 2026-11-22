@@ -383,6 +383,54 @@ async fn held_owned_point_reads_an_explicit_valid_instant_at_the_original_system
 }
 
 #[tokio::test]
+async fn normal_owned_points_and_commits_keep_colliding_full_ids_independent() {
+    use rtdb_types::{EntityId, OwnedRelation};
+
+    let mut settings = options();
+    settings.owned_relations = true;
+    let (node, driver) = running(settings, services()).await;
+    let mut session = node.session("xtdb", Arc::new(Authority)).unwrap();
+    let relation = OwnedRelation::new("colliding-ids").unwrap();
+    let first = EntityId::String("same-canonical-iid".into());
+    let second = EntityId::Uuid(first.iid().0);
+    assert_eq!(first.iid(), second.iid());
+    let documents = |id: &EntityId, value| Documents::new(vec![StructFields::from([
+        ("_id".into(), id.as_value()), ("value".into(), Value::I64(value)),
+    ])], node.memory()).unwrap();
+    let create = |id, value| TxOp::OwnedInsertDocs {
+        relation: relation.clone(), documents: documents(id, value), valid_from: None, valid_to: None,
+    };
+    let initial = session.state_mut().execute_tx(vec![create(&first, 1), create(&second, 2)], AutonomousTxOptions::default()).await.unwrap();
+    assert!(initial.committed(), "{:?}", initial.error());
+    let held = session.open_owned_read().await.unwrap();
+    for (id, expected) in [(&first, 1), (&second, 2)] {
+        let found = rows(held.open_point(&relation, id).await.unwrap().unwrap()).await;
+        assert_eq!(found[0][..2], [id.as_value(), Value::I64(expected)]);
+    }
+
+    let check = |id: &EntityId, expected| TxOp::OwnedCheck {
+        relation: relation.clone(), id: id.clone(), valid_at: held.present().system_time, expected,
+    };
+    let replace = TxOp::OwnedReplaceDocs {
+        relation: relation.clone(), documents: documents(&second, 3), valid_from: None, valid_to: None,
+    };
+    let delete = TxOp::OwnedDelete { relation: relation.clone(), id: first.clone(), valid_from: None, valid_to: None };
+    let revision = Some(initial.tx_key().system_time);
+    let changed = session.state_mut().execute_tx(
+        vec![check(&first, revision), check(&second, revision), replace, delete], AutonomousTxOptions::default(),
+    ).await.unwrap();
+    assert!(changed.committed(), "{:?}", changed.error());
+    let after = session.open_owned_read().await.unwrap();
+    assert!(rows(after.open_point(&relation, &first).await.unwrap().unwrap()).await.is_empty());
+    assert_eq!(rows(after.open_point(&relation, &second).await.unwrap().unwrap()).await[0][..2], [second.as_value(), Value::I64(3)]);
+    assert_eq!(rows(held.open_point(&relation, &first).await.unwrap().unwrap()).await[0][..2], [first.as_value(), Value::I64(1)]);
+    drop(after);
+    drop(held);
+    drop(session);
+    stop(&node, driver).await;
+}
+
+#[tokio::test]
 async fn ordered_owned_unique_groups_swaps_and_refuses_conflicts() {
     use rtdb_types::{EntityId, OwnedRelation};
 

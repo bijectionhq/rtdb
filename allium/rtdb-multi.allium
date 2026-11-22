@@ -1,5 +1,8 @@
 -- allium: 3
 -- rtdb-multi.allium
+-- Writable checkpoint worlds store collision probes in their local scope alongside shadows.
+-- A shadow miss probes the root registry at the world's retained archived cut.
+-- The world registration record retains its internal UUID address.
 --
 -- Scope: hosting an unbounded number of deployments on one shared, autoscaling infrastructure.
 -- A deployment is one RTDB database belonging to one customer application.

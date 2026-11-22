@@ -153,7 +153,7 @@ impl Entity {
     fn push(&mut self, ordinal: u32, row: SearchRow) -> Result<()> {
         self.iid = Some(row.iid);
         if let Some(id) = row.identity {
-            if id.iid().0 != row.iid || self.identity.as_ref().is_some_and(|previous| previous != &id) {
+            if !id.owned_locator_candidates().any(|candidate| candidate.0 == row.iid) || self.identity.as_ref().is_some_and(|previous| previous != &id) {
                 return Err(fault("Owned search input has conflicting complete identities"));
             }
             self.identity = Some(id);
@@ -777,7 +777,7 @@ impl SearchFile {
 
     pub(crate) fn run_identity(&self, run: DocMatch) -> Result<EntityId> {
         let id = decode_identity(self.run_identity_bytes(run)?)?.ok_or_else(|| corrupt("Search run omitted its full identity"))?;
-        if id.iid().0 != run.iid { return Err(corrupt("Search run identity disagrees with its IID")); }
+        if !id.owned_locator_candidates().any(|candidate| candidate.0 == run.iid) { return Err(corrupt("Search run identity disagrees with its IID")); }
         Ok(id)
     }
 

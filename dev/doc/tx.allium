@@ -54,6 +54,10 @@
 -- Owned point reads compare the complete stored identity before yielding any row.
 -- An owned transaction refuses ordinary operations and ordinary SQL catalogs and scans exclude owned tables.
 -- Owned point reads use the principal's namespace at a reserved present.
+-- Ordered owned mutations reserve permanent addresses using the canonical IID and deterministic collision probes.
+-- A protected registry records each locator's complete typed identity with the fact write.
+-- Point reads and ordered checks open the registry at the same cut as the fact and verify its complete stored identity.
+-- An existing relation without a complete registry refuses owned access.
 -- A held owned read captures the exact applied transaction key and retains that catalog for repeated reads.
 -- A covered held range may mint a witness of its owner relation's cumulative event frontier and placed writer epoch.
 -- Ordered validation refuses a witnessed write when that relation's frontier changed or the witness expired or belongs to another placed epoch.

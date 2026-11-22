@@ -121,6 +121,23 @@ impl EntityId {
         Iid(iid)
     }
 
+    /// Candidate locators for the protected owned table registry, in probe order.
+    /// The canonical locator is considered first for existing identity semantics.
+    pub fn owned_locator_candidates(&self) -> impl Iterator<Item = Iid> + '_ {
+        std::iter::once(self.iid()).chain((1u8..32).map(|probe| {
+            let mut hash = Sha256::new();
+            hash.update(b"rtdb-owned-address-v1\0");
+            hash.update([probe]);
+            match self {
+                Self::String(value) => { hash.update(b"s"); hash.update(value.as_bytes()); }
+                Self::Keyword(value) => { hash.update(b"k"); hash.update(value.as_str().as_bytes()); }
+                Self::Integer(value) => { hash.update(b"i"); hash.update(value.to_be_bytes()); }
+                Self::Uuid(value) => { hash.update(b"u"); hash.update(value); }
+            }
+            Iid(hash.finalize()[..16].try_into().expect("fixed digest size"))
+        }))
+    }
+
     pub fn uuid(value: &str) -> Result<Self> {
         uuid::Uuid::parse_str(value).map(|value| Self::Uuid(*value.as_bytes()))
             .map_err(|_| Anomaly::incorrect("xtdb/invalid-id", "Invalid UUID ID"))
@@ -167,6 +184,7 @@ const OWNED_RELATION_CATALOG: &str = ".relation-schemas";
 const OWNED_WORLD_CATALOG: &str = ".worlds";
 const OWNED_WORLD_PREFIX: &str = ".world-";
 const OWNED_UNIQUE_PREFIX: &str = ".unique-";
+const OWNED_ADDRESS_PREFIX: &str = ".addresses-";
 
 /// A native relation provisioned in the authenticated principal's namespace.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -184,6 +202,8 @@ impl OwnedRelation {
     pub fn name(&self) -> &str { &self.0 }
 
     pub fn table(&self, owner: &str) -> TableRef { owned_table(owner, &self.0) }
+
+    pub fn address_table(&self, owner: &str) -> TableRef { owned_table(owner, &format!("{OWNED_ADDRESS_PREFIX}{}", self.0)) }
 
     pub fn unique_table(&self, owner: &str) -> TableRef { owned_table(owner, &format!("{OWNED_UNIQUE_PREFIX}{}", self.0)) }
 
@@ -242,7 +262,8 @@ impl TableRef {
     pub fn owned_world_scope(&self) -> (bool, Option<Iid>) {
         let Some((_, name)) = self.table.split_once('-') else { return (false, None); };
         if self.schema != OWNED_SCHEMA_V1 { return (false, None); }
-        let world = name.strip_prefix(OWNED_WORLD_PREFIX)
+        let addressed = name.strip_prefix(OWNED_ADDRESS_PREFIX).unwrap_or(name);
+        let world = addressed.strip_prefix(OWNED_WORLD_PREFIX)
             .and_then(|rest| rest.split_once('.')).and_then(|(world, _)| world.parse().ok());
         (name == OWNED_WORLD_CATALOG, world)
     }
@@ -261,11 +282,15 @@ impl TableRef {
         self.table.split_once('-').is_some_and(|(_, name)| name.starts_with(OWNED_UNIQUE_PREFIX)) && self.supported_owned_name()
     }
 
+    pub fn is_owned_address_table(&self) -> bool {
+        self.table.split_once('-').is_some_and(|(_, name)| name.starts_with(OWNED_ADDRESS_PREFIX)) && self.supported_owned_name()
+    }
+
     /// True only for ordinary owned relations within this protected catalog's namespace.
     pub fn owns_path_target(&self, target: &Self) -> bool {
         (self.is_owned_path_catalog() || self.is_owned_search_catalog())
             && target.supported_owned_name()
-            && !target.is_owned_path_catalog() && !target.is_owned_search_catalog() && !target.is_owned_unique_table()
+            && !target.is_owned_path_catalog() && !target.is_owned_search_catalog() && !target.is_owned_unique_table() && !target.is_owned_address_table()
             && target.table[..64] == self.table[..64]
     }
 
@@ -273,7 +298,11 @@ impl TableRef {
         self.schema == OWNED_SCHEMA_V1
             && self.table.split_once('-').is_some_and(|(owner, name)| {
                 owner.len() == 64 && owner.bytes().all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-                    && (matches!(name, OWNED_PATH_CATALOG | OWNED_SEARCH_CATALOG | OWNED_RELATION_CATALOG) || name.strip_prefix(OWNED_UNIQUE_PREFIX).is_some_and(|relation| OwnedRelation::new(relation).is_ok())
+                    && (matches!(name, OWNED_PATH_CATALOG | OWNED_SEARCH_CATALOG | OWNED_RELATION_CATALOG)
+                        || name.strip_prefix(OWNED_UNIQUE_PREFIX).is_some_and(|relation| OwnedRelation::new(relation).is_ok())
+                        || name.strip_prefix(OWNED_ADDRESS_PREFIX).is_some_and(|relation| {
+                            OwnedRelation::from_source(relation.into()).is_ok_and(|relation| !relation.is_world_catalog())
+                        })
                         || OwnedRelation::from_source(name.into()).is_ok())
             })
     }

@@ -227,9 +227,9 @@ All observations are checked against the same ordered state before any mutation 
 Mutations apply in group order and then row order, using the authenticated session's principal and database.
 
 Owned lookups compare the complete stored `_id` before releasing data or accepting a point observation.
-The primary index continues to locate rows by 128-bit IID.
-Different identities occupying the same IID produce an explicit collision refusal when a different visible identity is found.
-This key layout cannot store colliding full identities independently.
+A private registry assigns each identity a permanent primary-index locator at transaction ordering.
+Colliding identities probe alternate locators and stay independently addressable over time.
+A legacy nonempty relation without a complete registry refuses owned reads and writes.
 
 === Declaring a private relation schema
 

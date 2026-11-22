@@ -361,6 +361,7 @@ struct CoveredCorpus {
 async fn covered_owned_corpus(
     context: Arc<QueryContext>, owner: &str, relation: &OwnedRelation, path: &OwnedRelation, query: &Query, retain_runs: bool,
 ) -> Result<CoveredCorpus> {
+    rtdb_query::require_owned_address_coverage(&context, owner, relation)?;
     let definition = crate::definitions::owned_definition(Arc::clone(&context), owner, relation, path).await?
         .ok_or_else(|| Anomaly::incorrect("rtdb.owned/search-path", "Owned relation has no declared clear-text search path with this name"))?;
     let database = context.catalog.default_database();
@@ -484,6 +485,10 @@ pub async fn owned_ranked(
                 return Err(Anomaly::new(AnomalyCategory::Unavailable, "rtdb.owned/search-candidate-limit", "Covered search exceeded its candidate budget"));
             }
             let id = file.run_identity(run)?;
+            let address = rtdb_query::owned_address(Arc::clone(&context), owner, relation, &id).await?;
+            if !matches!(address, rtdb_query::OwnedAddress::Assigned(locator) if locator.0 == run.iid) {
+                return Err(uncovered_owned_search());
+            }
             let columns = ["_id", covered.column.as_str()];
             let Some(mut rows) = rtdb_query::open_owned_point(
                 Arc::clone(&context), owner, relation, &id, Some(covered.bounds.valid_time), Some(&columns),

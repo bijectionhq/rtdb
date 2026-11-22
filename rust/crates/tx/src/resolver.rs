@@ -855,14 +855,32 @@ impl<'a> OpenTransaction<'a> {
         Ok(latest)
     }
 
+    async fn assign_owned_address(&mut self, owner: &str, relation: &rtdb_types::OwnedRelation, id: &rtdb_types::EntityId) -> Result<Iid> {
+        let context = self.context.query_context(self.snapshot()?, self.tx_key().system_time, &self.options.default_tz, self.trace_parent)?;
+        match rtdb_query::owned_address(context, owner, relation, id).await? {
+            rtdb_query::OwnedAddress::Assigned(locator) => Ok(locator),
+            rtdb_query::OwnedAddress::Vacant(locator) => {
+                self.buffer.put(relation.address_table(owner), StructFields::from([
+                    ("_id".into(), Value::Uuid(locator.0)),
+                    ("address".into(), id.as_value()),
+                ]), Interval::ALL)?;
+                Ok(locator)
+            }
+        }
+    }
+
     async fn delete_owned(&mut self, relation: &rtdb_types::OwnedRelation, id: &rtdb_types::EntityId, from: Option<Timestamp>, to: Option<Timestamp>) -> Result<()> {
         let options = self.options;
         let owner = options.user.as_deref().filter(|owner| !owner.is_empty()).ok_or_else(no_owned_principal)?;
         if relation.world().is_some() || relation.is_world_catalog() { return Err(rtdb_types::OwnedWorld::unavailable()); }
         let valid = interval(from.unwrap_or(self.tx_key().system_time), to.unwrap_or(Timestamp::MAX))?;
+        let locator = self.assign_owned_address(owner, relation, id).await?;
         self.read_owned_revision(owner, relation, id, Interval::ALL).await?;
         self.track_unique_mutation(owner, relation, id, valid).await?;
-        self.buffer.delete(relation.table(owner), id, valid)
+        let system_from = self.tx_key().system_time;
+        self.buffer.append(relation.table(owner), StoredEvent {
+            iid: locator, system_from, valid_time: valid, operation: StoredOperation::Delete, recency: None,
+        })
     }
 
     async fn write_owned(&mut self, relation: &rtdb_types::OwnedRelation, documents: &crate::Documents, iids: Option<&[Iid]>, from: Option<Timestamp>, to: Option<Timestamp>, create_only: bool) -> Result<()> {
@@ -959,7 +977,7 @@ impl<'a> OpenTransaction<'a> {
         if iids.is_some_and(|iids| iids.len() != documents.rows().len()) { return Err(Anomaly::incorrect("xtdb/invalid-iids", "Document and IID counts differ")); }
         let is_content = |name: &str| !matches!(name, "_valid_from" | "_valid_to");
         for (index, document) in documents.rows().iter().enumerate() {
-            let iid = match iids { Some(iids) => iids[index], None => crate::source::document_id(document, &self.context.memory)?.iid() };
+            let mut iid = match iids { Some(iids) => iids[index], None => crate::source::document_id(document, &self.context.memory)?.iid() };
             let default_from = from.unwrap_or(self.tx_key().system_time);
             let default_to = to.unwrap_or(Timestamp::MAX);
             let row_from = document.get("_valid_from").map(|value| timestamp(value, default_from)).transpose()?.unwrap_or(default_from);
@@ -970,7 +988,10 @@ impl<'a> OpenTransaction<'a> {
                 DocumentWrite::Insert => self.require_absent(table, iid, valid_time).await?,
                 DocumentWrite::Owned { relation, owner, create_only } => {
                     let id = crate::source::document_id(document, &self.context.memory)?;
-                    self.track_unique_mutation(owner, relation, &id, valid_time).await?;
+                    if !relation.is_world_catalog() {
+                        iid = self.assign_owned_address(owner, relation, &id).await?;
+                        self.track_unique_mutation(owner, relation, &id, valid_time).await?;
+                    }
                     if self.snapshot()?.contains_table(table) {
                         let _ = self.read_owned_revision(owner, relation, &id, Interval::ALL).await?;
                         if create_only && self.read_owned_revision(owner, relation, &id, valid_time).await?.is_some() {
