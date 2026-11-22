@@ -1920,18 +1920,23 @@ impl NativeSession {
                     || !rtdb_tx::proposal_close_controls(&controls)
             } else {
                 sections[0].1.expected_clock.is_none()
-                    || root.publication.as_ref().is_none_or(|root| root.attempt != sections[0].1.attempt
-                        || {
-                            let mut rows = 0usize;
-                            root.writes.iter().any(|op| match op {
-                                TxOp::OwnedReplaceDocs { relation, documents, valid_from: None, valid_to: None }
-                                    if relation.is_root_data() && !documents.rows().is_empty() => {
-                                        rows = rows.saturating_add(documents.rows().len());
-                                        rows > rtdb_tx::MAX_PROPOSAL_LAND_ROWS
-                                    }
-                                _ => true,
-                            }) || rows == 0
-                        })
+                    || root.publication.as_ref().is_none_or(|root| {
+                        if root.attempt != sections[0].1.attempt { return true; }
+                        if matches!(&root.writes[..], [TxOp::OwnedInsertDocs {
+                            relation, documents, valid_from: None, valid_to: None,
+                        }] if relation.is_root_data() && documents.rows().len() == 1) {
+                            return false;
+                        }
+                        let mut rows = 0usize;
+                        root.writes.iter().any(|op| match op {
+                            TxOp::OwnedReplaceDocs { relation, documents, valid_from: None, valid_to: None }
+                                if relation.is_root_data() && !documents.rows().is_empty() => {
+                                    rows = rows.saturating_add(documents.rows().len());
+                                    rows > rtdb_tx::MAX_PROPOSAL_LAND_ROWS
+                                }
+                            _ => true,
+                        }) || rows == 0
+                    })
                     || !rtdb_tx::proposal_land_controls(&controls)
             })
         {

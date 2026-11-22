@@ -333,6 +333,7 @@ pub(crate) fn hosted_proposal_land(
     let mut landing = None;
     let mut replacements = std::collections::BTreeMap::new();
     let mut close = false;
+    let mut insert = false;
     let mut controls = Vec::new();
     for op in operations {
         match op {
@@ -341,13 +342,21 @@ pub(crate) fn hosted_proposal_land(
                 | TxOp::OwnedCheck { .. } | TxOp::OwnedCheckRange { .. } | TxOp::OwnedCheckWorldPurge { .. }) => (),
             Operation::Public(TxOp::OwnedReplaceDocs { relation, documents, valid_from: None, valid_to: None })
             | Operation::OwnedWriteIids { relation, documents, valid_from: None, valid_to: None, create_only: false, .. }
-                if relation.is_root_data() && !close && !documents.rows().is_empty() =>
+                if relation.is_root_data() && !close && !insert && !documents.rows().is_empty() =>
             {
                 for row in documents.rows() {
                     let id = row.get("_id")?.entity_id().ok()?;
                     if replacements.insert((relation.name(), id.handle_bytes()), (relation, id)).is_some()
                         || replacements.len() > MAX_PROPOSAL_LAND_ROWS { return None; }
                 }
+            }
+            Operation::Public(TxOp::OwnedInsertDocs { relation, documents, valid_from: None, valid_to: None })
+            | Operation::OwnedWriteIids { relation, documents, valid_from: None, valid_to: None, create_only: true, .. }
+                if relation.is_root_data() && replacements.is_empty() && documents.rows().len() == 1 =>
+            {
+                let id = documents.rows()[0].get("_id")?.entity_id().ok()?;
+                replacements.insert((relation.name(), id.handle_bytes()), (relation, id));
+                insert = true;
             }
             Operation::Public(TxOp::OwnedDelete { relation, id, valid_from: None, valid_to: None })
                 if relation.is_root_data() && replacements.is_empty() => {
@@ -369,23 +378,23 @@ pub(crate) fn hosted_proposal_land(
         return None;
     }
     for (_, (relation, id)) in replacements {
-    let root_checked = operations.iter().any(|op| matches!(op,
-        Operation::Public(TxOp::OwnedCheck { relation: checked, id: observed, expected: Some(_), .. })
-            if checked == relation && observed == &id
-    ));
-    if close {
-        return (root_checked && proposal_close_controls(controls)
-            && !operations.iter().any(|op| match op {
-                Operation::Public(TxOp::OwnedCheckWorldPurge { .. }) => true,
-                _ => op.owned_relation().is_some_and(|relation| relation.world().is_some()),
-            })).then_some((world, pin, true));
-    }
-    let local = relation.in_world(world).ok()?;
-    let local_checked = operations.windows(2).any(|pair| matches!(pair, [
-        Operation::Public(TxOp::OwnedCheckWorldPurge { relation: guarded, pin: original, .. }),
-        Operation::Public(TxOp::OwnedCheck { relation: checked, id: observed, expected: Some(_), .. })
-    ] if guarded == &local && checked == &local && observed == &id && *original == pin));
-    if !root_checked || !local_checked { return None; }
+        let root_checked = operations.iter().any(|op| matches!(op,
+            Operation::Public(TxOp::OwnedCheck { relation: checked, id: observed, expected, .. })
+                if checked == relation && observed == &id && expected.is_none() == insert
+        ));
+        if close {
+            return (root_checked && proposal_close_controls(controls)
+                && !operations.iter().any(|op| match op {
+                    Operation::Public(TxOp::OwnedCheckWorldPurge { .. }) => true,
+                    _ => op.owned_relation().is_some_and(|relation| relation.world().is_some()),
+                })).then_some((world, pin, true));
+        }
+        let local = relation.in_world(world).ok()?;
+        let local_checked = operations.windows(2).any(|pair| matches!(pair, [
+            Operation::Public(TxOp::OwnedCheckWorldPurge { relation: guarded, pin: original, .. }),
+            Operation::Public(TxOp::OwnedCheck { relation: checked, id: observed, expected: Some(_), .. })
+        ] if guarded == &local && checked == &local && observed == &id && *original == pin));
+        if !root_checked || !local_checked { return None; }
     }
     (expected_clock.is_some() && proposal_land_controls(controls)).then_some((world, pin, false))
 }
