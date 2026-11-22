@@ -875,8 +875,16 @@ impl OwnedReadSession {
     pub fn check(&self) -> Result<()> { self.context.check_cancelled() }
 
     pub async fn open_point(&self, relation: &rtdb_types::OwnedRelation, id: &rtdb_types::EntityId) -> Result<Option<QueryCursor>> {
+        self.open_point_at(relation, id, None).await
+    }
+
+    /// Reads the business-valid instant while retaining this session's original system cut.
+    pub async fn open_point_at(
+        &self, relation: &rtdb_types::OwnedRelation, id: &rtdb_types::EntityId, valid_at: Option<Timestamp>,
+    ) -> Result<Option<QueryCursor>> {
         self.admit_read().await?;
-        rtdb_query::open_owned_point(Arc::clone(&self.context), &self.owner, relation, id, None, None).await
+        let valid = valid_at.map(|at| rtdb_types::Interval::new(at, at.next()?)).transpose()?;
+        rtdb_query::open_owned_point(Arc::clone(&self.context), &self.owner, relation, id, valid, None).await
     }
 
     /// Reads one covered page from the named ordered path at this held cut.

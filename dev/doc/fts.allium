@@ -10,6 +10,10 @@
 -- Which version of an entity is visible at the query's valid and system time is decided by the scan's bitemporal resolution, as it is for every other predicate, and MATCH is re-checked on the resolved row.
 -- So a search file that is missing costs a query time and never changes its result.
 --
+-- An owned clear-text declaration comes from the authenticated principal's protected search-path catalog.
+-- The artefact lane feeds its one explicitly declared UTF-8 column to the same search-file builder.
+-- Public SQL search definitions remain scoped to the public catalog.
+--
 -- The core knows a search file only as an artefact of kind `search`: trie-cat.allium records artefacts on trie entries, db.allium carries ArtefactsAdded through the leader, and gc.allium deletes artefacts with their owner.
 -- This spec owns what an artefact of kind `search` holds, which definitions and jobs produce them, and how a query reads them.
 --

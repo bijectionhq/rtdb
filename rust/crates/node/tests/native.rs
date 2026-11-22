@@ -350,6 +350,39 @@ async fn held_owned_points_share_one_cut_and_close_refuses_new_reads() {
 }
 
 #[tokio::test]
+async fn held_owned_point_reads_an_explicit_valid_instant_at_the_original_system_cut() {
+    use rtdb_types::{EntityId, OwnedRelation};
+
+    let mut settings = options();
+    settings.owned_relations = true;
+    let (node, driver) = running(settings, services()).await;
+    let mut writer = node.session("xtdb", Arc::new(Authority)).unwrap();
+    let relation = OwnedRelation::new("held-business-time").unwrap();
+    let id = EntityId::Integer(1);
+    let documents = |value| Documents::new(vec![StructFields::from([
+        ("_id".into(), Value::I64(1)), ("value".into(), Value::I64(value)),
+    ])], node.memory()).unwrap();
+    let write = TxOp::OwnedInsertDocs {
+        relation: relation.clone(), documents: documents(10), valid_from: Some(Timestamp(10)), valid_to: Some(Timestamp(20)),
+    };
+    assert!(writer.state_mut().execute_tx(vec![write], AutonomousTxOptions::default()).await.unwrap().committed());
+    let held = writer.open_owned_read().await.unwrap();
+    let update = TxOp::OwnedReplaceDocs {
+        relation: relation.clone(), documents: documents(11), valid_from: Some(Timestamp(10)), valid_to: Some(Timestamp(20)),
+    };
+    assert!(writer.state_mut().execute_tx(vec![update], AutonomousTxOptions::default()).await.unwrap().committed());
+    let cursor = held.open_point_at(&relation, &id, Some(Timestamp(10))).await.unwrap().unwrap();
+    assert_eq!(rows(cursor).await[0][..2], [Value::I64(1), Value::I64(10)]);
+    let cursor = held.open_point_at(&relation, &id, Some(Timestamp(20))).await.unwrap().unwrap();
+    assert!(rows(cursor).await.is_empty());
+    assert!(held.open_point_at(&relation, &id, Some(Timestamp::MAX)).await.is_err());
+    assert!(rows(held.open_point(&relation, &id).await.unwrap().unwrap()).await.is_empty());
+    drop(held);
+    drop(writer);
+    stop(&node, driver).await;
+}
+
+#[tokio::test]
 async fn held_owned_range_requires_a_covering_generation() {
     use rtdb_types::OwnedRelation;
 

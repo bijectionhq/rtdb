@@ -17,9 +17,28 @@ pub async fn open_owned_point(
     if owner.is_empty() {
         return Err(Anomaly::incorrect("rtdb.owned/no-owner", "Owned relations require an authenticated principal"));
     }
+    open_private_point(context, relation.table(owner), id, valid, columns).await
+}
+
+pub async fn open_owned_relation_schema(
+    context: Arc<QueryContext>, owner: &str, relation: &OwnedRelation,
+) -> Result<Option<QueryCursor>> {
+    if owner.is_empty() {
+        return Err(Anomaly::incorrect("rtdb.owned/no-owner", "Owned relations require an authenticated principal"));
+    }
+    open_private_point(
+        context, OwnedRelation::relation_catalog(owner), &EntityId::String(relation.name().into()),
+        None, Some(&["schema"]),
+    ).await
+}
+
+async fn open_private_point(
+    context: Arc<QueryContext>, table: TableRef, id: &EntityId,
+    valid: Option<Interval>, columns: Option<&[&str]>,
+) -> Result<Option<QueryCursor>> {
     let name = QualifiedTable {
         database: context.catalog.default_database().to_owned(),
-        table: relation.table(owner),
+        table,
     };
     let context = context.for_owned_relation(name.clone(), Some(id.clone()));
     let Some(table) = context.catalog.table(&name)? else { return Ok(None); };
@@ -76,7 +95,7 @@ pub async fn open_owned_path_catalog(
     catalog: &TableRef,
     path: Option<&str>,
 ) -> Result<Option<QueryCursor>> {
-    if !catalog.is_owned_path_catalog() {
+    if !catalog.is_owned_path_catalog() && !catalog.is_owned_search_catalog() {
         return Err(Anomaly::incorrect("rtdb.owned/path-catalog", "Expected an owned path catalog"));
     }
     let name = QualifiedTable { database: context.catalog.default_database().to_owned(), table: catalog.clone() };

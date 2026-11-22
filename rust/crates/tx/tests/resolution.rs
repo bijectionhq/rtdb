@@ -755,3 +755,53 @@ async fn external_event_writer_cannot_erase_private_replay_markers() {
     assert_eq!(resolved.result().error().unwrap().code, "xtdb/forbidden-table");
     assert!(!resolved.writes().tables().contains_key(&TableRef::new("xt", "rtdb_replay_keys")));
 }
+
+#[tokio::test]
+async fn declared_owned_schema_distinguishes_omission_and_null_after_source_decode() {
+    use rtdb_format::envelope::SourceMessage;
+    use rtdb_types::{OwnedRelation, OwnedSchema};
+
+    let context = context();
+    let state = PartitionState::empty(Default::default()).unwrap();
+    let relation = OwnedRelation::new("typed-orders").unwrap();
+    let schema = OwnedSchema::from_json(br#"{"fields":[
+        {"name":"amount","type":{"kind":"i64"},"optional":true,"nullable":false}
+    ]}"#).unwrap();
+    let source = |operations| {
+        let request = SourceTransaction::new(
+            operations, SubmitOptions { user: Some("owner".into()), ..SubmitOptions::default() }, &context.memory,
+        ).unwrap();
+        let encoded = request.encode().unwrap();
+        let message = SourceMessage::decode(encoded.as_slice()).unwrap().unwrap();
+        SourceTransaction::decode(&message, &context.memory).unwrap()
+    };
+    let documents = |value| {
+        let mut row = StructFields::from([("_id".into(), Value::I64(1))]);
+        if let Some(value) = value { row.insert("amount".into(), value); }
+        Documents::new(vec![row], &context.memory).unwrap()
+    };
+    let mut resolver = TxResolver::new(None, SourcePosition(-1), None, &context.memory).unwrap();
+    let declare = TxOp::OwnedDeclareRelation { relation: relation.clone(), schema };
+    let declared = resolver.resolve_source(
+        state.snapshot(), SourcePosition(0), Timestamp(100), source(vec![declare]), &context,
+    ).await.unwrap();
+    assert!(declared.result().committed());
+    assert!(declared.writes().tables().contains_key(&OwnedRelation::relation_catalog("owner")));
+
+    let create = TxOp::OwnedInsertDocs {
+        relation: relation.clone(), documents: documents(None), valid_from: None, valid_to: None,
+    };
+    let created = resolver.resolve_source(
+        state.snapshot(), SourcePosition(1), Timestamp(101), source(vec![create]), &context,
+    ).await.unwrap();
+    assert!(created.result().committed());
+
+    let replace = TxOp::OwnedReplaceDocs {
+        relation: relation.clone(), documents: documents(Some(Value::Null)), valid_from: None, valid_to: None,
+    };
+    let refused = resolver.resolve_source(
+        state.snapshot(), SourcePosition(2), Timestamp(102), source(vec![replace]), &context,
+    ).await.unwrap();
+    assert_eq!(refused.result().error().unwrap().code, "rtdb.owned/nonconforming");
+    assert!(!refused.writes().tables().contains_key(&relation.table("owner")));
+}

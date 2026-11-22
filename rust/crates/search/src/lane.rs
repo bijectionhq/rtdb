@@ -37,7 +37,7 @@ impl rtdb_maintenance::ArtefactKind for SearchArtefacts {
     }
 }
 
-/// Builds the search files of one database, for every definition in `xt.search_indexes`.
+/// Builds search files from the public and protected search catalogs of one database.
 pub struct SearchBuilder {
     database: String,
     store: Arc<dyn ObjectStore>,
@@ -45,15 +45,19 @@ pub struct SearchBuilder {
     memory: Arc<MemoryBudget>,
     clock: Arc<dyn Fn() -> rtdb_types::Instant + Send + Sync>,
     runtime: Arc<crate::SearchRuntime>,
-    columns: Mutex<BTreeMap<(String, i64), Vec<String>>>,
+    columns: Mutex<BTreeMap<(rtdb_types::TableRef, String, i64), Vec<String>>>,
 }
 
 impl SearchBuilder {
     pub fn new(database: String, store: Arc<dyn ObjectStore>, storage: Arc<BufferPool>, memory: Arc<MemoryBudget>, clock: Arc<dyn Fn() -> rtdb_types::Instant + Send + Sync>, runtime: Arc<crate::SearchRuntime>) -> Self {
         Self { database, store, storage, memory, clock, runtime, columns: Mutex::new(BTreeMap::new()) }
     }
-    async fn search_definitions(&self, snapshot: &Arc<PartitionValue>, cancellation: &CancellationToken) -> Result<Arc<Vec<SearchDefinition>>> {
-        self.runtime.definitions(&self.database, &[snapshot.snapshot()], &self.storage, &self.memory, (self.clock)(), cancellation).await
+    async fn search_definitions(&self, partition: &Arc<PartitionValue>, cancellation: &CancellationToken) -> Result<Vec<SearchDefinition>> {
+        let now = (self.clock)();
+        let snapshot = partition.snapshot();
+        let public = self.runtime.definitions(&self.database, std::slice::from_ref(&snapshot), &self.storage, &self.memory, now, cancellation).await?;
+        let owned = crate::definitions::owned_definitions_in(&self.database, snapshot, &self.storage, &self.memory, now, cancellation).await?;
+        Ok(public.iter().cloned().chain(owned).collect())
     }
 }
 
@@ -64,7 +68,7 @@ impl ArtefactBuilder for SearchBuilder {
         let mut columns = self.columns.lock();
         Ok(definitions.iter().map(|definition| {
             let id = definition.artefact_id();
-            columns.insert((id.clone(), definition.version), definition.columns.clone());
+            columns.insert((definition.table.clone(), id.clone(), definition.version), definition.columns.clone());
             ArtefactDefinition { table: definition.table.clone(), kind: KIND.into(), id, version: definition.version, historical: definition.history, group_bytes: Some(group_bytes(&self.memory)) }
         }).collect())
     }
@@ -108,10 +112,10 @@ impl ArtefactBuilder for SearchBuilder {
                 published_version: None,
             })
         };
-        let known = self.columns.lock().get(&(definition.id.clone(), definition.version)).cloned();
+        let known = self.columns.lock().get(&(definition.table.clone(), definition.id.clone(), definition.version)).cloned();
         let columns = match known { Some(columns) => columns, None => {
             self.definitions(snapshot, cancellation).await?;
-            self.columns.lock().get(&(definition.id.clone(), definition.version)).cloned().ok_or_else(|| Anomaly::incorrect("rtdb.search/definition-dropped", "The search index definition is no longer in force"))?
+            self.columns.lock().get(&(definition.table.clone(), definition.id.clone(), definition.version)).cloned().ok_or_else(|| Anomaly::incorrect("rtdb.search/definition-dropped", "The search index definition is no longer in force"))?
         } };
         let entry = snapshot.table_catalog().entry(&definition.table).ok_or_else(|| Anomaly::fault("rtdb.search/unknown-table", "Search job targets a table the catalog does not hold"))?;
         let identity = format!("{}/{}/{}-v{}", entry.slug.as_str(), job.owner, definition.id, definition.version);

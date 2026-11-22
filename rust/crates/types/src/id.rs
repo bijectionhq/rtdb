@@ -162,6 +162,8 @@ impl TableRef {
 const OWNED_SCHEMA_PREFIX: &str = "rtdb_owned_";
 const OWNED_SCHEMA_V1: &str = "rtdb_owned_v1";
 const OWNED_PATH_CATALOG: &str = ".ordered-paths";
+const OWNED_SEARCH_CATALOG: &str = ".search-paths";
+const OWNED_RELATION_CATALOG: &str = ".relation-schemas";
 
 /// A native relation provisioned in the authenticated principal's namespace.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -181,6 +183,9 @@ impl OwnedRelation {
     pub fn table(&self, owner: &str) -> TableRef { owned_table(owner, &self.0) }
 
     pub fn path_catalog(owner: &str) -> TableRef { owned_table(owner, OWNED_PATH_CATALOG) }
+
+    pub fn search_catalog(owner: &str) -> TableRef { owned_table(owner, OWNED_SEARCH_CATALOG) }
+    pub fn relation_catalog(owner: &str) -> TableRef { owned_table(owner, OWNED_RELATION_CATALOG) }
 }
 
 fn owned_table(owner: &str, name: &str) -> TableRef {
@@ -203,11 +208,24 @@ impl TableRef {
             && self.supported_owned_name()
     }
 
+    pub fn is_owned_search_catalog(&self) -> bool {
+        self.table.split_once('-').is_some_and(|(_, name)| name == OWNED_SEARCH_CATALOG)
+            && self.supported_owned_name()
+    }
+
+    /// True only for ordinary owned relations within this protected catalog's namespace.
+    pub fn owns_path_target(&self, target: &Self) -> bool {
+        (self.is_owned_path_catalog() || self.is_owned_search_catalog())
+            && target.supported_owned_name()
+            && !target.is_owned_path_catalog() && !target.is_owned_search_catalog()
+            && target.table[..64] == self.table[..64]
+    }
+
     pub fn supported_owned_name(&self) -> bool {
         self.schema == OWNED_SCHEMA_V1
             && self.table.split_once('-').is_some_and(|(owner, name)| {
                 owner.len() == 64 && owner.bytes().all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-                    && (name == OWNED_PATH_CATALOG || OwnedRelation::new(name).is_ok())
+                    && (matches!(name, OWNED_PATH_CATALOG | OWNED_SEARCH_CATALOG | OWNED_RELATION_CATALOG) || OwnedRelation::new(name).is_ok())
             })
     }
 }

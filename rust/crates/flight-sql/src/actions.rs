@@ -12,6 +12,8 @@ impl Service {
     pub async fn action(&self, call: Call, action: Action) -> Result<Response<Output<ActionResult>>, Status> {
         let work = async {
             match action.r#type.as_str() {
+                crate::owned_actions::DECLARE_OWNED_SEARCH_PATH_V1 => Ok(vec![Ok(self.declare_owned_search_path_action(&call, &action.body).await?)]),
+                crate::owned_actions::DECLARE_OWNED_RELATION_V1 => Ok(vec![Ok(self.declare_owned_relation_action(&call, &action.body).await?)]),
                 crate::owned_actions::DECLARE_OWNED_PATH_V1 => Ok(vec![Ok(self.declare_owned_path_action(&call, &action.body).await?)]),
                 crate::owned_actions::CREATE_OWNED_V1 => Ok(vec![Ok(self.create_owned_action(&call, &action.body).await?)]),
                 crate::owned_actions::COMMIT_OWNED_V1 => Ok(vec![Ok(self.commit_owned_action(&call, &action.body, crate::owned_actions::CommitFormat::Single).await?)]),
@@ -19,7 +21,8 @@ impl Service {
                 crate::owned_actions::OPEN_OWNED_READ_V1 => Ok(vec![Ok(self.open_owned_read_action(&call, &action.body).await?)]),
                 crate::owned_actions::HELD_OWNED_RANGE_V1 => Ok(vec![Ok(self.held_owned_range_action(&call, &action.body, false).await?)]),
                 crate::owned_actions::HELD_OWNED_RANGE_V2 => Ok(vec![Ok(self.held_owned_range_action(&call, &action.body, true).await?)]),
-                crate::owned_actions::HELD_OWNED_POINT_V1 => Ok(vec![Ok(self.held_owned_point_action(&call, &action.body).await?)]),
+                crate::owned_actions::HELD_OWNED_POINT_V1 => Ok(vec![Ok(self.held_owned_point_action(&call, &action.body, false).await?)]),
+                crate::owned_actions::HELD_OWNED_POINT_V2 => Ok(vec![Ok(self.held_owned_point_action(&call, &action.body, true).await?)]),
                 crate::owned_actions::CLOSE_OWNED_READ_V1 => {
                     self.close_owned_read_action(&call, &action.body)?;
                     Ok(Vec::new())

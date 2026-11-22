@@ -56,6 +56,13 @@ pub enum LogicalType {
 }
 
 impl LogicalType {
+    /// Whether this type admits text and no non-text values besides null.
+    pub fn is_clear_search_text(&self) -> bool {
+        let legs = self.legs();
+        legs.contains(&Self::Scalar(ScalarType::Utf8))
+            && legs.iter().all(|leg| matches!(leg, Self::Scalar(ScalarType::Utf8) | Self::Null))
+    }
+
     /// Includes inline storage and owned capacities, with conservative tree-node overhead.
     pub fn retained_bytes(&self) -> Result<usize> {
         let mut bytes = std::mem::size_of::<Self>();

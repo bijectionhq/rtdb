@@ -613,8 +613,12 @@ impl<'a> OpenTransaction<'a> {
             }
             Operation::Public(TxOp::PutArrowDocs { table, documents }) => self.put_arrow_documents(table, documents, None, None, None),
             Operation::PutArrowIids { table, documents, iids, valid_from, valid_to } => self.put_arrow_documents(table, documents, Some(iids), *valid_from, *valid_to),
+            Operation::Public(TxOp::OwnedDeclareRelation { relation, schema }) =>
+                self.declare_owned_relation(relation, schema).await,
             Operation::Public(TxOp::OwnedDeclarePath { relation, name, columns }) =>
-                self.declare_owned_path(relation, name, columns).await,
+                self.declare_owned_path(relation, name, columns, false).await,
+            Operation::Public(TxOp::OwnedDeclareSearchPath { relation, name, column }) =>
+                self.declare_owned_path(relation, name, std::slice::from_ref(column), true).await,
             Operation::Public(TxOp::OwnedDeadline { .. } | TxOp::OwnedCheck { .. }) => Ok(()),
             Operation::Public(TxOp::OwnedDelete { relation, id, valid_from, valid_to }) =>
                 self.delete_owned(relation, id, *valid_from, *valid_to).await,
@@ -662,18 +666,68 @@ impl<'a> OpenTransaction<'a> {
         let mutation = rtdb_sql::prepare_patch(QualifiedTable { database: self.context.database.clone(), table: table.clone() }, input, TemporalFilter::FromTo { from: Expr::Literal(time_value(interval.lower())), to: Expr::Literal(time_value(interval.upper())) }, &context.catalog)?;
         self.execute_mutation(mutation, context, None, None).await
     }
+    async fn declare_owned_relation(&mut self, relation: &rtdb_types::OwnedRelation, schema: &rtdb_types::OwnedSchema) -> Result<()> {
+        let owner = self.options.user.as_deref().filter(|owner| !owner.is_empty()).ok_or_else(no_owned_principal)?;
+        if self.snapshot()?.contains_table(&relation.table(owner))
+            || self.read_owned_schema(owner, relation).await?.is_some()
+        {
+            return Err(Anomaly::new(AnomalyCategory::Conflict, "rtdb.owned/relation-exists",
+                "The owned relation already has data or a declaration"));
+        }
+        let _encoded = self.context.memory.reserve(schema.retained_bytes() * 8 + 4096)?;
+        let document = StructFields::from([
+            ("_id".into(), Value::Utf8(relation.name().into())),
+            ("schema".into(), Value::Binary(schema.to_json()?)),
+        ]);
+        self.buffer.put(rtdb_types::OwnedRelation::relation_catalog(owner), document, Interval::ALL)
+    }
+
+    async fn read_owned_schema(&self, owner: &str, relation: &rtdb_types::OwnedRelation) -> Result<Option<(rtdb_types::OwnedSchema, Arc<MemoryReservation>)>> {
+        let snapshot = self.snapshot()?;
+        if !snapshot.contains_table(&rtdb_types::OwnedRelation::relation_catalog(owner)) {
+            return Ok(None);
+        }
+        let context = self.context.query_context(snapshot, self.tx_key().system_time, &self.options.default_tz, self.trace_parent)?
+            .with_accelerators(Arc::from([]));
+        let Some(mut cursor) = rtdb_query::open_owned_relation_schema(context, owner, relation).await? else { return Ok(None); };
+        let mut schema = None;
+        while let Some(batch) = cursor.next_batch().await? {
+            let batch = batch.batch();
+            for row in 0..batch.num_rows() {
+                let malformed = || Anomaly::fault("rtdb.owned/schema-catalog", "Invalid stored owned declaration");
+                if schema.is_some() { return Err(malformed()); }
+                let (index, field) = batch.schema_ref().column_with_name("schema").ok_or_else(malformed)?;
+                let values = batch.column(index).as_ref();
+                let bound = rtdb_columnar::estimate_read_value_bytes(field, values, row)?;
+                let decoded = self.context.memory.reserve(bound.checked_mul(8).and_then(|bound| bound.checked_add(4096)).ok_or_else(overflow)?)?;
+                let Value::Binary(bytes) = rtdb_columnar::read_value(field, values, row)? else { return Err(malformed()); };
+                schema = Some((rtdb_types::OwnedSchema::from_json(&bytes).map_err(|_| malformed())?, decoded));
+            }
+        }
+        Ok(schema)
+    }
+
     async fn declare_owned_path(
-        &mut self, relation: &rtdb_types::OwnedRelation, name: &rtdb_types::OwnedRelation, columns: &[String],
+        &mut self, relation: &rtdb_types::OwnedRelation, name: &rtdb_types::OwnedRelation,
+        columns: &[String], search: bool,
     ) -> Result<()> {
         let owner = self.options.user.as_deref().filter(|owner| !owner.is_empty()).ok_or_else(no_owned_principal)?;
         let target = relation.table(owner);
-        let catalog = rtdb_types::OwnedRelation::path_catalog(owner);
+        let catalog = if search { rtdb_types::OwnedRelation::search_catalog(owner) } else { rtdb_types::OwnedRelation::path_catalog(owner) };
         let snapshot = self.snapshot()?;
         if !snapshot.contains_table(&target) {
             return Err(Anomaly::incorrect("rtdb.owned/path-relation", "Owned path requires an existing relation"));
         }
         let available = snapshot.column_names(&target);
-        if !(2..=16).contains(&columns.len())
+        if search {
+            let [column] = columns else { return Err(invalid_search_path_column()); };
+            let types = snapshot.column_types_for(&target, columns.iter().cloned());
+            if column.starts_with('_') || !available.contains(column)
+                || !types.get(column).is_some_and(rtdb_types::LogicalType::is_clear_search_text)
+            {
+                return Err(invalid_search_path_column());
+            }
+        } else if !(2..=16).contains(&columns.len())
             || columns.last().is_none_or(|column| column != "_id")
             || columns.iter().collect::<std::collections::BTreeSet<_>>().len() != columns.len()
             || columns.iter().any(|column| !available.contains(column) || (column.starts_with('_') && column != "_id"))
@@ -760,6 +814,17 @@ impl<'a> OpenTransaction<'a> {
             for (document, iid) in documents.rows().iter().zip(iids) {
                 if crate::source::document_id(document, &self.context.memory)?.iid() != *iid {
                     return Err(Anomaly::incorrect("xtdb/invalid-iids", "Owned document IID does not match its identity"));
+                }
+            }
+        }
+        if let Some((schema, _retained)) = self.read_owned_schema(owner, relation).await? {
+            if !documents.has_exact_presence() {
+                return Err(Anomaly::incorrect("rtdb.owned/field-presence", "Declared owned writes require exact field presence"));
+            }
+            for row in documents.rows() {
+                schema.validate_row(row)?;
+                for value in row.values().filter(|value| matches!(value, Value::Decimal(_))) {
+                    rtdb_columnar::build_array(&value.logical_type(), std::slice::from_ref(value))?;
                 }
             }
         }
@@ -952,6 +1017,10 @@ async fn require_empty_insert(mut cursor: QueryCursor) -> Result<()> {
 
 fn insert_exists() -> Anomaly {
     Anomaly::new(AnomalyCategory::Conflict, "rtdb.tx/exists", "Insert overlaps an existing document")
+}
+
+fn invalid_search_path_column() -> Anomaly {
+    Anomaly::incorrect("rtdb.owned/search-column", "Owned search requires one stored clear-text UTF-8 column")
 }
 
 fn no_owned_principal() -> Anomaly {
