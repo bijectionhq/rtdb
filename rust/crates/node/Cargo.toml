@@ -8,7 +8,7 @@ publish.workspace = true
 
 [features]
 default = ["search"]
-search = ["dep:rtdb-search"]
+search = ["dep:rtdb-search", "dep:rtdb-text"]
 fts-experiments = ["search", "rtdb-search/experiments"]
 kafka = ["dep:rtdb-kafka"]
 kafka-connect = ["kafka"]
@@ -47,6 +47,7 @@ rtdb-azure = { workspace = true, optional = true }
 rtdb-gcs = { workspace = true, optional = true }
 rtdb-pg-source = { workspace = true, optional = true }
 rtdb-search = { workspace = true, optional = true }
+rtdb-text = { workspace = true, optional = true }
 async-trait.workspace = true
 futures.workspace = true
 prost-types.workspace = true
