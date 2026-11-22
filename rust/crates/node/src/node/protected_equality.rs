@@ -10,7 +10,7 @@ use rtdb_types::{
     Anomaly, AnomalyCategory, EntityId, OwnedRelation, Result, TransactionKey, Value,
 };
 
-use super::{OwnedRangeWitness, OwnedReadSession};
+use super::{OwnedIdentityPage, OwnedRangeWitness, OwnedReadSession};
 
 const MAX_ROWS: usize = 512;
 const PAGE_ROWS: usize = 64;
@@ -70,6 +70,40 @@ pub struct HeldProtectedEquality<'a> {
 }
 
 impl OwnedReadSession {
+    /// Give the installed hosted projector a bounded page of ciphertext
+    /// carrier identities and a witness only on completion of its prefix.
+    pub async fn protected_carrier_page(
+        &self,
+        relation: &OwnedRelation,
+        prefix: &str,
+        after: Option<&str>,
+        limit: usize,
+        scope: rtdb_types::PlacedAttemptScope,
+    ) -> Result<(OwnedIdentityPage, Option<OwnedRangeWitness>)> {
+        self.admit_read().await?;
+        if self.witness_scope != Some(scope)
+            || relation.name() != "fact_unit_column_payloads"
+            || !valid_carrier_prefix(prefix)
+            || limit > PAGE_ROWS
+            || after.is_some_and(|id| !valid_carrier(id, prefix))
+        {
+            return Err(unavailable());
+        }
+        let at = self.present.system_time;
+        let page = self
+            .identity_page_in_prefix(relation, at, at, after, limit, Some(prefix))
+            .await?;
+        if page.keys.iter().any(|id| !valid_carrier(id, prefix)) {
+            return Err(unavailable());
+        }
+        let witness = if page.more {
+            None
+        } else {
+            Some(self.relation_witness(relation)?.ok_or_else(unavailable)?)
+        };
+        Ok((page, witness))
+    }
+
     /// Build a small complete derived index from the admitted live root cut.
     /// The owned relation is private to the admitted installation; this path
     /// does not read a historical restore, world overlay, or lifetime table.
@@ -101,7 +135,7 @@ impl OwnedReadSession {
             _charges: Vec::new(),
         };
         let prefix = index.custody.carrier_prefix();
-        if prefix.len() != 2 * CARRIER_PREFIX_BYTES || !prefix.starts_with("4246435032") {
+        if !valid_carrier_prefix(prefix) {
             return Err(unavailable());
         }
         let mut after = None;
@@ -124,11 +158,7 @@ impl OwnedReadSession {
                 if scanned > MAX_ROWS {
                     return Err(bound());
                 }
-                if id.len() != 2 * (CARRIER_PREFIX_BYTES + CARRIER_IMAGE_BYTES)
-                    || !id
-                        .bytes()
-                        .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-                {
+                if !valid_carrier(id, prefix) {
                     return Err(unavailable());
                 }
                 let (envelope, _charge) = envelope(self, relation, id).await?;
@@ -240,6 +270,23 @@ async fn envelope(
         output = Some((envelope, charge));
     }
     output.ok_or_else(unavailable)
+}
+
+fn lower_hex(text: &str) -> bool {
+    text.bytes()
+        .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn valid_carrier_prefix(prefix: &str) -> bool {
+    prefix.len() == 2 * CARRIER_PREFIX_BYTES
+        && prefix.starts_with("4246435032")
+        && lower_hex(prefix)
+}
+
+fn valid_carrier(id: &str, prefix: &str) -> bool {
+    id.len() == 2 * (CARRIER_PREFIX_BYTES + CARRIER_IMAGE_BYTES)
+        && id.starts_with(prefix)
+        && lower_hex(id)
 }
 
 fn unavailable() -> Anomaly {

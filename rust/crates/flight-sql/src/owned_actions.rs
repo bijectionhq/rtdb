@@ -153,6 +153,7 @@ pub(crate) const HELD_OWNED_VALID_DURING_V2: &str = "rtdb.owned.ReadHeldValidDur
 pub(crate) const HELD_WORLD_VALID_V1: &str = "rtdb.owned.ReadHeldWorldValidDuring.v1";
 pub(crate) const HELD_WORLD_IDENTITIES_V1: &str = "rtdb.owned.ReadHeldWorldIdentityPage.v1";
 pub(crate) const HELD_WORLD_OVERLAY_IDENTITIES_V1: &str = "rtdb.owned.ReadHeldWorldOverlayIdentityPage.v1";
+pub(crate) const HELD_PROTECTED_CARRIERS_V1: &str = "rtdb.owned.ReadHeldProtectedCarrierPage.v1";
 pub(crate) const HELD_OWNED_IDENTITIES_V1: &str = "rtdb.owned.ReadHeldIdentityPage.v1";
 pub(crate) const HELD_OWNED_VERSIONS_V2: &str = "rtdb.owned.ReadHeldVersions.v2";
 pub(crate) const CLOSE_OWNED_READ_V1: &str = "rtdb.owned.CloseRead.v1";
@@ -963,6 +964,50 @@ impl Service {
             [(OWNED_IDENTITY_MORE.into(), u8::from(page.more).to_string())].into()
         );
         let reply = self.owned_point_reply(&schema, Some(&rows), system, valid, None)?;
+        held.snapshot.check_relation(&relation).map_err(status)?;
+        Ok(reply)
+    }
+
+    pub(crate) async fn held_protected_carriers_action(&self, call: &Call, body: &[u8]) -> Result<ActionResult, Status> {
+        if !self.0.config.owned_native_actions { return Err(unsupported()); }
+        self.hosted_control_policy(call)?;
+        let scope = self.hosted_control_scope(call).await?;
+        let (handle, request) = body.split_first_chunk::<16>()
+            .ok_or_else(|| invalid("Protected carrier page has no held handle"))?;
+        let held = self.owned_read(call, &Bytes::copy_from_slice(handle))?;
+        let (relation, arrow_bytes) = split_relation(request)?;
+        let batch = decode_batch(call, arrow_bytes)?;
+        let batch = batch.batch();
+        if batch.num_columns() != 3 || batch.num_rows() != 1 {
+            return Err(invalid("Protected carrier page requires a prefix, bound, and limit"));
+        }
+        let text = |name: &str| {
+            batch.column_by_name(name).and_then(|array| array.as_any().downcast_ref::<StringArray>())
+                .ok_or_else(|| invalid("Protected carrier key must be Utf8"))
+        };
+        let prefix = text("prefix")?;
+        if prefix.is_null(0) { return Err(invalid("Protected carrier prefix is absent")); }
+        let after = text("after")?;
+        let after = (!after.is_null(0)).then(|| after.value(0));
+        let limit = usize::try_from(history_request_integer(batch, "limit")?)
+            .map_err(|_| invalid("Protected carrier page limit is out of range"))?;
+        let (page, witness) = held.snapshot.protected_carrier_page(
+            &relation, prefix.value(0), after, limit, scope,
+        ).await.map_err(status)?;
+        let bytes = page.keys.iter().try_fold(4096, |size, key| wire::add(size, key.len()))?;
+        let _copy = call.reserve(bytes)?;
+        let keys = StringArray::from_iter_values(page.keys.iter().map(String::as_str));
+        let rows = RecordBatch::try_from_iter([("_id", Arc::new(keys) as Arc<dyn Array>)]).map_err(arrow)?;
+        let mut metadata = std::collections::HashMap::from([
+            (OWNED_IDENTITY_MORE.into(), u8::from(page.more).to_string()),
+        ]);
+        if let Some(witness) = witness {
+            let nonce = held.remember(call, &relation, witness)?;
+            metadata.insert(OWNED_RANGE_WITNESS.into(), nonce.simple().to_string());
+        }
+        let schema = rows.schema_ref().as_ref().clone().with_metadata(metadata);
+        let at = held.snapshot.present().system_time;
+        let reply = self.owned_point_reply(&schema, Some(&rows), at, at, None)?;
         held.snapshot.check_relation(&relation).map_err(status)?;
         Ok(reply)
     }
