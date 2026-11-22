@@ -361,7 +361,6 @@ struct CoveredCorpus {
 async fn covered_owned_corpus(
     context: Arc<QueryContext>, owner: &str, relation: &OwnedRelation, path: &OwnedRelation, query: &Query, retain_runs: bool,
 ) -> Result<CoveredCorpus> {
-    rtdb_query::require_owned_address_coverage(&context, owner, relation)?;
     let definition = crate::definitions::owned_definition(Arc::clone(&context), owner, relation, path).await?
         .ok_or_else(|| Anomaly::incorrect("rtdb.owned/search-path", "Owned relation has no declared clear-text search path with this name"))?;
     let database = context.catalog.default_database();
@@ -416,6 +415,8 @@ async fn covered_owned_corpus(
         frequencies: query.terms().iter().cloned().map(|term| (term, 0)).collect(),
         ..rtdb_text::Corpus::default()
     };
+    // The physical slot is only a local instruction for rereading the source.
+    // Corpus membership and uniqueness use the complete typed key.
     let mut seen = BTreeSet::new();
     let mut identities = BTreeMap::new();
     let mut visible_runs = Vec::new();
@@ -427,15 +428,17 @@ async fn covered_owned_corpus(
                 if doc.doc % 128 == 0 { context.check_cancelled()?; }
                 if !selected.file.visible(doc.doc, bounds) { continue; }
                 Arc::get_mut(&mut scratch).expect("corpus owns its reservation").grow_to(4096usize.saturating_add(identities.len().saturating_add(1).saturating_mul(256)))?;
-                let id = selected.file.run_identity_bytes(doc)?;
-                if identities.insert(doc.iid, id).is_some_and(|previous| previous != id) {
+                let key = selected.file.run_identity_bytes(doc)?;
+                let _key = context.memory.reserve(key.len())?;
+                selected.file.run_identity(doc)?;
+                if identities.insert(doc.iid, key).is_some_and(|previous| previous != key) {
                     return Err(uncovered_owned_search());
                 }
                 match cutter.judge(own, doc)? {
                     Judged::Hidden => (),
                     Judged::Visible { exact: false } => return Err(uncovered_owned_search()),
                     Judged::Visible { exact: true } => {
-                        if !seen.insert(doc.iid) { return Err(uncovered_owned_search()); }
+                        if !seen.insert(key) { return Err(uncovered_owned_search()); }
                         visible.insert(doc.doc);
                         corpus.documents += 1;
                         corpus.tokens += u64::from(selected.file.token_length(doc.doc)?);
@@ -509,14 +512,11 @@ pub async fn owned_ranked(
                 if candidates > 100_000 {
                     return Err(Anomaly::new(AnomalyCategory::Unavailable, "rtdb.owned/search-candidate-limit", "Covered search exceeded its candidate budget"));
                 }
+                let _key = context.memory.reserve(file.run_identity_bytes(run)?.len())?;
                 let id = file.run_identity(run)?;
-                let address = rtdb_query::owned_address(Arc::clone(&context), owner, relation, &id).await?;
-                if !matches!(address, rtdb_query::OwnedAddress::Assigned(locator) if locator.0 == run.iid) {
-                    return Err(uncovered_owned_search());
-                }
                 let columns = ["_id", covered.column.as_str()];
-                let Some(mut rows) = rtdb_query::open_owned_point(
-                    Arc::clone(&context), owner, relation, &id, Some(covered.bounds.valid_time), Some(&columns),
+                let Some(mut rows) = rtdb_query::open_owned_artefact_candidate(
+                    Arc::clone(&context), owner, relation, &id, Iid(run.iid), covered.bounds.valid_time, &columns,
                 ).await? else { return Err(uncovered_owned_search()); };
                 let mut resolved_score = None;
                 while let Some(batch) = rows.next_batch().await? {

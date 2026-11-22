@@ -347,7 +347,7 @@ A big-endian u32 offset (0 to 4096), u16 limit (1 to 128), and evidence flag byt
 The reply contains `_id` as a typed union of string, keyword, signed Int64 and UUID, `score: Float64`, and `partition: UInt64` as the zero-based request ordinal.
 Results sort by descending BM25 score across the full selected corpus, then by complete typed identity and partition ordinal.
 The held present and valid instant are in schema metadata, alongside `rtdb.owned.search_total` (the decimal count of all verified matches before slicing) and `rtdb.owned.search_scope` (the lowercase hex SHA-256 of the held handle, ordered relation/path frame, and query under the v4 domain tag). The scope binds pages only within the same hold. An empty result has a schema and no record batch.
-Every selected partition must have complete search artefacts at the held cut. Each matched posting is verified against the full identity and winning revision.
+Every selected partition must have complete format 10 search artefacts at the held cut. Corpus membership uses the complete canonical typed identity. Each matched posting nominates a physical row, which must have that same identity and winning revision at the held cut.
 A placed read with evidence requested publishes `rtdb.owned.search_witnesses` as the concatenated lowercase hex of one 16-byte range nonce per partition in request order. This also covers a successful empty result.
 
 `rtdb.owned.DeclareUniquePath.v1` uses the relation prefix and a terminated Arrow IPC stream with one batch and one row.
