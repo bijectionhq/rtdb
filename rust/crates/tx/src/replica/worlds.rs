@@ -170,7 +170,7 @@ pub(super) fn verify(
             || (world == ROOT) != (kind == Kind::Root) || fingerprint.len() != 32
             || attempt.len() != 22 || !attempt.bytes().all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
             || (effects.len() > 1 && matches!(kind, Kind::ProposalSettlement | Kind::ProposalOverlay | Kind::Fork | Kind::RootRetainedFork | Kind::RootRetainedAdvance | Kind::RootRetainedRenewal | Kind::RootRetainedSibling | Kind::ControlsRetainedFork | Kind::ProposalControlsFork | Kind::ProposalRootFork | Kind::ProposalRootHold | Kind::ProposalRootShorten | Kind::Advance | Kind::ControlsRetainedDrop | Kind::RootRetainedDrop | Kind::ProposalLanding | Kind::ProposalClose))
-            || (matches!(kind, Kind::RootRetainedDrop | Kind::ProposalLanding | Kind::ProposalClose | Kind::RootRetainedAdvance | Kind::RootRetainedRenewal | Kind::RootRetainedSibling | Kind::ProposalRootHold | Kind::ProposalRootShorten) && relations.len() != 1)
+            || (matches!(kind, Kind::RootRetainedDrop | Kind::ProposalClose | Kind::RootRetainedAdvance | Kind::RootRetainedRenewal | Kind::RootRetainedSibling | Kind::ProposalRootHold | Kind::ProposalRootShorten) && relations.len() != 1)
             || common_fingerprint.is_some_and(|first| first != fingerprint.as_slice())
             || worlds.insert(world, kind).is_some()
             || attempts.insert(attempt.as_str(), fingerprint.as_slice()).is_some()
@@ -227,6 +227,7 @@ pub(super) fn verify(
         expected_data.insert(OWNED_ROOT_PUBLICATION_RELATION);
     }
     let mut root_head = false;
+    let mut landed_rows = 0usize;
     let mut data = BTreeSet::new();
     let mut journals = BTreeSet::new();
     let mut overlays = BTreeSet::new();
@@ -326,13 +327,17 @@ pub(super) fn verify(
             if delete_root && allows_delete && (batch.len() != 1 || batch.header(0)?.op != EventOp::Delete) {
                 return Err(mismatch());
             }
-            if (root_holder_replace || landed) && allows_delete && (batch.len() != 1 || batch.header(0)?.op != EventOp::Put) {
+            if root_holder_replace && allows_delete && (batch.len() != 1 || batch.header(0)?.op != EventOp::Put) {
                 return Err(mismatch());
+            }
+            if landed && allows_delete {
+                landed_rows = landed_rows.saturating_add(batch.len());
+                if landed_rows > crate::MAX_PROPOSAL_LAND_ROWS { return Err(mismatch()); }
             }
             event_headers(batch, key, allows_delete && !root_holder_replace && !landed)?;
         }
     }
-    if !attempts.is_empty() || root_head != has_root || data != expected_data
+    if (landed && landed_rows == 0) || !attempts.is_empty() || root_head != has_root || data != expected_data
         || !journals.remove(OWNED_ATTEMPT_RELATION) || journals != expected_data
         || worlds.iter().any(|(world, kind)| match kind {
             Kind::Root | Kind::ProposalSettlement => false,

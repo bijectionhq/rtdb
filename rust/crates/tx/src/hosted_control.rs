@@ -323,13 +323,15 @@ pub fn proposal_close_controls<'a>(controls: impl IntoIterator<Item = &'a Hosted
     checks > 0 && (3..=5).contains(&replacements) && (1..=2).contains(&inserts)
 }
 
-/// One exact Proposal terminal effect and its matching witnessed Root write.
+pub const MAX_PROPOSAL_LAND_ROWS: usize = 16;
+
+/// One exact Proposal terminal effect and its matching witnessed Root writes.
 pub(crate) fn hosted_proposal_land(
     operations: &[crate::source::Operation],
 ) -> Option<(rtdb_types::Iid, rtdb_types::Iid, bool)> {
     use crate::{TxOp, source::Operation};
     let mut landing = None;
-    let mut replacement = None;
+    let mut replacements = std::collections::BTreeMap::new();
     let mut close = false;
     let mut controls = Vec::new();
     for op in operations {
@@ -339,14 +341,18 @@ pub(crate) fn hosted_proposal_land(
                 | TxOp::OwnedCheck { .. } | TxOp::OwnedCheckRange { .. } | TxOp::OwnedCheckWorldPurge { .. }) => (),
             Operation::Public(TxOp::OwnedReplaceDocs { relation, documents, valid_from: None, valid_to: None })
             | Operation::OwnedWriteIids { relation, documents, valid_from: None, valid_to: None, create_only: false, .. }
-                if relation.is_root_data() && replacement.is_none() && documents.rows().len() == 1 =>
+                if relation.is_root_data() && !close && !documents.rows().is_empty() =>
             {
-                replacement = Some((relation, documents.rows()[0].get("_id")?.entity_id().ok()?));
+                for row in documents.rows() {
+                    let id = row.get("_id")?.entity_id().ok()?;
+                    if replacements.insert((relation.name(), id.handle_bytes()), (relation, id)).is_some()
+                        || replacements.len() > MAX_PROPOSAL_LAND_ROWS { return None; }
+                }
             }
             Operation::Public(TxOp::OwnedDelete { relation, id, valid_from: None, valid_to: None })
-                if relation.is_root_data() && replacement.is_none() => {
+                if relation.is_root_data() && replacements.is_empty() => {
                 close = true;
-                replacement = Some((relation, id.clone()));
+                replacements.insert((relation.name(), id.handle_bytes()), (relation, id.clone()));
             }
             Operation::Public(TxOp::OwnedPublishWorld {
                 world, land_root: Some(pin), delete_root: None, advance_to: None,
@@ -356,12 +362,13 @@ pub(crate) fn hosted_proposal_land(
         }
     }
     let (world, pin, expected_clock) = landing?;
-    let (relation, id) = replacement?;
+    if replacements.is_empty() { return None; }
     if operations.iter().filter_map(Operation::owned_relation)
         .any(|relation| relation.is_world_catalog() || relation.world().is_some_and(|other| other != world))
     {
         return None;
     }
+    for (_, (relation, id)) in replacements {
     let root_checked = operations.iter().any(|op| matches!(op,
         Operation::Public(TxOp::OwnedCheck { relation: checked, id: observed, expected: Some(_), .. })
             if checked == relation && observed == &id
@@ -378,5 +385,7 @@ pub(crate) fn hosted_proposal_land(
         Operation::Public(TxOp::OwnedCheckWorldPurge { relation: guarded, pin: original, .. }),
         Operation::Public(TxOp::OwnedCheck { relation: checked, id: observed, expected: Some(_), .. })
     ] if guarded == &local && checked == &local && observed == &id && *original == pin));
-    (expected_clock.is_some() && root_checked && local_checked && proposal_land_controls(controls)).then_some((world, pin, false))
+    if !root_checked || !local_checked { return None; }
+    }
+    (expected_clock.is_some() && proposal_land_controls(controls)).then_some((world, pin, false))
 }
