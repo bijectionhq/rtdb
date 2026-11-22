@@ -131,8 +131,8 @@ value CellId {
 }
 
 value MemberId {
-    -- One process lifetime.
-    -- A restarted process registers a new MemberId.
+    -- Logkeepers retain their member identity with their durable journal.
+    -- Other roles register an identity for each process lifetime.
     uuid: String
 }
 
@@ -421,7 +421,6 @@ contract LogService {
     -- What a cell's log servers supply, per deployment.
     -- The log servers are logkeepers, built for this contract; the loglet kind is recorded per loglet, so another kind can back a deployment from its next epoch.
     -- A deployment's log is a dense sequence of records addressed by Lsn, carried by a chain of loglets.
-    -- Each server address contributes at most one acknowledgement to a loglet's quorum.
     append: (deployment: DeploymentId, epoch: Epoch, lsn: Lsn, records: List<LogRecord>) -> Lsn
     seal: (deployment: DeploymentId, loglet: Loglet, epoch: Epoch) -> SealReply
     check: (deployment: DeploymentId, epoch: Epoch) -> Epoch
@@ -444,6 +443,14 @@ contract LogService {
         -- A logkeeper serves only while it holds the journal's exclusive lock and its member lease.
         -- A replacement must reacquire the journal and obtain a new lease after the prior lease ends.
         -- A stable advertised address remains reserved for that journal.
+
+    @invariant QuorumsCountDistinctJournals
+        -- Each loglet slot names a distinct durable journal.
+        -- The client verifies the journal on each session before sending a journal operation.
+        -- A journal verifies that a bound operation addresses its identity before acting.
+        -- A failed or different identity contributes no vote to recovery, append, repair, read confirmation or retention.
+        -- Copy reservation and disposal retain journal identities for the full inventory, including members that have left the serving ensemble.
+        -- A legacy address inventory requires verified custody recorded at the inspected directory version before it authorizes a cell transfer or retirement.
 
     @invariant LocalJournalHasProcessBoundTransport
         -- A standalone authority addresses its journal by the retained journal ID.
@@ -482,7 +489,7 @@ contract LogService {
         -- A refusal reporting a higher epoch deposes the holder.
 
     @invariant ReadIndexUsesTheActiveLoglet
-        -- After recovering a durable write quorum, the writer installs an activation for its exact ensemble and write quorum in the new epoch.
+        -- Before writing, the holder activates a durable write quorum for the epoch, the member identities and the configured quorum size.
         -- A journal acknowledges activation only at its promised and synced epoch and records at most one ensemble for that epoch.
         -- A higher promise revokes the activation.
         -- A positive read-index reply requires that activation and reports the last held position after preceding journal work is durable.

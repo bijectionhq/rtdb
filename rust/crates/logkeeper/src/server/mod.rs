@@ -8,7 +8,7 @@ mod store;
 pub use journal::{JournalDigest, inspect_retained, inspect_retained_with_prefix};
 use crate::local::LocalListener;
 
-use crate::protocol::{Request, RequestBody, Response, ResponseBody, encode_frame, read_sized_frame};
+use crate::protocol::{JournalIdentity, Request, RequestBody, Response, ResponseBody, encode_frame, read_sized_frame};
 use bytes::BytesMut;
 use journal::{Journal, MemberIdentity};
 use rtdb_types::{Anomaly, AnomalyCategory, Result};
@@ -38,37 +38,34 @@ impl ServerOptions {
 pub struct PreparedJournal {
     journal: Journal,
     recovered: Vec<journal::Recovered>,
+    identity: Arc<str>,
 }
 
 impl PreparedJournal {
     pub async fn open(options: ServerOptions) -> Result<Self> {
-        Ok(Self::open_with_identity(options, None, false).await?.0)
+        Self::open_with_identity(options, None).await
     }
 
     /// Opens a member journal and recovers its ID before it can be advertised.
     pub async fn open_for_member(options: ServerOptions, candidate: String) -> Result<(Self, String)> {
-        let (journal, identity) = Self::open_with_identity(options, Some(candidate), false).await?;
-        let identity = identity.ok_or_else(|| Anomaly::fault("rtdb.logkeeper/identity", "The opened journal did not retain a member ID"))?;
+        let journal = Self::open_with_identity(options, Some(MemberIdentity::Open(candidate))).await?;
+        let identity = journal.identity.to_string();
         Ok((journal, identity))
     }
 
     /// Requires the retained journal identity before replay or registration.
     pub async fn reopen_member(options: ServerOptions, expected: String) -> Result<Self> {
-        Ok(Self::open_with_identity(options, Some(expected), true).await?.0)
+        Self::open_with_identity(options, Some(MemberIdentity::Reopen(expected))).await
     }
 
     async fn open_with_identity(
         options: ServerOptions,
-        identity: Option<String>,
-        reopen: bool,
-    ) -> Result<(Self, Option<String>)> {
+        member: Option<MemberIdentity>,
+    ) -> Result<Self> {
         let (journal, recovered, identity) = tokio::task::spawn_blocking(move || {
-            let member = identity.as_deref().map(|id| {
-                if reopen { MemberIdentity::Reopen(id) } else { MemberIdentity::Open(id) }
-            });
             Journal::open(&options.data_dir, options.fsync, options.cache_bytes, member)
         }).await.map_err(|error| Anomaly::fault("rtdb.logkeeper/recovery", error.to_string()))??;
-        Ok((Self { journal, recovered }, identity))
+        Ok(Self { journal, recovered, identity: identity.into() })
     }
 
     pub async fn serve(self, listener: TcpListener, cancellation: CancellationToken) -> Result<()> {
@@ -106,7 +103,7 @@ impl Listener {
 }
 
 async fn serve_prepared(mut listener: Listener, opened: PreparedJournal, cancellation: CancellationToken) -> Result<()> {
-    let PreparedJournal { journal, recovered } = opened;
+    let PreparedJournal { journal, recovered, identity } = opened;
     let journal = Arc::new(journal);
     let (queue, work) = mpsc::unbounded_channel();
     let has_dropped_streams = recovered.iter().any(|stream| stream.state.dropped);
@@ -123,11 +120,11 @@ async fn serve_prepared(mut listener: Listener, opened: PreparedJournal, cancell
                 Ok(Socket::Tcp(socket)) => {
                     let _ = socket.set_nodelay(true);
                     let (reader, writer) = socket.into_split();
-                    connections.spawn(connection(reader, writer, Arc::clone(&store), connections.clone(), stopping.clone()));
+                    connections.spawn(connection(reader, writer, Arc::clone(&store), Arc::clone(&identity), connections.clone(), stopping.clone()));
                 }
                 Ok(Socket::Local(socket)) => {
                     let (reader, writer) = tokio::io::split(socket);
-                    connections.spawn(connection(reader, writer, Arc::clone(&store), connections.clone(), stopping.clone()));
+                    connections.spawn(connection(reader, writer, Arc::clone(&store), Arc::clone(&identity), connections.clone(), stopping.clone()));
                 }
                 Err(error) => break Err(Anomaly::new(AnomalyCategory::Unavailable, "rtdb.logkeeper/accept", error.to_string())),
             },
@@ -147,6 +144,7 @@ async fn connection(
     mut reader: impl AsyncRead + Unpin,
     writer: impl AsyncWrite + Unpin + Send + 'static,
     store: Arc<Store>,
+    identity: Arc<str>,
     tasks: TaskTracker,
     cancellation: CancellationToken,
 ) {
@@ -159,8 +157,15 @@ async fn connection(
         };
         let id = request.id;
         let reply = |body: ResponseBody| Response { id, body: Some(body) };
+        if !request.target_journal.is_empty() && request.target_journal != *identity {
+            let _ = replies.send(reply(failed("the operation addresses another journal")));
+            continue;
+        }
         match request.body {
             None => { let _ = replies.send(reply(failed("a request without a body"))); }
+            Some(RequestBody::Identify(_)) => {
+                let _ = replies.send(reply(ResponseBody::JournalIdentity(JournalIdentity { journal: identity.to_string() })));
+            }
             Some(RequestBody::Fetch(fetch)) => {
                 match store.fetch(&fetch.stream, fetch.from_lsn, fetch.to_lsn, fetch.max_entries as usize, fetch.max_bytes as usize).map(|selected| selected.ready()) {
                     Ok(Ok(body)) | Err(body) => { let _ = replies.send(reply(body)); }
@@ -227,4 +232,39 @@ async fn write_replies(mut writer: impl AsyncWrite + Unpin, mut outbox: mpsc::Un
         buffer.clear();
     }
     let _ = writer.shutdown().await;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::protocol::{Seal, read_frame};
+
+    #[tokio::test]
+    async fn a_request_addressed_to_another_journal_cannot_seal_this_one() {
+        let disk = tempfile::tempdir().unwrap();
+        let expected = uuid::Uuid::new_v4().to_string();
+        let options = ServerOptions { data_dir: disk.path().to_owned(), fsync: true, cache_bytes: 0 };
+        let (journal, retained) = PreparedJournal::open_for_member(options, expected.clone()).await.unwrap();
+        assert_eq!(retained, expected);
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let stop = CancellationToken::new();
+        let task = tokio::spawn(journal.serve(listener, stop.clone()));
+        let mut socket = TcpStream::connect(address).await.unwrap();
+        for (id, epoch, target_journal) in [(1, 9, uuid::Uuid::new_v4().to_string()), (2, 1, expected)] {
+            let request = Request { id, target_journal, body: Some(RequestBody::Seal(Seal { stream: "a".into(), epoch })) };
+            let mut frame = BytesMut::new();
+            encode_frame(&request, &mut frame);
+            socket.write_all(&frame).await.unwrap();
+            let response = read_frame::<Response>(&mut socket).await.unwrap().unwrap();
+            assert_eq!(response.id, id);
+            if id == 1 {
+                assert!(matches!(response.body, Some(ResponseBody::Failed(_))));
+            } else {
+                assert!(matches!(response.body, Some(ResponseBody::Sealed(sealed)) if sealed.promised == 1));
+            }
+        }
+        stop.cancel();
+        task.await.unwrap().unwrap();
+    }
 }

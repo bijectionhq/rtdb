@@ -88,17 +88,21 @@ It separates a synced predecessor from an active successor and allows publicatio
 The move and activation are atomic in the model.
 The native logkeeper persists activation only on the writer's target ensemble after recovery and installs the same activation on repaired replicas.
 A read-index round requires matching stream, epoch, ensemble and write quorum and accepts a journal's held position only after its preceding journal work is durable.
-Journals without read-index support can still carry writes during rollout.
-A writer opened by an older binary establishes its activation when a supporting writer opens the stream.
+A writer requires an activated write quorum before it opens.
+During upgrade, logkeepers must serve the identity handshake before cell writers and subscribers enable identity-bound sessions.
 The subscriber probes the replica log of its attached database and waits for its installed position before capturing an implicit query or transaction snapshot.
 An explicit or already pinned basis keeps the history and time selected by the caller or transaction.
 The gateway requests a subscriber that supports fresh reads for a deployment with linearizable reads enabled.
 A subscriber that cannot establish its basis refuses before the read.
 The gateway retries an unanswered command on the holder when the refusal leaves the backend idle.
 The durable on-disk journal identity binds the logkeeper's directory registration.
-The active ensemble fingerprint currently binds the advertised endpoints and write quorum.
-A local conformance replay reproduced duplicate recovery votes when two endpoints addressed the same journal.
-Quorum admission still needs to match each vote to its expected durable journal and count that journal once across endpoint aliases, including during recovery and repair.
+The active ensemble fingerprint binds the declared journal identities and write quorum.
+Every new transport session identifies its durable journal before admitting work.
+The journal checks its identity on bound requests before deciding them.
+Cell callers supply the expected journal for every slot, including for copy, repair, trim and retirement.
+Low-level clients using discovery retain one observed identity per slot for the lifetime of the open ensemble and reject duplicate identities.
+[PhysicalJournalQuorum.tla](../tla/PhysicalJournalQuorum.tla) checks that replies from aliased or rebound endpoints cannot form a quorum that misses a prior write.
+The model treats identity and the durable receipt as observed together and abstracts the transport, disk and writer protocol.
 All trim requests require a grant bound to the history, loglet, epoch and protected recovery frontier.
 
 The placement agent is active.

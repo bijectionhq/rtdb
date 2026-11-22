@@ -212,7 +212,29 @@ A seal quorum made up of the fresh journal and the original journal that never h
 With `RTDBRecoveryIdentityStartup.cfg`, registration followed by a failed journal open leaves the process eligible.
 In a loopback cell, pass a regular file as the Logkeeper's `--data` path to reproduce the startup failure with the Rust binary.
 After 3.5 seconds, `status` reported one live Logkeeper while its advertised socket refused connections, and the process reported `Not a directory` during shutdown.
-The pushed Rust revision resolves old ensemble members to network addresses and registers a new Logkeeper before the serving task opens its journal. [Address resolution](https://github.com/bijectionhq/rtdb/blob/3beb2ab5d56abdde034660687ff5c04815fbf069/rust/crates/multi/src/deployment.rs#L213-L217) · [Registration](https://github.com/bijectionhq/rtdb/blob/3beb2ab5d56abdde034660687ff5c04815fbf069/rust/crates/multi/src/process.rs#L168-L176) · [Journal open](https://github.com/bijectionhq/rtdb/blob/3beb2ab5d56abdde034660687ff5c04815fbf069/rust/crates/logkeeper/src/server/mod.rs#L36-L47)
+The original reproduction ran against a revision that registered the logkeeper before opening its journal and identified replicas by their network addresses. [Historical registration path](https://github.com/bijectionhq/rtdb/blob/3beb2ab5d56abdde034660687ff5c04815fbf069/rust/crates/multi/src/process.rs#L168-L176)
+The current process opens and locks the journal before claiming membership.
+The client associates the endpoint with the durable journal ID and verifies each new session before sending commands.
+The journal checks the target identity on bound commands before acting.
+Activation identifies a set of journals and its quorum size, allowing different routes to the same membership.
+Recovery, ordinary appends, serving checks, replica repair and retention use that same connection boundary. [Connection](../../rust/crates/logkeeper/src/client/connection.rs) · [Ensemble](../../rust/crates/logkeeper/src/client/ensemble.rs)
+
+### Upgrading cell journals
+
+Upgrade logkeepers while retaining their journal directories, then quiesce directory writers, holders and cell administration while upgrading the clients that write journal inventories.
+Keep a quorum of logkeepers available within each ensemble during the logkeeper rollout.
+Upgraded readers accept legacy address inventories and packed parked records.
+Directory clients that predate bound inventories must be upgraded before those inventories are written.
+Reopen held deployments at a higher epoch to install the identity-bound activation.
+Resume an interrupted legacy cell transfer with both source and destination directories available so it can bind the source membership before copying.
+Before retiring or transferring an installation with an address-only inventory, verify each historical journal that received its replica stream.
+Use retained `MEMBER` files and historical placement records to identify the journals, and collect their current routes.
+Run `rtdb-multi list --directory DIR` to obtain the installation ID, inventory and version.
+Supply a JSON object mapping every legacy address to an array of verified objects with `address` and `journal` fields.
+Include all verified journals if more than one used the same legacy address.
+Run `rtdb-multi bind-journal-inventory --directory DIR --id UUID --version N --bindings FILE` to record that inventory at the inspected version.
+The command updates only the directory.
+The next transfer or disposal uses the resulting journal IDs, and disposal waits for all named journals to affirm retirement.
 
 ## Archive restore and physical replay
 

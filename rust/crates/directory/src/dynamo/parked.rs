@@ -1,10 +1,11 @@
 use prost::Message;
-use rtdb_types::{Anomaly, Result};
+use rtdb_types::{Anomaly, JournalEndpoint, Result, valid_journal_identity};
 use uuid::Uuid;
 
 use crate::{CatalogAdmissionFloor, Checkpoint, DeploymentRecord, JournalAnchor, Lifecycle, MemberId, StorageNamespaces, Version};
 
 const WIRE_VERSION: u8 = 1;
+const BOUND_JOURNAL_VERSION: u8 = 2;
 
 #[derive(Clone, PartialEq, Message)]
 struct ParkedDeployment {
@@ -48,6 +49,16 @@ struct ParkedDeployment {
     replica_anchor: Option<PackedJournalAnchor>,
     #[prost(message, repeated, tag = "20")]
     catalog_admission_floors: Vec<PackedCatalogFloor>,
+    #[prost(message, repeated, tag = "21")]
+    bound_journals: Vec<PackedJournal>,
+}
+
+#[derive(Clone, PartialEq, Message)]
+struct PackedJournal {
+    #[prost(string, tag = "1")]
+    address: String,
+    #[prost(bytes = "vec", tag = "2")]
+    journal: Vec<u8>,
 }
 
 #[derive(Clone, PartialEq, Message)]
@@ -127,6 +138,19 @@ pub(super) fn encode(record: &DeploymentRecord) -> Option<Vec<u8>> {
         namespaces.extend_from_slice(keys);
     }
 
+    let mut unbound_journals = Vec::new();
+    let mut bound_journals = Vec::new();
+    for endpoint in replica_journals {
+        match endpoint {
+            JournalEndpoint::Member { address, journal } => {
+                if !valid_journal_identity(journal) { return None; }
+                let id = Uuid::try_parse(journal).ok()?;
+                bound_journals.push(PackedJournal { address: address.clone(), journal: id.as_bytes().to_vec() });
+            }
+            JournalEndpoint::Address(address) => unbound_journals.push(address.clone()),
+        }
+    }
+    let wire_version = if bound_journals.is_empty() { WIRE_VERSION } else { BOUND_JOURNAL_VERSION };
     let packed = ParkedDeployment {
         org: org.clone(),
         lineage: (lineage != id).then(|| lineage.clone()),
@@ -156,13 +180,14 @@ pub(super) fn encode(record: &DeploymentRecord) -> Option<Vec<u8>> {
             through: floor.cut.through.0,
         }).collect(),
         quarantined: *lifecycle == Lifecycle::Quarantined,
-        replica_journals: replica_journals.iter().cloned().collect(),
+        replica_journals: unbound_journals,
+        bound_journals,
         compaction_replay_cutoff: *compaction_replay_cutoff,
         s3_write_lease_until_ms: *s3_write_lease_until_ms,
         engine_pin: engine_pin.clone(),
     };
     let mut encoded = Vec::with_capacity(1 + packed.encoded_len());
-    encoded.push(WIRE_VERSION);
+    encoded.push(wire_version);
     packed.encode(&mut encoded).expect("a sized in-memory buffer accepts the record");
     Some(encoded)
 }
@@ -172,8 +197,19 @@ fn invalid(message: impl Into<String>) -> Anomaly {
 }
 
 pub(super) fn decode(bytes: &[u8], id: &str, name: &str, epoch: u64, version: Version) -> Result<DeploymentRecord> {
-    let Some((&WIRE_VERSION, body)) = bytes.split_first() else { return Err(invalid("Unknown parked record version")); };
+    let Some((&wire_version @ (WIRE_VERSION | BOUND_JOURNAL_VERSION), body)) = bytes.split_first() else {
+        return Err(invalid("Unknown parked record version"));
+    };
     let packed = ParkedDeployment::decode(body).map_err(|error| invalid(error.to_string()))?;
+    if wire_version == WIRE_VERSION && !packed.bound_journals.is_empty() {
+        return Err(invalid("Bound journals require parked record version 2"));
+    }
+    let mut replica_journals: std::collections::BTreeSet<_> = packed.replica_journals.into_iter().map(JournalEndpoint::Address).collect();
+    for journal in packed.bound_journals {
+        let id = Uuid::from_slice(&journal.journal).map_err(|_| invalid("Invalid journal identifier"))?;
+        if id.is_nil() { return Err(invalid("A bound journal needs a nonzero identifier")); }
+        replica_journals.insert(JournalEndpoint::Member { address: journal.address, journal: id.to_string() });
+    }
     let (members, trailing) = packed.ensemble.as_chunks::<16>();
     if !trailing.is_empty() { return Err(invalid("The logkeeper list has a partial member identifier")); }
     let storage_generation = match packed.storage_generation.as_slice() {
@@ -249,7 +285,7 @@ pub(super) fn decode(bytes: &[u8], id: &str, name: &str, epoch: u64, version: Ve
         deletion_observation: None,
         engine_pin: packed.engine_pin,
         deletion_record: None,
-        replica_journals: packed.replica_journals.into_iter().collect(),
+        replica_journals,
         storage_regions: Default::default(),
         catalog_readers: Default::default(),
         catalog_admission_floors,

@@ -49,6 +49,7 @@ Usage: rtdb-multi --build-info\n\
        rtdb-multi read-width --directory DIR --name NAME --width N\n\
        rtdb-multi unquarantine --directory DIR --name NAME\n\
        rtdb-multi fork --directory DIR --storage-root PATH --keys PATH --from NAME --name NAME [--org ORG] [--at-block N | --at-time RFC3339] [--grace SECONDS] [--cell-secret FILE]\n\
+       rtdb-multi bind-journal-inventory --directory DIR --id UUID --version N --bindings FILE\n\
        rtdb-multi delete --directory DIR --storage-root PATH --keys PATH (--name NAME | --id UUID)\n\
        rtdb-multi schedule-disposal --directory DIR --id UUID\n\
        rtdb-multi disposal --directory DIR --id UUID\n\
@@ -647,6 +648,16 @@ async fn run(arguments: Vec<String>) -> Result<()> {
                 None => admin::fork_into(directory.as_ref(), &storage, key_service(arguments.required("keys")?).await?.as_ref(), from, destination, &rtdb_multi::control::ControlKey(cell_secret(&arguments)?)).await?,
                 },
             };
+            println!("{}", serde_json::to_string_pretty(&record).expect("a record serializes"));
+            Ok(())
+        }
+        "bind-journal-inventory" => {
+            let directory = directory(arguments.required("directory")?).await?;
+            let id = installation_id(&arguments)?;
+            let version = arguments.required("version")?.parse().map_err(|_| usage("--version must be a number".into()))?;
+            let contents = std::fs::read(arguments.required("bindings")?).map_err(io)?;
+            let bindings = serde_json::from_slice(&contents).map_err(|error| usage(format!("Invalid journal bindings: {error}")))?;
+            let record = admin::bind_journal_inventory(directory.as_ref(), &id.to_string(), version, bindings).await?;
             println!("{}", serde_json::to_string_pretty(&record).expect("a record serializes"));
             Ok(())
         }

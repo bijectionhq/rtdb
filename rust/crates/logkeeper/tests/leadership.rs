@@ -1,8 +1,8 @@
 mod common;
 
 use bytes::Bytes;
-use common::{CountingProxy, Ensemble, append};
-use rtdb_logkeeper::{CopyFrom, Loglet, StreamConfig, open_reader, open_writer, open_writer_on, seal};
+use common::{CountingProxy, Ensemble, Server, append};
+use rtdb_logkeeper::{CopyFrom, JournalEndpoint, Loglet, StreamConfig, open_reader, open_writer, open_writer_on, retire, seal};
 use rtdb_storage::log::{Log, LogOffset};
 use rtdb_types::{AnomalyCategory, Timestamp};
 use std::sync::Arc;
@@ -27,7 +27,7 @@ async fn a_successor_skips_commit_requests_when_the_synced_quorum_has_committed_
 
     let mut proxies = Vec::new();
     for address in &ensemble.addresses { proxies.push(CountingProxy::start(*address).await); }
-    let proxied = StreamConfig { servers: proxies.iter().map(|proxy| proxy.address.to_string()).collect(), ..config };
+    let proxied = StreamConfig { servers: proxies.iter().map(|proxy| proxy.address.to_string().into()).collect(), ..config };
     let successor = open_writer(proxied, 2, CancellationToken::new()).await.unwrap();
     assert_eq!(successor.latest().unwrap(), LogOffset(0));
     assert_eq!(proxies.iter().map(CountingProxy::commits).sum::<usize>(), 0);
@@ -51,7 +51,7 @@ async fn a_slow_replica_does_not_delay_a_durable_recovery_quorum() {
     let slow = CountingProxy::start(ensemble.addresses[2]).await;
     slow.hold_overwrites(true);
     let mut proxied = config.clone();
-    proxied.servers[2] = slow.address.to_string();
+    proxied.servers[2] = slow.address.to_string().into();
     let recovering = tokio::spawn(open_writer(proxied.clone(), 2, CancellationToken::new()));
     tokio::time::timeout(Duration::from_secs(5), async {
         while slow.held_overwrites() == 0 { tokio::time::sleep(Duration::from_millis(2)).await; }
@@ -65,7 +65,7 @@ async fn a_slow_replica_does_not_delay_a_durable_recovery_quorum() {
         loop {
             let audit = rtdb_logkeeper::audit_retained(&config).await.unwrap();
             if audit.interval == Some([0, 1]) && audit.digests.len() == 3 {
-                assert!(audit.digests.values().all(|digest| digest == &audit.digests[&config.servers[0]]));
+                assert!(audit.digests.values().all(|digest| digest == &audit.digests[config.servers[0].address()]));
                 break;
             }
             tokio::time::sleep(Duration::from_millis(2)).await;
@@ -86,7 +86,7 @@ async fn a_successor_publishes_a_recovered_tip_when_the_previous_commit_requests
         before.push(CountingProxy::start(*address).await);
         after.push(CountingProxy::start(*address).await);
     }
-    let initial = StreamConfig { servers: before.iter().map(|proxy| proxy.address.to_string()).collect(), ..config.clone() };
+    let initial = StreamConfig { servers: before.iter().map(|proxy| proxy.address.to_string().into()).collect(), ..config.clone() };
     let previous = open_writer(initial.clone(), 1, CancellationToken::new()).await.unwrap();
     for proxy in &before { proxy.drop_commits(); }
     assert_eq!(append(previous.as_ref(), "first", 1).await.offset, LogOffset(0));
@@ -94,7 +94,7 @@ async fn a_successor_publishes_a_recovered_tip_when_the_previous_commit_requests
     assert_eq!(reader.latest().unwrap(), LogOffset(-1));
     assert_eq!(reader.read_index(1).await.unwrap(), LogOffset(0));
 
-    let proxied = StreamConfig { servers: after.iter().map(|proxy| proxy.address.to_string()).collect(), ..config.clone() };
+    let proxied = StreamConfig { servers: after.iter().map(|proxy| proxy.address.to_string().into()).collect(), ..config.clone() };
     after[2].drop_commits();
     let successor = tokio::time::timeout(Duration::from_millis(500), open_writer(proxied, 2, CancellationToken::new())).await
         .expect("two surviving commit acknowledgments complete recovery").unwrap();
@@ -191,7 +191,7 @@ async fn an_append_already_on_the_wire_cannot_commit_after_its_successor_seals()
 
     let mut proxies = Vec::new();
     for address in &ensemble.addresses { proxies.push(CountingProxy::start(*address).await); }
-    let proxied = StreamConfig { servers: proxies.iter().map(|proxy| proxy.address.to_string()).collect(), ..config.clone() };
+    let proxied = StreamConfig { servers: proxies.iter().map(|proxy| proxy.address.to_string().into()).collect(), ..config.clone() };
     let old = open_writer(proxied, 2, CancellationToken::new()).await.unwrap();
     for proxy in &proxies { proxy.hold(true); }
     let stranded = old.enqueue(Bytes::from_static(b"stranded"), Timestamp(2)).await.unwrap();
@@ -223,7 +223,7 @@ async fn concurrent_confirmations_share_rounds() {
     let ensemble = Ensemble::start(3).await;
     let mut proxies = Vec::new();
     for address in &ensemble.addresses { proxies.push(CountingProxy::start(*address).await); }
-    let config = StreamConfig { servers: proxies.iter().map(|proxy| proxy.address.to_string()).collect(), stream: "batched".into(), write_quorum: 2, maximum_message_bytes: 1024 };
+    let config = StreamConfig { servers: proxies.iter().map(|proxy| proxy.address.to_string().into()).collect(), stream: "batched".into(), write_quorum: 2, maximum_message_bytes: 1024 };
     let log = open_writer(config, 1, CancellationToken::new()).await.unwrap();
     append(log.as_ref(), "one", 1).await;
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
@@ -238,4 +238,60 @@ async fn concurrent_confirmations_share_rounds() {
     let requests = proxies.iter().map(CountingProxy::requests).sum::<usize>() - before;
     assert_eq!(requests, 6, "{callers} concurrent confirmations take the round in flight and one more, a check per server each");
     assert_eq!(log.latest().unwrap(), LogOffset(0));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn one_journal_cannot_fill_two_quorum_slots_through_endpoint_aliases() {
+    let ensemble = Ensemble::start(1).await;
+    let first = CountingProxy::start(ensemble.addresses[0]).await;
+    let second = CountingProxy::start(ensemble.addresses[0]).await;
+    let config = StreamConfig {
+        servers: vec![first.address.to_string().into(), second.address.to_string().into()],
+        ..ensemble.config("distinct-journal-quorum")
+    };
+    let writer = tokio::time::timeout(
+        Duration::from_secs(5),
+        open_writer(config, 1, CancellationToken::new()),
+    ).await.expect("opening a loglet with aliased journals must finish");
+    assert!(writer.is_err(), "one journal provided two recovery votes");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_replacement_with_the_same_history_has_no_authority_to_confirm_or_retire() {
+    let mut ensemble = Ensemble::start(1).await;
+    let discovered = ensemble.config_of(&[0], "rebound");
+    open_reader(discovered.clone(), CancellationToken::new()).await.unwrap();
+    let journal = std::fs::read_to_string(ensemble.directories[0].path().join("JOURNAL_ID")).unwrap();
+    let address = ensemble.addresses[0];
+    let bound = StreamConfig { servers: vec![JournalEndpoint::Member { address: address.to_string(), journal: journal.clone() }], ..discovered.clone() };
+    let writer = open_writer(bound.clone(), 1, CancellationToken::new()).await.unwrap();
+    let offset = append(writer.as_ref(), "original", 1).await.offset;
+    let reader = open_reader(bound.clone(), CancellationToken::new()).await.unwrap();
+    assert_eq!(reader.read_index(1).await.unwrap(), offset);
+    drop(writer);
+    ensemble.stop(0).await;
+
+    let substitute = tempfile::tempdir().unwrap();
+    let original_segments = ensemble.directories[0].path().join("segments");
+    let substitute_segments = substitute.path().join("segments");
+    std::fs::create_dir(&substitute_segments).unwrap();
+    for file in std::fs::read_dir(original_segments).unwrap() {
+        let file = file.unwrap();
+        std::fs::copy(file.path(), substitute_segments.join(file.file_name())).unwrap();
+    }
+    let replacement = Server::start_at(substitute.path(), address).await;
+    let replacement_reader = open_reader(discovered, CancellationToken::new()).await.unwrap();
+    assert_eq!(replacement_reader.latest().unwrap(), offset);
+    assert!(reader.read_index(1).await.is_err());
+    assert!(open_reader(bound.clone(), CancellationToken::new()).await.is_err());
+    assert!(retire(&bound, 2).await.is_err());
+    assert_eq!(replacement_reader.read_range(LogOffset(0), LogOffset(1)).await.unwrap()[0].payload, "original");
+    replacement.stop().await;
+
+    ensemble.restart(0).await;
+    let route = CountingProxy::start(address).await;
+    let rerouted = StreamConfig { servers: vec![JournalEndpoint::Member { address: route.address.to_string(), journal }], ..bound };
+    let reader = open_reader(rerouted, CancellationToken::new()).await.unwrap();
+    assert_eq!(reader.read_index(1).await.unwrap(), offset);
+    ensemble.stop(0).await;
 }

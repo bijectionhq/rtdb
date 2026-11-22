@@ -18,7 +18,7 @@ use rtdb_types::{Anomaly, AnomalyCategory, Result, StorageEpoch};
 use tokio_util::sync::CancellationToken;
 
 use crate::control::{ACTIVATION_RATE_LIMITED, CLAIM_CONTENDED, Handler, MoveTicket, NODE_UNDER_PRESSURE, NOT_CLAIMABLE, Request, Response};
-use crate::deployment::{CellStorage, Role, database_config, ensemble_servers, select_logkeepers};
+use crate::deployment::{CellStorage, Role, database_config, ensemble_servers, journal_endpoint, select_logkeepers};
 use crate::lease::MemberLease;
 use crate::replica_retention::replica_trim_through;
 
@@ -409,9 +409,8 @@ impl NodeAgent {
         let live_members = alive.iter().map(|id| &members[id]).collect();
         let selected = select_logkeepers(&record.storage_identity(), record.ensemble.len(), live_members, &candidates);
         if selected.len() < record.ensemble.len() { return Ok(database_config(record, servers, &self.options.storage, Role::Holder)); }
-        let next = selected.iter().map(|member| member.address.clone()).collect();
-        let ensemble = selected.iter().map(|member| member.id.clone()).collect();
-        Ok(crate::deployment::moving_config(record, next, Some((servers, ensemble)), &self.options.storage, Role::Holder))
+        let next = selected.into_iter().map(journal_endpoint).collect();
+        Ok(crate::deployment::moving_config(record, next, Some(servers), &self.options.storage, Role::Holder))
     }
 
     /// Before a query on a deployment held with linearizable reads, confirms with a quorum of its logkeepers that no later holder has sealed its stream (`ServeLinearizableReadOnWriter`).

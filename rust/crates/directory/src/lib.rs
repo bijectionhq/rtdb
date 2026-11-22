@@ -11,7 +11,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
 use parking_lot::Mutex;
-use rtdb_types::{Anomaly, AnomalyCategory, Result};
+use rtdb_types::{Anomaly, AnomalyCategory, JournalEndpoint, Result};
 use serde::{Deserialize, Serialize};
 
 mod state_file;
@@ -250,7 +250,7 @@ pub struct DeploymentRecord {
     /// Every journal endpoint authorized to receive this installation's
     /// replica stream, retained before a new ensemble receives a copy.
     #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
-    pub replica_journals: BTreeSet<String>,
+    pub replica_journals: BTreeSet<JournalEndpoint>,
     /// Serving and archival storage admissions, retained until the owner
     /// drains its I/O and any ambiguous publications are confirmed.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
@@ -283,10 +283,10 @@ pub struct DeploymentRecord {
     pub parent: Option<String>,
     /// Source logkeepers still needed to stage the replica tail before a cell transfer can activate.
     #[serde(default)]
-    pub move_from: Option<Vec<String>>,
+    pub move_from: Option<Vec<JournalEndpoint>>,
     /// Endpoints a stream copy may have reached, including incomplete transfers and retired ensembles.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub log_copy_servers: Vec<String>,
+    pub log_copy_servers: Vec<JournalEndpoint>,
     /// Whether its holder confirms its leadership with the logkeepers before serving each query.
     #[serde(default)]
     pub linearizable_reads: bool,
@@ -628,7 +628,7 @@ pub struct DisposalReceipt {
     pub deployment: String,
     pub incarnation: u64,
     pub epoch: u64,
-    pub journals: BTreeSet<String>,
+    pub journals: BTreeSet<JournalEndpoint>,
     pub journals_retired_at_ms: i64,
     pub key_withdrawn_at_ms: i64,
     pub serving_prefix_observed_empty_at_ms: i64,

@@ -107,7 +107,7 @@ async fn an_entry_only_one_server_held_is_dropped_by_recovery_and_lsns_stay_dens
 async fn a_restarted_server_keeps_its_promise_entries_and_commit() {
     let directory = tempfile::tempdir().unwrap();
     let server = Server::start(directory.path()).await;
-    let config = |server: &Server| StreamConfig { servers: vec![server.address.to_string()], stream: "restart".into(), write_quorum: 1, maximum_message_bytes: 1024 };
+    let config = |server: &Server| StreamConfig { servers: vec![server.address.to_string().into()], stream: "restart".into(), write_quorum: 1, maximum_message_bytes: 1024 };
     let writer = open_writer(config(&server), 3, CancellationToken::new()).await.unwrap();
     for position in 0..4 { append(writer.as_ref(), &format!("r{position}"), position).await; }
     let told = open_reader(config(&server), CancellationToken::new()).await.unwrap();
@@ -182,7 +182,7 @@ fn idle_streams_cost_the_server_no_tasks() {
         runtime.metrics().num_alive_tasks()
     };
     let client_runtime = tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build().unwrap();
-    let config = |stream: usize| StreamConfig { servers: vec![address.to_string()], stream: format!("deployment-{stream}/1/replica"), write_quorum: 1, maximum_message_bytes: 1024 };
+    let config = |stream: usize| StreamConfig { servers: vec![address.to_string().into()], stream: format!("deployment-{stream}/1/replica"), write_quorum: 1, maximum_message_bytes: 1024 };
     let writers = client_runtime.block_on(async {
         let first = open_writer(config(0), 1, CancellationToken::new()).await.unwrap();
         append(first.as_ref(), "one", 0).await;

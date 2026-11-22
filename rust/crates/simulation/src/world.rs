@@ -534,5 +534,6 @@ fn describe_reply(body: &ResponseBody) -> String {
         ResponseBody::Entries(entries) => format!("entries {:?} (trim {}, last {})", entries.entries.iter().map(|entry| entry.lsn).collect::<Vec<_>>(), entries.trim_lsn, entries.last_lsn),
         ResponseBody::Failed(failed) => format!("failed: {}", failed.message),
         ResponseBody::PageDigest(page) => format!("digest through {}", page.through_lsn),
+        ResponseBody::JournalIdentity(identity) => format!("journal {}", identity.journal),
     }
 }

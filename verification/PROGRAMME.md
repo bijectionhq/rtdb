@@ -215,6 +215,10 @@ The target contract and status are in `dev/doc/structural-redesign.adoc`.
 The later serving review adds typed placed receipts, on-demand freshness checks, and a recoverability boundary for CDC.
 See [Authority boundaries](redesign/authority-boundaries.md).
 
+Logkeeper quorum admission binds physical journals from placement through recovery, read confirmation and retirement.
+The [physical journal quorum model](tla/PhysicalJournalQuorum.tla) checks 4,500 states and distinguishes endpoint counting, trusting an opening route and confirming with the surviving members after a route change.
+This evidence covers vote identity and intersection for one configured ensemble.
+
 | ID | Increment | Depends on | Exit test |
 | --- | --- | --- | --- |
 | [R4](redesign/R4-residence-ledger.md) | Residence ledger (Multi directory record; classic conditional-write object) with renewable holds and a collection floor; delete `garbage_lifetime`, the fixed lease and collector wait, the reaper grace, wall-clock release stamps and the unbounded in-process registry | Peer model `verification/tla/ResidenceRetirement.tla` | A follower behind the log tip serves a held generation; the collector never deletes below a live hold |

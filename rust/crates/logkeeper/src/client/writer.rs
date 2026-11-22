@@ -281,12 +281,15 @@ impl Writer {
             match reply {
                 Ok(Ack::Accepted(_)) => activated += 1,
                 Ok(Ack::Refused(refused)) if refused.promised > epoch => return Err(Error::Deposed { epoch, promised: refused.promised }),
-                // Older journals may still participate in writes. They cannot answer read index requests.
                 _ => (),
             }
             if activated >= ensemble.config.write_quorum { break; }
         }
         drop(activating);
+        if activated < ensemble.config.write_quorum {
+            return Err(Error::Remote { key: ensemble.config.stream.clone(), message: format!(
+                "activated {activated} journals, a write quorum is {}", ensemble.config.write_quorum) });
+        }
         let long_ago = Instant::now().checked_sub(REPAIR_BACKOFF).unwrap_or_else(Instant::now);
         let replicas = (0..ensemble.len()).map(|server| if synced.contains(&server) {
             Replica { acked: last, link: Link::Live }

@@ -1,9 +1,10 @@
 //! Typed requests to the servers of one stream's ensemble.
 
-use super::connection::{Connection, connection, remote};
-use super::StreamConfig;
+use super::connection::{Binding, Callback, Connection, connection, remote};
+use super::{JournalEndpoint, StreamConfig};
 use crate::protocol::{Accepted, Check, Commit, DigestPage, DropStream, Entries, Entry, Fetch, LogletCheck, Overwrite, PageDigest, Read, Refused, RequestBody, ResponseBody, Retire, Seal, Sealed, Trim};
 use bytes::Bytes;
+use parking_lot::Mutex;
 use rtdb_storage::{Error, Result};
 use sha2::{Digest, Sha256};
 use std::sync::Arc;
@@ -20,21 +21,50 @@ pub(crate) enum Ack {
 
 pub(crate) struct Ensemble {
     pub config: StreamConfig,
-    pub links: Vec<Arc<Connection>>,
+    pub links: Vec<Peer>,
     identity: Bytes,
+}
+
+pub(crate) struct Peer {
+    connection: Arc<Connection>,
+    binding: Binding,
+}
+
+impl Peer {
+    fn address(&self) -> &str { self.connection.address() }
+
+    pub fn send(&self, body: RequestBody, callback: Callback) {
+        self.connection.send(self.binding.clone(), body, callback)
+    }
+
+    async fn call(&self, body: RequestBody) -> Result<ResponseBody> {
+        self.connection.call(self.binding.clone(), body).await
+    }
 }
 
 impl Ensemble {
     pub fn new(config: StreamConfig) -> Self {
-        let links = config.servers.iter().map(|address| connection(address)).collect();
-        let mut servers: Vec<_> = config.servers.iter().collect();
-        servers.sort_unstable();
+        let journals = Arc::new(Mutex::new(config.servers.iter().map(|server| server.journal().map(Arc::from)).collect()));
+        let links = config.servers.iter().enumerate().map(|(slot, server)| Peer {
+            connection: connection(server.address()),
+            binding: match server.journal() {
+                Some(expected) => Binding::Expected(Arc::from(expected)),
+                None => Binding::Discover { slot, journals: Arc::clone(&journals) },
+            },
+        }).collect();
+        let mut journals: Vec<_> = config.servers.iter().filter_map(JournalEndpoint::journal).collect();
         let mut identity = Sha256::new();
-        identity.update(b"rtdb.logkeeper/ensemble/v1");
+        if journals.len() == config.servers.len() {
+            identity.update(b"rtdb.logkeeper/ensemble/v2");
+        } else {
+            identity.update(b"rtdb.logkeeper/ensemble/v1");
+            journals = config.servers.iter().map(JournalEndpoint::address).collect();
+        }
+        journals.sort_unstable();
         identity.update((config.write_quorum as u64).to_be_bytes());
-        for server in servers {
-            identity.update((server.len() as u64).to_be_bytes());
-            identity.update(server.as_bytes());
+        for journal in journals {
+            identity.update((journal.len() as u64).to_be_bytes());
+            identity.update(journal.as_bytes());
         }
         Self { config, links, identity: Bytes::copy_from_slice(&identity.finalize()) }
     }

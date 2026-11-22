@@ -57,11 +57,11 @@ impl Ensemble {
     }
 
     pub fn config(&self, stream: &str) -> StreamConfig {
-        StreamConfig { servers: self.addresses.iter().map(ToString::to_string).collect(), stream: stream.into(), write_quorum: 2, maximum_message_bytes: 1024 }
+        StreamConfig { servers: self.addresses.iter().map(|address| address.to_string().into()).collect(), stream: stream.into(), write_quorum: 2, maximum_message_bytes: 1024 }
     }
 
     pub fn config_of(&self, servers: &[usize], stream: &str) -> StreamConfig {
-        StreamConfig { servers: servers.iter().map(|&server| self.addresses[server].to_string()).collect(), stream: stream.into(), write_quorum: 1, maximum_message_bytes: 1024 }
+        StreamConfig { servers: servers.iter().map(|&server| self.addresses[server].to_string().into()).collect(), stream: stream.into(), write_quorum: 1, maximum_message_bytes: 1024 }
     }
 
     pub async fn stop(&mut self, server: usize) { self.servers[server].take().unwrap().stop().await; }

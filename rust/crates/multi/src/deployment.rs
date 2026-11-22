@@ -9,7 +9,7 @@ use futures::stream::FuturesUnordered;
 use rtdb_directory::{DeploymentRecord, Directory, MemberId, MemberRecord, MemberRole};
 use rtdb_format::database::proto::{DatabaseConfig, RemoteStorage, database_config};
 use rtdb_storage::{Error as StoreError, ObjectKey, ObjectStore};
-use rtdb_types::{Anomaly, Result};
+use rtdb_types::{Anomaly, JournalEndpoint, Result};
 use serde::{Deserialize, Serialize};
 
 /// The protobuf type name the logkeeper log factory is registered under.
@@ -250,17 +250,14 @@ pub enum Role {
 /// The logkeeper streams a deployment's database reads and writes, carried in its `DatabaseConfig`.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LogkeeperLogConfig {
-    pub servers: Vec<String>,
+    pub servers: Vec<JournalEndpoint>,
     pub deployment: String,
     pub key_id: String,
     pub replica_stream: String,
     pub replica_seal_scope: String,
     /// The ensemble the stream moves from, when the holder opening it moves it to `servers`.
     #[serde(default)]
-    pub previous_servers: Option<Vec<String>>,
-    /// The members `servers` are, recorded as the deployment's ensemble once a move completes.
-    #[serde(default)]
-    pub ensemble: Vec<String>,
+    pub previous_servers: Option<Vec<JournalEndpoint>>,
     /// The writer epoch for opening a stream and for confirming a read index.
     pub epoch: u64,
     #[serde(default)]
@@ -311,21 +308,25 @@ pub(crate) fn read_replicas<'a>(record: &DeploymentRecord, members: &'a BTreeMap
     ranks
 }
 
-pub(crate) fn ensemble_servers(record: &DeploymentRecord, members: &BTreeMap<MemberId, MemberRecord>) -> Result<Vec<String>> {
+pub(crate) fn journal_endpoint(member: &MemberRecord) -> JournalEndpoint {
+    JournalEndpoint::Member { address: member.address.clone(), journal: member.id.0.clone() }
+}
+
+pub(crate) fn ensemble_servers(record: &DeploymentRecord, members: &BTreeMap<MemberId, MemberRecord>) -> Result<Vec<JournalEndpoint>> {
     record.ensemble.iter().map(|id| {
-        members.get(id).filter(|member| member.role == MemberRole::Logkeeper).map(|member| member.address.clone())
+        members.get(id).filter(|member| member.role == MemberRole::Logkeeper).map(journal_endpoint)
             .ok_or_else(|| Anomaly::fault("rtdb.multi/unknown-logkeeper", format!("Logkeeper {id} is not a member")))
     }).collect()
 }
 
-/// The configuration a node opens `record` with, given its ensemble's addresses.
-pub fn database_config(record: &DeploymentRecord, servers: Vec<String>, storage: &CellStorage, role: Role) -> DatabaseConfig {
+/// The configuration a node opens `record` with, given its ensemble's journals.
+pub fn database_config(record: &DeploymentRecord, servers: Vec<JournalEndpoint>, storage: &CellStorage, role: Role) -> DatabaseConfig {
     moving_config(record, servers, None, storage, role)
 }
 
-/// The configuration a holder opens `record` with when it moves the stream from `previous` to `servers`, the ensemble `ensemble`.
-pub fn moving_config(record: &DeploymentRecord, servers: Vec<String>, moving: Option<(Vec<String>, Vec<rtdb_directory::MemberId>)>, storage: &CellStorage, role: Role) -> DatabaseConfig {
-    let mut log = LogkeeperLogConfig {
+/// The configuration a holder opens `record` with when it moves the stream from `previous_servers` to `servers`.
+pub fn moving_config(record: &DeploymentRecord, servers: Vec<JournalEndpoint>, previous_servers: Option<Vec<JournalEndpoint>>, storage: &CellStorage, role: Role) -> DatabaseConfig {
+    let log = LogkeeperLogConfig {
         write_quorum: write_quorum(servers.len()),
         servers,
         deployment: record.id.clone(),
@@ -336,10 +337,8 @@ pub fn moving_config(record: &DeploymentRecord, servers: Vec<String>, moving: Op
         require_read_index: record.linearizable_reads && matches!(role, Role::Subscriber | Role::Compactor),
         log_epoch: record.log_epoch,
         frozen_at: match role { Role::Snapshot(checkpoint) => Some(checkpoint), _ => None },
-        previous_servers: None,
-        ensemble: record.ensemble.iter().map(|id| id.0.clone()).collect(),
+        previous_servers,
     };
-    if let Some((previous, ensemble)) = moving { log.previous_servers = Some(previous); log.ensemble = ensemble.into_iter().map(|id| id.0).collect(); }
     let store = crate::store::CellStoreConfig { storage: storage.clone(), prefix: record.storage_prefix(), deployment: record.id.clone(),
         writer_epoch: (role == Role::Holder).then_some(record.epoch), compactor: role == Role::Compactor,
         snapshot_block: match role { Role::Snapshot(checkpoint) => Some(checkpoint.block), _ => None } };

@@ -34,9 +34,9 @@ pub async fn audit_retained(config: &StreamConfig) -> Result<RetainedAudit> {
                 let first = bounds.trim_lsn.saturating_add(1).max(0);
                 let window = (first <= bounds.commit_lsn).then_some([first, bounds.commit_lsn]);
                 if let Some(window) = window { responders.push((server, window)); }
-                audit.windows.insert(config.servers[server].clone(), window);
+                audit.windows.insert(config.servers[server].address().to_owned(), window);
             }
-            Err(error) => { audit.unavailable.insert(config.servers[server].clone(), error.to_string()); }
+            Err(error) => { audit.unavailable.insert(config.servers[server].address().to_owned(), error.to_string()); }
         }
     }
     let Some([first, through]) = quorum_overlap(&responders, config.write_quorum) else { return Ok(audit) };
@@ -48,8 +48,8 @@ pub async fn audit_retained(config: &StreamConfig) -> Result<RetainedAudit> {
     }).collect::<FuturesUnordered<_>>();
     while let Some((server, proof)) = proofs.next().await {
         match proof {
-            Ok(digest) => { audit.digests.insert(config.servers[server].clone(), digest); }
-            Err(error) if error.category == AnomalyCategory::Unavailable => { audit.unavailable.insert(config.servers[server].clone(), error.to_string()); }
+            Ok(digest) => { audit.digests.insert(config.servers[server].address().to_owned(), digest); }
+            Err(error) if error.category == AnomalyCategory::Unavailable => { audit.unavailable.insert(config.servers[server].address().to_owned(), error.to_string()); }
             Err(error) => return Err(error),
         }
     }
@@ -146,7 +146,7 @@ async fn chain(ensemble: &Ensemble, server: usize, first: i64, through: i64) -> 
         let page = ensemble.read(server, next, MAXIMUM_BATCH_ENTRIES, Duration::ZERO).await?;
         if next <= page.trim_lsn {
             return Err(Anomaly::new(AnomalyCategory::Unavailable, "rtdb.logkeeper/audit-trimmed", format!(
-                "Replica {} trimmed position {next} during the audit", ensemble.config.servers[server])));
+                "Replica {} trimmed position {next} during the audit", ensemble.config.servers[server].address())));
         }
         if page.entries.is_empty() {
             return Err(incomplete(ensemble, server, next));
@@ -161,7 +161,7 @@ async fn chain(ensemble: &Ensemble, server: usize, first: i64, through: i64) -> 
 }
 
 fn incomplete(ensemble: &Ensemble, server: usize, position: i64) -> Anomaly {
-    Anomaly::fault("rtdb.logkeeper/audit-gap", format!("Replica {} omitted committed position {position}", ensemble.config.servers[server]))
+        Anomaly::fault("rtdb.logkeeper/audit-gap", format!("Replica {} omitted committed position {position}", ensemble.config.servers[server].address()))
 }
 
 #[cfg(test)]

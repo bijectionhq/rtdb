@@ -266,7 +266,7 @@ fn remove_before(segments: &Path, sequence: u64) -> Result<()> {
     Ok(())
 }
 
-fn read_member_id(path: &Path, length: usize) -> Result<Option<String>> {
+fn read_identity(path: &Path, length: usize) -> Result<Option<String>> {
     use std::io::Read as _;
 
     let input = match File::open(path) {
@@ -277,12 +277,12 @@ fn read_member_id(path: &Path, length: usize) -> Result<Option<String>> {
     let mut identity = String::new();
     input.take((length + 1) as u64).read_to_string(&mut identity)
         .map_err(|error| io_error(path, error))?;
-    if identity.len() != length { return Err(corrupt(path, "invalid journal member identity")); }
+    if identity.len() != length { return Err(corrupt(path, "invalid journal identity")); }
     Ok(Some(identity))
 }
 
-fn write_member_id(data_dir: &Path, path: &Path, identity: &str, fsync: bool) -> Result<()> {
-    let temporary = data_dir.join("MEMBER.tmp");
+fn write_identity(data_dir: &Path, path: &Path, identity: &str, fsync: bool) -> Result<()> {
+    let temporary = path.with_extension("tmp");
     let mut file = OpenOptions::new().create(true).truncate(true).write(true)
         .open(&temporary).map_err(|error| io_error(&temporary, error))?;
     file.write_all(identity.as_bytes()).map_err(|error| io_error(&temporary, error))?;
@@ -291,9 +291,9 @@ fn write_member_id(data_dir: &Path, path: &Path, identity: &str, fsync: bool) ->
     sync_directory(data_dir, fsync)
 }
 
-pub(super) enum MemberIdentity<'a> {
-    Open(&'a str),
-    Reopen(&'a str),
+pub(super) enum MemberIdentity {
+    Open(String),
+    Reopen(String),
 }
 
 impl Journal {
@@ -302,8 +302,8 @@ impl Journal {
         data_dir: &Path,
         fsync: bool,
         cache_bytes: usize,
-        member: Option<MemberIdentity<'_>>,
-    ) -> Result<(Self, Vec<Recovered>, Option<String>)> {
+        member: Option<MemberIdentity>,
+    ) -> Result<(Self, Vec<Recovered>, String)> {
         let segments = data_dir.join("segments");
         if !matches!(member, Some(MemberIdentity::Reopen(_))) {
             fs::create_dir_all(&segments).map_err(|error| io_error(&segments, error))?;
@@ -313,26 +313,34 @@ impl Journal {
         lock.try_lock_exclusive().map_err(|error| io_error(&lock_path, error))?;
         let files = list_segments(&segments, true)?;
         let member_path = data_dir.join("MEMBER");
-        let mut identity = None;
-        if let Some(ref mode) = member {
-            let candidate = match mode {
-                MemberIdentity::Open(candidate) | MemberIdentity::Reopen(candidate) => candidate,
-            };
-            identity = read_member_id(&member_path, candidate.len())?;
-            if matches!(mode, MemberIdentity::Reopen(_)) && identity.as_deref() != Some(*candidate) {
-                return Err(corrupt(&member_path, "the original journal member identity is missing or different"));
-            }
-            if identity.is_some() && files.is_empty() {
-                return Err(corrupt(&member_path, "the installed journal has lost its segments"));
-            }
-            if identity.is_none() {
-                // A crash can leave the initial empty segment without its
-                // member file. It cannot leave acknowledged records there.
-                let empty_first_segment = files.len() == 1 && files.get(&0).is_some_and(|path|
-                    fs::metadata(path).is_ok_and(|metadata| metadata.len() == 0));
-                if !files.is_empty() && !empty_first_segment {
-                    return Err(corrupt(&member_path, "the journal has no installed member identity"));
+        let local_path = data_dir.join("JOURNAL_ID");
+        let (identity_path, candidate) = match member.as_ref() {
+            Some(MemberIdentity::Open(candidate) | MemberIdentity::Reopen(candidate)) => {
+                if local_path.try_exists().map_err(|error| io_error(&local_path, error))? {
+                    return Err(corrupt(&local_path, "an anonymous journal cannot register as a member"));
                 }
+                (&member_path, candidate.clone())
+            }
+            None => {
+                if member_path.try_exists().map_err(|error| io_error(&member_path, error))? {
+                    return Err(corrupt(&member_path, "a member journal requires its member configuration"));
+                }
+                (&local_path, uuid::Uuid::new_v4().to_string())
+            }
+        };
+        let identity = read_identity(identity_path, candidate.len())?;
+        if matches!(member, Some(MemberIdentity::Reopen(_))) && identity.as_deref() != Some(candidate.as_str()) {
+            return Err(corrupt(identity_path, "the original journal member identity is missing or different"));
+        }
+        if identity.is_some() && files.is_empty() {
+            return Err(corrupt(identity_path, "the installed journal has lost its segments"));
+        }
+        if member.is_some() && identity.is_none() {
+            // A crash can leave the initial empty segment before the member file is installed.
+            let empty_first_segment = files.len() == 1 && files.get(&0).is_some_and(|path|
+                fs::metadata(path).is_ok_and(|metadata| metadata.len() == 0));
+            if !files.is_empty() && !empty_first_segment {
+                return Err(corrupt(&member_path, "the journal has no installed member identity"));
             }
         }
         let mut chain = Vec::new();
@@ -368,12 +376,14 @@ impl Journal {
         let declared = replay.names.keys().copied().collect();
         let next_id = replay.names.keys().max().map_or(0, |id| id + 1);
         let recovered = replay.names.into_iter().map(|(id, name)| Recovered { id, name, state: replay.states.remove(&id).unwrap_or_default() }).collect();
-        if let Some(MemberIdentity::Open(candidate)) = member && identity.is_none() {
+        let identity = if let Some(identity) = identity {
+            identity
+        } else {
             if fsync { rtdb_storage::sync_file(&file).map_err(|error| io_error(&path, error))?; }
             sync_directory(&segments, fsync)?;
-            write_member_id(data_dir, &member_path, candidate, fsync)?;
-            identity = Some(candidate.to_owned());
-        }
+            write_identity(data_dir, identity_path, &candidate, fsync)?;
+            candidate
+        };
         let journal = Self {
             segments,
             fsync,
@@ -859,11 +869,11 @@ mod tests {
     fn an_installed_member_rejects_missing_segments() {
         let directory = tempfile::tempdir().unwrap();
         let first = "c2a4eba6-83a7-455d-a1c1-b80c5cf5f2ba";
-        let (journal, _, identity) = Journal::open(directory.path(), true, 0, Some(MemberIdentity::Open(first))).unwrap();
-        assert_eq!(identity.as_deref(), Some(first));
+        let (journal, _, identity) = Journal::open(directory.path(), true, 0, Some(MemberIdentity::Open(first.into()))).unwrap();
+        assert_eq!(identity, first);
         drop(journal);
         fs::remove_dir_all(directory.path().join("segments")).unwrap();
-        assert!(Journal::open(directory.path(), true, 0, Some(MemberIdentity::Reopen(first))).is_err());
+        assert!(Journal::open(directory.path(), true, 0, Some(MemberIdentity::Reopen(first.into()))).is_err());
     }
 
     #[test]

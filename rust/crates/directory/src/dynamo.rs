@@ -501,7 +501,7 @@ mod tests {
         reopened.checkpoint = Some(crate::Checkpoint { block: 87, boundary: 34_567, source: 31_234, system_time: 1_795_224_375_000_000, root_sha256: Some([42; 32]) });
         reopened.storage_namespaces = Some(crate::StorageNamespaces { objects: uuid::Uuid::new_v4(), keys: [42; 32] });
         let mut hosted = reopened.clone();
-        hosted.replica_journals.extend(["10.42.0.10:7654", "10.42.1.10:7654", "10.42.2.10:7654"].map(str::to_owned));
+        hosted.replica_journals.extend(["10.42.0.10:7654", "10.42.1.10:7654", "10.42.2.10:7654"].map(rtdb_types::JournalEndpoint::from));
         for (name, record) in [("pristine", &pristine), ("previously active", &reopened), ("with journal custody", &hosted)] {
             let compact = deployment_item(record, true).unwrap();
             assert!(matches!(compact[RECORD], AttributeValue::B(_)));
@@ -529,6 +529,21 @@ mod tests {
         let fallback = deployment_item(&reopened, true).unwrap();
         assert!(matches!(fallback[RECORD], AttributeValue::S(_)));
         assert_eq!(decode_deployment(&fallback).unwrap(), reopened);
+    }
+
+    #[test]
+    fn a_parked_inventory_preserves_its_journal_identity_in_both_formats() {
+        let mut record = parked_record();
+        record.replica_journals.insert(rtdb_types::JournalEndpoint::Member {
+            address: "10.42.0.10:7654".into(),
+            journal: record.ensemble[0].0.clone(),
+        });
+        record.replica_journals.insert("10.42.1.10:7654".into());
+        let compact = deployment_item(&record, true).unwrap();
+        let expanded = deployment_item(&record, false).unwrap();
+        assert!(matches!(&compact[RECORD], AttributeValue::B(bytes) if bytes.as_ref()[0] == 2));
+        assert_eq!(decode_deployment(&compact).unwrap(), record);
+        assert_eq!(decode_deployment(&expanded).unwrap(), record);
     }
 
     #[test]

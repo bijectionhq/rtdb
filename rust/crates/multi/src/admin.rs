@@ -8,11 +8,11 @@ pub use rtdb_directory::DeletionRecord;
 use rtdb_directory::{Cas, CellMedia, CellResidence, CellTransfer, CellTransferIntent, PreparedCellTransfer, RetiredResidence, DeletionFacts, DeploymentRecord, DisposalReceipt, DeletionObservation, DeletionInventory, ServingInventory, Directory, Lifecycle, MemberId, MemberPool, MemberRecord, MemberRole, MemberState, PlacementMove, StorageNamespaces, effective_holder, now_ms};
 use rtdb_logkeeper::StreamConfig;
 use rtdb_storage::log::Log;
-use rtdb_types::{Anomaly, AnomalyCategory, Result};
+use rtdb_types::{Anomaly, AnomalyCategory, JournalEndpoint, Result};
 use tokio_util::sync::CancellationToken;
 
 use crate::control::{self, ControlKey, MoveTicket, Request, Response};
-use crate::deployment::{CellStorage, ensemble_servers, live_holdings, require_storage_namespaces, s3_write_lease_horizon, select_logkeepers, storage_namespaces, write_quorum};
+use crate::deployment::{CellStorage, ensemble_servers, journal_endpoint, live_holdings, require_storage_namespaces, s3_write_lease_horizon, select_logkeepers, storage_namespaces, write_quorum};
 use crate::keys::KeyService;
 
 mod holder;
@@ -127,9 +127,11 @@ async fn update(directory: &dyn Directory, name: &str, change: impl Fn(&mut Depl
     Err(Anomaly::new(AnomalyCategory::Conflict, "rtdb.multi/update-contended", format!("{name} kept changing while being updated")))
 }
 
-async fn replica_servers(directory: &dyn Directory, record: &DeploymentRecord) -> Result<Vec<String>> {
+async fn replica_servers(directory: &dyn Directory, record: &DeploymentRecord) -> Result<Vec<JournalEndpoint>> {
     match &record.move_from {
-        Some(previous) => Ok(previous.clone()),
+        Some(previous) if previous.iter().all(|endpoint| endpoint.journal().is_some()) => Ok(previous.clone()),
+        Some(_) => Err(Anomaly::new(AnomalyCategory::Unavailable, "rtdb.multi/journal-identity-missing",
+            "Resume the cell transfer from its source directory to bind the source journal identities")),
         None => ensemble_servers(record, &members(directory).await?),
     }
 }
@@ -1020,7 +1022,14 @@ async fn prepare_cell_move(
     }
     let source_stream = administration_stream(from.directory.as_ref(), &current, maximum_message_bytes).await?;
     let target_stream = administration_stream(to.directory.as_ref(), &arrival, maximum_message_bytes).await?;
-    if target_stream.servers.iter().any(|server| source_stream.servers.contains(server) || current.replica_journals.contains(server)) {
+    let source_journals = source_stream.servers.iter().chain(&current.replica_journals).chain(&current.log_copy_servers);
+    if let Some(legacy) = source_journals.clone().find(|endpoint| endpoint.journal().is_none()) {
+        return Err(unbound_inventory(legacy.address()));
+    }
+    let source_addresses: HashSet<_> = source_journals.clone().map(JournalEndpoint::address).collect();
+    let source_ids: HashSet<_> = source_journals.filter_map(JournalEndpoint::journal).collect();
+    if target_stream.servers.iter().any(|server| source_addresses.contains(server.address())
+        || server.journal().is_some_and(|id| source_ids.contains(id))) {
         return Err(Anomaly::incorrect("rtdb.multi/shared-cell-journal", "Cell moves require independent replica journals"));
     }
 
@@ -1056,7 +1065,7 @@ async fn prepare_cell_move(
         }));
         Ok(())
     }).await?;
-    let staged = if let Some(pending) = pending {
+    let mut staged = if let Some(pending) = pending {
         pending
     } else {
         let mut staged = source.clone();
@@ -1117,7 +1126,16 @@ async fn prepare_cell_move(
     }
 
     if staged.move_from.as_ref() != Some(&source_stream.servers) {
-        return Err(conflict());
+        let previous = staged.move_from.as_ref().expect("a pending transfer has source journals");
+        let source_journals = &source_stream.servers;
+        if !same_transfer_journals(previous, source_journals) {
+            return Err(conflict());
+        }
+        staged = update_installation(to.directory.as_ref(), &staged.id, |record| {
+            if record.version != staged.version { return Err(conflict()); }
+            record.move_from = Some(source_journals.clone());
+            Ok(())
+        }).await?;
     }
     rtdb_logkeeper::seal(&source_stream, source.epoch).await?;
     await_storage_drain(from.directory.as_ref(), from.storage, from.keys, &source).await?;
@@ -1134,6 +1152,15 @@ async fn prepare_cell_move(
         Ok(())
     }).await?;
     Ok((source, prepared))
+}
+
+fn same_transfer_journals(previous: &[JournalEndpoint], source_journals: &[JournalEndpoint]) -> bool {
+    previous.len() == source_journals.len() && previous.iter().zip(source_journals).all(|(stored, source)| {
+        match stored.journal() {
+            Some(id) => source.journal() == Some(id),
+            None => stored.address() == source.address(),
+        }
+    })
 }
 
 async fn stage_cell_storage(
@@ -1221,13 +1248,42 @@ pub(crate) async fn update_installation(
 }
 
 pub(crate) async fn administration_stream(directory: &dyn Directory, record: &DeploymentRecord, maximum_message_bytes: usize) -> Result<StreamConfig> {
-    let members = members(directory).await?;
-    let servers: Vec<String> = record.ensemble.iter().map(|id| {
-        members.get(id).map(|member| member.address.clone()).ok_or_else(|| {
-            Anomaly::new(AnomalyCategory::Unavailable, "rtdb.multi/administration-ensemble", format!("Logkeeper {id} is missing from the directory"))
-        })
-    }).collect::<Result<_>>()?;
+    let servers = ensemble_servers(record, &members(directory).await?).map_err(|error| {
+        Anomaly::new(AnomalyCategory::Unavailable, "rtdb.multi/administration-ensemble",
+            error.message.unwrap_or_else(|| "The administration ensemble is unavailable".into()))
+    })?;
     Ok(StreamConfig { write_quorum: write_quorum(record.ensemble.len()), servers, stream: record.stream("replica"), maximum_message_bytes })
+}
+
+fn unbound_inventory(address: &str) -> Anomaly {
+    Anomaly::new(AnomalyCategory::Unavailable, "rtdb.multi/journal-identity-missing",
+        format!("Bind the verified journal inventory for the legacy address {address}"))
+}
+
+/// Installs operator-verified journal bindings against the inventory version that was inspected.
+pub async fn bind_journal_inventory(
+    directory: &dyn Directory, id: &str, expected: rtdb_directory::Version,
+    bindings: BTreeMap<String, Vec<JournalEndpoint>>,
+) -> Result<DeploymentRecord> {
+    let changed = || Anomaly::new(AnomalyCategory::Conflict, "rtdb.multi/journal-inventory-changed",
+        format!("Installation {id} has changed since its journal inventory was inspected"));
+    let mut record = directory.deployment(id).await?.ok_or_else(&changed)?;
+    if record.version != expected || record.disposal.is_some() { return Err(changed()); }
+    let legacy: HashSet<_> = record.replica_journals.iter().chain(&record.log_copy_servers)
+        .filter(|endpoint| endpoint.journal().is_none()).map(JournalEndpoint::address).collect();
+    if bindings.len() != legacy.len() || bindings.is_empty() || !legacy.iter().all(|address| bindings.contains_key(*address))
+        || bindings.values().any(|journals| journals.is_empty() || journals.iter().any(|endpoint|
+            endpoint.address().is_empty() || !endpoint.journal().is_some_and(rtdb_types::valid_journal_identity)))
+    {
+        return Err(Anomaly::incorrect("rtdb.multi/journal-inventory", "Supply the verified journal identities and routes for every legacy address"));
+    }
+    let bind = |endpoint: JournalEndpoint| match endpoint {
+        JournalEndpoint::Address(address) => bindings[&address].clone(),
+        bound => vec![bound],
+    };
+    record.replica_journals = record.replica_journals.into_iter().flat_map(&bind).collect();
+    record.log_copy_servers = record.log_copy_servers.into_iter().flat_map(bind).collect();
+    directory.replace_deployment(record, expected).await?.applied().ok_or_else(changed)
 }
 
 /// Accepts serving disposal by fencing this installation in the directory.
@@ -1406,9 +1462,16 @@ async fn finish_disposal_with_lock(
     crate::reference::require_disjoint_prefix(&prefix, others.iter())?;
     stream.servers.extend(fenced.replica_journals.iter().cloned());
     stream.servers.extend(fenced.log_copy_servers.iter().cloned());
-    if let Some(previous) = &fenced.move_from { stream.servers.extend(previous.iter().cloned()); }
-    stream.servers.sort();
-    stream.servers.dedup();
+    if let Some(previous) = &fenced.move_from {
+        if previous.iter().any(|endpoint| endpoint.journal().is_none()) {
+            return Err(Anomaly::new(AnomalyCategory::Unavailable, "rtdb.multi/journal-identity-missing",
+                "Resume the cell transfer from its source directory to bind the source journal identities"));
+        }
+        stream.servers.extend(previous.iter().cloned());
+    }
+    if !stream.servers.is_empty() {
+        stream.servers = retirement_journals(stream.servers, &members(directory).await?)?;
+    }
     stream.write_quorum = write_quorum(stream.servers.len());
     if !stream.servers.is_empty() {
         rtdb_logkeeper::retire(&stream, fenced.epoch).await?;
@@ -1437,7 +1500,9 @@ async fn finish_disposal_with_lock(
     };
     let deleted = update_installation(directory, id, |record| {
         if record.epoch != receipt.epoch || record.incarnation != receipt.incarnation
-            || record.storage_prefix() != prefix.as_str() || record.storage_namespaces != Some(namespaces) {
+            || record.storage_prefix() != prefix.as_str() || record.storage_namespaces != Some(namespaces)
+            || record.disposal.is_none() && (record.replica_journals != fenced.replica_journals
+                || record.log_copy_servers != fenced.log_copy_servers || record.move_from != fenced.move_from) {
             return Err(Anomaly::new(AnomalyCategory::Conflict, "rtdb.multi/disposal-fence", format!("Installation {id} changed during disposal")));
         }
         match record.lifecycle {
@@ -1450,12 +1515,14 @@ async fn finish_disposal_with_lock(
                 {
                     return Err(deletion_changed(id));
                 }
+                record.replica_journals.clone_from(&receipt.journals);
                 record.disposal = Some(Box::new(receipt.clone()));
                 record.deletion_record = Some(Box::new(signed.clone()));
                 record.lifecycle = Lifecycle::Deleted;
                 Ok(())
             }
             Lifecycle::Deleted if record.moved_at_ms.is_some() => {
+                record.replica_journals.clone_from(&receipt.journals);
                 record.disposal = Some(Box::new(receipt.clone()));
                 Ok(())
             }
@@ -1463,6 +1530,22 @@ async fn finish_disposal_with_lock(
         }
     }).await?;
     deleted.disposal.map(|receipt| *receipt).ok_or_else(|| Anomaly::fault("rtdb.multi/disposal-receipt", format!("Installation {id} lacks a disposal receipt")))
+}
+
+fn retirement_journals(
+    inventory: Vec<JournalEndpoint>, members: &BTreeMap<MemberId, MemberRecord>,
+) -> Result<Vec<JournalEndpoint>> {
+    let mut journals = BTreeMap::<String, JournalEndpoint>::new();
+    for endpoint in inventory {
+        let id = endpoint.journal().ok_or_else(|| unbound_inventory(endpoint.address()))?.to_owned();
+        let endpoint = members.get(&MemberId(id.clone())).filter(|member| member.role == MemberRole::Logkeeper)
+            .map_or(endpoint, journal_endpoint);
+        if let Some(other) = journals.insert(id, endpoint.clone()) && other != endpoint {
+            return Err(Anomaly::new(AnomalyCategory::Unavailable, "rtdb.multi/journal-route-ambiguous",
+                format!("The retired journal has conflicting routes {} and {}", other.address(), endpoint.address())));
+        }
+    }
+    Ok(journals.into_values().collect())
 }
 
 async fn erase_and_sign_disposal(
@@ -1977,6 +2060,49 @@ mod tests {
         let error = create_deployment(directory.as_ref(), "shop", "acme/orders", 0).await.unwrap_err();
         assert_eq!(error.code, "rtdb.multi/invalid-organisation");
         assert!(directory.deployments().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn retirement_needs_versioned_custody_for_every_legacy_address() {
+        use super::{BTreeMap, JournalEndpoint, MemberId, MemberPool, MemberRecord, MemberRole, MemberState, bind_journal_inventory, retirement_journals};
+
+        let address = "127.0.0.1:7654";
+        let replacement = MemberRecord {
+            id: MemberId::fresh(), role: MemberRole::Logkeeper, address: address.into(), control_address: None,
+            availability_zone: "local".into(), engine_version: String::new(), lease_expires_at_ms: i64::MAX,
+            state: MemberState::Eligible, drain_target_engine: None, pool: MemberPool::default(),
+            storage_namespaces: None, version: 1,
+        };
+        let members = BTreeMap::from([(replacement.id.clone(), replacement)]);
+        let directory = MemoryDirectory::new();
+        let mut record = DeploymentRecord::new("shop", "acme", vec![], 0);
+        record.replica_journals.insert(address.into());
+        let record = directory.create_deployment(record).await.unwrap();
+        let refused = retirement_journals(record.replica_journals.iter().cloned().collect(), &members).unwrap_err();
+        assert_eq!(refused.code, "rtdb.multi/journal-identity-missing");
+
+        let journals = [7655, 7656].map(|port| JournalEndpoint::Member {
+            address: format!("127.0.0.1:{port}"), journal: MemberId::fresh().0,
+        });
+        let bindings = BTreeMap::from([(address.to_owned(), journals.to_vec())]);
+        let stale = bind_journal_inventory(directory.as_ref(), &record.id, record.version + 1, bindings.clone()).await.unwrap_err();
+        assert_eq!(stale.code, "rtdb.multi/journal-inventory-changed");
+        let bound = bind_journal_inventory(directory.as_ref(), &record.id, record.version, bindings).await.unwrap();
+        let admitted = retirement_journals(bound.replica_journals.into_iter().collect(), &members).unwrap();
+        assert_eq!(admitted.into_iter().collect::<std::collections::BTreeSet<_>>(), journals.into_iter().collect());
+    }
+
+    #[test]
+    fn a_staged_copy_can_follow_a_journal_to_its_new_route() {
+        use super::{JournalEndpoint, MemberId, same_transfer_journals};
+
+        let journal = MemberId::fresh().0;
+        let previous = JournalEndpoint::Member { address: "127.0.0.1:7654".into(), journal: journal.clone() };
+        let rerouted = JournalEndpoint::Member { address: "127.0.0.1:7655".into(), journal };
+        let replacement = JournalEndpoint::Member { address: previous.address().into(), journal: MemberId::fresh().0 };
+        assert!(same_transfer_journals(&[previous.clone()], &[rerouted.clone()]));
+        assert!(!same_transfer_journals(&[previous.clone()], &[replacement]));
+        assert!(!same_transfer_journals(&[previous.address().into()], &[rerouted]));
     }
 
     #[tokio::test]

@@ -13,7 +13,7 @@ use futures::stream::{FuturesUnordered, StreamExt};
 use rtdb_storage::log::{AppendReceipt, Log, LogMetadata, LogOffset, LogRange, LogRecord, LogReplayTail, LogTail, ReplayHead};
 use rtdb_storage::object_store::ReadReservation;
 use rtdb_storage::{Error, Result};
-use rtdb_types::{Anomaly, Timestamp};
+use rtdb_types::{Anomaly, JournalEndpoint, Timestamp, valid_journal_identity};
 use std::collections::{BTreeSet, VecDeque};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -29,7 +29,7 @@ const RECORD_OVERHEAD_BYTES: usize = 256;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct StreamConfig {
-    pub servers: Vec<String>,
+    pub servers: Vec<JournalEndpoint>,
     pub stream: String,
     pub write_quorum: usize,
     pub maximum_message_bytes: usize,
@@ -39,7 +39,7 @@ pub struct StreamConfig {
 /// A chain lists a stream's loglets oldest first; one stream name names the stream on every ensemble, and a server may belong to several of them.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Loglet {
-    pub servers: Vec<String>,
+    pub servers: Vec<JournalEndpoint>,
     pub start_lsn: i64,
 }
 
@@ -86,8 +86,17 @@ fn validate(config: &StreamConfig) -> rtdb_types::Result<()> {
     if config.servers.is_empty() || config.stream.is_empty() {
         return Err(Anomaly::incorrect("rtdb.logkeeper/invalid-stream-config", "a stream needs a name and at least one server"));
     }
-    if config.servers.iter().collect::<BTreeSet<_>>().len() != config.servers.len() {
+    if config.servers.iter().map(JournalEndpoint::address).collect::<BTreeSet<_>>().len() != config.servers.len() {
         return Err(Anomaly::incorrect("rtdb.logkeeper/invalid-stream-config", "a server address can occupy only one slot per ensemble"));
+    }
+    let mut journals = BTreeSet::new();
+    for journal in config.servers.iter().filter_map(JournalEndpoint::journal) {
+        if !valid_journal_identity(journal) || !journals.insert(journal) {
+            return Err(Anomaly::incorrect("rtdb.logkeeper/invalid-stream-config", "each member slot needs a distinct journal identity"));
+        }
+    }
+    if !journals.is_empty() && journals.len() != config.servers.len() {
+        return Err(Anomaly::incorrect("rtdb.logkeeper/invalid-stream-config", "a member ensemble needs an identity for every slot"));
     }
     if config.write_quorum == 0 || config.write_quorum > config.servers.len() {
         return Err(Anomaly::incorrect("rtdb.logkeeper/invalid-stream-config", format!("write quorum {} must be between 1 and the {} servers", config.write_quorum, config.servers.len())));
@@ -229,7 +238,7 @@ pub async fn drop_stream(config: &StreamConfig, epoch: u64) -> rtdb_types::Resul
             Ok(Ack::Refused(refused)) => format!("promised epoch {}", refused.promised),
             Err(error) => error.to_string(),
         };
-        failures.push(format!("{}: {failure}", config.servers[server]));
+        failures.push(format!("{}: {failure}", config.servers[server].address()));
     }
     if failures.is_empty() { return Ok(()); }
     Err(Error::Remote { key: config.stream.clone(), message: format!("stream drop is incomplete: {}", failures.join("; ")) }.into())

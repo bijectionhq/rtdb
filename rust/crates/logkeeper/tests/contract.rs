@@ -27,7 +27,7 @@ async fn an_audit_distinguishes_equal_committed_positions_with_different_payload
     }).await.unwrap();
     assert_eq!(report.interval, Some([0, 0]));
     assert_eq!(report.digests.len(), 2);
-    assert_ne!(report.digests[&stream.servers[0]], report.digests[&stream.servers[1]]);
+    assert_ne!(report.digests[stream.servers[0].address()], report.digests[stream.servers[1].address()]);
     assert!(report.unavailable.is_empty());
     assert_eq!(rtdb_logkeeper::certify_committed_prefix(&stream, 0, None).await.unwrap_err().code, "rtdb.logkeeper/audit-divergence");
 }
@@ -47,8 +47,8 @@ async fn a_reachable_empty_replica_does_not_hide_the_fsynced_quorum_from_an_audi
         }
     }).await.unwrap();
     assert_eq!(report.digests.len(), 2);
-    assert_eq!(report.digests[&all.servers[0]], report.digests[&all.servers[1]]);
-    assert_eq!(report.windows[&all.servers[2]], None);
+    assert_eq!(report.digests[all.servers[0].address()], report.digests[all.servers[1].address()]);
+    assert_eq!(report.windows[all.servers[2].address()], None);
     assert!(report.unavailable.is_empty());
 }
 
@@ -131,7 +131,7 @@ async fn a_stopped_journal_matches_the_online_digest_across_epochs_and_preserves
     std::fs::write(&temporary, b"pending").unwrap();
     let offline = rtdb_logkeeper::inspect_retained(directory, &stream.stream, Some([1, 2])).unwrap().unwrap();
     assert_eq!(offline.interval, [1, 2]);
-    assert_eq!(offline.digest, online.digests[&stream.servers[0]]);
+    assert_eq!(offline.digest, online.digests[stream.servers[0].address()]);
     assert_eq!(std::fs::read(&temporary).unwrap(), b"pending");
     assert!(rtdb_logkeeper::inspect_retained(directory, &stream.stream, Some([0, 2])).is_err());
 
@@ -161,8 +161,8 @@ async fn a_saved_prefix_verifies_the_same_chain_after_trim_and_an_epoch_change()
     let initial = tokio::time::timeout(Duration::from_secs(5), async {
         loop {
             let report = rtdb_logkeeper::audit_retained(&config).await.unwrap();
-            if report.interval == Some([0, 2]) && report.digests.contains_key(&config.servers[0]) {
-                return report.digests[&config.servers[0]].clone();
+            if report.interval == Some([0, 2]) && report.digests.contains_key(config.servers[0].address()) {
+                return report.digests[config.servers[0].address()].clone();
             }
             tokio::time::sleep(Duration::from_millis(5)).await;
         }

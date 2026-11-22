@@ -979,7 +979,7 @@ async fn a_reused_intake_position_cannot_redeem_the_sealed_writers_receipt() {
 
     let old = cell.directory.deployment(&shop.id).await.unwrap().unwrap();
     let config = rtdb_logkeeper::StreamConfig {
-        servers: cell.logkeepers.iter().filter(|keeper| old.ensemble.contains(&keeper.lease.id())).map(|keeper| keeper.address.to_string()).collect(),
+        servers: cell.logkeepers.iter().filter(|keeper| old.ensemble.contains(&keeper.lease.id())).map(|keeper| keeper.address.to_string().into()).collect(),
         stream: old.stream("replica"), write_quorum: 2, maximum_message_bytes: 4 << 20,
     };
     rtdb_logkeeper::seal(&config, old.epoch + 1).await.unwrap();
@@ -1059,7 +1059,7 @@ async fn placed_attempt_outcomes_keep_their_exact_identity_through_a_checkpoint(
     let scope = PlacedAttemptScope::new(&stream, record.epoch).unwrap();
     let next_scope = PlacedAttemptScope::new(&stream, record.epoch + 1).unwrap();
     let config = rtdb_logkeeper::StreamConfig {
-        servers: cell.logkeepers.iter().filter(|keeper| record.ensemble.contains(&keeper.lease.id())).map(|keeper| keeper.address.to_string()).collect(),
+        servers: cell.logkeepers.iter().filter(|keeper| record.ensemble.contains(&keeper.lease.id())).map(|keeper| keeper.address.to_string().into()).collect(),
         stream, write_quorum: 2, maximum_message_bytes: 4 << 20,
     };
     let replica = rtdb_logkeeper::open_reader(config.clone(), Default::default()).await.unwrap();
@@ -1124,7 +1124,7 @@ async fn a_linearizable_subscriber_refuses_to_pin_a_basis_after_its_ensemble_is_
 
     let record = cell.directory.deployment(&deployment.id).await.unwrap().unwrap();
     let config = rtdb_logkeeper::StreamConfig {
-        servers: cell.logkeepers.iter().filter(|keeper| record.ensemble.contains(&keeper.lease.id())).map(|keeper| keeper.address.to_string()).collect(),
+        servers: cell.logkeepers.iter().filter(|keeper| record.ensemble.contains(&keeper.lease.id())).map(|keeper| keeper.address.to_string().into()).collect(),
         stream: record.stream("replica"), write_quorum: 2, maximum_message_bytes: 4 << 20,
     };
     rtdb_logkeeper::seal(&config, record.epoch + 1).await.unwrap();
@@ -2524,7 +2524,7 @@ async fn a_new_holder_moves_a_degraded_stream_to_live_logkeepers() {
     fn position(cell: &Cell, id: &rtdb_directory::MemberId) -> Option<usize> { cell.logkeepers.iter().position(|logkeeper| logkeeper.lease.id() == *id) }
     let first_dead = position(&cell, &record.ensemble[0]).unwrap();
     let dead_id = record.ensemble[0].clone();
-    let retired = cell.logkeepers[first_dead].address.to_string();
+    let retired = rtdb_types::JournalEndpoint::Member { address: cell.logkeepers[first_dead].address.to_string(), journal: dead_id.0.clone() };
     cell.logkeepers.remove(first_dead).stop().await.unwrap();
     tokio::time::sleep(Duration::from_millis(1700)).await;
     let holder = cell.holder("shop").await.unwrap();
@@ -2577,7 +2577,7 @@ async fn journal_replacement_keeps_acknowledged_history_after_interrupted_trim()
     let live = directory.members().await.unwrap().into_iter()
         .map(|member| (member.id, member.address)).collect::<BTreeMap<_, _>>();
     let reader = rtdb_logkeeper::open_reader(rtdb_logkeeper::StreamConfig {
-        servers: checkpointed.ensemble.iter().map(|id| live[id].clone()).collect(),
+        servers: checkpointed.ensemble.iter().map(|id| live[id].clone().into()).collect(),
         stream: checkpointed.stream("replica"),
         write_quorum: 2,
         maximum_message_bytes: 4 << 20,
@@ -2634,7 +2634,8 @@ async fn deletion_drops_a_recorded_copy_outside_the_current_ensemble() {
     client.simple_query("INSERT INTO orders (_id, total) VALUES (1, 10)").await.unwrap();
     drop(client);
     let held = cell.directory.deployment(&deployment.id).await.unwrap().unwrap();
-    let extra = cell.logkeepers.iter().find(|keeper| !held.ensemble.contains(&keeper.lease.id())).unwrap().address.to_string();
+    let extra = cell.logkeepers.iter().find(|keeper| !held.ensemble.contains(&keeper.lease.id())).unwrap();
+    let extra = rtdb_types::JournalEndpoint::Member { address: extra.address.to_string(), journal: extra.lease.id().0 };
     let stream = rtdb_logkeeper::StreamConfig { servers: vec![extra], stream: held.stream("replica"), write_quorum: 1, maximum_message_bytes: 4 << 20 };
     let recorder = DirectoryRecorder { directory: cell.directory.clone() };
     recorder.reserve_copy(&held.id, held.epoch, &stream.servers).await.unwrap();
@@ -2891,7 +2892,7 @@ async fn a_deployment_moves_cells_with_its_unflushed_tail_and_its_old_gateway_fo
     let stream = pending.stream("replica");
     assert_eq!(replay.replica_anchor.unwrap().stream, stream);
     let members: BTreeMap<_, _> = west.directory.members().await.unwrap().into_iter().map(|member| (member.id.clone(), member.address)).collect();
-    let servers = pending.ensemble.iter().map(|id| members[id].clone()).collect::<Vec<_>>();
+    let servers = pending.ensemble.iter().map(|id| members[id].clone().into()).collect::<Vec<_>>();
     let config = rtdb_logkeeper::StreamConfig {
         write_quorum: rtdb_multi::deployment::write_quorum(servers.len()), servers, stream: stream.clone(), maximum_message_bytes: 4 << 20,
     };
@@ -2991,7 +2992,7 @@ async fn a_recovering_subscriber_keeps_its_suffix_through_a_concurrent_trim() {
     let updated = directory.deployment(&deployment.id).await.unwrap().unwrap().checkpoint.unwrap();
     assert!(updated.boundary - 1 >= first_required);
     let members = directory.members().await.unwrap().into_iter().map(|member| (member.id.clone(), member.address)).collect::<BTreeMap<_, _>>();
-    let servers = held.ensemble.iter().map(|id| members[id].clone()).collect();
+    let servers = held.ensemble.iter().map(|id| members[id].clone().into()).collect();
     let reader = rtdb_logkeeper::open_reader(rtdb_logkeeper::StreamConfig {
         write_quorum: 2, servers, stream: held.stream("replica"), maximum_message_bytes: 4 << 20,
     }, Default::default()).await.unwrap();
@@ -3045,7 +3046,7 @@ async fn a_stream_is_trimmed_below_its_last_published_block_and_still_recovers()
     tokio::time::sleep(Duration::from_millis(600)).await;
     let record = cell.directory.deployment_by_name("shop").await.unwrap().unwrap();
     let members: std::collections::BTreeMap<_, _> = cell.directory.members().await.unwrap().into_iter().map(|member| (member.id.clone(), member)).collect();
-    let servers: Vec<String> = record.ensemble.iter().map(|id| members[id].address.clone()).collect();
+    let servers = record.ensemble.iter().map(|id| members[id].address.clone().into()).collect();
     let reader = rtdb_logkeeper::open_reader(rtdb_logkeeper::StreamConfig { write_quorum: 2, servers, stream: record.stream("replica"), maximum_message_bytes: 4 << 20 }, Default::default()).await.unwrap();
     use rtdb_storage::log::Log;
     assert!(matches!(reader.read_range(rtdb_storage::log::LogOffset(0), rtdb_storage::log::LogOffset(1)).await, Err(rtdb_storage::Error::UnavailableLogRange { .. })), "the stream is trimmed below the published blocks");
@@ -3933,7 +3934,7 @@ async fn a_fork_publishes_and_trims_only_after_adopting_a_block_from_its_own_log
     agent.reconcile().await;
     assert!(cell.directory.deployment(&child.id).await.unwrap().unwrap().checkpoint.is_none());
     let members: std::collections::BTreeMap<_, _> = cell.directory.members().await.unwrap().into_iter().map(|member| (member.id.clone(), member)).collect();
-    let servers = child.ensemble.iter().map(|id| members[id].address.clone()).collect();
+    let servers = child.ensemble.iter().map(|id| members[id].address.clone().into()).collect();
     let reader = rtdb_logkeeper::open_reader(rtdb_logkeeper::StreamConfig {
         write_quorum: 2, servers, stream: child.stream("replica"), maximum_message_bytes: 4 << 20,
     }, Default::default()).await.unwrap();

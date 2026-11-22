@@ -1428,7 +1428,7 @@ mod tests {
 
         std::fs::remove_file(root.path().join("keys").join(format!("{}.key", record.key_id()))).unwrap();
         crate::admin::update_installation(directory.as_ref(), &record.id, |record| {
-            record.replica_journals.insert("replica".to_owned());
+            record.replica_journals.insert("replica".into());
             Ok(())
         }).await.unwrap();
         let result = factory.wrap_cached(&configuration(Some(2)), cached).await;

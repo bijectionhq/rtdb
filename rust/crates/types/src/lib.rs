@@ -12,6 +12,8 @@ pub mod java_hash_map;
 mod logical;
 mod ordered;
 mod position;
+mod journal;
+pub use journal::{JournalEndpoint, valid_journal_identity};
 mod placed_attempt;
 pub use placed_attempt::{PLACED_ATTEMPT_OUTCOME_TABLE, PlacedAttempt, PlacedAttemptScope, PlacedAttemptSeed};
 mod pg;

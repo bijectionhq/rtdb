@@ -18,7 +18,7 @@ use rtdb_logkeeper::{QuorumLog, StreamConfig};
 use rtdb_node::{AwaitAuthority, ClosedEpochRecovery, LogAccess, LogFactory, OpenedLogs, PlacedReceiptCodec, ReplicaReadIndex};
 use rtdb_storage::log::{AppendReceipt, Log, LogOffset, LogRange, LogRecord, LogReplayTail, LogTail, MemoryLog, ReplayHead};
 use rtdb_storage::object_store::ReadReservation;
-use rtdb_types::{Anomaly, BlockIndex, PLACED_ATTEMPT_OUTCOME_TABLE, PlacedAttemptScope, ReplicaPosition, Result, SourcePosition, StorageEpoch, Timestamp};
+use rtdb_types::{Anomaly, BlockIndex, JournalEndpoint, PLACED_ATTEMPT_OUTCOME_TABLE, PlacedAttemptScope, ReplicaPosition, Result, SourcePosition, StorageEpoch, Timestamp};
 use tokio_util::sync::CancellationToken;
 
 use crate::cipher::{Cipher, SEALED_OVERHEAD};
@@ -69,7 +69,7 @@ pub type Writers = Arc<parking_lot::Mutex<std::collections::HashMap<String, std:
 #[async_trait]
 pub trait EnsembleRecorder: Send + Sync {
     /// Records every endpoint a copy can touch before any bytes move.
-    async fn reserve_copy(&self, deployment: &str, epoch: u64, servers: &[String]) -> Result<()>;
+    async fn reserve_copy(&self, deployment: &str, epoch: u64, servers: &[JournalEndpoint]) -> Result<()>;
     async fn record(&self, deployment: &str, epoch: u64, ensemble: Vec<rtdb_directory::MemberId>) -> Result<()>;
 }
 
@@ -91,7 +91,7 @@ pub struct DirectoryRecorder { pub directory: Arc<dyn rtdb_directory::Directory>
 
 #[async_trait]
 impl EnsembleRecorder for DirectoryRecorder {
-    async fn reserve_copy(&self, deployment: &str, epoch: u64, servers: &[String]) -> Result<()> {
+    async fn reserve_copy(&self, deployment: &str, epoch: u64, servers: &[JournalEndpoint]) -> Result<()> {
         for _ in 0..8 {
             let mut record = self.directory.deployment(deployment).await?.ok_or_else(|| Anomaly::incorrect("rtdb.multi/unknown-deployment", format!("No deployment {deployment}")))?;
             if record.epoch != epoch || record.holder.is_none()
@@ -166,13 +166,15 @@ impl LogFactory for LogkeeperLogFactory {
                 let key = self.holds.keys.existing(&config.key_id).await?;
                 // An interrupted copy can leave records even if the new
                 // ensemble never becomes the reported serving ensemble.
+                let ensemble = member_ids(&stream.servers)?;
                 self.recorder.reserve_copy(&config.deployment, config.epoch, &stream.servers).await?;
                 let writer = match &config.previous_servers {
                     Some(previous) => {
+                        member_ids(previous)?;
                         self.recorder.reserve_copy(&config.deployment, config.epoch, previous).await?;
                         let moved = rtdb_logkeeper::open_writer_on(vec![rtdb_logkeeper::Loglet { servers: previous.clone(), start_lsn: 0 }], stream, config.epoch, rtdb_logkeeper::CopyFrom::Retained, cancellation.clone()).await?;
                         // Recorded before the writer appends: until then the old ensemble, sealed and complete, still holds everything.
-                        self.recorder.record(&config.deployment, config.epoch, config.ensemble.iter().map(|id| rtdb_directory::MemberId(id.clone())).collect()).await?;
+                        self.recorder.record(&config.deployment, config.epoch, ensemble).await?;
                         moved
                     }
                     None => rtdb_logkeeper::open_writer(stream, config.epoch, cancellation.clone()).await?,
@@ -182,6 +184,7 @@ impl LogFactory for LogkeeperLogFactory {
             }
             LogAccess::ReadOnly => {
                 let key = self.holds.keys.existing(&config.key_id).await?;
+                member_ids(&stream.servers)?;
                 (rtdb_logkeeper::open_reader(stream, cancellation.clone()).await?, key)
             }
             LogAccess::SourceWriter => return Err(Anomaly::unsupported("rtdb.multi/source-writer",
@@ -215,6 +218,14 @@ impl LogFactory for LogkeeperLogFactory {
         Ok(OpenedLogs { source: intake, replica, source_epoch: epoch, replica_epoch: epoch,
             replica_read_index, await_authority, drivers: vec![trimming] })
     }
+}
+
+fn member_ids(servers: &[JournalEndpoint]) -> Result<Vec<rtdb_directory::MemberId>> {
+    servers.iter().map(|endpoint| {
+        endpoint.journal().filter(|id| rtdb_types::valid_journal_identity(id))
+            .map(|id| rtdb_directory::MemberId(id.to_owned())).ok_or_else(||
+                Anomaly::incorrect("rtdb.multi/journal-identity-missing", format!("No valid journal identity for {}", endpoint.address())))
+    }).collect()
 }
 
 /// The first source offset no replica record can already have consumed.
@@ -480,7 +491,7 @@ mod tests {
         record.epoch = 1;
         let record = directory.create_deployment(record).await.unwrap();
         let configuration = LogkeeperLogConfig {
-            servers: vec!["127.0.0.1:1".to_owned()],
+            servers: vec!["127.0.0.1:1".into()],
             deployment: record.id.clone(),
             key_id: record.key_id(),
             replica_stream: record.stream("replica"),
@@ -489,7 +500,6 @@ mod tests {
             epoch: record.epoch,
             require_read_index: false,
             log_epoch: record.log_epoch,
-            ensemble: vec![],
             frozen_at: None,
             previous_servers: None,
         };
@@ -517,7 +527,6 @@ mod tests {
             replica_stream: record.stream("replica"),
             replica_seal_scope: record.replica_seal_scope(),
             previous_servers: None,
-            ensemble: vec![],
             epoch: record.epoch,
             require_read_index: true,
             frozen_at: None,
