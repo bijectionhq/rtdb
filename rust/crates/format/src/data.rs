@@ -3,11 +3,12 @@ mod columns;
 use rtdb_types::StructFields;
 use std::sync::Arc;
 
-use arrow_array::{Array, ArrayRef, NullArray, RecordBatch, StructArray, TimestampMicrosecondArray, UnionArray};
+use arrow_array::{Array, ArrayRef, NullArray, RecordBatch, StringArray, StructArray, TimestampMicrosecondArray, UnionArray,
+    cast::AsArray, types::{Int16Type, Int32Type, Int64Type}};
 use arrow_buffer::ScalarBuffer;
 use arrow_schema::{DataType, Field, Schema, TimeUnit as ArrowTimeUnit, UnionFields, UnionMode};
 use rtdb_columnar::{BatchBuilder, IidView, MemoryBudget, OwnedBatch, build_array, build_iids, build_struct_array, copy_array, estimate_builder_bytes_refs, struct_field_cell, to_field};
-use rtdb_types::{Anomaly, EventHeader, EventOp, Iid, Interval, LogicalType, Result, RunEndWidth, Timestamp, Value};
+use rtdb_types::{Anomaly, EventHeader, EventOp, Iid, Interval, LogicalType, Result, RunEndWidth, ScalarType, Timestamp, Value};
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum StoredOperation {
@@ -88,11 +89,25 @@ struct EventPage { put: Option<(StructArray, Vec<LogicalType>)> }
 #[derive(Clone, Copy)]
 struct PutRef<'a> {
     array: &'a StructArray,
-    types: &'a [LogicalType],
+    types: PutFieldTypes<'a>,
     offset: usize,
 }
 
+#[derive(Clone, Copy)]
+enum PutFieldTypes<'a> {
+    Ordered(&'a [LogicalType]),
+    Named(&'a StructFields<LogicalType>),
+}
+
 impl<'a> PutRef<'a> {
+    fn field_type(self, index: usize) -> Result<&'a LogicalType> {
+        let ty = match self.types {
+            PutFieldTypes::Ordered(types) => types.get(index),
+            PutFieldTypes::Named(types) => types.get(self.array.fields()[index].name()),
+        };
+        ty.ok_or_else(|| invalid("Put column has no logical type"))
+    }
+
     fn column(self, name: &str) -> PutColumn<'a> {
         match self.position(name) {
             Some(index) => PutColumn::Stored(&self.array.fields()[index], self.array.column(index).as_ref(), self.offset),
@@ -101,7 +116,7 @@ impl<'a> PutRef<'a> {
     }
     fn value(self, name: &str, ty: &LogicalType) -> Result<Value> {
         match self.position(name) {
-            Some(index) => match self.types.get(index).ok_or_else(|| invalid("Put column has no logical type"))? {
+            Some(index) => match self.field_type(index)? {
                 LogicalType::Nothing => Ok(Value::Undefined),
                 stored => rtdb_columnar::read_value_as(stored, &self.array.fields()[index], self.array.column(index).as_ref(), self.offset),
             },
@@ -119,6 +134,86 @@ pub struct EventRef<'a> {
     header: EventHeader,
     recency: Option<Timestamp>,
     put: Option<PutRef<'a>>,
+}
+
+pub enum PutText<'a> {
+    Missing,
+    Utf8(&'a str),
+    Other,
+}
+
+impl<'a> EventRef<'a> {
+    pub fn validate_document(&self, memory: &Arc<MemoryBudget>) -> Result<()> {
+        let Some(put) = self.put else { return Ok(()); };
+        for (index, field) in put.array.fields().iter().enumerate() {
+            let logical = put.field_type(index)?;
+            if *logical != LogicalType::Nothing {
+                rtdb_columnar::validate_readable_cell(field, put.array.column(index).as_ref(), logical, put.offset, memory)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Borrows ordinary UTF-8 cells from a validated put document.
+    pub fn put_text(&self, name: &str) -> Result<PutText<'a>> {
+        let Some(put) = self.put else { return Ok(PutText::Missing); };
+        let Some(position) = put.position(name) else { return Ok(PutText::Missing); };
+        let logical = put.field_type(position)?;
+        text_cell(logical, &put.array.fields()[position], put.array.column(position).as_ref(), put.offset)
+    }
+}
+
+fn text_cell<'a>(logical: &LogicalType, field: &Field, array: &'a dyn Array, row: usize) -> Result<PutText<'a>> {
+    match field.data_type() {
+        DataType::Union(legs, UnionMode::Dense) => {
+            let union = array.as_union();
+            let tag = union.type_id(row);
+            let child = legs.iter().find_map(|(id, child)| (id == tag).then_some(child)).ok_or_else(|| invalid("Put union type has no leg"))?;
+            let derived;
+            let logical = match logical {
+                LogicalType::Union(types) => types.iter().find(|ty| rtdb_columnar::leg_name(ty).is_ok_and(|name| name == *child.name())),
+                _ => None,
+            };
+            let logical = match logical {
+                Some(logical) => logical,
+                None => {
+                    derived = rtdb_columnar::from_field(child)?;
+                    &derived
+                }
+            };
+            text_cell(logical, child, union.child(tag).as_ref(), union.value_offset(row))
+        }
+        DataType::RunEndEncoded(ends, child) => {
+            let derived;
+            let logical = match logical {
+                LogicalType::RunEndEncoded { value, .. } => value.as_ref(),
+                _ => {
+                    derived = rtdb_columnar::from_field(child)?;
+                    &derived
+                }
+            };
+            macro_rules! in_run {
+                ($ty:ty) => {{
+                    let runs = array.as_run::<$ty>();
+                    text_cell(logical, child, runs.values().as_ref(), runs.get_physical_index(row))
+                }};
+            }
+            match ends.data_type() {
+                DataType::Int16 => in_run!(Int16Type),
+                DataType::Int32 => in_run!(Int32Type),
+                DataType::Int64 => in_run!(Int64Type),
+                _ => Err(invalid("Put run ends have an unsupported layout")),
+            }
+        }
+        _ if array.is_null(row) => Ok(PutText::Missing),
+        _ => match logical {
+            LogicalType::Null | LogicalType::Nothing => Ok(PutText::Missing),
+            LogicalType::Maybe(inner) => text_cell(inner, field, array, row),
+            LogicalType::Scalar(ScalarType::Utf8) => array.as_any().downcast_ref::<StringArray>()
+                .map(|strings| PutText::Utf8(strings.value(row))).ok_or_else(|| invalid("Put text has an unsupported Arrow array")),
+            _ => Ok(PutText::Other),
+        },
+    }
 }
 
 impl EncodedEvent for EventRef<'_> {
@@ -146,7 +241,7 @@ impl PageEvent {
     }
     fn put_ref(&self) -> Option<PutRef<'_>> {
         let (Some((array, types)), EventOp::Put) = (&self.page.put, self.op) else { return None; };
-        Some(PutRef { array, types, offset: self.offset })
+        Some(PutRef { array, types: PutFieldTypes::Ordered(types), offset: self.offset })
     }
 }
 
@@ -269,6 +364,25 @@ impl EventBatch {
     /// Borrows a row and the logical types of its batch's put fields.
     pub fn event_ref<'a>(&'a self, row: usize, put_types: &'a [LogicalType]) -> Result<EventRef<'a>> {
         let header = self.header(row)?;
+        self.event_ref_at(row, header, PutFieldTypes::Ordered(put_types))
+    }
+
+    /// Borrows an event using the whole put field's validated layout for its cells.
+    pub fn borrow_event(&self, row: usize) -> Result<EventRef<'_>> {
+        let header = self.header(row)?;
+        let types = if header.op == EventOp::Put {
+            let (field, _, _) = self.operation(row)?;
+            let logical = self.put_layout(field)?;
+            let logical = match logical { LogicalType::Maybe(inner) => inner.as_ref(), ty => ty };
+            let LogicalType::Struct(types) = logical else { return Err(invalid("A put operation must contain a document struct")); };
+            PutFieldTypes::Named(types)
+        } else {
+            PutFieldTypes::Ordered(&[])
+        };
+        self.event_ref_at(row, header, types)
+    }
+
+    fn event_ref_at<'a>(&'a self, row: usize, header: EventHeader, put_types: PutFieldTypes<'a>) -> Result<EventRef<'a>> {
         let put = if header.op == EventOp::Put {
             let (_, array, offset) = self.operation(row)?;
             let array = array.as_any().downcast_ref::<StructArray>().filter(|array| array.is_valid(offset))
@@ -279,12 +393,18 @@ impl EventBatch {
         Ok(EventRef { header, recency, put })
     }
 
+    fn put_layout(&self, field: &Field) -> Result<&LogicalType> {
+        if let Some(logical) = self.put_type.get() { return Ok(logical); }
+        let logical = rtdb_columnar::from_field(field)?;
+        Ok(self.put_type.get_or_init(|| logical))
+    }
+
     pub fn read_event(&self, row: usize) -> Result<StoredEvent> {
         let header = self.header(row)?;
         let operation = match header.op {
             EventOp::Put => {
                 let (field, array, offset) = self.operation(row)?;
-                let logical = match self.put_type.get() { Some(logical) => logical, None => { let derived = rtdb_columnar::from_field(field)?; self.put_type.get_or_init(|| derived) } };
+                let logical = self.put_layout(field)?;
                 let Value::Struct(document) = rtdb_columnar::read_value_as(logical, field, array.as_ref(), offset)? else {
                     return Err(invalid("A put operation must contain a document struct"));
                 };
@@ -314,6 +434,75 @@ impl EventBatch {
 /// All rows must either carry recency or omit it; the caller supplies the put schema captured with the rows.
 pub fn build_event_batch(events: &[StoredEvent], put_fields: Option<StructFields<LogicalType>>, iid_encoding: Option<RunEndWidth>) -> Result<RecordBatch> {
     event_batch(events, put_fields, iid_encoding, false, None, PutLeg::First)
+}
+
+#[test]
+fn validating_a_borrowed_document_keeps_errors_in_unread_fields() {
+    let fields = StructFields::from([
+        ("uri".into(), LogicalType::Scalar(ScalarType::Uri)),
+        ("body".into(), LogicalType::Scalar(ScalarType::Utf8)),
+    ]);
+    let event = StoredEvent {
+        iid: Iid([0; 16]), system_from: Timestamp(10), valid_time: Interval::ALL, recency: None,
+        operation: StoredOperation::Put(StructFields::from([
+            ("uri".into(), Value::Uri("https://example.com".into())),
+            ("body".into(), Value::Utf8("indexed text".into())),
+        ])),
+    };
+    let batch = build_event_batch(&[event], Some(fields), None).unwrap();
+    let schema = batch.schema();
+    let op = schema.index_of("op").unwrap();
+    let union = batch.column(op).as_union();
+    let DataType::Union(legs, _) = union.data_type() else { panic!("Expected union"); };
+    let children = legs.iter().map(|(id, field)| {
+        if field.name() != "put" { return Arc::clone(union.child(id)); }
+        let put = union.child(id).as_struct();
+        let mut columns = put.columns().to_vec();
+        let uri = put.fields().iter().position(|field| field.name() == "uri").unwrap();
+        columns[uri] = Arc::new(StringArray::from(vec!["%"]));
+        Arc::new(StructArray::try_new(put.fields().clone(), columns, None).unwrap()) as ArrayRef
+    }).collect();
+    let mut columns = batch.columns().to_vec();
+    columns[op] = Arc::new(UnionArray::try_new(legs.clone(), union.type_ids().clone(), union.offsets().cloned(), children).unwrap());
+    let batch = EventBatch::new(RecordBatch::try_new(schema, columns).unwrap()).unwrap();
+    let event = batch.borrow_event(0).unwrap();
+    let memory = MemoryBudget::new(1 << 20);
+    assert_eq!(event.validate_document(&memory).unwrap_err().code, batch.read_event(0).unwrap_err().code);
+    assert_eq!(memory.used_bytes(), 0);
+}
+
+#[test]
+fn borrowed_events_validate_the_put_layout_when_a_put_is_read() {
+    let fields = StructFields::from([("body".into(), LogicalType::Scalar(ScalarType::Utf8))]);
+    let events = [StoredOperation::Delete, StoredOperation::Put(StructFields::from([
+        ("body".into(), Value::Utf8("indexed text".into())),
+    ]))].into_iter().map(|operation| StoredEvent {
+        iid: Iid([0; 16]), system_from: Timestamp(10), valid_time: Interval::ALL, recency: None, operation,
+    }).collect::<Vec<_>>();
+    let batch = build_event_batch(&events, Some(fields), None).unwrap();
+    let schema = batch.schema();
+    let op = schema.index_of("op").unwrap();
+    let union = batch.column(op).as_union();
+    let DataType::Union(legs, _) = union.data_type() else { panic!("Expected union"); };
+    let children = legs.iter().map(|(id, _)| Arc::clone(union.child(id))).collect();
+    let legs = legs.iter().map(|(id, field)| {
+        let field = if field.name() == "put" {
+            Arc::new(field.as_ref().clone().with_metadata([
+                (rtdb_columnar::EXTENSION_NAME_KEY.to_owned(), "unrecognized".into()),
+            ].into_iter().collect()))
+        } else {
+            Arc::clone(field)
+        };
+        (id, field)
+    }).collect();
+    let union = UnionArray::try_new(legs, union.type_ids().clone(), union.offsets().cloned(), children).unwrap();
+    let mut fields = schema.fields().to_vec();
+    fields[op] = Arc::new(fields[op].as_ref().clone().with_data_type(union.data_type().clone()));
+    let mut columns = batch.columns().to_vec();
+    columns[op] = Arc::new(union);
+    let batch = EventBatch::new(RecordBatch::try_new(Arc::new(Schema::new(fields)), columns).unwrap()).unwrap();
+    assert_eq!(batch.borrow_event(0).unwrap().header().op, EventOp::Delete);
+    assert_eq!(batch.borrow_event(1).err().unwrap().code, batch.read_event(1).unwrap_err().code);
 }
 
 /// Reconstructs stored cells under their captured put schema, preserving raw decimal coefficients.

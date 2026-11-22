@@ -25,8 +25,8 @@ impl JoinCursor {
 impl JoinPlan {
     fn build_layout(&self) -> &JoinInput { if self.build_left { &self.layout.left } else { &self.layout.right } }
     fn probe_layout(&self) -> &JoinInput { if self.build_left { &self.layout.right } else { &self.layout.left } }
-    fn track_build(&self) -> bool { self.kind == JoinKind::Full || self.kind == JoinKind::Left && self.build_left || self.kind == JoinKind::Right && !self.build_left }
-    fn preserve_probe(&self) -> bool { matches!(self.kind, JoinKind::Full | JoinKind::Single) || self.kind == JoinKind::Left && !self.build_left || self.kind == JoinKind::Right && self.build_left }
+    fn track_build(&self) -> bool { tracks_build(self.kind, self.build_left) }
+    fn preserve_probe(&self) -> bool { preserves_probe(self.kind, self.build_left) }
     fn blooms(&self) -> bool { matches!(self.kind,JoinKind::Inner | JoinKind::Semi) || self.track_build() && self.kind != JoinKind::Full }
     fn joined(&self,build: &OwnedRow,probe: &OwnedRow) -> Result<OwnedRow> {
         let (left,right) = if self.build_left { (build,probe) } else { (probe,build) };
@@ -149,6 +149,15 @@ fn append(page: &mut PageBuilder,row: OwnedRow,execution: &Execution) -> Result<
     page.push_growing(row,&execution.context.memory)
 }
 fn size_error() -> rtdb_types::Anomaly { invalid("join-size","Join output or comparator metadata exceeds supported allocation bounds") }
+
+pub(crate) fn tracks_build(kind: JoinKind, build_left: bool) -> bool {
+    kind == JoinKind::Full || kind == JoinKind::Left && build_left || kind == JoinKind::Right && !build_left
+}
+
+pub(crate) fn preserves_probe(kind: JoinKind, build_left: bool) -> bool {
+    matches!(kind, JoinKind::Full | JoinKind::Single)
+        || kind == JoinKind::Left && !build_left || kind == JoinKind::Right && build_left
+}
 
 #[async_trait]
 impl PageCursor for JoinCursor {

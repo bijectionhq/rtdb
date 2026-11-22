@@ -36,6 +36,7 @@
 -- The sort gathers payload columns by position and uses Arrow IPC for its spill runs.
 -- A sort can compare supported key types directly at selected Arrow positions.
 -- A sort can compute a supported key expression in its Arrow input batches and keep its payloads columnar through ordering and spill.
+-- A sort can combine several computed Arrow keys with keys taken directly from its input columns.
 -- Its spill threshold accounts for Arrow buffers held by selected payloads.
 -- A top-level materialized relation over a scan with compatible fixed-width Arrow fields and simple reference operations writes its batches once as Arrow IPC and opens an independent reader for each reference.
 -- A batch join can gather matching payload positions from selected Arrow vectors.
@@ -43,6 +44,8 @@
 -- Its Bloom and entity ID filters use those same build-side vectors.
 -- Compatible semi and anti equijoins select their output from the probe vectors and emit each selected probe position once.
 -- Their columnar output keeps the configured transport row limit.
+-- Compatible outer equijoins select both sides by position and use null positions for unmatched rows.
+-- A single equijoin fails when more than one build row matches a probe row.
 -- A columnar cross join gathers pairs of positions from its two inputs in left-major order within each batch pair.
 -- Relation ordinality and unpartitioned ROW_NUMBER with supported ordering append a signed 64-bit ordinal vector to Arrow batch inputs.
 -- Unpartitioned LEAD and LAG gather shifted cells from their ordered Arrow input and append null cells at the window boundary.
