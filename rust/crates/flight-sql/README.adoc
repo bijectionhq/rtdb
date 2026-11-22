@@ -334,7 +334,7 @@ Mutations use validity from their ordered present to infinity.
 The ordered resolver applies releases and claims as a group, so a commit may swap keys. Conflicts do not return the occupant or the key.
 A successful declaration returns the same transaction-key Arrow row as Create.
 
-=== Reading and dropping a hosted checkpoint world
+=== Working in a hosted checkpoint world
 
 The placed Multi host enables world actions on a listener configured for owned native actions.
 An authenticated, idle autocommit session must remain bound to its writer placement and epoch.
@@ -349,3 +349,18 @@ A found row includes the winning local or archived `rtdb.owned.revision_micros`.
 `rtdb.owned.DropWorld.v1` takes exactly the 16-byte world UUID.
 The ordered terminal record fences subsequent world operations before the host releases its archive pin.
 Success has zero Flight results.
+
+`rtdb.owned.ForkWorld.v1` takes a registered 16-byte capture UUID followed by a signed big-endian 64-bit expiration time in Unix microseconds.
+The host resolves the live deployment's capture receipt and reopens its verified archive root to obtain the parent transaction key.
+Success returns one Flight result containing the new world UUID as 16 bytes.
+
+`rtdb.owned.CommitWorld.v1` takes a 16-byte world UUID, then the Commit.v2 relation grouping without a deadline.
+The group count is a big-endian u16 from 1 to 32.
+Each group consists of a relation prefix, its big-endian u32 Arrow length, and one terminated IPC stream with a nonempty batch.
+The request admits up to 4096 rows across all groups.
+Each row has exactly `_id`, `_op: Utf8`, `_valid_from_micros: Int64`, `_valid_to_micros: Int64`, and `fact: Struct?`.
+Both signed endpoints are required and specify a nonempty half-open interval. Use Int64 minimum and maximum for unbounded endpoints.
+A `replace` carries the complete fact fields in its struct. The struct may include `_absent: List<Utf8>` to omit named null cells.
+A `delete` carries a null struct and writes a world tombstone over the interval.
+The resolver validates replacements against the schema inherited from the archived cut and orders all groups atomically at the live world deadline.
+Success returns the standard transaction-key Arrow row.

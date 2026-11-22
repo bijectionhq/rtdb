@@ -682,11 +682,13 @@ impl<'a> OpenTransaction<'a> {
     async fn declare_owned_relation(&mut self, relation: &rtdb_types::OwnedRelation, schema: &rtdb_types::OwnedSchema) -> Result<()> {
         let owner = self.options.user.as_deref().filter(|owner| !owner.is_empty()).ok_or_else(no_owned_principal)?;
         if relation.world().is_some() || relation.is_world_catalog() { return Err(rtdb_types::OwnedWorld::unavailable()); }
-        if self.snapshot()?.contains_table(&relation.table(owner))
-            || self.read_owned_schema(owner, relation).await?.is_some()
-        {
-            return Err(Anomaly::new(AnomalyCategory::Conflict, "rtdb.owned/relation-exists",
-                "The owned relation already has data or a declaration"));
+        let conflict = || Anomaly::new(AnomalyCategory::Conflict, "rtdb.owned/relation-exists",
+            "The owned relation already has a different declaration or inferred data");
+        if let Some((existing, _)) = self.read_owned_schema(owner, relation).await? {
+            return if &existing == schema { Ok(()) } else { Err(conflict()) };
+        }
+        if self.snapshot()?.contains_table(&relation.table(owner)) {
+            return Err(conflict());
         }
         let _encoded = self.context.memory.reserve(schema.retained_bytes() * 8 + 4096)?;
         let document = StructFields::from([
@@ -929,11 +931,11 @@ impl<'a> OpenTransaction<'a> {
             }
             let (record, _) = self.owned_world.as_ref().ok_or_else(unavailable)?;
             if Some(record.id) != relation.world() { return Err(unavailable()); }
+            let schema = record.schemas.relation(&root)
+                .ok_or_else(|| Anomaly::incorrect("rtdb.owned/world-undeclared", "World writes require a schema retained from the parent cut"))?;
             for row in documents.rows() {
                 let _scratch = self.context.memory.reserve(rtdb_types::WorldShadow::decode_bound(row)?)?;
-                if let rtdb_types::WorldShadow::Present(fact) = rtdb_types::WorldShadow::from_record(row)?
-                    && let Some(schema) = record.schemas.relation(&root)
-                {
+                if let rtdb_types::WorldShadow::Present(fact) = rtdb_types::WorldShadow::from_record(row)? {
                     validate_owned_schema(schema, &fact)?;
                 }
             }

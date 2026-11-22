@@ -3,12 +3,12 @@ use std::{fmt, sync::Arc};
 use futures::future::BoxFuture;
 use rtdb_directory::{Directory, HostedTask};
 use rtdb_flight_sql::{OwnedWorldHost, WorldCall, WorldPoint, WorldPointResult, WorldPointRow};
-use rtdb_node::NodeOptions;
-use rtdb_types::{OwnedWorld, Result};
+use rtdb_node::{NodeOptions, OwnedWorldWrite};
+use rtdb_types::{OwnedWorld, Result, Timestamp, TransactionKey};
 use uuid::Uuid;
 
 use crate::{
-    archive::{CheckpointReadResources, drop_checkpoint_world, read_checkpoint_world_point},
+    archive::{CheckpointReadResources, commit_checkpoint_world, drop_checkpoint_world, fork_checkpoint_world, read_checkpoint_world_point},
     capability::attachment_storage,
     deployment::CellStorage,
     keys::KeyService,
@@ -62,6 +62,27 @@ impl OwnedWorldHost for PlacedWorldHost {
                 WorldPointRow { fields, revision, reservation }
             });
             Ok(WorldPointResult { present: read.present.system_time, row })
+        })
+    }
+
+    fn fork_world<'a>(&'a self, call: WorldCall<'a>, capture: Uuid, until: Timestamp) -> BoxFuture<'a, Result<Uuid>> {
+        Box::pin(async move {
+            let deployment = self.deployment(&call)?;
+            let resources = CheckpointReadResources {
+                node: &self.options,
+                memory: call.node.memory(),
+                cache: Arc::clone(call.node.cache_budget()),
+                cancellation: call.cancellation,
+            };
+            fork_checkpoint_world(self.directory.as_ref(), &self.storage, self.keys.as_ref(), self.hosted_task.as_ref(),
+                call.session, deployment, capture, until, resources).await
+        })
+    }
+
+    fn commit_world<'a>(&'a self, call: WorldCall<'a>, world: Uuid, writes: Vec<OwnedWorldWrite>) -> BoxFuture<'a, Result<TransactionKey>> {
+        Box::pin(async move {
+            let deployment = self.deployment(&call)?;
+            commit_checkpoint_world(self.directory.as_ref(), &self.storage, call.session, deployment, world, writes).await
         })
     }
 

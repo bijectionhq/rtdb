@@ -62,31 +62,35 @@ impl<'a> CommitRequest<'a> {
         if let Some(relation) = single {
             return Ok(Self { deadline, groups: vec![(relation, body)] });
         }
-        let (count, mut rest) = body.split_first_chunk::<2>().ok_or_else(|| invalid("Owned commit has no group count"))?;
-        let count = usize::from(u16::from_be_bytes(*count));
-        if count > MAX_COMMIT_GROUPS {
-            return Err(invalid("Owned commit supports up to 32 relation groups"));
-        }
-        let mut groups = Vec::with_capacity(count);
-        for _ in 0..count {
-            let (relation, framed) = split_relation(rest)?;
-            if groups.iter().any(|(previous, _)| previous == &relation) {
-                return Err(invalid("Owned commit has a duplicate relation"));
-            }
-            let (length, framed) = framed.split_first_chunk::<4>().ok_or_else(|| invalid("Owned commit group has no Arrow length"))?;
-            let length = u32::from_be_bytes(*length) as usize;
-            let (arrow, tail) = framed.split_at_checked(length).ok_or_else(|| invalid("Owned commit group Arrow stream is truncated"))?;
-            if arrow.is_empty() {
-                return Err(invalid("Owned commit group Arrow stream is empty"));
-            }
-            groups.push((relation, arrow));
-            rest = tail;
-        }
-        if !rest.is_empty() {
-            return Err(invalid("Owned commit has trailing bytes"));
-        }
-        Ok(Self { deadline, groups })
+        Ok(Self { deadline, groups: owned_groups(body, false)? })
     }
+}
+
+fn owned_groups(body: &[u8], require_writes: bool) -> Result<Vec<(OwnedRelation, &[u8])>, Status> {
+    let (count, mut rest) = body.split_first_chunk::<2>().ok_or_else(|| invalid("Owned commit has no group count"))?;
+    let count = usize::from(u16::from_be_bytes(*count));
+    if count > MAX_COMMIT_GROUPS || (require_writes && count == 0) {
+        return Err(invalid("Owned commit has an invalid relation group count"));
+    }
+    let mut groups = Vec::with_capacity(count);
+    for _ in 0..count {
+        let (relation, framed) = split_relation(rest)?;
+        if groups.iter().any(|(previous, _)| previous == &relation) {
+            return Err(invalid("Owned commit has a duplicate relation"));
+        }
+        let (length, framed) = framed.split_first_chunk::<4>().ok_or_else(|| invalid("Owned commit group has no Arrow length"))?;
+        let length = u32::from_be_bytes(*length) as usize;
+        let (arrow, tail) = framed.split_at_checked(length).ok_or_else(|| invalid("Owned commit group Arrow stream is truncated"))?;
+        if arrow.is_empty() {
+            return Err(invalid("Owned commit group Arrow stream is empty"));
+        }
+        groups.push((relation, arrow));
+        rest = tail;
+    }
+    if !rest.is_empty() {
+        return Err(invalid("Owned commit has trailing bytes"));
+    }
+    Ok(groups)
 }
 
 pub(crate) const READ_OWNED_V1: &str = "rtdb.owned.ReadPoint.v1";
@@ -96,6 +100,8 @@ pub(crate) const HELD_OWNED_POINT_V2: &str = "rtdb.owned.ReadHeldPoint.v2";
 pub(crate) const CLOSE_OWNED_READ_V1: &str = "rtdb.owned.CloseRead.v1";
 pub(crate) const READ_WORLD_POINT_V1: &str = "rtdb.owned.ReadWorldPoint.v1";
 pub(crate) const DROP_WORLD_V1: &str = "rtdb.owned.DropWorld.v1";
+pub(crate) const FORK_WORLD_V1: &str = "rtdb.owned.ForkWorld.v1";
+pub(crate) const COMMIT_WORLD_V1: &str = "rtdb.owned.CommitWorld.v1";
 pub(crate) const SEARCH_HELD_OWNED_V1: &str = "rtdb.owned.SearchHeld.v1";
 pub(crate) const HELD_OWNED_RANGE_V1: &str = "rtdb.owned.ReadHeldRange.v1";
 pub(crate) const HELD_OWNED_RANGE_V2: &str = "rtdb.owned.ReadHeldRange.v2";
@@ -386,7 +392,10 @@ impl Service {
         let outcome = native.state_mut().execute_tx(operations, Default::default()).await.map_err(status)?;
         if let Some(error) = outcome.error() { return Err(status(error.clone())); }
         if !outcome.committed() { return Err(Status::aborted("Owned write did not commit")); }
-        let tx = outcome.tx_key();
+        self.owned_tx_reply(outcome.tx_key())
+    }
+
+    fn owned_tx_reply(&self, tx: rtdb_types::TransactionKey) -> Result<ActionResult, Status> {
         let schema = Arc::new(Schema::new(vec![
             Field::new("tx_id", DataType::Int64, false),
             Field::new("system_time_micros", DataType::Int64, false),
@@ -632,6 +641,88 @@ impl Service {
             crate::WorldCall { node: &self.0.node, attachment: &attachment, session: &mut session, cancellation: &call.cancellation },
             Uuid::from_bytes(bytes),
         ).await.map_err(status)
+    }
+
+    pub(crate) async fn fork_world_action(&self, call: &Call, body: &[u8]) -> Result<ActionResult, Status> {
+        if !self.0.config.owned_native_actions { return Err(unsupported()); }
+        let host = self.0.config.owned_world_host.as_ref().ok_or_else(unsupported)?;
+        let (capture, rest) = body.split_first_chunk::<16>().ok_or_else(|| invalid("Owned world fork has no capture UUID"))?;
+        let until: [u8; 8] = rest.try_into().map_err(|_| invalid("Owned world fork requires one expiry instant"))?;
+        let (_, attachment) = call.session.resolve_database(Some(&call.database), &self.0.node)?;
+        let attachment = attachment.ok_or_else(unsupported)?;
+        let connection = self.connection(call, &call.database).await?;
+        let mut session = connection.borrow().await?;
+        require_idle(&session)?;
+        let reply_charge = call.reserve(64)?;
+        let world = host.fork_world(
+            crate::WorldCall { node: &self.0.node, attachment: &attachment, session: &mut session, cancellation: &call.cancellation },
+            Uuid::from_bytes(*capture), Timestamp(i64::from_be_bytes(until)),
+        ).await.map_err(status)?;
+        Ok(ActionResult { body: wire::retain(Bytes::copy_from_slice(world.as_bytes()), reply_charge) })
+    }
+
+    pub(crate) async fn commit_world_action(&self, call: &Call, body: &[u8]) -> Result<ActionResult, Status> {
+        use rtdb_node::OwnedWorldWrite;
+        use rtdb_types::{Interval, WorldShadow};
+
+        if !self.0.config.owned_native_actions { return Err(unsupported()); }
+        let host = self.0.config.owned_world_host.as_ref().ok_or_else(unsupported)?;
+        let (world, groups) = body.split_first_chunk::<16>().ok_or_else(|| invalid("Owned world commit has no world UUID"))?;
+        let _framing = call.reserve(MAX_COMMIT_GROUPS * 512)?;
+        let mut writes = Vec::new();
+        let mut reservations = Vec::new();
+        for (relation, arrow) in owned_groups(groups, true)? {
+            let batch = request_batch(call, arrow)?;
+            let batch = batch.batch();
+            let schema = batch.schema_ref();
+            let field = |name| schema.column_with_name(name).map(|(_, field)| field.data_type());
+            if schema.fields().len() != 5 || field("_op") != Some(&DataType::Utf8)
+                || field("_valid_from_micros") != Some(&DataType::Int64)
+                || field("_valid_to_micros") != Some(&DataType::Int64)
+                || !matches!(field("fact"), Some(DataType::Struct(_)))
+            {
+                return Err(invalid("Owned world commit requires _id, _op, two Int64 valid endpoints, and a fact struct"));
+            }
+            if batch.num_rows() > MAX_GROUPED_COMMIT_ROWS - writes.len() {
+                return Err(invalid("Owned world commit exceeds its total row limit"));
+            }
+            let charge = call.reserve(wire::mul(batch.num_rows(), std::mem::size_of::<OwnedWorldWrite>() + 512)?)?;
+            writes.try_reserve_exact(batch.num_rows()).map_err(|_| Status::resource_exhausted("Owned world commit allocation failed"))?;
+            let (rows, decoded) = upload::owned_documents(batch, self)?;
+            reservations.push((charge, decoded));
+            for mut row in rows {
+                let id = row.remove("_id").ok_or_else(|| invalid("Owned world write has no _id"))?.entity_id().map_err(status)?;
+                let (Some(Value::Utf8(operation)), Some(Value::I64(from)), Some(Value::I64(to)), Some(payload)) = (
+                    row.remove("_op"), row.remove("_valid_from_micros"), row.remove("_valid_to_micros"), row.remove("fact"),
+                ) else { return Err(invalid("Owned world write requires a typed operation and explicit valid endpoints")); };
+                let valid = Interval::from_micros(from, to).map_err(status)?;
+                if valid.is_empty() { return Err(invalid("Owned world write needs a nonempty valid interval")); }
+                let shadow = match (operation.as_str(), payload) {
+                    ("delete", Value::Null) => WorldShadow::Deleted,
+                    ("replace", Value::Struct(mut fields)) => {
+                        strip_owned_absence(&mut fields)?;
+                        if fields.keys().any(|name| name.starts_with('_')) {
+                            return Err(invalid("Owned world fact contains a reserved field"));
+                        }
+                        let mut fact = StructFields::from([("_id".into(), id.as_value())]);
+                        fact.extend(fields);
+                        WorldShadow::Present(fact)
+                    }
+                    _ => return Err(invalid("Owned world write requires replace with a fact or delete with a null fact")),
+                };
+                writes.push(OwnedWorldWrite { relation: relation.clone(), id, shadow, valid });
+            }
+        }
+        let (_, attachment) = call.session.resolve_database(Some(&call.database), &self.0.node)?;
+        let attachment = attachment.ok_or_else(unsupported)?;
+        let connection = self.connection(call, &call.database).await?;
+        let mut session = connection.borrow().await?;
+        require_idle(&session)?;
+        let committed = host.commit_world(
+            crate::WorldCall { node: &self.0.node, attachment: &attachment, session: &mut session, cancellation: &call.cancellation },
+            Uuid::from_bytes(*world), writes,
+        ).await.map_err(status)?;
+        self.owned_tx_reply(committed)
     }
 
     pub(crate) async fn read_owned_action(&self, call: &Call, body: &[u8]) -> Result<ActionResult, Status> {

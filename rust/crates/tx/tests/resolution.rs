@@ -814,7 +814,7 @@ async fn owned_world_rows_require_the_ordered_registration_and_cannot_mix_with_r
     let state = PartitionState::empty(Default::default()).unwrap();
     let world = OwnedWorld {
         id: Iid([8; 16]), capture: Iid([9; 16]), manifest: "a".repeat(43),
-        basis: TransactionKey { tx_id: TxId(0), system_time: Timestamp(10) }, until: Timestamp(107), dropped: false,
+        basis: TransactionKey { tx_id: TxId(0), system_time: Timestamp(10) }, until: Timestamp(108), dropped: false,
         schemas: rtdb_types::WorldSchemas::new(std::collections::BTreeMap::from([(
             "orders".into(),
             rtdb_types::OwnedSchema::from_json(br#"{"fields":[{"name":"amount","type":{"kind":"i64"},"optional":true,"nullable":false}]}"#).unwrap(),
@@ -886,13 +886,18 @@ async fn owned_world_rows_require_the_ordered_registration_and_cannot_mix_with_r
             valid_from: Some(Timestamp(100)), valid_to: Some(Timestamp(150)),
         }
     };
-    let invalid = resolver.resolve_source(state.snapshot(), SourcePosition(5), Timestamp(105),
+    let undeclared = OwnedRelation::new("undeclared").unwrap().in_world(world.id).unwrap();
+    let refused = resolver.resolve_source(state.snapshot(), SourcePosition(5), Timestamp(105),
+        source(vec![replace(undeclared.clone())]), &context).await.unwrap();
+    assert_eq!(refused.result().error().unwrap().code, "rtdb.owned/world-undeclared");
+    assert!(!refused.writes().tables().contains_key(&undeclared.address_table("owner")));
+    let invalid = resolver.resolve_source(state.snapshot(), SourcePosition(6), Timestamp(106),
         source(vec![present(Some(Value::Null))]), &context).await.unwrap();
     assert_eq!(invalid.result().error().unwrap().code, "rtdb.owned/nonconforming");
-    let absent = resolver.resolve_source(state.snapshot(), SourcePosition(6), Timestamp(106),
+    let absent = resolver.resolve_source(state.snapshot(), SourcePosition(7), Timestamp(107),
         source(vec![present(None)]), &context).await.unwrap();
     assert!(absent.result().committed());
-    let expired = resolver.resolve_source(state.snapshot(), SourcePosition(7), Timestamp(107),
+    let expired = resolver.resolve_source(state.snapshot(), SourcePosition(8), Timestamp(108),
         source(vec![replace(local.clone())]), &context).await.unwrap();
     assert_eq!(expired.result().error().unwrap().code, "rtdb.world/unavailable");
 }
