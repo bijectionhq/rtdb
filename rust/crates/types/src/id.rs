@@ -154,23 +154,6 @@ impl EntityId {
         }
     }
 
-    /// Candidate locators for the protected owned table registry, in probe order.
-    /// The canonical locator is considered first for existing identity semantics.
-    pub fn owned_locator_candidates(&self) -> impl Iterator<Item = Iid> + '_ {
-        std::iter::once(self.iid()).chain((1u8..32).map(|probe| {
-            let mut hash = Sha256::new();
-            hash.update(b"rtdb-owned-address-v1\0");
-            hash.update([probe]);
-            match self {
-                Self::String(value) => { hash.update(b"s"); hash.update(value.as_bytes()); }
-                Self::Keyword(value) => { hash.update(b"k"); hash.update(value.as_str().as_bytes()); }
-                Self::Integer(value) => { hash.update(b"i"); hash.update(value.to_be_bytes()); }
-                Self::Uuid(value) => { hash.update(b"u"); hash.update(value); }
-            }
-            Iid(hash.finalize()[..16].try_into().expect("fixed digest size"))
-        }))
-    }
-
     pub fn uuid(value: &str) -> Result<Self> {
         uuid::Uuid::parse_str(value).map(|value| Self::Uuid(*value.as_bytes()))
             .map_err(|_| Anomaly::incorrect("xtdb/invalid-id", "Invalid UUID ID"))
@@ -219,7 +202,6 @@ const OWNED_WORLD_CLOCKS: &str = ".world-clocks";
 const OWNED_WORLD_CATALOG: &str = ".worlds";
 const OWNED_WORLD_PREFIX: &str = ".world-";
 const OWNED_UNIQUE_PREFIX: &str = ".unique-";
-const OWNED_ADDRESS_PREFIX: &str = ".addresses-";
 const OWNED_CAPACITY_PREFIX: &str = ".capacity-";
 const OWNED_FIXED_RANGE_PREFIX: &str = ".fixed-range-";
 const OWNED_PURGE_PREFIX: &str = ".purges-";
@@ -252,7 +234,6 @@ impl OwnedRelation {
         owned_table(owner, &format!("{OWNED_PURGE_FLOOR_PREFIX}{}", self.0))
     }
 
-    pub fn address_table(&self, owner: &str) -> TableRef { owned_table(owner, &format!("{OWNED_ADDRESS_PREFIX}{}", self.0)) }
 
     pub fn fixed_range_table(&self, owner: &str) -> TableRef { owned_table(owner, &format!("{OWNED_FIXED_RANGE_PREFIX}{}", self.0)) }
 
@@ -324,8 +305,7 @@ impl TableRef {
     pub fn owned_world_scope(&self) -> (bool, Option<Iid>) {
         let Some((_, name)) = self.table.split_once('-') else { return (false, None); };
         if self.schema != OWNED_SCHEMA_V1 { return (false, None); }
-        let addressed = name.strip_prefix(OWNED_ADDRESS_PREFIX)
-            .or_else(|| name.strip_prefix(OWNED_CHANGE_PREFIX)).unwrap_or(name);
+        let addressed = name.strip_prefix(OWNED_CHANGE_PREFIX).unwrap_or(name);
         let world = addressed.strip_prefix(OWNED_WORLD_PREFIX)
             .and_then(|rest| rest.split_once('.')).and_then(|(world, _)| world.parse().ok());
         (name == OWNED_WORLD_CATALOG, world)
@@ -336,12 +316,10 @@ impl TableRef {
         self.supported_owned_name().then(|| self.table.split_once('-').map(|(_, name)| name)).flatten()
     }
 
-    /// Maps a logical data table, its address table, or its journal to the
-    /// exact original relation. No other protected metadata is a companion.
+    /// Maps logical data and its journal to the exact original relation.
     pub fn owned_effect_relation_name(&self) -> Option<&str> {
         let name = self.owned_storage_name()?;
-        let relation = name.strip_prefix(OWNED_ADDRESS_PREFIX)
-            .or_else(|| name.strip_prefix(OWNED_CHANGE_PREFIX)).unwrap_or(name);
+        let relation = name.strip_prefix(OWNED_CHANGE_PREFIX).unwrap_or(name);
         OwnedRelation::from_source(relation.to_owned()).ok()
             .filter(|relation| !relation.is_world_catalog()).map(|_| relation)
     }
@@ -366,10 +344,6 @@ impl TableRef {
 
     pub fn is_owned_unique_table(&self) -> bool {
         self.table.split_once('-').is_some_and(|(_, name)| name.starts_with(OWNED_UNIQUE_PREFIX)) && self.supported_owned_name()
-    }
-
-    pub fn is_owned_address_table(&self) -> bool {
-        self.table.split_once('-').is_some_and(|(_, name)| name.starts_with(OWNED_ADDRESS_PREFIX)) && self.supported_owned_name()
     }
 
     /// True only for ordinary owned relations within this protected catalog's namespace.
@@ -398,9 +372,6 @@ impl TableRef {
                         || name.strip_prefix(OWNED_PURGE_FLOOR_PREFIX).is_some_and(|relation| OwnedRelation::new(relation).is_ok())
                         || name.strip_prefix(OWNED_PURGE_PREFIX).is_some_and(|relation| OwnedRelation::new(relation).is_ok())
                         || name.strip_prefix(OWNED_UNIQUE_PREFIX).is_some_and(|relation| OwnedRelation::new(relation).is_ok())
-                        || name.strip_prefix(OWNED_ADDRESS_PREFIX).is_some_and(|relation| {
-                            OwnedRelation::from_source(relation.into()).is_ok_and(|relation| !relation.is_world_catalog())
-                        })
                         || name.strip_prefix(OWNED_CAPACITY_PREFIX).is_some_and(|logical| OwnedRelation::new(logical).is_ok())
                         || name.strip_prefix(OWNED_FIXED_RANGE_PREFIX).is_some_and(|logical| OwnedRelation::new(logical).is_ok())
                         || name.strip_prefix(OWNED_CHANGE_PREFIX).is_some_and(|logical|

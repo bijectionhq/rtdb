@@ -57,6 +57,20 @@ pub fn decode_replica(message: &ResolvedTx, predecessor: Option<TransactionKey>,
         let pages = crate::ipc::decode(bytes, memory)?;
         if pages.len() != 1 { return Err(invalid("Resolved transaction table must contain exactly one record batch")); }
         let batch = IndexBatch::from_owned(pages.into_iter().next().ok_or_else(|| invalid("Replica table has no batch"))?)?;
+        let owned_data = table.is_owned_event_data();
+        if !batch.is_empty() && batch.view().has_entity_keys() != owned_data {
+            return Err(invalid("Resolved transaction has the wrong entity-key layout"));
+        }
+        if owned_data {
+            for index in 0..batch.len() {
+                let encoded = batch.view().entity_key(index)?.ok_or_else(|| invalid("Owned event has no complete key"))?;
+                let _key = memory.reserve(encoded.len().saturating_mul(2))?;
+                let id = rtdb_types::EntityId::from_handle_bytes(encoded)?;
+                if id.iid() != batch.header(index)?.iid || id.handle_bytes() != encoded {
+                    return Err(invalid("Resolved owned event locality differs from its complete key"));
+                }
+            }
+        }
         tables.insert(table, TableWrite::new(StructFields::new(), Some(batch)));
     }
     let outcome = placed_attempt.map(|attempt| read_placed_outcome(&tables, attempt, key, memory)).transpose()?;

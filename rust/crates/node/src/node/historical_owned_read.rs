@@ -51,7 +51,6 @@ impl OwnedReadSession {
         let mut floor = None;
         for relation in &relations {
             OwnedRelation::new(relation.name())?;
-            rtdb_query::require_owned_address_coverage(&self.context, &self.owner, relation)?;
             if let Some(required) = self.certify_historical_cut(relation, requested).await? {
                 floor = Some(floor.map_or(required, |floor: Timestamp| floor.max(required)));
             }

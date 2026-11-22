@@ -153,7 +153,7 @@ impl Entity {
     fn push(&mut self, ordinal: u32, row: SearchRow) -> Result<()> {
         self.iid = Some(row.iid);
         if let Some(id) = row.identity {
-            if !id.owned_locator_candidates().any(|candidate| candidate.0 == row.iid) || self.identity.as_ref().is_some_and(|previous| previous != &id) {
+            if id.iid().0 != row.iid || self.identity.as_ref().is_some_and(|previous| previous != &id) {
                 return Err(fault("Owned search input has conflicting complete identities"));
             }
             self.identity = Some(id);
