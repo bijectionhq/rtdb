@@ -199,7 +199,7 @@ async fn build_batches_at(
             let input = BatchDistinct::new(input, runtime.output(), execution, projected)?;
             Ok(Some((Box::new(input), projected)))
         }
-        RelationNode::Aggregate { groups, aggregates, .. } if output == BatchOutput::Arrow && execution.context.tracer.is_none() => {
+        RelationNode::Aggregate { groups, aggregates, .. } if output == BatchOutput::Arrow => {
             if !crate::aggregate::AggregateCursor::writes_scalar_vectors(&runtime, groups, aggregates)? { return Ok(None); }
             let child = runtime.child(0)?;
             let schema = child.schema().clone();
@@ -207,6 +207,9 @@ async fn build_batches_at(
             let aggregate = crate::aggregate::AggregateCursor::from_batches(input, projected, schema,
                 groups.clone(), aggregates.clone(), runtime, execution)?;
             Ok(Some((Box::new(aggregate), false)))
+        }
+        RelationNode::Let { binding, .. } if output == BatchOutput::Arrow => {
+            build_materialized_columns(&runtime, binding, execution).await
         }
         RelationNode::Reference { binding } if output == BatchOutput::Arrow => {
             let scope = execution.bindings.as_ref().ok_or_else(|| invalid("missing-relation", "Reference has no lexical binding"))?;
@@ -249,6 +252,18 @@ async fn build_batches_at(
             }
             let sort: BoxBatchCursor = Box::new(BatchSort::new(batches, schema, order_by.clone(), execution, projected, offset, limit)?);
             Ok(Some((sort, projected)))
+        }
+        RelationNode::Mark { dependent, arguments, condition: None, comparison, .. }
+            if output == BatchOutput::Arrow && arguments.is_empty() => {
+            let build = runtime.child(1)?;
+            let probe = runtime.child(0)?;
+            let Some(keys) = crate::mark::batch_membership_keys(probe.schema(), build.schema(), comparison) else { return Ok(None); };
+            if crate::join::rows_at_most(dependent, &execution)? > execution.context.options.join_build_rows { return Ok(None); }
+            let Some(probe_projected) = batch_shape(&probe, output)? else { return Ok(None); };
+            let Some((build, build_projected)) = build_batch_input(build, execution.child(1), None, output).await? else { return Ok(None); };
+            let probe = crate::batch_join::ProbeInput { runtime: probe, execution: execution.child(0), pushdowns: None, output };
+            let mark = crate::mark::BatchMembership::new(build, build_projected, probe, probe_projected, keys, execution)?;
+            Ok(Some((Box::new(mark), probe_projected)))
         }
         RelationNode::Mark { arguments, condition, comparison, .. } if output == BatchOutput::Arrow && !arguments.is_empty() => {
             let child = runtime.child(0)?;
@@ -302,7 +317,8 @@ async fn build_batches_at(
             Ok(Some((Box::new(join), left_projected || right_projected)))
         }
         RelationNode::Join { left,right,kind,condition: Some(condition) }
-            if *kind != rtdb_plan::JoinKind::Cross && execution.analysis.is_none() && execution.context.tracer.is_none() => {
+            if *kind != rtdb_plan::JoinKind::Cross && execution.analysis.is_none()
+                && (output == BatchOutput::Arrow || execution.context.tracer.is_none()) => {
             use rtdb_plan::JoinKind;
             if *kind != JoinKind::Inner && output != BatchOutput::Arrow { return Ok(None); }
             let (Some(build_projected),Some(probe_projected)) = (batch_shape(&runtime.child(0)?, output)?,batch_shape(&runtime.child(1)?, output)?) else { return Ok(None) };
@@ -316,8 +332,11 @@ async fn build_batches_at(
             let mut layout = crate::join_key::JoinLayout::new(build_relation,probe_relation,Some(condition),&execution.context.memory)?;
             layout.resolve_types(runtime.child(build_side)?.schema(),runtime.child(probe_side)?.schema(),&execution)?;
             let Some(order) = crate::batch_join::key_order(&layout) else { return Ok(None) };
-            let Some(theta) = crate::batch_join::theta_tests(&layout) else { return Ok(None) };
-            if !theta.is_empty() && output != BatchOutput::Arrow { return Ok(None); }
+            let (theta, residual) = match crate::batch_join::theta_tests(&layout) {
+                Some(theta) if output == BatchOutput::Arrow || theta.is_empty() => (theta, None),
+                None if output == BatchOutput::Arrow => (Vec::new(), Some(crate::batch_join::Residual::new(&layout, &execution)?)),
+                _ => return Ok(None),
+            };
             let Some((build,projected)) = build_batch_input(runtime.child(build_side)?,execution.child(build_side),pushdowns.clone(),output).await? else { return Ok(None) };
             if projected != build_projected { return Ok(None); }
             let probe = crate::batch_join::ProbeInput { runtime: runtime.child(probe_side)?,execution: execution.child(probe_side),pushdowns, output };
@@ -335,7 +354,8 @@ async fn build_batches_at(
                 None
             };
             let join = crate::batch_join::BatchJoin::new(build,probe,layout,order,projected,execution)
-                .swapped(unswapped).validating_payloads(output == BatchOutput::Arrow).with_kind(*kind).with_theta(theta).spilling_arrow(replay_build);
+                .swapped(unswapped).validating_payloads(output == BatchOutput::Arrow).with_kind(*kind)
+                .with_theta(theta).with_residual(residual).spilling_arrow(replay_build);
             Ok(Some((Box::new(join) as crate::columnar::BoxBatchCursor,projected)))
         }
         _ => Ok(None),
@@ -360,24 +380,24 @@ fn replayable_spill_input(relation: &Relation) -> bool {
 pub(crate) async fn build_columns(runtime: Arc<EmittedRelation>, execution: Execution) -> Result<Option<crate::columnar::BoxBatchCursor>> {
     execution.context.check_cancelled()?;
     if execution.analysis.is_some() { return Ok(None); }
-    if let RelationNode::Let { binding, .. } = runtime.relation().node() {
-        return build_materialized_columns(&runtime, binding, execution).await;
-    }
     let standalone_join = matches!(runtime.relation().node(),
         RelationNode::Join { left, right, kind, condition: Some(_) }
             if *kind != rtdb_plan::JoinKind::Cross
                 && matches!(left.node(), RelationNode::Scan(_)) && matches!(right.node(), RelationNode::Scan(_)));
     if !standalone_join && batch_shape(&runtime, BatchOutput::Arrow)?.is_none() { return Ok(None); }
+    if matches!(runtime.relation().node(), RelationNode::Let { .. }) {
+        return Ok(build_batch_input(runtime, execution, None, BatchOutput::Arrow).await?.map(|(cursor, _)| cursor));
+    }
     let reservation = state_reservation(&runtime, &execution)?;
     let Some((batches, _)) = build_batch_input(runtime, execution, None, BatchOutput::Arrow).await? else { return Ok(None) };
     Ok(Some(crate::columnar::retain_batch_state(batches, reservation)))
 }
 
 async fn build_materialized_columns(runtime: &Arc<EmittedRelation>, binding: &Arc<rtdb_plan::MaterializedBinding>,
-    execution: Execution) -> Result<Option<crate::columnar::BoxBatchCursor>> {
+    execution: Execution) -> Result<Option<(crate::columnar::BoxBatchCursor, bool)>> {
     let body = runtime.child(1)?;
     let bound = runtime.child(0)?;
-    if !columnar_binding_body(&body, binding)? || batch_shape(&bound, BatchOutput::Pages)?.is_none() {
+    if batch_shape(&body, BatchOutput::Arrow)?.is_none() || batch_shape(&bound, BatchOutput::Arrow)?.is_none() {
         return Ok(None);
     }
     let reservation = state_reservation(runtime, &execution)?;
@@ -387,10 +407,13 @@ async fn build_materialized_columns(runtime: &Arc<EmittedRelation>, binding: &Ar
     let scope = crate::materialized::BindingScope::columns(Arc::clone(binding), input, schema, execution.bindings.clone(), Arc::clone(context))?;
     let mut body_execution = execution.child(1);
     body_execution.bindings = Some(Arc::clone(&scope));
-    let Some((body, _)) = build_batch_input(body, body_execution, None, BatchOutput::Arrow).await? else { return Ok(None); };
+    let (body, projected) = match build_batch_input(Arc::clone(&body), body_execution.clone(), None, BatchOutput::Arrow).await? {
+        Some(input) => input,
+        None => (crate::columnar::batches_from_pages(build_pages(body, body_execution).await?, Arc::clone(&context.memory)), false),
+    };
     let cursor = Box::new(crate::materialized::ColumnLetCursor { body, _binding: scope });
     let cursor = crate::columnar::retain_batch_state(cursor, reservation);
-    Ok(Some(crate::trace::wrap_batches(cursor, runtime.relation(), context)))
+    Ok(Some((cursor, projected)))
 }
 
 pub(crate) enum OrderedInput {
@@ -479,21 +502,6 @@ fn batch_shape(runtime: &Arc<EmittedRelation>, output: BatchOutput) -> Result<Op
     stacker::maybe_grow(512 * 1024, 2 * 1024 * 1024, || batch_shape_at(runtime, output))
 }
 
-fn columnar_binding_body(runtime: &Arc<EmittedRelation>, binding: &rtdb_plan::MaterializedBinding) -> Result<bool> {
-    stacker::maybe_grow(512 * 1024, 2 * 1024 * 1024, || Ok(match runtime.relation().node() {
-        RelationNode::Reference { binding: reference } => reference.name == binding.name && reference.relation == binding.relation,
-        RelationNode::Project { expressions, .. } | RelationNode::Rename { expressions, .. } | RelationNode::Extend { expressions, .. } =>
-            expressions.iter().all(|named| crate::columnar::projection::shaped(&named.expr))
-                && columnar_binding_body(&runtime.child(0)?, binding)?,
-        RelationNode::Filter { .. } | RelationNode::Distinct { .. } | RelationNode::Limit { .. } =>
-            columnar_binding_body(&runtime.child(0)?, binding)?,
-        RelationNode::Set { operator: SetOperator::Union, all: true, .. } => {
-            columnar_binding_body(&runtime.child(0)?, binding)? && columnar_binding_body(&runtime.child(1)?, binding)?
-        }
-        _ => false,
-    }))
-}
-
 fn computed_batch_sort(schema: &Schema, order_by: &[rtdb_plan::SortExpr]) -> bool {
     !order_by.is_empty() && order_by.iter().all(|key| match &key.expr {
         Expr::Column { id, .. } => schema.position(*id).is_some(),
@@ -501,7 +509,7 @@ fn computed_batch_sort(schema: &Schema, order_by: &[rtdb_plan::SortExpr]) -> boo
     })
 }
 
-fn project_sort_keys(
+pub(crate) fn project_sort_keys(
     input: crate::columnar::BoxBatchCursor, schema: Schema, order_by: &[rtdb_plan::SortExpr], execution: &Execution,
 ) -> Result<Option<(crate::columnar::BoxBatchCursor, Schema, Vec<rtdb_plan::SortExpr>)>> {
     let scope = execution.scope()?;
@@ -534,6 +542,10 @@ fn batch_shape_at(runtime: &Arc<EmittedRelation>, output: BatchOutput) -> Result
     let relation = Arc::clone(runtime.relation());
     Ok(match relation.node() {
         RelationNode::Scan(scan) => (!crate::inspection::is_inspection(&scan.table.name.table) && crate::system_schema::definition(&scan.table.name.table).is_none()).then_some(false),
+        RelationNode::Let { .. } if output == BatchOutput::Arrow => {
+            if batch_shape(&runtime.child(0)?, output)?.is_none() { return Ok(None); }
+            batch_shape(&runtime.child(1)?, output)?
+        }
         RelationNode::Reference { .. } if output == BatchOutput::Arrow => Some(false),
         RelationNode::Values { rows } if output == BatchOutput::Arrow => crate::columnar::ColumnBatch::supports_literal_rows(rows).then_some(false),
         RelationNode::ColumnTable { expr: Expr::Parameter { .. }, .. } if output == BatchOutput::Arrow => Some(false),
@@ -567,6 +579,13 @@ fn batch_shape_at(runtime: &Arc<EmittedRelation>, output: BatchOutput) -> Result
         }
         RelationNode::Mark { arguments, .. } if output == BatchOutput::Arrow && !arguments.is_empty() =>
             batch_shape(&runtime.child(0)?, output)?,
+        RelationNode::Mark { condition: None, comparison, .. } if output == BatchOutput::Arrow => {
+            let build = runtime.child(1)?;
+            let probe = runtime.child(0)?;
+            if crate::mark::batch_membership_keys(probe.schema(), build.schema(), comparison).is_none()
+                || batch_shape(&build, output)?.is_none() { return Ok(None); }
+            batch_shape(&probe, output)?
+        }
         RelationNode::Apply { .. } if output == BatchOutput::Arrow =>
             batch_shape(&runtime.child(0)?, output)?,
         RelationNode::PatchGaps { input, .. } if output == BatchOutput::Arrow => {

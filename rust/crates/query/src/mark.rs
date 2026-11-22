@@ -5,6 +5,8 @@ use rtdb_plan::{BinaryOp,Expr,Schema};
 use rtdb_plan::Relation;
 use rtdb_types::{LogicalType,Result,Value};
 use crate::{context::Execution,cursor::OwnedRow,invalid,operators::{DeferredInput,build_pages},pages::{BoxPageCursor,OwnedPage,PageBuilder,PageCursor},runtime_schema::EmittedRelation,join_key::JoinLayout,join_storage::{BuildAccumulator,BuildInput,BuildTable,HashedPage,PartitionSpool,hash_values}};
+use crate::columnar::{BatchCursor, BoxBatchCursor, Column, ColumnBatch, poll_nested_batch};
+use crate::set_keys::BatchKeyIndex;
 
 enum State {
     Build { probe: DeferredInput,runtime: Arc<EmittedRelation> },
@@ -69,6 +71,110 @@ fn membership_key(input: &Schema,dependent: &Schema,comparison: &Expr) -> Option
         }
     }
     None
+}
+
+pub(crate) fn batch_membership_keys(input: &Schema, dependent: &Schema, comparison: &Expr) -> Option<(usize, usize)> {
+    use rtdb_types::ScalarType as S;
+    let MarkKeys::Membership { probe, candidate } = membership_key(input, dependent, comparison)? else { return None; };
+    let probe_type = &input.fields()[probe].data_type;
+    let candidate_type = &dependent.fields()[candidate].data_type;
+    let scalar = |ty: &LogicalType| ty.legs().into_iter().all(|leg| matches!(leg,
+        LogicalType::Null | LogicalType::Scalar(S::Bool | S::I8 | S::I16 | S::I32 | S::I64 | S::F32 | S::F64 | S::Utf8 | S::Binary)));
+    (scalar(probe_type) && scalar(candidate_type) && rtdb_plan::validate_equality_types(probe_type, candidate_type).is_ok())
+        .then_some((probe, candidate))
+}
+
+// The build retains only its comparison column. The probe keeps its whole batch and adds a Boolean vector.
+pub(crate) struct BatchMembership {
+    build: Option<BoxBatchCursor>,
+    probe: MembershipProbe,
+    index: BatchKeyIndex,
+    keys: (usize, usize),
+    build_projected: bool,
+    probe_projected: bool,
+    facts: CandidateFacts,
+    execution: Execution,
+}
+
+enum MembershipProbe {
+    Unopened(crate::batch_join::ProbeInput),
+    Open(BoxBatchCursor),
+    Done,
+}
+
+impl BatchMembership {
+    pub fn new(build: BoxBatchCursor, build_projected: bool, probe: crate::batch_join::ProbeInput,
+        probe_projected: bool, keys: (usize, usize), execution: Execution) -> Result<Self> {
+        let index = BatchKeyIndex::vector_hashing(&execution.context)?;
+        Ok(Self { build: Some(build), probe: MembershipProbe::Unopened(probe), index, keys, build_projected, probe_projected,
+            facts: CandidateFacts { empty: true, null: false, nested: false }, execution })
+    }
+
+    fn is_null(column: &Column, row: usize, context: &crate::QueryContext) -> Result<bool> {
+        if let Some(null) = column.null_at(row) { return Ok(null); }
+        let _scratch = context.memory.reserve(column.bound(row)?)?;
+        Ok(matches!(column.value(row)?, Value::Null | Value::Undefined))
+    }
+}
+
+#[async_trait]
+impl BatchCursor for BatchMembership {
+    async fn next_batch(&mut self) -> Result<Option<ColumnBatch>> {
+        let context = &self.execution.context;
+        let memory = &context.memory;
+        let (probe_key, build_key) = self.keys;
+        if let Some(mut build) = self.build.take() {
+            while let Some(batch) = poll_nested_batch(build.as_mut()).await? {
+                batch.validate_readable(context)?;
+                if batch.len == 0 { continue; }
+                self.facts.empty = false;
+                for row in 0..batch.len {
+                    context.check_cancelled_at(row)?;
+                    self.facts.null |= Self::is_null(&batch.columns[build_key], row, context)?;
+                }
+                let key = batch.key_projection(&[build_key], memory)?;
+                self.index.build(key, self.build_projected, context)?;
+            }
+        }
+        let state = std::mem::replace(&mut self.probe, MembershipProbe::Done);
+        let mut probe = match state {
+            MembershipProbe::Unopened(probe) => {
+                let input = crate::operators::build_batch_input(Arc::clone(&probe.runtime), probe.execution.clone(), probe.pushdowns, probe.output).await?;
+                match input {
+                    Some((cursor, _)) => cursor,
+                    None => crate::columnar::batches_from_pages(build_pages(probe.runtime, probe.execution).await?, Arc::clone(memory)),
+                }
+            }
+            MembershipProbe::Open(probe) => probe,
+            MembershipProbe::Done => return Ok(None),
+        };
+        while let Some(mut batch) = poll_nested_batch(probe.as_mut()).await? {
+            if batch.len == 0 { continue; }
+            batch.validate_readable(context)?;
+            let key = batch.key_projection(&[probe_key], memory)?;
+            let bytes = batch.len.checked_add(256).ok_or_else(|| invalid("mark-size", "Membership marks exceed addressable memory"))?;
+            let reservation = memory.reserve(bytes)?;
+            let mut marks = arrow_array::builder::BooleanBuilder::with_capacity(batch.len);
+            for row in 0..batch.len {
+                context.check_cancelled_at(row)?;
+                let null = Self::is_null(&key.columns[0], row, context)?;
+                if !null && self.index.matches(&key, row, self.probe_projected, false, context)? {
+                    marks.append_value(true);
+                } else if !self.facts.empty && (self.facts.null || null) {
+                    marks.append_null();
+                } else {
+                    marks.append_value(false);
+                }
+            }
+            drop(key);
+            let logical = LogicalType::Scalar(rtdb_types::ScalarType::Bool).maybe();
+            let field = Arc::new(rtdb_columnar::to_field("mark", &logical)?);
+            batch.append_column(Column::Arrow { array: Arc::new(marks.finish()), field, logical: Some(logical) }, reservation, memory)?;
+            self.probe = MembershipProbe::Open(probe);
+            return Ok(Some(batch));
+        }
+        Ok(None)
+    }
 }
 impl MarkPlan {
     fn build_hash(&self,row: &OwnedRow) -> Result<u32> {

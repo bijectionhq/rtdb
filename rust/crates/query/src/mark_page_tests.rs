@@ -50,6 +50,33 @@ async fn correlated_mark_adds_a_nullable_boolean_to_the_original_arrow_input() {
 }
 
 #[tokio::test]
+async fn uncorrelated_arrow_membership_matches_page_marks_with_null_and_empty_builds() {
+    let execution = execution(2);
+    let schema = |id| Schema::new(vec![field(id, LogicalType::Scalar(ScalarType::I64).maybe())]).unwrap();
+    let values = |id, values: &[Value]| Arc::new(Relation::new(schema(id), RelationNode::Values {
+        rows: values.iter().cloned().map(|value| vec![Expr::Literal(value)]).collect(),
+    }).unwrap());
+    let input = [Value::I64(1), Value::I64(4), Value::Null];
+    for (candidates, expected) in [
+        (vec![Value::I64(1), Value::Null], [Value::Bool(true), Value::Null, Value::Null]),
+        (vec![Value::I64(1)], [Value::Bool(true), Value::Bool(false), Value::Null]),
+        (vec![], [Value::Bool(false), Value::Bool(false), Value::Bool(false)]),
+    ] {
+        let relation = mark(values(0, &input), values(1, &candidates),
+            Expr::binary(BinaryOp::Eq, schema(0).fields()[0].expression(), schema(1).fields()[0].expression()), false);
+        let runtime = EmittedRelation::derive(Arc::clone(&relation), &execution.context.catalog, &[], &execution.context.memory).unwrap();
+        let mut columns = crate::operators::build_columns(runtime, execution.clone()).await.unwrap().expect("Expected Arrow membership");
+        let batch = columns.next_batch().await.unwrap().unwrap();
+        assert_eq!(batch.len, 3);
+        assert!(batch.columns.iter().all(|column| matches!(column, crate::columnar::Column::Arrow { .. })));
+        assert_eq!((0..3).map(|row| batch.columns[1].value(row).unwrap()).collect::<Vec<_>>(), expected);
+        let mut pages = open(relation, &execution).await;
+        assert_eq!(pages.next_page().await.unwrap().unwrap().rows().iter().map(|row| row.values[1].clone()).collect::<Vec<_>>(), expected);
+        assert!(columns.next_batch().await.unwrap().is_none());
+    }
+}
+
+#[tokio::test]
 async fn mark_hashes_eligibility_keys_and_keeps_unknown_marks_in_memory_and_on_disk() {
     let data_type = LogicalType::Scalar(ScalarType::I64).maybe();
     let left_field = field(0,data_type.clone());

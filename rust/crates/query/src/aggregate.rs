@@ -200,10 +200,14 @@ impl AggregateCursor {
             positions.push(schema.position(*id)?);
         }
         for aggregate in aggregates {
-            if !aggregate.order_by.is_empty() { return None; }
+            if !aggregate.order_by.is_empty() {
+                if !collect_vectors || aggregate.function.canonical() != AggregateFunction::ArrayAgg { return None; }
+                for order in &aggregate.order_by {
+                    for id in order.expr.referenced_columns() { positions.push(schema.position(id)?); }
+                }
+            }
             match aggregate.function.canonical() {
-                AggregateFunction::Percentile { .. } => return None,
-                AggregateFunction::ArrayAgg | AggregateFunction::VecAgg if !collect_vectors => return None,
+                AggregateFunction::ArrayAgg | AggregateFunction::VecAgg | AggregateFunction::Percentile { .. } if !collect_vectors => return None,
                 _ => {}
             }
             if let Some(argument) = &aggregate.argument { positions.push(argument_position(argument, schema).ok()?); }
@@ -278,7 +282,7 @@ impl AggregateCursor {
         let bytes = self.aggregates.len().checked_mul(std::mem::size_of::<AggregateColumn>())
             .ok_or_else(|| invalid("aggregate-size", "Aggregate column container overflow"))?;
         let reservation = self.execution.context.memory.reserve(bytes)?;
-        let columns = self.aggregates.iter().map(|aggregate| AggregateColumn::new(aggregate, &self.execution, collect_vectors)).collect::<Result<_>>()?;
+        let columns = self.aggregates.iter().map(|aggregate| AggregateColumn::new(aggregate, &self.schema, &self.execution, collect_vectors)).collect::<Result<_>>()?;
         Ok((columns, reservation))
     }
 
@@ -362,12 +366,12 @@ impl BatchCursor for AggregateCursor {
         let context = &self.execution.context;
         let schema = self.runtime.schema();
         let fields = &schema.fields()[self.groups.len()..];
-        for ((column, aggregate), field) in columns.into_iter().zip(&self.aggregates).zip(fields) {
+        for (((column, aggregate), field), types) in columns.into_iter().zip(&self.aggregates).zip(fields).zip(self.runtime.aggregates()?) {
             context.check_cancelled()?;
             let mut states = match column.accumulation {
                 Accumulation::Scalar(states) => states,
                 Accumulation::Vectors(vectors) => {
-                    let (column, charge) = vectors.finish(batch.len, aggregate, field, context)?;
+                    let (column, charge) = vectors.finish(batch.len, aggregate, field, types, &self.execution).await?;
                     batch.append_column(column, charge, &context.memory)?;
                     continue;
                 }
@@ -611,10 +615,12 @@ struct AggregateColumn { accumulation: Accumulation, distinct: Option<DistinctSe
 struct DistinctSeen { index: std::collections::HashMap<(usize, u32), Vec<usize>>, values: Vec<OwnedRow> }
 enum Accumulation { Scalar(ScalarGroups), Collected(PageBuilder), Vectors(CollectionVectors) }
 impl AggregateColumn {
-    fn new(aggregate: &AggregateExpr,execution: &Execution,collect_vectors: bool) -> Result<Self> {
+    fn new(aggregate: &AggregateExpr,schema: &Schema,execution: &Execution,collect_vectors: bool) -> Result<Self> {
         let accumulation = match aggregate.function {
-            AggregateFunction::ArrayAgg | AggregateFunction::VecAgg if collect_vectors =>
-                Accumulation::Vectors(CollectionVectors::new(&execution.context.memory)?),
+            AggregateFunction::ArrayAgg | AggregateFunction::VecAgg | AggregateFunction::Percentile { .. } if collect_vectors => {
+                let order = CollectionOrder::new(aggregate, schema)?;
+                Accumulation::Vectors(CollectionVectors::new(&execution.context.memory, order)?)
+            }
             AggregateFunction::ArrayAgg | AggregateFunction::VecAgg | AggregateFunction::Percentile { .. } => Accumulation::Collected(PageBuilder::new(0,&execution.context.memory)?),
             _ => Accumulation::Scalar(ScalarGroups::new(execution)?),
         };
@@ -669,9 +675,15 @@ impl AggregateColumn {
                 states.aggregate(input,mapping,&mask,group_count,argument,aggregate,types,&scope,execution)?;
             }
             Accumulation::Vectors(vectors) => {
-                let Rows::Columns { batch, .. } = input else { return Err(invalid("aggregate-input", "A collection vector requires batch input")); };
+                let Rows::Columns { batch, projected, .. } = input else { return Err(invalid("aggregate-input", "A collection vector requires batch input")); };
                 let argument = argument.ok_or_else(|| invalid("aggregate-state", "Collected aggregate argument is absent"))?;
-                vectors.append(batch, argument, mapping, &mask, group_count, &execution.context)?;
+                if matches!(aggregate.function, AggregateFunction::Percentile { .. }) {
+                    for (row, selected) in mask.iter_mut().enumerate() {
+                        execution.context.check_cancelled_at(row)?;
+                        if *selected { *selected = !input.is_null(row, Some(argument))?; }
+                    }
+                }
+                vectors.append(batch, argument, mapping, &mask, group_count, projected, &execution.context)?;
             }
             Accumulation::Collected(rows) => {
                 for ((row,group),selected) in input.page()?.rows().iter().zip(mapping).zip(mask) {
@@ -762,35 +774,63 @@ struct CollectionVectors {
     selected: usize,
     present: bool,
     reservation: Arc<rtdb_columnar::MemoryReservation>,
+    order: Option<CollectionOrder>,
+    projected: bool,
 }
 
 impl CollectionVectors {
-    fn new(memory: &Arc<rtdb_columnar::MemoryBudget>) -> Result<Self> {
-        Ok(Self { batches: Vec::new(), groups: Vec::new(), selected: 0, present: false, reservation: memory.reserve(4096)? })
+    fn new(memory: &Arc<rtdb_columnar::MemoryBudget>, order: Option<CollectionOrder>) -> Result<Self> {
+        Ok(Self { batches: Vec::new(), groups: Vec::new(), selected: 0, present: false, reservation: memory.reserve(4096)?, order, projected: false })
     }
 
-    fn append(&mut self, batch: &ColumnBatch, position: usize, mapping: &[usize], mask: &[bool], groups: usize, context: &crate::QueryContext) -> Result<()> {
+    fn append(&mut self, batch: &ColumnBatch, position: usize, mapping: &[usize], mask: &[bool], groups: usize, projected: bool, context: &crate::QueryContext) -> Result<()> {
         self.present |= batch.len != 0;
-        let count = mask.iter().filter(|&&selected| selected).count();
+        self.projected |= projected;
+        if let Some(order) = &self.order {
+            if batch.len == 0 { return Ok(()); }
+            let batch = order.page(batch, mapping, mask, context)?;
+            self.account_pages(self.selected, groups)?;
+            self.batches.push(batch);
+            return Ok(());
+        }
+        self.collect(batch, position, mapping.iter().copied().zip(mask).enumerate()
+            .filter_map(|(row, (group, &selected))| selected.then_some((row, group))), groups, context)
+    }
+
+    fn collect(&mut self, batch: &ColumnBatch, position: usize, picks: impl Iterator<Item = (usize, usize)> + Clone, groups: usize, context: &crate::QueryContext) -> Result<()> {
+        let count = picks.clone().count();
         if count == 0 { return Ok(()); }
         self.selected = self.selected.checked_add(count).filter(|count| *count <= i32::MAX as usize)
             .ok_or_else(|| invalid("aggregate-size", "List aggregate result exceeds signed Arrow offsets"))?;
-        let bytes = self.selected.checked_mul(4 * std::mem::size_of::<(usize, usize)>())
-            .and_then(|bytes| bytes.checked_add(groups.checked_mul(96)?))
-            .and_then(|bytes| bytes.checked_add((self.batches.len() + 1).checked_mul(256)?))
-            .and_then(|bytes| bytes.checked_add(4096)).ok_or_else(|| invalid("aggregate-size", "List aggregate allocation overflow"))?;
-        Arc::get_mut(&mut self.reservation).expect("The list aggregate owns its result positions").grow_to(bytes)?;
+        self.account_pages(self.selected, groups)?;
         self.groups.resize_with(groups, Vec::new);
         let page = self.batches.len();
         self.batches.push(batch.key_projection(&[position], &context.memory)?);
-        for (row, (&group, &selected)) in mapping.iter().zip(mask).enumerate() {
-            if selected { self.groups[group].push((page, row)); }
+        for (row, group) in picks {
+            self.groups.get_mut(group).ok_or_else(|| invalid("aggregate-group", "List aggregate group is absent"))?.push((page, row));
         }
         Ok(())
     }
 
-    fn finish(self, groups: usize, aggregate: &AggregateExpr, output: &rtdb_plan::Field,
-        context: &crate::QueryContext) -> Result<(Column, Arc<rtdb_columnar::MemoryReservation>)> {
+    fn account_pages(&mut self, positions: usize, groups: usize) -> Result<()> {
+        let bytes = positions.checked_mul(4 * std::mem::size_of::<(usize, usize)>())
+            .and_then(|bytes| bytes.checked_add(groups.checked_mul(96)?))
+            .and_then(|bytes| bytes.checked_add((self.batches.len() + 1).checked_mul(4 * std::mem::size_of::<ColumnBatch>())?))
+            .and_then(|bytes| bytes.checked_add(4096)).ok_or_else(|| invalid("aggregate-size", "List aggregate allocation overflow"))?;
+        Arc::get_mut(&mut self.reservation).expect("The list aggregate owns its result positions").grow_to(bytes)
+    }
+
+    async fn finish(mut self, groups: usize, aggregate: &AggregateExpr, output: &rtdb_plan::Field, types: &AggregateTypes,
+        execution: &Execution) -> Result<(Column, Arc<rtdb_columnar::MemoryReservation>)> {
+        if let AggregateFunction::Percentile { kind, fraction: PercentileFraction::Literal(fraction), descending } = aggregate.function {
+            let declared = aggregate.argument.as_ref().map_or(LogicalType::Null, rtdb_plan::Expr::data_type);
+            rtdb_expr::validate_order_type(&declared.join(&types.input))?;
+            return self.percentiles(groups, kind, fraction, descending, output, execution).await;
+        }
+        if let Some(order) = self.order.take() {
+            self = order.sort(self, groups, &aggregate.order_by, execution).await?;
+        }
+        let context = &execution.context;
         let memory = &context.memory;
         let base = groups.checked_mul(64).and_then(|bytes| self.selected.checked_mul(64).and_then(|rows| bytes.checked_add(rows)))
             .and_then(|bytes| bytes.checked_add(4096)).ok_or_else(|| invalid("aggregate-size", "List aggregate allocation overflow"))?;
@@ -813,6 +853,156 @@ impl CollectionVectors {
         };
         selected.collect_lists(offsets, valid, output, memory)
     }
+
+    async fn percentiles(self, groups: usize, kind: PercentileKind, fraction: f64, descending: bool,
+        output: &rtdb_plan::Field, execution: &Execution) -> Result<(Column, Arc<rtdb_columnar::MemoryReservation>)> {
+        use crate::scalar_key::ScalarKey;
+        let context = &execution.context;
+        let memory = &context.memory;
+        let bytes = groups.checked_mul(2 * std::mem::size_of::<Value>()).and_then(|bytes| bytes.checked_add(512))
+            .ok_or_else(|| invalid("aggregate-size", "Percentile results exceed addressable memory"))?;
+        let mut reservation = memory.reserve(bytes)?;
+        let mut values = Vec::with_capacity(groups);
+        let mut picks = Vec::with_capacity(groups);
+        let gather = kind == PercentileKind::Discrete && group_key_type(&output.data_type);
+        let read = |(batch, row): (usize, usize)| Rows::Columns { batch: &self.batches[batch], projected: self.projected, memory }.value(row, Some(0));
+        for group in 0..groups {
+            context.check_cancelled_at(group)?;
+            let rows = self.groups.get(group).map_or(&[][..], Vec::as_slice);
+            if rows.is_empty() {
+                if gather { picks.push(None); } else { values.push(Value::Null); }
+                continue;
+            }
+            let key = |(batch, row): (usize, usize)| ScalarKey::read(&self.batches[batch].columns[0], row);
+            let indices = crate::sort::sort_ordinals(rows.len(), context, |left, right| {
+                let (left, right) = if descending { (rows[right], rows[left]) } else { (rows[left], rows[right]) };
+                if let (Some(left), Some(right)) = (key(left), key(right))
+                    && let Some(order) = left.ordered_compare(right) { return Ok(order); }
+                rtdb_expr::ordered_compare_in_timezone(read(left)?.as_ref(), read(right)?.as_ref(), false, &context.timezone)
+            })?;
+            let (low, high, weight) = percentile_ranks(kind, fraction, rows.len() as i32)?;
+            let lower = rows[indices.values[low as usize]];
+            if gather {
+                picks.push(Some(lower));
+                continue;
+            }
+            let scope = execution.scope()?;
+            let lower = read(lower)?;
+            let value = if kind == PercentileKind::Discrete {
+                let value = lower.as_ref();
+                scope.reserve(value.retained_bytes()?.checked_mul(2).ok_or_else(|| invalid("aggregate-size", "Percentile output overflow"))?)?;
+                execution.evaluate(&scope, &rtdb_plan::Expr::Literal(value.clone()), &Schema::default(), &[]).await?
+            } else {
+                let lower = number(lower.as_ref()).ok_or_else(|| invalid("percentile-input", "Continuous percentile requires numeric values"))?;
+                if low == high {
+                    Value::F64(lower)
+                } else {
+                    let upper = read(rows[indices.values[high as usize]])?;
+                    let upper = number(upper.as_ref()).ok_or_else(|| invalid("percentile-input", "Continuous percentile requires numeric values"))?;
+                    Value::F64(lower + weight * (upper - lower))
+                }
+            };
+            let lease = Arc::get_mut(&mut reservation).expect("The percentile aggregate owns its result reservation");
+            lease.grow_to(lease.bytes().checked_add(value.retained_bytes()?).ok_or_else(|| invalid("aggregate-size", "Percentile output overflow"))?)?;
+            values.push(value);
+        }
+        if gather {
+            return crate::columnar::gather_nullable_column(|batch| &self.batches[batch], &picks, 0, memory);
+        }
+        if let Some(column) = crate::columnar::scalar_result(&values, memory)? { return Ok(column); }
+        Ok((Column::Values(values), reservation))
+    }
+}
+
+struct CollectionOrder {
+    positions: Vec<usize>,
+    schema: Schema,
+    group: rtdb_plan::Field,
+}
+
+impl CollectionOrder {
+    fn new(aggregate: &AggregateExpr, input: &Schema) -> Result<Option<Self>> {
+        if aggregate.order_by.is_empty() { return Ok(None); }
+        let argument = aggregate.argument.as_ref().ok_or_else(|| invalid("aggregate-state", "Ordered aggregate argument is absent"))?;
+        let argument = argument_position(argument, input)?;
+        let mut positions = vec![argument];
+        for order in &aggregate.order_by {
+            for position in crate::columnar::expression_columns(&order.expr, input)? {
+                if !positions.contains(&position) { positions.push(position); }
+            }
+        }
+        let group = Binder::after(input)?.field("_aggregate_group", None, LogicalType::Scalar(ScalarType::I64).maybe())?;
+        let schema = Schema::new(positions.iter().map(|&position| input.fields()[position].clone())
+            .chain(std::iter::once(group.clone())).collect())?;
+        Ok(Some(Self { positions, schema, group }))
+    }
+
+    fn page(&self, batch: &ColumnBatch, mapping: &[usize], mask: &[bool], context: &crate::QueryContext) -> Result<ColumnBatch> {
+        let memory = &context.memory;
+        let mut output = batch.key_projection(&self.positions, memory)?;
+        let bytes = batch.len.checked_mul(16).and_then(|bytes| bytes.checked_add(512))
+            .ok_or_else(|| invalid("aggregate-size", "Ordered list aggregate group vector overflow"))?;
+        let reservation = memory.reserve(bytes)?;
+        let mut groups = arrow_array::builder::Int64Builder::with_capacity(batch.len);
+        for (&group, &selected) in mapping.iter().zip(mask) {
+            if selected { groups.append_value(group as i64); } else { groups.append_null(); }
+        }
+        let logical = self.group.data_type.clone();
+        let field = Arc::new(rtdb_columnar::to_field(&self.group.name, &logical)?);
+        output.append_column(Column::Arrow { array: Arc::new(groups.finish()), field, logical: Some(logical) }, reservation, memory)?;
+        Ok(output)
+    }
+
+    async fn sort(self, input: CollectionVectors, groups: usize, order: &[rtdb_plan::SortExpr], execution: &Execution) -> Result<CollectionVectors> {
+        use crate::{operators::project_sort_keys, scalar_key::ScalarKey, sort::batches::BatchSort};
+        let scope = execution.scope()?;
+        for key in order { rtdb_expr::validate_order_type(&execution.expression_type(&scope, &key.expr, &self.schema)?)?; }
+        let context = &execution.context;
+        let memory = &context.memory;
+        let group = self.positions.len();
+        let mut output = CollectionVectors::new(memory, None)?;
+        output.present = input.present;
+        let mut projected = input.projected;
+        let source = Box::new(CollectionInput { batches: input.batches.into_iter(), _reservation: input.reservation });
+        let (source, schema, order) = if BatchSort::supports(&self.schema, order) {
+            (source as crate::columnar::BoxBatchCursor, self.schema, order.to_vec())
+        } else {
+            projected = true;
+            project_sort_keys(source, self.schema, order, execution)?
+                .ok_or_else(|| invalid("aggregate-order", "An aggregate ordering key cannot be projected"))?
+        };
+        let mut sorted = BatchSort::new(source, schema, order, execution.clone(), projected, 0, i64::MAX as u64)?;
+        while let Some(batch) = sorted.next_batch().await? {
+            let _positions = memory.reserve(batch.len.checked_mul(std::mem::size_of::<(usize, usize)>())
+                .ok_or_else(|| invalid("aggregate-size", "Ordered list positions overflow"))?)?;
+            let mut picks = Vec::with_capacity(batch.len);
+            for row in 0..batch.len {
+                context.check_cancelled_at(row)?;
+                let value = match ScalarKey::read(&batch.columns[group], row) {
+                    Some(ScalarKey::Signed(value)) => Some(value),
+                    Some(ScalarKey::Null) => None,
+                    _ => match batch.columns[group].value(row)? {
+                        Value::I64(value) => Some(value),
+                        Value::Null | Value::Undefined => None,
+                        _ => return Err(invalid("aggregate-group", "Expected a group index for an ordered aggregate")),
+                    },
+                };
+                if let Some(value) = value { picks.push((row, value as usize)); }
+            }
+            output.collect(&batch, 0, picks.iter().copied(), groups, context)?;
+        }
+        Ok(output)
+    }
+}
+
+struct CollectionInput {
+    batches: std::vec::IntoIter<ColumnBatch>,
+    _reservation: Arc<rtdb_columnar::MemoryReservation>,
+}
+
+#[async_trait]
+impl BatchCursor for CollectionInput {
+    async fn next_batch(&mut self) -> Result<Option<ColumnBatch>> { Ok(self.batches.next()) }
 }
 
 struct CollectedPage(Option<OwnedPage>);

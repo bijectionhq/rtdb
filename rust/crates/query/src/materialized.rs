@@ -43,10 +43,14 @@ impl BindingScope {
 
     pub async fn open_columns(&self, definition: &MaterializedBinding) -> Result<BoxBatchCursor> {
         let binding = self.find(definition)?;
-        let Replay::Columns(file) = binding.replay().await? else {
-            return Err(invalid("materialized-binding", "Columnar reference requires a columnar binding"));
-        };
-        Ok(Box::new(ColumnReference::new(&file, &binding.context, definition.relation.schema().len())?))
+        let context = &binding.context;
+        match binding.replay().await? {
+            Replay::Columns(file) => Ok(Box::new(ColumnReference::new(&file, context, definition.relation.schema().len())?)),
+            Replay::Rows(file) => {
+                let pages = Box::new(Reference { reader: file.reader(Arc::clone(&context.memory))?, context: Arc::clone(context) });
+                Ok(crate::columnar::batches_from_pages(pages, Arc::clone(&context.memory)))
+            }
+        }
     }
 
     fn find(&self, definition: &MaterializedBinding) -> Result<&ReplayBinding> {

@@ -1862,7 +1862,10 @@ surface QueryAccess {
         -- Compatible grouping columns can use the first Arrow position of each key and emit scalar aggregates in that first-seen order.
         -- Grouped output keeps the configured transport row limit.
         -- Scalar aggregates read their operands as needed and write compatible results as Arrow columns.
-        -- Unordered list aggregates collect selected Arrow positions after applying filters and distinctness.
+        -- List aggregates collect selected Arrow positions after applying filters and distinctness, and sort Arrow keys when the aggregate specifies an order.
+        -- Percentile aggregates order each group's selected positions and read the ranked arguments from their source vectors.
+        -- A bounded scalar membership join indexes the build key vectors and appends nullable Boolean marks to the probe batches.
+        -- An Arrow join can evaluate a residual predicate from its referenced cells while gathering the result payloads from the input batches.
         -- UNNEST over compatible Arrow list columns expands the selected child positions and gathers their parent payloads by position.
         -- A column table over a compatible Arrow list parameter reads the bound row's child slice as one semantic page.
         -- Its columnar result is split to the transport row limit after the operators have processed the complete page.
