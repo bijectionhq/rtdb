@@ -57,7 +57,7 @@ pub trait PublicationUploads: Send + Sync {
 pub struct RemoteStore {
     objects: Arc<RemoteObjects>,
     io: Arc<IoRegion>,
-    single_put: bool,
+    cell: bool,
     version_namespace: Option<Arc<S3ObjectNamespace>>,
 }
 
@@ -71,13 +71,13 @@ impl RemoteStore {
     /// Uses the owner's I/O region, which must be closed and joined after all store consumers finish.
     /// Every admitted operation remains owned through caller cancellation, including publication cleanup.
     pub fn new_in(client: Arc<dyn ProviderStore>, prefix: Option<ObjectKey>, io: Arc<IoRegion>) -> Self {
-        Self { objects: Arc::new(RemoteObjects { client, prefix, uploads: None, hide_tombstones: false }), io, single_put: false, version_namespace: None }
+        Self { objects: Arc::new(RemoteObjects { client, prefix, uploads: None, hide_tombstones: false }), io, cell: false, version_namespace: None }
     }
 
     /// Cell storage publishes a final object with one conditional provider
     /// write for untracked cell operations.
     pub fn new_single_put(client: Arc<dyn ProviderStore>, prefix: ObjectKey, io: Arc<IoRegion>) -> Self {
-        Self { objects: Arc::new(RemoteObjects { client, prefix: Some(prefix), uploads: None, hide_tombstones: true }), io, single_put: true, version_namespace: None }
+        Self { objects: Arc::new(RemoteObjects { client, prefix: Some(prefix), uploads: None, hide_tombstones: true }), io, cell: true, version_namespace: None }
     }
 
     /// Opens a cell store with abortable, journaled publication.
@@ -88,7 +88,7 @@ impl RemoteStore {
         uploads: Arc<dyn PublicationUploads>,
     ) -> Self {
         let objects = Arc::new(RemoteObjects { client, prefix: Some(prefix), uploads: Some(uploads), hide_tombstones: true });
-        Self { objects, io, single_put: true, version_namespace: None }
+        Self { objects, io, cell: true, version_namespace: None }
     }
 
     /// Enables version observations for a store backed by the specified S3 namespace.
@@ -114,7 +114,7 @@ impl RemoteStore {
         }
         let admission = self.io.admit()?.and(destination.io.admit()?);
         let (objects, destination_objects, source, key) = (Arc::clone(&self.objects), Arc::clone(&destination.objects), source.clone(), key.clone());
-        if destination.single_put {
+        if destination.cell {
             let io = destination.io.clone();
             return IoRegion::run_async_admitted(admission, async move {
                 let bytes = objects.get(&source).await?;
@@ -217,15 +217,15 @@ impl ObjectStore for RemoteStore {
     async fn put_with_version(&self, key: &ObjectKey, bytes: Bytes) -> Result<Option<PhysicalObjectVersion>> {
         let (objects, key) = (Arc::clone(&self.objects), key.clone());
         let io = self.io.clone();
-        let single_put = self.single_put;
+        let cell = self.cell;
         let namespace = self.version_namespace.clone();
         self.io.run_async(async move {
-            let version = objects.put(&key, bytes, single_put.then_some(io.as_ref())).await?;
+            let version = objects.put(&key, bytes, cell.then_some(io.as_ref())).await?;
             Ok(physical_version(namespace.as_deref(), &objects.path(&key), version))
         }).await
     }
     async fn put_file(&self, key: &ObjectKey, source: &std::path::Path) -> Result<()> {
-        if self.single_put {
+        if self.cell {
             return Err(Error::Remote { key: key.to_string(), message: "Cell writes must supply the final sealed bytes".into() });
         }
         let admission = self.io.admit()?;
@@ -239,6 +239,9 @@ impl ObjectStore for RemoteStore {
         self.io.run_async(async move { objects.list(directory.as_ref()).await }).await
     }
     async fn delete(&self, key: &ObjectKey) -> Result<()> {
+        if self.cell {
+            return Err(Error::Remote { key: key.to_string(), message: "Cell storage requires provider retirement authority".into() });
+        }
         let (objects, key) = (Arc::clone(&self.objects), key.clone());
         self.io.run_async(async move { objects.delete(&key).await }).await
     }
@@ -588,6 +591,21 @@ mod tests {
         for name in &listed { store.get(&ObjectKey::new(name.clone()).unwrap()).await.unwrap(); }
         assert_eq!(store.list(Some(&ObjectKey::new("~packs").unwrap())).await.unwrap().len(), 1, "and a listing under one finds it");
     }
+    #[tokio::test]
+    async fn a_cell_store_refuses_path_deletion() {
+        let provider = Arc::new(object_store::memory::InMemory::new());
+        let root = ObjectKey::new("cell").unwrap();
+        let cell = RemoteStore::new_single_put(provider.clone(), root.clone(), IoRegion::new());
+        let ordinary = RemoteStore::new(provider, Some(root));
+        let key = ObjectKey::new("data/retained").unwrap();
+        cell.put(&key, Bytes::from_static(b"owned")).await.unwrap();
+
+        assert!(matches!(cell.delete(&key).await, Err(Error::Remote { .. })));
+        assert_eq!(ordinary.get(&key).await.unwrap(), Bytes::from_static(b"owned"));
+        ordinary.delete(&key).await.unwrap();
+        assert!(matches!(cell.head(&key).await, Err(Error::MissingObject(_))));
+    }
+
     #[tokio::test]
     async fn only_serving_reads_hide_retirement_tombstones() {
         let provider = Arc::new(object_store::memory::InMemory::new());

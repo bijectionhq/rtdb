@@ -69,10 +69,21 @@ impl Base {
 
     /// Withdraws the selected references observed in this manifest. A competing edit can only be rebased onto its own latest snapshot.
     pub(crate) async fn forget(&self, bucket: &dyn ObjectStore, store: &str, names: &BTreeSet<String>) -> Result<()> {
+        self.withdraw(bucket, store, names).await.map(drop)
+    }
+
+    pub(crate) async fn forget_and_prune_locally(&self, bucket: &dyn ObjectStore, store: &str, names: &BTreeSet<String>) -> Result<()> {
+        if let Some(sequence) = self.withdraw(bucket, store, names).await? {
+            prune_manifests(bucket, store, sequence).await?;
+        }
+        Ok(())
+    }
+
+    async fn withdraw(&self, bucket: &dyn ObjectStore, store: &str, names: &BTreeSet<String>) -> Result<Option<u64>> {
         let selected: BTreeMap<&str, &str> = names.iter().filter_map(|name| {
             self.objects.get(name).map(|owner| (name.as_str(), owner.as_str()))
         }).collect();
-        if selected.is_empty() { return Ok(()); }
+        if selected.is_empty() { return Ok(None); }
 
         for _ in 0..8 {
             let Some((sequence, mut current)) = Self::load_snapshot(bucket, store).await? else {
@@ -81,7 +92,7 @@ impl Base {
             let count = current.objects.len();
             current.objects.retain(|name, owner| selected.get(name.as_str()) != Some(&owner.as_str()));
             if current.objects.len() == count {
-                return prune_manifests(bucket, store, sequence).await;
+                return Ok(Some(sequence));
             }
             let next = manifest_step::next_manifest_sequence(sequence).ok_or_else(|| {
                 Anomaly::fault("rtdb.multi/base-manifest-exhausted", format!("The reference manifest for {store} has no remaining sequence numbers"))
@@ -774,7 +785,7 @@ mod tests {
         let bucket = bucket();
         let initial = Base { objects: BTreeMap::from([("a".into(), "p/v06".into()), ("b".into(), "p/v06".into())]) };
         initial.initialize(bucket.as_ref(), "c/v06").await.unwrap();
-        initial.forget(bucket.as_ref(), "c/v06", &BTreeSet::from(["a".into()])).await.unwrap();
+        initial.forget_and_prune_locally(bucket.as_ref(), "c/v06", &BTreeSet::from(["a".into()])).await.unwrap();
         let latest = Base { objects: BTreeMap::from([("b".into(), "p/v06".into())]) };
         assert_eq!(Base::load(bucket.as_ref(), "c/v06").await.unwrap(), latest);
         assert_eq!(bucket.list(Some(&key("c/v06/~base").unwrap())).await.unwrap().len(), 1, "an older manifest is forgotten once a newer one is written");
@@ -846,14 +857,13 @@ mod tests {
             let first = tokio::spawn({
                 let initial = initial.clone();
                 let watched = watched.clone();
-                async move { initial.forget(watched.as_ref(), store, &BTreeSet::from(["a".into()])).await }
+                async move { initial.forget_and_prune_locally(watched.as_ref(), store, &BTreeSet::from(["a".into()])).await }
             });
             tokio::time::timeout(std::time::Duration::from_secs(5), async {
                 watched.request_reached.notified().await;
-                initial.forget(inner.as_ref(), store, &BTreeSet::from(["b".into()])).await.unwrap();
+                initial.forget_and_prune_locally(inner.as_ref(), store, &BTreeSet::from(["b".into()])).await.unwrap();
                 if prune_slot {
-                    initial.forget(inner.as_ref(), store, &BTreeSet::from(["c".into()])).await.unwrap();
-                    prune_manifests(inner.as_ref(), store, 2).await.unwrap();
+                    initial.forget_and_prune_locally(inner.as_ref(), store, &BTreeSet::from(["c".into()])).await.unwrap();
                     assert!(matches!(inner.head(watched.pause_put.as_ref().unwrap()).await, Err(Error::MissingObject(_))));
                 }
                 watched.resume_request.notify_one();
@@ -872,7 +882,7 @@ mod tests {
         let inner = bucket();
         let initial = Base { objects: BTreeMap::from([("a".into(), "parent/v06".into()), ("b".into(), "parent/v06".into())]) };
         initial.initialize(inner.as_ref(), store).await.unwrap();
-        initial.forget(inner.as_ref(), store, &BTreeSet::from(["a".into()])).await.unwrap();
+        initial.forget_and_prune_locally(inner.as_ref(), store, &BTreeSet::from(["a".into()])).await.unwrap();
         let mut watched = ManifestTestBucket::new(inner.clone());
         watched.pause_get = Some(key(&format!("{store}/{BASE_MANIFEST}/{:020}", 1)).unwrap());
         let watched = Arc::new(watched);
@@ -882,7 +892,7 @@ mod tests {
         });
         tokio::time::timeout(std::time::Duration::from_secs(5), async {
             watched.request_reached.notified().await;
-            initial.forget(inner.as_ref(), store, &BTreeSet::from(["b".into()])).await.unwrap();
+            initial.forget_and_prune_locally(inner.as_ref(), store, &BTreeSet::from(["b".into()])).await.unwrap();
             // The old slot is populated by a late write of an edit made against the seed.
             let delayed = Base { objects: BTreeMap::from([("a".into(), "parent/v06".into())]) };
             delayed.publish_at(inner.as_ref(), store, 1).await.unwrap();

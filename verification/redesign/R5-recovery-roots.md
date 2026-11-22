@@ -172,6 +172,12 @@ The reaper authenticates retained receipts under the exact source residence key 
 The same two-version retirement protocol orders the recovered data and original marker against readers and confirms absence of each version.
 The authorized reservation can finish from its persisted versions if the historical receipt or residence key later becomes unavailable.
 The retained receipt model explored 16 states, rejected four unsafe changes and reached settlement after losing the original receipt.
+The ordinary hosted path sweep withdraws eligible inherited references.
+Owned loose objects, owned packs and owned release markers remain until the provider retirement authority can settle them.
+Keeping the marker keeps released bytes hidden after a reopen, even when no exact removal can proceed.
+The hosted cell adapter rejects path deletion, so provider retirement and inventory are the outlets for physical removal.
+The bounded path-release model explored eight states and catches removing bytes by name, dropping their marker before settlement, and reopening an immutable manifest slot to delayed writes.
+[Hosted path-release model](../tla/HostedPathRelease.tla)
 Releases without a matching immutable publication witness still need a separately settled protocol for unversioned providers.
 [Retained receipt model](../tla/RetainedReleaseReceipt.tla)
 
@@ -274,7 +280,9 @@ The only operation that adds references initializes an unpublished fork's manife
 Later edits withdraw exact name-owner pairs from the latest confirmed manifest and publish only at that snapshot's successor.
 An immutable write can succeed in a lower slot that was already pruned while the request was in flight.
 The read path confirms the current head after loading its bytes, and the withdrawal path confirms absence in the current head after a write.
-Cleanup removes only slots strictly below a confirmed head.
+An admitted local sweep removes only slots strictly below a confirmed head.
+Hosted withdrawal retains earlier slots, including when withdrawal precedes an exact object retirement.
+Hosted manifest history currently remains with the residence until inventory disposal or a separately admitted manifest retirement.
 The reaper drops a shadowed fallback before deleting the local object and retains the release record until its physical work succeeds.
 This reasoning assumes authoritative listings, immutable conditional writes and monotone heads in open residence prefixes.
 Already open readers retain their selected manifest. `CatalogReaders` registers a cut under the logical deployment and storage root.
@@ -335,7 +343,7 @@ A second S3 regression exercises an unresolved fork publication through recovery
 
 | Effect path | Current admission and evidence | Remaining composition obligation |
 | --- | --- | --- |
-| `reap_as_of` and `References::erase` | The local sweep reserves its lineage, reloads referrers and copies retained data before deleting the path. The hosted exact collector keeps witnessed loose files while their source is still referenced, and confirms provider settlement before reopening admission. | Extend exact settlement to pack contents beyond checkpoint metadata and to remaining unwitnessed legacy and unversioned releases. |
+| Local path sweep and hosted retirement | The local sweep reserves its lineage and copies retained data before deleting paths. The hosted path sweep withdraws inherited names, and the hosted exact collector orders physical removal against the owner fence and published references. | Extend exact settlement to pack contents beyond checkpoint metadata and to remaining unwitnessed legacy and unversioned releases. |
 | `Base::initialize`, `Base::forget` and `Base::load` | Initialization adds references. Confirmed withdrawals only remove matching entries and require a current head before effect. | Connect the current-manifest contract to consumers that retain older manifests and to the authority closing and disposing a residence. |
 | Local `erase_deployment` and hosted `observe_s3_inventory` in disposal and old-residence cleanup | The administration path fences the residence, drains serving references, closes the lineage and transfers published references. Hosted disposal then purges versions and uploads through the provider inventory. Settlement atomically publishes the receipt and reopens the lineage. | Extend physical-owner read custody to administrative copies and qualify provider settlement under failure on hosted storage. |
 | `discard_local_fork` and hosted fork staging | The local path uses the unpublished prefix. Hosted preparation journals uploads on the staged child. Recovery closes admission and settles those upload IDs before ordinary inventory disposal. | Qualify exact provider settlement and task stoppage for hosted fork writers. |

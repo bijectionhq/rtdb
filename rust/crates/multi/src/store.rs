@@ -1080,11 +1080,6 @@ fn is_collected_trie_file(key: &str) -> bool {
         .is_some_and(|trie| trie.level() > 0)
 }
 
-fn needs_exact_hosted_retirement(key: &str) -> bool {
-    crate::packing::is_pack_key(key) || is_collected_trie_file(key) || key.strip_prefix("tables/").and_then(|tail| tail.split_once('/'))
-        .is_some_and(|(_, relative)| relative.starts_with("artefacts/"))
-}
-
 fn permits_release(record: &DeploymentRecord, store: &str, release: &GarbageRecord) -> bool {
     let Some(required) = &release.trie_floor else {
         return record.storage_namespaces.is_none() || !is_collected_trie_file(&release.key);
@@ -1207,19 +1202,37 @@ async fn reap(bucket: &dyn ObjectStore, record: &DeploymentRecord, grace: Durati
 
 #[cfg(test)]
 pub(crate) async fn reap_as_of(bucket: &dyn ObjectStore, record: &DeploymentRecord, now_ms: i64, grace: Duration, references: &crate::reference::References) -> Result<Reaped> {
-    reap_path_releases(bucket, record, now_ms, grace, references, true).await
+    reap_path_releases(bucket, record, now_ms, grace, ReleaseSweep::Local(references)).await
 }
 
 /// Runs the missing-reference control against an in-memory cell.
 #[doc(hidden)]
 pub async fn simulate_reap_without_references(bucket: &rtdb_storage::MemoryStore, record: &DeploymentRecord, now_ms: i64,
     grace: Duration) -> Result<Reaped> {
-    reap_path_releases(bucket, record, now_ms, grace, &crate::reference::References::default(), true).await
+    reap_path_releases(bucket, record, now_ms, grace, ReleaseSweep::Local(&crate::reference::References::default())).await
+}
+
+/// Exercises physical collection and reference transfer on the simulator's in-memory cells.
+#[doc(hidden)]
+pub async fn simulate_reap_cell(bucket: &rtdb_storage::MemoryStore, deployments: &[DeploymentRecord], now_ms: i64,
+    grace: Duration) -> Result<Vec<Result<Reaped>>> {
+    let references = crate::reference::References::scan(bucket, deployments).await?;
+    let mut outcomes = Vec::new();
+    for record in deployments.iter().filter(|record| can_reap(record)) {
+        outcomes.push(reap_path_releases(bucket, record, now_ms, grace, ReleaseSweep::Local(&references)).await);
+    }
+    Ok(outcomes)
+}
+
+enum ReleaseSweep<'a> {
+    Local(&'a crate::reference::References),
+    Hosted,
 }
 
 async fn reap_path_releases(bucket: &dyn ObjectStore, record: &DeploymentRecord, now_ms: i64, grace: Duration,
-    references: &crate::reference::References, local: bool) -> Result<Reaped> {
+    sweep: ReleaseSweep<'_>) -> Result<Reaped> {
     use crate::reference::{Base, physical_objects};
+    let local = match sweep { ReleaseSweep::Local(references) => Some(references), ReleaseSweep::Hosted => None };
     let mut reaped = Reaped::default();
     if !matches!(record.lifecycle, Lifecycle::Live | Lifecycle::Quarantined) { return Ok(reaped); }
     let published = record.checkpoint.map(|checkpoint| checkpoint.block);
@@ -1238,7 +1251,6 @@ async fn reap_path_releases(bucket: &dyn ObjectStore, record: &DeploymentRecord,
         // A released object is either its own object or one entry of a pack; a pack goes once every entry in it has been released for the grace period.
         let mut due: BTreeMap<String, String> = BTreeMap::new();
         let mut exact = BTreeSet::new();
-        let mut retained_markers = BTreeSet::new();
         for name in records {
             let Some(location) = physical(&own, &name) else { continue };
             let Ok(bytes) = bucket.get(&crate::reference::key(&location)?).await else { continue };
@@ -1253,13 +1265,10 @@ async fn reap_path_releases(bucket: &dyn ObjectStore, record: &DeploymentRecord,
                 reaped.waiting += 1;
                 continue;
             }
-            if !local && own.contains(&released.key)
-                && (released.trie_floor.is_some() || needs_exact_hosted_retirement(&released.key))
-            {
+            if local.is_none() && own.contains(&released.key) {
                 reaped.waiting += 1;
                 continue;
             }
-            if !local && released.trie_floor.is_some() && own.contains(&name) { retained_markers.insert(name.clone()); }
             due.insert(released.key, name);
         }
         due.retain(|key, _| !exact.contains(key));
@@ -1284,7 +1293,7 @@ async fn reap_path_releases(bucket: &dyn ObjectStore, record: &DeploymentRecord,
                 }
                 result => result?,
             };
-            if (local || !own.contains(&pack)) && Some(&pack) != latest.as_ref()
+            if (local.is_some() || !own.contains(&pack)) && Some(&pack) != latest.as_ref()
                 && !walked(&pack) && index.entries.keys().all(|name| due.contains_key(name))
             {
                 obsolete_packs.push(pack);
@@ -1292,29 +1301,34 @@ async fn reap_path_releases(bucket: &dyn ObjectStore, record: &DeploymentRecord,
                 packed.extend(index.entries.into_keys());
             }
         }
-        // Withdraw fallback edges before a physical removal could expose them in the current manifest.
-        let shadowed = obsolete_packs.iter().chain(due.keys())
-            .filter(|name| own.contains(*name) && before.objects.contains_key(*name)).cloned().collect();
-        before.forget(bucket, &store, &shadowed).await?;
-        for pack in obsolete_packs {
-            if own.contains(&pack) { references.erase(bucket, &store, &pack).await?; }
-            else if before.objects.contains_key(&pack) { forgotten.insert(pack); }
+        if let Some(references) = local {
+            // Withdraw fallback edges before physical removal can expose them.
+            let shadowed = obsolete_packs.iter().chain(due.keys())
+                .filter(|name| own.contains(*name) && before.objects.contains_key(*name)).cloned().collect();
+            before.forget_and_prune_locally(bucket, &store, &shadowed).await?;
+            for name in obsolete_packs.iter().chain(due.keys()).filter(|name| own.contains(*name)) {
+                references.erase(bucket, &store, name).await?;
+            }
         }
-        for name in due.keys() {
-            if own.contains(name) { references.erase(bucket, &store, name).await?; }
-            else if before.objects.contains_key(name) { forgotten.insert(name.clone()); }
-        }
+        forgotten.extend(obsolete_packs.into_iter().chain(due.keys().cloned())
+            .filter(|name| !own.contains(name) && before.objects.contains_key(name)));
         let mut local_records = Vec::new();
         for (name, garbage_record) in &due {
             if !packed.contains(name) {
-                if retained_markers.contains(garbage_record) { reaped.waiting += 1; continue; }
-                if own.contains(garbage_record) { local_records.push(garbage_record); }
+                if own.contains(garbage_record) {
+                    if local.is_none() { reaped.waiting += 1; continue; }
+                    local_records.push(garbage_record);
+                }
                 forgotten.insert(garbage_record.clone());
                 reaped.erased += 1;
             } else { reaped.waiting += 1; }
         }
-        before.forget(bucket, &store, &forgotten).await?;
-        for garbage_record in local_records { references.erase(bucket, &store, garbage_record).await?; }
+        if let Some(references) = local {
+            before.forget_and_prune_locally(bucket, &store, &forgotten).await?;
+            for garbage_record in local_records { references.erase(bucket, &store, garbage_record).await?; }
+        } else {
+            before.forget(bucket, &store, &forgotten).await?;
+        }
     }
     Ok(reaped)
 }
@@ -1412,8 +1426,8 @@ pub async fn run_reaper(
                                 Err(error) => eprintln!("The reaper could not open the provider inventory: {}", error.code),
                             }
                         }
-                        if let Ok(references) = references {
-                            reap_remote_paths(bucket.as_ref(), &deployments, now, grace, &references).await;
+                        if references.is_ok() {
+                            reap_remote_paths(bucket.as_ref(), &deployments, now, grace).await;
                         }
                     }
                     drop(maintenance);
@@ -1554,7 +1568,7 @@ async fn reap_local(directory: &dyn Directory, storage: &CellStorage, maintenanc
         let Some(record) = deployments.iter().find(|record| record.id == candidate.id && record.storage_prefix() == retirement.source && can_reap(record))
             else { return Ok(Reaped::default()); };
         let references = crate::reference::References::scan(bucket.as_ref(), &deployments).await?;
-        reap_path_releases(bucket.as_ref(), record, now_ms, grace, &references, true).await
+        reap_path_releases(bucket.as_ref(), record, now_ms, grace, ReleaseSweep::Local(&references)).await
     }.await;
     io.close_and_wait().await;
     directory.change_lineage(lineage, LineageChange::SettleRetirement { retirement }).await?;
@@ -1572,7 +1586,7 @@ pub(crate) async fn with_source_lineage<T>(directory: &dyn Directory, lineage: O
     result.and_then(|value| released.map(|_| value))
 }
 
-/// Reaps ordinary remote releases for live and quarantined deployments against the cell's references.
+/// Withdraws released inherited references in hosted storage.
 /// The local eraser requires the local-volume and lineage admission used by the maintenance task.
 ///
 /// ```compile_fail
@@ -1589,17 +1603,25 @@ pub(crate) async fn with_source_lineage<T>(directory: &dyn Directory, lineage: O
 ///     let _ = simulate_reap_without_references(bucket, record, 0, Duration::ZERO);
 /// }
 /// ```
+///
+/// ```compile_fail
+/// use std::time::Duration;
+/// use rtdb_multi::store::simulate_reap_cell;
+/// use rtdb_storage::ObjectStore;
+///
+/// fn run(bucket: &dyn ObjectStore) {
+///     let _ = simulate_reap_cell(bucket, &[], 0, Duration::ZERO);
+/// }
+/// ```
 pub async fn reaper_pass(bucket: &dyn ObjectStore, deployments: &[DeploymentRecord], now_ms: i64, grace: Duration) -> Result<Vec<Result<Reaped>>> {
-    let references = crate::reference::References::scan(bucket, deployments).await?;
-    Ok(reap_remote_paths(bucket, deployments, now_ms, grace, &references).await)
+    Ok(reap_remote_paths(bucket, deployments, now_ms, grace).await)
 }
 
-async fn reap_remote_paths(bucket: &dyn ObjectStore, deployments: &[DeploymentRecord], now_ms: i64, grace: Duration,
-    references: &crate::reference::References) -> Vec<Result<Reaped>> {
+async fn reap_remote_paths(bucket: &dyn ObjectStore, deployments: &[DeploymentRecord], now_ms: i64, grace: Duration) -> Vec<Result<Reaped>> {
     let mut reaped = Vec::new();
     for record in deployments {
         if !can_reap(record) { continue; }
-        reaped.push(reap_path_releases(bucket, record, now_ms, grace, references, false).await);
+        reaped.push(reap_path_releases(bucket, record, now_ms, grace, ReleaseSweep::Hosted).await);
     }
     reaped
 }
@@ -2151,6 +2173,46 @@ mod tests {
             .await.unwrap();
         assert_eq!(receipt.deployment, record.id);
         assert!(keys.key(&record.key_id()).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn a_hosted_path_sweep_withdraws_inherited_names_and_preserves_provider_objects() {
+        let bucket: crate::reference::Bucket = Arc::new(MemoryStore::default());
+        let parent = DeploymentRecord::new("shop", "acme", vec![], 0);
+        let child = DeploymentRecord::new("preview", "acme", vec![], 0);
+        let parent_store = format!("{}/v06", parent.storage_prefix());
+        let child_store = format!("{}/v06", child.storage_prefix());
+        let parent_object = |name| key(&format!("{parent_store}/objects/{name}"));
+        for name in ["inherited", "shadowed"] {
+            bucket.put(&parent_object(name), Bytes::from_static(b"parent")).await.unwrap();
+        }
+        crate::reference::fork(bucket.as_ref(), &parent.storage_prefix(), &child.storage_prefix(), None).await.unwrap();
+        let own: crate::reference::Bucket = Arc::new(crate::reference::PrefixedStore::new(bucket.clone(), &child_store));
+        let writer = GarbageStore::open(own.clone()).await.unwrap();
+        for name in ["shadowed", "owned"] {
+            writer.put(&key(&format!("objects/{name}")), Bytes::from_static(b"child")).await.unwrap();
+        }
+        for name in ["inherited", "shadowed", "owned"] {
+            writer.delete(&key(&format!("objects/{name}"))).await.unwrap();
+        }
+        let markers = own.list(Some(&key(GARBAGE_DIRECTORY))).await.unwrap();
+        assert_eq!(markers.len(), 3);
+
+        for outcome in reaper_pass(bucket.as_ref(), &[parent, child], i64::MAX, Duration::ZERO).await.unwrap() {
+            outcome.unwrap();
+        }
+        let base = crate::reference::Base::load(bucket.as_ref(), &child_store).await.unwrap();
+        assert_eq!(base.objects, BTreeMap::from([("objects/shadowed".to_owned(), parent_store.clone())]));
+        assert_eq!(bucket.get(&parent_object("inherited")).await.unwrap(), Bytes::from_static(b"parent"));
+        assert_eq!(own.get(&key("objects/shadowed")).await.unwrap(), Bytes::from_static(b"child"));
+        assert_eq!(own.get(&key("objects/owned")).await.unwrap(), Bytes::from_static(b"child"));
+        for marker in markers {
+            assert!(own.head(&marker.key).await.is_ok());
+        }
+        let manifests = key(&format!("{child_store}/{}", crate::reference::BASE_MANIFEST));
+        assert_eq!(bucket.list(Some(&manifests)).await.unwrap().len(), 2);
+        let reopened = GarbageStore::open(own).await.unwrap();
+        assert!(reopened.list(Some(&key("objects"))).await.unwrap().is_empty());
     }
 
     #[tokio::test]

@@ -1584,6 +1584,9 @@ rule ReapUnreachable {
     -- Local cleanup of a definitively rejected fork uses the unpublished fork's own prefix.
     -- The reservation advances the preparation generation and holds until the sweep's provider work drains.
     -- The sweep scans published referrers after reserving the lineage and copies retained objects before removing the source copies.
+    -- A cell's remote object store admits physical deletion through provider retirement and inventory operations.
+    -- A hosted path sweep withdraws eligible inherited references and preserves the provider payloads and release markers.
+    -- Owned hosted payloads and markers wait for provider retirement authority.
     -- An S3 loose-file release with an installed publication witness records the exact provider version.
     -- A hosted pack is erased by exact version after the indexed members of that same version each have a mature release.
     -- Only checkpoint metadata may be covered by this pack collector. A newer published pack must be present in the same store.
@@ -1605,6 +1608,8 @@ rule ReapUnreachable {
 rule WithdrawForkReferences {
     -- Each manifest update uses the successor of the sequence whose bytes it read.
     -- A fresh lookup confirms the current sequence and the missing selected references before retirement continues.
+    -- Hosted withdrawal retains earlier slots.
+    -- An admitted local sweep can prune slots below the confirmed head.
     when: ForkReferenceWithdrawalRequested(store, selected)
 
     ensures:

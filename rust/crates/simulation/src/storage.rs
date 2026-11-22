@@ -493,7 +493,7 @@ impl World {
                         self.check().await?;
                     }
                 }
-                store::reaper_pass(bucket.as_ref(), &records, self.now(), grace).await.map_err(|error| format!("the reaper's scan of cell {cell} failed: {error}"))?
+                store::simulate_reap_cell(bucket.as_ref(), &records, self.now(), grace).await.map_err(|error| format!("the reaper's scan of cell {cell} failed: {error}"))?
             }
         };
         let mut erased = 0;

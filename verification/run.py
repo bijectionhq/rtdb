@@ -2212,6 +2212,19 @@ TLA_CASES = (
     ("HostedPackRetirement", "hosted-pack-retirement-completion-witness",
      ("INVARIANT Safe", "INVARIANT NeverSettlesAllMarkersAfterReplacement"), "NeverSettlesAllMarkersAfterReplacement"),
     ("HostedExactRetirement", "hosted-exact-retirement", None, None),
+    ("HostedPathRelease", "hosted-path-release", None, None),
+    ("HostedPathRelease", "hosted-path-delete-owned",
+     ('Mutation = "none"', 'Mutation = "delete_owned_by_name"'), "OwnedRemovalHasAuthority"),
+    ("HostedPathRelease", "hosted-path-drop-release-marker",
+     ('Mutation = "none"', 'Mutation = "drop_release_marker"'), "ReopenHidesReleasedBytes"),
+    ("HostedPathRelease", "hosted-path-prune-manifest",
+     ('Mutation = "none"', 'Mutation = "prune_hosted_slot"'), "ManifestSlotsNeverReused"),
+    ("HostedPathRelease", "hosted-path-withdraw-inherited-witness",
+     ("INVARIANTS OwnedRemovalHasAuthority ReopenHidesReleasedBytes ManifestSlotsNeverReused",
+      "INVARIANT NeverWithdrawsInherited"), "NeverWithdrawsInherited"),
+    ("HostedPathRelease", "hosted-path-exact-settlement-witness",
+     ("INVARIANTS OwnedRemovalHasAuthority ReopenHidesReleasedBytes ManifestSlotsNeverReused",
+      "INVARIANT NeverSettlesExact"), "NeverSettlesExact"),
     ("PublicationTagIdentity", "publication-tag-terminal-key", None, None),
     ("PublicationTagIdentity", "publication-tag-atomic-identity",
      ('Policy = "terminal_key"', 'Policy = "atomic_identity"'), None),
@@ -4444,13 +4457,15 @@ def verify_native_reaper_boundary(args, source):
     env = os.environ | {"CARGO_TARGET_DIR": os.environ.get("CARGO_TARGET_DIR", str(ROOT / "target"))}
     command = ["cargo", "test", "--locked", "-p", "rtdb-multi", "--doc", "store::reaper_pass"]
     baseline = run_case_with_timeout(command, source / "rust", args.evidence, "rust-reaper-boundary-baseline", env, 180)
-    if baseline.returncode or "2 passed; 0 failed" not in baseline.stdout:
+    if baseline.returncode or "3 passed; 0 failed" not in baseline.stdout:
         raise ValueError("the reaper boundary compile-fail tests did not pass")
     path = source / "rust/crates/multi/src/store.rs"
     controls = {
         "export-local-path": ("#[cfg(test)]\npub(crate) async fn reap_as_of(", "pub async fn reap_as_of("),
         "generalize-simulated-erasure": ("simulate_reap_without_references(bucket: &rtdb_storage::MemoryStore",
                                           "simulate_reap_without_references(bucket: &dyn ObjectStore"),
+        "generalize-simulated-sweep": ("simulate_reap_cell(bucket: &rtdb_storage::MemoryStore",
+                                      "simulate_reap_cell(bucket: &dyn ObjectStore"),
     }
     for name, (before, after) in controls.items():
         original = path.read_bytes()
@@ -4459,10 +4474,10 @@ def verify_native_reaper_boundary(args, source):
             checked = run_case_with_timeout(command, source / "rust", args.evidence, f"rust-reaper-boundary-{name}", env, 180)
         finally:
             path.write_bytes(original)
-        if (checked.returncode != 101 or "1 passed; 1 failed" not in checked.stdout
+        if (checked.returncode != 101 or "2 passed; 1 failed" not in checked.stdout
             or "Test compiled successfully, but it's marked `compile_fail`" not in checked.stdout):
             raise ValueError(f"reaper boundary control {name} did not expose the forbidden call")
-    print("rust-reaper-boundary: both forbidden calls failed to compile and compiled under their matching controls")
+    print("rust-reaper-boundary: three forbidden calls failed to compile and compiled under their matching controls")
 
 
 def verify_native_residence_erasure_boundary(args, source):
