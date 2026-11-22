@@ -27,6 +27,7 @@ The primary scan applies the remaining predicates to the resolved row and SEARCH
 The ordered seek applies index-covered predicates before counting distinct keys.
 
 The index orders signed integers, Booleans, text, binary values, UUIDs, calendar dates, zoned timestamps at microsecond precision, and single- and double-precision floating-point values.
+Unsigned Arrow cells use the SQL engine's signed interpretation at the same width for seeks and ordering.
 Float keys preserve signed zero order and group NaNs at the end, as SQL sorting does.
 A zero or NaN comparison remains a row predicate. NaN rows cannot satisfy an indexed comparison to an ordinary float value.
 The index reads float results from their original rows to preserve payload bits.

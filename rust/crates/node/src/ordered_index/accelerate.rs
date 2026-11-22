@@ -464,14 +464,6 @@ fn order(
         let field = fields.get(end)?.as_ref()?;
         let family = family(&field.data_type)?;
         if !matches!(&sort.expr, Expr::Column { id, .. } if *id == field.id)
-            || field.data_type.legs().into_iter().any(|leg| {
-                matches!(
-                    leg,
-                    LogicalType::Scalar(
-                        ScalarType::U8 | ScalarType::U16 | ScalarType::U32 | ScalarType::U64
-                    )
-                )
-            })
             || sort.descending != reverse
             || (sort.nulls_first != reverse && field.data_type.nullable() && field.name != "_id")
             // SQL DISTINCT coalesces signed zeros, which can fall into
@@ -1123,6 +1115,16 @@ fn covered_array<'a>(
             )
         };
     }
+    macro_rules! unsigned_bits {
+        ($array:ty, $signed:ty, $unsigned:ty) => {
+            Arc::new(
+                cells!(Integer, |value| <$signed>::try_from(value)
+                    .map(|value| value as $unsigned)
+                    .map_err(super::format_error)?)
+                .collect::<Result<$array>>()?,
+            )
+        };
+    }
     use ScalarType as S;
     Ok(match scalar {
         S::Utf8 => {
@@ -1157,10 +1159,10 @@ fn covered_array<'a>(
         S::I16 => integer!(Int16Array, i16),
         S::I32 => integer!(Int32Array, i32),
         S::I64 => integer!(Int64Array, i64),
-        S::U8 => integer!(UInt8Array, u8),
-        S::U16 => integer!(UInt16Array, u16),
-        S::U32 => integer!(UInt32Array, u32),
-        S::U64 => integer!(UInt64Array, u64),
+        S::U8 => unsigned_bits!(UInt8Array, i8, u8),
+        S::U16 => unsigned_bits!(UInt16Array, i16, u16),
+        S::U32 => unsigned_bits!(UInt32Array, i32, u32),
+        S::U64 => unsigned_bits!(UInt64Array, i64, u64),
         S::Uuid => {
             let mut builder = FixedSizeBinaryBuilder::with_capacity(cells.len(), 16);
             for cell in cells!(Uuid, |value| value) {
@@ -1219,6 +1221,46 @@ impl PartialOrd for Head {
 mod tests {
     use super::*;
     use rtdb_columnar::MemoryBudget;
+    use rtdb_types::Value;
+
+    #[test]
+    fn unsigned_postings_match_sql_order_and_preserve_covered_bits() {
+        macro_rules! check_unsigned {
+            ($scalar:ident, $value:ident, $array:ty, $raw:ty) => {{
+                let scalar = ScalarType::$scalar;
+                let field = to_field("key", &LogicalType::Scalar(scalar.clone())).unwrap();
+                let sign_bit = <$raw>::MAX / 2 + 1;
+                let input = [sign_bit, <$raw>::MAX, 0, sign_bit - 1];
+                let array = <$array>::from(input.to_vec());
+                let keys = (0..input.len())
+                    .map(|row| AtomRef::from_arrow(&field, &array, row).unwrap())
+                    .collect::<Vec<_>>();
+
+                for (&raw, key) in input.iter().zip(&keys) {
+                    assert_eq!(Some(key.owned()), Atom::of(&Value::$value(raw)));
+                }
+                for (row, pair) in keys.windows(2).enumerate() {
+                    let sql_order = rtdb_expr::ordered_compare_in_timezone(
+                        &Value::$value(input[row]),
+                        &Value::$value(input[row + 1]),
+                        false,
+                        "UTC",
+                    )
+                    .unwrap();
+                    assert_eq!(pair[0].cmp(&pair[1]), sql_order);
+                    assert!(sql_order.is_lt());
+                }
+
+                let covered = covered_array(&scalar, 0, keys.into_iter()).unwrap();
+                let covered = covered.as_any().downcast_ref::<$array>().unwrap();
+                assert_eq!(&covered.values()[..], &input);
+            }};
+        }
+        check_unsigned!(U8, U8, UInt8Array, u8);
+        check_unsigned!(U16, U16, UInt16Array, u16);
+        check_unsigned!(U32, U32, UInt32Array, u32);
+        check_unsigned!(U64, U64, UInt64Array, u64);
+    }
 
     #[test]
     fn contiguous_values_share_only_the_selected_byte_window() {
