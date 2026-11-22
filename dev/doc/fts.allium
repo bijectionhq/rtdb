@@ -14,6 +14,8 @@
 -- The artefact lane feeds its one explicitly declared UTF-8 column to the same search-file builder.
 -- Published files include the ordered definition version, artifact identity, and exact token length of each run.
 -- Owned corpus statistics require published files covering all sources of the held cut.
+-- Owned runs carry their full typed identity. Ranked candidates verify that identity, their winning revision, and the declared text at the held cut.
+-- Owned ranking uses only the held corpus and breaks score ties by the complete typed identity.
 -- Row count, token count, and term frequencies use only runs whose temporal visibility is exact at that cut.
 -- Public SQL search definitions remain scoped to the public catalog.
 --

@@ -11,7 +11,7 @@ use rtdb_plan::{BinaryOp, Catalog, Expr};
 use rtdb_query::{MatchAnswers, QueryContext, ScanAccelerator, ScanRequest};
 use rtdb_storage::ObjectKey;
 use rtdb_text::Query;
-use rtdb_types::{Anomaly, AnomalyCategory, Iid, Interval, OwnedRelation, Result, TemporalBounds, Timestamp, Value};
+use rtdb_types::{Anomaly, AnomalyCategory, EntityId, EventOp, Iid, Interval, OwnedRelation, Result, TemporalBounds, Timestamp, Value};
 
 use crate::{KIND, SearchDefinition, SearchFile, runtime::{Suspect, TrieFile}};
 
@@ -347,6 +347,20 @@ fn uncovered_owned_search() -> Anomaly {
 pub async fn owned_corpus(
     context: Arc<QueryContext>, owner: &str, relation: &OwnedRelation, path: &OwnedRelation, text: &str,
 ) -> Result<rtdb_text::Corpus> {
+    Ok(covered_owned_corpus(context, owner, relation, path, &Query::parse(text), false).await?.corpus)
+}
+
+struct CoveredCorpus {
+    column: String,
+    bounds: TemporalBounds,
+    corpus: rtdb_text::Corpus,
+    visible_runs: Vec<(Arc<SearchFile>, BTreeSet<u32>)>,
+    _scratch: Arc<rtdb_columnar::MemoryReservation>,
+}
+
+async fn covered_owned_corpus(
+    context: Arc<QueryContext>, owner: &str, relation: &OwnedRelation, path: &OwnedRelation, query: &Query, retain_runs: bool,
+) -> Result<CoveredCorpus> {
     let definition = crate::definitions::owned_definition(Arc::clone(&context), owner, relation, path).await?
         .ok_or_else(|| Anomaly::incorrect("rtdb.owned/search-path", "Owned relation has no declared clear-text search path with this name"))?;
     let database = context.catalog.default_database();
@@ -391,12 +405,13 @@ pub async fn owned_corpus(
     }
 
     let cutter = Cutter { files: &files, skipped: &[], segments: Vec::new(), runtime: &runtime, database, bounds };
-    let query = Query::parse(text);
     let mut corpus = rtdb_text::Corpus {
         frequencies: query.terms().iter().cloned().map(|term| (term, 0)).collect(),
         ..rtdb_text::Corpus::default()
     };
     let mut seen = BTreeSet::new();
+    let mut identities = BTreeMap::new();
+    let mut visible_runs = Vec::new();
     let mut scratch = context.memory.reserve(4096)?;
     for selected in by_file(&files) {
         let mut visible = BTreeSet::new();
@@ -404,12 +419,15 @@ pub async fn owned_corpus(
             for doc in selected.file.single_column_member_runs(member)? {
                 if doc.doc % 128 == 0 { context.check_cancelled()?; }
                 if !selected.file.visible(doc.doc, bounds) { continue; }
+                Arc::get_mut(&mut scratch).expect("corpus owns its reservation").grow_to(4096usize.saturating_add(identities.len().saturating_add(1).saturating_mul(256)))?;
+                let id = selected.file.run_identity_bytes(doc)?;
+                if identities.insert(doc.iid, id).is_some_and(|previous| previous != id) {
+                    return Err(uncovered_owned_search());
+                }
                 match cutter.judge(own, doc)? {
                     Judged::Hidden => (),
                     Judged::Visible { exact: false } => return Err(uncovered_owned_search()),
                     Judged::Visible { exact: true } => {
-                        Arc::get_mut(&mut scratch).expect("corpus owns its reservation")
-                            .grow_to(4096usize.saturating_add(seen.len().saturating_add(1).saturating_mul(128)))?;
                         if !seen.insert(doc.iid) { return Err(uncovered_owned_search()); }
                         visible.insert(doc.doc);
                         corpus.documents += 1;
@@ -429,9 +447,90 @@ pub async fn owned_corpus(
             }
             *corpus.frequencies.entry(term.clone()).or_default() += frequency;
         }
+        if retain_runs && !visible.is_empty() {
+            visible_runs.push((Arc::clone(selected.file), visible));
+        }
     }
     context.check_cancelled()?;
-    Ok(corpus)
+    Ok(CoveredCorpus { column: column.clone(), bounds, corpus, visible_runs, _scratch: scratch })
+}
+
+/// One exact match on a held owned search path, identified by its full typed key.
+#[derive(Clone, Debug, PartialEq)]
+pub struct OwnedSearchHit {
+    pub id: EntityId,
+    pub score: f64,
+}
+
+/// Ranks only the admitted visible corpus and verifies each nominated run at the held point.
+pub async fn owned_ranked(
+    context: Arc<QueryContext>, owner: &str, relation: &OwnedRelation, path: &OwnedRelation, text: &str, limit: usize,
+) -> Result<Vec<OwnedSearchHit>> {
+    if !(1..=128).contains(&limit) {
+        return Err(Anomaly::incorrect("rtdb.owned/search-limit", "Owned search limit must be between 1 and 128"));
+    }
+    let query = Query::parse(text);
+    let covered = covered_owned_corpus(Arc::clone(&context), owner, relation, path, &query, true).await?;
+    let scorer = rtdb_text::Scorer::new(query.clone(), Some(&covered.corpus));
+    let mut hits = Vec::<OwnedSearchHit>::with_capacity(limit + 1);
+    let mut memory = context.memory.reserve(4096)?;
+    let mut candidates = 0;
+    for (file, visible) in &covered.visible_runs {
+        context.check_cancelled()?;
+        for run in file.matches(&covered.column, &query, covered.bounds)? {
+            if !visible.contains(&run.doc) { continue; }
+            candidates += 1;
+            if candidates > 100_000 {
+                return Err(Anomaly::new(AnomalyCategory::Unavailable, "rtdb.owned/search-candidate-limit", "Covered search exceeded its candidate budget"));
+            }
+            let id = file.run_identity(run)?;
+            let columns = ["_id", covered.column.as_str()];
+            let Some(mut rows) = rtdb_query::open_owned_point(
+                Arc::clone(&context), owner, relation, &id, Some(covered.bounds.valid_time), Some(&columns),
+            ).await? else { return Err(uncovered_owned_search()); };
+            let mut resolved_score = None;
+            while let Some(batch) = rows.next_batch().await? {
+                let batch = batch.batch();
+                if batch.num_rows() == 0 { continue; }
+                if resolved_score.is_some() || batch.num_rows() != 1 { return Err(uncovered_owned_search()); }
+                let revision = rtdb_query::owned_row_revision(batch, 0, &id, &context.memory)?;
+                let at = covered.bounds.valid_time.lower().0;
+                let same_run = file.rows_of(&run.iid)?.into_iter().any(|(row, event)| {
+                    event.op == EventOp::Put && event.system_from == revision.0 && event.valid_from <= at
+                        && at < event.valid_to && file.run_of(&covered.column, row) == Some(Some(run.doc))
+                });
+                if !same_run { return Err(uncovered_owned_search()); }
+                let (column, field) = batch.schema_ref().column_with_name(&covered.column).ok_or_else(uncovered_owned_search)?;
+                let values = batch.column(column).as_ref();
+                let bytes = rtdb_columnar::estimate_read_value_bytes(field, values, 0)?;
+                let _decode = context.memory.reserve(bytes.saturating_mul(64).saturating_add(4096))?;
+                let Value::Utf8(text) = rtdb_columnar::read_value(field, values, 0)? else { return Err(uncovered_owned_search()); };
+                let tokens = rtdb_text::tokens(&text);
+                if !query.matches(&tokens) || tokens.len() != file.token_length(run.doc)? as usize {
+                    return Err(uncovered_owned_search());
+                }
+                let score = scorer.bm25(&tokens);
+                if !score.is_finite() { return Err(uncovered_owned_search()); }
+                resolved_score = Some(score);
+            }
+
+            let hit = OwnedSearchHit { id, score: resolved_score.ok_or_else(uncovered_owned_search)? };
+            let at = hits.partition_point(|previous| {
+                previous.score.total_cmp(&hit.score).reverse().then_with(|| previous.id.cmp(&hit.id)).is_lt()
+            });
+            if at < limit {
+                hits.insert(at, hit);
+                hits.truncate(limit);
+                let bytes = hits.iter().try_fold(4096usize, |bytes, hit| {
+                    Ok::<_, Anomaly>(bytes.saturating_add(hit.id.as_value().retained_bytes()?).saturating_add(128))
+                })?;
+                let reservation = Arc::get_mut(&mut memory).expect("ranking owns its reservation");
+                reservation.grow_to(bytes.max(reservation.bytes()))?;
+            }
+        }
+    }
+    context.check_cancelled()?;
+    Ok(hits)
 }
 
 fn file_candidates(cutter: &Cutter<'_>, column: &str, query: &Query, max_candidates: usize, events: &mut usize) -> Result<Option<BTreeSet<Iid>>> {
@@ -645,7 +744,7 @@ mod tests {
 
         let columns = vec!["body".to_string()];
         let row = |id: u8, body: &str| crate::SearchRow {
-            iid: [id; 16], system_from: 0, valid_from: 0, valid_to: i64::MAX,
+            identity: None, iid: [id; 16], system_from: 0, valid_from: 0, valid_to: i64::MAX,
             op: rtdb_types::EventOp::Put, values: vec![Some(rtdb_text::tokens(body))],
         };
         let mut bytes = Vec::new();
@@ -695,7 +794,7 @@ mod tests {
         let columns = ["body".to_string()];
         let iid = [1; 16];
         let row = |system_from, valid_to, text: &str| crate::SearchRow {
-            iid, system_from, valid_from: 0, valid_to, op: rtdb_types::EventOp::Put,
+            identity: None, iid, system_from, valid_from: 0, valid_to, op: rtdb_types::EventOp::Put,
             values: vec![Some(rtdb_text::tokens(text))],
         };
         let trie = |key: &str, rows: &[crate::SearchRow]| {

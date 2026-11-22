@@ -1,6 +1,6 @@
 use std::{collections::BTreeSet, sync::Arc, time::Duration};
 
-use arrow_array::{Array, Int64Array, RecordBatch};
+use arrow_array::{Array, Float64Array, Int64Array, RecordBatch};
 use arrow_flight::Result as ActionResult;
 use arrow_ipc::writer::IpcWriteOptions;
 use arrow_schema::{DataType, Field, Schema};
@@ -11,7 +11,7 @@ use rtdb_format::ipc::{OwnedStream, write_arrow_stream};
 use rtdb_node::{NativeSession, OwnedRangeRequest, OwnedReadSession, TransactionStatus};
 use rtdb_query::QueryCursor;
 use rtdb_tx::{Documents, TxOp};
-use rtdb_types::{EntityId, OwnedRelation, StructFields, TimeUnit, Timestamp, Value};
+use rtdb_types::{EntityId, LogicalType, OwnedRelation, ScalarType, StructFields, TimeUnit, Timestamp, Value};
 use tokio::sync::OwnedSemaphorePermit;
 use tonic::Status;
 use uuid::Uuid;
@@ -90,6 +90,7 @@ pub(crate) const OPEN_OWNED_READ_V1: &str = "rtdb.owned.OpenRead.v1";
 pub(crate) const HELD_OWNED_POINT_V1: &str = "rtdb.owned.ReadHeldPoint.v1";
 pub(crate) const HELD_OWNED_POINT_V2: &str = "rtdb.owned.ReadHeldPoint.v2";
 pub(crate) const CLOSE_OWNED_READ_V1: &str = "rtdb.owned.CloseRead.v1";
+pub(crate) const SEARCH_HELD_OWNED_V1: &str = "rtdb.owned.SearchHeld.v1";
 pub(crate) const HELD_OWNED_RANGE_V1: &str = "rtdb.owned.ReadHeldRange.v1";
 pub(crate) const HELD_OWNED_RANGE_V2: &str = "rtdb.owned.ReadHeldRange.v2";
 const READ_IDLE: Duration = Duration::from_secs(60);
@@ -393,6 +394,54 @@ impl Service {
         }.map_err(status)?;
         let present = held.snapshot.present().system_time;
         let reply = self.owned_point_reply(&page.schema, page.batch.as_ref().map(OwnedBatch::batch), present, present, None)?;
+        held.snapshot.check().map_err(status)?;
+        Ok(reply)
+    }
+
+    pub(crate) async fn search_held_owned_action(&self, call: &Call, body: &[u8]) -> Result<ActionResult, Status> {
+        if !self.0.config.owned_native_actions { return Err(unsupported()); }
+        let (handle, request) = body.split_first_chunk::<16>().ok_or_else(|| invalid("Owned held search has no handle"))?;
+        let handle = Bytes::copy_from_slice(handle);
+        let held = self.owned_read(call, &handle)?;
+        if let Err(error) = held.snapshot.check() {
+            if let Lookup::Found(entry) = self.0.owned_reads.take(&handle) { entry.close(); }
+            return Err(status(error));
+        }
+        let (relation, arrow_bytes) = split_relation(request)?;
+        let batch = decode_batch(call, arrow_bytes)?;
+        if batch.batch().num_rows() != 1 || batch.batch().num_columns() != 3 {
+            return Err(invalid("Owned held search requires one row with path, query, and limit"));
+        }
+        let (rows, _decode) = upload::domain_documents(batch.batch(), self)?;
+        let row = &rows[0];
+        let (Some(Value::Utf8(path)), Some(Value::Utf8(query)), Some(Value::I64(limit))) =
+            (row.get("path"), row.get("query"), row.get("limit"))
+        else { return Err(invalid("Owned held search fields have invalid types")); };
+        let path = OwnedRelation::new(path.as_str()).map_err(status)?;
+        let limit = usize::try_from(*limit).map_err(|_| invalid("Owned held search limit is out of range"))?;
+        let hits = held.snapshot.ranked_search(&relation, &path, query, limit).await.map_err(status)?;
+        let id_type = LogicalType::from_legs([ScalarType::Utf8, ScalarType::Keyword, ScalarType::I64, ScalarType::Uuid].map(LogicalType::Scalar));
+        let schema = Arc::new(Schema::new(vec![
+            rtdb_columnar::to_field("_id", &id_type).map_err(status)?,
+            Field::new("score", DataType::Float64, false),
+        ]));
+        let mut charge = call.reserve(4096)?;
+        let output = if hits.is_empty() {
+            None
+        } else {
+            let mut ids = Vec::with_capacity(hits.len());
+            for hit in &hits {
+                let id = hit.id.as_value();
+                let reservation = Arc::get_mut(&mut charge).expect("search output owns its reservation");
+                reservation.grow_to(wire::add(reservation.bytes(), wire::mul(id.retained_bytes().map_err(status)?, 4)?)?).map_err(status)?;
+                ids.push(id);
+            }
+            let ids = rtdb_columnar::build_array(&id_type, &ids).map_err(status)?;
+            let scores = Arc::new(Float64Array::from_iter_values(hits.iter().map(|hit| hit.score)));
+            Some(RecordBatch::try_new(Arc::clone(&schema), vec![ids, scores]).map_err(arrow)?)
+        };
+        let present = held.snapshot.present().system_time;
+        let reply = self.owned_point_reply(&schema, output.as_ref(), present, present, None)?;
         held.snapshot.check().map_err(status)?;
         Ok(reply)
     }

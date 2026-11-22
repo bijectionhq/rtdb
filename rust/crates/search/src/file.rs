@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use rtdb_text::{Corpus, Query, RankScorer, Scorer};
-use rtdb_types::{Anomaly, EventHeader, EventOp, Iid, Interval, Result, TemporalBounds, Timestamp};
+use rtdb_types::{Anomaly, EntityId, EventHeader, EventOp, Iid, Interval, Result, TemporalBounds, Timestamp};
 use tantivy::collector::DocSetCollector;
 use tantivy::directory::error::{DeleteError, OpenReadError, OpenWriteError};
 use tantivy::directory::{FileHandle, FileSlice, OwnedBytes, RamDirectory, WatchCallback, WatchHandle, WritePtr};
@@ -26,9 +26,9 @@ use crate::rectangle::merge_adjacent_valid_time;
 #[cfg(feature = "experiments")]
 pub(crate) mod experiment;
 
-const MAGIC: &[u8; 8] = b"RTSRCH02";
+const MAGIC: &[u8; 8] = b"RTSRCH03";
 /// Identifies the bundle bytes produced by the builder, including visibility encoding.
-pub const FORMAT_VERSION: i32 = 8;
+pub const FORMAT_VERSION: i32 = 9;
 const WRITER_MEMORY: usize = 32 << 20;
 /// The bundle entry holding what tantivy's segment does not: rows, runs, rectangles, nulls, every row's key, and term impacts.
 const SIDECAR: &str = "rtdb.sidecar";
@@ -44,6 +44,8 @@ const KEY_BYTES: usize = 16 + 8 + 8 + 8 + 1;
 /// Rows arrive as the data file holds them: IID ascending, then system time descending.
 #[derive(Clone, Debug, PartialEq)]
 pub struct SearchRow {
+    /// Full entity identity on an owned put, when the lane requires that witness.
+    pub identity: Option<EntityId>,
     pub iid: [u8; 16],
     pub system_from: i64,
     pub valid_from: i64,
@@ -140,16 +142,22 @@ pub fn build_search_file(columns: &[String], rows: &[SearchRow], identity: &str)
 }
 
 /// What the writer accumulates beside tantivy's segment, to become the sidecar.
-struct Accumulated { ceiling: i64, member_starts: Vec<MemberStart>, page_starts: Vec<u32>, row_docs: Vec<Vec<u32>>, column_docs: Vec<u32>, keys: Vec<u8>, doc_iids: Vec<[u8; 16]>, token_lengths: Vec<u32>, doc_classes: Vec<u8>, sections: BTreeMap<u8, Section>, rectangle_starts: Vec<u32>, rectangles: Vec<[i64; 4]> }
+struct Accumulated { ceiling: i64, member_starts: Vec<MemberStart>, page_starts: Vec<u32>, row_docs: Vec<Vec<u32>>, column_docs: Vec<u32>, keys: Vec<u8>, doc_iids: Vec<[u8; 16]>, token_lengths: Vec<u32>, identity_starts: Vec<u32>, identities: Vec<u8>, doc_classes: Vec<u8>, sections: BTreeMap<u8, Section>, rectangle_starts: Vec<u32>, rectangles: Vec<[i64; 4]> }
 
 /// One entity's rows while they arrive: each row's position and header, and per column, its value as an index into the column's distinct values.
 #[derive(Default)]
-struct Entity { iid: Option<[u8; 16]>, rows: Vec<(u32, EventHeader)>, values: Vec<(Vec<Option<usize>>, Vec<Vec<String>>, std::collections::HashMap<Vec<String>, usize>)> }
+struct Entity { iid: Option<[u8; 16]>, identity: Option<EntityId>, rows: Vec<(u32, EventHeader)>, values: Vec<(Vec<Option<usize>>, Vec<Vec<String>>, std::collections::HashMap<Vec<String>, usize>)> }
 
 impl Entity {
     fn new(columns: usize) -> Self { Self { values: (0..columns).map(|_| Default::default()).collect(), ..Self::default() } }
     fn push(&mut self, ordinal: u32, row: SearchRow) -> Result<()> {
         self.iid = Some(row.iid);
+        if let Some(id) = row.identity {
+            if id.iid().0 != row.iid || self.identity.as_ref().is_some_and(|previous| previous != &id) {
+                return Err(fault("Owned search input has conflicting complete identities"));
+            }
+            self.identity = Some(id);
+        }
         self.rows.push((ordinal, EventHeader { iid: Iid(row.iid), system_from: Timestamp(row.system_from), valid_time: Interval::from_micros(row.valid_from, row.valid_to)?, op: row.op }));
         for ((indices, distinct, seen), value) in self.values.iter_mut().zip(row.values) {
             indices.push(value.map(|tokens| *seen.entry(tokens.clone()).or_insert_with(|| { distinct.push(tokens); distinct.len() - 1 })));
@@ -200,7 +208,7 @@ where
     let (schema, fields) = schema(columns);
     let settings = IndexSettings { docstore_compression: Compressor::None, ..IndexSettings::default() };
     let mut writer = Index::builder().schema(schema).settings(settings).single_segment_index_writer(directory.clone(), WRITER_MEMORY).map_err(fault)?;
-    let mut sidecar = Accumulated { ceiling: ceiling.unwrap_or(i64::MAX), member_starts: Vec::new(), page_starts: Vec::new(), row_docs: vec![Vec::new(); columns.len()], column_docs: vec![0; columns.len()], keys: Vec::new(), doc_iids: Vec::new(), token_lengths: Vec::new(), doc_classes: Vec::new(), sections: BTreeMap::new(), rectangle_starts: vec![0], rectangles: Vec::new() };
+    let mut sidecar = Accumulated { ceiling: ceiling.unwrap_or(i64::MAX), member_starts: Vec::new(), page_starts: Vec::new(), row_docs: vec![Vec::new(); columns.len()], column_docs: vec![0; columns.len()], keys: Vec::new(), doc_iids: Vec::new(), token_lengths: Vec::new(), identity_starts: vec![0], identities: Vec::new(), doc_classes: Vec::new(), sections: BTreeMap::new(), rectangle_starts: vec![0], rectangles: Vec::new() };
     let mut rows = 0u32;
     let mut previous_member_iid = None;
     for pages in members {
@@ -290,11 +298,36 @@ fn runs(writer: &mut tantivy::SingleSegmentIndexWriter, fields: &[Field], sideca
             sidecar.rectangles.extend(rectangles);
             sidecar.rectangle_starts.push(u32::try_from(sidecar.rectangles.len()).map_err(fault)?);
             sidecar.doc_iids.push(iid);
+            if let Some(id) = &entity.identity { encode_identity(id, &mut sidecar.identities); }
+            sidecar.identity_starts.push(u32::try_from(sidecar.identities.len()).map_err(fault)?);
             sidecar.column_docs[column] += 1;
             for index in members { sidecar.row_docs[column][entity.rows[index].0 as usize] = doc; }
         }
     }
     Ok(())
+}
+
+fn encode_identity(id: &EntityId, bytes: &mut Vec<u8>) {
+    let (tag, value): (u8, &[u8]) = match id {
+        EntityId::String(value) => (1, value.as_bytes()),
+        EntityId::Keyword(value) => (2, value.as_str().as_bytes()),
+        EntityId::Integer(value) => { bytes.push(3); bytes.extend_from_slice(&value.to_le_bytes()); return; }
+        EntityId::Uuid(value) => (4, value),
+    };
+    bytes.push(tag);
+    bytes.extend_from_slice(value);
+}
+
+fn decode_identity(bytes: &[u8]) -> Result<Option<EntityId>> {
+    let Some((&tag, value)) = bytes.split_first() else { return Ok(None); };
+    let text = || std::str::from_utf8(value).map(str::to_owned).map_err(fault);
+    Ok(Some(match tag {
+        1 => EntityId::String(text()?),
+        2 => EntityId::Keyword(rtdb_types::Keyword::from_name(text()?)),
+        3 => EntityId::Integer(i64::from_le_bytes(value.try_into().map_err(fault)?)),
+        4 => EntityId::Uuid(value.try_into().map_err(fault)?),
+        _ => return Err(corrupt("Search file has an invalid identity tag")),
+    }))
 }
 
 /// A term's documents within one window: the highest frequency among them, and the shortest stored length.
@@ -319,7 +352,7 @@ fn impacts_of(postings: &mut tantivy::postings::SegmentPostings, lengths: &tanti
     impacts
 }
 
-/// The sidecar, in order: format, analyzer and definition versions, artefact identity, row, document, page and member counts, each member's page and document starts, page starts, each column's document count, each row's run in each column, each document's IID, exact token length and lifespan class, the sections, each document's rectangles, every row's key, the impacts of every term in at least STORED_IMPACTS documents by column and term, and a checksum of the rest.
+/// The sidecar, in order: format, analyzer and definition versions, artefact identity, row, document, page and member counts, each member's page and document starts, page starts, each column's document count, each row's run in each column, each document's IID, exact token length, optional typed identity and lifespan class, the sections, each document's rectangles, every row's key, the impacts of every term in at least STORED_IMPACTS documents by column and term, and a checksum of the rest.
 fn encode(index: &Index, fields: &[Field], rows: u32, sidecar: &Accumulated, version: Option<i64>, identity: &str) -> Result<Vec<u8>> {
     let mut bytes = Vec::new();
     bytes.extend_from_slice(&FORMAT_VERSION.to_le_bytes());
@@ -337,7 +370,10 @@ fn encode(index: &Index, fields: &[Field], rows: u32, sidecar: &Accumulated, ver
     }
     for value in sidecar.page_starts.iter().chain(&sidecar.column_docs).chain(sidecar.row_docs.iter().flatten()) { bytes.extend_from_slice(&value.to_le_bytes()); }
     for iid in &sidecar.doc_iids { bytes.extend_from_slice(iid); }
-    for length in &sidecar.token_lengths { bytes.extend_from_slice(&length.to_le_bytes()); }
+    for length in sidecar.token_lengths.iter().chain(&sidecar.identity_starts) {
+        bytes.extend_from_slice(&length.to_le_bytes());
+    }
+    bytes.extend_from_slice(&sidecar.identities);
     bytes.extend_from_slice(&sidecar.doc_classes);
     bytes.extend_from_slice(&encode_sections(&sidecar.sections.values().copied().collect::<Vec<_>>()));
     for start in &sidecar.rectangle_starts { bytes.extend_from_slice(&start.to_le_bytes()); }
@@ -522,7 +558,7 @@ impl Directory for BundleDirectory {
 }
 
 /// What the sidecar holds, located within the bundle's bytes.
-struct Sidecar { bytes: OwnedBytes, version: Option<i64>, identity: [u8; 32], rows: u32, documents: u32, member_starts: Vec<MemberStart>, page_starts: Vec<u32>, column_docs: Vec<u32>, row_docs: usize, doc_iids: usize, token_lengths: usize, doc_classes: usize, sections: Vec<Section>, rectangle_starts: usize, rectangles: usize, keys: usize, impacts: BTreeMap<(u32, Vec<u8>), Range<usize>> }
+struct Sidecar { bytes: OwnedBytes, version: Option<i64>, identity: [u8; 32], rows: u32, documents: u32, member_starts: Vec<MemberStart>, page_starts: Vec<u32>, column_docs: Vec<u32>, row_docs: usize, doc_iids: usize, token_lengths: usize, identity_starts: usize, identities: usize, doc_classes: usize, sections: Vec<Section>, rectangle_starts: usize, rectangles: usize, keys: usize, impacts: BTreeMap<(u32, Vec<u8>), Range<usize>> }
 
 impl Sidecar {
     fn parse(bytes: OwnedBytes, columns: usize, documents: u32) -> Result<Self> {
@@ -574,6 +610,16 @@ impl Sidecar {
         }
         let doc_iids = take(documents as usize * 16)?.start;
         let token_lengths = take(documents as usize * 4)?.start;
+        let identity_starts = take((documents as usize + 1) * 4)?;
+        let mut previous = 0;
+        for index in (identity_starts.start..identity_starts.end).step_by(4) {
+            let offset = u32_at(index..index + 4);
+            if offset < previous || (index == identity_starts.start && offset != 0) {
+                return Err(corrupt("Search file identity offsets are out of order"));
+            }
+            previous = offset;
+        }
+        let identities = take(previous as usize)?.start;
         let doc_classes = take(documents as usize)?.start;
         let counted = take(1)?;
         let body = take(data[counted.start] as usize * 49)?;
@@ -597,7 +643,7 @@ impl Sidecar {
             impacts.insert((column, term), range);
         }
         if position != data.len() { return Err(corrupt("Search file sidecar has trailing bytes")); }
-        Ok(Self { bytes, version, identity, rows, documents, member_starts, page_starts, column_docs, row_docs: row_docs.start, doc_iids, token_lengths, doc_classes, sections, rectangle_starts: starts.start, rectangles, keys, impacts })
+        Ok(Self { bytes, version, identity, rows, documents, member_starts, page_starts, column_docs, row_docs: row_docs.start, doc_iids, token_lengths, identity_starts: identity_starts.start, identities, doc_classes, sections, rectangle_starts: starts.start, rectangles, keys, impacts })
     }
     fn data(&self) -> &[u8] { self.bytes.as_slice() }
     fn u32_at(&self, offset: usize) -> u32 { u32::from_le_bytes(self.data()[offset..offset + 4].try_into().unwrap_or_default()) }
@@ -718,6 +764,21 @@ impl SearchFile {
 
     pub(crate) fn matches_artefact(&self, identity: &str, version: i64) -> bool {
         self.sidecar.version == Some(version) && self.sidecar.identity == identity_digest(identity)
+    }
+
+    pub(crate) fn run_identity_bytes(&self, run: DocMatch) -> Result<&[u8]> {
+        if run.doc >= self.sidecar.documents { return Err(corrupt("Search file has no such run")); }
+        let offset = self.sidecar.identity_starts + run.doc as usize * 4;
+        let from = self.sidecar.identities + self.sidecar.u32_at(offset) as usize;
+        let to = self.sidecar.identities + self.sidecar.u32_at(offset + 4) as usize;
+        if from == to { return Err(corrupt("Search run omitted its full identity")); }
+        Ok(&self.sidecar.data()[from..to])
+    }
+
+    pub(crate) fn run_identity(&self, run: DocMatch) -> Result<EntityId> {
+        let id = decode_identity(self.run_identity_bytes(run)?)?.ok_or_else(|| corrupt("Search run omitted its full identity"))?;
+        if id.iid().0 != run.iid { return Err(corrupt("Search run identity disagrees with its IID")); }
+        Ok(id)
     }
 
     /// Counts analyzer tokens before the ranker's field-norm quantization.
@@ -1008,7 +1069,7 @@ mod tests {
         TemporalBounds { valid_time: Interval::from_micros(valid, valid + 1).unwrap(), system_time: Interval::from_micros(system, system + 1).unwrap() }
     }
     fn row(id: u8, system_from: i64, title: &str, body: &str) -> SearchRow {
-        SearchRow { iid: [id; 16], system_from, valid_from: 0, valid_to: i64::MAX, op: EventOp::Put, values: vec![Some(tokens(title)), Some(tokens(body))] }
+        SearchRow { identity: None, iid: [id; 16], system_from, valid_from: 0, valid_to: i64::MAX, op: EventOp::Put, values: vec![Some(tokens(title)), Some(tokens(body))] }
     }
     fn columns() -> Vec<String> { vec!["title".into(), "body".into()] }
     fn rows() -> Vec<SearchRow> {
@@ -1055,7 +1116,7 @@ mod tests {
     fn published_runs_keep_exact_lengths_and_definition_identity() {
         let columns = vec!["body".to_string()];
         let tokens = vec!["term".to_string(); 79];
-        let row = SearchRow { iid: [1; 16], system_from: 1, valid_from: 1, valid_to: 10, op: EventOp::Put, values: vec![Some(tokens)] };
+        let row = SearchRow { identity: None, iid: [1; 16], system_from: 1, valid_from: 1, valid_to: 10, op: EventOp::Put, values: vec![Some(tokens)] };
         let mut bytes = Vec::new();
         write_versioned_group(&columns, [[Ok(vec![row])]], "owned-file", 13, None, RamDirectory::create(), &mut bytes).unwrap();
         let file = SearchFile::open(bytes, &columns).unwrap();
@@ -1065,6 +1126,18 @@ mod tests {
         assert_eq!(file.token_length(0).unwrap(), 79);
         assert_eq!(file.stored_length("body", 0).unwrap(), 76);
         assert!(file.token_length(1).is_err());
+    }
+
+    #[test]
+    fn an_owned_run_round_trips_its_full_typed_identity() {
+        let columns = vec!["body".to_string()];
+        let id = EntityId::String("complete-id".into());
+        let row = SearchRow { identity: Some(id.clone()), iid: id.iid().0, system_from: 1, valid_from: 1, valid_to: 10,
+            op: EventOp::Put, values: vec![Some(tokens("invoice"))] };
+        let bytes = build_search_file(&columns, &[row], "owned-run").unwrap();
+        let file = SearchFile::open(bytes, &columns).unwrap();
+        let run = file.matches("body", &Query::parse("invoice"), at(2, 2)).unwrap()[0];
+        assert_eq!(file.run_identity(run).unwrap(), id);
     }
 
     #[test]
@@ -1177,7 +1250,7 @@ mod tests {
         (0..count).map(|index| {
             let body: Vec<String> = (0..1 + next() % 12).map(|_| words[next() % words.len()].to_string()).collect();
             let value = match index % 17 { 0 => None, 1 => Some(Vec::new()), _ => Some(body) };
-            SearchRow { iid: [(index / 20) as u8; 16], system_from: 1_000_000 - index as i64, valid_from: 0, valid_to: i64::MAX, op: EventOp::Put, values: vec![None, value] }
+            SearchRow { identity: None, iid: [(index / 20) as u8; 16], system_from: 1_000_000 - index as i64, valid_from: 0, valid_to: i64::MAX, op: EventOp::Put, values: vec![None, value] }
         }).collect()
     }
 
