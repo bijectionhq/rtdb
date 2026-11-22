@@ -550,6 +550,10 @@ The system cut must be covered by the relation history on a fresh hold or equal 
 Both actions require a covered index revision and return the requested system and valid instants in the reply metadata.
 Historical pages require the path to project `_id` for ordered erase validation.
 Historical pages and counts carry no commit witness.
+
+Held range and count actions can cover a cut by replaying up to 4096 uncheckpointed events from the captured relation, including up to eight flushed source files.
+This also covers relations that have no checkpoint yet when the retained sources supply the complete history.
+An incomplete or over-limit replay yields no rows, count, or witness.
 The relation-frontier check still applies to moving-valid reads, continuation reads, and reads whose exact witness or intervening coverage is unavailable.
 
 === Committing checked hosted control rows with owned facts

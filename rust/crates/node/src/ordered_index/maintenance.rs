@@ -325,9 +325,6 @@ async fn read_flushed_root(
     cancellation: &CancellationToken,
 ) -> Result<Option<Root>> {
     let through = source_frontier(snapshot, &definition.table);
-    if checkpoint.is_none() && through >= 0 {
-        return Ok(None);
-    }
     let (after, mut rows, mut root) = if let Some(checkpoint) = checkpoint {
         let root = checkpoint
             .roots()
@@ -338,10 +335,15 @@ async fn read_flushed_root(
     } else {
         (-1, 0, None)
     };
-    let files = source_files(snapshot, &definition.table, after, through)?;
-    if files.len() > MAX_TAIL_FILES {
+    let file_count = snapshot
+        .trie_catalog()
+        .l0_source(&definition.table, BlockIndex(after), BlockIndex(through))
+        .take(MAX_TAIL_FILES + 1)
+        .count();
+    if file_count > MAX_TAIL_FILES {
         return Ok(None);
     }
+    let files = source_files(snapshot, &definition.table, after, through)?;
     for source in files {
         let (count, changes) =
             flushed_changes(tree, definition, &source, cancellation, |_| true).await?;

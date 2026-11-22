@@ -777,7 +777,7 @@ async fn owned_prefix_capacity_checks_atomic_final_membership() {
 }
 
 #[tokio::test]
-async fn held_owned_range_requires_a_covering_generation() {
+async fn held_owned_range_covers_live_flushed_and_checkpointed_events() {
     use rtdb_types::OwnedRelation;
 
     let mut settings = options();
@@ -824,16 +824,24 @@ async fn held_owned_range_requires_a_covering_generation() {
     };
     let write = writer.state_mut().execute_tx(vec![correction], AutonomousTxOptions::default()).await.unwrap();
     assert!(write.committed(), "{:?}", write.error());
+    let open_count = || rtdb_node::OwnedCountRequest {
+        lower: None, upper: None, valid_at: Timestamp(10),
+    };
     let held = writer.open_owned_read().await.unwrap();
-    let failure = held.range(&relation, &path, None, None, 2).await.err().unwrap();
+    let unknown = OwnedRelation::new("unknown-path").unwrap();
+    let failure = held.range(&relation, &unknown, None, None, 2).await.err().unwrap();
     assert_eq!(failure.code, "rtdb.owned/path-uncovered");
-    let request = rtdb_node::OwnedCountRequest { lower: None, upper: None, valid_at: Timestamp(10) };
-    assert_eq!(held.count_range(&relation, &path, request).await.err().unwrap().code, "rtdb.owned/path-uncovered");
+    assert_eq!(held.count_range(&relation, &path, open_count()).await.unwrap().count, 3);
+    let page = held.range(&relation, &path, None, None, 2).await.unwrap();
+    assert_eq!(page.batch.unwrap().batch().num_rows(), 2);
     held.close();
     drop(held);
 
     let database = node.catalog().database("xtdb").unwrap();
     index_flush(&node, &database).await;
+    let held = writer.open_owned_read().await.unwrap();
+    assert_eq!(held.count_range(&relation, &path, open_count()).await.unwrap().count, 3);
+    drop(held);
     database.build_artefacts().await.unwrap();
     let held = writer.open_owned_read().await.unwrap();
     let lower = Value::I64(10);
@@ -896,6 +904,20 @@ async fn held_owned_range_requires_a_covering_generation() {
         let result = cut.count_range_at_system(&relation, &path, request, selected).await.unwrap();
         assert_eq!((result.count, result.present, result.valid_at), (2, selected, valid));
     }
+    let late = TxOp::OwnedInsertDocs {
+        relation: relation.clone(),
+        documents: Documents::new(vec![StructFields::from([
+            ("_id".into(), Value::I64(4)), ("priority".into(), Value::I64(15)),
+        ])], node.memory()).unwrap(),
+        valid_from: Some(Timestamp(0)),
+        valid_to: None,
+    };
+    let write = writer.state_mut().execute_tx(vec![late], AutonomousTxOptions::default()).await.unwrap();
+    assert!(write.committed(), "{:?}", write.error());
+    let fresh = writer.open_owned_read().await.unwrap();
+    assert_eq!(fresh.count_range(&relation, &path, open_count()).await.unwrap().count, 4);
+    assert_eq!(held.count_range(&relation, &path, open_count()).await.unwrap().count, 3);
+    drop(fresh);
     drop(old);
     drop(held);
     drop(writer);

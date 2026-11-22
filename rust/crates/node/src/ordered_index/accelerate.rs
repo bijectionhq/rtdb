@@ -33,6 +33,7 @@ use super::{
 
 const BATCH_ROWS: usize = 128;
 const MAX_CANDIDATES: usize = 16_384;
+const MAX_OWNED_REPLAY_ROWS: i64 = 4_096;
 
 pub(crate) struct OrderedIndexAccelerator;
 
@@ -739,7 +740,7 @@ fn owned_fields(snapshot: &rtdb_index::Snapshot, definition: &Definition) -> Vec
         .collect()
 }
 
-async fn covered_generation(
+async fn covered_root(
     context: &rtdb_query::QueryContext,
     snapshot: &rtdb_index::Snapshot,
     storage: &Arc<rtdb_storage::cache::BufferPool>,
@@ -747,29 +748,28 @@ async fn covered_generation(
     present: Timestamp,
 ) -> Result<(Tree, Root)> {
     let through = source_frontier(snapshot, &definition.table);
-    if through < 0
-        || snapshot
-            .iter_segments(&definition.table)
-            .any(|segment| segment.row_count() != 0)
-    {
+    let directory = definition.directory()?;
+    let checkpoint = checkpoint::latest(storage, &directory, &context.memory, through).await?;
+    let durable_rows = source_rows(snapshot, &definition.table);
+    let covered_rows = checkpoint
+        .as_ref()
+        .map_or(0, |checkpoint| checkpoint.source_rows);
+    let frontier = snapshot.relation_event_frontier(&definition.table)?;
+    if covered_rows > durable_rows || frontier - covered_rows > MAX_OWNED_REPLAY_ROWS {
         return Err(super::uncovered_owned_range());
     }
-    let directory = definition.directory()?;
-    let checkpoint = checkpoint::latest(storage, &directory, &context.memory, through)
-        .await?
-        .filter(|checkpoint| {
-            checkpoint.through == through
-                && checkpoint.source_rows == source_rows(snapshot, &definition.table)
-        })
-        .ok_or_else(super::uncovered_owned_range)?;
-    let tree = Tree::new(storage, &directory, &context.memory, checkpoint.scope).await?;
-    // The checkpoint accounts for every captured event. Before its first
-    // projected revision the index is empty, including after erase replay.
-    let root = checkpoint
-        .roots()
-        .at(&tree, present)
-        .await?
-        .and_then(|(_, root)| root);
+    let scope = checkpoint.as_ref().map_or(0, |checkpoint| checkpoint.scope);
+    let tree = Tree::new(storage, &directory, &context.memory, scope).await?;
+    let root = read_root(
+        &tree,
+        definition,
+        snapshot,
+        checkpoint,
+        present,
+        &context.cancellation,
+    )
+    .await?
+    .ok_or_else(super::uncovered_owned_range)?;
     Ok((tree, root))
 }
 
@@ -794,7 +794,7 @@ pub(super) async fn owned_page(
     }
 
     let present = context.current_time.as_micros()?;
-    let (tree, root) = covered_generation(context, snapshot, storage, definition, present).await?;
+    let (tree, root) = covered_root(context, snapshot, storage, definition, present).await?;
     let buckets: Vec<_> = Bucket::at(valid_at.unwrap_or(present)).collect();
     let scratch = context
         .memory
@@ -853,7 +853,7 @@ pub(super) async fn owned_count(
     compound_bound(&mut range, &fields, request.upper, false, true)?;
     request.valid_at.next()?;
     let present = context.current_time.as_micros()?;
-    let (tree, root) = covered_generation(context, snapshot, storage, definition, present).await?;
+    let (tree, root) = covered_root(context, snapshot, storage, definition, present).await?;
     let mut count = 0u64;
     for bucket in Bucket::at(request.valid_at) {
         let compare = |key: KeyRef<'_>| match key {

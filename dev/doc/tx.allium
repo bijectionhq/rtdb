@@ -81,6 +81,8 @@
 -- A historical point uses the held catalog and the same identity registry at the requested system time.
 -- The relation journal certifies historical point coverage, and incomplete coverage refuses the read.
 -- A covered held range may mint a witness of its owner relation's cumulative event frontier and placed writer epoch.
+-- An ordered read can extend a checkpoint with a bounded exact replay of the held relation's flushed and live events.
+-- A replay that lacks complete source coverage or exceeds its bound refuses the read.
 -- Ordered validation refuses a witnessed write when that relation's frontier changed or the witness expired or belongs to another placed epoch.
 -- Events in other owner relations leave the witness valid.
 -- An owned root mutation appends its owner relation's next dense change group in the same committed transaction.
