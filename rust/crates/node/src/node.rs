@@ -1562,8 +1562,17 @@ impl OwnedReadSession {
         request: crate::OwnedCountRequest<'_>,
     ) -> Result<crate::OwnedRangeCount> {
         self.admit_read().await?;
-        let result = crate::ordered_index::owned_count(self.relation_context(relation)?, &self.owner, relation, path, request).await?;
-        self.check_relation(relation)?;
+        let lifetime = self.lifetime_point_duration(relation).await?;
+        let context = if lifetime.is_some() {
+            if request.valid_at != self.present.system_time {
+                return Err(lifetime_read_unavailable());
+            }
+            Arc::clone(&self.context).with_owned_read_guard(self.relation_release_guard_for([relation], true)?)
+        } else {
+            self.relation_context(relation)?
+        };
+        let result = crate::ordered_index::owned_count_at(context, &self.owner, relation, path, request, lifetime).await?;
+        self.check_lifetime_range_release(relation, result.expiry)?;
         Ok(result)
     }
 
@@ -1572,7 +1581,7 @@ impl OwnedReadSession {
         request: crate::OwnedCountRequest<'_>,
     ) -> Result<(crate::OwnedRangeCount, Option<OwnedRangeWitness>)> {
         let counted = self.count_range(relation, path, request).await?;
-        let evidence = self.relation_witness(relation)?;
+        let evidence = self.relation_witness_for(relation, true, counted.expiry)?;
         Ok((counted, evidence))
     }
 
