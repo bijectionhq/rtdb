@@ -342,3 +342,29 @@ The combined Gradle rerun with the rebuilt native library passed 3,198 standard,
 The PostgreSQL slot-recreation fixture was skipped.
 No reflection or boxed-math warnings were recorded.
 Allium check and analysis reported the original diagnostics for all three changed specifications.
+
+== R5 · Archive copy custody and reset inventory
+
+The archive regression admits a copy against its journal anchor and holds the first required record while an admitted provider operation remains open.
+The record stays protected after archive publication and pin expiry, and the directory releases it after provider drain.
+The model explored 19 states and rejected trim during an admitted copy, releasing a pending pin, and publication without archive verification.
+The progress witness reaches physical trim after the archive takes custody and provider work has drained.
+
+The native reset fixture temporarily removes a required L0 data object and verifies that preparation refuses and keeps the compacted files.
+An unlisted L0 pair is present when the retry succeeds, and the plan excludes it.
+The successful replacement remains readable after restart.
+The packed copy test observes one physical pack for two members, and exact body reads still refuse a changed version.
+The directory, Multi, and node suites passed 27, 163, and 117 cases respectively.
+The live cell trace exercised checkpoint admission and trim and rejected all five controls.
+The complete native cell suite passed 99 cases on the default worker stack after the short-query planning fix.
+The fix also passed its depleted-stack test.
+
+== R8 · Log-time application receipt expiry
+
+The resolver regression begins with two records at the same append timestamp and checks the retry boundary after the second record's system time advances.
+It regresses the source clock before and after reusing the expired key and confirms that retries still name the most recent committed receipt.
+All 33 resolver cases passed.
+
+The combined Gradle run passed 3,198 standard, 3,348 property and 5,629 integration cases.
+The PostgreSQL slot-recreation fixture was skipped.
+No reflection or boxed-math warnings were recorded.
