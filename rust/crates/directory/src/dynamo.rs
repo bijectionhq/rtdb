@@ -459,6 +459,19 @@ impl Directory for DynamoDirectory {
         Err(lineage_busy())
     }
 
+    async fn authorize_owned_retirement(&self, id: &str, expected: Version, retirement: LineageRetirement) -> Result<LineageState> {
+        let owner = self.deployment(id).await?.filter(|owner| owner.version == expected).ok_or_else(lineage_busy)?;
+        let (current, legacy) = self.read_lineage(&owner.lineage).await?;
+        let next = current.authorize_exact_owned(&owner, &retirement)?;
+        if current == next { return Ok(next); }
+        let items = vec![
+            self.require_deployment_version(id, expected)?,
+            self.write_lineage(&owner.lineage, &next, current.version(), legacy)?,
+        ];
+        if !self.write_retirement(items).await? { return Err(lineage_busy()); }
+        Ok(next)
+    }
+
     async fn settle_owned_version(&self, id: &str, expected: Version, retirement: LineageRetirement) -> Result<Cas<DeploymentRecord>> {
         let Some(owner) = self.deployment(id).await? else { return Ok(Cas::Conflict(None)); };
         if owner.version != expected { return Ok(Cas::Conflict(Some(owner))); }

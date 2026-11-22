@@ -32,6 +32,7 @@ enum Op {
     SharedReferenceRevision { lineage: String },
     LineageState { lineage: String },
     BeginReferenceDisposal { id: String, expected: Version },
+    AuthorizeOwnedRetirement { id: String, expected: Version, retirement: LineageRetirement },
     SettleOwnedVersion { id: String, expected: Version, retirement: LineageRetirement },
     SettleReferenceDisposal { permit: ReferenceDisposal, record: DeploymentRecord, expected: Version },
     ChangeLineage { lineage: String, change: LineageChange },
@@ -104,6 +105,7 @@ async fn dispatch(directory: &dyn Directory, op: Op) -> Result<Reply> {
         Op::SharedReferenceRevision { lineage } => Reply::SharedReferenceRevision(directory.shared_reference_revision(&lineage).await?),
         Op::LineageState { lineage } => Reply::LineageState(directory.lineage_state(&lineage).await?),
         Op::BeginReferenceDisposal { id, expected } => Reply::ReferenceDisposal(directory.begin_reference_disposal(&id, expected).await?),
+        Op::AuthorizeOwnedRetirement { id, expected, retirement } => Reply::LineageState(directory.authorize_owned_retirement(&id, expected, retirement).await?),
         Op::SettleOwnedVersion { id, expected, retirement } => Reply::DeploymentCas(directory.settle_owned_version(&id, expected, retirement).await?),
         Op::SettleReferenceDisposal { permit, record, expected } => Reply::DeploymentCas(directory.settle_reference_disposal(&permit, record, expected).await?),
         Op::ChangeLineage { lineage, change } => Reply::LineageState(directory.change_lineage(&lineage, change).await?),
@@ -446,6 +448,11 @@ impl Directory for RemoteDirectory {
     }
     async fn change_lineage(&self, lineage: &str, change: LineageChange) -> Result<LineageState> {
         match self.call(Op::ChangeLineage { lineage: lineage.to_owned(), change }).await? { Reply::LineageState(state) => Ok(state), other => Err(protocol(other)) }
+    }
+    async fn authorize_owned_retirement(&self, id: &str, expected: Version, retirement: LineageRetirement) -> Result<LineageState> {
+        match self.call(Op::AuthorizeOwnedRetirement { id: id.to_owned(), expected, retirement }).await? {
+            Reply::LineageState(state) => Ok(state), other => Err(protocol(other)),
+        }
     }
     async fn settle_owned_version(&self, id: &str, expected: Version, retirement: LineageRetirement) -> Result<Cas<DeploymentRecord>> {
         match self.call(Op::SettleOwnedVersion { id: id.to_owned(), expected, retirement }).await? {

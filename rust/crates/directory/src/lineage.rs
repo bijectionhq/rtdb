@@ -14,6 +14,30 @@ pub struct LineageRetirement {
     pub work: RetirementWork,
 }
 
+impl LineageRetirement {
+    fn matches_owner(&self, owner: &DeploymentRecord) -> bool {
+        let (deployment, target, release) = match &self.work {
+            RetirementWork::S3 { deployment, target, release, .. } | RetirementWork::Tombstones { deployment, target, release, .. } => {
+                (deployment, target, release)
+            }
+            RetirementWork::Local { .. } => return false,
+        };
+        let prefix = format!("{}/", self.source);
+        owner.id == *deployment && owner.storage_prefix() == self.source
+            && target.starts_with(&prefix) && release.starts_with(&prefix) && target != release
+    }
+
+    fn matches_fence(&self, owner: &DeploymentRecord) -> bool {
+        let (target, marker) = match &self.work {
+            RetirementWork::S3 { target, release, release_version, .. } => (target, release_version.as_ref().map(|_| release)),
+            RetirementWork::Tombstones { target, release, .. } => (target, Some(release)),
+            RetirementWork::Local { .. } => return false,
+        };
+        matches!(owner.storage_regions.get(&self.token), Some(StorageRegion::ExactRetirement { object, release })
+            if object == target && release.as_ref() == marker)
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum RetirementWork {
@@ -78,7 +102,6 @@ pub enum LineageChange {
     PrepareHostedFork { preparation: ForkPreparation, task: Option<HostedTask> },
     ReleaseFork { preparation: ForkPreparation },
     ReserveRetirement { retirement: LineageRetirement, observed_references: Version, generation: Version },
-    AuthorizeExactErasure { retirement: LineageRetirement },
     AbandonExactRetirement { retirement: LineageRetirement },
     SettleRetirement { retirement: LineageRetirement },
 }
@@ -188,21 +211,28 @@ impl LineageState {
     }
     pub fn exact_erasure_authorized(&self) -> bool { matches!(self.admission, Admission::Erasing(_)) }
 
+    pub(crate) fn authorize_exact_owned(&self, owner: &DeploymentRecord, retirement: &LineageRetirement) -> Result<Self> {
+        if self.retirement() != Some(retirement) || !retirement.matches_owner(owner) || !retirement.matches_fence(owner)
+            || !matches!(owner.lifecycle, Lifecycle::Live | Lifecycle::Quarantined)
+        {
+            return Err(lineage_busy());
+        }
+        let mut next = self.clone();
+        if !self.exact_erasure_authorized() {
+            next.admission = Admission::Erasing(retirement.clone());
+            next.advance_version()?;
+        }
+        Ok(next)
+    }
+
     pub(crate) fn settle_exact_owned(&self, owner: &DeploymentRecord, retirement: &LineageRetirement) -> Result<(DeploymentRecord, Self)> {
-        let (deployment, target, release) = match &retirement.work {
-            RetirementWork::S3 { deployment, target, release, release_version, .. } => {
-                (deployment, target, release_version.as_ref().map(|_| release))
-            }
-            RetirementWork::Tombstones { deployment, target, release, .. } => (deployment, target, Some(release)),
-            RetirementWork::Local { .. } => return Err(lineage_busy()),
-        };
-        let fence = owner.storage_regions.get(&retirement.token);
-        let matching_fence = matches!(fence, Some(StorageRegion::ExactRetirement { object, release: fenced_release })
-            if object == target && release.is_none_or(|release| fenced_release.as_ref() == Some(release)))
-            || fence.is_none() && release.is_none(); // A legacy attempt may already have cleared its fence.
+        // An older exact-version attempt may already have cleared its data-only fence.
+        let matching_fence = retirement.matches_fence(owner)
+            || matches!(retirement.work, RetirementWork::S3 { release_version: None, .. })
+                && !owner.storage_regions.contains_key(&retirement.token);
         if !reference_revision::may_settle_exact_owned(
             matches!(&self.admission, Admission::Erasing(current) if current == retirement),
-            owner.id == *deployment && owner.storage_prefix() == retirement.source,
+            retirement.matches_owner(owner),
             matching_fence,
         ) { return Err(lineage_busy()); }
         let mut next_owner = owner.clone();
@@ -255,13 +285,6 @@ impl LineageState {
                 }
                 next.retirement_generation = next_reference_revision(self.retirement_generation)?;
                 next.admission = Admission::Retiring(retirement);
-            }
-            LineageChange::AuthorizeExactErasure { retirement } => {
-                if self.retirement() != Some(&retirement) || matches!(retirement.work, RetirementWork::Local { .. }) {
-                    return Err(lineage_busy());
-                }
-                if self.exact_erasure_authorized() { return Ok(next); }
-                next.admission = Admission::Erasing(retirement);
             }
             LineageChange::AbandonExactRetirement { retirement } => {
                 if matches!(retirement.work, RetirementWork::Local { .. })

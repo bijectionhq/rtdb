@@ -226,19 +226,27 @@ async fn exact_retirement(directory: &dyn Directory, parent: &DeploymentRecord, 
     assert_eq!(directory.change_lineage(lineage, LineageChange::PrepareHostedFork { preparation: attempted, task: None }).await.unwrap_err().code,
         "rtdb.directory/lineage-changed");
 
-    directory.change_lineage(lineage, LineageChange::AuthorizeExactErasure { retirement: retirement.clone() }).await.unwrap();
-    assert_eq!(directory.change_lineage(lineage, LineageChange::AbandonExactRetirement { retirement: retirement.clone() }).await.unwrap_err().code,
-        "rtdb.directory/lineage-changed");
-    let current = directory.lineage_state(lineage).await.unwrap();
+    let owner = directory.deployment(&parent.id).await.unwrap().unwrap();
+    assert!(directory.authorize_owned_retirement(&owner.id, owner.version, retirement.clone()).await.is_err());
+    let mut partial = owner.clone();
+    partial.storage_regions.insert(retirement.token, crate::StorageRegion::ExactRetirement { object: target.clone(), release: None });
+    let partial = directory.replace_deployment(partial, owner.version).await.unwrap().applied().unwrap();
+    assert!(directory.authorize_owned_retirement(&owner.id, partial.version, retirement.clone()).await.is_err());
+    let mut fenced = partial.clone();
+    fenced.storage_regions.insert(retirement.token, crate::StorageRegion::ExactRetirement { object: target, release: Some(release) });
+    let fenced = directory.replace_deployment(fenced, partial.version).await.unwrap().applied().unwrap();
+    assert!(directory.authorize_owned_retirement(&owner.id, partial.version, retirement.clone()).await.is_err());
+    assert!(!directory.lineage_state(lineage).await.unwrap().exact_erasure_authorized());
+    assert!(directory.settle_owned_version(&owner.id, fenced.version, retirement.clone()).await.is_err());
+
+    let current = directory.authorize_owned_retirement(&owner.id, fenced.version, retirement.clone()).await.unwrap();
     assert!(current.exact_erasure_authorized());
     assert_eq!(current.retirement(), Some(&retirement));
-    assert!(directory.change_lineage(lineage, settle).await.is_err(), "the lineage cannot reopen without its owner CAS");
-    let owner = directory.deployment(&parent.id).await.unwrap().unwrap();
-    assert!(directory.settle_owned_version(&owner.id, owner.version, retirement.clone()).await.is_err(), "the exact fence is required");
-    let mut fenced = owner.clone();
-    fenced.storage_regions.insert(retirement.token, crate::StorageRegion::ExactRetirement { object: target, release: Some(release) });
-    let fenced = directory.replace_deployment(fenced, owner.version).await.unwrap().applied().unwrap();
-    let wrong = directory.settle_owned_version(&owner.id, owner.version, retirement.clone()).await.unwrap();
+    assert_eq!(directory.authorize_owned_retirement(&owner.id, fenced.version, retirement.clone()).await.unwrap(), current);
+    assert_eq!(directory.change_lineage(lineage, LineageChange::AbandonExactRetirement { retirement: retirement.clone() }).await.unwrap_err().code,
+        "rtdb.directory/lineage-changed");
+    assert!(directory.change_lineage(lineage, settle).await.is_err());
+    let wrong = directory.settle_owned_version(&owner.id, partial.version, retirement.clone()).await.unwrap();
     assert!(matches!(wrong, Cas::Conflict(Some(_))));
     let settled = directory.settle_owned_version(&owner.id, fenced.version, retirement.clone()).await.unwrap().applied().unwrap();
     assert!(!settled.storage_regions.contains_key(&retirement.token));

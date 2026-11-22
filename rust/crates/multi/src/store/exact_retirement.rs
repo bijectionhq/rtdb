@@ -1,7 +1,7 @@
 use std::collections::BTreeSet;
 
 use async_trait::async_trait;
-use rtdb_directory::{DeploymentRecord, Directory, Lifecycle, LineageChange, LineageRetirement, LineageState, RetirementWork, StorageRegion};
+use rtdb_directory::{DeploymentRecord, Directory, Lifecycle, LineageChange, LineageRetirement, LineageState, RetirementWork, StorageRegion, Version};
 use rtdb_format::keys::block_key;
 use rtdb_storage::{Error, ObjectKey, ObjectStore};
 use rtdb_types::{Anomaly, AnomalyCategory, BlockIndex, PhysicalObjectVersion, Result, S3TombstoneTarget};
@@ -168,8 +168,8 @@ async fn finish(directory: &dyn Directory, bucket: &dyn ObjectStore, provider: &
     if !state.exact_erasure_authorized() {
         let ready = prepare(directory, bucket, provider, lineage, retirement, &target, &release, keys, threshold).await;
         match ready {
-            Ok(true) => {
-                if let Err(error) = directory.change_lineage(lineage, LineageChange::AuthorizeExactErasure { retirement: retirement.clone() }).await {
+            Ok(Some(owner_version)) => {
+                if let Err(error) = directory.authorize_owned_retirement(deployment, owner_version, retirement.clone()).await {
                     if directory.lineage_state(lineage).await?.retirement() != Some(retirement) {
                         super::release_region(directory, deployment, retirement.token, false).await?;
                     }
@@ -179,7 +179,7 @@ async fn finish(directory: &dyn Directory, bucket: &dyn ObjectStore, provider: &
             outcome => {
                 directory.change_lineage(lineage, LineageChange::AbandonExactRetirement { retirement: retirement.clone() }).await?;
                 super::release_region(directory, deployment, retirement.token, false).await?;
-                return outcome;
+                return outcome.map(|_| false);
             }
         }
     }
@@ -257,7 +257,7 @@ enum PackReadiness {
 }
 
 async fn prepare(directory: &dyn Directory, bucket: &dyn ObjectStore, provider: &dyn RetirementProvider, lineage: &str, retirement: &LineageRetirement,
-    target: &ObjectKey, release: &ObjectKey, keys: Option<&dyn KeyService>, threshold: i64) -> Result<bool> {
+    target: &ObjectKey, release: &ObjectKey, keys: Option<&dyn KeyService>, threshold: i64) -> Result<Option<Version>> {
     let RetirementWork::S3 { deployment, version, release_version, legacy_receipt, .. } = &retirement.work else { return Err(changed()); };
     let root = ObjectKey::new(&retirement.source)?;
     let Some((store, relative)) = target.as_str().strip_prefix(&format!("{root}/")).and_then(|suffix| suffix.split_once('/'))
@@ -265,26 +265,26 @@ async fn prepare(directory: &dyn Directory, bucket: &dyn ObjectStore, provider: 
     let store = format!("{root}/{store}");
     let markers = ObjectKey::new(format!("{store}/{GARBAGE_DIRECTORY}"))?;
     if !release.is_under(&markers) { return Err(changed()); }
-    let Some(witness) = read_release(bucket, release).await? else { return Ok(false); };
+    let Some(witness) = read_release(bucket, release).await? else { return Ok(None); };
     if witness.target_name() != Some(relative)
         || release_version.as_ref().is_some_and(|expected| witness.release_version.as_ref() != Some(expected))
     {
         return Err(changed());
     }
-    if witness.record.released_at_ms > threshold { return Ok(false); }
+    if witness.record.released_at_ms > threshold { return Ok(None); }
     match (witness.version.as_ref(), legacy_receipt.as_deref(), keys) {
         (Some(observed), None, _) if observed == version => {},
         (None, Some(receipt), Some(keys)) if release_version.is_some() => {
             let owner = directory.deployment(deployment).await?.ok_or_else(changed)?;
             if owner.storage_prefix() != retirement.source
                 || !receipts::verify(bucket, keys, &owner, &store, &witness.record, receipt, version).await?
-            { return Ok(false); }
+            { return Ok(None); }
         }
-        _ => return Ok(false),
+        _ => return Ok(None),
     }
     let pack = if witness.pack.is_some() {
         if release_version.is_none() { return Err(changed()); }
-        let Some(ready) = pack_release_bound(bucket, provider, target, &witness, &markers, threshold).await? else { return Ok(false); };
+        let Some(ready) = pack_release_bound(bucket, provider, target, &witness, &markers, threshold).await? else { return Ok(None); };
         Some(ready)
     } else {
         None
@@ -296,32 +296,32 @@ async fn prepare(directory: &dyn Directory, bucket: &dyn ObjectStore, provider: 
         for referrer in stores(bucket, &record.storage_prefix()).await? {
             let base = Base::load(bucket, &referrer).await?;
             if base.objects.get(relative) == Some(&store) || base.objects.get(release_name) == Some(&store) {
-                return Ok(false);
+                return Ok(None);
             }
         }
     }
 
     if pack.is_some() {
         let base = Base::load(bucket, &store).await?;
-        if base.objects.contains_key(release_name) { return Ok(false); }
-        if matches!(pack, Some(PackReadiness::Covered { .. })) && base.objects.contains_key(relative) { return Ok(false); }
+        if base.objects.contains_key(release_name) { return Ok(None); }
+        if matches!(pack, Some(PackReadiness::Covered { .. })) && base.objects.contains_key(relative) { return Ok(None); }
     }
     let mut observed_successor = None;
     if let Some(PackReadiness::Covered { block, youngest }) = pack {
-        let Some(owner) = deployments.iter().find(|record| record.id == *deployment) else { return Ok(false); };
-        let Some(checkpoint) = owner.checkpoint else { return Ok(false); };
-        if !checkpoint_pack_collectable(block, youngest, Some(checkpoint.block), None) { return Ok(false); }
+        let Some(owner) = deployments.iter().find(|record| record.id == *deployment) else { return Ok(None); };
+        let Some(checkpoint) = owner.checkpoint else { return Ok(None); };
+        if !checkpoint_pack_collectable(block, youngest, Some(checkpoint.block), None) { return Ok(None); }
         let catalog = block_key(BlockIndex(checkpoint.block))?;
         let successor = ObjectKey::new(format!("{store}/{}", block_pack(&catalog)))?;
         match observe_pack_index(bucket, &successor).await {
             Ok(index) if index.version.is_some() && index.value.entries.contains_key(&catalog) => {},
-            Ok(_) | Err(Error::MissingObject(_)) => return Ok(false),
+            Ok(_) | Err(Error::MissingObject(_)) => return Ok(None),
             Err(error) => return Err(error.into()),
         }
         observed_successor = Some(checkpoint);
     }
 
-    crate::admin::update_installation(directory, deployment, |record| {
+    let owner = crate::admin::update_installation(directory, deployment, |record| {
         if record.lineage != lineage || record.storage_prefix() != retirement.source || !can_reap(record)
             || !permits_release(record, &store, &witness.record)
         {
@@ -353,7 +353,7 @@ async fn prepare(directory: &dyn Directory, bucket: &dyn ObjectStore, provider: 
         if release_version.is_some() { released.insert(release_name.to_owned()); }
         base.forget(bucket, &store, &released).await?;
     }
-    Ok(true)
+    Ok(Some(owner.version))
 }
 
 fn changed() -> Anomaly {
@@ -659,9 +659,7 @@ mod tests {
         directory.change_lineage(&owner.lineage, LineageChange::ReserveRetirement {
             retirement: retirement.clone(), observed_references: 0, generation: 0,
         }).await.unwrap();
-        let erasing = directory.change_lineage(&owner.lineage, LineageChange::AuthorizeExactErasure {
-            retirement: retirement.clone(),
-        }).await.unwrap();
+        let erasing = directory.authorize_owned_retirement(&owner.id, fenced.version, retirement.clone()).await.unwrap();
         let server = tokio::spawn(async move {
             let entry = |key: &str, version: &str, latest: bool| format!(
                 "<Version><Key>{key}</Key><VersionId>{version}</VersionId><IsLatest>{latest}</IsLatest></Version>");
@@ -853,7 +851,7 @@ mod tests {
             object: object.to_string(), release: Some(marker.to_string()),
         });
         let owner_fenced = directory.replace_deployment(owner_fenced, owner.version).await.unwrap().applied().unwrap();
-        directory.change_lineage(&owner.lineage, LineageChange::AuthorizeExactErasure { retirement: retirement.clone() }).await.unwrap();
+        directory.authorize_owned_retirement(&owner.id, owner_fenced.version, retirement.clone()).await.unwrap();
 
         let provider = Provider { token: retirement.token, calls: parking_lot::Mutex::new(Vec::new()) };
         let bucket = MemoryStore::default();

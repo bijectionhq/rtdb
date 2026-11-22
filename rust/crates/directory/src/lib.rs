@@ -825,6 +825,8 @@ pub trait Directory: Send + Sync {
         Ok(self.lineage_state(lineage).await?.reference_revision())
     }
     async fn lineage_state(&self, lineage: &str) -> Result<LineageState>;
+    /// Authorizes the reserved effect against the owner revision that established its fence.
+    async fn authorize_owned_retirement(&self, id: &str, expected: Version, retirement: LineageRetirement) -> Result<LineageState>;
     /// Removes the provider-confirmed retirement fence and reopens the lineage together.
     async fn settle_owned_version(&self, id: &str, expected: Version, retirement: LineageRetirement) -> Result<Cas<DeploymentRecord>>;
     async fn begin_reference_disposal(&self, id: &str, expected: Version) -> Result<ReferenceDisposal>;
@@ -876,7 +878,7 @@ fn fork_conflict() -> Anomaly {
 mod reference_revision;
 mod lineage;
 pub use lineage::{ForkPreparation, ForkPublication, LineageChange, LineageRetirement, LineageState, PreparationOwner, ReferenceDisposal, RetirementWork};
-use lineage::StoredLineage;
+use lineage::{StoredLineage, lineage_busy};
 
 const REFERENCE_REVISION_PREFIX: &str = "~reference-revision/";
 
@@ -1037,6 +1039,18 @@ impl Directory for MemoryDirectory {
         let next = current.changed(change)?;
         if next != current {
             state.reference_revisions.insert(lineage.to_owned(), StoredLineage::Current(next.clone()));
+            self.persist(&mut state)?;
+        }
+        Ok(next)
+    }
+    async fn authorize_owned_retirement(&self, id: &str, expected: Version, retirement: LineageRetirement) -> Result<LineageState> {
+        let mut state = self.state()?;
+        let owner = state.deployments.get(id).filter(|owner| owner.version == expected).ok_or_else(lineage_busy)?;
+        let lineage = owner.lineage.clone();
+        let current = state.reference_revisions.get(&lineage).map(StoredLineage::state).unwrap_or_default();
+        let next = current.authorize_exact_owned(owner, &retirement)?;
+        if next != current {
+            state.reference_revisions.insert(lineage, StoredLineage::Current(next.clone()));
             self.persist(&mut state)?;
         }
         Ok(next)

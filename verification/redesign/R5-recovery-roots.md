@@ -155,6 +155,12 @@ The model assumes concurrent publication adds a newer version.
 The integrated hosted path keeps the old version while a current manifest points to its source location.
 Its reservation closes fork, capture and transfer preparation, and its per-object source fence orders inherited reads against provider removal.
 The reaper checks the fresh installed floor, provider identity and current manifests before authorizing erasure.
+The authorization transaction checks the specific owner revision validated during preparation and the matching data and release fences.
+A change to that record before authorization leaves the existing reservation available for revalidation.
+The same owner check covers immutable version removal and never-versioned tombstones.
+The shared directory contract exercises missing fences, incomplete fences and stale owner revisions across local, network and DynamoDB directories.
+TLC explored 31 states, rejected both unsafe authorization mutations and reached settlement after revalidation.
+[Owner authorization model](../tla/OwnedRetirementAuthorization.tla)
 Only a reservation that has issued no provider effect may be abandoned.
 After authorization, retries use the same stored provider version until a fresh inventory confirms it absent.
 The hosted retirement model explored 47 states and rejected four unsafe protocol mutations.
@@ -236,6 +242,15 @@ Cell-store reads and listings treat these tombstones as absent, and a conditiona
 The production reaper can resume an authorized data-and-marker pair from the directory after restart and settles its owner fence and lineage together.
 New retirements remain gated on clean namespace enrollment or independent proof of a historical namespace's publication identities.
 The serving bucket policy must grant conditional replacement to the reaper and keep terminal tombstones outside path collection until residence disposal.
+
+Whole-residence disposal also needs evidence that every retirement write has settled.
+A redundant create-if-absent tombstone request can be harmless while the first tombstone remains visible and recreate the key if the whole residence is purged before that request completes.
+The abortable-upload design records each provider upload before it can apply and closes its identity before settling the retirement.
+A bounded model exercises a redundant request arriving after purge with the upload already closed.
+An untracked retry or early settlement can recreate the disposed key in its negative controls.
+TLC explored 33 states and reached purge with a delayed completion whose closed upload could no longer affect storage.
+The running reaper still needs to connect tombstone writes to that durable drain before admitting new retirements.
+[Disposal composition model](../tla/TombstoneDisposal.tla)
 
 ### Shared fork publication and referrer inventories
 

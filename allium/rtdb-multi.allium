@@ -2397,14 +2397,15 @@ rule SettleNeverVersionedRetirement {
 rule AuthorizeHostedVersionErasure {
     -- The retirement reservation binds the physical version, release marker and source residence together.
     -- The reservation closes fork preparation and publication while the reaper scans the current manifests of the lineage.
-    -- The physical owner's storage region orders new inherited reads of this key against the reservation.
+    -- The physical owner's storage region orders new inherited reads of the affected keys against the reservation.
+    -- Authorization compares the same owner revision and fence that passed the retention checks.
     -- Settlement reopens admission after a complete provider inventory confirms absence of the selected version.
     when: HostedLooseFileReleaseDue(release)
 
     requires: InstalledCatalogFloorCovers(release)
     requires: LineageReservedFor(release)
     requires: NoCurrentManifestReferences(release.physical_key)
-    requires: PhysicalOwnerFencedForObject(release.physical_key)
+    requires: PhysicalOwnerRevisionMatchesValidatedFence(release)
 
     ensures:
         ExactVersionRetirementAuthorized(release)

@@ -101,6 +101,9 @@ mod tests {
         async fn publish_fork(&self, child: DeploymentRecord, expected_parent: Version, preparation: Option<crate::ForkPublication>) -> Result<DeploymentRecord> { self.inner.publish_fork(child, expected_parent, preparation).await }
         async fn lineage_state(&self, lineage: &str) -> Result<crate::LineageState> { self.inner.lineage_state(lineage).await }
         async fn change_lineage(&self, lineage: &str, change: crate::LineageChange) -> Result<crate::LineageState> { self.inner.change_lineage(lineage, change).await }
+        async fn authorize_owned_retirement(&self, id: &str, expected: crate::Version, retirement: crate::LineageRetirement) -> Result<crate::LineageState> {
+            self.inner.authorize_owned_retirement(id, expected, retirement).await
+        }
         async fn settle_owned_version(&self, id: &str, expected: crate::Version, retirement: crate::LineageRetirement) -> Result<crate::Cas<DeploymentRecord>> { self.inner.settle_owned_version(id, expected, retirement).await }
         async fn begin_reference_disposal(&self, id: &str, expected: crate::Version) -> Result<crate::ReferenceDisposal> { self.inner.begin_reference_disposal(id, expected).await }
         async fn settle_reference_disposal(&self, permit: &crate::ReferenceDisposal, record: DeploymentRecord, expected: crate::Version) -> Result<crate::Cas<DeploymentRecord>> { self.inner.settle_reference_disposal(permit, record, expected).await }
