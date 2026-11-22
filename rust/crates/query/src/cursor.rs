@@ -223,9 +223,9 @@ impl PreparedQuery {
         let mut metadata = context.memory.reserve(crate::runtime_schema::allocation_bound(&self.relation)?)?;
         let mut fields = Vec::with_capacity(runtime_schema.schema().len());
         let mut arrays = Vec::with_capacity(runtime_schema.schema().len());
-        let computed = if projection_has_arithmetic(&self.relation) {
+        let computed = if projection_has_computation(&self.relation) {
             let _parameter_fields = context.memory.reserve(rtdb_format::ipc::schema_translation_bound(batch.schema_ref())?)?;
-            let Some(columns) = project_bound_columns(&self.relation, arguments)? else { return Ok(None); };
+            let Some(columns) = project_bound_columns(&self.relation, arguments, &context.memory)? else { return Ok(None); };
             Some(columns)
         } else { None };
         let mut copy_cells = batch.num_rows() > 1 || computed.is_some();
@@ -404,13 +404,13 @@ fn parameter_projection_expression(expression: &Expr) -> bool {
                 || parameter_projection_expression(expr);
             operand(left) && operand(right)
         }
-        _ => false,
+        _ => crate::vector::bound_lowerable(expression),
     })
 }
 
-fn projection_has_arithmetic(mut relation: &Relation) -> bool {
+fn projection_has_computation(mut relation: &Relation) -> bool {
     loop {
-        if relation.expressions().iter().any(|expr| matches!(expr, Expr::Binary { .. })) { return true; }
+        if relation.expressions().iter().any(|expr| !matches!(expr, Expr::Column { .. } | Expr::Parameter { .. })) { return true; }
         match relation.node() {
             RelationNode::Project { input, .. } | RelationNode::Rename { input, .. } => relation = input,
             _ => return false,
@@ -418,10 +418,18 @@ fn projection_has_arithmetic(mut relation: &Relation) -> bool {
     }
 }
 
-fn project_bound_columns(relation: &Relation, arguments: &OwnedBatch) -> Result<Option<Vec<crate::columnar::Column>>> {
-    use crate::columnar::{ColumnBatch, projection::bound_column};
+fn project_bound_columns(
+    relation: &Relation, arguments: &OwnedBatch, memory: &Arc<MemoryBudget>,
+) -> Result<Option<Vec<crate::columnar::Column>>> {
+    use crate::columnar::{Column, ColumnBatch};
 
     let parameters = ColumnBatch::from_owned(arguments.slice(0, 1)?)?;
+    let bound_column = |expr: &Expr, schema: &Schema, input: &[Column]| {
+        if let Some(column) = crate::columnar::projection::bound_column(expr, schema, input, &parameters.columns)? {
+            return Ok(Some(column));
+        }
+        crate::vector::bound_column(expr, schema, input, &parameters.columns, memory)
+    };
     let mut layers = Vec::new();
     let mut relation = relation;
     let empty = Schema::default();
@@ -435,7 +443,7 @@ fn project_bound_columns(relation: &Relation, arguments: &OwnedBatch) -> Result<
             RelationNode::Values { rows } => {
                 let [row] = rows.as_slice() else { return Ok(None); };
                 for expression in row {
-                    let Some(column) = bound_column(expression, &empty, &[], &parameters.columns)? else { return Ok(None); };
+                    let Some(column) = bound_column(expression, &empty, &[])? else { return Ok(None); };
                     columns.push(column);
                 }
                 break relation.schema();
@@ -446,7 +454,7 @@ fn project_bound_columns(relation: &Relation, arguments: &OwnedBatch) -> Result<
     for (output, expressions) in layers.into_iter().rev() {
         let mut projected = Vec::with_capacity(expressions.len());
         for expression in expressions {
-            let Some(column) = bound_column(&expression.expr, schema, &columns, &parameters.columns)? else { return Ok(None); };
+            let Some(column) = bound_column(&expression.expr, schema, &columns)? else { return Ok(None); };
             projected.push(column);
         }
         (schema, columns) = (output, projected);

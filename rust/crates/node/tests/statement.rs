@@ -143,6 +143,72 @@ async fn computed_parameter_projection_uses_arrow_arithmetic_and_preserves_neste
 }
 
 #[tokio::test]
+async fn prepared_vector_projection_reads_arrow_operands_for_division_comparison_and_text() {
+    use arrow_array::{Int64Array, RecordBatch, StringArray, cast::AsArray, types::Int64Type};
+    use arrow_schema::{DataType, Field, Schema};
+    use rtdb_columnar::OwnedBatch;
+
+    let memory = MemoryBudget::new(1 << 24);
+    let context = context(None, &memory);
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("left", DataType::Int64, false),
+        Field::new("right", DataType::Int64, false),
+        Field::new("text", DataType::Utf8, false),
+    ]));
+    let bound = |divisor| {
+        let batch = RecordBatch::try_new(Arc::clone(&schema), vec![
+            Arc::new(Int64Array::from(vec![84])),
+            Arc::new(Int64Array::from(vec![divisor])),
+            Arc::new(StringArray::from(vec!["Straße"])),
+        ]).unwrap();
+        OwnedBatch::new(batch, &memory).unwrap()
+    };
+    let numeric = LogicalType::Scalar(ScalarType::I64);
+    let types = [numeric.clone(), numeric, LogicalType::Scalar(ScalarType::Utf8)];
+    let query = PreparedSql::prepare("SELECT $1 / $2 AS quotient, $1 > $2 AS larger, UPPER($3) AS label",
+        &context, PrepareOptions::default(), ResultSignaturePolicy::Dynamic).unwrap();
+    let mut cursor = query.try_open_parameter_projection(Arc::clone(&context), &bound(2), &types).await.unwrap().unwrap();
+    let output = cursor.next_batch().await.unwrap().unwrap();
+
+    assert_eq!(output.batch().column(0).as_primitive::<Int64Type>().value(0), 42);
+    assert!(output.batch().column(1).as_boolean().value(0));
+    assert_eq!(output.batch().column(2).as_string::<i32>().value(0), "STRASSE");
+    assert!(query.try_open_parameter_projection(context, &bound(0), &types).await.unwrap().is_none());
+}
+
+#[tokio::test]
+async fn prepared_vector_projection_admits_the_masked_utf8_span_before_evaluation() {
+    use arrow_array::{RecordBatch, StringArray};
+    use arrow_buffer::{Buffer, NullBuffer, OffsetBuffer, ScalarBuffer};
+    use arrow_schema::{DataType, Field, Schema};
+    use rtdb_columnar::OwnedBatch;
+
+    let memory = MemoryBudget::new(1 << 20);
+    let context = context(None, &memory);
+    let schema = Arc::new(Schema::new(vec![Field::new("input", DataType::Utf8, true)]));
+    let bound = |masked_bytes| {
+        let strings = StringArray::try_new(
+            OffsetBuffer::new(ScalarBuffer::from(vec![0, masked_bytes])),
+            Buffer::from_vec(vec![b'x'; masked_bytes as usize]),
+            Some(NullBuffer::new_null(1)),
+        ).unwrap();
+        let batch = RecordBatch::try_new(Arc::clone(&schema), vec![Arc::new(strings)]).unwrap();
+        OwnedBatch::new(batch, &memory).unwrap()
+    };
+    let types = [LogicalType::Scalar(ScalarType::Utf8).maybe()];
+    let query = PreparedSql::prepare("SELECT CHAR_LENGTH(UPPER($1)) AS size", &context, PrepareOptions::default(), ResultSignaturePolicy::Dynamic).unwrap();
+
+    let mut small = query.try_open_parameter_projection(Arc::clone(&context), &bound(1), &types).await.unwrap().unwrap();
+    let page = small.next_batch().await.unwrap().unwrap();
+    assert_eq!(page.batch().column(0).null_count(), 1);
+    drop((small, page));
+    assert!(query.try_open_parameter_projection(Arc::clone(&context), &bound(1 << 19), &types).await.unwrap().is_none());
+    let mut cursor = query.open_query_columns_typed(context, vec![Value::Null], &types).await.unwrap();
+    let output = cursor.next_batch().await.unwrap().unwrap();
+    assert_eq!(read_value(output.batch().schema_ref().field(0), output.batch().column(0).as_ref(), 0).unwrap(), Value::Null);
+}
+
+#[tokio::test]
 async fn prepared_parameter_projection_copies_only_the_first_fixed_size_list() {
     use arrow_array::{RecordBatch, cast::AsArray};
     use arrow_schema::Schema;
