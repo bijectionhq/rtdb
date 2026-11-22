@@ -1169,6 +1169,10 @@ async fn prepare_cell_move(
         {
             return Err(conflict());
         }
+        if record.has_live_suffix_pins(now_ms()) {
+            return Err(Anomaly::new(AnomalyCategory::Unavailable, "rtdb.multi/checkpoint-suffix-pinned", "A live checkpoint suffix pin retains this residence"));
+        }
+        record.checkpoint_suffix_pins.clear();
         record.lifecycle = Lifecycle::Moving;
         record.epoch = record.epoch.checked_add(1).ok_or_else(|| {
             Anomaly::fault("rtdb.multi/epoch-exhausted", format!("Installation {} has no remaining writer epochs", record.id))
@@ -1437,6 +1441,10 @@ async fn begin_disposal_at(directory: &dyn Directory, id: &str, incarnation: Opt
         if incarnation.is_some_and(|expected| expected != record.incarnation) {
             return Err(Anomaly::incorrect("rtdb.multi/disposal-identity", "The request names another residence"));
         }
+        if record.has_live_suffix_pins(now_ms()) {
+            return Err(Anomaly::new(AnomalyCategory::Unavailable, "rtdb.multi/checkpoint-suffix-pinned", "A live checkpoint suffix pin retains this residence"));
+        }
+        record.checkpoint_suffix_pins.clear();
         match record.lifecycle {
             Lifecycle::Deleted if record.disposal.is_some() => Ok(()),
             Lifecycle::Deleting => Ok(()),

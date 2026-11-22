@@ -1235,6 +1235,9 @@ pub(crate) async fn restore_checkpoint(
             return Ok(());
         }
         require_capture_open(record, operation)?;
+        if record.has_live_suffix_pins(rtdb_directory::now_ms()) {
+            return Err(unavailable("A live suffix pin still retains serving history"));
+        }
         if !same_incarnation(record, &point)
             || record.checkpoint != Some(point.checkpoint)
             || record.move_from.is_some()
@@ -1341,6 +1344,9 @@ pub(crate) async fn begin_retirement_at(
         }
         if record.lifecycle != Lifecycle::Deleted || record.disposal.is_none() {
             return Err(inconsistent("Recovery retirement requires a serving disposal receipt"));
+        }
+        if record.has_live_suffix_pins(rtdb_directory::now_ms()) {
+            return Err(unavailable("A live suffix pin retains an archived checkpoint"));
         }
         if record.checkpoint_worlds.values().any(|world| world.until.0 > rtdb_directory::now_ms().saturating_mul(1000)) {
             return Err(unavailable("A live world still retains an archived checkpoint"));

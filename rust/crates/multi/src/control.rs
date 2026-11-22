@@ -67,6 +67,15 @@ pub enum Request {
     Snapshot { name: String },
     /// Flush the deployment this node holds and wait for the block's adoption, keeping the holding.
     Flush { name: String },
+    /// Pin the named captured checkpoint through this writer's exact installed basis.
+    PinCheckpointSuffix {
+        name: String,
+        deployment: uuid::Uuid,
+        lease: uuid::Uuid,
+        capture: uuid::Uuid,
+        basis: rtdb_types::TransactionKey,
+        expires_at_ms: i64,
+    },
     /// Publish a compaction a worker produced, as the deployment's holder; the notification is an encoded TriesAdded.
     PublishCompaction { name: String, notification: Vec<u8>, grant: String },
     /// Read a fragment of another node's scan of the deployment, at the fragment's basis (`RefineKeyForLargeDeployments`).
@@ -94,6 +103,7 @@ pub enum Response {
     ReadLoads { loads: Vec<crate::read_width::ReadLoad> },
     Done,
     Flushed { checkpoint: rtdb_directory::Checkpoint },
+    CheckpointSuffixPinned { pin: rtdb_directory::CheckpointSuffixPin },
     Published { position: i64 },
     /// A fragment's rows: length-prefixed Arrow IPC streams, in base64.
     Fragment { batches: String },

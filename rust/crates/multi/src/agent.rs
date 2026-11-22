@@ -10,11 +10,11 @@ use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use parking_lot::Mutex;
-use rtdb_directory::{Cas, Checkpoint, DeploymentRecord, Directory, JournalAnchor, Lifecycle, MemberId, MemberRecord, MemberState, StorageRegion, Version, claim, effective_holder, now_ms, park, suspend_holding};
+use rtdb_directory::{Cas, Checkpoint, CheckpointSuffixPin, DeploymentRecord, Directory, JournalAnchor, Lifecycle, MemberId, MemberRecord, MemberState, StorageRegion, Version, claim, effective_holder, now_ms, park, suspend_holding};
 use rtdb_format::catalog::BlockCatalog;
 use rtdb_node::{Database, Node};
 use rtdb_replication::Role as DriverRole;
-use rtdb_types::{Anomaly, AnomalyCategory, Result, StorageEpoch};
+use rtdb_types::{Anomaly, AnomalyCategory, Result, StorageEpoch, TransactionKey};
 use tokio_util::sync::CancellationToken;
 
 use crate::control::{ACTIVATION_RATE_LIMITED, CLAIM_CONTENDED, Handler, MoveTicket, NODE_UNDER_PRESSURE, NOT_CLAIMABLE, Request, Response};
@@ -558,6 +558,114 @@ impl NodeAgent {
         Ok(Response::Flushed { checkpoint })
     }
 
+    async fn pin_checkpoint_suffix(
+        &self, name: &str, deployment: uuid::Uuid, lease: uuid::Uuid,
+        capture: uuid::Uuid, basis: TransactionKey, expires_at_ms: i64,
+    ) -> Result<Response> {
+        const MAX_PIN_MS: i64 = 60_000;
+        const MAX_PINS: usize = 32;
+        let unavailable = || Anomaly::new(
+            AnomalyCategory::Unavailable, "rtdb.multi/checkpoint-suffix-unavailable",
+            "The exact checkpoint suffix is no longer admissible on this writer",
+        );
+        let now = now_ms();
+        if lease.is_nil() || capture.is_nil() || expires_at_ms <= now || expires_at_ms > now.saturating_add(MAX_PIN_MS) {
+            return Err(unavailable());
+        }
+        let (id, epoch) = self.holdings.lock().get(name).map(|holding| (holding.id.clone(), holding.epoch))
+            .ok_or_else(unavailable)?;
+        if id != deployment.to_string() { return Err(unavailable()); }
+        let member = self.member();
+        let validate = |record: &DeploymentRecord| -> Result<(Checkpoint, String)> {
+            if record.name != name || record.epoch != epoch || record.holder.as_ref() != Some(&member)
+                || record.lifecycle != Lifecycle::Live || record.move_from.is_some()
+                || record.checkpoint_recovery.is_some() || expires_at_ms <= now_ms()
+            {
+                return Err(unavailable());
+            }
+            crate::archive::require_capture_open(record, capture)?;
+            let archived = record.checkpoint_captures.get(&capture).filter(|archived|
+                archived.media_bound && archived.incarnation == record.incarnation
+                && archived.log_epoch == record.log_epoch && archived.checkpoint.root_sha256.is_some()
+            ).ok_or_else(unavailable)?;
+            let checkpoint = archived.checkpoint;
+            if checkpoint.boundary < 0 || basis.system_time.0 <= checkpoint.system_time
+                || record.replica_anchor.as_ref().is_some_and(|anchor|
+                    anchor.root_incarnation != record.incarnation || anchor.interval[0] < 0
+                    || anchor.interval[1] < anchor.interval[0] || anchor.interval[1] > checkpoint.boundary)
+            {
+                return Err(unavailable());
+            }
+            Ok((checkpoint, archived.manifest_sha256.clone().ok_or_else(unavailable)?))
+        };
+        let record = self.directory.deployment(&id).await?.ok_or_else(unavailable)?;
+        let (checkpoint, manifest_sha256) = validate(&record)?;
+        if let Some(prior) = record.checkpoint_suffix_pins.get(&lease) {
+            if prior.capture == capture && prior.manifest_sha256 == manifest_sha256
+                && prior.checkpoint == checkpoint && prior.basis == basis && prior.expires_at_ms == expires_at_ms
+                && prior.incarnation == record.incarnation && prior.log_epoch == record.log_epoch && prior.writer_epoch == epoch
+            {
+                return Ok(Response::CheckpointSuffixPinned { pin: prior.clone() });
+            }
+            return Err(unavailable());
+        }
+        let database = self.node.catalog().database(name)?;
+        let before = database.status();
+        let applied = database.progress().current();
+        let after = database.status();
+        let installed = after.installed.filter(|installed|
+            matches!(after.role, DriverRole::Leading(_)) && before.role == after.role
+            && before.installed == Some(*installed) && installed.source == applied.source_position
+            && applied.tx_key == Some(basis)
+        ).ok_or_else(unavailable)?;
+        let log_epoch = StorageEpoch(record.log_epoch);
+        let replica_through = installed.replica.after_offset(log_epoch);
+        let source_through = installed.source.after_offset(log_epoch);
+        if replica_through <= checkpoint.boundary || source_through <= checkpoint.source { return Err(unavailable()); }
+
+        let members = self.members().await?;
+        let servers = ensemble_servers(&record, &members)?;
+        let stream = rtdb_logkeeper::StreamConfig {
+            write_quorum: crate::deployment::write_quorum(servers.len()), servers,
+            stream: record.stream("replica"), maximum_message_bytes: 4 << 20,
+        };
+        let prefix = record.replica_anchor.as_ref().map(|anchor|
+            rtdb_logkeeper::JournalDigest::from_digest_bytes(stream.stream.clone(), anchor.interval, anchor.digest));
+        let remaining = expires_at_ms.saturating_sub(now_ms()).max(0) as u64;
+        let proof = tokio::time::timeout(Duration::from_millis(remaining),
+            rtdb_logkeeper::certify_committed_prefix(&stream, replica_through, prefix.as_ref())
+        ).await.map_err(|_| unavailable())??;
+        let first_replica = checkpoint.boundary.checked_add(1).ok_or_else(unavailable)?;
+        if proof.interval[0] > first_replica || proof.interval[1] != replica_through {
+            return Err(unavailable());
+        }
+        let pin = CheckpointSuffixPin {
+            capture, manifest_sha256, checkpoint, incarnation: record.incarnation,
+            log_epoch: record.log_epoch, writer_epoch: epoch, basis, replica_through,
+            source_through, journal_interval: proof.interval, journal_sha256: proof.digest_bytes().ok_or_else(unavailable)?,
+            expires_at_ms,
+        };
+        crate::admin::update_installation(self.directory.as_ref(), &id, |current| {
+            let (selected, manifest) = validate(current)?;
+            if selected != pin.checkpoint || manifest != pin.manifest_sha256
+                || current.incarnation != record.incarnation || current.log_epoch != record.log_epoch
+                || current.ensemble != record.ensemble
+            {
+                return Err(unavailable());
+            }
+            if let Some(prior) = current.checkpoint_suffix_pins.get(&lease) {
+                return if prior == &pin { Ok(()) } else { Err(unavailable()) };
+            }
+            let now = now_ms();
+            if expires_at_ms <= now { return Err(unavailable()); }
+            current.checkpoint_suffix_pins.retain(|_, hold| hold.expires_at_ms > now);
+            if current.checkpoint_suffix_pins.len() >= MAX_PINS { return Err(unavailable()); }
+            current.checkpoint_suffix_pins.insert(lease, pin.clone());
+            Ok(())
+        }).await?;
+        Ok(Response::CheckpointSuffixPinned { pin })
+    }
+
     pub async fn park(&self, name: &str) -> Result<Response> { self.park_holding(name, None).await }
 
     async fn park_holding(&self, name: &str, moving: Option<(u64, &MoveTicket)>) -> Result<Response> {
@@ -934,7 +1042,18 @@ impl NodeAgent {
         if !needs_trim || record.recovery_manifest_sha256.is_none() { return; }
         let Some(published) = record.checkpoint else { return; };
         let boundary = published.boundary.min(checkpoint.boundary);
-        let oldest_replay = record.storage_regions.values().filter_map(StorageRegion::first_required_replica).min().unwrap_or(boundary);
+        let now = now_ms();
+        let pinned = record.checkpoint_suffix_pins.values()
+            .filter(|pin| pin.expires_at_ms > now)
+            .map(|pin| {
+                if pin.incarnation == record.incarnation && pin.log_epoch == record.log_epoch {
+                    pin.checkpoint.boundary.checked_add(1).unwrap_or(0)
+                } else {
+                    0
+                }
+            });
+        let oldest_replay = record.storage_regions.values().filter_map(StorageRegion::first_required_replica)
+            .chain(pinned).min().unwrap_or(boundary);
         let Some(through) = replica_trim_through(boundary, oldest_replay).filter(|through| *through > trimmed_through) else { return; };
         let Ok(members) = self.members().await else { return };
         let Ok(servers) = ensemble_servers(&record, &members) else { return };
@@ -951,6 +1070,8 @@ impl NodeAgent {
                 return;
             }
         }
+        // If an anchor already authorized this trim, new pins must start after it.
+        // Otherwise the anchor CAS above and pin admission contend on the same record.
         if rtdb_logkeeper::trim(&stream, rtdb_storage::log::LogOffset(through)).await.is_ok()
             && let Some(holding) = self.holdings.lock().get_mut(name).filter(|holding| holding.id == current.id && holding.epoch == epoch)
         {
@@ -1215,6 +1336,8 @@ impl Handler for NodeAgent {
             Request::SubscribeFresh { name } => self.subscribe_for(&name, SubscriptionUse::FreshQuery).await,
             Request::Snapshot { name } => self.snapshot(&name).await,
             Request::Flush { name } => self.flush(&name).await,
+            Request::PinCheckpointSuffix { name, deployment, lease, capture, basis, expires_at_ms } =>
+                self.pin_checkpoint_suffix(&name, deployment, lease, capture, basis, expires_at_ms).await,
             Request::PublishCompaction { name, notification, grant } => match self.check_node_grant(&grant, &name) { Ok(()) => self.publish_compaction(&name, &notification).await, Err(error) => Err(error) }
             Request::ScanFragment { name, fragment, grant } => match self.check_node_grant(&grant, &name) { Ok(()) => self.scan_fragment(&name, &fragment).await, Err(error) => Err(error) }
         };
