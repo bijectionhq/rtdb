@@ -102,6 +102,25 @@ async fn correlated_scalar_apply_keeps_computed_dependent_vectors() {
 }
 
 #[tokio::test]
+async fn correlated_mark_checks_every_comparison_in_a_coalesced_dependent_page() {
+    let execution = execution(100);
+    let dependent = union(table(1, &[0; 100]), union(table(1, &[1]), table(1, &[2])));
+    let dependent = Arc::new(dependent.filter(Expr::Literal(Value::Bool(true))).unwrap());
+    let eq = |value| Expr::binary(BinaryOp::Eq, column(1), literal(value));
+    let comparison = Expr::Case {
+        branches: vec![(eq(0), Expr::Literal(Value::Bool(false))), (eq(1), Expr::Literal(Value::Bool(true)))],
+        otherwise: Box::new(inverse_equals_one(Expr::binary(BinaryOp::Subtract, column(1), literal(2)))),
+    };
+    let relation = mark(table(0, &[1]), dependent, comparison, true);
+    let runtime = EmittedRelation::derive(Arc::clone(&relation), &execution.context.catalog, &[], &execution.context.memory).unwrap();
+    let mut columns = crate::operators::build_columns(runtime, execution.clone()).await.unwrap().expect("Expected Arrow membership output");
+    let mut pages = open(relation, &execution).await;
+    let error = columns.next_batch().await.err().unwrap();
+    assert_eq!(pages.next_page().await.err().unwrap().code, error.code);
+    assert_eq!(error.code, "xtdb.expression/division-by-zero");
+}
+
+#[tokio::test]
 async fn mark_hashes_eligibility_keys_and_keeps_unknown_marks_in_memory_and_on_disk() {
     let data_type = LogicalType::Scalar(ScalarType::I64).maybe();
     let left_field = field(0,data_type.clone());

@@ -81,6 +81,37 @@ async fn empty_arrow_groups_validate_aggregate_order_types() {
 }
 
 #[tokio::test]
+async fn grouping_wide_arrow_lists_reuses_the_input_reservation() {
+    use arrow_array::RecordBatch;
+    use rtdb_columnar::{OwnedBatch, copy_array, to_field};
+    let execution = execution(64);
+    let memory = &execution.context.memory;
+    let key = Value::List(vec![Value::Utf8("x".repeat(1 << 14))]);
+    let ty = key.logical_type();
+    let input_field = field(0, ty.clone());
+    let schema = Schema::new(vec![input_field.clone()]).unwrap();
+    let input = Arc::new(Relation::new(schema.clone(), RelationNode::Values { rows: vec![] }).unwrap());
+    let group = NamedExpr { field: field(1, ty.clone()), expr: input_field.expression() };
+    let aggregate = count(2, None);
+    let output = Schema::new(vec![group.field.clone(), aggregate.field.clone()]).unwrap();
+    let relation = Arc::new(Relation::new(output, RelationNode::Aggregate {
+        input, groups: vec![group.clone()], aggregates: vec![aggregate.clone()],
+    }).unwrap());
+    let runtime = EmittedRelation::derive(relation, &execution.context.catalog, &[], memory).unwrap();
+    let keys = copy_array(&ty, &vec![key.clone(); 64]).unwrap();
+    let arrow_schema = Arc::new(arrow_schema::Schema::new(vec![to_field(&input_field.name, &ty).unwrap()]));
+    let batch = RecordBatch::try_new(arrow_schema, vec![keys]).unwrap();
+    let batch = ColumnBatch::from_owned(OwnedBatch::new(batch, memory).unwrap()).unwrap();
+    let mut cursor = AggregateCursor::from_batches(Box::new(Batches(Some(batch))), false, schema,
+        vec![group], vec![aggregate], runtime, execution.clone()).unwrap();
+    let _pressure = memory.reserve(memory.limit_bytes() - memory.used_bytes() - (1 << 19)).unwrap();
+    let result = cursor.next_batch().await.unwrap().unwrap();
+    assert_eq!(result.len, 1);
+    assert_eq!(result.columns[0].value(0).unwrap(), key);
+    assert_eq!(result.columns[1].value(0).unwrap(), Value::I64(64));
+}
+
+#[tokio::test]
 async fn global_reductions_emit_arrow_vectors_for_nullable_and_empty_inputs() {
     use arrow_array::{Float64Array, RecordBatch};
     use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};

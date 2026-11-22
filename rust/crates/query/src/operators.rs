@@ -1547,12 +1547,14 @@ impl BatchApplyPlan {
     async fn open_dependent(&self, execution: Execution) -> Result<crate::columnar::BoxBatchCursor> {
         let execution = execution.child(1);
         let runtime = Arc::clone(&self.dependent);
-        match build_columns(Arc::clone(&runtime), execution.clone()).await? {
-            Some(batches) => Ok(batches),
-            None => Ok(crate::columnar::batches_from_pages(
-                build_pages(runtime, execution).await?, self.dependent.schema().len(), Arc::clone(&self.execution.context.memory),
-            )),
+        let consumes_all = matches!(self.kind, ApplyKind::Inner | ApplyKind::Left | ApplyKind::PullMany);
+        if (consumes_all || preserves_page_boundaries(runtime.relation()))
+            && let Some(batches) = build_columns(Arc::clone(&runtime), execution.clone()).await? {
+            return Ok(batches);
         }
+        Ok(crate::columnar::batches_from_pages(
+            build_pages(runtime, execution).await?, self.dependent.schema().len(), Arc::clone(&self.execution.context.memory),
+        ))
     }
 
     async fn documents(&self, mut batch: crate::columnar::ColumnBatch, output: &rtdb_plan::Field) -> Result<crate::columnar::ColumnBatch> {
@@ -1681,6 +1683,16 @@ impl BatchApplyPlan {
         }
         Ok(Some(output))
     }
+}
+
+fn preserves_page_boundaries(relation: &Relation) -> bool {
+    stacker::maybe_grow(128 * 1024, 2 * 1024 * 1024, || match relation.node() {
+        RelationNode::Scan(_) => true,
+        RelationNode::Values { rows } => !rows.is_empty(),
+        RelationNode::Project { input, .. } | RelationNode::Rename { input, .. } | RelationNode::Extend { input, .. } =>
+            preserves_page_boundaries(input),
+        _ => false,
+    })
 }
 
 fn apply_join_bytes(rows: usize, sources: usize) -> Result<usize> {

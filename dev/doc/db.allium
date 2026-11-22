@@ -1869,6 +1869,7 @@ surface QueryAccess {
         -- Compatible join partitions retain flat and nested Arrow layouts in spill files.
         -- Outer joins track unmatched build positions through partition replay.
         -- A correlated query can read Arrow batches from both inputs and gather its output from their selected positions.
+        -- Short-circuiting correlated queries observe the dependent plan's semantic pages.
         -- UNNEST over compatible Arrow list columns expands the selected child positions and gathers their parent payloads by position.
         -- A column table over a compatible Arrow list parameter reads the bound row's child slice as one semantic page.
         -- Its columnar result is split to the transport row limit after the operators have processed the complete page.
