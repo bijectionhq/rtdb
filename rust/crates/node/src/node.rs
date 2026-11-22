@@ -1241,6 +1241,12 @@ impl OwnedReadSession {
     /// The declaration is immutable and present on the same held cut as
     /// its private relation fence.
     pub async fn lifetime_point_duration(&self, relation: &rtdb_types::OwnedRelation) -> Result<Option<i64>> {
+        Ok(self.lifetime_point_policy(relation).await?.map(|floor| floor.duration))
+    }
+
+    pub async fn lifetime_point_policy(
+        &self, relation: &rtdb_types::OwnedRelation,
+    ) -> Result<Option<rtdb_types::OwnedLifetimeFloor>> {
         self.admit_access().await?;
         let database = self.retained_root_context().catalog.database(&self.database)?;
         let [snapshot] = database.partitions.as_slice() else { return Err(lifetime_read_unavailable()); };
@@ -1255,7 +1261,9 @@ impl OwnedReadSession {
         let schema = rtdb_query::read_owned_relation_schema(Arc::clone(&self.context), &self.owner, relation)
             .await?.and_then(|(schema, _)| schema.lifetime_micros())
             .ok_or_else(lifetime_read_unavailable)?;
-        Ok(Some(schema))
+        let floor = rtdb_query::read_owned_lifetime_floor(Arc::clone(&self.context), &self.owner, relation).await?;
+        floor.check(schema, self.present.system_time)?;
+        Ok(Some(floor))
     }
 
     pub fn check_live_point_relation(&self, relation: &rtdb_types::OwnedRelation) -> Result<()> {

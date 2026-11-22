@@ -819,14 +819,14 @@ impl<'a> OpenTransaction<'a> {
         if snapshot.contains_table(&relation.table(owner)) {
             return Err(conflict());
         }
-        if schema.lifetime_micros().is_some() {
+        if let Some(duration) = schema.lifetime_micros() {
             if !relation.is_root_data() || snapshot.contains_table(&relation.unique_table(owner))
                 || snapshot.contains_table(&relation.capacity_table(owner))
             {
                 return Err(lifetime_uncovered());
             }
-            let document = StructFields::from([("_id".into(), Value::Utf8(relation.name().into()))]);
-            self.buffer.put(relation.lifetime_table(owner), document, Interval::ALL)?;
+            let floor = rtdb_types::OwnedLifetimeFloor::at(duration, self.tx_key().system_time)?;
+            self.buffer.put(relation.lifetime_table(owner), floor.record(relation), Interval::ALL)?;
         }
         self.check_capacity_schema(snapshot.clone(), owner, relation, schema).await?;
         self.check_unique_schema(snapshot, owner, relation, schema).await?;
@@ -954,8 +954,8 @@ impl<'a> OpenTransaction<'a> {
             let target = root.as_ref().unwrap_or(relation);
             if new_lifetimes.contains(target) || base.contains_table(&target.lifetime_table(owner)) {
                 match operation {
-                    Operation::Public(TxOp::OwnedDeclareRelation { .. } | TxOp::OwnedInsertDocs { .. }
-                        | TxOp::OwnedCheck { .. })
+                    Operation::Public(TxOp::OwnedDeclareRelation { .. } | TxOp::OwnedDeclarePath { .. }
+                        | TxOp::OwnedInsertDocs { .. } | TxOp::OwnedCheck { .. } | TxOp::OwnedCheckRange { .. })
                     | Operation::OwnedWriteIids { create_only: true, .. } if root.is_none() => (),
                     _ => return Err(lifetime_uncovered()),
                 }
@@ -1698,11 +1698,20 @@ impl<'a> OpenTransaction<'a> {
                 if !create_only { return Err(lifetime_uncovered()); }
                 let created = self.tx_key().system_time;
                 let expires = Timestamp(created.0.checked_add(lifetime).ok_or_else(overflow)?);
+                let context = self.context.query_context(self.snapshot()?, created, &self.options.default_tz, self.trace_parent)?
+                    .with_accelerators(Arc::from([]));
+                let floor = rtdb_query::read_owned_lifetime_floor(Arc::clone(&context), owner, relation).await?;
+                floor.check(lifetime, created)?;
+                let next = rtdb_types::OwnedLifetimeFloor::at(lifetime, created)?;
                 for row in documents.rows() {
                     let id = crate::source::document_id(row, &self.context.memory)?;
-                    if self.read_owned_revision(owner, relation, &id, Interval::ALL).await?.is_some() {
+                    if rtdb_query::owned_purge_floor(Arc::clone(&context), owner, relation, &id).await?.is_some()
+                        || self.read_owned_revision(owner, relation, &id, Interval::ALL).await?.is_some() {
                         return Err(insert_exists());
                     }
+                }
+                if next.expired_created_through > floor.expired_created_through {
+                    self.buffer.put(relation.lifetime_table(owner), next.record(relation), Interval::ALL)?;
                 }
                 return self.put_documents(&table, documents, iids, Some(created), Some(expires),
                     DocumentWrite::Owned { relation, owner, create_only }).await;

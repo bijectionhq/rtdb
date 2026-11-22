@@ -105,6 +105,8 @@ pub(super) async fn read_checkpoint_point_in_context(
         if archived != Some(duration) {
             return Err(unavailable("The held lifetime differs from the archived declaration"));
         }
+        let floor = rtdb_query::read_owned_lifetime_floor(Arc::clone(&context), point.owner, point.relation).await?;
+        floor.check(duration, context.current_time.as_micros()?)?;
     }
     let memory = Arc::clone(&context.memory);
     let Some(mut cursor) = open_owned_point(

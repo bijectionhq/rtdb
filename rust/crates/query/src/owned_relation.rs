@@ -242,6 +242,37 @@ pub async fn open_owned_capacity_point(
     open_owned_table_point(context, relation.capacity_table(owner), id.iid(), Some(id), None, Some(columns), false).await
 }
 
+/// Reads the exact immutable lifetime policy and its current creation floor.
+pub async fn read_owned_lifetime_floor(
+    context: Arc<QueryContext>, owner: &str, relation: &OwnedRelation,
+) -> Result<rtdb_types::OwnedLifetimeFloor> {
+    let malformed = || Anomaly::fault("rtdb.owned/lifetime-floor", "The declared lifetime has no usable expiry floor");
+    if owner.is_empty() || !relation.is_root_data() { return Err(malformed()); }
+    let id = EntityId::String(relation.name().into());
+    let memory = Arc::clone(&context.memory);
+    let columns = ["_id", "duration", "expired_created_through"];
+    let Some(mut cursor) = open_owned_table_point(
+        context, relation.lifetime_table(owner), id.iid(), Some(&id), None, Some(&columns), false,
+    ).await? else { return Err(malformed()); };
+    let mut floor = None;
+    while let Some(batch) = cursor.next_batch().await? {
+        let batch = batch.batch();
+        if batch.num_rows() == 0 { continue; }
+        if floor.is_some() || batch.num_rows() != 1 { return Err(malformed()); }
+        let mut document = rtdb_types::StructFields::new();
+        let mut charges = Vec::with_capacity(columns.len());
+        for name in columns {
+            let (index, field) = batch.schema_ref().column_with_name(name).ok_or_else(malformed)?;
+            let array = batch.column(index).as_ref();
+            let bytes = rtdb_columnar::estimate_read_value_bytes(field, array, 0)?;
+            charges.push(memory.reserve(bytes.saturating_add(4096))?);
+            document.insert(name.into(), rtdb_columnar::read_value(field, array, 0)?);
+        }
+        floor = Some(rtdb_types::OwnedLifetimeFloor::decode(&document, relation)?);
+    }
+    floor.ok_or_else(malformed)
+}
+
 /// Reads the exact declared schema at the caller's admitted cut.
 pub async fn read_owned_relation_schema(
     context: Arc<QueryContext>, owner: &str, relation: &OwnedRelation,
