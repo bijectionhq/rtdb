@@ -3,12 +3,12 @@ use std::{fmt, sync::Arc};
 use futures::future::BoxFuture;
 use rtdb_directory::{Directory, HostedTask};
 use rtdb_flight_sql::{OwnedWorldHost, OwnedWorldRead, WorldCall, WorldIdentityPage, WorldPointResult, WorldPointRow};
-use rtdb_node::{NodeOptions, OwnedWorldPointWitness, OwnedWorldWrite};
+use rtdb_node::{NodeOptions, OwnedWorldPointWitness};
 use rtdb_types::{EntityId, Interval, OwnedRelation, OwnedWorld, Result, Timestamp, TransactionKey};
 use uuid::Uuid;
 
 use crate::{
-    archive::{CheckpointReadResources, HeldCheckpointWorld, WorldArchive, open_held_checkpoint_world, commit_checkpoint_world_batch, commit_checkpoint_world_checked, fork_checkpoint_world_selected},
+    archive::{CheckpointReadResources, HeldCheckpointWorld, WorldArchive, open_held_checkpoint_world, commit_checkpoint_world_batch, validate_checkpoint_world, fork_checkpoint_world_selected},
     capability::attachment_storage,
     deployment::CellStorage,
     keys::KeyService,
@@ -72,22 +72,22 @@ impl OwnedWorldHost for PlacedWorldHost {
         })
     }
 
-    fn commit_world<'a>(&'a self, call: WorldCall<'a>, world: Uuid, writes: Vec<OwnedWorldWrite>, checks: Vec<OwnedWorldPointWitness>, controls: Vec<rtdb_node::HostedControlWrite>, deadline: Timestamp, publication: Option<rtdb_node::OwnedWorldPublication>) -> BoxFuture<'a, Result<TransactionKey>> {
+    fn validate_world<'a>(&'a self, call: WorldCall<'a>, world: Uuid, checks: Vec<OwnedWorldPointWitness>, controls: Vec<rtdb_node::HostedControlWrite>, deadline: Timestamp) -> BoxFuture<'a, Result<TransactionKey>> {
         Box::pin(async move {
             let deployment = self.deployment(&call)?;
-            commit_checkpoint_world_checked(self.directory.as_ref(), &self.storage, call.session, deployment, world, writes, checks, controls, deadline, publication).await
+            validate_checkpoint_world(self.directory.as_ref(), &self.storage, call.session, deployment, world, checks, controls, deadline).await
         })
     }
 
     fn commit_world_batch<'a>(
         &'a self, call: WorldCall<'a>, sections: Vec<rtdb_node::OwnedWorldSection>,
-        root: rtdb_node::OwnedRootSection,
+        root: rtdb_node::OwnedRootSection, fingerprint: [u8; 32],
         controls: Vec<rtdb_node::HostedControlWrite>, deadline: Timestamp,
     ) -> BoxFuture<'a, Result<TransactionKey>> {
         Box::pin(async move {
             let deployment = self.deployment(&call)?;
             commit_checkpoint_world_batch(self.directory.as_ref(), &self.storage, call.session, deployment,
-                sections, root, controls, deadline).await
+                sections, root, fingerprint, controls, deadline).await
         })
     }
 

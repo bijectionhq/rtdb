@@ -60,11 +60,8 @@ impl Service {
                     Ok(Vec::new())
                 }
                 crate::owned_actions::FORK_HELD_WORLD_V2 => Ok(vec![Ok(self.fork_held_world_action(&call, &action.body).await?)]),
-                crate::owned_actions::COMMIT_WORLD_V3 => Ok(vec![Ok(self.commit_world_action(&call, &action.body, crate::owned_actions::WorldCommitFormat::Validation).await?)]),
-                crate::owned_actions::COMMIT_WORLD_DROP_V1 => Ok(vec![Ok(self.commit_world_action(&call, &action.body, crate::owned_actions::WorldCommitFormat::Drop).await?)]),
-                crate::owned_actions::COMMIT_WORLD_CLOCK_V1 => Ok(vec![Ok(self.commit_world_action(&call, &action.body, crate::owned_actions::WorldCommitFormat::Clock).await?)]),
-                crate::owned_actions::COMMIT_HELD_WORLDS_V3 => Ok(vec![Ok(self.commit_world_batch_action(&call, &action.body).await?)]),
-                crate::owned_actions::COMMIT_WORLD_V4 => Ok(vec![Ok(self.commit_world_action(&call, &action.body, crate::owned_actions::WorldCommitFormat::Publication).await?)]),
+                crate::owned_actions::COMMIT_WORLD_V3 => Ok(vec![Ok(self.validate_world_action(&call, &action.body).await?)]),
+                crate::owned_actions::COMMIT_HELD_WORLDS_V4 => Ok(vec![Ok(self.commit_world_batch_action(&call, &action.body).await?)]),
                 crate::owned_actions::READ_OWNED_V1 => Ok(vec![Ok(self.read_owned_action(&call, &action.body).await?)]),
                 "BeginTransaction" => {
                     let _: ActionBeginTransactionRequest = unpack(&action.body)?;

@@ -489,28 +489,18 @@ The final fields are the 22-byte attempt ID, its 32-byte fingerprint, and check-
 The placed owner derives the parent publication from the archived cut. A forward start requires an unchanged original live Root head.
 The response carries the minted 16-byte world followed by the transaction ID and system time as big-endian i64.
 
-`rtdb.owned.CommitHeldWorlds.v3` orders fixed-valid replacements and tombstones in one to eight distinct hosted checkpoint worlds as one source transaction.
-Its request starts with a big-endian i64 deadline, a common 32-byte fingerprint, and a big-endian u16 world count.
-Each world supplies the 16-byte world and original held handle, a u16 witness count and its 16-byte nonces, a 22-byte attempt ID, an i64 expected local clock (MIN for absent), then the overlay groups prefixed by their u32 byte length.
-After the worlds, a single byte selects no Root section (0), Root validation (1), or Root publication (2).
+`rtdb.owned.CommitHeldWorlds.v4` orders one to eight world publications with optional Root facts and checks.
+Its request starts with a big-endian i64 deadline, one 32-byte attempt fingerprint, and a big-endian u16 world count.
+Each world supplies the 16-byte world ID and original held handle, a u16 witness count and its 16-byte nonces, and a 22-byte attempt ID.
+One effect byte follows. Overlay (0) carries the relation groups prefixed with a u32 byte length. Clock advance (1) carries the i64 target. Drop (2) carries no payload.
+The expected prior clock comes from the original hold. Overlay publication advances it by one microsecond. An explicit target must increase it and fit within the ordered commit time.
+After the worlds, a byte selects no Root section (0), Root validation (1), or Root publication (2).
 Kinds 1 and 2 carry the original 16-byte Root hold. Kind 2 also carries its 22-byte attempt ID.
 Next come a u16 Root range witness count and the original handle/nonce pairs, then the u32 byte length and ordered Root fact groups.
 Kind 1 supplies point checks, range checks, or both. Kind 2 also supplies Root inserts, replacements, or deletes.
-A batch with one world requires kind 1 or 2.
-The request ends with the common check-only hosted ownership groups. Every integer is big-endian.
-The placed owner checks the parent pins and Root observations before applying changes. The optional Root head, overlays, local clocks and distinct immutable attempt markers share one transaction key in the usual commit reply.
-
-`rtdb.owned.CommitWorld.v4` publishes an admitted single-world overlay and application clock atomically.
-`rtdb.owned.CommitWorldClock.v1` publishes a clock alone using the same held conditions, deadline, hosted ownership checks, and immutable attempt marker.
-Its body shares the v4 prefix through the expected clock, followed by the target clock as a big-endian i64 and the check-only hosted control groups.
-The target must strictly exceed the held clock and be at or before the ordered commit time.
-`rtdb.owned.CommitWorldDrop.v1` orders a terminal marker and the immutable attempt marker using the same held conditions, deadline and hosted ownership checks.
-Its body shares the v4 prefix through the expected clock and then contains only the check-only hosted control groups.
-The placed archive owner retires the matching Directory pin after the ordered result; the response identifies the terminal transaction.
-The prefix through the witness list matches v3, followed by 22 lowercase hexadecimal attempt ID bytes, a 32-byte request fingerprint, and the expected application clock as signed Int64 (minimum for no local publication).
-A big-endian u32 length frames the existing overlay relation groups, followed by the check-only hosted control groups.
-The ordered resolver validates the original witnesses and advances the expected clock by one microsecond from the prior local clock or archived parent basis.
-It creates the immutable root attempt marker with the same transaction key as the overlay and clock. Administrative overlay operations retain their existing semantics.
+The request ends with the common check-only hosted ownership groups.
+The Root head, local writes, clocks, terminal registrations and immutable attempt markers share one transaction key in the commit reply.
+The placed archive owner retires the exact dropped pins after the ordered result.
 
 === Reading a merged held change feed
 

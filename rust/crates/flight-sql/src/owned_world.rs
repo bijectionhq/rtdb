@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use futures::future::BoxFuture;
 use rtdb_columnar::MemoryReservation;
-use rtdb_node::{Database, NativeSession, Node, OwnedWorldPointWitness, OwnedWorldWrite};
+use rtdb_node::{Database, NativeSession, Node, OwnedWorldPointWitness};
 use rtdb_types::{EntityId, Interval, OwnedRelation, Result, StructFields, Timestamp, TransactionKey, Value};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
@@ -12,10 +12,10 @@ use uuid::Uuid;
 pub trait OwnedWorldHost: std::fmt::Debug + Send + Sync {
     fn open_world_read<'a>(&'a self, call: WorldCall<'a>, world: Uuid) -> BoxFuture<'a, Result<Box<dyn OwnedWorldRead>>>;
     fn fork_world_checked<'a>(&'a self, call: WorldCall<'a>, capture: Uuid, suffix: Option<Uuid>, until: Timestamp, fork: rtdb_node::OwnedWorldFork) -> BoxFuture<'a, Result<(Uuid, TransactionKey)>>;
-    fn commit_world<'a>(&'a self, call: WorldCall<'a>, world: Uuid, writes: Vec<OwnedWorldWrite>, checks: Vec<OwnedWorldPointWitness>, controls: Vec<rtdb_node::HostedControlWrite>, deadline: Timestamp, publication: Option<rtdb_node::OwnedWorldPublication>) -> BoxFuture<'a, Result<TransactionKey>>;
+    fn validate_world<'a>(&'a self, call: WorldCall<'a>, world: Uuid, checks: Vec<OwnedWorldPointWitness>, controls: Vec<rtdb_node::HostedControlWrite>, deadline: Timestamp) -> BoxFuture<'a, Result<TransactionKey>>;
     fn commit_world_batch<'a>(
         &'a self, call: WorldCall<'a>, sections: Vec<rtdb_node::OwnedWorldSection>,
-        root: rtdb_node::OwnedRootSection,
+        root: rtdb_node::OwnedRootSection, fingerprint: [u8; 32],
         controls: Vec<rtdb_node::HostedControlWrite>, deadline: Timestamp,
     ) -> BoxFuture<'a, Result<TransactionKey>>;
 }
