@@ -1326,6 +1326,12 @@ rule ConsumeIntake {
 --
 -- A flush writes one pack and one manifest under the holder's epoch, commits BlockUploaded, then publishes the checkpoint.
 -- The log record is the commit point for readers; the directory checkpoint is the commit point for trimming and cold start.
+--
+-- An owned-point checkpoint world reads one exact transaction from an accepted independent capture.
+-- Its locator binds the deployment, capture, manifest digest and complete transaction key.
+-- Opening a point read requires a published root digest and an admission in the capture's original retention inventory.
+-- The admission holds until the query cursor and its archive I/O drain.
+-- The read loads only the checkpoint closure, with no replay of the serving tail.
 ------------------------------------------------------------
 
 rule FlushOnTailBudget {
