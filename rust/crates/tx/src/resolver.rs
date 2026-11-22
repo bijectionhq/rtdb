@@ -408,10 +408,11 @@ pub struct OpenTransaction<'a> {
     capacity_changes: OwnedCapacityChanges,
     owned_worlds: BTreeMap<Iid, (rtdb_types::OwnedWorld, Arc<MemoryReservation>)>,
     owned_changes: BTreeMap<String, PendingOwnedChanges>,
+    bounded_period_writes: BTreeMap<(rtdb_types::OwnedRelation, rtdb_types::EntityId), Arc<MemoryReservation>>,
 }
 impl<'a> OpenTransaction<'a> {
     fn new(base: Snapshot, key: TransactionKey, options: &'a SubmitOptions, context: &'a ResolveContext) -> Result<Self> {
-        Ok(Self { buffer: TransactionBuffer::new(base, key, Arc::clone(&context.memory))?, options, context, trace_parent: None, unique_changes: OwnedUniqueChanges::default(), capacity_changes: OwnedCapacityChanges::default(), owned_worlds: BTreeMap::new(), owned_changes: BTreeMap::new() })
+        Ok(Self { buffer: TransactionBuffer::new(base, key, Arc::clone(&context.memory))?, options, context, trace_parent: None, unique_changes: OwnedUniqueChanges::default(), capacity_changes: OwnedCapacityChanges::default(), owned_worlds: BTreeMap::new(), owned_changes: BTreeMap::new(), bounded_period_writes: BTreeMap::new() })
     }
     pub fn tx_key(&self) -> TransactionKey { self.buffer.tx_key() }
     pub fn snapshot(&self) -> Result<Snapshot> { self.buffer.snapshot() }
@@ -1532,6 +1533,24 @@ impl<'a> OpenTransaction<'a> {
         Ok(())
     }
 
+    fn reserve_bounded_period_write(
+        &mut self, relation: &rtdb_types::OwnedRelation, id: rtdb_types::EntityId,
+    ) -> Result<()> {
+        let bytes = id.as_value().retained_bytes()?.checked_mul(2)
+            .and_then(|bytes| bytes.checked_add(1024)).ok_or_else(overflow)?;
+        let key = (relation.clone(), id);
+        match self.bounded_period_writes.entry(key) {
+            std::collections::btree_map::Entry::Vacant(entry) => {
+                entry.insert(self.context.memory.reserve(bytes)?);
+                Ok(())
+            }
+            std::collections::btree_map::Entry::Occupied(_) => Err(Anomaly::incorrect(
+                "rtdb.owned/repeated-period",
+                "One ordered transaction may assert one period per complete bounded-period key",
+            )),
+        }
+    }
+
     async fn delete_owned(&mut self, relation: &rtdb_types::OwnedRelation, id: &rtdb_types::EntityId, from: Option<Timestamp>, to: Option<Timestamp>) -> Result<()> {
         if relation.name() == rtdb_types::OWNED_ATTEMPT_RELATION {
             return Err(Anomaly::incorrect("rtdb.owned/immutable-attempt", "Attempt reservations are immutable"));
@@ -1539,10 +1558,11 @@ impl<'a> OpenTransaction<'a> {
         let options = self.options;
         let owner = options.user.as_deref().filter(|owner| !owner.is_empty()).ok_or_else(no_owned_principal)?;
         if relation.world().is_some() || relation.is_world_catalog() { return Err(rtdb_types::OwnedWorld::unavailable()); }
-        if (from.is_some() || to.is_some())
-            && let Some((schema, _retained)) = self.read_owned_schema(owner, relation).await?
-        {
-            schema.require_write_validity(true)?;
+        if let Some((schema, _retained)) = self.read_owned_schema(owner, relation).await? {
+            schema.require_root_write_period(from, to)?;
+            if schema.requires_bounded_period() {
+                self.reserve_bounded_period_write(relation, id.clone())?;
+            }
         }
         let valid = interval(from.unwrap_or(self.tx_key().system_time), to.unwrap_or(Timestamp::MAX))?;
         self.read_owned_revision(owner, relation, id, Interval::ALL).await?;
@@ -1623,6 +1643,7 @@ impl<'a> OpenTransaction<'a> {
             let schema = record.schemas.relation(&root)
                 .ok_or_else(|| Anomaly::incorrect("rtdb.owned/world-undeclared", "World writes require a schema retained from the parent cut"))?;
             if schema.lifetime_micros().is_some() { return Err(lifetime_uncovered()); }
+            if schema.requires_bounded_period() { return Err(unavailable()); }
             schema.require_write_validity(explicit)?;
             for row in documents.rows() {
                 let _scratch = self.context.memory.reserve(Value::document_retained_bytes(row)?
@@ -1638,14 +1659,23 @@ impl<'a> OpenTransaction<'a> {
                 DocumentWrite::Owned { relation, owner, create_only }).await;
         }
         if let Some((schema, _retained)) = self.read_owned_schema(owner, relation).await? {
-            schema.require_write_validity(from.is_some() || to.is_some())?;
+            schema.require_root_write_period(from, to)?;
             if !documents.has_exact_presence() {
                 return Err(Anomaly::incorrect("rtdb.owned/field-presence", "Declared owned writes require exact field presence"));
             }
             for row in documents.rows() {
-                schema.require_write_validity(
-                    row.get("_valid_from").is_some() || row.get("_valid_to").is_some(),
-                )?;
+                let row_bounds = row.get("_valid_from").is_some() || row.get("_valid_to").is_some();
+                if schema.requires_bounded_period() {
+                    if row_bounds {
+                        return Err(Anomaly::incorrect(
+                            "rtdb.owned/validity-policy", "A bounded period belongs to the ordered operation",
+                        ));
+                    }
+                    let id = crate::source::document_id(row, &self.context.memory)?;
+                    self.reserve_bounded_period_write(relation, id)?;
+                } else {
+                    schema.require_write_validity(row_bounds)?;
+                }
                 validate_owned_schema(&schema, row)?;
             }
             if let Some(lifetime) = schema.lifetime_micros() {
