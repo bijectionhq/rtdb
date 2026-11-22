@@ -195,12 +195,13 @@ where
         ));
     }
     let deployment = selected.deployment.to_string();
+    let terminal = terminal.as_ref();
     let admit = |record: &rtdb_directory::DeploymentRecord| {
         if resources.cancellation.is_cancelled() {
             return Err(unavailable("The retained checkpoint read was cancelled"));
         }
         require_capture_open(record, selected.capture)?;
-        if let Some(terminal) = &terminal
+        if let Some(terminal) = terminal
             && (selected.suffix.is_some() || record.checkpoint_transfer_fence.as_deref() != Some(terminal.fence)
                 || record.lifecycle != rtdb_directory::Lifecycle::Restoring
                 || record.epoch != terminal.fence.fenced_writer_epoch)
@@ -236,7 +237,7 @@ where
         Some(selected.capture),
         None,
         |record| admit(record).map(|_| None),
-        |record, _, region| async {
+        |record, _, region| async move {
             resources.cancellation.run_until_cancelled(async {
                 let (capture, suffix) = admit(&record)?;
                 let bucket = archive.bucket(region).await?;
@@ -300,10 +301,10 @@ where
                 let base_basis = base_snapshot.tx_basis()
                     .filter(|basis| basis.system_time.0 == capture.checkpoint.system_time)
                     .ok_or_else(|| inconsistent("The retained checkpoint has a different transaction key"))?;
-                let name = record.name;
+                let name = &record.name;
                 let query_context = |partitions, basis: TransactionKey| {
                     let catalog = CatalogSnapshot::new(
-                        &name,
+                        name,
                         BTreeMap::from([(name.clone(), DatabaseSnapshot {
                             partitions,
                             storage: Arc::clone(&storage),
@@ -333,7 +334,7 @@ where
                     (None, None) => (),
                     _ => return Err(inconsistent("The selected archived suffix is unavailable")),
                 }
-                if let Some(terminal) = &terminal {
+                if let Some(terminal) = terminal {
                     replica_suffix::apply_terminal(
                         terminal.entries, terminal.fence, &mut recovered, &memory,
                     )?;
