@@ -18,6 +18,7 @@ const LEGACY_REPLAY_ABORT: &str = "ASSERT FALSE";
 #[derive(Clone, Debug)]
 pub(crate) enum Operation {
     Public(TxOp),
+    InsertIids { table: TableRef, documents: Documents, iids: Vec<Iid>, valid_from: Option<Timestamp>, valid_to: Option<Timestamp> },
     PutIids { table: TableRef, documents: Documents, iids: Vec<Iid>, valid_from: Option<Timestamp>, valid_to: Option<Timestamp> },
     PutArrowIids { table: TableRef, documents: ArrowDocuments, iids: Vec<Iid>, valid_from: Option<Timestamp>, valid_to: Option<Timestamp> },
     PatchIids { table: TableRef, documents: Documents, iids: Vec<Iid>, valid_from: Option<Timestamp>, valid_to: Option<Timestamp> },
@@ -53,8 +54,8 @@ impl SourceTransaction {
         for operation in &operations {
             let (text, table, ids) = match operation {
                 Operation::Public(TxOp::Sql { sql, .. } | TxOp::SqlBytes { sql, .. }) => (sql.capacity(), None, 0),
-                Operation::Public(TxOp::PutDocs { table, .. } | TxOp::PutArrowDocs { table, .. } | TxOp::PatchDocs { table, .. } | TxOp::DeleteDocs { table, .. } | TxOp::EraseDocs { table, .. }) => (0, Some(table), 0),
-                Operation::PutIids { table, iids, .. } | Operation::PutArrowIids { table, iids, .. } | Operation::PatchIids { table, iids, .. } => (0, Some(table), iids.capacity().checked_mul(16).ok_or_else(overflow)?),
+                Operation::Public(TxOp::InsertDocs { table, .. } | TxOp::PutDocs { table, .. } | TxOp::PutArrowDocs { table, .. } | TxOp::PatchDocs { table, .. } | TxOp::DeleteDocs { table, .. } | TxOp::EraseDocs { table, .. }) => (0, Some(table), 0),
+                Operation::InsertIids { table, iids, .. } | Operation::PutIids { table, iids, .. } | Operation::PutArrowIids { table, iids, .. } | Operation::PatchIids { table, iids, .. } => (0, Some(table), iids.capacity().checked_mul(16).ok_or_else(overflow)?),
                 Operation::Removed(name) => (name.capacity(), None, 0),
             };
             bytes = bytes.checked_add(text).and_then(|size| size.checked_add(ids)).and_then(|size| size.checked_add(table.map_or(0, |table| table.schema.capacity() + table.table.capacity()))).and_then(|size| size.checked_add(256)).ok_or_else(overflow)?;
@@ -251,7 +252,7 @@ impl SourceTransaction {
         let operations = || prefix.into_iter().chain(&self.operations);
         let scratch = operations().try_fold(65_536usize, |bytes, operation| {
             let extra = match operation {
-                Operation::Public(TxOp::PutDocs { documents, .. } | TxOp::PatchDocs { documents, .. }) | Operation::PutIids { documents, .. } | Operation::PatchIids { documents, .. } => documents.rows().iter().try_fold(0usize, |bytes, document| bytes.checked_add(Value::document_retained_bytes(document)?).ok_or_else(overflow))?,
+                Operation::Public(TxOp::InsertDocs { documents, .. } | TxOp::PutDocs { documents, .. } | TxOp::PatchDocs { documents, .. }) | Operation::InsertIids { documents, .. } | Operation::PutIids { documents, .. } | Operation::PatchIids { documents, .. } => documents.rows().iter().try_fold(0usize, |bytes, document| bytes.checked_add(Value::document_retained_bytes(document)?).ok_or_else(overflow))?,
                 Operation::Public(TxOp::PutArrowDocs { documents, .. }) | Operation::PutArrowIids { documents, .. } => {
                     documents.array().len().checked_mul(64).ok_or_else(overflow)?
                 }
@@ -332,14 +333,18 @@ fn operation_value<'a>(operation: &'a Operation, memory: &Arc<MemoryBudget>) -> 
             body.insert("args".into(), if arg_bytes.as_slice().is_empty() { Value::Null } else { Value::Binary(arg_bytes.as_slice().to_vec()) });
             "sql"
         }
-        Operation::Public(TxOp::PutDocs { table, documents, valid_from, valid_to } | TxOp::PatchDocs { table, documents, valid_from, valid_to }) => {
+        Operation::Public(TxOp::InsertDocs { table, documents, valid_from, valid_to } | TxOp::PutDocs { table, documents, valid_from, valid_to } | TxOp::PatchDocs { table, documents, valid_from, valid_to }) => {
             let iids = documents.rows().iter().map(|document| {
                 document_id(document, memory).map(|id| Value::FixedSizeBinary(id.iid().0.to_vec()))
             }).collect::<Result<_>>()?;
             body.insert("iids".into(), Value::List(iids));
             time_fields(&mut body, *valid_from, *valid_to);
             docs = Some((table_name(table), SourceDocuments::Rows(documents)));
-            if matches!(operation, Operation::Public(TxOp::PatchDocs { .. })) { "patch-docs" } else { "put-docs" }
+            match operation {
+                Operation::Public(TxOp::InsertDocs { .. }) => "insert-docs",
+                Operation::Public(TxOp::PatchDocs { .. }) => "patch-docs",
+                _ => "put-docs",
+            }
         }
         Operation::Public(TxOp::PutArrowDocs { table, documents }) => {
             let reader = documents.id_reader()?;
@@ -357,11 +362,15 @@ fn operation_value<'a>(operation: &'a Operation, memory: &Arc<MemoryBudget>) -> 
             docs = Some((table_name(table), SourceDocuments::Arrow(documents)));
             "put-docs"
         }
-        Operation::PutIids { table, documents, iids, valid_from, valid_to } | Operation::PatchIids { table, documents, iids, valid_from, valid_to } => {
+        Operation::InsertIids { table, documents, iids, valid_from, valid_to } | Operation::PutIids { table, documents, iids, valid_from, valid_to } | Operation::PatchIids { table, documents, iids, valid_from, valid_to } => {
             body.insert("iids".into(), Value::List(iids.iter().map(|iid| Value::FixedSizeBinary(iid.0.to_vec())).collect()));
             time_fields(&mut body, *valid_from, *valid_to);
             docs = Some((table_name(table), SourceDocuments::Rows(documents)));
-            if matches!(operation, Operation::PatchIids { .. }) { "patch-docs" } else { "put-docs" }
+            match operation {
+                Operation::InsertIids { .. } => "insert-docs",
+                Operation::PatchIids { .. } => "patch-docs",
+                _ => "put-docs",
+            }
         }
         Operation::Public(TxOp::DeleteDocs { table, ids, valid_from, valid_to }) => {
             body.insert("table".into(), Value::Utf8(table_name(table)));
@@ -892,7 +901,7 @@ impl SourceOperationReader<'_> {
         let body = array.as_any().downcast_ref::<StructArray>().ok_or_else(|| invalid("Transaction operation leg is not a struct"))?;
         let value_fields: &[&str] = match name.as_str() {
             "sql" => &["query", "args"],
-            "put-docs" | "patch-docs" => &["iids", "_valid_from", "_valid_to"],
+            "insert-docs" | "put-docs" | "patch-docs" => &["iids", "_valid_from", "_valid_to"],
             "delete-docs" => &["table", "iids", "_valid_from", "_valid_to"],
             "erase-docs" => &["table", "iids"],
             _ => &[],
@@ -907,7 +916,7 @@ impl SourceOperationReader<'_> {
                 let args = match value("args")? { Value::Null | Value::Undefined => None, Value::Binary(bytes) => Some(decode_arguments(&bytes, memory)?), _ => return Err(invalid("SQL arguments are not IPC bytes")) };
                 TxOp::Sql { sql, args }
             }
-            "put-docs" | "patch-docs" => {
+            "insert-docs" | "put-docs" | "patch-docs" => {
                 let docs_array = body.column_by_name("documents").ok_or_else(|| invalid("Document operation has no documents"))?;
                 let docs_union = docs_array.as_any().downcast_ref::<UnionArray>().ok_or_else(|| invalid("Document tables are not a union"))?;
                 let (table, docs_array, docs_offset) = union_leg(docs_union, offset)?;
@@ -929,7 +938,11 @@ impl SourceOperationReader<'_> {
                     && let Some(documents) = ArrowDocuments::from_source(structs, Arc::clone(&layout), source_bytes, memory)? {
                     return Ok(Operation::PutArrowIids { table, documents, iids: iids.expect("put contains IIDs"), valid_from, valid_to });
                 }
-                let documents = Documents::read_arrow(structs, layout, name == "put-docs", memory)?;
+                let documents = Documents::read_arrow(structs, layout, name != "patch-docs", memory)?;
+                if name == "insert-docs" {
+                    let iids = iids.ok_or_else(|| invalid("Insert operation has no IIDs"))?;
+                    return Ok(Operation::InsertIids { table, documents, iids, valid_from, valid_to });
+                }
                 if name == "put-docs" {
                     if let Some(iids) = iids { return Ok(Operation::PutIids { table, documents, iids, valid_from, valid_to }); }
                     TxOp::PutDocs { table, documents, valid_from, valid_to }
@@ -1066,8 +1079,8 @@ pub(crate) fn is_reserved_write_schema(schema: &str) -> bool {
 }
 fn check_writable_table(operation: &Operation) -> Result<()> {
     let table = match operation {
-        Operation::Public(TxOp::PutDocs { table, .. } | TxOp::PutArrowDocs { table, .. } | TxOp::PatchDocs { table, .. } | TxOp::DeleteDocs { table, .. } | TxOp::EraseDocs { table, .. })
-        | Operation::PutIids { table, .. } | Operation::PutArrowIids { table, .. } | Operation::PatchIids { table, .. } => table,
+        Operation::Public(TxOp::InsertDocs { table, .. } | TxOp::PutDocs { table, .. } | TxOp::PutArrowDocs { table, .. } | TxOp::PatchDocs { table, .. } | TxOp::DeleteDocs { table, .. } | TxOp::EraseDocs { table, .. })
+        | Operation::InsertIids { table, .. } | Operation::PutIids { table, .. } | Operation::PutArrowIids { table, .. } | Operation::PatchIids { table, .. } => table,
         _ => return Ok(()),
     };
     parse_table(&table_name(table))?;

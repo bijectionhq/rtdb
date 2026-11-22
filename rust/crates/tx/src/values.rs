@@ -587,6 +587,7 @@ fn schema_bytes(types: &[LogicalType]) -> Result<usize> {
 pub enum TxOp {
     Sql { sql: String, args: Option<SqlArguments> },
     SqlBytes { sql: String, arg_bytes: RetainedBytes },
+    InsertDocs { table: TableRef, documents: Documents, valid_from: Option<Timestamp>, valid_to: Option<Timestamp> },
     PutDocs { table: TableRef, documents: Documents, valid_from: Option<Timestamp>, valid_to: Option<Timestamp> },
     PutArrowDocs { table: TableRef, documents: ArrowDocuments },
     PatchDocs { table: TableRef, documents: Documents, valid_from: Option<Timestamp>, valid_to: Option<Timestamp> },

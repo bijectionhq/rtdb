@@ -267,6 +267,61 @@ async fn staged_txs_read_your_writes_across_a_batch_and_each_argument_row() {
 }
 
 #[tokio::test]
+async fn create_only_insert_checks_staged_intervals_and_replays_atomic_outcomes() {
+    use rtdb_format::envelope::{ReplicaBody, SourceMessage};
+
+    let state = PartitionState::empty(Default::default()).unwrap();
+    let context = context();
+    let mut resolver = TxResolver::new(None, SourcePosition(-1), None, &context.memory).unwrap();
+    let insert = |id, from, to| TxOp::InsertDocs {
+        table: table(),
+        documents: Documents::new(vec![StructFields::from([
+            ("_id".into(), Value::I64(id)), ("v".into(), Value::I64(id)),
+        ])], &context.memory).unwrap(),
+        valid_from: Some(Timestamp(from)),
+        valid_to: Some(Timestamp(to)),
+    };
+    let logged = |operations| {
+        let bytes = request(operations, &context).encode().unwrap();
+        let message = SourceMessage::decode(bytes.as_slice()).unwrap().unwrap();
+        SourceTransaction::decode(&message, &context.memory).unwrap()
+    };
+
+    let first = resolver.resolve_source(
+        state.snapshot(), SourcePosition(0), Timestamp(100), logged(vec![insert(1, 10, 20)]), &context,
+    ).await.unwrap();
+    assert!(first.result().committed());
+    let adjacent = resolver.resolve_source(
+        state.snapshot(), SourcePosition(1), Timestamp(101), logged(vec![insert(1, 20, 30)]), &context,
+    ).await.unwrap();
+    assert!(adjacent.result().committed());
+    let overlapping = resolver.resolve_source(
+        state.snapshot(), SourcePosition(2), Timestamp(102), logged(vec![insert(2, 10, 20), insert(1, 19, 21)]), &context,
+    ).await.unwrap();
+    assert_eq!(overlapping.result().error().unwrap().code, "rtdb.tx/exists");
+    assert!(!overlapping.writes().tables().contains_key(&table()));
+
+    let intra_transaction = resolver.resolve_source(
+        state.snapshot(), SourcePosition(3), Timestamp(103), logged(vec![insert(3, 10, 20), insert(3, 11, 12)]), &context,
+    ).await.unwrap();
+    assert_eq!(intra_transaction.result().error().unwrap().code, "rtdb.tx/exists");
+    assert!(!intra_transaction.writes().tables().contains_key(&table()));
+
+    let follower = PartitionState::empty(Default::default()).unwrap();
+    for resolved in [first, adjacent, overlapping, intra_transaction] {
+        let body = resolved.to_replica_body(&context.memory).unwrap();
+        let ReplicaBody::ResolvedTx(body) = body.body() else { panic!("expected resolved payload"); };
+        let snapshot = follower.snapshot();
+        let replayed = decode_replica(body, snapshot.tx_basis(), snapshot.block_index(), &context.memory).unwrap();
+        assert_eq!(&replayed.result, resolved.result());
+        follower.apply(&replayed.writes).unwrap();
+    }
+    let snapshot = follower.snapshot();
+    let events = snapshot.segments(&table()).iter().flat_map(|segment| segment.batches()).map(|batch| batch.len()).sum::<usize>();
+    assert_eq!(events, 2);
+}
+
+#[tokio::test]
 async fn staged_snapshot_requires_the_predecessor_and_block_of_each_overlay() {
     let state = PartitionState::empty(Default::default()).unwrap();
     let captured = state.value().snapshot();

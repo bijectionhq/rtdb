@@ -600,8 +600,10 @@ impl<'a> OpenTransaction<'a> {
             }
             Operation::Public(TxOp::PutArrowDocs { table, documents }) => self.put_arrow_documents(table, documents, None, None, None),
             Operation::PutArrowIids { table, documents, iids, valid_from, valid_to } => self.put_arrow_documents(table, documents, Some(iids), *valid_from, *valid_to),
-            Operation::Public(TxOp::PutDocs { table, documents, valid_from, valid_to }) => self.put_documents(table, documents, None, *valid_from, *valid_to),
-            Operation::PutIids { table, documents, iids, valid_from, valid_to } => self.put_documents(table, documents, Some(iids), *valid_from, *valid_to),
+            Operation::Public(TxOp::InsertDocs { table, documents, valid_from, valid_to }) => self.put_documents(table, documents, None, *valid_from, *valid_to, DocumentWrite::Insert).await,
+            Operation::InsertIids { table, documents, iids, valid_from, valid_to } => self.put_documents(table, documents, Some(iids), *valid_from, *valid_to, DocumentWrite::Insert).await,
+            Operation::Public(TxOp::PutDocs { table, documents, valid_from, valid_to }) => self.put_documents(table, documents, None, *valid_from, *valid_to, DocumentWrite::Put).await,
+            Operation::PutIids { table, documents, iids, valid_from, valid_to } => self.put_documents(table, documents, Some(iids), *valid_from, *valid_to, DocumentWrite::Put).await,
             Operation::Public(TxOp::DeleteDocs { table, ids, valid_from, valid_to }) => {
                 check_table(table)?;
                 let interval = interval(valid_from.unwrap_or(self.tx_key().system_time), valid_to.unwrap_or(Timestamp::MAX))?;
@@ -636,7 +638,37 @@ impl<'a> OpenTransaction<'a> {
         let mutation = rtdb_sql::prepare_patch(QualifiedTable { database: self.context.database.clone(), table: table.clone() }, input, TemporalFilter::FromTo { from: Expr::Literal(time_value(interval.lower())), to: Expr::Literal(time_value(interval.upper())) }, &context.catalog)?;
         self.execute_mutation(mutation, context, None, None).await
     }
-    fn put_documents(&mut self, table: &TableRef, documents: &crate::Documents, iids: Option<&[Iid]>, from: Option<Timestamp>, to: Option<Timestamp>) -> Result<()> {
+    async fn require_absent(&self, table: &TableRef, iid: Iid, valid: Interval) -> Result<()> {
+        use rtdb_plan::{Catalog, ColumnId, Expr, Field, QualifiedTable, Relation, Scan, TemporalFilter};
+
+        let snapshot = self.snapshot()?;
+        if !snapshot.contains_table(table) { return Ok(()); }
+        let context = self.context.query_context(snapshot, self.tx_key().system_time, &self.options.default_tz, self.trace_parent)?
+            .with_accelerators(Arc::from([]));
+        let table = context.catalog.table(&QualifiedTable { database: self.context.database.clone(), table: table.clone() })?
+            .ok_or_else(|| Anomaly::fault("rtdb.tx/insert-table", "Insert table disappeared from its ordered snapshot"))?;
+        let field = Field {
+            id: ColumnId(0), name: "_iid".into(), qualifier: None, qualified_only: false, unnamed: false,
+            data_type: table.scan_column_type("_iid"),
+        };
+        let scan = Relation::scan(Scan {
+            table, columns: vec![field],
+            valid_time: TemporalFilter::FromTo { from: Expr::Literal(time_value(valid.lower())), to: Expr::Literal(time_value(valid.upper())) },
+            system_time: TemporalFilter::Default, clamp_valid_time: false,
+            iids: Some([iid].into()), predicates: Vec::new(), top_k: None, ordered_top_k: None, matches: Vec::new(),
+        })?;
+        let query = PreparedQuery::new_in(Arc::new(scan), &context.memory)?;
+        let mut cursor = query.execute(context, Vec::new()).await?;
+        while let Some(batch) = cursor.next_batch().await? {
+            if batch.batch().num_rows() != 0 {
+                return Err(Anomaly::new(AnomalyCategory::Conflict, "rtdb.tx/exists", "Insert overlaps an existing document"));
+            }
+        }
+        Ok(())
+    }
+
+    async fn put_documents(&mut self, table: &TableRef, documents: &crate::Documents, iids: Option<&[Iid]>, from: Option<Timestamp>, to: Option<Timestamp>, write: DocumentWrite) -> Result<()> {
+
         if iids.is_some_and(|iids| iids.len() != documents.rows().len()) { return Err(Anomaly::incorrect("xtdb/invalid-iids", "Document and IID counts differ")); }
         let is_content = |name: &str| !matches!(name, "_valid_from" | "_valid_to");
         for (index, document) in documents.rows().iter().enumerate() {
@@ -645,8 +677,12 @@ impl<'a> OpenTransaction<'a> {
             let default_to = to.unwrap_or(Timestamp::MAX);
             let row_from = document.get("_valid_from").map(|value| timestamp(value, default_from)).transpose()?.unwrap_or(default_from);
             let row_to = document.get("_valid_to").map(|value| timestamp(value, default_to)).transpose()?.unwrap_or(default_to);
+            let valid_time = interval(row_from, row_to)?;
+            if matches!(write, DocumentWrite::Insert) {
+                self.require_absent(table, iid, valid_time).await?;
+            }
             let document = document.iter().filter(|(name, _)| is_content(name)).map(|(name, value)| (name.clone(), value.clone())).collect();
-            self.buffer.append_to(table, StoredEvent { iid, system_from: self.tx_key().system_time, valid_time: interval(row_from, row_to)?, operation: StoredOperation::Put(document), recency: None })?;
+            self.buffer.append_to(table, StoredEvent { iid, system_from: self.tx_key().system_time, valid_time, operation: StoredOperation::Put(document), recency: None })?;
         }
         if let Some(types) = documents.declared_types().filter(|_| !documents.rows().is_empty()) {
             self.buffer.declare_document_types(table, types.iter().filter(|(name, _)| is_content(name)))?;
@@ -772,6 +808,8 @@ async fn execute(input: Arc<rtdb_plan::Relation>, context: Arc<QueryContext>, ar
 fn validate_document_operation(operation: &Operation) -> Result<()> {
     let put_columns = &["_id", "_fn", "_valid_from", "_valid_to"][..];
     let (table, columns, verb, permitted) = match operation {
+        Operation::Public(TxOp::InsertDocs { table, documents, .. }) | Operation::InsertIids { table, documents, .. } =>
+            (table, documents.columns(), "insert", put_columns),
         Operation::Public(TxOp::PutDocs { table, documents, .. }) | Operation::PutIids { table, documents, .. } =>
             (table, documents.columns(), "put", put_columns),
         Operation::Public(TxOp::PutArrowDocs { table, documents }) | Operation::PutArrowIids { table, documents, .. } =>
@@ -793,8 +831,8 @@ fn validate_document_operation(operation: &Operation) -> Result<()> {
 /// Its patch path has no such wrapper.
 fn document_table(operation: &Operation) -> Option<&TableRef> {
     match operation {
-        Operation::Public(TxOp::PutDocs { table, .. } | TxOp::PutArrowDocs { table, .. } | TxOp::DeleteDocs { table, .. } | TxOp::EraseDocs { table, .. })
-        | Operation::PutIids { table, .. } | Operation::PutArrowIids { table, .. } => Some(table),
+        Operation::Public(TxOp::InsertDocs { table, .. } | TxOp::PutDocs { table, .. } | TxOp::PutArrowDocs { table, .. } | TxOp::DeleteDocs { table, .. } | TxOp::EraseDocs { table, .. })
+        | Operation::InsertIids { table, .. } | Operation::PutIids { table, .. } | Operation::PutArrowIids { table, .. } => Some(table),
         _ => None,
     }
 }
@@ -814,6 +852,9 @@ fn interval(from: Timestamp, to: Timestamp) -> Result<Interval> {
     }
     Interval::new(from, to)
 }
+#[derive(Clone, Copy)]
+enum DocumentWrite { Insert, Put }
+
 #[derive(Clone, Copy)]
 enum MutationKind { Put, Delete, Erase }
 

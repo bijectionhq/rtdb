@@ -35,6 +35,8 @@
 -- An idle native session in autocommit mode with write access can reserve an ordered present by awaiting an automatically timed, empty transaction at its submitted position.
 -- The reservation records its transaction outcome, advances the session's await token, and changes no application table.
 -- Transactions that resolve later in that database history use strictly greater system times.
+-- Typed create-only document inserts check absence over their valid-time intervals in the ordered transaction view.
+-- An overlap aborts the entire transaction.
 -- DML evaluates CURRENT_TIMESTAMP at the assigned system time when resolving the ordered transaction.
 -- EPOCH_NANOS_BE(CURRENT_TIMESTAMP) encodes that instant as eight unsigned big-endian bytes without rounding.
 --
