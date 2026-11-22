@@ -5,7 +5,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 pub use rtdb_directory::DeletionRecord;
-use rtdb_directory::{Cas, CellMedia, CellResidence, CellTransfer, CellTransferIntent, PreparedCellTransfer, RetiredResidence, DeletionFacts, DeploymentRecord, DisposalReceipt, DeletionObservation, DeletionInventory, ServingInventory, Directory, ForkPreparation, Lifecycle, LineageChange, MemberId, MemberPool, MemberRecord, MemberRole, MemberState, PlacementMove, StorageNamespaces, effective_holder, now_ms};
+use rtdb_directory::{Cas, CellMedia, CellResidence, CellTransfer, CellTransferIntent, PreparedCellTransfer, RetiredResidence, DeletionFacts, DeploymentRecord, DisposalReceipt, DeletionObservation, DeletionInventory, ServingInventory, Directory, ForkPreparation, ForkPublication, Lifecycle, LineageChange, MemberId, MemberPool, MemberRecord, MemberRole, MemberState, PlacementMove, StorageNamespaces, effective_holder, now_ms};
 use rtdb_logkeeper::StreamConfig;
 use rtdb_storage::log::Log;
 use rtdb_types::{Anomaly, AnomalyCategory, JournalEndpoint, Result};
@@ -443,7 +443,7 @@ async fn fork_source(directory: &dyn Directory, parent: &str) -> Result<Deployme
 struct ForkAccess {
     bucket: crate::reference::Bucket,
     io: Arc<rtdb_storage::IoRegion>,
-    preparation: Option<ForkPreparation>,
+    preparation: ForkPublication,
     maintenance: Option<Arc<std::fs::File>>,
 }
 
@@ -461,9 +461,12 @@ async fn with_fork_access<F: std::future::Future<Output = Result<DeploymentRecor
         let generation = directory.lineage_state(lineage).await?.retirement_generation();
         let preparation = ForkPreparation { token: uuid::Uuid::new_v4(), generation };
         directory.change_lineage(lineage, LineageChange::PrepareFork { preparation, local_volume }).await?;
-        Some(preparation)
+        ForkPublication::Local(preparation)
     } else {
-        None
+        let generation = directory.lineage_state(lineage).await?.open_generation()
+            .ok_or_else(|| Anomaly::new(AnomalyCategory::Busy, "rtdb.multi/reference-disposal-active",
+                "The lineage is closed to new fork preparations"))?;
+        ForkPublication::Remote { generation }
     };
     let io = rtdb_storage::IoRegion::new().child_holding(maintenance.clone().map(|lock| lock as Arc<dyn Send + Sync>));
     let result = async {
@@ -472,7 +475,7 @@ async fn with_fork_access<F: std::future::Future<Output = Result<DeploymentRecor
         operation(ForkAccess { bucket, io: Arc::clone(&io), preparation, maintenance }).await
     }.await;
     io.close_and_wait().await;
-    if result.is_err() && let Some(preparation) = preparation
+    if result.is_err() && let ForkPublication::Local(preparation) = preparation
         && let Err(error) = directory.change_lineage(lineage, LineageChange::ReleaseFork { preparation }).await
     {
         eprintln!("RTDB fork preparation {} is retained: {}", preparation.token, error.code);
@@ -618,14 +621,14 @@ async fn fork_with_tail(directory: &dyn Directory, storage: &CellStorage, access
 
 enum ForkPublicationError { Rejected(Anomaly), Uncertain(Anomaly) }
 
-async fn publish_fork(directory: &dyn Directory, source: &DeploymentRecord, child: &DeploymentRecord, preparation: Option<ForkPreparation>) -> std::result::Result<DeploymentRecord, ForkPublicationError> {
+async fn publish_fork(directory: &dyn Directory, source: &DeploymentRecord, child: &DeploymentRecord, preparation: ForkPublication) -> std::result::Result<DeploymentRecord, ForkPublicationError> {
     for _ in 0..8 {
         let current = directory.deployment(&source.id).await.map_err(ForkPublicationError::Rejected)?
             .filter(|current| current.can_fork() && current.epoch == source.epoch
                 && current.log_epoch == source.log_epoch && current.storage_prefix() == source.storage_prefix()
                 && current.storage_namespaces == child.storage_namespaces && current.engine_pin == child.engine_pin)
             .ok_or_else(|| ForkPublicationError::Rejected(Anomaly::new(AnomalyCategory::Conflict, "rtdb.multi/fork-unavailable", format!("{} changed while the fork was prepared", source.name))))?;
-        match directory.publish_fork(child.clone(), current.version, preparation).await {
+        match directory.publish_fork(child.clone(), current.version, Some(preparation)).await {
             Ok(stored) => return Ok(stored),
             Err(error) if error.code == "rtdb.directory/fork-parent-changed" => continue,
             Err(error) if error.code == "rtdb.directory/lineage-changed" => return Err(ForkPublicationError::Rejected(error)),
@@ -856,7 +859,7 @@ async fn settle_cell_move(
 pub async fn delete_deployment(directory: &dyn Directory, storage: &CellStorage, keys: &dyn KeyService, name: &str, maximum_message_bytes: usize) -> Result<DeletionRecord> {
     let current = record(directory, name).await?;
     if current.lifecycle == Lifecycle::Deleted { return deletion_receipt(current); }
-    let _maintenance = storage.try_local_maintenance()?;
+    let maintenance = storage.try_local_maintenance()?.map(Arc::new);
     let bucket = storage.bucket(rtdb_storage::IoRegion::new()).await?;
     let namespaces = storage_namespaces(bucket.as_ref(), keys).await?;
     let legacy_namespace = if current.lifecycle == Lifecycle::Deleting && current.storage_namespaces.is_none() {
@@ -885,7 +888,7 @@ pub async fn delete_deployment(directory: &dyn Directory, storage: &CellStorage,
     }).await?;
     if fenced.lifecycle == Lifecycle::Deleted { return deletion_receipt(fenced); }
     await_storage_drain(directory, storage, keys, &fenced).await?;
-    finish_disposal_with_lock(directory, storage, keys, &fenced.id, Some(fenced.incarnation), maximum_message_bytes).await?;
+    finish_disposal_with_lock(directory, storage, keys, &fenced.id, Some(fenced.incarnation), maximum_message_bytes, maintenance).await?;
     let deleted = directory.deployment(&fenced.id).await?.ok_or_else(|| deletion_changed(name))?;
     deletion_receipt(deleted)
 }
@@ -1271,6 +1274,15 @@ pub(crate) async fn update_installation(
     id: &str,
     change: impl Fn(&mut DeploymentRecord) -> Result<()>,
 ) -> Result<DeploymentRecord> {
+    update_installation_under_disposal(directory, id, None, change).await
+}
+
+async fn update_installation_under_disposal(
+    directory: &dyn Directory,
+    id: &str,
+    disposal: Option<&rtdb_directory::ReferenceDisposal>,
+    change: impl Fn(&mut DeploymentRecord) -> Result<()>,
+) -> Result<DeploymentRecord> {
     for _ in 0..8 {
         let current = directory.deployment(id).await?.ok_or_else(|| {
             Anomaly::incorrect("rtdb.multi/unknown-installation", format!("No installation has ID {id}"))
@@ -1280,7 +1292,11 @@ pub(crate) async fn update_installation(
         if next == current {
             return Ok(current);
         }
-        if let Cas::Applied(stored) = directory.replace_deployment(next, current.version).await? {
+        let replaced = match disposal {
+            Some(permit) => directory.settle_reference_disposal(permit, next, current.version).await?,
+            None => directory.replace_deployment(next, current.version).await?,
+        };
+        if let Cas::Applied(stored) = replaced {
             return Ok(stored);
         }
     }
@@ -1406,8 +1422,8 @@ pub(crate) async fn finish_disposal_at(
     incarnation: Option<u64>,
     maximum_message_bytes: usize,
 ) -> Result<DisposalReceipt> {
-    let _maintenance = storage.try_local_maintenance()?;
-    finish_disposal_with_lock(directory, storage, keys, id, incarnation, maximum_message_bytes).await
+    let maintenance = storage.try_local_maintenance()?.map(Arc::new);
+    finish_disposal_with_lock(directory, storage, keys, id, incarnation, maximum_message_bytes, maintenance).await
 }
 
 async fn finish_disposal_with_lock(
@@ -1417,6 +1433,7 @@ async fn finish_disposal_with_lock(
     id: &str,
     incarnation: Option<u64>,
     maximum_message_bytes: usize,
+    maintenance: Option<Arc<std::fs::File>>,
 ) -> Result<DisposalReceipt> {
     let mut fenced = directory.deployment(id).await?.ok_or_else(|| {
         Anomaly::incorrect("rtdb.multi/unknown-installation", format!("No installation has ID {id}"))
@@ -1479,7 +1496,8 @@ async fn finish_disposal_with_lock(
     } else {
         administration_stream(directory, &fenced, maximum_message_bytes).await?
     };
-    let bucket = storage.bucket(rtdb_storage::IoRegion::new()).await?;
+    let io = rtdb_storage::IoRegion::new().child_holding(maintenance.map(|lock| lock as Arc<dyn Send + Sync>));
+    let bucket = storage.bucket(io.clone()).await?;
     let namespaces = storage_namespaces(bucket.as_ref(), keys).await?;
     if fenced.storage_namespaces.is_none() {
         let configured = configured_cell_storage(directory, &fenced.name).await?;
@@ -1497,9 +1515,6 @@ async fn finish_disposal_with_lock(
     }
     require_storage_namespaces(&fenced, namespaces)?;
     let prefix = crate::reference::key(&fenced.storage_prefix())?;
-    let others: Vec<DeploymentRecord> = directory.deployments().await?.into_iter()
-        .filter(|record| record.id != fenced.id).collect();
-    crate::reference::require_disjoint_prefix(&prefix, others.iter())?;
     stream.servers.extend(fenced.replica_journals.iter().cloned());
     stream.servers.extend(fenced.log_copy_servers.iter().cloned());
     if let Some(previous) = &fenced.move_from {
@@ -1512,6 +1527,12 @@ async fn finish_disposal_with_lock(
     if !stream.servers.is_empty() {
         stream.servers = retirement_journals(stream.servers, &members(directory).await?)?;
     }
+    if matches!(storage, CellStorage::Local { .. }) {
+        crate::store::recover_local_lineage(directory, &fenced.lineage, storage.custody_namespace()?).await?;
+    }
+    let reference_disposal = directory.begin_reference_disposal(id, fenced.version).await?;
+    let others = deletion_neighbors(directory, &fenced).await?;
+    crate::reference::require_disjoint_prefix(&prefix, others.iter())?;
     stream.write_quorum = write_quorum(stream.servers.len());
     if !stream.servers.is_empty() {
         rtdb_logkeeper::retire(&stream, fenced.epoch).await?;
@@ -1522,11 +1543,12 @@ async fn finish_disposal_with_lock(
             storage, bucket.as_ref(), keys, &fenced, &prefix, &others, namespaces, journals_retired_at_ms,
         ).await?,
         CellStorage::S3 { config } => {
-            let (first, last) = observe_s3_inventory(directory, storage, config, bucket.as_ref(), &fenced).await?;
+            let (first, last) = observe_s3_inventory(directory, storage, config, bucket.as_ref(), &fenced, &others).await?;
             let signed = sign_disposal(&fenced, keys, namespaces, DeletionInventory::AllVersionsAndMultipartUploads, Some(first), last).await?;
             (signed, ServingInventory::S3VersionsAndUploads)
         }
     };
+    io.close_and_wait().await;
     let key_withdrawn_at_ms = signed.facts.key_destroyed_at_ms;
     let receipt = DisposalReceipt {
         deployment: fenced.id,
@@ -1538,7 +1560,7 @@ async fn finish_disposal_with_lock(
         serving_prefix_observed_empty_at_ms: now_ms().max(key_withdrawn_at_ms),
         serving_inventory,
     };
-    let deleted = update_installation(directory, id, |record| {
+    let deleted = update_installation_under_disposal(directory, id, Some(&reference_disposal), |record| {
         if record.epoch != receipt.epoch || record.incarnation != receipt.incarnation
             || record.storage_prefix() != prefix.as_str() || record.storage_namespaces != Some(namespaces)
             || record.disposal.is_none() && (record.replica_journals != fenced.replica_journals
@@ -1678,7 +1700,7 @@ async fn advance_observation(directory: &dyn Directory, deployment: &DeploymentR
 }
 
 async fn observe_s3_inventory(directory: &dyn Directory, storage: &CellStorage, config: &rtdb_s3::S3Config,
-                             bucket: &dyn rtdb_storage::ObjectStore, deployment: &DeploymentRecord) -> Result<(i64, i64)> {
+                             bucket: &dyn rtdb_storage::ObjectStore, deployment: &DeploymentRecord, others: &[DeploymentRecord]) -> Result<(i64, i64)> {
     let first_empty_at_ms = match deployment.deletion_observation {
         Some(DeletionObservation::Verified { first_empty_at_ms, last_empty_at_ms }) => {
             if first_empty_at_ms < 0 || last_empty_at_ms < s3_write_lease_horizon(first_empty_at_ms) || last_empty_at_ms > now_ms() {
@@ -1688,8 +1710,7 @@ async fn observe_s3_inventory(directory: &dyn Directory, storage: &CellStorage, 
         }
         Some(DeletionObservation::Empty { observed_at_ms }) => observed_at_ms,
         Some(DeletionObservation::Fenced { .. }) => {
-            let others = deletion_neighbors(directory, deployment).await?;
-            erase_inventory(storage, bucket, deployment, &others).await?;
+            erase_inventory(storage, bucket, deployment, others).await?;
             let observed_at_ms = now_ms();
             advance_observation(directory, deployment, Some(DeletionObservation::Empty { observed_at_ms })).await?;
             return Err(observation_pending(observed_at_ms));
@@ -2244,6 +2265,63 @@ mod tests {
             .filter(|entry| entry.path().extension().is_some_and(|ext| ext == "key")
                 && entry.metadata().unwrap().len() == crate::keys::KEY_BYTES as u64).count();
         assert_eq!(live_keys, 2);
+    }
+
+    #[tokio::test]
+    async fn disposal_restart_copies_live_referrers_and_rejects_an_old_fork_preparation() {
+        let data = tempfile::tempdir().unwrap();
+        let state = data.path().join("directory");
+        std::fs::create_dir(&state).unwrap();
+        MemoryDirectory::initialize(&state).unwrap();
+        let directory = MemoryDirectory::open(&state).unwrap();
+        let keys = LocalKeyService::new(data.path().join("keys")).unwrap();
+        let storage = CellStorage::Local { root: data.path().join("objects") };
+        let bucket = storage.bucket(rtdb_storage::IoRegion::new()).await.unwrap();
+        let mut source = DeploymentRecord::new("source", "acme", Vec::new(), 0);
+        let namespaces = super::storage_namespaces(bucket.as_ref(), &keys).await.unwrap();
+        source.storage_namespaces = Some(namespaces);
+        let source = directory.create_deployment(source).await.unwrap();
+        keys.key(&source.key_id()).await.unwrap();
+        let object = ObjectKey::new(format!("{}/v06/rows", source.storage_prefix())).unwrap();
+        let bytes = Bytes::from_static(b"rows");
+        bucket.put(&object, bytes.clone()).await.unwrap();
+
+        let destination = super::ForkDestination { name: "child", org: None };
+        let child = super::with_fork_access(directory.as_ref(), &storage, &keys, &source, |access|
+            super::fork_with_tail(directory.as_ref(), &storage, access, &keys, &source, destination, None, Vec::new(), 4 << 20)).await.unwrap();
+        let destination = super::ForkDestination { name: "grandchild", org: None };
+        let old_generation = directory.lineage_state(&child.lineage).await.unwrap().open_generation().unwrap();
+        let preparation = super::ForkPublication::Remote { generation: old_generation };
+        let mut staged = DeploymentRecord::new(destination.name, &child.org, Vec::new(), 0);
+        staged.parent = Some(child.id.clone());
+        staged.lineage.clone_from(&child.lineage);
+        staged.storage_namespaces = child.storage_namespaces;
+        crate::reference::fork(bucket.as_ref(), &child.storage_prefix(), &staged.storage_prefix(), None).await.unwrap();
+
+        let fenced = super::begin_disposal(directory.as_ref(), &source.id).await.unwrap();
+        directory.begin_reference_disposal(&fenced.id, fenced.version).await.unwrap();
+        drop(directory);
+        let directory = MemoryDirectory::open(&state).unwrap();
+        let restarted = directory.lineage_state(&child.lineage).await.unwrap();
+        assert_eq!(restarted.open_generation(), None, "a restarted directory retains the disposal cut");
+        super::finish_disposal(directory.as_ref(), &storage, &keys, &source.id, 4 << 20).await.unwrap();
+        assert_eq!(directory.lineage_state(&child.lineage).await.unwrap().open_generation(), Some(old_generation + 1),
+            "the durable receipt reopens its disposal generation");
+
+        let stale = super::publish_fork(directory.as_ref(), &child, &staged, preparation).await;
+        assert!(matches!(stale, Err(super::ForkPublicationError::Rejected(ref error)) if error.code == "rtdb.directory/lineage-changed"),
+            "a stale preparation cannot publish after disposal");
+        assert!(directory.deployment_by_name(&staged.name).await.unwrap().is_none());
+        super::discard_fork(bucket.as_ref(), &keys, &staged, None).await.unwrap();
+        assert!(matches!(bucket.get(&object).await, Err(rtdb_storage::Error::MissingObject(_))));
+        let copied = ObjectKey::new(format!("{}/v06/rows", child.storage_prefix())).unwrap();
+        assert_eq!(bucket.get(&copied).await.unwrap(), bytes);
+
+        let grandchild = super::with_fork_access(directory.as_ref(), &storage, &keys, &child, |access|
+            super::fork_with_tail(directory.as_ref(), &storage, access, &keys, &child, destination, None, Vec::new(), 4 << 20)).await.unwrap();
+        let child_store = format!("{}/v06", child.storage_prefix());
+        let manifest = crate::reference::Base::load(bucket.as_ref(), &format!("{}/v06", grandchild.storage_prefix())).await.unwrap();
+        assert_eq!(manifest.objects.get("rows"), Some(&child_store));
     }
 
     #[tokio::test]

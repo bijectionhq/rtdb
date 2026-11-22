@@ -1,5 +1,5 @@
 {
-  "summary": "Shared fork parent admission and monotone lineage revision arithmetic.",
+  "summary": "Shared fork parent and preparation admission, monotone lineage revision arithmetic and disposal receipt scope.",
   "flags": [
     "--no-external-by-default",
     "--verify-module",
@@ -7,7 +7,7 @@
     "--verify-module",
     "laws"
   ],
-  "min_verified_functions": 6,
+  "min_verified_functions": 11,
   "controls": {
     "ignore_parent_revision": {
       "defect": "A stale parent revision can publish a fork.",
@@ -172,6 +172,170 @@
         }
       ],
       "min_verified_functions": 5
+    },
+    "ignore_closed_lineage": {
+      "defect": "Drops a premise of may_publish_reference.",
+      "mutate": [
+        {
+          "file": "rust/crates/directory/src/reference_revision.rs",
+          "find": "    open && prepared_at == Some(current)\n",
+          "replace": "    prepared_at == Some(current)\n"
+        }
+      ],
+      "expect": [
+        {
+          "file": "rust/crates/directory/src/reference_revision.rs",
+          "function": "may_publish_reference",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 10
+    },
+    "ignore_closed_lineage_and_contract": {
+      "defect": "Drops the same premise from may_publish_reference and its contract.",
+      "mutate": [
+        {
+          "file": "rust/crates/directory/src/reference_revision.rs",
+          "find": "    open && prepared_at == Some(current)\n",
+          "replace": "    prepared_at == Some(current)\n"
+        },
+        {
+          "file": "rust/crates/directory/src/reference_revision.rs",
+          "find": "ensures accepted <==> open && prepared_at == Some(current),",
+          "replace": "ensures accepted <==> prepared_at == Some(current),"
+        }
+      ],
+      "expect": [
+        {
+          "file": "verification/verus/shared_reference_revision/laws.rs",
+          "function": "a_closed_lineage_refuses_its_current_preparation",
+          "category": "assertion failed"
+        }
+      ],
+      "min_verified_functions": 10
+    },
+    "ignore_preparation_revision": {
+      "defect": "Drops a premise of may_publish_reference.",
+      "mutate": [
+        {
+          "file": "rust/crates/directory/src/reference_revision.rs",
+          "find": "    open && prepared_at == Some(current)\n",
+          "replace": "    open\n"
+        }
+      ],
+      "expect": [
+        {
+          "file": "rust/crates/directory/src/reference_revision.rs",
+          "function": "may_publish_reference",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 10
+    },
+    "ignore_preparation_revision_and_contract": {
+      "defect": "Drops the same premise from may_publish_reference and its contract.",
+      "mutate": [
+        {
+          "file": "rust/crates/directory/src/reference_revision.rs",
+          "find": "    open && prepared_at == Some(current)\n",
+          "replace": "    open\n"
+        },
+        {
+          "file": "rust/crates/directory/src/reference_revision.rs",
+          "find": "ensures accepted <==> open && prepared_at == Some(current),",
+          "replace": "ensures accepted <==> open,"
+        }
+      ],
+      "expect": [
+        {
+          "file": "verification/verus/shared_reference_revision/laws.rs",
+          "function": "an_open_lineage_refuses_a_stale_preparation",
+          "category": "assertion failed"
+        }
+      ],
+      "min_verified_functions": 10
+    },
+    "ignore_disposal_revision": {
+      "defect": "Drops a premise of may_settle_reference_disposal.",
+      "mutate": [
+        {
+          "file": "rust/crates/directory/src/reference_revision.rs",
+          "find": "    current == expected && residence_matches\n",
+          "replace": "    residence_matches\n"
+        }
+      ],
+      "expect": [
+        {
+          "file": "rust/crates/directory/src/reference_revision.rs",
+          "function": "may_settle_reference_disposal",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 10
+    },
+    "ignore_disposal_revision_and_contract": {
+      "defect": "Drops the same premise from may_settle_reference_disposal and its contract.",
+      "mutate": [
+        {
+          "file": "rust/crates/directory/src/reference_revision.rs",
+          "find": "    current == expected && residence_matches\n",
+          "replace": "    residence_matches\n"
+        },
+        {
+          "file": "rust/crates/directory/src/reference_revision.rs",
+          "find": "ensures accepted <==> current == expected && residence_matches,",
+          "replace": "ensures accepted <==> residence_matches,"
+        }
+      ],
+      "expect": [
+        {
+          "file": "verification/verus/shared_reference_revision/laws.rs",
+          "function": "settlement_requires_the_exact_revision_and_residence",
+          "category": "assertion failed"
+        }
+      ],
+      "min_verified_functions": 10
+    },
+    "ignore_disposal_residence": {
+      "defect": "Drops a premise of may_settle_reference_disposal.",
+      "mutate": [
+        {
+          "file": "rust/crates/directory/src/reference_revision.rs",
+          "find": "    current == expected && residence_matches\n",
+          "replace": "    current == expected\n"
+        }
+      ],
+      "expect": [
+        {
+          "file": "rust/crates/directory/src/reference_revision.rs",
+          "function": "may_settle_reference_disposal",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 10
+    },
+    "ignore_disposal_residence_and_contract": {
+      "defect": "Drops the same premise from may_settle_reference_disposal and its contract.",
+      "mutate": [
+        {
+          "file": "rust/crates/directory/src/reference_revision.rs",
+          "find": "    current == expected && residence_matches\n",
+          "replace": "    current == expected\n"
+        },
+        {
+          "file": "rust/crates/directory/src/reference_revision.rs",
+          "find": "ensures accepted <==> current == expected && residence_matches,",
+          "replace": "ensures accepted <==> current == expected,"
+        }
+      ],
+      "expect": [
+        {
+          "file": "verification/verus/shared_reference_revision/laws.rs",
+          "function": "settlement_requires_the_exact_revision_and_residence",
+          "category": "assertion failed"
+        }
+      ],
+      "min_verified_functions": 10
     }
   }
 }

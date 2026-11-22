@@ -18,3 +18,17 @@ pub(super) fn may_publish_fork(parent: u64, expected: u64, can_fork: bool, linea
 pub(super) fn advance_revision(current: u64) -> Option<u64> {
     if current == u64::MAX { None } else { Some(current + 1) }
 }
+
+#[cfg_attr(verus_keep_ghost, verus_spec(accepted =>
+    ensures accepted <==> open && prepared_at == Some(current),
+))]
+pub(super) fn may_publish_reference(current: u64, open: bool, prepared_at: Option<u64>) -> bool {
+    open && prepared_at == Some(current)
+}
+
+#[cfg_attr(verus_keep_ghost, verus_spec(accepted =>
+    ensures accepted <==> current == expected && residence_matches,
+))]
+pub(super) fn may_settle_reference_disposal(current: u64, expected: u64, residence_matches: bool) -> bool {
+    current == expected && residence_matches
+}

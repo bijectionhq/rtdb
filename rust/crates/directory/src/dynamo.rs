@@ -23,8 +23,8 @@ use rtdb_types::{Anomaly, AnomalyCategory, Result};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 
-use crate::{Cas, ChangeFeed, DeploymentRecord, Directory, ForkPreparation, HostedTask, LineageChange, LineageState, MemberId, MemberRecord, REFERENCE_REVISION_PREFIX, Version, exists, fork_conflict, fork_parent_id, require_deployment_name, shared_fork_lineage};
-use crate::lineage::lineage_busy;
+use crate::{Cas, ChangeFeed, DeploymentRecord, Directory, ForkPublication, ReferenceDisposal, HostedTask, LineageChange, LineageState, MemberId, MemberRecord, REFERENCE_REVISION_PREFIX, Version, exists, fork_conflict, fork_parent_id, require_deployment_name, shared_fork_lineage};
+use crate::lineage::{disposal_changed, lineage_busy};
 
 mod parked;
 mod streams;
@@ -339,6 +339,29 @@ impl DynamoDirectory {
         }
     }
 
+    fn require_deployment_version(&self, id: &str, expected_parent: Version) -> Result<TransactWriteItem> {
+        let condition = ConditionCheck::builder().table_name(&self.tables.deployments)
+            .key(ID, AttributeValue::S(id.to_owned()))
+            .condition_expression("#v = :expected")
+            .expression_attribute_names("#v", VERSION)
+            .expression_attribute_values(":expected", number(expected_parent))
+            .build().map_err(build_fault)?;
+        Ok(TransactWriteItem::builder().condition_check(condition).build())
+    }
+
+    async fn write_retirement(&self, items: Vec<TransactWriteItem>) -> Result<bool> {
+        use aws_sdk_dynamodb::operation::transact_write_items::TransactWriteItemsError;
+        match self.client.transact_write_items().set_transact_items(Some(items)).send().await {
+            Ok(_) => Ok(true),
+            Err(error) => match error.as_service_error() {
+                Some(TransactWriteItemsError::TransactionCanceledException(refusal))
+                    if refusal.cancellation_reasons().iter().any(|reason|
+                        matches!(reason.code(), Some("ConditionalCheckFailed" | "TransactionConflict"))) => Ok(false),
+                _ => Err(sdk_anomaly("TransactWriteItems", error)),
+            },
+        }
+    }
+
     async fn read_lineage(&self, lineage: &str) -> Result<(LineageState, bool)> {
         let key = format!("{REFERENCE_REVISION_PREFIX}{lineage}");
         let Some(item) = self.get(&self.tables.deployment_names, NAME, &key).await? else {
@@ -382,17 +405,11 @@ impl Directory for DynamoDirectory {
         self.insert_deployment(record, Vec::new()).await
     }
 
-    async fn publish_fork(&self, child: DeploymentRecord, expected_parent: Version, preparation: Option<ForkPreparation>) -> Result<DeploymentRecord> {
+    async fn publish_fork(&self, child: DeploymentRecord, expected_parent: Version, preparation: Option<ForkPublication>) -> Result<DeploymentRecord> {
         let id = fork_parent_id(&child)?;
         let parent = self.deployment(id).await?.ok_or_else(fork_conflict)?;
         let shared = shared_fork_lineage(&child, Some(&parent), expected_parent)?.is_some();
-        let condition = ConditionCheck::builder().table_name(&self.tables.deployments)
-            .key(ID, AttributeValue::S(id.to_owned()))
-            .condition_expression("#v = :expected")
-            .expression_attribute_names("#v", VERSION)
-            .expression_attribute_values(":expected", number(expected_parent))
-            .build().map_err(build_fault)?;
-        let mut checks = vec![TransactWriteItem::builder().condition_check(condition).build()];
+        let mut checks = vec![self.require_deployment_version(id, expected_parent)?];
         if shared || preparation.is_some() {
             let (state, legacy) = self.read_lineage(&parent.lineage).await?;
             checks.push(self.write_lineage(&parent.lineage, &state.published(preparation, shared)?, state.version(), legacy)?);
@@ -424,6 +441,45 @@ impl Directory for DynamoDirectory {
             }
         }
         Err(lineage_busy())
+    }
+
+    async fn begin_reference_disposal(&self, id: &str, expected: Version) -> Result<ReferenceDisposal> {
+        let owner = self.deployment(id).await?.filter(|owner| owner.version == expected).ok_or_else(disposal_changed)?;
+        let (current, legacy) = self.read_lineage(&owner.lineage).await?;
+        let (permit, next) = current.begin_disposal(&owner)?;
+        if current == next {
+            return Ok(permit);
+        }
+        let items = vec![
+            self.require_deployment_version(id, expected)?,
+            self.write_lineage(&owner.lineage, &next, current.version(), legacy)?,
+        ];
+        if !self.write_retirement(items).await? {
+            return Err(lineage_busy());
+        }
+        Ok(permit)
+    }
+
+    async fn settle_reference_disposal(&self, permit: &ReferenceDisposal, mut record: DeploymentRecord, expected: Version) -> Result<Cas<DeploymentRecord>> {
+        let Some(owner) = self.deployment(&record.id).await? else { return Ok(Cas::Conflict(None)); };
+        if owner.version != expected {
+            return Ok(Cas::Conflict(Some(owner)));
+        }
+        let (current, legacy) = self.read_lineage(&permit.lineage).await?;
+        let next = current.finish_disposal(permit, &owner, &record)?;
+        record.version = expected + 1;
+        let put = Put::builder().table_name(&self.tables.deployments).set_item(Some(deployment_item(&record, self.pack_parked_records)?))
+            .condition_expression("#v = :expected").expression_attribute_names("#v", VERSION)
+            .expression_attribute_values(":expected", number(expected)).build().map_err(build_fault)?;
+        let items = vec![
+            TransactWriteItem::builder().put(put).build(),
+            self.write_lineage(&permit.lineage, &next, current.version(), legacy)?,
+        ];
+        if self.write_retirement(items).await? {
+            Ok(Cas::Applied(record))
+        } else {
+            Ok(Cas::Conflict(self.deployment(&record.id).await?))
+        }
     }
 
     async fn hosted_task_stopped(&self, task: &HostedTask) -> Result<bool> {

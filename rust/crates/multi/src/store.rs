@@ -1365,21 +1365,28 @@ fn can_reap(record: &DeploymentRecord) -> bool {
         && !record.storage_regions.values().any(|region| matches!(region, StorageRegion::Remote { archive: None, closed: true, .. }))
 }
 
-async fn reap_local(directory: &dyn Directory, storage: &CellStorage, maintenance: Arc<File>,
-    candidate: &DeploymentRecord, now_ms: i64, grace: Duration) -> Result<Reaped> {
-    let lineage = &candidate.lineage;
+/// Recovers local admissions while the caller holds the named volume's maintenance lock.
+pub(crate) async fn recover_local_lineage(directory: &dyn Directory, lineage: &str, local_volume: [u8; 32]) -> Result<rtdb_directory::LineageState> {
     let mut state = directory.lineage_state(lineage).await?;
-    let source = candidate.storage_prefix();
-    let local_volume = storage.custody_namespace()?;
     if let Some(previous) = state.retirement().cloned() {
-        if previous.local_volume != local_volume { return Ok(Reaped::default()); }
+        if previous.local_volume != local_volume { return Ok(state); }
         // The same volume lock covers every local sweep and stays held by any detached I/O.
         state = directory.change_lineage(lineage, LineageChange::SettleRetirement { retirement: previous }).await?;
     }
-    for preparation in state.local_preparations(local_volume) {
-        directory.change_lineage(lineage, LineageChange::ReleaseFork { preparation }).await?;
+    let abandoned = state.local_preparations(local_volume).collect::<Vec<_>>();
+    for preparation in abandoned {
+        state = directory.change_lineage(lineage, LineageChange::ReleaseFork { preparation }).await?;
     }
-    if !can_reap(candidate) { return Ok(Reaped::default()); }
+    Ok(state)
+}
+
+async fn reap_local(directory: &dyn Directory, storage: &CellStorage, maintenance: Arc<File>,
+    candidate: &DeploymentRecord, now_ms: i64, grace: Duration) -> Result<Reaped> {
+    let lineage = &candidate.lineage;
+    let source = candidate.storage_prefix();
+    let local_volume = storage.custody_namespace()?;
+    let state = recover_local_lineage(directory, lineage, local_volume).await?;
+    if state.open_generation().is_none() || !can_reap(candidate) { return Ok(Reaped::default()); }
     let io = IoRegion::new().child_holding(Some(maintenance.clone()));
     let bucket = storage.bucket(io.clone()).await?;
     let threshold = now_ms.saturating_sub(grace.as_millis() as i64);

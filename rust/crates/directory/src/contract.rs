@@ -3,7 +3,7 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use crate::{claim, now_ms, park, Cas, DeploymentRecord, Directory, ForkPreparation, Lifecycle, LineageChange, LineageRetirement, MemberId, MemberRecord, MemberRole, MemberState};
+use crate::{claim, now_ms, park, Cas, DeploymentRecord, Directory, DisposalReceipt, ForkPreparation, ForkPublication, Lifecycle, ServingInventory, LineageChange, LineageRetirement, MemberId, MemberRecord, MemberRole, MemberState};
 
 /// Panics on the first violation.
 /// Uses fresh ids and names, so it can run against a shared, non-empty directory.
@@ -97,6 +97,37 @@ pub async fn run(directory: &dyn Directory) {
         assert!(directory.deployment_by_name(&refused.name).await.unwrap().is_none());
     }
 
+    let mut later_fork = DeploymentRecord::new(format!("{name}-after-disposal"), &child.org, vec![], 0);
+    later_fork.parent = Some(child.id.clone());
+    later_fork.lineage.clone_from(&child.lineage);
+    let previous_generation = directory.lineage_state(&child.lineage).await.unwrap().open_generation().unwrap();
+    let stale_cut = ForkPublication::Remote { generation: previous_generation };
+    let next_cut = ForkPublication::Remote { generation: previous_generation + 1 };
+    let permit = directory.begin_reference_disposal(&deleting.id, deleting.version).await.unwrap();
+    assert_eq!(directory.begin_reference_disposal(&deleting.id, deleting.version).await.unwrap(), permit);
+    assert_eq!(directory.lineage_state(&child.lineage).await.unwrap().open_generation(), None);
+    for cut in [None, Some(stale_cut), Some(next_cut)] {
+        let refused = directory.publish_fork(later_fork.clone(), child.version, cut).await.unwrap_err();
+        assert_eq!(refused.code, "rtdb.directory/lineage-changed");
+    }
+    assert!(directory.deployment_by_name(&later_fork.name).await.unwrap().is_none());
+    let mut settled = deleting.clone();
+    settled.lifecycle = Lifecycle::Deleted;
+    assert!(directory.settle_reference_disposal(&permit, settled.clone(), deleting.version).await.is_err());
+    assert_eq!(directory.lineage_state(&child.lineage).await.unwrap().open_generation(), None);
+    settled.disposal = Some(Box::new(DisposalReceipt {
+        deployment: deleting.id.clone(), incarnation: deleting.incarnation, epoch: deleting.epoch,
+        journals: Default::default(), journals_retired_at_ms: 0, key_withdrawn_at_ms: 0,
+        serving_prefix_observed_empty_at_ms: 0, serving_inventory: ServingInventory::LocalDirectory,
+    }));
+    directory.settle_reference_disposal(&permit, settled, deleting.version).await.unwrap().applied().unwrap();
+    assert_eq!(directory.lineage_state(&child.lineage).await.unwrap().open_generation(), Some(previous_generation + 1));
+    let stale = directory.publish_fork(later_fork.clone(), child.version, Some(stale_cut)).await.unwrap_err();
+    assert_eq!(stale.code, "rtdb.directory/lineage-changed");
+    assert!(directory.deployment(&later_fork.id).await.unwrap().is_none());
+    assert!(directory.deployment_by_name(&later_fork.name).await.unwrap().is_none());
+    directory.publish_fork(later_fork, child.version, Some(next_cut)).await.unwrap();
+
     let member = MemberRecord { id: MemberId(format!("member-{suffix}")), role: MemberRole::Node, address: "127.0.0.1:1".into(), control_address: Some("127.0.0.1:2".into()),
         availability_zone: "a".into(), engine_version: "0".into(), lease_expires_at_ms: 10, state: MemberState::Joining, drain_target_engine: None, pool: Default::default(), storage_namespaces: None, version: 0 };
     let registered = directory.register_member(member.clone()).await.unwrap();
@@ -131,7 +162,7 @@ async fn local_retirement(directory: &dyn Directory, parent: &DeploymentRecord, 
     let mut child = DeploymentRecord::new(format!("{name}-prepared"), &parent.org, vec![], 0);
     child.parent = Some(parent.id.clone());
     child.lineage.clone_from(lineage);
-    directory.publish_fork(child, parent.version, Some(preparation)).await.unwrap();
+    directory.publish_fork(child, parent.version, Some(crate::ForkPublication::Local(preparation))).await.unwrap();
     assert_eq!(directory.change_lineage(lineage, reserve).await.unwrap_err().code, "rtdb.directory/lineage-changed");
 
     let published = directory.lineage_state(lineage).await.unwrap();
@@ -146,12 +177,12 @@ async fn local_retirement(directory: &dyn Directory, parent: &DeploymentRecord, 
     assert_eq!(directory.create_fork(late.clone(), parent.version).await.unwrap_err().code, "rtdb.directory/lineage-changed");
     directory.change_lineage(lineage, LineageChange::SettleRetirement { retirement }).await.unwrap();
     assert_eq!(directory.change_lineage(lineage, prepare).await.unwrap_err().code, "rtdb.directory/lineage-changed");
-    assert_eq!(directory.publish_fork(late.clone(), parent.version, Some(preparation)).await.unwrap_err().code, "rtdb.directory/lineage-changed");
+    assert_eq!(directory.publish_fork(late.clone(), parent.version, Some(crate::ForkPublication::Local(preparation))).await.unwrap_err().code, "rtdb.directory/lineage-changed");
     assert!(directory.deployment(&late.id).await.unwrap().is_none());
 
     let current = ForkPreparation { token: uuid::Uuid::new_v4(), generation: generation + 1 };
     directory.change_lineage(lineage, LineageChange::PrepareFork { preparation: current, local_volume }).await.unwrap();
-    directory.publish_fork(late, parent.version, Some(current)).await.unwrap();
+    directory.publish_fork(late, parent.version, Some(crate::ForkPublication::Local(current))).await.unwrap();
 }
 
 /// `EveryEpochHasOneClaimant` under contention: in each round, every claimant reads the deployment and races its claim through one of `directories`, and exactly one wins.

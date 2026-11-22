@@ -151,9 +151,11 @@ impl ObservedDirectory {
 #[async_trait::async_trait]
 impl Directory for ObservedDirectory {
     async fn create_deployment(&self, record: DeploymentRecord) -> Result<DeploymentRecord> { self.inner.create_deployment(record).await }
-    async fn publish_fork(&self, child: DeploymentRecord, expected: rtdb_directory::Version, preparation: Option<rtdb_directory::ForkPreparation>) -> Result<DeploymentRecord> { self.inner.publish_fork(child, expected, preparation).await }
+    async fn publish_fork(&self, child: DeploymentRecord, expected: rtdb_directory::Version, preparation: Option<rtdb_directory::ForkPublication>) -> Result<DeploymentRecord> { self.inner.publish_fork(child, expected, preparation).await }
     async fn lineage_state(&self, lineage: &str) -> Result<rtdb_directory::LineageState> { self.inner.lineage_state(lineage).await }
     async fn change_lineage(&self, lineage: &str, change: rtdb_directory::LineageChange) -> Result<rtdb_directory::LineageState> { self.inner.change_lineage(lineage, change).await }
+    async fn begin_reference_disposal(&self, id: &str, expected: rtdb_directory::Version) -> Result<rtdb_directory::ReferenceDisposal> { self.inner.begin_reference_disposal(id, expected).await }
+    async fn settle_reference_disposal(&self, permit: &rtdb_directory::ReferenceDisposal, record: DeploymentRecord, expected: rtdb_directory::Version) -> Result<rtdb_directory::Cas<DeploymentRecord>> { self.inner.settle_reference_disposal(permit, record, expected).await }
     async fn deployment(&self, id: &str) -> Result<Option<DeploymentRecord>> {
         self.reads.fetch_add(1, Ordering::Relaxed);
         self.inner.deployment(id).await

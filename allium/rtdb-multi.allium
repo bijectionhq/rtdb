@@ -2135,6 +2135,9 @@ rule Fork {
     -- The child, its name and the cell-local shared-reference revision publish atomically.
     -- A fork of a fork advances the same revision as the original lineage.
     -- A local fork acquires a preparation in the current lineage generation before reading storage and consumes it when the child publishes.
+    -- A remote fork observes the open lineage generation before reading storage.
+    -- The publication transaction requires that generation and an open lineage.
+    -- An intervening retirement therefore requires fresh preparation.
     -- Local preparation, publication and reclamation hold the same volume maintenance lock through their admitted provider work.
     when: ForkRequested(parent, basis, org)
 
@@ -2290,19 +2293,24 @@ rule RefreshScopedS3Session {
 }
 
 rule TransferSharedObjects {
-    -- Objects of the deleted deployment still referenced by another live deployment in its lineage move to that deployment's ownership by re-wrapping their data keys; no bytes are copied.
+    -- Disposal closes fork publication under the current version of the drained physical residence.
+    -- The close advances the lineage generation and survives interrupted attempts.
+    -- The referrer inventory is loaded after the close. Each surviving referrer receives the bytes under its own prefix.
     when: DeletionDue(record)
+
+    requires: ServingStorageRegionsDrained(record)
 
     ensures:
         for object in OwnedBy(record) where ReferencedByAnotherLiveMember(record.lineage, object):
-            DataKeyRewrapped(object, to: FirstLiveReferrer(record.lineage, object))
-        BumpLineageVersion(record.lineage)
+            for referrer in LiveReferrers(record.lineage, object):
+                CopyInto(referrer.storage_root.prefix, object)
 }
 
 rule EraseAndProve {
     -- If the inventory still contains objects, the deployment remains deleting and can retry with the same epoch.
     -- A destroyed key cannot be installed or allocated again under the same deployment identity in that cell.
-    -- The terminal CAS keeps the signed receipt with the tombstone so a retry returns the same receipt.
+    -- The terminal transaction keeps the signed receipt with the tombstone and reopens the exact lineage disposal together.
+    -- A retry returns the same receipt.
     when: SharedObjectsTransferred(record)
 
     requires: DeploymentPrefixIsDisjoint(record)
@@ -2312,7 +2320,7 @@ rule EraseAndProve {
     ensures:
         RetireReplicaJournals(record.id, record.epoch, AllRecordedJournals(record))
         AbortMultipartUploadsUnder(record.storage_root.prefix)
-        DeleteAllVersionsUnder(record.storage_root.prefix, except: TransferredObjects(record))
+        DeleteAllVersionsUnder(record.storage_root.prefix)
         AwaitEmptyInventory(record.storage_root.prefix, twice_separated_by: config.credential_ttl)
         KeyService.destroy(record.key_id)
         let proof = DeletionRecord(deployment: record.id, epoch: record.epoch, inventory_scope: all_versions_and_multipart_uploads, signature: SignedByCell())
@@ -2322,6 +2330,7 @@ rule EraseAndProve {
 rule PublishInventoryReceipt {
     -- A local store attests to the current inventory.
     -- An S3 store attests to its multipart and version inventories after aborting uploads and removing data versions and delete markers.
+    -- The receipt and the reopening of the matching physical disposal are atomic.
     when: InventoryEmptied(record, namespaces, inventory_scope)
 
     requires: record.lifecycle = deleting

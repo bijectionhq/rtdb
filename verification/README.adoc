@@ -242,6 +242,8 @@ It also exercises the Azure adapter against a loopback provider and separately m
   `lean/MonotoneReferenceManifest.lean` proves monotone owner-bound edits and safe pruning over arbitrary keys and sequences.
 * `tla/ReferenceReadDisposal.tla` checks whole-residence disposal with two inherited provider reads, including cancellation, owner registration, fencing, drain and copy before erasure.
   `lean/ReferenceReadDisposal.lean` proves the same retention and handoff invariants for arbitrary reader sets. The Verus `reference_read_admission` area checks the serving admission decision and `verify_native_reference_read` replays cancellation and disposal through the local provider.
+* `tla/ReferenceDisposalPublication.tla` checks a persistent lineage close, restart, referrer inventory, stale and fresh preparation, and reopening with the disposal receipt.
+  `lean/ReferenceDisposalPublication.lean` proves generation and residence laws over arbitrary histories. The `shared_reference_revision` Verus area checks the production publication and settlement predicates, and `verify_native_reference_disposal` replays the handoff across a directory restart.
   `verus/reference_manifest` checks the production sequence allocator and cleanup threshold.
   The Rust replays check conflicting and backfilled write slots, current-manifest lookup, owner binding, and preservation of a failed removal's release record.
 * `tla/CheckpointCopyEvidence.tla` checks the predicate admitting a body to a checkpoint copy plan.

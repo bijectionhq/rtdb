@@ -19,7 +19,7 @@ use tokio::sync::{broadcast, mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
 
-use crate::{Cas, ChangeFeed, DeploymentRecord, Directory, ForkPreparation, LineageChange, LineageState, MemberId, MemberRecord, Version};
+use crate::{Cas, ChangeFeed, DeploymentRecord, Directory, ForkPublication, ReferenceDisposal, LineageChange, LineageState, MemberId, MemberRecord, Version};
 
 /// A longer line closes the connection rather than growing the buffer without bound.
 const MAX_LINE: u64 = 64 << 20;
@@ -28,9 +28,11 @@ const MAX_LINE: u64 = 64 << 20;
 #[serde(rename_all = "snake_case")]
 enum Op {
     CreateDeployment { record: DeploymentRecord },
-    CreateFork { child: DeploymentRecord, expected_parent: Version, #[serde(default)] preparation: Option<ForkPreparation> },
+    CreateFork { child: DeploymentRecord, expected_parent: Version, #[serde(default)] preparation: Option<ForkPublication> },
     SharedReferenceRevision { lineage: String },
     LineageState { lineage: String },
+    BeginReferenceDisposal { id: String, expected: Version },
+    SettleReferenceDisposal { permit: ReferenceDisposal, record: DeploymentRecord, expected: Version },
     ChangeLineage { lineage: String, change: LineageChange },
     Deployment { id: String },
     DeploymentByName { name: String },
@@ -59,6 +61,7 @@ enum Reply {
     DeploymentCas(Cas<DeploymentRecord>),
     SharedReferenceRevision(Version),
     LineageState(LineageState),
+    ReferenceDisposal(ReferenceDisposal),
     Member(MemberRecord),
     OptionalMember(Option<MemberRecord>),
     Members(Vec<MemberRecord>),
@@ -99,6 +102,8 @@ async fn dispatch(directory: &dyn Directory, op: Op) -> Result<Reply> {
         Op::CreateFork { child, expected_parent, preparation } => Reply::Deployment(directory.publish_fork(child, expected_parent, preparation).await?),
         Op::SharedReferenceRevision { lineage } => Reply::SharedReferenceRevision(directory.shared_reference_revision(&lineage).await?),
         Op::LineageState { lineage } => Reply::LineageState(directory.lineage_state(&lineage).await?),
+        Op::BeginReferenceDisposal { id, expected } => Reply::ReferenceDisposal(directory.begin_reference_disposal(&id, expected).await?),
+        Op::SettleReferenceDisposal { permit, record, expected } => Reply::DeploymentCas(directory.settle_reference_disposal(&permit, record, expected).await?),
         Op::ChangeLineage { lineage, change } => Reply::LineageState(directory.change_lineage(&lineage, change).await?),
         Op::Deployment { id } => Reply::OptionalDeployment(directory.deployment(&id).await?),
         Op::DeploymentByName { name } => Reply::OptionalDeployment(directory.deployment_by_name(&name).await?),
@@ -428,7 +433,7 @@ impl Directory for RemoteDirectory {
     async fn create_deployment(&self, record: DeploymentRecord) -> Result<DeploymentRecord> {
         match self.call(Op::CreateDeployment { record }).await? { Reply::Deployment(record) => Ok(record), other => Err(protocol(other)) }
     }
-    async fn publish_fork(&self, child: DeploymentRecord, expected_parent: Version, preparation: Option<ForkPreparation>) -> Result<DeploymentRecord> {
+    async fn publish_fork(&self, child: DeploymentRecord, expected_parent: Version, preparation: Option<ForkPublication>) -> Result<DeploymentRecord> {
         match self.call(Op::CreateFork { child, expected_parent, preparation }).await? { Reply::Deployment(record) => Ok(record), other => Err(protocol(other)) }
     }
     async fn shared_reference_revision(&self, lineage: &str) -> Result<Version> {
@@ -439,6 +444,12 @@ impl Directory for RemoteDirectory {
     }
     async fn change_lineage(&self, lineage: &str, change: LineageChange) -> Result<LineageState> {
         match self.call(Op::ChangeLineage { lineage: lineage.to_owned(), change }).await? { Reply::LineageState(state) => Ok(state), other => Err(protocol(other)) }
+    }
+    async fn begin_reference_disposal(&self, id: &str, expected: Version) -> Result<ReferenceDisposal> {
+        match self.call(Op::BeginReferenceDisposal { id: id.to_owned(), expected }).await? { Reply::ReferenceDisposal(permit) => Ok(permit), other => Err(protocol(other)) }
+    }
+    async fn settle_reference_disposal(&self, permit: &ReferenceDisposal, record: DeploymentRecord, expected: Version) -> Result<Cas<DeploymentRecord>> {
+        match self.call(Op::SettleReferenceDisposal { permit: permit.clone(), record, expected }).await? { Reply::DeploymentCas(result) => Ok(result), other => Err(protocol(other)) }
     }
     async fn deployment(&self, id: &str) -> Result<Option<DeploymentRecord>> {
         match self.call(Op::Deployment { id: id.to_owned() }).await? { Reply::OptionalDeployment(record) => Ok(record), other => Err(protocol(other)) }

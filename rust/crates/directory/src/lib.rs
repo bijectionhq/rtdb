@@ -811,12 +811,14 @@ pub trait Directory: Send + Sync {
     async fn create_fork(&self, child: DeploymentRecord, expected_parent: Version) -> Result<DeploymentRecord> {
         self.publish_fork(child, expected_parent, None).await
     }
-    async fn publish_fork(&self, child: DeploymentRecord, expected_parent: Version, preparation: Option<ForkPreparation>) -> Result<DeploymentRecord>;
+    async fn publish_fork(&self, child: DeploymentRecord, expected_parent: Version, preparation: Option<ForkPublication>) -> Result<DeploymentRecord>;
     /// Monotone revision of shared fork publications in this cell. An untouched lineage starts at zero.
     async fn shared_reference_revision(&self, lineage: &str) -> Result<Version> {
         Ok(self.lineage_state(lineage).await?.reference_revision())
     }
     async fn lineage_state(&self, lineage: &str) -> Result<LineageState>;
+    async fn begin_reference_disposal(&self, id: &str, expected: Version) -> Result<ReferenceDisposal>;
+    async fn settle_reference_disposal(&self, permit: &ReferenceDisposal, record: DeploymentRecord, expected: Version) -> Result<Cas<DeploymentRecord>>;
     async fn change_lineage(&self, lineage: &str, change: LineageChange) -> Result<LineageState>;
     async fn deployment(&self, id: &str) -> Result<Option<DeploymentRecord>>;
     async fn deployment_by_name(&self, name: &str) -> Result<Option<DeploymentRecord>>;
@@ -863,7 +865,7 @@ fn fork_conflict() -> Anomaly {
 
 mod reference_revision;
 mod lineage;
-pub use lineage::{ForkPreparation, LineageChange, LineageRetirement, LineageState};
+pub use lineage::{ForkPreparation, ForkPublication, LineageChange, LineageRetirement, LineageState, ReferenceDisposal};
 use lineage::StoredLineage;
 
 const REFERENCE_REVISION_PREFIX: &str = "~reference-revision/";
@@ -950,6 +952,35 @@ impl MemoryDirectory {
         }
         Ok(())
     }
+    fn replace_record(&self, mut record: DeploymentRecord, expected: Version, disposal: Option<&ReferenceDisposal>) -> Result<Cas<DeploymentRecord>> {
+        let mut state = self.state()?;
+        let MemoryState { deployments, held, reference_revisions, .. } = &mut *state;
+        let Some(current) = deployments.get_mut(&record.id) else { return Ok(Cas::Conflict(None)); };
+        if current.version != expected { return Ok(Cas::Conflict(Some(current.as_ref().clone()))); }
+        if current.name != record.name { return Err(Anomaly::incorrect("rtdb.directory/rename", "A deployment's name never changes")); }
+        if let Some(permit) = disposal {
+            let references = reference_revisions.get(&permit.lineage).map(StoredLineage::state).unwrap_or_default();
+            let next = references.finish_disposal(permit, current, &record)?;
+            reference_revisions.insert(permit.lineage.clone(), StoredLineage::Current(next));
+        }
+        if current.holder != record.holder {
+            if let Some(previous) = current.holder.clone()
+                && let Some(existing) = held.get_mut(&previous)
+            {
+                existing.remove(&record.id);
+                if existing.is_empty() { held.remove(&previous); }
+            }
+            if let Some(holder) = &record.holder {
+                held.entry(holder.clone()).or_default().insert(record.id.clone());
+            }
+        }
+        record.version = expected + 1;
+        **current = record.clone();
+        self.persist(&mut state)?;
+        self.changes.publish(record.clone());
+        Ok(Cas::Applied(record))
+    }
+
     fn insert_deployment(&self, state: &mut MemoryState, mut record: DeploymentRecord, lineage: Option<(String, LineageState)>) -> Result<DeploymentRecord> {
         require_deployment_name(&record.name)?;
         if state.deployments.contains_key(&record.id) { return Err(exists("Deployment", &record.id)); }
@@ -976,7 +1007,7 @@ impl Directory for MemoryDirectory {
         let mut state = self.state()?;
         self.insert_deployment(&mut state, record, None)
     }
-    async fn publish_fork(&self, child: DeploymentRecord, expected_parent: Version, preparation: Option<ForkPreparation>) -> Result<DeploymentRecord> {
+    async fn publish_fork(&self, child: DeploymentRecord, expected_parent: Version, preparation: Option<ForkPublication>) -> Result<DeploymentRecord> {
         let mut state = self.state()?;
         let parent = state.deployments.get(fork_parent_id(&child)?).map(Box::as_ref).ok_or_else(fork_conflict)?;
         let shared = shared_fork_lineage(&child, Some(parent), expected_parent)?.is_some();
@@ -1000,6 +1031,21 @@ impl Directory for MemoryDirectory {
         }
         Ok(next)
     }
+    async fn begin_reference_disposal(&self, id: &str, expected: Version) -> Result<ReferenceDisposal> {
+        let mut state = self.state()?;
+        let owner = state.deployments.get(id).filter(|owner| owner.version == expected).ok_or_else(lineage::disposal_changed)?;
+        let lineage = owner.lineage.clone();
+        let current = state.reference_revisions.get(&lineage).map(StoredLineage::state).unwrap_or_default();
+        let (permit, next) = current.begin_disposal(owner)?;
+        if current != next {
+            state.reference_revisions.insert(lineage, StoredLineage::Current(next));
+            self.persist(&mut state)?;
+        }
+        Ok(permit)
+    }
+    async fn settle_reference_disposal(&self, permit: &ReferenceDisposal, record: DeploymentRecord, expected: Version) -> Result<Cas<DeploymentRecord>> {
+        self.replace_record(record, expected, Some(permit))
+    }
     async fn deployment(&self, id: &str) -> Result<Option<DeploymentRecord>> { Ok(self.state()?.deployments.get(id).map(Box::as_ref).cloned()) }
     async fn deployment_by_name(&self, name: &str) -> Result<Option<DeploymentRecord>> {
         if name.starts_with(REFERENCE_REVISION_PREFIX) { return Ok(None); }
@@ -1011,28 +1057,8 @@ impl Directory for MemoryDirectory {
         let state = self.state()?;
         Ok(state.held.get(member).into_iter().flatten().map(|id| state.deployments[id].as_ref().clone()).collect())
     }
-    async fn replace_deployment(&self, mut record: DeploymentRecord, expected: Version) -> Result<Cas<DeploymentRecord>> {
-        let mut state = self.state()?;
-        let MemoryState { deployments, held, .. } = &mut *state;
-        let Some(current) = deployments.get_mut(&record.id) else { return Ok(Cas::Conflict(None)); };
-        if current.version != expected { return Ok(Cas::Conflict(Some(current.as_ref().clone()))); }
-        if current.name != record.name { return Err(Anomaly::incorrect("rtdb.directory/rename", "A deployment's name never changes")); }
-        if current.holder != record.holder {
-            if let Some(previous) = current.holder.clone()
-                && let Some(existing) = held.get_mut(&previous)
-            {
-                existing.remove(&record.id);
-                if existing.is_empty() { held.remove(&previous); }
-            }
-            if let Some(holder) = &record.holder {
-                held.entry(holder.clone()).or_default().insert(record.id.clone());
-            }
-        }
-        record.version = expected + 1;
-        **current = record.clone();
-        self.persist(&mut state)?;
-        self.changes.publish(record.clone());
-        Ok(Cas::Applied(record))
+    async fn replace_deployment(&self, record: DeploymentRecord, expected: Version) -> Result<Cas<DeploymentRecord>> {
+        self.replace_record(record, expected, None)
     }
     async fn register_member(&self, mut record: MemberRecord) -> Result<MemberRecord> {
         let mut state = self.state()?;

@@ -183,6 +183,13 @@ The candidate model admits retirement after active readers drain, advances the p
 It transfers existing references and confirms provider removal before reopening.
 It covers one source version, one direct reader, and one shared fork.
 Local fork preparation and local collection use the same persistent admission state across memory, network and DynamoDB directory clients.
+Whole-residence disposal uses a distinct phase of that state. The directory closes the lineage under the version of the fenced, drained physical owner and advances the generation before the administration path loads the referrer inventory.
+An interrupted disposal can resume against the same residence and generation. Local sweep recovery cannot settle this phase.
+The terminal directory transaction checks the current owner version and the exact disposal permit, installs the receipt and reopens the lineage together.
+The local disposal bucket retains the maintenance witness through provider I/O.
+Remote preparation reads the open generation before it accesses storage and carries that generation to publication. Preparation may still fail if a remote source changes during provider work. A stale preparation cannot publish after the lineage reopens.
+Only local preparation currently holds a physical preparation entitlement for this protocol.
+[Production interleaving model](../tla/ReferenceDisposalPublication.tla) · [Generation and residence model](../lean/ReferenceDisposalPublication.lean)
 Ordinary remote collection needs a durable retirement intent that orders physical-owner admission, reference publication and provider settlement.
 Archive capture, fork preparation and transfer still have separate physical read paths. [Retirement admission model](../tla/LineageRetirementAdmission.tla)
 
@@ -192,7 +199,7 @@ Archive capture, fork preparation and transfer still have separate physical read
 | --- | --- | --- |
 | `reap_as_of` and `References::erase` | The reaper uses garbage records, checkpoint floors and existing manifests. The local sweep acquires a lineage reservation before reloading referrers and copies retained data before deleting the path. | Bind each remote retirement to one physical owner and version, validate referrers under that authority, and keep the intent until exact settlement. |
 | `Base::initialize`, `Base::forget` and `Base::load` | Initialization adds references. Confirmed withdrawals only remove matching entries and require a current head before effect. | Connect the current-manifest contract to consumers that retain older manifests and to the authority closing and disposing a residence. |
-| `erase_deployment` in disposal and old-residence cleanup | The administration path fences the residence, drains serving references admitted at that owner, transfers observed shared objects and checks the provider inventory under its prefix. | Order shared fork publication and administrative reads against the physical retirement authority. |
+| `erase_deployment` in disposal and old-residence cleanup | The administration path fences the residence, drains serving references, closes the lineage, scans and transfers published references and checks the provider inventory. Settlement atomically publishes the receipt and reopens the lineage. | Extend physical-owner read custody to administrative copies and qualify provider settlement under failure on hosted storage. |
 | `ordered_index_storage::reap` | The directory generation floor and reader registry close admission. Remote cleanup aborts journaled uploads and checks the generation prefix inventory. | Preserve the independent generation and residence bindings in any shared retirement API. |
 | `finish_capture_retirement` and whole archive retirement | A capture is closed in the directory. Archive custody and the provider inventory govern physical erasure and final receipts. | Preserve capture identity and the archive's separate namespace when composing with serving retirement. |
 

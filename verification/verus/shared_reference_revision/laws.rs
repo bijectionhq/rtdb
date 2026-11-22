@@ -1,4 +1,4 @@
-use crate::production::{advance_revision, may_publish_fork};
+use crate::production::{advance_revision, may_publish_fork, may_publish_reference, may_settle_reference_disposal};
 use vstd::prelude::*;
 
 verus! {
@@ -30,6 +30,26 @@ pub fn an_advance_is_strict_and_does_not_wrap(current: u64) {
         Some(next) => assert(next > current),
         None => assert(current == u64::MAX),
     }
+}
+
+// LAW REFERENCE-REVISION-5.
+pub fn a_closed_lineage_refuses_its_current_preparation(current: u64) {
+    let accepted = may_publish_reference(current, false, Some(current));
+    assert(!accepted);
+}
+
+// LAW REFERENCE-REVISION-6.
+pub fn an_open_lineage_refuses_a_stale_preparation(current: u64, prepared_at: Option<u64>)
+    requires prepared_at != Some(current),
+{
+    let accepted = may_publish_reference(current, true, prepared_at);
+    assert(!accepted);
+}
+
+// LAW REFERENCE-REVISION-7.
+pub fn settlement_requires_the_exact_revision_and_residence(current: u64, expected: u64, scope_matches: bool) {
+    let accepted = may_settle_reference_disposal(current, expected, scope_matches);
+    assert(accepted ==> current == expected && scope_matches);
 }
 
 }

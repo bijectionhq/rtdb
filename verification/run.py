@@ -1497,6 +1497,26 @@ def verify_shared_reference_revision(args, scratch):
 
 
 
+
+def verify_reference_disposal_publication(args, scratch):
+    path = Path("verification/lean/ReferenceDisposalPublication.lean")
+    controls = {
+        "do-not-advance-generation": (
+            "⟨s.generation + 1, some residence⟩", "⟨s.generation, some residence⟩",
+            ["a_preparation_cannot_cross_retirement"],
+        ),
+        "ignore-preparation-generation": (
+            "s.owner = none ∧ preparedAt = s.generation", "s.owner = none ∧ True",
+            ["a_preparation_cannot_cross_retirement"],
+        ),
+        "ignore-receipt-owner": (
+            "s.generation = generation ∧ s.owner = some residence", "s.generation = generation ∧ True",
+            ["settlement_names_the_current_residence"],
+        ),
+    }
+    verify_lean_model(args, scratch, path, "reference-disposal-publication", controls, 3)
+
+
 def verify_reference_read_disposal(args, scratch):
     path = Path("verification/lean/ReferenceReadDisposal.lean")
     controls = {
@@ -1818,6 +1838,7 @@ def verify_lean(args, scratch):
             verify_shared_reference_revision(args, scratch)
             verify_monotone_reference_manifest(args, scratch)
             verify_reference_read_disposal(args, scratch)
+            verify_reference_disposal_publication(args, scratch)
             verify_published_checkpoint(args, scratch)
             verify_checkpoint_table_manifest(args, scratch)
             verify_pack_publication_lean(args, scratch)
@@ -2179,6 +2200,19 @@ TLA_CASES = (
      ("INVARIANT Safe", "INVARIANT NeverRefusesOldPreparationAfterSettlement"), "NeverRefusesOldPreparationAfterSettlement"),
     ("LineageRetirementAdmission", "lineage-retirement-transfers-and-settles-witness",
      ("INVARIANT Safe", "INVARIANT NeverTransfersAndSettles"), "NeverTransfersAndSettles"),
+    ("ReferenceDisposalPublication", "reference-disposal-publication", None, None),
+    ("ReferenceDisposalPublication", "reference-disposal-publish-stale",
+     ('Mutation = "none"\nINVARIANT Safe', 'Mutation = "publish_stale"\nINVARIANT ForksReadable'), "ForksReadable"),
+    ("ReferenceDisposalPublication", "reference-disposal-scan-before-close",
+     ('Mutation = "none"\nINVARIANT Safe', 'Mutation = "scan_before_close"\nINVARIANT ForksReadable'), "ForksReadable"),
+    ("ReferenceDisposalPublication", "reference-disposal-skip-copy",
+     ('Mutation = "none"\nINVARIANT Safe', 'Mutation = "skip_copy"\nINVARIANT ForksReadable'), "ForksReadable"),
+    ("ReferenceDisposalPublication", "reference-disposal-early-reopen",
+     ('Mutation = "none"\nINVARIANT Safe', 'Mutation = "early_reopen"\nINVARIANT ReceiptFollowsErasure'), "ReceiptFollowsErasure"),
+    ("ReferenceDisposalPublication", "reference-disposal-lose-gate-on-restart",
+     ('Mutation = "none"\nINVARIANT Safe', 'Mutation = "forget_gate_on_restart"\nINVARIANT DurableGate'), "DurableGate"),
+    ("ReferenceDisposalPublication", "reference-disposal-new-preparation-witness",
+     ("INVARIANT Safe", "INVARIANT NeverPublishesAfterSettlement"), "NeverPublishesAfterSettlement"),
     ("ReferenceReadDisposal", "reference-read-disposal", None, None),
     ("ReferenceReadDisposal", "reference-read-wrong-owner",
      ('Mutation = "none"\nINVARIANT Safe', 'Mutation = "wrong_owner"\nINVARIANT PendingIsOwned'), "PendingIsOwned"),
@@ -2636,6 +2670,7 @@ def check_apalache(args, scratch, module, name, invariant, length, mutation=None
 
 
 def verify_apalache(args, scratch):
+    check_apalache(args, scratch, "ReferenceDisposalPublication", "reference-disposal-publication", "Safe", 11)
     check_apalache(args, scratch, "ReferenceReadDisposal", "reference-read-disposal", "Safe", 10)
     for mode in ("validated", "serialized", "blind"):
         mutation = None if mode == "validated" else ('Mode = "validated"', f'Mode = "{mode}"')
@@ -3578,8 +3613,8 @@ def verify_native_reference_revision(args, source):
     }
     command = ["cargo", "test", "--locked", "-p", "rtdb-directory", "--features", "dynamodb", "--lib"]
     cases = [(
-        "memory", "tests::memory_directory_meets_the_contract", "lib.rs",
-        "*revision = next_reference_revision(*revision)?;", "let _ = revision;",
+        "memory", "tests::memory_directory_meets_the_contract", "lineage.rs",
+        "if shared { next.references = next_reference_revision(self.references)?; }", "let _ = shared;",
         "publishing a shared fork advances its lineage cut",
     )]
     endpoint = env.get("RTDB_DYNAMODB_ENDPOINT")
@@ -3612,6 +3647,46 @@ def verify_native_reference_revision(args, source):
             path.write_bytes(original)
         print(f"rust-lineage-reference-{name}: atomic publication passed and its control failed as expected")
 
+
+
+
+def verify_native_reference_disposal(args, source):
+    env = os.environ | {
+        "CARGO_TARGET_DIR": os.environ.get("CARGO_TARGET_DIR", str(ROOT / "target")),
+        "CARGO_PROFILE_TEST_DEBUG": "0",
+    }
+    test = "admin::tests::disposal_restart_copies_live_referrers_and_rejects_an_old_fork_preparation"
+    command = ["cargo", "test", "--locked", "-p", "rtdb-multi", "--features", "dynamodb", "--lib", test, "--", "--exact"]
+    baseline = run_case(command, source / "rust", args.evidence, "rust-reference-disposal-baseline", env)
+    if baseline.returncode or f"{test} ... ok" not in baseline.stdout:
+        raise ValueError("the reference disposal restart replay did not pass")
+    root = source / "rust/crates/directory/src"
+    controls = {
+        "lose-gate": (
+            "lineage.rs", "next.admission = Admission::Disposing(residence.clone());",
+            "next.admission = Admission::default();", "a restarted directory retains the disposal cut",
+        ),
+        "split-receipt": (
+            "lib.rs", "self.replace_record(record, expected, Some(permit))",
+            "self.replace_record(record, expected, None)", "the durable receipt reopens its disposal generation",
+        ),
+        "publish-stale": (
+            "lineage.rs", "if !reference_revision::may_publish_reference(self.retirement_generation, open, Some(generation))",
+            "if !open", "a stale preparation cannot publish after disposal",
+        ),
+    }
+    for name, (file, before, after, expected) in controls.items():
+        path = root / file
+        original = path.read_bytes()
+        try:
+            replace_once(path, before, after)
+            result = run_case(command, source / "rust", args.evidence, f"rust-reference-disposal-{name}", env)
+            if (result.returncode != 101 or f"{test} ... FAILED" not in result.stdout
+                or expected not in (result.stdout + result.stderr) or "0 passed; 1 failed" not in result.stdout):
+                raise ValueError(f"{name}: reference disposal control failed outside its assertion")
+        finally:
+            path.write_bytes(original)
+        print(f"rust-reference-disposal-{name}: control rejected at its declared assertion")
 
 
 def verify_native_reference_read(args, source):
@@ -4635,6 +4710,7 @@ def main():
         "rust/crates/multi/src/packing.rs",
         "rust/crates/directory/src/lib.rs",
         "rust/crates/directory/src/dynamo/parked.rs",
+        "rust/crates/directory/src/lineage.rs",
         "rust/crates/node/src/resources.rs",
         "rust/crates/node/src/node.rs",
         "rust/crates/node/src/placed_receipts.rs",
@@ -4700,6 +4776,7 @@ def main():
             verify_native_reference_revision(args, source)
             verify_native_reference_manifest(args, source)
             verify_native_reference_read(args, source)
+            verify_native_reference_disposal(args, source)
             verify_compaction_publication_versions(args, source)
             verify_replay_prefix(args, source)
             verify_multi_trim_admission(args, source)
