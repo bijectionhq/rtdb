@@ -9,6 +9,8 @@ use super::{
 
 const RULE: &str = "!rule";
 const MAX_RULES: usize = 16;
+const MAX_PREDICATES: usize = 4;
+const MAX_PREDICATE_BYTES: usize = 2052;
 
 #[derive(Default)]
 pub(super) struct OwnedCapacityChanges {
@@ -27,21 +29,24 @@ struct CapacityRule {
     column: String,
     prefix_bytes: Option<NonZeroUsize>,
     cap: i64,
+    when: Vec<u8>,
 }
 
 impl CapacityRule {
-    fn new(column: String, prefix_bytes: i64, cap: i64) -> Result<Self> {
+    fn new(column: String, prefix_bytes: i64, cap: i64, when: Vec<u8>) -> Result<Self> {
         let prefix_bytes = usize::try_from(prefix_bytes)
             .ok()
             .filter(|n| *n <= MAX_KEY_BYTES)
             .ok_or_else(invalid_rule)?;
-        if column.is_empty() || column.len() > 96 || column.starts_with('_') || cap <= 0 {
+        if !valid_column(&column) || cap <= 0 {
             return Err(invalid_rule());
         }
+        predicates(&when)?;
         Ok(Self {
             column,
             prefix_bytes: NonZeroUsize::new(prefix_bytes),
             cap,
+            when,
         })
     }
 
@@ -53,6 +58,7 @@ impl CapacityRule {
                 Value::I64(self.prefix_bytes.map_or(0, NonZeroUsize::get) as i64),
             ),
             ("cap".into(), Value::I64(self.cap)),
+            ("when".into(), Value::Binary(self.when.clone())),
         ]))
     }
 
@@ -64,29 +70,77 @@ impl CapacityRule {
     }
 
     fn bucket_id(&self, key: &[u8]) -> EntityId {
-        let mut bytes = Vec::with_capacity(1 + self.column.len() + key.len());
+        let mut bytes = Vec::with_capacity(3 + self.column.len() + self.when.len() + key.len());
         bytes.push(self.column.len() as u8);
         bytes.extend_from_slice(self.column.as_bytes());
+        bytes.extend_from_slice(&(self.when.len() as u16).to_be_bytes());
+        bytes.extend_from_slice(&self.when);
         bytes.extend_from_slice(key);
         unique_id(&bytes)
+    }
+
+    fn identity(&self) -> (&str, &[u8]) {
+        (&self.column, &self.when)
+    }
+
+    fn admits(&self, schema: &rtdb_types::OwnedSchema) -> Result<bool> {
+        Ok(schema.column_type(&self.column) == Some(ScalarType::Binary)
+            && predicates(&self.when)?
+                .into_iter()
+                .all(|(column, _)| schema.column_type(column) == Some(ScalarType::Binary)))
     }
 
     fn decode(value: &Value) -> Result<Self> {
         let Value::Struct(rule) = value else {
             return Err(uncovered());
         };
-        let (Some(Value::Utf8(column)), Some(Value::I64(prefix_bytes)), Some(Value::I64(cap))) = (
+        let (
+            Some(Value::Utf8(column)),
+            Some(Value::I64(prefix_bytes)),
+            Some(Value::I64(cap)),
+            Some(Value::Binary(when)),
+        ) = (
             rule.get("column"),
             rule.get("prefix_bytes"),
             rule.get("cap"),
-        ) else {
+            rule.get("when"),
+        )
+        else {
             return Err(uncovered());
         };
-        if rule.len() != 3 {
+        if rule.len() != 4 {
             return Err(uncovered());
         }
-        Self::new(column.clone(), *prefix_bytes, *cap).map_err(|_| uncovered())
+        Self::new(column.clone(), *prefix_bytes, *cap, when.clone()).map_err(|_| uncovered())
     }
+}
+
+fn valid_column(column: &str) -> bool {
+    !column.is_empty() && column.len() <= 96 && !column.starts_with('_')
+}
+
+fn predicates(mut encoded: &[u8]) -> Result<Vec<(&str, &[u8])>> {
+    let mut result = Vec::new();
+    while let Some((&name_len, body)) = encoded.split_first() {
+        let (name, body) = body
+            .split_at_checked(usize::from(name_len))
+            .ok_or_else(invalid_rule)?;
+        let name = std::str::from_utf8(name).map_err(|_| invalid_rule())?;
+        let (value_len, body) = body.split_first_chunk::<2>().ok_or_else(invalid_rule)?;
+        let (value, tail) = body
+            .split_at_checked(usize::from(u16::from_be_bytes(*value_len)))
+            .ok_or_else(invalid_rule)?;
+        if result.len() >= MAX_PREDICATES
+            || !valid_column(name)
+            || !(1..=MAX_PREDICATE_BYTES).contains(&value.len())
+            || result.last().is_some_and(|&(prior, _)| prior >= name)
+        {
+            return Err(invalid_rule());
+        }
+        result.push((name, value));
+        encoded = tail;
+    }
+    Ok(result)
 }
 
 #[derive(Default)]
@@ -130,7 +184,7 @@ impl CapacityPolicy {
             .collect::<Result<Vec<_>>>()?;
         if rules
             .windows(2)
-            .any(|pair| pair[0].column >= pair[1].column)
+            .any(|pair| pair[0].identity() >= pair[1].identity())
         {
             return Err(uncovered());
         }
@@ -138,6 +192,14 @@ impl CapacityPolicy {
             rules,
             through_events: *through_events,
         })
+    }
+
+    fn retained_bytes(&self) -> usize {
+        1024 + self
+            .rules
+            .iter()
+            .map(|rule| 256 + rule.when.capacity())
+            .sum::<usize>()
     }
 }
 
@@ -251,10 +313,9 @@ impl OpenTransaction<'_> {
             .capacity_policy(snapshot.clone(), owner, relation)
             .await
             .map_err(count_uncovered)?;
-        let rule = policy
-            .rules
-            .iter()
-            .find(|rule| rule.column == column && rule.bucket(prefix) == Some(prefix));
+        let rule = policy.rules.iter().find(|rule| {
+            rule.column == column && rule.when.is_empty() && rule.bucket(prefix) == Some(prefix)
+        });
         let Some(rule) = rule else {
             return Err(Anomaly::incorrect(
                 "rtdb.owned/count-bound",
@@ -282,6 +343,7 @@ impl OpenTransaction<'_> {
         column: &str,
         prefix_bytes: i64,
         cap: i64,
+        when: &[u8],
     ) -> Result<()> {
         OwnedRelation::new(relation.name())?;
         let owner = self
@@ -290,7 +352,7 @@ impl OpenTransaction<'_> {
             .as_deref()
             .filter(|owner| !owner.is_empty())
             .ok_or_else(no_owned_principal)?;
-        let rule = CapacityRule::new(column.into(), prefix_bytes, cap)?;
+        let rule = CapacityRule::new(column.into(), prefix_bytes, cap, when.to_vec())?;
         let storage = relation.capacity_table(owner);
         let target = relation.table(owner);
         let snapshot = self.snapshot()?;
@@ -303,7 +365,7 @@ impl OpenTransaction<'_> {
         }
         let index = match policy
             .rules
-            .binary_search_by(|prior| prior.column.cmp(&rule.column))
+            .binary_search_by(|prior| prior.identity().cmp(&rule.identity()))
         {
             Ok(index) if policy.rules[index] == rule => {
                 return Ok(());
@@ -324,7 +386,7 @@ impl OpenTransaction<'_> {
             ));
         }
         if let Some((schema, _)) = self.read_owned_schema(owner, relation).await?
-            && schema.column_type(column) != Some(ScalarType::Binary)
+            && !rule.admits(&schema)?
         {
             return Err(invalid_rule());
         }
@@ -332,11 +394,9 @@ impl OpenTransaction<'_> {
             return Err(invalid_rule());
         }
         policy.rules.insert(index, rule);
-        self.capacity_changes.reservations.push(
-            self.context
-                .memory
-                .reserve(1024 + policy.rules.len() * 256)?,
-        );
+        self.capacity_changes
+            .reservations
+            .push(self.context.memory.reserve(policy.retained_bytes())?);
         self.buffer.put(storage, policy.document(), Interval::ALL)?;
         self.capacity_changes.relations.insert(
             relation.clone(),
@@ -362,11 +422,9 @@ impl OpenTransaction<'_> {
         if !self.capacity_changes.relations.contains_key(relation) {
             let snapshot = self.buffer.base_snapshot();
             let policy = self.capacity_policy(snapshot, owner, relation).await?;
-            self.capacity_changes.reservations.push(
-                self.context
-                    .memory
-                    .reserve(1024 + policy.rules.len() * 256)?,
-            );
+            self.capacity_changes
+                .reservations
+                .push(self.context.memory.reserve(policy.retained_bytes())?);
             let rule = (!policy.rules.is_empty()).then_some(TouchedRule {
                 policy,
                 ids: BTreeSet::new(),
@@ -483,6 +541,15 @@ impl OpenTransaction<'_> {
         next: &Snapshot,
         locators: &mut BTreeSet<rtdb_types::Iid>,
     ) -> Result<()> {
+        let qualifiers = predicates(&rule.when)?;
+        let columns = std::iter::once(rule.column.as_str())
+            .chain(
+                qualifiers
+                    .iter()
+                    .map(|(name, _)| *name)
+                    .filter(|&name| name != rule.column.as_str()),
+            )
+            .collect::<Vec<_>>();
         let mut deltas = BTreeMap::<EntityId, Delta>::new();
         let mut allocations = Vec::new();
         for id in ids {
@@ -499,23 +566,37 @@ impl OpenTransaction<'_> {
                     relation,
                     id,
                     None,
-                    Some(&[rule.column.as_str()]),
+                    Some(&columns),
                 )
                 .await?;
-                let Some(key) = self
-                    .read_occupancy_cell(cursor, id, &rule.column, uncovered)
-                    .await?
-                else {
+                let Some(row) = self.read_occupancy_row(cursor, id, uncovered).await? else {
                     continue;
                 };
-                let Value::Binary(key) = key else {
+                let row = row.batch();
+                let mut matches = true;
+                for &(column, expected) in &qualifiers {
+                    let actual = self.read_occupancy_value(row, column, uncovered)?;
+                    match actual {
+                        Value::Binary(bytes) if bytes.as_slice() == expected => (),
+                        Value::Binary(_) | Value::Null | Value::Undefined => {
+                            matches = false;
+                            break;
+                        }
+                        _ => return Err(invalid_key()),
+                    }
+                }
+                if !matches {
+                    continue;
+                }
+                let Value::Binary(key) = self.read_occupancy_value(row, &rule.column, uncovered)?
+                else {
                     return Err(invalid_key());
                 };
                 let prefix = rule.bucket(&key).ok_or_else(invalid_key)?;
                 allocations.push(
                     self.context
                         .memory
-                        .reserve((prefix.len() + rule.column.len()) * 4 + 512)?,
+                        .reserve((prefix.len() + rule.column.len() + rule.when.len()) * 4 + 512)?,
                 );
                 let delta = deltas.entry(rule.bucket_id(prefix)).or_default();
                 let count = if final_state {
@@ -580,12 +661,10 @@ impl OpenTransaction<'_> {
         schema: &rtdb_types::OwnedSchema,
     ) -> Result<()> {
         let policy = self.capacity_policy(snapshot, owner, relation).await?;
-        if policy
-            .rules
-            .iter()
-            .any(|rule| schema.column_type(&rule.column) != Some(ScalarType::Binary))
-        {
-            return Err(invalid_rule());
+        for rule in &policy.rules {
+            if !rule.admits(schema)? {
+                return Err(invalid_rule());
+            }
         }
         Ok(())
     }

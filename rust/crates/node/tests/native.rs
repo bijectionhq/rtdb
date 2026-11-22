@@ -724,7 +724,7 @@ async fn owned_prefix_capacity_checks_atomic_final_membership() {
     let relation = OwnedRelation::new("capacity-orders").unwrap();
     let other = OwnedRelation::new("capacity-other").unwrap();
     let rule = |relation: &OwnedRelation| TxOp::OwnedDeclareCapacity {
-        relation: relation.clone(), column: "canonical".into(), prefix_bytes: 1, cap: 2,
+        relation: relation.clone(), column: "canonical".into(), prefix_bytes: 1, cap: 2, when: Vec::new(),
     };
     let insert = |relation: &OwnedRelation, id, key| TxOp::OwnedInsertDocs {
         relation: relation.clone(),

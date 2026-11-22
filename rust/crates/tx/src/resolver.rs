@@ -674,8 +674,8 @@ impl<'a> OpenTransaction<'a> {
             Operation::Public(TxOp::OwnedDeclareRelation { relation, schema }) =>
                 self.declare_owned_relation(relation, schema).await,
             Operation::Public(TxOp::OwnedDeclareFixedRange { relation, rule }) => self.declare_fixed_range(relation, rule).await,
-            Operation::Public(TxOp::OwnedDeclareCapacity { relation, column, prefix_bytes, cap }) =>
-                self.declare_owned_capacity(relation, column, *prefix_bytes, *cap).await,
+            Operation::Public(TxOp::OwnedDeclareCapacity { relation, column, prefix_bytes, cap, when }) =>
+                self.declare_owned_capacity(relation, column, *prefix_bytes, *cap, when).await,
             Operation::Public(TxOp::OwnedDeclareUniquePath { relation, name, column }) =>
                 self.declare_owned_unique_path(relation, name, column).await,
             Operation::Public(TxOp::OwnedDeclarePath { relation, name, columns }) =>
