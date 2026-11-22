@@ -198,6 +198,7 @@ const OWNED_PATH_CATALOG: &str = ".ordered-paths";
 const OWNED_SEARCH_CATALOG: &str = ".search-paths";
 const OWNED_RELATION_CATALOG: &str = ".relation-schemas";
 pub const OWNED_ATTEMPT_RELATION: &str = "fact_attempts";
+pub const OWNED_ROOT_PUBLICATION_RELATION: &str = "fact_publications";
 const OWNED_WORLD_CLOCKS: &str = ".world-clocks";
 const OWNED_WORLD_CATALOG: &str = ".worlds";
 const OWNED_WORLD_PREFIX: &str = ".world-";
@@ -222,6 +223,11 @@ impl OwnedRelation {
     }
 
     pub fn name(&self) -> &str { &self.0 }
+
+    pub fn is_root_data(&self) -> bool {
+        self.world().is_none() && !self.is_world_catalog()
+            && !matches!(self.name(), OWNED_ATTEMPT_RELATION | OWNED_ROOT_PUBLICATION_RELATION)
+    }
 
     pub fn table(&self, owner: &str) -> TableRef { owned_table(owner, &self.0) }
 
@@ -340,6 +346,12 @@ impl TableRef {
     pub fn is_owned_search_catalog(&self) -> bool {
         self.table.split_once('-').is_some_and(|(_, name)| name == OWNED_SEARCH_CATALOG)
             && self.supported_owned_name()
+    }
+
+    /// Identifies derived Root writes with the same owner and source relation.
+    pub fn owned_root_constraint_relation(&self) -> Option<&str> {
+        let name = self.owned_storage_name()?;
+        name.strip_prefix(OWNED_UNIQUE_PREFIX).or_else(|| name.strip_prefix(OWNED_CAPACITY_PREFIX))
     }
 
     pub fn is_owned_unique_table(&self) -> bool {

@@ -83,7 +83,7 @@ impl SourceTransaction {
                     (owned_path_bytes(relation, name, columns)?, None, 0),
                 Operation::Public(TxOp::HostedControl(control)) => (control.retained_bytes()?, None, 0),
                 Operation::Public(TxOp::OwnedForkWorld { record, attempt, .. }) => (Value::document_retained_bytes(record)?.saturating_add(attempt.len()), None, 128),
-                Operation::Public(TxOp::OwnedPublishWorld { attempt, .. }) => (attempt.len(), None, 128),
+                Operation::Public(TxOp::OwnedPublishRoot { attempt, .. } | TxOp::OwnedPublishWorld { attempt, .. }) => (attempt.len(), None, 128),
                 Operation::Public(TxOp::OwnedCheckWorldPurge { relation, .. }) => (relation.name().len(), None, 0),
                 Operation::Public(TxOp::OwnedDeadline { .. } | TxOp::OwnedCheckWorldScope { .. }) => (0, None, 0),
                 Operation::Public(TxOp::OwnedDeclareFixedRange { relation, rule }) =>
@@ -315,7 +315,7 @@ impl SourceTransaction {
                     owned_path_bytes(relation, name, columns)?,
                 Operation::Public(TxOp::HostedControl(control)) => control.retained_bytes()?,
                 Operation::Public(TxOp::OwnedForkWorld { record, attempt, .. }) => Value::document_retained_bytes(record)?.saturating_add(attempt.len() + 128),
-                Operation::Public(TxOp::OwnedPublishWorld { attempt, .. }) => attempt.len() + 128,
+                Operation::Public(TxOp::OwnedPublishRoot { attempt, .. } | TxOp::OwnedPublishWorld { attempt, .. }) => attempt.len() + 128,
                 Operation::Public(TxOp::OwnedCheckWorldPurge { relation, .. }) => relation.name().len(),
                 Operation::Public(TxOp::OwnedDeadline { .. } | TxOp::OwnedCheckWorldScope { .. }) => 0,
                 Operation::Public(TxOp::OwnedDeclareFixedRange { relation, rule }) =>
@@ -488,6 +488,11 @@ fn operation_value<'a>(operation: &'a Operation, memory: &Arc<MemoryBudget>) -> 
             body.insert("attempt".into(), Value::Utf8(attempt.clone()));
             body.insert("fingerprint".into(), Value::Binary(fingerprint.to_vec()));
             "rtdb-owned-fork-world-v1"
+        }
+        Operation::Public(TxOp::OwnedPublishRoot { attempt, fingerprint }) => {
+            body.insert("attempt".into(), Value::Utf8(attempt.clone()));
+            body.insert("fingerprint".into(), Value::Binary(fingerprint.to_vec()));
+            "rtdb-owned-publish-root-v1"
         }
         Operation::Public(TxOp::OwnedPublishWorld { world, attempt, fingerprint, expected, advance_to, drop_world }) => {
             body.insert("world".into(), Value::Uuid(world.0));
@@ -1138,6 +1143,7 @@ impl SourceOperationReader<'_> {
             "rtdb-owned-deadline-v1" => &["until"],
             "rtdb-owned-fixed-range-v1" => &["relation", "rule"],
             "rtdb-owned-fork-world-v1" => &["registration", "attempt", "fingerprint"],
+            "rtdb-owned-publish-root-v1" => &["attempt", "fingerprint"],
             "rtdb-owned-publish-world-v1" | "rtdb-owned-drop-world-v1" => &["world", "attempt", "fingerprint", "expected"],
             "rtdb-owned-publish-world-v2" => &["world", "attempt", "fingerprint", "expected", "advance_to"],
             "rtdb-owned-check-world-purge-v1" => &["relation", "frontier"],
@@ -1165,6 +1171,14 @@ impl SourceOperationReader<'_> {
                 };
                 let fingerprint = fingerprint.try_into().map_err(|_| invalid("Invalid world fork fingerprint"))?;
                 TxOp::OwnedForkWorld { record, attempt, fingerprint }
+            }
+            "rtdb-owned-publish-root-v1" => {
+                let (Value::Utf8(attempt), Value::Binary(fingerprint)) =
+                    (value("attempt")?, value("fingerprint")?) else {
+                    return Err(invalid("Owned Root publication has invalid fields"));
+                };
+                let fingerprint = fingerprint.try_into().map_err(|_| invalid("Invalid Root publication fingerprint"))?;
+                TxOp::OwnedPublishRoot { attempt, fingerprint }
             }
             "rtdb-owned-publish-world-v1" | "rtdb-owned-publish-world-v2" | "rtdb-owned-drop-world-v1" => {
                 let (Value::Uuid(world), Value::Utf8(attempt), Value::Binary(fingerprint)) =

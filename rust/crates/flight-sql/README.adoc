@@ -486,13 +486,16 @@ The body carries the 16-byte hold, minted world, capture and optional suffix (ni
 The placed owner derives the archived cut before pinning and orders the registration with the attempt marker.
 The response carries the minted 16-byte world followed by the transaction ID and system time as big-endian i64.
 
-`rtdb.owned.CommitHeldWorlds.v2` orders fixed-valid replacements and tombstones in one to eight distinct hosted checkpoint worlds as one source transaction.
+`rtdb.owned.CommitHeldWorlds.v3` orders fixed-valid replacements and tombstones in one to eight distinct hosted checkpoint worlds as one source transaction.
 Its request starts with a big-endian i64 deadline, a common 32-byte fingerprint, and a big-endian u16 world count.
 Each world supplies the 16-byte world and original held handle, a u16 witness count and its 16-byte nonces, a 22-byte attempt ID, an i64 expected local clock (MIN for absent), then the overlay groups prefixed by their u32 byte length.
-After the worlds, encode the original Root range witnesses as a u16 count and handle/nonce pairs, then a u32 length and the ordered Root fact groups containing only point conditions.
-A batch with one world must include at least one Root condition. Root conditions are checked in the same order before any overlay applies.
+After the worlds, a single byte selects no Root section (0), Root validation (1), or Root publication (2).
+Kinds 1 and 2 carry the original 16-byte Root hold. Kind 2 also carries its 22-byte attempt ID.
+Next come a u16 Root range witness count and the original handle/nonce pairs, then the u32 byte length and ordered Root fact groups.
+Kind 1 supplies point checks, range checks, or both. Kind 2 also supplies Root inserts, replacements, or deletes.
+A batch with one world requires kind 1 or 2.
 The request ends with the common check-only hosted ownership groups. Every integer is big-endian.
-The placed owner checks all parent pins and orders all overlay effects, local application clocks and distinct immutable attempt markers at the transaction key in the usual commit reply.
+The placed owner checks the parent pins and Root observations before applying changes. The optional Root head, overlays, local clocks and distinct immutable attempt markers share one transaction key in the usual commit reply.
 
 `rtdb.owned.CommitWorld.v4` publishes an admitted single-world overlay and application clock atomically.
 `rtdb.owned.CommitWorldClock.v1` publishes a clock alone using the same held conditions, deadline, hosted ownership checks, and immutable attempt marker.

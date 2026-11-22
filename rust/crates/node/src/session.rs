@@ -169,7 +169,7 @@ impl DmlBuffer {
             )?,
             TxOp::HostedControl(control) => control.retained_bytes()?,
             TxOp::OwnedForkWorld { record, attempt, .. } => Value::document_retained_bytes(record)?.saturating_add(attempt.len() + 128),
-            TxOp::OwnedPublishWorld { attempt, .. } => attempt.len() + 128,
+            TxOp::OwnedPublishRoot { attempt, .. } | TxOp::OwnedPublishWorld { attempt, .. } => attempt.len() + 128,
             TxOp::OwnedCheckWorldPurge { relation, .. } => relation.name().len(),
             TxOp::OwnedDeadline { .. } | TxOp::OwnedCheckWorldScope { .. } => 0,
             TxOp::OwnedDeclareFixedRange { relation, rule } => relation.name().len() + rule.path.capacity() + rule.column.capacity(),

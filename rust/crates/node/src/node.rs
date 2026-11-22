@@ -1498,6 +1498,17 @@ pub struct OwnedWorldFork {
     pub controls: Vec<rtdb_tx::HostedControlWrite>,
 }
 
+#[derive(Default)]
+pub struct OwnedRootSection {
+    pub checks: Vec<TxOp>,
+    pub publication: Option<OwnedRootPublication>,
+}
+
+pub struct OwnedRootPublication {
+    pub attempt: String,
+    pub writes: Vec<TxOp>,
+}
+
 pub struct OwnedWorldSection {
     pub world: rtdb_types::Iid,
     pub parent_basis: TransactionKey,
@@ -1590,13 +1601,13 @@ impl NativeSession {
     }
     pub async fn commit_owned_world_batch(
         &mut self, sections: Vec<(Timestamp, OwnedWorldSection)>,
-        root_checks: Vec<TxOp>,
+        root: OwnedRootSection,
         controls: Vec<rtdb_tx::HostedControlWrite>, deadline: Timestamp,
     ) -> Result<TransactionResult> {
         let unavailable = rtdb_types::OwnedWorld::unavailable;
-        if !(1..=8).contains(&sections.len()) || (sections.len() == 1 && root_checks.is_empty())
+        if !(1..=8).contains(&sections.len()) || (sections.len() == 1 && root.checks.is_empty() && root.publication.is_none())
             || controls.is_empty() || controls.iter().any(|control| !control.is_check())
-            || root_checks.iter().any(|check| match check {
+            || root.checks.iter().any(|check| match check {
                 TxOp::OwnedCheck { relation, .. } | TxOp::OwnedCheckRange { relation, .. } =>
                     relation.world().is_some() || relation.is_world_catalog(),
                 _ => true,
@@ -1610,7 +1621,18 @@ impl NativeSession {
         let mut worlds = std::collections::BTreeSet::new();
         let mut attempts = std::collections::BTreeSet::new();
         let fingerprint = sections[0].1.publication.fingerprint;
-        let mut effects = controls.len().saturating_add(root_checks.len()).saturating_add(2);
+        let mut effects = controls.len().saturating_add(root.checks.len()).saturating_add(2);
+        if let Some(root) = &root.publication {
+            if root.writes.is_empty() || root.writes.iter().any(|write| match write {
+                TxOp::OwnedInsertDocs { relation, .. } | TxOp::OwnedReplaceDocs { relation, .. }
+                | TxOp::OwnedDelete { relation, .. } => !relation.is_root_data(),
+                _ => true,
+            }) {
+                return Err(unavailable());
+            }
+            attempts.insert(&root.attempt);
+            effects = effects.saturating_add(root.writes.len()).saturating_add(3);
+        }
         for (retained_until, section) in &sections {
             if !worlds.insert(section.world) || section.writes.is_empty()
                 || !(1..=128).contains(&section.checks.len()) || section.publication.drop_world
@@ -1637,7 +1659,11 @@ impl NativeSession {
         ops.push(TxOp::OwnedDeadline { until });
         ops.push(TxOp::OwnedCheckWorldScope { scope });
         ops.extend(controls.into_iter().map(TxOp::HostedControl));
-        ops.extend(root_checks);
+        ops.extend(root.checks);
+        if let Some(root) = root.publication {
+            ops.extend(root.writes);
+            ops.push(TxOp::OwnedPublishRoot { attempt: root.attempt, fingerprint });
+        }
         for (_, section) in sections {
             self.append_world_effects(&mut ops, section.world, section.writes, section.checks)?;
             let OwnedWorldPublication { attempt, fingerprint, expected_clock, advance_to, drop_world } = section.publication;

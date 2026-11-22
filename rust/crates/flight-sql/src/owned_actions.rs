@@ -167,7 +167,7 @@ pub(crate) enum WorldCommitFormat {
 
 pub(crate) const COMMIT_WORLD_DROP_V1: &str = "rtdb.owned.CommitWorldDrop.v1";
 pub(crate) const COMMIT_WORLD_CLOCK_V1: &str = "rtdb.owned.CommitWorldClock.v1";
-pub(crate) const COMMIT_HELD_WORLDS_V2: &str = "rtdb.owned.CommitHeldWorlds.v2";
+pub(crate) const COMMIT_HELD_WORLDS_V3: &str = "rtdb.owned.CommitHeldWorlds.v3";
 pub(crate) const COMMIT_WORLD_V4: &str = "rtdb.owned.CommitWorld.v4";
 pub(crate) const COMMIT_WORLD_V3: &str = "rtdb.owned.CommitWorld.v3";
 const MAX_WORLD_WITNESSES: usize = 128;
@@ -1648,21 +1648,56 @@ impl Service {
                 },
             });
         }
+        let ([root_kind], body) = body.split_first_chunk::<1>().ok_or_else(|| invalid("Missing Root section kind"))?;
+        let (root_read, body) = match *root_kind {
+            0 => (None, body),
+            1 | 2 => {
+                let (handle, body) = body.split_first_chunk::<16>().ok_or_else(|| invalid("Missing original Root hold"))?;
+                (Some(self.owned_read(call, &Bytes::copy_from_slice(handle))?), body)
+            }
+            _ => return Err(invalid("Invalid Root section kind")),
+        };
+        let (root_attempt, body) = if *root_kind == 2 {
+            let (attempt, body) = body.split_first_chunk::<22>().ok_or_else(|| invalid("Missing Root attempt identity"))?;
+            let attempt = std::str::from_utf8(attempt).map_err(|_| invalid("Invalid Root attempt identity"))?;
+            if !attempt.bytes().all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)) || !attempts.insert(attempt) {
+                return Err(invalid("Invalid or repeated Root attempt identity"));
+            }
+            rows_left = rows_left.checked_sub(3).ok_or_else(|| invalid("World batch exceeds its effect limit"))?;
+            (Some(attempt), body)
+        } else {
+            (None, body)
+        };
         let (root_witnesses, body, _root_witness_charge) = self.owned_witness_prefix(call, body, true)?;
-        let (root_length, body) = body.split_first_chunk::<4>().ok_or_else(|| invalid("Missing Root validation length"))?;
+        let (root_length, body) = body.split_first_chunk::<4>().ok_or_else(|| invalid("Missing Root section length"))?;
         let (root, body) = body.split_at_checked(u32::from_be_bytes(*root_length) as usize)
-            .ok_or_else(|| invalid("Incomplete Root validation groups"))?;
-        let mut root_checks = Vec::new();
-        let _root = self.decode_owned_commit_groups(
-            call, owned_groups(root, false, true)?, &mut root_checks, &mut rows_left, false,
+            .ok_or_else(|| invalid("Incomplete Root groups"))?;
+        let _root_framing = call.reserve(ordered_group_count(root)? * 512)?;
+        let mut root_ops = Vec::new();
+        let _root_groups = self.decode_owned_commit_groups(
+            call, owned_groups(root, false, true)?, &mut root_ops, &mut rows_left, false,
         )?;
-        if root_checks.iter().any(|check| !matches!(check, TxOp::OwnedCheck { .. })) {
-            return Err(invalid("Root conditions cannot carry mutations"));
+        let mut root = rtdb_node::OwnedRootSection::default();
+        let mut root_writes = Vec::new();
+        for operation in root_ops {
+            match &operation {
+                TxOp::OwnedCheck { relation, .. } if relation.world().is_none() && !relation.is_world_catalog() =>
+                    root.checks.push(operation),
+                TxOp::OwnedInsertDocs { relation, .. } | TxOp::OwnedReplaceDocs { relation, .. }
+                | TxOp::OwnedDelete { relation, .. } if root_attempt.is_some() && relation.is_root_data() =>
+                    root_writes.push(operation),
+                _ => return Err(invalid("Operation is outside the held Root section")),
+            }
+        }
+        if let Some(attempt) = root_attempt {
+            if root_writes.is_empty() { return Err(invalid("A Root publication requires fact writes")); }
+            root.publication = Some(rtdb_node::OwnedRootPublication { attempt: attempt.to_owned(), writes: root_writes });
+        }
+        let observed_root = !root.checks.is_empty() || !root_witnesses.is_empty();
+        if (*root_kind == 0 && observed_root) || (*root_kind == 1 && !observed_root) || (count == 1 && *root_kind == 0) {
+            return Err(invalid("A combined publication requires original Root conditions or writes"));
         }
         rows_left = rows_left.checked_sub(root_witnesses.len()).ok_or_else(|| invalid("World batch exceeds its effect limit"))?;
-        if count == 1 && root_checks.is_empty() && root_witnesses.is_empty() {
-            return Err(invalid("A single world batch requires original Root conditions"));
-        }
         let controls = owned_groups(body, true, false)?;
         hosted_control::admit_control_targets(policy, controls.iter().map(|(relation, _)| relation))?;
         let scope = self.hosted_control_scope(call).await?;
@@ -1673,16 +1708,21 @@ impl Service {
         let mut session = connection.borrow().await?;
         require_idle(&session)?;
         for resource in &held { resource.snapshot.check().map_err(status)?; }
-        for (original, evidence) in &root_witnesses {
-            original.snapshot.check().map_err(status)?;
-            if !evidence.matches_scope(Some(scope)) {
-                return Err(Status::failed_precondition("Root range witness belongs to another placement"));
+        if let Some(read) = &root_read {
+            read.snapshot.check().map_err(status)?;
+            if read.snapshot.present().system_time >= deadline {
+                return Err(Status::failed_precondition("Root hold is outside the world batch deadline"));
             }
-            root_checks.push(evidence.clone().operation());
+        }
+        for (original, evidence) in &root_witnesses {
+            if root_read.as_ref().is_none_or(|read| !Arc::ptr_eq(read, original)) || !evidence.matches_scope(Some(scope)) {
+                return Err(Status::failed_precondition("Root range witness belongs to another hold or placement"));
+            }
+            root.checks.push(evidence.clone().operation());
         }
         let committed = host.commit_world_batch(
             crate::WorldCall { node: &self.0.node, attachment: &attachment, session: &mut session, cancellation: &call.cancellation },
-            sections, root_checks, controls, deadline,
+            sections, root, controls, deadline,
         ).await.map_err(status)?;
         self.owned_tx_reply(committed)
     }
