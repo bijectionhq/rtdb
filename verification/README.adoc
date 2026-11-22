@@ -223,6 +223,12 @@ It also exercises the Azure adapter against a loopback provider and separately m
 * `tla/CheckpointReplayClosure.tla` checks bound table discovery, repeat observations and publication only after the replay inventory is copied.
   `lean/CheckpointReplayClosure.lean` proves membership for retained inputs and usable artefacts over arbitrary lists of decoded trie entries.
   The Rust cases cover shared paths, retained level-zero files, rejected table substitution, older archive manifests and independent-fork publication.
+* `tla/CheckpointCopyEvidence.tla` checks the predicate admitting a body to a checkpoint copy plan.
+  `lean/CheckpointCopyEvidence.lean` proves inventory agreement and budget conservation for arbitrary finite lists.
+  `verus/checkpoint_copy_budget` checks exact sealed-byte admission and accounting in production.
+  Rust cases cover an inherited pack and loose object, repair archive custody, a changed identity with identical data, and the S3 full-body response.
+* `tla/CheckpointPhysicalOwners.tla` compares one atomic admission with acquisition separately from each physical owner.
+  It checks that every owner has admitted the copy before provider work begins and that cancellation releases partial acquisitions.
 * `tla/CheckpointSourceHandoff.tla` compares exact physical and residence-wide source holds for two roots with shared and inherited dependencies.
   It checks delayed collection, cancellation before the provider drains and a separate durable destination handoff under declared fairness.
   `lean/CheckpointSourceHandoff.lean` proves preservation for arbitrary exact physical dependency sets and finite schedules.

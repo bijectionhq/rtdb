@@ -159,8 +159,11 @@ impl ObjectStore for RemoteStore {
         self.io.run_async(async move { objects.get(&key).await }).await
     }
     async fn get_fresh_exact(&self, key: &ObjectKey, length: usize) -> Result<Bytes> {
-        let (objects, key) = (Arc::clone(&self.objects), key.clone());
-        self.io.run_async(async move { objects.get_exact(&key, length).await }).await
+        Ok(self.observe_fresh_exact(key, length).await?.value)
+    }
+    async fn observe_fresh_exact(&self, key: &ObjectKey, length: usize) -> Result<ObjectObservation<Bytes>> {
+        let (objects, key, namespace) = (self.objects.clone(), key.clone(), self.version_namespace.clone());
+        self.io.run_async(async move { objects.observe_exact(&key, length, namespace.as_deref()).await }).await
     }
     async fn get_range(&self, key: &ObjectKey, range: Range<u64>) -> Result<Bytes> {
         let (objects, key) = (Arc::clone(&self.objects), key.clone());
@@ -314,12 +317,14 @@ impl RemoteObjects {
             .bytes().await.map_err(|error| provider_error(key, error))
     }
 
-    async fn get_exact(&self, key: &ObjectKey, length: usize) -> Result<Bytes> {
-        let object = self.client.get(&self.path(key)).await.map_err(|error| provider_error(key, error))?;
+    async fn observe_exact(&self, key: &ObjectKey, length: usize, namespace: Option<&S3ObjectNamespace>) -> Result<ObjectObservation<Bytes>> {
+        let path = self.path(key);
+        let object = self.client.get(&path).await.map_err(|error| provider_error(key, error))?;
         let wrong_size = || crate::object_store::wrong_size(key, length);
         if object.meta.size != length as u64 || object.range != (0..length as u64) {
             return Err(wrong_size());
         }
+        let version = physical_version(namespace, &path, object.meta.version.clone());
         let mut stream = object.into_stream();
         let first = stream.try_next().await.map_err(|error| provider_error(key, error))?.unwrap_or_default();
         if first.len() > length { return Err(wrong_size()); }
@@ -327,7 +332,7 @@ impl RemoteObjects {
             while let Some(chunk) = stream.try_next().await.map_err(|error| provider_error(key, error))? {
                 if !chunk.is_empty() { return Err(wrong_size()); }
             }
-            return Ok(first);
+            return Ok(ObjectObservation { value: first, version });
         }
         let mut bytes = Vec::with_capacity(length);
         bytes.extend_from_slice(&first);
@@ -337,7 +342,7 @@ impl RemoteObjects {
             bytes.extend_from_slice(&chunk);
         }
         if bytes.len() != length { return Err(wrong_size()); }
-        Ok(bytes.into())
+        Ok(ObjectObservation { value: bytes.into(), version })
     }
 
     async fn get_range(&self, key: &ObjectKey, range: Range<u64>) -> Result<Bytes> {

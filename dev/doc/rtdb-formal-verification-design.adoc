@@ -1468,6 +1468,16 @@ The source-handoff model compares whole-residence and exact physical holds, incl
 Both designs preserve the bounded safety invariant. The exact design admits collection of unrelated data while a copy is active.
 Lean proves source retention during an admitted read for arbitrary finite schedules over exact dependency sets.
 That result assumes the published dependency mapping is complete and collection authorization has a single order with admission.
+Archive and independent-fork copies now plan the exact logical member and the physical publication behind it when the provider exposes one.
+Packed members carry their containing pack's identity. A repair-backed member carries the identity of its accepted archive ciphertext.
+The exact read checks the body response against the planned namespace, physical key and version token, and separately checks the logical length and any bound metadata digest.
+The archive preflights its sealed byte budget before copying the body inventory.
+Verus checks the production debit step for every representable size, and Lean checks its composition over arbitrary lists of costs.
+TLC and Apalache check a changed physical source, including equal version tokens under different paths.
+Native selections use a read through the real storage layers and a loopback S3 response.
+A second bounded model compares a single atomic admission with separate acquisition from two physical owners.
+Both preserve the source obligation when reading requires every owner's hold, local admission accounts for earlier removal authorizations, and cancellation waits for provider drain.
+The separate acquisition model also reaches cleanup after a partial refusal.
 The native memory-provider run selects a later checkpoint and replays its retained suffix with the cursor admitted during startup.
 TLC checks cursor admission, reuse and strict progress before refusal and reaches a state with later trimming after admission.
 mCRL2 checks the observable results of the staged discovery model against the atomic contract for three reported indices.

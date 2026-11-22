@@ -148,6 +148,11 @@ pub trait ObjectStore: Send + Sync {
         if bytes.len() != length { return Err(wrong_size(key, length)); }
         Ok(bytes)
     }
+    /// Reads exactly the expected full object length and returns the physical version from
+    /// the response supplying the bytes when the provider can identify that version.
+    async fn observe_fresh_exact(&self, key: &ObjectKey, length: usize) -> Result<ObjectObservation<Bytes>> {
+        Ok(ObjectObservation { value: self.get_fresh_exact(key, length).await?, version: None })
+    }
     /// Returns exactly the half-open byte range; an unavailable range is an error.
     async fn get_range(&self, key: &ObjectKey, range: Range<u64>) -> Result<Bytes>;
     /// Reads the exact range and carries the physical version from this read, when available.

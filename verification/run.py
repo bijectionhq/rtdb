@@ -1420,6 +1420,25 @@ def verify_checkpoint_metadata_retention(args, scratch):
     verify_lean_model(args, scratch, path, "checkpoint-metadata-retention", controls, 4)
 
 
+def verify_checkpoint_copy_evidence(args, scratch):
+    path = Path("verification/lean/CheckpointCopyEvidence.lean")
+    controls = {
+        "erase-physical-binding": (
+            "  planned.version = body.version ∧", "  True ∧",
+            ["copied_members_match_the_plan"],
+        ),
+        "erase-bound-metadata": (
+            "  ∀ digest, planned.digest = some digest → body.digest = digest", "  True",
+            ["copied_members_match_the_plan"],
+        ),
+        "skip-budget-debit": (
+            "then charge (remaining - cost) tail else none", "then charge remaining tail else none",
+            ["successful_plan_conserves_budget", "a_funded_inventory_uses_its_exact_cost"],
+        ),
+    }
+    verify_lean_model(args, scratch, path, "checkpoint-copy-evidence", controls, 4)
+
+
 def verify_checkpoint_source_handoff(args, scratch):
     path = Path("verification/lean/CheckpointSourceHandoff.lean")
     controls = {
@@ -1700,6 +1719,7 @@ def verify_lean(args, scratch):
             verify_replica_hold_close(args, scratch)
             verify_checkpoint_metadata_retention(args, scratch)
             verify_checkpoint_source_handoff(args, scratch)
+            verify_checkpoint_copy_evidence(args, scratch)
             verify_published_checkpoint(args, scratch)
             verify_checkpoint_table_manifest(args, scratch)
             verify_pack_publication_lean(args, scratch)
@@ -1963,6 +1983,37 @@ TLA_CASES = (
      ('Mutation = "none"', 'Mutation = "publish_early"'), "Safe"),
     ("CheckpointReplayClosure", "checkpoint-replay-closure-copied-file-witness",
      ("INVARIANT Safe", "INVARIANT NeverPublishesAfterSourceLoss"), "NeverPublishesAfterSourceLoss"),
+    ("CheckpointCopyEvidence", "checkpoint-copy-evidence", None, None),
+    ("CheckpointCopyEvidence", "checkpoint-copy-trust-only-version-token",
+     ('Mutation = "none"\nINVARIANT Safe', 'Mutation = "trust_version_token"\nINVARIANT PlanMatchesBody'), "PlanMatchesBody"),
+    ("CheckpointCopyEvidence", "checkpoint-copy-accept-lost-evidence",
+     ('Mutation = "none"\nINVARIANT Safe', 'Mutation = "accept_lost_evidence"\nINVARIANT PlanMatchesBody'), "PlanMatchesBody"),
+    ("CheckpointCopyEvidence", "checkpoint-copy-infer-body-receipt",
+     ('Mutation = "none"\nINVARIANT Safe', 'Mutation = "fabricate_receipt"\nINVARIANT ReceiptNamesBody'), "ReceiptNamesBody"),
+    ("CheckpointCopyEvidence", "checkpoint-copy-ignore-metadata-digest",
+     ('Mutation = "none"\nINVARIANT Safe', 'Mutation = "ignore_metadata"\nINVARIANT AuthenticatedMetadata'), "AuthenticatedMetadata"),
+    ("CheckpointCopyEvidence", "checkpoint-copy-inherited-witness",
+     ("INVARIANT Safe", "INVARIANT NeverPublishesInherited"), "NeverPublishesInherited"),
+    ("CheckpointCopyEvidence", "checkpoint-copy-archive-witness",
+     ("INVARIANT Safe", "INVARIANT NeverPublishesArchived"), "NeverPublishesArchived"),
+    ("CheckpointCopyEvidence", "checkpoint-copy-unversioned-witness",
+     ("INVARIANT Safe", "INVARIANT NeverPublishesUnversioned"), "NeverPublishesUnversioned"),
+    ("CheckpointPhysicalOwners", "physical-owners-separate-admission", None, None),
+    ("CheckpointPhysicalOwners", "physical-owners-atomic-admission",
+     ('Design = "per_owner"\n    Mutation = "none"\nINVARIANT Safe',
+      'Design = "atomic"\n    Mutation = "none"\nINVARIANTS Safe NeverHasPartialAcquisition'), None),
+    ("CheckpointPhysicalOwners", "physical-owners-accept-one-owner",
+     ('Mutation = "none"\nINVARIANT Safe', 'Mutation = "accept_one_owner"\nINVARIANT ReadsRequireEveryOwner'), "ReadsRequireEveryOwner"),
+    ("CheckpointPhysicalOwners", "physical-owners-ignore-prior-authorization",
+     ('Mutation = "none"\nINVARIANT Safe', 'Mutation = "ignore_prior_authorization"\nINVARIANT HeldVersionsAreRetained'), "HeldVersionsAreRetained"),
+    ("CheckpointPhysicalOwners", "physical-owners-release-before-drain",
+     ('Mutation = "none"\nINVARIANT Safe', 'Mutation = "release_before_drain"\nINVARIANT ReadsRequireEveryOwner'), "ReadsRequireEveryOwner"),
+    ("CheckpointPhysicalOwners", "physical-owners-partial-acquisition-witness",
+     ("INVARIANT Safe", "INVARIANT NeverHasPartialAcquisition"), "NeverHasPartialAcquisition"),
+    ("CheckpointPhysicalOwners", "physical-owners-cancellation-witness",
+     ("INVARIANT Safe", "INVARIANT NeverCancelsAfterRefusal"), "NeverCancelsAfterRefusal"),
+    ("CheckpointPhysicalOwners", "physical-owners-publication-witness",
+     ("INVARIANT Safe", "INVARIANT NeverPublishes"), "NeverPublishes"),
     ("CheckpointSourceHandoff", "source-handoff-exact", None, None),
     ("CheckpointSourceHandoff", "source-handoff-residence",
      ('Design = "exact"\n    Mutation = "none"\nINVARIANT Safe', 'Design = "residence"\n    Mutation = "none"\nINVARIANTS Safe NeverReclaimsWhileHeld'), None),
@@ -2428,6 +2479,17 @@ def verify_apalache(args, scratch):
     check_apalache(args, scratch, "CheckpointReplayClosure", "checkpoint-replay-closure-omit-artefact",
                    "PublicationIsComplete", 10, ('Mutation = "none"', 'Mutation = "omit_artefact"'),
                    "a replay copy is published without the required shared artefact")
+    check_apalache(args, scratch, "CheckpointCopyEvidence", "checkpoint-copy-evidence", "Safe", 5)
+    check_apalache(args, scratch, "CheckpointCopyEvidence", "checkpoint-copy-trust-only-version-token",
+                   "PlanMatchesBody", 5, ('Mutation = "none"', 'Mutation = "trust_version_token"'),
+                   "matching provider tokens can name distinct physical paths")
+    check_apalache(args, scratch, "CheckpointCopyEvidence", "checkpoint-copy-infer-body-receipt",
+                   "ReceiptNamesBody", 5, ('Mutation = "none"', 'Mutation = "fabricate_receipt"'),
+                   "source metadata cannot substitute for the body response identity")
+    check_apalache(args, scratch, "CheckpointPhysicalOwners", "physical-owners-separate-admission", "Safe", 10)
+    check_apalache(args, scratch, "CheckpointPhysicalOwners", "physical-owners-accept-one-owner",
+                   "ReadsRequireEveryOwner", 10, ('Mutation = "none"', 'Mutation = "accept_one_owner"'),
+                   "a provider read begins before every physical owner accepts")
     check_apalache(args, scratch, "CheckpointSourceHandoff", "source-handoff-exact", "Safe", 11)
     check_apalache(args, scratch, "CheckpointSourceHandoff", "source-handoff-ignore-inherited-pack",
                    "SourceIsRetained", 11, ('Mutation = "none"', 'Mutation = "ignore_inherited_pack"'),
@@ -2869,10 +2931,9 @@ def verify_checkpoint_replay_closure(args, source):
     catalog_path = "rust/crates/format/src/catalog.rs"
     inventory_failure = "replay closure must include retained L0 and one copy per usable artefact"
     publish_root = "    packed.put(&catalog_key, cipher.seal_deterministic(catalog_key.as_str(), &catalog_bytes)?).await?;"
-    copy_loop = """    for (object, expected) in closure.into_iter().filter(|(object, _)| object != &catalog_key) {
-        let content = plaintext.get_fresh(&object).await?;
-        require_bound_metadata(expected, &content)?;
-        packed.put(&object, cipher.seal_deterministic(object.as_str(), &content)?).await?;
+    copy_loop = """    for source in sources {
+        let content = source.read(&plaintext).await?;
+        packed.put(&source.name, cipher.seal_deterministic(source.name.as_str(), &content)?).await?;
     }"""
     cases = (
         ("manifest", archive, manifest, None),
@@ -3515,6 +3576,66 @@ def verify_checkpoint_metadata_replay(args, source):
     print(f"{label}: startup metadata survived collection until provider drain, ignoring the hold failed")
 
 
+def verify_checkpoint_copy_publications(args, source):
+    env = os.environ | {
+        "CARGO_TARGET_DIR": os.environ.get("CARGO_TARGET_DIR", str(ROOT / "target")),
+        "CARGO_PROFILE_TEST_DEBUG": "0",
+    }
+    multi = ["cargo", "test", "--locked", "-p", "rtdb-multi", "--features", "dynamodb", "--lib"]
+    s3 = ["cargo", "test", "--locked", "-p", "rtdb-s3", "--lib"]
+    source_match = "archive::tests::a_checkpoint_copy_checks_the_planned_physical_publication"
+    inherited = "packing::tests::checkpoint_member_observations_name_the_inherited_publication"
+    repair = "archive::tests::checkpoint_copy_plans_from_the_repair_archive_custody"
+    provider = "tests::ranged_observation_uses_the_version_from_the_payload_response"
+    cases = (
+        ("source-match", multi, source_match, None),
+        ("inherited", multi, inherited, None),
+        ("repair", multi, repair, None),
+        ("provider", s3, provider, None),
+        ("drop-source-match", multi, source_match, (
+            "rust/crates/multi/src/archive.rs", "if observed.version != self.version {",
+            "if false && observed.version != self.version {",
+            "an identical body under another version cannot satisfy a source plan",
+        )),
+        ("lose-inherited-body", multi, inherited, (
+            "rust/crates/multi/src/reference.rs",
+            "self.read(key, |store, key| store.observe_fresh_exact(key, length)).await",
+            "Ok(ObjectObservation { value: self.get_fresh_exact(key, length).await?, version: None })",
+            "the exact body and head name the same publication",
+        )),
+        ("lose-repair-head", multi, repair, (
+            "rust/crates/multi/src/archive.rs", "let metadata = self.archive.files.observe_head(key).await?;",
+            "let metadata = ObjectObservation { value: self.archive.files.head_fresh(key).await?, version: None };",
+            "repair bytes must name archive custody",
+        )),
+        ("lose-provider-body", s3, provider, (
+            "rust/crates/storage/src/remote.rs",
+            "let version = physical_version(namespace, &path, object.meta.version.clone());",
+            "let version = None;", "the exact body must carry its provider response version",
+        )),
+    )
+    for name, cargo, test, control in cases:
+        command = [*cargo, test, "--", "--exact"]
+        label = f"rust-checkpoint-copy-publications-{name}"
+        if not control:
+            checked = run_case(command, source / "rust", args.evidence, label, env)
+            if checked.returncode or f"{test} ... ok" not in checked.stdout or "1 passed; 0 failed" not in checked.stdout:
+                raise ValueError(f"checkpoint copy publication baseline {name} failed")
+            continue
+        relative, before, after, failure = control
+        path = source / relative
+        original = path.read_bytes()
+        try:
+            replace_once(path, before, after)
+            checked = run_case(command, source / "rust", args.evidence, label, env)
+        finally:
+            path.write_bytes(original)
+        if (checked.returncode != 101 or f"{test} ... FAILED" not in checked.stdout
+            or failure not in checked.stdout or "0 passed; 1 failed" not in checked.stdout):
+            raise ValueError(f"checkpoint copy publication control {name} missed its declared assertion")
+    print("rust-checkpoint-copy-publications: all four cases and four controls matched")
+
+
 def verify_checkpoint_capture_metadata(args, source):
     env = os.environ | {
         "CARGO_TARGET_DIR": os.environ.get("CARGO_TARGET_DIR", str(ROOT / "target")),
@@ -4080,6 +4201,7 @@ def main():
             verify_checkpoint_receipts(args, source)
             verify_checkpoint_metadata_replay(args, source)
             verify_checkpoint_capture_metadata(args, source)
+            verify_checkpoint_copy_publications(args, source)
             verify_delegated_scan_replay(args, source)
             verify_fragment_residence_replay(args, source)
             verify_catalog_replay(args, source)

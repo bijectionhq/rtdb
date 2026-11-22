@@ -102,8 +102,30 @@ Controls hold the wrong cut, authorize an object in the current root, ignore an 
 The Lean model uses arbitrary sets of physical publications and proves that the admission, authorization, read and drain transitions preserve outstanding dependencies through any finite schedule.
 The exact variant permits reclamation of an unrelated publication during an admitted read. The residence-wide variant blocks that reclamation.
 The bounded liveness property assumes weak fairness for provider delivery, destination acceptance, handoff and cancellation drain.
-Physical enforcement still needs a complete mapping from each logical dependency to its observed publication, including inherited packs, plus authority shared by every collection entry point.
+Archive and independent-fork preparation now resolve logical members to the physical versions observed by their exact reads, including inherited packs and repair ciphertext.
+They keep the logical path and planned length with the version, apply root and table digest checks, and reject if a body's observation differs.
+An unversioned member relies on the immutable-object contract.
+This observation is local to preparation. Holding it across reclaim requires a durable admission against the physical owner and a shared ordering with authorization at every corresponding collection entry point.
 A production proof should cover the hold and retirement decisions, with directory compare-and-replace and provider version semantics stated as premises.
+
+### Admission across physical owners
+
+An inherited pack belongs to the authority responsible for the physical object reported in the body response.
+A repair-backed member belongs to the authority responsible for the archive ciphertext.
+In both cases the serving deployment's metadata hold can coexist with a separate physical owner.
+
+A candidate composition acquires protection from each physical owner before it admits a copy.
+Each owner orders admission against its already-authorized removals.
+The copy begins only after all ownership groups have accepted, and it rereads the members against the admitted plan.
+An incomplete acquisition releases the groups it already holds after their provider work drains.
+This composition needs an ordering within each owner and an all-owners admission check at handoff.
+The bounded comparison with atomic directory-wide admission preserves safety in both forms.
+Separate admission reaches a partial acquisition, and it reaches cleanup after the second owner refuses.
+The model checks cancellation and delayed removal. Concurrent owner transfer remains a separate obligation.
+
+The production evidence needs exact storage responses at the admission boundary, a durable namespace and owner binding for each group, and proof that provider erasure requires the same authorization used by the admission test.
+The final claim also needs a rule for providers that expose no stable object version.
+
 
 ## Open questions
 

@@ -1,8 +1,6 @@
 //! Immutable, ciphertext-only captures of published checkpoints.
 use std::{
-    collections::{
-        BTreeMap,
-    },
+    collections::BTreeMap,
     ops::Range,
     path::Path,
     sync::Arc,
@@ -40,12 +38,14 @@ use rtdb_storage::{
     Error,
     IoRegion,
     ObjectKey,
+    ObjectObservation,
     ObjectStore,
 };
 use rtdb_types::{
     Anomaly,
     AnomalyCategory,
     BlockIndex,
+    PhysicalObjectVersion,
     ReplicaPosition,
     Result,
     StorageEpoch,
@@ -99,6 +99,19 @@ async fn read_object(
     }
     let ciphertext = files.get_range(name, 0..object.bytes).await?;
     if ciphertext.len() as u64 != object.bytes || digest(&ciphertext) != object.sha256 {
+        return Err(Error::ConflictingObject(name.to_string()));
+    }
+    Ok(ciphertext)
+}
+
+async fn observe_archive_object(
+    files: &dyn ObjectStore,
+    name: &ObjectKey,
+    object: &ArchivedObject,
+) -> rtdb_storage::Result<ObjectObservation<Bytes>> {
+    let length = usize::try_from(object.bytes).map_err(|_| Error::ConflictingObject(name.to_string()))?;
+    let ciphertext = files.observe_fresh_exact(name, length).await?;
+    if ciphertext.value.len() != length || digest(&ciphertext.value) != object.sha256 {
         return Err(Error::ConflictingObject(name.to_string()));
     }
     Ok(ciphertext)
@@ -237,14 +250,31 @@ impl ObjectStore for CheckpointStore {
     }
 
     async fn head_fresh(&self, key: &ObjectKey) -> rtdb_storage::Result<StoredObject> {
+        Ok(self.observe_head(key).await?.value)
+    }
+
+    async fn observe_head(&self, key: &ObjectKey) -> rtdb_storage::Result<ObjectObservation<StoredObject>> {
         let Some(object) = self.archive.objects.get(key) else {
-            return self.serving.head_fresh(key).await;
+            return self.serving.observe_head(key).await;
         };
-        let metadata = self.archive.files.head_fresh(key).await?;
-        if metadata.size != object.bytes {
+        let metadata = self.archive.files.observe_head(key).await?;
+        if metadata.value.size != object.bytes {
             return Err(Error::ConflictingObject(key.to_string()));
         }
         Ok(metadata)
+    }
+
+    async fn observe_fresh_exact(&self, key: &ObjectKey, length: usize) -> rtdb_storage::Result<ObjectObservation<Bytes>> {
+        let Some(object) = self.archive.objects.get(key) else {
+            return self.serving.observe_fresh_exact(key, length).await;
+        };
+        if object.bytes != length as u64 {
+            return Err(Error::ConflictingObject(key.to_string()));
+        }
+        let observed = observe_archive_object(&self.archive.files, key, object).await?;
+        let plaintext = self.archive.archive_cipher.open(key.as_str(), &observed.value)?;
+        let value = self.archive.serving_cipher.seal_deterministic(key.as_str(), &plaintext)?;
+        Ok(ObjectObservation { value, version: observed.version })
     }
 
     async fn retirement_version(&self, key: &ObjectKey) -> rtdb_storage::Result<Option<rtdb_types::PhysicalObjectVersion>> {
@@ -654,6 +684,59 @@ async fn catalog_objects(plaintext: &dyn ObjectStore, catalog: &BlockCatalog, co
     Ok(closure)
 }
 
+/// The exact body observation expected for a logical source member. A packed
+/// member names its containing publication, and a repaired member names its
+/// archived ciphertext. The observation does not confer retirement authority.
+struct CheckpointCopySource {
+    name: ObjectKey,
+    logical_bytes: usize,
+    version: Option<PhysicalObjectVersion>,
+    metadata_digest: Option<[u8; 32]>,
+}
+
+impl CheckpointCopySource {
+    async fn observe(
+        store: &dyn ObjectStore,
+        name: ObjectKey,
+        metadata_digest: Option<[u8; 32]>,
+    ) -> Result<Self> {
+        let observed = store.observe_head(&name).await?;
+        let logical_bytes = usize::try_from(observed.value.size)
+            .map_err(|_| unavailable("Checkpoint object exceeds addressable length"))?;
+        Ok(Self { name, logical_bytes, version: observed.version, metadata_digest })
+    }
+
+    async fn read(&self, store: &dyn ObjectStore) -> Result<Bytes> {
+        let observed = store.observe_fresh_exact(&self.name, self.logical_bytes).await?;
+        if observed.version != self.version {
+            return Err(inconsistent("Checkpoint source publication changed during copying"));
+        }
+        if observed.value.len() != self.logical_bytes {
+            return Err(inconsistent("Checkpoint source length changed during copying"));
+        }
+        require_bound_metadata(self.metadata_digest, &observed.value)?;
+        Ok(observed.value)
+    }
+}
+
+async fn plan_checkpoint_copy(
+    store: &dyn ObjectStore,
+    closure: CheckpointObjects,
+    mut archive_budget: Option<u64>,
+) -> Result<Vec<CheckpointCopySource>> {
+    let mut sources = Vec::with_capacity(closure.len());
+    for (name, digest) in closure {
+        let source = CheckpointCopySource::observe(store, name, digest).await?;
+        if let Some(remaining) = &mut archive_budget {
+            *remaining = crate::checkpoint_copy_budget::remaining_after_sealing(
+                *remaining, source.logical_bytes as u64, crate::cipher::SEALED_OVERHEAD as u64,
+            ).ok_or_else(|| unavailable("Checkpoint exceeds the archive byte budget"))?;
+        }
+        sources.push(source);
+    }
+    Ok(sources)
+}
+
 pub(crate) async fn copy_fork_checkpoint(
     bucket: Arc<dyn ObjectStore>,
     keys: &dyn KeyService,
@@ -679,7 +762,8 @@ pub(crate) async fn copy_fork_checkpoint(
     let plaintext = EncryptingStore::new(source_store, source_key)?;
     let block = BlockIndex(selected);
     let catalog_key = key(&block_key(block)?)?;
-    let catalog_bytes = plaintext.get_fresh(&catalog_key).await?;
+    let root_source = CheckpointCopySource::observe(&plaintext, catalog_key.clone(), None).await?;
+    let catalog_bytes = root_source.read(&plaintext).await?;
     let catalog = BlockCatalog::decode(&catalog_bytes)?;
     if catalog.block_index() != block || !catalog.secondary_databases().is_empty() {
         return Err(inconsistent("The selected fork checkpoint has a different block or owns secondary databases"));
@@ -687,15 +771,16 @@ pub(crate) async fn copy_fork_checkpoint(
     if let Some(checkpoint) = source.checkpoint.filter(|checkpoint| checkpoint.block == selected) {
         verify_cut(&catalog, checkpoint, StorageEpoch(source.log_epoch))?;
     }
-    let closure = catalog_objects(&plaintext, &catalog, CheckpointContents::Replay).await?;
+    let mut closure = catalog_objects(&plaintext, &catalog, CheckpointContents::Replay).await?;
+    closure.remove(&catalog_key);
+    let sources = plan_checkpoint_copy(&plaintext, closure, None).await?;
     let physical = Arc::new(PrefixedStore::new(bucket, destination_root));
     crate::store::check_root(physical.as_ref(), &child.id, true).await?;
     let packed = crate::packing::PackingStore::open(physical, PackDiscovery::List).await?;
     let cipher = Cipher::new(child_key)?;
-    for (object, expected) in closure.into_iter().filter(|(object, _)| object != &catalog_key) {
-        let content = plaintext.get_fresh(&object).await?;
-        require_bound_metadata(expected, &content)?;
-        packed.put(&object, cipher.seal_deterministic(object.as_str(), &content)?).await?;
+    for source in sources {
+        let content = source.read(&plaintext).await?;
+        packed.put(&source.name, cipher.seal_deterministic(source.name.as_str(), &content)?).await?;
     }
     packed.put(&catalog_key, cipher.seal_deterministic(catalog_key.as_str(), &catalog_bytes)?).await?;
     Ok(())
@@ -920,21 +1005,13 @@ async fn capture_registered(
     let format = CheckpointContents::Replay;
     let closure = checkpoint_objects(&plaintext, &point, format).await?;
 
-    let mut bytes = 0u64;
-    let mut objects = Vec::with_capacity(closure.len());
-    for (object, expected) in closure {
-        let metadata = plaintext.head_fresh(&object).await?;
-        let ciphertext_size = metadata.size
-            .checked_add(crate::cipher::SEALED_OVERHEAD as u64)
-            .ok_or_else(|| unavailable("Checkpoint object exceeds the archive byte budget"))?;
-        bytes = bytes
-            .checked_add(ciphertext_size)
-            .filter(|total| *total <= MAXIMUM_BYTES)
-            .ok_or_else(|| unavailable("Checkpoint exceeds the archive byte budget"))?;
-        let size = usize::try_from(metadata.size).map_err(|_| unavailable("Checkpoint object exceeds the archive byte budget"))?;
-        let content = plaintext.get_fresh_exact(&object, size).await?;
-        require_bound_metadata(expected, &content)?;
+    let sources = plan_checkpoint_copy(&plaintext, closure, Some(MAXIMUM_BYTES)).await?;
+    let mut objects = Vec::with_capacity(sources.len());
+    for source in sources {
+        let content = source.read(&plaintext).await?;
+        let object = source.name;
         let ciphertext = archive_cipher.seal_deterministic(object.as_str(), &content)?;
+        let ciphertext_size = ciphertext.len() as u64;
         let digest = digest(&ciphertext);
         archive
             .put(&key(&format!("objects/{}", object.as_str()))?, ciphertext)
@@ -1456,6 +1533,59 @@ mod tests {
         let reopened: Capture = serde_json::from_slice(&legacy).unwrap();
         assert_eq!(encode(&reopened)?, legacy);
         reopened.verify(bucket, "capture", &material).await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_checkpoint_copy_checks_the_planned_physical_publication() -> Result<()> {
+        use std::sync::atomic::Ordering::SeqCst;
+
+        let raw = Arc::new(crate::packing::tests::VersionedPacks::default());
+        let storage = PrefixedStore::new(raw.clone(), "serving/v06");
+        let store = EncryptingStore::new(Arc::new(storage), &[5; crate::keys::KEY_BYTES])?;
+        let name = key("tables/t/data/example.arrow")?;
+        let bytes = Bytes::from_static(b"observed bytes");
+        store.put(&name, bytes.clone()).await?;
+        let closure = BTreeMap::from([(name.clone(), Some(publication_digest(&bytes)))]);
+        let plan = plan_checkpoint_copy(&store, closure, Some(bytes.len() as u64 + crate::cipher::SEALED_OVERHEAD as u64)).await?;
+        assert_eq!(plan[0].version.as_ref().map(|identity| identity.key.as_str()),
+            Some("serving/v06/tables/t/data/example.arrow"),
+            "the source plan must retain the physical storage identity");
+        assert_eq!(plan[0].read(&store).await?, bytes);
+
+        raw.change_on_exact.store(true, SeqCst);
+        let error = plan[0].read(&store).await.err().and_then(|err| err.message);
+        assert_eq!(error.as_deref(), Some("Checkpoint source publication changed during copying"),
+            "an identical body under another version cannot satisfy a source plan");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn checkpoint_copy_plans_from_the_repair_archive_custody() -> Result<()> {
+        let raw: Arc<dyn ObjectStore> = Arc::new(crate::packing::tests::VersionedPacks::default());
+        let files = PrefixedStore::new(raw, "accepted-archive/objects");
+        let name = key("covered")?;
+        let material = [7; crate::keys::KEY_BYTES];
+        let archive_cipher = Cipher::new(&[3; crate::keys::KEY_BYTES])?;
+        let bytes = Bytes::from_static(b"accepted");
+        let ciphertext = archive_cipher.seal_deterministic(name.as_str(), &bytes)?;
+        files.put(&name, ciphertext.clone()).await?;
+        let archive = ArchivedCheckpoint {
+            files,
+            objects: BTreeMap::from([(name.clone(), ArchivedObject {
+                name: name.to_string(), bytes: ciphertext.len() as u64, sha256: digest(&ciphertext),
+            })]),
+            archive_cipher,
+            serving_cipher: Cipher::new(&material)?,
+        };
+        let store = EncryptingStore::new(
+            archive.with_serving(Arc::new(rtdb_storage::MemoryStore::default())), &material,
+        )?;
+        let source = CheckpointCopySource::observe(&store, name.clone(), None).await?;
+        assert_eq!(source.version.as_ref().map(|version| version.key.as_str()),
+            Some("accepted-archive/objects/covered"), "repair bytes must name archive custody");
+        assert_eq!(source.read(&store).await?, bytes);
+        assert_eq!(store.retirement_version(&name).await?, None);
         Ok(())
     }
 

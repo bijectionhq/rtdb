@@ -292,12 +292,12 @@ impl PackingStore {
         Ok(LocatedEntry { pack: location.pack.clone(), entry, version: publication.version.map(Arc::new) })
     }
 
-    async fn read_packed(&self, object: &ObjectKey, location: LocatedEntry, read: PackRead) -> rtdb_storage::Result<Bytes> {
+    async fn read_packed(&self, object: &ObjectKey, location: LocatedEntry, read: PackRead) -> rtdb_storage::Result<ObjectObservation<Bytes>> {
         let location = self.observe_location(object, location).await?;
         let range = read.extent(object, &location.entry)?;
         let observed = self.inner.observe_range(&location.pack, range).await?;
         require_same_version(&location.pack, location.version.as_deref(), observed.version.as_ref())?;
-        Ok(observed.value)
+        Ok(observed)
     }
 
     fn held(&self, object: &ObjectKey) -> Option<Bytes> { self.state.lock().held.get(object.as_str()).cloned() }
@@ -332,11 +332,17 @@ impl ObjectStore for PackingStore {
         }
     }
     async fn head_fresh(&self, object: &ObjectKey) -> rtdb_storage::Result<StoredObject> {
+        Ok(self.observe_head(object).await?.value)
+    }
+    async fn observe_head(&self, object: &ObjectKey) -> rtdb_storage::Result<ObjectObservation<StoredObject>> {
         let Some(location) = self.locate(object).await? else {
-            return self.inner.head_fresh(object).await;
+            return self.inner.observe_head(object).await;
         };
         let location = self.observe_location(object, location).await?;
-        Ok(StoredObject { key: object.clone(), size: location.entry.length })
+        Ok(ObjectObservation {
+            value: StoredObject { key: object.clone(), size: location.entry.length },
+            version: location.version.as_deref().cloned(),
+        })
     }
     async fn retirement_version(&self, key: &ObjectKey) -> rtdb_storage::Result<Option<PhysicalObjectVersion>> {
         if packed(key.as_str()) { return Ok(None); }
@@ -344,23 +350,28 @@ impl ObjectStore for PackingStore {
     }
     async fn get(&self, object: &ObjectKey) -> rtdb_storage::Result<Bytes> {
         if let Some(bytes) = self.held(object) { return Ok(bytes); }
-        if let Some(location) = self.locate(object).await? { return self.read_packed(object, location, PackRead::Full).await; }
+        if let Some(location) = self.locate(object).await? { return self.read_packed(object, location, PackRead::Full).await.map(|read| read.value); }
         self.inner.get(object).await
     }
     async fn get_fresh(&self, object: &ObjectKey) -> rtdb_storage::Result<Bytes> {
-        if let Some(location) = self.locate(object).await? { return self.read_packed(object, location, PackRead::Full).await; }
+        if let Some(location) = self.locate(object).await? { return self.read_packed(object, location, PackRead::Full).await.map(|read| read.value); }
         self.inner.get_fresh(object).await
     }
     async fn get_fresh_exact(&self, key: &ObjectKey, length: usize) -> rtdb_storage::Result<Bytes> {
-        if let Some(location) = self.locate(key).await? { return self.read_packed(key, location, PackRead::Exact(length)).await; }
-        self.inner.get_fresh_exact(key, length).await
+        Ok(self.observe_fresh_exact(key, length).await?.value)
+    }
+    async fn observe_fresh_exact(&self, key: &ObjectKey, length: usize) -> rtdb_storage::Result<ObjectObservation<Bytes>> {
+        if let Some(location) = self.locate(key).await? {
+            return self.read_packed(key, location, PackRead::Exact(length)).await;
+        }
+        self.inner.observe_fresh_exact(key, length).await
     }
     async fn get_range(&self, object: &ObjectKey, range: Range<u64>) -> rtdb_storage::Result<Bytes> {
         if let Some(bytes) = self.held(object) {
             if range.start > range.end || range.end > bytes.len() as u64 { return Err(Error::InvalidRange { key: object.to_string(), start: range.start, end: range.end, length: bytes.len() as u64 }); }
             return Ok(bytes.slice(range.start as usize..range.end as usize));
         }
-        if let Some(location) = self.locate(object).await? { return self.read_packed(object, location, PackRead::Range(range)).await; }
+        if let Some(location) = self.locate(object).await? { return self.read_packed(object, location, PackRead::Range(range)).await.map(|read| read.value); }
         self.inner.get_range(object, range).await
     }
     async fn put(&self, object: &ObjectKey, bytes: Bytes) -> rtdb_storage::Result<()> {
@@ -424,18 +435,19 @@ impl ObjectStore for PackingStore {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use rtdb_storage::MemoryStore;
 
     fn object(name: &str) -> ObjectKey { ObjectKey::new(name).unwrap() }
 
     #[derive(Default)]
-    struct VersionedPacks {
+    pub(crate) struct VersionedPacks {
         inner: MemoryStore,
         versions: Mutex<BTreeMap<ObjectKey, usize>>,
         ranges: std::sync::atomic::AtomicUsize,
         change_on_range: std::sync::atomic::AtomicUsize,
+        pub(crate) change_on_exact: std::sync::atomic::AtomicBool,
     }
 
     impl VersionedPacks {
@@ -455,6 +467,14 @@ mod tests {
             Ok(ObjectObservation { value: self.head(key).await?, version: Some(self.version(key)) })
         }
         async fn get(&self, key: &ObjectKey) -> rtdb_storage::Result<Bytes> { self.inner.get(key).await }
+        async fn observe_fresh_exact(&self, key: &ObjectKey, length: usize) -> rtdb_storage::Result<ObjectObservation<Bytes>> {
+            let value = self.inner.get_fresh_exact(key, length).await?;
+            let mut version = self.version(key);
+            if self.change_on_exact.load(std::sync::atomic::Ordering::SeqCst) {
+                version.version = "different".into();
+            }
+            Ok(ObjectObservation { value, version: Some(version) })
+        }
         async fn get_range(&self, key: &ObjectKey, range: Range<u64>) -> rtdb_storage::Result<Bytes> { self.inner.get_range(key, range).await }
         async fn observe_range(&self, key: &ObjectKey, range: Range<u64>) -> rtdb_storage::Result<ObjectObservation<Bytes>> {
             use std::sync::atomic::Ordering::SeqCst;
@@ -477,6 +497,41 @@ mod tests {
         async fn put_file(&self, _: &ObjectKey, _: &Path) -> rtdb_storage::Result<()> { unreachable!("tests publish bytes") }
         async fn list(&self, directory: Option<&ObjectKey>) -> rtdb_storage::Result<Vec<StoredObject>> { self.inner.list(directory).await }
         async fn delete(&self, key: &ObjectKey) -> rtdb_storage::Result<()> { self.inner.delete(key).await }
+    }
+
+    #[tokio::test]
+    async fn checkpoint_member_observations_name_the_inherited_publication() -> rtdb_types::Result<()> {
+        let raw: crate::reference::Bucket = Arc::new(VersionedPacks::default());
+        let root = catalog_key(0)?;
+        let table = object("tables/t/blocks/b00.binpb");
+        let loose = object("tables/t/search/value.bin");
+        let plaintext = Bytes::from_static(b"source bytes");
+        let material = [5; crate::keys::KEY_BYTES];
+        let parent = crate::store::open_deployment_store(
+            raw.clone(), "parent/v06", PackDiscovery::List, crate::store::wall_clock(),
+        ).await?;
+        let writer = crate::store::EncryptingStore::new(parent, &material)?;
+        for name in [&loose, &table, &root] {
+            writer.put(name, plaintext.clone()).await?;
+        }
+        crate::reference::fork(raw.as_ref(), "parent", "child", None).await?;
+        let child = crate::store::open_deployment_store(
+            raw, "child/v06", PackDiscovery::List, crate::store::wall_clock(),
+        ).await?;
+        let reader = crate::store::EncryptingStore::new(child, &material)?;
+        let expected_pack = format!("parent/v06/{}", pack_key(0)?.as_str());
+        for (name, physical) in [(&root, expected_pack.as_str()), (&table, expected_pack.as_str()),
+                                 (&loose, "parent/v06/tables/t/search/value.bin")] {
+            let head = reader.observe_head(name).await?;
+            let body = reader.observe_fresh_exact(name, plaintext.len()).await?;
+            assert_eq!(head.value.key, *name);
+            assert_eq!(body.value, plaintext);
+            assert_eq!(body.version, head.version, "the exact body and head name the same publication");
+            assert_eq!(body.version.as_ref().map(|version| version.key.as_str()), Some(physical),
+                "copy observations must preserve the inherited physical publication");
+            assert_eq!(reader.retirement_version(name).await?, None);
+        }
+        Ok(())
     }
 
     #[tokio::test]

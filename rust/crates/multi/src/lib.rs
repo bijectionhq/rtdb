@@ -9,6 +9,7 @@ pub mod archive;
 pub mod capability;
 mod catalog_readers;
 pub mod cells;
+mod checkpoint_copy_budget;
 mod checkpoint_retention;
 pub mod cipher;
 pub mod control;

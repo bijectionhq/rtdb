@@ -1,0 +1,110 @@
+{
+  "summary": "Every successful archive copy plan debits the entire ciphertext using checked arithmetic.",
+  "flags": [
+    "--no-external-by-default",
+    "--verify-module",
+    "production",
+    "--verify-module",
+    "laws"
+  ],
+  "min_verified_functions": 3,
+  "controls": {
+    "omit_envelope": {
+      "defect": "The planned length counts only the plaintext.",
+      "mutate": [
+        {
+          "file": "rust/crates/multi/src/checkpoint_copy_budget.rs",
+          "find": "    if overhead > remaining { return None; }\n    let remaining = remaining - overhead;\n",
+          "replace": ""
+        }
+      ],
+      "expect": [
+        {
+          "file": "rust/crates/multi/src/checkpoint_copy_budget.rs",
+          "function": "remaining_after_sealing",
+          "category": "postcondition not satisfied"
+        },
+        {
+          "file": "rust/crates/multi/src/checkpoint_copy_budget.rs",
+          "function": "remaining_after_sealing",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 2
+    },
+    "omit_envelope_and_weaken_contract": {
+      "defect": "The planned length counts only the plaintext.",
+      "mutate": [
+        {
+          "file": "rust/crates/multi/src/checkpoint_copy_budget.rs",
+          "find": "    if overhead > remaining { return None; }\n    let remaining = remaining - overhead;\n",
+          "replace": ""
+        },
+        {
+          "file": "rust/crates/multi/src/checkpoint_copy_budget.rs",
+          "find": "        out.is_some() <==> (plaintext as int) + (overhead as int) <= remaining as int,",
+          "replace": "        out.is_some() <==> (plaintext as int) <= remaining as int,"
+        },
+        {
+          "file": "rust/crates/multi/src/checkpoint_copy_budget.rs",
+          "find": "        out.is_some() ==> (out.unwrap() as int) + (plaintext as int) + (overhead as int) == remaining as int,",
+          "replace": "        out.is_some() ==> (out.unwrap() as int) + (plaintext as int) == remaining as int,"
+        }
+      ],
+      "expect": [
+        {
+          "file": "verification/verus/checkpoint_copy_budget/laws.rs",
+          "function": "a_funded_object_charges_its_entire_ciphertext",
+          "category": "assertion failed"
+        },
+        {
+          "file": "verification/verus/checkpoint_copy_budget/laws.rs",
+          "function": "ciphertext_beyond_the_remaining_budget_is_refused",
+          "category": "assertion failed"
+        }
+      ],
+      "min_verified_functions": 1
+    },
+    "refuse_exact_fit": {
+      "defect": "An object using the remaining budget exactly is refused.",
+      "mutate": [
+        {
+          "file": "rust/crates/multi/src/checkpoint_copy_budget.rs",
+          "find": "    if plaintext > remaining { return None; }",
+          "replace": "    if plaintext >= remaining { return None; }"
+        }
+      ],
+      "expect": [
+        {
+          "file": "rust/crates/multi/src/checkpoint_copy_budget.rs",
+          "function": "remaining_after_sealing",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 2
+    },
+    "refuse_exact_fit_and_weaken_contract": {
+      "defect": "An object using the remaining budget exactly is refused.",
+      "mutate": [
+        {
+          "file": "rust/crates/multi/src/checkpoint_copy_budget.rs",
+          "find": "    if plaintext > remaining { return None; }",
+          "replace": "    if plaintext >= remaining { return None; }"
+        },
+        {
+          "file": "rust/crates/multi/src/checkpoint_copy_budget.rs",
+          "find": "        out.is_some() <==> (plaintext as int) + (overhead as int) <= remaining as int,",
+          "replace": "        out.is_some() <==> (plaintext as int) + (overhead as int) < remaining as int,"
+        }
+      ],
+      "expect": [
+        {
+          "file": "verification/verus/checkpoint_copy_budget/laws.rs",
+          "function": "a_funded_object_charges_its_entire_ciphertext",
+          "category": "assertion failed"
+        }
+      ],
+      "min_verified_functions": 2
+    }
+  }
+}

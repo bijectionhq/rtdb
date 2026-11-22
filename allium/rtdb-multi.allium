@@ -2135,6 +2135,8 @@ rule ForkAcrossOrganisations {
     -- Its checkpoint closure and its selected tail are copied under the child's key before the directory publishes the child.
     -- The destination root follows the required data, metadata, retained level-zero sources and recorded usable artefacts.
     -- The copy checks the table bytes used to discover those dependencies against the root manifest when present.
+    -- Each planned member binds its logical path, length and observed provider publication.
+    -- A packed member's physical dependency names the containing pack, including an inherited pack.
     -- This copy has independent key custody and its own erasure authority.
     -- Publication checks the parent in the writer epoch and storage generation used to prepare the copy.
     when: ForkRequested(parent, basis, org)
@@ -2305,6 +2307,8 @@ rule HostedCheckpointCapture {
     -- An archive copy from serving storage registers a metadata hold on the selected checkpoint.
     -- A new hold may cover the published checkpoint or inherit uninterrupted coverage from an older admission.
     -- The hold persists until its provider work drains. A verified existing archive can be returned after the source hold ends.
+    -- The source plan is checked against the full exact body observation before resealing each member.
+    -- A serving read supplied by a repair archive carries the repair archive's physical identity.
     when: AuthenticatedRecoveryCapture(authority, name, capture_id)
 
     requires: ConfiguredOrganizationOwns(authority, name)

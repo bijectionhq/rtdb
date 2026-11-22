@@ -14,7 +14,7 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use futures::future::BoxFuture;
 use rtdb_directory::{DeploymentRecord, Lifecycle};
-use rtdb_storage::{Error, ObjectKey, ObjectStore, object_store::StoredObject};
+use rtdb_storage::{Error, ObjectKey, ObjectObservation, ObjectStore, object_store::StoredObject};
 use rtdb_types::{Anomaly, Result};
 use serde::{Deserialize, Serialize};
 
@@ -103,6 +103,9 @@ impl ObjectStore for PrefixedStore {
     }
     async fn get(&self, key: &ObjectKey) -> rtdb_storage::Result<Bytes> { self.bucket.get(&self.full(key)?).await }
     async fn get_fresh_exact(&self, key: &ObjectKey, length: usize) -> rtdb_storage::Result<Bytes> { self.bucket.get_fresh_exact(&self.full(key)?, length).await }
+    async fn observe_fresh_exact(&self, key: &ObjectKey, length: usize) -> rtdb_storage::Result<ObjectObservation<Bytes>> {
+        self.bucket.observe_fresh_exact(&self.full(key)?, length).await
+    }
     async fn get_range(&self, key: &ObjectKey, range: Range<u64>) -> rtdb_storage::Result<Bytes> { self.bucket.get_range(&self.full(key)?, range).await }
     async fn observe_range(&self, key: &ObjectKey, range: Range<u64>) -> rtdb_storage::Result<rtdb_storage::ObjectObservation<Bytes>> {
         self.bucket.observe_range(&self.full(key)?, range).await
@@ -186,6 +189,9 @@ impl ObjectStore for ReferencingStore {
         self.read(key, |store, key| store.get_fresh(key)).await
     }
     async fn get_fresh_exact(&self, key: &ObjectKey, length: usize) -> rtdb_storage::Result<Bytes> { self.read(key, |store, key| store.get_fresh_exact(key, length)).await }
+    async fn observe_fresh_exact(&self, key: &ObjectKey, length: usize) -> rtdb_storage::Result<ObjectObservation<Bytes>> {
+        self.read(key, |store, key| store.observe_fresh_exact(key, length)).await
+    }
     async fn get_range(&self, key: &ObjectKey, range: Range<u64>) -> rtdb_storage::Result<Bytes> {
         self.read(key, |store, key| store.get_range(key, range.clone())).await
     }

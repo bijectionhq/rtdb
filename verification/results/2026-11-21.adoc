@@ -2594,3 +2594,56 @@ All three suites reported zero failures and errors.
 The PostgreSQL source integration case `slot recreation silently drops changes()` was skipped, with no reason in its XML.
 There were no reflection or boxed math warnings.
 The log is `/private/tmp/rtdb-placed-receipt-final-gradle.log`.
+
+=== Physical source evidence for checkpoint copying
+
+Each archive and independent-fork member now binds a logical key, size and optional physical version in its copy plan.
+A successful read checks its body observation and length against that binding, then checks the root or table metadata digest where present.
+The body observation comes from the response that supplied the bytes.
+An inherited packed member carries the containing pack's version and physical key.
+A repair-backed member carries the physical identity of the verified archive ciphertext.
+Reading that member still authenticates the archive digest and reseals it with the serving key.
+The source preparation preflights the entire archive byte budget before writing copied members.
+
+TLC revision `bc1b506` explored all 150 states for one planned member, up to one change and five evidence identities including absence.
+Four controls fail on dropped evidence, comparing only a version token, inferring the body identity from the plan, or accepting changed metadata.
+The bounded model reached publication for an inherited object, a repair archive object and an unversioned source that meets the logical contract.
+Apalache 0.63.0 cross-checked the invariant through five transitions and reproduced the token-only and inferred-identity counterexamples.
+The records are under `/private/tmp/rtdb-formal.QMjPSJsX/checkpoint-copy-evidence-models-12acffo7/`. link:../tla/CheckpointCopyEvidence.tla[Copy evidence model]
+Lean 4.36.0 checked four theorems for arbitrary finite copy plans and lists of byte costs.
+Three controls reject weakened version agreement, unchecked digests and failure to charge the budget.
+The records are under `/private/tmp/rtdb-formal.QMjPSJsX/checkpoint-copy-evidence-lean-4zjypry9/`. link:../lean/CheckpointCopyEvidence.lean[Inventory and budget laws]
+Verus checked the exact production debit and two laws over every representable ciphertext component and remaining budget.
+Four single and joint controls detect dropping encryption overhead and refusing an exact fit.
+The combined pass checked 37 areas and matched all 189 controls.
+The records are under `/private/tmp/rtdb-formal.QMjPSJsX/checkpoint-copy-evidence-verus-797y2ybv/`. link:../verus/checkpoint_copy_budget/proof.rs[Production budget proof]
+
+A second TLC comparison checked all 98 separate-admission states and 81 atomic-admission states for one copy across two physical owners.
+It reached successful publication, partial admission and cleanup after the second owner refused.
+Three controls admit a read after only one owner agrees, skip a prior removal authorization, or release before provider drain.
+Apalache cross-checked separate admission through ten transitions and reproduced the one-owner read counterexample.
+The records are under `/private/tmp/rtdb-formal.QMjPSJsX/checkpoint-physical-owners-model-1omsk52p/`. link:../tla/CheckpointPhysicalOwners.tla[Physical owner comparison]
+
+On parent `a6cf6d730` with these changes, the affected Rust selections passed 332 tests, including 96 hosted cell tests, with one optional test ignored.
+The native cases check the actual wrapped storage paths for inherited packs, loose files and archived repair as well as a loopback S3 full-object response.
+The log is `/private/tmp/rtdb-formal.QMjPSJsX/checkpoint-copy-evidence-a6c-rust-final.log`.
+Four new source replays passed with four mutation failures at their declared assertions.
+The four existing replay-closure cases also passed with all five controls, including moving the independent fork root ahead of its dependencies.
+The per-case records are under `/private/tmp/rtdb-formal.QMjPSJsX/checkpoint-copy-evidence-native-nn5a3rcs/`.
+The same tree passed five native recovery cases and eight storage and session simulation cases, with three optional simulation cases ignored.
+The logs are `/private/tmp/rtdb-formal.QMjPSJsX/checkpoint-copy-evidence-a6c-recovery.log` and `/private/tmp/rtdb-formal.QMjPSJsX/checkpoint-copy-evidence-a6c-simulation.log`.
+The standard JVM run on that tree passed 3,198 tests across nine tasks without failures or skips.
+Its rebuilt FFI library had SHA-256 `4a092a267e941f2603e90fa428a799e7a384f8113cc67669bbc4f5f08d44f2b7`.
+The log is `/private/tmp/rtdb-formal.QMjPSJsX/checkpoint-copy-evidence-a6c-jvm.log`.
+After rebasing onto `c7fdae115`, all 333 affected Rust tests passed, including 97 hosted cell cases, with one optional test ignored.
+The log is `/private/tmp/rtdb-formal.QMjPSJsX/checkpoint-copy-evidence-c7f-rust.log`.
+The rebased tree also passed all 37 Verus areas with 189 controls.
+TLC reran both new copy models and the peer's 163,544-state scoped receipt model with their controls.
+The records are under `/private/tmp/rtdb-formal.QMjPSJsX/checkpoint-copy-evidence-c7f-formal-prctoag4/`.
+The standard JVM suite passed 3,198 tests on the rebased tree without failures or skips.
+It used the rebuilt FFI library with SHA-256 `035e56094dd9ef9e97df62293c089ed4b6b50688c02f711e1087202f2e4b6664`.
+The log is `/private/tmp/rtdb-formal.QMjPSJsX/checkpoint-copy-evidence-c7f-jvm.log`.
+
+The plan carries physical evidence when the provider supplies it.
+Unversioned stores rely on immutable object names and the declared integrity checks.
+Holding these identities until I/O drains still requires admission against durable removal authority in every physical custody domain.

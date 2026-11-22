@@ -271,9 +271,10 @@ mod tests {
         let store = config.open_cell(&ObjectKey::new("root").unwrap(), &std::collections::BTreeMap::new(), IoRegion::new()).await.unwrap();
         let file = ObjectKey::new("pack").unwrap();
         let server = tokio::spawn(async move {
-            for (method, reply) in [
-                ("HEAD", "HTTP/1.1 200 OK\r\nContent-Length: 8\r\nx-amz-version-id: before\r\nConnection: close\r\n\r\n"),
-                ("GET", "HTTP/1.1 206 Partial Content\r\nContent-Range: bytes 2-4/8\r\nContent-Length: 3\r\nx-amz-version-id: observed\r\nConnection: close\r\n\r\ncde"),
+            for (method, is_range, reply) in [
+                ("HEAD", false, "HTTP/1.1 200 OK\r\nContent-Length: 8\r\nx-amz-version-id: before\r\nConnection: close\r\n\r\n"),
+                ("GET", true, "HTTP/1.1 206 Partial Content\r\nContent-Range: bytes 2-4/8\r\nContent-Length: 3\r\nx-amz-version-id: observed\r\nConnection: close\r\n\r\ncde"),
+                ("GET", false, "HTTP/1.1 200 OK\r\nContent-Length: 8\r\nx-amz-version-id: whole\r\nConnection: close\r\n\r\nabcdefgh"),
             ] {
                 let (stream, _) = listener.accept().await.unwrap();
                 let mut reader = BufReader::new(stream);
@@ -286,7 +287,7 @@ mod tests {
                     assert_ne!(reader.read_line(&mut line).await.unwrap(), 0);
                     ranged |= line.eq_ignore_ascii_case("range: bytes=2-4\r\n");
                 }
-                assert_eq!(ranged, method == "GET");
+                assert_eq!(ranged, is_range);
                 reader.get_mut().write_all(reply.as_bytes()).await.unwrap();
             }
         });
@@ -299,6 +300,10 @@ mod tests {
             let version = read.version.unwrap();
             assert_eq!(version.key, "root/pack");
             assert_eq!(version.version, "observed");
+            let whole = store.observe_fresh_exact(&file, 8).await.unwrap();
+            assert_eq!(whole.value.as_ref(), b"abcdefgh");
+            assert_eq!(whole.version.as_ref().map(|version| (version.key.as_str(), version.version.as_str())),
+                Some(("root/pack", "whole")), "the exact body must carry its provider response version");
             server.await.unwrap();
         }).await.unwrap();
         store.close_and_wait().await;

@@ -687,6 +687,9 @@ config {
 -- It includes recorded artefacts for live and nascent members, with one object per shared group key.
 -- A copy uses its verified root bytes or rechecks them on a fresh read.
 -- It also rechecks table bytes read for copying against those used to derive the inventory.
+-- A planned source member carries its logical length and the physical version observed for that dependency.
+-- An observed version includes the namespace, physical key and provider token.
+-- The body supplying that member must match the plan. Two responses without version evidence rely on the immutable-object contract.
 -- Existing archive receipts retain their original primary inventory. A stage verifies the inventory format recorded by its capture.
 -- An archive capture registers its source metadata hold with its selected checkpoint in the same directory update.
 -- A retry at an older checkpoint inherits the hold only if an open region still protects that metadata.

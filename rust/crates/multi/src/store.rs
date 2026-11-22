@@ -17,7 +17,7 @@ use parking_lot::Mutex;
 use prost_types::Any;
 use rtdb_directory::{Cas, DeploymentRecord, Directory, Lifecycle, MemberId, MemberPool, MemberRole, MemberState, HostedTask, StoragePublication, StorageRegion, now_ms};
 use rtdb_node::{OpenedRecoveryStore, RemoteStorageFactory};
-use rtdb_storage::{Error, IoRegion, ObjectKey, ObjectStore, object_store::{IndexPageLifecycle, StoredObject}, remote::PublicationJournal};
+use rtdb_storage::{Error, IoRegion, ObjectKey, ObjectObservation, ObjectStore, object_store::{IndexPageLifecycle, StoredObject}, remote::PublicationJournal};
 use rtdb_types::{Anomaly, Result};
 use serde::{Deserialize, Serialize};
 use tokio::sync::oneshot;
@@ -831,6 +831,9 @@ impl ObjectStore for FencedStore {
     async fn get(&self, key: &ObjectKey) -> rtdb_storage::Result<Bytes> { self.inner.get(key).await }
     async fn get_fresh(&self, key: &ObjectKey) -> rtdb_storage::Result<Bytes> { self.inner.get_fresh(key).await }
     async fn get_fresh_exact(&self, key: &ObjectKey, length: usize) -> rtdb_storage::Result<Bytes> { self.inner.get_fresh_exact(key, length).await }
+    async fn observe_fresh_exact(&self, key: &ObjectKey, length: usize) -> rtdb_storage::Result<ObjectObservation<Bytes>> {
+        self.inner.observe_fresh_exact(key, length).await
+    }
     async fn get_range(&self, key: &ObjectKey, range: Range<u64>) -> rtdb_storage::Result<Bytes> { self.inner.get_range(key, range).await }
     async fn put(&self, key: &ObjectKey, bytes: Bytes) -> rtdb_storage::Result<()> { self.check(key).await?; self.inner.put(key, bytes).await }
     async fn put_file(&self, key: &ObjectKey, source: &Path) -> rtdb_storage::Result<()> { self.check(key).await?; self.inner.put_file(key, source).await }
@@ -870,6 +873,10 @@ impl ObjectStore for EncryptingStore {
     }
     async fn head(&self, key: &ObjectKey) -> rtdb_storage::Result<StoredObject> { self.inner.head(key).await.map(plain) }
     async fn head_fresh(&self, key: &ObjectKey) -> rtdb_storage::Result<StoredObject> { self.inner.head_fresh(key).await.map(plain) }
+    async fn observe_head(&self, key: &ObjectKey) -> rtdb_storage::Result<ObjectObservation<StoredObject>> {
+        let observed = self.inner.observe_head(key).await?;
+        Ok(ObjectObservation { value: plain(observed.value), version: observed.version })
+    }
     async fn retirement_version(&self, key: &ObjectKey) -> rtdb_storage::Result<Option<rtdb_types::PhysicalObjectVersion>> {
         self.inner.retirement_version(key).await
     }
@@ -881,6 +888,12 @@ impl ObjectStore for EncryptingStore {
         let exact = length.checked_add(SEALED_OVERHEAD as usize)
             .ok_or_else(|| Error::Task("Encrypted object length overflow".into()))?;
         self.open(key, self.inner.get_fresh_exact(key, exact).await?)
+    }
+    async fn observe_fresh_exact(&self, key: &ObjectKey, length: usize) -> rtdb_storage::Result<ObjectObservation<Bytes>> {
+        let exact = length.checked_add(SEALED_OVERHEAD as usize)
+            .ok_or_else(|| Error::Task("Encrypted object length overflow".into()))?;
+        let observed = self.inner.observe_fresh_exact(key, exact).await?;
+        Ok(ObjectObservation { value: self.open(key, observed.value)?, version: observed.version })
     }
     async fn get_range(&self, key: &ObjectKey, range: Range<u64>) -> rtdb_storage::Result<Bytes> {
         let plaintext = self.get(key).await?;
@@ -951,6 +964,9 @@ impl GarbageStore {
 
 #[async_trait]
 impl ObjectStore for GarbageStore {
+    async fn observe_head(&self, key: &ObjectKey) -> rtdb_storage::Result<ObjectObservation<StoredObject>> {
+        self.inner.observe_head(key).await
+    }
     fn index_page_lifecycle(&self) -> Option<&dyn IndexPageLifecycle> {
         self.index_pages.as_ref().map(|pages| pages as &dyn IndexPageLifecycle)
     }
@@ -971,6 +987,9 @@ impl ObjectStore for GarbageStore {
     async fn get(&self, key: &ObjectKey) -> rtdb_storage::Result<Bytes> { self.inner.get(key).await }
     async fn get_fresh(&self, key: &ObjectKey) -> rtdb_storage::Result<Bytes> { self.inner.get_fresh(key).await }
     async fn get_fresh_exact(&self, key: &ObjectKey, length: usize) -> rtdb_storage::Result<Bytes> { self.inner.get_fresh_exact(key, length).await }
+    async fn observe_fresh_exact(&self, key: &ObjectKey, length: usize) -> rtdb_storage::Result<ObjectObservation<Bytes>> {
+        self.inner.observe_fresh_exact(key, length).await
+    }
     async fn get_range(&self, key: &ObjectKey, range: Range<u64>) -> rtdb_storage::Result<Bytes> { self.inner.get_range(key, range).await }
     fn supports_scan_ranges(&self, key: &ObjectKey) -> bool { self.inner.supports_scan_ranges(key) }
     async fn put(&self, key: &ObjectKey, bytes: Bytes) -> rtdb_storage::Result<()> { self.inner.put(key, bytes).await }
