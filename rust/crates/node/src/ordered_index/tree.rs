@@ -17,7 +17,7 @@ use tokio_util::sync::CancellationToken;
 
 use super::{
     correction, format_error,
-    key::{Atom, Bucket},
+    key::{Atom, AtomRef, Bucket},
     maintenance::cancelled,
     postings::{KeyRow, Postings, Tuple},
     seek,
@@ -203,12 +203,50 @@ impl Entry {
     }
 }
 
+/// Exact weight of postings whose last field before the identity is a signed Int64.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub(super) struct Measure {
+    pub count: u64,
+    // Fixed width survives JSON storage even outside its ordinary numeric range.
+    sum: [u8; 16],
+}
+
+impl Measure {
+    pub fn sum(self) -> i128 { i128::from_be_bytes(self.sum) }
+
+    pub fn checked_add(self, other: Self) -> Result<Self> {
+        Ok(Self {
+            count: self.count.checked_add(other.count).ok_or_else(cardinality_overflow)?,
+            sum: self.sum().checked_add(other.sum()).ok_or_else(cardinality_overflow)?.to_be_bytes(),
+        })
+    }
+
+    pub fn checked_sub(self, other: Self) -> Result<Self> {
+        Ok(Self {
+            count: self.count.checked_sub(other.count).ok_or_else(cardinality_overflow)?,
+            sum: self.sum().checked_sub(other.sum()).ok_or_else(cardinality_overflow)?.to_be_bytes(),
+        })
+    }
+
+    fn at(key: KeyRef<'_>) -> Self {
+        if let KeyRef::Posting(_, tuple, _) = key
+            && let Some(last) = tuple.len().checked_sub(2)
+            && let Some(AtomRef::Integer(value)) = tuple.get(last)
+            && i64::try_from(value).is_ok()
+        {
+            return Self { count: 1, sum: value.to_be_bytes() };
+        }
+        Self::default()
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(super) struct Pointer {
     pub digest: String,
     generation: i64,
     size: usize,
     entries: u64,
+    measure: Measure,
     first: Key,
     last: Key,
 }
@@ -240,6 +278,13 @@ impl Link {
         }
     }
 
+    fn measure(&self) -> Measure {
+        match self {
+            Self::Stored(pointer) => pointer.measure,
+            Self::New(node) => node.measure,
+        }
+    }
+
     fn last(&self) -> &Key {
         match self {
             Self::Stored(pointer) => &pointer.last,
@@ -252,6 +297,7 @@ impl Link {
 pub(super) struct Node {
     page: Page,
     entries: u64,
+    measure: Measure,
     _memory: Arc<MemoryReservation>,
 }
 
@@ -283,6 +329,15 @@ impl Page {
                 sum.checked_add(child.entries())
                     .ok_or_else(cardinality_overflow)
             }),
+        }
+    }
+
+    fn measure(&self) -> Result<Measure> {
+        match self {
+            Self::Leaf(leaf) => leaf.measure(leaf.posting_count()),
+            Self::Branch(children) => children.iter().try_fold(
+                Measure::default(), |total, child| total.checked_add(child.measure()),
+            ),
         }
     }
 
@@ -368,6 +423,12 @@ impl Leaf {
         } else {
             self.metadata[row - self.posting_count()].key.view()
         }
+    }
+
+    fn measure(&self, entries: usize) -> Result<Measure> {
+        (0..entries.min(self.posting_count())).try_fold(
+            Measure::default(), |total, slot| total.checked_add(Measure::at(self.key(slot))),
+        )
     }
 
     fn entry(&self, row: usize) -> EntryView<'_> {
@@ -535,12 +596,14 @@ impl Tree {
 
     fn link(&self, page: Page) -> Result<Link> {
         let entries = page.entry_count()?;
+        let measure = page.measure()?;
         let memory = self
             .memory
             .reserve(page.bytes().saturating_mul(2).saturating_add(256))?;
         Ok(Link::New(Arc::new(Node {
             page,
             entries,
+            measure,
             _memory: memory,
         })))
     }
@@ -554,6 +617,7 @@ impl Tree {
         let cached = self.decoded.lock().entries.get(&object).cloned();
         if let Some(node) = cached {
             if node.entries != pointer.entries
+                || node.measure != pointer.measure
                 || node.page.first() != &pointer.first
                 || node.page.last() != &pointer.last
             {
@@ -580,7 +644,9 @@ impl Tree {
         }
         let page = decode(bytes, pointer.generation, &memory)?;
         let entries = page.entry_count()?;
+        let measure = page.measure()?;
         if entries != pointer.entries
+            || measure != pointer.measure
             || page.first() != &pointer.first
             || page.last() != &pointer.last
         {
@@ -601,6 +667,7 @@ impl Tree {
         let node = Arc::new(Node {
             page,
             entries,
+            measure,
             _memory: memory,
         });
         // The read or maintenance operation owns the decoded pages. An idle
@@ -617,14 +684,26 @@ impl Tree {
 
     /// Counts the monotone prefix using the immutable cardinalities of
     /// children entirely before the boundary.
+    #[cfg(test)]
     pub async fn rank(
         &self,
         root: &Root,
         before: impl for<'key> Fn(KeyRef<'key>) -> bool,
         cancellation: &CancellationToken,
     ) -> Result<u64> {
+        self.rank_and_measure(root, before, cancellation, false).await.map(|(rank, _)| rank)
+    }
+
+    pub async fn rank_and_measure(
+        &self,
+        root: &Root,
+        before: impl for<'key> Fn(KeyRef<'key>) -> bool,
+        cancellation: &CancellationToken,
+        measured: bool,
+    ) -> Result<(u64, Measure)> {
+        let mut measure = Measure::default();
         let Some(mut link) = root.clone() else {
-            return Ok(0);
+            return Ok((0, measure));
         };
         let mut rank = 0u64;
         loop {
@@ -635,24 +714,31 @@ impl Tree {
             match &node.page {
                 Page::Leaf(leaf) => {
                     let prefix = seek::partition(leaf.len(), |slot| before(leaf.key(slot)));
-                    return rank
-                        .checked_add(prefix as u64)
-                        .ok_or_else(cardinality_overflow);
+                    if measured {
+                        measure = measure.checked_add(leaf.measure(prefix)?)?;
+                    }
+                    return Ok((
+                        rank.checked_add(prefix as u64).ok_or_else(cardinality_overflow)?,
+                        measure,
+                    ));
                 }
                 Page::Branch(children) => {
                     let prefix = seek::partition(children.len(), |slot| {
                         before(children[slot].last().view())
                     });
                     for child in &children[..prefix] {
+                        if measured {
+                            measure = measure.checked_add(child.measure())?;
+                        }
                         rank = rank
                             .checked_add(child.entries())
                             .ok_or_else(cardinality_overflow)?;
                     }
                     let Some(child) = children.get(prefix) else {
-                        return Ok(rank);
+                        return Ok((rank, measure));
                     };
                     if !before(child.first().view()) {
-                        return Ok(rank);
+                        return Ok((rank, measure));
                     }
                     link = child.clone();
                 }
@@ -930,6 +1016,7 @@ impl Tree {
                 generation,
                 size,
                 entries: node.entries,
+                measure: node.measure,
                 first: link.first().clone(),
                 last: link.last().clone(),
             });

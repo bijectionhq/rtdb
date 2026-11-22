@@ -8,7 +8,7 @@ pub(crate) use unique::READ_HELD_UNIQUE_V1;
 
 use std::{collections::{BTreeMap, BTreeSet}, sync::{Arc, Mutex}, time::Duration};
 
-use arrow_array::{Array, BooleanArray, Float64Array, Int64Array, RecordBatch, StringArray, TimestampMicrosecondArray, UInt64Array};
+use arrow_array::{Array, BinaryArray, BooleanArray, Float64Array, Int64Array, RecordBatch, StringArray, TimestampMicrosecondArray, UInt64Array};
 use arrow_flight::Result as ActionResult;
 use arrow_ipc::writer::IpcWriteOptions;
 use arrow_schema::{DataType, Field, Schema};
@@ -184,6 +184,7 @@ pub(crate) const HELD_OWNED_RANGE_V4: &str = "rtdb.owned.ReadHeldRange.v4";
 pub(crate) const HELD_OWNED_RANGE_V2: &str = "rtdb.owned.ReadHeldRange.v2";
 pub(crate) const HELD_OWNED_COUNT_V1: &str = "rtdb.owned.CountHeldRange.v1";
 pub(crate) const HELD_OWNED_COUNT_V2: &str = "rtdb.owned.CountHeldRange.v2";
+pub(crate) const HELD_OWNED_MEASURE_V1: &str = "rtdb.owned.MeasureHeldRange.v1";
 pub(crate) const READ_HELD_WORLD_CHANGES_V1: &str = "rtdb.owned.ReadHeldWorldChanges.v1";
 pub(crate) const HELD_OWNED_MERGED_CHANGES_V1: &str = "rtdb.owned.ReadHeldMergedChanges.v1";
 pub(crate) const READ_HELD_EXPIRY_CANDIDATES_V1: &str = "rtdb.owned.ReadHeldExpiryCandidates.v1";
@@ -1249,7 +1250,7 @@ impl Service {
         Ok(reply)
     }
 
-    pub(crate) async fn held_owned_count_action(&self, call: &Call, body: &[u8], historical: bool) -> Result<ActionResult, Status> {
+    pub(crate) async fn held_owned_count_action(&self, call: &Call, body: &[u8], historical: bool, measured: bool) -> Result<ActionResult, Status> {
         if !self.0.config.owned_native_actions { return Err(unsupported()); }
         let (handle, request) = body.split_first_chunk::<16>().ok_or_else(|| invalid("Owned held count has no handle"))?;
         let handle = Bytes::copy_from_slice(handle);
@@ -1280,10 +1281,20 @@ impl Service {
             };
             held.snapshot.count_range_at_system(&relation, &path, request, Timestamp(*system))
                 .await.map(|counted| (counted, None))
+        } else if measured {
+            held.snapshot.measure_range_observed(&relation, &path, request).await
         } else {
             held.snapshot.count_range_observed(&relation, &path, request).await
         }.map_err(status)?;
-        let batch = count_batch(counted.count)?;
+        let batch = if measured {
+            let sum = counted.sum.ok_or_else(|| invalid("Owned measure has no covered sum"))?.to_be_bytes();
+            RecordBatch::try_from_iter([
+                ("count", Arc::new(UInt64Array::from(vec![counted.count])) as arrow_array::ArrayRef),
+                ("sum_i128", Arc::new(BinaryArray::from_iter_values([sum.as_slice()]))),
+            ]).map_err(arrow)?
+        } else {
+            count_batch(counted.count)?
+        };
         let schema = batch.schema();
         let observed = witnessed_schema(call, &held, &relation, &schema, evidence)?;
         let output_schema = observed.as_ref().map_or(schema.as_ref(), |(schema, _)| schema);

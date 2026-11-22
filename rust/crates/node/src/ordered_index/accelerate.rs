@@ -28,7 +28,7 @@ use super::{
     key::{Atom, AtomRef, Bucket, Family, family},
     maintenance::{cancelled, read_root, source_frontier, source_rows},
     postings::Tuple,
-    tree::{Cursor, Hit, KeyRef, Root, Tree, cardinality_overflow},
+    tree::{Cursor, Hit, KeyRef, Measure, Root, Tree, cardinality_overflow},
 };
 
 const BATCH_ROWS: usize = 128;
@@ -835,10 +835,18 @@ pub(super) async fn owned_count(
     projection: OwnedProjection,
     request: super::OwnedCountRequest<'_>,
     lifetime: Option<i64>,
+    measured: bool,
 ) -> Result<super::OwnedRangeCount> {
     let OwnedProjection { fields, empty } = projection;
     let positions: Vec<_> = (0..fields.len()).collect();
     Covered::bind(&fields, definition, &positions)?.ok_or_else(super::uncovered_owned_range)?;
+    if measured {
+        match fields.as_slice() {
+            [.., measure, identity]
+                if identity.name == "_id" && measure.data_type == LogicalType::Scalar(ScalarType::I64) => {}
+            _ => return Err(super::uncovered_owned_range()),
+        }
+    }
     let mut range = Range::default();
     compound_bound(&mut range, &fields, request.lower, true, false)?;
     compound_bound(&mut range, &fields, request.upper, false, true)?;
@@ -848,10 +856,16 @@ pub(super) async fn owned_count(
         return Err(super::uncovered_owned_range());
     }
     if empty {
-        return Ok(super::OwnedRangeCount { count: 0, present, valid_at: request.valid_at, expiry: None });
+        return Ok(super::OwnedRangeCount { count: 0, sum: measured.then_some(0), present, valid_at: request.valid_at, expiry: None });
     }
     let (tree, root) = covered_root(context, snapshot, storage, definition, present).await?;
-    let count = rank_owned_range(&tree, &root, &range, request.valid_at, &context.cancellation).await?;
+    let (count, measure) = rank_owned_range(
+        &tree, &root, &range, request.valid_at, &context.cancellation, measured,
+    ).await?;
+    if measured && measure.count != count {
+        return Err(super::uncovered_owned_range());
+    }
+    let sum = measured.then(|| measure.sum());
     let expiry = if let Some(duration) = lifetime.filter(|_| count != 0) {
         let mut live = present.0;
         let mut expired = live.checked_add(duration).filter(|until| *until > live && *until < i64::MAX)
@@ -862,7 +876,7 @@ pub(super) async fn owned_count(
         while expired - live > 1 {
             context.check_cancelled()?;
             let middle = live + (expired - live) / 2;
-            match rank_owned_range(&tree, &root, &range, Timestamp(middle), &context.cancellation).await? {
+            match rank_owned_range(&tree, &root, &range, Timestamp(middle), &context.cancellation, false).await?.0 {
                 current if current == count => live = middle,
                 current if current < count => expired = middle,
                 _ => return Err(super::uncovered_owned_range()),
@@ -872,13 +886,15 @@ pub(super) async fn owned_count(
     } else {
         None
     };
-    Ok(super::OwnedRangeCount { count, present, valid_at: request.valid_at, expiry })
+    Ok(super::OwnedRangeCount { count, sum, present, valid_at: request.valid_at, expiry })
 }
 
 async fn rank_owned_range(
-    tree: &Tree, root: &Root, range: &Range, valid_at: Timestamp, cancellation: &CancellationToken,
-) -> Result<u64> {
+    tree: &Tree, root: &Root, range: &Range, valid_at: Timestamp,
+    cancellation: &CancellationToken, measured: bool,
+) -> Result<(u64, Measure)> {
     let mut count = 0u64;
+    let mut measure = Measure::default();
     for bucket in Bucket::at(valid_at) {
         let compare = |key: KeyRef<'_>| match key {
             KeyRef::Posting(found, tuple, _) => {
@@ -886,18 +902,20 @@ async fn rank_owned_range(
             }
             KeyRef::Row(_) | KeyRef::Revision(_) => Ordering::Greater,
         };
-        let lower = tree
-            .rank(
+        let (lower, lower_measure) = tree
+            .rank_and_measure(
                 root,
                 |key| compare(key) == Ordering::Less,
                 cancellation,
+                measured,
             )
             .await?;
-        let upper = tree
-            .rank(
+        let (upper, upper_measure) = tree
+            .rank_and_measure(
                 root,
                 |key| compare(key) != Ordering::Greater,
                 cancellation,
+                measured,
             )
             .await?;
         let bucket_count = upper
@@ -906,8 +924,9 @@ async fn rank_owned_range(
         count = count
             .checked_add(bucket_count)
             .ok_or_else(cardinality_overflow)?;
+        measure = measure.checked_add(upper_measure.checked_sub(lower_measure)?)?;
     }
-    Ok(count)
+    Ok((count, measure))
 }
 
 pub(crate) enum RowBounds<'a> {

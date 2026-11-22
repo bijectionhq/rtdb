@@ -1650,6 +1650,24 @@ impl OwnedReadSession {
         Ok((counted, evidence))
     }
 
+    /// Read an exact covered sum of the path's last signed Int64 field before the identity.
+    pub async fn measure_range_observed(
+        &self, relation: &rtdb_types::OwnedRelation, path: &rtdb_types::OwnedRelation,
+        request: crate::OwnedCountRequest<'_>,
+    ) -> Result<(crate::OwnedRangeCount, Option<OwnedRangeWitness>)> {
+        self.admit_read().await?;
+        let lifetime = self.lifetime_point_duration(relation).await?;
+        if lifetime.is_some() {
+            return Err(crate::ordered_index::uncovered_owned_range());
+        }
+        let context = self.relation_context(relation)?;
+        let counted = crate::ordered_index::owned_total_at(
+            context, &self.owner, relation, path, request, None, true,
+        ).await?;
+        let evidence = self.relation_witness_for(relation, true, None)?;
+        Ok((counted, evidence))
+    }
+
     /// Reads a covered ordered page at an admitted historical Root cut.
     pub async fn range_page_by_key_at_system(
         &self,

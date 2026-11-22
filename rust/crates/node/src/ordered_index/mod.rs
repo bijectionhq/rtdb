@@ -26,7 +26,7 @@ pub(crate) use maintenance::OrderedIndexMaintenance;
 pub(crate) use usage::Inventory;
 
 use rtdb_format::keys::ORDERED_INDEX_ROOT as INDEX_ROOT;
-const PAGE_LAYOUT_VERSION: u8 = 7;
+const PAGE_LAYOUT_VERSION: u8 = 8;
 const CATALOG: (&str, &str) = ("xt", "ordered_indexes");
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -201,6 +201,7 @@ pub struct OwnedCountRequest<'a> {
 
 pub struct OwnedRangeCount {
     pub count: u64,
+    pub sum: Option<i128>,
     pub present: rtdb_types::Timestamp,
     pub valid_at: rtdb_types::Timestamp,
     pub expiry: Option<rtdb_types::Timestamp>,
@@ -218,7 +219,7 @@ struct OwnedProjection {
     empty: bool,
 }
 
-fn uncovered_owned_range() -> Anomaly {
+pub(crate) fn uncovered_owned_range() -> Anomaly {
     Anomaly::new(
         rtdb_types::AnomalyCategory::Unavailable,
         "rtdb.owned/path-uncovered",
@@ -274,6 +275,18 @@ pub(crate) async fn owned_count_at(
     request: OwnedCountRequest<'_>,
     lifetime: Option<i64>,
 ) -> Result<OwnedRangeCount> {
+    owned_total_at(context, owner, relation, path, request, lifetime, false).await
+}
+
+pub(crate) async fn owned_total_at(
+    context: Arc<QueryContext>,
+    owner: &str,
+    relation: &rtdb_types::OwnedRelation,
+    path: &rtdb_types::OwnedRelation,
+    request: OwnedCountRequest<'_>,
+    lifetime: Option<i64>,
+    measured: bool,
+) -> Result<OwnedRangeCount> {
     let definition = owned_definition(&context, owner, relation, path).await?;
     let database = context
         .catalog
@@ -287,7 +300,7 @@ pub(crate) async fn owned_count_at(
         .find_map(|key| key.get("_id"));
     let projection = owned_projection(&context, snapshot, &definition, owner, relation, identity).await?;
     let work = accelerate::owned_count(
-        &context, snapshot, &database.storage, &definition, projection, request, lifetime,
+        &context, snapshot, &database.storage, &definition, projection, request, lifetime, measured,
     );
     rtdb_storage::IoRegion::leased(context.catalog.read_lease(), work).await
 }
