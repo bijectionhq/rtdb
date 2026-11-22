@@ -380,6 +380,16 @@ impl TableRef {
             && target.table[..64] == self.table[..64]
     }
 
+    /// A principal's logical data relation or its world overlay. Protected
+    /// metadata tables use ordinary IID events and are outside this lane.
+    pub fn is_owned_event_data(&self) -> bool {
+        self.schema == OWNED_SCHEMA_V1
+            && self.table.split_once('-').is_some_and(|(owner, name)| {
+                owner.len() == 64 && owner.bytes().all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+                    && OwnedRelation::from_source(name.to_owned()).is_ok_and(|relation| !relation.is_world_catalog())
+            })
+    }
+
     pub fn supported_owned_name(&self) -> bool {
         self.schema == OWNED_SCHEMA_V1
             && self.table.split_once('-').is_some_and(|(owner, name)| {

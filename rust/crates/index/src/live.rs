@@ -245,6 +245,9 @@ impl LiveTable {
         let mut next = self.clone();
         next.column_types = merge_column_types(&next.column_types, &write.column_types);
         if let Some(batch) = &write.batch {
+            if batch.view().has_entity_keys() != self.table.is_owned_event_data() {
+                return Err(invalid("The table write has the wrong physical entity-key layout"));
+            }
             if !batch.has_system_time(system_time) { return Err(invalid("Imported event system time differs from its transaction")); }
             if next.canonical_entity_iids {
                 next.canonical_entity_iids = batch.has_canonical_iids().unwrap_or(false);
@@ -568,21 +571,25 @@ impl TransactionBuffer {
     }
     pub fn put(&mut self, table: TableRef, document: StructFields<Value>, valid_time: Interval) -> Result<()> {
         let id = document.get("_id").ok_or_else(|| invalid("Put document has no _id"))?.entity_id()?;
-        self.append(table, StoredEvent { iid: id.iid(), system_from: self.tx_key.system_time, valid_time, operation: StoredOperation::Put(document), recency: None })
+        self.append(table, StoredEvent { entity_key: None, iid: id.iid(), system_from: self.tx_key.system_time, valid_time, operation: StoredOperation::Put(document), recency: None })
     }
     pub fn delete(&mut self, table: TableRef, id: &EntityId, valid_time: Interval) -> Result<()> {
-        self.append(table, StoredEvent { iid: id.iid(), system_from: self.tx_key.system_time, valid_time, operation: StoredOperation::Delete, recency: None })
+        self.append(table, StoredEvent { entity_key: None, iid: id.iid(), system_from: self.tx_key.system_time, valid_time, operation: StoredOperation::Delete, recency: None })
     }
     pub fn erase(&mut self, table: TableRef, id: &EntityId) -> Result<()> {
-        self.append(table, StoredEvent { iid: id.iid(), system_from: self.tx_key.system_time, valid_time: Interval::ALL, operation: StoredOperation::Erase, recency: None })
+        self.append(table, StoredEvent { entity_key: None, iid: id.iid(), system_from: self.tx_key.system_time, valid_time: Interval::ALL, operation: StoredOperation::Erase, recency: None })
     }
     pub fn append(&mut self, table: TableRef, event: StoredEvent) -> Result<()> { self.append_to(&table, event) }
     /// As `append`, copying the table reference only for the table's first write.
     pub fn append_to(&mut self, table: &TableRef, mut event: StoredEvent) -> Result<()> {
+        if event.entity_key.is_some() != table.is_owned_event_data() {
+            return Err(invalid("The transaction event has the wrong physical entity-key layout"));
+        }
         if event.system_from != self.tx_key.system_time { return Err(invalid("Transaction event has another system time")); }
         if let StoredOperation::Put(document) = &mut event.operation { document.values_mut().for_each(Value::admit_object_dates); }
         let document_bytes = match &event.operation { StoredOperation::Put(document) => Value::document_retained_bytes(document)?, _ => 0 };
-        let bytes = document_bytes.checked_add(4096).and_then(|bytes| bytes.checked_add(table.schema.len())).and_then(|bytes| bytes.checked_add(table.table.len()))
+        let bytes = document_bytes.checked_add(event.entity_key.as_ref().map_or(0, |key| key.len()))
+            .and_then(|bytes| bytes.checked_add(4096)).and_then(|bytes| bytes.checked_add(table.schema.len())).and_then(|bytes| bytes.checked_add(table.table.len()))
             .ok_or_else(|| invalid("Transaction event size overflow"))?;
         let reservation = self.budget.reserve(bytes)?;
         if !self.tables.contains_key(table) { self.tables.insert(table.clone(), PendingTable::default()); }
@@ -665,6 +672,7 @@ fn block_pages_preserve_order_and_layout_across_live_batches() {
     let memory = MemoryBudget::new(32 << 20);
     let table = TableRef::new("public", "docs");
     let rows = |start, time, text| (start..start + 2).map(|id| StoredEvent {
+        entity_key: None,
         iid: EntityId::Integer(id).iid(),
         system_from: Timestamp(time),
         valid_time: Interval::ALL,
@@ -699,6 +707,7 @@ fn evolving_live_layouts_flush_with_column_bounded_scratch() {
         let mut document = StructFields::from([("_id".into(), Value::I64(id)), ("value".into(), value)]);
         for column in 0..6 { document.insert(format!("payload_{column}"), Value::Binary(vec![id as u8; 1 << 17])); }
         StoredEvent {
+            entity_key: None,
             iid: EntityId::Integer(id).iid(), system_from: Timestamp(id), valid_time: Interval::ALL,
             operation: StoredOperation::Put(document), recency: None,
         }
@@ -730,6 +739,7 @@ fn event_batches_build_wide_document_columns_with_bounded_scratch() {
         let mut doc = StructFields::from([("_id".into(), Value::I64(id))]);
         for key in 0..10 { doc.insert(format!("field_{id}_{key}"), Value::I64(id + key)); }
         StoredEvent {
+            entity_key: None,
             iid: EntityId::Integer(id).iid(),
             system_from: Timestamp(1),
             valid_time: Interval::ALL,
@@ -750,6 +760,7 @@ fn event_batches_build_wide_document_columns_with_bounded_scratch() {
 fn staged_batches_release_event_builder_scratch_before_they_enter_the_live_index() {
     let memory = MemoryBudget::new(16 << 20);
     let events = (0..1024).map(|id| StoredEvent {
+        entity_key: None,
         iid: EntityId::Integer(id).iid(),
         system_from: Timestamp(1),
         valid_time: Interval::ALL,
@@ -773,6 +784,7 @@ fn a_denied_append_keeps_the_transaction_schema_and_budget_unchanged() {
     let table = TableRef::new("public", "docs");
     let system_from = Timestamp(10);
     let event = StoredEvent {
+        entity_key: None,
         iid: EntityId::Integer(1).iid(), system_from, valid_time: Interval::ALL,
         operation: StoredOperation::Put(StructFields::from([("_id".into(), Value::I64(1)), ("v".into(), Value::I64(2))])),
         recency: None,
@@ -797,6 +809,7 @@ fn denied_iid_verification_preserves_the_write_and_cannot_promote_its_generation
     let table = TableRef::new("public", "docs");
     let write = |id, system_from| {
         let event = StoredEvent {
+            entity_key: None,
             iid: EntityId::Uuid(id).iid(),
             system_from,
             valid_time: Interval::ALL,
@@ -877,7 +890,7 @@ mod chunk_tests {
         let table = TableRef::new("public", "docs");
         let mut live = LiveTable::new(table, BlockIndex(0), TrieConfig::default());
         for id in 0..10_000i64 {
-            let event = StoredEvent { iid: EntityId::Integer(id).iid(), system_from: Timestamp(id), valid_time: Interval::ALL,
+            let event = StoredEvent { entity_key: None, iid: EntityId::Integer(id).iid(), system_from: Timestamp(id), valid_time: Interval::ALL,
                 operation: StoredOperation::Put(StructFields::from([("_id".into(), Value::I64(id)), ("v".into(), Value::F64(id as f64))])), recency: None };
             live = live.append(&TableWrite::new(StructFields::new(), Some(IndexBatch::copy_events(&[event], &StructFields::new(), &memory).unwrap())), Timestamp(id)).unwrap();
         }
@@ -888,7 +901,7 @@ mod chunk_tests {
     }
 
     fn put(id: i64, memory: &Arc<MemoryBudget>) -> TableWrite {
-        let event = StoredEvent { iid: EntityId::Integer(id).iid(), system_from: Timestamp(id), valid_time: Interval::ALL,
+        let event = StoredEvent { entity_key: None, iid: EntityId::Integer(id).iid(), system_from: Timestamp(id), valid_time: Interval::ALL,
             operation: StoredOperation::Put(StructFields::from([("_id".into(), Value::I64(id))])), recency: None };
         TableWrite::new(StructFields::new(), Some(IndexBatch::copy_events(&[event], &StructFields::new(), memory).unwrap()))
     }
@@ -900,7 +913,7 @@ mod chunk_tests {
         for tx in 0..128i64 {
             let events = (tx * 64..tx * 64 + 64).map(|n| {
                 let id = match (n - tx * 64) % 3 { 0 => Value::I16(n as i16), 1 => Value::I32(n as i32), _ => Value::I64(n) };
-                StoredEvent { iid: EntityId::Integer(n).iid(), system_from: Timestamp(tx), valid_time: Interval::ALL,
+                StoredEvent { entity_key: None, iid: EntityId::Integer(n).iid(), system_from: Timestamp(tx), valid_time: Interval::ALL,
                     operation: StoredOperation::Put(StructFields::from([("_id".into(), id), ("sku".into(), Value::Utf8(format!("sku-{n}")))])), recency: None }
             }).collect::<Vec<_>>();
             live = live.append(&TableWrite::new(StructFields::new(), Some(IndexBatch::copy_events(&events, &StructFields::new(), &memory).unwrap())), Timestamp(tx)).unwrap();
@@ -941,7 +954,7 @@ mod chunk_tests {
         let mut live = LiveIndex::new(BlockIndex(0), None, TrieConfig::default());
         for id in 0..1000i64 {
             let key = format!("{id:032x}/0");
-            let event = StoredEvent { iid: EntityId::String(key.clone()).iid(), system_from: Timestamp(id), valid_time: Interval::ALL,
+            let event = StoredEvent { entity_key: None, iid: EntityId::String(key.clone()).iid(), system_from: Timestamp(id), valid_time: Interval::ALL,
                 operation: StoredOperation::Put(StructFields::from([("_id".into(), Value::Utf8(key))])), recency: None };
             let batch = IndexBatch::copy_events(&[event], &StructFields::new(), &memory).unwrap();
             let write = TableWrite::new(StructFields::new(), Some(batch));

@@ -366,6 +366,7 @@ mod tests {
 
     fn put(id: i64, system: i64, valid: Interval, key: i64) -> StoredEvent {
         StoredEvent {
+            entity_key: None,
             iid: Value::I64(id).entity_id().unwrap().iid(),
             system_from: Timestamp(system),
             valid_time: valid,
@@ -482,7 +483,7 @@ mod tests {
             )
             .await
             .unwrap();
-        let erase = StoredEvent {
+        let erase = StoredEvent { entity_key: None,
             iid,
             system_from: Timestamp(1),
             valid_time: Interval::ALL,

@@ -203,12 +203,20 @@ fn search_row(event: EventRef<'_>, columns: &[String], owned: bool, memory: &Arc
         PutText::Other => Some(Vec::new()),
     })).collect::<Result<_>>()?;
     let header = event.header();
-    let identity = if owned && header.op == EventOp::Put {
-        let Some(PutColumn::Stored(field, array, row)) = event.put_column("_id") else {
-            return Err(fault("Owned search put is missing its identity"));
-        };
-        let _scratch = memory.reserve(rtdb_columnar::estimate_copy_cell_bytes(field, array, row)?)?;
-        Some(event.put_cell("_id", &LogicalType::Null)?.entity_id()?)
+    let identity = if owned {
+        let key = event.entity_key().ok_or_else(|| fault("Owned search event is missing its physical identity"))?;
+        let _key = memory.reserve(key.len())?;
+        let id = rtdb_types::EntityId::from_handle_bytes(key)?;
+        if header.op == EventOp::Put {
+            let Some(PutColumn::Stored(field, array, row)) = event.put_column("_id") else {
+                return Err(fault("Owned search put is missing its identity"));
+            };
+            let _scratch = memory.reserve(rtdb_columnar::estimate_copy_cell_bytes(field, array, row)?)?;
+            if event.put_cell("_id", &LogicalType::Null)?.entity_id()? != id {
+                return Err(fault("Owned search document identity differs from its physical key"));
+            }
+        }
+        Some(id)
     } else {
         None
     };
@@ -297,6 +305,7 @@ mod tests {
             StoredOperation::Delete,
             StoredOperation::Erase,
         ].into_iter().enumerate().map(|(index, operation)| StoredEvent {
+            entity_key: None,
             iid: Iid([index as u8; 16]), system_from: Timestamp(10), valid_time: Interval::ALL, recency: None, operation,
         }).collect::<Vec<_>>();
         let batch = EventBatch::new(build_event_batch(&events, Some(fields), None).unwrap()).unwrap();
