@@ -337,7 +337,7 @@ async fn scenario(
         let progress = handle.progress().current();
         if reached.role != expected_role || reached.highest_term != Term(1) || reached.promotion_failure.is_some()
             || progress.tx_key != Some(last_tx) || progress.external_token.as_deref() != Some(token.as_slice())
-            || progress.latest_result.as_ref().is_none_or(|result| result.committed() != final_commit)
+            || progress.latest_result.as_ref().is_none_or(|completed| completed.result().committed() != final_commit)
             || handle.progress().fault().is_some()
         {
             return Err(format!("native actor {actor} did not converge at selected observation: {reached:?}, {progress:?}").into());

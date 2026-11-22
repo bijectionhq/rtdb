@@ -60,10 +60,19 @@ Answer(attempt, returned) ==
     /\ report' = <<attempt, returned>>
     /\ UNCHANGED <<epoch, directory, intake, committed, sealedAt, applied, basis, read, outageCommit>>
 
+Unresolved(attempt) ==
+    /\ report = <<None, None>> /\ attempt \in intake /\ attempt[1] < epoch
+    /\ IF Mutation = "close_before_replay"
+       THEN IndexOf(attempt) = 0 \/ IndexOf(attempt) > applied
+       ELSE applied >= sealedAt /\ IndexOf(attempt) = 0
+    /\ report' = <<attempt, None>>
+    /\ UNCHANGED <<epoch, directory, intake, committed, sealedAt, applied, basis, read, outageCommit>>
+
 IssueBasis(attempt) ==
     LET idx == IndexOf(attempt) IN
     /\ basis = <<None, 0>> /\ attempt \in intake
     /\ idx > 0 \/ Mutation = "basis_at_intake"
+    /\ idx <= applied \/ Mutation \in {"basis_at_intake", "basis_before_apply"}
     /\ basis' = <<attempt, IF idx = 0 THEN attempt[2] ELSE idx>>
     /\ UNCHANGED <<epoch, directory, intake, committed, sealedAt, applied, report, read, outageCommit>>
 
@@ -87,15 +96,17 @@ ReplyRead ==
     /\ UNCHANGED <<epoch, directory, intake, committed, sealedAt, applied, report, basis, outageCommit>>
 
 Next ==
-    \/ \E attempt \in Attempts : Submit(attempt) \/ Commit(attempt) \/ IssueBasis(attempt)
+    \/ \E attempt \in Attempts : Submit(attempt) \/ Commit(attempt) \/ IssueBasis(attempt) \/ Unresolved(attempt)
     \/ \E attempt, returned \in Attempts : Answer(attempt, returned)
     \/ \E knownEpoch \in Epochs : StartRead(knownEpoch)
     \/ Move \/ ToggleDirectory \/ Apply \/ ConfirmRead \/ ReplyRead
 
 Spec == Init /\ [][Next]_Vars
 
-ReceiptNamesTheAttempt == report[1] = report[2]
+ReceiptNamesTheAttempt == report[2] = None \/ report[1] = report[2]
 BasisNamesCommittedAttempt == basis[1] = None \/ IndexOf(basis[1]) = basis[2]
+BasisAppearsAfterApply == basis[1] = None \/ basis[2] <= applied
+ClosedReceiptIsAbsent == (report[1] # None /\ report[2] = None) => IndexOf(report[1]) = 0
 FreshReadIncludesPriorCommits == read.phase = "answered" => read.served >= read.minimum
 NeverServesDuringOutage == ~(~directory /\ outageCommit /\ read.phase = "answered" /\ read.served > 0)
 

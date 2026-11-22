@@ -16,6 +16,9 @@ pub struct PlacedAttemptScope {
 }
 
 impl PlacedAttemptScope {
+    pub fn writer_epoch(self) -> u64 { self.writer_epoch.get() }
+    pub fn same_history(self, other: Self) -> bool { self.history == other.history }
+
     pub fn new(history_stream: &str, writer_epoch: u64) -> Result<Self> {
         let writer_epoch = NonZeroU64::new(writer_epoch).ok_or_else(invalid)?;
         if history_stream.is_empty() { return Err(invalid()); }
@@ -93,6 +96,10 @@ pub struct PlacedAttempt {
 
 impl PlacedAttempt {
     pub fn position(self) -> SourcePosition { self.position }
+    pub fn scope(self) -> PlacedAttemptScope { self.seed.scope }
+    pub fn belongs_to(self, principal: Option<&str>) -> bool {
+        self.seed.identify(self.position, principal).is_ok_and(|expected| expected == self)
+    }
     pub fn matches(self, scope: PlacedAttemptScope, position: SourcePosition, principal: Option<&str>) -> bool {
         self.seed.scope == scope && self.seed.identify(position, principal).is_ok_and(|expected| expected == self)
     }

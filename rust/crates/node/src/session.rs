@@ -10,6 +10,8 @@ use rtdb_tx::{SubmitOptions, SubmittedTx, TransactionResult, TxOp, UserMetadata}
 use rtdb_types::{Anomaly, Result, TimeBasis, Instant, Timestamp, TxBasis, TxId};
 use tokio_util::sync::CancellationToken;
 
+use crate::placed_receipts::is_placed_token;
+
 #[async_trait]
 pub trait SessionService: Send + Sync {
     fn memory(&self) -> &Arc<MemoryBudget>;
@@ -23,11 +25,19 @@ pub trait SessionService: Send + Sync {
     fn snapshot_basis(&self) -> Result<TimeBasis>;
     async fn fresh_snapshot_basis(&self, _cancellation: &CancellationToken) -> Result<TimeBasis> { self.snapshot_basis() }
     async fn await_basis(&self, basis: Option<TxBasis>, timeout: Duration, cancellation: &CancellationToken) -> Result<()>;
+    async fn await_client_token(&self, token: Option<&str>, timeout: Duration, cancellation: &CancellationToken) -> Result<Option<String>> {
+        self.await_basis(token.map(decode_tx_basis).transpose()?, timeout, cancellation).await?;
+        Ok(None)
+    }
+    async fn check_submission_basis(&self, _database: &str, _token: Option<&str>, _cancellation: &CancellationToken) -> Result<()> { Ok(()) }
     async fn submit(&self, database: &str, operations: Vec<TxOp>, options: SubmitOptions, cancellation: &CancellationToken) -> Result<SubmittedTx>;
     async fn submit_replay(&self, _database: &str, _operations: Vec<TxOp>, _options: SubmitOptions, _permit: ReplaySubmissionPermit, _cancellation: &CancellationToken) -> Result<SubmittedTx> {
         Err(Anomaly::unsupported("rtdb.node/private-replay-unsupported", "This session service cannot submit a private replay"))
     }
     async fn await_transaction(&self, database: &str, tx_id: TxId, cancellation: &CancellationToken) -> Result<TransactionResult>;
+    async fn await_submission(&self, database: &str, submitted: &SubmittedTx, cancellation: &CancellationToken) -> Result<(TransactionResult, Option<String>)> {
+        Ok((self.await_transaction(database, submitted.tx_id, cancellation).await?, None))
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -257,6 +267,14 @@ impl Session {
     pub fn effective_await_token(&self) -> Option<&str> { self.transaction().and_then(Transaction::await_token).or(self.await_token.as_deref()) }
     pub fn connection_await_token(&self) -> (u64, Option<&str>) { (self.await_token_revision, self.await_token.as_deref()) }
     pub fn last_submitted(&self) -> Option<&LastSubmittedTx> { self.last_submitted.as_ref() }
+    pub fn last_submitted_await_token(&self) -> Option<&str> {
+        if let Some(LastSubmittedTx::Submitted(tx)) = self.last_submitted()
+            && let Some(receipt) = &tx.placed_receipt
+        {
+            return Some(receipt);
+        }
+        self.effective_await_token()
+    }
     pub fn cancellation(&self) -> &CancellationToken { &self.cancellation }
     pub fn status(&self) -> TransactionStatus {
         match &self.lifecycle {
@@ -393,7 +411,7 @@ impl Session {
                 let old = match &tx.phase { Phase::Pending(Some(options)) => options.clone(), _ => ReadOptions::default() };
                 let options = ReadOptions { snapshot_token: update_text(&settings.snapshot_token, &old.snapshot_token, &memory)?, snapshot_time: settings.snapshot_time.apply(&old.snapshot_time),
                     clock_time: settings.clock_time.apply(&old.clock_time), await_token: update_text(&settings.await_token, &old.await_token, &memory)? };
-                if let Some(token) = &options.await_token { decode_tx_basis(token)?; }
+                if let Some(token) = &options.await_token && !is_placed_token(token) { decode_tx_basis(token)?; }
                 Some(Phase::Pending(Some(options)))
             }
             Some(AccessSettings::ReadWrite(settings)) => {
@@ -450,14 +468,14 @@ impl Session {
         self.auto_commit = enabled;
         Ok(())
     }
-    async fn pin(&self, options: &ReadOptions) -> Result<QueryBasis> {
+    async fn pin(&self, options: &ReadOptions) -> Result<(QueryBasis, Option<String>)> {
         let token = options.await_token.as_deref().or(self.await_token.as_deref());
-        self.service.await_basis(token.map(decode_tx_basis).transpose()?, Duration::from_secs(60), &self.cancellation).await?;
+        let applied = self.service.await_client_token(token, Duration::from_secs(60), &self.cancellation).await?;
         let snapshot = match &options.snapshot_token {
             Some(token) => decode_time_basis(token)?,
             None => self.service.fresh_snapshot_basis(&self.cancellation).await?,
         };
-        Ok(QueryBasis { snapshot, snapshot_time: options.snapshot_time, current_time: options.clock_time.unwrap_or_else(|| self.service.query_instant()), timezone: self.effective_timezone().to_owned() })
+        Ok((QueryBasis { snapshot, snapshot_time: options.snapshot_time, current_time: options.clock_time.unwrap_or_else(|| self.service.query_instant()), timezone: self.effective_timezone().to_owned() }, applied))
     }
     pub async fn read_basis(&mut self) -> Result<QueryBasis> {
         self.revalidate().await?;
@@ -470,10 +488,15 @@ impl Session {
             }
         }
         let options = match self.transaction().map(|tx| &tx.phase) { Some(Phase::Pending(Some(options))) => options.clone(), _ => ReadOptions::default() };
-        let basis = self.pin(&options).await?;
+        let (basis, applied) = self.pin(&options).await?;
+        let mut local_token = options.await_token;
+        if let Some(token) = applied {
+            if local_token.is_some() { local_token = Some(RetainedText::new(token, self.service.memory())?); }
+            else { self.set_await_token(Some(token))?; }
+        }
         if self.transaction().is_some() || !self.auto_commit {
             let retained = RetainedBasis::copy(&basis, self.service.memory())?;
-            if let Some(tx) = self.transaction_mut() { tx.phase = Phase::Reading { basis: retained, await_token: options.await_token }; }
+            if let Some(tx) = self.transaction_mut() { tx.phase = Phase::Reading { basis: retained, await_token: local_token }; }
             else { self.lifecycle = Lifecycle::Open(Some(Transaction::new(Phase::Reading { basis: retained, await_token: None }, &self.timezone))); }
         }
         Ok(basis)
@@ -484,14 +507,14 @@ impl Session {
         let options = match self.transaction().map(|tx| &tx.phase) {
             Some(Phase::Pending(Some(options))) => options.clone(),
             Some(Phase::Reading { basis, await_token }) => {
-                self.service.await_basis(await_token.as_deref().or(self.await_token.as_deref()).map(decode_tx_basis).transpose()?, Duration::from_secs(60), &self.cancellation).await?;
+                self.service.await_client_token(await_token.as_deref().or(self.await_token.as_deref()), Duration::from_secs(60), &self.cancellation).await?;
                 let mut basis = basis.basis.clone();
                 basis.timezone = self.effective_timezone().to_owned();
                 return Ok(basis);
             }
             _ => ReadOptions::default(),
         };
-        self.pin(&options).await
+        self.pin(&options).await.map(|(basis, _)| basis)
     }
     pub async fn unchecked_read_basis(&mut self) -> Result<QueryBasis> {
         if matches!(self.transaction().map(|tx| &tx.phase), Some(Phase::Pending(Some(_)) | Phase::Reading { .. })) {
@@ -539,6 +562,7 @@ impl Session {
         let _sample = rtdb_plan::ExecutionSample::new(observer.clone(), match mode { CommitMode::Async => rtdb_plan::ExecutionTimer::TxSubmit, CommitMode::Sync => rtdb_plan::ExecutionTimer::TxExecute });
         self.revalidate().await?;
         self.ensure_open()?;
+        self.service.check_submission_basis(&database, self.await_token.as_deref(), &self.cancellation).await?;
         options.user = self.service.user().map(str::to_owned);
         if options.default_tz.is_empty() { options.default_tz = self.timezone.to_string(); }
         if replay.is_none() && let Some((key, sequence)) = &mut self.gateway_key {
@@ -554,18 +578,27 @@ impl Session {
         }.inspect_err(|_| {
             if let Some(observer) = &observer { observer.record_error(rtdb_plan::ExecutionError::Transaction); }
         })?;
-        let next = TxBasis { databases: BTreeMap::from([(database.clone(), vec![submitted.tx_id])]) };
-        let token = match &self.await_token { Some(token) => decode_tx_basis(token)?.merge(&next)?, None => next };
-        let token = RetainedText::new(encode_tx_basis(&token), self.service.memory())?;
+        let token = if let Some(receipt) = &submitted.placed_receipt {
+            receipt.clone()
+        } else {
+            let next = TxBasis { databases: BTreeMap::from([(database.clone(), vec![submitted.tx_id])]) };
+            let token = match &self.await_token { Some(token) => decode_tx_basis(token)?.merge(&next)?, None => next };
+            encode_tx_basis(&token)
+        };
         match mode {
-            CommitMode::Async => { self.replace_await_token(Some(token)); self.last_submitted = Some(LastSubmittedTx::Submitted(submitted)); Ok(CommitResult::Submitted(submitted)) }
+            CommitMode::Async => {
+                self.set_await_token(Some(token))?;
+                self.last_submitted = Some(LastSubmittedTx::Submitted(submitted.clone()));
+                Ok(CommitResult::Submitted(submitted))
+            }
             CommitMode::Sync => {
-                let result = {
+                let (result, applied) = {
                     let _await = rtdb_plan::ExecutionSample::new(observer.clone(), rtdb_plan::ExecutionTimer::TxAwait);
-                    self.service.await_transaction(&database, submitted.tx_id, &self.cancellation).await?
+                    self.service.await_submission(&database, &submitted, &self.cancellation).await?
                 };
                 if matches!(result, TransactionResult::Aborted { .. }) { if let Some(observer) = &observer { observer.record_error(rtdb_plan::ExecutionError::Transaction); } }
-                self.replace_await_token(Some(token)); self.last_submitted = Some(LastSubmittedTx::Executed(result.clone()));
+                self.set_await_token(Some(applied.unwrap_or(token)))?;
+                self.last_submitted = Some(LastSubmittedTx::Executed(result.clone()));
                 Ok(CommitResult::Executed(result))
             }
         }

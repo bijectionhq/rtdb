@@ -1184,7 +1184,8 @@ rule AnswerRetryFromWindow {
 
 rule ResolveAndAppend {
     -- The holder resolves against its state, pipelining later transactions against speculative state.
-    -- An asynchronous intake receipt identifies the history, writer epoch and local attempt sequence.
+    -- An asynchronous submission returns an authenticated, opaque receipt for the deployment history, writer epoch, local sequence, principal and fresh nonce.
+    -- A placed session accepts only receipts and causal tokens from the same deployment history and principal.
     -- The resolved replica record carries the exact attempt identity.
     -- Only its durable applied outcome supplies a causal basis.
     when: TxArrived(holding, tx, key)
@@ -1208,7 +1209,11 @@ rule ApplyOnCommit {
     -- The applied outcome and its basis are retained against the exact attempt through the receipt window, including at recovery.
     -- The indexed outcome witness is written in the same resolved delta as the transaction result.
     -- Its visible receipt window starts at the logged intake timestamp.
-    -- Closing an epoch lets receipt lookup distinguish an unresolved attempt from a pending one after recovering the sealed prefix.
+    -- The current writer can redeem an attempt once the installed prefix covers its intake sequence and the exact outcome witness is readable.
+    -- To classify a missing outcome as unresolved, the serving attachment installs the recovered prefix that closes the attempt's writer epoch.
+    -- A receipt expires one hour after its recorded intake time.
+    -- Redemption exchanges the receipt for a causal token naming the installed replica prefix that contains the durable outcome.
+    -- Reading at an implicit basis first installs at least the prefix named by the causal token.
     when: AppendCommitted(holding, record: ResolvedTx)
 
     requires: holding.state = serving

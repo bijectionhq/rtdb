@@ -605,8 +605,11 @@ impl Default for SubmitOptions {
     fn default() -> Self { Self { default_tz: "UTC".into(), system_time: None, user: None, user_metadata: None } }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct SubmittedTx { pub tx_id: TxId }
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SubmittedTx {
+    pub tx_id: TxId,
+    pub placed_receipt: Option<String>,
+}
 
 #[derive(Debug)]
 struct AnomalyAllocation { error: Anomaly, wire: Option<Arc<Vec<u8>>>, reservation: Arc<MemoryReservation> }

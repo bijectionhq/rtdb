@@ -8,7 +8,7 @@ use arrow_schema::{DataType, Field, Schema, UnionFields, UnionMode};
 use rtdb_columnar::{BatchBuilder, MemoryBudget, MemoryReservation, OwnedBatch, build_array, copy_array, estimate_builder_bytes, estimate_builder_bytes_refs, estimate_read_value_bytes, from_field, read_value, struct_field_cell, to_field};
 use rtdb_format::envelope::{SourceBody, SourceMessage};
 use prost::Message;
-use rtdb_types::{Anomaly, EntityId, Iid, LogicalType, OrderedSet, PlacedAttempt, PlacedAttemptScope, PlacedAttemptSeed, Result, ScalarType, SourcePosition, TableRef, TimeUnit, Timestamp, Value};
+use rtdb_types::{Anomaly, EntityId, Iid, LogicalType, OrderedSet, PlacedAttempt, PlacedAttemptSeed, Result, ScalarType, SourcePosition, TableRef, TimeUnit, Timestamp, Value};
 
 use crate::{ArrowDocuments, Documents, EntityIds, ReplaySubmission, RetainedBytes, SqlArguments, SubmitOptions, TxOp, UserMetadata};
 use crate::values::{DecodedDocumentLayout, contains_fixed_size_list};
@@ -73,8 +73,8 @@ impl SourceTransaction {
         self
     }
 
-    pub fn with_placed_scope(mut self, scope: Option<PlacedAttemptScope>) -> Self {
-        self.placed_seed = scope.map(PlacedAttemptScope::issue);
+    pub fn with_placed_seed(mut self, seed: Option<PlacedAttemptSeed>) -> Self {
+        self.placed_seed = seed;
         self
     }
 

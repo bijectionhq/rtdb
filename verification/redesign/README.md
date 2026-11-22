@@ -43,7 +43,7 @@ Dependency order: R4 and R6 can proceed in parallel; R5 needs R4; R7 needs R5 an
 
 | Change | Target | State |
 | --- | --- | --- |
-| Placed attempt receipts, fresh reads and loglet fences | [Authority boundaries](authority-boundaries.md) | Opt-in subscriber reads use durable loglet indexes. Resolved frames and checkpoints bind placed outcomes to attempt identities. Public receipts and retiring lease-based self-fencing remain open. |
+| Placed attempt receipts, fresh reads and loglet fences | [Authority boundaries](authority-boundaries.md) | Opt-in subscriber reads use durable loglet indexes. Placed submissions issue scoped receipts and redeem them against installed outcomes. Retiring lease-based self-fencing remains open. |
 | CDC recoverability and upstream acknowledgement | [Authority boundaries](authority-boundaries.md#recovery-roots-and-upstream-acknowledgement) | Contract specified; gated on R5 and provider qualification |
 | Argument-defined search ranking | [Full-text search](../../dev/doc/fts.allium) | Implemented in native SQL and the rank accelerator |
 | Custody-scoped sealing, enrollment and erasure | [R6](R6-sealing.md) · [R7](R7-eraser.md) | Bounded custody protocol checked in TLA+; provider and runtime changes pending |

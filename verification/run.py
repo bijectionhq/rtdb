@@ -1828,6 +1828,10 @@ TLA_CASES = (
      ('Mutation = "none"', 'Mutation = "reuse_slot"'), "ReceiptNamesTheAttempt"),
     ("PlacedServingAuthority", "placed-basis-issued-at-intake",
      ('Mutation = "none"', 'Mutation = "basis_at_intake"'), "BasisNamesCommittedAttempt"),
+    ("PlacedServingAuthority", "placed-basis-issued-before-apply",
+     ('Mutation = "none"', 'Mutation = "basis_before_apply"'), "BasisAppearsAfterApply"),
+    ("PlacedServingAuthority", "placed-receipt-closed-before-replay",
+     ('Mutation = "none"', 'Mutation = "close_before_replay"'), "ClosedReceiptIsAbsent"),
     ("PlacedServingAuthority", "placed-read-accepts-sealed-loglet",
      ('Mutation = "none"', 'Mutation = "accept_sealed_loglet"'), "FreshReadIncludesPriorCommits"),
     ("PlacedServingAuthority", "placed-read-skips-quorum",
@@ -1835,7 +1839,7 @@ TLA_CASES = (
     ("PlacedServingAuthority", "placed-read-skips-apply",
      ('Mutation = "none"', 'Mutation = "skip_apply"'), "FreshReadIncludesPriorCommits"),
     ("PlacedServingAuthority", "placed-directory-outage-witness",
-     ("INVARIANTS ReceiptNamesTheAttempt BasisNamesCommittedAttempt FreshReadIncludesPriorCommits",
+     ("INVARIANTS ReceiptNamesTheAttempt BasisNamesCommittedAttempt BasisAppearsAfterApply ClosedReceiptIsAbsent FreshReadIncludesPriorCommits",
       "INVARIANT NeverServesDuringOutage"), "NeverServesDuringOutage"),
     ("ErasureCustody", "erasure-custody", None, None),
     ("KeyLineageEnrollment", "key-lineage-enrollment", None, None),
@@ -3256,6 +3260,35 @@ def verify_replay_prefix(args, source):
     print("rust-replay-prefix: checkpoint selection and same-cursor replay passed, both controls rejected")
 
 
+
+def verify_placed_receipt_replay(args, source):
+    env = os.environ | {
+        "CARGO_TARGET_DIR": os.environ.get("CARGO_TARGET_DIR", str(ROOT / "target")),
+        "CARGO_PROFILE_TEST_DEBUG": "0",
+    }
+    reused = "a_reused_intake_position_cannot_redeem_the_sealed_writers_receipt"
+    restored = "placed_attempt_outcomes_keep_their_exact_identity_through_a_checkpoint"
+    command = ["cargo", "test", "--locked", "-p", "rtdb-multi", "--test", "cell"]
+    for test in (reused, restored):
+        baseline = run_case([*command, test, "--", "--exact"], source / "rust", args.evidence,
+                            f"rust-placed-receipt-{test}", env)
+        if baseline.returncode or f"{test} ... ok" not in baseline.stdout:
+            raise ValueError(f"{test}: native receipt replay failed")
+    path = source / "rust/crates/node/src/node.rs"
+    original = path.read_bytes()
+    try:
+        replace_once(path, "db.progress().current().placed_outcome(attempt)",
+                     "db.progress().current().tx_key.filter(|key| key.tx_id.0 == attempt.position().0)")
+        checked = run_case([*command, reused, "--", "--exact"], source / "rust", args.evidence,
+                           "rust-placed-receipt-reused-position-control", env)
+        if (checked.returncode != 101 or f"{reused} ... FAILED" not in checked.stdout
+            or "The sealed writer's receipt cannot return the successor's row" not in checked.stdout):
+            raise ValueError("the reused numeric position did not fail at receipt redemption")
+    finally:
+        path.write_bytes(original)
+    print("rust-placed-receipt: both replays passed, and reusing the source position failed")
+
+
 def verify_multi_trim_admission(args, source):
     env = os.environ | {
         "CARGO_TARGET_DIR": str(ROOT / "target"),
@@ -3979,6 +4012,8 @@ def main():
         "rust/crates/directory/src/lib.rs",
         "rust/crates/directory/src/dynamo/parked.rs",
         "rust/crates/node/src/resources.rs",
+        "rust/crates/node/src/node.rs",
+        "rust/crates/node/src/placed_receipts.rs",
         "rust/crates/multi/src/agent.rs",
         "rust/crates/multi/src/control.rs",
         "rust/crates/multi/src/fragments.rs",
@@ -4040,6 +4075,7 @@ def main():
             verify_compaction_publication_versions(args, source)
             verify_replay_prefix(args, source)
             verify_multi_trim_admission(args, source)
+            verify_placed_receipt_replay(args, source)
             verify_recovery_hold_replay(args, source)
             verify_checkpoint_receipts(args, source)
             verify_checkpoint_metadata_replay(args, source)

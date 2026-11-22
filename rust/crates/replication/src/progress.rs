@@ -1,19 +1,41 @@
 use std::sync::Arc;
 
 use rtdb_tx::TransactionResult;
-use rtdb_types::{Anomaly, AnomalyCategory, Result, SourcePosition, Timestamp, TransactionKey, TxId};
+use rtdb_types::{Anomaly, AnomalyCategory, PlacedAttempt, Result, SourcePosition, Timestamp, TransactionKey, TxId};
 use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AppliedTransaction {
+    result: Arc<TransactionResult>,
+    attempt: Option<PlacedAttempt>,
+}
+
+impl AppliedTransaction {
+    pub(crate) fn new(result: Arc<TransactionResult>, attempt: Option<PlacedAttempt>) -> Self {
+        Self { result, attempt }
+    }
+
+    pub fn result(&self) -> &TransactionResult { self.result.as_ref() }
+}
+
+impl From<Arc<TransactionResult>> for AppliedTransaction {
+    fn from(result: Arc<TransactionResult>) -> Self { Self::new(result, None) }
+}
 
 #[derive(Clone, Debug)]
 pub struct AppliedProgress {
     pub source_position: SourcePosition,
     pub tx_key: Option<TransactionKey>,
-    pub latest_result: Option<Arc<TransactionResult>>,
+    pub latest_result: Option<AppliedTransaction>,
     pub external_token: Option<Arc<[u8]>>,
 }
 impl AppliedProgress {
     pub fn tx_id(&self) -> TxId { self.tx_key.map_or(TxId(-1), |key| key.tx_id) }
+    pub fn placed_outcome(&self, attempt: PlacedAttempt) -> Option<TransactionKey> {
+        self.latest_result.as_ref().filter(|completed| completed.attempt == Some(attempt))
+            .map(|completed| completed.result.tx_key())
+    }
 }
 
 #[derive(Debug)]
@@ -44,7 +66,7 @@ impl ProgressMonitor {
     pub fn fault(&self) -> Option<Anomaly> { self.state.borrow().fault.clone() }
 
     /// Publishes source, transaction, result, and resume token together after their effects apply.
-    pub fn applied(&self, source: Option<SourcePosition>, result: Option<Arc<TransactionResult>>, token: Option<Vec<u8>>) -> Result<()> {
+    pub fn applied(&self, source: Option<SourcePosition>, result: Option<AppliedTransaction>, token: Option<Vec<u8>>) -> Result<()> {
         let mut failure = None;
         self.state.send_modify(|state| {
             if let Some(error) = &state.fault { failure = Some(error.clone()); return; }
@@ -53,12 +75,12 @@ impl ProgressMonitor {
                 failure = Some(Anomaly::fault("rtdb.replication/source-regression", "Applied source watermark moved backwards"));
                 return;
             }
-            if result.as_ref().is_some_and(|result| result.tx_key().tx_id <= state.applied.tx_id()) {
+            if result.as_ref().is_some_and(|result| result.result.tx_key().tx_id <= state.applied.tx_id()) {
                 failure = Some(Anomaly::fault("rtdb.replication/tx-regression", "Applied transaction ID did not advance"));
                 return;
             }
             if let Some(source) = source { state.applied.source_position = source; }
-            if let Some(result) = result { state.applied.tx_key = Some(result.tx_key()); state.applied.latest_result = Some(result); }
+            if let Some(result) = result { state.applied.tx_key = Some(result.result.tx_key()); state.applied.latest_result = Some(result); }
             if let Some(token) = token { state.applied.external_token = Some(token.into()); }
         });
         failure.map_or(Ok(()), Err)
@@ -136,7 +158,7 @@ impl ProgressMonitor {
     /// Returns the result only when the requested ID is still the most recent applied transaction.
     pub async fn await_tx(&self, tx_id: TxId, cancellation: &CancellationToken) -> Result<Option<Arc<TransactionResult>>> {
         let progress = self.until(|progress| progress.tx_id() >= tx_id, cancellation).await?;
-        Ok(progress.latest_result.filter(|result| result.tx_key().tx_id == tx_id))
+        Ok(progress.latest_result.map(|completed| completed.result).filter(|result| result.tx_key().tx_id == tx_id))
     }
     pub async fn await_source(&self, source: SourcePosition, cancellation: &CancellationToken) -> Result<()> {
         self.until(|progress| progress.source_position >= source, cancellation).await.map(|_| ())

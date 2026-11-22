@@ -28,6 +28,8 @@ Metadata naming an erased unit is erased with it before the window ends.
 - R2 (`85a868c07`): the resolver checks receipts in `xt.idempotency_receipts` (`rust/crates/tx/src/resolver.rs`, `receipt_outcome` and `put_receipt`, `RECEIPT_WINDOW_MICROS`), keyed by principal and key with a body digest (`rust/crates/tx/src/source.rs`, `body_digest`).
 - Placed resolution writes a checkpointed outcome witness with a one-hour validity interval starting at the intake record's timestamp.
   The exact attempt key survives checkpoint recovery.
+  The client receipt expires at the same one-hour boundary.
+  A causal token issued after redemption remains usable across writer changes.
 - Expired receipts and all of `xt.txs.user_metadata` remain in bitemporal history indefinitely.
 
 ## Handoff notes

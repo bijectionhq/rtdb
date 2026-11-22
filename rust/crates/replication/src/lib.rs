@@ -14,7 +14,7 @@ mod state;
 
 pub use admission::{Admission, TermFence, TermPosition, Verdict};
 pub use blocks::{BlockDiscovery, BlockStore, ProducedBlock, PublishedCheckpoint, RecoveredPartition};
-pub use driver::{ExternalReceipt, DatabaseEffects, DriverStatus, ReplicationClock, ReplicationConfig, ReplicationDriver, ReplicationHandle, Role, TermHandle};
+pub use driver::{ExternalReceipt, DatabaseEffects, DriverStatus, InstalledPrefix, ReplicationClock, ReplicationConfig, ReplicationDriver, ReplicationHandle, Role, TermHandle};
 pub use logs::{PartitionLogs, ReplicaMetadata, ReplicaReceipt, ReplicaRecord};
-pub use progress::{AppliedProgress, ProgressMonitor};
+pub use progress::{AppliedProgress, AppliedTransaction, ProgressMonitor};
 pub use state::{BlockCycle, FlushTimer, PendingBlock};

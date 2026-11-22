@@ -696,6 +696,9 @@ config {
 -- In the Rust partition owner, a query captures the catalog and its installed replica cut in the same partition value.
 -- Ordinary recovery with a matching journal boundary seeds the cut after the driver opens its replica tail.
 -- The driver advances the cut through delivered records after pending block adoption and resolution read-back buffers have drained.
+-- A placed replication driver publishes its installed replica prefix and the source position covered by that same prefix together.
+-- Receipt redemption uses the paired source position to know when to search for the exact attempt within an epoch.
+-- On a later writer epoch, the installed recovered replica prefix establishes when the search for a previous attempt is complete.
 -- Snapshots captured before the advance retain their original cut.
 -- Exact and restored recovery modes and checkpoints without a matching journal boundary leave the cut unavailable.
 -- An unrecognized replica body stops further advances on that open partition.

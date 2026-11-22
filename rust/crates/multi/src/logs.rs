@@ -9,12 +9,13 @@ use std::sync::atomic::{AtomicI64, Ordering};
 use std::time::Duration;
 
 use async_trait::async_trait;
+use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use bytes::Bytes;
 use futures::FutureExt;
 use prost_types::Any;
 use rtdb_format::envelope::{ReplicaBody, ReplicaEnvelope};
 use rtdb_logkeeper::{QuorumLog, StreamConfig};
-use rtdb_node::{LogAccess, LogFactory, OpenedLogs, ReplicaReadIndex};
+use rtdb_node::{AwaitAuthority, LogAccess, LogFactory, OpenedLogs, PlacedReceiptAuthority, ReplicaReadIndex};
 use rtdb_storage::log::{AppendReceipt, Log, LogOffset, LogRange, LogRecord, LogReplayTail, LogTail, MemoryLog, ReplayHead};
 use rtdb_storage::object_store::ReadReservation;
 use rtdb_types::{Anomaly, PLACED_ATTEMPT_OUTCOME_TABLE, PlacedAttemptScope, Result, SourcePosition, StorageEpoch, Timestamp};
@@ -38,6 +39,32 @@ impl ReplicaReadIndex for LogletReadIndex {
         tokio::time::timeout(READ_INDEX_WITHIN, self.log.read_index(self.epoch)).await
             .map_err(|_| Anomaly::new(rtdb_types::AnomalyCategory::Unavailable, "rtdb.multi/read-index-timeout", "Logkeepers did not confirm a read index in time"))?
             .map_err(Into::into)
+    }
+}
+
+struct LogletReceipts {
+    scope: PlacedAttemptScope,
+    cipher: Cipher,
+    index: LogletReadIndex,
+    recovered: Option<LogOffset>,
+}
+
+const RECEIPT_ASSOCIATED: &str = "rtdb.multi/placed-await/v1";
+
+#[async_trait]
+impl PlacedReceiptAuthority for LogletReceipts {
+    fn scope(&self) -> PlacedAttemptScope { self.scope }
+    fn seal(&self, value: &[u8]) -> Result<String> {
+        Ok(URL_SAFE_NO_PAD.encode(self.cipher.seal(RECEIPT_ASSOCIATED, value)?))
+    }
+    fn open(&self, token: &str) -> Result<Vec<u8>> {
+        let invalid = || Anomaly::incorrect("rtdb/invalid-await-token", "Await token is invalid for this database");
+        if token.len() > 192 { return Err(invalid()); }
+        let sealed = URL_SAFE_NO_PAD.decode(token).map_err(|_| invalid())?;
+        self.cipher.open(RECEIPT_ASSOCIATED, &sealed).map(|bytes| bytes.to_vec()).map_err(|_| invalid())
+    }
+    async fn recovered_through(&self) -> Result<LogOffset> {
+        match self.recovered { Some(position) => Ok(position), None => self.index.confirm().await }
     }
 }
 
@@ -117,7 +144,7 @@ pub(crate) fn frozen_checkpoint(
         start,
     });
     Ok(OpenedLogs { source: intake, replica, source_epoch: epoch, replica_epoch: epoch, replica_read_index: None,
-        placed_attempt_scope: None, drivers: Vec::new() })
+        await_authority: AwaitAuthority::Frozen, drivers: Vec::new() })
 }
 
 #[async_trait]
@@ -130,10 +157,7 @@ impl LogFactory for LogkeeperLogFactory {
             return frozen_checkpoint(checkpoint, epoch, self.maximum_message_bytes);
         }
         let stream = StreamConfig { servers: config.servers.clone(), stream: config.replica_stream.clone(), write_quorum: config.write_quorum, maximum_message_bytes: self.maximum_message_bytes };
-        let placed_attempt_scope = match access {
-            LogAccess::ReadWrite => Some(PlacedAttemptScope::new(&stream.stream, config.epoch)?),
-            _ => None,
-        };
+        let scope = (access == LogAccess::ReadWrite || config.epoch != 0).then(|| PlacedAttemptScope::new(&stream.stream, config.epoch)).transpose()?;
         let (quorum, key) = match access {
             LogAccess::ReadWrite => {
                 let key = self.holds.keys.existing(&config.key_id).await?;
@@ -163,6 +187,11 @@ impl LogFactory for LogkeeperLogFactory {
         let replica_read_index = config.require_read_index.then(|| Box::new(LogletReadIndex {
             log: Arc::clone(&quorum), epoch: config.epoch,
         }) as Box<dyn ReplicaReadIndex>);
+        let await_authority = if let Some(scope) = scope {
+            let recovered = (access == LogAccess::ReadWrite).then(|| quorum.latest()).transpose()?;
+            AwaitAuthority::Placed(Box::new(LogletReceipts { scope, cipher: Cipher::new(&key)?,
+                index: LogletReadIndex { log: Arc::clone(&quorum), epoch: config.epoch }, recovered }))
+        } else { AwaitAuthority::Frozen };
         let replica: Arc<dyn Log> = Arc::new(SealedLog::for_serving(quorum, &key, &config, Arc::clone(&self.holds))?);
         let next = next_source_offset(replica.as_ref(), epoch).await?;
         let intake = Arc::new(IntakeLog { log: MemoryLog::starting_at(self.maximum_message_bytes, LogOffset(next)), consumed: Arc::new(AtomicI64::new(next - 1)), start: next });
@@ -178,7 +207,7 @@ impl LogFactory for LogkeeperLogFactory {
             }.boxed()
         };
         Ok(OpenedLogs { source: intake, replica, source_epoch: epoch, replica_epoch: epoch,
-            replica_read_index, placed_attempt_scope, drivers: vec![trimming] })
+            replica_read_index, await_authority, drivers: vec![trimming] })
     }
 }
 

@@ -94,7 +94,7 @@ async fn an_implicit_basis_checks_the_replica_index_before_capturing_applied_his
         async fn open_logs(&self, _: &str, _: &DatabaseConfig, _: LogAccess, _: CancellationToken, _: &DatabaseStorage) -> Result<OpenedLogs> {
             Ok(OpenedLogs {
                 source: Arc::new(MemoryLog::new(1024)), replica: self.replica.clone(), source_epoch: StorageEpoch(0), replica_epoch: StorageEpoch(0),
-                replica_read_index: Some(Box::new(ReadIndex(self.confirm.clone()))), placed_attempt_scope: None, drivers: Vec::new(),
+                replica_read_index: Some(Box::new(ReadIndex(self.confirm.clone()))), await_authority: rtdb_node::AwaitAuthority::SourcePosition, drivers: Vec::new(),
             })
         }
     }
@@ -124,7 +124,7 @@ async fn an_implicit_basis_checks_the_replica_index_before_capturing_applied_his
         replica.enqueue(envelope.encode().into(), system_time).await.unwrap().durable().await.unwrap();
     }
     let mut applied = database.watch_status();
-    tokio::time::timeout(Duration::from_secs(5), applied.wait_for(|status| status.installed_replica_position == Some(rtdb_types::ReplicaPosition(1)))).await.unwrap().unwrap();
+    tokio::time::timeout(Duration::from_secs(5), applied.wait_for(|status| status.installed.map(|prefix| prefix.replica) == Some(rtdb_types::ReplicaPosition(1)))).await.unwrap().unwrap();
     confirm.add_permits(1);
     let basis = tokio::time::timeout(Duration::from_secs(5), pending).await.unwrap().unwrap();
     assert_eq!(basis.snapshot.databases["shop"], [Some(system_time.into())]);
@@ -1200,7 +1200,7 @@ async fn follower_compactor_publishes_results_through_the_writer_without_claimin
         }
         async fn open_logs(&self, _: &str, _: &DatabaseConfig, _: LogAccess, _: CancellationToken, _: &DatabaseStorage) -> Result<OpenedLogs> {
             Ok(OpenedLogs { source: self.source.clone(), replica: self.replica.clone(), source_epoch: rtdb_types::StorageEpoch(0),
-                replica_epoch: rtdb_types::StorageEpoch(0), replica_read_index: None, placed_attempt_scope: None, drivers: Vec::new() })
+                replica_epoch: rtdb_types::StorageEpoch(0), replica_read_index: None, await_authority: rtdb_node::AwaitAuthority::SourcePosition, drivers: Vec::new() })
         }
     }
     tokio::time::timeout(Duration::from_secs(30), async {
@@ -1299,7 +1299,7 @@ async fn startup_selects_a_newer_checkpoint_when_its_initial_replica_prefix_was_
             Ok(OpenedLogs {
                 source: self.shared.source.clone(), replica,
                 source_epoch: rtdb_types::StorageEpoch(0), replica_epoch: rtdb_types::StorageEpoch(0), replica_read_index: None,
-                placed_attempt_scope: None, drivers: Vec::new(),
+                await_authority: rtdb_node::AwaitAuthority::SourcePosition, drivers: Vec::new(),
             })
         }
     }

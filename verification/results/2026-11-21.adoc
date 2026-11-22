@@ -2546,3 +2546,51 @@ The log is `/private/tmp/rtdb-formal.QMjPSJsX/checkpoint-source-handoff-3c-jvm.l
 The native guard covers checkpoint roots and table metadata in hosted archive capture.
 Its proof assumes monotone publication within a residence, a directory observation for each authorization, and region release only after provider drain.
 The exact physical model still needs production publication identities and joint authorization across the collectors that can erase them, including inherited objects used by forks.
+
+=== Placed receipt issuance and causal redemption
+
+The native submit response and PostgreSQL transaction controls issue the same authenticated provisional receipt for an asynchronous placed attempt.
+The holder waits for its installed source and replica positions together, then confirms the exact attempt from applied progress or the indexed witness.
+A successor can classify an absent attempt as unresolved after it has installed the recovered replica prefix.
+A verified outcome issues an authenticated causal token for an installed replica position.
+Classic source logs retain their position-based await protocol.
+
+The Multi cell replay seals a writer before its pending attempt can append, terminates it, and commits a different attempt at the same source position on the successor.
+It rejects the sealed writer's receipt, a numeric token for the reused position, a forged token, a different principal, and a different installation serving the same database name.
+It accepts the successor's receipt and advances its connection's causal token.
+A second replay trims the original records after checkpoint publication and redeems the original provisional receipt on the new writer.
+The retained resolver outcome records include successful and aborted transactions.
+
+TLC explored 163,544 serving states and 1,505 witness states.
+It detected a reused-slot answer, issuing a basis at intake or before apply, and declaring absence before replaying the sealed prefix.
+The records are under `/private/tmp/rtdb-formal.QMjPSJsX/placed-receipt-model-bfax30d_/`. link:../tla/PlacedServingAuthority.tla[Serving model and controls]
+
+The 796 selected Rust tests passed on parent `4ff84793f`, including 97 whole-cell tests.
+The log is `/private/tmp/rtdb-placed-receipt-cargo.log`.
+The native control substituted the latest numeric position for the exact installed attempt.
+The sealed writer's token then returned the successor's row, and the replay failed at the rejection assertion.
+The control and baseline source digest are under `/private/tmp/rtdb-formal.QMjPSJsX/placed-receipt-native.PdUmW9/`.
+The repository verification runner repeated both exact baselines and its named reused-position control.
+The runner evidence is under `/private/tmp/rtdb-formal.QMjPSJsX/placed-receipt-runner-e1egms_s/`.
+All 53 PgWire protocol tests passed after the COPY fixture requested its buffered ParseComplete and BindComplete messages.
+The original fixture also timed out on clean parent `4ff84793f`.
+The logs are `/private/tmp/rtdb-placed-receipt-pgwire-verified.log` and `/private/tmp/rtdb-placed-receipt-pgwire-parent.log`.
+The explicit JVM rerun on the `4ff84793f` tree passed 3,198 standard and 3,348 property cases with the native receipt implementation.
+The log is `/private/tmp/rtdb-placed-receipt-jvm-and-property.log`.
+After rebasing onto `3c0868e23`, the default Rust workspace type check passed and all 884 selected native cases passed, including 97 cell cases and 53 PgWire protocol cases.
+The logs are `/private/tmp/rtdb-placed-receipt-rebased-workspace.log` and `/private/tmp/rtdb-placed-receipt-rebased-cargo.log`.
+The native conformance library, history replay and node fault suites passed a further 63 cases on the rebased tree.
+The log is `/private/tmp/rtdb-placed-receipt-conformance.log`.
+The rebased JVM tests use the native library SHA-256 `5c6f28d1dc0804bba0ae74f856f403d80cbce645fa17ca5421110f2f2156bba6`.
+TLC reproduced the placed attempt and serving results on the rebased tree and checked all 264 states of the archive replay-closure model.
+The records are under `/private/tmp/rtdb-formal.QMjPSJsX/rebased-placed-receipt-model-1ml5u9wx/`.
+The follow-up rebase onto `a6cf6d730` changed only native Multi archive and storage sources in the execution graph.
+The workspace type check and 227 Multi tests passed on that tree, including 97 cell cases.
+The JVM sources and native-library dependency closure retained the same inputs and library digest.
+The native logs are `/private/tmp/rtdb-placed-receipt-final-workspace.log` and `/private/tmp/rtdb-placed-receipt-final-multi.log`.
+The final Gradle invocation ran the standard, property and integration tasks in 22 minutes.
+It recorded 3,198 standard, 3,348 property and 5,630 integration cases.
+All three suites reported zero failures and errors.
+The PostgreSQL source integration case `slot recreation silently drops changes()` was skipped, with no reason in its XML.
+There were no reflection or boxed math warnings.
+The log is `/private/tmp/rtdb-placed-receipt-final-gradle.log`.

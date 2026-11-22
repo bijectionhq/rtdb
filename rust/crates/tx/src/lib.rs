@@ -15,7 +15,7 @@ pub use submission::{prepare_submission, prepare_submission_with_sql_options};
 pub use values::*;
 pub use source::SourceTransaction;
 pub use resolver::*;
-pub use replica::decode_replica;
+pub use replica::{ReplayedTransaction, decode_replica};
 
 pub use idempotency_window::expiration as idempotency_expiration;
 pub use replay_submission::{ReplaySubmission, private_replay_original};

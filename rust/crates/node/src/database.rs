@@ -10,7 +10,7 @@ use rtdb_maintenance::{ArtefactDatabase, ArtefactDriver, ArtefactHandle, Artefac
 use rtdb_replication::{BlockStore, PartitionLogs, ProgressMonitor, ReplicationDriver, ReplicationHandle, Role, TermHandle};
 use rtdb_storage::{IoRegion, ObjectStore, cache::{BufferPool, CacheBudget}};
 use rtdb_tx::{ResolveContext, TransactionAuthorization};
-use rtdb_types::{Anomaly, AnomalyCategory, PlacedAttemptScope, ReplicaPosition, Result, SourcePosition, TableRef, Term};
+use rtdb_types::{Anomaly, AnomalyCategory, ReplicaPosition, Result, SourcePosition, TableRef, Term};
 use tokio::sync::{RwLock, RwLockReadGuard, RwLockWriteGuard, Semaphore, mpsc, watch};
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
@@ -40,7 +40,7 @@ pub struct Database {
     pub(crate) logs: Arc<PartitionLogs>,
     pub(crate) replication: ReplicationHandle,
     replica_read_index: Option<Box<dyn ReplicaReadIndex>>,
-    pub(crate) placed_attempt_scope: Option<PlacedAttemptScope>,
+    pub(crate) await_authority: crate::AwaitAuthority,
     transaction_admission: RwLock<parking_lot::Mutex<Option<SourcePosition>>>,
     submitted_bytes: AtomicU64,
     replica_read_sessions: AtomicUsize,
@@ -62,6 +62,22 @@ impl Database {
     pub fn is_critical(&self) -> bool { self.name == "xtdb" || self.configuration.critical.unwrap_or(false) }
     pub fn startup_replica_target(&self) -> Result<Option<ReplicaPosition>> { self.logs.startup_replica_target() }
     pub fn latest_submitted_position(&self) -> Result<SourcePosition> { self.logs.latest_source_position() }
+    pub(crate) async fn await_installed(
+        &self, ready: impl Fn(rtdb_replication::InstalledPrefix) -> bool, cancellation: &CancellationToken,
+    ) -> Result<ReplicaPosition> {
+        let mut status = self.watch_status();
+        let waiting = status.wait_for(|status| status.role == Role::Stopped || status.installed.is_some_and(&ready));
+        let stopped = || Anomaly::new(AnomalyCategory::Unavailable, crate::NOT_HELD, format!("This node no longer applies {}", self.name));
+        let status = tokio::select! {
+            biased;
+            _ = cancellation.cancelled() => return Err(Anomaly::new(AnomalyCategory::Interrupted, "xtdb/operation-cancelled", "Operation was cancelled")),
+            _ = self.cancellation.cancelled() => return Err(stopped()),
+            status = waiting => status.map_err(|_| stopped())?,
+        };
+        if status.role == Role::Stopped { return Err(stopped()); }
+        status.installed.map(|prefix| prefix.replica).ok_or_else(stopped)
+    }
+
     pub(crate) async fn confirm_replica_snapshot(&self, cancellation: &CancellationToken) -> Result<()> {
         let Some(read_index) = &self.replica_read_index else { return Ok(()); };
         let behind = || Anomaly::new(AnomalyCategory::Unavailable, REPLICA_BEHIND,
@@ -71,7 +87,7 @@ impl Database {
             let position = ReplicaPosition::from_epoch_offset(self.logs.replica_epoch, offset.0)?;
             let mut status = self.watch_status();
             let applied = status.wait_for(|status| status.role == Role::Stopped
-                || status.installed_replica_position.is_some_and(|installed| installed >= position));
+                || status.installed.is_some_and(|prefix| prefix.replica >= position));
             let status = tokio::time::timeout(Duration::from_millis(20), applied).await.map_err(|_| behind())?.map_err(|_| behind())?;
             if status.role == Role::Stopped { return Err(behind()); }
             Ok(())
@@ -104,13 +120,13 @@ impl Database {
             let logs = Arc::clone(&self.logs);
             if let Ok(Ok(tip)) = self.io.run_blocking(move || Ok(logs.latest_replica_position())).await { self.currency.observe(observed_at, tip); }
         }
-        let mut current = deadline(self.currency.anchor(self.replication.status().installed_replica_position));
+        let mut current = deadline(self.currency.anchor(self.replication.status().installed.map(|prefix| prefix.replica)));
         if current.is_none_or(|deadline| !lease_admits(clock.monotonic_micros(), deadline)) {
             if let Some(tip) = self.currency.pending_tip() {
                 let mut status = self.replication.watch_status();
-                let caught_up = status.wait_for(|status| status.installed_replica_position.is_some_and(|installed| installed >= tip));
+                let caught_up = status.wait_for(|status| status.installed.is_some_and(|prefix| prefix.replica >= tip));
                 let _ = tokio::time::timeout(garbage.reader_lease_margin, self.cancellation.run_until_cancelled(caught_up)).await;
-                current = deadline(self.currency.anchor(self.replication.status().installed_replica_position));
+                current = deadline(self.currency.anchor(self.replication.status().installed.map(|prefix| prefix.replica)));
             }
         }
         let clock = Arc::clone(clock);
@@ -326,7 +342,7 @@ impl DatabaseFactory {
                 storage, replica_epoch: logs.replica_epoch.0,
             });
             let database = Arc::new(Database { name, configuration, read_only, partition, storage, logs, replication, replica_read_index: opened_logs.replica_read_index,
-                placed_attempt_scope: opened_logs.placed_attempt_scope,
+                await_authority: opened_logs.await_authority,
                 transaction_admission: RwLock::default(), submitted_bytes: AtomicU64::new(0), replica_read_sessions: AtomicUsize::new(0),
                 query_cpu, fragment_residence, compaction, artefacts, ordered_cycle, cancellation: cancellation.clone(), io: Arc::clone(&io), currency });
             let driver = DatabaseDriver { database: Arc::clone(&database), replication: replica_driver, compactor, artefacts: artefact_drivers, supervisor, logs: opened_logs.drivers, log_cancellation };
@@ -486,7 +502,7 @@ impl MaintenanceSupervisor {
                         let logs = Arc::clone(&self.logs);
                         if let Ok(Ok(tip)) = tokio::task::spawn_blocking(move || logs.latest_replica_position()).await { self.currency.observe(observed_at, tip); }
                     }
-                    self.currency.anchor(current.installed_replica_position);
+                    self.currency.anchor(current.installed.map(|prefix| prefix.replica));
                 }
             }
             let term = match current.role { Role::Leading(term) => Some(term), _ => None };

@@ -9,9 +9,15 @@ use rtdb_types::{Anomaly, BlockIndex, PLACED_ATTEMPT_OUTCOME_TABLE, PlacedAttemp
 
 use crate::{RetainedAnomaly, TransactionResult};
 
-/// Decodes every table before returning an applyable transaction; caller publishes it atomically.
-pub fn decode_replica(message: &ResolvedTx, predecessor: Option<TransactionKey>, block: BlockIndex, memory: &Arc<MemoryBudget>) -> Result<(StagedWrite, TransactionResult)> {
-    if let Some(placed) = message.placed_attempt.as_deref() {
+pub struct ReplayedTransaction {
+    pub writes: StagedWrite,
+    pub result: TransactionResult,
+    pub placed_attempt: Option<PlacedAttempt>,
+}
+
+/// Decodes the complete transaction for atomic application by the caller.
+pub fn decode_replica(message: &ResolvedTx, predecessor: Option<TransactionKey>, block: BlockIndex, memory: &Arc<MemoryBudget>) -> Result<ReplayedTransaction> {
+    let placed_attempt = if let Some(placed) = message.placed_attempt.as_deref() {
         let attempt = PlacedAttempt::decode(placed).map_err(|_| invalid("Invalid placed attempt identity"))?;
         let position = Some(attempt.position().0);
         if message.src_msg_id != position || message.tx_id != position
@@ -19,7 +25,8 @@ pub fn decode_replica(message: &ResolvedTx, predecessor: Option<TransactionKey>,
         {
             return Err(invalid("Placed attempt and transaction outcome disagree"));
         }
-    }
+        Some(attempt)
+    } else { None };
     let key = TransactionKey { tx_id: TxId(message.tx_id.unwrap_or_default()), system_time: Timestamp(message.system_time_micros.unwrap_or_default()) };
     let result = if message.committed.unwrap_or_default() {
         TransactionResult::Committed { tx_key: key }
@@ -36,7 +43,7 @@ pub fn decode_replica(message: &ResolvedTx, predecessor: Option<TransactionKey>,
         let batch = IndexBatch::from_owned(pages.into_iter().next().ok_or_else(|| invalid("Replica table has no batch"))?)?;
         tables.insert(TableRef::new(schema, table), TableWrite::new(StructFields::new(), Some(batch)));
     }
-    Ok((StagedWrite::new(key, predecessor, block, tables)?, result))
+    Ok(ReplayedTransaction { writes: StagedWrite::new(key, predecessor, block, tables)?, result, placed_attempt })
 }
 
 fn decode_error(bytes: &[u8], memory: &Arc<MemoryBudget>) -> Result<RetainedAnomaly> {

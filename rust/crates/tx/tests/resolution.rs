@@ -158,7 +158,7 @@ async fn replayed_unsigned_argument_payloads_bind_signed_and_keep_source_bytes()
     assert_eq!(document["v"], Value::I64(1));
     let body = resolved.to_replica_body(&context.memory).unwrap();
     let rtdb_format::envelope::ReplicaBody::ResolvedTx(body) = body.body() else { panic!("Expected resolved payload") };
-    let (replica, _) = decode_replica(body, None, state.value().snapshot().block_index(), &context.memory).unwrap();
+    let ReplayedTransaction { writes: replica, .. } = decode_replica(body, None, state.value().snapshot().block_index(), &context.memory).unwrap();
     assert_eq!(replica.tables()[&table()].batch().unwrap().view().read_event(0).unwrap().operation, StoredOperation::Put(document));
 }
 
@@ -347,7 +347,7 @@ async fn staged_empty_create_table_visible_across_a_batch_5507() {
     assert!(!next.writes().tables().contains_key(&TableRef::new("public", "untouched")));
     let body = declared.to_replica_body(&context.memory).unwrap();
     let rtdb_format::envelope::ReplicaBody::ResolvedTx(body) = body.body() else { panic!("Expected resolved payload") };
-    let (decoded, result) = decode_replica(body, None, state.value().snapshot().block_index(), &context.memory).unwrap();
+    let ReplayedTransaction { writes: decoded, result, .. } = decode_replica(body, None, state.value().snapshot().block_index(), &context.memory).unwrap();
     assert_eq!(&result, declared.result());
     assert_eq!(decoded.tables()[&empty].column_types(), declared.writes().tables()[&empty].column_types());
 }
@@ -405,7 +405,7 @@ async fn raw_decimal_cells_survive_source_replay_resolution_sum_and_replica_stag
         assert_eq!(document["v"], Value::Decimal(DecimalValue::new(36i128.to_be_bytes().to_vec(), precision, 129, 128).unwrap()));
         let body = resolved.to_replica_body(&context.memory).unwrap();
         let rtdb_format::envelope::ReplicaBody::ResolvedTx(body) = body.body() else { panic!("Expected resolved payload") };
-        let (replica, result) = decode_replica(body, None, state.value().snapshot().block_index(), &context.memory).unwrap();
+        let ReplayedTransaction { writes: replica, result, .. } = decode_replica(body, None, state.value().snapshot().block_index(), &context.memory).unwrap();
         assert_eq!(&result, resolved.result());
         for table in [table(), sums] {
             let expected = resolved.writes().tables()[&table].batch().unwrap();

@@ -80,6 +80,9 @@ impl ResolvedTx {
     pub fn writes(&self) -> &Arc<StagedWrite> { &self.writes }
     pub fn result(&self) -> &TransactionResult { &self.result }
     pub fn source_position(&self) -> SourcePosition { self.input.position() }
+    pub fn placed_attempt(&self) -> Option<PlacedAttempt> {
+        match self.input { ResolvedInput::Placed(attempt) => Some(attempt), ResolvedInput::Position(_) => None }
+    }
     pub fn external_token(&self) -> Option<&[u8]> { self.external_token.as_deref() }
     pub fn db_op(&self) -> Option<&DbOp> { self.db_op.as_ref() }
 
@@ -99,7 +102,7 @@ impl ResolvedTx {
         bound = bound.checked_add(error.as_ref().map_or(0, |error| error.as_slice().len())).and_then(|bound| bound.checked_add(self.external_token.as_ref().map_or(0, Vec::capacity))).ok_or_else(overflow)?;
         let reservation = memory.reserve(bound)?;
         let key = self.result.tx_key();
-        let placed_attempt = match self.input { ResolvedInput::Placed(attempt) => Some(attempt.encode().to_vec()), ResolvedInput::Position(_) => None };
+        let placed_attempt = self.placed_attempt().map(|attempt| attempt.encode().to_vec());
         let body = ReplicaBody::ResolvedTx(WireResolvedTx {
             tx_id: Some(key.tx_id.0), system_time_micros: Some(key.system_time.0), committed: Some(self.result.committed()), error: error.map(|error| error.as_slice().to_vec()),
             table_data: tables.into_iter().map(|(name, bytes)| (name, bytes.as_slice().to_vec())).collect(),

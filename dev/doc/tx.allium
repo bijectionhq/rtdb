@@ -980,6 +980,11 @@ rule CommitWriting {
         -- Reading / Pending no-op below.
 }
 
+-- In a placed deployment, COMMIT ASYNC sets the connection's await token to an opaque attempt receipt.
+-- A placed COMMIT SYNC sets it to an applied replica prefix after reading the exact attempt outcome.
+-- Before pinning an implicit read basis, an attempt receipt is redeemed and an applied token waits for its installed prefix.
+-- A supplied snapshot token still caps the history visible to the read.
+
 rule CommitNoOp {
     -- Commit of a Reading or still-Pending transaction submits nothing — there is no
     -- buffer to drain. It still writes the tx's session_default_tz back to the connection

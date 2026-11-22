@@ -3,7 +3,6 @@ use std::time::Duration;
 
 use rtdb_columnar::{MemoryBudget, MemoryReservation};
 use rtdb_expr::{EvalContext, EvaluationScope, evaluate_async};
-use rtdb_format::basis::decode_tx_basis;
 use rtdb_plan::{Binder, ControlAccessOptions, ControlCommitMode, ControlStatement, ControlValue, CopyFormat, DiscardTarget, Expr, Identifier, Schema, TransactionOptions};
 use rtdb_query::{QueryContext, QueryCursor};
 use rtdb_tx::UserMetadata;
@@ -280,13 +279,13 @@ impl NativeSession {
             .with_observer(crate::SessionService::execution_observer(self.service.as_ref())).with_tracer(self.service.node.tracer(), None);
         let mut bound = 8192usize;
         if let Some(value) = self.state.parameter(name) { bound = size(bound, value.len().checked_mul(4).ok_or_else(|| invalid("SHOW allocation size overflow"))?)?; }
-        if let Some(token) = self.state.effective_await_token() { bound = size(bound, token.len().checked_mul(4).ok_or_else(|| invalid("SHOW token size overflow"))?)?; }
+        if let Some(token) = if name == "latest_submitted_tx" { self.state.last_submitted_await_token() } else { self.state.effective_await_token() } { bound = size(bound, token.len().checked_mul(4).ok_or_else(|| invalid("SHOW token size overflow"))?)?; }
         let snapshot_token = if name == "snapshot_token" { Some(basis.snapshot_token()) } else { None };
         if let Some(token) = &snapshot_token { bound = size(bound, token.len().checked_mul(4).ok_or_else(|| invalid("SHOW token size overflow"))?)?; }
         let error = match (name, self.state.last_submitted()) { ("latest_submitted_tx", Some(LastSubmittedTx::Executed(tx))) => tx.encoded_error()?, _ => None };
         if let Some(error) = &error { bound = size(bound, error.as_ref().len().checked_mul(4).ok_or_else(|| invalid("SHOW error size overflow"))?)?; }
         let databases = if ["latest_completed_txs", "latest_submitted_msg_ids", "latest_processed_msg_ids"].contains(&name) {
-            crate::SessionService::await_basis(self.service.as_ref(), self.state.effective_await_token().map(decode_tx_basis).transpose()?, Duration::from_secs(60), cancellation).await?;
+            crate::SessionService::await_client_token(self.service.as_ref(), self.state.effective_await_token(), Duration::from_secs(60), cancellation).await?;
             self.service.visible_databases()?
         } else { Default::default() };
         for name in databases.keys() { bound = size(bound, size(8192, name.len().checked_mul(4).ok_or_else(|| invalid("SHOW database name size overflow"))?)?)?; }
@@ -314,7 +313,7 @@ impl NativeSession {
                 let fields = vec![("tx_id", integer.clone().maybe()), ("system_time", instant.clone().maybe()), ("committed", LogicalType::Scalar(ScalarType::Bool).maybe()), ("error", LogicalType::Scalar(ScalarType::Transit).maybe()), ("await_token", text.clone().maybe())];
                 let rows = self.state.last_submitted().map(|tx| {
                     let (system_time, committed) = match tx { LastSubmittedTx::Submitted(_) => (Value::Null, Value::Null), LastSubmittedTx::Executed(tx) => (timestamp(tx.tx_key().system_time), Value::Bool(tx.committed())) };
-                    vec![Value::I64(tx.tx_id().0), system_time, committed, error.as_ref().map_or(Value::Null, |error| Value::Transit(error.as_ref().to_vec())), self.state.effective_await_token().map_or(Value::Null, |token| Value::Utf8(token.into()))]
+                    vec![Value::I64(tx.tx_id().0), system_time, committed, error.as_ref().map_or(Value::Null, |error| Value::Transit(error.as_ref().to_vec())), self.state.last_submitted_await_token().map_or(Value::Null, |token| Value::Utf8(token.into()))]
                 }).into_iter().collect();
                 (fields, rows)
             }

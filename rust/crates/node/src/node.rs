@@ -6,19 +6,20 @@ use std::time::Duration;
 use async_trait::async_trait;
 use futures::future::try_join_all;
 use rtdb_columnar::{MemoryBudget, read_value};
+use rtdb_format::basis::decode_tx_basis;
 use rtdb_format::{database::proto::DatabaseConfig, envelope::{SourceBody, SourceMessage}, log::proto::{AttachDatabase, DetachDatabase, resolved_tx::DbOp}};
 use rtdb_maintenance::CollectionObserver;
 use rtdb_plan::{CatalogMetrics, CatalogUsers};
 use rtdb_query::{CatalogSnapshot, DatabaseSnapshot, PreparedQuery, QueryContext, QueryCursor};
 use rtdb_storage::cache::CacheBudget;
 use rtdb_tx::{IDEMPOTENCY_GUARD_RESULT, RetainedAnomaly, SubmitOptions, SubmittedTx, TransactionAuthorization, TransactionResult, TxOp, prepare_submission_with_sql_options};
-use rtdb_types::{Anomaly, AnomalyCategory, Instant, LogicalType, Result, SourcePosition, TimeBasis, TimeUnit, Timestamp, TransactionKey, TxBasis, TxId, Value};
+use rtdb_types::{Anomaly, AnomalyCategory, LogicalType, PlacedAttempt, ReplicaPosition, Result, ScalarType, SourcePosition, TimeBasis, TimeUnit, Timestamp, TransactionKey, TxBasis, TxId, Value};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc, oneshot};
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 
-use crate::{Clock, Database, DatabaseAccess, DatabaseCatalog, ExternalSources, Membership, NativeResources, NodeOptions, QueryBasis, ResourceFactory, Session, SessionIdentity, SessionService, SystemClock,
-    catalog::CatalogCommand, database::{DatabaseDriver, DatabaseFactory, OpenedDatabase}, statement::prepare_query};
+use crate::{AwaitAuthority, Clock, Database, DatabaseAccess, DatabaseCatalog, ExternalSources, Membership, NativeResources, NodeOptions, QueryBasis, ResourceFactory, Session, SessionIdentity, SessionService, SystemClock,
+    catalog::CatalogCommand, database::{DatabaseDriver, DatabaseFactory, OpenedDatabase}, placed_receipts::{PlacedToken, invalid_token, is_placed_token}, statement::prepare_query};
 
 
 #[derive(Clone)]
@@ -280,8 +281,8 @@ impl Node {
         self.ensure_open()?;
         let Some(basis) = basis else { return Ok(()); };
         if basis.databases.values().any(|positions| !positions.is_empty()) { self.ensure_indexing()?; }
-        let databases = self.catalog.open_databases();
-        let waits = databases.into_iter().filter_map(|(name, database)| basis.databases.get(&name).and_then(|positions| positions.first()).copied().map(|position| async move {
+        let waits = self.catalog.open_databases().into_iter().filter_map(|(name, database)| basis.databases.get(&name).and_then(|positions| positions.first()).copied().map(|position| async move {
+            if !matches!(database.await_authority, AwaitAuthority::SourcePosition) { return Err(invalid_token()); }
             database.replication.await_source(SourcePosition(position.0), cancellation).await
         }));
         tokio::time::timeout(timeout, try_join_all(waits)).await.map_err(|_| timeout_error())??;
@@ -427,8 +428,10 @@ impl Node {
         options.user = identity.user().map(str::to_owned);
         options.default_tz = rtdb_expr::normalize_timezone(&options.default_tz)?;
         let sql_options = rtdb_sql::PrepareOptions { generate_series_end_exclusive: self.factory.options.query.generate_series_end_exclusive, ..Default::default() };
+        let authority = database.await_authority.placed();
+        let seed = authority.map(|authority| authority.scope().issue());
         let source = prepare_submission_with_sql_options(operations, options, database.name(), &self.factory.memory, &sql_options)?
-            .with_placed_scope(database.placed_attempt_scope);
+            .with_placed_seed(seed);
         let (source, submitted_at) = match replay {
             Some((replay, submitted_at)) => (source.with_replay_submission(replay), Some(submitted_at)),
             None => (source, None),
@@ -442,7 +445,11 @@ impl Node {
             let mut latest = admission.lock();
             *latest = (*latest).max(Some(position));
         }
-        Ok(SubmittedTx { tx_id: TxId(position.0) })
+        let placed_receipt = authority.zip(seed).map(|(authority, seed)| {
+            let attempt = seed.identify(position, identity.user())?;
+            PlacedToken::Pending { attempt, submitted_at: append_time }.seal(authority)
+        }).transpose()?;
+        Ok(SubmittedTx { tx_id: TxId(position.0), placed_receipt })
     }
 
     /// The committed outcome visible to the retry when its duplicate guard ran.
@@ -476,15 +483,76 @@ impl Node {
         }
         Ok(None)
     }
-    pub async fn await_transaction(&self, database: &str, tx_id: TxId, identity: &dyn SessionIdentity, cancellation: &CancellationToken) -> Result<TransactionResult> {
-        self.await_transaction_in_placement(database, tx_id, identity, None, cancellation).await
+    async fn placed_outcome_key(&self, database: &str, attempt: PlacedAttempt, identity: &dyn SessionIdentity, placement: Option<&Weak<Database>>, cancellation: &CancellationToken) -> Result<Option<TransactionKey>> {
+        let basis = QueryBasis { snapshot: TimeBasis::default(), snapshot_time: None, current_time: self.query_instant(), timezone: self.factory.options.default_timezone.clone() };
+        let context = self.query_context_in_placement(database, &basis, identity, placement, cancellation).await?;
+        let options = rtdb_sql::PrepareOptions { parameter_types: BTreeMap::from([(0, LogicalType::Scalar(ScalarType::Utf8))]), default_timezone: context.timezone.clone(), generate_series_end_exclusive: context.options.generate_series_end_exclusive, ..Default::default() };
+        let sql = "SELECT tx_id, tx_system_time FROM xt.placed_attempt_outcomes FOR ALL VALID_TIME WHERE _id = ?";
+        let prepared = match prepare_query(sql, &context, &options) {
+            Ok(prepared) => prepared,
+            Err(error) if error.code == "xtdb/table-not-found" || error.code.contains("unknown-table") => return Ok(None),
+            Err(error) => return Err(error),
+        };
+        let mut cursor = prepared.execute(context, vec![Value::Utf8(attempt.outcome_key())]).await?;
+        while let Some(batch) = cursor.next_batch().await? {
+            let batch = batch.batch();
+            if batch.num_rows() == 0 { continue; }
+            let tx_id = read_value(batch.schema().field(0), batch.column(0).as_ref(), 0)?;
+            let time = read_value(batch.schema().field(1), batch.column(1).as_ref(), 0)?;
+            if let (Value::I64(tx_id), Value::Timestamp { value, unit: TimeUnit::Microsecond, .. }) = (tx_id, time)
+                && tx_id == attempt.position().0
+            {
+                return Ok(Some(TransactionKey { tx_id: TxId(tx_id), system_time: Timestamp(value) }));
+            }
+            return Err(bad_attempt_outcome());
+        }
+        Ok(None)
     }
 
-    async fn await_transaction_in_placement(&self, database: &str, tx_id: TxId, identity: &dyn SessionIdentity, placement: Option<&Weak<Database>>, cancellation: &CancellationToken) -> Result<TransactionResult> {
+    async fn redeem_placed_attempt(&self, db: &Database, attempt: PlacedAttempt, submitted_at: Timestamp, identity: &dyn SessionIdentity, placement: Option<&Weak<Database>>, cancellation: &CancellationToken) -> Result<(TransactionResult, String)> {
+        let authority = db.await_authority.placed().ok_or_else(invalid_token)?;
+        if self.now().0 >= submitted_at.0.saturating_add(rtdb_tx::RECEIPT_WINDOW_MICROS) {
+            return Err(Anomaly::incorrect("rtdb/await-token-expired", "The transaction attempt receipt has expired"));
+        }
+        let epoch = attempt.scope().writer_epoch();
+        let current = authority.scope().writer_epoch();
+        if epoch > current { return Err(receipt_replica_behind(db.name())); }
+        let through = if epoch == current {
+            db.await_installed(|prefix| prefix.source >= attempt.position(), cancellation).await?
+        } else {
+            // Recovery of the closed epoch must settle its chosen tail before absence is authoritative.
+            let offset = cancellation.run_until_cancelled(authority.recovered_through()).await.ok_or_else(cancelled)?
+                .map_err(|error| receipt_replica_behind(db.name()).with_context("cause", error.code.into()))?;
+            let recovered = ReplicaPosition::from_epoch_offset(db.logs.replica_epoch, offset.0)?;
+            db.await_installed(|prefix| prefix.replica >= recovered, cancellation).await?
+        };
+        let key = match db.progress().current().placed_outcome(attempt) {
+            Some(key) => Some(key),
+            None => self.placed_outcome_key(db.name(), attempt, identity, placement, cancellation).await?,
+        };
+        let Some(key) = key else {
+            return if epoch < current {
+                Err(Anomaly::incorrect("rtdb/attempt-unresolved", "The closed writer epoch has no outcome for this transaction attempt"))
+            } else {
+                Err(Anomaly::new(AnomalyCategory::Unavailable, "rtdb/attempt-pending", "The transaction attempt has no installed outcome"))
+            };
+        };
+        let result = self.await_transaction_result(db.name(), key.tx_id, Some(key), identity, placement, cancellation).await?;
+        let token = PlacedToken::Applied { attempt, through }.seal(authority)?;
+        Ok((result, token))
+    }
+
+    pub async fn await_transaction(&self, database: &str, tx_id: TxId, identity: &dyn SessionIdentity, cancellation: &CancellationToken) -> Result<TransactionResult> {
+        self.await_transaction_result(database, tx_id, None, identity, None, cancellation).await
+    }
+
+    async fn await_transaction_result(&self, database: &str, tx_id: TxId, expected: Option<TransactionKey>, identity: &dyn SessionIdentity, placement: Option<&Weak<Database>>, cancellation: &CancellationToken) -> Result<TransactionResult> {
         self.admit(database, DatabaseAccess::Read, identity, cancellation).await?;
         self.ensure_indexing()?;
         let db = self.attached_database(database, placement)?;
-        let latest = db.replication.await_tx(tx_id, cancellation).await?;
+        if expected.is_none() && !matches!(db.await_authority, AwaitAuthority::SourcePosition) { return Err(invalid_token()); }
+        let latest = db.replication.await_tx(tx_id, cancellation).await?
+            .filter(|result| expected.is_none_or(|key| key == result.tx_key()));
         if let Some(result) = &latest && !result.error().is_some_and(is_historical_guard_abort) {
             if !db.external_source()
                 && let Some(original) = result.error().map(rtdb_tx::private_replay_original).transpose()?.flatten()
@@ -506,6 +574,7 @@ impl Node {
         };
         let system_time = match cell("system_time")? { Value::Timestamp { value, unit: TimeUnit::Microsecond, .. } => Timestamp(value), _ => return Err(Anomaly::fault("rtdb.node/tx-result-time", "Stored transaction result has no microsecond system-time")) };
         let tx_key = TransactionKey { tx_id, system_time };
+        if expected.is_some_and(|key| key != tx_key) { return Err(bad_attempt_outcome()); }
         match cell("committed")? {
             Value::Bool(true) => Ok(TransactionResult::Committed { tx_key }),
             Value::Bool(false) => {
@@ -832,6 +901,28 @@ impl NativeSessionService {
         self.node.attached_database(&self.database, self.placement.as_ref())
     }
 
+    async fn confirm_placed_token(&self, db: &Database, token: PlacedToken, timeout: Duration, cancellation: &CancellationToken) -> Result<Option<(TransactionResult, String)>> {
+        self.node.admit(db.name(), DatabaseAccess::Read, self.identity.as_ref(), cancellation).await?;
+        self.node.ensure_indexing()?;
+        let work = async {
+            match token {
+                PlacedToken::Pending { attempt, submitted_at } => self.node.redeem_placed_attempt(db, attempt, submitted_at, self.identity.as_ref(), self.placement.as_ref(), cancellation).await.map(Some),
+                PlacedToken::Applied { attempt, through } => {
+                    let authority = db.await_authority.placed().ok_or_else(invalid_token)?;
+                    if attempt.scope().writer_epoch() > authority.scope().writer_epoch() {
+                        return Err(receipt_replica_behind(db.name()));
+                    }
+                    db.await_installed(|prefix| prefix.replica >= through, cancellation).await?;
+                    Ok(None)
+                }
+            }
+        };
+        let deadline = if db.read_only() { timeout.min(Duration::from_millis(250)) } else { timeout };
+        tokio::time::timeout(deadline, work).await.map_err(|_| {
+            if db.read_only() { receipt_replica_behind(db.name()) } else { timeout_error() }
+        })?
+    }
+
     pub(crate) async fn query_context(&self, database: &str, basis: &QueryBasis, cancellation: &CancellationToken) -> Result<Arc<QueryContext>> {
         self.node.query_context_in_placement(database, basis, self.identity.as_ref(), self.placement.as_ref(), cancellation).await
     }
@@ -878,13 +969,39 @@ impl SessionService for NativeSessionService {
     }
     async fn await_basis(&self, basis: Option<TxBasis>, timeout: Duration, cancellation: &CancellationToken) -> Result<()> {
         if !self.node.catalog.is_placed() { return self.node.await_basis(basis, timeout, cancellation).await; }
-        self.node.ensure_open()?;
-        let Some(position) = basis.as_ref().and_then(|basis| basis.databases.get(&self.database)).and_then(|positions| positions.first()) else {
-            return Ok(());
-        };
+        let Some(basis) = basis else { return Ok(()); };
+        let db = self.database()?;
+        if !matches!(db.await_authority, AwaitAuthority::SourcePosition) { return Err(invalid_token()); }
+        let Some(position) = basis.databases.get(&self.database).and_then(|positions| positions.first()) else { return Ok(()); };
         self.node.ensure_indexing()?;
-        let database = self.database()?;
-        tokio::time::timeout(timeout, database.replication.await_source(SourcePosition(position.0), cancellation)).await.map_err(|_| timeout_error())??;
+        tokio::time::timeout(timeout, db.replication.await_source(SourcePosition(position.0), cancellation)).await.map_err(|_| timeout_error())?
+    }
+    async fn await_client_token(&self, token: Option<&str>, timeout: Duration, cancellation: &CancellationToken) -> Result<Option<String>> {
+        let Some(token) = token else { return Ok(None); };
+        if !is_placed_token(token) {
+            self.await_basis(Some(decode_tx_basis(token)?), timeout, cancellation).await?;
+            return Ok(None);
+        }
+        let db = self.database()?;
+        let authority = db.await_authority.placed().ok_or_else(invalid_token)?;
+        let token = PlacedToken::open(token, authority, self.identity.user())?;
+        Ok(self.confirm_placed_token(&db, token, timeout, cancellation).await?.map(|(_, applied)| applied))
+    }
+    async fn check_submission_basis(&self, database: &str, token: Option<&str>, cancellation: &CancellationToken) -> Result<()> {
+        if !self.node.catalog.is_placed() { return Ok(()); }
+        let Some(token) = token else { return Ok(()); };
+        let db = self.node.attached_database(database, self.placement.as_ref())?;
+        if matches!(db.await_authority, AwaitAuthority::SourcePosition) { return Ok(()); }
+        let authority = db.await_authority.placed().ok_or_else(invalid_token)?;
+        let token = PlacedToken::open(token, authority, self.identity.user())?;
+        if let PlacedToken::Pending { attempt, submitted_at } = token
+            && attempt.scope() == authority.scope()
+            && self.node.now().0 < submitted_at.0.saturating_add(rtdb_tx::RECEIPT_WINDOW_MICROS)
+        {
+            // A later submission in this intake can only resolve after earlier attempts in the same epoch.
+            return Ok(());
+        }
+        self.confirm_placed_token(&db, token, Duration::from_secs(60), cancellation).await?;
         Ok(())
     }
     async fn submit(&self, database: &str, operations: Vec<TxOp>, options: SubmitOptions, cancellation: &CancellationToken) -> Result<SubmittedTx> {
@@ -893,7 +1010,17 @@ impl SessionService for NativeSessionService {
     async fn submit_replay(&self, database: &str, operations: Vec<TxOp>, options: SubmitOptions, permit: crate::ReplaySubmissionPermit, cancellation: &CancellationToken) -> Result<SubmittedTx> {
         self.node.submit(database, operations, options, Some(permit), self.identity.as_ref(), self.placement.as_ref(), cancellation).await
     }
-    async fn await_transaction(&self, database: &str, tx_id: TxId, cancellation: &CancellationToken) -> Result<TransactionResult> { self.node.await_transaction_in_placement(database, tx_id, self.identity.as_ref(), self.placement.as_ref(), cancellation).await }
+    async fn await_transaction(&self, database: &str, tx_id: TxId, cancellation: &CancellationToken) -> Result<TransactionResult> { self.node.await_transaction_result(database, tx_id, None, self.identity.as_ref(), self.placement.as_ref(), cancellation).await }
+    async fn await_submission(&self, database: &str, submitted: &SubmittedTx, cancellation: &CancellationToken) -> Result<(TransactionResult, Option<String>)> {
+        let Some(receipt) = &submitted.placed_receipt else {
+            return Ok((self.await_transaction(database, submitted.tx_id, cancellation).await?, None));
+        };
+        let db = self.node.attached_database(database, self.placement.as_ref())?;
+        let authority = db.await_authority.placed().ok_or_else(invalid_token)?;
+        let token = PlacedToken::open(receipt, authority, self.identity.user())?;
+        self.confirm_placed_token(&db, token, Duration::from_secs(60), cancellation).await?
+            .map(|(result, applied)| (result, Some(applied))).ok_or_else(invalid_token)
+    }
 }
 
 /// A retry of a committed transaction under the same identity and body is answered with the original's outcome.
@@ -947,5 +1074,11 @@ fn closed() -> Anomaly { Anomaly::new(AnomalyCategory::Interrupted, "xtdb/node-c
 fn cancelled() -> Anomaly { Anomaly::new(AnomalyCategory::Interrupted, "xtdb/operation-cancelled", "Operation was cancelled") }
 fn hosted_source_unavailable() -> Anomaly {
     Anomaly::new(AnomalyCategory::Unavailable, "rtdb.node/hosted-source-unavailable", "The host cannot confirm this database's durable history")
+}
+fn bad_attempt_outcome() -> Anomaly {
+    Anomaly::fault("rtdb.node/attempt-outcome", "Installed attempt outcome does not match the durable transaction")
+}
+fn receipt_replica_behind(database: &str) -> Anomaly {
+    Anomaly::new(AnomalyCategory::Unavailable, REPLICA_BEHIND, format!("This replica of {database} could not confirm the await token"))
 }
 fn timeout_error() -> Anomaly { Anomaly::new(AnomalyCategory::Unavailable, "xtdb/await-tx-timeout", "Timed out awaiting indexed progress") }

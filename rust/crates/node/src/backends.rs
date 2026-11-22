@@ -103,7 +103,7 @@ impl crate::LogFactory for KafkaFactory {
         }
         let epoch = rtdb_types::StorageEpoch(configuration.epoch);
         Ok(crate::OpenedLogs { source: source.log, replica: replica.log, source_epoch: epoch, replica_epoch: epoch,
-            replica_read_index: None, placed_attempt_scope: None, drivers })
+            replica_read_index: None, await_authority: crate::AwaitAuthority::SourcePosition, drivers })
     }
 }
 

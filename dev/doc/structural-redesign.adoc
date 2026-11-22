@@ -49,6 +49,8 @@ Independent exports own fresh keys.
 |Volatile intake positions and durable transaction identity
 |An intake receipt names an epoch-qualified attempt.
 A checkpointed replica outcome binds the attempt to an applied causal basis.
+Placed clients redeem opaque receipts scoped to the authenticated principal and deployment history.
+Closing an epoch establishes negative outcomes only after the successor installs the recovered prefix.
 |Public reuse of volatile source offsets.
 
 |Directory leases, idle cost and fresh reads
@@ -134,6 +136,8 @@ link:../../verification/redesign/authority-boundaries.md[Authority boundaries] s
 The placed serving model checks receipt and freshness transitions on an abstract committed replica prefix.
 Placed resolution stages a history-, epoch- and principal-scoped outcome witness in the transaction's replica frame.
 The checkpoint carries that witness into recovery.
+The SQL connection issues a provisional receipt for asynchronous submission and exchanges it for a causal token after verifying the installed outcome.
+Synchronous commits issue the causal token alongside the verified outcome.
 Native logkeepers persist the active ensemble after recovery and supply an on-demand read index from its durable quorum.
 An implicit read on a linearizable subscriber waits for the read-index bound to be applied before it captures its time basis.
 The gateway retries a subscriber refusal on the holder when the command is still unanswered and the backend reports an idle transaction state.

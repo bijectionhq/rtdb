@@ -47,7 +47,7 @@ impl SessionService for Service {
         let mut state = self.state.lock();
         state.observations.push("submit");
         state.submissions.push((database.into(), operations, options));
-        Ok(SubmittedTx { tx_id: TxId(state.submissions.len() as i64) })
+        Ok(SubmittedTx { tx_id: TxId(state.submissions.len() as i64), placed_receipt: None })
     }
     async fn await_transaction(&self, _: &str, tx_id: TxId, _: &CancellationToken) -> Result<TransactionResult> {
         let mut state = self.state.lock(); state.observations.push("apply");

@@ -39,13 +39,14 @@ impl Service {
                     let mut results = Vec::new();
                     if let Some(last) = native.state().last_submitted() {
                         let error_bound = match last { LastSubmittedTx::Executed(tx) => tx.error().map(crate::error::allocation_bound).transpose()?.unwrap_or(0), _ => 0 };
-                        let bound = wire::add(error_bound, wire::add(8192, wire::mul(native.state().effective_await_token().map_or(0, str::len), 16)?)?)?;
+                        let await_token = native.state().last_submitted_await_token();
+                        let bound = wire::add(error_bound, wire::add(8192, wire::mul(await_token.map_or(0, str::len), 16)?)?)?;
                         let _scratch = self.memory().reserve(bound).map_err(status)?;
                         let (tx_id, time, committed, error) = match last {
                             LastSubmittedTx::Submitted(tx) => (tx.tx_id.0, None, None, None),
                             LastSubmittedTx::Executed(tx) => (tx.tx_key().tx_id.0, Some(ticket::timestamp(tx.tx_key().system_time)?), Some(tx.committed()), tx.error().map(crate::error::anomaly_json).transpose()?),
                         };
-                        let value = serde_json::json!({ "txId": tx_id, "systemTime": time, "committed": committed, "error": error, "awaitToken": native.state().effective_await_token() });
+                        let value = serde_json::json!({ "txId": tx_id, "systemTime": time, "committed": committed, "error": error, "awaitToken": await_token });
                         let bytes = serde_json::to_vec(&value).map_err(arrow)?;
                         let charge = self.memory().reserve(bytes.capacity()).map_err(status)?;
                         results.push(Ok(ActionResult { body: wire::retain(bytes, charge) }));

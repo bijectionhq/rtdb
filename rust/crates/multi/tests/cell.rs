@@ -948,6 +948,98 @@ async fn a_draining_node_keeps_a_recently_used_deployment_until_a_target_is_avai
 
 
 
+async fn submitted_attempt(client: &tokio_postgres::Client) -> (i64, String) {
+    client.simple_query("SHOW LATEST_SUBMITTED_TX").await.unwrap().into_iter().find_map(|message| {
+        let tokio_postgres::SimpleQueryMessage::Row(row) = message else { return None; };
+        assert_eq!(row.get("committed"), None);
+        Some((row.get("tx_id").unwrap().parse().unwrap(), row.get("await_token").unwrap().to_owned()))
+    }).unwrap()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_reused_intake_position_cannot_redeem_the_sealed_writers_receipt() {
+    use rtdb_format::basis::encode_tx_basis;
+    use rtdb_types::{TxBasis, TxId};
+
+    struct AnotherPrincipal;
+    #[async_trait::async_trait]
+    impl rtdb_node::SessionIdentity for AnotherPrincipal {
+        fn user(&self) -> Option<&str> { Some("another-user") }
+        async fn revalidate(&self, _: rtdb_types::Timestamp) -> Result<()> { Ok(()) }
+        fn authorize_database(&self, _: &str, _: rtdb_node::DatabaseAccess) -> Result<()> { Ok(()) }
+    }
+
+    let mut cell = Cell::start_durable(2).await;
+    let shop = admin::create_deployment(cell.directory.as_ref(), "shop", "acme", 3).await.unwrap();
+    let via_gateway = cell.connect("shop").await;
+    via_gateway.simple_query("INSERT INTO orders (_id, total) VALUES (1, 10)").await.unwrap();
+    let holder = cell.holder("shop").await.unwrap();
+    let writer = connect(&cell.node(holder).pgwire_address.to_string(), "shop").await;
+    writer.simple_query("BEGIN READ WRITE; UPDATE orders SET total = 20 WHERE _id = 1").await.unwrap();
+
+    let old = cell.directory.deployment(&shop.id).await.unwrap().unwrap();
+    let config = rtdb_logkeeper::StreamConfig {
+        servers: cell.logkeepers.iter().filter(|keeper| old.ensemble.contains(&keeper.lease.id())).map(|keeper| keeper.address.to_string()).collect(),
+        stream: old.stream("replica"), write_quorum: 2, maximum_message_bytes: 4 << 20,
+    };
+    rtdb_logkeeper::seal(&config, old.epoch + 1).await.unwrap();
+    writer.simple_query("COMMIT ASYNC").await.unwrap();
+    let (lost_id, lost) = submitted_attempt(&writer).await;
+
+    drop((writer, via_gateway));
+    cell.nodes[holder].take().unwrap().kill().await.unwrap();
+    let successor = connect_eventually(&cell, "shop").await;
+    let new = cell.directory.deployment(&shop.id).await.unwrap().unwrap();
+    assert!(new.epoch > old.epoch);
+    successor.simple_query("BEGIN READ WRITE; UPDATE orders SET total = 30 WHERE _id = 1; COMMIT ASYNC").await.unwrap();
+    let (new_id, pending) = submitted_attempt(&successor).await;
+    assert_eq!(lost_id, new_id);
+    assert_ne!(lost, pending);
+    assert_eq!(values(&successor, "SELECT total FROM orders").await, ["30"]);
+    let applied = values(&successor, "SHOW AWAIT_TOKEN").await.pop().unwrap();
+    assert_ne!(applied, pending);
+    assert_eq!(submitted_attempt(&successor).await, (new_id, pending));
+
+    let reader = cell.connect("shop").await;
+    reader.simple_query(&format!("SET AWAIT_TOKEN TO '{lost}'")).await.unwrap();
+    let error = reader.simple_query("SELECT total FROM orders").await
+        .expect_err("The sealed writer's receipt cannot return the successor's row");
+    assert!(error.as_db_error().unwrap().message().contains("closed writer epoch has no outcome"));
+    let numeric = encode_tx_basis(&TxBasis { databases: BTreeMap::from([("shop".into(), vec![TxId(new_id)])]) });
+    reader.simple_query(&format!("SET AWAIT_TOKEN TO '{numeric}'")).await.unwrap();
+    let error = reader.simple_query("SELECT total FROM orders").await.unwrap_err();
+    assert!(error.as_db_error().unwrap().message().contains("Await token does not belong"));
+    reader.simple_query(&format!("SET AWAIT_TOKEN TO '{applied}'")).await.unwrap();
+    assert_eq!(values(&reader, "SELECT total FROM orders").await, ["30"]);
+
+    let holder = cell.holder("shop").await.unwrap();
+    let mut another = cell.node(holder).server.node().session("shop", Arc::new(AnotherPrincipal)).unwrap();
+    another.state_mut().set_await_token(Some(applied.clone())).unwrap();
+    assert_eq!(another.state_mut().read_basis().await.unwrap_err().code, "rtdb/invalid-await-token");
+
+    let mut forged = applied.clone().into_bytes();
+    let index = forged.len() / 2;
+    forged[index] = if forged[index] == b'A' { b'B' } else { b'A' };
+    let forged = String::from_utf8(forged).unwrap();
+    reader.simple_query(&format!("BEGIN READ ONLY WITH (AWAIT_TOKEN = '{forged}')")).await.unwrap();
+    let error = reader.simple_query("SELECT total FROM orders").await.unwrap_err();
+    assert!(error.as_db_error().unwrap().message().contains("Await token is invalid"));
+    reader.simple_query("ROLLBACK").await.unwrap();
+
+    drop((reader, successor, another));
+    cell.stop().await;
+
+    let other_installation = Cell::start_durable(1).await;
+    let other_shop = admin::create_deployment(other_installation.directory.as_ref(), "shop", "acme", 3).await.unwrap();
+    assert_ne!(other_shop.id, shop.id);
+    let fresh = other_installation.connect("shop").await;
+    fresh.simple_query(&format!("SET AWAIT_TOKEN TO '{applied}'")).await.unwrap();
+    let error = fresh.simple_query("SELECT 1").await.unwrap_err();
+    assert!(error.as_db_error().unwrap().message().contains("Await token is invalid"));
+    drop(fresh);
+    other_installation.stop().await;
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn placed_attempt_outcomes_keep_their_exact_identity_through_a_checkpoint() {
     use rtdb_format::envelope::{ReplicaBody, ReplicaEnvelope};
@@ -957,7 +1049,9 @@ async fn placed_attempt_outcomes_keep_their_exact_identity_through_a_checkpoint(
     let cell = Cell::start_durable(2).await;
     let deployment = admin::create_deployment(cell.directory.as_ref(), "shop", "acme", 3).await.unwrap();
     let writer = cell.connect("shop").await;
-    writer.simple_query("INSERT INTO orders (_id, total) VALUES (1, 10)").await.unwrap();
+    writer.simple_query("BEGIN READ WRITE; INSERT INTO orders (_id, total) VALUES (1, 10); COMMIT ASYNC").await.unwrap();
+    let (_, provisional) = submitted_attempt(&writer).await;
+    assert_eq!(values(&writer, "SELECT total FROM orders").await, ["10"]);
     assert!(writer.simple_query("ASSERT FALSE").await.is_err());
 
     let record = cell.directory.deployment(&deployment.id).await.unwrap().unwrap();
@@ -1006,6 +1100,9 @@ async fn placed_attempt_outcomes_keep_their_exact_identity_through_a_checkpoint(
     let successor = cell.directory.deployment(&deployment.id).await.unwrap().unwrap();
     assert!(successor.epoch > record.epoch);
     assert!(successor.checkpoint.is_some());
+    reopened.simple_query(&format!("SET AWAIT_TOKEN TO '{provisional}'")).await.unwrap();
+    assert_eq!(values(&reopened, "SELECT total FROM orders").await, ["10"]);
+    assert_ne!(values(&reopened, "SHOW AWAIT_TOKEN").await, [provisional]);
     assert_eq!(values(&reopened, receipt_query).await, expected);
     drop(reopened);
     cell.stop().await;
