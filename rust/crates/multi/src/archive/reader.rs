@@ -42,7 +42,7 @@ use crate::{
 };
 
 mod owned_inventory;
-pub(crate) use owned_inventory::{StageOwnedRelations, inspect_staged_owned_relations};
+pub(crate) use owned_inventory::{StageOwnedRelations, inspect_staged_owned_relations, stream_staged_owned_event_files};
 
 pub struct StagedReaderSettings {
     pub destination: Uuid,

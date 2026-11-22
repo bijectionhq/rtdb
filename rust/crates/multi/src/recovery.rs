@@ -75,6 +75,11 @@ enum Action {
         stage_operation: Uuid,
         staged_manifest_sha256: String,
     },
+    OpenCheckpointStageOwnedEventFiles {
+        destination: Uuid,
+        stage_operation: Uuid,
+        staged_manifest_sha256: String,
+    },
     InspectCheckpointStageOwnedRelations {
         destination: Uuid,
         stage_operation: Uuid,
@@ -492,7 +497,7 @@ impl RecoveryService {
                     inventory,
                 })
             },
-            Action::OpenCheckpointStage { .. } => Ok(Reply::Refused),
+            Action::OpenCheckpointStage { .. } | Action::OpenCheckpointStageOwnedEventFiles { .. } => Ok(Reply::Refused),
         }
     }
 
@@ -521,13 +526,14 @@ impl RecoveryService {
         stop: CancellationToken,
     ) -> Result<()> {
         let authorized = self.authorize(directory.as_ref(), &request).await?;
-        let Action::OpenCheckpointStage {
-            destination,
-            stage_operation,
-            staged_manifest_sha256,
-        } = request.action
-        else {
-            unreachable!("only stage-reader requests are routed here")
+        let (destination, stage_operation, staged_manifest_sha256, owned_event_files) = match request.action {
+            Action::OpenCheckpointStage { destination, stage_operation, staged_manifest_sha256 } => {
+                (destination, stage_operation, staged_manifest_sha256, false)
+            }
+            Action::OpenCheckpointStageOwnedEventFiles { destination, stage_operation, staged_manifest_sha256 } => {
+                (destination, stage_operation, staged_manifest_sha256, true)
+            }
+            _ => unreachable!("only stage-reader requests are routed here"),
         };
         if authorized.is_none_or(|source| source.checkpoint_stage.is_some())
             || destination.is_nil()
@@ -545,15 +551,19 @@ impl RecoveryService {
             manifest_sha256: staged_manifest_sha256,
             source: Some((request.authority, request.capture, self.org.clone())),
         };
-        let mut reader = std::pin::pin!(archive::tunnel_staged_checkpoint(
-            directory,
-            &self.storage,
-            self.keys.as_ref(),
-            selector,
-            self.hosted_task.clone(),
-            stop.clone(),
-            socket,
-        ));
+        let mut reader = std::pin::pin!(async {
+            if owned_event_files {
+                archive::stream_staged_owned_event_files(
+                    directory, &self.storage, self.keys.as_ref(), selector,
+                    self.hosted_task.clone(), stop.clone(), socket,
+                ).await
+            } else {
+                archive::tunnel_staged_checkpoint(
+                    directory, &self.storage, self.keys.as_ref(), selector,
+                    self.hosted_task.clone(), stop.clone(), socket,
+                ).await
+            }
+        });
         tokio::select! {
             result = &mut reader => result,
             _ = tokio::time::sleep(Duration::from_secs(29 * 60)) => {
@@ -626,7 +636,7 @@ pub async fn serve(
                     .await;
                     return;
                 };
-                if matches!(request.action, Action::OpenCheckpointStage { .. }) {
+                if matches!(request.action, Action::OpenCheckpointStage { .. } | Action::OpenCheckpointStageOwnedEventFiles { .. }) {
                     let _ = service.open_stage(directory, request, socket, stop).await;
                     return;
                 }

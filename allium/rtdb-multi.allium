@@ -2667,6 +2667,21 @@ rule InspectHeldCheckpointOwnedRelations {
         DrainReadersBeforeReleasingStageStorage(target)
 }
 
+rule StreamHeldCheckpointOwnedEventFiles {
+    when: AuthenticatedHeldStageOwnedEventsRequested(source, capture, target, operation, inventory_digest)
+
+    requires: ExactHeldStage(target, operation, inventory_digest)
+              and OriginalStageCapture(target, source, capture)
+              and CompleteReplayInventory(target)
+
+    ensures:
+        AcquireHeldStageStorageRegion(target)
+        VerifyAndReadFrozenInventory(target, inventory_digest)
+        StreamCurrentOwnedTrieEventFilesAtOriginalTransaction(target)
+        ConfirmStageHeldBeforeCompletingStream(target)
+        DrainReadersBeforeReleasingStageStorage(target)
+}
+
 rule RetireCheckpointArchives {
     when: RecoveryRetirementAuthorized(record)
 
