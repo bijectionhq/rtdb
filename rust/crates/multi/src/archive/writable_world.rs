@@ -221,12 +221,14 @@ pub(crate) async fn fork_checkpoint_world_selected(
         && fork.root.as_ref().is_some_and(|root| root.publication.is_some())
         && matches!(fork.requested, rtdb_node::WorldClockRequest::Retained);
     let renewal = fork.cut.is_renewal();
+    let proposal_hold = renewal && matches!(fork.requested, rtdb_node::WorldClockRequest::Proposal);
+    let source_mode = if proposal_hold { WorldClockMode::Proposal } else { WorldClockMode::Retained };
     let (capture, suffix) = if renewal {
         let predecessor = fork.previous.ok_or_else(OwnedWorld::unavailable)?;
         let source_world = fork.sibling.unwrap_or(fork.world);
         let retained = source.checkpoint_worlds.get(&Uuid::from_bytes(predecessor.0))
             .filter(|retained| retained.world.as_bytes() == &source_world.0
-                && retained.owner == owner && retained.mode == WorldClockMode::Retained
+                && retained.owner == owner && retained.mode == source_mode
                 && retained.until > now() && fork.cut.matches_basis(retained.basis))
             .ok_or_else(OwnedWorld::unavailable)?;
         if !capture.is_nil() || suffix.is_some() {
@@ -367,7 +369,7 @@ pub(crate) async fn fork_checkpoint_world_selected(
             let expected_source = fork.sibling.map_or(id, |world| Uuid::from_bytes(world.0));
             if previous.world != expected_source || previous.owner != retained.owner
                 || (!authored_advance && !renewal && previous.until != retained.until)
-                || previous.mode != WorldClockMode::Retained || retained.mode != WorldClockMode::Retained
+                || previous.mode != source_mode || retained.mode != source_mode || (proposal_hold && retained.until < previous.until)
                 || if renewal {
                     previous.basis != retained.basis || previous.capture != retained.capture
                         || previous.suffix != retained.suffix || previous.manifest_sha256 != retained.manifest_sha256

@@ -1738,13 +1738,15 @@ impl Service {
         let ([mode], rest) = rest.split_first_chunk::<1>().ok_or_else(|| invalid("World fork has no clock mode"))?;
         let select_publication = matches!(*mode, 4 | 5) && publish_root;
         let proposed_publication = *mode == 5 && publish_root;
+        let proposal_hold = *mode == 8 && publish_root;
         let sibling = *mode == 7 && publish_root;
-        let renewal = matches!(*mode, 6 | 7) && publish_root;
+        let renewal = matches!(*mode, 6 | 7 | 8) && publish_root;
         if renewal && (*previous_handle == [0; 16] || *capture != [0; 16] || *suffix != [0; 16]) {
             return Err(invalid("An authored renewal requires its original retained handle and derives its archive"));
         }
         let (requested, rest) = match *mode {
             0 => (rtdb_node::WorldClockRequest::Retained, rest),
+            8 if proposal_hold => (rtdb_node::WorldClockRequest::Proposal, rest),
             6 | 7 if renewal => (rtdb_node::WorldClockRequest::Retained, rest),
             4 if select_publication => (rtdb_node::WorldClockRequest::Retained, rest),
             5 if proposed_publication => (rtdb_node::WorldClockRequest::Proposal, rest),
@@ -1778,12 +1780,13 @@ impl Service {
             None
         } else {
             if (requested_until == Timestamp::MIN) == authored_replacement
-                || !matches!(requested, rtdb_node::WorldClockRequest::Retained) || ((world == pin) != sibling) {
+                || (!proposal_hold && !matches!(requested, rtdb_node::WorldClockRequest::Retained)) || ((world == pin) != sibling) {
                 return Err(invalid("A retained advance preserves the original world lifetime and mode"));
             }
             let previous = self.owned_world_read(call, &Bytes::copy_from_slice(previous_handle))?;
             previous.snapshot.check().map_err(status)?;
-            if ((previous.world.as_bytes() == world) == sibling) || previous.snapshot.clock_mode().is_writable()
+            if ((previous.world.as_bytes() == world) == sibling) || (if proposal_hold { previous.snapshot.clock_mode() != rtdb_types::WorldClockMode::Proposal }
+                    else { previous.snapshot.clock_mode().is_writable() })
                 || (!renewal && previous.snapshot.parent_basis().system_time >= cut.basis())
                 || previous.snapshot.parent_pin().0 == *pin
             {
@@ -1806,7 +1809,7 @@ impl Service {
         let mut root_framing = None;
         let mut root_groups = 0;
         let groups = if publish_root {
-            if (previous.is_some() && !authored_replacement) || !(matches!(requested, rtdb_node::WorldClockRequest::Retained) || proposed_publication)
+            if (previous.is_some() && !authored_replacement) || !(matches!(requested, rtdb_node::WorldClockRequest::Retained) || proposed_publication || proposal_hold)
                 || (cut.live().is_none() && !cut.is_publication())
             {
                 return Err(invalid("A Root publication requires an initial retained fork at its original live hold"));
@@ -1842,10 +1845,10 @@ impl Service {
                     _ => return Err(invalid("Operation is outside the held Root section")),
                 }
             }
-            if (authored_replacement && !sibling && !matches!(writes.as_slice(), [
+            if (authored_replacement && !sibling && !proposal_hold && !matches!(writes.as_slice(), [
                 TxOp::OwnedReplaceDocs { documents, valid_from: None, valid_to: None, .. }
             ] if documents.rows().len() == 1))
-                || (sibling && !matches!(writes.as_slice(), [
+                || ((sibling || proposal_hold) && !matches!(writes.as_slice(), [
                     TxOp::OwnedInsertDocs { documents, valid_from: None, valid_to: None, .. }
                 ] if documents.rows().len() == 1))
             {
