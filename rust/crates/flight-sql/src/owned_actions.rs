@@ -1674,6 +1674,9 @@ impl Service {
         let (previous_handle, rest) = rest.split_first_chunk::<16>().ok_or_else(|| invalid("World cut has no predecessor handle"))?;
         let (capture, rest) = rest.split_first_chunk::<16>().ok_or_else(|| invalid("World fork has no capture"))?;
         let (suffix, rest) = rest.split_first_chunk::<16>().ok_or_else(|| invalid("World fork has no suffix selector"))?;
+        if *capture == [0; 16] && (!publish_root || *suffix != [0; 16]) {
+            return Err(invalid("Only a Root publication may discover its exact held archive"));
+        }
         let (until, rest) = rest.split_first_chunk::<8>().ok_or_else(|| invalid("World fork has no expiry"))?;
         let (deadline, rest) = rest.split_first_chunk::<8>().ok_or_else(|| invalid("World fork has no deadline"))?;
         let ([mode], rest) = rest.split_first_chunk::<1>().ok_or_else(|| invalid("World fork has no clock mode"))?;

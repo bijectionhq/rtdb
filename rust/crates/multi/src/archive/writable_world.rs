@@ -11,7 +11,7 @@ use uuid::Uuid;
 
 use super::{
     CellStorage, CheckpointReadResources, CheckpointReadWorld, KeyService,
-    capture_receipt, read_world::{CaptureSelection, with_registered_capture_context},
+    archive_binding, capture_receipt, read_world::{CaptureSelection, with_registered_capture_context},
     replica_suffix, require_capture_open, same_lifetime,
 };
 use crate::admin::update_installation;
@@ -61,6 +61,42 @@ fn admit_capture(
     }
 }
 
+/// Select only an already published independent archive of the exact held
+/// key. The fork still reopens and verifies the selected archive before it
+/// writes the Directory pin or submits the ordered registration.
+fn select_live_archive(
+    source: &DeploymentRecord, archive: &CellStorage, deployment: Uuid, basis: TransactionKey,
+) -> Result<(Uuid, Option<Uuid>)> {
+    let binding = archive_binding(archive)?;
+    let available = |capture: &Uuid, registered: &rtdb_directory::CheckpointCapture| {
+        registered.archive == binding && registered.media_bound
+            && registered.incarnation == source.incarnation && registered.log_epoch == source.log_epoch
+            && registered.checkpoint.root_sha256.is_some()
+            && registered.manifest_sha256.is_some()
+            && require_capture_open(source, *capture).is_ok()
+    };
+    if let Some((&capture, _)) = source.checkpoint_captures.iter().find(|(capture, registered)|
+        available(capture, registered) && registered.checkpoint.system_time == basis.system_time.0
+    ) {
+        return Ok((capture, None));
+    }
+    for (&suffix, pin) in &source.checkpoint_suffix_pins {
+        if pin.basis != basis || pin.archive_sha256.is_none() || suffix.is_nil() {
+            continue;
+        }
+        let capture = pin.capture;
+        if !source.checkpoint_captures.get(&capture).is_some_and(|registered| available(&capture, registered)) {
+            continue;
+        }
+        let (point, manifest) = capture_receipt(source, archive, deployment, capture)?
+            .ok_or_else(OwnedWorld::unavailable)?;
+        if replica_suffix::accepted(source, &point, &manifest, suffix).is_ok() {
+            return Ok((capture, Some(suffix)));
+        }
+    }
+    Err(OwnedWorld::unavailable())
+}
+
 fn world_record(
     pin: Uuid,
     retained: &CheckpointWorldRetention,
@@ -100,6 +136,17 @@ pub(crate) async fn fork_checkpoint_world_selected(
         .await?
         .ok_or_else(OwnedWorld::unavailable)?;
     admit_session(session, &source, &owner)?;
+    let (capture, suffix) = if capture.is_nil() {
+        if suffix.is_some() || fork.root.publication.is_none() || fork.previous.is_some()
+            || !matches!(fork.requested, rtdb_node::WorldClockRequest::Retained)
+        {
+            return Err(OwnedWorld::unavailable());
+        }
+        let basis = fork.cut.live().ok_or_else(OwnedWorld::unavailable)?;
+        select_live_archive(&source, archive, deployment_id, basis)?
+    } else {
+        (capture, suffix)
+    };
     require_capture_open(&source, capture)?;
     let (point, manifest) = capture_receipt(&source, archive, deployment_id, capture)?
         .ok_or_else(OwnedWorld::unavailable)?;
@@ -109,9 +156,12 @@ pub(crate) async fn fork_checkpoint_world_selected(
     let expected_basis = suffix.map(|suffix|
         replica_suffix::accepted(&source, &point, &manifest, suffix).map(|pin| pin.basis)
     ).transpose()?;
-    if expected_basis.is_some_and(|basis| until <= basis.system_time) {
+    if expected_basis.is_some_and(|basis|
+        until <= basis.system_time || fork.cut.live().is_some_and(|original| original != basis)
+    ) {
         return Err(OwnedWorld::unavailable());
     }
+    let expected_basis = expected_basis.or(fork.cut.live());
     let live = session.open_owned_read().await?;
     let ((schemas, _schema_charge), parent_publication, basis) = with_registered_capture_context(
         directory, archive, keys, hosted_task,
