@@ -28,6 +28,9 @@ entity Checkpoint {
 -- The read opens a root at its system-time point and applies captured uncovered events, including erasures.
 -- A read or maintenance cycle owns index page buffers for its own lifetime.
 -- A point read merges bucket prefixes in key order.
+-- Every immutable page reference binds its exact subtree entry count and full fences.
+-- A covered held count subtracts the full-key boundary ranks in each bucket containing the requested valid instant.
+-- The bucket cover makes the counts disjoint across the visible postings for that instant.
 -- Unsigned Arrow cells compare at their signed execution widths for bounds, seeks, and page order.
 -- Zoned microsecond timestamp keys compare by their instant for bounds, seeks, and page order.
 -- Floating-point ordering distinguishes signed zeros and ties every NaN last. Zero and NaN bounds are left to the row predicate, and NaNs match no indexed comparison.

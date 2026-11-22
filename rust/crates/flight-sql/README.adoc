@@ -293,6 +293,13 @@ The exclusive `after` endpoint advances in the requested direction.
 For the next page, use the last returned row as `after` with the same held handle, path, bounds, and direction.
 The response uses the same covering schema and held time metadata as v1, with no record batch when the page is empty.
 
+`rtdb.owned.CountHeldRange.v1` uses the same handle and relation framing with one terminated Arrow IPC batch containing one row.
+Its fields are `path: Utf8`, `lower: Struct?`, `upper: Struct?`, and `valid_micros: Int64`.
+Bounds are complete path keys with an inclusive lower endpoint, an exclusive upper endpoint and null for an open side.
+The result contains one non-null `count: UInt64` at the held system present and the requested signed microsecond business-valid instant.
+The result schema carries `rtdb.owned.present_micros` and `rtdb.owned.valid_micros`.
+The count requires the same complete generation as a covered range and uses subtree cardinalities without a scan fallback.
+
 `rtdb.owned.DeclareSearchPath.v1` uses the relation prefix and a terminated Arrow IPC stream with one batch and one row.
 Its fields are `_id: Utf8` for the path name and `column: Utf8` for the stored clear-text column.
 The relation must already exist in the authenticated owner's namespace, and the column must contain only text or null.

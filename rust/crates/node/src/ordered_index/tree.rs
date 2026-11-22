@@ -176,13 +176,14 @@ pub(super) struct Pointer {
     pub digest: String,
     generation: i64,
     size: usize,
+    entries: u64,
     first: Key,
     last: Key,
 }
 
 impl Pointer {
     pub(super) fn exists_by(&self, block: i64) -> bool {
-        (0..=block).contains(&self.generation)
+        self.entries > 0 && (0..=block).contains(&self.generation)
     }
 }
 
@@ -200,6 +201,13 @@ impl Link {
         }
     }
 
+    fn entries(&self) -> u64 {
+        match self {
+            Self::Stored(pointer) => pointer.entries,
+            Self::New(node) => node.entries,
+        }
+    }
+
     fn last(&self) -> &Key {
         match self {
             Self::Stored(pointer) => &pointer.last,
@@ -211,6 +219,7 @@ impl Link {
 #[derive(Debug)]
 pub(super) struct Node {
     page: Page,
+    entries: u64,
     _memory: Arc<MemoryReservation>,
 }
 
@@ -232,6 +241,16 @@ impl Page {
         match self {
             Self::Leaf(leaf) => &leaf.last,
             Self::Branch(children) => children[children.len() - 1].last(),
+        }
+    }
+
+    fn entry_count(&self) -> Result<u64> {
+        match self {
+            Self::Leaf(leaf) => Ok(leaf.len() as u64),
+            Self::Branch(children) => children.iter().try_fold(0u64, |sum, child| {
+                sum.checked_add(child.entries())
+                    .ok_or_else(cardinality_overflow)
+            }),
         }
     }
 
@@ -483,11 +502,13 @@ impl Tree {
     }
 
     fn link(&self, page: Page) -> Result<Link> {
+        let entries = page.entry_count()?;
         let memory = self
             .memory
             .reserve(page.bytes().saturating_mul(2).saturating_add(256))?;
         Ok(Link::New(Arc::new(Node {
             page,
+            entries,
             _memory: memory,
         })))
     }
@@ -500,9 +521,12 @@ impl Tree {
         let object = self.page_key(pointer.generation, &pointer.digest)?;
         let cached = self.decoded.lock().entries.get(&object).cloned();
         if let Some(node) = cached {
-            if node.page.first() != &pointer.first || node.page.last() != &pointer.last {
+            if node.entries != pointer.entries
+                || node.page.first() != &pointer.first
+                || node.page.last() != &pointer.last
+            {
                 return Err(format_error(
-                    "Ordered index page fences differ from its reference",
+                    "Ordered index page count or fences differ from its reference",
                 ));
             }
             return Ok(node);
@@ -523,9 +547,13 @@ impl Tree {
             return Err(format_error("Ordered index page checksum mismatch"));
         }
         let page = decode(bytes, pointer.generation, &memory)?;
-        if page.first() != &pointer.first || page.last() != &pointer.last {
+        let entries = page.entry_count()?;
+        if entries != pointer.entries
+            || page.first() != &pointer.first
+            || page.last() != &pointer.last
+        {
             return Err(format_error(
-                "Ordered index page fences differ from its reference",
+                "Ordered index page count or fences differ from its reference",
             ));
         }
         let retained = page.bytes().saturating_add(256);
@@ -540,6 +568,7 @@ impl Tree {
         let retained = memory.bytes();
         let node = Arc::new(Node {
             page,
+            entries,
             _memory: memory,
         });
         // The read or maintenance operation owns the decoded pages. An idle
@@ -552,6 +581,51 @@ impl Tree {
             decoded.bytes += retained;
         }
         Ok(node)
+    }
+
+    /// Counts the monotone prefix using the immutable cardinalities of
+    /// children entirely before the boundary.
+    pub async fn rank(
+        &self,
+        root: &Root,
+        before: impl for<'key> Fn(KeyRef<'key>) -> bool,
+        cancellation: &CancellationToken,
+    ) -> Result<u64> {
+        let Some(mut link) = root.clone() else {
+            return Ok(0);
+        };
+        let mut rank = 0u64;
+        loop {
+            if cancellation.is_cancelled() {
+                return Err(cancelled());
+            }
+            let node = self.open(&link).await?;
+            match &node.page {
+                Page::Leaf(leaf) => {
+                    let prefix = seek::partition(leaf.len(), |slot| before(leaf.key(slot)));
+                    return rank
+                        .checked_add(prefix as u64)
+                        .ok_or_else(cardinality_overflow);
+                }
+                Page::Branch(children) => {
+                    let prefix = seek::partition(children.len(), |slot| {
+                        before(children[slot].last().view())
+                    });
+                    for child in &children[..prefix] {
+                        rank = rank
+                            .checked_add(child.entries())
+                            .ok_or_else(cardinality_overflow)?;
+                    }
+                    let Some(child) = children.get(prefix) else {
+                        return Ok(rank);
+                    };
+                    if !before(child.first().view()) {
+                        return Ok(rank);
+                    }
+                    link = child.clone();
+                }
+            }
+        }
     }
 
     pub async fn spans(&self, root: &Root, iid: Iid) -> Result<Arc<[Span]>> {
@@ -823,6 +897,7 @@ impl Tree {
                 digest,
                 generation,
                 size,
+                entries: node.entries,
                 first: link.first().clone(),
                 last: link.last().clone(),
             });
@@ -928,6 +1003,10 @@ fn decode(bytes: Bytes, generation: i64, memory: &Arc<MemoryReservation>) -> Res
         ));
     }
     Ok(Page::Leaf(Leaf::new(postings, metadata)?))
+}
+
+pub(super) fn cardinality_overflow() -> rtdb_types::Anomaly {
+    format_error("Ordered index entry count overflow")
 }
 
 fn sparse(link: &Link) -> bool {
@@ -1116,5 +1195,39 @@ impl Cursor {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod count_tests {
+    use super::*;
+    use rtdb_storage::MemoryStore;
+
+    #[tokio::test]
+    async fn rank_reads_persisted_cardinalities_across_leaf_boundaries() -> Result<()> {
+        let storage = Arc::new(BufferPool::new(Arc::new(MemoryStore::default()), 1 << 20));
+        let directory = ObjectKey::new("count-test")?;
+        let memory = MemoryBudget::new(16 << 20);
+        let cancel = CancellationToken::new();
+        let tree = Tree::new(&storage, &directory, &memory, 0).await?;
+        let edits = (0..150)
+            .map(|n| (Key::Revision(Timestamp(n)), Some(Item::Revision(None))))
+            .collect();
+        let root = tree.edit(None, edits).await?.expect("must create a tree");
+        let pointer = tree
+            .persist(&root, 0, &mut BTreeMap::new(), &cancel)
+            .await?;
+        assert_eq!(pointer.entries, 150);
+        let reopened = Tree::new(&storage, &directory, &memory, 0).await?;
+        let root = Some(Link::Stored(pointer));
+        for n in [0, 1, 63, 64, 127, 128, 149, 150, 200] {
+            let before =
+                |key: KeyRef<'_>| matches!(key, KeyRef::Revision(time) if time < Timestamp(n));
+            assert_eq!(
+                reopened.rank(&root, before, &cancel).await?,
+                n.min(150) as u64
+            );
+        }
+        Ok(())
     }
 }
