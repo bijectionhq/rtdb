@@ -327,6 +327,8 @@ It also exercises the Azure adapter against a loopback provider and separately m
   The catalog reclamation area checks the latest-block rule and the last-held-sibling predicate.
   The tiered publication area checks that all four serving siblings for the same block exist before the catalog retires the parent.
   The checkpoint discovery area checks the production retry decision and its decreasing distance from the maximum index.
+  The local repair area checks same-journal anchor advancement, protection and synchronization before collection, all digest bytes, the retained boundary match, and the exact exclusive replay endpoint in the Rust decision functions.
+  The native case repairs from the reopened anchor and rejects a build that omits the persisted boundary check.
   The replay floor area checks the exact signed-offset rule for a required replica record below a provider's reported floor.
   The system time area checks the production assignment and admission decisions, including exhaustion and rejection of equal or earlier timestamps.
   The IID partition area checks the base-four digit computation shared by trie and compaction code.

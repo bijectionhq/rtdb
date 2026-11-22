@@ -44,18 +44,12 @@ async fn run() -> Result<()> {
         Command::RepairCheckpoint { request, memory_bytes } => {
             let memory = rtdb_columnar::MemoryBudget::new(memory_bytes);
             let cancellation = tokio_util::sync::CancellationToken::new();
-            let repair = request.rebuild(memory, &cancellation);
-            tokio::pin!(repair);
-            let store = tokio::select! {
-                result = &mut repair => result?,
-                _ = shutdown_signal() => { cancellation.cancel(); repair.await? }
-            };
-            write_report(std::io::stdout().lock(), |output| {
-                let digest: String = store.checkpoint.sha256.iter().map(|byte| format!("{byte:02x}")).collect();
-                writeln!(output, "Rebuilt checkpoint {}@{digest} through transaction {}", store.checkpoint.block.0, store.latest_transaction.tx_id.0)?;
-                writeln!(output, "Storage: {}", store.path.display())?;
-                writeln!(output, "Source replica epoch: {}", store.source_replica_epoch.0)
-            })
+            report_checkpoint_repair(request.rebuild(memory, &cancellation), &cancellation).await
+        },
+        Command::RepairRetainedCheckpoint { request, memory_bytes } => {
+            let memory = rtdb_columnar::MemoryBudget::new(memory_bytes);
+            let cancellation = tokio_util::sync::CancellationToken::new();
+            report_checkpoint_repair(request.rebuild(memory, &cancellation), &cancellation).await
         },
         Command::Start(options) => {
             let (config, memory, _configuration) = options.load_reserved()?.into_execution(options.allocation_limit_bytes)?;
@@ -67,6 +61,23 @@ async fn run() -> Result<()> {
             run_server(&handle, driver, shutdown_signal()).await
         }
     }
+}
+
+async fn report_checkpoint_repair(
+    repair: impl std::future::Future<Output = Result<rtdb_node::RepairedStore>>,
+    cancellation: &tokio_util::sync::CancellationToken,
+) -> Result<()> {
+    tokio::pin!(repair);
+    let store = tokio::select! {
+        result = &mut repair => result?,
+        _ = shutdown_signal() => { cancellation.cancel(); repair.await? }
+    };
+    write_report(std::io::stdout().lock(), |output| {
+        let digest: String = store.checkpoint.sha256.iter().map(|byte| format!("{byte:02x}")).collect();
+        writeln!(output, "Rebuilt checkpoint {}@{digest} through transaction {}", store.checkpoint.block.0, store.latest_transaction.tx_id.0)?;
+        writeln!(output, "Storage: {}", store.path.display())?;
+        writeln!(output, "Source replica epoch: {}", store.source_replica_epoch.0)
+    })
 }
 
 async fn export_snapshot(options: cli::StartOptions, database: String, dry_run: bool) -> Result<()> {

@@ -10,6 +10,7 @@ mod logs;
 mod progress;
 mod readback_identity;
 mod repair;
+mod repair_decision;
 mod retirement_receipt;
 mod state;
 
@@ -17,6 +18,6 @@ pub use admission::{Admission, TermFence, TermPosition, Verdict};
 pub use blocks::{BlockDiscovery, BlockStore, ProducedBlock, PublishedCheckpoint, RecoveredPartition};
 pub use driver::{ExternalReceipt, DatabaseEffects, DriverStatus, InstalledPrefix, ReplicationClock, ReplicationConfig, ReplicationDriver, ReplicationHandle, Role, TermHandle};
 pub use logs::{PartitionLogs, ReplicaMetadata, ReplicaReceipt, ReplicaRecord};
-pub use repair::{LocalRepair, RepairCheckpoint, RepairedStore, RetainRepairBase};
+pub use repair::{LocalRepair, RepairCheckpoint, RepairedStore, RetainRepairBase, RetainedLocalRepair};
 pub use progress::{AppliedProgress, AppliedTransaction, ProgressMonitor};
 pub use state::{BlockCycle, FlushTimer, PendingBlock};

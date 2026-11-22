@@ -2275,10 +2275,18 @@ async fn an_installed_repair_base_keeps_older_targets_and_offloaded_replay_throu
     stop(&node, driver).await;
     drop(node);
 
-    let repair = LocalRepair {
-        source_storage: source_storage.clone(), base_storage: Some(trusted_base),
-        replica_log, output_parent: directory.path().to_owned(), base: receipt(&base), through: receipt(&through),
+    let repair = RetainedLocalRepair {
+        source_storage: source_storage.clone(), base_storage: trusted_base,
+        replica_log, output_parent: directory.path().to_owned(), through: receipt(&through),
     };
+    let anchor_path = objects.join(".tmp/catalog-ledger/repair-anchor");
+    let anchor = std::fs::read(&anchor_path).unwrap();
+    let (block, boundary, digest): (i64, i64, [u8; 32]) = serde_json::from_slice(&anchor).unwrap();
+    std::fs::write(&anchor_path, serde_json::to_vec(&(block, boundary + 1, digest)).unwrap()).unwrap();
+    let refusal = repair.rebuild(memory.clone(), &cancellation).await
+        .expect_err("a retained base must bind the boundary of the detached export");
+    assert_eq!(refusal.message.as_deref(), Some("The retained repair boundary differs from its exported checkpoint"));
+    std::fs::write(&anchor_path, &anchor).unwrap();
     let rebuilt = repair.rebuild(memory.clone(), &cancellation).await.unwrap();
     assert_eq!(rebuilt.latest_transaction, through.latest_completed_tx().unwrap());
     let mut reopened = settings.clone();

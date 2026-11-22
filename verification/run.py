@@ -3572,6 +3572,30 @@ def verify_checkpoint_table_manifest_replay(args, source):
     print("rust-table-manifest: both replays passed and three manifest controls failed")
 
 
+def verify_retained_repair(args, source):
+    env = os.environ | {
+        "CARGO_TARGET_DIR": os.environ.get("CARGO_TARGET_DIR", str(ROOT / "target")),
+        "CARGO_PROFILE_TEST_DEBUG": "0",
+    }
+    test = "an_installed_repair_base_keeps_older_targets_and_offloaded_replay_through_collection"
+    command = ["cargo", "test", "--locked", "-p", "rtdb-node", "--test", "native", test, "--", "--exact"]
+    baseline = run_case(command, source / "rust", args.evidence, "rust-retained-repair-baseline", env)
+    if baseline.returncode or f"{test} ... ok" not in baseline.stdout or "1 passed; 0 failed" not in baseline.stdout:
+        raise ValueError("the retained repair replay did not pass")
+    guard = source / "rust/crates/replication/src/repair.rs"
+    original = guard.read_bytes()
+    try:
+        replace_once(guard, "if !repair_decision::matches_retained_boundary(retained_boundary, after.0) {",
+                     "if false && !repair_decision::matches_retained_boundary(retained_boundary, after.0) {")
+        weakened = run_case(command, source / "rust", args.evidence, "rust-retained-repair-ignore-boundary", env)
+    finally:
+        guard.write_bytes(original)
+    if (weakened.returncode != 101 or f"{test} ... FAILED" not in weakened.stdout
+        or "a retained base must bind the boundary of the detached export" not in weakened.stdout):
+        raise ValueError("the retained repair replay accepted the weakened boundary check")
+    print("rust-retained-repair: replay passed and bypassing the boundary check failed")
+
+
 def verify_checkpoint_replay_closure(args, source):
     env = os.environ | {
         "CARGO_TARGET_DIR": os.environ.get("CARGO_TARGET_DIR", str(ROOT / "target")),
@@ -5417,6 +5441,7 @@ def main():
             replay_rank_witness(args, directory)
             replay_rust_trace(args)
             verify_checkpoint_replay(args, source)
+            verify_retained_repair(args, source)
             verify_published_checkpoint_replay(args, source)
             verify_checkpoint_table_manifest_replay(args, source)
             verify_checkpoint_replay_closure(args, source)
