@@ -157,18 +157,7 @@ pub(crate) const OPEN_WORLD_READ_V4: &str = "rtdb.owned.OpenWorldRead.v4";
 pub(crate) const HELD_WORLD_POINT_V2: &str = "rtdb.owned.ReadHeldWorldPoint.v2";
 pub(crate) const CLOSE_WORLD_READ_V1: &str = "rtdb.owned.CloseWorldRead.v1";
 pub(crate) const FORK_HELD_WORLD_V2: &str = "rtdb.owned.ForkHeldWorld.v2";
-#[derive(Clone, Copy)]
-pub(crate) enum WorldCommitFormat {
-    Validation,
-    Publication,
-    Clock,
-    Drop,
-}
-
-pub(crate) const COMMIT_WORLD_DROP_V1: &str = "rtdb.owned.CommitWorldDrop.v1";
-pub(crate) const COMMIT_WORLD_CLOCK_V1: &str = "rtdb.owned.CommitWorldClock.v1";
-pub(crate) const COMMIT_HELD_WORLDS_V3: &str = "rtdb.owned.CommitHeldWorlds.v3";
-pub(crate) const COMMIT_WORLD_V4: &str = "rtdb.owned.CommitWorld.v4";
+pub(crate) const COMMIT_HELD_WORLDS_V4: &str = "rtdb.owned.CommitHeldWorlds.v4";
 pub(crate) const COMMIT_WORLD_V3: &str = "rtdb.owned.CommitWorld.v3";
 const MAX_WORLD_WITNESSES: usize = 128;
 const WORLD_POINT_WITNESS: &str = "rtdb.owned.world_point_witness";
@@ -1637,27 +1626,38 @@ impl Service {
             if !attempt.bytes().all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)) || !attempts.insert(attempt) {
                 return Err(invalid("Invalid or repeated world batch attempt identity"));
             }
-            let (clock, rest) = rest.split_first_chunk::<8>().ok_or_else(|| invalid("Missing expected world batch clock"))?;
-            let clock = Timestamp(i64::from_be_bytes(*clock));
-            let (length, rest) = rest.split_first_chunk::<4>().ok_or_else(|| invalid("Missing world batch overlay length"))?;
-            let (overlay, rest) = rest.split_at_checked(u32::from_be_bytes(*length) as usize)
-                .ok_or_else(|| invalid("Incomplete world batch overlay"))?;
-            body = rest;
+            let ([kind], rest) = rest.split_first_chunk::<1>().ok_or_else(|| invalid("Missing world publication effect"))?;
             rows_left = rows_left.checked_sub(count * 2 + 2).ok_or_else(|| invalid("World batch exceeds its effect limit"))?;
             let resource = self.owned_world_read(call, &Bytes::copy_from_slice(handle))?;
             let (checks, charge) = resource.conditions(call, world, nonces)?;
             reservations.push(charge);
             let parent_basis = resource.snapshot.parent_basis();
+            let expected_clock = resource.snapshot.application_clock();
+            if *kind != 2 && !resource.snapshot.is_held() {
+                return Err(Status::failed_precondition("The original world is read-only"));
+            }
             held.push(resource);
-            let mut writes = Vec::new();
-            self.decode_world_writes(call, owned_groups(overlay, true, false)?, &mut rows_left, &mut writes, &mut reservations)?;
-            if writes.is_empty() { return Err(invalid("A world batch requires writes in each world")); }
+            let (effect, rest) = match *kind {
+                0 => {
+                    let (length, rest) = rest.split_first_chunk::<4>().ok_or_else(|| invalid("Missing world overlay length"))?;
+                    let (overlay, rest) = rest.split_at_checked(u32::from_be_bytes(*length) as usize)
+                        .ok_or_else(|| invalid("Incomplete world overlay"))?;
+                    let mut writes = Vec::new();
+                    self.decode_world_writes(call, owned_groups(overlay, true, false)?, &mut rows_left, &mut writes, &mut reservations)?;
+                    if writes.is_empty() { return Err(invalid("The world overlay has no writes")); }
+                    (rtdb_node::OwnedWorldEffect::Overlay(writes), rest)
+                }
+                1 => {
+                    let (target, rest) = rest.split_first_chunk::<8>().ok_or_else(|| invalid("Missing world clock target"))?;
+                    (rtdb_node::OwnedWorldEffect::Clock(Timestamp(i64::from_be_bytes(*target))), rest)
+                }
+                2 => (rtdb_node::OwnedWorldEffect::Drop, rest),
+                _ => return Err(invalid("Unknown world publication effect")),
+            };
+            body = rest;
             sections.push(rtdb_node::OwnedWorldSection {
-                world: rtdb_types::Iid(*world.as_bytes()), parent_basis, writes, checks,
-                publication: rtdb_node::OwnedWorldPublication {
-                    attempt: attempt.to_owned(), fingerprint: *fingerprint,
-                    expected_clock: (clock != Timestamp::MIN).then_some(clock), advance_to: None, drop_world: false,
-                },
+                world: rtdb_types::Iid(*world.as_bytes()), parent_basis, checks, expected_clock,
+                attempt: attempt.to_owned(), effect,
             });
         }
         let ([root_kind], body) = body.split_first_chunk::<1>().ok_or_else(|| invalid("Missing Root section kind"))?;
@@ -1706,8 +1706,8 @@ impl Service {
             root.publication = Some(rtdb_node::OwnedRootPublication { attempt: attempt.to_owned(), writes: root_writes });
         }
         let observed_root = !root.checks.is_empty() || !root_witnesses.is_empty();
-        if (*root_kind == 0 && observed_root) || (*root_kind == 1 && !observed_root) || (count == 1 && *root_kind == 0) {
-            return Err(invalid("A combined publication requires original Root conditions or writes"));
+        if (*root_kind == 0 && observed_root) || (*root_kind == 1 && !observed_root) {
+            return Err(invalid("The Root section kind disagrees with its observations"));
         }
         rows_left = rows_left.checked_sub(root_witnesses.len()).ok_or_else(|| invalid("World batch exceeds its effect limit"))?;
         let controls = owned_groups(body, true, false)?;
@@ -1734,12 +1734,12 @@ impl Service {
         }
         let committed = host.commit_world_batch(
             crate::WorldCall { node: &self.0.node, attachment: &attachment, session: &mut session, cancellation: &call.cancellation },
-            sections, root, controls, deadline,
+            sections, root, *fingerprint, controls, deadline,
         ).await.map_err(status)?;
         self.owned_tx_reply(committed)
     }
 
-    pub(crate) async fn commit_world_action(&self, call: &Call, body: &[u8], format: WorldCommitFormat) -> Result<ActionResult, Status> {
+    pub(crate) async fn validate_world_action(&self, call: &Call, body: &[u8]) -> Result<ActionResult, Status> {
         if !self.0.config.owned_native_actions { return Err(unsupported()); }
         let host = self.0.config.owned_world_host.as_ref().ok_or_else(unsupported)?;
         let (world, groups) = body.split_first_chunk::<16>().ok_or_else(|| invalid("Owned world commit has no world UUID"))?;
@@ -1759,61 +1759,24 @@ impl Service {
             .ok_or_else(|| invalid("Owned world point witness list is truncated"))?;
         let held = self.owned_world_read(call, &Bytes::copy_from_slice(handle))?;
         let (checks, _condition_charge) = held.conditions(call, world, nonces)?;
-        let (publication, overlay, groups) = if matches!(format, WorldCommitFormat::Publication | WorldCommitFormat::Clock | WorldCommitFormat::Drop) {
-            let (attempt, rest) = groups.split_first_chunk::<22>().ok_or_else(|| invalid("Missing world attempt identity"))?;
-            let (fingerprint, rest) = rest.split_first_chunk::<32>().ok_or_else(|| invalid("Missing world attempt fingerprint"))?;
-            let (clock, rest) = rest.split_first_chunk::<8>().ok_or_else(|| invalid("Missing expected world clock"))?;
-            let drop_world = matches!(format, WorldCommitFormat::Drop);
-            let (advance_to, overlay, groups) = if drop_world {
-                (None, None, rest)
-            } else if matches!(format, WorldCommitFormat::Clock) {
-                let (target, groups) = rest.split_first_chunk::<8>().ok_or_else(|| invalid("Missing world clock target"))?;
-                (Some(Timestamp(i64::from_be_bytes(*target))), None, groups)
-            } else {
-                let (length, rest) = rest.split_first_chunk::<4>().ok_or_else(|| invalid("Missing world overlay length"))?;
-                let (overlay, groups) = rest.split_at_checked(u32::from_be_bytes(*length) as usize)
-                    .ok_or_else(|| invalid("Incomplete world overlay groups"))?;
-                (None, Some(overlay), groups)
-            };
-            let clock = Timestamp(i64::from_be_bytes(*clock));
-            let attempt = std::str::from_utf8(attempt).map_err(|_| invalid("Invalid world attempt identity"))?;
-            if !attempt.bytes().all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)) {
-                return Err(invalid("Invalid world attempt identity"));
-            }
-            let publication = rtdb_node::OwnedWorldPublication {
-                attempt: attempt.into(), fingerprint: *fingerprint,
-                expected_clock: (clock != Timestamp::MIN).then_some(clock), advance_to, drop_world,
-            };
-            (Some(publication), overlay, groups)
-        } else {
-            (None, None, groups)
-        };
-        let checked_effects = if publication.is_some() { 2 * checks.len() + 4 } else { checks.len() };
         let _framing = call.reserve(MAX_COMMIT_GROUPS * 512)?;
-        let mut writes = Vec::new();
-        let mut reservations = Vec::new();
         let policy = self.hosted_control_policy(call)?;
         let control_groups = owned_groups(groups, true, false)?;
         hosted_control::admit_control_targets(policy, control_groups.iter().map(|(relation, _)| relation))?;
         let scope = self.hosted_control_scope(call).await?;
-        let mut rows_left = MAX_GROUPED_COMMIT_ROWS - checked_effects;
+        let mut rows_left = MAX_GROUPED_COMMIT_ROWS - (2 * checks.len() + 2);
         let (control_checks, _control_charges) = self.decode_hosted_control_groups(
             call, control_groups, scope, &mut rows_left, true,
         )?;
-        let groups = match overlay {
-            Some(overlay) => owned_groups(overlay, true, false)?,
-            None => Vec::new(),
-        };
-        self.decode_world_writes(call, groups, &mut rows_left, &mut writes, &mut reservations)?;
         let (_, attachment) = call.session.resolve_database(Some(&call.database), &self.0.node)?;
         let attachment = attachment.ok_or_else(unsupported)?;
         let connection = self.connection(call, &call.database).await?;
         let mut session = connection.borrow().await?;
         require_idle(&session)?;
         held.snapshot.check().map_err(status)?;
-        let committed = host.commit_world(
+        let committed = host.validate_world(
             crate::WorldCall { node: &self.0.node, attachment: &attachment, session: &mut session, cancellation: &call.cancellation },
-            world, writes, checks, control_checks, deadline, publication,
+            world, checks, control_checks, deadline,
         ).await.map_err(status)?;
         self.owned_tx_reply(committed)
     }

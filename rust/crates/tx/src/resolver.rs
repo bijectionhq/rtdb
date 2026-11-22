@@ -1045,7 +1045,7 @@ impl<'a> OpenTransaction<'a> {
                 let (rows, witnesses) = counts.remove(&world).ok_or_else(unavailable)?;
                 if witnesses == 0 || witnesses > 128 || !attempts.insert(attempt) || own_fingerprint != fingerprint
                     || (rows == 0) != (advance_to.is_some() || drop_world)
-                    || drop_world && advance_to.is_some() || world_batch && (advance_to.is_some() || drop_world)
+                    || drop_world && advance_to.is_some()
                 {
                     return Err(unavailable());
                 }

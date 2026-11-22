@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use rtdb_columnar::{MemoryBudget, MemoryReservation, OwnedBatch};
 use rtdb_directory::{CheckpointWorldRetention, DeploymentRecord, Directory, HostedTask, now_ms};
-use rtdb_node::{NativeSession, OwnedReadSession, OwnedWorldPointWitness, OwnedWorldWrite, TransactionStatus};
+use rtdb_node::{NativeSession, OwnedReadSession, OwnedWorldPointWitness, TransactionStatus};
 use rtdb_types::{
     EntityId, Iid, Interval, OwnedRelation, OwnedWorld, PlacedAttemptScope, Result, StructFields,
     Timestamp, TransactionKey, Value, WorldClockMode, WorldShadow,
@@ -214,8 +214,6 @@ fn matches_retention(world: &OwnedWorld, retained: &CheckpointWorldRetention) ->
 
 struct OpenWorld {
     retained: CheckpointWorldRetention,
-    incarnation: u64,
-    log_epoch: i32,
     snapshot: OwnedReadSession,
     record: OwnedWorld,
     clock: Option<Timestamp>,
@@ -266,8 +264,6 @@ async fn open_world(
     }
     Ok(OpenWorld {
         retained: retained.clone(),
-        incarnation: installation.incarnation,
-        log_epoch: installation.log_epoch,
         snapshot,
         record: world,
         clock,
@@ -275,59 +271,35 @@ async fn open_world(
     })
 }
 
-async fn retire_world_pin(
-    directory: &dyn Directory, deployment: &str, id: Uuid, pin: &CheckpointWorldRetention,
-    incarnation: u64, log_epoch: i32,
+async fn retire_world_pins(
+    directory: &dyn Directory, deployment: &str,
+    selected: &[(Uuid, &CheckpointWorldRetention)], incarnation: u64, log_epoch: i32,
 ) -> Result<()> {
     update_installation(directory, deployment, |current| {
         if current.incarnation != incarnation || current.log_epoch != log_epoch {
             return Err(OwnedWorld::unavailable());
         }
-        if let Some(current_pin) = current.checkpoint_worlds.get(&id) {
-            if current_pin != pin {
+        for (id, expected) in selected {
+            if current.checkpoint_worlds.get(id).is_some_and(|pin| pin != *expected) {
                 return Err(OwnedWorld::unavailable());
             }
-            current.checkpoint_worlds.remove(&id);
+            current.checkpoint_worlds.remove(id);
         }
         Ok(())
     }).await?;
     Ok(())
 }
 
-pub(crate) async fn commit_checkpoint_world_checked(
-    directory: &dyn Directory,
-    archive: &CellStorage,
-    session: &mut NativeSession,
-    deployment: Uuid,
-    id: Uuid,
-    writes: Vec<OwnedWorldWrite>,
-    checks: Vec<OwnedWorldPointWitness>,
-    controls: Vec<rtdb_node::HostedControlWrite>,
-    deadline: Timestamp,
-    publication: Option<rtdb_node::OwnedWorldPublication>,
+pub(crate) async fn validate_checkpoint_world(
+    directory: &dyn Directory, archive: &CellStorage, session: &mut NativeSession,
+    deployment: Uuid, id: Uuid, checks: Vec<OwnedWorldPointWitness>,
+    controls: Vec<rtdb_node::HostedControlWrite>, deadline: Timestamp,
 ) -> Result<TransactionKey> {
-    let OpenWorld {
-        snapshot,
-        record,
-        _schema_charge,
-        retained,
-        incarnation,
-        log_epoch,
-        ..
-    } = open_world(directory, archive, session, deployment, id).await?;
+    let OpenWorld { snapshot, record, _schema_charge, .. } = open_world(directory, archive, session, deployment, id).await?;
     drop(snapshot);
-    let dropping = publication.as_ref().is_some_and(|publication| publication.drop_world);
-    let outcome = session.commit_owned_world_checked(&record, writes, checks, controls, deadline, publication).await?;
+    let outcome = session.validate_owned_world(&record, checks, controls, deadline).await?;
     if !outcome.committed() {
-        return Err(outcome
-            .error()
-            .cloned()
-            .unwrap_or_else(OwnedWorld::unavailable));
-    }
-    if dropping {
-        // The ordered terminal marker is authoritative. A failed retirement leaves
-        // the exact pin retained until expiry.
-        let _ = retire_world_pin(directory, &deployment.to_string(), id, &retained, incarnation, log_epoch).await;
+        return Err(outcome.error().cloned().unwrap_or_else(OwnedWorld::unavailable));
     }
     Ok(outcome.tx_key())
 }
@@ -335,11 +307,12 @@ pub(crate) async fn commit_checkpoint_world_checked(
 pub(crate) async fn commit_checkpoint_world_batch(
     directory: &dyn Directory, archive: &CellStorage, session: &mut NativeSession, deployment: Uuid,
     sections: Vec<rtdb_node::OwnedWorldSection>, root: rtdb_node::OwnedRootSection,
-    controls: Vec<rtdb_node::HostedControlWrite>, deadline: Timestamp,
+    fingerprint: [u8; 32], controls: Vec<rtdb_node::HostedControlWrite>, deadline: Timestamp,
 ) -> Result<TransactionKey> {
     if !(1..=8).contains(&sections.len()) { return Err(OwnedWorld::unavailable()); }
     let installation = directory.deployment(&deployment.to_string()).await?.ok_or_else(OwnedWorld::unavailable)?;
     let mut admitted = Vec::with_capacity(sections.len());
+    let mut terminal = Vec::new();
     for section in sections {
         let id = Uuid::from_bytes(section.world.0);
         let retained = installation.checkpoint_worlds.get(&id).ok_or_else(OwnedWorld::unavailable)?;
@@ -349,11 +322,19 @@ pub(crate) async fn commit_checkpoint_world_batch(
             deployment, capture: retained.capture, manifest_sha256: retained.manifest_sha256.clone(),
             suffix: retained.suffix, basis: retained.basis,
         })?;
+        if matches!(&section.effect, rtdb_node::OwnedWorldEffect::Drop) {
+            terminal.push((id, retained));
+        }
         admitted.push((retained.until, section));
     }
-    let outcome = session.commit_owned_world_batch(admitted, root, controls, deadline).await?;
+    let outcome = session.commit_owned_world_batch(admitted, root, fingerprint, controls, deadline).await?;
     if !outcome.committed() {
         return Err(outcome.error().cloned().unwrap_or_else(OwnedWorld::unavailable));
+    }
+    if !terminal.is_empty() {
+        // The ordered terminal marker is authoritative. A failed retirement leaves
+        // the exact pins retained until expiry.
+        let _ = retire_world_pins(directory, &deployment.to_string(), &terminal, installation.incarnation, installation.log_epoch).await;
     }
     Ok(outcome.tx_key())
 }
