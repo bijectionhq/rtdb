@@ -249,6 +249,9 @@ pub struct LogkeeperLogConfig {
     /// The namespace of the deployment's log positions.
     #[serde(default)]
     pub log_epoch: i32,
+    /// Inclusive original intake position consumed before a transferred target may write.
+    #[serde(default)]
+    pub transferred_source_through: Option<i64>,
     pub write_quorum: usize,
 }
 
@@ -317,6 +320,10 @@ pub fn moving_config(record: &DeploymentRecord, servers: Vec<JournalEndpoint>, p
         epoch: record.epoch,
         require_read_index: record.linearizable_reads && matches!(role, Role::Subscriber | Role::Compactor),
         log_epoch: record.log_epoch,
+        transferred_source_through: record.checkpoint_transfer_activation.as_deref().map(|activation| {
+            let terminal = activation.replica.bootstrap.terminal.source_through;
+            record.checkpoint.map_or(terminal, |checkpoint| terminal.max(checkpoint.source))
+        }),
         frozen_at: match role { Role::Snapshot(checkpoint) => Some(checkpoint), _ => None },
         previous_servers,
     };
