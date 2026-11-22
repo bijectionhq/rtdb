@@ -4,7 +4,14 @@ EXTENDS ResidenceComposition, ResidenceCompositionEvents, Sequences
 VARIABLE cursor
 
 traceVars == <<vars, cursor>>
-TraceInit == Init /\ cursor = 0
+TraceInit ==
+    /\ cursor = 0
+    /\ IF DisposalEffectsOnly
+        THEN /\ head = 0 /\ checkpoint = 0 /\ floor = 0
+             /\ query = None /\ providerRead = None /\ recovery = None /\ firstRecord = 1
+             /\ phase = "disposing" /\ source = Needs(0) /\ forkCopy = {}
+             /\ prepared = None /\ fork = 0 /\ stalePublication = FALSE
+        ELSE Init
 
 \* A replay projects observed cuts, provider publications and directory phases
 \* into the bounded model rather than choosing them nondeterministically.
@@ -30,8 +37,8 @@ ObservedStep(event) ==
       [] kind = "prepare-fork" -> PrepareFork /\ prepared' = cut
       [] kind = "publish-fork" -> PublishFork /\ fork' = cut
       [] kind = "authorize-disposal" -> AuthorizeDisposal
-      [] kind = "copy-fork" -> CopyFork /\ fork = cut
-      [] kind = "erase-residence" -> EraseResidence
+      [] kind = "copy-fork" -> CopyForkPublication(publication) /\ fork = cut
+      [] kind = "erase-residence" -> EraseResidencePublication(publication)
       [] kind = "settle-disposal" -> SettleDisposal
       [] OTHER -> FALSE
 
@@ -43,9 +50,10 @@ Advance ==
 
 Complete ==
     /\ cursor = Len(Events)
-    /\ phase = "disposed"
-    /\ firstRecord = 2
-    /\ fork = 1 /\ forkCopy = Needs(fork)
+    /\ source = {} /\ forkCopy = Needs(fork)
+    /\ IF DisposalEffectsOnly
+        THEN phase = "disposing" /\ fork = 0
+        ELSE phase = "disposed" /\ firstRecord = 2 /\ fork = 1
 
 Accept == Complete /\ UNCHANGED traceVars
 TraceNext == Advance \/ Accept

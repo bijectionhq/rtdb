@@ -15,7 +15,9 @@
   ["prepare-fork", 1, ""],
   ["publish-fork", 1, ""],
   ["authorize-disposal", -1, ""],
-  ["copy-fork", 1, ""],
-  ["erase-residence", -1, ""],
+  ["copy-fork", 1, "new"],
+  ["erase-residence", -1, "new"],
+  ["copy-fork", 1, "shared"],
+  ["erase-residence", -1, "shared"],
   ["settle-disposal", -1, ""]
 ]

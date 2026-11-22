@@ -38,6 +38,7 @@ vars == <<head, checkpoint, floor, query, providerRead, recovery, firstRecord,
 
 None == -1
 Needs(cut) == IF cut = 0 THEN {"old", "shared"} ELSE {"new", "shared"}
+Publications == {"old", "shared", "new"}
 
 Open == phase \in {"serving", "retiring"}
 Protected == {query, providerRead, recovery, checkpoint, fork} \ {None}
@@ -152,16 +153,21 @@ AuthorizeDisposal ==
     /\ UNCHANGED <<head, checkpoint, floor, query, providerRead, recovery, firstRecord,
                    source, forkCopy, prepared, fork, stalePublication>>
 
-CopyFork ==
-    /\ phase = "disposing" /\ fork # None /\ forkCopy = {}
-    /\ Needs(fork) \subseteq source /\ forkCopy' = Needs(fork)
+CopyForkPublication(publication) ==
+    /\ phase = "disposing" /\ fork # None
+    /\ publication \in (Needs(fork) \cap source) \ forkCopy
+    /\ LET copied == IF Mutation = "copy_wrong_identity"
+                     THEN IF fork = 0 THEN "new" ELSE "old"
+                     ELSE publication
+       IN forkCopy' = forkCopy \cup {copied}
     /\ UNCHANGED <<head, checkpoint, floor, query, providerRead, recovery, firstRecord,
                    phase, source, prepared, fork, stalePublication>>
 
-EraseResidence ==
-    /\ phase = "disposing" /\ source # {}
-    /\ (fork = None \/ Needs(fork) \subseteq forkCopy \/ Mutation = "erase_before_copy")
-    /\ source' = {}
+EraseResidencePublication(publication) ==
+    /\ phase = "disposing" /\ publication \in source
+    /\ (fork = None \/ publication \notin Needs(fork) \/ publication \in forkCopy
+        \/ Mutation = "erase_before_copy")
+    /\ source' = source \ {publication}
     /\ UNCHANGED <<head, checkpoint, floor, query, providerRead, recovery, firstRecord,
                    phase, forkCopy, prepared, fork, stalePublication>>
 
@@ -174,17 +180,19 @@ SettleDisposal ==
 Next == Install \/ PublishCheckpoint \/ OpenQuery \/ CloseQuery \/ BeginProviderRead \/ DrainProviderRead
         \/ AdmitRecovery \/ FinishRecovery \/ Trim \/ AdvanceFloor \/ PrepareFork \/ PublishFork
         \/ CancelPreparation \/ AuthorizeVersion \/ ApplyVersionRemoval \/ SettleVersion
-        \/ AuthorizeDisposal \/ CopyFork \/ EraseResidence \/ SettleDisposal
+        \/ AuthorizeDisposal \/ SettleDisposal
+        \/ \E publication \in Publications : CopyForkPublication(publication) \/ EraseResidencePublication(publication)
 Spec == Init /\ [][Next]_vars
 
 RetainedCutsReadable == \A cut \in ServingDependencies : Needs(cut) \subseteq source
 ReplaySurvivesTrim == Open => firstRecord <= checkpoint + 1 /\ (recovery = None \/ firstRecord <= recovery + 1)
 ForkReadable == fork = None \/ Needs(fork) \subseteq (source \cup forkCopy)
+ForkCopyMatches == fork # None => forkCopy \subseteq Needs(fork)
 ClosedAfterDrain == ~Open => query = None /\ providerRead = None /\ recovery = None
 ReceiptConfirmsAbsence == phase = "disposed" => source = {}
 PublicationRespectsClose == ~stalePublication
 Safe == RetainedCutsReadable /\ ReplaySurvivesTrim /\ ForkReadable
-        /\ ClosedAfterDrain /\ ReceiptConfirmsAbsence /\ PublicationRespectsClose
+        /\ ForkCopyMatches /\ ClosedAfterDrain /\ ReceiptConfirmsAbsence /\ PublicationRespectsClose
 
 NeverDisposesAfterTrimAndForkCopy ==
     ~(phase = "disposed" /\ head = 1 /\ firstRecord = 2 /\ fork = 1 /\ forkCopy = Needs(1))

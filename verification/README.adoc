@@ -290,6 +290,7 @@ It also exercises the Azure adapter against a loopback provider and separately m
 * `tla/ResidenceComposition.tla` models snapshot admission, log trimming, exact-version retirement and whole-residence disposal in a common state.
   Its controls test cross-domain dependencies, including a canceled query's provider read, an older recovery cursor, fork publication and transfer before erasure.
   `tla/ResidenceCompositionReplay.tla` checks an authored event trace against the same transitions and refuses five invalid variants at their first unmatched step.
+  With `--native-replay`, it also checks copy and removal effects recorded by local disposal under a directory permit, with a separate control for removal before the relevant fork copy.
 * `tla/ResidenceRetirement.tla` composes durable intent and exact-identity deletion with a serving view, an in-flight provider request, a recovery cursor, a checkpoint, and a fork.
   It includes three generations, one shared file, one pair of physical versions of a logical key, and one delayed deletion grant per file.
   Its controls drop each hold or fence independently and include loss of a durable intent both before and after installation.

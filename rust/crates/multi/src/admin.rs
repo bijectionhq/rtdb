@@ -2302,6 +2302,91 @@ mod tests {
         assert!(storage.try_local_maintenance().unwrap().is_some());
     }
 
+    struct DisposalTraceStore<'a> {
+        inner: &'a dyn ObjectStore,
+        effects: parking_lot::Mutex<Vec<(&'static str, String)>>,
+    }
+
+    #[async_trait]
+    impl ObjectStore for DisposalTraceStore<'_> {
+        async fn head(&self, key: &ObjectKey) -> rtdb_storage::Result<StoredObject> {
+            self.inner.head(key).await
+        }
+        async fn get(&self, key: &ObjectKey) -> rtdb_storage::Result<Bytes> {
+            self.inner.get(key).await
+        }
+        async fn get_range(&self, key: &ObjectKey, range: Range<u64>) -> rtdb_storage::Result<Bytes> {
+            self.inner.get_range(key, range).await
+        }
+        async fn put(&self, key: &ObjectKey, bytes: Bytes) -> rtdb_storage::Result<()> {
+            self.inner.put(key, bytes).await?;
+            self.effects.lock().push(("copy-fork", key.to_string()));
+            Ok(())
+        }
+        async fn put_file(&self, key: &ObjectKey, path: &Path) -> rtdb_storage::Result<()> {
+            self.inner.put_file(key, path).await?;
+            self.effects.lock().push(("copy-fork", key.to_string()));
+            Ok(())
+        }
+        async fn list(&self, directory: Option<&ObjectKey>) -> rtdb_storage::Result<Vec<StoredObject>> {
+            self.inner.list(directory).await
+        }
+        async fn delete(&self, key: &ObjectKey) -> rtdb_storage::Result<()> {
+            self.inner.delete(key).await?;
+            assert!(matches!(self.inner.head(key).await, Err(rtdb_storage::Error::MissingObject(_))));
+            self.effects.lock().push(("erase-residence", key.to_string()));
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn local_disposal_records_copy_and_removal_of_each_publication() {
+        let data = tempfile::tempdir().unwrap();
+        let keys = LocalKeyService::new(data.path().join("keys")).unwrap();
+        let storage = CellStorage::Local { root: data.path().join("objects") };
+        let bucket = storage.bucket(rtdb_storage::IoRegion::new()).await.unwrap();
+        let directory = MemoryDirectory::new();
+        let mut source = DeploymentRecord::new("source", "acme", Vec::new(), 0);
+        let namespaces = super::storage_namespaces(bucket.as_ref(), &keys).await.unwrap();
+        source.storage_namespaces = Some(namespaces);
+        let source = directory.create_deployment(source).await.unwrap();
+        keys.key(&source.key_id()).await.unwrap();
+        let source_prefix = source.storage_prefix();
+        let source_store = format!("{source_prefix}/v06");
+        for name in ["old", "shared"] {
+            let key = ObjectKey::new(format!("{source_store}/{name}")).unwrap();
+            bucket.put(&key, Bytes::from_static(name.as_bytes())).await.unwrap();
+        }
+
+        let destination = super::ForkDestination { name: "child", org: None, hosted_task: None };
+        let child = super::with_fork_access(directory.as_ref(), &storage, &keys, &source, None, |access|
+            super::fork_with_tail(directory.clone(), &storage, access, &keys, &source, destination, None, Vec::new(), 4 << 20)).await.unwrap();
+        let fork_store = format!("{}/v06", child.storage_prefix());
+        for name in ["old", "shared"] {
+            let owned = ObjectKey::new(format!("{fork_store}/{name}")).unwrap();
+            assert!(matches!(bucket.head(&owned).await, Err(rtdb_storage::Error::MissingObject(_))));
+        }
+        let fenced = super::begin_disposal(directory.as_ref(), &source.id).await.unwrap();
+        let permit = directory.begin_reference_disposal(&fenced.id, fenced.version).await.unwrap();
+        assert_eq!(permit.residence(), source_prefix);
+        let erasure = ResidenceErasure(ErasureAuthority::Disposing(&permit));
+        let watched = DisposalTraceStore { inner: bucket.as_ref(), effects: Default::default() };
+        let (proof, _) = erase_and_sign_local_disposal(
+            &watched, &keys, &fenced, &erasure, &[child], namespaces, 0,
+        ).await.unwrap();
+        assert!(proof.facts.verified_empty);
+        for name in ["old", "shared"] {
+            let copied = ObjectKey::new(format!("{fork_store}/{name}")).unwrap();
+            assert_eq!(bucket.get(&copied).await.unwrap(), name.as_bytes());
+        }
+        let effects = watched.effects.into_inner();
+        assert_eq!(effects.len(), 4, "each publication is copied and removed once");
+        if let Some(path) = std::env::var_os("RTDB_RESIDENCE_DISPOSAL_TRACE_PATH") {
+            let trace = serde_json::json!({ "source_store": source_store, "fork_store": fork_store, "effects": effects });
+            std::fs::write(path, serde_json::to_vec_pretty(&trace).unwrap()).unwrap();
+        }
+    }
+
     struct RetainingStore<'a>(&'a MemoryStore);
 
     #[async_trait]

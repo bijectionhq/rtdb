@@ -35,10 +35,10 @@ Every recent real defect was compositional: cross-node reader stranding with eve
 A provider read retains its own dependency after the query closes.
 An installed successor updates the trim bound, while an admitted recovery keeps the older suffix and publications readable.
 The retirement transition needs the floor and all applicable dependencies before it can remove one immutable publication.
-Whole-residence disposal requires the provider read to drain, excludes fork publication, preserves the published fork's dependencies in its own store, and confirms source absence before settlement.
+Whole-residence disposal requires the provider read to drain, excludes fork publication, preserves each required publication in the published fork's own store before removing it from the source, and confirms source absence before settlement.
 
 The bounded model has two catalog cuts, three publications, one query, one in-flight provider read, one recovery cursor and one fork.
-TLC explored 845 distinct states. Eight weakened rules violate the corresponding composed invariant.
+TLC explored 1,063 distinct states. Nine weakened rules violate the corresponding composed invariant.
 The reachability cases cover exact reclamation while a current query is open and whole-residence settlement after a trim and fork copy.
 Apalache independently checks the conjunction and the trim control.
 See the [runner](../README.adoc#_run_the_studies) for reproduction.
@@ -50,10 +50,15 @@ A native event trace must supply the actual cut, provider identity and directory
 Its [authored fixture](../traces/residence-composition.json) projects catalog cuts and publication identities into the model.
 A trace must reach the disposal receipt with the expected replica floor and fork copy.
 Controls refuse a different physical publication, retirement before read drain, trimming an admitted recovery, erasing an uncopied fork dependency and a trace that ends before settlement.
-The composed checker runs against model fixtures.
-A native checkpoint and trim replay also exports committed directory revisions and physical floors observed from the logkeepers.
+The composed checker also replays the copy and removal effects captured through the native local-store disposal implementation.
+The fixture uses a genuine directory disposal permit and a published fork with two inherited objects.
+The checker validates the physical source and destination scopes before projecting the two publications into the model.
+A control moves one removal ahead of the copy it needs and is rejected at the first step.
+This replay begins after directory admission and ends at source absence. It exercises local storage effects, while the authored trace covers the full sequence through directory settlement.
+
+A separate native checkpoint and trim replay exports committed directory revisions and physical floors observed from the logkeepers.
 Its validator checks that authorization preserves replay holds and has a manifest from the same journal.
-The native trace covers one journal at a time. Production emission for query, custody, fork and erasure transitions remains open.
+It covers one journal at a time. Native composition across query admission, hosted provider custody, directory settlement and recovery trimming remains open.
 A model counterexample to a weakened rule shows why the rule matters for the modeled system.
 
 ## Handoff notes

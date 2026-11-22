@@ -2615,6 +2615,8 @@ TLA_CASES = (
      ('Mutation = "none"\nINVARIANT Safe', 'Mutation = "remove_by_path"\nINVARIANT RetainedCutsReadable'), "RetainedCutsReadable"),
     ("ResidenceComposition", "residence-composition-dispose-before-drain",
      ('Mutation = "none"\nINVARIANT Safe', 'Mutation = "dispose_before_drain"\nINVARIANT ClosedAfterDrain'), "ClosedAfterDrain"),
+    ("ResidenceComposition", "residence-composition-copy-wrong-identity",
+     ('Mutation = "none"\nINVARIANT Safe', 'Mutation = "copy_wrong_identity"\nINVARIANT ForkCopyMatches'), "ForkCopyMatches"),
     ("ResidenceComposition", "residence-composition-erase-before-copy",
      ('Mutation = "none"\nINVARIANT Safe', 'Mutation = "erase_before_copy"\nINVARIANT ForkReadable'), "ForkReadable"),
     ("ResidenceComposition", "residence-composition-settle-before-absence",
@@ -2840,63 +2842,59 @@ def verify_tla(args, scratch):
             print(f"{case}: {states[1]} distinct states, no violation")
 
 
-def verify_residence_trace(args, scratch):
-    fixture = Path("verification/traces/residence-composition.json")
-    events = json.loads((ROOT / fixture).read_text())
-    baseline = {event[0]: event for event in events}
-    reorder = {
-        "provider-read-undrained": ("drain-provider-read", "authorize-version"),
-        "recovery-trimmed": ("finish-recovery", "trim"),
-        "fork-copy-missing": ("copy-fork", "erase-residence"),
-    }
-    cases = {"baseline": events, "wrong-publication": [
-        [kind, cut, "new" if kind == "remove-version" else publication]
-        for kind, cut, publication in events
-    ]}
-    for name, (first, second) in reorder.items():
-        swapped = {first: baseline[second], second: baseline[first]}
-        cases[name] = [swapped.get(event[0], event) for event in events]
-    cases["no-settlement"] = events[:-1]
-    for name, trace in cases.items():
-        case = f"tlc-residence-trace-{name}"
-        directory = scratch / case
-        for module in ("ResidenceComposition", "ResidenceCompositionReplay"):
-            clone_file(Path(f"verification/tla/{module}.tla"), directory)
-        source = directory / "verification/tla/ResidenceCompositionReplay.tla"
-        encoded = ", ".join(f"<<{json.dumps(kind)}, {cut}, {json.dumps(publication)}>>" for kind, cut, publication in trace)
-        source.with_name("ResidenceCompositionEvents.tla").write_text(
-            "---- MODULE ResidenceCompositionEvents ----\nEXTENDS Integers\n"
-            f"Events == <<{encoded}>>\n====\n"
-        )
-        config = source.with_suffix(".cfg")
-        config.write_text("SPECIFICATION TraceSpec\nCONSTANT Mutation = \"none\"\nINVARIANT Safe\nPROPERTY ReplayTerminates\n")
-        checked = run_case(
-            [args.java, "-XX:+UseParallelGC", "-Xmx1g", "-cp", args.tlc, "tlc2.TLC",
-             "-workers", "1", "-metadir", str(directory / "states"), "-noGenerateSpecTE",
-             "-config", config.name, source.name],
-            source.parent, args.evidence, case,
-        )
-        if name == "baseline":
-            if checked.returncode or "No error has been found." not in checked.stdout:
-                raise ValueError(f"{case}: accepted trace did not settle")
-            print(f"{case}: fixture actions match the composed transition system")
-        else:
-            if not checked.returncode or "Deadlock reached" not in checked.stdout:
-                raise ValueError(f"{case}: expected an unmatched trace action")
-            if name == "no-settlement":
-                expected_cursor = len(trace)
-            else:
-                expected_step = {
-                    "wrong-publication": "remove-version",
-                    "provider-read-undrained": "authorize-version",
-                    "recovery-trimmed": "trim",
-                    "fork-copy-missing": "erase-residence",
-                }[name]
-                expected_cursor = next(index for index, event in enumerate(trace) if event[0] == expected_step)
-            cursors = re.findall(r"^/\\ cursor = (\d+)$", checked.stdout, re.M)
-            if not cursors or int(cursors[-1]) != expected_cursor:
-                raise ValueError(f"{case}: expected first refusal at cursor {expected_cursor}")
-            print(f"{case}: trace refused at action {expected_cursor + 1}")
+def check_residence_trace(args, scratch, case, trace, refusal=None, disposal_effects_only=False):
+    directory = scratch / case
+    for module in ("ResidenceComposition", "ResidenceCompositionReplay"):
+        clone_file(Path(f"verification/tla/{module}.tla"), directory)
+    source = directory / "verification/tla/ResidenceCompositionReplay.tla"
+    encoded = ", ".join(f"<<{json.dumps(kind)}, {cut}, {json.dumps(publication)}>>" for kind, cut, publication in trace)
+    mode = "TRUE" if disposal_effects_only else "FALSE"
+    source.with_name("ResidenceCompositionEvents.tla").write_text(
+        "---- MODULE ResidenceCompositionEvents ----\nEXTENDS Integers\n"
+        f"Events == <<{encoded}>>\nDisposalEffectsOnly == {mode}\n====\n"
+    )
+    config = source.with_suffix(".cfg")
+    config.write_text("SPECIFICATION TraceSpec\nCONSTANT Mutation = \"none\"\nINVARIANT Safe\nPROPERTY ReplayTerminates\n")
+    checked = run_case(
+        [args.java, "-XX:+UseParallelGC", "-Xmx1g", "-cp", args.tlc, "tlc2.TLC",
+         "-workers", "1", "-metadir", str(directory / "states"), "-noGenerateSpecTE",
+         "-config", config.name, source.name],
+        source.parent, args.evidence, case,
+    )
+    if refusal is None:
+        if checked.returncode or "No error has been found." not in checked.stdout:
+            raise ValueError(f"{case}: accepted trace did not reach its terminal state")
+        print(f"{case}: actions match the composed transition system")
+    else:
+        cursors = re.findall(r"^/\\ cursor = (\d+)$", checked.stdout, re.M)
+        if not checked.returncode or "Deadlock reached" not in checked.stdout or not cursors or int(cursors[-1]) != refusal:
+            raise ValueError(f"{case}: expected first refusal at cursor {refusal}")
+        print(f"{case}: trace refused at cursor {refusal}")
+
+
+def verify_residence_trace(args, scratch, events, disposal_effects_only=False):
+    phase = "native-disposal" if disposal_effects_only else "model"
+    prefix = f"tlc-residence-trace-{phase}"
+    check_residence_trace(args, scratch, f"{prefix}-baseline", events, disposal_effects_only=disposal_effects_only)
+    positions = {}
+    for index, (kind, _, _) in enumerate(events):
+        positions.setdefault(kind, index)
+    swaps = {"fork-copy-missing": ("copy-fork", "erase-residence")}
+    if not disposal_effects_only:
+        swaps.update({
+            "provider-read-undrained": ("drain-provider-read", "authorize-version"),
+            "recovery-trimmed": ("finish-recovery", "trim"),
+        })
+        remove = positions["remove-version"]
+        wrong_publication = list(events)
+        wrong_publication[remove] = ["remove-version", -1, "new"]
+        check_residence_trace(args, scratch, f"{prefix}-wrong-publication", wrong_publication, remove)
+        check_residence_trace(args, scratch, f"{prefix}-no-settlement", events[:-1], len(events) - 1)
+    for name, (first, second) in swaps.items():
+        left, right = positions[first], positions[second]
+        reordered = list(events)
+        reordered[left], reordered[right] = reordered[right], reordered[left]
+        check_residence_trace(args, scratch, f"{prefix}-{name}", reordered, min(left, right), disposal_effects_only)
 
 
 def verify_alloy(args, scratch):
@@ -4203,6 +4201,36 @@ def verify_multi_trim_admission(args, source):
     print(f"{label}: directory floor enforced before physical trim, missing check rejected")
 
 
+def verify_native_residence_trace(args, source, scratch):
+    trace = (args.evidence / "rust-residence-disposal-trace.json").resolve()
+    env = os.environ | {
+        "CARGO_TARGET_DIR": os.environ.get("CARGO_TARGET_DIR", str(ROOT / "target")),
+        "CARGO_PROFILE_TEST_DEBUG": "0",
+        "RTDB_RESIDENCE_DISPOSAL_TRACE_PATH": str(trace),
+    }
+    test = "admin::tests::local_disposal_records_copy_and_removal_of_each_publication"
+    result = run_case(["cargo", "test", "--locked", "-p", "rtdb-multi", "--lib", test, "--", "--exact"],
+                      source / "rust", args.evidence, "rust-residence-disposal-trace", env)
+    if result.returncode or f"{test} ... ok" not in result.stdout:
+        raise ValueError("local disposal did not produce a native trace")
+    observed = json.loads(trace.read_text())
+    prefixes = {
+        "copy-fork": (observed["fork_store"], 0),
+        "erase-residence": (observed["source_store"], -1),
+    }
+    if observed["source_store"] == observed["fork_store"]:
+        raise ValueError("native disposal requires distinct physical residences")
+    events = []
+    for kind, key in observed["effects"]:
+        prefix, cut = prefixes[kind]
+        store_prefix = f"{prefix}/"
+        publication = key.removeprefix(store_prefix)
+        if not key.startswith(store_prefix) or publication not in {"old", "shared"}:
+            raise ValueError(f"{kind} targets a publication outside its admitted store: {key}")
+        events.append([kind, cut, publication])
+    verify_residence_trace(args, scratch, events, disposal_effects_only=True)
+
+
 def verify_native_recovery_trace(args, source):
     import copy
     import sys
@@ -5196,7 +5224,7 @@ def main():
         directory = Path(scratch)
         verify_lean(args, directory)
         verify_tla(args, directory)
-        verify_residence_trace(args, directory)
+        verify_residence_trace(args, directory, json.loads((ROOT / "verification/traces/residence-composition.json").read_text()))
         verify_verus(args, directory)
         if args.openjml:
             verify_jvm_leaf_merge(args, directory)
@@ -5234,6 +5262,7 @@ def main():
             verify_native_reference_manifest(args, source)
             verify_native_reference_read(args, source)
             verify_native_reference_disposal(args, source)
+            verify_native_residence_trace(args, source, directory)
             verify_native_exact_marker(args, source)
             verify_compaction_publication_versions(args, source)
             verify_replay_prefix(args, source)
