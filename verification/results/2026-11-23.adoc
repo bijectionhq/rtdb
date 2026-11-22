@@ -72,3 +72,25 @@ The ordering control tests the shared function with the deterministic fixture's 
 Hosted provider settlement remains a separate check.
 
 The complete maintenance suite and the retirement mutation commands and outputs are retained under retirement-native-controls-tc3pkp0w/ in the evidence directory above.
+
+== Combined evidence for the reader-retention increments
+
+The combined model and proof run at e7c50b6b36 matched all 492 TLC cases and 70 Apalache cases.
+Lean checked 69 study baselines and rejected 199 controls.
+Verus passed the baseline in all 42 areas and rejected 231 controls at their declared functions.
+The Alloy, SMT, Maude, mCRL2, AutoHyper and OpenJML checks also matched.
+The receipt in collector-transaction-combined-e7c50b6b36/ names the source revision, executable digests and hashed inputs.
+
+A separate TLC run at 7c4ca5eb01 explored 52,254 states with a twelve-tick horizon, a six-tick lease, a three-tick I/O bound and margin, and clock origins in {0, 9, 15}.
+Both safety invariants and conditional progress held.
+The case configuration and output are retained in collector-turnover-expanded-q06v4exr/.
+
+At 7c4ca5eb01 the storage and index suites passed all 157 Rust cases.
+The separately run maintenance suite and retirement controls cover the local installed-receipt replay added after the combined formal revision.
+
+Gradle ran the full standard and property suites at 7c4ca5eb01 with the FFI library built from e7c50b6b36.
+Both revisions have the same production sources.
+There were 3,198 standard and 3,348 property passes with zero failures, errors or skips.
+All 398 JVM binding cases passed, including the native binding cases.
+The run emitted no reflection or boxed math warnings.
+The retained output is transaction-catalog-hold-pzn3x9vi/gradle-full-with-ffi.log.
