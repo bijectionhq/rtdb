@@ -25,11 +25,11 @@ const OWNED_PRESENT: &str = "rtdb.owned.present_micros";
 fn request(call: &Call, body: &[u8]) -> Result<(OwnedRelation, OwnedBatch), Status> {
     let (length, rest) = body.split_first_chunk::<2>().ok_or_else(|| invalid("Owned action has no relation length"))?;
     let length = usize::from(u16::from_be_bytes(*length));
-    let (name, arrow) = rest.split_at_checked(length).ok_or_else(|| invalid("Owned action relation is truncated"))?;
+    let (name, arrow_bytes) = rest.split_at_checked(length).ok_or_else(|| invalid("Owned action relation is truncated"))?;
     if length > 96 { return Err(invalid("Owned action relation exceeds its length limit")); }
     let name = std::str::from_utf8(name).map_err(arrow)?;
     let relation = OwnedRelation::new(name).map_err(status)?;
-    let mut stream = OwnedStream::read(arrow, call.service.memory()).map_err(status)?.into_pages();
+    let mut stream = OwnedStream::read(arrow_bytes, call.service.memory()).map_err(status)?.into_pages();
     let [batch] = stream.as_slice() else {
         return Err(invalid("Owned action requires exactly one Arrow record batch"));
     };
