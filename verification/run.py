@@ -2685,6 +2685,18 @@ TLA_CASES = (
     ("ReadCurrencyAnchor", "read-currency-anchor-concurrent-progress-witness",
      ("INVARIANT AnchorCoversPrefix", "INVARIANT NeverConfirmsWhileAnotherObservationIsPending"),
      "NeverConfirmsWhileAnotherObservationIsPending"),
+    ("CollectorTurnover", "collector-turnover-reuse-observation",
+     ('Mutation = "none"\nINVARIANTS WaitsForOwnObservation RetainsAdmittedIO',
+      'Mutation = "reuse_observation"\nINVARIANT WaitsForOwnObservation'), "WaitsForOwnObservation"),
+    ("CollectorTurnover", "collector-turnover-reader-retention",
+     ('Mutation = "none"\nINVARIANTS WaitsForOwnObservation RetainsAdmittedIO',
+      'Mutation = "reuse_observation"\nINVARIANT RetainsAdmittedIO'), "RetainsAdmittedIO"),
+    ("CollectorTurnover", "collector-turnover-restart-window",
+     ('Mutation = "none"', 'Mutation = "restart_window"'), "temporal:ExpiryProgress"),
+    ("CollectorTurnover", "collector-turnover", None, None),
+    ("CollectorTurnover", "collector-turnover-reclaim-witness",
+     ("INVARIANTS WaitsForOwnObservation RetainsAdmittedIO",
+      "INVARIANT NeverReclaimsWithChangedClockOrigin"), "NeverReclaimsWithChangedClockOrigin"),
     ("ResidenceComposition", "residence-composition", None, None),
     ("ResidenceComposition", "residence-composition-admit-below-floor",
      ('Mutation = "none"\nINVARIANT Safe', 'Mutation = "admit_below_floor"\nINVARIANT RetainedCutsReadable'), "RetainedCutsReadable"),
@@ -4307,6 +4319,29 @@ def verify_native_current_catalog(args, source):
     print("rust-current-catalog-admission: baseline passed and the omitted gate was rejected")
 
 
+def verify_native_collector_turnover(args, source):
+    env = os.environ | {
+        "CARGO_TARGET_DIR": os.environ.get("CARGO_TARGET_DIR", str(ROOT / "target")),
+        "CARGO_PROFILE_TEST_DEBUG": "0",
+    }
+    test = "a_replacement_collector_waits_a_whole_lease_on_its_own_clock"
+    command = ["cargo", "test", "--locked", "-p", "rtdb-maintenance", "--test", "gc", test, "--", "--exact"]
+    baseline = run_case(command, source / "rust", args.evidence, "rust-collector-turnover", env)
+    if baseline.returncode or f"{test} ... ok" not in baseline.stdout:
+        raise ValueError("the replacement collector must wait a full reader lease and then reclaim")
+    path = source / "rust/crates/maintenance/src/gc.rs"
+    original = path.read_bytes()
+    try:
+        replace_once(path, ".or_insert(now);", ".and_modify(|first| *first = now).or_insert(now);")
+        control = run_case(command, source / "rust", args.evidence, "rust-collector-turnover-restart-window", env)
+    finally:
+        path.write_bytes(original)
+    if (control.returncode != 101 or f"{test} ... FAILED" not in control.stdout
+        or "the replacement collector must reclaim at the elapsed lease boundary" not in control.stdout):
+        raise ValueError("the collection replay did not catch a lease window restarted at every observation")
+    print("rust-collector-turnover: successor waited a full lease, and restarting the window was rejected")
+
+
 def verify_native_residence_trace(args, source, scratch):
     trace = (args.evidence / "rust-residence-disposal-trace.json").resolve()
     env = os.environ | {
@@ -5372,6 +5407,7 @@ def main():
             verify_native_reference_disposal(args, source)
             verify_native_residence_trace(args, source, directory)
             verify_native_current_catalog(args, source)
+            verify_native_collector_turnover(args, source)
             verify_native_exact_marker(args, source)
             verify_compaction_publication_versions(args, source)
             verify_replay_prefix(args, source)

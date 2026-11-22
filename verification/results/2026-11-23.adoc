@@ -1,0 +1,40 @@
+= RTDB kernel study results, 2026-11-23
+
+== W1 · Successor trie collector and lease expiry
+
+The collector contract in link:../../dev/doc/gc.allium[gc.allium] starts a new wait after a collector restarts or takes over.
+The study covers a newly selected trie under that contract.
+It compares an observation scoped to one collector with a weaker design that permits a predecessor's observation to carry over.
+
+[cols="1,4",options="header"]
+|===
+|Evidence |Result
+
+|TLC 2026.11.19.180144
+|The baseline explored 9,792 distinct states across two terms, one file and one reader, with a time horizon of nine ticks, a four-tick lease and origins in {0, 9}.
+It checked that collection follows a full wait measured by the current collector and that an admitted provider read retains its file while in flight.
+With weak fairness of collection, a successor with an elapsed window eventually collects.
+The liveness premise requires time to reach the end of that window within the modeled horizon.
+
+|Controls and witness
+|The abstract observation reuse control violates the own-observation invariant and the I/O-retention invariant when checked separately.
+The restart-window control violates the temporal progress property.
+The reachability witness observes collection in a successor with a different clock origin.
+
+|Native Rust
+|The production collector runs twice as distinct instances over the same in-memory store and partition.
+For a 500-microsecond lease, the successor keeps the data and metadata on first observation and at 499 microseconds, then deletes both and publishes the retirement exactly at 500 microseconds.
+The progress control resets the observation window on each collection pass and fails at the final retirement assertion.
+The full maintenance crate passed all 53 cases, including 12 collection integration cases.
+|===
+
+The model assumes clocks with equal rates and arbitrary origins within the finite set.
+The reader anchor comes from a confirmed prefix that predates retirement.
+I/O finishes within the modeled two-tick bound, which equals the lease margin.
+The existing link:../verus/read_lease/laws.rs[Verus lease laws] cover the elapsed-time inequalities for bounded drift when the margin also covers provider execution.
+Provider duration, the scheduling of real elections, and reclamation through resumed intents and Multi's deferred reaper remain separate obligations.
+The native fixture exercises collector replacement with an eligible catalog and manual clocks.
+
+The maintained runner is link:../run.py[verification/run.py].
+The selected cases use link:../tla/CollectorTurnover.cfg[CollectorTurnover.cfg] and the native replay `a_replacement_collector_waits_a_whole_lease_on_its_own_clock`.
+Exact commands and logs are in `collector-turnover-tlc-wv642cbw/` and `collector-turnover-native-7y0po1n3/` under `/private/tmp/rtdb-formal.QMjPSJsX/`.

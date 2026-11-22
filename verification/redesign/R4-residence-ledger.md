@@ -70,7 +70,9 @@ The controls cover reversing the clock and tip reads, confirming ahead of instal
 
 The model assumes an advancing published frontier and monotone installed prefix within one replica epoch.
 The proof of the synchronous decisions relies on the caller supplying the clock sample and installed position from that same authority.
-Query capture, delegated fragments and membership queries check the lease at admission, including paths that can answer from memory. The native query fixture exercises the admission refusal and offline acceptance. Handling abandoned operations and availability across leadership turnover remain open.
+Query capture, delegated fragments and membership queries check the lease at admission, including paths that can answer from memory. The native query fixture exercises the admission refusal and offline acceptance. The [collector turnover study](../tla/CollectorTurnover.tla) checks that a fresh trie selection in a successor term starts its own lease window and protects bounded in-flight I/O.
+The native fixture observes the successor retain the files through that interval and reclaim them at expiry.
+Full term handoff, outstanding provider drain and settlement of deferred releases remain open.
 
 ## Handoff notes
 
