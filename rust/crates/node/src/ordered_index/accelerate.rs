@@ -778,6 +778,7 @@ pub(super) async fn owned_page(
     storage: &Arc<rtdb_storage::cache::BufferPool>,
     definition: &Definition,
     bounds: RowBounds<'_>,
+    valid_at: Option<Timestamp>,
 ) -> Result<super::OwnedRangePage> {
     let fields = owned_fields(snapshot, definition);
     let positions: Vec<_> = (0..fields.len()).collect();
@@ -793,7 +794,7 @@ pub(super) async fn owned_page(
 
     let present = context.current_time.as_micros()?;
     let (tree, root) = covered_generation(context, snapshot, storage, definition, present).await?;
-    let buckets: Vec<_> = Bucket::at(present).collect();
+    let buckets: Vec<_> = Bucket::at(valid_at.unwrap_or(present)).collect();
     let scratch = context
         .memory
         .reserve(limit.saturating_mul(64).saturating_add(16_384))?;

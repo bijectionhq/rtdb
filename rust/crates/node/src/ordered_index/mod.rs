@@ -206,6 +206,7 @@ pub(crate) async fn owned_range(
     relation: &rtdb_types::OwnedRelation,
     path: &rtdb_types::OwnedRelation,
     bounds: RowBounds<'_>,
+    valid_at: Option<rtdb_types::Timestamp>,
 ) -> Result<OwnedRangePage> {
     let definition = owned_definition(&context, owner, relation, path).await?;
     let database = context
@@ -214,7 +215,7 @@ pub(crate) async fn owned_range(
     let [snapshot] = database.partitions.as_slice() else {
         return Err(uncovered_owned_range());
     };
-    let work = accelerate::owned_page(&context, snapshot, &database.storage, &definition, bounds);
+    let work = accelerate::owned_page(&context, snapshot, &database.storage, &definition, bounds, valid_at);
     rtdb_storage::IoRegion::leased(context.catalog.read_lease(), work).await
 }
 

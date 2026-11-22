@@ -165,7 +165,9 @@ impl DmlBuffer {
                 relation.name().len() + name.name().len(), |bytes, column| bytes.checked_add(column.capacity() + 64).ok_or_else(allocation_overflow),
             )?,
             TxOp::OwnedDeadline { .. } => 0,
-            TxOp::OwnedCheckRange { relation, .. } => relation.name().len(),
+            TxOp::OwnedDeclareFixedRange { relation, rule } => relation.name().len() + rule.path.capacity() + rule.column.capacity(),
+            TxOp::OwnedCheckRange { relation, fixed, .. } =>
+                relation.name().len() + fixed.as_ref().map_or(0, |fixed| fixed.retained_bytes()),
             TxOp::Sql { sql, .. } | TxOp::SqlBytes { sql, .. } => sql.capacity(),
             TxOp::InsertDocs { table, .. } | TxOp::PutDocs { table, .. } | TxOp::PutArrowDocs { table, .. } | TxOp::PatchDocs { table, .. } | TxOp::DeleteDocs { table, .. } | TxOp::EraseDocs { table, .. } => table.schema.capacity().checked_add(table.table.capacity()).ok_or_else(allocation_overflow)?,
         }.checked_add(std::mem::size_of::<BufferedOperation>() * 2 + 128).ok_or_else(allocation_overflow)?;

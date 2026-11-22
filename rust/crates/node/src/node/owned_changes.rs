@@ -244,6 +244,33 @@ impl OwnedReadSession {
         Ok((covered.floor.through_events != 0).then_some(covered.floor.committed_at))
     }
 
+    pub(super) async fn covered_range_anchor(
+        &self,
+        relation: &OwnedRelation,
+        frontier: i64,
+    ) -> Result<i64> {
+        let database = self.context.catalog.database(&self.database)?;
+        let [snapshot] = database.partitions.as_slice() else {
+            return Err(change_feed_uncovered());
+        };
+        let Some(covered) = self
+            .covered_journal(snapshot, relation, self.present.system_time)
+            .await?
+        else {
+            return if frontier == 0 {
+                Ok(0)
+            } else {
+                Err(change_feed_uncovered())
+            };
+        };
+        if covered.head.through_events != frontier {
+            return Err(change_feed_uncovered());
+        }
+        self.require_journal_head(relation, covered.head_revision, covered.head)
+            .await?;
+        Ok(covered.head_revision)
+    }
+
     /// Pages source groups touching one identity within a certified system window.
     pub async fn versions(
         &self,

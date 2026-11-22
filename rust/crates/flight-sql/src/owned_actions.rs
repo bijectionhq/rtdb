@@ -24,6 +24,7 @@ use crate::{
     upload, wire,
 };
 
+pub(crate) const DECLARE_OWNED_FIXED_RANGE_V1: &str = "rtdb.owned.DeclareFixedRange.v1";
 pub(crate) const DECLARE_OWNED_CAPACITY_V1: &str = "rtdb.owned.DeclareCapacity.v1";
 pub(crate) const DECLARE_OWNED_UNIQUE_PATH_V1: &str = "rtdb.owned.DeclareUniquePath.v1";
 pub(crate) const DECLARE_OWNED_SEARCH_PATH_V1: &str = "rtdb.owned.DeclareSearchPath.v1";
@@ -112,6 +113,10 @@ pub(crate) const FORK_WORLD_V1: &str = "rtdb.owned.ForkWorld.v1";
 pub(crate) const COMMIT_WORLD_V1: &str = "rtdb.owned.CommitWorld.v1";
 pub(crate) const SEARCH_HELD_OWNED_V1: &str = "rtdb.owned.SearchHeld.v1";
 pub(crate) const HELD_OWNED_RANGE_V1: &str = "rtdb.owned.ReadHeldRange.v1";
+#[derive(Clone, Copy)]
+pub(crate) enum HeldRangeFormat { Leading, Full, FixedValid }
+
+pub(crate) const HELD_OWNED_RANGE_V3: &str = "rtdb.owned.ReadHeldRange.v3";
 pub(crate) const HELD_OWNED_RANGE_V2: &str = "rtdb.owned.ReadHeldRange.v2";
 pub(crate) const HELD_OWNED_COUNT_V1: &str = "rtdb.owned.CountHeldRange.v1";
 pub(crate) const HELD_OWNED_MERGED_CHANGES_V1: &str = "rtdb.owned.ReadHeldMergedChanges.v1";
@@ -132,13 +137,13 @@ pub(crate) struct OwnedReadResource {
     owner: ResourceOwner,
     session: String,
     database: String,
-    witnesses: Mutex<BTreeMap<String, RetainedRangeWitness>>,
+    witnesses: Mutex<BTreeMap<Uuid, RetainedRangeWitness>>,
     _permit: OwnedSemaphorePermit,
     _reservation: Arc<MemoryReservation>,
 }
 
 struct RetainedRangeWitness {
-    nonce: Uuid,
+    relation: OwnedRelation,
     evidence: OwnedRangeWitness,
     _reservation: Arc<MemoryReservation>,
 }
@@ -149,19 +154,19 @@ impl OwnedReadResource {
     fn remember(&self, call: &Call, relation: &OwnedRelation, evidence: OwnedRangeWitness) -> Result<Uuid, Status> {
         self.snapshot.check().map_err(status)?;
         let mut witnesses = self.witnesses.lock().map_err(|_| Status::internal("Owned range witness storage is unavailable"))?;
-        if let Some(witness) = witnesses.get(relation.name()) {
-            return Ok(witness.nonce);
+        if let Some((nonce, _)) = witnesses.iter().find(|(_, witness)| &witness.relation == relation && witness.evidence.same_range(&evidence)) {
+            return Ok(*nonce);
         }
         if witnesses.len() >= MAX_RANGE_WITNESSES {
-            return Err(Status::resource_exhausted("The held read has too many witnessed relations"));
+            return Err(Status::resource_exhausted("The held read has too many range witnesses"));
         }
         let nonce = Uuid::new_v4();
-        if witnesses.values().any(|witness| witness.nonce == nonce) {
+        if witnesses.contains_key(&nonce) {
             return Err(Status::unavailable("Could not issue an owned range witness"));
         }
-        let reservation = call.reserve(wire::add(512, relation.name().len() * 2)?)?;
-        witnesses.insert(relation.name().to_owned(), RetainedRangeWitness {
-            nonce, evidence, _reservation: reservation,
+        let reservation = call.reserve(wire::add(wire::add(512, relation.name().len() * 2)?, evidence.retained_bytes())?)?;
+        witnesses.insert(nonce, RetainedRangeWitness {
+            relation: relation.clone(), evidence, _reservation: reservation,
         });
         Ok(nonce)
     }
@@ -302,6 +307,22 @@ impl Service {
         self.owned_write_reply(call, vec![TxOp::OwnedDeclarePath { relation, name, columns }]).await
     }
 
+    pub(crate) async fn declare_owned_fixed_range_action(&self, call: &Call, body: &[u8]) -> Result<ActionResult, Status> {
+        if !self.0.config.owned_native_actions { return Err(unsupported()); }
+        let (relation, arrow) = split_relation(body)?;
+        let batch = request_batch(call, arrow)?;
+        if batch.batch().num_rows() != 1 || batch.batch().num_columns() != 3 {
+            return Err(invalid("Fixed range declaration requires one row with path, column and valid_micros"));
+        }
+        let (rows, _decoded) = upload::domain_documents(batch.batch(), self)?;
+        let row = &rows[0];
+        let (Some(Value::Utf8(path)), Some(Value::Utf8(column)), Some(Value::I64(valid_micros))) =
+            (row.get("path"), row.get("column"), row.get("valid_micros"))
+        else { return Err(invalid("Fixed range declaration has invalid field types")); };
+        let rule = rtdb_types::FixedRangeRule { path: path.clone(), column: column.clone(), valid_at: Timestamp(*valid_micros) };
+        self.owned_write_reply(call, vec![TxOp::OwnedDeclareFixedRange { relation, rule }]).await
+    }
+
     pub(crate) async fn declare_owned_capacity_action(&self, call: &Call, body: &[u8]) -> Result<ActionResult, Status> {
         if !self.0.config.owned_native_actions { return Err(unsupported()); }
         let (relation, arrow) = split_relation(body)?;
@@ -374,7 +395,7 @@ impl Service {
             held.snapshot.check().map_err(status)?;
             let nonce = Uuid::from_bytes(*nonce);
             let witness = held.witnesses.lock().map_err(|_| Status::internal("Owned range witness storage is unavailable"))?
-                .values().find(|witness| witness.nonce == nonce)
+                .get(&nonce)
                 .map(|witness| witness.evidence.clone()).ok_or_else(|| Status::not_found("Unknown owned range witness"))?;
             witnesses.push((held, witness));
         }
@@ -750,7 +771,7 @@ impl Service {
         self.owned_stream_reply(&schema, &response)
     }
 
-    pub(crate) async fn held_owned_range_action(&self, call: &Call, body: &[u8], full_key: bool) -> Result<ActionResult, Status> {
+    pub(crate) async fn held_owned_range_action(&self, call: &Call, body: &[u8], version: HeldRangeFormat) -> Result<ActionResult, Status> {
         if !self.0.config.owned_native_actions { return Err(unsupported()); }
         let (handle, request) = body.split_first_chunk::<16>().ok_or_else(|| invalid("Owned held range has no handle"))?;
         let handle = Bytes::copy_from_slice(handle);
@@ -761,7 +782,11 @@ impl Service {
         }
         let (relation, arrow) = split_relation(request)?;
         let batch = decode_batch(call, arrow)?;
-        let expected_fields = if full_key { 6 } else { 4 };
+        let expected_fields = match version {
+            HeldRangeFormat::Leading => 4,
+            HeldRangeFormat::Full => 6,
+            HeldRangeFormat::FixedValid => 7,
+        };
         if batch.batch().num_rows() != 1 || batch.batch().num_columns() != expected_fields {
             return Err(invalid("Owned range requires one row with the fields for its action version"));
         }
@@ -772,7 +797,15 @@ impl Service {
         else { return Err(invalid("Owned range fields have invalid types")); };
         let path = OwnedRelation::new(path.as_str()).map_err(status)?;
         let limit = usize::try_from(*limit).map_err(|_| invalid("Owned range limit is out of range"))?;
-        let (page, evidence) = if full_key {
+        let valid_at = if matches!(version, HeldRangeFormat::FixedValid) {
+            let Some(Value::I64(valid_at)) = row.get("valid_micros") else {
+                return Err(invalid("Owned fixed range requires a microsecond valid instant"));
+            };
+            let valid_at = Timestamp(*valid_at);
+            valid_at.next().map_err(status)?;
+            Some(valid_at)
+        } else { None };
+        let (page, evidence) = if !matches!(version, HeldRangeFormat::Leading) {
             let Some(Value::Bool(descending)) = row.get("descending") else {
                 return Err(invalid("Owned range requires a boolean descending field"));
             };
@@ -783,7 +816,7 @@ impl Service {
                 descending: *descending,
                 limit,
             };
-            held.snapshot.range_page_by_key_observed(&relation, &path, request).await
+            held.snapshot.range_page_by_key_at_observed(&relation, &path, request, valid_at).await
         } else {
             let lower = (!matches!(lower, Value::Null | Value::Undefined)).then_some(lower);
             let upper = (!matches!(upper, Value::Null | Value::Undefined)).then_some(upper);
@@ -792,7 +825,7 @@ impl Service {
         let present = held.snapshot.present().system_time;
         let observed = witnessed_schema(call, &held, &relation, &page.schema, evidence)?;
         let schema = observed.as_ref().map_or(page.schema.as_ref(), |(schema, _)| schema);
-        let reply = self.owned_point_reply(schema, page.batch.as_ref().map(OwnedBatch::batch), present, present, None)?;
+        let reply = self.owned_point_reply(schema, page.batch.as_ref().map(OwnedBatch::batch), present, valid_at.unwrap_or(present), None)?;
         held.snapshot.check().map_err(status)?;
         Ok(reply)
     }

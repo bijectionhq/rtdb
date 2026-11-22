@@ -83,6 +83,10 @@
 -- A fresh held read can derive a scoped point hold at the actual last visible publication marker.
 -- Each declared relation's retained floor covers both the requested and selected system coordinates.
 -- The derived hold shares the original generation and lease and admits point reads only in its fixed root scope.
+
+-- A declared fixed-valid Binary and Utf8 identity path journals both old and new covered keys at the authored instant.
+-- A held full-span fixed witness permits intervening relation writes only when every covered journal side lies outside its bounds.
+-- Missing exact evidence leaves relation-frontier validation in force.
 -- Held reads require the original session and attachment and refuse after expiry, lease loss, or closure.
 -- A held root valid window returns ordered non-overlapping winning slices clipped at the requested endpoints.
 -- Fully covered range counts and completed valid windows can issue relation-frontier evidence under the same placed lease as range pages.

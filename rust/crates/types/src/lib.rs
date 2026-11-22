@@ -73,3 +73,6 @@ mod sql_time;
 pub use sql_time::{parse_sql_timestamp_literal, parse_sql_timestamp_cast, parse_sql_timestamp_instant, parse_sql_local_datetime, parse_sql_zoned_datetime, parse_sql_date_literal, parse_query_clock, validate_sql_time_literal};
 mod duration_text;
 pub use duration_text::{DurationLiteral, format_iso_duration};
+
+mod fixed_range;
+pub use fixed_range::{FixedRangeEvidence, FixedRangeKey, FixedRangeRule, FIXED_RANGE_COMPONENT_BYTES, FIXED_RANGE_MAX_GROUPS, FIXED_RANGE_MAX_IDS};
