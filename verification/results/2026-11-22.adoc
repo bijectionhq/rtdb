@@ -311,3 +311,7 @@ The trace recorded 26 committed directory revisions and two physical floor obser
 The validator accepted the live capture.
 Five controls reject a missing manifest, a trim overlapping a hold, a physical floor beyond its authorization, a different journal and a gap in directory revisions.
 link:../recovery_trace.py[Recovery trace validator]
+
+The combined JVM suites passed 3,198 standard, 3,348 property and 5,629 integration cases, with one PostgreSQL slot-recreation skip.
+The PostgreSQL failover test passed in its focused retry and in the full integration run.
+No reflection or boxed-math warnings were recorded.

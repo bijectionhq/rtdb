@@ -12,11 +12,11 @@ The second review revises the custody and erasure contracts and adds the placed 
 | R2 Engine-owned retry receipts | — | Landed `85a868c07` (receipts are bitemporal rows in `xt.idempotency_receipts`; R8 removes them physically) |
 | R3 Epoch-qualified physical names | — | Landed `ae7b66e10` (naming epoch only; an input digest proved unnecessary) |
 | R4 Residence ledger, holds and collection floor | [R4-residence-ledger.md](R4-residence-ledger.md) | Multi admission floor and durable retry landed; renewable holds, classic authority and full timer removal remain |
-| R5 Recovery roots; collectable L0 | [R5-recovery-roots.md](R5-recovery-roots.md) | Multi protects startup metadata and suffixes, collects covered exact versions and admits witnessed loose-file retirement in enrolled terminal S3 allocations. Complete recovery closures, terminal pack coverage and provider qualification remain open. |
+| R5 Recovery roots; collectable L0 | [R5-recovery-roots.md](R5-recovery-roots.md) | Multi commits its replay inventory and suffix together before trim and trie-file retirement. Root-based compactor reset, L0 collection, terminal pack coverage and provider qualification remain open. |
 | R6 Sealing with destroyable data keys | [R6-sealing.md](R6-sealing.md) | Multi seals under a per-deployment key; classic unsealed; no per-unit keys |
 | R7 History collection and privacy erasure | [R7-eraser.md](R7-eraser.md) | Contract and bounded custody model; runtime pending |
 | R8 Retention of receipts and transaction metadata | [R8-metadata-retention.md](R8-metadata-retention.md) | Placed outcome witnesses have a logical receipt window. Physical expiry and transaction metadata retention remain open. |
-| R9 Capabilities and composed model | [R9-capabilities-and-composition.md](R9-capabilities-and-composition.md) | Pattern exists (replica admission witness, `IoRegion` lease scope) |
+| R9 Capabilities and composed model | [R9-capabilities-and-composition.md](R9-capabilities-and-composition.md) | Replica admission and lease scopes are implemented. Live cell recovery and trim traces are checked. The remaining authority transitions need production capture. |
 
 Dependency order: R4 and R6 can proceed in parallel; R5 needs R4; R7 needs R5 and R6; R8 needs R7; R9 grows with each.
 
@@ -44,7 +44,7 @@ Dependency order: R4 and R6 can proceed in parallel; R5 needs R4; R7 needs R5 an
 | Change | Target | State |
 | --- | --- | --- |
 | Placed attempt receipts, fresh reads and loglet fences | [Authority boundaries](authority-boundaries.md) | Opt-in subscriber reads use durable loglet indexes. Placed submissions issue scoped receipts and redeem them against installed outcomes. Frozen readers confirm receipts against their admitted checkpoint. Retiring lease-based self-fencing remains open. |
-| CDC recoverability and upstream acknowledgement | [Authority boundaries](authority-boundaries.md#recovery-roots-and-upstream-acknowledgement) | Contract specified; gated on R5 and provider qualification |
+| CDC recoverability and upstream acknowledgement | [Authority boundaries](authority-boundaries.md#recovery-roots-and-upstream-acknowledgement) | Native PostgreSQL can confirm early from retained, synced local journals and checkpoint storage. Hosted early confirmation needs provider recovery authority. |
 | Argument-defined search ranking | [Full-text search](../../dev/doc/fts.allium) | Implemented in native SQL and the rank accelerator |
 | Custody-scoped sealing, enrollment and erasure | [R6](R6-sealing.md) · [R7](R7-eraser.md) | Bounded custody protocol checked in TLA+; provider and runtime changes pending |
 
