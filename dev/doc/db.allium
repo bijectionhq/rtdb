@@ -1864,7 +1864,8 @@ surface QueryAccess {
         -- Scalar aggregates read their operands as needed and write compatible results as Arrow columns.
         -- List aggregates collect selected Arrow positions after applying filters and distinctness, and sort Arrow keys when the aggregate specifies an order.
         -- Percentile aggregates order each group's selected positions and read the ranked arguments from their source vectors.
-        -- A bounded scalar membership join indexes the build key vectors and appends nullable Boolean marks to the probe batches.
+        -- A compatible scalar membership join indexes the build key vectors and appends nullable Boolean marks to the probe batches.
+        -- A spilled scalar membership join retains the probe payloads and the build's global null facts through Arrow partition replay.
         -- An Arrow join can evaluate a residual predicate from its referenced cells while gathering the result payloads from the input batches.
         -- Compatible join partitions retain flat and nested Arrow layouts in spill files.
         -- Outer joins track unmatched build positions through partition replay.

@@ -823,7 +823,7 @@ fn arrow_hash(batch: &ColumnBatch, row: usize, positions: &[usize]) -> Option<u3
     })
 }
 
-fn retry_row_spill(error: &rtdb_types::Anomaly) -> bool {
+pub(crate) fn retry_row_spill(error: &rtdb_types::Anomaly) -> bool {
     matches!(error.code.as_str(), "rtdb.query/join-spill-layout" | "rtdb.query/spill-limit" | "rtdb/memory-budget-exceeded")
 }
 

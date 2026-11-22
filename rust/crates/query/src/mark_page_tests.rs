@@ -77,6 +77,36 @@ async fn uncorrelated_arrow_membership_matches_page_marks_with_null_and_empty_bu
 }
 
 #[tokio::test]
+async fn membership_spill_keeps_probe_payloads_and_global_null_facts() {
+    let execution = execution_threshold(1, 1);
+    let data_type = LogicalType::Scalar(ScalarType::I64).maybe();
+    let candidate = field(1, data_type);
+    let dependent = Arc::new(Relation::new(Schema::new(vec![candidate.clone()]).unwrap(), RelationNode::Values {
+        rows: vec![vec![literal(1)], vec![literal(2)], vec![Expr::Literal(Value::Null)]],
+    }).unwrap());
+    let relation = mark(table(0, &[1, 3, 2]), dependent,
+        Expr::binary(BinaryOp::Eq, column(0), candidate.expression()), false);
+    let mut pages = open(Arc::clone(&relation), &execution).await;
+    let mut expected = Vec::new();
+    while let Some(page) = pages.next_page().await.unwrap() {
+        expected.extend(page.rows().iter().map(|row| row.values.clone()));
+    }
+    drop(pages);
+    let runtime = EmittedRelation::derive(relation, &execution.context.catalog, &[], &execution.context.memory).unwrap();
+    let mut columns = crate::operators::build_columns(runtime, execution.clone()).await.unwrap().expect("Expected Arrow membership spill");
+    let mut actual = Vec::new();
+    while let Some(batch) = columns.next_batch().await.unwrap() {
+        assert!(execution.context.spill_bytes() > 0);
+        assert!(batch.columns.iter().all(|column| !matches!(column, crate::columnar::Column::Values(_))));
+        actual.extend((0..batch.len).map(|row| batch.columns.iter().map(|column| column.value(row).unwrap()).collect::<Vec<_>>()));
+    }
+    assert_eq!(actual, expected);
+    assert!(actual.contains(&vec![Value::I64(3), Value::Null]));
+    assert_eq!(actual.len(), 3);
+    assert_eq!(execution.context.spill_bytes(), 0);
+}
+
+#[tokio::test]
 async fn correlated_scalar_apply_keeps_computed_dependent_vectors() {
     use rtdb_plan::{ApplyKind, NamedExpr};
     let execution = execution(2);

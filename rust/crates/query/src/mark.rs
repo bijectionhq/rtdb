@@ -93,29 +93,37 @@ pub(crate) fn bounded_membership_input(input: &Relation) -> bool {
     })
 }
 
-// The build retains only its comparison column. The probe keeps its whole batch and adds a Boolean vector.
+// The build retains only comparison keys. The probe keeps its payload and adds a Boolean vector.
 pub(crate) struct BatchMembership {
-    build: Option<ProbeInput>,
-    probe: MembershipProbe,
-    index: BatchKeyIndex,
+    state: MembershipState,
     keys: (usize, usize),
-    probe_projected: bool,
     facts: CandidateFacts,
+    spill_comparison: Option<Expr>,
     execution: Execution,
 }
 
-enum MembershipProbe {
-    Unopened(ProbeInput),
-    Open(BoxBatchCursor),
+enum MembershipState {
+    Build { build: ProbeInput, probe: ProbeInput },
+    Memory { probe: BoxBatchCursor, projected: bool, index: BatchKeyIndex },
+    Spill { disk: MembershipSpill, restart: Option<(ProbeInput, ProbeInput)> },
+    Rows(BoxPageCursor),
     Done,
 }
 
+struct MembershipSpill {
+    build: crate::join_spill::Partitions,
+    probe: crate::join_spill::Partitions,
+    index: Option<BatchKeyIndex>,
+    build_partition: usize,
+    probe_partition: usize,
+    ready: Option<(std::collections::VecDeque<ColumnBatch>, Arc<rtdb_columnar::MemoryReservation>)>,
+}
+
 impl BatchMembership {
-    pub fn new(build: ProbeInput, probe: ProbeInput,
-        probe_projected: bool, keys: (usize, usize), execution: Execution) -> Result<Self> {
-        let index = BatchKeyIndex::vector_hashing(&execution.context)?;
-        Ok(Self { build: Some(build), probe: MembershipProbe::Unopened(probe), index, keys, probe_projected,
-            facts: CandidateFacts { empty: true, null: false, nested: false }, execution })
+    pub fn new(build: ProbeInput, probe: ProbeInput, keys: (usize, usize),
+        spill_comparison: Option<Expr>, execution: Execution) -> Self {
+        Self { state: MembershipState::Build { build, probe }, keys, spill_comparison,
+            facts: CandidateFacts { empty: true, null: false, nested: false }, execution }
     }
 
     async fn open(input: ProbeInput) -> Result<(BoxBatchCursor, bool)> {
@@ -132,63 +140,210 @@ impl BatchMembership {
         let _scratch = context.memory.reserve(column.bound(row)?)?;
         Ok(matches!(column.value(row)?, Value::Null | Value::Undefined))
     }
+
+    async fn build(&mut self, build: ProbeInput, probe: ProbeInput) -> Result<MembershipState> {
+        use crate::join_spill::{BlockWriter, compatible_schema, layout_error};
+        let context = &self.execution.context;
+        let memory = &context.memory;
+        let (probe_key, build_key) = self.keys;
+        let schema = Schema::new(vec![build.runtime.schema().fields()[build_key].clone()])?;
+        let (mut build, projected) = Self::open(build).await?;
+        let mut index = BatchKeyIndex::vector_hashing(context)?;
+        let mut held = Vec::new();
+        let mut inventory = memory.reserve(0)?;
+        let mut writer = None::<BlockWriter>;
+        let mut count = 0i64;
+        while let Some(batch) = poll_nested_batch(build.as_mut()).await? {
+            batch.validate_readable(context)?;
+            if batch.len == 0 { continue; }
+            self.facts.empty = false;
+            for row in 0..batch.len {
+                context.check_cancelled_at(row)?;
+                self.facts.null |= Self::is_null(&batch.columns[build_key], row, context)?;
+            }
+            let key = {
+                let bytes = batch.len.checked_mul(std::mem::size_of::<(usize, usize)>()).ok_or_else(mark_size)?;
+                let _rows = memory.reserve(bytes)?;
+                let rows = (0..batch.len).map(|row| (0, row)).collect::<Vec<_>>();
+                let key = ColumnBatch::take_rows_with_custody(&[&batch], &rows, &[build_key], true, memory)?;
+                key.compact_group_keys(&rows, memory)?
+            };
+            if self.spill_comparison.is_none() {
+                index.build(key, projected, context)?;
+                continue;
+            }
+            if let Some(writer) = &mut writer {
+                writer.append(key, context)?;
+                continue;
+            }
+            count = count.checked_add(i64::try_from(key.len).map_err(|_| mark_size())?).ok_or_else(mark_size)?;
+            if count > context.options.join_build_rows {
+                if !compatible_schema(&schema) || !compatible_schema(probe.runtime.schema()) { return Err(layout_error()); }
+                let mut spill = BlockWriter::new(&schema, context)?;
+                for key in held.drain(..) { spill.append(key, context)?; }
+                spill.append(key, context)?;
+                writer = Some(spill);
+            } else {
+                let bytes = (held.len() + 1).checked_mul(4 * std::mem::size_of::<ColumnBatch>()).ok_or_else(mark_size)?;
+                Arc::get_mut(&mut inventory).expect("Membership owns its batch inventory").grow_to(bytes)?;
+                held.push(key);
+            }
+        }
+        drop(build);
+        let Some(build) = writer else {
+            for key in held { index.build(key, projected, context)?; }
+            let (probe, projected) = Self::open(probe).await?;
+            return Ok(MembershipState::Memory { probe, projected, index });
+        };
+        let build = build.finish(context)?.shuffle(1, context, |batch, row| membership_hash(batch, row, 0, context))?;
+        let schema = probe.runtime.schema().clone();
+        let (mut probe, _) = Self::open(probe).await?;
+        let mut writer = BlockWriter::new(&schema, context)?;
+        while let Some(batch) = poll_nested_batch(probe.as_mut()).await? {
+            batch.validate_readable(context)?;
+            writer.append(batch, context)?;
+        }
+        let probe = writer.finish(context)?.shuffle(build.count(), context, |batch, row| membership_hash(batch, row, probe_key, context))?;
+        let disk = MembershipSpill { build, probe, index: None, build_partition: 0, probe_partition: 0, ready: None };
+        Ok(MembershipState::Spill { disk, restart: None })
+    }
+
+    fn rows(&self, build: ProbeInput, probe: ProbeInput) -> Result<MembershipState> {
+        let comparison = self.spill_comparison.as_ref().expect("Spilled membership retains its comparison");
+        let input = DeferredInput::new(Arc::clone(&probe.runtime), probe.execution, crate::inspection::Constraints::default(), probe.pushdowns);
+        let cursor = Mark::new(input, &probe.runtime, build.runtime, Vec::new(), None, comparison.clone(), self.execution.clone())?;
+        Ok(MembershipState::Rows(Box::new(cursor)))
+    }
+
+    fn mark_batch(&self, mut batch: ColumnBatch, index: &mut BatchKeyIndex, projected: bool) -> Result<ColumnBatch> {
+        let context = &self.execution.context;
+        let memory = &context.memory;
+        let key = batch.key_projection(&[self.keys.0], memory)?;
+        let bytes = batch.len.checked_add(256).ok_or_else(mark_size)?;
+        let reservation = memory.reserve(bytes)?;
+        let mut marks = arrow_array::builder::BooleanBuilder::with_capacity(batch.len);
+        for row in 0..batch.len {
+            context.check_cancelled_at(row)?;
+            let null = Self::is_null(&key.columns[0], row, context)?;
+            if !null && index.matches(&key, row, projected, false, context)? {
+                marks.append_value(true);
+            } else if !self.facts.empty && (self.facts.null || null) {
+                marks.append_null();
+            } else {
+                marks.append_value(false);
+            }
+        }
+        drop(key);
+        let logical = LogicalType::Scalar(rtdb_types::ScalarType::Bool).maybe();
+        let field = Arc::new(rtdb_columnar::to_field("mark", &logical)?);
+        batch.append_column(Column::Arrow { array: Arc::new(marks.finish()), field, logical: Some(logical) }, reservation, memory)?;
+        Ok(batch)
+    }
+}
+
+impl MembershipSpill {
+    fn next(&mut self, mark: &BatchMembership) -> Result<Option<ColumnBatch>> {
+        let context = &mark.execution.context;
+        loop {
+            context.check_cancelled()?;
+            if let Some(batch) = self.ready.as_mut().and_then(|(batches, _)| batches.pop_front()) { return Ok(Some(batch)); }
+            self.ready = None;
+            let builds = self.build.count();
+            if self.build_partition == builds { return Ok(None); }
+            if self.probe_partition == self.probe.count() / builds {
+                self.index = None;
+                self.build_partition += 1;
+                self.probe_partition = 0;
+                continue;
+            }
+            if self.index.is_none() {
+                let mut index = BatchKeyIndex::vector_hashing(context)?;
+                for frame in 0..self.build.frames(self.build_partition) {
+                    context.check_cancelled()?;
+                    index.build(self.build.read(self.build_partition, frame)?, false, context)?;
+                }
+                self.index = Some(index);
+            }
+            let index = self.index.as_mut().expect("The build partition is loaded");
+            let partition = self.probe_partition * builds + self.build_partition;
+            let count = self.probe.frames(partition);
+            let bytes = count.checked_mul(2 * std::mem::size_of::<ColumnBatch>()).and_then(|bytes| bytes.checked_add(256)).ok_or_else(mark_size)?;
+            let reservation = context.memory.reserve(bytes)?;
+            let mut ready = std::collections::VecDeque::with_capacity(count);
+            for frame in 0..count {
+                let batch = self.probe.read(partition, frame)?;
+                ready.push_back(mark.mark_batch(batch, index, false)?);
+            }
+            self.probe_partition += 1;
+            self.ready = Some((ready, reservation));
+        }
+    }
+}
+
+fn membership_hash(batch: &ColumnBatch, row: usize, key: usize, context: &crate::QueryContext) -> Result<u32> {
+    let column = &batch.columns[key];
+    if let Some(key) = crate::scalar_key::ScalarKey::read(column, row) {
+        return Ok(crate::join_storage::combine_cell_hash(0, key.hash() as i32));
+    }
+    let _scratch = context.memory.reserve(column.bound(row)?)?;
+    hash_values(std::iter::once(&column.value(row)?))
+}
+
+fn mark_size() -> rtdb_types::Anomaly {
+    invalid("mark-size", "Membership state exceeds addressable memory")
 }
 
 #[async_trait]
 impl BatchCursor for BatchMembership {
     async fn next_batch(&mut self) -> Result<Option<ColumnBatch>> {
-        let context = &self.execution.context;
-        let memory = &context.memory;
-        let (probe_key, build_key) = self.keys;
-        if let Some(build) = self.build.take() {
-            let (mut build, projected) = Self::open(build).await?;
-            while let Some(batch) = poll_nested_batch(build.as_mut()).await? {
-                batch.validate_readable(context)?;
-                if batch.len == 0 { continue; }
-                self.facts.empty = false;
-                for row in 0..batch.len {
-                    context.check_cancelled_at(row)?;
-                    self.facts.null |= Self::is_null(&batch.columns[build_key], row, context)?;
+        use crate::batch_join::retry_row_spill;
+        loop {
+            self.execution.context.check_cancelled()?;
+            match std::mem::replace(&mut self.state, MembershipState::Done) {
+                MembershipState::Build { build, probe } => {
+                    let restart = self.spill_comparison.as_ref().map(|_| (build.clone(), probe.clone()));
+                    self.state = match self.build(build, probe).await {
+                        Ok(MembershipState::Spill { disk, .. }) => MembershipState::Spill { disk, restart },
+                        Ok(state) => state,
+                        Err(error) if retry_row_spill(&error) && restart.is_some() => {
+                            let (build, probe) = restart.expect("Repeatable membership inputs are retained");
+                            self.rows(build, probe)?
+                        }
+                        Err(error) => return Err(error),
+                    };
                 }
-                let _rows = memory.reserve(batch.len.checked_mul(std::mem::size_of::<(usize, usize)>())
-                    .ok_or_else(|| invalid("mark-size", "Membership key positions exceed addressable memory"))?)?;
-                let rows = (0..batch.len).map(|row| (0, row)).collect::<Vec<_>>();
-                let key = batch.key_projection(&[build_key], memory)?.compact_group_keys(&rows, memory)?;
-                self.index.build(key, projected, context)?;
+                MembershipState::Memory { mut probe, projected, mut index } => {
+                    while let Some(batch) = poll_nested_batch(probe.as_mut()).await? {
+                        if batch.len == 0 { continue; }
+                        batch.validate_readable(&self.execution.context)?;
+                        let output = self.mark_batch(batch, &mut index, projected)?;
+                        self.state = MembershipState::Memory { probe, projected, index };
+                        return Ok(Some(output));
+                    }
+                    return Ok(None);
+                }
+                MembershipState::Spill { mut disk, restart } => match disk.next(self) {
+                    Ok(Some(batch)) => {
+                        self.state = MembershipState::Spill { disk, restart: None };
+                        return Ok(Some(batch));
+                    }
+                    Ok(None) => return Ok(None),
+                    Err(error) if retry_row_spill(&error) && restart.is_some() => {
+                        let (build, probe) = restart.expect("Repeatable membership inputs are retained");
+                        drop(disk);
+                        self.state = self.rows(build, probe)?;
+                    }
+                    Err(error) => return Err(error),
+                },
+                MembershipState::Rows(mut rows) => {
+                    let Some(page) = rows.next_page().await? else { return Ok(None); };
+                    let batch = ColumnBatch::from_page(&page, &self.execution.context.memory)?;
+                    self.state = MembershipState::Rows(rows);
+                    return Ok(Some(batch));
+                }
+                MembershipState::Done => return Ok(None),
             }
         }
-        let state = std::mem::replace(&mut self.probe, MembershipProbe::Done);
-        let mut probe = match state {
-            MembershipProbe::Unopened(probe) => Self::open(probe).await?.0,
-            MembershipProbe::Open(probe) => probe,
-            MembershipProbe::Done => return Ok(None),
-        };
-        while let Some(mut batch) = poll_nested_batch(probe.as_mut()).await? {
-            if batch.len == 0 { continue; }
-            batch.validate_readable(context)?;
-            let key = batch.key_projection(&[probe_key], memory)?;
-            let bytes = batch.len.checked_add(256).ok_or_else(|| invalid("mark-size", "Membership marks exceed addressable memory"))?;
-            let reservation = memory.reserve(bytes)?;
-            let mut marks = arrow_array::builder::BooleanBuilder::with_capacity(batch.len);
-            for row in 0..batch.len {
-                context.check_cancelled_at(row)?;
-                let null = Self::is_null(&key.columns[0], row, context)?;
-                if !null && self.index.matches(&key, row, self.probe_projected, false, context)? {
-                    marks.append_value(true);
-                } else if !self.facts.empty && (self.facts.null || null) {
-                    marks.append_null();
-                } else {
-                    marks.append_value(false);
-                }
-            }
-            drop(key);
-            let logical = LogicalType::Scalar(rtdb_types::ScalarType::Bool).maybe();
-            let field = Arc::new(rtdb_columnar::to_field("mark", &logical)?);
-            batch.append_column(Column::Arrow { array: Arc::new(marks.finish()), field, logical: Some(logical) }, reservation, memory)?;
-            self.probe = MembershipProbe::Open(probe);
-            return Ok(Some(batch));
-        }
-        Ok(None)
     }
 }
 impl MarkPlan {
