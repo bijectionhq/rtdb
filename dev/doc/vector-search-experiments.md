@@ -146,6 +146,42 @@ Result count alone is therefore an inadequate signal that the search has covered
 The whole-cluster predicate could open every qualifying cluster within eight probes.
 The stationary random filters selected 118, 1,042, and 9,925 eligible rows, and the whole-cluster filter selected 1,228.
 
+### 1,000,000 embeddings
+
+This baseline uses commit `9cdfc768b` and the original scalar primary-table scoring and centroid range format.
+All 60 paired stationary exact queries matched, all five temporal checks passed, and warm and cold ANN returned identical rows.
+Loading and flushing the table took 36.00 s.
+Completing the ordered index builds took another 46 min 27 s.
+Packing and publishing the centroid ranges took 3.51 s after offline training.
+The packed index occupied 404,000,000 bytes, and the live-tail IID lookup occupied another 24,000,000 bytes.
+The live insert took 12.43 ms and wrote zero bytes to the packed index.
+
+| Filter | Exact scan | Ordered acceleration enabled |
+| --- | ---: | ---: |
+| None | 6,210.99 / 8,977.12 | 6,234.87 / 7,034.15 |
+| Random, ~0.1% | 2,078.09 / 2,210.88 | 232.81 / 530.30 |
+| Random, ~1% | 2,215.96 / 2,325.65 | 329.10 / 987.88 |
+| Random, ~10% | 2,595.38 / 3,213.08 | 2,627.79 / 3,066.65 |
+| Whole clusters, ~1% | 2,215.16 / 2,403.48 | 351.73 / 2,303.24 |
+
+| Filter | Probes | Warm ANN | Cold ANN | Mean recall@10 | Below exact result count | Cold range reads / MiB, p50 |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| None | 8 | 173.43 / 192.14 | 174.13 / 192.65 | 74.2% | 0 / 12 | 8 / 6.68 |
+| None | 32 | 172.25 / 189.12 | 170.17 / 192.41 | 91.7% | 0 / 12 | 32 / 26.03 |
+| Random, ~0.1% | 8 | 86.26 / 104.06 | 86.97 / 101.61 | 23.3% | 0 / 12 | 8 / 6.68 |
+| Random, ~0.1% | 32 | 160.06 / 207.34 | 161.37 / 196.05 | 46.7% | 0 / 12 | 32 / 26.03 |
+| Random, ~1% | 8 | 177.94 / 190.86 | 177.60 / 187.20 | 35.8% | 0 / 12 | 8 / 6.68 |
+| Random, ~1% | 32 | 170.43 / 191.66 | 172.91 / 190.65 | 63.3% | 0 / 12 | 32 / 26.03 |
+| Random, ~10% | 8 | 166.09 / 211.71 | 168.60 / 216.56 | 55.0% | 0 / 12 | 8 / 6.68 |
+| Random, ~10% | 32 | 169.43 / 227.08 | 170.98 / 214.71 | 76.7% | 0 / 12 | 32 / 26.03 |
+| Whole clusters, ~1% | 8 | 168.90 / 184.85 | 169.80 / 185.50 | 100.0% | 0 / 12 | 6 / 5.17 |
+| Whole clusters, ~1% | 32 | 170.37 / 184.96 | 170.29 / 182.28 | 100.0% | 0 / 12 | 6 / 5.17 |
+
+At 32 probes the unfiltered worst query recalled 70% of its exact top ten.
+The ~0.1% random filter always filled ten positions but averaged 46.7% recall at 32 probes, including one query with zero matches in the exact top ten.
+The random filters selected 1,054, 9,982, and 99,573 rows, and the whole-cluster filter selected 13,429.
+The 99,573-row scope exceeded the ordered candidate cap of 16,384 and fell back to a scan.
+
 ## Churn and snapshot coverage
 
 ```sh
@@ -175,6 +211,20 @@ The IID-to-ID lookup added 2,400,000 bytes of resident metadata at this size.
 | Random, ~1% | 204.01 | 25.77 | 27.5% | 60.0% | 28.02 / 28.66 |
 | Random, ~10% | 242.62 | 86.87 | 47.5% | 72.5% | 27.73 / 28.13 |
 | Whole clusters, ~1% | 205.19 | 26.61 | 100% | 100% | 28.29 / 28.63 |
+
+The million-row churn run removed 27 rows by delete and 37 by erase.
+Reranking the stale shortlist plus the two puts returned two rows.
+Shadowing 67 changed IIDs before shortlisting restored all ten exact neighbors when all 512 clusters were probed.
+All 20 paired exact results matched, as did warm and cold ANN for each probe budget.
+The churn transaction took 3.52 ms while the older reader was active.
+
+| Filter | Exact p50, ms | Ordered p50, ms | 8 probes recall@10 | 32 probes recall@10 | 32 probes ANN warm / cold p50, ms |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| None | 6,222.01 | 6,203.93 | 62.5% | 82.5% | 237.97 / 239.48 |
+| Random, ~0.1% | 2,050.56 | 310.25 | 20.0% | 50.0% | 233.64 / 229.88 |
+| Random, ~1% | 2,191.12 | 366.30 | 47.5% | 75.0% | 236.54 / 235.42 |
+| Random, ~10% | 2,587.09 | 2,653.17 | 60.0% | 80.0% | 245.12 / 243.38 |
+| Whole clusters, ~1% | 2,229.55 | 1,015.39 | 100.0% | 100.0% | 243.07 / 241.43 |
 
 The stationary and churn runs occurred at different levels of host load.
 Compare the query paths within each run and use the churn tests and recall results to assess the effect of changed rows.
