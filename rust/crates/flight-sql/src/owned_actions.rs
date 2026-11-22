@@ -158,6 +158,7 @@ pub(crate) const OPEN_WORLD_READ_V3: &str = "rtdb.owned.OpenWorldRead.v3";
 pub(crate) const HELD_WORLD_POINT_V2: &str = "rtdb.owned.ReadHeldWorldPoint.v2";
 pub(crate) const CLOSE_WORLD_READ_V1: &str = "rtdb.owned.CloseWorldRead.v1";
 pub(crate) const DROP_WORLD_V1: &str = "rtdb.owned.DropWorld.v1";
+pub(crate) const FORK_HELD_WORLD_V1: &str = "rtdb.owned.ForkHeldWorld.v1";
 pub(crate) const FORK_WORLD_V1: &str = "rtdb.owned.ForkWorld.v1";
 pub(crate) const FORK_WORLD_V2: &str = "rtdb.owned.ForkWorld.v2";
 pub(crate) const COMMIT_WORLD_V1: &str = "rtdb.owned.CommitWorld.v1";
@@ -1576,6 +1577,52 @@ impl Service {
             crate::WorldCall { node: &self.0.node, attachment: &attachment, session: &mut session, cancellation: &call.cancellation },
             Uuid::from_bytes(bytes),
         ).await.map_err(status)
+    }
+
+    pub(crate) async fn fork_held_world_action(&self, call: &Call, body: &[u8]) -> Result<ActionResult, Status> {
+        if !self.0.config.owned_native_actions { return Err(unsupported()); }
+        let host = self.0.config.owned_world_host.as_ref().ok_or_else(unsupported)?;
+        let (handle, rest) = body.split_first_chunk::<16>().ok_or_else(|| invalid("World fork has no held root handle"))?;
+        let (world, rest) = rest.split_first_chunk::<16>().ok_or_else(|| invalid("World fork has no minted identity"))?;
+        let (capture, rest) = rest.split_first_chunk::<16>().ok_or_else(|| invalid("World fork has no capture"))?;
+        let (suffix, rest) = rest.split_first_chunk::<16>().ok_or_else(|| invalid("World fork has no suffix selector"))?;
+        let (until, rest) = rest.split_first_chunk::<8>().ok_or_else(|| invalid("World fork has no expiry"))?;
+        let (deadline, rest) = rest.split_first_chunk::<8>().ok_or_else(|| invalid("World fork has no deadline"))?;
+        let (attempt, rest) = rest.split_first_chunk::<22>().ok_or_else(|| invalid("World fork has no attempt identity"))?;
+        let (fingerprint, groups) = rest.split_first_chunk::<32>().ok_or_else(|| invalid("World fork has no fingerprint"))?;
+        let attempt = std::str::from_utf8(attempt).map_err(|_| invalid("Invalid world fork attempt identity"))?;
+        if !attempt.bytes().all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)) {
+            return Err(invalid("Invalid world fork attempt identity"));
+        }
+        let held = self.owned_read(call, &Bytes::copy_from_slice(handle))?;
+        let policy = self.hosted_control_policy(call)?;
+        let scope = self.hosted_control_scope(call).await?;
+        let (basis, lease_deadline) = held.snapshot.fork_cut(scope).await.map_err(status)?;
+        let groups = owned_groups(groups, true, false)?;
+        hosted_control::admit_control_targets(policy, groups.iter().map(|(relation, _)| relation))?;
+        let mut rows_left = MAX_GROUPED_COMMIT_ROWS - 3; // Deadline, registration and attempt marker.
+        let (controls, _charges) = self.decode_hosted_control_groups(call, groups, scope, &mut rows_left, true)?;
+        let (_, attachment) = call.session.resolve_database(Some(&call.database), &self.0.node)?;
+        let attachment = attachment.ok_or_else(unsupported)?;
+        let connection = self.connection(call, &call.database).await?;
+        let mut session = connection.borrow().await?;
+        require_idle(&session)?;
+        let reply_charge = call.reserve(64)?;
+        let suffix = Uuid::from_bytes(*suffix);
+        let (registered, key) = host.fork_world_checked(
+            crate::WorldCall { node: &self.0.node, attachment: &attachment, session: &mut session, cancellation: &call.cancellation },
+            Uuid::from_bytes(*capture), (!suffix.is_nil()).then_some(suffix), Timestamp(i64::from_be_bytes(*until)),
+            rtdb_node::OwnedWorldFork {
+                world: rtdb_types::Iid(*world), basis, deadline: Timestamp(i64::from_be_bytes(*deadline)).min(lease_deadline),
+                scope, attempt: attempt.into(), fingerprint: *fingerprint, controls,
+            },
+        ).await.map_err(status)?;
+        if registered.as_bytes() != world { return Err(unsupported()); }
+        let mut reply = Vec::with_capacity(32);
+        reply.extend_from_slice(registered.as_bytes());
+        reply.extend_from_slice(&key.tx_id.0.to_be_bytes());
+        reply.extend_from_slice(&key.system_time.0.to_be_bytes());
+        Ok(ActionResult { body: wire::retain(Bytes::from(reply), reply_charge) })
     }
 
     pub(crate) async fn fork_world_action(&self, call: &Call, body: &[u8], with_suffix: bool) -> Result<ActionResult, Status> {

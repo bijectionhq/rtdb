@@ -495,6 +495,11 @@ It takes the world UUID, one signed big-endian 64-bit exclusive deadline in Unix
 The remaining bytes are the existing hosted control groups. Only check rows from the placed allowlist are admitted.
 The ordered transaction checks the world registration, placement, deadline, local point revisions, root erasure frontiers, and hosted ownership before issuing the transaction-key receipt.
 
+`rtdb.owned.ForkHeldWorld.v1` creates one retained world from an authenticated Root hold at the exact authorized capture or accepted suffix.
+The body carries the 16-byte hold, minted world, capture and optional suffix (nil selects the base capture), followed by expiry and deadline as big-endian i64, the 22-byte attempt ID, its 32-byte fingerprint, and check-only hosted controls.
+The placed owner derives the archived cut before pinning and orders the registration with the attempt marker.
+The response carries the minted 16-byte world followed by the transaction ID and system time as big-endian i64.
+
 `rtdb.owned.CommitWorld.v4` publishes an admitted single-world overlay and application clock atomically.
 `rtdb.owned.CommitWorldClock.v1` publishes a clock alone using the same held conditions, deadline, hosted ownership checks, and immutable attempt marker.
 Its body shares the v4 prefix through the expected clock, followed by the target clock as a big-endian i64 and the check-only hosted control groups.
