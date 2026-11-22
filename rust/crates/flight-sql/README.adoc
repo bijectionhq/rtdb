@@ -438,3 +438,15 @@ A commit that cannot fit in an otherwise empty page is rejected.
 `rtdb.owned.change_coverage_micros` identifies the last returned revision of a partial page and the held present of an exhausted page.
 Resume from that coverage time.
 An empty covered page has no rows and carries the already-known held present in `rtdb.owned.present_micros`.
+
+=== Declaring owned prefix capacity
+
+`rtdb.owned.DeclareCapacity.v1` takes the relation prefix and a terminated Arrow IPC stream with one batch and one row.
+Its fields are `column: Utf8`, `prefix_bytes: Int64` (1–4096), and `cap: Int64` (positive).
+The immutable rule applies before the relation's first fact event and returns the same transaction-key Arrow row as Create.
+Each final live fact must provide a Binary key of at least the declared prefix length and at most 4096 bytes.
+Each distinct prefix of that length has its own counter and the same cap.
+Writes to the governed root must start at ordered present and have an unbounded valid end.
+The resolver applies same-transaction releases and claims together, then commits the facts and counters atomically.
+A capacity conflict or uncovered counter frontier aborts the commit.
+World writes to a governed relation refuse until the world can account for inherited occupancy.

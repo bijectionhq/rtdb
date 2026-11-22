@@ -613,6 +613,51 @@ async fn ordered_owned_unique_groups_swaps_and_refuses_conflicts() {
 }
 
 #[tokio::test]
+async fn owned_prefix_capacity_checks_atomic_final_membership() {
+    use rtdb_types::{EntityId, OwnedRelation};
+
+    let mut settings = options();
+    settings.owned_relations = true;
+    let (node, driver) = running(settings, services()).await;
+    let mut session = node.session("xtdb", Arc::new(Authority)).unwrap();
+    let relation = OwnedRelation::new("capacity-orders").unwrap();
+    let other = OwnedRelation::new("capacity-other").unwrap();
+    let rule = |relation: &OwnedRelation| TxOp::OwnedDeclareCapacity {
+        relation: relation.clone(), column: "canonical".into(), prefix_bytes: 1, cap: 2,
+    };
+    let insert = |relation: &OwnedRelation, id, key| TxOp::OwnedInsertDocs {
+        relation: relation.clone(),
+        documents: Documents::new(vec![StructFields::from([
+            ("_id".into(), Value::I64(id)), ("canonical".into(), Value::Binary(key)),
+        ])], node.memory()).unwrap(),
+        valid_from: None, valid_to: None,
+    };
+    let delete = |id, valid_to| TxOp::OwnedDelete {
+        relation: relation.clone(), id: EntityId::Integer(id), valid_from: None, valid_to,
+    };
+    let outcome = session.state_mut().execute_tx(vec![
+        rule(&relation), insert(&relation, 1, vec![7, 1]), insert(&relation, 2, vec![7, 2]),
+    ], AutonomousTxOptions::default()).await.unwrap();
+    assert!(outcome.committed(), "{:?}", outcome.error());
+    let over = session.state_mut().execute_tx(vec![insert(&relation, 3, vec![7, 3])],
+        AutonomousTxOptions::default()).await.unwrap();
+    assert_eq!(over.error().unwrap().code, "rtdb.owned/capacity-exceeded");
+    let outcome = session.state_mut().execute_tx(vec![
+        insert(&relation, 3, vec![7, 3]), delete(1, None), insert(&relation, 4, vec![8, 4]),
+        insert(&other, 1, vec![7, 1]),
+    ], AutonomousTxOptions::default()).await.unwrap();
+    assert!(outcome.committed(), "{:?}", outcome.error());
+    let timed = session.state_mut().execute_tx(vec![delete(2, Some(Timestamp(i64::MAX - 1)))],
+        AutonomousTxOptions::default()).await.unwrap();
+    assert_eq!(timed.error().unwrap().code, "rtdb.owned/capacity-valid-time");
+    let late = session.state_mut().execute_tx(vec![rule(&other)], AutonomousTxOptions::default()).await.unwrap();
+    assert_eq!(late.error().unwrap().code, "rtdb.owned/capacity-bootstrap");
+
+    drop(session);
+    stop(&node, driver).await;
+}
+
+#[tokio::test]
 async fn held_owned_range_requires_a_covering_generation() {
     use rtdb_types::OwnedRelation;
 
