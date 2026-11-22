@@ -1040,10 +1040,8 @@ impl OwnedReadSession {
         &self, relation: &rtdb_types::OwnedRelation, id: &rtdb_types::EntityId, valid_at: Option<Timestamp>,
     ) -> Result<Option<QueryCursor>> {
         self.admit_access().await?;
+        self.require_scoped_relation(relation)?;
         if let Some(scope) = &self.historical {
-            if !scope.relations.contains(relation) {
-                return Err(historical_owned_read::unavailable());
-            }
             self.check_point_purge_floor(relation, id, scope.system_time).await?;
         }
         let valid = valid_at.map(|at| rtdb_types::Interval::new(at, at.next()?)).transpose()?;
@@ -1063,16 +1061,16 @@ impl OwnedReadSession {
         rtdb_query::open_owned_point_at_system(Arc::clone(&self.context), &self.owner, relation, id, valid, system).await
     }
 
-    /// Prevents returning point bytes from an older archive or historical cut after an ordered erase.
+    /// Prevents returning bytes from an older archive or historical cut after an ordered erase.
     pub async fn check_point_purge_floor(
         &self, relation: &rtdb_types::OwnedRelation, id: &rtdb_types::EntityId, system: Timestamp,
     ) -> Result<()> {
         self.admit_access().await?;
-        let context = self.historical.as_ref().map_or(&self.context, |scope| &scope.purge_context);
+        let context = self.retained_root_context();
         if rtdb_query::owned_purge_floor(Arc::clone(context), &self.owner, relation, id)
             .await?.is_some_and(|floor| system < floor)
         {
-            return Err(Anomaly::new(AnomalyCategory::Unavailable, "rtdb.owned/read-purged", "The point cut precedes its ordered erase"));
+            return Err(Anomaly::new(AnomalyCategory::Unavailable, "rtdb.owned/read-purged", "The requested cut precedes its ordered erase"));
         }
         self.check()
     }
@@ -1087,8 +1085,9 @@ impl OwnedReadSession {
     ) -> Result<OwnedValidHistory<'a>> {
         self.admit_access().await?;
         let at_head = self.historical.is_none() && system == self.present.system_time;
+        self.require_scoped_relation(relation)?;
         if let Some(scope) = &self.historical {
-            if system != scope.system_time || !scope.relations.contains(relation) {
+            if system != scope.system_time {
                 return Err(historical_owned_read::unavailable());
             }
         } else if !at_head {
@@ -1233,6 +1232,17 @@ impl OwnedReadSession {
     async fn admit_read(&self) -> Result<()> {
         if self.historical.is_some() { return Err(historical_owned_read::unavailable()); }
         self.admit_access().await
+    }
+
+    fn retained_root_context(&self) -> &Arc<QueryContext> {
+        self.historical.as_ref().map_or(&self.context, |scope| &scope.root_context)
+    }
+
+    fn require_scoped_relation(&self, relation: &rtdb_types::OwnedRelation) -> Result<()> {
+        if self.historical.as_ref().is_some_and(|scope| !scope.relations.contains(relation)) {
+            return Err(historical_owned_read::unavailable());
+        }
+        Ok(())
     }
 
     async fn admit_access(&self) -> Result<()> {

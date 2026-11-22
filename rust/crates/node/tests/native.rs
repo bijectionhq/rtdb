@@ -4579,6 +4579,7 @@ async fn merged_held_changes_resume_only_after_whole_visible_commits() {
 
 #[tokio::test]
 async fn derived_owned_root_points_use_the_visible_marker_and_a_closed_scope() {
+    use rtdb_node::{OwnedVersionOrder, OwnedVersionRequest};
     use rtdb_types::{EntityId, Interval, OwnedRelation};
 
     let mut settings = options();
@@ -4638,6 +4639,23 @@ async fn derived_owned_root_points_use_the_visible_marker_and_a_closed_scope() {
     assert!(timeline.next_batch().await.unwrap().is_none());
     assert!(timeline.witness().unwrap().is_none());
     drop(timeline);
+    let versions = |through| OwnedVersionRequest {
+        system: Interval::new(Timestamp::MIN, through).unwrap(),
+        after: 0,
+        scan_limit: 4,
+        result_limit: 4,
+        order: OwnedVersionOrder::Descending,
+    };
+    let through = old.system_time().next().unwrap();
+    assert!(old.versions(&other, &fact, versions(through)).await.is_err());
+    assert!(old.versions(&facts, &fact, versions(second.tx_key().system_time.next().unwrap())).await.is_err());
+    let mut page = old.versions(&facts, &fact, versions(through)).await.unwrap();
+    assert!(page.done && page.witness.is_none());
+    assert_eq!(page.versions.len(), 1);
+    let version = page.versions.pop().unwrap();
+    assert_eq!(version.system_time, old.system_time());
+    assert_eq!(rows(version.timeline).await.len(), 1);
+
     drop(old);
     drop(session);
     stop(&node, driver).await;

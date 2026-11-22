@@ -88,7 +88,7 @@
 -- World writes to a governed root refuse without inherited capacity accounting.
 -- A fresh held read can derive a scoped read-only hold at the actual last visible publication marker.
 -- Each declared relation's retained floor covers both the requested and selected system coordinates.
--- The derived hold shares the original generation and lease and admits point and valid-window reads in its fixed root scope.
+-- The derived hold shares the original generation and lease and admits point, valid-window and version reads in its fixed root scope.
 
 -- A declared fixed-valid Binary and Utf8 identity path journals both old and new covered keys at the authored instant.
 -- A held full-span fixed witness permits intervening relation writes only when every covered journal side lies outside its bounds.
@@ -99,6 +99,7 @@
 -- Held system versions seek both window edges in the relation's ordered change journal and verify its event frontier.
 -- Both directions advance past every scanned source group, including groups with no change to the requested identity.
 -- A placed read can receive a conservative relation witness after rendering the complete version page.
+-- A historical hold uses the original journal to certify version pages through its selected cut and issues no commit evidence.
 -- Each admitted version resolves the complete valid timeline at that revision on the same pinned physical catalog.
 -- An owned path declaration is maintained from the ordered owner's private catalog.
 -- An owned unique declaration starts before any relation data and admits one Binary key per row.

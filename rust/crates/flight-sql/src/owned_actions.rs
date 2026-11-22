@@ -731,7 +731,7 @@ impl Service {
         let order = if descending.value(0) { OwnedVersionOrder::Descending } else { OwnedVersionOrder::Ascending };
         let request = OwnedVersionRequest { system, after, scan_limit, result_limit, order };
         let page = held.snapshot.versions(&relation, &id, request).await.map_err(status)?;
-        let present = held.snapshot.present().system_time;
+        let present = held.snapshot.system_time();
         let _framing = call.reserve(wire::mul(page.versions.len() + 1, 512)?)?;
         let header_charge = call.reserve(64)?;
         let mut header = Vec::with_capacity(35);

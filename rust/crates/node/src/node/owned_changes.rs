@@ -294,7 +294,7 @@ impl OwnedReadSession {
         } = request;
         if relation.world().is_some()
             || relation.is_world_catalog()
-            || system.upper() > self.present.system_time.next()?
+            || system.upper() > self.system_time().next()?
             || !(1..=OWNED_CHANGE_PAGE_GROUPS).contains(&scan_limit)
             || !(1..=scan_limit).contains(&result_limit)
         {
@@ -303,8 +303,10 @@ impl OwnedReadSession {
                 "Versions require a system window at or before the held cut and up to 128 groups",
             ));
         }
-        self.admit_read().await?;
-        let database = self.context.catalog.database(&self.database)?;
+        self.admit_access().await?;
+        self.require_scoped_relation(relation)?;
+        let journal_context = self.retained_root_context();
+        let database = journal_context.catalog.database(&self.database)?;
         let [snapshot] = database.partitions.as_slice() else {
             return Err(change_feed_uncovered());
         };
@@ -325,29 +327,22 @@ impl OwnedReadSession {
             return Ok(page);
         }
 
-        page.floor = rtdb_query::owned_purge_floor(
-            Arc::clone(&self.context),
-            &self.owner,
-            relation,
-            id,
-        )
-        .await?
-        .unwrap_or(Timestamp::MIN);
-        if let Some(journal) = self
-            .covered_journal(snapshot, relation, self.present.system_time)
-            .await?
-        {
-            if journal.floor.through_events != 0 {
-                page.floor = page.floor.max(journal.floor.committed_at);
-            }
-            if system.lower() < page.floor {
-                return Err(Anomaly::new(
-                    AnomalyCategory::Unavailable,
-                    "rtdb.owned/version-floor",
-                    "The requested system window precedes the certified owned history floor",
-                )
-                .with_context("history-floor-micros", page.floor.0.into()));
-            }
+        let purge_floor = rtdb_query::owned_purge_floor(
+            Arc::clone(journal_context), &self.owner, relation, id,
+        ).await?;
+        let journal = self.covered_journal(snapshot, relation, self.present.system_time).await?;
+        let history_floor = journal.as_ref()
+            .filter(|journal| journal.floor.through_events != 0)
+            .map(|journal| journal.floor.committed_at);
+        page.floor = purge_floor.max(history_floor).unwrap_or(Timestamp::MIN);
+        if system.lower() < page.floor {
+            return Err(Anomaly::new(
+                AnomalyCategory::Unavailable,
+                "rtdb.owned/version-floor",
+                "The requested system window precedes the certified owned history floor",
+            ).with_context("history-floor-micros", page.floor.0.into()));
+        }
+        if let Some(journal) = journal {
             self.require_journal_head(relation, journal.head_revision, journal.head)
                 .await?;
             let first = self
@@ -374,7 +369,7 @@ impl OwnedReadSession {
             {
                 self.check()?;
                 let entry = read_owned_change_entry(
-                    Arc::clone(&self.context),
+                    Arc::clone(journal_context),
                     &self.owner,
                     relation,
                     current,
@@ -512,7 +507,7 @@ impl OwnedReadSession {
             return Err(change_feed_uncovered());
         }
         let entry =
-            read_owned_change_entry(Arc::clone(&self.context), &self.owner, relation, 0).await?;
+            read_owned_change_entry(Arc::clone(self.retained_root_context()), &self.owner, relation, 0).await?;
         if entry.value != Value::Null
             || entry.system_time != floor.committed_at
             || entry.through_events != floor.through_events
@@ -595,7 +590,7 @@ impl OwnedReadSession {
         head: OwnedJournalHeader,
     ) -> Result<()> {
         let entry =
-            read_owned_change_entry(Arc::clone(&self.context), &self.owner, relation, revision)
+            read_owned_change_entry(Arc::clone(self.retained_root_context()), &self.owner, relation, revision)
                 .await?;
         if entry.system_time != head.committed_at
             || entry.through_events != head.through_events
@@ -611,7 +606,7 @@ impl OwnedReadSession {
         relation: &OwnedRelation,
         revision: i64,
     ) -> Result<OwnedJournalHeader> {
-        read_owned_journal_header(Arc::clone(&self.context), &self.owner, relation, revision).await
+        read_owned_journal_header(Arc::clone(self.retained_root_context()), &self.owner, relation, revision).await
     }
 }
 
