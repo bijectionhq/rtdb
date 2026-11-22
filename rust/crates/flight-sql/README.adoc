@@ -281,6 +281,7 @@ Its two columns are `_id: Utf8` for the path name and `columns: List<Utf8>` for 
 The key consists of distinct stored columns and ends with `_id`.
 The relation must already exist in the authenticated owner's namespace.
 A successful declaration returns the same transaction-key Arrow row as Create.
+Ordered and search path declarations can be repeated with the same complete name, owner relation and columns.
 The declaration is immutable and private to the owner's index catalog.
 Index maintenance builds the generation after declaration.
 

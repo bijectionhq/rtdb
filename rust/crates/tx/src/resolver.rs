@@ -788,11 +788,34 @@ impl<'a> OpenTransaction<'a> {
         if snapshot.contains_table(&catalog) {
             let context = self.context.query_context(snapshot, self.tx_key().system_time, &self.options.default_tz, self.trace_parent)?;
             if let Some(mut existing) = rtdb_query::open_owned_path_catalog(context, &catalog, Some(name.name())).await? {
+                let different = || Anomaly::new(AnomalyCategory::Conflict, "rtdb.owned/path-exists", "Owned path name has a different declaration");
+                let mut found = false;
                 while let Some(batch) = existing.next_batch().await? {
-                    if batch.batch().num_rows() != 0 {
-                        return Err(Anomaly::new(AnomalyCategory::Conflict, "rtdb.owned/path-exists", "Owned path name already exists"));
+                    let batch = batch.batch();
+                    for row in 0..batch.num_rows() {
+                        if found { return Err(different()); }
+                        let cell = |name| {
+                            let (index, field) = batch.schema_ref().column_with_name(name).ok_or_else(different)?;
+                            let array = batch.column(index).as_ref();
+                            let bytes = rtdb_columnar::estimate_read_value_bytes(field, array, row)?;
+                            let _charge = self.context.memory.reserve(bytes.checked_mul(2).and_then(|n| n.checked_add(4096)).ok_or_else(overflow)?)?;
+                            rtdb_columnar::read_value(field, array, row)
+                        };
+                        let matches_text = |key, expected: &str| -> Result<bool> {
+                            Ok(matches!(cell(key)?, Value::Utf8(text) if text == expected))
+                        };
+                        let Value::List(stored_columns) = cell("columns")? else { return Err(different()); };
+                        if !matches_text("_id", name.name())? || !matches_text("schema_name", &target.schema)?
+                            || !matches_text("table_name", &target.table)?
+                            || stored_columns.len() != columns.len()
+                            || !stored_columns.iter().zip(columns).all(|(value, expected)| matches!(value, Value::Utf8(column) if column == expected))
+                        {
+                            return Err(different());
+                        }
+                        found = true;
                     }
                 }
+                if found { return Ok(()); }
             }
         }
         let document = StructFields::from([
