@@ -531,6 +531,9 @@ fn take_arrow_rows<'a>(
                 let null = array.data_type() == &DataType::Null;
                 let absent = null && field.is_nullable() && logical.as_ref() != Some(&LogicalType::Nothing);
                 keep_selection |= nested_layout(array.data_type()) || (null && !absent);
+                if array.is_null(row) && matches!(array.data_type(), DataType::Utf8 | DataType::LargeUtf8 | DataType::Binary | DataType::LargeBinary) {
+                    keep_selection |= flat_copy_bytes(field, array.as_ref(), row)? != 0;
+                }
                 let vector = (!absent).then_some((array, field, logical));
                 (0, row, vector, Some(&batch._reservation))
             }

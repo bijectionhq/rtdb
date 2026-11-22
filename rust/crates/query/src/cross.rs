@@ -197,6 +197,33 @@ mod tests {
         assert_eq!(context.memory.used_bytes(), 0);
     }
 
+    #[test]
+    fn cross_join_repeats_null_cells_without_their_hidden_binary_bytes() {
+        use arrow_array::{BinaryArray, Int64Array, RecordBatch};
+        use arrow_buffer::{Buffer, NullBuffer, OffsetBuffer};
+        use arrow_schema::{DataType, Field, Schema};
+        use crate::columnar::Column;
+
+        let context = context(1);
+        let hidden = 1 << 20;
+        let bytes = BinaryArray::new(OffsetBuffer::new(vec![0, hidden as i32].into()),
+            Buffer::from_vec(vec![b'x'; hidden]), Some(NullBuffer::new_null(1)));
+        let left = RecordBatch::try_new(Arc::new(Schema::new(vec![Field::new("bytes", DataType::Binary, true)])), vec![Arc::new(bytes)]).unwrap();
+        let right = RecordBatch::try_new(Arc::new(Schema::new(vec![Field::new("number", DataType::Int64, false)])), vec![Arc::new(Int64Array::from(vec![0; 8]))]).unwrap();
+        let left = ColumnBatch::from_owned(rtdb_columnar::OwnedBatch::new(left, &context.memory).unwrap()).unwrap();
+        let right = ColumnBatch::from_owned(rtdb_columnar::OwnedBatch::new(right, &context.memory).unwrap()).unwrap();
+        let result = ColumnBatch::cross(&left, &right, 8, &context).unwrap();
+        let Column::Selected(_) = &result.columns[0] else { panic!("Expected selected null cells"); };
+        drop(left);
+        for row in 0..result.len {
+            assert_eq!(result.columns[0].value(row).unwrap(), Value::Null);
+        }
+        let ty = rtdb_types::LogicalType::Scalar(rtdb_types::ScalarType::Binary).maybe();
+        let field = rtdb_columnar::to_field("bytes", &ty).unwrap();
+        let (array, _reservation) = crate::columnar::relayout_output(&result.columns[0], &ty, &field, &context.memory).unwrap().unwrap();
+        assert!(array.as_any().downcast_ref::<BinaryArray>().unwrap().value_data().is_empty());
+    }
+
     #[tokio::test]
     async fn empty_cross_pages_are_emitted_but_absent_left_still_advances_first_right_page() {
         let context = context(1);
