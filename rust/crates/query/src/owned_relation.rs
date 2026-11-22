@@ -131,6 +131,17 @@ pub async fn open_owned_capacity_point(
     open_owned_table_point(context, relation.capacity_table(owner), id.iid(), Some(id), None, Some(columns)).await
 }
 
+/// Exact identity probe on a hosted writer's admitted ordinary control table.
+pub async fn open_hosted_control_point(
+    context: Arc<QueryContext>, table: TableRef, id: &EntityId,
+) -> Result<Option<QueryCursor>> {
+    if table.schema != "public" || !table.table.starts_with("bj_") || !matches!(id, EntityId::String(_)) {
+        return Err(Anomaly::incorrect("rtdb.hosted/control", "Invalid hosted control point"));
+    }
+    let valid = Interval::new(Timestamp(0), Timestamp::MAX)?;
+    open_owned_table_point(context, table, id.iid(), Some(id), Some(valid), Some(&["_valid_from", "_valid_to"]), false).await
+}
+
 pub async fn open_owned_relation_schema(
     context: Arc<QueryContext>, owner: &str, relation: &OwnedRelation,
 ) -> Result<Option<QueryCursor>> {

@@ -1,11 +1,11 @@
 use rtdb_types::StructFields;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use rtdb_columnar::MemoryBudget;
-use rtdb_format::generated::xtdb::log::proto::ResolvedTx;
+use rtdb_format::{data::StoredOperation, generated::xtdb::log::proto::ResolvedTx};
 use rtdb_index::{IndexBatch, StagedWrite, TableWrite};
-use rtdb_types::{Anomaly, BlockIndex, PLACED_ATTEMPT_OUTCOME_TABLE, PlacedAttempt, Result, TableRef, Timestamp, TransactionKey, TxId};
+use rtdb_types::{Anomaly, BlockIndex, EventOp, Interval, PLACED_ATTEMPT_OUTCOME_TABLE, PlacedAttempt, Result, TableRef, Timestamp, TransactionKey, TxId, Value};
 
 use crate::{RetainedAnomaly, TransactionResult};
 
@@ -55,13 +55,105 @@ pub fn decode_replica(message: &ResolvedTx, predecessor: Option<TransactionKey>,
         let batch = IndexBatch::from_owned(pages.into_iter().next().ok_or_else(|| invalid("Replica table has no batch"))?)?;
         tables.insert(table, TableWrite::new(StructFields::new(), Some(batch)));
     }
-    if owned_namespace.is_some() && (!result.committed() || message.db_op.is_some() || tables.keys().any(|table| {
-        !TableRef::owned_schema(&table.schema)
-            && !(table.schema == "xt" && matches!(table.table.as_str(), "txs" | "idempotency_receipts" | PLACED_ATTEMPT_OUTCOME_TABLE))
-    })) {
-        return Err(invalid("Resolved owned transaction mixes storage scopes"));
+    if let Some((_, owned_scope)) = owned_namespace {
+        if !result.committed() || message.db_op.is_some() {
+            return Err(invalid("Resolved owned transaction mixes storage scopes"));
+        }
+        let controls: Vec<_> = tables
+            .iter()
+            .filter(|(table, _)| {
+                !TableRef::owned_schema(&table.schema)
+                    && !(table.schema == "xt"
+                        && matches!(
+                            table.table.as_str(),
+                            "txs" | "idempotency_receipts" | PLACED_ATTEMPT_OUTCOME_TABLE
+                        ))
+            })
+            .collect();
+        if !controls.is_empty() {
+            let Some(attempt) = placed_attempt.filter(|_| owned_scope == (false, None)) else {
+                return Err(invalid(
+                    "Resolved hosted controls require one placed owned root",
+                ));
+            };
+            verify_hosted_controls(&tables, &controls, attempt, key, memory)?;
+        }
     }
     Ok(ReplayedTransaction { writes: StagedWrite::new(key, predecessor, block, tables)?, result, placed_attempt })
+}
+
+fn verify_hosted_controls(
+    tables: &BTreeMap<TableRef, TableWrite>,
+    controls: &[(&TableRef, &TableWrite)],
+    attempt: PlacedAttempt,
+    key: TransactionKey,
+    memory: &Arc<MemoryBudget>,
+) -> Result<()> {
+    use crate::hosted_control::{CONTROL_TABLES, admits_name};
+
+    let mismatch =
+        || invalid("Resolved hosted controls differ from their ordered attempt inventory");
+    let outcome = tables
+        .get(&TableRef::new("xt", PLACED_ATTEMPT_OUTCOME_TABLE))
+        .and_then(TableWrite::batch)
+        .filter(|batch| batch.len() == 1)
+        .ok_or_else(mismatch)?;
+    let _decode = memory.reserve(
+        outcome
+            .arrow()
+            .get_array_memory_size()
+            .checked_mul(4)
+            .and_then(|bytes| bytes.checked_add(8192))
+            .ok_or_else(mismatch)?,
+    )?;
+    let event = outcome.view().read_event(0)?;
+    let StoredOperation::Put(proof) = event.operation else {
+        return Err(mismatch());
+    };
+    if event.system_from != key.system_time
+        || !matches!(proof.get("_id"), Some(Value::Utf8(id)) if id == &attempt.outcome_key())
+        || proof.get("tx_id") != Some(&Value::I64(key.tx_id.0))
+    {
+        return Err(mismatch());
+    }
+    let Some(Value::List(names)) = proof.get(CONTROL_TABLES) else {
+        return Err(mismatch());
+    };
+    if names.len() != controls.len() || names.len() > 32 {
+        return Err(mismatch());
+    }
+    let mut expected = BTreeSet::new();
+    for name in names {
+        let Value::Utf8(name) = name else {
+            return Err(mismatch());
+        };
+        if !admits_name(name) || !expected.insert(name.as_str()) {
+            return Err(mismatch());
+        }
+    }
+    let valid = Interval::new(Timestamp(0), Timestamp::MAX)?;
+    for (table, rows) in controls {
+        if table.schema != "public" || !expected.remove(table.table.as_str()) {
+            return Err(mismatch());
+        }
+        let batch = rows
+            .batch()
+            .filter(|batch| !batch.is_empty())
+            .ok_or_else(mismatch)?;
+        for index in 0..batch.len() {
+            let row = batch.header(index)?;
+            if row.op != EventOp::Put
+                || row.system_from != key.system_time
+                || row.valid_time != valid
+            {
+                return Err(mismatch());
+            }
+        }
+    }
+    if !expected.is_empty() {
+        return Err(mismatch());
+    }
+    Ok(())
 }
 
 fn decode_error(bytes: &[u8], memory: &Arc<MemoryBudget>) -> Result<RetainedAnomaly> {

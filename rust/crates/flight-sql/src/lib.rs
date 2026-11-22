@@ -13,7 +13,7 @@ mod state;
 mod ticket;
 mod wire;
 
-pub use config::{FORWARDED_PEER_HEADER, FlightConfig, FlightPeerVerifier};
+pub use config::{FORWARDED_PEER_HEADER, FlightConfig, FlightPeerVerifier, HostedControlConfig};
 pub use server::{ServerDriver, ServerHandle, ServerStatus};
 
 mod owned_actions;

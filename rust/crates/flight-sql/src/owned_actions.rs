@@ -31,6 +31,7 @@ pub(crate) const DECLARE_OWNED_SEARCH_PATH_V1: &str = "rtdb.owned.DeclareSearchP
 pub(crate) const DECLARE_OWNED_RELATION_V1: &str = "rtdb.owned.DeclareRelation.v1";
 pub(crate) const DECLARE_OWNED_PATH_V1: &str = "rtdb.owned.DeclarePath.v1";
 pub(crate) const CREATE_OWNED_V1: &str = "rtdb.owned.Create.v1";
+pub(crate) const COMMIT_HOSTED_V1: &str = "rtdb.owned.CommitHosted.v1";
 pub(crate) const COMMIT_OWNED_V1: &str = "rtdb.owned.Commit.v1";
 pub(crate) const COMMIT_OWNED_V2: &str = "rtdb.owned.Commit.v2";
 pub(crate) const COMMIT_OWNED_V4: &str = "rtdb.owned.Commit.v4";
@@ -428,12 +429,19 @@ impl Service {
 
     pub(crate) async fn commit_owned_witnessed_action(&self, call: &Call, body: &[u8], erase_allowed: bool) -> Result<ActionResult, Status> {
         if !self.0.config.owned_native_actions { return Err(unsupported()); }
+        let (witnesses, body, _framing) = self.owned_witness_prefix(call, body, erase_allowed)?;
+        self.commit_owned(call, body, CommitFormat::Grouped, witnesses, erase_allowed).await
+    }
+
+    fn owned_witness_prefix<'a>(
+        &self, call: &Call, body: &'a [u8], allow_empty: bool,
+    ) -> Result<(Witnesses, &'a [u8], Arc<MemoryReservation>), Status> {
         let (length, mut body) = body.split_first_chunk::<2>().ok_or_else(|| invalid("Owned commit has no witness count"))?;
         let count = usize::from(u16::from_be_bytes(*length));
-        if count > MAX_RANGE_WITNESSES || (count == 0 && !erase_allowed) {
+        if count > MAX_RANGE_WITNESSES || (count == 0 && !allow_empty) {
             return Err(invalid("Invalid owned commit range witness count"));
         }
-        let _framing = call.reserve(count * 512)?;
+        let framing = call.reserve(count * 512)?;
         let mut witnesses = Vec::with_capacity(count);
         for _ in 0..count {
             let (handle, tail) = body.split_first_chunk::<16>().ok_or_else(|| invalid("Owned range witness has no held handle"))?;
@@ -447,7 +455,70 @@ impl Service {
                 .map(|witness| witness.evidence.clone()).ok_or_else(|| Status::not_found("Unknown owned range witness"))?;
             witnesses.push((held, witness));
         }
-        self.commit_owned(call, body, CommitFormat::Grouped, witnesses, erase_allowed).await
+        Ok((witnesses, body, framing))
+    }
+
+    pub(crate) async fn commit_hosted_controls_action(&self, call: &Call, body: &[u8]) -> Result<ActionResult, Status> {
+        let policy = self.0.config.hosted_controls.as_ref().ok_or_else(unsupported)?;
+        if !self.0.config.owned_native_actions || call.session.placed_database() != Some(call.database.as_str())
+            || call.session.caller.principal.user_id() != Some(policy.owner.as_str())
+            || matches!(call.session.caller.owner, crate::state::Owner::Anonymous)
+        {
+            return Err(Status::permission_denied("Hosted controls require the installed placed writer"));
+        }
+        let (witnesses, body, _witness_charge) = self.owned_witness_prefix(call, body, true)?;
+        let (deadline, body) = body.split_first_chunk::<8>().ok_or_else(|| invalid("Hosted commit has no deadline"))?;
+        let deadline = Timestamp(i64::from_be_bytes(*deadline));
+        let (length, body) = body.split_first_chunk::<4>().ok_or_else(|| invalid("Hosted commit has no fact group length"))?;
+        let (facts, controls) = body.split_at_checked(u32::from_be_bytes(*length) as usize)
+            .ok_or_else(|| invalid("Hosted fact group stream is truncated"))?;
+        let _framing = call.reserve(MAX_COMMIT_GROUPS * 1024)?;
+        let facts = owned_groups(facts, true)?;
+        let controls = owned_groups(controls, true)?;
+        if facts.len() + controls.len() > MAX_COMMIT_GROUPS
+            || controls.iter().any(|(relation, _)| !policy.relations.contains(relation.name()))
+        {
+            return Err(Status::permission_denied("Hosted control targets are outside the installed allowlist"));
+        }
+        let connection = self.connection(call, &call.database).await?;
+        let native = connection.borrow().await?;
+        require_idle(&native)?;
+        let scope = native.placed_history().map_err(status)?
+            .ok_or_else(|| Status::failed_precondition("Hosted controls require live ordered placement"))?;
+        drop(native);
+
+        let mut rows_left = MAX_GROUPED_COMMIT_ROWS;
+        let mut writes = vec![TxOp::OwnedDeadline { until: deadline }];
+        let _facts = self.decode_owned_commit_groups(call, facts, &mut writes, &mut rows_left, false)?;
+        let mut held = Vec::with_capacity(controls.len());
+        for (relation, arrow) in controls {
+            let batch = request_batch(call, arrow)?;
+            let rows = batch.batch().num_rows();
+            let schema = batch.batch().schema_ref();
+            let exact_type = |name, kind| schema.field_with_name(name).is_ok_and(|field| field.data_type() == &kind);
+            let unique = schema.fields().iter().map(|field| field.name()).collect::<BTreeSet<_>>();
+            if rows == 0 || unique.len() != schema.fields().len() || schema.fields().len() > 130
+                || !exact_type("_id", DataType::Utf8) || !exact_type("_expected_micros", DataType::Int64)
+            {
+                return Err(invalid("Hosted controls require distinct fields, Utf8 IDs and explicit Int64 expectations"));
+            }
+            rows_left = rows_left.checked_sub(rows).ok_or_else(|| invalid("Hosted commit exceeds its total row limit"))?;
+            let reservation = call.reserve(wire::mul(rows, std::mem::size_of::<TxOp>() + 512)?)?;
+            writes.try_reserve_exact(rows).map_err(|_| Status::resource_exhausted("Hosted control allocation failed"))?;
+            let (rows, documents) = upload::owned_documents(batch.batch(), self)?;
+            for mut row in rows {
+                strip_owned_absence(&mut row)?;
+                let expected = match row.remove("_expected_micros") {
+                    Some(Value::I64(time)) => Some(Timestamp(time)),
+                    Some(Value::Null) => None,
+                    _ => return Err(invalid("Hosted control expectation must be Int64 or null")),
+                };
+                let control = rtdb_tx::HostedControlWrite::new(relation.clone(), scope, expected, row).map_err(status)?;
+                writes.push(TxOp::HostedControl(control));
+            }
+            held.push((reservation, documents));
+        }
+        self.owned_write_reply_with_witnesses(call, writes, witnesses).await
     }
 
     async fn commit_owned(&self, call: &Call, body: &[u8], format: CommitFormat, witnesses: Witnesses, erase_allowed: bool) -> Result<ActionResult, Status> {
@@ -463,21 +534,29 @@ impl Service {
             CommitFormat::Grouped => MAX_GROUPED_COMMIT_ROWS,
         };
         let mut writes = vec![TxOp::OwnedDeadline { until: deadline }];
+        let _rows = self.decode_owned_commit_groups(call, groups, &mut writes, &mut rows_left, erase_allowed)?;
+        self.owned_write_reply_with_witnesses(call, writes, witnesses).await
+    }
+
+    fn decode_owned_commit_groups(
+        &self, call: &Call, groups: Vec<(OwnedRelation, &[u8])>, writes: &mut Vec<TxOp>,
+        rows_left: &mut usize, erase_allowed: bool,
+    ) -> Result<Vec<(Arc<MemoryReservation>, Arc<MemoryReservation>)>, Status> {
         let mut retained = Vec::with_capacity(groups.len());
         for (relation, arrow) in groups {
             let batch = request_batch(call, arrow)?;
             let rows = batch.batch().num_rows();
-            rows_left = rows_left.checked_sub(rows)
+            *rows_left = rows_left.checked_sub(rows)
                 .ok_or_else(|| invalid("Owned commit exceeds its total row limit"))?;
             let operations = wire::mul(rows, 2)?;
             let operations_charge = call.reserve(wire::mul(operations, std::mem::size_of::<TxOp>() + 512)?)?;
             writes.try_reserve_exact(operations)
                 .map_err(|_| Status::resource_exhausted("Owned commit operation allocation failed"))?;
             let (rows, documents_charge) = upload::owned_documents(batch.batch(), self)?;
-            self.append_owned_commit_group(&mut writes, &relation, rows, erase_allowed)?;
+            self.append_owned_commit_group(writes, &relation, rows, erase_allowed)?;
             retained.push((operations_charge, documents_charge));
         }
-        self.owned_write_reply_with_witnesses(call, writes, witnesses).await
+        Ok(retained)
     }
 
     fn append_owned_commit_group(

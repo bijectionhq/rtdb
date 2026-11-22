@@ -79,6 +79,7 @@ impl SourceTransaction {
                     (relation.name().len().checked_add(schema.retained_bytes()).ok_or_else(overflow)?, None, 0),
                 Operation::Public(TxOp::OwnedDeclarePath { relation, name, columns }) =>
                     (owned_path_bytes(relation, name, columns)?, None, 0),
+                Operation::Public(TxOp::HostedControl(control)) => (control.retained_bytes()?, None, 0),
                 Operation::Public(TxOp::OwnedDeadline { .. } | TxOp::OwnedCheckWorldScope { .. }) => (0, None, 0),
                 Operation::Public(TxOp::OwnedDeclareFixedRange { relation, rule }) =>
                     (relation.name().len() + rule.path.capacity() + rule.column.capacity(), None, 0),
@@ -305,6 +306,7 @@ impl SourceTransaction {
                     relation.name().len().checked_add(schema.retained_bytes()).ok_or_else(overflow)?,
                 Operation::Public(TxOp::OwnedDeclarePath { relation, name, columns }) =>
                     owned_path_bytes(relation, name, columns)?,
+                Operation::Public(TxOp::HostedControl(control)) => control.retained_bytes()?,
                 Operation::Public(TxOp::OwnedDeadline { .. } | TxOp::OwnedCheckWorldScope { .. }) => 0,
                 Operation::Public(TxOp::OwnedDeclareFixedRange { relation, rule }) =>
                     relation.name().len() + rule.path.capacity() + rule.column.capacity(),
@@ -467,6 +469,10 @@ fn operation_value<'a>(operation: &'a Operation, memory: &Arc<MemoryBudget>) -> 
         Operation::Public(TxOp::OwnedCheckWorldScope { scope }) => {
             body.insert("scope".into(), Value::Binary(scope.encode().to_vec()));
             "rtdb-owned-check-world-scope-v1"
+        }
+        Operation::Public(TxOp::HostedControl(control)) => {
+            body = control.body();
+            "rtdb-hosted-control-v1"
         }
         Operation::Public(TxOp::OwnedDeadline { until }) => {
             body.insert("until".into(), Value::I64(until.0));
@@ -1085,6 +1091,7 @@ impl SourceOperationReader<'_> {
             "rtdb-owned-relation-v1" => &["relation", "schema"],
             "rtdb-owned-capacity-v1" => &["relation", "column", "prefix_bytes", "cap"],
             "rtdb-owned-path-v1" => &["relation", "name", "columns"],
+            "rtdb-hosted-control-v1" => &["relation", "scope", "expected", "document"],
             "rtdb-owned-deadline-v1" => &["until"],
             "rtdb-owned-fixed-range-v1" => &["relation", "rule"],
             "rtdb-owned-check-world-scope-v1" => &["scope"],
@@ -1165,6 +1172,19 @@ impl SourceOperationReader<'_> {
             "rtdb-owned-check-world-scope-v1" => {
                 let Value::Binary(scope) = value("scope")? else { return Err(invalid("Owned world witness has no placement scope")); };
                 TxOp::OwnedCheckWorldScope { scope: rtdb_types::PlacedAttemptScope::decode(&scope)? }
+            }
+            "rtdb-hosted-control-v1" => {
+                let (Value::Utf8(relation), Value::Binary(scope), expected, Value::Struct(document)) =
+                    (value("relation")?, value("scope")?, value("expected")?, value("document")?)
+                else { return Err(invalid("Hosted control has invalid fields")); };
+                let expected = match expected {
+                    Value::I64(time) => Some(Timestamp(time)),
+                    Value::Null => None,
+                    _ => return Err(invalid("Hosted control has an invalid expectation")),
+                };
+                TxOp::HostedControl(crate::HostedControlWrite::new(
+                    rtdb_types::OwnedRelation::new(relation)?, rtdb_types::PlacedAttemptScope::decode(&scope)?, expected, document,
+                )?)
             }
             "rtdb-owned-deadline-v1" => {
                 let Value::I64(until) = value("until")? else { return Err(invalid("Owned deadline is not a microsecond timestamp")); };
