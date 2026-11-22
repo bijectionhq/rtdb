@@ -1420,6 +1420,33 @@ def verify_checkpoint_metadata_retention(args, scratch):
     verify_lean_model(args, scratch, path, "checkpoint-metadata-retention", controls, 4)
 
 
+def verify_repair_archive_custody(args, scratch):
+    path = Path("verification/lean/RepairArchiveCustody.lean")
+    controls = {
+        "drop-repair": (
+            "slots.destination = some archive ∨ slots.repair = some archive",
+            "slots.destination = some archive",
+            ["a_region_retains_its_repair"],
+        ),
+        "admit-after-close": (
+            "(∀ archive, Covers slots archive → ¬ state.closed archive) →",
+            "(∀ archive, Covers slots archive → True) →",
+            ["transitions_preserve_archive_custody"],
+        ),
+        "erase-held-archive": (
+            "(∀ region slots, state.regions region = some slots → ¬ Covers slots archive) →",
+            "(∀ region slots, state.regions region = some slots → True) →",
+            ["transitions_preserve_archive_custody"],
+        ),
+        "release-before-drain": (
+            "¬ state.reading region → Step state (setRegion state region none)",
+            "True → Step state (setRegion state region none)",
+            ["transitions_preserve_archive_custody"],
+        ),
+    }
+    verify_lean_model(args, scratch, path, "repair-archive-custody", controls, 4)
+
+
 def verify_checkpoint_copy_evidence(args, scratch):
     path = Path("verification/lean/CheckpointCopyEvidence.lean")
     controls = {
@@ -1720,6 +1747,7 @@ def verify_lean(args, scratch):
             verify_checkpoint_metadata_retention(args, scratch)
             verify_checkpoint_source_handoff(args, scratch)
             verify_checkpoint_copy_evidence(args, scratch)
+            verify_repair_archive_custody(args, scratch)
             verify_published_checkpoint(args, scratch)
             verify_checkpoint_table_manifest(args, scratch)
             verify_pack_publication_lean(args, scratch)
@@ -1995,6 +2023,37 @@ TLA_CASES = (
      ('Mutation = "none"', 'Mutation = "publish_early"'), "Safe"),
     ("CheckpointReplayClosure", "checkpoint-replay-closure-copied-file-witness",
      ("INVARIANT Safe", "INVARIANT NeverPublishesAfterSourceLoss"), "NeverPublishesAfterSourceLoss"),
+    ("RepairArchiveCustody", "repair-archive-custody", None, None),
+    ("RepairArchiveCustody", "repair-archive-custody-omit-repair",
+     ('Mutation = "none"', 'Mutation = "drop_repair_hold"'), "Safe"),
+    ("RepairArchiveCustody", "repair-archive-custody-retire-by-destination",
+     ('Mutation = "none"', 'Mutation = "ignore_repair_when_erasing"'), "Safe"),
+    ("RepairArchiveCustody", "repair-archive-custody-admit-closed-archive",
+     ('Mutation = "none"', 'Mutation = "admit_after_retirement"'), "Safe"),
+    ("RepairArchiveCustody", "repair-archive-custody-read-after-close",
+     ('Mutation = "none"', 'Mutation = "read_when_closed"'), "Safe"),
+    ("RepairArchiveCustody", "repair-archive-custody-release-before-drain",
+     ('Mutation = "none"', 'Mutation = "release_before_drain"'), "Safe"),
+    ("RepairArchiveCustody", "repair-archive-custody-source-read-witness",
+     ("INVARIANT Safe", "INVARIANT NeverReadsRepair"), "NeverReadsRepair"),
+    ("RepairArchiveCustody", "repair-archive-custody-debt-witness",
+     ("INVARIANT Safe", "INVARIANT NeverClosesWithProviderDebt"), "NeverClosesWithProviderDebt"),
+    ("RepairArchiveCustody", "repair-archive-custody-unrelated-retirement-witness",
+     ("INVARIANT Safe", "INVARIANT NeverErasesUnrelatedDuringRead"), "NeverErasesUnrelatedDuringRead"),
+    ("RepairArchiveCustody", "repair-archive-custody-drain-settlement-witness",
+     ("INVARIANT Safe", "INVARIANT NeverErasesBothAfterRelease"), "NeverErasesBothAfterRelease"),
+    ("SourceRetirementSettlement", "source-retirement-exact-version", None, None),
+    ("SourceRetirementSettlement", "source-retirement-serialized-path",
+     ('Design = "exact"\n    Mutation = "none"\nINVARIANT Safe',
+      'Design = "serialized"\n    Mutation = "none"\nINVARIANTS Safe NeverCompletesAfterStopWithReplacementHeld'), None),
+    ("SourceRetirementSettlement", "source-retirement-delete-by-current-path",
+     ('Mutation = "none"\nINVARIANT Safe', 'Mutation = "delete_by_current_path"\nINVARIANT ReplacementSurvives'), "ReplacementSurvives"),
+    ("SourceRetirementSettlement", "source-retirement-task-stop-is-not-settlement",
+     ('Mutation = "none"\nINVARIANT Safe', 'Mutation = "task_stop_settles_io"\nINVARIANT SettlementMeansOldVersionAbsent'), "SettlementMeansOldVersionAbsent"),
+    ("SourceRetirementSettlement", "source-retirement-late-completion-witness",
+     ("INVARIANT Safe", "INVARIANT NeverCompletesAfterStopWithReplacementHeld"), "NeverCompletesAfterStopWithReplacementHeld"),
+    ("SourceRetirementSettlement", "source-retirement-replacement-witness",
+     ("INVARIANT Safe", "INVARIANT NeverSettlesThenAdmitsReplacement"), "NeverSettlesThenAdmitsReplacement"),
     ("CheckpointCopyEvidence", "checkpoint-copy-evidence", None, None),
     ("CheckpointCopyEvidence", "checkpoint-copy-trust-only-version-token",
      ('Mutation = "none"\nINVARIANT Safe', 'Mutation = "trust_version_token"\nINVARIANT PlanMatchesBody'), "PlanMatchesBody"),
@@ -2491,6 +2550,17 @@ def verify_apalache(args, scratch):
     check_apalache(args, scratch, "CheckpointReplayClosure", "checkpoint-replay-closure-omit-artefact",
                    "PublicationIsComplete", 10, ('Mutation = "none"', 'Mutation = "omit_artefact"'),
                    "a replay copy is published without the required shared artefact")
+    check_apalache(args, scratch, "RepairArchiveCustody", "repair-archive-custody", "Safe", 12)
+    check_apalache(args, scratch, "RepairArchiveCustody", "repair-archive-custody-retire-by-destination",
+                   "RetainedArchivesSurvive", 12, ('Mutation = "none"', 'Mutation = "ignore_repair_when_erasing"'),
+                   "erasure ignores the region's independent source archive")
+    check_apalache(args, scratch, "RepairArchiveCustody", "repair-archive-custody-admit-closed-archive",
+                   "AdmissionUsesOpenArchives", 12, ('Mutation = "none"', 'Mutation = "admit_after_retirement"'),
+                   "a new region admits an already retired archive")
+    check_apalache(args, scratch, "SourceRetirementSettlement", "source-retirement-exact-version", "Safe", 9)
+    check_apalache(args, scratch, "SourceRetirementSettlement", "source-retirement-delete-by-current-path",
+                   "ReplacementSurvives", 9, ('Mutation = "none"', 'Mutation = "delete_by_current_path"'),
+                   "a delayed delete resolves the newly published version by its path")
     check_apalache(args, scratch, "CheckpointCopyEvidence", "checkpoint-copy-evidence", "Safe", 5)
     check_apalache(args, scratch, "CheckpointCopyEvidence", "checkpoint-copy-trust-only-version-token",
                    "PlanMatchesBody", 5, ('Mutation = "none"', 'Mutation = "trust_version_token"'),
@@ -3599,6 +3669,77 @@ def verify_checkpoint_metadata_replay(args, source):
     print(f"{label}: startup metadata survived collection until provider drain, ignoring the hold failed")
 
 
+def verify_repair_archive_replay(args, source):
+    env = os.environ | {
+        "CARGO_TARGET_DIR": os.environ.get("CARGO_TARGET_DIR", str(ROOT / "target")),
+        "CARGO_PROFILE_TEST_DEBUG": "0",
+    }
+    multi = ["cargo", "test", "--locked", "-p", "rtdb-multi", "--features", "dynamodb"]
+    multi_lib = [*multi, "--lib"]
+    cell = [*multi, "--test", "cell"]
+    directory = ["cargo", "test", "--locked", "-p", "rtdb-directory", "--features", "dynamodb", "--lib"]
+    custody = "archive_custody::tests::source_repair_and_capture_destination_have_independent_archive_custody"
+    repaired = "restoring_the_current_archive_preserves_the_ordered_tail_and_authority"
+    local = "archive::tests::a_capture_can_inherit_only_continuously_retained_source_metadata"
+    cancel = "store::tests::an_inflight_local_read_retains_the_maintenance_witness_after_cancellation"
+    archive = "rust/crates/multi/src/archive.rs"
+    guard = "rust/crates/directory/src/archive_custody.rs"
+    cases = (
+        ("directory", directory, custody, None),
+        ("recapture-and-transfer", cell, repaired, None),
+        ("local-lock", multi_lib, local, None),
+        ("cancelled-worker", multi_lib, cancel, None),
+        ("omit-source-slot", directory, custody, (
+            guard, " || matches!(repair, Some(id) if id == capture)", "",
+            "the repair source must be kept independently of the capture destination",
+        )),
+        ("allow-closed-read", directory, custody, (
+            guard, "    covered && !closed\n", "    covered\n",
+            "a closed repair region cannot issue provider reads",
+        )),
+        ("recapture-without-source-slot", cell, repaired, (
+            archive, "archive: Some(operation),\n                repair_archive,",
+            "archive: Some(operation),\n                repair_archive: None,",
+            "recapturing a repaired checkpoint must open the admitted source archive",
+        )),
+        ("transfer-without-source-admission", cell, repaired, (
+            archive, "ArchivedCheckpoint::load(&record, keys, owner, io).await?",
+            "ArchivedCheckpoint::load(&record, keys, Uuid::nil(), io).await?",
+            "a cross-cell move uses its original repair archive admission",
+        )),
+        ("no-source-maintenance-lock", multi_lib, local, (
+            archive, "let maintenance = storage.try_local_maintenance()?;",
+            "let maintenance: Option<std::fs::File> = None;",
+            "a local capture must share the source maintenance authority",
+        )),
+        ("cancel-without-provider-witness", multi_lib, cancel, (
+            "rust/crates/storage/src/io_region.rs", "        admission.lifetimes.extend(self.lifetime.iter().cloned());",
+            "",
+            "provider work retains the maintenance witness after its caller is cancelled",
+        )),
+    )
+    for name, cargo, test, control in cases:
+        command = [*cargo, test, "--", "--exact"]
+        label = f"rust-repair-archive-custody-{name}"
+        if not control:
+            checked = run_case(command, source / "rust", args.evidence, label, env)
+            if checked.returncode or f"{test} ... ok" not in checked.stdout or "1 passed; 0 failed" not in checked.stdout:
+                raise ValueError(f"repair custody baseline {name} failed")
+            continue
+        relative, before, after, failure = control
+        path = source / relative
+        original = path.read_bytes()
+        try:
+            replace_once(path, before, after)
+            checked = run_case(command, source / "rust", args.evidence, label, env)
+        finally:
+            path.write_bytes(original)
+        if (checked.returncode != 101 or f"{test} ... FAILED" not in checked.stdout
+            or failure not in checked.stdout or "0 passed; 1 failed" not in checked.stdout):
+            raise ValueError(f"repair custody control {name} missed its declared assertion")
+    print("rust-repair-archive-custody: four replays passed and six controls failed as expected")
+
+
 def verify_checkpoint_copy_publications(args, source):
     env = os.environ | {
         "CARGO_TARGET_DIR": os.environ.get("CARGO_TARGET_DIR", str(ROOT / "target")),
@@ -4225,6 +4366,7 @@ def main():
             verify_checkpoint_metadata_replay(args, source)
             verify_checkpoint_capture_metadata(args, source)
             verify_checkpoint_copy_publications(args, source)
+            verify_repair_archive_replay(args, source)
             verify_delegated_scan_replay(args, source)
             verify_fragment_residence_replay(args, source)
             verify_catalog_replay(args, source)

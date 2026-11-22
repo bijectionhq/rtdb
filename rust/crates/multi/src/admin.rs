@@ -438,8 +438,14 @@ async fn fork_source(directory: &dyn Directory, parent: &str) -> Result<Deployme
     Ok(source)
 }
 
-async fn fork_bucket(storage: &CellStorage, keys: &dyn KeyService, source: &DeploymentRecord) -> Result<crate::reference::Bucket> {
-    let bucket = storage.bucket(rtdb_storage::IoRegion::new()).await?;
+async fn fork_bucket(
+    storage: &CellStorage,
+    keys: &dyn KeyService,
+    source: &DeploymentRecord,
+    maintenance: Option<Arc<std::fs::File>>,
+) -> Result<crate::reference::Bucket> {
+    let io = rtdb_storage::IoRegion::new().child_holding(maintenance.map(|lock| lock as Arc<dyn Send + Sync>));
+    let bucket = storage.bucket(io).await?;
     require_storage_namespaces(source, storage_namespaces(bucket.as_ref(), keys).await?)?;
     Ok(bucket)
 }
@@ -460,8 +466,8 @@ pub async fn fork_into(directory: &dyn Directory, storage: &CellStorage, keys: &
     let original = fork_source(directory, parent).await?;
     if let Some(org) = destination.org { validate_org(org)?; }
     let source = flush_checkpoint(directory, &original, control).await?;
-    let _maintenance = storage.try_local_maintenance()?;
-    let bucket = fork_bucket(storage, keys, &source).await?;
+    let maintenance = storage.try_local_maintenance()?.map(Arc::new);
+    let bucket = fork_bucket(storage, keys, &source, maintenance.clone()).await?;
     fork_with_tail(directory, bucket, keys, &source, destination, None, Vec::new(), 4 << 20).await
 }
 
@@ -472,9 +478,9 @@ pub async fn fork_at_block(directory: &dyn Directory, storage: &CellStorage, key
 }
 
 pub async fn fork_block_into(directory: &dyn Directory, storage: &CellStorage, keys: &dyn KeyService, parent: &str, destination: ForkDestination<'_>, block: i64, grace: Duration) -> Result<DeploymentRecord> {
-    let _maintenance = storage.try_local_maintenance()?;
+    let maintenance = storage.try_local_maintenance()?.map(Arc::new);
     let source = fork_source(directory, parent).await?;
-    let bucket = fork_bucket(storage, keys, &source).await?;
+    let bucket = fork_bucket(storage, keys, &source, maintenance.clone()).await?;
     let age = now_ms() - crate::reference::written_at_ms(bucket.as_ref(), &source.storage_prefix(), block).await?;
     if age >= grace.as_millis() as i64 { return Err(Anomaly::incorrect("rtdb.multi/block-too-old", format!("Block {block} was written {}s ago, beyond the reaper's grace of {}s", age / 1000, grace.as_secs()))); }
     fork_with_tail(directory, bucket, keys, &source, destination, Some(block), Vec::new(), 4 << 20).await
@@ -487,11 +493,11 @@ pub async fn fork_at_time(directory: &dyn Directory, storage: &CellStorage, keys
 }
 
 pub async fn fork_time_into(directory: &dyn Directory, storage: &CellStorage, keys: &dyn KeyService, parent: &str, destination: ForkDestination<'_>, system_time: rtdb_types::Timestamp, grace: Duration, maximum_message_bytes: usize) -> Result<DeploymentRecord> {
-    let _maintenance = storage.try_local_maintenance()?;
+    let maintenance = storage.try_local_maintenance()?.map(Arc::new);
     let source = fork_source(directory, parent).await?;
     let checkpoint = source.checkpoint.ok_or_else(|| Anomaly::incorrect("rtdb.multi/no-checkpoint", format!("{parent} has published no block to fork from")))?;
     if system_time.0 < checkpoint.system_time { return Err(Anomaly::incorrect("rtdb.multi/before-checkpoint", format!("{parent}'s last published block is after that time: fork at a past block instead"))); }
-    let bucket = fork_bucket(storage, keys, &source).await?;
+    let bucket = fork_bucket(storage, keys, &source, maintenance.clone()).await?;
     if now_ms() - crate::reference::written_at_ms(bucket.as_ref(), &source.storage_prefix(), checkpoint.block).await? >= grace.as_millis() as i64 {
         return Err(Anomaly::incorrect("rtdb.multi/block-too-old", format!("{parent}'s last published block is older than the reaper's grace")));
     }
@@ -541,7 +547,7 @@ async fn fork_with_tail(directory: &dyn Directory, bucket: crate::reference::Buc
             source_key
         } else {
             let key = keys.key(&child.key_id()).await?;
-            crate::archive::copy_fork_checkpoint(bucket.clone(), keys, source, &source_key, &child, &key, at_block).await?;
+            crate::archive::copy_fork_checkpoint(bucket.clone(), source, &source_key, &child, &key, at_block).await?;
             key
         };
         if let Some(stream) = &child_stream {
@@ -1153,7 +1159,7 @@ async fn stage_cell_storage(
             return Err(cell_move_conflict(from, to, &staged.name));
         }
         record.storage_regions.insert(region, if local {
-            StorageRegion::Local { archive: None, tracks_ordered_index_pages: true, checkpoint_metadata_from: None, checkpoint_replay_from: None, }
+            StorageRegion::Local { archive: None, repair_archive: None, tracks_ordered_index_pages: true, checkpoint_metadata_from: None, checkpoint_replay_from: None, }
         } else {
             crate::store::remote_storage_region(None, hosted_task.clone())
         });
@@ -1171,9 +1177,9 @@ async fn stage_cell_storage(
         crate::reference::materialize(
             source_bucket.as_ref(), &source.storage_prefix(), target_bucket.as_ref(), &staged.storage_prefix(),
         ).await?;
-        if let Some(archive) = crate::archive::ArchivedCheckpoint::load(source, from.keys, IoRegion::new()).await? {
-            archive.materialize(staged, Arc::clone(&target_bucket)).await?;
-        }
+        crate::archive::materialize_completed_repair(
+            from.directory.as_ref(), from.keys, source, staged, target_bucket.clone(), hosted_task.as_ref(),
+        ).await?;
         if let Some(checkpoint) = staged.checkpoint {
             crate::reference::verify_block_pack(target_bucket.as_ref(), &staged.storage_prefix(), checkpoint.block).await?;
         }

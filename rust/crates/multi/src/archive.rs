@@ -126,24 +126,30 @@ pub(crate) struct ArchivedCheckpoint {
     serving_cipher: Cipher,
 }
 
+/// Select the repair in the same directory observation that authorizes its I/O.
+pub(crate) fn completed_repair(record: &DeploymentRecord) -> Result<Option<&CheckpointRecovery>> {
+    let repair = record.checkpoint_recovery.as_deref().filter(|repair| repair.completed_at_ms.is_some());
+    if let Some(repair) = repair {
+        require_capture_open(record, repair.operation)?;
+    }
+    Ok(repair)
+}
+
 impl ArchivedCheckpoint {
     pub(crate) async fn load(
         record: &DeploymentRecord,
         keys: &dyn KeyService,
+        owner: Uuid,
         region: Arc<IoRegion>,
     ) -> Result<Option<Self>> {
-        let Some(recovery) = record
-            .checkpoint_recovery
-            .as_ref()
-            .filter(|restore| restore.completed_at_ms.is_some())
-        else {
-            return Ok(None);
-        };
+        let Some(recovery) = completed_repair(record)? else { return Ok(None); };
+        if !record.storage_regions.get(&owner).is_some_and(|hold| hold.admits_archive_read(recovery.operation)) {
+            return Err(inconsistent("Opening a repair archive requires its own storage admission"));
+        }
         let archive: CellStorage = serde_json::from_str(&recovery.archive)
             .map_err(|_| inconsistent("Invalid retained archive binding"))?;
         let deployment = record.id.parse::<Uuid>()
             .map_err(|_| inconsistent("Invalid retained archive owner"))?;
-        require_capture_open(record, recovery.operation)?;
         let expected = capture_point(record, deployment, recovery.operation, &recovery.archive)?;
         let bucket = archive.bucket(region).await?;
         let prefix = format!("checkpoint-captures/{}/{}", record.id, recovery.operation);
@@ -232,6 +238,41 @@ impl ArchivedCheckpoint {
         }
         Ok(())
     }
+}
+
+/// Transfer the repair overlay under a temporary admission in its original
+/// custody. The destination uses its separate publication region.
+pub(crate) async fn materialize_completed_repair(
+    directory: &dyn Directory,
+    keys: &dyn KeyService,
+    source: &DeploymentRecord,
+    target: &DeploymentRecord,
+    destination: Arc<dyn ObjectStore>,
+    hosted_task: Option<&rtdb_directory::HostedTask>,
+) -> Result<()> {
+    let Some(repair) = completed_repair(source)? else { return Ok(()); };
+    let archive: CellStorage = serde_json::from_str(&repair.archive)
+        .map_err(|_| inconsistent("Invalid retained archive binding"))?;
+    stage::with_region(
+        directory, keys, &source.id, &archive, hosted_task, Some(repair.operation), None,
+        |current| {
+            if !matches!(current.lifecycle, Lifecycle::Moving)
+                || current.epoch != source.epoch
+                || current.incarnation != source.incarnation
+                || current.log_epoch != source.log_epoch
+                || current.storage_prefix() != source.storage_prefix()
+                || completed_repair(current)? != Some(repair)
+            {
+                return Err(inconsistent("The source no longer admits its repair for transfer"));
+            }
+            Ok(())
+        },
+        |record, owner, io| async move {
+            let repair = ArchivedCheckpoint::load(&record, keys, owner, io).await?
+                .ok_or_else(|| inconsistent("The source lost its admitted repair"))?;
+            repair.materialize(target, destination).await
+        },
+    ).await
 }
 
 struct CheckpointStore {
@@ -576,7 +617,7 @@ pub(crate) async fn verify_checkpoint_capture(
             }
             Ok(())
         },
-        |region| async {
+        |_, _, region| async {
             let bucket = archive.bucket(region).await?;
             if read::<CapturePoint>(bucket.as_ref(), &archive_witness(deployment, operation)?).await?.as_ref() != Some(&point) {
                 return Err(inconsistent("The archive belongs to another captured checkpoint"));
@@ -739,7 +780,6 @@ async fn plan_checkpoint_copy(
 
 pub(crate) async fn copy_fork_checkpoint(
     bucket: Arc<dyn ObjectStore>,
-    keys: &dyn KeyService,
     source: &DeploymentRecord,
     source_key: &[u8],
     child: &DeploymentRecord,
@@ -748,7 +788,9 @@ pub(crate) async fn copy_fork_checkpoint(
 ) -> Result<()> {
     let selected = at_block.or_else(|| source.checkpoint.map(|checkpoint| checkpoint.block))
         .ok_or_else(|| unavailable("The source has no checkpoint to copy"))?;
-    let recovery = ArchivedCheckpoint::load(source, keys, IoRegion::new()).await?;
+    if source.checkpoint_recovery.is_some() {
+        return Err(inconsistent("A fork requires serving history outside checkpoint repair"));
+    }
     let version = checkpoint_storage_root()?;
     let source_root = format!("{}/{version}", source.storage_prefix());
     let destination_root = format!("{}/{version}", child.storage_prefix());
@@ -756,8 +798,8 @@ pub(crate) async fn copy_fork_checkpoint(
     if owner.as_ref() != source.id.as_bytes() {
         return Err(inconsistent("The checkpoint belongs to another source"));
     }
-    let source_store = open_deployment_store_with_archive(
-        bucket.clone(), &source_root, PackDiscovery::From(selected), wall_clock(), recovery,
+    let source_store = open_deployment_store(
+        bucket.clone(), &source_root, PackDiscovery::From(selected), wall_clock(),
     ).await?;
     let plaintext = EncryptingStore::new(source_store, source_key)?;
     let block = BlockIndex(selected);
@@ -858,17 +900,20 @@ pub async fn capture(
         }
         let checkpoint = record.checkpoint_captures[&operation].checkpoint;
         let checkpoint_metadata_from = capture_metadata_floor(record, checkpoint);
+        let repair_archive = completed_repair(record)?.map(|repair| repair.operation);
         let admission = if local {
             rtdb_directory::StorageRegion::Local {
                 archive: Some(operation),
+                repair_archive,
                 tracks_ordered_index_pages: true,
                 checkpoint_metadata_from,
                 checkpoint_replay_from: None,
             }
         } else {
             let mut admission = crate::store::remote_storage_region(Some(operation), hosted_task.clone());
-            if let rtdb_directory::StorageRegion::Remote { checkpoint_metadata_from: floor, .. } = &mut admission {
+            if let rtdb_directory::StorageRegion::Remote { checkpoint_metadata_from: floor, repair_archive: held_repair, .. } = &mut admission {
                 *floor = checkpoint_metadata_from;
+                *held_repair = repair_archive;
             }
             admission
         };
@@ -985,8 +1030,12 @@ async fn capture_registered(
         .ok_or_else(|| unavailable("The source key is unavailable"))?;
     let archive_material = keys.key(&archive_key_id(&point)).await?;
     let archive_cipher = Cipher::new(&archive_material)?;
-    let recovery = ArchivedCheckpoint::load(record, keys, io.clone()).await?;
-    let source = storage.bucket(io).await?;
+    let recovery = ArchivedCheckpoint::load(record, keys, region, io.clone()).await?;
+    // A local sweep and this source read share the maintenance witness. The
+    // provider keeps its clone during a read even if this copy is cancelled.
+    let maintenance = storage.try_local_maintenance()?;
+    let source_io = io.child_holding(maintenance.map(|lock| Arc::new(lock) as Arc<dyn Send + Sync>));
+    let source = storage.bucket(source_io).await?;
     let version = checkpoint_storage_root()?;
     let root = format!("{}/{version}", record.storage_prefix());
     let owner = source.get(&key(&format!("{root}/{ROOT_MARKER}"))?).await?;
@@ -1607,8 +1656,6 @@ mod tests {
     async fn an_independent_fork_copies_the_replay_closure_before_its_root() -> Result<()> {
         let fixture = replay_fixture()?;
         let bucket: Arc<dyn ObjectStore> = Arc::new(rtdb_storage::MemoryStore::default());
-        let path = tempfile::tempdir().unwrap();
-        let keys = crate::keys::LocalKeyService::new(path.path())?;
         let mut source = DeploymentRecord::new("source", "org", Vec::new(), 0);
         source.checkpoint = Some(fixture.point.checkpoint);
         let child = DeploymentRecord::new("child", "other", Vec::new(), 0);
@@ -1625,7 +1672,7 @@ mod tests {
             source_store.put(name, bytes.clone()).await?;
         }
         source_store.put(&fixture.root, fixture.files[&fixture.root].clone()).await?;
-        copy_fork_checkpoint(bucket.clone(), &keys, &source, &source_material, &child, &child_material, None).await?;
+        copy_fork_checkpoint(bucket.clone(), &source, &source_material, &child, &child_material, None).await?;
         let serving = open_deployment_store(bucket.clone(), &scope(&child), PackDiscovery::List, wall_clock()).await?;
         let copied = EncryptingStore::new(serving, &child_material)?;
         for (name, bytes) in &fixture.files {
@@ -1633,7 +1680,7 @@ mod tests {
         }
 
         source_physical.delete(&fixture.artefact).await?;
-        let failure = copy_fork_checkpoint(bucket.clone(), &keys, &source, &source_material, &incomplete, &child_material, None).await;
+        let failure = copy_fork_checkpoint(bucket.clone(), &source, &source_material, &incomplete, &child_material, None).await;
         assert_eq!(failure.unwrap_err().code, "rtdb.storage/missing-object");
         let serving = open_deployment_store(bucket, &scope(&incomplete), PackDiscovery::List, wall_clock()).await?;
         assert!(matches!(serving.head_fresh(&fixture.root).await, Err(Error::MissingObject(_))),
@@ -1692,7 +1739,7 @@ mod tests {
         let id = deployment.to_string();
         update_installation(directory.as_ref(), &id, |record| {
             record.storage_regions.insert(predecessor, rtdb_directory::StorageRegion::Local {
-                archive: None,
+                archive: None, repair_archive: None,
                 tracks_ordered_index_pages: false,
                 checkpoint_metadata_from: Some(checkpoint.block),
                 checkpoint_replay_from: None,
@@ -1709,6 +1756,13 @@ mod tests {
             Ok(())
         }).await?;
         assert_eq!(attempt().await?, completed, "a durable receipt can be reopened after the source hold ends");
+        {
+            let _maintenance = storage.try_local_maintenance()?.unwrap();
+            let busy = capture(directory.clone(), &storage, &archive, &keys, deployment, Uuid::new_v4(), None, None)
+                .await.err().map(|error| error.code);
+            assert_eq!(busy.as_deref(), Some("rtdb.multi/storage-maintenance-busy"),
+                "a local capture must share the source maintenance authority");
+        }
         assert!(directory.deployment(&id).await?.unwrap().storage_regions.is_empty());
         Ok(())
     }

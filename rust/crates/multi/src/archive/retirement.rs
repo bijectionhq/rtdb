@@ -1,7 +1,7 @@
 //! Independent physical retirement of one captured checkpoint.
 
 use rtdb_directory::{
-    CheckpointCaptureRetirement, DeploymentRecord, Directory, Lifecycle, StorageRegion, now_ms,
+    CheckpointCaptureRetirement, DeploymentRecord, Directory, Lifecycle, now_ms,
 };
 use rtdb_storage::IoRegion;
 use rtdb_types::Result;
@@ -118,11 +118,7 @@ pub(crate) async fn finish_capture_retirement(
         return Ok(accepted);
     }
     let pending = |record: &DeploymentRecord| {
-        record.storage_regions.values().any(|region| {
-            matches!(region, StorageRegion::Local { archive: Some(operation), .. } |
-            StorageRegion::Remote { archive: Some(operation), .. } |
-            StorageRegion::Remote { repair_archive: Some(operation), .. } if *operation == capture)
-        })
+        record.storage_regions.values().any(|region| region.holds_archive(capture))
     };
     if pending(&record) {
         reconcile_storage_regions(directory, storage, keys, &record).await?;

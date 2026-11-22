@@ -694,6 +694,10 @@ config {
 -- An archive capture registers its source metadata hold with its selected checkpoint in the same directory update.
 -- A retry at an older checkpoint inherits the hold only if an open region still protects that metadata.
 -- A completed archive can be verified and returned without opening serving storage.
+-- A repair-backed copy admits the prior repair archive and the new destination in the same directory update.
+-- A serving-store open and a transfer that materializes repair contents also name the admitted repair archive.
+-- A closed region cannot start a repair read. Pending provider mutations retain their archive obligations through settlement.
+-- Local archive copies and forks retain their maintenance witness through completion of admitted provider work.
 -- Other admission failures end startup with the provider error.
 -- The replication driver consumes the admitted cursor for that same log and boundary.
 -- In the Rust partition owner, a query captures the catalog and its installed replica cut in the same partition value.

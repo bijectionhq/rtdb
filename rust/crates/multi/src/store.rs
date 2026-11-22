@@ -203,7 +203,7 @@ impl RemoteStorageFactory for CellStoreFactory {
         let checkpoint_metadata: Arc<dyn Send + Sync> = Arc::new(checkpoint_metadata);
         let opened = IoRegion::retaining(Arc::clone(&checkpoint_metadata), async {
             let recovery = if storage_root.as_str() == crate::archive::checkpoint_storage_root()? {
-                crate::archive::ArchivedCheckpoint::load(&record, self.keys.as_ref(), region.clone()).await?
+                crate::archive::ArchivedCheckpoint::load(&record, self.keys.as_ref(), owner, region.clone()).await?
             } else {
                 None
             };
@@ -378,11 +378,9 @@ impl CellStoreFactory {
                 let checkpoint_replay_from = if config.snapshot_block.is_none() && record.compaction_replay_cutoff.is_none() {
                     checkpoint_startup_replay(record)?
                 } else { None };
-                let repair = record.checkpoint_recovery.as_ref()
-                    .filter(|repair| repair.completed_at_ms.is_some())
-                    .map(|repair| repair.operation);
+                let repair = crate::archive::completed_repair(record)?.map(|repair| repair.operation);
                 record.storage_regions.insert(id, if local {
-                    StorageRegion::Local { archive: repair, tracks_ordered_index_pages: true, checkpoint_metadata_from, checkpoint_replay_from }
+                    StorageRegion::Local { archive: None, repair_archive: repair, tracks_ordered_index_pages: true, checkpoint_metadata_from, checkpoint_replay_from }
                 } else {
                     StorageRegion::Remote { tracks_ordered_index_pages: true, checkpoint_metadata_from, checkpoint_replay_from, archive: None, repair_archive: repair, owner: hosted_task.clone(),
                         closed: false, publications: BTreeMap::new() }
@@ -612,7 +610,9 @@ pub(crate) async fn reconcile_storage_regions(
     for (&region, state) in &record.storage_regions {
         match state {
             StorageRegion::Local { .. } | StorageRegion::ReplicaReplay { custody: rtdb_directory::ReplayCustody::Local, .. }
-                if matches!(storage, CellStorage::Local { .. }) && keys.local_storage_region_drained(region)? => {
+                if (matches!(storage, CellStorage::Local { .. })
+                    || matches!(state, StorageRegion::Local { archive: Some(_), .. } | StorageRegion::Local { repair_archive: Some(_), .. }))
+                    && keys.local_storage_region_drained(region)? => {
                 release_region(directory, &record.id, region, false).await?;
                 keys.forget_local_storage_region(region)?;
             }
@@ -1167,7 +1167,8 @@ pub async fn run_reaper(
                         for record in &deployments {
                             if record.ordered_indexes.is_empty() && record.ordered_index_catalogs.is_empty()
                                 && !record.storage_regions.values().any(|region| {
-                                    matches!(region, StorageRegion::Remote { .. } | StorageRegion::ReplicaReplay { .. })
+                                    matches!(region, StorageRegion::Remote { .. } | StorageRegion::ReplicaReplay { .. }
+                                        | StorageRegion::Local { archive: Some(_), .. } | StorageRegion::Local { repair_archive: Some(_), .. })
                                         || region.checkpoint_metadata_from().is_some()
                                 })
                             {
@@ -1283,6 +1284,43 @@ pub async fn reaper_pass(bucket: &dyn ObjectStore, deployments: &[DeploymentReco
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn an_inflight_local_read_retains_the_maintenance_witness_after_cancellation() {
+        let root = tempfile::tempdir().unwrap();
+        let storage = CellStorage::Local { root: root.path().to_owned() };
+        let lock = storage.try_local_maintenance().unwrap().unwrap();
+        let owner = IoRegion::new();
+        let io = owner.child_holding(Some(Arc::new(lock)));
+        let (started, admitted) = oneshot::channel();
+        let (finish, resume) = std::sync::mpsc::channel();
+        let reader = tokio::spawn(async move {
+            io.run_blocking(move || {
+                started.send(()).unwrap();
+                resume.recv().unwrap();
+                Ok(())
+            }).await
+        });
+        admitted.await.unwrap();
+        reader.abort();
+        assert!(reader.await.unwrap_err().is_cancelled());
+        let busy = storage.try_local_maintenance().err().map(|error| error.code);
+        assert_eq!(busy.as_deref(), Some("rtdb.multi/storage-maintenance-busy"),
+            "provider work retains the maintenance witness after its caller is cancelled");
+        finish.send(()).unwrap();
+        owner.close_and_wait().await;
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                match storage.try_local_maintenance() {
+                    Ok(Some(_)) => break,
+                    Err(error) if error.code == "rtdb.multi/storage-maintenance-busy" => {
+                        tokio::task::yield_now().await;
+                    }
+                    result => panic!("expected a local maintenance witness: {result:?}"),
+                }
+            }
+        }).await.unwrap();
+    }
 
     #[test]
     fn a_new_storage_generation_uses_an_independent_cache_identity() {
@@ -1774,7 +1812,7 @@ mod tests {
         let mut record = DeploymentRecord::new("shop", "acme", vec![], 0);
         let bucket = storage.bucket(IoRegion::new()).await.unwrap();
         record.storage_namespaces = Some(crate::deployment::storage_namespaces(bucket.as_ref(), &keys).await.unwrap());
-        record.storage_regions.insert(region, StorageRegion::Local { archive: None, tracks_ordered_index_pages: true, checkpoint_metadata_from: None, checkpoint_replay_from: None, });
+        record.storage_regions.insert(region, StorageRegion::Local { archive: None, repair_archive: None, tracks_ordered_index_pages: true, checkpoint_metadata_from: None, checkpoint_replay_from: None, });
         let record = directory.create_deployment(record).await.unwrap();
         crate::admin::begin_disposal(directory.as_ref(), &record.id).await.unwrap();
 

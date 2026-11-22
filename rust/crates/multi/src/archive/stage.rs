@@ -203,7 +203,7 @@ pub async fn stage_checkpoint(
             }
             Ok(())
         },
-        |archive_io| {
+        |_, _, archive_io| {
             let (directory, target_id, intent) = (&directory, &target_id, &intent);
             let (retained, point, manifest, hosted_task) =
                 (&retained, &point, &manifest, hosted_task.as_ref());
@@ -226,7 +226,7 @@ pub async fn stage_checkpoint(
                         }
                         Ok(())
                     },
-                    |target_io| {
+                    |_, _, target_io| {
                         copy_checkpoint(
                             archive, storage, keys, retained, point, manifest, archive_io,
                             target_io,
@@ -304,13 +304,13 @@ pub(super) async fn with_region<T, F, Fut>(
     run: F,
 ) -> Result<T>
 where
-    F: FnOnce(Arc<IoRegion>) -> Fut,
+    F: FnOnce(DeploymentRecord, Uuid, Arc<IoRegion>) -> Fut,
     Fut: Future<Output = Result<T>>,
 {
     let region = Uuid::new_v4();
     let (state, witness) = match media {
         CellStorage::Local { .. } => (
-            rtdb_directory::StorageRegion::Local { archive: capture, tracks_ordered_index_pages: true, checkpoint_metadata_from: None, checkpoint_replay_from: None, },
+            rtdb_directory::StorageRegion::Local { archive: capture, repair_archive: None, tracks_ordered_index_pages: true, checkpoint_metadata_from: None, checkpoint_replay_from: None, },
             keys.hold_local_storage_region(region)?,
         ),
         CellStorage::S3 { .. } => {
@@ -342,7 +342,7 @@ where
     .await;
     let uncertain = admitted.is_err();
     let result = match admitted {
-        Ok(_) => run(io.clone()).await,
+        Ok(record) => run(record, region, io.clone()).await,
         Err(error) => Err(error),
     };
     io.close_and_wait().await;

@@ -1836,6 +1836,10 @@ async fn restoring_the_current_archive_preserves_the_ordered_tail_and_authority(
     let reopened = connect_eventually(&cell, "shop").await;
     assert_eq!(values(&reopened, "SHOW rtdb_hosted_source_barrier").await, [id.to_string()]);
     assert_eq!(values(&reopened, "SELECT total FROM orders ORDER BY _id").await, ["10", "20"]);
+    let recaptured = rtdb_multi::archive::capture(
+        cell.directory.clone(), &storage, &archive, &cell.keys(), id, uuid::Uuid::new_v4(), None, None,
+    ).await.expect("recapturing a repaired checkpoint must open the admitted source archive");
+    assert_eq!(recaptured.point.checkpoint, successor.checkpoint);
     let retried = rtdb_multi::archive::restore(cell.directory.as_ref(), &storage, &archive, &cell.keys(), id, operation, 4 << 20, None).await.unwrap();
     assert_eq!(retried, restored);
     let other_dir = tempfile::tempdir().unwrap();
@@ -1865,7 +1869,8 @@ async fn restoring_the_current_archive_preserves_the_ordered_tail_and_authority(
         source: rtdb_directory::CellResidence { cell: "source".into(), org: "acme".into() },
         destination: rtdb_directory::CellResidence { cell: "destination".into(), org: "acme-destination".into() },
     };
-    let prepared = admin::prepare_managed_cell_transfer(&from, &to, &intent, 4 << 20, None).await.unwrap();
+    let prepared = admin::prepare_managed_cell_transfer(&from, &to, &intent, 4 << 20, None)
+        .await.expect("a cross-cell move uses its original repair archive admission");
     let pending = destination.directory.deployment(&id.to_string()).await.unwrap().unwrap();
     assert_eq!(pending.lifecycle, Lifecycle::Moving);
     assert_eq!(pending.org, intent.destination.org);

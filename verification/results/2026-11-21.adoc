@@ -2676,3 +2676,58 @@ The final Gradle run recorded 3,198 standard cases and 5,630 integration cases w
 The PostgreSQL slot-recreation case was already disabled in its source.
 No reflection or boxed-math warnings appeared.
 The log is `/private/tmp/rtdb-frozen-receipt-rebased-gradle.log`.
+
+=== Repair archive custody and local source drain
+
+The storage region now records the copy destination and the repair source independently on both local and remote media.
+Archive retirement considers both slots. A closed region can still retain custody while provider mutations settle.
+Serving-store open and recapture select the repair in their directory admission.
+A transfer that materializes a repair takes temporary read admission in the original custody and writes through the separately admitted destination.
+Opening repair bytes requires a region that admits the exact archive.
+Local archive sources and fork buckets pass the existing maintenance witness to their I/O regions, so an admitted read retains it after caller cancellation.
+
+TLC revision `bc1b506` explored all 162 states of one copy region, two independently held archives and one unrelated archive.
+Five controls fail for omitted repair custody, erasing under the destination rule alone, late admission, a read started from a closed region and release before drain.
+The model reached repair reads, closure with provider work awaiting settlement, unrelated retirement and retirement after release.
+Apalache 0.63.0 checked the invariant through twelve transitions and independently rejected ignoring the repair slot or admitting after retirement.
+The records are under `/private/tmp/rtdb-formal.QMjPSJsX/repair-archive-custody-models-svm4jv3y/`. link:../tla/RepairArchiveCustody.tla[Bounded custody model]
+Lean 4.36.0 checked four theorems for arbitrary archive identities, regions and finite schedules.
+Its controls remove repair membership, admission against closure, protection from erasure or the drain condition.
+The records are under `/private/tmp/rtdb-formal.QMjPSJsX/repair-archive-custody-lean-uuv1paid/`. link:../lean/RepairArchiveCustody.lean[Archive custody laws]
+Verus checked six functions and four single and joint controls in the production archive custody area.
+The combined run passed 38 areas and matched all 193 controls.
+The records are under `/private/tmp/rtdb-formal.QMjPSJsX/repair-archive-custody-verus-zx_aovdi/`. link:../verus/repair_archive_custody/proof.rs[Production membership and admission guard]
+
+The bounded retirement-settlement comparison checks one key, two immutable provider versions and one outstanding removal.
+TLC explored all 44 states of exact-version removal and all 24 states of serialized path removal.
+Both preserve source and replacement availability under their respective rules.
+Only the exact design reaches completion of the old removal after its task stops while a reader holds the replacement.
+Both designs reach settlement and admission of the replacement.
+The controls fail when exact removal resolves the current name or task stop stands in for provider settlement.
+Apalache checked the exact policy through nine transitions and reproduced the path-only counterexample.
+The records are under `/private/tmp/rtdb-formal.QMjPSJsX/source-retirement-settlement-models-79vqjde3/`. link:../tla/SourceRetirementSettlement.tla[Provider settlement comparison]
+
+On parent `6e55bc6c5` the affected Rust suites passed 272 tests, including 97 hosted cell cases, with one optional test ignored.
+The repaired-cell case reopens and recaptures the source, transfers it to another cell and checks the retained ordered history.
+The log is `/private/tmp/rtdb-formal.QMjPSJsX/repair-custody-6e5-rust-complete.log`.
+Four focused native replays passed, with six controls failing at their declared assertions for archive membership, closed-region reads, recapture, transfer, maintenance authority and canceled provider work.
+The per-case records are under `/private/tmp/rtdb-formal.QMjPSJsX/repair-archive-custody-native-p3rdpdq3/`.
+The standard JVM suite on that parent passed 3,198 tests with no failures or skips.
+It reused the unaffected FFI library, with SHA-256 `035e56094dd9ef9e97df62293c089ed4b6b50688c02f711e1087202f2e4b6664`.
+The log is `/private/tmp/rtdb-formal.QMjPSJsX/repair-custody-6e5-jvm.log`.
+
+After rebasing onto `f740a4080`, the affected Rust suites passed 273 cases, including 98 hosted cell cases, with one optional case ignored.
+The log is `/private/tmp/rtdb-formal.QMjPSJsX/repair-custody-f740-rust.log`.
+The four repair-source replays and six controls matched on that tree, as did the checkpoint metadata replay and its four controls.
+The records are under `/private/tmp/rtdb-formal.QMjPSJsX/repair-archive-custody-f740-native-lb2i79ko/`.
+The combined run passed all 38 Verus areas and matched all 193 controls. TLC reran both new studies and the frozen-receipt model with its controls.
+The records are under `/private/tmp/rtdb-formal.QMjPSJsX/repair-custody-f740-formal-p4ie01jr/`.
+The standard JVM suite passed 3,198 tests with no failures, errors or skips.
+It used the rebuilt FFI library with SHA-256 `1682a5e0ad49022072a1d1bbc18ce6ee65a8546f2f6259186704c1240d5377ab`.
+The log is `/private/tmp/rtdb-formal.QMjPSJsX/repair-custody-f740-jvm.log`.
+The JVM property suite passed 3,348 cases with no failures, errors or skips, including 100 iterations each for 33 core simulation methods.
+The log is `/private/tmp/rtdb-formal.QMjPSJsX/repair-custody-f740-property.log`.
+
+The archive argument depends on retirement actors honoring both custody slots.
+Local serving-object collection shares the maintenance witness.
+The ordinary remote serving collector still needs durable per-version authorization and a provider settlement rule across all physical owners.

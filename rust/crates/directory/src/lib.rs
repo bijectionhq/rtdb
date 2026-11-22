@@ -393,6 +393,8 @@ pub struct CatalogReader {
 pub enum StorageRegion {
     Local {
         archive: Option<uuid::Uuid>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        repair_archive: Option<uuid::Uuid>,
         #[serde(default)]
         tracks_ordered_index_pages: bool,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -430,7 +432,27 @@ pub enum ReplayCustody {
     Hosted { owner: Option<HostedTask> },
 }
 
+mod archive_custody;
+
 impl StorageRegion {
+    /// A closed region may still owe provider settlement for the archive.
+    pub fn holds_archive(&self, capture: uuid::Uuid) -> bool {
+        let (destination, repair) = match self {
+            Self::Local { archive, repair_archive, .. } |
+            Self::Remote { archive, repair_archive, .. } => (*archive, *repair_archive),
+            Self::ReplicaReplay { .. } => return false,
+        };
+        archive_custody::covers_archive(destination.map(|id| id.as_u128()), repair.map(|id| id.as_u128()), capture.as_u128())
+    }
+
+    /// Reads may begin only under an open region for the exact archive.
+    pub fn admits_archive_read(&self, capture: uuid::Uuid) -> bool {
+        archive_custody::may_read_archive(
+            self.holds_archive(capture),
+            matches!(self, Self::Remote { closed: true, .. }),
+        )
+    }
+
     pub fn checkpoint_metadata_from(&self) -> Option<i64> {
         match self {
             Self::Local { checkpoint_metadata_from, .. } |

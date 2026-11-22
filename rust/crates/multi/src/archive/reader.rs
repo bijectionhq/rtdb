@@ -195,7 +195,7 @@ async fn serve_stage(
         None,
         None,
         |current| authority.require_held(current),
-        |region| {
+        |_, _, region| {
             let authority = &authority;
             let record = &record;
             async move {

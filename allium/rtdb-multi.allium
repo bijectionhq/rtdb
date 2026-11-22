@@ -2312,6 +2312,9 @@ rule HostedCheckpointCapture {
     -- The hold persists until its provider work drains. A verified existing archive can be returned after the source hold ends.
     -- The source plan is checked against the full exact body observation before resealing each member.
     -- A serving read supplied by a repair archive carries the repair archive's physical identity.
+    -- The capture region retains its destination and its repair source independently.
+    -- A local source copy holds the cell maintenance witness through admitted I/O.
+    -- A cell transfer that materializes repair data retains the archive in its original directory and custody.
     when: AuthenticatedRecoveryCapture(authority, name, capture_id)
 
     requires: ConfiguredOrganizationOwns(authority, name)

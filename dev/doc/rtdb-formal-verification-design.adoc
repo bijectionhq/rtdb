@@ -1478,6 +1478,13 @@ Native selections use a read through the real storage layers and a loopback S3 r
 A second bounded model compares a single atomic admission with separate acquisition from two physical owners.
 Both preserve the source obligation when reading requires every owner's hold, local admission accounts for earlier removal authorizations, and cancellation waits for provider drain.
 The separate acquisition model also reaches cleanup after a partial refusal.
+A repair-backed capture now retains the existing repair and the new destination in its storage region.
+Serving-store open and source-side transfer use the same repair read guard.
+Archive retirement considers both dependencies, and an admitted local copy retains the maintenance witness until its I/O finishes.
+Lean checks archive custody through arbitrary finite schedules.
+Verus checks exact archive membership and the closed-region read guard in production.
+The retirement-settlement model distinguishes a delayed provider effect from the lifetime of its submitting task.
+An exact-version removal can overlap admission of a different version, while a path-based removal needs exclusion of that path's replacement until settlement.
 The native memory-provider run selects a later checkpoint and replays its retained suffix with the cursor admitted during startup.
 TLC checks cursor admission, reuse and strict progress before refusal and reaches a state with later trimming after admission.
 mCRL2 checks the observable results of the staged discovery model against the atomic contract for three reported indices.

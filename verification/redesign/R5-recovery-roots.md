@@ -126,6 +126,22 @@ The model checks cancellation and delayed removal. Concurrent owner transfer rem
 The production evidence needs exact storage responses at the admission boundary, a durable namespace and owner binding for each group, and proof that provider erasure requires the same authorization used by the admission test.
 The final claim also needs a rule for providers that expose no stable object version.
 
+### Repair custody and ordinary remote collection
+
+Repair-backed serving and recapture name their repair archive in the directory admission.
+For recapture the destination remains separately recorded, including when its provider still owes settlement.
+A transfer takes a read hold from the original archive owner before materializing repair bytes into the separately held destination.
+Provider-backed repair transfer uses the worker's hosted task witness for recovery of abandoned admissions.
+On local serving storage the existing maintenance lock orders ordinary collection against copies and is retained by the admitted provider work.
+
+The ordinary remote collector still works from a residence list and releases the visible object name.
+Its exact-version design needs a durable authorization naming the provider copy before submitting a physical effect.
+Task termination alone establishes that the task cannot issue another request. A mutation accepted by the provider can still complete.
+The bounded settlement comparison preserves replacement availability for exact-version removal and for path removal that excludes publication and admission until settlement.
+It reaches late completion with the replacement held in the exact variant.
+An integration proof must account for how version deletion affects the current-name view, each inherited reference, and retry after a lost provider reply.
+
+
 
 ## Open questions
 
