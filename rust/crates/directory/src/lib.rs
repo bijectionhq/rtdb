@@ -429,7 +429,11 @@ pub enum StorageRegion {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         object: Option<String>,
     },
-    ExactRetirement { object: String },
+    ExactRetirement {
+        object: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        release: Option<String>,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -821,6 +825,8 @@ pub trait Directory: Send + Sync {
         Ok(self.lineage_state(lineage).await?.reference_revision())
     }
     async fn lineage_state(&self, lineage: &str) -> Result<LineageState>;
+    /// Removes the provider-confirmed retirement fence and reopens the lineage together.
+    async fn settle_owned_version(&self, id: &str, expected: Version, retirement: LineageRetirement) -> Result<Cas<DeploymentRecord>>;
     async fn begin_reference_disposal(&self, id: &str, expected: Version) -> Result<ReferenceDisposal>;
     async fn settle_reference_disposal(&self, permit: &ReferenceDisposal, record: DeploymentRecord, expected: Version) -> Result<Cas<DeploymentRecord>>;
     async fn change_lineage(&self, lineage: &str, change: LineageChange) -> Result<LineageState>;
@@ -1034,6 +1040,19 @@ impl Directory for MemoryDirectory {
             self.persist(&mut state)?;
         }
         Ok(next)
+    }
+    async fn settle_owned_version(&self, id: &str, expected: Version, retirement: LineageRetirement) -> Result<Cas<DeploymentRecord>> {
+        let mut state = self.state()?;
+        let Some(owner) = state.deployments.get(id) else { return Ok(Cas::Conflict(None)); };
+        if owner.version != expected { return Ok(Cas::Conflict(Some(owner.as_ref().clone()))); }
+        let lineage = owner.lineage.clone();
+        let current = state.reference_revisions.get(&lineage).map(StoredLineage::state).unwrap_or_default();
+        let (next, next_lineage) = current.settle_exact_owned(owner, &retirement)?;
+        state.deployments.insert(id.to_owned(), Box::new(next.clone()));
+        state.reference_revisions.insert(lineage, StoredLineage::Current(next_lineage));
+        self.persist(&mut state)?;
+        self.changes.publish(next.clone());
+        Ok(Cas::Applied(next))
     }
     async fn begin_reference_disposal(&self, id: &str, expected: Version) -> Result<ReferenceDisposal> {
         let mut state = self.state()?;

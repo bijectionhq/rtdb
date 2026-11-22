@@ -135,7 +135,11 @@ Provider-backed repair transfer uses the worker's hosted task witness for recove
 On local serving storage the existing maintenance lock orders ordinary collection against copies and is retained by the admitted provider work.
 
 The ordinary remote collector accepts loose-file releases that carry a matching installed publication and immutable S3 version.
-The lineage reservation retains the provider identity, source residence and original release record through effect authorization and settlement.
+The lineage reservation retains both provider identities: the released data version and the release marker version observed with its body.
+Before erasure authorization the reaper reads the marker again, verifies the exact identity and contents, and installs a physical-owner fence covering both paths.
+A declared reference to either path keeps it in place, including references with an owned shadow.
+Data removal settles first. A fresh provider inventory must establish that each reserved version is absent before the directory can reopen the lineage.
+The successful settlement transaction clears the physical-owner fence and reopens the lineage together. An older authorized reservation without a marker version can settle its data while leaving the marker for a version-aware pass.
 Task termination alone establishes that the task cannot issue another request. A mutation accepted by the provider can still complete.
 The bounded settlement comparison preserves replacement availability for exact-version removal and for path removal that excludes publication and admission until settlement.
 It reaches late completion with the replacement held in the exact variant.
@@ -154,6 +158,8 @@ The reaper checks the fresh installed floor, provider identity and current manif
 Only a reservation that has issued no provider effect may be abandoned.
 After authorization, retries use the same stored provider version until a fresh inventory confirms it absent.
 The hosted retirement model explored 47 states and rejected four unsafe protocol mutations.
+The marker settlement model separately checks a replacement at the same marker key, a delayed exact removal, independent absence evidence and atomic reopening.
+[Marker settlement model](../tla/ExactMarkerSettlement.tla)
 It also reached a redundant provider effect after settlement while the replacement remained available.
 The legacy collector leaves owned loose trie files and derived artefacts in place when their release records lack a matching immutable publication witness.
 Those records need conversion from retained receipts or a separately settled path-based protocol for unversioned providers.

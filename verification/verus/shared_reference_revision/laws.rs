@@ -1,4 +1,4 @@
-use crate::production::{advance_revision, may_publish_fork, may_publish_reference, may_settle_reference_disposal};
+use crate::production::{advance_revision, may_publish_fork, may_publish_reference, may_settle_reference_disposal, may_settle_exact_owned};
 use vstd::prelude::*;
 
 verus! {
@@ -50,6 +50,12 @@ pub fn an_open_lineage_refuses_a_stale_preparation(current: u64, prepared_at: Op
 pub fn settlement_requires_the_exact_revision_and_residence(current: u64, expected: u64, scope_matches: bool) {
     let accepted = may_settle_reference_disposal(current, expected, scope_matches);
     assert(accepted ==> current == expected && scope_matches);
+}
+
+// LAW REFERENCE-REVISION-8.
+pub fn exact_settlement_consumes_the_authorized_owner_fence(authorized: bool, same_owner: bool, matching_fence: bool) {
+    let allowed = may_settle_exact_owned(authorized, same_owner, matching_fence);
+    assert(allowed ==> authorized && same_owner && matching_fence);
 }
 
 }

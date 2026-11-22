@@ -68,7 +68,8 @@ impl ReferenceReads {
                     owner.storage_prefix() == residence && owner.org == worker.org && owner.lineage == worker.lineage,
                     owner.storage_namespaces == Some(worker.namespaces),
                 ) || owner.storage_regions.values().any(|region| {
-                    matches!(region, StorageRegion::ExactRetirement { object: retiring } if *retiring == object)
+                    matches!(region, StorageRegion::ExactRetirement { object: retiring, release }
+                        if *retiring == object || release.as_ref() == Some(&object))
                 }) {
                     return Err(Anomaly::new(AnomalyCategory::Unavailable, CLOSED, "The reference's physical residence no longer admits reads"));
                 }
@@ -156,10 +157,17 @@ mod tests {
 
         let retirement = Uuid::new_v4();
         crate::admin::update_installation(directory.as_ref(), &parent.id, |owner| {
-            owner.storage_regions.insert(retirement, StorageRegion::ExactRetirement { object: parent_object.to_string() });
+            owner.storage_regions.insert(retirement, StorageRegion::ExactRetirement { object: parent_object.to_string(), release: None });
             Ok(())
         }).await.unwrap();
-        assert!(matches!(store.get(&object).await, Err(Error::Closed(_))));
+        assert!(matches!(store.get(&object).await, Err(Error::Closed(_))), "the owner fences the retiring data");
+        crate::admin::update_installation(directory.as_ref(), &parent.id, |owner| {
+            owner.storage_regions.insert(retirement, StorageRegion::ExactRetirement {
+                object: format!("{parent_store}/another-object"), release: Some(parent_object.to_string()),
+            });
+            Ok(())
+        }).await.unwrap();
+        assert!(matches!(store.get(&object).await, Err(Error::Closed(_))), "the owner also fences the release marker");
         crate::store::release_region(directory.as_ref(), &parent.id, retirement, false).await.unwrap();
 
         let (entered, running) = oneshot::channel();

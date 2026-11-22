@@ -2348,6 +2348,10 @@ rule PublishInventoryReceipt {
 
 rule SettleObservedS3Version {
     -- Every retry sends the immutable identifier retained by the retirement authority.
+    -- The hosted trie release binds the marker version from the same response as the release body.
+    -- The physical owner fences both paths while the installed release is in flight.
+    -- Data and marker retirement each need an exact absence observation.
+    -- The directory clears the owner fence and reopens the lineage atomically.
     -- Settlement uses a fresh, complete lookup scoped to the exact key and version.
     when: ExactVersionRetirementContinued(retirement)
 

@@ -19,7 +19,7 @@ use tokio::sync::{broadcast, mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
 
-use crate::{Cas, ChangeFeed, DeploymentRecord, Directory, ForkPublication, ReferenceDisposal, LineageChange, LineageState, MemberId, MemberRecord, Version};
+use crate::{Cas, ChangeFeed, DeploymentRecord, Directory, ForkPublication, ReferenceDisposal, LineageChange, LineageRetirement, LineageState, MemberId, MemberRecord, Version};
 
 /// A longer line closes the connection rather than growing the buffer without bound.
 const MAX_LINE: u64 = 64 << 20;
@@ -32,6 +32,7 @@ enum Op {
     SharedReferenceRevision { lineage: String },
     LineageState { lineage: String },
     BeginReferenceDisposal { id: String, expected: Version },
+    SettleOwnedVersion { id: String, expected: Version, retirement: LineageRetirement },
     SettleReferenceDisposal { permit: ReferenceDisposal, record: DeploymentRecord, expected: Version },
     ChangeLineage { lineage: String, change: LineageChange },
     Deployment { id: String },
@@ -103,6 +104,7 @@ async fn dispatch(directory: &dyn Directory, op: Op) -> Result<Reply> {
         Op::SharedReferenceRevision { lineage } => Reply::SharedReferenceRevision(directory.shared_reference_revision(&lineage).await?),
         Op::LineageState { lineage } => Reply::LineageState(directory.lineage_state(&lineage).await?),
         Op::BeginReferenceDisposal { id, expected } => Reply::ReferenceDisposal(directory.begin_reference_disposal(&id, expected).await?),
+        Op::SettleOwnedVersion { id, expected, retirement } => Reply::DeploymentCas(directory.settle_owned_version(&id, expected, retirement).await?),
         Op::SettleReferenceDisposal { permit, record, expected } => Reply::DeploymentCas(directory.settle_reference_disposal(&permit, record, expected).await?),
         Op::ChangeLineage { lineage, change } => Reply::LineageState(directory.change_lineage(&lineage, change).await?),
         Op::Deployment { id } => Reply::OptionalDeployment(directory.deployment(&id).await?),
@@ -444,6 +446,11 @@ impl Directory for RemoteDirectory {
     }
     async fn change_lineage(&self, lineage: &str, change: LineageChange) -> Result<LineageState> {
         match self.call(Op::ChangeLineage { lineage: lineage.to_owned(), change }).await? { Reply::LineageState(state) => Ok(state), other => Err(protocol(other)) }
+    }
+    async fn settle_owned_version(&self, id: &str, expected: Version, retirement: LineageRetirement) -> Result<Cas<DeploymentRecord>> {
+        match self.call(Op::SettleOwnedVersion { id: id.to_owned(), expected, retirement }).await? {
+            Reply::DeploymentCas(result) => Ok(result), other => Err(protocol(other)),
+        }
     }
     async fn begin_reference_disposal(&self, id: &str, expected: Version) -> Result<ReferenceDisposal> {
         match self.call(Op::BeginReferenceDisposal { id: id.to_owned(), expected }).await? { Reply::ReferenceDisposal(permit) => Ok(permit), other => Err(protocol(other)) }

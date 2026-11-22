@@ -7,7 +7,7 @@
     "--verify-module",
     "laws"
   ],
-  "min_verified_functions": 11,
+  "min_verified_functions": 13,
   "controls": {
     "ignore_parent_revision": {
       "defect": "A stale parent revision can publish a fork.",
@@ -336,6 +336,84 @@
         }
       ],
       "min_verified_functions": 10
+    },
+    "ignore_exact_authorization": {
+      "mutate": [
+        {
+          "file": "rust/crates/directory/src/reference_revision.rs",
+          "find": "    authorized && same_owner && matching_fence\n",
+          "replace": "    same_owner && matching_fence\n"
+        }
+      ],
+      "expect": [
+        {
+          "file": "rust/crates/directory/src/reference_revision.rs",
+          "function": "may_settle_exact_owned",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 12
+    },
+    "ignore_exact_authorization_and_contract": {
+      "mutate": [
+        {
+          "file": "rust/crates/directory/src/reference_revision.rs",
+          "find": "    authorized && same_owner && matching_fence\n",
+          "replace": "    same_owner && matching_fence\n"
+        },
+        {
+          "file": "rust/crates/directory/src/reference_revision.rs",
+          "find": "accepted <==> authorized && same_owner && matching_fence,",
+          "replace": "accepted <==> same_owner && matching_fence,"
+        }
+      ],
+      "expect": [
+        {
+          "file": "verification/verus/shared_reference_revision/laws.rs",
+          "function": "exact_settlement_consumes_the_authorized_owner_fence",
+          "category": "assertion failed"
+        }
+      ],
+      "min_verified_functions": 12
+    },
+    "ignore_exact_fence": {
+      "mutate": [
+        {
+          "file": "rust/crates/directory/src/reference_revision.rs",
+          "find": "    authorized && same_owner && matching_fence\n",
+          "replace": "    authorized && same_owner\n"
+        }
+      ],
+      "expect": [
+        {
+          "file": "rust/crates/directory/src/reference_revision.rs",
+          "function": "may_settle_exact_owned",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 12
+    },
+    "ignore_exact_fence_and_contract": {
+      "mutate": [
+        {
+          "file": "rust/crates/directory/src/reference_revision.rs",
+          "find": "    authorized && same_owner && matching_fence\n",
+          "replace": "    authorized && same_owner\n"
+        },
+        {
+          "file": "rust/crates/directory/src/reference_revision.rs",
+          "find": "accepted <==> authorized && same_owner && matching_fence,",
+          "replace": "accepted <==> authorized && same_owner,"
+        }
+      ],
+      "expect": [
+        {
+          "file": "verification/verus/shared_reference_revision/laws.rs",
+          "function": "exact_settlement_consumes_the_authorized_owner_fence",
+          "category": "assertion failed"
+        }
+      ],
+      "min_verified_functions": 12
     }
   }
 }

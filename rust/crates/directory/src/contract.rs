@@ -66,6 +66,7 @@ pub async fn run(directory: &dyn Directory) {
     assert_eq!(directory.shared_reference_revision(&external.lineage).await.unwrap(), 0);
     local_retirement(directory, &applied, &name).await;
     exact_retirement(directory, &applied).await;
+    let applied = directory.deployment(&applied.id).await.unwrap().unwrap();
 
     let reserved = format!("{}{id}", super::REFERENCE_REVISION_PREFIX, id = applied.lineage);
     let fake = DeploymentRecord::new(&reserved, &applied.org, vec![], 0);
@@ -197,6 +198,10 @@ async fn exact_retirement(directory: &dyn Directory, parent: &DeploymentRecord) 
         deployment: parent.id.clone(), target: target.clone(), release: format!("{scope}/v06/~garbage/release"),
         version: PhysicalObjectVersion { namespace: S3ObjectNamespace { bucket: "cell".into(), endpoint: None, region: None },
             key: format!("cell/{target}"), version: "original".into() },
+        release_version: Some(PhysicalObjectVersion {
+            namespace: S3ObjectNamespace { bucket: "cell".into(), endpoint: None, region: None },
+            key: format!("cell/{scope}/v06/%7Egarbage/release"), version: "record".into(),
+        }),
     } };
     let reserve = LineageChange::ReserveRetirement {
         retirement: retirement.clone(), observed_references: state.reference_revision(), generation: state.retirement_generation(),
@@ -214,7 +219,17 @@ async fn exact_retirement(directory: &dyn Directory, parent: &DeploymentRecord) 
     let current = directory.lineage_state(lineage).await.unwrap();
     assert!(current.exact_erasure_authorized());
     assert_eq!(current.retirement(), Some(&retirement));
-    directory.change_lineage(lineage, settle).await.unwrap();
+    assert!(directory.change_lineage(lineage, settle).await.is_err(), "the lineage cannot reopen without its owner CAS");
+    let owner = directory.deployment(&parent.id).await.unwrap().unwrap();
+    assert!(directory.settle_owned_version(&owner.id, owner.version, retirement.clone()).await.is_err(), "the exact fence is required");
+    let mut fenced = owner.clone();
+    fenced.storage_regions.insert(retirement.token, crate::StorageRegion::ExactRetirement { object: target, release: Some(format!("{scope}/v06/~garbage/release")) });
+    let fenced = directory.replace_deployment(fenced, owner.version).await.unwrap().applied().unwrap();
+    let wrong = directory.settle_owned_version(&owner.id, owner.version, retirement.clone()).await.unwrap();
+    assert!(matches!(wrong, Cas::Conflict(Some(_))));
+    let settled = directory.settle_owned_version(&owner.id, fenced.version, retirement.clone()).await.unwrap().applied().unwrap();
+    assert!(!settled.storage_regions.contains_key(&retirement.token));
+    assert!(directory.lineage_state(lineage).await.unwrap().retirement().is_none());
     directory.change_lineage(lineage, LineageChange::PrepareHostedFork { preparation: attempted, task: None }).await.unwrap();
     directory.change_lineage(lineage, LineageChange::ReleaseFork { preparation: attempted }).await.unwrap();
 }

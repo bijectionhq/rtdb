@@ -4,7 +4,7 @@ use rtdb_types::{Anomaly, AnomalyCategory, PhysicalObjectVersion, Result};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::{DeploymentRecord, HostedTask, Lifecycle, Version, next_reference_revision, reference_revision};
+use crate::{DeploymentRecord, HostedTask, Lifecycle, StorageRegion, Version, next_reference_revision, reference_revision};
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LineageRetirement {
@@ -18,7 +18,14 @@ pub struct LineageRetirement {
 #[serde(untagged)]
 pub enum RetirementWork {
     Local { local_volume: [u8; 32] },
-    S3 { deployment: String, target: String, release: String, version: PhysicalObjectVersion },
+    S3 {
+        deployment: String,
+        target: String,
+        release: String,
+        version: PhysicalObjectVersion,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        release_version: Option<PhysicalObjectVersion>,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -168,6 +175,27 @@ impl LineageState {
     }
     pub fn exact_erasure_authorized(&self) -> bool { matches!(self.admission, Admission::Erasing(_)) }
 
+    pub(crate) fn settle_exact_owned(&self, owner: &DeploymentRecord, retirement: &LineageRetirement) -> Result<(DeploymentRecord, Self)> {
+        let RetirementWork::S3 { deployment, target, release, release_version, .. } = &retirement.work else { return Err(lineage_busy()); };
+        let fence = owner.storage_regions.get(&retirement.token);
+        let matching_fence = matches!(fence, Some(StorageRegion::ExactRetirement { object, release: fenced_release })
+            if object == target && (release_version.is_none() || fenced_release.as_ref() == Some(release)))
+            || fence.is_none() && release_version.is_none(); // A legacy attempt may already have cleared its fence.
+        if !reference_revision::may_settle_exact_owned(
+            matches!(&self.admission, Admission::Erasing(current) if current == retirement),
+            owner.id == *deployment && owner.storage_prefix() == retirement.source,
+            matching_fence,
+        ) { return Err(lineage_busy()); }
+        let mut next_owner = owner.clone();
+        next_owner.version = next_reference_revision(owner.version)?;
+        next_owner.storage_regions.remove(&retirement.token);
+
+        let mut next = self.clone();
+        next.admission = Admission::default();
+        next.advance_version()?;
+        Ok((next_owner, next))
+    }
+
     fn advance_version(&mut self) -> Result<()> {
         self.version = next_reference_revision(self.version)?;
         Ok(())
@@ -226,7 +254,7 @@ impl LineageState {
             }
             LineageChange::SettleRetirement { retirement } => {
                 if self.retirement() != Some(&retirement)
-                    || (matches!(retirement.work, RetirementWork::S3 { .. }) && !self.exact_erasure_authorized())
+                    || !matches!(retirement.work, RetirementWork::Local { .. })
                 {
                     return Err(lineage_busy());
                 }

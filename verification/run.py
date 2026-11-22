@@ -2164,6 +2164,17 @@ TLA_CASES = (
     ("SourceRetirementSettlement", "source-retirement-replacement-witness",
      ("INVARIANT Safe", "INVARIANT NeverSettlesThenAdmitsReplacement"), "NeverSettlesThenAdmitsReplacement"),
     ("ExactRetirementRetry", "exact-retirement-retry", None, None),
+    ("ExactMarkerSettlement", "exact-marker-settlement", None, None),
+    ("ExactMarkerSettlement", "exact-marker-delete-marker-by-name",
+     ('Mutation = "none"\nINVARIANT Safe', 'Mutation = "delete_marker_by_name"\nINVARIANT NoReplacementLost'), "NoReplacementLost"),
+    ("ExactMarkerSettlement", "exact-marker-confirm-on-reply",
+     ('Mutation = "none"\nINVARIANT Safe', 'Mutation = "confirm_on_reply"\nINVARIANT SettlementFollowsEvidence'), "SettlementFollowsEvidence"),
+    ("ExactMarkerSettlement", "exact-marker-skip-marker",
+     ('Mutation = "none"\nINVARIANT Safe', 'Mutation = "skip_marker"\nINVARIANT SettlementFollowsEvidence'), "SettlementFollowsEvidence"),
+    ("ExactMarkerSettlement", "exact-marker-leave-owner-closed",
+     ('Mutation = "none"\nINVARIANT Safe', 'Mutation = "leave_owner_closed"\nINVARIANT AtomicReopen'), "AtomicReopen"),
+    ("ExactMarkerSettlement", "exact-marker-late-effect-witness",
+     ("INVARIANT Safe", "INVARIANT NeverSettlesWithLateMarkerEffect"), "NeverSettlesWithLateMarkerEffect"),
     ("HostedExactRetirement", "hosted-exact-retirement", None, None),
     ("HostedExactRetirement", "hosted-exact-retirement-ignore-reference",
      ('Mutation = "none"', 'Mutation = "ignore_reference"'), "Safe"),
@@ -2681,6 +2692,7 @@ def check_apalache(args, scratch, module, name, invariant, length, mutation=None
 
 
 def verify_apalache(args, scratch):
+    check_apalache(args, scratch, "ExactMarkerSettlement", "exact-marker-settlement", "Safe", 11)
     check_apalache(args, scratch, "ReferenceDisposalPublication", "reference-disposal-publication", "Safe", 11)
     check_apalache(args, scratch, "ReferenceReadDisposal", "reference-read-disposal", "Safe", 10)
     for mode in ("validated", "serialized", "blind"):
@@ -3700,6 +3712,42 @@ def verify_native_reference_disposal(args, source):
         print(f"rust-reference-disposal-{name}: control rejected at its declared assertion")
 
 
+
+def verify_native_exact_marker(args, source):
+    env = os.environ | {
+        "CARGO_TARGET_DIR": os.environ.get("CARGO_TARGET_DIR", str(ROOT / "target")),
+        "CARGO_PROFILE_TEST_DEBUG": "0",
+    }
+    test = "store::exact_retirement::tests::the_remote_reaper_keeps_its_exact_reservation_until_both_versions_settle"
+    command = ["cargo", "test", "--locked", "-p", "rtdb-multi", "--features", "dynamodb", "--lib", test, "--", "--exact"]
+    baseline = run_case(command, source / "rust", args.evidence, "rust-exact-marker-baseline", env)
+    if baseline.returncode or f"{test} ... ok" not in baseline.stdout:
+        raise ValueError("the exact marker and data settlement replay did not pass")
+    cases = {
+        "skip-marker": (
+            "rust/crates/multi/src/store/exact_retirement.rs",
+            "    if let Some(release_version) = release_version {\n        provider.erase(&release, release_version).await?;\n    }",
+            "    let _ = release_version;", "the release marker needs its own absence evidence",
+        ),
+        "orphan-owner-fence": (
+            "rust/crates/directory/src/lineage.rs", "next_owner.storage_regions.remove(&retirement.token);",
+            "let _ = retirement.token;", "settlement removes the physical owner's fence",
+        ),
+    }
+    for name, (file, before, after, expected) in cases.items():
+        path = source / file
+        original = path.read_bytes()
+        try:
+            replace_once(path, before, after)
+            result = run_case(command, source / "rust", args.evidence, f"rust-exact-marker-{name}", env)
+            if (result.returncode != 101 or f"{test} ... FAILED" not in result.stdout
+                or expected not in (result.stdout + result.stderr) or "0 passed; 1 failed" not in result.stdout):
+                raise ValueError(f"{name}: exact marker control failed outside its assertion")
+        finally:
+            path.write_bytes(original)
+        print(f"rust-exact-marker-{name}: control rejected at its declared assertion")
+
+
 def verify_native_reference_read(args, source):
     env = os.environ | {
         "CARGO_TARGET_DIR": os.environ.get("CARGO_TARGET_DIR", str(ROOT / "target")),
@@ -3715,11 +3763,15 @@ def verify_native_reference_read(args, source):
         "ignore-owner": (
             "reference.rs", "if let Some(custody) = &self.custody",
             "if let Some(custody) = self.custody.as_ref().filter(|_| false)",
-            "cancelled provider work still needs its physical owner",
+            "the owner fences the retiring data",
         ),
         "admit-after-fence": (
             "reference/custody.rs", "matches!(owner.lifecycle, Lifecycle::Live | Lifecycle::Quarantined),",
             "true,", "a closed physical owner refuses a new provider read",
+        ),
+        "ignore-marker-fence": (
+            "reference/custody.rs", "if *retiring == object || release.as_ref() == Some(&object))",
+            "if *retiring == object)", "the owner also fences the release marker",
         ),
     }
     for name, (file, before, after, expected) in cases.items():
@@ -4717,6 +4769,7 @@ def main():
         "rust/crates/multi/src/logs.rs",
         "rust/crates/multi/src/recovery_holds.rs",
         "rust/crates/multi/src/store.rs",
+        "rust/crates/multi/src/store/exact_retirement.rs",
         "rust/crates/multi/src/catalog_readers.rs",
         "rust/crates/multi/src/packing.rs",
         "rust/crates/directory/src/lib.rs",
@@ -4788,6 +4841,7 @@ def main():
             verify_native_reference_manifest(args, source)
             verify_native_reference_read(args, source)
             verify_native_reference_disposal(args, source)
+            verify_native_exact_marker(args, source)
             verify_compaction_publication_versions(args, source)
             verify_replay_prefix(args, source)
             verify_multi_trim_admission(args, source)
