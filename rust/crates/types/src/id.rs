@@ -155,6 +155,7 @@ const OWNED_SCHEMA_PREFIX: &str = "rtdb_owned_";
 const OWNED_SCHEMA_V1: &str = "rtdb_owned_v1";
 const OWNED_PATH_CATALOG: &str = ".ordered-paths";
 const OWNED_SEARCH_CATALOG: &str = ".search-paths";
+const OWNED_RELATION_CATALOG: &str = ".relation-schemas";
 
 /// A native relation provisioned in the authenticated principal's namespace.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -176,6 +177,7 @@ impl OwnedRelation {
     pub fn path_catalog(owner: &str) -> TableRef { owned_table(owner, OWNED_PATH_CATALOG) }
 
     pub fn search_catalog(owner: &str) -> TableRef { owned_table(owner, OWNED_SEARCH_CATALOG) }
+    pub fn relation_catalog(owner: &str) -> TableRef { owned_table(owner, OWNED_RELATION_CATALOG) }
 }
 
 fn owned_table(owner: &str, name: &str) -> TableRef {
@@ -215,7 +217,7 @@ impl TableRef {
         self.schema == OWNED_SCHEMA_V1
             && self.table.split_once('-').is_some_and(|(owner, name)| {
                 owner.len() == 64 && owner.bytes().all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-                    && (matches!(name, OWNED_PATH_CATALOG | OWNED_SEARCH_CATALOG) || OwnedRelation::new(name).is_ok())
+                    && (matches!(name, OWNED_PATH_CATALOG | OWNED_SEARCH_CATALOG | OWNED_RELATION_CATALOG) || OwnedRelation::new(name).is_ok())
             })
     }
 }

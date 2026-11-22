@@ -62,6 +62,8 @@ impl SourceTransaction {
             let (text, table, ids) = match operation {
                 Operation::Public(TxOp::OwnedDeclareSearchPath { relation, name, column }) =>
                     (owned_path_bytes(relation, name, std::slice::from_ref(column))?, None, 0),
+                Operation::Public(TxOp::OwnedDeclareRelation { relation, schema }) =>
+                    (relation.name().len().checked_add(schema.retained_bytes()).ok_or_else(overflow)?, None, 0),
                 Operation::Public(TxOp::OwnedDeclarePath { relation, name, columns }) =>
                     (owned_path_bytes(relation, name, columns)?, None, 0),
                 Operation::Public(TxOp::OwnedDeadline { .. }) => (0, None, 0),
@@ -280,6 +282,8 @@ impl SourceTransaction {
                 Operation::Public(TxOp::DeleteDocs { ids, .. } | TxOp::EraseDocs { ids, .. }) => ids.ids().len().checked_mul(128).ok_or_else(overflow)?,
                 Operation::Public(TxOp::OwnedDeclareSearchPath { relation, name, column }) =>
                     owned_path_bytes(relation, name, std::slice::from_ref(column))?,
+                Operation::Public(TxOp::OwnedDeclareRelation { relation, schema }) =>
+                    relation.name().len().checked_add(schema.retained_bytes()).ok_or_else(overflow)?,
                 Operation::Public(TxOp::OwnedDeclarePath { relation, name, columns }) =>
                     owned_path_bytes(relation, name, columns)?,
                 Operation::Public(TxOp::OwnedDeadline { .. }) => 0,
@@ -348,6 +352,33 @@ fn owned_path_bytes(relation: &rtdb_types::OwnedRelation, name: &rtdb_types::Own
     })
 }
 
+// A shared document layout can backfill both omitted fields and explicit
+// nulls with the same Arrow null cell.
+fn owned_field_presence(documents: &Documents) -> Value {
+    Value::List(documents.rows().iter().map(|row| Value::List(
+        row.iter().filter(|(_, value)| !matches!(value, Value::Undefined))
+            .map(|(name, _)| Value::Utf8(name.clone())).collect(),
+    )).collect())
+}
+
+fn read_owned_field_presence(value: Value) -> Result<Option<Vec<std::collections::BTreeSet<String>>>> {
+    let rows = match value {
+        Value::Null | Value::Undefined => return Ok(None),
+        Value::List(rows) => rows,
+        _ => return Err(invalid("Owned field presence is not a row list")),
+    };
+    let rows = rows.into_iter().map(|row| {
+        let Value::List(fields) = row else { return Err(invalid("Owned field presence is not a field list")); };
+        let mut names = std::collections::BTreeSet::new();
+        for field in fields {
+            let Value::Utf8(name) = field else { return Err(invalid("Owned field presence name is not text")); };
+            if !names.insert(name) { return Err(invalid("Duplicate owned field presence name")); }
+        }
+        Ok(names)
+    }).collect::<Result<Vec<_>>>()?;
+    Ok(Some(rows))
+}
+
 fn operation_value<'a>(operation: &'a Operation, memory: &Arc<MemoryBudget>) -> Result<(String, SourceOperation<'a>)> {
     let mut body = StructFields::new();
     let mut docs = None;
@@ -367,6 +398,11 @@ fn operation_value<'a>(operation: &'a Operation, memory: &Arc<MemoryBudget>) -> 
             body.insert("name".into(), Value::Utf8(name.name().into()));
             body.insert("column".into(), Value::Utf8(column.clone()));
             "rtdb-owned-search-path-v1"
+        }
+        Operation::Public(TxOp::OwnedDeclareRelation { relation, schema }) => {
+            body.insert("relation".into(), Value::Utf8(relation.name().into()));
+            body.insert("schema".into(), Value::Binary(schema.to_json()?));
+            "rtdb-owned-relation-v1"
         }
         Operation::Public(TxOp::OwnedDeclarePath { relation, name, columns }) => {
             body.insert("relation".into(), Value::Utf8(relation.name().into()));
@@ -396,6 +432,7 @@ fn operation_value<'a>(operation: &'a Operation, memory: &Arc<MemoryBudget>) -> 
                 document_id(document, memory).map(|id| Value::FixedSizeBinary(id.iid().0.to_vec()))
             }).collect::<Result<_>>()?;
             body.insert("iids".into(), Value::List(iids));
+            body.insert("field_presence".into(), owned_field_presence(documents));
             time_fields(&mut body, *valid_from, *valid_to);
             docs = Some((relation.name().to_owned(), SourceDocuments::Rows(documents)));
             if matches!(operation, Operation::Public(TxOp::OwnedInsertDocs { .. })) {
@@ -406,6 +443,9 @@ fn operation_value<'a>(operation: &'a Operation, memory: &Arc<MemoryBudget>) -> 
         }
         Operation::OwnedWriteIids { create_only, relation, documents, iids, valid_from, valid_to } => {
             body.insert("iids".into(), Value::List(iids.iter().map(|iid| Value::FixedSizeBinary(iid.0.to_vec())).collect()));
+            if documents.has_exact_presence() {
+                body.insert("field_presence".into(), owned_field_presence(documents));
+            }
             time_fields(&mut body, *valid_from, *valid_to);
             docs = Some((relation.name().to_owned(), SourceDocuments::Rows(documents)));
             if *create_only { "rtdb-owned-insert-v1" } else { "rtdb-owned-replace-v1" }
@@ -979,11 +1019,13 @@ impl SourceOperationReader<'_> {
         let value_fields: &[&str] = match name.as_str() {
             "sql" => &["query", "args"],
             "rtdb-owned-search-path-v1" => &["relation", "name", "column"],
+            "rtdb-owned-relation-v1" => &["relation", "schema"],
             "rtdb-owned-path-v1" => &["relation", "name", "columns"],
             "rtdb-owned-deadline-v1" => &["until"],
             "rtdb-owned-check-v1" => &["relation", "id", "valid_at", "expected"],
             "rtdb-owned-delete-v1" => &["relation", "id", "_valid_from", "_valid_to"],
-            "rtdb-owned-insert-v1" | "rtdb-owned-replace-v1" | "insert-docs" | "put-docs" | "patch-docs" => &["iids", "_valid_from", "_valid_to"],
+            "rtdb-owned-insert-v1" | "rtdb-owned-replace-v1" => &["iids", "_valid_from", "_valid_to", "field_presence"],
+            "insert-docs" | "put-docs" | "patch-docs" => &["iids", "_valid_from", "_valid_to"],
             "delete-docs" => &["table", "iids", "_valid_from", "_valid_to"],
             "erase-docs" => &["table", "iids"],
             _ => &[],
@@ -998,6 +1040,14 @@ impl SourceOperationReader<'_> {
                     (value("relation")?, value("name")?, value("column")?)
                 else { return Err(invalid("Owned search path declaration has invalid fields")); };
                 TxOp::OwnedDeclareSearchPath { relation: rtdb_types::OwnedRelation::new(relation)?, name: rtdb_types::OwnedRelation::new(name)?, column }
+            }
+            "rtdb-owned-relation-v1" => {
+                let (Value::Utf8(relation), Value::Binary(schema)) = (value("relation")?, value("schema")?)
+                    else { return Err(invalid("Owned relation declaration has invalid fields")); };
+                TxOp::OwnedDeclareRelation {
+                    relation: rtdb_types::OwnedRelation::new(relation)?,
+                    schema: rtdb_types::OwnedSchema::from_json(&schema)?,
+                }
             }
             "rtdb-owned-path-v1" => {
                 let (Value::Utf8(relation), Value::Utf8(name), Value::List(columns)) =
@@ -1057,11 +1107,14 @@ impl SourceOperationReader<'_> {
                     && let Some(documents) = ArrowDocuments::from_source(structs, Arc::clone(&layout), source_bytes, memory)? {
                     return Ok(Operation::PutArrowIids { table: table.expect("plain put has a table"), documents, iids: iids.expect("put contains IIDs"), valid_from, valid_to });
                 }
-                let documents = Documents::read_arrow(structs, layout, name != "patch-docs", memory)?;
                 if let Some(relation) = owned {
+                    let presence = body.column_by_name("field_presence")
+                        .map(|_| value("field_presence").and_then(read_owned_field_presence)).transpose()?.flatten();
+                    let documents = Documents::read_arrow_with_presence(structs, layout, true, presence.as_deref(), memory)?;
                     let iids = iids.ok_or_else(|| invalid("Owned insert operation has no IIDs"))?;
                     return Ok(Operation::OwnedWriteIids { create_only: name == "rtdb-owned-insert-v1", relation, documents, iids, valid_from, valid_to });
                 }
+                let documents = Documents::read_arrow(structs, layout, name != "patch-docs", memory)?;
                 let table = table.expect("ordinary document operation has a table");
                 if name == "insert-docs" {
                     let iids = iids.ok_or_else(|| invalid("Insert operation has no IIDs"))?;

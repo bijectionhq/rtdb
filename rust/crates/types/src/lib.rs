@@ -28,6 +28,8 @@ mod uri;
 mod utf8;
 mod version;
 mod object_sort;
+mod owned_schema;
+pub use owned_schema::OwnedSchema;
 mod memory;
 mod allocation;
 mod clojure_index;

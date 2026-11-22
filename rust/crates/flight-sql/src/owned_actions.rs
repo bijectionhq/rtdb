@@ -25,6 +25,7 @@ use crate::{
 };
 
 pub(crate) const DECLARE_OWNED_SEARCH_PATH_V1: &str = "rtdb.owned.DeclareSearchPath.v1";
+pub(crate) const DECLARE_OWNED_RELATION_V1: &str = "rtdb.owned.DeclareRelation.v1";
 pub(crate) const DECLARE_OWNED_PATH_V1: &str = "rtdb.owned.DeclarePath.v1";
 pub(crate) const CREATE_OWNED_V1: &str = "rtdb.owned.Create.v1";
 pub(crate) const COMMIT_OWNED_V1: &str = "rtdb.owned.Commit.v1";
@@ -154,6 +155,17 @@ fn require_idle(native: &NativeSession) -> Result<(), Status> {
 }
 
 impl Service {
+    pub(crate) async fn declare_owned_relation_action(&self, call: &Call, body: &[u8]) -> Result<ActionResult, Status> {
+        if !self.0.config.owned_native_actions { return Err(unsupported()); }
+        let (relation, json) = split_relation(body)?;
+        if json.len() > rtdb_types::OwnedSchema::MAX_JSON_BYTES {
+            return Err(invalid("Owned declaration exceeds its byte limit"));
+        }
+        let _decoded = call.reserve(wire::add(wire::mul(json.len(), 8)?, 4096)?)?;
+        let schema = rtdb_types::OwnedSchema::from_json(json).map_err(status)?;
+        self.owned_write_reply(call, vec![TxOp::OwnedDeclareRelation { relation, schema }]).await
+    }
+
     pub(crate) async fn declare_owned_path_action(&self, call: &Call, body: &[u8]) -> Result<ActionResult, Status> {
         if !self.0.config.owned_native_actions { return Err(unsupported()); }
         let (relation, arrow) = split_relation(body)?;
@@ -193,7 +205,8 @@ impl Service {
         if !self.0.config.owned_native_actions { return Err(unsupported()); }
         let (relation, arrow) = split_relation(body)?;
         let batch = request_batch(call, arrow)?;
-        let (rows, _decoded) = upload::documents(batch.batch(), self)?;
+        let (mut rows, _decoded) = upload::owned_documents(batch.batch(), self)?;
+        for row in &mut rows { strip_owned_absence(row)?; }
         let operation = TxOp::OwnedInsertDocs {
             relation, documents: Documents::new(rows, self.memory()).map_err(status)?,
             valid_from: None, valid_to: None,
@@ -224,7 +237,7 @@ impl Service {
             let operations_charge = call.reserve(wire::mul(operations, std::mem::size_of::<TxOp>() + 512)?)?;
             writes.try_reserve_exact(operations)
                 .map_err(|_| Status::resource_exhausted("Owned commit operation allocation failed"))?;
-            let (rows, documents_charge) = upload::documents(batch.batch(), self)?;
+            let (rows, documents_charge) = upload::owned_documents(batch.batch(), self)?;
             self.append_owned_commit_group(&mut writes, &relation, rows)?;
             retained.push((operations_charge, documents_charge));
         }
@@ -238,6 +251,7 @@ impl Service {
         rows: Vec<rtdb_types::StructFields<Value>>,
     ) -> Result<(), Status> {
         for mut row in rows {
+            strip_owned_absence(&mut row)?;
             let id = row.get("_id").ok_or_else(|| invalid("Owned commit row has no _id"))?.entity_id().map_err(status)?;
             let Value::Utf8(operation) = row.remove("_op").ok_or_else(|| invalid("Owned commit row has no _op"))? else {
                 return Err(invalid("Owned commit _op must be Utf8"));
@@ -490,6 +504,22 @@ fn point_request(
         None
     };
     Ok((relation, id, valid, identity))
+}
+
+fn strip_owned_absence(row: &mut rtdb_types::StructFields<Value>) -> Result<(), Status> {
+    let absent = match row.remove("_absent") {
+        None | Some(Value::Null | Value::Undefined) => return Ok(()),
+        Some(Value::List(fields)) if fields.len() <= 128 => fields,
+        _ => return Err(invalid("Owned _absent must be a list of at most 128 field names")),
+    };
+    for field in absent {
+        let Value::Utf8(name) = field else { return Err(invalid("Owned _absent field must be text")); };
+        if name.starts_with('_') || !matches!(row.get(name.as_str()), Some(Value::Null | Value::Undefined)) {
+            return Err(invalid("Owned _absent may name only distinct null payload cells"));
+        }
+        row.remove(name.as_str());
+    }
+    Ok(())
 }
 
 fn optional_micros(value: Option<Value>) -> Result<Option<Timestamp>, Status> {

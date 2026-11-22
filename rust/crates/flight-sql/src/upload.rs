@@ -106,6 +106,15 @@ pub(crate) fn domain_documents(batch: &RecordBatch, service: &Service) -> Result
     decode_documents(batch, service, rtdb_columnar::read_value_as)
 }
 
+pub(crate) fn owned_documents(batch: &RecordBatch, service: &Service) -> Result<(Vec<StructFields<Value>>, Arc<MemoryReservation>), Status> {
+    decode_documents(batch, service, |ty, field, column, row| {
+        match ty {
+            rtdb_types::LogicalType::Nothing => Ok(Value::Undefined),
+            _ => rtdb_columnar::read_value_as(ty, field, column, row),
+        }
+    })
+}
+
 fn decode_documents(
     batch: &RecordBatch, service: &Service,
     read: impl Fn(&rtdb_types::LogicalType, &arrow_schema::Field, &dyn arrow_array::Array, usize) -> rtdb_types::Result<Value>,

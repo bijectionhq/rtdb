@@ -34,6 +34,7 @@ pub struct Documents(Arc<DocumentBatch>);
 struct DocumentBatch {
     rows: Vec<StructFields<Value>>,
     layout: DocumentLayout,
+    exact_presence: bool,
     _reservation: Arc<MemoryReservation>,
 }
 
@@ -96,10 +97,12 @@ impl Documents {
             return Err(Anomaly::incorrect("rtdb.tx/document-schema", "Document columns must be unique and cover every field in every row"));
         }
         for row in &mut rows { row.values_mut().for_each(Value::admit_object_dates); }
-        Ok(Self(Arc::new(DocumentBatch { rows, layout: DocumentLayout::Submitted(columns), _reservation: reservation })))
+        Ok(Self(Arc::new(DocumentBatch { rows, layout: DocumentLayout::Submitted(columns), exact_presence: true, _reservation: reservation })))
     }
 
     pub fn rows(&self) -> &[StructFields<Value>] { &self.0.rows }
+
+    pub(crate) fn has_exact_presence(&self) -> bool { self.0.exact_presence }
 
     /// Returns the source column order for this document batch.
     pub fn columns(&self) -> &[String] {
@@ -111,6 +114,16 @@ impl Documents {
     }
 
     pub(crate) fn read_arrow(array: &StructArray, layout: Arc<DecodedDocumentLayout>, omit_nulls: bool, memory: &Arc<MemoryBudget>) -> Result<Self> {
+        Self::read_arrow_with_presence(array, layout, omit_nulls, None, memory)
+    }
+
+    pub(crate) fn read_arrow_with_presence(
+        array: &StructArray, layout: Arc<DecodedDocumentLayout>, omit_nulls: bool,
+        presence: Option<&[BTreeSet<String>]>, memory: &Arc<MemoryBudget>,
+    ) -> Result<Self> {
+        if presence.is_some_and(|rows| rows.len() != array.len()) {
+            return Err(Anomaly::incorrect("rtdb.tx/document-presence", "Document presence must cover every row"));
+        }
         if array.fields() != &layout.physical {
             return Err(Anomaly::incorrect("rtdb.tx/document-schema", "Document arrays and their column layout differ"));
         }
@@ -123,9 +136,13 @@ impl Documents {
         let mut rows = Vec::with_capacity(array.len());
         for row in 0..array.len() {
             if array.is_null(row) { return Err(Anomaly::incorrect("rtdb.tx/invalid-ipc", "Document is not a struct")); }
-            let preserve_null = |field: &arrow_schema::Field| !omit_nulls || field.name() == "_id";
+            let explicit = presence.map(|rows| &rows[row]);
+            let preserve_null = |field: &arrow_schema::Field| explicit.is_some() || !omit_nulls || field.name() == "_id";
             let children = || array.fields().iter().zip(array.columns()).zip(&readers).filter(|((field, column), _)| {
-                preserve_null(field) || bottom(field) || (field.data_type() != &DataType::Null && column.is_valid(row))
+                explicit.map_or_else(
+                    || preserve_null(field) || bottom(field) || (field.data_type() != &DataType::Null && column.is_valid(row)),
+                    |fields| fields.contains(field.name()),
+                )
             });
             let temporary = children().try_fold(4096usize, |bytes, ((field, column), _)| {
                 let value = if bottom(field) { 0 } else { rtdb_columnar::estimate_read_cell_bytes(field, column.as_ref(), row)? };
@@ -142,11 +159,14 @@ impl Documents {
                     document.insert(field.name().clone(), value);
                 }
             }
+            if explicit.is_some_and(|fields| document.len() != fields.len()) {
+                return Err(Anomaly::incorrect("rtdb.tx/document-presence", "Document presence names an unknown column"));
+            }
             retained = retained.checked_add(Value::document_retained_bytes(&document)?).ok_or_else(overflow)?;
             reservation.shrink_to(retained)?;
             rows.push(document);
         }
-        Ok(Self(Arc::new(DocumentBatch { rows, layout: DocumentLayout::Decoded(layout), _reservation: reservation })))
+        Ok(Self(Arc::new(DocumentBatch { rows, layout: DocumentLayout::Decoded(layout), exact_presence: presence.is_some(), _reservation: reservation })))
     }
 }
 
@@ -697,6 +717,7 @@ pub enum TxOp {
     Sql { sql: String, args: Option<SqlArguments> },
     SqlBytes { sql: String, arg_bytes: RetainedBytes },
     OwnedDeclareSearchPath { relation: rtdb_types::OwnedRelation, name: rtdb_types::OwnedRelation, column: String },
+    OwnedDeclareRelation { relation: rtdb_types::OwnedRelation, schema: rtdb_types::OwnedSchema },
     OwnedDeclarePath { relation: rtdb_types::OwnedRelation, name: rtdb_types::OwnedRelation, columns: Vec<String> },
     OwnedDeadline { until: Timestamp },
     OwnedCheck { relation: rtdb_types::OwnedRelation, id: EntityId, valid_at: Timestamp, expected: Option<Timestamp> },
@@ -713,7 +734,7 @@ pub enum TxOp {
 
 impl TxOp {
     pub fn is_owned(&self) -> bool {
-        matches!(self, Self::OwnedDeclareSearchPath { .. } | Self::OwnedDeclarePath { .. } | Self::OwnedDeadline { .. } | Self::OwnedCheck { .. } | Self::OwnedDelete { .. } | Self::OwnedReplaceDocs { .. } | Self::OwnedInsertDocs { .. })
+        matches!(self, Self::OwnedDeclareRelation { .. } | Self::OwnedDeclareSearchPath { .. } | Self::OwnedDeclarePath { .. } | Self::OwnedDeadline { .. } | Self::OwnedCheck { .. } | Self::OwnedDelete { .. } | Self::OwnedReplaceDocs { .. } | Self::OwnedInsertDocs { .. })
     }
 }
 
