@@ -170,6 +170,15 @@ async fn build_batches_at(
             let input = BatchDistinct::new(input, runtime.output(), execution, projected)?;
             Ok(Some((Box::new(input), projected)))
         }
+        RelationNode::Aggregate { groups, aggregates, .. } if output == BatchOutput::Arrow && execution.context.tracer.is_none() => {
+            if !crate::aggregate::AggregateCursor::writes_scalar_vectors(&runtime, groups, aggregates)? { return Ok(None); }
+            let child = runtime.child(0)?;
+            let schema = child.schema().clone();
+            let Some((input, projected)) = build_batches(child, execution.child(0), pushdowns).await? else { return Ok(None); };
+            let aggregate = crate::aggregate::AggregateCursor::from_batches(input, projected, schema,
+                groups.clone(), aggregates.clone(), runtime, execution)?;
+            Ok(Some((Box::new(aggregate), false)))
+        }
         RelationNode::Sort { order_by, .. } | RelationNode::SortLimit { order_by, .. } if output == BatchOutput::Arrow => {
             if matches!(relation.node(), RelationNode::SortLimit { fetch: Some(_), .. }) && !execution.context.accelerators.is_empty()
                 && let Some(batches) = build_ordered_columns(Arc::clone(&runtime), execution.clone(), (0..runtime.schema().len()).collect()).await?
@@ -385,6 +394,10 @@ fn batch_shape_at(runtime: &Arc<EmittedRelation>, output: BatchOutput) -> Result
                 .map(|(left, right)| left || (*operator == SetOperator::Union && right))
         }
         RelationNode::Distinct { .. } if output == BatchOutput::Arrow => batch_shape(&runtime.child(0)?, output)?,
+        RelationNode::Aggregate { groups, aggregates, .. } if output == BatchOutput::Arrow => {
+            if !crate::aggregate::AggregateCursor::writes_scalar_vectors(runtime, groups, aggregates)? { return Ok(None); }
+            batch_shape(&runtime.child(0)?, BatchOutput::Pages)?.map(|_| false)
+        }
         RelationNode::Join { kind: rtdb_plan::JoinKind::Cross, .. } if output == BatchOutput::Arrow => {
             batch_shape(&runtime.child(0)?, output)?.zip(batch_shape(&runtime.child(1)?, output)?).map(|(left, right)| left || right)
         }

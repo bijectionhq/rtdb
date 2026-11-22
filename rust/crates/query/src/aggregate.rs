@@ -8,6 +8,7 @@ use rtdb_plan::{AggregateExpr, AggregateFunction, Binder, NamedExpr, PercentileF
 use rtdb_types::{LogicalType, Result, ScalarType, Value};
 
 use crate::context::Execution;
+use crate::columnar::{BatchCursor, Column, ColumnBatch};
 use crate::cursor::{BoxCursor, OwnedRow, RowCursor};
 use crate::operators::rows_equal;
 use crate::pages::{BoxPageCursor, OwnedPage, PageBuilder, PageCursor};
@@ -113,6 +114,12 @@ pub(crate) struct AggregateCursor {
     input: Option<AggregateInput>, schema: Schema, groups: Vec<NamedExpr>, aggregates: Vec<AggregateExpr>,
     runtime: Arc<EmittedRelation>, execution: Execution,
 }
+
+struct Reduced {
+    keys: GroupKeys,
+    columns: Vec<AggregateColumn>,
+    _reservation: Arc<rtdb_columnar::MemoryReservation>,
+}
 impl AggregateCursor {
     pub fn new(input: BoxPageCursor, schema: Schema, groups: Vec<NamedExpr>, aggregates: Vec<AggregateExpr>, runtime: Arc<EmittedRelation>, execution: Execution) -> Result<Self> {
         Self::with_input(AggregateInput::Pages(input), schema, groups, aggregates, runtime, execution)
@@ -142,6 +149,19 @@ impl AggregateCursor {
         Ok(Self { input: Some(input), schema, groups, aggregates, runtime, execution })
     }
     fn column_positions(&self) -> Option<Vec<usize>> { Self::reads_columns(&self.schema, &self.groups, &self.aggregates) }
+
+    pub fn writes_scalar_vectors(runtime: &EmittedRelation, groups: &[NamedExpr], aggregates: &[AggregateExpr]) -> Result<bool> {
+        if !groups.is_empty() || aggregates.is_empty() { return Ok(false); }
+        let child = runtime.child(0)?;
+        if Self::reads_columns(child.schema(), groups, aggregates).is_none() { return Ok(false); }
+        let float = LogicalType::Scalar(ScalarType::F64);
+        Ok(aggregates.iter().zip(runtime.aggregates()?).all(|(aggregate, types)| match aggregate.function.canonical() {
+            AggregateFunction::Count | AggregateFunction::CountStar => true,
+            AggregateFunction::Sum | AggregateFunction::Average =>
+                without_nullability(&types.input) == &float && without_nullability(types.output_type()) == &float,
+            _ => false,
+        }))
+    }
     /// The input positions every aggregate and group reads, when each reads only its argument or key column.
     pub fn reads_columns(schema: &Schema, groups: &[NamedExpr], aggregates: &[AggregateExpr]) -> Option<Vec<usize>> {
         let mut positions = Vec::new();
@@ -157,10 +177,10 @@ impl AggregateCursor {
         Some(positions)
     }
 
-    async fn aggregate(&mut self, mut input: AggregateInput) -> Result<Option<OwnedPage>> {
+    async fn reduce(&mut self, mut input: AggregateInput) -> Result<Reduced> {
         let memory = &self.execution.context.memory;
         let mut keys = GroupKeys::new(self.groups.is_empty())?;
-        let _columns = memory.reserve(self.aggregates.len().checked_mul(std::mem::size_of::<AggregateColumn>()).ok_or_else(||invalid("aggregate-size","Aggregate column container overflow"))?)?;
+        let reservation = memory.reserve(self.aggregates.len().checked_mul(std::mem::size_of::<AggregateColumn>()).ok_or_else(||invalid("aggregate-size","Aggregate column container overflow"))?)?;
         let mut columns = self.aggregates.iter().map(|aggregate|AggregateColumn::new(aggregate,&self.execution)).collect::<Result<Vec<_>>>()?;
         let positions = self.column_positions();
         let mut typed_groups = TypedGroups::default();
@@ -216,6 +236,12 @@ impl AggregateCursor {
                 column.aggregate(rows,&mapping,keys.count,aggregate,types,&self.schema,&self.execution).await?;
             }
         }
+        Ok(Reduced { keys, columns, _reservation: reservation })
+    }
+
+    async fn aggregate(&mut self, input: AggregateInput) -> Result<Option<OwnedPage>> {
+        let Reduced { keys, columns, _reservation } = self.reduce(input).await?;
+        let memory = &self.execution.context.memory;
         let mut output = PageBuilder::new(keys.count,memory)?;
         if keys.global { output.push(OwnedRow::copy_parts(&[],0,self.aggregates.len(),memory)?)?; }
         for (index,key) in keys.keys.iter().enumerate() {
@@ -234,6 +260,46 @@ impl PageCursor for AggregateCursor {
         self.execution.context.check_cancelled()?;
         let Some(input) = self.input.take() else { return Ok(None); };
         self.aggregate(input).await
+    }
+}
+
+#[async_trait]
+impl BatchCursor for AggregateCursor {
+    async fn next_batch(&mut self) -> Result<Option<ColumnBatch>> {
+        self.execution.context.check_cancelled()?;
+        let Some(input) = self.input.take() else { return Ok(None); };
+        let Reduced { columns, _reservation, .. } = self.reduce(input).await?;
+        let context = &self.execution.context;
+        let schema = self.runtime.schema();
+        let bytes = crate::runtime_schema::schema_bound(schema)?.checked_add(
+            columns.len().checked_mul(512).ok_or_else(|| invalid("aggregate-size", "Aggregate output exceeds addressable memory"))?,
+        ).ok_or_else(|| invalid("aggregate-size", "Aggregate output exceeds addressable memory"))?;
+        let reservation = context.memory.reserve(bytes)?;
+        let mut vectors = Vec::with_capacity(columns.len());
+        for ((column, aggregate), field) in columns.into_iter().zip(&self.aggregates).zip(schema.fields()) {
+            context.check_cancelled()?;
+            let Accumulation::Scalar(mut states) = column.accumulation else {
+                return Err(invalid("aggregate-input", "A scalar vector aggregate collected input rows"));
+            };
+            states.ensure(1, &self.execution)?;
+            let state = &states.values[0];
+            let array: arrow_array::ArrayRef = match aggregate.function {
+                AggregateFunction::Count | AggregateFunction::CountStar => Arc::new(arrow_array::Int64Array::from(vec![state.count])),
+                AggregateFunction::Sum | AggregateFunction::Average => {
+                    let sum = match state.finish(aggregate, &self.execution.scope()?)? {
+                        Value::F64(value) => Some(value),
+                        Value::Null => None,
+                        _ => return Err(invalid("aggregate-input", "Expected a floating-point aggregate state")),
+                    };
+                    Arc::new(arrow_array::Float64Array::from(vec![sum]))
+                }
+                _ => return Err(invalid("aggregate-input", "Aggregate does not emit a scalar vector")),
+            };
+            let logical = field.data_type.clone();
+            let field = Arc::new(rtdb_columnar::to_field(&field.name, &logical)?);
+            vectors.push(Column::Arrow { array, field, logical: Some(logical) });
+        }
+        ColumnBatch::settled(vectors, 1, reservation).map(Some)
     }
 }
 
