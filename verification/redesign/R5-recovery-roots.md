@@ -188,6 +188,35 @@ It abstracts the index decoder, directory transactions and snapshot execution.
 Live provider qualification still needs rolling deployment evidence and the exact provider's listing, deletion and credential behavior.
 The hosted reaper role needs transactional puts confined to the cell's `~reference-revision/` rows in `deployment-names` and a deployment-table condition check for whole-residence disposal.
 
+### Never-versioned serving buckets
+
+The Bijection hosted serving bucket policy explicitly denies enabling S3 versioning, replication and object lock for every principal.
+The recovery bucket is versioned and serves a separate purpose.
+The serving reaper points at the never-versioned bucket, so exact-version reclamation does not cover that deployment profile.
+[Serving bucket policy](https://github.com/bijectionhq/bijection/blob/dca74b6ee7dae24a70b4aaa37f5a00072bcda041/services/big-brain/infra/runtime/cell/hosting_rtdb_storage.tf) · [Reaper configuration](https://github.com/bijectionhq/bijection/blob/dca74b6ee7dae24a70b4aaa37f5a00072bcda041/services/big-brain/infra/runtime/cell/hosting_rtdb_runtime.tf)
+
+A provider mode that preserves the serving bucket contract is to retire a key by conditionally replacing its payload with a permanent tombstone.
+The lineage reservation and physical-owner fence still order retirement against recovery, fork publication and provider reads.
+The provider operation compares the selected ETag for a present object, or uses create-if-absent for a missing key with authenticated publication evidence.
+If a competing create wins, the old reservation cannot overwrite its publication.
+A fresh same-key observation of the tombstone and a verified never-versioned policy establish settlement.
+The marker prevents a delayed create-if-absent request from reviving the retired key even after the lineage reopens.
+Only whole-residence disposal can remove the tombstone, after publishing the residence's terminal fence and settling its outstanding uploads.
+The key vault already uses this type of conditional withdrawal with post-operation observations.
+[AWS conditional writes](https://docs.aws.amazon.com/AmazonS3/latest/userguide/conditional-writes.html) · [Key vault implementation](../../rust/crates/multi/src/keys/s3.rs)
+
+Provider status must be enforced for the lifetime of the residence.
+A versioning change between the preflight read and the conditional write could retain the original payload beneath the tombstone even if a later verification refuses settlement.
+Enabling versioning on an existing bucket also leaves pre-existing objects with `null` version IDs.
+[AWS versioning semantics](https://docs.aws.amazon.com/AmazonS3/latest/userguide/Versioning.html)
+
+The proposed runtime requires an identity bound to the physical key and retirement evidence, a reaper-only conditional replacement grant, and reads and listings that treat authenticated tombstones as retired.
+Path-based collectors must share that authority before a namespace is enrolled, so an ordinary delete cannot clear a tombstone or allow an ETag to be reused.
+The bounded model covers one key, one held read, a previously admitted create and two outstanding conditional replacement requests.
+TLC explored 62 states, rejected six unsafe changes, and reached settlement with an outstanding create and, in a separate witness, an outstanding retirement request.
+Claiming full release coverage, qualifying the bucket policy and adapter, and handling historical keys that may already have been physically reused are still runtime obligations.
+[Never-versioned retirement model](../tla/UnversionedRetirement.tla)
+
 ### Shared fork publication and referrer inventories
 
 Shared forks publish their child record, name and an advanced lineage revision in one directory transaction.

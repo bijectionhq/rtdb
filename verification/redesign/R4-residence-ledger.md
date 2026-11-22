@@ -84,9 +84,11 @@ A trie release from a legacy marker awaits a receipt in an enrolled residence.
 [HostedTrieReclamation.tla](../tla/HostedTrieReclamation.tla) models the receipt, floor, release record, stale observations and a second residence with independent holds.
 It treats file identity within one residence and completion of provider effects as premises.
 The retirement plan already observes loose provider versions when available.
-The hosted reaper settles witnessed loose files against their immutable S3 versions after validating current manifests and fencing inherited reads at the physical owner.
+The hosted reaper settles witnessed loose files and covered checkpoint packs against their immutable S3 versions after validating current manifests and fencing inherited reads at the physical owner.
 For older markers, it can recover the version from the authenticated receipt for the same installed cut and object.
-Pack coverage, releases without a matching publication witness and provider qualification remain open.
+Mixed-content packs, releases without a matching publication witness and provider qualification remain open.
+The Bijection serving bucket denies versioning, so its physical retirement needs a separately qualified provider operation under the same directory authority.
+[Hosted serving bucket contract](R5-recovery-roots.md#never-versioned-serving-buckets)
 
 ## Tests and proofs
 
