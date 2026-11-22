@@ -32,6 +32,7 @@ impl Drop for ReplicaReadSession {
 }
 
 pub struct Database {
+    pub(crate) protected_equality_epoch: uuid::Uuid,
     name: String,
     configuration: DatabaseConfig,
     read_only: bool,
@@ -369,7 +370,7 @@ impl DatabaseFactory {
             let fragment_residence = resources.fragment_storage.map(|storage| rtdb_query::FragmentResidence {
                 storage, replica_epoch: logs.replica_epoch.0,
             });
-            let database = Arc::new(Database { name, configuration, read_only, partition, storage, logs, replication, replica_read_index: opened_logs.replica_read_index,
+            let database = Arc::new(Database { protected_equality_epoch: uuid::Uuid::new_v4(), name, configuration, read_only, partition, storage, logs, replication, replica_read_index: opened_logs.replica_read_index,
                 await_authority: opened_logs.await_authority,
                 transaction_admission: RwLock::default(), submitted_bytes: AtomicU64::new(0), replica_read_sessions: AtomicUsize::new(0),
                 query_cpu, fragment_residence, compaction, artefacts, ordered_cycle, cancellation: cancellation.clone(), io: Arc::clone(&io), currency });

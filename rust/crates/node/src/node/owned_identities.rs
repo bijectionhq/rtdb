@@ -53,6 +53,37 @@ impl OwnedReadSession {
         Ok((page, witness))
     }
 
+    /// Compare resident derived coverage with the exact carrier events in
+    /// this originating hold. Coverage is comparable only in one live
+    /// database attachment and placed writer history.
+    pub async fn protected_carrier_coverage(
+        &self,
+        relation: &OwnedRelation,
+        prefix: &str,
+        scope: rtdb_types::PlacedAttemptScope,
+    ) -> Result<([u8; 72], OwnedRangeWitness)> {
+        self.admit_read().await?;
+        if self.witness_scope != Some(scope) || relation.name() != "fact_unit_column_payloads"
+            || !valid_carrier_prefix(prefix)
+        {
+            return Err(protected_page_unavailable());
+        }
+        let witness = self.relation_witness(relation)?.ok_or_else(protected_page_unavailable)?;
+        let database = self.context.catalog.database(&self.database)?;
+        let [snapshot] = database.partitions.as_slice() else {
+            return Err(protected_page_unavailable());
+        };
+        let purge = snapshot.relation_event_frontier(&relation.purge_table(&self.owner))?;
+        let current = self.node.attached_database(&self.database, Some(&self.attachment))?;
+        let mut coverage = [0; 72];
+        coverage[..40].copy_from_slice(&scope.encode());
+        coverage[40..56].copy_from_slice(current.protected_equality_epoch.as_bytes());
+        coverage[56..64].copy_from_slice(&witness.frontier.to_be_bytes());
+        coverage[64..].copy_from_slice(&purge.to_be_bytes());
+        self.check_relation(relation)?;
+        Ok((coverage, witness))
+    }
+
     /// Reads live local shadow keys, including tombstones, for one admitted world.
     pub async fn world_identity_candidates(
         &self, world: rtdb_types::Iid, relation: &OwnedRelation, valid: Timestamp,
