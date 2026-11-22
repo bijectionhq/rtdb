@@ -178,7 +178,7 @@ fn stored(sources: &[Source], cells: &[(usize, usize)], name: &str) -> Result<Co
     }).collect();
     let Some((_, field, logical)) = children.iter().flatten().next().cloned() else { return Ok(Column::Values(vec![Value::Null; cells.len()])) };
     let uniform = children.iter().all(|child| child.as_ref().is_some_and(|(_, other, other_logical)| other == &field && other_logical == &logical));
-    if uniform && flat(field.data_type()) {
+    if uniform && (flat(field.data_type()) || children.iter().flatten().all(|(array, ..)| dense_float_list(array.as_ref()))) {
         let arrays: Vec<&dyn Array> = children.iter().flatten().map(|(array, ..)| array.as_ref()).collect();
         let array = interleave(&arrays, cells)?;
         return Ok(Column::Arrow { array, field, logical });
@@ -285,6 +285,13 @@ pub(crate) fn interleave(arrays: &[&dyn Array], cells: &[(usize, usize)]) -> Res
         arrow_select::interleave::interleave(&children, &picks[id as usize]).map_err(|error| invalid("column-gather", error))
     }).collect::<Result<Vec<_>>>()?;
     Ok(Arc::new(UnionArray::try_new(fields.clone(), datafusion_common::arrow::buffer::ScalarBuffer::from(ids), Some(datafusion_common::arrow::buffer::ScalarBuffer::from(offsets)), children).map_err(|error| invalid("column-gather", error))?))
+}
+
+fn dense_float_list(array: &dyn Array) -> bool {
+    let DataType::FixedSizeList(item, width) = array.data_type() else { return false };
+    *width > 0 && item.metadata().is_empty() && matches!(item.data_type(), DataType::Float32 | DataType::Float64)
+        && array.as_any().downcast_ref::<arrow_array::FixedSizeListArray>()
+            .is_some_and(|list| item.is_nullable() || list.values().null_count() == 0)
 }
 
 pub(crate) fn flat(data_type: &DataType) -> bool {
@@ -1014,9 +1021,9 @@ impl Column {
 
 /// Projects batches through expressions computed over whole columns where the kernel's arithmetic is exactly the
 /// evaluator's, and row by row through the evaluator for any expression or batch where it isn't.
-pub(crate) struct BatchExpressions { input: BoxBatchCursor, schema: rtdb_plan::Schema, expressions: Vec<rtdb_plan::Expr>, clocked: Option<Vec<rtdb_plan::Expr>>, execution: crate::context::Execution }
+pub(crate) struct BatchExpressions { input: BoxBatchCursor, schema: rtdb_plan::Schema, expressions: Vec<rtdb_plan::Expr>, clocked: Option<Vec<rtdb_plan::Expr>>, cosine: Vec<Option<crate::cosine::Projection>>, execution: crate::context::Execution }
 impl BatchExpressions {
-    pub fn new(input: BoxBatchCursor, schema: rtdb_plan::Schema, expressions: Vec<rtdb_plan::Expr>, execution: crate::context::Execution) -> Self { Self { input, schema, expressions, clocked: None, execution } }
+    pub fn new(input: BoxBatchCursor, schema: rtdb_plan::Schema, expressions: Vec<rtdb_plan::Expr>, execution: crate::context::Execution) -> Self { Self { input, schema, expressions, clocked: None, cosine: Vec::new(), execution } }
 }
 
 /// The expressions with each read of the query clock replaced by the instant the evaluator reads, for the kernels;
@@ -1043,13 +1050,23 @@ impl BatchCursor for BatchExpressions {
     async fn next_batch(&mut self) -> Result<Option<ColumnBatch>> {
         let Some(batch) = self.input.next_batch().await? else { return Ok(None) };
         self.execution.context.check_cancelled()?;
-        if self.clocked.is_none() { self.clocked = Some(read_clock(&self.expressions, &self.execution).await?); }
-        let clocked = self.clocked.as_deref().unwrap_or_default();
         let parameters = self.execution.parameters.values();
+        if self.clocked.is_none() {
+            let clocked = read_clock(&self.expressions, &self.execution).await?;
+            self.cosine = clocked.iter().map(|expr| crate::cosine::Projection::bind(expr, &self.schema, parameters, &self.execution.context.memory)).collect::<Result<_>>()?;
+            self.clocked = Some(clocked);
+        }
+        let clocked = self.clocked.as_deref().unwrap_or_default();
         let mut page = None;
         let mut columns = Vec::with_capacity(self.expressions.len());
         let mut reservation = self.execution.context.memory.reserve(256)?;
-        for (expression, kernel) in self.expressions.iter().zip(clocked) {
+        for ((expression, kernel), cosine) in self.expressions.iter().zip(clocked).zip(&self.cosine) {
+            if let Some(cosine) = cosine {
+                let bound = batch.len.checked_mul(16).and_then(|bytes| bytes.checked_add(256)).ok_or_else(size_error)?;
+                let lease = Arc::get_mut(&mut reservation).ok_or_else(|| invalid("column-size", "A column page's charge is shared"))?;
+                lease.grow_to(lease.bytes().checked_add(bound).ok_or_else(size_error)?)?;
+                if let Some(column) = cosine.column(&batch) { columns.push(column); continue; }
+            }
             if let Some(bound) = projection::bound(kernel, &self.schema, &batch)? {
                 let lease = Arc::get_mut(&mut reservation).ok_or_else(|| invalid("column-size", "A column page's charge is shared"))?;
                 lease.grow_to(lease.bytes().checked_add(bound).ok_or_else(size_error)?)?;
@@ -1181,7 +1198,7 @@ pub(crate) mod projection {
             Expr::Call { name, args, .. } if name == "coalesce" => args.iter().all(shaped),
             Expr::Call { name, args, .. } if clock(name, args) => true,
             Expr::Cast { expr: inner, target: CastTarget::Fixed(_) } if shaped(inner) => true,
-            expr => crate::vector::lowerable(expr),
+            expr => crate::cosine::shaped(expr) || crate::vector::lowerable(expr),
         }
     }
     fn literal(value: &Value) -> bool { constant(value).is_some() || matches!(value, Value::Utf8(_) | Value::Bool(_) | Value::Timestamp { .. }) }

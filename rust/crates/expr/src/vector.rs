@@ -25,8 +25,54 @@ pub(crate) fn cosine_distance(left: &Value, right: &Value) -> Result<Value> {
         left_squared += left * left;
         right_squared += right * right;
     }
+    Ok(Value::F64(distance(dot, left_squared, right_squared)))
+}
+
+fn distance(dot: f64, left_squared: f64, right_squared: f64) -> f64 {
     let similarity = dot / (left_squared * right_squared).sqrt();
-    Ok(Value::F64(1.0 - similarity.clamp(-1.0, 1.0)))
+    1.0 - similarity.clamp(-1.0, 1.0)
+}
+
+pub struct CosineVector {
+    components: Vec<f64>,
+    squared: f64,
+}
+
+impl CosineVector {
+    pub fn prepare<'a>(values: impl Iterator<Item = &'a Value> + Clone, dimensions: usize) -> Result<Self> {
+        let mut scale = 0.0_f64;
+        let mut components = Vec::with_capacity(dimensions);
+        for value in values {
+            let value = component(value)?;
+            scale = scale.max(value.abs());
+            components.push(value);
+        }
+        if scale == 0.0 {
+            return Err(Anomaly::incorrect("rtdb.vector/zero-norm", "Cosine distance requires a nonzero vector"));
+        }
+        let mut squared = 0.0;
+        for value in &mut components {
+            *value /= scale;
+            squared += *value * *value;
+        }
+        Ok(Self { components, squared })
+    }
+
+    pub fn dimensions(&self) -> usize { self.components.len() }
+
+    pub fn score(&self, values: impl ExactSizeIterator<Item = f64> + Clone) -> Option<f64> {
+        if values.len() != self.dimensions() { return None; }
+        let scale = values.clone().try_fold(0.0_f64, |scale, value| value.is_finite().then(|| scale.max(value.abs())))?;
+        if scale == 0.0 { return None; }
+        let mut dot = 0.0;
+        let mut squared = 0.0;
+        for (value, prepared) in values.zip(&self.components) {
+            let value = value / scale;
+            dot += value * prepared;
+            squared += value * value;
+        }
+        Some(distance(dot, squared, self.squared))
+    }
 }
 
 fn components(vector: &Value) -> Result<&[Value]> {
@@ -51,4 +97,22 @@ fn component(value: &Value) -> Result<f64> {
     number(value)
         .filter(|value| value.is_finite())
         .ok_or_else(|| Anomaly::incorrect("rtdb.vector/component", "Vector components must be finite numbers"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{CosineVector, cosine_distance};
+    use rtdb_types::Value;
+
+    #[test]
+    fn prepared_distance_has_the_scalar_bits() {
+        let query = [1e290, -1e-210, 0.0, 1e290].map(Value::F64);
+        let prepared = CosineVector::prepare(query.iter(), query.len()).unwrap();
+        for row in [[1e-290, 1e-290, 0.0, 1e-290], [1.0, -2.0, -0.0, 3.0], [-10.0, -100.0, 5.0, 0.01]] {
+            let Value::F64(expected) = cosine_distance(&Value::List(row.map(Value::F64).to_vec()), &Value::List(query.to_vec())).unwrap() else { unreachable!() };
+            assert_eq!(prepared.score(row.into_iter()).unwrap().to_bits(), expected.to_bits());
+        }
+        assert_eq!(prepared.score([0.0; 4].into_iter()), None);
+        assert_eq!(prepared.score([1.0, f64::NAN, 0.0, 1.0].into_iter()), None);
+    }
 }

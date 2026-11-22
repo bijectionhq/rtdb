@@ -20,6 +20,7 @@ mod scan;
 mod fragment;
 mod columnar;
 mod vector;
+mod cosine;
 mod page_metadata;
 mod scan_tasks;
 mod spill;
