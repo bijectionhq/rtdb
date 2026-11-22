@@ -917,7 +917,7 @@ pub enum TxOp {
     HostedControl(crate::HostedControlWrite),
     OwnedDeadline { until: Timestamp },
     OwnedCheckWorldScope { scope: rtdb_types::PlacedAttemptScope },
-    OwnedPublishWorld { world: rtdb_types::Iid, attempt: String, fingerprint: [u8; 32], expected: Option<Timestamp> },
+    OwnedPublishWorld { world: rtdb_types::Iid, attempt: String, fingerprint: [u8; 32], expected: Option<Timestamp>, advance_to: Option<Timestamp> },
     OwnedCheckWorldPurge { relation: rtdb_types::OwnedRelation, frontier: i64 },
     OwnedCheckRange {
         relation: rtdb_types::OwnedRelation, basis: rtdb_types::TransactionKey,

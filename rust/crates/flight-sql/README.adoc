@@ -496,6 +496,9 @@ The remaining bytes are the existing hosted control groups. Only check rows from
 The ordered transaction checks the world registration, placement, deadline, local point revisions, root erasure frontiers, and hosted ownership before issuing the transaction-key receipt.
 
 `rtdb.owned.CommitWorld.v4` publishes an admitted single-world overlay and application clock atomically.
+`rtdb.owned.CommitWorldClock.v1` publishes a clock alone using the same held conditions, deadline, hosted ownership checks, and immutable attempt marker.
+Its body shares the v4 prefix through the expected clock, followed by the target clock as a big-endian i64 and the check-only hosted control groups.
+The target must strictly exceed the held clock and be at or before the ordered commit time.
 The prefix through the witness list matches v3, followed by 22 lowercase hexadecimal attempt ID bytes, a 32-byte request fingerprint, and the expected application clock as signed Int64 (minimum for no local publication).
 A big-endian u32 length frames the existing overlay relation groups, followed by the check-only hosted control groups.
 The ordered resolver validates the original witnesses and advances the expected clock by one microsecond from the prior local clock or archived parent basis.

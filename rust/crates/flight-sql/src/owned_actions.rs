@@ -166,8 +166,10 @@ pub(crate) enum WorldCommitFormat {
     ConditionedOverlay,
     Validation,
     Publication,
+    Clock,
 }
 
+pub(crate) const COMMIT_WORLD_CLOCK_V1: &str = "rtdb.owned.CommitWorldClock.v1";
 pub(crate) const COMMIT_WORLD_V4: &str = "rtdb.owned.CommitWorld.v4";
 pub(crate) const COMMIT_WORLD_V3: &str = "rtdb.owned.CommitWorld.v3";
 pub(crate) const COMMIT_WORLD_V2: &str = "rtdb.owned.CommitWorld.v2";
@@ -1587,7 +1589,7 @@ impl Service {
         let host = self.0.config.owned_world_host.as_ref().ok_or_else(unsupported)?;
         let (world, groups) = body.split_first_chunk::<16>().ok_or_else(|| invalid("Owned world commit has no world UUID"))?;
         let world = Uuid::from_bytes(*world);
-        let (deadline, groups) = if matches!(format, WorldCommitFormat::Validation | WorldCommitFormat::Publication) {
+        let (deadline, groups) = if matches!(format, WorldCommitFormat::Validation | WorldCommitFormat::Publication | WorldCommitFormat::Clock) {
             let (deadline, groups) = groups.split_first_chunk::<8>().ok_or_else(|| invalid("Owned world validation has no deadline"))?;
             (Some(Timestamp(i64::from_be_bytes(*deadline))), groups)
         } else {
@@ -1608,13 +1610,19 @@ impl Service {
         } else {
             (None, Vec::new(), None, groups)
         };
-        let (publication, overlay, groups) = if matches!(format, WorldCommitFormat::Publication) {
+        let (publication, overlay, groups) = if matches!(format, WorldCommitFormat::Publication | WorldCommitFormat::Clock) {
             let (attempt, rest) = groups.split_first_chunk::<22>().ok_or_else(|| invalid("Missing world attempt identity"))?;
             let (fingerprint, rest) = rest.split_first_chunk::<32>().ok_or_else(|| invalid("Missing world attempt fingerprint"))?;
             let (clock, rest) = rest.split_first_chunk::<8>().ok_or_else(|| invalid("Missing expected world clock"))?;
-            let (length, rest) = rest.split_first_chunk::<4>().ok_or_else(|| invalid("Missing world overlay length"))?;
-            let (overlay, groups) = rest.split_at_checked(u32::from_be_bytes(*length) as usize)
-                .ok_or_else(|| invalid("Incomplete world overlay groups"))?;
+            let (advance_to, overlay, groups) = if matches!(format, WorldCommitFormat::Clock) {
+                let (target, groups) = rest.split_first_chunk::<8>().ok_or_else(|| invalid("Missing world clock target"))?;
+                (Some(Timestamp(i64::from_be_bytes(*target))), None, groups)
+            } else {
+                let (length, rest) = rest.split_first_chunk::<4>().ok_or_else(|| invalid("Missing world overlay length"))?;
+                let (overlay, groups) = rest.split_at_checked(u32::from_be_bytes(*length) as usize)
+                    .ok_or_else(|| invalid("Incomplete world overlay groups"))?;
+                (None, Some(overlay), groups)
+            };
             let clock = Timestamp(i64::from_be_bytes(*clock));
             let attempt = std::str::from_utf8(attempt).map_err(|_| invalid("Invalid world attempt identity"))?;
             if !attempt.bytes().all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)) {
@@ -1622,9 +1630,9 @@ impl Service {
             }
             let publication = rtdb_node::OwnedWorldPublication {
                 attempt: attempt.into(), fingerprint: *fingerprint,
-                expected_clock: (clock != Timestamp::MIN).then_some(clock),
+                expected_clock: (clock != Timestamp::MIN).then_some(clock), advance_to,
             };
-            (Some(publication), Some(overlay), groups)
+            (Some(publication), overlay, groups)
         } else {
             (None, None, groups)
         };
@@ -1632,7 +1640,7 @@ impl Service {
         let _framing = call.reserve(MAX_COMMIT_GROUPS * 512)?;
         let mut writes = Vec::new();
         let mut reservations = Vec::new();
-        let (control_checks, _control_charges, groups) = if matches!(format, WorldCommitFormat::Validation | WorldCommitFormat::Publication) {
+        let (control_checks, _control_charges, groups) = if matches!(format, WorldCommitFormat::Validation | WorldCommitFormat::Publication | WorldCommitFormat::Clock) {
             let policy = self.hosted_control_policy(call)?;
             let groups = owned_groups(groups, true, false)?;
             hosted_control::admit_control_targets(policy, groups.iter().map(|(relation, _)| relation))?;

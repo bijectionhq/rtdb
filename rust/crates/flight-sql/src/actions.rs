@@ -64,6 +64,7 @@ impl Service {
                 crate::owned_actions::COMMIT_WORLD_V1 => Ok(vec![Ok(self.commit_world_action(&call, &action.body, crate::owned_actions::WorldCommitFormat::Overlay).await?)]),
                 crate::owned_actions::COMMIT_WORLD_V2 => Ok(vec![Ok(self.commit_world_action(&call, &action.body, crate::owned_actions::WorldCommitFormat::ConditionedOverlay).await?)]),
                 crate::owned_actions::COMMIT_WORLD_V3 => Ok(vec![Ok(self.commit_world_action(&call, &action.body, crate::owned_actions::WorldCommitFormat::Validation).await?)]),
+                crate::owned_actions::COMMIT_WORLD_CLOCK_V1 => Ok(vec![Ok(self.commit_world_action(&call, &action.body, crate::owned_actions::WorldCommitFormat::Clock).await?)]),
                 crate::owned_actions::COMMIT_WORLD_V4 => Ok(vec![Ok(self.commit_world_action(&call, &action.body, crate::owned_actions::WorldCommitFormat::Publication).await?)]),
                 crate::owned_actions::DROP_WORLD_V1 => {
                     self.drop_world_action(&call, &action.body).await?;

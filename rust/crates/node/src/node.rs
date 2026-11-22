@@ -1435,6 +1435,7 @@ pub struct OwnedWorldPublication {
     pub attempt: String,
     pub fingerprint: [u8; 32],
     pub expected_clock: Option<Timestamp>,
+    pub advance_to: Option<Timestamp>,
 }
 
 #[derive(Clone)]
@@ -1516,7 +1517,8 @@ impl NativeSession {
         {
             return Err(rtdb_types::OwnedWorld::unavailable());
         }
-        if publication.is_some() && (writes.is_empty() || checks.is_empty() || controls.is_empty()
+        if publication.as_ref().is_some_and(|publication| (writes.is_empty() != publication.advance_to.is_some())
+            || checks.is_empty() || controls.is_empty()
             || deadline.is_none() || writes.len().saturating_add(controls.len())
                 .saturating_add(checks.len().saturating_mul(2)).saturating_add(4) > 4096)
         {
@@ -1553,8 +1555,8 @@ impl NativeSession {
             ops.push(TxOp::OwnedReplaceDocs { relation, documents, valid_from: Some(valid.lower()), valid_to: Some(valid.upper()) });
         }
         ops.extend(controls.into_iter().map(TxOp::HostedControl));
-        if let Some(OwnedWorldPublication { attempt, fingerprint, expected_clock }) = publication {
-            ops.push(TxOp::OwnedPublishWorld { world: record.id, attempt, fingerprint, expected: expected_clock });
+        if let Some(OwnedWorldPublication { attempt, fingerprint, expected_clock, advance_to }) = publication {
+            ops.push(TxOp::OwnedPublishWorld { world: record.id, attempt, fingerprint, expected: expected_clock, advance_to });
         }
         self.state.execute_tx(ops, Default::default()).await
     }
