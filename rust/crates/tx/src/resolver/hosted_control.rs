@@ -19,7 +19,7 @@ impl OpenTransaction<'_> {
             Anomaly::new(
                 AnomalyCategory::Forbidden,
                 "rtdb.hosted/control-scope",
-                "Hosted controls require an admitted placed root commit",
+                "Hosted controls require an admitted placed commit",
             )
         };
         let Some(scope) =
@@ -48,13 +48,25 @@ impl OpenTransaction<'_> {
         {
             return Err(unavailable());
         }
+        let validating_world = self.owned_world.is_some();
+        if validating_world && (
+            controls.clone().any(|control| !control.is_check())
+            || !operations.iter().any(|operation| matches!(operation, Operation::Public(TxOp::OwnedCheckWorldScope { .. })))
+        ) {
+            return Err(unavailable());
+        }
         let mut has_fact_write = false;
         for operation in operations {
-            if !permits(operation)
-                || operation.owned_relation().is_some_and(|relation| {
-                    relation.world().is_some() || relation.is_world_catalog()
-                })
-            {
+            if validating_world {
+                if !matches!(operation, Operation::Public(
+                    TxOp::OwnedDeadline { .. } | TxOp::OwnedCheck { .. } | TxOp::OwnedCheckWorldScope { .. }
+                        | TxOp::OwnedCheckWorldPurge { .. } | TxOp::HostedControl(_)
+                )) {
+                    return Err(unavailable());
+                }
+            } else if !permits(operation) || operation.owned_relation().is_some_and(|relation|
+                relation.world().is_some() || relation.is_world_catalog()
+            ) {
                 return Err(unavailable());
             }
             has_fact_write |= match operation {

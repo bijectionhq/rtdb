@@ -675,7 +675,7 @@ impl<'a> OpenTransaction<'a> {
                 }
                 Ok(())
             }
-            Operation::Public(TxOp::OwnedDeadline { .. } | TxOp::OwnedCheckWorldScope { .. } | TxOp::OwnedCheckRange { .. } | TxOp::OwnedCheckCapacity { .. } | TxOp::OwnedCheck { .. }) => Ok(()),
+            Operation::Public(TxOp::OwnedDeadline { .. } | TxOp::OwnedCheckWorldScope { .. } | TxOp::OwnedCheckWorldPurge { .. } | TxOp::OwnedCheckRange { .. } | TxOp::OwnedCheckCapacity { .. } | TxOp::OwnedCheck { .. }) => Ok(()),
             Operation::Public(TxOp::OwnedErase { relation, id }) =>
                 self.erase_owned(relation, id).await,
             Operation::Public(TxOp::OwnedDelete { relation, id, valid_from, valid_to }) =>
@@ -878,6 +878,18 @@ impl<'a> OpenTransaction<'a> {
                 {
                     return Err(Anomaly::new(AnomalyCategory::Conflict, "rtdb.owned/world-witness-unavailable",
                         "Owned world point witness is no longer admissible"));
+                }
+                continue;
+            }
+            if let Operation::Public(TxOp::OwnedCheckWorldPurge { relation, frontier }) = operation {
+                let root = relation.root_relation().ok_or_else(unavailable)?;
+                let base = self.buffer.base_snapshot();
+                if self.owned_world.is_none() || *frontier < 0
+                    || base.contains_table(&rtdb_types::OwnedRelation::obsolete_purge_table(owner))
+                    || base.relation_event_frontier(&root.purge_table(owner))? != *frontier
+                {
+                    return Err(Anomaly::new(AnomalyCategory::Conflict, "rtdb.owned/world-witness-unavailable",
+                        "The world point's root erasure frontier changed before ordering"));
                 }
                 continue;
             }

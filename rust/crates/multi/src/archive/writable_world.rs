@@ -336,7 +336,7 @@ pub async fn commit_checkpoint_world(
     id: Uuid,
     writes: Vec<OwnedWorldWrite>,
 ) -> Result<TransactionKey> {
-    commit_checkpoint_world_checked(directory, archive, session, deployment, id, writes, Vec::new()).await
+    commit_checkpoint_world_checked(directory, archive, session, deployment, id, writes, Vec::new(), Vec::new(), None).await
 }
 
 pub(crate) async fn commit_checkpoint_world_checked(
@@ -347,6 +347,8 @@ pub(crate) async fn commit_checkpoint_world_checked(
     id: Uuid,
     writes: Vec<OwnedWorldWrite>,
     checks: Vec<OwnedWorldPointWitness>,
+    controls: Vec<rtdb_node::HostedControlWrite>,
+    deadline: Option<Timestamp>,
 ) -> Result<TransactionKey> {
     let OpenWorld {
         snapshot,
@@ -355,7 +357,7 @@ pub(crate) async fn commit_checkpoint_world_checked(
         ..
     } = open_world(directory, archive, session, deployment, id).await?;
     drop(snapshot);
-    let outcome = session.commit_owned_world_checked(&record, writes, checks).await?;
+    let outcome = session.commit_owned_world_checked(&record, writes, checks, controls, deadline).await?;
     if !outcome.committed() {
         return Err(outcome
             .error()

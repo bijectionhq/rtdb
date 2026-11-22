@@ -168,6 +168,7 @@ impl DmlBuffer {
                 relation.name().len() + name.name().len(), |bytes, column| bytes.checked_add(column.capacity() + 64).ok_or_else(allocation_overflow),
             )?,
             TxOp::HostedControl(control) => control.retained_bytes()?,
+            TxOp::OwnedCheckWorldPurge { relation, .. } => relation.name().len(),
             TxOp::OwnedDeadline { .. } | TxOp::OwnedCheckWorldScope { .. } => 0,
             TxOp::OwnedDeclareFixedRange { relation, rule } => relation.name().len() + rule.path.capacity() + rule.column.capacity(),
             TxOp::OwnedCheckRange { relation, fixed, .. } =>

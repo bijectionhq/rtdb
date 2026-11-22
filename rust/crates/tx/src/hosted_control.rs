@@ -70,7 +70,7 @@ impl HostedControlWrite {
         Ok(result)
     }
 
-    pub(crate) fn is_check(&self) -> bool {
+    pub fn is_check(&self) -> bool {
         self.check_only
     }
 

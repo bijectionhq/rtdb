@@ -89,10 +89,10 @@ impl OwnedWorldHost for PlacedWorldHost {
         })
     }
 
-    fn commit_world<'a>(&'a self, call: WorldCall<'a>, world: Uuid, writes: Vec<OwnedWorldWrite>, checks: Vec<OwnedWorldPointWitness>) -> BoxFuture<'a, Result<TransactionKey>> {
+    fn commit_world<'a>(&'a self, call: WorldCall<'a>, world: Uuid, writes: Vec<OwnedWorldWrite>, checks: Vec<OwnedWorldPointWitness>, controls: Vec<rtdb_node::HostedControlWrite>, deadline: Option<Timestamp>) -> BoxFuture<'a, Result<TransactionKey>> {
         Box::pin(async move {
             let deployment = self.deployment(&call)?;
-            commit_checkpoint_world_checked(self.directory.as_ref(), &self.storage, call.session, deployment, world, writes, checks).await
+            commit_checkpoint_world_checked(self.directory.as_ref(), &self.storage, call.session, deployment, world, writes, checks, controls, deadline).await
         })
     }
 
