@@ -499,8 +499,11 @@ The archive owner retains the new cut before ordering. The resolver compares the
 The response carries the unchanged world ID followed by the transaction ID and system time as big-endian i64.
 
 `rtdb.owned.PublishWorldCut.v2` orders one initial retained fork alongside a Root publication at the same source position.
-It takes the v1 fields through the fingerprint and requires mode 0, an all-zero predecessor handle and an independently archived cut with the exact original live Root transaction key.
-An all-zero capture and suffix select an already certified archive of that key from the placed host's Directory.
+It takes the v1 fields through the fingerprint and requires an all-zero predecessor handle.
+Mode 0 selects an independently archived cut at the exact original live Root transaction key.
+Mode 4 selects the accepted application publication read from the original live Root hold.
+The archived transaction and its application head must agree at that publication, and the ordered resolver checks that the head has not moved.
+An all-zero capture and suffix select an already certified archive of the requested cut from the placed host's Directory.
 Archive discovery does not create a capture or advance the original hold.
 Next come a big-endian u16 range witness count and its original 16-byte Root handle and 16-byte nonce pairs, then the big-endian u32 byte length and ordered Root fact groups.
 Root groups may supply point checks, inserts, replacements and deletes.

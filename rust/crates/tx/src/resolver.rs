@@ -1037,7 +1037,9 @@ impl<'a> OpenTransaction<'a> {
                             }
                         } else {
                             if world.pin != world.id { return Err(unavailable()); }
-                            if world.initial_clock() > world.inherited_clock() || world.mode == rtdb_types::WorldClockMode::Proposal {
+                            if world.initial_clock() > world.inherited_clock() || world.mode == rtdb_types::WorldClockMode::Proposal
+                                || (with_root && world.parent_publication == Some(world.basis.system_time))
+                            {
                                 expected_tip = Some((world.basis.system_time, world.parent_publication));
                             }
                         }

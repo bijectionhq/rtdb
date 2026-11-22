@@ -61,11 +61,11 @@ fn admit_capture(
     }
 }
 
-/// Select only an already published independent archive of the exact held
-/// key. The fork still reopens and verifies the selected archive before it
+/// Select an already published independent archive matching the original
+/// held coordinate. The fork reopens and verifies that archive before it
 /// writes the Directory pin or submits the ordered registration.
-fn select_live_archive(
-    source: &DeploymentRecord, archive: &CellStorage, deployment: Uuid, basis: TransactionKey,
+fn select_held_archive(
+    source: &DeploymentRecord, archive: &CellStorage, deployment: Uuid, cut: &rtdb_node::OwnedForkCut,
 ) -> Result<(Uuid, Option<Uuid>)> {
     let binding = archive_binding(archive)?;
     let available = |capture: &Uuid, registered: &rtdb_directory::CheckpointCapture| {
@@ -76,12 +76,12 @@ fn select_live_archive(
             && require_capture_open(source, *capture).is_ok()
     };
     if let Some((&capture, _)) = source.checkpoint_captures.iter().find(|(capture, registered)|
-        available(capture, registered) && registered.checkpoint.system_time == basis.system_time.0
+        available(capture, registered) && registered.checkpoint.system_time == cut.basis().0
     ) {
         return Ok((capture, None));
     }
     for (&suffix, pin) in &source.checkpoint_suffix_pins {
-        if pin.basis != basis || pin.archive_sha256.is_none() || suffix.is_nil() {
+        if !cut.matches_basis(pin.basis) || pin.archive_sha256.is_none() || suffix.is_nil() {
             continue;
         }
         let capture = pin.capture;
@@ -142,8 +142,10 @@ pub(crate) async fn fork_checkpoint_world_selected(
         {
             return Err(OwnedWorld::unavailable());
         }
-        let basis = fork.cut.live().ok_or_else(OwnedWorld::unavailable)?;
-        select_live_archive(&source, archive, deployment_id, basis)?
+        if fork.cut.live().is_none() && !fork.cut.is_publication() {
+            return Err(OwnedWorld::unavailable());
+        }
+        select_held_archive(&source, archive, deployment_id, &fork.cut)?
     } else {
         (capture, suffix)
     };
@@ -157,7 +159,7 @@ pub(crate) async fn fork_checkpoint_world_selected(
         replica_suffix::accepted(&source, &point, &manifest, suffix).map(|pin| pin.basis)
     ).transpose()?;
     if expected_basis.is_some_and(|basis|
-        until <= basis.system_time || fork.cut.live().is_some_and(|original| original != basis)
+        until <= basis.system_time || !fork.cut.matches_basis(basis)
     ) {
         return Err(OwnedWorld::unavailable());
     }
@@ -183,8 +185,9 @@ pub(crate) async fn fork_checkpoint_world_selected(
     drop(live);
     let parent = CheckpointReadWorld { deployment: deployment_id, capture, manifest_sha256: manifest, suffix, basis };
 
-    if fork.cut.basis() != basis.system_time || fork.cut.live().is_some_and(|original| original != basis)
+    if !fork.cut.matches_basis(basis)
         || parent_publication.is_some_and(|publication| publication > basis.system_time)
+        || (fork.cut.is_publication() && parent_publication != Some(basis.system_time))
     {
         return Err(OwnedWorld::unavailable());
     }

@@ -1680,8 +1680,10 @@ impl Service {
         let (until, rest) = rest.split_first_chunk::<8>().ok_or_else(|| invalid("World fork has no expiry"))?;
         let (deadline, rest) = rest.split_first_chunk::<8>().ok_or_else(|| invalid("World fork has no deadline"))?;
         let ([mode], rest) = rest.split_first_chunk::<1>().ok_or_else(|| invalid("World fork has no clock mode"))?;
+        let select_publication = *mode == 4 && publish_root;
         let (requested, rest) = match *mode {
             0 => (rtdb_node::WorldClockRequest::Retained, rest),
+            4 if select_publication => (rtdb_node::WorldClockRequest::Retained, rest),
             1 => (rtdb_node::WorldClockRequest::Held { start: None }, rest),
             2 => {
                 let (start, rest) = rest.split_first_chunk::<8>().ok_or_else(|| invalid("World fork has no explicit clock start"))?;
@@ -1699,7 +1701,11 @@ impl Service {
         let held = self.owned_read(call, &Bytes::copy_from_slice(handle))?;
         let policy = self.hosted_control_policy(call)?;
         let scope = self.hosted_control_scope(call).await?;
-        let cut = held.snapshot.fork_cut(scope).await.map_err(status)?;
+        let cut = if select_publication {
+            held.snapshot.fork_publication_cut(scope).await.map_err(status)?
+        } else {
+            held.snapshot.fork_cut(scope).await.map_err(status)?
+        };
         let requested_until = Timestamp(i64::from_be_bytes(*until));
         let previous = if *previous_handle == [0; 16] {
             if world != pin { return Err(invalid("An initial pin must name its world")); }
@@ -1720,14 +1726,16 @@ impl Service {
         };
         // Deadline, registration, one immutable attempt and a Root head
         // (or the standalone fork's optional tip check).
-        let mut rows_left = MAX_GROUPED_COMMIT_ROWS - 4;
+        let mut rows_left = MAX_GROUPED_COMMIT_ROWS - 4 - usize::from(select_publication);
         let mut root = rtdb_node::OwnedRootSection::default();
         let mut root_batches = None;
         let mut root_witness_charge = None;
         let mut root_framing = None;
         let mut root_groups = 0;
         let groups = if publish_root {
-            if previous.is_some() || !matches!(requested, rtdb_node::WorldClockRequest::Retained) || cut.live().is_none() {
+            if previous.is_some() || !matches!(requested, rtdb_node::WorldClockRequest::Retained)
+                || (cut.live().is_none() && !cut.is_publication())
+            {
                 return Err(invalid("A Root publication requires an initial retained fork at its original live hold"));
             }
             let (witnesses, groups, charge) = self.owned_witness_prefix(call, groups, true)?;
