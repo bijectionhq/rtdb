@@ -118,6 +118,11 @@ impl OwnedWorldRead for HeldCheckpointWorld {
     ) -> BoxFuture<'a, Result<(u64, OwnedWorldWitness)>> {
         Box::pin(HeldCheckpointWorld::count(self, relation, path, request))
     }
+    fn overlay_range<'a>(
+        &'a self, relation: OwnedRelation, path: OwnedRelation, request: OwnedRangeRequest<'a>, valid: Timestamp,
+    ) -> BoxFuture<'a, Result<(OwnedRangePage, OwnedWorldWitness)>> {
+        Box::pin(HeldCheckpointWorld::overlay_range(self, relation, path, request, valid))
+    }
     fn parent_pin(&self) -> rtdb_types::Iid { HeldCheckpointWorld::parent_pin(self) }
     fn until(&self) -> Timestamp { HeldCheckpointWorld::until(self) }
     fn evidence_until(&self) -> Timestamp { HeldCheckpointWorld::evidence_until(self) }
@@ -151,10 +156,25 @@ impl OwnedWorldRead for HeldCheckpointWorld {
         })
     }
 
+    fn overlay_identities<'a>(
+        &'a self, relation: &'a OwnedRelation, valid: Timestamp, after: Option<&'a str>, limit: usize,
+    ) -> BoxFuture<'a, Result<WorldIdentityPage>> {
+        Box::pin(async move {
+            let page = HeldCheckpointWorld::overlay_identities(self, relation, valid, after, limit).await?;
+            Ok(WorldIdentityPage { keys: page.keys, more: page.more, reservations: page.reservations })
+        })
+    }
+
     fn read_point<'a>(
         &'a self, relation: &'a OwnedRelation, id: &'a EntityId, valid_at: Timestamp, observed: bool,
     ) -> BoxFuture<'a, Result<WorldPointResult>> {
         Box::pin(async move { self.point(relation, id, valid_at, observed).await.map(point_result) })
+    }
+
+    fn read_parent_point<'a>(
+        &'a self, relation: &'a OwnedRelation, id: &'a EntityId, valid_at: Timestamp,
+    ) -> BoxFuture<'a, Result<WorldPointResult>> {
+        Box::pin(async move { self.parent_point(relation, id, valid_at).await.map(point_result) })
     }
 }
 

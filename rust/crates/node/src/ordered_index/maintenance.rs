@@ -17,7 +17,7 @@ use tokio_util::sync::CancellationToken;
 
 use super::{
     Definition, INDEX_ROOT, checkpoint, definitions, format_error,
-    projection::{Changes, EventOrder, RevisionRoots},
+    projection::{Changes, EventOrder, KeyLayout, RevisionRoots},
     tree::{Address, AddressRef, Root, Tree},
 };
 
@@ -254,7 +254,7 @@ async fn flushed_changes(
             &definition.columns,
             &tree.memory,
             cancellation,
-            definition.table.is_owned_event_data(),
+            KeyLayout::for_table(&definition.table),
             &retain,
         )
     })
@@ -312,7 +312,7 @@ pub(super) async fn read_root(
                 &definition.columns,
                 &tree.memory,
                 cancellation,
-                definition.table.is_owned_event_data(),
+                KeyLayout::for_table(&definition.table),
                 |_, _| true,
             )?;
         }

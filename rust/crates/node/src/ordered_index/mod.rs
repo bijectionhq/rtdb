@@ -115,18 +115,31 @@ async fn owned_definitions(
     database: &str, snapshot: &Snapshot, storage: &Arc<BufferPool>, memory: &Arc<MemoryBudget>,
     now: Instant, cancellation: &CancellationToken,
 ) -> Result<Vec<Definition>> {
-    let owned_catalogs: Vec<_> = snapshot.tables().into_iter().filter(TableRef::is_owned_path_catalog).collect();
+    let tables = snapshot.tables();
+    let owned_catalogs: Vec<_> = tables.iter().filter(|table| table.is_owned_path_catalog()).collect();
     if owned_catalogs.is_empty() { return Ok(Vec::new()); }
     let catalog = CatalogSnapshot::new(database, BTreeMap::from([(
         database.to_owned(), DatabaseSnapshot { partitions: vec![snapshot.clone()], storage: Arc::clone(storage) },
     )]), false)?;
     let context = QueryContext::new(catalog, Arc::clone(memory), now, "UTC", QueryOptions::default(), cancellation)?;
+    let mut world_tables = BTreeMap::<_, Vec<_>>::new();
+    for table in &tables {
+        if let Some(root) = table.owned_world_root_table() {
+            world_tables.entry(root).or_default().push(table);
+        }
+    }
     let mut definitions = Vec::new();
     for table in owned_catalogs {
-        if let Some(cursor) = rtdb_query::open_owned_path_catalog(Arc::clone(&context), &table, None).await? {
+        if let Some(cursor) = rtdb_query::open_owned_path_catalog(Arc::clone(&context), table, None).await? {
             for definition in read_definitions(cursor).await? {
                 if !table.owns_path_target(&definition.table) {
                     return Err(format_error("Owned path definition refers to another owner or an internal catalog"));
+                }
+                if let Some(overlays) = world_tables.get(&definition.table) {
+                    definitions.extend(overlays.iter().map(|table| Definition {
+                        table: (**table).clone(),
+                        ..definition.clone()
+                    }));
                 }
                 definitions.push(definition);
             }
@@ -277,9 +290,10 @@ async fn owned_projection(
 ) -> Result<OwnedProjection> {
     let empty = snapshot.relation_event_frontier(&definition.table)? == 0;
     let mut types = snapshot.column_types_for(&definition.table, definition.columns.clone());
-    if empty {
+    if empty || relation.world().is_some() {
+        let root = relation.root_relation();
         let (declaration, _charge) =
-            rtdb_query::read_owned_relation_schema(Arc::clone(context), owner, relation)
+            rtdb_query::read_owned_relation_schema(Arc::clone(context), owner, root.as_ref().unwrap_or(relation))
                 .await?
                 .ok_or_else(uncovered_owned_range)?;
         let identity = match identity {
@@ -287,7 +301,8 @@ async fn owned_projection(
                 identity.entity_id()?;
                 identity.logical_type()
             }
-            None => LogicalType::Scalar(ScalarType::Utf8),
+            None => types.get("_id").cloned()
+                .unwrap_or(LogicalType::Scalar(ScalarType::Utf8)),
         };
         for name in &definition.columns {
             let ty = if name == "_id" {
@@ -323,20 +338,23 @@ async fn owned_definition(
     path: &rtdb_types::OwnedRelation,
 ) -> Result<Definition> {
     let catalog = rtdb_types::OwnedRelation::path_catalog(owner);
-    let target = relation.table(owner);
+    let root = relation.root_relation();
+    let target = root.as_ref().unwrap_or(relation).table(owner);
     let cursor =
         rtdb_query::open_owned_path_catalog(Arc::clone(context), &catalog, Some(path.name()))
             .await?
             .ok_or_else(uncovered_owned_range)?;
     let mut definitions = read_definitions(cursor).await?.into_iter();
-    definitions
+    let mut definition = definitions
         .next()
         .filter(|definition| {
             definition.name == path.name()
                 && definition.table == target
                 && definitions.next().is_none()
         })
-        .ok_or_else(uncovered_owned_range)
+        .ok_or_else(uncovered_owned_range)?;
+    definition.table = relation.table(owner);
+    Ok(definition)
 }
 
 fn format_error(error: impl std::fmt::Display) -> Anomaly {

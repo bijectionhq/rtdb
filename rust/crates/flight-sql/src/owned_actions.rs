@@ -150,6 +150,7 @@ pub(crate) const HELD_OWNED_HISTORICAL_POINT_V1: &str = "rtdb.owned.ReadHeldHist
 pub(crate) const HELD_OWNED_VALID_DURING_V2: &str = "rtdb.owned.ReadHeldValidDuring.v2";
 pub(crate) const HELD_WORLD_VALID_V1: &str = "rtdb.owned.ReadHeldWorldValidDuring.v1";
 pub(crate) const HELD_WORLD_IDENTITIES_V1: &str = "rtdb.owned.ReadHeldWorldIdentityPage.v1";
+pub(crate) const HELD_WORLD_OVERLAY_IDENTITIES_V1: &str = "rtdb.owned.ReadHeldWorldOverlayIdentityPage.v1";
 pub(crate) const HELD_OWNED_IDENTITIES_V1: &str = "rtdb.owned.ReadHeldIdentityPage.v1";
 pub(crate) const HELD_OWNED_VERSIONS_V2: &str = "rtdb.owned.ReadHeldVersions.v2";
 pub(crate) const CLOSE_OWNED_READ_V1: &str = "rtdb.owned.CloseRead.v1";
@@ -164,6 +165,9 @@ const WORLD_POINT_WITNESS: &str = "rtdb.owned.world_point_witness";
 const WORLD_RANGE_WITNESS: &str = "rtdb.owned.world_range_witness";
 pub(crate) const HELD_WORLD_RANGE_V1: &str = "rtdb.owned.ReadHeldWorldRange.v1";
 pub(crate) const HELD_WORLD_COUNT_V1: &str = "rtdb.owned.CountHeldWorldRange.v1";
+pub(crate) const HELD_WORLD_OVERLAY_RANGE_V1: &str = "rtdb.owned.ReadHeldWorldOverlayRange.v1";
+#[derive(Clone, Copy)]
+pub(crate) enum WorldOrder { ParentRange, ParentCount, OverlayRange }
 pub(crate) const SEARCH_HELD_WORLD_V1: &str = "rtdb.owned.SearchHeldWorld.v1";
 pub(crate) const SEARCH_HELD_OWNED_V4: &str = "rtdb.owned.SearchHeld.v4";
 pub(crate) const HELD_OWNED_RANGE_V1: &str = "rtdb.owned.ReadHeldRange.v1";
@@ -1201,12 +1205,13 @@ impl Service {
         Ok(reply)
     }
 
-    pub(crate) async fn held_world_ordered_action(&self, call: &Call, body: &[u8], count: bool) -> Result<ActionResult, Status> {
+    pub(crate) async fn held_world_ordered_action(&self, call: &Call, body: &[u8], order: WorldOrder) -> Result<ActionResult, Status> {
         if !self.0.config.owned_native_actions { return Err(unsupported()); }
         let (handle, request) = body.split_first_chunk::<16>().ok_or_else(|| invalid("Missing held world range handle"))?;
         let held = self.owned_world_read(call, &Bytes::copy_from_slice(handle))?;
         let (relation, arrow) = split_relation(request)?;
         let batch = decode_batch(call, arrow)?;
+        let count = matches!(order, WorldOrder::ParentCount);
         let fields = if count { 4 } else { 7 };
         if batch.batch().num_rows() != 1 || batch.batch().num_columns() != fields {
             return Err(invalid("Invalid held world range arguments"));
@@ -1233,7 +1238,11 @@ impl Service {
                 lower, upper, after: compound_bound(Some(after))?, descending: *descending,
                 limit: usize::try_from(*limit).map_err(|_| invalid("Invalid held world range limit"))?,
             };
-            let (page, witness) = held.snapshot.range(relation.clone(), path, request, valid_at).await.map_err(status)?;
+            let (page, witness) = if matches!(order, WorldOrder::OverlayRange) {
+                held.snapshot.overlay_range(relation.clone(), path, request, valid_at).await
+            } else {
+                held.snapshot.range(relation.clone(), path, request, valid_at).await
+            }.map_err(status)?;
             (page.schema, page.batch, witness, None)
         };
         let _charge = call.reserve(wire::add(wire::schema_bound(&schema)?, 256)?)?;
@@ -1281,7 +1290,7 @@ impl Service {
         let valid = Timestamp(i64::from_be_bytes(*valid));
         let held = self.owned_world_read(call, &Bytes::copy_from_slice(handle))?;
         let rank = owned_rank_request(call, request)?;
-        if !rank.observe || held.snapshot.is_held() {
+        if !rank.observe {
             return Err(Status::failed_precondition("Search requires the complete immutable retained corpus"));
         }
         let relations = rank.partitions.iter().map(|(relation, _)| relation.clone()).collect::<Vec<_>>();
@@ -1522,14 +1531,13 @@ impl Service {
         let (handle, body) = body.split_first_chunk::<16>().ok_or_else(|| invalid("Owned world point has no held handle"))?;
         let held = self.owned_world_read(call, &Bytes::copy_from_slice(handle))?;
         let (mode, body) = body.split_first().ok_or_else(|| invalid("Owned world point has no observation flag"))?;
-        let observed = match mode {
-            0 => false,
-            1 => true,
-            _ => return Err(invalid("Invalid owned world point observation flag")),
-        };
         let (relation, id, valid, _identity) = point_request(call, body, PointTime::Required)?;
         let valid_at = valid.ok_or_else(|| invalid("Owned world point requires a valid_micros instant"))?;
-        let mut result = held.snapshot.read_point(&relation, &id, valid_at, observed).await.map_err(status)?;
+        let mut result = match mode {
+            0 | 1 => held.snapshot.read_point(&relation, &id, valid_at, *mode == 1).await,
+            2 => held.snapshot.read_parent_point(&relation, &id, valid_at).await,
+            _ => return Err(invalid("Invalid owned world point source")),
+        }.map_err(status)?;
         if result.present != held.snapshot.present() {
             return Err(Status::internal("Owned world point changed its held present"));
         }
@@ -1577,7 +1585,7 @@ impl Service {
         Ok(reply)
     }
 
-    pub(crate) async fn held_world_identities_action(&self, call: &Call, body: &[u8]) -> Result<ActionResult, Status> {
+    pub(crate) async fn held_world_identities_action(&self, call: &Call, body: &[u8], overlay: bool) -> Result<ActionResult, Status> {
         if !self.0.config.owned_native_actions || self.0.config.owned_world_host.is_none() { return Err(unsupported()); }
         let (handle, body) = body.split_first_chunk::<16>().ok_or_else(|| invalid("Owned world identities have no held handle"))?;
         let held = self.owned_world_read(call, &Bytes::copy_from_slice(handle))?;
@@ -1597,7 +1605,11 @@ impl Service {
             .filter(|_| field.metadata().is_empty())
             .ok_or_else(|| invalid("Owned world identity bound must be nullable Utf8"))?;
         let after = (!after.is_null(0)).then(|| after.value(0));
-        let page = held.snapshot.identity_page(&relation, valid, after, limit).await.map_err(status)?;
+        let page = if overlay {
+            held.snapshot.overlay_identities(&relation, valid, after, limit).await
+        } else {
+            held.snapshot.identity_page(&relation, valid, after, limit).await
+        }.map_err(status)?;
         let bytes = page.keys.iter().try_fold(4096, |size, key| wire::add(size, key.len()))?;
         let _copy = call.reserve(bytes)?;
         let keys = StringArray::from_iter_values(page.keys.iter().map(String::as_str));

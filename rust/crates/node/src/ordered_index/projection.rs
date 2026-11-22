@@ -7,7 +7,7 @@ use std::{
 use rtdb_columnar::{MemoryBudget, MemoryReservation};
 use rtdb_format::data::{EncodedEvent, EventBatch, PutColumn};
 use rtdb_temporal::HistoryResolver;
-use rtdb_types::{EventHeader, EventOp, Iid, Interval, Result, TemporalBounds, Timestamp};
+use rtdb_types::{EventHeader, EventOp, Iid, Interval, LogicalType, Result, TableRef, TemporalBounds, Timestamp, Value, WorldShadow};
 use tokio_util::sync::CancellationToken;
 
 use super::{
@@ -217,6 +217,25 @@ pub(super) enum EventOrder {
     NewestFirst,
 }
 
+#[derive(Clone, Copy)]
+pub(super) enum KeyLayout {
+    Plain,
+    Governed,
+    World,
+}
+
+impl KeyLayout {
+    pub fn for_table(table: &TableRef) -> Self {
+        if table.owned_world_root_table().is_some() {
+            Self::World
+        } else if table.is_owned_event_data() {
+            Self::Governed
+        } else {
+            Self::Plain
+        }
+    }
+}
+
 struct Event {
     header: EventHeader,
     tuple: Option<KeyRow>,
@@ -273,9 +292,10 @@ impl Changes {
         columns: &[String],
         memory: &Arc<MemoryBudget>,
         cancellation: &CancellationToken,
-        keyed: bool,
+        layout: KeyLayout,
         retain: impl Fn(EventHeader, AddressRef<'_>) -> bool,
     ) -> Result<()> {
+        let keyed = !matches!(layout, KeyLayout::Plain);
         if batch.has_entity_keys() != keyed {
             return Err(format_error("Ordered source events have the wrong physical identity layout"));
         }
@@ -305,7 +325,7 @@ impl Changes {
                     None
                 };
                 if !retain(header, address) { continue; }
-                let row = if header.op == EventOp::Put {
+                if header.op == EventOp::Put {
                     if let Some(id) = id {
                         let Some(PutColumn::Stored(field, array, row)) = event.put_column("_id") else {
                             return Err(format_error("Governed ordered put omitted its identity"));
@@ -315,6 +335,21 @@ impl Changes {
                             return Err(format_error("Governed ordered put differs from its physical identity"));
                         }
                     }
+                }
+                let local_tombstone = if matches!(layout, KeyLayout::World) && header.op == EventOp::Put {
+                    let Some(PutColumn::Stored(field, array, row)) = event.put_column(WorldShadow::FIELDS) else {
+                        return Err(format_error("Ordered world shadow omitted its field marker"));
+                    };
+                    let _charge = memory.reserve(rtdb_columnar::estimate_copy_cell_bytes(field, array, row)?)?;
+                    match event.put_cell(WorldShadow::FIELDS, &LogicalType::Null)?.as_ref() {
+                        Value::Null => true,
+                        Value::List(_) => false,
+                        _ => return Err(format_error("Invalid ordered world shadow field marker")),
+                    }
+                } else {
+                    false
+                };
+                let row = if header.op == EventOp::Put && !local_tombstone {
                     let cells = columns
                         .iter()
                         .map(|name| match event.put_column(name) {
@@ -411,7 +446,11 @@ mod tests {
                 &["key".into()],
                 memory,
                 cancellation,
-                events.first().is_some_and(|event| event.entity_key.is_some()),
+                if events.first().is_some_and(|event| event.entity_key.is_some()) {
+                    KeyLayout::Governed
+                } else {
+                    KeyLayout::Plain
+                },
                 |_, _| true,
             )
             .unwrap();

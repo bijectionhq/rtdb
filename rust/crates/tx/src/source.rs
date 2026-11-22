@@ -512,11 +512,12 @@ fn operation_value<'a>(operation: &'a Operation, memory: &Arc<MemoryBudget>) -> 
                 "rtdb-owned-publish-world-v1"
             }
         }
-        Operation::Public(TxOp::OwnedCheckWorldPurge { relation, pin, frontier }) => {
+        Operation::Public(TxOp::OwnedCheckWorldPurge { relation, pin, frontier, local_frontier }) => {
             body.insert("relation".into(), Value::Utf8(relation.name().into()));
             body.insert("pin".into(), Value::Uuid(pin.0));
             body.insert("frontier".into(), Value::I64(*frontier));
-            "rtdb-owned-check-world-purge-v2"
+            body.insert("local_frontier".into(), local_frontier.map_or(Value::Null, Value::I64));
+            "rtdb-owned-check-world-purge-v3"
         }
         Operation::Public(TxOp::OwnedCheckWorldScope { scope }) => {
             body.insert("scope".into(), Value::Binary(scope.encode().to_vec()));
@@ -1194,7 +1195,7 @@ impl SourceOperationReader<'_> {
             "rtdb-owned-publish-root-v1" => &["attempt", "fingerprint"],
             "rtdb-owned-publish-world-v1" | "rtdb-owned-drop-world-v1" => &["world", "attempt", "fingerprint", "expected"],
             "rtdb-owned-publish-world-v2" => &["world", "attempt", "fingerprint", "expected", "advance_to"],
-            "rtdb-owned-check-world-purge-v2" => &["relation", "pin", "frontier"],
+            "rtdb-owned-check-world-purge-v3" => &["relation", "pin", "frontier", "local_frontier"],
             "rtdb-owned-check-world-scope-v1" => &["scope"],
             "rtdb-owned-check-range-v1" => &["relation", "basis_id", "basis_time", "scope", "frontier", "until"],
             "rtdb-owned-check-range-v2" => &["relation", "basis_id", "basis_time", "scope", "frontier", "until", "fixed"],
@@ -1262,12 +1263,17 @@ impl SourceOperationReader<'_> {
                     },
                 }
             }
-            "rtdb-owned-check-world-purge-v2" => {
+            "rtdb-owned-check-world-purge-v3" => {
                 let (Value::Utf8(relation), Value::Uuid(pin), Value::I64(frontier)) =
                     (value("relation")?, value("pin")?, value("frontier")?) else {
                     return Err(invalid("Owned world purge witness has invalid fields"));
                 };
-                TxOp::OwnedCheckWorldPurge { relation: rtdb_types::OwnedRelation::from_source(relation)?, pin: Iid(pin), frontier }
+                let local_frontier = match value("local_frontier")? {
+                    Value::Null => None,
+                    Value::I64(frontier) if frontier >= 0 => Some(frontier),
+                    _ => return Err(invalid("Invalid owned world overlay frontier")),
+                };
+                TxOp::OwnedCheckWorldPurge { relation: rtdb_types::OwnedRelation::from_source(relation)?, pin: Iid(pin), frontier, local_frontier }
             }
             "rtdb-owned-check-capacity-v1" => {
                 let (Value::Utf8(relation), Value::Utf8(column), Value::Binary(prefix), Value::I64(at_most)) =

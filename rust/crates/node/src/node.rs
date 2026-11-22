@@ -1068,7 +1068,7 @@ impl OwnedReadSession {
             let purge_frontier = snapshot.relation_event_frontier(&root.purge_table(&self.owner))?;
             Some(OwnedWorldWitness {
                 world, pin: registered.pin, relation, purge_frontier, scope,
-                point: Some(OwnedWorldObservedPoint { id: id.clone(), valid_at, revision: local_revision }),
+                observation: OwnedWorldObservation::Point { id: id.clone(), valid_at, revision: local_revision },
                 until: self.witness_until.min(registered.until),
             })
         } else {
@@ -1261,13 +1261,13 @@ impl OwnedReadSession {
         Ok((hits, witnesses))
     }
 
-    /// Observe immutable relations by their retained pin and exact purge frontiers.
-    pub async fn retained_world_relation_witnesses<'a>(
+    /// Observe the retained parent and, for a held world, the complete local overlay relation.
+    pub async fn world_relation_witnesses<'a>(
         &self, world: rtdb_types::Iid, relations: impl IntoIterator<Item = &'a rtdb_types::OwnedRelation>,
     ) -> Result<Vec<OwnedWorldWitness>> {
         let unavailable = rtdb_types::OwnedWorld::unavailable;
         let (registered, _charge) = self.world_registration(world).await?
-            .filter(|(record, _)| !record.dropped && !record.is_held() && record.until > self.present.system_time)
+            .filter(|(record, _)| !record.dropped && record.until > self.present.system_time)
             .ok_or_else(unavailable)?;
         let scope = self.witness_scope.ok_or_else(unavailable)?;
         let database = self.context.catalog.database(&self.database)?;
@@ -1279,14 +1279,23 @@ impl OwnedReadSession {
         for relation in relations {
             self.check_relation(relation)?;
             if selected.len() == 32 { return Err(unavailable()); }
+            let local = relation.in_world(world)?;
+            let local_frontier = registered.is_held().then(|| snapshot.relation_event_frontier(&local.table(&self.owner))).transpose()?;
             selected.push(OwnedWorldWitness {
-                world, pin: registered.pin, relation: relation.in_world(world)?, scope,
-                point: None,
+                world, pin: registered.pin, relation: local, scope,
+                observation: OwnedWorldObservation::Relation { local_frontier },
                 purge_frontier: snapshot.relation_event_frontier(&relation.purge_table(&self.owner))?,
                 until: self.witness_until.min(registered.until),
             });
         }
         Ok(selected)
+    }
+
+    pub async fn range_world_overlay(
+        &self, world: rtdb_types::Iid, relation: &rtdb_types::OwnedRelation,
+        path: &rtdb_types::OwnedRelation, request: crate::OwnedRangeRequest<'_>, valid: Timestamp,
+    ) -> Result<crate::OwnedRangePage> {
+        self.range_page(&relation.in_world(world)?, path, crate::ordered_index::RowBounds::Compound(request), Some(valid)).await
     }
 
     /// Reads one covered page from the named ordered path at this held cut.
@@ -1501,17 +1510,16 @@ pub struct OwnedWorldWitness {
     world: rtdb_types::Iid,
     pin: rtdb_types::Iid,
     relation: rtdb_types::OwnedRelation,
-    point: Option<OwnedWorldObservedPoint>,
+    observation: OwnedWorldObservation,
     scope: rtdb_types::PlacedAttemptScope,
     until: Timestamp,
     purge_frontier: i64,
 }
 
 #[derive(Clone)]
-struct OwnedWorldObservedPoint {
-    id: rtdb_types::EntityId,
-    valid_at: Timestamp,
-    revision: Option<Timestamp>,
+enum OwnedWorldObservation {
+    Point { id: rtdb_types::EntityId, valid_at: Timestamp, revision: Option<Timestamp> },
+    Relation { local_frontier: Option<i64> },
 }
 
 impl OwnedWorldWitness {
@@ -1519,7 +1527,11 @@ impl OwnedWorldWitness {
 
     pub fn allocation_bound(&self) -> usize {
         use rtdb_types::EntityId;
-        let bytes = match self.point.as_ref().map(|point| &point.id) {
+        let point = match &self.observation {
+            OwnedWorldObservation::Point { id, .. } => Some(id),
+            OwnedWorldObservation::Relation { .. } => None,
+        };
+        let bytes = match point {
             Some(EntityId::String(id)) => id.len(),
             Some(EntityId::Keyword(id)) => id.as_str().len(),
             _ => 0,
@@ -1758,10 +1770,16 @@ impl NativeSession {
 
     fn append_world_checks(ops: &mut Vec<TxOp>, checks: Vec<OwnedWorldWitness>) {
         for check in checks {
-            ops.push(TxOp::OwnedCheckWorldPurge { relation: check.relation.clone(), pin: check.pin, frontier: check.purge_frontier });
-            if let Some(point) = check.point {
+            let local_frontier = match &check.observation {
+                OwnedWorldObservation::Point { .. } => None,
+                OwnedWorldObservation::Relation { local_frontier } => *local_frontier,
+            };
+            ops.push(TxOp::OwnedCheckWorldPurge {
+                relation: check.relation.clone(), pin: check.pin, frontier: check.purge_frontier, local_frontier,
+            });
+            if let OwnedWorldObservation::Point { id, valid_at, revision } = check.observation {
                 ops.push(TxOp::OwnedCheck {
-                    relation: check.relation, id: point.id, valid_at: point.valid_at, expected: point.revision,
+                    relation: check.relation, id, valid_at, expected: revision,
                 });
             }
         }

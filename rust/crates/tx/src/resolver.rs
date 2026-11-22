@@ -1119,16 +1119,23 @@ impl<'a> OpenTransaction<'a> {
                 }
                 continue;
             }
-            if let Operation::Public(TxOp::OwnedCheckWorldPurge { relation, pin, frontier }) = operation {
+            if let Operation::Public(TxOp::OwnedCheckWorldPurge { relation, pin, frontier, local_frontier }) = operation {
                 let root = relation.root_relation().ok_or_else(unavailable)?;
                 let base = self.buffer.base_snapshot();
                 if relation.world().and_then(|world| self.owned_worlds.get(&world))
-                    .is_none_or(|(record, _)| record.pin != *pin) || *frontier < 0
+                    .is_none_or(|(record, _)| record.pin != *pin || (local_frontier.is_some() && !record.is_held()))
+                    || *frontier < 0
                     || base.contains_table(&rtdb_types::OwnedRelation::obsolete_purge_table(owner))
                     || base.relation_event_frontier(&root.purge_table(owner))? != *frontier
                 {
                     return Err(Anomaly::new(AnomalyCategory::Conflict, "rtdb.owned/world-witness-unavailable",
                         "The world point's retained parent or root erasure frontier changed before ordering"));
+                }
+                if let Some(expected) = local_frontier
+                    && base.relation_event_frontier(&relation.table(owner))? != *expected
+                {
+                    return Err(Anomaly::new(AnomalyCategory::Conflict, "rtdb.owned/world-witness-unavailable",
+                        "The world overlay changed before ordering"));
                 }
                 continue;
             }

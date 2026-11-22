@@ -143,6 +143,12 @@ pub struct OwnedIdentityCandidates {
     _charges: Vec<Arc<rtdb_columnar::MemoryReservation>>,
 }
 
+impl OwnedIdentityCandidates {
+    pub fn into_parts(self) -> (Vec<String>, Vec<Arc<rtdb_columnar::MemoryReservation>>) {
+        (self.keys, self._charges)
+    }
+}
+
 /// Reads root identities or local shadow candidates in one exact native cut.
 pub async fn owned_identity_candidates(
     context: Arc<QueryContext>, owner: &str, relation: &OwnedRelation, system: Timestamp,
