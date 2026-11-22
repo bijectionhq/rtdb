@@ -185,12 +185,22 @@ impl<'a> Cutter<'a> {
     }
 
     fn judge(&self, own: usize, doc: crate::DocMatch) -> Result<Judged> {
+        self.judge_key(own, doc, None)
+    }
+
+    fn judge_key(&self, own: usize, doc: crate::DocMatch, key: Option<&[u8]>) -> Result<Judged> {
+        if key.is_some() && !self.segments.is_empty() { return Err(uncovered_owned_search()); }
         let own = &self.files[own];
         let mut rectangles: Vec<[i64; 4]> = own.file.rectangles(doc.doc).collect();
         let mut tied = false;
         for other in self.files {
             if other.identity == own.identity || !covers(other.trie.part(), &doc.iid) { continue; }
-            tied |= cut(&mut rectangles, other.file.events(&doc.iid)?);
+            let events = if let Some(key) = key {
+                other.file.rows_for_key(&doc.iid, key).map(|row| row.map(|(_, event)| event)).collect::<Result<_>>()?
+            } else {
+                other.file.events(&doc.iid)?
+            };
+            tied |= cut(&mut rectangles, events);
         }
         for segment in &self.segments { tied |= cut(&mut rectangles, self.runtime.live_events(self.database, segment, &doc.iid)?); }
         if !rectangles.iter().any(|rectangle| crate::file::meets(*rectangle, self.bounds)) { return Ok(Judged::Hidden); }
@@ -406,6 +416,7 @@ async fn covered_owned_corpus(
             opened.insert(recorded.key.clone(), Arc::clone(&file));
             file
         };
+        if !file.has_full_event_keys() { return Err(uncovered_owned_search()); }
         let data = ObjectKey::new(entry.slug.data_key(&trie.key))?;
         files.push(TrieFile { trie: trie.key.clone(), data, identity: recorded.key.as_str().to_owned(), file, member: recorded.member });
     }
@@ -418,7 +429,6 @@ async fn covered_owned_corpus(
     // The physical slot is only a local instruction for rereading the source.
     // Corpus membership and uniqueness use the complete typed key.
     let mut seen = BTreeSet::new();
-    let mut identities = BTreeMap::new();
     let mut visible_runs = Vec::new();
     let mut scratch = context.memory.reserve(4096)?;
     for selected in by_file(&files) {
@@ -427,14 +437,11 @@ async fn covered_owned_corpus(
             for doc in selected.file.single_column_member_runs(member)? {
                 if doc.doc % 128 == 0 { context.check_cancelled()?; }
                 if !selected.file.visible(doc.doc, bounds) { continue; }
-                Arc::get_mut(&mut scratch).expect("corpus owns its reservation").grow_to(4096usize.saturating_add(identities.len().saturating_add(1).saturating_mul(256)))?;
+                Arc::get_mut(&mut scratch).expect("corpus owns its reservation").grow_to(4096usize.saturating_add(seen.len().saturating_add(1).saturating_mul(256)))?;
                 let key = selected.file.run_identity_bytes(doc)?;
                 let _key = context.memory.reserve(key.len())?;
                 selected.file.run_identity(doc)?;
-                if identities.insert(doc.iid, key).is_some_and(|previous| previous != key) {
-                    return Err(uncovered_owned_search());
-                }
-                match cutter.judge(own, doc)? {
+                match cutter.judge_key(own, doc, Some(key))? {
                     Judged::Hidden => (),
                     Judged::Visible { exact: false } => return Err(uncovered_owned_search()),
                     Judged::Visible { exact: true } => {
@@ -512,7 +519,8 @@ pub async fn owned_ranked(
                 if candidates > 100_000 {
                     return Err(Anomaly::new(AnomalyCategory::Unavailable, "rtdb.owned/search-candidate-limit", "Covered search exceeded its candidate budget"));
                 }
-                let _key = context.memory.reserve(file.run_identity_bytes(run)?.len())?;
+                let key = file.run_identity_bytes(run)?;
+                let _key = context.memory.reserve(key.len())?;
                 let id = file.run_identity(run)?;
                 let columns = ["_id", covered.column.as_str()];
                 let Some(mut rows) = rtdb_query::open_owned_artefact_candidate(
@@ -525,10 +533,16 @@ pub async fn owned_ranked(
                     if resolved_score.is_some() || batch.num_rows() != 1 { return Err(uncovered_owned_search()); }
                     let revision = rtdb_query::owned_row_revision(batch, 0, &id, &context.memory)?;
                     let at = covered.bounds.valid_time.lower().0;
-                    let same_run = file.rows_of(&run.iid)?.into_iter().any(|(row, event)| {
-                        event.op == EventOp::Put && event.system_from == revision.0 && event.valid_from <= at
+                    let mut same_run = false;
+                    for row in file.rows_for_key(&run.iid, key) {
+                        let (row, event) = row?;
+                        if event.op == EventOp::Put && event.system_from == revision.0 && event.valid_from <= at
                             && at < event.valid_to && file.run_of(&covered.column, row) == Some(Some(run.doc))
-                    });
+                        {
+                            same_run = true;
+                            break;
+                        }
+                    }
                     if !same_run { return Err(uncovered_owned_search()); }
                     let (column, field) = batch.schema_ref().column_with_name(&covered.column).ok_or_else(uncovered_owned_search)?;
                     let values = batch.column(column).as_ref();

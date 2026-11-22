@@ -28,7 +28,7 @@ pub(crate) mod experiment;
 
 const MAGIC: &[u8; 8] = b"RTSRCH03";
 /// Identifies the bundle bytes produced by the builder, including visibility encoding.
-pub const FORMAT_VERSION: i32 = 10;
+pub const FORMAT_VERSION: i32 = 11;
 const WRITER_MEMORY: usize = 32 << 20;
 /// The bundle entry holding what tantivy's segment does not: rows, runs, rectangles, nulls, every row's key, and term impacts.
 const SIDECAR: &str = "rtdb.sidecar";
@@ -44,7 +44,7 @@ const KEY_BYTES: usize = 16 + 8 + 8 + 8 + 1;
 /// Rows arrive as the data file holds them: IID ascending, then system time descending.
 #[derive(Clone, Debug, PartialEq)]
 pub struct SearchRow {
-    /// Full entity identity on an owned put, when the lane requires that witness.
+    /// Full entity identity on every owned effect, including delete and erase.
     pub identity: Option<EntityId>,
     pub iid: [u8; 16],
     pub system_from: i64,
@@ -142,7 +142,7 @@ pub fn build_search_file(columns: &[String], rows: &[SearchRow], identity: &str)
 }
 
 /// What the writer accumulates beside tantivy's segment, to become the sidecar.
-struct Accumulated { ceiling: i64, member_starts: Vec<MemberStart>, page_starts: Vec<u32>, row_docs: Vec<Vec<u32>>, column_docs: Vec<u32>, keys: Vec<u8>, doc_iids: Vec<[u8; 16]>, token_lengths: Vec<u32>, identity_starts: Vec<u32>, identities: Vec<u8>, doc_classes: Vec<u8>, sections: BTreeMap<u8, Section>, rectangle_starts: Vec<u32>, rectangles: Vec<[i64; 4]> }
+struct Accumulated { ceiling: i64, member_starts: Vec<MemberStart>, page_starts: Vec<u32>, row_docs: Vec<Vec<u32>>, column_docs: Vec<u32>, keys: Vec<u8>, row_identity_starts: Vec<u32>, row_identities: Vec<u8>, doc_iids: Vec<[u8; 16]>, token_lengths: Vec<u32>, identity_starts: Vec<u32>, identities: Vec<u8>, doc_classes: Vec<u8>, sections: BTreeMap<u8, Section>, rectangle_starts: Vec<u32>, rectangles: Vec<[i64; 4]> }
 
 /// One entity's rows while they arrive: each row's position and header, and per column, its value as an index into the column's distinct values.
 #[derive(Default)]
@@ -208,7 +208,7 @@ where
     let (schema, fields) = schema(columns);
     let settings = IndexSettings { docstore_compression: Compressor::None, ..IndexSettings::default() };
     let mut writer = Index::builder().schema(schema).settings(settings).single_segment_index_writer(directory.clone(), WRITER_MEMORY).map_err(fault)?;
-    let mut sidecar = Accumulated { ceiling: ceiling.unwrap_or(i64::MAX), member_starts: Vec::new(), page_starts: Vec::new(), row_docs: vec![Vec::new(); columns.len()], column_docs: vec![0; columns.len()], keys: Vec::new(), doc_iids: Vec::new(), token_lengths: Vec::new(), identity_starts: vec![0], identities: Vec::new(), doc_classes: Vec::new(), sections: BTreeMap::new(), rectangle_starts: vec![0], rectangles: Vec::new() };
+    let mut sidecar = Accumulated { ceiling: ceiling.unwrap_or(i64::MAX), member_starts: Vec::new(), page_starts: Vec::new(), row_docs: vec![Vec::new(); columns.len()], column_docs: vec![0; columns.len()], keys: Vec::new(), row_identity_starts: vec![0], row_identities: Vec::new(), doc_iids: Vec::new(), token_lengths: Vec::new(), identity_starts: vec![0], identities: Vec::new(), doc_classes: Vec::new(), sections: BTreeMap::new(), rectangle_starts: vec![0], rectangles: Vec::new() };
     let mut rows = 0u32;
     let mut previous_member_iid = None;
     for pages in members {
@@ -216,27 +216,40 @@ where
             page: u32::try_from(sidecar.page_starts.len()).map_err(fault)?,
             doc: u32::try_from(sidecar.doc_iids.len()).map_err(fault)?,
         });
-        let mut entity = Entity::new(columns.len());
+        let mut entities = BTreeMap::<Option<EntityId>, Entity>::new();
+        let mut previous: Option<([u8; 16], i64)> = None;
         for page in pages {
             sidecar.page_starts.push(rows);
             for row in page? {
                 if row.values.len() != columns.len() { return Err(fault("Search row values do not cover the file's columns")); }
-                if entity.iid.is_none() && previous_member_iid.is_some_and(|iid| iid >= row.iid) {
+                if previous.is_none() && previous_member_iid.is_some_and(|iid| iid >= row.iid) {
                     return Err(Anomaly::unsupported("rtdb.search/input-order", "Search file members do not hold disjoint IID ranges in order"));
                 }
-                if entity.iid.is_some_and(|iid| iid > row.iid) { return Err(Anomaly::unsupported("rtdb.search/input-order", "Search rows are not in IID order")); }
-                if entity.iid.is_some_and(|iid| iid != row.iid) { runs(&mut writer, &fields, &mut sidecar, std::mem::replace(&mut entity, Entity::new(columns.len())))?; }
-                if entity.rows.last().is_some_and(|(_, last)| last.system_from.0 < row.system_from) { return Err(Anomaly::unsupported("rtdb.search/input-order", "Search rows are not in system-time-descending order")); }
+                if let Some((iid, system)) = previous {
+                    if iid > row.iid || (iid == row.iid && system < row.system_from) {
+                        return Err(Anomaly::unsupported("rtdb.search/input-order", "Search rows are not in IID and descending system-time order"));
+                    }
+                    if iid != row.iid {
+                        for entity in std::mem::take(&mut entities).into_values() {
+                            runs(&mut writer, &fields, &mut sidecar, entity)?;
+                        }
+                    }
+                }
+                previous = Some((row.iid, row.system_from));
                 for docs in &mut sidecar.row_docs { docs.push(NO_DOC); }
                 sidecar.keys.extend_from_slice(&row.iid);
                 for value in [row.system_from, row.valid_from, row.valid_to] { sidecar.keys.extend_from_slice(&value.to_le_bytes()); }
                 sidecar.keys.push(op_code(row.op));
-                entity.push(rows, row)?;
+                if let Some(id) = &row.identity { sidecar.row_identities.extend_from_slice(&id.handle_bytes()); }
+                sidecar.row_identity_starts.push(u32::try_from(sidecar.row_identities.len()).map_err(fault)?);
+                entities.entry(row.identity.clone()).or_insert_with(|| Entity::new(columns.len())).push(rows, row)?;
                 rows = rows.checked_add(1).ok_or_else(|| fault("A search file holds at most u32::MAX rows"))?;
             }
         }
-        previous_member_iid = entity.iid.or(previous_member_iid);
-        runs(&mut writer, &fields, &mut sidecar, entity)?;
+        previous_member_iid = previous.map(|(iid, _)| iid).or(previous_member_iid);
+        for entity in entities.into_values() {
+            runs(&mut writer, &fields, &mut sidecar, entity)?;
+        }
     }
     if sidecar.member_starts.is_empty() { return Err(fault("A search file holds at least one member")); }
     writer.finalize().map_err(fault)?;
@@ -329,7 +342,7 @@ fn impacts_of(postings: &mut tantivy::postings::SegmentPostings, lengths: &tanti
     impacts
 }
 
-/// The sidecar, in order: format, analyzer and definition versions, artefact identity, row, document, page and member counts, each member's page and document starts, page starts, each column's document count, each row's run in each column, each document's IID, exact token length, optional typed identity and lifespan class, the sections, each document's rectangles, every row's key, the impacts of every term in at least STORED_IMPACTS documents by column and term, and a checksum of the rest.
+/// The sidecar, in order: format, analyzer and definition versions, artefact identity, row, document, page and member counts, each member's page and document starts, page starts, each column's document count, each row's run in each column, each document's IID, exact token length, optional typed identity and lifespan class, the sections, each document's rectangles, every row's physical route and canonical identity, the impacts of every term in at least STORED_IMPACTS documents by column and term, and a checksum of the rest.
 fn encode(index: &Index, fields: &[Field], rows: u32, sidecar: &Accumulated, version: Option<i64>, identity: &str) -> Result<Vec<u8>> {
     let mut bytes = Vec::new();
     bytes.extend_from_slice(&FORMAT_VERSION.to_le_bytes());
@@ -356,6 +369,8 @@ fn encode(index: &Index, fields: &[Field], rows: u32, sidecar: &Accumulated, ver
     for start in &sidecar.rectangle_starts { bytes.extend_from_slice(&start.to_le_bytes()); }
     for rectangle in &sidecar.rectangles { for value in rectangle { bytes.extend_from_slice(&value.to_le_bytes()); } }
     bytes.extend_from_slice(&sidecar.keys);
+    for offset in &sidecar.row_identity_starts { bytes.extend_from_slice(&offset.to_le_bytes()); }
+    bytes.extend_from_slice(&sidecar.row_identities);
     let reader = index.reader_builder().reload_policy(tantivy::ReloadPolicy::Manual).try_into().map_err(fault)?;
     let searcher = reader.searcher();
     let mut entries = Vec::new();
@@ -535,7 +550,7 @@ impl Directory for BundleDirectory {
 }
 
 /// What the sidecar holds, located within the bundle's bytes.
-struct Sidecar { bytes: OwnedBytes, version: Option<i64>, identity: [u8; 32], rows: u32, documents: u32, member_starts: Vec<MemberStart>, page_starts: Vec<u32>, column_docs: Vec<u32>, row_docs: usize, doc_iids: usize, token_lengths: usize, identity_starts: usize, identities: usize, doc_classes: usize, sections: Vec<Section>, rectangle_starts: usize, rectangles: usize, keys: usize, impacts: BTreeMap<(u32, Vec<u8>), Range<usize>> }
+struct Sidecar { bytes: OwnedBytes, version: Option<i64>, identity: [u8; 32], rows: u32, documents: u32, member_starts: Vec<MemberStart>, page_starts: Vec<u32>, column_docs: Vec<u32>, row_docs: usize, doc_iids: usize, token_lengths: usize, identity_starts: usize, identities: usize, doc_classes: usize, sections: Vec<Section>, rectangle_starts: usize, rectangles: usize, keys: usize, row_identity_starts: usize, row_identities: usize, has_full_keys: bool, impacts: BTreeMap<(u32, Vec<u8>), Range<usize>> }
 
 impl Sidecar {
     fn parse(bytes: OwnedBytes, columns: usize, documents: u32) -> Result<Self> {
@@ -607,6 +622,18 @@ impl Sidecar {
         if rectangle_starts.first() != Some(&0) || rectangle_starts.windows(2).any(|pair| pair[0] > pair[1]) { return Err(corrupt("Search file rectangles are out of order")); }
         let rectangles = take(*rectangle_starts.last().unwrap_or(&0) as usize * 32)?.start;
         let keys = take(rows as usize * KEY_BYTES)?.start;
+        let row_identity_starts = take((rows as usize + 1) * 4)?;
+        let mut previous = 0;
+        let mut has_full_keys = true;
+        for index in (row_identity_starts.start..row_identity_starts.end).step_by(4) {
+            let offset = u32_at(index..index + 4);
+            if offset < previous || (index == row_identity_starts.start && offset != 0) {
+                return Err(corrupt("Search file row identity offsets are out of order"));
+            }
+            if index != row_identity_starts.start && offset == previous { has_full_keys = false; }
+            previous = offset;
+        }
+        let row_identities = take(previous as usize)?.start;
         let entries = u32_at(take(4)?);
         let mut impacts = BTreeMap::new();
         for _ in 0..entries {
@@ -620,7 +647,7 @@ impl Sidecar {
             impacts.insert((column, term), range);
         }
         if position != data.len() { return Err(corrupt("Search file sidecar has trailing bytes")); }
-        Ok(Self { bytes, version, identity, rows, documents, member_starts, page_starts, column_docs, row_docs: row_docs.start, doc_iids, token_lengths, identity_starts: identity_starts.start, identities, doc_classes, sections, rectangle_starts: starts.start, rectangles, keys, impacts })
+        Ok(Self { bytes, version, identity, rows, documents, member_starts, page_starts, column_docs, row_docs: row_docs.start, doc_iids, token_lengths, identity_starts: identity_starts.start, identities, doc_classes, sections, rectangle_starts: starts.start, rectangles, keys, row_identity_starts: row_identity_starts.start, row_identities, has_full_keys, impacts })
     }
     fn data(&self) -> &[u8] { self.bytes.as_slice() }
     fn u32_at(&self, offset: usize) -> u32 { u32::from_le_bytes(self.data()[offset..offset + 4].try_into().unwrap_or_default()) }
@@ -663,6 +690,13 @@ impl Sidecar {
         while low < high { let middle = low + (high - low) / 2; if self.row_iid(middle) <= &iid[..] { low = middle + 1; } else { high = middle; } }
         start..low
     }
+    fn row_identity(&self, row: u32) -> &[u8] {
+        let offset = self.row_identity_starts + row as usize * 4;
+        let from = self.row_identities + self.u32_at(offset) as usize;
+        let to = self.row_identities + self.u32_at(offset + 4) as usize;
+        &self.data()[from..to]
+    }
+
     fn key(&self, row: u32) -> Result<KeyedEvent> {
         let at = self.keys + row as usize * KEY_BYTES + 16;
         Ok(KeyedEvent { system_from: self.i64_at(at), valid_from: self.i64_at(at + 8), valid_to: self.i64_at(at + 16), op: op_of(self.data()[at + 24])? })
@@ -724,6 +758,15 @@ impl SearchFile {
 
     /// Every event of one entity this file's data holds, with its row, system time descending.
     pub fn rows_of(&self, iid: &[u8; 16]) -> Result<Vec<(u32, KeyedEvent)>> { self.sidecar.rows_of(iid).map(|row| Ok((row, self.sidecar.key(row)?))).collect() }
+
+    pub(crate) fn has_full_event_keys(&self) -> bool {
+        self.sidecar.has_full_keys
+    }
+
+    pub(crate) fn rows_for_key<'a>(&'a self, iid: &[u8; 16], key: &'a [u8]) -> impl Iterator<Item = Result<(u32, KeyedEvent)>> + 'a {
+        self.sidecar.rows_of(iid).filter(move |row| self.sidecar.row_identity(*row) == key)
+            .map(|row| Ok((row, self.sidecar.key(row)?)))
+    }
 
     /// A row's run in a column: `None` where the row is visible nowhere within the file, `Some(None)` where it is visible with the column null or absent.
     pub fn run_of(&self, column: &str, row: u32) -> Option<Option<u32>> {
