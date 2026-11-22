@@ -994,7 +994,7 @@ pub struct OwnedReadSession {
 impl OwnedReadSession {
     pub fn present(&self) -> TransactionKey { self.present }
 
-    pub async fn fork_cut(&self, scope: rtdb_types::PlacedAttemptScope) -> Result<(Timestamp, Timestamp)> {
+    pub async fn fork_cut(&self, scope: rtdb_types::PlacedAttemptScope) -> Result<OwnedForkCut> {
         self.admit_access().await?;
         let attached_scope = self.attachment.upgrade()
             .and_then(|database| database.await_authority.codec().map(|codec| codec.scope()));
@@ -1004,7 +1004,12 @@ impl OwnedReadSession {
         if let Some(historical) = &self.historical {
             self.check_relations(&historical.relations)?;
         }
-        Ok((self.system_time(), self.fork_until))
+        Ok(OwnedForkCut {
+            basis: self.system_time(),
+            live: self.historical.is_none().then_some(self.present),
+            until: self.fork_until,
+            scope,
+        })
     }
 
     pub fn system_time(&self) -> Timestamp {
@@ -1488,11 +1493,31 @@ impl OwnedWorldPointWitness {
     }
 }
 
+pub struct OwnedForkCut {
+    basis: Timestamp,
+    live: Option<TransactionKey>,
+    until: Timestamp,
+    scope: rtdb_types::PlacedAttemptScope,
+}
+
+impl OwnedForkCut {
+    pub fn basis(&self) -> Timestamp { self.basis }
+    pub fn live(&self) -> Option<TransactionKey> { self.live }
+    pub fn until(&self) -> Timestamp { self.until }
+    pub fn scope(&self) -> rtdb_types::PlacedAttemptScope { self.scope }
+}
+
+#[derive(Clone, Copy)]
+pub enum WorldClockRequest {
+    Retained,
+    Held { start: Option<Timestamp> },
+}
+
 pub struct OwnedWorldFork {
     pub world: rtdb_types::Iid,
-    pub basis: Timestamp,
+    pub cut: OwnedForkCut,
+    pub requested: WorldClockRequest,
     pub deadline: Timestamp,
-    pub scope: rtdb_types::PlacedAttemptScope,
     pub attempt: String,
     pub fingerprint: [u8; 32],
     pub controls: Vec<rtdb_tx::HostedControlWrite>,
@@ -1539,16 +1564,32 @@ impl NativeSession {
     pub async fn register_owned_world_checked(
         &mut self, record: &rtdb_types::OwnedWorld, fork: OwnedWorldFork,
     ) -> Result<TransactionResult> {
-        let until = fork.deadline.min(record.until);
-        if record.id != fork.world || record.basis.system_time != fork.basis || fork.controls.is_empty()
-            || fork.controls.len() > 4093 || fork.controls.iter().any(|control| !control.is_check())
-            || self.placed_history()? != Some(fork.scope)
+        let until = fork.deadline.min(fork.cut.until).min(record.until);
+        let inherited = record.inherited_clock();
+        let requested = match fork.requested {
+            WorldClockRequest::Retained => rtdb_types::WorldClockMode::Retained,
+            WorldClockRequest::Held { start } => rtdb_types::WorldClockMode::Held { start: start.unwrap_or(inherited) },
+        };
+        let advances = record.initial_clock() > inherited;
+        if record.id != fork.world || record.basis.system_time != fork.cut.basis || fork.controls.is_empty()
+            || fork.cut.live.is_some_and(|live| live != record.basis) || record.mode != requested
+            || (advances && fork.cut.live.is_none())
+            || fork.controls.len() > 4092 || fork.controls.iter().any(|control| !control.is_check())
+            || self.placed_history()? != Some(fork.cut.scope)
         {
             return Err(rtdb_types::OwnedWorld::unavailable());
         }
-        let mut ops = Vec::with_capacity(fork.controls.len() + 2);
+        let mut ops = Vec::with_capacity(fork.controls.len() + 2 + usize::from(advances));
         ops.push(TxOp::OwnedDeadline { until });
         ops.extend(fork.controls.into_iter().map(TxOp::HostedControl));
+        if advances {
+            ops.push(TxOp::OwnedCheck {
+                relation: rtdb_types::OwnedRelation::new(rtdb_types::OWNED_ROOT_PUBLICATION_RELATION)?,
+                id: rtdb_types::EntityId::String("head".into()),
+                valid_at: record.basis.system_time,
+                expected: record.parent_publication,
+            });
+        }
         ops.push(TxOp::OwnedForkWorld { record: record.record(), attempt: fork.attempt, fingerprint: fork.fingerprint });
         self.state.execute_tx(ops, Default::default()).await
     }

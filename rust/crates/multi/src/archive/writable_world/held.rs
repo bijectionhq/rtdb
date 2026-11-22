@@ -65,6 +65,8 @@ impl HeldCheckpointWorld {
     pub fn present(&self) -> TransactionKey { self.open.snapshot.present() }
 
     pub fn application_clock(&self) -> Option<Timestamp> { self.open.clock }
+    pub fn initial_clock(&self) -> Timestamp { self.open.record.initial_clock() }
+    pub fn is_held(&self) -> bool { self.open.record.is_held() }
 
     pub fn parent_basis(&self) -> TransactionKey { self.open.retained.basis }
 

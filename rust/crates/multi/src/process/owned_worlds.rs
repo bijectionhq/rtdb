@@ -97,6 +97,8 @@ impl OwnedWorldRead for HeldCheckpointWorld {
     fn present(&self) -> Timestamp { HeldCheckpointWorld::present(self).system_time }
 
     fn application_clock(&self) -> Option<Timestamp> { HeldCheckpointWorld::application_clock(self) }
+    fn initial_clock(&self) -> Timestamp { HeldCheckpointWorld::initial_clock(self) }
+    fn is_held(&self) -> bool { HeldCheckpointWorld::is_held(self) }
 
     fn parent_basis(&self) -> TransactionKey { HeldCheckpointWorld::parent_basis(self) }
 

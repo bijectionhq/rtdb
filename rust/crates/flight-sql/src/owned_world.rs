@@ -51,6 +51,8 @@ pub struct WorldIdentityPage {
 pub trait OwnedWorldRead: Send + Sync {
     fn present(&self) -> Timestamp;
     fn application_clock(&self) -> Option<Timestamp>;
+    fn initial_clock(&self) -> Timestamp;
+    fn is_held(&self) -> bool;
     fn parent_basis(&self) -> TransactionKey;
     fn check_relation(&self, relation: &OwnedRelation) -> Result<()>;
     fn check(&self) -> Result<()>;

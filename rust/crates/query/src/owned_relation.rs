@@ -387,7 +387,7 @@ pub async fn read_owned_world(
 
     let memory = Arc::clone(&context.memory);
     let id = EntityId::Uuid(world.0);
-    let names = ["_id", "capture", "manifest", "basis_id", "basis_time", "until", "schemas", "dropped", "suffix"];
+    let names = ["_id", "capture", "manifest", "basis_id", "basis_time", "parent_publication", "mode", "held_start", "until", "schemas", "dropped", "suffix"];
     let Some(mut cursor) = open_owned_point(
         context, owner, &OwnedRelation::world_catalog(), &id, None, Some(&names),
     ).await? else { return Ok(None); };
@@ -416,6 +416,23 @@ pub async fn read_owned_world(
         }
     }
     Ok(record)
+}
+
+pub async fn read_owned_root_publication(context: Arc<QueryContext>, owner: &str) -> Result<Option<Timestamp>> {
+    let memory = Arc::clone(&context.memory);
+    let relation = OwnedRelation::new(rtdb_types::OWNED_ROOT_PUBLICATION_RELATION)?;
+    let id = EntityId::String("head".into());
+    let valid = Interval::ALL;
+    let Some(mut cursor) = open_owned_point(context, owner, &relation, &id, Some(valid), Some(&["_id", "_system_from"])).await?
+    else { return Ok(None); };
+    let mut publication = None;
+    while let Some(batch) = cursor.next_batch().await? {
+        for row in 0..batch.batch().num_rows() {
+            let revision = owned_row_revision(batch.batch(), row, &id, &memory)?;
+            if publication.replace(revision).is_some() { return Err(rtdb_types::OwnedWorld::unavailable()); }
+        }
+    }
+    Ok(publication)
 }
 
 pub async fn read_owned_parent_schemas(

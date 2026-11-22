@@ -5,7 +5,7 @@ use rtdb_directory::{CheckpointWorldRetention, DeploymentRecord, Directory, Host
 use rtdb_node::{NativeSession, OwnedReadSession, OwnedWorldPointWitness, OwnedWorldWrite, TransactionStatus};
 use rtdb_types::{
     EntityId, Iid, Interval, OwnedRelation, OwnedWorld, PlacedAttemptScope, Result, StructFields,
-    Timestamp, TransactionKey, Value, WorldShadow,
+    Timestamp, TransactionKey, Value, WorldClockMode, WorldShadow,
 };
 use uuid::Uuid;
 
@@ -72,6 +72,8 @@ fn world_record(
         suffix: retained.suffix.map(|id| Iid(*id.as_bytes())),
         manifest: retained.manifest_sha256.clone(),
         basis: retained.basis,
+        parent_publication: retained.parent_publication,
+        mode: retained.mode,
         until: retained.until,
         schemas,
         dropped: false,
@@ -110,13 +112,17 @@ pub(crate) async fn fork_checkpoint_world_selected(
         return Err(OwnedWorld::unavailable());
     }
     let live = session.open_owned_read().await?;
-    let ((schemas, _schema_charge), basis) = with_registered_capture_context(
+    let ((schemas, _schema_charge), parent_publication, basis) = with_registered_capture_context(
         directory, archive, keys, hosted_task,
         CaptureSelection { deployment: deployment_id, capture, manifest: &manifest, suffix, expected_basis },
         resources,
         |context, basis| {
             let owner = &owner;
-            async move { Ok((rtdb_query::read_owned_parent_schemas(context, owner).await?, basis)) }
+            async move {
+                let publication = rtdb_query::read_owned_root_publication(Arc::clone(&context), owner).await?;
+                let schemas = rtdb_query::read_owned_parent_schemas(context, owner).await?;
+                Ok((schemas, publication, basis))
+            }
         },
     ).await?;
     live.check()?;
@@ -126,9 +132,22 @@ pub(crate) async fn fork_checkpoint_world_selected(
     drop(live);
     let parent = CheckpointReadWorld { deployment: deployment_id, capture, manifest_sha256: manifest, suffix, basis };
 
-    if fork.basis != basis.system_time {
+    if fork.cut.basis() != basis.system_time || fork.cut.live().is_some_and(|original| original != basis)
+        || parent_publication.is_some_and(|publication| publication > basis.system_time)
+    {
         return Err(OwnedWorld::unavailable());
     }
+    let inherited = parent_publication.unwrap_or(basis.system_time);
+    let mode = match fork.requested {
+        rtdb_node::WorldClockRequest::Retained => WorldClockMode::Retained,
+        rtdb_node::WorldClockRequest::Held { start } => {
+            let start = start.unwrap_or(inherited);
+            if start < inherited || start == Timestamp::MAX || (start > inherited && fork.cut.live().is_none()) {
+                return Err(OwnedWorld::unavailable());
+            }
+            WorldClockMode::Held { start }
+        }
+    };
     let id = Uuid::from_bytes(fork.world.0);
     if id.is_nil() { return Err(OwnedWorld::unavailable()); }
     let retained = CheckpointWorldRetention {
@@ -138,6 +157,8 @@ pub(crate) async fn fork_checkpoint_world_selected(
         schema_digest: schemas.digest(),
         suffix: parent.suffix,
         basis: parent.basis,
+        parent_publication,
+        mode,
         until,
     };
     let scope = session.placed_history()?;
@@ -150,7 +171,7 @@ pub(crate) async fn fork_checkpoint_world_selected(
         }
         admit_capture(record, archive, &parent)?;
         let now = now();
-        if until <= now || fork.deadline <= now || Some(fork.scope) != scope {
+        if until <= now || fork.deadline.min(fork.cut.until()) <= now || Some(fork.cut.scope()) != scope {
             return Err(OwnedWorld::unavailable());
         }
         record
@@ -185,6 +206,8 @@ fn matches_retention(world: &OwnedWorld, retained: &CheckpointWorldRetention) ->
         && world.suffix.map(|suffix| Uuid::from_bytes(suffix.0)) == retained.suffix
         && world.manifest == retained.manifest_sha256
         && world.basis == retained.basis
+        && world.parent_publication == retained.parent_publication
+        && world.mode == retained.mode
         && world.until == retained.until
         && world.schemas.digest() == retained.schema_digest
 }
@@ -238,7 +261,7 @@ async fn open_world(
         return Err(OwnedWorld::unavailable());
     }
     let clock = snapshot.world_application_clock(world.id).await?;
-    if clock.is_some_and(|clock| clock <= retained.basis.system_time || clock > snapshot.present().system_time) {
+    if clock.is_some_and(|clock| !world.is_held() || clock <= world.initial_clock() || clock > snapshot.present().system_time) {
         return Err(OwnedWorld::unavailable());
     }
     Ok(OpenWorld {

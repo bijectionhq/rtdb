@@ -835,6 +835,7 @@ async fn world_mutations_refuse_source_operations_without_held_admission() {
     let world = OwnedWorld {
         id: Iid([8; 16]), capture: Iid([9; 16]), suffix: None, manifest: "a".repeat(43),
         basis: TransactionKey { tx_id: TxId(0), system_time: Timestamp(10) },
+        parent_publication: None, mode: rtdb_types::WorldClockMode::Held { start: Timestamp(10) },
         until: Timestamp(200), schemas: WorldSchemas::new(Default::default()).unwrap(), dropped: false,
     };
     let catalog = OwnedRelation::world_catalog();
