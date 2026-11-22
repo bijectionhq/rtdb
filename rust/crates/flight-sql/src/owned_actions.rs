@@ -2079,7 +2079,7 @@ impl Service {
         hosted_control::admit_control_targets(policy, controls.iter().map(|(relation, _)| relation))?;
         let scope = self.hosted_control_scope(call).await?;
         let (controls, _charges) = self.decode_hosted_control_groups(call, controls, scope, &mut rows_left, !release && !delete_root && !proposal_overlay && !proposal_land)?;
-        if proposal_overlay && !rtdb_tx::retained_delete_controls(&controls) {
+        if proposal_overlay && !rtdb_tx::proposal_overlay_controls(&controls) {
             return Err(invalid("A Proposal overlay requires checked hosted settlement"));
         }
         if proposal_land && !rtdb_tx::proposal_land_controls(&controls) {

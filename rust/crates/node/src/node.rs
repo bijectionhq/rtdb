@@ -1899,8 +1899,11 @@ impl NativeSession {
             return Err(unavailable());
         }
         if proposal_overlay && (sections.len() != 1 || root.publication.is_some()
-            || !matches!(&sections[0].1.effect, OwnedWorldEffect::Overlay(_) | OwnedWorldEffect::SettleProposal)
-            || !rtdb_tx::retained_delete_controls(&controls))
+            || match &sections[0].1.effect {
+                OwnedWorldEffect::Overlay(_) => !rtdb_tx::proposal_overlay_controls(&controls),
+                OwnedWorldEffect::SettleProposal => !rtdb_tx::retained_delete_controls(&controls),
+                _ => true,
+            })
         {
             return Err(unavailable());
         }

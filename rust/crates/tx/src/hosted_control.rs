@@ -231,6 +231,23 @@ mod retained_release_tests {
     }
 }
 
+/// Proposal content settlements may also replace their exact generation row.
+pub fn proposal_overlay_controls<'a>(controls: impl IntoIterator<Item = &'a HostedControlWrite>) -> bool {
+    let mut checks = 0;
+    let mut existing = 0;
+    let mut replacements = 0;
+    for control in controls {
+        if control.is_check() {
+            checks += 1;
+        } else {
+            existing += usize::from(control.expected().is_some());
+            replacements += 1;
+        }
+    }
+    checks > 0 && (1..=6).contains(&replacements)
+        && existing >= if replacements == 6 { 2 } else { 1 }
+}
+
 /// Classify one acceptance-valid Proposal overlay settled with hosted owner controls.
 /// Every changed locator needs an original point check in the same overlay.
 pub(crate) fn hosted_proposal_overlay(operations: &[crate::source::Operation]) -> Option<rtdb_types::Iid> {
@@ -266,7 +283,8 @@ pub(crate) fn hosted_proposal_overlay(operations: &[crate::source::Operation]) -
         }
     }
     let world = world?;
-    (terminal == writes.is_empty() && retained_delete_controls(controls) && writes.into_iter().all(|(relation, id)| {
+    let controls_allowed = if terminal { retained_delete_controls(controls) } else { proposal_overlay_controls(controls) };
+    (terminal == writes.is_empty() && controls_allowed && writes.into_iter().all(|(relation, id)| {
         relation.world() == Some(world) && points.remove(&(relation.name(), id))
     })).then_some(world)
 }

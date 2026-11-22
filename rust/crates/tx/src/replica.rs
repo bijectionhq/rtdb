@@ -110,7 +110,10 @@ pub fn decode_replica(message: &ResolvedTx, predecessor: Option<TransactionKey>,
                     worlds::HostedEffects::ProposalHold if !(1..=6).contains(
                         &controls.iter().filter_map(|(_, write)| write.batch()).map(|batch| batch.len()).sum::<usize>()
                     ) => return Err(invalid("Resolved Proposal hold differs from its bounded control replacements")),
-                    worlds::HostedEffects::RetainedWrite | worlds::HostedEffects::ProposalOverlay if !(1..=5).contains(
+                    worlds::HostedEffects::ProposalOverlay if !(1..=6).contains(
+                        &controls.iter().filter_map(|(_, write)| write.batch()).map(|batch| batch.len()).sum::<usize>()
+                    ) => return Err(invalid("Resolved Proposal settlement differs from its bounded control replacements")),
+                    worlds::HostedEffects::RetainedWrite if !(1..=5).contains(
                         &controls.iter().filter_map(|(_, write)| write.batch()).map(|batch| batch.len()).sum::<usize>()
                     ) => return Err(invalid("Resolved world write differs from its bounded control replacements")),
                     _ => {}
