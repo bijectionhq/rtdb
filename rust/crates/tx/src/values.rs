@@ -957,7 +957,7 @@ pub enum TxOp {
     OwnedDeclareFixedRange { relation: rtdb_types::OwnedRelation, rule: rtdb_types::FixedRangeRule },
     /// Compare one declared Binary prefix counter at ordered present, after this commit's writes.
     OwnedCheckCapacity { relation: rtdb_types::OwnedRelation, column: String, prefix: Vec<u8>, at_most: i64 },
-    OwnedDeclareCapacity { relation: rtdb_types::OwnedRelation, column: String, prefix_bytes: i64, cap: i64 },
+    OwnedDeclareCapacity { relation: rtdb_types::OwnedRelation, column: String, prefix_bytes: i64, cap: i64, when: Vec<u8> },
     OwnedDeclareUniquePath { relation: rtdb_types::OwnedRelation, name: rtdb_types::OwnedRelation, column: String },
     OwnedDeclareSearchPath { relation: rtdb_types::OwnedRelation, name: rtdb_types::OwnedRelation, column: String },
     OwnedDeclareRelation { relation: rtdb_types::OwnedRelation, schema: rtdb_types::OwnedSchema },

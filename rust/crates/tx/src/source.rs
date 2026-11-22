@@ -76,8 +76,8 @@ impl SourceTransaction {
                     (owned_path_bytes(relation, name, std::slice::from_ref(column))?, None, 0),
                 Operation::Public(TxOp::OwnedCheckCapacity { relation, column, prefix, .. }) =>
                     (capacity_condition_bytes(relation, column.capacity(), prefix.capacity())?, None, 0),
-                Operation::Public(TxOp::OwnedDeclareCapacity { relation, column, .. }) =>
-                    (relation.name().len().checked_add(column.capacity()).ok_or_else(overflow)?, None, 0),
+                Operation::Public(TxOp::OwnedDeclareCapacity { relation, column, when, .. }) =>
+                    (capacity_condition_bytes(relation, column.capacity(), when.capacity())?, None, 0),
                 Operation::Public(TxOp::OwnedDeclareRelation { relation, schema }) =>
                     (relation.name().len().checked_add(schema.retained_bytes()).ok_or_else(overflow)?, None, 0),
                 Operation::Public(TxOp::OwnedDeclarePath { relation, name, columns }) =>
@@ -308,8 +308,8 @@ impl SourceTransaction {
                     owned_path_bytes(relation, name, std::slice::from_ref(column))?,
                 Operation::Public(TxOp::OwnedCheckCapacity { relation, column, prefix, .. }) =>
                     capacity_condition_bytes(relation, column.capacity(), prefix.capacity())?,
-                Operation::Public(TxOp::OwnedDeclareCapacity { relation, column, .. }) =>
-                    relation.name().len().checked_add(column.capacity()).ok_or_else(overflow)?,
+                Operation::Public(TxOp::OwnedDeclareCapacity { relation, column, when, .. }) =>
+                    capacity_condition_bytes(relation, column.capacity(), when.capacity())?,
                 Operation::Public(TxOp::OwnedDeclareRelation { relation, schema }) =>
                     relation.name().len().checked_add(schema.retained_bytes()).ok_or_else(overflow)?,
                 Operation::Public(TxOp::OwnedDeclarePath { relation, name, columns }) =>
@@ -437,12 +437,13 @@ fn operation_value<'a>(operation: &'a Operation, memory: &Arc<MemoryBudget>) -> 
             body.insert("at_most".into(), Value::I64(*at_most));
             "rtdb-owned-check-capacity-v1"
         }
-        Operation::Public(TxOp::OwnedDeclareCapacity { relation, column, prefix_bytes, cap }) => {
+        Operation::Public(TxOp::OwnedDeclareCapacity { relation, column, prefix_bytes, cap, when }) => {
             body.insert("relation".into(), Value::Utf8(relation.name().into()));
             body.insert("column".into(), Value::Utf8(column.clone()));
             body.insert("prefix_bytes".into(), Value::I64(*prefix_bytes));
             body.insert("cap".into(), Value::I64(*cap));
-            "rtdb-owned-capacity-v1"
+            body.insert("when".into(), Value::Binary(when.clone()));
+            "rtdb-owned-capacity-v2"
         }
         Operation::Public(TxOp::OwnedDeclareUniquePath { relation, name, column }) => {
             body.insert("relation".into(), Value::Utf8(relation.name().into()));
@@ -1292,11 +1293,11 @@ impl SourceOperationReader<'_> {
                 else { return Err(invalid("Owned capacity condition has invalid fields")); };
                 TxOp::OwnedCheckCapacity { relation: rtdb_types::OwnedRelation::new(relation)?, column, prefix, at_most }
             }
-            "rtdb-owned-capacity-v1" => {
-                let (Value::Utf8(relation), Value::Utf8(column), Value::I64(prefix_bytes), Value::I64(cap)) =
-                    (value("relation")?, value("column")?, value("prefix_bytes")?, value("cap")?)
+            "rtdb-owned-capacity-v2" => {
+                let (Value::Utf8(relation), Value::Utf8(column), Value::I64(prefix_bytes), Value::I64(cap), Value::Binary(when)) =
+                    (value("relation")?, value("column")?, value("prefix_bytes")?, value("cap")?, value("when")?)
                 else { return Err(invalid("Owned capacity declaration has invalid fields")); };
-                TxOp::OwnedDeclareCapacity { relation: rtdb_types::OwnedRelation::new(relation)?, column, prefix_bytes, cap }
+                TxOp::OwnedDeclareCapacity { relation: rtdb_types::OwnedRelation::new(relation)?, column, prefix_bytes, cap, when }
             }
             "rtdb-owned-unique-path-v1" => {
                 let (Value::Utf8(relation), Value::Utf8(name), Value::Utf8(column)) =

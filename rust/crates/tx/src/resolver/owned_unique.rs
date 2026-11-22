@@ -181,20 +181,29 @@ impl OpenTransaction<'_> {
     }
 
     pub(super) async fn read_occupancy_cell(&self, cursor: Option<QueryCursor>, id: &EntityId, column: &str, uncovered: fn() -> Anomaly) -> Result<Option<Value>> {
+        self.read_occupancy_row(cursor, id, uncovered).await?
+            .map(|row| self.read_occupancy_value(row.batch(), column, uncovered)).transpose()
+    }
+
+    pub(super) async fn read_occupancy_row(&self, cursor: Option<QueryCursor>, id: &EntityId, uncovered: fn() -> Anomaly) -> Result<Option<OwnedBatch>> {
         let Some(mut cursor) = cursor else { return Ok(None); };
-        let mut value = None;
-        while let Some(batch) = cursor.next_batch().await? {
-            let batch = batch.batch();
+        let mut row = None;
+        while let Some(owned) = cursor.next_batch().await? {
+            let batch = owned.batch();
             if batch.num_rows() == 0 { continue; }
-            if value.is_some() || batch.num_rows() != 1 { return Err(uncovered()); }
+            if row.is_some() || batch.num_rows() != 1 { return Err(uncovered()); }
             rtdb_query::owned_row_revision(batch, 0, id, &self.context.memory)?;
-            let (slot, field) = batch.schema_ref().column_with_name(column).ok_or_else(uncovered)?;
-            let column = batch.column(slot).as_ref();
-            let bytes = rtdb_columnar::estimate_read_value_bytes(field, column, 0)?;
-            let _read = self.context.memory.reserve(bytes.saturating_add(4096))?;
-            value = Some(rtdb_columnar::read_value(field, column, 0)?);
+            row = Some(owned);
         }
-        Ok(value)
+        Ok(row)
+    }
+
+    pub(super) fn read_occupancy_value(&self, row: &RecordBatch, column: &str, uncovered: fn() -> Anomaly) -> Result<Value> {
+        let (slot, field) = row.schema_ref().column_with_name(column).ok_or_else(uncovered)?;
+        let column = row.column(slot).as_ref();
+        let bytes = rtdb_columnar::estimate_read_value_bytes(field, column, 0)?;
+        let _read = self.context.memory.reserve(bytes.saturating_add(4096))?;
+        rtdb_columnar::read_value(field, column, 0)
     }
 }
 
