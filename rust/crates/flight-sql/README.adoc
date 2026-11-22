@@ -557,7 +557,7 @@ An empty covered page has no rows and carries the already-known held present in 
 `rtdb.owned.DeclareCapacity.v1` takes the relation prefix and a terminated Arrow IPC stream with one batch and one row.
 Its fields are `column: Utf8`, `prefix_bytes: Int64` (0–4096), and `cap: Int64` (positive).
 An owned relation may declare up to 16 distinct binary projections before its first fact event. Declarations return the same transaction-key Arrow row as Create.
-Zero counts complete nonempty Binary keys. Positive widths count prefixes of that length. Keys are limited to 4096 bytes.
+Zero counts complete Binary keys. An empty complete key charges a single relation-wide bucket. Positive widths count prefixes of that length. Keys are limited to 4096 bytes.
 Each projection and partition has its own counter. One shared relation frontier certifies all counters.
 Writes to the governed root must start at ordered present and have an unbounded valid end.
 The resolver applies same-transaction releases and claims together, then commits the facts and counters atomically.
