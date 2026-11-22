@@ -2,13 +2,13 @@ use std::{fmt, sync::Arc};
 
 use futures::future::BoxFuture;
 use rtdb_directory::{Directory, HostedTask};
-use rtdb_flight_sql::{OwnedWorldHost, WorldCall, WorldPoint, WorldPointResult, WorldPointRow};
+use rtdb_flight_sql::{OwnedWorldHost, OwnedWorldRead, WorldCall, WorldPoint, WorldPointResult, WorldPointRow};
 use rtdb_node::{NodeOptions, OwnedWorldWrite};
-use rtdb_types::{OwnedWorld, Result, Timestamp, TransactionKey};
+use rtdb_types::{EntityId, OwnedRelation, OwnedWorld, Result, Timestamp, TransactionKey};
 use uuid::Uuid;
 
 use crate::{
-    archive::{CheckpointReadResources, commit_checkpoint_world, drop_checkpoint_world, fork_checkpoint_world, read_checkpoint_world_point},
+    archive::{CheckpointReadResources, HeldCheckpointWorld, WorldArchive, open_held_checkpoint_world, commit_checkpoint_world, drop_checkpoint_world, fork_checkpoint_world, read_checkpoint_world_point},
     capability::attachment_storage,
     deployment::CellStorage,
     keys::KeyService,
@@ -57,11 +57,21 @@ impl OwnedWorldHost for PlacedWorldHost {
                 self.directory.as_ref(), &self.storage, self.keys.as_ref(), self.hosted_task.as_ref(),
                 call.session, deployment, point.world, point.relation, point.id, point.valid_at, resources,
             ).await?;
-            let row = read.fact.map(|fact| {
-                let (fields, revision, reservation) = fact.into_parts();
-                WorldPointRow { fields, revision, reservation }
-            });
-            Ok(WorldPointResult { present: read.present.system_time, row })
+            Ok(point_result(read))
+        })
+    }
+
+    fn open_world_read<'a>(&'a self, call: WorldCall<'a>, world: Uuid) -> BoxFuture<'a, Result<Box<dyn OwnedWorldRead>>> {
+        Box::pin(async move {
+            let deployment = self.deployment(&call)?;
+            let archive = WorldArchive {
+                directory: Arc::clone(&self.directory), storage: self.storage.clone(),
+                keys: Arc::clone(&self.keys), hosted_task: self.hosted_task.clone(), options: self.options.clone(),
+            };
+            let held = open_held_checkpoint_world(
+                archive, call.session, deployment, world, Arc::clone(call.node.memory()), Arc::clone(call.node.cache_budget()),
+            ).await?;
+            Ok(Box::new(held) as Box<dyn OwnedWorldRead>)
         })
     }
 
@@ -92,4 +102,26 @@ impl OwnedWorldHost for PlacedWorldHost {
             drop_checkpoint_world(self.directory.as_ref(), call.session, deployment, world).await
         })
     }
+}
+
+impl OwnedWorldRead for HeldCheckpointWorld {
+    fn present(&self) -> Timestamp { HeldCheckpointWorld::present(self).system_time }
+
+    fn check(&self) -> Result<()> { HeldCheckpointWorld::check(self) }
+
+    fn close(&self) { HeldCheckpointWorld::close(self); }
+
+    fn read_point<'a>(
+        &'a self, relation: &'a OwnedRelation, id: &'a EntityId, valid_at: Timestamp,
+    ) -> BoxFuture<'a, Result<WorldPointResult>> {
+        Box::pin(async move { self.point(relation, id, valid_at).await.map(point_result) })
+    }
+}
+
+fn point_result(read: crate::archive::WorldPoint) -> WorldPointResult {
+    let row = read.fact.map(|fact| {
+        let (fields, revision, reservation) = fact.into_parts();
+        WorldPointRow { fields, revision, reservation }
+    });
+    WorldPointResult { present: read.present.system_time, row }
 }

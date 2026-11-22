@@ -5,6 +5,8 @@
 -- The world registration record retains its internal UUID address.
 -- Hosted fork selects a registered capture in the authenticated writer's deployment and derives its basis from the verified archive root.
 -- Hosted world writes use the retained schema and the ordered registration's lifetime.
+-- A held world point handle keeps one ordered local capture and one verified archive region until bounded expiry or close.
+-- The captured registration fences new opens after ordered drop while an earlier handle stays inside its retained read admission.
 --
 -- Scope: hosting an unbounded number of deployments on one shared, autoscaling infrastructure.
 -- A deployment is one RTDB database belonging to one customer application.
