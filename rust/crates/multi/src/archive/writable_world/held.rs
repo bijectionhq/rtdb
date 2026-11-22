@@ -139,7 +139,8 @@ pub(crate) async fn open_held_checkpoint_world(
         tokio::join!(expire, serve);
     });
     opened.await.map_err(|_| OwnedWorld::unavailable())??;
-    open.check()?;
+    let held = HeldCheckpointWorld { open, memory, requests, cancellation };
+    held.check()?;
     let _ = opening.disarm();
-    Ok(HeldCheckpointWorld { open, memory, requests, cancellation })
+    Ok(held)
 }
