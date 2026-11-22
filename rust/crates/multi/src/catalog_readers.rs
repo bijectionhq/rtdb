@@ -134,6 +134,22 @@ impl CatalogReaders {
         Ok(self.floor(&record).is_some_and(|floor| floor >= installed.through))
     }
 
+    pub async fn trie_release_floor(&self, installed: CatalogCut) -> Result<CatalogAdmissionFloor> {
+        if !self.matches_cut(installed)? { return Err(closed()); }
+        let record = self.directory.deployment(&self.deployment).await?.ok_or_else(closed)?;
+        if !self.residence_is_open(&record) || self.writer_epoch != Some(record.epoch) || record.holder.is_none()
+            || self.floor(&record).is_none_or(|floor| floor < installed.through)
+        {
+            return Err(closed());
+        }
+        Ok(CatalogAdmissionFloor { residence: self.residence.clone(), object_namespace: self.namespaces.objects, cut: installed })
+    }
+
+    pub fn matches_release(&self, floor: &CatalogAdmissionFloor) -> bool {
+        floor.residence == self.residence && floor.object_namespace == self.namespaces.objects
+            && self.matches_cut(floor.cut).unwrap_or(false)
+    }
+
     async fn change(&self, change: ReaderChange) -> Result<()> {
         let (answer, result) = oneshot::channel();
         let start = {

@@ -170,6 +170,13 @@ impl ObjectStore for CatalogFloorStore {
         self.proposals.lock().unwrap().push(installed);
         Ok(!self.blocked.load(Ordering::Relaxed))
     }
+    async fn release_trie_files(&self, receipt: &ObjectKey, contents: Bytes) -> Result<()> {
+        let installed = rtdb_format::trie_retirement::InstalledRetirement::decode(receipt.as_str(), &contents)?;
+        let mut files: Vec<_> = installed.files().iter().collect();
+        files.sort_by_key(|file| file.release_order());
+        for file in files { self.delete(&ObjectKey::new(&file.key)?).await?; }
+        Ok(())
+    }
 }
 
 #[tokio::test]

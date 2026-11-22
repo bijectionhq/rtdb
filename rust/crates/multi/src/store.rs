@@ -15,7 +15,8 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use parking_lot::Mutex;
 use prost_types::Any;
-use rtdb_directory::{Cas, DeploymentRecord, Directory, Lifecycle, MemberId, MemberPool, MemberRole, MemberState, HostedTask, StoragePublication, StorageRegion, now_ms};
+use rtdb_directory::{Cas, CatalogAdmissionFloor, DeploymentRecord, Directory, Lifecycle, MemberId, MemberPool, MemberRole, MemberState, HostedTask, StoragePublication, StorageRegion, now_ms};
+use rtdb_format::{keys::{StorageRoot, TrieKey}, trie_retirement::{InstalledRetirement, MAXIMUM_RECEIPT_BYTES}};
 use rtdb_node::{OpenedRecoveryStore, RemoteStorageFactory};
 use rtdb_storage::{Error, IoRegion, ObjectKey, ObjectObservation, ObjectStore, object_store::{IndexPageLifecycle, StoredObject}, remote::PublicationJournal};
 use rtdb_types::{Anomaly, Result};
@@ -871,6 +872,12 @@ impl ObjectStore for EncryptingStore {
     async fn advance_catalog_floor(&self, installed: rtdb_types::CatalogCut) -> Result<bool> {
         self.inner.advance_catalog_floor(installed).await
     }
+    async fn release_trie_files(&self, receipt: &ObjectKey, contents: Bytes) -> Result<()> {
+        if contents.len() > MAXIMUM_RECEIPT_BYTES || self.get_fresh_exact(receipt, contents.len()).await? != contents {
+            return Err(Anomaly::incorrect("rtdb.multi/trie-release-receipt", "The trie release does not match its stored installation receipt"));
+        }
+        self.inner.release_trie_files(receipt, contents).await
+    }
     async fn head(&self, key: &ObjectKey) -> rtdb_storage::Result<StoredObject> { self.inner.head(key).await.map(plain) }
     async fn head_fresh(&self, key: &ObjectKey) -> rtdb_storage::Result<StoredObject> { self.inner.head_fresh(key).await.map(plain) }
     async fn observe_head(&self, key: &ObjectKey) -> rtdb_storage::Result<ObjectObservation<StoredObject>> {
@@ -930,7 +937,12 @@ impl ObjectStore for EncryptingStore {
 
 /// A garbage record: an object released by its deployment, which the reaper may erase once `released_at_ms` is older than its grace period.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct GarbageRecord { pub key: String, pub released_at_ms: i64 }
+pub struct GarbageRecord {
+    pub key: String,
+    pub released_at_ms: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    trie_floor: Option<CatalogAdmissionFloor>,
+}
 
 /// Only a listing needs to know what has been released, so the released set is read on the first one, not on open.
 pub struct GarbageStore {
@@ -952,6 +964,13 @@ impl GarbageStore {
             let mut released = BTreeSet::new();
             for object in self.inner.list(Some(&ObjectKey::new(GARBAGE_DIRECTORY).map_err(|error| Error::Task(error.to_string()))?)).await? {
                 if let Ok(record) = serde_json::from_slice::<GarbageRecord>(&self.inner.get(&object.key).await?) {
+                    if let Some(readers) = &self.catalog_readers {
+                        match &record.trie_floor {
+                            Some(floor) if !readers.matches_release(floor) => continue,
+                            None if is_collected_trie_file(&record.key) => continue,
+                            _ => (),
+                        }
+                    }
                     released.insert(ObjectKey::new(record.key).map_err(|error| Error::Task(error.to_string()))?);
                 }
             }
@@ -960,6 +979,45 @@ impl GarbageStore {
         }).await?;
         Ok(())
     }
+
+    async fn write_release(&self, key: &ObjectKey, trie_floor: Option<CatalogAdmissionFloor>) -> rtdb_storage::Result<()> {
+        if self.released.lock().contains(key) { return Ok(()); }
+        let record = GarbageRecord { key: key.as_str().to_owned(), released_at_ms: (self.clock)(), trie_floor };
+        let suffix = if rtdb_format::keys::is_ordered_index_object(key.as_str()) { ORDERED_INDEX_RELEASE }
+            else if rtdb_format::keys::is_trie_retirement_object(key.as_str()) { TRIE_RETIREMENT_RELEASE } else { "" };
+        let name = ObjectKey::new(format!("{GARBAGE_DIRECTORY}/{:020}-{}{suffix}", record.released_at_ms, uuid::Uuid::new_v4().simple()))
+            .map_err(|error| Error::Task(error.to_string()))?;
+        self.inner.put(&name, Bytes::from(serde_json::to_vec(&record).expect("a record serializes"))).await?;
+        self.released.lock().insert(key.clone());
+        Ok(())
+    }
+}
+
+fn is_collected_trie_file(key: &str) -> bool {
+    let Some((_, name)) = key.strip_prefix("tables/").and_then(|tail| tail.split_once('/')) else { return false; };
+    name.strip_prefix("data/").or_else(|| name.strip_prefix("meta/"))
+        .and_then(|file| file.strip_suffix(".arrow"))
+        .and_then(|trie| trie.parse::<TrieKey>().ok())
+        .is_some_and(|trie| trie.level() > 0)
+}
+
+fn permits_release(record: &DeploymentRecord, store: &str, release: &GarbageRecord) -> bool {
+    let Some(required) = &release.trie_floor else {
+        return record.storage_namespaces.is_none() || !is_collected_trie_file(&release.key);
+    };
+    let cut = required.cut;
+    let Ok(root) = StorageRoot::new(cut.storage_version, cut.storage_epoch) else { return false; };
+    let root = root.key();
+    let residence = record.storage_prefix();
+    required.residence == residence
+        && store == format!("{residence}/{root}")
+        && record.storage_namespaces.is_some_and(|value| value.objects == required.object_namespace)
+        && cut.replica_epoch.0 == record.log_epoch
+        && record.catalog_admission_floors.get(&root).is_some_and(|floor| {
+            floor.residence == required.residence && floor.object_namespace == required.object_namespace
+                && floor.cut.storage_version == cut.storage_version && floor.cut.storage_epoch == cut.storage_epoch
+                && floor.cut.replica_epoch == cut.replica_epoch && floor.cut.through >= cut.through
+        })
 }
 
 #[async_trait]
@@ -978,6 +1036,18 @@ impl ObjectStore for GarbageStore {
     async fn advance_catalog_floor(&self, installed: rtdb_types::CatalogCut) -> Result<bool> {
         let Some(readers) = &self.catalog_readers else { return Ok(true); };
         readers.advance(installed).await
+    }
+    async fn release_trie_files(&self, receipt: &ObjectKey, contents: Bytes) -> Result<()> {
+        let readers = self.catalog_readers.as_ref().ok_or_else(|| Anomaly::unsupported(
+            "rtdb.multi/trie-release", "This store has no coordinated catalog floor"))?;
+        let installed = InstalledRetirement::decode(receipt.as_str(), &contents)?;
+        let floor = readers.trie_release_floor(installed.cut()).await?;
+        let mut files: Vec<_> = installed.files().iter().collect();
+        files.sort_by_key(|file| file.release_order());
+        for file in files {
+            self.write_release(&ObjectKey::new(&file.key)?, Some(floor.clone())).await?;
+        }
+        Ok(())
     }
     async fn head(&self, key: &ObjectKey) -> rtdb_storage::Result<StoredObject> { self.inner.head(key).await }
     async fn head_fresh(&self, key: &ObjectKey) -> rtdb_storage::Result<StoredObject> { self.inner.head_fresh(key).await }
@@ -1007,15 +1077,10 @@ impl ObjectStore for GarbageStore {
         Ok(objects.into_iter().filter(|object| !object.key.as_str().starts_with(GARBAGE_DIRECTORY) && !released.contains(&object.key)).collect())
     }
     async fn delete(&self, key: &ObjectKey) -> rtdb_storage::Result<()> {
-        if self.released.lock().contains(key) { return Ok(()); }
-        let record = GarbageRecord { key: key.as_str().to_owned(), released_at_ms: (self.clock)() };
-        let suffix = if rtdb_format::keys::is_ordered_index_object(key.as_str()) { ORDERED_INDEX_RELEASE }
-            else if rtdb_format::keys::is_trie_retirement_object(key.as_str()) { TRIE_RETIREMENT_RELEASE } else { "" };
-        let name = ObjectKey::new(format!("{GARBAGE_DIRECTORY}/{:020}-{}{suffix}", record.released_at_ms, uuid::Uuid::new_v4().simple()))
-            .map_err(|error| Error::Task(error.to_string()))?;
-        self.inner.put(&name, Bytes::from(serde_json::to_vec(&record).expect("a record serializes"))).await?;
-        self.released.lock().insert(key.clone());
-        Ok(())
+        if self.catalog_readers.is_some() && is_collected_trie_file(key.as_str()) {
+            return Err(Error::Remote { key: key.to_string(), message: "A hosted trie file requires an installed retirement receipt".into() });
+        }
+        self.write_release(key, None).await
     }
 }
 
@@ -1075,7 +1140,7 @@ pub async fn reap_as_of(bucket: &dyn ObjectStore, record: &DeploymentRecord, now
             let Some(location) = physical(&own, &name) else { continue };
             let Ok(bytes) = bucket.get(&crate::reference::key(&location)?).await else { continue };
             let Ok(released) = serde_json::from_slice::<GarbageRecord>(&bytes) else { continue };
-            if released.released_at_ms > threshold || checkpoint_metadata_block(&released.key)
+            if !permits_release(record, &store, &released) || released.released_at_ms > threshold || checkpoint_metadata_block(&released.key)
                 .is_some_and(|block| !checkpoint_metadata_collectable(block, published, oldest))
             {
                 reaped.waiting += 1;
@@ -1284,6 +1349,81 @@ pub async fn reaper_pass(bucket: &dyn ObjectStore, deployments: &[DeploymentReco
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn trie_release_waits_for_its_installed_catalog_floor() {
+        use rtdb_directory::{MemoryDirectory, StorageNamespaces};
+        use rtdb_format::keys::CURRENT_STORAGE_VERSION;
+        use rtdb_format::trie_retirement::{RetirementFile, RetirementIntent, intent_digest, journal_directory};
+        use rtdb_storage::MemoryStore;
+        use rtdb_types::{CatalogCut, ReplicaPosition, StorageEpoch, TableRef};
+
+        let directory = MemoryDirectory::new();
+        let owner = Uuid::new_v4();
+        let namespaces = StorageNamespaces { objects: Uuid::new_v4(), keys: [0; 32] };
+        let epoch = StorageEpoch(0);
+        let root = rtdb_format::keys::StorageRoot::new(CURRENT_STORAGE_VERSION, epoch).unwrap().key();
+        let mut record = DeploymentRecord::new("shop", "acme", vec![], 0);
+        record.holder = Some(MemberId::fresh());
+        record.storage_namespaces = Some(namespaces);
+        record.storage_regions.insert(owner, StorageRegion::Local {
+            archive: None, repair_archive: None, tracks_ordered_index_pages: true,
+            checkpoint_metadata_from: None, checkpoint_replay_from: None,
+        });
+        let record = directory.create_deployment(record).await.unwrap();
+        let scope = format!("{}/{root}", record.storage_prefix());
+        let bucket: crate::reference::Bucket = Arc::new(MemoryStore::default());
+        let mut store = open_deployment_store(bucket.clone(), &scope, crate::packing::PackDiscovery::List, wall_clock()).await.unwrap();
+        let tasks = TaskTracker::new();
+        let readers = CatalogReaders::new(directory.clone(), tasks.clone(), &record, root, namespaces, owner, Some(record.epoch));
+        Arc::get_mut(&mut store).unwrap().catalog_readers = Some(readers);
+        let store = EncryptingStore::new(store, &[7; 32]).unwrap();
+        let cut = CatalogCut { storage_version: CURRENT_STORAGE_VERSION, storage_epoch: epoch, replica_epoch: epoch, through: ReplicaPosition(0) };
+        let hold = store.retain_catalog(Some(cut)).await.unwrap().unwrap();
+        let file = key("tables/orders/data/l01-rc-b00.arrow");
+        let physical = key(&format!("{scope}/{file}"));
+        store.put(&file, Bytes::from_static(b"admitted")).await.unwrap();
+
+        assert!(store.delete(&file).await.is_err());
+        let legacy = GarbageRecord { key: file.to_string(), released_at_ms: 0, trie_floor: None };
+        bucket.put(&key(&format!("{scope}/{GARBAGE_DIRECTORY}/legacy")), serde_json::to_vec(&legacy).unwrap().into()).await.unwrap();
+
+        let intent = RetirementIntent {
+            selected: cut, table: TableRef::new("public", "orders"), tries: vec!["l01-rc-b00".into()],
+            files: vec![RetirementFile { key: file.to_string(), version: None, matches_publication: false }],
+        };
+        let installed = ReplicaPosition(1);
+        let floor = intent.installed_cut(installed).unwrap();
+        let plan = serde_json::to_vec(&intent).unwrap();
+        let receipt = key(&format!("{}/installed/{}", journal_directory(cut), intent_digest(&plan)));
+        let receipt_bytes = Bytes::from([installed.0.to_be_bytes().as_slice(), &plan].concat());
+        store.put(&receipt, receipt_bytes.clone()).await.unwrap();
+        assert!(!store.advance_catalog_floor(floor).await.unwrap());
+        assert!(store.release_trie_files(&receipt, receipt_bytes.clone()).await.is_err());
+
+        let held = directory.deployment(&record.id).await.unwrap().unwrap();
+        assert_eq!(held.catalog_readers.len(), 1);
+        let refs = crate::reference::References::default();
+        reap_as_of(bucket.as_ref(), &held, i64::MAX, Duration::ZERO, &refs).await.unwrap();
+        assert_eq!(store.get(&file).await.unwrap(), Bytes::from_static(b"admitted"));
+        drop(hold);
+        tasks.close();
+        tasks.wait().await;
+        assert!(store.advance_catalog_floor(floor).await.unwrap());
+        let mut forged = receipt_bytes.to_vec();
+        forged[7] = 2;
+        assert!(store.release_trie_files(&receipt, forged.into()).await.is_err());
+        store.release_trie_files(&receipt, receipt_bytes).await.unwrap();
+        reap_as_of(bucket.as_ref(), &held, i64::MAX, Duration::ZERO, &refs).await.unwrap();
+        assert!(bucket.head(&physical).await.is_ok());
+        let current = directory.deployment(&record.id).await.unwrap().unwrap();
+        let mut foreign = current.clone();
+        foreign.storage_namespaces.as_mut().unwrap().objects = Uuid::new_v4();
+        reap_as_of(bucket.as_ref(), &foreign, i64::MAX, Duration::ZERO, &refs).await.unwrap();
+        assert!(bucket.head(&physical).await.is_ok());
+        reap_as_of(bucket.as_ref(), &current, i64::MAX, Duration::ZERO, &refs).await.unwrap();
+        assert!(matches!(bucket.head(&physical).await, Err(Error::MissingObject(_))));
+    }
 
     #[tokio::test]
     async fn an_inflight_local_read_retains_the_maintenance_witness_after_cancellation() {

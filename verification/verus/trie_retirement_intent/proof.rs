@@ -1,6 +1,6 @@
 #![feature(proc_macro_hygiene)]
 
-#[path = "../../../rust/crates/maintenance/src/retirement_intent_step.rs"]
+#[path = "../../../rust/crates/format/src/trie_retirement_step.rs"]
 mod production;
 
 mod laws;

@@ -15,6 +15,7 @@ pub mod metadata;
 mod statistics;
 pub mod temporal_text;
 pub mod transit;
+pub mod trie_retirement;
 mod transit_cell;
 
 pub mod generated {

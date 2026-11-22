@@ -74,6 +74,18 @@ Each physical effect needs a release decision tied to the authority that admits 
 | Derived artefacts and ordered pages | The artefact lane retires definition files and unused builds. Hosted ordered pages have a separate directory-backed lifecycle and reaper. | Bind artefact retirement and repair to an exact publication, prove the last shared member is covered, and show how ordered-page scopes refine the residence ledger. [Artefact lane](../../rust/crates/maintenance/src/artefact.rs) · [Ordered pages](../../rust/crates/multi/src/ordered_index_storage.rs) |
 | Captures, moves and installation disposal | The lifecycle paths use captured archive and installation identities, and the disposal code inventories provider objects. | Prove each lifecycle fence covers every affected reader, recovery and fork dependency, including provider work outstanding when the route changes. [Capture retirement](../../rust/crates/multi/src/archive/retirement.rs) · [Installation disposal](../../rust/crates/multi/src/admin.rs) |
 
+### Hosted trie release records
+
+The leader reads back the installed retirement receipt and registers its exact cut under the matching catalog admission floor.
+The receipt names the logical file list by the digest of the selected plan.
+Every queued release carries that residence, object namespace and installed cut.
+The reaper consumes the release using a directory observation for the same storage root and journal that covers the certified cut.
+A trie release from a legacy marker awaits a receipt in an enrolled residence.
+[HostedTrieReclamation.tla](../tla/HostedTrieReclamation.tla) models the receipt, floor, release record, stale observations and a second residence with independent holds.
+It treats file identity within one residence and completion of provider effects as premises.
+The retirement plan already observes loose provider versions when available.
+Exact physical settlement, pack coverage and copy custody still must refine the certified logical release.
+
 ## Tests and proofs
 
 - **Native:** a follower behind the log tip serves a held generation; the collector never deletes below a live hold; an abandoned hold expires after two sweeps and its generation becomes reclaimable (LIVE-2). Reuse the follower fixtures in `rust/crates/conformance/tests/node_faults.rs` (`follower_cursor_during_collection`).

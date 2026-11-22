@@ -14,7 +14,7 @@ use rtdb_types::{Anomaly, BlockIndex, CatalogCut, Result, TableRef, Timestamp};
 use tokio::sync::Semaphore;
 use tokio_util::sync::CancellationToken;
 use crate::{CycleWorker, SnapshotSource, TrieDeletionPublisher};
-use crate::retirement_intent::{self, FileRelease, PendingRetirement, RetirementFile};
+use crate::retirement_intent::{self, FileRelease, PendingRetirement};
 
 #[derive(Clone, Debug)]
 pub struct GarbageConfig {
@@ -115,7 +115,6 @@ impl TrieCollector {
         if self.store.defers_trie_releases() && cut.is_none() { return Ok(()); }
         let release = FileRelease {
             slots: Arc::new(Semaphore::new(self.config.delete_parallelism)),
-            parallelism: self.config.delete_parallelism,
             cancellation: cancellation.clone(),
         };
         if let Some(cut) = cut
@@ -192,7 +191,7 @@ impl TrieCollector {
                     async move {
                         let _permit = deletes.acquire().await.map_err(crate::invalid)?;
                         if cancellation.is_cancelled() { return Err(crate::closed()); }
-                        RetirementFile::observe(self.store.as_ref(), &key, version).await
+                        retirement_intent::observe_file(self.store.as_ref(), &key, version).await
                     }
                 }).buffered(self.config.delete_parallelism).collect::<Vec<_>>().await;
                 let files = files.into_iter().collect::<Result<Vec<_>>>()?;

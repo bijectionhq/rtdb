@@ -119,6 +119,10 @@ pub trait ObjectStore: Send + Sync {
     async fn advance_catalog_floor(&self, _installed: rtdb_types::CatalogCut) -> rtdb_types::Result<bool> {
         Ok(true)
     }
+    /// Releases the files selected by an installed trie-removal receipt.
+    async fn release_trie_files(&self, _receipt: &ObjectKey, _contents: Bytes) -> rtdb_types::Result<()> {
+        Err(rtdb_types::Anomaly::unsupported("rtdb.storage/trie-release", "This store has no coordinated trie release"))
+    }
     async fn head(&self, key: &ObjectKey) -> Result<StoredObject>;
     /// Reads current metadata for the key from the backing provider.
     /// The default is suitable when `head` already obtains current provider metadata.
