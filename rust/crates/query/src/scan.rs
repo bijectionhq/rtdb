@@ -1183,7 +1183,7 @@ impl PartitionScan {
         }
         let mut resolver = HistoryResolver::new_in(self.bounds, self.scan.clamp_valid_time, Arc::clone(&self.execution.context.memory));
         let keyed = self.scan.table.name.table.is_owned_event_data();
-        let requested_key = if keyed { self.execution.context.owned_identity().map(EntityId::handle_bytes) } else { None };
+        let requested_key = if keyed { self.execution.context.catalog.owned_identity().map(EntityId::handle_bytes) } else { None };
         // Every equal physical IID stays within one task. A key's events still
         // arrive in descending system time, independently of its neighbours.
         let mut bucket = None;
