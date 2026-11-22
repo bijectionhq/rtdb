@@ -33,6 +33,16 @@
 -- A node whose catalog cannot be confirmed current waits up to the margin for its log processor, then holds an expired lease.
 -- The native collector deletes an eligible trie only once `reader_lease` has passed on its own monotonic clock since it first observed that trie as eligible.
 -- In Multi, that deletion records a release, which the cell reaper erases only after its grace.
+-- Native nodes with a local journal and local storage share a catalog floor at the storage root.
+-- Catalog admission and floor advancement use the same filesystem lock.
+-- A reader's shared ticket lock retains its catalog until its last provider operation completes or its process exits.
+-- The collector persists the floor before releasing files from the installed receipt.
+-- A capture in the floor's journal must supply a cut at or above the durable floor.
+-- A successor journal can open from the latest durable checkpoint after offline replacement.
+-- Held catalogs from the predecessor and opaque captures delay the successor floor.
+-- Installing the successor floor fences earlier journals.
+-- An exclusive compactor reset resumes cut publication after it adopts its new naming epoch.
+-- The installed prefix covers the new catalog before the reset completes.
 -- The native leader acknowledges a trie removal after its known installed replica prefix covers the removal record.
 -- The immutable partition value at acknowledgement contains neither a requested key nor a checkpoint dependency on that key.
 -- A skipped replay record or an unrecognized prefix cannot supply this acknowledgement.

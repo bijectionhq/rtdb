@@ -668,6 +668,12 @@ impl ReplicationDriver {
                 })?;
             }
             self.installed = Some(InstalledPrefix { replica: through, source: self.progress.current().source_position });
+            if let Some(leader) = &mut self.leader
+                && let Some(reset) = leader.compactor_reset.as_ref()
+                && self.partition.value().table_catalog().block_index() == Some(reset.block)
+            {
+                leader.compactor_reset.take().expect("matched reset block").complete();
+            }
         }
         self.complete_trie_removals();
         Ok(())
@@ -875,11 +881,6 @@ impl ReplicationDriver {
                     })), (self.clock)()).await?;
                 }
                 self.publish_status(self.role());
-                if let Some(leader) = &mut self.leader {
-                    if leader.compactor_reset.as_ref().is_some_and(|reset| reset.block == self.partition.value().table_catalog().block_index().unwrap_or(BlockIndex(-1))) {
-                        leader.compactor_reset.take().expect("matched reset block").complete();
-                    }
-                }
                 continue;
             }
             if self.pending_block.is_some() && self.upload_for_installed_block(&record) {

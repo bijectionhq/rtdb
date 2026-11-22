@@ -113,11 +113,10 @@ pub trait ObjectStore: Send + Sync {
     async fn retain_catalog(&self, _cut: Option<rtdb_types::CatalogCut>) -> rtdb_types::Result<Option<Arc<dyn Send + Sync>>> {
         Ok(None)
     }
-    /// Whether retiring trie files releases them to a shared reaper after the installed catalog floor.
+    /// Whether physical trie retirement waits for an installed receipt and the catalog floor.
     fn defers_trie_releases(&self) -> bool { false }
-    /// Records an installed retirement as a lower bound for new hosted catalog captures.
+    /// Records an installed retirement as a lower bound for new catalog captures.
     /// Returns false while a reader still needs a catalog before the proposed floor.
-    /// Standalone stores have no coordinated catalog admissions.
     async fn advance_catalog_floor(&self, _installed: rtdb_types::CatalogCut) -> rtdb_types::Result<bool> {
         Ok(true)
     }
@@ -301,6 +300,7 @@ pub(crate) fn map_range(file: LocalFile, key: &ObjectKey, range: Range<u64>, res
 pub struct LocalStore {
     root: Arc<PathBuf>,
     io: Arc<IoRegion>,
+    catalog: Option<Arc<crate::local_catalog::LocalCatalogLedger>>,
 }
 
 struct AdmittedFile {
@@ -319,7 +319,12 @@ impl LocalStore {
         let root = root.as_ref();
         fs::create_dir_all(root).map_err(|err| Error::io(root, err))?;
         let root = fs::canonicalize(root).map_err(|err| Error::io(root, err))?;
-        Ok(Self { root: Arc::new(root), io })
+        Ok(Self { root: Arc::new(root), io, catalog: None })
+    }
+    /// Joins the catalog admission and retirement ledger on a shared local filesystem.
+    pub fn with_catalog_ledger(mut self, replica_epoch: rtdb_types::StorageEpoch) -> Self {
+        self.catalog = Some(Arc::new(crate::local_catalog::LocalCatalogLedger::new(self.root.clone(), replica_epoch)));
+        self
     }
     /// Rejects new work and joins this store's I/O region, including cancelled callers' blocking work.
     pub async fn close_and_wait(&self) { self.io.close_and_wait().await; }
@@ -410,6 +415,37 @@ fn read_local_range(path: &Path, key: &ObjectKey, range: Range<u64>) -> Result<B
 #[async_trait]
 impl ObjectStore for LocalStore {
     fn syncs_checkpoints(&self) -> bool { true }
+
+    async fn retain_catalog(&self, cut: Option<rtdb_types::CatalogCut>) -> rtdb_types::Result<Option<Arc<dyn Send + Sync>>> {
+        let Some(ledger) = self.catalog.clone() else { return Ok(None); };
+        Ok(Some(Arc::new(self.io.run(move || Ok(ledger.retain(cut))).await??)))
+    }
+
+    fn defers_trie_releases(&self) -> bool { self.catalog.is_some() }
+
+    async fn advance_catalog_floor(&self, installed: rtdb_types::CatalogCut) -> rtdb_types::Result<bool> {
+        let Some(ledger) = self.catalog.clone() else { return Ok(true); };
+        self.io.run(move || Ok(ledger.advance(installed))).await?
+    }
+
+    async fn release_trie_files(&self, receipt: &ObjectKey, contents: Bytes) -> rtdb_types::Result<()> {
+        use rtdb_format::trie_retirement::InstalledRetirement;
+        let unavailable = || rtdb_types::Anomaly::incorrect("rtdb.storage/trie-release",
+            "The local catalog floor does not authorize this installed trie release");
+        let ledger = self.catalog.clone().ok_or_else(unavailable)?;
+        let installed = InstalledRetirement::decode(receipt.as_str(), &contents)?;
+        let cut = installed.cut();
+        if self.get_fresh_exact(receipt, contents.len()).await? != contents
+            || !self.io.run(move || Ok(ledger.permits_retirement(cut))).await??
+        {
+            return Err(unavailable());
+        }
+        let mut files = installed.files().iter().collect::<Vec<_>>();
+        files.sort_by_key(|file| file.release_order());
+        let files = files.into_iter().map(|file| ObjectKey::new(&file.key)).collect::<Result<Vec<_>>>()?;
+        for file in files { self.delete(&file).await?; }
+        Ok(())
+    }
 
     async fn head(&self, key: &ObjectKey) -> Result<StoredObject> {
         let (path, key) = (self.path(key), key.clone());

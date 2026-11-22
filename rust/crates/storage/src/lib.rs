@@ -6,6 +6,7 @@ pub mod log;
 pub mod object_store;
 pub mod read_lease;
 mod lease_decision;
+mod local_catalog;
 mod durability;
 pub use durability::{sync_directory, sync_file};
 #[cfg(feature = "remote")]

@@ -5237,6 +5237,7 @@ dependencies = [
  "parking_lot",
  "percent-encoding",
  "rtdb-columnar",
+ "rtdb-format",
  "rtdb-types",
  "serde_json",
  "tempfile",

@@ -49,7 +49,8 @@ All three designers proposed the same mechanism; differences are noted inline.
   When a live operation and an abandoned operation can produce the same observations for any finite prefix, a safe timing-only decision cannot reclaim that object.
   Use a provider-use bound that covers the last possible dependency access, or a sound observation of drain for providers whose use has no such bound.
   The production ledger still needs renewable holds and a capability consumed by the reaper.
-- **Classic side:** nothing yet. Readers are protected by bounded monotonic leases (default 1 h, 60 s margin) and the collector waits a lease after first observing a trie; see the "Reader leases across nodes" section of `verification/results/2026-11-21.adoc`.
+- **Classic side:** Native local-journal and local-storage nodes coordinate trie retirement through the filesystem ledger below.
+  Bounded monotonic leases and the collector eligibility delay still cover the paths that use them.
 - **Directory implementations:** `MemoryDirectory`, `DynamoDirectory`, `RemoteDirectory` exist; there is no object-store-backed one.
 
 ## Handoff notes
@@ -69,10 +70,29 @@ Each physical effect needs a release decision tied to the authority that admits 
 | --- | --- | --- |
 | Cursor and distributed scan | Snapshot admission registers a Multi catalog hold through the backing store. Cursor and fragment polling retain their context for provider work. | Connect all attempts and cancellation paths to a renewable hold or confirmed drain, including classic stores and transaction and export entry points. [Snapshot helper](../../rust/crates/query/src/context.rs) · [Cursor](../../rust/crates/query/src/cursor.rs) · [Fragment](../../rust/crates/query/src/fragment.rs) |
 | Trie compaction output | Hosted retirement plans carry observed provider versions for witnessed loose files. The collector records an installed removal receipt and advances the admission floor before queueing file releases. A successor can retry an incomplete handoff from the pending plan. | Couple the installed receipt, every dependency hold, the admission floor and the provider identity in one certificate. [Collector](../../rust/crates/maintenance/src/gc.rs) · [Intent and receipt](../../rust/crates/maintenance/src/retirement_intent.rs) |
-| Classic trie and block collection | The classic store's catalog hooks have default no-op admission and floor behavior. Trie collection uses the lease window and snapshot registry. The block collector uses an installed snapshot and configured retention. | Install the classic ledger and make the raw object effect consume its authorization. [Storage contract](../../rust/crates/storage/src/object_store.rs) · [Collectors](../../rust/crates/maintenance/src/gc.rs) |
+| Classic trie and block collection | Native local storage serializes reader ticket admission and the durable floor, and checks the installed receipt before physical trie deletion. Trie collection also uses the lease window and snapshot registry. The block collector uses an installed snapshot and configured retention. | Extend the classic ledger to qualified remote stores and the independent block and artefact collection paths. [Storage contract](../../rust/crates/storage/src/object_store.rs) · [Collectors](../../rust/crates/maintenance/src/gc.rs) |
 | Multi loose and packed objects | Hosted exact settlement handles witnessed loose trie files and fully released checkpoint metadata packs. The local path eraser runs under the volume maintenance witness and the directory lineage reservation. The simulator can exercise its missing-reference control only on a memory store. | Extend the contract to L0-bearing packs, old path-only releases and unversioned providers. [Reaper](../../rust/crates/multi/src/store.rs) · [Fork references](../../rust/crates/multi/src/reference.rs) |
 | Derived artefacts and ordered pages | The artefact lane retires definition files and unused builds. Hosted ordered pages have a separate directory-backed lifecycle and reaper. | Bind artefact retirement and repair to an exact publication, prove the last shared member is covered, and show how ordered-page scopes refine the residence ledger. [Artefact lane](../../rust/crates/maintenance/src/artefact.rs) · [Ordered pages](../../rust/crates/multi/src/ordered_index_storage.rs) |
 | Captures, moves and installation disposal | The lifecycle paths use captured archive and installation identities, and the disposal code inventories provider objects. | Prove each lifecycle fence covers every affected reader, recovery and fork dependency, including provider work outstanding when the route changes. [Capture retirement](../../rust/crates/multi/src/archive/retirement.rs) · [Installation disposal](../../rust/crates/multi/src/admin.rs) |
+
+### Local trie release records
+
+Readers and the trie collector open the ledger under one canonical storage root.
+Admission and advancement hold the same exclusive filesystem lock.
+Each reader retains a shared lock on its ticket for the lifetime of its snapshot and the provider operations that inherit it.
+Closing the reader or exiting its process releases the lock.
+The collector can unlink an abandoned ticket after taking its exclusive lock.
+A live reader whose cut cannot cover the proposed floor leaves the retirement pending.
+
+A successful advance synchronizes the journal-scoped floor before any file effects.
+A release reads the exact installed receipt and checks that floor before deleting the batch.
+A collector can reopen the storage root and finish a partially released batch from the same receipt.
+The local contract assumes every participating node uses the same filesystem lock domain and storage root.
+An offline journal replacement starts a newer epoch from the latest durable checkpoint.
+The successor can admit that checkpoint before it has applied a known cut in its new journal.
+Any opaque or earlier held catalog delays retirement under the new journal.
+An installed successor floor closes new admission from earlier journals.
+Classic remote storage and independent maintenance paths still require their own custody and settlement integration.
 
 ### Hosted trie release records
 

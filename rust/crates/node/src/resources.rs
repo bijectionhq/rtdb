@@ -273,7 +273,14 @@ impl ResourceFactory for NativeResources {
             let mut fragment_storage = None;
             let store: Arc<dyn ObjectStore> = match &configuration.storage {
                 None | Some(database_config::Storage::InMemoryStorage(_)) => Arc::new(MemoryStore::default()),
-                Some(database_config::Storage::LocalStorage(storage)) => Arc::new(LocalStore::open_in(PathBuf::from(storage.path.as_deref().ok_or_else(|| invalid("Local storage has no path"))?).join(root.as_str()), Arc::clone(&io))?),
+                Some(database_config::Storage::LocalStorage(storage)) => {
+                    let store = LocalStore::open_in(PathBuf::from(storage.path.as_deref().ok_or_else(|| invalid("Local storage has no path"))?)
+                        .join(root.as_str()), Arc::clone(&io))?;
+                    let store = if let Some(database_config::Log::LocalLog(log)) = &configuration.log {
+                        store.with_catalog_ledger(StorageEpoch(log.epoch.unwrap_or_default()))
+                    } else { store };
+                    Arc::new(store)
+                }
                 Some(database_config::Storage::RemoteStorage(storage)) => {
                     let configuration = storage.object_store.as_ref().ok_or_else(|| invalid("Remote storage has no provider configuration"))?;
                     let factory = self.storage_factories.get(type_name(configuration)?).ok_or_else(|| invalid("Native storage factory is unavailable"))?;

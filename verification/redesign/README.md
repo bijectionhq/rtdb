@@ -11,8 +11,8 @@ The second review revises the custody and erasure contracts and adds the placed 
 | R1 System time bounded by the source log | — | Landed `d85286ba2` |
 | R2 Engine-owned retry receipts | — | Landed `85a868c07` (receipts are bitemporal rows in `xt.idempotency_receipts`; R8 removes them physically) |
 | R3 Epoch-qualified physical names | — | Landed `ae7b66e10` (naming epoch only; an input digest proved unnecessary) |
-| R4 Residence ledger, holds and collection floor | [R4-residence-ledger.md](R4-residence-ledger.md) | Multi admission floor and durable retry landed; renewable holds, classic authority and full timer removal remain |
-| R5 Recovery roots; collectable L0 | [R5-recovery-roots.md](R5-recovery-roots.md) | Multi commits its replay inventory and suffix together before trim and trie-file retirement. Root-based compactor reset, L0 collection, terminal pack coverage and provider qualification remain open. |
+| R4 Residence ledger, holds and collection floor | [R4-residence-ledger.md](R4-residence-ledger.md) | Multi and native local storage enforce a catalog admission floor and retry retirement from installed receipts. Remote classic storage, renewable holds and timer removal remain. |
+| R5 Recovery roots; collectable L0 | [R5-recovery-roots.md](R5-recovery-roots.md) | Multi commits its replay inventory and suffix together before trim and trie-file retirement, and pending archives protect their journal range. Root-based compactor reset, L0 collection, terminal pack coverage and provider qualification remain open. |
 | R6 Sealing with destroyable data keys | [R6-sealing.md](R6-sealing.md) | Multi seals under a per-deployment key; classic unsealed; no per-unit keys |
 | R7 History collection and privacy erasure | [R7-eraser.md](R7-eraser.md) | Contract and bounded custody model; runtime pending |
 | R8 Retention of receipts and transaction metadata | [R8-metadata-retention.md](R8-metadata-retention.md) | Placed outcome witnesses have a logical receipt window. Physical expiry and transaction metadata retention remain open. |

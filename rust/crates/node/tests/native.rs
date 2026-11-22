@@ -1589,6 +1589,10 @@ async fn local_recovery_syncs_an_empty_newer_log_epoch_and_preserves_flushed_row
         assert!(transaction.committed());
         node.catalog().database("xtdb").unwrap().flush().await.unwrap();
         node.sync_all(Duration::from_secs(10), &CancellationToken::new()).await.unwrap();
+        drop(session);
+        let cut = node.catalog().database("xtdb").unwrap().snapshot().catalog_cut().unwrap();
+        let ledger = rtdb_storage::LocalStore::open(directory.path().join("store/v06")).unwrap().with_catalog_ledger(cut.replica_epoch);
+        assert!(rtdb_storage::ObjectStore::advance_catalog_floor(&ledger, cut).await.unwrap());
         stop(&node, driver).await;
 
         configuration.log = Some(database_config::Log::LocalLog(LocalLog { path: Some(directory.path().join("log-1").to_string_lossy().into_owned()), epoch: Some(1) }));
@@ -1808,6 +1812,9 @@ async fn compactor_reset_preserves_l0_history_and_deletes_compacted_files_only_a
         assert_eq!(before, vec![vec![Value::I64(10)], vec![Value::I64(20)]]);
         assert!(node.prepare_compactor_reset("xtdb", &CancellationToken::new()).await.is_err());
         drop(session);
+        let cut = node.catalog().database("xtdb").unwrap().snapshot().catalog_cut().unwrap();
+        let ledger = rtdb_storage::LocalStore::open(store.join("v06")).unwrap().with_catalog_ledger(cut.replica_epoch);
+        assert!(rtdb_storage::ObjectStore::advance_catalog_floor(&ledger, cut).await.unwrap());
         stop(&node, driver).await;
         drop(node);
 

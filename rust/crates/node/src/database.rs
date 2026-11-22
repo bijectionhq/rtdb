@@ -10,7 +10,7 @@ use rtdb_maintenance::{ArtefactDatabase, ArtefactDriver, ArtefactHandle, Artefac
 use rtdb_replication::{BlockStore, PartitionLogs, ProgressMonitor, ReplicationDriver, ReplicationHandle, Role, TermHandle};
 use rtdb_storage::{IoRegion, ObjectStore, cache::{BufferPool, CacheBudget}};
 use rtdb_tx::{ResolveContext, TransactionAuthorization};
-use rtdb_types::{Anomaly, AnomalyCategory, ReplicaPosition, Result, SourcePosition, TableRef, Term};
+use rtdb_types::{Anomaly, AnomalyCategory, CatalogCut, ReplicaPosition, Result, SourcePosition, TableRef, Term};
 use tokio::sync::{RwLock, RwLockReadGuard, RwLockWriteGuard, Semaphore, mpsc, watch};
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
@@ -291,7 +291,20 @@ impl DatabaseFactory {
                 resources.storage_version, resources.storage_epoch, Arc::clone(&resources.store), Arc::clone(&storage), Arc::clone(&self.memory))?;
             let recovered = if self.options.replication.enabled {
                 blocks.recover_for_replay(recovered, &logs, self.options.trie, self.clock.now(), &cancellation).await?
-            } else { recovered.with_source_floor(logs.source_floor()?) };
+            } else {
+                let through = match &recovered.block {
+                    Some(block) => block.boundary_replica_position()
+                        .filter(|position| position.after_offset(logs.replica_epoch) >= 0),
+                    None => Some(logs.replica_floor()?),
+                };
+                if let Some(through) = through {
+                    recovered.partition.publish_catalog_cut(CatalogCut {
+                        storage_version: logs.storage_version, storage_epoch: logs.storage_epoch,
+                        replica_epoch: logs.replica_epoch, through,
+                    })?;
+                }
+                recovered.with_source_floor(logs.source_floor()?)
+            };
             let secondaries = recovered.block.as_ref().map(|block| block.secondary_databases().clone()).unwrap_or_default();
             let partition = Arc::clone(&recovered.partition);
             let progress = ProgressMonitor::new(recovered.progress.clone());

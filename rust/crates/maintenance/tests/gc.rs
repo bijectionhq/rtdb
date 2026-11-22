@@ -299,6 +299,56 @@ async fn durable_retirement_intents_survive_writer_stop_on_both_sides_of_install
 }
 
 #[tokio::test]
+async fn local_trie_collection_resumes_an_installed_batch_after_the_last_reader_drains() {
+    let table = TableRef::new("public", "docs");
+    let tables = TableCatalog::default().with_seeded_table(table.clone(), Vec::new()).unwrap();
+    let obsolete: TrieKey = "l01-rc-b00".parse().unwrap();
+    let slug = &tables.entry(&table).unwrap().slug;
+    let data = ObjectKey::new(slug.data_key(&obsolete)).unwrap();
+    let metadata = ObjectKey::new(slug.metadata_key(&obsolete)).unwrap();
+    let catalog = TrieCatalog::new(16).unwrap().with_tries(table.clone(),
+        [obsolete.clone(), "l01-rc-b01".parse().unwrap()].into_iter()
+            .map(|key| CatalogTrie::notification(key, 1, None).unwrap()), Timestamp(100)).unwrap();
+    let state = Arc::new(PartitionState::new(PartitionValue::loaded(catalog, tables, TrieConfig::default()).unwrap()));
+    let scope = CatalogCut {
+        storage_version: StorageVersion(6), storage_epoch: StorageEpoch(0),
+        replica_epoch: StorageEpoch(0), through: ReplicaPosition(0),
+    };
+    state.publish_catalog_cut(scope).unwrap();
+    let directory = tempfile::tempdir().unwrap();
+    let open = || Arc::new(LocalStore::open(directory.path()).unwrap().with_catalog_ledger(StorageEpoch(0)));
+    let reader = open();
+    let hold = reader.retain_catalog(Some(scope)).await.unwrap().unwrap();
+    let writer = open();
+    for key in [&data, &metadata] { writer.put(key, Bytes::from_static(b"trie file")).await.unwrap(); }
+    let pending = ObjectKey::new(format!("{TRIE_RETIREMENT_DIRECTORY}/6-0-0/pending")).unwrap();
+    let installed = ObjectKey::new(format!("{TRIE_RETIREMENT_DIRECTORY}/6-0-0/installed")).unwrap();
+    let publisher = Arc::new(InstallingPublisher {
+        phase: Removal::Complete, state: state.clone(), scope, store: writer.clone(),
+        pending: pending.clone(), requests: Mutex::new(Vec::new()),
+    });
+    let observer = Arc::new(Observer::default());
+    let collect = |store: Arc<LocalStore>| TrieCollector::new(store, state.clone(), publisher.clone(),
+        observer.clone(), unleased(), fixed_clock()).unwrap();
+    let cancellation = CancellationToken::new();
+    collect(writer.clone()).collect_as_of(Timestamp(100), &cancellation).await.unwrap();
+    assert!(!state.value().retains_trie(&table, &obsolete));
+    assert_eq!(writer.list(Some(&installed)).await.unwrap().len(), 1);
+    assert_eq!(writer.list(Some(&pending)).await.unwrap().len(), 1);
+    for key in [&data, &metadata] { assert!(reader.get(key).await.is_ok()); }
+
+    drop(hold);
+    collect(open()).collect_as_of(Timestamp(100), &cancellation).await.unwrap();
+    assert_eq!(*publisher.requests.lock().unwrap(), [vec![obsolete]]);
+    assert!(writer.list(Some(&pending)).await.unwrap().is_empty());
+    for key in [&data, &metadata] {
+        assert!(matches!(reader.get(key).await, Err(rtdb_storage::Error::MissingObject(_))));
+    }
+    assert_eq!(reader.retain_catalog(Some(scope)).await.err().unwrap().code, "rtdb.storage/catalog-not-current");
+    assert!(observer.0.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
 async fn collection_preserves_live_and_pending_tries_of_the_installed_checkpoint_until_replaced() {
     let table = TableRef::new("public", "docs");
     let tables = TableCatalog::default().with_seeded_table(table.clone(), Vec::new()).unwrap();

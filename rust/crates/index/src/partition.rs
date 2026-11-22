@@ -158,7 +158,7 @@ impl PartitionState {
     }
 
     /// Publishes a prefix after the replica driver has finished installing it.
-    /// The unversioned reset suspends publication for this open partition.
+    /// A reset suspends publication until adoption of its new naming epoch.
     pub fn publish_catalog_cut(&self, cut: CatalogCut) -> Result<()> {
         let mut value = self.value.write();
         match value.catalog_publication {
@@ -287,6 +287,11 @@ impl PartitionState {
             // did not perform the reset or that is recovering an interrupted reset.
             durable_tries.with_naming_epoch(epoch)
         };
+        let old_epoch = value.table_catalog.block().map_or(0, BlockCatalog::naming_epoch);
+        let catalog_publication = match value.catalog_publication {
+            CatalogPublication::Suspended if epoch > old_epoch && epoch == value.trie_catalog.naming_epoch() => CatalogPublication::Untracked,
+            publication => publication,
+        };
         let table_catalog = value.table_catalog.adopt(block, &prepared.metadata)?;
         if !table_catalog.tables().keys().eq(table_blocks.keys()) {
             return Err(invalid("Table blocks do not match the adopted checkpoint registry"));
@@ -294,7 +299,7 @@ impl PartitionState {
         let live = value.live.next_block()?;
         *value = Arc::new(PartitionValue { trie_catalog: Arc::new(trie_catalog), checkpoint_tries,
             table_catalog: Arc::new(table_catalog), live: Arc::new(live), live_snapshot: None,
-            catalog_publication: value.catalog_publication });
+            catalog_publication });
         Ok(())
     }
 }
