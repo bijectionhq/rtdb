@@ -97,12 +97,26 @@ pub async fn open_owned_identity_page(
     if relation.world().is_some() || relation.is_world_catalog() {
         return Err(address_unavailable());
     }
-    open_owned_identity_candidates(context, owner, relation, system, valid, after, fetch).await
+    open_owned_identity_candidates(context, owner, relation, system, valid, after, None, fetch).await
+}
+
+/// Read complete keys only within the installed protected carrier prefix.
+pub async fn open_owned_identity_prefix(
+    context: Arc<QueryContext>, owner: &str, relation: &OwnedRelation,
+    at: Timestamp, after: Option<&str>, prefix: &str, fetch: i64,
+) -> Result<Option<QueryCursor>> {
+    if relation.world().is_some() || relation.is_world_catalog() || prefix.is_empty()
+        || !prefix.bytes().all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        || after.is_some_and(|id| !id.starts_with(prefix))
+    {
+        return Err(address_unavailable());
+    }
+    open_owned_identity_candidates(context, owner, relation, at, at, after, Some(prefix), fetch).await
 }
 
 async fn open_owned_identity_candidates(
     context: Arc<QueryContext>, owner: &str, relation: &OwnedRelation, system: Timestamp,
-    valid: Timestamp, after: Option<&str>, fetch: i64,
+    valid: Timestamp, after: Option<&str>, prefix: Option<&str>, fetch: i64,
 ) -> Result<Option<QueryCursor>> {
     let context = owned_context_at_system(context, system)?;
     if owner.is_empty() { return Err(address_unavailable()); }
@@ -117,9 +131,18 @@ async fn open_owned_identity_candidates(
         unnamed: false, data_type: table.scan_column_type("_id"),
     };
     let order = id.expression();
-    let predicates = after.map(|after| Expr::binary(
+    let mut predicates: Vec<_> = after.map(|after| Expr::binary(
         BinaryOp::Gt, order.clone(), Expr::Literal(Value::Utf8(after.into())),
     )).into_iter().collect();
+    if let Some(prefix) = prefix {
+        let mut upper = prefix.to_owned();
+        let last = upper.pop().ok_or_else(address_unavailable)?;
+        upper.push(char::from(last as u8 + 1));
+        predicates.extend([
+            Expr::binary(BinaryOp::GtEq, order.clone(), Expr::Literal(Value::Utf8(prefix.into()))),
+            Expr::binary(BinaryOp::Lt, order.clone(), Expr::Literal(Value::Utf8(upper))),
+        ]);
+    }
     let scan = Arc::new(Relation::scan(Scan {
         table,
         columns: vec![id],
@@ -162,7 +185,7 @@ pub async fn owned_identity_candidates(
     let mut keys: Vec<String> = Vec::with_capacity(fetch);
     let mut remaining: usize = 8 << 20;
     if let Some(mut cursor) = open_owned_identity_candidates(
-        Arc::clone(&context), owner, relation, system, valid, after, fetch as i64,
+        Arc::clone(&context), owner, relation, system, valid, after, None, fetch as i64,
     ).await? {
         while let Some(batch) = cursor.next_batch().await? {
             let batch = batch.batch();

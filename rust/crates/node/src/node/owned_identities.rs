@@ -41,6 +41,13 @@ impl OwnedReadSession {
         after: Option<&str>,
         limit: usize,
     ) -> Result<OwnedIdentityPage> {
+        self.identity_page_in_prefix(relation, system, valid, after, limit, None).await
+    }
+
+    pub(super) async fn identity_page_in_prefix(
+        &self, relation: &OwnedRelation, system: Timestamp, valid: Timestamp, after: Option<&str>,
+        limit: usize, prefix: Option<&str>,
+    ) -> Result<OwnedIdentityPage> {
         if !(1..=MAX_PAGE_ROWS).contains(&limit) {
             return Err(Anomaly::incorrect(
                 "rtdb.owned/identity-page",
@@ -54,17 +61,16 @@ impl OwnedReadSession {
         let mut keys: Vec<String> = Vec::with_capacity(count);
         let mut remaining = MAX_PAGE_BYTES;
         let mut more = false;
-        if let Some(mut cursor) = rtdb_query::open_owned_identity_page(
-            Arc::clone(&context),
-            &self.owner,
-            relation,
-            system,
-            valid,
-            after,
-            count as i64,
-        )
-        .await?
-        {
+        let cursor = match prefix {
+            Some(prefix) if at_head && valid == system => rtdb_query::open_owned_identity_prefix(
+                Arc::clone(&context), &self.owner, relation, system, after, prefix, count as i64,
+            ).await?,
+            Some(_) => return Err(invalid_page()),
+            None => rtdb_query::open_owned_identity_page(
+                Arc::clone(&context), &self.owner, relation, system, valid, after, count as i64,
+            ).await?,
+        };
+        if let Some(mut cursor) = cursor {
             'page: while let Some(batch) = cursor.next_batch().await? {
                 let batch = batch.batch();
                 let (column, field) = batch
@@ -95,7 +101,9 @@ impl OwnedReadSession {
                         return Err(invalid_page());
                     };
                     let previous = keys.last().map(String::as_str).or(after);
-                    if previous.is_some_and(|previous| previous >= key.as_str()) {
+                    if previous.is_some_and(|previous| previous >= key.as_str())
+                        || prefix.is_some_and(|prefix| !key.starts_with(prefix))
+                    {
                         return Err(invalid_page());
                     }
                     if !at_head {

@@ -102,6 +102,8 @@ pub trait RemoteStorageFactory: Send + Sync {
 
 #[async_trait]
 pub trait ResourceFactory: Send + Sync {
+    /// This optional authority is installed by the native resource owner.
+    fn protected_equality(&self) -> Option<Arc<dyn crate::ProtectedEqualityProjector>> { None }
     fn validate(&self, name: &str, configuration: &DatabaseConfig) -> Result<()>;
     /// Opens a fresh database storage region without opening logs; partial failures drain that region.
     /// The region's operations also belong to this factory's node region, which retains them after caller cancellation.
@@ -132,6 +134,7 @@ pub struct NativeResources {
     pub read_only_log: ReadOnlyLocalLogOptions,
     log_factories: BTreeMap<String, Arc<dyn LogFactory>>,
     storage_factories: BTreeMap<String, Arc<dyn RemoteStorageFactory>>,
+    protected_equality: Option<Arc<dyn crate::ProtectedEqualityProjector>>,
     disk_cache: Option<Arc<DiskCache>>,
     io: Arc<IoRegion>,
     memory_transaction_clock: Option<Arc<TransactionClock>>,
@@ -142,12 +145,16 @@ pub struct NativeResources {
 impl Default for NativeResources {
     fn default() -> Self {
         Self { maximum_log_message_bytes: 64 * 1024 * 1024, log_queue_capacity: 64, read_only_log: ReadOnlyLocalLogOptions::default(),
-            log_factories: BTreeMap::new(), storage_factories: BTreeMap::new(), disk_cache: None, io: IoRegion::new(),
+            log_factories: BTreeMap::new(), storage_factories: BTreeMap::new(), protected_equality: None, disk_cache: None, io: IoRegion::new(),
             memory_transaction_clock: None, local_log_clock: Arc::new(|| Ok(crate::Clock::now(&crate::SystemClock))), local_log_uses_clock_for_non_transactions: false }
     }
 }
 
 impl NativeResources {
+    pub fn with_protected_equality(mut self, projector: Arc<dyn crate::ProtectedEqualityProjector>) -> Self {
+        self.protected_equality = Some(projector);
+        self
+    }
     pub fn with_disk_cache(mut self, cache: Arc<DiskCache>) -> Self { self.disk_cache = Some(cache); self }
     /// Samples this clock for each transaction appended to an in-memory or local source log.
     /// Calls into a shared clock can originate from different databases concurrently.
@@ -223,6 +230,10 @@ pub(crate) fn validate_database_shape(name: &str, configuration: &DatabaseConfig
 
 #[async_trait]
 impl ResourceFactory for NativeResources {
+    fn protected_equality(&self) -> Option<Arc<dyn crate::ProtectedEqualityProjector>> {
+        self.protected_equality.clone()
+    }
+
     async fn close(&self) -> Result<()> { if let Some(cache) = &self.disk_cache { cache.close_and_wait().await; } self.io.close_and_wait().await; Ok(()) }
     fn validate(&self, name: &str, configuration: &DatabaseConfig) -> Result<()> {
         validate_database_shape(name, configuration)?;
