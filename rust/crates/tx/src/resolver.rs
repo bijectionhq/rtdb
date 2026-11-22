@@ -675,8 +675,8 @@ impl<'a> OpenTransaction<'a> {
                 }
                 Ok(())
             }
-            Operation::Public(TxOp::OwnedPublishWorld { world, attempt, fingerprint, expected, advance_to }) =>
-                self.publish_owned_world(*world, attempt, *fingerprint, *expected, *advance_to).await,
+            Operation::Public(TxOp::OwnedPublishWorld { world, attempt, fingerprint, expected, advance_to, drop_world }) =>
+                self.publish_owned_world(*world, attempt, *fingerprint, *expected, *advance_to, *drop_world).await,
             Operation::Public(TxOp::OwnedDeadline { .. } | TxOp::OwnedCheckWorldScope { .. } | TxOp::OwnedCheckWorldPurge { .. } | TxOp::OwnedCheckRange { .. } | TxOp::OwnedCheckCapacity { .. } | TxOp::OwnedCheck { .. }) => Ok(()),
             Operation::Public(TxOp::OwnedErase { relation, id }) =>
                 self.erase_owned(relation, id).await,
@@ -872,10 +872,10 @@ impl<'a> OpenTransaction<'a> {
             return Err(Anomaly::new(AnomalyCategory::Conflict, "rtdb.owned/expired", "Owned transaction reached its deadline before ordering"));
         }
         let mut publications = operations.iter().filter_map(|operation| match operation {
-            Operation::Public(TxOp::OwnedPublishWorld { world, advance_to, .. }) => Some((*world, *advance_to)),
+            Operation::Public(TxOp::OwnedPublishWorld { world, advance_to, drop_world, .. }) => Some((*world, *advance_to, *drop_world)),
             _ => None,
         });
-        if let Some((world, advance_to)) = publications.next() {
+        if let Some((world, advance_to, drop_world)) = publications.next() {
             let scoped_check = operations.iter().any(|operation| matches!(operation, Operation::Public(TxOp::OwnedCheckWorldScope { .. })));
             let mut point_checks = operations.iter().enumerate().filter_map(|(index, operation)| {
                 let Operation::Public(TxOp::OwnedCheck { relation, .. }) = operation else { return None; };
@@ -909,7 +909,7 @@ impl<'a> OpenTransaction<'a> {
                 };
                 effects = effects.saturating_add(size);
             }
-            if publications.next().is_some() || deadline.is_none() || (rows == 0) != advance_to.is_some()
+            if publications.next().is_some() || deadline.is_none() || (rows == 0) != (advance_to.is_some() || drop_world) || drop_world && advance_to.is_some()
                 || !scoped_check || !guarded_points || !hosted || witnesses > 128 || effects > 4096
                 || self.owned_world.as_ref().is_none_or(|(record, _)| record.id != world)
             {
@@ -1007,7 +1007,7 @@ impl<'a> OpenTransaction<'a> {
 
     async fn publish_owned_world(
         &mut self, world: Iid, attempt: &str, fingerprint: [u8; 32], expected: Option<Timestamp>,
-        advance_to: Option<Timestamp>,
+        advance_to: Option<Timestamp>, drop_world: bool,
     ) -> Result<()> {
         use rtdb_types::{EntityId, OWNED_ATTEMPT_RELATION, OwnedRelation, OwnedWorld};
         let owner = self.options.user.as_deref().filter(|owner| !owner.is_empty()).ok_or_else(no_owned_principal)?;
@@ -1023,11 +1023,15 @@ impl<'a> OpenTransaction<'a> {
             return Err(Anomaly::new(AnomalyCategory::Conflict, "rtdb.world/stale-clock", "The hosted world application clock changed"));
         }
         let head = previous.unwrap_or(basis);
-        let next = match advance_to {
-            Some(to) => to,
-            None => head.next()?,
+        let next = if drop_world {
+            None
+        } else {
+            Some(match advance_to {
+                Some(to) => to,
+                None => head.next()?,
+            })
         };
-        if next <= head || next > self.tx_key().system_time {
+        if next.is_some_and(|next| next <= head || next > self.tx_key().system_time) {
             return Err(Anomaly::new(AnomalyCategory::Conflict, "rtdb.world/clock-bound",
                 "The world clock advance must increase the held clock and stay within ordered present"));
         }
@@ -1041,9 +1045,15 @@ impl<'a> OpenTransaction<'a> {
             ("_id".into(), id.as_value()), ("fingerprint".into(), Value::Binary(fingerprint.to_vec())),
         ])], &self.context.memory)?;
         self.write_owned(&relation, &docs, None, Some(Timestamp::MIN), Some(Timestamp::MAX), true).await?;
-        self.buffer.put(OwnedRelation::world_clock_table(owner), StructFields::from([
-            ("_id".into(), Value::Uuid(world.0)), ("clock".into(), Value::I64(next.0)),
-        ]), Interval::ALL)
+        if let Some(next) = next {
+            return self.buffer.put(OwnedRelation::world_clock_table(owner), StructFields::from([
+                ("_id".into(), Value::Uuid(world.0)), ("clock".into(), Value::I64(next.0)),
+            ]), Interval::ALL);
+        }
+        let mut terminal = self.owned_world.as_ref().ok_or_else(OwnedWorld::unavailable)?.0.record();
+        terminal.insert("dropped".into(), Value::Bool(true));
+        let documents = crate::Documents::new(vec![terminal], &self.context.memory)?;
+        self.write_owned(&OwnedRelation::world_catalog(), &documents, None, None, None, false).await
     }
 
     async fn erase_owned(&mut self, relation: &rtdb_types::OwnedRelation, id: &rtdb_types::EntityId) -> Result<()> {
