@@ -2685,6 +2685,11 @@ TLA_CASES = (
     ("ReadCurrencyAnchor", "read-currency-anchor-concurrent-progress-witness",
      ("INVARIANT AnchorCoversPrefix", "INVARIANT NeverConfirmsWhileAnotherObservationIsPending"),
      "NeverConfirmsWhileAnotherObservationIsPending"),
+    ("TrieGcRetry", "trie-gc-retry", None, None),
+    ("TrieGcRetry", "trie-gc-only-block-signals",
+     ('Mutation = "none"', 'Mutation = "only_block_signals"'), "temporal:EventuallyReapsWhenDrained"),
+    ("TrieGcRetry", "trie-gc-retry-witness",
+     ("INVARIANT RetainsWhileHeld", "INVARIANT NeverReapsInSuccessor"), "NeverReapsInSuccessor"),
     ("CollectorTurnover", "collector-turnover-reuse-observation",
      ('Mutation = "none"\nINVARIANTS WaitsForOwnObservation RetainsAdmittedIO',
       'Mutation = "reuse_observation"\nINVARIANT WaitsForOwnObservation'), "WaitsForOwnObservation"),
@@ -4366,6 +4371,31 @@ def verify_native_collector_turnover(args, source):
     print("rust-collector-turnover: successor waited a full lease, and restarting the window was rejected")
 
 
+def verify_native_trie_gc_retry(args, source):
+    env = os.environ | {
+        "CARGO_TARGET_DIR": os.environ.get("CARGO_TARGET_DIR", str(ROOT / "target")),
+        "CARGO_PROFILE_TEST_DEBUG": "0",
+    }
+    test = "a_successor_retires_an_old_leaders_trie_only_after_its_query_finishes"
+    command = ["cargo", "test", "--locked", "-p", "rtdb-node", "--test", "native", test, "--", "--exact"]
+    baseline = run_case(command, source / "rust", args.evidence, "rust-trie-gc-retry", env)
+    if baseline.returncode or f"{test} ... ok" not in baseline.stdout:
+        raise ValueError("trie collection must resume after the held query finishes")
+
+    path = source / "rust/crates/node/src/database.rs"
+    original = path.read_bytes()
+    try:
+        replace_once(path, "_ = trie_retry.tick(), if self.options.automatic_gc && region.is_some() => {",
+                     "_ = trie_retry.tick(), if false => {")
+        control = run_case(command, source / "rust", args.evidence, "rust-trie-gc-only-block-signals", env)
+    finally:
+        path.write_bytes(original)
+    if (control.returncode != 101 or f"{test} ... FAILED" not in control.stdout
+        or "the successor must finish the installed retirement after the query releases its hold" not in control.stdout):
+        raise ValueError("the trie collection replay did not catch the lost retry after the last block")
+    print("rust-trie-gc-retry: idle successor finished the installed retirement, and omitting retries was rejected")
+
+
 def verify_native_transaction_catalog_hold(args, source):
     env = os.environ | {
         "CARGO_TARGET_DIR": os.environ.get("CARGO_TARGET_DIR", str(ROOT / "target")),
@@ -5460,6 +5490,7 @@ def main():
             verify_native_residence_trace(args, source, directory)
             verify_native_current_catalog(args, source)
             verify_native_collector_turnover(args, source)
+            verify_native_trie_gc_retry(args, source)
             verify_native_transaction_catalog_hold(args, source)
             verify_native_exact_marker(args, source)
             verify_compaction_publication_versions(args, source)

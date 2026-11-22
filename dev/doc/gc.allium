@@ -3,11 +3,13 @@
 --
 -- Garbage collection of superseded tries (data + meta files) for one database.
 --
--- Per-database, leader-only, signal-driven. The node that leads this database's
--- replica log also owns its trie GC; followers do not run trie GC at all. There
--- is no periodic timer: the leader signals at every block boundary (the only
--- moment new garbage can appear), and tx processing carries on without waiting
--- for the GC cycle.
+-- Per-database, leader-only, signal-driven.
+-- The node that leads this database's replica log owns its trie GC.
+-- The leader signals at block adoption and transaction processing continues without waiting for the cycle.
+-- In native Rust, the term supervisor also signals on term entry and periodically while automatic trie GC is enabled.
+-- The period is the configured reader lease clamped to 100 milliseconds through 60 seconds.
+-- A retry gives an eligible trie or pending receipt a fresh collection opportunity even if no new block arrives.
+-- The timer only schedules cycles. The collector still checks eligibility, elapsed reader leases and the catalog admission floor.
 --
 -- Tries transition to `garbage` during addTries (see trie-cat.allium); this
 -- spec covers physical cleanup: deleting object-store files and publishing
@@ -120,7 +122,7 @@ entity TrieGarbageCollector {
     --                    that *started* after their suspension).
     --
     -- See `TrieGarbageCollector.kt` for the loop body.
-    enabled: Boolean              -- gates the auto-signal from finishBlock; awaitNoGarbage is unaffected
+    enabled: Boolean              -- gates automatic signals; awaitNoGarbage is unaffected
     blocks_to_keep: Integer
     garbage_lifetime: Duration
 
@@ -239,7 +241,7 @@ rule LeaderClosesTrieGc {
 --                         drains its triggers after each cycle and runs again
 --                         if any are pending.
 --
--- The `enabled` config gates only the auto-`signal()` from finishBlock.
+-- The enabled flag gates signals from block adoption and the native term timer.
 -- Direct `awaitNoGarbage()` always runs a cycle, regardless of `enabled`.
 
 rule LeaderFinishBlockSignalsTrieGc {
@@ -511,7 +513,7 @@ surface TrieGcAdmin {
 
     @guarantee BypassesEnabledFlag
         -- AdminAwaitsNoTrieGarbage runs a cycle regardless of config.enabled.
-        -- The flag gates only the auto-signal from finishBlock.
+        -- The flag gates automatic signals from block adoption and the native term timer.
 
     @guarantee CycleAwaiterFairness
         -- Every caller is resumed (or cancelled) by exactly one cycle whose

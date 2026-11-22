@@ -2385,6 +2385,153 @@ async fn follower_compactor_publishes_results_through_the_writer_without_claimin
 }
 
 #[tokio::test]
+async fn a_successor_retires_an_old_leaders_trie_only_after_its_query_finishes() {
+    use rtdb_format::{keys::{CURRENT_STORAGE_VERSION, TrieKey}, trie_retirement::journal_directory};
+    use rtdb_replication::Role;
+    use rtdb_storage::{Error, IoRegion, LocalStore, ObjectKey, log::{AppendTimestampSource, MemoryLog}};
+    use rtdb_types::StorageEpoch;
+
+    struct SharedJournal {
+        source: Arc<MemoryLog>,
+        replica: Arc<MemoryLog>,
+        storage: std::path::PathBuf,
+    }
+
+    #[async_trait]
+    impl ResourceFactory for SharedJournal {
+        fn validate(&self, _: &str, _: &DatabaseConfig) -> Result<()> { Ok(()) }
+
+        async fn open_storage(&self, _: &str, _: &DatabaseConfig) -> Result<DatabaseStorage> {
+            let io = IoRegion::new();
+            let store = LocalStore::open_in(&self.storage, Arc::clone(&io))?.with_catalog_ledger(StorageEpoch(0));
+            Ok(DatabaseStorage {
+                store: Arc::new(store), blocks: Default::default(), checkpoint_metadata: None, fragment_storage: None,
+                storage_epoch: StorageEpoch(0), storage_version: CURRENT_STORAGE_VERSION, io,
+            })
+        }
+
+        async fn open_logs(&self, _: &str, _: &DatabaseConfig, _: LogAccess, _: CancellationToken, _: &DatabaseStorage) -> Result<OpenedLogs> {
+            Ok(OpenedLogs {
+                source: self.source.clone(), replica: self.replica.clone(),
+                source_epoch: StorageEpoch(0), replica_epoch: StorageEpoch(0),
+                replica_read_index: None, await_authority: AwaitAuthority::SourcePosition, drivers: Vec::new(),
+            })
+        }
+    }
+
+    struct JournalClock(Arc<TickClock>);
+    impl AppendTimestampSource for JournalClock {
+        fn timestamp(&self, _: &[u8], _: Timestamp) -> rtdb_storage::Result<Timestamp> { Ok(self.0.now()) }
+    }
+
+    struct CollectorClock { wall: Arc<TickClock>, monotonic: AtomicI64 }
+    impl Clock for CollectorClock {
+        fn now(&self) -> Timestamp { self.wall.now() }
+        fn monotonic_micros(&self) -> i64 { self.monotonic.load(Ordering::Relaxed) }
+    }
+
+    async fn flush(node: &Node, database: &Database) {
+        let mut status = database.watch_status();
+        let next = status.borrow().open_block;
+        database.flush().await.unwrap();
+        status.wait_for(|state| state.adopted_block.as_ref().is_some_and(|block| block.block_index() >= next)).await.unwrap();
+        node.sync_all(Duration::from_secs(5), node.cancellation()).await.unwrap();
+    }
+
+    tokio::time::timeout(Duration::from_secs(30), async {
+        let files = tempfile::tempdir().unwrap();
+        let wall = Arc::new(TickClock(AtomicI64::new(1_000_000)));
+        let journal = || Arc::new(MemoryLog::with_timestamp_source(1 << 26, Arc::new(JournalClock(wall.clone()))));
+        let shared = Arc::new(SharedJournal { source: journal(), replica: journal(), storage: files.path().join("objects") });
+        let old_clock = Arc::new(CollectorClock { wall: wall.clone(), monotonic: AtomicI64::new(0) });
+        let new_clock = Arc::new(CollectorClock { wall, monotonic: AtomicI64::new(9_000_000) });
+        let mut config = options();
+        config.compaction_threads = 1;
+        config.garbage.blocks_to_keep = 1;
+        config.garbage.garbage_lifetime = Duration::ZERO;
+        config.garbage.reader_lease = Duration::from_secs(1);
+        config.garbage.reader_lease_margin = Duration::from_millis(100);
+
+        let mut predecessor_config = config.clone();
+        predecessor_config.replication.idle_heartbeat = false;
+        predecessor_config.replication.claim_wait = Some(Duration::from_secs(60));
+        let (predecessor, predecessor_driver) = running(predecessor_config, NodeServices {
+            resources: shared.clone(), clock: old_clock, ..services()
+        }).await;
+        let previous = predecessor.catalog().database("xtdb").unwrap();
+        let mut previous_status = previous.watch_status();
+        let mut reader = predecessor.session("xtdb", Arc::new(Authority)).unwrap();
+        reader.state_mut().execute_operation(put(&predecessor, 1, 10)).await.unwrap();
+        flush(&predecessor, &previous).await;
+        previous.compaction().unwrap().compact_all().await.unwrap();
+        let table = TableRef::new("public", "docs");
+        let old: TrieKey = "l01-rc-b00".parse().unwrap();
+        let snapshot = previous.snapshot();
+        assert_eq!(snapshot.trie_entries(&table).iter().map(|trie| &trie.key).collect::<Vec<_>>(), [&old]);
+        let slug = &snapshot.table_entry(&table).unwrap().slug;
+        let files = [slug.data_key(&old), slug.metadata_key(&old)].map(|name| ObjectKey::new(name).unwrap());
+        let journal = journal_directory(snapshot.catalog_cut().unwrap());
+        drop(snapshot);
+        let Role::Leading(old_term) = previous_status.borrow().role else { panic!("the first node must lead") };
+        let cursor = reader.query_sql("SELECT value FROM docs", vec![]).await.unwrap();
+
+        config.automatic_gc = true;
+        config.replication.claim_wait = Some(Duration::from_millis(25));
+        let (successor, successor_driver) = running(config, NodeServices {
+            resources: shared, clock: new_clock.clone(), ..services()
+        }).await;
+        let current = successor.catalog().database("xtdb").unwrap();
+        current.watch_status().wait_for(|state| matches!(state.role, Role::Leading(term) if term > old_term)).await.unwrap();
+        previous_status.wait_for(|state| state.role == Role::Following && state.highest_term > old_term).await.unwrap();
+
+        let mut writer = successor.session("xtdb", Arc::new(Authority)).unwrap();
+        writer.state_mut().execute_operation(put(&successor, 2, 20)).await.unwrap();
+        flush(&successor, &current).await;
+        current.compaction().unwrap().compact_all().await.unwrap();
+        assert!(current.trie_catalog().garbage_tries(&table, Timestamp::MAX).iter().any(|trie| trie.key == old),
+            "the successor compaction must supersede the old trie");
+
+        let store = current.object_store();
+        let pending = ObjectKey::new(format!("{journal}/pending")).unwrap();
+        let mut ids = 3..12;
+        let intent = loop {
+            let id = ids.next().expect("the successor must install a retirement for the held trie");
+            new_clock.monotonic.fetch_add(2_000_000, Ordering::Relaxed);
+            writer.state_mut().execute_operation(put(&successor, id, id * 10)).await.unwrap();
+            flush(&successor, &current).await;
+            let observed = tokio::time::timeout(Duration::from_millis(200), async {
+                loop {
+                    for object in store.list(Some(&pending)).await.unwrap() {
+                        let digest = object.key.as_str().rsplit('/').next().unwrap();
+                        let receipt = ObjectKey::new(format!("{journal}/installed/{digest}")).unwrap();
+                        let Ok(body) = store.get(&object.key).await else { continue; };
+                        let intent: rtdb_format::trie_retirement::RetirementIntent = serde_json::from_slice(&body).unwrap();
+                        if intent.tries.contains(&old.to_string()) && store.head_fresh(&receipt).await.is_ok() {
+                            return object.key;
+                        }
+                    }
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            }).await;
+            if let Ok(intent) = observed { break intent; }
+        };
+        for file in &files { store.head_fresh(file).await.unwrap(); }
+        assert_eq!(rows(cursor).await, vec![vec![Value::I64(10)]]);
+
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if matches!(store.head_fresh(&intent).await, Err(Error::MissingObject(_))) { break; }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        }).await.expect("the successor must finish the installed retirement after the query releases its hold");
+        for file in &files { assert!(matches!(store.head_fresh(file).await, Err(Error::MissingObject(_)))); }
+        drop((reader, writer, previous, current));
+        stop(&predecessor, predecessor_driver).await;
+        stop(&successor, successor_driver).await;
+    }).await.expect("the shared-journal handoff must finish");
+}
+
+#[tokio::test]
 async fn startup_selects_a_newer_checkpoint_when_its_initial_replica_prefix_was_trimmed() {
     use rtdb_storage::{Result as StorageResult, log::{AppendReceipt, Log, LogOffset, LogRange, LogRecord, LogTail, MemoryLog}};
     use std::sync::atomic::AtomicUsize;

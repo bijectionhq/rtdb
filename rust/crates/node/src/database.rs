@@ -520,6 +520,10 @@ impl MaintenanceSupervisor {
         let mut status = self.replication.watch_status();
         let mut region: Option<TermRegion> = None;
         let mut adopted = None;
+        let mut trie_retry = tokio::time::interval(self.options.garbage.reader_lease.clamp(
+            std::time::Duration::from_millis(100), std::time::Duration::from_secs(60),
+        ));
+        trie_retry.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         let result = loop {
             if cancellation.is_cancelled() { break Ok(()); }
             let current = status.borrow_and_update().clone();
@@ -543,7 +547,10 @@ impl MaintenanceSupervisor {
                         biased;
                         _ = cancellation.cancelled() => break Ok(()),
                         changed = status.changed() => { if changed.is_err() { break Err(closed()); } continue; }
-                        started = self.start_term(handle, &cancellation) => match started { Ok(next) => region = Some(next), Err(error) => break Err(error) },
+                        started = self.start_term(handle, &cancellation) => match started {
+                            Ok(next) => { region = Some(next); trie_retry.reset_immediately(); }
+                            Err(error) => break Err(error),
+                        },
                     }
                 }
             }
@@ -561,6 +568,9 @@ impl MaintenanceSupervisor {
             tokio::select! {
                 biased;
                 _ = cancellation.cancelled() => break Ok(()),
+                _ = trie_retry.tick(), if self.options.automatic_gc && region.is_some() => {
+                    if let Some(region) = &region { region.trie.signal(); }
+                }
                 changed = status.changed() => if changed.is_err() { break Err(closed()); },
                 result = async { region.as_mut().expect("guarded term region").tasks.join_next().await }, if region.is_some() => break Err(component_exit(result)),
             }
