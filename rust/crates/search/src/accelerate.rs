@@ -483,11 +483,17 @@ pub struct OwnedSearchHit {
     pub score: f64,
 }
 
+pub(crate) fn owned_rank_order(left: &OwnedSearchHit, right: &OwnedSearchHit) -> std::cmp::Ordering {
+    left.score.total_cmp(&right.score).reverse()
+        .then_with(|| left.id.cmp(&right.id))
+        .then_with(|| left.partition.cmp(&right.partition))
+}
+
 /// The requested rank window and the exact number of verified matches.
 pub struct OwnedSearchPage {
     pub hits: Vec<OwnedSearchHit>,
     pub total: usize,
-    _reservation: Arc<rtdb_columnar::MemoryReservation>,
+    pub(crate) _reservation: Arc<rtdb_columnar::MemoryReservation>,
 }
 
 /// Ranks nominated runs at one cut using statistics from all selected partitions.
@@ -564,12 +570,7 @@ pub async fn owned_ranked(
                 }
 
                 let hit = OwnedSearchHit { partition, id, score: resolved_score.ok_or_else(uncovered_owned_search)? };
-                let at = hits.partition_point(|previous| {
-                    previous.score.total_cmp(&hit.score).reverse()
-                        .then_with(|| previous.id.cmp(&hit.id))
-                        .then_with(|| previous.partition.cmp(&hit.partition))
-                        .is_lt()
-                });
+                let at = hits.partition_point(|previous| owned_rank_order(previous, &hit).is_lt());
                 if at < window {
                     hits.insert(at, hit);
                     hits.truncate(window);

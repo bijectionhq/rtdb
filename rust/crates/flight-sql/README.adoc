@@ -479,9 +479,11 @@ The remaining bytes are the existing hosted control groups. Only check rows from
 The ordered transaction checks the world registration, placement, deadline, local point revisions, root erasure frontiers, and hosted ownership before issuing the transaction-key receipt.
 
 `rtdb.owned.SearchHeldWorld.v1` takes the original 16-byte world handle and a signed big-endian i64 valid instant, then the same partition, offset, limit, evidence flag and query framing as SearchHeld.v4.
-The selected world must be retained, the evidence flag must be one, and every partition must have complete clear-text artefacts with unchanged Root purge frontiers since the archive cut.
+The evidence flag must be one, and every partition must have unchanged Root purge frontiers since the archive cut. Retained worlds require complete clear-text artefacts.
+Writable held and proposal worlds require a declared clear-text column in the archived relation and installed world schema. They exhaust the exact held, UTF-8 identity selection and read the visible row, including local replacements and the effect of tombstones, before scoring the combined corpus.
+Writable search refuses a corpus above 4,096 visible identities or 8 MiB of selected text, an incomplete identity page, and a scope without purge coverage. It uses exact row resolution because the retained search artefact does not represent overlay values or mask archived runs shadowed by the writable line.
 The ranked reply carries the world present, requested valid instant, exact total and one held condition per partition, including for an empty result.
-Conditions validate the original archive pin and whole-corpus purge frontiers.
+Conditions validate the original archive pin and whole-corpus purge frontiers, plus the local relation touch frontier for writable worlds.
 
 `rtdb.owned.ReadHeldWorldChanges.v1` uses the merged changes framing and reply with a held world handle.
 It returns ordered local overlay groups after the supplied revision at or above the archived parent basis. The archived parent is fixed.

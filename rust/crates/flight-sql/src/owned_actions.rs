@@ -1294,7 +1294,7 @@ impl Service {
         let held = self.owned_world_read(call, &Bytes::copy_from_slice(handle))?;
         let rank = owned_rank_request(call, request)?;
         if !rank.observe {
-            return Err(Status::failed_precondition("Search requires the complete immutable retained corpus"));
+            return Err(Status::failed_precondition("Search requires evidence for every selected world partition"));
         }
         let relations = rank.partitions.iter().map(|(relation, _)| relation.clone()).collect::<Vec<_>>();
         let scope = owned_rank_scope(b"rtdb.owned.search.world.v1\0", &body[..24 + rank.frame_len], rank.query);
