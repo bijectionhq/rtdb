@@ -1,0 +1,72 @@
+= RTDB kernel study results, 2026-11-22
+
+== W2 and R5 · Inherited serving reads and physical residence disposal
+
+Production change `586330acad`.
+An inherited serving read acquires a directory registration on the deployment and residence containing the provider path.
+The provider operation retains that registration through caller cancellation.
+Disposal closes that residence to new reads, drains its regions and transfers the observed fork references before removing the source.
+A fork can read an owned copy without depending on a retired owner.
+
+The native replay starts a fork fallback read, cancels its waiter while the provider operation is active, and confirms that disposal still waits for the physical owner.
+After the provider work releases its hold, disposal completes and the same open fork reads the copy.
+Two source controls fail at their named assertions when owner admission is skipped or a fenced owner admits new work.
+The local replay exercised `ReferencingStore`, the in-memory directory and local object store, the provider I/O lifetime boundary and the disposal API.
+It makes no claim about reproducing a failure of a query snapshot.
+
+[cols="1,4",options="header"]
+|===
+|Evidence | Result
+
+|Lean 4.36.0
+|Three theorems cover the reference model for arbitrary reader types and reachable histories.
+The runner checked their axioms and rejected three weakened transition rules.
+The full Lean suite matched.
+
+|TLC
+|All 84 states of the two-reader disposal model were explored.
+Five deliberately weakened models failed and the reachability control observed disposal after cancellation and drain.
+All 357 repository cases matched their expected results.
+
+|Apalache 0.63.0
+|The disposal safety invariant held through ten transitions.
+The other symbolic checks matched their configured outcomes.
+
+|Verus
+|The admission predicate used by the serving path and its three laws verified.
+Three code controls and three paired code-and-contract controls failed at their declared sites.
+All 41 areas and 211 controls matched.
+
+|Native Rust
+|The disposal replay and its two controls matched.
+The storage, maintenance, directory, Multi, and simulation suites reported 480 successful cases and 11 ignored cases using DynamoDB-enabled compilation. Cases gated on an unconfigured provider endpoint can exit before exercising it.
+A separate pass against ephemeral DynamoDB Local 3.3.2 exercised all 12 DynamoDB directory cases.
+The S3-specific native endpoint cases had no configured endpoint.
+
+|JVM and storage integration
+|3,198 standard and 3,348 property cases passed with zero failures, errors or skips.
+Core ran 100 distinct iterations each for 33 simulation methods.
+The selected JVM S3 proxy integration also passed all 12 cases. It uses a local proxy and exercises the JVM storage adapter.
+All three Gradle tasks used the rebuilt FFI library with SHA-256 `0b7f18375ac27e9d12cdd03b163c2e728447bd7fc398176ecbaa39f933a0bac3`.
+
+|Other design checks
+|The existing Alloy, Maude, mCRL2 and AutoHyper suites matched their expected results. These checks did not gain new disposal cases.
+|===
+
+The Lean theorem and TLC and Apalache results are about their models.
+Verus checks the synchronous admission predicate. The native replay supplies evidence for the directory CAS, Rust lifetime and disposal composition on the exercised path.
+Ordinary remote collection, transitive fork publication during retirement, and administrative copy admission remain open.
+The per-inherited-read directory cost and hosted-provider behaviour are unmeasured.
+
+=== Reproduction
+
+The repo runner includes the model, program proofs and controls. With the pinned tools and local authorization, use the command in link:../README.adoc[the runner instructions].
+Local evidence under `/private/tmp/rtdb-formal.QMjPSJsX/` includes command arguments and solver logs.
+
+* `reference-read-native-axy173_w/` contains the native replay and its controls.
+* `reference-read-formal-s1ne3ojt/` contains Verus and the focused TLC and Apalache runs. `reference-read-combined-o_sv1ij8/` contains the full TLC, Apalache, Alloy, Maude, mCRL2 and AutoHyper runs.
+* `reference-read-full-lean-0_8mo993/` contains the full Lean run, including the three new controls.
+* `reference-read-final-rust.log`, `reference-read-dynamo.log`, `reference-read-jvm.log` and `reference-read-s3-integration.log` contain the suite logs.
+
+The production tree is `80a7f0f32943b1bc525e379a464263a42c20a1b0`.
+The two preceding merge commits consolidated branch history while retaining identical source trees.
