@@ -958,7 +958,7 @@ pub enum TxOp {
     HostedControl(crate::HostedControlWrite),
     OwnedDeadline { until: Timestamp },
     OwnedCheckWorldScope { scope: rtdb_types::PlacedAttemptScope },
-    OwnedForkWorld { record: StructFields<Value>, previous: Option<rtdb_types::Iid>, attempt: String, fingerprint: [u8; 32] },
+    OwnedForkWorld { record: StructFields<Value>, previous: Option<rtdb_types::Iid>, attempt: String, fingerprint: [u8; 32], publish_root: bool },
     OwnedPublishRoot { attempt: String, fingerprint: [u8; 32] },
     OwnedPublishWorld { world: rtdb_types::Iid, attempt: String, fingerprint: [u8; 32], expected: Option<Timestamp>, advance_to: Option<Timestamp>, drop_world: bool },
     OwnedCheckWorldPurge { relation: rtdb_types::OwnedRelation, pin: rtdb_types::Iid, frontier: i64, local_frontier: Option<i64> },

@@ -496,6 +496,15 @@ The final fields are the 22-byte attempt ID, its 32-byte fingerprint, and check-
 The archive owner retains the new cut before ordering. The resolver compares the exact predecessor pin before moving a retained world and checks the original Root head for an explicit forward clock start.
 The response carries the unchanged world ID followed by the transaction ID and system time as big-endian i64.
 
+`rtdb.owned.PublishWorldCut.v2` orders one initial retained fork alongside a Root publication at the same source position.
+It takes the v1 fields through the fingerprint and requires mode 0, an all-zero predecessor handle and an independently archived cut with the exact original live Root transaction key.
+Next come a big-endian u16 range witness count and its original 16-byte Root handle and 16-byte nonce pairs, then the big-endian u32 byte length and ordered Root fact groups.
+Root groups may supply point checks, inserts, replacements and deletes and must supply at least one fact write.
+The remainder contains the common hosted groups with at least one check and optional checked replacements.
+The resolver writes the world registration, Root head, fact changes, hosted replacements and one shared immutable attempt marker in the same transaction.
+The response has the v1 layout.
+A failed order can leave its preallocated archival pin retained until expiry without a visible registration.
+
 `rtdb.owned.CommitHeldWorlds.v4` orders one to eight world publications with optional Root facts and checks.
 Its request starts with a big-endian i64 deadline, one 32-byte attempt fingerprint, and a big-endian u16 world count.
 Each world supplies the 16-byte world ID and original held handle, a u16 witness count and its 16-byte nonces, and a 22-byte attempt ID.

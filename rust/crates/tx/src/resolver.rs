@@ -689,18 +689,18 @@ impl<'a> OpenTransaction<'a> {
                 }
                 Ok(())
             }
-            Operation::Public(TxOp::OwnedForkWorld { record, previous, attempt, fingerprint }) => {
+            Operation::Public(TxOp::OwnedForkWorld { record, previous, attempt, fingerprint, publish_root }) => {
                 self.reserve_owned_attempt(attempt, *fingerprint).await?;
                 let documents = crate::Documents::new(vec![record.clone()], &self.context.memory)?;
-                self.write_owned(&rtdb_types::OwnedRelation::world_catalog(), &documents, None, None, None, previous.is_none()).await
+                self.write_owned(&rtdb_types::OwnedRelation::world_catalog(), &documents, None, None, None, previous.is_none()).await?;
+                if *publish_root {
+                    self.publish_owned_root_head().await?;
+                }
+                Ok(())
             }
             Operation::Public(TxOp::OwnedPublishRoot { attempt, fingerprint }) => {
                 self.reserve_owned_attempt(attempt, *fingerprint).await?;
-                let relation = rtdb_types::OwnedRelation::new(rtdb_types::OWNED_ROOT_PUBLICATION_RELATION)?;
-                let documents = crate::Documents::new(vec![StructFields::from([
-                    ("_id".into(), Value::Utf8("head".into())),
-                ])], &self.context.memory)?;
-                self.write_owned(&relation, &documents, None, Some(Timestamp::MIN), Some(Timestamp::MAX), false).await
+                self.publish_owned_root_head().await
             }
             Operation::Public(TxOp::OwnedPublishWorld { world, attempt, fingerprint, expected, advance_to, drop_world }) =>
                 self.publish_owned_world(*world, attempt, *fingerprint, *expected, *advance_to, *drop_world).await,
@@ -982,15 +982,33 @@ impl<'a> OpenTransaction<'a> {
         if deadline.is_some_and(|until| self.tx_key().system_time >= until) {
             return Err(Anomaly::new(AnomalyCategory::Conflict, "rtdb.owned/expired", "Owned transaction reached its deadline before ordering"));
         }
-        if operations.iter().any(|operation| matches!(operation, Operation::Public(TxOp::OwnedForkWorld { .. }))) {
+        if let Some(publish_root) = operations.iter().find_map(|operation| match operation {
+            Operation::Public(TxOp::OwnedForkWorld { publish_root, .. }) => Some(*publish_root),
+            _ => None,
+        }) {
             let mut forks = 0;
             let mut checks = 0;
+            let mut root_rows = 0usize;
+            let mut effects = 1usize + usize::from(publish_root); // Shared attempt and optional Root head.
             let mut expected_tip = None;
             let mut checked_tip = None;
             for operation in operations {
+                effects = effects.saturating_add(1);
                 match operation {
                     Operation::Public(TxOp::OwnedDeadline { .. }) => {}
                     Operation::Public(TxOp::HostedControl(control)) if control.is_check() => { checks += 1; }
+                    Operation::Public(TxOp::HostedControl(_)) if publish_root => {}
+                    Operation::Public(TxOp::OwnedCheck { relation, .. } | TxOp::OwnedCheckRange { relation, .. })
+                        if publish_root && relation.is_root_data() => {}
+                    Operation::Public(TxOp::OwnedInsertDocs { relation, documents, .. } | TxOp::OwnedReplaceDocs { relation, documents, .. })
+                    | Operation::OwnedWriteIids { relation, documents, .. }
+                        if publish_root && relation.is_root_data() && !documents.rows().is_empty() => {
+                        root_rows = root_rows.saturating_add(documents.rows().len());
+                        effects = effects.saturating_add(documents.rows().len() - 1);
+                    }
+                    Operation::Public(TxOp::OwnedDelete { relation, .. }) if publish_root && relation.is_root_data() => {
+                        root_rows = root_rows.saturating_add(1);
+                    }
                     Operation::Public(TxOp::OwnedCheck { relation, id: rtdb_types::EntityId::String(id), valid_at, expected })
                         if relation.name() == rtdb_types::OWNED_ROOT_PUBLICATION_RELATION && id == "head"
                             && checked_tip.is_none() => {
@@ -1000,6 +1018,9 @@ impl<'a> OpenTransaction<'a> {
                         let world = rtdb_types::OwnedWorld::from_record(record)?;
                         if world.dropped || world.basis.system_time >= self.tx_key().system_time
                             || deadline.is_none_or(|until| until > world.until)
+                            || (publish_root && (previous.is_some()
+                                || world.mode != rtdb_types::WorldClockMode::Retained
+                                || world.basis.tx_id >= self.tx_key().tx_id))
                         {
                             return Err(unavailable());
                         }
@@ -1021,7 +1042,9 @@ impl<'a> OpenTransaction<'a> {
                     _ => return Err(unavailable()),
                 }
             }
-            if forks != 1 || checks == 0 || expected_tip != checked_tip || operations.len() >= 4096 {
+            if forks != 1 || checks == 0 || expected_tip != checked_tip || effects > 4096
+                || (publish_root && root_rows == 0)
+            {
                 return Err(unavailable());
             }
         }
@@ -1233,6 +1256,14 @@ impl<'a> OpenTransaction<'a> {
         terminal.insert("dropped".into(), Value::Bool(true));
         let documents = crate::Documents::new(vec![terminal], &self.context.memory)?;
         self.write_owned(&OwnedRelation::world_catalog(), &documents, None, None, None, false).await
+    }
+
+    async fn publish_owned_root_head(&mut self) -> Result<()> {
+        let relation = rtdb_types::OwnedRelation::new(rtdb_types::OWNED_ROOT_PUBLICATION_RELATION)?;
+        let documents = crate::Documents::new(vec![StructFields::from([
+            ("_id".into(), Value::Utf8("head".into())),
+        ])], &self.context.memory)?;
+        self.write_owned(&relation, &documents, None, Some(Timestamp::MIN), Some(Timestamp::MAX), false).await
     }
 
     async fn reserve_owned_attempt(&mut self, attempt: &str, fingerprint: [u8; 32]) -> Result<()> {
