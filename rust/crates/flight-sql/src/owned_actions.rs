@@ -35,6 +35,7 @@ pub(crate) const COMMIT_HOSTED_V1: &str = "rtdb.owned.CommitHosted.v1";
 pub(crate) const COMMIT_OWNED_V1: &str = "rtdb.owned.Commit.v1";
 pub(crate) const COMMIT_OWNED_V2: &str = "rtdb.owned.Commit.v2";
 pub(crate) const COMMIT_OWNED_V5: &str = "rtdb.owned.Commit.v5";
+pub(crate) const COMMIT_OWNED_V6: &str = "rtdb.owned.Commit.v6";
 pub(crate) const COMMIT_OWNED_V4: &str = "rtdb.owned.Commit.v4";
 pub(crate) const COMMIT_OWNED_V3: &str = "rtdb.owned.Commit.v3";
 const MAX_RANGE_WITNESSES: usize = 32;
@@ -46,6 +47,7 @@ const MAX_GROUPED_COMMIT_ROWS: usize = 4096;
 pub(crate) enum CommitFormat {
     Single,
     Grouped,
+    Ordered,
 }
 
 struct CommitRequest<'a> {
@@ -60,28 +62,43 @@ impl<'a> CommitRequest<'a> {
                 let (relation, rest) = split_relation(body)?;
                 (Some(relation), rest)
             },
-            CommitFormat::Grouped => (None, body),
+            CommitFormat::Grouped | CommitFormat::Ordered => (None, body),
         };
         let (deadline, body) = body.split_first_chunk::<8>().ok_or_else(|| invalid("Owned commit has no deadline"))?;
         let deadline = Timestamp(i64::from_be_bytes(*deadline));
         if let Some(relation) = single {
             return Ok(Self { deadline, groups: vec![(relation, body)] });
         }
-        Ok(Self { deadline, groups: owned_groups(body, false)? })
+        Ok(Self { deadline, groups: owned_groups(body, false, matches!(format, CommitFormat::Ordered))? })
     }
 }
 
-fn owned_groups(body: &[u8], require_writes: bool) -> Result<Vec<(OwnedRelation, &[u8])>, Status> {
+fn ordered_group_count(body: &[u8]) -> Result<usize, Status> {
+    let (count, _) = body.split_first_chunk::<2>()
+        .ok_or_else(|| invalid("Ordered owned commit has no group count"))?;
+    let count = usize::from(u16::from_be_bytes(*count));
+    if count > MAX_GROUPED_COMMIT_ROWS {
+        return Err(invalid("Ordered owned commit has too many groups"));
+    }
+    Ok(count)
+}
+
+fn owned_groups(body: &[u8], require_writes: bool, ordered: bool) -> Result<Vec<(OwnedRelation, &[u8])>, Status> {
     let (count, mut rest) = body.split_first_chunk::<2>().ok_or_else(|| invalid("Owned commit has no group count"))?;
     let count = usize::from(u16::from_be_bytes(*count));
-    if count > MAX_COMMIT_GROUPS || (require_writes && count == 0) {
+    let limit = if ordered { MAX_GROUPED_COMMIT_ROWS } else { MAX_COMMIT_GROUPS };
+    if count > limit || (require_writes && count == 0) {
         return Err(invalid("Owned commit has an invalid relation group count"));
     }
+    let mut relations = BTreeSet::new();
     let mut groups = Vec::with_capacity(count);
     for _ in 0..count {
         let (relation, framed) = split_relation(rest)?;
-        if groups.iter().any(|(previous, _)| previous == &relation) {
+        if !relations.insert(relation.clone()) && !ordered {
             return Err(invalid("Owned commit has a duplicate relation"));
+        }
+        if relations.len() > MAX_COMMIT_GROUPS {
+            return Err(invalid("Owned commit exceeds its distinct relation limit"));
         }
         let (length, framed) = framed.split_first_chunk::<4>().ok_or_else(|| invalid("Owned commit group has no Arrow length"))?;
         let length = u32::from_be_bytes(*length) as usize;
@@ -438,10 +455,6 @@ impl Service {
         self.commit_owned(call, body, format, Vec::new(), false, None).await
     }
 
-    pub(crate) async fn commit_owned_witnessed_action(&self, call: &Call, body: &[u8], erase_allowed: bool) -> Result<ActionResult, Status> {
-        self.commit_owned_witnessed(call, body, erase_allowed, None).await
-    }
-
     pub(crate) async fn commit_owned_counted_action(&self, call: &Call, body: &[u8]) -> Result<ActionResult, Status> {
         if !self.0.config.owned_native_actions { return Err(unsupported()); }
         let (relation, body) = split_relation(body)?;
@@ -458,13 +471,15 @@ impl Service {
         }
         let _condition = call.reserve(prefix.len() + column.len() + 1024)?;
         let condition = TxOp::OwnedCheckCapacity { relation, column: column.into(), prefix: prefix.to_vec(), at_most };
-        self.commit_owned_witnessed(call, body, false, Some(condition)).await
+        let (witnesses, body, _framing) = self.owned_witness_prefix(call, body, true)?;
+        self.commit_owned(call, body, CommitFormat::Grouped, witnesses, false, Some(condition)).await
     }
 
-    async fn commit_owned_witnessed(&self, call: &Call, body: &[u8], erase_allowed: bool, condition: Option<TxOp>) -> Result<ActionResult, Status> {
+    pub(crate) async fn commit_owned_witnessed_action(&self, call: &Call, body: &[u8], format: CommitFormat, erase_allowed: bool) -> Result<ActionResult, Status> {
         if !self.0.config.owned_native_actions { return Err(unsupported()); }
-        let (witnesses, body, _framing) = self.owned_witness_prefix(call, body, erase_allowed || condition.is_some())?;
-        self.commit_owned(call, body, CommitFormat::Grouped, witnesses, erase_allowed, condition).await
+        let allow_empty = erase_allowed || matches!(format, CommitFormat::Ordered);
+        let (witnesses, body, _framing) = self.owned_witness_prefix(call, body, allow_empty)?;
+        self.commit_owned(call, body, format, witnesses, erase_allowed, None).await
     }
 
     fn owned_witness_prefix<'a>(
@@ -506,10 +521,12 @@ impl Service {
         let (length, body) = body.split_first_chunk::<4>().ok_or_else(|| invalid("Hosted commit has no fact group length"))?;
         let (facts, controls) = body.split_at_checked(u32::from_be_bytes(*length) as usize)
             .ok_or_else(|| invalid("Hosted fact group stream is truncated"))?;
-        let _framing = call.reserve(MAX_COMMIT_GROUPS * 1024)?;
-        let facts = owned_groups(facts, true)?;
-        let controls = owned_groups(controls, true)?;
-        if facts.len() + controls.len() > MAX_COMMIT_GROUPS
+        let fact_groups = ordered_group_count(facts)?;
+        let _framing = call.reserve((fact_groups + MAX_COMMIT_GROUPS) * 512)?;
+        let facts = owned_groups(facts, true, true)?;
+        let controls = owned_groups(controls, true, false)?;
+        let fact_relations = facts.iter().map(|(relation, _)| relation).collect::<BTreeSet<_>>();
+        if fact_relations.len() + controls.len() > MAX_COMMIT_GROUPS
             || controls.iter().any(|(relation, _)| !policy.relations.contains(relation.name()))
         {
             return Err(Status::permission_denied("Hosted control targets are outside the installed allowlist"));
@@ -560,12 +577,13 @@ impl Service {
         let group_limit = match format {
             CommitFormat::Single => 1,
             CommitFormat::Grouped => MAX_COMMIT_GROUPS,
+            CommitFormat::Ordered => ordered_group_count(body.get(8..).unwrap_or_default())?,
         };
         let _framing = call.reserve(group_limit * 512)?;
         let CommitRequest { deadline, groups } = CommitRequest::parse(body, format)?;
         let mut rows_left = match format {
             CommitFormat::Single => usize::MAX,
-            CommitFormat::Grouped => MAX_GROUPED_COMMIT_ROWS,
+            CommitFormat::Grouped | CommitFormat::Ordered => MAX_GROUPED_COMMIT_ROWS,
         };
         let mut writes = vec![TxOp::OwnedDeadline { until: deadline }];
         writes.extend(condition);
@@ -1426,7 +1444,7 @@ impl Service {
         let _framing = call.reserve(MAX_COMMIT_GROUPS * 512)?;
         let mut writes = Vec::new();
         let mut reservations = Vec::new();
-        for (relation, arrow) in owned_groups(groups, true)? {
+        for (relation, arrow) in owned_groups(groups, true, false)? {
             let batch = request_batch(call, arrow)?;
             let batch = batch.batch();
             let schema = batch.schema_ref();
