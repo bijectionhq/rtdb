@@ -111,8 +111,10 @@ async fn copy_to_arrow_stream_uses_the_original_read_transaction() {
         UNION ALL
         SELECT 1::BIGINT AS probe, _id, val FROM payloads WHERE _id > 1
     ) AS probes ORDER BY probe, _id) TO STDOUT WITH (FORMAT 'arrow-stream')", &[]).await;
+    reader.send(b'H', &[]).await;
     assert_eq!(reader.receive().await.0, b'1');
     reader.bind("transfer", "arrow").await;
+    reader.send(b'H', &[]).await;
     assert_eq!(reader.receive().await.0, b'2');
     reader.execute("transfer", 0).await;
     reader.send(b'S', &[]).await;
