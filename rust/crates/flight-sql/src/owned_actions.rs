@@ -118,7 +118,7 @@ pub(crate) const COMMIT_WORLD_V1: &str = "rtdb.owned.CommitWorld.v1";
 pub(crate) const COMMIT_WORLD_V2: &str = "rtdb.owned.CommitWorld.v2";
 const MAX_WORLD_WITNESSES: usize = 128;
 const WORLD_POINT_WITNESS: &str = "rtdb.owned.world_point_witness";
-pub(crate) const SEARCH_HELD_OWNED_V2: &str = "rtdb.owned.SearchHeld.v2";
+pub(crate) const SEARCH_HELD_OWNED_V3: &str = "rtdb.owned.SearchHeld.v3";
 pub(crate) const HELD_OWNED_RANGE_V1: &str = "rtdb.owned.ReadHeldRange.v1";
 #[derive(Clone, Copy)]
 pub(crate) enum HeldRangeFormat { Leading, Full, FixedValid }
@@ -136,6 +136,7 @@ const OWNED_VALID_FROM: &str = "rtdb.owned.valid_from_micros";
 const OWNED_VALID_TO: &str = "rtdb.owned.valid_to_micros";
 const MAX_HISTORY_SLICES: usize = 4096;
 const OWNED_VERSION_REVISION: &str = "rtdb.owned.version_revision";
+const OWNED_SEARCH_WITNESSES: &str = "rtdb.owned.search_witnesses";
 const OWNED_VERSION_TIME: &str = "rtdb.owned.version_micros";
 const OWNED_REVISION: &str = "rtdb.owned.revision_micros";
 const OWNED_CHANGE_COVERAGE: &str = "rtdb.owned.change_coverage_micros";
@@ -1053,17 +1054,32 @@ impl Service {
             partitions.push((relation, path));
             request = rest;
         }
-        let (limit, query) = request.split_first_chunk::<2>().ok_or_else(|| invalid("Owned held search has no limit"))?;
+        let (settings, query) = request.split_first_chunk::<3>().ok_or_else(|| invalid("Owned held search requires a limit and evidence flag"))?;
+        let limit = usize::from(u16::from_be_bytes([settings[0], settings[1]]));
+        let observe = match settings[2] {
+            0 => false,
+            1 => true,
+            _ => return Err(invalid("Invalid owned held search evidence flag")),
+        };
         if query.len() > 4096 { return Err(invalid("Owned held search query exceeds its size bound")); }
         let query = std::str::from_utf8(query).map_err(arrow)?;
-        let limit = usize::from(u16::from_be_bytes(*limit));
-        let hits = held.snapshot.ranked_search(&partitions, query, limit).await.map_err(status)?;
+        let (hits, witnesses) = held.snapshot.ranked_search(&partitions, query, limit, observe).await.map_err(status)?;
         let id_type = LogicalType::from_legs([ScalarType::Utf8, ScalarType::Keyword, ScalarType::I64, ScalarType::Uuid].map(LogicalType::Scalar));
-        let schema = Arc::new(Schema::new(vec![
+        let mut metadata = std::collections::HashMap::new();
+        if !witnesses.is_empty() {
+            if witnesses.len() != partitions.len() { return Err(Status::internal("Incomplete owned search evidence")); }
+            let mut nonces = String::with_capacity(32 * witnesses.len());
+            for ((relation, _), witness) in partitions.iter().zip(witnesses) {
+                let nonce = held.remember(call, relation, witness)?;
+                nonces.push_str(&nonce.simple().to_string());
+            }
+            metadata.insert(OWNED_SEARCH_WITNESSES.into(), nonces);
+        }
+        let schema = Arc::new(Schema::new_with_metadata(vec![
             rtdb_columnar::to_field("_id", &id_type).map_err(status)?,
             Field::new("score", DataType::Float64, false),
             Field::new("partition", DataType::UInt64, false),
-        ]));
+        ], metadata));
         let mut charge = call.reserve(4096)?;
         let output = if hits.is_empty() {
             None
