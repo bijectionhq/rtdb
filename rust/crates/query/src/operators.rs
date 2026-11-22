@@ -253,18 +253,21 @@ async fn build_batches_at(
             let sort: BoxBatchCursor = Box::new(BatchSort::new(batches, schema, order_by.clone(), execution, projected, offset, limit)?);
             Ok(Some((sort, projected)))
         }
-        RelationNode::Mark { dependent, arguments, condition: None, comparison, .. }
+        RelationNode::Mark { input, dependent, arguments, condition: None, comparison, .. }
             if output == BatchOutput::Arrow && arguments.is_empty() => {
             let build = runtime.child(1)?;
             let probe = runtime.child(0)?;
             let Some(keys) = crate::mark::batch_membership_keys(probe.schema(), build.schema(), comparison) else { return Ok(None); };
-            if !crate::mark::bounded_membership_input(dependent)
-                || crate::join::rows_at_most(dependent, &execution)? > execution.context.options.join_build_rows { return Ok(None); }
+            let bounded = crate::mark::bounded_membership_input(dependent)
+                && crate::join::rows_at_most(dependent, &execution)? <= execution.context.options.join_build_rows;
+            let spill_comparison = if bounded { None }
+                else if replayable_spill_input(input) && replayable_spill_input(dependent) { Some(comparison.clone()) }
+                else { return Ok(None); };
             let Some(probe_projected) = batch_shape(&probe, output)? else { return Ok(None); };
             if batch_shape(&build, output)?.is_none() { return Ok(None); }
             let build = crate::batch_join::ProbeInput { runtime: build, execution: execution.child(1), pushdowns: None, output };
             let probe = crate::batch_join::ProbeInput { runtime: probe, execution: execution.child(0), pushdowns: None, output };
-            let mark = crate::mark::BatchMembership::new(build, probe, probe_projected, keys, execution)?;
+            let mark = crate::mark::BatchMembership::new(build, probe, keys, spill_comparison, execution);
             Ok(Some((Box::new(mark), probe_projected)))
         }
         RelationNode::Mark { arguments, condition, comparison, .. } if output == BatchOutput::Arrow && !arguments.is_empty() => {
@@ -364,8 +367,14 @@ async fn build_batches_at(
     }
 }
 
-fn replayable_spill_input(relation: &Relation) -> bool {
+fn replayable_spill_input(mut relation: &Relation) -> bool {
     use rtdb_plan::TemporalFilter;
+    while let RelationNode::Project { input, expressions } | RelationNode::Rename { input, expressions, .. } = relation.node() {
+        if expressions.len() != input.schema().len() || !expressions.iter().zip(input.schema().fields()).all(|(named, field)| {
+            matches!(named.expr, Expr::Column { id, .. } if id == field.id)
+        }) { return false; }
+        relation = input;
+    }
     if let RelationNode::Values { rows } = relation.node() {
         return crate::columnar::ColumnBatch::supports_literal_rows(rows);
     }
