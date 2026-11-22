@@ -9,7 +9,7 @@ use rtdb_columnar::OwnedBatch;
 use rtdb_format::ipc::{OwnedStream, write_arrow_stream};
 use rtdb_node::{NativeSession, TransactionStatus};
 use rtdb_tx::{Documents, TxOp};
-use rtdb_types::OwnedRelation;
+use rtdb_types::{OwnedRelation, Timestamp};
 use tonic::Status;
 
 use crate::{
@@ -20,6 +20,7 @@ use crate::{
 
 pub(crate) const CREATE_OWNED_V1: &str = "rtdb.owned.Create.v1";
 pub(crate) const READ_OWNED_V1: &str = "rtdb.owned.ReadPoint.v1";
+const OWNED_PRESENT: &str = "rtdb.owned.present_micros";
 
 fn request(call: &Call, body: &[u8]) -> Result<(OwnedRelation, OwnedBatch), Status> {
     let (length, rest) = body.split_first_chunk::<2>().ok_or_else(|| invalid("Owned action has no relation length"))?;
@@ -89,8 +90,9 @@ impl Service {
         let connection = self.connection(call, &call.database).await?;
         let mut native = connection.borrow().await?;
         require_idle(&native)?;
-        let Some(mut cursor) = native.open_owned_point(&relation, &id).await.map_err(status)? else {
-            return self.owned_action_reply(&Schema::empty(), None);
+        let (present, result) = native.open_owned_point(&relation, &id).await.map_err(status)?;
+        let Some(mut cursor) = result else {
+            return self.owned_point_reply(&Schema::empty(), None, present);
         };
         let mut result = None;
         while let Some(batch) = cursor.next_batch().await.map_err(status)? {
@@ -101,11 +103,21 @@ impl Service {
             result = Some(batch);
         }
         if let Some(batch) = result {
-            self.owned_action_reply(batch.batch().schema_ref(), Some(batch.batch()))
+            self.owned_point_reply(batch.batch().schema_ref(), Some(batch.batch()), present)
         } else {
             let schema = wire::plan_schema(cursor.runtime_schema(), self.memory())?;
-            self.owned_action_reply(&schema, None)
+            self.owned_point_reply(&schema, None, present)
         }
+    }
+
+    fn owned_point_reply(&self, schema: &Schema, batch: Option<&RecordBatch>, present: Timestamp) -> Result<ActionResult, Status> {
+        let _metadata = self.memory().reserve(wire::schema_bound(schema)?).map_err(status)?;
+        let mut metadata = schema.metadata().clone();
+        metadata.insert(OWNED_PRESENT.into(), present.0.to_string());
+        let schema = Arc::new(schema.clone().with_metadata(metadata));
+        let batch = batch.map(|batch| RecordBatch::try_new(Arc::clone(&schema), batch.columns().to_vec()))
+            .transpose().map_err(arrow)?;
+        self.owned_action_reply(&schema, batch.as_ref())
     }
 
     fn owned_action_reply(&self, schema: &Schema, batch: Option<&RecordBatch>) -> Result<ActionResult, Status> {

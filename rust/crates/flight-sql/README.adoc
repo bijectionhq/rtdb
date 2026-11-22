@@ -190,7 +190,10 @@ The connection's authenticated principal and attached database select the owned 
 Success returns one Flight `Result` whose body is a terminated Arrow IPC stream.
 Create success contains one row with non-null signed 64-bit `tx_id` and `system_time_micros` fields.
 Point success contains the document columns and at most one row.
-An unknown relation returns an empty stream with a zero-field schema, and a missing entity in an existing relation returns its current schema with zero rows.
+Every point response Arrow schema contains `rtdb.owned.present_micros` as a signed decimal microsecond timestamp assigned by the store.
+A point result with no rows contains the schema and terminator, with zero record batches.
+An unknown relation uses a zero-field schema, and a missing entity in an existing relation uses its current schema.
+The Flight limit applies to the complete encoded Action and Result protobuf messages, with a default of 64 MiB.
 Failures use the Flight gRPC status and the existing anomaly metadata.
 
 Use `x-xtdb-database` for the initial Multi gateway connection and retain the resulting session cookie or bearer token.

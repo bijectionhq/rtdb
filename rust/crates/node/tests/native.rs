@@ -286,8 +286,8 @@ async fn owned_native_relations_are_scoped_to_the_durable_principal() {
     let first = owner.state_mut().execute_tx(vec![insert(10)], options.clone()).await.unwrap();
     assert!(first.committed(), "{:?}", first.error());
     let id = EntityId::Integer(1);
-    assert_eq!(rows(owner.open_owned_point(&relation, &id).await.unwrap().unwrap()).await, [vec![Value::I64(1), Value::I64(10)]]);
-    assert!(other.open_owned_point(&relation, &id).await.unwrap().is_none());
+    assert_eq!(rows(owner.open_owned_point(&relation, &id).await.unwrap().1.unwrap()).await, [vec![Value::I64(1), Value::I64(10)]]);
+    assert!(other.open_owned_point(&relation, &id).await.unwrap().1.is_none());
 
     let physical = relation.table("xtdb");
     let raw = TxOp::PutDocs {
@@ -308,7 +308,7 @@ async fn owned_native_relations_are_scoped_to_the_durable_principal() {
     assert!(owner.query_sql("SELECT * FROM docs", vec![]).await.is_err());
     let second = other.state_mut().execute_tx(vec![insert(12)], options).await.unwrap();
     assert!(second.committed(), "{:?}", second.error());
-    assert_eq!(rows(other.open_owned_point(&relation, &id).await.unwrap().unwrap()).await, [vec![Value::I64(1), Value::I64(12)]]);
+    assert_eq!(rows(other.open_owned_point(&relation, &id).await.unwrap().1.unwrap()).await, [vec![Value::I64(1), Value::I64(12)]]);
     drop(other);
     drop(owner);
     stop(&node, driver).await;

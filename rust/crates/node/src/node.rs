@@ -867,7 +867,7 @@ impl NativeSession {
         self.state.reserve_ordered_present().await
     }
     /// Reads one IID in the authenticated principal's owned relation at a store-reserved present.
-    pub async fn open_owned_point(&mut self, relation: &rtdb_types::OwnedRelation, id: &rtdb_types::EntityId) -> Result<Option<QueryCursor>> {
+    pub async fn open_owned_point(&mut self, relation: &rtdb_types::OwnedRelation, id: &rtdb_types::EntityId) -> Result<(Timestamp, Option<QueryCursor>)> {
         if !self.service.node.factory.options.owned_relations { return Err(owned_relations_disabled()); }
         let owner = self.state.user().filter(|owner| !owner.is_empty()).map(str::to_owned)
             .ok_or_else(|| Anomaly::new(AnomalyCategory::Forbidden, "rtdb.owned/no-owner", "Owned relations require an authenticated principal"))?;
@@ -880,7 +880,8 @@ impl NativeSession {
             timezone: self.state.session_timezone().to_owned(),
         };
         let context = self.service.query_context(database, &basis, self.state.cancellation()).await?;
-        rtdb_query::open_owned_point(context, &owner, relation, id.iid(), None, None).await
+        let cursor = rtdb_query::open_owned_point(context, &owner, relation, id.iid(), None, None).await?;
+        Ok((present.system_time, cursor))
     }
     pub async fn query_context(&mut self) -> Result<Arc<QueryContext>> {
         let basis = self.state.read_basis().await?;
