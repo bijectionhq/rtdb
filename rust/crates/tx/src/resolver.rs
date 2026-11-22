@@ -1184,6 +1184,18 @@ impl<'a> OpenTransaction<'a> {
                 return Err(unavailable());
             }
         }
+        for operation in operations {
+            let Some((relation, _, from, to)) = crate::hosted_control::proposal_overlay_write(operation) else { continue; };
+            let world = relation.world().ok_or_else(unavailable)?;
+            let root = relation.root_relation().ok_or_else(unavailable)?;
+            let (record, _) = self.owned_worlds.get(&world).ok_or_else(unavailable)?;
+            let bounded = record.schemas.relation(&root).is_some_and(|schema| schema.requires_bounded_period());
+            if (bounded && proposal_overlay != Some(world))
+                || (proposal_overlay == Some(world) && bounded != (from.is_some() && to.is_some()))
+            {
+                return Err(unavailable());
+            }
+        }
         if let Some((world, pin, close)) = proposal_land {
             let (record, _) = self.owned_worlds.get(&world).ok_or_else(unavailable)?;
             let parent = record.parent_publication.ok_or_else(unavailable)?;
@@ -1643,8 +1655,12 @@ impl<'a> OpenTransaction<'a> {
             let schema = record.schemas.relation(&root)
                 .ok_or_else(|| Anomaly::incorrect("rtdb.owned/world-undeclared", "World writes require a schema retained from the parent cut"))?;
             if schema.lifetime_micros().is_some() { return Err(lifetime_uncovered()); }
-            if schema.requires_bounded_period() { return Err(unavailable()); }
-            schema.require_write_validity(explicit)?;
+            if schema.requires_bounded_period() {
+                if !explicit || record.mode != rtdb_types::WorldClockMode::Proposal { return Err(unavailable()); }
+                schema.require_root_write_period(Some(from), Some(to))?;
+            } else {
+                schema.require_write_validity(explicit)?;
+            }
             for row in documents.rows() {
                 let _scratch = self.context.memory.reserve(Value::document_retained_bytes(row)?
                     .checked_mul(2).and_then(|bytes| bytes.checked_add(4096)).ok_or_else(overflow)?)?;
