@@ -184,6 +184,39 @@ impl Column {
 pub(crate) struct ColumnBatch { pub columns: Vec<Column>, pub len: usize, _reservation: Arc<MemoryReservation> }
 
 impl ColumnBatch {
+    pub(crate) fn cross(left: &Self, right: &Self, rows: usize, context: &crate::QueryContext) -> Result<Self> {
+        let memory = &context.memory;
+        let width = left.columns.len().checked_add(right.columns.len()).ok_or_else(size_error)?;
+        let base = width.checked_mul(256).and_then(|bytes| bytes.checked_add(4096)).ok_or_else(size_error)?;
+        let mut reservation = memory.reserve(base)?;
+        if rows == 0 {
+            let columns = (0..width).map(|_| Column::Values(Vec::new())).collect();
+            return Self::settled(columns, 0, reservation);
+        }
+        let positions = rows.checked_mul(2 * std::mem::size_of::<(usize, usize)>()).ok_or_else(size_error)?;
+        let _picks = memory.reserve(positions)?;
+        let mut left_rows = Vec::with_capacity(rows);
+        let mut right_rows = Vec::with_capacity(rows);
+        for left_row in 0..left.len {
+            context.check_cancelled()?;
+            for right_row in 0..right.len {
+                context.check_cancelled_at(right_row)?;
+                left_rows.push((0, left_row));
+                right_rows.push((0, right_row));
+            }
+        }
+        let mut columns = Vec::with_capacity(width);
+        for (batch, positions) in [(left, left_rows), (right, right_rows)] {
+            for index in 0..batch.columns.len() {
+                let (column, _scratch) = gather_column_rows(|_| batch, &positions, index, memory)?;
+                let lease = Arc::get_mut(&mut reservation).expect("Cross join owns its output reservation");
+                lease.grow_to(lease.bytes().checked_add(column.retained_bytes()?).ok_or_else(size_error)?)?;
+                columns.push(column);
+            }
+        }
+        Self::settled(columns, rows, reservation)
+    }
+
     /// A page of columns allocated under `reservation`, whose charge becomes exactly what they retain.
     pub fn settled(columns: Vec<Column>, len: usize, mut reservation: Arc<MemoryReservation>) -> Result<Self> {
         let bytes = columns.iter().try_fold(256usize, |bytes, column| bytes.checked_add(column.retained_bytes()?).ok_or_else(size_error))?;

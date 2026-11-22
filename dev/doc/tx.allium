@@ -34,8 +34,10 @@
 -- A columnar sort on input fields orders batch and row positions using the SQL key comparator.
 -- The sort gathers payload columns by position and uses Arrow IPC for its spill runs.
 -- A sort can compare supported key types directly at selected Arrow positions.
+-- A sort can compute a supported key expression in its Arrow input batches and keep its payloads columnar through ordering and spill.
 -- Its spill threshold accounts for Arrow buffers held by selected payloads.
 -- A batch join can gather matching payload positions from selected Arrow vectors.
+-- A columnar cross join gathers pairs of positions from its two inputs in left-major order within each batch pair.
 -- The embedded logical relation entry point runs plan reporting and measured execution on that read basis.
 -- An idle native session in autocommit mode with write access can reserve an ordered present by awaiting an automatically timed, empty transaction at its submitted position.
 -- The reservation records its transaction outcome, advances the session's await token, and changes no application table.

@@ -4,7 +4,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use rtdb_expr::{integer, is_true, null_eq_in_timezone};
 use rtdb_plan::{ApplyKind, Expr, NamedExpr, Relation, RelationNode, Schema, SetOperator};
-use rtdb_types::{Result, Value};
+use rtdb_types::{LogicalType, Result, Value};
 
 use crate::context::Execution;
 use crate::cursor::{BoxCursor, OwnedRow};
@@ -146,7 +146,14 @@ async fn build_batches_at(
             }
             let child = runtime.child(0)?;
             let schema = child.schema().clone();
-            if !BatchSort::supports(&schema, order_by) { return Ok(None); }
+            let computed = !BatchSort::supports(&schema, order_by);
+            if computed && !computed_batch_sort(order_by) { return Ok(None); }
+            let computed_type = if computed {
+                let scope = execution.scope()?;
+                let ty = execution.expression_type(&scope, &order_by[0].expr, &schema)?;
+                if !batch_ordered_type(&ty) { return Ok(None); }
+                Some(ty)
+            } else { None };
             let (offset, limit, pushdowns) = match relation.node() {
                 RelationNode::SortLimit { offset, fetch, .. } => {
                     let offset_rows = row_limit(offset.as_ref(), &execution).await?.unwrap_or(0);
@@ -158,8 +165,32 @@ async fn build_batches_at(
                 _ => (0, i64::MAX as u64, pushdowns),
             };
             let Some((batches, projected)) = build_batch_input(child, execution.child(0), pushdowns, output).await? else { return Ok(None); };
+            if let Some(ty) = computed_type {
+                let key = &order_by[0];
+                let next = schema.fields().iter().map(|field| field.id.0).max().unwrap_or(0)
+                    .checked_add(1).or_else(|| (0..u32::MAX).find(|id| schema.position(rtdb_plan::ColumnId(*id)).is_none()))
+                    .ok_or_else(|| invalid("sort-key", "Sort key column ID exceeds its range"))?;
+                let field = rtdb_plan::Field { id: rtdb_plan::ColumnId(next), name: "sort_key".into(), qualifier: None,
+                    qualified_only: false, unnamed: true, data_type: ty };
+                let order = rtdb_plan::SortExpr { expr: field.expression(), descending: key.descending, nulls_first: key.nulls_first };
+                let mut columns = schema.fields().iter().map(rtdb_plan::Field::expression).collect::<Vec<_>>();
+                columns.push(key.expr.clone());
+                let sort_schema = Schema::new(schema.fields().iter().cloned().chain([field]).collect())?;
+                let positions = (0..schema.len()).collect();
+                let memory = Arc::clone(&execution.context.memory);
+                let input = Box::new(crate::columnar::BatchExpressions::new(batches, schema, columns, execution.clone()));
+                let sort = Box::new(BatchSort::new(input, sort_schema, vec![order], execution, true, offset, limit)?);
+                let output = Box::new(crate::columnar::BatchProject::new(sort, positions, memory));
+                return Ok(Some((output, true)));
+            }
             let sort: BoxBatchCursor = Box::new(BatchSort::new(batches, schema, order_by.clone(), execution, projected, offset, limit)?);
             Ok(Some((sort, projected)))
+        }
+        RelationNode::Join { kind: rtdb_plan::JoinKind::Cross, .. } if output == BatchOutput::Arrow => {
+            let Some((left, left_projected)) = build_batch_input(runtime.child(0)?, execution.child(0), pushdowns.clone(), output).await? else { return Ok(None); };
+            let Some((right, right_projected)) = build_batch_input(runtime.child(1)?, execution.child(1), pushdowns, output).await? else { return Ok(None); };
+            let join = crate::cross::CrossBatchJoin::new(left, right, execution.context);
+            Ok(Some((Box::new(join), left_projected || right_projected)))
         }
         RelationNode::Join { left,right,kind: rtdb_plan::JoinKind::Inner,condition: Some(condition) } if execution.analysis.is_none() && execution.context.tracer.is_none() => {
             let (Some(build_projected),Some(probe_projected)) = (batch_shape(&runtime.child(0)?, BatchOutput::Pages)?,batch_shape(&runtime.child(1)?, BatchOutput::Pages)?) else { return Ok(None) };
@@ -282,6 +313,20 @@ fn batch_shape(runtime: &Arc<EmittedRelation>, output: BatchOutput) -> Result<Op
     stacker::maybe_grow(512 * 1024, 2 * 1024 * 1024, || batch_shape_at(runtime, output))
 }
 
+fn computed_batch_sort(order_by: &[rtdb_plan::SortExpr]) -> bool {
+    matches!(order_by, [key] if crate::columnar::projection::shaped(&key.expr)
+        && !matches!(key.expr, Expr::Column { .. }) && batch_ordered_type(&key.expr.data_type()))
+}
+
+fn batch_ordered_type(ty: &LogicalType) -> bool {
+    use rtdb_types::ScalarType::{I8, I16, I32, I64, U8, U16, U32, U64};
+    match ty {
+        LogicalType::Scalar(I8 | I16 | I32 | I64 | U8 | U16 | U32 | U64) => true,
+        LogicalType::Maybe(inner) => batch_ordered_type(inner),
+        _ => false,
+    }
+}
+
 fn batch_shape_at(runtime: &Arc<EmittedRelation>, output: BatchOutput) -> Result<Option<bool>> {
     let relation = Arc::clone(runtime.relation());
     Ok(match relation.node() {
@@ -307,11 +352,15 @@ fn batch_shape_at(runtime: &Arc<EmittedRelation>, output: BatchOutput) -> Result
             batch_shape(&runtime.child(0)?, output)?.zip(batch_shape(&runtime.child(1)?, output)?).map(|(left, right)| left || right)
         }
         RelationNode::Distinct { .. } if output == BatchOutput::Arrow && runtime.schema().len() == 1 => batch_shape(&runtime.child(0)?, output)?,
+        RelationNode::Join { kind: rtdb_plan::JoinKind::Cross, .. } if output == BatchOutput::Arrow => {
+            batch_shape(&runtime.child(0)?, output)?.zip(batch_shape(&runtime.child(1)?, output)?).map(|(left, right)| left || right)
+        }
         RelationNode::Limit { .. } if output == BatchOutput::Arrow => batch_shape(&runtime.child(0)?, output)?,
         RelationNode::Sort { order_by, .. } | RelationNode::SortLimit { order_by, .. } if output == BatchOutput::Arrow => {
             let child = runtime.child(0)?;
-            if !crate::sort::batches::BatchSort::supports(child.schema(), order_by) { return Ok(None); }
-            batch_shape(&child, output)?
+            let computed = !crate::sort::batches::BatchSort::supports(child.schema(), order_by);
+            if computed && !computed_batch_sort(order_by) { return Ok(None); }
+            batch_shape(&child, output)?.map(|projected| projected || computed)
         }
         _ => None,
     })

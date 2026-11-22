@@ -1864,6 +1864,33 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn computed_sort_key_keeps_payload_columns_through_arrow_spill() {
+        use rtdb_plan::{BinaryOp, Relation, SortExpr};
+
+        let (state, table, _, store, _) = persisted_page_fixture().await;
+        let storage = Arc::new(BufferPool::new(store, 1 << 20));
+        let (scan, mut execution, memory) = descriptor_scan(state.value().snapshot(), table, storage);
+        let context = Arc::get_mut(&mut execution.context).unwrap();
+        context.options.sort_memory_bytes = 1;
+        context.options.batch_rows = 1;
+        let key = Expr::binary(BinaryOp::Subtract, Expr::Literal(Value::I64(0)), scan.columns[0].expression());
+        let relation = Arc::new(Relation::scan(scan).unwrap());
+        let relation = Arc::new(relation.sort(vec![SortExpr { expr: key, descending: false, nulls_first: false }]).unwrap());
+        let runtime = crate::runtime_schema::EmittedRelation::derive(relation, &execution.context.catalog, &[], &memory).unwrap();
+        let mut cursor = crate::operators::build_columns(runtime, execution.clone()).await.unwrap().expect("Expected a batch sort");
+        let mut values = Vec::new();
+        while let Some(page) = cursor.next_batch().await.unwrap() {
+            let [crate::columnar::Column::Arrow { array, .. }] = page.columns.as_slice() else {
+                panic!("Expected only the selected Arrow payload");
+            };
+            let array = array.as_any().downcast_ref::<arrow_array::Int64Array>().unwrap();
+            values.extend(array.values().iter().copied());
+        }
+        assert_eq!(values, [3, 2, 1]);
+        assert!(execution.context.spill_peak_bytes() > 0);
+    }
+
+    #[tokio::test]
     async fn a_data_page_outside_its_metadata_path_fails_every_scan_that_reads_it() {
         let (state, table, _, store, _) = persisted_pages(true).await;
         let storage = Arc::new(BufferPool::new(store, 1 << 20));
