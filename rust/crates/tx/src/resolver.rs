@@ -702,7 +702,7 @@ impl<'a> OpenTransaction<'a> {
                 } else {
                     self.write_owned(&relation, &documents, None, None, None, previous.is_none()).await?;
                 }
-                if matches!(root, crate::OwnedForkRoot::Writes | crate::OwnedForkRoot::WritesAdvance) {
+                if matches!(*root, crate::OwnedForkRoot::Writes | crate::OwnedForkRoot::WritesAdvance | crate::OwnedForkRoot::ProposalWrites) {
                     self.publish_owned_root_head().await?;
                 }
                 Ok(())
@@ -1008,10 +1008,10 @@ impl<'a> OpenTransaction<'a> {
         }) {
             use crate::OwnedForkRoot;
             let authored_advance = root == OwnedForkRoot::WritesAdvance;
-            let publish_root = root == OwnedForkRoot::Writes || authored_advance;
+            let publish_root = matches!(root, OwnedForkRoot::Writes | OwnedForkRoot::WritesAdvance | OwnedForkRoot::ProposalWrites);
             let with_root = root != OwnedForkRoot::None;
-            let proposal_controls = root == OwnedForkRoot::ProposalControls;
-            let required_mode = if proposal_controls {
+            let proposal_publication = matches!(root, OwnedForkRoot::ProposalControls | OwnedForkRoot::ProposalWrites);
+            let required_mode = if proposal_publication {
                 rtdb_types::WorldClockMode::Proposal
             } else {
                 rtdb_types::WorldClockMode::Retained
@@ -1064,7 +1064,7 @@ impl<'a> OpenTransaction<'a> {
                             || deadline.is_none_or(|until| until > world.until)
                             || (with_root && ((previous.is_some() != authored_advance)
                                 || world.mode != required_mode
-                                || ((proposal_controls || authored_advance) && world.parent_publication != Some(world.basis.system_time))
+                                || ((proposal_publication || authored_advance) && world.parent_publication != Some(world.basis.system_time))
                                 || world.basis.tx_id >= self.tx_key().tx_id))
                         {
                             return Err(unavailable());
@@ -1102,7 +1102,7 @@ impl<'a> OpenTransaction<'a> {
             if (authored_advance && (!replacement_checked || !existing_control_write || control_writes > 5))
                 || forks != 1 || checks == 0 || expected_tip != checked_tip || effects > 4096
                 || (publish_root && root_rows == 0)
-                || (matches!(root, OwnedForkRoot::Controls | OwnedForkRoot::ProposalControls) && control_writes == 0)
+                || ((root == OwnedForkRoot::Controls || proposal_publication) && control_writes == 0)
             {
                 return Err(unavailable());
             }

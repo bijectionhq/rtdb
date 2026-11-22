@@ -1824,9 +1824,6 @@ impl Service {
                     _ => return Err(invalid("Operation is outside the held Root section")),
                 }
             }
-            if proposed_publication && !writes.is_empty() {
-                return Err(invalid("A Proposal registration only settles hosted controls"));
-            }
             if authored_advance && !matches!(writes.as_slice(), [
                 TxOp::OwnedReplaceDocs { documents, valid_from: None, valid_to: None, .. }
             ] if documents.rows().len() == 1) {
@@ -1849,7 +1846,8 @@ impl Service {
         if !controls.iter().any(rtdb_tx::HostedControlWrite::is_check) {
             return Err(invalid("A retained fork requires a hosted ownership check"));
         }
-        if publish_root && root.publication.is_none() && controls.iter().all(rtdb_tx::HostedControlWrite::is_check) {
+        if publish_root && (root.publication.is_none() || proposed_publication)
+            && controls.iter().all(rtdb_tx::HostedControlWrite::is_check) {
             return Err(invalid("A co-ordered fork requires Root facts or a hosted control replacement"));
         }
         let (_, attachment) = call.session.resolve_database(Some(&call.database), &self.0.node)?;

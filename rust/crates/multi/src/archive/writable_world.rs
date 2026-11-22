@@ -224,7 +224,7 @@ pub(crate) async fn fork_checkpoint_world_selected(
         if suffix.is_some() || fork.root.is_none() || (fork.previous.is_some() && !authored_advance)
             || !(matches!(fork.requested, rtdb_node::WorldClockRequest::Retained)
                 || (matches!(fork.requested, rtdb_node::WorldClockRequest::Proposal)
-                    && fork.root.as_ref().is_some_and(|root| root.publication.is_none())))
+                    && fork.cut.is_publication()))
         {
             return Err(OwnedWorld::unavailable());
         }
@@ -306,8 +306,7 @@ pub(crate) async fn fork_checkpoint_world_selected(
     let mode = match fork.requested {
         rtdb_node::WorldClockRequest::Retained => WorldClockMode::Retained,
         rtdb_node::WorldClockRequest::Proposal if fork.cut.live().is_some()
-            || (fork.cut.is_publication() && fork.previous.is_none()
-                && fork.root.as_ref().is_some_and(|root| root.publication.is_none())) => WorldClockMode::Proposal,
+            || (fork.cut.is_publication() && fork.previous.is_none() && fork.root.is_some()) => WorldClockMode::Proposal,
         rtdb_node::WorldClockRequest::Proposal => return Err(OwnedWorld::unavailable()),
         rtdb_node::WorldClockRequest::Held { start } => {
             let start = start.unwrap_or(inherited);
