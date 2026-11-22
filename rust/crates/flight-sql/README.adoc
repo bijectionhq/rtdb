@@ -566,6 +566,10 @@ Root section kind 4 supports one acceptance-valid Root delete together with the 
 It uses the Root hold, range witnesses and group framing of kind 1, and reuses the world's immutable attempt ID.
 The Root groups must include the original positive point check for the deleted fact.
 The hosted groups require at least one check and allow one to five checked replacements, including at least one existing owner row.
+Root kind 7 selects one exact hosted Proposal Drop with the original Proposal handle and zero world witnesses.
+It carries the original live Root handle, a matching witnessed acceptance-valid Root delete, and checked custody replacements plus the registered receipt.
+The ordered source compares the physical pin and held overlay clock before terminal registration.
+The placed host retires that original pin only after acceptance.
 
 === Polling hosted held dependencies
 

@@ -1937,6 +1937,7 @@ impl Service {
         let mut proposal_eligible = count == 1;
         let mut terminal_proposal = false;
         let mut landing_eligible = count == 1;
+        let mut close_eligible = count == 1;
         let mut worlds = BTreeSet::new();
         let mut attempts = BTreeSet::new();
         let mut sections = Vec::with_capacity(count);
@@ -1966,6 +1967,7 @@ impl Service {
             let parent_pin = resource.snapshot.parent_pin();
             let expected_clock = resource.snapshot.application_clock();
             let mode = resource.snapshot.clock_mode();
+            close_eligible &= mode == rtdb_types::WorldClockMode::Proposal && *kind == 2 && count == 0;
             landing_eligible &= mode == rtdb_types::WorldClockMode::Proposal
                 && *kind == 2 && count != 0 && expected_clock.is_some();
             release_eligible &= mode == rtdb_types::WorldClockMode::Retained
@@ -1973,7 +1975,7 @@ impl Service {
             proposal_eligible &= mode == rtdb_types::WorldClockMode::Proposal
                 && ((*kind == 0 && count != 0) || *kind == 3);
             terminal_proposal |= *kind == 3;
-            if count == 0 && !release_eligible && !(proposal_eligible && terminal_proposal) {
+            if count == 0 && !release_eligible && !close_eligible && !(proposal_eligible && terminal_proposal) {
                 return Err(invalid("Ordinary world effects require original witnesses"));
             }
             if (*kind == 0 && !mode.is_writable())
@@ -2009,7 +2011,7 @@ impl Service {
         let ([root_kind], body) = body.split_first_chunk::<1>().ok_or_else(|| invalid("Missing Root section kind"))?;
         let (root_read, body) = match *root_kind {
             0 => (None, body),
-            1 | 2 | 3 | 4 | 5 | 6 => {
+            1 | 2 | 3 | 4 | 5 | 6 | 7 => {
                 let (handle, body) = body.split_first_chunk::<16>().ok_or_else(|| invalid("Missing original Root hold"))?;
                 (Some(self.owned_read(call, &Bytes::copy_from_slice(handle))?), body)
             }
@@ -2018,8 +2020,9 @@ impl Service {
         let delete_root = *root_kind == 4;
         let proposal_overlay = *root_kind == 5;
         let proposal_land = *root_kind == 6;
-        let (root_attempt, body) = if delete_root || proposal_land {
-            if (delete_root && !release_eligible) || (proposal_land && !landing_eligible) {
+        let proposal_close = *root_kind == 7;
+        let (root_attempt, body) = if delete_root || proposal_land || proposal_close {
+            if (delete_root && !release_eligible) || (proposal_land && !landing_eligible) || (proposal_close != close_eligible) {
                 return Err(invalid("The terminal world does not admit this Root effect"));
             }
             rows_left = rows_left.checked_sub(1).ok_or_else(|| invalid("World batch exceeds its effect limit"))?;
@@ -2058,7 +2061,7 @@ impl Service {
         }
         if let Some(attempt) = root_attempt {
             if root_writes.is_empty() { return Err(invalid("A Root publication requires fact writes")); }
-            if delete_root && !matches!(root_writes.as_slice(), [
+            if (delete_root || proposal_close) && !matches!(root_writes.as_slice(), [
                 TxOp::OwnedDelete { valid_from: None, valid_to: None, .. }
             ]) {
                 return Err(invalid("A retained drop supports one acceptance-valid Root delete"));
@@ -2067,6 +2070,7 @@ impl Service {
         }
         root.proposal_overlay = proposal_overlay;
         root.proposal_land = proposal_land;
+        root.proposal_close = proposal_close;
         if (proposal_overlay && !proposal_eligible) || (terminal_proposal && !proposal_overlay) {
             return Err(invalid("Registered settlement requires one witnessed Proposal overlay"));
         }
@@ -2074,7 +2078,7 @@ impl Service {
         let release = *root_kind == 3;
         if (*root_kind == 0 && observed_root) || (*root_kind == 1 && !observed_root)
             || (release || delete_root) != release_eligible || (release && observed_root)
-            || ((delete_root || proposal_land) && !observed_root)
+            || (proposal_close != close_eligible) || ((delete_root || proposal_land || proposal_close) && !observed_root)
         {
             return Err(invalid("The Root section kind disagrees with its observations"));
         }
@@ -2082,9 +2086,12 @@ impl Service {
         let controls = owned_groups(body, true, false)?;
         hosted_control::admit_control_targets(policy, controls.iter().map(|(relation, _)| relation))?;
         let scope = self.hosted_control_scope(call).await?;
-        let (controls, _charges) = self.decode_hosted_control_groups(call, controls, scope, &mut rows_left, !release && !delete_root && !proposal_overlay && !proposal_land)?;
+        let (controls, _charges) = self.decode_hosted_control_groups(call, controls, scope, &mut rows_left, !release && !delete_root && !proposal_overlay && !proposal_land && !proposal_close)?;
         if proposal_overlay && !rtdb_tx::proposal_overlay_controls(&controls) {
             return Err(invalid("A Proposal overlay requires checked hosted settlement"));
+        }
+        if proposal_close && !rtdb_tx::proposal_close_controls(&controls) {
+            return Err(invalid("A Proposal holder close requires checked custody settlement"));
         }
         if proposal_land && !rtdb_tx::proposal_land_controls(&controls) {
             return Err(invalid("A Proposal landing requires an owner replacement and new receipt"));
@@ -2102,14 +2109,14 @@ impl Service {
         require_idle(&session)?;
         for resource in &held {
             resource.snapshot.check().map_err(status)?;
-            if terminal_proposal && deadline > resource.snapshot.evidence_until() {
+            if (terminal_proposal || proposal_close) && deadline > resource.snapshot.evidence_until() {
                 return Err(Status::failed_precondition("Proposal hold is outside the settlement deadline"));
             }
         }
         if let Some(read) = &root_read {
             read.snapshot.check().map_err(status)?;
             if read.snapshot.present().system_time >= deadline
-                || ((delete_root || proposal_overlay || proposal_land) && (deadline > read.snapshot.evidence_until()
+                || ((delete_root || proposal_overlay || proposal_land || proposal_close) && (deadline > read.snapshot.evidence_until()
                     || read.snapshot.fork_cut(scope).await.map_err(status)?.live().is_none()))
             {
                 return Err(Status::failed_precondition("Root hold is outside the world batch deadline"));

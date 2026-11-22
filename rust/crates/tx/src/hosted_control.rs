@@ -306,13 +306,31 @@ pub fn proposal_land_controls<'a>(controls: impl IntoIterator<Item = &'a HostedC
     checks > 0 && replacements == 1 && receipts == 1
 }
 
-/// One witnessed in-place clear Root replacement and its exact Proposal close.
+/// Last-holder closure replaces the exact census, owner, and quota, and writes a receipt.
+pub fn proposal_close_controls<'a>(controls: impl IntoIterator<Item = &'a HostedControlWrite>) -> bool {
+    let mut checks = 0;
+    let mut replacements = 0;
+    let mut inserts = 0;
+    for control in controls {
+        if control.is_check() {
+            checks += 1;
+        } else if control.expected().is_some() {
+            replacements += 1;
+        } else {
+            inserts += 1;
+        }
+    }
+    checks > 0 && (3..=5).contains(&replacements) && (1..=2).contains(&inserts)
+}
+
+/// One exact Proposal terminal effect and its matching witnessed Root write.
 pub(crate) fn hosted_proposal_land(
     operations: &[crate::source::Operation],
-) -> Option<(rtdb_types::Iid, rtdb_types::Iid)> {
+) -> Option<(rtdb_types::Iid, rtdb_types::Iid, bool)> {
     use crate::{TxOp, source::Operation};
     let mut landing = None;
     let mut replacement = None;
+    let mut close = false;
     let mut controls = Vec::new();
     for op in operations {
         match op {
@@ -325,28 +343,40 @@ pub(crate) fn hosted_proposal_land(
             {
                 replacement = Some((relation, documents.rows()[0].get("_id")?.entity_id().ok()?));
             }
+            Operation::Public(TxOp::OwnedDelete { relation, id, valid_from: None, valid_to: None })
+                if relation.is_root_data() && replacement.is_none() => {
+                close = true;
+                replacement = Some((relation, id.clone()));
+            }
             Operation::Public(TxOp::OwnedPublishWorld {
                 world, land_root: Some(pin), delete_root: None, advance_to: None,
-                drop_world: true, expected: Some(_), ..
-            }) if landing.is_none() => landing = Some((*world, *pin)),
+                drop_world: true, expected, ..
+            }) if landing.is_none() => landing = Some((*world, *pin, *expected)),
             _ => return None,
         }
     }
-    let (world, pin) = landing?;
+    let (world, pin, expected_clock) = landing?;
     let (relation, id) = replacement?;
     if operations.iter().filter_map(Operation::owned_relation)
         .any(|relation| relation.is_world_catalog() || relation.world().is_some_and(|other| other != world))
     {
         return None;
     }
-    let local = relation.in_world(world).ok()?;
     let root_checked = operations.iter().any(|op| matches!(op,
         Operation::Public(TxOp::OwnedCheck { relation: checked, id: observed, expected: Some(_), .. })
             if checked == relation && observed == &id
     ));
+    if close {
+        return (root_checked && proposal_close_controls(controls)
+            && !operations.iter().any(|op| match op {
+                Operation::Public(TxOp::OwnedCheckWorldPurge { .. }) => true,
+                _ => op.owned_relation().is_some_and(|relation| relation.world().is_some()),
+            })).then_some((world, pin, true));
+    }
+    let local = relation.in_world(world).ok()?;
     let local_checked = operations.windows(2).any(|pair| matches!(pair, [
         Operation::Public(TxOp::OwnedCheckWorldPurge { relation: guarded, pin: original, .. }),
         Operation::Public(TxOp::OwnedCheck { relation: checked, id: observed, expected: Some(_), .. })
     ] if guarded == &local && checked == &local && observed == &id && *original == pin));
-    (root_checked && local_checked && proposal_land_controls(controls)).then_some((world, pin))
+    (expected_clock.is_some() && root_checked && local_checked && proposal_land_controls(controls)).then_some((world, pin, false))
 }
