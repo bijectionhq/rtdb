@@ -223,8 +223,9 @@ pub(crate) async fn fork_checkpoint_world_selected(
     let renewal = fork.cut.is_renewal();
     let (capture, suffix) = if renewal {
         let predecessor = fork.previous.ok_or_else(OwnedWorld::unavailable)?;
+        let source_world = fork.sibling.unwrap_or(fork.world);
         let retained = source.checkpoint_worlds.get(&Uuid::from_bytes(predecessor.0))
-            .filter(|retained| retained.world.as_bytes() == &fork.world.0
+            .filter(|retained| retained.world.as_bytes() == &source_world.0
                 && retained.owner == owner && retained.mode == WorldClockMode::Retained
                 && retained.until > now() && fork.cut.matches_basis(retained.basis))
             .ok_or_else(OwnedWorld::unavailable)?;
@@ -330,7 +331,7 @@ pub(crate) async fn fork_checkpoint_world_selected(
     };
     let id = Uuid::from_bytes(fork.world.0);
     let pin = Uuid::from_bytes(fork.pin.0);
-    if id.is_nil() || pin.is_nil() || (fork.previous.is_none() != (pin == id)) {
+    if id.is_nil() || pin.is_nil() || ((fork.previous.is_none() || fork.sibling.is_some()) != (pin == id)) {
         return Err(OwnedWorld::unavailable());
     }
     let retained = CheckpointWorldRetention {
@@ -363,7 +364,8 @@ pub(crate) async fn fork_checkpoint_world_selected(
             .retain(|_, world| world.until > now);
         if let Some(previous) = fork.previous {
             let previous = record.checkpoint_worlds.get(&Uuid::from_bytes(previous.0)).ok_or_else(OwnedWorld::unavailable)?;
-            if previous.world != id || previous.owner != retained.owner
+            let expected_source = fork.sibling.map_or(id, |world| Uuid::from_bytes(world.0));
+            if previous.world != expected_source || previous.owner != retained.owner
                 || (!authored_advance && !renewal && previous.until != retained.until)
                 || previous.mode != WorldClockMode::Retained || retained.mode != WorldClockMode::Retained
                 || if renewal {
@@ -389,7 +391,7 @@ pub(crate) async fn fork_checkpoint_world_selected(
     .await?;
     admit_session(session, &installed, &retained.owner)?;
     let registration = world_record(pin, &retained, schemas);
-    let previous = fork.previous.map(|previous| Uuid::from_bytes(previous.0));
+    let previous = if fork.sibling.is_some() { None } else { fork.previous.map(|previous| Uuid::from_bytes(previous.0)) };
     let outcome = session.register_owned_world_checked(&registration, fork).await?;
     if !outcome.committed() {
         // A competing retry may already have registered this world.
