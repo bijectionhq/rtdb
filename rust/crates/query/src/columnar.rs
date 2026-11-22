@@ -468,12 +468,33 @@ impl ColumnBatch {
     pub(crate) fn key_projection(&self, positions: &[usize], memory: &Arc<MemoryBudget>) -> Result<Self> {
         let base = positions.len().checked_mul(std::mem::size_of::<Column>())
             .and_then(|bytes| bytes.checked_add(256)).ok_or_else(size_error)?;
-        let bytes = positions.iter().try_fold(base, |bytes, &position| {
-            bytes.checked_add(self.columns[position].retained_bytes()?).ok_or_else(size_error)
-        })?;
-        let reservation = memory.reserve(bytes)?;
-        let columns = positions.iter().map(|&position| self.columns[position].duplicate()).collect();
-        Ok(Self { columns, len: self.len, reservation, appended: Vec::new() })
+        let mut reservation = memory.reserve(base)?;
+        let mut columns = Vec::with_capacity(positions.len());
+        for &position in positions {
+            let column = &self.columns[position];
+            let lease = Arc::get_mut(&mut reservation).expect("The key projection owns its reservation");
+            if let Column::Selected(selection) = column {
+                let layout = |source: usize| selection.sources[source].as_ref().map(|(_, field, logical, _)| (field, logical));
+                let first = selection.cells.first().and_then(|&(source, _)| layout(source));
+                if selection.cells.iter().all(|&(source, _)| layout(source) == first) {
+                    let ((array, field, logical), _scratch) = selection.fragment_vector(0..self.len, memory)?;
+                    let detached = Column::Arrow { array, field, logical };
+                    lease.grow_to(lease.bytes().checked_add(detached.retained_bytes()?).ok_or_else(size_error)?)?;
+                    columns.push(detached);
+                    continue;
+                }
+                let bytes = (0..self.len).try_fold(256usize, |bytes, row| {
+                    column.bound(row)?.checked_mul(2).and_then(|size| bytes.checked_add(size)).ok_or_else(size_error)
+                })?;
+                lease.grow_to(lease.bytes().checked_add(bytes).ok_or_else(size_error)?)?;
+                let values = (0..self.len).map(|row| column.value(row)).collect::<Result<_>>()?;
+                columns.push(Column::Values(values));
+            } else {
+                lease.grow_to(lease.bytes().checked_add(column.retained_bytes()?).ok_or_else(size_error)?)?;
+                columns.push(column.duplicate());
+            }
+        }
+        Self::settled(columns, self.len, reservation)
     }
 
     fn take_rows_with_custody(
@@ -607,6 +628,27 @@ fn shifted_columns_share_the_input_reservations_across_appends() {
     assert!(memory.used_bytes() < bytes * 2 + 64 * 1024);
     drop(batch);
     assert_eq!(memory.used_bytes(), 0);
+}
+
+#[test]
+fn projected_partition_keys_release_unrelated_source_buffers() {
+    use arrow_array::Int64Array;
+    use arrow_buffer::OffsetBuffer;
+
+    let memory = MemoryBudget::new(3 << 20);
+    let custody = memory.reserve(2 << 20).unwrap();
+    let element = Arc::new(ArrowField::new("item", DataType::Int64, false));
+    let array = Arc::new(ListArray::new(Arc::clone(&element), OffsetBuffer::new(vec![0, 1, 2].into()),
+        Arc::new(Int64Array::from(vec![10, 20])), None));
+    let field = Arc::new(ArrowField::new("key", DataType::List(element), false));
+    let logical = rtdb_columnar::from_field(&field).unwrap();
+    let selected = SelectedColumn::new(vec![Some((array, field, Some(logical), Some(custody)))], Arc::new(vec![(0, 1)]));
+    let input = ColumnBatch::settled(vec![Column::Selected(selected)], 1, memory.reserve(1024).unwrap()).unwrap();
+    let keys = input.key_projection(&[0], &memory).unwrap();
+    drop(input);
+    assert!(memory.used_bytes() < 64 * 1024);
+    assert!(matches!(keys.columns[0], Column::Arrow { .. }));
+    assert_eq!(keys.columns[0].value(0).unwrap(), Value::List(vec![Value::I64(20)]));
 }
 
 fn gather_column_cells<'a>(
