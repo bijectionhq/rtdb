@@ -878,6 +878,11 @@ impl<'a> OpenTransaction<'a> {
             _ => None,
         }).take(9).collect::<Vec<_>>();
         let world_batch = publications.len() > 1;
+        let root_conditions = !publications.is_empty() && operations.iter().any(|operation| match operation {
+            Operation::Public(TxOp::OwnedCheck { relation, .. } | TxOp::OwnedCheckRange { relation, .. }) =>
+                relation.world().is_none() && !relation.is_world_catalog(),
+            _ => false,
+        });
         if publications.len() > 8 { return Err(unavailable()); }
         if publications.is_empty() && operations.iter().any(|operation| match operation {
             Operation::Public(TxOp::OwnedReplaceDocs { relation, .. })
@@ -891,10 +896,13 @@ impl<'a> OpenTransaction<'a> {
         if let Some(first) = scoped.next() {
             if first.is_world_catalog() { return Err(unavailable()); }
             let world = first.world();
-            if world_batch {
-                admitted.insert(world.ok_or_else(unavailable)?);
-                for relation in scoped {
-                    admitted.insert(relation.world().ok_or_else(unavailable)?);
+            if world_batch || root_conditions {
+                for relation in std::iter::once(first).chain(scoped) {
+                    match relation.world() {
+                        Some(world) => { admitted.insert(world); }
+                        None if root_conditions && !relation.is_world_catalog() => (),
+                        None => return Err(unavailable()),
+                    }
                     if admitted.len() > 8 { return Err(unavailable()); }
                 }
             } else {
@@ -953,6 +961,8 @@ impl<'a> OpenTransaction<'a> {
                         counts.entry(world).or_default().0 += count;
                         count
                     }
+                    Operation::Public(TxOp::OwnedCheck { relation, .. } | TxOp::OwnedCheckRange { relation, .. })
+                        if relation.world().is_none() && !relation.is_world_catalog() => 1,
                     Operation::Public(TxOp::OwnedCheck { relation, .. }) => {
                         let world = relation.world().ok_or_else(unavailable)?;
                         if !index.checked_sub(1).is_some_and(|previous|

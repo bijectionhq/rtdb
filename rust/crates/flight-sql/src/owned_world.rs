@@ -15,6 +15,7 @@ pub trait OwnedWorldHost: std::fmt::Debug + Send + Sync {
     fn commit_world<'a>(&'a self, call: WorldCall<'a>, world: Uuid, writes: Vec<OwnedWorldWrite>, checks: Vec<OwnedWorldPointWitness>, controls: Vec<rtdb_node::HostedControlWrite>, deadline: Timestamp, publication: Option<rtdb_node::OwnedWorldPublication>) -> BoxFuture<'a, Result<TransactionKey>>;
     fn commit_world_batch<'a>(
         &'a self, call: WorldCall<'a>, sections: Vec<rtdb_node::OwnedWorldSection>,
+        root_checks: Vec<rtdb_tx::TxOp>,
         controls: Vec<rtdb_node::HostedControlWrite>, deadline: Timestamp,
     ) -> BoxFuture<'a, Result<TransactionKey>>;
 }
