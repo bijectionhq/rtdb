@@ -953,7 +953,8 @@ impl<'a> OpenTransaction<'a> {
             let target = root.as_ref().unwrap_or(relation);
             if new_lifetimes.contains(target) || base.contains_table(&target.lifetime_table(owner)) {
                 match operation {
-                    Operation::Public(TxOp::OwnedDeclareRelation { .. } | TxOp::OwnedInsertDocs { .. })
+                    Operation::Public(TxOp::OwnedDeclareRelation { .. } | TxOp::OwnedInsertDocs { .. }
+                        | TxOp::OwnedCheck { .. })
                     | Operation::OwnedWriteIids { create_only: true, .. } if root.is_none() => (),
                     _ => return Err(lifetime_uncovered()),
                 }
@@ -1300,9 +1301,20 @@ impl<'a> OpenTransaction<'a> {
                 continue;
             }
             let Operation::Public(TxOp::OwnedCheck { relation, id, valid_at, expected }) = operation else { continue; };
-            let upper = valid_at.0.checked_add(1).map(Timestamp)
+            let observed = if self.buffer.base_snapshot().contains_table(&relation.lifetime_table(owner)) {
+                let accepted = self.tx_key().system_time;
+                if *valid_at >= accepted {
+                    return Err(lifetime_uncovered());
+                }
+                // Expiration does not publish a new row revision. Certify
+                // visibility again at acceptance, not at the old valid instant.
+                accepted
+            } else {
+                *valid_at
+            };
+            let upper = observed.0.checked_add(1).map(Timestamp)
                 .ok_or_else(|| Anomaly::incorrect("rtdb.owned/invalid-read-instant", "The observation's valid instant has no following microsecond"))?;
-            let actual = self.read_owned_revision(owner, relation, id, Interval::new(*valid_at, upper)?).await?;
+            let actual = self.read_owned_revision(owner, relation, id, Interval::new(observed, upper)?).await?;
             if actual != *expected {
                 return Err(Anomaly::new(AnomalyCategory::Conflict, "rtdb.owned/stale-point", "The owned point observation changed before ordering"));
             }
