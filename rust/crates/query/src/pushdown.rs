@@ -2,8 +2,8 @@ use std::{collections::BTreeMap, sync::Arc};
 use rtdb_columnar::{MemoryBudget, MemoryReservation};
 use rtdb_format::{bloom::BloomFilter, transit::{TransitValue, encode_msgpack}};
 use rtdb_plan::{BinaryOp, ColumnId, Expr, Field, NamedExpr, Schema};
-use rtdb_types::{Iid, LogicalType, Result, ScalarType, Value};
-use crate::{context::Execution, invalid};
+use rtdb_types::{EntityId, Iid, LogicalType, Result, ScalarType, Value};
+use crate::{columnar::ColumnBatch, context::Execution, invalid, scalar_key::ScalarKey};
 
 type IidEntries = BTreeMap<Iid, Arc<MemoryReservation>>;
 
@@ -76,6 +76,18 @@ impl IidCandidates {
                 scope.reserve(value.retained_bytes()?.checked_mul(3).and_then(|bytes| bytes.checked_add(256)).ok_or_else(size_error)?)?;
                 (value.entity_id()?.iid(), entries)
             }
+            _ => return Ok(false),
+        };
+        if !entries.contains_key(&iid) {
+            entries.insert(iid, memory.reserve(256)?);
+        }
+        Ok(true)
+    }
+
+    fn insert_scalar(&mut self, key: ScalarKey<'_>, memory: &Arc<MemoryBudget>) -> Result<bool> {
+        let (iid, entries) = match (self, key) {
+            (Self::Entity(EntityIdDomain::Integer, entries), ScalarKey::Signed(value)) => (EntityId::Integer(value).iid(), entries),
+            (Self::Entity(EntityIdDomain::String, entries), ScalarKey::Text(value)) => (EntityId::string_iid(value), entries),
             _ => return Ok(false),
         };
         if !entries.contains_key(&iid) {
@@ -245,6 +257,22 @@ impl PushdownBuilder {
                 if !iids.insert(&value, evaluation.as_ref().expect("the scope was just opened"), &execution.context.memory)? {
                     key.filter.iids = None;
                 }
+            }
+        }
+        Ok(())
+    }
+    pub fn insert_arrow(&mut self, schema: &Schema, batch: &ColumnBatch, row: usize, memory: &Arc<MemoryBudget>) -> Result<()> {
+        for key in &mut self.keys {
+            if key.filter.bloom.is_none() { continue; }
+            let Expr::Column { id, .. } = &key.expression else {
+                return Err(invalid("pushdown-key", "Arrow join filter requires a column key"));
+            };
+            let value = schema.position(*id).and_then(|position| ScalarKey::read(&batch.columns[position], row))
+                .ok_or_else(|| invalid("pushdown-key", "Arrow join filter could not read its key"))?;
+            key.add(rtdb_format::bloom::hashes(value.hash() as i32, value.murmur3() as i32));
+            if value != ScalarKey::Null && let Some(iids) = &mut key.filter.iids
+                && !iids.insert_scalar(value, memory)? {
+                key.filter.iids = None;
             }
         }
         Ok(())

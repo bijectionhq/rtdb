@@ -465,6 +465,49 @@ impl ColumnBatch {
         Self::take_rows_with_custody(&[self], rows, &positions, true, memory)
     }
 
+    pub(crate) fn key_projection(&self, positions: &[usize], memory: &Arc<MemoryBudget>) -> Result<Self> {
+        self.project_keys(positions, false, memory)
+    }
+
+    pub(crate) fn compact_group_keys(&self, rows: &[(usize, usize)], memory: &Arc<MemoryBudget>) -> Result<Self> {
+        let _positions = memory.reserve(self.columns.len().checked_mul(std::mem::size_of::<usize>()).ok_or_else(size_error)?)?;
+        let positions: Vec<_> = (0..self.columns.len()).collect();
+        let picked = Self::take_rows_with_custody(&[self], rows, &positions, true, memory)?;
+        picked.project_keys(&positions, true, memory)
+    }
+
+    fn project_keys(&self, positions: &[usize], detach: bool, memory: &Arc<MemoryBudget>) -> Result<Self> {
+        let base = positions.len().checked_mul(std::mem::size_of::<Column>())
+            .and_then(|bytes| bytes.checked_add(256)).ok_or_else(size_error)?;
+        let mut reservation = memory.reserve(base)?;
+        let mut columns = Vec::with_capacity(positions.len());
+        for &position in positions {
+            let column = &self.columns[position];
+            let lease = Arc::get_mut(&mut reservation).expect("The key projection owns its reservation");
+            if detach && let Column::Selected(selection) = column {
+                let layout = |source: usize| selection.sources[source].as_ref().map(|(_, field, logical, _)| (field, logical));
+                let first = selection.cells.first().and_then(|&(source, _)| layout(source));
+                if selection.cells.iter().all(|&(source, _)| layout(source) == first) {
+                    let ((array, field, logical), _scratch) = selection.fragment_vector(0..self.len, memory)?;
+                    let detached = Column::Arrow { array, field, logical };
+                    lease.grow_to(lease.bytes().checked_add(detached.retained_bytes()?).ok_or_else(size_error)?)?;
+                    columns.push(detached);
+                    continue;
+                }
+                let bytes = (0..self.len).try_fold(256usize, |bytes, row| {
+                    column.bound(row)?.checked_mul(2).and_then(|size| bytes.checked_add(size)).ok_or_else(size_error)
+                })?;
+                lease.grow_to(lease.bytes().checked_add(bytes).ok_or_else(size_error)?)?;
+                let values = (0..self.len).map(|row| column.value(row)).collect::<Result<_>>()?;
+                columns.push(Column::Values(values));
+            } else {
+                lease.grow_to(lease.bytes().checked_add(column.retained_bytes()?).ok_or_else(size_error)?)?;
+                columns.push(column.duplicate());
+            }
+        }
+        Self::settled(columns, self.len, reservation)
+    }
+
     fn take_rows_with_custody(
         sources: &[impl std::borrow::Borrow<Self>], rows: &[(usize, usize)], positions: &[usize],
         retain_sources: bool, memory: &Arc<MemoryBudget>,
@@ -490,15 +533,22 @@ impl ColumnBatch {
     /// A page of rows as columns of values, charged as each column is built.
     pub fn from_page(page: &OwnedPage, memory: &Arc<MemoryBudget>) -> Result<Self> {
         let width = page.rows().first().map_or(0, |row| row.values.len());
-        let mut reservation = memory.reserve(256)?;
+        let bound = width.checked_mul(std::mem::size_of::<Column>()).and_then(|bytes| bytes.checked_add(256)).ok_or_else(size_error)?;
+        let mut reservation = memory.reserve(bound)?;
         let mut columns = Vec::with_capacity(width);
         for position in 0..width {
-            let column = Column::Values(page.rows().iter().map(|row| row.values.get(position).cloned().ok_or_else(|| invalid("column-row", "A row is narrower than its page"))).collect::<Result<_>>()?);
+            let cells = page.len().checked_mul(std::mem::size_of::<Value>()).ok_or_else(size_error)?;
+            let bytes = page.rows().iter().try_fold(cells, |bytes, row| {
+                let value = row.values.get(position).ok_or_else(|| invalid("column-row", "A row is narrower than its page"))?;
+                bytes.checked_add(value.retained_bytes()?).ok_or_else(size_error)
+            })?;
             let lease = Arc::get_mut(&mut reservation).ok_or_else(|| invalid("column-size", "A column page's charge is shared"))?;
-            lease.grow_to(lease.bytes().checked_add(column.retained_bytes()?).ok_or_else(size_error)?)?;
-            columns.push(column);
+            lease.grow_to(lease.bytes().checked_add(bytes).ok_or_else(size_error)?)?;
+            let mut values = Vec::with_capacity(page.len());
+            values.extend(page.rows().iter().map(|row| row.values[position].clone()));
+            columns.push(Column::Values(values));
         }
-        Self::settled(columns, page.len(), reservation)
+        Ok(Self { columns, len: page.len(), reservation, appended: Vec::new() })
     }
 
     /// Materialises every row, admitting the page's rows together before any is built.
@@ -527,13 +577,18 @@ impl ColumnBatch {
 
 pub(crate) fn ordinal_column(len: usize, start: i64, name: &str, context: &crate::QueryContext)
     -> Result<(Column, Arc<MemoryReservation>)> {
+    ordinal_column_by(len, name, context, |index| start + index as i64)
+}
+
+pub(crate) fn ordinal_column_by(len: usize, name: &str, context: &crate::QueryContext, mut ordinal: impl FnMut(usize) -> i64)
+    -> Result<(Column, Arc<MemoryReservation>)> {
     let bound = len.checked_mul(std::mem::size_of::<i64>())
         .and_then(|bytes| bytes.checked_add(name.len())).and_then(|bytes| bytes.checked_add(512)).ok_or_else(size_error)?;
     let reservation = context.memory.reserve(bound)?;
     let mut values = Vec::with_capacity(len);
     for index in 0..len {
         context.check_cancelled_at(index)?;
-        values.push(start + index as i64);
+        values.push(ordinal(index));
     }
     let array = Arc::new(arrow_array::Int64Array::from(values));
     let field = Arc::new(ArrowField::new(name, DataType::Int64, false));
@@ -584,6 +639,43 @@ fn shifted_columns_share_the_input_reservations_across_appends() {
     assert!(memory.used_bytes() < bytes * 2 + 64 * 1024);
     drop(batch);
     assert_eq!(memory.used_bytes(), 0);
+}
+
+#[test]
+fn projected_partition_keys_release_unrelated_source_buffers() {
+    use arrow_array::Int64Array;
+    use arrow_buffer::OffsetBuffer;
+
+    let memory = MemoryBudget::new(3 << 20);
+    let custody = memory.reserve(2 << 20).unwrap();
+    let element = Arc::new(ArrowField::new("item", DataType::Int64, false));
+    let array = Arc::new(ListArray::new(Arc::clone(&element), OffsetBuffer::new(vec![0, 1, 2].into()),
+        Arc::new(Int64Array::from(vec![10, 20])), None));
+    let field = Arc::new(ArrowField::new("key", DataType::List(element), false));
+    let logical = rtdb_columnar::from_field(&field).unwrap();
+    let selected = SelectedColumn::new(vec![Some((array, field, Some(logical), Some(custody)))], Arc::new(vec![(0, 1)]));
+    let input = ColumnBatch::settled(vec![Column::Selected(selected)], 1, memory.reserve(1024).unwrap()).unwrap();
+    let keys = input.compact_group_keys(&[(0, 0)], &memory).unwrap();
+    drop(input);
+    assert!(memory.used_bytes() < 64 * 1024);
+    assert!(matches!(keys.columns[0], Column::Arrow { .. }));
+    assert_eq!(keys.columns[0].value(0).unwrap(), Value::List(vec![Value::I64(20)]));
+}
+
+#[test]
+fn dense_partition_keys_release_an_attached_page_reservation() {
+    use arrow_array::{Int64Array, RecordBatch};
+    use arrow_schema::Schema;
+
+    let memory = MemoryBudget::new(3 << 20);
+    let schema = Arc::new(Schema::new(vec![ArrowField::new("key", DataType::Int64, false)]));
+    let record = RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(vec![10, 20]))]).unwrap();
+    let custody = memory.reserve(2 << 20).unwrap();
+    let input = ColumnBatch::from_owned(rtdb_columnar::OwnedBatch::with_reservation(record, custody).unwrap()).unwrap();
+    let keys = input.compact_group_keys(&[(0, 1)], &memory).unwrap();
+    drop(input);
+    assert!(memory.used_bytes() < 64 * 1024);
+    assert_eq!(keys.columns[0].value(0).unwrap(), Value::I64(20));
 }
 
 fn gather_column_cells<'a>(

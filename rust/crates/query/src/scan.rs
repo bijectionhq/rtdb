@@ -1987,6 +1987,34 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn inner_equi_join_of_cold_pages_keeps_multiple_key_columns_in_arrow() {
+        use rtdb_plan::{BinaryOp, JoinKind, Relation};
+
+        let (state, table, _, store, _) = persisted_page_fixture().await;
+        let storage = Arc::new(BufferPool::new(store, 1 << 20));
+        let (mut left, execution, memory) = descriptor_scan(state.value().snapshot(), table, storage);
+        let id = Field { id: ColumnId(1), name: "_id".into(), qualifier: None, qualified_only: false, unnamed: false,
+            data_type: LogicalType::Scalar(ScalarType::I64) };
+        left.columns.push(id);
+        let mut right = left.clone();
+        for field in &mut right.columns { field.id.0 += 10; }
+        let key = |index: usize| Expr::binary(BinaryOp::Eq, left.columns[index].expression(), right.columns[index].expression());
+        let condition = Expr::binary(BinaryOp::And, key(0), key(1));
+        let relation = Arc::new(Relation::join(Arc::new(Relation::scan(left).unwrap()), Arc::new(Relation::scan(right).unwrap()),
+            JoinKind::Inner, Some(condition)).unwrap());
+        let runtime = crate::runtime_schema::EmittedRelation::derive(relation, &execution.context.catalog, &[], &memory).unwrap();
+        let mut cursor = crate::operators::build_columns(runtime, execution).await.unwrap().expect("Expected Arrow equijoin execution");
+        let mut rows = Vec::new();
+        while let Some(batch) = cursor.next_batch().await.unwrap() {
+            assert!(batch.columns.iter().all(|column| matches!(column, crate::columnar::Column::Arrow { .. })));
+            for row in 0..batch.len {
+                rows.push(batch.columns.iter().map(|column| column.value(row).unwrap()).collect::<Vec<_>>());
+            }
+        }
+        assert_eq!(rows, (1..=3).map(|value| vec![Value::I64(value); 4]).collect::<Vec<_>>());
+    }
+
+    #[tokio::test]
     async fn outer_unnest_expands_list_positions_and_keeps_arrow_payloads() {
         use rtdb_plan::{Relation, RelationNode, Schema};
 
@@ -2141,6 +2169,57 @@ mod tests {
                 vec![Value::I64(1), Value::Null, Value::I64(2)],
             ]);
         }
+    }
+
+    #[tokio::test]
+    async fn partitioned_window_keeps_arrow_values_and_shifts_inside_each_group() {
+        use rtdb_plan::{Relation, RelationNode, Schema, SortExpr, WindowExpr, WindowFunction};
+
+        let (state, table, _) = live_table_with_values([Value::I64(1), Value::I64(2), Value::I64(1)]);
+        let storage = Arc::new(BufferPool::new(Arc::new(MemoryStore::default()), 1 << 20));
+        let (mut scan, mut execution, memory) = descriptor_scan(state.value().snapshot(), table, storage);
+        Arc::get_mut(&mut execution.context).unwrap().options.batch_rows = 1;
+        let group = scan.columns[0].id;
+        let mut id = scan.columns[0].clone();
+        id.id = ColumnId(1);
+        id.name = "_id".into();
+        let sort = id.expression();
+        scan.columns.push(id.clone());
+        let scan = Arc::new(Relation::scan(scan).unwrap());
+        let mut ordinal = id.clone();
+        ordinal.id = ColumnId(2);
+        ordinal.name = "ordinal".into();
+        let mut next = id.clone();
+        next.id = ColumnId(3);
+        next.name = "next_id".into();
+        next.data_type = next.data_type.maybe();
+        let schema = scan.schema().concat(&Schema::new(vec![ordinal.clone(), next.clone()]).unwrap()).unwrap();
+        let relation = Arc::new(Relation::new(schema, RelationNode::Window {
+            input: scan,
+            partition_by: vec![group],
+            order_by: vec![SortExpr { expr: sort, descending: true, nulls_first: false }],
+            expressions: vec![
+                WindowExpr { field: ordinal, function: WindowFunction::RowNumber },
+                WindowExpr { field: next, function: WindowFunction::Lead { column: id.id, offset: 1 } },
+            ],
+        }).unwrap());
+        let runtime = crate::runtime_schema::EmittedRelation::derive(relation, &execution.context.catalog, &[], &memory).unwrap();
+        let mut cursor = crate::operators::build_columns(Arc::clone(&runtime), execution.clone()).await.unwrap().expect("Expected Arrow window");
+        let mut rows = Vec::new();
+        while let Some(page) = cursor.next_batch().await.unwrap() {
+            assert_eq!(page.len, 1);
+            assert!(page.columns[..3].iter().all(|column| matches!(column, crate::columnar::Column::Arrow { .. })));
+            assert!(matches!(page.columns[3], crate::columnar::Column::Selected(_)));
+            rows.push(page.columns.iter().map(|column| column.value(0).unwrap()).collect::<Vec<_>>());
+        }
+        assert_eq!(rows, [
+            vec![Value::I64(1), Value::I64(3), Value::I64(1), Value::I64(1)],
+            vec![Value::I64(1), Value::I64(1), Value::I64(2), Value::Null],
+            vec![Value::I64(2), Value::I64(2), Value::I64(1), Value::Null],
+        ]);
+        let mut pages = crate::operators::build_pages(runtime, execution).await.unwrap();
+        let reference = pages.next_page().await.unwrap().unwrap();
+        assert_eq!(rows, reference.rows().iter().map(|row| row.values.clone()).collect::<Vec<_>>());
     }
 
     #[tokio::test]
