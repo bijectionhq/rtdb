@@ -495,6 +495,18 @@ pub(crate) fn track_checkpoint_stage_publications(
     ));
 }
 
+pub(crate) fn track_checkpoint_transfer_publications(
+    io: &mut Arc<IoRegion>,
+    directory: Arc<dyn Directory>,
+    deployment: String,
+    region: Uuid,
+    operation: Uuid,
+) {
+    Arc::get_mut(io).expect("the region has not been exposed").track_publications(Arc::new(
+        DirectoryPublications { directory, deployment, region, writer_epoch: None, owner: PublicationOwner::CheckpointTransfer(operation) },
+    ));
+}
+
 pub(crate) fn track_hosted_fork_publications(io: &mut Arc<IoRegion>, directory: Arc<dyn Directory>, deployment: String, region: Uuid) {
     Arc::get_mut(io).expect("the region has not been exposed").track_publications(Arc::new(
         DirectoryPublications { directory, deployment, region, writer_epoch: None, owner: PublicationOwner::HostedFork },
@@ -506,6 +518,7 @@ enum PublicationOwner {
     Serving,
     Transfer,
     CheckpointStage(Uuid),
+    CheckpointTransfer(Uuid),
     HostedFork,
 }
 
@@ -531,6 +544,13 @@ impl PublicationJournal for DirectoryPublications {
                 PublicationOwner::CheckpointStage(operation) => record.lifecycle == Lifecycle::Restoring
                     && record.checkpoint_stage.as_ref().is_some_and(|stage| {
                         stage.intent.operation == operation && stage.staged_manifest_sha256.is_none()
+                    }),
+                PublicationOwner::CheckpointTransfer(operation) => record.lifecycle == Lifecycle::Restoring
+                    && record.checkpoint_transfer_fence.as_deref().is_some_and(|fence| {
+                        let intent = &fence.destination.intent;
+                        intent.operation == operation && intent.destination.to_string() == record.id
+                            && record.checkpoint_stage.as_deref() == Some(&fence.destination)
+                            && key.as_str() == crate::archive::checkpoint_transfer_object(record, operation)
                     }),
                 PublicationOwner::HostedFork => record.lifecycle == Lifecycle::Restoring
                     && record.hosted_fork_stage.as_ref().is_some_and(|stage| stage.preparation.token == self.region),

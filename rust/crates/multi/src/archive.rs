@@ -93,6 +93,10 @@ pub(crate) fn checkpoint_storage_root() -> Result<String> {
     Ok(StorageRoot::new(CURRENT_STORAGE_VERSION, StorageEpoch(0))?.key())
 }
 
+pub(crate) fn checkpoint_transfer_object(record: &DeploymentRecord, operation: Uuid) -> String {
+    format!("{}/checkpoint-transfers/{operation}.v1", record.storage_prefix())
+}
+
 fn digest(ciphertext: &[u8]) -> String {
     URL_SAFE_NO_PAD.encode(ring::digest::digest(&ring::digest::SHA256, ciphertext))
 }
@@ -1360,6 +1364,7 @@ pub(crate) async fn seal_checkpoint_transfer(
             .ok_or_else(|| inconsistent("The terminal replica interval has no canonical digest"))?;
         (Some(digest), entries)
     };
+    let entries = replica_suffix::open_terminal_entries(&source, keys, entries).await?;
     let source_through = replica_suffix::terminal_source_through(&entries, fence)?;
 
     let mut node = rtdb_node::NodeOptions::default();

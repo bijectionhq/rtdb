@@ -26,8 +26,8 @@ use serde::de::DeserializeOwned;
 use crate::{Cas, ChangeFeed, DeploymentRecord, Directory, ForkPublication, ReferenceDisposal, HostedTask, LineageChange, LineageRetirement, LineageState, MemberId, MemberRecord, REFERENCE_REVISION_PREFIX, Version, exists, fork_conflict, fork_parent_id, require_deployment_name, shared_fork_lineage};
 use crate::lineage::{disposal_changed, lineage_busy};
 use crate::{
-    CheckpointTransferFence, CheckpointTransferSelection, CheckpointTransferTerminal, ForkPreparation, fork_stage_changed,
-    fork_stage_version, prepare_checkpoint_transfer, prepare_checkpoint_transfer_terminal, require_fork_stage_update,
+    CheckpointTransferBootstrap, CheckpointTransferFence, CheckpointTransferSelection, CheckpointTransferTerminal, ForkPreparation, fork_stage_changed,
+    fork_stage_version, prepare_checkpoint_transfer, prepare_checkpoint_transfer_bootstrap, prepare_checkpoint_transfer_terminal, require_fork_stage_update,
     require_transfer_update, stage_hosted_fork_record, transfer_changed,
 };
 
@@ -330,7 +330,7 @@ impl DynamoDirectory {
     async fn insert_deployment(&self, mut record: DeploymentRecord, fork: Vec<TransactWriteItem>,
         stage_version: Option<Version>) -> Result<DeploymentRecord> {
         require_deployment_name(&record.name)?;
-        if record.checkpoint_transfer_fence.is_some() || record.checkpoint_transfer_terminal.is_some() { return Err(transfer_changed()); }
+        if record.checkpoint_transfer_fence.is_some() || record.checkpoint_transfer_terminal.is_some() || record.checkpoint_transfer_bootstrap.is_some() { return Err(transfer_changed()); }
         record.version = stage_version.unwrap_or(0) + 1;
         let deployment = Put::builder().table_name(&self.tables.deployments).set_item(Some(deployment_item(&record, self.pack_parked_records)?));
         let deployment = match stage_version {
@@ -647,8 +647,27 @@ impl Directory for DynamoDirectory {
         Ok(terminal.clone())
     }
 
+    async fn record_checkpoint_transfer_bootstrap(&self, bootstrap: &CheckpointTransferBootstrap) -> Result<CheckpointTransferBootstrap> {
+        let intent = &bootstrap.terminal.fence.destination.intent;
+        let source = self.deployment(&intent.source.to_string()).await?.ok_or_else(transfer_changed)?;
+        let destination = self.deployment(&intent.destination.to_string()).await?.ok_or_else(transfer_changed)?;
+        let next = prepare_checkpoint_transfer_bootstrap(&source, &destination, bootstrap)?;
+        if next.version == destination.version { return Ok(bootstrap.clone()); }
+        let put = Put::builder().table_name(&self.tables.deployments)
+            .set_item(Some(deployment_item(&next, self.pack_parked_records)?))
+            .condition_expression("#v = :expected")
+            .expression_attribute_names("#v", VERSION)
+            .expression_attribute_values(":expected", number(destination.version))
+            .build().map_err(build_fault)?;
+        let source_check = self.require_deployment_version(&source.id, source.version)?;
+        if !self.write_retirement(vec![source_check, TransactWriteItem::builder().put(put).build()]).await? {
+            return Err(transfer_changed());
+        }
+        Ok(bootstrap.clone())
+    }
+
     async fn replace_deployment(&self, mut record: DeploymentRecord, expected: Version) -> Result<Cas<DeploymentRecord>> {
-        if record.hosted_fork_stage.is_some() || record.checkpoint_transfer_fence.is_some() || record.checkpoint_transfer_terminal.is_some() {
+        if record.hosted_fork_stage.is_some() || record.checkpoint_transfer_fence.is_some() || record.checkpoint_transfer_terminal.is_some() || record.checkpoint_transfer_bootstrap.is_some() {
             let Some(current) = self.deployment(&record.id).await? else { return Ok(Cas::Conflict(None)); };
             if current.version != expected { return Ok(Cas::Conflict(Some(current))); }
             require_fork_stage_update(&current, &record)?;

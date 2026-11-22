@@ -177,6 +177,19 @@ pub(super) async fn apply_archived(
     Ok(())
 }
 
+pub(super) async fn open_terminal_entries(
+    source: &DeploymentRecord, keys: &dyn KeyService, mut entries: Vec<ArchivedReplicaEntry>,
+) -> Result<Vec<ArchivedReplicaEntry>> {
+    if entries.is_empty() { return Ok(entries); }
+    let material = keys.existing_key(&source.key_id()).await?.ok_or_else(suffix_unavailable)?;
+    let cipher = Cipher::new(&material)?;
+    let scope = source.replica_seal_scope();
+    for entry in &mut entries {
+        entry.payload = cipher.open(&scope, &entry.payload)?;
+    }
+    Ok(entries)
+}
+
 pub(super) fn terminal_source_through(
     entries: &[ArchivedReplicaEntry], fence: &rtdb_directory::CheckpointTransferFence,
 ) -> Result<i64> {
@@ -283,7 +296,7 @@ fn suffix_unavailable() -> Anomaly {
     unavailable("The exact replica suffix cannot be materialized")
 }
 
-fn encode_records(entries: &[ArchivedReplicaEntry]) -> Result<Vec<u8>> {
+pub(super) fn encode_records(entries: &[ArchivedReplicaEntry]) -> Result<Vec<u8>> {
     let mut out = FORMAT.to_vec();
     for entry in entries {
         entry.encode_length_delimited(&mut out).map_err(|_| suffix_unavailable())?;

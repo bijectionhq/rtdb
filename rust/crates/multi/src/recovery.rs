@@ -151,7 +151,7 @@ enum Reply {
         disposal: DisposalReceipt,
     },
     TransferTargetVerified {
-        terminal: rtdb_directory::CheckpointTransferTerminal,
+        bootstrap: rtdb_directory::CheckpointTransferBootstrap,
     },
     StageOwnedRelations {
         name: String,
@@ -487,10 +487,10 @@ impl RecoveryService {
                     manifest_sha256: staged_manifest_sha256,
                     source: Some((request.authority, request.capture, self.org.clone())),
                 };
-                let terminal = archive::verify_checkpoint_transfer_target(
+                let bootstrap = archive::verify_checkpoint_transfer_target(
                     directory, &self.storage, self.keys.as_ref(), selector, self.hosted_task.clone(),
                 ).await?;
-                Ok(Reply::TransferTargetVerified { terminal })
+                Ok(Reply::TransferTargetVerified { bootstrap })
             },
             Action::InspectCheckpointStageOwnedRelations {
                 destination,

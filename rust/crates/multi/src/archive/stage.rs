@@ -25,7 +25,7 @@ use crate::{
     reference::{PrefixedStore, key},
     store::{
         ROOT_MARKER, reconcile_storage_regions, release_region, remote_storage_region,
-        track_checkpoint_stage_publications, track_publications,
+        track_checkpoint_stage_publications, track_checkpoint_transfer_publications, track_publications,
     },
 };
 
@@ -297,6 +297,7 @@ fn staged(
 /// inventory until all asynchronous storage operations have drained.
 pub(super) enum RegionPublication {
     Stage(Arc<dyn Directory>, Uuid),
+    CheckpointTransfer(Arc<dyn Directory>, Uuid),
     Capture(Arc<dyn Directory>),
 }
 
@@ -335,6 +336,9 @@ where
         match publication {
             Some(RegionPublication::Stage(owner, operation)) => {
                 track_checkpoint_stage_publications(&mut io, owner, deployment.to_owned(), region, operation);
+            }
+            Some(RegionPublication::CheckpointTransfer(owner, operation)) => {
+                track_checkpoint_transfer_publications(&mut io, owner, deployment.to_owned(), region, operation);
             }
             Some(RegionPublication::Capture(owner)) => {
                 track_publications(&mut io, owner, deployment.to_owned(), region, None);
@@ -437,7 +441,7 @@ async fn copy_checkpoint(
     Ok(digest)
 }
 
-async fn put_exact(
+pub(super) async fn put_exact(
     store: &dyn ObjectStore,
     name: &rtdb_storage::ObjectKey,
     bytes: Bytes,
