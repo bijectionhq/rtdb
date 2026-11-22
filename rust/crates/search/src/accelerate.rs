@@ -357,7 +357,7 @@ fn uncovered_owned_search() -> Anomaly {
 pub async fn owned_corpus(
     context: Arc<QueryContext>, owner: &str, relation: &OwnedRelation, path: &OwnedRelation, text: &str,
 ) -> Result<rtdb_text::Corpus> {
-    Ok(covered_owned_corpus(context, owner, relation, path, &Query::parse(text), None, false).await?.corpus)
+    Ok(covered_owned_corpus(context, owner, relation, path, &Query::parse(text), None, false, None).await?.corpus)
 }
 
 struct CoveredCorpus {
@@ -371,6 +371,7 @@ struct CoveredCorpus {
 async fn covered_owned_corpus(
     context: Arc<QueryContext>, owner: &str, relation: &OwnedRelation, path: &OwnedRelation, query: &Query,
     valid_at: Option<Timestamp>, retain_runs: bool,
+    shadowed: Option<&BTreeSet<EntityId>>,
 ) -> Result<CoveredCorpus> {
     let definition = crate::definitions::owned_definition(Arc::clone(&context), owner, relation, path).await?
         .ok_or_else(|| Anomaly::incorrect("rtdb.owned/search-path", "Owned relation has no declared clear-text search path with this name"))?;
@@ -443,11 +444,12 @@ async fn covered_owned_corpus(
                 Arc::get_mut(&mut scratch).expect("corpus owns its reservation").grow_to(4096usize.saturating_add(seen.len().saturating_add(1).saturating_mul(256)))?;
                 let key = selected.file.run_identity_bytes(doc)?;
                 let _key = context.memory.reserve(key.len())?;
-                selected.file.run_identity(doc)?;
+                let id = selected.file.run_identity(doc)?;
                 match cutter.judge_key(own, doc, Some(key))? {
                     Judged::Hidden => (),
                     Judged::Visible { exact: false } => return Err(uncovered_owned_search()),
                     Judged::Visible { exact: true } => {
+                        if shadowed.is_some_and(|ids| ids.contains(&id)) { continue; }
                         if !seen.insert(key) { return Err(uncovered_owned_search()); }
                         visible.insert(doc.doc);
                         corpus.documents += 1;
@@ -501,6 +503,14 @@ pub async fn owned_ranked(
     context: Arc<QueryContext>, owner: &str, partitions: &[(OwnedRelation, OwnedRelation)], text: &str,
     offset: usize, limit: usize, valid_at: Option<Timestamp>,
 ) -> Result<OwnedSearchPage> {
+    owned_ranked_with_overlay(context, owner, partitions, text, offset, limit, valid_at, None).await
+}
+
+/// Rank the admitted archive and original overlay with one set of statistics and one rank window.
+pub async fn owned_ranked_with_overlay(
+    context: Arc<QueryContext>, owner: &str, partitions: &[(OwnedRelation, OwnedRelation)], text: &str,
+    offset: usize, limit: usize, valid_at: Option<Timestamp>, overlay: Option<crate::HeldTextCorpus>,
+) -> Result<OwnedSearchPage> {
     if offset > 4096 || !(1..=128).contains(&limit) || !(1..=32).contains(&partitions.len()) || text.len() > 4096 {
         return Err(Anomaly::incorrect("rtdb.owned/search-limit", "Owned search exceeds its result, partition, or query bound"));
     }
@@ -511,25 +521,22 @@ pub async fn owned_ranked(
     let query = Query::parse(text);
     let mut corpus = rtdb_text::Corpus::default();
     let mut covered = Vec::with_capacity(partitions.len());
-    for (relation, path) in partitions {
-        let part = covered_owned_corpus(Arc::clone(&context), owner, relation, path, &query, valid_at, true).await?;
+    for (partition, (relation, path)) in partitions.iter().enumerate() {
+        let shadowed = overlay.as_ref().and_then(|part| part.shadowed(partition));
+        let part = covered_owned_corpus(Arc::clone(&context), owner, relation, path, &query, valid_at, true, shadowed).await?;
         corpus.add(&part.corpus);
         covered.push((relation, part));
     }
+    if let Some(overlay) = &overlay { corpus.add(overlay.statistics()); }
     let scorer = rtdb_text::Scorer::new(query.clone(), Some(&corpus));
-    let window = offset + limit;
-    let mut memory = context.memory.reserve(4096 + (window + 1) * size_of::<OwnedSearchHit>())?;
-    let mut hits = Vec::<OwnedSearchHit>::with_capacity(window + 1);
-    let mut candidates = 0;
+    let mut rank = OwnedRankWindow::new(&context.memory, offset, limit)?;
+    if let Some(overlay) = overlay { overlay.rank(&scorer, &mut rank)?; }
     for (partition, (relation, covered)) in covered.iter().enumerate() {
         for (file, visible) in &covered.visible_runs {
             context.check_cancelled()?;
             for run in file.matches(&covered.column, &query, covered.bounds)? {
                 if !visible.contains(&run.doc) { continue; }
-                candidates += 1;
-                if candidates > 100_000 {
-                    return Err(Anomaly::new(AnomalyCategory::Unavailable, "rtdb.owned/search-candidate-limit", "Covered search exceeded its candidate budget"));
-                }
+                rank.admit_candidate()?;
                 let key = file.run_identity_bytes(run)?;
                 let _key = context.memory.reserve(key.len())?;
                 let id = file.run_identity(run)?;
@@ -570,22 +577,55 @@ pub async fn owned_ranked(
                 }
 
                 let hit = OwnedSearchHit { partition, id, score: resolved_score.ok_or_else(uncovered_owned_search)? };
-                let at = hits.partition_point(|previous| owned_rank_order(previous, &hit).is_lt());
-                if at < window {
-                    hits.insert(at, hit);
-                    hits.truncate(window);
-                    let bytes = hits.iter().try_fold(4096usize, |bytes, hit| {
-                        Ok::<_, Anomaly>(bytes.saturating_add(hit.id.as_value().retained_bytes()?).saturating_add(128))
-                    })?;
-                    let reservation = Arc::get_mut(&mut memory).expect("ranking owns its reservation");
-                    reservation.grow_to(bytes.max(reservation.bytes()))?;
-                }
+                rank.insert(hit)?;
             }
         }
     }
     context.check_cancelled()?;
-    hits.drain(..offset.min(hits.len()));
-    Ok(OwnedSearchPage { hits, total: candidates, _reservation: memory })
+    Ok(rank.finish())
+}
+
+pub(crate) struct OwnedRankWindow {
+    hits: Vec<OwnedSearchHit>,
+    memory: Arc<rtdb_columnar::MemoryReservation>,
+    offset: usize,
+    window: usize,
+    total: usize,
+}
+
+impl OwnedRankWindow {
+    pub(crate) fn new(memory: &Arc<rtdb_columnar::MemoryBudget>, offset: usize, limit: usize) -> Result<Self> {
+        let window = offset + limit;
+        let memory = memory.reserve(4096 + (window + 1) * size_of::<OwnedSearchHit>())?;
+        Ok(Self { hits: Vec::with_capacity(window + 1), memory, offset, window, total: 0 })
+    }
+
+    pub(crate) fn admit_candidate(&mut self) -> Result<()> {
+        self.total += 1;
+        if self.total > 100_000 {
+            return Err(Anomaly::new(AnomalyCategory::Unavailable, "rtdb.owned/search-candidate-limit", "Covered search exceeded its candidate budget"));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn insert(&mut self, hit: OwnedSearchHit) -> Result<()> {
+        let at = self.hits.partition_point(|previous| owned_rank_order(previous, &hit).is_lt());
+        if at < self.window {
+            self.hits.insert(at, hit);
+            self.hits.truncate(self.window);
+            let bytes = self.hits.iter().try_fold(4096usize, |bytes, hit| {
+                Ok::<_, Anomaly>(bytes.saturating_add(hit.id.as_value().retained_bytes()?).saturating_add(128))
+            })?;
+            let reservation = Arc::get_mut(&mut self.memory).expect("ranking owns its reservation");
+            reservation.grow_to(bytes.max(reservation.bytes()))?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn finish(mut self) -> OwnedSearchPage {
+        self.hits.drain(..self.offset.min(self.hits.len()));
+        OwnedSearchPage { hits: self.hits, total: self.total, _reservation: self.memory }
+    }
 }
 
 fn file_candidates(cutter: &Cutter<'_>, column: &str, query: &Query, max_candidates: usize, events: &mut usize) -> Result<Option<BTreeSet<Iid>>> {

@@ -43,6 +43,7 @@ enum ArchiveRead {
         partitions: Vec<(OwnedRelation, OwnedRelation)>,
         frontiers: Vec<i64>,
         query: String,
+        overlay: Option<rtdb_node::HeldTextCorpus>,
         offset: usize,
         limit: usize,
         valid: Timestamp,
@@ -198,45 +199,92 @@ impl HeldCheckpointWorld {
         let witnesses = self.open.snapshot.world_relation_witnesses(
             self.open.record.id, partitions.iter().map(|(relation, _)| relation),
         ).await?;
-        let frontiers = witnesses.iter().map(OwnedWorldWitness::purge_frontier).collect();
-        if self.clock_mode().is_writable() {
-            let page = self.rank_visible_documents(partitions, frontiers, &query, offset, limit, valid, &guard).await?;
-            self.check()?;
-            guard()?;
-            return Ok((page, witnesses));
-        }
+        let frontiers = witnesses.iter().map(OwnedWorldWitness::purge_frontier).collect::<Vec<_>>();
+        let writable = self.clock_mode().is_writable();
+        let columns = if writable {
+            self.search_columns(&partitions, &frontiers, &guard).await?
+        } else {
+            Vec::new()
+        };
+        let overlay = if writable {
+            Some(self.search_overlay(&partitions, &columns, valid, &query, &guard).await?)
+        } else {
+            None
+        };
         let (reply, result) = oneshot::channel();
         self.cancellation.run_until_cancelled(self.requests.send(ArchiveRead::Search {
-            partitions, frontiers, query, offset, limit, valid, guard: Arc::clone(&guard), reply,
+            partitions: partitions.clone(), frontiers, query: query.clone(), overlay,
+            offset, limit, valid, guard: Arc::clone(&guard), reply,
         })).await.ok_or_else(OwnedWorld::unavailable)?.map_err(|_| OwnedWorld::unavailable())?;
         let page = self.cancellation.run_until_cancelled(result).await
-            .ok_or_else(OwnedWorld::unavailable)?.map_err(|_| OwnedWorld::unavailable())??;
+            .ok_or_else(OwnedWorld::unavailable)?.map_err(|_| OwnedWorld::unavailable())?;
+        let page = match page {
+            Err(error) if writable && error.code == "rtdb.owned/search-uncovered" => {
+                self.rank_visible_documents(&partitions, &columns, &query, offset, limit, valid, &guard).await?
+            }
+            other => other?,
+        };
         self.check()?;
         guard()?;
         Ok((page, witnesses))
     }
 
-    async fn rank_visible_documents(
-        &self, partitions: Vec<(OwnedRelation, OwnedRelation)>, frontiers: Vec<i64>, query: &str,
-        offset: usize, limit: usize, valid: Timestamp,
+    async fn search_overlay(
+        &self, partitions: &[(OwnedRelation, OwnedRelation)], columns: &[String], valid: Timestamp,
+        query: &str, guard: &Arc<dyn Fn() -> Result<()> + Send + Sync>,
+    ) -> Result<rtdb_node::HeldTextCorpus> {
+        let mut corpus = rtdb_node::HeldTextCorpus::new(Arc::clone(&self.memory), query)?;
+        for (partition, ((relation, _), column)) in partitions.iter().zip(columns).enumerate() {
+            let mut after = None;
+            loop {
+                guard()?;
+                // This is the physical shadow relation: its typed tombstones
+                // are still present identities and also mask the archived row.
+                let candidates = self.open.snapshot.world_identity_candidates(
+                    self.open.record.id, relation, valid, after.as_deref(), 128,
+                ).await?;
+                for key in &candidates.keys {
+                    let id = EntityId::String(key.clone());
+                    let (shadow, _) = self.open.read_local(relation, &id, valid, &self.memory, false).await?;
+                    let shadow = shadow.ok_or_else(OwnedWorld::unavailable)?;
+                    let text = shadow.as_ref().map(|fact| search_text(fact, column)).transpose()?.flatten();
+                    corpus.shadow(partition, id, text)?;
+                }
+                if candidates.keys.len() < 128 { break; }
+                after = Some(candidates.keys.last().cloned().ok_or_else(OwnedWorld::unavailable)?);
+            }
+        }
+        guard()?;
+        Ok(corpus)
+    }
+
+    async fn search_columns(
+        &self, partitions: &[(OwnedRelation, OwnedRelation)], frontiers: &[i64],
         guard: &Arc<dyn Fn() -> Result<()> + Send + Sync>,
-    ) -> Result<rtdb_node::OwnedSearchPage> {
+    ) -> Result<Vec<String>> {
         let (reply, result) = oneshot::channel();
         self.cancellation.run_until_cancelled(self.requests.send(ArchiveRead::SearchColumns {
-            partitions: partitions.clone(), frontiers, guard: Arc::clone(guard), reply,
+            partitions: partitions.to_vec(), frontiers: frontiers.to_vec(), guard: Arc::clone(guard), reply,
         })).await.ok_or_else(OwnedWorld::unavailable)?.map_err(|_| OwnedWorld::unavailable())?;
         let columns = self.cancellation.run_until_cancelled(result).await
             .ok_or_else(OwnedWorld::unavailable)?.map_err(|_| OwnedWorld::unavailable())??;
-        if columns.len() != partitions.len() { return Err(OwnedWorld::unavailable()); }
-
-        let mut corpus = rtdb_node::HeldTextCorpus::new(Arc::clone(&self.memory), query)?;
-        for (partition, ((relation, _), column)) in partitions.iter().zip(&columns).enumerate() {
-            if !self.open.record.schemas.relation(relation)
+        if columns.len() != partitions.len() || partitions.iter().zip(&columns).any(|((relation, _), column)| {
+            !self.open.record.schemas.relation(relation)
                 .and_then(|schema| schema.column_logical_type(column))
                 .is_some_and(|kind| kind.is_clear_search_text())
-            {
-                return Err(OwnedWorld::unavailable());
-            }
+        }) {
+            return Err(OwnedWorld::unavailable());
+        }
+        Ok(columns)
+    }
+
+    async fn rank_visible_documents(
+        &self, partitions: &[(OwnedRelation, OwnedRelation)], columns: &[String], query: &str,
+        offset: usize, limit: usize, valid: Timestamp,
+        guard: &Arc<dyn Fn() -> Result<()> + Send + Sync>,
+    ) -> Result<rtdb_node::OwnedSearchPage> {
+        let mut corpus = rtdb_node::HeldTextCorpus::new(Arc::clone(&self.memory), query)?;
+        for (partition, ((relation, _), column)) in partitions.iter().zip(columns).enumerate() {
             let mut after = None;
             loop {
                 guard()?;
@@ -245,12 +293,7 @@ impl HeldCheckpointWorld {
                     let id = EntityId::String(key.clone());
                     let point = self.point(relation, &id, valid, false).await?;
                     let fact = point.fact.ok_or_else(OwnedWorld::unavailable)?;
-                    let text = match fact.row().get(column.as_str()) {
-                        Some(Value::Utf8(text)) => Some(text.as_str()),
-                        None | Some(Value::Null) => None,
-                        _ => return Err(OwnedWorld::unavailable()),
-                    };
-                    corpus.observe(partition, id, text)?;
+                    corpus.observe(partition, id, search_text(&fact, column)?)?;
                 }
                 if !page.more { break; }
                 after = Some(page.keys.last().cloned().ok_or_else(OwnedWorld::unavailable)?);
@@ -446,6 +489,14 @@ impl HeldCheckpointWorld {
 
 }
 
+fn search_text<'a>(fact: &'a WorldFact, column: &str) -> Result<Option<&'a str>> {
+    match fact.row().get(column) {
+        Some(Value::Utf8(text)) => Ok(Some(text)),
+        None | Some(Value::Null) => Ok(None),
+        _ => Err(OwnedWorld::unavailable()),
+    }
+}
+
 fn check_archive_coverage<'a>(
     context: &rtdb_query::QueryContext, owner: &str,
     frontiers: impl IntoIterator<Item = (&'a OwnedRelation, i64)>,
@@ -567,13 +618,13 @@ pub(crate) async fn open_held_checkpoint_world(
                                     };
                                     let _ = reply.send(response);
                                 }
-                                ArchiveRead::Search { partitions, frontiers, query, offset, limit, valid, guard, mut reply } => {
+                                ArchiveRead::Search { partitions, frontiers, query, overlay, offset, limit, valid, guard, mut reply } => {
                                     let read = async {
                                         guard()?;
                                         check_archive_coverage(&context, &owner,
                                             partitions.iter().map(|(relation, _)| relation).zip(frontiers))?;
                                         let scoped = Arc::clone(&context).with_owned_read_guard(Arc::clone(&guard));
-                                        let page = rtdb_node::rank_owned_cut(scoped, &owner, &partitions, &query, offset, limit, Some(valid)).await?;
+                                        let page = rtdb_node::rank_owned_overlay_cut(scoped, &owner, &partitions, &query, offset, limit, Some(valid), overlay).await?;
                                         guard()?;
                                         Ok(page)
                                     };

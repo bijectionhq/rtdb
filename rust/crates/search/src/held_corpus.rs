@@ -1,11 +1,14 @@
-use std::sync::Arc;
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    sync::Arc,
+};
 
 use rtdb_columnar::{MemoryBudget, MemoryReservation};
 use rtdb_query::QueryContext;
 use rtdb_text::{Corpus, Query, Scorer};
 use rtdb_types::{Anomaly, AnomalyCategory, EntityId, OwnedRelation, Result};
 
-use crate::{OwnedSearchHit, OwnedSearchPage, accelerate::owned_rank_order};
+use crate::{OwnedSearchHit, OwnedSearchPage, accelerate::OwnedRankWindow};
 
 /// Resolve a declared single-column search path on its admitted archive cut.
 pub async fn owned_text_column(
@@ -44,6 +47,7 @@ pub struct HeldTextCorpus {
     query: Query,
     corpus: Corpus,
     matches: Vec<Match>,
+    shadows: BTreeMap<usize, BTreeSet<EntityId>>,
     identities: usize,
     text_bytes: usize,
 }
@@ -61,6 +65,7 @@ impl HeldTextCorpus {
             query,
             corpus: Corpus::default(),
             matches: Vec::new(),
+            shadows: BTreeMap::new(),
             identities: 0,
             text_bytes: 0,
         })
@@ -108,44 +113,53 @@ impl HeldTextCorpus {
         Ok(())
     }
 
+    /// Register an exact typed overlay shadow, even if it contributes no text.
+    pub fn shadow(&mut self, partition: usize, id: EntityId, text: Option<&str>) -> Result<()> {
+        self.observe(partition, id.clone(), text)?;
+        let charge = id.as_value().retained_bytes()? + 192;
+        let retained = Arc::get_mut(&mut self.retained).expect("exclusive corpus reservation");
+        retained.grow_to(retained.bytes().saturating_add(charge))?;
+        if !self.shadows.entry(partition).or_default().insert(id) {
+            return Err(corpus_limit());
+        }
+        Ok(())
+    }
+
+    pub(crate) fn shadowed(&self, partition: usize) -> Option<&BTreeSet<EntityId>> {
+        self.shadows.get(&partition)
+    }
+
+    pub(crate) fn statistics(&self) -> &Corpus {
+        &self.corpus
+    }
+
+    pub(crate) fn rank(self, scorer: &Scorer, window: &mut OwnedRankWindow) -> Result<()> {
+        if scorer.query() != &self.query {
+            return Err(corpus_limit());
+        }
+        for matched in self.matches {
+            window.admit_candidate()?;
+            let score = scorer.score(&matched.frequencies, matched.length);
+            if !score.is_finite() {
+                return Err(corpus_limit());
+            }
+            window.insert(OwnedSearchHit {
+                partition: matched.partition,
+                id: matched.id,
+                score,
+            })?;
+        }
+        Ok(())
+    }
+
     pub fn finish(self, offset: usize, limit: usize) -> Result<OwnedSearchPage> {
         if offset > 4096 || !(1..=128).contains(&limit) {
             return Err(corpus_limit());
         }
-        let scorer = Scorer::new(self.query, Some(&self.corpus));
-        let total = self.matches.len();
-        let _scratch = self
-            .memory
-            .reserve(total * std::mem::size_of::<OwnedSearchHit>())?;
-        let mut ranked = self
-            .matches
-            .into_iter()
-            .map(|matched| OwnedSearchHit {
-                partition: matched.partition,
-                id: matched.id,
-                score: scorer.score(&matched.frequencies, matched.length),
-            })
-            .collect::<Vec<_>>();
-        if ranked.iter().any(|hit| !hit.score.is_finite()) {
-            return Err(corpus_limit());
-        }
-        ranked.sort_unstable_by(owned_rank_order);
-        let selected = ranked.into_iter().skip(offset).take(limit);
-        let mut reservation = self.memory.reserve(4096)?;
-        let mut hits = Vec::with_capacity(selected.len());
-        for hit in selected {
-            let reservation = Arc::get_mut(&mut reservation).expect("exclusive rank reservation");
-            let bytes = reservation
-                .bytes()
-                .saturating_add(hit.id.as_value().retained_bytes()? + 128);
-            reservation.grow_to(bytes)?;
-            hits.push(hit);
-        }
-        Ok(OwnedSearchPage {
-            hits,
-            total,
-            _reservation: reservation,
-        })
+        let scorer = Scorer::new(self.query.clone(), Some(&self.corpus));
+        let mut window = OwnedRankWindow::new(&self.memory, offset, limit)?;
+        self.rank(&scorer, &mut window)?;
+        Ok(window.finish())
     }
 }
 
