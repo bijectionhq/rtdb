@@ -1696,6 +1696,16 @@ pub struct OwnedWorldFork {
     pub root: Option<OwnedRootSection>,
 }
 
+impl OwnedWorldFork {
+    pub fn shortens_proposal(&self) -> bool {
+        matches!(self.requested, WorldClockRequest::Proposal) && self.cut.is_renewal()
+            && self.previous.is_some()
+            && self.root.as_ref().and_then(|root| root.publication.as_ref())
+                .is_some_and(|publication| matches!(publication.writes.as_slice(), [TxOp::OwnedDelete { .. }]))
+    }
+}
+
+
 #[derive(Default)]
 pub struct OwnedRootSection {
     pub proposal_overlay: bool,
@@ -1761,6 +1771,7 @@ impl NativeSession {
         let proposal_hold = requested == rtdb_types::WorldClockMode::Proposal
             && fork.cut.is_renewal() && fork.previous.is_some();
         let root = match &fork.root {
+            Some(_) if fork.shortens_proposal() => OwnedForkRoot::ProposalShorten,
             Some(section) if proposal_hold && section.publication.is_some() => OwnedForkRoot::ProposalHold,
             Some(section) if section.publication.is_some() && fork.sibling.is_some() && fork.cut.is_renewal() =>
                 OwnedForkRoot::WritesSibling,
@@ -1794,10 +1805,10 @@ impl NativeSession {
             || (matches!(root, OwnedForkRoot::Controls | OwnedForkRoot::ProposalControls | OwnedForkRoot::ProposalWrites)
                 && fork.controls.iter().all(rtdb_tx::HostedControlWrite::is_check))
             || (root == OwnedForkRoot::WritesAdvance && !fork.cut.is_publication())
-            || (fork.cut.is_renewal() && !matches!(root, OwnedForkRoot::WritesRenewal | OwnedForkRoot::WritesSibling | OwnedForkRoot::ProposalHold))
+            || (fork.cut.is_renewal() && !matches!(root, OwnedForkRoot::WritesRenewal | OwnedForkRoot::WritesSibling | OwnedForkRoot::ProposalHold | OwnedForkRoot::ProposalShorten))
             || fork.sibling.is_some_and(|sibling| sibling == record.id || fork.previous.is_none()
                 || root != OwnedForkRoot::WritesSibling)
-            || (root != OwnedForkRoot::None && ((fork.previous.is_some() && !matches!(root, OwnedForkRoot::WritesAdvance | OwnedForkRoot::WritesRenewal | OwnedForkRoot::WritesSibling | OwnedForkRoot::ProposalHold))
+            || (root != OwnedForkRoot::None && ((fork.previous.is_some() && !matches!(root, OwnedForkRoot::WritesAdvance | OwnedForkRoot::WritesRenewal | OwnedForkRoot::WritesSibling | OwnedForkRoot::ProposalHold | OwnedForkRoot::ProposalShorten))
                 || (requested != rtdb_types::WorldClockMode::Retained && !proposal_publication && !proposal_hold)
                 || (fork.cut.live.is_none() && !fork.cut.is_publication())))
             || fork.root.iter().flat_map(|section| &section.checks).any(|check| match check {

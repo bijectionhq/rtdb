@@ -542,6 +542,9 @@ Mode 8 supplies the original live Proposal handle and a fresh physical pin for t
 The placed owner derives the archive from the original pin, and the source preserves the exact archived cut and Proposal overlay identity while extending its expiry.
 One acceptance-valid Root insert and its original absence check order with the new registration and checked owner controls.
 The old physical pin retires after ordering, while the Proposal remains active.
+Mode 9 uses the same predecessor and archive selection with a strictly shorter live expiry.
+It orders one acceptance-valid Root delete and its original present-key check with the Proposal registry replacement and hosted controls.
+The predecessor archive pin is eligible for retirement only after the order accepts.
 The response has the v1 layout.
 A failed order can leave its preallocated archival pin retained until expiry without a visible registration.
 

@@ -956,6 +956,7 @@ pub enum OwnedForkRoot {
     ProposalControls,
     ProposalWrites,
     ProposalHold,
+    ProposalShorten,
 }
 
 #[derive(Clone, Debug)]
