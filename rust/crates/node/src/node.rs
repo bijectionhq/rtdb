@@ -4,8 +4,6 @@ mod hosted_observation;
 mod owned_changes;
 mod owned_identities;
 mod owned_unique;
-mod protected_equality;
-pub use protected_equality::{HeldProtectedEquality, ProtectedEqualityPartition, ProtectedEqualityProjector};
 pub use owned_identities::OwnedIdentityPage;
 pub use owned_changes::{OwnedChangeCommit, OwnedMergedChanges, OwnedRelationChanges, OWNED_MERGED_CHANGE_RELATIONS};
 

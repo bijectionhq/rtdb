@@ -3,10 +3,13 @@ use std::sync::Arc;
 use rtdb_columnar::{MemoryReservation, estimate_read_value_bytes, read_execution_value};
 use rtdb_types::{Anomaly, AnomalyCategory, EntityId, OwnedRelation, Result, Timestamp, Value};
 
-use super::OwnedReadSession;
+use super::{OwnedRangeWitness, OwnedReadSession};
 
 const MAX_PAGE_ROWS: usize = 128;
 const MAX_PAGE_BYTES: usize = 8 << 20;
+const PROTECTED_PAGE_ROWS: usize = 64;
+const CARRIER_PREFIX_BYTES: usize = 5 + 16 + 32 + 16 + 1 + 16 + 16 + 4;
+const CARRIER_IMAGE_BYTES: usize = 4096;
 
 /// A bounded key page with progress through its last returned identity.
 pub struct OwnedIdentityPage {
@@ -16,6 +19,40 @@ pub struct OwnedIdentityPage {
 }
 
 impl OwnedReadSession {
+    /// Give the installed hosted projector a bounded page of ciphertext
+    /// carrier identities and a witness only on completion of its prefix.
+    pub async fn protected_carrier_page(
+        &self,
+        relation: &OwnedRelation,
+        prefix: &str,
+        after: Option<&str>,
+        limit: usize,
+        scope: rtdb_types::PlacedAttemptScope,
+    ) -> Result<(OwnedIdentityPage, Option<OwnedRangeWitness>)> {
+        self.admit_read().await?;
+        if self.witness_scope != Some(scope)
+            || relation.name() != "fact_unit_column_payloads"
+            || !valid_carrier_prefix(prefix)
+            || !(1..=PROTECTED_PAGE_ROWS).contains(&limit)
+            || after.is_some_and(|id| !valid_carrier(id, prefix))
+        {
+            return Err(protected_page_unavailable());
+        }
+        let at = self.present.system_time;
+        let page = self
+            .identity_page_in_prefix(relation, at, at, after, limit, Some(prefix))
+            .await?;
+        if page.keys.iter().any(|id| !valid_carrier(id, prefix)) {
+            return Err(protected_page_unavailable());
+        }
+        let witness = if page.more {
+            None
+        } else {
+            Some(self.relation_witness(relation)?.ok_or_else(protected_page_unavailable)?)
+        };
+        Ok((page, witness))
+    }
+
     /// Reads live local shadow keys, including tombstones, for one admitted world.
     pub async fn world_identity_candidates(
         &self, world: rtdb_types::Iid, relation: &OwnedRelation, valid: Timestamp,
@@ -44,7 +81,7 @@ impl OwnedReadSession {
         self.identity_page_in_prefix(relation, system, valid, after, limit, None).await
     }
 
-    pub(super) async fn identity_page_in_prefix(
+    async fn identity_page_in_prefix(
         &self, relation: &OwnedRelation, system: Timestamp, valid: Timestamp, after: Option<&str>,
         limit: usize, prefix: Option<&str>,
     ) -> Result<OwnedIdentityPage> {
@@ -131,5 +168,30 @@ fn invalid_page() -> Anomaly {
     Anomaly::fault(
         "rtdb.owned/identity-order",
         "The owned identity query returned invalid keys",
+    )
+}
+
+fn lower_hex(text: &str) -> bool {
+    text.bytes()
+        .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn valid_carrier_prefix(prefix: &str) -> bool {
+    prefix.len() == 2 * CARRIER_PREFIX_BYTES
+        && prefix.starts_with("4246435032")
+        && lower_hex(prefix)
+}
+
+fn valid_carrier(id: &str, prefix: &str) -> bool {
+    id.len() == 2 * (CARRIER_PREFIX_BYTES + CARRIER_IMAGE_BYTES)
+        && id.starts_with(prefix)
+        && lower_hex(id)
+}
+
+fn protected_page_unavailable() -> Anomaly {
+    Anomaly::new(
+        AnomalyCategory::Unavailable,
+        "rtdb.owned/protected-equality",
+        "The installed protected equality partition is unavailable",
     )
 }

@@ -33,7 +33,6 @@ pub use rtdb_replication::{LocalRepair, RepairCheckpoint, RepairedStore};
 pub use node::{OwnedIdentityPage, OwnedValidHistory, OwnedVersion, OwnedVersionOrder, OwnedVersionPage, OwnedVersionRequest};
 #[cfg(feature = "search")]
 pub use rtdb_search::{HeldTextCorpus, OwnedSearchPage, owned_ranked as rank_owned_cut, owned_ranked_with_overlay as rank_owned_overlay_cut, owned_text_column};
-pub use node::{HeldProtectedEquality, ProtectedEqualityPartition, ProtectedEqualityProjector};
 pub use node::{IDEMPOTENCY_KEY_PARAMETER, NOT_HELD, REPLICA_BEHIND, NativeSession, Node, NodeDriver, NodeServices, OwnedChangeCommit, OwnedChangePage, OwnedForkCut, OwnedMergedChanges, OwnedRelationChanges, OWNED_MERGED_CHANGE_RELATIONS, OwnedRangeWitness, OwnedReadSession, OwnedRootPublication, OwnedRootSection, OwnedWorldEffect, OwnedWorldFork, OwnedWorldWitness, OwnedWorldSection, OwnedWorldShadowRead, OwnedWorldWrite, ReadFence, WorldClockRequest};
 
 mod statement;
