@@ -4,11 +4,15 @@ use rtdb_columnar::MemoryReservation;
 use rtdb_index::Snapshot;
 use rtdb_query::{OwnedJournalHeader, read_owned_change_entry, read_owned_journal_header};
 use rtdb_types::{
-    Anomaly, OWNED_CHANGE_GROUP_BYTES, OWNED_CHANGE_PAGE_BYTES, OWNED_CHANGE_PAGE_GROUPS,
-    OwnedChange, OwnedChangeGroup, OwnedRelation, Result, Timestamp, Value, change_feed_uncovered,
+    Anomaly, AnomalyCategory, EntityId, Interval, OWNED_CHANGE_GROUP_BYTES,
+    OWNED_CHANGE_PAGE_BYTES, OWNED_CHANGE_PAGE_GROUPS, OwnedChange, OwnedChangeGroup,
+    OwnedRelation, Result, Timestamp, Value, change_feed_uncovered,
 };
 
-use super::{OwnedChangePage, OwnedReadSession};
+use super::{
+    OwnedChangePage, OwnedReadSession, OwnedVersion, OwnedVersionOrder, OwnedVersionPage,
+    OwnedVersionRequest,
+};
 
 pub const OWNED_MERGED_CHANGE_RELATIONS: usize = 32;
 
@@ -238,6 +242,194 @@ impl OwnedReadSession {
         self.require_journal_head(relation, covered.head_revision, covered.head)
             .await?;
         Ok((covered.floor.through_events != 0).then_some(covered.floor.committed_at))
+    }
+
+    /// Pages source groups touching one identity within a certified system window.
+    pub async fn versions(
+        &self,
+        relation: &OwnedRelation,
+        id: &EntityId,
+        request: OwnedVersionRequest,
+    ) -> Result<OwnedVersionPage> {
+        let OwnedVersionRequest {
+            system,
+            after,
+            scan_limit,
+            result_limit,
+            order,
+        } = request;
+        if relation.world().is_some()
+            || relation.is_world_catalog()
+            || system.upper() > self.present.system_time.next()?
+            || !(1..=OWNED_CHANGE_PAGE_GROUPS).contains(&scan_limit)
+            || !(1..=scan_limit).contains(&result_limit)
+        {
+            return Err(Anomaly::incorrect(
+                "rtdb.owned/version-window",
+                "Versions require a system window at or before the held cut and up to 128 groups",
+            ));
+        }
+        self.admit_read().await?;
+        let database = self.context.catalog.database(&self.database)?;
+        let [snapshot] = database.partitions.as_slice() else {
+            return Err(change_feed_uncovered());
+        };
+        let mut page = OwnedVersionPage {
+            floor: Timestamp::MIN,
+            next_revision: after,
+            done: true,
+            scanned: 0,
+            witness: None,
+            versions: Vec::with_capacity(result_limit),
+            _reservation: self.context.memory.reserve(result_limit * 512)?,
+        };
+        if system.is_empty() {
+            if after != 0 {
+                return Err(change_feed_uncovered());
+            }
+            page.witness = self.relation_witness(relation)?;
+            return Ok(page);
+        }
+
+        if let Some(journal) = self
+            .covered_journal(snapshot, relation, self.present.system_time)
+            .await?
+        {
+            if journal.floor.through_events != 0 {
+                page.floor = journal.floor.committed_at;
+                if system.lower() < page.floor {
+                    return Err(Anomaly::new(
+                        AnomalyCategory::Unavailable,
+                        "rtdb.owned/version-floor",
+                        "The requested system window precedes the certified owned history floor",
+                    )
+                    .with_context("history-floor-micros", page.floor.0.into()));
+                }
+            }
+            self.require_journal_head(relation, journal.head_revision, journal.head)
+                .await?;
+            let first = self
+                .version_boundary(relation, &journal, system.lower())
+                .await?;
+            let end = self
+                .version_boundary(relation, &journal, system.upper())
+                .await?;
+            if first > end {
+                return Err(change_feed_uncovered());
+            }
+            let revisions = first..end;
+            let after = i64::try_from(after).map_err(|_| change_feed_uncovered())?;
+            if after != 0 && !revisions.contains(&after) {
+                return Err(change_feed_uncovered());
+            }
+            let (mut current, step) = match order {
+                OwnedVersionOrder::Ascending => (if after == 0 { first } else { after + 1 }, 1),
+                OwnedVersionOrder::Descending => (if after == 0 { end - 1 } else { after - 1 }, -1),
+            };
+            while page.scanned < scan_limit
+                && page.versions.len() < result_limit
+                && revisions.contains(&current)
+            {
+                self.check()?;
+                let entry = read_owned_change_entry(
+                    Arc::clone(&self.context),
+                    &self.owner,
+                    relation,
+                    current,
+                )
+                .await?;
+                let Value::List(touches) = entry.value else {
+                    return Err(change_feed_uncovered());
+                };
+                let count = i64::try_from(touches.len()).map_err(|_| change_feed_uncovered())?;
+                let header = OwnedJournalHeader {
+                    committed_at: entry.system_time,
+                    through_events: entry.through_events,
+                };
+                let previous = if current == 1 {
+                    journal.floor
+                } else {
+                    self.journal_header(relation, current - 1).await?
+                };
+                if count == 0
+                    || previous.through_events.checked_add(count) != Some(header.through_events)
+                    || (current > 1 && !ordered_or_same(current, current - 1, header, previous))
+                    || !ordered_or_same(current, 1, header, journal.first)
+                    || !ordered_or_same(journal.head_revision, current, journal.head, header)
+                    || !system.contains(header.committed_at)
+                {
+                    return Err(change_feed_uncovered());
+                }
+                let mut touched = false;
+                for touch in &touches {
+                    touched |= &OwnedChange::from_value(touch)?.id == id;
+                }
+                let revision = u64::try_from(current).map_err(|_| change_feed_uncovered())?;
+                if touched {
+                    let timeline = rtdb_query::open_owned_valid_during_at(
+                        Arc::clone(&self.context),
+                        &self.owner,
+                        relation,
+                        id,
+                        Interval::ALL,
+                        header.committed_at,
+                    )
+                    .await?
+                    .ok_or_else(change_feed_uncovered)?;
+                    page.versions.push(OwnedVersion {
+                        revision,
+                        system_time: header.committed_at,
+                        timeline,
+                    });
+                }
+                page.next_revision = revision;
+                page.scanned += 1;
+                current += step;
+            }
+            page.done = !revisions.contains(&current);
+        } else if after != 0 {
+            return Err(change_feed_uncovered());
+        }
+        page.witness = self.relation_witness(relation)?;
+        Ok(page)
+    }
+
+    async fn version_boundary(
+        &self,
+        relation: &OwnedRelation,
+        journal: &CoveredJournal,
+        time: Timestamp,
+    ) -> Result<i64> {
+        let end = journal.head_revision + 1;
+        if time <= journal.first.committed_at {
+            return Ok(1);
+        }
+        if time > journal.head.committed_at {
+            return Ok(end);
+        }
+        let (mut low, mut high) = (2, journal.head_revision);
+        while low < high {
+            self.check()?;
+            let mid = low + (high - low) / 2;
+            let header = self.journal_header(relation, mid).await?;
+            if !ordered_or_same(mid, 1, header, journal.first)
+                || !ordered_or_same(journal.head_revision, mid, journal.head, header)
+            {
+                return Err(change_feed_uncovered());
+            }
+            if header.committed_at < time {
+                low = mid + 1;
+            } else {
+                high = mid;
+            }
+        }
+        if low > 1 && self.journal_header(relation, low - 1).await?.committed_at >= time {
+            return Err(change_feed_uncovered());
+        }
+        if low < end && self.journal_header(relation, low).await?.committed_at < time {
+            return Err(change_feed_uncovered());
+        }
+        Ok(low)
     }
 
     async fn covered_journal(
