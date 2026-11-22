@@ -52,8 +52,9 @@ impl OpenTransaction<'_> {
         let validating_world = !self.owned_worlds.is_empty();
         let publishing_world = operations.iter().any(|op| matches!(op, Operation::Public(TxOp::OwnedPublishWorld { .. })));
         let retained_release = crate::hosted_control::retained_release_world(operations).is_some();
+        let proposal_overlay = crate::hosted_control::hosted_proposal_overlay(operations).is_some();
         if validating_world && (
-            (!retained_release && controls.clone().any(|control| !control.is_check()))
+            (!retained_release && !proposal_overlay && controls.clone().any(|control| !control.is_check()))
             || !operations.iter().any(|operation| matches!(operation, Operation::Public(TxOp::OwnedCheckWorldScope { .. })))
         ) {
             return Err(unavailable());
