@@ -1,7 +1,7 @@
 use std::{collections::BTreeMap, sync::Arc, time::Duration};
 
 use rtdb_columnar::MemoryBudget;
-use rtdb_directory::{CheckpointTransferTerminal, Directory, HostedTask, Lifecycle};
+use rtdb_directory::{CheckpointTransferBootstrap, Directory, HostedTask, Lifecycle};
 use rtdb_format::catalog::CheckpointContents;
 use rtdb_node::{NodeOptions, ReadFence};
 use rtdb_query::{CatalogSnapshot, DatabaseSnapshot, QueryContext, read_owned_schema_catalog};
@@ -54,16 +54,22 @@ pub(crate) async fn inspect_staged_owned_relations(
     }).await
 }
 
-/// Verify the source-owned terminal receipt against the actual destination
-/// inventory without exposing the replay overlay to serving traffic.
+/// Materialize a replay input under the target key after verifying it against
+/// the original terminal source receipt and the held destination checkpoint.
 pub(crate) async fn verify_checkpoint_transfer_target(
     directory: Arc<dyn Directory>,
     storage: &CellStorage,
     keys: &dyn KeyService,
     selector: StageSelector,
     hosted_task: Option<HostedTask>,
-) -> Result<CheckpointTransferTerminal> {
-    use crate::{admin::administration_stream, archive::{archive_lifetime_floors_digest, replica_suffix}};
+) -> Result<CheckpointTransferBootstrap> {
+    use crate::{
+        admin::administration_stream,
+        archive::{archive_lifetime_floors_digest, checkpoint_transfer_object, encode, replica_suffix, sha256,
+            stage::{RegionPublication, put_exact, with_region}},
+        cipher::Cipher,
+        reference::key,
+    };
 
     let (source, capture, org) = selector.source.as_ref()
         .ok_or_else(|| inconsistent("Transfer replay requires the authenticated original source"))?;
@@ -80,12 +86,42 @@ pub(crate) async fn verify_checkpoint_transfer_target(
         .ok_or_else(|| inconsistent("The source has no terminal receipt for the exact target attempt"))?
         .clone();
     let replay_directory = Arc::clone(&directory);
+    let hosted_task_for_write = hosted_task.clone();
     with_stage(directory, storage, keys, selector, hosted_task, |authority, record, verified| async move {
         if verified.contents != CheckpointContents::Replay
             || record.checkpoint_transfer_fence.as_deref() != Some(&terminal.fence)
             || authority.stage != terminal.fence.destination
         {
             return Err(inconsistent("The destination inventory has another transfer fence"));
+        }
+        if let Some(prior) = record.checkpoint_transfer_bootstrap.as_deref() {
+            if prior.terminal != terminal {
+                return Err(inconsistent("The target already has another terminal replay artifact"));
+            }
+            with_region(
+                replay_directory.as_ref(), keys, &record.id, storage, hosted_task_for_write.as_ref(),
+                None, None,
+                |current| {
+                    authority.require_held(current)?;
+                    if current.checkpoint_transfer_bootstrap.as_deref() != Some(prior) {
+                        return Err(inconsistent("The target bootstrap receipt changed"));
+                    }
+                    Ok(None)
+                },
+                |_, _, region| async {
+                    let object = key(&checkpoint_transfer_object(&record, authority.stage.intent.operation))?;
+                    let bucket = storage.bucket(region).await?;
+                    let size = usize::try_from(bucket.head_fresh(&object).await?.size)
+                        .ok().filter(|size| *size <= replica_suffix::MAX_SUFFIX_BYTES + (16 << 10) + 64)
+                        .ok_or_else(|| inconsistent("The target bootstrap object exceeds its storage bound"))?;
+                    let bytes = bucket.observe_fresh_exact(&object, size).await?.value;
+                    if sha256(&bytes) != prior.ciphertext_sha256 {
+                        return Err(inconsistent("The ordered target bootstrap cannot be reopened"));
+                    }
+                    Ok(())
+                },
+            ).await?;
+            return Ok(prior.clone());
         }
         let stop = CancellationToken::new();
         let result = tokio::time::timeout(Duration::from_secs(25), async {
@@ -108,7 +144,8 @@ pub(crate) async fn verify_checkpoint_transfer_target(
                 Vec::new()
             };
 
-            let (mut recovered, _, storage, memory, options) =
+            let entries = replica_suffix::open_terminal_entries(&source, keys, entries).await?;
+            let (mut recovered, _, pool, memory, options) =
                 open_owned_snapshot(&authority, verified.store).await?;
             replica_suffix::apply_terminal(&entries, &terminal.fence, &mut recovered, &memory)?;
             let snapshot = recovered.partition.snapshot();
@@ -122,17 +159,60 @@ pub(crate) async fn verify_checkpoint_transfer_target(
             let snapshot = snapshot.with_system_time_cap(Some(terminal.basis.system_time))?;
             let name = &authority.stage.intent.name;
             let catalog = CatalogSnapshot::new(
-                name, BTreeMap::from([(name.clone(), DatabaseSnapshot { partitions: vec![snapshot], storage })]), true,
+                name, BTreeMap::from([(name.clone(), DatabaseSnapshot { partitions: vec![snapshot], storage: pool })]), true,
             )?;
             let context = QueryContext::new(catalog, memory, terminal.basis.system_time, "UTC", options.query, &stop)?;
             if archive_lifetime_floors_digest(context, terminal.basis).await? != terminal.lifetime_floors_sha256 {
                 return Err(inconsistent("Destination replay changed the authenticated lifetime floors"));
             }
             authority.confirm(name).await?;
-            Ok(terminal)
+            let receipt = encode(&terminal)?;
+            if receipt.len() > 16 << 10 {
+                return Err(inconsistent("The terminal receipt exceeds the bootstrap bound"));
+            }
+            let receipt_len = receipt.len() as u32;
+            let replay = replica_suffix::encode_records(&entries)?;
+            let mut plaintext = Vec::with_capacity(4 + receipt.len() + replay.len());
+            plaintext.extend_from_slice(&receipt_len.to_be_bytes());
+            plaintext.extend_from_slice(&receipt);
+            plaintext.extend_from_slice(&replay);
+            let operation = authority.stage.intent.operation;
+            let object = key(&checkpoint_transfer_object(&record, operation))?;
+            let material = keys.existing_key(&record.key_id()).await?
+                .ok_or_else(|| unavailable("The original target media key is unavailable"))?;
+            let bytes = Cipher::new(&material)?.seal_deterministic(object.as_str(), &plaintext)?;
+            let bootstrap = CheckpointTransferBootstrap {
+                terminal, ciphertext_sha256: sha256(&bytes),
+            };
+            Ok((object, bytes, bootstrap))
         }).await;
         stop.cancel();
-        result.map_err(|_| unavailable("Destination terminal replay timed out"))?
+        let (object, bytes, bootstrap) =
+            result.map_err(|_| unavailable("Destination terminal replay timed out"))??;
+
+        let operation = authority.stage.intent.operation;
+        with_region(
+            replay_directory.as_ref(), keys, &record.id, storage, hosted_task_for_write.as_ref(),
+            None, Some(RegionPublication::CheckpointTransfer(Arc::clone(&replay_directory), operation)),
+            |current| {
+                authority.require_held(current)?;
+                if current.checkpoint_transfer_fence.as_deref() != Some(&bootstrap.terminal.fence)
+                    || current.checkpoint_transfer_bootstrap.as_deref().is_some_and(|prior| prior != &bootstrap)
+                {
+                    return Err(inconsistent("The staged target no longer owns this bootstrap"));
+                }
+                Ok(None)
+            },
+            |_, _, region| async {
+                let bucket = storage.bucket(region).await?;
+                put_exact(bucket.as_ref(), &object, bytes.clone()).await?;
+                if bucket.get(&object).await? != bytes {
+                    return Err(inconsistent("The target replay artifact changed before receipt ordering"));
+                }
+                Ok(())
+            },
+        ).await?;
+        replay_directory.record_checkpoint_transfer_bootstrap(&bootstrap).await
     }).await
 }
 
