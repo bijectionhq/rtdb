@@ -3,7 +3,7 @@ use std::sync::Arc;
 use futures::future::BoxFuture;
 use rtdb_columnar::MemoryReservation;
 use rtdb_node::{Database, NativeSession, Node, OwnedWorldPointWitness, OwnedWorldWrite};
-use rtdb_types::{EntityId, OwnedRelation, Result, StructFields, Timestamp, TransactionKey, Value};
+use rtdb_types::{EntityId, Interval, OwnedRelation, Result, StructFields, Timestamp, TransactionKey, Value};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
@@ -58,6 +58,9 @@ pub trait OwnedWorldRead: Send + Sync {
     fn check_relation(&self, relation: &OwnedRelation) -> Result<()>;
     fn check(&self) -> Result<()>;
     fn close(&self);
+    fn valid_during<'a>(
+        &'a self, relation: &'a OwnedRelation, id: &'a EntityId, valid: Interval,
+    ) -> BoxFuture<'a, Result<Vec<(Interval, Timestamp)>>>;
     fn identity_page<'a>(
         &'a self, relation: &'a OwnedRelation, valid: Timestamp, after: Option<&'a str>, limit: usize,
     ) -> BoxFuture<'a, Result<WorldIdentityPage>>;

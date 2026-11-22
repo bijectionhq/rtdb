@@ -4,7 +4,7 @@ use futures::future::BoxFuture;
 use rtdb_directory::{Directory, HostedTask};
 use rtdb_flight_sql::{OwnedWorldHost, OwnedWorldRead, WorldCall, WorldIdentityPage, WorldPoint, WorldPointResult, WorldPointRow};
 use rtdb_node::{NodeOptions, OwnedWorldPointWitness, OwnedWorldWrite};
-use rtdb_types::{EntityId, OwnedRelation, OwnedWorld, Result, Timestamp, TransactionKey};
+use rtdb_types::{EntityId, Interval, OwnedRelation, OwnedWorld, Result, Timestamp, TransactionKey};
 use uuid::Uuid;
 
 use crate::{
@@ -116,6 +116,12 @@ impl OwnedWorldRead for HeldCheckpointWorld {
     fn check(&self) -> Result<()> { HeldCheckpointWorld::check(self) }
 
     fn close(&self) { HeldCheckpointWorld::close(self); }
+
+    fn valid_during<'a>(
+        &'a self, relation: &'a OwnedRelation, id: &'a EntityId, valid: Interval,
+    ) -> BoxFuture<'a, Result<Vec<(Interval, Timestamp)>>> {
+        Box::pin(HeldCheckpointWorld::valid_during(self, relation, id, valid))
+    }
 
     fn identity_page<'a>(
         &'a self, relation: &'a OwnedRelation, valid: Timestamp, after: Option<&'a str>, limit: usize,
