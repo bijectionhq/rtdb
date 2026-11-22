@@ -209,6 +209,7 @@ mod retained_release_tests {
             expected: None,
             advance_to: None,
             drop_world: true,
+            settlement_pin: None,
             delete_root: None,
         };
         let world = Iid([1; 16]);
@@ -236,6 +237,7 @@ pub(crate) fn hosted_proposal_overlay(operations: &[crate::source::Operation]) -
     let mut world = None;
     let mut controls = Vec::new();
     let mut writes = Vec::new();
+    let mut terminal = false;
     let mut points = std::collections::BTreeSet::new();
     for operation in operations {
         match operation {
@@ -246,8 +248,11 @@ pub(crate) fn hosted_proposal_overlay(operations: &[crate::source::Operation]) -
                 points.insert((relation.name(), id.handle_bytes()));
             }
             Operation::Public(TxOp::OwnedPublishWorld {
-                world: next, advance_to: None, drop_world: false, delete_root: None, ..
-            }) if world.is_none() => world = Some(*next),
+                world: next, advance_to: None, drop_world: false, settlement_pin, delete_root: None, ..
+            }) if world.is_none() => {
+                world = Some(*next);
+                terminal = settlement_pin.is_some();
+            },
             Operation::Public(TxOp::OwnedReplaceDocs {
                 relation, documents, valid_from: None, valid_to: None,
             }) | Operation::OwnedWriteIids {
@@ -260,7 +265,7 @@ pub(crate) fn hosted_proposal_overlay(operations: &[crate::source::Operation]) -
         }
     }
     let world = world?;
-    (!writes.is_empty() && retained_delete_controls(controls) && writes.into_iter().all(|(relation, id)| {
+    (terminal == writes.is_empty() && retained_delete_controls(controls) && writes.into_iter().all(|(relation, id)| {
         relation.world() == Some(world) && points.remove(&(relation.name(), id))
     })).then_some(world)
 }

@@ -1599,9 +1599,14 @@ impl Service {
         if result.present != held.snapshot.present() {
             return Err(Status::internal("Owned world point changed its held present"));
         }
+        let until = result.until;
         let nonce = result.witness.take().map(|evidence| held.remember(call, evidence)).transpose()?;
         let reply = self.world_point_reply(call, result, valid_at, nonce)?;
-        held.snapshot.check_relation(&relation).map_err(status)?;
+        if *mode == 2 {
+            held.snapshot.check_parent_point(&relation, until).map_err(status)?;
+        } else {
+            held.snapshot.check_relation(&relation).map_err(status)?;
+        }
         Ok(reply)
     }
 
@@ -1710,7 +1715,7 @@ impl Service {
             }
             let schema = Arc::new(Schema::new_with_metadata(fields, metadata));
             let batch = RecordBatch::try_new(Arc::clone(&schema), columns).map_err(arrow)?;
-            self.owned_point_reply(&schema, Some(&batch), result.present, valid_at, Some(revision))
+            self.owned_point_reply_until(&schema, Some(&batch), result.present, valid_at, Some(revision), result.until)
         } else {
             self.owned_point_reply(&Schema::empty().with_metadata(metadata), None, result.present, valid_at, None)
         }
@@ -1913,6 +1918,7 @@ impl Service {
         let _framing = call.reserve((count + 2) * MAX_COMMIT_GROUPS * 512)?;
         let mut release_eligible = count == 1;
         let mut proposal_eligible = count == 1;
+        let mut terminal_proposal = false;
         let mut worlds = BTreeSet::new();
         let mut attempts = BTreeSet::new();
         let mut sections = Vec::with_capacity(count);
@@ -1945,8 +1951,9 @@ impl Service {
             release_eligible &= mode == rtdb_types::WorldClockMode::Retained
                 && *kind == 2 && count == 0;
             proposal_eligible &= mode == rtdb_types::WorldClockMode::Proposal
-                && *kind == 0 && count != 0;
-            if count == 0 && !release_eligible {
+                && ((*kind == 0 && count != 0) || *kind == 3);
+            terminal_proposal |= *kind == 3;
+            if count == 0 && !release_eligible && !(proposal_eligible && terminal_proposal) {
                 return Err(invalid("Ordinary world effects require original witnesses"));
             }
             if (*kind == 0 && !mode.is_writable())
@@ -1970,6 +1977,7 @@ impl Service {
                     (rtdb_node::OwnedWorldEffect::Clock(Timestamp(i64::from_be_bytes(*target))), rest)
                 }
                 2 => (rtdb_node::OwnedWorldEffect::Drop, rest),
+                3 => (rtdb_node::OwnedWorldEffect::SettleProposal, rest),
                 _ => return Err(invalid("Unknown world publication effect")),
             };
             body = rest;
@@ -2035,7 +2043,7 @@ impl Service {
             root.publication = Some(rtdb_node::OwnedRootPublication { attempt: attempt.to_owned(), writes: root_writes });
         }
         root.proposal_overlay = proposal_overlay;
-        if proposal_overlay && !proposal_eligible {
+        if (proposal_overlay && !proposal_eligible) || (terminal_proposal && !proposal_overlay) {
             return Err(invalid("Registered settlement requires one witnessed Proposal overlay"));
         }
         let observed_root = !root.checks.is_empty() || !root_witnesses.is_empty();
@@ -2065,7 +2073,12 @@ impl Service {
         let connection = self.connection(call, &call.database).await?;
         let mut session = connection.borrow().await?;
         require_idle(&session)?;
-        for resource in &held { resource.snapshot.check().map_err(status)?; }
+        for resource in &held {
+            resource.snapshot.check().map_err(status)?;
+            if terminal_proposal && deadline > resource.snapshot.evidence_until() {
+                return Err(Status::failed_precondition("Proposal hold is outside the settlement deadline"));
+            }
+        }
         if let Some(read) = &root_read {
             read.snapshot.check().map_err(status)?;
             if read.snapshot.present().system_time >= deadline

@@ -551,6 +551,7 @@ pub(crate) async fn commit_checkpoint_world_batch(
 pub struct WorldPoint {
     pub present: TransactionKey,
     pub fact: Option<WorldFact>,
+    pub(crate) until: Option<Timestamp>,
     pub(crate) shadowed: bool,
     pub(crate) witness: Option<OwnedWorldWitness>,
 }

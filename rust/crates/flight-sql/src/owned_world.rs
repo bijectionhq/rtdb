@@ -30,6 +30,7 @@ pub struct WorldCall<'a> {
 pub struct WorldPointResult {
     pub present: Timestamp,
     pub row: Option<WorldPointRow>,
+    pub until: Option<Timestamp>,
     pub shadowed: bool,
     pub witness: Option<OwnedWorldWitness>,
 }
@@ -71,6 +72,7 @@ pub trait OwnedWorldRead: Send + Sync {
     fn until(&self) -> Timestamp;
     fn evidence_until(&self) -> Timestamp;
     fn check_relation(&self, relation: &OwnedRelation) -> Result<()>;
+    fn check_parent_point(&self, relation: &OwnedRelation, until: Option<Timestamp>) -> Result<()>;
     fn check(&self) -> Result<()>;
     fn close(&self);
     fn changes<'a>(&'a self, relations: &'a [OwnedRelation], after: Timestamp, limit: usize)

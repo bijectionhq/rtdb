@@ -503,7 +503,9 @@ The response carries the unchanged world ID followed by the transaction ID and s
 An owned relation with acceptance validity may additionally declare a positive `lifetime_micros` before its first fact.
 Its source accepts immutable creation only, preserving complete identities after expiry so an old identity cannot be re-created.
 One-shot and held live point reads use the server's ordered present and report a returned row's exclusive expiry as `rtdb.owned.until_micros` in Arrow metadata.
-Other read coordinates and paths refuse this declaration until they can apply its lifetime.
+A held retained parent point at its original archive basis also checks the live relation lifetime.
+It returns the same cutoff for a live fact, `rtdb.owned/lifetime-expired` for a fact that was visible at the basis and has since expired, and absence when no fact was visible at the basis.
+Other read coordinates and paths refuse this declaration.
 
 `rtdb.owned.PublishWorldCut.v2` orders one initial retained fork alongside a Root publication at the same source position.
 It takes the v1 fields through the fingerprint and requires an all-zero predecessor handle.

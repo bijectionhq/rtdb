@@ -28,6 +28,7 @@ struct ArchivePoint {
     relation: OwnedRelation,
     id: EntityId,
     valid: Interval,
+    lifetime: Option<i64>,
     guard: Arc<dyn Fn() -> Result<()> + Send + Sync>,
     reply: oneshot::Sender<Result<Option<WorldFact>>>,
 }
@@ -160,25 +161,48 @@ impl HeldCheckpointWorld {
         let fact = if let Some(fact) = local {
             fact
         } else {
-            self.archive_point(relation, id, valid_at).await?
+            self.archive_point(relation, id, valid_at, None).await?
         };
         self.check_relation(relation)?;
-        Ok(WorldPoint { present: self.present(), fact, shadowed, witness })
+        Ok(WorldPoint { present: self.present(), fact, until: None, shadowed, witness })
     }
 
     pub async fn parent_point(&self, relation: &OwnedRelation, id: &EntityId, valid_at: Timestamp) -> Result<WorldPoint> {
-        self.check_relation(relation)?;
-        let fact = self.archive_point(relation, id, valid_at).await?;
-        self.check_relation(relation)?;
-        Ok(WorldPoint { present: self.present(), fact, shadowed: false, witness: None })
+        self.check()?;
+        let lifetime = self.open.snapshot.lifetime_point_duration(relation).await?;
+        let basis = self.parent_basis().system_time;
+        if lifetime.is_some() && (self.clock_mode() != WorldClockMode::Retained || valid_at != basis) {
+            return Err(OwnedWorld::unavailable());
+        }
+        let fact = self.archive_point(relation, id, valid_at, lifetime).await?;
+        let until = fact.as_ref().zip(lifetime).map(|(fact, lifetime)| {
+            let expiry = fact.revision.0.checked_add(lifetime).map(Timestamp)
+                .filter(|expiry| fact.revision <= basis && basis < *expiry)
+                .ok_or_else(OwnedWorld::unavailable)?;
+            if expiry <= self.present().system_time {
+                return Err(expired_lifetime());
+            }
+            Ok(expiry)
+        }).transpose()?;
+        self.check_parent_point(relation, until)?;
+        Ok(WorldPoint { present: self.present(), fact, until, shadowed: false, witness: None })
     }
 
-    async fn archive_point(&self, relation: &OwnedRelation, id: &EntityId, valid_at: Timestamp) -> Result<Option<WorldFact>> {
+    pub fn check_parent_point(&self, relation: &OwnedRelation, until: Option<Timestamp>) -> Result<()> {
+        self.check()?;
+        self.open.snapshot.check_live_point_relation(relation)?;
+        if until.is_some_and(|until| until <= now()) {
+            return Err(expired_lifetime());
+        }
+        Ok(())
+    }
+
+    async fn archive_point(&self, relation: &OwnedRelation, id: &EntityId, valid_at: Timestamp, lifetime: Option<i64>) -> Result<Option<WorldFact>> {
         let valid = Interval::at(valid_at)?;
-        self.open.snapshot.check_point_purge_floor(relation, id, self.open.retained.basis.system_time).await?;
+        let guard = self.open.snapshot.parent_point_release_guard(relation, id, self.open.retained.basis.system_time).await?;
         let (reply, result) = oneshot::channel();
         self.cancellation.run_until_cancelled(self.requests.send(ArchiveRead::Point(ArchivePoint {
-            relation: relation.clone(), id: id.clone(), valid, guard: self.open.snapshot.relation_release_guard([relation])?, reply,
+            relation: relation.clone(), id: id.clone(), valid, lifetime, guard, reply,
         }))).await.ok_or_else(OwnedWorld::unavailable)?.map_err(|_| OwnedWorld::unavailable())?;
         self.cancellation.run_until_cancelled(result).await
             .ok_or_else(OwnedWorld::unavailable)?.map_err(|_| OwnedWorld::unavailable())?
@@ -489,6 +513,11 @@ impl HeldCheckpointWorld {
 
 }
 
+fn expired_lifetime() -> rtdb_types::Anomaly {
+    rtdb_types::Anomaly::new(rtdb_types::AnomalyCategory::Unavailable, "rtdb.owned/lifetime-expired",
+        "The fact at this checkpoint has expired")
+}
+
 fn search_text<'a>(fact: &'a WorldFact, column: &str) -> Result<Option<&'a str>> {
     match fact.row().get(column) {
         Some(Value::Utf8(text)) => Ok(Some(text)),
@@ -604,11 +633,11 @@ pub(crate) async fn open_held_checkpoint_world(
                                     ));
                                     let _ = reply.send(coverage);
                                 }
-                                ArchiveRead::Point(ArchivePoint { relation, id, valid, guard, mut reply }) => {
+                                ArchiveRead::Point(ArchivePoint { relation, id, valid, lifetime, guard, mut reply }) => {
                                     let read = async {
                                         let batches = read_checkpoint_point_in_context(Arc::clone(&context).with_owned_read_guard(guard), CheckpointPoint {
                                             owner: &owner, relation: &relation, id: &id, valid: Some(valid),
-                                        }).await?;
+                                        }, lifetime).await?;
                                         decode_point(batches.unwrap_or_default(), &id, memory)
                                     };
                                     let response = tokio::select! {
