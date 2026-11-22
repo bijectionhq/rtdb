@@ -643,10 +643,28 @@ async fn publish_fork(directory: &dyn Directory, source: &DeploymentRecord, chil
     Err(ForkPublicationError::Rejected(Anomaly::new(AnomalyCategory::Conflict, "rtdb.multi/update-contended", format!("{} kept changing while its fork was published", source.name))))
 }
 
+pub(crate) struct ResidenceErasure<'a>(ErasureAuthority<'a>);
+
+enum ErasureAuthority<'a> {
+    Disposing(&'a rtdb_directory::ReferenceDisposal),
+    RejectedFork(&'a str),
+}
+
+impl ResidenceErasure<'_> {
+    pub(crate) fn prefix(&self) -> &str {
+        match self.0 {
+            ErasureAuthority::Disposing(permit) => permit.residence(),
+            ErasureAuthority::RejectedFork(prefix) => prefix,
+        }
+    }
+}
+
 async fn discard_fork(bucket: &dyn rtdb_storage::ObjectStore, keys: &dyn KeyService, child: &DeploymentRecord, stream: Option<&StreamConfig>) -> Result<()> {
     let key_removed = keys.destroy(&child.key_id()).await;
     let erase_objects = async {
-        if !crate::reference::erase_deployment(bucket, &child.storage_prefix(), &[]).await? {
+        let prefix = child.storage_prefix();
+        let erasure = ResidenceErasure(ErasureAuthority::RejectedFork(&prefix));
+        if !crate::reference::erase_deployment(bucket, &erasure, &[]).await? {
             return Err(Anomaly::fault("rtdb.multi/fork-cleanup", format!("Storage still contains staged objects for {}", child.id)));
         }
         Ok(())
@@ -1533,6 +1551,7 @@ async fn finish_disposal_with_lock(
         crate::store::recover_hosted_lineage(directory, &fenced.lineage).await?;
     }
     let reference_disposal = directory.begin_reference_disposal(id, fenced.version).await?;
+    let erasure = ResidenceErasure(ErasureAuthority::Disposing(&reference_disposal));
     let others = deletion_neighbors(directory, &fenced).await?;
     crate::reference::require_disjoint_prefix(&prefix, others.iter())?;
     stream.write_quorum = write_quorum(stream.servers.len());
@@ -1542,10 +1561,10 @@ async fn finish_disposal_with_lock(
     let journals_retired_at_ms = now_ms();
     let (signed, serving_inventory) = match storage {
         CellStorage::Local { .. } => erase_and_sign_disposal(
-            storage, bucket.as_ref(), keys, &fenced, &prefix, &others, namespaces, journals_retired_at_ms,
+            storage, bucket.as_ref(), keys, &fenced, &erasure, &others, namespaces, journals_retired_at_ms,
         ).await?,
         CellStorage::S3 { config } => {
-            let (first, last) = observe_s3_inventory(directory, storage, config, bucket.as_ref(), &fenced, &others).await?;
+            let (first, last) = observe_s3_inventory(directory, storage, config, bucket.as_ref(), &fenced, &erasure, &others).await?;
             let signed = sign_disposal(&fenced, keys, namespaces, DeletionInventory::AllVersionsAndMultipartUploads, Some(first), last).await?;
             (signed, ServingInventory::S3VersionsAndUploads)
         }
@@ -1617,16 +1636,16 @@ async fn erase_and_sign_disposal(
     bucket: &dyn rtdb_storage::ObjectStore,
     keys: &dyn KeyService,
     fenced: &DeploymentRecord,
-    prefix: &rtdb_storage::ObjectKey,
+    erasure: &ResidenceErasure<'_>,
     others: &[DeploymentRecord],
     namespaces: StorageNamespaces,
     journals_retired_at_ms: i64,
 ) -> Result<(DeletionRecord, ServingInventory)> {
     // Its forks keep what they share with it: those objects are copied into them before it goes.
-    if !crate::reference::erase_deployment(bucket, prefix.as_str(), others).await? {
+    if !crate::reference::erase_deployment(bucket, erasure, others).await? {
         return Err(Anomaly::new(AnomalyCategory::Unavailable, "rtdb.multi/disposal-prefix", format!("Installation {} still has serving objects", fenced.id)));
     }
-    let serving_inventory = storage.purge_serving_inventory(prefix).await?;
+    let serving_inventory = storage.purge_serving_inventory(&rtdb_storage::ObjectKey::new(erasure.prefix())?).await?;
     let objects_erased_at_ms = now_ms().max(journals_retired_at_ms);
     let signed = sign_disposal(fenced, keys, namespaces, DeletionInventory::CurrentObjects, None, objects_erased_at_ms).await?;
     Ok((signed, serving_inventory))
@@ -1702,7 +1721,8 @@ async fn advance_observation(directory: &dyn Directory, deployment: &DeploymentR
 }
 
 async fn observe_s3_inventory(directory: &dyn Directory, storage: &CellStorage, config: &rtdb_s3::S3Config,
-                             bucket: &dyn rtdb_storage::ObjectStore, deployment: &DeploymentRecord, others: &[DeploymentRecord]) -> Result<(i64, i64)> {
+                             bucket: &dyn rtdb_storage::ObjectStore, deployment: &DeploymentRecord,
+                             erasure: &ResidenceErasure<'_>, others: &[DeploymentRecord]) -> Result<(i64, i64)> {
     let first_empty_at_ms = match deployment.deletion_observation {
         Some(DeletionObservation::Verified { first_empty_at_ms, last_empty_at_ms }) => {
             if first_empty_at_ms < 0 || last_empty_at_ms < s3_write_lease_horizon(first_empty_at_ms) || last_empty_at_ms > now_ms() {
@@ -1712,7 +1732,7 @@ async fn observe_s3_inventory(directory: &dyn Directory, storage: &CellStorage, 
         }
         Some(DeletionObservation::Empty { observed_at_ms }) => observed_at_ms,
         Some(DeletionObservation::Fenced { .. }) => {
-            erase_inventory(storage, bucket, deployment, others).await?;
+            erase_inventory(storage, bucket, deployment, erasure, others).await?;
             let observed_at_ms = now_ms();
             advance_observation(directory, deployment, Some(DeletionObservation::Empty { observed_at_ms })).await?;
             return Err(observation_pending(observed_at_ms));
@@ -1723,7 +1743,7 @@ async fn observe_s3_inventory(directory: &dyn Directory, storage: &CellStorage, 
 
     let cell = rtdb_storage::ObjectKey::new(crate::deployment::S3_CELL_ROOT)?;
     let inventory = config.versioned_inventory(&cell, &BTreeMap::new()).await?;
-    let prefix = rtdb_storage::ObjectKey::new(deployment.storage_prefix())?;
+    let prefix = rtdb_storage::ObjectKey::new(erasure.prefix())?;
     if !inventory.is_empty(&prefix).await? {
         advance_observation(directory, deployment, Some(DeletionObservation::Fenced { leases_expire_at_ms: now_ms() })).await?;
         return Err(deletion_incomplete(deployment));
@@ -1738,10 +1758,10 @@ fn deletion_incomplete(deployment: &DeploymentRecord) -> Anomaly {
     Anomaly::new(AnomalyCategory::Unavailable, "rtdb.multi/deletion-incomplete", format!("Storage still contains objects for {}", deployment.name))
 }
 
-async fn erase_inventory(storage: &CellStorage, bucket: &dyn rtdb_storage::ObjectStore, deployment: &DeploymentRecord, others: &[DeploymentRecord]) -> Result<DeletionInventory> {
-    let storage_prefix = deployment.storage_prefix();
-    if !crate::reference::erase_deployment(bucket, &storage_prefix, others).await? { return Err(deletion_incomplete(deployment)); }
-    storage.purge_inventory(&rtdb_storage::ObjectKey::new(&storage_prefix)?).await
+async fn erase_inventory(storage: &CellStorage, bucket: &dyn rtdb_storage::ObjectStore, deployment: &DeploymentRecord,
+    erasure: &ResidenceErasure<'_>, others: &[DeploymentRecord]) -> Result<DeletionInventory> {
+    if !crate::reference::erase_deployment(bucket, erasure, others).await? { return Err(deletion_incomplete(deployment)); }
+    storage.purge_inventory(&rtdb_storage::ObjectKey::new(erasure.prefix())?).await
 }
 
 /// A saved replica prefix that can be passed to the offline verifier.
@@ -2114,7 +2134,7 @@ mod tests {
     use rtdb_directory::MemoryDirectory;
     use rtdb_storage::{MemoryStore, ObjectKey, ObjectStore, object_store::StoredObject};
 
-    use super::{CellStorage, DeploymentRecord, Directory, KeyService, Lifecycle, create_deployment, delete_deployment, erase_and_sign_disposal};
+    use super::{CellStorage, DeploymentRecord, Directory, ErasureAuthority, KeyService, Lifecycle, ResidenceErasure, create_deployment, delete_deployment, erase_and_sign_disposal};
     use crate::keys::LocalKeyService;
 
     #[tokio::test]
@@ -2214,15 +2234,18 @@ mod tests {
         let bucket = MemoryStore::default();
         let namespaces = super::storage_namespaces(&bucket, &keys).await.unwrap();
         deployment.storage_namespaces = Some(namespaces);
-        let prefix = ObjectKey::new(deployment.storage_prefix()).unwrap();
+        let directory = MemoryDirectory::new();
+        let deployment = directory.create_deployment(deployment).await.unwrap();
+        let permit = directory.begin_reference_disposal(&deployment.id, deployment.version).await.unwrap();
+        let erasure = ResidenceErasure(ErasureAuthority::Disposing(&permit));
         let object = ObjectKey::new(format!("{}/v06/rows", deployment.storage_prefix())).unwrap();
         bucket.put(&object, Bytes::from_static(b"data")).await.unwrap();
 
-        let error = erase_and_sign_disposal(&storage, &RetainingStore(&bucket), &keys, &deployment, &prefix, &[], namespaces, 0).await.unwrap_err();
+        let error = erase_and_sign_disposal(&storage, &RetainingStore(&bucket), &keys, &deployment, &erasure, &[], namespaces, 0).await.unwrap_err();
         assert_eq!(error.code, "rtdb.multi/disposal-prefix");
         assert_eq!(keys.key(&deployment.key_id()).await.unwrap(), key);
 
-        let (proof, _) = erase_and_sign_disposal(&storage, &bucket, &keys, &deployment, &prefix, &[], namespaces, 0).await.unwrap();
+        let (proof, _) = erase_and_sign_disposal(&storage, &bucket, &keys, &deployment, &erasure, &[], namespaces, 0).await.unwrap();
         assert!(proof.facts.verified_empty);
         assert!(bucket.list(Some(&ObjectKey::new(deployment.storage_prefix()).unwrap())).await.unwrap().is_empty());
         assert_eq!(keys.existing(&deployment.key_id()).await.unwrap_err().code, "rtdb.multi/key-destroyed");

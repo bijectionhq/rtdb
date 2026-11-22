@@ -1580,6 +1580,8 @@ rule ReapUnreachable {
     -- A failed physical removal keeps its release record for the next pass.
     -- A local sweep reserves the lineage against its current shared-reference revision after draining local preparation.
     -- Local path erasure is internal to the admitted maintenance task.
+    -- Whole-residence erasure uses the prefix admitted by the directory's disposal permit.
+    -- Cleanup of a definitively rejected fork uses the unpublished fork's own prefix.
     -- The reservation advances the preparation generation and holds until the sweep's provider work drains.
     -- The sweep scans published referrers after reserving the lineage and copies retained objects before removing the source copies.
     -- An S3 loose-file release with an installed publication witness records the exact provider version.

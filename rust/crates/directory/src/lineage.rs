@@ -60,6 +60,10 @@ pub struct ReferenceDisposal {
     generation: Version,
 }
 
+impl ReferenceDisposal {
+    pub fn residence(&self) -> &str { &self.residence }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum LineageChange {

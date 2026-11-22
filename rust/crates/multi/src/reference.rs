@@ -407,6 +407,19 @@ async fn block_packs(bucket: &dyn ObjectStore, parent: &str, block: i64) -> Resu
 }
 
 /// Every reference in a cell: for each physical object, the stores that reference it.
+///
+/// ```compile_fail
+/// use rtdb_multi::reference::erase_deployment;
+/// ```
+///
+/// ```compile_fail
+/// use rtdb_multi::reference::simulate_erase_deployment;
+/// use rtdb_storage::ObjectStore;
+///
+/// fn remove(bucket: &dyn ObjectStore) {
+///     let _ = simulate_erase_deployment(bucket, "org/deployment/1", &[]);
+/// }
+/// ```
 #[derive(Default)]
 pub struct References { by_object: BTreeMap<String, BTreeSet<String>> }
 
@@ -433,22 +446,34 @@ impl References {
     }
 
     /// Erases `name` from `store`, first copying it into every store that still references it there.
-    pub async fn erase(&self, bucket: &dyn ObjectStore, store: &str, name: &str) -> Result<()> {
+    pub(crate) async fn erase(&self, bucket: &dyn ObjectStore, store: &str, name: &str) -> Result<()> {
         let physical = format!("{store}/{name}");
         for referrer in self.by_object.get(&physical).into_iter().flatten() { copy_in(bucket, &physical, bucket, &format!("{referrer}/{name}")).await?; }
         bucket.delete(&key(&physical)?).await.map_err(storage)
     }
 
     /// Erases everything a store holds, copying the referenced objects out first.
-    pub async fn erase_store(&self, bucket: &dyn ObjectStore, store: &str) -> Result<()> {
+    async fn erase_store(&self, bucket: &dyn ObjectStore, store: &str) -> Result<()> {
         for name in physical_objects(bucket, store).await? { self.erase(bucket, store, &name).await?; }
         for object in bucket.list(Some(&key(store)?)).await.map_err(storage)? { bucket.delete(&object.key).await.map_err(storage)?; }
         Ok(())
     }
 }
 
-/// Erases every object a deployment's `prefix` holds, first copying what the other deployments of the cell (`others`) reference into them, and returns whether the prefix is then empty.
-pub async fn erase_deployment(bucket: &dyn ObjectStore, prefix: &str, others: &[DeploymentRecord]) -> Result<bool> {
+/// Returns whether the admitted residence is empty after preserving its referrers.
+pub(crate) async fn erase_deployment(bucket: &dyn ObjectStore, erasure: &crate::admin::ResidenceErasure<'_>,
+    others: &[DeploymentRecord]) -> Result<bool> {
+    erase_residence(bucket, erasure.prefix(), others).await
+}
+
+/// Exercises residence removal on the simulator's in-memory cells.
+#[doc(hidden)]
+pub async fn simulate_erase_deployment(bucket: &rtdb_storage::MemoryStore, prefix: &str,
+    others: &[DeploymentRecord]) -> Result<bool> {
+    erase_residence(bucket, prefix, others).await
+}
+
+async fn erase_residence(bucket: &dyn ObjectStore, prefix: &str, others: &[DeploymentRecord]) -> Result<bool> {
     require_disjoint_prefix(&key(prefix)?, others.iter())?;
     let references = References::scan(bucket, others).await?;
     for store in stores(bucket, prefix).await? { references.erase_store(bucket, &store).await?; }
@@ -533,7 +558,7 @@ mod tests {
         let retained = format!("{other_prefix}/v06/rows");
         put(&bucket, &retained, b"other deployment").await;
         let (outer, _) = other_prefix.rsplit_once('/').unwrap();
-        let error = erase_deployment(bucket.as_ref(), outer, &[other]).await.unwrap_err();
+        let error = erase_residence(bucket.as_ref(), outer, &[other]).await.unwrap_err();
         assert_eq!(error.code, "rtdb.multi/overlapping-deployment-prefix");
         assert_eq!(bucket.get(&key(&retained).unwrap()).await.unwrap(), b"other deployment".as_slice());
     }

@@ -4345,6 +4345,31 @@ def verify_native_reaper_boundary(args, source):
     print("rust-reaper-boundary: both forbidden calls failed to compile and compiled under their matching controls")
 
 
+def verify_native_residence_erasure_boundary(args, source):
+    env = os.environ | {"CARGO_TARGET_DIR": os.environ.get("CARGO_TARGET_DIR", str(ROOT / "target"))}
+    command = ["cargo", "test", "--locked", "-p", "rtdb-multi", "--doc", "reference::References"]
+    baseline = run_case_with_timeout(command, source / "rust", args.evidence, "rust-residence-erasure-boundary-baseline", env, 180)
+    if baseline.returncode or "2 passed; 0 failed" not in baseline.stdout:
+        raise ValueError("the residence erasure boundary compile-fail tests did not pass")
+    path = source / "rust/crates/multi/src/reference.rs"
+    controls = {
+        "export-residence-eraser": ("pub(crate) async fn erase_deployment(", "pub async fn erase_deployment("),
+        "generalize-simulation": ("simulate_erase_deployment(bucket: &rtdb_storage::MemoryStore",
+                                  "simulate_erase_deployment(bucket: &dyn ObjectStore"),
+    }
+    for name, (before, after) in controls.items():
+        original = path.read_bytes()
+        try:
+            replace_once(path, before, after)
+            checked = run_case_with_timeout(command, source / "rust", args.evidence, f"rust-residence-erasure-boundary-{name}", env, 180)
+        finally:
+            path.write_bytes(original)
+        if (checked.returncode != 101 or "1 passed; 1 failed" not in checked.stdout
+            or "Test compiled successfully, but it's marked `compile_fail`" not in checked.stdout):
+            raise ValueError(f"residence erasure boundary control {name} did not expose the forbidden call")
+    print("rust-residence-erasure-boundary: both forbidden calls failed to compile and compiled under their matching controls")
+
+
 def verify_checkpoint_copy_publications(args, source):
     env = os.environ | {
         "CARGO_TARGET_DIR": os.environ.get("CARGO_TARGET_DIR", str(ROOT / "target")),
@@ -4984,6 +5009,7 @@ def main():
             verify_checkpoint_copy_publications(args, source)
             verify_native_pack_retirement(args, source)
             verify_native_reaper_boundary(args, source)
+            verify_native_residence_erasure_boundary(args, source)
             verify_repair_archive_replay(args, source)
             verify_delegated_scan_replay(args, source)
             verify_fragment_residence_replay(args, source)
