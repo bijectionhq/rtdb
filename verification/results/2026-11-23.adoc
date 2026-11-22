@@ -38,3 +38,22 @@ The native fixture exercises collector replacement with an eligible catalog and 
 The maintained runner is link:../run.py[verification/run.py].
 The selected cases use link:../tla/CollectorTurnover.cfg[CollectorTurnover.cfg] and the native replay `a_replacement_collector_waits_a_whole_lease_on_its_own_clock`.
 Exact commands and logs are in `collector-turnover-tlc-wv642cbw/` and `collector-turnover-native-7y0po1n3/` under `/private/tmp/rtdb-formal.QMjPSJsX/`.
+
+The targeted suite repeated after rebase at `4bed8fe25f` in `collector-turnover-land-d9jr3wxr/`.
+The check receipt names the revision and pinned TLC and Java executables.
+
+== W1 · Transaction catalog retention through the local ledger
+
+The external transaction fixture uses two independent local store handles on the same filesystem ledger.
+It checks that the floor stays at its previous position while the resolver owns the capture.
+The writer stages a row and opens a cursor over the transaction's overlay.
+The cursor retains the captured catalog after resolution returns, still reads the row, and releases the hold on drop.
+The next attempt advances the floor.
+A source transaction attempting to use the earlier capture then receives `rtdb.storage/catalog-not-current` from the store.
+The overlay mutation fails at the assertion that the cursor retains the hold after resolution.
+All 120 transaction crate cases passed after rebase.
+Exact commands and output are under transaction-catalog-hold-pzn3x9vi/ in the evidence directory above.
+
+The fixture exercises production transaction resolution, query capture and the local directory lock protocol.
+It uses a row in the transaction overlay and no remote provider work.
+Shared admission on stores without a catalog ledger, scheduling across real elections, and transaction-cursor cancellation while a provider call drains remain open.

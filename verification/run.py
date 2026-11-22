@@ -4342,6 +4342,31 @@ def verify_native_collector_turnover(args, source):
     print("rust-collector-turnover: successor waited a full lease, and restarting the window was rejected")
 
 
+def verify_native_transaction_catalog_hold(args, source):
+    env = os.environ | {
+        "CARGO_TARGET_DIR": os.environ.get("CARGO_TARGET_DIR", str(ROOT / "target")),
+        "CARGO_PROFILE_TEST_DEBUG": "0",
+    }
+    test = "resolver::tests::a_transaction_cursor_retains_its_catalog_until_dropped"
+    command = ["cargo", "test", "--locked", "-p", "rtdb-tx", "--lib", test, "--", "--exact"]
+    baseline = run_case(command, source / "rust", args.evidence, "rust-transaction-catalog-hold", env)
+    if baseline.returncode or f"{test} ... ok" not in baseline.stdout:
+        raise ValueError("a transaction cursor must keep its catalog until drop")
+
+    path = source / "rust/crates/index/src/snapshot.rs"
+    original = path.read_bytes()
+    try:
+        marker = "        for (table, segment) in segments { next.layered"
+        replace_once(path, marker, "        next.catalog_read = None;\n" + marker)
+        control = run_case(command, source / "rust", args.evidence, "rust-transaction-cursor-without-hold", env)
+    finally:
+        path.write_bytes(original)
+    if (control.returncode != 101 or f"{test} ... FAILED" not in control.stdout
+        or "the transaction cursor must retain its catalog after resolution" not in control.stdout):
+        raise ValueError("the transaction replay did not catch loss of the catalog hold in the transaction overlay")
+    print("rust-transaction-catalog-hold: the active transaction and its cursor held the floor, and drop unblocked it")
+
+
 def verify_native_residence_trace(args, source, scratch):
     trace = (args.evidence / "rust-residence-disposal-trace.json").resolve()
     env = os.environ | {
@@ -5288,6 +5313,7 @@ def main():
         "rust/crates/maintenance/src/retirement_intent.rs",
         "rust/crates/maintenance/tests/gc.rs",
         "rust/crates/index/src/partition.rs",
+        "rust/crates/index/src/snapshot.rs",
         "rust/crates/query/src/cursor.rs",
         "rust/crates/query/src/fragment.rs",
         "rust/crates/query/src/scan.rs",
@@ -5408,6 +5434,7 @@ def main():
             verify_native_residence_trace(args, source, directory)
             verify_native_current_catalog(args, source)
             verify_native_collector_turnover(args, source)
+            verify_native_transaction_catalog_hold(args, source)
             verify_native_exact_marker(args, source)
             verify_compaction_publication_versions(args, source)
             verify_replay_prefix(args, source)

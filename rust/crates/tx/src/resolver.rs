@@ -2304,6 +2304,77 @@ mod tests {
         fn check_role_membership(&self, _: &str, _: Option<&str>) -> Result<()> { panic!("unexpected role check") }
     }
 
+    struct CapturingWriter {
+        store: Arc<rtdb_storage::LocalStore>,
+        proposed_floor: rtdb_types::CatalogCut,
+        cursor: Option<QueryCursor>,
+    }
+
+    #[async_trait]
+    impl TransactionWriter for CapturingWriter {
+        async fn write(&mut self, tx: &mut OpenTransaction<'_>) -> Result<WriterResult> {
+            use rtdb_storage::ObjectStore;
+
+            assert!(!self.store.advance_catalog_floor(self.proposed_floor).await?,
+                "an active transaction must retain its durable catalog");
+            tx.execute_sql("INSERT INTO docs RECORDS {_id: 42}", None).await?;
+            self.cursor = Some(tx.open_query("SELECT _id FROM docs", Vec::new()).await?);
+            Ok(WriterResult::Committed { user_metadata: None })
+        }
+    }
+
+    #[tokio::test]
+    async fn a_transaction_cursor_retains_its_catalog_until_dropped() {
+        use rtdb_storage::{LocalStore, ObjectStore};
+        use rtdb_types::{CatalogCut, ReplicaPosition, StorageEpoch, StorageVersion};
+
+        let directory = tempfile::tempdir().unwrap();
+        let open = || Arc::new(LocalStore::open(directory.path()).unwrap().with_catalog_ledger(StorageEpoch(0)));
+        let store = open();
+        let mut writer = CapturingWriter {
+            store: open(),
+            proposed_floor: CatalogCut {
+                storage_version: StorageVersion(6),
+                storage_epoch: StorageEpoch(0),
+                replica_epoch: StorageEpoch(0),
+                through: ReplicaPosition(1),
+            },
+            cursor: None,
+        };
+        let state = rtdb_index::PartitionState::empty(Default::default()).unwrap();
+        state.publish_catalog_cut(CatalogCut { through: ReplicaPosition(0), ..writer.proposed_floor }).unwrap();
+        let memory = MemoryBudget::new(1 << 24);
+        let context = ResolveContext {
+            owned_witness_scope: None,
+            database: "xtdb".into(),
+            storage: Arc::new(BufferPool::new(store, 1 << 20)),
+            memory: Arc::clone(&memory),
+            query_options: QueryOptions::default(),
+            scan_accelerators: Default::default(),
+            cancellation: CancellationToken::new(),
+            default_tz: "UTC".into(),
+            authorization: Arc::new(NoRoleChecks),
+            execution_observer: None,
+            tracer: None,
+        };
+
+        let mut resolver = TxResolver::new(None, SourcePosition(0), None, &memory).unwrap();
+        let outcome = resolver.resolve_external(state.snapshot(), Timestamp(100), None, None, &mut writer, &context).await.unwrap();
+        assert!(outcome.result().committed());
+        assert!(!writer.store.advance_catalog_floor(writer.proposed_floor).await.unwrap(),
+            "the transaction cursor must retain its catalog after resolution");
+        let mut cursor = writer.cursor.take().unwrap();
+        assert_eq!(cursor.next_batch().await.unwrap().unwrap().batch().num_rows(), 1);
+        assert!(cursor.next_batch().await.unwrap().is_none());
+        drop(cursor);
+        assert!(writer.store.advance_catalog_floor(writer.proposed_floor).await.unwrap());
+
+        let request = SourceTransaction::new(Vec::new(), SubmitOptions::default(), &memory).unwrap();
+        let error = resolver.resolve_source(state.snapshot(), SourcePosition(1), Timestamp(101), request, &context).await
+            .err().expect("source resolution must check catalog admission");
+        assert_eq!(error.code, "rtdb.storage/catalog-not-current");
+    }
+
     #[tokio::test]
     async fn mutation_syntax_is_charged_until_the_plan_takes_ownership() {
         let memory = MemoryBudget::new(1 << 24);

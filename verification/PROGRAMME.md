@@ -62,12 +62,14 @@ Query capture, delegated fragments and membership queries refuse unconfirmed or 
 The native query fixture also checks that offline admission needs no replica lease.
 The [collector turnover study](tla/CollectorTurnover.tla) checks fresh observation and conditional reclamation in a successor term.
 The corresponding native fixture replaces the trie collector with another clock origin and observes reclamation after the fresh lease interval.
+Source and external transaction resolution request a store catalog hold before evaluation.
+The local ledger fixture verifies that the transaction and its cursor retain the hold, then observes the floor advance after cursor drop and a subsequent stale capture refused.
 
 **Start from:** `storage/src/{read_lease,lease_decision,io_region}.rs`, `node/src/{read_currency,database,node}.rs`, `maintenance/src/gc.rs`, `index/src/partition.rs`; models `tla/{LeaseAdmission,ReaderIO,ResidenceReaderRetention}.tla`.
 
 **Open obligations:**
 
-1. Audit every other read path: leader transaction snapshots (registry only, no lease), spill and materialization, export, administrative collection, compactor reset, and ordered-index reads.
+1. Audit every other read path: leader transaction snapshots on stores without a catalog ledger, spill and materialization, export, administrative collection, compactor reset, and ordered-index reads.
 2. Audit every other deletion path against the same contract: block GC, artefact removal and repair, ordered-index storage reaping, and Multi region release, deployment removal and forks.
 3. Leadership turnover: replay a real term handoff with in-flight snapshots and cover staged release resumption and deferred physical deletion.
 4. Compose the currency, caller admission and provider drain with the collector under the model's clock and I/O premises. The [currency model](tla/ReadCurrencyAnchor.tla) checks competing tip samples, and [Verus](verus/read_currency/proof.rs) proves the production observation and confirmation steps.

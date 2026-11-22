@@ -33,3 +33,4 @@ sha2.workspace = true
 rtdb-metrics.workspace = true
 tokio.workspace = true
 rtdb-trie.workspace = true
+tempfile.workspace = true
