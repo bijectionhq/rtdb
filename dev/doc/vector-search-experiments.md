@@ -41,7 +41,7 @@ Compare exhaustive SQL, ordered-filter exact SQL, and centroid ANN at 100,000 an
 Use the public ANN-Benchmarks GloVe angular data with held-out queries.
 Sweep selectivity with random and clustered metadata.
 Record recall@10, result count, warm latency, cold object reads and bytes, build and update costs, and index bytes written per source update.
-Compare every temporal correctness case to the exact SQL path, including retained readers and rebuilds under concurrent writes.
+Compare temporal correctness to the exact SQL path, including retained readers across a concurrent write and coverage invalidation after a flush.
 
 ### Running the prototype
 
@@ -83,8 +83,11 @@ The dataset and generated binary files stay in the ignored build directory.
 The experiment loads the primary table and centroid index from the same fixed input.
 It does not yet publish an ANN generation through the replica log.
 The index retains the fixture's valid-time point and captured flushed frontier.
-It scores additional puts discovered in the actual live segment and reranks the union against the captured SQL snapshot.
-The primary scan removes stale or erased candidates and reapplies the current filter.
+The churn prototype reads the captured live segments for writes that change a row at the covered point.
+A put or delete whose valid interval contains the point shadows the indexed version of that row.
+An erase shadows the indexed version across valid time.
+Changed IDs bypass centroid selection and the static metadata summaries.
+The primary scan resolves their visible versions, reapplies predicates, and reranks them together with the untouched shortlist.
 A different valid-time point, an advanced flushed frontier, a transaction overlay, or a tail over 1,024 events takes the exact SQL path.
 A production generation would need a covered valid-time interval or an explicit schedule of validity boundaries, and durable publication and retirement tied to existing snapshot references.
 An erase must eventually retire the vector bytes as well as removing the row from search results.
@@ -94,6 +97,8 @@ An erase must eventually retire the vector bytes as well as removing the row fro
 The measurements use an Apple M4 Max, a locked Rust release build, and 100-dimensional GloVe vectors.
 Primary table queries ran against the same captured snapshots and local in-memory primary storage.
 The exact paths alternate order for each query.
+The stationary baseline below uses commit `fe910aeb7`.
+The churn experiment adds removal of stale versions before the candidate limit is applied.
 Latency cells show p50 / p95 in milliseconds.
 p95 is nearest rank and equals the largest of the twelve per-query samples.
 Cold ANN latency includes probing, local range reads and SQL reranking.

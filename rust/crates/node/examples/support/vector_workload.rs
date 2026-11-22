@@ -9,7 +9,7 @@ use rtdb_node::{NativeSession, Node};
 use rtdb_query::{PreparedQuery, QueryContext};
 use rtdb_storage::cache::BufferPool;
 use rtdb_tx::{Documents, EntityIds, TxOp};
-use rtdb_types::{BlockIndex, StructFields, TableRef, TimeUnit, Timestamp, Value};
+use rtdb_types::{BlockIndex, EventOp, StructFields, TableRef, TimeUnit, Timestamp, Value};
 use serde_json::{Value as Json, json};
 
 use super::{Identity, TickClock, bench_options, bench_services, commit, flush, sql};
@@ -84,7 +84,7 @@ impl Coverage {
         Self { rows, flushed: partition.trie_catalog().l0_max_block_index(table), system_at: partition.tx_basis().unwrap().system_time }
     }
 
-    fn tail(&self, context: &QueryContext, table: &TableRef, valid: Timestamp) -> Option<BTreeSet<i64>> {
+    fn tail(&self, context: &QueryContext, table: &TableRef, valid: Timestamp, index: &VectorIndex) -> Option<BTreeSet<i64>> {
         let [partition] = context.catalog.database("xtdb").ok()?.partitions.as_slice() else { return None };
         let system = partition.system_time_cap()?;
         if valid != VALID_AT || system < self.system_at || partition.has_overlays() ||
@@ -99,7 +99,13 @@ impl Coverage {
                 if header.system_from <= self.system_at || header.system_from > system { continue; }
                 events += 1;
                 if events > 1024 { return None; }
-                if let StoredOperation::Put(document) = segment.row(row).unwrap().event().unwrap().operation {
+                if header.op != EventOp::Erase && !(header.valid_time.lower() <= valid && valid < header.valid_time.upper()) {
+                    continue;
+                }
+                if let Some(id) = index.indexed_id(header.iid) {
+                    ids.insert(id);
+                } else if header.op == EventOp::Put {
+                    let StoredOperation::Put(document) = segment.row(row).unwrap().event().unwrap().operation else { unreachable!() };
                     let Some(Value::I64(id)) = document.get("_id") else { return None };
                     ids.insert(*id);
                 }
@@ -109,22 +115,30 @@ impl Coverage {
     }
 }
 
-async fn approximate(context: &Arc<QueryContext>, table: &TableRef, coverage: &Coverage, index: &VectorIndex,
-    cache: &BufferPool, query: &[f32], valid: Timestamp, filter: Filter, probes: usize) -> (Rows, Json) {
-    let started = Instant::now();
-    let Some(mut ids) = coverage.tail(context, table, valid) else {
-        let rows = search(context, query, valid, filter, None).await;
-        return (rows, json!({"route": "exact", "ms": started.elapsed().as_secs_f64() * 1000.0}));
-    };
-    let tail = ids.len();
-    let candidates = index.candidates(cache, query, filter, probes, 64).await;
-    assert!(candidates.ids.iter().all(|id| *id >= 0 && (*id as usize) < coverage.rows));
-    ids.extend(candidates.ids);
-    let rows = search(context, query, valid, filter, Some(&ids)).await;
-    (rows, json!({"route": "ann", "tail_put_iids": tail, "ms": started.elapsed().as_secs_f64() * 1000.0,
-        "requested_ranges": candidates.requested_ranges, "requested_bytes": candidates.requested_bytes,
-        "object_reads": candidates.object_reads, "object_bytes": candidates.object_bytes,
-        "vectors_scored": candidates.scored, "reranked": ids.len()}))
+struct CapturedIndex<'a> {
+    table: &'a TableRef,
+    coverage: &'a Coverage,
+    index: &'a VectorIndex,
+    cache: &'a BufferPool,
+}
+
+impl CapturedIndex<'_> {
+    async fn approximate(&self, context: &Arc<QueryContext>, query: &[f32], valid: Timestamp, filter: Filter, probes: usize) -> (Rows, Json) {
+        let started = Instant::now();
+        let Some(mut ids) = self.coverage.tail(context, self.table, valid, self.index) else {
+            let rows = search(context, query, valid, filter, None).await;
+            return (rows, json!({"route": "exact", "ms": started.elapsed().as_secs_f64() * 1000.0}));
+        };
+        let changed = ids.len();
+        let candidates = self.index.candidates(self.cache, query, filter, probes, 64, &ids).await;
+        assert!(candidates.ids.iter().all(|id| *id >= 0 && (*id as usize) < self.coverage.rows));
+        ids.extend(candidates.ids);
+        let rows = search(context, query, valid, filter, Some(&ids)).await;
+        (rows, json!({"route": "ann", "changed_iids": changed, "ms": started.elapsed().as_secs_f64() * 1000.0,
+            "requested_ranges": candidates.requested_ranges, "requested_bytes": candidates.requested_bytes,
+            "object_reads": candidates.object_reads, "object_bytes": candidates.object_bytes,
+            "vectors_scored": candidates.scored, "reranked": ids.len()}))
+    }
 }
 
 fn compare(expected: &Rows, observed: &Rows) -> f64 {
@@ -133,7 +147,104 @@ fn compare(expected: &Rows, observed: &Rows) -> f64 {
     matched as f64 / expected.len() as f64
 }
 
-async fn fixture(data: Embeddings, query_count: usize, filters: &[Filter], probes: &[usize]) -> Json {
+async fn compare_routes(
+    context: &Arc<QueryContext>,
+    captured: &CapturedIndex<'_>,
+    data: &Embeddings,
+    query_count: usize,
+    filters: &[Filter],
+    probes: &[usize],
+) -> Vec<Json> {
+    let exhaustive = Arc::clone(context).with_accelerators(Arc::from([]));
+    let mut samples = Vec::new();
+    for (number, query) in data.queries.chunks_exact(data.dimensions).take(query_count).enumerate() {
+        for &filter in filters {
+            let contexts = [&exhaustive, context];
+            let mut measured = [(Rows::new(), 0.0), (Rows::new(), 0.0)];
+            for order in 0..contexts.len() {
+                let position = (number + order) % contexts.len();
+                let start = Instant::now();
+                let rows = search(contexts[position], query, VALID_AT, filter, None).await;
+                measured[position] = (rows, start.elapsed().as_secs_f64() * 1000.0);
+            }
+            let [(expected, exact_ms), (ordered, ordered_ms)] = measured;
+            assert_eq!(ordered, expected, "query {number}, filter {filter:?}");
+            for &probe in probes {
+                let cold_cache = BufferPool::new(captured.index.store.clone(), 256 << 20);
+                let cold = CapturedIndex { cache: &cold_cache, ..*captured };
+                let (cold_rows, cold) = cold.approximate(context, query, VALID_AT, filter, probe).await;
+                let (warm_rows, warm) = captured.approximate(context, query, VALID_AT, filter, probe).await;
+                assert_eq!(cold_rows, warm_rows, "cache changed the result");
+                assert_eq!(cold["object_reads"], cold["requested_ranges"]);
+                assert_eq!(warm["object_reads"], 0);
+                samples.push(json!({"query": number, "filter": format!("{filter:?}"), "probes": probe,
+                    "exact_ms": exact_ms, "ordered_ms": ordered_ms, "expected_count": expected.len(),
+                    "returned": warm_rows.len(), "recall": compare(&expected, &warm_rows), "cold": cold, "warm": warm}));
+            }
+        }
+    }
+    samples
+}
+
+async fn churn(node: &Node, session: &mut NativeSession, captured: &CapturedIndex<'_>, data: &Embeddings,
+    query_count: usize, filters: &[Filter], probes: &[usize]) -> Json {
+    let query = &data.queries[..data.dimensions];
+    let all_clusters = data.centroids.len() / data.dimensions;
+    let stale = captured.index.candidates(captured.cache, query, Filter::All, all_clusters, 64, &BTreeSet::new()).await;
+    assert_eq!(stale.ids.len(), 64);
+    let removed: BTreeSet<_> = stale.ids.into_iter().collect();
+    let entity_ids = |ids: &[i64]| {
+        EntityIds::new(ids.iter().map(|id| Value::I64(*id).entity_id().unwrap()).collect(), node.memory()).unwrap()
+    };
+    let (deleted, erased): (Vec<_>, Vec<_>) = removed.iter().copied().partition(|id| id % 2 == 0);
+    let reassigned = (0..data.clusters.len()).find(|id| {
+        let (random, _) = index::groups(*id, data.clusters[*id]);
+        random >= 10 && !removed.contains(&(*id as i64))
+    }).unwrap();
+    let fresh = data.clusters.len() as i64 + 1;
+    let initial = session.query_context().await.unwrap();
+    let before = search(&initial, query, VALID_AT, Filter::All, None).await;
+    let reassigned_only = BTreeSet::from([reassigned as i64]);
+    let filter = Filter::RandomBelow(10);
+    assert!(search(&initial, query, VALID_AT, filter, Some(&reassigned_only)).await.is_empty());
+
+    let documents = Documents::new(vec![
+        document(reassigned as i64, data.vector(reassigned), 0, 0),
+        document(fresh, query, 0, 0),
+    ], node.memory()).unwrap();
+    let operations = vec![
+        TxOp::DeleteDocs { table: captured.table.clone(), ids: entity_ids(&deleted), valid_from: Some(VALID_AT), valid_to: None },
+        TxOp::EraseDocs { table: captured.table.clone(), ids: entity_ids(&erased) },
+        TxOp::PutDocs { table: captured.table.clone(), documents, valid_from: Some(VALID_AT), valid_to: None },
+    ];
+    let write = async {
+        let started = Instant::now();
+        commit(session, operations).await;
+        started.elapsed().as_secs_f64() * 1000.0
+    };
+    let (held, commit_ms) = tokio::join!(search(&initial, query, VALID_AT, Filter::All, None), write);
+    assert_eq!(held, before);
+
+    let current = session.query_context().await.unwrap();
+    assert_eq!(search(&current, query, VALID_AT, filter, Some(&reassigned_only)).await[0][0], Value::I64(reassigned as i64));
+    let expected = search(&current, query, VALID_AT, Filter::All, None).await;
+    assert_eq!(expected.len(), TOP);
+    assert_eq!(expected[0][0], Value::I64(fresh));
+    let (result, all_probes) = captured.approximate(&current, query, VALID_AT, Filter::All, all_clusters).await;
+    assert_eq!(result, expected);
+    assert!(all_probes["changed_iids"].as_u64().unwrap() >= 66);
+
+    let mut stale_ids = removed;
+    stale_ids.extend([reassigned as i64, fresh]);
+    let without_shadowing = search(&current, query, VALID_AT, Filter::All, Some(&stale_ids)).await;
+    assert!(without_shadowing.len() < TOP);
+    let samples = compare_routes(&current, captured, data, query_count, filters, probes).await;
+    json!({"deletes": deleted.len(), "erases": erased.len(), "puts": 2, "commit_ms": commit_ms,
+        "result_count_without_shadowing": without_shadowing.len(), "result_count_with_shadowing": result.len(),
+        "all_probes": all_probes, "samples": samples})
+}
+
+async fn fixture(data: Embeddings, query_count: usize, filters: &[Filter], probes: &[usize], churn_only: bool) -> Json {
     let count = data.clusters.len();
     let table = TableRef::new("public", "vectors");
     let clock = Arc::new(TickClock(AtomicI64::new(1_000_000)));
@@ -163,39 +274,16 @@ async fn fixture(data: Embeddings, query_count: usize, filters: &[Filter], probe
     database.build_artefacts().await.unwrap();
     let ordered_ms = ordered_started.elapsed().as_secs_f64() * 1000.0;
     let active = session.query_context().await.unwrap();
-    let exhaustive = Arc::clone(&active).with_accelerators(Arc::from([]));
     let coverage = Coverage::capture(&active, &table, count);
     let scratch = tempfile::tempdir().unwrap();
     let build = Instant::now();
     let index = VectorIndex::build(&data, scratch.path()).await;
     let build_ms = build.elapsed().as_secs_f64() * 1000.0;
     let cache = index.warm_cache().await;
-    let mut samples = Vec::new();
-    for (number, query) in data.queries.chunks_exact(data.dimensions).take(query_count).enumerate() {
-        for &filter in filters {
-            let contexts = [&exhaustive, &active];
-            let mut measured = [(Rows::new(), 0.0), (Rows::new(), 0.0)];
-            for order in 0..contexts.len() {
-                let position = (number + order) % contexts.len();
-                let start = Instant::now();
-                let rows = search(contexts[position], query, VALID_AT, filter, None).await;
-                measured[position] = (rows, start.elapsed().as_secs_f64() * 1000.0);
-            }
-            let [(expected, exact_ms), (ordered, ordered_ms)] = measured;
-            assert_eq!(ordered, expected, "query {number}, filter {filter:?}");
-            for &probe in probes {
-                let cold = BufferPool::new(index.store.clone(), 256 << 20);
-                let (cold_rows, cold) = approximate(&active, &table, &coverage, &index, &cold, query, VALID_AT, filter, probe).await;
-                let (warm_rows, warm) = approximate(&active, &table, &coverage, &index, &cache, query, VALID_AT, filter, probe).await;
-                assert_eq!(cold_rows, warm_rows, "cache changed the result");
-                assert_eq!(cold["object_reads"], cold["requested_ranges"]);
-                assert_eq!(warm["object_reads"], 0);
-                samples.push(json!({"query": number, "filter": format!("{filter:?}"), "probes": probe,
-                    "exact_ms": exact_ms, "ordered_ms": ordered_ms, "expected_count": expected.len(),
-                    "returned": warm_rows.len(), "recall": compare(&expected, &warm_rows), "cold": cold, "warm": warm}));
-            }
-        }
-    }
+    let captured_index = CapturedIndex { table: &table, coverage: &coverage, index: &index, cache: &cache };
+    let samples = if churn_only { Vec::new() } else {
+        compare_routes(&active, &captured_index, &data, query_count, filters, probes).await
+    };
 
     let query = &data.queries[..data.dimensions];
     let before = search(&active, query, VALID_AT, Filter::All, None).await;
@@ -205,9 +293,9 @@ async fn fixture(data: Embeddings, query_count: usize, filters: &[Filter], probe
     let newer = session.query_context().await.unwrap();
     let expected = search(&newer, query, VALID_AT, Filter::All, None).await;
     let all_clusters = index.centroids.len() / data.dimensions;
-    let (overlay, plan) = approximate(&newer, &table, &coverage, &index, &cache, query, VALID_AT, Filter::All, all_clusters).await;
+    let (overlay, plan) = captured_index.approximate(&newer, query, VALID_AT, Filter::All, all_clusters).await;
     assert_eq!(expected, overlay);
-    assert_eq!(plan["tail_put_iids"], 1);
+    assert_eq!(plan["changed_iids"], 1);
     assert_eq!(overlay[0][0], Value::I64(count as i64));
     assert_eq!(search(&active, query, VALID_AT, Filter::All, None).await, before);
 
@@ -221,19 +309,26 @@ async fn fixture(data: Embeddings, query_count: usize, filters: &[Filter], probe
 
     let corrected = session.query_context().await.unwrap();
     let expected = search(&corrected, query, VALID_AT, Filter::All, None).await;
-    let (overlay, plan) = approximate(&corrected, &table, &coverage, &index, &cache, query, VALID_AT, Filter::All, all_clusters).await;
+    let (overlay, plan) = captured_index.approximate(&corrected, query, VALID_AT, Filter::All, all_clusters).await;
     assert_eq!(plan["route"], "ann");
     assert_eq!(overlay, expected);
     assert!(overlay.iter().all(|row| ![Value::I64(-1), Value::I64(count as i64), Value::I64(affected)].contains(&row[0])));
-    let (later, fallback) = approximate(&corrected, &table, &coverage, &index, &cache, query, Timestamp(1), Filter::All, all_clusters).await;
+    let (later, fallback) = captured_index.approximate(&corrected, query, Timestamp(1), Filter::All, all_clusters).await;
     assert_eq!(fallback["route"], "exact");
     assert_eq!(later, search(&corrected, query, Timestamp(1), Filter::All, None).await);
     assert!(later.iter().any(|row| row[0] == Value::I64(-1)));
     assert!(later.iter().any(|row| row[0] == Value::I64(affected)));
 
+    let churn = if churn_only {
+        churn(&node, &mut session, &captured_index, &data, query_count, filters, probes).await
+    } else { Json::Null };
+    let expected = if churn_only {
+        let captured = session.query_context().await.unwrap();
+        search(&captured, query, VALID_AT, Filter::All, None).await
+    } else { expected };
     flush(&node).await;
     let flushed = session.query_context().await.unwrap();
-    let (after_flush, fallback) = approximate(&flushed, &table, &coverage, &index, &cache, query, VALID_AT, Filter::All, all_clusters).await;
+    let (after_flush, fallback) = captured_index.approximate(&flushed, query, VALID_AT, Filter::All, all_clusters).await;
     assert_eq!(fallback["route"], "exact");
     assert_eq!(after_flush, expected);
     index.store.close_and_wait().await;
@@ -242,14 +337,15 @@ async fn fixture(data: Embeddings, query_count: usize, filters: &[Filter], probe
 
     json!({"documents": count, "dimensions": data.dimensions, "queries": query_count,
         "load_ms": load_ms, "ordered_build_ms": ordered_ms, "ann_build_ms": build_ms,
-        "index_bytes": index.bytes, "tail_insert_ms": update_ms, "temporal_canaries": 5, "samples": samples})
+        "index_bytes": index.bytes, "iid_lookup_bytes": index.lookup_bytes(),
+        "tail_insert_ms": update_ms, "temporal_canaries": 5, "samples": samples, "churn": churn})
 }
 
-pub(super) async fn run(path: &Path, queries: usize) {
+pub(super) async fn run(path: &Path, queries: usize, churn_only: bool) {
     let data = Embeddings::read(path);
     assert!(queries > 0 && queries <= data.queries.len() / data.dimensions);
     let filters = [Filter::All, Filter::RandomBelow(1), Filter::RandomBelow(10), Filter::RandomBelow(100), Filter::ClusterBelow(10)];
-    println!("{}", fixture(data, queries, &filters, &[8, 32]).await);
+    println!("{}", fixture(data, queries, &filters, &[8, 32], churn_only).await);
 }
 
 #[cfg(test)]
@@ -259,15 +355,17 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn ann_reranks_on_the_captured_basis_and_declines_uncovered_history() {
         let data = Embeddings {
-            vectors: (1..=32).flat_map(|value| [1.0, value as f32]).collect(),
+            vectors: (1..=96).flat_map(|value| [1.0, value as f32]).collect(),
             queries: vec![1.0, 0.0],
             centroids: vec![1.0, 0.0, 0.0, 1.0],
-            clusters: (0..32).map(|row| row % 2).collect(),
+            clusters: (0..96).map(|row| row % 2).collect(),
             dimensions: 2,
         };
-        let report = fixture(data, 1, &[Filter::All, Filter::RandomBelow(10)], &[2]).await;
+        let report = fixture(data, 1, &[Filter::All, Filter::RandomBelow(10)], &[2], true).await;
         assert_eq!(report["temporal_canaries"], 5);
-        for sample in report["samples"].as_array().unwrap() {
+        assert_eq!(report["churn"]["result_count_without_shadowing"], 2);
+        assert_eq!(report["churn"]["result_count_with_shadowing"], 10);
+        for sample in report["churn"]["samples"].as_array().unwrap() {
             assert_eq!(sample["recall"], 1.0);
             assert_eq!(sample["warm"]["route"], "ann");
         }

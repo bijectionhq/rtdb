@@ -1,5 +1,5 @@
 use std::cmp::Ordering;
-use std::collections::BinaryHeap;
+use std::collections::{BTreeSet, BinaryHeap};
 use std::fs::File;
 use std::io::{BufWriter, Write};
 use std::ops::Range;
@@ -8,6 +8,7 @@ use std::sync::Arc;
 
 use futures::{StreamExt, TryStreamExt};
 use rtdb_storage::{LocalStore, ObjectKey, ObjectStore, cache::BufferPool};
+use rtdb_types::{Iid, Value};
 
 #[derive(Clone, Copy, Debug)]
 pub(super) enum Filter {
@@ -84,6 +85,7 @@ pub(super) struct VectorIndex {
     pub(super) bytes: u64,
     dimensions: usize,
     ranges: Vec<Range<u64>>,
+    ids: Vec<(Iid, i64)>,
     object: ObjectKey,
 }
 
@@ -124,7 +126,11 @@ impl VectorIndex {
         let object = ObjectKey::new("ann/vectors.bin").unwrap();
         store.put_file(&object, &stage).await.unwrap();
         std::fs::remove_file(stage).unwrap();
-        Self { store, centroids: data.centroids.clone(), bytes: offset, dimensions: data.dimensions, ranges, object }
+        let mut ids: Vec<_> = (0..data.clusters.len() as i64)
+            .map(|id| (Value::I64(id).entity_id().unwrap().iid(), id))
+            .collect();
+        ids.sort_unstable_by_key(|entry| entry.0);
+        Self { store, centroids: data.centroids.clone(), bytes: offset, dimensions: data.dimensions, ranges, ids, object }
     }
 
     pub(super) async fn warm_cache(&self) -> BufferPool {
@@ -133,7 +139,24 @@ impl VectorIndex {
         cache
     }
 
-    pub(super) async fn candidates(&self, cache: &BufferPool, query: &[f32], filter: Filter, probes: usize, limit: usize) -> Candidates {
+    pub(super) fn indexed_id(&self, iid: Iid) -> Option<i64> {
+        let slot = self.ids.binary_search_by_key(&iid, |entry| entry.0).ok()?;
+        Some(self.ids[slot].1)
+    }
+
+    pub(super) fn lookup_bytes(&self) -> usize {
+        self.ids.capacity() * std::mem::size_of::<(Iid, i64)>()
+    }
+
+    pub(super) async fn candidates(
+        &self,
+        cache: &BufferPool,
+        query: &[f32],
+        filter: Filter,
+        probes: usize,
+        limit: usize,
+        changed: &BTreeSet<i64>,
+    ) -> Candidates {
         let mut groups: Vec<_> = self.centroids.chunks_exact(self.dimensions).enumerate()
             .filter(|(id, _)| !self.ranges[*id].is_empty())
             .filter(|(id, _)| !matches!(filter, Filter::ClusterBelow(end) if cluster_group(*id) >= end))
@@ -151,6 +174,7 @@ impl VectorIndex {
         while let Some((cluster, bytes)) = reads.try_next().await.unwrap() {
             for row in bytes.as_slice().chunks_exact(4 + self.dimensions * 4) {
                 let id = u32::from_le_bytes(row[..4].try_into().unwrap()) as usize;
+                if !changed.is_empty() && changed.contains(&(id as i64)) { continue; }
                 let (random, group) = self::groups(id, cluster);
                 if !filter.accepts(random, group) { continue; }
                 let (mut dot, mut norm) = (0.0, 0.0);
