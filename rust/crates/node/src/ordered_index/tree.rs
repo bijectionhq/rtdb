@@ -27,22 +27,52 @@ const FANOUT: usize = 64;
 const PAGE_CACHE_LIMIT: usize = 8 << 20;
 type Work<'a, T> = Pin<Box<dyn Future<Output = Result<T>> + Send + 'a>>;
 
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub(super) struct Address {
+    pub iid: Iid,
+    pub key: Vec<u8>,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(super) struct AddressRef<'a> {
+    pub iid: Iid,
+    pub key: &'a [u8],
+}
+
+impl AddressRef<'_> {
+    pub fn compare(self, other: Self) -> Ordering {
+        self.key.cmp(other.key).then_with(|| {
+            if self.key.is_empty() { self.iid.cmp(&other.iid) } else { Ordering::Equal }
+        })
+    }
+    pub fn owned(self) -> Address { Address { iid: self.iid, key: self.key.to_vec() } }
+}
+
+impl Address {
+    pub fn view(&self) -> AddressRef<'_> { AddressRef { iid: self.iid, key: &self.key } }
+}
+
+impl PartialEq for Address { fn eq(&self, other: &Self) -> bool { self.cmp(other).is_eq() } }
+impl Eq for Address {}
+impl PartialOrd for Address { fn partial_cmp(&self, other: &Self) -> Option<Ordering> { Some(self.cmp(other)) } }
+impl Ord for Address { fn cmp(&self, other: &Self) -> Ordering { self.view().compare(other.view()) } }
+
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub(super) enum Key {
     Posting {
         bucket: Bucket,
         tuple: KeyRow,
-        iid: Iid,
+        address: Address,
     },
-    Row(Iid),
+    Row(Address),
     Revision(Timestamp),
 }
 
 impl Key {
     fn view(&self) -> KeyRef<'_> {
         match self {
-            Self::Posting { bucket, tuple, iid } => KeyRef::Posting(*bucket, tuple.view(), *iid),
-            Self::Row(iid) => KeyRef::Row(*iid),
+            Self::Posting { bucket, tuple, address } => KeyRef::Posting(*bucket, tuple.view(), address.view()),
+            Self::Row(address) => KeyRef::Row(address.view()),
             Self::Revision(time) => KeyRef::Revision(*time),
         }
     }
@@ -50,16 +80,17 @@ impl Key {
     fn bytes(&self) -> usize {
         size_of::<Self>()
             + match self {
-                Self::Posting { tuple, .. } => tuple.bytes(),
-                Self::Row(_) | Self::Revision(_) => 0,
+                Self::Posting { tuple, address, .. } => tuple.bytes() + address.key.len(),
+                Self::Row(address) => address.key.len(),
+                Self::Revision(_) => 0,
             }
     }
 }
 
 #[derive(Clone, Copy)]
 pub(super) enum KeyRef<'a> {
-    Posting(Bucket, Tuple<'a>, Iid),
-    Row(Iid),
+    Posting(Bucket, Tuple<'a>, AddressRef<'a>),
+    Row(AddressRef<'a>),
     Revision(Timestamp),
 }
 
@@ -70,8 +101,8 @@ impl KeyRef<'_> {
             (Posting(bucket, tuple, iid), Posting(other_bucket, other_tuple, other_iid)) => bucket
                 .cmp(&other_bucket)
                 .then_with(|| tuple.compare(other_tuple))
-                .then_with(|| iid.cmp(&other_iid)),
-            (Row(iid), Row(other)) => iid.cmp(&other),
+                .then_with(|| iid.compare(other_iid)),
+            (Row(address), Row(other)) => address.compare(other),
             (Revision(time), Revision(other)) => time.cmp(&other),
             (Posting(..), _) | (Row(_), Revision(_)) => Ordering::Less,
             _ => Ordering::Greater,
@@ -82,10 +113,10 @@ impl KeyRef<'_> {
         match self {
             Self::Posting(bucket, tuple, iid) => Key::Posting {
                 bucket,
-                iid,
+                address: iid.owned(),
                 tuple: KeyRow::Fence(tuple.iter().map(|atom| atom.owned()).collect()),
             },
-            Self::Row(iid) => Key::Row(iid),
+            Self::Row(address) => Key::Row(address.owned()),
             Self::Revision(time) => Key::Revision(time),
         }
     }
@@ -122,11 +153,12 @@ impl EntryView<'_> {
     fn bytes(self) -> usize {
         let key = size_of::<Key>()
             + match self.key {
-                KeyRef::Posting(_, tuple, _) => tuple
+                KeyRef::Posting(_, tuple, address) => address.key.len() + tuple
                     .iter()
                     .map(|cell| size_of::<Atom>() + cell.retained_bytes())
                     .sum::<usize>(),
-                _ => 0,
+                KeyRef::Row(address) => address.key.len(),
+                KeyRef::Revision(_) => 0,
             };
         key + match self.item {
             Item::Posting | Item::Revision(None) => 0,
@@ -628,8 +660,8 @@ impl Tree {
         }
     }
 
-    pub async fn spans(&self, root: &Root, iid: Iid) -> Result<Arc<[Span]>> {
-        let key = Key::Row(iid);
+    pub async fn spans(&self, root: &Root, address: &Address) -> Result<Arc<[Span]>> {
+        let key = Key::Row(address.clone());
         let mut link = root.clone();
         while let Some(page) = link.take() {
             if &key < page.first() || &key > page.last() {

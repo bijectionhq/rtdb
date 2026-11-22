@@ -15,7 +15,7 @@ use super::{
     key::{AtomRef, Bucket},
     maintenance::cancelled,
     postings::{BatchKind, KeyBatch, KeyRow, ProjectedKeys, Tuple},
-    tree::{Cursor, Hit, Item, Key, KeyRef, Link, Root, Span, Tree},
+    tree::{Address, AddressRef, Cursor, Hit, Item, Key, KeyRef, Link, Root, Span, Tree},
 };
 
 /// The roots for the partition's system-time points, with erasures applied to every affected root.
@@ -84,24 +84,24 @@ impl RevisionRoots {
             }
             let mut edits = BTreeMap::new();
             let mut cut_at_revision = false;
-            for (iid, mut events) in rows {
+            for (address, mut events) in rows {
                 if cancellation.is_cancelled() {
                     return Err(cancelled());
                 }
                 if matches!(order, EventOrder::OldestFirst) {
                     events.reverse();
                 }
-                let before = tree.spans(&root, iid).await?;
+                let before = tree.spans(&root, &address).await?;
                 let cut = events.iter().any(|event| event.header.op == EventOp::Erase);
-                let after = resolve(iid, time, &before, &events, &tree.memory)?;
+                let after = resolve(address.iid, time, &before, &events, &tree.memory)?;
                 if cut {
                     cut_at_revision = true;
                     self.stage_archived(tree, cancellation).await?;
                     for (_, historical) in self.changes.range_mut(..time) {
-                        let spans = tree.spans(historical, iid).await?;
+                        let spans = tree.spans(historical, &address).await?;
                         if !spans.is_empty() {
                             let mut removals = BTreeMap::new();
-                            project(&mut removals, iid, &spans, Arc::from([]));
+                            project(&mut removals, &address, &spans, Arc::from([]));
                             *historical = tree
                                 .edit(historical.clone(), removals.into_iter().collect())
                                 .await?;
@@ -109,7 +109,7 @@ impl RevisionRoots {
                     }
                 }
                 if before.as_ref() != after.as_slice() {
-                    project(&mut edits, iid, &before, after.into());
+                    project(&mut edits, &address, &before, after.into());
                 }
             }
             if cut_at_revision || !edits.is_empty() {
@@ -187,7 +187,7 @@ fn resolve(
     Ok(coalesced)
 }
 
-fn project(edits: &mut BTreeMap<Key, Option<Item>>, iid: Iid, before: &[Span], after: Arc<[Span]>) {
+fn project(edits: &mut BTreeMap<Key, Option<Item>>, address: &Address, before: &[Span], after: Arc<[Span]>) {
     let postings = |spans: &[Span]| -> BTreeSet<Key> {
         spans
             .iter()
@@ -195,7 +195,7 @@ fn project(edits: &mut BTreeMap<Key, Option<Item>>, iid: Iid, before: &[Span], a
                 Bucket::cover(span.valid).map(|bucket| Key::Posting {
                     bucket,
                     tuple: span.tuple.clone(),
-                    iid,
+                    address: address.clone(),
                 })
             })
             .collect()
@@ -209,7 +209,7 @@ fn project(edits: &mut BTreeMap<Key, Option<Item>>, iid: Iid, before: &[Span], a
         edits.insert(key.clone(), Some(Item::Posting));
     }
     let spans = (!after.is_empty()).then_some(Item::Row(after));
-    edits.insert(Key::Row(iid), spans);
+    edits.insert(Key::Row(address.clone()), spans);
 }
 
 pub(super) enum EventOrder {
@@ -225,7 +225,7 @@ struct Event {
 
 #[derive(Default)]
 pub(super) struct Changes {
-    revisions: BTreeMap<Timestamp, BTreeMap<Iid, Vec<Event>>>,
+    revisions: BTreeMap<Timestamp, BTreeMap<Address, Vec<Event>>>,
 }
 
 impl Changes {
@@ -240,7 +240,7 @@ impl Changes {
     ) -> Result<Root> {
         for (time, rows) in self.revisions {
             let mut edits = BTreeMap::new();
-            for (iid, mut events) in rows {
+            for (address, mut events) in rows {
                 if cancellation.is_cancelled() {
                     return Err(cancelled());
                 }
@@ -248,17 +248,17 @@ impl Changes {
                 {
                     continue;
                 }
-                let before = tree.spans(&root, iid).await?;
+                let before = tree.spans(&root, &address).await?;
                 let after = if time > system_at {
                     Vec::new()
                 } else {
                     if matches!(order, EventOrder::OldestFirst) {
                         events.reverse();
                     }
-                    resolve(iid, time, &before, &events, &tree.memory)?
+                    resolve(address.iid, time, &before, &events, &tree.memory)?
                 };
                 if before.as_ref() != after.as_slice() {
-                    project(&mut edits, iid, &before, after.into());
+                    project(&mut edits, &address, &before, after.into());
                 }
             }
             root = tree.edit(root, edits.into_iter().collect()).await?;
@@ -273,8 +273,12 @@ impl Changes {
         columns: &[String],
         memory: &Arc<MemoryBudget>,
         cancellation: &CancellationToken,
-        retain: impl Fn(EventHeader) -> bool,
+        keyed: bool,
+        retain: impl Fn(EventHeader, AddressRef<'_>) -> bool,
     ) -> Result<()> {
+        if batch.has_entity_keys() != keyed {
+            return Err(format_error("Ordered source events have the wrong physical identity layout"));
+        }
         let _headers = memory.reserve(batch.len().saturating_mul(256))?;
         let events = batch.page_events()?;
         for events in events[skip.min(events.len())..].chunks(128) {
@@ -293,10 +297,24 @@ impl Changes {
                     return Err(cancelled());
                 }
                 let header = event.header();
-                if !retain(header) {
-                    continue;
-                }
+                let address = AddressRef { iid: header.iid, key: event.entity_key().unwrap_or_default() };
+                let _key = memory.reserve(address.key.len().saturating_add(128))?;
+                let id = if keyed {
+                    Some(rtdb_types::EntityId::from_handle_bytes(address.key)?)
+                } else {
+                    None
+                };
+                if !retain(header, address) { continue; }
                 let row = if header.op == EventOp::Put {
+                    if let Some(id) = id {
+                        let Some(PutColumn::Stored(field, array, row)) = event.put_column("_id") else {
+                            return Err(format_error("Governed ordered put omitted its identity"));
+                        };
+                        let _id = memory.reserve(rtdb_columnar::estimate_copy_cell_bytes(field, array, row)?)?;
+                        if event.put_cell("_id", &rtdb_types::LogicalType::Null)?.entity_id()? != id {
+                            return Err(format_error("Governed ordered put differs from its physical identity"));
+                        }
+                    }
                     let cells = columns
                         .iter()
                         .map(|name| match event.put_column(name) {
@@ -316,7 +334,7 @@ impl Changes {
                 } else {
                     None
                 };
-                retained.push((header, row));
+                retained.push((header, address, row));
             }
             let keys = if rows.is_empty() {
                 None
@@ -339,17 +357,18 @@ impl Changes {
                     .shrink_to(keys.retained_bytes())?;
                 Some(ProjectedKeys::new(keys, allocation))
             };
-            for (header, row) in retained {
+            for (header, address, row) in retained {
+                let allocation = memory.reserve(address.key.len().saturating_add(256))?;
                 self.revisions
                     .entry(header.system_from)
                     .or_default()
-                    .entry(header.iid)
+                    .entry(address.owned())
                     .or_default()
                     .push(Event {
                         header,
                         tuple: row
                             .map(|row| keys.as_ref().expect("a put has projected keys").row(row)),
-                        _allocation: memory.reserve(256)?,
+                        _allocation: allocation,
                     });
             }
         }
@@ -392,7 +411,8 @@ mod tests {
                 &["key".into()],
                 memory,
                 cancellation,
-                |_| true,
+                events.first().is_some_and(|event| event.entity_key.is_some()),
+                |_, _| true,
             )
             .unwrap();
         changes
@@ -410,13 +430,13 @@ mod tests {
                 .await
                 .unwrap()
             {
-                let Key::Posting { tuple, iid, .. } = entry.into_entry().key else {
+                let Key::Posting { tuple, address, .. } = entry.into_entry().key else {
                     panic!("Expected posting");
                 };
                 let AtomRef::Integer(value) = tuple.view().cell(0) else {
                     panic!("Expected integer");
                 };
-                keys.push((value, iid));
+                keys.push((value, address.iid));
             }
         }
         keys.sort_unstable();
@@ -462,6 +482,40 @@ mod tests {
         }
         assert!(keys(&tree, root, Timestamp(16)).await.is_empty());
         assert_eq!(keys(&tree, pin, Timestamp(4)).await, vec![(90, iid)]);
+    }
+
+    #[tokio::test]
+    async fn an_erase_removes_only_the_complete_key_at_a_shared_iid() {
+        use rtdb_types::EntityId;
+
+        let directory = ObjectKey::new("shared-iid-index").unwrap();
+        let storage = Arc::new(BufferPool::new(Arc::new(MemoryStore::default()), 8 << 20));
+        let memory = MemoryBudget::new(32 << 20);
+        let tree = Tree::new(&storage, &directory, &memory, 0).await.unwrap();
+        let token = CancellationToken::new();
+        let mut roots = RevisionRoots::default();
+        let mut first = put(1, 0, Interval::ALL, 2);
+        let iid = first.iid;
+        first.entity_key = Some(EntityId::Integer(1).handle_bytes().into());
+        let peer_id = EntityId::Uuid(iid.0);
+        let mut peer = put(1, 0, Interval::ALL, 9);
+        let StoredOperation::Put(row) = &mut peer.operation else { unreachable!(); };
+        row.insert("_id".into(), peer_id.as_value());
+        peer.entity_key = Some(peer_id.handle_bytes().into());
+        let erase = StoredEvent {
+            entity_key: first.entity_key.clone(), iid, system_from: Timestamp(1),
+            valid_time: Interval::ALL, operation: StoredOperation::Erase, recency: None,
+        };
+        roots.apply(&tree, changes(&[first, peer], &memory, &token), EventOrder::OldestFirst, &token)
+            .await.unwrap();
+        let (_, original) = roots.at(&tree, Timestamp(0)).await.unwrap().unwrap();
+        assert_eq!(keys(&tree, original, Timestamp(0)).await, vec![(2, iid), (9, iid)]);
+        roots.apply(&tree, changes(&[erase], &memory, &token), EventOrder::OldestFirst, &token)
+            .await.unwrap();
+        for at in [0, 1] {
+            let (_, root) = roots.at(&tree, Timestamp(at)).await.unwrap().unwrap();
+            assert_eq!(keys(&tree, root, Timestamp(0)).await, vec![(9, iid)]);
+        }
     }
 
     #[tokio::test]

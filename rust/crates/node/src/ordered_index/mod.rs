@@ -26,7 +26,7 @@ pub(crate) use maintenance::OrderedIndexMaintenance;
 pub(crate) use usage::Inventory;
 
 use rtdb_format::keys::ORDERED_INDEX_ROOT as INDEX_ROOT;
-const PAGE_LAYOUT_VERSION: u8 = 6;
+const PAGE_LAYOUT_VERSION: u8 = 7;
 const CATALOG: (&str, &str) = ("xt", "ordered_indexes");
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -315,7 +315,6 @@ async fn owned_definition(
     relation: &rtdb_types::OwnedRelation,
     path: &rtdb_types::OwnedRelation,
 ) -> Result<Definition> {
-    rtdb_query::require_owned_address_coverage(context, owner, relation)?;
     let catalog = rtdb_types::OwnedRelation::path_catalog(owner);
     let target = relation.table(owner);
     let cursor =

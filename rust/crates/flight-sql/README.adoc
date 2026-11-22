@@ -257,7 +257,7 @@ Relations without a declaration continue to infer their schema.
 Use `rtdb.owned.OpenRead.v2` with an empty body to reserve one present and retain its exact applied catalog.
 The one result body contains 16 opaque handle bytes, the signed big-endian i64 Unix microsecond present, and the signed big-endian i64 ordered transaction id.
 Governed data pages carry a complete typed `_entity_key` on put, delete, and erase events. A native point probes the bounded physical locator family and resolves only its exact key.
-Older governed pages without the key require a reset. Compaction resolves each complete key independently inside an IID bucket. The writer still assigns a permanent distinct IID per key because ordered projections require that invariant.
+Older governed pages without the key require a reset. Compaction resolves each complete key independently inside an IID bucket. Covered search and ordered paths use complete identities. The writer still assigns a permanent IID through the existing registry.
 
 Send `rtdb.owned.ReadHeldPoint.v1` with those 16 handle bytes followed by the ordinary ReadPoint action body.
 The Arrow response uses the held present and valid instant on every call, including missing rows.
@@ -286,6 +286,8 @@ The key consists of distinct stored columns and ends with `_id`.
 The relation must already exist in the authenticated owner's namespace.
 A successful declaration returns the same transaction-key Arrow row as Create.
 Ordered and search path declarations can be repeated with the same complete name, owner relation and columns.
+Ordered index layout 7 stores complete typed handles in postings, correction rows and their fences.
+Rebuild older ordered index artefacts before using covered paths under this layout.
 The declaration is immutable and private to the owner's index catalog.
 Index maintenance builds the generation after declaration.
 
