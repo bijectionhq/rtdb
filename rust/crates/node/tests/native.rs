@@ -634,6 +634,15 @@ async fn owned_erase_revokes_old_holds_without_erasing_a_colliding_identity() {
     assert_eq!(changes.groups[0].touches[0].kind, OwnedChangeKind::Erase);
     assert_eq!(changes.groups[0].touches[0].id, erased);
 
+    let also_erased = session.state_mut().execute_tx(vec![TxOp::OwnedErase {
+        relation: relation.clone(), id: retained.clone(),
+    }], AutonomousTxOptions::default()).await.unwrap();
+    assert!(also_erased.committed(), "{:?}", also_erased.error());
+    let current = session.open_owned_read().await.unwrap();
+    let first_floor = purge.tx_key().system_time;
+    assert!(current.check_point_purge_floor(&relation, &erased, first_floor).await.is_ok());
+    assert!(current.check_point_purge_floor(&relation, &retained, first_floor).await.is_err());
+    drop(current);
     drop(after);
     drop(before);
     drop(session);

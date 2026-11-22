@@ -312,7 +312,9 @@ An erase row accepts the typed `_id` and an optional point observation, with no 
 The resolver refuses erase on a relation with a governed ordered, search, or unique path or a prefix-capacity rule and refuses any other mutation of the same identity in the same commit.
 Erase adds an all-history event and a distinct `erase` change entry at the ordered cut.
 It revokes reads at older cuts for the erased relation and refuses historical point and archived fallback reads preceding the identity's erase.
-Installations with owner-wide erase markers require a reset before native held reads or erasure.
+Each identity's historical floor is keyed by its full typed handle inside an independently covered purge bucket.
+Colliding locators cannot advance each other's floors.
+Installations with owner-wide markers or per-relation erase markers without complete floor coverage require a reset before historical point reads or another erase in the affected scope.
 The receipt acknowledges ordered erasure. Disposal of backing objects and keys has its own lifecycle.
 Both values belong to the same authenticated session, database, and placed writer epoch.
 The handle must still admit reads when submitted, and the witness's exclusive ordering deadline may be earlier than the request deadline.

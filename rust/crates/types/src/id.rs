@@ -121,6 +121,39 @@ impl EntityId {
         Iid(iid)
     }
 
+    /// Complete typed handle bytes. The enclosing value frames its length.
+    /// No logical identifier equality depends on the IID digest.
+    pub fn handle_bytes(&self) -> Vec<u8> {
+        let (tag, payload): (u8, &[u8]) = match self {
+            Self::String(value) => (0, value.as_bytes()),
+            Self::Keyword(value) => (1, value.as_str().as_bytes()),
+            Self::Integer(value) => {
+                let mut handle = vec![2];
+                handle.extend_from_slice(&((*value as u64) ^ (1 << 63)).to_be_bytes());
+                return handle;
+            }
+            Self::Uuid(value) => (3, value),
+        };
+        let mut handle = Vec::with_capacity(payload.len() + 1);
+        handle.push(tag);
+        handle.extend_from_slice(payload);
+        handle
+    }
+
+    pub fn from_handle_bytes(handle: &[u8]) -> Result<Self> {
+        let invalid = || Anomaly::incorrect("rtdb.owned/invalid-handle", "Invalid complete typed identity");
+        let (tag, payload) = handle.split_first().ok_or_else(invalid)?;
+        match tag {
+            0 | 1 => {
+                let value = std::str::from_utf8(payload).map_err(|_| invalid())?.to_owned();
+                Ok(if *tag == 0 { Self::String(value) } else { Self::Keyword(Keyword::from_name(value)) })
+            }
+            2 => Ok(Self::Integer((u64::from_be_bytes(payload.try_into().map_err(|_| invalid())?) ^ (1 << 63)) as i64)),
+            3 => Ok(Self::Uuid(payload.try_into().map_err(|_| invalid())?)),
+            _ => Err(invalid()),
+        }
+    }
+
     /// Candidate locators for the protected owned table registry, in probe order.
     /// The canonical locator is considered first for existing identity semantics.
     pub fn owned_locator_candidates(&self) -> impl Iterator<Item = Iid> + '_ {
@@ -188,6 +221,7 @@ const OWNED_ADDRESS_PREFIX: &str = ".addresses-";
 const OWNED_CAPACITY_PREFIX: &str = ".capacity-";
 const OWNED_FIXED_RANGE_PREFIX: &str = ".fixed-range-";
 const OWNED_PURGE_PREFIX: &str = ".purges-";
+const OWNED_PURGE_FLOOR_PREFIX: &str = ".purge-floors-";
 const OWNED_CHANGE_PREFIX: &str = ".changes-";
 
 /// A native relation provisioned in the authenticated principal's namespace.
@@ -211,6 +245,10 @@ impl OwnedRelation {
     pub fn obsolete_purge_table(owner: &str) -> TableRef { owned_table(owner, ".purges") }
 
     pub fn purge_table(&self, owner: &str) -> TableRef { owned_table(owner, &format!("{OWNED_PURGE_PREFIX}{}", self.0)) }
+
+    pub fn purge_floor_table(&self, owner: &str) -> TableRef {
+        owned_table(owner, &format!("{OWNED_PURGE_FLOOR_PREFIX}{}", self.0))
+    }
 
     pub fn address_table(&self, owner: &str) -> TableRef { owned_table(owner, &format!("{OWNED_ADDRESS_PREFIX}{}", self.0)) }
 
@@ -318,6 +356,7 @@ impl TableRef {
             && self.table.split_once('-').is_some_and(|(owner, name)| {
                 owner.len() == 64 && owner.bytes().all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
                     && (matches!(name, OWNED_PATH_CATALOG | OWNED_SEARCH_CATALOG | OWNED_RELATION_CATALOG)
+                        || name.strip_prefix(OWNED_PURGE_FLOOR_PREFIX).is_some_and(|relation| OwnedRelation::new(relation).is_ok())
                         || name.strip_prefix(OWNED_PURGE_PREFIX).is_some_and(|relation| OwnedRelation::new(relation).is_ok())
                         || name.strip_prefix(OWNED_UNIQUE_PREFIX).is_some_and(|relation| OwnedRelation::new(relation).is_ok())
                         || name.strip_prefix(OWNED_ADDRESS_PREFIX).is_some_and(|relation| {

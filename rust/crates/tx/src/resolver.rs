@@ -994,6 +994,7 @@ impl<'a> OpenTransaction<'a> {
                 }
             }
         }
+        let mut bucket = rtdb_query::read_owned_purge_bucket(Arc::clone(&context), owner, relation, id).await?;
         let locator = match rtdb_query::owned_address(context, owner, relation, id).await? {
             rtdb_query::OwnedAddress::Assigned(locator) => locator,
             rtdb_query::OwnedAddress::Vacant(_) => return Err(Anomaly::incorrect(
@@ -1005,15 +1006,16 @@ impl<'a> OpenTransaction<'a> {
         let first_erase = !self.owned_changes.get(relation.name()).is_some_and(|group| group.erased);
         self.record_owned_change(relation, id.clone(), OwnedChangeKind::Erase, Interval::ALL)?;
         self.buffer.erase(table, &EntityId::Uuid(locator.0))?;
-        self.buffer.put(relation.address_table(owner), StructFields::from([
-            ("_id".into(), Value::Uuid(locator.0)),
-            ("address".into(), id.as_value()),
-            ("purged_at".into(), Value::I64(ordered.system_time.0)),
-        ]), Interval::ALL)?;
+        let floors = relation.purge_floor_table(owner);
+        self.buffer.put(floors.clone(), bucket.advance(id, ordered.system_time)?, Interval::ALL)?;
         if first_erase {
-            self.buffer.put(relation.purge_table(owner), StructFields::from([
+            let markers = relation.purge_table(owner);
+            let through = self.snapshot()?.relation_event_frontier(&markers)?
+                .checked_add(1).ok_or_else(overflow)?;
+            self.buffer.put(markers, StructFields::from([
                 ("_id".into(), Value::I64(ordered.tx_id.0)),
             ]), Interval::ALL)?;
+            self.buffer.put(floors, rtdb_query::purge_coverage_document(through), Interval::ALL)?;
         }
         Ok(())
     }
