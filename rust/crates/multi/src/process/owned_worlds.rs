@@ -8,7 +8,7 @@ use rtdb_types::{EntityId, Interval, OwnedRelation, OwnedWorld, Result, Timestam
 use uuid::Uuid;
 
 use crate::{
-    archive::{CheckpointReadResources, HeldCheckpointWorld, WorldArchive, open_held_checkpoint_world, commit_checkpoint_world_checked, drop_checkpoint_world, fork_checkpoint_world_at, fork_checkpoint_world_selected, read_checkpoint_world_point},
+    archive::{CheckpointReadResources, HeldCheckpointWorld, WorldArchive, open_held_checkpoint_world, commit_checkpoint_world_batch, commit_checkpoint_world_checked, drop_checkpoint_world, fork_checkpoint_world_at, fork_checkpoint_world_selected, read_checkpoint_world_point},
     capability::attachment_storage,
     deployment::CellStorage,
     keys::KeyService,
@@ -107,6 +107,17 @@ impl OwnedWorldHost for PlacedWorldHost {
         Box::pin(async move {
             let deployment = self.deployment(&call)?;
             commit_checkpoint_world_checked(self.directory.as_ref(), &self.storage, call.session, deployment, world, writes, checks, controls, deadline, publication).await
+        })
+    }
+
+    fn commit_world_batch<'a>(
+        &'a self, call: WorldCall<'a>, sections: Vec<rtdb_node::OwnedWorldSection>,
+        controls: Vec<rtdb_node::HostedControlWrite>, deadline: Timestamp,
+    ) -> BoxFuture<'a, Result<TransactionKey>> {
+        Box::pin(async move {
+            let deployment = self.deployment(&call)?;
+            commit_checkpoint_world_batch(self.directory.as_ref(), &self.storage, call.session, deployment,
+                sections, controls, deadline).await
         })
     }
 

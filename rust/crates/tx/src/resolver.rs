@@ -1,5 +1,5 @@
 use rtdb_types::StructFields;
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -401,12 +401,12 @@ pub struct OpenTransaction<'a> {
     buffer: TransactionBuffer, options: &'a SubmitOptions, context: &'a ResolveContext, trace_parent: Option<rtdb_plan::SpanContext>,
     unique_changes: OwnedUniqueChanges,
     capacity_changes: OwnedCapacityChanges,
-    owned_world: Option<(rtdb_types::OwnedWorld, Arc<MemoryReservation>)>,
+    owned_worlds: BTreeMap<Iid, (rtdb_types::OwnedWorld, Arc<MemoryReservation>)>,
     owned_changes: BTreeMap<String, PendingOwnedChanges>,
 }
 impl<'a> OpenTransaction<'a> {
     fn new(base: Snapshot, key: TransactionKey, options: &'a SubmitOptions, context: &'a ResolveContext) -> Result<Self> {
-        Ok(Self { buffer: TransactionBuffer::new(base, key, Arc::clone(&context.memory))?, options, context, trace_parent: None, unique_changes: OwnedUniqueChanges::default(), capacity_changes: OwnedCapacityChanges::default(), owned_world: None, owned_changes: BTreeMap::new() })
+        Ok(Self { buffer: TransactionBuffer::new(base, key, Arc::clone(&context.memory))?, options, context, trace_parent: None, unique_changes: OwnedUniqueChanges::default(), capacity_changes: OwnedCapacityChanges::default(), owned_worlds: BTreeMap::new(), owned_changes: BTreeMap::new() })
     }
     pub fn tx_key(&self) -> TransactionKey { self.buffer.tx_key() }
     pub fn snapshot(&self) -> Result<Snapshot> { self.buffer.snapshot() }
@@ -861,19 +861,38 @@ impl<'a> OpenTransaction<'a> {
             }
         }
         let unavailable = rtdb_types::OwnedWorld::unavailable;
+        let publications = operations.iter().filter_map(|operation| match operation {
+            Operation::Public(TxOp::OwnedPublishWorld { world, attempt, fingerprint, advance_to, drop_world, .. }) =>
+                Some((*world, attempt, *fingerprint, *advance_to, *drop_world)),
+            _ => None,
+        }).take(9).collect::<Vec<_>>();
+        let world_batch = publications.len() > 1;
+        if publications.len() > 8 { return Err(unavailable()); }
         let mut scoped = operations.iter().filter_map(Operation::owned_relation);
+        let mut admitted = BTreeSet::new();
         if let Some(first) = scoped.next() {
             let world = first.world();
-            if scoped.any(|relation| relation.world() != world || relation.is_world_catalog() != first.is_world_catalog()) {
-                return Err(unavailable());
+            if world_batch {
+                admitted.insert(world.ok_or_else(unavailable)?);
+                for relation in scoped {
+                    admitted.insert(relation.world().ok_or_else(unavailable)?);
+                    if admitted.len() > 8 { return Err(unavailable()); }
+                }
+            } else {
+                if scoped.any(|relation| relation.world() != world || relation.is_world_catalog() != first.is_world_catalog()) {
+                    return Err(unavailable());
+                }
+                admitted.extend(world);
             }
-            if let Some(world) = world {
-                let context = self.context.query_context(self.snapshot()?, self.tx_key().system_time, &self.options.default_tz, self.trace_parent)?;
-                let record = rtdb_query::read_owned_world(context, owner, world).await?.ok_or_else(unavailable)?;
+        }
+        if !admitted.is_empty() {
+            let context = self.context.query_context(self.snapshot()?, self.tx_key().system_time, &self.options.default_tz, self.trace_parent)?;
+            for world in admitted {
+                let record = rtdb_query::read_owned_world(Arc::clone(&context), owner, world).await?.ok_or_else(unavailable)?;
                 if record.0.dropped || self.tx_key().system_time >= record.0.until {
                     return Err(unavailable());
                 }
-                self.owned_world = Some(record);
+                self.owned_worlds.insert(world, record);
             }
         }
         if deadline.is_some_and(|until| self.tx_key().system_time >= until) {
@@ -900,56 +919,67 @@ impl<'a> OpenTransaction<'a> {
                 return Err(unavailable());
             }
         }
-        let mut publications = operations.iter().filter_map(|operation| match operation {
-            Operation::Public(TxOp::OwnedPublishWorld { world, advance_to, drop_world, .. }) => Some((*world, *advance_to, *drop_world)),
-            _ => None,
-        });
-        if let Some((world, advance_to, drop_world)) = publications.next() {
-            let scoped_check = operations.iter().any(|operation| matches!(operation, Operation::Public(TxOp::OwnedCheckWorldScope { .. })));
-            let mut point_checks = operations.iter().enumerate().filter_map(|(index, operation)| {
-                let Operation::Public(TxOp::OwnedCheck { relation, .. }) = operation else { return None; };
-                Some(relation.world() == Some(world) && index.checked_sub(1).is_some_and(|previous|
-                    matches!(&operations[previous], Operation::Public(TxOp::OwnedCheckWorldPurge { relation: guarded, .. }) if guarded == relation)))
-            });
-            let guarded_points = point_checks.next() == Some(true) && point_checks.all(|paired| paired);
-            let mut rows = 0usize;
-            let mut witnesses = 0usize;
+        if !publications.is_empty() {
+            let mut effects = publications.len(); // One immutable attempt per publication.
+            let mut scoped_checks = 0;
             let mut hosted = false;
-            let mut effects = 1usize; // The source publication operation materializes two effects.
-            for operation in operations {
+            let mut counts = BTreeMap::<Iid, (usize, usize)>::new();
+            for (index, operation) in operations.iter().enumerate() {
                 let size = match operation {
                     Operation::Public(TxOp::OwnedReplaceDocs { relation, documents, .. })
                     | Operation::OwnedWriteIids { relation, documents, create_only: false, .. }
-                        if relation.world() == Some(world) && !documents.rows().is_empty() => {
-                        rows = rows.saturating_add(documents.rows().len());
-                        documents.rows().len()
+                        if !documents.rows().is_empty() => {
+                        let world = relation.world().ok_or_else(unavailable)?;
+                        let count = documents.rows().len();
+                        counts.entry(world).or_default().0 += count;
+                        count
                     }
-                    Operation::Public(TxOp::OwnedCheck { .. }) => {
-                        witnesses += 1;
+                    Operation::Public(TxOp::OwnedCheck { relation, .. }) => {
+                        let world = relation.world().ok_or_else(unavailable)?;
+                        if !index.checked_sub(1).is_some_and(|previous|
+                            matches!(&operations[previous], Operation::Public(TxOp::OwnedCheckWorldPurge { relation: guarded, .. }) if guarded == relation))
+                        {
+                            return Err(unavailable());
+                        }
+                        counts.entry(world).or_default().1 += 1;
                         1
                     }
                     Operation::Public(TxOp::HostedControl(control)) if control.is_check() => {
                         hosted = true;
                         1
                     }
-                    Operation::Public(TxOp::OwnedCheckWorldScope { .. } | TxOp::OwnedDeadline { .. }
-                        | TxOp::OwnedCheckWorldPurge { .. } | TxOp::OwnedPublishWorld { .. }) => 1,
+                    Operation::Public(TxOp::OwnedCheckWorldScope { .. }) => {
+                        scoped_checks += 1;
+                        1
+                    }
+                    Operation::Public(TxOp::OwnedDeadline { .. } | TxOp::OwnedCheckWorldPurge { .. } | TxOp::OwnedPublishWorld { .. }) => 1,
                     _ => return Err(unavailable()),
                 };
                 effects = effects.saturating_add(size);
+                if effects > 4096 { return Err(unavailable()); }
             }
-            if publications.next().is_some() || deadline.is_none() || (rows == 0) != (advance_to.is_some() || drop_world) || drop_world && advance_to.is_some()
-                || !scoped_check || !guarded_points || !hosted || witnesses > 128 || effects > 4096
-                || self.owned_world.as_ref().is_none_or(|(record, _)| record.id != world)
+            if deadline.is_none() || scoped_checks != 1 || !hosted
+                || counts.len() != publications.len() || self.owned_worlds.len() != publications.len()
             {
                 return Err(unavailable());
+            }
+            let fingerprint = publications[0].2;
+            let mut attempts = BTreeSet::new();
+            for (world, attempt, own_fingerprint, advance_to, drop_world) in publications {
+                let (rows, witnesses) = counts.remove(&world).ok_or_else(unavailable)?;
+                if witnesses == 0 || witnesses > 128 || !attempts.insert(attempt) || own_fingerprint != fingerprint
+                    || (rows == 0) != (advance_to.is_some() || drop_world)
+                    || drop_world && advance_to.is_some() || world_batch && (advance_to.is_some() || drop_world)
+                {
+                    return Err(unavailable());
+                }
             }
         }
         self.check_hosted_controls(operations, source_scope).await?;
         self.check_capacity_source(operations).await?;
         for operation in operations {
             if let Operation::Public(TxOp::OwnedCheckWorldScope { scope }) = operation {
-                if self.owned_world.is_none() || deadline.is_none()
+                if self.owned_worlds.is_empty() || deadline.is_none()
                     || Some(*scope) != source_scope || Some(*scope) != self.context.owned_witness_scope
                 {
                     return Err(Anomaly::new(AnomalyCategory::Conflict, "rtdb.owned/world-witness-unavailable",
@@ -960,7 +990,7 @@ impl<'a> OpenTransaction<'a> {
             if let Operation::Public(TxOp::OwnedCheckWorldPurge { relation, frontier }) = operation {
                 let root = relation.root_relation().ok_or_else(unavailable)?;
                 let base = self.buffer.base_snapshot();
-                if self.owned_world.is_none() || *frontier < 0
+                if relation.world().is_none_or(|world| !self.owned_worlds.contains_key(&world)) || *frontier < 0
                     || base.contains_table(&rtdb_types::OwnedRelation::obsolete_purge_table(owner))
                     || base.relation_event_frontier(&root.purge_table(owner))? != *frontier
                 {
@@ -1040,7 +1070,7 @@ impl<'a> OpenTransaction<'a> {
     ) -> Result<()> {
         use rtdb_types::{OwnedRelation, OwnedWorld};
         let owner = self.options.user.as_deref().filter(|owner| !owner.is_empty()).ok_or_else(no_owned_principal)?;
-        let basis = self.owned_world.as_ref().filter(|(record, _)| record.id == world)
+        let basis = self.owned_worlds.get(&world)
             .ok_or_else(OwnedWorld::unavailable)?.0.basis.system_time;
         let snapshot = self.buffer.base_snapshot();
         let context = self.context.query_context(snapshot, self.tx_key().system_time, &self.options.default_tz, self.trace_parent)?;
@@ -1068,7 +1098,7 @@ impl<'a> OpenTransaction<'a> {
                 ("_id".into(), Value::Uuid(world.0)), ("clock".into(), Value::I64(next.0)),
             ]), Interval::ALL);
         }
-        let mut terminal = self.owned_world.as_ref().ok_or_else(OwnedWorld::unavailable)?.0.record();
+        let mut terminal = self.owned_worlds.get(&world).ok_or_else(OwnedWorld::unavailable)?.0.record();
         terminal.insert("dropped".into(), Value::Bool(true));
         let documents = crate::Documents::new(vec![terminal], &self.context.memory)?;
         self.write_owned(&OwnedRelation::world_catalog(), &documents, None, None, None, false).await
@@ -1236,8 +1266,8 @@ impl<'a> OpenTransaction<'a> {
             if create_only || from >= to || !documents.has_exact_presence() {
                 return Err(unavailable());
             }
-            let (record, _) = self.owned_world.as_ref().ok_or_else(unavailable)?;
-            if Some(record.id) != relation.world() { return Err(unavailable()); }
+            let world = relation.world().ok_or_else(unavailable)?;
+            let (record, _) = self.owned_worlds.get(&world).ok_or_else(unavailable)?;
             let schema = record.schemas.relation(&root)
                 .ok_or_else(|| Anomaly::incorrect("rtdb.owned/world-undeclared", "World writes require a schema retained from the parent cut"))?;
             schema.require_write_validity(true)?;

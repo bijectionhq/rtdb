@@ -79,7 +79,7 @@ mod replica_suffix;
 pub(crate) use replica_suffix::{MAX_SUFFIX_ENTRIES, capture as capture_replica_suffix};
 mod read_world;
 mod writable_world;
-pub(crate) use writable_world::{commit_checkpoint_world_checked, fork_checkpoint_world_at, fork_checkpoint_world_selected, HeldCheckpointWorld, WorldArchive, open_held_checkpoint_world};
+pub(crate) use writable_world::{commit_checkpoint_world_batch, commit_checkpoint_world_checked, fork_checkpoint_world_at, fork_checkpoint_world_selected, HeldCheckpointWorld, WorldArchive, open_held_checkpoint_world};
 pub use writable_world::{WorldFact, WorldPoint, commit_checkpoint_world, drop_checkpoint_world, fork_checkpoint_world, read_checkpoint_world_point};
 pub use read_world::{CheckpointPoint, CheckpointReadResources, CheckpointReadWorld, read_checkpoint_owned_point};
 pub(crate) use retirement::{finish_capture_retirement, require_capture_open, retire_capture};
