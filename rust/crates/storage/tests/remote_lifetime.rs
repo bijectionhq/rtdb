@@ -5,7 +5,7 @@ use std::{fmt, future::{Future, poll_fn}, pin::Pin, sync::{Arc, atomic::{AtomicU
 use async_trait::async_trait;
 use bytes::Bytes;
 use futures::{StreamExt, TryStreamExt, stream::BoxStream};
-use object_store::{CopyOptions, GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStore as ProviderStore, ObjectStoreExt, PutMultipartOptions, PutOptions, PutPayload, PutResult, UploadPart, memory::InMemory, path::Path};
+use object_store::{CopyOptions, GetOptions, GetResult, GetResultPayload, ListResult, MultipartUpload, ObjectMeta, ObjectStore as ProviderStore, ObjectStoreExt, PutMultipartOptions, PutOptions, PutPayload, PutResult, UploadPart, memory::InMemory, path::Path};
 use rtdb_columnar::MemoryBudget;
 use rtdb_storage::{Error, IoRegion, ObjectKey, ObjectStore, ReadReservation, remote::{PublicationJournal, PublicationResult, PublicationUploads, RemoteStore}};
 use tokio::sync::Semaphore;
@@ -30,6 +30,7 @@ struct Hooks {
     abort: Option<Arc<Gate>>,
     delete: Option<Arc<Gate>>,
     read: Option<Arc<Gate>>,
+    read_body: Option<Arc<Gate>>,
     fail_part: Option<usize>,
     fail_abort: bool,
     fail_delete: bool,
@@ -110,7 +111,15 @@ impl ProviderStore for ControlledStore {
         if !options.head { if let Some(gate) = &self.hooks.read { gate.enter().await; } }
         let version = if options.head { self.hooks.head_version } else { self.hooks.read_version };
         let etag = if options.head { self.hooks.head_etag } else { self.hooks.read_etag };
+        let gate = if options.head { None } else { self.hooks.read_body.clone() };
         let mut result = self.inner.get_opts(location, options).await?;
+        if let Some(gate) = gate {
+            let GetResultPayload::Stream(body) = result.payload else { unreachable!("in-memory provider returns a stream") };
+            result.payload = GetResultPayload::Stream(futures::stream::once(async move {
+                gate.enter().await;
+                Ok::<_, object_store::Error>(body)
+            }).try_flatten().boxed());
+        }
         if let Some(version) = version { result.meta.version = Some(version.into()); }
         if let Some(etag) = etag { result.meta.e_tag = Some(etag.into()); }
         Ok(result)
@@ -571,6 +580,31 @@ async fn cancelled_reserved_range_keeps_its_charge_until_the_provider_finishes()
     assert_pending(close.as_mut()).await; assert_eq!(memory.used_bytes(), 4);
     gate.release(); bounded(close).await;
     assert_eq!(memory.used_bytes(), 0);
+}
+
+#[tokio::test]
+async fn cancelled_remote_body_keeps_its_catalog_owner_until_the_provider_drains() {
+    let gate = Gate::new();
+    let provider = ControlledStore::new(Hooks { read_body: Some(Arc::clone(&gate)), ..Default::default() });
+    provider.inner.put(&Path::from("data.arrow"), Bytes::from_static(b"catalog data").into()).await.unwrap();
+    let root = IoRegion::new();
+    let store = RemoteStore::new_in(provider, None, root.child());
+    let key = ObjectKey::new("data.arrow").unwrap();
+    let owner = Arc::new(());
+    let held = Arc::downgrade(&owner);
+    let mut request = Box::pin(IoRegion::retaining(owner, store.get_fresh_exact(&key, 12)));
+    assert_pending(request.as_mut()).await;
+    gate.arrived().await;
+
+    drop(request);
+    let mut drain = Box::pin(root.close_and_wait());
+    assert_pending(drain.as_mut()).await;
+    assert!(held.upgrade().is_some(), "the response body still needs the catalog owner");
+    assert!(matches!(store.head(&key).await, Err(Error::Closed(_))));
+
+    gate.release();
+    bounded(drain).await;
+    assert!(held.upgrade().is_none(), "provider completion must release the last catalog owner");
 }
 
 #[tokio::test]

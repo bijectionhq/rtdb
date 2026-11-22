@@ -94,3 +94,12 @@ There were 3,198 standard and 3,348 property passes with zero failures, errors o
 All 398 JVM binding cases passed, including the native binding cases.
 The run emitted no reflection or boxed math warnings.
 The retained output is transaction-catalog-hold-pzn3x9vi/gradle-full-with-ffi.log.
+
+== W1 · Remote provider response drain
+
+The production remote adapter admits a read into a child I/O region and consumes the response body within that operation.
+The native fixture pauses the response stream, drops the caller and starts draining the parent region.
+The catalog owner remains alive and the drained region refuses new provider requests while the response is pending.
+Finishing the stream releases the owner and completes the drain.
+All 15 remote lifetime tests passed against the production adapter and a controlled in-memory provider.
+The fixture exercises the provider response stream in-process.
