@@ -116,44 +116,14 @@ impl OpenTransaction<'_> {
                     "A hosted control row must appear once per commit",
                 ));
             }
-            let mut cursor =
-                rtdb_query::open_hosted_control_point(Arc::clone(&context), table, control.id())
-                    .await?
-                    .ok_or_else(unavailable)?;
-            let mut revision = None;
-            while let Some(batch) = cursor.next_batch().await? {
-                let batch = batch.batch();
-                if batch.num_rows() == 0 {
-                    continue;
-                }
-                if batch.num_rows() != 1 || revision.is_some() {
-                    return Err(unavailable());
-                }
-                let column = |name| {
-                    let (index, field) = batch
-                        .schema_ref()
-                        .column_with_name(name)
-                        .ok_or_else(unavailable)?;
-                    rtdb_columnar::read_value(field, batch.column(index).as_ref(), 0)
-                };
-                if !matches!(
-                    column("_valid_from")?,
-                    Value::Timestamp {
-                        value: 0,
-                        unit: TimeUnit::Microsecond,
-                        ..
-                    }
-                ) || column("_valid_to")? != Value::Null
-                {
-                    return Err(unavailable());
-                }
-                revision = Some(rtdb_query::owned_row_revision(
-                    batch,
-                    0,
-                    control.id(),
-                    &self.context.memory,
-                )?);
-            }
+            let point = rtdb_query::read_hosted_control_point(
+                Arc::clone(&context),
+                table,
+                control.id(),
+                false,
+            )
+            .await?;
+            let revision = point.row.map(|(_, revision)| revision);
             if revision != control.expected() {
                 return Err(Anomaly::new(
                     AnomalyCategory::Conflict,

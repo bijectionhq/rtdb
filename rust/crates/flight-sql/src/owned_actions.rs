@@ -518,13 +518,7 @@ impl Service {
     }
 
     pub(crate) async fn commit_hosted_controls_action(&self, call: &Call, body: &[u8], counted: bool) -> Result<ActionResult, Status> {
-        let policy = self.0.config.hosted_controls.as_ref().ok_or_else(unsupported)?;
-        if !self.0.config.owned_native_actions || call.session.placed_database() != Some(call.database.as_str())
-            || call.session.caller.principal.user_id() != Some(policy.owner.as_str())
-            || matches!(call.session.caller.owner, crate::state::Owner::Anonymous)
-        {
-            return Err(Status::permission_denied("Hosted controls require the installed placed writer"));
-        }
+        let policy = self.hosted_control_policy(call)?;
         let (condition, body, _condition_charge) = if counted {
             let (condition, body, reservation) = owned_count_condition(call, body)?;
             (Some(condition), body, Some(reservation))
@@ -542,17 +536,11 @@ impl Service {
         let facts = owned_groups(facts, false, true)?;
         let controls = owned_groups(controls, true, false)?;
         let fact_relations = facts.iter().map(|(relation, _)| relation).collect::<BTreeSet<_>>();
-        if fact_relations.len() + controls.len() > MAX_COMMIT_GROUPS
-            || controls.iter().any(|(relation, _)| !policy.relations.contains(relation.name()))
-        {
+        if fact_relations.len() + controls.len() > MAX_COMMIT_GROUPS {
             return Err(Status::permission_denied("Hosted control targets are outside the installed allowlist"));
         }
-        let connection = self.connection(call, &call.database).await?;
-        let native = connection.borrow().await?;
-        require_idle(&native)?;
-        let scope = native.placed_history().map_err(status)?
-            .ok_or_else(|| Status::failed_precondition("Hosted controls require live ordered placement"))?;
-        drop(native);
+        hosted_control::admit_control_targets(policy, controls.iter().map(|(relation, _)| relation))?;
+        let scope = self.hosted_control_scope(call).await?;
 
         let mut rows_left = MAX_GROUPED_COMMIT_ROWS;
         let mut writes = vec![TxOp::OwnedDeadline { until: deadline }];

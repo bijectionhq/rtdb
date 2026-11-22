@@ -612,6 +612,7 @@ impl QueryCursor {
     /// Batch fields derived from this execution's pinned catalog, before any rows are read.
     /// The advertised result fields remain available through `schema`.
     pub fn runtime_schema(&self) -> &Schema { self.runtime_schema.schema() }
+    pub(crate) fn retained_runtime_schema(&self) -> Arc<RuntimeSchema> { Arc::clone(&self.runtime_schema) }
     pub fn cancel(&mut self) { self.context.cancellation.cancel(); self.finish_trace(); self.sample = None; }
     /// Encodes one batch before returning to the transport. The encoder must
     /// return detached wire data and must not retain the borrowed Arrow buffers.

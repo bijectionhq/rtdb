@@ -20,6 +20,7 @@ impl Service {
                 crate::owned_actions::DECLARE_OWNED_PATH_V1 => Ok(vec![Ok(self.declare_owned_path_action(&call, &action.body).await?)]),
                 crate::owned_actions::CREATE_OWNED_V1 => Ok(vec![Ok(self.create_owned_action(&call, &action.body).await?)]),
                 crate::owned_actions::COMMIT_HOSTED_COUNTED_V1 => Ok(vec![Ok(self.commit_hosted_controls_action(&call, &action.body, true).await?)]),
+                crate::owned_actions::READ_HELD_HOSTED_CONTROL_V1 => Ok(vec![Ok(self.read_held_hosted_control_action(&call, &action.body).await?)]),
                 crate::owned_actions::COMMIT_HOSTED_V1 => Ok(vec![Ok(self.commit_hosted_controls_action(&call, &action.body, false).await?)]),
                 crate::owned_actions::COMMIT_OWNED_V1 => Ok(vec![Ok(self.commit_owned_action(&call, &action.body, crate::owned_actions::CommitFormat::Single).await?)]),
                 crate::owned_actions::COMMIT_OWNED_V2 => Ok(vec![Ok(self.commit_owned_action(&call, &action.body, crate::owned_actions::CommitFormat::Grouped).await?)]),
