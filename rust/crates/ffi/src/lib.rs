@@ -250,7 +250,7 @@ pub unsafe extern "C" fn rtdb_v1_statement_prepare(handle: u64, operation: u64, 
 pub unsafe extern "C" fn rtdb_v1_statement_bind(handle: u64, array: *mut FFI_ArrowArray, schema: *mut FFI_ArrowSchema, error: *mut u64) -> i32 {
     unsafe { call(error, || {
         let statement = handles::statement(handle)?; let _admitted = statement.session.region.enter()?;
-        let rows = arrow::import_rows(output(array)?, output(schema)?, statement.session.region.memory())?;
+        let rows = arrow::import_arguments(output(array)?, output(schema)?, statement.session.region.memory())?;
         statement.bind(rows)
     }) }
 }
@@ -265,7 +265,7 @@ pub unsafe extern "C" fn rtdb_v1_statement_bind_transit(handle: u64, input: *con
         let arguments = rtdb_tx::SqlArguments::from_rows(rows, memory)?;
         let reservation = memory.reserve(add(mul(arguments.types().len(), 64)?, 4096)?)?;
         let names = (0..arguments.types().len()).map(|index| format!("${}", index + 1)).collect();
-        statement.bind(arrow::ImportedRows { arguments, names, _reservation: reservation })
+        statement.bind(arrow::BoundArguments { arguments, names, _reservation: reservation })
     }) }
 }
 #[unsafe(no_mangle)]

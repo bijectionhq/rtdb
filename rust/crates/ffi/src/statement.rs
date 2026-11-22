@@ -6,11 +6,11 @@ use rtdb_node::{ControlExecutionOptions, ControlFrontend, ControlResult, NativeS
 use rtdb_plan::ControlStatement;
 use rtdb_query::QueryCursor;
 use rtdb_sql::{AdmittedControl, parse_admitted_control_in};
-use rtdb_tx::{Documents, SqlArguments, TxOp};
+use rtdb_tx::{ArrowDocuments, Documents, SqlArguments, TxOp};
 use rtdb_types::{Anomaly, LogicalType, Result, TableRef, Value};
 use tokio_util::sync::CancellationToken;
 use rtdb_types::StructFields;
-use crate::{arrow::ImportedRows, region::EmbeddedRegion};
+use crate::{arrow::BoundArguments, region::EmbeddedRegion};
 
 pub(crate) struct SessionHandle {
     pub region: Arc<EmbeddedRegion>,
@@ -37,7 +37,7 @@ enum Source {
     Show { statement: AdmittedControl, prepared: bool },
     Bulk { table: TableRef, _name_reservation: Arc<MemoryReservation> },
 }
-struct StatementState { source: Source, bound: Option<ImportedRows> }
+struct StatementState { source: Source, bound: Option<BoundArguments> }
 pub(crate) struct StatementHandle {
     pub session: Arc<SessionHandle>,
     creation_database: String,
@@ -90,7 +90,7 @@ impl StatementHandle {
         Ok(StatementState { source, bound: None })
     }
     pub fn close(&self) { self.state.lock().take(); }
-    pub fn bind(&self, values: ImportedRows) -> Result<()> {
+    pub fn bind(&self, values: BoundArguments) -> Result<()> {
         self.session.ensure_open()?;
         self.state.lock().as_mut().ok_or_else(super::closed)?.bound = Some(values); Ok(())
     }
@@ -163,8 +163,15 @@ impl StatementHandle {
                         *prepared = Some(PreparedSql::prepare(text, &context, Default::default(), ResultSignaturePolicy::Dynamic)?);
                     }
                     let context = session.query_context_for(&self.creation_database, token).await?;
+                    let prepared = prepared.as_ref().ok_or_else(not_prepared)?;
+                    check_argument_row_count(args)?;
+                    if let Some(args) = args
+                        && let Some(page) = args.single_arrow_page()
+                        && let Some(cursor) = prepared.try_open_parameter_projection(Arc::clone(&context), page, args.types()).await? {
+                        return Ok(cursor);
+                    }
                     let values = argument_row(args, self.session.region.memory())?;
-                    prepared.as_ref().ok_or_else(not_prepared)?.open_query_columns_typed(context, values.0, args.map(SqlArguments::types).unwrap_or_default()).await
+                    prepared.open_query_columns_typed(context, values.0, args.map(SqlArguments::types).unwrap_or_default()).await
                 }
                 Source::Show { statement: control, prepared } => {
                     if !*prepared && args.is_some() { return Err(Anomaly::incorrect("xtdb.adbc/bind-without-prepare", "Call prepare before executing with bound arguments")); }
@@ -207,6 +214,18 @@ impl StatementHandle {
                 Source::Bulk { table, .. } => {
                     let Some(bound) = state.bound.take() else { return Ok(0); };
                     let count = i64::try_from(bound.arguments.row_count()).map_err(|_| super::invalid("Bulk row count exceeds i64"))?;
+                    if let Some(page) = bound.arguments.single_arrow_page() {
+                        match ArrowDocuments::from_ingest_batch(page, self.session.region.memory()) {
+                            Ok(Some(documents)) => {
+                                let operation = TxOp::PutArrowDocs { table: table.clone(), documents };
+                                token.run_until_cancelled(session.state_mut().execute_operation(operation)).await.ok_or_else(super::cancelled)??;
+                                return Ok(count);
+                            }
+                            Ok(None) => {}
+                            Err(error) if error.code == "rtdb/memory-budget-exceeded" => {}
+                            Err(error) => return Err(error),
+                        }
+                    }
                     let node = super::add(super::mul(std::mem::size_of::<(String, Value)>(), 16)?, 256)?;
                     let bytes = bound.arguments.rows().try_fold(4096, |bytes, row| {
                         bound.names.iter().zip(row?.iter()).try_fold(bytes, |bytes, (name, value)| {
@@ -227,12 +246,18 @@ impl StatementHandle {
     }
 }
 fn argument_row(arguments: Option<&SqlArguments>, memory: &Arc<rtdb_columnar::MemoryBudget>) -> Result<(Vec<Value>, Arc<MemoryReservation>)> {
+    check_argument_row_count(arguments)?;
     let Some(arguments) = arguments else { return Ok((Vec::new(), memory.reserve(0)?)); };
-    if arguments.row_count() != 1 { return Err(Anomaly::incorrect("xtdb/incorrect-arg-count", "A query or SET requires one argument row")); }
     let row = arguments.rows().next().ok_or_else(|| super::invalid("Argument row is missing"))??;
     let bound = row.iter().try_fold(1024, |bytes, value| super::add(bytes, value.retained_bytes()?))?;
     let reservation = memory.reserve(bound)?;
     Ok((row.to_vec(), reservation))
+}
+fn check_argument_row_count(arguments: Option<&SqlArguments>) -> Result<()> {
+    if arguments.is_some_and(|arguments| arguments.row_count() != 1) {
+        return Err(Anomaly::incorrect("xtdb/incorrect-arg-count", "A query or SET requires one argument row"));
+    }
+    Ok(())
 }
 fn not_prepared() -> Anomaly { Anomaly::incorrect("xtdb.adbc/not-prepared", "Call prepare first") }
 

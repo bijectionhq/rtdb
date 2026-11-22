@@ -12,7 +12,7 @@ use rtdb_sql::StaticMutationKind;
 
 use crate::{ArrowDocuments, Documents, SourceTransaction, SqlArguments, SubmitOptions, TxOp};
 use crate::source::Operation;
-use crate::values::plain_scalar_field;
+use crate::values::{canonical_argument_column, plain_scalar_field};
 
 struct SubmissionCatalog<'a>(&'a str);
 impl Catalog for SubmissionCatalog<'_> {
@@ -298,35 +298,6 @@ fn projected_arrow_documents(input: &Relation, pages: &[&RecordBatch], memory: &
     let projection = RecordBatch::try_new(Arc::new(arrow_schema::Schema::new(fields)), columns)
         .map_err(|error| Anomaly::fault("rtdb.tx/static-plan", error.to_string()))?;
     ArrowDocuments::from_record_batch(&projection, memory)
-}
-
-fn canonical_argument_column(pages: &[&RecordBatch], index: usize, memory: &Arc<MemoryBudget>) -> Result<ArrayRef> {
-    if let [page] = pages {
-        let array = page.column(index);
-        let nulls = array.logical_null_count();
-        if nulls == array.len() || (nulls == 0 && array.data_type() != &DataType::Boolean) {
-            return Ok(Arc::clone(array));
-        }
-    }
-
-    // The source body digest includes the payload beneath null slots and the padding on a Boolean vector.
-    let rows = pages.iter().try_fold(0usize, |rows, page| rows.checked_add(page.num_rows()).ok_or_else(overflow))?;
-    let base = rows.checked_mul(64).and_then(|bytes| bytes.checked_add(pages.len().checked_mul(64)?))
-        .and_then(|bytes| bytes.checked_add(4096)).ok_or_else(overflow)?;
-    let bound = pages.iter().try_fold(base, |bytes, page| {
-        bytes.checked_add(page.column(index).get_array_memory_size().checked_mul(4).ok_or_else(overflow)?).ok_or_else(overflow)
-    })?;
-    let mut reservation = memory.reserve(bound)?;
-    let mut cells = Vec::with_capacity(rows);
-    let sources = pages.iter().enumerate().map(|(source, page)| {
-        cells.extend((0..page.num_rows()).map(|row| Some((source, row))));
-        page.column(index).as_ref()
-    }).collect::<Vec<_>>();
-    let column = rtdb_columnar::copy_nullable_cells(&sources, &cells)?;
-    drop(sources);
-    drop(cells);
-    Arc::get_mut(&mut reservation).expect("argument selection owns its reservation").shrink_to(column.get_array_memory_size())?;
-    rtdb_columnar::retain_array(column, &reservation)
 }
 
 fn infer_document_decimals(value: &mut Value) -> Result<()> {
