@@ -66,7 +66,7 @@ fn admit_capture(
 /// writes the Directory pin or submits the ordered registration.
 fn select_held_archive(
     source: &DeploymentRecord, archive: &CellStorage, deployment: Uuid, cut: &rtdb_node::OwnedForkCut,
-) -> Result<(Uuid, Option<Uuid>)> {
+) -> Result<Option<(Uuid, Option<Uuid>)>> {
     let binding = archive_binding(archive)?;
     let available = |capture: &Uuid, registered: &rtdb_directory::CheckpointCapture| {
         registered.archive == binding && registered.media_bound
@@ -78,7 +78,7 @@ fn select_held_archive(
     if let Some((&capture, _)) = source.checkpoint_captures.iter().find(|(capture, registered)|
         available(capture, registered) && registered.checkpoint.system_time == cut.basis().0
     ) {
-        return Ok((capture, None));
+        return Ok(Some((capture, None)));
     }
     for (&suffix, pin) in &source.checkpoint_suffix_pins {
         if !cut.matches_basis(pin.basis) || pin.archive_sha256.is_none() || suffix.is_nil() {
@@ -91,10 +91,50 @@ fn select_held_archive(
         let (point, manifest) = capture_receipt(source, archive, deployment, capture)?
             .ok_or_else(OwnedWorld::unavailable)?;
         if replica_suffix::accepted(source, &point, &manifest, suffix).is_ok() {
-            return Ok((capture, Some(suffix)));
+            return Ok(Some((capture, Some(suffix))));
         }
     }
-    Err(OwnedWorld::unavailable())
+    Ok(None)
+}
+
+async fn copy_published_fork_input(
+    directory: Arc<dyn Directory>,
+    storage: &CellStorage,
+    archive: &CellStorage,
+    keys: &dyn KeyService,
+    hosted_task: Option<&HostedTask>,
+    deployment: Uuid,
+    source: &DeploymentRecord,
+    cut: &rtdb_node::OwnedForkCut,
+    until: Timestamp,
+) -> Result<Uuid> {
+    let checkpoint = source.checkpoint.filter(|checkpoint| {
+        checkpoint.root_sha256.is_some() && checkpoint.system_time == cut.basis().0
+    }).ok_or_else(OwnedWorld::unavailable)?;
+    if !cut.is_publication() || until <= now() || cut.until() <= now() {
+        return Err(OwnedWorld::unavailable());
+    }
+
+    // The same exact source checkpoint and installed archive share one
+    // Directory capture on every retry. A changed checkpoint gets a new ID.
+    let mut digest = ring::digest::Context::new(&ring::digest::SHA256);
+    digest.update(b"rtdb.world-published-fork-input.v1\0");
+    digest.update(deployment.as_bytes());
+    digest.update(&source.incarnation.to_be_bytes());
+    digest.update(&source.log_epoch.to_be_bytes());
+    digest.update(&checkpoint.block.to_be_bytes());
+    digest.update(&checkpoint.boundary.to_be_bytes());
+    digest.update(&checkpoint.source.to_be_bytes());
+    digest.update(&checkpoint.system_time.to_be_bytes());
+    digest.update(&checkpoint.root_sha256.ok_or_else(OwnedWorld::unavailable)?);
+    digest.update(archive_binding(archive)?.as_bytes());
+    let mut id = [0; 16];
+    id.copy_from_slice(&digest.finish().as_ref()[..16]);
+    let operation = Uuid::from_bytes(id);
+    super::capture_with_purpose(
+        directory, storage, archive, keys, deployment, operation, hosted_task.cloned(), Some(source), true,
+    ).await?;
+    Ok(operation)
 }
 
 fn world_record(
@@ -120,7 +160,7 @@ fn world_record(
 /// Forks an independently archived, exact parent cut. The directory pin
 /// precedes the ordered assertion, so a partial fork can only retain media.
 pub(crate) async fn fork_checkpoint_world_selected(
-    directory: &dyn Directory, archive: &CellStorage, keys: &dyn KeyService, hosted_task: Option<&HostedTask>,
+    directory: Arc<dyn Directory>, archive: &CellStorage, capture_source: Option<&CellStorage>, keys: &dyn KeyService, hosted_task: Option<&HostedTask>,
     session: &mut NativeSession, deployment_id: Uuid, capture: Uuid, suffix: Option<Uuid>,
     until: Timestamp, resources: CheckpointReadResources<'_>, fork: rtdb_node::OwnedWorldFork,
 ) -> Result<(Uuid, TransactionKey)> {
@@ -131,21 +171,35 @@ pub(crate) async fn fork_checkpoint_world_selected(
         .ok_or_else(OwnedWorld::unavailable)?
         .to_owned();
     let deployment = deployment_id.to_string();
-    let source = directory
+    let mut source = directory
         .deployment(&deployment)
         .await?
         .ok_or_else(OwnedWorld::unavailable)?;
     admit_session(session, &source, &owner)?;
     let (capture, suffix) = if capture.is_nil() {
         if suffix.is_some() || fork.root.is_none() || fork.previous.is_some()
-            || !matches!(fork.requested, rtdb_node::WorldClockRequest::Retained)
+            || !(matches!(fork.requested, rtdb_node::WorldClockRequest::Retained)
+                || (matches!(fork.requested, rtdb_node::WorldClockRequest::Proposal)
+                    && fork.root.as_ref().is_some_and(|root| root.publication.is_none())))
         {
             return Err(OwnedWorld::unavailable());
         }
         if fork.cut.live().is_none() && !fork.cut.is_publication() {
             return Err(OwnedWorld::unavailable());
         }
-        select_held_archive(&source, archive, deployment_id, &fork.cut)?
+        if let Some(selected) = select_held_archive(&source, archive, deployment_id, &fork.cut)? {
+            selected
+        } else {
+            let storage = capture_source.ok_or_else(OwnedWorld::unavailable)?;
+            let deadline = until.min(fork.deadline).min(fork.cut.until());
+            let capture = copy_published_fork_input(
+                Arc::clone(&directory), storage, archive, keys, hosted_task, deployment_id,
+                &source, &fork.cut, deadline,
+            ).await?;
+            source = directory.deployment(&deployment).await?.ok_or_else(OwnedWorld::unavailable)?;
+            admit_session(session, &source, &owner)?;
+            (capture, None)
+        }
     } else {
         (capture, suffix)
     };
@@ -166,7 +220,7 @@ pub(crate) async fn fork_checkpoint_world_selected(
     let expected_basis = expected_basis.or(fork.cut.live());
     let live = session.open_owned_read().await?;
     let ((schemas, _schema_charge), parent_publication, basis) = with_registered_capture_context(
-        directory, archive, keys, hosted_task,
+        directory.as_ref(), archive, keys, hosted_task,
         CaptureSelection { deployment: deployment_id, capture, manifest: &manifest, suffix, expected_basis },
         resources,
         |context, basis| {
@@ -179,7 +233,10 @@ pub(crate) async fn fork_checkpoint_world_selected(
         },
     ).await?;
     live.check()?;
-    if basis.system_time >= live.present().system_time {
+    let head = live.present();
+    if (basis.system_time >= head.system_time || basis.tx_id >= head.tx_id)
+        && (!fork.cut.is_publication() || basis != head)
+    {
         return Err(OwnedWorld::unavailable());
     }
     drop(live);
@@ -194,7 +251,9 @@ pub(crate) async fn fork_checkpoint_world_selected(
     let inherited = parent_publication.unwrap_or(basis.system_time);
     let mode = match fork.requested {
         rtdb_node::WorldClockRequest::Retained => WorldClockMode::Retained,
-        rtdb_node::WorldClockRequest::Proposal if fork.cut.live().is_some() => WorldClockMode::Proposal,
+        rtdb_node::WorldClockRequest::Proposal if fork.cut.live().is_some()
+            || (fork.cut.is_publication() && fork.previous.is_none()
+                && fork.root.as_ref().is_some_and(|root| root.publication.is_none())) => WorldClockMode::Proposal,
         rtdb_node::WorldClockRequest::Proposal => return Err(OwnedWorld::unavailable()),
         rtdb_node::WorldClockRequest::Held { start } => {
             let start = start.unwrap_or(inherited);
@@ -223,7 +282,7 @@ pub(crate) async fn fork_checkpoint_world_selected(
     };
     let scope = session.placed_history()?;
     let database = session.state().database().to_owned();
-    let installed = update_installation(directory, &deployment, |record| {
+    let installed = update_installation(directory.as_ref(), &deployment, |record| {
         let eligible = PlacedAttemptScope::new(&record.stream("replica"), record.epoch)
             .map_err(|_| OwnedWorld::unavailable())?;
         if record.name != database || scope != Some(eligible) {
@@ -271,7 +330,7 @@ pub(crate) async fn fork_checkpoint_world_selected(
     if let Some(previous) = previous
         && let Some(prior) = installed.checkpoint_worlds.get(&previous)
     {
-        let _ = retire_world_pins(directory, &deployment, &[(previous, prior)], installed.incarnation, installed.log_epoch).await;
+        let _ = retire_world_pins(directory.as_ref(), &deployment, &[(previous, prior)], installed.incarnation, installed.log_epoch).await;
     }
     Ok((id, outcome.tx_key()))
 }

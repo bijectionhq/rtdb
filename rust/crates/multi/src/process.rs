@@ -65,6 +65,9 @@ pub struct RunningNode {
 }
 
 pub async fn start_node(directory: Arc<dyn Directory>, mut settings: NodeSettings) -> Result<RunningNode> {
+    if let Some(archive) = &settings.agent.world_archive {
+        crate::archive::require_independent_world_archive(&settings.agent.storage, archive)?;
+    }
     let engine_version = settings.engine_version.take().unwrap_or_else(|| ENGINE_VERSION.into());
     crate::admin::validate_engine_version(&engine_version)?;
     let scoped_writes = match (&settings.agent.s3_write_role, &settings.agent.storage) {
@@ -113,7 +116,8 @@ pub async fn start_node(directory: Arc<dyn Directory>, mut settings: NodeSetting
             options.owned_relations = true;
             Arc::new(owned_worlds::PlacedWorldHost {
                 directory: Arc::clone(&directory),
-                storage: settings.agent.storage.clone(),
+                capture_source: settings.agent.world_archive.as_ref().map(|_| settings.agent.storage.clone()),
+                archive: settings.agent.world_archive.clone().unwrap_or_else(|| settings.agent.storage.clone()),
                 keys: Arc::clone(&settings.keys),
                 hosted_task: settings.hosted_task.clone(),
                 options,

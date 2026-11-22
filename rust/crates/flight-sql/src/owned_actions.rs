@@ -1731,10 +1731,12 @@ impl Service {
         let (until, rest) = rest.split_first_chunk::<8>().ok_or_else(|| invalid("World fork has no expiry"))?;
         let (deadline, rest) = rest.split_first_chunk::<8>().ok_or_else(|| invalid("World fork has no deadline"))?;
         let ([mode], rest) = rest.split_first_chunk::<1>().ok_or_else(|| invalid("World fork has no clock mode"))?;
-        let select_publication = *mode == 4 && publish_root;
+        let select_publication = matches!(*mode, 4 | 5) && publish_root;
+        let proposed_publication = *mode == 5 && publish_root;
         let (requested, rest) = match *mode {
             0 => (rtdb_node::WorldClockRequest::Retained, rest),
             4 if select_publication => (rtdb_node::WorldClockRequest::Retained, rest),
+            5 if proposed_publication => (rtdb_node::WorldClockRequest::Proposal, rest),
             1 => (rtdb_node::WorldClockRequest::Held { start: None }, rest),
             2 => {
                 let (start, rest) = rest.split_first_chunk::<8>().ok_or_else(|| invalid("World fork has no explicit clock start"))?;
@@ -1784,7 +1786,7 @@ impl Service {
         let mut root_framing = None;
         let mut root_groups = 0;
         let groups = if publish_root {
-            if previous.is_some() || !matches!(requested, rtdb_node::WorldClockRequest::Retained)
+            if previous.is_some() || !(matches!(requested, rtdb_node::WorldClockRequest::Retained) || proposed_publication)
                 || (cut.live().is_none() && !cut.is_publication())
             {
                 return Err(invalid("A Root publication requires an initial retained fork at its original live hold"));
@@ -1819,6 +1821,9 @@ impl Service {
                         writes.push(operation),
                     _ => return Err(invalid("Operation is outside the held Root section")),
                 }
+            }
+            if proposed_publication && !writes.is_empty() {
+                return Err(invalid("A Proposal registration only settles hosted controls"));
             }
             if !writes.is_empty() {
                 root.publication = Some(rtdb_node::OwnedRootPublication { attempt: attempt.to_owned(), writes });

@@ -16,7 +16,8 @@ use crate::{
 
 pub(super) struct PlacedWorldHost {
     pub(super) directory: Arc<dyn Directory>,
-    pub(super) storage: CellStorage,
+    pub(super) capture_source: Option<CellStorage>,
+    pub(super) archive: CellStorage,
     pub(super) keys: Arc<dyn KeyService>,
     pub(super) hosted_task: Option<HostedTask>,
     pub(super) options: NodeOptions,
@@ -48,7 +49,7 @@ impl OwnedWorldHost for PlacedWorldHost {
         Box::pin(async move {
             let deployment = self.deployment(&call)?;
             let archive = WorldArchive {
-                directory: Arc::clone(&self.directory), storage: self.storage.clone(),
+                directory: Arc::clone(&self.directory), storage: self.archive.clone(),
                 keys: Arc::clone(&self.keys), hosted_task: self.hosted_task.clone(), options: self.options.clone(),
             };
             let held = open_held_checkpoint_world(
@@ -67,7 +68,8 @@ impl OwnedWorldHost for PlacedWorldHost {
                 node: &self.options, memory: call.node.memory(),
                 cache: Arc::clone(call.node.cache_budget()), cancellation: call.cancellation,
             };
-            fork_checkpoint_world_selected(self.directory.as_ref(), &self.storage, self.keys.as_ref(),
+            fork_checkpoint_world_selected(Arc::clone(&self.directory), &self.archive,
+                self.capture_source.as_ref(), self.keys.as_ref(),
                 self.hosted_task.as_ref(), call.session, deployment, capture, suffix, until, resources, fork).await
         })
     }
@@ -75,7 +77,7 @@ impl OwnedWorldHost for PlacedWorldHost {
     fn validate_world<'a>(&'a self, call: WorldCall<'a>, world: Uuid, checks: Vec<OwnedWorldWitness>, controls: Vec<rtdb_node::HostedControlWrite>, deadline: Timestamp) -> BoxFuture<'a, Result<TransactionKey>> {
         Box::pin(async move {
             let deployment = self.deployment(&call)?;
-            validate_checkpoint_world(self.directory.as_ref(), &self.storage, call.session, deployment, world, checks, controls, deadline).await
+            validate_checkpoint_world(self.directory.as_ref(), &self.archive, call.session, deployment, world, checks, controls, deadline).await
         })
     }
 
@@ -86,7 +88,7 @@ impl OwnedWorldHost for PlacedWorldHost {
     ) -> BoxFuture<'a, Result<TransactionKey>> {
         Box::pin(async move {
             let deployment = self.deployment(&call)?;
-            commit_checkpoint_world_batch(self.directory.as_ref(), &self.storage, call.session, deployment,
+            commit_checkpoint_world_batch(self.directory.as_ref(), &self.archive, call.session, deployment,
                 sections, root, fingerprint, controls, deadline).await
         })
     }

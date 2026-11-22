@@ -609,6 +609,9 @@ pub struct CheckpointCapture {
     pub incarnation: u64,
     pub log_epoch: i32,
     pub checkpoint: Checkpoint,
+    /// Automatically derived from a held fork's already published source.
+    #[serde(default)]
+    pub automatic_fork: bool,
     /// Payload copying starts only after the archive's witness becomes durable.
     pub media_bound: bool,
     /// The immutable manifest accepted after verifying the complete archive.
