@@ -162,6 +162,9 @@ impl OwnedReadSession {
             ));
         }
         self.admit_read().await?;
+        for relation in relations.iter().filter(|relation| relation.world().is_none()) {
+            self.lifetime_point_policy(relation).await?;
+        }
         let guard = self.relation_release_guard_for(relations, true)?;
         let guarded = Arc::clone(&self.context).with_owned_read_guard(guard);
         let database = self.context.catalog.database(&self.database)?;
@@ -358,7 +361,7 @@ impl OwnedReadSession {
         }
         self.admit_access().await?;
         self.require_scoped_relation(relation)?;
-        let journal_context = self.guard_context(Arc::clone(self.retained_root_context()), [relation])?;
+        let journal_context = self.journal_context(relation)?;
         let database = journal_context.catalog.database(&self.database)?;
         let [snapshot] = database.partitions.as_slice() else {
             return Err(change_feed_uncovered());
@@ -560,7 +563,7 @@ impl OwnedReadSession {
             return Err(change_feed_uncovered());
         }
         let entry =
-            read_owned_change_entry(self.guard_context(Arc::clone(self.retained_root_context()), [relation])?, &self.owner, relation, 0).await?;
+            read_owned_change_entry(self.journal_context(relation)?, &self.owner, relation, 0).await?;
         if entry.value != Value::Null
             || entry.system_time != floor.committed_at
             || entry.through_events != floor.through_events
@@ -643,7 +646,7 @@ impl OwnedReadSession {
         head: OwnedJournalHeader,
     ) -> Result<()> {
         let entry =
-            read_owned_change_entry(self.guard_context(Arc::clone(self.retained_root_context()), [relation])?, &self.owner, relation, revision)
+            read_owned_change_entry(self.journal_context(relation)?, &self.owner, relation, revision)
                 .await?;
         if entry.system_time != head.committed_at
             || entry.through_events != head.through_events
@@ -654,12 +657,19 @@ impl OwnedReadSession {
         Ok(())
     }
 
+    fn journal_context(&self, relation: &OwnedRelation) -> Result<Arc<rtdb_query::QueryContext>> {
+        // Only the journal projects lifetime history here. The guarded data
+        // and version readers still require their independent validity scope.
+        let guard = self.relation_release_guard_for([relation], true)?;
+        Ok(Arc::clone(self.retained_root_context()).with_owned_read_guard(guard))
+    }
+
     async fn journal_header(
         &self,
         relation: &OwnedRelation,
         revision: i64,
     ) -> Result<OwnedJournalHeader> {
-        read_owned_journal_header(self.guard_context(Arc::clone(self.retained_root_context()), [relation])?, &self.owner, relation, revision).await
+        read_owned_journal_header(self.journal_context(relation)?, &self.owner, relation, revision).await
     }
 }
 

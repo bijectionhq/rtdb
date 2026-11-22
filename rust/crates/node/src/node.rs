@@ -1266,6 +1266,60 @@ impl OwnedReadSession {
         Ok(Some(floor))
     }
 
+    /// Nominate one exact, already expired identity from a placed live hold.
+    /// This authenticates discovery only. Replay retention authorizes removal.
+    pub async fn nominate_expired_identity(
+        &self, relation: &rtdb_types::OwnedRelation, id: &rtdb_types::EntityId,
+        scope: rtdb_types::PlacedAttemptScope,
+    ) -> Result<(String, Timestamp, Timestamp)> {
+        use sha2::{Digest, Sha256};
+        self.admit_read().await?;
+        if self.witness_scope != Some(scope) || !relation.is_root_data() || self.node.now() >= self.witness_until {
+            return Err(lifetime_read_unavailable());
+        }
+        let database = self.node.attached_database(&self.database, Some(&self.attachment))?;
+        let AwaitAuthority::Live { codec, .. } = &database.await_authority else {
+            return Err(lifetime_read_unavailable());
+        };
+        if codec.scope() != scope { return Err(lifetime_read_unavailable()); }
+
+        let floor = self.lifetime_point_policy(relation).await?.ok_or_else(lifetime_read_unavailable)?;
+        let guard = self.relation_release_guard_for([relation], true)?;
+        let context = Arc::clone(&self.context).with_owned_read_guard(guard);
+        let mut cursor = rtdb_query::open_owned_point(
+            Arc::clone(&context), &self.owner, relation, id,
+            Some(rtdb_types::Interval::ALL), Some(&["_id", "_system_from"]),
+        ).await?.ok_or_else(lifetime_read_unavailable)?;
+        let mut created = None;
+        while let Some(batch) = cursor.next_batch().await? {
+            for row in 0..batch.batch().num_rows() {
+                if created.is_some() { return Err(lifetime_read_unavailable()); }
+                created = Some(rtdb_query::owned_row_revision(batch.batch(), row, id, &context.memory)?);
+            }
+        }
+        let created = created.ok_or_else(lifetime_read_unavailable)?;
+        let expiry = Timestamp(created.0.checked_add(floor.duration).ok_or_else(lifetime_read_unavailable)?);
+        if expiry > self.present.system_time { return Err(lifetime_read_unavailable()); }
+
+        let handle = id.handle_bytes();
+        let mut digest = Sha256::new();
+        digest.update(b"rtdb.expiry-nomination.v1\0");
+        digest.update(scope.encode());
+        for input in [self.owner.as_bytes(), relation.name().as_bytes(), handle.as_slice()] {
+            digest.update((input.len() as u64).to_be_bytes());
+            digest.update(input);
+        }
+        let mut nomination = Vec::with_capacity(73);
+        nomination.push(0xe1);
+        nomination.extend_from_slice(&digest.finalize());
+        for coordinate in [created.0, expiry.0, self.present.tx_id.0, self.present.system_time.0, self.witness_until.0] {
+            nomination.extend_from_slice(&coordinate.to_be_bytes());
+        }
+        context.check_cancelled()?;
+        if self.node.now() >= self.witness_until { return Err(lifetime_read_unavailable()); }
+        Ok((format!("rtdblife1.{}", codec.seal(&nomination)?), created, expiry))
+    }
+
     pub fn check_live_point_relation(&self, relation: &rtdb_types::OwnedRelation) -> Result<()> {
         self.relation_release_guard_for([relation], true)?()
     }
