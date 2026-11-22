@@ -171,6 +171,8 @@ The legacy collector retains covered loose file markers while their immutable pu
 The reaper authenticates retained receipts under the exact source residence key and matches the full installed cut and logical object.
 The same two-version retirement protocol orders the recovered data and original marker against readers and confirms absence of each version.
 The authorized reservation can finish from its persisted versions if the historical receipt or residence key later becomes unavailable.
+For a hosted loose trie release, the physical owner verifies that the directory's authenticated checkpoint covers the installed removal and that older recovery admissions have drained.
+Settle previously authorized retirements through their recorded publications before certifying this coverage across a rolling upgrade.
 The retained receipt model explored 16 states, rejected four unsafe changes and reached settlement after losing the original receipt.
 The ordinary hosted path sweep withdraws eligible inherited references.
 Owned loose objects, owned packs and owned release markers remain until the provider retirement authority can settle them.

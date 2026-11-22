@@ -122,6 +122,7 @@ pub(super) async fn reap(directory: &dyn Directory, bucket: &dyn ObjectStore, pr
             let Some(witness) = read_release(bucket, &marker.key).await? else { continue; };
             let Some(relative) = witness.target_name().filter(|_| witness.release_version.is_some() || witness.terminal.is_some()) else { continue; };
             if witness.record.released_at_ms > threshold || !permits_release(candidate, &store, &witness.record) { continue; }
+            if !recovery_covers_release(candidate, &witness.record) { continue; }
             let target = ObjectKey::new(format!("{store}/{relative}"))?;
             if advisory.is_some_and(|observed| observed.has_declared_reference(&target) || observed.has_declared_reference(&marker.key)) { continue; }
             eligible.push((marker.key, target, witness));
@@ -130,7 +131,6 @@ pub(super) async fn reap(directory: &dyn Directory, bucket: &dyn ObjectStore, pr
         let mut checked = BTreeSet::new();
         for (marker, target, witness) in &eligible {
             let work = if let Some(publication) = &witness.terminal {
-                if !terminal_recovery_covered(candidate, &witness.record) { continue; }
                 let Some([data_tombstone, release_tombstone]) = provider.terminal_targets(target, marker, publication).await? else { continue; };
                 RetirementWork::Tombstones { deployment: candidate.id.clone(), target: target.to_string(), release: marker.to_string(), data_tombstone, release_tombstone }
             } else {
@@ -363,7 +363,7 @@ async fn prepare(directory: &dyn Directory, bucket: &dyn ObjectStore, provider: 
             StorageRegion::Remote { archive: Some(_), .. } | StorageRegion::Local { archive: Some(_), .. } => true,
             _ => false,
         }) { return Err(changed()); }
-        if witness.terminal.is_some() && !terminal_recovery_covered(record, &witness.record) {
+        if !recovery_covers_release(record, &witness.record) {
             return Err(changed());
         }
         if let Some(PackReadiness::Covered { block, youngest }) = pack {
@@ -390,8 +390,8 @@ async fn prepare(directory: &dyn Directory, bucket: &dyn ObjectStore, provider: 
     Ok(Some(owner.version))
 }
 
-fn terminal_recovery_covered(owner: &DeploymentRecord, release: &super::GarbageRecord) -> bool {
-    let Some(floor) = &release.trie_floor else { return false; };
+fn recovery_covers_release(owner: &DeploymentRecord, release: &super::GarbageRecord) -> bool {
+    let Some(floor) = &release.trie_floor else { return true; };
     let through = floor.cut.through.after_offset(floor.cut.replica_epoch);
     through >= 0 && owner.checkpoint.is_some_and(|checkpoint| checkpoint.root_sha256.is_some() && checkpoint.boundary >= through)
         && owner.storage_regions.values().filter_map(StorageRegion::first_required_replica).all(|first| first > through)
@@ -519,6 +519,7 @@ mod tests {
             storage_version: CURRENT_STORAGE_VERSION, storage_epoch: epoch, replica_epoch: epoch, through: ReplicaPosition(2),
         } };
         parent.catalog_admission_floors.insert(root.clone(), floor.clone());
+        parent.checkpoint = Some(rtdb_directory::Checkpoint { block: 0, boundary: 1, source: 0, system_time: 0, root_sha256: Some([1; 32]) });
         let parent = directory.create_deployment(parent).await.unwrap();
         let store = format!("{}/{root}", parent.storage_prefix());
         let relative = ObjectKey::new("tables/orders/data/l01-rc-b00.arrow").unwrap();
@@ -532,6 +533,19 @@ mod tests {
         let garbage = super::super::GarbageStore::open_with_clock(physical, std::sync::Arc::new(|| 0)).await.unwrap();
         garbage.write_release(&relative, Some(floor.clone()), None).await.unwrap();
         garbage.write_release(&relative, Some(floor), Some(&versions.version)).await.unwrap();
+
+        reap(directory.as_ref(), bucket.as_ref(), &versions, &parent, 0, None, None).await.unwrap();
+        assert_eq!(versions.attempts.load(Ordering::Relaxed), 0);
+        let recovery = Uuid::new_v4();
+        let parent = crate::admin::update_installation(directory.as_ref(), &parent.id, |record| {
+            record.checkpoint = Some(rtdb_directory::Checkpoint { block: 1, boundary: 2, source: 1, system_time: 0, root_sha256: Some([2; 32]) });
+            record.storage_regions.insert(recovery, StorageRegion::ReplicaReplay { first_required: 2, custody: ReplayCustody::Local });
+            Ok(())
+        }).await.unwrap();
+        reap(directory.as_ref(), bucket.as_ref(), &versions, &parent, 0, None, None).await.unwrap();
+        assert_eq!(versions.attempts.load(Ordering::Relaxed), 0);
+        super::super::release_region(directory.as_ref(), &parent.id, recovery, false).await.unwrap();
+        let parent = directory.deployment(&parent.id).await.unwrap().unwrap();
 
         let preparation = ForkPreparation { token: Uuid::new_v4(), generation: 0 };
         directory.change_lineage(&parent.lineage, LineageChange::PrepareHostedFork { preparation, task: None }).await.unwrap();
@@ -790,6 +804,7 @@ mod tests {
         let floor = CatalogAdmissionFloor { residence: owner.storage_prefix(), object_namespace: namespace,
             cut: CatalogCut { through: ReplicaPosition(2), ..selected } };
         owner.catalog_admission_floors.insert(root.clone(), floor.clone());
+        owner.checkpoint = Some(rtdb_directory::Checkpoint { block: 1, boundary: 2, source: 1, system_time: 0, root_sha256: Some([2; 32]) });
         let owner = directory.create_deployment(owner).await.unwrap();
         let store = format!("{}/{root}", owner.storage_prefix());
         let key = "tables/orders/data/l01-rc-b00.arrow";

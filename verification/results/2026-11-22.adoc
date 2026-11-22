@@ -265,3 +265,15 @@ link:../tla/TerminalRetirementAdmission.tla[Admission model]
 The replay abstracts provider policies and mixed packs.
 The runtime provider gate still needs qualification in the hosted environment.
 The native and TLC records are in `/private/tmp/rtdb-terminal-publication-native-final.log` and `/private/tmp/rtdb-terminal-retirement-final-ofwj4jrq/`.
+
+== R5 · Recovery coverage for versioned loose-file retirement
+
+Versioned loose trie releases and recovered legacy witnesses use the same checkpoint and replica-start guard as terminal releases.
+The owner revision rechecks the guard when establishing the exact retirement fence.
+The versioned replay verifies that an older directory checkpoint or an admitted recovery at the removal cut prevents provider effects.
+After both advance, the same replay exercises fork references, owner reads, a lost provider reply and exact version settlement.
+All six native exact retirement cases passed in `/private/tmp/rtdb-versioned-checkpoint-fence-final.log`.
+The reconciled native build on `54fd1569d5` passed 241 targeted tests, with one ignored case, after boxing the staged reader's serving future.
+The JVM suite on the terminal publication tree recorded 3,198 standard, 3,348 property and 5,629 integration passes, with one PostgreSQL slot-recreation skip.
+The root suite ran separately after a discovery failure, and the property and integration results came from the preceding full execution.
+The final combined Gradle invocation accepted all task results as current.
