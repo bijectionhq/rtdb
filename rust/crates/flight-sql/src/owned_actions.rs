@@ -1210,7 +1210,7 @@ impl Service {
             };
             Some(Timestamp(*system))
         } else { None };
-        let (page, evidence) = if !matches!(version, HeldRangeFormat::Leading) {
+        let (page, evidence, expiry) = if !matches!(version, HeldRangeFormat::Leading) {
             let Some(Value::Bool(descending)) = row.get("descending") else {
                 return Err(invalid("Owned range requires a boolean descending field"));
             };
@@ -1223,20 +1223,25 @@ impl Service {
             };
             if let (Some(system), Some(valid)) = (system, valid_at) {
                 held.snapshot.range_page_by_key_at_system(&relation, &path, request, system, valid)
-                    .await.map(|page| (page, None))
+                    .await.map(|page| (page, None, None))
             } else {
-                held.snapshot.range_page_by_key_at_observed(&relation, &path, request, valid_at).await
+                held.snapshot.range_page_by_key_lifetime(&relation, &path, request, valid_at).await
             }
         } else {
             let lower = (!matches!(lower, Value::Null | Value::Undefined)).then_some(lower);
             let upper = (!matches!(upper, Value::Null | Value::Undefined)).then_some(upper);
-            held.snapshot.range(&relation, &path, lower, upper, limit).await.map(|page| (page, None))
+            held.snapshot.range(&relation, &path, lower, upper, limit).await.map(|page| (page, None, None))
         }.map_err(status)?;
         let present = system.unwrap_or(held.snapshot.present().system_time);
         let observed = witnessed_schema(call, &held, &relation, &page.schema, evidence)?;
         let schema = observed.as_ref().map_or(page.schema.as_ref(), |(schema, _)| schema);
-        let reply = self.owned_point_reply(schema, page.batch.as_ref().map(OwnedBatch::batch), present, valid_at.unwrap_or(present), None)?;
-        held.snapshot.check_relation(&relation).map_err(status)?;
+        let reply = self.owned_point_reply_until(schema, page.batch.as_ref().map(OwnedBatch::batch),
+            present, valid_at.unwrap_or(present), None, expiry)?;
+        if system.is_none() && !matches!(version, HeldRangeFormat::Leading) {
+            held.snapshot.check_lifetime_range_release(&relation, expiry).map_err(status)?;
+        } else {
+            held.snapshot.check_relation(&relation).map_err(status)?;
+        }
         Ok(reply)
     }
 
