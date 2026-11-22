@@ -64,3 +64,6 @@ pub use owned_relation::{
     open_owned_unique_point, open_owned_valid_during, open_owned_valid_during_at, owned_address, owned_row_revision, read_owned_parent_schemas,
     read_owned_change_entry, read_owned_world, require_owned_address_coverage,
 };
+
+mod owned_journal;
+pub use owned_journal::{OwnedJournalHeader, read_owned_journal_header};

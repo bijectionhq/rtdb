@@ -25,6 +25,7 @@ impl Service {
                 crate::owned_actions::HELD_OWNED_RANGE_V1 => Ok(vec![Ok(self.held_owned_range_action(&call, &action.body, false).await?)]),
                 crate::owned_actions::HELD_OWNED_RANGE_V2 => Ok(vec![Ok(self.held_owned_range_action(&call, &action.body, true).await?)]),
                 crate::owned_actions::HELD_OWNED_COUNT_V1 => Ok(vec![Ok(self.held_owned_count_action(&call, &action.body).await?)]),
+                crate::owned_actions::HELD_OWNED_MERGED_CHANGES_V1 => Ok(vec![Ok(self.held_owned_merged_changes_action(&call, &action.body).await?)]),
                 crate::owned_actions::HELD_OWNED_CHANGES_V2 => Ok(vec![Ok(self.held_owned_changes_action(&call, &action.body).await?)]),
                 crate::owned_actions::HELD_OWNED_POINT_V1 => Ok(vec![Ok(self.held_owned_point_action(&call, &action.body, false).await?)]),
                 crate::owned_actions::HELD_OWNED_POINT_V2 => Ok(vec![Ok(self.held_owned_point_action(&call, &action.body, true).await?)]),

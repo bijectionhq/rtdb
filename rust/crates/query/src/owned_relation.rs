@@ -102,7 +102,7 @@ pub async fn open_owned_relation_schema(
     ).await
 }
 
-async fn open_owned_table_point(
+pub(crate) async fn open_owned_table_point(
     context: Arc<QueryContext>, table: TableRef, locator: Iid, id: Option<&EntityId>,
     valid: Option<Interval>, columns: Option<&[&str]>, history: bool,
 ) -> Result<Option<QueryCursor>> {

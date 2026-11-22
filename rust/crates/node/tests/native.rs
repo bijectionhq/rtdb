@@ -4405,3 +4405,51 @@ async fn held_owned_changes_preserve_whole_groups_and_cover_the_ordered_cut() {
     drop(writer);
     stop(&node, driver).await;
 }
+
+#[tokio::test]
+async fn merged_held_changes_resume_only_after_whole_visible_commits() {
+    use rtdb_types::{EntityId, OwnedRelation};
+
+    let mut settings = options();
+    settings.owned_relations = true;
+    let (node, driver) = running(settings, services()).await;
+    let mut session = node.session("xtdb", Arc::new(Authority)).unwrap();
+    let first = OwnedRelation::new("first-feed").unwrap();
+    let second = OwnedRelation::new("second-feed").unwrap();
+    let excluded = OwnedRelation::new("excluded-feed").unwrap();
+    let empty = OwnedRelation::new("empty-feed").unwrap();
+    let insert = |relation: &OwnedRelation, id| TxOp::OwnedInsertDocs {
+        relation: relation.clone(),
+        documents: Documents::new(vec![StructFields::from([("_id".into(), Value::I64(id))])], node.memory()).unwrap(),
+        valid_from: None, valid_to: None,
+    };
+    let joined = session.state_mut().execute_tx(vec![
+        insert(&second, 2), insert(&first, 1), insert(&excluded, 9),
+    ], AutonomousTxOptions::default()).await.unwrap();
+    let invisible = session.state_mut().execute_tx(vec![insert(&excluded, 10)], AutonomousTxOptions::default()).await.unwrap();
+    let later = session.state_mut().execute_tx(vec![insert(&first, 3)], AutonomousTxOptions::default()).await.unwrap();
+    assert!(joined.committed() && invisible.committed() && later.committed());
+
+    let held = session.open_owned_read().await.unwrap();
+    let selected = [second.clone(), empty, first.clone()];
+    let page = held.merged_changes(&selected, Timestamp::MIN, 1).await.unwrap();
+    assert_eq!(page.commits.len(), 1);
+    assert_eq!(page.commits[0].changes.len(), 2);
+    assert_eq!(page.commits[0].changes[0].relation, first);
+    assert_eq!(page.commits[0].changes[1].relation, second);
+    assert_eq!(page.commits[0].changes[1].touches[0].id, EntityId::Integer(2));
+
+    let next = held.merged_changes(&selected, page.commits[0].revision, 1).await.unwrap();
+    assert_eq!(next.commits.len(), 1);
+    assert_eq!(next.commits[0].changes.len(), 1);
+    assert_eq!(next.commits[0].changes[0].touches[0].id, EntityId::Integer(3));
+    assert!(held.merged_changes(&selected, next.commits[0].revision, 1).await.unwrap().commits.is_empty());
+    assert!(held.merged_changes(&[first.clone(), first.clone()], Timestamp::MIN, 1).await.is_err());
+
+    assert!(session.state_mut().execute_tx(vec![insert(&second, 4)], AutonomousTxOptions::default()).await.unwrap().committed());
+    assert!(held.merged_changes(&selected, next.commits[0].revision, 1).await.unwrap().commits.is_empty());
+
+    drop(held);
+    drop(session);
+    stop(&node, driver).await;
+}
