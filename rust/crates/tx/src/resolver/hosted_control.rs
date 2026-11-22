@@ -62,10 +62,11 @@ impl OpenTransaction<'_> {
             if validating_world {
                 if !matches!(operation, Operation::Public(
                     TxOp::OwnedDeadline { .. } | TxOp::OwnedCheck { .. } | TxOp::OwnedCheckWorldScope { .. }
-                        | TxOp::OwnedCheckWorldPurge { .. } | TxOp::HostedControl(_)
+                        | TxOp::OwnedCheckWorldPurge { .. } | TxOp::OwnedCheckRange { .. } | TxOp::HostedControl(_)
                 )) && !(publishing_world && matches!(operation,
-                    Operation::Public(TxOp::OwnedPublishWorld { .. } | TxOp::OwnedReplaceDocs { .. })
-                        | Operation::OwnedWriteIids { create_only: false, .. }
+                    Operation::Public(TxOp::OwnedPublishWorld { .. } | TxOp::OwnedPublishRoot { .. }
+                        | TxOp::OwnedInsertDocs { .. } | TxOp::OwnedReplaceDocs { .. } | TxOp::OwnedDelete { .. })
+                        | Operation::OwnedWriteIids { .. }
                 )) {
                     return Err(unavailable());
                 }

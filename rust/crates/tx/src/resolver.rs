@@ -694,6 +694,14 @@ impl<'a> OpenTransaction<'a> {
                 let documents = crate::Documents::new(vec![record.clone()], &self.context.memory)?;
                 self.write_owned(&rtdb_types::OwnedRelation::world_catalog(), &documents, None, None, None, true).await
             }
+            Operation::Public(TxOp::OwnedPublishRoot { attempt, fingerprint }) => {
+                self.reserve_owned_attempt(attempt, *fingerprint).await?;
+                let relation = rtdb_types::OwnedRelation::new(rtdb_types::OWNED_ROOT_PUBLICATION_RELATION)?;
+                let documents = crate::Documents::new(vec![StructFields::from([
+                    ("_id".into(), Value::Utf8("head".into())),
+                ])], &self.context.memory)?;
+                self.write_owned(&relation, &documents, None, Some(Timestamp::MIN), Some(Timestamp::MAX), false).await
+            }
             Operation::Public(TxOp::OwnedPublishWorld { world, attempt, fingerprint, expected, advance_to, drop_world }) =>
                 self.publish_owned_world(*world, attempt, *fingerprint, *expected, *advance_to, *drop_world).await,
             Operation::Public(TxOp::OwnedDeadline { .. } | TxOp::OwnedCheckWorldScope { .. } | TxOp::OwnedCheckWorldPurge { .. } | TxOp::OwnedCheckRange { .. } | TxOp::OwnedCheckCapacity { .. } | TxOp::OwnedCheck { .. }) => Ok(()),
@@ -877,7 +885,15 @@ impl<'a> OpenTransaction<'a> {
                 Some((*world, attempt, *fingerprint, *advance_to, *drop_world)),
             _ => None,
         }).take(9).collect::<Vec<_>>();
-        let world_batch = publications.len() > 1;
+        let mut root_publications = operations.iter().filter_map(|operation| match operation {
+            Operation::Public(TxOp::OwnedPublishRoot { attempt, fingerprint }) => Some((attempt, *fingerprint)),
+            _ => None,
+        });
+        let root_publication = root_publications.next();
+        if root_publication.is_some() && (root_publications.next().is_some() || publications.is_empty()) {
+            return Err(unavailable());
+        }
+        let world_batch = publications.len() > 1 || root_publication.is_some();
         let root_conditions = !publications.is_empty() && operations.iter().any(|operation| match operation {
             Operation::Public(TxOp::OwnedCheck { relation, .. } | TxOp::OwnedCheckRange { relation, .. }) =>
                 relation.world().is_none() && !relation.is_world_catalog(),
@@ -900,7 +916,7 @@ impl<'a> OpenTransaction<'a> {
                 for relation in std::iter::once(first).chain(scoped) {
                     match relation.world() {
                         Some(world) => { admitted.insert(world); }
-                        None if root_conditions && !relation.is_world_catalog() => (),
+                        None if (root_conditions || root_publication.is_some()) && !relation.is_world_catalog() => (),
                         None => return Err(unavailable()),
                     }
                     if admitted.len() > 8 { return Err(unavailable()); }
@@ -947,12 +963,26 @@ impl<'a> OpenTransaction<'a> {
             }
         }
         if !publications.is_empty() {
-            let mut effects = publications.len(); // One immutable attempt per publication.
+            // One immutable attempt per world and one Root attempt and head when writing Root.
+            let mut effects = publications.len() + 2 * usize::from(root_publication.is_some());
+            let mut root_rows = 0usize;
             let mut scoped_checks = 0;
             let mut hosted = false;
             let mut counts = BTreeMap::<Iid, (usize, usize)>::new();
             for (index, operation) in operations.iter().enumerate() {
                 let size = match operation {
+                    Operation::Public(TxOp::OwnedInsertDocs { relation, documents, .. } | TxOp::OwnedReplaceDocs { relation, documents, .. })
+                    | Operation::OwnedWriteIids { relation, documents, .. }
+                        if root_publication.is_some() && relation.is_root_data() && !documents.rows().is_empty() => {
+                        let count = documents.rows().len();
+                        root_rows += count;
+                        count
+                    }
+                    Operation::Public(TxOp::OwnedDelete { relation, .. })
+                        if root_publication.is_some() && relation.is_root_data() => {
+                        root_rows += 1;
+                        1
+                    }
                     Operation::Public(TxOp::OwnedReplaceDocs { relation, documents, .. })
                     | Operation::OwnedWriteIids { relation, documents, create_only: false, .. }
                         if !documents.rows().is_empty() => {
@@ -981,7 +1011,8 @@ impl<'a> OpenTransaction<'a> {
                         scoped_checks += 1;
                         1
                     }
-                    Operation::Public(TxOp::OwnedDeadline { .. } | TxOp::OwnedCheckWorldPurge { .. } | TxOp::OwnedPublishWorld { .. }) => 1,
+                    Operation::Public(TxOp::OwnedDeadline { .. } | TxOp::OwnedCheckWorldPurge { .. }
+                        | TxOp::OwnedPublishWorld { .. } | TxOp::OwnedPublishRoot { .. }) => 1,
                     _ => return Err(unavailable()),
                 };
                 effects = effects.saturating_add(size);
@@ -994,6 +1025,12 @@ impl<'a> OpenTransaction<'a> {
             }
             let fingerprint = publications[0].2;
             let mut attempts = BTreeSet::new();
+            if let Some((attempt, root_fingerprint)) = root_publication {
+                if root_rows == 0 || root_fingerprint != fingerprint {
+                    return Err(unavailable());
+                }
+                attempts.insert(attempt);
+            }
             for (world, attempt, own_fingerprint, advance_to, drop_world) in publications {
                 let (rows, witnesses) = counts.remove(&world).ok_or_else(unavailable)?;
                 if witnesses == 0 || witnesses > 128 || !attempts.insert(attempt) || own_fingerprint != fingerprint

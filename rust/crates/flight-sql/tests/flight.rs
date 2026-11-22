@@ -837,7 +837,7 @@ async fn world_flight_actions_require_a_placed_world_host() {
     let running = Running::start(Some("secret"), FlightConfig { owned_native_actions: true, ..FlightConfig::default() }).await;
     let mut client = Client::connect(&running.server, Some("xtdb:secret")).await;
     for action in [
-        "rtdb.owned.ForkHeldWorld.v1", "rtdb.owned.CommitWorld.v4", "rtdb.owned.CommitHeldWorlds.v2",
+        "rtdb.owned.ForkHeldWorld.v1", "rtdb.owned.CommitWorld.v4", "rtdb.owned.CommitHeldWorlds.v3",
         "rtdb.owned.CommitWorldDrop.v1", "rtdb.owned.CommitWorldClock.v1", "rtdb.owned.CommitWorld.v3",
         "rtdb.owned.OpenWorldRead.v3", "rtdb.owned.ReadHeldWorldPoint.v2",
         "rtdb.owned.CloseWorldRead.v1",
