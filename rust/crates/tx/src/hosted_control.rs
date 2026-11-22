@@ -27,21 +27,57 @@ pub fn retained_release_controls<'a>(
     checks != 0 && (1..=2).contains(&replacements)
 }
 
+pub fn retained_delete_controls<'a>(controls: impl IntoIterator<Item = &'a HostedControlWrite>) -> bool {
+    let mut checks = 0;
+    let mut replacements = 0;
+    let mut existing = 0;
+    for control in controls {
+        if control.is_check() {
+            checks += 1;
+        } else {
+            replacements += 1;
+            existing += usize::from(control.expected().is_some());
+        }
+    }
+    checks > 0 && existing > 0 && (1..=5).contains(&replacements)
+}
+
 pub(crate) fn retained_release_world(operations: &[crate::source::Operation]) -> Option<rtdb_types::Iid> {
     use crate::{TxOp, source::Operation};
     let mut world = None;
     let mut controls = Vec::new();
+    let mut delete = None;
+    let mut root_checks = 0;
+    let mut delete_root = false;
     for op in operations {
         match op {
             Operation::Public(TxOp::HostedControl(control)) => controls.push(control),
             Operation::Public(TxOp::OwnedDeadline { .. } | TxOp::OwnedCheckWorldScope { .. }) => (),
+            Operation::Public(TxOp::OwnedCheck { relation, .. } | TxOp::OwnedCheckRange { relation, .. })
+                if relation.is_root_data() => { root_checks += 1; }
+            Operation::Public(TxOp::OwnedDelete { relation, id, valid_from: None, valid_to: None })
+                if relation.is_root_data() && delete.is_none() => delete = Some((relation, id)),
             Operation::Public(TxOp::OwnedPublishWorld {
-                world: next, expected: None, advance_to: None, drop_world: true, ..
-            }) if world.is_none() => world = Some(*next),
+                world: next, expected: None, advance_to: None, drop_world: true, delete_root: writes, ..
+            }) if world.is_none() => {
+                world = Some(*next);
+                delete_root = *writes;
+            }
             _ => return None,
         }
     }
-    world.filter(|_| retained_release_controls(controls))
+    world.filter(|_| {
+        if !delete_root {
+            return delete.is_none() && root_checks == 0 && retained_release_controls(controls);
+        }
+        let Some((relation, id)) = delete else { return false; };
+        let checked = operations.iter().any(|operation| matches!(
+            operation,
+            Operation::Public(TxOp::OwnedCheck { relation: checked, id: observed, expected: Some(_), .. })
+                if checked == relation && observed == id
+        ));
+        checked && retained_delete_controls(controls)
+    })
 }
 
 /// An assertion or checked replacement of one installed hosted control row.
@@ -173,6 +209,7 @@ mod retained_release_tests {
             expected: None,
             advance_to: None,
             drop_world: true,
+            delete_root: false,
         };
         let world = Iid([1; 16]);
         let mut operations = [

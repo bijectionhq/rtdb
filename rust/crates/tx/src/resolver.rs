@@ -702,8 +702,11 @@ impl<'a> OpenTransaction<'a> {
                 self.reserve_owned_attempt(attempt, *fingerprint).await?;
                 self.publish_owned_root_head().await
             }
-            Operation::Public(TxOp::OwnedPublishWorld { world, attempt, fingerprint, expected, advance_to, drop_world }) =>
-                self.publish_owned_world(*world, attempt, *fingerprint, *expected, *advance_to, *drop_world).await,
+            Operation::Public(TxOp::OwnedPublishWorld { world, attempt, fingerprint, expected, advance_to, drop_world, delete_root }) => {
+                self.publish_owned_world(*world, attempt, *fingerprint, *expected, *advance_to, *drop_world).await?;
+                if *delete_root { self.publish_owned_root_head().await?; }
+                Ok(())
+            },
             Operation::Public(TxOp::OwnedDeadline { .. } | TxOp::OwnedCheckWorldScope { .. } | TxOp::OwnedCheckWorldPurge { .. } | TxOp::OwnedCheckRange { .. } | TxOp::OwnedCheckCapacity { .. } | TxOp::OwnedCheck { .. }) => Ok(()),
             Operation::Public(TxOp::OwnedErase { relation, id }) =>
                 self.erase_owned(relation, id).await,
@@ -972,6 +975,11 @@ impl<'a> OpenTransaction<'a> {
         }
         let retained_release = crate::hosted_control::retained_release_world(operations);
         admitted.extend(retained_release);
+        if retained_release.is_none() && operations.iter().any(|op| matches!(
+            op, Operation::Public(TxOp::OwnedPublishWorld { delete_root: true, .. })
+        )) {
+            return Err(unavailable());
+        }
         if !admitted.is_empty() {
             let context = self.context.query_context(self.snapshot()?, self.tx_key().system_time, &self.options.default_tz, self.trace_parent)?;
             for world in admitted {
@@ -1066,7 +1074,8 @@ impl<'a> OpenTransaction<'a> {
             }
         }
         if let Some(world) = retained_release {
-            if deadline.is_none()
+            let represented = operations.len().saturating_add(2);
+            if represented > 4096 || deadline.is_none()
                 || self.owned_worlds.get(&world).is_none_or(|(record, _)| {
                     record.mode != rtdb_types::WorldClockMode::Retained
                 })

@@ -1961,13 +1961,18 @@ impl Service {
         let ([root_kind], body) = body.split_first_chunk::<1>().ok_or_else(|| invalid("Missing Root section kind"))?;
         let (root_read, body) = match *root_kind {
             0 => (None, body),
-            1 | 2 | 3 => {
+            1 | 2 | 3 | 4 => {
                 let (handle, body) = body.split_first_chunk::<16>().ok_or_else(|| invalid("Missing original Root hold"))?;
                 (Some(self.owned_read(call, &Bytes::copy_from_slice(handle))?), body)
             }
             _ => return Err(invalid("Invalid Root section kind")),
         };
-        let (root_attempt, body) = if *root_kind == 2 {
+        let delete_root = *root_kind == 4;
+        let (root_attempt, body) = if delete_root {
+            if !release_eligible { return Err(invalid("A Root delete requires one retained drop")); }
+            rows_left = rows_left.checked_sub(1).ok_or_else(|| invalid("World batch exceeds its effect limit"))?;
+            (Some(sections[0].attempt.as_str()), body)
+        } else if *root_kind == 2 {
             let (attempt, body) = body.split_first_chunk::<22>().ok_or_else(|| invalid("Missing Root attempt identity"))?;
             let attempt = std::str::from_utf8(attempt).map_err(|_| invalid("Invalid Root attempt identity"))?;
             if !attempt.bytes().all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)) || !attempts.insert(attempt) {
@@ -2001,12 +2006,18 @@ impl Service {
         }
         if let Some(attempt) = root_attempt {
             if root_writes.is_empty() { return Err(invalid("A Root publication requires fact writes")); }
+            if delete_root && !matches!(root_writes.as_slice(), [
+                TxOp::OwnedDelete { valid_from: None, valid_to: None, .. }
+            ]) {
+                return Err(invalid("A retained drop supports one acceptance-valid Root delete"));
+            }
             root.publication = Some(rtdb_node::OwnedRootPublication { attempt: attempt.to_owned(), writes: root_writes });
         }
         let observed_root = !root.checks.is_empty() || !root_witnesses.is_empty();
         let release = *root_kind == 3;
         if (*root_kind == 0 && observed_root) || (*root_kind == 1 && !observed_root)
-            || release != release_eligible || (release && observed_root)
+            || (release || delete_root) != release_eligible || (release && observed_root)
+            || (delete_root && !observed_root)
         {
             return Err(invalid("The Root section kind disagrees with its observations"));
         }
@@ -2014,7 +2025,10 @@ impl Service {
         let controls = owned_groups(body, true, false)?;
         hosted_control::admit_control_targets(policy, controls.iter().map(|(relation, _)| relation))?;
         let scope = self.hosted_control_scope(call).await?;
-        let (controls, _charges) = self.decode_hosted_control_groups(call, controls, scope, &mut rows_left, !release)?;
+        let (controls, _charges) = self.decode_hosted_control_groups(call, controls, scope, &mut rows_left, !release && !delete_root)?;
+        if delete_root && !rtdb_tx::retained_delete_controls(&controls) {
+            return Err(invalid("A Root delete with retained drop requires checked owner settlement"));
+        }
         if release && !rtdb_tx::retained_release_controls(&controls) {
             return Err(invalid("A retained drop needs original checks and existing owner replacements"));
         }
@@ -2026,7 +2040,10 @@ impl Service {
         for resource in &held { resource.snapshot.check().map_err(status)?; }
         if let Some(read) = &root_read {
             read.snapshot.check().map_err(status)?;
-            if read.snapshot.present().system_time >= deadline {
+            if read.snapshot.present().system_time >= deadline
+                || (delete_root && (deadline > read.snapshot.evidence_until()
+                    || read.snapshot.fork_cut(scope).await.map_err(status)?.live().is_none()))
+            {
                 return Err(Status::failed_precondition("Root hold is outside the world batch deadline"));
             }
         }
