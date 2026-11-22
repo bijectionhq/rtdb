@@ -19,6 +19,15 @@ pub struct OwnedMergedChanges {
     complete: bool,
 }
 
+impl OwnedMergedChanges {
+    pub fn covered_through(&self, present: Timestamp) -> Result<Timestamp> {
+        if self.complete {
+            return Ok(present);
+        }
+        self.commits.last().map(|commit| commit.revision).ok_or_else(change_feed_uncovered)
+    }
+}
+
 pub struct OwnedChangeCommit {
     pub revision: Timestamp,
     pub changes: Vec<OwnedRelationChanges>,
@@ -57,14 +66,7 @@ impl OwnedReadSession {
         let page = self
             .merged_changes(std::slice::from_ref(relation), after, limit)
             .await?;
-        let covered_through = if page.complete {
-            self.present.system_time
-        } else {
-            page.commits
-                .last()
-                .ok_or_else(change_feed_uncovered)?
-                .revision
-        };
+        let covered_through = page.covered_through(self.present.system_time)?;
         let groups = page
             .commits
             .into_iter()

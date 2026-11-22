@@ -4479,6 +4479,8 @@ async fn merged_held_changes_resume_only_after_whole_visible_commits() {
     let selected = [second.clone(), empty, first.clone()];
     let page = held.merged_changes(&selected, Timestamp::MIN, 1).await.unwrap();
     assert_eq!(page.commits.len(), 1);
+    let present = held.present().system_time;
+    assert_eq!(page.covered_through(present).unwrap(), joined.tx_key().system_time);
     assert_eq!(page.commits[0].changes.len(), 2);
     assert_eq!(page.commits[0].changes[0].relation, first);
     assert_eq!(page.commits[0].changes[1].relation, second);
@@ -4486,6 +4488,7 @@ async fn merged_held_changes_resume_only_after_whole_visible_commits() {
 
     let next = held.merged_changes(&selected, page.commits[0].revision, 1).await.unwrap();
     assert_eq!(next.commits.len(), 1);
+    assert_eq!(next.covered_through(present).unwrap(), present);
     assert_eq!(next.commits[0].changes.len(), 1);
     assert_eq!(next.commits[0].changes[0].touches[0].id, EntityId::Integer(3));
     assert!(held.merged_changes(&selected, next.commits[0].revision, 1).await.unwrap().commits.is_empty());
