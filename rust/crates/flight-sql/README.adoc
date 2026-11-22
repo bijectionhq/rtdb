@@ -320,7 +320,7 @@ Any intervening event on that owner relation invalidates the witness, including 
 Events on other relations or owners do not invalidate it.
 Count replies carry no range witness.
 
-`rtdb.owned.Commit.v5` uses the same witness prefix with zero through 32 witnesses and the same deadline and Arrow entry framing.
+`rtdb.owned.CommitOrdered.v1` uses the same witness prefix with zero through 32 witnesses and the same deadline and Arrow entry framing.
 It preserves the order of relation runs, and the same relation may appear in multiple runs.
 The commit admits up to 4096 entries across at most 32 distinct relations.
 A check-only request can have zero groups, and this action accepts point and range checks with the ordinary root mutations.
