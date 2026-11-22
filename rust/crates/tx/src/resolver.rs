@@ -704,7 +704,7 @@ impl<'a> OpenTransaction<'a> {
             }
             Operation::Public(TxOp::OwnedPublishWorld { world, attempt, fingerprint, expected, advance_to, drop_world, delete_root }) => {
                 self.publish_owned_world(*world, attempt, *fingerprint, *expected, *advance_to, *drop_world).await?;
-                if *delete_root { self.publish_owned_root_head().await?; }
+                if delete_root.is_some() { self.publish_owned_root_head().await?; }
                 Ok(())
             },
             Operation::Public(TxOp::OwnedDeadline { .. } | TxOp::OwnedCheckWorldScope { .. } | TxOp::OwnedCheckWorldPurge { .. } | TxOp::OwnedCheckRange { .. } | TxOp::OwnedCheckCapacity { .. } | TxOp::OwnedCheck { .. }) => Ok(()),
@@ -976,7 +976,7 @@ impl<'a> OpenTransaction<'a> {
         let retained_release = crate::hosted_control::retained_release_world(operations);
         admitted.extend(retained_release);
         if retained_release.is_none() && operations.iter().any(|op| matches!(
-            op, Operation::Public(TxOp::OwnedPublishWorld { delete_root: true, .. })
+            op, Operation::Public(TxOp::OwnedPublishWorld { delete_root: Some(_), .. })
         )) {
             return Err(unavailable());
         }
@@ -1074,10 +1074,15 @@ impl<'a> OpenTransaction<'a> {
             }
         }
         if let Some(world) = retained_release {
+            let original_pin = operations.iter().find_map(|op| match op {
+                Operation::Public(TxOp::OwnedPublishWorld { delete_root, .. }) => *delete_root,
+                _ => None,
+            });
             let represented = operations.len().saturating_add(2);
             if represented > 4096 || deadline.is_none()
                 || self.owned_worlds.get(&world).is_none_or(|(record, _)| {
                     record.mode != rtdb_types::WorldClockMode::Retained
+                        || original_pin.is_some_and(|pin| pin != record.pin)
                 })
                 || operations.iter().filter(|op| matches!(op, Operation::Public(TxOp::OwnedCheckWorldScope { .. }))).count() != 1
             {

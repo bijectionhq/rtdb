@@ -1856,7 +1856,8 @@ impl NativeSession {
                 OwnedWorldEffect::Drop => (None, true),
             };
             ops.push(TxOp::OwnedPublishWorld { world: section.world, attempt: section.attempt,
-                fingerprint, expected: section.expected_clock, advance_to, drop_world, delete_root });
+                fingerprint, expected: section.expected_clock, advance_to, drop_world,
+                delete_root: delete_root.then_some(section.parent_pin) });
         }
         self.state.execute_tx(ops, Default::default()).await
     }

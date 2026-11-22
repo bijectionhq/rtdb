@@ -509,7 +509,8 @@ fn operation_value<'a>(operation: &'a Operation, memory: &Arc<MemoryBudget>) -> 
             body.insert("attempt".into(), Value::Utf8(attempt.clone()));
             body.insert("fingerprint".into(), Value::Binary(fingerprint.to_vec()));
             body.insert("expected".into(), expected.map_or(Value::Null, |time| Value::I64(time.0)));
-            if *delete_root {
+            if let Some(pin) = delete_root {
+                body.insert("pin".into(), Value::Uuid(pin.0));
                 "rtdb-owned-drop-with-root-delete-v1"
             } else if *drop_world {
                 "rtdb-owned-drop-world-v1"
@@ -1202,7 +1203,8 @@ impl SourceOperationReader<'_> {
             "rtdb-owned-fork-world-v2" | "rtdb-owned-root-retained-fork-v1" | "rtdb-owned-controls-retained-fork-v1"
             | "rtdb-owned-controls-proposal-fork-v1" => &["registration", "previous", "attempt", "fingerprint"],
             "rtdb-owned-publish-root-v1" => &["attempt", "fingerprint"],
-            "rtdb-owned-publish-world-v1" | "rtdb-owned-drop-world-v1" | "rtdb-owned-drop-with-root-delete-v1" => &["world", "attempt", "fingerprint", "expected"],
+            "rtdb-owned-publish-world-v1" | "rtdb-owned-drop-world-v1" => &["world", "attempt", "fingerprint", "expected"],
+            "rtdb-owned-drop-with-root-delete-v1" => &["world", "attempt", "fingerprint", "expected", "pin"],
             "rtdb-owned-publish-world-v2" => &["world", "attempt", "fingerprint", "expected", "advance_to"],
             "rtdb-owned-check-world-purge-v3" => &["relation", "pin", "frontier", "local_frontier"],
             "rtdb-owned-check-world-scope-v1" => &["scope"],
@@ -1268,7 +1270,10 @@ impl SourceOperationReader<'_> {
                 TxOp::OwnedPublishWorld {
                     world: rtdb_types::Iid(world), attempt, fingerprint,
                     drop_world: matches!(name.as_str(), "rtdb-owned-drop-world-v1" | "rtdb-owned-drop-with-root-delete-v1"),
-                    delete_root: name == "rtdb-owned-drop-with-root-delete-v1",
+                    delete_root: if name == "rtdb-owned-drop-with-root-delete-v1" {
+                        let Value::Uuid(pin) = value("pin")? else { return Err(invalid("Retained Root delete has no original pin")); };
+                        Some(Iid(pin))
+                    } else { None },
                     advance_to: if name == "rtdb-owned-publish-world-v2" {
                         let Value::I64(to) = value("advance_to")? else {
                             return Err(invalid("Invalid world clock advance target"));

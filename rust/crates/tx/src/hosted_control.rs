@@ -61,7 +61,7 @@ pub(crate) fn retained_release_world(operations: &[crate::source::Operation]) ->
                 world: next, expected: None, advance_to: None, drop_world: true, delete_root: writes, ..
             }) if world.is_none() => {
                 world = Some(*next);
-                delete_root = *writes;
+                delete_root = writes.is_some();
             }
             _ => return None,
         }
@@ -209,7 +209,7 @@ mod retained_release_tests {
             expected: None,
             advance_to: None,
             drop_world: true,
-            delete_root: false,
+            delete_root: None,
         };
         let world = Iid([1; 16]);
         let mut operations = [

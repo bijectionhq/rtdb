@@ -91,7 +91,7 @@ pub(crate) fn source_inventory(operations: &[Operation]) -> Result<Vec<Value>> {
         Operation::Public(TxOp::OwnedPublishRoot { attempt, fingerprint }) =>
             Some(Ok((ROOT, Kind::Root, attempt, fingerprint))),
         Operation::Public(TxOp::OwnedPublishWorld { world, attempt, fingerprint, advance_to, drop_world, delete_root, .. }) => {
-            let kind = if *delete_root { Kind::RootRetainedDrop }
+            let kind = if delete_root.is_some() { Kind::RootRetainedDrop }
                 else if retained_release == Some(*world) { Kind::ControlsRetainedDrop }
                 else if *drop_world { Kind::Drop }
                 else if advance_to.is_some() { Kind::Clock }
