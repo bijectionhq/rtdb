@@ -330,6 +330,14 @@ impl TableRef {
             .filter(|relation| !relation.is_world_catalog()).map(|_| relation)
     }
 
+    /// The Root relation in the same owner namespace as this actual world table.
+    pub fn owned_world_root_table(&self) -> Option<Self> {
+        let name = self.owned_storage_name()?;
+        let relation = OwnedRelation::from_source(name.to_owned()).ok()?.root_relation()?;
+        let (owner, _) = self.table.split_once('-')?;
+        Some(Self::new(OWNED_SCHEMA_V1, format!("{owner}-{}", relation.name())))
+    }
+
     pub fn is_owned_change_journal(&self) -> bool {
         self.owned_storage_name().is_some_and(|name| name.starts_with(OWNED_CHANGE_PREFIX))
     }

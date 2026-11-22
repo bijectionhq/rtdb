@@ -141,30 +141,42 @@ impl HeldCheckpointWorld {
 
     pub async fn point(&self, relation: &OwnedRelation, id: &EntityId, valid_at: Timestamp, observed: bool) -> Result<WorldPoint> {
         self.check_relation(relation)?;
-        let valid = Interval::at(valid_at)?;
         let (local, witness) = self.open.read_local(relation, id, valid_at, &self.memory, observed).await?;
         let shadowed = local.is_some();
         let fact = if let Some(fact) = local {
             fact
         } else {
-            self.open.snapshot.check_point_purge_floor(relation, id, self.open.retained.basis.system_time).await?;
-            let (reply, result) = oneshot::channel();
-            self.cancellation.run_until_cancelled(self.requests.send(ArchiveRead::Point(ArchivePoint {
-                relation: relation.clone(), id: id.clone(), valid, guard: self.open.snapshot.relation_release_guard([relation])?, reply,
-            }))).await.ok_or_else(OwnedWorld::unavailable)?.map_err(|_| OwnedWorld::unavailable())?;
-            self.cancellation.run_until_cancelled(result).await
-                .ok_or_else(OwnedWorld::unavailable)?.map_err(|_| OwnedWorld::unavailable())??
+            self.archive_point(relation, id, valid_at).await?
         };
         self.check_relation(relation)?;
         Ok(WorldPoint { present: self.present(), fact, shadowed, witness })
+    }
+
+    pub async fn parent_point(&self, relation: &OwnedRelation, id: &EntityId, valid_at: Timestamp) -> Result<WorldPoint> {
+        self.check_relation(relation)?;
+        let fact = self.archive_point(relation, id, valid_at).await?;
+        self.check_relation(relation)?;
+        Ok(WorldPoint { present: self.present(), fact, shadowed: false, witness: None })
+    }
+
+    async fn archive_point(&self, relation: &OwnedRelation, id: &EntityId, valid_at: Timestamp) -> Result<Option<WorldFact>> {
+        let valid = Interval::at(valid_at)?;
+        self.open.snapshot.check_point_purge_floor(relation, id, self.open.retained.basis.system_time).await?;
+        let (reply, result) = oneshot::channel();
+        self.cancellation.run_until_cancelled(self.requests.send(ArchiveRead::Point(ArchivePoint {
+            relation: relation.clone(), id: id.clone(), valid, guard: self.open.snapshot.relation_release_guard([relation])?, reply,
+        }))).await.ok_or_else(OwnedWorld::unavailable)?.map_err(|_| OwnedWorld::unavailable())?;
+        self.cancellation.run_until_cancelled(result).await
+            .ok_or_else(OwnedWorld::unavailable)?.map_err(|_| OwnedWorld::unavailable())?
     }
     pub async fn ranked_search(
         &self, partitions: Vec<(OwnedRelation, OwnedRelation)>, query: String, offset: usize, limit: usize,
         valid: Timestamp,
     ) -> Result<(rtdb_node::OwnedSearchPage, Vec<OwnedWorldWitness>)> {
         self.check()?;
+        if self.is_held() { return Err(OwnedWorld::unavailable()); }
         let guard = self.open.snapshot.relation_release_guard(partitions.iter().map(|(relation, _)| relation))?;
-        let witnesses = self.open.snapshot.retained_world_relation_witnesses(
+        let witnesses = self.open.snapshot.world_relation_witnesses(
             self.open.record.id, partitions.iter().map(|(relation, _)| relation),
         ).await?;
         let frontiers = witnesses.iter().map(OwnedWorldWitness::purge_frontier).collect();
@@ -190,6 +202,19 @@ impl HeldCheckpointWorld {
         Ok((page, witness))
     }
 
+    pub async fn overlay_range(
+        &self, relation: OwnedRelation, path: OwnedRelation, request: OwnedRangeRequest<'_>, valid: Timestamp,
+    ) -> Result<(OwnedRangePage, OwnedWorldWitness)> {
+        self.check_relation(&relation)?;
+        if !self.is_held() { return Err(OwnedWorld::unavailable()); }
+        let world = self.open.record.id;
+        let witness = self.open.snapshot.world_relation_witnesses(world, [&relation])
+            .await?.pop().ok_or_else(OwnedWorld::unavailable)?;
+        let page = self.open.snapshot.range_world_overlay(world, &relation, &path, request, valid).await?;
+        self.check_relation(&relation)?;
+        Ok((page, witness))
+    }
+
     pub async fn count(
         &self, relation: OwnedRelation, path: OwnedRelation, request: OwnedCountRequest<'_>,
     ) -> Result<(u64, OwnedWorldWitness)> {
@@ -205,7 +230,7 @@ impl HeldCheckpointWorld {
         self.check_relation(&relation)?;
         Interval::at(valid)?;
         let guard = self.open.snapshot.relation_release_guard([&relation])?;
-        let witness = self.open.snapshot.retained_world_relation_witnesses(
+        let witness = self.open.snapshot.world_relation_witnesses(
             self.open.record.id, [&relation],
         ).await?.pop().ok_or_else(OwnedWorld::unavailable)?;
         let (reply, result) = oneshot::channel();
@@ -318,6 +343,21 @@ impl HeldCheckpointWorld {
             }
         }
         if !complete { return Err(OwnedWorld::unavailable()); }
+        self.check_relation(relation)?;
+        Ok(WorldIdentityPage { keys, more, reservations })
+    }
+
+    pub async fn overlay_identities(
+        &self, relation: &OwnedRelation, valid: Timestamp, after: Option<&str>, limit: usize,
+    ) -> Result<WorldIdentityPage> {
+        self.check_relation(relation)?;
+        if !(1..=128).contains(&limit) || !self.is_held() { return Err(OwnedWorld::unavailable()); }
+        let candidates = self.open.snapshot.world_identity_candidates(
+            self.open.record.id, relation, valid, after, limit + 1,
+        ).await?;
+        let (mut keys, reservations) = candidates.into_parts();
+        let more = keys.len() > limit;
+        keys.truncate(limit);
         self.check_relation(relation)?;
         Ok(WorldIdentityPage { keys, more, reservations })
     }

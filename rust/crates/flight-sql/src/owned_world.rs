@@ -64,6 +64,9 @@ pub trait OwnedWorldRead: Send + Sync {
     fn count<'a>(
         &'a self, relation: OwnedRelation, path: OwnedRelation, request: OwnedCountRequest<'a>,
     ) -> BoxFuture<'a, Result<(u64, OwnedWorldWitness)>>;
+    fn overlay_range<'a>(
+        &'a self, relation: OwnedRelation, path: OwnedRelation, request: OwnedRangeRequest<'a>, valid: Timestamp,
+    ) -> BoxFuture<'a, Result<(OwnedRangePage, OwnedWorldWitness)>>;
     fn parent_pin(&self) -> rtdb_types::Iid;
     fn until(&self) -> Timestamp;
     fn evidence_until(&self) -> Timestamp;
@@ -78,7 +81,13 @@ pub trait OwnedWorldRead: Send + Sync {
     fn identity_page<'a>(
         &'a self, relation: &'a OwnedRelation, valid: Timestamp, after: Option<&'a str>, limit: usize,
     ) -> BoxFuture<'a, Result<WorldIdentityPage>>;
+    fn overlay_identities<'a>(
+        &'a self, relation: &'a OwnedRelation, valid: Timestamp, after: Option<&'a str>, limit: usize,
+    ) -> BoxFuture<'a, Result<WorldIdentityPage>>;
     fn read_point<'a>(
         &'a self, relation: &'a OwnedRelation, id: &'a EntityId, valid_at: Timestamp, observed: bool,
+    ) -> BoxFuture<'a, Result<WorldPointResult>>;
+    fn read_parent_point<'a>(
+        &'a self, relation: &'a OwnedRelation, id: &'a EntityId, valid_at: Timestamp,
     ) -> BoxFuture<'a, Result<WorldPointResult>>;
 }

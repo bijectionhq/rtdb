@@ -961,7 +961,7 @@ pub enum TxOp {
     OwnedForkWorld { record: StructFields<Value>, previous: Option<rtdb_types::Iid>, attempt: String, fingerprint: [u8; 32] },
     OwnedPublishRoot { attempt: String, fingerprint: [u8; 32] },
     OwnedPublishWorld { world: rtdb_types::Iid, attempt: String, fingerprint: [u8; 32], expected: Option<Timestamp>, advance_to: Option<Timestamp>, drop_world: bool },
-    OwnedCheckWorldPurge { relation: rtdb_types::OwnedRelation, pin: rtdb_types::Iid, frontier: i64 },
+    OwnedCheckWorldPurge { relation: rtdb_types::OwnedRelation, pin: rtdb_types::Iid, frontier: i64, local_frontier: Option<i64> },
     OwnedCheckRange {
         relation: rtdb_types::OwnedRelation, basis: rtdb_types::TransactionKey,
         scope: rtdb_types::PlacedAttemptScope, frontier: i64, until: Timestamp,
