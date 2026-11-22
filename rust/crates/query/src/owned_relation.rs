@@ -39,22 +39,18 @@ pub async fn open_owned_point_at_system(
     open_owned_point(context, owner, relation, id, Some(valid), None).await
 }
 
-fn owned_context_at_system(mut context: Arc<QueryContext>, system: Timestamp) -> Result<Arc<QueryContext>> {
+fn owned_context_at_system(context: Arc<QueryContext>, system: Timestamp) -> Result<Arc<QueryContext>> {
     let held = context.current_time.as_micros()?;
     let database = context.catalog.database(context.catalog.default_database())?;
     let [snapshot] = database.partitions.as_slice() else { return Err(address_unavailable()); };
     if snapshot.system_time_cap() != Some(held) || system > held {
         return Err(Anomaly::new(AnomalyCategory::Unavailable, "rtdb.owned/history-cut", "Owned history requires an exact retained system cut"));
     }
-    if system != held {
-        let historical = snapshot.clone().with_system_time_cap(Some(system))?;
-        let changed = Arc::make_mut(&mut context);
-        let database = changed.catalog.databases.get_mut(&changed.catalog.default_database)
-            .ok_or_else(address_unavailable)?;
-        database.partitions[0] = historical;
-        changed.current_time = system.into();
+    if system == held {
+        Ok(context)
+    } else {
+        context.with_owned_system_cut(system, &context.cancellation)
     }
-    Ok(context)
 }
 
 /// Returns the held system point's winning rows across a clipped business-valid window.

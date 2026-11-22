@@ -24,7 +24,10 @@ impl OwnedMergedChanges {
         if self.complete {
             return Ok(present);
         }
-        self.commits.last().map(|commit| commit.revision).ok_or_else(change_feed_uncovered)
+        self.commits
+            .last()
+            .map(|commit| commit.revision)
+            .ok_or_else(change_feed_uncovered)
     }
 }
 
@@ -224,16 +227,17 @@ impl OwnedReadSession {
         &self,
         relation: &OwnedRelation,
         at: Timestamp,
-    ) -> Result<()> {
+    ) -> Result<Option<Timestamp>> {
         let database = self.context.catalog.database(&self.database)?;
         let [snapshot] = database.partitions.as_slice() else {
             return Err(change_feed_uncovered());
         };
-        if let Some(covered) = self.covered_journal(snapshot, relation, at).await? {
-            self.require_journal_head(relation, covered.head_revision, covered.head)
-                .await?;
-        }
-        Ok(())
+        let Some(covered) = self.covered_journal(snapshot, relation, at).await? else {
+            return Ok(None);
+        };
+        self.require_journal_head(relation, covered.head_revision, covered.head)
+            .await?;
+        Ok((covered.floor.through_events != 0).then_some(covered.floor.committed_at))
     }
 
     async fn covered_journal(
