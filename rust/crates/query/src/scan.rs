@@ -1891,6 +1891,91 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn multi_column_distinct_and_set_operations_select_arrow_rows() {
+        use rtdb_plan::{BinaryOp, NamedExpr, Relation, RelationNode, SetOperator};
+
+        let (state, table, _, store, _) = persisted_page_fixture().await;
+        let storage = Arc::new(BufferPool::new(store, 1 << 20));
+        let (scan, execution, memory) = descriptor_scan(state.value().snapshot(), table, storage);
+        let first = scan.columns[0].clone();
+        let mut second = first.clone();
+        second.id = ColumnId(10);
+        second.name = "again".into();
+        let project = Arc::new(Arc::new(Relation::scan(scan).unwrap()).project(vec![
+            NamedExpr { field: first.clone(), expr: first.expression() },
+            NamedExpr { field: second, expr: first.expression() },
+        ]).unwrap());
+        let set = |left: Arc<Relation>, right, operator, all| {
+            Arc::new(Relation::new(left.schema().clone(), RelationNode::Set { left, right, operator, all }).unwrap())
+        };
+        let repeated = set(Arc::clone(&project), Arc::clone(&project), SetOperator::Union, true);
+        let right = Arc::new(Arc::clone(&project).filter(Expr::binary(BinaryOp::Eq, first.expression(), Expr::Literal(Value::I64(2)))).unwrap());
+        let distinct = Arc::new(Relation::new(repeated.schema().clone(), RelationNode::Distinct { input: Arc::clone(&repeated) }).unwrap());
+        for (relation, expected) in [
+            (distinct, vec![1, 2, 3]),
+            (set(Arc::clone(&repeated), Arc::clone(&right), SetOperator::Union, false), vec![1, 2, 3]),
+            (set(Arc::clone(&repeated), Arc::clone(&right), SetOperator::Intersect, true), vec![2]),
+            (set(Arc::clone(&repeated), Arc::clone(&right), SetOperator::Except, true), vec![1, 3, 1, 2, 3]),
+            (set(Arc::clone(&repeated), Arc::clone(&right), SetOperator::Except, false), vec![1, 3]),
+        ] {
+            let runtime = crate::runtime_schema::EmittedRelation::derive(relation, &execution.context.catalog, &[], &memory).unwrap();
+            let mut cursor = crate::operators::build_columns(runtime, execution.clone()).await.unwrap().expect("Expected a set batch cursor");
+            let mut actual = Vec::new();
+            while let Some(page) = cursor.next_batch().await.unwrap() {
+                let [crate::columnar::Column::Arrow { array: first, .. }, crate::columnar::Column::Arrow { array: second, .. }] = page.columns.as_slice() else {
+                    panic!("Expected the set output to retain Arrow columns");
+                };
+                let first = first.as_any().downcast_ref::<arrow_array::Int64Array>().unwrap();
+                let second = second.as_any().downcast_ref::<arrow_array::Int64Array>().unwrap();
+                assert_eq!(first.values(), second.values());
+                actual.extend(first.values().iter().copied());
+            }
+            assert_eq!(actual, expected);
+        }
+    }
+
+    #[tokio::test]
+    async fn outer_unnest_expands_list_positions_and_keeps_arrow_payloads() {
+        use rtdb_plan::{Relation, RelationNode, Schema};
+
+        let (state, table, _) = live_table_with_values(vec![
+            Value::List(vec![Value::I64(10), Value::I64(20)]),
+            Value::Null,
+            Value::List(vec![Value::I64(30)]),
+        ]);
+        let storage = Arc::new(BufferPool::new(Arc::new(MemoryStore::default()), 1 << 20));
+        let (scan, execution, memory) = descriptor_scan(state.value().snapshot(), table, storage);
+        let expr = scan.columns[0].expression();
+        let mut element = scan.columns[0].clone();
+        element.id = ColumnId(10);
+        element.name = "element".into();
+        element.data_type = LogicalType::Scalar(ScalarType::I64).maybe();
+        let mut ordinal = element.clone();
+        ordinal.id = ColumnId(11);
+        ordinal.name = "ordinal".into();
+        ordinal.data_type = LogicalType::Scalar(ScalarType::I32).maybe();
+        let scan = Arc::new(Relation::scan(scan).unwrap());
+        let schema = scan.schema().concat(&Schema::new(vec![element.clone(), ordinal.clone()]).unwrap()).unwrap();
+        let relation = Arc::new(Relation::new(schema, RelationNode::Unnest {
+            input: scan, expr, element, ordinality: Some(ordinal), outer: true,
+        }).unwrap());
+        let runtime = crate::runtime_schema::EmittedRelation::derive(relation, &execution.context.catalog, &[], &memory).unwrap();
+        let mut cursor = crate::operators::build_columns(runtime, execution).await.unwrap().expect("Expected a batch unnest");
+        let mut elements = Vec::new();
+        let mut ordinals = Vec::new();
+        while let Some(page) = cursor.next_batch().await.unwrap() {
+            assert!(matches!(page.columns[1], crate::columnar::Column::Selected(_)));
+            assert!(matches!(page.columns[2], crate::columnar::Column::Arrow { .. }));
+            for row in 0..page.len {
+                elements.push(page.columns[1].value(row).unwrap());
+                ordinals.push(page.columns[2].value(row).unwrap());
+            }
+        }
+        assert_eq!(elements, [Value::I64(10), Value::I64(20), Value::Null, Value::I64(30)]);
+        assert_eq!(ordinals, [Value::I32(1), Value::I32(2), Value::Null, Value::I32(1)]);
+    }
+
+    #[tokio::test]
     async fn a_data_page_outside_its_metadata_path_fails_every_scan_that_reads_it() {
         let (state, table, _, store, _) = persisted_pages(true).await;
         let storage = Arc::new(BufferPool::new(store, 1 << 20));

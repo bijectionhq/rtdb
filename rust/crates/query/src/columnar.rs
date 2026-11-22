@@ -217,6 +217,123 @@ impl ColumnBatch {
         Self::settled(columns, rows, reservation)
     }
 
+    pub(crate) fn expand_list(&self, position: usize, ordinality: Option<&str>, outer: bool, context: &crate::QueryContext)
+        -> Result<Option<Self>> {
+        let memory = &context.memory;
+        let base = self.len.checked_mul(512).and_then(|bytes| bytes.checked_add(4096)).ok_or_else(size_error)?;
+        let mut selection = memory.reserve(base)?;
+        let mut inputs = HashMap::new();
+        let mut layouts = HashSet::new();
+        let mut sources = vec![None];
+        let mut spans = Vec::with_capacity(self.len);
+        let mut rows = 0usize;
+        let list = &self.columns[position];
+        for row in 0..self.len {
+            context.check_cancelled_at(row)?;
+            let vector = match list {
+                Column::Arrow { array, field, logical } => Some((array, field, logical.as_ref(), row, Some(&self._reservation))),
+                Column::Selected(selected) => selected.source(row)?.map(|((array, field, logical, custody), offset)| {
+                    (array, field, logical.as_ref(), offset, custody.as_ref())
+                }),
+                Column::Values(_) => return Ok(None),
+            };
+            let (source, start, count) = match vector {
+                None => (0, 0, 0),
+                Some((array, field, logical, offset, custody)) => {
+                    let Some(logical) = logical else { return Ok(None); };
+                    let layout = (Arc::as_ptr(field), std::ptr::from_ref(logical));
+                    if layouts.insert(layout) {
+                        let lease = Arc::get_mut(&mut selection).expect("Unnest owns the selection reservation");
+                        let bytes = field.size().checked_mul(8).ok_or_else(size_error)?;
+                        lease.grow_to(lease.bytes().checked_add(bytes).ok_or_else(size_error)?)?;
+                        if !stable_read_layout(logical, field) || !readable_list_type(logical, field) {
+                            return Ok(None);
+                        }
+                    }
+                    if array.is_null(offset) || *logical == LogicalType::Null {
+                        (0, 0, 0)
+                    } else {
+                        let (field, values, start, count) = match array.data_type() {
+                            DataType::List(field) => {
+                                use arrow_array::cast::AsArray;
+                                let list = array.as_list::<i32>();
+                                let offsets = list.value_offsets();
+                                let start = offsets[offset] as usize;
+                                (field, list.values(), start, offsets[offset + 1] as usize - start)
+                            }
+                            DataType::FixedSizeList(field, width) => {
+                                use arrow_array::cast::AsArray;
+                                let width = *width as usize;
+                                let list = array.as_fixed_size_list();
+                                (field, list.values(), offset * width, width)
+                            }
+                            _ => return Ok(None),
+                        };
+                        let key = (Arc::as_ptr(values).cast::<()>(), Arc::as_ptr(field));
+                        let source = if let Some(&source) = inputs.get(&key) {
+                            source
+                        } else {
+                            let lease = Arc::get_mut(&mut selection).expect("Unnest owns the selection reservation");
+                            let bytes = field.size().checked_mul(8).ok_or_else(size_error)?;
+                            lease.grow_to(lease.bytes().checked_add(bytes).ok_or_else(size_error)?)?;
+                            let source = sources.len();
+                            sources.push(Some((Arc::clone(values), Arc::clone(field), Some(rtdb_columnar::from_field(field)?), custody.cloned())));
+                            inputs.insert(key, source);
+                            source
+                        };
+                        (source, start, count)
+                    }
+                }
+            };
+            if ordinality.is_some() && i32::try_from(count).is_err() {
+                return Err(invalid("ordinality-overflow", "List ordinal exceeds signed32 bits"));
+            }
+            rows = rows.checked_add(if outer { count.max(1) } else { count }).ok_or_else(size_error)?;
+            spans.push((source, start, count));
+        }
+        let ordinal_bytes = if ordinality.is_some() { std::mem::size_of::<Option<i32>>() + std::mem::size_of::<i32>() + 1 } else { 0 };
+        let width = self.columns.len() + 1 + usize::from(ordinality.is_some());
+        let bytes = rows.checked_mul(2 * std::mem::size_of::<(usize, usize)>() + ordinal_bytes)
+            .and_then(|bytes| width.checked_mul(std::mem::size_of::<Column>()).and_then(|width| bytes.checked_add(width)))
+            .and_then(|bytes| bytes.checked_add(4096)).ok_or_else(size_error)?;
+        let mut reservation = memory.reserve(bytes)?;
+        let mut parents = Vec::with_capacity(rows);
+        let mut children = Vec::with_capacity(rows);
+        let mut ordinals = if ordinality.is_some() { Vec::with_capacity(rows) } else { Vec::new() };
+        for (parent, (source, start, count)) in spans.into_iter().enumerate() {
+            for index in 0..count {
+                context.check_cancelled_at(index)?;
+                parents.push((0, parent));
+                children.push((source, start + index));
+                if ordinality.is_some() { ordinals.push(Some((index + 1) as i32)); }
+            }
+            if outer && count == 0 {
+                parents.push((0, parent));
+                children.push((0, 0));
+                if ordinality.is_some() { ordinals.push(None); }
+            }
+        }
+        let expanded = Column::Selected(SelectedColumn::new(sources, Arc::new(children)));
+        let mut columns = Vec::with_capacity(width);
+        for index in 0..self.columns.len() {
+            let column = if rows == 0 { Column::Values(Vec::new()) } else {
+                let (column, _scratch) = gather_column_rows(|_| self, &parents, index, memory)?;
+                let lease = Arc::get_mut(&mut reservation).expect("Unnest owns the output reservation");
+                lease.grow_to(lease.bytes().checked_add(column.retained_bytes()?).ok_or_else(size_error)?)?;
+                column
+            };
+            columns.push(column);
+        }
+        columns.push(expanded);
+        if let Some(name) = ordinality {
+            let array = Arc::new(arrow_array::Int32Array::from(ordinals));
+            let field = Arc::new(ArrowField::new(name, DataType::Int32, outer));
+            let logical = LogicalType::Scalar(rtdb_types::ScalarType::I32);
+            columns.push(Column::Arrow { array, field, logical: Some(if outer { logical.maybe() } else { logical }) });
+        }
+        Self::settled(columns, rows, reservation).map(Some)
+    }
+
     /// A page of columns allocated under `reservation`, whose charge becomes exactly what they retain.
     pub fn settled(columns: Vec<Column>, len: usize, mut reservation: Arc<MemoryReservation>) -> Result<Self> {
         let bytes = columns.iter().try_fold(256usize, |bytes, column| bytes.checked_add(column.retained_bytes()?).ok_or_else(size_error))?;
@@ -1283,6 +1400,25 @@ impl SelectedColumn {
 
 fn stable_read_layout(logical: &LogicalType, field: &ArrowField) -> bool {
     stable_values(logical) && rtdb_columnar::execution_type(logical) == *logical && rtdb_columnar::from_field(field).is_ok_and(|ty| ty == *logical)
+}
+
+fn readable_list_type(logical: &LogicalType, field: &ArrowField) -> bool {
+    fn readable(field: &ArrowField) -> bool {
+        match field.data_type() {
+            DataType::Null => field.is_nullable(),
+            DataType::Union(..) => false,
+            DataType::Struct(fields) => fields.iter().all(|child| readable(child)),
+            DataType::List(child) | DataType::FixedSizeList(child, _) | DataType::Map(child, _) => readable(child),
+            _ => true,
+        }
+    }
+    let logical = match logical { LogicalType::Maybe(inner) => inner.as_ref(), ty => ty };
+    match (logical, field.data_type()) {
+        (LogicalType::Null, DataType::Null) => true,
+        (LogicalType::List { kind: ListKind::List | ListKind::FixedSizeList(_) | ListKind::Set, .. },
+         DataType::List(child) | DataType::FixedSizeList(child, _)) => readable(child),
+        _ => false,
+    }
 }
 
 fn stable_values(logical: &LogicalType) -> bool {
