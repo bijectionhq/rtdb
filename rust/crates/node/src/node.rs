@@ -935,6 +935,17 @@ impl OwnedReadSession {
         self.range_page(relation, path, crate::ordered_index::RowBounds::Compound(request)).await
     }
 
+    /// Counts a covered full-key range at this held system cut and an explicit valid instant.
+    pub async fn count_range(
+        &self, relation: &rtdb_types::OwnedRelation, path: &rtdb_types::OwnedRelation,
+        request: crate::OwnedCountRequest<'_>,
+    ) -> Result<crate::OwnedRangeCount> {
+        self.admit_read().await?;
+        let result = crate::ordered_index::owned_count(Arc::clone(&self.context), &self.owner, relation, path, request).await?;
+        self.check()?;
+        Ok(result)
+    }
+
     async fn range_page(
         &self, relation: &rtdb_types::OwnedRelation, path: &rtdb_types::OwnedRelation,
         bounds: crate::ordered_index::RowBounds<'_>,

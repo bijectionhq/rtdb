@@ -1,6 +1,6 @@
 use std::{collections::BTreeSet, sync::Arc, time::Duration};
 
-use arrow_array::{Array, Float64Array, Int64Array, RecordBatch};
+use arrow_array::{Array, Float64Array, Int64Array, RecordBatch, UInt64Array};
 use arrow_flight::Result as ActionResult;
 use arrow_ipc::writer::IpcWriteOptions;
 use arrow_schema::{DataType, Field, Schema};
@@ -8,7 +8,7 @@ use bytes::Bytes;
 use prost::Message;
 use rtdb_columnar::{MemoryReservation, OwnedBatch};
 use rtdb_format::ipc::{OwnedStream, write_arrow_stream};
-use rtdb_node::{NativeSession, OwnedRangeRequest, OwnedReadSession, TransactionStatus};
+use rtdb_node::{NativeSession, OwnedCountRequest, OwnedRangeRequest, OwnedReadSession, TransactionStatus};
 use rtdb_query::QueryCursor;
 use rtdb_tx::{Documents, TxOp};
 use rtdb_types::{EntityId, LogicalType, OwnedRelation, ScalarType, StructFields, TimeUnit, Timestamp, Value};
@@ -94,6 +94,7 @@ pub(crate) const CLOSE_OWNED_READ_V1: &str = "rtdb.owned.CloseRead.v1";
 pub(crate) const SEARCH_HELD_OWNED_V1: &str = "rtdb.owned.SearchHeld.v1";
 pub(crate) const HELD_OWNED_RANGE_V1: &str = "rtdb.owned.ReadHeldRange.v1";
 pub(crate) const HELD_OWNED_RANGE_V2: &str = "rtdb.owned.ReadHeldRange.v2";
+pub(crate) const HELD_OWNED_COUNT_V1: &str = "rtdb.owned.CountHeldRange.v1";
 const READ_IDLE: Duration = Duration::from_secs(60);
 const OWNED_PRESENT: &str = "rtdb.owned.present_micros";
 const OWNED_VALID: &str = "rtdb.owned.valid_micros";
@@ -401,6 +402,39 @@ impl Service {
         }.map_err(status)?;
         let present = held.snapshot.present().system_time;
         let reply = self.owned_point_reply(&page.schema, page.batch.as_ref().map(OwnedBatch::batch), present, present, None)?;
+        held.snapshot.check().map_err(status)?;
+        Ok(reply)
+    }
+
+    pub(crate) async fn held_owned_count_action(&self, call: &Call, body: &[u8]) -> Result<ActionResult, Status> {
+        if !self.0.config.owned_native_actions { return Err(unsupported()); }
+        let (handle, request) = body.split_first_chunk::<16>().ok_or_else(|| invalid("Owned held count has no handle"))?;
+        let handle = Bytes::copy_from_slice(handle);
+        let held = self.owned_read(call, &handle)?;
+        if let Err(error) = held.snapshot.check() {
+            if let Lookup::Found(entry) = self.0.owned_reads.take(&handle) { entry.close(); }
+            return Err(status(error));
+        }
+        let (relation, arrow) = split_relation(request)?;
+        let batch = decode_batch(call, arrow)?;
+        if batch.batch().num_rows() != 1 || batch.batch().num_columns() != 4 {
+            return Err(invalid("Owned count requires one row with path, lower, upper and valid_micros"));
+        }
+        let (mut rows, _decoded) = upload::domain_documents(batch.batch(), self)?;
+        let row = rows.pop().expect("validated one row");
+        let (Some(Value::Utf8(path)), Some(lower), Some(upper), Some(Value::I64(valid))) =
+            (row.get("path"), row.get("lower"), row.get("upper"), row.get("valid_micros"))
+        else { return Err(invalid("Owned count fields have invalid types")); };
+        let path = OwnedRelation::new(path.as_str()).map_err(status)?;
+        let request = OwnedCountRequest {
+            lower: compound_bound(Some(lower))?,
+            upper: compound_bound(Some(upper))?,
+            valid_at: Timestamp(*valid),
+        };
+        let counted = held.snapshot.count_range(&relation, &path, request).await.map_err(status)?;
+        let schema = Arc::new(Schema::new(vec![Field::new("count", DataType::UInt64, false)]));
+        let batch = RecordBatch::try_new(Arc::clone(&schema), vec![Arc::new(UInt64Array::from(vec![counted.count]))]).map_err(arrow)?;
+        let reply = self.owned_point_reply(&schema, Some(&batch), counted.present, counted.valid_at, None)?;
         held.snapshot.check().map_err(status)?;
         Ok(reply)
     }

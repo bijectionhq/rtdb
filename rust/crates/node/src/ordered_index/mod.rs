@@ -26,7 +26,7 @@ pub(crate) use maintenance::OrderedIndexMaintenance;
 pub(crate) use usage::Inventory;
 
 use rtdb_format::keys::ORDERED_INDEX_ROOT as INDEX_ROOT;
-const PAGE_LAYOUT_VERSION: u8 = 5;
+const PAGE_LAYOUT_VERSION: u8 = 6;
 const CATALOG: (&str, &str) = ("xt", "ordered_indexes");
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -180,8 +180,24 @@ pub struct OwnedRangeRequest<'a> {
     pub limit: usize,
 }
 
+pub struct OwnedCountRequest<'a> {
+    pub lower: Option<&'a rtdb_types::StructFields<Value>>,
+    pub upper: Option<&'a rtdb_types::StructFields<Value>>,
+    pub valid_at: rtdb_types::Timestamp,
+}
+
+pub struct OwnedRangeCount {
+    pub count: u64,
+    pub present: rtdb_types::Timestamp,
+    pub valid_at: rtdb_types::Timestamp,
+}
+
 fn uncovered_owned_range() -> Anomaly {
-    Anomaly::new(rtdb_types::AnomalyCategory::Unavailable, "rtdb.owned/path-uncovered", "The held basis has no fully covered generation of this owned path")
+    Anomaly::new(
+        rtdb_types::AnomalyCategory::Unavailable,
+        "rtdb.owned/path-uncovered",
+        "The held basis has no fully covered generation of this owned path",
+    )
 }
 
 pub(crate) async fn owned_range(
@@ -191,18 +207,56 @@ pub(crate) async fn owned_range(
     path: &rtdb_types::OwnedRelation,
     bounds: RowBounds<'_>,
 ) -> Result<OwnedRangePage> {
-    let catalog = rtdb_types::OwnedRelation::path_catalog(owner);
-    let target = relation.table(owner);
-    let cursor = rtdb_query::open_owned_path_catalog(Arc::clone(&context), &catalog, Some(path.name())).await?
-        .ok_or_else(uncovered_owned_range)?;
-    let mut definitions = read_definitions(cursor).await?.into_iter();
-    let definition = definitions.next()
-        .filter(|definition| definition.name == path.name() && definition.table == target && definitions.next().is_none())
-        .ok_or_else(uncovered_owned_range)?;
-    let database = context.catalog.database(context.catalog.default_database())?;
-    let [snapshot] = database.partitions.as_slice() else { return Err(uncovered_owned_range()); };
+    let definition = owned_definition(&context, owner, relation, path).await?;
+    let database = context
+        .catalog
+        .database(context.catalog.default_database())?;
+    let [snapshot] = database.partitions.as_slice() else {
+        return Err(uncovered_owned_range());
+    };
     let work = accelerate::owned_page(&context, snapshot, &database.storage, &definition, bounds);
     rtdb_storage::IoRegion::leased(context.catalog.read_lease(), work).await
+}
+
+pub(crate) async fn owned_count(
+    context: Arc<QueryContext>,
+    owner: &str,
+    relation: &rtdb_types::OwnedRelation,
+    path: &rtdb_types::OwnedRelation,
+    request: OwnedCountRequest<'_>,
+) -> Result<OwnedRangeCount> {
+    let definition = owned_definition(&context, owner, relation, path).await?;
+    let database = context
+        .catalog
+        .database(context.catalog.default_database())?;
+    let [snapshot] = database.partitions.as_slice() else {
+        return Err(uncovered_owned_range());
+    };
+    let work = accelerate::owned_count(&context, snapshot, &database.storage, &definition, request);
+    rtdb_storage::IoRegion::leased(context.catalog.read_lease(), work).await
+}
+
+async fn owned_definition(
+    context: &Arc<QueryContext>,
+    owner: &str,
+    relation: &rtdb_types::OwnedRelation,
+    path: &rtdb_types::OwnedRelation,
+) -> Result<Definition> {
+    let catalog = rtdb_types::OwnedRelation::path_catalog(owner);
+    let target = relation.table(owner);
+    let cursor =
+        rtdb_query::open_owned_path_catalog(Arc::clone(context), &catalog, Some(path.name()))
+            .await?
+            .ok_or_else(uncovered_owned_range)?;
+    let mut definitions = read_definitions(cursor).await?.into_iter();
+    definitions
+        .next()
+        .filter(|definition| {
+            definition.name == path.name()
+                && definition.table == target
+                && definitions.next().is_none()
+        })
+        .ok_or_else(uncovered_owned_range)
 }
 
 fn format_error(error: impl std::fmt::Display) -> Anomaly {

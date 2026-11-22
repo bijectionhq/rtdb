@@ -19,7 +19,7 @@ use rtdb_columnar::{
 };
 use rtdb_plan::{BinaryOp, ColumnId, Expr, Field, UnaryOp};
 use rtdb_query::{OrderedBatches, OrderedCandidates, OrderedScan, ScanAccelerator, ScanRequest};
-use rtdb_types::{AnomalyCategory, Iid, LogicalType, Result, ScalarType, TimeUnit};
+use rtdb_types::{AnomalyCategory, Iid, LogicalType, Result, ScalarType, TimeUnit, Timestamp};
 use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 
@@ -28,7 +28,7 @@ use super::{
     key::{Atom, AtomRef, Bucket, Family, family},
     maintenance::{cancelled, read_root, source_frontier, source_rows},
     postings::Tuple,
-    tree::{Cursor, Hit, KeyRef, Tree},
+    tree::{Cursor, Hit, KeyRef, Root, Tree, cardinality_overflow},
 };
 
 const BATCH_ROWS: usize = 128;
@@ -719,6 +719,59 @@ async fn use_index(
     }))
 }
 
+fn owned_fields(snapshot: &rtdb_index::Snapshot, definition: &Definition) -> Vec<Field> {
+    let types = snapshot.column_types_for(&definition.table, definition.columns.clone());
+    definition
+        .columns
+        .iter()
+        .enumerate()
+        .map(|(id, name)| Field {
+            id: ColumnId(id as u32),
+            name: name.clone(),
+            qualifier: None,
+            qualified_only: false,
+            unnamed: false,
+            data_type: types
+                .get(name.as_str())
+                .cloned()
+                .unwrap_or(LogicalType::Null),
+        })
+        .collect()
+}
+
+async fn covered_generation(
+    context: &rtdb_query::QueryContext,
+    snapshot: &rtdb_index::Snapshot,
+    storage: &Arc<rtdb_storage::cache::BufferPool>,
+    definition: &Definition,
+    present: Timestamp,
+) -> Result<(Tree, Root)> {
+    let through = source_frontier(snapshot, &definition.table);
+    if through < 0
+        || snapshot
+            .iter_segments(&definition.table)
+            .any(|segment| segment.row_count() != 0)
+    {
+        return Err(super::uncovered_owned_range());
+    }
+    let directory = definition.directory()?;
+    let checkpoint = checkpoint::latest(storage, &directory, &context.memory, through)
+        .await?
+        .filter(|checkpoint| {
+            checkpoint.through == through
+                && checkpoint.source_rows == source_rows(snapshot, &definition.table)
+        })
+        .ok_or_else(super::uncovered_owned_range)?;
+    let tree = Tree::new(storage, &directory, &context.memory, checkpoint.scope).await?;
+    let root = checkpoint
+        .roots()
+        .at(&tree, present)
+        .await?
+        .ok_or_else(super::uncovered_owned_range)?
+        .1;
+    Ok((tree, root))
+}
+
 pub(super) async fn owned_page(
     context: &rtdb_query::QueryContext,
     snapshot: &rtdb_index::Snapshot,
@@ -726,44 +779,55 @@ pub(super) async fn owned_page(
     definition: &Definition,
     bounds: RowBounds<'_>,
 ) -> Result<super::OwnedRangePage> {
-    let types = snapshot.column_types_for(&definition.table, definition.columns.clone());
-    let fields: Vec<_> = definition.columns.iter().enumerate().map(|(id, name)| Field {
-        id: ColumnId(id as u32), name: name.clone(), qualifier: None, qualified_only: false,
-        unnamed: false, data_type: types.get(name.as_str()).cloned().unwrap_or(LogicalType::Null),
-    }).collect();
+    let fields = owned_fields(snapshot, definition);
     let positions: Vec<_> = (0..fields.len()).collect();
-    let covered = Covered::bind(&fields, definition, &positions)?.ok_or_else(super::uncovered_owned_range)?;
+    let covered =
+        Covered::bind(&fields, definition, &positions)?.ok_or_else(super::uncovered_owned_range)?;
     let (range, reverse, limit) = bounds.bind(&fields)?;
     if !(1..=BATCH_ROWS).contains(&limit) {
-        return Err(rtdb_types::Anomaly::incorrect("rtdb.owned/range-limit", "Owned range limit must be between 1 and 128"));
+        return Err(rtdb_types::Anomaly::incorrect(
+            "rtdb.owned/range-limit",
+            "Owned range limit must be between 1 and 128",
+        ));
     }
 
-    let through = source_frontier(snapshot, &definition.table);
-    if through < 0 || snapshot.iter_segments(&definition.table).any(|segment| segment.row_count() != 0) {
-        return Err(super::uncovered_owned_range());
-    }
-    let directory = definition.directory()?;
-    let checkpoint = checkpoint::latest(storage, &directory, &context.memory, through).await?
-        .filter(|checkpoint| checkpoint.through == through && checkpoint.source_rows == source_rows(snapshot, &definition.table))
-        .ok_or_else(super::uncovered_owned_range)?;
-    let tree = Tree::new(storage, &directory, &context.memory, checkpoint.scope).await?;
     let present = context.current_time.as_micros()?;
-    let root = checkpoint.roots().at(&tree, present).await?
-        .ok_or_else(super::uncovered_owned_range)?.1;
+    let (tree, root) = covered_generation(context, snapshot, storage, definition, present).await?;
     let buckets: Vec<_> = Bucket::at(present).collect();
-    let scratch = context.memory.reserve(limit.saturating_mul(64).saturating_add(16_384))?;
-    let cursors = buckets.iter().map(|_| Cursor::new(root.clone(), reverse)).collect();
+    let scratch = context
+        .memory
+        .reserve(limit.saturating_mul(64).saturating_add(16_384))?;
+    let cursors = buckets
+        .iter()
+        .map(|_| Cursor::new(root.clone(), reverse))
+        .collect();
     let mut scan = PostingScan {
-        heap: BinaryHeap::new(), cursors, buckets, advanced: None, range, reverse,
-        width: definition.columns.len(), cancellation: context.cancellation.clone(), _scratch: scratch, tree,
+        heap: BinaryHeap::new(),
+        cursors,
+        buckets,
+        advanced: None,
+        range,
+        reverse,
+        width: definition.columns.len(),
+        cancellation: context.cancellation.clone(),
+        _scratch: scratch,
+        tree,
     };
-    for slot in 0..scan.cursors.len() { scan.advance(slot).await?; }
+    for slot in 0..scan.cursors.len() {
+        scan.advance(slot).await?;
+    }
     let schema = Arc::clone(&covered.schema);
     let mut seek = CoveredSeek {
         state: Some(CoveredState {
             projection: covered,
-            postings: MatchingPostings { scan, predicates: Vec::new(), distinct: None, last: None },
-            skip: 0, remaining: limit,
+            postings: MatchingPostings {
+                scan,
+                predicates: Vec::new(),
+                distinct: None,
+                last: None,
+            },
+            skip: 0,
+            remaining: limit,
         }),
         sliced_rows: 0,
         gathered_rows: 0,
@@ -772,31 +836,129 @@ pub(super) async fn owned_page(
     Ok(super::OwnedRangePage { schema, batch })
 }
 
+pub(super) async fn owned_count(
+    context: &rtdb_query::QueryContext,
+    snapshot: &rtdb_index::Snapshot,
+    storage: &Arc<rtdb_storage::cache::BufferPool>,
+    definition: &Definition,
+    request: super::OwnedCountRequest<'_>,
+) -> Result<super::OwnedRangeCount> {
+    let fields = owned_fields(snapshot, definition);
+    let positions: Vec<_> = (0..fields.len()).collect();
+    Covered::bind(&fields, definition, &positions)?.ok_or_else(super::uncovered_owned_range)?;
+    let mut range = Range::default();
+    compound_bound(&mut range, &fields, request.lower, true, false)?;
+    compound_bound(&mut range, &fields, request.upper, false, true)?;
+    request.valid_at.next()?;
+    let present = context.current_time.as_micros()?;
+    let (tree, root) = covered_generation(context, snapshot, storage, definition, present).await?;
+    let mut count = 0u64;
+    for bucket in Bucket::at(request.valid_at) {
+        let compare = |key: KeyRef<'_>| match key {
+            KeyRef::Posting(found, tuple, _) => {
+                found.cmp(&bucket).then_with(|| range.position(tuple))
+            }
+            KeyRef::Row(_) | KeyRef::Revision(_) => Ordering::Greater,
+        };
+        let lower = tree
+            .rank(
+                &root,
+                |key| compare(key) == Ordering::Less,
+                &context.cancellation,
+            )
+            .await?;
+        let upper = tree
+            .rank(
+                &root,
+                |key| compare(key) != Ordering::Greater,
+                &context.cancellation,
+            )
+            .await?;
+        let bucket_count = upper
+            .checked_sub(lower)
+            .ok_or_else(|| super::format_error("Ordered count ranks are inconsistent"))?;
+        count = count
+            .checked_add(bucket_count)
+            .ok_or_else(cardinality_overflow)?;
+    }
+    Ok(super::OwnedRangeCount {
+        count,
+        present,
+        valid_at: request.valid_at,
+    })
+}
+
 pub(crate) enum RowBounds<'a> {
-    Leading { lower: Option<&'a rtdb_types::Value>, upper: Option<&'a rtdb_types::Value>, limit: usize },
+    Leading {
+        lower: Option<&'a rtdb_types::Value>,
+        upper: Option<&'a rtdb_types::Value>,
+        limit: usize,
+    },
     Compound(super::OwnedRangeRequest<'a>),
+}
+
+fn invalid_bound() -> rtdb_types::Anomaly {
+    rtdb_types::Anomaly::incorrect(
+        "rtdb.owned/range-bound",
+        "Owned range bound does not match its declared path key",
+    )
+}
+
+fn bound_atom(field: &Field, value: &rtdb_types::Value) -> Result<Atom> {
+    let expected = family(&field.data_type).ok_or_else(invalid_bound)?;
+    Atom::of(value)
+        .filter(|atom| {
+            atom.family() == Some(expected)
+                || (matches!(atom, Atom::Null) && field.name != "_id" && field.data_type.nullable())
+        })
+        .ok_or_else(invalid_bound)
+}
+
+fn compound_bound(
+    range: &mut Range,
+    fields: &[Field],
+    key: Option<&rtdb_types::StructFields<rtdb_types::Value>>,
+    lower: bool,
+    strict: bool,
+) -> Result<()> {
+    let Some(key) = key else {
+        return Ok(());
+    };
+    if key.len() != fields.len() {
+        return Err(invalid_bound());
+    }
+    let key = fields
+        .iter()
+        .map(|field| {
+            let value = key.get(&field.name).ok_or_else(invalid_bound)?;
+            if !field.data_type.legs().contains(&value.logical_type()) {
+                return Err(invalid_bound());
+            }
+            bound_atom(field, value)
+        })
+        .collect::<Result<_>>()?;
+    range.cursors.push(CursorBound { key, lower, strict });
+    Ok(())
 }
 
 impl RowBounds<'_> {
     fn bind(self, fields: &[Field]) -> Result<(Range, bool, usize)> {
-        fn invalid_bound() -> rtdb_types::Anomaly {
-            rtdb_types::Anomaly::incorrect("rtdb.owned/range-bound", "Owned range bound does not match its declared path key")
-        }
-
-        fn atom(field: &Field, value: &rtdb_types::Value) -> Result<Atom> {
-            let expected = family(&field.data_type).ok_or_else(invalid_bound)?;
-            Atom::of(value)
-                .filter(|atom| atom.family() == Some(expected)
-                    || (matches!(atom, Atom::Null) && field.name != "_id" && field.data_type.nullable()))
-                .ok_or_else(invalid_bound)
-        }
-
         let mut range = Range::default();
         match self {
-            Self::Leading { lower, upper, limit } => {
+            Self::Leading {
+                lower,
+                upper,
+                limit,
+            } => {
                 let leading = fields.first().ok_or_else(invalid_bound)?;
-                range.lower = lower.map(|value| atom(leading, value)).transpose()?.map(|atom| (atom, false));
-                range.upper = upper.map(|value| atom(leading, value)).transpose()?.map(|atom| (atom, true));
+                range.lower = lower
+                    .map(|value| bound_atom(leading, value))
+                    .transpose()?
+                    .map(|atom| (atom, false));
+                range.upper = upper
+                    .map(|value| bound_atom(leading, value))
+                    .transpose()?
+                    .map(|atom| (atom, true));
                 Ok((range, false, limit))
             }
             Self::Compound(request) => {
@@ -805,16 +967,7 @@ impl RowBounds<'_> {
                     (request.upper, false, true),
                     (request.after, !request.descending, true),
                 ] {
-                    let Some(key) = key else { continue; };
-                    if key.len() != fields.len() { return Err(invalid_bound()); }
-                    let key = fields.iter().map(|field| {
-                        let value = key.get(&field.name).ok_or_else(invalid_bound)?;
-                        if !field.data_type.legs().contains(&value.logical_type()) {
-                            return Err(invalid_bound());
-                        }
-                        atom(field, value)
-                    }).collect::<Result<_>>()?;
-                    range.cursors.push(CursorBound { key, lower, strict });
+                    compound_bound(&mut range, fields, key, lower, strict)?;
                 }
                 Ok((range, request.descending, request.limit))
             }

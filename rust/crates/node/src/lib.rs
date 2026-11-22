@@ -1,5 +1,5 @@
 mod ordered_index;
-pub use ordered_index::{OwnedRangePage, OwnedRangeRequest};
+pub use ordered_index::{OwnedCountRequest, OwnedRangeCount, OwnedRangePage, OwnedRangeRequest};
 mod session;
 mod resources;
 mod catalog;

@@ -460,6 +460,15 @@ async fn held_owned_range_requires_a_covering_generation() {
     };
     let write = writer.state_mut().execute_tx(vec![insert], AutonomousTxOptions::default()).await.unwrap();
     assert!(write.committed(), "{:?}", write.error());
+    let correction = TxOp::OwnedReplaceDocs {
+        relation: relation.clone(),
+        documents: Documents::new(vec![StructFields::from([
+            ("_id".into(), Value::I64(1)), ("priority".into(), Value::I64(99)),
+        ])], node.memory()).unwrap(),
+        valid_from: Some(Timestamp(10)), valid_to: Some(Timestamp(20)),
+    };
+    let write = writer.state_mut().execute_tx(vec![correction], AutonomousTxOptions::default()).await.unwrap();
+    assert!(write.committed(), "{:?}", write.error());
     let declaration = TxOp::OwnedDeclarePath {
         relation: relation.clone(), name: path.clone(), columns: vec!["priority".into(), "_id".into()],
     };
@@ -468,6 +477,8 @@ async fn held_owned_range_requires_a_covering_generation() {
     let held = writer.open_owned_read().await.unwrap();
     let failure = held.range(&relation, &path, None, None, 2).await.err().unwrap();
     assert_eq!(failure.code, "rtdb.owned/path-uncovered");
+    let request = rtdb_node::OwnedCountRequest { lower: None, upper: None, valid_at: Timestamp(10) };
+    assert_eq!(held.count_range(&relation, &path, request).await.err().unwrap().code, "rtdb.owned/path-uncovered");
     held.close();
     drop(held);
 
@@ -492,6 +503,15 @@ async fn held_owned_range_requires_a_covering_generation() {
     ]);
     let lower = key(10, 1);
     let upper = key(20, 3);
+    for (valid_at, expected) in [(9, 2), (10, 1), (19, 1), (20, 2)] {
+        let request = rtdb_node::OwnedCountRequest {
+            lower: Some(&lower), upper: Some(&upper), valid_at: Timestamp(valid_at),
+        };
+        let result = held.count_range(&relation, &path, request).await.unwrap();
+        assert_eq!(result.count, expected);
+        assert_eq!(result.present, held.present().system_time);
+        assert_eq!(result.valid_at, Timestamp(valid_at));
+    }
     for (descending, after, next) in [(false, key(10, 1), 2), (true, key(10, 2), 1)] {
         let request = rtdb_node::OwnedRangeRequest {
             lower: Some(&lower), upper: Some(&upper), after: Some(&after), descending, limit: 1,
