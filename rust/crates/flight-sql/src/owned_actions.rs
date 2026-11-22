@@ -122,12 +122,13 @@ pub(crate) const HELD_OWNED_POINT_V1: &str = "rtdb.owned.ReadHeldPoint.v1";
 pub(crate) const HELD_OWNED_POINT_V2: &str = "rtdb.owned.ReadHeldPoint.v2";
 pub(crate) const HELD_OWNED_HISTORICAL_POINT_V1: &str = "rtdb.owned.ReadHeldHistoricalPoint.v1";
 pub(crate) const HELD_OWNED_VALID_DURING_V2: &str = "rtdb.owned.ReadHeldValidDuring.v2";
+pub(crate) const HELD_WORLD_IDENTITIES_V1: &str = "rtdb.owned.ReadHeldWorldIdentityPage.v1";
 pub(crate) const HELD_OWNED_IDENTITIES_V1: &str = "rtdb.owned.ReadHeldIdentityPage.v1";
 pub(crate) const HELD_OWNED_VERSIONS_V2: &str = "rtdb.owned.ReadHeldVersions.v2";
 pub(crate) const CLOSE_OWNED_READ_V1: &str = "rtdb.owned.CloseRead.v1";
 pub(crate) const READ_WORLD_POINT_V1: &str = "rtdb.owned.ReadWorldPoint.v1";
 pub(crate) const OPEN_WORLD_READ_V1: &str = "rtdb.owned.OpenWorldRead.v1";
-pub(crate) const HELD_WORLD_POINT_V1: &str = "rtdb.owned.ReadHeldWorldPoint.v1";
+pub(crate) const HELD_WORLD_POINT_V2: &str = "rtdb.owned.ReadHeldWorldPoint.v2";
 pub(crate) const CLOSE_WORLD_READ_V1: &str = "rtdb.owned.CloseWorldRead.v1";
 pub(crate) const DROP_WORLD_V1: &str = "rtdb.owned.DropWorld.v1";
 pub(crate) const FORK_WORLD_V1: &str = "rtdb.owned.ForkWorld.v1";
@@ -1335,14 +1336,53 @@ impl Service {
         if !self.0.config.owned_native_actions || self.0.config.owned_world_host.is_none() { return Err(unsupported()); }
         let (handle, body) = body.split_first_chunk::<16>().ok_or_else(|| invalid("Owned world point has no held handle"))?;
         let held = self.owned_world_read(call, &Bytes::copy_from_slice(handle))?;
+        let (mode, body) = body.split_first().ok_or_else(|| invalid("Owned world point has no observation flag"))?;
+        let observed = match mode {
+            0 => false,
+            1 => true,
+            _ => return Err(invalid("Invalid owned world point observation flag")),
+        };
         let (relation, id, valid, _identity) = point_request(call, body, PointTime::Required)?;
         let valid_at = valid.ok_or_else(|| invalid("Owned world point requires a valid_micros instant"))?;
-        let mut result = held.snapshot.read_point(&relation, &id, valid_at).await.map_err(status)?;
+        let mut result = held.snapshot.read_point(&relation, &id, valid_at, observed).await.map_err(status)?;
         if result.present != held.snapshot.present() {
             return Err(Status::internal("Owned world point changed its held present"));
         }
         let nonce = result.witness.take().map(|evidence| held.remember_point(call, evidence)).transpose()?;
         let reply = self.world_point_reply(call, result, valid_at, nonce)?;
+        held.snapshot.check().map_err(status)?;
+        Ok(reply)
+    }
+
+    pub(crate) async fn held_world_identities_action(&self, call: &Call, body: &[u8]) -> Result<ActionResult, Status> {
+        if !self.0.config.owned_native_actions || self.0.config.owned_world_host.is_none() { return Err(unsupported()); }
+        let (handle, body) = body.split_first_chunk::<16>().ok_or_else(|| invalid("Owned world identities have no held handle"))?;
+        let held = self.owned_world_read(call, &Bytes::copy_from_slice(handle))?;
+        held.snapshot.check().map_err(status)?;
+        let (relation, arrow_bytes) = split_relation(body)?;
+        let request = decode_batch(call, arrow_bytes)?;
+        let request = request.batch();
+        if request.num_columns() != 3 || request.num_rows() != 1 {
+            return Err(invalid("Owned world identities require one valid instant, exclusive bound, and limit"));
+        }
+        let valid = history_request_endpoint(request, "valid_micros")?;
+        let limit = usize::try_from(history_request_integer(request, "limit")?)
+            .map_err(|_| invalid("Owned world identity limit is out of range"))?;
+        let (column, field) = request.schema_ref().column_with_name("after")
+            .ok_or_else(|| invalid("Owned world identities require an exclusive bound"))?;
+        let after = request.column(column).as_any().downcast_ref::<StringArray>()
+            .filter(|_| field.metadata().is_empty())
+            .ok_or_else(|| invalid("Owned world identity bound must be nullable Utf8"))?;
+        let after = (!after.is_null(0)).then(|| after.value(0));
+        let page = held.snapshot.identity_page(&relation, valid, after, limit).await.map_err(status)?;
+        let bytes = page.keys.iter().try_fold(4096, |size, key| wire::add(size, key.len()))?;
+        let _copy = call.reserve(bytes)?;
+        let keys = StringArray::from_iter_values(page.keys.iter().map(String::as_str));
+        let rows = RecordBatch::try_from_iter([("_id", Arc::new(keys) as Arc<dyn Array>)]).map_err(arrow)?;
+        let schema = rows.schema_ref().as_ref().clone().with_metadata(
+            [(OWNED_IDENTITY_MORE.into(), u8::from(page.more).to_string())].into()
+        );
+        let reply = self.owned_point_reply(&schema, Some(&rows), held.snapshot.present(), valid, None)?;
         held.snapshot.check().map_err(status)?;
         Ok(reply)
     }

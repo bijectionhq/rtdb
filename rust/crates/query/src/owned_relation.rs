@@ -76,6 +76,13 @@ pub async fn open_owned_identity_page(
     if relation.world().is_some() || relation.is_world_catalog() {
         return Err(address_unavailable());
     }
+    open_owned_identity_candidates(context, owner, relation, system, valid, after, fetch).await
+}
+
+async fn open_owned_identity_candidates(
+    context: Arc<QueryContext>, owner: &str, relation: &OwnedRelation, system: Timestamp,
+    valid: Timestamp, after: Option<&str>, fetch: i64,
+) -> Result<Option<QueryCursor>> {
     let context = owned_context_at_system(context, system)?;
     if !require_owned_address_coverage(&context, owner, relation)? {
         return Ok(None);
@@ -109,6 +116,62 @@ pub async fn open_owned_identity_page(
     }])?);
     let page = Arc::new(sorted.limit(None, Some(Expr::Literal(Value::I64(fetch))))?);
     PreparedQuery::new_in(page, &context.memory)?.execute(context, Vec::new()).await.map(Some)
+}
+
+/// A bounded page of ordered UTF-8 keys with retained memory ownership.
+pub struct OwnedIdentityCandidates {
+    pub keys: Vec<String>,
+    _charges: Vec<Arc<rtdb_columnar::MemoryReservation>>,
+}
+
+/// Reads root identities or local shadow candidates in one exact native cut.
+pub async fn owned_identity_candidates(
+    context: Arc<QueryContext>, owner: &str, relation: &OwnedRelation, system: Timestamp,
+    valid: Timestamp, after: Option<&str>, fetch: usize,
+) -> Result<OwnedIdentityCandidates> {
+    let unavailable = || Anomaly::new(AnomalyCategory::Unavailable, "rtdb.owned/world-identities",
+        "The held world identity candidates exceed their exact coverage or byte bound");
+    if !(1..=129).contains(&fetch) || relation.is_world_catalog() { return Err(unavailable()); }
+    let context = owned_context_at_system(context, system)?;
+    let mut charges = vec![context.memory.reserve(fetch * 128)?];
+    let mut keys: Vec<String> = Vec::with_capacity(fetch);
+    let mut remaining: usize = 8 << 20;
+    if let Some(mut cursor) = open_owned_identity_candidates(
+        Arc::clone(&context), owner, relation, system, valid, after, fetch as i64,
+    ).await? {
+        while let Some(batch) = cursor.next_batch().await? {
+            let batch = batch.batch();
+            let (column, field) = batch.schema_ref().column_with_name("_id").ok_or_else(unavailable)?;
+            let array = batch.column(column).as_ref();
+            for row in 0..batch.num_rows() {
+                let size = rtdb_columnar::estimate_read_value_bytes(field, array, row)?;
+                remaining = remaining.checked_sub(size).ok_or_else(unavailable)?;
+                charges.push(context.memory.reserve(size)?);
+                let Value::Utf8(key) = rtdb_columnar::read_execution_value(field, array, row)? else {
+                    return Err(unavailable());
+                };
+                if keys.len() == fetch || keys.last().map(String::as_str).or(after).is_some_and(|prior| prior >= key.as_str()) {
+                    return Err(unavailable());
+                }
+                let id = EntityId::String(key.clone());
+                let mut point = open_owned_point(
+                    Arc::clone(&context), owner, relation, &id,
+                    Some(Interval::at(valid)?), Some(&["_id"]),
+                ).await?.ok_or_else(unavailable)?;
+                let mut found = false;
+                while let Some(hit) = point.next_batch().await? {
+                    if hit.batch().num_rows() == 0 { continue; }
+                    if found || hit.batch().num_rows() != 1 { return Err(unavailable()); }
+                    owned_row_revision(hit.batch(), 0, &id, &context.memory)?;
+                    found = true;
+                }
+                if !found { return Err(unavailable()); }
+                keys.push(key);
+            }
+        }
+    }
+    context.check_cancelled()?;
+    Ok(OwnedIdentityCandidates { keys, _charges: charges })
 }
 
 /// Reads one full identity in a relation's private uniqueness table.

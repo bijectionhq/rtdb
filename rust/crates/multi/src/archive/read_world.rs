@@ -249,6 +249,7 @@ where
                 if selected.expected_basis.is_some_and(|expected| basis != expected) {
                     return Err(inconsistent("The retained checkpoint has a different transaction key"));
                 }
+                let snapshot = snapshot.with_system_time_cap(Some(basis.system_time))?;
                 let name = record.name;
                 let catalog = CatalogSnapshot::new(
                     &name,

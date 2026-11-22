@@ -16,6 +16,22 @@ pub struct OwnedIdentityPage {
 }
 
 impl OwnedReadSession {
+    /// Reads live local shadow keys, including tombstones, for one admitted world.
+    pub async fn world_identity_candidates(
+        &self, world: rtdb_types::Iid, relation: &OwnedRelation, valid: Timestamp,
+        after: Option<&str>, fetch: usize,
+    ) -> Result<rtdb_query::OwnedIdentityCandidates> {
+        let (admitted, _charge) = self.world_registration(world).await?
+            .filter(|(world, _)| !world.dropped && world.until > self.present.system_time)
+            .ok_or_else(rtdb_types::OwnedWorld::unavailable)?;
+        let relation = relation.in_world(admitted.id)?;
+        let page = rtdb_query::owned_identity_candidates(
+            Arc::clone(&self.context), &self.owner, &relation, self.present.system_time, valid, after, fetch,
+        ).await?;
+        self.check()?;
+        Ok(page)
+    }
+
     pub async fn identity_page(
         &self,
         relation: &OwnedRelation,

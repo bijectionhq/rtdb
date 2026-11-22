@@ -403,10 +403,17 @@ A found row includes the winning local or archived `rtdb.owned.revision_micros`.
 
 `rtdb.owned.OpenWorldRead.v1` takes the world UUID and admits one live cut and its verified archived parent.
 The single result contains 16 opaque handle bytes followed by the signed big-endian 64-bit live present in Unix microseconds.
-Use `rtdb.owned.ReadHeldWorldPoint.v1` with the handle in place of the world UUID and the same relation and Arrow fields as the one-shot read.
+`rtdb.owned.ReadHeldWorldPoint.v2` takes the 16-byte held handle, one observation flag byte (0 for read-only or 1 to request a witness), then the same relation and Arrow fields as the one-shot read.
 Every call reads the same live cut and archive root. The held handle stays bound to the original authenticated session and attachment.
 Use `rtdb.owned.CloseWorldRead.v1` with the 16-byte handle to cancel the read. Success has zero Flight results. The archive lease releases after in-flight I/O drains.
 A held read expires no later than 60 seconds or the world's own expiration. A drop fences new opens. Earlier admitted handles can read only while their original cut and archive lease still admit them.
+
+`rtdb.owned.ReadHeldWorldIdentityPage.v1` takes the 16-byte held world handle, a relation prefix and one Arrow request row.
+Supply `valid_micros: Int64`, `after: Utf8?` (an exclusive bound), and `limit: Int64` (1 through 128).
+The reply contains sorted `_id: Utf8` keys, the held world present and valid instant, and `rtdb.owned.identity_more`.
+Resume after the last visible identity when that flag is set.
+The page merges exact archived and local shadow candidates. A winning local tombstone hides the identity.
+Missing coverage, an archive purge floor after the parent cut, or excessive work refuses the page.
 
 `rtdb.owned.DropWorld.v1` takes exactly the 16-byte world UUID.
 The ordered terminal record fences subsequent world operations before the host releases its archive pin.
@@ -450,7 +457,7 @@ Use the coverage time as the next exclusive system time.
 An empty page carries only the response schema and terminator.
 Revisions are dense within the authenticated owner's relation, and each returned system time belongs to a commit with a change on that relation.
 
-`rtdb.owned.ReadHeldWorldPoint.v1` may include `rtdb.owned.world_point_witness`, an opaque 32-digit hexadecimal nonce.
+`rtdb.owned.ReadHeldWorldPoint.v2` with flag 1 may include `rtdb.owned.world_point_witness`, an opaque 32-digit hexadecimal nonce.
 The witness exists only under an authenticated placed read with a retained lease. It may accompany an absent result or an archived winner.
 `rtdb.owned.CommitWorld.v2` takes the 16-byte world UUID, the 16-byte held world handle, a big-endian u16 witness count from 1 to 128, and that many distinct raw 16-byte nonces.
 The remaining bytes are the same relation groups as `CommitWorld.v1`.
