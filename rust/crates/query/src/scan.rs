@@ -1987,6 +1987,34 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn inner_equi_join_of_cold_pages_keeps_multiple_key_columns_in_arrow() {
+        use rtdb_plan::{BinaryOp, JoinKind, Relation};
+
+        let (state, table, _, store, _) = persisted_page_fixture().await;
+        let storage = Arc::new(BufferPool::new(store, 1 << 20));
+        let (mut left, execution, memory) = descriptor_scan(state.value().snapshot(), table, storage);
+        let id = Field { id: ColumnId(1), name: "_id".into(), qualifier: None, qualified_only: false, unnamed: false,
+            data_type: LogicalType::Scalar(ScalarType::I64) };
+        left.columns.push(id);
+        let mut right = left.clone();
+        for field in &mut right.columns { field.id.0 += 10; }
+        let key = |index: usize| Expr::binary(BinaryOp::Eq, left.columns[index].expression(), right.columns[index].expression());
+        let condition = Expr::binary(BinaryOp::And, key(0), key(1));
+        let relation = Arc::new(Relation::join(Arc::new(Relation::scan(left).unwrap()), Arc::new(Relation::scan(right).unwrap()),
+            JoinKind::Inner, Some(condition)).unwrap());
+        let runtime = crate::runtime_schema::EmittedRelation::derive(relation, &execution.context.catalog, &[], &memory).unwrap();
+        let mut cursor = crate::operators::build_columns(runtime, execution).await.unwrap().expect("Expected Arrow equijoin execution");
+        let mut rows = Vec::new();
+        while let Some(batch) = cursor.next_batch().await.unwrap() {
+            assert!(batch.columns.iter().all(|column| matches!(column, crate::columnar::Column::Arrow { .. })));
+            for row in 0..batch.len {
+                rows.push(batch.columns.iter().map(|column| column.value(row).unwrap()).collect::<Vec<_>>());
+            }
+        }
+        assert_eq!(rows, (1..=3).map(|value| vec![Value::I64(value); 4]).collect::<Vec<_>>());
+    }
+
+    #[tokio::test]
     async fn outer_unnest_expands_list_positions_and_keeps_arrow_payloads() {
         use rtdb_plan::{Relation, RelationNode, Schema};
 

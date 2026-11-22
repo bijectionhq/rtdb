@@ -1,0 +1,94 @@
+use arrow_array::{
+    cast::AsArray,
+    types::{Int8Type, Int16Type, Int32Type, Int64Type},
+};
+use arrow_schema::DataType;
+use rtdb_types::{LogicalType, ScalarType};
+
+use crate::columnar::Column;
+
+#[derive(Clone, Copy, PartialEq)]
+pub(crate) enum ScalarKey<'a> {
+    Null,
+    Bool(bool),
+    Signed(i64),
+    Text(&'a str),
+    Bytes(&'a [u8]),
+}
+
+impl<'a> ScalarKey<'a> {
+    pub fn read(column: &'a Column, row: usize) -> Option<Self> {
+        let Some((array, field, logical, row)) = column.arrow_cell(row)? else {
+            return Some(Self::Null);
+        };
+        if !field.metadata().is_empty() {
+            return None;
+        }
+        let logical = match logical? {
+            LogicalType::Maybe(inner) => inner.as_ref(),
+            ty => ty,
+        };
+        let null = array.is_null(row).then_some(Self::Null);
+        Some(match (array.data_type(), logical) {
+            (DataType::Null, LogicalType::Null) if field.is_nullable() => Self::Null,
+            (DataType::Boolean, LogicalType::Scalar(ScalarType::Bool)) => {
+                null.unwrap_or_else(|| Self::Bool(array.as_boolean().value(row)))
+            }
+            (DataType::Int8, LogicalType::Scalar(ScalarType::I8)) => null.unwrap_or_else(|| {
+                Self::Signed(i64::from(array.as_primitive::<Int8Type>().value(row)))
+            }),
+            (DataType::Int16, LogicalType::Scalar(ScalarType::I16)) => null.unwrap_or_else(|| {
+                Self::Signed(i64::from(array.as_primitive::<Int16Type>().value(row)))
+            }),
+            (DataType::Int32, LogicalType::Scalar(ScalarType::I32)) => null.unwrap_or_else(|| {
+                Self::Signed(i64::from(array.as_primitive::<Int32Type>().value(row)))
+            }),
+            (DataType::Int64, LogicalType::Scalar(ScalarType::I64)) => {
+                null.unwrap_or_else(|| Self::Signed(array.as_primitive::<Int64Type>().value(row)))
+            }
+            (DataType::Utf8, LogicalType::Scalar(ScalarType::Utf8)) => {
+                null.unwrap_or_else(|| Self::Text(array.as_string::<i32>().value(row)))
+            }
+            (DataType::Binary, LogicalType::Scalar(ScalarType::Binary)) => {
+                null.unwrap_or_else(|| Self::Bytes(array.as_binary::<i32>().value(row)))
+            }
+            _ => return None,
+        })
+    }
+
+    pub fn hash(self) -> u32 {
+        self.hash_with(rtdb_columnar::xxhash32)
+    }
+
+    pub fn murmur3(self) -> u32 {
+        self.hash_with(rtdb_columnar::murmur3_32)
+    }
+
+    pub fn equal(self, other: Self) -> Option<bool> {
+        match (self, other) {
+            (Self::Null, _)
+            | (_, Self::Null)
+            | (Self::Bool(_), Self::Bool(_))
+            | (Self::Signed(_), Self::Signed(_))
+            | (Self::Text(_), Self::Text(_))
+            | (Self::Bytes(_), Self::Bytes(_)) => Some(self == other),
+            _ => None,
+        }
+    }
+
+    fn hash_with(self, hash: fn(&[u8], u32) -> u32) -> u32 {
+        match self {
+            Self::Null => 0,
+            Self::Bool(value) => {
+                if value {
+                    17
+                } else {
+                    19
+                }
+            }
+            Self::Signed(value) => hash(&(value as f64).to_bits().to_be_bytes(), 0),
+            Self::Text(text) => hash(text.as_bytes(), 0),
+            Self::Bytes(bytes) => hash(bytes, 0),
+        }
+    }
+}

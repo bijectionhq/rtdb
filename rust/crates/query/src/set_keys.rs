@@ -1,13 +1,7 @@
 use std::{collections::HashMap, mem::size_of, sync::Arc};
 
-use arrow_array::{
-    Array,
-    cast::AsArray,
-    types::{Int8Type, Int16Type, Int32Type, Int64Type},
-};
-use arrow_schema::DataType;
-use rtdb_columnar::{MemoryReservation, xxhash32};
-use rtdb_types::{LogicalType, Result, ScalarType};
+use rtdb_columnar::MemoryReservation;
+use rtdb_types::Result;
 
 use crate::{
     QueryContext,
@@ -15,72 +9,8 @@ use crate::{
     cursor::OwnedRow,
     invalid,
     operators::{combine_equality_hash, equality_hash, rows_equal},
+    scalar_key::ScalarKey,
 };
-
-#[derive(Clone, Copy, PartialEq)]
-enum ScalarKey<'a> {
-    Null,
-    Bool(bool),
-    Signed(i64),
-    Text(&'a [u8]),
-    Bytes(&'a [u8]),
-}
-
-impl<'a> ScalarKey<'a> {
-    fn read(column: &'a Column, row: usize) -> Option<Self> {
-        let Some((array, field, logical, row)) = column.arrow_cell(row)? else {
-            return Some(Self::Null);
-        };
-        if !field.metadata().is_empty() {
-            return None;
-        }
-        let logical = match logical? {
-            LogicalType::Maybe(inner) => inner.as_ref(),
-            ty => ty,
-        };
-        let null = array.is_null(row).then_some(Self::Null);
-        Some(match (array.data_type(), logical) {
-            (DataType::Null, LogicalType::Null) if field.is_nullable() => Self::Null,
-            (DataType::Boolean, LogicalType::Scalar(ScalarType::Bool)) => {
-                null.unwrap_or_else(|| Self::Bool(array.as_boolean().value(row)))
-            }
-            (DataType::Int8, LogicalType::Scalar(ScalarType::I8)) => null.unwrap_or_else(|| {
-                Self::Signed(i64::from(array.as_primitive::<Int8Type>().value(row)))
-            }),
-            (DataType::Int16, LogicalType::Scalar(ScalarType::I16)) => null.unwrap_or_else(|| {
-                Self::Signed(i64::from(array.as_primitive::<Int16Type>().value(row)))
-            }),
-            (DataType::Int32, LogicalType::Scalar(ScalarType::I32)) => null.unwrap_or_else(|| {
-                Self::Signed(i64::from(array.as_primitive::<Int32Type>().value(row)))
-            }),
-            (DataType::Int64, LogicalType::Scalar(ScalarType::I64)) => {
-                null.unwrap_or_else(|| Self::Signed(array.as_primitive::<Int64Type>().value(row)))
-            }
-            (DataType::Utf8, LogicalType::Scalar(ScalarType::Utf8)) => {
-                null.unwrap_or_else(|| Self::Text(array.as_string::<i32>().value(row).as_bytes()))
-            }
-            (DataType::Binary, LogicalType::Scalar(ScalarType::Binary)) => {
-                null.unwrap_or_else(|| Self::Bytes(array.as_binary::<i32>().value(row)))
-            }
-            _ => return None,
-        })
-    }
-
-    fn hash(self) -> u32 {
-        match self {
-            Self::Null => 0,
-            Self::Bool(value) => {
-                if value {
-                    17
-                } else {
-                    19
-                }
-            }
-            Self::Signed(value) => xxhash32(&(value as f64).to_bits().to_be_bytes(), 0),
-            Self::Text(bytes) | Self::Bytes(bytes) => xxhash32(bytes, 0),
-        }
-    }
-}
 
 #[derive(Clone, Copy)]
 struct ArrowKey<'a> {
@@ -173,22 +103,7 @@ fn direct_equal(left: ArrowKey<'_>, right: ArrowKey<'_>) -> Option<bool> {
     for (left_column, right_column) in left.batch.columns.iter().zip(&right.batch.columns) {
         let left = ScalarKey::read(left_column, left.row)?;
         let right = ScalarKey::read(right_column, right.row)?;
-        if left == right {
-            continue;
-        }
-        if matches!(
-            (left, right),
-            (ScalarKey::Null, _)
-                | (_, ScalarKey::Null)
-                | (ScalarKey::Bool(_), ScalarKey::Bool(_))
-                | (ScalarKey::Signed(_), ScalarKey::Signed(_))
-                | (ScalarKey::Text(_), ScalarKey::Text(_))
-                | (ScalarKey::Bytes(_), ScalarKey::Bytes(_))
-        ) {
-            equal = false;
-        } else {
-            return None;
-        }
+        equal &= left.equal(right)?;
     }
     Some(equal)
 }
@@ -422,7 +337,7 @@ mod tests {
     use std::collections::BTreeMap;
 
     use arrow_array::{ArrayRef, Int32Array, Int64Array, RecordBatch, StringArray};
-    use arrow_schema::{Field, Schema};
+    use arrow_schema::{DataType, Field, Schema};
     use rtdb_columnar::{MemoryBudget, OwnedBatch};
     use rtdb_storage::{MemoryStore, cache::BufferPool};
     use rtdb_types::Timestamp;

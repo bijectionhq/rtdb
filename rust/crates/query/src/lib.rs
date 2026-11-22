@@ -6,6 +6,7 @@ mod cursor;
 mod runtime_schema;
 mod operators;
 mod set_keys;
+mod scalar_key;
 mod limit_bounds;
 mod list;
 mod column_table;

@@ -18,6 +18,7 @@ use crate::operators::DeferredInput;
 use crate::pages::{BoxPageCursor, OwnedPage, PageCursor};
 use crate::pushdown::{PushdownBuilder, Pushdowns};
 use crate::runtime_schema::EmittedRelation;
+use crate::scalar_key::ScalarKey;
 
 /// For each equality, whether its first operand is the build side's key; `None` where the join needs the row join.
 pub(crate) fn key_order(layout: &JoinLayout) -> Option<Vec<bool>> {
@@ -41,20 +42,35 @@ enum State {
     Done,
 }
 
-/// The build side: its batches, the key cells of every row in order, and the index over their hashes.
-struct Table { batches: Vec<ColumnBatch>, starts: Vec<usize>, keys: Vec<Value>, kind: Option<KeyKind>, index: HashIndex, _keys: Arc<MemoryReservation> }
+struct Table {
+    batches: Vec<ColumnBatch>,
+    starts: Vec<usize>,
+    keys: BuildKeys,
+    index: HashIndex,
+    _keys: Arc<MemoryReservation>,
+    _inventory: Arc<MemoryReservation>,
+}
+
+enum BuildKeys { Arrow, Values { keys: Vec<Value>, kind: Option<KeyKind> } }
+
+impl Table {
+    fn position(&self, ordinal: usize) -> (usize, usize) {
+        let batch = self.starts.partition_point(|&start| start <= ordinal) - 1;
+        (batch, ordinal - self.starts[batch])
+    }
+}
 
 pub(crate) struct BatchJoin { state: State, spec: Spec }
 
 /// What the join compares and how it reads cells, fixed for its lifetime.
 /// `unswapped` is the join's own layout where the join builds its right input, which a spill hands to the row join.
-struct Spec { order: Vec<bool>, build_keys: Vec<usize>, probe_keys: Vec<usize>, projected: bool, swapped: bool, unswapped: Option<JoinLayout>, execution: Execution }
+struct Spec { order: Vec<bool>, build_keys: Vec<usize>, probe_keys: Vec<usize>, projected: bool, swapped: bool, unswapped: Option<JoinLayout>, validate_payloads: bool, execution: Execution }
 
 impl BatchJoin {
     pub fn new(build: BoxBatchCursor, probe: ProbeInput, layout: JoinLayout, order: Vec<bool>, projected: bool, execution: Execution) -> Self {
         let build_keys = layout.left.key_positions().to_vec();
         let probe_keys = layout.right.key_positions().to_vec();
-        Self { state: State::Build { build, probe, layout }, spec: Spec { order, build_keys, probe_keys, projected, swapped: false, unswapped: None, execution } }
+        Self { state: State::Build { build, probe, layout }, spec: Spec { order, build_keys, probe_keys, projected, swapped: false, unswapped: None, validate_payloads: false, execution } }
     }
 }
 
@@ -62,6 +78,8 @@ impl BatchJoin {
     /// With the join's own layout, builds its right input and emits each match's left columns first, as the join's
     /// schema orders them.
     pub fn swapped(mut self, unswapped: Option<JoinLayout>) -> Self { self.spec.swapped = unswapped.is_some(); self.spec.unswapped = unswapped; self }
+
+    pub fn validating_payloads(mut self, validate: bool) -> Self { self.spec.validate_payloads = validate; self }
 }
 
 impl Spec {
@@ -76,47 +94,92 @@ impl Spec {
         let threshold = self.execution.context.options.join_build_rows;
         let mut batches = Vec::new();
         let mut rows = 0usize;
+        let mut inventory = memory.reserve(256)?;
         while let Some(batch) = build.next_batch().await? {
             self.execution.context.check_cancelled()?;
+            if self.validate_payloads { batch.validate_readable(&self.execution.context)?; }
             rows = rows.checked_add(batch.len).ok_or_else(size_error)?;
+            let bytes = batches.len().checked_add(1).and_then(|count| count.checked_mul(4 * std::mem::size_of::<ColumnBatch>()))
+                .and_then(|bytes| bytes.checked_add(256)).ok_or_else(size_error)?;
+            Arc::get_mut(&mut inventory).expect("The join owns its batch inventory").grow_to(bytes)?;
             batches.push(batch);
             if i64::try_from(rows).map_or(true, |rows| rows > threshold) { return self.spill(batches, build, probe, layout); }
         }
         let width = self.build_keys.len();
-        let mut reservation = memory.reserve(rows.checked_mul(width).and_then(|cells| cells.checked_mul(std::mem::size_of::<Value>())).and_then(|bytes| bytes.checked_add(rows.checked_mul(std::mem::size_of::<u32>() + std::mem::size_of::<usize>())?)).and_then(|bytes| bytes.checked_add(256)).ok_or_else(size_error)?)?;
-        let mut keys = Vec::with_capacity(rows * width);
+        let starts_bytes = batches.len().checked_mul(std::mem::size_of::<usize>()).and_then(|bytes| bytes.checked_add(256)).ok_or_else(size_error)?;
+        let _hashes = memory.reserve(rows.checked_mul(std::mem::size_of::<u32>()).ok_or_else(size_error)?)?;
+        let mut reservation = memory.reserve(starts_bytes)?;
         let mut hashes = Vec::with_capacity(rows);
         let mut starts = Vec::with_capacity(batches.len());
         let mut start = 0;
         for batch in &batches {
             starts.push(start);
             start += batch.len;
-            for row in 0..batch.len {
-                let first = keys.len();
-                for &position in &self.build_keys { keys.push(self.cell(&batch.columns[position], row)?); }
-                hashes.push(hash_values(&keys[first..])?);
-            }
         }
-        let held = keys.iter().try_fold(0usize, |bytes, value| bytes.checked_add(value.retained_bytes()?).ok_or_else(size_error))?;
-        let lease = Arc::get_mut(&mut reservation).ok_or_else(|| invalid("join-size", "A join key charge is shared"))?;
-        lease.grow_to(lease.bytes().checked_add(held).ok_or_else(size_error)?)?;
+        let keys = if self.arrow_build_hashes(&batches, &mut hashes)? {
+            BuildKeys::Arrow
+        } else {
+            hashes.clear();
+            let mut keys = Vec::new();
+            let bytes = rows.checked_mul(width).and_then(|cells| cells.checked_mul(std::mem::size_of::<Value>()))
+                .and_then(|bytes| bytes.checked_add(starts_bytes)).ok_or_else(size_error)?;
+            let lease = Arc::get_mut(&mut reservation).expect("The join owns its build-key reservation");
+            lease.grow_to(bytes)?;
+            keys.reserve_exact(rows * width);
+            for batch in &batches {
+                for row in 0..batch.len {
+                    self.execution.context.check_cancelled_at(row)?;
+                    let first = keys.len();
+                    let bound = key_bound(batch, row, &self.build_keys)?;
+                    let retained = lease.bytes();
+                    lease.grow_to(retained.checked_add(bound).ok_or_else(size_error)?)?;
+                    for &position in &self.build_keys { keys.push(self.cell(&batch.columns[position], row)?); }
+                    let actual = keys[first..].iter().try_fold(retained, |bytes, value| bytes.checked_add(value.retained_bytes()?).ok_or_else(size_error))?;
+                    if actual <= lease.bytes() { lease.shrink_to(actual)?; } else { lease.grow_to(actual)?; }
+                    hashes.push(hash_values(&keys[first..])?);
+                }
+            }
+            let kind = if width == 1 { KeyKind::of_build(&keys) } else { None };
+            BuildKeys::Values { keys, kind }
+        };
         let index = HashIndex::new(&hashes, &memory)?;
         drop(hashes);
+        drop(_hashes);
         let mut filters = PushdownBuilder::new(layout.condition.as_ref(), &layout.left.schema, &layout.right.original, i64::try_from(rows).map_err(|_| size_error())?, true, &self.execution)?;
-        let mut scratch = vec![Value::Null; layout.left.schema.len()];
-        for row in 0..rows {
-            for (index, &position) in self.build_keys.iter().enumerate() { scratch[position] = keys[row * width + index].clone(); }
-            filters.insert(&layout.left.schema, &scratch, &self.execution).await?;
+        match &keys {
+            BuildKeys::Arrow => for batch in &batches {
+                for row in 0..batch.len {
+                    self.execution.context.check_cancelled_at(row)?;
+                    filters.insert_arrow(&layout.left.schema, batch, row, &memory)?;
+                }
+            },
+            BuildKeys::Values { keys, .. } => {
+                let _scratch = memory.reserve(layout.left.schema.len().checked_mul(std::mem::size_of::<Value>()).ok_or_else(size_error)?)?;
+                let mut scratch = vec![Value::Null; layout.left.schema.len()];
+                for row in 0..rows {
+                    for (index, &position) in self.build_keys.iter().enumerate() { scratch[position] = keys[row * width + index].clone(); }
+                    filters.insert(&layout.left.schema, &scratch, &self.execution).await?;
+                }
+            }
         }
-        drop(scratch);
         let filters = filters.finish(&memory)?;
         let pushdowns = Pushdowns::merge(probe.pushdowns.as_ref(), filters, &memory)?;
         let Some((probe_batches, probe_projected)) = crate::operators::build_batches(probe.runtime, probe.execution, pushdowns).await? else {
             return Err(rtdb_types::Anomaly::fault("rtdb.query/batch-join", "A batch join's probe input did not open as batches"));
         };
         if probe_projected != self.projected { return Err(rtdb_types::Anomaly::fault("rtdb.query/batch-join", "A batch join's inputs disagree on date admission")); }
-        let kind = if width == 1 { KeyKind::of_build(&keys) } else { None };
-        Ok(State::Probe { table: Table { batches, starts, keys, kind, index, _keys: reservation }, probe: probe_batches })
+        Ok(State::Probe { table: Table { batches, starts, keys, index, _keys: reservation, _inventory: inventory }, probe: probe_batches })
+    }
+
+    fn arrow_build_hashes(&self, batches: &[ColumnBatch], hashes: &mut Vec<u32>) -> Result<bool> {
+        for batch in batches {
+            for row in 0..batch.len {
+                self.execution.context.check_cancelled_at(row)?;
+                let Some(hash) = arrow_hash(batch, row, &self.build_keys) else { return Ok(false); };
+                hashes.push(hash);
+            }
+        }
+        Ok(true)
     }
 
     /// Hands the input read so far, and the rest, to the row join, which spills a build side this large.
@@ -132,44 +195,20 @@ impl Spec {
     }
 
     fn probe_batch(&self, table: &Table, probe: &ColumnBatch) -> Result<Option<ColumnBatch>> {
-        let width = self.build_keys.len();
+        if self.validate_payloads { probe.validate_readable(&self.execution.context)?; }
         let mut matched = Matches { pairs: Vec::new(), probes: Vec::new(), charge: self.execution.context.memory.reserve(4096)? };
-        let typed = table.kind.and_then(|kind| ProbeKey::of(&probe.columns[self.probe_keys[0]], kind));
-        if let Some(key) = typed {
-            for row in 0..probe.len {
-                self.execution.context.check_cancelled_at(row)?;
-                let Some(hash) = key.hash(row) else { continue };
-                for build in table.index.candidates(hash) {
-                    if key.equals(row, &table.keys[build]) { matched.push(table, build, row)?; }
-                }
-            }
-        } else {
-            let equality = self.execution.scope()?;
-            let mut key = Vec::with_capacity(width);
-            for row in 0..probe.len {
-                self.execution.context.check_cancelled()?;
-                key.clear();
-                for &position in &self.probe_keys { key.push(self.cell(&probe.columns[position], row)?); }
-                'candidates: for build in table.index.candidates(hash_values(&key)?) {
-                    let mut unknown = false;
-                    for (index, build_first) in self.order.iter().enumerate() {
-                        let (build_cell, probe_cell) = (&table.keys[build * width + index], &key[index]);
-                        let (first, second) = if *build_first { (build_cell, probe_cell) } else { (probe_cell, build_cell) };
-                        let equal = rtdb_expr::sql_eq_in_timezone(first, second, &self.execution.context.timezone, &equality)?;
-                        equality.reset()?;
-                        match equal { None => unknown = true, Some(false) => continue 'candidates, Some(true) => {} }
-                    }
-                    if unknown { continue; }
-                    matched.push(table, build, row)?;
-                }
-            }
+        match &table.keys {
+            BuildKeys::Arrow => self.probe_arrow_keys(table, probe, &mut matched)?,
+            BuildKeys::Values { keys, kind } => self.probe_value_keys(table, probe, keys, *kind, &mut matched)?,
         }
         let Matches { pairs, probes, charge: matches } = matched;
         if pairs.is_empty() { return Ok(None); }
         let memory = &self.execution.context.memory;
-        let mut reservation = memory.reserve(256)?;
         let build_width = table.batches.first().map_or(0, |batch| batch.columns.len());
-        let mut columns = Vec::with_capacity(build_width + probe.columns.len());
+        let width = build_width.checked_add(probe.columns.len()).ok_or_else(size_error)?;
+        let bound = width.checked_mul(std::mem::size_of::<Column>()).and_then(|bytes| bytes.checked_add(256)).ok_or_else(size_error)?;
+        let mut reservation = memory.reserve(bound)?;
+        let mut columns = Vec::with_capacity(width);
         let mut append = |batches: &[ColumnBatch], rows: &[(usize, usize)], width| -> Result<()> {
             for position in 0..width {
                 let (column, _scratch) = gather_column_rows(|batch| &batches[batch], rows, position, memory)?;
@@ -185,6 +224,113 @@ impl Spec {
         drop(matches);
         ColumnBatch::settled(columns, pairs.len(), reservation).map(Some)
     }
+
+    fn probe_value_keys(&self, table: &Table, probe: &ColumnBatch, keys: &[Value], kind: Option<KeyKind>, matches: &mut Matches) -> Result<()> {
+        if let Some(key) = kind.and_then(|kind| ProbeKey::of(&probe.columns[self.probe_keys[0]], kind)) {
+            for row in 0..probe.len {
+                self.execution.context.check_cancelled_at(row)?;
+                let Some(hash) = key.hash(row) else { continue };
+                for (candidate, build) in table.index.candidates(hash).enumerate() {
+                    self.execution.context.check_cancelled_at(candidate)?;
+                    if key.equals(row, &keys[build]) { matches.push(table, build, row)?; }
+                }
+            }
+            return Ok(());
+        }
+        let width = self.build_keys.len();
+        let equality = self.execution.scope()?;
+        for row in 0..probe.len {
+            self.execution.context.check_cancelled()?;
+            let (key, _scratch) = self.value_keys(probe, row, &self.probe_keys)?;
+            for (candidate, build) in table.index.candidates(hash_values(&key)?).enumerate() {
+                self.execution.context.check_cancelled_at(candidate)?;
+                if self.equal_values(&keys[build * width..(build + 1) * width], &key, &equality)? {
+                    matches.push(table, build, row)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn probe_arrow_keys(&self, table: &Table, probe: &ColumnBatch, matches: &mut Matches) -> Result<()> {
+        for row in 0..probe.len {
+            self.execution.context.check_cancelled_at(row)?;
+            let mut probe_values = None;
+            let hash = match arrow_hash(probe, row, &self.probe_keys) {
+                Some(hash) => hash,
+                None => {
+                    let key = self.value_keys(probe, row, &self.probe_keys)?;
+                    let hash = hash_values(&key.0)?;
+                    probe_values = Some(key);
+                    hash
+                }
+            };
+            for (candidate, build) in table.index.candidates(hash).enumerate() {
+                self.execution.context.check_cancelled_at(candidate)?;
+                let (batch_index, build_row) = table.position(build);
+                let batch = &table.batches[batch_index];
+                let typed = if probe_values.is_none() { self.equal_arrow(batch, build_row, probe, row) } else { None };
+                let matched = match typed {
+                    Some(matched) => matched,
+                    None => {
+                        if probe_values.is_none() {
+                            probe_values = Some(self.value_keys(probe, row, &self.probe_keys)?);
+                        }
+                        let (probe_key, _) = probe_values.as_ref().expect("A fallback probe key has been read");
+                        let (build_key, _scratch) = self.value_keys(batch, build_row, &self.build_keys)?;
+                        self.equal_values(&build_key, probe_key, &self.execution.scope()?)?
+                    }
+                };
+                if matched { matches.push(table, build, row)?; }
+            }
+        }
+        Ok(())
+    }
+
+    fn equal_arrow(&self, build: &ColumnBatch, build_row: usize, probe: &ColumnBatch, probe_row: usize) -> Option<bool> {
+        let mut matched = true;
+        for (&left, &right) in self.build_keys.iter().zip(&self.probe_keys) {
+            let left = ScalarKey::read(&build.columns[left], build_row)?;
+            let right = ScalarKey::read(&probe.columns[right], probe_row)?;
+            matched &= left.equal(right)? && left != ScalarKey::Null;
+        }
+        Some(matched)
+    }
+
+    fn equal_values(&self, build: &[Value], probe: &[Value], equality: &rtdb_expr::EvaluationScope) -> Result<bool> {
+        let mut unknown = false;
+        for ((build, probe), build_first) in build.iter().zip(probe).zip(&self.order) {
+            let (left, right) = if *build_first { (build, probe) } else { (probe, build) };
+            let equal = rtdb_expr::sql_eq_in_timezone(left, right, &self.execution.context.timezone, equality)?;
+            equality.reset()?;
+            match equal {
+                None => unknown = true,
+                Some(false) => return Ok(false),
+                Some(true) => {}
+            }
+        }
+        Ok(!unknown)
+    }
+
+    fn value_keys(&self, batch: &ColumnBatch, row: usize, positions: &[usize]) -> Result<(Vec<Value>, Arc<MemoryReservation>)> {
+        let reservation = self.execution.context.memory.reserve(key_bound(batch, row, positions)?)?;
+        let keys = positions.iter().map(|&position| self.cell(&batch.columns[position], row)).collect::<Result<_>>()?;
+        Ok((keys, reservation))
+    }
+}
+
+fn arrow_hash(batch: &ColumnBatch, row: usize, positions: &[usize]) -> Option<u32> {
+    positions.iter().try_fold(0, |hash, &position| {
+        ScalarKey::read(&batch.columns[position], row).map(|key| combine_cell_hash(hash, key.hash() as i32))
+    })
+}
+
+fn key_bound(batch: &ColumnBatch, row: usize, positions: &[usize]) -> Result<usize> {
+    let base = positions.len().checked_mul(std::mem::size_of::<Value>())
+        .and_then(|bytes| bytes.checked_add(256)).ok_or_else(size_error)?;
+    positions.iter().try_fold(base, |bytes, &position| {
+        batch.columns[position].bound(row)?.checked_mul(2).and_then(|bound| bytes.checked_add(bound)).ok_or_else(size_error)
+    })
 }
 
 /// The build and probe rows a probe batch matched, in probe order, charged as they grow.
@@ -198,8 +344,7 @@ impl Matches {
             self.pairs.reserve_exact(capacity - self.pairs.len());
             self.probes.reserve_exact(capacity - self.probes.len());
         }
-        let batch = table.starts.partition_point(|start| *start <= build) - 1;
-        self.pairs.push((batch, build - table.starts[batch]));
+        self.pairs.push(table.position(build));
         self.probes.push((0, row));
         Ok(())
     }
