@@ -17,3 +17,6 @@ pub use config::{FORWARDED_PEER_HEADER, FlightConfig, FlightPeerVerifier};
 pub use server::{ServerDriver, ServerHandle, ServerStatus};
 
 mod owned_actions;
+
+mod owned_world;
+pub use owned_world::{OwnedWorldHost, WorldCall, WorldPoint, WorldPointResult, WorldPointRow};

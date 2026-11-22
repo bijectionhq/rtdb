@@ -242,6 +242,7 @@ async fn owned_definition(
     relation: &rtdb_types::OwnedRelation,
     path: &rtdb_types::OwnedRelation,
 ) -> Result<Definition> {
+    rtdb_query::require_owned_address_coverage(context, owner, relation)?;
     let catalog = rtdb_types::OwnedRelation::path_catalog(owner);
     let target = relation.table(owner);
     let cursor =

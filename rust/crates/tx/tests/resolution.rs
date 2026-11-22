@@ -477,7 +477,7 @@ async fn owned_commit_checks_deadline_and_exact_point_before_mutation() {
     let collision = resolver.resolve_source(
         state.snapshot(), SourcePosition(4), Timestamp(104), source(vec![check(alias, None)]), &context,
     ).await.unwrap();
-    assert_eq!(collision.result().error().unwrap().code, "rtdb.owned/iid-collision");
+    assert!(collision.result().committed(), "a colliding but unassigned full identity is absent");
 
     let deleted = resolver.resolve_source(
         state.snapshot(), SourcePosition(5), Timestamp(105),
@@ -844,20 +844,38 @@ async fn owned_world_rows_require_the_ordered_registration_and_cannot_mix_with_r
         source(vec![TxOp::OwnedInsertDocs { relation: OwnedRelation::world_catalog(),
             documents: Documents::new(vec![world.record()], &context.memory).unwrap(), valid_from: None, valid_to: None }]), &context).await.unwrap();
     assert!(declared.result().committed());
+    assert!(!declared.writes().tables().contains_key(&OwnedRelation::world_catalog().address_table("owner")));
     let mixed = resolver.resolve_source(state.snapshot(), SourcePosition(2), Timestamp(102),
         source(vec![replace(local.clone()), replace(root.clone())]), &context).await.unwrap();
     assert_eq!(mixed.result().error().unwrap().code, "rtdb.world/unavailable");
+    let canonical = EntityId::Integer(1);
+    let alias = EntityId::Uuid(canonical.iid().0);
+    let fact = StructFields::from([("_id".into(), alias.as_value()), ("amount".into(), Value::I64(2))]);
+    let alias_write = TxOp::OwnedReplaceDocs {
+        relation: local.clone(),
+        documents: Documents::new(vec![WorldShadow::Present(fact).record(&alias).unwrap()], &context.memory).unwrap(),
+        valid_from: Some(Timestamp(50)), valid_to: Some(Timestamp(100)),
+    };
     let accepted = resolver.resolve_source(state.snapshot(), SourcePosition(3), Timestamp(103),
-        source(vec![replace(local.clone())]), &context).await.unwrap();
+        source(vec![replace(local.clone()), alias_write]), &context).await.unwrap();
     assert!(accepted.result().committed());
     assert!(accepted.writes().tables().contains_key(&local.table("owner")));
+    let addresses = local.address_table("owner");
+    assert_eq!(addresses.owned_world_scope(), (false, Some(world.id)));
+    assert!(accepted.writes().tables().contains_key(&addresses));
+    assert!(!accepted.writes().tables().contains_key(&root.address_table("owner")));
+    let payload = accepted.to_replica_body(&context.memory).unwrap();
+    let rtdb_format::envelope::ReplicaBody::ResolvedTx(body) = payload.body() else { panic!("expected resolved payload"); };
+    let replica = decode_replica(body, Some(mixed.result().tx_key()), state.snapshot().block_index(), &context.memory).unwrap();
+    assert!(replica.writes.tables().contains_key(&addresses));
     assert!(!accepted.writes().tables().contains_key(&root.table("owner")));
     let revision = accepted.result().tx_key().system_time;
     let check = |at, expected| TxOp::OwnedCheck {
         relation: local.clone(), id: EntityId::Integer(1), valid_at: Timestamp(at), expected,
     };
+    let alias_check = TxOp::OwnedCheck { relation: local.clone(), id: alias, valid_at: Timestamp(70), expected: Some(revision) };
     let observed = resolver.resolve_source(state.snapshot(), SourcePosition(4), Timestamp(104),
-        source(vec![check(49, None), check(50, Some(revision)), check(99, Some(revision)), check(100, None)]), &context).await.unwrap();
+        source(vec![check(49, None), check(50, Some(revision)), check(99, Some(revision)), check(100, None), alias_check]), &context).await.unwrap();
     assert!(observed.result().committed());
     let present = |value| {
         let mut fact = StructFields::from([("_id".into(), Value::I64(1))]);

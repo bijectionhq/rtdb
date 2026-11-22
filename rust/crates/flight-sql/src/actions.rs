@@ -31,6 +31,11 @@ impl Service {
                     self.close_owned_read_action(&call, &action.body)?;
                     Ok(Vec::new())
                 }
+                crate::owned_actions::READ_WORLD_POINT_V1 => Ok(vec![Ok(self.read_world_point_action(&call, &action.body).await?)]),
+                crate::owned_actions::DROP_WORLD_V1 => {
+                    self.drop_world_action(&call, &action.body).await?;
+                    Ok(Vec::new())
+                }
                 crate::owned_actions::READ_OWNED_V1 => Ok(vec![Ok(self.read_owned_action(&call, &action.body).await?)]),
                 "BeginTransaction" => {
                     let _: ActionBeginTransactionRequest = unpack(&action.body)?;

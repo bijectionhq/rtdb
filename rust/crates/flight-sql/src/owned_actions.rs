@@ -94,6 +94,8 @@ pub(crate) const OPEN_OWNED_READ_V1: &str = "rtdb.owned.OpenRead.v1";
 pub(crate) const HELD_OWNED_POINT_V1: &str = "rtdb.owned.ReadHeldPoint.v1";
 pub(crate) const HELD_OWNED_POINT_V2: &str = "rtdb.owned.ReadHeldPoint.v2";
 pub(crate) const CLOSE_OWNED_READ_V1: &str = "rtdb.owned.CloseRead.v1";
+pub(crate) const READ_WORLD_POINT_V1: &str = "rtdb.owned.ReadWorldPoint.v1";
+pub(crate) const DROP_WORLD_V1: &str = "rtdb.owned.DropWorld.v1";
 pub(crate) const SEARCH_HELD_OWNED_V1: &str = "rtdb.owned.SearchHeld.v1";
 pub(crate) const HELD_OWNED_RANGE_V1: &str = "rtdb.owned.ReadHeldRange.v1";
 pub(crate) const HELD_OWNED_RANGE_V2: &str = "rtdb.owned.ReadHeldRange.v2";
@@ -436,7 +438,7 @@ impl Service {
             if let Lookup::Found(entry) = self.0.owned_reads.take(&handle) { entry.close(); }
             return Err(status(error));
         }
-        let (relation, id, valid, _identity) = point_request(call, request, with_valid)?;
+        let (relation, id, valid, _identity) = point_request(call, request, if with_valid { PointTime::Optional } else { PointTime::Default })?;
         self.execute_owned_point(&held.snapshot, &relation, &id, valid).await
     }
 
@@ -583,9 +585,58 @@ impl Service {
         Ok(())
     }
 
+    pub(crate) async fn read_world_point_action(&self, call: &Call, body: &[u8]) -> Result<ActionResult, Status> {
+        if !self.0.config.owned_native_actions { return Err(unsupported()); }
+        let host = self.0.config.owned_world_host.as_ref().ok_or_else(unsupported)?;
+        let (world, body) = body.split_first_chunk::<16>().ok_or_else(|| invalid("Owned world point has no world UUID"))?;
+        let (relation, id, valid, _identity) = point_request(call, body, PointTime::Required)?;
+        let valid_at = valid.ok_or_else(|| invalid("Owned world point requires a valid_micros instant"))?;
+        let (_, attachment) = call.session.resolve_database(Some(&call.database), &self.0.node)?;
+        let attachment = attachment.ok_or_else(unsupported)?;
+        let connection = self.connection(call, &call.database).await?;
+        let mut session = connection.borrow().await?;
+        require_idle(&session)?;
+        let result = host.read_point(
+            crate::WorldCall { node: &self.0.node, attachment: &attachment, session: &mut session, cancellation: &call.cancellation },
+            crate::WorldPoint { world: Uuid::from_bytes(*world), relation: &relation, id: &id, valid_at },
+        ).await.map_err(status)?;
+        if let Some(row) = result.row {
+            let crate::WorldPointRow { fields: row, revision, reservation: _retained } = row;
+            let bytes = Value::document_retained_bytes(&row).map_err(status)?;
+            let _encoding = call.reserve(wire::add(4096, wire::mul(bytes, 8)?)?)?;
+            let mut fields = Vec::with_capacity(row.len());
+            let mut columns = Vec::with_capacity(row.len());
+            for (name, value) in &row {
+                let logical = value.logical_type();
+                fields.push(rtdb_columnar::to_field(name, &logical).map_err(status)?);
+                columns.push(rtdb_columnar::build_array(&logical, std::slice::from_ref(value)).map_err(status)?);
+            }
+            let schema = Arc::new(Schema::new(fields));
+            let batch = RecordBatch::try_new(Arc::clone(&schema), columns).map_err(arrow)?;
+            self.owned_point_reply(&schema, Some(&batch), result.present, valid_at, Some(revision))
+        } else {
+            self.owned_point_reply(&Schema::empty(), None, result.present, valid_at, None)
+        }
+    }
+
+    pub(crate) async fn drop_world_action(&self, call: &Call, body: &[u8]) -> Result<(), Status> {
+        if !self.0.config.owned_native_actions { return Err(unsupported()); }
+        let host = self.0.config.owned_world_host.as_ref().ok_or_else(unsupported)?;
+        let bytes: [u8; 16] = body.try_into().map_err(|_| invalid("Owned world drop requires one world UUID"))?;
+        let (_, attachment) = call.session.resolve_database(Some(&call.database), &self.0.node)?;
+        let attachment = attachment.ok_or_else(unsupported)?;
+        let connection = self.connection(call, &call.database).await?;
+        let mut session = connection.borrow().await?;
+        require_idle(&session)?;
+        host.drop_world(
+            crate::WorldCall { node: &self.0.node, attachment: &attachment, session: &mut session, cancellation: &call.cancellation },
+            Uuid::from_bytes(bytes),
+        ).await.map_err(status)
+    }
+
     pub(crate) async fn read_owned_action(&self, call: &Call, body: &[u8]) -> Result<ActionResult, Status> {
         if !self.0.config.owned_native_actions { return Err(unsupported()); }
-        let (relation, id, _, _identity) = point_request(call, body, false)?;
+        let (relation, id, _, _identity) = point_request(call, body, PointTime::Default)?;
         let connection = self.connection(call, &call.database).await?;
         let mut native = connection.borrow().await?;
         require_idle(&native)?;
@@ -653,13 +704,16 @@ impl Service {
     }
 }
 
+#[derive(Clone, Copy)]
+enum PointTime { Default, Optional, Required }
+
 fn point_request(
-    call: &Call, body: &[u8], with_valid: bool,
+    call: &Call, body: &[u8], time: PointTime,
 ) -> Result<(OwnedRelation, EntityId, Option<Timestamp>, Arc<MemoryReservation>), Status> {
     let (relation, arrow) = split_relation(body)?;
     let batch = request_batch(call, arrow)?;
     let batch = batch.batch();
-    let expected_columns = if with_valid { 2 } else { 1 };
+    let expected_columns = if matches!(time, PointTime::Default) { 1 } else { 2 };
     if batch.num_columns() != expected_columns || batch.num_rows() != 1 {
         return Err(invalid("Owned point action requires one row with the fields for its action version"));
     }
@@ -667,15 +721,21 @@ fn point_request(
     let values = batch.column(column).as_ref();
     let identity = call.reserve(wire::add(4096, rtdb_columnar::estimate_read_value_bytes(field, values, 0).map_err(status)?)?)?;
     let id = rtdb_columnar::read_execution_value(field, values, 0).map_err(status)?.entity_id().map_err(status)?;
-    let valid = if with_valid {
+    let valid = if !matches!(time, PointTime::Default) {
         let (column, field) = batch.schema_ref().column_with_name("valid_micros")
-            .ok_or_else(|| invalid("Owned held point v2 requires valid_micros"))?;
-        if field.data_type() != &DataType::Int64 || !field.is_nullable() || !field.metadata().is_empty() {
-            return Err(invalid("Owned held point valid_micros must be nullable Int64"));
+            .ok_or_else(|| invalid("Owned point requires valid_micros"))?;
+        if field.data_type() != &DataType::Int64 || !field.metadata().is_empty()
+            || (matches!(time, PointTime::Optional) && !field.is_nullable())
+        {
+            return Err(invalid("Owned point valid_micros has an invalid Int64 field"));
         }
         let values = batch.column(column).as_any().downcast_ref::<Int64Array>()
-            .ok_or_else(|| invalid("Owned held point valid_micros must be nullable Int64"))?;
-        (!values.is_null(0)).then(|| Timestamp(values.value(0)))
+            .ok_or_else(|| invalid("Owned point valid_micros must be Int64"))?;
+        let valid = (!values.is_null(0)).then(|| Timestamp(values.value(0)));
+        if matches!(time, PointTime::Required) && valid.is_none() {
+            return Err(invalid("Owned world point requires a valid_micros instant"));
+        }
+        valid
     } else {
         None
     };

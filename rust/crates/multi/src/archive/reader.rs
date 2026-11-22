@@ -516,6 +516,7 @@ async fn serve_reader(
         claim_wait: Duration::from_secs(1),
         capabilities: None,
         flight_peer: None,
+        flight_owned_worlds: None,
     };
     let auth = match &transport {
         Transport::Loopback { password, .. } => format!("password: \"{password}\""),

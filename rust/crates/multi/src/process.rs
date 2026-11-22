@@ -1,5 +1,6 @@
 //! Assembling the cell's processes: a node (server, agent, lease, control listener) and a logkeeper (server and lease).
 
+mod owned_worlds;
 pub(crate) mod standalone;
 
 pub use standalone::{STANDALONE_PROTOCOL, StandaloneSettings, initialize_standalone, serve_standalone};
@@ -105,6 +106,19 @@ pub async fn start_node(directory: Arc<dyn Directory>, mut settings: NodeSetting
             else { rtdb_directory::ReplayCustody::Hosted { owner: settings.hosted_task.clone() } },
         tasks: storage_regions.clone(),
     });
+    let flight_owned_worlds = settings.configuration.flight_sql.as_ref()
+        .filter(|flight| flight.port >= 0 && flight.owned_native_actions)
+        .map(|_| {
+            let mut options = options.clone();
+            options.owned_relations = true;
+            Arc::new(owned_worlds::PlacedWorldHost {
+                directory: Arc::clone(&directory),
+                storage: settings.agent.storage.clone(),
+                keys: Arc::clone(&settings.keys),
+                hosted_task: settings.hosted_task.clone(),
+                options,
+            }) as Arc<dyn rtdb_flight_sql::OwnedWorldHost>
+        });
     let storage = Arc::new(crate::store::CellStoreFactory {
         directory: Arc::clone(&directory),
         keys: Arc::clone(&settings.keys),
@@ -120,6 +134,7 @@ pub async fn start_node(directory: Arc<dyn Directory>, mut settings: NodeSetting
         claim_wait: settings.claim_wait,
         capabilities: settings.capabilities.clone().map(|secret| secret as Arc<dyn rtdb_pgwire::CapabilityVerifier>),
         flight_peer: settings.capabilities.clone().map(|secret| secret as Arc<dyn rtdb_flight_sql::FlightPeerVerifier>),
+        flight_owned_worlds,
         read_fence: Some(fence.clone() as Arc<dyn rtdb_node::ReadFence>),
         scan_fragmenter: Some(fragmenter.clone() as Arc<dyn rtdb_query::ScanFragmenter>),
         compaction_relay: match (settings.pool == rtdb_directory::MemberPool::Compaction, &settings.capabilities) {

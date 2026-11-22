@@ -310,14 +310,24 @@ pub async fn commit_checkpoint_world(
     Ok(outcome.tx_key())
 }
 
+pub struct WorldPoint {
+    pub present: TransactionKey,
+    pub fact: Option<WorldFact>,
+}
+
 pub struct WorldFact {
     row: StructFields<Value>,
+    revision: Timestamp,
     _reservation: Arc<MemoryReservation>,
 }
 
 impl WorldFact {
     pub fn row(&self) -> &StructFields<Value> {
         &self.row
+    }
+
+    pub(crate) fn into_parts(self) -> (StructFields<Value>, Timestamp, Arc<MemoryReservation>) {
+        (self.row, self.revision, self._reservation)
     }
 }
 
@@ -333,7 +343,7 @@ fn decode_point(
             if found.is_some() {
                 return Err(OwnedWorld::unavailable());
             }
-            rtdb_query::owned_row_revision(batch, row, id, memory)?;
+            let revision = rtdb_query::owned_row_revision(batch, row, id, memory)?;
             let columns = || {
                 batch
                     .schema_ref()
@@ -364,6 +374,7 @@ fn decode_point(
                 .collect::<Result<_>>()?;
             found = Some(WorldFact {
                 row: fields,
+                revision,
                 _reservation: reservation,
             });
         }
@@ -384,11 +395,12 @@ pub async fn read_checkpoint_world_point(
     id: &EntityId,
     valid_at: Timestamp,
     resources: CheckpointReadResources<'_>,
-) -> Result<Option<WorldFact>> {
+) -> Result<WorldPoint> {
     let valid = Interval::at(valid_at)?;
     let OpenWorld {
         retained, snapshot, ..
     } = open_world(directory, archive, session, deployment, world).await?;
+    let present = snapshot.present();
     let local = relation.in_world(Iid(*world.as_bytes()))?;
     let memory = resources.memory;
     if let Some(mut cursor) = snapshot.open_point_at(&local, id, Some(valid_at)).await? {
@@ -404,13 +416,15 @@ pub async fn read_checkpoint_world_point(
                 return Err(OwnedWorld::unavailable());
             }
             let reservation = memory.reserve(WorldShadow::decode_bound(&fact.row)?)?;
-            return Ok(match WorldShadow::from_record(&fact.row)? {
+            let visible = match WorldShadow::from_record(&fact.row)? {
                 WorldShadow::Deleted => None,
                 WorldShadow::Present(row) => Some(WorldFact {
                     row,
+                    revision: fact.revision,
                     _reservation: reservation,
                 }),
-            });
+            };
+            return Ok(WorldPoint { present, fact: visible });
         }
     }
     let parent = CheckpointReadWorld {
@@ -438,5 +452,6 @@ pub async fn read_checkpoint_world_point(
     if retained.until <= now() {
         return Err(OwnedWorld::unavailable());
     }
-    decode_point(batches.unwrap_or_default(), id, memory)
+    let fact = decode_point(batches.unwrap_or_default(), id, memory)?;
+    Ok(WorldPoint { present, fact })
 }
