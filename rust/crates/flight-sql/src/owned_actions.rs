@@ -144,6 +144,7 @@ pub(crate) const HELD_OWNED_POINT_V1: &str = "rtdb.owned.ReadHeldPoint.v1";
 pub(crate) const HELD_OWNED_POINT_V2: &str = "rtdb.owned.ReadHeldPoint.v2";
 pub(crate) const HELD_OWNED_HISTORICAL_POINT_V1: &str = "rtdb.owned.ReadHeldHistoricalPoint.v1";
 pub(crate) const HELD_OWNED_VALID_DURING_V2: &str = "rtdb.owned.ReadHeldValidDuring.v2";
+pub(crate) const HELD_WORLD_VALID_V1: &str = "rtdb.owned.ReadHeldWorldValidDuring.v1";
 pub(crate) const HELD_WORLD_IDENTITIES_V1: &str = "rtdb.owned.ReadHeldWorldIdentityPage.v1";
 pub(crate) const HELD_OWNED_IDENTITIES_V1: &str = "rtdb.owned.ReadHeldIdentityPage.v1";
 pub(crate) const HELD_OWNED_VERSIONS_V2: &str = "rtdb.owned.ReadHeldVersions.v2";
@@ -1402,6 +1403,44 @@ impl Service {
         }
         let nonce = result.witness.take().map(|evidence| held.remember_point(call, evidence)).transpose()?;
         let reply = self.world_point_reply(call, result, valid_at, nonce)?;
+        held.snapshot.check_relation(&relation).map_err(status)?;
+        Ok(reply)
+    }
+
+    pub(crate) async fn held_world_valid_during_action(&self, call: &Call, body: &[u8]) -> Result<ActionResult, Status> {
+        use rtdb_types::Interval;
+
+        if !self.0.config.owned_native_actions || self.0.config.owned_world_host.is_none() { return Err(unsupported()); }
+        let (handle, body) = body.split_first_chunk::<16>().ok_or_else(|| invalid("Owned world history has no held handle"))?;
+        let held = self.owned_world_read(call, &Bytes::copy_from_slice(handle))?;
+        let (relation, arrow_bytes) = split_relation(body)?;
+        let batch = request_batch(call, arrow_bytes)?;
+        let batch = batch.batch();
+        if batch.num_columns() != 3 || batch.num_rows() != 1 {
+            return Err(invalid("Owned world history requires a typed identity and two valid endpoints"));
+        }
+        let (id, _identity) = point_identity(call, batch)?;
+        let from = history_request_endpoint(batch, "valid_from_micros")?;
+        let to = history_request_endpoint(batch, "valid_to_micros")?;
+        let valid = Interval::new(from, to).map_err(status)?;
+        if valid.is_empty() { return Err(invalid("Owned world history requires a nonempty valid window")); }
+        let slices = held.snapshot.valid_during(&relation, &id, valid).await.map_err(status)?;
+        let _rows = call.reserve(4096 + slices.len() * 128)?;
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("valid_from_micros", DataType::Int64, false),
+            Field::new("valid_to_micros", DataType::Int64, false),
+            Field::new("system_from_micros", DataType::Int64, false),
+        ]).with_metadata([
+            (OWNED_PRESENT.into(), held.snapshot.present().0.to_string()),
+            (OWNED_VALID_FROM.into(), from.0.to_string()),
+            (OWNED_VALID_TO.into(), to.0.to_string()),
+        ].into()));
+        let rows = RecordBatch::try_new(Arc::clone(&schema), vec![
+            Arc::new(Int64Array::from_iter_values(slices.iter().map(|(valid, _)| valid.lower().0))),
+            Arc::new(Int64Array::from_iter_values(slices.iter().map(|(valid, _)| valid.upper().0))),
+            Arc::new(Int64Array::from_iter_values(slices.iter().map(|(_, revision)| revision.0))),
+        ]).map_err(arrow)?;
+        let reply = self.owned_action_reply(&schema, Some(&rows))?;
         held.snapshot.check_relation(&relation).map_err(status)?;
         Ok(reply)
     }

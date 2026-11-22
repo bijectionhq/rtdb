@@ -34,6 +34,13 @@ struct ArchivePoint {
 
 enum ArchiveRead {
     Point(ArchivePoint),
+    Boundaries {
+        relation: OwnedRelation,
+        id: EntityId,
+        valid: Interval,
+        guard: Arc<dyn Fn() -> Result<()> + Send + Sync>,
+        reply: oneshot::Sender<Result<Vec<Timestamp>>>,
+    },
     Identities {
         relation: OwnedRelation,
         at: Timestamp,
@@ -92,6 +99,40 @@ impl HeldCheckpointWorld {
         self.check_relation(relation)?;
         Ok(WorldPoint { present: self.present(), fact, shadowed, witness })
     }
+    pub async fn valid_during(
+        &self, relation: &OwnedRelation, id: &EntityId, valid: Interval,
+    ) -> Result<Vec<(Interval, Timestamp)>> {
+        self.check_relation(relation)?;
+        if valid.is_empty() { return Err(OwnedWorld::unavailable()); }
+        self.open.snapshot.check_point_purge_floor(relation, id, self.open.retained.basis.system_time).await?;
+        let local = self.open.snapshot.open_world_shadow_boundaries(self.open.record.id, relation, id, valid).await?;
+        let local = read_boundaries(local, valid).await?;
+        let (reply, result) = oneshot::channel();
+        self.cancellation.run_until_cancelled(self.requests.send(ArchiveRead::Boundaries {
+            relation: relation.clone(), id: id.clone(), valid,
+            guard: self.open.snapshot.relation_release_guard([relation])?, reply,
+        })).await.ok_or_else(OwnedWorld::unavailable)?.map_err(|_| OwnedWorld::unavailable())?;
+        let parent = self.cancellation.run_until_cancelled(result).await
+            .ok_or_else(OwnedWorld::unavailable)?.map_err(|_| OwnedWorld::unavailable())??;
+        // A parent boundary inside a local shadow cannot affect the selected timeline.
+        let mut boundaries: Vec<_> = parent.into_iter().filter(|boundary| {
+            !local.chunks_exact(2).any(|span| span[0] < *boundary && *boundary < span[1])
+        }).collect();
+        boundaries.extend(local);
+        boundaries.extend([valid.lower(), valid.upper()]);
+        boundaries.sort_unstable();
+        boundaries.dedup();
+        if boundaries.len() > MAX_HISTORY_SLICES + 1 { return Err(history_limit()); }
+        let mut visible = Vec::with_capacity(boundaries.len().saturating_sub(1));
+        for window in boundaries.windows(2) {
+            if let Some(fact) = self.point(relation, id, window[0], false).await?.fact {
+                visible.push((Interval::new(window[0], window[1])?, fact.revision));
+            }
+        }
+        self.check_relation(relation)?;
+        Ok(visible)
+    }
+
     pub async fn identity_page(
         &self, relation: &OwnedRelation, valid: Timestamp, after: Option<&str>, limit: usize,
     ) -> Result<WorldIdentityPage> {
@@ -162,6 +203,41 @@ impl HeldCheckpointWorld {
 
 }
 
+const MAX_HISTORY_SLICES: usize = 128;
+
+fn history_limit() -> rtdb_types::Anomaly {
+    rtdb_types::Anomaly::new(
+        rtdb_types::AnomalyCategory::Busy, "rtdb.world/history-size",
+        "The world history interval exceeds its boundary limit",
+    )
+}
+
+async fn read_boundaries(cursor: Option<rtdb_query::QueryCursor>, valid: Interval) -> Result<Vec<Timestamp>> {
+    let mut boundaries = Vec::new();
+    let Some(mut cursor) = cursor else { return Ok(boundaries); };
+    let mut prior = valid.lower();
+    while let Some(batch) = cursor.next_batch().await? {
+        let batch = batch.batch();
+        let read = |name, row| {
+            let (slot, field) = batch.schema_ref().column_with_name(name).ok_or_else(OwnedWorld::unavailable)?;
+            match rtdb_columnar::read_value(field, batch.column(slot).as_ref(), row)? {
+                Value::Timestamp { value, unit: rtdb_types::TimeUnit::Microsecond, .. } => Ok(Timestamp(value)),
+                Value::Null if name == "_valid_to" => Ok(Timestamp::MAX),
+                _ => Err(OwnedWorld::unavailable()),
+            }
+        };
+        for row in 0..batch.num_rows() {
+            if boundaries.len() == MAX_HISTORY_SLICES * 2 { return Err(history_limit()); }
+            let from = read("_valid_from", row)?;
+            let to = read("_valid_to", row)?;
+            if from < prior || from >= to || to > valid.upper() { return Err(OwnedWorld::unavailable()); }
+            boundaries.extend([from, to]);
+            prior = to;
+        }
+    }
+    Ok(boundaries)
+}
+
 impl Drop for HeldCheckpointWorld {
     fn drop(&mut self) { self.close(); }
 }
@@ -219,6 +295,22 @@ pub(crate) async fn open_held_checkpoint_world(
                                             owner: &owner, relation: &relation, id: &id, valid: Some(valid),
                                         }).await?;
                                         decode_point(batches.unwrap_or_default(), &id, memory)
+                                    };
+                                    let response = tokio::select! {
+                                        _ = scope.cancelled() => break,
+                                        _ = reply.closed() => continue,
+                                        result = read => result,
+                                    };
+                                    let _ = reply.send(response);
+                                }
+                                ArchiveRead::Boundaries { relation, id, valid, guard, mut reply } => {
+                                    let read = async {
+                                        require_relation_purge_history(&context, &owner)?;
+                                        let cursor = rtdb_query::open_owned_valid_boundaries(
+                                            Arc::clone(&context).with_owned_read_guard(guard),
+                                            &owner, &relation, &id, valid, parent_time,
+                                        ).await?;
+                                        read_boundaries(cursor, valid).await
                                     };
                                     let response = tokio::select! {
                                         _ = scope.cancelled() => break,

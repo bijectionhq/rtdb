@@ -1036,6 +1036,19 @@ impl OwnedReadSession {
         Ok(OwnedWorldShadowRead { row, witness })
     }
 
+    pub async fn open_world_shadow_boundaries(
+        &self, world: rtdb_types::Iid, relation: &rtdb_types::OwnedRelation, id: &rtdb_types::EntityId,
+        valid: rtdb_types::Interval,
+    ) -> Result<Option<QueryCursor>> {
+        let (admitted, _charge) = self.world_registration(world).await?
+            .filter(|(world, _)| !world.dropped && world.until > self.present.system_time)
+            .ok_or_else(rtdb_types::OwnedWorld::unavailable)?;
+        rtdb_query::open_owned_valid_boundaries(
+            self.relation_context(relation)?, &self.owner, &relation.in_world(admitted.id)?,
+            id, valid, self.present.system_time,
+        ).await
+    }
+
     pub fn close(&self) { self.cancellation.cancel(); }
     pub fn check(&self) -> Result<()> { self.context.check_cancelled() }
 

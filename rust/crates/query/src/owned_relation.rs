@@ -68,6 +68,21 @@ pub async fn open_owned_valid_during_at(
     open_owned_table_point(context, relation.table(owner), locator, Some(id), Some(valid), None, true).await
 }
 
+/// Opens the winning valid boundaries, including local world tombstones.
+pub async fn open_owned_valid_boundaries(
+    context: Arc<QueryContext>, owner: &str, relation: &OwnedRelation, id: &EntityId,
+    valid: Interval, system: Timestamp,
+) -> Result<Option<QueryCursor>> {
+    if relation.is_world_catalog() || valid.is_empty() {
+        return Err(Anomaly::incorrect("rtdb.owned/history-window", "Invalid owned valid window"));
+    }
+    let context = owned_context_at_system(context, system)?;
+    let OwnedAddress::Assigned(locator) = owned_address(Arc::clone(&context), owner, relation, id).await? else {
+        return Ok(None);
+    };
+    open_owned_table_point(context, relation.table(owner), locator, Some(id), Some(valid), Some(&["_id"]), true).await
+}
+
 /// Opens a bounded page of visible identities in complete UTF-8 key order.
 pub async fn open_owned_identity_page(
     context: Arc<QueryContext>, owner: &str, relation: &OwnedRelation, system: Timestamp,
