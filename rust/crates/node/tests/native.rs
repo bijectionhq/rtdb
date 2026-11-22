@@ -397,6 +397,25 @@ async fn held_owned_range_requires_a_covering_generation() {
         rtdb_columnar::read_value(result.schema.field(1), batch.column(1).as_ref(), row).unwrap()
     }).collect::<Vec<_>>();
     assert_eq!(ids, [Value::I64(1), Value::I64(2)]);
+
+    let key = |priority, id| StructFields::from([
+        ("priority".into(), Value::I64(priority)),
+        ("_id".into(), Value::I64(id)),
+    ]);
+    let lower = key(10, 1);
+    let upper = key(20, 3);
+    for (descending, after, next) in [(false, key(10, 1), 2), (true, key(10, 2), 1)] {
+        let request = rtdb_node::OwnedRangeRequest {
+            lower: Some(&lower), upper: Some(&upper), after: Some(&after), descending, limit: 1,
+        };
+        let page = held.range_page_by_key(&relation, &path, request).await.unwrap();
+        let batch = page.batch.unwrap();
+        assert_eq!(batch.batch().num_rows(), 1);
+        assert_eq!(
+            rtdb_columnar::read_value(page.schema.field(1), batch.batch().column(1).as_ref(), 0).unwrap(),
+            Value::I64(next),
+        );
+    }
     drop(held);
     drop(writer);
     stop(&node, driver).await;

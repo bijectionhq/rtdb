@@ -884,8 +884,23 @@ impl OwnedReadSession {
         &self, relation: &rtdb_types::OwnedRelation, path: &rtdb_types::OwnedRelation,
         lower: Option<&Value>, upper: Option<&Value>, limit: usize,
     ) -> Result<crate::OwnedRangePage> {
+        self.range_page(relation, path, crate::ordered_index::RowBounds::Leading { lower, upper, limit }).await
+    }
+
+    /// Reads in either direction with exclusive full-key continuation at this held cut.
+    pub async fn range_page_by_key(
+        &self, relation: &rtdb_types::OwnedRelation, path: &rtdb_types::OwnedRelation,
+        request: crate::OwnedRangeRequest<'_>,
+    ) -> Result<crate::OwnedRangePage> {
+        self.range_page(relation, path, crate::ordered_index::RowBounds::Compound(request)).await
+    }
+
+    async fn range_page(
+        &self, relation: &rtdb_types::OwnedRelation, path: &rtdb_types::OwnedRelation,
+        bounds: crate::ordered_index::RowBounds<'_>,
+    ) -> Result<crate::OwnedRangePage> {
         self.admit_read().await?;
-        let result = crate::ordered_index::owned_range(Arc::clone(&self.context), &self.owner, relation, path, lower, upper, limit).await?;
+        let result = crate::ordered_index::owned_range(Arc::clone(&self.context), &self.owner, relation, path, bounds).await?;
         self.check()?;
         Ok(result)
     }

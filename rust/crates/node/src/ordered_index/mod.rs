@@ -21,7 +21,7 @@ use rtdb_types::{Anomaly, Instant, Result, TableRef, Value};
 use sha2::{Digest, Sha256};
 use tokio_util::sync::CancellationToken;
 
-pub(crate) use accelerate::OrderedIndexAccelerator;
+pub(crate) use accelerate::{OrderedIndexAccelerator, RowBounds};
 pub(crate) use maintenance::OrderedIndexMaintenance;
 pub(crate) use usage::Inventory;
 
@@ -174,6 +174,15 @@ pub struct OwnedRangePage {
     pub batch: Option<rtdb_columnar::OwnedBatch>,
 }
 
+/// Full-key bounds for a covered page. Bound documents name every path column.
+pub struct OwnedRangeRequest<'a> {
+    pub lower: Option<&'a rtdb_types::StructFields<Value>>,
+    pub upper: Option<&'a rtdb_types::StructFields<Value>>,
+    pub after: Option<&'a rtdb_types::StructFields<Value>>,
+    pub descending: bool,
+    pub limit: usize,
+}
+
 fn uncovered_owned_range() -> Anomaly {
     Anomaly::new(rtdb_types::AnomalyCategory::Unavailable, "rtdb.owned/path-uncovered", "The held basis has no fully covered generation of this owned path")
 }
@@ -183,9 +192,7 @@ pub(crate) async fn owned_range(
     owner: &str,
     relation: &rtdb_types::OwnedRelation,
     path: &rtdb_types::OwnedRelation,
-    lower: Option<&Value>,
-    upper: Option<&Value>,
-    limit: usize,
+    bounds: RowBounds<'_>,
 ) -> Result<OwnedRangePage> {
     let catalog = rtdb_types::OwnedRelation::path_catalog(owner);
     let target = relation.table(owner);
@@ -197,7 +204,7 @@ pub(crate) async fn owned_range(
         .ok_or_else(uncovered_owned_range)?;
     let database = context.catalog.database(context.catalog.default_database())?;
     let [snapshot] = database.partitions.as_slice() else { return Err(uncovered_owned_range()); };
-    let work = accelerate::owned_page(&context, snapshot, &database.storage, &definition, accelerate::RowBounds { lower, upper, limit });
+    let work = accelerate::owned_page(&context, snapshot, &database.storage, &definition, bounds);
     rtdb_storage::IoRegion::leased(context.catalog.read_lease(), work).await
 }
 
