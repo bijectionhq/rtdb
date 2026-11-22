@@ -26,6 +26,10 @@ Metadata naming an erased unit is erased with it before the window ends.
 ## State on main (2026-11-21)
 
 - R2 (`85a868c07`): the resolver checks receipts in `xt.idempotency_receipts` (`rust/crates/tx/src/resolver.rs`, `receipt_outcome` and `put_receipt`, `RECEIPT_WINDOW_MICROS`), keyed by principal and key with a body digest (`rust/crates/tx/src/source.rs`, `body_digest`).
+- Application receipt validity and lookup use the recorded source-log instant.
+  Lookup selects the newest visible receipt whose expiry is still ahead of the recorded log instant.
+  A backward log-clock reading cannot hide an already committed, unexpired receipt before its start time.
+  Legacy receipt rows retain their original stored intervals.
 - Placed resolution writes a checkpointed outcome witness with a one-hour validity interval starting at the intake record's timestamp.
   The exact attempt key survives checkpoint recovery.
   The client receipt expires at the same one-hour boundary.

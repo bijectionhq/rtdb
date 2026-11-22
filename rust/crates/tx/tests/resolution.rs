@@ -716,9 +716,11 @@ async fn a_retry_identity_answers_its_own_body_and_refuses_another_within_its_wi
         resolved
     };
 
+    assert!(resolve(request(vec![], &context), 100).await.result().committed());
     let original = resolve(keyed("alice", 1), 100).await;
     assert!(original.result().committed());
-    let duplicate = resolve(keyed("alice", 1), 200).await;
+    assert_eq!(original.result().tx_key().system_time, Timestamp(101));
+    let duplicate = resolve(keyed("alice", 1), 100).await;
     let error = duplicate.result().error().unwrap();
     assert_eq!(error.code, "rtdb/idempotency-duplicate");
     assert_eq!(error.context["original-tx-id"], original.result().tx_key().tx_id.0);
@@ -726,8 +728,14 @@ async fn a_retry_identity_answers_its_own_body_and_refuses_another_within_its_wi
     let conflict = resolve(keyed("alice", 2), 300).await;
     assert_eq!(conflict.result().error().unwrap().code, "rtdb/idempotency-conflict");
     assert!(resolve(keyed("bob", 2), 400).await.result().committed(), "another principal's identity is independent");
+    let regressed = resolve(keyed("alice", 1), 99).await;
+    assert_eq!(regressed.result().error().unwrap().code, "rtdb/idempotency-duplicate");
     let after = resolve(keyed("alice", 3), 100 + RECEIPT_WINDOW_MICROS).await;
     assert!(after.result().committed(), "the identity is free again once the window has passed");
+    let retried_after_regression = resolve(keyed("alice", 3), 99).await;
+    let error = retried_after_regression.result().error().unwrap();
+    assert_eq!(error.code, "rtdb/idempotency-duplicate");
+    assert_eq!(error.context["original-tx-id"], after.result().tx_key().tx_id.0);
 }
 
 #[tokio::test]

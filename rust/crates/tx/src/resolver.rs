@@ -231,7 +231,7 @@ impl TxResolver {
                     Some(key) => match request.body_digest() {
                         Ok(digest) => {
                             let id = format!("{}\u{1f}{key}", request.options.user.as_deref().unwrap_or(""));
-                            let outcome = tx.receipt_outcome(&id, &digest).await.and_then(|outcome| outcome);
+                            let outcome = tx.receipt_outcome(&id, &digest, log_time).await.and_then(|outcome| outcome);
                             (Some((id, digest)), outcome)
                         }
                         Err(error) => (None, Err(error)),
@@ -281,7 +281,7 @@ impl TxResolver {
             }
             outcome.and_then(|()| match (replay, receipt) {
                 (Some(replay), _) => tx.write_replay_marker(replay),
-                (None, Some((id, digest))) => tx.put_receipt(&id, &digest),
+                (None, Some((id, digest))) => tx.put_receipt(&id, &digest, log_time),
                 (None, None) => Ok(()),
             })
         };
@@ -466,9 +466,12 @@ impl<'a> OpenTransaction<'a> {
     }
 
     /// Whether a live receipt names this retry identity: the same body is a duplicate of the original, a different one a conflict.
-    async fn receipt_outcome(&self, id: &str, digest: &str) -> Result<Result<()>> {
+    async fn receipt_outcome(&self, id: &str, digest: &str, log_time: Timestamp) -> Result<Result<()>> {
         if !self.snapshot()?.contains_table(&receipts_table()) { return Ok(Ok(())); }
-        let mut query = self.open_query("SELECT digest, tx_id, tx_system_time FROM xt.idempotency_receipts WHERE _id = ?", vec![Value::Utf8(id.into())]).await?;
+        let mut query = self.open_query(
+            "SELECT digest, tx_id, tx_system_time FROM xt.idempotency_receipts FOR ALL VALID_TIME               WHERE _id = ? AND (_valid_to IS NULL OR _valid_to > ?) ORDER BY tx_system_time DESC LIMIT 1",
+            vec![Value::Utf8(id.into()), time_value(log_time)],
+        ).await?;
         while let Some(batch) = query.next_batch().await? {
             let batch = batch.batch();
             if batch.num_rows() == 0 { continue; }
@@ -488,14 +491,14 @@ impl<'a> OpenTransaction<'a> {
         Ok(Ok(()))
     }
 
-    fn put_receipt(&mut self, id: &str, digest: &str) -> Result<()> {
+    fn put_receipt(&mut self, id: &str, digest: &str, log_time: Timestamp) -> Result<()> {
         let key = self.tx_key();
         let document = StructFields::from([
             ("_id".into(), Value::Utf8(id.into())), ("digest".into(), Value::Utf8(digest.into())),
             ("tx_id".into(), Value::I64(key.tx_id.0)), ("tx_system_time".into(), time_value(key.system_time)),
         ]);
-        let expires = Timestamp(key.system_time.0.saturating_add(RECEIPT_WINDOW_MICROS));
-        self.buffer.put(receipts_table(), document, interval(key.system_time, expires)?)
+        let expires = Timestamp(log_time.0.saturating_add(RECEIPT_WINDOW_MICROS));
+        self.buffer.put(receipts_table(), document, interval(log_time, expires)?)
     }
 
     fn write_attempt_outcome(&mut self, attempt: PlacedAttempt, log_time: Timestamp, controls: std::collections::BTreeSet<&str>) -> Result<()> {
@@ -1453,7 +1456,7 @@ impl<'a> OpenTransaction<'a> {
     }
 }
 
-/// How long, in system time, a committed transaction's receipt answers retries of its identity.
+/// How long, from source-log admission, a receipt answers retries of its identity.
 pub const RECEIPT_WINDOW_MICROS: i64 = 3_600_000_000;
 fn receipts_table() -> TableRef { TableRef::new("xt", "idempotency_receipts") }
 
