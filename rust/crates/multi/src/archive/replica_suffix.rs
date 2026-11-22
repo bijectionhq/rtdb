@@ -99,6 +99,58 @@ pub(crate) async fn capture(
     ).await
 }
 
+/// Resolve an immutable published sidecar using only the capture's own authority.
+pub(super) fn accepted<'a>(
+    record: &'a DeploymentRecord, point: &CapturePoint, manifest: &str, suffix: Uuid,
+) -> Result<&'a CheckpointSuffixPin> {
+    let pin = record.checkpoint_suffix_pins.get(&suffix).ok_or_else(suffix_unavailable)?;
+    if pin.capture != point.operation || pin.incarnation != point.incarnation
+        || pin.incarnation != record.incarnation || pin.log_epoch != point.log_epoch
+        || pin.log_epoch != record.log_epoch || pin.checkpoint != point.checkpoint
+        || pin.manifest_sha256 != manifest || pin.archive_sha256.is_none()
+        || pin.checkpoint.boundary.checked_add(1) != Some(pin.journal_interval[0])
+        || pin.journal_interval[1] != pin.replica_through || pin.source_through <= point.checkpoint.source
+        || pin.basis.system_time.0 <= point.checkpoint.system_time
+    {
+        return Err(suffix_unavailable());
+    }
+    Ok(pin)
+}
+
+pub(super) async fn apply_archived(
+    bucket: &dyn ObjectStore, deployment: Uuid, suffix: Uuid, stream: String,
+    pin: &CheckpointSuffixPin, material: &[u8; crate::keys::KEY_BYTES],
+    recovered: &mut rtdb_replication::RecoveredPartition, memory: &Arc<rtdb_columnar::MemoryBudget>,
+) -> Result<()> {
+    let object = key(&format!("checkpoint-captures/{deployment}/{}/replica-suffix/{suffix}.v1", pin.capture))?;
+    let expected = pin.archive_sha256.as_deref().ok_or_else(suffix_unavailable)?;
+    let bytes = bucket.head_fresh(&object).await?.size;
+    if bytes > MAX_BYTES as u64 + 1024 { return Err(suffix_unavailable()); }
+    let charge = usize::try_from(bytes).ok().and_then(|size| size.checked_mul(4))
+        .and_then(|size| size.checked_add(4096 + MAX_SUFFIX_ENTRIES * 128)).ok_or_else(suffix_unavailable)?;
+    let _charge = memory.reserve(charge)?;
+    let sealed = read_sealed(bucket, &object, expected).await?;
+    let cipher = Cipher::new(material)?;
+    let plaintext = cipher.open(object.as_str(), &sealed)?;
+    let entries = decode(plaintext)?;
+    let certificate = JournalDigest::from_digest_bytes(stream, pin.journal_interval, pin.journal_sha256);
+    let catalog = recovered.block.as_ref().ok_or_else(suffix_unavailable)?;
+    validate_records(&entries, pin, &certificate, catalog)?;
+    for entry in entries {
+        if let Some(ReplicaBody::ResolvedTx(message)) = ReplicaFrame::decode(&entry.payload)?.message {
+            recovered.apply_archived_transaction(&message, memory)?;
+        }
+    }
+    let epoch = StorageEpoch(pin.log_epoch);
+    if recovered.progress.tx_key != Some(pin.basis)
+        || recovered.progress.source_position.after_offset(epoch) != pin.source_through
+        || recovered.partition.snapshot().tx_basis() != Some(pin.basis)
+    {
+        return Err(suffix_unavailable());
+    }
+    Ok(())
+}
+
 fn admit<'a>(
     record: &'a DeploymentRecord, archive: &CellStorage, deployment: Uuid,
     pin_id: Uuid, selected: &CheckpointSuffixPin,

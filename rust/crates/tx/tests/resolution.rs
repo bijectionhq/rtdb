@@ -813,7 +813,7 @@ async fn owned_world_rows_require_the_ordered_registration_and_cannot_mix_with_r
     let context = context();
     let state = PartitionState::empty(Default::default()).unwrap();
     let world = OwnedWorld {
-        id: Iid([8; 16]), capture: Iid([9; 16]), manifest: "a".repeat(43),
+        id: Iid([8; 16]), capture: Iid([9; 16]), suffix: None, manifest: "a".repeat(43),
         basis: TransactionKey { tx_id: TxId(0), system_time: Timestamp(10) }, until: Timestamp(108), dropped: false,
         schemas: rtdb_types::WorldSchemas::new(std::collections::BTreeMap::from([(
             "orders".into(),
@@ -910,7 +910,7 @@ async fn ordered_world_drop_is_terminal_and_refuses_a_different_fork() {
     let context = context();
     let state = PartitionState::empty(Default::default()).unwrap();
     let world = OwnedWorld {
-        id: Iid([8; 16]), capture: Iid([9; 16]), manifest: "a".repeat(43),
+        id: Iid([8; 16]), capture: Iid([9; 16]), suffix: None, manifest: "a".repeat(43),
         basis: TransactionKey { tx_id: TxId(0), system_time: Timestamp(10) },
         until: Timestamp(200), schemas: WorldSchemas::new(Default::default()).unwrap(), dropped: false,
     };
@@ -1104,7 +1104,7 @@ async fn owned_world_conditions_distinguish_local_absence_from_a_tombstone_revis
     context.owned_witness_scope = Some(scope);
     let state = PartitionState::empty(Default::default()).unwrap();
     let world = OwnedWorld {
-        id: Iid([8; 16]), capture: Iid([9; 16]), manifest: "a".repeat(43),
+        id: Iid([8; 16]), capture: Iid([9; 16]), suffix: None, manifest: "a".repeat(43),
         basis: TransactionKey { tx_id: TxId(0), system_time: Timestamp(10) }, until: Timestamp(200), dropped: false,
         schemas: WorldSchemas::new(std::collections::BTreeMap::from([(
             "orders".into(), rtdb_types::OwnedSchema::from_json(br#"{"fields":[]}"#).unwrap(),

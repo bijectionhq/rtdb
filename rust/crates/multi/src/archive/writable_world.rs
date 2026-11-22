@@ -12,7 +12,7 @@ use uuid::Uuid;
 use super::{
     CellStorage, CheckpointPoint, CheckpointReadResources, CheckpointReadWorld, KeyService,
     capture_receipt, read_checkpoint_owned_point, read_world::{CaptureSelection, with_registered_capture_context},
-    require_capture_open, same_lifetime,
+    replica_suffix, require_capture_open, same_lifetime,
 };
 use crate::admin::update_installation;
 
@@ -51,11 +51,14 @@ fn admit_capture(
     if !same_lifetime(record, &point)
         || manifest != parent.manifest_sha256
         || point.checkpoint.root_sha256.is_none()
-        || point.checkpoint.system_time != parent.basis.system_time.0
     {
         return Err(OwnedWorld::unavailable());
     }
-    Ok(())
+    match parent.suffix {
+        Some(suffix) if replica_suffix::accepted(record, &point, &manifest, suffix)?.basis == parent.basis => Ok(()),
+        None if point.checkpoint.system_time == parent.basis.system_time.0 => Ok(()),
+        _ => Err(OwnedWorld::unavailable()),
+    }
 }
 
 fn world_record(
@@ -66,6 +69,7 @@ fn world_record(
     OwnedWorld {
         id: Iid(*id.as_bytes()),
         capture: Iid(*retained.capture.as_bytes()),
+        suffix: retained.suffix.map(|id| Iid(*id.as_bytes())),
         manifest: retained.manifest_sha256.clone(),
         basis: retained.basis,
         until: retained.until,
@@ -87,6 +91,24 @@ pub async fn fork_checkpoint_world(
     until: Timestamp,
     resources: CheckpointReadResources<'_>,
 ) -> Result<Uuid> {
+    fork_checkpoint_world_at(
+        directory, archive, keys, hosted_task, session, deployment_id, capture, None,
+        until, resources,
+    ).await
+}
+
+pub(crate) async fn fork_checkpoint_world_at(
+    directory: &dyn Directory,
+    archive: &CellStorage,
+    keys: &dyn KeyService,
+    hosted_task: Option<&HostedTask>,
+    session: &mut NativeSession,
+    deployment_id: Uuid,
+    capture: Uuid,
+    suffix: Option<Uuid>,
+    until: Timestamp,
+    resources: CheckpointReadResources<'_>,
+) -> Result<Uuid> {
     let owner = session
         .state()
         .user()
@@ -105,10 +127,16 @@ pub async fn fork_checkpoint_world(
     if !same_lifetime(&source, &point) || until <= now() || until.0 <= point.checkpoint.system_time {
         return Err(OwnedWorld::unavailable());
     }
+    let expected_basis = suffix.map(|suffix|
+        replica_suffix::accepted(&source, &point, &manifest, suffix).map(|pin| pin.basis)
+    ).transpose()?;
+    if expected_basis.is_some_and(|basis| until <= basis.system_time) {
+        return Err(OwnedWorld::unavailable());
+    }
     let live = session.open_owned_read().await?;
     let ((schemas, _schema_charge), basis) = with_registered_capture_context(
         directory, archive, keys, hosted_task,
-        CaptureSelection { deployment: deployment_id, capture, manifest: &manifest, expected_basis: None },
+        CaptureSelection { deployment: deployment_id, capture, manifest: &manifest, suffix, expected_basis },
         resources,
         |context, basis| {
             let owner = &owner;
@@ -120,7 +148,7 @@ pub async fn fork_checkpoint_world(
         return Err(OwnedWorld::unavailable());
     }
     drop(live);
-    let parent = CheckpointReadWorld { deployment: deployment_id, capture, manifest_sha256: manifest, basis };
+    let parent = CheckpointReadWorld { deployment: deployment_id, capture, manifest_sha256: manifest, suffix, basis };
 
     let id = Uuid::new_v4();
     let retained = CheckpointWorldRetention {
@@ -128,6 +156,7 @@ pub async fn fork_checkpoint_world(
         capture: parent.capture,
         manifest_sha256: parent.manifest_sha256.clone(),
         schema_digest: schemas.digest(),
+        suffix: parent.suffix,
         basis: parent.basis,
         until,
     };
@@ -171,6 +200,7 @@ pub async fn fork_checkpoint_world(
 
 fn matches_retention(world: &OwnedWorld, retained: &CheckpointWorldRetention) -> bool {
     world.capture.0 == *retained.capture.as_bytes()
+        && world.suffix.map(|suffix| Uuid::from_bytes(suffix.0)) == retained.suffix
         && world.manifest == retained.manifest_sha256
         && world.basis == retained.basis
         && world.until == retained.until
@@ -207,6 +237,7 @@ async fn open_world(
         deployment,
         capture: retained.capture,
         manifest_sha256: retained.manifest_sha256.clone(),
+        suffix: retained.suffix,
         basis: retained.basis,
     };
     admit_capture(&installation, archive, &parent)?;
@@ -419,6 +450,7 @@ impl OpenWorld {
             deployment,
             capture: self.retained.capture,
             manifest_sha256: self.retained.manifest_sha256.clone(),
+            suffix: self.retained.suffix,
             basis: self.retained.basis,
         }
     }

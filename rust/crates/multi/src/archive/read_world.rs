@@ -23,7 +23,7 @@ use uuid::Uuid;
 
 use super::{
     ArchivedObject, CellStorage, Cipher, KeyService, PrefixedStore, archive_witness,
-    capture_receipt, inconsistent, key, read, read_object, require_capture_open, stage,
+    capture_receipt, inconsistent, key, read, read_object, replica_suffix, require_capture_open, stage,
     unavailable, verified_archive,
 };
 
@@ -34,6 +34,8 @@ pub struct CheckpointReadWorld {
     pub deployment: Uuid,
     pub capture: Uuid,
     pub manifest_sha256: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub suffix: Option<Uuid>,
     pub basis: TransactionKey,
 }
 
@@ -101,7 +103,7 @@ where
 {
     with_registered_capture_context(
         directory, archive, keys, hosted_task,
-        CaptureSelection { deployment: world.deployment, capture: world.capture, manifest: &world.manifest_sha256, expected_basis: Some(world.basis) },
+        CaptureSelection { deployment: world.deployment, capture: world.capture, manifest: &world.manifest_sha256, suffix: world.suffix, expected_basis: Some(world.basis) },
         resources, |context, _| run(context),
     ).await
 }
@@ -110,6 +112,7 @@ pub(super) struct CaptureSelection<'a> {
     pub deployment: Uuid,
     pub capture: Uuid,
     pub manifest: &'a str,
+    pub suffix: Option<Uuid>,
     pub expected_basis: Option<TransactionKey>,
 }
 
@@ -140,8 +143,14 @@ where
         let (capture, manifest) =
             capture_receipt(record, archive, selected.deployment, selected.capture)?
                 .ok_or_else(|| unavailable("The read world has no retained checkpoint receipt"))?;
+        let suffix = selected.suffix.map(|suffix|
+            replica_suffix::accepted(record, &capture, selected.manifest, suffix)
+        ).transpose()?.cloned();
         if manifest != selected.manifest
-            || selected.expected_basis.is_some_and(|basis| capture.checkpoint.system_time != basis.system_time.0)
+            || selected.expected_basis.is_some_and(|basis| match &suffix {
+                Some(pin) => pin.basis != basis,
+                None => capture.checkpoint.system_time != basis.system_time.0,
+            })
             || capture.checkpoint.boundary < 0
             || capture.checkpoint.root_sha256.is_none()
         {
@@ -149,7 +158,7 @@ where
                 "The read world does not name an exact published cut",
             ));
         }
-        Ok(capture)
+        Ok((capture, suffix))
     };
     stage::with_region(
         directory,
@@ -162,7 +171,7 @@ where
         |record| admit(record).map(|_| ()),
         |record, _, region| async {
             resources.cancellation.run_until_cancelled(async {
-                let capture = admit(&record)?;
+                let (capture, suffix) = admit(&record)?;
                 let bucket = archive.bucket(region).await?;
                 if read(
                     bucket.as_ref(),
@@ -180,7 +189,7 @@ where
                     verified_archive(bucket.clone(), &capture, selected.manifest, keys).await?;
                 let store: Arc<dyn ObjectStore> = Arc::new(CapturedObjects {
                     files: PrefixedStore::new(
-                        bucket,
+                        Arc::clone(&bucket),
                         format!(
                             "checkpoint-captures/{}/{}/objects",
                             selected.deployment, selected.capture
@@ -212,7 +221,7 @@ where
                     root_sha256: capture.checkpoint.root_sha256,
                 };
                 let source_floor = SourcePosition::from_epoch_offset(epoch, capture.checkpoint.source)?;
-                let recovered = blocks
+                let mut recovered = blocks
                     .recover(
                         resources.node.trie,
                         source_floor,
@@ -220,11 +229,24 @@ where
                         BlockDiscovery::AtPublished(checkpoint),
                     )
                     .await?;
+                if recovered.partition.snapshot().tx_basis().is_none_or(|basis|
+                    basis.system_time.0 != capture.checkpoint.system_time
+                ) {
+                    return Err(inconsistent("The retained checkpoint has a different transaction key"));
+                }
+                match (selected.suffix, suffix) {
+                    (Some(suffix), Some(pin)) => {
+                        replica_suffix::apply_archived(
+                            bucket.as_ref(), selected.deployment, suffix, record.stream("replica"), &pin, &material,
+                            &mut recovered, &memory,
+                        ).await?;
+                    }
+                    (None, None) => (),
+                    _ => return Err(inconsistent("The selected archived suffix is unavailable")),
+                }
                 let snapshot = recovered.partition.snapshot();
                 let basis = snapshot.tx_basis().ok_or_else(|| inconsistent("The retained checkpoint has no transaction basis"))?;
-                if basis.system_time.0 != capture.checkpoint.system_time
-                    || selected.expected_basis.is_some_and(|expected| basis != expected)
-                {
+                if selected.expected_basis.is_some_and(|expected| basis != expected) {
                     return Err(inconsistent("The retained checkpoint has a different transaction key"));
                 }
                 let name = record.name;

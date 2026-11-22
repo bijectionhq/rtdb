@@ -555,6 +555,8 @@ pub struct CheckpointWorldRetention {
     pub manifest_sha256: String,
     #[serde(default)]
     pub schema_digest: [u8; 32],
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub suffix: Option<uuid::Uuid>,
     pub basis: rtdb_types::TransactionKey,
     pub until: rtdb_types::Timestamp,
 }

@@ -111,6 +111,7 @@ pub(crate) const HELD_WORLD_POINT_V1: &str = "rtdb.owned.ReadHeldWorldPoint.v1";
 pub(crate) const CLOSE_WORLD_READ_V1: &str = "rtdb.owned.CloseWorldRead.v1";
 pub(crate) const DROP_WORLD_V1: &str = "rtdb.owned.DropWorld.v1";
 pub(crate) const FORK_WORLD_V1: &str = "rtdb.owned.ForkWorld.v1";
+pub(crate) const FORK_WORLD_V2: &str = "rtdb.owned.ForkWorld.v2";
 pub(crate) const COMMIT_WORLD_V1: &str = "rtdb.owned.CommitWorld.v1";
 pub(crate) const COMMIT_WORLD_V2: &str = "rtdb.owned.CommitWorld.v2";
 const MAX_WORLD_WITNESSES: usize = 128;
@@ -1209,10 +1210,17 @@ impl Service {
         ).await.map_err(status)
     }
 
-    pub(crate) async fn fork_world_action(&self, call: &Call, body: &[u8]) -> Result<ActionResult, Status> {
+    pub(crate) async fn fork_world_action(&self, call: &Call, body: &[u8], with_suffix: bool) -> Result<ActionResult, Status> {
         if !self.0.config.owned_native_actions { return Err(unsupported()); }
         let host = self.0.config.owned_world_host.as_ref().ok_or_else(unsupported)?;
         let (capture, rest) = body.split_first_chunk::<16>().ok_or_else(|| invalid("Owned world fork has no capture UUID"))?;
+        let (suffix, rest) = if with_suffix {
+            let (suffix, rest) = rest.split_first_chunk::<16>()
+                .ok_or_else(|| invalid("Owned world fork has no suffix UUID"))?;
+            (Some(Uuid::from_bytes(*suffix)), rest)
+        } else {
+            (None, rest)
+        };
         let until: [u8; 8] = rest.try_into().map_err(|_| invalid("Owned world fork requires one expiry instant"))?;
         let (_, attachment) = call.session.resolve_database(Some(&call.database), &self.0.node)?;
         let attachment = attachment.ok_or_else(unsupported)?;
@@ -1222,7 +1230,7 @@ impl Service {
         let reply_charge = call.reserve(64)?;
         let world = host.fork_world(
             crate::WorldCall { node: &self.0.node, attachment: &attachment, session: &mut session, cancellation: &call.cancellation },
-            Uuid::from_bytes(*capture), Timestamp(i64::from_be_bytes(until)),
+            Uuid::from_bytes(*capture), suffix, Timestamp(i64::from_be_bytes(until)),
         ).await.map_err(status)?;
         Ok(ActionResult { body: wire::retain(Bytes::copy_from_slice(world.as_bytes()), reply_charge) })
     }

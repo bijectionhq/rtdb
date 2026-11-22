@@ -403,6 +403,10 @@ Success has zero Flight results.
 `rtdb.owned.ForkWorld.v1` takes a registered 16-byte capture UUID followed by a signed big-endian 64-bit expiration time in Unix microseconds.
 The host resolves the live deployment's capture receipt and reopens its verified archive root to obtain the parent transaction key.
 Success returns one Flight result containing the new world UUID as 16 bytes.
+`rtdb.owned.ForkWorld.v2` takes a registered 16-byte capture UUID, the 16-byte lease UUID of a published replica suffix for that capture, and the same 64-bit expiration.
+The host authenticates the archived suffix and applies its inline resolved transactions in a private recovered partition at the exact accepted transaction key.
+The world retains that suffix with its parent capture and reopens the same replay cut for held and one-shot reads.
+The reply and subsequent world read and write actions use the same wire shapes.
 
 `rtdb.owned.CommitWorld.v1` takes a 16-byte world UUID, then the Commit.v2 relation grouping without a deadline.
 The group count is a big-endian u16 from 1 to 32.

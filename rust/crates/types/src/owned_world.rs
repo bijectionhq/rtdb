@@ -63,6 +63,7 @@ impl WorldSchemas {
 pub struct OwnedWorld {
     pub id: Iid,
     pub capture: Iid,
+    pub suffix: Option<Iid>,
     pub manifest: String,
     pub basis: TransactionKey,
     pub until: Timestamp,
@@ -72,7 +73,7 @@ pub struct OwnedWorld {
 
 impl OwnedWorld {
     pub fn record(&self) -> StructFields<Value> {
-        StructFields::from([
+        let mut row = StructFields::from([
             ("_id".into(), Value::Uuid(self.id.0)),
             ("capture".into(), Value::Uuid(self.capture.0)),
             ("manifest".into(), Value::Utf8(self.manifest.clone())),
@@ -84,7 +85,11 @@ impl OwnedWorld {
                 "schemas".into(),
                 Value::Binary(self.schemas.encoded.clone()),
             ),
-        ])
+        ]);
+        if let Some(suffix) = self.suffix {
+            row.insert("suffix".into(), Value::Uuid(suffix.0));
+        }
+        row
     }
 
     pub fn from_record(row: &StructFields<Value>) -> Result<Self> {
@@ -113,7 +118,12 @@ impl OwnedWorld {
             Some(Value::Bool(dropped)) => *dropped,
             _ => return Err(Self::unavailable()),
         };
-        if row.len() != 7 + usize::from(row.contains_key("dropped"))
+        let suffix = match row.get("suffix") {
+            None | Some(Value::Null | Value::Undefined) => None,
+            Some(Value::Uuid(id)) if *id != [0; 16] => Some(Iid(*id)),
+            _ => return Err(Self::unavailable()),
+        };
+        if row.len() != 7 + usize::from(row.contains_key("dropped")) + usize::from(row.contains_key("suffix"))
             || *id == [0; 16]
             || *capture == [0; 16]
             || *until <= *time
@@ -127,6 +137,7 @@ impl OwnedWorld {
         Ok(Self {
             id: Iid(*id),
             capture: Iid(*capture),
+            suffix,
             manifest: manifest.clone(),
             basis: TransactionKey {
                 tx_id: TxId(*tx_id),
@@ -141,6 +152,7 @@ impl OwnedWorld {
     pub fn same_fork(&self, other: &Self) -> bool {
         self.id == other.id
             && self.capture == other.capture
+            && self.suffix == other.suffix
             && self.manifest == other.manifest
             && self.basis == other.basis
             && self.until == other.until

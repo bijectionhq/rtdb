@@ -32,6 +32,31 @@ struct PreparedReplay {
 }
 
 impl RecoveredPartition {
+    /// Applies an authenticated inline resolved transaction to this private
+    /// recovered partition without running live database or storage effects.
+    pub fn apply_archived_transaction(
+        &mut self, message: &proto::ResolvedTx, memory: &Arc<MemoryBudget>,
+    ) -> Result<()> {
+        let source = message.src_msg_id.map(SourcePosition).ok_or_else(|| invalid("Archived transaction has no source position"))?;
+        if message.db_op.is_some() || message.external_source_token.is_some() || source <= self.progress.source_position {
+            return Err(invalid("Archived transaction has unsupported effects or source order"));
+        }
+        let value = self.partition.value();
+        let latest = value.live().latest_completed_tx();
+        let rtdb_tx::ReplayedTransaction { writes, result, .. } =
+            rtdb_tx::decode_replica(message, latest, value.live().block_index(), memory)?;
+        if latest.is_some_and(|previous| result.tx_key().tx_id <= previous.tx_id
+            || result.tx_key().system_time <= previous.system_time)
+        {
+            return Err(invalid("Archived transaction regressed its basis"));
+        }
+        self.partition.apply(&writes)?;
+        self.progress.source_position = source;
+        self.progress.tx_key = Some(result.tx_key());
+        self.progress.latest_result = None;
+        Ok(())
+    }
+
     pub(crate) fn take_replay_tail(&mut self, logs: &Arc<PartitionLogs>, after: ReplicaPosition) -> Result<Option<Box<dyn LogTail>>> {
         let Some(prepared) = self.replay_tail.take() else { return Ok(None); };
         if !Arc::ptr_eq(&prepared.logs, logs) || prepared.after != after {
