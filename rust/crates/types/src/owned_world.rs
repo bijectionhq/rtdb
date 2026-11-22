@@ -54,6 +54,10 @@ impl WorldSchemas {
         Sha256::digest(&self.encoded).into()
     }
 
+    pub fn into_catalog_json(self) -> Vec<u8> {
+        self.encoded
+    }
+
     pub fn relation(&self, relation: &OwnedRelation) -> Option<&OwnedSchema> {
         self.fields.get(relation.name())
     }

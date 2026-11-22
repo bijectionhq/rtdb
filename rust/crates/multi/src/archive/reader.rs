@@ -13,7 +13,7 @@ use bytes::Bytes;
 use prost_types::Any;
 use rtdb_columnar::MemoryBudget;
 use rtdb_directory::{CheckpointStage, DeploymentRecord, Directory, HostedTask, Lifecycle};
-use rtdb_format::database::proto::database_config;
+use rtdb_format::{catalog::CheckpointContents, database::proto::database_config};
 use rtdb_node::{Database, LogAccess, LogFactory, OpenedLogs, ReadFence, RemoteStorageFactory};
 use rtdb_replication::BlockDiscovery;
 use rtdb_server::{PlacedOptions, ServerDriver, config::NodeConfiguration};
@@ -40,6 +40,9 @@ use crate::{
     reference::{PrefixedStore, key},
     store::{CELL_STORAGE_TYPE, EncryptingStore, ROOT_MARKER},
 };
+
+mod owned_inventory;
+pub(crate) use owned_inventory::{StageOwnedRelations, inspect_staged_owned_relations};
 
 pub struct StagedReaderSettings {
     pub destination: Uuid,
@@ -156,6 +159,23 @@ async fn serve_stage(
     stop: CancellationToken,
     transport: Transport,
 ) -> Result<()> {
+    with_stage(directory, storage, keys, selector, hosted_task, |authority, record, verified| async move {
+        Box::pin(serve_reader(&authority, &record, storage, verified.store, transport, stop)).await
+    }).await
+}
+
+async fn with_stage<T, F, Fut>(
+    directory: Arc<dyn Directory>,
+    storage: &CellStorage,
+    keys: &dyn KeyService,
+    selector: StageSelector,
+    hosted_task: Option<HostedTask>,
+    read: F,
+) -> Result<T>
+where
+    F: FnOnce(StageReadAuthority, DeploymentRecord, VerifiedStage) -> Fut,
+    Fut: std::future::Future<Output = Result<T>>,
+{
     let id = selector.destination.to_string();
     let record = directory
         .deployment(&id)
@@ -186,6 +206,7 @@ async fn serve_stage(
         stage: stage.clone(),
         id: id.clone(),
     };
+    let reader = authority.clone();
     with_region(
         directory.as_ref(),
         keys,
@@ -195,13 +216,9 @@ async fn serve_stage(
         None,
         None,
         |current| authority.require_held(current).map(|_| None),
-        |_, _, region| {
-            let authority = &authority;
-            let record = &record;
-            async move {
-                let store = open_inventory(storage, keys, record, &authority.stage, region).await?;
-                Box::pin(serve_reader(authority, record, storage, store, transport, stop)).await
-            }
+        |record, _, region| async move {
+            let store = open_inventory(storage, keys, &record, &reader.stage, region).await?;
+            read(reader, record, store).await
         },
     )
     .await
@@ -258,13 +275,18 @@ impl ReadFence for StageReadAuthority {
     }
 }
 
+struct VerifiedStage {
+    store: Arc<dyn ObjectStore>,
+    contents: CheckpointContents,
+}
+
 async fn open_inventory(
     storage: &CellStorage,
     keys: &dyn KeyService,
     record: &DeploymentRecord,
     stage: &CheckpointStage,
     region: Arc<IoRegion>,
-) -> Result<Arc<dyn ObjectStore>> {
+) -> Result<VerifiedStage> {
     let root = format!("{}/{}", record.storage_prefix(), checkpoint_storage_root()?);
     let files = PrefixedStore::new(storage.bucket(region).await?, root);
     if files.get(&key(ROOT_MARKER)?).await?.as_ref() != record.id.as_bytes() {
@@ -338,7 +360,7 @@ async fn open_inventory(
             "The staged object inventory differs from the checkpoint closure",
         ));
     }
-    Ok(plaintext)
+    Ok(VerifiedStage { store: plaintext, contents })
 }
 
 struct StageObjects {

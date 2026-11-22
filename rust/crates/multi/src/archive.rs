@@ -84,7 +84,7 @@ pub(crate) use writable_world::WorldPoint;
 pub use read_world::{CheckpointPoint, CheckpointReadResources, CheckpointReadWorld, read_checkpoint_owned_point};
 pub(crate) use retirement::{finish_capture_retirement, obsolete_fork_input, require_capture_open, retire_capture, retire_obsolete_fork_input};
 pub use reader::{StagedReaderSettings, serve_staged_checkpoint};
-pub(crate) use reader::{StageSelector, tunnel_staged_checkpoint};
+pub(crate) use reader::{StageOwnedRelations, StageSelector, inspect_staged_owned_relations, tunnel_staged_checkpoint};
 
 const MAXIMUM_BYTES: u64 = 1 << 30;
 const MAXIMUM_MANIFEST_BYTES: u64 = 16 << 20;

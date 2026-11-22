@@ -361,6 +361,10 @@ impl TableRef {
             && self.supported_owned_name()
     }
 
+    pub fn is_owned_relation_catalog(&self) -> bool {
+        self.owned_storage_name() == Some(OWNED_RELATION_CATALOG)
+    }
+
     /// Identifies derived Root writes with the same owner and source relation.
     pub fn owned_root_constraint_relation(&self) -> Option<&str> {
         let name = self.owned_storage_name()?;

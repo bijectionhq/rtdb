@@ -467,16 +467,23 @@ pub async fn read_owned_root_publication(context: Arc<QueryContext>, owner: &str
 pub async fn read_owned_parent_schemas(
     context: Arc<QueryContext>, owner: &str,
 ) -> Result<(rtdb_types::WorldSchemas, Arc<rtdb_columnar::MemoryReservation>)> {
+    if owner.is_empty() { return Err(rtdb_types::OwnedWorld::unavailable()); }
+    read_owned_schema_catalog(context, OwnedRelation::relation_catalog(owner)).await
+}
+
+pub async fn read_owned_schema_catalog(
+    context: Arc<QueryContext>, catalog: TableRef,
+) -> Result<(rtdb_types::WorldSchemas, Arc<rtdb_columnar::MemoryReservation>)> {
     use std::collections::BTreeMap;
     use rtdb_types::{OwnedSchema, OwnedWorld, WorldSchemas};
 
-    if owner.is_empty() { return Err(OwnedWorld::unavailable()); }
+    if !catalog.is_owned_relation_catalog() { return Err(OwnedWorld::unavailable()); }
     let memory = Arc::clone(&context.memory);
     let mut charge = memory.reserve(4096)?;
     let mut bytes = 0usize;
     let mut fields = BTreeMap::new();
     if let Some(mut rows) = open_private_catalog(
-        context, OwnedRelation::relation_catalog(owner), &["_id", "schema"], None,
+        context, catalog, &["_id", "schema"], None,
     ).await? {
         while let Some(batch) = rows.next_batch().await? {
             let batch = batch.batch();

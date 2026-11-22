@@ -217,6 +217,12 @@ the acknowledgement and serves one read-only PgWire session on that same
 connection. It closes the session on loss of the directory fence or when
 the recovery action's lifetime expires.
 
+The private `inspect_checkpoint_stage_owned_relations` action takes the same source, capture, and stage selectors as `open_checkpoint_stage`.
+It requires a complete replay stage and returns the original transaction key, the captured owner namespace digest, the sorted physical relation names, and the canonical native schema declarations.
+A stage without owned relations returns an empty inventory.
+Multiple namespaces, unsupported native tables, and an owned namespace missing its declaration catalog refuse inspection.
+The action returns metadata only and leaves the PgWire catalog unchanged.
+
 The hosted `discard_checkpoint_stage` action binds the original capture
 digest and stage operation. It reserves a disposal tombstone if a stage has
 yet to appear, so a late stage cannot reopen it. It returns the retained

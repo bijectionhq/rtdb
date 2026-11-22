@@ -28,6 +28,7 @@ use crate::{
 };
 
 const FRAME_BYTES: u64 = 2048;
+const MAX_REPLY_BYTES: usize = 4 << 20;
 const SOCKET_DEADLINE: Duration = Duration::from_secs(15);
 
 #[derive(Deserialize)]
@@ -70,6 +71,11 @@ enum Action {
         stage_operation: Uuid,
     },
     OpenCheckpointStage {
+        destination: Uuid,
+        stage_operation: Uuid,
+        staged_manifest_sha256: String,
+    },
+    InspectCheckpointStageOwnedRelations {
         destination: Uuid,
         stage_operation: Uuid,
         staged_manifest_sha256: String,
@@ -133,6 +139,13 @@ enum Reply {
         destination: Uuid,
         stage_operation: Uuid,
         disposal: DisposalReceipt,
+    },
+    StageOwnedRelations {
+        name: String,
+        authority: Uuid,
+        capture: Uuid,
+        #[serde(flatten)]
+        inventory: archive::StageOwnedRelations,
     },
     Refused,
     Deferred,
@@ -447,6 +460,38 @@ impl RecoveryService {
                     staged_manifest_sha256,
                 })
             }
+            Action::InspectCheckpointStageOwnedRelations {
+                destination,
+                stage_operation,
+                staged_manifest_sha256,
+            } => {
+                if installation.checkpoint_stage.is_some()
+                    || destination.is_nil()
+                    || stage_operation.is_nil()
+                    || !valid_manifest(&staged_manifest_sha256)
+                {
+                    return Ok(Reply::Refused);
+                }
+                let selector = archive::StageSelector {
+                    destination,
+                    operation: stage_operation,
+                    manifest_sha256: staged_manifest_sha256,
+                    source: Some((request.authority, request.capture, self.org.clone())),
+                };
+                let inventory = archive::inspect_staged_owned_relations(
+                    directory,
+                    &self.storage,
+                    self.keys.as_ref(),
+                    selector,
+                    self.hosted_task.clone(),
+                ).await?;
+                Ok(Reply::StageOwnedRelations {
+                    name: installation.name,
+                    authority: request.authority,
+                    capture: request.capture,
+                    inventory,
+                })
+            },
             Action::OpenCheckpointStage { .. } => Ok(Reply::Refused),
         }
     }
@@ -624,6 +669,9 @@ async fn read_request(
 
 async fn write_reply(socket: &mut (impl AsyncWrite + Unpin), reply: &Reply) -> std::io::Result<()> {
     let mut bytes = serde_json::to_vec(reply).expect("the recovery reply serializes");
+    if bytes.len() >= MAX_REPLY_BYTES {
+        return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "Recovery reply exceeds its bound"));
+    }
     bytes.push(b'\n');
     socket.write_all(&bytes).await?;
     socket.shutdown().await
