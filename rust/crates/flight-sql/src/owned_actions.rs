@@ -621,8 +621,10 @@ impl Service {
         let mut rows_left = MAX_GROUPED_COMMIT_ROWS;
         let mut writes = vec![TxOp::OwnedDeadline { until: deadline }];
         writes.extend(condition);
-        let _facts = self.decode_owned_commit_groups(call, facts, &mut writes, &mut rows_left, false)?;
         let (controls, _held) = self.decode_hosted_control_groups(call, controls, scope, &mut rows_left, false)?;
+        let replay = rtdb_tx::hosted_replay_controls(controls.iter()).map_err(status)?.is_some();
+        if replay && counted { return Err(invalid("Native replay admits an original effect batch")); }
+        let _facts = self.decode_owned_commit_groups(call, facts, &mut writes, &mut rows_left, replay)?;
         writes.extend(controls.into_iter().map(TxOp::HostedControl));
         self.owned_write_reply_with_witnesses(call, writes, witnesses).await
     }
@@ -2378,12 +2380,21 @@ impl Service {
         }
         if let Some(batch) = result {
             let revision = rtdb_query::owned_row_revision(batch.batch(), 0, id, self.memory()).map_err(status)?;
-            let until = lifetime.map(|lifetime| revision.0.checked_add(lifetime.duration)
-                .map(Timestamp).filter(|until| revision > lifetime.expired_created_through
-                    && revision <= present && present < *until)
-                .ok_or_else(|| Status::failed_precondition("The retained point is outside its creation lifetime"))
-            ).transpose()?;
-            let reply = self.owned_point_reply_until(batch.batch().schema_ref(), Some(batch.batch()), present, valid, Some(revision), until)?;
+            let until = lifetime.map(|lifetime| {
+                let (created, expires) = rtdb_query::owned_row_lifetime(batch.batch(), 0, revision, lifetime.duration).map_err(status)?;
+                if created <= lifetime.expired_created_through || revision > present || present >= expires {
+                    return Err(Status::failed_precondition("The retained point is outside its creation lifetime"));
+                }
+                Ok(expires)
+            }).transpose()?;
+            let projected = if until.is_some() {
+                let fields = batch.batch().schema_ref().fields().iter().enumerate()
+                    .filter(|(_, field)| !matches!(field.name().as_str(), "_valid_from" | "_valid_to"))
+                    .map(|(index, _)| index).collect::<Vec<_>>();
+                Some(batch.batch().project(&fields).map_err(arrow)?)
+            } else { None };
+            let rows = projected.as_ref().unwrap_or_else(|| batch.batch());
+            let reply = self.owned_point_reply_until(rows.schema_ref(), Some(rows), present, valid, Some(revision), until)?;
             if until.is_some_and(|until| until <= self.0.node.now()) {
                 return Err(Status::failed_precondition("The held point reached its creation lifetime"));
             }

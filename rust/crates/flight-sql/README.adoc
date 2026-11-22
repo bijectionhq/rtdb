@@ -716,6 +716,11 @@ The resolver checks both the ordinary control observations and the final owned c
 
 This action supports checked replacement and exact absence insertion for hosted controls.
 Other control effects, including arbitrary SQL, computed values, deletes, relabeling and temporal splits, are outside this action.
+
+An installed held restore may combine its exact writer, archive, hold, unsealed state, and predecessor checks with an absent-checked original transaction receipt.
+The native effects and the restore frontier replace in the same commit as that receipt.
+Copied native Root assertions retain their source valid intervals, including the original creation and expiry of a lifetime row.
+The destination system order still gives every applied transaction a fresh position above the archived cut.
 Generic SQL keeps the existing private relation boundary.
 
 === Final-state prefix count

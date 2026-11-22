@@ -4,9 +4,10 @@ use super::*;
 
 impl OpenTransaction<'_> {
     pub(super) async fn check_hosted_controls(
-        &self,
+        &mut self,
         operations: &[Operation],
         source_scope: Option<rtdb_types::PlacedAttemptScope>,
+        replay: Option<crate::hosted_control::HostedReplay>,
     ) -> Result<()> {
         let controls = operations.iter().filter_map(|operation| match operation {
             Operation::Public(TxOp::HostedControl(control)) => Some(control),
@@ -41,7 +42,7 @@ impl OpenTransaction<'_> {
                         | TxOp::OwnedDelete { .. }
                         | TxOp::HostedControl(_)
                 ) | Operation::OwnedWriteIids { .. }
-            )
+            ) || (replay.is_some() && matches!(operation, Operation::Public(TxOp::OwnedErase { .. })))
         };
         if !operations
             .iter()
@@ -50,6 +51,14 @@ impl OpenTransaction<'_> {
             return Err(unavailable());
         }
         let validating_world = !self.owned_worlds.is_empty();
+        if let Some(replay) = &replay {
+            replay.check_order(self.tx_key().system_time)?;
+            if validating_world || operations.iter().any(|operation| !matches!(operation,
+                Operation::Public(TxOp::OwnedDeadline { .. } | TxOp::OwnedCheck { .. } | TxOp::OwnedInsertDocs { .. }
+                    | TxOp::OwnedReplaceDocs { .. } | TxOp::OwnedDelete { .. } | TxOp::OwnedErase { .. }
+                    | TxOp::HostedControl(_))
+            )) { return Err(unavailable()); }
+        }
         let publishing_world = operations.iter().any(|op| matches!(op, Operation::Public(TxOp::OwnedPublishWorld { .. })));
         let retained_release = crate::hosted_control::retained_release_world(operations).is_some();
         let proposal_overlay = crate::hosted_control::hosted_proposal_overlay(operations).is_some();
@@ -79,7 +88,7 @@ impl OpenTransaction<'_> {
                 return Err(unavailable());
             }
             has_fact_write |= match operation {
-                Operation::Public(TxOp::OwnedDelete { .. }) => true,
+                Operation::Public(TxOp::OwnedDelete { .. } | TxOp::OwnedErase { .. }) => true,
                 Operation::Public(
                     TxOp::OwnedInsertDocs { documents, .. }
                     | TxOp::OwnedReplaceDocs { documents, .. },
@@ -147,6 +156,9 @@ impl OpenTransaction<'_> {
                 false,
             )
             .await?;
+            if let Some(replay) = &replay {
+                replay.check_base(control, point.row.as_ref().map(|(row, _)| row.batch()))?;
+            }
             let revision = point.row.map(|(_, revision)| revision);
             if revision != control.expected() {
                 return Err(Anomaly::new(
@@ -156,6 +168,7 @@ impl OpenTransaction<'_> {
                 ));
             }
         }
+        self.hosted_replay = replay;
         Ok(())
     }
 }

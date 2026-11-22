@@ -109,9 +109,13 @@ pub(super) async fn read_checkpoint_point_in_context(
         floor.check(duration, context.current_time.as_micros()?)?;
     }
     let memory = Arc::clone(&context.memory);
-    let Some(mut cursor) = open_owned_point(
-        context, point.owner, point.relation, point.id, point.valid, None,
-    ).await? else { return Ok(None); };
+    let cursor = if lifetime.is_some() {
+        let valid = point.valid.ok_or_else(|| inconsistent("The archived lifetime requires an exact valid instant"))?;
+        rtdb_query::open_owned_lifetime_point(context, point.owner, point.relation, point.id, valid).await?
+    } else {
+        open_owned_point(context, point.owner, point.relation, point.id, point.valid, None).await?
+    };
+    let Some(mut cursor) = cursor else { return Ok(None); };
     let mut batches = Vec::new();
     while let Some(batch) = cursor.next_batch().await? {
         for row in 0..batch.batch().num_rows() {

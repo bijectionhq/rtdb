@@ -178,12 +178,12 @@ impl HeldCheckpointWorld {
         }
         let fact = self.archive_point(relation, id, valid_at, lifetime).await?;
         let until = fact.as_ref().zip(policy).map(|(fact, policy)| {
-            if fact.revision <= policy.expired_created_through {
+            let validity = fact.lifetime.filter(|valid| fact.revision <= basis && valid.contains(basis))
+                .ok_or_else(OwnedWorld::unavailable)?;
+            if validity.lower() <= policy.expired_created_through {
                 return Err(expired_lifetime());
             }
-            let expiry = fact.revision.0.checked_add(policy.duration).map(Timestamp)
-                .filter(|expiry| fact.revision <= basis && basis < *expiry)
-                .ok_or_else(OwnedWorld::unavailable)?;
+            let expiry = validity.upper();
             if expiry <= self.present().system_time {
                 return Err(expired_lifetime());
             }
@@ -649,7 +649,7 @@ pub(crate) async fn open_held_checkpoint_world(
                                         let batches = read_checkpoint_point_in_context(Arc::clone(&context).with_owned_read_guard(guard), CheckpointPoint {
                                             owner: &owner, relation: &relation, id: &id, valid: Some(valid),
                                         }, lifetime).await?;
-                                        decode_point(batches.unwrap_or_default(), &id, memory)
+                                        decode_point(batches.unwrap_or_default(), &id, memory, lifetime)
                                     };
                                     let response = tokio::select! {
                                         _ = scope.cancelled() => break,

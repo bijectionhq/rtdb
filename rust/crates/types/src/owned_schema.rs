@@ -295,6 +295,29 @@ impl OwnedSchema {
         Ok(())
     }
 
+    /// Validate an interval already accepted by the original held installation.
+    /// The destination ordering time does not extend the original lifetime.
+    pub fn require_replayed_period(
+        &self, valid: crate::Interval, source: crate::Timestamp, operation: crate::EventOp,
+    ) -> Result<()> {
+        use crate::{EventOp, Timestamp};
+        let from = valid.lower();
+        let to = valid.upper();
+        let accepted = !valid.is_empty() && match (self.0.validity, self.0.lifetime_micros, operation) {
+            (_, _, EventOp::Erase) => false,
+            (Validity::Explicit, _, _) => true,
+            (Validity::BoundedPeriod, _, _) => from > Timestamp::MIN && to < Timestamp::MAX,
+            (Validity::Acceptance, None, _) => from > Timestamp::MIN && from <= source && to == Timestamp::MAX,
+            (Validity::Acceptance, Some(duration), EventOp::Put) => from.0 > 0 && from <= source
+                && from.0.checked_add(duration) == Some(to.0),
+            (Validity::Acceptance, Some(_), EventOp::Delete) => false,
+        };
+        if !accepted {
+            return Err(Anomaly::incorrect("rtdb.owned/restore-validity", "The copied fact interval disagrees with its original declaration"));
+        }
+        Ok(())
+    }
+
     fn field(&self, name: &str) -> Option<&Field> {
         self.0.fields.iter().find(|field| field.name == name)
     }
@@ -337,6 +360,18 @@ fn nonconforming(field: &str) -> Anomaly {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn replay_keeps_the_first_creation_and_its_original_expiry() -> Result<()> {
+        use crate::{EventOp, Interval, Timestamp};
+        let schema = OwnedSchema::from_json(br#"{"fields":[],"validity":"acceptance","lifetime_micros":10}"#)?;
+        let original = Interval::from_micros(20, 30)?;
+        assert!(schema.require_replayed_period(original, Timestamp(40), EventOp::Put).is_ok());
+        assert!(schema.require_replayed_period(Interval::from_micros(40, 50)?, Timestamp(20), EventOp::Put).is_err());
+        assert!(schema.require_replayed_period(Interval::from_micros(20, 50)?, Timestamp(40), EventOp::Put).is_err());
+        assert!(schema.require_replayed_period(original, Timestamp(40), EventOp::Delete).is_err());
+        Ok(())
+    }
 
     #[test]
     fn declarations_are_closed_over_names_and_types() {

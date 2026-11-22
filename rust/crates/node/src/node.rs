@@ -1235,7 +1235,10 @@ impl OwnedReadSession {
         let guard = self.relation_release_guard_for([relation], true)?;
         let context = Arc::clone(&self.context).with_owned_read_guard(guard);
         context.check_cancelled()?;
-        rtdb_query::open_owned_point(context, &self.owner, relation, id, valid, None).await
+        match (lifetime, valid) {
+            (Some(_), Some(valid)) => rtdb_query::open_owned_lifetime_point(context, &self.owner, relation, id, valid).await,
+            _ => rtdb_query::open_owned_point(context, &self.owner, relation, id, valid, None).await,
+        }
     }
 
     /// The declaration is immutable and present on the same held cut as
@@ -1547,15 +1550,15 @@ impl OwnedReadSession {
                 let _identity = context.memory.reserve(size.saturating_add(4096))?;
                 let id = read_value(field, ids, row)?.entity_id()?;
                 let mut point = rtdb_query::open_owned_point(
-                    Arc::clone(&context), &self.owner, relation, &id, Some(valid), Some(&["_id", "_system_from"]),
+                    Arc::clone(&context), &self.owner, relation, &id, Some(valid), Some(&["_id", "_system_from", "_valid_from", "_valid_to"]),
                 ).await?.ok_or_else(lifetime_read_unavailable)?;
                 let mut until = None;
                 while let Some(part) = point.next_batch().await? {
                     for index in 0..part.batch().num_rows() {
                         if until.is_some() { return Err(lifetime_read_unavailable()); }
-                        let created = rtdb_query::owned_row_revision(part.batch(), index, &id, &context.memory)?;
-                        let cutoff = Timestamp(created.0.checked_add(duration).ok_or_else(lifetime_read_unavailable)?);
-                        if created > present || cutoff <= present { return Err(lifetime_read_unavailable()); }
+                        let revision = rtdb_query::owned_row_revision(part.batch(), index, &id, &context.memory)?;
+                        let (_, cutoff) = rtdb_query::owned_row_lifetime(part.batch(), index, revision, duration)?;
+                        if revision > present || cutoff <= present { return Err(lifetime_read_unavailable()); }
                         until = Some(cutoff);
                     }
                 }

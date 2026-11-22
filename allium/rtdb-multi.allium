@@ -2682,6 +2682,20 @@ rule StreamHeldCheckpointOwnedEventFiles {
         DrainReadersBeforeReleasingStageStorage(target)
 }
 
+rule ReplayHeldNativeRootEffects {
+    when: HeldDestinationOrdersNativeArchiveTransaction(target, archive, original, predecessor)
+
+    requires: CurrentPlacedRestoreWriter(target)
+              and ActiveRestoreHoldForArchive(target, archive)
+              and ExactNativeReplayPredecessor(target, predecessor)
+              and AbsentOriginalReplayReceipt(target, original)
+
+    ensures:
+        PreserveOriginalValidIntervalsAndCreationExpiry(original)
+        CoOrderRootEffectsAndOriginalReplayReceipt(target, original)
+        AdvanceNativeReplayFrontier(target, original)
+}
+
 rule RetireCheckpointArchives {
     when: RecoveryRetirementAuthorized(record)
 

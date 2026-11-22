@@ -23,6 +23,14 @@ pub async fn open_owned_point(
     open_owned_table_point(context, relation.table(owner), id.iid(), Some(id), valid, columns, false).await
 }
 
+/// Project the original validity endpoints along with a live lifetime point.
+pub async fn open_owned_lifetime_point(
+    context: Arc<QueryContext>, owner: &str, relation: &OwnedRelation, id: &EntityId, valid: Interval,
+) -> Result<Option<QueryCursor>> {
+    if owner.is_empty() || !relation.is_root_data() || valid.is_empty() { return Err(address_unavailable()); }
+    open_owned_table_point_with_edges(context, relation.table(owner), id.iid(), Some(id), Some(valid), None, false, true).await
+}
+
 /// Revalidates an immutable artefact's nominated row with its complete key.
 /// The caller supplies the locator from a covered artefact, and still has to
 /// compare the returned row's full identity and source revision before use.
@@ -312,6 +320,13 @@ pub(crate) async fn open_owned_table_point(
     context: Arc<QueryContext>, table: TableRef, locator: Iid, id: Option<&EntityId>,
     valid: Option<Interval>, columns: Option<&[&str]>, history: bool,
 ) -> Result<Option<QueryCursor>> {
+    open_owned_table_point_with_edges(context, table, locator, id, valid, columns, history, history).await
+}
+
+async fn open_owned_table_point_with_edges(
+    context: Arc<QueryContext>, table: TableRef, locator: Iid, id: Option<&EntityId>,
+    valid: Option<Interval>, columns: Option<&[&str]>, history: bool, edges: bool,
+) -> Result<Option<QueryCursor>> {
     let name = QualifiedTable {
         database: context.catalog.default_database().to_owned(),
         table,
@@ -322,7 +337,7 @@ pub(crate) async fn open_owned_table_point(
     for required in ["_id", "_system_from"] {
         if !fields.contains(&required) { fields.push(required); }
     }
-    if history {
+    if edges {
         for required in ["_valid_from", "_valid_to"] {
             if !fields.contains(&required) { fields.push(required); }
         }
@@ -350,6 +365,27 @@ pub(crate) async fn open_owned_table_point(
     };
     let query = PreparedQuery::new_in(plan, &context.memory)?;
     query.execute(context, Vec::new()).await.map(Some)
+}
+
+/// A replayed row keeps its original creation and expiration in its stored
+/// validity interval while its physical system revision advances.
+pub fn owned_row_lifetime(
+    batch: &arrow_array::RecordBatch, row: usize, revision: Timestamp, duration: i64,
+) -> Result<(Timestamp, Timestamp)> {
+    let invalid = || Anomaly::fault("rtdb.owned/creation-lifetime", "The owned row lacks its exact creation lifetime");
+    use arrow_array::Array as _;
+    if row >= batch.num_rows() { return Err(invalid()); }
+    let edge = |name: &str| -> Result<Timestamp> {
+        let array = batch.column_by_name(name).and_then(|array| array.as_any().downcast_ref::<arrow_array::TimestampMicrosecondArray>())
+            .filter(|array| array.is_valid(row)).ok_or_else(invalid)?;
+        Ok(Timestamp(array.value(row)))
+    };
+    let created = edge("_valid_from")?;
+    let expires = edge("_valid_to")?;
+    if created.0 <= 0 || created > revision || duration <= 0 || created.0.checked_add(duration) != Some(expires.0) {
+        return Err(invalid());
+    }
+    Ok((created, expires))
 }
 
 fn address_unavailable() -> Anomaly {
