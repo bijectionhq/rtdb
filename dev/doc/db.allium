@@ -370,6 +370,7 @@ variant TxMessage : SourceMessage {
     -- Client-submitted transaction operations.
     -- Coalesced SQL argument batches align compatible Arrow columns by position and preserve argument row order in source IPC.
     -- Embedded ADBC SQL arguments use canonical source fields and preserve their declared types and row order.
+    -- SQL source replay binds Arrow argument rows by position and reads a scalar parameter when evaluation reaches it.
     -- A static INSERT from compatible positional scalar batches projects Arrow arguments into source document vectors in upload order.
     -- A static INSERT with per-row valid-time expressions reads the operands of those expressions and gathers compatible payload columns in Arrow.
     -- Rows are grouped by their evaluated bounds in first-seen order and retain their order within each group.

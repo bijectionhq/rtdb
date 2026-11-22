@@ -21,6 +21,18 @@ pub fn validate_readable_column(field: &Field, array: &dyn Array, logical: &Logi
     Ok(())
 }
 
+/// Checks the selected cell without reading payloads whose physical layouts already establish validity.
+pub fn validate_readable_cell(field: &Field, array: &dyn Array, logical: &LogicalType, row: usize, memory: &Arc<MemoryBudget>) -> Result<()> {
+    if row >= array.len() || array.data_type() != field.data_type() { return Err(layout()); }
+    if ambiguous_union(field, logical)? {
+        let _cell = memory.reserve(estimate_read_value_bytes(field, array, row)?)?;
+        read_value_as(logical, field, array, row)?;
+    } else if needs_check(field, false) {
+        check_cell(field, array, row, false)?;
+    }
+    Ok(())
+}
+
 fn ambiguous_union(field: &Field, logical: &LogicalType) -> Result<bool> {
     if let DataType::Union(children, UnionMode::Dense) = field.data_type() {
         for (_, child) in children.iter() {

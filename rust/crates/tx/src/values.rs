@@ -562,6 +562,18 @@ pub struct ArgumentRow<'a> {
     _reservation: Option<Arc<MemoryReservation>>,
 }
 
+#[derive(Clone, Copy)]
+pub(crate) enum BoundArgumentRow<'a> {
+    Values { values: &'a [Value], types: Option<&'a [LogicalType]> },
+    Arrow { batch: &'a OwnedBatch, row: usize, types: &'a [LogicalType] },
+}
+
+impl BoundArgumentRow<'_> {
+    pub(crate) fn width(self) -> usize {
+        match self { Self::Values { values, .. } => values.len(), Self::Arrow { batch, .. } => batch.batch().num_columns() }
+    }
+}
+
 impl<'a> ArgumentRow<'a> {
     pub(crate) fn borrowed(values: &'a [Value]) -> Self {
         Self { values: Cow::Borrowed(values), _reservation: None }
@@ -643,6 +655,23 @@ impl SqlArguments {
         self.chunks.iter().flat_map(move |(start, chunk)| {
             (0..chunk.len()).map(move |index| chunk.row(index, &self.memory).map(|row| (start + index, row)))
         })
+    }
+
+    pub(crate) fn indexed_bound_rows(&self) -> impl Iterator<Item = Result<(usize, BoundArgumentRow<'_>)>> {
+        let types = self.types();
+        self.chunks.iter().flat_map(move |(start, chunk)| (0..chunk.len()).map(move |row| {
+            let bound = match chunk.as_ref() {
+                ArgumentChunk::Rows { rows, .. } => BoundArgumentRow::Values { values: &rows[row], types: Some(types) },
+                ArgumentChunk::Arrow { batch, types: physical_types, .. } => {
+                    let page = batch.batch();
+                    for ((field, column), ty) in page.schema_ref().fields().iter().zip(page.columns()).zip(physical_types.iter()) {
+                        rtdb_columnar::validate_readable_cell(field, column.as_ref(), ty, row, &self.memory)?;
+                    }
+                    BoundArgumentRow::Arrow { batch, row, types }
+                }
+            };
+            Ok((start + row, bound))
+        }))
     }
 
     pub(crate) fn uniform_arrow_pages(&self) -> Option<Vec<&RecordBatch>> {

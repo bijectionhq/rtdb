@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use rtdb_columnar::{MemoryReservation, OwnedBatch};
+use rtdb_columnar::{MemoryReservation, OwnedBatch, Selection};
 use rtdb_plan::{CatalogLookups, ColumnId, Field, RecordingCatalog, Schema, SqlNotice};
 use rtdb_query::{PreparedQuery, QueryContext, QueryCursor, RuntimeSchema};
 use rtdb_sql::{DeferredStatementSyntax, ParsedStatement, PrepareOptions, StatementKind, StatementSyntaxBatch};
@@ -174,6 +174,30 @@ impl PreparedSql {
     /// Opens Arrow batches directly for a client that consumes Arrow.
     pub async fn open_query_columns_typed(&self, context: Arc<QueryContext>, arguments: Vec<Value>, types: &[LogicalType]) -> Result<QueryCursor> {
         self.open_query_batches(context, arguments, types, true).await
+    }
+
+    pub async fn try_open_query_arrow(&self, context: Arc<QueryContext>, arguments: &OwnedBatch, types: &[LogicalType]) -> Result<Option<QueryCursor>> {
+        if arguments.batch().num_rows() == 0 || !self.0.options.parameter_types.is_empty() { return Ok(None); }
+        if arguments.batch().num_columns() != self.parameter_count() {
+            return Err(parameter_error("Argument count differs from the prepared statement"));
+        }
+        if let Some(cursor) = self.try_open_parameter_projection(Arc::clone(&context), arguments, types).await? {
+            return Ok(Some(cursor));
+        }
+        let arguments = if arguments.batch().num_rows() == 1 {
+            arguments.clone()
+        } else {
+            match arguments.select(&Selection::Indices(vec![0])) {
+                Ok(row) => row,
+                Err(error) if error.code == "rtdb/memory-budget-exceeded" => return Ok(None),
+                Err(error) => return Err(error),
+            }
+        };
+        let query = deep(self.source(), || self.bind(&context, types, true))?;
+        if self.0.policy == ResultSignaturePolicy::Exact { self.check_signature(query.schema())?; }
+        let cursor = query.execute_arrow_columns(context, arguments, 0, types, Some(self.source())).await?;
+        if self.0.policy == ResultSignaturePolicy::PostgreSql { self.check_signature(cursor.runtime_schema())?; }
+        Ok(Some(cursor))
     }
 
     /// Uses the first Arrow parameter row directly when the query only projects parameters.

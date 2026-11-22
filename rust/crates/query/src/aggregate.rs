@@ -129,7 +129,7 @@ impl AggregateCursor {
                 if let PercentileFraction::Integer(value) = *fraction { *fraction = PercentileFraction::Literal(value as f64); }
                 if let PercentileFraction::Parameter { index } = *fraction {
                     let _scratch = execution.context.memory.reserve(4096)?;
-                    let value = execution.parameters.values().get(index).unwrap_or(&Value::Null);
+                    let value = execution.parameters.get(index)?.unwrap_or(&Value::Null);
                     let resolved = number(value).ok_or_else(|| rtdb_types::Anomaly::incorrect("xtdb/expected-number", "Percentile fraction parameter must be a number").with_context("param", serde_json::json!(format!("?_{}", index))))?;
                     *fraction = PercentileFraction::Literal(resolved);
                 }

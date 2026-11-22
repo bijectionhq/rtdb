@@ -24,6 +24,70 @@ fn put(context: &ResolveContext, value: i64, from: i64, to: i64) -> TxOp { TxOp:
 fn sql(text: &str) -> TxOp { TxOp::Sql { sql: text.into(), args: None } }
 
 #[tokio::test]
+async fn sql_source_replay_keeps_unreached_parameter_cells_in_arrow() {
+    use arrow_array::{Int64Array, RecordBatch, StringArray};
+    use arrow_schema::{DataType, Field, Schema};
+    use rtdb_columnar::OwnedBatch;
+    use rtdb_format::envelope::SourceMessage;
+
+    let context = context();
+    let state = PartitionState::empty(Default::default()).unwrap();
+    let mut resolver = TxResolver::new(None, SourcePosition(-1), None, &context.memory).unwrap();
+    let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false), Field::new("payload", DataType::Utf8, false)]));
+    let text = "x".repeat(1 << 21);
+    let batch = RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(vec![1, 2])), Arc::new(StringArray::from(vec![text.as_str(), text.as_str()]))]).unwrap();
+    let arguments = SqlArguments::from_arrow(OwnedBatch::new(batch, &context.memory).unwrap(), &context.memory).unwrap();
+    let source = request(vec![TxOp::Sql {
+        sql: "INSERT INTO docs (_id, v) SELECT $1, CASE WHEN $1 < 0 THEN CAST(CHAR_LENGTH($2) AS BIGINT) ELSE $1 END".into(),
+        args: Some(arguments),
+    }], &context);
+    let encoded = source.encode().unwrap();
+    let message = SourceMessage::decode(encoded.as_slice()).unwrap().unwrap();
+    let decoded = SourceTransaction::decode(&message, &context.memory).unwrap();
+    drop((source, encoded, message));
+    let headroom = 1 << 20;
+    let _pressure = context.memory.reserve(context.memory.limit_bytes() - context.memory.used_bytes() - headroom).unwrap();
+
+    let resolved = resolver.resolve_source(state.value().snapshot(), SourcePosition(0), Timestamp(100), decoded, &context).await.unwrap();
+    assert!(resolved.result().committed(), "{:?}", resolved.result().error());
+    let writes = resolved.writes().tables();
+    let docs = writes.get(&table()).unwrap().batch().unwrap().view();
+    let values = (0..docs.len()).map(|row| {
+        let event = docs.read_event(row).unwrap();
+        let StoredOperation::Put(document) = event.operation else { panic!("Expected a put"); };
+        document["v"].clone()
+    }).collect::<Vec<_>>();
+    assert_eq!(values, [Value::I64(1), Value::I64(2)]);
+}
+
+#[tokio::test]
+async fn sql_source_replay_validates_an_unreached_uri_before_evaluation() {
+    use arrow_array::{Int64Array, RecordBatch, StringArray};
+    use arrow_schema::{DataType, Field, Schema};
+    use rtdb_columnar::{OwnedBatch, to_field};
+    use rtdb_types::{LogicalType, ScalarType};
+
+    let context = context();
+    let state = PartitionState::empty(Default::default()).unwrap();
+    let mut resolver = TxResolver::new(None, SourcePosition(-1), None, &context.memory).unwrap();
+    let fields = vec![Field::new("id", DataType::Int64, false), to_field("payload", &LogicalType::Scalar(ScalarType::Uri)).unwrap()];
+    let batch = RecordBatch::try_new(Arc::new(Schema::new(fields)), vec![Arc::new(Int64Array::from(vec![1])), Arc::new(StringArray::from(vec!["http://["]))]).unwrap();
+    let arguments = SqlArguments::from_arrow(OwnedBatch::new(batch, &context.memory).unwrap(), &context.memory).unwrap();
+    let source = request(vec![TxOp::Sql {
+        sql: "INSERT INTO docs (_id, v) SELECT $1, CASE WHEN $1 < 0 THEN $2 IS NOT NULL ELSE TRUE END".into(),
+        args: Some(arguments),
+    }], &context);
+    let encoded = source.encode().unwrap();
+    let message = rtdb_format::envelope::SourceMessage::decode(encoded.as_slice()).unwrap().unwrap();
+    let decoded = SourceTransaction::decode(&message, &context.memory).unwrap();
+
+    let result = resolver.resolve_source(state.value().snapshot(), SourcePosition(0), Timestamp(100), decoded, &context).await.unwrap();
+    let error = result.result().error().unwrap();
+    assert_eq!(error.code, "xtdb/invalid-uri");
+    assert!(error.context.get("arg-idx").is_none());
+}
+
+#[tokio::test]
 async fn old_resolvers_abort_a_fenced_source_record_before_a_replay_can_commit() {
     use rtdb_format::envelope::{SourceBody, SourceMessage};
 

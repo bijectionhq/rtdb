@@ -7,6 +7,18 @@ use rtdb_types::{LogicalType as L, Result, ScalarType};
 use crate::{CatalogSnapshot, invalid};
 
 pub(crate) fn parameter_types(relation: &Relation, values: &[rtdb_types::Value], mode: EmissionMode) -> Vec<L> {
+    declared_parameter_types(relation, values.len(), mode).into_iter().zip(values).map(|(declared, value)| {
+        declared.filter(|ty| !matches!(value, rtdb_types::Value::Null) || ty.nullable()).unwrap_or_else(|| value.logical_type())
+    }).collect()
+}
+
+pub(crate) fn arrow_parameter_types(relation: &Relation, fields: &[L], mode: EmissionMode) -> Vec<L> {
+    declared_parameter_types(relation, fields.len(), mode).into_iter().zip(fields).map(|(declared, field)| {
+        declared.unwrap_or_else(|| mode.field_type(field))
+    }).collect()
+}
+
+fn declared_parameter_types(relation: &Relation, width: usize, mode: EmissionMode) -> Vec<Option<L>> {
     fn collect(relation: &Relation, declarations: &mut [Option<L>], local: &mut Vec<usize>, mode: EmissionMode) {
         for expression in relation.expressions() {
             expression.visit(&mut |expression| {
@@ -29,9 +41,9 @@ pub(crate) fn parameter_types(relation: &Relation, values: &[rtdb_types::Value],
             for child in relation.children() { collect(child, declarations, local, mode); }
         }
     }
-    let mut declarations = vec![None; values.len()];
+    let mut declarations = vec![None; width];
     collect(relation, &mut declarations, &mut Vec::new(), mode);
-    declarations.into_iter().zip(values).map(|(declared, value)| declared.filter(|ty| !matches!(value, rtdb_types::Value::Null) || ty.nullable()).unwrap_or_else(|| value.logical_type())).collect()
+    declarations
 }
 
 /// Result fields emitted from the plan and a catalog snapshot, with their memory reservation.

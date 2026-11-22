@@ -583,11 +583,15 @@ async fn build_pages_at(runtime: Arc<EmittedRelation>, execution: Execution, con
 fn ordered_window(offset: Option<&Expr>, fetch: &Expr, execution: &Execution) -> Option<(u64, u64)> {
     let bound = |expr: &Expr| {
         let value = match expr {
-            Expr::Literal(value) => value,
-            Expr::Parameter { index, .. } => execution.parameters.values().get(*index)?,
-            _ => return None,
+            Expr::Literal(value) => integer(value),
+            Expr::Parameter { index, .. } => {
+                let parameters = execution.parameters.evaluator();
+                parameters.known(*index).and_then(integer)
+                    .or_else(|| parameters.arrow_cell(*index)?.signed_integer().map(i128::from))
+            }
+            _ => None,
         };
-        integer(value).and_then(checked_row_count)
+        value.and_then(checked_row_count)
     };
     Some((match offset { Some(expr) => bound(expr)?, None => 0 }, bound(fetch)?))
 }

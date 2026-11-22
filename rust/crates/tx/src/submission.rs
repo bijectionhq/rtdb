@@ -99,7 +99,7 @@ fn expand(sql: &str, args: Option<&SqlArguments>, options: &SubmitOptions, datab
         let _evaluation = memory.reserve(bound)?;
         let mut parameters = parameters.to_vec();
         parameters.iter_mut().for_each(rtdb_columnar::admit_execution_value);
-        let context = EvalContext { parameters: &parameters, parameter_types: None, current_time: Timestamp(0).into(), timezone: &options.default_tz, outer_rows: &[], snapshot_token: None, allocation: Some(&row_scope), catalog: None };
+        let context = EvalContext { parameters: rtdb_expr::Parameters::Values(&parameters), parameter_types: None, current_time: Timestamp(0).into(), timezone: &options.default_tz, outer_rows: &[], snapshot_token: None, allocation: Some(&row_scope), catalog: None };
         let temporal = match valid_time {
             TemporalFilter::Default => (None, None),
             TemporalFilter::All => (Some(Timestamp::MIN), Some(Timestamp::MAX)),
@@ -196,7 +196,7 @@ fn projected_timed_puts(
                 rtdb_columnar::admit_execution_value(&mut value);
                 parameters[*index] = value;
             }
-            let context = EvalContext { parameters: &parameters, parameter_types: None, current_time: Timestamp(0).into(),
+            let context = EvalContext { parameters: rtdb_expr::Parameters::Values(&parameters), parameter_types: None, current_time: Timestamp(0).into(),
                 timezone, outer_rows: &[], snapshot_token: None, allocation: Some(&row_scope), catalog: None };
             let evaluate_bounds = || -> Result<_> {
                 let mut endpoints = [Value::Null, Value::Null];

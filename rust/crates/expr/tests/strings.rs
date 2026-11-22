@@ -19,7 +19,7 @@ fn batch_execution_compiles_opened_fields_and_admits_unsigned_cells_and_paramete
     let compiled = CompiledExpr::compile(&expression, &schema).unwrap();
     let input = arrow_array::RecordBatch::try_new(Arc::new(arrow_schema::Schema::new(vec![physical])), vec![Arc::new(arrow_array::UInt64Array::from(vec![u64::MAX]))]).unwrap();
     let memory = MemoryBudget::new(1 << 20);
-    let output = evaluate_batch(&compiled, &input, &EvalContext { parameters: &[V::U64(u64::MAX)], ..Default::default() }, &memory).unwrap();
+    let output = evaluate_batch(&compiled, &input, &EvalContext { parameters: rtdb_expr::Parameters::Values(&[V::U64(u64::MAX)]), ..Default::default() }, &memory).unwrap();
     assert_eq!(output.batch().schema().field(0).data_type(), &arrow_schema::DataType::Int64);
     assert_eq!(rtdb_columnar::read_value(output.batch().schema().field(0), output.batch().column(0).as_ref(), 0).unwrap(), V::I64(-2));
     assert_eq!(rtdb_columnar::read_value(input.schema().field(0), input.column(0).as_ref(), 0).unwrap(), V::U64(u64::MAX));

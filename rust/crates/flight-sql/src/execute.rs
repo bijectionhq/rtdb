@@ -126,10 +126,10 @@ impl Service {
                 let prepared = PreparedSql::prepare(&sql, &context, options, ResultSignaturePolicy::Dynamic).map_err(status)?;
                 if prepared.is_dml() { return Err(invalid("ticket query cannot execute an update")); }
                 let types = arguments.as_ref().map(SqlArguments::types).unwrap_or_default();
-                let projection = if let Some(batch) = parameter_batch.as_ref() {
-                    prepared.try_open_parameter_projection(Arc::clone(&context), batch, types).await.map_err(status)?
+                let arrow_query = if let Some(batch) = parameter_batch.as_ref() {
+                    prepared.try_open_query_arrow(Arc::clone(&context), batch, types).await.map_err(status)?
                 } else { None };
-                match projection {
+                match arrow_query {
                     Some(cursor) => cursor,
                     None => {
                         let row = arguments.as_ref().map(|arguments| {

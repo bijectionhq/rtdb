@@ -17,7 +17,7 @@ pub use decimal::{DecimalParameters, INTERNAL_DECIMAL_PRECISION_KEY, INTERNAL_DE
 pub use execution::{admit_execution_value, execution_field_type, execution_type, read_execution_value, read_execution_value_as};
 pub use read_allocation::{estimate_copy_cell_bytes, estimate_event_copy_cell_bytes, estimate_event_null_cell_bytes, estimate_null_copy_cell_bytes,
     estimate_read_cell_bytes, estimate_read_value_bytes};
-pub use read_check::validate_readable_column;
+pub use read_check::{validate_readable_cell, validate_readable_column};
 pub use iid::{IidView, build_iids};
 pub use interleave::{copy_event_cells, copy_nullable_cells, copy_selected_cells, interleave};
 pub use hash::{hash_cell, hash_value, hash_value_murmur3, murmur3_32, xxhash32};

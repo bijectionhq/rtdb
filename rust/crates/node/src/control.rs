@@ -196,7 +196,7 @@ impl NativeSession {
                 allocation.reserve(rtdb_expr::text_allocation_bound(&value)?)?;
                 allocation.reserve(name.len().checked_mul(4).ok_or_else(|| invalid("SET name allocation overflow"))?)?;
                 let value = if matches!(value, Value::Null | Value::Undefined) { None } else {
-                    let eval = EvalContext { parameters: arguments, parameter_types: None, current_time: self.service.node.query_instant(), timezone: self.state.effective_timezone(), outer_rows: &[], snapshot_token: None, allocation: Some(&allocation), catalog };
+                    let eval = EvalContext { parameters: rtdb_expr::Parameters::Values(arguments), parameter_types: None, current_time: self.service.node.query_instant(), timezone: self.state.effective_timezone(), outer_rows: &[], snapshot_token: None, allocation: Some(&allocation), catalog };
                     let Value::Utf8(value) = rtdb_expr::scalar_call("str", &[value], &eval)? else { return Err(invalid("Session parameter could not be formatted")); };
                     Some(value)
                 };
@@ -229,7 +229,7 @@ impl NativeSession {
                 let context = self.query_context_with(cancellation, false).await?;
                 let bound = arguments.iter().try_fold(8192usize, |bytes, value| size(bytes, value.retained_bytes()?))?;
                 let _scratch = context.memory.reserve(size(bound, expressions.len().checked_mul(8192).ok_or_else(|| invalid("EXECUTE allocation size overflow"))?)?)?;
-                let eval = EvalContext { parameters: arguments, parameter_types: None, current_time: context.current_time, timezone: &context.timezone, outer_rows: &[], snapshot_token: context.snapshot_token(), allocation: Some(&allocation), catalog: Some(&context.catalog) };
+                let eval = EvalContext { parameters: rtdb_expr::Parameters::Values(arguments), parameter_types: None, current_time: context.current_time, timezone: &context.timezone, outer_rows: &[], snapshot_token: context.snapshot_token(), allocation: Some(&allocation), catalog: Some(&context.catalog) };
                 let mut arguments = Vec::with_capacity(expressions.len());
                 for expression in expressions { arguments.push(evaluate_async(expression, &Schema::default(), &[], &eval).await?); }
                 let actual = arguments.iter().try_fold(0usize, |bytes, value| size(bytes, value.retained_bytes()?))?;
@@ -264,7 +264,7 @@ impl NativeSession {
     }
 
     async fn control_value(&self, expression: &Expr, parameters: &[Value], allocation: &EvaluationScope, catalog: Option<&dyn rtdb_expr::PgCatalogLookup>) -> Result<Value> {
-        evaluate_async(expression, &Schema::default(), &[], &EvalContext { parameters, parameter_types: None, current_time: self.service.node.query_instant(), timezone: self.state.effective_timezone(), outer_rows: &[], snapshot_token: None, allocation: Some(allocation), catalog }).await
+        evaluate_async(expression, &Schema::default(), &[], &EvalContext { parameters: rtdb_expr::Parameters::Values(parameters), parameter_types: None, current_time: self.service.node.query_instant(), timezone: self.state.effective_timezone(), outer_rows: &[], snapshot_token: None, allocation: Some(allocation), catalog }).await
     }
 
     fn check_database_control(&self, action: &str, name: &str, options: ControlExecutionOptions) -> Result<()> {
@@ -345,7 +345,7 @@ impl NativeSession {
 /// `catalog` must be the captured basis when an expression resolves relation names.
 /// Evaluation stays on the caller's future; dropping it cancels SLEEP without installing partial settings.
 pub async fn transaction_settings(options: &TransactionOptions, parameters: &[Value], timezone: &str, session_timezone: &str, current_time: impl Into<rtdb_types::Instant>, memory: &Arc<MemoryBudget>, allocation: &EvaluationScope, catalog: Option<&dyn rtdb_expr::PgCatalogLookup>) -> Result<TransactionSettings> {
-    let initial = EvalContext { parameters, parameter_types: None, current_time: current_time.into(), timezone, outer_rows: &[], snapshot_token: None, allocation: Some(allocation), catalog };
+    let initial = EvalContext { parameters: rtdb_expr::Parameters::Values(parameters), parameter_types: None, current_time: current_time.into(), timezone, outer_rows: &[], snapshot_token: None, allocation: Some(allocation), catalog };
     let timezone_update = update(options.timezone.as_ref(), &initial, |value| string(value, "TIMEZONE")).await?;
     let timezone = match &timezone_update { OptionUpdate::Set(timezone) => rtdb_expr::normalize_timezone(timezone)?, OptionUpdate::Clear => session_timezone.to_owned(), OptionUpdate::Unchanged => timezone.to_owned() };
     let eval = EvalContext { timezone: &timezone, ..initial };

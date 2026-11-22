@@ -101,15 +101,23 @@ impl EntityId {
     }
 
     pub fn iid(&self) -> Iid {
-        let input = match self {
-            Self::Uuid(bytes) => return Iid(*bytes),
-            Self::String(value) => format!("s{value}"),
-            Self::Keyword(value) => format!("k{value}"),
-            Self::Integer(value) => format!("i{value}"),
-        };
-        let hash = Sha256::digest(input.as_bytes());
+        match self {
+            Self::Uuid(bytes) => Iid(*bytes),
+            Self::String(value) => Self::string_iid(value),
+            Self::Keyword(value) => Self::keyword_iid(value.as_str()),
+            Self::Integer(value) => Self::prefixed_iid(b'i', &value.to_string()),
+        }
+    }
+
+    pub fn string_iid(value: &str) -> Iid { Self::prefixed_iid(b's', value) }
+    pub fn keyword_iid(name: &str) -> Iid { Self::prefixed_iid(b'k', name) }
+
+    fn prefixed_iid(prefix: u8, value: &str) -> Iid {
+        let mut hash = Sha256::new();
+        hash.update([prefix]);
+        hash.update(value.as_bytes());
         let mut iid = [0; 16];
-        iid.copy_from_slice(&hash[..16]);
+        iid.copy_from_slice(&hash.finalize()[..16]);
         Iid(iid)
     }
 

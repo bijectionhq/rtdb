@@ -16,7 +16,7 @@ use rtdb_types::{Anomaly, AnomalyCategory, EventHeader, EventOp, Iid, Interval, 
 use tokio_util::sync::CancellationToken;
 
 use crate::replay_submission::{ReplaySubmission, duplicate_replay, is_replay_table, replay_table};
-use crate::values::plain_scalar_field;
+use crate::values::{BoundArgumentRow, plain_scalar_field};
 use crate::{ArrowDocuments, SourceTransaction, SubmitOptions, TransactionResult, TxOp, UserMetadata, source::{Operation, SourceGuard, decode_arguments, is_reserved_write_schema, table_name}};
 
 pub const IDEMPOTENCY_GUARD_RESULT: &str = "rtdb/idempotency-guard";
@@ -389,19 +389,22 @@ impl<'a> OpenTransaction<'a> {
     }
 
     pub async fn execute_sql(&mut self, sql: &str, arguments: Option<&[Value]>) -> Result<()> {
-        self.execute_sql_typed(sql, arguments, None, &mut None).await
+        self.execute_sql_typed(sql, arguments.map(|values| BoundArgumentRow::Values { values, types: None }), &mut None).await
     }
 
     /// `planned` carries one operation's mutation from each argument row to the next, which reuses it while the
     /// transaction's catalog answers the planning's lookups the same.
-    async fn execute_sql_typed(&mut self, sql: &str, arguments: Option<&[Value]>, types: Option<&[rtdb_types::LogicalType]>, planned: &mut Option<PlannedMutation>) -> Result<()> {
+    async fn execute_sql_typed(&mut self, sql: &str, arguments: Option<BoundArgumentRow<'_>>, planned: &mut Option<PlannedMutation>) -> Result<()> {
         self.context.check_cancelled()?;
         // A statement whose plan reads no table can't see the transaction's own writes, so it skips extending the snapshot with them.
         let snapshot = if planned.as_ref().is_some_and(|planned| !planned.reads) { self.buffer.base_snapshot() } else { self.snapshot()? };
         let context = self.context.query_context(snapshot, self.tx_key().system_time, &self.options.default_tz, self.trace_parent)?;
-        let parameter_types = match types {
-            Some(types) => types.iter().map(rtdb_columnar::execution_type).enumerate().collect(),
-            None => arguments.unwrap_or_default().iter().enumerate().map(|(index, value)| (index, rtdb_columnar::execution_type(&value.logical_type()))).collect(),
+        let parameter_types = match arguments {
+            Some(BoundArgumentRow::Values { types: Some(types), .. } | BoundArgumentRow::Arrow { types, .. }) =>
+                types.iter().map(rtdb_columnar::execution_type).enumerate().collect(),
+            Some(BoundArgumentRow::Values { values, .. }) =>
+                values.iter().enumerate().map(|(index, value)| (index, rtdb_columnar::execution_type(&value.logical_type()))).collect(),
+            None => Default::default(),
         };
         let options = rtdb_sql::PrepareOptions { parameter_types, default_timezone: context.timezone.clone(), generate_series_end_exclusive: context.options.generate_series_end_exclusive, ..Default::default() };
         let with_sql = |error: Anomaly| error.with_context("sql", sql.into());
@@ -473,7 +476,7 @@ impl<'a> OpenTransaction<'a> {
         Ok(query.next_batch().await?.is_some())
     }
 
-    async fn execute_mutation(&mut self, mutation: rtdb_sql::Mutation, context: Arc<QueryContext>, arguments: Option<&[Value]>, syntax: Option<Arc<MemoryReservation>>) -> Result<()> {
+    async fn execute_mutation(&mut self, mutation: rtdb_sql::Mutation, context: Arc<QueryContext>, arguments: Option<BoundArgumentRow<'_>>, syntax: Option<Arc<MemoryReservation>>) -> Result<()> {
         use rtdb_sql::Mutation;
         let (table, input, kind) = match mutation {
             Mutation::Put { table, input } => (Some(table), input, MutationKind::Put),
@@ -588,9 +591,9 @@ impl<'a> OpenTransaction<'a> {
             Operation::Public(TxOp::Sql { sql, args }) => match args {
                 Some(arguments) => {
                     let mut planned = None;
-                    for row in arguments.indexed_rows() {
+                    for row in arguments.indexed_bound_rows() {
                         let (index, row) = row?;
-                        self.execute_sql_typed(sql, Some(&row), Some(arguments.types()), &mut planned)
+                        self.execute_sql_typed(sql, Some(row), &mut planned)
                             .await.map_err(|error| error.with_context("arg-idx", index.into()))?;
                     }
                     Ok(())
@@ -601,9 +604,9 @@ impl<'a> OpenTransaction<'a> {
                 if arg_bytes.as_slice().is_empty() { return self.execute_sql(sql, None).await; }
                 let arguments = decode_arguments(arg_bytes.as_slice(), &self.context.memory)?;
                 let mut planned = None;
-                for row in arguments.indexed_rows() {
+                for row in arguments.indexed_bound_rows() {
                     let (index, row) = row?;
-                    self.execute_sql_typed(sql, Some(&row), Some(arguments.types()), &mut planned)
+                    self.execute_sql_typed(sql, Some(row), &mut planned)
                         .await.map_err(|error| error.with_context("arg-idx", index.into()))?;
                 }
                 Ok(())
@@ -885,14 +888,18 @@ fn reads_tables(mutation: &rtdb_sql::Mutation) -> bool {
     }
 }
 
-async fn execute(input: Arc<rtdb_plan::Relation>, context: Arc<QueryContext>, arguments: Option<&[Value]>, syntax: Option<Arc<MemoryReservation>>) -> Result<QueryCursor> {
+async fn execute(input: Arc<rtdb_plan::Relation>, context: Arc<QueryContext>, arguments: Option<BoundArgumentRow<'_>>, syntax: Option<Arc<MemoryReservation>>) -> Result<QueryCursor> {
     let count = input.parameter_count();
     if arguments.is_none() && count != 0 { return Err(Anomaly::incorrect("xtdb.indexer/missing-sql-args", "Arguments list was expected but not provided").with_context("param-count", count.into())); }
-    let arguments = arguments.unwrap_or_default();
-    if arguments.len() != count { return Err(Anomaly::incorrect("xtdb.indexer/incorrect-sql-arg-count", format!("Parameter error: {} provided, {count} expected", arguments.len())).with_context("param-count", count.into()).with_context("arg-count", arguments.len().into())); }
+    let width = arguments.map_or(0, BoundArgumentRow::width);
+    if width != count { return Err(Anomaly::incorrect("xtdb.indexer/incorrect-sql-arg-count", format!("Parameter error: {width} provided, {count} expected")).with_context("param-count", count.into()).with_context("arg-count", width.into())); }
     let query = PreparedQuery::new_in(input, &context.memory)?;
     drop(syntax);
-    query.execute_columns(context, arguments.to_vec()).await
+    match arguments {
+        Some(BoundArgumentRow::Arrow { batch, row, types }) => query.execute_arrow_columns(context, batch.clone(), row, types, None).await,
+        Some(BoundArgumentRow::Values { values, .. }) => query.execute_columns(context, values.to_vec()).await,
+        None => query.execute_columns(context, Vec::new()).await,
+    }
 }
 async fn require_empty_insert(mut cursor: QueryCursor) -> Result<()> {
     while let Some(batch) = cursor.next_batch().await? {

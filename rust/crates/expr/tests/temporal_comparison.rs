@@ -101,7 +101,7 @@ fn comparison_coerces_string_literals_but_not_parameters_or_distinct_operands() 
     assert_eq!(binary(B::NotEq, text.clone(), date.clone(), "UTC"), V::Bool(false));
     assert_eq!(binary(B::IsDistinctFrom, text.clone(), date.clone(), "UTC"), V::Bool(true));
     let expr = Expr::binary(B::Eq, Expr::Literal(date), Expr::Parameter { index: 0, data_type: text.logical_type() });
-    assert_eq!(evaluate(&expr, &Schema::default(), &[], &EvalContext { parameters: &[text], ..Default::default() }).unwrap(), V::Bool(false));
+    assert_eq!(evaluate(&expr, &Schema::default(), &[], &EvalContext { parameters: rtdb_expr::Parameters::Values(&[text]), ..Default::default() }).unwrap(), V::Bool(false));
 }
 
 #[test]

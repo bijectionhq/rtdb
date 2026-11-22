@@ -8,7 +8,8 @@ use rtdb_plan::{BinaryOp, Catalog, ExecutionError, ExecutionSample, ExecutionTim
 use rtdb_types::{ListKind, LogicalType, Result, ScalarType, Value};
 
 use crate::{QueryContext, context::{Execution, cancelled}, invalid};
-use crate::runtime_schema::{EmissionMode, EmittedRelation, RuntimeSchema, parameter_types};
+use crate::parameters::BoundParameters;
+use crate::runtime_schema::{EmissionMode, EmittedRelation, RuntimeSchema, arrow_parameter_types, parameter_types};
 
 /// A row and the lease charging it; a lease may be shared by the rows of one page, so the row records its own size.
 pub(crate) struct OwnedRow { pub values: Vec<Value>, reservation: Arc<MemoryReservation>, bytes: usize }
@@ -189,6 +190,11 @@ impl PreparedQuery {
         self.open(context, parameters, text, Batching::Columns).await
     }
 
+    /// Opens the query with one row of a bound Arrow batch.
+    pub async fn execute_arrow_columns(&self, context: Arc<QueryContext>, batch: OwnedBatch, row: usize, types: &[LogicalType], text: Option<&str>) -> Result<QueryCursor> {
+        measured_open(Arc::clone(&context), self.open_arrow(context, batch, row, types, text, Batching::Columns)).await
+    }
+
     pub fn is_parameter_projection(&self) -> bool {
         if !matches!(self.output, QueryOutput::Rows) || self.settings.as_ref() != &rtdb_plan::QuerySettings::default()
             || self.required_parameter_count == 0 { return false; }
@@ -270,7 +276,7 @@ impl PreparedQuery {
             Err(error) if error.code == "rtdb/undersized-reservation" => return Ok(None),
             Err(error) => return Err(error),
         };
-        let context = context.apply_settings(&self.settings, &[])?;
+        let context = context.apply_settings(&self.settings, rtdb_expr::Parameters::Values(&[]))?;
         let query_span = crate::trace::QueryTrace::start(&context, text);
         let context = Arc::clone(&context).with_tracer(context.tracer.clone(), query_span.as_ref().map(|span| span.context()));
         let trace = crate::trace::CursorTrace::new(&context, "output", "query.cursor.output", true);
@@ -285,6 +291,40 @@ impl PreparedQuery {
 
     async fn open_retained(&self, context: Arc<QueryContext>, mut parameters: Vec<Value>, text: Option<&str>, batching: Batching) -> Result<QueryCursor> {
         if parameters.len() < self.required_parameter_count { return Err(invalid("missing-parameter", "Query has fewer parameters than its prepared plan")); }
+        self.check_dependencies(&context)?;
+        let bound = parameters.iter().try_fold(crate::runtime_schema::allocation_bound(&self.relation)?, |bytes, value| {
+            bytes.checked_add(value.retained_bytes()?.checked_mul(16).ok_or_else(|| invalid("parameter-size", "Parameter type allocation overflow"))?).ok_or_else(|| invalid("parameter-size", "Parameter type allocation overflow"))
+        })?;
+        let temporary = context.memory.reserve(bound)?;
+        let schema = self.emit_result_schema(&context, &parameter_types(&self.relation, &parameters, EmissionMode::ArrowFields))?;
+        parameters.iter_mut().for_each(rtdb_columnar::admit_execution_value);
+        let context = context.apply_settings(&self.settings, rtdb_expr::Parameters::Values(&parameters))?;
+        self.open_bound(context, schema, text, batching, move |memory| {
+            let types = parameter_types(&self.relation, &parameters, EmissionMode::Execution);
+            let result = BoundParameters::new(parameters, types, memory);
+            drop(temporary);
+            result
+        }).await
+    }
+
+    async fn open_arrow(&self, context: Arc<QueryContext>, batch: OwnedBatch, row: usize, types: &[LogicalType], text: Option<&str>, batching: Batching) -> Result<QueryCursor> {
+        if types.len() < self.required_parameter_count { return Err(invalid("missing-parameter", "Query has fewer parameters than its prepared plan")); }
+        self.check_dependencies(&context)?;
+        let bound = types.iter().try_fold(crate::runtime_schema::allocation_bound(&self.relation)?, |bytes, ty| {
+            ty.retained_bytes()?.checked_mul(8).and_then(|size| bytes.checked_add(size))
+                .ok_or_else(|| invalid("parameter-size", "Parameter type allocation overflow"))
+        })?;
+        let temporary = context.memory.reserve(bound)?;
+        let schema = self.emit_result_schema(&context, &arrow_parameter_types(&self.relation, types, EmissionMode::ArrowFields))?;
+        let execution_types = arrow_parameter_types(&self.relation, types, EmissionMode::Execution);
+        let mut parameters = BoundParameters::from_arrow(batch, row, execution_types, &context.memory)?;
+        drop(temporary);
+        let context = context.apply_settings(&self.settings, parameters.evaluator())?;
+        parameters.use_execution_budget(&context.memory);
+        self.open_bound(context, schema, text, batching, |_| Ok(parameters)).await
+    }
+
+    fn check_dependencies(&self, context: &QueryContext) -> Result<()> {
         for dependency in self.relation.dependencies() {
             let Some(current) = context.catalog.table(&dependency.name)? else {
                 if dependency.oid.is_none() && dependency.columns.is_empty() { continue; }
@@ -294,13 +334,11 @@ impl PreparedQuery {
                 return Err(invalid("stale-plan", "Prepared table OID or column types changed; prepare against the execution snapshot"));
             }
         }
-        let bound = parameters.iter().try_fold(crate::runtime_schema::allocation_bound(&self.relation)?, |bytes, value| {
-            bytes.checked_add(value.retained_bytes()?.checked_mul(16).ok_or_else(|| invalid("parameter-size", "Parameter type allocation overflow"))?).ok_or_else(|| invalid("parameter-size", "Parameter type allocation overflow"))
-        })?;
-        let temporary = context.memory.reserve(bound)?;
-        let schema = self.emit_result_schema(&context, &parameter_types(&self.relation, &parameters, EmissionMode::ArrowFields))?;
-        parameters.iter_mut().for_each(rtdb_columnar::admit_execution_value);
-        let context = context.apply_settings(&self.settings, &parameters)?;
+        Ok(())
+    }
+
+    async fn open_bound(&self, context: Arc<QueryContext>, schema: Arc<RuntimeSchema>, text: Option<&str>, batching: Batching,
+        bind: impl FnOnce(&Arc<MemoryBudget>) -> Result<BoundParameters>) -> Result<QueryCursor> {
         let query_span = crate::trace::QueryTrace::start(&context, text);
         let context = Arc::clone(&context).with_tracer(context.tracer.clone(), query_span.as_ref().map(|span| span.context()));
         if let QueryOutput::Plan(plan) = &self.output {
@@ -310,9 +348,7 @@ impl PreparedQuery {
             cursor.plan_reservation = self._plan_reservation.clone();
             return Ok(cursor);
         }
-        let types = parameter_types(&self.relation, &parameters, EmissionMode::Execution);
-        let parameters = Arc::new(crate::parameters::BoundParameters::new(parameters, types, &context.memory)?);
-        drop(temporary);
+        let parameters = Arc::new(bind(&context.memory)?);
         let runtime_schema = EmittedRelation::derive(Arc::clone(&self.relation), &context.catalog, parameters.types(), &context.memory)?;
         let analysis = if matches!(&self.output, QueryOutput::Analyze(_)) { Some(crate::analysis::AnalysisNode::new(&self.relation, &context)?) } else { None };
         let execution = Execution { context: Arc::clone(&context), parameters, outer: crate::context::OuterRows::empty(&context.memory)?, bindings: None, analysis: analysis.clone() };
