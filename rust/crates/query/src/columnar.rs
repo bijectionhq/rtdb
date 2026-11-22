@@ -465,6 +465,17 @@ impl ColumnBatch {
         Self::take_rows_with_custody(&[self], rows, &positions, true, memory)
     }
 
+    pub(crate) fn key_projection(&self, positions: &[usize], memory: &Arc<MemoryBudget>) -> Result<Self> {
+        let base = positions.len().checked_mul(std::mem::size_of::<Column>())
+            .and_then(|bytes| bytes.checked_add(256)).ok_or_else(size_error)?;
+        let bytes = positions.iter().try_fold(base, |bytes, &position| {
+            bytes.checked_add(self.columns[position].retained_bytes()?).ok_or_else(size_error)
+        })?;
+        let reservation = memory.reserve(bytes)?;
+        let columns = positions.iter().map(|&position| self.columns[position].duplicate()).collect();
+        Ok(Self { columns, len: self.len, reservation, appended: Vec::new() })
+    }
+
     fn take_rows_with_custody(
         sources: &[impl std::borrow::Borrow<Self>], rows: &[(usize, usize)], positions: &[usize],
         retain_sources: bool, memory: &Arc<MemoryBudget>,
@@ -534,13 +545,18 @@ impl ColumnBatch {
 
 pub(crate) fn ordinal_column(len: usize, start: i64, name: &str, context: &crate::QueryContext)
     -> Result<(Column, Arc<MemoryReservation>)> {
+    ordinal_column_by(len, name, context, |index| start + index as i64)
+}
+
+pub(crate) fn ordinal_column_by(len: usize, name: &str, context: &crate::QueryContext, mut ordinal: impl FnMut(usize) -> i64)
+    -> Result<(Column, Arc<MemoryReservation>)> {
     let bound = len.checked_mul(std::mem::size_of::<i64>())
         .and_then(|bytes| bytes.checked_add(name.len())).and_then(|bytes| bytes.checked_add(512)).ok_or_else(size_error)?;
     let reservation = context.memory.reserve(bound)?;
     let mut values = Vec::with_capacity(len);
     for index in 0..len {
         context.check_cancelled_at(index)?;
-        values.push(start + index as i64);
+        values.push(ordinal(index));
     }
     let array = Arc::new(arrow_array::Int64Array::from(values));
     let field = Arc::new(ArrowField::new(name, DataType::Int64, false));

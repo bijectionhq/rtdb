@@ -160,9 +160,10 @@ async fn build_batches_at(
         RelationNode::Window { partition_by, order_by, expressions, .. } if output == BatchOutput::Arrow => {
             let child = runtime.child(0)?;
             let schema = child.schema().clone();
-            if !crate::window::BatchWindow::supports(&schema, partition_by, order_by, expressions) { return Ok(None); }
+            if (!partition_by.is_empty() && !matches!(child.relation().node(), RelationNode::Scan(_)))
+                || !crate::window::BatchWindow::supports(&schema, partition_by, order_by, expressions) { return Ok(None); }
             let Some((input, projected)) = build_batch_input(child, execution.child(0), None, output).await? else { return Ok(None); };
-            let window = crate::window::BatchWindow::new(input, schema, order_by.clone(), expressions, projected, execution)?;
+            let window = crate::window::BatchWindow::new(input, schema, partition_by, order_by.clone(), expressions, projected, execution)?;
             Ok(Some((Box::new(window), projected)))
         }
         RelationNode::Distinct { .. } if output == BatchOutput::Arrow => {
@@ -472,7 +473,8 @@ fn batch_shape_at(runtime: &Arc<EmittedRelation>, output: BatchOutput) -> Result
         RelationNode::Ordinality { scope: rtdb_plan::OrdinalityScope::Relation, .. } if output == BatchOutput::Arrow => batch_shape(&runtime.child(0)?, output)?,
         RelationNode::Window { partition_by, order_by, expressions, .. } if output == BatchOutput::Arrow => {
             let child = runtime.child(0)?;
-            if !crate::window::BatchWindow::supports(child.schema(), partition_by, order_by, expressions) { return Ok(None); }
+            if (!partition_by.is_empty() && !matches!(child.relation().node(), RelationNode::Scan(_)))
+                || !crate::window::BatchWindow::supports(child.schema(), partition_by, order_by, expressions) { return Ok(None); }
             batch_shape(&child, output)?
         }
         RelationNode::Sort { order_by, .. } | RelationNode::SortLimit { order_by, .. } if output == BatchOutput::Arrow => {

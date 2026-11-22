@@ -49,15 +49,25 @@ enum Key<'a> {
     Scalar(OwnedRow),
 }
 
+#[derive(Clone, Copy)]
+enum KeyHash {
+    Set,
+    Vector,
+}
+
 impl<'a> Key<'a> {
     fn bind(
         batch: &'a ColumnBatch,
         row: usize,
         projected: bool,
         context: &QueryContext,
+        hashing: KeyHash,
     ) -> Result<(u32, Self)> {
         let hash = batch.columns.iter().try_fold(0, |hash, column| {
-            ScalarKey::read(column, row).map(|cell| combine_equality_hash(hash, cell.hash()))
+            ScalarKey::read(column, row).map(|cell| match hashing {
+                KeyHash::Set => combine_equality_hash(hash, cell.hash()),
+                KeyHash::Vector => crate::join_storage::combine_cell_hash(hash, cell.hash() as i32),
+            })
         });
         let key = ArrowKey {
             batch,
@@ -68,10 +78,11 @@ impl<'a> Key<'a> {
             Some(hash) => Ok((hash, Self::Arrow(key))),
             None => {
                 let key = key.read(context)?;
-                Ok((
-                    equality_hash(&key.values, &context.timezone),
-                    Self::Scalar(key),
-                ))
+                let hash = match hashing {
+                    KeyHash::Set => equality_hash(&key.values, &context.timezone),
+                    KeyHash::Vector => crate::join_storage::hash_values(&key.values)?,
+                };
+                Ok((hash, Self::Scalar(key)))
             }
         }
     }
@@ -158,7 +169,7 @@ impl Positions {
         all: bool,
         context: &QueryContext,
         resolve: impl Fn(Position) -> ArrowKey<'a>,
-    ) -> Result<bool> {
+    ) -> Result<Option<usize>> {
         let mut next = self.chains.get(&hash).map(|&(first, _)| first);
         let mut checked = 0usize;
         while let Some(index) = next {
@@ -169,11 +180,11 @@ impl Positions {
                 if all {
                     self.rows[index].consumed = true;
                 }
-                return Ok(true);
+                return Ok(Some(index));
             }
             next = position.next;
         }
-        Ok(false)
+        Ok(None)
     }
 }
 
@@ -181,14 +192,24 @@ pub(crate) struct BatchKeyIndex {
     batches: Vec<(ColumnBatch, bool)>,
     positions: Positions,
     reservation: Arc<MemoryReservation>,
+    hashing: KeyHash,
 }
 
 impl BatchKeyIndex {
     pub fn new(context: &QueryContext) -> Result<Self> {
+        Self::with_hash(context, KeyHash::Set)
+    }
+
+    pub fn vector_hashing(context: &QueryContext) -> Result<Self> {
+        Self::with_hash(context, KeyHash::Vector)
+    }
+
+    fn with_hash(context: &QueryContext, hashing: KeyHash) -> Result<Self> {
         Ok(Self {
             batches: Vec::new(),
             positions: Positions::default(),
             reservation: context.memory.reserve(0)?,
+            hashing,
         })
     }
 
@@ -237,7 +258,7 @@ impl BatchKeyIndex {
         let mut hashes = Vec::with_capacity(batch.len);
         for row in 0..batch.len {
             context.check_cancelled_at(row)?;
-            let (hash, _) = Key::bind(&batch, row, projected, context)?;
+            let (hash, _) = Key::bind(&batch, row, projected, context, self.hashing)?;
             hashes.push(hash);
         }
         self.append(batch, projected, &hashes)
@@ -251,8 +272,9 @@ impl BatchKeyIndex {
         all: bool,
         context: &QueryContext,
     ) -> Result<bool> {
-        let (hash, key) = Key::bind(batch, row, projected, context)?;
+        let (hash, key) = Key::bind(batch, row, projected, context, self.hashing)?;
         self.find(hash, &key, all, context)
+            .map(|found| found.is_some())
     }
 
     fn find(
@@ -261,7 +283,7 @@ impl BatchKeyIndex {
         key: &Key<'_>,
         all: bool,
         context: &QueryContext,
-    ) -> Result<bool> {
+    ) -> Result<Option<usize>> {
         let batches = &self.batches;
         self.positions.find(hash, key, all, context, |position| {
             let (batch, projected) = &batches[position.batch];
@@ -282,6 +304,20 @@ impl BatchKeyIndex {
         schema: &rtdb_plan::Schema,
         mut select: impl FnMut(usize) -> Result<bool>,
     ) -> Result<()> {
+        self.identify(batch, projected, context, schema, |row, _, first| {
+            mask.push(first && select(row)?);
+            Ok(())
+        })
+    }
+
+    pub fn identify(
+        &mut self,
+        batch: &ColumnBatch,
+        projected: bool,
+        context: &QueryContext,
+        schema: &rtdb_plan::Schema,
+        mut visit: impl FnMut(usize, usize, bool) -> Result<()>,
+    ) -> Result<()> {
         let bytes = batch
             .len
             .checked_mul(size_of::<(usize, usize)>() + size_of::<u32>())
@@ -299,22 +335,29 @@ impl BatchKeyIndex {
                 .ok_or_else(size_error)?,
         )?;
         let mut current = Positions::default();
+        let previous = self.positions.rows.len();
         let mut picks = Vec::with_capacity(batch.len);
         let mut hashes = Vec::with_capacity(batch.len);
         for row in 0..batch.len {
             context.check_cancelled_at(row)?;
-            let (hash, key) = Key::bind(batch, row, projected, context)?;
+            let (hash, key) = Key::bind(batch, row, projected, context, self.hashing)?;
             if row == 0 {
                 crate::operators::validate_distinct_types(schema)?;
             }
-            let duplicate = self.find(hash, &key, false, context)?
-                || current.find(hash, &key, false, context, |position| ArrowKey {
-                    batch,
-                    row: position.row,
-                    projected,
-                })?;
-            mask.push(!duplicate && select(row)?);
-            if !duplicate {
+            if let Some(index) = self.find(hash, &key, false, context)? {
+                visit(row, index, false)?;
+                continue;
+            }
+            let known = current.find(hash, &key, false, context, |position| ArrowKey {
+                batch,
+                row: position.row,
+                projected,
+            })?;
+            let index = previous
+                .checked_add(known.unwrap_or(current.rows.len()))
+                .ok_or_else(size_error)?;
+            visit(row, index, known.is_none())?;
+            if known.is_none() {
                 current.push(hash, 0, row);
                 picks.push((0, row));
                 hashes.push(hash);
@@ -391,8 +434,8 @@ mod tests {
             vec![Some("same"), Some("same"), Some("same"), None, Some("null")],
             &context,
         );
-        let (first, key) = Key::bind(&right, 0, false, &context).unwrap();
-        let (second, _) = Key::bind(&right, 1, false, &context).unwrap();
+        let (first, key) = Key::bind(&right, 0, false, &context, KeyHash::Set).unwrap();
+        let (second, _) = Key::bind(&right, 1, false, &context, KeyHash::Set).unwrap();
         assert!(matches!(key, Key::Arrow(_)));
         assert_eq!(first, second);
         let mut index = BatchKeyIndex::new(&context).unwrap();
@@ -487,8 +530,8 @@ mod tests {
             context.memory.reserve(1024).unwrap(),
         )
         .unwrap();
-        let (left_hash, _) = Key::bind(&left, 0, false, &context).unwrap();
-        let (right_hash, _) = Key::bind(&right, 0, false, &context).unwrap();
+        let (left_hash, _) = Key::bind(&left, 0, false, &context, KeyHash::Set).unwrap();
+        let (right_hash, _) = Key::bind(&right, 0, false, &context, KeyHash::Set).unwrap();
         assert_eq!(left_hash, right_hash);
         let mut index = BatchKeyIndex::new(&context).unwrap();
         index.build(right, false, &context).unwrap();
