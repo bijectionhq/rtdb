@@ -36,6 +36,7 @@
 -- The sort gathers payload columns by position and uses Arrow IPC for its spill runs.
 -- A sort can compare supported key types directly at selected Arrow positions.
 -- A sort can compute a supported key expression in its Arrow input batches and keep its payloads columnar through ordering and spill.
+-- A sort can combine several computed Arrow keys with keys taken directly from its input columns.
 -- Its spill threshold accounts for Arrow buffers held by selected payloads.
 -- A top-level materialized relation over a scan with compatible fixed-width Arrow fields and simple reference operations writes its batches once as Arrow IPC and opens an independent reader for each reference.
 -- A batch join can gather matching payload positions from selected Arrow vectors.

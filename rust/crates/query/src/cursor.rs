@@ -546,6 +546,9 @@ fn uses_row_batch_limit(relation: &Relation) -> bool {
             RelationNode::ColumnTable { expr: Expr::Parameter { .. }, .. }
             | RelationNode::Join { kind: JoinKind::Left | JoinKind::Right | JoinKind::Full | JoinKind::Single | JoinKind::Semi | JoinKind::Anti, .. } => true,
             RelationNode::Aggregate { groups, .. } => !groups.is_empty(),
+            RelationNode::Sort { order_by, .. } | RelationNode::SortLimit { order_by, .. } => {
+                order_by.len() > 1 && order_by.iter().any(|key| !matches!(key.expr, Expr::Column { .. }))
+            }
             RelationNode::Project { expressions, .. } | RelationNode::Rename { expressions, .. }
             | RelationNode::Extend { expressions, .. } => expressions.iter().any(|named| {
                 !crate::columnar::projection::shaped(&named.expr)

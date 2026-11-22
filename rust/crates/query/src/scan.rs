@@ -1873,20 +1873,25 @@ mod tests {
         let context = Arc::get_mut(&mut execution.context).unwrap();
         context.options.sort_memory_bytes = 1;
         context.options.batch_rows = 1;
-        let key = Expr::binary(BinaryOp::Subtract, Expr::Literal(Value::I64(0)), scan.columns[0].expression());
+        let value = scan.columns[0].expression();
+        let sort_key = |expr| SortExpr { expr, descending: false, nulls_first: false };
+        let key = sort_key(Expr::binary(BinaryOp::Subtract, Expr::Literal(Value::I64(0)), value.clone()));
+        let first = sort_key(Expr::binary(BinaryOp::Subtract, value.clone(), value.clone()));
         let relation = Arc::new(Relation::scan(scan).unwrap());
-        let relation = Arc::new(relation.sort(vec![SortExpr { expr: key, descending: false, nulls_first: false }]).unwrap());
-        let runtime = crate::runtime_schema::EmittedRelation::derive(relation, &execution.context.catalog, &[], &memory).unwrap();
-        let mut cursor = crate::operators::build_columns(runtime, execution.clone()).await.unwrap().expect("Expected a batch sort");
-        let mut values = Vec::new();
-        while let Some(page) = cursor.next_batch().await.unwrap() {
-            let [crate::columnar::Column::Arrow { array, .. }] = page.columns.as_slice() else {
-                panic!("Expected only the selected Arrow payload");
-            };
-            let array = array.as_any().downcast_ref::<arrow_array::Int64Array>().unwrap();
-            values.extend(array.values().iter().copied());
+        for order in [vec![key.clone()], vec![first, key, sort_key(value)]] {
+            let relation = Arc::new(Arc::clone(&relation).sort(order).unwrap());
+            let runtime = crate::runtime_schema::EmittedRelation::derive(relation, &execution.context.catalog, &[], &memory).unwrap();
+            let mut cursor = crate::operators::build_columns(runtime, execution.clone()).await.unwrap().expect("Expected a batch sort");
+            let mut values = Vec::new();
+            while let Some(page) = cursor.next_batch().await.unwrap() {
+                let [crate::columnar::Column::Arrow { array, .. }] = page.columns.as_slice() else {
+                    panic!("Expected only the selected Arrow payload");
+                };
+                let array = array.as_any().downcast_ref::<arrow_array::Int64Array>().unwrap();
+                values.extend(array.values().iter().copied());
+            }
+            assert_eq!(values, [3, 2, 1]);
         }
-        assert_eq!(values, [3, 2, 1]);
         assert!(execution.context.spill_peak_bytes() > 0);
     }
 
