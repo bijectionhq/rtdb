@@ -136,7 +136,7 @@ fn owned_groups(body: &[u8], require_writes: bool, ordered: bool) -> Result<Vec<
 
 pub(crate) const READ_OWNED_V1: &str = "rtdb.owned.ReadPoint.v1";
 pub(crate) const OPEN_OWNED_READ_AS_OF_V1: &str = "rtdb.owned.OpenReadAsOf.v1";
-pub(crate) const OPEN_OWNED_READ_V1: &str = "rtdb.owned.OpenRead.v1";
+pub(crate) const OPEN_OWNED_READ_V2: &str = "rtdb.owned.OpenRead.v2";
 pub(crate) const HELD_OWNED_POINT_V1: &str = "rtdb.owned.ReadHeldPoint.v1";
 pub(crate) const HELD_OWNED_POINT_V2: &str = "rtdb.owned.ReadHeldPoint.v2";
 pub(crate) const HELD_OWNED_HISTORICAL_POINT_V1: &str = "rtdb.owned.ReadHeldHistoricalPoint.v1";
@@ -737,7 +737,7 @@ impl Service {
         let mut native = connection.borrow().await?;
         require_idle(&native)?;
         let snapshot = native.open_owned_read().await.map_err(status)?;
-        self.retain_owned_read(call, snapshot, permit)
+        self.retain_owned_read(call, snapshot, permit, true)
     }
 
     pub(crate) async fn open_owned_read_as_of_action(&self, call: &Call, body: &[u8]) -> Result<ActionResult, Status> {
@@ -769,18 +769,21 @@ impl Service {
             .await.map_err(status)?;
         held.snapshot.check().map_err(status)?;
         match snapshot {
-            Some(snapshot) => self.retain_owned_read(call, snapshot, permit),
+            Some(snapshot) => self.retain_owned_read(call, snapshot, permit, false),
             None => Ok(ActionResult { body: Bytes::from_static(&[0]) }),
         }
     }
 
-    fn retain_owned_read(&self, call: &Call, snapshot: OwnedReadSession, permit: OwnedSemaphorePermit) -> Result<ActionResult, Status> {
+    fn retain_owned_read(&self, call: &Call, snapshot: OwnedReadSession, permit: OwnedSemaphorePermit, include_transaction: bool) -> Result<ActionResult, Status> {
         let reservation = call.reserve(wire::add(2048, wire::add(call.session.id.len(), call.database.len())?)?)?;
         let reply_charge = call.reserve(64)?;
         let handle = Uuid::new_v4();
-        let mut reply = Vec::with_capacity(24);
+        let mut reply = Vec::with_capacity(if include_transaction { 32 } else { 24 });
         reply.extend_from_slice(handle.as_bytes());
         reply.extend_from_slice(&snapshot.system_time().0.to_be_bytes());
+        if include_transaction {
+            reply.extend_from_slice(&snapshot.present().tx_id.0.to_be_bytes());
+        }
         let held = Arc::new(OwnedReadResource {
             snapshot, owner: call.session.owner(), session: call.session.id.clone(), database: call.database.clone(),
             witnesses: Mutex::default(), _permit: permit, _reservation: reservation,
