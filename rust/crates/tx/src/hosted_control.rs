@@ -1,11 +1,12 @@
 use rtdb_types::{
     Anomaly, EntityId, OwnedRelation, PlacedAttemptScope, Result, StructFields, TableRef,
-    Timestamp, Value,
+    TimeUnit, Timestamp, Value,
 };
 
 pub(crate) const CONTROL_TABLES: &str = "hosted_control_tables";
 const RESTORE: &str = "bj_rtdb_restore_hold";
 const NATIVE_FRONTIER: &str = "native-frontier.v1";
+const REPLAY_TRANSACTIONS: &str = "bj_rtdb_restore_transactions";
 
 #[derive(Debug, PartialEq, Eq, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -15,6 +16,7 @@ pub struct HostedReplay {
     through: u64,
     previous: Option<rtdb_types::TransactionKey>,
     source: rtdb_types::TransactionKey,
+    logical_at: u64,
     fingerprint: [u8; 32],
 }
 
@@ -38,17 +40,22 @@ pub fn hosted_replay_controls<'a>(
     let source = replay.source;
     let receipt_id = format!("native-transaction/{}", source.tx_id.0);
     let receipt = selected(RESTORE, &receipt_id).ok_or_else(replay_invalid)?;
+    let coordinates = selected(REPLAY_TRANSACTIONS, &receipt_id).ok_or_else(replay_invalid)?;
     if controls.clone().filter(|control| control.name() == RESTORE).count() != 5
         || controls.clone().filter(|control| control.name() == "bj_installation").count() != 1
+        || controls.clone().filter(|control| control.name() == REPLAY_TRANSACTIONS).count() != 1
         || !check("bj_installation", "authority", true)
         || !check(RESTORE, "restore", true) || !check(RESTORE, "archive", true)
         || !check(RESTORE, "replayed", false)
         || head.expected().is_some() != replay.previous.is_some()
         || receipt.expected().is_some() || replay_body(receipt) != Some(encoded)
         || source.tx_id.0 < 0 || source.system_time.0 <= 0
-        || u64::try_from(source.system_time.0).ok().and_then(|time| time.checked_mul(1_000)).is_none_or(|time| time > replay.through)
+        || replay.logical_at == 0 || replay.logical_at % 1_000 != 0
+        || u64::try_from(source.system_time.0).ok().and_then(|time| time.checked_mul(1_000))
+            .is_none_or(|time| time < replay.logical_at || time > replay.through)
         || replay.previous.is_some_and(|previous| previous.tx_id.0 < 0 || previous.tx_id >= source.tx_id
             || previous.system_time.0 <= 0 || previous.system_time >= source.system_time)
+        || !replay.matches_coordinates(coordinates)
     {
         return Err(replay_invalid());
     }
@@ -62,6 +69,25 @@ fn replay_body(control: &HostedControlWrite) -> Option<&[u8]> {
 }
 
 impl HostedReplay {
+    fn matches_coordinates(&self, control: &HostedControlWrite) -> bool {
+        let Some(document) = control.replacement() else { return false; };
+        let matches_bytes = |name: &str, bytes: &[u8]| {
+            matches!(document.get(name), Some(Value::Binary(value)) if value.as_slice() == bytes)
+        };
+        let matches_time = |name: &str, micros: i64| {
+            matches!(document.get(name), Some(Value::Timestamp {
+                value, unit: TimeUnit::Microsecond, timezone: Some(_),
+            }) if *value == micros)
+        };
+        control.expected().is_none()
+            && document.len() == 6
+            && matches_bytes("binding", &self.binding)
+            && matches_bytes("digest", &self.fingerprint)
+            && matches_time("source_at", self.source.system_time.0)
+            && matches_time("logical_at", (self.logical_at / 1_000) as i64)
+            && matches_time("source_cut", (self.through / 1_000) as i64)
+    }
+
     pub(crate) fn check_order(&self, ordered: Timestamp) -> Result<()> {
         if u64::try_from(ordered.0).ok().and_then(|time| time.checked_mul(1_000)).is_none_or(|time| time <= self.through) {
             return Err(replay_invalid());
@@ -89,7 +115,7 @@ impl HostedReplay {
                 if bytes.len() > 4096 { return Err(replay_invalid()); }
                 let previous: Self = serde_json::from_slice(bytes).map_err(|_| replay_invalid())?;
                 previous.binding == self.binding && previous.archive == self.archive && previous.through == self.through
-                    && Some(previous.source) == self.previous
+                    && Some(previous.source) == self.previous && previous.logical_at < self.logical_at
             }
             _ => true,
         };
@@ -299,11 +325,22 @@ mod replay_tests {
         let fields = |id: &str| StructFields::from([("_id".into(), Value::Utf8(id.into()))]);
         let (binding, archive, fingerprint) = ([1u8; 32], [2u8; 32], [3u8; 32]);
         let body = serde_json::json!({"binding": binding, "archive": archive, "through": 4000,
-            "previous": null, "source": {"tx_id": 3, "system_time": 4}, "fingerprint": fingerprint}).to_string().into_bytes();
+            "previous": null, "source": {"tx_id": 3, "system_time": 4}, "logical_at": 3000,
+            "fingerprint": fingerprint}).to_string().into_bytes();
         let replace = |id: &str, expected, body: &[u8]| {
             let mut document = fields(id);
             document.insert("binding".into(), Value::Binary(body.to_vec()));
             HostedControlWrite::new(hold.clone(), scope, expected, document)
+        };
+        let projection = |logical_at| {
+            let time = |value| Value::Timestamp { value, unit: TimeUnit::Microsecond, timezone: Some("UTC".into()) };
+            let mut document = fields("native-transaction/3");
+            document.insert("binding".into(), Value::Binary(binding.to_vec()));
+            document.insert("digest".into(), Value::Binary(fingerprint.to_vec()));
+            document.insert("source_at".into(), time(4));
+            document.insert("logical_at".into(), time(logical_at));
+            document.insert("source_cut".into(), time(4));
+            HostedControlWrite::new(OwnedRelation::new(REPLAY_TRANSACTIONS)?, scope, None, document)
         };
         let mut controls = vec![
             HostedControlWrite::check(OwnedRelation::new("bj_installation")?, scope, Some(Timestamp(9)), fields("authority"))?,
@@ -311,6 +348,7 @@ mod replay_tests {
             HostedControlWrite::check(hold.clone(), scope, None, fields("replayed"))?,
             replace(NATIVE_FRONTIER, None, &body)?,
             replace("native-transaction/3", None, &body)?,
+            projection(3)?,
             HostedControlWrite::check(hold.clone(), scope, Some(Timestamp(9)), fields("restore"))?,
         ];
         let replay = hosted_replay_controls(controls.iter())?.unwrap();
@@ -320,6 +358,9 @@ mod replay_tests {
         controls[4] = replace("native-transaction/3", Some(Timestamp(9)), &body)?;
         assert!(hosted_replay_controls(controls.iter()).is_err());
         controls[4] = replace("native-transaction/3", None, &body)?;
+        controls[5] = projection(2)?;
+        assert!(hosted_replay_controls(controls.iter()).is_err());
+        controls[5] = projection(3)?;
         controls.pop();
         assert!(hosted_replay_controls(controls.iter()).is_err());
         Ok(())
