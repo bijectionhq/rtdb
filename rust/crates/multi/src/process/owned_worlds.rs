@@ -2,13 +2,13 @@ use std::{fmt, sync::Arc};
 
 use futures::future::BoxFuture;
 use rtdb_directory::{Directory, HostedTask};
-use rtdb_flight_sql::{OwnedWorldHost, OwnedWorldRead, WorldCall, WorldIdentityPage, WorldPoint, WorldPointResult, WorldPointRow};
+use rtdb_flight_sql::{OwnedWorldHost, OwnedWorldRead, WorldCall, WorldIdentityPage, WorldPointResult, WorldPointRow};
 use rtdb_node::{NodeOptions, OwnedWorldPointWitness, OwnedWorldWrite};
 use rtdb_types::{EntityId, Interval, OwnedRelation, OwnedWorld, Result, Timestamp, TransactionKey};
 use uuid::Uuid;
 
 use crate::{
-    archive::{CheckpointReadResources, HeldCheckpointWorld, WorldArchive, open_held_checkpoint_world, commit_checkpoint_world_batch, commit_checkpoint_world_checked, drop_checkpoint_world, fork_checkpoint_world_at, fork_checkpoint_world_selected, read_checkpoint_world_point},
+    archive::{CheckpointReadResources, HeldCheckpointWorld, WorldArchive, open_held_checkpoint_world, commit_checkpoint_world_batch, commit_checkpoint_world_checked, fork_checkpoint_world_selected},
     capability::attachment_storage,
     deployment::CellStorage,
     keys::KeyService,
@@ -44,23 +44,6 @@ impl PlacedWorldHost {
 }
 
 impl OwnedWorldHost for PlacedWorldHost {
-    fn read_point<'a>(&'a self, call: WorldCall<'a>, point: WorldPoint<'a>) -> BoxFuture<'a, Result<WorldPointResult>> {
-        Box::pin(async move {
-            let deployment = self.deployment(&call)?;
-            let resources = CheckpointReadResources {
-                node: &self.options,
-                memory: call.node.memory(),
-                cache: Arc::clone(call.node.cache_budget()),
-                cancellation: call.cancellation,
-            };
-            let read = read_checkpoint_world_point(
-                self.directory.as_ref(), &self.storage, self.keys.as_ref(), self.hosted_task.as_ref(),
-                call.session, deployment, point.world, point.relation, point.id, point.valid_at, resources,
-            ).await?;
-            Ok(point_result(read))
-        })
-    }
-
     fn open_world_read<'a>(&'a self, call: WorldCall<'a>, world: Uuid) -> BoxFuture<'a, Result<Box<dyn OwnedWorldRead>>> {
         Box::pin(async move {
             let deployment = self.deployment(&call)?;
@@ -75,20 +58,6 @@ impl OwnedWorldHost for PlacedWorldHost {
         })
     }
 
-    fn fork_world<'a>(&'a self, call: WorldCall<'a>, capture: Uuid, suffix: Option<Uuid>, until: Timestamp) -> BoxFuture<'a, Result<Uuid>> {
-        Box::pin(async move {
-            let deployment = self.deployment(&call)?;
-            let resources = CheckpointReadResources {
-                node: &self.options,
-                memory: call.node.memory(),
-                cache: Arc::clone(call.node.cache_budget()),
-                cancellation: call.cancellation,
-            };
-            fork_checkpoint_world_at(self.directory.as_ref(), &self.storage, self.keys.as_ref(), self.hosted_task.as_ref(),
-                call.session, deployment, capture, suffix, until, resources).await
-        })
-    }
-
     fn fork_world_checked<'a>(
         &'a self, call: WorldCall<'a>, capture: Uuid, suffix: Option<Uuid>, until: Timestamp, fork: rtdb_node::OwnedWorldFork,
     ) -> BoxFuture<'a, Result<(Uuid, TransactionKey)>> {
@@ -99,11 +68,11 @@ impl OwnedWorldHost for PlacedWorldHost {
                 cache: Arc::clone(call.node.cache_budget()), cancellation: call.cancellation,
             };
             fork_checkpoint_world_selected(self.directory.as_ref(), &self.storage, self.keys.as_ref(),
-                self.hosted_task.as_ref(), call.session, deployment, capture, suffix, until, resources, Some(fork)).await
+                self.hosted_task.as_ref(), call.session, deployment, capture, suffix, until, resources, fork).await
         })
     }
 
-    fn commit_world<'a>(&'a self, call: WorldCall<'a>, world: Uuid, writes: Vec<OwnedWorldWrite>, checks: Vec<OwnedWorldPointWitness>, controls: Vec<rtdb_node::HostedControlWrite>, deadline: Option<Timestamp>, publication: Option<rtdb_node::OwnedWorldPublication>) -> BoxFuture<'a, Result<TransactionKey>> {
+    fn commit_world<'a>(&'a self, call: WorldCall<'a>, world: Uuid, writes: Vec<OwnedWorldWrite>, checks: Vec<OwnedWorldPointWitness>, controls: Vec<rtdb_node::HostedControlWrite>, deadline: Timestamp, publication: Option<rtdb_node::OwnedWorldPublication>) -> BoxFuture<'a, Result<TransactionKey>> {
         Box::pin(async move {
             let deployment = self.deployment(&call)?;
             commit_checkpoint_world_checked(self.directory.as_ref(), &self.storage, call.session, deployment, world, writes, checks, controls, deadline, publication).await
@@ -121,12 +90,6 @@ impl OwnedWorldHost for PlacedWorldHost {
         })
     }
 
-    fn drop_world<'a>(&'a self, call: WorldCall<'a>, world: Uuid) -> BoxFuture<'a, Result<()>> {
-        Box::pin(async move {
-            let deployment = self.deployment(&call)?;
-            drop_checkpoint_world(self.directory.as_ref(), call.session, deployment, world).await
-        })
-    }
 }
 
 impl OwnedWorldRead for HeldCheckpointWorld {

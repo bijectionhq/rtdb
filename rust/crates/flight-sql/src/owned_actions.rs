@@ -153,19 +153,12 @@ pub(crate) const HELD_WORLD_IDENTITIES_V1: &str = "rtdb.owned.ReadHeldWorldIdent
 pub(crate) const HELD_OWNED_IDENTITIES_V1: &str = "rtdb.owned.ReadHeldIdentityPage.v1";
 pub(crate) const HELD_OWNED_VERSIONS_V2: &str = "rtdb.owned.ReadHeldVersions.v2";
 pub(crate) const CLOSE_OWNED_READ_V1: &str = "rtdb.owned.CloseRead.v1";
-pub(crate) const READ_WORLD_POINT_V1: &str = "rtdb.owned.ReadWorldPoint.v1";
 pub(crate) const OPEN_WORLD_READ_V3: &str = "rtdb.owned.OpenWorldRead.v3";
 pub(crate) const HELD_WORLD_POINT_V2: &str = "rtdb.owned.ReadHeldWorldPoint.v2";
 pub(crate) const CLOSE_WORLD_READ_V1: &str = "rtdb.owned.CloseWorldRead.v1";
-pub(crate) const DROP_WORLD_V1: &str = "rtdb.owned.DropWorld.v1";
 pub(crate) const FORK_HELD_WORLD_V1: &str = "rtdb.owned.ForkHeldWorld.v1";
-pub(crate) const FORK_WORLD_V1: &str = "rtdb.owned.ForkWorld.v1";
-pub(crate) const FORK_WORLD_V2: &str = "rtdb.owned.ForkWorld.v2";
-pub(crate) const COMMIT_WORLD_V1: &str = "rtdb.owned.CommitWorld.v1";
 #[derive(Clone, Copy)]
 pub(crate) enum WorldCommitFormat {
-    Overlay,
-    ConditionedOverlay,
     Validation,
     Publication,
     Clock,
@@ -177,7 +170,6 @@ pub(crate) const COMMIT_WORLD_CLOCK_V1: &str = "rtdb.owned.CommitWorldClock.v1";
 pub(crate) const COMMIT_HELD_WORLDS_V1: &str = "rtdb.owned.CommitHeldWorlds.v1";
 pub(crate) const COMMIT_WORLD_V4: &str = "rtdb.owned.CommitWorld.v4";
 pub(crate) const COMMIT_WORLD_V3: &str = "rtdb.owned.CommitWorld.v3";
-pub(crate) const COMMIT_WORLD_V2: &str = "rtdb.owned.CommitWorld.v2";
 const MAX_WORLD_WITNESSES: usize = 128;
 const WORLD_POINT_WITNESS: &str = "rtdb.owned.world_point_witness";
 pub(crate) const SEARCH_HELD_OWNED_V4: &str = "rtdb.owned.SearchHeld.v4";
@@ -1384,34 +1376,6 @@ impl Service {
         Ok(())
     }
 
-    pub(crate) async fn read_world_point_action(&self, call: &Call, body: &[u8]) -> Result<ActionResult, Status> {
-        if !self.0.config.owned_native_actions { return Err(unsupported()); }
-        let host = self.0.config.owned_world_host.as_ref().ok_or_else(unsupported)?;
-        let (world, body) = body.split_first_chunk::<16>().ok_or_else(|| invalid("Owned world point has no world UUID"))?;
-        let (relation, id, valid, _identity) = point_request(call, body, PointTime::Required)?;
-        let valid_at = valid.ok_or_else(|| invalid("Owned world point requires a valid_micros instant"))?;
-        let (_, attachment) = call.session.resolve_database(Some(&call.database), &self.0.node)?;
-        let attachment = attachment.ok_or_else(unsupported)?;
-        let connection = self.connection(call, &call.database).await?;
-        let mut session = connection.borrow().await?;
-        require_idle(&session)?;
-        let snapshot = host.open_world_read(
-            crate::WorldCall { node: &self.0.node, attachment: &attachment, session: &mut session, cancellation: &call.cancellation },
-            Uuid::from_bytes(*world),
-        ).await.map_err(status)?;
-        let reply = async {
-            let result = snapshot.read_point(&relation, &id, valid_at, false).await.map_err(status)?;
-            if result.present != snapshot.present() {
-                return Err(Status::internal("Owned world point changed its held present"));
-            }
-            let reply = self.world_point_reply(call, result, valid_at, None)?;
-            snapshot.check_relation(&relation).map_err(status)?;
-            Ok(reply)
-        }.await;
-        snapshot.close();
-        reply
-    }
-
     pub(crate) async fn open_world_read_action(&self, call: &Call, body: &[u8]) -> Result<ActionResult, Status> {
         if !self.0.config.owned_native_actions { return Err(unsupported()); }
         let host = self.0.config.owned_world_host.as_ref().ok_or_else(unsupported)?;
@@ -1584,21 +1548,6 @@ impl Service {
         }
     }
 
-    pub(crate) async fn drop_world_action(&self, call: &Call, body: &[u8]) -> Result<(), Status> {
-        if !self.0.config.owned_native_actions { return Err(unsupported()); }
-        let host = self.0.config.owned_world_host.as_ref().ok_or_else(unsupported)?;
-        let bytes: [u8; 16] = body.try_into().map_err(|_| invalid("Owned world drop requires one world UUID"))?;
-        let (_, attachment) = call.session.resolve_database(Some(&call.database), &self.0.node)?;
-        let attachment = attachment.ok_or_else(unsupported)?;
-        let connection = self.connection(call, &call.database).await?;
-        let mut session = connection.borrow().await?;
-        require_idle(&session)?;
-        host.drop_world(
-            crate::WorldCall { node: &self.0.node, attachment: &attachment, session: &mut session, cancellation: &call.cancellation },
-            Uuid::from_bytes(bytes),
-        ).await.map_err(status)
-    }
-
     pub(crate) async fn fork_held_world_action(&self, call: &Call, body: &[u8]) -> Result<ActionResult, Status> {
         if !self.0.config.owned_native_actions { return Err(unsupported()); }
         let host = self.0.config.owned_world_host.as_ref().ok_or_else(unsupported)?;
@@ -1643,31 +1592,6 @@ impl Service {
         reply.extend_from_slice(&key.tx_id.0.to_be_bytes());
         reply.extend_from_slice(&key.system_time.0.to_be_bytes());
         Ok(ActionResult { body: wire::retain(Bytes::from(reply), reply_charge) })
-    }
-
-    pub(crate) async fn fork_world_action(&self, call: &Call, body: &[u8], with_suffix: bool) -> Result<ActionResult, Status> {
-        if !self.0.config.owned_native_actions { return Err(unsupported()); }
-        let host = self.0.config.owned_world_host.as_ref().ok_or_else(unsupported)?;
-        let (capture, rest) = body.split_first_chunk::<16>().ok_or_else(|| invalid("Owned world fork has no capture UUID"))?;
-        let (suffix, rest) = if with_suffix {
-            let (suffix, rest) = rest.split_first_chunk::<16>()
-                .ok_or_else(|| invalid("Owned world fork has no suffix UUID"))?;
-            (Some(Uuid::from_bytes(*suffix)), rest)
-        } else {
-            (None, rest)
-        };
-        let until: [u8; 8] = rest.try_into().map_err(|_| invalid("Owned world fork requires one expiry instant"))?;
-        let (_, attachment) = call.session.resolve_database(Some(&call.database), &self.0.node)?;
-        let attachment = attachment.ok_or_else(unsupported)?;
-        let connection = self.connection(call, &call.database).await?;
-        let mut session = connection.borrow().await?;
-        require_idle(&session)?;
-        let reply_charge = call.reserve(64)?;
-        let world = host.fork_world(
-            crate::WorldCall { node: &self.0.node, attachment: &attachment, session: &mut session, cancellation: &call.cancellation },
-            Uuid::from_bytes(*capture), suffix, Timestamp(i64::from_be_bytes(until)),
-        ).await.map_err(status)?;
-        Ok(ActionResult { body: wire::retain(Bytes::copy_from_slice(world.as_bytes()), reply_charge) })
     }
 
     pub(crate) async fn commit_world_batch_action(&self, call: &Call, body: &[u8]) -> Result<ActionResult, Status> {
@@ -1746,27 +1670,21 @@ impl Service {
         let host = self.0.config.owned_world_host.as_ref().ok_or_else(unsupported)?;
         let (world, groups) = body.split_first_chunk::<16>().ok_or_else(|| invalid("Owned world commit has no world UUID"))?;
         let world = Uuid::from_bytes(*world);
-        let (deadline, groups) = if matches!(format, WorldCommitFormat::Validation | WorldCommitFormat::Publication | WorldCommitFormat::Clock | WorldCommitFormat::Drop) {
-            let (deadline, groups) = groups.split_first_chunk::<8>().ok_or_else(|| invalid("Owned world validation has no deadline"))?;
-            (Some(Timestamp(i64::from_be_bytes(*deadline))), groups)
-        } else {
-            (None, groups)
-        };
-        let (held, checks, _condition_charge, groups) = if !matches!(format, WorldCommitFormat::Overlay) {
-            let (handle, rest) = groups.split_first_chunk::<16>().ok_or_else(|| invalid("Owned world commit has no held handle"))?;
-            let (count, rest) = rest.split_first_chunk::<2>().ok_or_else(|| invalid("Owned world commit has no witness count"))?;
-            let count = usize::from(u16::from_be_bytes(*count));
-            if !(1..=MAX_WORLD_WITNESSES).contains(&count) {
-                return Err(invalid("Owned world commit requires one to 128 point witnesses"));
-            }
-            let (nonces, groups) = rest.split_at_checked(count * 16)
-                .ok_or_else(|| invalid("Owned world point witness list is truncated"))?;
-            let held = self.owned_world_read(call, &Bytes::copy_from_slice(handle))?;
-            let (checks, charge) = held.conditions(call, world, nonces)?;
-            (Some(held), checks, Some(charge), groups)
-        } else {
-            (None, Vec::new(), None, groups)
-        };
+        let (deadline, groups) = groups.split_first_chunk::<8>()
+            .ok_or_else(|| invalid("Owned world validation has no deadline"))?;
+        let deadline = Timestamp(i64::from_be_bytes(*deadline));
+        let (handle, rest) = groups.split_first_chunk::<16>()
+            .ok_or_else(|| invalid("Owned world commit has no held handle"))?;
+        let (count, rest) = rest.split_first_chunk::<2>()
+            .ok_or_else(|| invalid("Owned world commit has no witness count"))?;
+        let count = usize::from(u16::from_be_bytes(*count));
+        if !(1..=MAX_WORLD_WITNESSES).contains(&count) {
+            return Err(invalid("Owned world commit requires one to 128 point witnesses"));
+        }
+        let (nonces, groups) = rest.split_at_checked(count * 16)
+            .ok_or_else(|| invalid("Owned world point witness list is truncated"))?;
+        let held = self.owned_world_read(call, &Bytes::copy_from_slice(handle))?;
+        let (checks, _condition_charge) = held.conditions(call, world, nonces)?;
         let (publication, overlay, groups) = if matches!(format, WorldCommitFormat::Publication | WorldCommitFormat::Clock | WorldCommitFormat::Drop) {
             let (attempt, rest) = groups.split_first_chunk::<22>().ok_or_else(|| invalid("Missing world attempt identity"))?;
             let (fingerprint, rest) = rest.split_first_chunk::<32>().ok_or_else(|| invalid("Missing world attempt fingerprint"))?;
@@ -1800,31 +1718,25 @@ impl Service {
         let _framing = call.reserve(MAX_COMMIT_GROUPS * 512)?;
         let mut writes = Vec::new();
         let mut reservations = Vec::new();
-        let (control_checks, _control_charges, groups) = if matches!(format, WorldCommitFormat::Validation | WorldCommitFormat::Publication | WorldCommitFormat::Clock | WorldCommitFormat::Drop) {
-            let policy = self.hosted_control_policy(call)?;
-            let groups = owned_groups(groups, true, false)?;
-            hosted_control::admit_control_targets(policy, groups.iter().map(|(relation, _)| relation))?;
-            let scope = self.hosted_control_scope(call).await?;
-            let mut rows_left = MAX_GROUPED_COMMIT_ROWS - checked_effects;
-            let (controls, charges) = self.decode_hosted_control_groups(
-                call, groups, scope, &mut rows_left, true,
-            )?;
-            let overlays = match overlay {
-                Some(overlay) => owned_groups(overlay, true, false)?,
-                None => Vec::new(),
-            };
-            (controls, charges, overlays)
-        } else {
-            (Vec::new(), Vec::new(), owned_groups(groups, true, false)?)
+        let policy = self.hosted_control_policy(call)?;
+        let control_groups = owned_groups(groups, true, false)?;
+        hosted_control::admit_control_targets(policy, control_groups.iter().map(|(relation, _)| relation))?;
+        let scope = self.hosted_control_scope(call).await?;
+        let mut rows_left = MAX_GROUPED_COMMIT_ROWS - checked_effects;
+        let (control_checks, _control_charges) = self.decode_hosted_control_groups(
+            call, control_groups, scope, &mut rows_left, true,
+        )?;
+        let groups = match overlay {
+            Some(overlay) => owned_groups(overlay, true, false)?,
+            None => Vec::new(),
         };
-        let mut rows_left = MAX_GROUPED_COMMIT_ROWS - checked_effects - control_checks.len();
         self.decode_world_writes(call, groups, &mut rows_left, &mut writes, &mut reservations)?;
         let (_, attachment) = call.session.resolve_database(Some(&call.database), &self.0.node)?;
         let attachment = attachment.ok_or_else(unsupported)?;
         let connection = self.connection(call, &call.database).await?;
         let mut session = connection.borrow().await?;
         require_idle(&session)?;
-        if let Some(held) = held.as_ref() { held.snapshot.check().map_err(status)?; }
+        held.snapshot.check().map_err(status)?;
         let committed = host.commit_world(
             crate::WorldCall { node: &self.0.node, attachment: &attachment, session: &mut session, cancellation: &call.cancellation },
             world, writes, checks, control_checks, deadline, publication,

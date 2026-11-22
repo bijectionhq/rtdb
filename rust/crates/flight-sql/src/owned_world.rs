@@ -10,16 +10,13 @@ use uuid::Uuid;
 /// The placed host's closed checkpoint-world authority. Flight supplies the
 /// authenticated native session and its already admitted database attachment.
 pub trait OwnedWorldHost: std::fmt::Debug + Send + Sync {
-    fn read_point<'a>(&'a self, call: WorldCall<'a>, point: WorldPoint<'a>) -> BoxFuture<'a, Result<WorldPointResult>>;
     fn open_world_read<'a>(&'a self, call: WorldCall<'a>, world: Uuid) -> BoxFuture<'a, Result<Box<dyn OwnedWorldRead>>>;
-    fn fork_world<'a>(&'a self, call: WorldCall<'a>, capture: Uuid, suffix: Option<Uuid>, until: Timestamp) -> BoxFuture<'a, Result<Uuid>>;
     fn fork_world_checked<'a>(&'a self, call: WorldCall<'a>, capture: Uuid, suffix: Option<Uuid>, until: Timestamp, fork: rtdb_node::OwnedWorldFork) -> BoxFuture<'a, Result<(Uuid, TransactionKey)>>;
-    fn commit_world<'a>(&'a self, call: WorldCall<'a>, world: Uuid, writes: Vec<OwnedWorldWrite>, checks: Vec<OwnedWorldPointWitness>, controls: Vec<rtdb_node::HostedControlWrite>, deadline: Option<Timestamp>, publication: Option<rtdb_node::OwnedWorldPublication>) -> BoxFuture<'a, Result<TransactionKey>>;
+    fn commit_world<'a>(&'a self, call: WorldCall<'a>, world: Uuid, writes: Vec<OwnedWorldWrite>, checks: Vec<OwnedWorldPointWitness>, controls: Vec<rtdb_node::HostedControlWrite>, deadline: Timestamp, publication: Option<rtdb_node::OwnedWorldPublication>) -> BoxFuture<'a, Result<TransactionKey>>;
     fn commit_world_batch<'a>(
         &'a self, call: WorldCall<'a>, sections: Vec<rtdb_node::OwnedWorldSection>,
         controls: Vec<rtdb_node::HostedControlWrite>, deadline: Timestamp,
     ) -> BoxFuture<'a, Result<TransactionKey>>;
-    fn drop_world<'a>(&'a self, call: WorldCall<'a>, world: Uuid) -> BoxFuture<'a, Result<()>>;
 }
 
 pub struct WorldCall<'a> {
@@ -27,13 +24,6 @@ pub struct WorldCall<'a> {
     pub attachment: &'a Database,
     pub session: &'a mut NativeSession,
     pub cancellation: &'a CancellationToken,
-}
-
-pub struct WorldPoint<'a> {
-    pub world: Uuid,
-    pub relation: &'a OwnedRelation,
-    pub id: &'a EntityId,
-    pub valid_at: Timestamp,
 }
 
 pub struct WorldPointResult {

@@ -868,9 +868,17 @@ impl<'a> OpenTransaction<'a> {
         }).take(9).collect::<Vec<_>>();
         let world_batch = publications.len() > 1;
         if publications.len() > 8 { return Err(unavailable()); }
+        if publications.is_empty() && operations.iter().any(|operation| match operation {
+            Operation::Public(TxOp::OwnedReplaceDocs { relation, .. })
+            | Operation::OwnedWriteIids { relation, .. } => relation.world().is_some(),
+            _ => false,
+        }) {
+            return Err(unavailable());
+        }
         let mut scoped = operations.iter().filter_map(Operation::owned_relation);
         let mut admitted = BTreeSet::new();
         if let Some(first) = scoped.next() {
+            if first.is_world_catalog() { return Err(unavailable()); }
             let world = first.world();
             if world_batch {
                 admitted.insert(world.ok_or_else(unavailable)?);
@@ -879,7 +887,7 @@ impl<'a> OpenTransaction<'a> {
                     if admitted.len() > 8 { return Err(unavailable()); }
                 }
             } else {
-                if scoped.any(|relation| relation.world() != world || relation.is_world_catalog() != first.is_world_catalog()) {
+                if scoped.any(|relation| relation.world() != world || relation.is_world_catalog()) {
                     return Err(unavailable());
                 }
                 admitted.extend(world);

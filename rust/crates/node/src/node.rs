@@ -1542,53 +1542,30 @@ impl NativeSession {
         self.state.execute_tx(ops, Default::default()).await
     }
 
-    pub async fn register_owned_world(&mut self, record: &rtdb_types::OwnedWorld) -> Result<TransactionResult> {
-        let documents = rtdb_tx::Documents::new(vec![record.record()], self.service.node.memory())?;
-        self.state.execute_tx(vec![
-            TxOp::OwnedDeadline { until: record.until },
-            TxOp::OwnedInsertDocs { relation: rtdb_types::OwnedRelation::world_catalog(), documents, valid_from: None, valid_to: None },
-        ], Default::default()).await
-    }
-
-    pub async fn drop_owned_world(&mut self, mut record: rtdb_types::OwnedWorld) -> Result<TransactionResult> {
-        record.dropped = true;
-        let documents = rtdb_tx::Documents::new(vec![record.record()], self.service.node.memory())?;
-        self.state.execute_tx(vec![TxOp::OwnedReplaceDocs {
-            relation: rtdb_types::OwnedRelation::world_catalog(), documents, valid_from: None, valid_to: None,
-        }], Default::default()).await
-    }
-
-    pub async fn commit_owned_world(
-        &mut self, record: &rtdb_types::OwnedWorld, writes: Vec<OwnedWorldWrite>,
-    ) -> Result<TransactionResult> {
-        self.commit_owned_world_checked(record, writes, Vec::new(), Vec::new(), None, None).await
-    }
-
     pub async fn commit_owned_world_checked(
         &mut self, record: &rtdb_types::OwnedWorld, writes: Vec<OwnedWorldWrite>,
         checks: Vec<OwnedWorldPointWitness>,
         controls: Vec<rtdb_tx::HostedControlWrite>,
-        deadline: Option<Timestamp>,
+        deadline: Timestamp,
         publication: Option<OwnedWorldPublication>,
     ) -> Result<TransactionResult> {
-        if writes.len() > 4096 || checks.len() > 128 || (writes.is_empty() && (checks.is_empty() || controls.is_empty())) { return Err(rtdb_types::OwnedWorld::unavailable()); }
-        if !controls.is_empty() && (deadline.is_none() || controls.len().saturating_add(checks.len()).saturating_add(writes.len()) > 4096
-            || (!writes.is_empty() && publication.is_none())
-            || controls.iter().any(|control| !control.is_check()))
-        {
-            return Err(rtdb_types::OwnedWorld::unavailable());
-        }
-        if publication.as_ref().is_some_and(|publication| (writes.is_empty() != (publication.advance_to.is_some() || publication.drop_world))
-            || publication.drop_world && publication.advance_to.is_some()
-            || checks.is_empty() || controls.is_empty()
-            || deadline.is_none() || writes.len().saturating_add(controls.len())
-                .saturating_add(checks.len().saturating_mul(2)).saturating_add(4) > 4096)
+        let effects = writes.len().saturating_add(controls.len())
+            .saturating_add(checks.len().saturating_mul(2)).saturating_add(4);
+        if !(1..=128).contains(&checks.len()) || controls.is_empty() || effects > 4096
+            || controls.iter().any(|control| !control.is_check())
+            || match &publication {
+                None => !writes.is_empty(),
+                Some(publication) => (
+                    writes.is_empty() != (publication.advance_to.is_some() || publication.drop_world)
+                    || publication.drop_world && publication.advance_to.is_some()
+                ),
+            }
         {
             return Err(rtdb_types::OwnedWorld::unavailable());
         }
         let scope = self.placed_history()?;
         let now = self.service.node.now();
-        let mut until = deadline.map_or(record.until, |deadline| deadline.min(record.until));
+        let mut until = deadline.min(record.until);
         for check in &checks {
             if check.world != record.id || check.relation.world() != Some(record.id)
                 || scope != Some(check.scope) || now >= check.until
