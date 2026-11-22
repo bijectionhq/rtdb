@@ -470,11 +470,17 @@ pub struct OwnedSearchHit {
     pub score: f64,
 }
 
+/// The requested rank window and the exact number of verified matches.
+pub struct OwnedSearchPage {
+    pub hits: Vec<OwnedSearchHit>,
+    pub total: usize,
+}
+
 /// Ranks nominated runs at one cut using statistics from all selected partitions.
 pub async fn owned_ranked(
-    context: Arc<QueryContext>, owner: &str, partitions: &[(OwnedRelation, OwnedRelation)], text: &str, limit: usize,
-) -> Result<Vec<OwnedSearchHit>> {
-    if !(1..=128).contains(&limit) || !(1..=32).contains(&partitions.len()) || text.len() > 4096 {
+    context: Arc<QueryContext>, owner: &str, partitions: &[(OwnedRelation, OwnedRelation)], text: &str, offset: usize, limit: usize,
+) -> Result<OwnedSearchPage> {
+    if offset > 4096 || !(1..=128).contains(&limit) || !(1..=32).contains(&partitions.len()) || text.len() > 4096 {
         return Err(Anomaly::incorrect("rtdb.owned/search-limit", "Owned search exceeds its result, partition, or query bound"));
     }
     let distinct: BTreeSet<_> = partitions.iter().map(|(relation, _)| relation).collect();
@@ -490,8 +496,9 @@ pub async fn owned_ranked(
         covered.push((relation, part));
     }
     let scorer = rtdb_text::Scorer::new(query.clone(), Some(&corpus));
-    let mut hits = Vec::<OwnedSearchHit>::with_capacity(limit + 1);
-    let mut memory = context.memory.reserve(4096)?;
+    let window = offset + limit;
+    let mut memory = context.memory.reserve(4096 + (window + 1) * size_of::<OwnedSearchHit>())?;
+    let mut hits = Vec::<OwnedSearchHit>::with_capacity(window + 1);
     let mut candidates = 0;
     for (partition, (relation, covered)) in covered.iter().enumerate() {
         for (file, visible) in &covered.visible_runs {
@@ -544,9 +551,9 @@ pub async fn owned_ranked(
                         .then_with(|| previous.partition.cmp(&hit.partition))
                         .is_lt()
                 });
-                if at < limit {
+                if at < window {
                     hits.insert(at, hit);
-                    hits.truncate(limit);
+                    hits.truncate(window);
                     let bytes = hits.iter().try_fold(4096usize, |bytes, hit| {
                         Ok::<_, Anomaly>(bytes.saturating_add(hit.id.as_value().retained_bytes()?).saturating_add(128))
                     })?;
@@ -557,7 +564,8 @@ pub async fn owned_ranked(
         }
     }
     context.check_cancelled()?;
-    Ok(hits)
+    hits.drain(..offset.min(hits.len()));
+    Ok(OwnedSearchPage { hits, total: candidates })
 }
 
 fn file_candidates(cutter: &Cutter<'_>, column: &str, query: &Query, max_candidates: usize, events: &mut usize) -> Result<Option<BTreeSet<Iid>>> {
