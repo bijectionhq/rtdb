@@ -63,6 +63,53 @@ pub async fn read_checkpoint_owned_point(
     point: CheckpointPoint<'_>,
     resources: CheckpointReadResources<'_>,
 ) -> Result<Option<Vec<OwnedBatch>>> {
+    let memory = resources.memory;
+    with_checkpoint_context(
+        directory,
+        archive,
+        keys,
+        hosted_task,
+        world,
+        resources,
+        |context| async move {
+            let Some(mut cursor) = open_owned_point(
+                context,
+                point.owner,
+                point.relation,
+                point.id,
+                point.valid,
+                None,
+            )
+            .await?
+            else {
+                return Ok(None);
+            };
+            let mut batches = Vec::new();
+            while let Some(batch) = cursor.next_batch().await? {
+                for row in 0..batch.batch().num_rows() {
+                    owned_row_revision(batch.batch(), row, point.id, memory)?;
+                }
+                batches.push(batch);
+            }
+            Ok(Some(batches))
+        },
+    )
+    .await
+}
+
+pub(super) async fn with_checkpoint_context<T, F, Fut>(
+    directory: &dyn Directory,
+    archive: &CellStorage,
+    keys: &dyn KeyService,
+    hosted_task: Option<&HostedTask>,
+    world: &CheckpointReadWorld,
+    resources: CheckpointReadResources<'_>,
+    run: F,
+) -> Result<T>
+where
+    F: FnOnce(Arc<QueryContext>) -> Fut,
+    Fut: std::future::Future<Output = Result<T>>,
+{
     if !resources.node.owned_relations {
         return Err(unavailable(
             "Owned checkpoint reads require the owned-relation capability",
@@ -179,26 +226,7 @@ pub async fn read_checkpoint_owned_point(
                 resources.node.query.clone(),
                 resources.cancellation,
             )?;
-            let Some(mut cursor) = open_owned_point(
-                context,
-                point.owner,
-                point.relation,
-                point.id,
-                point.valid,
-                None,
-            )
-            .await?
-            else {
-                return Ok(None);
-            };
-            let mut batches = Vec::new();
-            while let Some(batch) = cursor.next_batch().await? {
-                for row in 0..batch.batch().num_rows() {
-                    owned_row_revision(batch.batch(), row, point.id, resources.memory)?;
-                }
-                batches.push(batch);
-            }
-            Ok(Some(batches))
+            run(context).await
         },
     )
     .await

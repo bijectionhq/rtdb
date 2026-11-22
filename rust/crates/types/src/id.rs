@@ -164,6 +164,8 @@ const OWNED_SCHEMA_V1: &str = "rtdb_owned_v1";
 const OWNED_PATH_CATALOG: &str = ".ordered-paths";
 const OWNED_SEARCH_CATALOG: &str = ".search-paths";
 const OWNED_RELATION_CATALOG: &str = ".relation-schemas";
+const OWNED_WORLD_CATALOG: &str = ".worlds";
+const OWNED_WORLD_PREFIX: &str = ".world-";
 
 /// A native relation provisioned in the authenticated principal's namespace.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -186,6 +188,37 @@ impl OwnedRelation {
 
     pub fn search_catalog(owner: &str) -> TableRef { owned_table(owner, OWNED_SEARCH_CATALOG) }
     pub fn relation_catalog(owner: &str) -> TableRef { owned_table(owner, OWNED_RELATION_CATALOG) }
+
+    pub fn world_catalog() -> Self { Self(OWNED_WORLD_CATALOG.into()) }
+
+    pub fn in_world(&self, world: Iid) -> Result<Self> {
+        Self::new(self.name())?;
+        Ok(Self(format!("{OWNED_WORLD_PREFIX}{world}.{}", self.name())))
+    }
+
+    pub fn is_world_catalog(&self) -> bool { self.0 == OWNED_WORLD_CATALOG }
+
+    pub fn world(&self) -> Option<Iid> {
+        let (world, _) = self.0.strip_prefix(OWNED_WORLD_PREFIX)?.split_once('.')?;
+        world.parse().ok()
+    }
+
+    pub fn root_relation(&self) -> Option<Self> {
+        let (_, relation) = self.0.strip_prefix(OWNED_WORLD_PREFIX)?.split_once('.')?;
+        Self::new(relation).ok()
+    }
+
+    /// The ordered source log carries internal relation addresses.
+    pub fn from_source(name: String) -> Result<Self> {
+        if name == OWNED_WORLD_CATALOG { return Ok(Self(name)); }
+        if let Some((world, relation)) = name.strip_prefix(OWNED_WORLD_PREFIX).and_then(|rest| rest.split_once('.')) {
+            let id: Iid = world.parse()?;
+            let scoped = Self::new(relation)?.in_world(id)?;
+            if scoped.0 == name { return Ok(scoped); }
+        }
+        Self::new(name)
+    }
+
 }
 
 fn owned_table(owner: &str, name: &str) -> TableRef {
@@ -202,6 +235,14 @@ fn owned_table(owner: &str, name: &str) -> TableRef {
 
 impl TableRef {
     pub fn owned_schema(schema: &str) -> bool { schema.starts_with(OWNED_SCHEMA_PREFIX) }
+
+    pub fn owned_world_scope(&self) -> (bool, Option<Iid>) {
+        let Some((_, name)) = self.table.split_once('-') else { return (false, None); };
+        if self.schema != OWNED_SCHEMA_V1 { return (false, None); }
+        let world = name.strip_prefix(OWNED_WORLD_PREFIX)
+            .and_then(|rest| rest.split_once('.')).and_then(|(world, _)| world.parse().ok());
+        (name == OWNED_WORLD_CATALOG, world)
+    }
 
     pub fn is_owned_path_catalog(&self) -> bool {
         self.table.split_once('-').is_some_and(|(_, name)| name == OWNED_PATH_CATALOG)
@@ -225,7 +266,7 @@ impl TableRef {
         self.schema == OWNED_SCHEMA_V1
             && self.table.split_once('-').is_some_and(|(owner, name)| {
                 owner.len() == 64 && owner.bytes().all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-                    && (matches!(name, OWNED_PATH_CATALOG | OWNED_SEARCH_CATALOG | OWNED_RELATION_CATALOG) || OwnedRelation::new(name).is_ok())
+                    && (matches!(name, OWNED_PATH_CATALOG | OWNED_SEARCH_CATALOG | OWNED_RELATION_CATALOG) || OwnedRelation::from_source(name.into()).is_ok())
             })
     }
 }

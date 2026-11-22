@@ -871,6 +871,14 @@ pub struct OwnedReadSession {
 
 impl OwnedReadSession {
     pub fn present(&self) -> TransactionKey { self.present }
+
+    pub async fn world_registration(&self, world: rtdb_types::Iid) -> Result<Option<(rtdb_types::OwnedWorld, Arc<rtdb_columnar::MemoryReservation>)>> {
+        self.admit_read().await?;
+        let record = rtdb_query::read_owned_world(Arc::clone(&self.context), &self.owner, world).await?;
+        self.check()?;
+        Ok(record)
+    }
+
     pub fn close(&self) { self.cancellation.cancel(); }
     pub fn check(&self) -> Result<()> { self.context.check_cancelled() }
 
@@ -939,6 +947,13 @@ impl Drop for OwnedReadSession {
     fn drop(&mut self) { self.close(); }
 }
 
+pub struct OwnedWorldWrite {
+    pub relation: rtdb_types::OwnedRelation,
+    pub id: rtdb_types::EntityId,
+    pub shadow: rtdb_types::WorldShadow,
+    pub valid: rtdb_types::Interval,
+}
+
 pub struct NativeSession { pub(crate) state: Session, pub(crate) service: Arc<NativeSessionService> }
 impl NativeSession {
     pub fn track_replica_read_session(&self) -> Result<impl Send + use<>> {
@@ -946,6 +961,34 @@ impl NativeSession {
     }
     pub fn state(&self) -> &Session { &self.state }
     pub fn state_mut(&mut self) -> &mut Session { &mut self.state }
+    /// Identifies the placed replica history of this authenticated attachment.
+    pub fn placed_history(&self) -> Result<Option<rtdb_types::PlacedAttemptScope>> {
+        Ok(self.service.database()?.await_authority.codec().map(|codec| codec.scope()))
+    }
+
+    pub async fn register_owned_world(&mut self, record: &rtdb_types::OwnedWorld) -> Result<TransactionResult> {
+        let documents = rtdb_tx::Documents::new(vec![record.record()], self.service.node.memory())?;
+        self.state.execute_tx(vec![
+            TxOp::OwnedDeadline { until: record.until },
+            TxOp::OwnedInsertDocs { relation: rtdb_types::OwnedRelation::world_catalog(), documents, valid_from: None, valid_to: None },
+        ], Default::default()).await
+    }
+
+    pub async fn commit_owned_world(
+        &mut self, record: &rtdb_types::OwnedWorld, writes: Vec<OwnedWorldWrite>,
+    ) -> Result<TransactionResult> {
+        if !(1..=4096).contains(&writes.len()) { return Err(rtdb_types::OwnedWorld::unavailable()); }
+        let _operations = self.service.node.memory().reserve((writes.len() + 1) * (std::mem::size_of::<TxOp>() + 512))?;
+        let mut ops = Vec::with_capacity(writes.len() + 1);
+        ops.push(TxOp::OwnedDeadline { until: record.until });
+        for OwnedWorldWrite { relation, id, shadow, valid } in writes {
+            let relation = relation.in_world(record.id)?;
+            let _encode = self.service.node.memory().reserve(shadow.allocation_bound()?)?;
+            let documents = rtdb_tx::Documents::new(vec![shadow.record(&id)?], self.service.node.memory())?;
+            ops.push(TxOp::OwnedReplaceDocs { relation, documents, valid_from: Some(valid.lower()), valid_to: Some(valid.upper()) });
+        }
+        self.state.execute_tx(ops, Default::default()).await
+    }
     /// Reserves a fresh system time by awaiting an ordered, fact-free source transaction.
     /// The key is durable in this database's history. Later transactions in that history have strictly greater system times.
     pub async fn reserve_ordered_present(&mut self) -> Result<TransactionKey> {

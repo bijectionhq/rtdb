@@ -1209,6 +1209,7 @@ async fn prepare_cell_move(
         staged.catalog_admission_floors.clear();
         staged.checkpoint_recovery = None;
         staged.checkpoint_captures.clear();
+        staged.checkpoint_worlds.clear();
         staged.checkpoint_capture_retirements.clear();
         staged.archive_retirement = None;
         staged.retired_residences.clear();
@@ -1222,6 +1223,7 @@ async fn prepare_cell_move(
             });
             if prior.archive_retirement.is_none() {
                 staged.checkpoint_captures.clone_from(&prior.checkpoint_captures);
+                staged.checkpoint_worlds.clone_from(&prior.checkpoint_worlds);
                 staged.checkpoint_capture_retirements.clone_from(&prior.checkpoint_capture_retirements);
             }
         }

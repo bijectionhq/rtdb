@@ -363,10 +363,13 @@ pub trait TransactionWriter: Send {
 }
 pub enum WriterResult { Committed { user_metadata: Option<UserMetadata> }, Aborted { error: Anomaly, user_metadata: Option<UserMetadata> } }
 
-pub struct OpenTransaction<'a> { buffer: TransactionBuffer, options: &'a SubmitOptions, context: &'a ResolveContext, trace_parent: Option<rtdb_plan::SpanContext> }
+pub struct OpenTransaction<'a> {
+    buffer: TransactionBuffer, options: &'a SubmitOptions, context: &'a ResolveContext, trace_parent: Option<rtdb_plan::SpanContext>,
+    owned_world: Option<(rtdb_types::OwnedWorld, Arc<MemoryReservation>)>,
+}
 impl<'a> OpenTransaction<'a> {
     fn new(base: Snapshot, key: TransactionKey, options: &'a SubmitOptions, context: &'a ResolveContext) -> Result<Self> {
-        Ok(Self { buffer: TransactionBuffer::new(base, key, Arc::clone(&context.memory))?, options, context, trace_parent: None })
+        Ok(Self { buffer: TransactionBuffer::new(base, key, Arc::clone(&context.memory))?, options, context, trace_parent: None, owned_world: None })
     }
     pub fn tx_key(&self) -> TransactionKey { self.buffer.tx_key() }
     pub fn snapshot(&self) -> Result<Snapshot> { self.buffer.snapshot() }
@@ -668,6 +671,7 @@ impl<'a> OpenTransaction<'a> {
     }
     async fn declare_owned_relation(&mut self, relation: &rtdb_types::OwnedRelation, schema: &rtdb_types::OwnedSchema) -> Result<()> {
         let owner = self.options.user.as_deref().filter(|owner| !owner.is_empty()).ok_or_else(no_owned_principal)?;
+        if relation.world().is_some() || relation.is_world_catalog() { return Err(rtdb_types::OwnedWorld::unavailable()); }
         if self.snapshot()?.contains_table(&relation.table(owner))
             || self.read_owned_schema(owner, relation).await?.is_some()
         {
@@ -712,6 +716,7 @@ impl<'a> OpenTransaction<'a> {
         columns: &[String], search: bool,
     ) -> Result<()> {
         let owner = self.options.user.as_deref().filter(|owner| !owner.is_empty()).ok_or_else(no_owned_principal)?;
+        if relation.world().is_some() || relation.is_world_catalog() { return Err(rtdb_types::OwnedWorld::unavailable()); }
         let target = relation.table(owner);
         let catalog = if search { rtdb_types::OwnedRelation::search_catalog(owner) } else { rtdb_types::OwnedRelation::path_catalog(owner) };
         let declaration = self.read_owned_schema(owner, relation).await?;
@@ -765,7 +770,7 @@ impl<'a> OpenTransaction<'a> {
         self.buffer.put(catalog, document, Interval::ALL)
     }
 
-    async fn check_owned_preconditions(&self, operations: &[Operation]) -> Result<()> {
+    async fn check_owned_preconditions(&mut self, operations: &[Operation]) -> Result<()> {
         let owner = self.options.user.as_deref().filter(|owner| !owner.is_empty()).ok_or_else(no_owned_principal)?;
         let mut deadline = None;
         for operation in operations {
@@ -773,6 +778,22 @@ impl<'a> OpenTransaction<'a> {
                 if deadline.replace(*until).is_some() {
                     return Err(Anomaly::incorrect("rtdb.owned/duplicate-deadline", "An owned transaction may supply at most one deadline"));
                 }
+            }
+        }
+        let unavailable = rtdb_types::OwnedWorld::unavailable;
+        let mut scoped = operations.iter().filter_map(Operation::owned_relation);
+        if let Some(first) = scoped.next() {
+            let world = first.world();
+            if scoped.any(|relation| relation.world() != world || relation.is_world_catalog() != first.is_world_catalog()) {
+                return Err(unavailable());
+            }
+            if let Some(world) = world {
+                let context = self.context.query_context(self.snapshot()?, self.tx_key().system_time, &self.options.default_tz, self.trace_parent)?;
+                let record = rtdb_query::read_owned_world(context, owner, world).await?.ok_or_else(unavailable)?;
+                if self.tx_key().system_time >= record.0.until {
+                    return Err(unavailable());
+                }
+                self.owned_world = Some(record);
             }
         }
         if deadline.is_some_and(|until| self.tx_key().system_time >= until) {
@@ -809,6 +830,7 @@ impl<'a> OpenTransaction<'a> {
     async fn delete_owned(&mut self, relation: &rtdb_types::OwnedRelation, id: &rtdb_types::EntityId, from: Option<Timestamp>, to: Option<Timestamp>) -> Result<()> {
         let options = self.options;
         let owner = options.user.as_deref().filter(|owner| !owner.is_empty()).ok_or_else(no_owned_principal)?;
+        if relation.world().is_some() || relation.is_world_catalog() { return Err(rtdb_types::OwnedWorld::unavailable()); }
         let valid = interval(from.unwrap_or(self.tx_key().system_time), to.unwrap_or(Timestamp::MAX))?;
         self.read_owned_revision(owner, relation, id, Interval::ALL).await?;
         self.buffer.delete(relation.table(owner), id, valid)
@@ -828,16 +850,44 @@ impl<'a> OpenTransaction<'a> {
                 }
             }
         }
+        if relation.is_world_catalog() {
+            if !create_only || from.is_some() || to.is_some() || documents.rows().len() != 1
+                || !documents.has_exact_presence()
+            {
+                return Err(rtdb_types::OwnedWorld::unavailable());
+            }
+            let record = rtdb_types::OwnedWorld::from_record(&documents.rows()[0])?;
+            let ordered = self.tx_key().system_time;
+            if record.basis.system_time >= ordered || record.until <= ordered {
+                return Err(rtdb_types::OwnedWorld::unavailable());
+            }
+            return self.put_documents(&table, documents, iids, Some(Timestamp::MIN), Some(Timestamp::MAX),
+                DocumentWrite::Owned { relation, owner, create_only }).await;
+        }
+        if let Some(root) = relation.root_relation() {
+            let unavailable = rtdb_types::OwnedWorld::unavailable;
+            let (Some(from), Some(to)) = (from, to) else { return Err(unavailable()); };
+            if create_only || from >= to || !documents.has_exact_presence() {
+                return Err(unavailable());
+            }
+            let (record, _) = self.owned_world.as_ref().ok_or_else(unavailable)?;
+            if Some(record.id) != relation.world() { return Err(unavailable()); }
+            for row in documents.rows() {
+                let _scratch = self.context.memory.reserve(rtdb_types::WorldShadow::decode_bound(row)?)?;
+                if let rtdb_types::WorldShadow::Present(fact) = rtdb_types::WorldShadow::from_record(row)?
+                    && let Some(schema) = record.schemas.relation(&root)
+                {
+                    validate_owned_schema(schema, &fact)?;
+                }
+            }
+            return self.put_documents(&table, documents, iids, Some(from), Some(to),
+                DocumentWrite::Owned { relation, owner, create_only }).await;
+        }
         if let Some((schema, _retained)) = self.read_owned_schema(owner, relation).await? {
             if !documents.has_exact_presence() {
                 return Err(Anomaly::incorrect("rtdb.owned/field-presence", "Declared owned writes require exact field presence"));
             }
-            for row in documents.rows() {
-                schema.validate_row(row)?;
-                for value in row.values().filter(|value| matches!(value, Value::Decimal(_))) {
-                    rtdb_columnar::build_array(&value.logical_type(), std::slice::from_ref(value))?;
-                }
-            }
+            for row in documents.rows() { validate_owned_schema(&schema, row)?; }
         }
         self.put_documents(&table, documents, iids, from, to, DocumentWrite::Owned { relation, owner, create_only }).await
     }
@@ -1032,6 +1082,14 @@ fn insert_exists() -> Anomaly {
 
 fn invalid_search_path_column() -> Anomaly {
     Anomaly::incorrect("rtdb.owned/search-column", "Owned search requires one stored clear-text UTF-8 column")
+}
+
+fn validate_owned_schema(schema: &rtdb_types::OwnedSchema, row: &StructFields<Value>) -> Result<()> {
+    schema.validate_row(row)?;
+    for value in row.values().filter(|value| matches!(value, Value::Decimal(_))) {
+        rtdb_columnar::build_array(&value.logical_type(), std::slice::from_ref(value))?;
+    }
+    Ok(())
 }
 
 fn no_owned_principal() -> Anomaly {
