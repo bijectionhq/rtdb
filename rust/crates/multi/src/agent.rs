@@ -547,9 +547,15 @@ impl NodeAgent {
         let deadline = tokio::time::Instant::now() + self.options.activation_timeout;
         let block = self.flush_and_adopt(&database, &id, epoch, self.options.activation_timeout).await?;
         let missing = || Anomaly::fault("rtdb.multi/flush-checkpoint", format!("{name} did not adopt a block in its current log epoch"));
-        tokio::time::timeout_at(deadline, self.publish_checkpoint(&id, epoch, &database, &block)).await
+        let (published, checkpoint) = tokio::time::timeout_at(deadline, self.publish_checkpoint(&id, epoch, &database, &block)).await
             .map_err(|_| checkpoint_timeout(name))??.ok_or_else(missing)?;
-        Ok(Response::Flushed { block: block.block_index().0 })
+        if published.checkpoint != Some(checkpoint) || checkpoint.root_sha256.is_none() {
+            return Err(Anomaly::new(
+                AnomalyCategory::Unavailable, "rtdb.multi/capture-flush",
+                "The adopted checkpoint is no longer the exact published cut",
+            ));
+        }
+        Ok(Response::Flushed { checkpoint })
     }
 
     pub async fn park(&self, name: &str) -> Result<Response> { self.park_holding(name, None).await }

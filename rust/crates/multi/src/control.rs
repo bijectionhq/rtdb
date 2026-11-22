@@ -93,7 +93,7 @@ pub enum Response {
     HoldingLoads { holdings: Vec<crate::load::HoldingLoad> },
     ReadLoads { loads: Vec<crate::read_width::ReadLoad> },
     Done,
-    Flushed { block: i64 },
+    Flushed { checkpoint: rtdb_directory::Checkpoint },
     Published { position: i64 },
     /// A fragment's rows: length-prefixed Arrow IPC streams, in base64.
     Fragment { batches: String },

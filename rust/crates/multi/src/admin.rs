@@ -201,7 +201,7 @@ pub async fn flush_checkpoint(directory: &dyn Directory, original: &DeploymentRe
     }
     let address = control_address(&members(directory).await?, &holder)?;
     let unavailable = || Anomaly::new(AnomalyCategory::Unavailable, "rtdb.multi/capture-flush", "The holder did not publish an exact checkpoint in the original residence");
-    let Response::Flushed { block } = expect(
+    let Response::Flushed { checkpoint } = expect(
         &address, Request::Flush { name: original.name.clone() }, control,
     ).await? else { return Err(unavailable()); };
     let deadline = tokio::time::Instant::now() + CONTROL_TIMEOUT;
@@ -210,8 +210,11 @@ pub async fn flush_checkpoint(directory: &dyn Directory, original: &DeploymentRe
         if !matches_original(&after) || after.epoch != before.epoch || tokio::time::Instant::now() > deadline {
             return Err(unavailable());
         }
-        if after.checkpoint.is_some_and(|cut| cut.block >= block) {
+        if after.checkpoint == Some(checkpoint) {
             return Ok(after);
+        }
+        if after.checkpoint.is_some_and(|cut| cut.block >= checkpoint.block) {
+            return Err(unavailable());
         }
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     }

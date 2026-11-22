@@ -1727,10 +1727,12 @@ async fn a_checkpoint_capture_keeps_its_cut_and_archives_only_sealed_objects() {
         }
     };
     let first = advance(None).await;
+    let selected = cell.directory.deployment(&id.to_string()).await.unwrap().unwrap();
+    assert_eq!(selected.checkpoint, Some(first));
     let destination = tempfile::tempdir().unwrap();
     let archive = CellStorage::Local { root: destination.path().to_owned() };
     let operation = uuid::Uuid::new_v4();
-    let capture = rtdb_multi::archive::capture(cell.directory.clone(), &cell.storage(), &archive, &cell.keys(), id, operation, None, None).await.unwrap();
+    let capture = rtdb_multi::archive::capture(cell.directory.clone(), &cell.storage(), &archive, &cell.keys(), id, operation, None, Some(&selected)).await.unwrap();
     assert_eq!(capture.point.checkpoint, first);
     assert!(capture.objects.iter().any(|object| object.name.ends_with(".arrow")));
     assert!(capture.objects.iter().any(|object| object.name.starts_with("blocks/")));
@@ -1743,7 +1745,20 @@ async fn a_checkpoint_capture_keeps_its_cut_and_archives_only_sealed_objects() {
     }
     client.simple_query("INSERT INTO orders (_id, detail) VALUES (2, 'later')").await.unwrap();
     assert!(advance(Some(first.block)).await.block > first.block);
-    let replay = rtdb_multi::archive::capture(cell.directory.clone(), &cell.storage(), &archive, &cell.keys(), id, operation, None, None).await.unwrap();
+    let stale_operation = uuid::Uuid::new_v4();
+    let raced = rtdb_multi::archive::capture(
+        cell.directory.clone(), &cell.storage(), &archive, &cell.keys(),
+        id, stale_operation, None, Some(&selected),
+    ).await.unwrap_err();
+    assert_eq!(raced.message.as_deref(), Some("The selected source cut changed before archive admission"));
+    let newer = cell.directory.deployment(&id.to_string()).await.unwrap().unwrap();
+    assert!(!newer.checkpoint_captures.contains_key(&stale_operation));
+    let mismatched = rtdb_multi::archive::capture(
+        cell.directory.clone(), &cell.storage(), &archive, &cell.keys(),
+        id, operation, None, Some(&newer),
+    ).await.unwrap_err();
+    assert_eq!(mismatched.message.as_deref(), Some("The capture operation already names another checkpoint"));
+    let replay = rtdb_multi::archive::capture(cell.directory.clone(), &cell.storage(), &archive, &cell.keys(), id, operation, None, Some(&selected)).await.unwrap();
     assert_eq!(replay, capture);
     let other_destination = tempfile::tempdir().unwrap();
     let other_archive = CellStorage::Local { root: other_destination.path().to_owned() };
