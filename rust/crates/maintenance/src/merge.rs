@@ -16,7 +16,7 @@ use rtdb_format::{data::{EncodedEvent, EventBatch, PageEvent, copy_encoded_batch
     log::proto::{TriesAdded, TrieDetails, TrieFileVersions}, metadata::MetadataFile};
 use rtdb_storage::{ObjectKey, ObjectStore, ReadReservation};
 use rtdb_temporal::AdmittedPolygonCalculator;
-use rtdb_types::{EventOp, Interval, LogicalType, Result, RunEndWidth, StorageEpoch, StorageVersion, Timestamp};
+use rtdb_types::{EventOp, Iid, Interval, LogicalType, Result, RunEndWidth, StorageEpoch, StorageVersion, Timestamp};
 use tokio_util::sync::CancellationToken;
 use crate::{CompactionExecutor, CompactionJob, RecencyMode, SnapshotSource};
 
@@ -197,34 +197,60 @@ fn merged_put_schema(inputs: &[InputSegment]) -> Result<Option<StructFields<Logi
     Ok(Some(fields))
 }
 
-/// Until projections and erasure use full keys throughout compaction, an
-/// assigned IID may cover only one full identity. Never coalesce mismatches.
-fn check_compaction_locator<'a>(
-    previous: &mut Option<(rtdb_types::Iid, Option<&'a [u8]>)>, event: &'a PageEvent,
-) -> Result<()> {
-    let key = event.entity_key();
-    if previous.is_some_and(|(iid, old)| iid == event.iid && old != key) {
-        return Err(crate::invalid("Compaction cannot coalesce distinct entity keys at one IID"));
+/// Page and trie order use IID, then descending system time. Each complete
+/// key within the current physical bucket owns its temporal state.
+struct EntityStates<'a, State> {
+    bucket: Option<Iid>,
+    states: BTreeMap<Option<&'a [u8]>, (State, Arc<MemoryReservation>)>,
+}
+
+impl<'a, State> EntityStates<'a, State> {
+    fn new() -> Self {
+        Self { bucket: None, states: BTreeMap::new() }
     }
-    *previous = Some((event.iid, key));
-    Ok(())
+
+    fn get(
+        &mut self, event: &'a PageEvent, memory: &Arc<MemoryBudget>,
+        init: impl FnOnce() -> State,
+    ) -> Result<&mut State> {
+        if self.bucket != Some(event.iid) {
+            self.states.clear();
+            self.bucket = Some(event.iid);
+        }
+        match self.states.entry(event.entity_key()) {
+            std::collections::btree_map::Entry::Occupied(entry) => Ok(&mut entry.into_mut().0),
+            std::collections::btree_map::Entry::Vacant(entry) => {
+                let charge = memory.reserve(std::mem::size_of::<State>() + 512)?;
+                Ok(&mut entry.insert((init(), charge)).0)
+            }
+        }
+    }
+}
+
+struct SameTimeState {
+    calculator: AdmittedPolygonCalculator,
+    system_from: Option<Timestamp>,
+    seen_erase: bool,
+    erased: bool,
 }
 
 fn resolve_same_time(events: &[PageEvent], memory: &Arc<MemoryBudget>) -> Result<(Vec<PageEvent>, Vec<Arc<MemoryReservation>>)> {
     let mut result = Vec::new();
     let mut charges = Vec::new();
-    let mut calculator = AdmittedPolygonCalculator::new(None, Arc::clone(memory));
-    let mut previous = None;
-    let mut seen_erase = false;
-    let mut erased_iid = None;
-    let mut locator = None;
+    let mut states = EntityStates::new();
     for event in events {
-        check_compaction_locator(&mut locator, event)?;
-        let group = (event.iid, event.system_from);
-        if previous != Some(group) { calculator.reset(); previous = Some(group); seen_erase = false; }
+        let state = states.get(event, memory, || SameTimeState {
+            calculator: AdmittedPolygonCalculator::new(None, Arc::clone(memory)),
+            system_from: None, seen_erase: false, erased: false,
+        })?;
+        if state.system_from != Some(event.system_from) {
+            state.calculator.reset();
+            state.system_from = Some(event.system_from);
+            state.seen_erase = false;
+        }
         let header = event.header();
-        let resolved = if erased_iid == Some(event.iid) { None } else {
-            calculator.visit(&header, |polygon| {
+        let resolved = if state.erased { None } else {
+            state.calculator.visit(&header, |polygon| {
                 for (valid_from, valid_to, system_to) in polygon.ranges() {
                     if system_to > event.system_from {
                         charges.push(memory.reserve(row_bytes(event)?.checked_mul(2).ok_or_else(|| crate::invalid("Resolved row allocation overflow"))?)?);
@@ -236,15 +262,15 @@ fn resolve_same_time(events: &[PageEvent], memory: &Arc<MemoryBudget>) -> Result
                 Ok(())
             })?
         };
-        if header.op == EventOp::Erase { erased_iid = Some(event.iid); }
+        if header.op == EventOp::Erase { state.erased = true; }
         if resolved.is_none() {
-            if !seen_erase {
+            if !state.seen_erase {
                 charges.push(memory.reserve(row_bytes(event)?.checked_mul(2).ok_or_else(|| crate::invalid("Resolved row allocation overflow"))?)?);
                 let mut event = event.clone();
                 event.valid_time = Interval::new(Timestamp::MIN, Timestamp::MAX)?;
                 result.push(event);
             }
-            seen_erase = true;
+            state.seen_erase = true;
         }
     }
     Ok((result, charges))
@@ -312,13 +338,12 @@ impl CompactionExecutor for SegmentCompactor {
                 rows.push(events);
             }
             let mut heap = planner::RowHeap::new(&rows)?;
-            let mut calculator = AdmittedPolygonCalculator::new(None, Arc::clone(&self.memory));
+            let mut states = EntityStates::new();
             let mut buckets: BTreeMap<usize, Vec<PageEvent>> = BTreeMap::new();
             let mut bucket_charges = Vec::new();
-            let mut locator = None;
             while let Some((stream, row)) = heap.next() {
                 let event = &rows[stream][row];
-                check_compaction_locator(&mut locator, event)?;
+                let calculator = states.get(event, &self.memory, || AdmittedPolygonCalculator::new(None, Arc::clone(&self.memory)))?;
                 let Some(recency) = calculator.visit(&event.header(), |polygon| Ok(polygon.recency()))? else { continue; };
                 let target = if job.recency_mode == RecencyMode::Partition && recency != Timestamp::MAX {
                     let date = recency_partition(recency, self.config.recency_partition)?;
@@ -334,7 +359,7 @@ impl CompactionExecutor for SegmentCompactor {
                 event.recency = if outputs[target].carries_recency { Some(if job.recency_mode == RecencyMode::Partition { recency } else { event.recency.ok_or_else(|| crate::invalid("Historical input lost recency"))? }) } else { None };
                 buckets.entry(target).or_default().push(event);
             }
-            drop(calculator);
+            drop(states);
             for (index, events) in buckets {
                 outputs[index].write(&events, task.path.clone(), &put, &self.config, &self.memory)?;
             }
