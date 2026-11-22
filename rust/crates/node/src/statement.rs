@@ -28,11 +28,23 @@ enum PreparedResult { Query { schema: Schema, pg_types: Vec<PgType>, parameter_p
 #[derive(Clone)]
 pub struct PreparedSql(Arc<PreparedData>);
 
-/// Binding and planning recurse as deep as the statement's expressions nest, which only long source can reach,
-/// so a long statement is prepared on a stack of its own rather than overflowing the caller's.
 fn deep<T>(source: &str, prepare: impl FnOnce() -> T) -> T {
     const DEEP_SOURCE_BYTES: usize = 4096;
-    if source.len() < DEEP_SOURCE_BYTES { prepare() } else { stacker::grow(64 << 20, prepare) }
+    if source.len() >= DEEP_SOURCE_BYTES {
+        stacker::grow(64 << 20, prepare)
+    } else {
+        stacker::maybe_grow(512 << 10, 8 << 20, prepare)
+    }
+}
+
+#[cfg(test)]
+mod stack_tests {
+    #[test]
+    fn short_sql_preparation_checks_the_callers_remaining_stack() {
+        stacker::grow(128 << 10, || {
+            super::deep("SELECT 1", || assert!(stacker::remaining_stack().unwrap() > 512 << 10));
+        });
+    }
 }
 
 impl PreparedSql {
