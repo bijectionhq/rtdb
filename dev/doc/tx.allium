@@ -96,7 +96,9 @@
 -- World writes to a governed root refuse without inherited capacity accounting.
 -- A fresh held read can derive a scoped read-only hold at the actual last visible publication marker.
 -- Each declared relation's retained floor covers both the requested and selected system coordinates.
--- The derived hold shares the original generation and lease and admits point, valid-window and version reads in its fixed root scope.
+-- The derived hold shares the original generation and lease and admits point, valid-window, version, ordered page and count reads in its fixed root scope.
+-- Historical ordered pages and counts use a fully covered index revision at the admitted system cut and explicit valid instant.
+-- Historical index coverage includes ordered erasures, and historical pages and counts carry no commit evidence.
 
 -- A declared fixed-valid Binary and Utf8 identity path journals both old and new covered keys at the authored instant.
 -- A held full-span fixed witness permits intervening relation writes only when every covered journal side lies outside its bounds.

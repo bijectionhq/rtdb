@@ -763,12 +763,13 @@ async fn covered_generation(
         })
         .ok_or_else(super::uncovered_owned_range)?;
     let tree = Tree::new(storage, &directory, &context.memory, checkpoint.scope).await?;
+    // The checkpoint accounts for every captured event. Before its first
+    // projected revision the index is empty, including after erase replay.
     let root = checkpoint
         .roots()
         .at(&tree, present)
         .await?
-        .ok_or_else(super::uncovered_owned_range)?
-        .1;
+        .and_then(|(_, root)| root);
     Ok((tree, root))
 }
 

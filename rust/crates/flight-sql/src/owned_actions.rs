@@ -162,11 +162,13 @@ const WORLD_POINT_WITNESS: &str = "rtdb.owned.world_point_witness";
 pub(crate) const SEARCH_HELD_OWNED_V3: &str = "rtdb.owned.SearchHeld.v3";
 pub(crate) const HELD_OWNED_RANGE_V1: &str = "rtdb.owned.ReadHeldRange.v1";
 #[derive(Clone, Copy)]
-pub(crate) enum HeldRangeFormat { Leading, Full, FixedValid }
+pub(crate) enum HeldRangeFormat { Leading, Full, FixedValid, Historical }
 
 pub(crate) const HELD_OWNED_RANGE_V3: &str = "rtdb.owned.ReadHeldRange.v3";
+pub(crate) const HELD_OWNED_RANGE_V4: &str = "rtdb.owned.ReadHeldRange.v4";
 pub(crate) const HELD_OWNED_RANGE_V2: &str = "rtdb.owned.ReadHeldRange.v2";
 pub(crate) const HELD_OWNED_COUNT_V1: &str = "rtdb.owned.CountHeldRange.v1";
+pub(crate) const HELD_OWNED_COUNT_V2: &str = "rtdb.owned.CountHeldRange.v2";
 pub(crate) const HELD_OWNED_MERGED_CHANGES_V1: &str = "rtdb.owned.ReadHeldMergedChanges.v1";
 pub(crate) const HELD_OWNED_CHANGES_V2: &str = "rtdb.owned.ReadHeldChanges.v2";
 const READ_IDLE: Duration = Duration::from_secs(60);
@@ -1025,6 +1027,7 @@ impl Service {
             HeldRangeFormat::Leading => 4,
             HeldRangeFormat::Full => 6,
             HeldRangeFormat::FixedValid => 7,
+            HeldRangeFormat::Historical => 8,
         };
         if batch.batch().num_rows() != 1 || batch.batch().num_columns() != expected_fields {
             return Err(invalid("Owned range requires one row with the fields for its action version"));
@@ -1036,13 +1039,19 @@ impl Service {
         else { return Err(invalid("Owned range fields have invalid types")); };
         let path = OwnedRelation::new(path.as_str()).map_err(status)?;
         let limit = usize::try_from(*limit).map_err(|_| invalid("Owned range limit is out of range"))?;
-        let valid_at = if matches!(version, HeldRangeFormat::FixedValid) {
+        let valid_at = if matches!(version, HeldRangeFormat::FixedValid | HeldRangeFormat::Historical) {
             let Some(Value::I64(valid_at)) = row.get("valid_micros") else {
                 return Err(invalid("Owned fixed range requires a microsecond valid instant"));
             };
             let valid_at = Timestamp(*valid_at);
             valid_at.next().map_err(status)?;
             Some(valid_at)
+        } else { None };
+        let system = if matches!(version, HeldRangeFormat::Historical) {
+            let Some(Value::I64(system)) = row.get("system_micros") else {
+                return Err(invalid("Owned historical range requires a microsecond system cut"));
+            };
+            Some(Timestamp(*system))
         } else { None };
         let (page, evidence) = if !matches!(version, HeldRangeFormat::Leading) {
             let Some(Value::Bool(descending)) = row.get("descending") else {
@@ -1055,13 +1064,18 @@ impl Service {
                 descending: *descending,
                 limit,
             };
-            held.snapshot.range_page_by_key_at_observed(&relation, &path, request, valid_at).await
+            if let (Some(system), Some(valid)) = (system, valid_at) {
+                held.snapshot.range_page_by_key_at_system(&relation, &path, request, system, valid)
+                    .await.map(|page| (page, None))
+            } else {
+                held.snapshot.range_page_by_key_at_observed(&relation, &path, request, valid_at).await
+            }
         } else {
             let lower = (!matches!(lower, Value::Null | Value::Undefined)).then_some(lower);
             let upper = (!matches!(upper, Value::Null | Value::Undefined)).then_some(upper);
             held.snapshot.range(&relation, &path, lower, upper, limit).await.map(|page| (page, None))
         }.map_err(status)?;
-        let present = held.snapshot.present().system_time;
+        let present = system.unwrap_or(held.snapshot.present().system_time);
         let observed = witnessed_schema(call, &held, &relation, &page.schema, evidence)?;
         let schema = observed.as_ref().map_or(page.schema.as_ref(), |(schema, _)| schema);
         let reply = self.owned_point_reply(schema, page.batch.as_ref().map(OwnedBatch::batch), present, valid_at.unwrap_or(present), None)?;
@@ -1069,7 +1083,7 @@ impl Service {
         Ok(reply)
     }
 
-    pub(crate) async fn held_owned_count_action(&self, call: &Call, body: &[u8]) -> Result<ActionResult, Status> {
+    pub(crate) async fn held_owned_count_action(&self, call: &Call, body: &[u8], historical: bool) -> Result<ActionResult, Status> {
         if !self.0.config.owned_native_actions { return Err(unsupported()); }
         let (handle, request) = body.split_first_chunk::<16>().ok_or_else(|| invalid("Owned held count has no handle"))?;
         let handle = Bytes::copy_from_slice(handle);
@@ -1080,8 +1094,8 @@ impl Service {
         }
         let (relation, arrow_bytes) = split_relation(request)?;
         let batch = decode_batch(call, arrow_bytes)?;
-        if batch.batch().num_rows() != 1 || batch.batch().num_columns() != 4 {
-            return Err(invalid("Owned count requires one row with path, lower, upper and valid_micros"));
+        if batch.batch().num_rows() != 1 || batch.batch().num_columns() != 4 + usize::from(historical) {
+            return Err(invalid("Owned count requires one row with the fields for its action version"));
         }
         let (mut rows, _decoded) = upload::domain_documents(batch.batch(), self)?;
         let row = rows.pop().expect("validated one row");
@@ -1094,7 +1108,15 @@ impl Service {
             upper: compound_bound(Some(upper))?,
             valid_at: Timestamp(*valid),
         };
-        let (counted, evidence) = held.snapshot.count_range_observed(&relation, &path, request).await.map_err(status)?;
+        let (counted, evidence) = if historical {
+            let Some(Value::I64(system)) = row.get("system_micros") else {
+                return Err(invalid("Owned historical count requires a microsecond system cut"));
+            };
+            held.snapshot.count_range_at_system(&relation, &path, request, Timestamp(*system))
+                .await.map(|counted| (counted, None))
+        } else {
+            held.snapshot.count_range_observed(&relation, &path, request).await
+        }.map_err(status)?;
         let schema = Arc::new(Schema::new(vec![Field::new("count", DataType::UInt64, false)]));
         let batch = RecordBatch::try_new(Arc::clone(&schema), vec![Arc::new(UInt64Array::from(vec![counted.count]))]).map_err(arrow)?;
         let observed = witnessed_schema(call, &held, &relation, &schema, evidence)?;

@@ -1286,6 +1286,64 @@ impl OwnedReadSession {
         Ok((counted, evidence))
     }
 
+    /// Reads a covered ordered page at an admitted historical Root cut.
+    pub async fn range_page_by_key_at_system(
+        &self,
+        relation: &rtdb_types::OwnedRelation,
+        path: &rtdb_types::OwnedRelation,
+        request: crate::OwnedRangeRequest<'_>,
+        system: Timestamp,
+        valid: Timestamp,
+    ) -> Result<crate::OwnedRangePage> {
+        valid.next()?;
+        let context = self.ordered_root_context(relation, system).await?;
+        let page = crate::ordered_index::owned_range(
+            Arc::clone(&context), &self.owner, relation, path,
+            crate::ordered_index::RowBounds::Compound(request), Some(valid),
+        ).await?;
+        let Some((column, field)) = page.schema.column_with_name("_id") else {
+            return Err(historical_owned_read::unavailable());
+        };
+        if let Some(batch) = &page.batch {
+            let array = batch.batch().column(column).as_ref();
+            for row in 0..array.len() {
+                let bytes = rtdb_columnar::estimate_read_value_bytes(field, array, row)?;
+                let _charge = context.memory.reserve(bytes.saturating_add(4096))?;
+                let id = rtdb_columnar::read_execution_value(field, array, row)?.entity_id()?;
+                self.check_point_purge_floor(relation, &id, system).await?;
+            }
+        }
+        self.check_relation(relation)?;
+        Ok(page)
+    }
+
+    /// Counts a covered historical Root range using the erase-filtered index roots.
+    pub async fn count_range_at_system(
+        &self,
+        relation: &rtdb_types::OwnedRelation,
+        path: &rtdb_types::OwnedRelation,
+        request: crate::OwnedCountRequest<'_>,
+        system: Timestamp,
+    ) -> Result<crate::OwnedRangeCount> {
+        let context = self.ordered_root_context(relation, system).await?;
+        let result = crate::ordered_index::owned_count(context, &self.owner, relation, path, request).await?;
+        self.check_relation(relation)?;
+        Ok(result)
+    }
+
+    async fn ordered_root_context(
+        &self, relation: &rtdb_types::OwnedRelation, system: Timestamp,
+    ) -> Result<Arc<QueryContext>> {
+        rtdb_types::OwnedRelation::new(relation.name())?;
+        self.admit_root_system(relation, system).await?;
+        let context = self.relation_context(relation)?;
+        if context.current_time.as_micros()? == system {
+            Ok(context)
+        } else {
+            context.with_owned_system_cut(system, &context.cancellation)
+        }
+    }
+
     async fn range_page(
         &self, relation: &rtdb_types::OwnedRelation, path: &rtdb_types::OwnedRelation,
         bounds: crate::ordered_index::RowBounds<'_>, valid_at: Option<Timestamp>,

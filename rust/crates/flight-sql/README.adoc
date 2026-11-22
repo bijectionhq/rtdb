@@ -521,7 +521,7 @@ Its visible row must cover all valid time.
 The derived handle uses the marker's actual commit time, which must also be inside every selected relation's certified history.
 
 The response is one byte zero for a covered absent marker, or the new 16-byte handle followed by its signed 64-bit big-endian system time.
-Use the handle with ReadHeldPoint.v1, ReadHeldPoint.v2, ReadHeldValidDuring.v2, or ReadHeldVersions.v2 in the declared scope and CloseRead.v1 to release it.
+Use the handle with ReadHeldPoint.v1, ReadHeldPoint.v2, ReadHeldValidDuring.v2, ReadHeldVersions.v2, ReadHeldRange.v4, or CountHeldRange.v2 in the declared scope and CloseRead.v1 to release it.
 The default business-valid time is the selected marker time.
 The derived handle shares the original generation, lease and expiry and may serve requests after the fresh handle is closed.
 It carries no commit evidence.
@@ -539,6 +539,12 @@ It traverses the covered path at that valid instant on the held system cut and u
 When the declaration and valid instant match and `after` is absent, the exact witness protects the full requested half-open span, including a covered empty result and the unreturned part of a capped page.
 The ordered resolver validates both old and new full keys through at most 64 intervening dense journal groups.
 A group omits exact sides when its relevant IDs or keys fall outside the supported type or byte limits, or when its evidence could not be captured.
+
+`rtdb.owned.ReadHeldRange.v4` and `rtdb.owned.CountHeldRange.v2` add a `system_micros: Int64` field to v3 and v1 respectively.
+The system cut must be covered by the relation history on a fresh hold or equal the selected cut on a derived hold.
+Both actions require a covered index revision and return the requested system and valid instants in the reply metadata.
+Historical pages require the path to project `_id` for ordered erase validation.
+Historical pages and counts carry no commit witness.
 The relation-frontier check still applies to moving-valid reads, continuation reads, and reads whose exact witness or intervening coverage is unavailable.
 
 === Committing checked hosted control rows with owned facts

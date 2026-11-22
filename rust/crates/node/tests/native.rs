@@ -799,6 +799,22 @@ async fn held_owned_range_requires_a_covering_generation() {
     };
     let write = writer.state_mut().execute_tx(vec![insert], AutonomousTxOptions::default()).await.unwrap();
     assert!(write.committed(), "{:?}", write.error());
+    let declaration = TxOp::OwnedDeclarePath {
+        relation: relation.clone(), name: path.clone(), columns: vec!["priority".into(), "_id".into()],
+    };
+    let publications = OwnedRelation::new("publications").unwrap();
+    let marker = EntityId::String("head".into());
+    let publish = TxOp::OwnedInsertDocs {
+        relation: publications.clone(),
+        documents: Documents::new(
+            vec![StructFields::from([("_id".into(), marker.as_value())])], node.memory(),
+        ).unwrap(),
+        valid_from: Some(Timestamp::MIN),
+        valid_to: None,
+    };
+    let write = writer.state_mut().execute_tx(vec![declaration, publish], AutonomousTxOptions::default()).await.unwrap();
+    assert!(write.committed(), "{:?}", write.error());
+    let selected = write.tx_key().system_time;
     let correction = TxOp::OwnedReplaceDocs {
         relation: relation.clone(),
         documents: Documents::new(vec![StructFields::from([
@@ -807,11 +823,6 @@ async fn held_owned_range_requires_a_covering_generation() {
         valid_from: Some(Timestamp(10)), valid_to: Some(Timestamp(20)),
     };
     let write = writer.state_mut().execute_tx(vec![correction], AutonomousTxOptions::default()).await.unwrap();
-    assert!(write.committed(), "{:?}", write.error());
-    let declaration = TxOp::OwnedDeclarePath {
-        relation: relation.clone(), name: path.clone(), columns: vec!["priority".into(), "_id".into()],
-    };
-    let write = writer.state_mut().execute_tx(vec![declaration], AutonomousTxOptions::default()).await.unwrap();
     assert!(write.committed(), "{:?}", write.error());
     let held = writer.open_owned_read().await.unwrap();
     let failure = held.range(&relation, &path, None, None, 2).await.err().unwrap();
@@ -864,6 +875,28 @@ async fn held_owned_range_requires_a_covering_generation() {
             Value::I64(next),
         );
     }
+    let old = held.derive_as_of(
+        selected, &publications, &marker, vec![publications.clone(), relation.clone()],
+    ).await.unwrap().unwrap();
+    for cut in [&held, &old] {
+        let valid = Timestamp(10);
+        let request = rtdb_node::OwnedRangeRequest {
+            lower: Some(&lower), upper: Some(&upper), after: None, descending: false, limit: 1,
+        };
+        let page = cut.range_page_by_key_at_system(&relation, &path, request, selected, valid).await.unwrap();
+        let batch = page.batch.unwrap();
+        assert_eq!(batch.batch().num_rows(), 1);
+        assert_eq!(
+            rtdb_columnar::read_value(page.schema.field(1), batch.batch().column(1).as_ref(), 0).unwrap(),
+            Value::I64(1),
+        );
+        let request = rtdb_node::OwnedCountRequest {
+            lower: Some(&lower), upper: Some(&upper), valid_at: valid,
+        };
+        let result = cut.count_range_at_system(&relation, &path, request, selected).await.unwrap();
+        assert_eq!((result.count, result.present, result.valid_at), (2, selected, valid));
+    }
+    drop(old);
     drop(held);
     drop(writer);
     stop(&node, driver).await;
