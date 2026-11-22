@@ -24,6 +24,7 @@ use crate::{
     upload, wire,
 };
 
+pub(crate) const DECLARE_OWNED_UNIQUE_PATH_V1: &str = "rtdb.owned.DeclareUniquePath.v1";
 pub(crate) const DECLARE_OWNED_SEARCH_PATH_V1: &str = "rtdb.owned.DeclareSearchPath.v1";
 pub(crate) const DECLARE_OWNED_RELATION_V1: &str = "rtdb.owned.DeclareRelation.v1";
 pub(crate) const DECLARE_OWNED_PATH_V1: &str = "rtdb.owned.DeclarePath.v1";
@@ -187,19 +188,25 @@ impl Service {
         self.owned_write_reply(call, vec![TxOp::OwnedDeclarePath { relation, name, columns }]).await
     }
 
-    pub(crate) async fn declare_owned_search_path_action(&self, call: &Call, body: &[u8]) -> Result<ActionResult, Status> {
+    pub(crate) async fn declare_owned_single_column_path_action(&self, call: &Call, body: &[u8], unique: bool) -> Result<ActionResult, Status> {
         if !self.0.config.owned_native_actions { return Err(unsupported()); }
         let (relation, arrow) = split_relation(body)?;
         let batch = request_batch(call, arrow)?;
         if batch.batch().num_rows() != 1 || batch.batch().num_columns() != 2 {
-            return Err(invalid("Owned search path declaration requires one row with _id and column"));
+            return Err(invalid("Owned path declaration requires one row with _id and column"));
         }
         let (rows, _decoded) = upload::documents(batch.batch(), self)?;
         let (Some(Value::Utf8(name)), Some(Value::Utf8(column))) = (rows[0].get("_id"), rows[0].get("column")) else {
-            return Err(invalid("Owned search path declaration requires a text name and column"));
+            return Err(invalid("Owned path declaration requires a text name and column"));
         };
         let name = OwnedRelation::new(name.as_str()).map_err(status)?;
-        self.owned_write_reply(call, vec![TxOp::OwnedDeclareSearchPath { relation, name, column: column.clone() }]).await
+        let column = column.clone();
+        let operation = if unique {
+            TxOp::OwnedDeclareUniquePath { relation, name, column }
+        } else {
+            TxOp::OwnedDeclareSearchPath { relation, name, column }
+        };
+        self.owned_write_reply(call, vec![operation]).await
     }
 
     pub(crate) async fn create_owned_action(&self, call: &Call, body: &[u8]) -> Result<ActionResult, Status> {

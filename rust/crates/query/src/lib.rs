@@ -58,4 +58,4 @@ fn cardinality_violation() -> rtdb_types::Anomaly {
 }
 
 mod owned_relation;
-pub use owned_relation::{open_owned_path_catalog, open_owned_point, open_owned_relation_schema, owned_row_revision, read_owned_parent_schemas, read_owned_world};
+pub use owned_relation::{open_owned_path_catalog, open_owned_point, open_owned_relation_schema, open_owned_unique_point, owned_row_revision, read_owned_parent_schemas, read_owned_world};

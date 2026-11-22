@@ -20,6 +20,16 @@ pub async fn open_owned_point(
     open_private_point(context, relation.table(owner), id, valid, columns).await
 }
 
+/// Reads one full identity in a relation's private uniqueness table.
+pub async fn open_owned_unique_point(
+    context: Arc<QueryContext>, owner: &str, relation: &OwnedRelation, id: &EntityId, columns: &[&str],
+) -> Result<Option<QueryCursor>> {
+    if owner.is_empty() {
+        return Err(Anomaly::incorrect("rtdb.owned/no-owner", "Owned relations require an authenticated principal"));
+    }
+    open_private_point(context, relation.unique_table(owner), id, None, Some(columns)).await
+}
+
 pub async fn open_owned_relation_schema(
     context: Arc<QueryContext>, owner: &str, relation: &OwnedRelation,
 ) -> Result<Option<QueryCursor>> {

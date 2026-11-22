@@ -383,6 +383,61 @@ async fn held_owned_point_reads_an_explicit_valid_instant_at_the_original_system
 }
 
 #[tokio::test]
+async fn ordered_owned_unique_groups_swaps_and_refuses_conflicts() {
+    use rtdb_types::{EntityId, OwnedRelation};
+
+    let mut settings = options();
+    settings.owned_relations = true;
+    let (node, driver) = running(settings, services()).await;
+    let mut session = node.session("xtdb", Arc::new(Authority)).unwrap();
+    let relation = OwnedRelation::new("unique-orders").unwrap();
+    let declaration = TxOp::OwnedDeclareUniquePath {
+        relation: relation.clone(), name: OwnedRelation::new("order-key").unwrap(), column: "canonical".into(),
+    };
+    assert!(session.state_mut().execute_tx(vec![declaration], AutonomousTxOptions::default()).await.unwrap().committed());
+    let documents = |id, key| Documents::new(vec![StructFields::from([
+        ("_id".into(), Value::I64(id)), ("canonical".into(), Value::Binary(vec![key])),
+    ])], node.memory()).unwrap();
+    let insert = |id, key| TxOp::OwnedInsertDocs {
+        relation: relation.clone(), documents: documents(id, key), valid_from: None, valid_to: None,
+    };
+    let replace = |id, key, valid_to| TxOp::OwnedReplaceDocs {
+        relation: relation.clone(), documents: documents(id, key), valid_from: None, valid_to,
+    };
+    let written = session.state_mut().execute_tx(vec![insert(1, 1), insert(2, 2)], AutonomousTxOptions::default()).await.unwrap();
+    assert!(written.committed(), "{:?}", written.error());
+    let conflict = session.state_mut().execute_tx(vec![replace(1, 2, None)], AutonomousTxOptions::default()).await.unwrap();
+    let error = conflict.error().unwrap();
+    assert_eq!(error.code, "rtdb.owned/unique-taken");
+    assert!(error.context.is_empty());
+    let conflict = session.state_mut().execute_tx(vec![replace(1, 3, None), replace(2, 3, None)], AutonomousTxOptions::default()).await.unwrap();
+    assert_eq!(conflict.error().unwrap().code, "rtdb.owned/unique-taken");
+
+    let swap = session.state_mut().execute_tx(vec![replace(2, 1, None), replace(1, 2, None)], AutonomousTxOptions::default()).await.unwrap();
+    assert!(swap.committed(), "{:?}", swap.error());
+    let held = session.open_owned_read().await.unwrap();
+    let key = rows(held.open_point(&relation, &EntityId::Integer(2)).await.unwrap().unwrap()).await;
+    assert_eq!(key[0][1], Value::Binary(vec![1]));
+    drop(held);
+
+    let invalid = session.state_mut().execute_tx(
+        vec![replace(1, 4, Some(Timestamp(i64::MAX - 1)))], AutonomousTxOptions::default(),
+    ).await.unwrap();
+    assert_eq!(invalid.error().unwrap().code, "rtdb.owned/unique-valid-time");
+    let release = TxOp::OwnedDelete {
+        relation: relation.clone(), id: EntityId::Integer(2), valid_from: None, valid_to: None,
+    };
+    let transfer = session.state_mut().execute_tx(vec![insert(3, 1), release], AutonomousTxOptions::default()).await.unwrap();
+    assert!(transfer.committed(), "{:?}", transfer.error());
+    let private = relation.unique_table("xtdb");
+    let query = format!("SELECT holder FROM {}.\"{}\"", private.schema, private.table);
+    assert!(session.query_sql(&query, vec![]).await.is_err());
+
+    drop(session);
+    stop(&node, driver).await;
+}
+
+#[tokio::test]
 async fn held_owned_range_requires_a_covering_generation() {
     use rtdb_types::OwnedRelation;
 
