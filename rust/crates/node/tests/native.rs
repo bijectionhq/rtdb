@@ -495,7 +495,7 @@ async fn held_owned_valid_during_clips_winners_and_omits_deleted_windows() {
     assert!(writer.state_mut().execute_tx(vec![delete(60, 90)], AutonomousTxOptions::default()).await.unwrap().committed());
 
     let valid = Interval::from_micros(10, 70).unwrap();
-    let mut history = held.open_valid_during_observed(&relation, &id, valid).await.unwrap();
+    let mut history = held.open_valid_during_observed(&relation, &id, valid, held.system_time()).await.unwrap();
     assert!(history.witness().is_err());
     let mut actual = Vec::new();
     while let Some(batch) = history.next_batch().await.unwrap() {
@@ -521,7 +521,7 @@ async fn held_owned_valid_during_clips_winners_and_omits_deleted_windows() {
     assert!(history.witness().unwrap().is_none(), "standalone holds do not issue ordered witnesses");
     drop(history);
     let missing = EntityId::Integer(2);
-    let mut absent = held.open_valid_during_observed(&relation, &missing, valid).await.unwrap();
+    let mut absent = held.open_valid_during_observed(&relation, &missing, valid, held.system_time()).await.unwrap();
     assert!(absent.witness().is_err());
     assert!(absent.next_batch().await.unwrap().is_none());
     assert!(absent.witness().unwrap().is_none());
@@ -4579,7 +4579,7 @@ async fn merged_held_changes_resume_only_after_whole_visible_commits() {
 
 #[tokio::test]
 async fn derived_owned_root_points_use_the_visible_marker_and_a_closed_scope() {
-    use rtdb_types::{EntityId, OwnedRelation};
+    use rtdb_types::{EntityId, Interval, OwnedRelation};
 
     let mut settings = options();
     settings.owned_relations = true;
@@ -4611,6 +4611,14 @@ async fn derived_owned_root_points_use_the_visible_marker_and_a_closed_scope() {
     let old = fresh.derive_as_of(intermediate.system_time, &publications, &marker, scope)
         .await.unwrap().unwrap();
     assert_eq!(old.system_time(), first.tx_key().system_time);
+    let mut timeline = fresh.open_valid_during_observed(
+        &facts, &fact, Interval::ALL, old.system_time(),
+    ).await.unwrap();
+    let first_batch = timeline.next_batch().await.unwrap().unwrap();
+    assert_eq!(first_batch.batch().num_rows(), 1);
+    assert!(timeline.next_batch().await.unwrap().is_none());
+    assert!(timeline.witness().unwrap().is_none());
+    drop(timeline);
     drop(fresh);
     assert!(old.open_point(&other, &fact).await.is_err());
     assert!(old.changes(&facts, Timestamp::MIN, 1).await.is_err());
@@ -4621,6 +4629,15 @@ async fn derived_owned_root_points_use_the_visible_marker_and_a_closed_scope() {
     let field = batch.batch().schema_ref().field(index);
     assert_eq!(rtdb_columnar::read_value(field, batch.batch().column(index).as_ref(), 0).unwrap(), Value::I64(1));
     drop(cursor);
+
+    assert!(old.open_valid_during_observed(&other, &fact, Interval::ALL, old.system_time()).await.is_err());
+    assert!(old.open_valid_during_observed(&facts, &fact, Interval::ALL, second.tx_key().system_time).await.is_err());
+    let mut timeline = old.open_valid_during_observed(&facts, &fact, Interval::ALL, old.system_time()).await.unwrap();
+    let historical = timeline.next_batch().await.unwrap().unwrap();
+    assert_eq!(historical.batch(), first_batch.batch());
+    assert!(timeline.next_batch().await.unwrap().is_none());
+    assert!(timeline.witness().unwrap().is_none());
+    drop(timeline);
     drop(old);
     drop(session);
     stop(&node, driver).await;

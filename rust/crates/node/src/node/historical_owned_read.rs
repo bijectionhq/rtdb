@@ -15,7 +15,7 @@ pub(super) struct Scope {
 const MAX_SCOPE_RELATIONS: usize = 32;
 
 impl OwnedReadSession {
-    /// Opens an independent point-only hold at the last visible marker in this captured generation.
+    /// Opens an independent read-only hold at the last visible marker in this captured generation.
     pub async fn derive_as_of(
         &self,
         requested: Timestamp,
@@ -67,8 +67,11 @@ impl OwnedReadSession {
             self.check()?;
             return Ok(None);
         };
-        if selected > requested || floor.is_some_and(|floor| selected < floor) {
+        if selected > requested {
             return Err(unavailable());
+        }
+        if let Some(floor) = floor.filter(|floor| selected < *floor) {
+            return Err(below_floor(floor));
         }
         self.check_point_purge_floor(publication, marker, selected).await?;
         let context = self
@@ -154,4 +157,13 @@ pub(super) fn unavailable() -> Anomaly {
         "rtdb.owned/historical-uncovered",
         "The held scope cannot certify this historical root cut",
     )
+}
+
+pub(super) fn below_floor(floor: Timestamp) -> Anomaly {
+    Anomaly::new(
+        AnomalyCategory::Unavailable,
+        "rtdb.owned/history-floor",
+        "The requested system cut precedes the certified owned history floor",
+    )
+    .with_context("history-floor-micros", floor.0.into())
 }

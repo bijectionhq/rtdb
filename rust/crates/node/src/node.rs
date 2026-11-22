@@ -901,6 +901,7 @@ pub struct OwnedValidHistory<'a> {
     held: &'a OwnedReadSession,
     relation: &'a rtdb_types::OwnedRelation,
     cursor: Option<QueryCursor>,
+    at_head: bool,
     complete: bool,
     failed: bool,
 }
@@ -927,7 +928,12 @@ impl OwnedValidHistory<'_> {
         if !self.complete || self.failed {
             return Err(Anomaly::fault("rtdb.owned/history-read", "Owned history must complete before issuing evidence"));
         }
-        self.held.relation_witness(self.relation)
+        if self.at_head {
+            self.held.relation_witness(self.relation)
+        } else {
+            self.held.check()?;
+            Ok(None)
+        }
     }
 }
 
@@ -1071,20 +1077,33 @@ impl OwnedReadSession {
         self.check()
     }
 
-    /// Returns the typed identity's winning valid slices at this held system cut.
-    pub async fn open_valid_during(
-        &self, relation: &rtdb_types::OwnedRelation, id: &rtdb_types::EntityId, valid: rtdb_types::Interval,
-    ) -> Result<Option<QueryCursor>> {
-        self.admit_read().await?;
-        rtdb_query::open_owned_valid_during(Arc::clone(&self.context), &self.owner, relation, id, valid).await
-    }
-
+    /// Reads the winning valid slices at an admitted system cut of this root hold.
     pub async fn open_valid_during_observed<'a>(
-        &'a self, relation: &'a rtdb_types::OwnedRelation, id: &rtdb_types::EntityId,
+        &'a self,
+        relation: &'a rtdb_types::OwnedRelation,
+        id: &rtdb_types::EntityId,
         valid: rtdb_types::Interval,
+        system: Timestamp,
     ) -> Result<OwnedValidHistory<'a>> {
-        let cursor = self.open_valid_during(relation, id, valid).await?;
-        Ok(OwnedValidHistory { held: self, relation, cursor, complete: false, failed: false })
+        self.admit_access().await?;
+        let at_head = self.historical.is_none() && system == self.present.system_time;
+        if let Some(scope) = &self.historical {
+            if system != scope.system_time || !scope.relations.contains(relation) {
+                return Err(historical_owned_read::unavailable());
+            }
+        } else if !at_head {
+            self.certify_historical_cut(relation, system).await?;
+        }
+        if !at_head {
+            self.check_point_purge_floor(relation, id, system).await?;
+        }
+        let cursor = rtdb_query::open_owned_valid_during_at(
+            Arc::clone(&self.context), &self.owner, relation, id, valid, system,
+        ).await?;
+        self.check()?;
+        Ok(OwnedValidHistory {
+            held: self, relation, cursor, at_head, complete: false, failed: false,
+        })
     }
 
     /// Computes the visible corpus of one covered clear-text path at this read's cut.

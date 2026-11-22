@@ -53,14 +53,6 @@ fn owned_context_at_system(context: Arc<QueryContext>, system: Timestamp) -> Res
     }
 }
 
-/// Returns the held system point's winning rows across a clipped business-valid window.
-pub async fn open_owned_valid_during(
-    context: Arc<QueryContext>, owner: &str, relation: &OwnedRelation, id: &EntityId, valid: Interval,
-) -> Result<Option<QueryCursor>> {
-    let system = context.current_time.as_micros()?;
-    open_owned_valid_during_at(context, owner, relation, id, valid, system).await
-}
-
 /// Reads a certified earlier system point without replacing the retained physical catalog.
 pub async fn open_owned_valid_during_at(
     context: Arc<QueryContext>, owner: &str, relation: &OwnedRelation, id: &EntityId,

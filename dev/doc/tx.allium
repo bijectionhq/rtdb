@@ -86,16 +86,16 @@
 -- An empty owned root relation may declare an immutable cap for each distinct fixed-length prefix of its binary fact key.
 -- The ordered resolver validates the final prefix memberships and commits covered counter deltas with the current-valid fact changes.
 -- World writes to a governed root refuse without inherited capacity accounting.
--- A fresh held read can derive a scoped point hold at the actual last visible publication marker.
+-- A fresh held read can derive a scoped read-only hold at the actual last visible publication marker.
 -- Each declared relation's retained floor covers both the requested and selected system coordinates.
--- The derived hold shares the original generation and lease and admits point reads only in its fixed root scope.
+-- The derived hold shares the original generation and lease and admits point and valid-window reads in its fixed root scope.
 
 -- A declared fixed-valid Binary and Utf8 identity path journals both old and new covered keys at the authored instant.
 -- A held full-span fixed witness permits intervening relation writes only when every covered journal side lies outside its bounds.
 -- Missing exact evidence leaves relation-frontier validation in force.
 -- Held reads require the original session and attachment and refuse after expiry, lease loss, or closure.
--- A held root valid window returns ordered non-overlapping winning slices clipped at the requested endpoints.
--- Fully covered range counts and completed valid windows can issue relation-frontier evidence under the same placed lease as range pages.
+-- At the admitted system cut, a held root valid window returns ordered non-overlapping winning slices clipped at the requested endpoints.
+-- Fully covered range counts and completed head valid windows can issue relation-frontier evidence under the same placed lease as range pages.
 -- Held system versions seek both window edges in the relation's ordered change journal and verify its event frontier.
 -- Both directions advance past every scanned source group, including groups with no change to the requested identity.
 -- A placed read can receive a conservative relation witness after rendering the complete version page.

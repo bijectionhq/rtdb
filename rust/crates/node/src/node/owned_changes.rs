@@ -11,7 +11,7 @@ use rtdb_types::{
 
 use super::{
     OwnedChangePage, OwnedReadSession, OwnedVersion, OwnedVersionOrder, OwnedVersionPage,
-    OwnedVersionRequest,
+    OwnedVersionRequest, historical_owned_read,
 };
 
 pub const OWNED_MERGED_CHANGE_RELATIONS: usize = 32;
@@ -232,16 +232,23 @@ impl OwnedReadSession {
         relation: &OwnedRelation,
         at: Timestamp,
     ) -> Result<Option<Timestamp>> {
+        if at > self.present.system_time {
+            return Err(change_feed_uncovered());
+        }
         let database = self.context.catalog.database(&self.database)?;
         let [snapshot] = database.partitions.as_slice() else {
             return Err(change_feed_uncovered());
         };
-        let Some(covered) = self.covered_journal(snapshot, relation, at).await? else {
+        let Some(covered) = self.covered_journal(snapshot, relation, self.present.system_time).await? else {
             return Ok(None);
         };
+        let floor = (covered.floor.through_events != 0).then_some(covered.floor.committed_at);
+        if let Some(floor) = floor.filter(|floor| at < *floor) {
+            return Err(historical_owned_read::below_floor(floor));
+        }
         self.require_journal_head(relation, covered.head_revision, covered.head)
             .await?;
-        Ok((covered.floor.through_events != 0).then_some(covered.floor.committed_at))
+        Ok(floor)
     }
 
     pub(super) async fn covered_range_anchor(

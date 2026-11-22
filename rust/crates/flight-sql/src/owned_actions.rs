@@ -102,7 +102,7 @@ pub(crate) const OPEN_OWNED_READ_V1: &str = "rtdb.owned.OpenRead.v1";
 pub(crate) const HELD_OWNED_POINT_V1: &str = "rtdb.owned.ReadHeldPoint.v1";
 pub(crate) const HELD_OWNED_POINT_V2: &str = "rtdb.owned.ReadHeldPoint.v2";
 pub(crate) const HELD_OWNED_HISTORICAL_POINT_V1: &str = "rtdb.owned.ReadHeldHistoricalPoint.v1";
-pub(crate) const HELD_OWNED_VALID_DURING_V1: &str = "rtdb.owned.ReadHeldValidDuring.v1";
+pub(crate) const HELD_OWNED_VALID_DURING_V2: &str = "rtdb.owned.ReadHeldValidDuring.v2";
 pub(crate) const HELD_OWNED_VERSIONS_V2: &str = "rtdb.owned.ReadHeldVersions.v2";
 pub(crate) const CLOSE_OWNED_READ_V1: &str = "rtdb.owned.CloseRead.v1";
 pub(crate) const READ_WORLD_POINT_V1: &str = "rtdb.owned.ReadWorldPoint.v1";
@@ -679,8 +679,8 @@ impl Service {
         let (relation, arrow_bytes) = split_relation(request)?;
         let batch = request_batch(call, arrow_bytes)?;
         let batch = batch.batch();
-        if batch.num_columns() != 3 || batch.num_rows() != 1 {
-            return Err(invalid("Owned history requires one row with _id and two valid endpoints"));
+        if batch.num_columns() != 4 || batch.num_rows() != 1 {
+            return Err(invalid("Owned history requires one row with _id, a system cut and two valid endpoints"));
         }
         let (id, _identity) = point_identity(call, batch)?;
         let from = history_request_endpoint(batch, "valid_from_micros")?;
@@ -688,10 +688,10 @@ impl Service {
         let valid = Interval::new(from, to).map_err(status)?;
         if valid.is_empty() { return Err(invalid("Owned history requires a nonempty valid window")); }
 
-        let present = held.snapshot.present().system_time;
-        let history = held.snapshot.open_valid_during_observed(&relation, &id, valid).await.map_err(status)?;
+        let system = history_request_endpoint(batch, "system_micros")?;
+        let history = held.snapshot.open_valid_during_observed(&relation, &id, valid, system).await.map_err(status)?;
         let read = HistoryRead::Observed { read: history, held: &held, relation: &relation };
-        let reply = self.history_reply(call, &id, read, valid, present, None).await?;
+        let reply = self.history_reply(call, &id, read, valid, system, None).await?;
         held.snapshot.check().map_err(status)?;
         Ok(reply)
     }

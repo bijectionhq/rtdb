@@ -350,16 +350,16 @@ A successful declaration returns the same transaction-key Arrow row as Create.
 
 === Reading valid history at a held cut
 
-`rtdb.owned.ReadHeldValidDuring.v1` takes a 16-byte held handle, the relation prefix, and one terminated Arrow IPC stream.
-The stream contains one batch with one row and fields `_id`, `valid_from_micros: Int64`, and `valid_to_micros: Int64`.
-Both endpoints must be non-null, with the start strictly before the end.
+`rtdb.owned.ReadHeldValidDuring.v2` takes a 16-byte held handle, the relation prefix, and one terminated Arrow IPC stream.
+The stream contains one batch with one row and fields `_id`, `system_micros: Int64`, `valid_from_micros: Int64`, and `valid_to_micros: Int64`.
+The system cut and both valid endpoints must be non-null, with the valid start strictly before the valid end.
 One result contains a schema and zero or more record batches of the winning facts in ascending valid-time order.
 The `_valid_from` and `_valid_to` timestamps clip each slice to the request. A null `_valid_to` represents an unbounded end.
 Each row includes `_system_from`, the winning revision. Gaps and tombstones have no row.
 Schema metadata reports `rtdb.owned.present_micros`, `rtdb.owned.valid_from_micros`, and `rtdb.owned.valid_to_micros`.
-A read requires the original held root cut and refuses more than 4096 slices or an oversized Flight result.
+The returned present metadata identifies the system cut used for the read. A fresh hold can use its own cut or an earlier certified cut. A derived hold uses its selected cut and declared relations. Reads refuse more than 4096 slices or an oversized Flight result.
 
-On placed writer sessions with retained leases, a fully completed held valid window carries the same optional `rtdb.owned.range_witness` nonce as covered ranges, including a proven empty window.
+On placed writer sessions with retained leases, a fully completed valid window at the held head carries the same optional `rtdb.owned.range_witness` nonce as covered ranges, including a proven empty window.
 A fully covered held count also carries that nonce, including zero counts.
 The nonce depends on the entire relation's frontier at the held cut and retains the original session, placement and expiry.
 
@@ -482,7 +482,7 @@ Its visible row must cover all valid time.
 The derived handle uses the marker's actual commit time, which must also be inside every selected relation's certified history.
 
 The response is one byte zero for a covered absent marker, or the new 16-byte handle followed by its signed 64-bit big-endian system time.
-Use the handle with ReadHeldPoint.v1 or ReadHeldPoint.v2 for points in the declared scope and CloseRead.v1 to release it.
+Use the handle with ReadHeldPoint.v1, ReadHeldPoint.v2, or ReadHeldValidDuring.v2 in the declared scope and CloseRead.v1 to release it.
 The default business-valid time is the selected marker time.
 The derived handle shares the original generation, lease and expiry and may serve requests after the fresh handle is closed.
 It carries no commit evidence.
