@@ -84,7 +84,7 @@ pub(crate) use writable_world::WorldPoint;
 pub use read_world::{CheckpointPoint, CheckpointReadResources, CheckpointReadWorld, read_checkpoint_owned_point};
 pub(crate) use retirement::{finish_capture_retirement, obsolete_fork_input, require_capture_open, retire_capture, retire_obsolete_fork_input};
 pub use reader::{StagedReaderSettings, serve_staged_checkpoint};
-pub(crate) use reader::{StageOwnedRelations, StageSelector, inspect_staged_owned_relations, stream_staged_owned_event_files, tunnel_staged_checkpoint};
+pub(crate) use reader::{verify_checkpoint_transfer_target, StageOwnedRelations, StageSelector, inspect_staged_owned_relations, stream_staged_owned_event_files, tunnel_staged_checkpoint};
 
 const MAXIMUM_BYTES: u64 = 1 << 30;
 const MAXIMUM_MANIFEST_BYTES: u64 = 16 << 20;
@@ -1309,6 +1309,16 @@ async fn read_archive_lifetime_floors(
     Ok(floors)
 }
 
+async fn archive_lifetime_floors_digest(
+    context: Arc<rtdb_query::QueryContext>, basis: rtdb_types::TransactionKey,
+) -> Result<[u8; 32]> {
+    let floors = read_archive_lifetime_floors(context, basis).await?;
+    let records: Vec<_> = floors.into_iter().map(|(table, floor)|
+        (table, floor.duration, floor.expired_created_through, floor.swept_present_through)
+    ).collect();
+    Ok(sha256(&encode(&records)?))
+}
+
 /// Complete an already ordered source transfer fence. The result is a
 /// retained source receipt, and does not activate or release either residence.
 pub(crate) async fn seal_checkpoint_transfer(
@@ -1366,12 +1376,7 @@ pub(crate) async fn seal_checkpoint_transfer(
         CheckpointReadResources { node: &node, memory: &memory, cache, cancellation: &cancellation },
         Some(read_world::TerminalReplay { fence, entries: &entries }),
         |context, basis| async move {
-            let floors = read_archive_lifetime_floors(context, basis).await?;
-            let records: Vec<_> = floors.into_iter().map(|(table, floor)|
-                (table, floor.duration, floor.expired_created_through, floor.swept_present_through)
-            ).collect();
-            let bytes = encode(&records)?;
-            Ok((basis, sha256(&bytes)))
+            Ok((basis, archive_lifetime_floors_digest(context, basis).await?))
         },
     ).await?;
     directory.record_checkpoint_transfer_terminal(&rtdb_directory::CheckpointTransferTerminal {
