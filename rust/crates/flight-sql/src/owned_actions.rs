@@ -160,6 +160,14 @@ pub(crate) const DROP_WORLD_V1: &str = "rtdb.owned.DropWorld.v1";
 pub(crate) const FORK_WORLD_V1: &str = "rtdb.owned.ForkWorld.v1";
 pub(crate) const FORK_WORLD_V2: &str = "rtdb.owned.ForkWorld.v2";
 pub(crate) const COMMIT_WORLD_V1: &str = "rtdb.owned.CommitWorld.v1";
+#[derive(Clone, Copy)]
+pub(crate) enum WorldCommitFormat {
+    Overlay,
+    ConditionedOverlay,
+    Validation,
+}
+
+pub(crate) const COMMIT_WORLD_V3: &str = "rtdb.owned.CommitWorld.v3";
 pub(crate) const COMMIT_WORLD_V2: &str = "rtdb.owned.CommitWorld.v2";
 const MAX_WORLD_WITNESSES: usize = 128;
 const WORLD_POINT_WITNESS: &str = "rtdb.owned.world_point_witness";
@@ -552,8 +560,18 @@ impl Service {
         let mut writes = vec![TxOp::OwnedDeadline { until: deadline }];
         writes.extend(condition);
         let _facts = self.decode_owned_commit_groups(call, facts, &mut writes, &mut rows_left, false)?;
-        let mut held = Vec::with_capacity(controls.len());
-        for (relation, arrow) in controls {
+        let (controls, _held) = self.decode_hosted_control_groups(call, controls, scope, &mut rows_left, false)?;
+        writes.extend(controls.into_iter().map(TxOp::HostedControl));
+        self.owned_write_reply_with_witnesses(call, writes, witnesses).await
+    }
+
+    fn decode_hosted_control_groups(
+        &self, call: &Call, groups: Vec<(OwnedRelation, &[u8])>, scope: rtdb_types::PlacedAttemptScope,
+        rows_left: &mut usize, require_checks: bool,
+    ) -> Result<(Vec<rtdb_tx::HostedControlWrite>, Vec<(Arc<MemoryReservation>, Arc<MemoryReservation>)>), Status> {
+        let mut held = Vec::with_capacity(groups.len());
+        let mut controls = Vec::new();
+        for (relation, arrow) in groups {
             let batch = request_batch(call, arrow)?;
             let rows = batch.batch().num_rows();
             let schema = batch.batch().schema_ref();
@@ -565,9 +583,9 @@ impl Service {
             {
                 return Err(invalid("Hosted controls require distinct fields, Utf8 IDs and explicit Int64 expectations"));
             }
-            rows_left = rows_left.checked_sub(rows).ok_or_else(|| invalid("Hosted commit exceeds its total row limit"))?;
+            *rows_left = rows_left.checked_sub(rows).ok_or_else(|| invalid("Hosted commit exceeds its total row limit"))?;
             let reservation = call.reserve(wire::mul(rows, std::mem::size_of::<TxOp>() + 512)?)?;
-            writes.try_reserve_exact(rows).map_err(|_| Status::resource_exhausted("Hosted control allocation failed"))?;
+            controls.try_reserve_exact(rows).map_err(|_| Status::resource_exhausted("Hosted control allocation failed"))?;
             let (rows, documents) = upload::owned_documents(batch.batch(), self)?;
             for mut row in rows {
                 strip_owned_absence(&mut row)?;
@@ -581,16 +599,17 @@ impl Service {
                     None => false,
                     _ => return Err(invalid("Hosted control check flag must be Boolean")),
                 };
+                if require_checks && !check_only { return Err(invalid("World validation permits only hosted control checks")); }
                 let control = if check_only {
                     rtdb_tx::HostedControlWrite::check(relation.clone(), scope, expected, row)
                 } else {
                     rtdb_tx::HostedControlWrite::new(relation.clone(), scope, expected, row)
                 }.map_err(status)?;
-                writes.push(TxOp::HostedControl(control));
+                controls.push(control);
             }
             held.push((reservation, documents));
         }
-        self.owned_write_reply_with_witnesses(call, writes, witnesses).await
+        Ok((controls, held))
     }
 
     async fn commit_owned(&self, call: &Call, body: &[u8], format: CommitFormat, witnesses: Witnesses, erase_allowed: bool, condition: Option<TxOp>) -> Result<ActionResult, Status> {
@@ -1557,7 +1576,7 @@ impl Service {
         Ok(ActionResult { body: wire::retain(Bytes::copy_from_slice(world.as_bytes()), reply_charge) })
     }
 
-    pub(crate) async fn commit_world_action(&self, call: &Call, body: &[u8], conditional: bool) -> Result<ActionResult, Status> {
+    pub(crate) async fn commit_world_action(&self, call: &Call, body: &[u8], format: WorldCommitFormat) -> Result<ActionResult, Status> {
         use rtdb_node::OwnedWorldWrite;
         use rtdb_types::{Interval, WorldShadow};
 
@@ -1565,7 +1584,13 @@ impl Service {
         let host = self.0.config.owned_world_host.as_ref().ok_or_else(unsupported)?;
         let (world, groups) = body.split_first_chunk::<16>().ok_or_else(|| invalid("Owned world commit has no world UUID"))?;
         let world = Uuid::from_bytes(*world);
-        let (held, checks, _condition_charge, groups) = if conditional {
+        let (deadline, groups) = if matches!(format, WorldCommitFormat::Validation) {
+            let (deadline, groups) = groups.split_first_chunk::<8>().ok_or_else(|| invalid("Owned world validation has no deadline"))?;
+            (Some(Timestamp(i64::from_be_bytes(*deadline))), groups)
+        } else {
+            (None, groups)
+        };
+        let (held, checks, _condition_charge, groups) = if !matches!(format, WorldCommitFormat::Overlay) {
             let (handle, rest) = groups.split_first_chunk::<16>().ok_or_else(|| invalid("Owned world commit has no held handle"))?;
             let (count, rest) = rest.split_first_chunk::<2>().ok_or_else(|| invalid("Owned world commit has no witness count"))?;
             let count = usize::from(u16::from_be_bytes(*count));
@@ -1583,7 +1608,20 @@ impl Service {
         let _framing = call.reserve(MAX_COMMIT_GROUPS * 512)?;
         let mut writes = Vec::new();
         let mut reservations = Vec::new();
-        for (relation, arrow) in owned_groups(groups, true, false)? {
+        let (control_checks, _control_charges, groups) = if matches!(format, WorldCommitFormat::Validation) {
+            let policy = self.hosted_control_policy(call)?;
+            let groups = owned_groups(groups, true, false)?;
+            hosted_control::admit_control_targets(policy, groups.iter().map(|(relation, _)| relation))?;
+            let scope = self.hosted_control_scope(call).await?;
+            let mut rows_left = MAX_GROUPED_COMMIT_ROWS - checks.len();
+            let (controls, charges) = self.decode_hosted_control_groups(
+                call, groups, scope, &mut rows_left, true,
+            )?;
+            (controls, charges, Vec::new())
+        } else {
+            (Vec::new(), Vec::new(), owned_groups(groups, true, false)?)
+        };
+        for (relation, arrow) in groups {
             let batch = request_batch(call, arrow)?;
             let batch = batch.batch();
             let schema = batch.schema_ref();
@@ -1633,7 +1671,7 @@ impl Service {
         if let Some(held) = held.as_ref() { held.snapshot.check().map_err(status)?; }
         let committed = host.commit_world(
             crate::WorldCall { node: &self.0.node, attachment: &attachment, session: &mut session, cancellation: &call.cancellation },
-            world, writes, checks,
+            world, writes, checks, control_checks, deadline,
         ).await.map_err(status)?;
         self.owned_tx_reply(committed)
     }

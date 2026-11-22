@@ -1030,9 +1030,17 @@ impl OwnedReadSession {
             }
         }
         context.check_cancelled()?;
-        let witness = self.witness_scope.filter(|_| observed).map(|scope| OwnedWorldPointWitness {
-            world, relation, id: id.clone(), valid_at, local_revision, scope, until: self.witness_until,
-        });
+        let witness = if let Some(scope) = self.witness_scope.filter(|_| observed) {
+            let root = relation.root_relation().ok_or_else(rtdb_types::OwnedWorld::unavailable)?;
+            let database = self.context.catalog.database(&self.database)?;
+            let [snapshot] = database.partitions.as_slice() else { return Err(rtdb_types::OwnedWorld::unavailable()); };
+            let purge_frontier = snapshot.relation_event_frontier(&root.purge_table(&self.owner))?;
+            Some(OwnedWorldPointWitness {
+                world, relation, id: id.clone(), valid_at, local_revision, purge_frontier, scope, until: self.witness_until,
+            })
+        } else {
+            None
+        };
         Ok(OwnedWorldShadowRead { row, witness })
     }
 
@@ -1425,6 +1433,7 @@ pub struct OwnedWorldPointWitness {
     local_revision: Option<Timestamp>,
     scope: rtdb_types::PlacedAttemptScope,
     until: Timestamp,
+    purge_frontier: i64,
 }
 
 impl OwnedWorldPointWitness {
@@ -1477,17 +1486,24 @@ impl NativeSession {
     pub async fn commit_owned_world(
         &mut self, record: &rtdb_types::OwnedWorld, writes: Vec<OwnedWorldWrite>,
     ) -> Result<TransactionResult> {
-        self.commit_owned_world_checked(record, writes, Vec::new()).await
+        self.commit_owned_world_checked(record, writes, Vec::new(), Vec::new(), None).await
     }
 
     pub async fn commit_owned_world_checked(
         &mut self, record: &rtdb_types::OwnedWorld, writes: Vec<OwnedWorldWrite>,
         checks: Vec<OwnedWorldPointWitness>,
+        controls: Vec<rtdb_tx::HostedControlWrite>,
+        deadline: Option<Timestamp>,
     ) -> Result<TransactionResult> {
-        if !(1..=4096).contains(&writes.len()) || checks.len() > 128 { return Err(rtdb_types::OwnedWorld::unavailable()); }
+        if writes.len() > 4096 || checks.len() > 128 || (writes.is_empty() && (checks.is_empty() || controls.is_empty())) { return Err(rtdb_types::OwnedWorld::unavailable()); }
+        if !controls.is_empty() && (!writes.is_empty() || deadline.is_none() || controls.len().saturating_add(checks.len()) > 4096
+            || controls.iter().any(|control| !control.is_check()))
+        {
+            return Err(rtdb_types::OwnedWorld::unavailable());
+        }
         let scope = self.placed_history()?;
         let now = self.service.node.now();
-        let mut until = record.until;
+        let mut until = deadline.map_or(record.until, |deadline| deadline.min(record.until));
         for check in &checks {
             if check.world != record.id || check.relation.world() != Some(record.id)
                 || scope != Some(check.scope) || now >= check.until
@@ -1496,7 +1512,7 @@ impl NativeSession {
             }
             until = until.min(check.until);
         }
-        let count = writes.len() + checks.len() + 2;
+        let count = writes.len() + checks.len() * 2 + controls.len() + 2;
         let _operations = self.service.node.memory().reserve(count * (std::mem::size_of::<TxOp>() + 512))?;
         let mut ops = Vec::with_capacity(count);
         ops.push(TxOp::OwnedDeadline { until });
@@ -1504,6 +1520,7 @@ impl NativeSession {
             ops.push(TxOp::OwnedCheckWorldScope { scope: check.scope });
         }
         for check in checks {
+            ops.push(TxOp::OwnedCheckWorldPurge { relation: check.relation.clone(), frontier: check.purge_frontier });
             ops.push(TxOp::OwnedCheck {
                 relation: check.relation, id: check.id, valid_at: check.valid_at, expected: check.local_revision,
             });
@@ -1514,6 +1531,7 @@ impl NativeSession {
             let documents = rtdb_tx::Documents::new(vec![shadow.record(&id)?], self.service.node.memory())?;
             ops.push(TxOp::OwnedReplaceDocs { relation, documents, valid_from: Some(valid.lower()), valid_to: Some(valid.upper()) });
         }
+        ops.extend(controls.into_iter().map(TxOp::HostedControl));
         self.state.execute_tx(ops, Default::default()).await
     }
     /// Reserves a fresh system time by awaiting an ordered, fact-free source transaction.

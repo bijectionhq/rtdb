@@ -487,6 +487,11 @@ Before applying any write, the ordered resolver checks the placement and earlies
 A local tombstone has its own observed revision. An archived winner certifies local absence. The parent cut itself is fixed by the world registration.
 The response has the same transaction-key row as `CommitWorld.v1`.
 
+`rtdb.owned.CommitWorld.v3` validates an admitted world condition without writing any fact or publishing a clock.
+It takes the world UUID, one signed big-endian 64-bit exclusive deadline in Unix microseconds, the held handle, a big-endian u16 witness count from 1 to 128, and the distinct 16-byte nonces.
+The remaining bytes are the existing hosted control groups. Only check rows from the placed allowlist are admitted.
+The ordered transaction checks the world registration, placement, deadline, local point revisions, root erasure frontiers, and hosted ownership before issuing the transaction-key receipt.
+
 === Reading a merged held change feed
 
 `rtdb.owned.ReadHeldMergedChanges.v1` takes the 16-byte held handle, an exclusive signed Int64 ordered system time in big-endian microseconds, a big-endian unsigned 16-bit commit limit, and a big-endian unsigned 16-bit relation count followed by that many relation prefixes.
