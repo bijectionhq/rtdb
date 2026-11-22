@@ -1770,11 +1770,17 @@ impl NativeSession {
         controls: Vec<rtdb_tx::HostedControlWrite>, deadline: Timestamp,
     ) -> Result<TransactionResult> {
         let unavailable = rtdb_types::OwnedWorld::unavailable;
-        let retained_release = matches!(sections.as_slice(), [(_, section)]
-            if matches!(&section.effect, OwnedWorldEffect::Drop)
-                && section.checks.is_empty() && section.expected_clock.is_none())
+        let terminal = sections.first().filter(|(_, section)| sections.len() == 1
+            && matches!(&section.effect, OwnedWorldEffect::Drop)
+            && section.checks.is_empty() && section.expected_clock.is_none());
+        let delete_root = terminal.is_some_and(|(_, section)| root.publication.as_ref().is_some_and(|root| {
+            root.attempt == section.attempt && matches!(root.writes.as_slice(), [
+                TxOp::OwnedDelete { relation, valid_from: None, valid_to: None, .. }
+            ] if relation.is_root_data())
+        })) && rtdb_tx::retained_delete_controls(&controls);
+        let retained_release = delete_root || (terminal.is_some()
             && root.checks.is_empty() && root.publication.is_none()
-            && rtdb_tx::retained_release_controls(&controls);
+            && rtdb_tx::retained_release_controls(&controls));
         if !(1..=8).contains(&sections.len()) || controls.is_empty() || (!retained_release && controls.iter().any(|control| !control.is_check()))
             || root.checks.iter().any(|check| match check {
                 TxOp::OwnedCheck { relation, .. } | TxOp::OwnedCheckRange { relation, .. } =>
@@ -1798,8 +1804,10 @@ impl NativeSession {
             }) {
                 return Err(unavailable());
             }
-            attempts.insert(&root.attempt);
-            effects = effects.saturating_add(root.writes.len()).saturating_add(3);
+            if !delete_root {
+                attempts.insert(&root.attempt);
+            }
+            effects = effects.saturating_add(root.writes.len()).saturating_add(if delete_root { 1 } else { 3 });
         }
         for (retained_until, section) in &sections {
             let writes = match &section.effect {
@@ -1833,7 +1841,9 @@ impl NativeSession {
         ops.extend(root.checks);
         if let Some(root) = root.publication {
             ops.extend(root.writes);
-            ops.push(TxOp::OwnedPublishRoot { attempt: root.attempt, fingerprint });
+            if !delete_root {
+                ops.push(TxOp::OwnedPublishRoot { attempt: root.attempt, fingerprint });
+            }
         }
         for (_, section) in sections {
             Self::append_world_checks(&mut ops, section.checks);
@@ -1846,7 +1856,8 @@ impl NativeSession {
                 OwnedWorldEffect::Drop => (None, true),
             };
             ops.push(TxOp::OwnedPublishWorld { world: section.world, attempt: section.attempt,
-                fingerprint, expected: section.expected_clock, advance_to, drop_world });
+                fingerprint, expected: section.expected_clock, advance_to, drop_world,
+                delete_root: delete_root.then_some(section.parent_pin) });
         }
         self.state.execute_tx(ops, Default::default()).await
     }
