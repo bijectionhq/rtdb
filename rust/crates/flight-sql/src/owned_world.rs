@@ -44,11 +44,20 @@ pub struct WorldPointRow {
 }
 
 
+pub struct WorldIdentityPage {
+    pub keys: Vec<String>,
+    pub more: bool,
+    pub reservations: Vec<Arc<MemoryReservation>>,
+}
+
 /// A verified live cut and its already admitted archived parent.
 pub trait OwnedWorldRead: Send + Sync {
     fn present(&self) -> Timestamp;
     fn check(&self) -> Result<()>;
     fn close(&self);
+    fn identity_page<'a>(
+        &'a self, relation: &'a OwnedRelation, valid: Timestamp, after: Option<&'a str>, limit: usize,
+    ) -> BoxFuture<'a, Result<WorldIdentityPage>>;
     fn read_point<'a>(
         &'a self, relation: &'a OwnedRelation, id: &'a EntityId, valid_at: Timestamp,
     ) -> BoxFuture<'a, Result<WorldPointResult>>;

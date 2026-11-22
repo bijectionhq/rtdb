@@ -2,7 +2,7 @@ use std::{fmt, sync::Arc};
 
 use futures::future::BoxFuture;
 use rtdb_directory::{Directory, HostedTask};
-use rtdb_flight_sql::{OwnedWorldHost, OwnedWorldRead, WorldCall, WorldPoint, WorldPointResult, WorldPointRow};
+use rtdb_flight_sql::{OwnedWorldHost, OwnedWorldRead, WorldCall, WorldIdentityPage, WorldPoint, WorldPointResult, WorldPointRow};
 use rtdb_node::{NodeOptions, OwnedWorldPointWitness, OwnedWorldWrite};
 use rtdb_types::{EntityId, OwnedRelation, OwnedWorld, Result, Timestamp, TransactionKey};
 use uuid::Uuid;
@@ -110,6 +110,15 @@ impl OwnedWorldRead for HeldCheckpointWorld {
     fn check(&self) -> Result<()> { HeldCheckpointWorld::check(self) }
 
     fn close(&self) { HeldCheckpointWorld::close(self); }
+
+    fn identity_page<'a>(
+        &'a self, relation: &'a OwnedRelation, valid: Timestamp, after: Option<&'a str>, limit: usize,
+    ) -> BoxFuture<'a, Result<WorldIdentityPage>> {
+        Box::pin(async move {
+            let page = HeldCheckpointWorld::identity_page(self, relation, valid, after, limit).await?;
+            Ok(WorldIdentityPage { keys: page.keys, more: page.more, reservations: page.reservations })
+        })
+    }
 
     fn read_point<'a>(
         &'a self, relation: &'a OwnedRelation, id: &'a EntityId, valid_at: Timestamp,

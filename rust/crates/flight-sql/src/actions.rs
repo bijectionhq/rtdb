@@ -37,6 +37,7 @@ impl Service {
                 crate::owned_actions::HELD_OWNED_CHANGES_V2 => Ok(vec![Ok(self.held_owned_changes_action(&call, &action.body).await?)]),
                 crate::owned_actions::HELD_OWNED_POINT_V1 => Ok(vec![Ok(self.held_owned_point_action(&call, &action.body, false).await?)]),
                 crate::owned_actions::HELD_OWNED_POINT_V2 => Ok(vec![Ok(self.held_owned_point_action(&call, &action.body, true).await?)]),
+                crate::owned_actions::HELD_WORLD_IDENTITIES_V1 => Ok(vec![Ok(self.held_world_identities_action(&call, &action.body).await?)]),
                 crate::owned_actions::HELD_OWNED_IDENTITIES_V1 => Ok(vec![Ok(self.held_owned_identities_action(&call, &action.body).await?)]),
                 crate::owned_actions::HELD_OWNED_VERSIONS_V2 => Ok(self.held_owned_versions_action(&call, &action.body).await?.into_iter().map(Ok).collect()),
                 crate::owned_actions::HELD_OWNED_HISTORICAL_POINT_V1 => Ok(vec![Ok(self.held_owned_historical_point_action(&call, &action.body).await?)]),
