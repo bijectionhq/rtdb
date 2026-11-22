@@ -2,6 +2,7 @@
 //! bucket locator, never an identity or permission to purge another handle.
 use std::{collections::BTreeMap, sync::Arc};
 
+use rtdb_plan::Catalog;
 use rtdb_types::{
     Anomaly, AnomalyCategory, EntityId, OwnedRelation, Result, StructFields, Timestamp, Value,
     OWNED_CHANGE_GROUP_BYTES,
