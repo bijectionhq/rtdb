@@ -907,6 +907,8 @@ pub enum TxOp {
     Sql { sql: String, args: Option<SqlArguments> },
     SqlBytes { sql: String, arg_bytes: RetainedBytes },
     OwnedDeclareFixedRange { relation: rtdb_types::OwnedRelation, rule: rtdb_types::FixedRangeRule },
+    /// Compare one declared Binary prefix counter at ordered present, after this commit's writes.
+    OwnedCheckCapacity { relation: rtdb_types::OwnedRelation, column: String, prefix: Vec<u8>, at_most: i64 },
     OwnedDeclareCapacity { relation: rtdb_types::OwnedRelation, column: String, prefix_bytes: i64, cap: i64 },
     OwnedDeclareUniquePath { relation: rtdb_types::OwnedRelation, name: rtdb_types::OwnedRelation, column: String },
     OwnedDeclareSearchPath { relation: rtdb_types::OwnedRelation, name: rtdb_types::OwnedRelation, column: String },
@@ -935,7 +937,7 @@ pub enum TxOp {
 
 impl TxOp {
     pub fn is_owned(&self) -> bool {
-        matches!(self, Self::HostedControl(_) | Self::OwnedDeclareFixedRange { .. } | Self::OwnedDeclareCapacity { .. } | Self::OwnedDeclareUniquePath { .. } | Self::OwnedDeclareRelation { .. } | Self::OwnedDeclareSearchPath { .. } | Self::OwnedDeclarePath { .. } | Self::OwnedDeadline { .. } | Self::OwnedCheckWorldScope { .. } | Self::OwnedCheckRange { .. } | Self::OwnedCheck { .. } | Self::OwnedErase { .. } | Self::OwnedDelete { .. } | Self::OwnedReplaceDocs { .. } | Self::OwnedInsertDocs { .. })
+        matches!(self, Self::HostedControl(_) | Self::OwnedDeclareFixedRange { .. } | Self::OwnedDeclareCapacity { .. } | Self::OwnedCheckCapacity { .. } | Self::OwnedDeclareUniquePath { .. } | Self::OwnedDeclareRelation { .. } | Self::OwnedDeclareSearchPath { .. } | Self::OwnedDeclarePath { .. } | Self::OwnedDeadline { .. } | Self::OwnedCheckWorldScope { .. } | Self::OwnedCheckRange { .. } | Self::OwnedCheck { .. } | Self::OwnedErase { .. } | Self::OwnedDelete { .. } | Self::OwnedReplaceDocs { .. } | Self::OwnedInsertDocs { .. })
     }
 }
 

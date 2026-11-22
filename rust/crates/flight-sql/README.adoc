@@ -539,3 +539,20 @@ The response is the ordinary committed transaction-key row.
 This action supports checked replacement and exact absence insertion for hosted controls.
 Other control effects, including arbitrary SQL, computed values, deletes, relabeling and temporal splits, are outside this action.
 Generic SQL keeps the existing private relation boundary.
+
+=== Final-state prefix count
+
+`rtdb.owned.Commit.v6` begins with one owned root relation prefix, followed by
+one clock byte (zero for the transaction's ordered system time as valid time),
+a big-endian `u16` length and UTF-8 Binary column name (1 to 96 bytes), a
+big-endian `u16` length and complete Binary prefix (1 to 4096 bytes), then a
+nonnegative big-endian `i64` maximum. Append the Commit.v3 request, with zero
+or more witness pairs, one deadline, and the standard grouped mutation body.
+
+The relation must already have an immutable `DeclareCapacity.v1` rule matching
+the column and complete prefix length. The resolver checks counter coverage
+against the ordered base before applying mutations. It compares the maximum
+with the covered count after applying all of this transaction's writes.
+An exceeded maximum aborts the entire transaction with
+`rtdb.owned/count-bound-exceeded`. Other clocks, world overlays, and erase
+entries are unsupported by this action.

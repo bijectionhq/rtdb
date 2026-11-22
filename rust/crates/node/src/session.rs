@@ -158,6 +158,9 @@ impl DmlBuffer {
                 .checked_add(id.as_value().retained_bytes()?).ok_or_else(allocation_overflow)?,
             TxOp::OwnedDeclareSearchPath { relation, name, column } | TxOp::OwnedDeclareUniquePath { relation, name, column } =>
                 (relation.name().len() + name.name().len()).checked_add(column.capacity()).ok_or_else(allocation_overflow)?,
+            TxOp::OwnedCheckCapacity { relation, column, prefix, .. } => relation.name().len()
+                .checked_add(column.capacity()).and_then(|bytes| bytes.checked_add(prefix.capacity()))
+                .ok_or_else(allocation_overflow)?,
             TxOp::OwnedDeclareCapacity { relation, column, .. } =>
                 relation.name().len().checked_add(column.capacity()).ok_or_else(allocation_overflow)?,
             TxOp::OwnedDeclareRelation { relation, schema } => relation.name().len().checked_add(schema.retained_bytes()).ok_or_else(allocation_overflow)?,
