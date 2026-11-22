@@ -33,7 +33,15 @@ impl OpenTransaction<'_> {
         let storage = relation.unique_table(owner);
         let snapshot = self.snapshot()?;
         if snapshot.contains_table(&storage) {
-            return Err(Anomaly::new(AnomalyCategory::Conflict, "rtdb.owned/unique-path-exists", "The owned relation already has a unique path"));
+            let declaration = EntityId::String(DECLARATION_ID.into());
+            let existing_name = self.read_unique_cell(snapshot.clone(), owner, relation, &declaration, "path").await?;
+            let existing_column = self.read_unique_cell(snapshot, owner, relation, &declaration, "column").await?;
+            if existing_name == Some(Value::Utf8(name.name().into()))
+                && existing_column == Some(Value::Utf8(column.into()))
+            {
+                return Ok(());
+            }
+            return Err(Anomaly::new(AnomalyCategory::Conflict, "rtdb.owned/unique-path-exists", "The owned relation already has a different unique path"));
         }
         if snapshot.iter_segments(&target).any(|segment| segment.row_count() != 0)
             || !snapshot.trie_entries(&target).is_empty()

@@ -348,7 +348,7 @@ A placed read with evidence requested publishes `rtdb.owned.search_witnesses` as
 
 `rtdb.owned.DeclareUniquePath.v1` uses the relation prefix and a terminated Arrow IPC stream with one batch and one row.
 Its fields are `_id: Utf8` for the path name and `column: Utf8` for the canonical Binary key column.
-Declare one immutable unique path per owned relation before writing relation data. An existing empty typed relation must declare the key as Binary.
+Declare one immutable unique path per owned relation before writing relation data. An exact retry of the declaration keeps its original definition. An existing empty typed relation must declare the key as Binary.
 On this relation the final state of each owned commit must give each live row a nonempty Binary key of at most 4096 bytes.
 Mutations use validity from their ordered present to infinity.
 The ordered resolver applies releases and claims as a group, so a commit may swap keys. Conflicts do not return the occupant or the key.
