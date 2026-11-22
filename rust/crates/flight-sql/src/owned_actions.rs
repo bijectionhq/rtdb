@@ -8,7 +8,7 @@ pub(crate) use unique::READ_HELD_UNIQUE_V1;
 
 use std::{collections::{BTreeMap, BTreeSet}, sync::{Arc, Mutex}, time::Duration};
 
-use arrow_array::{Array, BinaryArray, BooleanArray, Float64Array, Int64Array, RecordBatch, StringArray, TimestampMicrosecondArray, UInt64Array};
+use arrow_array::{Array, ArrayRef, BinaryArray, BooleanArray, Float64Array, Int64Array, RecordBatch, StringArray, TimestampMicrosecondArray, UInt64Array};
 use arrow_flight::Result as ActionResult;
 use arrow_ipc::writer::IpcWriteOptions;
 use arrow_schema::{DataType, Field, Schema};
