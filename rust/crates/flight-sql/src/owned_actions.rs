@@ -1599,9 +1599,14 @@ impl Service {
         if result.present != held.snapshot.present() {
             return Err(Status::internal("Owned world point changed its held present"));
         }
+        let until = result.until;
         let nonce = result.witness.take().map(|evidence| held.remember(call, evidence)).transpose()?;
         let reply = self.world_point_reply(call, result, valid_at, nonce)?;
-        held.snapshot.check_relation(&relation).map_err(status)?;
+        if *mode == 2 {
+            held.snapshot.check_parent_point(&relation, until).map_err(status)?;
+        } else {
+            held.snapshot.check_relation(&relation).map_err(status)?;
+        }
         Ok(reply)
     }
 
@@ -1710,7 +1715,7 @@ impl Service {
             }
             let schema = Arc::new(Schema::new_with_metadata(fields, metadata));
             let batch = RecordBatch::try_new(Arc::clone(&schema), columns).map_err(arrow)?;
-            self.owned_point_reply(&schema, Some(&batch), result.present, valid_at, Some(revision))
+            self.owned_point_reply_until(&schema, Some(&batch), result.present, valid_at, Some(revision), result.until)
         } else {
             self.owned_point_reply(&Schema::empty().with_metadata(metadata), None, result.present, valid_at, None)
         }

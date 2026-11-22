@@ -135,6 +135,10 @@ impl OwnedWorldRead for HeldCheckpointWorld {
         HeldCheckpointWorld::check_relation(self, relation)
     }
 
+    fn check_parent_point(&self, relation: &OwnedRelation, until: Option<Timestamp>) -> Result<()> {
+        HeldCheckpointWorld::check_parent_point(self, relation, until)
+    }
+
     fn check(&self) -> Result<()> { HeldCheckpointWorld::check(self) }
 
     fn close(&self) { HeldCheckpointWorld::close(self); }
@@ -187,5 +191,5 @@ fn point_result(read: crate::archive::WorldPoint) -> WorldPointResult {
         let (fields, revision, reservation) = fact.into_parts();
         WorldPointRow { fields, revision, reservation }
     });
-    WorldPointResult { present: read.present.system_time, row, shadowed: read.shadowed, witness: read.witness }
+    WorldPointResult { present: read.present.system_time, row, until: read.until, shadowed: read.shadowed, witness: read.witness }
 }

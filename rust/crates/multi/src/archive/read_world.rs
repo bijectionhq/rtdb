@@ -68,7 +68,7 @@ pub async fn read_checkpoint_owned_point(
 ) -> Result<Option<Vec<OwnedBatch>>> {
     with_checkpoint_context(
         directory, archive, keys, hosted_task, world, resources,
-        |context| read_checkpoint_point_in_context(context, point),
+        |context| read_checkpoint_point_in_context(context, point, None),
     ).await
 }
 
@@ -87,7 +87,7 @@ pub(super) fn require_relation_purge_history(context: &QueryContext, owner: &str
 }
 
 pub(super) async fn read_checkpoint_point_in_context(
-    context: Arc<QueryContext>, point: CheckpointPoint<'_>,
+    context: Arc<QueryContext>, point: CheckpointPoint<'_>, lifetime: Option<i64>,
 ) -> Result<Option<Vec<OwnedBatch>>> {
     require_relation_purge_history(&context, point.owner)?;
     let database = context.catalog.database(context.catalog.default_database())?;
@@ -95,8 +95,16 @@ pub(super) async fn read_checkpoint_point_in_context(
         return Err(inconsistent("The archived world has no exact relation lifetime scope"));
     };
     let root = point.relation.root_relation();
-    if snapshot.contains_table(&root.as_ref().unwrap_or(point.relation).lifetime_table(point.owner)) {
-        return Err(unavailable("Creation-lifetime relations do not admit archived point reads"));
+    let governed = snapshot.contains_table(&root.as_ref().unwrap_or(point.relation).lifetime_table(point.owner));
+    if governed != lifetime.is_some() {
+        return Err(unavailable("The held lifetime does not match the archived relation"));
+    }
+    if let Some(duration) = lifetime {
+        let archived = rtdb_query::read_owned_relation_schema(Arc::clone(&context), point.owner, point.relation)
+            .await?.and_then(|(schema, _)| schema.lifetime_micros());
+        if archived != Some(duration) {
+            return Err(unavailable("The held lifetime differs from the archived declaration"));
+        }
     }
     let memory = Arc::clone(&context.memory);
     let Some(mut cursor) = open_owned_point(
