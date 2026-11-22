@@ -38,28 +38,77 @@ fn bookkeeping(key: &str) -> bool { key == crate::store::ROOT_MARKER || key.star
 impl Base {
     /// The latest manifest of `store`, or none.
     pub async fn load(bucket: &dyn ObjectStore, store: &str) -> Result<Base> {
+        Ok(Self::load_snapshot(bucket, store).await?.map_or_else(Self::default, |(_, base)| base))
+    }
+
+    async fn load_snapshot(bucket: &dyn ObjectStore, store: &str) -> Result<Option<(u64, Base)>> {
         for _ in 0..4 {
-            let Some((_, name)) = latest_manifest(bucket, store).await? else { return Ok(Base::default()); };
-            match bucket.get(&key(&name)?).await {
-                Ok(bytes) => return serde_json::from_slice(&bytes)
-                    .map_err(|error| Anomaly::fault("rtdb.multi/base-manifest", format!("{name}: {error}"))),
+            let Some((sequence, name)) = latest_manifest(bucket, store).await? else { return Ok(None); };
+            let bytes = match bucket.get(&key(&name)?).await {
+                Ok(bytes) => bytes,
                 Err(Error::MissingObject(_)) => continue,
+                Err(error) => return Err(storage(error)),
+            };
+            // A pruned slot can receive a delayed write after the first listing.
+            if !latest_manifest(bucket, store).await?.is_some_and(|(current, path)| current == sequence && path == name) { continue; }
+            return serde_json::from_slice(&bytes)
+                .map(|base| Some((sequence, base)))
+                .map_err(|error| Anomaly::fault("rtdb.multi/base-manifest", format!("{name}: {error}")));
+        }
+        Err(manifest_changed(store))
+    }
+
+    /// Installs the first manifest during preparation of an unpublished fork.
+    async fn initialize(&self, bucket: &dyn ObjectStore, store: &str) -> Result<()> {
+        self.publish_at(bucket, store, 0).await.map_err(storage)
+    }
+
+    async fn publish_at(&self, bucket: &dyn ObjectStore, store: &str, sequence: u64) -> rtdb_storage::Result<()> {
+        bucket.put(&key(&format!("{store}/{BASE_MANIFEST}/{sequence:020}"))?, Bytes::from(serde_json::to_vec(self).expect("a manifest serializes"))).await
+    }
+
+    /// Withdraws the selected references observed in this manifest. A competing edit can only be rebased onto its own latest snapshot.
+    pub(crate) async fn forget(&self, bucket: &dyn ObjectStore, store: &str, names: &BTreeSet<String>) -> Result<()> {
+        let selected: BTreeMap<&str, &str> = names.iter().filter_map(|name| {
+            self.objects.get(name).map(|owner| (name.as_str(), owner.as_str()))
+        }).collect();
+        if selected.is_empty() { return Ok(()); }
+
+        for _ in 0..8 {
+            let Some((sequence, mut current)) = Self::load_snapshot(bucket, store).await? else {
+                return Err(manifest_changed(store));
+            };
+            let count = current.objects.len();
+            current.objects.retain(|name, owner| selected.get(name.as_str()) != Some(&owner.as_str()));
+            if current.objects.len() == count {
+                return prune_manifests(bucket, store, sequence).await;
+            }
+            let next = manifest_step::next_manifest_sequence(sequence).ok_or_else(|| {
+                Anomaly::fault("rtdb.multi/base-manifest-exhausted", format!("The reference manifest for {store} has no remaining sequence numbers"))
+            })?;
+            match current.publish_at(bucket, store, next).await {
+                // A delayed write can land in a lower slot that has already been pruned. Only the current manifest confirms withdrawal.
+                Ok(()) | Err(Error::ConflictingObject(_)) => {},
                 Err(error) => return Err(storage(error)),
             }
         }
-        Err(Anomaly::new(rtdb_types::AnomalyCategory::Unavailable, "rtdb.multi/base-manifest-changed", format!("The reference manifest for {store} kept changing")))
+        Err(manifest_changed(store))
     }
+}
 
-    /// Writes this as `store`'s manifest, after its latest, and forgets the earlier ones.
-    pub async fn save(&self, bucket: &dyn ObjectStore, store: &str) -> Result<()> {
-        let previous = latest_manifest(bucket, store).await?;
-        let sequence = previous.as_ref().map_or(0, |(sequence, _)| sequence + 1);
-        bucket.put(&key(&format!("{store}/{BASE_MANIFEST}/{sequence:020}"))?, Bytes::from(serde_json::to_vec(self).expect("a manifest serializes"))).await.map_err(storage)?;
-        for object in bucket.list(Some(&key(&format!("{store}/{BASE_MANIFEST}"))?)).await.map_err(storage)? {
-            if manifest_sequence(object.key.as_str()).is_some_and(|earlier| earlier < sequence) { bucket.delete(&object.key).await.map_err(storage)?; }
+mod manifest_step;
+
+fn manifest_changed(store: &str) -> Anomaly {
+    Anomaly::new(rtdb_types::AnomalyCategory::Unavailable, "rtdb.multi/base-manifest-changed", format!("The reference manifest for {store} kept changing"))
+}
+
+async fn prune_manifests(bucket: &dyn ObjectStore, store: &str, sequence: u64) -> Result<()> {
+    for object in bucket.list(Some(&key(&format!("{store}/{BASE_MANIFEST}"))?)).await.map_err(storage)? {
+        if manifest_sequence(object.key.as_str()).is_some_and(|earlier| manifest_step::may_prune_manifest(earlier, sequence)) {
+            bucket.delete(&object.key).await.map_err(storage)?;
         }
-        Ok(())
     }
+    Ok(())
 }
 
 fn manifest_sequence(name: &str) -> Option<u64> { name.rsplit('/').next()?.parse().ok() }
@@ -293,7 +342,7 @@ pub async fn fork(bucket: &dyn ObjectStore, parent: &str, child: &str, at_block:
         let mut base = Base::load(bucket, &store).await?;
         base.objects.retain(|name, _| wanted(name));
         for name in physical_objects(bucket, &store).await? { if wanted(&name) { base.objects.insert(name, store.clone()); } }
-        base.save(bucket, &format!("{child}/{version}")).await?;
+        base.initialize(bucket, &format!("{child}/{version}")).await?;
     }
     Ok(())
 }
@@ -529,7 +578,7 @@ mod tests {
     async fn reading_a_manifest_retries_when_its_listed_revision_was_replaced() {
         let bucket = bucket();
         let base = Base { objects: BTreeMap::from([("row".into(), "parent/v06".into())]) };
-        base.save(bucket.as_ref(), "child/v06").await.unwrap();
+        base.initialize(bucket.as_ref(), "child/v06").await.unwrap();
         let changing = TransferringStore {
             inner: bucket,
             original: key(&format!("child/v06/{BASE_MANIFEST}/{:020}", 0)).unwrap(),
@@ -649,10 +698,163 @@ mod tests {
     #[tokio::test]
     async fn a_store_keeps_one_manifest_whose_latest_is_read() {
         let bucket = bucket();
-        Base { objects: BTreeMap::from([("a".into(), "p/v06".into())]) }.save(bucket.as_ref(), "c/v06").await.unwrap();
+        let initial = Base { objects: BTreeMap::from([("a".into(), "p/v06".into()), ("b".into(), "p/v06".into())]) };
+        initial.initialize(bucket.as_ref(), "c/v06").await.unwrap();
+        initial.forget(bucket.as_ref(), "c/v06", &BTreeSet::from(["a".into()])).await.unwrap();
         let latest = Base { objects: BTreeMap::from([("b".into(), "p/v06".into())]) };
-        latest.save(bucket.as_ref(), "c/v06").await.unwrap();
         assert_eq!(Base::load(bucket.as_ref(), "c/v06").await.unwrap(), latest);
         assert_eq!(bucket.list(Some(&key("c/v06/~base").unwrap())).await.unwrap().len(), 1, "an older manifest is forgotten once a newer one is written");
+    }
+
+    struct ManifestTestBucket {
+        inner: Bucket,
+        pause_put: Option<ObjectKey>,
+        pause_get: Option<ObjectKey>,
+        request_reached: tokio::sync::Notify,
+        resume_request: tokio::sync::Notify,
+        check_removals: Option<String>,
+        interrupt_removal: std::sync::atomic::AtomicBool,
+    }
+
+    impl ManifestTestBucket {
+        fn new(inner: Bucket) -> Self {
+            Self { inner, pause_put: None, pause_get: None, request_reached: Default::default(), resume_request: Default::default(),
+                check_removals: None, interrupt_removal: false.into() }
+        }
+
+        async fn pause_at(&self, key: &ObjectKey, watched: Option<&ObjectKey>) {
+            if watched == Some(key) {
+                self.request_reached.notify_one();
+                self.resume_request.notified().await;
+            }
+        }
+    }
+
+    #[async_trait]
+    impl ObjectStore for ManifestTestBucket {
+        async fn head(&self, key: &ObjectKey) -> rtdb_storage::Result<StoredObject> { self.inner.head(key).await }
+        async fn get(&self, key: &ObjectKey) -> rtdb_storage::Result<Bytes> {
+            self.pause_at(key, self.pause_get.as_ref()).await;
+            self.inner.get(key).await
+        }
+        async fn get_range(&self, key: &ObjectKey, range: Range<u64>) -> rtdb_storage::Result<Bytes> { self.inner.get_range(key, range).await }
+        async fn put(&self, key: &ObjectKey, bytes: Bytes) -> rtdb_storage::Result<()> {
+            self.pause_at(key, self.pause_put.as_ref()).await;
+            self.inner.put(key, bytes).await
+        }
+        async fn put_file(&self, key: &ObjectKey, source: &Path) -> rtdb_storage::Result<()> { self.inner.put_file(key, source).await }
+        async fn list(&self, directory: Option<&ObjectKey>) -> rtdb_storage::Result<Vec<StoredObject>> { self.inner.list(directory).await }
+        async fn delete(&self, key: &ObjectKey) -> rtdb_storage::Result<()> {
+            if let Some(store) = &self.check_removals
+                && let Some(name) = key.as_str().strip_prefix(&format!("{store}/"))
+                && !bookkeeping(name)
+            {
+                let base = Base::load(self.inner.as_ref(), store).await.unwrap();
+                assert!(!base.objects.contains_key(name), "retiring a local copy cannot expose its old fallback in the current manifest");
+                if name == "payload" && self.interrupt_removal.swap(false, std::sync::atomic::Ordering::Relaxed) {
+                    return Err(Error::Task("fixture interrupted the physical removal".into()));
+                }
+            }
+            self.inner.delete(key).await
+        }
+    }
+
+    #[tokio::test]
+    async fn a_delayed_manifest_write_rebases_and_confirms_the_current_withdrawals() {
+        for prune_slot in [true, false] {
+            let store = "child/v06";
+            let inner = bucket();
+            let initial = Base { objects: ["a", "b", "c"].into_iter().map(|name| (name.into(), "parent/v06".into())).collect() };
+            initial.initialize(inner.as_ref(), store).await.unwrap();
+            let mut watched = ManifestTestBucket::new(inner.clone());
+            watched.pause_put = Some(key(&format!("{store}/{BASE_MANIFEST}/{:020}", 1)).unwrap());
+            let watched = Arc::new(watched);
+            let first = tokio::spawn({
+                let initial = initial.clone();
+                let watched = watched.clone();
+                async move { initial.forget(watched.as_ref(), store, &BTreeSet::from(["a".into()])).await }
+            });
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                watched.request_reached.notified().await;
+                initial.forget(inner.as_ref(), store, &BTreeSet::from(["b".into()])).await.unwrap();
+                if prune_slot {
+                    initial.forget(inner.as_ref(), store, &BTreeSet::from(["c".into()])).await.unwrap();
+                    prune_manifests(inner.as_ref(), store, 2).await.unwrap();
+                    assert!(matches!(inner.head(watched.pause_put.as_ref().unwrap()).await, Err(Error::MissingObject(_))));
+                }
+                watched.resume_request.notify_one();
+                first.await.unwrap().unwrap();
+            }).await.unwrap();
+            let current = Base::load(inner.as_ref(), store).await.unwrap();
+            let expected = if prune_slot { Vec::<String>::new() } else { vec!["c".into()] };
+            assert_eq!(current.objects.into_keys().collect::<Vec<_>>(), expected, "the current manifest must contain both confirmed withdrawals");
+            assert_eq!(inner.list(Some(&key(&format!("{store}/{BASE_MANIFEST}")).unwrap())).await.unwrap().len(), 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn a_load_rejects_a_backfilled_slot_that_is_no_longer_current() {
+        let store = "child/v06";
+        let inner = bucket();
+        let initial = Base { objects: BTreeMap::from([("a".into(), "parent/v06".into()), ("b".into(), "parent/v06".into())]) };
+        initial.initialize(inner.as_ref(), store).await.unwrap();
+        initial.forget(inner.as_ref(), store, &BTreeSet::from(["a".into()])).await.unwrap();
+        let mut watched = ManifestTestBucket::new(inner.clone());
+        watched.pause_get = Some(key(&format!("{store}/{BASE_MANIFEST}/{:020}", 1)).unwrap());
+        let watched = Arc::new(watched);
+        let load = tokio::spawn({
+            let watched = watched.clone();
+            async move { Base::load(watched.as_ref(), store).await }
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            watched.request_reached.notified().await;
+            initial.forget(inner.as_ref(), store, &BTreeSet::from(["b".into()])).await.unwrap();
+            // The old slot is populated by a late write of an edit made against the seed.
+            let delayed = Base { objects: BTreeMap::from([("a".into(), "parent/v06".into())]) };
+            delayed.publish_at(inner.as_ref(), store, 1).await.unwrap();
+            watched.resume_request.notify_one();
+            assert!(load.await.unwrap().unwrap().objects.is_empty(), "a backfilled slot cannot establish the current manifest");
+        }).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_withdrawal_names_the_observed_owner() {
+        let bucket = bucket();
+        let actual = Base { objects: BTreeMap::from([("a".into(), "other/v06".into()), ("b".into(), "parent/v06".into())]) };
+        actual.initialize(bucket.as_ref(), "child/v06").await.unwrap();
+        let mut observed = actual.clone();
+        observed.objects.insert("a".into(), "parent/v06".into());
+        observed.forget(bucket.as_ref(), "child/v06", &BTreeSet::from(["a".into(), "b".into()])).await.unwrap();
+        assert_eq!(Base::load(bucket.as_ref(), "child/v06").await.unwrap().objects,
+            BTreeMap::from([("a".into(), "other/v06".into())]), "a newer owner is outside the observed withdrawal");
+    }
+
+    #[tokio::test]
+    async fn collection_withdraws_shadowed_fallbacks_and_keeps_a_failed_removal_pending() {
+        use crate::store::reap_as_of;
+
+        let inner = bucket();
+        let record = DeploymentRecord::new("child", "acme", Vec::new(), 0);
+        let store = format!("{}/v06", record.storage_prefix());
+        let marker = format!("{}/00000000000000000000-release", crate::store::GARBAGE_DIRECTORY);
+        let physical = |name: &str| key(&format!("{store}/{name}")).unwrap();
+        let base = Base { objects: BTreeMap::from([("payload".into(), "parent/v06".into()), (marker.clone(), "parent/v06".into())]) };
+        base.initialize(inner.as_ref(), &store).await.unwrap();
+        let released = Bytes::from(serde_json::to_vec(&serde_json::json!({"key": "payload", "released_at_ms": 0})).unwrap());
+        for prefix in [store.as_str(), "parent/v06"] {
+            inner.put(&key(&format!("{prefix}/payload")).unwrap(), Bytes::from_static(b"rows")).await.unwrap();
+            inner.put(&key(&format!("{prefix}/{marker}")).unwrap(), released.clone()).await.unwrap();
+        }
+        let mut watched = ManifestTestBucket::new(inner.clone());
+        watched.check_removals = Some(store.clone());
+        watched.interrupt_removal = true.into();
+        let refs = References::default();
+        assert!(reap_as_of(&watched, &record, 1, std::time::Duration::ZERO, &refs).await.is_err());
+        assert!(inner.head(&physical(&marker)).await.is_ok(), "a failed removal must preserve its release record");
+        assert!(inner.head(&physical("payload")).await.is_ok());
+        assert_eq!(reap_as_of(&watched, &record, 1, std::time::Duration::ZERO, &refs).await.unwrap().erased, 1);
+        assert!(inner.head(&physical("payload")).await.is_err());
+        assert!(inner.head(&physical(&marker)).await.is_err());
+        assert!(Base::load(inner.as_ref(), &store).await.unwrap().objects.is_empty());
     }
 }

@@ -156,9 +156,16 @@ The revision has its own directory entry so a materialized residence can support
 Existing shared deployments are part of the initial manifest inventory. The revision witnesses subsequent publications.
 Readers that compare revisions must read the directory strongly and include every actual manifest that predates their scan.
 The reaper still needs to bind this observed revision to a durable effect authorization that preserves the referrer inventory until the action settles.
-Manifest-only writes need a separate monotonicity argument.
-`reap_as_of` computes its manifest edit from an earlier `Base::load`, while `Base::save` selects a new sequence just before publication.
-The effect proof must establish that such edits cannot make a previously withdrawn reference visible again, including when a local copy that shadowed the reference is collected.
+The only operation that adds references initializes an unpublished fork's manifest under its fresh prefix.
+Later edits withdraw exact name-owner pairs from the latest confirmed manifest and publish only at that snapshot's successor.
+An immutable write can succeed in a lower slot that was already pruned while the request was in flight.
+The read path confirms the current head after loading its bytes, and the withdrawal path confirms absence in the current head after a write.
+Cleanup removes only slots strictly below a confirmed head.
+The reaper drops a shadowed fallback before deleting the local object and retains the release record until its physical work succeeds.
+This reasoning assumes authoritative listings, immutable conditional writes and monotone heads in open residence prefixes.
+Already open readers retain their selected manifest and still need the physical-owner read and retirement contract.
+`CatalogReaders` registers a cut under the logical deployment and storage root, while `ReferencingStore` can issue I/O at an ancestor's physical location.
+That fallback and its provider retry need custody from the physical owner before collection may erase the original. [Manifest model](../tla/MonotoneReferenceManifest.tla)
 
 The revision covers publication. A shared fork must also carry a retirement generation from before it starts reading providers through the directory transaction that publishes its prepared manifest.
 Checking that the lineage currently admits publication cannot distinguish a preparation that preceded an intervening retirement.
@@ -172,7 +179,7 @@ The production authority, resumable intent, and per-owner read handoff remain to
 | Effect path | Current admission and evidence | Remaining composition obligation |
 | --- | --- | --- |
 | `reap_as_of` and `References::erase` | The reaper uses garbage records, checkpoint floors and a scan of existing manifests. It copies to observed referrers before deleting the path. | Bind the authorized retirement to one physical owner and version, validate the referrer set under that authority, and keep the intent until exact settlement. |
-| `Base::save` | It publishes a higher manifest sequence before deleting older manifest names. `Base::load` retries a missing selected manifest. | Establish the manifest cut and retry contract for every consumer of inherited-object locations. |
+| `Base::initialize`, `Base::forget` and `Base::load` | Initialization adds references. Confirmed withdrawals only remove matching entries and require a current head before effect. | Connect the current-manifest contract to consumers that retain older manifests and to the authority closing and disposing a residence. |
 | `erase_deployment` in disposal and old-residence cleanup | The administration path fences the residence, transfers observed shared objects and checks the provider inventory under its prefix. | Prove that no publication of a new reference to that residence can race the referrer scan and transfer. |
 | `ordered_index_storage::reap` | The directory generation floor and reader registry close admission. Remote cleanup aborts journaled uploads and checks the generation prefix inventory. | Preserve the independent generation and residence bindings in any shared retirement API. |
 | `finish_capture_retirement` and whole archive retirement | A capture is closed in the directory. Archive custody and the provider inventory govern physical erasure and final receipts. | Preserve capture identity and the archive's separate namespace when composing with serving retirement. |

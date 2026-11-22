@@ -85,6 +85,7 @@ Archive and independent fork preparation now carry each planned provider version
 Durable repair archive admission now covers serving, recapture and transfer. Local copies keep the existing maintenance witness through provider completion.
 The S3 adapter now executes and settles a removal addressed to an exact immutable object version.
 Same-lineage fork publication now advances a cell-local shared-reference revision atomically with the child and name, including forks of a fork.
+Manifest withdrawals apply to the latest confirmed manifest and preserve other committed removals. The reaper withdraws shadowed fallbacks before removing local objects or pending-release records.
 Durable authorization, admission across physical owners, and use of the adapter by the ordinary remote serving reaper remain open.
 
 **Start from:** `replication/src/{checkpoint_discovery,replay_floor,blocks}.rs`, `multi/src/{archive,recovery_holds,replica_retention}.rs`; models `tla/{RecoveryReplay,InstalledCheckpoint,Checkpoint,ResidenceRetirement}.tla`, `mcrl2/CheckpointDiscovery.mcrl2`.

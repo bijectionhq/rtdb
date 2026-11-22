@@ -1124,8 +1124,7 @@ pub async fn reap_as_of(bucket: &dyn ObjectStore, record: &DeploymentRecord, now
     let oldest = record.storage_regions.values().filter_map(StorageRegion::checkpoint_metadata_from).min();
     let threshold = now_ms - grace.as_millis() as i64;
     for store in crate::reference::stores(bucket, &record.storage_prefix()).await? {
-        let mut base = Base::load(bucket, &store).await?;
-        let before = base.clone();
+        let before = Base::load(bucket, &store).await?;
         let mut own: BTreeSet<String> = physical_objects(bucket, &store).await?.into_iter().collect();
         // Where an object physically is: in this store, or in the one its manifest names.
         let physical = |own: &BTreeSet<String>, name: &str| -> Option<String> {
@@ -1175,23 +1174,27 @@ pub async fn reap_as_of(bucket: &dyn ObjectStore, record: &DeploymentRecord, now
                 packed.extend(index.entries.into_keys());
             }
         }
+        // Withdraw fallback edges before a physical removal could expose them in the current manifest.
+        let shadowed = obsolete_packs.iter().chain(due.keys())
+            .filter(|name| own.contains(*name) && before.objects.contains_key(*name)).cloned().collect();
+        before.forget(bucket, &store, &shadowed).await?;
         for pack in obsolete_packs {
             if own.contains(&pack) { references.erase(bucket, &store, &pack).await?; }
-            if before.objects.contains_key(&pack) { forgotten.insert(pack); }
+            else if before.objects.contains_key(&pack) { forgotten.insert(pack); }
         }
         for name in due.keys() {
             if own.contains(name) { references.erase(bucket, &store, name).await?; }
-            if before.objects.contains_key(name) { forgotten.insert(name.clone()); }
+            else if before.objects.contains_key(name) { forgotten.insert(name.clone()); }
         }
         let mut local_records = Vec::new();
         for (name, garbage_record) in &due {
             if !packed.contains(name) {
-                if own.contains(garbage_record) { local_records.push(garbage_record); } else { forgotten.insert(garbage_record.clone()); }
+                if own.contains(garbage_record) { local_records.push(garbage_record); }
+                forgotten.insert(garbage_record.clone());
                 reaped.erased += 1;
             } else { reaped.waiting += 1; }
         }
-        for name in &forgotten { base.objects.remove(name); }
-        if base != before { base.save(bucket, &store).await?; }
+        before.forget(bucket, &store, &forgotten).await?;
         for garbage_record in local_records { references.erase(bucket, &store, garbage_record).await?; }
     }
     Ok(reaped)
@@ -1383,6 +1386,12 @@ mod tests {
         let file = key("tables/orders/data/l01-rc-b00.arrow");
         let physical = key(&format!("{scope}/{file}"));
         store.put(&file, Bytes::from_static(b"admitted")).await.unwrap();
+        let ancestor = "parent/v06";
+        let ancestor_copy = key(&format!("{ancestor}/{file}"));
+        bucket.copy(&physical, &ancestor_copy).await.unwrap();
+        let base = crate::reference::Base { objects: BTreeMap::from([(file.to_string(), ancestor.into())]) };
+        let manifest = key(&format!("{scope}/{}/{:020}", crate::reference::BASE_MANIFEST, 0));
+        bucket.put(&manifest, serde_json::to_vec(&base).unwrap().into()).await.unwrap();
 
         assert!(store.delete(&file).await.is_err());
         let legacy = GarbageRecord { key: file.to_string(), released_at_ms: 0, trie_floor: None };
@@ -1421,8 +1430,13 @@ mod tests {
         foreign.storage_namespaces.as_mut().unwrap().objects = Uuid::new_v4();
         reap_as_of(bucket.as_ref(), &foreign, i64::MAX, Duration::ZERO, &refs).await.unwrap();
         assert!(bucket.head(&physical).await.is_ok());
+        assert_eq!(crate::reference::Base::load(bucket.as_ref(), &scope).await.unwrap(), base,
+            "an unrecognized catalog floor cannot withdraw a fallback");
         reap_as_of(bucket.as_ref(), &current, i64::MAX, Duration::ZERO, &refs).await.unwrap();
         assert!(matches!(bucket.head(&physical).await, Err(Error::MissingObject(_))));
+        assert!(crate::reference::Base::load(bucket.as_ref(), &scope).await.unwrap().objects.is_empty(),
+            "a recognized release withdraws the fallback before deleting the local copy");
+        assert!(bucket.head(&ancestor_copy).await.is_ok());
     }
 
     #[tokio::test]

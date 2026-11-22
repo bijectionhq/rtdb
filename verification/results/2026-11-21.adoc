@@ -2816,3 +2816,52 @@ The log is `/private/tmp/rtdb-formal.QMjPSJsX/shared-reference-65d-jvm.log`.
 
 The live reaper still needs a durable authorization that checks the revision and prevents stale fork preparation from publishing after retirement.
 The retirement admission model checks the proposed authority in isolation. Composition with the running reaper remains open.
+
+=== Monotone fork reference manifests
+
+Only initialization of a fresh fork adds reference edges.
+Later collection edits withdraw the exact observed name and owner from the current manifest.
+The edit writes the next immutable slot of the snapshot it read and confirms its withdrawal from the published head before continuing.
+Lookups confirm the head after loading its bytes, and cleanup prunes only below that confirmed head.
+These decisions assume authoritative listing, immutable conditional writes and a monotone head while the residence remains open.
+
+The reaper withdraws shadowed fallback references before deleting its own object or release record.
+An interrupted physical removal leaves the release record available for a later pass.
+These changes preserve fresh manifest observations. The retained-manifest and physical-owner admission contracts remain separate obligations.
+
+TLC revision `bc1b506` explored all 244 states for three edges, competing withdrawals, one delayed write and one overlapping lookup.
+Four negative controls cover a stale whole-manifest overwrite, accepting the write reply, accepting a backfilled read and removing a local copy before withdrawing its fallback.
+Both reachability checks found the expected completed operations.
+Apalache 0.63.0 checked safety through eleven transitions and reproduced the stale-overwrite counterexample.
+Lean 4.36.0 proved seven laws over arbitrary name-owner relations and natural-number slot sequences.
+Removing withdrawal or allowing the head to be pruned failed the declared laws.
+Verus checked four functions in the new manifest area and matched all four of its production and joint controls.
+The full run passed 40 Verus areas and matched 205 controls.
+The records are under `/private/tmp/rtdb-formal.QMjPSJsX/monotone-reference-formal-n7ifp186/`. link:../tla/MonotoneReferenceManifest.tla[Manifest model] link:../lean/MonotoneReferenceManifest.lean[Withdrawal and cleanup laws]
+
+Four production replays passed with five controls failing at their declared assertions.
+The delayed writer replay covers a conflicting immutable slot and a slot that was pruned and then accepted a late write.
+The lookup replay rejects a body from a backfilled slot.
+The collection replay observes the current manifest at the physical delete and confirms that an interrupted removal can retry.
+The affected Multi and simulation suites passed 262 cases, including 98 hosted cell cases, with 11 ignored cases.
+The records are under `/private/tmp/rtdb-formal.QMjPSJsX/monotone-reference-native-gmqeucr8/`.
+
+The complete Lean runner, all 345 TLC cases, and the Alloy, Maude, mCRL2, AutoHyper and Apalache suites matched their expected outcomes on parent `555fe7ec6`.
+The records are under `/private/tmp/rtdb-formal.QMjPSJsX/monotone-reference-combined-108vhzvw/`.
+The JVM run passed 3,198 standard tests and 3,348 property cases with no failures, errors or skips.
+The property suite recorded 100 iterations each for 33 core simulation methods.
+Both suites used the unchanged FFI artifact with SHA-256 `61b0e492d985e6e49ca28a8dccb8220e77e4c3fef7afc633df54b701b7ce6cdc`.
+The log is `/private/tmp/rtdb-formal.QMjPSJsX/monotone-reference-jvm.log`.
+
+The combined tree on `4f29a957d` also exercises the installed catalog receipt against a physically owned trie with an inherited fallback.
+A foreign scope leaves the owned object and its fallback intact.
+An accepted receipt allows the local withdrawal and removal while leaving the ancestor's physical copy in place.
+The four manifest replays and all five native controls matched after rebasing.
+The affected format, storage, maintenance, Multi and simulation suites passed 584 cases, with 11 ignored cases.
+The records are under `/private/tmp/rtdb-formal.QMjPSJsX/monotone-reference-4f29-native-ofki4pkd/`.
+The full Lean runner, all 350 TLC cases, all 40 Verus areas and 205 controls, and the Alloy, Maude, mCRL2, AutoHyper and Apalache suites matched on the combined tree.
+The hosted trie release model explored all 324 states, rejected the three controls and reached collection in the presence of an unrelated hold.
+The records are under `/private/tmp/rtdb-formal.QMjPSJsX/monotone-reference-4f29-formal-2r57kjab/`.
+On the combined tree the JVM run passed 3,198 standard tests and 3,348 property cases with no failures, errors or skips.
+It recorded 100 iterations each for 33 core simulation methods, using the rebuilt FFI library with SHA-256 `0b7f18375ac27e9d12cdd03b163c2e728447bd7fc398176ecbaa39f933a0bac3`.
+The log is `/private/tmp/rtdb-formal.QMjPSJsX/monotone-reference-4f29-jvm.log`.

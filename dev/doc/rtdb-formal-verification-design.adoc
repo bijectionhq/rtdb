@@ -704,6 +704,12 @@ An independent copy or a refused publication preserves the revision.
 The bounded model rejects authorization of a scan overtaken by a descendant publication, and the Lean model proves that an unchanged revision preserves the reference inventory over a finite publication history.
 This evidence covers the publication mechanism. The reaper still needs to compare the revision in its authorization transaction and preserve the resulting obligations through settlement. link:../../verification/tla/SharedReferenceRevision.tla[Shared reference revision model]
 
+After a fork initializes its manifest, concurrent reaper edits can only withdraw the selected name-owner pairs.
+Each attempt reads a confirmed head, edits that snapshot at its immediate successor, and verifies the current head before acknowledging the withdrawal.
+A fresh read also verifies its head after fetching the manifest body, since a delayed write can repopulate a pruned slot.
+The reaper withdraws a shadowed fallback before removing the local copy and keeps its release evidence through a failed removal.
+The local replay checks the live reaper path. Readers retaining an older manifest and cross-owner provider effects still need the coordinated admission and settlement contract. link:../../verification/tla/MonotoneReferenceManifest.tla[Manifest withdrawal model]
+
 The Rust reference reaper scans the deployment inventory before reaching the provider delete.
 The existing local maintenance lock serializes local fork preparation with that sweep.
 On S3 the local lock helper returns without acquiring a distributed fence.

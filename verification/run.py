@@ -1496,6 +1496,22 @@ def verify_shared_reference_revision(args, scratch):
     verify_lean_model(args, scratch, path, "shared-reference-revision", controls, 4)
 
 
+def verify_monotone_reference_manifest(args, scratch):
+    path = Path("verification/lean/MonotoneReferenceManifest.lean")
+    controls = {
+        "omit-withdrawal": (
+            "current name owner ∧ ¬ requested name owner", "current name owner",
+            ["a_requested_current_edge_is_removed"],
+        ),
+        "prune-head": (
+            "def mayPrune (slot confirmed : Nat) : Prop := slot < confirmed",
+            "def mayPrune (slot confirmed : Nat) : Prop := slot ≤ confirmed",
+            ["a_confirmed_head_is_never_pruned", "a_confirmed_cleanup_cannot_remove_a_future_head"],
+        ),
+    }
+    verify_lean_model(args, scratch, path, "monotone-reference-manifest", controls, 7)
+
+
 def verify_checkpoint_source_handoff(args, scratch):
     path = Path("verification/lean/CheckpointSourceHandoff.lean")
     controls = {
@@ -1780,6 +1796,7 @@ def verify_lean(args, scratch):
             verify_repair_archive_custody(args, scratch)
             verify_exact_retirement_retry(args, scratch)
             verify_shared_reference_revision(args, scratch)
+            verify_monotone_reference_manifest(args, scratch)
             verify_published_checkpoint(args, scratch)
             verify_checkpoint_table_manifest(args, scratch)
             verify_pack_publication_lean(args, scratch)
@@ -2139,6 +2156,19 @@ TLA_CASES = (
      ("INVARIANT Safe", "INVARIANT NeverRefusesOldPreparationAfterSettlement"), "NeverRefusesOldPreparationAfterSettlement"),
     ("LineageRetirementAdmission", "lineage-retirement-transfers-and-settles-witness",
      ("INVARIANT Safe", "INVARIANT NeverTransfersAndSettles"), "NeverTransfersAndSettles"),
+    ("MonotoneReferenceManifest", "monotone-reference-manifest", None, None),
+    ("MonotoneReferenceManifest", "reference-manifest-stale-overwrite",
+     ('Mutation = "none"\nINVARIANT Safe', 'Mutation = "append_stale_whole_manifest"\nINVARIANT NoWithdrawnReferenceReturns'), "NoWithdrawnReferenceReturns"),
+    ("MonotoneReferenceManifest", "reference-manifest-trust-put-reply",
+     ('Mutation = "none"\nINVARIANT Safe', 'Mutation = "confirm_put_reply"\nINVARIANT ConfirmedWithdrawalIsCurrent'), "ConfirmedWithdrawalIsCurrent"),
+    ("MonotoneReferenceManifest", "reference-manifest-trust-backfilled-slot",
+     ('Mutation = "none"\nINVARIANT Safe', 'Mutation = "trust_backfilled_read"\nINVARIANT ReadUsesThePublishedHead'), "ReadUsesThePublishedHead"),
+    ("MonotoneReferenceManifest", "reference-manifest-remove-before-unlink",
+     ('Mutation = "none"\nINVARIANT Safe', 'Mutation = "remove_before_unlink"\nINVARIANT NoFallbackExposed'), "NoFallbackExposed"),
+    ("MonotoneReferenceManifest", "reference-manifest-backfill-retry-witness",
+     ("INVARIANT Safe", "INVARIANT NeverConfirmsAfterBackfill"), "NeverConfirmsAfterBackfill"),
+    ("MonotoneReferenceManifest", "reference-manifest-withdrawal-witness",
+     ("INVARIANT Safe", "INVARIANT NeverRemovesAfterUnlink"), "NeverRemovesAfterUnlink"),
     ("CheckpointCopyEvidence", "checkpoint-copy-evidence", None, None),
     ("CheckpointCopyEvidence", "checkpoint-copy-trust-only-version-token",
      ('Mutation = "none"\nINVARIANT Safe', 'Mutation = "trust_version_token"\nINVARIANT PlanMatchesBody'), "PlanMatchesBody"),
@@ -2658,6 +2688,10 @@ def verify_apalache(args, scratch):
     check_apalache(args, scratch, "LineageRetirementAdmission", "lineage-retirement-open-gate-alone",
                    "PublishedForkHasBytes", 10, ('Mutation = "none"', 'Mutation = "check_only_open_gate"'),
                    "publication would accept an old preparation after retirement reopens admission")
+    check_apalache(args, scratch, "MonotoneReferenceManifest", "monotone-reference-manifest", "Safe", 11)
+    check_apalache(args, scratch, "MonotoneReferenceManifest", "reference-manifest-stale-overwrite",
+                   "NoWithdrawnReferenceReturns", 11, ('Mutation = "none"', 'Mutation = "append_stale_whole_manifest"'),
+                   "the latest manifest can restore an unrelated withdrawal when a stale edit appends")
     check_apalache(args, scratch, "CheckpointCopyEvidence", "checkpoint-copy-evidence", "Safe", 5)
     check_apalache(args, scratch, "CheckpointCopyEvidence", "checkpoint-copy-trust-only-version-token",
                    "PlanMatchesBody", 5, ('Mutation = "none"', 'Mutation = "trust_version_token"'),
@@ -3540,6 +3574,51 @@ def verify_native_reference_revision(args, source):
         finally:
             path.write_bytes(original)
         print(f"rust-lineage-reference-{name}: atomic publication passed and its control failed as expected")
+
+
+def verify_native_reference_manifest(args, source):
+    env = os.environ | {
+        "CARGO_TARGET_DIR": os.environ.get("CARGO_TARGET_DIR", str(ROOT / "target")),
+        "CARGO_PROFILE_TEST_DEBUG": "0",
+    }
+    command = ["cargo", "test", "--locked", "-p", "rtdb-multi", "--features", "dynamodb", "--lib"]
+    delayed = "a_delayed_manifest_write_rebases_and_confirms_the_current_withdrawals"
+    backfill = "a_load_rejects_a_backfilled_slot_that_is_no_longer_current"
+    owner = "a_withdrawal_names_the_observed_owner"
+    shadow = "collection_withdraws_shadowed_fallbacks_and_keeps_a_failed_removal_pending"
+    cases = {
+        "trust-put": (delayed, "reference.rs", "Ok(()) | Err(Error::ConflictingObject(_)) => {},",
+                       "Ok(()) => return Ok(()), Err(Error::ConflictingObject(_)) => {},",
+                       "the current manifest must contain both confirmed withdrawals"),
+        "trust-old-slot": (backfill, "reference.rs",
+                           "if !latest_manifest(bucket, store).await?.is_some_and(|(current, path)| current == sequence && path == name) { continue; }",
+                           "", "a backfilled slot cannot establish the current manifest"),
+        "ignore-observed-owner": (owner, "reference.rs", "selected.get(name.as_str()) != Some(&owner.as_str())",
+                                  "!selected.contains_key(name.as_str())", "a newer owner is outside the observed withdrawal"),
+        "retain-data-fallback": (shadow, "store.rs", "before.forget(bucket, &store, &shadowed).await?;",
+                                 "let _shadowed: BTreeSet<String> = shadowed;",
+                                 "retiring a local copy cannot expose its old fallback in the current manifest"),
+        "retain-marker-fallback": (shadow, "store.rs",
+                                   "if own.contains(garbage_record) { local_records.push(garbage_record); }\n                forgotten.insert(garbage_record.clone());",
+                                   "if own.contains(garbage_record) { local_records.push(garbage_record); }\n                else { forgotten.insert(garbage_record.clone()); }",
+                                   "retiring a local copy cannot expose its old fallback in the current manifest"),
+    }
+    baseline = run_case([*command, "reference::tests"], source / "rust", args.evidence, "rust-reference-manifest-baseline", env)
+    if baseline.returncode or any(f"reference::tests::{test} ... ok" not in baseline.stdout for test in (delayed, backfill, owner, shadow)):
+        raise ValueError("the reference manifest replays did not pass")
+    for name, (test, file, before, after, expected) in cases.items():
+        test = f"reference::tests::{test}"
+        path = source / "rust/crates/multi/src" / file
+        original = path.read_bytes()
+        try:
+            replace_once(path, before, after)
+            checked = run_case([*command, test, "--", "--exact"], source / "rust", args.evidence, f"rust-reference-manifest-{name}", env)
+            if (checked.returncode != 101 or f"{test} ... FAILED" not in checked.stdout
+                or expected not in checked.stdout or "0 passed; 1 failed" not in checked.stdout):
+                raise ValueError(f"{name}: the reference manifest control did not fail at its declared assertion")
+        finally:
+            path.write_bytes(original)
+    print("rust-reference-manifest: four production replays and five expected control failures")
 
 
 def verify_replay_prefix(args, source):
@@ -4466,6 +4545,7 @@ def main():
         "rust/crates/s3/src/lib.rs",
         "rust/crates/s3/src/versions.rs",
         "rust/crates/multi/src/reference.rs",
+        "rust/crates/multi/src/reference/manifest_step.rs",
         "rust/crates/multi/src/archive.rs",
         "rust/crates/types/src/position.rs",
         "rust/crates/storage/src/log/mod.rs",
@@ -4542,6 +4622,7 @@ def main():
             verify_s3_object_version(args, source)
             verify_s3_exact_retirement(args, source)
             verify_native_reference_revision(args, source)
+            verify_native_reference_manifest(args, source)
             verify_compaction_publication_versions(args, source)
             verify_replay_prefix(args, source)
             verify_multi_trim_admission(args, source)

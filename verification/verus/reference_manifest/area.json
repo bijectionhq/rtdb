@@ -1,0 +1,95 @@
+{
+  "summary": "Immutable manifest slot allocation and cleanup below a confirmed head.",
+  "flags": [
+    "--no-external-by-default",
+    "--verify-module",
+    "production",
+    "--verify-module",
+    "laws"
+  ],
+  "min_verified_functions": 4,
+  "controls": {
+    "reuse_sequence": {
+      "defect": "A publisher reuses the current manifest sequence.",
+      "mutate": [
+        {
+          "file": "rust/crates/multi/src/reference/manifest_step.rs",
+          "find": "    current.checked_add(1)\n",
+          "replace": "    if current == u64::MAX { None } else { Some(current) }\n"
+        }
+      ],
+      "expect": [
+        {
+          "file": "rust/crates/multi/src/reference/manifest_step.rs",
+          "function": "next_manifest_sequence",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 3
+    },
+    "reuse_sequence_and_contract": {
+      "defect": "A publisher reuses the current manifest sequence.",
+      "mutate": [
+        {
+          "file": "rust/crates/multi/src/reference/manifest_step.rs",
+          "find": "    current.checked_add(1)\n",
+          "replace": "    if current == u64::MAX { None } else { Some(current) }\n"
+        },
+        {
+          "file": "rust/crates/multi/src/reference/manifest_step.rs",
+          "find": "current < u64::MAX ==> next == Some((current + 1) as u64),",
+          "replace": "current < u64::MAX ==> next == Some(current),"
+        }
+      ],
+      "expect": [
+        {
+          "file": "verification/verus/reference_manifest/laws.rs",
+          "function": "a_manifest_successor_is_strict",
+          "category": "assertion failed"
+        }
+      ],
+      "min_verified_functions": 3
+    },
+    "prune_current": {
+      "defect": "Cleanup can remove its confirmed head.",
+      "mutate": [
+        {
+          "file": "rust/crates/multi/src/reference/manifest_step.rs",
+          "find": "    candidate < confirmed\n",
+          "replace": "    candidate <= confirmed\n"
+        }
+      ],
+      "expect": [
+        {
+          "file": "rust/crates/multi/src/reference/manifest_step.rs",
+          "function": "may_prune_manifest",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 3
+    },
+    "prune_current_and_contract": {
+      "defect": "Cleanup can remove its confirmed head.",
+      "mutate": [
+        {
+          "file": "rust/crates/multi/src/reference/manifest_step.rs",
+          "find": "    candidate < confirmed\n",
+          "replace": "    candidate <= confirmed\n"
+        },
+        {
+          "file": "rust/crates/multi/src/reference/manifest_step.rs",
+          "find": "    ensures prune <==> candidate < confirmed,",
+          "replace": "    ensures prune <==> candidate <= confirmed,"
+        }
+      ],
+      "expect": [
+        {
+          "file": "verification/verus/reference_manifest/laws.rs",
+          "function": "a_late_prune_preserves_the_current_head",
+          "category": "assertion failed"
+        }
+      ],
+      "min_verified_functions": 3
+    }
+  }
+}

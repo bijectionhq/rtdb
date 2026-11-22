@@ -1575,6 +1575,9 @@ rule ReapUnreachable {
     -- An object is deleted only when no published manifest of any live deployment in its lineage references it, and reaper_grace has passed since it was released.
     -- The reaper's deletions are conditional on the lineage's version, which every fork and every deletion bumps, so a fork created mid-sweep keeps what it references.
     -- When the reaper cannot determine reachability, it keeps the affected release records for a later pass.
+    -- Withdrawing an inherited reference removes only the selected name and owner from the latest manifest.
+    -- The reaper confirms that withdrawal before deleting a local copy that shadows the reference.
+    -- A failed physical removal keeps its release record for the next pass.
     when: candidate: GarbageCandidate.released_at + config.reaper_grace <= now
 
     requires: not exists d in LiveDeploymentsOf(candidate.lineage): candidate.object in ReferencedBy(d.checkpoint.manifest)
@@ -1585,6 +1588,20 @@ rule ReapUnreachable {
     ensures:
         ObjectStorage.delete_all_versions(candidate.object.key)
         candidate.deleted = true
+}
+
+rule WithdrawForkReferences {
+    -- Each manifest update uses the successor of the sequence whose bytes it read.
+    -- A fresh lookup confirms the current sequence and the missing selected references before retirement continues.
+    when: ForkReferenceWithdrawalRequested(store, selected)
+
+    ensures:
+        let current = ConfirmCurrentReferenceManifest(store)
+        let remaining = current.references - selected
+        if remaining != current.references:
+            WriteImmutableReferenceManifest(store, current.sequence + 1, remaining)
+        if ConfirmedCurrentManifestExcludes(store, selected):
+            ForkReferenceWithdrawalConfirmed(store, selected)
 }
 
 rule RetireOrderedIndexPages {
