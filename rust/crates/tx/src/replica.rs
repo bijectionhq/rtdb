@@ -104,9 +104,9 @@ pub fn decode_replica(message: &ResolvedTx, predecessor: Option<TransactionKey>,
                     worlds::HostedEffects::RetainedRelease if !(1..=2).contains(
                         &controls.iter().filter_map(|(_, write)| write.batch()).map(|batch| batch.len()).sum::<usize>()
                     ) => return Err(invalid("Resolved retained release differs from its bounded control replacements")),
-                    worlds::HostedEffects::RetainedWrite if !(1..=5).contains(
+                    worlds::HostedEffects::RetainedWrite | worlds::HostedEffects::ProposalOverlay if !(1..=5).contains(
                         &controls.iter().filter_map(|(_, write)| write.batch()).map(|batch| batch.len()).sum::<usize>()
-                    ) => return Err(invalid("Resolved retained Root write differs from its bounded control replacements")),
+                    ) => return Err(invalid("Resolved world write differs from its bounded control replacements")),
                     _ => {}
                 }
                 if has_controls {

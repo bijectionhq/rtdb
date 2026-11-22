@@ -1629,6 +1629,7 @@ pub struct OwnedWorldFork {
 
 #[derive(Default)]
 pub struct OwnedRootSection {
+    pub proposal_overlay: bool,
     pub checks: Vec<TxOp>,
     pub publication: Option<OwnedRootPublication>,
 }
@@ -1807,7 +1808,15 @@ impl NativeSession {
         let retained_release = delete_root || (terminal.is_some()
             && root.checks.is_empty() && root.publication.is_none()
             && rtdb_tx::retained_release_controls(&controls));
-        if !(1..=8).contains(&sections.len()) || controls.is_empty() || (!retained_release && controls.iter().any(|control| !control.is_check()))
+        let proposal_overlay = root.proposal_overlay;
+        if proposal_overlay && (sections.len() != 1 || root.publication.is_some()
+            || !matches!(&sections[0].1.effect, OwnedWorldEffect::Overlay(_))
+            || !rtdb_tx::retained_delete_controls(&controls))
+        {
+            return Err(unavailable());
+        }
+        if !(1..=8).contains(&sections.len()) || controls.is_empty()
+            || (!retained_release && !proposal_overlay && controls.iter().any(|control| !control.is_check()))
             || root.checks.iter().any(|check| match check {
                 TxOp::OwnedCheck { relation, .. } | TxOp::OwnedCheckRange { relation, .. } =>
                     relation.world().is_some() || relation.is_world_catalog(),

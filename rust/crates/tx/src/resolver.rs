@@ -983,6 +983,7 @@ impl<'a> OpenTransaction<'a> {
             }
         }
         let retained_release = crate::hosted_control::retained_release_world(operations);
+        let proposal_overlay = crate::hosted_control::hosted_proposal_overlay(operations);
         admitted.extend(retained_release);
         if retained_release.is_none() && operations.iter().any(|op| matches!(
             op, Operation::Public(TxOp::OwnedPublishWorld { delete_root: Some(_), .. })
@@ -1112,6 +1113,13 @@ impl<'a> OpenTransaction<'a> {
                 return Err(unavailable());
             }
         }
+        if let Some(world) = proposal_overlay {
+            if self.owned_worlds.get(&world).is_none_or(|(record, _)| {
+                record.mode != rtdb_types::WorldClockMode::Proposal
+            }) {
+                return Err(unavailable());
+            }
+        }
         if let Some(world) = retained_release {
             let original_pin = operations.iter().find_map(|op| match op {
                 Operation::Public(TxOp::OwnedPublishWorld { delete_root, .. }) => *delete_root,
@@ -1171,7 +1179,7 @@ impl<'a> OpenTransaction<'a> {
                         counts.entry(world).or_default().1 += 1;
                         1
                     }
-                    Operation::Public(TxOp::HostedControl(control)) if control.is_check() => {
+                    Operation::Public(TxOp::HostedControl(control)) if control.is_check() || proposal_overlay.is_some() => {
                         hosted = true;
                         1
                     }

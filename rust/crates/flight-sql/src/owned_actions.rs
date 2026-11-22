@@ -1912,6 +1912,7 @@ impl Service {
         if !(1..=8).contains(&count) { return Err(invalid("A world batch requires one to eight worlds")); }
         let _framing = call.reserve((count + 2) * MAX_COMMIT_GROUPS * 512)?;
         let mut release_eligible = count == 1;
+        let mut proposal_eligible = count == 1;
         let mut worlds = BTreeSet::new();
         let mut attempts = BTreeSet::new();
         let mut sections = Vec::with_capacity(count);
@@ -1943,6 +1944,8 @@ impl Service {
             let mode = resource.snapshot.clock_mode();
             release_eligible &= mode == rtdb_types::WorldClockMode::Retained
                 && *kind == 2 && count == 0;
+            proposal_eligible &= mode == rtdb_types::WorldClockMode::Proposal
+                && *kind == 0 && count != 0;
             if count == 0 && !release_eligible {
                 return Err(invalid("Ordinary world effects require original witnesses"));
             }
@@ -1978,13 +1981,14 @@ impl Service {
         let ([root_kind], body) = body.split_first_chunk::<1>().ok_or_else(|| invalid("Missing Root section kind"))?;
         let (root_read, body) = match *root_kind {
             0 => (None, body),
-            1 | 2 | 3 | 4 => {
+            1 | 2 | 3 | 4 | 5 => {
                 let (handle, body) = body.split_first_chunk::<16>().ok_or_else(|| invalid("Missing original Root hold"))?;
                 (Some(self.owned_read(call, &Bytes::copy_from_slice(handle))?), body)
             }
             _ => return Err(invalid("Invalid Root section kind")),
         };
         let delete_root = *root_kind == 4;
+        let proposal_overlay = *root_kind == 5;
         let (root_attempt, body) = if delete_root {
             if !release_eligible { return Err(invalid("A Root delete requires one retained drop")); }
             rows_left = rows_left.checked_sub(1).ok_or_else(|| invalid("World batch exceeds its effect limit"))?;
@@ -2030,6 +2034,10 @@ impl Service {
             }
             root.publication = Some(rtdb_node::OwnedRootPublication { attempt: attempt.to_owned(), writes: root_writes });
         }
+        root.proposal_overlay = proposal_overlay;
+        if proposal_overlay && !proposal_eligible {
+            return Err(invalid("Registered settlement requires one witnessed Proposal overlay"));
+        }
         let observed_root = !root.checks.is_empty() || !root_witnesses.is_empty();
         let release = *root_kind == 3;
         if (*root_kind == 0 && observed_root) || (*root_kind == 1 && !observed_root)
@@ -2042,7 +2050,10 @@ impl Service {
         let controls = owned_groups(body, true, false)?;
         hosted_control::admit_control_targets(policy, controls.iter().map(|(relation, _)| relation))?;
         let scope = self.hosted_control_scope(call).await?;
-        let (controls, _charges) = self.decode_hosted_control_groups(call, controls, scope, &mut rows_left, !release && !delete_root)?;
+        let (controls, _charges) = self.decode_hosted_control_groups(call, controls, scope, &mut rows_left, !release && !delete_root && !proposal_overlay)?;
+        if proposal_overlay && !rtdb_tx::retained_delete_controls(&controls) {
+            return Err(invalid("A Proposal overlay requires checked hosted settlement"));
+        }
         if delete_root && !rtdb_tx::retained_delete_controls(&controls) {
             return Err(invalid("A Root delete with retained drop requires checked owner settlement"));
         }
@@ -2058,7 +2069,7 @@ impl Service {
         if let Some(read) = &root_read {
             read.snapshot.check().map_err(status)?;
             if read.snapshot.present().system_time >= deadline
-                || (delete_root && (deadline > read.snapshot.evidence_until()
+                || ((delete_root || proposal_overlay) && (deadline > read.snapshot.evidence_until()
                     || read.snapshot.fork_cut(scope).await.map_err(status)?.live().is_none()))
             {
                 return Err(Status::failed_precondition("Root hold is outside the world batch deadline"));

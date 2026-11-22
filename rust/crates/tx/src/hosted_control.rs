@@ -228,3 +228,39 @@ mod retained_release_tests {
         Ok(())
     }
 }
+
+/// Classify one acceptance-valid Proposal overlay settled with hosted owner controls.
+/// Every changed locator needs an original point check in the same overlay.
+pub(crate) fn hosted_proposal_overlay(operations: &[crate::source::Operation]) -> Option<rtdb_types::Iid> {
+    use crate::{TxOp, source::Operation};
+    let mut world = None;
+    let mut controls = Vec::new();
+    let mut writes = Vec::new();
+    let mut points = std::collections::BTreeSet::new();
+    for operation in operations {
+        match operation {
+            Operation::Public(TxOp::HostedControl(control)) => controls.push(control),
+            Operation::Public(TxOp::OwnedDeadline { .. } | TxOp::OwnedCheckWorldScope { .. }
+                | TxOp::OwnedCheckWorldPurge { .. } | TxOp::OwnedCheckRange { .. }) => (),
+            Operation::Public(TxOp::OwnedCheck { relation, id, .. }) => {
+                points.insert((relation.name(), id.handle_bytes()));
+            }
+            Operation::Public(TxOp::OwnedPublishWorld {
+                world: next, advance_to: None, drop_world: false, delete_root: None, ..
+            }) if world.is_none() => world = Some(*next),
+            Operation::Public(TxOp::OwnedReplaceDocs {
+                relation, documents, valid_from: None, valid_to: None,
+            }) | Operation::OwnedWriteIids {
+                relation, documents, valid_from: None, valid_to: None, create_only: false, ..
+            } if relation.world().is_some() && documents.rows().len() == 1 => {
+                let id = documents.rows()[0].get("_id")?.entity_id().ok()?;
+                writes.push((relation, id.handle_bytes()));
+            }
+            _ => return None,
+        }
+    }
+    let world = world?;
+    (!writes.is_empty() && retained_delete_controls(controls) && writes.into_iter().all(|(relation, id)| {
+        relation.world() == Some(world) && points.remove(&(relation.name(), id))
+    })).then_some(world)
+}
