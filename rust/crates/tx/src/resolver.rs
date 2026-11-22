@@ -711,9 +711,9 @@ impl<'a> OpenTransaction<'a> {
                 self.reserve_owned_attempt(attempt, *fingerprint).await?;
                 self.publish_owned_root_head().await
             }
-            Operation::Public(TxOp::OwnedPublishWorld { world, attempt, fingerprint, expected, advance_to, drop_world, settlement_pin, delete_root }) => {
+            Operation::Public(TxOp::OwnedPublishWorld { world, attempt, fingerprint, expected, advance_to, drop_world, settlement_pin, land_root, delete_root }) => {
                 self.publish_owned_world(*world, attempt, *fingerprint, *expected, *advance_to, *drop_world, *settlement_pin).await?;
-                if delete_root.is_some() { self.publish_owned_root_head().await?; }
+                if delete_root.is_some() || land_root.is_some() { self.publish_owned_root_head().await?; }
                 Ok(())
             },
             Operation::Public(TxOp::OwnedDeadline { .. } | TxOp::OwnedCheckWorldScope { .. } | TxOp::OwnedCheckWorldPurge { .. } | TxOp::OwnedCheckRange { .. } | TxOp::OwnedCheckCapacity { .. } | TxOp::OwnedCheck { .. }) => Ok(()),
@@ -1011,6 +1011,13 @@ impl<'a> OpenTransaction<'a> {
         }
         let retained_release = crate::hosted_control::retained_release_world(operations);
         let proposal_overlay = crate::hosted_control::hosted_proposal_overlay(operations);
+        let proposal_land = crate::hosted_control::hosted_proposal_land(operations);
+        admitted.extend(proposal_land.map(|(world, _)| world));
+        if proposal_land.is_none() && operations.iter().any(|op| matches!(op,
+            Operation::Public(TxOp::OwnedPublishWorld { land_root: Some(_), .. })
+        )) {
+            return Err(unavailable());
+        }
         admitted.extend(retained_release);
         admitted.extend(proposal_overlay);
         if proposal_overlay.is_none() && publications.iter().any(|publication| publication.5.is_some()) {
@@ -1168,7 +1175,23 @@ impl<'a> OpenTransaction<'a> {
                 return Err(unavailable());
             }
         }
-        if let Some(world) = retained_release {
+        if let Some((world, pin)) = proposal_land {
+            let (record, _) = self.owned_worlds.get(&world).ok_or_else(unavailable)?;
+            let parent = record.parent_publication.ok_or_else(unavailable)?;
+            if record.mode != rtdb_types::WorldClockMode::Proposal || record.pin != pin
+                || record.basis.system_time != parent || deadline.is_none()
+                || operations.len().saturating_add(2) > 4096
+                || operations.iter().filter(|op| matches!(op, Operation::Public(TxOp::OwnedCheckWorldScope { .. }))).count() != 1
+                || self.read_owned_revision(
+                    owner,
+                    &rtdb_types::OwnedRelation::new(rtdb_types::OWNED_ROOT_PUBLICATION_RELATION)?,
+                    &rtdb_types::EntityId::String("head".into()),
+                    Interval::ALL,
+                ).await? != Some(parent)
+            {
+                return Err(unavailable());
+            }
+        } else if let Some(world) = retained_release {
             let original_pin = operations.iter().find_map(|op| match op {
                 Operation::Public(TxOp::OwnedPublishWorld { delete_root, .. }) => *delete_root,
                 _ => None,

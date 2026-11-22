@@ -1699,6 +1699,7 @@ pub struct OwnedWorldFork {
 #[derive(Default)]
 pub struct OwnedRootSection {
     pub proposal_overlay: bool,
+    pub proposal_land: bool,
     pub checks: Vec<TxOp>,
     pub publication: Option<OwnedRootPublication>,
 }
@@ -1886,6 +1887,17 @@ impl NativeSession {
             && root.checks.is_empty() && root.publication.is_none()
             && rtdb_tx::retained_release_controls(&controls));
         let proposal_overlay = root.proposal_overlay;
+        let proposal_land = root.proposal_land;
+        if proposal_land && (sections.len() != 1 || proposal_overlay
+            || !matches!(&sections[0].1.effect, OwnedWorldEffect::Drop)
+            || sections[0].1.expected_clock.is_none()
+            || root.publication.as_ref().is_none_or(|root| root.attempt != sections[0].1.attempt
+                || !matches!(&root.writes[..], [TxOp::OwnedReplaceDocs { relation, documents, valid_from: None, valid_to: None }]
+                    if relation.is_root_data() && documents.rows().len() == 1))
+            || !rtdb_tx::proposal_land_controls(&controls))
+        {
+            return Err(unavailable());
+        }
         if proposal_overlay && (sections.len() != 1 || root.publication.is_some()
             || !matches!(&sections[0].1.effect, OwnedWorldEffect::Overlay(_) | OwnedWorldEffect::SettleProposal)
             || !rtdb_tx::retained_delete_controls(&controls))
@@ -1893,7 +1905,7 @@ impl NativeSession {
             return Err(unavailable());
         }
         if !(1..=8).contains(&sections.len()) || controls.is_empty()
-            || (!retained_release && !proposal_overlay && controls.iter().any(|control| !control.is_check()))
+            || (!retained_release && !proposal_overlay && !proposal_land && controls.iter().any(|control| !control.is_check()))
             || root.checks.iter().any(|check| match check {
                 TxOp::OwnedCheck { relation, .. } | TxOp::OwnedCheckRange { relation, .. } =>
                     relation.world().is_some() || relation.is_world_catalog(),
@@ -1916,10 +1928,10 @@ impl NativeSession {
             }) {
                 return Err(unavailable());
             }
-            if !delete_root {
+            if !delete_root && !proposal_land {
                 attempts.insert(&root.attempt);
             }
-            effects = effects.saturating_add(root.writes.len()).saturating_add(if delete_root { 1 } else { 3 });
+            effects = effects.saturating_add(root.writes.len()).saturating_add(if delete_root || proposal_land { 1 } else { 3 });
         }
         for (retained_until, section) in &sections {
             let terminal_proposal = matches!(&section.effect, OwnedWorldEffect::SettleProposal);
@@ -1958,7 +1970,7 @@ impl NativeSession {
         ops.extend(root.checks);
         if let Some(root) = root.publication {
             ops.extend(root.writes);
-            if !delete_root {
+            if !delete_root && !proposal_land {
                 ops.push(TxOp::OwnedPublishRoot { attempt: root.attempt, fingerprint });
             }
         }
@@ -1975,7 +1987,9 @@ impl NativeSession {
             };
             ops.push(TxOp::OwnedPublishWorld { world: section.world, attempt: section.attempt,
                 fingerprint, expected: section.expected_clock, advance_to, drop_world,
-                settlement_pin, delete_root: delete_root.then_some(section.parent_pin) });
+                settlement_pin,
+                land_root: proposal_land.then_some(section.parent_pin),
+                delete_root: delete_root.then_some(section.parent_pin) });
         }
         self.state.execute_tx(ops, Default::default()).await
     }

@@ -99,6 +99,9 @@ pub fn decode_replica(message: &ResolvedTx, predecessor: Option<TransactionKey>,
                 match hosted {
                     worlds::HostedEffects::CheckOnly if has_controls =>
                         return Err(invalid("Resolved world effects may only check hosted controls")),
+                    worlds::HostedEffects::ProposalLanding if controls.iter()
+                        .filter_map(|(_, write)| write.batch()).map(|batch| batch.len()).sum::<usize>() != 2 =>
+                        return Err(invalid("Resolved Proposal landing requires its two owner rows")),
                     worlds::HostedEffects::RequiredReplacements if controls.is_empty() =>
                         return Err(invalid("Resolved control-only retained fork has no hosted replacements")),
                     worlds::HostedEffects::RetainedRelease if !(1..=2).contains(
