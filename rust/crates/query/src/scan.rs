@@ -2209,8 +2209,8 @@ mod tests {
 
     #[tokio::test]
     async fn ordered_list_and_percentile_aggregates_select_arrow_positions() {
-        use rtdb_plan::{AggregateExpr, AggregateFunction, BinaryOp, NamedExpr, PercentileFraction, PercentileKind, Relation, RelationNode, Schema, SortExpr};
-        let (state, table, _) = live_table_with_values([Value::I64(1), Value::I64(3), Value::I64(2), Value::I64(2), Value::Null]);
+        use rtdb_plan::{AggregateExpr, AggregateFunction, BinaryOp, NamedExpr, PercentileFraction, PercentileKind, Relation, RelationNode, Schema, SetOperator, SortExpr};
+        let (state, table, _) = live_table_with_values([Value::I64(1), Value::I64(3), Value::I64(2)]);
         let storage = Arc::new(BufferPool::new(Arc::new(MemoryStore::default()), 1 << 20));
         let (scan, execution, memory) = descriptor_scan(state.value().snapshot(), table, storage);
         let expression = scan.columns[0].expression();
@@ -2219,7 +2219,13 @@ mod tests {
         order.id = ColumnId(8);
         order.name = "order_key".into();
         order.data_type = LogicalType::Scalar(ScalarType::I64).maybe();
-        let input = Arc::new(Arc::new(Relation::scan(scan).unwrap()).project(vec![
+        let scan = Arc::new(Relation::scan(scan).unwrap());
+        let schema = scan.schema().clone();
+        let tail = Arc::new(Relation::new(schema.clone(), RelationNode::Values {
+            rows: vec![vec![Expr::Literal(Value::I64(2))], vec![Expr::Literal(Value::Null)]],
+        }).unwrap());
+        let joined = Arc::new(Relation::new(schema, RelationNode::Set { left: scan, right: tail, operator: SetOperator::Union, all: true }).unwrap());
+        let input = Arc::new(joined.project(vec![
             NamedExpr { field: value_field.clone(), expr: expression.clone() },
             NamedExpr { field: order.clone(), expr: Expr::binary(BinaryOp::Subtract, Expr::Literal(Value::I64(0)), expression.clone()) },
         ]).unwrap());
@@ -2280,6 +2286,31 @@ mod tests {
         let mut columns = crate::operators::build_columns(runtime, execution).await.unwrap().expect("Expected Arrow membership");
         assert!(rows.next_page().await.unwrap().is_none());
         assert!(columns.next_batch().await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn uuid_groups_keep_their_first_arrow_key_positions() {
+        use rtdb_plan::{AggregateExpr, AggregateFunction, NamedExpr, Relation, RelationNode, Schema};
+        let one = Value::Uuid([1; 16]);
+        let two = Value::Uuid([2; 16]);
+        let (state, table, _) = live_table_with_values([two.clone(), one.clone(), two.clone()]);
+        let storage = Arc::new(BufferPool::new(Arc::new(MemoryStore::default()), 1 << 20));
+        let (scan, execution, memory) = descriptor_scan(state.value().snapshot(), table, storage);
+        let key = scan.columns[0].clone();
+        let count = rtdb_plan::Field { id: ColumnId(8), name: "count".into(), qualifier: None,
+            qualified_only: false, unnamed: false, data_type: LogicalType::Scalar(ScalarType::I64) };
+        let relation = Arc::new(Relation::new(Schema::new(vec![key.clone(), count.clone()]).unwrap(), RelationNode::Aggregate {
+            input: Arc::new(Relation::scan(scan).unwrap()), groups: vec![NamedExpr { field: key.clone(), expr: key.expression() }],
+            aggregates: vec![AggregateExpr { field: count, function: AggregateFunction::CountStar, argument: None, distinct: false, filter: None, order_by: vec![] }],
+        }).unwrap());
+        let runtime = crate::runtime_schema::EmittedRelation::derive(relation, &execution.context.catalog, &[], &memory).unwrap();
+        let mut pages = crate::operators::build_pages(Arc::clone(&runtime), execution.clone()).await.unwrap();
+        let mut columns = crate::operators::build_columns(runtime, execution).await.unwrap().expect("Expected Arrow grouping");
+        let batch = columns.next_batch().await.unwrap().unwrap();
+        assert!(batch.columns.iter().all(|column| !matches!(column, crate::columnar::Column::Values(_))));
+        let actual = (0..batch.len).map(|row| batch.columns.iter().map(|column| column.value(row).unwrap()).collect::<Vec<_>>()).collect::<Vec<_>>();
+        assert_eq!(actual, [vec![two, Value::I64(2)], vec![one, Value::I64(1)]]);
+        assert_eq!(actual, pages.next_page().await.unwrap().unwrap().rows().iter().map(|row| row.values.clone()).collect::<Vec<_>>());
     }
 
     #[tokio::test]

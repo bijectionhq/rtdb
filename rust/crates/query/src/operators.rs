@@ -200,7 +200,7 @@ async fn build_batches_at(
             Ok(Some((Box::new(input), projected)))
         }
         RelationNode::Aggregate { groups, aggregates, .. } if output == BatchOutput::Arrow => {
-            if !crate::aggregate::AggregateCursor::writes_scalar_vectors(&runtime, groups, aggregates)? { return Ok(None); }
+            if !crate::aggregate::AggregateCursor::supports_columnar(&runtime, groups, aggregates)? { return Ok(None); }
             let child = runtime.child(0)?;
             let schema = child.schema().clone();
             let Some((input, projected)) = build_batch_input(child, execution.child(0), pushdowns, output).await? else { return Ok(None); };
@@ -577,7 +577,7 @@ fn batch_shape_at(runtime: &Arc<EmittedRelation>, output: BatchOutput) -> Result
         }
         RelationNode::Distinct { .. } if output == BatchOutput::Arrow => batch_shape(&runtime.child(0)?, output)?,
         RelationNode::Aggregate { groups, aggregates, .. } if output == BatchOutput::Arrow => {
-            if !crate::aggregate::AggregateCursor::writes_scalar_vectors(runtime, groups, aggregates)? { return Ok(None); }
+            if !crate::aggregate::AggregateCursor::supports_columnar(runtime, groups, aggregates)? { return Ok(None); }
             batch_shape(&runtime.child(0)?, output)?.map(|_| false)
         }
         RelationNode::Mark { arguments, .. } if output == BatchOutput::Arrow && !arguments.is_empty() =>
@@ -1538,10 +1538,14 @@ impl BatchApplyPlan {
     }
 
     async fn dependent_batches(&self, batch: &crate::columnar::ColumnBatch, row: usize) -> Result<crate::columnar::BoxBatchCursor> {
-        let execution = self.bind(batch, row).await?.child(1);
+        self.open_dependent(self.bind(batch, row).await?).await
+    }
+
+    async fn open_dependent(&self, execution: Execution) -> Result<crate::columnar::BoxBatchCursor> {
+        let execution = execution.child(1);
         let runtime = Arc::clone(&self.dependent);
-        match build_batches(Arc::clone(&runtime), execution.clone(), None).await? {
-            Some((batches, _)) => Ok(batches),
+        match build_columns(Arc::clone(&runtime), execution.clone()).await? {
+            Some(batches) => Ok(batches),
             None => Ok(crate::columnar::batches_from_pages(
                 build_pages(runtime, execution).await?, self.dependent.schema().len(), Arc::clone(&self.execution.context.memory),
             )),
@@ -1707,18 +1711,20 @@ impl crate::columnar::BatchCursor for BatchApply {
                 if let Some((comparison, schema)) = &plan.comparison {
                     let row = Arc::new(batch.expression_row(position, &plan.positions, memory)?);
                     let execution = plan.execution.bind_arguments(&plan.arguments, &plan.schema, Arc::clone(&row)).await?;
-                    let dependent = build_pages(Arc::clone(&plan.dependent), execution.child(1)).await?;
-                    let mark = crate::mark::correlated_mark(&row, dependent, comparison, schema, &execution).await?;
+                    let dependent = plan.open_dependent(execution.clone()).await?;
+                    let mark = crate::mark::correlated_batch_mark(&row, dependent, comparison, schema, &execution).await?;
                     marks.push(match mark { Value::Bool(value) => Some(value), _ => None });
                     continue;
                 }
-                let execution = plan.bind(&batch, position).await?;
-                let mut cursor = build(Arc::clone(&plan.dependent), execution.child(1)).await?;
-                let first = cursor.next().await?;
+                let mut cursor = plan.dependent_batches(&batch, position).await?;
+                let mut first = None;
+                while let Some(page) = crate::columnar::poll_nested_batch(cursor.as_mut()).await? {
+                    if page.len > 0 { page.validate_readable(context)?; first = Some(page); break; }
+                }
                 match plan.kind {
                     ApplyKind::Semi | ApplyKind::Anti => selected.push(first.is_some() == (plan.kind == ApplyKind::Semi)),
                     ApplyKind::Exists => marks.push(Some(first.is_some())),
-                    ApplyKind::Mark => marks.push(apply_mark(&mut cursor, first, &plan.execution).await?),
+                    ApplyKind::Mark => marks.push(apply_batch_mark(&mut cursor, first, &plan.execution).await?),
                     _ => unreachable!("The apply mode was checked"),
                 }
             }
@@ -1734,6 +1740,35 @@ impl crate::columnar::BatchCursor for BatchApply {
             return Ok(Some(batch));
         }
     }
+}
+
+async fn apply_batch_mark(cursor: &mut crate::columnar::BoxBatchCursor, mut next: Option<crate::columnar::ColumnBatch>, execution: &Execution) -> Result<Option<bool>> {
+    use crate::scalar_key::ScalarKey;
+    let context = &execution.context;
+    let mut mark = Some(false);
+    while let Some(page) = next {
+        page.validate_readable(context)?;
+        for row in 0..page.len {
+            context.check_cancelled_at(row)?;
+            let column = page.columns.first().ok_or_else(|| invalid("mark-type", "Mark comparison must return Boolean or null"))?;
+            match ScalarKey::read(column, row) {
+                Some(ScalarKey::Bool(true)) => return Ok(Some(true)),
+                Some(ScalarKey::Bool(false)) => continue,
+                Some(ScalarKey::Null) => mark = None,
+                _ => {
+                    let _cell = context.memory.reserve(column.bound(row)?)?;
+                    match column.value(row)? {
+                        Value::Bool(true) => return Ok(Some(true)),
+                        Value::Bool(false) => (),
+                        Value::Null | Value::Undefined => mark = None,
+                        _ => return Err(invalid("mark-type", "Mark comparison must return Boolean or null")),
+                    }
+                }
+            }
+        }
+        next = crate::columnar::poll_nested_batch(cursor.as_mut()).await?;
+    }
+    Ok(mark)
 }
 
 async fn apply_mark(cursor: &mut BoxCursor, mut next: Option<OwnedRow>, execution: &Execution) -> Result<Option<bool>> {

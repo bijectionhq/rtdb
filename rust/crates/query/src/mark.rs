@@ -388,6 +388,35 @@ pub(crate) async fn correlated_mark(row: &OwnedRow,mut dependent: BoxPageCursor,
     Ok(result)
 }
 
+pub(crate) async fn correlated_batch_mark(row: &OwnedRow, mut dependent: BoxBatchCursor, comparison: &Expr,
+    schema: &Schema, execution: &Execution) -> Result<Value> {
+    let context = &execution.context;
+    let memory = &context.memory;
+    let width = row.values.len();
+    let positions = crate::columnar::expression_columns(comparison, schema)?.into_iter()
+        .filter_map(|position| position.checked_sub(width)).collect::<Vec<_>>();
+    let mut result = Value::Bool(false);
+    while let Some(page) = poll_nested_batch(dependent.as_mut()).await? {
+        page.validate_readable(context)?;
+        let metadata = execution.scope()?;
+        let invocation = execution.prepare_expression(comparison, schema, &metadata)?;
+        for candidate in 0..page.len {
+            context.check_cancelled_at(candidate)?;
+            let right = page.expression_row(candidate, &positions, memory)?;
+            let combined = OwnedRow::copy_parts(&[&row.values, &right.values], 0, 0, memory)?;
+            let scope = execution.scope()?;
+            match execution.evaluate_invocation(&scope, &invocation, &combined.values).await? {
+                Value::Bool(true) => result = Value::Bool(true),
+                Value::Null if result != Value::Bool(true) => result = Value::Null,
+                Value::Bool(false) | Value::Null => (),
+                _ => return Err(invalid("mark-type", "Mark comparison must return Boolean or null")),
+            }
+        }
+        if result == Value::Bool(true) { break; }
+    }
+    Ok(result)
+}
+
 #[cfg(test)]
 mod facts_tests {
     use super::*;

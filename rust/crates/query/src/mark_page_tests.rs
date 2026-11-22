@@ -77,6 +77,31 @@ async fn uncorrelated_arrow_membership_matches_page_marks_with_null_and_empty_bu
 }
 
 #[tokio::test]
+async fn correlated_scalar_apply_keeps_computed_dependent_vectors() {
+    use rtdb_plan::{ApplyKind, NamedExpr};
+    let execution = execution(2);
+    let input = table(0, &[1, 2]);
+    let value = field(2, LogicalType::Scalar(ScalarType::I64));
+    let dependent = Arc::new(table(1, &[10]).project(vec![NamedExpr { field: value.clone(), expr: Expr::binary(
+        BinaryOp::Add, column(1), Expr::Parameter { index: 0, data_type: LogicalType::Scalar(ScalarType::I64) },
+    ) }]).unwrap());
+    let output = field(3, value.data_type.maybe());
+    let schema = input.schema().concat(&Schema::new(vec![output.clone()]).unwrap()).unwrap();
+    let relation = Arc::new(Relation::new(schema, RelationNode::Apply {
+        input, dependent, arguments: vec![(0, column(0))], kind: ApplyKind::Scalar, output: Some(output),
+    }).unwrap());
+    let runtime = EmittedRelation::derive(Arc::clone(&relation), &execution.context.catalog, &[], &execution.context.memory).unwrap();
+    let mut columns = crate::operators::build_columns(runtime, execution.clone()).await.unwrap().expect("Expected Arrow Apply");
+    let batch = columns.next_batch().await.unwrap().unwrap();
+    assert_eq!(batch.len, 2);
+    assert!(batch.columns.iter().all(|column| !matches!(column, crate::columnar::Column::Values(_))));
+    let actual = (0..batch.len).map(|row| batch.columns[1].value(row).unwrap()).collect::<Vec<_>>();
+    assert_eq!(actual, [Value::I64(11), Value::I64(12)]);
+    let mut pages = open(relation, &execution).await;
+    assert_eq!(actual, pages.next_page().await.unwrap().unwrap().rows().iter().map(|row| row.values[1].clone()).collect::<Vec<_>>());
+}
+
+#[tokio::test]
 async fn mark_hashes_eligibility_keys_and_keeps_unknown_marks_in_memory_and_on_disk() {
     let data_type = LogicalType::Scalar(ScalarType::I64).maybe();
     let left_field = field(0,data_type.clone());

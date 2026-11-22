@@ -182,11 +182,10 @@ impl AggregateCursor {
         Self::positions(&self.schema, &self.groups, &self.aggregates, collect_vectors)
     }
 
-    pub fn writes_scalar_vectors(runtime: &EmittedRelation, groups: &[NamedExpr], aggregates: &[AggregateExpr]) -> Result<bool> {
+    pub fn supports_columnar(runtime: &EmittedRelation, groups: &[NamedExpr], aggregates: &[AggregateExpr]) -> Result<bool> {
         if aggregates.is_empty() { return Ok(false); }
         let child = runtime.child(0)?;
-        if Self::positions(child.schema(), groups, aggregates, true).is_none() { return Ok(false); }
-        Ok(runtime.schema().fields()[..groups.len()].iter().all(|field| group_key_type(&field.data_type)))
+        Ok(Self::positions(child.schema(), groups, aggregates, true).is_some())
     }
     /// The input positions every aggregate and group reads, when each reads only its argument or key column.
     pub fn reads_columns(schema: &Schema, groups: &[NamedExpr], aggregates: &[AggregateExpr]) -> Option<Vec<usize>> {
@@ -441,7 +440,7 @@ impl BatchCursor for AggregateCursor {
     }
 }
 
-fn group_key_type(ty: &LogicalType) -> bool {
+fn direct_rank_type(ty: &LogicalType) -> bool {
     use ScalarType as S;
     matches!(without_nullability(ty), LogicalType::Null | LogicalType::Scalar(
         S::Bool | S::I8 | S::I16 | S::I32 | S::I64 | S::F32 | S::F64 | S::Utf8 | S::Binary))
@@ -872,7 +871,7 @@ impl CollectionVectors {
         let mut reservation = memory.reserve(bytes)?;
         let mut values = Vec::with_capacity(groups);
         let mut picks = Vec::with_capacity(groups);
-        let gather = kind == PercentileKind::Discrete && group_key_type(&output.data_type);
+        let gather = kind == PercentileKind::Discrete && direct_rank_type(&output.data_type);
         let read = |(batch, row): (usize, usize)| Rows::Columns { batch: &self.batches[batch], projected: self.projected, memory }.value(row, Some(0));
         for group in 0..groups {
             context.check_cancelled_at(group)?;
