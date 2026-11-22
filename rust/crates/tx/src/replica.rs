@@ -99,6 +99,9 @@ pub fn decode_replica(message: &ResolvedTx, predecessor: Option<TransactionKey>,
                 match hosted {
                     worlds::HostedEffects::CheckOnly if has_controls =>
                         return Err(invalid("Resolved world effects may only check hosted controls")),
+                    worlds::HostedEffects::ProposalClose if !(4..=7).contains(
+                        &controls.iter().filter_map(|(_, write)| write.batch()).map(|batch| batch.len()).sum::<usize>()
+                    ) => return Err(invalid("Resolved Proposal close lacks its bounded custody and receipt effects")),
                     worlds::HostedEffects::ProposalLanding if controls.iter()
                         .filter_map(|(_, write)| write.batch()).map(|batch| batch.len()).sum::<usize>() != 2 =>
                         return Err(invalid("Resolved Proposal landing requires its two owner rows")),

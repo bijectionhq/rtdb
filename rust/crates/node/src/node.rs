@@ -1710,6 +1710,7 @@ impl OwnedWorldFork {
 pub struct OwnedRootSection {
     pub proposal_overlay: bool,
     pub proposal_land: bool,
+    pub proposal_close: bool,
     pub checks: Vec<TxOp>,
     pub publication: Option<OwnedRootPublication>,
 }
@@ -1889,7 +1890,7 @@ impl NativeSession {
         let terminal = sections.first().filter(|(_, section)| sections.len() == 1
             && matches!(&section.effect, OwnedWorldEffect::Drop)
             && section.checks.is_empty() && section.expected_clock.is_none());
-        let delete_root = terminal.is_some_and(|(_, section)| root.publication.as_ref().is_some_and(|root| {
+        let delete_root = !root.proposal_close && terminal.is_some_and(|(_, section)| root.publication.as_ref().is_some_and(|root| {
             root.attempt == section.attempt && matches!(root.writes.as_slice(), [
                 TxOp::OwnedDelete { relation, valid_from: None, valid_to: None, .. }
             ] if relation.is_root_data())
@@ -1898,14 +1899,24 @@ impl NativeSession {
             && root.checks.is_empty() && root.publication.is_none()
             && rtdb_tx::retained_release_controls(&controls));
         let proposal_overlay = root.proposal_overlay;
-        let proposal_land = root.proposal_land;
+        let proposal_close = root.proposal_close;
+        let proposal_land = root.proposal_land || proposal_close;
         if proposal_land && (sections.len() != 1 || proposal_overlay
             || !matches!(&sections[0].1.effect, OwnedWorldEffect::Drop)
-            || sections[0].1.expected_clock.is_none()
-            || root.publication.as_ref().is_none_or(|root| root.attempt != sections[0].1.attempt
-                || !matches!(&root.writes[..], [TxOp::OwnedReplaceDocs { relation, documents, valid_from: None, valid_to: None }]
-                    if relation.is_root_data() && documents.rows().len() == 1))
-            || !rtdb_tx::proposal_land_controls(&controls))
+            || (root.proposal_land && proposal_close)
+            || if proposal_close {
+                !sections[0].1.checks.is_empty()
+                    || root.publication.as_ref().is_none_or(|root| root.attempt != sections[0].1.attempt
+                        || !matches!(&root.writes[..], [TxOp::OwnedDelete { relation, valid_from: None, valid_to: None, .. }]
+                            if relation.is_root_data()))
+                    || !rtdb_tx::proposal_close_controls(&controls)
+            } else {
+                sections[0].1.expected_clock.is_none()
+                    || root.publication.as_ref().is_none_or(|root| root.attempt != sections[0].1.attempt
+                        || !matches!(&root.writes[..], [TxOp::OwnedReplaceDocs { relation, documents, valid_from: None, valid_to: None }]
+                            if relation.is_root_data() && documents.rows().len() == 1))
+                    || !rtdb_tx::proposal_land_controls(&controls)
+            })
         {
             return Err(unavailable());
         }
@@ -1957,7 +1968,7 @@ impl NativeSession {
                 OwnedWorldEffect::Overlay(_) => return Err(unavailable()),
                 OwnedWorldEffect::Clock(_) | OwnedWorldEffect::Drop | OwnedWorldEffect::SettleProposal => 0,
             };
-            if !worlds.insert(section.world) || (!retained_release && !terminal_proposal && !(1..=128).contains(&section.checks.len()))
+            if !worlds.insert(section.world) || (!retained_release && !terminal_proposal && !proposal_close && !(1..=128).contains(&section.checks.len()))
                 || section.checks.len() > 128
                 || !attempts.insert(&section.attempt)
             {
