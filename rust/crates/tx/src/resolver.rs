@@ -693,7 +693,7 @@ impl<'a> OpenTransaction<'a> {
                 self.reserve_owned_attempt(attempt, *fingerprint).await?;
                 let documents = crate::Documents::new(vec![record.clone()], &self.context.memory)?;
                 let relation = rtdb_types::OwnedRelation::world_catalog();
-                if matches!(root, crate::OwnedForkRoot::WritesAdvance | crate::OwnedForkRoot::WritesRenewal | crate::OwnedForkRoot::ProposalHold) {
+                if matches!(root, crate::OwnedForkRoot::WritesAdvance | crate::OwnedForkRoot::WritesRenewal | crate::OwnedForkRoot::ProposalHold | crate::OwnedForkRoot::ProposalShorten) {
                     // The ordered preconditions compared the exact original
                     // registration and its lease on the base snapshot.
                     let owner = self.options.user.as_deref().ok_or_else(no_owned_principal)?;
@@ -702,7 +702,7 @@ impl<'a> OpenTransaction<'a> {
                 } else {
                     self.write_owned(&relation, &documents, None, None, None, previous.is_none() || sibling.is_some()).await?;
                 }
-                if matches!(*root, crate::OwnedForkRoot::Writes | crate::OwnedForkRoot::WritesAdvance | crate::OwnedForkRoot::WritesRenewal | crate::OwnedForkRoot::WritesSibling | crate::OwnedForkRoot::ProposalWrites | crate::OwnedForkRoot::ProposalHold) {
+                if matches!(*root, crate::OwnedForkRoot::Writes | crate::OwnedForkRoot::WritesAdvance | crate::OwnedForkRoot::WritesRenewal | crate::OwnedForkRoot::WritesSibling | crate::OwnedForkRoot::ProposalWrites | crate::OwnedForkRoot::ProposalHold | crate::OwnedForkRoot::ProposalShorten) {
                     self.publish_owned_root_head().await?;
                 }
                 Ok(())
@@ -1046,10 +1046,11 @@ impl<'a> OpenTransaction<'a> {
             _ => None,
         }) {
             use crate::OwnedForkRoot;
-            let proposal_hold = root == OwnedForkRoot::ProposalHold;
+            let proposal_shorten = root == OwnedForkRoot::ProposalShorten;
+            let proposal_hold = matches!(root, OwnedForkRoot::ProposalHold | OwnedForkRoot::ProposalShorten);
             let renewal = root == OwnedForkRoot::WritesRenewal || proposal_hold;
             let sibling_fork = root == OwnedForkRoot::WritesSibling;
-            let replaces_pin = matches!(root, OwnedForkRoot::WritesAdvance | OwnedForkRoot::WritesRenewal | OwnedForkRoot::ProposalHold);
+            let replaces_pin = matches!(root, OwnedForkRoot::WritesAdvance | OwnedForkRoot::WritesRenewal | OwnedForkRoot::ProposalHold | OwnedForkRoot::ProposalShorten);
             let bounded_write = replaces_pin || sibling_fork;
             let publish_root = root == OwnedForkRoot::Writes || root == OwnedForkRoot::ProposalWrites || bounded_write;
             let with_root = root != OwnedForkRoot::None;
@@ -1089,7 +1090,7 @@ impl<'a> OpenTransaction<'a> {
                     }
                     Operation::Public(TxOp::OwnedInsertDocs { relation, documents, valid_from: None, valid_to: None })
                     | Operation::OwnedWriteIids { relation, documents, valid_from: None, valid_to: None, create_only: true, .. }
-                        if (sibling_fork || proposal_hold) && relation.is_root_data() && documents.rows().len() == 1
+                        if (sibling_fork || (proposal_hold && !proposal_shorten)) && relation.is_root_data() && documents.rows().len() == 1
                             && replacement.is_none() => {
                         let id = crate::source::document_id(&documents.rows()[0], &self.context.memory)?;
                         replacement = Some((relation, id));
@@ -1100,6 +1101,11 @@ impl<'a> OpenTransaction<'a> {
                         if publish_root && !bounded_write && relation.is_root_data() && !documents.rows().is_empty() => {
                         root_rows = root_rows.saturating_add(documents.rows().len());
                         effects = effects.saturating_add(documents.rows().len() - 1);
+                    }
+                    Operation::Public(TxOp::OwnedDelete { relation, id, valid_from: None, valid_to: None })
+                        if proposal_shorten && relation.is_root_data() && replacement.is_none() => {
+                        replacement = Some((relation, id.clone()));
+                        root_rows += 1;
                     }
                     Operation::Public(TxOp::OwnedDelete { relation, .. }) if publish_root && !bounded_write && relation.is_root_data() => {
                         root_rows = root_rows.saturating_add(1);
@@ -1129,7 +1135,9 @@ impl<'a> OpenTransaction<'a> {
                                 deadline.is_some_and(|until| until.0 <= prior.until.0.saturating_sub(crate::SIBLING_PIN_MARGIN_MICROS))
                                     && prior.can_seed_sibling(&world)
                             } else if replaces_pin {
-                                deadline.is_some_and(|until| until <= prior.until) && if proposal_hold {
+                                deadline.is_some_and(|until| until <= prior.until) && if proposal_shorten {
+                                    prior.can_shorten_proposal(&world)
+                                } else if proposal_hold {
                                     prior.can_hold_proposal(&world)
                                 } else if renewal {
                                     prior.can_renew_to(&world)
@@ -1158,7 +1166,7 @@ impl<'a> OpenTransaction<'a> {
             let replacement_checked = replacement.is_some_and(|(relation, id)| operations.iter().any(|operation| matches!(
                 operation,
                 Operation::Public(TxOp::OwnedCheck { relation: checked, id: observed, expected, .. })
-                    if *checked == *relation && *observed == id && expected.is_none() == (sibling_fork || proposal_hold)
+                    if *checked == *relation && *observed == id && expected.is_none() == (sibling_fork || (proposal_hold && !proposal_shorten))
             )));
             if (bounded_write && (!replacement_checked || !existing_control_write || control_writes > (5 + usize::from(proposal_hold))))
                 || forks != 1 || checks == 0 || expected_tip != checked_tip || effects > 4096

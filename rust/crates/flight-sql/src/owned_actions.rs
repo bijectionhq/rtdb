@@ -1738,15 +1738,16 @@ impl Service {
         let ([mode], rest) = rest.split_first_chunk::<1>().ok_or_else(|| invalid("World fork has no clock mode"))?;
         let select_publication = matches!(*mode, 4 | 5) && publish_root;
         let proposed_publication = *mode == 5 && publish_root;
-        let proposal_hold = *mode == 8 && publish_root;
+        let proposal_hold = matches!(*mode, 8 | 9) && publish_root;
+        let proposal_shorten = *mode == 9 && publish_root;
         let sibling = *mode == 7 && publish_root;
-        let renewal = matches!(*mode, 6 | 7 | 8) && publish_root;
+        let renewal = matches!(*mode, 6 | 7 | 8 | 9) && publish_root;
         if renewal && (*previous_handle == [0; 16] || *capture != [0; 16] || *suffix != [0; 16]) {
             return Err(invalid("An authored renewal requires its original retained handle and derives its archive"));
         }
         let (requested, rest) = match *mode {
             0 => (rtdb_node::WorldClockRequest::Retained, rest),
-            8 if proposal_hold => (rtdb_node::WorldClockRequest::Proposal, rest),
+            8 | 9 if proposal_hold => (rtdb_node::WorldClockRequest::Proposal, rest),
             6 | 7 if renewal => (rtdb_node::WorldClockRequest::Retained, rest),
             4 if select_publication => (rtdb_node::WorldClockRequest::Retained, rest),
             5 if proposed_publication => (rtdb_node::WorldClockRequest::Proposal, rest),
@@ -1848,11 +1849,14 @@ impl Service {
             if (authored_replacement && !sibling && !proposal_hold && !matches!(writes.as_slice(), [
                 TxOp::OwnedReplaceDocs { documents, valid_from: None, valid_to: None, .. }
             ] if documents.rows().len() == 1))
-                || ((sibling || proposal_hold) && !matches!(writes.as_slice(), [
+                || ((sibling || (proposal_hold && !proposal_shorten)) && !matches!(writes.as_slice(), [
                     TxOp::OwnedInsertDocs { documents, valid_from: None, valid_to: None, .. }
                 ] if documents.rows().len() == 1))
+                || (proposal_shorten && !matches!(writes.as_slice(), [
+                    TxOp::OwnedDelete { valid_from: None, valid_to: None, .. }
+                ]))
             {
-                return Err(invalid("A retained authored advance requires one acceptance-valid Root replacement"));
+                return Err(invalid("The authored custody change requires one acceptance-valid Root effect"));
             }
             if !writes.is_empty() {
                 root.publication = Some(rtdb_node::OwnedRootPublication { attempt: attempt.to_owned(), writes });

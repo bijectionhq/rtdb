@@ -222,6 +222,7 @@ pub(crate) async fn fork_checkpoint_world_selected(
         && matches!(fork.requested, rtdb_node::WorldClockRequest::Retained);
     let renewal = fork.cut.is_renewal();
     let proposal_hold = renewal && matches!(fork.requested, rtdb_node::WorldClockRequest::Proposal);
+    let proposal_shorten = fork.shortens_proposal();
     let source_mode = if proposal_hold { WorldClockMode::Proposal } else { WorldClockMode::Retained };
     let (capture, suffix) = if renewal {
         let predecessor = fork.previous.ok_or_else(OwnedWorld::unavailable)?;
@@ -369,7 +370,11 @@ pub(crate) async fn fork_checkpoint_world_selected(
             let expected_source = fork.sibling.map_or(id, |world| Uuid::from_bytes(world.0));
             if previous.world != expected_source || previous.owner != retained.owner
                 || (!authored_advance && !renewal && previous.until != retained.until)
-                || previous.mode != source_mode || retained.mode != source_mode || (proposal_hold && retained.until < previous.until)
+                || previous.mode != source_mode || retained.mode != source_mode || (proposal_hold && if proposal_shorten {
+                    retained.until >= previous.until
+                } else {
+                    retained.until < previous.until
+                })
                 || if renewal {
                     previous.basis != retained.basis || previous.capture != retained.capture
                         || previous.suffix != retained.suffix || previous.manifest_sha256 != retained.manifest_sha256
