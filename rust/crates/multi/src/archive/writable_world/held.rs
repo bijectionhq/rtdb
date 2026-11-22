@@ -53,6 +53,8 @@ pub(crate) struct WorldIdentityPage {
 impl HeldCheckpointWorld {
     pub fn present(&self) -> TransactionKey { self.open.snapshot.present() }
 
+    pub fn parent_basis(&self) -> TransactionKey { self.open.retained.basis }
+
     pub fn check(&self) -> Result<()> {
         self.open.check()?;
         if self.cancellation.is_cancelled() || self.requests.is_closed() {
@@ -75,6 +77,7 @@ impl HeldCheckpointWorld {
         self.check_relation(relation)?;
         let valid = Interval::at(valid_at)?;
         let (local, witness) = self.open.read_local(relation, id, valid_at, &self.memory, observed).await?;
+        let shadowed = local.is_some();
         let fact = if let Some(fact) = local {
             fact
         } else {
@@ -87,7 +90,7 @@ impl HeldCheckpointWorld {
                 .ok_or_else(OwnedWorld::unavailable)?.map_err(|_| OwnedWorld::unavailable())??
         };
         self.check_relation(relation)?;
-        Ok(WorldPoint { present: self.present(), fact, witness })
+        Ok(WorldPoint { present: self.present(), fact, shadowed, witness })
     }
     pub async fn identity_page(
         &self, relation: &OwnedRelation, valid: Timestamp, after: Option<&str>, limit: usize,

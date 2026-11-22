@@ -416,9 +416,10 @@ The read resolves the local world shadow at one reserved present, including tomb
 The IPC metadata reports the live world present as `rtdb.owned.present_micros` and the selected instant as `rtdb.owned.valid_micros`.
 A found row includes the winning local or archived `rtdb.owned.revision_micros`. An absent row has no record batch.
 
-`rtdb.owned.OpenWorldRead.v1` takes the world UUID and admits one live cut and its verified archived parent.
-The single result contains 16 opaque handle bytes followed by the signed big-endian 64-bit live present in Unix microseconds.
+`rtdb.owned.OpenWorldRead.v2` takes the world UUID and admits one live cut and its verified archived parent.
+The 40-byte result contains the opaque handle, the live present, and the archived parent transaction ID and system time. Each coordinate is a signed big-endian 64-bit integer. Times are Unix microseconds.
 `rtdb.owned.ReadHeldWorldPoint.v2` takes the 16-byte held handle, one observation flag byte (0 for read-only or 1 to request a witness), then the same relation and Arrow fields as the one-shot read.
+The point response schema includes `rtdb.owned.world_shadowed` (0 or 1). A local tombstone counts as a shadow.
 Every call reads the same live cut and archive root. The held handle stays bound to the original authenticated session and attachment.
 Use `rtdb.owned.CloseWorldRead.v1` with the 16-byte handle to cancel the read. Success has zero Flight results. The archive lease releases after in-flight I/O drains.
 A held read expires no later than 60 seconds or the world's own expiration. A drop fences new opens. Earlier admitted handles can read only while their original cut and archive lease still admit them.

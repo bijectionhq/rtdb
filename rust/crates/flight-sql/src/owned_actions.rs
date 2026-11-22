@@ -149,7 +149,7 @@ pub(crate) const HELD_OWNED_IDENTITIES_V1: &str = "rtdb.owned.ReadHeldIdentityPa
 pub(crate) const HELD_OWNED_VERSIONS_V2: &str = "rtdb.owned.ReadHeldVersions.v2";
 pub(crate) const CLOSE_OWNED_READ_V1: &str = "rtdb.owned.CloseRead.v1";
 pub(crate) const READ_WORLD_POINT_V1: &str = "rtdb.owned.ReadWorldPoint.v1";
-pub(crate) const OPEN_WORLD_READ_V1: &str = "rtdb.owned.OpenWorldRead.v1";
+pub(crate) const OPEN_WORLD_READ_V2: &str = "rtdb.owned.OpenWorldRead.v2";
 pub(crate) const HELD_WORLD_POINT_V2: &str = "rtdb.owned.ReadHeldWorldPoint.v2";
 pub(crate) const CLOSE_WORLD_READ_V1: &str = "rtdb.owned.CloseWorldRead.v1";
 pub(crate) const DROP_WORLD_V1: &str = "rtdb.owned.DropWorld.v1";
@@ -1339,9 +1339,12 @@ impl Service {
             world,
         ).await.map_err(status)?;
         let handle = Uuid::new_v4();
-        let mut reply = Vec::with_capacity(24);
+        let parent = snapshot.parent_basis();
+        let mut reply = Vec::with_capacity(40);
         reply.extend_from_slice(handle.as_bytes());
         reply.extend_from_slice(&snapshot.present().0.to_be_bytes());
+        reply.extend_from_slice(&parent.tx_id.0.to_be_bytes());
+        reply.extend_from_slice(&parent.system_time.0.to_be_bytes());
         let held = Arc::new(OwnedWorldReadResource {
             snapshot, world, conditions: Mutex::new(BTreeMap::new()),
             owner: call.session.owner(), session: call.session.id.clone(), database: call.database.clone(),
@@ -1425,7 +1428,12 @@ impl Service {
     }
 
     fn world_point_reply(&self, call: &Call, result: crate::WorldPointResult, valid_at: Timestamp, nonce: Option<Uuid>) -> Result<ActionResult, Status> {
-        let metadata = nonce.into_iter().map(|nonce| (WORLD_POINT_WITNESS.into(), nonce.simple().to_string())).collect();
+        let mut metadata = std::collections::HashMap::from([
+            ("rtdb.owned.world_shadowed".into(), u8::from(result.shadowed).to_string()),
+        ]);
+        if let Some(nonce) = nonce {
+            metadata.insert(WORLD_POINT_WITNESS.into(), nonce.simple().to_string());
+        }
         if let Some(row) = result.row {
             let crate::WorldPointRow { fields: row, revision, reservation: _retained } = row;
             let bytes = Value::document_retained_bytes(&row).map_err(status)?;

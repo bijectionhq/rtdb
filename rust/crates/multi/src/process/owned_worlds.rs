@@ -107,6 +107,8 @@ impl OwnedWorldHost for PlacedWorldHost {
 impl OwnedWorldRead for HeldCheckpointWorld {
     fn present(&self) -> Timestamp { HeldCheckpointWorld::present(self).system_time }
 
+    fn parent_basis(&self) -> TransactionKey { HeldCheckpointWorld::parent_basis(self) }
+
     fn check_relation(&self, relation: &OwnedRelation) -> Result<()> {
         HeldCheckpointWorld::check_relation(self, relation)
     }
@@ -136,5 +138,5 @@ fn point_result(read: crate::archive::WorldPoint) -> WorldPointResult {
         let (fields, revision, reservation) = fact.into_parts();
         WorldPointRow { fields, revision, reservation }
     });
-    WorldPointResult { present: read.present.system_time, row, witness: read.witness }
+    WorldPointResult { present: read.present.system_time, row, shadowed: read.shadowed, witness: read.witness }
 }
