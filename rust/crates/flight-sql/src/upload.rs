@@ -99,10 +99,21 @@ fn validate_ingest(command: &CommandStatementIngest, database: &str) -> Result<(
     Ok(())
 }
 pub(crate) fn documents(batch: &RecordBatch, service: &Service) -> Result<(Vec<StructFields<Value>>, Arc<MemoryReservation>), Status> {
+    decode_documents(batch, service, rtdb_columnar::read_execution_value_as)
+}
+
+pub(crate) fn domain_documents(batch: &RecordBatch, service: &Service) -> Result<(Vec<StructFields<Value>>, Arc<MemoryReservation>), Status> {
+    decode_documents(batch, service, rtdb_columnar::read_value_as)
+}
+
+fn decode_documents(
+    batch: &RecordBatch, service: &Service,
+    read: impl Fn(&rtdb_types::LogicalType, &arrow_schema::Field, &dyn arrow_array::Array, usize) -> rtdb_types::Result<Value>,
+) -> Result<(Vec<StructFields<Value>>, Arc<MemoryReservation>), Status> {
     let schema = batch.schema(); let mut bound = 8192;
     for row in 0..batch.num_rows() { for (column, field) in schema.fields().iter().enumerate() { bound = wire::add(bound, wire::add(field.name().len(), estimate_read_value_bytes(field, batch.column(column).as_ref(), row).map_err(status)?)?)?; } }
     let scratch = service.memory().reserve(bound).map_err(status)?;
     let types = if batch.num_rows() == 0 { Vec::new() } else { schema.fields().iter().map(|field| rtdb_columnar::from_field(field).map_err(status)).collect::<Result<Vec<_>, _>>()? };
-    let rows = (0..batch.num_rows()).map(|row| schema.fields().iter().zip(&types).enumerate().map(|(column, (field, ty))| Ok((field.name().clone(), rtdb_columnar::read_execution_value_as(ty, field, batch.column(column).as_ref(), row).map_err(status)?))).collect::<Result<StructFields<_>, Status>>()).collect::<Result<Vec<_>, _>>()?;
+    let rows = (0..batch.num_rows()).map(|row| schema.fields().iter().zip(&types).enumerate().map(|(column, (field, ty))| Ok((field.name().clone(), read(ty, field, batch.column(column).as_ref(), row).map_err(status)?))).collect::<Result<StructFields<_>, Status>>()).collect::<Result<Vec<_>, _>>()?;
     Ok((rows, scratch))
 }

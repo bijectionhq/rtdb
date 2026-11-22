@@ -8,10 +8,10 @@ use bytes::Bytes;
 use prost::Message;
 use rtdb_columnar::{MemoryReservation, OwnedBatch};
 use rtdb_format::ipc::{OwnedStream, write_arrow_stream};
-use rtdb_node::{NativeSession, OwnedReadSession, TransactionStatus};
+use rtdb_node::{NativeSession, OwnedRangeRequest, OwnedReadSession, TransactionStatus};
 use rtdb_query::QueryCursor;
 use rtdb_tx::{Documents, TxOp};
-use rtdb_types::{EntityId, OwnedRelation, TimeUnit, Timestamp, Value};
+use rtdb_types::{EntityId, OwnedRelation, StructFields, TimeUnit, Timestamp, Value};
 use tokio::sync::OwnedSemaphorePermit;
 use tonic::Status;
 use uuid::Uuid;
@@ -88,6 +88,7 @@ pub(crate) const OPEN_OWNED_READ_V1: &str = "rtdb.owned.OpenRead.v1";
 pub(crate) const HELD_OWNED_POINT_V1: &str = "rtdb.owned.ReadHeldPoint.v1";
 pub(crate) const CLOSE_OWNED_READ_V1: &str = "rtdb.owned.CloseRead.v1";
 pub(crate) const HELD_OWNED_RANGE_V1: &str = "rtdb.owned.ReadHeldRange.v1";
+pub(crate) const HELD_OWNED_RANGE_V2: &str = "rtdb.owned.ReadHeldRange.v2";
 const READ_IDLE: Duration = Duration::from_secs(60);
 const OWNED_PRESENT: &str = "rtdb.owned.present_micros";
 const OWNED_VALID: &str = "rtdb.owned.valid_micros";
@@ -135,6 +136,14 @@ fn request_batch(call: &Call, arrow: &[u8]) -> Result<OwnedBatch, Status> {
         return Err(invalid("Owned action requires an _id column"));
     }
     Ok(batch)
+}
+
+fn compound_bound(value: Option<&Value>) -> Result<Option<&StructFields<Value>>, Status> {
+    match value {
+        Some(Value::Null) => Ok(None),
+        Some(Value::Struct(fields)) => Ok(Some(fields)),
+        _ => Err(invalid("Owned full-key range endpoints must be structs or null")),
+    }
 }
 
 fn require_idle(native: &NativeSession) -> Result<(), Status> {
@@ -315,7 +324,7 @@ impl Service {
         Ok(reply)
     }
 
-    pub(crate) async fn held_owned_range_action(&self, call: &Call, body: &[u8]) -> Result<ActionResult, Status> {
+    pub(crate) async fn held_owned_range_action(&self, call: &Call, body: &[u8], full_key: bool) -> Result<ActionResult, Status> {
         if !self.0.config.owned_native_actions { return Err(unsupported()); }
         let (handle, request) = body.split_first_chunk::<16>().ok_or_else(|| invalid("Owned held range has no handle"))?;
         let handle = Bytes::copy_from_slice(handle);
@@ -326,19 +335,34 @@ impl Service {
         }
         let (relation, arrow) = split_relation(request)?;
         let batch = decode_batch(call, arrow)?;
-        if batch.batch().num_rows() != 1 || batch.batch().num_columns() != 4 {
-            return Err(invalid("Owned range requires one row with path, lower, upper, and limit"));
+        let expected_fields = if full_key { 6 } else { 4 };
+        if batch.batch().num_rows() != 1 || batch.batch().num_columns() != expected_fields {
+            return Err(invalid("Owned range requires one row with the fields for its action version"));
         }
-        let (mut rows, _decoded) = upload::documents(batch.batch(), self)?;
+        let (mut rows, _decoded) = upload::domain_documents(batch.batch(), self)?;
         let row = rows.pop().expect("validated one row");
         let (Some(Value::Utf8(path)), Some(lower), Some(upper), Some(Value::I64(limit))) =
             (row.get("path"), row.get("lower"), row.get("upper"), row.get("limit"))
         else { return Err(invalid("Owned range fields have invalid types")); };
         let path = OwnedRelation::new(path.as_str()).map_err(status)?;
         let limit = usize::try_from(*limit).map_err(|_| invalid("Owned range limit is out of range"))?;
-        let lower = (!matches!(lower, Value::Null | Value::Undefined)).then_some(lower);
-        let upper = (!matches!(upper, Value::Null | Value::Undefined)).then_some(upper);
-        let page = held.snapshot.range(&relation, &path, lower, upper, limit).await.map_err(status)?;
+        let page = if full_key {
+            let Some(Value::Bool(descending)) = row.get("descending") else {
+                return Err(invalid("Owned range requires a boolean descending field"));
+            };
+            let request = OwnedRangeRequest {
+                lower: compound_bound(Some(lower))?,
+                upper: compound_bound(Some(upper))?,
+                after: compound_bound(row.get("after"))?,
+                descending: *descending,
+                limit,
+            };
+            held.snapshot.range_page_by_key(&relation, &path, request).await
+        } else {
+            let lower = (!matches!(lower, Value::Null | Value::Undefined)).then_some(lower);
+            let upper = (!matches!(upper, Value::Null | Value::Undefined)).then_some(upper);
+            held.snapshot.range(&relation, &path, lower, upper, limit).await
+        }.map_err(status)?;
         let reply = self.owned_point_reply(
             &page.schema, page.batch.as_ref().map(OwnedBatch::batch), held.snapshot.present().system_time, None,
         )?;
