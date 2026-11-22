@@ -49,7 +49,7 @@ async fn export_snapshot(options: cli::StartOptions, database: String, dry_run: 
     config.flight_sql = None;
     config.health = None;
     let (handle, driver) = ServerDriver::open_with_memory(config, options.allocation_limit_bytes, memory).await?;
-    let plan = match handle.node().snapshot_export(&database, handle.node().now()) {
+    let plan = match handle.node().snapshot_export(&database, handle.node().now()).await {
         Ok(Some(plan)) => plan,
         Ok(None) => {
             let reported = write_report(std::io::stderr().lock(), |output| writeln!(output, "No completed blocks found - aborting."));
@@ -242,7 +242,7 @@ mod tests {
             let directory = tempfile::tempdir().unwrap();
             let (handle, driver) = unopened(directory.path()).await;
             let error = if export_error {
-                handle.node().snapshot_export("missing-database", handle.node().now()).err().expect("missing database")
+                handle.node().snapshot_export("missing-database", handle.node().now()).await.err().expect("missing database")
             } else { write_report(BrokenOutput, |output| writeln!(output, "maintenance manifest")).unwrap_err() };
             let code = error.code.clone();
             assert_eq!(close_unstarted::<()>(driver, Err(error)).await.unwrap_err().code, code);

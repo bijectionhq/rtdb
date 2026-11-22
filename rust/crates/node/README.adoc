@@ -54,8 +54,9 @@ Database names that cannot form a safe single path component use an injective he
 Production local-log writers sample the configured clock for source transactions and the system clock for other messages, unless `with_local_log_clock` enables the configured clock for all records.
 `with_log_clock` replaces that clock with a fallible host clock for in-memory and local source transactions, keeping the local log's policy for other messages.
 The clock is sampled during append, after queue admission.
-`Node::snapshot_export` requires indexing and compaction to be disabled and returns a passive, charged manifest for the loaded block.
-The plan copies through the existing object-store capability, accepts completed immutable copies on retry and checks cancellation between copies.
+`Node::snapshot_export` requires indexing and compaction to be disabled and loads the exact checkpoint root and its table manifests.
+The export includes table declarations without data files and derives the primary trie dependencies from the checkpoint's own table manifests.
+The plan copies through the existing object-store capability, accepts completed immutable copies on retry and publishes the checkpoint root after its dependencies.
 `Node::prepare_compactor_reset` catches up through a block and captures surviving L0 pairs directly from storage, including files whose serving entries were removed by compaction.
 The passive `CompactorReset` plan retains its catalog generation, term capability, deletion list and memory reservations.
 Its application requires an exclusive maintenance node with indexing enabled and compaction and automatic GC disabled.

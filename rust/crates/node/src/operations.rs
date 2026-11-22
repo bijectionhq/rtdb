@@ -1,7 +1,7 @@
 use std::{collections::BTreeMap, sync::Arc, time::Duration};
 use rtdb_columnar::MemoryReservation;
-use rtdb_format::keys::{CURRENT_STORAGE_VERSION, StorageRoot, TrieKey, block_key, lex_hex};
-use rtdb_index::{CatalogTrie, TrieCatalog, TrieState};
+use rtdb_format::{catalog::CheckpointContents, keys::{CURRENT_STORAGE_VERSION, StorageRoot, TrieKey, block_key, lex_hex}};
+use rtdb_index::{CatalogTrie, TrieCatalog};
 use rtdb_storage::{ObjectKey, ObjectStore};
 use rtdb_types::{Anomaly, AnomalyCategory, BlockIndex, Result, StorageEpoch, TableRef, Timestamp};
 use tokio_util::sync::CancellationToken;
@@ -64,7 +64,8 @@ impl SnapshotExport {
     /// Completed copies remain on failure and identical retries are accepted.
     /// Cancellation is checked between copies; an admitted object copy finishes before returning.
     pub async fn copy(&self, cancellation: &CancellationToken) -> Result<()> {
-        for key in &self.files {
+        // The root makes the destination visible to checkpoint discovery.
+        for key in self.files.iter().skip(1).chain(self.files.first()) {
             if cancellation.is_cancelled() { return Err(Anomaly::new(AnomalyCategory::Interrupted, "rtdb.export/cancelled", "Snapshot export was cancelled")); }
             self.store.copy(key, &self.destination(key)?).await?;
         }
@@ -125,14 +126,26 @@ impl Node {
         }
         Ok(CompactorReset { database, term, expected, expected_block: value.live().block_index(), replacements, files, reservations: reservations.into() })
     }
-    /// Captures the loaded block's live and nascent files for an offline snapshot export.
+    /// Plans an offline export from the loaded block's immutable dependency closure.
     /// Indexing and compaction must be disabled on this node; source files must remain available until copying finishes.
     /// Returns None when the database has no completed block.
-    pub fn snapshot_export(&self, database: &str, now: Timestamp) -> Result<Option<SnapshotExport>> {
+    pub async fn snapshot_export(&self, database: &str, now: Timestamp) -> Result<Option<SnapshotExport>> {
         self.require_offline_export()?;
         let database = self.catalog().database(database)?;
         let value = database.partition.value();
-        let Some(block_index) = value.table_catalog().block_index() else { return Ok(None); };
+        let Some(captured) = value.table_catalog().block() else { return Ok(None); };
+        let block_index = captured.block_index();
+        let expected = captured.publication_sha256();
+        let blocks = rtdb_replication::BlockStore::new(
+            Arc::clone(database.storage.object_store()),
+            Arc::clone(&database.storage),
+            Arc::clone(self.memory()),
+            value.trie_catalog().file_size_target(),
+        )?;
+        let (block, tables) = blocks.load(block_index).await?;
+        if expected.is_some_and(|digest| block.publication_sha256() != Some(digest)) {
+            return Err(invalid("Loaded checkpoint root changed while planning the export"));
+        }
         let date = rtdb_types::CivilDateTime::from_epoch_second(now.epoch_parts().0, 0)?;
         let (year, month, day) = date.date().ymd();
         let year_of_era = if year <= 0 { 1 - year } else { year };
@@ -141,28 +154,25 @@ impl Node {
         let date = format!("{year}{month:02}{day:02}T{:02}{:02}{:02}Z", second / 3600, second / 60 % 60, second % 60);
         let directory = ObjectKey::new(format!("exports/b{}_{}", lex_hex(u64::try_from(block_index.0).map_err(invalid)?), date))?;
         let root = ObjectKey::new(format!("{directory}/{}", StorageRoot::new(CURRENT_STORAGE_VERSION, StorageEpoch(0))?.key()))?;
+        let entries = block.table_entries()?;
         let mut bound = 4096usize;
-        let mut table_count = 0;
-        for table in value.trie_catalog().tables() {
-            let entry = value.table_catalog().entry(table).ok_or_else(|| invalid("Trie table has no registered slug"))?;
-            bound = bound.checked_add(entry.slug.as_str().len()).and_then(|bytes| bytes.checked_add(512)).ok_or_else(overflow)?;
-            for trie in value.trie_catalog().iter_tries(table).filter(|trie| !matches!(trie.state, TrieState::Garbage { .. })) {
-                let path_bytes = entry.slug.as_str().len().checked_add(trie.key.part().len()).and_then(|bytes| bytes.checked_add(512)).ok_or_else(overflow)?;
-                bound = bound.checked_add(path_bytes.checked_mul(4).ok_or_else(overflow)?).ok_or_else(overflow)?;
+        for entry in &entries {
+            let slug_bytes = entry.slug.as_str().len();
+            bound = bound.checked_add(slug_bytes.checked_mul(4).and_then(|size| size.checked_add(1024)).ok_or_else(overflow)?).ok_or_else(overflow)?;
+            let table = tables.get(&entry.table).ok_or_else(|| invalid("Checkpoint table manifest is unavailable"))?;
+            for trie in table.trie_details() {
+                let bytes = trie.trie_key.as_ref().map_or(0, String::len).checked_add(slug_bytes).ok_or_else(overflow)?;
+                bound = bound.checked_add(bytes.checked_mul(8).and_then(|size| size.checked_add(1024)).ok_or_else(overflow)?).ok_or_else(overflow)?;
             }
-            table_count += 1;
         }
         let reservation = self.memory().reserve(bound)?;
+        let table_count = entries.len();
         let mut files = vec![ObjectKey::new(block_key(block_index)?)?];
-        for table in value.trie_catalog().tables() {
-            let entry = value.table_catalog().entry(table).ok_or_else(|| invalid("Trie table has no registered slug"))?;
+        for entry in entries {
+            let table = tables.get(&entry.table).ok_or_else(|| invalid("Checkpoint table manifest is unavailable"))?;
             files.push(ObjectKey::new(entry.slug.block_key(block_index)?)?);
-        }
-        for table in value.trie_catalog().tables() {
-            let entry = value.table_catalog().entry(table).ok_or_else(|| invalid("Trie table has no registered slug"))?;
-            for trie in value.trie_catalog().live_and_nascent_tries(table) {
-                files.push(ObjectKey::new(entry.slug.metadata_key(&trie.key))?);
-                files.push(ObjectKey::new(entry.slug.data_key(&trie.key))?);
+            for file in table.checkpoint_trie_files(&entry.slug, CheckpointContents::Primary)? {
+                files.push(ObjectKey::new(file)?);
             }
         }
         Ok(Some(SnapshotExport { store: Arc::clone(database.storage.object_store()), block_index, export_time: now, directory, storage_root: root, table_count, files, _reservation: reservation }))

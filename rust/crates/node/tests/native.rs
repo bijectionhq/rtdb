@@ -1032,12 +1032,14 @@ async fn offline_export_copies_one_loaded_block_and_reopens_as_a_single_partitio
         let (node, driver) = running(settings.clone(), fresh_local_services(&runtime_services)).await;
         let mut session = node.session("xtdb", Arc::new(Authority)).unwrap();
         assert!(session.state_mut().execute_tx(vec![put(&node, 1, 10)], AutonomousTxOptions::default()).await.unwrap().committed());
+        let empty = TxOp::Sql { sql: "CREATE TABLE empty_history (value BIGINT)".into(), args: None };
+        assert!(session.state_mut().execute_tx(vec![empty], AutonomousTxOptions::default()).await.unwrap().committed());
         node.catalog().database("xtdb").unwrap().flush().await.unwrap();
         node.sync_all(Duration::from_secs(10), &CancellationToken::new()).await.unwrap();
         node.catalog().database("xtdb").unwrap().compaction().unwrap().compact_all().await.unwrap();
         node.catalog().database("xtdb").unwrap().flush().await.unwrap();
         node.sync_all(Duration::from_secs(10), &CancellationToken::new()).await.unwrap();
-        assert!(node.snapshot_export("xtdb", Timestamp(0)).is_err());
+        assert!(node.snapshot_export("xtdb", Timestamp(0)).await.is_err());
         drop(session);
         stop(&node, driver).await;
         drop(node);
@@ -1045,7 +1047,7 @@ async fn offline_export_copies_one_loaded_block_and_reopens_as_a_single_partitio
         settings.replication.enabled = false;
         settings.compaction_threads = 0;
         let (node, driver) = running(settings.clone(), fresh_local_services(&runtime_services)).await;
-        let plan = node.snapshot_export("xtdb", Timestamp(0)).unwrap().unwrap();
+        let plan = node.snapshot_export("xtdb", Timestamp(0)).await.unwrap().unwrap();
         assert!(plan.directory().as_str().ends_with("_19700101T000000Z"));
         assert_eq!(plan.files()[0].as_str(), rtdb_format::keys::block_key(plan.block_index()).unwrap());
         assert!(plan.files().iter().any(|path| path.as_str().contains("/data/l01-rc")));
@@ -1070,6 +1072,7 @@ async fn offline_export_copies_one_loaded_block_and_reopens_as_a_single_partitio
         let (restored, driver) = running(settings, fresh_local_services(&runtime_services)).await;
         let mut session = restored.session("xtdb", Arc::new(Authority)).unwrap();
         assert_eq!(rows(session.query_sql("SELECT value FROM docs", vec![]).await.unwrap()).await, vec![vec![Value::I64(10)]]);
+        assert!(rows(session.query_sql("SELECT value FROM empty_history", vec![]).await.unwrap()).await.is_empty());
         drop(session);
         stop(&restored, driver).await;
     }).await.unwrap();
@@ -1081,7 +1084,7 @@ async fn offline_export_has_no_manifest_before_a_completed_block() {
     settings.replication.enabled = false;
     settings.compaction_threads = 0;
     let (node, driver) = running(settings, services()).await;
-    assert!(node.snapshot_export("xtdb", Timestamp(0)).unwrap().is_none());
+    assert!(node.snapshot_export("xtdb", Timestamp(0)).await.unwrap().is_none());
     stop(&node, driver).await;
 }
 
