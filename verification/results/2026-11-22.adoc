@@ -368,3 +368,75 @@ All 33 resolver cases passed.
 The combined Gradle run passed 3,198 standard, 3,348 property and 5,629 integration cases.
 The PostgreSQL slot-recreation fixture was skipped.
 No reflection or boxed-math warnings were recorded.
+
+== W2 and R9 · Native local disposal trace
+
+Model and replay change `c376a8669e`.
+A local directory admits erasure of one source residence after the fork has published references to two objects.
+The test captures successful copy and removal effects from the local object store during the native disposal call.
+It checks the signed empty inventory and rereads both fork copies afterwards.
+The trace records physical paths. The replay checks the source and destination scopes before mapping paths to the bounded model.
+
+[cols="1,4",options="header"]
+|===
+|Evidence | Result
+
+|Native
+|165 Multi library tests passed. The trace recorded four effects in order, copy then remove for each publication.
+The composed checker accepted all four effects and refused the trace control at its first step when a source removal moved ahead of the required copy.
+
+|TLC and Apalache
+|TLC explored 1,063 states in the per-publication composition.
+Nine unsafe changes failed, and the two reachability cases observed selective collection and whole-residence progress.
+The authored trace passed, and all five altered traces were rejected at their declared points.
+Apalache independently checked 11 transitions and found the missing replay-suffix guard in its negative control.
+
+|Combined evidence
+|On `c376a8669e`, 474 TLC cases, 70 Apalache cases, 67 Lean proof cases and 41 Verus areas with 225 controls matched.
+OpenJML, Alloy and SMT ran on the same revision. A missing Maude prelude interrupted the original aggregate run after those checks. The restored, hash-matched Maude distribution passed along with mCRL2 and AutoHyper in a separate invocation on the same revision.
+|===
+
+The native trace starts with a directory permit and an already-published fork. It ends at observed local source absence.
+The authored TLA+ trace goes through directory settlement and includes a query, an in-flight read and a recovery cursor.
+The native trace gives evidence for the local copy and removal effects. Hosted provider execution and the full composition across these entry points remain open.
+
+The reproduction runner is link:../run.py[verification/run.py].
+The native fixture and captured trace are in `per-publication-native-c376a8669e-56_ro90g/`.
+Recorded proof commands and tool identities are in `per-publication-combined-c376a8669e/` and `per-publication-combined-tail-c376a8669e-6voyi_ho/` under `/private/tmp/rtdb-formal.QMjPSJsX/`.
+
+== W1 · Replica-tip currency for reader leases
+
+Production change `aa0c65dd19`.
+The foreground and maintenance paths still share one mutex-protected state.
+Both now use the verified Rust decisions for recording a pending tip and confirming its clock anchor.
+An observation at an equal or older tip keeps the pending sample.
+The sampled tip must be installed before confirmation, and the anchor keeps the greater clock reading.
+
+[cols="1,4",options="header"]
+|===
+|Evidence | Result
+
+|Lean
+|Four audited theorems establish prefix coverage and monotonicity over arbitrary finite model histories.
+Three model controls fail at their declared theorem.
+
+|TLC
+|126,031 states for two observers, with bounded clock and replica positions.
+Four safety controls fail, and the reachability case sees one confirmation while a second observer is still active.
+
+|Verus
+|The two production functions and four laws verify for representable inputs.
+Three code mutations and three paired code-and-contract mutations fail at their declared sites.
+
+|Rust
+|All 22 Node library tests passed at `aa0c65dd19`.
+The three currency cases also passed in an isolated harness linked to the prebuilt Rust dependencies.
+|===
+
+The clock sample must precede the provider tip read. The installed frontier must advance monotonically within the same replica epoch.
+The proof covers the anchoring decision under those premises. The provider's response and drain timing, early query refusal and leadership turnover remain separate obligations.
+
+Proof logs and commands are in `read-currency-lean-ac4jaa85/`, `read-currency-tlc-a5iv5da7/`, `read-currency-verus-71qg5jbs/` and `read-currency-native-if_slre_/` under `/private/tmp/rtdb-formal.QMjPSJsX/`.
+The package test log is `read-currency-full-node-aa0c65dd19.log`.
+The post-rebase TLC run reproduced the currency results at `aa0c65dd19` and passed the added recovery custody and repair-anchor model cases and their Lean controls.
+Its commands are in `currency-rebase-recovery-aa0c65dd19-gw4uu07w/`.
