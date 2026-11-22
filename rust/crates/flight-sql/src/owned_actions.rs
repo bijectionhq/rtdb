@@ -167,7 +167,7 @@ pub(crate) enum WorldCommitFormat {
 
 pub(crate) const COMMIT_WORLD_DROP_V1: &str = "rtdb.owned.CommitWorldDrop.v1";
 pub(crate) const COMMIT_WORLD_CLOCK_V1: &str = "rtdb.owned.CommitWorldClock.v1";
-pub(crate) const COMMIT_HELD_WORLDS_V1: &str = "rtdb.owned.CommitHeldWorlds.v1";
+pub(crate) const COMMIT_HELD_WORLDS_V2: &str = "rtdb.owned.CommitHeldWorlds.v2";
 pub(crate) const COMMIT_WORLD_V4: &str = "rtdb.owned.CommitWorld.v4";
 pub(crate) const COMMIT_WORLD_V3: &str = "rtdb.owned.CommitWorld.v3";
 const MAX_WORLD_WITNESSES: usize = 128;
@@ -1603,8 +1603,8 @@ impl Service {
         let (fingerprint, body) = body.split_first_chunk::<32>().ok_or_else(|| invalid("Missing world batch fingerprint"))?;
         let (count, mut body) = body.split_first_chunk::<2>().ok_or_else(|| invalid("Missing world batch count"))?;
         let count = usize::from(u16::from_be_bytes(*count));
-        if !(2..=8).contains(&count) { return Err(invalid("A world batch requires two to eight worlds")); }
-        let _framing = call.reserve((count + 1) * MAX_COMMIT_GROUPS * 512)?;
+        if !(1..=8).contains(&count) { return Err(invalid("A world batch requires one to eight worlds")); }
+        let _framing = call.reserve((count + 2) * MAX_COMMIT_GROUPS * 512)?;
         let mut worlds = BTreeSet::new();
         let mut attempts = BTreeSet::new();
         let mut sections = Vec::with_capacity(count);
@@ -1648,6 +1648,21 @@ impl Service {
                 },
             });
         }
+        let (root_witnesses, body, _root_witness_charge) = self.owned_witness_prefix(call, body, true)?;
+        let (root_length, body) = body.split_first_chunk::<4>().ok_or_else(|| invalid("Missing Root validation length"))?;
+        let (root, body) = body.split_at_checked(u32::from_be_bytes(*root_length) as usize)
+            .ok_or_else(|| invalid("Incomplete Root validation groups"))?;
+        let mut root_checks = Vec::new();
+        let _root = self.decode_owned_commit_groups(
+            call, owned_groups(root, false, true)?, &mut root_checks, &mut rows_left, false,
+        )?;
+        if root_checks.iter().any(|check| !matches!(check, TxOp::OwnedCheck { .. })) {
+            return Err(invalid("Root conditions cannot carry mutations"));
+        }
+        rows_left = rows_left.checked_sub(root_witnesses.len()).ok_or_else(|| invalid("World batch exceeds its effect limit"))?;
+        if count == 1 && root_checks.is_empty() && root_witnesses.is_empty() {
+            return Err(invalid("A single world batch requires original Root conditions"));
+        }
         let controls = owned_groups(body, true, false)?;
         hosted_control::admit_control_targets(policy, controls.iter().map(|(relation, _)| relation))?;
         let scope = self.hosted_control_scope(call).await?;
@@ -1658,9 +1673,16 @@ impl Service {
         let mut session = connection.borrow().await?;
         require_idle(&session)?;
         for resource in &held { resource.snapshot.check().map_err(status)?; }
+        for (original, evidence) in &root_witnesses {
+            original.snapshot.check().map_err(status)?;
+            if !evidence.matches_scope(Some(scope)) {
+                return Err(Status::failed_precondition("Root range witness belongs to another placement"));
+            }
+            root_checks.push(evidence.clone().operation());
+        }
         let committed = host.commit_world_batch(
             crate::WorldCall { node: &self.0.node, attachment: &attachment, session: &mut session, cancellation: &call.cancellation },
-            sections, controls, deadline,
+            sections, root_checks, controls, deadline,
         ).await.map_err(status)?;
         self.owned_tx_reply(committed)
     }

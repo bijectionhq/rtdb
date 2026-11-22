@@ -1590,10 +1590,18 @@ impl NativeSession {
     }
     pub async fn commit_owned_world_batch(
         &mut self, sections: Vec<(Timestamp, OwnedWorldSection)>,
+        root_checks: Vec<TxOp>,
         controls: Vec<rtdb_tx::HostedControlWrite>, deadline: Timestamp,
     ) -> Result<TransactionResult> {
         let unavailable = rtdb_types::OwnedWorld::unavailable;
-        if !(2..=8).contains(&sections.len()) || controls.is_empty() || controls.iter().any(|control| !control.is_check()) {
+        if !(1..=8).contains(&sections.len()) || (sections.len() == 1 && root_checks.is_empty())
+            || controls.is_empty() || controls.iter().any(|control| !control.is_check())
+            || root_checks.iter().any(|check| match check {
+                TxOp::OwnedCheck { relation, .. } | TxOp::OwnedCheckRange { relation, .. } =>
+                    relation.world().is_some() || relation.is_world_catalog(),
+                _ => true,
+            })
+        {
             return Err(unavailable());
         }
         let scope = self.placed_history()?.ok_or_else(unavailable)?;
@@ -1602,7 +1610,7 @@ impl NativeSession {
         let mut worlds = std::collections::BTreeSet::new();
         let mut attempts = std::collections::BTreeSet::new();
         let fingerprint = sections[0].1.publication.fingerprint;
-        let mut effects = controls.len().saturating_add(2);
+        let mut effects = controls.len().saturating_add(root_checks.len()).saturating_add(2);
         for (retained_until, section) in &sections {
             if !worlds.insert(section.world) || section.writes.is_empty()
                 || !(1..=128).contains(&section.checks.len()) || section.publication.drop_world
@@ -1629,6 +1637,7 @@ impl NativeSession {
         ops.push(TxOp::OwnedDeadline { until });
         ops.push(TxOp::OwnedCheckWorldScope { scope });
         ops.extend(controls.into_iter().map(TxOp::HostedControl));
+        ops.extend(root_checks);
         for (_, section) in sections {
             self.append_world_effects(&mut ops, section.world, section.writes, section.checks)?;
             let OwnedWorldPublication { attempt, fingerprint, expected_clock, advance_to, drop_world } = section.publication;

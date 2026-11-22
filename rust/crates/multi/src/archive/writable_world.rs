@@ -311,9 +311,10 @@ pub(crate) async fn commit_checkpoint_world_checked(
 
 pub(crate) async fn commit_checkpoint_world_batch(
     directory: &dyn Directory, archive: &CellStorage, session: &mut NativeSession, deployment: Uuid,
-    sections: Vec<rtdb_node::OwnedWorldSection>, controls: Vec<rtdb_node::HostedControlWrite>, deadline: Timestamp,
+    sections: Vec<rtdb_node::OwnedWorldSection>, root_checks: Vec<rtdb_tx::TxOp>,
+    controls: Vec<rtdb_node::HostedControlWrite>, deadline: Timestamp,
 ) -> Result<TransactionKey> {
-    if !(2..=8).contains(&sections.len()) { return Err(OwnedWorld::unavailable()); }
+    if !(1..=8).contains(&sections.len()) { return Err(OwnedWorld::unavailable()); }
     let installation = directory.deployment(&deployment.to_string()).await?.ok_or_else(OwnedWorld::unavailable)?;
     let mut admitted = Vec::with_capacity(sections.len());
     for section in sections {
@@ -327,7 +328,7 @@ pub(crate) async fn commit_checkpoint_world_batch(
         })?;
         admitted.push((retained.until, section));
     }
-    let outcome = session.commit_owned_world_batch(admitted, controls, deadline).await?;
+    let outcome = session.commit_owned_world_batch(admitted, root_checks, controls, deadline).await?;
     if !outcome.committed() {
         return Err(outcome.error().cloned().unwrap_or_else(OwnedWorld::unavailable));
     }
