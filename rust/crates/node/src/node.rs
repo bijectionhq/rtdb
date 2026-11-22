@@ -856,6 +856,34 @@ impl NativeSession {
     }
     pub fn state(&self) -> &Session { &self.state }
     pub fn state_mut(&mut self) -> &mut Session { &mut self.state }
+    /// Reserves a fresh system time by awaiting an ordered, fact-free source transaction.
+    /// The key is durable in this database's history. Later transactions in that history have strictly greater system times.
+    pub async fn reserve_ordered_present(&self) -> Result<TransactionKey> {
+        self.state.revalidate().await?;
+        if self.state.status() != crate::TransactionStatus::Idle {
+            return Err(Anomaly::incorrect("xtdb/tx-already-in-progress", "Cannot reserve an ordered present while another transaction is in progress"));
+        }
+
+        let database = self.state.database();
+        let cancellation = self.state.cancellation();
+        self.service.check_submission_basis(database, self.state.effective_await_token(), cancellation).await?;
+        let metadata = rtdb_tx::UserMetadata::new(
+            Value::Struct(StructFields::from([("rtdb_present_reservation".into(), Value::Bool(true))])),
+            self.service.memory(),
+        )?;
+        let options = SubmitOptions {
+            default_tz: self.state.session_timezone().to_owned(),
+            user_metadata: Some(metadata),
+            ..SubmitOptions::default()
+        };
+        let submitted = self.service.submit(database, Vec::new(), options, cancellation).await?;
+        let (result, _) = self.service.await_submission(database, &submitted, cancellation).await?;
+        match result {
+            TransactionResult::Committed { tx_key } if tx_key.tx_id == submitted.tx_id => Ok(tx_key),
+            TransactionResult::Aborted { error: Some(error), .. } => Err((*error).clone()),
+            _ => Err(Anomaly::fault("rtdb.node/present-reservation", "The ordered present transaction did not commit at its submitted position")),
+        }
+    }
     pub async fn query_context(&mut self) -> Result<Arc<QueryContext>> {
         let basis = self.state.read_basis().await?;
         Ok(self.service.query_context(self.state.database(), &basis, self.state.cancellation()).await?.with_observer(self.service.execution_observer()).with_tracer(self.service.node.tracer(), None))

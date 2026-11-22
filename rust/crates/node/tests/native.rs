@@ -2524,6 +2524,42 @@ impl Clock for ReplayTestClock {
     fn now(&self) -> Timestamp { Timestamp(self.0.load(Ordering::Relaxed)) }
 }
 
+#[tokio::test]
+async fn ordered_present_is_applied_and_advances_when_the_append_clock_retreats() {
+    let clock = Arc::new(ReplayTestClock(AtomicI64::new(1_000_000)));
+    let log_clock = Arc::clone(&clock);
+    let resources = NativeResources::default().with_log_clock(Arc::new(move || Ok(log_clock.now())));
+    let services = NodeServices { clock: clock.clone(), resources: Arc::new(resources), ..services() };
+    let (node, driver) = running(options(), services).await;
+    let mut session = node.session("xtdb", Arc::new(Authority)).unwrap();
+    let initial = session.state_mut().execute_tx(
+        vec![put(&node, 1, 10)],
+        AutonomousTxOptions::default(),
+    ).await.unwrap();
+    assert!(initial.committed());
+
+    let first = session.reserve_ordered_present().await.unwrap();
+    clock.0.store(999_999, Ordering::Relaxed);
+    let second = session.reserve_ordered_present().await.unwrap();
+    assert!(initial.tx_key().system_time < first.system_time);
+    assert!(first.system_time < second.system_time);
+    let database = node.catalog().database("xtdb").unwrap();
+    assert_eq!(database.snapshot().tx_basis(), Some(second));
+
+    assert_eq!(
+        rows(session.query_sql("SELECT _id FROM docs FOR ALL VALID_TIME", vec![]).await.unwrap()).await,
+        [vec![Value::I64(1)]],
+    );
+    let next = session.state_mut().execute_tx(
+        vec![put(&node, 2, 20)],
+        AutonomousTxOptions::default(),
+    ).await.unwrap();
+    assert!(next.committed());
+    assert!(second.system_time < next.tx_key().system_time);
+    drop(session);
+    stop(&node, driver).await;
+}
+
 async fn commit_private(session: &mut NativeSession, operation: TxOp, key: &str, not_after: Timestamp) -> Result<CommitResult> {
     session.state_mut().begin()?;
     session.state_mut().execute_operation(operation).await?;

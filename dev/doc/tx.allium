@@ -32,6 +32,9 @@
 -- Its spill threshold accounts for Arrow buffers held by selected payloads.
 -- A batch join can gather matching payload positions from selected Arrow vectors.
 -- The embedded logical relation entry point runs plan reporting and measured execution on that read basis.
+-- An idle native session with write access can reserve an ordered present by awaiting an automatically timed, empty transaction at its submitted position.
+-- The reservation records its transaction outcome and changes no application table.
+-- Transactions that resolve later in that database history use strictly greater system times.
 -- DML evaluates CURRENT_TIMESTAMP at the assigned system time when resolving the ordered transaction.
 -- EPOCH_NANOS_BE(CURRENT_TIMESTAMP) encodes that instant as eight unsigned big-endian bytes without rounding.
 --
