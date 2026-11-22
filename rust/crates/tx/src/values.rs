@@ -943,6 +943,13 @@ fn schema_bytes(types: &[LogicalType]) -> Result<usize> {
     types.iter().try_fold(256usize, |bytes, ty| bytes.checked_add(rtdb_columnar::estimate_builder_bytes(ty, &[])?).ok_or_else(overflow))
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum OwnedForkRoot {
+    None,
+    Writes,
+    Controls,
+}
+
 #[derive(Clone, Debug)]
 pub enum TxOp {
     Sql { sql: String, args: Option<SqlArguments> },
@@ -958,7 +965,7 @@ pub enum TxOp {
     HostedControl(crate::HostedControlWrite),
     OwnedDeadline { until: Timestamp },
     OwnedCheckWorldScope { scope: rtdb_types::PlacedAttemptScope },
-    OwnedForkWorld { record: StructFields<Value>, previous: Option<rtdb_types::Iid>, attempt: String, fingerprint: [u8; 32], publish_root: bool },
+    OwnedForkWorld { record: StructFields<Value>, previous: Option<rtdb_types::Iid>, attempt: String, fingerprint: [u8; 32], root: OwnedForkRoot },
     OwnedPublishRoot { attempt: String, fingerprint: [u8; 32] },
     OwnedPublishWorld { world: rtdb_types::Iid, attempt: String, fingerprint: [u8; 32], expected: Option<Timestamp>, advance_to: Option<Timestamp>, drop_world: bool },
     OwnedCheckWorldPurge { relation: rtdb_types::OwnedRelation, pin: rtdb_types::Iid, frontier: i64, local_frontier: Option<i64> },

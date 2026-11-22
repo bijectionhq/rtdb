@@ -1352,8 +1352,11 @@ rule ConsumeIntake {
 -- If no local version exists at that instant the point reads its archived parent at the same valid instant.
 -- While a world is retained the archive retirement fence cannot close its capture.
 -- An initial retained fork at the original live Root key may share one ordered publication with checked Root writes and checked hosted controls.
--- The placed owner may select the existing certified archive from its Directory and reopens it to compare the entire original held key before ordering.
+-- A live hold may select its accepted application publication as the initial retained basis.
+-- The placed owner may select the existing certified archive from its Directory and reopens it to compare the held transaction or its exact application publication before ordering.
+-- A fork of the held application publication compares the same Root head in the ordered source transaction.
 -- Archive admission precedes ordering, and the registration, Root head, writes, control replacements and one immutable attempt marker become visible at one transaction key.
+-- A retained registration with checked hosted replacements and no Root fact writes leaves the Root head unchanged.
 -- The placed replay inventory binds the new retained registration and exact Root relation set, and separately identifies the admitted hosted tables receiving replacements.
 -- Early drop orders a terminal owner-scoped marker before the directory releases its capture pin.
 -- The terminal marker refuses later world opens and writes.

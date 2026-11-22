@@ -11,7 +11,7 @@ use super::invalid;
 pub(crate) const WORLD_EFFECTS: &str = "owned_world_effects";
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum Kind { Root, Overlay, Clock, Fork, RootRetainedFork, Advance, Drop }
+enum Kind { Root, Overlay, Clock, Fork, RootRetainedFork, ControlsRetainedFork, Advance, Drop }
 
 const ROOT: Iid = Iid([0; 16]);
 
@@ -31,6 +31,7 @@ impl Kind {
             Self::Clock => "clock",
             Self::Fork => "fork",
             Self::RootRetainedFork => "root-retained-fork",
+            Self::ControlsRetainedFork => "controls-retained-fork",
             Self::Advance => "advance",
             Self::Drop => "drop",
         }
@@ -43,6 +44,7 @@ impl Kind {
             "clock" => Ok(Self::Clock),
             "fork" => Ok(Self::Fork),
             "root-retained-fork" => Ok(Self::RootRetainedFork),
+            "controls-retained-fork" => Ok(Self::ControlsRetainedFork),
             "advance" => Ok(Self::Advance),
             "drop" => Ok(Self::Drop),
             _ => Err(mismatch()),
@@ -65,11 +67,15 @@ pub(crate) fn source_inventory(operations: &[Operation]) -> Result<Vec<Value>> {
         }
     }
     operations.iter().filter_map(|operation| match operation {
-        Operation::Public(TxOp::OwnedForkWorld { record, previous, attempt, fingerprint, publish_root }) => Some(
+        Operation::Public(TxOp::OwnedForkWorld { record, previous, attempt, fingerprint, root }) => Some(
             match record.get("_id") {
                 Some(Value::Uuid(world)) => {
-                    let kind = if *publish_root { Kind::RootRetainedFork }
-                        else if previous.is_some() { Kind::Advance } else { Kind::Fork };
+                    let kind = match root {
+                        crate::OwnedForkRoot::Writes => Kind::RootRetainedFork,
+                        crate::OwnedForkRoot::Controls => Kind::ControlsRetainedFork,
+                        crate::OwnedForkRoot::None if previous.is_some() => Kind::Advance,
+                        crate::OwnedForkRoot::None => Kind::Fork,
+                    };
                     Ok((Iid(*world), kind, attempt, fingerprint))
                 }
                 _ => Err(mismatch()),
@@ -98,12 +104,13 @@ pub(crate) fn source_inventory(operations: &[Operation]) -> Result<Vec<Value>> {
 pub(super) fn verify(
     tables: &BTreeMap<TableRef, TableWrite>, effects: &[Value], key: TransactionKey,
     memory: &Arc<MemoryBudget>,
-) -> Result<bool> {
+) -> Result<HostedEffects> {
     if !(1..=9).contains(&effects.len()) { return Err(mismatch()); }
     let mut worlds = BTreeMap::new();
     let mut attempts = BTreeMap::new();
     let mut expected_data = BTreeSet::new();
     let mut common_fingerprint: Option<&[u8]> = None;
+    let mut hosted = HostedEffects::CheckOnly;
     let mut root_retained_fork = false;
     for effect in effects {
         let Value::Struct(fields) = effect else { return Err(mismatch()); };
@@ -115,14 +122,19 @@ pub(super) fn verify(
         if fields.len() != 5 || relations.is_empty() == kind.writes_data()
             || (world == ROOT) != (kind == Kind::Root) || fingerprint.len() != 32
             || attempt.len() != 22 || !attempt.bytes().all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-            || (effects.len() > 1 && matches!(kind, Kind::Fork | Kind::RootRetainedFork | Kind::Advance))
+            || (effects.len() > 1 && matches!(kind, Kind::Fork | Kind::RootRetainedFork | Kind::ControlsRetainedFork | Kind::Advance))
             || common_fingerprint.is_some_and(|first| first != fingerprint.as_slice())
             || worlds.insert(world, kind).is_some()
             || attempts.insert(attempt.as_str(), fingerprint.as_slice()).is_some()
         {
             return Err(mismatch());
         }
-        root_retained_fork |= kind == Kind::RootRetainedFork;
+        if kind == Kind::RootRetainedFork {
+            root_retained_fork = true;
+            hosted = HostedEffects::OptionalReplacements;
+        } else if kind == Kind::ControlsRetainedFork {
+            hosted = HostedEffects::RequiredReplacements;
+        }
         for relation in relations {
             let Value::Utf8(name) = relation else { return Err(mismatch()); };
             let relation = OwnedRelation::from_source(name.clone()).map_err(|_| mismatch())?;
@@ -180,7 +192,7 @@ pub(super) fn verify(
                 let matches_kind = match worlds.get(&record.id) {
                     Some(Kind::Drop) => record.dropped,
                     Some(Kind::Fork) => !record.dropped && record.id == record.pin,
-                    Some(Kind::RootRetainedFork) => !record.dropped && record.id == record.pin
+                    Some(Kind::RootRetainedFork | Kind::ControlsRetainedFork) => !record.dropped && record.id == record.pin
                         && record.mode == rtdb_types::WorldClockMode::Retained,
                     Some(Kind::Advance) => !record.dropped && !record.mode.is_writable() && record.id != record.pin,
                     _ => false,
@@ -232,12 +244,18 @@ pub(super) fn verify(
             Kind::Root => false,
             Kind::Overlay => !overlays.contains(world) || !clocks.contains(world),
             Kind::Clock => !clocks.contains(world),
-            Kind::Fork | Kind::RootRetainedFork | Kind::Advance | Kind::Drop => !registrations.contains(world),
+            Kind::Fork | Kind::RootRetainedFork | Kind::ControlsRetainedFork | Kind::Advance | Kind::Drop => !registrations.contains(world),
         })
     {
         return Err(mismatch());
     }
-    Ok(root_retained_fork)
+    Ok(hosted)
+}
+
+pub(super) enum HostedEffects {
+    CheckOnly,
+    OptionalReplacements,
+    RequiredReplacements,
 }
 
 fn event_headers(batch: &IndexBatch, key: TransactionKey, allows_delete: bool) -> Result<()> {

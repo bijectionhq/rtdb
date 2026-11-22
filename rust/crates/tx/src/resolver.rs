@@ -689,11 +689,11 @@ impl<'a> OpenTransaction<'a> {
                 }
                 Ok(())
             }
-            Operation::Public(TxOp::OwnedForkWorld { record, previous, attempt, fingerprint, publish_root }) => {
+            Operation::Public(TxOp::OwnedForkWorld { record, previous, attempt, fingerprint, root }) => {
                 self.reserve_owned_attempt(attempt, *fingerprint).await?;
                 let documents = crate::Documents::new(vec![record.clone()], &self.context.memory)?;
                 self.write_owned(&rtdb_types::OwnedRelation::world_catalog(), &documents, None, None, None, previous.is_none()).await?;
-                if *publish_root {
+                if *root == crate::OwnedForkRoot::Writes {
                     self.publish_owned_root_head().await?;
                 }
                 Ok(())
@@ -982,13 +982,17 @@ impl<'a> OpenTransaction<'a> {
         if deadline.is_some_and(|until| self.tx_key().system_time >= until) {
             return Err(Anomaly::new(AnomalyCategory::Conflict, "rtdb.owned/expired", "Owned transaction reached its deadline before ordering"));
         }
-        if let Some(publish_root) = operations.iter().find_map(|operation| match operation {
-            Operation::Public(TxOp::OwnedForkWorld { publish_root, .. }) => Some(*publish_root),
+        if let Some(root) = operations.iter().find_map(|operation| match operation {
+            Operation::Public(TxOp::OwnedForkWorld { root, .. }) => Some(*root),
             _ => None,
         }) {
+            use crate::OwnedForkRoot;
+            let publish_root = root == OwnedForkRoot::Writes;
+            let with_root = root != OwnedForkRoot::None;
             let mut forks = 0;
             let mut checks = 0;
             let mut root_rows = 0usize;
+            let mut control_writes = 0usize;
             let mut effects = 1usize + usize::from(publish_root); // Shared attempt and optional Root head.
             let mut expected_tip = None;
             let mut checked_tip = None;
@@ -997,9 +1001,9 @@ impl<'a> OpenTransaction<'a> {
                 match operation {
                     Operation::Public(TxOp::OwnedDeadline { .. }) => {}
                     Operation::Public(TxOp::HostedControl(control)) if control.is_check() => { checks += 1; }
-                    Operation::Public(TxOp::HostedControl(_)) if publish_root => {}
+                    Operation::Public(TxOp::HostedControl(_)) if with_root => { control_writes += 1; }
                     Operation::Public(TxOp::OwnedCheck { relation, .. } | TxOp::OwnedCheckRange { relation, .. })
-                        if publish_root && relation.is_root_data() => {}
+                        if with_root && relation.is_root_data() => {}
                     Operation::Public(TxOp::OwnedInsertDocs { relation, documents, .. } | TxOp::OwnedReplaceDocs { relation, documents, .. })
                     | Operation::OwnedWriteIids { relation, documents, .. }
                         if publish_root && relation.is_root_data() && !documents.rows().is_empty() => {
@@ -1018,7 +1022,7 @@ impl<'a> OpenTransaction<'a> {
                         let world = rtdb_types::OwnedWorld::from_record(record)?;
                         if world.dropped || world.basis.system_time >= self.tx_key().system_time
                             || deadline.is_none_or(|until| until > world.until)
-                            || (publish_root && (previous.is_some()
+                            || (with_root && (previous.is_some()
                                 || world.mode != rtdb_types::WorldClockMode::Retained
                                 || world.basis.tx_id >= self.tx_key().tx_id))
                         {
@@ -1033,7 +1037,9 @@ impl<'a> OpenTransaction<'a> {
                             }
                         } else {
                             if world.pin != world.id { return Err(unavailable()); }
-                            if world.initial_clock() > world.inherited_clock() || world.mode == rtdb_types::WorldClockMode::Proposal {
+                            if world.initial_clock() > world.inherited_clock() || world.mode == rtdb_types::WorldClockMode::Proposal
+                                || (with_root && world.parent_publication == Some(world.basis.system_time))
+                            {
                                 expected_tip = Some((world.basis.system_time, world.parent_publication));
                             }
                         }
@@ -1044,6 +1050,7 @@ impl<'a> OpenTransaction<'a> {
             }
             if forks != 1 || checks == 0 || expected_tip != checked_tip || effects > 4096
                 || (publish_root && root_rows == 0)
+                || (root == OwnedForkRoot::Controls && control_writes == 0)
             {
                 return Err(unavailable());
             }

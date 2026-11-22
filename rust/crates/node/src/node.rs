@@ -1010,9 +1010,24 @@ impl OwnedReadSession {
         Ok(OwnedForkCut {
             basis: self.system_time(),
             live: self.historical.is_none().then_some(self.present),
+            publication: false,
             until: self.fork_until,
             scope,
         })
+    }
+
+    /// Retain the application publication seen by this original live hold.
+    /// The placed archive resolves its full transaction key.
+    pub async fn fork_publication_cut(&self, scope: rtdb_types::PlacedAttemptScope) -> Result<OwnedForkCut> {
+        let mut cut = self.fork_cut(scope).await?;
+        let head = cut.live.take().ok_or_else(rtdb_types::OwnedWorld::unavailable)?;
+        let publication = rtdb_query::read_owned_root_publication(Arc::clone(&self.context), &self.owner)
+            .await?.filter(|publication| *publication <= head.system_time)
+            .ok_or_else(rtdb_types::OwnedWorld::unavailable)?;
+        self.check()?;
+        cut.basis = publication;
+        cut.publication = true;
+        Ok(cut)
     }
 
     pub fn system_time(&self) -> Timestamp {
@@ -1548,6 +1563,7 @@ impl OwnedWorldWitness {
 pub struct OwnedForkCut {
     basis: Timestamp,
     live: Option<TransactionKey>,
+    publication: bool,
     until: Timestamp,
     scope: rtdb_types::PlacedAttemptScope,
 }
@@ -1555,6 +1571,10 @@ pub struct OwnedForkCut {
 impl OwnedForkCut {
     pub fn basis(&self) -> Timestamp { self.basis }
     pub fn live(&self) -> Option<TransactionKey> { self.live }
+    pub fn is_publication(&self) -> bool { self.publication }
+    pub fn matches_basis(&self, basis: TransactionKey) -> bool {
+        self.basis == basis.system_time && self.live.is_none_or(|live| live == basis)
+    }
     pub fn until(&self) -> Timestamp { self.until }
     pub fn scope(&self) -> rtdb_types::PlacedAttemptScope { self.scope }
 }
@@ -1576,7 +1596,7 @@ pub struct OwnedWorldFork {
     pub attempt: String,
     pub fingerprint: [u8; 32],
     pub controls: Vec<rtdb_tx::HostedControlWrite>,
-    pub root: OwnedRootSection,
+    pub root: Option<OwnedRootSection>,
 }
 
 #[derive(Default)]
@@ -1635,26 +1655,36 @@ impl NativeSession {
             WorldClockRequest::Held { start } => rtdb_types::WorldClockMode::Held { start: start.unwrap_or(inherited) },
             WorldClockRequest::Proposal => rtdb_types::WorldClockMode::Proposal,
         };
-        let requires_tip = record.initial_clock() > inherited || requested == rtdb_types::WorldClockMode::Proposal;
-        let publish_root = fork.root.publication.is_some();
-        let effects = fork.controls.len().saturating_add(fork.root.checks.len())
-            .saturating_add(fork.root.publication.as_ref().map_or(0, |root| root.writes.len() + 1))
+        use rtdb_tx::OwnedForkRoot;
+        let root = match &fork.root {
+            Some(section) if section.publication.is_some() => OwnedForkRoot::Writes,
+            Some(_) => OwnedForkRoot::Controls,
+            None => OwnedForkRoot::None,
+        };
+        let requires_live_tip = record.initial_clock() > inherited || requested == rtdb_types::WorldClockMode::Proposal;
+        let requires_tip = requires_live_tip || (root != OwnedForkRoot::None && record.parent_publication == Some(record.basis.system_time));
+        let effects = fork.controls.len()
+            .saturating_add(fork.root.as_ref().map_or(0, |section| section.checks.len()))
+            .saturating_add(fork.root.as_ref().and_then(|section| section.publication.as_ref()).map_or(0, |root| root.writes.len() + 1))
             .saturating_add(3 + usize::from(requires_tip));
-        if record.id != fork.world || record.pin != fork.pin || record.basis.system_time != fork.cut.basis
+        if record.id != fork.world || record.pin != fork.pin || !fork.cut.matches_basis(record.basis)
             || (fork.previous.is_none() != (record.pin == record.id)) || fork.controls.is_empty()
             || fork.previous.is_some_and(|pin| pin == record.pin || record.mode.is_writable())
-            || fork.cut.live.is_some_and(|live| live != record.basis) || record.mode != requested
-            || (requires_tip && fork.cut.live.is_none())
+            || record.mode != requested
+            || (requires_live_tip && fork.cut.live.is_none())
+            || (fork.cut.is_publication() && (root == OwnedForkRoot::None
+                || record.parent_publication != Some(fork.cut.basis())))
             || effects > 4096 || !fork.controls.iter().any(rtdb_tx::HostedControlWrite::is_check)
-            || (!publish_root && (!fork.root.checks.is_empty() || fork.controls.iter().any(|control| !control.is_check())))
-            || (publish_root && (fork.previous.is_some() || requested != rtdb_types::WorldClockMode::Retained
-                || fork.cut.live.is_none()))
-            || fork.root.checks.iter().any(|check| match check {
+            || (root == OwnedForkRoot::None && fork.controls.iter().any(|control| !control.is_check()))
+            || (root == OwnedForkRoot::Controls && fork.controls.iter().all(rtdb_tx::HostedControlWrite::is_check))
+            || (root != OwnedForkRoot::None && (fork.previous.is_some() || requested != rtdb_types::WorldClockMode::Retained
+                || (fork.cut.live.is_none() && !fork.cut.is_publication())))
+            || fork.root.iter().flat_map(|section| &section.checks).any(|check| match check {
                 TxOp::OwnedCheck { relation, .. } | TxOp::OwnedCheckRange { relation, .. } =>
                     !relation.is_root_data(),
                 _ => true,
             })
-            || fork.root.publication.as_ref().is_some_and(|root| {
+            || fork.root.as_ref().and_then(|section| section.publication.as_ref()).is_some_and(|root| {
                 root.attempt != fork.attempt || root.writes.is_empty() || root.writes.iter().any(|write| match write {
                     TxOp::OwnedInsertDocs { relation, .. } | TxOp::OwnedReplaceDocs { relation, .. }
                     | TxOp::OwnedDelete { relation, .. } => !relation.is_root_data(),
@@ -1668,9 +1698,9 @@ impl NativeSession {
         let _operations = self.service.node.memory().reserve(effects * (std::mem::size_of::<TxOp>() + 512))?;
         let mut ops = Vec::with_capacity(effects);
         ops.push(TxOp::OwnedDeadline { until });
-        if publish_root {
-            ops.extend(fork.root.checks);
-            ops.extend(fork.root.publication.into_iter().flat_map(|root| root.writes));
+        if let Some(section) = fork.root {
+            ops.extend(section.checks);
+            ops.extend(section.publication.into_iter().flat_map(|root| root.writes));
         }
         ops.extend(fork.controls.into_iter().map(TxOp::HostedControl));
         if requires_tip {
@@ -1682,7 +1712,7 @@ impl NativeSession {
             });
         }
         ops.push(TxOp::OwnedForkWorld { record: record.record(), previous: fork.previous,
-            attempt: fork.attempt, fingerprint: fork.fingerprint, publish_root });
+            attempt: fork.attempt, fingerprint: fork.fingerprint, root });
         self.state.execute_tx(ops, Default::default()).await
     }
 

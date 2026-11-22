@@ -85,7 +85,10 @@ impl OpenTransaction<'_> {
                 _ => false,
             };
         }
-        if !has_fact_write && controls.clone().any(|control| !control.is_check()) {
+        let fork_with_controls = operations.iter().any(|operation| matches!(
+            operation, Operation::Public(TxOp::OwnedForkWorld { root: crate::OwnedForkRoot::Controls, .. })
+        ));
+        if !has_fact_write && !fork_with_controls && controls.clone().any(|control| !control.is_check()) {
             return Err(unavailable());
         }
 
