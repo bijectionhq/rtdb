@@ -5,6 +5,7 @@ pub mod accelerate;
 pub mod definitions;
 pub mod file;
 pub mod lane;
+mod held_corpus;
 mod member_bounds;
 mod rank_cutoff;
 mod rank_windows;
@@ -15,4 +16,5 @@ pub use file::{DocMatch, FORMAT_VERSION, MemberMatches, SearchFile, SearchRow, S
 pub use definitions::{SearchDefinition, definitions_in};
 pub use lane::{GROUP_BYTES, KIND, SearchArtefacts, SearchBuilder, search_pages};
 pub use accelerate::{OwnedSearchHit, OwnedSearchPage, SearchAccelerator, owned_corpus, owned_ranked};
+pub use held_corpus::{HeldTextCorpus, owned_text_column};
 pub use runtime::{SearchRuntime, Suspect};

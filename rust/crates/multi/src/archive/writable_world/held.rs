@@ -49,6 +49,12 @@ enum ArchiveRead {
         guard: Arc<dyn Fn() -> Result<()> + Send + Sync>,
         reply: oneshot::Sender<Result<rtdb_node::OwnedSearchPage>>,
     },
+    SearchColumns {
+        partitions: Vec<(OwnedRelation, OwnedRelation)>,
+        frontiers: Vec<i64>,
+        guard: Arc<dyn Fn() -> Result<()> + Send + Sync>,
+        reply: oneshot::Sender<Result<Vec<String>>>,
+    },
     Ordered {
         relation: OwnedRelation,
         path: OwnedRelation,
@@ -181,12 +187,24 @@ impl HeldCheckpointWorld {
         valid: Timestamp,
     ) -> Result<(rtdb_node::OwnedSearchPage, Vec<OwnedWorldWitness>)> {
         self.check()?;
-        if self.clock_mode().is_writable() { return Err(OwnedWorld::unavailable()); }
+        if offset > 4096 || !(1..=128).contains(&limit) || !(1..=32).contains(&partitions.len())
+            || query.len() > 4096
+            || partitions.iter().map(|(relation, _)| relation).collect::<std::collections::BTreeSet<_>>().len() != partitions.len()
+        {
+            return Err(OwnedWorld::unavailable());
+        }
+        Interval::at(valid)?;
         let guard = self.open.snapshot.relation_release_guard(partitions.iter().map(|(relation, _)| relation))?;
         let witnesses = self.open.snapshot.world_relation_witnesses(
             self.open.record.id, partitions.iter().map(|(relation, _)| relation),
         ).await?;
         let frontiers = witnesses.iter().map(OwnedWorldWitness::purge_frontier).collect();
+        if self.clock_mode().is_writable() {
+            let page = self.rank_visible_documents(partitions, frontiers, &query, offset, limit, valid, &guard).await?;
+            self.check()?;
+            guard()?;
+            return Ok((page, witnesses));
+        }
         let (reply, result) = oneshot::channel();
         self.cancellation.run_until_cancelled(self.requests.send(ArchiveRead::Search {
             partitions, frontiers, query, offset, limit, valid, guard: Arc::clone(&guard), reply,
@@ -196,6 +214,50 @@ impl HeldCheckpointWorld {
         self.check()?;
         guard()?;
         Ok((page, witnesses))
+    }
+
+    async fn rank_visible_documents(
+        &self, partitions: Vec<(OwnedRelation, OwnedRelation)>, frontiers: Vec<i64>, query: &str,
+        offset: usize, limit: usize, valid: Timestamp,
+        guard: &Arc<dyn Fn() -> Result<()> + Send + Sync>,
+    ) -> Result<rtdb_node::OwnedSearchPage> {
+        let (reply, result) = oneshot::channel();
+        self.cancellation.run_until_cancelled(self.requests.send(ArchiveRead::SearchColumns {
+            partitions: partitions.clone(), frontiers, guard: Arc::clone(guard), reply,
+        })).await.ok_or_else(OwnedWorld::unavailable)?.map_err(|_| OwnedWorld::unavailable())?;
+        let columns = self.cancellation.run_until_cancelled(result).await
+            .ok_or_else(OwnedWorld::unavailable)?.map_err(|_| OwnedWorld::unavailable())??;
+        if columns.len() != partitions.len() { return Err(OwnedWorld::unavailable()); }
+
+        let mut corpus = rtdb_node::HeldTextCorpus::new(Arc::clone(&self.memory), query)?;
+        for (partition, ((relation, _), column)) in partitions.iter().zip(&columns).enumerate() {
+            if !self.open.record.schemas.relation(relation)
+                .and_then(|schema| schema.column_logical_type(column))
+                .is_some_and(|kind| kind.is_clear_search_text())
+            {
+                return Err(OwnedWorld::unavailable());
+            }
+            let mut after = None;
+            loop {
+                guard()?;
+                let page = self.identity_page(relation, valid, after.as_deref(), 128).await?;
+                for key in &page.keys {
+                    let id = EntityId::String(key.clone());
+                    let point = self.point(relation, &id, valid, false).await?;
+                    let fact = point.fact.ok_or_else(OwnedWorld::unavailable)?;
+                    let text = match fact.row().get(column.as_str()) {
+                        Some(Value::Utf8(text)) => Some(text.as_str()),
+                        None | Some(Value::Null) => None,
+                        _ => return Err(OwnedWorld::unavailable()),
+                    };
+                    corpus.observe(partition, id, text)?;
+                }
+                if !page.more { break; }
+                after = Some(page.keys.last().cloned().ok_or_else(OwnedWorld::unavailable)?);
+            }
+        }
+        guard()?;
+        corpus.finish(offset, limit)
     }
 
     pub async fn range(
@@ -514,6 +576,28 @@ pub(crate) async fn open_held_checkpoint_world(
                                         let page = rtdb_node::rank_owned_cut(scoped, &owner, &partitions, &query, offset, limit, Some(valid)).await?;
                                         guard()?;
                                         Ok(page)
+                                    };
+                                    let response = tokio::select! {
+                                        _ = scope.cancelled() => break,
+                                        _ = reply.closed() => continue,
+                                        result = read => result,
+                                    };
+                                    let _ = reply.send(response);
+                                }
+                                ArchiveRead::SearchColumns { partitions, frontiers, guard, mut reply } => {
+                                    let read = async {
+                                        guard()?;
+                                        check_archive_coverage(&context, &owner,
+                                            partitions.iter().map(|(relation, _)| relation).zip(frontiers))?;
+                                        let scoped = Arc::clone(&context).with_owned_read_guard(Arc::clone(&guard));
+                                        let mut columns = Vec::with_capacity(partitions.len());
+                                        for (relation, path) in &partitions {
+                                            columns.push(rtdb_node::owned_text_column(
+                                                Arc::clone(&scoped), &owner, relation, path,
+                                            ).await?);
+                                        }
+                                        guard()?;
+                                        Ok(columns)
                                     };
                                     let response = tokio::select! {
                                         _ = scope.cancelled() => break,
