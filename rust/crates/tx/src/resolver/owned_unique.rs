@@ -1,11 +1,12 @@
-use std::{collections::{BTreeMap, BTreeSet}, fmt::Write};
+use std::collections::{BTreeMap, BTreeSet};
+
+use rtdb_query::OwnedUniqueRule;
 
 use rtdb_types::{EntityId, OwnedRelation};
 
 use super::*;
 
-pub(super) const MAX_KEY_BYTES: usize = 4096;
-const DECLARATION_ID: &str = "!path";
+pub(super) use rtdb_query::{OWNED_UNIQUE_KEY_MAX as MAX_KEY_BYTES, owned_unique_key_id as unique_id};
 
 #[derive(Default)]
 pub(super) struct OwnedUniqueChanges {
@@ -14,7 +15,8 @@ pub(super) struct OwnedUniqueChanges {
 }
 
 struct TouchedPath {
-    column: String,
+    rule: OwnedUniqueRule,
+    writes: i64,
     ids: BTreeSet<EntityId>,
 }
 
@@ -33,17 +35,17 @@ impl OpenTransaction<'_> {
         let storage = relation.unique_table(owner);
         let snapshot = self.snapshot()?;
         if snapshot.contains_table(&storage) {
-            let declaration = EntityId::String(DECLARATION_ID.into());
-            let existing_name = self.read_unique_cell(snapshot.clone(), owner, relation, &declaration, "path").await?;
-            let existing_column = self.read_unique_cell(snapshot, owner, relation, &declaration, "column").await?;
-            if existing_name == Some(Value::Utf8(name.name().into()))
-                && existing_column == Some(Value::Utf8(column.into()))
-            {
+            let frontier = snapshot.relation_event_frontier(&target)?;
+            let context = self.context.query_context(snapshot, self.tx_key().system_time, &self.options.default_tz, self.trace_parent)?
+                .with_accelerators(Arc::from([]));
+            let existing = rtdb_query::read_owned_unique_rule(context, owner, relation).await?;
+            if &existing.path == name && existing.column == column && existing.through_events == frontier {
                 return Ok(());
             }
-            return Err(Anomaly::new(AnomalyCategory::Conflict, "rtdb.owned/unique-path-exists", "The owned relation already has a different unique path"));
+            return Err(Anomaly::new(AnomalyCategory::Conflict, "rtdb.owned/unique-path-exists", "The owned relation already has a different or uncertified unique path"));
         }
-        if snapshot.iter_segments(&target).any(|segment| segment.row_count() != 0)
+        if snapshot.relation_event_frontier(&target)? != 0
+            || snapshot.iter_segments(&target).any(|segment| segment.row_count() != 0)
             || !snapshot.trie_entries(&target).is_empty()
             || snapshot.table_catalog().metadata(&target).is_some_and(|metadata| metadata.row_count != 0)
         {
@@ -62,13 +64,9 @@ impl OpenTransaction<'_> {
                 return Err(invalid_key());
             }
         }
-        let document = StructFields::from([
-            ("_id".into(), Value::Utf8(DECLARATION_ID.into())),
-            ("path".into(), Value::Utf8(name.name().into())),
-            ("column".into(), Value::Utf8(column.into())),
-        ]);
-        self.buffer.put(storage, document, Interval::ALL)?;
-        self.unique_changes.paths.insert(relation.clone(), Some(TouchedPath { column: column.into(), ids: BTreeSet::new() }));
+        let rule = OwnedUniqueRule { path: name.clone(), column: column.into(), through_events: 0 };
+        self.buffer.put(storage, rule.document(), Interval::ALL)?;
+        self.unique_changes.paths.insert(relation.clone(), Some(TouchedPath { rule, writes: 0, ids: BTreeSet::new() }));
         Ok(())
     }
 
@@ -78,11 +76,9 @@ impl OpenTransaction<'_> {
         if !self.unique_changes.paths.contains_key(relation) {
             let snapshot = self.snapshot()?;
             let path = if snapshot.contains_table(&relation.unique_table(owner)) {
-                let id = EntityId::String(DECLARATION_ID.into());
-                let Some(Value::Utf8(column)) = self.read_unique_cell(snapshot, owner, relation, &id, "column").await? else {
-                    return Err(unique_uncovered());
-                };
-                Some(TouchedPath { column, ids: BTreeSet::new() })
+                let context = self.context.query_context(snapshot, self.tx_key().system_time, &self.options.default_tz, self.trace_parent)?;
+                let rule = rtdb_query::read_owned_unique_rule(context, owner, relation).await?;
+                Some(TouchedPath { rule, writes: 0, ids: BTreeSet::new() })
             } else {
                 None
             };
@@ -94,6 +90,7 @@ impl OpenTransaction<'_> {
             if valid.lower() != ordered || valid.upper() != Timestamp::MAX || valid.is_empty() {
                 return Err(Anomaly::incorrect("rtdb.owned/unique-valid-time", "Unique writes require validity from ordered present without an end"));
             }
+            path.writes = path.writes.checked_add(1).ok_or_else(overflow)?;
             if !path.ids.contains(id) {
                 let bytes = id.as_value().retained_bytes()?.checked_add(1024).ok_or_else(overflow)?;
                 self.unique_changes.reservations.push(self.context.memory.reserve(bytes)?);
@@ -110,13 +107,20 @@ impl OpenTransaction<'_> {
         let base = self.buffer.base_snapshot();
         let next = self.snapshot()?;
         for (relation, path) in changes.paths {
-            let Some(path) = path else { continue; };
-            if path.ids.is_empty() { continue; }
+            let Some(TouchedPath { mut rule, ids, writes }) = path else { continue; };
+            if writes == 0 { continue; }
+            let target = relation.table(owner);
+            let through_events = rule.through_events.checked_add(writes).ok_or_else(overflow)?;
+            if base.relation_event_frontier(&target)? != rule.through_events
+                || next.relation_event_frontier(&target)? != through_events {
+                return Err(unique_uncovered());
+            }
+
             let mut keys = BTreeMap::<Vec<u8>, KeyChange>::new();
             let mut allocations = Vec::new();
-            for id in path.ids {
+            for id in ids {
                 for (snapshot, final_state) in [(&base, false), (&next, true)] {
-                    let Some(key) = self.read_unique_key(snapshot.clone(), owner, &relation, &id, &path.column).await? else { continue; };
+                    let Some(key) = self.read_unique_key(snapshot.clone(), owner, &relation, &id, &rule.column).await? else { continue; };
                     allocations.push(self.context.memory.reserve(key.len().saturating_mul(4).saturating_add(512))?);
                     let change = keys.entry(key).or_default();
                     let slot = if final_state { &mut change.claim } else { &mut change.release };
@@ -150,6 +154,8 @@ impl OpenTransaction<'_> {
                     self.buffer.delete(storage.clone(), &locator, Interval::ALL)?;
                 }
             }
+            rule.through_events = through_events;
+            self.buffer.put(storage, rule.document(), Interval::ALL)?;
         }
         Ok(())
     }
@@ -190,13 +196,6 @@ impl OpenTransaction<'_> {
         }
         Ok(value)
     }
-}
-
-pub(super) fn unique_id(key: &[u8]) -> EntityId {
-    let mut name = String::with_capacity(1 + key.len() * 2);
-    name.push('k');
-    for byte in key { write!(&mut name, "{byte:02x}").expect("writing to a string cannot fail"); }
-    EntityId::String(name)
 }
 
 fn unique_taken() -> Anomaly {

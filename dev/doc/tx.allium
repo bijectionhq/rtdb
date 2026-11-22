@@ -112,6 +112,10 @@
 -- Each admitted version resolves the complete valid timeline at that revision on the same pinned physical catalog.
 -- An owned path declaration is maintained from the ordered owner's private catalog.
 -- An owned unique declaration starts before any relation data and admits one Binary key per row.
+-- Every ordered unique mutation commits the covered relation frontier together with its occupancy changes.
+-- A held current-valid unique lookup requires the declaration frontier to cover the captured relation.
+-- A hit proves both the full occupancy identity and the winning fact holder's complete Binary key.
+-- A covered miss or verified hit can yield one original held relation witness.
 -- The ordered resolver validates the final staged key set with typed holders and commits occupancy and rows together.
 -- Key conflicts expose neither the occupied key nor its holder.
 -- A held range requires an exact published covering generation for the captured frontier and serves one page directly from that path.

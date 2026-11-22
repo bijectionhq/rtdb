@@ -676,6 +676,15 @@ async fn ordered_owned_unique_groups_swaps_and_refuses_conflicts() {
     let held = session.open_owned_read().await.unwrap();
     let key = rows(held.open_point(&relation, &EntityId::Integer(2)).await.unwrap().unwrap()).await;
     assert_eq!(key[0][1], Value::Binary(vec![1]));
+    let path = OwnedRelation::new("order-key").unwrap();
+    let valid = held.system_time();
+    let hit = held.unique(&relation, &path, &[1], valid).await.unwrap().unwrap();
+    assert_eq!(
+        rtdb_query::owned_row_revision(hit.row.batch(), 0, &EntityId::Integer(2), node.memory()).unwrap(),
+        hit.revision,
+    );
+    assert!(held.unique(&relation, &path, &[3], valid).await.unwrap().is_none());
+    assert!(held.unique(&relation, &path, &[1], valid.next().unwrap()).await.is_err());
     drop(held);
 
     let invalid = session.state_mut().execute_tx(

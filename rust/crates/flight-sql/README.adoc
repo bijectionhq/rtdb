@@ -355,6 +355,20 @@ Mutations use validity from their ordered present to infinity.
 The ordered resolver applies releases and claims as a group, so a commit may swap keys. Conflicts do not return the occupant or the key.
 A successful declaration returns the same transaction-key Arrow row as Create.
 
+`rtdb.owned.ReadHeldUnique.v1` takes the original 16-byte held read handle,
+the owned relation prefix, the declared unique path prefix, and one terminated
+Arrow IPC batch with exactly one row `key: Binary`, `valid_micros: Int64`.
+The valid instant must equal the held system instant because unique occupancy
+covers ordered-present membership. The relation's private declaration records
+its covered event frontier with the occupancy changes in the same transaction.
+A missing declaration or a frontier mismatch refuses the lookup.
+
+A successful reply begins with one 16-byte range witness nonce followed by the
+ordinary point IPC response. There is one full fact row for a unique hit,
+or no rows for a covered absence. The resolver revalidates this relation
+witness in the same way as other held range evidence. The complete occupancy
+identity, holder identity, and holder's declared key must all agree.
+
 === Reading valid history at a held cut
 
 `rtdb.owned.ReadHeldValidDuring.v2` takes a 16-byte held handle, the relation prefix, and one terminated Arrow IPC stream.
