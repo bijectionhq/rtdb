@@ -1830,6 +1830,7 @@ surface QueryAccess {
         -- For columnar query output, stacked filters apply in plan order to the surviving vectors and row positions.
         -- A columnar limit applies its offset and row count to batches and slices compatible Arrow arrays.
         -- DISTINCT and set operations with columnar inputs select their output positions from those Arrow batches.
+        -- Their key index retains Arrow batches and compares compatible nulls, booleans, signed integers, text and binary cells at their indexed positions.
         -- UNNEST over compatible Arrow list columns expands the selected child positions and gathers their parent payloads by position.
         -- Scalar evaluation within a columnar projection reads the cells referenced by the expression.
         -- A projected field missing from some pages uses Arrow nulls when the available columns share a layout or form a scalar dense union.

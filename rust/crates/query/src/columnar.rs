@@ -146,6 +146,16 @@ fn arrow_value_bound(array: &dyn Array, field: &ArrowField, logical: Option<&Log
 }
 
 impl Column {
+    pub(crate) fn arrow_cell(&self, row: usize) -> Option<Option<(&dyn Array, &ArrowField, Option<&LogicalType>, usize)>> {
+        match self {
+            Self::Arrow { array, field, logical } => Some(Some((array.as_ref(), field, logical.as_ref(), row))),
+            Self::Selected(column) => Some(column.source(row).ok()?.map(|((array, field, logical, _), offset)| {
+                (array.as_ref(), field.as_ref(), logical.as_ref(), offset)
+            })),
+            Self::Values(_) => None,
+        }
+    }
+
     pub fn value(&self, row: usize) -> Result<Value> {
         match self {
             Self::Arrow { array, field, logical } => arrow_value(array.as_ref(), field, logical.as_ref(), row),
@@ -440,6 +450,25 @@ impl ColumnBatch {
     pub fn take_rows(
         sources: &[impl std::borrow::Borrow<Self>], rows: &[(usize, usize)], positions: &[usize], memory: &Arc<MemoryBudget>,
     ) -> Result<Self> {
+        Self::take_rows_with_custody(sources, rows, positions, false, memory)
+    }
+
+    pub(crate) fn select_keys(&self, rows: &[(usize, usize)], memory: &Arc<MemoryBudget>) -> Result<Self> {
+        let positions: Vec<_> = (0..self.columns.len()).collect();
+        if rows.len() < self.len {
+            match Self::take_rows_with_custody(&[self], rows, &positions, false, memory) {
+                Ok(output) => return Ok(output),
+                Err(error) if error.code == "rtdb/memory-budget-exceeded" => {}
+                Err(error) => return Err(error),
+            }
+        }
+        Self::take_rows_with_custody(&[self], rows, &positions, true, memory)
+    }
+
+    fn take_rows_with_custody(
+        sources: &[impl std::borrow::Borrow<Self>], rows: &[(usize, usize)], positions: &[usize],
+        retain_sources: bool, memory: &Arc<MemoryBudget>,
+    ) -> Result<Self> {
         let source = |batch: usize| sources[batch].borrow();
         if rows.is_empty() || sources.iter().map(|source| source.borrow()).any(|source| positions.iter().any(|&position| position >= source.columns.len()))
             || rows.iter().any(|&(batch, row)| sources.get(batch).is_none_or(|source| row >= source.borrow().len))
@@ -449,7 +478,7 @@ impl ColumnBatch {
         let mut reservation = memory.reserve(positions.len().saturating_mul(256).saturating_add(256))?;
         let mut columns = Vec::with_capacity(positions.len());
         for &position in positions {
-            let (column, _scratch) = gather_column_rows(source, rows, position, memory)?;
+            let (column, _scratch) = gather_column_cells(source, rows.iter().copied().map(Some), rows.len(), position, retain_sources, memory)?;
             let retained = column.retained_bytes()?;
             let lease = Arc::get_mut(&mut reservation).expect("ordered gather owns its reservation");
             lease.grow_to(lease.bytes().checked_add(retained).ok_or_else(size_error)?)?;
