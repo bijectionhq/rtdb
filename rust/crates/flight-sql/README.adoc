@@ -543,6 +543,7 @@ Generic SQL keeps the existing private relation boundary.
 === Final-state prefix count
 
 `rtdb.owned.Commit.v6` begins with one owned root relation prefix, followed by
+Its fact groups preserve relation run order and may repeat a relation.
 one clock byte (zero for the transaction's ordered system time as valid time),
 a big-endian `u16` length and UTF-8 Binary column name (1 to 96 bytes), a
 big-endian `u16` length and complete Binary prefix (1 to 4096 bytes), then a

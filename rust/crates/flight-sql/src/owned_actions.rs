@@ -472,7 +472,7 @@ impl Service {
         let _condition = call.reserve(prefix.len() + column.len() + 1024)?;
         let condition = TxOp::OwnedCheckCapacity { relation, column: column.into(), prefix: prefix.to_vec(), at_most };
         let (witnesses, body, _framing) = self.owned_witness_prefix(call, body, true)?;
-        self.commit_owned(call, body, CommitFormat::Grouped, witnesses, false, Some(condition)).await
+        self.commit_owned(call, body, CommitFormat::Ordered, witnesses, false, Some(condition)).await
     }
 
     pub(crate) async fn commit_owned_witnessed_action(&self, call: &Call, body: &[u8], format: CommitFormat, erase_allowed: bool) -> Result<ActionResult, Status> {
