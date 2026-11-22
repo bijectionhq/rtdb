@@ -1,4 +1,7 @@
+mod hosted_control;
 mod unique;
+
+pub(crate) use hosted_control::READ_HELD_HOSTED_CONTROL_V1;
 pub(crate) use unique::READ_HELD_UNIQUE_V1;
 
 use std::{collections::{BTreeMap, BTreeSet}, sync::{Arc, Mutex}, time::Duration};
