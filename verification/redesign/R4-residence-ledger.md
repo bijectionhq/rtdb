@@ -70,7 +70,7 @@ The controls cover reversing the clock and tip reads, confirming ahead of instal
 
 The model assumes an advancing published frontier and monotone installed prefix within one replica epoch.
 The proof of the synchronous decisions relies on the caller supplying the clock sample and installed position from that same authority.
-Admission before a memory-only query answer, handling abandoned operations, and availability across leadership turnover remain separate obligations.
+Query capture, delegated fragments and membership queries check the lease at admission, including paths that can answer from memory. The native query fixture exercises the admission refusal and offline acceptance. Handling abandoned operations and availability across leadership turnover remain open.
 
 ## Handoff notes
 

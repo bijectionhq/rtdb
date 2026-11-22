@@ -4284,6 +4284,29 @@ def verify_multi_trim_admission(args, source):
     print(f"{label}: directory floor enforced before physical trim, missing check rejected")
 
 
+def verify_native_current_catalog(args, source):
+    env = os.environ | {
+        "CARGO_TARGET_DIR": os.environ.get("CARGO_TARGET_DIR", str(ROOT / "target")),
+        "CARGO_PROFILE_TEST_DEBUG": "0",
+    }
+    test = "a_replicated_query_without_a_current_catalog_lease_is_refused_before_evaluation"
+    command = ["cargo", "test", "--locked", "-p", "rtdb-node", "--test", "native", test, "--", "--exact"]
+    baseline = run_case(command, source / "rust", args.evidence, "rust-current-catalog-admission", env)
+    if baseline.returncode or f"{test} ... ok" not in baseline.stdout:
+        raise ValueError("the replicated query must refuse a snapshot without a current catalog lease")
+    path = source / "rust/crates/node/src/node.rs"
+    original = path.read_bytes()
+    try:
+        replace_once(path, "        crate::read_currency::require_current(database, lease.as_deref())?;\n", "")
+        control = run_case(command, source / "rust", args.evidence, "rust-current-catalog-admission-without-check", env)
+    finally:
+        path.write_bytes(original)
+    if (control.returncode != 101 or f"{test} ... FAILED" not in control.stdout
+        or "a replicated query exposed a snapshot without a current lease" not in control.stdout):
+        raise ValueError("the admission replay did not catch removal of the currency gate")
+    print("rust-current-catalog-admission: baseline passed and the omitted gate was rejected")
+
+
 def verify_native_residence_trace(args, source, scratch):
     trace = (args.evidence / "rust-residence-disposal-trace.json").resolve()
     env = os.environ | {
@@ -5348,6 +5371,7 @@ def main():
             verify_native_reference_read(args, source)
             verify_native_reference_disposal(args, source)
             verify_native_residence_trace(args, source, directory)
+            verify_native_current_catalog(args, source)
             verify_native_exact_marker(args, source)
             verify_compaction_publication_versions(args, source)
             verify_replay_prefix(args, source)

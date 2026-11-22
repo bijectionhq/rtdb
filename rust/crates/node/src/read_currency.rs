@@ -1,5 +1,6 @@
 use parking_lot::Mutex;
-use rtdb_types::ReplicaPosition;
+use rtdb_storage::ReadLease;
+use rtdb_types::{Anomaly, AnomalyCategory, ReplicaPosition, Result};
 
 mod step;
 
@@ -37,6 +38,18 @@ impl ReadCurrency {
     pub fn pending_tip(&self) -> Option<ReplicaPosition> { self.0.lock().pending.map(|(_, tip)| ReplicaPosition(tip)) }
 }
 
+/// Rejects a replicated query before exposing its snapshot without a current lease.
+pub(crate) fn require_current(database: &str, lease: Option<&ReadLease>) -> Result<()> {
+    if let Some(lease) = lease {
+        lease.check().map_err(|_| {
+            Anomaly::new(AnomalyCategory::Unavailable, "rtdb.node/catalog-not-current",
+                "This node could not confirm the catalogs required by the query")
+                .with_context("db-name", database.into())
+        })?;
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -65,6 +78,22 @@ mod tests {
         assert_eq!(currency.pending_tip(), Some(position(5)));
         assert_eq!(currency.anchor(Some(position(4))), None);
         assert_eq!(currency.anchor(Some(position(5))), Some(10));
+    }
+
+    #[test]
+    fn query_admission_requires_an_unexpired_anchor_for_a_replicated_snapshot() {
+        use std::sync::Arc;
+
+        require_current("offline", None).unwrap();
+        let current = ReadLease::new(Some(11), Arc::new(|| 10));
+        require_current("shop", Some(&current)).unwrap();
+
+        for deadline in [None, Some(9), Some(10)] {
+            let lease = ReadLease::new(deadline, Arc::new(|| 10));
+            let error = require_current("shop", Some(&lease)).unwrap_err();
+            assert_eq!(error.category, AnomalyCategory::Unavailable);
+            assert_eq!(error.code, "rtdb.node/catalog-not-current");
+        }
     }
 
     #[test]

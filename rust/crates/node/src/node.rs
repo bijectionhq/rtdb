@@ -374,6 +374,7 @@ impl Node {
             let snapshot = rtdb_query::retain_catalog_snapshot(snapshot.with_system_time_cap(cap)?, &database.storage).await?;
             snapshots.insert(name, DatabaseSnapshot { partitions: vec![snapshot], storage: Arc::clone(&database.storage) });
         }
+        crate::read_currency::require_current(database, lease.as_deref())?;
         let mut catalog = CatalogSnapshot::new(database, snapshots, false)?.with_runtime(Arc::new(crate::runtime::NodeCatalogRuntime::new(self.clone(), cancellation.clone())))
             .with_ordered_indexes(Arc::new(crate::ordered_index::Inventory))
             .with_fragmenter(self.scan_fragmenter.clone(), fragment_residence);
@@ -413,6 +414,7 @@ impl Node {
         let lease = self.catalog_read_lease(&database).await?;
         let snapshot = database.partition.open_snapshot(Some(fragment.basis.system_time));
         let snapshot = rtdb_query::retain_catalog_snapshot(snapshot, &database.storage).await?;
+        crate::read_currency::require_current(database.name(), lease.as_deref())?;
         let snapshots = BTreeMap::from([(database.name().to_owned(), DatabaseSnapshot { partitions: vec![snapshot], storage: Arc::clone(&database.storage) })]);
         let mut catalog = CatalogSnapshot::new(database.name(), snapshots, false)?;
         if let Some(lease) = &lease { catalog = catalog.with_read_lease(Arc::clone(lease)); }

@@ -290,6 +290,7 @@ It also exercises the Azure adapter against a loopback provider and separately m
 * `tla/ReadCurrencyAnchor.tla` checks competing clock and tip observations and the replica prefix needed to confirm them.
   `verus/read_currency` checks the two Rust decisions shared by foreground and maintenance observers.
   `lean/ReadCurrencyAnchor.lean` proves prefix coverage and monotonicity for arbitrary finite histories in the reference model.
+  The native replay verifies early refusal of a replicated query without a current lease, with a matching omission control.
 * `tla/ResidenceComposition.tla` models snapshot admission, log trimming, exact-version retirement and whole-residence disposal in a common state.
   Its controls test cross-domain dependencies, including a canceled query's provider read, an older recovery cursor, fork publication and transfer before erasure.
   `tla/ResidenceCompositionReplay.tla` checks an authored event trace against the same transitions and refuses five invalid variants at their first unmatched step.
