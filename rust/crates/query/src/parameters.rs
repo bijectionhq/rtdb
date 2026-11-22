@@ -61,21 +61,28 @@ impl rtdb_expr::ParameterLookup for BoundParameters {
         }
     }
     fn arrow_cell(&self, index: usize) -> Option<rtdb_expr::ArrowParameterCell<'_>> {
-        match &self.input {
-            Input::Row(_) => None,
-            Input::Arrow(row) => Some(rtdb_expr::ArrowParameterCell {
-                field: row.batch.batch().schema_ref().fields().get(index)?.as_ref(),
-                array: row.batch.batch().column(index).as_ref(), row: row.row,
-            }),
-            Input::Overlay { outer, values } => {
-                if values.iter().any(|(slot, _)| *slot == index) { return None; }
-                outer.arrow_cell(index)
-            }
-        }
+        let (batch, row) = self.arrow_input(index)?;
+        Some(rtdb_expr::ArrowParameterCell {
+            field: batch.batch().schema_ref().fields()[index].as_ref(),
+            array: batch.batch().column(index).as_ref(),
+            row,
+        })
     }
 }
 
 impl BoundParameters {
+    pub(crate) fn arrow_input(&self, index: usize) -> Option<(&OwnedBatch, usize)> {
+        if index >= self.types.len() { return None; }
+        match &self.input {
+            Input::Row(_) => None,
+            Input::Arrow(row) => Some((&row.batch, row.row)),
+            Input::Overlay { outer, values } => {
+                if values.iter().any(|(slot, _)| *slot == index) { return None; }
+                outer.arrow_input(index)
+            }
+        }
+    }
+
     #[cfg(test)]
     pub fn infer(values: Vec<Value>, memory: &Arc<MemoryBudget>) -> Result<Self> {
         let values = OwnedRow::new(values, memory)?;

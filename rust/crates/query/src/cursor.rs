@@ -372,7 +372,14 @@ impl PreparedQuery {
                     crate::operators::build_pages(operators, execution).await.map(QueryInput::Pages)
                 }
                 Batching::Columns if analysis.is_none() => match crate::operators::build_columns(Arc::clone(&operators), execution.clone()).await? {
-                    Some(batches) => Ok(QueryInput::Columns(batches)),
+                    Some(input) => {
+                        let limit = if uses_row_batch_limit(operators.relation()) {
+                            context.options.batch_rows
+                        } else {
+                            usize::MAX
+                        };
+                        Ok(QueryInput::Columns(ColumnOutput { input, limit, pending: None }))
+                    }
                     None => crate::operators::build(operators, execution).await.map(QueryInput::Rows),
                 },
                 _ => crate::operators::build(operators, execution).await.map(QueryInput::Rows),
@@ -386,7 +393,7 @@ impl PreparedQuery {
                         context.check_cancelled()?;
                     }
                 }
-                QueryInput::Columns(mut input) | QueryInput::Ordered(mut input) => {
+                QueryInput::Columns(ColumnOutput { mut input, .. }) | QueryInput::Ordered(mut input) => {
                     while owner.run_until_cancelled(cancellation.run_until_cancelled(input.next_batch())).await.flatten().ok_or_else(cancelled)??.is_some() {
                         context.check_cancelled()?;
                     }
@@ -526,10 +533,55 @@ fn reserve_plan(relation: &Relation, settings: &rtdb_plan::QuerySettings, memory
 enum QueryInput {
     Rows(BoxCursor),
     Pages(crate::pages::BoxPageCursor),
-    Columns(crate::columnar::BoxBatchCursor),
+    Columns(ColumnOutput),
     ColumnPages(crate::columnar::BoxBatchCursor),
     Ordered(crate::columnar::BoxBatchCursor),
     Projection(Option<OwnedBatch>),
+}
+
+fn uses_row_batch_limit(relation: &Relation) -> bool {
+    use rtdb_plan::{Expr, JoinKind, RelationNode};
+    stacker::maybe_grow(128 * 1024, 2 * 1024 * 1024, || {
+        let row_batched = match relation.node() {
+            RelationNode::ColumnTable { expr: Expr::Parameter { .. }, .. }
+            | RelationNode::Join { kind: JoinKind::Semi | JoinKind::Anti, .. } => true,
+            RelationNode::Aggregate { groups, .. } => !groups.is_empty(),
+            RelationNode::Project { expressions, .. } | RelationNode::Rename { expressions, .. }
+            | RelationNode::Extend { expressions, .. } => expressions.iter().any(|named| {
+                !crate::columnar::projection::shaped(&named.expr)
+            }),
+            _ => false,
+        };
+        row_batched || relation.children().into_iter().any(|child| uses_row_batch_limit(child))
+    })
+}
+
+struct ColumnOutput {
+    input: crate::columnar::BoxBatchCursor,
+    limit: usize,
+    pending: Option<(OwnedBatch, usize)>,
+}
+
+impl ColumnOutput {
+    async fn next(&mut self, schema: &Schema, memory: &Arc<MemoryBudget>) -> Result<Option<OwnedBatch>> {
+        let (batch, offset) = match self.pending.take() {
+            Some(pending) => pending,
+            None => loop {
+                let Some(batch) = self.input.next_batch().await? else { return Ok(None); };
+                if batch.len != 0 { break (column_batch(schema, memory, batch)?, 0); }
+            },
+        };
+        let count = (batch.batch().num_rows() - offset).min(self.limit);
+        if count == batch.batch().num_rows() { return Ok(Some(batch)); }
+        let first = u32::try_from(offset).map_err(|_| invalid("batch-size", "Arrow transport row offset exceeds 32 bits"))?;
+        let end = u32::try_from(offset + count).map_err(|_| invalid("batch-size", "Arrow transport row range exceeds 32 bits"))?;
+        let _indices = memory.reserve(count.checked_mul(std::mem::size_of::<u32>())
+            .ok_or_else(|| invalid("batch-size", "Arrow transport selection exceeds addressable memory"))?)?;
+        let selection = rtdb_columnar::Selection::Indices((first..end).collect());
+        let output = batch.select(&selection)?;
+        if offset + count < batch.batch().num_rows() { self.pending = Some((batch, offset + count)); }
+        Ok(Some(output))
+    }
 }
 
 tokio::task_local! { static ENCODING_ORDERED_BATCH: (); }
@@ -623,7 +675,8 @@ impl QueryCursor {
                 batch.validate_readable(&self.context)?;
                 return column_batch(self.runtime_schema.schema(), &self.context.memory, batch).map(Some);
             }
-            QueryInput::Columns(input) | QueryInput::Ordered(input) => loop {
+            QueryInput::Columns(output) => return output.next(self.runtime_schema.schema(), &self.context.memory).await,
+            QueryInput::Ordered(input) => loop {
                 let Some(batch) = input.next_batch().await? else { return Ok(None); };
                 if batch.len != 0 { return column_batch(self.runtime_schema.schema(), &self.context.memory, batch).map(Some); }
             },

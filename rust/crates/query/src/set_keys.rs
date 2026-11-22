@@ -5,7 +5,7 @@ use rtdb_types::Result;
 
 use crate::{
     QueryContext,
-    columnar::{Column, ColumnBatch},
+    columnar::ColumnBatch,
     cursor::OwnedRow,
     invalid,
     operators::{combine_equality_hash, equality_hash, rows_equal},
@@ -213,6 +213,42 @@ impl BatchKeyIndex {
         })
     }
 
+    pub fn len(&self) -> usize {
+        self.positions.rows.len()
+    }
+
+    pub fn group_keys(&self, width: usize, context: &QueryContext) -> Result<Option<ColumnBatch>> {
+        if self.len() == 0 {
+            return Ok(None);
+        }
+        let bytes = self
+            .len()
+            .checked_mul(size_of::<(usize, usize)>())
+            .and_then(|bytes| {
+                self.batches
+                    .len()
+                    .checked_mul(size_of::<&ColumnBatch>())
+                    .and_then(|batches| bytes.checked_add(batches))
+            })
+            .and_then(|bytes| {
+                width
+                    .checked_mul(size_of::<usize>())
+                    .and_then(|width| bytes.checked_add(width))
+            })
+            .ok_or_else(size_error)?;
+        let _scratch = context.memory.reserve(bytes)?;
+        let batches: Vec<_> = self.batches.iter().map(|(batch, _)| batch).collect();
+        let rows: Vec<_> = self
+            .positions
+            .rows
+            .iter()
+            .map(|position| (position.batch, position.row))
+            .collect();
+        let columns: Vec<_> = (0..width).collect();
+        ColumnBatch::take_rows_with_custody(&batches, &rows, &columns, true, &context.memory)
+            .map(Some)
+    }
+
     fn append(&mut self, batch: ColumnBatch, projected: bool, hashes: &[u32]) -> Result<()> {
         let rows = self
             .positions
@@ -390,7 +426,7 @@ mod tests {
     use tokio_util::sync::CancellationToken;
 
     use super::*;
-    use crate::{CatalogSnapshot, DatabaseSnapshot, QueryOptions};
+    use crate::{CatalogSnapshot, DatabaseSnapshot, QueryOptions, columnar::Column};
 
     fn context() -> Arc<QueryContext> {
         let database = DatabaseSnapshot {

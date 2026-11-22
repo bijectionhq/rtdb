@@ -351,8 +351,16 @@ impl ColumnBatch {
 
     pub(crate) fn append_column(&mut self, column: Column, mut reservation: Arc<MemoryReservation>, memory: &Arc<MemoryBudget>) -> Result<()> {
         use std::mem::size_of;
+        let metadata = match &column {
+            Column::Arrow { field, logical, .. } => field.size().checked_add(
+                logical.as_ref().map_or(Ok(0), LogicalType::retained_bytes)?,
+            ).ok_or_else(size_error)?,
+            _ => 0,
+        };
         let bytes = column.retained_bytes()?
-            .checked_add(size_of::<Column>() + size_of::<Arc<MemoryReservation>>() + 256).ok_or_else(size_error)?;
+            .checked_add(metadata)
+            .and_then(|bytes| bytes.checked_add(size_of::<Column>() + size_of::<Arc<MemoryReservation>>() + 256))
+            .ok_or_else(size_error)?;
         let lease = Arc::get_mut(&mut reservation).expect("An appended column owns its reservation");
         if bytes <= lease.bytes() { lease.shrink_to(bytes)?; } else { lease.grow_to(bytes)?; }
         let old_columns = self.columns.len().checked_mul(size_of::<Column>()).ok_or_else(size_error)?;
@@ -446,6 +454,46 @@ impl ColumnBatch {
         Ok(Self { columns, len: batch.batch().num_rows(), reservation: Arc::clone(batch.reservation()), appended: Vec::new() })
     }
 
+    pub(crate) fn from_list_parameter(
+        source: &rtdb_columnar::OwnedBatch, position: usize, row: usize,
+        parameter_type: &LogicalType, memory: &Arc<MemoryBudget>,
+    ) -> Result<Option<Self>> {
+        use arrow_array::cast::AsArray;
+        let field = &source.batch().schema_ref().fields()[position];
+        let mut reservation = memory.reserve(field.size().checked_mul(8).and_then(|bytes| bytes.checked_add(512)).ok_or_else(size_error)?)?;
+        if !stable_read_layout(parameter_type, field) || !readable_list_type(parameter_type, field) {
+            return Ok(None);
+        }
+        let array = source.batch().column(position);
+        if array.is_null(row) || *parameter_type == LogicalType::Null {
+            return Self::settled(vec![Column::Values(Vec::new())], 0, memory.reserve(256)?).map(Some);
+        }
+        let (child, array) = match field.data_type() {
+            DataType::List(child) => (child, array.as_list::<i32>().value(row)),
+            DataType::FixedSizeList(child, _) => (child, array.as_fixed_size_list().value(row)),
+            _ => return Ok(None),
+        };
+        let len = array.len();
+        if len == 0 {
+            return Self::settled(vec![Column::Values(Vec::new())], 0, reservation).map(Some);
+        }
+        let logical = rtdb_columnar::from_field(child)?;
+        let metadata = logical.retained_bytes()?.checked_add(512).ok_or_else(size_error)?;
+        Arc::get_mut(&mut reservation).expect("The list slice owns its metadata").shrink_to(metadata)?;
+        let bound = array.get_array_memory_size().checked_add(4096).ok_or_else(size_error)?;
+        let holds_unused_buffers = array.to_data().get_slice_memory_size().is_ok_and(|visible| {
+            array.get_buffer_memory_size() > visible.saturating_mul(2).saturating_add(4096)
+        });
+        let (array, custody) = if holds_unused_buffers || bound > memory.available_bytes() {
+            let Ok(compacted) = compact_arrow_rows(array.as_ref(), child, 0..len, memory) else { return Ok(None); };
+            compacted
+        } else {
+            (array, Arc::clone(source.reservation()))
+        };
+        let columns = vec![Column::Arrow { field: Arc::clone(child), array, logical: Some(logical) }];
+        Ok(Some(Self { columns, len, reservation, appended: vec![custody] }))
+    }
+
     /// Gathers nonempty positions in already resolved batches without building row objects.
     pub fn take_rows(
         sources: &[impl std::borrow::Borrow<Self>], rows: &[(usize, usize)], positions: &[usize], memory: &Arc<MemoryBudget>,
@@ -508,7 +556,7 @@ impl ColumnBatch {
         Self::settled(columns, self.len, reservation)
     }
 
-    fn take_rows_with_custody(
+    pub(crate) fn take_rows_with_custody(
         sources: &[impl std::borrow::Borrow<Self>], rows: &[(usize, usize)], positions: &[usize],
         retain_sources: bool, memory: &Arc<MemoryBudget>,
     ) -> Result<Self> {
@@ -2617,9 +2665,13 @@ impl Column {
 
 /// Projects batches through expressions computed over whole columns where the kernel's arithmetic is exactly the
 /// evaluator's, and row by row through the evaluator for any expression or batch where it isn't.
-pub(crate) struct BatchExpressions { input: BoxBatchCursor, schema: rtdb_plan::Schema, expressions: Vec<rtdb_plan::Expr>, clocked: Option<Vec<rtdb_plan::Expr>>, execution: crate::context::Execution }
+pub(crate) struct BatchExpressions { input: BoxBatchCursor, schema: rtdb_plan::Schema, expressions: Vec<rtdb_plan::Expr>, clocked: Option<Vec<rtdb_plan::Expr>>, execution: crate::context::Execution, validate_input: bool }
 impl BatchExpressions {
-    pub fn new(input: BoxBatchCursor, schema: rtdb_plan::Schema, expressions: Vec<rtdb_plan::Expr>, execution: crate::context::Execution) -> Self { Self { input, schema, expressions, clocked: None, execution } }
+    pub fn new(input: BoxBatchCursor, schema: rtdb_plan::Schema, expressions: Vec<rtdb_plan::Expr>, execution: crate::context::Execution) -> Self { Self { input, schema, expressions, clocked: None, execution, validate_input: false } }
+    pub fn validating_input(mut self, validate: bool) -> Self {
+        self.validate_input = validate;
+        self
+    }
 }
 
 /// The expressions with each read of the query clock replaced by the instant the evaluator reads, for the kernels;
@@ -2646,6 +2698,7 @@ impl BatchCursor for BatchExpressions {
     async fn next_batch(&mut self) -> Result<Option<ColumnBatch>> {
         let Some(batch) = self.input.next_batch().await? else { return Ok(None) };
         self.execution.context.check_cancelled()?;
+        if self.validate_input { batch.validate_readable(&self.execution.context)?; }
         if self.clocked.is_none() { self.clocked = Some(read_clock(&self.expressions, &self.execution).await?); }
         let clocked = self.clocked.as_deref().unwrap_or_default();
         let parameters = self.execution.parameters.evaluator();
@@ -2666,8 +2719,12 @@ impl BatchCursor for BatchExpressions {
             }
             if let Some(bound) = projection::bound(kernel, &self.schema, &batch)? {
                 let lease = Arc::get_mut(&mut reservation).ok_or_else(|| invalid("column-size", "A column page's charge is shared"))?;
-                lease.grow_to(lease.bytes().checked_add(bound).ok_or_else(size_error)?)?;
-                if let Some(column) = projection::column(kernel, &self.schema, &batch, parameters)? { columns.push(column); continue; }
+                let next = lease.bytes().checked_add(bound).ok_or_else(size_error)?;
+                match lease.grow_to(next) {
+                    Ok(()) => if let Some(column) = projection::column(kernel, &self.schema, &batch, parameters)? { columns.push(column); continue; },
+                    Err(error) if matches!(kernel, rtdb_plan::Expr::List(_)) && error.code == "rtdb/memory-budget-exceeded" => {},
+                    Err(error) => return Err(error),
+                }
             }
             if let Some(column) = crate::vector::column(expression, &self.schema, &batch, parameters) {
                 // A vectorised column's size is known once computed; it is charged before the next is built.
@@ -2707,7 +2764,8 @@ impl BatchCursor for BatchExpressions {
 /// including any integer overflow, so its error is raised.
 pub(crate) mod projection {
     use std::sync::Arc;
-    use arrow_array::{Array, ArrayRef, Float64Array, Int64Array, StructArray};
+    use arrow_array::{Array, ArrayRef, Float64Array, Int64Array, ListArray, StructArray};
+    use arrow_buffer::OffsetBuffer;
     use arrow_schema::{DataType, Field as ArrowField};
     use rtdb_plan::{BinaryOp, CastTarget, Expr, Schema};
     use rtdb_types::{LogicalType, Result, ScalarType, StructFields, Value};
@@ -2835,6 +2893,19 @@ pub(crate) mod projection {
                 let (Some(left), Some(right)) = (bound(left, schema, batch)?, bound(right, schema, batch)?) else { return Ok(None) };
                 per_row(32)?.checked_add(left).and_then(|bytes| bytes.checked_add(right)).ok_or_else(super::size_error)?
             }
+            Expr::List(items) => {
+                let Some((arrays, logical)) = list_columns(items, schema, batch) else { return Ok(None); };
+                let bytes = arrays.iter().try_fold(4096usize, |bytes, array| {
+                    let visible = array.to_data().get_slice_memory_size().unwrap_or_else(|_| array.get_buffer_memory_size());
+                    visible.checked_mul(4).and_then(|size| bytes.checked_add(size)).ok_or_else(super::size_error)
+                })?;
+                let metadata = logical.retained_bytes()?;
+                items.len().checked_mul(64).and_then(|bytes| bytes.checked_add(8))
+                    .and_then(|bytes| bytes.checked_mul(rows))
+                    .and_then(|scratch| scratch.checked_add(bytes))
+                    .and_then(|bytes| bytes.checked_add(metadata.checked_mul(8)?))
+                    .ok_or_else(super::size_error)?
+            }
             Expr::Struct(fields) => {
                 let mut total = per_row(std::mem::size_of::<Value>().checked_add(256).ok_or_else(super::size_error)?)?;
                 for (name, field) in fields {
@@ -2899,6 +2970,16 @@ pub(crate) mod projection {
             }
             Expr::Literal(value) if literal(value) => Ok(Some(Column::Values(vec![value.clone(); batch.len]))),
             Expr::Binary { .. } => arithmetic(expr, schema, &batch.columns, batch.len, Parameters::Values(parameters)),
+            Expr::List(items) => {
+                let Some((arrays, logical)) = list_columns(items, schema, batch) else { return Ok(None); };
+                let child = Arc::new(rtdb_columnar::to_field("item", &logical)?);
+                let picked = (0..batch.len).flat_map(|row| (0..arrays.len()).map(move |column| (column, row))).collect::<Vec<_>>();
+                let values = rtdb_columnar::copy_selected_cells(&arrays, &picked)?;
+                let offsets = OffsetBuffer::from_lengths(std::iter::repeat_n(arrays.len(), batch.len));
+                let array = Arc::new(ListArray::try_new(child, offsets, values, None).map_err(|error| crate::invalid("column-list", error))?);
+                let field = Arc::new(ArrowField::new("value", array.data_type().clone(), false));
+                Ok(Some(Column::Arrow { array, field, logical: Some(LogicalType::list(logical)) }))
+            }
             Expr::Struct(fields) => {
                 let mut columns = Vec::with_capacity(fields.len());
                 for (_, field) in fields {
@@ -2934,6 +3015,26 @@ pub(crate) mod projection {
             Expr::RowCopy(fields) => row_copy(fields, schema, batch),
             _ => Ok(None),
         }
+    }
+
+    fn list_columns<'a>(items: &[Expr], schema: &Schema, batch: &'a ColumnBatch) -> Option<(Vec<&'a dyn Array>, LogicalType)> {
+        let count = items.len().checked_mul(batch.len)?;
+        if items.is_empty() || count > i32::MAX as usize { return None; }
+        let mut arrays = Vec::with_capacity(items.len());
+        let mut element = None;
+        let mut nullable = false;
+        for item in items {
+            let Expr::Column { id, .. } = item else { return None; };
+            let Column::Arrow { array, field, logical: Some(logical) } = &batch.columns[schema.position(*id)?] else { return None; };
+            let scalar = super::plain_scalar(logical)?;
+            if !super::copyable(scalar) || !super::stable_read_layout(logical, field)
+                || element.is_some_and(|previous| previous != scalar) { return None; }
+            element = Some(scalar);
+            nullable |= logical.nullable() || array.null_count() != 0;
+            arrays.push(array.as_ref());
+        }
+        let ty = LogicalType::Scalar(element?.clone());
+        Some((arrays, if nullable { ty.maybe() } else { ty }))
     }
 
     /// The first non-null argument per row. An argument the kernels can't compute, or one that raises an error the

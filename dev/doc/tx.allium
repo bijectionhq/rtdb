@@ -41,6 +41,8 @@
 -- A batch join can gather matching payload positions from selected Arrow vectors.
 -- A compatible inner equijoin hashes and compares its Arrow key cells at their build and probe positions.
 -- Its Bloom and entity ID filters use those same build-side vectors.
+-- Compatible semi and anti equijoins select their output from the probe vectors and emit each selected probe position once.
+-- Their columnar output keeps the configured transport row limit.
 -- A columnar cross join gathers pairs of positions from its two inputs in left-major order within each batch pair.
 -- Relation ordinality and unpartitioned ROW_NUMBER with supported ordering append a signed 64-bit ordinal vector to Arrow batch inputs.
 -- Unpartitioned LEAD and LAG gather shifted cells from their ordered Arrow input and append null cells at the window boundary.

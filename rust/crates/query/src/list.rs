@@ -100,12 +100,12 @@ pub(crate) struct BatchOrdinality {
     input: crate::columnar::BoxBatchCursor,
     context: Arc<QueryContext>,
     name: String,
-    rows: i64,
+    relation_rows: Option<i64>,
 }
 
 impl BatchOrdinality {
-    pub fn new(input: crate::columnar::BoxBatchCursor, name: String, context: Arc<QueryContext>) -> Self {
-        Self { input, context, name, rows: 0 }
+    pub fn new(input: crate::columnar::BoxBatchCursor, name: String, scope: OrdinalityScope, context: Arc<QueryContext>) -> Self {
+        Self { input, context, name, relation_rows: (scope == OrdinalityScope::Relation).then_some(0) }
     }
 }
 
@@ -115,11 +115,12 @@ impl crate::columnar::BatchCursor for BatchOrdinality {
         self.context.check_cancelled()?;
         let Some(mut batch) = crate::columnar::poll_nested_batch(self.input.as_mut()).await? else { return Ok(None); };
         let length = i64::try_from(batch.len).map_err(|_| ordinality_overflow())?;
-        let end = self.rows.checked_add(length).ok_or_else(ordinality_overflow)?;
-        let start = if length == 0 { end } else { self.rows + 1 };
+        let previous = self.relation_rows.unwrap_or(0);
+        let end = previous.checked_add(length).ok_or_else(ordinality_overflow)?;
+        let start = if length == 0 { end } else { previous + 1 };
         let (column, reservation) = crate::columnar::ordinal_column(batch.len, start, &self.name, &self.context)?;
         batch.append_column(column, reservation, &self.context.memory)?;
-        self.rows = end;
+        if let Some(rows) = &mut self.relation_rows { *rows = end; }
         Ok(Some(batch))
     }
 }
