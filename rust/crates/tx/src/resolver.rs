@@ -790,7 +790,7 @@ impl<'a> OpenTransaction<'a> {
             if let Some(world) = world {
                 let context = self.context.query_context(self.snapshot()?, self.tx_key().system_time, &self.options.default_tz, self.trace_parent)?;
                 let record = rtdb_query::read_owned_world(context, owner, world).await?.ok_or_else(unavailable)?;
-                if self.tx_key().system_time >= record.0.until {
+                if record.0.dropped || self.tx_key().system_time >= record.0.until {
                     return Err(unavailable());
                 }
                 self.owned_world = Some(record);
@@ -851,15 +851,22 @@ impl<'a> OpenTransaction<'a> {
             }
         }
         if relation.is_world_catalog() {
-            if !create_only || from.is_some() || to.is_some() || documents.rows().len() != 1
-                || !documents.has_exact_presence()
-            {
-                return Err(rtdb_types::OwnedWorld::unavailable());
+            let unavailable = rtdb_types::OwnedWorld::unavailable;
+            if from.is_some() || to.is_some() || documents.rows().len() != 1 || !documents.has_exact_presence() {
+                return Err(unavailable());
             }
             let record = rtdb_types::OwnedWorld::from_record(&documents.rows()[0])?;
             let ordered = self.tx_key().system_time;
-            if record.basis.system_time >= ordered || record.until <= ordered {
-                return Err(rtdb_types::OwnedWorld::unavailable());
+            if create_only {
+                if record.dropped || record.basis.system_time >= ordered || record.until <= ordered {
+                    return Err(unavailable());
+                }
+            } else {
+                if !record.dropped { return Err(unavailable()); }
+                let context = self.context.query_context(self.snapshot()?, ordered, &self.options.default_tz, self.trace_parent)?;
+                let (previous, _retained) = rtdb_query::read_owned_world(context, owner, record.id).await?.ok_or_else(unavailable)?;
+                if !previous.same_fork(&record) { return Err(unavailable()); }
+                if previous.dropped { return Ok(()); }
             }
             return self.put_documents(&table, documents, iids, Some(Timestamp::MIN), Some(Timestamp::MAX),
                 DocumentWrite::Owned { relation, owner, create_only }).await;

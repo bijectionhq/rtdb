@@ -974,6 +974,14 @@ impl NativeSession {
         ], Default::default()).await
     }
 
+    pub async fn drop_owned_world(&mut self, mut record: rtdb_types::OwnedWorld) -> Result<TransactionResult> {
+        record.dropped = true;
+        let documents = rtdb_tx::Documents::new(vec![record.record()], self.service.node.memory())?;
+        self.state.execute_tx(vec![TxOp::OwnedReplaceDocs {
+            relation: rtdb_types::OwnedRelation::world_catalog(), documents, valid_from: None, valid_to: None,
+        }], Default::default()).await
+    }
+
     pub async fn commit_owned_world(
         &mut self, record: &rtdb_types::OwnedWorld, writes: Vec<OwnedWorldWrite>,
     ) -> Result<TransactionResult> {

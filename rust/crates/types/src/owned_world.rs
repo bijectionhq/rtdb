@@ -67,6 +67,7 @@ pub struct OwnedWorld {
     pub basis: TransactionKey,
     pub until: Timestamp,
     pub schemas: WorldSchemas,
+    pub dropped: bool,
 }
 
 impl OwnedWorld {
@@ -78,6 +79,7 @@ impl OwnedWorld {
             ("basis_id".into(), Value::I64(self.basis.tx_id.0)),
             ("basis_time".into(), Value::I64(self.basis.system_time.0)),
             ("until".into(), Value::I64(self.until.0)),
+            ("dropped".into(), Value::Bool(self.dropped)),
             (
                 "schemas".into(),
                 Value::Binary(self.schemas.encoded.clone()),
@@ -106,7 +108,12 @@ impl OwnedWorld {
         else {
             return Err(Self::unavailable());
         };
-        if row.len() != 7
+        let dropped = match row.get("dropped") {
+            None | Some(Value::Null | Value::Undefined) => false,
+            Some(Value::Bool(dropped)) => *dropped,
+            _ => return Err(Self::unavailable()),
+        };
+        if row.len() != 7 + usize::from(row.contains_key("dropped"))
             || *id == [0; 16]
             || *capture == [0; 16]
             || *until <= *time
@@ -127,7 +134,17 @@ impl OwnedWorld {
             },
             until: Timestamp(*until),
             schemas: WorldSchemas::from_bytes(schemas)?,
+            dropped,
         })
+    }
+
+    pub fn same_fork(&self, other: &Self) -> bool {
+        self.id == other.id
+            && self.capture == other.capture
+            && self.manifest == other.manifest
+            && self.basis == other.basis
+            && self.until == other.until
+            && self.schemas == other.schemas
     }
 
     pub fn unavailable() -> Anomaly {
