@@ -260,6 +260,12 @@ The Arrow response uses the held present and valid instant on every call, includ
 `rtdb.owned.ReadHeldPoint.v2` uses the same framing with exactly one Arrow row and two columns, `_id` and `valid_micros: Int64?`.
 A null `valid_micros` uses the held default. Otherwise it selects one business-valid microsecond within the original held system cut.
 `rtdb.owned.valid_micros` echoes the selected instant even when the row is absent, and `rtdb.owned.present_micros` stays at the held present.
+
+`rtdb.owned.ReadHeldHistoricalPoint.v1` inserts an eight-byte big-endian signed system time in microseconds immediately after the held handle, before the relation prefix.
+It uses the same point key, with null `valid_micros` selecting the requested system time on the valid axis.
+The relation's journal must cover the system time at or before the held cut.
+The point reply carries that requested system time in `rtdb.owned.present_micros`.
+
 Send `rtdb.owned.CloseRead.v1` with only the 16 handle bytes to release it.
 Close success has zero Flight results.
 

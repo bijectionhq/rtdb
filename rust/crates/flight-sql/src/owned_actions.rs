@@ -97,6 +97,7 @@ pub(crate) const READ_OWNED_V1: &str = "rtdb.owned.ReadPoint.v1";
 pub(crate) const OPEN_OWNED_READ_V1: &str = "rtdb.owned.OpenRead.v1";
 pub(crate) const HELD_OWNED_POINT_V1: &str = "rtdb.owned.ReadHeldPoint.v1";
 pub(crate) const HELD_OWNED_POINT_V2: &str = "rtdb.owned.ReadHeldPoint.v2";
+pub(crate) const HELD_OWNED_HISTORICAL_POINT_V1: &str = "rtdb.owned.ReadHeldHistoricalPoint.v1";
 pub(crate) const HELD_OWNED_VALID_DURING_V1: &str = "rtdb.owned.ReadHeldValidDuring.v1";
 pub(crate) const HELD_OWNED_VERSIONS_V1: &str = "rtdb.owned.ReadHeldVersions.v1";
 pub(crate) const CLOSE_OWNED_READ_V1: &str = "rtdb.owned.CloseRead.v1";
@@ -517,6 +518,20 @@ impl Service {
         }
         let (relation, id, valid, _identity) = point_request(call, request, if with_valid { PointTime::Optional } else { PointTime::Default })?;
         self.execute_owned_point(&held.snapshot, &relation, &id, valid).await
+    }
+
+    pub(crate) async fn held_owned_historical_point_action(&self, call: &Call, body: &[u8]) -> Result<ActionResult, Status> {
+        if !self.0.config.owned_native_actions { return Err(unsupported()); }
+        let (handle, request) = body.split_first_chunk::<16>().ok_or_else(|| invalid("Owned historical point has no handle"))?;
+        let (system, request) = request.split_first_chunk::<8>().ok_or_else(|| invalid("Owned historical point has no system time"))?;
+        let system = Timestamp(i64::from_be_bytes(*system));
+        let held = self.owned_read(call, &Bytes::copy_from_slice(handle))?;
+        let (relation, id, valid, _identity) = point_request(call, request, PointTime::Optional)?;
+        let valid = valid.unwrap_or(system);
+        let cursor = held.snapshot.open_historical_point(&relation, &id, system, valid).await.map_err(status)?;
+        let reply = self.finish_owned_point(system, valid, &id, cursor).await?;
+        held.snapshot.check().map_err(status)?;
+        Ok(reply)
     }
 
     pub(crate) async fn held_owned_valid_during_action(&self, call: &Call, body: &[u8]) -> Result<ActionResult, Status> {
