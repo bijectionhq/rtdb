@@ -111,6 +111,7 @@ pub(crate) const SEARCH_HELD_OWNED_V1: &str = "rtdb.owned.SearchHeld.v1";
 pub(crate) const HELD_OWNED_RANGE_V1: &str = "rtdb.owned.ReadHeldRange.v1";
 pub(crate) const HELD_OWNED_RANGE_V2: &str = "rtdb.owned.ReadHeldRange.v2";
 pub(crate) const HELD_OWNED_COUNT_V1: &str = "rtdb.owned.CountHeldRange.v1";
+pub(crate) const HELD_OWNED_MERGED_CHANGES_V1: &str = "rtdb.owned.ReadHeldMergedChanges.v1";
 pub(crate) const HELD_OWNED_CHANGES_V2: &str = "rtdb.owned.ReadHeldChanges.v2";
 const READ_IDLE: Duration = Duration::from_secs(60);
 const OWNED_PRESENT: &str = "rtdb.owned.present_micros";
@@ -806,17 +807,71 @@ impl Service {
         Ok(reply)
     }
 
-    fn owned_changes_reply(&self, page: &rtdb_node::OwnedChangePage, present: Timestamp) -> Result<ActionResult, Status> {
+    pub(crate) async fn held_owned_merged_changes_action(&self, call: &Call, body: &[u8]) -> Result<ActionResult, Status> {
+        if !self.0.config.owned_native_actions { return Err(unsupported()); }
+        let (handle, request) = body.split_first_chunk::<16>().ok_or_else(|| invalid("Merged changes require a held read handle"))?;
+        let handle = Bytes::copy_from_slice(handle);
+        let held = self.owned_read(call, &handle)?;
+        if let Err(error) = held.snapshot.check() {
+            if let Lookup::Found(entry) = self.0.owned_reads.take(&handle) { entry.close(); }
+            return Err(status(error));
+        }
+        let (after, rest) = request.split_first_chunk::<8>().ok_or_else(|| invalid("Merged changes require an exclusive revision"))?;
+        let (limit, rest) = rest.split_first_chunk::<2>().ok_or_else(|| invalid("Merged changes require a group limit"))?;
+        let (count, mut rest) = rest.split_first_chunk::<2>().ok_or_else(|| invalid("Merged changes require a relation count"))?;
+        let count = usize::from(u16::from_be_bytes(*count));
+        if !(1..=rtdb_node::OWNED_MERGED_CHANGE_RELATIONS).contains(&count) {
+            return Err(invalid("Merged changes require one to 32 owner relations"));
+        }
+        let _relations = call.reserve(count * 512)?;
+        let mut relations = Vec::with_capacity(count);
+        for _ in 0..count {
+            let (relation, tail) = split_relation(rest)?;
+            relations.push(relation);
+            rest = tail;
+        }
+        if !rest.is_empty() { return Err(invalid("Merged changes have trailing bytes")); }
+        let page = held.snapshot.merged_changes(&relations, Timestamp(i64::from_be_bytes(*after)), usize::from(u16::from_be_bytes(*limit)))
+            .await.map_err(status)?;
+        let reply = self.owned_merged_changes_reply(&page, held.snapshot.present().system_time)?;
+        held.snapshot.check().map_err(status)?;
+        Ok(reply)
+    }
+
+    fn owned_merged_changes_reply(
+        &self, page: &rtdb_node::OwnedMergedChanges, present: Timestamp,
+    ) -> Result<ActionResult, Status> {
         use rtdb_types::{LogicalType, ScalarType};
 
-        let logical_id = LogicalType::from_legs([ScalarType::I64, ScalarType::Utf8, ScalarType::Keyword, ScalarType::Uuid]
-            .into_iter().map(LogicalType::Scalar));
-        let touches_type = LogicalType::list(LogicalType::Struct(StructFields::from([
-            ("_id".into(), logical_id),
-            ("op".into(), LogicalType::Scalar(ScalarType::Utf8)),
-            ("valid_from_micros".into(), LogicalType::Scalar(ScalarType::I64)),
-            ("valid_to_micros".into(), LogicalType::Scalar(ScalarType::I64).maybe()),
+        let changes_type = LogicalType::list(LogicalType::Struct(StructFields::from([
+            ("relation".into(), LogicalType::Scalar(ScalarType::Utf8)),
+            ("touches".into(), owned_touches_type()),
         ])));
+        let schema = Schema::new(vec![
+            Field::new("revision", DataType::Int64, false),
+            rtdb_columnar::to_field("changes", &changes_type).map_err(status)?,
+        ]).with_metadata(std::collections::HashMap::from([(OWNED_PRESENT.into(), present.0.to_string())]));
+        if page.commits.is_empty() {
+            return self.owned_action_reply(&schema, None);
+        }
+        let schema = Arc::new(schema);
+        let _rows = self.memory().reserve(wire::add(wire::mul(page.retained_bytes, 2)?, 8192)?).map_err(status)?;
+        let revisions = Int64Array::from_iter_values(page.commits.iter().map(|commit| commit.revision.0));
+        let changes: Vec<_> = page.commits.iter().map(|commit| Value::List(commit.changes.iter().map(|change| {
+            Value::Struct(StructFields::from([
+                ("relation".into(), Value::Utf8(change.relation.name().into())),
+                ("touches".into(), Value::List(change.touches.iter().map(rtdb_types::OwnedChange::to_value).collect())),
+            ]))
+        }).collect())).collect();
+        let _arrow = self.memory().reserve(rtdb_columnar::estimate_builder_bytes(&changes_type, &changes).map_err(status)?)
+            .map_err(status)?;
+        let changes = rtdb_columnar::build_array(&changes_type, &changes).map_err(status)?;
+        let batch = RecordBatch::try_new(Arc::clone(&schema), vec![Arc::new(revisions), changes]).map_err(arrow)?;
+        self.owned_action_reply(&schema, Some(&batch))
+    }
+
+    fn owned_changes_reply(&self, page: &rtdb_node::OwnedChangePage, present: Timestamp) -> Result<ActionResult, Status> {
+        let touches_type = owned_touches_type();
         let schema = Arc::new(Schema::new(vec![
             Field::new("revision", DataType::UInt64, false),
             Field::new("system_time_micros", DataType::Int64, false),
@@ -1227,3 +1282,16 @@ fn has_payload(row: &rtdb_types::StructFields<Value>) -> bool {
 
 #[cfg(test)]
 mod commit_tests;
+
+fn owned_touches_type() -> rtdb_types::LogicalType {
+    use rtdb_types::{LogicalType, ScalarType};
+
+    let logical_id = LogicalType::from_legs([ScalarType::I64, ScalarType::Utf8, ScalarType::Keyword, ScalarType::Uuid]
+        .into_iter().map(LogicalType::Scalar));
+    LogicalType::list(LogicalType::Struct(StructFields::from([
+        ("_id".into(), logical_id),
+        ("op".into(), LogicalType::Scalar(ScalarType::Utf8)),
+        ("valid_from_micros".into(), LogicalType::Scalar(ScalarType::I64)),
+        ("valid_to_micros".into(), LogicalType::Scalar(ScalarType::I64).maybe()),
+    ])))
+}

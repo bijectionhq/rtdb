@@ -416,3 +416,18 @@ The `rtdb.owned.change_coverage_micros` metadata is the last returned group time
 Use the coverage time as the next exclusive system time.
 An empty page carries only the response schema and terminator.
 Revisions are dense within the authenticated owner's relation, and each returned system time belongs to a commit with a change on that relation.
+
+=== Reading a merged held change feed
+
+`rtdb.owned.ReadHeldMergedChanges.v1` takes the 16-byte held handle, an exclusive signed Int64 ordered system time in big-endian microseconds, a big-endian unsigned 16-bit commit limit, and a big-endian unsigned 16-bit relation count followed by that many relation prefixes.
+Supply one to 32 distinct preadmitted owner root relation names and a limit of one to 128 commits.
+The server seeks each selected relation's exact journal at the same held cut and refuses gaps or an exclusive cursor that predates uncovered history.
+A relation with a proven empty history contributes no commits.
+
+The reply is a terminated Arrow stream with `revision: Int64` ordered system microseconds and `changes: List<Struct<relation: Utf8, touches: List<Struct>>>`.
+The touch fields match ReadHeldChanges.v2.
+All selected relations touched by the same commit share a row, with relations in name order and touches in the relation's original write order.
+A capped page stops before a whole commit if it would exceed the 8 MiB retained-value budget.
+A commit that cannot fit in an otherwise empty page is rejected.
+Resume from the last returned revision.
+An empty covered page has no rows and carries the already-known held present in `rtdb.owned.present_micros`.
