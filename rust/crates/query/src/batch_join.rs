@@ -12,6 +12,7 @@ use crate::columnar::{BatchCursor, BoxBatchCursor, Column, ColumnBatch, gather_c
 use crate::context::Execution;
 use crate::invalid;
 use crate::join_key::JoinLayout;
+use crate::join_spill::{BlockWriter, Partitions, compatible_schema};
 use crate::join_storage::{HashIndex, combine_cell_hash, hash_values};
 use crate::operators::DeferredInput;
 use crate::pages::{BoxPageCursor, OwnedPage, PageCursor};
@@ -32,11 +33,13 @@ pub(crate) fn key_order(layout: &JoinLayout) -> Option<Vec<bool>> {
     }).collect()
 }
 
+#[derive(Clone)]
 pub(crate) struct ProbeInput { pub runtime: Arc<EmittedRelation>, pub execution: Execution, pub pushdowns: Option<Arc<Pushdowns>> }
 
 enum State {
     Build { build: BoxBatchCursor, probe: ProbeInput, layout: JoinLayout },
     Probe { table: Table, probe: BoxBatchCursor },
+    Disk { join: DiskJoin, restart: Option<(ProbeInput, ProbeInput, JoinLayout)> },
     Rows(BoxPageCursor),
     Done,
 }
@@ -61,13 +64,76 @@ impl Table {
     }
 }
 
+struct DiskJoin {
+    build: Partitions,
+    probe: Partitions,
+    table: Option<Table>,
+    build_partition: usize,
+    probe_partition: usize,
+    ready: Option<(VecDeque<ColumnBatch>, Arc<MemoryReservation>)>,
+}
+
+impl DiskJoin {
+    fn next(&mut self, spec: &Spec) -> Result<Option<ColumnBatch>> {
+        let context = &spec.execution.context;
+        let memory = &context.memory;
+        loop {
+            context.check_cancelled()?;
+            if let Some(batch) = self.ready.as_mut().and_then(|(batches, _)| batches.pop_front()) {
+                return Ok(Some(batch));
+            }
+            self.ready = None;
+            let builds = self.build.count();
+            if self.build_partition == builds { return Ok(None); }
+            if self.probe_partition == self.probe.count() / builds {
+                self.table = None;
+                self.build_partition += 1;
+                self.probe_partition = 0;
+                continue;
+            }
+            let inventory = |frames: usize| frames.checked_mul(2 * std::mem::size_of::<ColumnBatch>())
+                .and_then(|bytes| bytes.checked_add(256)).ok_or_else(size_error);
+            if self.table.is_none() {
+                let count = self.build.frames(self.build_partition);
+                let reservation = memory.reserve(inventory(count)?)?;
+                let mut batches = Vec::with_capacity(count);
+                let mut rows = 0usize;
+                for frame in 0..count {
+                    context.check_cancelled()?;
+                    let batch = self.build.read(self.build_partition, frame)?;
+                    rows = rows.checked_add(batch.len).ok_or_else(size_error)?;
+                    batches.push(batch);
+                }
+                self.table = Some(spec.table(batches, rows, reservation)?);
+            }
+            let table = self.table.as_mut().expect("The build partition is loaded");
+            let partition = self.probe_partition * builds + self.build_partition;
+            let count = self.probe.frames(partition);
+            let reservation = memory.reserve(inventory(count)?)?;
+            let mut ready = VecDeque::with_capacity(count);
+            let mut rows = 0usize;
+            // A probe partition's error must surface before any of its matches.
+            for frame in 0..count {
+                context.check_cancelled()?;
+                let batch = self.probe.read(partition, frame)?;
+                if let Some(batch) = spec.probe_batch(table, &batch)? {
+                    rows = rows.checked_add(batch.len).filter(|rows| *rows <= i32::MAX as usize).ok_or_else(size_error)?;
+                    ready.push_back(batch);
+                }
+            }
+            self.ready = Some((ready, reservation));
+            self.probe_partition += 1;
+        }
+    }
+}
+
 pub(crate) struct BatchJoin { state: State, spec: Spec }
 
 /// What the join compares and how it reads cells, fixed for its lifetime.
 /// `unswapped` is the join's own layout where the join builds its right input, which a spill hands to the row join.
 struct Spec {
     order: Vec<bool>, build_keys: Vec<usize>, probe_keys: Vec<usize>, widths: [usize; 2], kind: JoinKind,
-    projected: bool, swapped: bool, unswapped: Option<JoinLayout>, validate_payloads: bool, execution: Execution,
+    projected: bool, swapped: bool, unswapped: Option<JoinLayout>, validate_payloads: bool, replay_build: Option<ProbeInput>, execution: Execution,
 }
 
 impl BatchJoin {
@@ -75,7 +141,8 @@ impl BatchJoin {
         let build_keys = layout.left.key_positions().to_vec();
         let probe_keys = layout.right.key_positions().to_vec();
         let widths = [layout.left.original.len(), layout.right.original.len()];
-        Self { state: State::Build { build, probe, layout }, spec: Spec { order, build_keys, probe_keys, widths, kind: JoinKind::Inner, projected, swapped: false, unswapped: None, validate_payloads: false, execution } }
+        Self { state: State::Build { build, probe, layout }, spec: Spec { order, build_keys, probe_keys, widths, kind: JoinKind::Inner,
+            projected, swapped: false, unswapped: None, validate_payloads: false, replay_build: None, execution } }
     }
 }
 
@@ -87,6 +154,8 @@ impl BatchJoin {
     pub fn validating_payloads(mut self, validate: bool) -> Self { self.spec.validate_payloads = validate; self }
 
     pub fn with_kind(mut self, kind: JoinKind) -> Self { self.spec.kind = kind; self }
+
+    pub fn spilling_arrow(mut self, build: Option<ProbeInput>) -> Self { self.spec.replay_build = build; self }
 }
 
 impl Spec {
@@ -116,8 +185,59 @@ impl Spec {
                 .and_then(|bytes| bytes.checked_add(256)).ok_or_else(size_error)?;
             Arc::get_mut(&mut inventory).expect("The join owns its batch inventory").grow_to(bytes)?;
             batches.push(batch);
-            if i64::try_from(rows).map_or(true, |rows| rows > threshold) { return self.spill(batches, build, probe, layout); }
+            if i64::try_from(rows).map_or(true, |rows| rows > threshold) {
+                if let Some(replay_build) = self.replay_build.take()
+                    && compatible_schema(&layout.left.original) && compatible_schema(&layout.right.original) {
+                    let replay_probe = probe.clone();
+                    match self.spill_arrow(batches, build, probe, &layout).await {
+                        Ok(join) => return Ok(State::Disk { join, restart: Some((replay_build, replay_probe, layout)) }),
+                        Err(error) if retry_row_spill(&error) => {
+                            drop(inventory);
+                            return self.replay_spill(replay_build, replay_probe, layout).await;
+                        }
+                        Err(error) => return Err(error),
+                    }
+                }
+                return self.spill(batches, build, probe, layout);
+            }
         }
+        let mut table = self.table(batches, rows, inventory)?;
+        let width = self.build_keys.len();
+        let blooms = matches!(self.kind, JoinKind::Inner | JoinKind::Semi) || self.tracks_build() && self.kind != JoinKind::Full;
+        let mut filters = PushdownBuilder::new(layout.condition.as_ref(), &layout.left.schema, &layout.right.original, i64::try_from(rows).map_err(|_| size_error())?, blooms, &self.execution)?;
+        if blooms {
+            match &table.keys {
+                BuildKeys::Arrow => for batch in &table.batches {
+                    for row in 0..batch.len {
+                        self.execution.context.check_cancelled_at(row)?;
+                        filters.insert_arrow(&layout.left.schema, batch, row, &memory)?;
+                    }
+                },
+                BuildKeys::Values { keys, .. } => {
+                    let _scratch = memory.reserve(layout.left.schema.len().checked_mul(std::mem::size_of::<Value>()).ok_or_else(size_error)?)?;
+                    let mut scratch = vec![Value::Null; layout.left.schema.len()];
+                    for row in 0..rows {
+                        for (index, &position) in self.build_keys.iter().enumerate() { scratch[position] = keys[row * width + index].clone(); }
+                        filters.insert(&layout.left.schema, &scratch, &self.execution).await?;
+                    }
+                }
+            }
+        }
+        let filters = filters.finish(&memory)?;
+        let pushdowns = Pushdowns::merge(probe.pushdowns.as_ref(), filters, &memory)?;
+        let Some((probe_batches, probe_projected)) = crate::operators::build_batches(probe.runtime, probe.execution, pushdowns).await? else {
+            return Err(rtdb_types::Anomaly::fault("rtdb.query/batch-join", "A batch join's probe input did not open as batches"));
+        };
+        if probe_projected != self.projected { return Err(rtdb_types::Anomaly::fault("rtdb.query/batch-join", "A batch join's inputs disagree on date admission")); }
+        if self.tracks_build() {
+            let charge = memory.reserve(rows)?;
+            table.unmatched = Some((vec![1; rows], charge));
+        }
+        Ok(State::Probe { table, probe: probe_batches })
+    }
+
+    fn table(&self, batches: Vec<ColumnBatch>, rows: usize, inventory: Arc<MemoryReservation>) -> Result<Table> {
+        let memory = &self.execution.context.memory;
         let width = self.build_keys.len();
         let starts_bytes = batches.len().checked_mul(std::mem::size_of::<usize>()).and_then(|bytes| bytes.checked_add(256)).ok_or_else(size_error)?;
         let _hashes = memory.reserve(rows.checked_mul(std::mem::size_of::<u32>()).ok_or_else(size_error)?)?;
@@ -158,40 +278,7 @@ impl Spec {
         let index = HashIndex::new(&hashes, &memory)?;
         drop(hashes);
         drop(_hashes);
-        let blooms = matches!(self.kind, JoinKind::Inner | JoinKind::Semi) || self.tracks_build() && self.kind != JoinKind::Full;
-        let mut filters = PushdownBuilder::new(layout.condition.as_ref(), &layout.left.schema, &layout.right.original, i64::try_from(rows).map_err(|_| size_error())?, blooms, &self.execution)?;
-        if blooms {
-            match &keys {
-                BuildKeys::Arrow => for batch in &batches {
-                    for row in 0..batch.len {
-                        self.execution.context.check_cancelled_at(row)?;
-                        filters.insert_arrow(&layout.left.schema, batch, row, &memory)?;
-                    }
-                },
-                BuildKeys::Values { keys, .. } => {
-                    let _scratch = memory.reserve(layout.left.schema.len().checked_mul(std::mem::size_of::<Value>()).ok_or_else(size_error)?)?;
-                    let mut scratch = vec![Value::Null; layout.left.schema.len()];
-                    for row in 0..rows {
-                        for (index, &position) in self.build_keys.iter().enumerate() { scratch[position] = keys[row * width + index].clone(); }
-                        filters.insert(&layout.left.schema, &scratch, &self.execution).await?;
-                    }
-                }
-            }
-        }
-        let filters = filters.finish(&memory)?;
-        let pushdowns = Pushdowns::merge(probe.pushdowns.as_ref(), filters, &memory)?;
-        let Some((probe_batches, probe_projected)) = crate::operators::build_batches(probe.runtime, probe.execution, pushdowns).await? else {
-            return Err(rtdb_types::Anomaly::fault("rtdb.query/batch-join", "A batch join's probe input did not open as batches"));
-        };
-        if probe_projected != self.projected { return Err(rtdb_types::Anomaly::fault("rtdb.query/batch-join", "A batch join's inputs disagree on date admission")); }
-        let unmatched = if self.tracks_build() {
-            let charge = memory.reserve(rows)?;
-            Some((vec![1; rows], charge))
-        } else {
-            None
-        };
-        Ok(State::Probe { table: Table { batches, starts, keys, index, rows, unmatched,
-            _keys: reservation, _inventory: inventory }, probe: probe_batches })
+        Ok(Table { batches, starts, keys, index, rows, unmatched: None, _keys: reservation, _inventory: inventory })
     }
 
     fn arrow_build_hashes(&self, batches: &[ColumnBatch], hashes: &mut Vec<u32>) -> Result<bool> {
@@ -203,6 +290,45 @@ impl Spec {
             }
         }
         Ok(true)
+    }
+
+    async fn spill_arrow(
+        &self, held: Vec<ColumnBatch>, mut rest: BoxBatchCursor, probe: ProbeInput, layout: &JoinLayout,
+    ) -> Result<DiskJoin> {
+        let context = &self.execution.context;
+        let mut build = BlockWriter::new(&layout.left.original, context)?;
+        for batch in held { build.append(batch, context)?; }
+        while let Some(batch) = rest.next_batch().await? {
+            batch.validate_readable(context)?;
+            build.append(batch, context)?;
+        }
+        drop(rest);
+        let build = build.finish(context)?.shuffle(1, context, |batch, row| self.spill_hash(batch, row, &self.build_keys))?;
+        let Some((mut input, projected)) = crate::operators::build_batches(probe.runtime, probe.execution, probe.pushdowns).await? else {
+            return Err(crate::join_spill::layout_error());
+        };
+        if projected != self.projected { return Err(crate::join_spill::layout_error()); }
+        let mut probe = BlockWriter::new(&layout.right.original, context)?;
+        while let Some(batch) = input.next_batch().await? {
+            batch.validate_readable(context)?;
+            probe.append(batch, context)?;
+        }
+        let probe = probe.finish(context)?.shuffle(build.count(), context, |batch, row| self.spill_hash(batch, row, &self.probe_keys))?;
+        Ok(DiskJoin { build, probe, table: None, build_partition: 0, probe_partition: 0, ready: None })
+    }
+
+    fn spill_hash(&self, batch: &ColumnBatch, row: usize, positions: &[usize]) -> Result<u32> {
+        if let Some(hash) = arrow_hash(batch, row, positions) { return Ok(hash); }
+        let (values, _reservation) = self.value_keys(batch, row, positions)?;
+        hash_values(&values)
+    }
+
+    async fn replay_spill(&self, build: ProbeInput, probe: ProbeInput, layout: JoinLayout) -> Result<State> {
+        let open = |input: ProbeInput| DeferredInput::new(
+            input.runtime, input.execution, crate::inspection::Constraints::default(), input.pushdowns,
+        );
+        let build = open(build).open_pages(None).await?;
+        Ok(State::Rows(Box::new(crate::join::JoinCursor::new(build, open(probe), layout, true, self.kind, self.execution.clone())?)))
     }
 
     /// Hands the input read so far, and the rest, to the row join, which spills a build side this large.
@@ -479,6 +605,10 @@ fn arrow_hash(batch: &ColumnBatch, row: usize, positions: &[usize]) -> Option<u3
     })
 }
 
+fn retry_row_spill(error: &rtdb_types::Anomaly) -> bool {
+    matches!(error.code.as_str(), "rtdb.query/join-spill-layout" | "rtdb.query/spill-limit" | "rtdb/memory-budget-exceeded")
+}
+
 fn key_bound(batch: &ColumnBatch, row: usize, positions: &[usize]) -> Result<usize> {
     let base = positions.len().checked_mul(std::mem::size_of::<Value>())
         .and_then(|bytes| bytes.checked_add(256)).ok_or_else(size_error)?;
@@ -645,6 +775,19 @@ impl BatchCursor for BatchJoin {
                     let batch = ColumnBatch::from_page(&page, &self.spec.execution.context.memory)?;
                     self.state = State::Rows(rows);
                     if batch.len > 0 { return Ok(Some(batch)); }
+                }
+                State::Disk { mut join, restart } => match join.next(&self.spec) {
+                    Ok(Some(output)) => {
+                        self.state = State::Disk { join, restart: None };
+                        return Ok(Some(output));
+                    }
+                    Ok(None) => return Ok(None),
+                    Err(error) if retry_row_spill(&error) => {
+                        let Some((build, probe, layout)) = restart else { return Err(error); };
+                        drop(join);
+                        self.state = self.spec.replay_spill(build, probe, layout).await?;
+                    }
+                    Err(error) => return Err(error),
                 }
                 State::Done => return Ok(None),
             }

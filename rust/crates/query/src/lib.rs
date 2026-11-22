@@ -41,6 +41,7 @@ mod materialized;
 mod cross;
 mod query_cpu;
 mod join_storage;
+mod join_spill;
 mod mark;
 
 pub use accelerate::{CandidateVerifier, ConstantEvaluator, FileMatches, MatchAnswers, OrderedBatches, OrderedCandidates, OrderedScan, ScanAccelerator, ScanRequest};

@@ -2054,6 +2054,45 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn equijoin_spill_replays_arrow_partitions_in_the_original_order() {
+        use rtdb_plan::{BinaryOp, JoinKind, Relation};
+
+        let (state, table, _, store, _) = persisted_page_fixture().await;
+        for (spill_limit, arrow) in [(8192, true), (900, false)] {
+            let storage = Arc::new(BufferPool::new(store.clone(), 1 << 20));
+            let (left, mut execution, memory) = descriptor_scan(state.value().snapshot(), table.clone(), storage);
+            let context = Arc::get_mut(&mut execution.context).unwrap();
+            context.options.join_build_rows = 1;
+            context.spill = Arc::new(crate::spill::SpillRegion::new(spill_limit).unwrap());
+            let mut right = left.clone();
+            right.columns[0].id = ColumnId(10);
+            let condition = Expr::binary(BinaryOp::Eq, left.columns[0].expression(), right.columns[0].expression());
+            let relation = Arc::new(Relation::join(
+                Arc::new(Relation::scan(left).unwrap()), Arc::new(Relation::scan(right).unwrap()),
+                JoinKind::Inner, Some(condition),
+            ).unwrap());
+            let runtime = crate::runtime_schema::EmittedRelation::derive(relation, &execution.context.catalog, &[], &memory).unwrap();
+            let mut baseline = crate::operators::build_pages(Arc::clone(&runtime), execution.clone()).await.unwrap();
+            let mut expected = Vec::new();
+            while let Some(page) = baseline.next_page().await.unwrap() {
+                expected.extend(page.rows().iter().map(|row| row.values.clone()));
+            }
+            drop(baseline);
+            assert_eq!(execution.context.spill_bytes(), 0);
+            let mut cursor = crate::operators::build_columns(runtime, execution.clone()).await.unwrap().expect("Expected columnar join");
+            let mut actual = Vec::new();
+            while let Some(batch) = cursor.next_batch().await.unwrap() {
+                assert_eq!(batch.columns.iter().all(|column| matches!(column, crate::columnar::Column::Arrow { .. })), arrow);
+                actual.extend((0..batch.len).map(|row| batch.columns.iter().map(|column| column.value(row).unwrap()).collect::<Vec<_>>()));
+            }
+            assert_eq!(actual, expected);
+            assert_eq!(actual.len(), 3);
+            assert!(execution.context.spill_peak_bytes() > 0);
+            assert_eq!(execution.context.spill_bytes(), 0);
+        }
+    }
+
+    #[tokio::test]
     async fn computed_projection_keeps_cold_scan_payloads_and_list_children_in_arrow() {
         use rtdb_plan::{NamedExpr, Relation};
 

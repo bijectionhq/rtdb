@@ -285,12 +285,33 @@ async fn build_batches_at(
                 layout.resolve_types(runtime.child(0)?.schema(),runtime.child(1)?.schema(),&execution)?;
                 Some(layout)
             } else { None };
+            let replay_build = if output == BatchOutput::Arrow && *kind == JoinKind::Inner
+                && !swapped && replayable_spill_input(build_relation) && replayable_spill_input(probe_relation) {
+                Some(crate::batch_join::ProbeInput {
+                    runtime: runtime.child(build_side)?, execution: execution.child(build_side), pushdowns: probe.pushdowns.clone(),
+                })
+            } else {
+                None
+            };
             let join = crate::batch_join::BatchJoin::new(build,probe,layout,order,projected,execution)
-                .swapped(unswapped).validating_payloads(output == BatchOutput::Arrow).with_kind(*kind);
+                .swapped(unswapped).validating_payloads(output == BatchOutput::Arrow).with_kind(*kind).spilling_arrow(replay_build);
             Ok(Some((Box::new(join) as crate::columnar::BoxBatchCursor,projected)))
         }
         _ => Ok(None),
     }
+}
+
+fn replayable_spill_input(relation: &Relation) -> bool {
+    use rtdb_plan::TemporalFilter;
+    let RelationNode::Scan(scan) = relation.node() else { return false; };
+    let simple = |expr: &Expr| matches!(expr, Expr::Literal(_) | Expr::Parameter { .. });
+    let fixed = |filter: &TemporalFilter| match filter {
+        TemporalFilter::Default | TemporalFilter::All => true,
+        TemporalFilter::At(at) => simple(at),
+        TemporalFilter::FromTo { from, to } | TemporalFilter::Between { from, to } => simple(from) && simple(to),
+    };
+    scan.predicates.is_empty() && scan.matches.is_empty() && scan.top_k.is_none() && scan.ordered_top_k.is_none()
+        && fixed(&scan.valid_time) && fixed(&scan.system_time)
 }
 
 /// Opens a whole plan as a batch source where `build_batches` takes its shape, charging the root operator's state as
