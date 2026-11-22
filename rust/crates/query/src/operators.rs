@@ -347,8 +347,8 @@ async fn build_batches_at(
                 layout.resolve_types(runtime.child(0)?.schema(),runtime.child(1)?.schema(),&execution)?;
                 Some(layout)
             } else { None };
-            let replay_build = if output == BatchOutput::Arrow && *kind == JoinKind::Inner
-                && !swapped && replayable_spill_input(build_relation) && replayable_spill_input(probe_relation) {
+            let replay_build = if output == BatchOutput::Arrow
+                && replayable_spill_input(build_relation) && replayable_spill_input(probe_relation) {
                 Some(crate::batch_join::ProbeInput {
                     runtime: runtime.child(build_side)?, execution: execution.child(build_side), pushdowns: probe.pushdowns.clone(), output,
                 })
@@ -366,6 +366,9 @@ async fn build_batches_at(
 
 fn replayable_spill_input(relation: &Relation) -> bool {
     use rtdb_plan::TemporalFilter;
+    if let RelationNode::Values { rows } = relation.node() {
+        return crate::columnar::ColumnBatch::supports_literal_rows(rows);
+    }
     let RelationNode::Scan(scan) = relation.node() else { return false; };
     let simple = |expr: &Expr| matches!(expr, Expr::Literal(_) | Expr::Parameter { .. });
     let fixed = |filter: &TemporalFilter| match filter {

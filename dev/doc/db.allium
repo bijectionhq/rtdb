@@ -1866,6 +1866,8 @@ surface QueryAccess {
         -- Percentile aggregates order each group's selected positions and read the ranked arguments from their source vectors.
         -- A bounded scalar membership join indexes the build key vectors and appends nullable Boolean marks to the probe batches.
         -- An Arrow join can evaluate a residual predicate from its referenced cells while gathering the result payloads from the input batches.
+        -- Compatible join partitions retain flat and nested Arrow layouts in spill files.
+        -- Outer joins track unmatched build positions through partition replay.
         -- A correlated query can read Arrow batches from both inputs and gather its output from their selected positions.
         -- UNNEST over compatible Arrow list columns expands the selected child positions and gathers their parent payloads by position.
         -- A column table over a compatible Arrow list parameter reads the bound row's child slice as one semantic page.

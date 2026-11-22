@@ -183,9 +183,10 @@ impl DiskJoin {
             let builds = self.build.count();
             if self.build_partition == builds { return Ok(None); }
             if self.probe_partition == self.probe.count() / builds {
-                self.table = None;
+                let table = self.table.take().expect("The completed partition has a build table");
                 self.build_partition += 1;
                 self.probe_partition = 0;
+                if let Some(unmatched) = spec.unmatched_build(&table)? { return Ok(Some(unmatched)); }
                 continue;
             }
             let inventory = |frames: usize| frames.checked_mul(2 * std::mem::size_of::<ColumnBatch>())
@@ -201,7 +202,12 @@ impl DiskJoin {
                     rows = rows.checked_add(batch.len).ok_or_else(size_error)?;
                     batches.push(batch);
                 }
-                self.table = Some(spec.table(batches, rows, reservation)?);
+                let mut table = spec.table(batches, rows, reservation)?;
+                if spec.tracks_build() {
+                    let charge = memory.reserve(rows)?;
+                    table.unmatched = Some((vec![1; rows], charge));
+                }
+                self.table = Some(table);
             }
             let table = self.table.as_mut().expect("The build partition is loaded");
             let partition = self.probe_partition * builds + self.build_partition;
@@ -429,12 +435,13 @@ impl Spec {
         hash_values(&values)
     }
 
-    async fn replay_spill(&self, build: ProbeInput, probe: ProbeInput, layout: JoinLayout) -> Result<State> {
+    async fn replay_spill(&mut self, build: ProbeInput, probe: ProbeInput, layout: JoinLayout) -> Result<State> {
         let open = |input: ProbeInput| DeferredInput::new(
             input.runtime, input.execution, crate::inspection::Constraints::default(), input.pushdowns,
         );
         let build = open(build).open_pages(None).await?;
-        Ok(State::Rows(Box::new(crate::join::JoinCursor::new(build, open(probe), layout, true, self.kind, self.execution.clone())?)))
+        let (layout, build_left) = match self.unswapped.take() { Some(unswapped) => (unswapped, false), None => (layout, true) };
+        Ok(State::Rows(Box::new(crate::join::JoinCursor::new(build, open(probe), layout, build_left, self.kind, self.execution.clone())?)))
     }
 
     /// Hands the input read so far, and the rest, to the row join, which spills a build side this large.

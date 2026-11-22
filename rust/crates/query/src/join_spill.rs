@@ -18,18 +18,20 @@ use crate::{
 const FRAME_ROWS: usize = 1024;
 
 pub(crate) fn compatible_schema(schema: &Schema) -> bool {
-    fn scalar(ty: &LogicalType) -> bool {
+    fn compatible(ty: &LogicalType) -> bool {
         match ty {
             LogicalType::Null | LogicalType::Scalar(
                 ScalarType::Bool | ScalarType::I8 | ScalarType::I16 | ScalarType::I32 | ScalarType::I64
                 | ScalarType::F32 | ScalarType::F64 | ScalarType::Utf8 | ScalarType::Binary
                 | ScalarType::FixedSizeBinary(_) | ScalarType::Uuid
             ) => true,
-            LogicalType::Maybe(ty) => scalar(ty),
+            LogicalType::Maybe(ty) => compatible(ty),
+            LogicalType::List { kind: rtdb_types::ListKind::List | rtdb_types::ListKind::FixedSizeList(_), element } => compatible(element),
+            LogicalType::Struct(fields) => fields.values().all(compatible),
             _ => false,
         }
     }
-    schema.fields().iter().all(|field| scalar(&field.data_type))
+    schema.fields().iter().all(|field| compatible(&field.data_type))
 }
 
 pub(crate) fn layout_error() -> rtdb_types::Anomaly {
