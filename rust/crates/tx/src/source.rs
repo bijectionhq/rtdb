@@ -1122,6 +1122,25 @@ impl SourceOperationReader<'_> {
             "rtdb-hosted-control-v1" | "rtdb-hosted-control-check-v1" => &["relation", "scope", "expected", "document"],
             "rtdb-owned-deadline-v1" => &["until"],
             "rtdb-owned-fixed-range-v1" => &["relation", "rule"],
+            "rtdb-owned-publish-world-v1" => &["world", "attempt", "fingerprint", "expected"],
+            "rtdb-owned-check-world-purge-v1" => &["relation", "frontier"],
+            "rtdb-owned-check-world-scope-v1" => &["scope"],
+            "rtdb-owned-check-range-v1" => &["relation", "basis_id", "basis_time", "scope", "frontier", "until"],
+            "rtdb-owned-check-range-v2" => &["relation", "basis_id", "basis_time", "scope", "frontier", "until", "fixed"],
+            "rtdb-owned-check-v1" => &["relation", "id", "valid_at", "expected"],
+            "rtdb-owned-erase-v2" => &["relation", "id"],
+            "rtdb-owned-delete-v1" => &["relation", "id", "_valid_from", "_valid_to"],
+            "rtdb-owned-insert-v1" | "rtdb-owned-replace-v1" => &["iids", "_valid_from", "_valid_to", "field_presence"],
+            "insert-docs" | "put-docs" | "patch-docs" => &["iids", "_valid_from", "_valid_to"],
+            "delete-docs" => &["table", "iids", "_valid_from", "_valid_to"],
+            "erase-docs" => &["table", "iids"],
+            _ => &[],
+        };
+        let bound = body.fields().iter().zip(body.columns()).filter(|(field, _)| value_fields.contains(&field.name().as_str()))
+            .try_fold(base, |bytes, (field, column)| bytes.checked_add(estimate_read_value_bytes(field, column.as_ref(), offset)?).ok_or_else(overflow))?;
+        parsed_fields.grow_to(bound)?;
+        let value = |name| struct_cell(body, name, offset);
+        let operation = match name.as_str() {
             "rtdb-owned-publish-world-v1" => {
                 let (Value::Uuid(world), Value::Utf8(attempt), Value::Binary(fingerprint)) =
                     (value("world")?, value("attempt")?, value("fingerprint")?) else {
@@ -1143,23 +1162,6 @@ impl SourceOperationReader<'_> {
                 };
                 TxOp::OwnedCheckWorldPurge { relation: rtdb_types::OwnedRelation::from_source(relation)?, frontier }
             }
-            "rtdb-owned-check-world-scope-v1" => &["scope"],
-            "rtdb-owned-check-range-v1" => &["relation", "basis_id", "basis_time", "scope", "frontier", "until"],
-            "rtdb-owned-check-range-v2" => &["relation", "basis_id", "basis_time", "scope", "frontier", "until", "fixed"],
-            "rtdb-owned-check-v1" => &["relation", "id", "valid_at", "expected"],
-            "rtdb-owned-erase-v2" => &["relation", "id"],
-            "rtdb-owned-delete-v1" => &["relation", "id", "_valid_from", "_valid_to"],
-            "rtdb-owned-insert-v1" | "rtdb-owned-replace-v1" => &["iids", "_valid_from", "_valid_to", "field_presence"],
-            "insert-docs" | "put-docs" | "patch-docs" => &["iids", "_valid_from", "_valid_to"],
-            "delete-docs" => &["table", "iids", "_valid_from", "_valid_to"],
-            "erase-docs" => &["table", "iids"],
-            _ => &[],
-        };
-        let bound = body.fields().iter().zip(body.columns()).filter(|(field, _)| value_fields.contains(&field.name().as_str()))
-            .try_fold(base, |bytes, (field, column)| bytes.checked_add(estimate_read_value_bytes(field, column.as_ref(), offset)?).ok_or_else(overflow))?;
-        parsed_fields.grow_to(bound)?;
-        let value = |name| struct_cell(body, name, offset);
-        let operation = match name.as_str() {
             "rtdb-owned-check-capacity-v1" => {
                 let (Value::Utf8(relation), Value::Utf8(column), Value::Binary(prefix), Value::I64(at_most)) =
                     (value("relation")?, value("column")?, value("prefix")?, value("at_most")?)
