@@ -426,6 +426,31 @@ async fn open_private_catalog(
     query.execute(context, Vec::new()).await.map(Some)
 }
 
+pub async fn read_owned_world_clock(
+    context: Arc<QueryContext>, owner: &str, world: Iid,
+) -> Result<Option<Timestamp>> {
+    let unavailable = rtdb_types::OwnedWorld::unavailable;
+    let id = EntityId::Uuid(world.0);
+    let Some(mut cursor) = open_owned_table_point(
+        Arc::clone(&context), OwnedRelation::world_clock_table(owner), world, Some(&id),
+        None, Some(&["clock"]), false,
+    ).await? else { return Ok(None); };
+    let mut clock = None;
+    while let Some(batch) = cursor.next_batch().await? {
+        let batch = batch.batch();
+        if batch.num_rows() == 0 { continue; }
+        if clock.is_some() || batch.num_rows() != 1 { return Err(unavailable()); }
+        let revision = owned_row_revision(batch, 0, &id, &context.memory)?;
+        let (index, field) = batch.schema_ref().column_with_name("clock").ok_or_else(unavailable)?;
+        let Value::I64(reading) = rtdb_columnar::read_value(field, batch.column(index).as_ref(), 0)? else {
+            return Err(unavailable());
+        };
+        if reading > revision.0 { return Err(unavailable()); }
+        clock = Some(Timestamp(reading));
+    }
+    Ok(clock)
+}
+
 pub async fn read_owned_world(
     context: Arc<QueryContext>, owner: &str, world: rtdb_types::Iid,
 ) -> Result<Option<(rtdb_types::OwnedWorld, Arc<rtdb_columnar::MemoryReservation>)>> {

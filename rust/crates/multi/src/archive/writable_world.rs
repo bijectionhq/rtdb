@@ -211,6 +211,7 @@ struct OpenWorld {
     retained: CheckpointWorldRetention,
     snapshot: OwnedReadSession,
     record: OwnedWorld,
+    clock: Option<Timestamp>,
     _schema_charge: Arc<MemoryReservation>,
 }
 
@@ -252,10 +253,15 @@ async fn open_world(
     {
         return Err(OwnedWorld::unavailable());
     }
+    let clock = snapshot.world_application_clock(world.id).await?;
+    if clock.is_some_and(|clock| clock <= retained.basis.system_time || clock > snapshot.present().system_time) {
+        return Err(OwnedWorld::unavailable());
+    }
     Ok(OpenWorld {
         retained: retained.clone(),
         snapshot,
         record: world,
+        clock,
         _schema_charge: charge,
     })
 }
@@ -336,7 +342,7 @@ pub async fn commit_checkpoint_world(
     id: Uuid,
     writes: Vec<OwnedWorldWrite>,
 ) -> Result<TransactionKey> {
-    commit_checkpoint_world_checked(directory, archive, session, deployment, id, writes, Vec::new(), Vec::new(), None).await
+    commit_checkpoint_world_checked(directory, archive, session, deployment, id, writes, Vec::new(), Vec::new(), None, None).await
 }
 
 pub(crate) async fn commit_checkpoint_world_checked(
@@ -349,6 +355,7 @@ pub(crate) async fn commit_checkpoint_world_checked(
     checks: Vec<OwnedWorldPointWitness>,
     controls: Vec<rtdb_node::HostedControlWrite>,
     deadline: Option<Timestamp>,
+    publication: Option<rtdb_node::OwnedWorldPublication>,
 ) -> Result<TransactionKey> {
     let OpenWorld {
         snapshot,
@@ -357,7 +364,7 @@ pub(crate) async fn commit_checkpoint_world_checked(
         ..
     } = open_world(directory, archive, session, deployment, id).await?;
     drop(snapshot);
-    let outcome = session.commit_owned_world_checked(&record, writes, checks, controls, deadline).await?;
+    let outcome = session.commit_owned_world_checked(&record, writes, checks, controls, deadline, publication).await?;
     if !outcome.committed() {
         return Err(outcome
             .error()

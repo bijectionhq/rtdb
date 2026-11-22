@@ -214,6 +214,8 @@ const OWNED_SCHEMA_V1: &str = "rtdb_owned_v1";
 const OWNED_PATH_CATALOG: &str = ".ordered-paths";
 const OWNED_SEARCH_CATALOG: &str = ".search-paths";
 const OWNED_RELATION_CATALOG: &str = ".relation-schemas";
+pub const OWNED_ATTEMPT_RELATION: &str = "fact_attempts";
+const OWNED_WORLD_CLOCKS: &str = ".world-clocks";
 const OWNED_WORLD_CATALOG: &str = ".worlds";
 const OWNED_WORLD_PREFIX: &str = ".world-";
 const OWNED_UNIQUE_PREFIX: &str = ".unique-";
@@ -262,6 +264,8 @@ impl OwnedRelation {
 
     pub fn search_catalog(owner: &str) -> TableRef { owned_table(owner, OWNED_SEARCH_CATALOG) }
     pub fn relation_catalog(owner: &str) -> TableRef { owned_table(owner, OWNED_RELATION_CATALOG) }
+
+    pub fn world_clock_table(owner: &str) -> TableRef { owned_table(owner, OWNED_WORLD_CLOCKS) }
 
     pub fn world_catalog() -> Self { Self(OWNED_WORLD_CATALOG.into()) }
 
@@ -355,7 +359,7 @@ impl TableRef {
         self.schema == OWNED_SCHEMA_V1
             && self.table.split_once('-').is_some_and(|(owner, name)| {
                 owner.len() == 64 && owner.bytes().all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-                    && (matches!(name, OWNED_PATH_CATALOG | OWNED_SEARCH_CATALOG | OWNED_RELATION_CATALOG)
+                    && (matches!(name, OWNED_PATH_CATALOG | OWNED_SEARCH_CATALOG | OWNED_RELATION_CATALOG | OWNED_WORLD_CLOCKS)
                         || name.strip_prefix(OWNED_PURGE_FLOOR_PREFIX).is_some_and(|relation| OwnedRelation::new(relation).is_ok())
                         || name.strip_prefix(OWNED_PURGE_PREFIX).is_some_and(|relation| OwnedRelation::new(relation).is_ok())
                         || name.strip_prefix(OWNED_UNIQUE_PREFIX).is_some_and(|relation| OwnedRelation::new(relation).is_ok())

@@ -419,8 +419,8 @@ The read resolves the local world shadow at one reserved present, including tomb
 The IPC metadata reports the live world present as `rtdb.owned.present_micros` and the selected instant as `rtdb.owned.valid_micros`.
 A found row includes the winning local or archived `rtdb.owned.revision_micros`. An absent row has no record batch.
 
-`rtdb.owned.OpenWorldRead.v2` takes the world UUID and admits one live cut and its verified archived parent.
-The 40-byte result contains the opaque handle, the live present, and the archived parent transaction ID and system time. Each coordinate is a signed big-endian 64-bit integer. Times are Unix microseconds.
+`rtdb.owned.OpenWorldRead.v3` takes the world UUID and admits one live cut and its verified archived parent.
+The 48-byte result contains the opaque handle, the live present, archived parent transaction ID and system time, and the last application clock. Int64 minimum identifies a world with no local application publication. Each coordinate is a signed big-endian 64-bit integer. Times are Unix microseconds.
 `rtdb.owned.ReadHeldWorldPoint.v2` takes the 16-byte held handle, one observation flag byte (0 for read-only or 1 to request a witness), then the same relation and Arrow fields as the one-shot read.
 The point response schema includes `rtdb.owned.world_shadowed` (0 or 1). A local tombstone counts as a shadow.
 Every call reads the same live cut and archive root. The held handle stays bound to the original authenticated session and attachment.
@@ -494,6 +494,15 @@ The response has the same transaction-key row as `CommitWorld.v1`.
 It takes the world UUID, one signed big-endian 64-bit exclusive deadline in Unix microseconds, the held handle, a big-endian u16 witness count from 1 to 128, and the distinct 16-byte nonces.
 The remaining bytes are the existing hosted control groups. Only check rows from the placed allowlist are admitted.
 The ordered transaction checks the world registration, placement, deadline, local point revisions, root erasure frontiers, and hosted ownership before issuing the transaction-key receipt.
+
+`rtdb.owned.CommitWorld.v4` publishes an admitted single-world overlay and application clock atomically.
+`rtdb.owned.CommitWorldClock.v1` publishes a clock alone using the same held conditions, deadline, hosted ownership checks, and immutable attempt marker.
+Its body shares the v4 prefix through the expected clock, followed by the target clock as a big-endian i64 and the check-only hosted control groups.
+The target must strictly exceed the held clock and be at or before the ordered commit time.
+The prefix through the witness list matches v3, followed by 22 lowercase hexadecimal attempt ID bytes, a 32-byte request fingerprint, and the expected application clock as signed Int64 (minimum for no local publication).
+A big-endian u32 length frames the existing overlay relation groups, followed by the check-only hosted control groups.
+The ordered resolver validates the original witnesses and advances the expected clock by one microsecond from the prior local clock or archived parent basis.
+It creates the immutable root attempt marker with the same transaction key as the overlay and clock. Administrative overlay operations retain their existing semantics.
 
 === Reading a merged held change feed
 

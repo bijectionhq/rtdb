@@ -49,6 +49,7 @@ impl OpenTransaction<'_> {
             return Err(unavailable());
         }
         let validating_world = self.owned_world.is_some();
+        let publishing_world = operations.iter().any(|op| matches!(op, Operation::Public(TxOp::OwnedPublishWorld { .. })));
         if validating_world && (
             controls.clone().any(|control| !control.is_check())
             || !operations.iter().any(|operation| matches!(operation, Operation::Public(TxOp::OwnedCheckWorldScope { .. })))
@@ -61,6 +62,9 @@ impl OpenTransaction<'_> {
                 if !matches!(operation, Operation::Public(
                     TxOp::OwnedDeadline { .. } | TxOp::OwnedCheck { .. } | TxOp::OwnedCheckWorldScope { .. }
                         | TxOp::OwnedCheckWorldPurge { .. } | TxOp::HostedControl(_)
+                )) && !(publishing_world && matches!(operation,
+                    Operation::Public(TxOp::OwnedPublishWorld { .. } | TxOp::OwnedReplaceDocs { .. })
+                        | Operation::OwnedWriteIids { create_only: false, .. }
                 )) {
                     return Err(unavailable());
                 }
