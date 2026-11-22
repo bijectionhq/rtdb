@@ -2545,6 +2545,9 @@ async fn ordered_present_is_applied_and_advances_when_the_append_clock_retreats(
     assert!(first.system_time < second.system_time);
     let database = node.catalog().database("xtdb").unwrap();
     assert_eq!(database.snapshot().tx_basis(), Some(second));
+    let (_, token) = session.state().connection_await_token();
+    let basis = rtdb_format::basis::decode_tx_basis(token.unwrap()).unwrap();
+    assert_eq!(basis.databases["xtdb"], [second.tx_id]);
 
     assert_eq!(
         rows(session.query_sql("SELECT _id FROM docs FOR ALL VALID_TIME", vec![]).await.unwrap()).await,
@@ -2557,6 +2560,42 @@ async fn ordered_present_is_applied_and_advances_when_the_append_clock_retreats(
     assert!(next.committed());
     assert!(second.system_time < next.tx_key().system_time);
     drop(session);
+    stop(&node, driver).await;
+}
+
+#[tokio::test]
+async fn ordered_present_refuses_read_only_grants_and_session_modes_before_append() {
+    struct ReadOnlyIdentity;
+    #[async_trait]
+    impl SessionIdentity for ReadOnlyIdentity {
+        fn user(&self) -> Option<&str> { Some("reader") }
+        async fn revalidate(&self, _: Timestamp) -> Result<()> { Ok(()) }
+        fn authorize_database(&self, _: &str, access: DatabaseAccess) -> Result<()> {
+            match access {
+                DatabaseAccess::Read => Ok(()),
+                DatabaseAccess::Write => Err(Anomaly::new(
+                    rtdb_types::AnomalyCategory::Forbidden, "test/read-only", "Write grant required",
+                )),
+            }
+        }
+    }
+
+    let (node, driver) = running(options(), services()).await;
+    let database = node.catalog().database("xtdb").unwrap();
+    let before = database.latest_submitted_position().unwrap();
+    let mut reader = node.session("xtdb", Arc::new(ReadOnlyIdentity)).unwrap();
+    assert_eq!(reader.reserve_ordered_present().await.unwrap_err().code, "test/read-only");
+
+    let mut writer = node.session("xtdb", Arc::new(Authority)).unwrap();
+    writer.state_mut().set_session_characteristics(Some(rtdb_plan::AccessMode::ReadOnly)).unwrap();
+    assert_eq!(writer.reserve_ordered_present().await.unwrap_err().code, "xtdb/read-only-tx");
+    writer.state_mut().set_session_characteristics(None).unwrap();
+    writer.state_mut().set_auto_commit(false).await.unwrap();
+    assert_eq!(writer.reserve_ordered_present().await.unwrap_err().code, "xtdb/tx-already-in-progress");
+    assert_eq!(database.latest_submitted_position().unwrap(), before);
+
+    drop(reader);
+    drop(writer);
     stop(&node, driver).await;
 }
 
