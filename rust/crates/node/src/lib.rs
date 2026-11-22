@@ -30,7 +30,9 @@ pub use config::*;
 pub use database::{CompactionRelay, Database};
 pub use rtdb_tx::HostedControlWrite;
 pub use node::{OwnedIdentityPage, OwnedValidHistory, OwnedVersion, OwnedVersionOrder, OwnedVersionPage, OwnedVersionRequest};
-pub use node::{IDEMPOTENCY_KEY_PARAMETER, NOT_HELD, REPLICA_BEHIND, NativeSession, Node, NodeDriver, NodeServices, OwnedChangeCommit, OwnedChangePage, OwnedForkCut, OwnedMergedChanges, OwnedRelationChanges, OWNED_MERGED_CHANGE_RELATIONS, OwnedRangeWitness, OwnedReadSession, OwnedRootPublication, OwnedRootSection, OwnedWorldEffect, OwnedWorldFork, OwnedWorldPointWitness, OwnedWorldSection, OwnedWorldShadowRead, OwnedWorldWrite, ReadFence, WorldClockRequest};
+#[cfg(feature = "search")]
+pub use rtdb_search::{OwnedSearchPage, owned_ranked as rank_owned_cut};
+pub use node::{IDEMPOTENCY_KEY_PARAMETER, NOT_HELD, REPLICA_BEHIND, NativeSession, Node, NodeDriver, NodeServices, OwnedChangeCommit, OwnedChangePage, OwnedForkCut, OwnedMergedChanges, OwnedRelationChanges, OWNED_MERGED_CHANGE_RELATIONS, OwnedRangeWitness, OwnedReadSession, OwnedRootPublication, OwnedRootSection, OwnedWorldEffect, OwnedWorldFork, OwnedWorldWitness, OwnedWorldSection, OwnedWorldShadowRead, OwnedWorldWrite, ReadFence, WorldClockRequest};
 
 mod statement;
 pub use statement::{PreparedSql, ResultSignaturePolicy};

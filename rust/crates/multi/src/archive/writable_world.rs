@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use rtdb_columnar::{MemoryBudget, MemoryReservation, OwnedBatch};
 use rtdb_directory::{CheckpointWorldRetention, DeploymentRecord, Directory, HostedTask, now_ms};
-use rtdb_node::{NativeSession, OwnedReadSession, OwnedWorldPointWitness, TransactionStatus};
+use rtdb_node::{NativeSession, OwnedReadSession, OwnedWorldWitness, TransactionStatus};
 use rtdb_types::{
     EntityId, Iid, Interval, OwnedRelation, OwnedWorld, PlacedAttemptScope, Result, StructFields,
     Timestamp, TransactionKey, Value, WorldClockMode, WorldShadow,
@@ -313,7 +313,7 @@ async fn retire_world_pins(
 
 pub(crate) async fn validate_checkpoint_world(
     directory: &dyn Directory, archive: &CellStorage, session: &mut NativeSession,
-    deployment: Uuid, id: Uuid, checks: Vec<OwnedWorldPointWitness>,
+    deployment: Uuid, id: Uuid, checks: Vec<OwnedWorldWitness>,
     controls: Vec<rtdb_node::HostedControlWrite>, deadline: Timestamp,
 ) -> Result<TransactionKey> {
     let OpenWorld { snapshot, record, _schema_charge, .. } = open_world(directory, archive, session, deployment, id).await?;
@@ -366,7 +366,7 @@ pub struct WorldPoint {
     pub present: TransactionKey,
     pub fact: Option<WorldFact>,
     pub(crate) shadowed: bool,
-    pub(crate) witness: Option<OwnedWorldPointWitness>,
+    pub(crate) witness: Option<OwnedWorldWitness>,
 }
 
 pub struct WorldFact {
@@ -457,7 +457,7 @@ impl OpenWorld {
     async fn read_local(
         &self, relation: &OwnedRelation, id: &EntityId, valid_at: Timestamp, memory: &Arc<MemoryBudget>,
         observed: bool,
-    ) -> Result<(Option<Option<WorldFact>>, Option<OwnedWorldPointWitness>)> {
+    ) -> Result<(Option<Option<WorldFact>>, Option<OwnedWorldWitness>)> {
         let read = self.snapshot.read_world_shadow(self.record.id, relation, id, valid_at, observed).await?;
         let Some(fact) = decode_point(read.row.into_iter().collect(), id, memory)? else {
             return Ok((None, read.witness));

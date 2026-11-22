@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use futures::future::BoxFuture;
 use rtdb_columnar::MemoryReservation;
-use rtdb_node::{Database, NativeSession, Node, OwnedWorldPointWitness};
+use rtdb_node::{Database, NativeSession, Node, OwnedWorldWitness};
 use rtdb_types::{EntityId, Interval, OwnedRelation, Result, StructFields, Timestamp, TransactionKey, Value};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
@@ -12,7 +12,7 @@ use uuid::Uuid;
 pub trait OwnedWorldHost: std::fmt::Debug + Send + Sync {
     fn open_world_read<'a>(&'a self, call: WorldCall<'a>, world: Uuid) -> BoxFuture<'a, Result<Box<dyn OwnedWorldRead>>>;
     fn fork_world_checked<'a>(&'a self, call: WorldCall<'a>, capture: Uuid, suffix: Option<Uuid>, until: Timestamp, fork: rtdb_node::OwnedWorldFork) -> BoxFuture<'a, Result<(Uuid, TransactionKey)>>;
-    fn validate_world<'a>(&'a self, call: WorldCall<'a>, world: Uuid, checks: Vec<OwnedWorldPointWitness>, controls: Vec<rtdb_node::HostedControlWrite>, deadline: Timestamp) -> BoxFuture<'a, Result<TransactionKey>>;
+    fn validate_world<'a>(&'a self, call: WorldCall<'a>, world: Uuid, checks: Vec<OwnedWorldWitness>, controls: Vec<rtdb_node::HostedControlWrite>, deadline: Timestamp) -> BoxFuture<'a, Result<TransactionKey>>;
     fn commit_world_batch<'a>(
         &'a self, call: WorldCall<'a>, sections: Vec<rtdb_node::OwnedWorldSection>,
         root: rtdb_node::OwnedRootSection, fingerprint: [u8; 32],
@@ -31,7 +31,7 @@ pub struct WorldPointResult {
     pub present: Timestamp,
     pub row: Option<WorldPointRow>,
     pub shadowed: bool,
-    pub witness: Option<OwnedWorldPointWitness>,
+    pub witness: Option<OwnedWorldWitness>,
 }
 
 pub struct WorldPointRow {
@@ -54,6 +54,10 @@ pub trait OwnedWorldRead: Send + Sync {
     fn initial_clock(&self) -> Timestamp;
     fn is_held(&self) -> bool;
     fn parent_basis(&self) -> TransactionKey;
+    fn ranked_search<'a>(
+        &'a self, partitions: Vec<(OwnedRelation, OwnedRelation)>, query: String, offset: usize, limit: usize,
+        valid: Timestamp,
+    ) -> BoxFuture<'a, Result<(rtdb_node::OwnedSearchPage, Vec<OwnedWorldWitness>)>>;
     fn parent_pin(&self) -> rtdb_types::Iid;
     fn until(&self) -> Timestamp;
     fn evidence_until(&self) -> Timestamp;

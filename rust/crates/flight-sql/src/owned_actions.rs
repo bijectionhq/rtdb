@@ -14,7 +14,7 @@ use bytes::Bytes;
 use prost::Message;
 use rtdb_columnar::{MemoryReservation, OwnedBatch};
 use rtdb_format::ipc::{OwnedStream, write_arrow_stream};
-use rtdb_node::{NativeSession, OwnedCountRequest, OwnedRangeRequest, OwnedRangeWitness, OwnedReadSession, OwnedValidHistory, OwnedVersionOrder, OwnedVersionRequest, OwnedWorldPointWitness, TransactionStatus};
+use rtdb_node::{NativeSession, OwnedCountRequest, OwnedRangeRequest, OwnedRangeWitness, OwnedReadSession, OwnedValidHistory, OwnedVersionOrder, OwnedVersionRequest, OwnedWorldWitness, TransactionStatus};
 use rtdb_query::QueryCursor;
 use rtdb_tx::{Documents, TxOp};
 use rtdb_types::{EntityId, LogicalType, OwnedRelation, ScalarType, StructFields, TimeUnit, Timestamp, Value};
@@ -161,6 +161,7 @@ pub(crate) const COMMIT_HELD_WORLDS_V4: &str = "rtdb.owned.CommitHeldWorlds.v4";
 pub(crate) const COMMIT_WORLD_V3: &str = "rtdb.owned.CommitWorld.v3";
 const MAX_WORLD_WITNESSES: usize = 128;
 const WORLD_POINT_WITNESS: &str = "rtdb.owned.world_point_witness";
+pub(crate) const SEARCH_HELD_WORLD_V1: &str = "rtdb.owned.SearchHeldWorld.v1";
 pub(crate) const SEARCH_HELD_OWNED_V4: &str = "rtdb.owned.SearchHeld.v4";
 pub(crate) const HELD_OWNED_RANGE_V1: &str = "rtdb.owned.ReadHeldRange.v1";
 #[derive(Clone, Copy)]
@@ -291,12 +292,12 @@ impl Leased for OwnedWorldReadResource {
 }
 
 struct RetainedWorldWitness {
-    evidence: OwnedWorldPointWitness,
+    evidence: OwnedWorldWitness,
     _reservation: Arc<MemoryReservation>,
 }
 
 impl OwnedWorldReadResource {
-    fn remember_point(&self, call: &Call, evidence: OwnedWorldPointWitness) -> Result<Uuid, Status> {
+    fn remember(&self, call: &Call, evidence: OwnedWorldWitness) -> Result<Uuid, Status> {
         self.snapshot.check().map_err(status)?;
         let mut conditions = self.conditions.lock().map_err(|_| Status::internal("Owned world witness storage is unavailable"))?;
         if conditions.len() >= MAX_WORLD_WITNESSES {
@@ -311,7 +312,7 @@ impl OwnedWorldReadResource {
         Ok(nonce)
     }
 
-    fn conditions(&self, call: &Call, world: Uuid, nonces: &[u8]) -> Result<(Vec<OwnedWorldPointWitness>, Arc<MemoryReservation>), Status> {
+    fn conditions(&self, call: &Call, world: Uuid, nonces: &[u8]) -> Result<(Vec<OwnedWorldWitness>, Arc<MemoryReservation>), Status> {
         self.snapshot.check().map_err(status)?;
         if world != self.world { return Err(Status::not_found("unknown owned world point witness")); }
         let stored = self.conditions.lock().map_err(|_| Status::internal("Owned world witness storage is unavailable"))?;
@@ -327,6 +328,56 @@ impl OwnedWorldReadResource {
         }).collect::<Result<_, _>>()?;
         Ok((conditions, charge))
     }
+}
+
+struct OwnedRankRequest<'a> {
+    partitions: Vec<(OwnedRelation, OwnedRelation)>,
+    frame_len: usize,
+    offset: usize,
+    limit: usize,
+    observe: bool,
+    query: &'a str,
+    _reservation: Arc<MemoryReservation>,
+}
+
+fn owned_rank_request<'a>(call: &Call, request: &'a [u8]) -> Result<OwnedRankRequest<'a>, Status> {
+    let (count, mut rest) = request.split_first_chunk::<2>().ok_or_else(|| invalid("Owned held search has no partition count"))?;
+    let count = usize::from(u16::from_be_bytes(*count));
+    if !(1..=32).contains(&count) { return Err(invalid("Owned held search partition count is out of range")); }
+    let reservation = call.reserve(count * 512)?;
+    let mut partitions = Vec::with_capacity(count);
+    for _ in 0..count {
+        let (relation, tail) = split_relation(rest)?;
+        let (path, tail) = split_relation(tail)?;
+        partitions.push((relation, path));
+        rest = tail;
+    }
+    let frame_len = request.len() - rest.len();
+    let (settings, query) = rest.split_first_chunk::<7>().ok_or_else(|| invalid("Owned held search requires an offset, limit and evidence flag"))?;
+    let offset = u32::from_be_bytes([settings[0], settings[1], settings[2], settings[3]]) as usize;
+    let limit = usize::from(u16::from_be_bytes([settings[4], settings[5]]));
+    let observe = match settings[6] {
+        0 => false,
+        1 => true,
+        _ => return Err(invalid("Invalid owned held search evidence flag")),
+    };
+    if query.len() > 4096 { return Err(invalid("Owned held search query exceeds its size bound")); }
+    let query = std::str::from_utf8(query).map_err(arrow)?;
+    Ok(OwnedRankRequest { partitions, frame_len, offset, limit, observe, query, _reservation: reservation })
+}
+
+fn owned_rank_scope(domain: &[u8], frame: &[u8], query: &str) -> String {
+    let mut digest = Sha256::new();
+    digest.update(domain);
+    digest.update(frame);
+    digest.update(query.as_bytes());
+    let digest: [u8; 32] = digest.finalize().into();
+    let mut scope = String::with_capacity(64);
+    for bytes in digest.chunks_exact(16) {
+        let chunk = Uuid::from_bytes(bytes.try_into().expect("16-byte SHA-256 chunk"));
+        scope.push_str(&chunk.simple().to_string());
+    }
+    scope
 }
 
 fn count_component(body: &[u8], maximum: usize) -> Result<(&[u8], &[u8]), Status> {
@@ -1151,53 +1202,58 @@ impl Service {
             if let Lookup::Found(entry) = self.0.owned_reads.take(&handle) { entry.close(); }
             return Err(status(error));
         }
-        let (count, mut request) = request.split_first_chunk::<2>().ok_or_else(|| invalid("Owned held search has no partition count"))?;
-        let count = usize::from(u16::from_be_bytes(*count));
-        if !(1..=32).contains(&count) { return Err(invalid("Owned held search partition count is out of range")); }
-        let _partitions = call.reserve(count * 512)?;
-        let mut partitions = Vec::with_capacity(count);
-        for _ in 0..count {
-            let (relation, rest) = split_relation(request)?;
-            let (path, rest) = split_relation(rest)?;
-            partitions.push((relation, path));
-            request = rest;
+        let rank = owned_rank_request(call, request)?;
+        let (page, witnesses) = held.snapshot.ranked_search_page(
+            &rank.partitions, rank.query, rank.offset, rank.limit, rank.observe,
+        ).await.map_err(status)?;
+        let mut nonces = Vec::new();
+        if !witnesses.is_empty() {
+            if witnesses.len() != rank.partitions.len() { return Err(Status::internal("Incomplete owned search evidence")); }
+            for ((relation, _), witness) in rank.partitions.iter().zip(witnesses) {
+                nonces.push(held.remember(call, relation, witness)?);
+            }
         }
-        let (settings, query) = request.split_first_chunk::<7>().ok_or_else(|| invalid("Owned held search requires an offset, limit and evidence flag"))?;
-        let offset = u32::from_be_bytes([settings[0], settings[1], settings[2], settings[3]]) as usize;
-        let limit = usize::from(u16::from_be_bytes([settings[4], settings[5]]));
-        let observe = match settings[6] {
-            0 => false,
-            1 => true,
-            _ => return Err(invalid("Invalid owned held search evidence flag")),
-        };
-        if query.len() > 4096 { return Err(invalid("Owned held search query exceeds its size bound")); }
-        let query = std::str::from_utf8(query).map_err(arrow)?;
-        let (page, witnesses) = held.snapshot.ranked_search_page(&partitions, query, offset, limit, observe).await.map_err(status)?;
+        let present = held.snapshot.present().system_time;
+        let scope = owned_rank_scope(b"rtdb.owned.search.held.v4\0", &body[..16 + rank.frame_len], rank.query);
+        let reply = self.owned_rank_reply(call, page, scope, nonces, present, present)?;
+        held.snapshot.check_relations(rank.partitions.iter().map(|(relation, _)| relation)).map_err(status)?;
+        Ok(reply)
+    }
+
+    pub(crate) async fn search_held_world_action(&self, call: &Call, body: &[u8]) -> Result<ActionResult, Status> {
+        if !self.0.config.owned_native_actions { return Err(unsupported()); }
+        let (handle, request) = body.split_first_chunk::<16>().ok_or_else(|| invalid("Missing held world search handle"))?;
+        let (valid, request) = request.split_first_chunk::<8>().ok_or_else(|| invalid("Missing held world search valid instant"))?;
+        let valid = Timestamp(i64::from_be_bytes(*valid));
+        let held = self.owned_world_read(call, &Bytes::copy_from_slice(handle))?;
+        let rank = owned_rank_request(call, request)?;
+        if !rank.observe || held.snapshot.is_held() {
+            return Err(Status::failed_precondition("Search requires the complete immutable retained corpus"));
+        }
+        let relations = rank.partitions.iter().map(|(relation, _)| relation.clone()).collect::<Vec<_>>();
+        let scope = owned_rank_scope(b"rtdb.owned.search.world.v1\0", &body[..24 + rank.frame_len], rank.query);
+        let (page, witnesses) = held.snapshot.ranked_search(rank.partitions, rank.query.to_owned(), rank.offset, rank.limit, valid)
+            .await.map_err(status)?;
+        if witnesses.len() != relations.len() { return Err(Status::internal("Incomplete retained search evidence")); }
+        let nonces = witnesses.into_iter().map(|witness| held.remember(call, witness)).collect::<Result<Vec<_>, _>>()?;
+        let reply = self.owned_rank_reply(call, page, scope, nonces, held.snapshot.present(), valid)?;
+        for relation in &relations { held.snapshot.check_relation(relation).map_err(status)?; }
+        Ok(reply)
+    }
+
+    fn owned_rank_reply(
+        &self, call: &Call, page: rtdb_node::OwnedSearchPage, scope: String, witnesses: Vec<Uuid>,
+        present: Timestamp, valid: Timestamp,
+    ) -> Result<ActionResult, Status> {
         let hits = page.hits;
         let id_type = LogicalType::from_legs([ScalarType::Utf8, ScalarType::Keyword, ScalarType::I64, ScalarType::Uuid].map(LogicalType::Scalar));
-        let mut digest = Sha256::new();
-        digest.update(b"rtdb.owned.search.held.v4\0");
-        // The handle binds the authenticated owner and cut. Keep the exact
-        // ordered partition/path frame and query, omitting delivery settings.
-        digest.update(&body[..body.len() - request.len()]);
-        digest.update(query.as_bytes());
-        let digest: [u8; 32] = digest.finalize().into();
-        let mut scope = String::with_capacity(64);
-        for bytes in digest.chunks_exact(16) {
-            let chunk = Uuid::from_bytes(bytes.try_into().expect("16-byte SHA-256 chunk"));
-            scope.push_str(&chunk.simple().to_string());
-        }
         let mut metadata = std::collections::HashMap::from([
             (OWNED_SEARCH_TOTAL.into(), page.total.to_string()),
             (OWNED_SEARCH_SCOPE.into(), scope),
         ]);
         if !witnesses.is_empty() {
-            if witnesses.len() != partitions.len() { return Err(Status::internal("Incomplete owned search evidence")); }
             let mut nonces = String::with_capacity(32 * witnesses.len());
-            for ((relation, _), witness) in partitions.iter().zip(witnesses) {
-                let nonce = held.remember(call, relation, witness)?;
-                nonces.push_str(&nonce.simple().to_string());
-            }
+            for witness in witnesses { nonces.push_str(&witness.simple().to_string()); }
             metadata.insert(OWNED_SEARCH_WITNESSES.into(), nonces);
         }
         let schema = Arc::new(Schema::new_with_metadata(vec![
@@ -1221,10 +1277,7 @@ impl Service {
             let ordinals = Arc::new(UInt64Array::from_iter_values(hits.iter().map(|hit| hit.partition as u64)));
             Some(RecordBatch::try_new(Arc::clone(&schema), vec![ids, scores, ordinals]).map_err(arrow)?)
         };
-        let present = held.snapshot.present().system_time;
-        let reply = self.owned_point_reply(&schema, output.as_ref(), present, present, None)?;
-        held.snapshot.check_relations(partitions.iter().map(|(relation, _)| relation)).map_err(status)?;
-        Ok(reply)
+        self.owned_point_reply(&schema, output.as_ref(), present, valid, None)
     }
 
     pub(crate) async fn held_owned_changes_action(&self, call: &Call, body: &[u8]) -> Result<ActionResult, Status> {
@@ -1426,7 +1479,7 @@ impl Service {
         if result.present != held.snapshot.present() {
             return Err(Status::internal("Owned world point changed its held present"));
         }
-        let nonce = result.witness.take().map(|evidence| held.remember_point(call, evidence)).transpose()?;
+        let nonce = result.witness.take().map(|evidence| held.remember(call, evidence)).transpose()?;
         let reply = self.world_point_reply(call, result, valid_at, nonce)?;
         held.snapshot.check_relation(&relation).map_err(status)?;
         Ok(reply)

@@ -1066,8 +1066,9 @@ impl OwnedReadSession {
             let database = self.context.catalog.database(&self.database)?;
             let [snapshot] = database.partitions.as_slice() else { return Err(rtdb_types::OwnedWorld::unavailable()); };
             let purge_frontier = snapshot.relation_event_frontier(&root.purge_table(&self.owner))?;
-            Some(OwnedWorldPointWitness {
-                world, pin: registered.pin, relation, id: id.clone(), valid_at, local_revision, purge_frontier, scope,
+            Some(OwnedWorldWitness {
+                world, pin: registered.pin, relation, purge_frontier, scope,
+                point: Some(OwnedWorldObservedPoint { id: id.clone(), valid_at, revision: local_revision }),
                 until: self.witness_until.min(registered.until),
             })
         } else {
@@ -1246,7 +1247,7 @@ impl OwnedReadSession {
         offset: usize, limit: usize, observe: bool,
     ) -> Result<(rtdb_search::OwnedSearchPage, Vec<OwnedRangeWitness>)> {
         self.admit_read().await?;
-        let work = rtdb_search::owned_ranked(self.guard_context(Arc::clone(&self.context), partitions.iter().map(|(relation, _)| relation))?, &self.owner, partitions, query, offset, limit);
+        let work = rtdb_search::owned_ranked(self.guard_context(Arc::clone(&self.context), partitions.iter().map(|(relation, _)| relation))?, &self.owner, partitions, query, offset, limit, None);
         let hits = rtdb_storage::IoRegion::leased(self.context.catalog.read_lease(), work).await?;
         let mut witnesses = Vec::with_capacity(partitions.len());
         if observe {
@@ -1258,6 +1259,34 @@ impl OwnedReadSession {
         }
         self.check_relations(partitions.iter().map(|(relation, _)| relation))?;
         Ok((hits, witnesses))
+    }
+
+    /// Observe the entire immutable corpus by its retained pin and exact purge frontiers.
+    pub async fn retained_world_search_witnesses<'a>(
+        &self, world: rtdb_types::Iid, relations: impl IntoIterator<Item = &'a rtdb_types::OwnedRelation>,
+    ) -> Result<Vec<OwnedWorldWitness>> {
+        let unavailable = rtdb_types::OwnedWorld::unavailable;
+        let (registered, _charge) = self.world_registration(world).await?
+            .filter(|(record, _)| !record.dropped && !record.is_held() && record.until > self.present.system_time)
+            .ok_or_else(unavailable)?;
+        let scope = self.witness_scope.ok_or_else(unavailable)?;
+        let database = self.context.catalog.database(&self.database)?;
+        let [snapshot] = database.partitions.as_slice() else { return Err(unavailable()); };
+        if snapshot.contains_table(&rtdb_types::OwnedRelation::obsolete_purge_table(&self.owner)) {
+            return Err(unavailable());
+        }
+        let mut selected = Vec::new();
+        for relation in relations {
+            self.check_relation(relation)?;
+            if selected.len() == 32 { return Err(unavailable()); }
+            selected.push(OwnedWorldWitness {
+                world, pin: registered.pin, relation: relation.in_world(world)?, scope,
+                point: None,
+                purge_frontier: snapshot.relation_event_frontier(&relation.purge_table(&self.owner))?,
+                until: self.witness_until.min(registered.until),
+            });
+        }
+        Ok(selected)
     }
 
     /// Reads one covered page from the named ordered path at this held cut.
@@ -1464,29 +1493,36 @@ impl Drop for OwnedReadSession {
 
 pub struct OwnedWorldShadowRead {
     pub row: Option<rtdb_columnar::OwnedBatch>,
-    pub witness: Option<OwnedWorldPointWitness>,
+    pub witness: Option<OwnedWorldWitness>,
 }
 
 #[derive(Clone)]
-pub struct OwnedWorldPointWitness {
+pub struct OwnedWorldWitness {
     world: rtdb_types::Iid,
     pin: rtdb_types::Iid,
     relation: rtdb_types::OwnedRelation,
-    id: rtdb_types::EntityId,
-    valid_at: Timestamp,
-    local_revision: Option<Timestamp>,
+    point: Option<OwnedWorldObservedPoint>,
     scope: rtdb_types::PlacedAttemptScope,
     until: Timestamp,
     purge_frontier: i64,
 }
 
-impl OwnedWorldPointWitness {
+#[derive(Clone)]
+struct OwnedWorldObservedPoint {
+    id: rtdb_types::EntityId,
+    valid_at: Timestamp,
+    revision: Option<Timestamp>,
+}
+
+impl OwnedWorldWitness {
+    pub fn purge_frontier(&self) -> i64 { self.purge_frontier }
+
     pub fn allocation_bound(&self) -> usize {
         use rtdb_types::EntityId;
-        let bytes = match &self.id {
-            EntityId::String(id) => id.len(),
-            EntityId::Keyword(id) => id.as_str().len(),
-            EntityId::Integer(_) | EntityId::Uuid(_) => 0,
+        let bytes = match self.point.as_ref().map(|point| &point.id) {
+            Some(EntityId::String(id)) => id.len(),
+            Some(EntityId::Keyword(id)) => id.as_str().len(),
+            _ => 0,
         };
         bytes.saturating_add(self.relation.name().len()).saturating_add(1024)
     }
@@ -1539,7 +1575,7 @@ pub struct OwnedWorldSection {
     pub world: rtdb_types::Iid,
     pub parent_pin: rtdb_types::Iid,
     pub parent_basis: TransactionKey,
-    pub checks: Vec<OwnedWorldPointWitness>,
+    pub checks: Vec<OwnedWorldWitness>,
     pub attempt: String,
     pub expected_clock: Option<Timestamp>,
     pub effect: OwnedWorldEffect,
@@ -1607,7 +1643,7 @@ impl NativeSession {
     }
 
     pub async fn validate_owned_world(
-        &mut self, record: &rtdb_types::OwnedWorld, checks: Vec<OwnedWorldPointWitness>,
+        &mut self, record: &rtdb_types::OwnedWorld, checks: Vec<OwnedWorldWitness>,
         controls: Vec<rtdb_tx::HostedControlWrite>, deadline: Timestamp,
     ) -> Result<TransactionResult> {
         let unavailable = rtdb_types::OwnedWorld::unavailable;
@@ -1720,12 +1756,14 @@ impl NativeSession {
         self.state.execute_tx(ops, Default::default()).await
     }
 
-    fn append_world_checks(ops: &mut Vec<TxOp>, checks: Vec<OwnedWorldPointWitness>) {
+    fn append_world_checks(ops: &mut Vec<TxOp>, checks: Vec<OwnedWorldWitness>) {
         for check in checks {
             ops.push(TxOp::OwnedCheckWorldPurge { relation: check.relation.clone(), pin: check.pin, frontier: check.purge_frontier });
-            ops.push(TxOp::OwnedCheck {
-                relation: check.relation, id: check.id, valid_at: check.valid_at, expected: check.local_revision,
-            });
+            if let Some(point) = check.point {
+                ops.push(TxOp::OwnedCheck {
+                    relation: check.relation, id: point.id, valid_at: point.valid_at, expected: point.revision,
+                });
+            }
         }
     }
 
