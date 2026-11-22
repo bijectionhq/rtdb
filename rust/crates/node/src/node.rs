@@ -872,7 +872,7 @@ pub struct OwnedReadSession {
 impl OwnedReadSession {
     pub fn present(&self) -> TransactionKey { self.present }
 
-    pub async fn world_registration(&self, world: rtdb_types::Iid) -> Result<Option<rtdb_types::OwnedWorld>> {
+    pub async fn world_registration(&self, world: rtdb_types::Iid) -> Result<Option<(rtdb_types::OwnedWorld, Arc<rtdb_columnar::MemoryReservation>)>> {
         self.admit_read().await?;
         let record = rtdb_query::read_owned_world(Arc::clone(&self.context), &self.owner, world).await?;
         self.check()?;
@@ -951,6 +951,7 @@ pub struct OwnedWorldWrite {
     pub relation: rtdb_types::OwnedRelation,
     pub id: rtdb_types::EntityId,
     pub shadow: rtdb_types::WorldShadow,
+    pub valid: rtdb_types::Interval,
 }
 
 pub struct NativeSession { pub(crate) state: Session, pub(crate) service: Arc<NativeSessionService> }
@@ -980,10 +981,11 @@ impl NativeSession {
         let _operations = self.service.node.memory().reserve((writes.len() + 1) * (std::mem::size_of::<TxOp>() + 512))?;
         let mut ops = Vec::with_capacity(writes.len() + 1);
         ops.push(TxOp::OwnedDeadline { until: record.until });
-        for OwnedWorldWrite { relation, id, shadow } in writes {
+        for OwnedWorldWrite { relation, id, shadow, valid } in writes {
             let relation = relation.in_world(record.id)?;
-            let documents = rtdb_tx::Documents::new(vec![shadow.record(&id)], self.service.node.memory())?;
-            ops.push(TxOp::OwnedReplaceDocs { relation, documents, valid_from: None, valid_to: None });
+            let _encode = self.service.node.memory().reserve(shadow.allocation_bound()?)?;
+            let documents = rtdb_tx::Documents::new(vec![shadow.record(&id)?], self.service.node.memory())?;
+            ops.push(TxOp::OwnedReplaceDocs { relation, documents, valid_from: Some(valid.lower()), valid_to: Some(valid.upper()) });
         }
         self.state.execute_tx(ops, Default::default()).await
     }

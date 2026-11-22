@@ -547,6 +547,8 @@ pub struct CheckpointWorldRetention {
     pub owner: String,
     pub capture: uuid::Uuid,
     pub manifest_sha256: String,
+    #[serde(default)]
+    pub schema_digest: [u8; 32],
     pub basis: rtdb_types::TransactionKey,
     pub until: rtdb_types::Timestamp,
 }

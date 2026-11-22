@@ -4,8 +4,8 @@ use rtdb_columnar::{MemoryBudget, MemoryReservation, OwnedBatch};
 use rtdb_directory::{CheckpointWorldRetention, DeploymentRecord, Directory, HostedTask, now_ms};
 use rtdb_node::{NativeSession, OwnedReadSession, OwnedWorldWrite, TransactionStatus};
 use rtdb_types::{
-    EntityId, Iid, OwnedRelation, OwnedWorld, PlacedAttemptScope, Result, StructFields, Timestamp,
-    TransactionKey, Value, WorldShadow,
+    EntityId, Iid, Interval, OwnedRelation, OwnedWorld, PlacedAttemptScope, Result, StructFields,
+    Timestamp, TransactionKey, Value, WorldShadow,
 };
 use uuid::Uuid;
 
@@ -55,13 +55,18 @@ fn admit_capture(
     Ok(())
 }
 
-fn world_record(id: Uuid, retained: &CheckpointWorldRetention) -> OwnedWorld {
+fn world_record(
+    id: Uuid,
+    retained: &CheckpointWorldRetention,
+    schemas: rtdb_types::WorldSchemas,
+) -> OwnedWorld {
     OwnedWorld {
         id: Iid(*id.as_bytes()),
         capture: Iid(*retained.capture.as_bytes()),
         manifest: retained.manifest_sha256.clone(),
         basis: retained.basis,
         until: retained.until,
+        schemas,
     }
 }
 
@@ -93,14 +98,14 @@ pub async fn fork_checkpoint_world(
     if until <= now() || until <= parent.basis.system_time {
         return Err(OwnedWorld::unavailable());
     }
-    with_checkpoint_context(
+    let (schemas, _schema_charge) = with_checkpoint_context(
         directory,
         archive,
         keys,
         hosted_task,
         parent,
         resources,
-        |_| async { Ok(()) },
+        |context| rtdb_query::read_owned_parent_schemas(context, &owner),
     )
     .await?;
 
@@ -109,6 +114,7 @@ pub async fn fork_checkpoint_world(
         owner,
         capture: parent.capture,
         manifest_sha256: parent.manifest_sha256.clone(),
+        schema_digest: schemas.digest(),
         basis: parent.basis,
         until,
     };
@@ -139,7 +145,7 @@ pub async fn fork_checkpoint_world(
     .await?;
     admit_session(session, &installed, &retained.owner)?;
     let outcome = session
-        .register_owned_world(&world_record(id, &retained))
+        .register_owned_world(&world_record(id, &retained, schemas))
         .await?;
     if !outcome.committed() {
         return Err(outcome
@@ -150,13 +156,20 @@ pub async fn fork_checkpoint_world(
     Ok(id)
 }
 
+struct OpenWorld {
+    retained: CheckpointWorldRetention,
+    snapshot: OwnedReadSession,
+    record: OwnedWorld,
+    _schema_charge: Arc<MemoryReservation>,
+}
+
 async fn open_world(
     directory: &dyn Directory,
     archive: &CellStorage,
     session: &mut NativeSession,
     deployment: Uuid,
     id: Uuid,
-) -> Result<(CheckpointWorldRetention, OwnedReadSession)> {
+) -> Result<OpenWorld> {
     let installation = directory
         .deployment(&deployment.to_string())
         .await?
@@ -177,13 +190,25 @@ async fn open_world(
     };
     admit_capture(&installation, archive, &parent)?;
     let snapshot = session.open_owned_read().await?;
+    let (world, charge) = snapshot
+        .world_registration(Iid(*id.as_bytes()))
+        .await?
+        .ok_or_else(OwnedWorld::unavailable)?;
     if snapshot.present().system_time >= retained.until
-        || snapshot.world_registration(Iid(*id.as_bytes())).await?
-            != Some(world_record(id, retained))
+        || world.capture.0 != *retained.capture.as_bytes()
+        || world.manifest != retained.manifest_sha256
+        || world.basis != retained.basis
+        || world.until != retained.until
+        || world.schemas.digest() != retained.schema_digest
     {
         return Err(OwnedWorld::unavailable());
     }
-    Ok((retained.clone(), snapshot))
+    Ok(OpenWorld {
+        retained: retained.clone(),
+        snapshot,
+        record: world,
+        _schema_charge: charge,
+    })
 }
 
 /// Applies complete local replacements and tombstones in one ordered write.
@@ -195,11 +220,14 @@ pub async fn commit_checkpoint_world(
     id: Uuid,
     writes: Vec<OwnedWorldWrite>,
 ) -> Result<TransactionKey> {
-    let (retained, snapshot) = open_world(directory, archive, session, deployment, id).await?;
+    let OpenWorld {
+        snapshot,
+        record,
+        _schema_charge,
+        ..
+    } = open_world(directory, archive, session, deployment, id).await?;
     drop(snapshot);
-    let outcome = session
-        .commit_owned_world(&world_record(id, &retained), writes)
-        .await?;
+    let outcome = session.commit_owned_world(&record, writes).await?;
     if !outcome.committed() {
         return Err(outcome
             .error()
@@ -281,12 +309,16 @@ pub async fn read_checkpoint_world_point(
     world: Uuid,
     relation: &OwnedRelation,
     id: &EntityId,
+    valid_at: Timestamp,
     resources: CheckpointReadResources<'_>,
 ) -> Result<Option<WorldFact>> {
-    let (retained, snapshot) = open_world(directory, archive, session, deployment, world).await?;
+    let valid = Interval::at(valid_at)?;
+    let OpenWorld {
+        retained, snapshot, ..
+    } = open_world(directory, archive, session, deployment, world).await?;
     let local = relation.in_world(Iid(*world.as_bytes()))?;
     let memory = resources.memory;
-    if let Some(mut cursor) = snapshot.open_point(&local, id).await? {
+    if let Some(mut cursor) = snapshot.open_point_at(&local, id, Some(valid_at)).await? {
         let mut batches = Vec::new();
         while let Some(batch) = cursor.next_batch().await? {
             if batch.batch().num_rows() != 0 {
@@ -298,11 +330,12 @@ pub async fn read_checkpoint_world_point(
             if retained.until <= now() {
                 return Err(OwnedWorld::unavailable());
             }
-            return Ok(match WorldShadow::from_record(fact.row)? {
+            let reservation = memory.reserve(WorldShadow::decode_bound(&fact.row)?)?;
+            return Ok(match WorldShadow::from_record(&fact.row)? {
                 WorldShadow::Deleted => None,
                 WorldShadow::Present(row) => Some(WorldFact {
                     row,
-                    _reservation: fact._reservation,
+                    _reservation: reservation,
                 }),
             });
         }
@@ -323,7 +356,7 @@ pub async fn read_checkpoint_world_point(
             owner: &retained.owner,
             relation,
             id,
-            valid: None,
+            valid: Some(valid),
         },
         resources,
     )

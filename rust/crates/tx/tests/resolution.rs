@@ -814,7 +814,11 @@ async fn owned_world_rows_require_the_ordered_registration_and_cannot_mix_with_r
     let state = PartitionState::empty(Default::default()).unwrap();
     let world = OwnedWorld {
         id: Iid([8; 16]), capture: Iid([9; 16]), manifest: "a".repeat(43),
-        basis: TransactionKey { tx_id: TxId(0), system_time: Timestamp(10) }, until: Timestamp(104),
+        basis: TransactionKey { tx_id: TxId(0), system_time: Timestamp(10) }, until: Timestamp(107),
+        schemas: rtdb_types::WorldSchemas::new(std::collections::BTreeMap::from([(
+            "orders".into(),
+            rtdb_types::OwnedSchema::from_json(br#"{"fields":[{"name":"amount","type":{"kind":"i64"},"optional":true,"nullable":false}]}"#).unwrap(),
+        )])).unwrap(),
     };
     let root = OwnedRelation::new("orders").unwrap();
     let local = root.in_world(world.id).unwrap();
@@ -829,8 +833,8 @@ async fn owned_world_rows_require_the_ordered_registration_and_cannot_mix_with_r
         SourceTransaction::decode(&message, &context.memory).unwrap()
     };
     let replace = |relation| TxOp::OwnedReplaceDocs {
-        relation, documents: Documents::new(vec![WorldShadow::Deleted.record(&EntityId::Integer(1))], &context.memory).unwrap(),
-        valid_from: None, valid_to: None,
+        relation, documents: Documents::new(vec![WorldShadow::Deleted.record(&EntityId::Integer(1)).unwrap()], &context.memory).unwrap(),
+        valid_from: Some(Timestamp(50)), valid_to: Some(Timestamp(100)),
     };
     let mut resolver = TxResolver::new(None, SourcePosition(-1), None, &context.memory).unwrap();
     let missing = resolver.resolve_source(state.snapshot(), SourcePosition(0), Timestamp(100),
@@ -848,7 +852,29 @@ async fn owned_world_rows_require_the_ordered_registration_and_cannot_mix_with_r
     assert!(accepted.result().committed());
     assert!(accepted.writes().tables().contains_key(&local.table("owner")));
     assert!(!accepted.writes().tables().contains_key(&root.table("owner")));
-    let expired = resolver.resolve_source(state.snapshot(), SourcePosition(4), Timestamp(104),
-        source(vec![replace(local)]), &context).await.unwrap();
+    let revision = accepted.result().tx_key().system_time;
+    let check = |at, expected| TxOp::OwnedCheck {
+        relation: local.clone(), id: EntityId::Integer(1), valid_at: Timestamp(at), expected,
+    };
+    let observed = resolver.resolve_source(state.snapshot(), SourcePosition(4), Timestamp(104),
+        source(vec![check(49, None), check(50, Some(revision)), check(99, Some(revision)), check(100, None)]), &context).await.unwrap();
+    assert!(observed.result().committed());
+    let present = |value| {
+        let mut fact = StructFields::from([("_id".into(), Value::I64(1))]);
+        if let Some(value) = value { fact.insert("amount".into(), value); }
+        TxOp::OwnedReplaceDocs {
+            relation: local.clone(),
+            documents: Documents::new(vec![WorldShadow::Present(fact).record(&EntityId::Integer(1)).unwrap()], &context.memory).unwrap(),
+            valid_from: Some(Timestamp(100)), valid_to: Some(Timestamp(150)),
+        }
+    };
+    let invalid = resolver.resolve_source(state.snapshot(), SourcePosition(5), Timestamp(105),
+        source(vec![present(Some(Value::Null))]), &context).await.unwrap();
+    assert_eq!(invalid.result().error().unwrap().code, "rtdb.owned/nonconforming");
+    let absent = resolver.resolve_source(state.snapshot(), SourcePosition(6), Timestamp(106),
+        source(vec![present(None)]), &context).await.unwrap();
+    assert!(absent.result().committed());
+    let expired = resolver.resolve_source(state.snapshot(), SourcePosition(7), Timestamp(107),
+        source(vec![replace(local.clone())]), &context).await.unwrap();
     assert_eq!(expired.result().error().unwrap().code, "rtdb.world/unavailable");
 }

@@ -1,4 +1,63 @@
-use crate::{Anomaly, EntityId, Iid, Result, StructFields, Timestamp, TransactionKey, TxId, Value};
+use std::collections::BTreeMap;
+
+use sha2::{Digest, Sha256};
+
+use crate::{
+    Anomaly, EntityId, Iid, OwnedRelation, OwnedSchema, Result, StructFields, Timestamp,
+    TransactionKey, TxId, Value,
+};
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct WorldSchemas {
+    encoded: Vec<u8>,
+    fields: BTreeMap<String, OwnedSchema>,
+}
+
+impl WorldSchemas {
+    pub const MAX_BYTES: usize = 1024 * 1024;
+
+    pub fn new(fields: BTreeMap<String, OwnedSchema>) -> Result<Self> {
+        let documents = fields
+            .iter()
+            .map(|(name, schema)| {
+                OwnedRelation::new(name.as_str())?;
+                let encoded =
+                    String::from_utf8(schema.to_json()?).map_err(|_| OwnedWorld::unavailable())?;
+                Ok((name.as_str(), encoded))
+            })
+            .collect::<Result<BTreeMap<_, _>>>()?;
+        let encoded = serde_json::to_vec(&documents).map_err(|_| OwnedWorld::unavailable())?;
+        if encoded.len() > Self::MAX_BYTES {
+            return Err(OwnedWorld::unavailable());
+        }
+        Ok(Self { encoded, fields })
+    }
+
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self> {
+        if bytes.len() > Self::MAX_BYTES {
+            return Err(OwnedWorld::unavailable());
+        }
+        let documents: BTreeMap<String, String> =
+            serde_json::from_slice(bytes).map_err(|_| OwnedWorld::unavailable())?;
+        let fields = documents
+            .into_iter()
+            .map(|(name, json)| Ok((name, OwnedSchema::from_json(json.as_bytes())?)))
+            .collect::<Result<_>>()?;
+        let normalized = Self::new(fields)?;
+        if normalized.encoded.as_slice() != bytes {
+            return Err(OwnedWorld::unavailable());
+        }
+        Ok(normalized)
+    }
+
+    pub fn digest(&self) -> [u8; 32] {
+        Sha256::digest(&self.encoded).into()
+    }
+
+    pub fn relation(&self, relation: &OwnedRelation) -> Option<&OwnedSchema> {
+        self.fields.get(relation.name())
+    }
+}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct OwnedWorld {
@@ -7,6 +66,7 @@ pub struct OwnedWorld {
     pub manifest: String,
     pub basis: TransactionKey,
     pub until: Timestamp,
+    pub schemas: WorldSchemas,
 }
 
 impl OwnedWorld {
@@ -18,6 +78,10 @@ impl OwnedWorld {
             ("basis_id".into(), Value::I64(self.basis.tx_id.0)),
             ("basis_time".into(), Value::I64(self.basis.system_time.0)),
             ("until".into(), Value::I64(self.until.0)),
+            (
+                "schemas".into(),
+                Value::Binary(self.schemas.encoded.clone()),
+            ),
         ])
     }
 
@@ -29,6 +93,7 @@ impl OwnedWorld {
             Some(Value::I64(tx_id)),
             Some(Value::I64(time)),
             Some(Value::I64(until)),
+            Some(Value::Binary(schemas)),
         ) = (
             row.get("_id"),
             row.get("capture"),
@@ -36,11 +101,12 @@ impl OwnedWorld {
             row.get("basis_id"),
             row.get("basis_time"),
             row.get("until"),
+            row.get("schemas"),
         )
         else {
             return Err(Self::unavailable());
         };
-        if row.len() != 6
+        if row.len() != 7
             || *id == [0; 16]
             || *capture == [0; 16]
             || *until <= *time
@@ -60,6 +126,7 @@ impl OwnedWorld {
                 system_time: Timestamp(*time),
             },
             until: Timestamp(*until),
+            schemas: WorldSchemas::from_bytes(schemas)?,
         })
     }
 
@@ -76,15 +143,43 @@ pub enum WorldShadow {
 }
 
 impl WorldShadow {
-    pub fn record(self, id: &EntityId) -> StructFields<Value> {
-        let fact = match self {
-            Self::Present(row) => Value::Struct(row),
-            Self::Deleted => Value::Null,
-        };
-        StructFields::from([("_id".into(), id.as_value()), ("world_fact".into(), fact)])
+    pub fn allocation_bound(&self) -> Result<usize> {
+        match self {
+            Self::Present(row) => Value::document_retained_bytes(row)?
+                .checked_mul(8)
+                .and_then(|bytes| bytes.checked_add(4096))
+                .ok_or_else(OwnedWorld::unavailable),
+            Self::Deleted => Ok(4096),
+        }
     }
 
-    pub fn validate_record(row: &StructFields<Value>) -> Result<()> {
+    pub fn record(self, id: &EntityId) -> Result<StructFields<Value>> {
+        let fact = match self {
+            Self::Present(mut row) => {
+                row.values_mut().for_each(Value::admit_object_dates);
+                Value::Binary(serde_json::to_vec(&row).map_err(|_| OwnedWorld::unavailable())?)
+            }
+            Self::Deleted => Value::Null,
+        };
+        Ok(StructFields::from([
+            ("_id".into(), id.as_value()),
+            ("world_fact".into(), fact),
+        ]))
+    }
+
+    pub fn decode_bound(row: &StructFields<Value>) -> Result<usize> {
+        let bytes = match row.get("world_fact") {
+            Some(Value::Binary(bytes)) => bytes.len(),
+            Some(Value::Null) => 0,
+            _ => return Err(OwnedWorld::unavailable()),
+        };
+        bytes
+            .checked_mul(32)
+            .and_then(|bytes| bytes.checked_add(4096))
+            .ok_or_else(OwnedWorld::unavailable)
+    }
+
+    pub fn from_record(row: &StructFields<Value>) -> Result<Self> {
         if row.len() != 2 {
             return Err(OwnedWorld::unavailable());
         }
@@ -93,28 +188,23 @@ impl WorldShadow {
             .ok_or_else(OwnedWorld::unavailable)?
             .entity_id()?;
         match row.get("world_fact") {
-            Some(Value::Null) => Ok(()),
-            Some(Value::Struct(fact))
+            Some(Value::Null) => Ok(Self::Deleted),
+            Some(Value::Binary(bytes)) => {
+                let fact: StructFields<Value> =
+                    serde_json::from_slice(bytes).map_err(|_| OwnedWorld::unavailable())?;
                 if fact
                     .get("_id")
                     .and_then(|value| value.entity_id().ok())
                     .as_ref()
-                    == Some(&id)
-                    && fact
+                    != Some(&id)
+                    || fact
                         .keys()
-                        .all(|name| name == "_id" || !name.starts_with('_')) =>
-            {
-                Ok(())
+                        .any(|name| name != "_id" && name.starts_with('_'))
+                {
+                    return Err(OwnedWorld::unavailable());
+                }
+                Ok(Self::Present(fact))
             }
-            _ => Err(OwnedWorld::unavailable()),
-        }
-    }
-
-    pub fn from_record(mut row: StructFields<Value>) -> Result<Self> {
-        Self::validate_record(&row)?;
-        match row.remove("world_fact") {
-            Some(Value::Null) => Ok(Self::Deleted),
-            Some(Value::Struct(fact)) => Ok(Self::Present(fact)),
             _ => Err(OwnedWorld::unavailable()),
         }
     }
