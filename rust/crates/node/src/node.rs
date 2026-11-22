@@ -886,6 +886,41 @@ pub struct OwnedChangePage {
     _reservations: Vec<Arc<rtdb_columnar::MemoryReservation>>,
 }
 
+/// A held history cursor that can issue relation evidence only after successful exhaustion.
+pub struct OwnedValidHistory<'a> {
+    held: &'a OwnedReadSession,
+    relation: &'a rtdb_types::OwnedRelation,
+    cursor: Option<QueryCursor>,
+    complete: bool,
+    failed: bool,
+}
+
+impl OwnedValidHistory<'_> {
+    pub fn runtime_schema(&self) -> Option<&rtdb_plan::Schema> {
+        self.cursor.as_ref().map(QueryCursor::runtime_schema)
+    }
+
+    pub async fn next_batch(&mut self) -> Result<Option<rtdb_columnar::OwnedBatch>> {
+        if self.failed {
+            return Err(Anomaly::fault("rtdb.owned/history-read", "An owned history cursor failed"));
+        }
+        let result = match &mut self.cursor {
+            Some(cursor) => cursor.next_batch().await,
+            None => Ok(None),
+        };
+        self.complete = matches!(&result, Ok(None));
+        self.failed = result.is_err();
+        result
+    }
+
+    pub fn witness(&self) -> Result<Option<OwnedRangeWitness>> {
+        if !self.complete || self.failed {
+            return Err(Anomaly::fault("rtdb.owned/history-read", "Owned history must complete before issuing evidence"));
+        }
+        self.held.relation_witness(self.relation)
+    }
+}
+
 pub struct OwnedVersion {
     pub revision: u64,
     pub system_time: Timestamp,
@@ -946,6 +981,14 @@ impl OwnedReadSession {
     ) -> Result<Option<QueryCursor>> {
         self.admit_read().await?;
         rtdb_query::open_owned_valid_during(Arc::clone(&self.context), &self.owner, relation, id, valid).await
+    }
+
+    pub async fn open_valid_during_observed<'a>(
+        &'a self, relation: &'a rtdb_types::OwnedRelation, id: &rtdb_types::EntityId,
+        valid: rtdb_types::Interval,
+    ) -> Result<OwnedValidHistory<'a>> {
+        let cursor = self.open_valid_during(relation, id, valid).await?;
+        Ok(OwnedValidHistory { held: self, relation, cursor, complete: false, failed: false })
     }
 
     /// Pages source-group versions of one full identity inside a certified system window.
@@ -1085,7 +1128,13 @@ impl OwnedReadSession {
         request: crate::OwnedRangeRequest<'_>,
     ) -> Result<(crate::OwnedRangePage, Option<OwnedRangeWitness>)> {
         let page = self.range_page_by_key(relation, path, request).await?;
-        let Some(scope) = self.witness_scope else { return Ok((page, None)); };
+        let evidence = self.relation_witness(relation)?;
+        Ok((page, evidence))
+    }
+
+    fn relation_witness(&self, relation: &rtdb_types::OwnedRelation) -> Result<Option<OwnedRangeWitness>> {
+        self.check()?;
+        let Some(scope) = self.witness_scope else { return Ok(None); };
         let database = self.context.catalog.database(&self.database)?;
         let [snapshot] = database.partitions.as_slice() else {
             return Err(Anomaly::incorrect("rtdb.owned/range-witness", "An owned range witness requires one held partition"));
@@ -1095,9 +1144,9 @@ impl OwnedReadSession {
             return Err(Anomaly::incorrect("rtdb.owned/range-witness", "The exact owned range basis is unavailable"));
         }
         self.check()?;
-        Ok((page, Some(OwnedRangeWitness {
+        Ok(Some(OwnedRangeWitness {
             relation: relation.clone(), basis: self.present, scope, frontier, until: self.witness_until,
-        })))
+        }))
     }
 
     /// Reads whole ordered owner-relation groups after an exclusive system time.
@@ -1215,6 +1264,15 @@ impl OwnedReadSession {
         let result = crate::ordered_index::owned_count(Arc::clone(&self.context), &self.owner, relation, path, request).await?;
         self.check()?;
         Ok(result)
+    }
+
+    pub async fn count_range_observed(
+        &self, relation: &rtdb_types::OwnedRelation, path: &rtdb_types::OwnedRelation,
+        request: crate::OwnedCountRequest<'_>,
+    ) -> Result<(crate::OwnedRangeCount, Option<OwnedRangeWitness>)> {
+        let counted = self.count_range(relation, path, request).await?;
+        let evidence = self.relation_witness(relation)?;
+        Ok((counted, evidence))
     }
 
     async fn range_page(

@@ -473,9 +473,10 @@ async fn held_owned_valid_during_clips_winners_and_omits_deleted_windows() {
     assert!(writer.state_mut().execute_tx(vec![delete(60, 90)], AutonomousTxOptions::default()).await.unwrap().committed());
 
     let valid = Interval::from_micros(10, 70).unwrap();
-    let mut cursor = held.open_valid_during(&relation, &id, valid).await.unwrap().unwrap();
+    let mut history = held.open_valid_during_observed(&relation, &id, valid).await.unwrap();
+    assert!(history.witness().is_err());
     let mut actual = Vec::new();
-    while let Some(batch) = cursor.next_batch().await.unwrap() {
+    while let Some(batch) = history.next_batch().await.unwrap() {
         let batch = batch.batch();
         let read = |name, row| {
             let (slot, field) = batch.schema_ref().column_with_name(name).unwrap();
@@ -495,7 +496,14 @@ async fn held_owned_valid_during_clips_winners_and_omits_deleted_windows() {
         (40, 60, Value::I64(20), second.tx_key().system_time.0),
         (60, 70, Value::I64(10), first.tx_key().system_time.0),
     ]);
-    drop(cursor);
+    assert!(history.witness().unwrap().is_none(), "standalone holds do not issue ordered witnesses");
+    drop(history);
+    let missing = EntityId::Integer(2);
+    let mut absent = held.open_valid_during_observed(&relation, &missing, valid).await.unwrap();
+    assert!(absent.witness().is_err());
+    assert!(absent.next_batch().await.unwrap().is_none());
+    assert!(absent.witness().unwrap().is_none());
+    drop(absent);
     drop(held);
     drop(writer);
     stop(&node, driver).await;
@@ -674,7 +682,8 @@ async fn held_owned_range_requires_a_covering_generation() {
         let request = rtdb_node::OwnedCountRequest {
             lower: Some(&lower), upper: Some(&upper), valid_at: Timestamp(valid_at),
         };
-        let result = held.count_range(&relation, &path, request).await.unwrap();
+        let (result, witness) = held.count_range_observed(&relation, &path, request).await.unwrap();
+        assert!(witness.is_none(), "standalone counts do not issue ordered witnesses");
         assert_eq!(result.count, expected);
         assert_eq!(result.present, held.present().system_time);
         assert_eq!(result.valid_at, Timestamp(valid_at));
