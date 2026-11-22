@@ -101,6 +101,9 @@ impl OwnedWorldRead for HeldCheckpointWorld {
     fn is_held(&self) -> bool { HeldCheckpointWorld::is_held(self) }
 
     fn parent_basis(&self) -> TransactionKey { HeldCheckpointWorld::parent_basis(self) }
+    fn parent_pin(&self) -> rtdb_types::Iid { HeldCheckpointWorld::parent_pin(self) }
+    fn until(&self) -> Timestamp { HeldCheckpointWorld::until(self) }
+    fn evidence_until(&self) -> Timestamp { HeldCheckpointWorld::evidence_until(self) }
 
     fn check_relation(&self, relation: &OwnedRelation) -> Result<()> {
         HeldCheckpointWorld::check_relation(self, relation)

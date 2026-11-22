@@ -482,12 +482,14 @@ The ordered transaction checks the world registration, placement, deadline, loca
 It returns ordered local overlay groups after the supplied revision at or above the archived parent basis. The archived parent is fixed.
 The scope must retain journal coverage and certified purge history. A local tombstone emits a delete.
 
-`rtdb.owned.ForkHeldWorld.v2` creates a retained or held world from an authenticated Root hold at the exact authorized capture or accepted suffix.
-The body carries the 16-byte hold, minted world, capture and optional suffix (nil selects the base capture), followed by expiry and deadline as big-endian i64.
-A byte selects retained (0), held at the inherited clock (1), or held with an explicit start (2 followed by a big-endian i64 timestamp).
+`rtdb.owned.PublishWorldCut.v1` registers an initial archived cut or moves a retained world to a newer verified Root cut.
+The request supplies 16-byte IDs for the original Root hold, world, minted pin, predecessor world hold, capture and suffix. A nil suffix selects the capture itself.
+An initial request uses the world ID as its pin and a nil predecessor. An advance supplies the original retained-world hold and a freshly minted pin.
+Expiry and deadline follow as big-endian i64. An advance supplies Int64 minimum for expiry to inherit the original world's expiry.
+A clock-mode byte selects retained (0), held at the inherited clock (1), or held with an explicit start (2 followed by a big-endian i64 timestamp). An advance uses mode 0.
 The final fields are the 22-byte attempt ID, its 32-byte fingerprint, and check-only hosted controls.
-The placed owner derives the parent publication from the archived cut. A forward start requires an unchanged original live Root head.
-The response carries the minted 16-byte world followed by the transaction ID and system time as big-endian i64.
+The archive owner retains the new cut before ordering. The resolver compares the exact predecessor pin before moving a retained world and checks the original Root head for an explicit forward clock start.
+The response carries the unchanged world ID followed by the transaction ID and system time as big-endian i64.
 
 `rtdb.owned.CommitHeldWorlds.v4` orders one to eight world publications with optional Root facts and checks.
 Its request starts with a big-endian i64 deadline, one 32-byte attempt fingerprint, and a big-endian u16 world count.

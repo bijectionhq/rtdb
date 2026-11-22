@@ -62,12 +62,13 @@ fn admit_capture(
 }
 
 fn world_record(
-    id: Uuid,
+    pin: Uuid,
     retained: &CheckpointWorldRetention,
     schemas: rtdb_types::WorldSchemas,
 ) -> OwnedWorld {
     OwnedWorld {
-        id: Iid(*id.as_bytes()),
+        id: Iid(*retained.world.as_bytes()),
+        pin: Iid(*pin.as_bytes()),
         capture: Iid(*retained.capture.as_bytes()),
         suffix: retained.suffix.map(|id| Iid(*id.as_bytes())),
         manifest: retained.manifest_sha256.clone(),
@@ -149,8 +150,12 @@ pub(crate) async fn fork_checkpoint_world_selected(
         }
     };
     let id = Uuid::from_bytes(fork.world.0);
-    if id.is_nil() { return Err(OwnedWorld::unavailable()); }
+    let pin = Uuid::from_bytes(fork.pin.0);
+    if id.is_nil() || pin.is_nil() || (fork.previous.is_none() != (pin == id)) {
+        return Err(OwnedWorld::unavailable());
+    }
     let retained = CheckpointWorldRetention {
+        world: id,
         owner,
         capture: parent.capture,
         manifest_sha256: parent.manifest_sha256.clone(),
@@ -177,18 +182,28 @@ pub(crate) async fn fork_checkpoint_world_selected(
         record
             .checkpoint_worlds
             .retain(|_, world| world.until > now);
-        if let Some(existing) = record.checkpoint_worlds.get(&id) {
+        if let Some(previous) = fork.previous {
+            let previous = record.checkpoint_worlds.get(&Uuid::from_bytes(previous.0)).ok_or_else(OwnedWorld::unavailable)?;
+            if previous.world != id || previous.owner != retained.owner || previous.until != retained.until
+                || previous.mode != WorldClockMode::Retained || retained.mode != WorldClockMode::Retained
+                || previous.basis.system_time >= retained.basis.system_time || previous.basis.tx_id >= retained.basis.tx_id
+            {
+                return Err(OwnedWorld::unavailable());
+            }
+        }
+        if let Some(existing) = record.checkpoint_worlds.get(&pin) {
             return if existing == &retained { Ok(()) } else { Err(OwnedWorld::unavailable()) };
         }
         if record.checkpoint_worlds.len() >= MAX_RETAINED_WORLDS {
             return Err(OwnedWorld::unavailable());
         }
-        record.checkpoint_worlds.insert(id, retained.clone());
+        record.checkpoint_worlds.insert(pin, retained.clone());
         Ok(())
     })
     .await?;
     admit_session(session, &installed, &retained.owner)?;
-    let registration = world_record(id, &retained, schemas);
+    let registration = world_record(pin, &retained, schemas);
+    let previous = fork.previous.map(|previous| Uuid::from_bytes(previous.0));
     let outcome = session.register_owned_world_checked(&registration, fork).await?;
     if !outcome.committed() {
         // A competing retry may already have registered this world.
@@ -198,11 +213,17 @@ pub(crate) async fn fork_checkpoint_world_selected(
             .cloned()
             .unwrap_or_else(OwnedWorld::unavailable));
     }
+    if let Some(previous) = previous
+        && let Some(prior) = installed.checkpoint_worlds.get(&previous)
+    {
+        let _ = retire_world_pins(directory, &deployment, &[(previous, prior)], installed.incarnation, installed.log_epoch).await;
+    }
     Ok((id, outcome.tx_key()))
 }
 
 fn matches_retention(world: &OwnedWorld, retained: &CheckpointWorldRetention) -> bool {
-    world.capture.0 == *retained.capture.as_bytes()
+    world.id.0 == *retained.world.as_bytes()
+        && world.capture.0 == *retained.capture.as_bytes()
         && world.suffix.map(|suffix| Uuid::from_bytes(suffix.0)) == retained.suffix
         && world.manifest == retained.manifest_sha256
         && world.basis == retained.basis
@@ -227,13 +248,18 @@ async fn open_world(
     deployment: Uuid,
     id: Uuid,
 ) -> Result<OpenWorld> {
+    let snapshot = session.open_owned_read().await?;
+    let (world, charge) = snapshot
+        .world_registration(Iid(*id.as_bytes()))
+        .await?
+        .ok_or_else(OwnedWorld::unavailable)?;
     let installation = directory
         .deployment(&deployment.to_string())
         .await?
         .ok_or_else(OwnedWorld::unavailable)?;
     let retained = installation
         .checkpoint_worlds
-        .get(&id)
+        .get(&Uuid::from_bytes(world.pin.0))
         .ok_or_else(OwnedWorld::unavailable)?;
     admit_session(session, &installation, &retained.owner)?;
     if retained.until <= now() {
@@ -247,11 +273,6 @@ async fn open_world(
         basis: retained.basis,
     };
     admit_capture(&installation, archive, &parent)?;
-    let snapshot = session.open_owned_read().await?;
-    let (world, charge) = snapshot
-        .world_registration(Iid(*id.as_bytes()))
-        .await?
-        .ok_or_else(OwnedWorld::unavailable)?;
     if world.dropped
         || snapshot.present().system_time >= retained.until
         || !matches_retention(&world, retained)
@@ -314,16 +335,18 @@ pub(crate) async fn commit_checkpoint_world_batch(
     let mut admitted = Vec::with_capacity(sections.len());
     let mut terminal = Vec::new();
     for section in sections {
-        let id = Uuid::from_bytes(section.world.0);
-        let retained = installation.checkpoint_worlds.get(&id).ok_or_else(OwnedWorld::unavailable)?;
+        let pin = Uuid::from_bytes(section.parent_pin.0);
+        let retained = installation.checkpoint_worlds.get(&pin).ok_or_else(OwnedWorld::unavailable)?;
         admit_session(session, &installation, &retained.owner)?;
-        if retained.basis != section.parent_basis || now() >= retained.until { return Err(OwnedWorld::unavailable()); }
+        if retained.world.as_bytes() != &section.world.0 || retained.basis != section.parent_basis || now() >= retained.until {
+            return Err(OwnedWorld::unavailable());
+        }
         admit_capture(&installation, archive, &CheckpointReadWorld {
             deployment, capture: retained.capture, manifest_sha256: retained.manifest_sha256.clone(),
             suffix: retained.suffix, basis: retained.basis,
         })?;
         if matches!(&section.effect, rtdb_node::OwnedWorldEffect::Drop) {
-            terminal.push((id, retained));
+            terminal.push((pin, retained));
         }
         admitted.push((retained.until, section));
     }

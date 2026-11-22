@@ -689,10 +689,10 @@ impl<'a> OpenTransaction<'a> {
                 }
                 Ok(())
             }
-            Operation::Public(TxOp::OwnedForkWorld { record, attempt, fingerprint }) => {
+            Operation::Public(TxOp::OwnedForkWorld { record, previous, attempt, fingerprint }) => {
                 self.reserve_owned_attempt(attempt, *fingerprint).await?;
                 let documents = crate::Documents::new(vec![record.clone()], &self.context.memory)?;
-                self.write_owned(&rtdb_types::OwnedRelation::world_catalog(), &documents, None, None, None, true).await
+                self.write_owned(&rtdb_types::OwnedRelation::world_catalog(), &documents, None, None, None, previous.is_none()).await
             }
             Operation::Public(TxOp::OwnedPublishRoot { attempt, fingerprint }) => {
                 self.reserve_owned_attempt(attempt, *fingerprint).await?;
@@ -955,13 +955,25 @@ impl<'a> OpenTransaction<'a> {
                             && checked_tip.is_none() => {
                         checked_tip = Some((*valid_at, *expected));
                     }
-                    Operation::Public(TxOp::OwnedForkWorld { record, .. }) => {
+                    Operation::Public(TxOp::OwnedForkWorld { record, previous, .. }) => {
                         let world = rtdb_types::OwnedWorld::from_record(record)?;
-                        if world.id.0 == [0; 16] || world.dropped || deadline.is_none_or(|until| until > world.until) {
+                        if world.dropped || world.basis.system_time >= self.tx_key().system_time
+                            || deadline.is_none_or(|until| until > world.until)
+                        {
                             return Err(unavailable());
                         }
-                        if world.initial_clock() > world.inherited_clock() {
-                            expected_tip = Some((world.basis.system_time, world.parent_publication));
+                        if let Some(previous) = previous {
+                            let base = self.buffer.base_snapshot();
+                            let context = self.context.query_context(base, self.tx_key().system_time, &self.options.default_tz, self.trace_parent)?;
+                            let (prior, _charge) = rtdb_query::read_owned_world(context, owner, world.id).await?.ok_or_else(unavailable)?;
+                            if prior.pin != *previous || !prior.can_move_to(&world) {
+                                return Err(unavailable());
+                            }
+                        } else {
+                            if world.pin != world.id { return Err(unavailable()); }
+                            if world.initial_clock() > world.inherited_clock() {
+                                expected_tip = Some((world.basis.system_time, world.parent_publication));
+                            }
                         }
                         forks += 1;
                     }
@@ -1063,15 +1075,16 @@ impl<'a> OpenTransaction<'a> {
                 }
                 continue;
             }
-            if let Operation::Public(TxOp::OwnedCheckWorldPurge { relation, frontier }) = operation {
+            if let Operation::Public(TxOp::OwnedCheckWorldPurge { relation, pin, frontier }) = operation {
                 let root = relation.root_relation().ok_or_else(unavailable)?;
                 let base = self.buffer.base_snapshot();
-                if relation.world().is_none_or(|world| !self.owned_worlds.contains_key(&world)) || *frontier < 0
+                if relation.world().and_then(|world| self.owned_worlds.get(&world))
+                    .is_none_or(|(record, _)| record.pin != *pin) || *frontier < 0
                     || base.contains_table(&rtdb_types::OwnedRelation::obsolete_purge_table(owner))
                     || base.relation_event_frontier(&root.purge_table(owner))? != *frontier
                 {
                     return Err(Anomaly::new(AnomalyCategory::Conflict, "rtdb.owned/world-witness-unavailable",
-                        "The world point's root erasure frontier changed before ordering"));
+                        "The world point's retained parent or root erasure frontier changed before ordering"));
                 }
                 continue;
             }
@@ -1306,11 +1319,14 @@ impl<'a> OpenTransaction<'a> {
                     return Err(unavailable());
                 }
             } else {
-                if !record.dropped { return Err(unavailable()); }
                 let context = self.context.query_context(self.snapshot()?, ordered, &self.options.default_tz, self.trace_parent)?;
                 let (previous, _retained) = rtdb_query::read_owned_world(context, owner, record.id).await?.ok_or_else(unavailable)?;
-                if !previous.same_fork(&record) { return Err(unavailable()); }
-                if previous.dropped { return Ok(()); }
+                if record.dropped {
+                    if !previous.same_fork(&record) { return Err(unavailable()); }
+                    if previous.dropped { return Ok(()); }
+                } else if !previous.can_move_to(&record) {
+                    return Err(unavailable());
+                }
             }
             return self.put_documents(&table, documents, iids, Some(Timestamp::MIN), Some(Timestamp::MAX),
                 DocumentWrite::Owned { relation, owner, create_only }).await;

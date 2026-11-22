@@ -156,7 +156,7 @@ pub(crate) const CLOSE_OWNED_READ_V1: &str = "rtdb.owned.CloseRead.v1";
 pub(crate) const OPEN_WORLD_READ_V4: &str = "rtdb.owned.OpenWorldRead.v4";
 pub(crate) const HELD_WORLD_POINT_V2: &str = "rtdb.owned.ReadHeldWorldPoint.v2";
 pub(crate) const CLOSE_WORLD_READ_V1: &str = "rtdb.owned.CloseWorldRead.v1";
-pub(crate) const FORK_HELD_WORLD_V2: &str = "rtdb.owned.ForkHeldWorld.v2";
+pub(crate) const PUBLISH_WORLD_CUT_V1: &str = "rtdb.owned.PublishWorldCut.v1";
 pub(crate) const COMMIT_HELD_WORLDS_V4: &str = "rtdb.owned.CommitHeldWorlds.v4";
 pub(crate) const COMMIT_WORLD_V3: &str = "rtdb.owned.CommitWorld.v3";
 const MAX_WORLD_WITNESSES: usize = 128;
@@ -1539,11 +1539,13 @@ impl Service {
         }
     }
 
-    pub(crate) async fn fork_held_world_action(&self, call: &Call, body: &[u8]) -> Result<ActionResult, Status> {
+    pub(crate) async fn publish_world_cut_action(&self, call: &Call, body: &[u8]) -> Result<ActionResult, Status> {
         if !self.0.config.owned_native_actions { return Err(unsupported()); }
         let host = self.0.config.owned_world_host.as_ref().ok_or_else(unsupported)?;
         let (handle, rest) = body.split_first_chunk::<16>().ok_or_else(|| invalid("World fork has no held root handle"))?;
-        let (world, rest) = rest.split_first_chunk::<16>().ok_or_else(|| invalid("World fork has no minted identity"))?;
+        let (world, rest) = rest.split_first_chunk::<16>().ok_or_else(|| invalid("World cut has no minted identity"))?;
+        let (pin, rest) = rest.split_first_chunk::<16>().ok_or_else(|| invalid("World cut has no minted pin"))?;
+        let (previous_handle, rest) = rest.split_first_chunk::<16>().ok_or_else(|| invalid("World cut has no predecessor handle"))?;
         let (capture, rest) = rest.split_first_chunk::<16>().ok_or_else(|| invalid("World fork has no capture"))?;
         let (suffix, rest) = rest.split_first_chunk::<16>().ok_or_else(|| invalid("World fork has no suffix selector"))?;
         let (until, rest) = rest.split_first_chunk::<8>().ok_or_else(|| invalid("World fork has no expiry"))?;
@@ -1568,6 +1570,24 @@ impl Service {
         let policy = self.hosted_control_policy(call)?;
         let scope = self.hosted_control_scope(call).await?;
         let cut = held.snapshot.fork_cut(scope).await.map_err(status)?;
+        let requested_until = Timestamp(i64::from_be_bytes(*until));
+        let previous = if *previous_handle == [0; 16] {
+            if world != pin { return Err(invalid("An initial pin must name its world")); }
+            None
+        } else {
+            if requested_until != Timestamp::MIN || !matches!(requested, rtdb_node::WorldClockRequest::Retained) || world == pin {
+                return Err(invalid("A retained advance preserves the original world lifetime and mode"));
+            }
+            let previous = self.owned_world_read(call, &Bytes::copy_from_slice(previous_handle))?;
+            previous.snapshot.check().map_err(status)?;
+            if previous.world.as_bytes() != world || previous.snapshot.is_held()
+                || previous.snapshot.parent_basis().system_time >= cut.basis()
+                || previous.snapshot.parent_pin().0 == *pin
+            {
+                return Err(Status::failed_precondition("The original retained world cannot select this cut"));
+            }
+            Some(previous)
+        };
         let groups = owned_groups(groups, true, false)?;
         hosted_control::admit_control_targets(policy, groups.iter().map(|(relation, _)| relation))?;
         let mut rows_left = MAX_GROUPED_COMMIT_ROWS - 4; // Deadline, optional tip check, registration and attempt.
@@ -1579,11 +1599,19 @@ impl Service {
         require_idle(&session)?;
         let reply_charge = call.reserve(64)?;
         let suffix = Uuid::from_bytes(*suffix);
+        let original = previous.as_ref().map(|previous| &previous.snapshot);
+        let mut deadline = Timestamp(i64::from_be_bytes(*deadline));
+        if let Some(previous) = original {
+            previous.check().map_err(status)?;
+            deadline = deadline.min(previous.evidence_until());
+        }
         let (registered, key) = host.fork_world_checked(
             crate::WorldCall { node: &self.0.node, attachment: &attachment, session: &mut session, cancellation: &call.cancellation },
-            Uuid::from_bytes(*capture), (!suffix.is_nil()).then_some(suffix), Timestamp(i64::from_be_bytes(*until)),
+            Uuid::from_bytes(*capture), (!suffix.is_nil()).then_some(suffix),
+            original.map_or(requested_until, |world| world.until()),
             rtdb_node::OwnedWorldFork {
-                world: rtdb_types::Iid(*world), cut, requested, deadline: Timestamp(i64::from_be_bytes(*deadline)),
+                world: rtdb_types::Iid(*world), pin: rtdb_types::Iid(*pin),
+                previous: original.map(|world| world.parent_pin()), cut, requested, deadline,
                 attempt: attempt.into(), fingerprint: *fingerprint, controls,
             },
         ).await.map_err(status)?;
@@ -1632,6 +1660,7 @@ impl Service {
             let (checks, charge) = resource.conditions(call, world, nonces)?;
             reservations.push(charge);
             let parent_basis = resource.snapshot.parent_basis();
+            let parent_pin = resource.snapshot.parent_pin();
             let expected_clock = resource.snapshot.application_clock();
             if *kind != 2 && !resource.snapshot.is_held() {
                 return Err(Status::failed_precondition("The original world is read-only"));
@@ -1656,7 +1685,7 @@ impl Service {
             };
             body = rest;
             sections.push(rtdb_node::OwnedWorldSection {
-                world: rtdb_types::Iid(*world.as_bytes()), parent_basis, checks, expected_clock,
+                world: rtdb_types::Iid(*world.as_bytes()), parent_pin, parent_basis, checks, expected_clock,
                 attempt: attempt.to_owned(), effect,
             });
         }

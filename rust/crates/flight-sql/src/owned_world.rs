@@ -54,6 +54,9 @@ pub trait OwnedWorldRead: Send + Sync {
     fn initial_clock(&self) -> Timestamp;
     fn is_held(&self) -> bool;
     fn parent_basis(&self) -> TransactionKey;
+    fn parent_pin(&self) -> rtdb_types::Iid;
+    fn until(&self) -> Timestamp;
+    fn evidence_until(&self) -> Timestamp;
     fn check_relation(&self, relation: &OwnedRelation) -> Result<()>;
     fn check(&self) -> Result<()>;
     fn close(&self);
