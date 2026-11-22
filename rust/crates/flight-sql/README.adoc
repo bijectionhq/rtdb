@@ -216,6 +216,15 @@ These metadata values are signed decimal microseconds.
 A successful commit reply has the same schema as the create reply.
 An expired deadline or stale observation aborts the entire transaction before mutations apply.
 
+`rtdb.owned.Commit.v2` applies the same row schema and reply format to multiple relations in one transaction.
+Its body starts with one exclusive signed 64-bit big-endian microsecond deadline and an unsigned 16-bit big-endian group count.
+Each group is an unsigned 16-bit big-endian relation-name length, the ASCII relation name, an unsigned 32-bit big-endian IPC length, and exactly that many bytes of a terminated IPC stream.
+Each group contains one nonempty batch.
+Use 1–32 distinct relations and at most 4096 rows across the request.
+The final stream ends the body.
+All observations are checked against the same ordered state before any mutation applies.
+Mutations apply in group order and then row order, using the authenticated session's principal and database.
+
 Owned lookups compare the complete stored `_id` before releasing data or accepting a point observation.
 The primary index continues to locate rows by 128-bit IID.
 Different identities occupying the same IID produce an explicit collision refusal when a different visible identity is found.

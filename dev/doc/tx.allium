@@ -41,6 +41,8 @@
 -- An overlap aborts the entire transaction.
 -- Owned native inserts resolve in the authenticated principal's versioned namespace.
 -- Owned deadlines and point observations are checked at the ordered cut before owned mutations apply.
+-- One grouped owned Flight commit supplies one deadline and batches for distinct relations.
+-- Observations across those relations share the ordered cut, and their mutations apply atomically in group and row order.
 -- Owned create, replace, and delete operations apply atomically in their listed order.
 -- Owned point reads compare the complete stored identity before yielding any row.
 -- An owned transaction refuses ordinary operations and ordinary SQL catalogs and scans exclude owned tables.
