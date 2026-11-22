@@ -59,6 +59,6 @@ pub trait OwnedWorldRead: Send + Sync {
         &'a self, relation: &'a OwnedRelation, valid: Timestamp, after: Option<&'a str>, limit: usize,
     ) -> BoxFuture<'a, Result<WorldIdentityPage>>;
     fn read_point<'a>(
-        &'a self, relation: &'a OwnedRelation, id: &'a EntityId, valid_at: Timestamp,
+        &'a self, relation: &'a OwnedRelation, id: &'a EntityId, valid_at: Timestamp, observed: bool,
     ) -> BoxFuture<'a, Result<WorldPointResult>>;
 }

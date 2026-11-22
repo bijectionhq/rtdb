@@ -128,7 +128,7 @@ pub(crate) const HELD_OWNED_VERSIONS_V2: &str = "rtdb.owned.ReadHeldVersions.v2"
 pub(crate) const CLOSE_OWNED_READ_V1: &str = "rtdb.owned.CloseRead.v1";
 pub(crate) const READ_WORLD_POINT_V1: &str = "rtdb.owned.ReadWorldPoint.v1";
 pub(crate) const OPEN_WORLD_READ_V1: &str = "rtdb.owned.OpenWorldRead.v1";
-pub(crate) const HELD_WORLD_POINT_V1: &str = "rtdb.owned.ReadHeldWorldPoint.v1";
+pub(crate) const HELD_WORLD_POINT_V2: &str = "rtdb.owned.ReadHeldWorldPoint.v2";
 pub(crate) const CLOSE_WORLD_READ_V1: &str = "rtdb.owned.CloseWorldRead.v1";
 pub(crate) const DROP_WORLD_V1: &str = "rtdb.owned.DropWorld.v1";
 pub(crate) const FORK_WORLD_V1: &str = "rtdb.owned.ForkWorld.v1";
@@ -1336,9 +1336,15 @@ impl Service {
         if !self.0.config.owned_native_actions || self.0.config.owned_world_host.is_none() { return Err(unsupported()); }
         let (handle, body) = body.split_first_chunk::<16>().ok_or_else(|| invalid("Owned world point has no held handle"))?;
         let held = self.owned_world_read(call, &Bytes::copy_from_slice(handle))?;
+        let (mode, body) = body.split_first().ok_or_else(|| invalid("Owned world point has no observation flag"))?;
+        let observed = match mode {
+            0 => false,
+            1 => true,
+            _ => return Err(invalid("Invalid owned world point observation flag")),
+        };
         let (relation, id, valid, _identity) = point_request(call, body, PointTime::Required)?;
         let valid_at = valid.ok_or_else(|| invalid("Owned world point requires a valid_micros instant"))?;
-        let mut result = held.snapshot.read_point(&relation, &id, valid_at).await.map_err(status)?;
+        let mut result = held.snapshot.read_point(&relation, &id, valid_at, observed).await.map_err(status)?;
         if result.present != held.snapshot.present() {
             return Err(Status::internal("Owned world point changed its held present"));
         }

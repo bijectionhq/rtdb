@@ -64,10 +64,10 @@ impl HeldCheckpointWorld {
         self.open.snapshot.close();
     }
 
-    pub async fn point(&self, relation: &OwnedRelation, id: &EntityId, valid_at: Timestamp) -> Result<WorldPoint> {
+    pub async fn point(&self, relation: &OwnedRelation, id: &EntityId, valid_at: Timestamp, observed: bool) -> Result<WorldPoint> {
         self.check()?;
         let valid = Interval::at(valid_at)?;
-        let (local, witness) = self.open.read_local(relation, id, valid_at, &self.memory, true).await?;
+        let (local, witness) = self.open.read_local(relation, id, valid_at, &self.memory, observed).await?;
         let fact = if let Some(fact) = local {
             fact
         } else {

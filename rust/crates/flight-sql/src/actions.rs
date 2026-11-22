@@ -47,7 +47,7 @@ impl Service {
                     Ok(Vec::new())
                 }
                 crate::owned_actions::OPEN_WORLD_READ_V1 => Ok(vec![Ok(self.open_world_read_action(&call, &action.body).await?)]),
-                crate::owned_actions::HELD_WORLD_POINT_V1 => Ok(vec![Ok(self.held_world_point_action(&call, &action.body).await?)]),
+                crate::owned_actions::HELD_WORLD_POINT_V2 => Ok(vec![Ok(self.held_world_point_action(&call, &action.body).await?)]),
                 crate::owned_actions::CLOSE_WORLD_READ_V1 => {
                     self.close_world_read_action(&call, &action.body)?;
                     Ok(Vec::new())

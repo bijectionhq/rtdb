@@ -839,7 +839,7 @@ async fn world_flight_actions_require_a_placed_world_host() {
     for action in [
         "rtdb.owned.ReadWorldPoint.v1", "rtdb.owned.DropWorld.v1",
         "rtdb.owned.ForkWorld.v1", "rtdb.owned.CommitWorld.v1", "rtdb.owned.CommitWorld.v2",
-        "rtdb.owned.OpenWorldRead.v1", "rtdb.owned.ReadHeldWorldPoint.v1",
+        "rtdb.owned.OpenWorldRead.v1", "rtdb.owned.ReadHeldWorldPoint.v2",
         "rtdb.owned.CloseWorldRead.v1",
     ] {
         let refused = client.action(action, Bytes::from_static(&[0; 16])).await.unwrap_err();
