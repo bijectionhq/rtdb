@@ -12,6 +12,9 @@
 --
 -- An owned clear-text declaration comes from the authenticated principal's protected search-path catalog.
 -- The artefact lane feeds its one explicitly declared UTF-8 column to the same search-file builder.
+-- Published files include the ordered definition version, artifact identity, and exact token length of each run.
+-- Owned corpus statistics require published files covering all sources of the held cut.
+-- Row count, token count, and term frequencies use only runs whose temporal visibility is exact at that cut.
 -- Public SQL search definitions remain scoped to the public catalog.
 --
 -- The core knows a search file only as an artefact of kind `search`: trie-cat.allium records artefacts on trie entries, db.allium carries ArtefactsAdded through the leader, and gc.allium deletes artefacts with their owner.

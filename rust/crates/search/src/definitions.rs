@@ -52,6 +52,21 @@ pub(crate) async fn owned_definitions_in(
     Ok(definitions)
 }
 
+pub(crate) async fn owned_definition(
+    context: Arc<QueryContext>, owner: &str, relation: &rtdb_types::OwnedRelation, path: &rtdb_types::OwnedRelation,
+) -> Result<Option<SearchDefinition>> {
+    let catalog = rtdb_types::OwnedRelation::search_catalog(owner);
+    let Some(cursor) = rtdb_query::open_owned_path_catalog(context, &catalog, Some(path.name())).await? else {
+        return Ok(None);
+    };
+    let mut definitions = read_definitions(cursor, Some(&catalog)).await?.into_iter();
+    let Some(definition) = definitions.next() else { return Ok(None); };
+    if definition.name != path.name() || definitions.next().is_some() {
+        return Err(Anomaly::fault("rtdb.search/owned-definition-identity", "Owned search definition did not resolve its full identity"));
+    }
+    Ok((definition.table == relation.table(owner)).then_some(definition))
+}
+
 async fn read_definitions(
     mut cursor: rtdb_query::QueryCursor, owned_catalog: Option<&TableRef>,
 ) -> Result<Vec<SearchDefinition>> {
