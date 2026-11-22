@@ -170,6 +170,7 @@ impl ArtefactBuilder for SearchBuilder {
         };
         let ceiling = crate::file::ceiling_of(recency);
         let version = definition.version;
+        let owned = rtdb_types::TableRef::owned_schema(&definition.table.schema);
         let sections = tokio::task::spawn_blocking(move || -> Result<Vec<crate::file::Section>> {
             let _indexing = indexing;
             let opened = inputs.into_iter().map(|input| open_input(input, &memory)).collect::<Result<Vec<_>>>()?;
@@ -177,7 +178,7 @@ impl ArtefactBuilder for SearchBuilder {
             std::fs::create_dir(&segment).map_err(fault)?;
             let directory = tantivy::directory::MmapDirectory::open(&segment).map_err(fault)?;
             let output = std::io::BufWriter::new(std::fs::File::create(&output).map_err(fault)?);
-            let members = readers.into_iter().map(|reader| PageRows::new(reader, &columns, &memory, &token));
+            let members = readers.into_iter().map(|reader| PageRows::new(reader, &columns, &memory, &token, owned));
             write_versioned_group(&columns, members, &identity, version, ceiling, directory, output)
         }).await.map_err(|error| Anomaly::fault("rtdb.search/build", error.to_string()))??;
         if cancellation.is_cancelled() { return Err(Anomaly::new(rtdb_types::AnomalyCategory::Interrupted, "rtdb.search/cancelled", "Search build cancelled")); }
@@ -194,7 +195,7 @@ pub(crate) fn indexing_allowance(trie_size: i64) -> usize { usize::try_from(trie
 
 fn fault(error: impl std::fmt::Display) -> Anomaly { Anomaly::fault("rtdb.search/build", error.to_string()) }
 
-fn search_row(event: &rtdb_format::data::StoredEvent, columns: &[String]) -> SearchRow {
+fn search_row(event: &rtdb_format::data::StoredEvent, columns: &[String], owned: bool) -> Result<SearchRow> {
     let values = columns.iter().map(|column| match &event.operation {
         StoredOperation::Put(document) => match document.get(column) {
             None | Some(Value::Null | Value::Undefined) => None,
@@ -204,15 +205,20 @@ fn search_row(event: &rtdb_format::data::StoredEvent, columns: &[String]) -> Sea
         _ => None,
     }).collect();
     let op = match &event.operation { StoredOperation::Put(_) => rtdb_types::EventOp::Put, StoredOperation::Delete => rtdb_types::EventOp::Delete, StoredOperation::Erase => rtdb_types::EventOp::Erase };
-    SearchRow { iid: event.iid.0, system_from: event.system_from.0, valid_from: event.valid_time.lower().0, valid_to: event.valid_time.upper().0, op, values }
+    let identity = match &event.operation {
+        StoredOperation::Put(document) if owned => Some(document.get("_id")
+            .ok_or_else(|| fault("Owned search put is missing its identity"))?.entity_id()?),
+        _ => None,
+    };
+    Ok(SearchRow { identity, iid: event.iid.0, system_from: event.system_from.0, valid_from: event.valid_time.lower().0, valid_to: event.valid_time.upper().0, op, values })
 }
 
 /// A data file's pages of rows in order, each read under its memory reservation.
-struct PageRows<'a> { reader: ArrowFile, columns: &'a [String], memory: &'a Arc<MemoryBudget>, cancellation: &'a CancellationToken, page: usize }
+struct PageRows<'a> { reader: ArrowFile, columns: &'a [String], memory: &'a Arc<MemoryBudget>, cancellation: &'a CancellationToken, page: usize, owned: bool }
 
 impl<'a> PageRows<'a> {
-    fn new(reader: ArrowFile, columns: &'a [String], memory: &'a Arc<MemoryBudget>, cancellation: &'a CancellationToken) -> Self {
-        Self { reader, columns, memory, cancellation, page: 0 }
+    fn new(reader: ArrowFile, columns: &'a [String], memory: &'a Arc<MemoryBudget>, cancellation: &'a CancellationToken, owned: bool) -> Self {
+        Self { reader, columns, memory, cancellation, page: 0, owned }
     }
 }
 
@@ -225,7 +231,7 @@ impl Iterator for PageRows<'_> {
         self.page += 1;
         Some(read_page(&mut self.reader, page, self.memory).and_then(|owned| {
             let batch = EventBatch::new(owned.batch().clone())?;
-            (0..batch.len()).map(|row| Ok(search_row(&batch.read_event(row)?, self.columns))).collect()
+            (0..batch.len()).map(|row| search_row(&batch.read_event(row)?, self.columns, self.owned)).collect()
         }))
     }
 }
@@ -240,7 +246,7 @@ pub fn search_pages<'a>(data: &[u8], columns: &'a [String], cancellation: &'a Ca
         page += 1;
         Some(file.read_page(page - 1).and_then(|batch| {
             let batch = EventBatch::new(batch)?;
-            (0..batch.len()).map(|row| Ok(search_row(&batch.read_event(row)?, columns))).collect()
+            (0..batch.len()).map(|row| search_row(&batch.read_event(row)?, columns, false)).collect()
         }))
     }))
 }
