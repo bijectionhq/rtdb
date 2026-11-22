@@ -1,5 +1,6 @@
 use std::sync::Arc;
 
+use arrow_array::{Array, TimestampMicrosecondArray};
 use rtdb_plan::{BinaryOp, Catalog, ColumnId, Expr, Field, QualifiedTable, Relation, Scan, SortExpr, TemporalFilter};
 use rtdb_types::{Anomaly, AnomalyCategory, EntityId, Iid, Interval, OwnedRelation, Result, TableRef, TimeUnit, Timestamp, Value};
 
@@ -392,18 +393,16 @@ pub fn owned_row_revision(
     let (id_column, id_field) = schema.column_with_name("_id")
         .ok_or_else(|| Anomaly::fault("rtdb.owned/row-identity", "Owned read omitted its identity column"))?;
     let id = batch.column(id_column).as_ref();
-    let bound = rtdb_columnar::estimate_read_value_bytes(id_field, id, row)?;
-    let _scratch = memory.reserve(bound.checked_add(4096)
-        .ok_or_else(|| Anomaly::fault("rtdb.owned/row-identity", "Owned identity allocation overflow"))?)?;
-    if &rtdb_columnar::read_value(id_field, id, row)?.entity_id()? != expected_id {
+    let _scratch = memory.reserve(4096)?;
+    if rtdb_columnar::read_entity_id(id_field, id, row)? != rtdb_columnar::EntityIdRef::from(expected_id) {
         return Err(Anomaly::new(rtdb_types::AnomalyCategory::Conflict, "rtdb.owned/iid-collision", "Owned row locator resolves to a different complete identity"));
     }
-    let (revision_column, revision_field) = schema.column_with_name("_system_from")
+    let (revision_column, _) = schema.column_with_name("_system_from")
         .ok_or_else(|| Anomaly::fault("rtdb.owned/row-revision", "Owned read omitted its revision column"))?;
-    match rtdb_columnar::read_value(revision_field, batch.column(revision_column).as_ref(), row)? {
-        Value::Timestamp { value, unit: TimeUnit::Microsecond, .. } => Ok(Timestamp(value)),
-        _ => Err(Anomaly::fault("rtdb.owned/row-revision", "Owned row revision is not a microsecond timestamp")),
-    }
+    batch.column(revision_column).as_any().downcast_ref::<TimestampMicrosecondArray>()
+        .filter(|revisions| row < revisions.len() && revisions.is_valid(row))
+        .map(|revisions| Timestamp(revisions.value(row)))
+        .ok_or_else(|| Anomaly::fault("rtdb.owned/row-revision", "Owned row revision is not a microsecond timestamp"))
 }
 
 /// Reads the fixed protected path catalog shape for engine maintenance and resolution.

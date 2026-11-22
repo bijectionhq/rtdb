@@ -3,15 +3,15 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use parking_lot::Mutex;
-use rtdb_columnar::MemoryBudget;
-use rtdb_format::{data::{EncodedEvent, EventBatch, EventRef, PutColumn, PutText}, ipc::ArrowFile, keys::ArtefactOwner, log::proto::ArtefactRecord};
+use rtdb_columnar::{MemoryBudget, MemoryReservation, OwnedBatch};
+use rtdb_format::{data::{EncodedEvent, EventBatch, EventRef, PutText}, ipc::ArrowFile, keys::ArtefactOwner, log::proto::ArtefactRecord};
 use rtdb_index::PartitionValue;
 use rtdb_maintenance::{ArtefactBuilder, ArtefactDefinition, ArtefactJob};
 use rtdb_storage::{ObjectKey, ObjectStore, cache::BufferPool};
-use rtdb_types::{Anomaly, EventOp, LogicalType, Result};
+use rtdb_types::{Anomaly, EventOp, Result};
 use tokio_util::sync::CancellationToken;
 
-use crate::{SearchRow, file::{artefact_identity, write_versioned_group}, definitions::SearchDefinition};
+use crate::{SearchRow, file::{IndexedRow, SearchPage, artefact_identity, write_versioned_group}, definitions::SearchDefinition};
 use rtdb_maintenance::input::{download, open_input, read_page};
 
 pub const KIND: &str = "search";
@@ -106,7 +106,7 @@ impl ArtefactBuilder for SearchBuilder {
                 kind: Some(KIND.into()),
                 definition_id: Some(definition.id.clone()),
                 definition_version: Some(definition.version),
-                stats: Some(crate::file::encode_sections(sections)),
+                stats: Some(crate::file::encode_sections(sections)?),
                 scope: None,
                 file_size: Some(i64::try_from(size).map_err(fault)?),
                 published_version: None,
@@ -125,7 +125,7 @@ impl ArtefactBuilder for SearchBuilder {
             self.runtime.forget_file(&self.database, &key);
             self.storage.invalidate(&key).await?;
             match self.runtime.file(&self.database, &self.storage, &key, &columns).await {
-                Ok(file) if file.matches_artefact(&identity, definition.version) => {
+                Ok(file) if file.matches_artefact(&identity, definition.version) && file.verify().is_ok() => {
                     let size = self.store.head_fresh(&key).await?.size;
                     let record = record(file.sections(), size)?;
                     self.runtime.clear(&suspect);
@@ -162,8 +162,8 @@ impl ArtefactBuilder for SearchBuilder {
             }
         };
         let indexing = self.memory.reserve(indexing_allowance(size))?;
-        let (memory, token, bundle) = (Arc::clone(&self.memory), cancellation.clone(), workdir.path().join("bundle.bin"));
-        let (segment, output) = (workdir.path().join("segment"), bundle.clone());
+        let (memory, token, bundle) = (Arc::clone(&self.memory), cancellation.clone(), workdir.path().join("search.arrow"));
+        let output = bundle.clone();
         let recency = match &job.owner {
             ArtefactOwner::Trie(trie) => trie.recency(),
             ArtefactOwner::Group(group) => group.recency(),
@@ -172,14 +172,10 @@ impl ArtefactBuilder for SearchBuilder {
         let version = definition.version;
         let owned = rtdb_types::TableRef::owned_schema(&definition.table.schema);
         let sections = tokio::task::spawn_blocking(move || -> Result<Vec<crate::file::Section>> {
-            let _indexing = indexing;
             let opened = inputs.into_iter().map(|input| open_input(input, &memory)).collect::<Result<Vec<_>>>()?;
-            let (readers, _reservations): (Vec<_>, Vec<_>) = opened.into_iter().unzip();
-            std::fs::create_dir(&segment).map_err(fault)?;
-            let directory = tantivy::directory::MmapDirectory::open(&segment).map_err(fault)?;
             let output = std::io::BufWriter::new(std::fs::File::create(&output).map_err(fault)?);
-            let members = readers.into_iter().map(|reader| PageRows::new(reader, &columns, &memory, &token, owned));
-            write_versioned_group(&columns, members, &identity, version, ceiling, directory, output)
+            let members = opened.into_iter().map(|(reader, opening)| PageRows::new(reader, opening, Arc::clone(&memory), token.clone(), owned));
+            write_versioned_group(&columns, members, &identity, version, ceiling, output, Some(indexing))
         }).await.map_err(|error| Anomaly::fault("rtdb.search/build", error.to_string()))??;
         if cancellation.is_cancelled() { return Err(Anomaly::new(rtdb_types::AnomalyCategory::Interrupted, "rtdb.search/cancelled", "Search build cancelled")); }
         let size = tokio::fs::metadata(&bundle).await.map_err(fault)?.len();
@@ -190,85 +186,108 @@ impl ArtefactBuilder for SearchBuilder {
     }
 }
 
-/// The heap a segment's indexing may take, besides the page being read: tantivy holds a segment's postings in memory until it serializes them.
 pub(crate) fn indexing_allowance(trie_size: i64) -> usize { usize::try_from(trie_size.max(0)).unwrap_or(usize::MAX).saturating_add(32 << 20) }
 
 fn fault(error: impl std::fmt::Display) -> Anomaly { Anomaly::fault("rtdb.search/build", error.to_string()) }
 
-fn search_row(event: EventRef<'_>, columns: &[String], owned: bool, memory: &Arc<MemoryBudget>) -> Result<SearchRow> {
-    event.validate_document(memory)?;
+fn search_row<'a>(event: EventRef<'a>, columns: &[String], with_identity: bool) -> Result<IndexedRow<'a>> {
     let values = columns.iter().map(|column| Ok(match event.put_text(column)? {
         PutText::Missing => None,
-        PutText::Utf8(text) => Some(rtdb_text::tokens(text)),
-        PutText::Other => Some(Vec::new()),
+        PutText::Utf8(text) => Some(rtdb_text::analyze(text)),
+        PutText::Other => Some(arrow_array::StringArray::from(Vec::<&str>::new())),
     })).collect::<Result<_>>()?;
     let header = event.header();
-    let identity = if owned && header.op == EventOp::Put {
-        let Some(PutColumn::Stored(field, array, row)) = event.put_column("_id") else {
-            return Err(fault("Owned search put is missing its identity"));
-        };
-        let _scratch = memory.reserve(rtdb_columnar::estimate_copy_cell_bytes(field, array, row)?)?;
-        Some(event.put_cell("_id", &LogicalType::Null)?.entity_id()?)
+    let identity = if with_identity && header.op == EventOp::Put {
+        Some(event.put_identity()?.ok_or_else(|| fault("Owned search put is missing its identity"))?)
     } else {
         None
     };
-    Ok(SearchRow { identity, iid: header.iid.0, system_from: header.system_from.0, valid_from: header.valid_time.lower().0,
-        valid_to: header.valid_time.upper().0, op: header.op, values })
+    Ok(IndexedRow { header, identity, values })
 }
 
-fn search_batch(batch: &EventBatch, columns: &[String], owned: bool, memory: &Arc<MemoryBudget>) -> Result<Vec<SearchRow>> {
-    (0..batch.len()).map(|row| search_row(batch.borrow_event(row)?, columns, owned, memory)).collect()
-}
-
-/// A data file's pages of rows in order, each read under its memory reservation.
-struct PageRows<'a> { reader: ArrowFile, columns: &'a [String], memory: &'a Arc<MemoryBudget>, cancellation: &'a CancellationToken, page: usize, owned: bool }
-
-impl<'a> PageRows<'a> {
-    fn new(reader: ArrowFile, columns: &'a [String], memory: &'a Arc<MemoryBudget>, cancellation: &'a CancellationToken, owned: bool) -> Self {
-        Self { reader, columns, memory, cancellation, page: 0, owned }
+fn test_row(row: IndexedRow<'_>) -> SearchRow {
+    let IndexedRow { header, identity, values } = row;
+    SearchRow {
+        identity: identity.map(rtdb_columnar::EntityIdRef::into_owned),
+        iid: header.iid.0, system_from: header.system_from.0, valid_from: header.valid_time.lower().0,
+        valid_to: header.valid_time.upper().0, op: header.op,
+        values: values.into_iter().map(|tokens| tokens.map(|tokens| tokens.iter().flatten().map(str::to_owned).collect())).collect(),
     }
 }
 
-impl Iterator for PageRows<'_> {
-    type Item = Result<Vec<SearchRow>>;
-    fn next(&mut self) -> Option<Result<Vec<SearchRow>>> {
+#[cfg(test)]
+fn search_batch(batch: &EventBatch, columns: &[String], owned: bool) -> Result<Vec<SearchRow>> {
+    (0..batch.len()).map(|row| search_row(batch.borrow_event(row)?, columns, owned).map(test_row)).collect()
+}
+
+pub(crate) struct ArrowSearchPage {
+    events: EventBatch,
+    _owned: OwnedBatch,
+    with_identity: bool,
+}
+
+impl SearchPage for ArrowSearchPage {
+    fn len(&self) -> usize { self.events.len() }
+
+    fn row(&self, row: usize, columns: &[String]) -> Result<IndexedRow<'_>> {
+        search_row(self.events.borrow_event(row)?, columns, self.with_identity)
+    }
+}
+
+pub(crate) struct PageRows {
+    reader: ArrowFile,
+    _opening: Arc<MemoryReservation>,
+    memory: Arc<MemoryBudget>,
+    cancellation: CancellationToken,
+    page: usize,
+    with_identity: bool,
+}
+
+impl PageRows {
+    fn new(reader: ArrowFile, opening: Arc<MemoryReservation>, memory: Arc<MemoryBudget>,
+           cancellation: CancellationToken, with_identity: bool) -> Self {
+        Self { reader, _opening: opening, memory, cancellation, page: 0, with_identity }
+    }
+}
+
+impl Iterator for PageRows {
+    type Item = Result<ArrowSearchPage>;
+
+    fn next(&mut self) -> Option<Self::Item> {
         if self.page == self.reader.page_count() { return None; }
-        if self.cancellation.is_cancelled() { return Some(Err(Anomaly::new(rtdb_types::AnomalyCategory::Interrupted, "rtdb.search/cancelled", "Search build cancelled"))); }
+        if self.cancellation.is_cancelled() {
+            return Some(Err(Anomaly::new(rtdb_types::AnomalyCategory::Interrupted, "rtdb.search/cancelled", "Search build cancelled")));
+        }
         let page = self.page;
         self.page += 1;
-        Some(read_page(&mut self.reader, page, self.memory).and_then(|owned| {
-            let batch = EventBatch::new(owned.batch().clone())?;
-            search_batch(&batch, self.columns, self.owned, self.memory)
+        Some(read_page(&mut self.reader, page, &self.memory).and_then(|owned| {
+            let events = EventBatch::new(owned.batch().clone())?;
+            Ok(ArrowSearchPage { events, _owned: owned, with_identity: self.with_identity })
         }))
     }
 }
 
-/// A data file's pages of rows in order, read one at a time, with the tokens of each column's value.
-pub fn search_pages<'a>(data: &[u8], columns: &'a [String], cancellation: &'a CancellationToken) -> Result<impl Iterator<Item = Result<Vec<SearchRow>>> + 'a> {
-    search_pages_with_budget(data, columns, cancellation, MemoryBudget::new(usize::MAX))
+/// Reads a data file's indexed rows for diagnostics and fixtures.
+pub fn search_pages<'a>(data: &[u8], columns: &'a [String], cancellation: &CancellationToken) -> Result<impl Iterator<Item = Result<Vec<SearchRow>>> + 'a> {
+    let pages = search_pages_from_reader(std::io::Cursor::new(Arc::<[u8]>::from(data)), cancellation.clone(), MemoryBudget::new(usize::MAX))?;
+    Ok(pages.map(move |page| {
+        let page = page?;
+        (0..page.len()).map(|row| page.row(row, columns).map(test_row)).collect()
+    }))
 }
 
-pub(crate) fn search_pages_with_budget<'a>(
-    data: &[u8], columns: &'a [String], cancellation: &'a CancellationToken, memory: Arc<MemoryBudget>,
-) -> Result<impl Iterator<Item = Result<Vec<SearchRow>>> + 'a> {
-    let mut file = ArrowFile::open(Arc::from(data), None)?;
-    let mut page = 0;
-    Ok(std::iter::from_fn(move || {
-        if page == file.page_count() { return None; }
-        if cancellation.is_cancelled() { return Some(Err(Anomaly::new(rtdb_types::AnomalyCategory::Interrupted, "rtdb.search/cancelled", "Search build cancelled"))); }
-        page += 1;
-        Some(file.read_page(page - 1).and_then(|batch| {
-            let batch = EventBatch::new(batch)?;
-            search_batch(&batch, columns, false, &memory)
-        }))
-    }))
+pub(crate) fn search_pages_from_reader(
+    reader: impl std::io::Read + std::io::Seek + Send + 'static, cancellation: CancellationToken, memory: Arc<MemoryBudget>,
+) -> Result<PageRows> {
+    let (reader, opening) = open_input(reader, &memory)?;
+    Ok(PageRows::new(reader, opening, memory, cancellation, false))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use rtdb_format::data::{StoredEvent, StoredOperation, build_event_batch};
-    use rtdb_types::{Iid, Interval, RunEndWidth, ScalarType, StructFields, Timestamp, Value};
+    use rtdb_types::{Iid, Interval, LogicalType, RunEndWidth, ScalarType, StructFields, Timestamp, Value};
 
     #[test]
     fn arrow_search_rows_keep_token_presence_and_owned_identity() {
@@ -306,8 +325,7 @@ mod tests {
         assert!(matches!(first.put_text("encoded").unwrap(), PutText::Utf8("one run")));
         assert!(matches!(batch.borrow_event(1).unwrap().put_text("encoded").unwrap(), PutText::Missing));
         let columns = ["body".into(), "title".into(), "missing".into(), "encoded".into()];
-        let memory = MemoryBudget::new(1 << 20);
-        let result = search_batch(&batch, &columns, true, &memory).unwrap();
+        let result = search_batch(&batch, &columns, true).unwrap();
         let expected = (0..batch.len()).map(|row| {
             let event = batch.read_event(row).unwrap();
             let header = event.header();
@@ -324,7 +342,26 @@ mod tests {
             }
         }).collect::<Vec<_>>();
         assert_eq!(result, expected);
-        assert_eq!(memory.used_bytes(), 0);
+    }
+
+    #[test]
+    fn indexing_borrows_only_the_selected_cells() {
+        use arrow_array::{StringArray, StructArray};
+        let text = rtdb_columnar::to_field("body", &LogicalType::Scalar(ScalarType::Utf8)).unwrap();
+        let uri = rtdb_columnar::to_field("uri", &LogicalType::Scalar(ScalarType::Uri)).unwrap();
+        let document = StructArray::new(vec![text, uri].into(), vec![
+            Arc::new(StringArray::from(vec!["indexed text"])),
+            Arc::new(StringArray::from(vec!["%"])),
+        ], None);
+        let header = rtdb_types::EventHeader {
+            iid: Iid([0; 16]), system_from: Timestamp(10), valid_time: Interval::ALL, op: EventOp::Put,
+        };
+        let memory = MemoryBudget::new(1 << 20);
+        let owned = rtdb_format::data::owned_put_batch(Arc::new(document), &[header], None, &memory).unwrap();
+        let batch = EventBatch::new(owned.batch().clone()).unwrap();
+        assert!(batch.read_event(0).is_err());
+        let rows = search_batch(&batch, &["body".into()], false).unwrap();
+        assert_eq!(rows[0].values, [Some(vec!["indexed".into(), "text".into()])]);
     }
 
 }

@@ -3,9 +3,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use rtdb_text::Query;
 use rtdb_types::{Iid, Result};
-use tantivy::{DocSet, Term, postings::Postings, schema::IndexRecordOption};
-
-use super::{DocMatch, Ranked, SearchFile, fault};
+use super::{DocMatch, Ranked, SearchFile};
 use crate::rank_windows::window_of;
 
 #[derive(Clone, Copy, Debug)]
@@ -30,10 +28,10 @@ pub(crate) struct WindowSummary {
 
 impl WindowSummary {
     pub(crate) fn new(file: &SearchFile, ids: &BTreeMap<Iid, i64>) -> Option<Self> {
-        let count = file.sidecar.documents.checked_sub(1).map_or(0, |doc| window_of(doc) as usize + 1);
+        let count = file.manifest.documents.checked_sub(1).map_or(0, |doc| window_of(doc) as usize + 1);
         let mut minimum_ids = vec![i64::MAX; count];
-        for doc in 0..file.sidecar.documents {
-            let id = *ids.get(&Iid(file.sidecar.doc_iid(doc)))?;
+        for doc in 0..file.manifest.documents {
+            let id = *ids.get(&Iid(file.manifest.doc_iid(doc)))?;
             let minimum = &mut minimum_ids[window_of(doc) as usize];
             *minimum = (*minimum).min(id);
         }
@@ -41,19 +39,12 @@ impl WindowSummary {
     }
 
     pub(crate) fn prepare(&mut self, file: &SearchFile, column: &str, scoring: &Query) -> Result<()> {
-        let Some(field) = file.field(column) else { return Ok(()) };
-        let Some(segment) = file.searcher.segment_readers().first() else { return Ok(()) };
-        let inverted = segment.inverted_index(field).map_err(fault)?;
-        let lengths = segment.get_fieldnorms_reader(field).map_err(fault)?;
         for term in scoring.terms() {
             if self.terms.contains_key(term) { continue; }
             let mut windows = vec![BTreeSet::new(); self.minimum_ids.len()];
-            let term_key = Term::from_field_text(field, term);
-            if let Some(mut postings) = inverted.read_postings(&term_key, IndexRecordOption::WithFreqs).map_err(fault)? {
-                let mut doc = postings.doc();
-                while doc != tantivy::TERMINATED {
-                    windows[window_of(doc) as usize].insert((postings.term_freq(), lengths.fieldnorm(doc)));
-                    doc = postings.advance();
+            if let Some(postings) = file.postings(column, term)? {
+                for &doc in postings.documents() {
+                    windows[window_of(doc) as usize].insert((postings.frequency(doc), file.stored_length(column, doc)?));
                 }
             }
             self.terms.insert(term.clone(), windows.into_iter().map(|pairs| pairs.into_iter().collect()).collect());
@@ -73,13 +64,13 @@ impl Ranked {
     pub(crate) fn with_tie_bounds(&mut self, summary: &WindowSummary) {
         let Some(windows) = &mut self.0 else { return };
         for (score, _) in &mut windows.windows { *score = 0.0; }
-        for (index, term) in windows.scoring.query().terms().iter().enumerate() {
+        for (index, term) in windows.scorer.scoring.query().terms().iter().enumerate() {
             let by_window = &summary.terms[term];
             let mut scores = BTreeMap::new();
             for (score, window) in &mut windows.windows {
                 let best = by_window[*window as usize].iter().map(|&(frequency, length)| {
                     *scores.entry((frequency, length)).or_insert_with(||
-                        windows.scoring.term_score(index, frequency, length))
+                        windows.scorer.scoring.term_score(index, frequency, length))
                 }).fold(0.0f64, f64::max);
                 *score += best;
             }
@@ -100,8 +91,8 @@ impl Ranked {
     pub(crate) fn expand_experiment(&mut self) -> Result<(usize, Vec<(DocMatch, f64)>)> {
         let Some(windows) = &mut self.0 else { return Ok((0, Vec::new())) };
         let before = windows.next;
-        let hits = windows.expand(None, &mut 0)?;
-        Ok((windows.next - before, hits))
+        let hits = windows.expand(None, &mut 0);
+        Ok((windows.next - before, hits.iter().collect()))
     }
 }
 

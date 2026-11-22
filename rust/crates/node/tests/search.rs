@@ -207,6 +207,14 @@ async fn owned_search_declaration_is_private_and_builds_real_search_artefacts() 
     assert_eq!(hits.iter().map(|hit| hit.id.clone()).collect::<Vec<_>>(),
         [rtdb_types::EntityId::Integer(1), rtdb_types::EntityId::Integer(2)]);
     assert_eq!(hits[0].score.to_bits(), hits[1].score.to_bits());
+    let (arrow_page, _) = held.ranked_search_batch(&partitions, "invoice", 1, 2, false).await.unwrap();
+    assert_eq!(arrow_page.total, 19);
+    let arrow_hits = arrow_page.hits.batch();
+    assert_eq!(arrow_hits.num_rows(), 2);
+    let ids = arrow_hits.column(0);
+    let field = arrow_hits.schema_ref().field(0);
+    let identities = (0..arrow_hits.num_rows()).map(|row| rtdb_columnar::read_entity_id(field, ids.as_ref(), row).unwrap().into_owned()).collect::<Vec<_>>();
+    assert_eq!(identities, [rtdb_types::EntityId::Integer(2), rtdb_types::EntityId::Integer(3)]);
     let (paid, _) = held.ranked_search(&partitions, "paid", 2, false).await.unwrap();
     assert_eq!(paid[0].id, rtdb_types::EntityId::Integer(0));
     drop(held);
@@ -673,6 +681,7 @@ async fn a_ranked_limit_returns_the_same_rows_as_ranking_everything_and_keeping_
     }
     let ranked = |rows: Vec<Vec<Value>>| rows.into_iter().map(|row| (row[0].clone(), row[1].clone())).collect::<Vec<_>>();
     for (filter, scoring) in [("MATCH(body, 'invoice')", "invoice overdue"), ("MATCH(body, 'overdue late')", "late"), ("MATCH(body, 'book')", "book red paid"),
+        ("MATCH(body, '\"red paid\"')", "red paid"),
         ("MATCH(body, 'invoice') AND MATCH(body, 'paid')", "invoice overdue"), ("MATCH(body, 'book') AND _id % 3 = 0", "book")] {
         for valid in ["2020-06-01Z", "2022-06-01Z"] {
             for system in [None, Some(systems[0]), Some(systems[1])] {

@@ -3,8 +3,13 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
+use arrow_array::{Array, Float64Array, LargeListArray, StringArray, UInt32Array,
+    builder::{Float64Builder, LargeListBuilder, StringBuilder, UInt32Builder}, cast::AsArray, types::UInt32Type};
+use arrow_buffer::OffsetBuffer;
+use arrow_schema::{DataType, Field};
 use parking_lot::Mutex;
 use rtdb_columnar::MemoryBudget;
+use rtdb_format::data::PutText;
 use rtdb_index::Snapshot;
 use rtdb_storage::cache::BufferPool;
 use rtdb_types::{Iid, Instant, Result};
@@ -41,24 +46,84 @@ type DefinitionKey = (String, Vec<(Option<(i64, i64)>, Option<i64>)>);
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Suspect { pub database: String, pub table: rtdb_types::TableRef, pub owner: rtdb_format::keys::ArtefactOwner, pub artefact_id: String, pub version: i64 }
 
-/// Postings over a live segment's rows for one column, valid for every segment that starts with the same batches.
-struct LivePostings { batches: Vec<std::sync::Weak<rtdb_index::IndexBatch>>, rows: u32, bytes: usize, postings: std::collections::HashMap<String, Vec<u32>> }
+struct LivePostingPage {
+    first_row: u32,
+    terms: StringArray,
+    rows: LargeListArray,
+    tokens: LargeListArray,
+}
 
-impl LivePostings {
-    /// How many leading batches `segment` shares with these postings.
-    fn shared_prefix(&self, segment: &rtdb_index::LiveTable) -> usize {
-        self.batches.iter().zip(segment.batches()).take_while(|(cached, batch)| cached.upgrade().is_some_and(|cached| Arc::ptr_eq(&cached, batch))).count()
-    }
-    fn extend(&mut self, segment: &rtdb_index::LiveTable, column: &str) -> Result<()> {
-        for row in self.rows..segment.row_count() {
-            let event = segment.row(row)?.event()?;
-            let rtdb_format::data::StoredOperation::Put(document) = &event.operation else { continue };
-            let Some(rtdb_types::Value::Utf8(text)) = document.get(column) else { continue };
-            let mut seen = std::collections::BTreeSet::new();
-            for token in rtdb_text::tokens(text) {
-                if seen.insert(token.clone()) { self.bytes += token.len() + 4; self.postings.entry(token).or_default().push(row); }
+impl LivePostingPage {
+    fn from_rows(segment: &rtdb_index::LiveTable, column: &str, from: u32) -> Result<Self> {
+        let mut postings = BTreeMap::<String, Vec<u32>>::new();
+        let mut tokens = LargeListBuilder::new(StringBuilder::new());
+        for row in from..segment.row_count() {
+            let source = segment.row(row)?;
+            let event = source.batch.view().borrow_event(source.row)?;
+            if let PutText::Utf8(text) = event.put_text(column)? {
+                for token in rtdb_text::analyze(text).iter().flatten() {
+                    tokens.values().append_value(token);
+                    let rows = postings.entry(token.to_owned()).or_default();
+                    if rows.last() != Some(&row) { rows.push(row); }
+                }
+                tokens.append(true);
+            } else {
+                tokens.append(false);
             }
         }
+        let (terms, postings): (Vec<_>, Vec<_>) = postings.into_iter().unzip();
+        let offsets = OffsetBuffer::from_lengths(postings.iter().map(Vec::len));
+        let rows = UInt32Array::from_iter_values(postings.into_iter().flatten());
+        let field = Arc::new(Field::new("item", DataType::UInt32, false));
+        Ok(Self { first_row: from, terms: StringArray::from(terms),
+            rows: LargeListArray::new(field, offsets, Arc::new(rows), None), tokens: tokens.finish() })
+    }
+
+    fn postings(&self, term: &str) -> Option<&[u32]> {
+        let mut first = 0;
+        let mut end = self.terms.len();
+        while first < end {
+            let middle = first + (end - first) / 2;
+            if self.terms.value(middle) < term { first = middle + 1; } else { end = middle; }
+        }
+        if first == self.terms.len() || self.terms.value(first) != term { return None; }
+        let offsets = self.rows.value_offsets();
+        let rows = self.rows.values().as_primitive::<UInt32Type>();
+        Some(&rows.values()[offsets[first] as usize..offsets[first + 1] as usize])
+    }
+
+    fn tokens(&self, row: u32) -> StringArray {
+        let row = (row - self.first_row) as usize;
+        let offsets = self.tokens.value_offsets();
+        let first = offsets[row] as usize;
+        self.tokens.values().as_string::<i32>().slice(first, offsets[row + 1] as usize - first)
+    }
+}
+
+pub(crate) struct LiveMatches {
+    pub rows: UInt32Array,
+    pub scores: Option<Float64Array>,
+}
+
+#[derive(Default)]
+struct LivePostings {
+    batches: Vec<std::sync::Weak<rtdb_index::IndexBatch>>,
+    rows: u32,
+    pages: Vec<LivePostingPage>,
+    bytes: usize,
+}
+
+impl LivePostings {
+    fn shared_prefix(&self, segment: &rtdb_index::LiveTable) -> usize {
+        self.batches.iter().zip(segment.batches()).take_while(|(cached, batch)| {
+            cached.upgrade().is_some_and(|cached| Arc::ptr_eq(&cached, batch))
+        }).count()
+    }
+
+    fn extend(&mut self, segment: &rtdb_index::LiveTable, column: &str) -> Result<()> {
+        let page = LivePostingPage::from_rows(segment, column, self.rows)?;
+        self.bytes += page.terms.get_array_memory_size() + page.rows.get_array_memory_size() + page.tokens.get_array_memory_size();
+        self.pages.push(page);
         self.batches = segment.batches().map(Arc::downgrade).collect();
         self.rows = segment.row_count();
         Ok(())
@@ -66,25 +131,6 @@ impl LivePostings {
 }
 
 type LiveKey = (String, rtdb_types::TableRef, String, usize);
-
-/// Every event of a live segment by IID, with its row, valid for every segment that starts with the same batches.
-struct LiveKeys { batches: Vec<std::sync::Weak<rtdb_index::IndexBatch>>, rows: u32, events: std::collections::HashMap<[u8; 16], Vec<(u32, crate::file::KeyedEvent)>> }
-
-impl LiveKeys {
-    fn shared_prefix(&self, segment: &rtdb_index::LiveTable) -> usize {
-        self.batches.iter().zip(segment.batches()).take_while(|(cached, batch)| cached.upgrade().is_some_and(|cached| Arc::ptr_eq(&cached, batch))).count()
-    }
-    fn extend(&mut self, segment: &rtdb_index::LiveTable) -> Result<()> {
-        for row in self.rows..segment.row_count() {
-            let header = segment.row(row)?.header()?;
-            let event = crate::file::KeyedEvent { system_from: header.system_from.0, valid_from: header.valid_time.lower().0, valid_to: header.valid_time.upper().0, op: header.op };
-            self.events.entry(header.iid.0).or_default().push((row, event));
-        }
-        self.batches = segment.batches().map(Arc::downgrade).collect();
-        self.rows = segment.row_count();
-        Ok(())
-    }
-}
 
 /// Why a recorded search file could not be used; only a file that is gone or whose bytes are wrong is worth rebuilding.
 #[derive(Debug)]
@@ -104,7 +150,6 @@ pub struct TrieFile { pub trie: rtdb_format::keys::TrieKey, pub data: rtdb_stora
 pub struct SearchRuntime {
     definitions: Mutex<Bounded<DefinitionKey, Arc<Vec<SearchDefinition>>>>,
     live: Mutex<Bounded<LiveKey, Arc<Mutex<LivePostings>>>>,
-    live_keys: Mutex<Bounded<(String, rtdb_types::TableRef, usize), Arc<Mutex<LiveKeys>>>>,
     files: Mutex<Bounded<(String, String), OpenedFile>>,
     built: Mutex<Bounded<(String, String), OpenedFile>>,
     /// Builds in progress, which a second query for the same file awaits rather than repeats.
@@ -118,7 +163,7 @@ pub struct SearchRuntime {
 impl SearchRuntime {
     /// `file_bytes` bounds the recorded search files kept across queries, each keeping its buffer-pool lease so its bytes stay charged to the pool; half as much bounds the files a node builds itself, and 32 times as much the files mapped from this node's disk, of which only the pages a query reads are resident.
     pub fn new(file_bytes: usize) -> Arc<Self> {
-        Arc::new(Self { definitions: Mutex::new(Bounded::new(256)), live: Mutex::new(Bounded::new(64 << 20)), live_keys: Mutex::new(Bounded::new(256)), files: Mutex::new(Bounded::new(file_bytes)), built: Mutex::new(Bounded::new(file_bytes / 2)), mapped: Mutex::new(Bounded::new(file_bytes.saturating_mul(32))), building: Default::default(), match_sets: Mutex::new(Bounded::new(64 << 20)), suspects: Default::default(), reported: Default::default() })
+        Arc::new(Self { definitions: Mutex::new(Bounded::new(256)), live: Mutex::new(Bounded::new(64 << 20)), files: Mutex::new(Bounded::new(file_bytes)), built: Mutex::new(Bounded::new(file_bytes / 2)), mapped: Mutex::new(Bounded::new(file_bytes.saturating_mul(32))), building: Default::default(), match_sets: Mutex::new(Bounded::new(64 << 20)), suspects: Default::default(), reported: Default::default() })
     }
     pub fn accelerator(self: &Arc<Self>) -> Arc<SearchAccelerator> { Arc::new(SearchAccelerator::with_runtime(Arc::clone(self))) }
     pub fn artefacts(self: &Arc<Self>) -> Arc<SearchArtefacts> { Arc::new(SearchArtefacts::with_runtime(Arc::clone(self))) }
@@ -202,10 +247,9 @@ impl SearchRuntime {
             let (indexed, token) = (columns.to_vec(), cancellation.clone());
             let memory = Arc::clone(memory);
             let bytes = tokio::task::spawn_blocking(move || -> Result<Vec<u8>> {
-                let _indexing = indexing;
                 let mut bytes = Vec::new();
-                let pages = crate::lane::search_pages_with_budget(lease.as_slice(), &indexed, &token, memory)?;
-                crate::file::write_search_file(&indexed, pages, "built", ceiling, tantivy::directory::RamDirectory::create(), &mut bytes)?;
+                let pages = crate::lane::search_pages_from_reader(std::io::Cursor::new(lease), token, memory)?;
+                crate::file::write_query_pages(&indexed, pages, ceiling, &mut bytes, indexing)?;
                 Ok(bytes)
             }).await.map_err(|error| rtdb_types::Anomaly::fault("rtdb.search/build", error.to_string()))??;
             let size = bytes.len();
@@ -226,15 +270,25 @@ impl SearchRuntime {
 
     /// The rows of a live segment whose column holds every term of the query; phrases are left to the caller.
     /// Postings are kept per segment and extended by the rows appended since, so a growing live index is tokenised once.
-    pub fn live_rows(&self, database: &str, segment: &rtdb_index::LiveTable, column: &str, query: &rtdb_text::Query) -> Result<Vec<u32>> {
-        let Some(first) = segment.batches().next() else { return Ok(Vec::new()) };
+    pub fn live_rows(&self, database: &str, segment: &rtdb_index::LiveTable, column: &str, query: &rtdb_text::Query) -> Result<UInt32Array> {
+        Ok(self.live_matches(database, segment, column, query, None, false)?.rows)
+    }
+
+    pub(crate) fn live_matches(&self, database: &str, segment: &rtdb_index::LiveTable, column: &str,
+        query: &rtdb_text::Query, scorer: Option<&rtdb_text::Scorer>, phrases: bool,
+    ) -> Result<LiveMatches> {
+        let mut matching = UInt32Builder::with_capacity(0);
+        let mut scores = scorer.map(|_| Float64Builder::with_capacity(0));
+        let Some(first) = segment.batches().next() else {
+            return Ok(LiveMatches { rows: matching.finish(), scores: scores.map(|mut scores| scores.finish()) });
+        };
         let key = (database.to_string(), segment.table().clone(), column.to_string(), Arc::as_ptr(first) as usize);
         let entry = {
             let mut live = self.live.lock();
             match live.get(&key) {
                 Some(entry) => entry,
                 None => {
-                    let entry = Arc::new(Mutex::new(LivePostings { batches: Vec::new(), rows: 0, bytes: 0, postings: Default::default() }));
+                    let entry = Arc::new(Mutex::new(LivePostings::default()));
                     live.insert(key.clone(), Arc::clone(&entry), 1);
                     entry
                 }
@@ -244,7 +298,7 @@ impl SearchRuntime {
         let mut shared = postings.shared_prefix(segment);
         // A segment ending inside the cached batches is an older snapshot of the same rows, answered by filtering; one that diverges from them is indexed afresh.
         if shared < segment.batches().count().min(postings.batches.len()) {
-            *postings = LivePostings { batches: Vec::new(), rows: 0, bytes: 0, postings: Default::default() };
+            *postings = LivePostings::default();
             shared = 0;
         }
         if shared == postings.batches.len() && postings.rows < segment.row_count() {
@@ -253,47 +307,25 @@ impl SearchRuntime {
             self.live.lock().insert(key, Arc::clone(&entry), bytes.max(1));
         }
         let visible = segment.row_count();
-        let mut lists: Vec<&Vec<u32>> = Vec::with_capacity(query.terms().len());
-        for term in query.terms() { match postings.postings.get(term) { Some(rows) => lists.push(rows), None => return Ok(Vec::new()) } }
-        lists.sort_by_key(|rows| rows.len());
-        let Some((shortest, rest)) = lists.split_first() else { return Ok(Vec::new()) };
-        Ok(shortest.iter().copied().filter(|row| *row < visible && rest.iter().all(|rows| rows.binary_search(row).is_ok())).collect())
-    }
-
-    /// Every event of an entity a live segment holds, system time descending; a segment's keys are kept and extended by the rows appended since, as its postings are.
-    pub fn live_events(&self, database: &str, segment: &rtdb_index::LiveTable, iid: &[u8; 16]) -> Result<Vec<crate::file::KeyedEvent>> {
-        Ok(self.live_rows_of(database, segment, iid)?.into_iter().map(|(_, event)| event).collect())
-    }
-
-    /// Every event of an entity in descending system time and descending live row order.
-    fn live_rows_of(&self, database: &str, segment: &rtdb_index::LiveTable, iid: &[u8; 16]) -> Result<Vec<(u32, crate::file::KeyedEvent)>> {
-        let keys = self.live_keys_of(database, segment)?;
-        let visible = segment.row_count();
-        let keys = keys.lock();
-        let mut events: Vec<(u32, crate::file::KeyedEvent)> = keys.events.get(iid).map_or_else(Vec::new, |events| events.iter().filter(|(row, _)| *row < visible).copied().collect());
-        events.sort_by_key(|(row, event)| (std::cmp::Reverse(event.system_from), std::cmp::Reverse(*row)));
-        Ok(events)
-    }
-
-    fn live_keys_of(&self, database: &str, segment: &rtdb_index::LiveTable) -> Result<Arc<Mutex<LiveKeys>>> {
-        let Some(first) = segment.batches().next() else { return Ok(Arc::new(Mutex::new(LiveKeys { batches: Vec::new(), rows: 0, events: Default::default() }))) };
-        let key = (database.to_string(), segment.table().clone(), Arc::as_ptr(first) as usize);
-        let existing = self.live_keys.lock().get(&key);
-        let entry = match existing {
-            Some(entry) => entry,
-            None => {
-                let entry = Arc::new(Mutex::new(LiveKeys { batches: Vec::new(), rows: 0, events: Default::default() }));
-                self.live_keys.lock().insert(key.clone(), Arc::clone(&entry), 1);
-                entry
+        let phrases = phrases && !query.phrases().is_empty();
+        for page in &postings.pages {
+            let Some(mut lists) = query.terms().iter().map(|term| page.postings(term)).collect::<Option<Vec<_>>>() else { continue; };
+            lists.sort_by_key(|rows| rows.len());
+            let Some((shortest, rest)) = lists.split_first() else { break; };
+            for row in shortest.iter().copied().take_while(|row| *row < visible)
+                .filter(|row| rest.iter().all(|other| other.binary_search(row).is_ok()))
+            {
+                if phrases || scorer.is_some() {
+                    let tokens = page.tokens(row);
+                    if phrases && !query.matches_arrow(&tokens) { continue; }
+                    if let Some((scorer, scores)) = scorer.zip(scores.as_mut()) {
+                        scores.append_value(scorer.bm25_arrow(&tokens));
+                    }
+                }
+                matching.append_value(row);
             }
-        };
-        {
-            let mut keys = entry.lock();
-            let shared = keys.shared_prefix(segment);
-            if shared < segment.batches().count().min(keys.batches.len()) { *keys = LiveKeys { batches: Vec::new(), rows: 0, events: Default::default() }; }
-            if keys.shared_prefix(segment) == keys.batches.len() && keys.rows < segment.row_count() { keys.extend(segment)?; }
         }
-        Ok(entry)
+        Ok(LiveMatches { rows: matching.finish(), scores: scores.map(|mut scores| scores.finish()) })
     }
 
     /// Hands a recorded file a scan could not read to the database's lane.

@@ -29,11 +29,15 @@ impl Clock for ManualClock { fn now(&self) -> Timestamp { Timestamp(self.0.load(
 struct Running { node: Node, node_task: tokio::task::JoinHandle<Result<()>>, server: ServerHandle, server_task: tokio::task::JoinHandle<Result<()>>, clock: Arc<ManualClock> }
 impl Running {
     async fn start(password: Option<&str>, config: FlightConfig) -> Self { Self::start_with_placements(password, config, &[]).await }
-    async fn start_with_placements(password: Option<&str>, mut config: FlightConfig, placements: &[&str]) -> Self {
+    async fn start_with_placements(password: Option<&str>, config: FlightConfig, placements: &[&str]) -> Self {
+        Self::start_with_options(password, config, placements, NodeOptions::default()).await
+    }
+
+    async fn start_with_options(password: Option<&str>, mut config: FlightConfig, placements: &[&str], mut options: NodeOptions) -> Self {
         let node_clock: Arc<dyn Clock> = Arc::new(TickClock(AtomicI64::new(1_000_000)));
         let auth = Authenticator::open(AuthConfig::SingleRootUser { password: password.map(Secret::new) }, MemoryBudget::new(64 << 20), node_clock.clone(), Arc::new(NoHttp)).await.unwrap();
         let services = NodeServices { clock: node_clock, ..NodeServices::local(auth.clone(), Arc::new(Observer), auth.clone(), Arc::new(Metrics)) };
-        let mut options = NodeOptions::default(); options.automatic_compaction = false; options.automatic_gc = false; options.replication.assertion_interval = Duration::from_millis(1); options.replication.election_seed = 1;
+        options.automatic_compaction = false; options.automatic_gc = false; options.replication.assertion_interval = Duration::from_millis(1); options.replication.election_seed = 1;
         options.owned_relations = config.owned_native_actions;
         if !placements.is_empty() { options.membership = Membership::Placed; }
         let (node, driver) = Node::open(options, services).await.unwrap(); let node_task = tokio::spawn(driver.run());
@@ -753,6 +757,89 @@ async fn transactional_record_inserts_with_many_parameter_rows_release_their_mem
     }
     assert_eq!(integer(&client.query("SELECT COUNT(*) FROM docs").await[0], 0, 0), 2000);
     assert!(running.node.memory().used_bytes() - baseline < 16 << 20);
+    running.stop().await;
+}
+
+#[tokio::test]
+async fn owned_arrow_search_actions_round_trip_ranked_hits() {
+    use arrow_array::{ArrayRef, BooleanArray, FixedSizeBinaryArray, Float64Array, UInt16Array, UInt32Array, UInt64Array};
+    use arrow_ipc::{reader::StreamReader, writer::IpcWriteOptions};
+    use rtdb_types::{EntityId, OwnedRelation};
+    use tokio_util::sync::CancellationToken;
+
+    fn ipc(columns: impl IntoIterator<Item = (&'static str, ArrayRef)>) -> Bytes {
+        let batch = RecordBatch::try_from_iter(columns).unwrap();
+        rtdb_format::ipc::write_arrow_stream(batch.schema_ref(), std::slice::from_ref(&batch), IpcWriteOptions::default()).unwrap().into()
+    }
+    fn text(text: &str) -> ArrayRef { Arc::new(StringArray::from(vec![text])) }
+
+    let mut options = NodeOptions::default();
+    options.file_size_target = 1;
+    options.automatic_artefacts = false;
+    let running = Running::start_with_options(Some("secret"), FlightConfig { owned_native_actions: true, ..FlightConfig::default() }, &[], options).await;
+    let mut client = Client::connect(&running.server, Some("xtdb:secret")).await;
+    let relation = OwnedRelation::new("searchdocs").unwrap();
+    let path = OwnedRelation::new("body-index").unwrap();
+    let mut create = (relation.name().len() as u16).to_be_bytes().to_vec();
+    create.extend_from_slice(relation.name().as_bytes());
+    create.extend_from_slice(&ipc([
+        ("_id", Arc::new(Int64Array::from(vec![1])) as ArrayRef),
+        ("body", text("the overdue invoice")),
+    ]));
+    client.action("rtdb.owned.Create.v1", create.into()).await.unwrap();
+    client.action("rtdb.owned.DeclareSearchPath.v2", ipc([
+        ("relation", text(relation.name())), ("_id", text(path.name())), ("column", text("body")),
+    ])).await.unwrap();
+
+    let database = running.node.catalog().database("xtdb").unwrap();
+    database.flush().await.unwrap();
+    running.node.sync_all(Duration::from_secs(10), &CancellationToken::new()).await.unwrap();
+    database.compaction().unwrap().compact_all().await.unwrap();
+    database.build_artefacts().await.unwrap();
+    let opened = client.action("rtdb.owned.OpenRead.v2", Bytes::new()).await.unwrap();
+    let handle = &opened[0].body[..16];
+    let request = |offset| {
+        let handles = FixedSizeBinaryArray::try_from_iter([handle].into_iter()).unwrap();
+        ipc([
+            ("handle", Arc::new(handles) as ArrayRef),
+            ("query", text("invoice")),
+            ("relation", text(relation.name())),
+            ("path", text(path.name())),
+            ("offset", Arc::new(UInt32Array::from(vec![offset]))),
+            ("limit", Arc::new(UInt16Array::from(vec![2]))),
+            ("evidence", Arc::new(BooleanArray::from(vec![false]))),
+        ])
+    };
+    let output = client.action("rtdb.owned.SearchHeld.v5", request(0)).await.unwrap();
+    let mut data = StreamReader::try_new(output[0].body.as_ref(), None).unwrap();
+    let schema = data.schema();
+    assert_eq!(schema.metadata()["rtdb.owned.search_total"], "1");
+    let hits = data.next().unwrap().unwrap();
+    assert_eq!(hits.num_rows(), 1);
+    assert_eq!(rtdb_columnar::read_entity_id(hits.schema_ref().field(0), hits.column(0).as_ref(), 0).unwrap().into_owned(), EntityId::Integer(1));
+    assert!(hits.column(1).as_any().downcast_ref::<Float64Array>().unwrap().value(0) > 0.0);
+    assert_eq!(hits.column(2).as_any().downcast_ref::<UInt64Array>().unwrap().value(0), 0);
+    assert!(data.next().is_none());
+    let output = client.action("rtdb.owned.SearchHeld.v5", request(1)).await.unwrap();
+    let mut empty = StreamReader::try_new(output[0].body.as_ref(), None).unwrap();
+    assert_eq!(empty.schema(), schema);
+    assert!(empty.next().is_none());
+
+    let mut legacy = handle.to_vec();
+    legacy.extend_from_slice(&1u16.to_be_bytes());
+    for name in [relation.name(), path.name()] {
+        legacy.extend_from_slice(&(name.len() as u16).to_be_bytes());
+        legacy.extend_from_slice(name.as_bytes());
+    }
+    legacy.extend_from_slice(&0u32.to_be_bytes());
+    legacy.extend_from_slice(&[0, 2, 0]);
+    legacy.extend_from_slice(b"invoice");
+    let output = client.action("rtdb.owned.SearchHeld.v4", legacy.into()).await.unwrap();
+    let mut data = StreamReader::try_new(output[0].body.as_ref(), None).unwrap();
+    assert_eq!(data.schema(), schema);
+    assert_eq!(data.next().unwrap().unwrap(), hits);
+    drop(database);
+    drop(client);
     running.stop().await;
 }
 

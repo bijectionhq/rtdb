@@ -37,6 +37,8 @@
 -- A sort can compare supported key types directly at selected Arrow positions.
 -- A sort can compute a supported key expression in its Arrow input batches and keep its payloads columnar through ordering and spill.
 -- A sort can combine several computed Arrow keys with keys taken directly from its input columns.
+-- Public search can supply a verified Arrow score column to the sort and can score borrowed Arrow text when verification supplied no score.
+-- The Arrow versions of the owned search actions admit Arrow IPC requests and encode verified hits as Arrow IPC.
 -- Its spill threshold accounts for Arrow buffers held by selected payloads.
 -- A top-level materialized relation over a scan with compatible fixed-width Arrow fields and simple reference operations writes its batches once as Arrow IPC and opens an independent reader for each reference.
 -- A batch join can gather matching payload positions from selected Arrow vectors.

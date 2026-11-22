@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, atomic::AtomicI64};
 use std::time::{Duration, Instant};
 
-use async_trait::async_trait;
+use arrow_buffer::Buffer;
 use rtdb_format::keys::TableSlug;
 use rtdb_node::{NativeSession, Node};
 use rtdb_search::{SearchFile, SearchRow, build_search_file};
@@ -15,8 +15,6 @@ use rtdb_text::{Corpus, Query, tokens};
 use rtdb_tx::{Documents, TxOp};
 use rtdb_types::{EntityId, EventOp, Interval, StructFields, TableRef, TemporalBounds, Timestamp, Value};
 use serde_json::{Value as Json, json};
-use tantivy::HasLen;
-use tantivy::directory::{FileHandle, OwnedBytes};
 use tokio_util::sync::CancellationToken;
 
 use super::{Identity, TickClock, bench_options, bench_services, body, commit, flush, query, sql, where_ids};
@@ -62,7 +60,7 @@ impl Bundle {
                 blocks: Mutex::default(),
                 reads: Arc::clone(io),
             };
-            Arc::new(SearchFile::open_with_ranges(Arc::new(reader), &columns()).unwrap())
+            Arc::new(SearchFile::open_with_ranges(self.bytes, move |range| reader.read_bytes(range), &columns()).unwrap())
         } else {
             let bytes = fs::read(&self.path).unwrap();
             io.lock().unwrap().record(bytes.len());
@@ -90,18 +88,13 @@ impl Reads {
 struct RangedFile {
     file: File,
     len: usize,
-    blocks: Mutex<BTreeMap<usize, OwnedBytes>>,
+    blocks: Mutex<BTreeMap<usize, Buffer>>,
     reads: Arc<Mutex<Reads>>,
 }
 
-impl HasLen for RangedFile {
-    fn len(&self) -> usize { self.len }
-}
-
-#[async_trait]
-impl FileHandle for RangedFile {
-    fn read_bytes(&self, range: Range<usize>) -> io::Result<OwnedBytes> {
-        if range.is_empty() { return Ok(OwnedBytes::empty()); }
+impl RangedFile {
+    fn read_bytes(&self, range: Range<usize>) -> io::Result<Buffer> {
+        if range.is_empty() { return Ok(Buffer::from(Vec::<u8>::new())); }
         let mut blocks = self.blocks.lock().unwrap();
         let first = range.start / RANGE_BLOCK_BYTES;
         let last = (range.end - 1) / RANGE_BLOCK_BYTES;
@@ -117,14 +110,14 @@ impl FileHandle for RangedFile {
                     file.seek(SeekFrom::Start(start as u64))?;
                     file.read_exact(&mut bytes)?;
                     self.reads.lock().unwrap().record(bytes.len());
-                    entry.insert(OwnedBytes::new(bytes))
+                    entry.insert(Buffer::from(bytes))
                 }
             };
             let part = range.start.max(start) - start..range.end.min(end) - start;
-            if first == last { return Ok(bytes.slice(part)); }
+            if first == last { return Ok(bytes.slice_with_length(part.start, part.len())); }
             result.extend_from_slice(&bytes.as_slice()[part]);
         }
-        Ok(OwnedBytes::new(result))
+        Ok(Buffer::from(result))
     }
 }
 

@@ -1,8 +1,9 @@
 use std::collections::BTreeSet;
 use std::sync::Arc;
 
+use arrow_array::{Array, FixedSizeBinaryArray, Float64Array, builder::FixedSizeBinaryBuilder};
 use async_trait::async_trait;
-use rtdb_columnar::{MemoryBudget, OwnedBatch};
+use rtdb_columnar::{MemoryBudget, MemoryReservation, OwnedBatch};
 use rtdb_index::Snapshot;
 use rtdb_plan::{Expr, Scan, Schema};
 use rtdb_storage::cache::BufferPool;
@@ -34,11 +35,105 @@ pub struct ScanRequest<'a> {
     pub verifier: &'a dyn CandidateVerifier,
 }
 
-/// The rows the scan would return for a set of IIDs, after resolution and the scan's own predicates.
 #[async_trait]
 pub trait CandidateVerifier: Send + Sync {
-    /// Each visible row's IID with its value of `column`.
-    async fn visible(&self, iids: BTreeSet<Iid>, column: rtdb_plan::ColumnId) -> Result<Vec<(Iid, Value)>>;
+    /// Resolves the scan, applies its predicates, and scores each surviving UTF-8 cell.
+    async fn score_visible(&self, iids: BTreeSet<Iid>, column: rtdb_plan::ColumnId, scorer: &rtdb_text::Scorer) -> Result<CandidateScores>;
+}
+
+#[derive(Clone)]
+pub struct CandidateScores {
+    iids: FixedSizeBinaryArray,
+    scores: Float64Array,
+    _reservation: Arc<MemoryReservation>,
+}
+
+impl CandidateScores {
+    pub(crate) fn new(iids: FixedSizeBinaryArray, scores: Float64Array, reservation: Arc<MemoryReservation>) -> Self {
+        debug_assert_eq!(iids.len(), scores.len());
+        Self { iids, scores, _reservation: reservation }
+    }
+
+    pub fn from_verified(mut scores: Vec<(Iid, f64)>, memory: &Arc<MemoryBudget>) -> Result<Option<Self>> {
+        scores.sort_unstable_by_key(|&(iid, _)| iid);
+        if scores.windows(2).any(|pair| pair[0].0 == pair[1].0) { return Ok(None); }
+        let reservation = memory.reserve(256usize.saturating_add(scores.len().saturating_mul(48)))?;
+        let mut iids = FixedSizeBinaryBuilder::with_capacity(scores.len(), 16);
+        for &(iid, _) in &scores {
+            iids.append_value(iid.0).map_err(|error| crate::invalid("verifier-iid", error))?;
+        }
+        let values = Float64Array::from_iter_values(scores.into_iter().map(|(_, score)| score));
+        Ok(Some(Self::new(iids.finish(), values, reservation)))
+    }
+
+    pub(crate) fn score(&self, iid: Iid) -> Option<f64> {
+        let (mut first, mut end) = (0, self.iids.len());
+        while first < end {
+            let middle = first + (end - first) / 2;
+            match self.iids.value(middle).cmp(iid.0.as_slice()) {
+                std::cmp::Ordering::Less => first = middle + 1,
+                std::cmp::Ordering::Greater => end = middle,
+                std::cmp::Ordering::Equal => return Some(self.scores.value(middle)),
+            }
+        }
+        None
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = (Iid, f64)> + '_ {
+        (0..self.iids.len()).map(|row| {
+            (Iid(self.iids.value(row).try_into().expect("fixed width iid")), self.scores.value(row))
+        })
+    }
+}
+
+pub struct ScanSelection {
+    pub iids: CandidateIids,
+    pub scores: Option<CandidateScores>,
+}
+
+#[derive(Clone)]
+pub struct CandidateIids {
+    values: FixedSizeBinaryArray,
+    _reservation: Arc<MemoryReservation>,
+}
+
+impl CandidateIids {
+    pub fn from_set(iids: BTreeSet<Iid>, memory: &Arc<MemoryBudget>) -> Result<Self> {
+        Self::build(iids.len(), iids, memory)
+    }
+
+    fn build(capacity: usize, iids: impl IntoIterator<Item = Iid>, memory: &Arc<MemoryBudget>) -> Result<Self> {
+        let reservation = memory.reserve(256usize.saturating_add(capacity.saturating_mul(16)))?;
+        let mut values = FixedSizeBinaryBuilder::with_capacity(capacity, 16);
+        for iid in iids { values.append_value(iid.0).map_err(|error| crate::invalid("candidate-iid", error))?; }
+        Ok(Self { values: values.finish(), _reservation: reservation })
+    }
+
+    pub fn len(&self) -> usize { self.values.len() }
+    pub fn is_empty(&self) -> bool { self.values.is_empty() }
+    pub fn iter(&self) -> impl Iterator<Item = Iid> + '_ {
+        (0..self.len()).map(|row| Iid(self.values.value(row).try_into().expect("fixed width iid")))
+    }
+
+    fn lower_bound(&self, iid: Iid) -> usize {
+        let (mut first, mut end) = (0, self.len());
+        while first < end {
+            let middle = first + (end - first) / 2;
+            if self.values.value(middle) < iid.0.as_slice() { first = middle + 1; } else { end = middle; }
+        }
+        first
+    }
+
+    pub fn contains(&self, iid: Iid) -> bool { self.intersects(iid, iid) }
+
+    pub(crate) fn intersects(&self, lower: Iid, upper: Iid) -> bool {
+        let row = self.lower_bound(lower);
+        row < self.len() && self.values.value(row) <= upper.0.as_slice()
+    }
+
+    pub(crate) fn retain(self, mut keep: impl FnMut(Iid) -> bool, memory: &Arc<MemoryBudget>) -> Result<Self> {
+        Self::build(self.len(), self.iter().filter(|&iid| keep(iid)), memory)
+    }
 }
 
 /// Exact ordered output for a point scan in its requested order.
@@ -65,6 +160,12 @@ pub trait OrderedBatches: Send {
 #[async_trait]
 pub trait ScanAccelerator: Send + Sync {
     async fn candidate_iids(&self, request: &ScanRequest<'_>) -> Result<Option<BTreeSet<Iid>>>;
+    /// Optionally supplies the scores of a ranked point scan alongside its candidate scope.
+    async fn select_candidates(&self, request: &ScanRequest<'_>) -> Result<Option<ScanSelection>> {
+        self.candidate_iids(request).await?.map(|iids| {
+            Ok(ScanSelection { iids: CandidateIids::from_set(iids, request.memory)?, scores: None })
+        }).transpose()
+    }
     /// The first matching rows of a point read, in the requested SQL order.
     /// A covered result applies the window and projects the requested scan positions.
     /// A payload seek leaves windowing to the scan after any table predicates are checked.

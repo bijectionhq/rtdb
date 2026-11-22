@@ -56,13 +56,19 @@ Trie GC deletes artefacts whatever the setting, so turning search off leaves not
   If the shared file needs repair after a member's data file has been collected, the lane publishes an individual file for each surviving trie.
 * *A search file only nominates candidates, and answers MATCH exactly.*
   The scan resolves each candidate's full history and `PageFilter` re-checks the predicate on the resolved row.
-  A `MATCH` with a constant query in a scan predicate becomes a column the scan evaluates: from the search file of the row's data file, null included, and from the row's value where there is none.
+  A `MATCH` with a constant query in a scan predicate becomes a nullable Arrow Boolean column.
+  The scan takes answers from the file and borrows the resolved text on a fallback.
+  At a point cut the ranked scan can also supply its verified scores to the final SQL sort.
 * *A missing search file is never an error.*
   The accelerator treats it as absent and builds the trie's search file itself from the immutable data file, which is what makes deleting one always safe.
-* *Tokens are ours, postings are tantivy's.*
-  `rtdb-text` analyses text (Unicode word split, lowercasing); the search file feeds tantivy pre-tokenized strings, so the residual check and the index agree token for token.
+* *Arrow search files.*
+  The manifest records events, text runs, temporal rectangles, row positions and a term directory.
+  Separate Arrow batches store sorted posting document IDs, positions and window bounds.
+  The directory lets a reader load the posting batches for the requested terms.
+  `rtdb-text` analyzes the same UTF-8 cells for the writer and the scan.
 * *Byte-deterministic search files.*
-  Segment ids derive from the artefact owner and definition, the writer is single-threaded with no merges, and the bundle orders its files by name.
+  The manifest binds the owner and definition version.
+  The writer orders terms by column and token and records a checksum for every IPC record batch.
   Two builders of one job write identical bytes to one key.
 * *Definitions are documents.*
   `xt.search_indexes` is written by the indexer, so the definitions in force are a function of log position and readable as of any basis.

@@ -17,9 +17,11 @@ The node configuration's `search: {enabled, threads}` switches the lane and the 
 == Pieces
 
 `file`::
-A search file holds one Tantivy segment for a trie or an eligible partition group.
-Each document covers an entity's text run in one column and records its bitemporal visibility.
-The sidecar maps documents and row positions to the group's members.
+A search file is an Arrow IPC file for a trie or an eligible partition group.
+Its manifest maps events, text runs and data pages to the group's members and records each run's bitemporal visibility.
+The term directory locates the Arrow posting batches.
+The artefact format version identifies the Arrow layout.
+The maintenance lane rebuilds older versions from primary data, and held owned search requires coverage in the new format.
 
 `definitions`::
 Reads the definitions in force from `xt.search_indexes` at a snapshot.
@@ -29,7 +31,9 @@ The `search` artefact kind: a builder per database that the core artefact lane d
 
 `accelerate`::
 The scan accelerator narrows candidate IIDs, accounts for events in other sources and supplies indexed `MATCH` answers.
-The query's `SEARCH_SCORE` corpus comes from the rows visible at its snapshot.
+The two-argument SQL score uses unit weights.
+The five-argument form uses the corpus supplied by the caller.
+Held owned ranking uses the exact covered corpus at its retained snapshot.
 
 == Ownership
 

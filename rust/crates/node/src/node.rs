@@ -1234,8 +1234,18 @@ impl OwnedReadSession {
         &self, partitions: &[(rtdb_types::OwnedRelation, rtdb_types::OwnedRelation)], query: &str,
         offset: usize, limit: usize, observe: bool,
     ) -> Result<(rtdb_search::OwnedSearchPage, Vec<OwnedRangeWitness>)> {
+        let (batch, witnesses) = self.ranked_search_batch(partitions, query, offset, limit, observe).await?;
+        Ok((batch.into_page()?, witnesses))
+    }
+
+    /// Ranks a covered search path and returns the verified hit columns at the held basis.
+    #[cfg(feature = "search")]
+    pub async fn ranked_search_batch(
+        &self, partitions: &[(rtdb_types::OwnedRelation, rtdb_types::OwnedRelation)], query: &str,
+        offset: usize, limit: usize, observe: bool,
+    ) -> Result<(rtdb_search::OwnedSearchBatch, Vec<OwnedRangeWitness>)> {
         self.admit_read().await?;
-        let work = rtdb_search::owned_ranked(self.guard_context(Arc::clone(&self.context), partitions.iter().map(|(relation, _)| relation))?, &self.owner, partitions, query, offset, limit);
+        let work = rtdb_search::owned_ranked_batch(self.guard_context(Arc::clone(&self.context), partitions.iter().map(|(relation, _)| relation))?, &self.owner, partitions, query, offset, limit);
         let hits = rtdb_storage::IoRegion::leased(self.context.catalog.read_lease(), work).await?;
         let mut witnesses = Vec::with_capacity(partitions.len());
         if observe {

@@ -2,7 +2,7 @@
 use std::cmp::Ordering;
 
 use arrow_array::{
-    Array, Int8Array, Int16Array, Int32Array, Int64Array, StringArray, TimestampMicrosecondArray,
+    Array, Float64Array, Int8Array, Int16Array, Int32Array, Int64Array, StringArray, TimestampMicrosecondArray,
 };
 use arrow_schema::{DataType, Field, TimeUnit as ArrowTime};
 use rtdb_plan::{Schema, SortExpr};
@@ -14,6 +14,7 @@ use crate::columnar::{Column, ColumnBatch};
 enum Kind {
     Integer,
     Text,
+    Float,
     UtcMicros,
 }
 
@@ -27,6 +28,7 @@ impl Kind {
                     ScalarType::I8 | ScalarType::I16 | ScalarType::I32 | ScalarType::I64,
                 ) => Self::Integer,
                 LogicalType::Scalar(ScalarType::Utf8) => Self::Text,
+                LogicalType::Scalar(ScalarType::F64) => Self::Float,
                 LogicalType::Scalar(ScalarType::Timestamp {
                     unit: TimeUnit::Microsecond,
                     timezone: Some(zone),
@@ -71,7 +73,7 @@ impl Kind {
                 Self::Integer,
                 DataType::Int8 | DataType::Int16 | DataType::Int32 | DataType::Int64,
             )
-            | (Self::Text, DataType::Utf8) => true,
+            | (Self::Text, DataType::Utf8) | (Self::Float, DataType::Float64) => true,
             (Self::UtcMicros, DataType::Timestamp(ArrowTime::Microsecond, Some(zone))) => {
                 zone.as_ref() == "UTC"
             }
@@ -87,6 +89,7 @@ impl Kind {
             (Self::Integer, Value::I32(value)) => Key::Number(i64::from(*value)),
             (Self::Integer, Value::I64(value)) => Key::Number(*value),
             (Self::Text, Value::Utf8(value)) => Key::Text(value.as_bytes()),
+            (Self::Float, Value::F64(value)) => Key::Float(*value),
             (
                 Self::UtcMicros,
                 Value::Timestamp {
@@ -128,6 +131,7 @@ impl Kind {
             DataType::Int32 => Key::Number(i64::from(cell!(Int32Array))),
             DataType::Int64 => Key::Number(cell!(Int64Array)),
             DataType::Utf8 => Key::Text(cell!(StringArray).as_bytes()),
+            DataType::Float64 => Key::Float(cell!(Float64Array)),
             DataType::Timestamp(..) => Key::Number(cell!(TimestampMicrosecondArray)),
             _ => unreachable!("only admitted sort keys are read"),
         }
@@ -137,6 +141,7 @@ impl Kind {
 enum Key<'a> {
     Null,
     Number(i64),
+    Float(f64),
     Text(&'a [u8]),
 }
 
@@ -159,6 +164,10 @@ impl Key<'_> {
                 };
             }
             (Self::Number(left), Self::Number(right)) => left.cmp(&right),
+            (Self::Float(left), Self::Float(right)) => match (left.is_nan(), right.is_nan()) {
+                (false, false) => left.total_cmp(&right),
+                (left, right) => left.cmp(&right),
+            },
             (Self::Text(left), Self::Text(right)) => left.cmp(right),
             _ => unreachable!("sort key columns have one admitted kind"),
         };

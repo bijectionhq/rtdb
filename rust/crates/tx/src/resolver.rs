@@ -12,7 +12,7 @@ use rtdb_format::transit::{self, TransitValue as T};
 use rtdb_index::{Snapshot, StagedWrite, TransactionBuffer};
 use rtdb_query::{CatalogSnapshot, DatabaseSnapshot, PreparedQuery, QueryContext, QueryCursor, QueryOptions};
 use rtdb_storage::cache::BufferPool;
-use rtdb_types::{Anomaly, AnomalyCategory, EventHeader, EventOp, Iid, Interval, LogicalType, PLACED_ATTEMPT_OUTCOME_TABLE, PlacedAttempt, Result, ScalarType, SourcePosition, TableRef, TimeUnit, Timestamp, TransactionKey, TxId, Value};
+use rtdb_types::{Anomaly, AnomalyCategory, EntityId, EventHeader, EventOp, Iid, Interval, LogicalType, PLACED_ATTEMPT_OUTCOME_TABLE, PlacedAttempt, Result, ScalarType, SourcePosition, TableRef, TimeUnit, Timestamp, TransactionKey, TxId, Value};
 use tokio_util::sync::CancellationToken;
 
 use crate::replay_submission::{ReplaySubmission, duplicate_replay, is_replay_table, replay_table};
@@ -544,12 +544,8 @@ impl<'a> OpenTransaction<'a> {
                 if TableRef::owned_schema(&table.table.schema) { check_table(&table.table)?; }
                 check_search_index_name(&name)?;
                 if if_not_exists && self.index_exists("search_indexes", &name).await? { return Ok(()); }
-                let document = rtdb_types::StructFields::from([
-                    ("_id".into(), Value::Utf8(name)), ("schema_name".into(), Value::Utf8(table.table.schema.clone())), ("table_name".into(), Value::Utf8(table.table.table.clone())),
-                    ("columns".into(), Value::List(columns.into_iter().map(Value::Utf8).collect())), ("analyzer".into(), Value::Utf8(rtdb_text::SIMPLE_ANALYZER.into())),
-                    ("version".into(), Value::I64(self.tx_key().tx_id.0)), ("history".into(), Value::Bool(history)),
-                ]);
-                return self.buffer.put(TableRef::new("xt", "search_indexes"), document, interval(self.tx_key().system_time, Timestamp::MAX)?);
+                let valid = interval(self.tx_key().system_time, Timestamp::MAX)?;
+                return self.put_search_definition(&TableRef::new("xt", "search_indexes"), &name, &table.table, &columns, Some(history), valid);
             }
             Mutation::DropSearchIndex { name } => {
                 check_search_index_name(&name)?;
@@ -840,6 +836,9 @@ impl<'a> OpenTransaction<'a> {
                 if found { return Ok(()); }
             }
         }
+        if search {
+            return self.put_search_definition(&catalog, name.name(), &target, columns, None, Interval::ALL);
+        }
         let document = StructFields::from([
             ("_id".into(), Value::Utf8(name.name().into())),
             ("schema_name".into(), Value::Utf8(target.schema)),
@@ -848,6 +847,44 @@ impl<'a> OpenTransaction<'a> {
             ("version".into(), Value::I64(self.tx_key().tx_id.0)),
         ]);
         self.buffer.put(catalog, document, Interval::ALL)
+    }
+
+    fn put_search_definition(
+        &mut self, catalog: &TableRef, name: &str, target: &TableRef, columns: &[String],
+        history: Option<bool>, valid_time: Interval,
+    ) -> Result<()> {
+        use arrow_array::{ArrayRef, BooleanArray, Int64Array, StringArray, StructArray, builder::{ListBuilder, StringBuilder}};
+        let memory = &self.context.memory;
+        let bound = columns.iter().try_fold(4096usize, |bytes, name| {
+            bytes.checked_add(name.len().saturating_mul(4).saturating_add(32)).ok_or_else(overflow)
+        })?.saturating_add((name.len() + target.schema.len() + target.table.len()).saturating_mul(4));
+        let _scratch = memory.reserve(bound)?;
+        let ty = LogicalType::list(LogicalType::Scalar(ScalarType::Utf8));
+        let fields = rtdb_columnar::to_field("columns", &ty)?;
+        let DataType::List(child) = fields.data_type() else { unreachable!() };
+        let mut list = ListBuilder::new(StringBuilder::new()).with_field(Arc::clone(child));
+        for column in columns { list.values().append_value(column); }
+        list.append(true);
+        let text = |value: &str| Arc::new(StringArray::from(vec![value])) as ArrayRef;
+        let mut definition = vec![
+            ("_id", text(name)),
+            ("schema_name", text(&target.schema)),
+            ("table_name", text(&target.table)),
+            ("columns", Arc::new(list.finish()) as ArrayRef),
+            ("version", Arc::new(Int64Array::from(vec![self.tx_key().tx_id.0])) as ArrayRef),
+        ];
+        if let Some(history) = history {
+            definition.push(("analyzer", text(rtdb_text::SIMPLE_ANALYZER)));
+            definition.push(("history", Arc::new(BooleanArray::from(vec![history])) as ArrayRef));
+        }
+        let (fields, arrays): (Vec<_>, Vec<_>) = definition.into_iter().map(|(name, array)| {
+            (arrow_schema::Field::new(name, array.data_type().clone(), false), array)
+        }).unzip();
+        let definition = StructArray::try_new(fields.into(), arrays, None)
+            .map_err(|error| Anomaly::fault("rtdb.tx/search-definition", error.to_string()))?;
+        let header = EventHeader { iid: EntityId::string_iid(name), system_from: self.tx_key().system_time, valid_time, op: EventOp::Put };
+        let batch = rtdb_format::data::owned_put_batch(Arc::new(definition), &[header], None, memory)?;
+        self.buffer.append_batch(catalog, batch)
     }
 
     async fn check_owned_preconditions(&mut self, operations: &[Operation], source_scope: Option<rtdb_types::PlacedAttemptScope>) -> Result<()> {

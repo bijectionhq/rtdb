@@ -4,7 +4,7 @@
 -- Full-text search over a table's documents, answered at any valid time and system time.
 --
 -- The unit indexed is the text run: every version of one entity in a trie data file whose indexed values are the same, with the rectangles of valid time × system time where one of them is visible, as the scan's own resolver decides them over the file.
--- A trie may carry one search file per index definition over its own data file's runs.
+-- A trie may carry one Arrow IPC search file per index definition over its own data file's runs.
 -- The members of a partition group (trie-cat.allium: PartGroup) may share one search file over their runs, deleted with the last member.
 -- A search file only nominates candidates.
 -- Which version of an entity is visible at the query's valid and system time is decided by the scan's bitemporal resolution, as it is for every other predicate, and MATCH is re-checked on the resolved row.
@@ -16,6 +16,7 @@
 -- Owned corpus statistics require published files covering all sources of the held cut.
 -- Owned runs carry their full typed identity. Ranked candidates verify that identity, their winning revision, and the declared text at the held cut.
 -- Owned ranking uses only the held corpus and breaks score ties by the complete typed identity.
+-- Held ranking publishes Arrow columns for complete identities, scores and partition ordinals.
 -- Row count, token count, and term frequencies use only runs whose temporal visibility is exact at that cut.
 -- Public SQL search definitions remain scoped to the public catalog.
 --
@@ -150,7 +151,9 @@ rule SearchJobRuns {
     -- The lane downloads the owner's data files, in bucket order for a group.
     -- Both paths read one page at a time under that page's memory reservation.
     -- They read event headers and borrow compatible indexed text cells from the page's Arrow vectors for tokenization.
-    -- Both reserve the segment's indexing heap up front in proportion to the input size, build the segment on disk, and stream the bundle to the object store.
+    -- An owned definition also borrows the selected typed identity cell.
+    -- Both reserve indexing buffers in proportion to the input size.
+    -- They write the manifest and posting batches as an Arrow IPC file and upload it under the job's immutable key.
     -- A job the memory budget cannot admit fails, and is eligible again at the next block.
     when: job: SearchJob.created
 
@@ -216,9 +219,12 @@ rule RepairUnreadableSearchFile {
 --      A data file never changes, so a kept one serves every later query of the trie.
 --      Queries that need the same file at once share one build; one that fails or is cancelled leaves the next to build it.
 --   4. Every live segment contributes the IIDs of its matching rows under the same rule, with recency ∞.
---      A node keeps postings per live segment and column, extending them by the batches appended since, so a growing live index is tokenised once.
+--      A node keeps Arrow posting batches per live segment and column, extending them by the batches appended since.
+--      The same Arrow token cells serve phrase checks and ranking while the segment remains cached.
+--      The primary live trie supplies the event headers used for temporal cuts.
 --      A document is cut by the events of its entity in the partition's other selected tries and live segments, as CutByLaterEvents says, and contributes only if a rectangle it keeps meets the bounds.
 --   5. The scan runs restricted to the union, resolving each candidate's full history in every selected trie and live segment.
+--      The primary scan prunes and tests candidates against a sorted Arrow IID column.
 --   6. MATCH is evaluated on each resolved row, as MatchEvaluatedByTheScan says.
 --
 -- Past max_candidates candidates, the scan runs unnarrowed instead.
@@ -238,10 +244,13 @@ rule RepairUnreadableSearchFile {
 --   2. IIDs in the scan's selected IID scope are taken best bound first, in batches.
 --      A document left exactly visible by CutByLaterEvents counts as verified when the scan's only predicate is the MATCH used to narrow candidates.
 --      The rest, live rows, documents a tie left inexact, and every IID where the scan has other predicates, are verified by running the scan itself over the partition restricted to them, with its own predicates.
+--      The verifier scores the selected Arrow text cells and returns Arrow IID and score columns.
 --   3. Verification can stop early only when n verified rows score strictly above both sources: already-scored candidates and unread windows.
 --      Either source can be empty. Equal bounds, including the two signed zeroes, keep verification going.
 --      An invalid score or bound supplied to this decision also keeps verification going.
 --   4. The scan is restricted to the IIDs of verified rows scoring at least the n-th, ties included, and the sort above keeps the first n as it would have.
+--      At a point cut, a verified score for a single visible row of an IID supplies that row's SQL sort key.
+--      An unverified score and the scores of a range scan are evaluated on the resolved Arrow text cells.
 --
 -- The visible row of an IID is one of its matching events, so its bound is never below its score, and no IID left out can hold one of the first n rows.
 -- An IID's history lies in one partition, so the first n rows overall are among the first n of some partition, and the sort above picks them from the union.
@@ -274,11 +283,11 @@ rule MatchIsAResidualPredicate {
 }
 
 rule MatchEvaluatedByTheScan {
-    -- A MATCH with a constant query in a predicate the scan filters by, under NOT and IS NULL as much as bare, is a boolean column the scan evaluates on each resolved row.
+    -- A MATCH with a constant query in a predicate the scan filters by, under NOT and IS NULL as much as bare, is a nullable Arrow Boolean column the scan evaluates on each resolved row.
     -- The text column is then read only for the rows the scan cannot answer otherwise, and projected only if something else needs it.
     -- A row of a trie takes MATCH from its search file for a definition covering the column: true where the document matches, null where the column is null or absent, and false otherwise.
     -- A row in a trie with no readable recorded file takes it from the file the node builds, and a row in a live segment, or in a trie the node does not build, from its own value.
-    -- NOT MATCH, which no candidate set narrows, and count(*) over MATCH thus tokenise no text but the live index's.
+    -- A row answered by the search file does not require reading its stored text for the predicate.
     when: ScanWithMatch(scan, predicate)
 
     ensures:
@@ -291,11 +300,17 @@ rule MatchEvaluatedByTheScan {
 
 contract SearchFileLayout {
     -- What a search file holds.
-    -- See: search/src/file.rs
+    -- See: search/src/file.rs and search/src/file/layout.rs
 
     @invariant PureFunctionOfFileAndDefinition
         -- A search file's bytes are a deterministic function of the owner's data files, its definition and the job's identity.
         -- Every node that runs the same job writes the same object.
+
+    @invariant ArrowSearchBatches
+        -- The first batch is the manifest, with typed tables for events, runs, row-to-run positions, member and page bounds, lifespan sections and the term directory.
+        -- Other batches store Arrow document IDs, token positions and ranking-window bounds, located by the term directory.
+        -- A batch checksum in the IPC footer binds each directory entry to immutable bytes.
+        -- A reader validates the manifest and every posting batch it opens.
 
     @invariant OneDocPerRun
         -- A search file has one document per text run of each column in each member's data file, so a version changing one column adds no posting to another.
@@ -314,7 +329,7 @@ contract SearchFileLayout {
     @invariant LifespanSections
         -- A document's lifespan runs from its birth, the earliest of its rectangles' later lower bound, to its death, the latest of their earlier upper bound, clipped to its trie's recency: no row of a historical trie is visible from its recency on, whatever its own file's events say.
         -- Documents fall into classes by lifespan: under one, four, sixteen, sixty-four and two hundred and fifty-six weeks, and longer.
-        -- Each class's section bounds its documents' rectangles, births and deaths, and the file records it in its sidecar and in its artefact record's stats.
+        -- Each class's section bounds its documents' rectangles, births and deaths, and the file records it in its manifest and as an Arrow stream in its artefact record's stats.
         -- A shared file's lifespan sections bound its full partition group, whose members share one recency.
         -- A document is visible at a point only where its birth is before the point's later coordinate and its death after the earlier, so a section whose bounds miss a query's holds nothing visible to it.
         -- A query at a past valid time but the present system time prunes little this way: only the bounds on each axis apply.
@@ -384,7 +399,7 @@ surface FullTextSearch {
 -- Black box helpers used in rule expressions:
 --   search_entries(job)                — the file's record on its trie or on every member of its group
 --   search_candidates(scan, predicate)  — steps 1–4 of the query plan
---   BuildAndUploadSearchFile(job)       — tokenise the data file's rows and upload the bundled index under the owner's artefact key
+--   BuildAndUploadSearchFile(job)       — tokenise the data file's rows and upload their Arrow search file under the owner's artefact key
 --   EachCandidateCutByItsEntitysLaterEvents(scan) — CutByLaterEvents' subtraction, before narrowing and ranking
 --   EachResolvedRowMatchedFromItsSearchFileOrValue(scan, predicate) — MatchEvaluatedByTheScan's evaluation, in the scan, before its filter
 --   retired_records(table)               — the records RetireSearchFiles retires (maintenance/src/artefact.rs: retired_artefacts)

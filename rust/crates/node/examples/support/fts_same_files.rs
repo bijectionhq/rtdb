@@ -49,7 +49,7 @@ impl ConstantEvaluator for LiteralOnly {
 
 #[async_trait]
 impl CandidateVerifier for LiteralOnly {
-    async fn visible(&self, _: BTreeSet<Iid>, _: rtdb_plan::ColumnId) -> Result<Vec<(Iid, Value)>> {
+    async fn score_visible(&self, _: BTreeSet<Iid>, _: rtdb_plan::ColumnId, _: &rtdb_text::Scorer) -> Result<rtdb_query::CandidateScores> {
         panic!("Point ranker must fall back before needing ordinary scan verification")
     }
 

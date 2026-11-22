@@ -5,7 +5,7 @@ use std::sync::{Arc, OnceLock};
 use arrow_array::{Array, RecordBatch, StructArray, UnionArray};
 use rtdb_columnar::{MemoryBudget, MemoryReservation, OwnedBatch, estimate_read_value_bytes, from_field, read_execution_value};
 use rtdb_format::data::{EventBatch, EventRef, StoredEvent, StoredOperation, owned_event_batch};
-use rtdb_trie::{EventRow, IidReader, MemoryHashTrie, TrieConfig};
+use rtdb_trie::{Bucketer, EventRow, IidReader, MemoryHashTrie, TrieConfig, TrieNode};
 use rtdb_types::{Anomaly, BlockIndex, EntityId, EventHeader, EventOp, Iid, Interval, LogicalType, Result, TableRef, Timestamp, TransactionKey, Value};
 
 use crate::{Snapshot, TableMeta, absent_type, declare_column_types, merge_column_types};
@@ -239,6 +239,28 @@ impl LiveTable {
     pub fn row(&self, row: u32) -> Result<RowSource> {
         let (index, offset) = self.locate_row(row)?;
         Ok(RowSource { batch: Arc::clone(&self.chunks[index].1), row: offset as usize })
+    }
+
+    /// Returns the stored headers for an IID in the live snapshot's history order.
+    pub fn iid_headers(&self, iid: Iid) -> Result<impl Iterator<Item = EventHeader>> {
+        let mut node = self.trie.root().as_ref();
+        let leaf = loop {
+            match node {
+                TrieNode::Leaf(leaf) => break Some(leaf),
+                TrieNode::Branch { path, children } => {
+                    let bucket = Bucketer::DEFAULT.bucket(iid, path.len())? as usize;
+                    let Some(child) = &children[bucket] else { break None; };
+                    node = child;
+                }
+            }
+        };
+        let rows = leaf.map(|leaf| self.located_rows(leaf)).transpose()?;
+        let (first, end) = rows.as_ref().map_or((0, 0), |rows| {
+            let first = rows.headers.partition_point(|header| header.iid < iid);
+            let end = first + rows.headers[first..].partition_point(|header| header.iid == iid);
+            (first, end)
+        });
+        Ok((first..end).map(move |row| rows.as_ref().expect("nonempty history has a leaf").headers[row]))
     }
     pub fn append(&self, write: &TableWrite, system_time: Timestamp) -> Result<Self> {
         if self.last_system_time.is_some_and(|previous| previous > system_time) { return Err(invalid("Live table system time moved backwards")); }

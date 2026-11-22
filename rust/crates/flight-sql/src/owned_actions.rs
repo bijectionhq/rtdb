@@ -6,7 +6,7 @@ pub(crate) use unique::READ_HELD_UNIQUE_V1;
 
 use std::{collections::{BTreeMap, BTreeSet}, sync::{Arc, Mutex}, time::Duration};
 
-use arrow_array::{Array, BooleanArray, Float64Array, Int64Array, RecordBatch, StringArray, TimestampMicrosecondArray, UInt64Array};
+use arrow_array::{Array, BooleanArray, FixedSizeBinaryArray, Int64Array, RecordBatch, StringArray, TimestampMicrosecondArray, UInt16Array, UInt32Array, UInt64Array};
 use arrow_flight::Result as ActionResult;
 use arrow_ipc::writer::IpcWriteOptions;
 use arrow_schema::{DataType, Field, Schema};
@@ -17,7 +17,7 @@ use rtdb_format::ipc::{OwnedStream, write_arrow_stream};
 use rtdb_node::{NativeSession, OwnedCountRequest, OwnedRangeRequest, OwnedRangeWitness, OwnedReadSession, OwnedValidHistory, OwnedVersionOrder, OwnedVersionRequest, OwnedWorldPointWitness, TransactionStatus};
 use rtdb_query::QueryCursor;
 use rtdb_tx::{Documents, TxOp};
-use rtdb_types::{EntityId, LogicalType, OwnedRelation, ScalarType, StructFields, TimeUnit, Timestamp, Value};
+use rtdb_types::{EntityId, OwnedRelation, StructFields, TimeUnit, Timestamp, Value};
 use sha2::{Digest, Sha256};
 use tokio::sync::OwnedSemaphorePermit;
 use tonic::Status;
@@ -35,6 +35,7 @@ pub(crate) const DECLARE_OWNED_FIXED_RANGE_V1: &str = "rtdb.owned.DeclareFixedRa
 pub(crate) const DECLARE_OWNED_CAPACITY_V1: &str = "rtdb.owned.DeclareCapacity.v1";
 pub(crate) const DECLARE_OWNED_UNIQUE_PATH_V1: &str = "rtdb.owned.DeclareUniquePath.v1";
 pub(crate) const DECLARE_OWNED_SEARCH_PATH_V1: &str = "rtdb.owned.DeclareSearchPath.v1";
+pub(crate) const DECLARE_OWNED_SEARCH_PATH_V2: &str = "rtdb.owned.DeclareSearchPath.v2";
 pub(crate) const DECLARE_OWNED_RELATION_V1: &str = "rtdb.owned.DeclareRelation.v1";
 pub(crate) const DECLARE_OWNED_PATH_V1: &str = "rtdb.owned.DeclarePath.v1";
 pub(crate) const CREATE_OWNED_V1: &str = "rtdb.owned.Create.v1";
@@ -180,7 +181,9 @@ pub(crate) const COMMIT_WORLD_V3: &str = "rtdb.owned.CommitWorld.v3";
 pub(crate) const COMMIT_WORLD_V2: &str = "rtdb.owned.CommitWorld.v2";
 const MAX_WORLD_WITNESSES: usize = 128;
 const WORLD_POINT_WITNESS: &str = "rtdb.owned.world_point_witness";
+pub(crate) const SEARCH_HELD_OWNED_V3: &str = "rtdb.owned.SearchHeld.v3";
 pub(crate) const SEARCH_HELD_OWNED_V4: &str = "rtdb.owned.SearchHeld.v4";
+pub(crate) const SEARCH_HELD_OWNED_V5: &str = "rtdb.owned.SearchHeld.v5";
 pub(crate) const HELD_OWNED_RANGE_V1: &str = "rtdb.owned.ReadHeldRange.v1";
 #[derive(Clone, Copy)]
 pub(crate) enum HeldRangeFormat { Leading, Full, FixedValid, Historical }
@@ -203,6 +206,29 @@ const MAX_HISTORY_SLICES: usize = 4096;
 const OWNED_VERSION_REVISION: &str = "rtdb.owned.version_revision";
 const OWNED_SEARCH_TOTAL: &str = "rtdb.owned.search_total";
 const OWNED_SEARCH_SCOPE: &str = "rtdb.owned.search_scope";
+
+struct HeldSearch<'a> {
+    partitions: &'a [(OwnedRelation, OwnedRelation)],
+    query: &'a str,
+    offset: usize,
+    limit: usize,
+    observe: bool,
+    scope: Option<String>,
+}
+
+fn held_search_scope(frame: impl IntoIterator<Item = impl AsRef<[u8]>>, query: &str) -> String {
+    let mut digest = Sha256::new();
+    digest.update(b"rtdb.owned.search.held.v4\0");
+    for bytes in frame { digest.update(bytes); }
+    digest.update(query.as_bytes());
+    let digest: [u8; 32] = digest.finalize().into();
+    let mut scope = String::with_capacity(64);
+    for bytes in digest.chunks_exact(16) {
+        let chunk = Uuid::from_bytes(bytes.try_into().expect("16-byte SHA-256 chunk"));
+        scope.push_str(&chunk.simple().to_string());
+    }
+    scope
+}
 const OWNED_SEARCH_WITNESSES: &str = "rtdb.owned.search_witnesses";
 const OWNED_VERSION_TIME: &str = "rtdb.owned.version_micros";
 const OWNED_REVISION: &str = "rtdb.owned.revision_micros";
@@ -380,6 +406,22 @@ fn decode_batch(call: &Call, arrow: &[u8]) -> Result<OwnedBatch, Status> {
     Ok(stream.pop().expect("validated one batch"))
 }
 
+fn search_array<'a, T: Array + 'static>(batch: &'a RecordBatch, name: &str) -> Result<&'a T, Status> {
+    batch.column_by_name(name).and_then(|column| column.as_any().downcast_ref::<T>())
+        .ok_or_else(|| invalid(format!("Owned search field {name} has an invalid Arrow type")))
+}
+
+fn owned_text<'a>(batch: &'a RecordBatch, name: &str, row: usize) -> Result<&'a str, Status> {
+    let (index, field) = batch.schema_ref().column_with_name(name)
+        .ok_or_else(|| invalid(format!("Owned search omitted {name}")))?;
+    let values = batch.column(index).as_ref();
+    let logical = rtdb_columnar::from_field(field).map_err(status)?;
+    match rtdb_columnar::text_cell(&logical, field, values, row).map_err(status)? {
+        rtdb_columnar::TextCell::Utf8(text) => Ok(text),
+        _ => Err(invalid(format!("Owned search field {name} requires text"))),
+    }
+}
+
 fn request_batch(call: &Call, arrow: &[u8]) -> Result<OwnedBatch, Status> {
     let batch = decode_batch(call, arrow)?;
     if batch.batch().schema_ref().index_of("_id").is_err() {
@@ -473,18 +515,28 @@ impl Service {
         if batch.batch().num_rows() != 1 || batch.batch().num_columns() != 2 {
             return Err(invalid("Owned path declaration requires one row with _id and column"));
         }
-        let (rows, _decoded) = upload::documents(batch.batch(), self)?;
-        let (Some(Value::Utf8(name)), Some(Value::Utf8(column))) = (rows[0].get("_id"), rows[0].get("column")) else {
-            return Err(invalid("Owned path declaration requires a text name and column"));
-        };
-        let name = OwnedRelation::new(name.as_str()).map_err(status)?;
-        let column = column.clone();
+        let name = owned_text(batch.batch(), "_id", 0)?;
+        let name = OwnedRelation::new(name).map_err(status)?;
+        let column = owned_text(batch.batch(), "column", 0)?.to_owned();
         let operation = if unique {
             TxOp::OwnedDeclareUniquePath { relation, name, column }
         } else {
             TxOp::OwnedDeclareSearchPath { relation, name, column }
         };
         self.owned_write_reply(call, vec![operation]).await
+    }
+
+    pub(crate) async fn declare_owned_search_batch_action(&self, call: &Call, body: &[u8]) -> Result<ActionResult, Status> {
+        if !self.0.config.owned_native_actions { return Err(unsupported()); }
+        let batch = decode_batch(call, body)?;
+        let batch = batch.batch();
+        if batch.num_rows() != 1 || batch.num_columns() != 3 {
+            return Err(invalid("Owned search path requires one row with relation, _id and column"));
+        }
+        let relation = OwnedRelation::new(owned_text(batch, "relation", 0)?).map_err(status)?;
+        let name = OwnedRelation::new(owned_text(batch, "_id", 0)?).map_err(status)?;
+        let column = owned_text(batch, "column", 0)?.to_owned();
+        self.owned_write_reply(call, vec![TxOp::OwnedDeclareSearchPath { relation, name, column }]).await
     }
 
     pub(crate) async fn create_owned_action(&self, call: &Call, body: &[u8]) -> Result<ActionResult, Status> {
@@ -1161,7 +1213,7 @@ impl Service {
         Ok(reply)
     }
 
-    pub(crate) async fn search_held_owned_action(&self, call: &Call, body: &[u8]) -> Result<ActionResult, Status> {
+    pub(crate) async fn search_held_owned_action(&self, call: &Call, body: &[u8], paged: bool) -> Result<ActionResult, Status> {
         if !self.0.config.owned_native_actions { return Err(unsupported()); }
         let (handle, request) = body.split_first_chunk::<16>().ok_or_else(|| invalid("Owned held search has no handle"))?;
         let handle = Bytes::copy_from_slice(handle);
@@ -1181,35 +1233,91 @@ impl Service {
             partitions.push((relation, path));
             request = rest;
         }
-        let (settings, query) = request.split_first_chunk::<7>().ok_or_else(|| invalid("Owned held search requires an offset, limit and evidence flag"))?;
-        let offset = u32::from_be_bytes([settings[0], settings[1], settings[2], settings[3]]) as usize;
-        let limit = usize::from(u16::from_be_bytes([settings[4], settings[5]]));
-        let observe = match settings[6] {
+        let (offset, settings) = if paged {
+            let (offset, rest) = request.split_first_chunk::<4>().ok_or_else(|| invalid("Owned held search requires an offset"))?;
+            (u32::from_be_bytes(*offset) as usize, rest)
+        } else { (0, request) };
+        let (settings, query) = settings.split_first_chunk::<3>().ok_or_else(|| invalid("Owned held search requires a limit and evidence flag"))?;
+        let limit = usize::from(u16::from_be_bytes([settings[0], settings[1]]));
+        let observe = match settings[2] {
             0 => false,
             1 => true,
             _ => return Err(invalid("Invalid owned held search evidence flag")),
         };
         if query.len() > 4096 { return Err(invalid("Owned held search query exceeds its size bound")); }
         let query = std::str::from_utf8(query).map_err(arrow)?;
-        let (page, witnesses) = held.snapshot.ranked_search_page(&partitions, query, offset, limit, observe).await.map_err(status)?;
-        let hits = page.hits;
-        let id_type = LogicalType::from_legs([ScalarType::Utf8, ScalarType::Keyword, ScalarType::I64, ScalarType::Uuid].map(LogicalType::Scalar));
-        let mut digest = Sha256::new();
-        digest.update(b"rtdb.owned.search.held.v4\0");
-        // The handle binds the authenticated owner and cut. Keep the exact
-        // ordered partition/path frame and query, omitting delivery settings.
-        digest.update(&body[..body.len() - request.len()]);
-        digest.update(query.as_bytes());
-        let digest: [u8; 32] = digest.finalize().into();
-        let mut scope = String::with_capacity(64);
-        for bytes in digest.chunks_exact(16) {
-            let chunk = Uuid::from_bytes(bytes.try_into().expect("16-byte SHA-256 chunk"));
-            scope.push_str(&chunk.simple().to_string());
+        let scope = paged.then(|| held_search_scope([&body[..body.len() - request.len()]], query));
+        self.search_held_owned_reply(call, &held, HeldSearch { partitions: &partitions, query, offset, limit, observe, scope }).await
+    }
+
+    pub(crate) async fn search_held_owned_batch_action(&self, call: &Call, body: &[u8]) -> Result<ActionResult, Status> {
+        if !self.0.config.owned_native_actions { return Err(unsupported()); }
+        let batch = decode_batch(call, body)?;
+        let batch = batch.batch();
+        if !(1..=32).contains(&batch.num_rows()) || batch.num_columns() != 7 {
+            return Err(invalid("Owned held search requires one row per partition with all seven fields"));
         }
-        let mut metadata = std::collections::HashMap::from([
-            (OWNED_SEARCH_TOTAL.into(), page.total.to_string()),
-            (OWNED_SEARCH_SCOPE.into(), scope),
-        ]);
+        let handles = search_array::<FixedSizeBinaryArray>(batch, "handle")?;
+        let offsets = search_array::<UInt32Array>(batch, "offset")?;
+        let limits = search_array::<UInt16Array>(batch, "limit")?;
+        let evidence = search_array::<BooleanArray>(batch, "evidence")?;
+        if handles.value_length() != 16 || handles.null_count() != 0 || offsets.null_count() != 0
+            || limits.null_count() != 0 || evidence.null_count() != 0 {
+            return Err(invalid("Owned held search has invalid settings"));
+        }
+        let handle = Bytes::copy_from_slice(handles.value(0));
+        let held = self.owned_read(call, &handle)?;
+        if let Err(error) = held.snapshot.check() {
+            if let Lookup::Found(entry) = self.0.owned_reads.take(&handle) { entry.close(); }
+            return Err(status(error));
+        }
+        let queries = search_array::<StringArray>(batch, "query")?;
+        let relations = search_array::<StringArray>(batch, "relation")?;
+        let paths = search_array::<StringArray>(batch, "path")?;
+        if queries.null_count() != 0 || relations.null_count() != 0 || paths.null_count() != 0 {
+            return Err(invalid("Owned held search requires non-null query, relations, and paths"));
+        }
+        let query = queries.value(0);
+        let offset = offsets.value(0);
+        let limit = limits.value(0);
+        let observe = evidence.value(0);
+        if query.len() > 4096 || offset > 4096 || !(1..=128).contains(&limit) { return Err(invalid("Owned held search exceeds its query or result bound")); }
+        let _partitions = call.reserve(batch.num_rows() * 512)?;
+        let mut partitions = Vec::with_capacity(batch.num_rows());
+        let mut frame = Vec::with_capacity(18 + batch.num_rows() * 196);
+        frame.extend_from_slice(&handle);
+        frame.extend_from_slice(&(batch.num_rows() as u16).to_be_bytes());
+        for row in 0..batch.num_rows() {
+            if handles.value(row) != handle.as_ref() || offsets.value(row) != offset || limits.value(row) != limit
+                || evidence.value(row) != observe || queries.value(row) != query
+            {
+                return Err(invalid("Owned held search settings must agree across its partitions"));
+            }
+            let relation = OwnedRelation::new(relations.value(row)).map_err(status)?;
+            let path = OwnedRelation::new(paths.value(row)).map_err(status)?;
+            for name in [relation.name(), path.name()] {
+                frame.extend_from_slice(&(name.len() as u16).to_be_bytes());
+                frame.extend_from_slice(name.as_bytes());
+            }
+            partitions.push((relation, path));
+        }
+        let scope = Some(held_search_scope([frame], query));
+        self.search_held_owned_reply(call, &held, HeldSearch {
+            partitions: &partitions, query, offset: offset as usize, limit: usize::from(limit), observe, scope,
+        }).await
+    }
+
+    async fn search_held_owned_reply(
+        &self, call: &Call, held: &OwnedReadResource, request: HeldSearch<'_>,
+    ) -> Result<ActionResult, Status> {
+        let HeldSearch { partitions, query, offset, limit, observe, scope } = request;
+        let (page, witnesses) = held.snapshot.ranked_search_batch(partitions, query, offset, limit, observe).await.map_err(status)?;
+        let hits = page.hits;
+        let mut metadata = std::collections::HashMap::new();
+        if let Some(scope) = scope {
+            metadata.insert(OWNED_SEARCH_TOTAL.into(), page.total.to_string());
+            metadata.insert(OWNED_SEARCH_SCOPE.into(), scope);
+        }
         if !witnesses.is_empty() {
             if witnesses.len() != partitions.len() { return Err(Status::internal("Incomplete owned search evidence")); }
             let mut nonces = String::with_capacity(32 * witnesses.len());
@@ -1219,29 +1327,10 @@ impl Service {
             }
             metadata.insert(OWNED_SEARCH_WITNESSES.into(), nonces);
         }
-        let schema = Arc::new(Schema::new_with_metadata(vec![
-            rtdb_columnar::to_field("_id", &id_type).map_err(status)?,
-            Field::new("score", DataType::Float64, false),
-            Field::new("partition", DataType::UInt64, false),
-        ], metadata));
-        let mut charge = call.reserve(4096)?;
-        let output = if hits.is_empty() {
-            None
-        } else {
-            let mut ids = Vec::with_capacity(hits.len());
-            for hit in &hits {
-                let id = hit.id.as_value();
-                let reservation = Arc::get_mut(&mut charge).expect("search output owns its reservation");
-                reservation.grow_to(wire::add(reservation.bytes(), wire::mul(id.retained_bytes().map_err(status)?, 4)?)?).map_err(status)?;
-                ids.push(id);
-            }
-            let ids = rtdb_columnar::build_array(&id_type, &ids).map_err(status)?;
-            let scores = Arc::new(Float64Array::from_iter_values(hits.iter().map(|hit| hit.score)));
-            let ordinals = Arc::new(UInt64Array::from_iter_values(hits.iter().map(|hit| hit.partition as u64)));
-            Some(RecordBatch::try_new(Arc::clone(&schema), vec![ids, scores, ordinals]).map_err(arrow)?)
-        };
+        let schema = hits.batch().schema().as_ref().clone().with_metadata(metadata);
         let present = held.snapshot.present().system_time;
-        let reply = self.owned_point_reply(&schema, output.as_ref(), present, present, None)?;
+        let output = (hits.batch().num_rows() != 0).then_some(hits.batch());
+        let reply = self.owned_point_reply(&schema, output, present, present, None)?;
         held.snapshot.check_relations(partitions.iter().map(|(relation, _)| relation)).map_err(status)?;
         Ok(reply)
     }

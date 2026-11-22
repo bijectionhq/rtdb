@@ -235,7 +235,7 @@ async fn build_batches_at(
                         continue;
                     }
                     let ty = execution.expression_type(&scope, &key.expr, &schema)?;
-                    if !batch_ordered_type(&ty) { return Ok(None); }
+                    if !batch_ordered_type(&ty) && !crate::columnar::search::score_key(&key.expr) { return Ok(None); }
                     let id = max_id.checked_add(1).or_else(|| (0..u32::MAX).find(|id| !fields.iter().any(|field| field.id.0 == *id)))
                         .ok_or_else(|| invalid("sort-key", "Sort key column ID exceeds its range"))?;
                     max_id = max_id.max(id);
@@ -447,7 +447,7 @@ fn columnar_binding_body(runtime: &Arc<EmittedRelation>, binding: &rtdb_plan::Ma
 fn computed_batch_sort(schema: &Schema, order_by: &[rtdb_plan::SortExpr]) -> bool {
     !order_by.is_empty() && order_by.iter().all(|key| match &key.expr {
         Expr::Column { id, .. } => schema.position(*id).is_some(),
-        expr => crate::columnar::projection::shaped(expr) && batch_ordered_type(&expr.data_type()),
+        expr => crate::columnar::search::score_key(expr) || (crate::columnar::projection::shaped(expr) && batch_ordered_type(&expr.data_type())),
     })
 }
 

@@ -78,8 +78,6 @@ datafusion-functions = { version = "=54.2.0", default-features = false, features
 arrow-ipc = { version = "=58.4.1", features = ["lz4", "zstd"] }
 async-trait = "0.1"
 memmap2 = "=0.9.12"
-tantivy = { version = "=0.27.0", default-features = false, features = ["mmap"] }
-stable_deref_trait = "1.2"
 async-stream = "=0.3.6"
 http = "1"
 base64 = "0.22"
