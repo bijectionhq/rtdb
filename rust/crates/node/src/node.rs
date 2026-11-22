@@ -881,6 +881,7 @@ impl OwnedRangeWitness {
 
 pub struct OwnedChangePage {
     pub groups: Vec<rtdb_types::OwnedChangeGroup>,
+    pub covered_through: Timestamp,
     pub retained_bytes: usize,
     _reservations: Vec<Arc<rtdb_columnar::MemoryReservation>>,
 }
@@ -994,8 +995,8 @@ impl OwnedReadSession {
         })))
     }
 
-    /// Reads whole ordered owner-relation groups from an exclusive dense revision.
-    pub async fn changes(&self, relation: &rtdb_types::OwnedRelation, after: u64, limit: usize) -> Result<OwnedChangePage> {
+    /// Reads whole ordered owner-relation groups after an exclusive system time.
+    pub async fn changes(&self, relation: &rtdb_types::OwnedRelation, after: Timestamp, limit: usize) -> Result<OwnedChangePage> {
         use rtdb_types::{OwnedChange, OwnedChangeGroup, OWNED_CHANGE_GROUP_BYTES, OWNED_CHANGE_PAGE_BYTES,
             OWNED_CHANGE_PAGE_GROUPS, change_feed_uncovered};
 
@@ -1005,47 +1006,78 @@ impl OwnedReadSession {
         self.admit_read().await?;
         let database = self.context.catalog.database(&self.database)?;
         let [snapshot] = database.partitions.as_slice() else { return Err(change_feed_uncovered()); };
+        let present = self.present.system_time;
+        if after > present || snapshot.tx_basis() != Some(self.present) {
+            return Err(change_feed_uncovered());
+        }
         let journal = relation.change_journal(&self.owner)?;
         let frontier = snapshot.relation_event_frontier(&journal)?;
-        if frontier < 2 || snapshot.tx_basis() != Some(self.present) {
-            return Err(change_feed_uncovered());
-        }
-        let through = u64::try_from(frontier - 1).map_err(|_| change_feed_uncovered())?;
-        if after > through { return Err(change_feed_uncovered()); }
-        let (floor, from, _floor_charge) = rtdb_query::read_owned_change_entry(Arc::clone(&self.context), &self.owner, relation, 0).await?;
-        if floor != Value::Null { return Err(change_feed_uncovered()); }
-        let (head, latest, _head_charge) = rtdb_query::read_owned_change_entry(
-            Arc::clone(&self.context), &self.owner, relation, frontier - 1,
-        ).await?;
-        if !matches!(head, Value::List(touches) if !touches.is_empty()) || latest <= from
-            || latest != snapshot.relation_event_frontier(&relation.table(&self.owner))?
-        {
-            return Err(change_feed_uncovered());
-        }
-        let mut previous = if after == 0 { from } else if after == through { latest } else {
-            let (entry, covered, _anchor_charge) = rtdb_query::read_owned_change_entry(
-                Arc::clone(&self.context), &self.owner, relation, i64::try_from(after).map_err(|_| change_feed_uncovered())?,
-            ).await?;
-            if !matches!(entry, Value::List(touches) if !touches.is_empty()) || covered <= from || covered > latest {
-                return Err(change_feed_uncovered());
-            }
-            covered
-        };
-
+        let source_frontier = snapshot.relation_event_frontier(&relation.table(&self.owner))?;
         let mut page = OwnedChangePage {
             groups: Vec::with_capacity(limit),
+            covered_through: present,
             retained_bytes: 0,
             _reservations: vec![self.context.memory.reserve(limit * 256)?],
         };
-        let mut bytes = 0usize;
-        for revision in after + 1..=through.min(after + limit as u64) {
+        if frontier == 0 && source_frontier == 0 {
             self.check()?;
-            let (entry, covered, retained) = rtdb_query::read_owned_change_entry(
-                Arc::clone(&self.context), &self.owner, relation, i64::try_from(revision).map_err(|_| change_feed_uncovered())?,
-            ).await?;
-            let Value::List(touches) = entry else { return Err(change_feed_uncovered()); };
+            return Ok(page);
+        }
+        if frontier < 2 { return Err(change_feed_uncovered()); }
+        let through = frontier - 1;
+        let read = |sequence| rtdb_query::read_owned_change_entry(Arc::clone(&self.context), &self.owner, relation, sequence);
+        let floor = read(0).await?;
+        let head = read(through).await?;
+        if floor.value != Value::Null
+            || (floor.through_events > 0 && after < floor.system_time)
+            || !matches!(&head.value, Value::List(touches) if !touches.is_empty())
+            || head.system_time < floor.system_time || head.system_time > present
+            || head.through_events <= floor.through_events
+            || head.through_events != source_frontier
+        {
+            return Err(change_feed_uncovered());
+        }
+        if after >= head.system_time {
+            self.check()?;
+            return Ok(page);
+        }
+        let latest = head.through_events;
+        let latest_time = head.system_time;
+        drop(head);
+
+        // The engine appends each relation's sequence at a strictly increasing system time.
+        let mut sequence = 0;
+        let mut upper = through - 1;
+        let mut previous = floor.through_events;
+        while sequence < upper {
+            self.check()?;
+            let middle = sequence + (upper - sequence + 1) / 2;
+            let entry = read(middle).await?;
+            if !matches!(entry.value, Value::List(touches) if !touches.is_empty())
+                || entry.system_time < floor.system_time || entry.system_time >= latest_time
+                || entry.through_events <= floor.through_events || entry.through_events >= latest
+            {
+                return Err(change_feed_uncovered());
+            }
+            if entry.system_time <= after {
+                sequence = middle;
+                previous = entry.through_events;
+            } else {
+                upper = middle - 1;
+            }
+        }
+        let mut previous_time = after;
+        let mut bytes = 0usize;
+        for sequence in (sequence + 1..=through).take(limit) {
+            self.check()?;
+            let entry = read(sequence).await?;
+            let Value::List(touches) = entry.value else { return Err(change_feed_uncovered()); };
             let increment = i64::try_from(touches.len()).map_err(|_| change_feed_uncovered())?;
-            if increment == 0 || previous.checked_add(increment) != Some(covered) || covered > latest {
+            if increment == 0 || previous.checked_add(increment) != Some(entry.through_events)
+                || entry.through_events > latest || entry.system_time <= previous_time
+                || entry.system_time < floor.system_time || entry.system_time > latest_time
+                || (sequence == through) != (entry.through_events == latest && entry.system_time == latest_time)
+            {
                 return Err(change_feed_uncovered());
             }
             let group_bytes = touches.iter().try_fold(0usize, |bytes, touch| {
@@ -1055,11 +1087,16 @@ impl OwnedReadSession {
             if group_bytes > OWNED_CHANGE_PAGE_BYTES - bytes { break; }
             let touches = touches.iter().map(OwnedChange::from_value).collect::<Result<Vec<_>>>()?;
             bytes += group_bytes;
-            previous = covered;
-            page.groups.push(OwnedChangeGroup { revision, touches });
-            page._reservations.push(retained);
+            previous = entry.through_events;
+            previous_time = entry.system_time;
+            let revision = u64::try_from(sequence).map_err(|_| change_feed_uncovered())?;
+            page.groups.push(OwnedChangeGroup { revision, system_time: entry.system_time, touches });
+            page._reservations.push(entry.retained);
         }
         self.check()?;
+        if previous != latest {
+            page.covered_through = page.groups.last().ok_or_else(change_feed_uncovered)?.system_time;
+        }
         page.retained_bytes = bytes;
         Ok(page)
     }

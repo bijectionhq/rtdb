@@ -68,7 +68,9 @@
 -- Events in other owner relations leave the witness valid.
 -- An owned root mutation appends its owner relation's next dense change group in the same committed transaction.
 -- The first tracked group shares its transaction with the relation's feed floor.
--- A held feed page reads whole groups through its held cut and refuses a missing floor or requested group.
+-- A held feed page seeks by exclusive system time and returns complete groups in transaction order.
+-- Its coverage ends at the last returned group when truncated or at the reserved present when exhausted.
+-- An empty relation is covered through the reserved present, and a request crossing untracked events or a missing group is refused.
 -- Held reads require the original session and attachment and refuse after expiry, lease loss, or closure.
 -- A held root valid window returns ordered non-overlapping winning slices clipped at the requested endpoints.
 -- An owned path declaration is maintained from the ordered owner's private catalog.

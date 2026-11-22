@@ -79,6 +79,7 @@ impl OwnedChange {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct OwnedChangeGroup {
     pub revision: u64,
+    pub system_time: Timestamp,
     pub touches: Vec<OwnedChange>,
 }
 

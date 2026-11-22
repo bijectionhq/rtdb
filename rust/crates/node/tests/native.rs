@@ -4230,7 +4230,7 @@ async fn ordered_coverage_uses_only_adopted_l0_files() {
 }
 
 #[tokio::test]
-async fn held_owned_changes_preserve_whole_groups_and_dense_relation_cursors() {
+async fn held_owned_changes_preserve_whole_groups_and_cover_the_ordered_cut() {
     use rtdb_types::{EntityId, OwnedChangeKind, OwnedRelation};
 
     let mut settings = options();
@@ -4239,9 +4239,11 @@ async fn held_owned_changes_preserve_whole_groups_and_dense_relation_cursors() {
     let mut writer = node.session("xtdb", Arc::new(Authority)).unwrap();
     let relation = OwnedRelation::new("feed").unwrap();
     let other = OwnedRelation::new("other-feed").unwrap();
-    let uncovered = writer.open_owned_read().await.unwrap();
-    assert_eq!(uncovered.changes(&relation, 0, 1).await.err().unwrap().code, "rtdb.owned/change-feed-uncovered");
-    drop(uncovered);
+    let empty = writer.open_owned_read().await.unwrap();
+    let page = empty.changes(&relation, Timestamp::MIN, 1).await.unwrap();
+    assert!(page.groups.is_empty());
+    assert_eq!(page.covered_through, empty.present().system_time);
+    drop(empty);
 
     let make_insert = |relation: &OwnedRelation, ids: &[i64]| TxOp::OwnedInsertDocs {
         relation: relation.clone(),
@@ -4251,16 +4253,19 @@ async fn held_owned_changes_preserve_whole_groups_and_dense_relation_cursors() {
     let outcome = writer.state_mut().execute_tx(vec![make_insert(&relation, &[1, 2]), make_insert(&other, &[1])],
         AutonomousTxOptions::default()).await.unwrap();
     assert!(outcome.committed());
+    let first_time = outcome.tx_key().system_time;
     let held = writer.open_owned_read().await.unwrap();
-    let first = held.changes(&relation, 0, 1).await.unwrap();
+    let first = held.changes(&relation, Timestamp::MIN, 1).await.unwrap();
     assert_eq!(first.groups.len(), 1);
     assert_eq!(first.groups[0].revision, 1);
+    assert_eq!(first.groups[0].system_time, first_time);
+    assert_eq!(first.covered_through, held.present().system_time);
     assert_eq!(first.groups[0].touches.iter().map(|touch| touch.id.clone()).collect::<Vec<_>>(),
         [EntityId::Integer(1), EntityId::Integer(2)]);
     assert!(first.groups[0].touches.iter().all(|touch| touch.kind == OwnedChangeKind::Put
         && touch.valid == rtdb_types::Interval::from_micros(10, 20).unwrap()));
-    assert!(held.changes(&relation, 1, 1).await.unwrap().groups.is_empty());
-    assert_eq!(held.changes(&other, 0, 1).await.unwrap().groups[0].revision, 1);
+    assert!(held.changes(&relation, first_time, 1).await.unwrap().groups.is_empty());
+    assert_eq!(held.changes(&other, Timestamp::MIN, 1).await.unwrap().groups[0].system_time, first_time);
 
     let delete = TxOp::OwnedDelete {
         relation: relation.clone(), id: EntityId::Integer(1),
@@ -4271,22 +4276,28 @@ async fn held_owned_changes_preserve_whole_groups_and_dense_relation_cursors() {
     }], AutonomousTxOptions::default()).await.unwrap();
     assert!(!refused.committed());
     let after_refusal = writer.open_owned_read().await.unwrap();
-    assert!(after_refusal.changes(&relation, 1, 128).await.unwrap().groups.is_empty());
+    assert!(after_refusal.changes(&relation, first_time, 128).await.unwrap().groups.is_empty());
     drop(after_refusal);
 
-    assert!(writer.state_mut().execute_tx(vec![delete], AutonomousTxOptions::default()).await.unwrap().committed());
-    assert!(held.changes(&relation, 1, 1).await.unwrap().groups.is_empty());
+    let outcome = writer.state_mut().execute_tx(vec![delete], AutonomousTxOptions::default()).await.unwrap();
+    assert!(outcome.committed());
+    let second_time = outcome.tx_key().system_time;
+    assert!(held.changes(&relation, first_time, 1).await.unwrap().groups.is_empty());
     drop(held);
 
     let database = node.catalog().database("xtdb").unwrap();
     index_flush(&node, &database).await;
     let reopened = writer.open_owned_read().await.unwrap();
-    let next = reopened.changes(&relation, 1, 1).await.unwrap();
+    let first = reopened.changes(&relation, Timestamp::MIN, 1).await.unwrap();
+    assert_eq!(first.covered_through, first_time);
+    let next = reopened.changes(&relation, first.covered_through, 1).await.unwrap();
     assert_eq!(next.groups.len(), 1);
     assert_eq!(next.groups[0].revision, 2);
+    assert_eq!(next.groups[0].system_time, second_time);
+    assert_eq!(next.covered_through, reopened.present().system_time);
     assert_eq!(next.groups[0].touches[0].kind, OwnedChangeKind::Delete);
     assert_eq!(next.groups[0].touches[0].valid, rtdb_types::Interval::from_micros(15, 18).unwrap());
-    assert!(reopened.changes(&other, 1, 1).await.unwrap().groups.is_empty());
+    assert!(reopened.changes(&other, first_time, 1).await.unwrap().groups.is_empty());
     drop(reopened);
     drop(writer);
     stop(&node, driver).await;

@@ -1063,11 +1063,11 @@ impl<'a> OpenTransaction<'a> {
                 self.buffer.put(journal.clone(), floor, Interval::ALL)?;
             } else {
                 let context = self.context.query_context(base.clone(), self.tx_key().system_time, &self.options.default_tz, self.trace_parent)?;
-                let (entry, covered, _retained) = rtdb_query::read_owned_change_entry(context, owner, &relation, revision - 1).await
+                let entry = rtdb_query::read_owned_change_entry(context, owner, &relation, revision - 1).await
                     .map_err(|error| if error.code == "rtdb.owned/change-feed-uncovered" {
                         Anomaly::incorrect("rtdb.owned/change-feed-gap", "The owned relation has a change feed coverage gap")
                     } else { error })?;
-                if !matches!(entry, Value::List(touches) if !touches.is_empty()) || covered != previous {
+                if !matches!(entry.value, Value::List(touches) if !touches.is_empty()) || entry.through_events != previous {
                     return Err(Anomaly::incorrect("rtdb.owned/change-feed-gap", "The owned relation has a change feed coverage gap"));
                 }
             }
