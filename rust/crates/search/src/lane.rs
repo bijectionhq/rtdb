@@ -4,11 +4,11 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use parking_lot::Mutex;
 use rtdb_columnar::MemoryBudget;
-use rtdb_format::{data::{EventBatch, StoredOperation}, ipc::ArrowFile, keys::ArtefactOwner, log::proto::ArtefactRecord};
+use rtdb_format::{data::{EncodedEvent, EventBatch, EventRef, PutColumn, PutText}, ipc::ArrowFile, keys::ArtefactOwner, log::proto::ArtefactRecord};
 use rtdb_index::PartitionValue;
 use rtdb_maintenance::{ArtefactBuilder, ArtefactDefinition, ArtefactJob};
 use rtdb_storage::{ObjectKey, ObjectStore, cache::BufferPool};
-use rtdb_types::{Anomaly, Result, Value};
+use rtdb_types::{Anomaly, EventOp, LogicalType, Result};
 use tokio_util::sync::CancellationToken;
 
 use crate::{SearchRow, file::{artefact_identity, write_versioned_group}, definitions::SearchDefinition};
@@ -195,22 +195,29 @@ pub(crate) fn indexing_allowance(trie_size: i64) -> usize { usize::try_from(trie
 
 fn fault(error: impl std::fmt::Display) -> Anomaly { Anomaly::fault("rtdb.search/build", error.to_string()) }
 
-fn search_row(event: &rtdb_format::data::StoredEvent, columns: &[String], owned: bool) -> Result<SearchRow> {
-    let values = columns.iter().map(|column| match &event.operation {
-        StoredOperation::Put(document) => match document.get(column) {
-            None | Some(Value::Null | Value::Undefined) => None,
-            Some(Value::Utf8(text)) => Some(rtdb_text::tokens(text)),
-            Some(_) => Some(Vec::new()),
-        },
-        _ => None,
-    }).collect();
-    let op = match &event.operation { StoredOperation::Put(_) => rtdb_types::EventOp::Put, StoredOperation::Delete => rtdb_types::EventOp::Delete, StoredOperation::Erase => rtdb_types::EventOp::Erase };
-    let identity = match &event.operation {
-        StoredOperation::Put(document) if owned => Some(document.get("_id")
-            .ok_or_else(|| fault("Owned search put is missing its identity"))?.entity_id()?),
-        _ => None,
+fn search_row(event: EventRef<'_>, columns: &[String], owned: bool, memory: &Arc<MemoryBudget>) -> Result<SearchRow> {
+    event.validate_document(memory)?;
+    let values = columns.iter().map(|column| Ok(match event.put_text(column)? {
+        PutText::Missing => None,
+        PutText::Utf8(text) => Some(rtdb_text::tokens(text)),
+        PutText::Other => Some(Vec::new()),
+    })).collect::<Result<_>>()?;
+    let header = event.header();
+    let identity = if owned && header.op == EventOp::Put {
+        let Some(PutColumn::Stored(field, array, row)) = event.put_column("_id") else {
+            return Err(fault("Owned search put is missing its identity"));
+        };
+        let _scratch = memory.reserve(rtdb_columnar::estimate_copy_cell_bytes(field, array, row)?)?;
+        Some(event.put_cell("_id", &LogicalType::Null)?.entity_id()?)
+    } else {
+        None
     };
-    Ok(SearchRow { identity, iid: event.iid.0, system_from: event.system_from.0, valid_from: event.valid_time.lower().0, valid_to: event.valid_time.upper().0, op, values })
+    Ok(SearchRow { identity, iid: header.iid.0, system_from: header.system_from.0, valid_from: header.valid_time.lower().0,
+        valid_to: header.valid_time.upper().0, op: header.op, values })
+}
+
+fn search_batch(batch: &EventBatch, columns: &[String], owned: bool, memory: &Arc<MemoryBudget>) -> Result<Vec<SearchRow>> {
+    (0..batch.len()).map(|row| search_row(batch.borrow_event(row)?, columns, owned, memory)).collect()
 }
 
 /// A data file's pages of rows in order, each read under its memory reservation.
@@ -231,13 +238,19 @@ impl Iterator for PageRows<'_> {
         self.page += 1;
         Some(read_page(&mut self.reader, page, self.memory).and_then(|owned| {
             let batch = EventBatch::new(owned.batch().clone())?;
-            (0..batch.len()).map(|row| search_row(&batch.read_event(row)?, self.columns, self.owned)).collect()
+            search_batch(&batch, self.columns, self.owned, self.memory)
         }))
     }
 }
 
 /// A data file's pages of rows in order, read one at a time, with the tokens of each column's value.
 pub fn search_pages<'a>(data: &[u8], columns: &'a [String], cancellation: &'a CancellationToken) -> Result<impl Iterator<Item = Result<Vec<SearchRow>>> + 'a> {
+    search_pages_with_budget(data, columns, cancellation, MemoryBudget::new(usize::MAX))
+}
+
+pub(crate) fn search_pages_with_budget<'a>(
+    data: &[u8], columns: &'a [String], cancellation: &'a CancellationToken, memory: Arc<MemoryBudget>,
+) -> Result<impl Iterator<Item = Result<Vec<SearchRow>>> + 'a> {
     let mut file = ArrowFile::open(Arc::from(data), None)?;
     let mut page = 0;
     Ok(std::iter::from_fn(move || {
@@ -246,7 +259,72 @@ pub fn search_pages<'a>(data: &[u8], columns: &'a [String], cancellation: &'a Ca
         page += 1;
         Some(file.read_page(page - 1).and_then(|batch| {
             let batch = EventBatch::new(batch)?;
-            (0..batch.len()).map(|row| search_row(&batch.read_event(row)?, columns, false)).collect()
+            search_batch(&batch, columns, false, &memory)
         }))
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rtdb_format::data::{StoredEvent, StoredOperation, build_event_batch};
+    use rtdb_types::{Iid, Interval, RunEndWidth, ScalarType, StructFields, Timestamp, Value};
+
+    #[test]
+    fn arrow_search_rows_keep_token_presence_and_owned_identity() {
+        let integer = LogicalType::Scalar(ScalarType::I64);
+        let text = LogicalType::Scalar(ScalarType::Utf8);
+        let fields = StructFields::from([
+            ("_id".into(), text.clone()),
+            ("body".into(), text.clone().join(&integer).maybe()),
+            ("title".into(), text.maybe()),
+            ("encoded".into(), LogicalType::RunEndEncoded { width: RunEndWidth::I16, value: Box::new(LogicalType::Scalar(ScalarType::Utf8).maybe()) }),
+            ("unindexed".into(), LogicalType::list(integer).maybe()),
+        ]);
+        let events = [
+            StoredOperation::Put(StructFields::from([
+                ("_id".into(), Value::Utf8("a".into())),
+                ("body".into(), Value::Utf8("One TWO".into())),
+                ("title".into(), Value::Utf8("visible title".into())),
+                ("encoded".into(), Value::Utf8("one run".into())),
+                ("unindexed".into(), Value::List(vec![Value::I64(1); 32])),
+            ])),
+            StoredOperation::Put(StructFields::from([
+                ("_id".into(), Value::Utf8("b".into())),
+                ("body".into(), Value::I64(42)),
+                ("title".into(), Value::Null),
+            ])),
+            StoredOperation::Delete,
+            StoredOperation::Erase,
+        ].into_iter().enumerate().map(|(index, operation)| StoredEvent {
+            iid: Iid([index as u8; 16]), system_from: Timestamp(10), valid_time: Interval::ALL, recency: None, operation,
+        }).collect::<Vec<_>>();
+        let batch = EventBatch::new(build_event_batch(&events, Some(fields), None).unwrap()).unwrap();
+        let first = batch.borrow_event(0).unwrap();
+        assert!(matches!(first.put_text("title").unwrap(), PutText::Utf8("visible title")));
+        assert!(matches!(first.put_text("body").unwrap(), PutText::Utf8("One TWO")));
+        assert!(matches!(first.put_text("encoded").unwrap(), PutText::Utf8("one run")));
+        assert!(matches!(batch.borrow_event(1).unwrap().put_text("encoded").unwrap(), PutText::Missing));
+        let columns = ["body".into(), "title".into(), "missing".into(), "encoded".into()];
+        let memory = MemoryBudget::new(1 << 20);
+        let result = search_batch(&batch, &columns, true, &memory).unwrap();
+        let expected = (0..batch.len()).map(|row| {
+            let event = batch.read_event(row).unwrap();
+            let header = event.header();
+            let document = match &event.operation { StoredOperation::Put(document) => Some(document), _ => None };
+            let values = columns.iter().map(|name| match document.and_then(|document| document.get(name)) {
+                None | Some(Value::Null | Value::Undefined) => None,
+                Some(Value::Utf8(text)) => Some(rtdb_text::tokens(text)),
+                Some(_) => Some(vec![]),
+            }).collect();
+            SearchRow {
+                identity: document.map(|document| document["_id"].entity_id().unwrap()),
+                iid: header.iid.0, system_from: header.system_from.0, valid_from: header.valid_time.lower().0,
+                valid_to: header.valid_time.upper().0, op: header.op, values,
+            }
+        }).collect::<Vec<_>>();
+        assert_eq!(result, expected);
+        assert_eq!(memory.used_bytes(), 0);
+    }
+
 }

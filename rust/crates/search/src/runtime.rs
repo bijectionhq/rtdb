@@ -200,10 +200,12 @@ impl SearchRuntime {
             let ceiling = crate::file::ceiling_of(trie.recency());
             let indexing = memory.reserve(crate::lane::indexing_allowance(i64::try_from(lease.as_slice().len()).unwrap_or(i64::MAX)))?;
             let (indexed, token) = (columns.to_vec(), cancellation.clone());
+            let memory = Arc::clone(memory);
             let bytes = tokio::task::spawn_blocking(move || -> Result<Vec<u8>> {
                 let _indexing = indexing;
                 let mut bytes = Vec::new();
-                crate::file::write_search_file(&indexed, crate::search_pages(lease.as_slice(), &indexed, &token)?, "built", ceiling, tantivy::directory::RamDirectory::create(), &mut bytes)?;
+                let pages = crate::lane::search_pages_with_budget(lease.as_slice(), &indexed, &token, memory)?;
+                crate::file::write_search_file(&indexed, pages, "built", ceiling, tantivy::directory::RamDirectory::create(), &mut bytes)?;
                 Ok(bytes)
             }).await.map_err(|error| rtdb_types::Anomaly::fault("rtdb.search/build", error.to_string()))??;
             let size = bytes.len();
