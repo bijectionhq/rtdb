@@ -254,8 +254,7 @@ Relations without an explicit declaration continue to infer their schema.
 === Holding one owned read cut
 
 Use `rtdb.owned.OpenRead.v2` with an empty body to reserve one present and retain its exact applied catalog.
-A live held result ends with the ordered transaction id as a signed big-endian i64 after the 16-byte handle and the signed big-endian i64 system time.
-The one result body contains 16 opaque handle bytes followed by the signed big-endian 64-bit Unix microsecond present.
+The one result body contains 16 opaque handle bytes, the signed big-endian i64 Unix microsecond present, and the signed big-endian i64 ordered transaction id.
 Send `rtdb.owned.ReadHeldPoint.v1` with those 16 handle bytes followed by the ordinary ReadPoint action body.
 The Arrow response uses the held present and valid instant on every call, including missing rows.
 `rtdb.owned.ReadHeldPoint.v2` uses the same framing with exactly one Arrow row and two columns, `_id` and `valid_micros: Int64?`.
