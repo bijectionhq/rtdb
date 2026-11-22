@@ -719,7 +719,9 @@ impl<'a> OpenTransaction<'a> {
             },
             Operation::Public(TxOp::OwnedDeadline { .. } | TxOp::OwnedCheckWorldScope { .. } | TxOp::OwnedCheckWorldPurge { .. } | TxOp::OwnedCheckRange { .. } | TxOp::OwnedCheckCapacity { .. } | TxOp::OwnedCheck { .. }) => Ok(()),
             Operation::Public(TxOp::OwnedErase { relation, id }) =>
-                self.erase_owned(relation, id).await,
+                self.erase_owned(relation, id, rtdb_types::OwnedChangeKind::Erase).await,
+            Operation::Public(TxOp::OwnedSweepExpired { relation, id, created, replay_floor }) =>
+                self.sweep_owned_expiry(relation, id, *created, *replay_floor).await,
             Operation::Public(TxOp::OwnedDelete { relation, id, valid_from, valid_to }) =>
                 self.delete_owned(relation, id, *valid_from, *valid_to).await,
             Operation::Public(TxOp::OwnedInsertDocs { relation, documents, valid_from, valid_to }) =>
@@ -943,6 +945,12 @@ impl<'a> OpenTransaction<'a> {
                 }
             }
         }
+        if operations.iter().any(|operation| matches!(operation, Operation::Public(TxOp::OwnedSweepExpired { .. }))) {
+            self.context.authorization.check_role_membership(&self.context.database, self.options.user.as_deref())?;
+            if operations.len() != 2 || deadline.is_none() {
+                return Err(lifetime_uncovered());
+            }
+        }
         let base = self.buffer.base_snapshot();
         let new_lifetimes: BTreeSet<_> = operations.iter().filter_map(|operation| match operation {
             Operation::Public(TxOp::OwnedDeclareRelation { relation, schema }) if schema.lifetime_micros().is_some() => Some(relation),
@@ -955,7 +963,8 @@ impl<'a> OpenTransaction<'a> {
             if new_lifetimes.contains(target) || base.contains_table(&target.lifetime_table(owner)) {
                 match operation {
                     Operation::Public(TxOp::OwnedDeclareRelation { .. } | TxOp::OwnedDeclarePath { .. }
-                        | TxOp::OwnedInsertDocs { .. } | TxOp::OwnedCheck { .. } | TxOp::OwnedCheckRange { .. })
+                        | TxOp::OwnedInsertDocs { .. } | TxOp::OwnedCheck { .. } | TxOp::OwnedCheckRange { .. }
+                        | TxOp::OwnedSweepExpired { .. })
                     | Operation::OwnedWriteIids { create_only: true, .. } if root.is_none() => (),
                     _ => return Err(lifetime_uncovered()),
                 }
@@ -1482,8 +1491,39 @@ impl<'a> OpenTransaction<'a> {
         self.write_owned(&relation, &docs, None, Some(Timestamp::MIN), Some(Timestamp::MAX), true).await
     }
 
-    async fn erase_owned(&mut self, relation: &rtdb_types::OwnedRelation, id: &rtdb_types::EntityId) -> Result<()> {
-        use rtdb_types::{EntityId, OwnedChangeKind, OwnedRelation};
+    async fn sweep_owned_expiry(
+        &mut self, relation: &rtdb_types::OwnedRelation, id: &rtdb_types::EntityId,
+        created: Timestamp, replay_floor: Timestamp,
+    ) -> Result<()> {
+        use rtdb_types::OwnedChangeKind;
+        let owner = self.options.user.as_deref().filter(|owner| !owner.is_empty()).ok_or_else(no_owned_principal)?;
+        let ordered = self.tx_key().system_time;
+        if !relation.is_root_data() || replay_floor >= ordered { return Err(lifetime_uncovered()); }
+        let lifetime = self.read_owned_schema(owner, relation).await?
+            .and_then(|(schema, _)| schema.lifetime_micros()).ok_or_else(lifetime_uncovered)?;
+        let expires = Timestamp(created.0.checked_add(lifetime).ok_or_else(overflow)?);
+        if expires > replay_floor { return Err(lifetime_uncovered()); }
+        let context = self.context.query_context(self.snapshot()?, ordered, &self.options.default_tz, self.trace_parent)?;
+        let mut floor = rtdb_query::read_owned_lifetime_floor(Arc::clone(&context), owner, relation).await?;
+        floor.check(lifetime, ordered)?;
+        if rtdb_query::owned_purge_floor(context, owner, relation, id).await?.is_some() {
+            return Ok(());
+        }
+        if self.read_owned_revision(owner, relation, id, Interval::ALL).await? != Some(created) {
+            return Err(lifetime_uncovered());
+        }
+        floor.expired_created_through = rtdb_types::OwnedLifetimeFloor::at(lifetime, ordered)?.expired_created_through;
+        floor.swept_present_through = floor.swept_present_through.max(replay_floor);
+        self.erase_owned(relation, id, OwnedChangeKind::Expired).await?;
+        self.buffer.put(relation.lifetime_table(owner), floor.record(relation), Interval::ALL)?;
+        Ok(())
+    }
+
+    async fn erase_owned(
+        &mut self, relation: &rtdb_types::OwnedRelation, id: &rtdb_types::EntityId,
+        kind: rtdb_types::OwnedChangeKind,
+    ) -> Result<()> {
+        use rtdb_types::{EntityId, OwnedRelation};
         if relation.name() == rtdb_types::OWNED_ATTEMPT_RELATION {
             return Err(Anomaly::incorrect("rtdb.owned/immutable-attempt", "Attempt reservations are immutable"));
         }
@@ -1525,7 +1565,7 @@ impl<'a> OpenTransaction<'a> {
         // The full handle, including its type, is the erasure target even
         // when the locality prefix is shared or the key has no live winner.
         let first_erase = !self.owned_changes.get(relation.name()).is_some_and(|group| group.erased);
-        self.record_owned_change(relation, id.clone(), OwnedChangeKind::Erase, Interval::ALL)?;
+        self.record_owned_change(relation, id.clone(), kind, Interval::ALL)?;
         self.buffer.append(table, StoredEvent {
             entity_key: Some(id.handle_bytes().into()), iid: id.iid(),
             system_from: self.tx_key().system_time, valid_time: Interval::ALL,
@@ -1702,7 +1742,8 @@ impl<'a> OpenTransaction<'a> {
                     .with_accelerators(Arc::from([]));
                 let floor = rtdb_query::read_owned_lifetime_floor(Arc::clone(&context), owner, relation).await?;
                 floor.check(lifetime, created)?;
-                let next = rtdb_types::OwnedLifetimeFloor::at(lifetime, created)?;
+                let mut next = rtdb_types::OwnedLifetimeFloor::at(lifetime, created)?;
+                next.swept_present_through = floor.swept_present_through;
                 for row in documents.rows() {
                     let id = crate::source::document_id(row, &self.context.memory)?;
                     if rtdb_query::owned_purge_floor(Arc::clone(&context), owner, relation, &id).await?.is_some()
@@ -1803,10 +1844,10 @@ impl<'a> OpenTransaction<'a> {
         let too_large = || Anomaly::incorrect("rtdb.owned/change-group-too-large", "An owned relation's change group exceeds its byte limit");
         use rtdb_types::{OwnedChange, OwnedChangeKind};
         let group = self.owned_changes.entry(relation.name().to_owned()).or_default();
-        if group.erased || kind == OwnedChangeKind::Erase {
+        if group.erased || matches!(kind, OwnedChangeKind::Erase | OwnedChangeKind::Expired) {
             for previous in &group.touches {
                 let previous = OwnedChange::from_value(previous)?;
-                if previous.id == id && (kind == OwnedChangeKind::Erase || previous.kind == OwnedChangeKind::Erase) {
+                if previous.id == id && (matches!(kind, OwnedChangeKind::Erase | OwnedChangeKind::Expired) || matches!(previous.kind, OwnedChangeKind::Erase | OwnedChangeKind::Expired)) {
                     return Err(Anomaly::incorrect("rtdb.owned/purge-overlap", "Owned erase cannot share its identity with another mutation in the same commit"));
                 }
             }
@@ -1819,7 +1860,7 @@ impl<'a> OpenTransaction<'a> {
         group.touches.push(entry);
         group.reservations.push(charge);
         group.bytes = group_bytes;
-        group.erased |= kind == OwnedChangeKind::Erase;
+        group.erased |= matches!(kind, OwnedChangeKind::Erase | OwnedChangeKind::Expired);
         Ok(())
     }
 

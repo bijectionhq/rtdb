@@ -520,7 +520,11 @@ The count's metadata and original witness include this exclusive cutoff.
 The private lifetime declaration stores the immutable duration and an ordered monotone floor of creation times already expired.
 Native writes advance that floor together with accepted data. Live and archived reads require the exact floor format and declaration.
 An existing lifetime marker without the floor requires a reset.
-This floor describes expiry and does not certify physical collection or a replay-present sweep boundary.
+The protected marker also stores the replay-present sweep floor.
+Trusted native maintenance may nominate one exact created identity and a cutoff granted by its replay-retention authority.
+The ordered source requires superuser maintenance authority, a deadline, the original creation revision and expiry at or before the permitted cutoff.
+It orders an all-history retirement event, the monotone sweep floor and an `expired` journal touch together.
+Retries of retired identities publish no duplicate touch. Hosted candidate enumeration and archive-media collection remain separate.
 Leading-key, historical, and world ranges and historical or world counts remain unavailable for these relations.
 Other read coordinates and paths refuse this declaration.
 

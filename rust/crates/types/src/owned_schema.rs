@@ -9,6 +9,7 @@ use crate::{Anomaly, LogicalType, Result, ScalarType, StructFields, TimeUnit, Va
 pub struct OwnedLifetimeFloor {
     pub duration: i64,
     pub expired_created_through: crate::Timestamp,
+    pub swept_present_through: crate::Timestamp,
 }
 
 impl OwnedLifetimeFloor {
@@ -16,7 +17,7 @@ impl OwnedLifetimeFloor {
         if !(1..=3_155_760_000_000_000).contains(&duration) {
             return Err(invalid("Invalid owned creation lifetime"));
         }
-        Ok(Self { duration, expired_created_through: crate::Timestamp(present.0.saturating_sub(duration)) })
+        Ok(Self { duration, expired_created_through: crate::Timestamp(present.0.saturating_sub(duration)), swept_present_through: crate::Timestamp::MIN })
     }
 
     pub fn record(self, relation: &crate::OwnedRelation) -> StructFields<Value> {
@@ -24,22 +25,23 @@ impl OwnedLifetimeFloor {
             ("_id".into(), Value::Utf8(relation.name().into())),
             ("duration".into(), Value::I64(self.duration)),
             ("expired_created_through".into(), Value::I64(self.expired_created_through.0)),
+            ("swept_present_through".into(), Value::I64(self.swept_present_through.0)),
         ])
     }
 
     pub fn decode(record: &StructFields<Value>, relation: &crate::OwnedRelation) -> Result<Self> {
-        let (Some(Value::Utf8(id)), Some(Value::I64(duration)), Some(Value::I64(floor))) =
-            (record.get("_id"), record.get("duration"), record.get("expired_created_through"))
+        let (Some(Value::Utf8(id)), Some(Value::I64(duration)), Some(Value::I64(floor)), Some(Value::I64(swept))) =
+            (record.get("_id"), record.get("duration"), record.get("expired_created_through"), record.get("swept_present_through"))
         else { return Err(invalid("Owned creation lifetime has no exact expiry floor")); };
-        if record.len() != 3 || id != relation.name() || !(1..=3_155_760_000_000_000).contains(duration) {
+        if record.len() != 4 || id != relation.name() || !(1..=3_155_760_000_000_000).contains(duration) {
             return Err(invalid("Invalid owned creation-lifetime floor"));
         }
-        Ok(Self { duration: *duration, expired_created_through: crate::Timestamp(*floor) })
+        Ok(Self { duration: *duration, expired_created_through: crate::Timestamp(*floor), swept_present_through: crate::Timestamp(*swept) })
     }
 
     pub fn check(self, duration: i64, present: crate::Timestamp) -> Result<()> {
         let allowed = Self::at(duration, present)?;
-        if self.duration != duration || self.expired_created_through > allowed.expired_created_through {
+        if self.duration != duration || self.expired_created_through > allowed.expired_created_through || self.swept_present_through > present {
             return Err(invalid("Owned creation-lifetime floor differs from the declared policy and present"));
         }
         Ok(())
