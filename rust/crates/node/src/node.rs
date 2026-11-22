@@ -1757,7 +1757,10 @@ impl NativeSession {
         use rtdb_tx::OwnedForkRoot;
         let proposal_publication = requested == rtdb_types::WorldClockMode::Proposal
             && fork.cut.is_publication() && fork.root.is_some();
+        let proposal_hold = requested == rtdb_types::WorldClockMode::Proposal
+            && fork.cut.is_renewal() && fork.previous.is_some();
         let root = match &fork.root {
+            Some(section) if proposal_hold && section.publication.is_some() => OwnedForkRoot::ProposalHold,
             Some(section) if section.publication.is_some() && fork.sibling.is_some() && fork.cut.is_renewal() =>
                 OwnedForkRoot::WritesSibling,
             Some(section) if section.publication.is_some() && fork.previous.is_some() && fork.cut.is_renewal() =>
@@ -1770,7 +1773,7 @@ impl NativeSession {
             None => OwnedForkRoot::None,
         };
         let requires_live_tip = record.initial_clock() > inherited
-            || (requested == rtdb_types::WorldClockMode::Proposal && !proposal_publication);
+            || (requested == rtdb_types::WorldClockMode::Proposal && !proposal_publication && !proposal_hold);
         let requires_tip = requires_live_tip || proposal_publication
             || (root != OwnedForkRoot::None && !fork.cut.is_renewal()
                 && record.parent_publication == Some(record.basis.system_time));
@@ -1780,7 +1783,7 @@ impl NativeSession {
             .saturating_add(3 + usize::from(requires_tip));
         if record.id != fork.world || record.pin != fork.pin || !fork.cut.matches_basis(record.basis)
             || ((fork.previous.is_none() || fork.sibling.is_some()) != (record.pin == record.id)) || fork.controls.is_empty()
-            || fork.previous.is_some_and(|pin| pin == record.pin || record.mode.is_writable())
+            || fork.previous.is_some_and(|pin| pin == record.pin || (record.mode.is_writable() && !proposal_hold))
             || record.mode != requested
             || (requires_live_tip && fork.cut.live.is_none())
             || (fork.cut.is_publication() && (root == OwnedForkRoot::None
@@ -1790,11 +1793,11 @@ impl NativeSession {
             || (matches!(root, OwnedForkRoot::Controls | OwnedForkRoot::ProposalControls | OwnedForkRoot::ProposalWrites)
                 && fork.controls.iter().all(rtdb_tx::HostedControlWrite::is_check))
             || (root == OwnedForkRoot::WritesAdvance && !fork.cut.is_publication())
-            || (fork.cut.is_renewal() && !matches!(root, OwnedForkRoot::WritesRenewal | OwnedForkRoot::WritesSibling))
+            || (fork.cut.is_renewal() && !matches!(root, OwnedForkRoot::WritesRenewal | OwnedForkRoot::WritesSibling | OwnedForkRoot::ProposalHold))
             || fork.sibling.is_some_and(|sibling| sibling == record.id || fork.previous.is_none()
                 || root != OwnedForkRoot::WritesSibling)
-            || (root != OwnedForkRoot::None && ((fork.previous.is_some() && !matches!(root, OwnedForkRoot::WritesAdvance | OwnedForkRoot::WritesRenewal | OwnedForkRoot::WritesSibling))
-                || (requested != rtdb_types::WorldClockMode::Retained && !proposal_publication)
+            || (root != OwnedForkRoot::None && ((fork.previous.is_some() && !matches!(root, OwnedForkRoot::WritesAdvance | OwnedForkRoot::WritesRenewal | OwnedForkRoot::WritesSibling | OwnedForkRoot::ProposalHold))
+                || (requested != rtdb_types::WorldClockMode::Retained && !proposal_publication && !proposal_hold)
                 || (fork.cut.live.is_none() && !fork.cut.is_publication())))
             || fork.root.iter().flat_map(|section| &section.checks).any(|check| match check {
                 TxOp::OwnedCheck { relation, .. } | TxOp::OwnedCheckRange { relation, .. } =>

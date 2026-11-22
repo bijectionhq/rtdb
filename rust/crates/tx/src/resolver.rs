@@ -693,7 +693,7 @@ impl<'a> OpenTransaction<'a> {
                 self.reserve_owned_attempt(attempt, *fingerprint).await?;
                 let documents = crate::Documents::new(vec![record.clone()], &self.context.memory)?;
                 let relation = rtdb_types::OwnedRelation::world_catalog();
-                if matches!(root, crate::OwnedForkRoot::WritesAdvance | crate::OwnedForkRoot::WritesRenewal) {
+                if matches!(root, crate::OwnedForkRoot::WritesAdvance | crate::OwnedForkRoot::WritesRenewal | crate::OwnedForkRoot::ProposalHold) {
                     // The ordered preconditions compared the exact original
                     // registration and its lease on the base snapshot.
                     let owner = self.options.user.as_deref().ok_or_else(no_owned_principal)?;
@@ -702,7 +702,7 @@ impl<'a> OpenTransaction<'a> {
                 } else {
                     self.write_owned(&relation, &documents, None, None, None, previous.is_none() || sibling.is_some()).await?;
                 }
-                if matches!(*root, crate::OwnedForkRoot::Writes | crate::OwnedForkRoot::WritesAdvance | crate::OwnedForkRoot::WritesRenewal | crate::OwnedForkRoot::WritesSibling | crate::OwnedForkRoot::ProposalWrites) {
+                if matches!(*root, crate::OwnedForkRoot::Writes | crate::OwnedForkRoot::WritesAdvance | crate::OwnedForkRoot::WritesRenewal | crate::OwnedForkRoot::WritesSibling | crate::OwnedForkRoot::ProposalWrites | crate::OwnedForkRoot::ProposalHold) {
                     self.publish_owned_root_head().await?;
                 }
                 Ok(())
@@ -1039,14 +1039,15 @@ impl<'a> OpenTransaction<'a> {
             _ => None,
         }) {
             use crate::OwnedForkRoot;
-            let renewal = root == OwnedForkRoot::WritesRenewal;
+            let proposal_hold = root == OwnedForkRoot::ProposalHold;
+            let renewal = root == OwnedForkRoot::WritesRenewal || proposal_hold;
             let sibling_fork = root == OwnedForkRoot::WritesSibling;
-            let replaces_pin = matches!(root, OwnedForkRoot::WritesAdvance | OwnedForkRoot::WritesRenewal);
+            let replaces_pin = matches!(root, OwnedForkRoot::WritesAdvance | OwnedForkRoot::WritesRenewal | OwnedForkRoot::ProposalHold);
             let bounded_write = replaces_pin || sibling_fork;
             let publish_root = root == OwnedForkRoot::Writes || root == OwnedForkRoot::ProposalWrites || bounded_write;
             let with_root = root != OwnedForkRoot::None;
             let proposal_publication = matches!(root, OwnedForkRoot::ProposalControls | OwnedForkRoot::ProposalWrites);
-            let required_mode = if proposal_publication {
+            let required_mode = if proposal_publication || proposal_hold {
                 rtdb_types::WorldClockMode::Proposal
             } else {
                 rtdb_types::WorldClockMode::Retained
@@ -1073,7 +1074,7 @@ impl<'a> OpenTransaction<'a> {
                         if with_root && relation.is_root_data() => {}
                     Operation::Public(TxOp::OwnedReplaceDocs { relation, documents, valid_from: None, valid_to: None })
                     | Operation::OwnedWriteIids { relation, documents, valid_from: None, valid_to: None, create_only: false, .. }
-                        if replaces_pin && relation.is_root_data() && documents.rows().len() == 1
+                        if replaces_pin && !proposal_hold && relation.is_root_data() && documents.rows().len() == 1
                             && replacement.is_none() => {
                         let id = crate::source::document_id(&documents.rows()[0], &self.context.memory)?;
                         replacement = Some((relation, id));
@@ -1081,7 +1082,7 @@ impl<'a> OpenTransaction<'a> {
                     }
                     Operation::Public(TxOp::OwnedInsertDocs { relation, documents, valid_from: None, valid_to: None })
                     | Operation::OwnedWriteIids { relation, documents, valid_from: None, valid_to: None, create_only: true, .. }
-                        if sibling_fork && relation.is_root_data() && documents.rows().len() == 1
+                        if (sibling_fork || proposal_hold) && relation.is_root_data() && documents.rows().len() == 1
                             && replacement.is_none() => {
                         let id = crate::source::document_id(&documents.rows()[0], &self.context.memory)?;
                         replacement = Some((relation, id));
@@ -1121,7 +1122,9 @@ impl<'a> OpenTransaction<'a> {
                                 deadline.is_some_and(|until| until.0 <= prior.until.0.saturating_sub(crate::SIBLING_PIN_MARGIN_MICROS))
                                     && prior.can_seed_sibling(&world)
                             } else if replaces_pin {
-                                deadline.is_some_and(|until| until <= prior.until) && if renewal {
+                                deadline.is_some_and(|until| until <= prior.until) && if proposal_hold {
+                                    prior.can_hold_proposal(&world)
+                                } else if renewal {
                                     prior.can_renew_to(&world)
                                 } else {
                                     prior.can_advance_to(&world)
@@ -1135,7 +1138,7 @@ impl<'a> OpenTransaction<'a> {
                         } else {
                             if world.pin != world.id { return Err(unavailable()); }
                         }
-                        if world.initial_clock() > world.inherited_clock() || world.mode == rtdb_types::WorldClockMode::Proposal
+                        if world.initial_clock() > world.inherited_clock() || (world.mode == rtdb_types::WorldClockMode::Proposal && !proposal_hold)
                             || (with_root && !renewal && !sibling_fork && world.parent_publication == Some(world.basis.system_time))
                         {
                             expected_tip = Some((world.basis.system_time, world.parent_publication));
@@ -1148,9 +1151,9 @@ impl<'a> OpenTransaction<'a> {
             let replacement_checked = replacement.is_some_and(|(relation, id)| operations.iter().any(|operation| matches!(
                 operation,
                 Operation::Public(TxOp::OwnedCheck { relation: checked, id: observed, expected, .. })
-                    if *checked == *relation && *observed == id && expected.is_none() == sibling_fork
+                    if *checked == *relation && *observed == id && expected.is_none() == (sibling_fork || proposal_hold)
             )));
-            if (bounded_write && (!replacement_checked || !existing_control_write || control_writes > 5))
+            if (bounded_write && (!replacement_checked || !existing_control_write || control_writes > (5 + usize::from(proposal_hold))))
                 || forks != 1 || checks == 0 || expected_tip != checked_tip || effects > 4096
                 || (publish_root && root_rows == 0)
                 || ((root == OwnedForkRoot::Controls || proposal_publication) && control_writes == 0)

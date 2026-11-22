@@ -228,6 +228,15 @@ impl OwnedWorld {
             && self.parent_publication == next.parent_publication && self.schemas == next.schemas
     }
 
+    pub fn can_hold_proposal(&self, next: &Self) -> bool {
+        self.id == next.id && self.pin != next.pin && !self.dropped && !next.dropped
+            && self.mode == WorldClockMode::Proposal && next.mode == self.mode
+            && self.capture == next.capture && self.suffix == next.suffix
+            && self.manifest == next.manifest && self.basis == next.basis
+            && self.parent_publication == next.parent_publication && self.schemas == next.schemas
+            && self.until <= next.until
+    }
+
     pub fn same_fork(&self, other: &Self) -> bool {
         self.id == other.id
             && self.pin == other.pin

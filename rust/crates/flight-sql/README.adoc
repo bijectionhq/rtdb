@@ -538,6 +538,10 @@ Mode 7 supplies a retained source handle, zero capture and suffix selectors, and
 It creates one Root fact and independent custody of the source archive at the same transaction key.
 The source pin must retain its original registration and at least sixty seconds of standing beyond the ordered deadline.
 The original holder remains in place after the sibling order.
+Mode 8 supplies the original live Proposal handle and a fresh physical pin for the same writable world.
+The placed owner derives the archive from the original pin, and the source preserves the exact archived cut and Proposal overlay identity while extending its expiry.
+One acceptance-valid Root insert and its original absence check order with the new registration and checked owner controls.
+The old physical pin retires after ordering, while the Proposal remains active.
 The response has the v1 layout.
 A failed order can leave its preallocated archival pin retained until expiry without a visible registration.
 
