@@ -832,7 +832,7 @@ impl<'a> OpenTransaction<'a> {
         let owner = self.options.user.as_deref().filter(|owner| !owner.is_empty()).ok_or_else(no_owned_principal)?;
         if relation.world().is_some() || relation.is_world_catalog() { return Err(rtdb_types::OwnedWorld::unavailable()); }
         let target = relation.table(owner);
-        if self.owned_changes.get(relation.name()).is_some_and(|group| group.erased) {
+        if search && self.owned_changes.get(relation.name()).is_some_and(|group| group.erased) {
             return Err(purge_path_uncovered());
         }
         let catalog = if search { rtdb_types::OwnedRelation::search_catalog(owner) } else { rtdb_types::OwnedRelation::path_catalog(owner) };
@@ -1272,8 +1272,8 @@ impl<'a> OpenTransaction<'a> {
         let table = relation.table(owner);
         let ordered = self.tx_key();
         let context = self.context.query_context(snapshot, ordered.system_time, &self.options.default_tz, self.trace_parent)?;
-        for catalog in [OwnedRelation::path_catalog(owner), OwnedRelation::search_catalog(owner)] {
-            let Some(mut rows) = rtdb_query::open_owned_path_catalog(Arc::clone(&context), &catalog, None).await? else { continue; };
+        let search = OwnedRelation::search_catalog(owner);
+        if let Some(mut rows) = rtdb_query::open_owned_path_catalog(Arc::clone(&context), &search, None).await? {
             while let Some(batch) = rows.next_batch().await? {
                 let batch = batch.batch();
                 for row in 0..batch.num_rows() {
@@ -1738,7 +1738,7 @@ fn validate_owned_schema(schema: &rtdb_types::OwnedSchema, row: &StructFields<Va
 }
 
 fn purge_path_uncovered() -> Anomaly {
-    Anomaly::incorrect("rtdb.owned/purge-path-uncovered", "Owned erase is unsupported while the relation has a governed path")
+    Anomaly::incorrect("rtdb.owned/purge-path-uncovered", "Owned erase is unsupported while the relation has a search or final-state constraint path")
 }
 
 fn no_owned_principal() -> Anomaly {
