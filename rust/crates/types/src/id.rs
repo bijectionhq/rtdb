@@ -91,6 +91,15 @@ pub enum EntityId {
 }
 
 impl EntityId {
+    pub fn as_value(&self) -> crate::Value {
+        match self {
+            Self::String(value) => crate::Value::Utf8(value.clone()),
+            Self::Keyword(value) => crate::Value::Keyword(value.clone()),
+            Self::Integer(value) => crate::Value::I64(*value),
+            Self::Uuid(value) => crate::Value::Uuid(*value),
+        }
+    }
+
     pub fn iid(&self) -> Iid {
         let input = match self {
             Self::Uuid(bytes) => return Iid(*bytes),

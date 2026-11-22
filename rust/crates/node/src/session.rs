@@ -153,7 +153,10 @@ struct DmlBuffer { operations: Vec<BufferedOperation> }
 impl DmlBuffer {
     fn append(&mut self, operation: TxOp, memory: &Arc<MemoryBudget>) -> Result<()> {
         let bytes = match &operation {
-            TxOp::OwnedInsertDocs { relation, .. } => relation.name().len(),
+            TxOp::OwnedInsertDocs { relation, .. } | TxOp::OwnedReplaceDocs { relation, .. } => relation.name().len(),
+            TxOp::OwnedCheck { relation, id, .. } | TxOp::OwnedDelete { relation, id, .. } => relation.name().len()
+                .checked_add(id.as_value().retained_bytes()?).ok_or_else(allocation_overflow)?,
+            TxOp::OwnedDeadline { .. } => 0,
             TxOp::Sql { sql, .. } | TxOp::SqlBytes { sql, .. } => sql.capacity(),
             TxOp::InsertDocs { table, .. } | TxOp::PutDocs { table, .. } | TxOp::PutArrowDocs { table, .. } | TxOp::PatchDocs { table, .. } | TxOp::DeleteDocs { table, .. } | TxOp::EraseDocs { table, .. } => table.schema.capacity().checked_add(table.table.capacity()).ok_or_else(allocation_overflow)?,
         }.checked_add(std::mem::size_of::<BufferedOperation>() * 2 + 128).ok_or_else(allocation_overflow)?;
@@ -570,7 +573,7 @@ impl Session {
         self.revalidate().await?;
         self.ensure_open()?;
         if self.default_access_mode == Some(AccessMode::ReadOnly)
-            && operations.iter().any(|operation| matches!(operation, TxOp::OwnedInsertDocs { .. }))
+            && operations.iter().any(TxOp::is_owned)
         {
             return Err(Anomaly::incorrect("xtdb/read-only-tx", "Cannot write an owned relation in a read-only session"));
         }

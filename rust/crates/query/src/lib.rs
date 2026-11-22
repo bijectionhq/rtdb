@@ -58,4 +58,4 @@ fn cardinality_violation() -> rtdb_types::Anomaly {
 }
 
 mod owned_relation;
-pub use owned_relation::open_owned_point;
+pub use owned_relation::{open_owned_point, owned_row_revision};

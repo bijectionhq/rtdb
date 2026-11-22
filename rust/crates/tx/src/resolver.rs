@@ -230,6 +230,9 @@ impl TxResolver {
                     None => (None, Ok(())),
                 }
             } else { (None, Ok(())) };
+            if has_owned_operations && outcome.is_ok() {
+                outcome = tx.check_owned_preconditions(&request.operations).await;
+            }
             for (index, operation) in request.operations.iter().enumerate().take_while(|_| outcome.is_ok()) {
                 context.check_cancelled()?;
                 if let Err(error) = validate_document_operation(operation, request.options.user.as_deref()) {
@@ -607,10 +610,15 @@ impl<'a> OpenTransaction<'a> {
             }
             Operation::Public(TxOp::PutArrowDocs { table, documents }) => self.put_arrow_documents(table, documents, None, None, None),
             Operation::PutArrowIids { table, documents, iids, valid_from, valid_to } => self.put_arrow_documents(table, documents, Some(iids), *valid_from, *valid_to),
+            Operation::Public(TxOp::OwnedDeadline { .. } | TxOp::OwnedCheck { .. }) => Ok(()),
+            Operation::Public(TxOp::OwnedDelete { relation, id, valid_from, valid_to }) =>
+                self.delete_owned(relation, id, *valid_from, *valid_to).await,
             Operation::Public(TxOp::OwnedInsertDocs { relation, documents, valid_from, valid_to }) =>
-                self.insert_owned(relation, documents, None, *valid_from, *valid_to).await,
-            Operation::OwnedInsertIids { relation, documents, iids, valid_from, valid_to } =>
-                self.insert_owned(relation, documents, Some(iids), *valid_from, *valid_to).await,
+                self.write_owned(relation, documents, None, *valid_from, *valid_to, true).await,
+            Operation::Public(TxOp::OwnedReplaceDocs { relation, documents, valid_from, valid_to }) =>
+                self.write_owned(relation, documents, None, *valid_from, *valid_to, false).await,
+            Operation::OwnedWriteIids { create_only, relation, documents, iids, valid_from, valid_to } =>
+                self.write_owned(relation, documents, Some(iids), *valid_from, *valid_to, *create_only).await,
             Operation::Public(TxOp::InsertDocs { table, documents, valid_from, valid_to }) => self.put_documents(table, documents, None, *valid_from, *valid_to, DocumentWrite::Insert).await,
             Operation::InsertIids { table, documents, iids, valid_from, valid_to } => self.put_documents(table, documents, Some(iids), *valid_from, *valid_to, DocumentWrite::Insert).await,
             Operation::Public(TxOp::PutDocs { table, documents, valid_from, valid_to }) => self.put_documents(table, documents, None, *valid_from, *valid_to, DocumentWrite::Put).await,
@@ -649,7 +657,56 @@ impl<'a> OpenTransaction<'a> {
         let mutation = rtdb_sql::prepare_patch(QualifiedTable { database: self.context.database.clone(), table: table.clone() }, input, TemporalFilter::FromTo { from: Expr::Literal(time_value(interval.lower())), to: Expr::Literal(time_value(interval.upper())) }, &context.catalog)?;
         self.execute_mutation(mutation, context, None, None).await
     }
-    async fn insert_owned(&mut self, relation: &rtdb_types::OwnedRelation, documents: &crate::Documents, iids: Option<&[Iid]>, from: Option<Timestamp>, to: Option<Timestamp>) -> Result<()> {
+    async fn check_owned_preconditions(&self, operations: &[Operation]) -> Result<()> {
+        let owner = self.options.user.as_deref().filter(|owner| !owner.is_empty()).ok_or_else(no_owned_principal)?;
+        let mut deadline = None;
+        for operation in operations {
+            if let Operation::Public(TxOp::OwnedDeadline { until }) = operation {
+                if deadline.replace(*until).is_some() {
+                    return Err(Anomaly::incorrect("rtdb.owned/duplicate-deadline", "An owned transaction may supply at most one deadline"));
+                }
+            }
+        }
+        if deadline.is_some_and(|until| self.tx_key().system_time >= until) {
+            return Err(Anomaly::new(AnomalyCategory::Conflict, "rtdb.owned/expired", "Owned transaction reached its deadline before ordering"));
+        }
+        for operation in operations {
+            let Operation::Public(TxOp::OwnedCheck { relation, id, valid_at, expected }) = operation else { continue; };
+            let upper = valid_at.0.checked_add(1).map(Timestamp)
+                .ok_or_else(|| Anomaly::incorrect("rtdb.owned/invalid-read-instant", "The observation's valid instant has no following microsecond"))?;
+            let actual = self.read_owned_revision(owner, relation, id, Interval::new(*valid_at, upper)?).await?;
+            if actual != *expected {
+                return Err(Anomaly::new(AnomalyCategory::Conflict, "rtdb.owned/stale-point", "The owned point observation changed before ordering"));
+            }
+        }
+        Ok(())
+    }
+
+    async fn read_owned_revision(&self, owner: &str, relation: &rtdb_types::OwnedRelation, id: &rtdb_types::EntityId, valid: Interval) -> Result<Option<Timestamp>> {
+        let context = self.context.query_context(self.snapshot()?, self.tx_key().system_time, &self.options.default_tz, self.trace_parent)?;
+        let columns = ["_id", "_system_from"];
+        let Some(mut cursor) = rtdb_query::open_owned_point(context, owner, relation, id, Some(valid), Some(&columns)).await? else {
+            return Ok(None);
+        };
+        let mut latest = None;
+        while let Some(batch) = cursor.next_batch().await? {
+            for row in 0..batch.batch().num_rows() {
+                let revision = rtdb_query::owned_row_revision(batch.batch(), row, id, &self.context.memory)?;
+                latest = Some(latest.map_or(revision, |previous: Timestamp| previous.max(revision)));
+            }
+        }
+        Ok(latest)
+    }
+
+    async fn delete_owned(&mut self, relation: &rtdb_types::OwnedRelation, id: &rtdb_types::EntityId, from: Option<Timestamp>, to: Option<Timestamp>) -> Result<()> {
+        let options = self.options;
+        let owner = options.user.as_deref().filter(|owner| !owner.is_empty()).ok_or_else(no_owned_principal)?;
+        let valid = interval(from.unwrap_or(self.tx_key().system_time), to.unwrap_or(Timestamp::MAX))?;
+        self.read_owned_revision(owner, relation, id, Interval::ALL).await?;
+        self.buffer.delete(relation.table(owner), id, valid)
+    }
+
+    async fn write_owned(&mut self, relation: &rtdb_types::OwnedRelation, documents: &crate::Documents, iids: Option<&[Iid]>, from: Option<Timestamp>, to: Option<Timestamp>, create_only: bool) -> Result<()> {
         let options = self.options;
         let owner = options.user.as_deref().filter(|owner| !owner.is_empty()).ok_or_else(no_owned_principal)?;
         let table = relation.table(owner);
@@ -663,7 +720,7 @@ impl<'a> OpenTransaction<'a> {
                 }
             }
         }
-        self.put_documents(&table, documents, iids, from, to, DocumentWrite::OwnedInsert { relation, owner }).await
+        self.put_documents(&table, documents, iids, from, to, DocumentWrite::Owned { relation, owner, create_only }).await
     }
 
     async fn require_absent(&self, table: &TableRef, iid: Iid, valid: Interval) -> Result<()> {
@@ -703,12 +760,12 @@ impl<'a> OpenTransaction<'a> {
             match write {
                 DocumentWrite::Put => (),
                 DocumentWrite::Insert => self.require_absent(table, iid, valid_time).await?,
-                DocumentWrite::OwnedInsert { relation, owner } => {
-                    let snapshot = self.snapshot()?;
-                    if snapshot.contains_table(table) {
-                        let context = self.context.query_context(snapshot, self.tx_key().system_time, &self.options.default_tz, self.trace_parent)?;
-                        if let Some(cursor) = rtdb_query::open_owned_point(context, owner, relation, iid, Some(valid_time), Some(&["_iid"])).await? {
-                            require_empty_insert(cursor).await?;
+                DocumentWrite::Owned { relation, owner, create_only } => {
+                    let id = crate::source::document_id(document, &self.context.memory)?;
+                    if self.snapshot()?.contains_table(table) {
+                        let _ = self.read_owned_revision(owner, relation, &id, Interval::ALL).await?;
+                        if create_only && self.read_owned_revision(owner, relation, &id, valid_time).await?.is_some() {
+                            return Err(insert_exists());
                         }
                     }
                 }
@@ -840,10 +897,14 @@ async fn execute(input: Arc<rtdb_plan::Relation>, context: Arc<QueryContext>, ar
 async fn require_empty_insert(mut cursor: QueryCursor) -> Result<()> {
     while let Some(batch) = cursor.next_batch().await? {
         if batch.batch().num_rows() != 0 {
-            return Err(Anomaly::new(AnomalyCategory::Conflict, "rtdb.tx/exists", "Insert overlaps an existing document"));
+            return Err(insert_exists());
         }
     }
     Ok(())
+}
+
+fn insert_exists() -> Anomaly {
+    Anomaly::new(AnomalyCategory::Conflict, "rtdb.tx/exists", "Insert overlaps an existing document")
 }
 
 fn no_owned_principal() -> Anomaly {
@@ -852,7 +913,7 @@ fn no_owned_principal() -> Anomaly {
 
 fn validate_document_operation(operation: &Operation, owner: Option<&str>) -> Result<()> {
     let put_columns = &["_id", "_fn", "_valid_from", "_valid_to"][..];
-    if let Operation::Public(TxOp::OwnedInsertDocs { relation, documents, .. }) | Operation::OwnedInsertIids { relation, documents, .. } = operation {
+    if let Operation::Public(TxOp::OwnedInsertDocs { relation, documents, .. } | TxOp::OwnedReplaceDocs { relation, documents, .. }) | Operation::OwnedWriteIids { relation, documents, .. } = operation {
         let owner = owner.filter(|owner| !owner.is_empty()).ok_or_else(no_owned_principal)?;
         return validate_document_columns(&relation.table(owner), documents.columns(), "insert", put_columns);
     }
@@ -906,7 +967,7 @@ fn interval(from: Timestamp, to: Timestamp) -> Result<Interval> {
     Interval::new(from, to)
 }
 #[derive(Clone, Copy)]
-enum DocumentWrite<'a> { Insert, Put, OwnedInsert { relation: &'a rtdb_types::OwnedRelation, owner: &'a str } }
+enum DocumentWrite<'a> { Insert, Put, Owned { relation: &'a rtdb_types::OwnedRelation, owner: &'a str, create_only: bool } }
 
 #[derive(Clone, Copy)]
 enum MutationKind { Put, Delete, Erase }

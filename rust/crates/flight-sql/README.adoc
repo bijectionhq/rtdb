@@ -179,7 +179,7 @@ Raw host failures still require their source-specific conversion before entering
 Both actions use the authenticated Flight session on an idle autocommit connection and require database write access.
 An embedded server enables `FlightConfig::owned_native_actions` and `NodeOptions::owned_relations`.
 
-Send `rtdb.owned.Create.v1` or `rtdb.owned.ReadPoint.v1` as the Flight `Action.type`.
+Send `rtdb.owned.Create.v1`, `rtdb.owned.ReadPoint.v1`, or `rtdb.owned.Commit.v1` as the Flight `Action.type`.
 The body contains a big-endian unsigned 16-bit relation-name length, the logical relation name as ASCII bytes, and one terminated Arrow IPC stream containing exactly one nonempty record batch.
 The relation name contains 1–96 lowercase ASCII letters, digits, hyphens or underscores.
 The create batch contains unique column names, an `_id` column, and the document fields.
@@ -200,3 +200,23 @@ Use `x-xtdb-database` for the initial Multi gateway connection and retain the re
 The gateway forwards these actions to the session's attached holder and fences that route at holder movement.
 A new holder requires a new authenticated session.
 A disconnected create has an unknown outcome and is not automatically retried.
+
+`rtdb.owned.Commit.v1` inserts an exclusive signed 64-bit big-endian Unix microsecond deadline between the relation name and Arrow IPC stream.
+The batch contains `_id` and a non-null Utf8 `_op` column with `create`, `replace`, `delete`, or `check`.
+Create and replace accept document fields.
+Delete accepts an identity and optional validity bounds, with null values for other document columns.
+Check accepts an identity and an observation, with null mutation bounds and document values.
+Create, replace, and delete apply in batch order in one atomic transaction.
+
+A nullable `_read_valid_micros: Int64` specifies the point to revalidate before mutation.
+A null `_read_system_micros: Int64` at that point asserts absence, and a non-null value asserts the exact previously observed winning revision.
+A mutation without a valid instant carries no observation.
+The point reply includes `rtdb.owned.valid_micros` for the observed instant and includes `rtdb.owned.revision_micros` when a row is present.
+These metadata values are signed decimal microseconds.
+A successful commit reply has the same schema as the create reply.
+An expired deadline or stale observation aborts the entire transaction before mutations apply.
+
+Owned lookups compare the complete stored `_id` before releasing data or accepting a point observation.
+The primary index continues to locate rows by 128-bit IID.
+Different identities occupying the same IID produce an explicit collision refusal when a different visible identity is found.
+This key layout cannot store colliding full identities independently.

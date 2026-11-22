@@ -18,7 +18,7 @@ const LEGACY_REPLAY_ABORT: &str = "ASSERT FALSE";
 #[derive(Clone, Debug)]
 pub(crate) enum Operation {
     Public(TxOp),
-    OwnedInsertIids { relation: rtdb_types::OwnedRelation, documents: Documents, iids: Vec<Iid>, valid_from: Option<Timestamp>, valid_to: Option<Timestamp> },
+    OwnedWriteIids { create_only: bool, relation: rtdb_types::OwnedRelation, documents: Documents, iids: Vec<Iid>, valid_from: Option<Timestamp>, valid_to: Option<Timestamp> },
     InsertIids { table: TableRef, documents: Documents, iids: Vec<Iid>, valid_from: Option<Timestamp>, valid_to: Option<Timestamp> },
     PutIids { table: TableRef, documents: Documents, iids: Vec<Iid>, valid_from: Option<Timestamp>, valid_to: Option<Timestamp> },
     PutArrowIids { table: TableRef, documents: ArrowDocuments, iids: Vec<Iid>, valid_from: Option<Timestamp>, valid_to: Option<Timestamp> },
@@ -28,7 +28,7 @@ pub(crate) enum Operation {
 
 impl Operation {
     pub(crate) fn is_owned(&self) -> bool {
-        matches!(self, Self::OwnedInsertIids { .. } | Self::Public(TxOp::OwnedInsertDocs { .. }))
+        match self { Self::Public(operation) => operation.is_owned(), Self::OwnedWriteIids { .. } => true, _ => false }
     }
 }
 
@@ -60,8 +60,11 @@ impl SourceTransaction {
         let mut bytes = operations.capacity().checked_mul(std::mem::size_of::<Operation>()).and_then(|size| size.checked_add(options.default_tz.capacity())).and_then(|size| size.checked_add(options.user.as_ref().map_or(0, String::capacity))).ok_or_else(overflow)?;
         for operation in &operations {
             let (text, table, ids) = match operation {
-                Operation::Public(TxOp::OwnedInsertDocs { relation, .. }) => (relation.name().len(), None, 0),
-                Operation::OwnedInsertIids { relation, iids, .. } => (relation.name().len(), None, iids.capacity().checked_mul(16).ok_or_else(overflow)?),
+                Operation::Public(TxOp::OwnedDeadline { .. }) => (0, None, 0),
+                Operation::Public(TxOp::OwnedCheck { relation, id, .. } | TxOp::OwnedDelete { relation, id, .. }) =>
+                    (relation.name().len().checked_add(id.as_value().retained_bytes()?).ok_or_else(overflow)?, None, 0),
+                Operation::Public(TxOp::OwnedInsertDocs { relation, .. } | TxOp::OwnedReplaceDocs { relation, .. }) => (relation.name().len(), None, 0),
+                Operation::OwnedWriteIids { relation, iids, .. } => (relation.name().len(), None, iids.capacity().checked_mul(16).ok_or_else(overflow)?),
                 Operation::Public(TxOp::Sql { sql, .. } | TxOp::SqlBytes { sql, .. }) => (sql.capacity(), None, 0),
                 Operation::Public(TxOp::InsertDocs { table, .. } | TxOp::PutDocs { table, .. } | TxOp::PutArrowDocs { table, .. } | TxOp::PatchDocs { table, .. } | TxOp::DeleteDocs { table, .. } | TxOp::EraseDocs { table, .. }) => (0, Some(table), 0),
                 Operation::InsertIids { table, iids, .. } | Operation::PutIids { table, iids, .. } | Operation::PutArrowIids { table, iids, .. } | Operation::PatchIids { table, iids, .. } => (0, Some(table), iids.capacity().checked_mul(16).ok_or_else(overflow)?),
@@ -261,7 +264,7 @@ impl SourceTransaction {
         let operations = || prefix.into_iter().chain(&self.operations);
         let scratch = operations().try_fold(65_536usize, |bytes, operation| {
             let extra = match operation {
-                Operation::Public(TxOp::OwnedInsertDocs { documents, .. } | TxOp::InsertDocs { documents, .. } | TxOp::PutDocs { documents, .. } | TxOp::PatchDocs { documents, .. }) | Operation::OwnedInsertIids { documents, .. } | Operation::InsertIids { documents, .. } | Operation::PutIids { documents, .. } | Operation::PatchIids { documents, .. } => documents.rows().iter().try_fold(0usize, |bytes, document| bytes.checked_add(Value::document_retained_bytes(document)?).ok_or_else(overflow))?,
+                Operation::Public(TxOp::OwnedInsertDocs { documents, .. } | TxOp::OwnedReplaceDocs { documents, .. } | TxOp::InsertDocs { documents, .. } | TxOp::PutDocs { documents, .. } | TxOp::PatchDocs { documents, .. }) | Operation::OwnedWriteIids { documents, .. } | Operation::InsertIids { documents, .. } | Operation::PutIids { documents, .. } | Operation::PatchIids { documents, .. } => documents.rows().iter().try_fold(0usize, |bytes, document| bytes.checked_add(Value::document_retained_bytes(document)?).ok_or_else(overflow))?,
                 Operation::Public(TxOp::PutArrowDocs { documents, .. }) | Operation::PutArrowIids { documents, .. } => {
                     documents.array().len().checked_mul(64).ok_or_else(overflow)?
                 }
@@ -271,6 +274,9 @@ impl SourceTransaction {
                 }
                 Operation::Public(TxOp::SqlBytes { sql, arg_bytes }) => sql.capacity().checked_add(arg_bytes.as_slice().len()).ok_or_else(overflow)?,
                 Operation::Public(TxOp::DeleteDocs { ids, .. } | TxOp::EraseDocs { ids, .. }) => ids.ids().len().checked_mul(128).ok_or_else(overflow)?,
+                Operation::Public(TxOp::OwnedDeadline { .. }) => 0,
+                Operation::Public(TxOp::OwnedCheck { relation, id, .. } | TxOp::OwnedDelete { relation, id, .. }) =>
+                    relation.name().len().checked_add(id.as_value().retained_bytes()?).ok_or_else(overflow)?,
                 Operation::Removed(name) => name.capacity(),
             };
             // An operation's own body is a few small fields beside what `extra` counts; a transaction of many small operations is charged for those, not for a fixed allowance each.
@@ -342,20 +348,41 @@ fn operation_value<'a>(operation: &'a Operation, memory: &Arc<MemoryBudget>) -> 
             body.insert("args".into(), if arg_bytes.as_slice().is_empty() { Value::Null } else { Value::Binary(arg_bytes.as_slice().to_vec()) });
             "sql"
         }
-        Operation::Public(TxOp::OwnedInsertDocs { relation, documents, valid_from, valid_to }) => {
+        Operation::Public(TxOp::OwnedDeadline { until }) => {
+            body.insert("until".into(), Value::I64(until.0));
+            "rtdb-owned-deadline-v1"
+        }
+        Operation::Public(TxOp::OwnedCheck { relation, id, valid_at, expected }) => {
+            body.insert("relation".into(), Value::Utf8(relation.name().into()));
+            body.insert("id".into(), id.as_value());
+            body.insert("valid_at".into(), Value::I64(valid_at.0));
+            body.insert("expected".into(), expected.map_or(Value::Null, |expected| Value::I64(expected.0)));
+            "rtdb-owned-check-v1"
+        }
+        Operation::Public(TxOp::OwnedDelete { relation, id, valid_from, valid_to }) => {
+            body.insert("relation".into(), Value::Utf8(relation.name().into()));
+            body.insert("id".into(), id.as_value());
+            time_fields(&mut body, *valid_from, *valid_to);
+            "rtdb-owned-delete-v1"
+        }
+        Operation::Public(TxOp::OwnedInsertDocs { relation, documents, valid_from, valid_to } | TxOp::OwnedReplaceDocs { relation, documents, valid_from, valid_to }) => {
             let iids = documents.rows().iter().map(|document| {
                 document_id(document, memory).map(|id| Value::FixedSizeBinary(id.iid().0.to_vec()))
             }).collect::<Result<_>>()?;
             body.insert("iids".into(), Value::List(iids));
             time_fields(&mut body, *valid_from, *valid_to);
             docs = Some((relation.name().to_owned(), SourceDocuments::Rows(documents)));
-            "rtdb-owned-insert-v1"
+            if matches!(operation, Operation::Public(TxOp::OwnedInsertDocs { .. })) {
+                "rtdb-owned-insert-v1"
+            } else {
+                "rtdb-owned-replace-v1"
+            }
         }
-        Operation::OwnedInsertIids { relation, documents, iids, valid_from, valid_to } => {
+        Operation::OwnedWriteIids { create_only, relation, documents, iids, valid_from, valid_to } => {
             body.insert("iids".into(), Value::List(iids.iter().map(|iid| Value::FixedSizeBinary(iid.0.to_vec())).collect()));
             time_fields(&mut body, *valid_from, *valid_to);
             docs = Some((relation.name().to_owned(), SourceDocuments::Rows(documents)));
-            "rtdb-owned-insert-v1"
+            if *create_only { "rtdb-owned-insert-v1" } else { "rtdb-owned-replace-v1" }
         }
         Operation::Public(TxOp::InsertDocs { table, documents, valid_from, valid_to } | TxOp::PutDocs { table, documents, valid_from, valid_to } | TxOp::PatchDocs { table, documents, valid_from, valid_to }) => {
             let iids = documents.rows().iter().map(|document| {
@@ -925,7 +952,10 @@ impl SourceOperationReader<'_> {
         let body = array.as_any().downcast_ref::<StructArray>().ok_or_else(|| invalid("Transaction operation leg is not a struct"))?;
         let value_fields: &[&str] = match name.as_str() {
             "sql" => &["query", "args"],
-            "rtdb-owned-insert-v1" | "insert-docs" | "put-docs" | "patch-docs" => &["iids", "_valid_from", "_valid_to"],
+            "rtdb-owned-deadline-v1" => &["until"],
+            "rtdb-owned-check-v1" => &["relation", "id", "valid_at", "expected"],
+            "rtdb-owned-delete-v1" => &["relation", "id", "_valid_from", "_valid_to"],
+            "rtdb-owned-insert-v1" | "rtdb-owned-replace-v1" | "insert-docs" | "put-docs" | "patch-docs" => &["iids", "_valid_from", "_valid_to"],
             "delete-docs" => &["table", "iids", "_valid_from", "_valid_to"],
             "erase-docs" => &["table", "iids"],
             _ => &[],
@@ -935,16 +965,36 @@ impl SourceOperationReader<'_> {
         parsed_fields.grow_to(bound)?;
         let value = |name| struct_cell(body, name, offset);
         let operation = match name.as_str() {
+            "rtdb-owned-deadline-v1" => {
+                let Value::I64(until) = value("until")? else { return Err(invalid("Owned deadline is not a microsecond timestamp")); };
+                TxOp::OwnedDeadline { until: Timestamp(until) }
+            }
+            "rtdb-owned-check-v1" | "rtdb-owned-delete-v1" => {
+                let Value::Utf8(relation) = value("relation")? else { return Err(invalid("Owned operation has no relation")); };
+                let relation = rtdb_types::OwnedRelation::new(relation)?;
+                let id = value("id")?.entity_id()?;
+                if name == "rtdb-owned-check-v1" {
+                    let Value::I64(valid_at) = value("valid_at")? else { return Err(invalid("Owned observation has no valid instant")); };
+                    let expected = match value("expected")? {
+                        Value::I64(time) => Some(Timestamp(time)),
+                        Value::Null => None,
+                        _ => return Err(invalid("Owned observation has an invalid revision")),
+                    };
+                    TxOp::OwnedCheck { relation, id, valid_at: Timestamp(valid_at), expected }
+                } else {
+                    TxOp::OwnedDelete { relation, id, valid_from: optional_timestamp(value("_valid_from")?)?, valid_to: optional_timestamp(value("_valid_to")?)? }
+                }
+            }
             "sql" => {
                 let sql = match value("query")? { Value::Utf8(sql) => sql, _ => return Err(invalid("SQL operation has no query")) };
                 let args = match value("args")? { Value::Null | Value::Undefined => None, Value::Binary(bytes) => Some(decode_arguments(&bytes, memory)?), _ => return Err(invalid("SQL arguments are not IPC bytes")) };
                 TxOp::Sql { sql, args }
             }
-            "rtdb-owned-insert-v1" | "insert-docs" | "put-docs" | "patch-docs" => {
+            "rtdb-owned-insert-v1" | "rtdb-owned-replace-v1" | "insert-docs" | "put-docs" | "patch-docs" => {
                 let docs_array = body.column_by_name("documents").ok_or_else(|| invalid("Document operation has no documents"))?;
                 let docs_union = docs_array.as_any().downcast_ref::<UnionArray>().ok_or_else(|| invalid("Document tables are not a union"))?;
                 let (table, docs_array, docs_offset) = union_leg(docs_union, offset)?;
-                let owned = (name == "rtdb-owned-insert-v1").then(|| rtdb_types::OwnedRelation::new(table.clone())).transpose()?;
+                let owned = matches!(name.as_str(), "rtdb-owned-insert-v1" | "rtdb-owned-replace-v1").then(|| rtdb_types::OwnedRelation::new(table.clone())).transpose()?;
                 let table = if owned.is_none() { Some(parse_table(&table)?) } else { None };
                 let lists = docs_array.as_any().downcast_ref::<ListArray>().ok_or_else(|| invalid("Documents are not a list"))?;
                 if lists.is_null(docs_offset) { return Err(invalid("Documents are not a list")); }
@@ -966,7 +1016,7 @@ impl SourceOperationReader<'_> {
                 let documents = Documents::read_arrow(structs, layout, name != "patch-docs", memory)?;
                 if let Some(relation) = owned {
                     let iids = iids.ok_or_else(|| invalid("Owned insert operation has no IIDs"))?;
-                    return Ok(Operation::OwnedInsertIids { relation, documents, iids, valid_from, valid_to });
+                    return Ok(Operation::OwnedWriteIids { create_only: name == "rtdb-owned-insert-v1", relation, documents, iids, valid_from, valid_to });
                 }
                 let table = table.expect("ordinary document operation has a table");
                 if name == "insert-docs" {
