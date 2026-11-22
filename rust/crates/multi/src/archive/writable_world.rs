@@ -141,6 +141,8 @@ pub(crate) async fn fork_checkpoint_world_selected(
     let inherited = parent_publication.unwrap_or(basis.system_time);
     let mode = match fork.requested {
         rtdb_node::WorldClockRequest::Retained => WorldClockMode::Retained,
+        rtdb_node::WorldClockRequest::Proposal if fork.cut.live().is_some() => WorldClockMode::Proposal,
+        rtdb_node::WorldClockRequest::Proposal => return Err(OwnedWorld::unavailable()),
         rtdb_node::WorldClockRequest::Held { start } => {
             let start = start.unwrap_or(inherited);
             if start < inherited || start == Timestamp::MAX || (start > inherited && fork.cut.live().is_none()) {
@@ -280,7 +282,7 @@ async fn open_world(
         return Err(OwnedWorld::unavailable());
     }
     let clock = snapshot.world_application_clock(world.id).await?;
-    if clock.is_some_and(|clock| !world.is_held() || clock <= world.initial_clock() || clock > snapshot.present().system_time) {
+    if clock.is_some_and(|clock| !world.mode.is_writable() || clock <= world.initial_clock() || clock > snapshot.present().system_time) {
         return Err(OwnedWorld::unavailable());
     }
     Ok(OpenWorld {

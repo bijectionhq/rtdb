@@ -167,7 +167,7 @@ pub(super) fn verify(
                 let matches_kind = match worlds.get(&record.id) {
                     Some(Kind::Drop) => record.dropped,
                     Some(Kind::Fork) => !record.dropped && record.id == record.pin,
-                    Some(Kind::Advance) => !record.dropped && !record.is_held() && record.id != record.pin,
+                    Some(Kind::Advance) => !record.dropped && !record.mode.is_writable() && record.id != record.pin,
                     _ => false,
                 };
                 if record.basis.system_time >= key.system_time || record.until <= key.system_time

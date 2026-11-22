@@ -1012,7 +1012,7 @@ impl<'a> OpenTransaction<'a> {
                             }
                         } else {
                             if world.pin != world.id { return Err(unavailable()); }
-                            if world.initial_clock() > world.inherited_clock() {
+                            if world.initial_clock() > world.inherited_clock() || world.mode == rtdb_types::WorldClockMode::Proposal {
                                 expected_tip = Some((world.basis.system_time, world.parent_publication));
                             }
                         }
@@ -1123,7 +1123,7 @@ impl<'a> OpenTransaction<'a> {
                 let root = relation.root_relation().ok_or_else(unavailable)?;
                 let base = self.buffer.base_snapshot();
                 if relation.world().and_then(|world| self.owned_worlds.get(&world))
-                    .is_none_or(|(record, _)| record.pin != *pin || (local_frontier.is_some() && !record.is_held()))
+                    .is_none_or(|(record, _)| record.pin != *pin || (local_frontier.is_some() && !record.mode.is_writable()))
                     || *frontier < 0
                     || base.contains_table(&rtdb_types::OwnedRelation::obsolete_purge_table(owner))
                     || base.relation_event_frontier(&root.purge_table(owner))? != *frontier
@@ -1194,26 +1194,28 @@ impl<'a> OpenTransaction<'a> {
         &mut self, world: Iid, attempt: &str, fingerprint: [u8; 32], expected: Option<Timestamp>,
         advance_to: Option<Timestamp>, drop_world: bool,
     ) -> Result<()> {
-        use rtdb_types::{OwnedRelation, OwnedWorld};
+        use rtdb_types::{OwnedRelation, OwnedWorld, WorldClockMode};
         let owner = self.options.user.as_deref().filter(|owner| !owner.is_empty()).ok_or_else(no_owned_principal)?;
         let record = &self.owned_worlds.get(&world).ok_or_else(OwnedWorld::unavailable)?.0;
-        if !record.is_held() && !drop_world {
+        if !record.mode.is_writable() && !drop_world {
             return Err(OwnedWorld::unavailable());
         }
         let initial_clock = record.initial_clock();
         let snapshot = self.buffer.base_snapshot();
         let context = self.context.query_context(snapshot, self.tx_key().system_time, &self.options.default_tz, self.trace_parent)?;
         let previous = rtdb_query::read_owned_world_clock(context, owner, world).await?;
-        if previous != expected || previous.is_some_and(|at| !record.is_held() || at <= initial_clock) {
+        if previous != expected || previous.is_some_and(|at| !record.mode.is_writable() || at <= initial_clock) {
             return Err(Anomaly::new(AnomalyCategory::Conflict, "rtdb.world/stale-clock", "The hosted world application clock changed"));
         }
         let head = previous.unwrap_or(initial_clock);
         let next = if drop_world {
             None
         } else {
-            Some(match advance_to {
-                Some(to) => to,
-                None => head.next()?,
+            Some(match (record.mode, advance_to) {
+                (WorldClockMode::Held { .. }, Some(to)) => to,
+                (WorldClockMode::Held { .. }, None) => head.next()?,
+                (WorldClockMode::Proposal, None) => self.tx_key().system_time,
+                _ => return Err(OwnedWorld::unavailable()),
             })
         };
         if next.is_some_and(|next| next <= head || next > self.tx_key().system_time) {
@@ -1391,16 +1393,19 @@ impl<'a> OpenTransaction<'a> {
                 return Err(Anomaly::incorrect("rtdb.owned/world-unique-uncovered", "World writes require inherited unique occupancy"));
             }
             let unavailable = rtdb_types::OwnedWorld::unavailable;
-            let (Some(from), Some(to)) = (from, to) else { return Err(unavailable()); };
+            let world = relation.world().ok_or_else(unavailable)?;
+            let (record, _) = self.owned_worlds.get(&world).ok_or_else(unavailable)?;
+            let (from, to, explicit) = match (record.mode, from, to) {
+                (mode, Some(from), Some(to)) if mode.is_writable() => (from, to, true),
+                (rtdb_types::WorldClockMode::Proposal, None, None) => (self.tx_key().system_time, Timestamp::MAX, false),
+                _ => return Err(unavailable()),
+            };
             if create_only || from >= to || !documents.has_exact_presence() {
                 return Err(unavailable());
             }
-            let world = relation.world().ok_or_else(unavailable)?;
-            let (record, _) = self.owned_worlds.get(&world).ok_or_else(unavailable)?;
-            if !record.is_held() { return Err(unavailable()); }
             let schema = record.schemas.relation(&root)
                 .ok_or_else(|| Anomaly::incorrect("rtdb.owned/world-undeclared", "World writes require a schema retained from the parent cut"))?;
-            schema.require_write_validity(true)?;
+            schema.require_write_validity(explicit)?;
             for row in documents.rows() {
                 let _scratch = self.context.memory.reserve(Value::document_retained_bytes(row)?
                     .checked_mul(2).and_then(|bytes| bytes.checked_add(4096)).ok_or_else(overflow)?)?;

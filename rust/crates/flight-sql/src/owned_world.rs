@@ -3,7 +3,7 @@ use std::sync::Arc;
 use futures::future::BoxFuture;
 use rtdb_columnar::MemoryReservation;
 use rtdb_node::{Database, NativeSession, Node, OwnedCountRequest, OwnedRangePage, OwnedRangeRequest, OwnedWorldWitness};
-use rtdb_types::{EntityId, Interval, OwnedRelation, Result, StructFields, Timestamp, TransactionKey, Value};
+use rtdb_types::{EntityId, Interval, OwnedRelation, Result, StructFields, Timestamp, TransactionKey, Value, WorldClockMode};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
@@ -52,7 +52,7 @@ pub trait OwnedWorldRead: Send + Sync {
     fn present(&self) -> Timestamp;
     fn application_clock(&self) -> Option<Timestamp>;
     fn initial_clock(&self) -> Timestamp;
-    fn is_held(&self) -> bool;
+    fn clock_mode(&self) -> WorldClockMode;
     fn parent_basis(&self) -> TransactionKey;
     fn ranked_search<'a>(
         &'a self, partitions: Vec<(OwnedRelation, OwnedRelation)>, query: String, offset: usize, limit: usize,

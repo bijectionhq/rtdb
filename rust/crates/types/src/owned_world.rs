@@ -63,6 +63,13 @@ impl WorldSchemas {
 pub enum WorldClockMode {
     Retained,
     Held { start: Timestamp },
+    Proposal,
+}
+
+impl WorldClockMode {
+    pub fn is_writable(self) -> bool {
+        self != Self::Retained
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -87,19 +94,16 @@ impl OwnedWorld {
 
     pub fn initial_clock(&self) -> Timestamp {
         match self.mode {
-            WorldClockMode::Retained => self.inherited_clock(),
+            WorldClockMode::Retained | WorldClockMode::Proposal => self.inherited_clock(),
             WorldClockMode::Held { start } => start,
         }
-    }
-
-    pub fn is_held(&self) -> bool {
-        matches!(self.mode, WorldClockMode::Held { .. })
     }
 
     pub fn record(&self) -> StructFields<Value> {
         let (mode, start) = match self.mode {
             WorldClockMode::Retained => ("retained", Value::Null),
             WorldClockMode::Held { start } => ("held", Value::I64(start.0)),
+            WorldClockMode::Proposal => ("proposal", Value::Null),
         };
         let mut row = StructFields::from([
             ("_id".into(), Value::Uuid(self.id.0)),
@@ -155,6 +159,7 @@ impl OwnedWorld {
         let inherited = parent_publication.unwrap_or(Timestamp(*time));
         let mode = match (row.get("mode"), row.get("held_start")) {
             (Some(Value::Utf8(mode)), Some(Value::Null)) if mode == "retained" => WorldClockMode::Retained,
+            (Some(Value::Utf8(mode)), Some(Value::Null)) if mode == "proposal" => WorldClockMode::Proposal,
             (Some(Value::Utf8(mode)), Some(Value::I64(start))) if mode == "held"
                 && *start >= inherited.0 && *start < Timestamp::MAX.0 => WorldClockMode::Held { start: Timestamp(*start) },
             _ => return Err(Self::unavailable()),
@@ -198,7 +203,7 @@ impl OwnedWorld {
         self.id == next.id
             && self.pin != next.pin
             && !self.dropped && !next.dropped
-            && !self.is_held() && !next.is_held()
+            && self.mode == WorldClockMode::Retained && next.mode == WorldClockMode::Retained
             && self.until == next.until
             && self.basis.system_time < next.basis.system_time
             && self.basis.tx_id < next.basis.tx_id
