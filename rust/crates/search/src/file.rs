@@ -765,7 +765,7 @@ impl SearchFile {
 
     pub(crate) fn rows_for_key<'a>(&'a self, iid: &[u8; 16], key: &'a [u8]) -> impl Iterator<Item = Result<(u32, KeyedEvent)>> + 'a {
         self.sidecar.rows_of(iid).filter(move |row| self.sidecar.row_identity(*row) == key)
-            .map(|row| Ok((row, self.sidecar.key(row)?)))
+            .map(move |row| Ok((row, self.sidecar.key(row)?)))
     }
 
     /// A row's run in a column: `None` where the row is visible nowhere within the file, `Some(None)` where it is visible with the column null or absent.
