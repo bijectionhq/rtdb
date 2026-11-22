@@ -8,7 +8,7 @@ use bytes::Bytes;
 use prost::Message;
 use rtdb_columnar::{MemoryReservation, OwnedBatch};
 use rtdb_format::ipc::{OwnedStream, write_arrow_stream};
-use rtdb_node::{NativeSession, OwnedCountRequest, OwnedRangeRequest, OwnedRangeWitness, OwnedReadSession, TransactionStatus};
+use rtdb_node::{NativeSession, OwnedCountRequest, OwnedRangeRequest, OwnedRangeWitness, OwnedReadSession, OwnedValidHistory, TransactionStatus};
 use rtdb_query::QueryCursor;
 use rtdb_tx::{Documents, TxOp};
 use rtdb_types::{EntityId, LogicalType, OwnedRelation, ScalarType, StructFields, TimeUnit, Timestamp, Value};
@@ -98,6 +98,7 @@ pub(crate) const OPEN_OWNED_READ_V1: &str = "rtdb.owned.OpenRead.v1";
 pub(crate) const HELD_OWNED_POINT_V1: &str = "rtdb.owned.ReadHeldPoint.v1";
 pub(crate) const HELD_OWNED_POINT_V2: &str = "rtdb.owned.ReadHeldPoint.v2";
 pub(crate) const HELD_OWNED_VALID_DURING_V1: &str = "rtdb.owned.ReadHeldValidDuring.v1";
+pub(crate) const HELD_OWNED_VERSIONS_V1: &str = "rtdb.owned.ReadHeldVersions.v1";
 pub(crate) const CLOSE_OWNED_READ_V1: &str = "rtdb.owned.CloseRead.v1";
 pub(crate) const READ_WORLD_POINT_V1: &str = "rtdb.owned.ReadWorldPoint.v1";
 pub(crate) const OPEN_WORLD_READ_V1: &str = "rtdb.owned.OpenWorldRead.v1";
@@ -117,6 +118,8 @@ const OWNED_VALID: &str = "rtdb.owned.valid_micros";
 const OWNED_VALID_FROM: &str = "rtdb.owned.valid_from_micros";
 const OWNED_VALID_TO: &str = "rtdb.owned.valid_to_micros";
 const MAX_HISTORY_SLICES: usize = 4096;
+const OWNED_VERSION_REVISION: &str = "rtdb.owned.version_revision";
+const OWNED_VERSION_TIME: &str = "rtdb.owned.version_micros";
 const OWNED_REVISION: &str = "rtdb.owned.revision_micros";
 const OWNED_CHANGE_COVERAGE: &str = "rtdb.owned.change_coverage_micros";
 
@@ -140,6 +143,7 @@ type Witnesses = Vec<(Arc<OwnedReadResource>, OwnedRangeWitness)>;
 
 impl OwnedReadResource {
     fn remember(&self, call: &Call, relation: &OwnedRelation, evidence: OwnedRangeWitness) -> Result<Uuid, Status> {
+        self.snapshot.check().map_err(status)?;
         let mut witnesses = self.witnesses.lock().map_err(|_| Status::internal("Owned range witness storage is unavailable"))?;
         if let Some(witness) = witnesses.get(relation.name()) {
             return Ok(witness.nonce);
@@ -157,6 +161,48 @@ impl OwnedReadResource {
         });
         Ok(nonce)
     }
+}
+
+enum HistoryRead<'a> {
+    Observed { read: OwnedValidHistory<'a>, held: &'a OwnedReadResource, relation: &'a OwnedRelation },
+    Version(QueryCursor),
+}
+
+impl HistoryRead<'_> {
+    async fn next_batch(&mut self) -> rtdb_types::Result<Option<OwnedBatch>> {
+        match self {
+            Self::Observed { read, .. } => read.next_batch().await,
+            Self::Version(cursor) => cursor.next_batch().await,
+        }
+    }
+
+    fn runtime_schema(&self) -> Option<&rtdb_plan::Schema> {
+        match self {
+            Self::Observed { read, .. } => read.runtime_schema(),
+            Self::Version(cursor) => Some(cursor.runtime_schema()),
+        }
+    }
+
+    fn witness_nonce(&self, call: &Call) -> Result<Option<Uuid>, Status> {
+        match self {
+            Self::Observed { read, held, relation } => {
+                read.witness().map_err(status)?.map(|evidence| held.remember(call, relation, evidence)).transpose()
+            }
+            Self::Version(_) => Ok(None),
+        }
+    }
+}
+
+fn witnessed_schema(
+    call: &Call, held: &OwnedReadResource, relation: &OwnedRelation, schema: &Schema,
+    evidence: Option<OwnedRangeWitness>,
+) -> Result<Option<(Schema, Arc<MemoryReservation>)>, Status> {
+    let Some(evidence) = evidence else { return Ok(None); };
+    let charge = call.reserve(wire::add(wire::schema_bound(schema)?, 256)?)?;
+    let nonce = held.remember(call, relation, evidence)?;
+    let mut metadata = schema.metadata().clone();
+    metadata.insert(OWNED_RANGE_WITNESS.into(), nonce.simple().to_string());
+    Ok(Some((schema.clone().with_metadata(metadata), charge)))
 }
 
 impl Leased for OwnedReadResource {
@@ -497,37 +543,97 @@ impl Service {
         if valid.is_empty() { return Err(invalid("Owned history requires a nonempty valid window")); }
 
         let present = held.snapshot.present().system_time;
+        let history = held.snapshot.open_valid_during_observed(&relation, &id, valid).await.map_err(status)?;
+        let read = HistoryRead::Observed { read: history, held: &held, relation: &relation };
+        let reply = self.history_reply(call, &id, read, valid, present, None).await?;
+        held.snapshot.check().map_err(status)?;
+        Ok(reply)
+    }
+
+    pub(crate) async fn held_owned_versions_action(&self, call: &Call, body: &[u8]) -> Result<Vec<ActionResult>, Status> {
+        use rtdb_types::Interval;
+
+        if !self.0.config.owned_native_actions { return Err(unsupported()); }
+        let (handle, request) = body.split_first_chunk::<16>().ok_or_else(|| invalid("Owned versions has no held handle"))?;
+        let handle = Bytes::copy_from_slice(handle);
+        let held = self.owned_read(call, &handle)?;
+        if let Err(error) = held.snapshot.check() {
+            if let Lookup::Found(entry) = self.0.owned_reads.take(&handle) { entry.close(); }
+            return Err(status(error));
+        }
+        let (relation, arrow_bytes) = split_relation(request)?;
+        let batch = request_batch(call, arrow_bytes)?;
+        let batch = batch.batch();
+        if batch.num_columns() != 5 || batch.num_rows() != 1 {
+            return Err(invalid("Owned versions requires one row with identity, system endpoints, and pagination fields"));
+        }
+        let (id, _identity) = point_identity(call, batch)?;
+        let from = history_request_endpoint(batch, "system_from_micros")?;
+        let to = history_request_endpoint(batch, "system_to_micros")?;
+        let system = Interval::new(from, to).map_err(status)?;
+        let after = u64::try_from(history_request_integer(batch, "after_revision")?)
+            .map_err(|_| invalid("Owned version revision must be nonnegative"))?;
+        let limit = usize::try_from(history_request_integer(batch, "limit")?)
+            .map_err(|_| invalid("Owned version limit is out of range"))?;
+        let page = held.snapshot.versions(&relation, &id, system, after, limit).await.map_err(status)?;
+        let present = held.snapshot.present().system_time;
+        let _framing = call.reserve(wire::mul(page.versions.len() + 1, 512)?)?;
+        let header_charge = call.reserve(64)?;
+        let mut header = Vec::with_capacity(17);
+        header.extend_from_slice(&page.next_revision.to_be_bytes());
+        header.push(u8::from(page.done));
+        header.extend_from_slice(&page.floor.0.to_be_bytes());
+        let header = ActionResult { body: wire::retain(header, header_charge) };
+        let mut bytes = header.encoded_len();
+        let mut results = vec![header];
+        for version in page.versions {
+            let reply = self.history_reply(call, &id, HistoryRead::Version(version.timeline), Interval::ALL, present,
+                Some((version.revision, version.system_time))).await?;
+            bytes = wire::add(bytes, reply.encoded_len())?;
+            if bytes > self.0.config.maximum_message_bytes {
+                return Err(Status::resource_exhausted("Owned version page exceeds the Flight response limit"));
+            }
+            results.push(reply);
+        }
+        held.snapshot.check().map_err(status)?;
+        Ok(results)
+    }
+
+    async fn history_reply(
+        &self, call: &Call, id: &EntityId, mut read: HistoryRead<'_>, valid: rtdb_types::Interval,
+        present: Timestamp, version: Option<(u64, Timestamp)>,
+    ) -> Result<ActionResult, Status> {
+        let (from, to) = (valid.lower(), valid.upper());
+        let as_of = version.map_or(present, |(_, system)| system);
         let mut pages = Vec::new();
         let mut rows = 0usize;
         let mut retained_bytes = 0usize;
         let mut last_end = from;
         let empty_schema;
-        let schema = if let Some(mut cursor) = held.snapshot.open_valid_during(&relation, &id, valid).await.map_err(status)? {
-            while let Some(page) = cursor.next_batch().await.map_err(status)? {
-                let batch = page.batch();
-                if batch.num_rows() == 0 { continue; }
-                rows = wire::add(rows, batch.num_rows())?;
-                retained_bytes = wire::add(retained_bytes, batch.get_array_memory_size())?;
-                if rows > MAX_HISTORY_SLICES || retained_bytes > self.0.config.maximum_message_bytes {
-                    return Err(Status::resource_exhausted("Owned history exceeds its slice or response limit"));
-                }
-                for row in 0..batch.num_rows() {
-                    let start = history_row_time(batch, "_valid_from", row)?.ok_or_else(history_invalid)?;
-                    let end = history_row_time(batch, "_valid_to", row)?.unwrap_or(Timestamp::MAX);
-                    let revision = rtdb_query::owned_row_revision(batch, row, &id, self.memory()).map_err(status)?;
-                    if start < last_end || start >= end || end > to || revision > present {
-                        return Err(history_invalid());
-                    }
-                    last_end = end;
-                }
-                pages.push(page);
+        while let Some(page) = read.next_batch().await.map_err(status)? {
+            let batch = page.batch();
+            if batch.num_rows() == 0 { continue; }
+            rows = wire::add(rows, batch.num_rows())?;
+            retained_bytes = wire::add(retained_bytes, batch.get_array_memory_size())?;
+            if rows > MAX_HISTORY_SLICES || retained_bytes > self.0.config.maximum_message_bytes {
+                return Err(Status::resource_exhausted("Owned history exceeds its slice or response limit"));
             }
-            if let Some(page) = pages.first() {
-                page.batch().schema()
-            } else {
-                empty_schema = wire::plan_schema(cursor.runtime_schema(), self.memory())?;
-                Arc::new((*empty_schema).clone())
+            for row in 0..batch.num_rows() {
+                let start = history_row_time(batch, "_valid_from", row)?.ok_or_else(history_invalid)?;
+                let end = history_row_time(batch, "_valid_to", row)?.unwrap_or(Timestamp::MAX);
+                let revision = rtdb_query::owned_row_revision(batch, row, id, self.memory()).map_err(status)?;
+                if start < last_end || start >= end || end > to || revision > as_of {
+                    return Err(history_invalid());
+                }
+                last_end = end;
             }
+            pages.push(page);
+        }
+        let schema = if let Some(page) = pages.first() {
+            page.batch().schema()
+        } else if let Some(schema) = read.runtime_schema() {
+            empty_schema = wire::plan_schema(schema, self.memory())?;
+            Arc::new((*empty_schema).clone())
         } else {
             Arc::new(Schema::empty())
         };
@@ -536,13 +642,18 @@ impl Service {
         metadata.insert(OWNED_PRESENT.into(), present.0.to_string());
         metadata.insert(OWNED_VALID_FROM.into(), from.0.to_string());
         metadata.insert(OWNED_VALID_TO.into(), to.0.to_string());
+        if let Some((revision, time)) = version {
+            metadata.insert(OWNED_VERSION_REVISION.into(), revision.to_string());
+            metadata.insert(OWNED_VERSION_TIME.into(), time.0.to_string());
+        }
+        if let Some(nonce) = read.witness_nonce(call)? {
+            metadata.insert(OWNED_RANGE_WITNESS.into(), nonce.simple().to_string());
+        }
         let schema = Arc::new(schema.as_ref().clone().with_metadata(metadata));
         let response = pages.iter().map(|page| {
             RecordBatch::try_new(Arc::clone(&schema), page.batch().columns().to_vec()).map_err(arrow)
         }).collect::<Result<Vec<_>, _>>()?;
-        let reply = self.owned_stream_reply(&schema, &response)?;
-        held.snapshot.check().map_err(status)?;
-        Ok(reply)
+        self.owned_stream_reply(&schema, &response)
     }
 
     pub(crate) async fn held_owned_range_action(&self, call: &Call, body: &[u8], full_key: bool) -> Result<ActionResult, Status> {
@@ -585,14 +696,9 @@ impl Service {
             held.snapshot.range(&relation, &path, lower, upper, limit).await.map(|page| (page, None))
         }.map_err(status)?;
         let present = held.snapshot.present().system_time;
-        let _metadata = evidence.as_ref().map(|_| call.reserve(wire::add(wire::schema_bound(&page.schema)?, 256)?)).transpose()?;
-        let schema = if let Some(evidence) = evidence {
-            let nonce = held.remember(call, &relation, evidence)?;
-            let mut metadata = page.schema.metadata().clone();
-            metadata.insert(OWNED_RANGE_WITNESS.into(), nonce.simple().to_string());
-            Some(page.schema.as_ref().clone().with_metadata(metadata))
-        } else { None };
-        let reply = self.owned_point_reply(schema.as_ref().unwrap_or(page.schema.as_ref()), page.batch.as_ref().map(OwnedBatch::batch), present, present, None)?;
+        let observed = witnessed_schema(call, &held, &relation, &page.schema, evidence)?;
+        let schema = observed.as_ref().map_or(page.schema.as_ref(), |(schema, _)| schema);
+        let reply = self.owned_point_reply(schema, page.batch.as_ref().map(OwnedBatch::batch), present, present, None)?;
         held.snapshot.check().map_err(status)?;
         Ok(reply)
     }
@@ -622,10 +728,12 @@ impl Service {
             upper: compound_bound(Some(upper))?,
             valid_at: Timestamp(*valid),
         };
-        let counted = held.snapshot.count_range(&relation, &path, request).await.map_err(status)?;
+        let (counted, evidence) = held.snapshot.count_range_observed(&relation, &path, request).await.map_err(status)?;
         let schema = Arc::new(Schema::new(vec![Field::new("count", DataType::UInt64, false)]));
         let batch = RecordBatch::try_new(Arc::clone(&schema), vec![Arc::new(UInt64Array::from(vec![counted.count]))]).map_err(arrow)?;
-        let reply = self.owned_point_reply(&schema, Some(&batch), counted.present, counted.valid_at, None)?;
+        let observed = witnessed_schema(call, &held, &relation, &schema, evidence)?;
+        let output_schema = observed.as_ref().map_or(schema.as_ref(), |(schema, _)| schema);
+        let reply = self.owned_point_reply(output_schema, Some(&batch), counted.present, counted.valid_at, None)?;
         held.snapshot.check().map_err(status)?;
         Ok(reply)
     }
@@ -1056,15 +1164,19 @@ fn point_identity(call: &Call, batch: &RecordBatch) -> Result<(EntityId, Arc<Mem
 }
 
 fn history_request_endpoint(batch: &RecordBatch, name: &str) -> Result<Timestamp, Status> {
+    history_request_integer(batch, name).map(Timestamp)
+}
+
+fn history_request_integer(batch: &RecordBatch, name: &str) -> Result<i64, Status> {
     let (column, field) = batch.schema_ref().column_with_name(name)
-        .ok_or_else(|| invalid("Owned history has no valid endpoint"))?;
+        .ok_or_else(|| invalid("Owned history is missing a required integer field"))?;
     if field.data_type() != &DataType::Int64 || !field.metadata().is_empty() {
-        return Err(invalid("Owned history valid endpoints must be Int64"));
+        return Err(invalid("Owned history integer fields must be Int64"));
     }
     let values = batch.column(column).as_any().downcast_ref::<Int64Array>()
-        .ok_or_else(|| invalid("Owned history valid endpoints must be Int64"))?;
-    if values.is_null(0) { return Err(invalid("Owned history valid endpoints must be explicit")); }
-    Ok(Timestamp(values.value(0)))
+        .ok_or_else(|| invalid("Owned history integer fields must be Int64"))?;
+    if values.is_null(0) { return Err(invalid("Owned history integer fields must be non-null")); }
+    Ok(values.value(0))
 }
 
 fn history_row_time(batch: &RecordBatch, name: &str, row: usize) -> Result<Option<Timestamp>, Status> {

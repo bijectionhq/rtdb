@@ -383,6 +383,66 @@ async fn held_owned_point_reads_an_explicit_valid_instant_at_the_original_system
 }
 
 #[tokio::test]
+async fn held_owned_versions_page_source_groups_and_include_an_empty_deleted_timeline() {
+    use rtdb_types::{EntityId, Interval, OwnedRelation};
+    let mut settings = options();
+    settings.owned_relations = true;
+    let (node, driver) = running(settings, services()).await;
+    let mut writer = node.session("xtdb", Arc::new(Authority)).unwrap();
+    let relation = OwnedRelation::new("system-history").unwrap();
+    let id = EntityId::Integer(1);
+    let docs = |id, value| Documents::new(vec![StructFields::from([
+        ("_id".into(), Value::I64(id)), ("value".into(), Value::I64(value)),
+    ])], node.memory()).unwrap();
+    let make = |id, value| TxOp::OwnedInsertDocs {
+        relation: relation.clone(), documents: docs(id, value), valid_from: Some(Timestamp(0)), valid_to: None,
+    };
+    let first = writer.state_mut().execute_tx(vec![make(1, 10)], AutonomousTxOptions::default()).await.unwrap();
+    assert!(first.committed());
+    assert!(writer.state_mut().execute_tx(vec![make(2, 99)], AutonomousTxOptions::default()).await.unwrap().committed());
+    let correction = TxOp::OwnedReplaceDocs {
+        relation: relation.clone(), documents: docs(1, 20), valid_from: Some(Timestamp(5)), valid_to: Some(Timestamp(10)),
+    };
+    let changed = writer.state_mut().execute_tx(vec![correction], AutonomousTxOptions::default()).await.unwrap();
+    assert!(changed.committed());
+    let delete = TxOp::OwnedDelete {
+        relation: relation.clone(), id: id.clone(), valid_from: Some(Timestamp::MIN), valid_to: Some(Timestamp::MAX),
+    };
+    let deleted = writer.state_mut().execute_tx(vec![delete], AutonomousTxOptions::default()).await.unwrap();
+    assert!(deleted.committed());
+
+    let held = writer.open_owned_read().await.unwrap();
+    let floor = first.tx_key().system_time;
+    let through = held.present().system_time.next().unwrap();
+    let window = Interval::new(floor, through).unwrap();
+    let refused = Interval::new(Timestamp::MIN, through).unwrap();
+    assert_eq!(held.versions(&relation, &id, refused, 0, 1).await.err().unwrap().code, "rtdb.owned/version-floor");
+    let mut page = held.versions(&relation, &id, window, 0, 1).await.unwrap();
+    assert_eq!(page.floor, floor);
+    assert_eq!(page.next_revision, 1);
+    assert!(!page.done);
+    let first_version = page.versions.pop().unwrap();
+    assert_eq!(first_version.system_time, floor);
+    assert_eq!(rows(first_version.timeline).await.len(), 1);
+    let skipped = held.versions(&relation, &id, window, page.next_revision, 1).await.unwrap();
+    assert_eq!(skipped.next_revision, 2);
+    assert!(skipped.versions.is_empty());
+    let mut last = held.versions(&relation, &id, window, skipped.next_revision, 2).await.unwrap();
+    assert!(last.done);
+    assert_eq!(last.next_revision, 4);
+    let tombstoned = last.versions.pop().unwrap();
+    assert_eq!(tombstoned.system_time, deleted.tx_key().system_time);
+    assert!(rows(tombstoned.timeline).await.is_empty());
+    let corrected = last.versions.pop().unwrap();
+    assert_eq!(corrected.system_time, changed.tx_key().system_time);
+    assert_eq!(rows(corrected.timeline).await.len(), 3);
+
+    drop(held);
+    drop(writer);
+    stop(&node, driver).await;
+}
+
+#[tokio::test]
 async fn held_owned_valid_during_clips_winners_and_omits_deleted_windows() {
     use rtdb_types::{EntityId, Interval, OwnedRelation, TimeUnit};
 
@@ -413,9 +473,10 @@ async fn held_owned_valid_during_clips_winners_and_omits_deleted_windows() {
     assert!(writer.state_mut().execute_tx(vec![delete(60, 90)], AutonomousTxOptions::default()).await.unwrap().committed());
 
     let valid = Interval::from_micros(10, 70).unwrap();
-    let mut cursor = held.open_valid_during(&relation, &id, valid).await.unwrap().unwrap();
+    let mut history = held.open_valid_during_observed(&relation, &id, valid).await.unwrap();
+    assert!(history.witness().is_err());
     let mut actual = Vec::new();
-    while let Some(batch) = cursor.next_batch().await.unwrap() {
+    while let Some(batch) = history.next_batch().await.unwrap() {
         let batch = batch.batch();
         let read = |name, row| {
             let (slot, field) = batch.schema_ref().column_with_name(name).unwrap();
@@ -435,7 +496,14 @@ async fn held_owned_valid_during_clips_winners_and_omits_deleted_windows() {
         (40, 60, Value::I64(20), second.tx_key().system_time.0),
         (60, 70, Value::I64(10), first.tx_key().system_time.0),
     ]);
-    drop(cursor);
+    assert!(history.witness().unwrap().is_none(), "standalone holds do not issue ordered witnesses");
+    drop(history);
+    let missing = EntityId::Integer(2);
+    let mut absent = held.open_valid_during_observed(&relation, &missing, valid).await.unwrap();
+    assert!(absent.witness().is_err());
+    assert!(absent.next_batch().await.unwrap().is_none());
+    assert!(absent.witness().unwrap().is_none());
+    drop(absent);
     drop(held);
     drop(writer);
     stop(&node, driver).await;
@@ -614,7 +682,8 @@ async fn held_owned_range_requires_a_covering_generation() {
         let request = rtdb_node::OwnedCountRequest {
             lower: Some(&lower), upper: Some(&upper), valid_at: Timestamp(valid_at),
         };
-        let result = held.count_range(&relation, &path, request).await.unwrap();
+        let (result, witness) = held.count_range_observed(&relation, &path, request).await.unwrap();
+        assert!(witness.is_none(), "standalone counts do not issue ordered witnesses");
         assert_eq!(result.count, expected);
         assert_eq!(result.present, held.present().system_time);
         assert_eq!(result.valid_at, Timestamp(valid_at));

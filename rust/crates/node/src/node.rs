@@ -886,6 +886,55 @@ pub struct OwnedChangePage {
     _reservations: Vec<Arc<rtdb_columnar::MemoryReservation>>,
 }
 
+/// A held history cursor that can issue relation evidence only after successful exhaustion.
+pub struct OwnedValidHistory<'a> {
+    held: &'a OwnedReadSession,
+    relation: &'a rtdb_types::OwnedRelation,
+    cursor: Option<QueryCursor>,
+    complete: bool,
+    failed: bool,
+}
+
+impl OwnedValidHistory<'_> {
+    pub fn runtime_schema(&self) -> Option<&rtdb_plan::Schema> {
+        self.cursor.as_ref().map(QueryCursor::runtime_schema)
+    }
+
+    pub async fn next_batch(&mut self) -> Result<Option<rtdb_columnar::OwnedBatch>> {
+        if self.failed {
+            return Err(Anomaly::fault("rtdb.owned/history-read", "An owned history cursor failed"));
+        }
+        let result = match &mut self.cursor {
+            Some(cursor) => cursor.next_batch().await,
+            None => Ok(None),
+        };
+        self.complete = matches!(&result, Ok(None));
+        self.failed = result.is_err();
+        result
+    }
+
+    pub fn witness(&self) -> Result<Option<OwnedRangeWitness>> {
+        if !self.complete || self.failed {
+            return Err(Anomaly::fault("rtdb.owned/history-read", "Owned history must complete before issuing evidence"));
+        }
+        self.held.relation_witness(self.relation)
+    }
+}
+
+pub struct OwnedVersion {
+    pub revision: u64,
+    pub system_time: Timestamp,
+    pub timeline: QueryCursor,
+}
+
+pub struct OwnedVersionPage {
+    pub floor: Timestamp,
+    pub next_revision: u64,
+    pub done: bool,
+    pub versions: Vec<OwnedVersion>,
+    _reservation: Arc<rtdb_columnar::MemoryReservation>,
+}
+
 /// A database-scoped capture held by the same authenticated native session.
 pub struct OwnedReadSession {
     context: Arc<QueryContext>,
@@ -934,6 +983,105 @@ impl OwnedReadSession {
         rtdb_query::open_owned_valid_during(Arc::clone(&self.context), &self.owner, relation, id, valid).await
     }
 
+    pub async fn open_valid_during_observed<'a>(
+        &'a self, relation: &'a rtdb_types::OwnedRelation, id: &rtdb_types::EntityId,
+        valid: rtdb_types::Interval,
+    ) -> Result<OwnedValidHistory<'a>> {
+        let cursor = self.open_valid_during(relation, id, valid).await?;
+        Ok(OwnedValidHistory { held: self, relation, cursor, complete: false, failed: false })
+    }
+
+    /// Pages source-group versions of one full identity inside a certified system window.
+    pub async fn versions(
+        &self, relation: &rtdb_types::OwnedRelation, id: &rtdb_types::EntityId,
+        system: rtdb_types::Interval, after: u64, limit: usize,
+    ) -> Result<crate::OwnedVersionPage> {
+        use rtdb_query::OwnedChangeEntry;
+        use rtdb_types::{Interval, OWNED_CHANGE_PAGE_GROUPS, OwnedChange, change_feed_uncovered};
+
+        if system.is_empty() || system.upper() > self.present.system_time.next()?
+            || !(1..=OWNED_CHANGE_PAGE_GROUPS).contains(&limit)
+        {
+            return Err(Anomaly::incorrect("rtdb.owned/version-window", "Versions require a nonempty system window at or before the held cut and up to 128 groups"));
+        }
+        self.admit_read().await?;
+        let read = |revision| rtdb_query::read_owned_change_entry(
+            Arc::clone(&self.context), &self.owner, relation, revision,
+        );
+        let database = self.context.catalog.database(&self.database)?;
+        let [snapshot] = database.partitions.as_slice() else { return Err(change_feed_uncovered()); };
+        let journal = relation.change_journal(&self.owner)?;
+        let frontier = snapshot.relation_event_frontier(&journal)?;
+        if frontier < 2 || snapshot.tx_basis() != Some(self.present) { return Err(change_feed_uncovered()); }
+        let through = u64::try_from(frontier - 1).map_err(|_| change_feed_uncovered())?;
+        if after > through { return Err(change_feed_uncovered()); }
+        let OwnedChangeEntry { value: marker, through_events: base_events, system_time: floor, retained: _floor_charge } = read(0).await?;
+        if marker != Value::Null || floor > self.present.system_time { return Err(change_feed_uncovered()); }
+        if system.lower() < floor {
+            return Err(Anomaly::new(AnomalyCategory::Unavailable, "rtdb.owned/version-floor", "The requested system window precedes the certified owned history floor")
+                .with_context("history-floor-micros", floor.0.into()));
+        }
+        let OwnedChangeEntry { value: head, through_events: head_events, system_time: head_time, retained: _head_charge } = read(frontier - 1).await?;
+        if !matches!(head, Value::List(touches) if !touches.is_empty()) || head_events <= base_events
+            || head_time < floor || head_time > self.present.system_time
+            || head_events != snapshot.relation_event_frontier(&relation.table(&self.owner))?
+        {
+            return Err(change_feed_uncovered());
+        }
+        let (mut covered, mut previous_time) = if after == 0 { (base_events, floor) } else {
+            let OwnedChangeEntry { value: entry, through_events: count, system_time: time, retained: _charge } = read(i64::try_from(after).map_err(|_| change_feed_uncovered())?).await?;
+            if !matches!(entry, Value::List(touches) if !touches.is_empty())
+                || count <= base_events || count > head_events || time < floor || time > head_time
+            {
+                return Err(change_feed_uncovered());
+            }
+            (count, time)
+        };
+        let mut page = crate::OwnedVersionPage {
+            floor, next_revision: after, done: after == through,
+            versions: Vec::with_capacity(limit), _reservation: self.context.memory.reserve(limit * 512)?,
+        };
+        if after != 0 && previous_time >= system.upper() {
+            self.check()?;
+            page.done = true;
+            return Ok(page);
+        }
+        for revision in after + 1..=through.min(after + limit as u64) {
+            self.check()?;
+            let OwnedChangeEntry { value: entry, through_events: count, system_time: time, retained: _charge } = read(i64::try_from(revision).map_err(|_| change_feed_uncovered())?).await?;
+            let Value::List(touches) = entry else { return Err(change_feed_uncovered()); };
+            let increment = i64::try_from(touches.len()).map_err(|_| change_feed_uncovered())?;
+            if increment == 0 || covered.checked_add(increment) != Some(count) || count > head_events
+                || (if revision == 1 { time != floor } else { time <= previous_time }) || time > head_time
+            {
+                return Err(change_feed_uncovered());
+            }
+            covered = count;
+            previous_time = time;
+            page.next_revision = revision;
+            if time >= system.upper() {
+                page.done = true;
+                break;
+            }
+            if time < system.lower() { continue; }
+            let mut touched = false;
+            for touch in &touches {
+                touched |= &OwnedChange::from_value(touch)?.id == id;
+            }
+            if touched {
+                let timeline = rtdb_query::open_owned_valid_during_at(
+                    Arc::clone(&self.context), &self.owner, relation, id, Interval::ALL, time,
+                ).await?;
+                // A source group touching this identity must already have an address, even after a complete delete.
+                let timeline = timeline.ok_or_else(change_feed_uncovered)?;
+                page.versions.push(crate::OwnedVersion { revision, system_time: time, timeline });
+            }
+        }
+        page.done |= page.next_revision == through;
+        self.check()?;
+        Ok(page)
+    }
+
     /// Computes the visible corpus of one covered clear-text path at this read's cut.
     #[cfg(feature = "search")]
     pub async fn search_corpus(
@@ -980,7 +1128,13 @@ impl OwnedReadSession {
         request: crate::OwnedRangeRequest<'_>,
     ) -> Result<(crate::OwnedRangePage, Option<OwnedRangeWitness>)> {
         let page = self.range_page_by_key(relation, path, request).await?;
-        let Some(scope) = self.witness_scope else { return Ok((page, None)); };
+        let evidence = self.relation_witness(relation)?;
+        Ok((page, evidence))
+    }
+
+    fn relation_witness(&self, relation: &rtdb_types::OwnedRelation) -> Result<Option<OwnedRangeWitness>> {
+        self.check()?;
+        let Some(scope) = self.witness_scope else { return Ok(None); };
         let database = self.context.catalog.database(&self.database)?;
         let [snapshot] = database.partitions.as_slice() else {
             return Err(Anomaly::incorrect("rtdb.owned/range-witness", "An owned range witness requires one held partition"));
@@ -990,9 +1144,9 @@ impl OwnedReadSession {
             return Err(Anomaly::incorrect("rtdb.owned/range-witness", "The exact owned range basis is unavailable"));
         }
         self.check()?;
-        Ok((page, Some(OwnedRangeWitness {
+        Ok(Some(OwnedRangeWitness {
             relation: relation.clone(), basis: self.present, scope, frontier, until: self.witness_until,
-        })))
+        }))
     }
 
     /// Reads whole ordered owner-relation groups after an exclusive system time.
@@ -1110,6 +1264,15 @@ impl OwnedReadSession {
         let result = crate::ordered_index::owned_count(Arc::clone(&self.context), &self.owner, relation, path, request).await?;
         self.check()?;
         Ok(result)
+    }
+
+    pub async fn count_range_observed(
+        &self, relation: &rtdb_types::OwnedRelation, path: &rtdb_types::OwnedRelation,
+        request: crate::OwnedCountRequest<'_>,
+    ) -> Result<(crate::OwnedRangeCount, Option<OwnedRangeWitness>)> {
+        let counted = self.count_range(relation, path, request).await?;
+        let evidence = self.relation_witness(relation)?;
+        Ok((counted, evidence))
     }
 
     async fn range_page(
