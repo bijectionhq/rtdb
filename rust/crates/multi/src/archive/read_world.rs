@@ -25,7 +25,7 @@ use uuid::Uuid;
 use super::{
     ArchivedObject, CellStorage, Cipher, KeyService, PrefixedStore, archive_witness,
     capture_receipt, inconsistent, key, read, read_object, replica_suffix, require_capture_open, stage,
-    unavailable, verified_archive,
+    read_archive_lifetime_floors, unavailable, verified_archive,
 };
 
 /// Reopenable locator for one independently retained published cut.
@@ -267,11 +267,33 @@ where
                         BlockDiscovery::AtPublished(checkpoint),
                     )
                     .await?;
-                if recovered.partition.snapshot().tx_basis().is_none_or(|basis|
-                    basis.system_time.0 != capture.checkpoint.system_time
-                ) {
-                    return Err(inconsistent("The retained checkpoint has a different transaction key"));
-                }
+                let base_snapshot = recovered.partition.snapshot();
+                let base_basis = base_snapshot.tx_basis()
+                    .filter(|basis| basis.system_time.0 == capture.checkpoint.system_time)
+                    .ok_or_else(|| inconsistent("The retained checkpoint has a different transaction key"))?;
+                let name = record.name;
+                let query_context = |partitions, basis: TransactionKey| {
+                    let catalog = CatalogSnapshot::new(
+                        &name,
+                        BTreeMap::from([(name.clone(), DatabaseSnapshot {
+                            partitions,
+                            storage: Arc::clone(&storage),
+                        })]),
+                        true,
+                    )?;
+                    QueryContext::new(
+                        catalog, Arc::clone(&memory), basis.system_time, "UTC",
+                        resources.node.query.clone(), resources.cancellation,
+                    )
+                };
+                let base_floors = if suffix.is_some() {
+                    let base_snapshot = base_snapshot.with_system_time_cap(Some(base_basis.system_time))?;
+                    let context = query_context(vec![base_snapshot], base_basis)?;
+                    Some(read_archive_lifetime_floors(context, base_basis).await?)
+                } else {
+                    drop(base_snapshot);
+                    None
+                };
                 match (selected.suffix, suffix) {
                     (Some(suffix), Some(pin)) => {
                         replica_suffix::apply_archived(
@@ -288,26 +310,20 @@ where
                     return Err(inconsistent("The retained checkpoint has a different transaction key"));
                 }
                 let snapshot = snapshot.with_system_time_cap(Some(basis.system_time))?;
-                let name = record.name;
-                let catalog = CatalogSnapshot::new(
-                    &name,
-                    BTreeMap::from([(
-                        name.clone(),
-                        DatabaseSnapshot {
-                            partitions: vec![snapshot],
-                            storage,
-                        },
-                    )]),
-                    true,
-                )?;
-                let context = QueryContext::new(
-                    catalog,
-                    memory,
-                    basis.system_time,
-                    "UTC",
-                    resources.node.query.clone(),
-                    resources.cancellation,
-                )?;
+                let context = query_context(vec![snapshot], basis)?;
+                if let Some(prior) = base_floors {
+                    let replayed = read_archive_lifetime_floors(Arc::clone(&context), basis).await?;
+                    for (table, floor) in prior {
+                        let preserved = replayed.get(&table).is_some_and(|next|
+                            next.duration == floor.duration
+                            && next.expired_created_through >= floor.expired_created_through
+                            && next.swept_present_through >= floor.swept_present_through
+                        );
+                        if !preserved {
+                            return Err(inconsistent("The certified replica suffix regresses a checkpoint lifetime floor"));
+                        }
+                    }
+                }
                 run(context, basis).await
             }).await.ok_or_else(|| unavailable("The retained checkpoint read was cancelled"))?
         },
