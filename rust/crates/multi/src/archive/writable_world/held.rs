@@ -33,7 +33,8 @@ struct ArchivePoint {
 }
 
 enum ArchiveRead {
-    ChangeCoverage {
+    Coverage {
+        frontiers: Vec<(OwnedRelation, i64)>,
         guard: Arc<dyn Fn() -> Result<()> + Send + Sync>,
         reply: oneshot::Sender<Result<()>>,
     },
@@ -122,16 +123,22 @@ impl HeldCheckpointWorld {
     ) -> Result<rtdb_node::OwnedMergedChanges> {
         self.check()?;
         let guard = self.open.snapshot.relation_release_guard(relations)?;
-        let (reply, result) = oneshot::channel();
-        self.cancellation.run_until_cancelled(self.requests.send(ArchiveRead::ChangeCoverage {
-            guard: Arc::clone(&guard), reply,
-        })).await.ok_or_else(OwnedWorld::unavailable)?.map_err(|_| OwnedWorld::unavailable())?;
-        self.cancellation.run_until_cancelled(result).await
-            .ok_or_else(OwnedWorld::unavailable)?.map_err(|_| OwnedWorld::unavailable())??;
+        self.require_archive_coverage(Vec::new(), Arc::clone(&guard)).await?;
         let page = self.open.snapshot.world_merged_changes(self.open.record.id, relations, after, limit).await?;
         guard()?;
         self.check()?;
         Ok(page)
+    }
+
+    async fn require_archive_coverage(
+        &self, frontiers: Vec<(OwnedRelation, i64)>, guard: Arc<dyn Fn() -> Result<()> + Send + Sync>,
+    ) -> Result<()> {
+        let (reply, result) = oneshot::channel();
+        self.cancellation.run_until_cancelled(self.requests.send(ArchiveRead::Coverage {
+            frontiers, guard, reply,
+        })).await.ok_or_else(OwnedWorld::unavailable)?.map_err(|_| OwnedWorld::unavailable())?;
+        self.cancellation.run_until_cancelled(result).await
+            .ok_or_else(OwnedWorld::unavailable)?.map_err(|_| OwnedWorld::unavailable())?
     }
 
     pub fn close(&self) {
@@ -210,9 +217,15 @@ impl HeldCheckpointWorld {
         let world = self.open.record.id;
         let witness = self.open.snapshot.world_relation_witnesses(world, [&relation])
             .await?.pop().ok_or_else(OwnedWorld::unavailable)?;
+        self.require_overlay_coverage(&relation, &witness).await?;
         let page = self.open.snapshot.range_world_overlay(world, &relation, &path, request, valid).await?;
         self.check_relation(&relation)?;
         Ok((page, witness))
+    }
+
+    async fn require_overlay_coverage(&self, relation: &OwnedRelation, witness: &OwnedWorldWitness) -> Result<()> {
+        let guard = self.open.snapshot.relation_release_guard([relation])?;
+        self.require_archive_coverage(vec![(relation.clone(), witness.purge_frontier())], guard).await
     }
 
     pub async fn count(
@@ -352,6 +365,9 @@ impl HeldCheckpointWorld {
     ) -> Result<WorldIdentityPage> {
         self.check_relation(relation)?;
         if !(1..=128).contains(&limit) || !self.clock_mode().is_writable() { return Err(OwnedWorld::unavailable()); }
+        let witness = self.open.snapshot.world_relation_witnesses(self.open.record.id, [relation])
+            .await?.pop().ok_or_else(OwnedWorld::unavailable)?;
+        self.require_overlay_coverage(relation, &witness).await?;
         let candidates = self.open.snapshot.world_identity_candidates(
             self.open.record.id, relation, valid, after, limit + 1,
         ).await?;
@@ -362,6 +378,21 @@ impl HeldCheckpointWorld {
         Ok(WorldIdentityPage { keys, more, reservations })
     }
 
+}
+
+fn check_archive_coverage<'a>(
+    context: &rtdb_query::QueryContext, owner: &str,
+    frontiers: impl IntoIterator<Item = (&'a OwnedRelation, i64)>,
+) -> Result<()> {
+    require_relation_purge_history(context, owner)?;
+    let database = context.catalog.database(context.catalog.default_database())?;
+    let [snapshot] = database.partitions.as_slice() else { return Err(OwnedWorld::unavailable()); };
+    for (relation, expected) in frontiers {
+        if snapshot.relation_event_frontier(&relation.purge_table(owner))? != expected {
+            return Err(OwnedWorld::unavailable());
+        }
+    }
+    Ok(())
 }
 
 const MAX_HISTORY_SLICES: usize = 128;
@@ -450,8 +481,10 @@ pub(crate) async fn open_held_checkpoint_world(
                                 point = pending.recv() => match point { Some(point) => point, None => break },
                             };
                             match request {
-                                ArchiveRead::ChangeCoverage { guard, reply } => {
-                                    let coverage = guard().and_then(|()| require_relation_purge_history(&context, &owner));
+                                ArchiveRead::Coverage { frontiers, guard, reply } => {
+                                    let coverage = guard().and_then(|()| check_archive_coverage(
+                                        &context, &owner, frontiers.iter().map(|(relation, frontier)| (relation, *frontier)),
+                                    ));
                                     let _ = reply.send(coverage);
                                 }
                                 ArchiveRead::Point(ArchivePoint { relation, id, valid, guard, mut reply }) => {
@@ -471,14 +504,8 @@ pub(crate) async fn open_held_checkpoint_world(
                                 ArchiveRead::Search { partitions, frontiers, query, offset, limit, valid, guard, mut reply } => {
                                     let read = async {
                                         guard()?;
-                                        require_relation_purge_history(&context, &owner)?;
-                                        let database = context.catalog.database(context.catalog.default_database())?;
-                                        let [snapshot] = database.partitions.as_slice() else { return Err(OwnedWorld::unavailable()); };
-                                        for ((relation, _), frontier) in partitions.iter().zip(frontiers) {
-                                            if snapshot.relation_event_frontier(&relation.purge_table(&owner))? != frontier {
-                                                return Err(OwnedWorld::unavailable());
-                                            }
-                                        }
+                                        check_archive_coverage(&context, &owner,
+                                            partitions.iter().map(|(relation, _)| relation).zip(frontiers))?;
                                         let scoped = Arc::clone(&context).with_owned_read_guard(Arc::clone(&guard));
                                         let page = rtdb_node::rank_owned_cut(scoped, &owner, &partitions, &query, offset, limit, Some(valid)).await?;
                                         guard()?;
@@ -494,12 +521,7 @@ pub(crate) async fn open_held_checkpoint_world(
                                 ArchiveRead::Ordered { relation, path, frontier, lower, upper, valid, read, guard, mut reply } => {
                                     let read = async {
                                         guard()?;
-                                        require_relation_purge_history(&context, &owner)?;
-                                        let database = context.catalog.database(context.catalog.default_database())?;
-                                        let [snapshot] = database.partitions.as_slice() else { return Err(OwnedWorld::unavailable()); };
-                                        if snapshot.relation_event_frontier(&relation.purge_table(&owner))? != frontier {
-                                            return Err(OwnedWorld::unavailable());
-                                        }
+                                        check_archive_coverage(&context, &owner, [(&relation, frontier)])?;
                                         let context = Arc::clone(&context).with_owned_read_guard(Arc::clone(&guard));
                                         let (lower, upper) = (lower.as_ref(), upper.as_ref());
                                         let result = match read {

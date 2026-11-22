@@ -1040,7 +1040,8 @@ impl OwnedReadSession {
         let valid = rtdb_types::Interval::at(valid_at)?;
         self.admit_read().await?;
         let context = self.relation_context(relation)?;
-        let relation = relation.in_world(world)?;
+        let root = relation;
+        let relation = root.in_world(world)?;
         let mut row = None;
         let mut local_revision = None;
         if let Some(mut cursor) = rtdb_query::open_owned_point(
@@ -1057,12 +1058,14 @@ impl OwnedReadSession {
                 row = Some(batch);
             }
         }
+        if let Some(revision) = local_revision {
+            self.check_point_purge_floor(root, id, revision).await?;
+        }
         context.check_cancelled()?;
         let witness = if let Some(scope) = self.witness_scope.filter(|_| observed) {
             let (registered, _charge) = self.world_registration(world).await?
                 .filter(|(record, _)| !record.dropped && record.until > self.present.system_time)
                 .ok_or_else(rtdb_types::OwnedWorld::unavailable)?;
-            let root = relation.root_relation().ok_or_else(rtdb_types::OwnedWorld::unavailable)?;
             let database = self.context.catalog.database(&self.database)?;
             let [snapshot] = database.partitions.as_slice() else { return Err(rtdb_types::OwnedWorld::unavailable()); };
             let purge_frontier = snapshot.relation_event_frontier(&root.purge_table(&self.owner))?;
