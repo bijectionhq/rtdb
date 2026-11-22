@@ -202,6 +202,7 @@ contract OutputSegmentLayout {
 
     @invariant OutputPagesShareTheMergedSchema
         -- Every page in an output data file uses the merged schema, including its field types and nullability.
+        -- Normalization retains the complete entity-key column in governed event data.
         -- Compaction copies compatible document cells from selected Arrow positions in both stages.
         -- It aligns evolving nested fields and union legs to the merged schema and writes typed nulls for absent fields.
         -- Rebuilt pages use the event writer's encoding for undefined union padding under null containers and for bottom-typed fields widened to unions.

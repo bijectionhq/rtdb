@@ -430,6 +430,28 @@ mod tests {
     fn page(events: &[StoredEvent]) -> Vec<PageEvent> { EventBatch::new(build_event_batch(events, None, None).unwrap()).unwrap().page_events().unwrap() }
 
     #[test]
+    fn normalization_retains_governed_event_keys_in_the_output_file() {
+        let directory = tempfile::tempdir().unwrap();
+        let spill = directory.path().join("merge.arrow");
+        let data = directory.path().join("data.arrow");
+        let metadata = directory.path().join("meta.arrow");
+        let memory = MemoryBudget::new(1 << 22);
+        let config = MergeConfig::default();
+        let events = [b"world-a".as_slice(), b"world-b".as_slice()].map(|key| StoredEvent {
+            entity_key: Some(Arc::from(key)), iid: Iid([1; 16]), system_from: Timestamp(100),
+            valid_time: Interval::ALL, operation: StoredOperation::Delete, recency: None,
+        });
+        let mut spill = MergeFile::new(spill, None, false, &[], &None, true, &config, &memory).unwrap();
+        spill.write(&page(&events), vec![], &None, &config, &memory).unwrap();
+        spill.finish(&config).unwrap();
+        layout::normalize(&spill, &None, &config, &memory, &data, &metadata, &CancellationToken::new()).unwrap();
+        let (mut reader, _reservation) = open_input(File::open(data).unwrap(), &memory).unwrap();
+        let batch = EventBatch::new(read_page(&mut reader, 0, &memory).unwrap().batch().clone()).unwrap();
+        assert_eq!(batch.entity_key(0).unwrap(), Some(b"world-a".as_slice()));
+        assert_eq!(batch.entity_key(1).unwrap(), Some(b"world-b".as_slice()));
+    }
+
+    #[test]
     fn compaction_reserves_encoding_scratch_before_writing_a_page() {
         let fields = StructFields::from([("payload".into(), LogicalType::Scalar(rtdb_types::ScalarType::Binary))]);
         let input = build_event_batch(&[StoredEvent {
