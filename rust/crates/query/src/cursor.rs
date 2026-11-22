@@ -547,9 +547,12 @@ impl QueryCursor {
         };
         let result = rtdb_storage::IoRegion::retaining(retention, rtdb_storage::IoRegion::leased(lease, pull)).await.flatten().ok_or_else(cancelled);
         let result = result.and_then(|batch| {
-            if let (Some(id), Ok(Some(page))) = (self.context.catalog.owned_identity(), &batch) {
-                for row in 0..page.batch().num_rows() {
-                    crate::owned_row_revision(page.batch(), row, id, &self.context.memory)?;
+            if let Some(id) = self.context.catalog.owned_identity() {
+                self.context.check_cancelled()?;
+                if let Ok(Some(page)) = &batch {
+                    for row in 0..page.batch().num_rows() {
+                        crate::owned_row_revision(page.batch(), row, id, &self.context.memory)?;
+                    }
                 }
             }
             Ok(batch)

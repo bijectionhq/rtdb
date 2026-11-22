@@ -1,29 +1,52 @@
-use std::{collections::BTreeSet, sync::Arc};
+use std::{collections::BTreeSet, sync::Arc, time::Duration};
 
 use arrow_array::{Int64Array, RecordBatch};
 use arrow_flight::Result as ActionResult;
 use arrow_ipc::writer::IpcWriteOptions;
 use arrow_schema::{DataType, Field, Schema};
+use bytes::Bytes;
 use prost::Message;
-use rtdb_columnar::OwnedBatch;
+use rtdb_columnar::{MemoryReservation, OwnedBatch};
 use rtdb_format::ipc::{OwnedStream, write_arrow_stream};
-use rtdb_node::{NativeSession, TransactionStatus};
+use rtdb_node::{NativeSession, OwnedReadSession, TransactionStatus};
+use rtdb_query::QueryCursor;
 use rtdb_tx::{Documents, TxOp};
-use rtdb_types::{OwnedRelation, TimeUnit, Timestamp, Value};
+use rtdb_types::{EntityId, OwnedRelation, TimeUnit, Timestamp, Value};
+use tokio::sync::OwnedSemaphorePermit;
 use tonic::Status;
+use uuid::Uuid;
 
 use crate::{
     error::{arrow, invalid, status, unsupported},
-    service::{Call, Service},
+    lease::{Leased, Lookup},
+    service::{Call, Service, found},
+    state::ResourceOwner,
     upload, wire,
 };
 
 pub(crate) const CREATE_OWNED_V1: &str = "rtdb.owned.Create.v1";
 pub(crate) const COMMIT_OWNED_V1: &str = "rtdb.owned.Commit.v1";
 pub(crate) const READ_OWNED_V1: &str = "rtdb.owned.ReadPoint.v1";
+pub(crate) const OPEN_OWNED_READ_V1: &str = "rtdb.owned.OpenRead.v1";
+pub(crate) const HELD_OWNED_POINT_V1: &str = "rtdb.owned.ReadHeldPoint.v1";
+pub(crate) const CLOSE_OWNED_READ_V1: &str = "rtdb.owned.CloseRead.v1";
+const READ_IDLE: Duration = Duration::from_secs(60);
 const OWNED_PRESENT: &str = "rtdb.owned.present_micros";
 const OWNED_VALID: &str = "rtdb.owned.valid_micros";
 const OWNED_REVISION: &str = "rtdb.owned.revision_micros";
+
+pub(crate) struct OwnedReadResource {
+    snapshot: OwnedReadSession,
+    owner: ResourceOwner,
+    session: String,
+    database: String,
+    _permit: OwnedSemaphorePermit,
+    _reservation: Arc<MemoryReservation>,
+}
+
+impl Leased for OwnedReadResource {
+    fn close(&self) { self.snapshot.close(); }
+}
 
 fn split_relation(body: &[u8]) -> Result<(OwnedRelation, &[u8]), Status> {
     let (length, rest) = body.split_first_chunk::<2>().ok_or_else(|| invalid("Owned action has no relation length"))?;
@@ -135,24 +158,77 @@ impl Service {
         self.owned_action_reply(&schema, Some(&batch))
     }
 
-    pub(crate) async fn read_owned_action(&self, call: &Call, body: &[u8]) -> Result<ActionResult, Status> {
+    pub(crate) async fn open_owned_read_action(&self, call: &Call, body: &[u8]) -> Result<ActionResult, Status> {
         if !self.0.config.owned_native_actions { return Err(unsupported()); }
-        let (relation, arrow) = split_relation(body)?;
-        let batch = request_batch(call, arrow)?;
-        let batch = batch.batch();
-        if batch.num_columns() != 1 || batch.num_rows() != 1 {
-            return Err(invalid("Owned point action requires one _id cell"));
-        }
-        let field = batch.schema_ref().field(0);
-        let values = batch.column(0).as_ref();
-        let _identity = call.reserve(wire::add(
-            4096, rtdb_columnar::estimate_read_value_bytes(field, values, 0).map_err(status)?,
-        )?)?;
-        let id = rtdb_columnar::read_execution_value(field, values, 0).map_err(status)?.entity_id().map_err(status)?;
+        if !body.is_empty() { return Err(invalid("Owned read open takes an empty body")); }
+        let permit = Arc::clone(&self.0.owned_read_slots).try_acquire_owned()
+            .map_err(|_| Status::resource_exhausted("The node has too many retained owned reads"))?;
         let connection = self.connection(call, &call.database).await?;
         let mut native = connection.borrow().await?;
         require_idle(&native)?;
-        let (present, result) = native.open_owned_point(&relation, &id).await.map_err(status)?;
+        let reservation = call.reserve(wire::add(2048, wire::add(call.session.id.len(), call.database.len())?)?)?;
+        let reply_charge = call.reserve(64)?;
+        let snapshot = native.open_owned_read().await.map_err(status)?;
+        let handle = Uuid::new_v4();
+        let mut reply = Vec::with_capacity(24);
+        reply.extend_from_slice(handle.as_bytes());
+        reply.extend_from_slice(&snapshot.present().system_time.0.to_be_bytes());
+        let held = Arc::new(OwnedReadResource {
+            snapshot, owner: call.session.owner(), session: call.session.id.clone(), database: call.database.clone(),
+            _permit: permit, _reservation: reservation,
+        });
+        self.0.owned_reads.insert(Bytes::copy_from_slice(handle.as_bytes()), held, READ_IDLE, READ_IDLE, false, 16).map_err(status)?;
+        Ok(ActionResult { body: wire::retain(reply, reply_charge) })
+    }
+
+    fn owned_read(&self, call: &Call, handle: &Bytes) -> Result<Arc<OwnedReadResource>, Status> {
+        let entry = found(self.0.owned_reads.lookup(handle, false), "owned read")?;
+        if entry.session != call.session.id || entry.database != call.database || !call.session.owns(&entry.owner) {
+            return Err(Status::not_found("unknown owned read"));
+        }
+        Ok(entry)
+    }
+
+    pub(crate) async fn held_owned_point_action(&self, call: &Call, body: &[u8]) -> Result<ActionResult, Status> {
+        if !self.0.config.owned_native_actions { return Err(unsupported()); }
+        let (handle, request) = body.split_first_chunk::<16>().ok_or_else(|| invalid("Owned held point has no handle"))?;
+        let handle = Bytes::copy_from_slice(handle);
+        let held = self.owned_read(call, &handle)?;
+        if let Err(error) = held.snapshot.check() {
+            if let Lookup::Found(entry) = self.0.owned_reads.take(&handle) { entry.close(); }
+            return Err(status(error));
+        }
+        let (relation, id, _identity) = point_request(call, request)?;
+        let cursor = held.snapshot.open_point(&relation, &id).await.map_err(status)?;
+        let reply = self.finish_owned_point(held.snapshot.present().system_time, &id, cursor).await?;
+        held.snapshot.check().map_err(status)?;
+        Ok(reply)
+    }
+
+    pub(crate) fn close_owned_read_action(&self, call: &Call, body: &[u8]) -> Result<(), Status> {
+        if !self.0.config.owned_native_actions { return Err(unsupported()); }
+        if body.len() != 16 { return Err(invalid("Owned read close requires one 16-byte handle")); }
+        let handle = Bytes::copy_from_slice(body);
+        self.owned_read(call, &handle)?;
+        let entry = found(self.0.owned_reads.take(&handle), "owned read")?;
+        entry.close();
+        Ok(())
+    }
+
+    pub(crate) async fn read_owned_action(&self, call: &Call, body: &[u8]) -> Result<ActionResult, Status> {
+        if !self.0.config.owned_native_actions { return Err(unsupported()); }
+        let (relation, id, _identity) = point_request(call, body)?;
+        let connection = self.connection(call, &call.database).await?;
+        let mut native = connection.borrow().await?;
+        require_idle(&native)?;
+        let snapshot = native.open_owned_read().await.map_err(status)?;
+        let cursor = snapshot.open_point(&relation, &id).await.map_err(status)?;
+        let reply = self.finish_owned_point(snapshot.present().system_time, &id, cursor).await?;
+        snapshot.check().map_err(status)?;
+        Ok(reply)
+    }
+
+    async fn finish_owned_point(&self, present: Timestamp, id: &EntityId, result: Option<QueryCursor>) -> Result<ActionResult, Status> {
         let Some(mut cursor) = result else {
             return self.owned_point_reply(&Schema::empty(), None, present, None);
         };
@@ -165,7 +241,7 @@ impl Service {
             result = Some(batch);
         }
         if let Some(batch) = result {
-            let revision = rtdb_query::owned_row_revision(batch.batch(), 0, &id, self.memory()).map_err(status)?;
+            let revision = rtdb_query::owned_row_revision(batch.batch(), 0, id, self.memory()).map_err(status)?;
             self.owned_point_reply(batch.batch().schema_ref(), Some(batch.batch()), present, Some(revision))
         } else {
             let schema = wire::plan_schema(cursor.runtime_schema(), self.memory())?;
@@ -200,6 +276,20 @@ impl Service {
         let retained = self.memory().reserve(reply.body.len()).map_err(status)?;
         Ok(ActionResult { body: wire::retain(reply.body, retained) })
     }
+}
+
+fn point_request(call: &Call, body: &[u8]) -> Result<(OwnedRelation, EntityId, Arc<MemoryReservation>), Status> {
+    let (relation, arrow) = split_relation(body)?;
+    let batch = request_batch(call, arrow)?;
+    let batch = batch.batch();
+    if batch.num_columns() != 1 || batch.num_rows() != 1 {
+        return Err(invalid("Owned point action requires one _id cell"));
+    }
+    let field = batch.schema_ref().field(0);
+    let values = batch.column(0).as_ref();
+    let identity = call.reserve(wire::add(4096, rtdb_columnar::estimate_read_value_bytes(field, values, 0).map_err(status)?)?)?;
+    let id = rtdb_columnar::read_execution_value(field, values, 0).map_err(status)?.entity_id().map_err(status)?;
+    Ok((relation, id, identity))
 }
 
 fn optional_micros(value: Option<Value>) -> Result<Option<Timestamp>, Status> {

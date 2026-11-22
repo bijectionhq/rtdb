@@ -328,13 +328,13 @@ impl Node {
     }
 
     pub async fn query_context(&self, database: &str, basis: &QueryBasis, identity: &dyn SessionIdentity, cancellation: &CancellationToken) -> Result<Arc<QueryContext>> {
-        self.query_context_in_placement(database, basis, identity, None, cancellation).await
+        self.query_context_in_placement(database, basis, identity, None, None, cancellation).await
     }
 
-    async fn query_context_in_placement(&self, database: &str, basis: &QueryBasis, identity: &dyn SessionIdentity, placement: Option<&Weak<Database>>, cancellation: &CancellationToken) -> Result<Arc<QueryContext>> {
+    async fn query_context_in_placement(&self, database: &str, basis: &QueryBasis, identity: &dyn SessionIdentity, placement: Option<&Weak<Database>>, exact: Option<TransactionKey>, cancellation: &CancellationToken) -> Result<Arc<QueryContext>> {
         self.admit(database, DatabaseAccess::Read, identity, cancellation).await?;
         let placed = self.catalog.is_placed();
-        let held = placed.then(|| self.attached_database(database, placement)).transpose()?;
+        let held = (placed || exact.is_some()).then(|| self.attached_database(database, placement)).transpose()?;
         if let Some(fence) = &self.read_fence { fence.confirm(database).await?; }
         if let Some(previous) = &held {
             let current = self.catalog.database(database).map_err(|_| lost_placement(database))?;
@@ -345,14 +345,17 @@ impl Node {
         let fragment_residence = held.as_ref().and_then(|database| database.fragment_residence().cloned());
         let mut snapshots = BTreeMap::new();
         let mut lease: Option<Arc<rtdb_storage::ReadLease>> = None;
-        let classic = if placed { BTreeMap::new() } else { self.catalog.open_databases() };
+        let classic = if held.is_some() { BTreeMap::new() } else { self.catalog.open_databases() };
         for (name, database) in held.into_iter().map(|held| (database.to_owned(), held)).chain(classic) {
             if !placed && identity.authorize_database(&name, DatabaseAccess::Read).is_err() { continue; }
             if let Some(database_lease) = self.catalog_read_lease(&database).await? {
                 lease = Some(match lease { Some(lease) => lease.earlier(database_lease), None => database_lease });
             }
             let head = database.partition.value().live().latest_completed_tx().map(|key| key.system_time);
-            let snapshot = database.partition.open_snapshot(head);
+            let snapshot = if exact.is_some() { database.partition.snapshot() } else { database.partition.open_snapshot(head) };
+            if exact.is_some_and(|cut| snapshot.tx_basis() != Some(cut)) {
+                return Err(Anomaly::new(AnomalyCategory::Conflict, "rtdb.owned/capture-raced", "The exact reserved transaction is no longer the applied catalog head"));
+            }
             let requested = basis.snapshot.databases.get(&name).and_then(|partitions| partitions.first()).copied().flatten();
             if let Some(requested) = requested.filter(|requested| snapshot.tx_basis().is_none_or(|head| *requested > head.system_time.into())) {
                 return Err(rtdb_query::unindexed_tx(requested, snapshot.tx_basis()));
@@ -463,7 +466,7 @@ impl Node {
     /// The committed outcome visible to the retry when its duplicate guard ran.
     async fn historical_keyed_transaction(&self, database: &str, key: &str, retry_time: Timestamp, submitted_at: Timestamp, identity: &dyn SessionIdentity, placement: Option<&Weak<Database>>, cancellation: &CancellationToken) -> Result<Option<TransactionKey>> {
         let basis = QueryBasis { snapshot: self.snapshot_basis()?, snapshot_time: None, current_time: self.query_instant(), timezone: self.factory.options.default_timezone.clone() };
-        let context = self.query_context_in_placement(database, &basis, identity, placement, cancellation).await?;
+        let context = self.query_context_in_placement(database, &basis, identity, placement, None, cancellation).await?;
         let timestamp = |time: Timestamp| Value::Timestamp { value: time.0, unit: TimeUnit::Microsecond, timezone: Some("UTC".into()) };
         let arguments = vec![timestamp(retry_time), timestamp(submitted_at), Value::Utf8(key.to_owned())];
         let options = rtdb_sql::PrepareOptions {
@@ -493,7 +496,7 @@ impl Node {
     }
     async fn placed_outcome_key(&self, database: &str, attempt: PlacedAttempt, identity: &dyn SessionIdentity, placement: Option<&Weak<Database>>, cancellation: &CancellationToken) -> Result<Option<TransactionKey>> {
         let basis = QueryBasis { snapshot: TimeBasis::default(), snapshot_time: None, current_time: self.query_instant(), timezone: self.factory.options.default_timezone.clone() };
-        let context = self.query_context_in_placement(database, &basis, identity, placement, cancellation).await?;
+        let context = self.query_context_in_placement(database, &basis, identity, placement, None, cancellation).await?;
         let options = rtdb_sql::PrepareOptions { parameter_types: BTreeMap::from([(0, LogicalType::Scalar(ScalarType::Utf8))]), default_timezone: context.timezone.clone(), generate_series_end_exclusive: context.options.generate_series_end_exclusive, ..Default::default() };
         let sql = "SELECT tx_id, tx_system_time FROM xt.placed_attempt_outcomes FOR ALL VALID_TIME WHERE _id = ?";
         let prepared = match prepare_query(sql, &context, &options) {
@@ -579,7 +582,7 @@ impl Node {
             return Ok(if db.external_source() { result.as_ref().clone() } else { answer_duplicate(result.as_ref().clone()) });
         }
         let basis = QueryBasis { snapshot: self.snapshot_basis()?, snapshot_time: None, current_time: self.query_instant(), timezone: self.factory.options.default_timezone.clone() };
-        let context = self.query_context_in_placement(database, &basis, identity, placement, cancellation).await?;
+        let context = self.query_context_in_placement(database, &basis, identity, placement, None, cancellation).await?;
         let options = rtdb_sql::PrepareOptions { parameter_types: BTreeMap::from([(0, LogicalType::Scalar(rtdb_types::ScalarType::I64))]), default_timezone: context.timezone.clone(), generate_series_end_exclusive: context.options.generate_series_end_exclusive, ..Default::default() };
         let mut cursor = prepare_query("SELECT system_time, committed, error, user_metadata FROM xt.txs FOR ALL VALID_TIME WHERE _id = ?", &context, &options)?
             .execute(context, vec![Value::I64(tx_id.0)]).await?;
@@ -854,6 +857,38 @@ impl NodeDriver {
     }
 }
 
+/// A database-scoped capture held by the same authenticated native session.
+pub struct OwnedReadSession {
+    context: Arc<QueryContext>,
+    node: Node,
+    identity: Arc<dyn SessionIdentity>,
+    database: String,
+    owner: String,
+    present: TransactionKey,
+    cancellation: CancellationToken,
+    _reservation: Arc<rtdb_columnar::MemoryReservation>,
+}
+
+impl OwnedReadSession {
+    pub fn present(&self) -> TransactionKey { self.present }
+    pub fn close(&self) { self.cancellation.cancel(); }
+    pub fn check(&self) -> Result<()> { self.context.check_cancelled() }
+
+    pub async fn open_point(&self, relation: &rtdb_types::OwnedRelation, id: &rtdb_types::EntityId) -> Result<Option<QueryCursor>> {
+        self.context.check_cancelled()?;
+        self.node.admit(&self.database, DatabaseAccess::Read, self.identity.as_ref(), &self.cancellation).await?;
+        if self.identity.user() != Some(self.owner.as_str()) {
+            return Err(Anomaly::new(AnomalyCategory::Forbidden, "rtdb.owned/read-owner", "The captured read belongs to another authenticated principal"));
+        }
+        self.context.check_cancelled()?;
+        rtdb_query::open_owned_point(Arc::clone(&self.context), &self.owner, relation, id, None, None).await
+    }
+}
+
+impl Drop for OwnedReadSession {
+    fn drop(&mut self) { self.close(); }
+}
+
 pub struct NativeSession { pub(crate) state: Session, pub(crate) service: Arc<NativeSessionService> }
 impl NativeSession {
     pub fn track_replica_read_session(&self) -> Result<impl Send + use<>> {
@@ -866,22 +901,43 @@ impl NativeSession {
     pub async fn reserve_ordered_present(&mut self) -> Result<TransactionKey> {
         self.state.reserve_ordered_present().await
     }
-    /// Reads one IID in the authenticated principal's owned relation at a store-reserved present.
-    pub async fn open_owned_point(&mut self, relation: &rtdb_types::OwnedRelation, id: &rtdb_types::EntityId) -> Result<(Timestamp, Option<QueryCursor>)> {
+    /// Retains the exact applied catalog at one store-reserved transaction for repeated reads.
+    pub async fn open_owned_read(&mut self) -> Result<OwnedReadSession> {
         if !self.service.node.factory.options.owned_relations { return Err(owned_relations_disabled()); }
+        let node = self.service.node.clone();
+        let identity = Arc::clone(&self.service.identity);
+        let database = self.state.database().to_owned();
         let owner = self.state.user().filter(|owner| !owner.is_empty()).map(str::to_owned)
             .ok_or_else(|| Anomaly::new(AnomalyCategory::Forbidden, "rtdb.owned/no-owner", "Owned relations require an authenticated principal"))?;
+        let charge = node.memory().reserve(database.capacity().checked_add(owner.capacity()).and_then(|bytes| bytes.checked_add(2048))
+            .ok_or_else(|| Anomaly::incorrect("rtdb.owned/read-size", "Retained read allocation overflow"))?)?;
+        let attached = Arc::downgrade(&node.attached_database(&database, self.service.placement.as_ref())?);
         let present = self.reserve_ordered_present().await?;
-        let database = self.state.database();
         let basis = QueryBasis {
-            snapshot: TimeBasis { databases: BTreeMap::from([(database.to_owned(), vec![Some(present.system_time.into())])]) },
+            snapshot: TimeBasis { databases: BTreeMap::from([(database.clone(), vec![Some(present.system_time.into())])]) },
             snapshot_time: Some(present.system_time),
             current_time: present.system_time.into(),
             timezone: self.state.session_timezone().to_owned(),
         };
-        let context = self.service.query_context(database, &basis, self.state.cancellation()).await?;
-        let cursor = rtdb_query::open_owned_point(context, &owner, relation, id, None, None).await?;
-        Ok((present.system_time, cursor))
+        let cancellation = self.state.cancellation().child_token();
+        let context = node.query_context_in_placement(
+            &database, &basis, identity.as_ref(), Some(&attached), Some(present), &cancellation,
+        ).await?;
+        let lease = context.catalog.read_lease();
+        let clock = Arc::clone(&node.factory.clock);
+        let deadline = clock.monotonic_micros().saturating_add(60_000_000);
+        let guarded_node = node.clone();
+        let guarded_database = database.clone();
+        let context = context.with_owned_read_guard(Arc::new(move || {
+            if clock.monotonic_micros() >= deadline {
+                return Err(Anomaly::new(AnomalyCategory::Unavailable, "rtdb.owned/read-expired", "The retained owned read expired"));
+            }
+            guarded_node.attached_database(&guarded_database, Some(&attached))?;
+            if let Some(lease) = &lease { lease.check()?; }
+            Ok(())
+        }));
+        context.check_cancelled()?;
+        Ok(OwnedReadSession { context, node, identity, database, owner, present, cancellation, _reservation: charge })
     }
     pub async fn query_context(&mut self) -> Result<Arc<QueryContext>> {
         let basis = self.state.read_basis().await?;
@@ -972,7 +1028,7 @@ impl NativeSessionService {
     }
 
     pub(crate) async fn query_context(&self, database: &str, basis: &QueryBasis, cancellation: &CancellationToken) -> Result<Arc<QueryContext>> {
-        self.node.query_context_in_placement(database, basis, self.identity.as_ref(), self.placement.as_ref(), cancellation).await
+        self.node.query_context_in_placement(database, basis, self.identity.as_ref(), self.placement.as_ref(), None, cancellation).await
     }
 
     pub(crate) async fn await_durable_source(&self, database: &str, hosted: bool, cancellation: &CancellationToken) -> Result<Option<String>> {

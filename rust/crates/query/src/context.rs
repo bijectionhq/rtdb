@@ -43,6 +43,7 @@ pub struct CatalogSnapshot {
     pub(crate) databases: BTreeMap<String, DatabaseSnapshot>,
     transaction_scoped: bool,
     owned_relation: Option<(QualifiedTable, rtdb_types::EntityId)>,
+    owned_read_guard: Option<Arc<dyn Fn() -> Result<()> + Send + Sync>>,
     pub(crate) runtime: Option<Arc<dyn CatalogRuntime>>,
     pub(crate) ordered_indexes: Option<Arc<dyn OrderedIndexInventory>>,
     pub(crate) fragmenter: Option<Arc<dyn crate::fragment::ScanFragmenter>>,
@@ -58,7 +59,7 @@ impl CatalogSnapshot {
         if transaction_scoped && databases.get(&default_database).is_none_or(|database| database.partitions.len() != 1) {
             return Err(invalid("transaction-partition-scope", "An index-time query must contain exactly its resolving partition"));
         }
-        Ok(Self { default_database, databases, transaction_scoped, owned_relation: None, runtime: None, ordered_indexes: None, fragmenter: None, fragment_residence: None, read_lease: None })
+        Ok(Self { default_database, databases, transaction_scoped, owned_relation: None, owned_read_guard: None, runtime: None, ordered_indexes: None, fragmenter: None, fragment_residence: None, read_lease: None })
     }
     pub fn with_runtime(mut self, runtime: Arc<dyn CatalogRuntime>) -> Self { self.runtime = Some(runtime); self }
     pub fn with_ordered_indexes(mut self, inventory: Arc<dyn OrderedIndexInventory>) -> Self {
@@ -240,8 +241,15 @@ impl QueryContext {
         self
     }
 
+    pub fn with_owned_read_guard(mut self: Arc<Self>, guard: Arc<dyn Fn() -> Result<()> + Send + Sync>) -> Arc<Self> {
+        Arc::make_mut(&mut self).catalog.owned_read_guard = Some(guard);
+        self
+    }
+
     pub fn check_cancelled(&self) -> Result<()> {
-        if self.cancellation.is_cancelled() || self.owner_cancellation.is_cancelled() { Err(cancelled()) } else { Ok(()) }
+        if self.cancellation.is_cancelled() || self.owner_cancellation.is_cancelled() { return Err(cancelled()); }
+        if let Some(guard) = &self.catalog.owned_read_guard { guard()?; }
+        Ok(())
     }
     /// Checks for cancellation at the first of every 1024 indices: reading a token takes its lock, which per row adds up.
     pub fn check_cancelled_at(&self, index: usize) -> Result<()> {
