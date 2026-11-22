@@ -35,6 +35,49 @@ pub(crate) async fn retire_capture(
     capture: Uuid,
     manifest: Option<&str>,
 ) -> Result<CheckpointCaptureRetirement> {
+    retire_capture_inner(directory, installation, storage, archive, keys, capture, manifest, false).await
+}
+
+pub(crate) fn obsolete_fork_input(record: &DeploymentRecord, capture: Uuid) -> bool {
+    record.checkpoint_captures.get(&capture).is_some_and(|registered|
+        registered.automatic_fork && Some(registered.checkpoint) != record.checkpoint
+    )
+        && !record.checkpoint_capture_retirements.contains_key(&capture)
+        && !record.storage_regions.values().any(|region| region.holds_archive(capture))
+        && !record.checkpoint_worlds.values().any(|world|
+            world.capture == capture && world.until.0 > now_ms().saturating_mul(1000)
+        )
+        && !record.checkpoint_suffix_pins.values().any(|pin|
+            pin.capture == capture && pin.expires_at_ms > now_ms()
+        )
+        && !record.checkpoint_recovery.as_ref().is_some_and(|repair| repair.operation == capture)
+}
+
+pub(crate) async fn retire_obsolete_fork_input(
+    directory: &dyn Directory, record: &DeploymentRecord, storage: &CellStorage,
+    keys: &dyn KeyService, capture: Uuid,
+) -> Result<()> {
+    let registration = record.checkpoint_captures.get(&capture)
+        .filter(|_| obsolete_fork_input(record, capture))
+        .ok_or_else(|| unavailable("The automatic fork input remains retained"))?;
+    let archive: CellStorage = serde_json::from_str(&registration.archive)
+        .map_err(|_| inconsistent("Invalid retained automatic capture custody"))?;
+    retire_capture_inner(
+        directory, record, storage, &archive, keys, capture, registration.manifest_sha256.as_deref(), true,
+    ).await?;
+    Ok(())
+}
+
+async fn retire_capture_inner(
+    directory: &dyn Directory,
+    installation: &DeploymentRecord,
+    storage: &CellStorage,
+    archive: &CellStorage,
+    keys: &dyn KeyService,
+    capture: Uuid,
+    manifest: Option<&str>,
+    require_obsolete_fork: bool,
+) -> Result<CheckpointCaptureRetirement> {
     let archive = archive_binding(archive)?;
     if let Some(prior) = installation.checkpoint_capture_retirements.get(&capture) {
         require_same_release(prior, &archive, manifest)?;
@@ -45,6 +88,9 @@ pub(crate) async fn retire_capture(
         update_installation(directory, &installation.id, |record| {
             if let Some(prior) = record.checkpoint_capture_retirements.get(&capture) {
                 return require_same_release(prior, &archive, manifest);
+            }
+            if require_obsolete_fork && !obsolete_fork_input(record, capture) {
+                return Err(unavailable("The automatic fork input remains retained"));
             }
             require_capture_open(record, capture)?;
             if record.checkpoint_suffix_pins.values().any(|pin| {

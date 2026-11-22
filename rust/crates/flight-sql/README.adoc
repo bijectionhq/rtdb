@@ -505,7 +505,10 @@ It takes the v1 fields through the fingerprint and requires an all-zero predeces
 Mode 0 selects an independently archived cut at the exact original live Root transaction key.
 Mode 4 selects the accepted application publication read from the original live Root hold.
 The archived transaction and its application head must agree at that publication, and the ordered resolver checks that the head has not moved.
-An all-zero capture and suffix select an already certified archive of the requested cut from the placed host's Directory.
+An all-zero capture and suffix first select an already certified archive of the requested cut from the placed host's Directory.
+For a held application publication, a placed node configured with an independent `--archive-root` can otherwise copy the source's already published checkpoint when its exact system time equals that publication and its root digest is present.
+The Directory capture owner derives one reusable operation from the source checkpoint and archive and verifies it through the normal reopen path. A later checkpoint or newly materialized replica suffix cannot substitute for it.
+Once the source checkpoint is superseded, the archive retirement owner can close an automatic copy without a live world, suffix, repair, or I/O pin.
 Archive discovery does not create a capture or advance the original hold.
 Next come a big-endian u16 range witness count and its original 16-byte Root handle and 16-byte nonce pairs, then the big-endian u32 byte length and ordered Root fact groups.
 Root groups may supply point checks, inserts, replacements and deletes.

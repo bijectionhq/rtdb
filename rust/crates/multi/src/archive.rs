@@ -82,7 +82,7 @@ mod writable_world;
 pub(crate) use writable_world::{commit_checkpoint_world_batch, validate_checkpoint_world, fork_checkpoint_world_selected, HeldCheckpointWorld, WorldArchive, open_held_checkpoint_world};
 pub(crate) use writable_world::WorldPoint;
 pub use read_world::{CheckpointPoint, CheckpointReadResources, CheckpointReadWorld, read_checkpoint_owned_point};
-pub(crate) use retirement::{finish_capture_retirement, require_capture_open, retire_capture};
+pub(crate) use retirement::{finish_capture_retirement, obsolete_fork_input, require_capture_open, retire_capture, retire_obsolete_fork_input};
 pub use reader::{StagedReaderSettings, serve_staged_checkpoint};
 pub(crate) use reader::{StageSelector, tunnel_staged_checkpoint};
 
@@ -567,6 +567,14 @@ fn same_storage(storage: &CellStorage, destination: &CellStorage) -> bool {
     }
 }
 
+pub(crate) fn require_independent_world_archive(source: &CellStorage, archive: &CellStorage) -> Result<()> {
+    if same_storage(source, archive) || source.overlaps(archive)? {
+        return Err(inconsistent("Hosted forks require an independent archive"));
+    }
+    archive_binding(archive)?;
+    Ok(())
+}
+
 fn archive_binding(archive: &CellStorage) -> Result<String> {
     match archive {
         CellStorage::S3 { config } if config.credentials.is_some() || config.remote.is_some() => {
@@ -913,11 +921,25 @@ pub async fn capture(
     hosted_task: Option<rtdb_directory::HostedTask>,
     flushed: Option<&DeploymentRecord>,
 ) -> Result<Capture> {
+    capture_with_purpose(directory, storage, destination, keys, deployment, operation, hosted_task, flushed, false).await
+}
+
+async fn capture_with_purpose(
+    directory: Arc<dyn Directory>,
+    storage: &CellStorage,
+    destination: &CellStorage,
+    keys: &dyn KeyService,
+    deployment: Uuid,
+    operation: Uuid,
+    hosted_task: Option<rtdb_directory::HostedTask>,
+    flushed: Option<&DeploymentRecord>,
+    automatic_fork: bool,
+) -> Result<Capture> {
     let lineage = if matches!(storage, CellStorage::S3 { .. }) {
         Some(directory.deployment(&deployment.to_string()).await?.ok_or_else(|| unavailable("The source installation no longer exists"))?.lineage)
     } else { None };
     crate::store::with_source_lineage(directory.as_ref(), lineage.as_deref(), hosted_task.as_ref(),
-        Box::pin(capture_checkpoint(directory.clone(), storage, destination, keys, deployment, operation, hosted_task.clone(), flushed))).await
+        Box::pin(capture_checkpoint(directory.clone(), storage, destination, keys, deployment, operation, hosted_task.clone(), flushed, automatic_fork))).await
 }
 
 async fn capture_checkpoint(
@@ -929,8 +951,11 @@ async fn capture_checkpoint(
     operation: Uuid,
     hosted_task: Option<rtdb_directory::HostedTask>,
     flushed: Option<&DeploymentRecord>,
+    automatic_fork: bool,
 ) -> Result<Capture> {
-    if deployment.is_nil() || operation.is_nil() || same_storage(storage, destination) {
+    if deployment.is_nil() || operation.is_nil() || same_storage(storage, destination)
+        || (automatic_fork && flushed.is_none())
+    {
         return Err(inconsistent(
             "Capture requires one deployment, operation and independent archive",
         ));
@@ -970,6 +995,7 @@ async fn capture_checkpoint(
         if let Some(registered) = record.checkpoint_captures.get(&operation) {
             if registered.archive != binding || registered.incarnation != record.incarnation
                 || registered.log_epoch != record.log_epoch
+                || registered.automatic_fork != automatic_fork
             {
                 return Err(inconsistent("The capture operation already names another archive or lifetime"));
             }
@@ -993,10 +1019,17 @@ async fn capture_checkpoint(
                 incarnation: record.incarnation,
                 log_epoch: record.log_epoch,
                 checkpoint,
+                automatic_fork,
                 media_bound: false,
                 manifest_sha256: None,
                 remote_disposal: None,
             });
+        }
+        if automatic_fork && record.storage_regions.values().any(|region| region.holds_archive(operation)) {
+            return Err(Anomaly::new(
+                AnomalyCategory::Busy, "rtdb.multi/fork-capture-active",
+                "The exact fork input already has an admitted copy",
+            ));
         }
         let checkpoint = record.checkpoint_captures[&operation].checkpoint;
         let checkpoint_metadata_from = capture_metadata_floor(record, checkpoint);
@@ -1861,6 +1894,7 @@ mod tests {
             incarnation: record.incarnation,
             log_epoch: record.log_epoch,
             checkpoint,
+            automatic_fork: false,
             media_bound: false,
             manifest_sha256: None,
             remote_disposal: None,
@@ -1984,6 +2018,7 @@ mod tests {
                     system_time: 100,
                     root_sha256: None,
                 },
+                automatic_fork: false,
                 media_bound: true,
                 manifest_sha256: None,
                 remote_disposal: None,

@@ -1480,6 +1480,18 @@ pub async fn run_reaper(
                             }
                         }
                         for record in &deployments {
+                            if let Some(capture) = record.checkpoint_captures.keys().copied()
+                                .find(|capture| crate::archive::obsolete_fork_input(record, *capture))
+                            {
+                                let disposal = crate::archive::retire_obsolete_fork_input(
+                                    directory.as_ref(), record, &storage, keys, capture,
+                                );
+                                match cancellation.run_until_cancelled(disposal).await {
+                                    None => return,
+                                    Some(Err(error)) => eprintln!("Automatic fork input {capture} is retained: {}", error.code),
+                                    Some(Ok(())) => {}
+                                }
+                            }
                             for (&capture, release) in &record.checkpoint_capture_retirements {
                                 if release.observed_empty_at_ms.is_some() { continue; }
                                 let disposal = crate::archive::finish_capture_retirement(
